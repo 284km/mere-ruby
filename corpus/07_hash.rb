@@ -1,0 +1,6 @@
+puts({"a" => 1, "b" => 2})
+puts({1 => "one", 2 => "two"})
+puts({})
+puts({} == {})
+puts({"k" => nil})
+puts({"x" => [1, 2]})

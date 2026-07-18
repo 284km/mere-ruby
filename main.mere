@@ -1,0 +1,532 @@
+// mere-ruby — a Ruby subset interpreter written in pure Mere. Milestone M0.
+//
+// M0 scope: literals (integer, float, string, true/false/nil, array, hash),
+// operators with Ruby precedence (** right-assoc, unary - !, * / %, + -,
+// comparisons, == !=, && ||), parentheses, comments, and `puts`.
+// Ruby semantics where they differ from C: floor division and
+// sign-of-divisor modulo, value-returning && / ||, truthiness (only nil
+// and false are falsy — 0 is truthy), puts flattening arrays recursively.
+//
+// Verification: every corpus program must print byte-identical output to
+// the reference `ruby` (see run_corpus.sh).
+//
+//   mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
+//   ./mere-ruby script.rb
+
+// ---- values and syntax trees --------------------------------------------
+type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
+         | TP of str | TNL | TEOF;
+
+// EHsh / VHsh hold interleaved [k1, v1, k2, v2, ...] lists (M0
+// simplification: literal order is preserved, which matches Ruby's
+// insertion-ordered Hash for programs that only build literals).
+type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
+          | ENil | EArr of Expr list | EHsh of Expr list
+          | EBin of str * Expr * Expr | EUn of str * Expr;
+
+type Stmt = SPuts of Expr list | SExpr of Expr;
+
+type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
+         | VNil | VArr of Val list | VHsh of Val list;
+
+// ---- small helpers ------------------------------------------------------
+let rec rev_app = fn xs -> fn acc ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_app t (Cons (h, acc));
+
+let is_digit = fn (c: str) -> let o = ord c in o >= 48 && o <= 57;
+let is_alpha = fn (c: str) ->
+  let o = ord c in (o >= 97 && o <= 122) || (o >= 65 && o <= 90) || o == 95;
+let is_alnum = fn (c: str) -> is_digit c || is_alpha c;
+
+// ---- lexer ---------------------------------------------------------------
+let rec scan_digits = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && is_digit (char_at s i) then scan_digits s (i + 1) else i;
+
+let rec scan_ident = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && is_alnum (char_at s i) then scan_ident s (i + 1) else i;
+
+let rec skip_comment = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i
+  else if str_eq (char_at s i) "\n" then i
+  else skip_comment s (i + 1);
+
+// double-quoted string body: \n \t \\ \" \' decode; an unknown escape
+// drops the backslash (Ruby: "\q" == "q"). Returns (decoded, index after
+// the closing quote).
+let rec lex_dq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then fail "mere-ruby: unterminated string"
+  else
+    let c = char_at s i in
+    if str_eq c "\"" then (acc, i + 1)
+    else if str_eq c "\\" then
+      (if i + 1 >= str_len s then fail "mere-ruby: unterminated string"
+       else
+         let e = char_at s (i + 1) in
+         let piece =
+           if str_eq e "n" then "\n"
+           else if str_eq e "t" then "\t"
+           else e in
+         lex_dq s (i + 2) (acc ++ piece))
+    else lex_dq s (i + 1) (acc ++ c);
+
+// single-quoted string body: only \' and \\ are escapes; anything else
+// after a backslash keeps the backslash (Ruby semantics).
+let rec lex_sq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then fail "mere-ruby: unterminated string"
+  else
+    let c = char_at s i in
+    if str_eq c "'" then (acc, i + 1)
+    else if str_eq c "\\" && i + 1 < str_len s then
+      let e = char_at s (i + 1) in
+      if str_eq e "'" || str_eq e "\\" then lex_sq s (i + 2) (acc ++ e)
+      else lex_sq s (i + 1) (acc ++ c)
+    else lex_sq s (i + 1) (acc ++ c);
+
+let is_punct2 = fn (p: str) ->
+  str_eq p "**" || str_eq p "==" || str_eq p "!=" || str_eq p "<=" ||
+  str_eq p ">=" || str_eq p "&&" || str_eq p "||" || str_eq p "=>";
+
+let is_punct1 = fn (c: str) ->
+  str_eq c "+" || str_eq c "-" || str_eq c "*" || str_eq c "/" ||
+  str_eq c "%" || str_eq c "<" || str_eq c ">" || str_eq c "!" ||
+  str_eq c "(" || str_eq c ")" || str_eq c "[" || str_eq c "]" ||
+  str_eq c "\{" || str_eq c "}" || str_eq c ",";
+
+let rec lex_go = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then Cons (TEOF, Nil)
+  else
+    let c = char_at s i in
+    if str_eq c " " || str_eq c "\t" || str_eq c "\r" then lex_go s (i + 1)
+    else if str_eq c "\n" then Cons (TNL, lex_go s (i + 1))
+    else if str_eq c "#" then lex_go s (skip_comment s i)
+    else if is_digit c then
+      let j = scan_digits s i in
+      if j + 1 < str_len s && str_eq (char_at s j) "."
+         && is_digit (char_at s (j + 1)) then
+        let k = scan_digits s (j + 1) in
+        Cons (TFlt (float_of_str (substring s i k)), lex_go s k)
+      else Cons (TInt (int_of_str (substring s i j)), lex_go s j)
+    else if str_eq c "\"" then
+      let (lit, j) = lex_dq s (i + 1) "" in
+      Cons (TStrL lit, lex_go s j)
+    else if str_eq c "'" then
+      let (lit, j) = lex_sq s (i + 1) "" in
+      Cons (TStrL lit, lex_go s j)
+    else if is_alpha c then
+      let j = scan_ident s i in
+      Cons (TId (substring s i j), lex_go s j)
+    else
+      let two = if i + 2 <= str_len s then substring s i (i + 2) else "" in
+      if is_punct2 two then Cons (TP two, lex_go s (i + 2))
+      else if is_punct1 c then Cons (TP c, lex_go s (i + 1))
+      else fail ("mere-ruby: unexpected character: " ++ c);
+
+// ---- parser (precedence climbing) ---------------------------------------
+// Binary precedence, Ruby's order (subset). 0 = not a binary operator.
+// ** is handled separately (tighter than unary minus on its left, so
+// -2**2 == -(2**2) == -4, and right-associative: 2**3**2 == 512).
+let prec_of = fn (op: str) ->
+  if str_eq op "||" then 1
+  else if str_eq op "&&" then 2
+  else if str_eq op "==" || str_eq op "!=" then 3
+  else if str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=" then 4
+  else if str_eq op "+" || str_eq op "-" then 5
+  else if str_eq op "*" || str_eq op "/" || str_eq op "%" then 6
+  else 0;
+
+let expect = fn toks -> fn (want: str) ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p want then r else fail ("mere-ruby: expected " ++ want ++ ", got " ++ p)
+  | _ -> fail ("mere-ruby: expected " ++ want);
+
+let rec parse_expr = fn toks -> parse_bin toks 1
+
+and parse_bin = fn toks -> fn (minp: int) ->
+  let (lhs, r) = parse_unary toks in
+  parse_more lhs r minp
+
+and parse_more = fn (lhs: Expr) -> fn toks -> fn (minp: int) ->
+  match toks with
+  | Cons (TP op, rest) ->
+    let p = prec_of op in
+    if p > 0 && p >= minp then
+      let (rhs, r2) = parse_bin rest (p + 1) in
+      parse_more (EBin (op, lhs, rhs)) r2 minp
+    else (lhs, toks)
+  | _ -> (lhs, toks)
+
+and parse_unary = fn toks ->
+  match toks with
+  | Cons (TP op, rest) ->
+    if str_eq op "-" then
+      let (e, r) = parse_unary rest in (EUn ("-", e), r)
+    else if str_eq op "!" then
+      let (e, r) = parse_unary rest in (EUn ("!", e), r)
+    else parse_pow toks
+  | _ -> parse_pow toks
+
+and parse_pow = fn toks ->
+  let (b, r) = parse_primary toks in
+  match r with
+  | Cons (TP op, rest) ->
+    if str_eq op "**" then
+      let (e, r2) = parse_unary rest in (EBin ("**", b, e), r2)
+    else (b, r)
+  | _ -> (b, r)
+
+and parse_primary = fn toks ->
+  match toks with
+  | Cons (TInt n, r) -> (EInt n, r)
+  | Cons (TFlt f, r) -> (EFlt f, r)
+  | Cons (TStrL s, r) -> (EStrL s, r)
+  | Cons (TId id, r) ->
+    if str_eq id "true" then (EBool true, r)
+    else if str_eq id "false" then (EBool false, r)
+    else if str_eq id "nil" then (ENil, r)
+    else fail ("mere-ruby: unknown identifier: " ++ id)
+  | Cons (TP p, r) ->
+    if str_eq p "(" then
+      let (e, r2) = parse_expr r in
+      (e, expect r2 ")")
+    else if str_eq p "[" then parse_array r
+    else if str_eq p "\{" then parse_hash r
+    else fail ("mere-ruby: unexpected token: " ++ p)
+  | _ -> fail "mere-ruby: unexpected end of input"
+
+and parse_array = fn toks ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "]" then (EArr Nil, r) else parse_arr_items toks Nil
+  | _ -> parse_arr_items toks Nil
+
+and parse_arr_items = fn toks -> fn (acc: Expr list) ->
+  let (e, r) = parse_expr toks in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_arr_items r2 (Cons (e, acc))
+    else if str_eq p "]" then (EArr (rev_app (Cons (e, acc)) Nil), r2)
+    else fail ("mere-ruby: expected , or ] in array, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated array literal"
+
+and parse_hash = fn toks ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "}" then (EHsh Nil, r) else parse_hash_items toks Nil
+  | _ -> parse_hash_items toks Nil
+
+and parse_hash_items = fn toks -> fn (acc: Expr list) ->
+  let (k, r) = parse_expr toks in
+  let r2 = expect r "=>" in
+  let (v, r3) = parse_expr r2 in
+  match r3 with
+  | Cons (TP p, r4) ->
+    if str_eq p "," then parse_hash_items r4 (Cons (v, Cons (k, acc)))
+    else if str_eq p "}" then (EHsh (rev_app (Cons (v, Cons (k, acc))) Nil), r4)
+    else fail ("mere-ruby: expected , or } in hash, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated hash literal";
+
+// ---- statements ----------------------------------------------------------
+let expect_end = fn toks ->
+  match toks with
+  | Cons (TNL, r) -> r
+  | Cons (TEOF, _) -> toks
+  | _ -> fail "mere-ruby: expected end of statement";
+
+let rec parse_puts_args = fn toks -> fn (acc: Expr list) ->
+  let (e, r) = parse_expr toks in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_puts_args r2 (Cons (e, acc))
+    else (rev_app (Cons (e, acc)) Nil, r)
+  | _ -> (rev_app (Cons (e, acc)) Nil, r);
+
+let rec parse_prog = fn toks -> fn (acc: Stmt list) ->
+  match toks with
+  | Cons (TNL, r) -> parse_prog r acc
+  | Cons (TEOF, _) -> rev_app acc Nil
+  | Cons (TId id, r) ->
+    if str_eq id "puts" then
+      (match r with
+       | Cons (TNL, r2) -> parse_prog r2 (Cons (SPuts Nil, acc))
+       | Cons (TEOF, _) -> rev_app (Cons (SPuts Nil, acc)) Nil
+       | _ ->
+         let (es, r2) = parse_puts_args r Nil in
+         parse_prog (expect_end r2) (Cons (SPuts es, acc)))
+    else
+      let (e, r2) = parse_expr toks in
+      parse_prog (expect_end r2) (Cons (SExpr e, acc))
+  | _ ->
+    let (e, r2) = parse_expr toks in
+    parse_prog (expect_end r2) (Cons (SExpr e, acc));
+
+// ---- evaluator -----------------------------------------------------------
+// Ruby truthiness: only nil and false are falsy. 0 and "" are truthy.
+let truthy = fn (v: Val) ->
+  match v with
+  | VNil -> false
+  | VBool b -> b
+  | _ -> true;
+
+let to_f = fn (v: Val) ->
+  match v with
+  | VInt n -> float_of_int n
+  | VFlt f -> f
+  | _ -> fail "mere-ruby: not a number";
+
+let is_num = fn (v: Val) ->
+  match v with VInt _ -> true | VFlt _ -> true | _ -> false;
+
+let feq = fn (x: float) -> fn (y: float) -> x <= y && y <= x;
+
+// Ruby integer division floors toward negative infinity (-7 / 2 == -4)
+// and modulo takes the sign of the divisor (-7 % 3 == 2). Mere's native
+// / and % truncate toward zero (C semantics), so correct after the fact.
+let floor_div = fn (a: int) -> fn (b: int) ->
+  if b == 0 then fail "mere-ruby: divided by 0"
+  else
+    let q = a / b in
+    let r = a - q * b in
+    if r != 0 && (if r < 0 then b > 0 else b < 0) then q - 1 else q;
+
+let floor_mod = fn (a: int) -> fn (b: int) -> a - (floor_div a b) * b;
+
+let rec pow_int = fn (b: int) -> fn (e: int) ->
+  if e < 0 then fail "mere-ruby: negative integer exponent unsupported in M0"
+  else if e == 0 then 1
+  else b * pow_int b (e - 1);
+
+let rec pow_flt = fn (b: float) -> fn (e: int) ->
+  if e < 0 then 1.0 / pow_flt b (0 - e)
+  else if e == 0 then 1.0
+  else b * pow_flt b (e - 1);
+
+let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
+  match va with
+  | VInt x ->
+    (match vb with
+     | VInt y -> x == y
+     | VFlt y -> feq (float_of_int x) y
+     | _ -> false)
+  | VFlt x ->
+    (match vb with
+     | VInt y -> feq x (float_of_int y)
+     | VFlt y -> feq x y
+     | _ -> false)
+  | VStr x -> (match vb with VStr y -> str_eq x y | _ -> false)
+  | VBool x ->
+    (match vb with
+     | VBool y -> if x then y else (if y then false else true)
+     | _ -> false)
+  | VNil -> (match vb with VNil -> true | _ -> false)
+  | VArr xs -> (match vb with VArr ys -> eq_list xs ys | _ -> false)
+  | VHsh xs -> (match vb with VHsh ys -> eq_list xs ys | _ -> false)
+
+and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> true | _ -> false)
+  | Cons (h, t) ->
+    (match ys with
+     | Nil -> false
+     | Cons (h2, t2) -> rb_eq h h2 && eq_list t t2);
+
+// numeric / string ordering: negative | zero | positive like a compare fn.
+let cmp_vals = fn (va: Val) -> fn (vb: Val) ->
+  if is_num va && is_num vb then
+    (match va with
+     | VInt x ->
+       (match vb with
+        | VInt y -> if x < y then 0 - 1 else if x > y then 1 else 0
+        | _ ->
+          let fx = to_f va in let fy = to_f vb in
+          if fx < fy then 0 - 1 else if fy < fx then 1 else 0)
+     | _ ->
+       let fx = to_f va in let fy = to_f vb in
+       if fx < fy then 0 - 1 else if fy < fx then 1 else 0)
+  else
+    match va with
+    | VStr x ->
+      (match vb with
+       | VStr y -> str_compare x y
+       | _ -> fail "mere-ruby: comparison of incompatible types")
+    | _ -> fail "mere-ruby: comparison of incompatible types";
+
+let rec list_append = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append t ys);
+
+let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
+  if str_eq op "+" then
+    (match va with
+     | VStr x -> (match vb with VStr y -> VStr (x ++ y) | _ -> fail "mere-ruby: no implicit conversion in +")
+     | VArr xs -> (match vb with VArr ys -> VArr (list_append xs ys) | _ -> fail "mere-ruby: no implicit conversion in +")
+     | VInt x -> (match vb with VInt y -> VInt (x + y) | VFlt y -> VFlt (float_of_int x + y) | _ -> fail "mere-ruby: + type error")
+     | VFlt x -> (match vb with VInt y -> VFlt (x + float_of_int y) | VFlt y -> VFlt (x + y) | _ -> fail "mere-ruby: + type error")
+     | _ -> fail "mere-ruby: + type error")
+  else if str_eq op "-" then
+    (match va with
+     | VInt x -> (match vb with VInt y -> VInt (x - y) | VFlt y -> VFlt (float_of_int x - y) | _ -> fail "mere-ruby: - type error")
+     | VFlt x -> (match vb with VInt y -> VFlt (x - float_of_int y) | VFlt y -> VFlt (x - y) | _ -> fail "mere-ruby: - type error")
+     | _ -> fail "mere-ruby: - type error")
+  else if str_eq op "*" then
+    (match va with
+     | VStr x -> (match vb with VInt y -> VStr (str_repeat x y) | _ -> fail "mere-ruby: * type error")
+     | VInt x -> (match vb with VInt y -> VInt (x * y) | VFlt y -> VFlt (float_of_int x * y) | _ -> fail "mere-ruby: * type error")
+     | VFlt x -> (match vb with VInt y -> VFlt (x * float_of_int y) | VFlt y -> VFlt (x * y) | _ -> fail "mere-ruby: * type error")
+     | _ -> fail "mere-ruby: * type error")
+  else if str_eq op "/" then
+    (match va with
+     | VInt x ->
+       (match vb with
+        | VInt y -> VInt (floor_div x y)
+        | VFlt y -> VFlt (float_of_int x / y)
+        | _ -> fail "mere-ruby: / type error")
+     | VFlt x ->
+       (match vb with
+        | VInt y -> VFlt (x / float_of_int y)
+        | VFlt y -> VFlt (x / y)
+        | _ -> fail "mere-ruby: / type error")
+     | _ -> fail "mere-ruby: / type error")
+  else if str_eq op "%" then
+    (match va with
+     | VInt x -> (match vb with VInt y -> VInt (floor_mod x y) | _ -> fail "mere-ruby: % supports integers only in M0")
+     | _ -> fail "mere-ruby: % supports integers only in M0")
+  else if str_eq op "**" then
+    (match va with
+     | VInt x -> (match vb with VInt y -> VInt (pow_int x y) | _ -> fail "mere-ruby: ** float exponent unsupported in M0")
+     | VFlt x -> (match vb with VInt y -> VFlt (pow_flt x y) | _ -> fail "mere-ruby: ** float exponent unsupported in M0")
+     | _ -> fail "mere-ruby: ** type error")
+  else fail ("mere-ruby: unknown operator: " ++ op);
+
+let rec eval_e = fn (e: Expr) ->
+  match e with
+  | EInt n -> VInt n
+  | EFlt f -> VFlt f
+  | EStrL s -> VStr s
+  | EBool b -> VBool b
+  | ENil -> VNil
+  | EArr items -> VArr (eval_list items)
+  | EHsh items -> VHsh (eval_list items)
+  | EUn (op, a) ->
+    if str_eq op "!" then
+      (if truthy (eval_e a) then VBool false else VBool true)
+    else
+      (match eval_e a with
+       | VInt n -> VInt (0 - n)
+       | VFlt f -> VFlt (0.0 - f)
+       | _ -> fail "mere-ruby: unary - on non-number")
+  | EBin (op, a, b) ->
+    if str_eq op "&&" then
+      let va = eval_e a in
+      if truthy va then eval_e b else va
+    else if str_eq op "||" then
+      let va = eval_e a in
+      if truthy va then va else eval_e b
+    else if str_eq op "==" then VBool (rb_eq (eval_e a) (eval_e b))
+    else if str_eq op "!=" then
+      (if rb_eq (eval_e a) (eval_e b) then VBool false else VBool true)
+    else if str_eq op "<" then VBool (cmp_vals (eval_e a) (eval_e b) < 0)
+    else if str_eq op "<=" then VBool (cmp_vals (eval_e a) (eval_e b) <= 0)
+    else if str_eq op ">" then VBool (cmp_vals (eval_e a) (eval_e b) > 0)
+    else if str_eq op ">=" then VBool (cmp_vals (eval_e a) (eval_e b) >= 0)
+    else arith_bin op (eval_e a) (eval_e b)
+
+and eval_list = fn (items: Expr list) ->
+  match items with
+  | Nil -> Nil
+  | Cons (h, t) -> Cons (eval_e h, eval_list t);
+
+// ---- printing (Ruby's to_s / inspect / puts) -----------------------------
+let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
+  else
+    let c = char_at s i in
+    let piece =
+      if str_eq c "\\" then "\\\\"
+      else if str_eq c "\"" then "\\\""
+      else if str_eq c "\n" then "\\n"
+      else if str_eq c "\t" then "\\t"
+      else c in
+    esc_str s (i + 1) (acc ++ piece);
+
+let rec to_s = fn (v: Val) ->
+  match v with
+  | VInt n -> str_of_int n
+  | VFlt f -> str_of_float f
+  | VStr s -> s
+  | VBool b -> if b then "true" else "false"
+  | VNil -> ""
+  | VArr _ -> inspect v
+  | VHsh _ -> inspect v
+
+and inspect = fn (v: Val) ->
+  match v with
+  | VStr s -> "\"" ++ esc_str s 0 "" ++ "\""
+  | VNil -> "nil"
+  | VArr xs -> "[" ++ join_inspect xs "" ++ "]"
+  | VHsh xs -> "\{" ++ join_pairs xs "" ++ "}"
+  | _ -> to_s v
+
+and join_inspect = fn (xs: Val list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) ->
+    let piece = if str_eq acc "" then inspect h else acc ++ ", " ++ inspect h in
+    join_inspect t piece
+
+and join_pairs = fn (xs: Val list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       let pair = inspect k ++ "=>" ++ inspect v in
+       let acc2 = if str_eq acc "" then pair else acc ++ ", " ++ pair in
+       join_pairs t acc2
+     | Nil -> acc);
+
+// puts: arrays flatten recursively (each element on its own line), nil
+// prints an empty line, everything else prints to_s.
+let rec puts_val = fn (v: Val) ->
+  match v with
+  | VArr xs -> puts_arr xs
+  | _ -> print (to_s v)
+
+and puts_arr = fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (h, t) ->
+    let _ = puts_val h in
+    puts_arr t;
+
+// ---- driver ---------------------------------------------------------------
+let rec puts_args = fn (es: Expr list) ->
+  match es with
+  | Nil -> ()
+  | Cons (e, t) ->
+    let _ = puts_val (eval_e e) in
+    puts_args t;
+
+let rec run_stmts = fn (prog: Stmt list) ->
+  match prog with
+  | Nil -> ()
+  | Cons (s, t) ->
+    let _ =
+      (match s with
+       | SPuts es ->
+         (match es with
+          | Nil -> print ""
+          | _ -> puts_args es)
+       | SExpr e -> let _ = eval_e e in ()) in
+    run_stmts t;
+
+let run_cli = fn () ->
+  match args () with
+  | Nil -> let _ = print "usage: mere-ruby <script.rb>" in 2
+  | Cons (path, _) ->
+    let src = read_file path in
+    let toks = lex_go src 0 in
+    let prog = parse_prog toks Nil in
+    let _ = run_stmts prog in
+    0;
+
+exit (run_cli ())
