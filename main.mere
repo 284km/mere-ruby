@@ -1,11 +1,16 @@
-// mere-ruby — a Ruby subset interpreter written in pure Mere. Milestone M0.
+// mere-ruby — a Ruby subset interpreter written in pure Mere. M0 + M1.
 //
-// M0 scope: literals (integer, float, string, true/false/nil, array, hash),
+// M0: literals (integer, float, string, true/false/nil, array, hash),
 // operators with Ruby precedence (** right-assoc, unary - !, * / %, + -,
 // comparisons, == !=, && ||), parentheses, comments, and `puts`.
 // Ruby semantics where they differ from C: floor division and
 // sign-of-divisor modulo, value-returning && / ||, truthiness (only nil
 // and false are falsy — 0 is truthy), puts flattening arrays recursively.
+//
+// M1: local variables (assignment / reassignment; the environment is a
+// Mere Map, whose insertion-ordered semantics match Ruby's), and block
+// control flow: if / elsif / else, unless, while, until, case / when
+// (with multi-value `when a, b`), all with the multi-line ... end form.
 //
 // Verification: every corpus program must print byte-identical output to
 // the reference `ruby` (see run_corpus.sh).
@@ -22,9 +27,18 @@ type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
 // insertion-ordered Hash for programs that only build literals).
 type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ENil | EArr of Expr list | EHsh of Expr list
-          | EBin of str * Expr * Expr | EUn of str * Expr;
+          | EBin of str * Expr * Expr | EUn of str * Expr
+          | EVar of str;
 
-type Stmt = SPuts of Expr list | SExpr of Expr;
+// SIf: clause list ((condition, body) pairs — the if plus each elsif)
+// and the else body (Nil when absent). unless / until desugar to a
+// negated condition at parse time. SCase: subject, when-clauses (each:
+// candidate values, body), else body.
+type Stmt = SPuts of Expr list | SExpr of Expr
+          | SAssign of str * Expr
+          | SIf of (Expr * Stmt list) list * Stmt list
+          | SWhile of Expr * Stmt list
+          | SCase of Expr * (Expr list * Stmt list) list * Stmt list;
 
 type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
          | VNil | VArr of Val list | VHsh of Val list;
@@ -90,7 +104,7 @@ let is_punct1 = fn (c: str) ->
   str_eq c "+" || str_eq c "-" || str_eq c "*" || str_eq c "/" ||
   str_eq c "%" || str_eq c "<" || str_eq c ">" || str_eq c "!" ||
   str_eq c "(" || str_eq c ")" || str_eq c "[" || str_eq c "]" ||
-  str_eq c "\{" || str_eq c "}" || str_eq c ",";
+  str_eq c "\{" || str_eq c "}" || str_eq c "," || str_eq c "=";
 
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
@@ -122,6 +136,18 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       else fail ("mere-ruby: unexpected character: " ++ c);
 
 // ---- parser (precedence climbing) ---------------------------------------
+let is_keyword = fn (id: str) ->
+  str_eq id "puts" || str_eq id "if" || str_eq id "unless" ||
+  str_eq id "elsif" || str_eq id "else" || str_eq id "end" ||
+  str_eq id "while" || str_eq id "until" || str_eq id "case" ||
+  str_eq id "when" || str_eq id "then" || str_eq id "do" ||
+  str_eq id "true" || str_eq id "false" || str_eq id "nil";
+
+// keywords that close (or continue) an enclosing block: statement lists
+// stop before them without consuming.
+let is_block_stop = fn (id: str) ->
+  str_eq id "end" || str_eq id "else" || str_eq id "elsif" || str_eq id "when";
+
 // Binary precedence, Ruby's order (subset). 0 = not a binary operator.
 // ** is handled separately (tighter than unary minus on its left, so
 // -2**2 == -(2**2) == -4, and right-associative: 2**3**2 == 512).
@@ -184,7 +210,8 @@ and parse_primary = fn toks ->
     if str_eq id "true" then (EBool true, r)
     else if str_eq id "false" then (EBool false, r)
     else if str_eq id "nil" then (ENil, r)
-    else fail ("mere-ruby: unknown identifier: " ++ id)
+    else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
+    else (EVar id, r)
   | Cons (TP p, r) ->
     if str_eq p "(" then
       let (e, r2) = parse_expr r in
@@ -233,6 +260,24 @@ let expect_end = fn toks ->
   | Cons (TEOF, _) -> toks
   | _ -> fail "mere-ruby: expected end of statement";
 
+let expect_kw = fn toks -> fn (kw: str) ->
+  match toks with
+  | Cons (TId id, r) ->
+    if str_eq id kw then r
+    else fail ("mere-ruby: expected " ++ kw ++ ", got " ++ id)
+  | _ -> fail ("mere-ruby: expected " ++ kw);
+
+// optional `then` (after if/elsif/when conditions) or `do` (after
+// while/until conditions) before the newline.
+let skip_then = fn toks ->
+  match toks with
+  | Cons (TId id, r) ->
+    if str_eq id "then" || str_eq id "do" then r else toks
+  | _ -> toks;
+
+let rec skip_nls = fn toks ->
+  match toks with Cons (TNL, r) -> skip_nls r | _ -> toks;
+
 let rec parse_puts_args = fn toks -> fn (acc: Expr list) ->
   let (e, r) = parse_expr toks in
   match r with
@@ -241,24 +286,102 @@ let rec parse_puts_args = fn toks -> fn (acc: Expr list) ->
     else (rev_app (Cons (e, acc)) Nil, r)
   | _ -> (rev_app (Cons (e, acc)) Nil, r);
 
-let rec parse_prog = fn toks -> fn (acc: Stmt list) ->
+// parse statements until a block-closing keyword (end / else / elsif /
+// when) or EOF; the closer is left unconsumed for the caller.
+let rec parse_stmts = fn toks -> fn (acc: Stmt list) ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TEOF, _) -> (rev_app acc Nil, t)
+  | Cons (TId id, _) ->
+    if is_block_stop id then (rev_app acc Nil, t)
+    else
+      let (s, r) = parse_stmt t in
+      parse_stmts (expect_end r) (Cons (s, acc))
+  | _ ->
+    let (s, r) = parse_stmt t in
+    parse_stmts (expect_end r) (Cons (s, acc))
+
+and parse_stmt = fn toks ->
   match toks with
-  | Cons (TNL, r) -> parse_prog r acc
-  | Cons (TEOF, _) -> rev_app acc Nil
   | Cons (TId id, r) ->
     if str_eq id "puts" then
       (match r with
-       | Cons (TNL, r2) -> parse_prog r2 (Cons (SPuts Nil, acc))
-       | Cons (TEOF, _) -> rev_app (Cons (SPuts Nil, acc)) Nil
-       | _ ->
-         let (es, r2) = parse_puts_args r Nil in
-         parse_prog (expect_end r2) (Cons (SPuts es, acc)))
+       | Cons (TNL, _) -> (SPuts Nil, r)
+       | Cons (TEOF, _) -> (SPuts Nil, r)
+       | _ -> let (es, r2) = parse_puts_args r Nil in (SPuts es, r2))
+    else if str_eq id "if" then parse_if r false
+    else if str_eq id "unless" then parse_if r true
+    else if str_eq id "while" then parse_while r false
+    else if str_eq id "until" then parse_while r true
+    else if str_eq id "case" then parse_case r
+    else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
     else
-      let (e, r2) = parse_expr toks in
-      parse_prog (expect_end r2) (Cons (SExpr e, acc))
+      // identifier: assignment when followed by `=`, else an expression
+      (match r with
+       | Cons (TP p, r2) ->
+         if str_eq p "=" then
+           let (e, r3) = parse_expr r2 in (SAssign (id, e), r3)
+         else
+           let (e, r4) = parse_expr toks in (SExpr e, r4)
+       | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
   | _ ->
-    let (e, r2) = parse_expr toks in
-    parse_prog (expect_end r2) (Cons (SExpr e, acc));
+    let (e, r) = parse_expr toks in (SExpr e, r)
+
+and parse_if = fn toks -> fn (negate: bool) ->
+  let (cond0, r) = parse_expr toks in
+  let cond = if negate then EUn ("!", cond0) else cond0 in
+  let (body, r2) = parse_stmts (skip_then r) Nil in
+  let (clauses, els, r3) = parse_if_tail r2 in
+  (SIf (Cons ((cond, body), clauses), els), r3)
+
+and parse_if_tail = fn toks ->
+  match toks with
+  | Cons (TId id, r) ->
+    if str_eq id "end" then (Nil, Nil, r)
+    else if str_eq id "else" then
+      let (b, r2) = parse_stmts r Nil in
+      (Nil, b, expect_kw r2 "end")
+    else if str_eq id "elsif" then
+      let (c, r2) = parse_expr r in
+      let (b, r3) = parse_stmts (skip_then r2) Nil in
+      let (clauses, els, r4) = parse_if_tail r3 in
+      (Cons ((c, b), clauses), els, r4)
+    else fail ("mere-ruby: expected elsif/else/end, got " ++ id)
+  | _ -> fail "mere-ruby: unterminated if"
+
+and parse_while = fn toks -> fn (negate: bool) ->
+  let (cond0, r) = parse_expr toks in
+  let cond = if negate then EUn ("!", cond0) else cond0 in
+  let (body, r2) = parse_stmts (skip_then r) Nil in
+  (SWhile (cond, body), expect_kw r2 "end")
+
+and parse_case = fn toks ->
+  let (subj, r) = parse_expr toks in
+  parse_whens subj r Nil
+
+and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TId id, r) ->
+    if str_eq id "when" then
+      let (vs, r2) = parse_when_vals r Nil in
+      let (b, r3) = parse_stmts (skip_then r2) Nil in
+      parse_whens subj r3 (Cons ((vs, b), acc))
+    else if str_eq id "else" then
+      let (b, r2) = parse_stmts r Nil in
+      (SCase (subj, rev_app acc Nil, b), expect_kw r2 "end")
+    else if str_eq id "end" then
+      (SCase (subj, rev_app acc Nil, Nil), r)
+    else fail ("mere-ruby: expected when/else/end in case, got " ++ id)
+  | _ -> fail "mere-ruby: unterminated case"
+
+and parse_when_vals = fn toks -> fn (acc: Expr list) ->
+  let (e, r) = parse_expr toks in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_when_vals r2 (Cons (e, acc))
+    else (rev_app (Cons (e, acc)) Nil, r)
+  | _ -> (rev_app (Cons (e, acc)) Nil, r);
 
 // ---- evaluator -----------------------------------------------------------
 // Ruby truthiness: only nil and false are falsy. 0 and "" are truthy.
@@ -397,43 +520,48 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | _ -> fail "mere-ruby: ** type error")
   else fail ("mere-ruby: unknown operator: " ++ op);
 
-let rec eval_e = fn (e: Expr) ->
+// env is a Mere Map from variable name (str) to Val. The Map is mutable,
+// so assignment is map_set and the same map threads everywhere.
+let rec eval_e = fn env -> fn (e: Expr) ->
   match e with
   | EInt n -> VInt n
   | EFlt f -> VFlt f
   | EStrL s -> VStr s
   | EBool b -> VBool b
   | ENil -> VNil
-  | EArr items -> VArr (eval_list items)
-  | EHsh items -> VHsh (eval_list items)
+  | EVar name ->
+    if map_has env name then map_get env name
+    else fail ("mere-ruby: undefined local variable or method '" ++ name ++ "'")
+  | EArr items -> VArr (eval_list env items)
+  | EHsh items -> VHsh (eval_list env items)
   | EUn (op, a) ->
     if str_eq op "!" then
-      (if truthy (eval_e a) then VBool false else VBool true)
+      (if truthy (eval_e env a) then VBool false else VBool true)
     else
-      (match eval_e a with
+      (match eval_e env a with
        | VInt n -> VInt (0 - n)
        | VFlt f -> VFlt (0.0 - f)
        | _ -> fail "mere-ruby: unary - on non-number")
   | EBin (op, a, b) ->
     if str_eq op "&&" then
-      let va = eval_e a in
-      if truthy va then eval_e b else va
+      let va = eval_e env a in
+      if truthy va then eval_e env b else va
     else if str_eq op "||" then
-      let va = eval_e a in
-      if truthy va then va else eval_e b
-    else if str_eq op "==" then VBool (rb_eq (eval_e a) (eval_e b))
+      let va = eval_e env a in
+      if truthy va then va else eval_e env b
+    else if str_eq op "==" then VBool (rb_eq (eval_e env a) (eval_e env b))
     else if str_eq op "!=" then
-      (if rb_eq (eval_e a) (eval_e b) then VBool false else VBool true)
-    else if str_eq op "<" then VBool (cmp_vals (eval_e a) (eval_e b) < 0)
-    else if str_eq op "<=" then VBool (cmp_vals (eval_e a) (eval_e b) <= 0)
-    else if str_eq op ">" then VBool (cmp_vals (eval_e a) (eval_e b) > 0)
-    else if str_eq op ">=" then VBool (cmp_vals (eval_e a) (eval_e b) >= 0)
-    else arith_bin op (eval_e a) (eval_e b)
+      (if rb_eq (eval_e env a) (eval_e env b) then VBool false else VBool true)
+    else if str_eq op "<" then VBool (cmp_vals (eval_e env a) (eval_e env b) < 0)
+    else if str_eq op "<=" then VBool (cmp_vals (eval_e env a) (eval_e env b) <= 0)
+    else if str_eq op ">" then VBool (cmp_vals (eval_e env a) (eval_e env b) > 0)
+    else if str_eq op ">=" then VBool (cmp_vals (eval_e env a) (eval_e env b) >= 0)
+    else arith_bin op (eval_e env a) (eval_e env b)
 
-and eval_list = fn (items: Expr list) ->
+and eval_list = fn env -> fn (items: Expr list) ->
   match items with
   | Nil -> Nil
-  | Cons (h, t) -> Cons (eval_e h, eval_list t);
+  | Cons (h, t) -> Cons (eval_e env h, eval_list env t);
 
 // ---- printing (Ruby's to_s / inspect / puts) -----------------------------
 let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
@@ -499,25 +627,61 @@ and puts_arr = fn (xs: Val list) ->
     puts_arr t;
 
 // ---- driver ---------------------------------------------------------------
-let rec puts_args = fn (es: Expr list) ->
+let rec puts_args = fn env -> fn (es: Expr list) ->
   match es with
   | Nil -> ()
   | Cons (e, t) ->
-    let _ = puts_val (eval_e e) in
-    puts_args t;
+    let _ = puts_val (eval_e env e) in
+    puts_args env t;
 
-let rec run_stmts = fn (prog: Stmt list) ->
+let rec run_stmts = fn env -> fn (prog: Stmt list) ->
   match prog with
   | Nil -> ()
   | Cons (s, t) ->
-    let _ =
-      (match s with
-       | SPuts es ->
-         (match es with
-          | Nil -> print ""
-          | _ -> puts_args es)
-       | SExpr e -> let _ = eval_e e in ()) in
-    run_stmts t;
+    let _ = exec_stmt env s in
+    run_stmts env t
+
+and exec_stmt = fn env -> fn (s: Stmt) ->
+  match s with
+  | SPuts es ->
+    (match es with
+     | Nil -> print ""
+     | _ -> puts_args env es)
+  | SExpr e -> let _ = eval_e env e in ()
+  | SAssign (name, e) ->
+    let _ = map_set env name (eval_e env e) in ()
+  | SIf (clauses, els) -> run_if env clauses els
+  | SWhile (cond, body) -> run_while env cond body
+  | SCase (subj, whens, els) -> run_case env (eval_e env subj) whens els
+
+and run_if = fn env -> fn clauses -> fn (els: Stmt list) ->
+  match clauses with
+  | Nil -> run_stmts env els
+  | Cons (cl, rest) ->
+    let (c, b) = cl in
+    if truthy (eval_e env c) then run_stmts env b
+    else run_if env rest els
+
+and run_while = fn env -> fn (cond: Expr) -> fn (body: Stmt list) ->
+  if truthy (eval_e env cond) then
+    let _ = run_stmts env body in
+    run_while env cond body
+  else ()
+
+// Ruby's `when` uses ===; for the value classes in this subset that is
+// plain equality.
+and run_case = fn env -> fn (v: Val) -> fn whens -> fn (els: Stmt list) ->
+  match whens with
+  | Nil -> run_stmts env els
+  | Cons (w, rest) ->
+    let (vs, b) = w in
+    if when_matches env v vs then run_stmts env b
+    else run_case env v rest els
+
+and when_matches = fn env -> fn (v: Val) -> fn (vs: Expr list) ->
+  match vs with
+  | Nil -> false
+  | Cons (e, t) -> rb_eq (eval_e env e) v || when_matches env v t;
 
 let run_cli = fn () ->
   match args () with
@@ -525,8 +689,13 @@ let run_cli = fn () ->
   | Cons (path, _) ->
     let src = read_file path in
     let toks = lex_go src 0 in
-    let prog = parse_prog toks Nil in
-    let _ = run_stmts prog in
+    let (prog, rest) = parse_stmts toks Nil in
+    let _ =
+      (match rest with
+       | Cons (TEOF, _) -> ()
+       | _ -> fail "mere-ruby: unexpected token at top level") in
+    let env = map_new () in
+    let _ = run_stmts env prog in
     0;
 
 exit (run_cli ())

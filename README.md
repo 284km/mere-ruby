@@ -1,9 +1,10 @@
 # mere-ruby
 
 A Ruby subset interpreter written in [Mere](https://merelang.org/), in
-pure Mere. Milestone **M0**: literals, operators with Ruby precedence,
-and `puts` — every corpus program prints byte-identical output to the
-reference `ruby`.
+pure Mere. Milestones **M0 + M1**: literals, operators with Ruby
+precedence, variables, control flow, and `puts` — every corpus program
+(FizzBuzz included) prints byte-identical output to the reference
+`ruby`.
 
 ```sh
 mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
@@ -32,6 +33,23 @@ mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
   separate lines, `nil` prints an empty line, bare `puts` prints an
   empty line, multiple comma-separated arguments.
 - Comments, blank lines, expression statements.
+
+## What M1 adds
+
+- **Local variables**: assignment and reassignment (`x = x + 1`), read
+  anywhere an expression is allowed. The environment is a Mere `Map` —
+  whose insertion-ordered semantics happen to match Ruby's hashes, a
+  design coincidence this project leans on.
+- **Control flow** in the multi-line `... end` form:
+  - `if / elsif / else / end`, `unless` (desugared to a negated `if`)
+  - `while` and `until` (desugared to a negated `while`), with optional
+    `do`
+  - `case / when / else / end`, including multi-value `when a, b`
+    (Ruby's `===` is plain equality for the value classes in this
+    subset)
+  - optional `then` after conditions, nested blocks
+- Enough for real small programs: the corpus closes with FizzBuzz and a
+  float-accumulation loop, both byte-identical to `ruby`.
 
 ## Verification
 
