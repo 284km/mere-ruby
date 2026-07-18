@@ -62,6 +62,7 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // params, body.
           | SDef of str * str list * (str * Expr) list * Stmt list
           | SReturn of Expr
+          | SBreak of Expr | SNext of Expr
           | SClass of str * str * Stmt list
           | SIVarAssign of str * Expr
           | SAttr of str * str list
@@ -103,7 +104,10 @@ type Meth = Meth of str list * (str * Expr) list * Stmt list;
 // FRaise signals that a Ruby exception unwound to a begin/rescue (the
 // exception value itself is stashed in the world's ivars under "$exc",
 // since raise unwinds via Mere's `fail` and try_or yields only a default).
-type Flow = FNext of Val | FReturn of Val | FRaise of Val;
+// FBreak / FLoopNext are loop control (break / next), caught by the
+// enclosing while loop; FReturn / FRaise propagate to the method / rescue.
+type Flow = FNext of Val | FReturn of Val | FRaise of Val
+          | FBreak of Val | FLoopNext of Val;
 
 // ---- mutable-array store (M10) ------------------------------------------
 // A single top-level Map captured by every function below (no threading):
@@ -337,7 +341,7 @@ let is_keyword = fn (id: str) ->
   str_eq id "def" || str_eq id "return" || str_eq id "class" ||
   str_eq id "self" || str_eq id "yield" ||
   str_eq id "begin" || str_eq id "rescue" || str_eq id "ensure" ||
-  str_eq id "raise" ||
+  str_eq id "raise" || str_eq id "break" || str_eq id "next" ||
   str_eq id "true" || str_eq id "false" || str_eq id "nil";
 
 // a capitalized bare identifier is a constant (a class reference here).
@@ -352,6 +356,12 @@ let is_ivar = fn (id: str) -> str_len id > 0 && str_eq (char_at id 0) "@";
 let is_block_stop = fn (id: str) ->
   str_eq id "end" || str_eq id "else" || str_eq id "elsif" || str_eq id "when" ||
   str_eq id "rescue" || str_eq id "ensure";
+
+// keywords that end an optional value (for break/next/return): block
+// closers plus trailing statement modifiers (`next if c`, `break unless c`).
+let stops_value = fn (id: str) ->
+  is_block_stop id || str_eq id "if" || str_eq id "unless" ||
+  str_eq id "while" || str_eq id "until";
 
 // Binary precedence, Ruby's order (subset). 0 = not a binary operator.
 // ** is handled separately (tighter than unary minus on its left, so
@@ -761,6 +771,18 @@ and parse_stmt = fn toks ->
          (match es with
           | Cons (e, Nil) -> (SReturn e, r2)
           | _ -> (SReturn (EArr es), r2)))
+    else if str_eq id "break" then
+      (match r with
+       | Cons (TNL, _) -> (SBreak ENil, r)
+       | Cons (TEOF, _) -> (SBreak ENil, r)
+       | Cons (TId k, _) -> if stops_value k then (SBreak ENil, r) else let (e, r2) = parse_expr r in (SBreak e, r2)
+       | _ -> let (e, r2) = parse_expr r in (SBreak e, r2))
+    else if str_eq id "next" then
+      (match r with
+       | Cons (TNL, _) -> (SNext ENil, r)
+       | Cons (TEOF, _) -> (SNext ENil, r)
+       | Cons (TId k, _) -> if stops_value k then (SNext ENil, r) else let (e, r2) = parse_expr r in (SNext e, r2)
+       | _ -> let (e, r2) = parse_expr r in (SNext e, r2))
     else if is_ivar id then
       // @name = expr, else an expression (@name read, or a method chain)
       (match r with
@@ -1560,7 +1582,7 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let (has, params, body, cenv) = theblk in
   let _ = bind_block_params cenv params argvals in
-  (match run_stmts cenv world encl body with FNext v -> v | FReturn v -> v | FRaise v -> v)
+  (match run_stmts cenv world encl body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
 and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
@@ -1823,7 +1845,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
    | Meth (params, defaults, body) ->
      let frame = map_new () in
      let _ = bind_params frame world blk name params defaults args in
-     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v))
+     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
@@ -1847,7 +1869,7 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
     let frame = map_new () in
     let _ = map_set frame "self" recv in
     let _ = bind_params frame world blk name params defaults args in
-    (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v)
+    (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
 
 // allocate an object, then run initialize if the class defines one.
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
@@ -1963,6 +1985,8 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
        (match exec_stmt env world blk s with
         | FReturn v -> FReturn v
         | FRaise v -> FRaise v
+        | FBreak v -> FBreak v
+        | FLoopNext v -> FLoopNext v
         | FNext _ -> run_stmts env world blk rest))
 
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
@@ -1996,6 +2020,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = register_class world name body in FNext VNil
   | SAttr (_, _) -> FNext VNil
   | SReturn e -> FReturn (eval_e env world blk e)
+  | SBreak e -> FBreak (eval_e env world blk e)
+  | SNext e -> FLoopNext (eval_e env world blk e)
   | SBegin (body, rescues, els, ens) ->
     let (meths, sup, ocls, ivars) = world in
     let caught = FRaise VNil in
@@ -2010,6 +2036,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          let _ = map_delete ivars "$exc" in
          run_rescues env world blk exc rescues
        | FReturn v -> FReturn v
+       | FBreak v -> FBreak v
+       | FLoopNext v -> FLoopNext v
        | FNext v -> (match els with Nil -> FNext v | _ -> run_stmts env world blk els))) caught in
     // ensure always runs.
     let _ = (match ens with Nil -> FNext VNil | _ -> run_stmts env world blk ens) in
@@ -2045,6 +2073,8 @@ and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stm
     (match run_stmts env world blk body with
      | FReturn v -> FReturn v
      | FRaise v -> FRaise v
+     | FBreak v -> FNext v          // break exits the loop with its value
+     | FLoopNext _ -> run_while env world blk cond body   // next: skip to next iteration
      | FNext _ -> run_while env world blk cond body)
   else FNext VNil
 
