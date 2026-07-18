@@ -162,6 +162,20 @@ let rec strip_us = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
   if i >= str_len s then acc
   else let c = char_at s i in strip_us s (i + 1) (if str_eq c "_" then acc else acc ++ c);
 
+// ---- string interpolation helpers (M11) ---------------------------------
+let rec tapp = fn (a: Tok list) -> fn (b: Tok list) ->
+  match a with Nil -> b | Cons (h, t) -> Cons (h, tapp t b);
+let rec drop_eof = fn (ts: Tok list) ->
+  match ts with Nil -> Nil | Cons (TEOF, _) -> Nil | Cons (h, t) -> Cons (h, drop_eof t);
+// find the `}` matching a `#{` (i points just after `#{`), counting nesting.
+let rec find_close_brace = fn (s: str) -> fn (i: int) -> fn (depth: int) ->
+  if i >= str_len s then i
+  else
+    let c = char_at s i in
+    if str_eq c "\{" then find_close_brace s (i + 1) (depth + 1)
+    else if str_eq c "}" then (if depth == 0 then i else find_close_brace s (i + 1) (depth - 1))
+    else find_close_brace s (i + 1) depth;
+
 // double-quoted string body: \n \t \\ \" \' decode; an unknown escape
 // drops the backslash (Ruby: "\q" == "q"). Returns (decoded, index after
 // the closing quote).
@@ -211,7 +225,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
   else
     let c = char_at s i in
     if str_eq c " " || str_eq c "\t" || str_eq c "\r" then lex_go s (i + 1)
-    else if str_eq c "\n" then Cons (TNL, lex_go s (i + 1))
+    else if str_eq c "\n" || str_eq c ";" then Cons (TNL, lex_go s (i + 1))
     else if str_eq c "#" then lex_go s (skip_comment s i)
     else if is_digit c then
       // 0x / 0o / 0b prefixed integers.
@@ -241,8 +255,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
         Cons (TStrL ch, lex_go s (i + 3))
       else Cons (TStrL n, lex_go s (i + 2))
     else if str_eq c "\"" then
-      let (lit, j) = lex_dq s (i + 1) "" in
-      Cons (TStrL lit, lex_go s j)
+      // double-quoted strings support #{expr} interpolation, desugared to a
+      // parenthesized concat: `("" + "a" + (expr).to_s + "c")`.
+      let (segs, j) = lex_dstr s (i + 1) "" in
+      tapp (Cons (TP "(", Cons (TStrL "", segs))) (Cons (TP ")", lex_go s j))
     else if str_eq c "'" then
       let (lit, j) = lex_sq s (i + 1) "" in
       Cons (TStrL lit, lex_go s j)
@@ -273,7 +289,29 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
         let two = if i + 2 <= str_len s then substring s i (i + 2) else "" in
         if is_punct2 two then Cons (TP two, lex_go s (i + 2))
         else if is_punct1 c then Cons (TP c, lex_go s (i + 1))
-        else fail ("mere-ruby: unexpected character: " ++ c);
+        else fail ("mere-ruby: unexpected character: " ++ c)
+
+// scan a double-quoted string body from i, returning the token segments
+// (each prefixed with `+`) and the index after the closing quote. A
+// literal run becomes `+ "run"`; a #{expr} becomes `+ ( <expr> ) . to_s`.
+and lex_dstr = fn (s: str) -> fn (i: int) -> fn (lit: str) ->
+  if i >= str_len s then fail "mere-ruby: unterminated string"
+  else
+    let c = char_at s i in
+    if str_eq c "\"" then (Cons (TP "+", Cons (TStrL lit, Nil)), i + 1)
+    else if str_eq c "\\" && i + 1 < str_len s then
+      let e = char_at s (i + 1) in
+      let piece = if str_eq e "n" then "\n" else if str_eq e "t" then "\t" else e in
+      lex_dstr s (i + 2) (lit ++ piece)
+    else if str_eq c "#" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\{" then
+      let close = find_close_brace s (i + 2) 0 in
+      let exprtoks = drop_eof (lex_go (substring s (i + 2) close) 0) in
+      let interp =
+        Cons (TP "+", Cons (TP "(",
+          tapp exprtoks (Cons (TP ")", Cons (TP ".", Cons (TId "to_s", Nil)))))) in
+      let (rest, j) = lex_dstr s (close + 1) "" in
+      (Cons (TP "+", Cons (TStrL lit, tapp interp rest)), j)
+    else lex_dstr s (i + 1) (lit ++ c);
 
 // ---- parser (precedence climbing) ---------------------------------------
 let is_keyword = fn (id: str) ->
@@ -325,6 +363,12 @@ let expect_end = fn toks ->
   match toks with
   | Cons (TNL, r) -> r
   | Cons (TEOF, _) -> toks
+  // a statement may also be terminated by a block-closing keyword on the
+  // same line (e.g. `def m() 1 end`), left unconsumed for the caller.
+  | Cons (TId id, _) ->
+    if str_eq id "end" || str_eq id "else" || str_eq id "elsif" || str_eq id "when" ||
+       str_eq id "rescue" || str_eq id "ensure"
+    then toks else fail "mere-ruby: expected end of statement"
   | _ -> fail "mere-ruby: expected end of statement";
 
 let expect_kw = fn toks -> fn (kw: str) ->
@@ -1245,6 +1289,7 @@ let rec val_join = fn (xs: Val list) -> fn (sep: str) -> fn (acc: str) -> fn (fi
 // the counterpoint to method scope: methods are flat, blocks capture.
 let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   match e with
+  | ESplat inner -> eval_e env world blk inner   // bare splat: evaluate inner
   | EInt n -> VInt n
   | EFlt f -> VFlt f
   | EStrL s -> VStr s
@@ -1719,7 +1764,8 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
 
 and class_name = fn (recv: Val) ->
   match recv with
-  | VInt _ -> "Integer" | VFlt _ -> "Float" | VStr _ -> "String" | VBool _ -> "Boolean"
+  | VInt _ -> "Integer" | VFlt _ -> "Float" | VStr _ -> "String"
+  | VBool b -> if b then "TrueClass" else "FalseClass"
   | VNil -> "NilClass" | VArr _ -> "Array" | VHsh _ -> "Hash" | VSym _ -> "Symbol"
   | VRange _ -> "Range" | VClass _ -> "Class" | VObj _ -> "Object"
   | VExc (c, _) -> c | VMain -> "Object"
@@ -1996,36 +2042,54 @@ and puts_each = fn world -> fn (xs: Val list) ->
   | Nil -> ()
   | Cons (h, t) -> let _ = puts_one world h in puts_each world t;
 
+// run a program; when print_result is true, print the last statement's
+// value with no trailing newline (bootstraptest's `print(begin; ...; end)`
+// model, used by the --eval-print harness mode).
+let run_prog = fn (path: str) -> fn (print_result: bool) ->
+  let src = read_file path in
+  let toks = lex_go src 0 in
+  let (prog, rest) = parse_stmts toks Nil in
+  let _ =
+    (match rest with
+     | Cons (TEOF, _) -> ()
+     | _ -> fail "mere-ruby: unexpected token at top level") in
+  let env = map_new () in
+  let meths = map_new () in
+  let sup = map_new () in
+  let ocls = map_new () in
+  let ivars = map_new () in
+  let _ = map_set sup "StandardError" "Exception" in
+  let _ = map_set sup "RuntimeError" "StandardError" in
+  let _ = map_set sup "ArgumentError" "StandardError" in
+  let _ = map_set sup "TypeError" "StandardError" in
+  let _ = map_set sup "RangeError" "StandardError" in
+  let _ = map_set sup "IndexError" "StandardError" in
+  let _ = map_set sup "KeyError" "StandardError" in
+  let _ = map_set sup "ZeroDivisionError" "StandardError" in
+  let _ = map_set sup "NotImplementedError" "StandardError" in
+  let world = (meths, sup, ocls, ivars) in
+  let _ = map_set env "self" VMain in   // top-level self is `main`
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let final = run_stmts env world noblk prog in
+  if print_result then
+    (match final with
+     | FNext (VObj id) ->
+       let cls = map_get ocls (str_of_int id) in
+       if has_meth world cls "to_s" then
+         (match invoke world noblk (VObj id) cls "to_s" Nil with VStr s -> print_no_nl s | other -> print_no_nl (to_s other))
+       else print_no_nl (to_s (VObj id))
+     | FNext v -> print_no_nl (to_s v)
+     | _ -> ())
+  else ();
+
 let run_cli = fn () ->
   match args () with
   | Nil -> let _ = print "usage: mere-ruby <script.rb>" in 2
-  | Cons (path, _) ->
-    let src = read_file path in
-    let toks = lex_go src 0 in
-    let (prog, rest) = parse_stmts toks Nil in
-    let _ =
+  | Cons (a0, rest) ->
+    if str_eq a0 "--eval-print" then
       (match rest with
-       | Cons (TEOF, _) -> ()
-       | _ -> fail "mere-ruby: unexpected token at top level") in
-    let env = map_new () in
-    let meths = map_new () in
-    let sup = map_new () in
-    let ocls = map_new () in
-    let ivars = map_new () in
-    // built-in exception hierarchy (user `class E < StandardError` extends it).
-    let _ = map_set sup "StandardError" "Exception" in
-    let _ = map_set sup "RuntimeError" "StandardError" in
-    let _ = map_set sup "ArgumentError" "StandardError" in
-    let _ = map_set sup "TypeError" "StandardError" in
-    let _ = map_set sup "RangeError" "StandardError" in
-    let _ = map_set sup "IndexError" "StandardError" in
-    let _ = map_set sup "KeyError" "StandardError" in
-    let _ = map_set sup "ZeroDivisionError" "StandardError" in
-    let _ = map_set sup "NotImplementedError" "StandardError" in
-    let world = (meths, sup, ocls, ivars) in
-    let _ = map_set env "self" VMain in   // top-level self is `main`
-    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    let _ = run_stmts env world noblk prog in
-    0;
+       | Cons (path, _) -> let _ = run_prog path true in 0
+       | Nil -> let _ = print "usage: mere-ruby --eval-print <script.rb>" in 2)
+    else let _ = run_prog a0 false in 0;
 
 exit (run_cli ())
