@@ -43,7 +43,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ECallB of str * Expr list * str list * Stmt list
           | EMethodB of Expr * str * Expr list * str list * Stmt list
           // M6 exceptions:
-          | ERaise of Expr list;                 // raise [Class][, msg]
+          | ERaise of Expr list                  // raise [Class][, msg]
+          // M9: a splat argument `*expr` at a call site (expands an array).
+          | ESplat of Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -549,7 +551,13 @@ and parse_call_args = fn toks ->
   | _ -> parse_call_items toks Nil
 
 and parse_call_items = fn toks -> fn (acc: Expr list) ->
-  let (e, r) = parse_expr toks in
+  // a `*expr` argument is a splat (expanded at eval time).
+  let (e, r) =
+    (match toks with
+     | Cons (TP star, r0) ->
+       if str_eq star "*" then let (inner, r1) = parse_expr r0 in (ESplat inner, r1)
+       else parse_expr toks
+     | _ -> parse_expr toks) in
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then parse_call_items r2 (Cons (e, acc))
@@ -866,15 +874,22 @@ and parse_params = fn toks -> fn (acc: str list) ->
   match toks with
   | Cons (TP p, r) ->
     if str_eq p ")" then (rev_app acc Nil, r)
+    else if str_eq p "*" then
+      // splat parameter *name (or bare *)
+      (match r with
+       | Cons (TId name, r2) -> parse_params_after ("*" ++ name) r2 acc
+       | _ -> parse_params_after "*" r acc)
     else fail ("mere-ruby: expected parameter name, got " ++ p)
-  | Cons (TId name, r) ->
-    (match r with
-     | Cons (TP p, r2) ->
-       if str_eq p "," then parse_params r2 (Cons (name, acc))
-       else if str_eq p ")" then (rev_app (Cons (name, acc)) Nil, r2)
-       else fail ("mere-ruby: expected , or ) in parameters, got " ++ p)
-     | _ -> fail "mere-ruby: unterminated parameter list")
-  | _ -> fail "mere-ruby: expected parameter name";
+  | Cons (TId name, r) -> parse_params_after name r acc
+  | _ -> fail "mere-ruby: expected parameter name"
+
+and parse_params_after = fn (name: str) -> fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "," then parse_params r (Cons (name, acc))
+    else if str_eq p ")" then (rev_app (Cons (name, acc)) Nil, r)
+    else fail ("mere-ruby: expected , or ) in parameters, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated parameter list";
 
 // ---- evaluator -----------------------------------------------------------
 // Ruby truthiness: only nil and false are falsy. 0 and "" are truthy.
@@ -1318,6 +1333,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
   | Nil -> Nil
+  // splat argument: expand an array's elements into the argument list.
+  | Cons (ESplat e, t) ->
+    let spread = (match eval_e env world blk e with VArr xs -> xs | v -> Cons (v, Nil)) in
+    list_append spread (eval_args env world blk t)
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
 // ---- multiple assignment ------------------------------------------------
@@ -1711,6 +1730,24 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
   else obj
 
 and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (args: Val list) ->
+  if has_splat params then
+    // *rest collects the middle; fixed params before/after bind positionally.
+    let before = take_until_splat params in
+    let after = after_splat params in
+    let sname = splat_name params in
+    let nb = list_str_len before in
+    let na = list_str_len after in
+    let nv = vlen args in
+    let sc = nv - nb - na in
+    let sc = if sc < 0 then 0 else sc in
+    let _ = bind_seq frame before (vtake args nb) in
+    let _ = map_set frame sname (VArr (vtake (vdrop args nb) sc)) in
+    let _ = bind_seq frame after (vdrop args (nb + sc)) in
+    ()
+  else bind_strict frame name params args
+
+// fixed-arity binding (exact count required, as before).
+and bind_strict = fn frame -> fn (name: str) -> fn (params: str list) -> fn (args: Val list) ->
   match params with
   | Nil ->
     (match args with
@@ -1719,7 +1756,17 @@ and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (arg
   | Cons (p, ps) ->
     (match args with
      | Nil -> fail ("mere-ruby: wrong number of arguments calling " ++ name)
-     | Cons (a, rest_a) -> let _ = map_set frame p a in bind_params frame name ps rest_a)
+     | Cons (a, rest_a) -> let _ = map_set frame p a in bind_strict frame name ps rest_a)
+
+// positional binding without an arity check (used for the fixed params
+// around a splat); missing args bind nil.
+and bind_seq = fn frame -> fn (params: str list) -> fn (args: Val list) ->
+  match params with
+  | Nil -> ()
+  | Cons (p, ps) ->
+    (match args with
+     | Nil -> let _ = map_set frame p VNil in bind_seq frame ps Nil
+     | Cons (a, r) -> let _ = map_set frame p a in bind_seq frame ps r)
 
 // register a class body: instance methods and attr_* accessors.
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
