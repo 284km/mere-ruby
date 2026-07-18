@@ -515,9 +515,8 @@ and parse_block = fn toks ->
   | Cons (TP brace, r) ->
     if str_eq brace "\{" then
       let (bp, r2) = parse_block_params r in
-      let (s0, r3) = parse_stmt (skip_nls r2) in
-      let (s, r4) = apply_modifier s0 r3 in
-      (bp, Cons (s, Nil), expect (skip_nls r4) "}")
+      let (body, r3) = parse_brace_stmts r2 Nil in
+      (bp, body, r3)
     else fail "mere-ruby: expected block"
   | Cons (TId d, r) ->
     if str_eq d "do" then
@@ -526,6 +525,19 @@ and parse_block = fn toks ->
       (bp, body, expect_kw r3 "end")
     else fail "mere-ruby: expected block"
   | _ -> fail "mere-ruby: expected block"
+
+// statements inside a `{ ... }` block, terminated by `}` (consumed).
+and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TP p, r) ->
+    if str_eq p "}" then (rev_app acc Nil, r)
+    else let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
+         parse_brace_stmts r1 (Cons (s, acc))
+  | Cons (TEOF, _) -> fail "mere-ruby: unterminated block"
+  | _ ->
+    let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
+    parse_brace_stmts r1 (Cons (s, acc))
 
 and parse_block_params = fn toks ->
   let t = skip_nls toks in
@@ -1361,7 +1373,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    if has then run_block world noblk blk args
+    if has then flow_value (run_block world noblk blk args)
     else fail "mere-ruby: no block given (yield)"
   | ERaise arges ->
     let (meths, sup, ocls, ivars) = world in
@@ -1575,14 +1587,18 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
   let _ = map_set ivars "$exc" (VExc (cls, msg)) in
   fail "mere-ruby: (built-in exception raised)"
 
-// run `theblk` with the given argument values. Its params bind into its
-// own captured env (so it sees and mutates the enclosing locals). The body
-// runs with `encl` as the active block, so a `yield` inside the block
-// reaches the enclosing method's block. Returns the block's value.
+// run `theblk` and return the resulting Flow, so break/next inside the
+// block reach the iterating method. Its params bind into its own captured
+// env (so it sees and mutates the enclosing locals); the body runs with
+// `encl` as the active block so a yield inside it reaches the enclosing
+// method's block.
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let (has, params, body, cenv) = theblk in
   let _ = bind_block_params cenv params argvals in
-  (match run_stmts cenv world encl body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
+  run_stmts cenv world encl body
+
+and flow_value = fn (f: Flow) ->
+  match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
 and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
@@ -1597,107 +1613,130 @@ and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals: Val lis
 // enclosing method's block (threaded so a yield inside the iterated block
 // reaches it); `theblk` is the block being iterated.
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  // each iterator returns a Flow: FBreak v (a `break v` fired — that value
+  // becomes the whole call's result) or FNext <natural result>.
   match recv with
   | VArr id -> let xs = deref id in
-    if str_eq name "each" then let _ = arr_each world encl theblk xs in recv
-    else if str_eq name "map" then arr_new (arr_map world encl theblk xs)
-    else if str_eq name "select" then arr_new (arr_select world encl theblk xs)
-    else if str_eq name "reject" then arr_new (arr_reject world encl theblk xs)
-    else if str_eq name "each_with_index" then let _ = arr_each_idx world encl theblk xs 0 in recv
+    if str_eq name "each" then iter_result (arr_each world encl theblk xs) recv
+    else if str_eq name "map" then iter_result (arr_map world encl theblk xs Nil) recv
+    else if str_eq name "select" then iter_result (arr_filter world encl theblk xs Nil true) recv
+    else if str_eq name "reject" then iter_result (arr_filter world encl theblk xs Nil false) recv
+    else if str_eq name "each_with_index" then iter_result (arr_each_idx world encl theblk xs 0) recv
     else if str_eq name "reduce" || str_eq name "inject" then
       (match args with
-       | Cons (init, _) -> arr_reduce world encl theblk xs init
-       | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> arr_reduce world encl theblk t h))
-    else if str_eq name "count" then VInt (arr_count_blk world encl theblk xs)
+       | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
+       | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> iter_result (arr_reduce world encl theblk t h) recv))
+    else if str_eq name "count" then iter_result (arr_count_blk world encl theblk xs 0) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Array")
   | VHsh xs ->
-    if str_eq name "each" then let _ = hash_each world encl theblk xs in recv
-    else if str_eq name "select" then VHsh (hash_select world encl theblk xs)
+    if str_eq name "each" then iter_result (hash_each world encl theblk xs) recv
+    else if str_eq name "select" then iter_result (hash_filter world encl theblk xs Nil) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Hash")
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
-    if str_eq name "each" then let _ = range_each world encl theblk lo last in recv
-    else if str_eq name "map" then arr_new (range_map world encl theblk lo last)
+    if str_eq name "each" then iter_result (range_each world encl theblk lo last) recv
+    else if str_eq name "map" then iter_result (range_map world encl theblk lo last Nil) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Range")
   | VInt n ->
-    if str_eq name "times" then let _ = range_each world encl theblk 0 (n - 1) in recv
+    if str_eq name "times" then iter_result (range_each world encl theblk 0 (n - 1)) recv
     else if str_eq name "upto" then
       (match args with
-       | Cons (VInt m, _) -> let _ = range_each world encl theblk n m in recv
+       | Cons (VInt m, _) -> iter_result (range_each world encl theblk n m) recv
        | _ -> fail "mere-ruby: upto needs an integer")
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Integer")
   | _ -> fail ("mere-ruby: undefined block method '" ++ name ++ "' for this value")
 
+// unwrap an iterator's Flow: break -> its value; else the iterator's
+// natural result (`dflt`, e.g. the receiver, or the value FNext carries).
+and iter_result = fn (f: Flow) -> fn (dflt: Val) ->
+  match f with FBreak v -> v | FNext v -> v | other -> dflt
+
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
-  | Nil -> ()
-  | Cons (h, t) -> let _ = run_block world encl theblk (Cons (h, Nil)) in arr_each world encl theblk t
-
-and arr_map = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> Nil
-  | Cons (h, t) -> Cons (run_block world encl theblk (Cons (h, Nil)), arr_map world encl theblk t)
-
-and arr_select = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> Nil
+  | Nil -> FNext VNil
   | Cons (h, t) ->
-    if truthy (run_block world encl theblk (Cons (h, Nil))) then Cons (h, arr_select world encl theblk t)
-    else arr_select world encl theblk t
+    (match run_block world encl theblk (Cons (h, Nil)) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | _ -> arr_each world encl theblk t)
+
+and arr_map = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> FNext (arr_new (val_rev acc Nil))
+  | Cons (h, t) ->
+    (match run_block world encl theblk (Cons (h, Nil)) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | f -> arr_map world encl theblk t (Cons (flow_value f, acc)))
+
+// keep (want=true) or drop (want=false) elements by block truthiness.
+and arr_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) -> fn (want: bool) ->
+  match xs with
+  | Nil -> FNext (arr_new (val_rev acc Nil))
+  | Cons (h, t) ->
+    (match run_block world encl theblk (Cons (h, Nil)) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | f ->
+       let keep = if want then truthy (flow_value f) else (if truthy (flow_value f) then false else true) in
+       arr_filter world encl theblk t (if keep then Cons (h, acc) else acc) want)
 
 and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (i: int) ->
   match xs with
-  | Nil -> ()
+  | Nil -> FNext VNil
   | Cons (h, t) ->
-    let _ = run_block world encl theblk (Cons (h, Cons (VInt i, Nil))) in
-    arr_each_idx world encl theblk t (i + 1)
+    (match run_block world encl theblk (Cons (h, Cons (VInt i, Nil))) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | _ -> arr_each_idx world encl theblk t (i + 1))
 
 and range_each = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
-  if i > last then ()
-  else let _ = run_block world encl theblk (Cons (VInt i, Nil)) in range_each world encl theblk (i + 1) last
+  if i > last then FNext VNil
+  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+        | FBreak v -> FBreak v | FReturn v -> FReturn v
+        | _ -> range_each world encl theblk (i + 1) last)
 
-and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
-  if i > last then Nil
-  else Cons (run_block world encl theblk (Cons (VInt i, Nil)), range_map world encl theblk (i + 1) last)
-
-and arr_reject = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> Nil
-  | Cons (h, t) ->
-    if truthy (run_block world encl theblk (Cons (h, Nil))) then arr_reject world encl theblk t
-    else Cons (h, arr_reject world encl theblk t)
+and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) -> fn (acc: Val list) ->
+  if i > last then FNext (arr_new (val_rev acc Nil))
+  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+        | FBreak v -> FBreak v | FReturn v -> FReturn v
+        | f -> range_map world encl theblk (i + 1) last (Cons (flow_value f, acc)))
 
 and arr_reduce = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val) ->
   match xs with
-  | Nil -> acc
-  | Cons (h, t) -> arr_reduce world encl theblk t (run_block world encl theblk (Cons (acc, Cons (h, Nil))))
-
-and arr_count_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> 0
+  | Nil -> FNext acc
   | Cons (h, t) ->
-    (if truthy (run_block world encl theblk (Cons (h, Nil))) then 1 else 0) + arr_count_blk world encl theblk t
+    (match run_block world encl theblk (Cons (acc, Cons (h, Nil))) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | f -> arr_reduce world encl theblk t (flow_value f))
+
+and arr_count_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (n: int) ->
+  match xs with
+  | Nil -> FNext (VInt n)
+  | Cons (h, t) ->
+    (match run_block world encl theblk (Cons (h, Nil)) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | f -> arr_count_blk world encl theblk t (if truthy (flow_value f) then n + 1 else n))
 
 // hash.each { |k, v| ... } iterates key/value pairs of the flat list.
 and hash_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
-  | Nil -> ()
-  | Cons (k, rest) ->
-    (match rest with
-     | Cons (v, t) -> let _ = run_block world encl theblk (Cons (k, Cons (v, Nil))) in hash_each world encl theblk t
-     | Nil -> ())
-
-// hash.select { |k, v| ... } keeps matching pairs, rebuilding the flat list.
-and hash_select = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> Nil
+  | Nil -> FNext VNil
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
-       if truthy (run_block world encl theblk (Cons (k, Cons (v, Nil))))
-       then Cons (k, Cons (v, hash_select world encl theblk t))
-       else hash_select world encl theblk t
-     | Nil -> Nil)
+       (match run_block world encl theblk (Cons (k, Cons (v, Nil))) with
+        | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
+        | _ -> hash_each world encl theblk t)
+     | Nil -> FNext VNil)
+
+// hash.select { |k, v| ... } keeps matching pairs, rebuilding a Hash.
+and hash_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> FNext (VHsh (val_rev acc Nil))
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       (match run_block world encl theblk (Cons (k, Cons (v, Nil))) with
+        | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
+        | f -> hash_filter world encl theblk t (if truthy (flow_value f) then Cons (v, Cons (k, acc)) else acc))
+     | Nil -> FNext (VHsh (val_rev acc Nil)))
 
 // core methods on primitive receivers (String / Array / Hash / Integer),
 // all non-mutating. Indexing (`[]`) and the read-heavy Enumerable methods
