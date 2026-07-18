@@ -51,6 +51,28 @@ mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
 - Enough for real small programs: the corpus closes with FizzBuzz and a
   float-accumulation loop, both byte-identical to `ruby`.
 
+## What M2 adds
+
+- **Method definitions**: `def name(a, b) ... end` and `def name ... end`,
+  called as `name(args)` or (for a no-arg method) bare `name`. Methods
+  live in a namespace separate from local variables.
+- **`return`**, explicit (with or without a value) and implicit (a
+  method's value is its last statement). Early return propagates out of
+  nested `if` / `while` / `case` to the method boundary.
+- **Recursion**: factorial, Fibonacci, and a recursive sum are in the
+  corpus.
+- **Flat method scope**: a method body sees only its parameters, not the
+  caller's locals — Ruby methods are not closures over their caller. Each
+  call runs in a fresh environment, which is both correct and simpler than
+  a lexical closure.
+- **Statement modifiers**: `return x if cond`, `... unless ...`,
+  `... while ...`, `... until ...`.
+
+M2 forced a fix in the host language itself: the evaluator became one
+mutual-recursion group of eleven functions threading two maps, and the
+Mere C backend emitted several of them twice (a duplicate-definition
+build failure). It is fixed upstream in Mere v0.1.66 — see `PAIN.md`.
+
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`

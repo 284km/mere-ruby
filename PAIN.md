@@ -1,7 +1,35 @@
-# Pain found writing mere-ruby (M0)
+# Pain found writing mere-ruby
 
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
+
+## M2. A C-backend duplicate-definition bug — FIXED upstream (Mere v0.1.66)
+
+The biggest find so far, and the first bug in Mere's *code generator*
+rather than its library. Adding methods (`def`) turned the evaluator into
+one mutual-recursion group of eleven functions — `eval_e`, `call_method`,
+`run_stmts`, `exec_stmt`, and the rest — threading two maps (locals and
+methods) through all of them. It ran correctly under the interpreter, but
+the C backend refused to compile: eighteen functions were each emitted
+twice, a `redefinition` error from clang.
+
+The cause was in per-instantiation specialization. A polymorphic
+function's list of specializations is grown, across resolution passes,
+from one concrete arrow type per use site. When a function is used from
+many sites, arrows that differ only in a *region type variable* — which
+the mangled-name tag erases — pile up as "distinct" specs that all mangle
+to the **same** C symbol. The backend then emitted one definition per
+spec, and the identical definitions collided.
+
+What made this a satisfying dogfood loop: the interpreter backend matched
+`ruby` the whole time, so the logic was provably correct; the bug was
+purely in how the *other* backend lowered a large mutual recursion. The
+minimal trigger turned out to be emergent — small hand-written groups
+would not reproduce it; it took eleven interdependent functions over two
+differently-typed maps. Fixed upstream by deduping the spec list by its
+emitted C symbol at the single emission point (Mere v0.1.66), with a
+reduced eight-function version of this evaluator captured as the
+regression test.
 
 ## 1. `str_of_float` was not round-trip faithful — FIXED upstream (Mere v0.1.65)
 
