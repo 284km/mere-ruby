@@ -3,6 +3,29 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
+## M4. A bare `Nil` placeholder in a tuple is polymorphic — C codegen only
+
+Small, and a recurrence of a known Mere papercut. M4 threads the "current
+block" as a tuple `(has, params, body, cenv)`. A "no block" value is
+`(false, Nil, Nil, env)`, and those bare `Nil`s have no local constraint
+on their element type — `params` could be any `'a list`. The interpreter
+runs it fine (it is polymorphic and never inspected), but the C backend
+monomorphizes, and an unconstrained `'a` reaches codegen:
+`unsupported C codegen type element: 'a`.
+
+The fix is a one-token annotation at each no-block site:
+`(false, (Nil : str list), (Nil : Stmt list), env)`. This is the same
+shape as the standing rule that a bare `None` sometimes needs a type
+annotation on the compiled backends — a place where inference is happy
+but monomorphization needs the type spelled out. Not a milestone
+blocker, but worth logging as the pattern keeps returning: a value that
+is polymorphic-and-unused in the interpreter must be concrete for C.
+
+Everything else in M4 was clean — blocks as closures fell straight out
+of "the block carries its defining env," and threading that env through
+the evaluator was the same mechanical tax as `world`. No host-language
+change was needed.
+
 ## M3. A `Map` cannot live in a record or variant field (region annotations)
 
 Not a bug — a sharp edge in the region system, and the decision it

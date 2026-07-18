@@ -94,6 +94,20 @@ Objects are represented as integer handles into the interpreter's world
 instance variables). See `PAIN.md` for why that shape, and why the
 world is a *tuple* of maps rather than a record.
 
+## What M4 adds — blocks and iterators
+
+- **Blocks** (`{ |x| ... }` and `do |x| ... end`) as true closures: a
+  block captures its defining scope and reads and mutates the enclosing
+  locals — the counterpoint to M2's flat method scope.
+- **Built-in iterators** taking a block: `each`, `map`, `select`,
+  `each_with_index` on arrays; `times` and `upto` on integers.
+- **Ranges**: `1..5` (inclusive) and `1...5` (exclusive), with `.each`,
+  `.map`, `.to_a`.
+- **`yield`**, which calls the block passed to the current method —
+  including nested cases (a method that yields from inside `@xs.each { |n|
+  yield(n) }`) and implicit-`self` block calls (`each { ... }` inside a
+  method calling `self.each`).
+
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
