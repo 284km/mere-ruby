@@ -92,7 +92,9 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // 2h: `alias new old` (copy a method); `include M` (mix a module's
           // instance methods into the class).
           | SAlias of str * str
-          | SInclude of str;
+          | SInclude of str
+          // 2n: `undef name[, name]` removes method definitions.
+          | SUndef of str list;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -870,6 +872,13 @@ and looks_like_multi = fn toks ->
   | Cons (TP star, Cons (TId _, _)) -> str_eq star "*"
   | _ -> false
 
+// `undef a, b, :c` — a comma-separated list of bare/:symbol method names.
+and parse_undef_names = fn toks -> fn (acc: str list) ->
+  let (n, r) = parse_alias_name toks in
+  match r with
+  | Cons (TP c, r2) -> if str_eq c "," then parse_undef_names r2 (Cons (n, acc)) else (rev_app (Cons (n, acc)) Nil, r)
+  | _ -> (rev_app (Cons (n, acc)) Nil, r)
+
 // an alias name is a bare identifier or a :symbol.
 and parse_alias_name = fn toks ->
   match toks with
@@ -941,6 +950,8 @@ and parse_stmt = fn toks ->
       // `alias new old` — names may be bare or :symbols.
       let (n1, r1) = parse_alias_name r in
       let (n2, r2) = parse_alias_name r1 in (SAlias (n1, n2), r2)
+    else if str_eq id "undef" || str_eq id "undef_method" then
+      let (names, r2) = parse_undef_names r Nil in (SUndef names, r2)
     else if str_eq id "include" || str_eq id "prepend" then
       // `include M[, N]` — mix module instance methods in (first module only
       // for now; extra modules are consumed and ignored).
@@ -1176,6 +1187,19 @@ and parse_def = fn toks ->
             | _ -> (name0, r0))
          else (name0, r0)
        | _ -> (name0, r0)) in
+    // setter definition `def x=(v)` — the `=` is part of the name. Guard
+    // against endless defs `def x = (expr)` by requiring a real parameter
+    // `( ident )` / `( ident ,` inside (a string desugars to `("" + ...)`).
+    let (name, r) =
+      (match r with
+       | Cons (TP eq, r1) ->
+         if str_eq eq "=" then
+           (match r1 with
+            | Cons (TP lp, Cons (TId _, Cons (TP rp, _))) ->
+              if str_eq lp "(" && (str_eq rp ")" || str_eq rp ",") then (name ++ "=", r1) else (name, r)
+            | _ -> (name, r))
+         else (name, r)
+       | _ -> (name, r)) in
     let (params, defs, r2) =
       (match r with
        | Cons (TP p, r3) ->
@@ -1184,6 +1208,16 @@ and parse_def = fn toks ->
          else (Nil, Nil, r)
        | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
+    // endless method `def name(params) = expr` — body is a single expression.
+    (match r2 with
+     | Cons (TP eq, r3) ->
+       if str_eq eq "=" then
+         let (e, r4) = parse_expr r3 in (SDef (name, params, defs, Cons (SExpr e, Nil)), r4)
+       else parse_def_body name params defs r2
+     | _ -> parse_def_body name params defs r2)
+  | _ -> fail "mere-ruby: expected method name after def"
+
+and parse_def_body = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
     let (body0, r4) = parse_stmts r2 Nil in
     // method-level rescue/ensure: `def f ... rescue ... end` wraps the
     // whole body in an implicit begin.
@@ -1198,7 +1232,6 @@ and parse_def = fn toks ->
          else (body0, r4)
        | _ -> (body0, r4)) in
     (SDef (name, params, defs, body), expect_kw r5 "end")
-  | _ -> fail "mere-ruby: expected method name after def"
 
 and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
   match toks with
@@ -2068,7 +2101,9 @@ and invoke_val = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str
     else if str_eq name "class" then VClass cls
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
-    else prim_method recv name args
+    else if is_prim_method name then prim_method recv name args
+    // an object has no such method — raise a catchable NoMethodError.
+    else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls)
   | VSym s ->
     if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
     then flow_value (run_block world noblk blk args)
@@ -2453,8 +2488,24 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
        // `include M` records the module for method lookup fallback.
        | SInclude m ->
          map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ m else m)
+       // `undef name` removes the method from this class.
+       | SUndef names -> undef_all meths cls names
        | _ -> ()) in
     register_class world cls rest
+
+// remove each top-level method entry.
+and undef_top = fn meths -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) -> let _ = if map_has meths n then map_delete meths n else () in undef_top meths rest
+
+// remove each `cls#name` method entry.
+and undef_all = fn meths -> fn (cls: str) -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let _ = if map_has meths (cls ++ "#" ++ n) then map_delete meths (cls ++ "#" ++ n) else () in
+    undef_all meths cls rest
 
 // attr_reader/writer/accessor: synthesize getter and/or setter methods.
 and add_attrs = fn world -> fn (cls: str) -> fn (mode: str) -> fn (syms: str list) ->
@@ -2530,6 +2581,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
     FNext VNil
   | SInclude _ -> FNext VNil   // top-level include: no-op (no enclosing class)
+  | SUndef names ->
+    let (meths, sup, ocls, ivars) = world in
+    let _ = undef_top meths names in FNext VNil
   | SReturn e -> FReturn (eval_e env world blk e)
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
