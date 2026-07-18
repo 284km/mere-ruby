@@ -1,10 +1,11 @@
 # mere-ruby
 
 A Ruby subset interpreter written in [Mere](https://merelang.org/), in
-pure Mere. Milestones **M0 + M1**: literals, operators with Ruby
-precedence, variables, control flow, and `puts` — every corpus program
-(FizzBuzz included) prints byte-identical output to the reference
-`ruby`.
+pure Mere. Through milestone **M5** it runs literals, operators, variables,
+control flow, methods, classes and inheritance, blocks and iterators, and a
+broad set of core methods — every corpus program (FizzBuzz, class
+hierarchies, `map`/`select`/`reduce` chains, hashes) prints byte-identical
+output to the reference `ruby`.
 
 ```sh
 mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
@@ -107,6 +108,27 @@ world is a *tuple* of maps rather than a record.
   including nested cases (a method that yields from inside `@xs.each { |n|
   yield(n) }`) and implicit-`self` block calls (`each { ... }` inside a
   method calling `self.each`).
+
+## What M5 adds — core methods (breadth)
+
+All non-mutating, matching Ruby's results:
+
+- **Indexing**: `arr[i]`, `str[i]`, `hash[k]`, with negative indices.
+- **String**: `upcase`, `downcase`, `capitalize`, `reverse`, `strip`,
+  `chars`, `split`, `include?`, `start_with?`, `end_with?`, `empty?`.
+- **Array**: `first`, `last`, `sort`, `uniq`, `min`, `max`, `sum`,
+  `index`, `count`, `join`, `reverse`, `include?`, plus block forms
+  `reduce` / `inject`, `reject`, `count`.
+- **Hash**: `keys`, `values`, `size`, `[]`, `key?` / `has_key?`,
+  `include?`, `each { |k, v| }`, `select { |k, v| }`, `empty?`.
+- **Integer**: `even?`, `odd?`, `zero?`, `succ`, `pred`, `abs`.
+- **Universal**: `class`, `nil?`, `inspect`, `to_s`, `to_i`, `to_f`,
+  `to_a`, `size` / `length`.
+
+Method names ending in `?` or `!` lex correctly, and method chains
+continue after a block (`arr.map { |x| x * 2 }.sum`). In-place mutation
+(`<<`, `push`, `arr[i] = v`) is deferred to a later milestone; the corpus
+builds collections functionally.
 
 ## Verification
 
