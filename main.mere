@@ -41,7 +41,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // a call/method with a trailing block { |bp| body }: block params
           // and block body come last.
           | ECallB of str * Expr list * str list * Stmt list
-          | EMethodB of Expr * str * Expr list * str list * Stmt list;
+          | EMethodB of Expr * str * Expr list * str list * Stmt list
+          // M6 exceptions:
+          | ERaise of Expr list;                 // raise [Class][, msg]
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -58,7 +60,13 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SReturn of Expr
           | SClass of str * str * Stmt list
           | SIVarAssign of str * Expr
-          | SAttr of str * str list;
+          | SAttr of str * str list
+          // M6: begin body / rescue clauses (class names, var, handler) /
+          // else body / ensure body.
+          | SBegin of Stmt list * (str list * str * Stmt list) list * Stmt list * Stmt list
+          // `var = <stmt>` where stmt is a begin/end used as a value: run
+          // the statement, bind its value (else propagate return/raise).
+          | SLocalFrom of str * Stmt;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -66,7 +74,8 @@ type Stmt = SPuts of Expr list | SExpr of Expr
 type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
          | VNil | VArr of Val list | VHsh of Val list
          | VObj of int | VClass of str | VSym of str
-         | VRange of int * int * bool;
+         | VRange of int * int * bool
+         | VExc of str * str;   // exception: class name, message
 
 // A user method: parameter names and body. Stored in the methods table
 // (a Map[str, Meth]) keyed by bare name (top-level) or "Class#name"
@@ -77,7 +86,10 @@ type Meth = Meth of str list * Stmt list;
 // method's implicit return is its last statement's value); FReturn is a
 // non-local exit carrying an explicit `return` value up through enclosing
 // blocks and loops to the method boundary.
-type Flow = FNext of Val | FReturn of Val;
+// FRaise signals that a Ruby exception unwound to a begin/rescue (the
+// exception value itself is stashed in the world's ivars under "$exc",
+// since raise unwinds via Mere's `fail` and try_or yields only a default).
+type Flow = FNext of Val | FReturn of Val | FRaise of Val;
 
 // ---- small helpers ------------------------------------------------------
 let rec rev_app = fn xs -> fn acc ->
@@ -201,6 +213,8 @@ let is_keyword = fn (id: str) ->
   str_eq id "when" || str_eq id "then" || str_eq id "do" ||
   str_eq id "def" || str_eq id "return" || str_eq id "class" ||
   str_eq id "self" || str_eq id "yield" ||
+  str_eq id "begin" || str_eq id "rescue" || str_eq id "ensure" ||
+  str_eq id "raise" ||
   str_eq id "true" || str_eq id "false" || str_eq id "nil";
 
 // a capitalized bare identifier is a constant (a class reference here).
@@ -213,7 +227,8 @@ let is_ivar = fn (id: str) -> str_len id > 0 && str_eq (char_at id 0) "@";
 // keywords that close (or continue) an enclosing block: statement lists
 // stop before them without consuming.
 let is_block_stop = fn (id: str) ->
-  str_eq id "end" || str_eq id "else" || str_eq id "elsif" || str_eq id "when";
+  str_eq id "end" || str_eq id "else" || str_eq id "elsif" || str_eq id "when" ||
+  str_eq id "rescue" || str_eq id "ensure";
 
 // Binary precedence, Ruby's order (subset). 0 = not a binary operator.
 // ** is handled separately (tighter than unary minus on its left, so
@@ -412,6 +427,11 @@ and parse_primary = fn toks ->
        | Cons (TNL, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
        | _ -> let (e, r2) = parse_expr r in (EYield (Cons (e, Nil)), r2))
+    else if str_eq id "raise" then
+      (match r with
+       | Cons (TNL, _) -> (ERaise Nil, r)
+       | Cons (TEOF, _) -> (ERaise Nil, r)
+       | _ -> let (es, r2) = parse_puts_args r Nil in (ERaise es, r2))
     else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
     else
       // `name(args)` / `name(args) { block }` / `name { block }` / bare name.
@@ -551,6 +571,7 @@ and parse_stmt = fn toks ->
     else if str_eq id "case" then parse_case r
     else if str_eq id "def" then parse_def r
     else if str_eq id "class" then parse_class r
+    else if str_eq id "begin" then parse_begin r
     else if str_eq id "attr_accessor" then parse_attr "rw" r
     else if str_eq id "attr_reader" then parse_attr "r" r
     else if str_eq id "attr_writer" then parse_attr "w" r
@@ -575,7 +596,13 @@ and parse_stmt = fn toks ->
       (match r with
        | Cons (TP p, r2) ->
          if str_eq p "=" && not (is_keyword id) && not (is_cap id) then
-           let (e, r3) = parse_expr r2 in (SAssign (id, e), r3)
+           // `var = begin ... end` binds the begin's value.
+           (match r2 with
+            | Cons (TId bg, r3) ->
+              if str_eq bg "begin" then
+                let (sb, r4) = parse_begin r3 in (SLocalFrom (id, sb), r4)
+              else let (e, r3b) = parse_expr r2 in (SAssign (id, e), r3b)
+            | _ -> let (e, r3c) = parse_expr r2 in (SAssign (id, e), r3c))
          else
            let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
@@ -597,6 +624,53 @@ and parse_class = fn toks ->
     let (body, r5) = parse_stmts r2 Nil in
     (SClass (name, super, body), expect_kw r5 "end")
   | _ -> fail "mere-ruby: expected class name after class"
+
+// begin body rescue* [else] [ensure] end
+and parse_begin = fn toks ->
+  let (body, r) = parse_stmts toks Nil in
+  let (rescues, r2) = parse_rescues r Nil in
+  let (els, r3) = parse_opt_kw_block r2 "else" in
+  let (ens, r4) = parse_opt_kw_block r3 "ensure" in
+  (SBegin (body, rescues, els, ens), expect_kw r4 "end")
+
+and parse_rescues = fn toks -> fn acc ->
+  match toks with
+  | Cons (TId id, r) ->
+    if str_eq id "rescue" then
+      let (classes, var, r2) = parse_rescue_head r in
+      let (handler, r3) = parse_stmts r2 Nil in
+      parse_rescues r3 (Cons ((classes, var, handler), acc))
+    else (rev_app acc Nil, toks)
+  | _ -> (rev_app acc Nil, toks)
+
+// `rescue [C1, C2] [=> var]` up to the newline.
+and parse_rescue_head = fn toks ->
+  let (classes, r) = parse_rescue_classes toks Nil in
+  let (var, r2) =
+    (match r with
+     | Cons (TP p, r3) ->
+       if str_eq p "=>" then
+         (match r3 with Cons (TId v, r4) -> (v, r4) | _ -> fail "mere-ruby: rescue => needs a variable")
+       else ("", r)
+     | _ -> ("", r)) in
+  (classes, var, expect_end r2)
+
+and parse_rescue_classes = fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TId c, r) ->
+    if is_cap c then
+      (match r with
+       | Cons (TP p, r2) ->
+         if str_eq p "," then parse_rescue_classes r2 (Cons (c, acc))
+         else (rev_app (Cons (c, acc)) Nil, r)
+       | _ -> (rev_app (Cons (c, acc)) Nil, r))
+    else (rev_app acc Nil, toks)
+  | _ -> (rev_app acc Nil, toks)
+
+and parse_opt_kw_block = fn toks -> fn (kw: str) ->
+  match toks with
+  | Cons (TId id, r) -> if str_eq id kw then parse_stmts r Nil else (Nil, toks)
+  | _ -> (Nil, toks)
 
 and parse_attr = fn (mode: str) -> fn toks ->
   let (syms, r) = parse_sym_list toks Nil in (SAttr (mode, syms), r)
@@ -677,8 +751,20 @@ and parse_def = fn toks ->
        | Cons (TP p, r3) ->
          if str_eq p "(" then parse_params r3 Nil else (Nil, r)
        | _ -> (Nil, r)) in
-    let (body, r4) = parse_stmts r2 Nil in
-    (SDef (name, params, body), expect_kw r4 "end")
+    let (body0, r4) = parse_stmts r2 Nil in
+    // method-level rescue/ensure: `def f ... rescue ... end` wraps the
+    // whole body in an implicit begin.
+    let (body, r5) =
+      (match r4 with
+       | Cons (TId k, _) ->
+         if str_eq k "rescue" || str_eq k "ensure" then
+           let (rescues, ra) = parse_rescues r4 Nil in
+           let (els, rb) = parse_opt_kw_block ra "else" in
+           let (ens, rc) = parse_opt_kw_block rb "ensure" in
+           (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
+         else (body0, r4)
+       | _ -> (body0, r4)) in
+    (SDef (name, params, body), expect_kw r5 "end")
   | _ -> fail "mere-ruby: expected method name after def"
 
 and parse_params = fn toks -> fn (acc: str list) ->
@@ -762,6 +848,7 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   | VSym x -> (match vb with VSym y -> str_eq x y | _ -> false)
   | VRange (a, b, c) ->
     (match vb with VRange (d, e, f) -> a == d && b == e && (if c then f else (if f then false else true)) | _ -> false)
+  | VExc (c, m) -> (match vb with VExc (d, n) -> str_eq c d && str_eq m n | _ -> false)
 
 and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -949,6 +1036,7 @@ let rec to_s = fn (v: Val) ->
   | VObj _ -> "#<object>"   // disp (world-aware) overrides for objects
   | VRange (lo, hi, excl) ->
     str_of_int lo ++ (if excl then "..." else "..") ++ str_of_int hi
+  | VExc (_, m) -> m   // Ruby: an exception's to_s is its message
 
 and inspect = fn (v: Val) ->
   match v with
@@ -1040,6 +1128,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     if has then run_block world noblk blk args
     else fail "mere-ruby: no block given (yield)"
+  | ERaise arges ->
+    let (meths, sup, ocls, ivars) = world in
+    let exc = make_exc (eval_args env world blk arges) in
+    // stash the exception, then unwind via Mere's fail to the nearest
+    // begin/rescue (which reads it back from "$exc").
+    let _ = map_set ivars "$exc" exc in
+    fail "mere-ruby: (ruby exception raised)"
   | EVar name ->
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -1073,7 +1168,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     (match recv with
      | VClass c ->
        if str_eq name "new" then new_obj world c args
-       else fail ("mere-ruby: undefined class method '" ++ name ++ "' for " ++ c)
+       else if str_eq name "name" then VStr c
+       else prim_method recv name args   // to_s / class / inspect on a class
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
        invoke world noblk recv (map_get ocls (str_of_int id)) name args
@@ -1113,12 +1209,74 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq op "<=" then VBool (cmp_vals (eval_e env world blk a) (eval_e env world blk b) <= 0)
     else if str_eq op ">" then VBool (cmp_vals (eval_e env world blk a) (eval_e env world blk b) > 0)
     else if str_eq op ">=" then VBool (cmp_vals (eval_e env world blk a) (eval_e env world blk b) >= 0)
-    else arith_bin op (eval_e env world blk a) (eval_e env world blk b)
+    else
+      let va = eval_e env world blk a in
+      let vb = eval_e env world blk b in
+      // integer division / modulo by zero raises a real ZeroDivisionError
+      // (a proper Ruby exception, so `rescue ZeroDivisionError` catches it).
+      if (str_eq op "/" || str_eq op "%") && (match vb with VInt z -> z == 0 | _ -> false)
+      then raise_exc world "ZeroDivisionError" "divided by 0"
+      else arith_bin op va vb
 
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
   | Nil -> Nil
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
+
+// build an exception value from raise's arguments. `raise "m"` is a
+// RuntimeError; `raise Cls` / `raise Cls, "m"` uses the class; `raise e`
+// re-raises an existing exception.
+and make_exc = fn (args: Val list) ->
+  match args with
+  | Nil -> VExc ("RuntimeError", "RuntimeError")
+  | Cons (VStr msg, _) -> VExc ("RuntimeError", msg)
+  | Cons (VClass c, rest) ->
+    (match rest with Cons (VStr m, _) -> VExc (c, m) | _ -> VExc (c, c))
+  | Cons (VExc (c, m), _) -> VExc (c, m)
+  | Cons (v, _) -> VExc ("RuntimeError", to_s v)
+
+// does exception class `ecls` match one of the rescued classes (walking
+// the superclass chain)? A bare rescue (no classes) catches StandardError.
+and rescue_matches = fn world -> fn (exc: Val) -> fn (classes: str list) ->
+  match exc with
+  | VExc (ecls, _) ->
+    (match classes with
+     | Nil -> exc_is_a world ecls "StandardError"
+     | _ -> any_class_matches world ecls classes)
+  | _ -> false
+
+and any_class_matches = fn world -> fn (ecls: str) -> fn (classes: str list) ->
+  match classes with
+  | Nil -> false
+  | Cons (c, rest) -> if exc_is_a world ecls c then true else any_class_matches world ecls rest
+
+and exc_is_a = fn world -> fn (ecls: str) -> fn (target: str) ->
+  if str_eq ecls target then true
+  else
+    let (meths, sup, ocls, ivars) = world in
+    if map_has sup ecls then exc_is_a world (map_get sup ecls) target else false
+
+and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
+  match rescues with
+  | Nil -> re_raise world exc
+  | Cons (rc, rest) ->
+    let (classes, var, handler) = rc in
+    if rescue_matches world exc classes then
+      let _ = if str_eq var "" then () else map_set env var exc in
+      run_stmts env world blk handler
+    else run_rescues env world blk exc rest
+
+and re_raise = fn world -> fn (exc: Val) ->
+  let (meths, sup, ocls, ivars) = world in
+  let _ = map_set ivars "$exc" exc in
+  fail "mere-ruby: (exception re-raised past all rescues)"
+
+// raise a specific built-in exception from inside the interpreter (e.g.
+// ZeroDivisionError), setting "$exc" then unwinding via fail.
+and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let _ = map_set ivars "$exc" (VExc (cls, msg)) in
+  fail "mere-ruby: (built-in exception raised)"
 
 // run `theblk` with the given argument values. Its params bind into its
 // own captured env (so it sees and mutates the enclosing locals). The body
@@ -1127,7 +1285,7 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let (has, params, body, cenv) = theblk in
   let _ = bind_block_params cenv params argvals in
-  (match run_stmts cenv world encl body with FNext v -> v | FReturn v -> v)
+  (match run_stmts cenv world encl body with FNext v -> v | FReturn v -> v | FRaise v -> v)
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
 and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
@@ -1253,6 +1411,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "inspect" then VStr (inspect recv)
   else if str_eq name "class" then VClass (class_name recv)
   else if str_eq name "nil?" then VBool (match recv with VNil -> true | _ -> false)
+  else if str_eq name "message" then (match recv with VExc (_, m) -> VStr m | _ -> VStr (to_s recv))
   else if str_eq name "to_i" then
     (match recv with
      | VInt n -> VInt n | VFlt f -> VInt (int_of_float f) | VStr s -> VInt (int_of_str s)
@@ -1335,6 +1494,7 @@ and class_name = fn (recv: Val) ->
   | VInt _ -> "Integer" | VFlt _ -> "Float" | VStr _ -> "String" | VBool _ -> "Boolean"
   | VNil -> "NilClass" | VArr _ -> "Array" | VHsh _ -> "Hash" | VSym _ -> "Symbol"
   | VRange _ -> "Range" | VClass _ -> "Class" | VObj _ -> "Object"
+  | VExc (c, _) -> c
 
 and range_to_a = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (VInt i, range_to_a (i + 1) last)
@@ -1363,7 +1523,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
    | Meth (params, body) ->
      let frame = map_new () in
      let _ = bind_params frame name params args in
-     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v))
+     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v))
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
@@ -1387,7 +1547,7 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
     let frame = map_new () in
     let _ = map_set frame "self" recv in
     let _ = bind_params frame name params args in
-    (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v)
+    (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v)
 
 // allocate an object, then run initialize if the class defines one.
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
@@ -1456,6 +1616,7 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
      | _ ->
        (match exec_stmt env world blk s with
         | FReturn v -> FReturn v
+        | FRaise v -> FRaise v
         | FNext _ -> run_stmts env world blk rest))
 
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
@@ -1486,6 +1647,30 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = register_class world name body in FNext VNil
   | SAttr (_, _) -> FNext VNil
   | SReturn e -> FReturn (eval_e env world blk e)
+  | SBegin (body, rescues, els, ens) ->
+    let (meths, sup, ocls, ivars) = world in
+    let caught = FRaise VNil in
+    // run the body; a raise unwinds via fail and try_or yields `caught`.
+    let result = try_or (fn (u: unit) -> run_stmts env world blk body) caught in
+    // handle rescue / else, itself wrapped so a raise inside a handler
+    // (or a re-raise past all rescues) still lets ensure run first.
+    let outcome = try_or (fn (u: unit) ->
+      (match result with
+       | FRaise _ ->
+         let exc = if map_has ivars "$exc" then map_get ivars "$exc" else VExc ("StandardError", "error") in
+         let _ = map_delete ivars "$exc" in
+         run_rescues env world blk exc rescues
+       | FReturn v -> FReturn v
+       | FNext v -> (match els with Nil -> FNext v | _ -> run_stmts env world blk els))) caught in
+    // ensure always runs.
+    let _ = (match ens with Nil -> FNext VNil | _ -> run_stmts env world blk ens) in
+    (match outcome with
+     | FRaise _ -> fail "mere-ruby: (exception propagates after ensure)"
+     | other -> other)
+  | SLocalFrom (name, s) ->
+    (match exec_stmt env world blk s with
+     | FNext v -> let _ = map_set env name v in FNext v
+     | other -> other)
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
   match clauses with
@@ -1499,6 +1684,7 @@ and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stm
   if truthy (eval_e env world blk cond) then
     (match run_stmts env world blk body with
      | FReturn v -> FReturn v
+     | FRaise v -> FRaise v
      | FNext _ -> run_while env world blk cond body)
   else FNext VNil
 
@@ -1560,6 +1746,16 @@ let run_cli = fn () ->
     let sup = map_new () in
     let ocls = map_new () in
     let ivars = map_new () in
+    // built-in exception hierarchy (user `class E < StandardError` extends it).
+    let _ = map_set sup "StandardError" "Exception" in
+    let _ = map_set sup "RuntimeError" "StandardError" in
+    let _ = map_set sup "ArgumentError" "StandardError" in
+    let _ = map_set sup "TypeError" "StandardError" in
+    let _ = map_set sup "RangeError" "StandardError" in
+    let _ = map_set sup "IndexError" "StandardError" in
+    let _ = map_set sup "KeyError" "StandardError" in
+    let _ = map_set sup "ZeroDivisionError" "StandardError" in
+    let _ = map_set sup "NotImplementedError" "StandardError" in
     let world = (meths, sup, ocls, ivars) in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     let _ = run_stmts env world noblk prog in
