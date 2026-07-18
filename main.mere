@@ -525,6 +525,20 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
            (EMethod (recv, "[]=", Cons (idx, Cons (rhs, Nil))), r5)
          else parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3
        | _ -> parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3)
+    // scope resolution: Foo::Bar (nested constant, looked up by bare name)
+    // or Foo::meth(...) (module/class method call).
+    else if str_eq dot "::" then
+      (match r with
+       | Cons (TId name, r2) ->
+         (match r2 with
+          | Cons (TP p, r3) ->
+            if str_eq p "(" then let (argv, r4) = parse_call_args r3 in attach_block_method recv name argv r4
+            else if is_cap name then parse_postfix_more (EConst name) r2
+            else attach_block_method recv name Nil r2
+          | _ ->
+            if is_cap name then parse_postfix_more (EConst name) r2
+            else attach_block_method recv name Nil r2)
+       | _ -> fail "mere-ruby: expected name after ::")
     else (recv, toks)
   | _ -> (recv, toks)
 
@@ -665,8 +679,13 @@ and parse_hash = fn toks ->
   | _ -> parse_hash_items toks Nil
 
 and parse_hash_items = fn toks -> fn (acc: Expr list) ->
-  let (k, r) = parse_expr toks in
-  let r2 = expect r "=>" in
+  // `name: value` symbol-key shorthand is equivalent to `:name => value`.
+  let (k, r2) =
+    (match toks with
+     | Cons (TId name, Cons (TP colon, r0)) ->
+       if str_eq colon ":" then (ESym name, r0)
+       else let (ke, r) = parse_expr toks in (ke, expect r "=>")
+     | _ -> let (ke, r) = parse_expr toks in (ke, expect r "=>")) in
   let (v, r3) = parse_expr r2 in
   match r3 with
   | Cons (TP p, r4) ->
@@ -683,20 +702,46 @@ and parse_call_args = fn toks ->
     if str_eq p ")" then (Nil, r) else parse_call_items toks Nil
   | _ -> parse_call_items toks Nil
 
+// Arguments may end with bare hash pairs — old-style `k => v` or keyword
+// `name: value` — which Ruby collects into a single trailing Hash argument.
+// `pos` accumulates positional args (reversed); `hp` accumulates hash pairs
+// as v,k,v,k (reversed), emitted as one trailing EHsh.
 and parse_call_items = fn toks -> fn (acc: Expr list) ->
-  // a `*expr` argument is a splat (expanded at eval time).
-  let (e, r) =
-    (match toks with
-     | Cons (TP star, r0) ->
-       if str_eq star "*" then let (inner, r1) = parse_expr r0 in (ESplat inner, r1)
-       else parse_expr toks
-     | _ -> parse_expr toks) in
+  parse_call_go toks acc Nil
+
+and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
+  match toks with
+  | Cons (TId name, Cons (TP colon, r0)) ->
+    if str_eq colon ":" then
+      let (v, r1) = parse_expr r0 in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp)))
+    else parse_call_pos_arg toks pos hp
+  | Cons (TP star, r0) ->
+    if str_eq star "*" then
+      let (inner, r1) = parse_expr r0 in parse_call_sep r1 (Cons (ESplat inner, pos)) hp
+    else parse_call_pos_arg toks pos hp
+  | _ -> parse_call_pos_arg toks pos hp
+
+and parse_call_pos_arg = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
+  let (e, r) = parse_expr toks in
   match r with
   | Cons (TP p, r2) ->
-    if str_eq p "," then parse_call_items r2 (Cons (e, acc))
-    else if str_eq p ")" then (rev_app (Cons (e, acc)) Nil, r2)
+    if str_eq p "=>" then
+      let (v, r3) = parse_expr r2 in parse_call_sep r3 pos (Cons (v, Cons (e, hp)))
+    else parse_call_sep r (Cons (e, pos)) hp
+  | _ -> parse_call_sep r (Cons (e, pos)) hp
+
+and parse_call_sep = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "," then parse_call_go r pos hp
+    else if str_eq p ")" then (finish_call_args pos hp, r)
     else fail ("mere-ruby: expected , or ) in argument list, got " ++ p)
   | _ -> fail "mere-ruby: unterminated argument list"
+
+and finish_call_args = fn (pos: Expr list) -> fn (hp: Expr list) ->
+  match hp with
+  | Nil -> rev_app pos Nil
+  | _ -> rev_app pos (Cons (EHsh (rev_app hp Nil), Nil))
 
 // ---- statements — SAME mutual-recursion group as the expression parser,
 // because a block body (`{ ... }` / `do ... end`) parses statements while
@@ -2128,6 +2173,14 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
        | SDef (mname, params, defs, mbody) ->
          let _ = map_set meths (cls ++ "#" ++ mname) (Meth (params, defs, mbody)) in ()
        | SAttr (mode, syms) -> add_attrs world cls mode syms
+       // a constant assignment in the body runs at definition time; stored by
+       // bare name so `Klass::CONST` (parsed as EConst CONST) resolves.
+       | SAssign (aname, e) ->
+         if is_upper_first aname then
+           let frame = map_new () in
+           let noblk = (false, (Nil : str list), (Nil : Stmt list), frame) in
+           map_set consts aname (eval_e frame world noblk e)
+         else ()
        | _ -> ()) in
     register_class world cls rest
 
