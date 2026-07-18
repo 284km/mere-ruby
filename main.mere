@@ -544,13 +544,16 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
     else if str_eq dot "::" then
       (match r with
        | Cons (TId name, r2) ->
+         // A::B is the constant B qualified by A; keep the full name so a
+         // namespaced class resolves and reports consistently.
+         let qual = (match recv with EConst rc -> rc ++ "::" ++ name | _ -> name) in
          (match r2 with
           | Cons (TP p, r3) ->
             if str_eq p "(" then let (argv, r4) = parse_call_args r3 in attach_block_method recv name argv r4
-            else if is_cap name then parse_postfix_more (EConst name) r2
+            else if is_cap name then parse_postfix_more (EConst qual) r2
             else attach_block_method recv name Nil r2
           | _ ->
-            if is_cap name then parse_postfix_more (EConst name) r2
+            if is_cap name then parse_postfix_more (EConst qual) r2
             else attach_block_method recv name Nil r2)
        | _ -> fail "mere-ruby: expected name after ::")
     else (recv, toks)
@@ -682,6 +685,9 @@ and parse_primary = fn toks ->
       (e, expect r2 ")")
     else if str_eq p "[" then parse_array r
     else if str_eq p "\{" then parse_hash r
+    else if str_eq p "::" then
+      // leading ::Const — a top-level constant, read by bare name.
+      (match r with Cons (TId n, r2) -> (EConst n, r2) | _ -> fail "mere-ruby: expected constant after ::")
     else fail ("mere-ruby: unexpected token: " ++ p)
   | _ -> fail "mere-ruby: unexpected end of input"
 
@@ -975,9 +981,19 @@ and parse_stmt = fn toks ->
   | _ ->
     let (e, r) = parse_expr toks in (SExpr e, r)
 
+// `A::B::C` in a class/module header — the flat model keys on the full
+// joined name ("A::B") so `.class` etc. report it the way Ruby does.
+and parse_qualified_name = fn (acc: str) -> fn toks ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "::" then (match r with Cons (TId n, r2) -> parse_qualified_name (acc ++ "::" ++ n) r2 | _ -> (acc, toks))
+    else (acc, toks)
+  | _ -> (acc, toks)
+
 and parse_class = fn toks ->
   match toks with
-  | Cons (TId name, r) ->
+  | Cons (TId name0, r0) ->
+    let (name, r) = parse_qualified_name name0 r0 in
     let (super, r2) =
       (match r with
        | Cons (TP lt, r3) ->
@@ -1660,28 +1676,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EMethod (recv_e, name, arges) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
-    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    (match recv with
-     | VClass c ->
-       if str_eq name "new" then new_obj world c args
-       else if str_eq name "name" then VStr c
-       else if has_meth world c name then invoke world noblk recv c name args   // module / class method
-       else prim_method recv name args   // to_s / class / inspect on a class
-     | VObj id ->
-       let (meths, sup, ocls, ivars) = world in
-       let cls = map_get ocls (str_of_int id) in
-       if has_meth world cls name then invoke world noblk recv cls name args
-       else if str_eq name "class" then VClass cls
-       else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
-         (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
-       else prim_method recv name args   // universal fallbacks (to_s / nil? / inspect …)
-     | VSym s ->
-       // a captured `&block` sentinel: `.call`/`.()`/`.[]` runs the ambient block.
-       if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
-       then flow_value (run_block world noblk blk args)
-       else if str_eq s "&blk" && str_eq name "class" then VClass "Proc"
-       else prim_method recv name args
-     | _ -> prim_method recv name args)
+    // send / __send__ dispatch a runtime method name; respond_to? probes it.
+    if str_eq name "send" || str_eq name "__send__" || str_eq name "public_send" then
+      (match args with
+       | Cons (VSym m, rest) -> invoke_val env world blk recv m rest
+       | Cons (VStr m, rest) -> invoke_val env world blk recv m rest
+       | _ -> fail "mere-ruby: send expects a method name")
+    else if str_eq name "respond_to?" then
+      (match args with
+       | Cons (VSym m, _) -> VBool (responds world recv m)
+       | Cons (VStr m, _) -> VBool (responds world recv m)
+       | _ -> VBool false)
+    else invoke_val env world blk recv name args
   | EMethodB (recv_e, name, arges, bp, bb) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
@@ -1999,6 +2005,48 @@ and hash_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (a
 // core methods on primitive receivers (String / Array / Hash / Integer),
 // all non-mutating. Indexing (`[]`) and the read-heavy Enumerable methods
 // live here; block-taking iterators live in builtin_iter.
+// dispatch method `name` on any receiver value (the core of `recv.name`,
+// also reused by send/__send__).
+and invoke_val = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  match recv with
+  | VClass c ->
+    if str_eq name "new" then new_obj world c args
+    else if str_eq name "name" then VStr c
+    else if has_meth world c name then invoke world noblk recv c name args
+    else prim_method recv name args
+  | VObj id ->
+    let (meths, sup, ocls, ivars) = world in
+    let cls = map_get ocls (str_of_int id) in
+    if has_meth world cls name then invoke world noblk recv cls name args
+    else if str_eq name "class" then VClass cls
+    else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
+      (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
+    else prim_method recv name args
+  | VSym s ->
+    if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
+    then flow_value (run_block world noblk blk args)
+    else if str_eq s "&blk" && str_eq name "class" then VClass "Proc"
+    else prim_method recv name args
+  | _ -> prim_method recv name args
+
+// does `recv` respond to `name`? (used by respond_to?)
+and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
+  match recv with
+  | VObj id -> let (meths, sup, ocls, ivars) = world in has_meth world (map_get ocls (str_of_int id)) name || is_prim_method name
+  | VClass c -> str_eq name "new" || has_meth world c name || is_prim_method name
+  | _ -> is_prim_method name
+
+// a curated set of universally-available primitive method names.
+and is_prim_method = fn (name: str) ->
+  str_eq name "to_s" || str_eq name "inspect" || str_eq name "class" ||
+  str_eq name "nil?" || str_eq name "frozen?" || str_eq name "freeze" ||
+  str_eq name "dup" || str_eq name "clone" || str_eq name "itself" ||
+  str_eq name "tap" || str_eq name "is_a?" || str_eq name "kind_of?" ||
+  str_eq name "instance_of?" || str_eq name "respond_to?" || str_eq name "send" ||
+  str_eq name "__send__" || str_eq name "hash" || str_eq name "object_id" ||
+  str_eq name "==" || str_eq name "!="
+
 and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // universal
   if str_eq name "to_s" then VStr (to_s recv)
@@ -2336,13 +2384,21 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
          let key = if str_contains mname "#" then mname else cls ++ "#" ++ mname in
          let _ = map_set meths key (Meth (params, defs, mbody)) in ()
        | SAttr (mode, syms) -> add_attrs world cls mode syms
-       // a constant assignment in the body runs at definition time; stored by
-       // bare name so `Klass::CONST` (parsed as EConst CONST) resolves.
+       // a nested class / module registers under its qualified name so that
+       // `Outer::Inner` resolves (and reports its full name).
+       | SClass (cname, csuper, cbody) ->
+         let full = cls ++ "::" ++ cname in
+         let _ = if str_eq csuper "" then () else map_set sup full csuper in
+         register_class world full cbody
+       // a constant assignment in the body runs at definition time; stored
+       // both by qualified name (`Klass::CONST`) and bare name (lexical use).
        | SAssign (aname, e) ->
          if is_upper_first aname then
            let frame = map_new () in
            let noblk = (false, (Nil : str list), (Nil : Stmt list), frame) in
-           map_set consts aname (eval_e frame world noblk e)
+           let v = eval_e frame world noblk e in
+           let _ = map_set consts aname v in
+           map_set consts (cls ++ "::" ++ aname) v
          else ()
        // `alias new old` inside the class copies the method entry.
        | SAlias (n1, n2) ->
