@@ -78,8 +78,12 @@ type Stmt = SPuts of Expr list | SExpr of Expr
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
 // a bool for the exclusive form (1...5).
+// M10: arrays are mutable reference types, so VArr is a HANDLE (an id into
+// the top-level arr_store); its contents live in the store and are shared
+// by all aliases. VHsh stays an immutable value list (hash mutation is a
+// later milestone).
 type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
-         | VNil | VArr of Val list | VHsh of Val list
+         | VNil | VArr of int | VHsh of Val list
          | VObj of int | VClass of str | VSym of str
          | VRange of int * int * bool
          | VExc of str * str    // exception: class name, message
@@ -98,6 +102,20 @@ type Meth = Meth of str list * Stmt list;
 // exception value itself is stashed in the world's ivars under "$exc",
 // since raise unwinds via Mere's `fail` and try_or yields only a default).
 type Flow = FNext of Val | FReturn of Val | FRaise of Val;
+
+// ---- mutable-array store (M10) ------------------------------------------
+// A single top-level Map captured by every function below (no threading):
+// id (as str) -> the array's contents (a Val list). Arrays are handles
+// (VArr id) into it, so aliases share one mutable list. A fresh id is
+// map_len arr_store (arrays are never removed — memory grows, acceptable).
+let arr_store = map_new () in
+let arr_new = fn (xs: Val list) ->
+  let id = map_len arr_store in
+  let _ = map_set arr_store (str_of_int id) xs in
+  VArr id;
+let deref = fn (id: int) -> map_get arr_store (str_of_int id);
+let arr_set = fn (id: int) -> fn (xs: Val list) ->
+  let _ = map_set arr_store (str_of_int id) xs in ();
 
 // ---- small helpers ------------------------------------------------------
 let rec rev_app = fn xs -> fn acc ->
@@ -179,7 +197,7 @@ let rec lex_sq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 let is_punct2 = fn (p: str) ->
   str_eq p "**" || str_eq p "==" || str_eq p "!=" || str_eq p "<=" ||
   str_eq p ">=" || str_eq p "&&" || str_eq p "||" || str_eq p "=>" ||
-  str_eq p "..";
+  str_eq p ".." || str_eq p "<<";
 
 let is_punct1 = fn (c: str) ->
   str_eq c "+" || str_eq c "-" || str_eq c "*" || str_eq c "/" ||
@@ -290,6 +308,7 @@ let prec_of = fn (op: str) ->
   else if str_eq op "&&" then 2
   else if str_eq op "==" || str_eq op "!=" then 3
   else if str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=" then 4
+  else if str_eq op "<<" then 4
   else if str_eq op "+" || str_eq op "-" then 5
   else if str_eq op "*" || str_eq op "/" || str_eq op "%" then 6
   else 0;
@@ -950,7 +969,7 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
      | VBool y -> if x then y else (if y then false else true)
      | _ -> false)
   | VNil -> (match vb with VNil -> true | _ -> false)
-  | VArr xs -> (match vb with VArr ys -> eq_list xs ys | _ -> false)
+  | VArr x -> (match vb with VArr y -> eq_list (deref x) (deref y) | _ -> false)
   | VHsh xs -> (match vb with VHsh ys -> eq_list xs ys | _ -> false)
   // object identity (same handle); classes and symbols by value.
   | VObj x -> (match vb with VObj y -> x == y | _ -> false)
@@ -997,7 +1016,7 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   if str_eq op "+" then
     (match va with
      | VStr x -> (match vb with VStr y -> VStr (x ++ y) | _ -> fail "mere-ruby: no implicit conversion in +")
-     | VArr xs -> (match vb with VArr ys -> VArr (list_append xs ys) | _ -> fail "mere-ruby: no implicit conversion in +")
+     | VArr x -> (match vb with VArr y -> arr_new (list_append (deref x) (deref y)) | _ -> fail "mere-ruby: no implicit conversion in +")
      | VInt x -> (match vb with VInt y -> VInt (x + y) | VFlt y -> VFlt (float_of_int x + y) | _ -> fail "mere-ruby: + type error")
      | VFlt x -> (match vb with VInt y -> VFlt (x + float_of_int y) | VFlt y -> VFlt (x + y) | _ -> fail "mere-ruby: + type error")
      | _ -> fail "mere-ruby: + type error")
@@ -1034,6 +1053,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | VInt x -> (match vb with VInt y -> VInt (pow_int x y) | _ -> fail "mere-ruby: ** float exponent unsupported in M0")
      | VFlt x -> (match vb with VInt y -> VFlt (pow_flt x y) | _ -> fail "mere-ruby: ** float exponent unsupported in M0")
      | _ -> fail "mere-ruby: ** type error")
+  else if str_eq op "<<" then
+    // array append (mutating, returns the same array); string concat.
+    (match va with
+     | VArr id -> let _ = arr_set id (list_append (deref id) (Cons (vb, Nil))) in va
+     | VStr x -> (match vb with VStr y -> VStr (x ++ y) | _ -> fail "mere-ruby: << string needs a string")
+     | _ -> fail "mere-ruby: << type error")
   else fail ("mere-ruby: unknown operator: " ++ op);
 
 // ---- M5 core-method helpers (leaf: no world / block) ---------------------
@@ -1066,6 +1091,16 @@ let rec val_nth = fn (xs: Val list) -> fn (i: int) ->
 
 let rec val_list_of_strs = fn (ss: str list) ->
   match ss with Nil -> Nil | Cons (h, t) -> Cons (VStr h, val_list_of_strs t);
+
+// last element / all-but-last / set element i (M10 array mutation).
+let rec val_last = fn (xs: Val list) ->
+  match xs with Nil -> VNil | Cons (h, t) -> (match t with Nil -> h | _ -> val_last t);
+let rec val_init = fn (xs: Val list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> (match t with Nil -> Nil | _ -> Cons (h, val_init t));
+let rec val_set_at = fn (xs: Val list) -> fn (i: int) -> fn (v: Val) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if i == 0 then Cons (v, t) else Cons (h, val_set_at t (i - 1) v);
 
 let rec val_contains = fn (xs: Val list) -> fn (v: Val) ->
   match xs with Nil -> false | Cons (h, t) -> if rb_eq h v then true else val_contains t v;
@@ -1116,7 +1151,7 @@ let rec hash_haskey = fn (xs: Val list) -> fn (k: Val) ->
 let rec hash_pairs = fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
-  | Cons (k, rest) -> (match rest with Cons (v, t) -> Cons (VArr (Cons (k, Cons (v, Nil))), hash_pairs t) | Nil -> Nil);
+  | Cons (k, rest) -> (match rest with Cons (v, t) -> Cons (arr_new (Cons (k, Cons (v, Nil))), hash_pairs t) | Nil -> Nil);
 let rec hash_len = fn (xs: Val list) ->
   match xs with Nil -> 0 | Cons (_, rest) -> (match rest with Cons (_, t) -> 1 + hash_len t | Nil -> 0);
 
@@ -1154,7 +1189,7 @@ and inspect = fn (v: Val) ->
   match v with
   | VStr s -> "\"" ++ esc_str s 0 "" ++ "\""
   | VNil -> "nil"
-  | VArr xs -> "[" ++ join_inspect xs "" ++ "]"
+  | VArr id -> "[" ++ join_inspect (deref id) "" ++ "]"
   | VHsh xs -> "\{" ++ join_pairs xs "" ++ "}"
   | VSym s -> ":" ++ s
   | _ -> to_s v
@@ -1297,7 +1332,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      // `blk` (the enclosing method's block) is threaded so a yield inside
      // the iterated block reaches it (e.g. `@xs.each { |n| yield(n) }`).
      | _ -> builtin_iter world blk newblk recv name args)
-  | EArr items -> VArr (eval_args env world blk items)
+  | EArr items -> arr_new (eval_args env world blk items)
   | EHsh items -> VHsh (eval_args env world blk items)
   | EUn (op, a) ->
     if str_eq op "!" then
@@ -1335,7 +1370,7 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Nil -> Nil
   // splat argument: expand an array's elements into the argument list.
   | Cons (ESplat e, t) ->
-    let spread = (match eval_e env world blk e with VArr xs -> xs | v -> Cons (v, Nil)) in
+    let spread = (match eval_e env world blk e with VArr id -> deref id | v -> Cons (v, Nil)) in
     list_append spread (eval_args env world blk t)
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
@@ -1379,7 +1414,7 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
     let sc = nv - nb - na in
     let sc = if sc < 0 then 0 else sc in
     let _ = assign_parallel env world before (vtake values nb) in
-    let _ = assign_one env world sname (VArr (vtake (vdrop values nb) sc)) in
+    let _ = assign_one env world sname (arr_new (vtake (vdrop values nb) sc)) in
     let _ = assign_parallel env world after (vdrop values (nb + sc)) in
     ()
   else assign_parallel env world targets values
@@ -1470,11 +1505,11 @@ and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals: Val lis
 // reaches it); `theblk` is the block being iterated.
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   match recv with
-  | VArr xs ->
+  | VArr id -> let xs = deref id in
     if str_eq name "each" then let _ = arr_each world encl theblk xs in recv
-    else if str_eq name "map" then VArr (arr_map world encl theblk xs)
-    else if str_eq name "select" then VArr (arr_select world encl theblk xs)
-    else if str_eq name "reject" then VArr (arr_reject world encl theblk xs)
+    else if str_eq name "map" then arr_new (arr_map world encl theblk xs)
+    else if str_eq name "select" then arr_new (arr_select world encl theblk xs)
+    else if str_eq name "reject" then arr_new (arr_reject world encl theblk xs)
     else if str_eq name "each_with_index" then let _ = arr_each_idx world encl theblk xs 0 in recv
     else if str_eq name "reduce" || str_eq name "inject" then
       (match args with
@@ -1489,7 +1524,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
     if str_eq name "each" then let _ = range_each world encl theblk lo last in recv
-    else if str_eq name "map" then VArr (range_map world encl theblk lo last)
+    else if str_eq name "map" then arr_new (range_map world encl theblk lo last)
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Range")
   | VInt n ->
     if str_eq name "times" then let _ = range_each world encl theblk 0 (n - 1) in recv
@@ -1589,20 +1624,20 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | _ -> fail "mere-ruby: no to_f")
   else if str_eq name "to_a" then
     (match recv with
-     | VArr xs -> VArr xs
-     | VRange (lo, hi, excl) -> VArr (range_to_a lo (if excl then hi - 1 else hi))
+     | VArr id -> VArr id
+     | VRange (lo, hi, excl) -> arr_new (range_to_a lo (if excl then hi - 1 else hi))
      | _ -> fail "mere-ruby: no to_a")
   else if str_eq name "size" || str_eq name "length" then
     (match recv with
-     | VArr xs -> VInt (val_list_len xs) | VStr s -> VInt (str_len s)
+     | VArr id -> VInt (val_list_len (deref id)) | VStr s -> VInt (str_len s)
      | VHsh xs -> VInt (hash_len xs) | _ -> fail "mere-ruby: no size")
   else if str_eq name "empty?" then
     (match recv with
-     | VArr xs -> VBool (val_list_len xs == 0) | VStr s -> VBool (str_len s == 0)
+     | VArr id -> VBool (val_list_len (deref id) == 0) | VStr s -> VBool (str_len s == 0)
      | VHsh xs -> VBool (hash_len xs == 0) | _ -> fail "mere-ruby: no empty?")
   else if str_eq name "[]" then
     (match recv with
-     | VArr xs -> (match args with Cons (VInt i, _) -> val_nth xs (if i < 0 then val_list_len xs + i else i) | _ -> VNil)
+     | VArr id -> let xs = deref id in (match args with Cons (VInt i, _) -> val_nth xs (if i < 0 then val_list_len xs + i else i) | _ -> VNil)
      | VStr s -> (match args with Cons (VInt i, _) -> let j = if i < 0 then str_len s + i else i in if j >= 0 && j < str_len s then VStr (substring s j (j + 1)) else VNil | _ -> VNil)
      | VHsh xs -> (match args with Cons (k, _) -> hash_get xs k | _ -> VNil)
      | _ -> fail "mere-ruby: no []")
@@ -1619,17 +1654,17 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "downcase" then (match recv with VStr s -> VStr (str_downcase s) | _ -> fail "no downcase")
   else if str_eq name "capitalize" then (match recv with VStr s -> VStr (str_capitalize s) | _ -> fail "no capitalize")
   else if str_eq name "reverse" then
-    (match recv with VStr s -> VStr (str_rev s) | VArr xs -> VArr (val_rev xs Nil) | _ -> fail "no reverse")
+    (match recv with VStr s -> VStr (str_rev s) | VArr id -> arr_new (val_rev (deref id) Nil) | _ -> fail "no reverse")
   else if str_eq name "strip" then (match recv with VStr s -> VStr (str_trim s) | _ -> fail "no strip")
-  else if str_eq name "chars" then (match recv with VStr s -> VArr (str_chars_val s 0) | _ -> fail "no chars")
+  else if str_eq name "chars" then (match recv with VStr s -> arr_new (str_chars_val s 0) | _ -> fail "no chars")
   else if str_eq name "split" then
     (match recv with
-     | VStr s -> (match args with Cons (VStr sep, _) -> VArr (val_list_of_strs (str_split s sep)) | _ -> VArr (val_list_of_strs (str_split s " ")))
+     | VStr s -> (match args with Cons (VStr sep, _) -> arr_new (val_list_of_strs (str_split s sep)) | _ -> arr_new (val_list_of_strs (str_split s " ")))
      | _ -> fail "no split")
   else if str_eq name "include?" then
     (match recv with
      | VStr s -> (match args with Cons (VStr sub, _) -> VBool (str_contains s sub) | _ -> VBool false)
-     | VArr xs -> (match args with Cons (v, _) -> VBool (val_contains xs v) | _ -> VBool false)
+     | VArr id -> (match args with Cons (v, _) -> VBool (val_contains (deref id) v) | _ -> VBool false)
      | VHsh xs -> (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false)
      | _ -> fail "no include?")
   else if str_eq name "start_with?" then
@@ -1637,23 +1672,47 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "end_with?" then
     (match recv with VStr s -> (match args with Cons (VStr p, _) -> VBool (str_ends_with s p) | _ -> VBool false) | _ -> fail "no end_with?")
   // Array
-  else if str_eq name "first" then (match recv with VArr xs -> val_nth xs 0 | _ -> fail "no first")
-  else if str_eq name "last" then (match recv with VArr xs -> val_nth xs (val_list_len xs - 1) | _ -> fail "no last")
-  else if str_eq name "sort" then (match recv with VArr xs -> VArr (val_sort xs) | _ -> fail "no sort")
-  else if str_eq name "uniq" then (match recv with VArr xs -> VArr (val_uniq xs Nil) | _ -> fail "no uniq")
-  else if str_eq name "min" then (match recv with VArr xs -> (match xs with Nil -> VNil | Cons (h, t) -> val_min t h) | _ -> fail "no min")
-  else if str_eq name "max" then (match recv with VArr xs -> (match xs with Nil -> VNil | Cons (h, t) -> val_max t h) | _ -> fail "no max")
-  else if str_eq name "sum" then (match recv with VArr xs -> val_sum xs (VInt 0) | _ -> fail "no sum")
-  else if str_eq name "index" then (match recv with VArr xs -> (match args with Cons (v, _) -> val_index_of xs v 0 | _ -> VNil) | _ -> fail "no index")
+  else if str_eq name "first" then (match recv with VArr id -> val_nth (deref id) 0 | _ -> fail "no first")
+  else if str_eq name "last" then (match recv with VArr id -> let xs = deref id in val_nth xs (val_list_len xs - 1) | _ -> fail "no last")
+  else if str_eq name "sort" then (match recv with VArr id -> arr_new (val_sort (deref id)) | _ -> fail "no sort")
+  else if str_eq name "uniq" then (match recv with VArr id -> arr_new (val_uniq (deref id) Nil) | _ -> fail "no uniq")
+  else if str_eq name "min" then (match recv with VArr id -> (match deref id with Nil -> VNil | Cons (h, t) -> val_min t h) | _ -> fail "no min")
+  else if str_eq name "max" then (match recv with VArr id -> (match deref id with Nil -> VNil | Cons (h, t) -> val_max t h) | _ -> fail "no max")
+  else if str_eq name "sum" then (match recv with VArr id -> val_sum (deref id) (VInt 0) | _ -> fail "no sum")
+  else if str_eq name "index" then (match recv with VArr id -> (match args with Cons (v, _) -> val_index_of (deref id) v 0 | _ -> VNil) | _ -> fail "no index")
   else if str_eq name "count" then
     (match recv with
-     | VArr xs -> (match args with Cons (v, _) -> VInt (val_count_eq xs v) | Nil -> VInt (val_list_len xs))
+     | VArr id -> let xs = deref id in (match args with Cons (v, _) -> VInt (val_count_eq xs v) | Nil -> VInt (val_list_len xs))
      | _ -> fail "no count")
   else if str_eq name "join" then
-    (match recv with VArr xs -> (match args with Cons (VStr sep, _) -> VStr (val_join xs sep "" true) | _ -> VStr (val_join xs "" "" true)) | _ -> fail "no join")
+    (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> VStr (val_join xs sep "" true) | _ -> VStr (val_join xs "" "" true)) | _ -> fail "no join")
   // Hash
-  else if str_eq name "keys" then (match recv with VHsh xs -> VArr (hash_keys xs) | _ -> fail "no keys")
-  else if str_eq name "values" then (match recv with VHsh xs -> VArr (hash_values xs) | _ -> fail "no values")
+  // Array mutation (in place; VArr is a handle into the shared store).
+  else if str_eq name "push" || str_eq name "append" then
+    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (list_append (deref id) (Cons (v, Nil))) in recv | Nil -> recv) | _ -> fail "no push")
+  else if str_eq name "pop" then
+    (match recv with VArr id -> let xs = deref id in (match xs with Nil -> VNil | _ -> let _ = arr_set id (val_init xs) in val_last xs) | _ -> fail "no pop")
+  else if str_eq name "shift" then
+    (match recv with VArr id -> (match deref id with Nil -> VNil | Cons (h, t) -> let _ = arr_set id t in h) | _ -> fail "no shift")
+  else if str_eq name "unshift" || str_eq name "prepend" then
+    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (Cons (v, deref id)) in recv | Nil -> recv) | _ -> fail "no unshift")
+  else if str_eq name "concat" then
+    (match recv with VArr id -> (match args with Cons (VArr oid, _) -> let _ = arr_set id (list_append (deref id) (deref oid)) in recv | _ -> recv) | _ -> fail "no concat")
+  else if str_eq name "clear" then
+    (match recv with VArr id -> let _ = arr_set id Nil in recv | _ -> fail "no clear")
+  else if str_eq name "[]=" then
+    (match recv with
+     | VArr id ->
+       (match args with
+        | Cons (VInt i, Cons (v, _)) ->
+          let xs = deref id in
+          let n = val_list_len xs in
+          let j = if i < 0 then n + i else i in
+          let _ = arr_set id (val_set_at xs j v) in v
+        | _ -> VNil)
+     | _ -> fail "no []=")
+  else if str_eq name "keys" then (match recv with VHsh xs -> arr_new (hash_keys xs) | _ -> fail "no keys")
+  else if str_eq name "values" then (match recv with VHsh xs -> arr_new (hash_values xs) | _ -> fail "no values")
   else if str_eq name "key?" || str_eq name "has_key?" then
     (match recv with VHsh xs -> (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false) | _ -> fail "no key?")
   else fail ("mere-ruby: undefined method '" ++ name ++ "' for this value")
@@ -1741,7 +1800,7 @@ and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (arg
     let sc = nv - nb - na in
     let sc = if sc < 0 then 0 else sc in
     let _ = bind_seq frame before (vtake args nb) in
-    let _ = map_set frame sname (VArr (vtake (vdrop args nb) sc)) in
+    let _ = map_set frame sname (arr_new (vtake (vdrop args nb) sc)) in
     let _ = bind_seq frame after (vdrop args (nb + sc)) in
     ()
   else bind_strict frame name params args
@@ -1874,10 +1933,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let values =
       (match rhs with
        | Cons (single, Nil) ->
-         (match eval_e env world blk single with VArr xs -> xs | v -> Cons (v, Nil))
+         (match eval_e env world blk single with VArr id -> deref id | v -> Cons (v, Nil))
        | _ -> eval_args env world blk rhs) in
     let _ = assign_targets env world targets values in
-    FNext (VArr values)
+    FNext (arr_new values)
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
   match clauses with
@@ -1922,7 +1981,7 @@ and puts_args = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
 // which cannot be byte-matched — corpus objects define to_s).
 and puts_one = fn world -> fn (v: Val) ->
   match v with
-  | VArr xs -> puts_each world xs
+  | VArr id -> puts_each world (deref id)
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int id) in
