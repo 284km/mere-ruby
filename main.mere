@@ -78,7 +78,11 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // local, "@name" for an ivar, "*name" for a splat. The RHS is one
           // or more expressions (one array is destructured; several values
           // form the array).
-          | SMultiAssign of str list * Expr list;
+          | SMultiAssign of str list * Expr list
+          // 2h: `alias new old` (copy a method); `include M` (mix a module's
+          // instance methods into the class).
+          | SAlias of str * str
+          | SInclude of str;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -129,6 +133,9 @@ let globals = map_new ();
 // constants (Capitalized names) live in another; a class name that is not
 // an assigned constant reads as VClass.
 let consts = map_new ();
+// modules mixed into a class via `include`: class name -> "M1|M2|..." of the
+// included module names (searched after the class's own methods + ancestors).
+let includes = map_new ();
 let is_upper_first = fn (id: str) ->
   str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
 // iteration budget: a top-level counter ticked once per loop iteration so
@@ -800,6 +807,21 @@ and looks_like_multi = fn toks ->
   | Cons (TP star, Cons (TId _, _)) -> str_eq star "*"
   | _ -> false
 
+// an alias name is a bare identifier or a :symbol.
+and parse_alias_name = fn toks ->
+  match toks with
+  | Cons (TId n, r) -> (n, r)
+  | Cons (TSym n, r) -> (n, r)
+  | _ -> fail "mere-ruby: expected a name in alias"
+
+// consume optional `, Name, Name` after `include M` (ignored).
+and maybe_more_names = fn toks ->
+  match toks with
+  | Cons (TP c, r) ->
+    if str_eq c "," then (match r with Cons (TId _, r2) -> maybe_more_names r2 | _ -> (0, toks))
+    else (0, toks)
+  | _ -> (0, toks)
+
 and parse_multi = fn toks ->
   let (targets, r) = parse_target_list toks Nil in   // consumes through `=`
   let (rhs, r2) = parse_rhs_list r Nil in
@@ -852,6 +874,24 @@ and parse_stmt = fn toks ->
     else if str_eq id "attr_accessor" then parse_attr "rw" r
     else if str_eq id "attr_reader" then parse_attr "r" r
     else if str_eq id "attr_writer" then parse_attr "w" r
+    else if str_eq id "alias" then
+      // `alias new old` — names may be bare or :symbols.
+      let (n1, r1) = parse_alias_name r in
+      let (n2, r2) = parse_alias_name r1 in (SAlias (n1, n2), r2)
+    else if str_eq id "include" || str_eq id "prepend" then
+      // `include M[, N]` — mix module instance methods in (first module only
+      // for now; extra modules are consumed and ignored).
+      (match r with
+       | Cons (TId m, r2) -> let (_, r3) = maybe_more_names r2 in (SInclude m, r3)
+       | _ -> (SExpr ENil, r))
+    else if str_eq id "private" || str_eq id "public" || str_eq id "protected" ||
+            str_eq id "module_function" || str_eq id "extend" ||
+            str_eq id "require" || str_eq id "require_relative" then
+      // visibility / mixin-into-singleton / require: accepted as no-ops.
+      (match r with
+       | Cons (TNL, _) -> (SExpr ENil, r)
+       | Cons (TEOF, _) -> (SExpr ENil, r)
+       | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
     else if str_eq id "return" then
       (match r with
        | Cons (TNL, _) -> (SReturn ENil, r)
@@ -2054,12 +2094,30 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if str_eq cls "" then false
   else if map_has meths (cls ++ "#" ++ name) then true
+  else if includes_has world cls name then true
   else if map_has sup cls then has_meth world (map_get sup cls) name
   else false
+
+// does any module `include`d into `cls` define `name` as an instance method?
+and includes_has = fn world -> fn (cls: str) -> fn (name: str) ->
+  if map_has includes cls then any_mod_has world (str_split (map_get includes cls) "|") name else false
+
+and any_mod_has = fn world -> fn (mods: str list) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  match mods with
+  | Nil -> false
+  | Cons (m, r) -> if map_has meths (m ++ "#" ++ name) then true else any_mod_has world r name
+
+and mod_lookup = fn world -> fn (mods: str list) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  match mods with
+  | Nil -> fail ("mere-ruby: undefined method '" ++ name ++ "'")
+  | Cons (m, r) -> if map_has meths (m ++ "#" ++ name) then map_get meths (m ++ "#" ++ name) else mod_lookup world r name
 
 and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if map_has meths (cls ++ "#" ++ name) then map_get meths (cls ++ "#" ++ name)
+  else if includes_has world cls name then mod_lookup world (str_split (map_get includes cls) "|") name
   else if map_has sup cls then lookup_meth world (map_get sup cls) name
   else fail ("mere-ruby: undefined method '" ++ name ++ "' for an instance of " ++ cls)
 
@@ -2181,6 +2239,13 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
            let noblk = (false, (Nil : str list), (Nil : Stmt list), frame) in
            map_set consts aname (eval_e frame world noblk e)
          else ()
+       // `alias new old` inside the class copies the method entry.
+       | SAlias (n1, n2) ->
+         if map_has meths (cls ++ "#" ++ n2) then map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2))
+         else ()
+       // `include M` records the module for method lookup fallback.
+       | SInclude m ->
+         map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ m else m)
        | _ -> ()) in
     register_class world cls rest
 
@@ -2251,6 +2316,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = if str_eq super "" then () else map_set sup name super in
     let _ = register_class world name body in FNext VNil
   | SAttr (_, _) -> FNext VNil
+  | SAlias (n1, n2) ->
+    let (meths, sup, ocls, ivars) = world in
+    let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
+    FNext VNil
+  | SInclude _ -> FNext VNil   // top-level include: no-op (no enclosing class)
   | SReturn e -> FReturn (eval_e env world blk e)
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
