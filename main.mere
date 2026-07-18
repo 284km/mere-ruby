@@ -45,7 +45,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // M6 exceptions:
           | ERaise of Expr list                  // raise [Class][, msg]
           // M9: a splat argument `*expr` at a call site (expands an array).
-          | ESplat of Expr;
+          | ESplat of Expr
+          // 2f: ternary `cond ? a : b`.
+          | ETern of Expr * Expr * Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -231,7 +233,7 @@ let rec lex_sq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 let is_punct2 = fn (p: str) ->
   str_eq p "**" || str_eq p "==" || str_eq p "!=" || str_eq p "<=" ||
   str_eq p ">=" || str_eq p "&&" || str_eq p "||" || str_eq p "=>" ||
-  str_eq p ".." || str_eq p "<<" ||
+  str_eq p ".." || str_eq p "<<" || str_eq p "::" ||
   str_eq p "+=" || str_eq p "-=" || str_eq p "*=" || str_eq p "/=" || str_eq p "%=";
 
 let is_punct1 = fn (c: str) ->
@@ -239,7 +241,8 @@ let is_punct1 = fn (c: str) ->
   str_eq c "%" || str_eq c "<" || str_eq c ">" || str_eq c "!" ||
   str_eq c "(" || str_eq c ")" || str_eq c "[" || str_eq c "]" ||
   str_eq c "\{" || str_eq c "}" || str_eq c "," || str_eq c "=" ||
-  str_eq c "." || str_eq c "|" || str_eq c "&";
+  str_eq c "." || str_eq c "|" || str_eq c "&" ||
+  str_eq c "?" || str_eq c ":";
 
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
@@ -433,6 +436,20 @@ let rec skip_nls = fn toks ->
 // a range `lo..hi` / `lo...hi` sits above the binary operators (very low
 // precedence in Ruby).
 let rec parse_expr = fn toks ->
+  let (cond, r) = parse_range toks in
+  match r with
+  | Cons (TP op, rest) ->
+    if str_eq op "?" then
+      let (then_e, r2) = parse_expr rest in
+      (match r2 with
+       | Cons (TP colon, r3) ->
+         if str_eq colon ":" then let (else_e, r4) = parse_expr r3 in (ETern (cond, then_e, else_e), r4)
+         else fail "mere-ruby: expected : in ternary"
+       | _ -> fail "mere-ruby: expected : in ternary")
+    else (cond, r)
+  | _ -> (cond, r)
+
+and parse_range = fn toks ->
   let (lo, r) = parse_bin toks 1 in
   match r with
   | Cons (TP op, rest) ->
@@ -1441,6 +1458,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         | VInt hi -> VRange (lo, hi, excl)
         | _ -> fail "mere-ruby: range bounds must be integers")
      | _ -> fail "mere-ruby: range bounds must be integers")
+  | ETern (cond, then_e, else_e) ->
+    if truthy (eval_e env world blk cond) then eval_e env world blk then_e
+    else eval_e env world blk else_e
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -1495,7 +1515,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else prim_method recv name args   // to_s / class / inspect on a class
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
-       invoke world noblk recv (map_get ocls (str_of_int id)) name args
+       let cls = map_get ocls (str_of_int id) in
+       if has_meth world cls name then invoke world noblk recv cls name args
+       else if str_eq name "class" then VClass cls
+       else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
+         (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
+       else prim_method recv name args   // universal fallbacks (to_s / nil? / inspect …)
      | VSym s ->
        // a captured `&block` sentinel: `.call`/`.()`/`.[]` runs the ambient block.
        if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
@@ -1826,6 +1851,12 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "inspect" then VStr (inspect recv)
   else if str_eq name "class" then VClass (class_name recv)
   else if str_eq name "nil?" then VBool (match recv with VNil -> true | _ -> false)
+  else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
+    (match args with
+     | Cons (VClass c, _) ->
+       VBool (str_eq (class_name recv) c || str_eq c "Object" ||
+              (str_eq c "Numeric" && (match recv with VInt _ -> true | VFlt _ -> true | _ -> false)))
+     | _ -> VBool false)
   else if str_eq name "message" then (match recv with VExc (_, m) -> VStr m | _ -> VStr (to_s recv))
   else if str_eq name "to_i" then
     (match recv with
@@ -1964,6 +1995,14 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let frame = map_new () in
      let _ = bind_params frame world blk name params defaults args in
      (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
+
+// is `cls` the class `target` or a descendant of it? (plus universal roots)
+and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if str_eq cls target then true
+  else if str_eq target "Object" || str_eq target "BasicObject" then true
+  else if map_has sup cls then obj_is_a world (map_get sup cls) target
+  else false
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
