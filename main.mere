@@ -66,7 +66,12 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SBegin of Stmt list * (str list * str * Stmt list) list * Stmt list * Stmt list
           // `var = <stmt>` where stmt is a begin/end used as a value: run
           // the statement, bind its value (else propagate return/raise).
-          | SLocalFrom of str * Stmt;
+          | SLocalFrom of str * Stmt
+          // M8: multiple assignment. Targets are encoded names — a plain
+          // local, "@name" for an ivar, "*name" for a splat. The RHS is one
+          // or more expressions (one array is destructured; several values
+          // form the array).
+          | SMultiAssign of str list * Expr list;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -601,7 +606,47 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
     else (s, toks)
   | _ -> (s, toks)
 
+// a statement that begins `id ,` (a bare non-keyword identifier then a
+// comma) or `* id` is a multiple assignment target list.
+and looks_like_multi = fn toks ->
+  match toks with
+  | Cons (TId nm, Cons (TP c, _)) -> (if is_keyword nm then false else str_eq c ",")
+  | Cons (TP star, Cons (TId _, _)) -> str_eq star "*"
+  | _ -> false
+
+and parse_multi = fn toks ->
+  let (targets, r) = parse_target_list toks Nil in   // consumes through `=`
+  let (rhs, r2) = parse_rhs_list r Nil in
+  (SMultiAssign (targets, rhs), r2)
+
+and parse_target_list = fn toks -> fn (acc: str list) ->
+  let (t, r) = parse_one_target toks in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_target_list r2 (Cons (t, acc))
+    else if str_eq p "=" then (rev_app (Cons (t, acc)) Nil, r2)
+    else fail ("mere-ruby: expected , or = in multiple assignment, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated multiple-assignment targets"
+
+and parse_one_target = fn toks ->
+  match toks with
+  | Cons (TP star, r) ->
+    if str_eq star "*" then
+      (match r with Cons (TId nm, r2) -> ("*" ++ nm, r2) | _ -> ("*", r))
+    else fail "mere-ruby: bad assignment target"
+  | Cons (TId nm, r) -> (nm, r)   // plain local, or @ivar (@ kept in the name)
+  | _ -> fail "mere-ruby: bad assignment target"
+
+and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
+  let (e, r) = parse_expr toks in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_rhs_list r2 (Cons (e, acc))
+    else (rev_app (Cons (e, acc)) Nil, r)
+  | _ -> (rev_app (Cons (e, acc)) Nil, r)
+
 and parse_stmt = fn toks ->
+  if looks_like_multi toks then parse_multi toks else
   match toks with
   | Cons (TId id, r) ->
     if str_eq id "puts" then
@@ -624,7 +669,12 @@ and parse_stmt = fn toks ->
       (match r with
        | Cons (TNL, _) -> (SReturn ENil, r)
        | Cons (TEOF, _) -> (SReturn ENil, r)
-       | _ -> let (e, r2) = parse_expr r in (SReturn e, r2))
+       | _ ->
+         // `return a, b` returns an array of the values.
+         let (es, r2) = parse_rhs_list r Nil in
+         (match es with
+          | Cons (e, Nil) -> (SReturn e, r2)
+          | _ -> (SReturn (EArr es), r2)))
     else if is_ivar id then
       // @name = expr, else an expression (@name read, or a method chain)
       (match r with
@@ -1270,6 +1320,59 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Nil -> Nil
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
+// ---- multiple assignment ------------------------------------------------
+and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
+  let (meths, sup, ocls, ivars) = world in
+  if str_len tgt > 0 && str_eq (char_at tgt 0) "@" then
+    (match map_get env "self" with
+     | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ substring tgt 1 (str_len tgt)) v in ()
+     | _ -> ())
+  else let _ = map_set env tgt v in ()
+
+and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
+
+and has_splat = fn (ts: str list) ->
+  match ts with Nil -> false | Cons (t, r) -> if tgt_is_splat t then true else has_splat r
+
+and vlen = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + vlen t
+and vtake = fn (xs: Val list) -> fn (n: int) ->
+  if n <= 0 then Nil else (match xs with Nil -> Nil | Cons (h, t) -> Cons (h, vtake t (n - 1)))
+and vdrop = fn (xs: Val list) -> fn (n: int) ->
+  if n <= 0 then xs else (match xs with Nil -> Nil | Cons (_, t) -> vdrop t (n - 1))
+
+// assign values to targets in parallel (no splat); missing values are nil.
+and assign_parallel = fn env -> fn world -> fn (targets: str list) -> fn (values: Val list) ->
+  match targets with
+  | Nil -> ()
+  | Cons (t, ts) ->
+    (match values with
+     | Nil -> let _ = assign_one env world t VNil in assign_parallel env world ts Nil
+     | Cons (v, vs) -> let _ = assign_one env world t v in assign_parallel env world ts vs)
+
+and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values: Val list) ->
+  if has_splat targets then
+    let before = take_until_splat targets in
+    let after = after_splat targets in
+    let sname = splat_name targets in
+    let nb = list_str_len before in
+    let na = list_str_len after in
+    let nv = vlen values in
+    let sc = nv - nb - na in
+    let sc = if sc < 0 then 0 else sc in
+    let _ = assign_parallel env world before (vtake values nb) in
+    let _ = assign_one env world sname (VArr (vtake (vdrop values nb) sc)) in
+    let _ = assign_parallel env world after (vdrop values (nb + sc)) in
+    ()
+  else assign_parallel env world targets values
+
+and take_until_splat = fn (ts: str list) ->
+  match ts with Nil -> Nil | Cons (t, r) -> if tgt_is_splat t then Nil else Cons (t, take_until_splat r)
+and after_splat = fn (ts: str list) ->
+  match ts with Nil -> Nil | Cons (t, r) -> if tgt_is_splat t then r else after_splat r
+and splat_name = fn (ts: str list) ->
+  match ts with Nil -> "" | Cons (t, r) -> if tgt_is_splat t then substring t 1 (str_len t) else splat_name r
+and list_str_len = fn (ts: str list) -> match ts with Nil -> 0 | Cons (_, t) -> 1 + list_str_len t
+
 // build an exception value from raise's arguments. `raise "m"` is a
 // RuntimeError; `raise Cls` / `raise Cls, "m"` uses the class; `raise e`
 // re-raises an existing exception.
@@ -1718,6 +1821,16 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (match exec_stmt env world blk s with
      | FNext v -> let _ = map_set env name v in FNext v
      | other -> other)
+  | SMultiAssign (targets, rhs) ->
+    // build the value list: a single array RHS is destructured; several
+    // values (or a single non-array) form the list.
+    let values =
+      (match rhs with
+       | Cons (single, Nil) ->
+         (match eval_e env world blk single with VArr xs -> xs | v -> Cons (v, Nil))
+       | _ -> eval_args env world blk rhs) in
+    let _ = assign_targets env world targets values in
+    FNext (VArr values)
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
   match clauses with
