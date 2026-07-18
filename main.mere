@@ -54,7 +54,10 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | EDefined of Expr
           // 2k: super. bool = zsuper (bare `super`, forward current args);
           // when false the args are explicit (super() or super(a, b)).
-          | ESuper of bool * Expr list;
+          | ESuper of bool * Expr list
+          // 2m: `&expr` block-pass marker in an argument list (only &:sym is
+          // turned into a real block; other forms are best-effort).
+          | EBlockPass of Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -321,8 +324,15 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let j = scan_ident s (i + 1) in
       Cons (TId (substring s i j), lex_go s j)
     else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
-      // :symbol
-      let j = scan_ident s (i + 1) in
+      // :symbol — include a trailing ? or ! (e.g. :even?, :sort!), guarding !=.
+      let j0 = scan_ident s (i + 1) in
+      let j =
+        if j0 < str_len s then
+          let cj = char_at s j0 in
+          if str_eq cj "?" then j0 + 1
+          else if str_eq cj "!" && (j0 + 1 >= str_len s || (if str_eq (char_at s (j0 + 1)) "=" then false else true)) then j0 + 1
+          else j0
+        else j0 in
       Cons (TSym (substring s (i + 1) j), lex_go s j)
     else
       let three = if i + 3 <= str_len s then substring s i (i + 3) else "" in
@@ -561,11 +571,21 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
 
 // a trailing `{ }` / `do end` block turns a method call into EMethodB.
 and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr list) -> fn toks ->
-  if starts_block toks then
+  let (argv2, hasbp, bp0, bb0) = extract_block_pass argv in
+  if hasbp then parse_postfix_more (EMethodB (recv, name, argv2, bp0, bb0)) toks
+  else if starts_block toks then
     let (bp, bb, r) = parse_block toks in
     // continue the chain: `arr.map { } .sum` etc.
     parse_postfix_more (EMethodB (recv, name, argv, bp, bb)) r
   else parse_postfix_more (EMethod (recv, name, argv)) toks
+
+// A trailing `&:sym` block-pass arg becomes a real one-param block
+// `{ |__bp| __bp.sym }`. Returns (args-without-bp, found?, bparams, bbody).
+and extract_block_pass = fn (argv: Expr list) ->
+  match rev_app argv Nil with
+  | Cons (EBlockPass (ESym s), rrest) ->
+    (rev_app rrest Nil, true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil))
+  | _ -> (argv, false, (Nil : str list), (Nil : Stmt list))
 
 and starts_block = fn toks ->
   match toks with
@@ -612,15 +632,23 @@ and parse_block_params = fn toks ->
 
 and parse_pipe_params = fn toks -> fn (acc: str list) ->
   match toks with
-  | Cons (TP bar, r) -> if str_eq bar "|" then (rev_app acc Nil, r) else fail "mere-ruby: bad block params"
-  | Cons (TId name, r) ->
-    (match r with
-     | Cons (TP p, r2) ->
-       if str_eq p "," then parse_pipe_params r2 (Cons (name, acc))
-       else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, r2)
-       else fail "mere-ruby: expected , or | in block params"
-     | _ -> fail "mere-ruby: unterminated block params")
+  | Cons (TP bar, r) ->
+    if str_eq bar "|" then (rev_app acc Nil, r)
+    else if str_eq bar "*" then
+      (match r with Cons (TId n, r2) -> pipe_after ("*" ++ n) r2 acc | _ -> pipe_after "*" r acc)
+    else if str_eq bar "&" then
+      (match r with Cons (TId n, r2) -> pipe_after ("&" ++ n) r2 acc | _ -> pipe_after "&" r acc)
+    else fail "mere-ruby: bad block params"
+  | Cons (TId name, r) -> pipe_after name r acc
   | _ -> fail "mere-ruby: expected block parameter"
+
+and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "," then parse_pipe_params r (Cons (name, acc))
+    else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, r)
+    else fail "mere-ruby: expected , or | in block params"
+  | _ -> fail "mere-ruby: unterminated block params"
 
 and parse_primary = fn toks ->
   match toks with
@@ -642,7 +670,7 @@ and parse_primary = fn toks ->
          else (EYield Nil, r)
        | Cons (TNL, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
-       | _ -> let (e, r2) = parse_expr r in (EYield (Cons (e, Nil)), r2))
+       | _ -> let (es, r2) = parse_puts_args r Nil in (EYield es, r2))
     else if str_eq id "raise" then
       (match r with
        | Cons (TNL, _) -> (ERaise Nil, r)
@@ -669,7 +697,9 @@ and parse_primary = fn toks ->
        | Cons (TP p, r2) ->
          if str_eq p "(" then
            let (argv, r3) = parse_call_args r2 in
-           if starts_block r3 then
+           let (argv2, hasbp, bp0, bb0) = extract_block_pass argv in
+           if hasbp then (ECallB (id, argv2, bp0, bb0), r3)
+           else if starts_block r3 then
              let (bp, bb, r4) = parse_block r3 in (ECallB (id, argv, bp, bb), r4)
            else (ECall (id, argv), r3)
          else if starts_block r then
@@ -755,6 +785,9 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
     else if str_eq star "..." then
       // `foo(...)` forwards the collected forwarding args.
       parse_call_sep r0 (Cons (ESplat (EVar "__fwd"), pos)) hp
+    else if str_eq star "&" then
+      // block-pass `&:sym` / `&expr` — recorded as a trailing marker arg.
+      let (be, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EBlockPass be, pos)) hp
     else parse_call_pos_arg toks pos hp
   | _ -> parse_call_pos_arg toks pos hp
 
@@ -1631,6 +1664,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                else eval_args env world blk arges in
     let supercls = if map_has sup defcls then map_get sup defcls else "" in
     invoke world blk recv supercls meth args
+  | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -1865,13 +1899,25 @@ and flow_value = fn (f: Flow) ->
   match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
-and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
+and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals0: Val list) ->
+  // auto-splat: a block with 2+ params given a single array destructures it.
+  let argvals =
+    (match params with
+     | Cons (_, Cons (_, _)) -> (match argvals0 with Cons (VArr id, Nil) -> deref id | _ -> argvals0)
+     | _ -> argvals0) in
   match params with
   | Nil -> ()
   | Cons (p, ps) ->
-    (match argvals with
-     | Nil -> let _ = map_set cenv p VNil in bind_block_params cenv ps Nil
-     | Cons (a, rest) -> let _ = map_set cenv p a in bind_block_params cenv ps rest)
+    if str_len p > 0 && str_eq (char_at p 0) "*" then
+      // *rest collects the remaining args (fixed params after a splat are rare
+      // in blocks and not distributed here).
+      let _ = map_set cenv (substring p 1 (str_len p)) (arr_new argvals) in ()
+    else if str_len p > 0 && str_eq (char_at p 0) "&" then
+      let _ = map_set cenv (substring p 1 (str_len p)) VNil in bind_block_params cenv ps argvals
+    else
+      (match argvals with
+       | Nil -> let _ = map_set cenv p VNil in bind_block_params cenv ps Nil
+       | Cons (a, rest) -> let _ = map_set cenv p a in bind_block_params cenv ps rest)
 
 // built-in block-taking iterators on primitive receivers. `encl` is the
 // enclosing method's block (threaded so a yield inside the iterated block
