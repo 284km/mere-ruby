@@ -7,3 +7,6 @@ puts 0.25 * 4
 puts 2.0 ** 10
 puts 1 + 2.5
 puts -1.5
+puts 0.1 + 0.2
+puts 1.0 / 3
+puts 2.0 / 7

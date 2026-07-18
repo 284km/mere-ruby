@@ -3,24 +3,32 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
-## 1. `str_of_float` is not round-trip faithful — blocks float parity
+## 1. `str_of_float` was not round-trip faithful — FIXED upstream (Mere v0.1.65)
 
-The one real blocker found in M0. Mere formats floats with ~12
+The one real blocker found in M0. Mere formatted floats with 12
 significant digits, so:
 
-| expression | ruby prints | mere-ruby can print |
+| expression | ruby prints | mere-ruby could print |
 |---|---|---|
 | `0.1 + 0.2` | `0.30000000000000004` | `0.3` |
 | `1.0 / 3` | `0.3333333333333333` | `0.333333333333` |
 
 Ruby (like modern JS, Python) uses shortest round-trip formatting: the
 fewest digits that parse back to the same double. Mere's `str_of_float`
-loses information — `float_of_str (str_of_float x)` is not `x`. There
-is no way to recover the missing digits from inside mere-ruby, so full float
-output parity is blocked on an upstream fix (a shortest-round-trip
-`str_of_float` across the backends). Until then the corpus restricts
-itself to floats whose 12-digit form equals the shortest form, and a
-deliberate negative-control file documents the divergence.
+lost information — `float_of_str (str_of_float x)` was not `x` — and
+the missing digits cannot be recovered from inside mere-ruby, so float
+output parity was blocked on an upstream fix.
+
+**Fixed the same day in Mere v0.1.65**: all four backends now widen from
+12 toward 17 significant digits until the string parses back to the same
+double. Reading the four implementations side by side for the fix also
+surfaced a pre-existing cross-backend divergence (the LLVM helper
+rendered whole floats as `100.` where every other backend prints
+`100.0`) — fixed in the same slice. The corpus now includes
+`puts 0.1 + 0.2` and `puts 1.0 / 3` and matches ruby byte-for-byte.
+The dogfood loop working as designed: the first thing the Ruby
+interpreter could not print was a bug in the host language, not in the
+interpreter.
 
 ## 2. Writing a lexer in Mere, tripped by Mere's own lexer
 
