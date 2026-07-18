@@ -47,7 +47,11 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // M9: a splat argument `*expr` at a call site (expands an array).
           | ESplat of Expr
           // 2f: ternary `cond ? a : b`.
-          | ETern of Expr * Expr * Expr;
+          | ETern of Expr * Expr * Expr
+          // 2i: subjectless `case` marker (when-conditions are truthiness
+          // tests); `defined?(e)` returns a description string or nil.
+          | ECaseNone
+          | EDefined of Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -638,6 +642,13 @@ and parse_primary = fn toks ->
        | Cons (TNL, _) -> (ERaise Nil, r)
        | Cons (TEOF, _) -> (ERaise Nil, r)
        | _ -> let (es, r2) = parse_puts_args r Nil in (ERaise es, r2))
+    else if str_eq id "defined?" then
+      // defined?(e) or defined? e — never evaluates e for its value.
+      (match r with
+       | Cons (TP p, r2) ->
+         if str_eq p "(" then let (e, r3) = parse_expr r2 in (EDefined e, expect r3 ")")
+         else let (e, r3) = parse_unary r in (EDefined e, r3)
+       | _ -> let (e, r3) = parse_unary r in (EDefined e, r3))
     else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
     else
       // `name(args)` / `name(args) { block }` / `name { block }` / bare name.
@@ -1056,8 +1067,11 @@ and parse_while = fn toks -> fn (negate: bool) ->
   (SWhile (cond, body), expect_kw r2 "end")
 
 and parse_case = fn toks ->
-  let (subj, r) = parse_expr toks in
-  parse_whens subj r Nil
+  // `case` immediately followed by a newline is subjectless: the when
+  // conditions are truthiness tests rather than === against a subject.
+  match toks with
+  | Cons (TNL, _) -> parse_whens ECaseNone toks Nil
+  | _ -> let (subj, r) = parse_expr toks in parse_whens subj r Nil
 
 and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
   let t = skip_nls toks in
@@ -1546,6 +1560,34 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ETern (cond, then_e, else_e) ->
     if truthy (eval_e env world blk cond) then eval_e env world blk then_e
     else eval_e env world blk else_e
+  | ECaseNone -> VNil   // only meaningful as an SCase subject marker
+  | EDefined e ->
+    (match e with
+     | ENil -> VStr "nil"
+     | EBool b -> if b then VStr "true" else VStr "false"
+     | EBin (_, _, _) -> VStr "method"   // operators are method calls
+     | EUn (_, _) -> VStr "method"
+     | ESelf -> VStr "self"
+     | EVar name ->
+       if map_has env name then VStr "local-variable"
+       else if is_method_defined env world name then VStr "method"
+       else VNil
+     | ECall (name, _) -> if is_method_defined env world name then VStr "method" else VNil
+     | ECallB (name, _, _, _) -> if is_method_defined env world name then VStr "method" else VNil
+     | EIVar name ->
+       let (meths, sup, ocls, ivars) = world in
+       (match map_get env "self" with
+        | VObj id -> if map_has ivars (str_of_int id ++ "@" ++ name) then VStr "instance-variable" else VNil
+        | _ -> VNil)
+     | EConst name -> if map_has consts name then VStr "constant" else VNil
+     | EMethod (recv, name, _) ->
+       let (meths, sup, ocls, ivars) = world in
+       (match eval_e env world blk recv with
+        | VObj id -> if has_meth world (map_get ocls (str_of_int id)) name then VStr "method" else VNil
+        | VClass c -> if str_eq name "new" || has_meth world c name then VStr "method" else VNil
+        | _ -> VStr "method")
+     | EYield _ -> let (has, _, _, _) = blk in if has then VStr "yield" else VNil
+     | _ -> VStr "expression")   // literals, operators, ranges, ternary, etc.
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -1936,6 +1978,15 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "inspect" then VStr (inspect recv)
   else if str_eq name "class" then VClass (class_name recv)
   else if str_eq name "nil?" then VBool (match recv with VNil -> true | _ -> false)
+  else if str_eq name "frozen?" then
+    // numbers/symbols/nil/booleans are frozen; strings, arrays, hashes and
+    // objects are mutable (no frozen_string_literal here).
+    VBool (match recv with VInt _ -> true | VFlt _ -> true | VBool _ -> true | VNil -> true | VSym _ -> true | _ -> false)
+  else if str_eq name "freeze" then recv
+  else if str_eq name "dup" || str_eq name "clone" then
+    (match recv with VArr id -> arr_new (deref id) | _ -> recv)
+  else if str_eq name "itself" then recv
+  else if str_eq name "tap" then recv
   else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
     (match args with
      | Cons (VClass c, _) ->
@@ -2090,6 +2141,16 @@ and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
   else false
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
+// is `name` callable here — a top-level method, or a method on self's class?
+and is_method_defined = fn env -> fn world -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has meths name then true
+  else if map_has env "self" then
+    (match map_get env "self" with
+     | VObj id -> has_meth world (map_get ocls (str_of_int id)) name
+     | _ -> false)
+  else false
+
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if str_eq cls "" then false
@@ -2307,7 +2368,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SIf (clauses, els) -> run_if env world blk clauses els
   | SWhile (cond, body) -> run_while env world blk cond body
   | SCase (subj, whens, els) ->
-    run_case env world blk (eval_e env world blk subj) whens els
+    (match subj with
+     | ECaseNone -> run_case_truthy env world blk whens els
+     | _ -> run_case env world blk (eval_e env world blk subj) whens els)
   | SDef (name, params, defs, body) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = map_set meths name (Meth (params, defs, body)) in FNext VNil
@@ -2394,6 +2457,20 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
   match vs with
   | Nil -> false
   | Cons (e, t) -> rb_eq (eval_e env world blk e) v || when_matches env world blk v t
+
+// subjectless case: the first when whose any condition is truthy wins.
+and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt list) ->
+  match whens with
+  | Nil -> run_stmts env world blk els
+  | Cons (w, rest) ->
+    let (vs, b) = w in
+    if any_truthy env world blk vs then run_stmts env world blk b
+    else run_case_truthy env world blk rest els
+
+and any_truthy = fn env -> fn world -> fn blk -> fn (vs: Expr list) ->
+  match vs with
+  | Nil -> false
+  | Cons (e, t) -> truthy (eval_e env world blk e) || any_truthy env world blk t
 
 and puts_args = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
   match es with
