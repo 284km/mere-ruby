@@ -3,6 +3,42 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
+## M3. A `Map` cannot live in a record or variant field (region annotations)
+
+Not a bug — a sharp edge in the region system, and the decision it
+forced. The object model wants mutable per-object state: an instance
+variable table. The natural shape is a value case `VObj of Map[str, Val]`,
+or a record `World { ivars: Map[..], classes: Map[..], ... }` bundling
+the interpreter's mutable tables.
+
+Neither compiles. Writing a `Map` type in a declaration needs its region
+parameter (`Map[__heap, str, Val]`, three arguments, not two), and even
+with the region spelled out, `map_new ()`'s inferred region would not
+unify with the annotated `__heap` — the checker reports `expected __heap,
+got &__heap unit`. A `Map` flows fine as a *bare inferred value* (as it
+has since M1), but the moment its type must be *written down* in a field,
+the region annotation fights back.
+
+Two consequences shaped M3's design:
+
+1. **Objects are integer handles, not map-carrying values.** `VObj of int`
+   is an id; a global object table (`id -> class`) and instance-variable
+   table (`"id@name" -> value`) hold the mutable state. This is a
+   legitimate representation — many real VMs do exactly this — and it
+   keeps `Val` free of an awkward recursive-through-`Map` type.
+2. **The interpreter's world is a *tuple* of maps, not a record.** Tuples
+   need no type declaration, so `(meths, sup, ocls, ivars)` threads as one
+   parameter with none of the annotation trouble, destructured where a
+   map is needed. A record would have hit the wall above.
+
+The tax is real: every evaluator function that touches object state
+destructures the world tuple, and the whole world threads through the
+mutual recursion beside `env`. It is the M1 "no ref cells" story at
+scale — mutable interpreter state has to live in maps threaded by hand.
+It is the strongest data point yet for either scalar `ref` cells or a
+region-annotation ergonomics pass in Mere; noted upstream, not yet a
+change. The milestone itself needed no host-language fix.
+
 ## M2. A C-backend duplicate-definition bug — FIXED upstream (Mere v0.1.66)
 
 The biggest find so far, and the first bug in Mere's *code generator*

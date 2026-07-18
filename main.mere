@@ -20,7 +20,7 @@
 
 // ---- values and syntax trees --------------------------------------------
 type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
-         | TP of str | TNL | TEOF;
+         | TSym of str | TP of str | TNL | TEOF;
 
 // EHsh / VHsh hold interleaved [k1, v1, k2, v2, ...] lists (M0
 // simplification: literal order is preserved, which matches Ruby's
@@ -28,25 +28,40 @@ type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
 type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ENil | EArr of Expr list | EHsh of Expr list
           | EBin of str * Expr * Expr | EUn of str * Expr
-          | EVar of str | ECall of str * Expr list;
+          | EVar of str | ECall of str * Expr list
+          // M3 object model:
+          | ESym of str          // :name
+          | ESelf                // self
+          | EConst of str        // a capitalized name (a class reference)
+          | EIVar of str         // @name
+          | EMethod of Expr * str * Expr list;  // recv.name(args)
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
 // negated condition at parse time. SCase: subject, when-clauses (each:
 // candidate values, body), else body. SDef: name, params, body.
+// M3: SClass name, superclass ("" = none), body (defs / attrs);
+// SIVarAssign @name = e; SAttr mode ("r"/"w"/"rw"), symbol names.
 type Stmt = SPuts of Expr list | SExpr of Expr
           | SAssign of str * Expr
           | SIf of (Expr * Stmt list) list * Stmt list
           | SWhile of Expr * Stmt list
           | SCase of Expr * (Expr list * Stmt list) list * Stmt list
           | SDef of str * str list * Stmt list
-          | SReturn of Expr;
+          | SReturn of Expr
+          | SClass of str * str * Stmt list
+          | SIVarAssign of str * Expr
+          | SAttr of str * str list;
 
+// VObj holds an object id (a handle into the world's object tables);
+// VClass holds a class name. VSym is a Ruby symbol.
 type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
-         | VNil | VArr of Val list | VHsh of Val list;
+         | VNil | VArr of Val list | VHsh of Val list
+         | VObj of int | VClass of str | VSym of str;
 
 // A user method: parameter names and body. Stored in the methods table
-// (a Map[str, Method]), a namespace separate from local variables.
+// (a Map[str, Meth]) keyed by bare name (top-level) or "Class#name"
+// (instance method), a namespace separate from local variables.
 type Meth = Meth of str list * Stmt list;
 
 // Statement execution result: FNext carries the statement's value (so a
@@ -116,7 +131,8 @@ let is_punct1 = fn (c: str) ->
   str_eq c "+" || str_eq c "-" || str_eq c "*" || str_eq c "/" ||
   str_eq c "%" || str_eq c "<" || str_eq c ">" || str_eq c "!" ||
   str_eq c "(" || str_eq c ")" || str_eq c "[" || str_eq c "]" ||
-  str_eq c "\{" || str_eq c "}" || str_eq c "," || str_eq c "=";
+  str_eq c "\{" || str_eq c "}" || str_eq c "," || str_eq c "=" ||
+  str_eq c ".";
 
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
@@ -141,6 +157,14 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if is_alpha c then
       let j = scan_ident s i in
       Cons (TId (substring s i j), lex_go s j)
+    else if str_eq c "@" then
+      // @ivar: keep the leading @ in the identifier text
+      let j = scan_ident s (i + 1) in
+      Cons (TId (substring s i j), lex_go s j)
+    else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
+      // :symbol
+      let j = scan_ident s (i + 1) in
+      Cons (TSym (substring s (i + 1) j), lex_go s j)
     else
       let two = if i + 2 <= str_len s then substring s i (i + 2) else "" in
       if is_punct2 two then Cons (TP two, lex_go s (i + 2))
@@ -153,8 +177,16 @@ let is_keyword = fn (id: str) ->
   str_eq id "elsif" || str_eq id "else" || str_eq id "end" ||
   str_eq id "while" || str_eq id "until" || str_eq id "case" ||
   str_eq id "when" || str_eq id "then" || str_eq id "do" ||
-  str_eq id "def" || str_eq id "return" ||
+  str_eq id "def" || str_eq id "return" || str_eq id "class" ||
+  str_eq id "self" ||
   str_eq id "true" || str_eq id "false" || str_eq id "nil";
+
+// a capitalized bare identifier is a constant (a class reference here).
+let is_cap = fn (id: str) ->
+  let o = ord (char_at id 0) in o >= 65 && o <= 90;
+
+// an @-prefixed identifier is an instance variable.
+let is_ivar = fn (id: str) -> str_len id > 0 && str_eq (char_at id 0) "@";
 
 // keywords that close (or continue) an enclosing block: statement lists
 // stop before them without consuming.
@@ -206,7 +238,7 @@ and parse_unary = fn toks ->
   | _ -> parse_pow toks
 
 and parse_pow = fn toks ->
-  let (b, r) = parse_primary toks in
+  let (b, r) = parse_postfix toks in
   match r with
   | Cons (TP op, rest) ->
     if str_eq op "**" then
@@ -214,15 +246,45 @@ and parse_pow = fn toks ->
     else (b, r)
   | _ -> (b, r)
 
+// postfix method-call chains: `recv.name`, `recv.name(args)`, and the
+// setter form `recv.name = expr` (parsed as a call to `name=`).
+and parse_postfix = fn toks ->
+  let (e, r) = parse_primary toks in
+  parse_postfix_more e r
+
+and parse_postfix_more = fn (recv: Expr) -> fn toks ->
+  match toks with
+  | Cons (TP dot, r) ->
+    if str_eq dot "." then
+      (match r with
+       | Cons (TId name, r2) ->
+         (match r2 with
+          | Cons (TP p, r3) ->
+            if str_eq p "(" then
+              let (argv, r4) = parse_call_args r3 in
+              parse_postfix_more (EMethod (recv, name, argv)) r4
+            else if str_eq p "=" then
+              let (rhs, r4) = parse_expr r3 in
+              (EMethod (recv, name ++ "=", Cons (rhs, Nil)), r4)
+            else parse_postfix_more (EMethod (recv, name, Nil)) r2
+          | _ -> parse_postfix_more (EMethod (recv, name, Nil)) r2)
+       | _ -> fail "mere-ruby: expected method name after .")
+    else (recv, toks)
+  | _ -> (recv, toks)
+
 and parse_primary = fn toks ->
   match toks with
   | Cons (TInt n, r) -> (EInt n, r)
   | Cons (TFlt f, r) -> (EFlt f, r)
   | Cons (TStrL s, r) -> (EStrL s, r)
+  | Cons (TSym s, r) -> (ESym s, r)
   | Cons (TId id, r) ->
     if str_eq id "true" then (EBool true, r)
     else if str_eq id "false" then (EBool false, r)
     else if str_eq id "nil" then (ENil, r)
+    else if str_eq id "self" then (ESelf, r)
+    else if is_ivar id then (EIVar (substring id 1 (str_len id)), r)
+    else if is_cap id then (EConst id, r)
     else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
     else
       // `name(args)` is a call; a bare `name` is a variable read (or, if
@@ -376,23 +438,66 @@ and parse_stmt = fn toks ->
     else if str_eq id "until" then parse_while r true
     else if str_eq id "case" then parse_case r
     else if str_eq id "def" then parse_def r
+    else if str_eq id "class" then parse_class r
+    else if str_eq id "attr_accessor" then parse_attr "rw" r
+    else if str_eq id "attr_reader" then parse_attr "r" r
+    else if str_eq id "attr_writer" then parse_attr "w" r
     else if str_eq id "return" then
       (match r with
        | Cons (TNL, _) -> (SReturn ENil, r)
        | Cons (TEOF, _) -> (SReturn ENil, r)
        | _ -> let (e, r2) = parse_expr r in (SReturn e, r2))
-    else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
-    else
-      // identifier: assignment when followed by `=`, else an expression
+    else if is_ivar id then
+      // @name = expr, else an expression (@name read, or a method chain)
       (match r with
        | Cons (TP p, r2) ->
          if str_eq p "=" then
+           let (e, r3) = parse_expr r2 in
+           (SIVarAssign (substring id 1 (str_len id), e), r3)
+         else let (e, r4) = parse_expr toks in (SExpr e, r4)
+       | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
+    else
+      // identifier or expression keyword (self/true/false/nil/Const):
+      // a plain `name =` is a local assignment; everything else (including
+      // method chains and expression keywords) parses as an expression.
+      (match r with
+       | Cons (TP p, r2) ->
+         if str_eq p "=" && not (is_keyword id) && not (is_cap id) then
            let (e, r3) = parse_expr r2 in (SAssign (id, e), r3)
          else
            let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
   | _ ->
     let (e, r) = parse_expr toks in (SExpr e, r)
+
+and parse_class = fn toks ->
+  match toks with
+  | Cons (TId name, r) ->
+    let (super, r2) =
+      (match r with
+       | Cons (TP lt, r3) ->
+         if str_eq lt "<" then
+           (match r3 with
+            | Cons (TId sup, r4) -> (sup, r4)
+            | _ -> fail "mere-ruby: expected superclass name")
+         else ("", r)
+       | _ -> ("", r)) in
+    let (body, r5) = parse_stmts r2 Nil in
+    (SClass (name, super, body), expect_kw r5 "end")
+  | _ -> fail "mere-ruby: expected class name after class"
+
+and parse_attr = fn (mode: str) -> fn toks ->
+  let (syms, r) = parse_sym_list toks Nil in (SAttr (mode, syms), r)
+
+and parse_sym_list = fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TSym s, r) ->
+    (match r with
+     | Cons (TP p, r2) ->
+       if str_eq p "," then parse_sym_list r2 (Cons (s, acc))
+       else (rev_app (Cons (s, acc)) Nil, r)
+     | _ -> (rev_app (Cons (s, acc)) Nil, r))
+  | _ -> fail "mere-ruby: expected :symbol"
 
 and parse_if = fn toks -> fn (negate: bool) ->
   let (cond0, r) = parse_expr toks in
@@ -539,6 +644,10 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   | VNil -> (match vb with VNil -> true | _ -> false)
   | VArr xs -> (match vb with VArr ys -> eq_list xs ys | _ -> false)
   | VHsh xs -> (match vb with VHsh ys -> eq_list xs ys | _ -> false)
+  // object identity (same handle); classes and symbols by value.
+  | VObj x -> (match vb with VObj y -> x == y | _ -> false)
+  | VClass x -> (match vb with VClass y -> str_eq x y | _ -> false)
+  | VSym x -> (match vb with VSym y -> str_eq x y | _ -> false)
 
 and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -637,6 +746,9 @@ let rec to_s = fn (v: Val) ->
   | VNil -> ""
   | VArr _ -> inspect v
   | VHsh _ -> inspect v
+  | VSym s -> s
+  | VClass c -> c
+  | VObj _ -> "#<object>"   // disp (world-aware) overrides for objects
 
 and inspect = fn (v: Val) ->
   match v with
@@ -644,6 +756,7 @@ and inspect = fn (v: Val) ->
   | VNil -> "nil"
   | VArr xs -> "[" ++ join_inspect xs "" ++ "]"
   | VHsh xs -> "\{" ++ join_pairs xs "" ++ "}"
+  | VSym s -> ":" ++ s
   | _ -> to_s v
 
 and join_inspect = fn (xs: Val list) -> fn (acc: str) ->
@@ -664,82 +777,176 @@ and join_pairs = fn (xs: Val list) -> fn (acc: str) ->
        join_pairs t acc2
      | Nil -> acc);
 
-// puts: arrays flatten recursively (each element on its own line), nil
-// prints an empty line, everything else prints to_s.
-let rec puts_val = fn (v: Val) ->
-  match v with
-  | VArr xs -> puts_arr xs
-  | _ -> print (to_s v)
-
-and puts_arr = fn (xs: Val list) ->
-  match xs with
-  | Nil -> ()
-  | Cons (h, t) ->
-    let _ = puts_val h in
-    puts_arr t;
-
 // ---- evaluator + driver (one mutual recursion) ---------------------------
-// `env` is a Map[str, Val] of local variables; `methods` is a Map[str,
-// Meth] — a separate namespace. eval_e, statement execution, and method
-// calls are mutually recursive because a call runs statements, a
-// statement evaluates expressions, and an expression may be a call.
+// `env` is a Map[str, Val] of local variables (including "self" inside a
+// method). `world` is the global object model, a 4-tuple of Maps bundled
+// so a single parameter threads all of it:
+//   (meths, sup, ocls, ivars)
+//   meths : Map[str, Meth]  — bare name (top-level) or "Class#name"
+//   sup   : Map[str, str]   — class name -> superclass name
+//   ocls  : Map[str, str]   — object id (as str) -> its class name
+//   ivars : Map[str, Val]   — "id@name" -> instance variable value
+// (Maps cannot be put in a record/variant field without wrestling the
+// region annotations, but a tuple of Maps threads cleanly — so a tuple
+// is the bundle. A fresh object's id is `map_len ocls`.)
 //
-// Ruby method scope is FLAT, not lexical: a method body does not see the
-// caller's locals, only its own parameters. So a call runs in a fresh
-// env, which is simpler than a closure — the caller's Map is never
-// consulted. (Blocks, in M4, will be the closures.)
-let rec eval_e = fn env -> fn methods -> fn (e: Expr) ->
+// Ruby method scope is FLAT: a method body sees only its parameters and
+// self, never the caller's locals. Each call runs in a fresh env.
+let rec eval_e = fn env -> fn world -> fn (e: Expr) ->
   match e with
   | EInt n -> VInt n
   | EFlt f -> VFlt f
   | EStrL s -> VStr s
   | EBool b -> VBool b
   | ENil -> VNil
+  | ESym s -> VSym s
+  | ESelf -> if map_has env "self" then map_get env "self" else VNil
+  | EConst name -> VClass name
+  | EIVar name ->
+    let (meths, sup, ocls, ivars) = world in
+    if map_has env "self" then
+      (match map_get env "self" with
+       | VObj id ->
+         let k = str_of_int id ++ "@" ++ name in
+         if map_has ivars k then map_get ivars k else VNil
+       | _ -> VNil)
+    else VNil
   | EVar name ->
+    let (meths, sup, ocls, ivars) = world in
     if map_has env name then map_get env name
-    // a bare name that is not a local is a no-argument method call
-    else if map_has methods name then call_method methods name Nil
-    else fail ("mere-ruby: undefined local variable or method '" ++ name ++ "'")
-  | ECall (name, arges) -> call_method methods name (eval_args env methods arges)
-  | EArr items -> VArr (eval_args env methods items)
-  | EHsh items -> VHsh (eval_args env methods items)
+    else if map_has meths name then call_method env world name Nil
+    else try_self_call env world name Nil
+  | ECall (name, arges) ->
+    let (meths, sup, ocls, ivars) = world in
+    let args = eval_args env world arges in
+    if map_has meths name then call_method env world name args
+    else try_self_call env world name args
+  | EMethod (recv_e, name, arges) ->
+    let recv = eval_e env world recv_e in
+    let args = eval_args env world arges in
+    (match recv with
+     | VClass c ->
+       if str_eq name "new" then new_obj world c args
+       else fail ("mere-ruby: undefined class method '" ++ name ++ "' for " ++ c)
+     | VObj id ->
+       let (meths, sup, ocls, ivars) = world in
+       invoke world recv (map_get ocls (str_of_int id)) name args
+     | _ -> prim_method recv name args)
+  | EArr items -> VArr (eval_args env world items)
+  | EHsh items -> VHsh (eval_args env world items)
   | EUn (op, a) ->
     if str_eq op "!" then
-      (if truthy (eval_e env methods a) then VBool false else VBool true)
+      (if truthy (eval_e env world a) then VBool false else VBool true)
     else
-      (match eval_e env methods a with
+      (match eval_e env world a with
        | VInt n -> VInt (0 - n)
        | VFlt f -> VFlt (0.0 - f)
        | _ -> fail "mere-ruby: unary - on non-number")
   | EBin (op, a, b) ->
     if str_eq op "&&" then
-      let va = eval_e env methods a in
-      if truthy va then eval_e env methods b else va
+      let va = eval_e env world a in
+      if truthy va then eval_e env world b else va
     else if str_eq op "||" then
-      let va = eval_e env methods a in
-      if truthy va then va else eval_e env methods b
-    else if str_eq op "==" then VBool (rb_eq (eval_e env methods a) (eval_e env methods b))
+      let va = eval_e env world a in
+      if truthy va then va else eval_e env world b
+    else if str_eq op "==" then VBool (rb_eq (eval_e env world a) (eval_e env world b))
     else if str_eq op "!=" then
-      (if rb_eq (eval_e env methods a) (eval_e env methods b) then VBool false else VBool true)
-    else if str_eq op "<" then VBool (cmp_vals (eval_e env methods a) (eval_e env methods b) < 0)
-    else if str_eq op "<=" then VBool (cmp_vals (eval_e env methods a) (eval_e env methods b) <= 0)
-    else if str_eq op ">" then VBool (cmp_vals (eval_e env methods a) (eval_e env methods b) > 0)
-    else if str_eq op ">=" then VBool (cmp_vals (eval_e env methods a) (eval_e env methods b) >= 0)
-    else arith_bin op (eval_e env methods a) (eval_e env methods b)
+      (if rb_eq (eval_e env world a) (eval_e env world b) then VBool false else VBool true)
+    else if str_eq op "<" then VBool (cmp_vals (eval_e env world a) (eval_e env world b) < 0)
+    else if str_eq op "<=" then VBool (cmp_vals (eval_e env world a) (eval_e env world b) <= 0)
+    else if str_eq op ">" then VBool (cmp_vals (eval_e env world a) (eval_e env world b) > 0)
+    else if str_eq op ">=" then VBool (cmp_vals (eval_e env world a) (eval_e env world b) >= 0)
+    else arith_bin op (eval_e env world a) (eval_e env world b)
 
-and eval_args = fn env -> fn methods -> fn (items: Expr list) ->
+and eval_args = fn env -> fn world -> fn (items: Expr list) ->
   match items with
   | Nil -> Nil
-  | Cons (h, t) -> Cons (eval_e env methods h, eval_args env methods t)
+  | Cons (h, t) -> Cons (eval_e env world h, eval_args env world t)
 
-and call_method = fn methods -> fn (name: str) -> fn (args: Val list) ->
-  match map_get methods name with
+// a minimal set of core methods on primitive receivers (a preview of M5;
+// to_s in particular is needed the moment a class builds a string).
+and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  if str_eq name "to_s" then VStr (to_s recv)
+  else if str_eq name "to_i" then
+    (match recv with
+     | VInt n -> VInt n
+     | VFlt f -> VInt (int_of_float f)
+     | VStr s -> VInt (int_of_str s)
+     | _ -> fail "mere-ruby: no to_i")
+  else if str_eq name "to_f" then
+    (match recv with
+     | VInt n -> VFlt (float_of_int n)
+     | VFlt f -> VFlt f
+     | _ -> fail "mere-ruby: no to_f")
+  else if str_eq name "size" || str_eq name "length" then
+    (match recv with
+     | VArr xs -> VInt (val_list_len xs)
+     | VStr s -> VInt (str_len s)
+     | _ -> fail "mere-ruby: no size")
+  else if str_eq name "abs" then
+    (match recv with
+     | VInt n -> VInt (if n < 0 then 0 - n else n)
+     | VFlt f -> VFlt (if f < 0.0 then 0.0 - f else f)
+     | _ -> fail "mere-ruby: no abs")
+  else fail ("mere-ruby: undefined method '" ++ name ++ "' for this value")
+
+and val_list_len = fn (xs: Val list) ->
+  match xs with Nil -> 0 | Cons (_, t) -> 1 + val_list_len t
+
+// a bare name that is neither a local nor a top-level method is an
+// implicit-self method call (a method calling a sibling method).
+and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has env "self" then
+    (match map_get env "self" with
+     | VObj id ->
+       let cls = map_get ocls (str_of_int id) in
+       if has_meth world cls name then invoke world (VObj id) cls name args
+       else fail ("mere-ruby: undefined method '" ++ name ++ "'")
+     | _ -> fail ("mere-ruby: undefined local variable or method '" ++ name ++ "'"))
+  else fail ("mere-ruby: undefined local variable or method '" ++ name ++ "'")
+
+// top-level method call: fresh frame, no self.
+and call_method = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  let (meths, sup, ocls, ivars) = world in
+  (match map_get meths name with
+   | Meth (params, body) ->
+     let frame = map_new () in
+     let _ = bind_params frame name params args in
+     (match run_stmts frame world body with FNext v -> v | FReturn v -> v))
+
+// walk the ancestor chain: does `cls` (or a superclass) define `name`?
+and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if str_eq cls "" then false
+  else if map_has meths (cls ++ "#" ++ name) then true
+  else if map_has sup cls then has_meth world (map_get sup cls) name
+  else false
+
+and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has meths (cls ++ "#" ++ name) then map_get meths (cls ++ "#" ++ name)
+  else if map_has sup cls then lookup_meth world (map_get sup cls) name
+  else fail ("mere-ruby: undefined method '" ++ name ++ "' for an instance of " ++ cls)
+
+// invoke an instance method: fresh frame binding self + params.
+and invoke = fn world -> fn (recv: Val) -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
+  match lookup_meth world cls name with
   | Meth (params, body) ->
     let frame = map_new () in
+    let _ = map_set frame "self" recv in
     let _ = bind_params frame name params args in
-    (match run_stmts frame methods body with
-     | FNext v -> v
-     | FReturn v -> v)
+    (match run_stmts frame world body with FNext v -> v | FReturn v -> v)
+
+// allocate an object, then run initialize if the class defines one.
+and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = map_len ocls in
+  let _ = map_set ocls (str_of_int id) cls in
+  let obj = VObj id in
+  if has_meth world cls "initialize" then
+    let _ = invoke world obj cls "initialize" args in obj
+  else obj
 
 and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (args: Val list) ->
   match params with
@@ -752,73 +959,137 @@ and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (arg
      | Nil -> fail ("mere-ruby: wrong number of arguments calling " ++ name)
      | Cons (a, rest_a) -> let _ = map_set frame p a in bind_params frame name ps rest_a)
 
+// register a class body: instance methods and attr_* accessors.
+and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  let (meths, sup, ocls, ivars) = world in
+  match body with
+  | Nil -> ()
+  | Cons (s, rest) ->
+    let _ =
+      (match s with
+       | SDef (mname, params, mbody) ->
+         let _ = map_set meths (cls ++ "#" ++ mname) (Meth (params, mbody)) in ()
+       | SAttr (mode, syms) -> add_attrs world cls mode syms
+       | _ -> ()) in
+    register_class world cls rest
+
+// attr_reader/writer/accessor: synthesize getter and/or setter methods.
+and add_attrs = fn world -> fn (cls: str) -> fn (mode: str) -> fn (syms: str list) ->
+  let (meths, sup, ocls, ivars) = world in
+  match syms with
+  | Nil -> ()
+  | Cons (name, rest) ->
+    let _ =
+      if str_eq mode "r" || str_eq mode "rw" then
+        map_set meths (cls ++ "#" ++ name)
+          (Meth (Nil, Cons (SReturn (EIVar name), Nil)))
+      else () in
+    let _ =
+      if str_eq mode "w" || str_eq mode "rw" then
+        map_set meths (cls ++ "#" ++ name ++ "=")
+          (Meth (Cons ("v", Nil),
+                 Cons (SIVarAssign (name, EVar "v"), Cons (SReturn (EVar "v"), Nil))))
+      else () in
+    add_attrs world cls mode rest
+
 // run a statement list; stop and propagate on an explicit return. The
 // value of the list is its last statement's value (Ruby's implicit
 // return), or nil when empty.
-and run_stmts = fn env -> fn methods -> fn (prog: Stmt list) ->
+and run_stmts = fn env -> fn world -> fn (prog: Stmt list) ->
   match prog with
   | Nil -> FNext VNil
   | Cons (s, rest) ->
     (match rest with
-     | Nil -> exec_stmt env methods s
+     | Nil -> exec_stmt env world s
      | _ ->
-       (match exec_stmt env methods s with
+       (match exec_stmt env world s with
         | FReturn v -> FReturn v
-        | FNext _ -> run_stmts env methods rest))
+        | FNext _ -> run_stmts env world rest))
 
-and exec_stmt = fn env -> fn methods -> fn (s: Stmt) ->
+and exec_stmt = fn env -> fn world -> fn (s: Stmt) ->
   match s with
   | SPuts es ->
-    let _ = (match es with Nil -> print "" | _ -> puts_args env methods es) in
+    let _ = (match es with Nil -> print "" | _ -> puts_args env world es) in
     FNext VNil
-  | SExpr e -> FNext (eval_e env methods e)
+  | SExpr e -> FNext (eval_e env world e)
   | SAssign (name, e) ->
-    let v = eval_e env methods e in
+    let v = eval_e env world e in
     let _ = map_set env name v in FNext v
-  | SIf (clauses, els) -> run_if env methods clauses els
-  | SWhile (cond, body) -> run_while env methods cond body
+  | SIVarAssign (name, e) ->
+    let (meths, sup, ocls, ivars) = world in
+    let v = eval_e env world e in
+    (match map_get env "self" with
+     | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ name) v in FNext v
+     | _ -> fail "mere-ruby: @ivar assignment outside an object")
+  | SIf (clauses, els) -> run_if env world clauses els
+  | SWhile (cond, body) -> run_while env world cond body
   | SCase (subj, whens, els) ->
-    run_case env methods (eval_e env methods subj) whens els
+    run_case env world (eval_e env world subj) whens els
   | SDef (name, params, body) ->
-    let _ = map_set methods name (Meth (params, body)) in FNext VNil
-  | SReturn e -> FReturn (eval_e env methods e)
+    let (meths, sup, ocls, ivars) = world in
+    let _ = map_set meths name (Meth (params, body)) in FNext VNil
+  | SClass (name, super, body) ->
+    let (meths, sup, ocls, ivars) = world in
+    let _ = if str_eq super "" then () else map_set sup name super in
+    let _ = register_class world name body in FNext VNil
+  | SAttr (_, _) -> FNext VNil
+  | SReturn e -> FReturn (eval_e env world e)
 
-and run_if = fn env -> fn methods -> fn clauses -> fn (els: Stmt list) ->
+and run_if = fn env -> fn world -> fn clauses -> fn (els: Stmt list) ->
   match clauses with
-  | Nil -> run_stmts env methods els
+  | Nil -> run_stmts env world els
   | Cons (cl, rest) ->
     let (c, b) = cl in
-    if truthy (eval_e env methods c) then run_stmts env methods b
-    else run_if env methods rest els
+    if truthy (eval_e env world c) then run_stmts env world b
+    else run_if env world rest els
 
-and run_while = fn env -> fn methods -> fn (cond: Expr) -> fn (body: Stmt list) ->
-  if truthy (eval_e env methods cond) then
-    (match run_stmts env methods body with
+and run_while = fn env -> fn world -> fn (cond: Expr) -> fn (body: Stmt list) ->
+  if truthy (eval_e env world cond) then
+    (match run_stmts env world body with
      | FReturn v -> FReturn v
-     | FNext _ -> run_while env methods cond body)
+     | FNext _ -> run_while env world cond body)
   else FNext VNil
 
 // Ruby's `when` uses ===; for the value classes in this subset that is
 // plain equality.
-and run_case = fn env -> fn methods -> fn (v: Val) -> fn whens -> fn (els: Stmt list) ->
+and run_case = fn env -> fn world -> fn (v: Val) -> fn whens -> fn (els: Stmt list) ->
   match whens with
-  | Nil -> run_stmts env methods els
+  | Nil -> run_stmts env world els
   | Cons (w, rest) ->
     let (vs, b) = w in
-    if when_matches env methods v vs then run_stmts env methods b
-    else run_case env methods v rest els
+    if when_matches env world v vs then run_stmts env world b
+    else run_case env world v rest els
 
-and when_matches = fn env -> fn methods -> fn (v: Val) -> fn (vs: Expr list) ->
+and when_matches = fn env -> fn world -> fn (v: Val) -> fn (vs: Expr list) ->
   match vs with
   | Nil -> false
-  | Cons (e, t) -> rb_eq (eval_e env methods e) v || when_matches env methods v t
+  | Cons (e, t) -> rb_eq (eval_e env world e) v || when_matches env world v t
 
-and puts_args = fn env -> fn methods -> fn (es: Expr list) ->
+and puts_args = fn env -> fn world -> fn (es: Expr list) ->
   match es with
   | Nil -> ()
   | Cons (e, t) ->
-    let _ = puts_val (eval_e env methods e) in
-    puts_args env methods t;
+    let _ = puts_one env world (eval_e env world e) in
+    puts_args env world t
+
+// puts of one value: arrays flatten recursively; an object uses its
+// user-defined to_s if present (Ruby would otherwise print an address,
+// which cannot be byte-matched — corpus objects define to_s).
+and puts_one = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VArr xs -> puts_each env world xs
+  | VObj id ->
+    let (meths, sup, ocls, ivars) = world in
+    let cls = map_get ocls (str_of_int id) in
+    if has_meth world cls "to_s" then
+      (match invoke world v cls "to_s" Nil with VStr s -> print s | other -> print (to_s other))
+    else print ("#<" ++ cls ++ ">")
+  | _ -> print (to_s v)
+
+and puts_each = fn env -> fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (h, t) -> let _ = puts_one env world h in puts_each env world t;
 
 let run_cli = fn () ->
   match args () with
@@ -832,8 +1103,12 @@ let run_cli = fn () ->
        | Cons (TEOF, _) -> ()
        | _ -> fail "mere-ruby: unexpected token at top level") in
     let env = map_new () in
-    let methods = map_new () in
-    let _ = run_stmts env methods prog in
+    let meths = map_new () in
+    let sup = map_new () in
+    let ocls = map_new () in
+    let ivars = map_new () in
+    let world = (meths, sup, ocls, ivars) in
+    let _ = run_stmts env world prog in
     0;
 
 exit (run_cli ())

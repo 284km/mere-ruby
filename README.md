@@ -73,6 +73,27 @@ mutual-recursion group of eleven functions threading two maps, and the
 Mere C backend emitted several of them twice (a duplicate-definition
 build failure). It is fixed upstream in Mere v0.1.66 — see `PAIN.md`.
 
+## What M3 adds — the object model
+
+- **Classes**: `class Name ... end`, `class Name < Super ... end`,
+  instance methods via `def` inside the class body.
+- **Instances**: `Name.new(args)` allocates an object and runs
+  `initialize`; `@ivar` reads and writes instance variables; `self` is
+  the receiver.
+- **Method dispatch** walks the ancestor chain (`obj.method(args)`,
+  and no-arg `obj.method`), so subclasses override and inherit. A method
+  can call a sibling method with an implicit `self`.
+- **`attr_accessor` / `attr_reader` / `attr_writer`** synthesize getters
+  and setters; `obj.attr = value` calls the setter.
+- **Symbols** (`:name`) and a few primitive methods (`to_s`, `to_i`,
+  `to_f`, `size` / `length`, `abs`) — a small preview of M5, since a
+  class's `to_s` immediately needs `@x.to_s`.
+
+Objects are represented as integer handles into the interpreter's world
+(a bundle of maps: class table, superclass links, object classes,
+instance variables). See `PAIN.md` for why that shape, and why the
+world is a *tuple* of maps rather than a record.
+
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
