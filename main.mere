@@ -58,7 +58,9 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SIf of (Expr * Stmt list) list * Stmt list
           | SWhile of Expr * Stmt list
           | SCase of Expr * (Expr list * Stmt list) list * Stmt list
-          | SDef of str * str list * Stmt list
+          // SDef: name, param names, (name, default-expr) for defaulted
+          // params, body.
+          | SDef of str * str list * (str * Expr) list * Stmt list
           | SReturn of Expr
           | SClass of str * str * Stmt list
           | SIVarAssign of str * Expr
@@ -89,10 +91,10 @@ type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
          | VExc of str * str    // exception: class name, message
          | VMain;               // the top-level `self` (main), class Object
 
-// A user method: parameter names and body. Stored in the methods table
-// (a Map[str, Meth]) keyed by bare name (top-level) or "Class#name"
-// (instance method), a namespace separate from local variables.
-type Meth = Meth of str list * Stmt list;
+// A user method: parameter names, defaults ((name, default-expr) for
+// params with `= default`), and body. Stored in the methods table (a
+// Map[str, Meth]) keyed by bare name (top-level) or "Class#name".
+type Meth = Meth of str list * (str * Expr) list * Stmt list;
 
 // Statement execution result: FNext carries the statement's value (so a
 // method's implicit return is its last statement's value); FReturn is a
@@ -116,6 +118,8 @@ let arr_new = fn (xs: Val list) ->
 let deref = fn (id: int) -> map_get arr_store (str_of_int id);
 let arr_set = fn (id: int) -> fn (xs: Val list) ->
   let _ = map_set arr_store (str_of_int id) xs in ();
+// global variables ($name) live in another top-level captured Map.
+let globals = map_new ();
 
 // ---- small helpers ------------------------------------------------------
 let rec rev_app = fn xs -> fn acc ->
@@ -276,6 +280,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       Cons (TId (substring s i j2), lex_go s j2)
     else if str_eq c "@" then
       // @ivar: keep the leading @ in the identifier text
+      let j = scan_ident s (i + 1) in
+      Cons (TId (substring s i j), lex_go s j)
+    else if str_eq c "$" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
+      // $global: keep the leading $ in the identifier text
       let j = scan_ident s (i + 1) in
       Cons (TId (substring s i j), lex_go s j)
     else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
@@ -912,11 +920,11 @@ and parse_when_vals = fn toks -> fn (acc: Expr list) ->
 and parse_def = fn toks ->
   match toks with
   | Cons (TId name, r) ->
-    let (params, r2) =
+    let (params, defs, r2) =
       (match r with
        | Cons (TP p, r3) ->
-         if str_eq p "(" then parse_params r3 Nil else (Nil, r)
-       | _ -> (Nil, r)) in
+         if str_eq p "(" then parse_params r3 Nil Nil else (Nil, Nil, r)
+       | _ -> (Nil, Nil, r)) in
     let (body0, r4) = parse_stmts r2 Nil in
     // method-level rescue/ensure: `def f ... rescue ... end` wraps the
     // whole body in an implicit begin.
@@ -930,27 +938,33 @@ and parse_def = fn toks ->
            (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
          else (body0, r4)
        | _ -> (body0, r4)) in
-    (SDef (name, params, body), expect_kw r5 "end")
+    (SDef (name, params, defs, body), expect_kw r5 "end")
   | _ -> fail "mere-ruby: expected method name after def"
 
-and parse_params = fn toks -> fn (acc: str list) ->
+and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
   match toks with
   | Cons (TP p, r) ->
-    if str_eq p ")" then (rev_app acc Nil, r)
+    if str_eq p ")" then (rev_app acc Nil, rev_app defs Nil, r)
     else if str_eq p "*" then
-      // splat parameter *name (or bare *)
       (match r with
-       | Cons (TId name, r2) -> parse_params_after ("*" ++ name) r2 acc
-       | _ -> parse_params_after "*" r acc)
+       | Cons (TId name, r2) -> parse_params_after ("*" ++ name) r2 acc defs
+       | _ -> parse_params_after "*" r acc defs)
     else fail ("mere-ruby: expected parameter name, got " ++ p)
-  | Cons (TId name, r) -> parse_params_after name r acc
+  | Cons (TId name, r) ->
+    // optional default: `name = expr`
+    (match r with
+     | Cons (TP eq, r2) ->
+       if str_eq eq "=" then
+         let (e, r3) = parse_expr r2 in parse_params_after name r3 acc (Cons ((name, e), defs))
+       else parse_params_after name r acc defs
+     | _ -> parse_params_after name r acc defs)
   | _ -> fail "mere-ruby: expected parameter name"
 
-and parse_params_after = fn (name: str) -> fn toks -> fn (acc: str list) ->
+and parse_params_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
   match toks with
   | Cons (TP p, r) ->
-    if str_eq p "," then parse_params r (Cons (name, acc))
-    else if str_eq p ")" then (rev_app (Cons (name, acc)) Nil, r)
+    if str_eq p "," then parse_params r (Cons (name, acc)) defs
+    else if str_eq p ")" then (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, r)
     else fail ("mere-ruby: expected , or ) in parameters, got " ++ p)
   | _ -> fail "mere-ruby: unterminated parameter list";
 
@@ -1328,6 +1342,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = map_set ivars "$exc" exc in
     fail "mere-ruby: (ruby exception raised)"
   | EVar name ->
+    if str_len name > 0 && str_eq (char_at name 0) "$" then
+      (let k = substring name 1 (str_len name) in if map_has globals k then map_get globals k else VNil)
+    else
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     if map_has env name then map_get env name
@@ -1422,7 +1439,9 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
 // ---- multiple assignment ------------------------------------------------
 and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   let (meths, sup, ocls, ivars) = world in
-  if str_len tgt > 0 && str_eq (char_at tgt 0) "@" then
+  if str_len tgt > 0 && str_eq (char_at tgt 0) "$" then
+    let _ = map_set globals (substring tgt 1 (str_len tgt)) v in ()
+  else if str_len tgt > 0 && str_eq (char_at tgt 0) "@" then
     (match map_get env "self" with
      | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ substring tgt 1 (str_len tgt)) v in ()
      | _ -> ())
@@ -1794,9 +1813,9 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
 and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   (match map_get meths name with
-   | Meth (params, body) ->
+   | Meth (params, defaults, body) ->
      let frame = map_new () in
-     let _ = bind_params frame name params args in
+     let _ = bind_params frame world blk name params defaults args in
      (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v))
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
@@ -1817,10 +1836,10 @@ and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
 // block passed at the call site (installed for yield inside the body).
 and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
   match lookup_meth world cls name with
-  | Meth (params, body) ->
+  | Meth (params, defaults, body) ->
     let frame = map_new () in
     let _ = map_set frame "self" recv in
-    let _ = bind_params frame name params args in
+    let _ = bind_params frame world blk name params defaults args in
     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v)
 
 // allocate an object, then run initialize if the class defines one.
@@ -1834,7 +1853,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
     let _ = invoke world noblk obj cls "initialize" args in obj
   else obj
 
-and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (args: Val list) ->
+and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (args: Val list) ->
   if has_splat params then
     // *rest collects the middle; fixed params before/after bind positionally.
     let before = take_until_splat params in
@@ -1845,13 +1864,31 @@ and bind_params = fn frame -> fn (name: str) -> fn (params: str list) -> fn (arg
     let nv = vlen args in
     let sc = nv - nb - na in
     let sc = if sc < 0 then 0 else sc in
-    let _ = bind_seq frame before (vtake args nb) in
+    // fixed params before the splat may have defaults when args run short.
+    let _ = bind_defaulted frame world blk before defaults (vtake args nb) in
     let _ = map_set frame sname (arr_new (vtake (vdrop args nb) sc)) in
     let _ = bind_seq frame after (vdrop args (nb + sc)) in
     ()
-  else bind_strict frame name params args
+  else bind_defaulted frame world blk params defaults args
 
-// fixed-arity binding (exact count required, as before).
+// positional binding with defaults: a param with no arg takes its default
+// expression (evaluated in the frame), else nil.
+and bind_defaulted = fn frame -> fn world -> fn blk -> fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (args: Val list) ->
+  match params with
+  | Nil -> ()
+  | Cons (p, ps) ->
+    (match args with
+     | Cons (a, rest) -> let _ = map_set frame p a in bind_defaulted frame world blk ps defaults rest
+     | Nil ->
+       let v = if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
+       let _ = map_set frame p v in bind_defaulted frame world blk ps defaults Nil)
+
+and has_default = fn (defaults: (str * Expr) list) -> fn (p: str) ->
+  match defaults with Nil -> false | Cons (d, r) -> let (n, _) = d in if str_eq n p then true else has_default r p
+and get_default = fn (defaults: (str * Expr) list) -> fn (p: str) ->
+  match defaults with Nil -> ENil | Cons (d, r) -> let (n, e) = d in if str_eq n p then e else get_default r p
+
+// fixed-arity binding (exact count required) — kept for reference/callers.
 and bind_strict = fn frame -> fn (name: str) -> fn (params: str list) -> fn (args: Val list) ->
   match params with
   | Nil ->
@@ -1881,8 +1918,8 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   | Cons (s, rest) ->
     let _ =
       (match s with
-       | SDef (mname, params, mbody) ->
-         let _ = map_set meths (cls ++ "#" ++ mname) (Meth (params, mbody)) in ()
+       | SDef (mname, params, defs, mbody) ->
+         let _ = map_set meths (cls ++ "#" ++ mname) (Meth (params, defs, mbody)) in ()
        | SAttr (mode, syms) -> add_attrs world cls mode syms
        | _ -> ()) in
     register_class world cls rest
@@ -1896,12 +1933,12 @@ and add_attrs = fn world -> fn (cls: str) -> fn (mode: str) -> fn (syms: str lis
     let _ =
       if str_eq mode "r" || str_eq mode "rw" then
         map_set meths (cls ++ "#" ++ name)
-          (Meth (Nil, Cons (SReturn (EIVar name), Nil)))
+          (Meth (Nil, Nil, Cons (SReturn (EIVar name), Nil)))
       else () in
     let _ =
       if str_eq mode "w" || str_eq mode "rw" then
         map_set meths (cls ++ "#" ++ name ++ "=")
-          (Meth (Cons ("v", Nil),
+          (Meth (Cons ("v", Nil), Nil,
                  Cons (SIVarAssign (name, EVar "v"), Cons (SReturn (EVar "v"), Nil))))
       else () in
     add_attrs world cls mode rest
@@ -1929,7 +1966,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SExpr e -> FNext (eval_e env world blk e)
   | SAssign (name, e) ->
     let v = eval_e env world blk e in
-    let _ = map_set env name v in FNext v
+    let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
+            then map_set globals (substring name 1 (str_len name)) v
+            else map_set env name v in
+    FNext v
   | SIVarAssign (name, e) ->
     let (meths, sup, ocls, ivars) = world in
     let v = eval_e env world blk e in
@@ -1940,9 +1980,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SWhile (cond, body) -> run_while env world blk cond body
   | SCase (subj, whens, els) ->
     run_case env world blk (eval_e env world blk subj) whens els
-  | SDef (name, params, body) ->
+  | SDef (name, params, defs, body) ->
     let (meths, sup, ocls, ivars) = world in
-    let _ = map_set meths name (Meth (params, body)) in FNext VNil
+    let _ = map_set meths name (Meth (params, defs, body)) in FNext VNil
   | SClass (name, super, body) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = if str_eq super "" then () else map_set sup name super in
