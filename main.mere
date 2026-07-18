@@ -51,7 +51,10 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // 2i: subjectless `case` marker (when-conditions are truthiness
           // tests); `defined?(e)` returns a description string or nil.
           | ECaseNone
-          | EDefined of Expr;
+          | EDefined of Expr
+          // 2k: super. bool = zsuper (bare `super`, forward current args);
+          // when false the args are explicit (super() or super(a, b)).
+          | ESuper of bool * Expr list;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -642,6 +645,13 @@ and parse_primary = fn toks ->
        | Cons (TNL, _) -> (ERaise Nil, r)
        | Cons (TEOF, _) -> (ERaise Nil, r)
        | _ -> let (es, r2) = parse_puts_args r Nil in (ERaise es, r2))
+    else if str_eq id "super" then
+      // `super` forwards the current args; `super(...)` / `super()` are explicit.
+      (match r with
+       | Cons (TP p, r2) ->
+         if str_eq p "(" then let (argv, r3) = parse_call_args r2 in (ESuper (false, argv), r3)
+         else (ESuper (true, Nil), r)
+       | _ -> (ESuper (true, Nil), r))
     else if str_eq id "defined?" then
       // defined?(e) or defined? e — never evaluates e for its value.
       (match r with
@@ -1596,6 +1606,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         | _ -> VStr "method")
      | EYield _ -> let (has, _, _, _) = blk in if has then VStr "yield" else VNil
      | _ -> VStr "expression")   // literals, operators, ranges, ternary, etc.
+  | ESuper (zsuper, arges) ->
+    let (meths, sup, ocls, ivars) = world in
+    let defcls = (match map_get env "__defcls" with VClass c -> c | _ -> "") in
+    let meth = (match map_get env "__meth" with VStr s -> s | _ -> "") in
+    let recv = if map_has env "self" then map_get env "self" else VMain in
+    let args = if zsuper then (match map_get env "__args" with VArr id -> deref id | _ -> Nil)
+               else eval_args env world blk arges in
+    let supercls = if map_has sup defcls then map_get sup defcls else "" in
+    invoke world blk recv supercls meth args
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -2190,13 +2209,27 @@ and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   else if map_has sup cls then lookup_meth world (map_get sup cls) name
   else fail ("mere-ruby: undefined method '" ++ name ++ "' for an instance of " ++ cls)
 
+// like lookup_meth but also returns the class the method was found in, so
+// `super` can resume the lookup from that class's superclass.
+and lookup_meth_cls = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has meths (cls ++ "#" ++ name) then (map_get meths (cls ++ "#" ++ name), cls)
+  else if includes_has world cls name then (mod_lookup world (str_split (map_get includes cls) "|") name, cls)
+  else if map_has sup cls then lookup_meth_cls world (map_get sup cls) name
+  else fail ("mere-ruby: undefined method '" ++ name ++ "' for an instance of " ++ cls)
+
 // invoke an instance method: fresh frame binding self + params; blk is the
 // block passed at the call site (installed for yield inside the body).
 and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
-  match lookup_meth world cls name with
+  let (m, defcls) = lookup_meth_cls world cls name in
+  match m with
   | Meth (params, defaults, body) ->
     let frame = map_new () in
     let _ = map_set frame "self" recv in
+    // hidden bindings so `super` can resume lookup above the defining class.
+    let _ = map_set frame "__defcls" (VClass defcls) in
+    let _ = map_set frame "__meth" (VStr name) in
+    let _ = map_set frame "__args" (arr_new args) in
     let _ = bind_params frame world blk name params defaults args in
     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
 
