@@ -130,6 +130,24 @@ continue after a block (`arr.map { |x| x * 2 }.sum`). In-place mutation
 (`<<`, `push`, `arr[i] = v`) is deferred to a later milestone; the corpus
 builds collections functionally.
 
+## What M6 adds — exceptions
+
+- **`raise`** with a message, a class, or a class and message.
+- **`begin` / `rescue` / `else` / `ensure` / `end`**, `rescue Class => e`,
+  multiple `rescue` clauses, a bare `rescue` (catches `StandardError`),
+  method-level rescue (`def f ... rescue ... end`), and `begin` used as a
+  value (`x = begin ... end`).
+- **Exception class hierarchy**: built-in `RuntimeError` / `ArgumentError`
+  / `ZeroDivisionError` / … `< StandardError < Exception`; user exceptions
+  extend it (`class MyError < StandardError`). `rescue` matches up the
+  chain. Integer division by zero raises a real `ZeroDivisionError`.
+- `e.message` / `e.class`. (`retry` is deferred.)
+
+This is the last piece of the **G1 subset**: 40 corpus programs — FizzBuzz,
+class hierarchies, iterator chains, hashes, and exception flows — all match
+the reference `ruby` byte-for-byte, on both the interpreter and the
+C backend.
+
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`

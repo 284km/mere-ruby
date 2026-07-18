@@ -3,6 +3,31 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
+## M6. A caught `fail` printed to stderr — FIXED upstream (Mere v0.1.67)
+
+Ruby exceptions have no native counterpart in Mere, so `begin/rescue` is
+built on the two primitives that exist: `fail` (raise) and `try_or`
+(catch). A `raise` stashes the exception value in a threaded map and calls
+`fail` to unwind; `begin` wraps the body in `try_or`, and on catch reads
+the exception back and matches it against the rescue clauses. That works —
+but every rescued exception printed a stray `fail: ...` line to stderr,
+even though the program continued correctly.
+
+The cause was in the C runtime's `__lang_fail_impl`: it `fprintf`-ed the
+message to stderr *unconditionally*, before checking whether an active
+`try_or` would catch the longjmp. A failure that is about to be caught is
+control flow, not an error, and must be silent. The LLVM backend and the
+interpreter already did the right thing (check the jmpbuf first, print only
+when genuinely uncaught) — so the C backend was both noisy and divergent.
+Fixed in Mere v0.1.67 by reordering: longjmp if caught, print only when
+about to abort. A satisfying find: using the language's own error
+primitive as an exception mechanism is exactly the kind of load a
+hand-written test never puts on it.
+
+`retry` and in-place collection mutation are deferred; the exception
+semantics themselves (hierarchy matching, ensure ordering, method-level
+rescue, `begin` as a value) are complete.
+
 ## M4. A bare `Nil` placeholder in a tuple is polymorphic — C codegen only
 
 Small, and a recurrence of a known Mere papercut. M4 threads the "current
