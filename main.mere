@@ -166,7 +166,16 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       Cons (TStrL lit, lex_go s j)
     else if is_alpha c then
       let j = scan_ident s i in
-      Cons (TId (substring s i j), lex_go s j)
+      // Ruby method names may end in `?` or `!` (e.g. even?, sort!). Guard
+      // `!=`: extend on `!` only when it is not the start of `!=`.
+      let j2 =
+        if j < str_len s then
+          let cj = char_at s j in
+          if str_eq cj "?" then j + 1
+          else if str_eq cj "!" && (j + 1 >= str_len s || (if str_eq (char_at s (j + 1)) "=" then false else true)) then j + 1
+          else j
+        else j in
+      Cons (TId (substring s i j2), lex_go s j2)
     else if str_eq c "@" then
       // @ivar: keep the leading @ in the identifier text
       let j = scan_ident s (i + 1) in
@@ -317,6 +326,17 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
             else attach_block_method recv name Nil r2
           | _ -> attach_block_method recv name Nil r2)
        | _ -> fail "mere-ruby: expected method name after .")
+    // index: recv[i] -> recv.[](i); recv[i] = v -> recv.[]=(i, v)
+    else if str_eq dot "[" then
+      let (idx, r2) = parse_expr r in
+      let r3 = expect r2 "]" in
+      (match r3 with
+       | Cons (TP eq, r4) ->
+         if str_eq eq "=" then
+           let (rhs, r5) = parse_expr r4 in
+           (EMethod (recv, "[]=", Cons (idx, Cons (rhs, Nil))), r5)
+         else parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3
+       | _ -> parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3)
     else (recv, toks)
   | _ -> (recv, toks)
 
@@ -324,7 +344,8 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
 and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr list) -> fn toks ->
   if starts_block toks then
     let (bp, bb, r) = parse_block toks in
-    (EMethodB (recv, name, argv, bp, bb), r)
+    // continue the chain: `arr.map { } .sum` etc.
+    parse_postfix_more (EMethodB (recv, name, argv, bp, bb)) r
   else parse_postfix_more (EMethod (recv, name, argv)) toks
 
 and starts_block = fn toks ->
@@ -817,6 +838,90 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | _ -> fail "mere-ruby: ** type error")
   else fail ("mere-ruby: unknown operator: " ++ op);
 
+// ---- M5 core-method helpers (leaf: no world / block) ---------------------
+// character-level case mapping (Mere has str_rev/trim/split/... but no
+// upcase/downcase).
+let shift_case = fn (s: str) -> fn (lo: int) -> fn (hi: int) -> fn (delta: int) ->
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i >= str_len s then acc
+    else
+      let o = ord (char_at s i) in
+      let c = if o >= lo && o <= hi then chr (o + delta) else char_at s i in
+      go (i + 1) (acc ++ c) in
+  go 0 "";
+let str_upcase = fn (s: str) -> shift_case s 97 122 (0 - 32);
+let str_downcase = fn (s: str) -> shift_case s 65 90 32;
+let str_capitalize = fn (s: str) ->
+  if str_len s == 0 then s
+  else str_upcase (substring s 0 1) ++ str_downcase (substring s 1 (str_len s));
+
+// explode a string into a list of one-character VStr values.
+let rec str_chars_val = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then Nil else Cons (VStr (char_at s i), str_chars_val s (i + 1));
+
+// index into a Val list (nil beyond the end); supports Ruby negative
+// indices (-1 = last).
+let rec val_nth = fn (xs: Val list) -> fn (i: int) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (h, t) -> if i == 0 then h else val_nth t (i - 1);
+
+let rec val_list_of_strs = fn (ss: str list) ->
+  match ss with Nil -> Nil | Cons (h, t) -> Cons (VStr h, val_list_of_strs t);
+
+let rec val_contains = fn (xs: Val list) -> fn (v: Val) ->
+  match xs with Nil -> false | Cons (h, t) -> if rb_eq h v then true else val_contains t v;
+
+let rec val_index_of = fn (xs: Val list) -> fn (v: Val) -> fn (i: int) ->
+  match xs with Nil -> VNil | Cons (h, t) -> if rb_eq h v then VInt i else val_index_of t v (i + 1);
+
+let rec val_count_eq = fn (xs: Val list) -> fn (v: Val) ->
+  match xs with Nil -> 0 | Cons (h, t) -> (if rb_eq h v then 1 else 0) + val_count_eq t v;
+
+let rec val_uniq = fn (xs: Val list) -> fn (seen: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if val_contains seen h then val_uniq t seen else Cons (h, val_uniq t (Cons (h, seen)));
+
+let rec val_rev = fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with Nil -> acc | Cons (h, t) -> val_rev t (Cons (h, acc));
+
+// insertion sort by cmp_vals (stable enough for the corpus; Ruby's <=>).
+let rec val_insert = fn (v: Val) -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Cons (v, Nil)
+  | Cons (h, t) -> if cmp_vals v h <= 0 then Cons (v, xs) else Cons (h, val_insert v t);
+let rec val_sort = fn (xs: Val list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> val_insert h (val_sort t);
+
+let rec val_min = fn (xs: Val list) -> fn (best: Val) ->
+  match xs with Nil -> best | Cons (h, t) -> val_min t (if cmp_vals h best < 0 then h else best);
+let rec val_max = fn (xs: Val list) -> fn (best: Val) ->
+  match xs with Nil -> best | Cons (h, t) -> val_max t (if cmp_vals h best > 0 then h else best);
+
+let rec val_sum = fn (xs: Val list) -> fn (acc: Val) ->
+  match xs with Nil -> acc | Cons (h, t) -> val_sum t (arith_bin "+" acc h);
+
+// hash (VHsh flat [k1,v1,k2,v2,...]) accessors.
+let rec hash_keys = fn (xs: Val list) ->
+  match xs with Nil -> Nil | Cons (k, rest) -> (match rest with Cons (_, t) -> Cons (k, hash_keys t) | Nil -> Nil);
+let rec hash_values = fn (xs: Val list) ->
+  match xs with Nil -> Nil | Cons (_, rest) -> (match rest with Cons (v, t) -> Cons (v, hash_values t) | Nil -> Nil);
+let rec hash_get = fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (k2, rest) -> (match rest with Cons (v, t) -> if rb_eq k2 k then v else hash_get t k | Nil -> VNil);
+let rec hash_haskey = fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> false
+  | Cons (k2, rest) -> (match rest with Cons (_, t) -> if rb_eq k2 k then true else hash_haskey t k | Nil -> false);
+let rec hash_pairs = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (k, rest) -> (match rest with Cons (v, t) -> Cons (VArr (Cons (k, Cons (v, Nil))), hash_pairs t) | Nil -> Nil);
+let rec hash_len = fn (xs: Val list) ->
+  match xs with Nil -> 0 | Cons (_, rest) -> (match rest with Cons (_, t) -> 1 + hash_len t | Nil -> 0);
+
 // ---- printing (Ruby's to_s / inspect / puts) -----------------------------
 let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
   if i >= str_len s then acc
@@ -871,6 +976,15 @@ and join_pairs = fn (xs: Val list) -> fn (acc: str) ->
        let acc2 = if str_eq acc "" then pair else acc ++ ", " ++ pair in
        join_pairs t acc2
      | Nil -> acc);
+
+// Array#join — placed after to_s (which it uses on each element).
+let rec val_join = fn (xs: Val list) -> fn (sep: str) -> fn (acc: str) -> fn (first: bool) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) ->
+    let piece = to_s h in
+    let acc2 = if first then piece else acc ++ sep ++ piece in
+    val_join t sep acc2 false;
 
 // ---- evaluator + driver (one mutual recursion) ---------------------------
 // `env` is a Map[str, Val] of local variables (including "self" inside a
@@ -1033,8 +1147,18 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     if str_eq name "each" then let _ = arr_each world encl theblk xs in recv
     else if str_eq name "map" then VArr (arr_map world encl theblk xs)
     else if str_eq name "select" then VArr (arr_select world encl theblk xs)
+    else if str_eq name "reject" then VArr (arr_reject world encl theblk xs)
     else if str_eq name "each_with_index" then let _ = arr_each_idx world encl theblk xs 0 in recv
+    else if str_eq name "reduce" || str_eq name "inject" then
+      (match args with
+       | Cons (init, _) -> arr_reduce world encl theblk xs init
+       | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> arr_reduce world encl theblk t h))
+    else if str_eq name "count" then VInt (arr_count_blk world encl theblk xs)
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Array")
+  | VHsh xs ->
+    if str_eq name "each" then let _ = hash_each world encl theblk xs in recv
+    else if str_eq name "select" then VHsh (hash_select world encl theblk xs)
+    else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Hash")
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
     if str_eq name "each" then let _ = range_each world encl theblk lo last in recv
@@ -1081,21 +1205,60 @@ and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int
   if i > last then Nil
   else Cons (run_block world encl theblk (Cons (VInt i, Nil)), range_map world encl theblk (i + 1) last)
 
-// a minimal set of core methods on primitive receivers (a preview of M5;
-// to_s in particular is needed the moment a class builds a string).
+and arr_reject = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) ->
+    if truthy (run_block world encl theblk (Cons (h, Nil))) then arr_reject world encl theblk t
+    else Cons (h, arr_reject world encl theblk t)
+
+and arr_reduce = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) -> arr_reduce world encl theblk t (run_block world encl theblk (Cons (acc, Cons (h, Nil))))
+
+and arr_count_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> 0
+  | Cons (h, t) ->
+    (if truthy (run_block world encl theblk (Cons (h, Nil))) then 1 else 0) + arr_count_blk world encl theblk t
+
+// hash.each { |k, v| ... } iterates key/value pairs of the flat list.
+and hash_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) -> let _ = run_block world encl theblk (Cons (k, Cons (v, Nil))) in hash_each world encl theblk t
+     | Nil -> ())
+
+// hash.select { |k, v| ... } keeps matching pairs, rebuilding the flat list.
+and hash_select = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       if truthy (run_block world encl theblk (Cons (k, Cons (v, Nil))))
+       then Cons (k, Cons (v, hash_select world encl theblk t))
+       else hash_select world encl theblk t
+     | Nil -> Nil)
+
+// core methods on primitive receivers (String / Array / Hash / Integer),
+// all non-mutating. Indexing (`[]`) and the read-heavy Enumerable methods
+// live here; block-taking iterators live in builtin_iter.
 and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  // universal
   if str_eq name "to_s" then VStr (to_s recv)
+  else if str_eq name "inspect" then VStr (inspect recv)
+  else if str_eq name "class" then VClass (class_name recv)
+  else if str_eq name "nil?" then VBool (match recv with VNil -> true | _ -> false)
   else if str_eq name "to_i" then
     (match recv with
-     | VInt n -> VInt n
-     | VFlt f -> VInt (int_of_float f)
-     | VStr s -> VInt (int_of_str s)
+     | VInt n -> VInt n | VFlt f -> VInt (int_of_float f) | VStr s -> VInt (int_of_str s)
      | _ -> fail "mere-ruby: no to_i")
   else if str_eq name "to_f" then
-    (match recv with
-     | VInt n -> VFlt (float_of_int n)
-     | VFlt f -> VFlt f
-     | _ -> fail "mere-ruby: no to_f")
+    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | _ -> fail "mere-ruby: no to_f")
   else if str_eq name "to_a" then
     (match recv with
      | VArr xs -> VArr xs
@@ -1103,15 +1266,75 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> fail "mere-ruby: no to_a")
   else if str_eq name "size" || str_eq name "length" then
     (match recv with
-     | VArr xs -> VInt (val_list_len xs)
-     | VStr s -> VInt (str_len s)
-     | _ -> fail "mere-ruby: no size")
-  else if str_eq name "abs" then
+     | VArr xs -> VInt (val_list_len xs) | VStr s -> VInt (str_len s)
+     | VHsh xs -> VInt (hash_len xs) | _ -> fail "mere-ruby: no size")
+  else if str_eq name "empty?" then
     (match recv with
-     | VInt n -> VInt (if n < 0 then 0 - n else n)
-     | VFlt f -> VFlt (if f < 0.0 then 0.0 - f else f)
-     | _ -> fail "mere-ruby: no abs")
+     | VArr xs -> VBool (val_list_len xs == 0) | VStr s -> VBool (str_len s == 0)
+     | VHsh xs -> VBool (hash_len xs == 0) | _ -> fail "mere-ruby: no empty?")
+  else if str_eq name "[]" then
+    (match recv with
+     | VArr xs -> (match args with Cons (VInt i, _) -> val_nth xs (if i < 0 then val_list_len xs + i else i) | _ -> VNil)
+     | VStr s -> (match args with Cons (VInt i, _) -> let j = if i < 0 then str_len s + i else i in if j >= 0 && j < str_len s then VStr (substring s j (j + 1)) else VNil | _ -> VNil)
+     | VHsh xs -> (match args with Cons (k, _) -> hash_get xs k | _ -> VNil)
+     | _ -> fail "mere-ruby: no []")
+  // Integer
+  else if str_eq name "even?" then (match recv with VInt n -> VBool (floor_mod n 2 == 0) | _ -> fail "no even?")
+  else if str_eq name "odd?" then (match recv with VInt n -> VBool (floor_mod n 2 != 0) | _ -> fail "no odd?")
+  else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | _ -> fail "no zero?")
+  else if str_eq name "succ" || str_eq name "next" then (match recv with VInt n -> VInt (n + 1) | _ -> fail "no succ")
+  else if str_eq name "pred" then (match recv with VInt n -> VInt (n - 1) | _ -> fail "no pred")
+  else if str_eq name "abs" then
+    (match recv with VInt n -> VInt (if n < 0 then 0 - n else n) | VFlt f -> VFlt (if f < 0.0 then 0.0 - f else f) | _ -> fail "no abs")
+  // String
+  else if str_eq name "upcase" then (match recv with VStr s -> VStr (str_upcase s) | _ -> fail "no upcase")
+  else if str_eq name "downcase" then (match recv with VStr s -> VStr (str_downcase s) | _ -> fail "no downcase")
+  else if str_eq name "capitalize" then (match recv with VStr s -> VStr (str_capitalize s) | _ -> fail "no capitalize")
+  else if str_eq name "reverse" then
+    (match recv with VStr s -> VStr (str_rev s) | VArr xs -> VArr (val_rev xs Nil) | _ -> fail "no reverse")
+  else if str_eq name "strip" then (match recv with VStr s -> VStr (str_trim s) | _ -> fail "no strip")
+  else if str_eq name "chars" then (match recv with VStr s -> VArr (str_chars_val s 0) | _ -> fail "no chars")
+  else if str_eq name "split" then
+    (match recv with
+     | VStr s -> (match args with Cons (VStr sep, _) -> VArr (val_list_of_strs (str_split s sep)) | _ -> VArr (val_list_of_strs (str_split s " ")))
+     | _ -> fail "no split")
+  else if str_eq name "include?" then
+    (match recv with
+     | VStr s -> (match args with Cons (VStr sub, _) -> VBool (str_contains s sub) | _ -> VBool false)
+     | VArr xs -> (match args with Cons (v, _) -> VBool (val_contains xs v) | _ -> VBool false)
+     | VHsh xs -> (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false)
+     | _ -> fail "no include?")
+  else if str_eq name "start_with?" then
+    (match recv with VStr s -> (match args with Cons (VStr p, _) -> VBool (str_starts_with s p) | _ -> VBool false) | _ -> fail "no start_with?")
+  else if str_eq name "end_with?" then
+    (match recv with VStr s -> (match args with Cons (VStr p, _) -> VBool (str_ends_with s p) | _ -> VBool false) | _ -> fail "no end_with?")
+  // Array
+  else if str_eq name "first" then (match recv with VArr xs -> val_nth xs 0 | _ -> fail "no first")
+  else if str_eq name "last" then (match recv with VArr xs -> val_nth xs (val_list_len xs - 1) | _ -> fail "no last")
+  else if str_eq name "sort" then (match recv with VArr xs -> VArr (val_sort xs) | _ -> fail "no sort")
+  else if str_eq name "uniq" then (match recv with VArr xs -> VArr (val_uniq xs Nil) | _ -> fail "no uniq")
+  else if str_eq name "min" then (match recv with VArr xs -> (match xs with Nil -> VNil | Cons (h, t) -> val_min t h) | _ -> fail "no min")
+  else if str_eq name "max" then (match recv with VArr xs -> (match xs with Nil -> VNil | Cons (h, t) -> val_max t h) | _ -> fail "no max")
+  else if str_eq name "sum" then (match recv with VArr xs -> val_sum xs (VInt 0) | _ -> fail "no sum")
+  else if str_eq name "index" then (match recv with VArr xs -> (match args with Cons (v, _) -> val_index_of xs v 0 | _ -> VNil) | _ -> fail "no index")
+  else if str_eq name "count" then
+    (match recv with
+     | VArr xs -> (match args with Cons (v, _) -> VInt (val_count_eq xs v) | Nil -> VInt (val_list_len xs))
+     | _ -> fail "no count")
+  else if str_eq name "join" then
+    (match recv with VArr xs -> (match args with Cons (VStr sep, _) -> VStr (val_join xs sep "" true) | _ -> VStr (val_join xs "" "" true)) | _ -> fail "no join")
+  // Hash
+  else if str_eq name "keys" then (match recv with VHsh xs -> VArr (hash_keys xs) | _ -> fail "no keys")
+  else if str_eq name "values" then (match recv with VHsh xs -> VArr (hash_values xs) | _ -> fail "no values")
+  else if str_eq name "key?" || str_eq name "has_key?" then
+    (match recv with VHsh xs -> (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false) | _ -> fail "no key?")
   else fail ("mere-ruby: undefined method '" ++ name ++ "' for this value")
+
+and class_name = fn (recv: Val) ->
+  match recv with
+  | VInt _ -> "Integer" | VFlt _ -> "Float" | VStr _ -> "String" | VBool _ -> "Boolean"
+  | VNil -> "NilClass" | VArr _ -> "Array" | VHsh _ -> "Hash" | VSym _ -> "Symbol"
+  | VRange _ -> "Range" | VClass _ -> "Class" | VObj _ -> "Object"
 
 and range_to_a = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (VInt i, range_to_a (i + 1) last)
