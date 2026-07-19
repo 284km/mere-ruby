@@ -66,7 +66,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // e.g. `if c ... end.should == x`.
           | EStmt of Stmt
           // G2: /pattern/ regex literal (minimal engine: ^ $ . \d +).
-          | ERegex of str;
+          | ERegex of str
+          // G2: break/next/redo/return in EXPRESSION position (fail-unwind).
+          | EFlow of str * Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -114,7 +116,10 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SRequire of bool * Expr
           // G2: low-precedence `stmt and stmt` / `stmt or stmt`.
           | SAndThen of Stmt * Stmt
-          | SOrElse of Stmt * Stmt;
+          | SOrElse of Stmt * Stmt
+          // G2: `begin ... end while/until c` — run body, then loop while
+          // the (already-negated-for-until) condition holds.
+          | SDoWhile of Stmt * Expr;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -168,6 +173,10 @@ let arr_set = fn (id: int) -> fn (xs: Val list) ->
 let proc_store = map_new ();
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// expression-position flow (break/next/redo/return inside an expression)
+// unwinds via fail with the kind and value parked here; loop/method/block
+// runners catch and convert back into a Flow.
+let flow_sig = map_new ();
 // require bookkeeping: "dir" = the current file's directory (require_relative
 // resolves against it); loaded_files dedups double-loads.
 let load_ctx = map_new ();
@@ -1041,6 +1050,30 @@ and parse_primary = fn toks ->
          if str_eq p "(" then let (e, r3) = parse_expr r2 in (EDefined e, expect r3 ")")
          else let (e, r3) = parse_unary r in (EDefined e, r3)
        | _ -> let (e, r3) = parse_unary r in (EDefined e, r3))
+    else if str_eq id "break" || str_eq id "next" || str_eq id "return" || str_eq id "redo" then
+      // flow keywords in expression position (ternary branches, call args).
+      (match r with
+       | Cons (TNL, _) -> (EFlow (id, ENil), r)
+       | Cons (TEOF, _) -> (EFlow (id, ENil), r)
+       | Cons (TP p, _) ->
+         if str_eq p ")" || str_eq p "}" || str_eq p "]" || str_eq p "," ||
+            str_eq p ":" || str_eq p ";" then (EFlow (id, ENil), r)
+         else if str_eq id "redo" then (EFlow (id, ENil), r)
+         else let (e, r2) = parse_expr r in (EFlow (id, e), r2)
+       | Cons (TId w, _) ->
+         if stops_value w || str_eq id "redo" then (EFlow (id, ENil), r)
+         else let (e, r2) = parse_expr r in (EFlow (id, e), r2)
+       | _ ->
+         if str_eq id "redo" then (EFlow (id, ENil), r)
+         else let (e, r2) = parse_expr r in (EFlow (id, e), r2))
+    else if str_eq id "if" then
+      // statement constructs usable as expressions (call args etc.).
+      let (s, r2) = parse_if r false in (EStmt s, r2)
+    else if str_eq id "unless" then let (s, r2) = parse_if r true in (EStmt s, r2)
+    else if str_eq id "while" then let (s, r2) = parse_while r false in (EStmt s, r2)
+    else if str_eq id "until" then let (s, r2) = parse_while r true in (EStmt s, r2)
+    else if str_eq id "case" then let (s, r2) = parse_case r in (EStmt s, r2)
+    else if str_eq id "begin" then let (s, r2) = parse_begin r in (EStmt s, r2)
     else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
     else
       // `name(args)` / `name(args) { block }` / `name { block }` / bare name.
@@ -1231,12 +1264,12 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       let (c, r2) = parse_expr r in
       // `begin ... end while cond` is do-while: run the body once, then loop.
       (match s with
-       | SBegin (_, _, _, _) -> (SBegin (Cons (s, Cons (SWhile (c, Cons (s, Nil)), Nil)), Nil, Nil, Nil), r2)
+       | SBegin (_, _, _, _) -> (SDoWhile (s, c), r2)
        | _ -> (SWhile (c, Cons (s, Nil)), r2))
     else if str_eq id "until" then
       let (c, r2) = parse_expr r in
       (match s with
-       | SBegin (_, _, _, _) -> (SBegin (Cons (s, Cons (SWhile (EUn ("!", c), Cons (s, Nil)), Nil)), Nil, Nil, Nil), r2)
+       | SBegin (_, _, _, _) -> (SDoWhile (s, EUn ("!", c)), r2)
        | _ -> (SWhile (EUn ("!", c), Cons (s, Nil)), r2))
     else if str_eq id "rescue" then
       // `expr rescue fallback` — a one-line begin/rescue.
@@ -2259,9 +2292,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = map_set lambda_ids (str_of_int id) VNil in
     VProc id
   | EStmt s ->
-    // a statement in expression position: its value is the flow's value
-    // (escapes other than raise are absorbed here).
-    flow_value (exec_stmt env world blk s)
+    // a statement in expression position: FNext yields the value; escaping
+    // flows unwind as signals so the enclosing loop/method converts them.
+    (match exec_stmt env world blk s with
+     | FNext v -> v
+     | FBreak v -> flow_throw "break" v
+     | FLoopNext v -> flow_throw "next" v
+     | FReturn v -> flow_throw "return" v
+     | FRaise v -> v)
+  | EFlow (kind, e) ->
+    let v = eval_e env world blk e in
+    flow_throw kind v
   | ERegex p -> VRegex p
   | EYield arges ->
     let args = eval_args env world blk arges in
@@ -2545,10 +2586,29 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // the assignment targets not yet bound outside, delete them afterwards.
   let created = fresh_targets cenv (deep_targets body) in
   let _ = bind_block_params cenv params argvals in
-  let f = run_stmts cenv world encl body in
+  let f = block_body_flow cenv world encl body in
   let _ = restore_params cenv saved in
   let _ = drop_created cenv created in
   f
+
+// run a block body once, converting flow signals: break/next become Flows
+// for the iterator; return keeps unwinding to the enclosing method; redo
+// reruns the block body.
+and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
+  let f = try_or (fn (u: unit) -> run_stmts cenv world encl body) (FRaise VNil) in
+  match f with
+  | FReturn v -> flow_rethrow "return" v   // statement return-in-block unwinds too
+  | FRaise _ ->
+    if map_has flow_sig "k" then
+      let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+      let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+      let _ = map_delete flow_sig "k" in
+      if str_eq k "break" then FBreak v
+      else if str_eq k "next" then FLoopNext v
+      else if str_eq k "redo" then let _ = tick () in block_body_flow cenv world encl body
+      else flow_rethrow k v
+    else fail "mere-ruby: (ruby exception raised)"
+  | other -> other
 
 // deep scan for local-assignment targets (stops at def/class boundaries;
 // the hidden for-loop assignment is excluded so `for` keeps leaking).
@@ -2907,7 +2967,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                   ("wrong number of arguments (given " ++ str_of_int (vlen args) ++
                    ", expected " ++ str_of_int nps ++ ")") in ())
         else () in
-      flow_value (run_block world noblk theblk args)
+      if map_has lambda_ids (str_of_int pid) then
+        // a lambda is method-like: `return` returns from the LAMBDA.
+        let f = try_or (fn (u: unit) -> run_block world noblk theblk args) (FRaise VNil) in
+        (match f with
+         | FRaise _ ->
+           if map_has flow_sig "k" then
+             let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+             let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+             let _ = map_delete flow_sig "k" in
+             if str_eq k "return" then v else flow_throw k v
+           else fail "mere-ruby: (ruby exception raised)"
+         | other -> flow_value other)
+      else flow_value (run_block world noblk theblk args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "arity" then VInt 0
     else dispatch_prim env world blk recv name args vischeck
@@ -3144,7 +3216,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
    | Meth (params, defaults, body) ->
      let frame = map_new () in
      let _ = bind_params frame world blk name params defaults args in
-     (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
+     (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
 
 // is `cls` the class `target` or a descendant of it? (plus universal roots)
 and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
@@ -3223,7 +3295,22 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
     let _ = map_set frame "__meth" (VStr name) in
     let _ = map_set frame "__args" (arr_new args) in
     let _ = bind_params frame world blk name params defaults args in
-    (match run_stmts frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
+    (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
+
+// run a method body, converting a `return` flow signal into the method's
+// return value (any other signal or a real exception keeps unwinding).
+and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
+  let f = try_or (fn (u: unit) -> run_stmts frame world blk body) (FRaise VNil) in
+  match f with
+  | FRaise _ ->
+    if map_has flow_sig "k" then
+      let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+      let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+      let _ = map_delete flow_sig "k" in
+      if str_eq k "return" then FNext v
+      else flow_rethrow k v
+    else fail "mere-ruby: (ruby exception raised)"
+  | other -> other
 
 // allocate an object, then run initialize if the class defines one.
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
@@ -3613,6 +3700,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = undef_top meths names in FNext VNil
   | SVis (_, _) -> FNext VNil   // top-level visibility: no-op
+  | SDoWhile (s2, cond) -> run_dowhile env world blk s2 cond
   | SAndThen (s1, s2) ->
     (match exec_stmt env world blk s1 with
      | FNext v -> if truthy v then exec_stmt env world blk s2 else FNext v
@@ -3659,14 +3747,24 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let caught = FRaise VNil in
     // run the body; a raise unwinds via fail and try_or yields `caught`.
     let result = try_or (fn (u: unit) -> run_stmts env world blk body) caught in
+    // a flow signal (break/next/return crossing this begin) is NOT an
+    // exception: remember it, run ensure, then keep unwinding.
+    let flowk = (match result with
+                 | FRaise _ ->
+                   if map_has flow_sig "k" then (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") else ""
+                 | _ -> "") in
+    let flowv = (if str_eq flowk "" then VNil else (if map_has flow_sig "v" then map_get flow_sig "v" else VNil)) in
+    let _ = if str_eq flowk "" then () else map_delete flow_sig "k" in
     // handle rescue / else, itself wrapped so a raise inside a handler
     // (or a re-raise past all rescues) still lets ensure run first.
     let outcome = try_or (fn (u: unit) ->
       (match result with
        | FRaise _ ->
-         let exc = if map_has ivars "$exc" then map_get ivars "$exc" else VExc ("StandardError", "error") in
-         let _ = map_delete ivars "$exc" in
-         run_rescues env world blk exc rescues
+         if str_eq flowk "" then
+           let exc = if map_has ivars "$exc" then map_get ivars "$exc" else VExc ("StandardError", "error") in
+           let _ = map_delete ivars "$exc" in
+           run_rescues env world blk exc rescues
+         else FRaise VNil   // flow pending — skip rescue
        | FReturn v -> FReturn v
        | FBreak v -> FBreak v
        | FLoopNext v -> FLoopNext v
@@ -3676,9 +3774,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let ensf = (match ens with Nil -> FNext VNil | _ -> run_stmts env world blk ens) in
     (match ensf with
      | FNext _ ->
-       (match outcome with
-        | FRaise _ -> fail "mere-ruby: (exception propagates after ensure)"
-        | other -> other)
+       if str_eq flowk "" then
+         (match outcome with
+          | FRaise _ -> fail "mere-ruby: (exception propagates after ensure)"
+          | other -> other)
+       else flow_rethrow flowk flowv
      | esc -> esc)
   | SLocalFrom (name, s) ->
     (match exec_stmt env world blk s with
@@ -3706,13 +3806,54 @@ and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) -
 and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stmt list) ->
   if truthy (eval_e env world blk cond) then
     let _ = tick () in
-    (match run_stmts env world blk body with
+    (match while_body_flow env world blk body with
      | FReturn v -> FReturn v
      | FRaise v -> FRaise v
      | FBreak v -> FNext v          // break exits the loop with its value
      | FLoopNext _ -> run_while env world blk cond body   // next: skip to next iteration
      | FNext _ -> run_while env world blk cond body)
   else FNext VNil
+
+// begin..end while/until: the body runs at least once INSIDE the loop
+// context (so break/next/redo on the first pass behave correctly).
+and run_dowhile = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (cond: Expr) ->
+  let _ = tick () in
+  (match while_body_flow env world blk (Cons (s, Nil)) with
+   | FReturn v -> FReturn v
+   | FRaise v -> FRaise v
+   | FBreak v -> FNext v
+   | _ ->
+     if truthy (eval_e env world blk cond) then run_dowhile env world blk s cond
+     else FNext VNil)
+
+// park a flow kind+value and unwind via fail; a runner up the stack
+// converts it back into a Flow (or a method return value).
+and flow_throw = fn (kind: str) -> fn (v: Val) ->
+  let _ = map_set flow_sig "k" (VStr kind) in
+  let _ = map_set flow_sig "v" v in
+  fail "mere-ruby: (flow signal)"
+
+// run a loop body once, converting flow signals; redo reruns the body
+// without re-evaluating the loop condition.
+and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
+  let f = try_or (fn (u: unit) -> run_stmts env world blk body) (FRaise VNil) in
+  match f with
+  | FRaise _ ->
+    if map_has flow_sig "k" then
+      let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+      let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+      let _ = map_delete flow_sig "k" in
+      if str_eq k "break" then FBreak v
+      else if str_eq k "next" then FLoopNext v
+      else if str_eq k "redo" then let _ = tick () in while_body_flow env world blk body
+      else flow_rethrow k v
+    else fail "mere-ruby: (ruby exception raised)"
+  | other -> other
+
+and flow_rethrow = fn (k: str) -> fn (v: Val) ->
+  let _ = map_set flow_sig "k" (VStr k) in
+  let _ = map_set flow_sig "v" v in
+  fail "mere-ruby: (flow signal)"
 
 // Ruby's `when` uses ===; for the value classes in this subset that is
 // plain equality.
