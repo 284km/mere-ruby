@@ -151,6 +151,8 @@ let arr_set = fn (id: int) -> fn (xs: Val list) ->
 // (has, params, body, captured env) — the env is a Map, so like arrays a
 // proc lives behind an int handle rather than inside the Val variant.
 let proc_store = map_new ();
+// proc ids created via `lambda` — lambdas check arity strictly on call.
+let lambda_ids = map_new ();
 // global variables ($name) live in another top-level captured Map.
 let globals = map_new ();
 // constants (Capitalized names) live in another; a class name that is not
@@ -1278,7 +1280,9 @@ and parse_for = fn toks ->
          let (e, r3) = parse_expr r2 in
          let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
          let (body, r4) = parse_stmts r3b Nil in
-         (SExpr (EMethodB (e, "each", Nil, Cons (v, Nil), body)), expect_kw r4 "end")
+         // the hidden __for param keeps v assigned in the SHARED scope, so
+         // v survives the loop (block params themselves are block-local).
+         (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (SAssign (v, EVar "__for"), body))), expect_kw r4 "end")
        else fail "mere-ruby: expected in after for"
      | _ -> fail "mere-ruby: expected in after for")
   | _ -> fail "mere-ruby: expected a variable after for"
@@ -1930,7 +1934,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // proc { } / lambda { } capture the block as a first-class VProc.
     if str_eq name "proc" || str_eq name "lambda" then
       (let id = map_len proc_store in
-       let _ = map_set proc_store (str_of_int id) (true, bp, bb, env) in VProc id)
+       let _ = map_set proc_store (str_of_int id) (true, bp, bb, env) in
+       let _ = if str_eq name "lambda" then map_set lambda_ids (str_of_int id) VNil else () in
+       VProc id)
     else if map_has meths name then call_method env world newblk name args
     // implicit self: a bare `each { }` inside a method is `self.each { }`.
     else if map_has env "self" then
@@ -2160,8 +2166,32 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
 // method's block.
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let (has, params, body, cenv) = theblk in
+  // Ruby block params are block-local: save any outer bindings of the
+  // param names and restore them after the block (for-loops keep their
+  // variable via an explicit assignment to a hidden __for param).
+  let saved = save_params cenv params Nil in
   let _ = bind_block_params cenv params argvals in
-  run_stmts cenv world encl body
+  let f = run_stmts cenv world encl body in
+  let _ = restore_params cenv saved in
+  f
+
+and save_params = fn cenv -> fn (params: str list) -> fn acc ->
+  match params with
+  | Nil -> acc
+  | Cons (p0, r) ->
+    let p = if str_len p0 > 0 && (str_eq (char_at p0 0) "*" || str_eq (char_at p0 0) "&")
+            then substring p0 1 (str_len p0) else p0 in
+    if str_eq p "" then save_params cenv r acc
+    else save_params cenv r (Cons ((p, map_has cenv p, (if map_has cenv p then map_get cenv p else VNil)), acc))
+
+and restore_params = fn cenv -> fn saved ->
+  match saved with
+  | Nil -> ()
+  | Cons (t, r) ->
+    let (p, had, v) = t in
+    let _ = if had then map_set cenv p v
+            else (if map_has cenv p then map_delete cenv p else ()) in
+    restore_params cenv r
 
 and flow_value = fn (f: Flow) ->
   match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
@@ -2256,11 +2286,11 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   // becomes the whole call's result) or FNext <natural result>.
   match recv with
   | VArr id -> let xs = deref id in
-    if str_eq name "each" then iter_result (arr_each world encl theblk xs) recv
+    if str_eq name "each" then iter_each_result (arr_each world encl theblk xs) recv
     else if str_eq name "map" then iter_result (arr_map world encl theblk xs Nil) recv
     else if str_eq name "select" then iter_result (arr_filter world encl theblk xs Nil true) recv
     else if str_eq name "reject" then iter_result (arr_filter world encl theblk xs Nil false) recv
-    else if str_eq name "each_with_index" then iter_result (arr_each_idx world encl theblk xs 0) recv
+    else if str_eq name "each_with_index" then iter_each_result (arr_each_idx world encl theblk xs 0) recv
     else if str_eq name "reduce" || str_eq name "inject" then
       (match args with
        | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
@@ -2274,19 +2304,19 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "flat_map" || str_eq name "collect_concat" then iter_result (arr_map world encl theblk xs Nil) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Array")
   | VHsh xs ->
-    if str_eq name "each" then iter_result (hash_each world encl theblk xs) recv
+    if str_eq name "each" then iter_each_result (hash_each world encl theblk xs) recv
     else if str_eq name "select" then iter_result (hash_filter world encl theblk xs Nil) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Hash")
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
-    if str_eq name "each" then iter_result (range_each world encl theblk lo last) recv
+    if str_eq name "each" then iter_each_result (range_each world encl theblk lo last) recv
     else if str_eq name "map" then iter_result (range_map world encl theblk lo last Nil) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Range")
   | VInt n ->
-    if str_eq name "times" then iter_result (range_each world encl theblk 0 (n - 1)) recv
+    if str_eq name "times" then iter_each_result (range_each world encl theblk 0 (n - 1)) recv
     else if str_eq name "upto" then
       (match args with
-       | Cons (VInt m, _) -> iter_result (range_each world encl theblk n m) recv
+       | Cons (VInt m, _) -> iter_each_result (range_each world encl theblk n m) recv
        | _ -> fail "mere-ruby: upto needs an integer")
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Integer")
   | _ -> fail ("mere-ruby: undefined block method '" ++ name ++ "' for this value")
@@ -2295,6 +2325,11 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
 // natural result (`dflt`, e.g. the receiver, or the value FNext carries).
 and iter_result = fn (f: Flow) -> fn (dflt: Val) ->
   match f with FBreak v -> v | FNext v -> v | other -> dflt
+
+// each/times/upto return the RECEIVER on natural completion (their body
+// flows return FNext VNil); break still yields the break value.
+and iter_each_result = fn (f: Flow) -> fn (recv: Val) ->
+  match f with FBreak v -> v | _ -> recv
 
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
@@ -2431,7 +2466,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
   | VProc pid ->
     // call/./[]/yield run the stored block; class reports Proc.
     if str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===" then
-      flow_value (run_block world noblk (map_get proc_store (str_of_int pid)) args)
+      let theblk = map_get proc_store (str_of_int pid) in
+      // a lambda checks arity strictly (procs stay lenient).
+      let _ =
+        if map_has lambda_ids (str_of_int pid) then
+          let (h2, ps, b2, e2) = theblk in
+          let nps = list_str_len (strip_block_params ps) in
+          (if has_splat ps then ()
+           else if nps == vlen args then ()
+           else let _ = raise_exc world "ArgumentError"
+                  ("wrong number of arguments (given " ++ str_of_int (vlen args) ++
+                   ", expected " ++ str_of_int nps ++ ")") in ())
+        else () in
+      flow_value (run_block world noblk theblk args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "arity" then VInt 0
     else prim_method recv name args
