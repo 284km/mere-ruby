@@ -37,6 +37,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | EMethod of Expr * str * Expr list  // recv.name(args)
           // M4 blocks / iterators:
           | ERange of Expr * Expr * bool         // lo..hi (bool = exclusive)
+          // `name [items]` (space before bracket): indexing when name is a
+          // live local, else a call with one array argument. Decided at eval.
+          | EAmbigIdx of str * Expr list
           // a range in condition position: the flip-flop operator. The int
           // is the site id keying its hidden on/off state.
           | EFlipFlop of int * Expr * Expr * bool
@@ -936,7 +939,10 @@ and paren_body = fn toks ->
   | _ -> paren_expr_body (skip_nls toks)
 
 and paren_expr_body = fn toks ->
-  if looks_like_multi toks then
+  if looks_like_multix toks then
+    let (s2, r2) = parse_multix toks in
+    (EStmt s2, expect (skip_nls r2) ")")
+  else if looks_like_multi toks then
     let (s2, r2) = parse_multi toks in
     (EStmt s2, expect (skip_nls r2) ")")
   else
@@ -1093,7 +1099,12 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
        | _ -> fail "mere-ruby: expected method name after .")
     // index: recv[i] -> recv.[](i); recv[i] = v -> recv.[]=(i, v)
     else if str_eq dot "[" then
-      let (idx, r2) = parse_expr r in
+      let (idx, r2) =
+        (match r with
+         | Cons (TP st, r0) ->
+           if str_eq st "*" then let (i2, r1) = parse_expr r0 in (ESplat i2, r1)
+           else parse_expr r
+         | _ -> parse_expr r) in
       let r3 = expect r2 "]" in
       (match r3 with
        | Cons (TP eq, r4) ->
@@ -1380,7 +1391,12 @@ and parse_primary = fn toks ->
        | Cons (TP p, r2) ->
          if str_eq p "=" then
            // assignment as an expression: `true && x = 1` binds rightmost.
-           let (e, r3) = parse_expr r2 in (EAssign (id, e), r3)
+           (match r2 with
+            | Cons (TP st, r2b) ->
+              if str_eq st "*" then
+                let (e, r3) = parse_expr r2b in (EAssign (id, EArr (Cons (ESplat e, Nil))), r3)
+              else let (e, r3) = parse_expr r2 in (EAssign (id, e), r3)
+            | _ -> let (e, r3) = parse_expr r2 in (EAssign (id, e), r3))
          else if not (str_eq (opassign_base p) "") then
            // op-assign as an expression: `(i += 1) >= 5`.
            let (e, r3) = parse_expr r2 in
@@ -1397,6 +1413,13 @@ and parse_primary = fn toks ->
          // `p [1, 2]` — p/pp take a space-bracket array argument.
          else if str_eq p " [" && (str_eq id "p" || str_eq id "pp") then
            let (es, r2b) = parse_puts_args r Nil in (ECall (id, es), r2b)
+         // `name [items]` — indexing or call-with-array, decided at eval.
+         else if str_eq p " [" then
+           (match parse_array r2 with
+            | (ae, r2b) ->
+              (match ae with
+               | EArr items -> (EAmbigIdx (id, items), r2b)
+               | other -> (ECall (id, Cons (other, Nil)), r2b)))
          // a double-quoted string argument: `d "desc" do ... end`.
          else if str_eq p "(s" then
            let (es, r2b) = parse_puts_args r Nil in
@@ -1793,7 +1816,13 @@ and parse_x_targets = fn toks -> fn (acc: Expr list) ->
   let (t, r) =
     (match toks with
      | Cons (TP star, r0) ->
-       if str_eq star "*" then let (inner, r1) = parse_x_target1 r0 in (ESplat inner, r1)
+       if str_eq star "*" then
+         // `* = 1` — an anonymous splat consumes (and discards) values.
+         (match r0 with
+          | Cons (TP nx, _) ->
+            if str_eq nx "=" || str_eq nx "," then (ESplat ENil, r0)
+            else let (inner, r1) = parse_x_target1 r0 in (ESplat inner, r1)
+          | _ -> let (inner, r1) = parse_x_target1 r0 in (ESplat inner, r1))
        else parse_x_target1 toks
      | _ -> parse_x_target1 toks) in
   match r with
@@ -1826,7 +1855,12 @@ and parse_x_group = fn toks -> fn (acc: Expr list) ->
   let (t, r) =
     (match toks with
      | Cons (TP star, r0) ->
-       if str_eq star "*" then let (i, r1) = parse_x_target1 r0 in (ESplat i, r1)
+       if str_eq star "*" then
+         (match r0 with
+          | Cons (TP nx, _) ->
+            if str_eq nx ")" || str_eq nx "," then (ESplat ENil, r0)
+            else let (i, r1) = parse_x_target1 r0 in (ESplat i, r1)
+          | _ -> let (i, r1) = parse_x_target1 r0 in (ESplat i, r1))
        else parse_x_target1 toks
      | _ -> parse_x_target1 toks) in
   match r with
@@ -1856,7 +1890,12 @@ and parse_x_chain = fn (recv: Expr) -> fn toks ->
   | _ -> (recv, toks)
 
 and parse_x_idx = fn toks -> fn (acc: Expr list) ->
-  let (e, r) = parse_expr toks in
+  let (e, r) =
+    (match toks with
+     | Cons (TP st, r0) ->
+       if str_eq st "*" then let (i, r1) = parse_expr r0 in (ESplat i, r1)
+       else parse_expr toks
+     | _ -> parse_expr toks) in
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then parse_x_idx r2 (Cons (e, acc))
@@ -1871,7 +1910,11 @@ and looks_like_multix = fn toks ->
   match toks with
   | Cons (TId nm, _) -> if is_keyword nm then false else scan_mx toks 0 false false
   // a leading group: a comma or splat at depth 1 marks targets too ((*a) = ...)
-  | Cons (TP lp, _) -> if str_eq lp "(" then scan_mx toks 0 false true else false
+  | Cons (TP lp, r) ->
+    if str_eq lp "(" then scan_mx toks 0 false true
+    // a leading splat is itself a target (* = 1, *a = ...), if an = follows.
+    else if str_eq lp "*" then scan_mx r 0 true false
+    else false
   | _ -> false
 
 and scan_mx = fn toks -> fn (depth: int) -> fn (seen: bool) -> fn (grp: bool) ->
@@ -1920,6 +1963,17 @@ and parse_one_target = fn toks ->
     else fail "mere-ruby: bad assignment target"
   | Cons (TId nm, r) -> (nm, r)   // plain local, or @ivar (@ kept in the name)
   | _ -> fail "mere-ruby: bad assignment target"
+
+// the RHS of `a = ...`: one value, or a comma list / splat that builds an
+// array (`a = 1, 2` and `a = *nil`).
+and sassign_rhs = fn (id: str) -> fn toks ->
+  let (es, r) = parse_rhs_list toks Nil in
+  (match es with
+   | Cons (single, Nil) ->
+     (match single with
+      | ESplat _ -> (SAssign (id, EArr es), r)
+      | _ -> (SAssign (id, single), r))
+   | _ -> (SAssign (id, EArr es), r))
 
 and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
   let (e, r) =
@@ -2059,8 +2113,8 @@ and parse_stmt_id = fn toks ->
               // chained assignment `a = b = ... = e` binds right-to-left.
               else if (match r3 with Cons (TP eq2, _) -> str_eq eq2 "=" | _ -> false) && not (is_keyword bg) then
                 let (s2, r4) = parse_stmt r2 in (SLocalFrom (id, s2), r4)
-              else let (e, r3b) = parse_expr r2 in (SAssign (id, e), r3b)
-            | _ -> let (e, r3c) = parse_expr r2 in (SAssign (id, e), r3c))
+              else sassign_rhs id r2
+            | _ -> sassign_rhs id r2)
          else if not (str_eq (opassign_base p) "") && not (is_keyword id) && not (is_cap id) then
            // `var += expr` -> `var = var <op> expr`
            let (e, r3) = parse_expr r2 in
@@ -2793,9 +2847,10 @@ let rec val_last = fn (xs: Val list) ->
   match xs with Nil -> VNil | Cons (h, t) -> (match t with Nil -> h | _ -> val_last t);
 let rec val_init = fn (xs: Val list) ->
   match xs with Nil -> Nil | Cons (h, t) -> (match t with Nil -> Nil | _ -> Cons (h, val_init t));
+// past-the-end writes extend with nils (Ruby's a[5] = x on a short array).
 let rec val_set_at = fn (xs: Val list) -> fn (i: int) -> fn (v: Val) ->
   match xs with
-  | Nil -> Nil
+  | Nil -> if i <= 0 then Cons (v, Nil) else Cons (VNil, val_set_at Nil (i - 1) v)
   | Cons (h, t) -> if i == 0 then Cons (v, t) else Cons (h, val_set_at t (i - 1) v);
 
 let rec val_contains = fn (xs: Val list) -> fn (v: Val) ->
@@ -3008,6 +3063,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    if truthy v2 then map_set ff_state key (VBool false) else ()) in
         VBool true
       else VBool false
+  | EAmbigIdx (name, items) ->
+    if map_has env name then eval_e env world blk (EMethod (EVar name, "[]", items))
+    else eval_e env world blk (ECall (name, Cons (EArr items, Nil)))
   | ERange (loe, hie, excl) ->
     (match eval_e env world blk loe with
      | VInt lo ->
