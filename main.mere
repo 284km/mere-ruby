@@ -508,6 +508,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let opener = char_at s (b - 1) in
       let (lit, j) = scan_balanced2 s b 1 "" opener (pct_close_of opener) in
       if is_percent_w s i then Cons (TP " [", pw_words lit 0 (lex_go s j))
+      // %s{...} is a symbol; %i{...} a symbol array.
+      else if str_eq (char_at s (i + 1)) "s" then Cons (TSym lit, lex_go s j)
+      else if str_eq (char_at s (i + 1)) "i" || str_eq (char_at s (i + 1)) "I" then
+        Cons (TP " [", pi_words lit 0 (lex_go s j))
       // %Q/%(...) interpolate like double-quoted strings; %q stays raw.
       else if (if str_eq (char_at s (i + 1)) "q" then false else true) && rx_has_interp lit 0 then
         tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src lit) 0))) (Cons (TP ")", lex_go s j))
@@ -569,7 +573,8 @@ and percent_body = fn (s: str) -> fn (i: int) ->
   else
     let c1 = char_at s (i + 1) in
     if is_pct_open c1 then i + 2
-    else if (str_eq c1 "q" || str_eq c1 "Q" || str_eq c1 "w" || str_eq c1 "i")
+    else if (str_eq c1 "q" || str_eq c1 "Q" || str_eq c1 "w" || str_eq c1 "i" || str_eq c1 "s" ||
+             str_eq c1 "W" || str_eq c1 "I")
             && i + 2 < str_len s && is_pct_open (char_at s (i + 2)) then i + 3
     else 0 - 1
 
@@ -579,7 +584,7 @@ and pct_close_of = fn (c: str) ->
   if str_eq c "(" then ")" else if str_eq c "\{" then "}" else "]"
 
 and is_percent_w = fn (s: str) -> fn (i: int) ->
-  i + 1 < str_len s && str_eq (char_at s (i + 1)) "w"
+  i + 1 < str_len s && (str_eq (char_at s (i + 1)) "w" || str_eq (char_at s (i + 1)) "W")
 
 // raw scan to the balanced closing delimiter; returns (body, index-after).
 and scan_balanced2 = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: str) -> fn (op: str) -> fn (clo: str) ->
@@ -599,8 +604,30 @@ and pw_words = fn (t: str) -> fn (i: int) -> fn rest ->
   else
     let (w, j) = pw_word t i "" in
     let k = pw_skip t j in
-    if k >= str_len t then Cons (TStrL w, Cons (TP "]", rest))
-    else Cons (TStrL w, Cons (TP ",", pw_words t k rest))
+    if k >= str_len t then pw_tok w (Cons (TP "]", rest))
+    else pw_tok w (Cons (TP ",", pw_words t k rest))
+
+// %i body -> `:w1, :w2, ... ]` token run (symbol words).
+and pi_words = fn (t: str) -> fn (i: int) -> fn rest ->
+  if i >= str_len t then Cons (TP "]", rest)
+  else if str_eq (char_at t i) " " || str_eq (char_at t i) "\n" then pi_words t (i + 1) rest
+  else
+    let (w, j) = pw_word t i "" in
+    let k = pw_skip t j in
+    if k >= str_len t then pi_tok w (Cons (TP "]", rest))
+    else pi_tok w (Cons (TP ",", pi_words t k rest))
+
+// one %i/%w word: an interpolated word desugars through the string lexer.
+and pi_tok = fn (w: str) -> fn rest ->
+  if rx_has_interp w 0 then
+    Cons (TP "(s", tapp (drop_eof (lex_go (rx_interp_src w) 0))
+      (Cons (TP ")", Cons (TP ".", Cons (TId "to_sym", rest)))))
+  else Cons (TSym w, rest)
+
+and pw_tok = fn (w: str) -> fn rest ->
+  if rx_has_interp w 0 then
+    Cons (TP "(s", tapp (drop_eof (lex_go (rx_interp_src w) 0)) (Cons (TP ")", rest)))
+  else Cons (TStrL w, rest)
 
 and pw_word = fn (t: str) -> fn (i: int) -> fn (acc: str) ->
   if i >= str_len t then (acc, i)
@@ -1531,7 +1558,13 @@ and parse_arr_items = fn toks -> fn (acc: Expr list) ->
 and arr_items_sep = fn r -> fn (acc: Expr list) ->
   match r with
   | Cons (TP p, r2) ->
-    if str_eq p "," then parse_arr_items (skip_nls r2) acc
+    if str_eq p "," then
+      // `[1, 2,]` — a hanging comma before the closing bracket.
+      (match skip_nls r2 with
+       | Cons (TP rb, r3) ->
+         if str_eq rb "]" then (EArr (rev_app acc Nil), r3)
+         else parse_arr_items (skip_nls r2) acc
+       | _ -> parse_arr_items (skip_nls r2) acc)
     else if str_eq p "]" then (EArr (rev_app acc Nil), r2)
     else fail ("mere-ruby: expected , or ] in array, got " ++ p)
   | _ -> fail "mere-ruby: unterminated array literal"
@@ -1541,7 +1574,12 @@ and parse_arr_expr = fn toks -> fn (acc: Expr list) ->
   let r = skip_nls r0 in   // allow a newline before the , or ]
   match r with
   | Cons (TP p, r2) ->
-    if str_eq p "," then parse_arr_items (skip_nls r2) (Cons (e, acc))
+    if str_eq p "," then
+      (match skip_nls r2 with
+       | Cons (TP rb, r3) ->
+         if str_eq rb "]" then (EArr (rev_app (Cons (e, acc)) Nil), r3)
+         else parse_arr_items (skip_nls r2) (Cons (e, acc))
+       | _ -> parse_arr_items (skip_nls r2) (Cons (e, acc)))
     else if str_eq p "]" then (EArr (rev_app (Cons (e, acc)) Nil), r2)
     // trailing hash without braces: ["a", "b" => 1, "c" => 2]
     else if str_eq p "=>" then
@@ -3023,20 +3061,37 @@ and inspect = fn (v: Val) ->
   | VArr id -> "[" ++ join_inspect (deref id) "" ++ "]"
   | VHsh xs -> "\{" ++ join_pairs xs "" ++ "}"
   | VSym sy ->
-    // symbols with non-identifier characters inspect quoted (:"foo bar").
-    if sym_plain sy 0 then ":" ++ sy else ":\"" ++ sy ++ "\""
+    // a symbol that isn't a plain identifier / valid operator name inspects
+    // quoted and escaped (:"foo bar", :"9", :"a\nb").
+    if sym_plain sy then ":" ++ sy else ":\"" ++ esc_str sy 0 "" ++ "\""
   | _ -> to_s v
 
-and sym_plain = fn (sy: str) -> fn (i: int) ->
+and sym_plain = fn (sy: str) ->
   if str_len sy == 0 then false
-  else if i >= str_len sy then true
+  else if is_valid_op_sym sy then true
+  else
+    // optional @ / @@ / $ sigil, then an identifier (?, !, = may end it).
+    let st = (if str_len sy >= 2 && str_eq (substring sy 0 2) "@@" then 2
+              else if str_eq (char_at sy 0) "@" || str_eq (char_at sy 0) "$" then 1
+              else 0) in
+    if st >= str_len sy then false
+    else if is_alpha (char_at sy st) || str_eq (char_at sy st) "_" then sym_ident_rest sy (st + 1)
+    else false
+
+and sym_ident_rest = fn (sy: str) -> fn (i: int) ->
+  if i >= str_len sy then true
   else
     let c = char_at sy i in
-    if is_alnum c || str_eq c "_" || str_eq c "?" || str_eq c "!" || str_eq c "=" ||
-       str_eq c "@" || str_eq c "$" || str_eq c "<" || str_eq c ">" || str_eq c "+" ||
-       str_eq c "-" || str_eq c "*" || str_eq c "/" || str_eq c "%" || str_eq c "~" ||
-       str_eq c "&" || str_eq c "|" || str_eq c "^" || str_eq c "[" || str_eq c "]"
-    then sym_plain sy (i + 1) else false
+    if is_alnum c || str_eq c "_" then sym_ident_rest sy (i + 1)
+    else (str_eq c "?" || str_eq c "!" || str_eq c "=") && i + 1 == str_len sy
+
+and is_valid_op_sym = fn (sy: str) ->
+  str_eq sy "+" || str_eq sy "-" || str_eq sy "*" || str_eq sy "/" || str_eq sy "%" ||
+  str_eq sy "**" || str_eq sy "==" || str_eq sy "!=" || str_eq sy "<" || str_eq sy "<=" ||
+  str_eq sy ">" || str_eq sy ">=" || str_eq sy "<=>" || str_eq sy "===" || str_eq sy "=~" ||
+  str_eq sy "!~" || str_eq sy "<<" || str_eq sy ">>" || str_eq sy "[]" || str_eq sy "[]=" ||
+  str_eq sy "!" || str_eq sy "~" || str_eq sy "^" || str_eq sy "&" || str_eq sy "|" ||
+  str_eq sy "+@" || str_eq sy "-@"
 
 and join_inspect = fn (xs: Val list) -> fn (acc: str) ->
   match xs with
