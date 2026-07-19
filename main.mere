@@ -1776,6 +1776,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let (meths, sup, ocls, ivars) = world in
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world newblk recv cls name args
+       // Enumerable: synthesize block iterators from the user's `each`.
+       else if has_meth world cls "each" && is_enum_method name then
+         builtin_iter world blk newblk (enum_collect world recv cls) name args
        else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls)
      // `blk` (the enclosing method's block) is threaded so a yield inside
@@ -1967,6 +1970,53 @@ and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals0: Val li
        | Nil -> let _ = map_set cenv p VNil in bind_block_params cenv ps Nil
        | Cons (a, rest) -> let _ = map_set cenv p a in bind_block_params cenv ps rest)
 
+// block predicates on a list (run the block per element, short-circuiting).
+and arr_detect = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (h, t) -> if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then h else arr_detect world encl theblk t
+
+and arr_any = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> VBool false
+  | Cons (h, t) -> if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then VBool true else arr_any world encl theblk t
+
+and arr_all = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> VBool true
+  | Cons (h, t) -> if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then arr_all world encl theblk t else VBool false
+
+and arr_none = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> VBool true
+  | Cons (h, t) -> if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then VBool false else arr_none world encl theblk t
+
+and arr_find_index = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (i: int) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (h, t) -> if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then VInt i else arr_find_index world encl theblk t (i + 1)
+
+// run an object's user `each` with a collector block, returning the yielded
+// values as a fresh array (the basis of the synthesized Enumerable methods).
+and enum_collect = fn world -> fn (recv: Val) -> fn (cls: str) ->
+  let accv = arr_new Nil in
+  (match accv with
+   | VArr _ ->
+     let cenv = map_new () in
+     let _ = map_set cenv "__acc" accv in
+     let collector = (true, Cons ("__e", Nil), Cons (SExpr (EMethod (EVar "__acc", "push", Cons (EVar "__e", Nil))), Nil), cenv) in
+     let _ = invoke world collector recv cls "each" Nil in accv
+   | _ -> accv)
+
+and is_enum_method = fn (name: str) ->
+  str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
+  str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_index" ||
+  str_eq name "index" || str_eq name "any?" || str_eq name "all?" || str_eq name "none?" ||
+  str_eq name "count" || str_eq name "reduce" || str_eq name "inject" || str_eq name "each_with_index" ||
+  str_eq name "to_a" || str_eq name "entries" || str_eq name "first" || str_eq name "include?" ||
+  str_eq name "member?" || str_eq name "min" || str_eq name "max" || str_eq name "sort" ||
+  str_eq name "sum" || str_eq name "flat_map"
+
 // built-in block-taking iterators on primitive receivers. `encl` is the
 // enclosing method's block (threaded so a yield inside the iterated block
 // reaches it); `theblk` is the block being iterated.
@@ -1985,6 +2035,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
        | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> iter_result (arr_reduce world encl theblk t h) recv))
     else if str_eq name "count" then iter_result (arr_count_blk world encl theblk xs 0) recv
+    else if str_eq name "detect" || str_eq name "find" then arr_detect world encl theblk xs
+    else if str_eq name "any?" then arr_any world encl theblk xs
+    else if str_eq name "all?" then arr_all world encl theblk xs
+    else if str_eq name "none?" then arr_none world encl theblk xs
+    else if str_eq name "find_index" || str_eq name "index" then arr_find_index world encl theblk xs 0
+    else if str_eq name "flat_map" || str_eq name "collect_concat" then iter_result (arr_map world encl theblk xs Nil) recv
     else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Array")
   | VHsh xs ->
     if str_eq name "each" then iter_result (hash_each world encl theblk xs) recv
@@ -2117,6 +2173,10 @@ and invoke_val = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
     else if is_prim_method name then prim_method recv name args
+    // Enumerable (no block): to_a returns the collected array; others delegate.
+    else if has_meth world cls "each" && is_enum_method name then
+      let coll = enum_collect world recv cls in
+      if str_eq name "to_a" || str_eq name "entries" then coll else prim_method coll name args
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
     // an object has no such method — raise a catchable NoMethodError.
     else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls)
