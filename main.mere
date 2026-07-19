@@ -817,6 +817,10 @@ and paren_body = fn toks ->
   | _ -> paren_expr_body (skip_nls toks)
 
 and paren_expr_body = fn toks ->
+  if looks_like_multi toks then
+    let (s2, r2) = parse_multi toks in
+    (EStmt s2, expect (skip_nls r2) ")")
+  else
   let (e, r2) = parse_andor toks in
   match r2 with
   | Cons (TId w, _) ->
@@ -3367,7 +3371,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   match recv with
   | VClass c ->
-    if str_eq name "new" then new_obj world c args
+    if str_eq c "Class" && str_eq name "new" then
+      (let (meths2, sup2, ocls2, iv2) = world in
+       let anon = "AnonClass_" ++ str_of_int (map_len ocls2) in
+       let _ = (match args with Cons (VClass sc, _) -> map_set sup2 anon sc | _ -> ()) in
+       VClass anon)
+    else if str_eq name "new" then new_obj world c args
     else if str_eq name "name" then VStr c
     else if str_eq name "const_defined?" then
       (match args with
@@ -3401,6 +3410,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
     then flow_value (run_block world noblk blk args)
     else if str_eq s "&blk" && str_eq name "class" then VClass "Proc"
+    else dispatch_prim env world blk recv name args vischeck
+  | VMain ->
+    // explicit self at the top level dispatches to top-level methods.
+    let (meths, sup, ocls, ivars) = world in
+    if map_has meths name then call_method env world noblk name args
     else dispatch_prim env world blk recv name args vischeck
   | VProc pid ->
     // call/./[]/yield run the stored block; class reports Proc.
@@ -3439,11 +3453,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
 // dispatch `recv.name(args) { block }` — shared by literal-block calls and
 // &proc block-pass arguments.
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
+    // Object#then / yield_self: run the block with the receiver.
+    if str_eq name "then" || str_eq name "yield_self" then
+      flow_value (run_block world blk newblk (Cons (recv, Nil)))
+    else
     (match recv with
      | VClass c ->
-       // Proc.new { } captures the block; other Class.new { } ignore it.
+       // Proc.new { } captures the block; Class.new { } makes an anonymous
+       // class whose body is the block; class_eval reopens the class.
        if str_eq c "Proc" && str_eq name "new" then
          (let id = map_len proc_store in let _ = map_set proc_store (str_of_int id) newblk in VProc id)
+       else if str_eq c "Class" && str_eq name "new" then
+         (let (meths2, sup2, ocls2, iv2) = world in
+          let anon = "AnonClass_" ++ str_of_int (map_len ocls2) in
+          let _ = (match args with Cons (VClass sc, _) -> map_set sup2 anon sc | _ -> ()) in
+          let (h3, ps3, bb3, e3) = newblk in
+          let _ = flow_value (register_class world anon bb3) in
+          VClass anon)
+       else if str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "instance_eval" then
+         (let (h3, ps3, bb3, e3) = newblk in
+          let _ = flow_value (register_class world c bb3) in
+          VClass c)
        else if str_eq name "new" then new_obj world c args
        else if has_meth world c name then invoke world newblk recv c name args
        else prim_method recv name args
@@ -3513,6 +3543,10 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
     (match recv with VStr sp -> VRegex sp | _ -> fail "no __regex")
+  else if str_eq name "casecmp?" then
+    (match recv with
+     | VStr a -> (match args with Cons (VStr b2, _) -> VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
+     | _ -> fail "no casecmp?")
   else if str_eq name "to_sym" then
     (match recv with VStr s -> VSym s | VSym s -> VSym s | _ -> fail "no to_sym")
   else if str_eq name "equal?" then
@@ -4321,13 +4355,16 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SMultiAssign (targets, rhs) ->
     // build the value list: a single array RHS is destructured; several
     // values (or a single non-array) form the list.
-    let values =
-      (match rhs with
-       | Cons (single, Nil) ->
-         (match eval_e env world blk single with VArr id -> deref id | v -> Cons (v, Nil))
-       | _ -> eval_args env world blk rhs) in
-    let _ = assign_targets env world targets values in
-    FNext (arr_new values)
+    (match rhs with
+     | Cons (single, Nil) ->
+       let rv = eval_e env world blk single in
+       let values = (match rv with VArr id -> deref id | v -> Cons (v, Nil)) in
+       let _ = assign_targets env world targets values in
+       FNext rv   // the statement's value is the RHS itself (nil stays falsy)
+     | _ ->
+       let values = eval_args env world blk rhs in
+       let _ = assign_targets env world targets values in
+       FNext (arr_new values))
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
   match clauses with
@@ -4412,6 +4449,15 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
 // is-a, anything else tests ==.
 and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
   match cand with
+  | VObj oid ->
+    // a user-defined === (called even when private, as case/when does)
+    let (m2, s2, ocls2, iv2) = world in
+    let ocl = map_get ocls2 (str_of_int oid) in
+    if has_meth world ocl "===" then
+      let frame0 = map_new () in
+      let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
+      truthy (invoke world noblk0 cand ocl "===" (Cons (v, Nil)))
+    else rb_eq cand v
   | VRegex p ->
     (match v with
      | VStr sv -> (match rx_do_match world p sv with VNil -> false | _ -> true)
