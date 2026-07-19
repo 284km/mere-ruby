@@ -108,6 +108,7 @@ type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
          | VObj of int | VClass of str | VSym of str
          | VRange of int * int * bool
          | VExc of str * str    // exception: class name, message
+         | VProc of int         // a proc/lambda: a handle into proc_store
          | VMain;               // the top-level `self` (main), class Object
 
 // A user method: parameter names, defaults ((name, default-expr) for
@@ -140,6 +141,10 @@ let arr_new = fn (xs: Val list) ->
 let deref = fn (id: int) -> map_get arr_store (str_of_int id);
 let arr_set = fn (id: int) -> fn (xs: Val list) ->
   let _ = map_set arr_store (str_of_int id) xs in ();
+// procs/lambdas are handles into this store, which holds their block
+// (has, params, body, captured env) — the env is a Map, so like arrays a
+// proc lives behind an int handle rather than inside the Val variant.
+let proc_store = map_new ();
 // global variables ($name) live in another top-level captured Map.
 let globals = map_new ();
 // constants (Capitalized names) live in another; a class name that is not
@@ -539,6 +544,10 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               (EMethod (recv, name ++ "=", Cons (rhs, Nil)), r4)
             else attach_block_method recv name Nil r2
           | _ -> attach_block_method recv name Nil r2)
+       // `recv.(args)` is shorthand for `recv.call(args)`.
+       | Cons (TP lp, r2) ->
+         if str_eq lp "(" then let (argv, r3) = parse_call_args r2 in attach_block_method recv "call" argv r3
+         else fail "mere-ruby: expected method name after ."
        | _ -> fail "mere-ruby: expected method name after .")
     // index: recv[i] -> recv.[](i); recv[i] = v -> recv.[]=(i, v)
     else if str_eq dot "[" then
@@ -1724,7 +1733,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = map_set ivars "$exc" exc in
     fail "mere-ruby: (ruby exception raised)"
   | EVar name ->
-    if str_len name > 0 && str_eq (char_at name 0) "$" then
+    if str_eq name "block_given?" then (let (has, _, _, _) = blk in VBool has)
+    else if str_len name > 0 && str_eq (char_at name 0) "$" then
       (let k = substring name 1 (str_len name) in if map_has globals k then map_get globals k else VNil)
     else
     let (meths, sup, ocls, ivars) = world in
@@ -1742,7 +1752,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
     let newblk = (true, bp, bb, env) in
-    if map_has meths name then call_method env world newblk name args
+    // proc { } / lambda { } capture the block as a first-class VProc.
+    if str_eq name "proc" || str_eq name "lambda" then
+      (let id = map_len proc_store in
+       let _ = map_set proc_store (str_of_int id) (true, bp, bb, env) in VProc id)
+    else if map_has meths name then call_method env world newblk name args
     // implicit self: a bare `each { }` inside a method is `self.each { }`.
     else if map_has env "self" then
       (match map_get env "self" with
@@ -1772,6 +1786,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let args = eval_args env world blk arges in
     let newblk = (true, bp, bb, env) in
     (match recv with
+     | VClass c ->
+       // Proc.new { } captures the block; other Class.new { } ignore it.
+       if str_eq c "Proc" && str_eq name "new" then
+         (let id = map_len proc_store in let _ = map_set proc_store (str_of_int id) newblk in VProc id)
+       else if str_eq name "new" then new_obj world c args
+       else if has_meth world c name then invoke world newblk recv c name args
+       else prim_method recv name args
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
        let cls = map_get ocls (str_of_int id) in
@@ -2185,6 +2206,13 @@ and invoke_val = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str
     then flow_value (run_block world noblk blk args)
     else if str_eq s "&blk" && str_eq name "class" then VClass "Proc"
     else prim_method recv name args
+  | VProc pid ->
+    // call/./[]/yield run the stored block; class reports Proc.
+    if str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===" then
+      flow_value (run_block world noblk (map_get proc_store (str_of_int pid)) args)
+    else if str_eq name "class" then VClass "Proc"
+    else if str_eq name "arity" then VInt 0
+    else prim_method recv name args
   | _ -> prim_method recv name args
 
 // does `recv` respond to `name`? (used by respond_to?)
@@ -2333,7 +2361,7 @@ and class_name = fn (recv: Val) ->
   | VBool b -> if b then "TrueClass" else "FalseClass"
   | VNil -> "NilClass" | VArr _ -> "Array" | VHsh _ -> "Hash" | VSym _ -> "Symbol"
   | VRange _ -> "Range" | VClass _ -> "Class" | VObj _ -> "Object"
-  | VExc (c, _) -> c | VMain -> "Object"
+  | VExc (c, _) -> c | VProc _ -> "Proc" | VMain -> "Object"
 
 and range_to_a = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (VInt i, range_to_a (i + 1) last)
@@ -2566,6 +2594,13 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
          map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ m else m)
        // `undef name` removes the method from this class.
        | SUndef names -> undef_all meths cls names
+       // `define_method(:name) { body }` registers the block as a method.
+       | SExpr (ECallB (fname, fargs, bp, bb)) ->
+         if str_eq fname "define_method" then
+           (match fargs with
+            | Cons (ESym nm, _) -> map_set meths (cls ++ "#" ++ nm) (Meth (bp, Nil, bb))
+            | _ -> ())
+         else ()
        | _ -> ()) in
     register_class world cls rest
 
