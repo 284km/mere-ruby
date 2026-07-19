@@ -949,24 +949,45 @@ and eapp = fn (xs: Expr list) -> fn (ys: Expr list) ->
   match xs with Nil -> ys | Cons (h, t) -> Cons (h, eapp t ys)
 
 // bare lambda params: `-> x, y { ... }` (up to the block opener).
-and lambda_bare_params = fn toks -> fn (acc: str list) ->
+and psplat_any = fn (ps: str list) ->
+  match ps with
+  | Nil -> false
+  | Cons (p, r) -> (str_len p > 0 && str_eq (char_at p 0) "*") || psplat_any r
+
+// the defaults for plain (non-keyword) names; kw defaults are keyed "k:".
+and plain_defaults = fn (ds: (str * Expr) list) ->
+  match ds with
+  | Nil -> Nil
+  | Cons ((n, d), r) ->
+    if str_len n > 0 && str_eq (char_at n (str_len n - 1)) ":" then plain_defaults r
+    else Cons ((n, d), plain_defaults r)
+
+and lambda_bare_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
-  | Cons (TId n, r) -> lambda_bare_after n r acc
+  | Cons (TId n, r) ->
+    // `-> a=default { ... }` — an optional bare parameter.
+    (match r with
+     | Cons (TP eq, r2) ->
+       if str_eq eq "=" then
+         let (d, r3) = parse_bin r2 5 in
+         lambda_bare_after n r3 acc (Cons ((n, d), ds))
+       else lambda_bare_after n r acc ds
+     | _ -> lambda_bare_after n r acc ds)
   // `-> *args, **kwargs { ... }` — splat / kw-splat / block-pass params.
   | Cons (TP st, r) ->
     if str_eq st "*" || str_eq st "**" || str_eq st "&" then
       (match r with
-       | Cons (TId n, r2) -> lambda_bare_after (st ++ n) r2 acc
-       | _ -> lambda_bare_after st r acc)
-    else (rev_app acc Nil, toks)
-  | _ -> (rev_app acc Nil, toks)
+       | Cons (TId n, r2) -> lambda_bare_after (st ++ n) r2 acc ds
+       | _ -> lambda_bare_after st r acc ds)
+    else (rev_app acc Nil, rev_app ds Nil, toks)
+  | _ -> (rev_app acc Nil, rev_app ds Nil, toks)
 
-and lambda_bare_after = fn (n: str) -> fn r -> fn (acc: str list) ->
+and lambda_bare_after = fn (n: str) -> fn r -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match r with
   | Cons (TP c, r2) ->
-    if str_eq c "," then lambda_bare_params r2 (Cons (n, acc))
-    else (rev_app (Cons (n, acc)) Nil, r)
-  | _ -> (rev_app (Cons (n, acc)) Nil, r)
+    if str_eq c "," then lambda_bare_params r2 (Cons (n, acc)) ds
+    else (rev_app (Cons (n, acc)) Nil, rev_app ds Nil, r)
+  | _ -> (rev_app (Cons (n, acc)) Nil, rev_app ds Nil, r)
 
 // the inside of ( ... ): an and/or expression, optionally with a trailing
 // statement modifier — `(i += 1 until i > 9)` is a while-statement value.
@@ -1249,8 +1270,10 @@ and starts_sp_bracket = fn toks ->
 and starts_bare_arg = fn toks ->
   match toks with
   | Cons (TId w, _) ->
-    // value keywords are arguments (`x.go false`); structural ones are not.
-    if str_eq w "true" || str_eq w "false" || str_eq w "nil" || str_eq w "self" then true
+    // value keywords are arguments (`x.go false`); a def is an expression
+    // (`ruby2_keywords def m...`); structural keywords are not arguments.
+    if str_eq w "true" || str_eq w "false" || str_eq w "nil" || str_eq w "self" ||
+       str_eq w "def" then true
     else if is_keyword w || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
        str_eq w "in" || str_eq w "for" then false
     else true
@@ -1343,6 +1366,9 @@ and parse_block_params_d = fn toks ->
 
 and parse_pipe_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
+  // `|one; bl|` — names after a semicolon (lexed as TNL) are block-locals:
+  // encoded with a ; prefix, they always bind nil.
+  | Cons (TNL, r) -> parse_block_locals r acc ds
   | Cons (TP bar, r) ->
     if str_eq bar "|" then (rev_app acc Nil, rev_app ds Nil, r)
     else if str_eq bar "*" then
@@ -1398,12 +1424,25 @@ and pipe_group = fn toks -> fn (acc: str) ->
   | Cons (TId n, r) -> pipe_group r (acc ++ n)
   | _ -> fail "mere-ruby: bad block params"
 
+and parse_block_locals = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
+  match toks with
+  | Cons (TId n, r) ->
+    (match r with
+     | Cons (TP c, r2) ->
+       if str_eq c "," then parse_block_locals r2 (Cons (";" ++ n, acc)) ds
+       else if str_eq c "|" then (rev_app (Cons (";" ++ n, acc)) Nil, rev_app ds Nil, r2)
+       else fail "mere-ruby: bad block-local list"
+     | _ -> fail "mere-ruby: bad block-local list")
+  | _ -> fail "mere-ruby: bad block-local list"
+
 and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
   | Cons (TP p, r) ->
     if str_eq p "," then parse_pipe_params r (Cons (name, acc)) ds
     else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, rev_app ds Nil, r)
     else fail "mere-ruby: expected , or | in block params"
+  // `|one; bl|` — the ; (lexed as a newline) starts the block-local names.
+  | Cons (TNL, r) -> parse_block_locals r (Cons (name, acc)) ds
   | _ -> fail "mere-ruby: unterminated block params"
 
 and parse_primary = fn toks ->
@@ -1579,18 +1618,25 @@ and parse_primary = fn toks ->
       (ERange (EInt (0 - 4611686018427387903), hi, str_eq p "..."), r2)
     else if str_eq p "->" then
       // -> (params) { body } / -> x { body } / -> { body } lambda literal.
-      let (params, r1) =
+      let (params, lds, r1) =
         (match r with
          | Cons (TP lp, r2) ->
-           if str_eq lp "(" then let (ps, ds, r3) = parse_params r2 Nil Nil in (ps, r3)
-           else if str_eq lp "*" || str_eq lp "**" || str_eq lp "&" then lambda_bare_params r Nil
-           else (Nil, r)
+           if str_eq lp "(" then let (ps, ds, r3) = parse_params r2 Nil Nil in (ps, ds, r3)
+           else if str_eq lp "*" || str_eq lp "**" || str_eq lp "&" then lambda_bare_params r Nil Nil
+           else (Nil, Nil, r)
          | Cons (TId n, r2) ->
-           if str_eq n "do" then (Nil, r) else lambda_bare_params r Nil
-         | _ -> (Nil, r)) in
+           if str_eq n "do" then ((Nil : str list), (Nil : (str * Expr) list), r)
+           else lambda_bare_params r Nil Nil
+         | _ -> (Nil, Nil, r)) in
       let (bp, bb, r4) = parse_block r1 in
       let allp = list_append_str params bp in
-      (ELambda (allp, bb), r4)
+      // optional params (defaults) relax the strict lambda arity check via
+      // a hidden anonymous splat; kw defaults keep their own binding.
+      let pds = plain_defaults lds in
+      let allp2 = (match pds with
+                   | Nil -> allp
+                   | _ -> if psplat_any allp then allp else list_append_str allp (Cons ("*", Nil))) in
+      (ELambda (allp2, defaults_prologue pds bb), r4)
     else fail ("mere-ruby: unexpected token: " ++ p)
   | _ -> fail "mere-ruby: unexpected end of input"
 
@@ -1714,6 +1760,19 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
        if str_eq colon ":" then (ESym name, r0)
        else hash_key_expr toks
      | _ -> hash_key_expr toks) in
+  // `{a:}` / `{a:, b:}` — an omitted value reads the same-named variable.
+  let omitted =
+    (match k with
+     | ESym _ ->
+       (match r2 with
+        | Cons (TP nx, _) -> str_eq nx "}" || str_eq nx ","
+        | _ -> false)
+     | _ -> false) in
+  if omitted then
+    (match k with
+     | ESym nm -> hash_items_sep r2 (Cons (EVar nm, Cons (k, acc)))
+     | _ -> fail "mere-ruby: bad hash key")
+  else
   let (v, r3a) = parse_expr r2 in
   let r3 = skip_nls r3a in
   match r3 with
@@ -4096,7 +4155,10 @@ and bind_block_seq = fn cenv -> fn (params: str list) -> fn (argvals: Val list) 
      | Cons (a, rest) -> let _ = bind_one_bparam cenv p a in bind_block_seq cenv ps rest)
 
 and bind_one_bparam = fn cenv -> fn (p: str) -> fn (v: Val) ->
-  if str_len p > 0 && str_eq (char_at p 0) "(" then
+  // a ;block-local always starts nil (it never takes an argument).
+  if str_len p > 0 && str_eq (char_at p 0) ";" then
+    let _ = map_set cenv (substring p 1 (str_len p)) VNil in ()
+  else if str_len p > 0 && str_eq (char_at p 0) "(" then
     bind_destructure cenv (substring p 1 (str_len p - 1)) v
   else let _ = map_set cenv p v in ()
 
