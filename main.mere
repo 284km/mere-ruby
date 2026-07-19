@@ -2847,32 +2847,39 @@ and bind_seq = fn frame -> fn (params: str list) -> fn (args: Val list) ->
      | Nil -> let _ = map_set frame p VNil in bind_seq frame ps Nil
      | Cons (a, r) -> let _ = map_set frame p a in bind_seq frame ps r)
 
-// register a class body: instance methods and attr_* accessors.
+// register a class body: declarations register, everything else EXECUTES
+// (a Ruby class body is code). Returns the escaping Flow (break/raise in
+// the body propagates out) or FNext when the walk completes.
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
-  register_class_v world cls body "public"
+  let cenv = map_new () in
+  let _ = map_set cenv "self" (VClass cls) in
+  register_class_v world cls body "public" cenv
 
 // walk the class body tracking the current visibility mode (a bare
 // `private` marks every subsequent def private until `public`).
-and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (vis: str) ->
+and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (vis: str) -> fn cenv ->
   let (meths, sup, ocls, ivars) = world in
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), cenv) in
   match body with
-  | Nil -> ()
+  | Nil -> FNext VNil
   | Cons (s, rest) ->
     let vis2 = (match s with SVis (m, Nil) -> m | _ -> vis) in
-    let _ =
+    let f =
       (match s with
        // named form: mark (or unmark) those methods directly.
        | SVis (m, names) ->
-         (match names with
-          | Nil -> ()
-          | _ -> mark_vis meths cls names (str_eq m "private"))
+         let _ = (match names with
+                  | Nil -> ()
+                  | _ -> mark_vis meths cls names (str_eq m "private")) in
+         FNext VNil
        | SDef (mname, params, defs, mbody) ->
          // a receiver-qualified name (def C.m -> "C#m") registers as-is;
          // a plain name registers under the enclosing class.
          let key = if str_contains mname "#" then mname else cls ++ "#" ++ mname in
          let _ = map_set meths key (Meth (params, defs, mbody)) in
-         if str_eq vis2 "private" then map_set privates key VNil else ()
-       | SAttr (mode, syms) -> add_attrs world cls mode syms
+         let _ = if str_eq vis2 "private" then map_set privates key VNil else () in
+         FNext VNil
+       | SAttr (mode, syms) -> let _ = add_attrs world cls mode syms in FNext VNil
        // a nested class / module registers under its qualified name so that
        // `Outer::Inner` resolves (and reports its full name).
        | SClass (cname, csuper, cbody) ->
@@ -2883,30 +2890,36 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        // both by qualified name (`Klass::CONST`) and bare name (lexical use).
        | SAssign (aname, e) ->
          if is_upper_first aname then
-           let frame = map_new () in
-           let noblk = (false, (Nil : str list), (Nil : Stmt list), frame) in
-           let v = eval_e frame world noblk e in
+           let v = eval_e cenv world noblk e in
            let _ = map_set consts aname v in
-           map_set consts (cls ++ "::" ++ aname) v
-         else ()
+           let _ = map_set consts (cls ++ "::" ++ aname) v in
+           FNext VNil
+         else exec_stmt cenv world noblk s   // a local in the class body
        // `alias new old` inside the class copies the method entry.
        | SAlias (n1, n2) ->
-         if map_has meths (cls ++ "#" ++ n2) then map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2))
-         else ()
+         let _ = if map_has meths (cls ++ "#" ++ n2) then map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2))
+                 else () in
+         FNext VNil
        // `include M` records the module for method lookup fallback.
        | SInclude m ->
-         map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ m else m)
+         let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ m else m) in
+         FNext VNil
        // `undef name` removes the method from this class.
-       | SUndef names -> undef_all meths cls names
-       // `define_method(:name) { body }` registers the block as a method.
+       | SUndef names -> let _ = undef_all meths cls names in FNext VNil
+       // `define_method(:name) { body }` registers the block as a method;
+       // any other expression statement executes.
        | SExpr (ECallB (fname, fargs, bp, bb)) ->
          if str_eq fname "define_method" then
-           (match fargs with
-            | Cons (ESym nm, _) -> map_set meths (cls ++ "#" ++ nm) (Meth (bp, Nil, bb))
-            | _ -> ())
-         else ()
-       | _ -> ()) in
-    register_class_v world cls rest vis2
+           let _ = (match fargs with
+                    | Cons (ESym nm, _) -> map_set meths (cls ++ "#" ++ nm) (Meth (bp, Nil, bb))
+                    | _ -> ()) in
+           FNext VNil
+         else exec_stmt cenv world noblk s
+       // everything else is plain code — a class body executes.
+       | _ -> exec_stmt cenv world noblk s) in
+    (match f with
+     | FNext _ -> register_class_v world cls rest vis2 cenv
+     | esc -> esc)
 
 // bind each plain-local target to nil unless already bound ("*name" strips
 // the splat prefix; @ivars, $globals and constants are skipped).
@@ -3018,7 +3031,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = if str_eq super "" then () else map_set sup name super in
     // record the class itself as a defined constant (const_defined? etc.).
     let _ = if map_has consts name then () else map_set consts name (VClass name) in
-    let _ = register_class world name body in FNext VNil
+    // a break/raise escaping the class body propagates (a body is code).
+    (match register_class world name body with
+     | FNext _ -> FNext VNil
+     | esc -> esc)
   | SAttr (_, _) -> FNext VNil
   | SAlias (n1, n2) ->
     let (meths, sup, ocls, ivars) = world in
