@@ -67,6 +67,15 @@ class PositiveMatcher
     end
     nil
   end
+  def =~(pattern)
+    if @actual =~ pattern
+      $mspec_pass += 1
+    else
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected #{@actual.inspect} to match"
+    end
+    nil
+  end
 end
 
 class NegativeMatcher

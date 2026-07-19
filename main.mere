@@ -305,6 +305,7 @@ let is_punct2 = fn (p: str) ->
   str_eq p "**" || str_eq p "==" || str_eq p "!=" || str_eq p "<=" ||
   str_eq p ">=" || str_eq p "&&" || str_eq p "||" || str_eq p "=>" ||
   str_eq p ".." || str_eq p "<<" || str_eq p "::" || str_eq p "->" ||
+  str_eq p "=~" || str_eq p "!~" ||
   str_eq p "+=" || str_eq p "-=" || str_eq p "*=" || str_eq p "/=" || str_eq p "%=";
 
 let is_punct1 = fn (c: str) ->
@@ -416,6 +417,9 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let (body, after) = heredoc_body s (nl + 1) hid squiggly in
       let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
       Cons (TStrL body, tapp linetoks (Cons (TNL, lex_go s after)))
+    else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
+      // a backslash at end of line continues the logical line.
+      lex_go s (i + 2)
     else if str_eq c "/" && regex_position s i then
       // a minimal regex literal: lexed as a plain string token (patterns
       // are parsed but matchers may ignore them). Heuristic: a / directly
@@ -655,6 +659,7 @@ let prec_of = fn (op: str) ->
   if str_eq op "||" then 1
   else if str_eq op "&&" then 2
   else if str_eq op "==" || str_eq op "!=" || str_eq op "<=>" || str_eq op "===" then 3
+  else if str_eq op "=~" || str_eq op "!~" then 3
   else if str_eq op "|" || str_eq op "&" || str_eq op "^" then 4
   else if str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=" then 4
   else if str_eq op "<<" then 4
@@ -982,8 +987,19 @@ and parse_block = fn toks ->
   | Cons (TId d, r) ->
     if str_eq d "do" then
       let (bp, r2) = parse_block_params r in
-      let (body, r3) = parse_stmts r2 Nil in
-      (bp, body, expect_kw r3 "end")
+      let (body0, r3) = parse_stmts r2 Nil in
+      // do-blocks accept trailing rescue/ensure (an implicit begin).
+      let (body, r5) =
+        (match r3 with
+         | Cons (TId k, _) ->
+           if str_eq k "rescue" || str_eq k "ensure" then
+             let (rescues, ra) = parse_rescues r3 Nil in
+             let (els, rb) = parse_opt_kw_block ra "else" in
+             let (ens, rc) = parse_opt_kw_block rb "ensure" in
+             (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
+           else (body0, r3)
+         | _ -> (body0, r3)) in
+      (bp, body, expect_kw r5 "end")
     else fail "mere-ruby: expected block"
   | _ -> fail "mere-ruby: expected block"
 
@@ -1821,7 +1837,8 @@ and is_op_method_name = fn (op: str) ->
   str_eq op "==" || str_eq op "!=" || str_eq op "<=>" || str_eq op "===" ||
   str_eq op "<" || str_eq op ">" || str_eq op "<=" || str_eq op ">=" ||
   str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/" ||
-  str_eq op "%" || str_eq op "**" || str_eq op "<<" || str_eq op "!"
+  str_eq op "%" || str_eq op "**" || str_eq op "<<" || str_eq op "!" ||
+  str_eq op "=~" || str_eq op "!~" || str_eq op "|" || str_eq op "&" || str_eq op "^"
 
 and parse_def_body = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
     let (body0, r4) = parse_stmts r2 Nil in
@@ -2515,6 +2532,18 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "!=" then
       (if rb_eq va0 (eval_e env world blk b) then VBool false else VBool true)
     else if str_eq op "===" then VBool (case_eqq world va0 (eval_e env world blk b))
+    else if str_eq op "=~" then
+      (let vb = eval_e env world blk b in
+       match va0 with
+       | VStr sv -> (match vb with VRegex p -> rx_index p sv | _ -> VNil)
+       | VRegex p -> (match vb with VStr sv -> rx_index p sv | _ -> VNil)
+       | _ -> VNil)
+    else if str_eq op "!~" then
+      (let vb = eval_e env world blk b in
+       match va0 with
+       | VStr sv -> (match vb with VRegex p -> VBool (if rx_match p sv then false else true) | _ -> VBool true)
+       | VRegex p -> (match vb with VStr sv -> VBool (if rx_match p sv then false else true) | _ -> VBool true)
+       | _ -> VBool true)
     else if str_eq op "<=>" then
       (let vb = eval_e env world blk b in
        let c = cmp_vals va0 vb in
@@ -3996,6 +4025,17 @@ and when_any_eq = fn (v: Val) -> fn (xs: Val list) ->
 and rx_match = fn (pat: str) -> fn (s: str) ->
   if str_len pat > 0 && str_eq (char_at pat 0) "^" then rx_here pat 1 s 0
   else rx_scan pat s 0
+
+// =~ returns the match POSITION or nil.
+and rx_index = fn (pat: str) -> fn (s: str) ->
+  if str_len pat > 0 && str_eq (char_at pat 0) "^" then
+    (if rx_here pat 1 s 0 then VInt 0 else VNil)
+  else rx_index_scan pat s 0
+
+and rx_index_scan = fn (pat: str) -> fn (s: str) -> fn (i: int) ->
+  if rx_here pat 0 s i then VInt i
+  else if i >= str_len s then VNil
+  else rx_index_scan pat s (i + 1)
 
 and rx_scan = fn (pat: str) -> fn (s: str) -> fn (i: int) ->
   if rx_here pat 0 s i then true
