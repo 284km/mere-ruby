@@ -34,6 +34,8 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ESelf                // self
           | EConst of str        // a capitalized name (a class reference)
           | EConstOrNil of str   // a const read that yields nil when undefined
+          | EScopedAssign of Expr * str * Expr  // recv::Const = value (runtime recv)
+          | EScopedRead of Expr * str  // recv::Const read (runtime recv)
           | EIVar of str         // @name
           | EMethod of Expr * str * Expr list  // recv.name(args)
           // M4 blocks / iterators:
@@ -1290,14 +1292,16 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
        | Cons (TId name, r2) ->
          // A::B is the constant B qualified by A; keep the full name so a
          // namespaced class resolves and reports consistently.
-         let qual = (match recv with EConst rc -> rc ++ "::" ++ name | _ -> name) in
+         let mkread = (match recv with
+                       | EConst rc -> EConst (rc ++ "::" ++ name)
+                       | _ -> EScopedRead (recv, name)) in
          (match r2 with
           | Cons (TP p, r3) ->
             if str_eq p "(" then let (argv, r4) = parse_call_args r3 in attach_block_method recv name argv r4
-            else if is_cap name then parse_postfix_more (EConst qual) r2
+            else if is_cap name then parse_postfix_more mkread r2
             else attach_block_method recv name Nil r2
           | _ ->
-            if is_cap name then parse_postfix_more (EConst qual) r2
+            if is_cap name then parse_postfix_more mkread r2
             else attach_block_method recv name Nil r2)
        | _ -> fail "mere-ruby: expected name after ::")
     else (recv, toks)
@@ -1940,7 +1944,12 @@ and parse_call_pos_arg = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
 and parse_call_sep = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
   match skip_nls toks with
   | Cons (TP p, r) ->
-    if str_eq p "," then parse_call_go (skip_nls r) pos hp
+    if str_eq p "," then
+      // `f(1,)` — a vestigial trailing comma before the close paren.
+      (match skip_nls r with
+       | Cons (TP rp, r2) ->
+         if str_eq rp ")" then (finish_call_args pos hp, r2) else parse_call_go (skip_nls r) pos hp
+       | _ -> parse_call_go (skip_nls r) pos hp)
     else if str_eq p ")" then (finish_call_args pos hp, r)
     else fail ("mere-ruby: expected , or ) in argument list, got " ++ p)
   | _ -> fail "mere-ruby: unterminated argument list"
@@ -2381,7 +2390,10 @@ and parse_stmt = fn toks ->
   match toks with
   // scoped constant assignment: `A::C = e` / `A::B::C = e` / `::C = e`.
   | Cons (TId a, Cons (TP sc, Cons (TId cn, Cons (TP eq, r)))) ->
-    if str_eq sc "::" && is_cap a && is_cap cn then
+    if str_eq sc "::" && (if is_cap a then false else true) && is_cap cn && str_eq eq "=" then
+      // `recv::Const = value` with a lowercase (runtime) receiver.
+      let (e, r2) = parse_expr r in (SExpr (EScopedAssign (EVar a, cn, e)), r2)
+    else if str_eq sc "::" && is_cap a && is_cap cn then
       (if str_eq eq "=" then
          let (e, r2) = parse_expr r in (SAssign (a ++ "::" ++ cn, e), r2)
        else if not (str_eq (opassign_base eq) "") then
@@ -2534,6 +2546,10 @@ and parse_stmt_id = fn toks ->
            // `var += expr` -> `var = var <op> expr`
            let (e, r3) = parse_expr r2 in
            (SAssign (id, EBin (opassign_base p, EVar id, e)), r3)
+         else if not (str_eq (opassign_base p) "") && is_cap id then
+           // `Const op= expr` — a bare constant op-assign (nil read when undefined).
+           let (e, r3) = parse_expr r2 in
+           (SAssign (id, EBin (opassign_base p, EConstOrNil id, e)), r3)
          else
            let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
@@ -3494,6 +3510,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ESelf -> if map_has env "self" then map_get env "self" else VNil
   | EConst name -> if map_has consts name then map_get consts name else VClass name
   | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
+  | EScopedRead (recv_e, cn) ->
+    (match eval_e env world blk recv_e with
+     | VClass c ->
+       let key = c ++ "::" ++ cn in
+       if map_has consts key then map_get consts key
+       else if map_has consts cn then map_get consts cn
+       else raise_exc world "NameError" ("uninitialized constant " ++ cn)
+     | _ -> if map_has consts cn then map_get consts cn else VClass cn)
+  | EScopedAssign (recv_e, cn, val_e) ->
+    let v = eval_e env world blk val_e in
+    let _ = (match eval_e env world blk recv_e with
+             | VClass c -> map_set consts (c ++ "::" ++ cn) v
+             | _ -> ()) in
+    v
   | EIVar name ->
     let (meths, sup, ocls, ivars) = world in
     // a name still starting with @ is a class variable (@@x).
