@@ -234,6 +234,7 @@ let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
 // dispatch (implicit-self calls and send bypass, as in Ruby).
 let privates = map_new ();
+let protecteds = map_new ();  // protected methods (callable only same-class)
 let is_upper_first = fn (id: str) ->
   str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
 // iteration budget: a top-level counter ticked once per loop iteration so
@@ -2568,7 +2569,7 @@ and parse_stmt_id = fn toks ->
             str_eq id "private_class_method" then
       // visibility: bare form switches the mode for subsequent defs; the
       // named form (`private :m, :n`) marks those methods.
-      let mode = if str_eq id "public" then "public" else "private" in
+      let mode = if str_eq id "public" then "public" else if str_eq id "protected" then "protected" else "private" in
       (match r with
        | Cons (TNL, _) -> ((if str_eq id "private_class_method" then SExpr ENil else SVis (mode, Nil)), r)
        | Cons (TEOF, _) -> ((if str_eq id "private_class_method" then SExpr ENil else SVis (mode, Nil)), r)
@@ -3779,7 +3780,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (match eval_e env world blk recv with
         | VObj id ->
           let cls = map_get ocls (str_of_int id) in
-          if has_meth world cls name && (if meth_private world cls name then false else true)
+          if has_meth world cls name &&
+             (if meth_private world cls name then false
+              else if meth_protected world cls name then protected_ok env world cls
+              else true)
           then VStr "method" else VNil
         | VClass c -> if str_eq name "new" || has_meth world c name then VStr "method" else VNil
         | _ -> VStr "method")
@@ -4853,6 +4857,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     if has_meth world cls name then
       (if vischeck && meth_private world cls name
        then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
+       else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true)
+       then raise_exc world "NoMethodError" ("protected method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
        else invoke world noblk recv cls name args)
     else if str_eq name "class" then VClass (display_cls world cls)
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
@@ -5727,7 +5733,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        | SVis (m, names) ->
          let _ = (match names with
                   | Nil -> ()
-                  | _ -> mark_vis meths cls names (str_eq m "private")) in
+                  | _ -> mark_vis_mode meths cls names m) in
          FNext VNil
        | SDef (mname0, params, defs, mbody) ->
          // `def self.m` (marked "self.m") is a class method: register under
@@ -5739,9 +5745,11 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let key = if str_contains mname "#" then mname else cls ++ "#" ++ mname in
          let _ = map_set meths key (Meth (params, defs, mbody)) in
          // receiver-qualified / singleton defs are always public.
-         let _ = if str_eq vis2 "private" && (if is_selfdef then false else true) &&
-                    (if str_contains mname "#" then false else true)
-                 then map_set privates key VNil else () in
+         let _ = if (if is_selfdef then false else true) && (if str_contains mname "#" then false else true) then
+                   (if str_eq vis2 "private" then map_set privates key VNil
+                    else if str_eq vis2 "protected" then map_set protecteds key VNil
+                    else ())
+                 else () in
          FNext (VSym (meth_base mname))
        | SAttr (mode, syms) -> let _ = add_attrs world cls mode syms in FNext VNil
        // a nested class / module registers under its qualified name so that
@@ -5831,6 +5839,17 @@ and declare_nils = fn env -> fn (names: str list) ->
     declare_nils env rest
 
 // mark (private=true) or unmark each `cls#name` in the privates table.
+and mark_vis_mode = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (mode: str) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let key = cls ++ "#" ++ n in
+    let _ = (if str_eq mode "private" then let _ = map_set privates key VNil in ()
+             else if str_eq mode "protected" then let _ = map_set protecteds key VNil in ()
+             else (let _ = if map_has privates key then map_delete privates key else () in
+                   if map_has protecteds key then map_delete protecteds key else ())) in
+    mark_vis_mode meths cls rest mode
+
 and mark_vis = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (priv: bool) ->
   match names with
   | Nil -> ()
@@ -5842,6 +5861,26 @@ and mark_vis = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (priv: bo
 
 // is the method (as found from `cls`) private? Resolves the defining class
 // so a private method inherited by a subclass stays private.
+// is `name` a protected method somewhere in cls's ancestry?
+and meth_protected = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if str_eq cls "" then false
+  else if map_has protecteds (cls ++ "#" ++ name) then true
+  else if map_has meths (cls ++ "#" ++ name) then false
+  else if map_has sup cls then meth_protected world (map_get sup cls) name
+  else if str_eq cls "Object" then false
+  else meth_protected world "Object" name
+
+// a protected call is allowed when the caller's self is a kind of the
+// method's class.
+and protected_ok = fn env -> fn world -> fn (cls: str) ->
+  if map_has env "self" then
+    (let (meths, sup, ocls, ivars) = world in
+     match map_get env "self" with
+     | VObj id -> obj_is_a world (map_get ocls (str_of_int id)) cls
+     | _ -> false)
+  else false
+
 and meth_private = fn world -> fn (cls: str) -> fn (name: str) ->
   // walk from the object's class up: the first ancestor that either marks
   // the method private (`private :foo` override) or defines it decides.
