@@ -175,6 +175,8 @@ let arr_set = fn (id: int) -> fn (xs: Val list) ->
 let proc_store = map_new ();
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// class variables (@@x): "Cls@x" -> value, resolved up the superclass chain.
+let cvars = map_new ();
 // expression-position flow (break/next/redo/return inside an expression)
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
@@ -340,9 +342,14 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
         let j = scan_base s i 10 in
         if j + 1 < str_len s && str_eq (char_at s j) "."
            && is_digit (char_at s (j + 1)) then
-          let k = scan_base s (j + 1) 10 in
+          let k0 = scan_base s (j + 1) 10 in
+          // exponent: 1.2e-3 / 4.5E+2 / 6.7e8
+          let k = scan_exponent s k0 in
           Cons (TFlt (float_of_str (strip_us (substring s i k) 0 "")), lex_go s k)
-        else Cons (TInt (parse_base s i j 10 0), lex_go s j)
+        else
+          let je = scan_exponent s j in
+          if je > j then Cons (TFlt (float_of_str (strip_us (substring s i je) 0 "")), lex_go s je)
+          else Cons (TInt (parse_base s i j 10 0), lex_go s j)
     else if str_eq c "?" && i + 1 < str_len s &&
             (is_alnum (char_at s (i + 1)) || str_eq (char_at s (i + 1)) "\\") then
       // character literal ?a (or ?\n / ?\t).
@@ -372,6 +379,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
           else j
         else j in
       Cons (TId (substring s i j2), lex_go s j2)
+    else if str_eq c "@" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "@" then
+      // @@classvar: both @ kept in the identifier text
+      let j = scan_ident s (i + 2) in
+      Cons (TId (substring s i j), lex_go s j)
     else if str_eq c "@" then
       // @ivar: keep the leading @ in the identifier text
       let j = scan_ident s (i + 1) in
@@ -510,6 +521,13 @@ and pw_end = fn (t: str) -> fn (i: int) ->
 
 and pw_skip = fn (t: str) -> fn (j: int) ->
   if j < str_len t && (str_eq (char_at t j) " " || str_eq (char_at t j) "\n") then pw_skip t (j + 1) else j
+
+// index after an e/E exponent suffix at i, or i when there is none.
+and scan_exponent = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && (str_eq (char_at s i) "e" || str_eq (char_at s i) "E") then
+    let j = (if i + 1 < str_len s && (str_eq (char_at s (i + 1)) "-" || str_eq (char_at s (i + 1)) "+") then i + 2 else i + 1) in
+    (if j < str_len s && is_digit (char_at s j) then scan_base s j 10 else i)
+  else i
 
 and find_nl = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i
@@ -1052,9 +1070,27 @@ and parse_pipe_params = fn toks -> fn (acc: str list) ->
       (match r with Cons (TId n, r2) -> pipe_after ("*" ++ n) r2 acc | _ -> pipe_after "*" r acc)
     else if str_eq bar "&" then
       (match r with Cons (TId n, r2) -> pipe_after ("&" ++ n) r2 acc | _ -> pipe_after "&" r acc)
+    else if str_eq bar "(" then
+      // nested destructuring |(a, (b, c))| — encoded as a spec string.
+      let (spec, r2) = pipe_group r "" in
+      pipe_after ("(" ++ spec ++ ")") r2 acc
     else fail "mere-ruby: bad block params"
   | Cons (TId name, r) -> pipe_after name r acc
   | _ -> fail "mere-ruby: expected block parameter"
+
+// tokens of a nested destructure group (after the opening paren) encoded
+// back into a compact string: names, commas, splats, nested groups.
+and pipe_group = fn toks -> fn (acc: str) ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p ")" then (acc, r)
+    else if str_eq p "(" || str_eq p " [" then
+      let (inner, r2) = pipe_group r "" in pipe_group r2 (acc ++ "(" ++ inner ++ ")")
+    else if str_eq p "," then pipe_group r (acc ++ ",")
+    else if str_eq p "*" then pipe_group r (acc ++ "*")
+    else fail "mere-ruby: bad block params"
+  | Cons (TId n, r) -> pipe_group r (acc ++ n)
+  | _ -> fail "mere-ruby: bad block params"
 
 and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) ->
   match toks with
@@ -1083,7 +1119,7 @@ and parse_primary = fn toks ->
        | Cons (TP p, r2) ->
          if str_eq p "(" then let (argv, r3) = parse_call_args r2 in (EYield argv, r3)
          // `yield [0]` passes an array literal (not an index on the result).
-         else if str_eq p "[" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
+         else if str_eq p "[" || str_eq p " [" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
          else (EYield Nil, r)
        | Cons (TNL, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
@@ -2371,6 +2407,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EConst name -> if map_has consts name then map_get consts name else VClass name
   | EIVar name ->
     let (meths, sup, ocls, ivars) = world in
+    // a name still starting with @ is a class variable (@@x).
+    if str_len name > 0 && str_eq (char_at name 0) "@" then
+      cvar_get env world (substring name 1 (str_len name))
+    else
     if map_has env "self" then
       (match map_get env "self" with
        | VObj id ->
@@ -2913,8 +2953,52 @@ and bind_block_seq = fn cenv -> fn (params: str list) -> fn (argvals: Val list) 
   | Nil -> ()
   | Cons (p, ps) ->
     (match argvals with
-     | Nil -> let _ = map_set cenv p VNil in bind_block_seq cenv ps Nil
-     | Cons (a, rest) -> let _ = map_set cenv p a in bind_block_seq cenv ps rest)
+     | Nil -> let _ = bind_one_bparam cenv p VNil in bind_block_seq cenv ps Nil
+     | Cons (a, rest) -> let _ = bind_one_bparam cenv p a in bind_block_seq cenv ps rest)
+
+and bind_one_bparam = fn cenv -> fn (p: str) -> fn (v: Val) ->
+  if str_len p > 0 && str_eq (char_at p 0) "(" then
+    bind_destructure cenv (substring p 1 (str_len p - 1)) v
+  else let _ = map_set cenv p v in ()
+
+// bind a destructure spec ("a,(b,c),*r") against a value (arrays spread).
+and bind_destructure = fn cenv -> fn (spec: str) -> fn (v: Val) ->
+  let parts = spec_split spec 0 0 "" Nil in
+  let vals = (match v with VArr id -> deref id | other -> Cons (other, Nil)) in
+  bind_spec_parts cenv parts vals
+
+and bind_spec_parts = fn cenv -> fn (parts: str list) -> fn (vals: Val list) ->
+  match parts with
+  | Nil -> ()
+  | Cons (p, ps) ->
+    if str_len p > 0 && str_eq (char_at p 0) "*" then
+      // splat takes what the trailing fixed parts don't need.
+      let nafter = list_str_len ps in
+      let take = vlen vals - nafter in
+      let take = if take < 0 then 0 else take in
+      let nm = substring p 1 (str_len p) in
+      let _ = if str_eq nm "" then () else map_set cenv nm (arr_new (vtake vals take)) in
+      bind_spec_parts cenv ps (vdrop vals take)
+    else
+      (match vals with
+       | Nil -> let _ = bind_spec_one cenv p VNil in bind_spec_parts cenv ps Nil
+       | Cons (a, rest) -> let _ = bind_spec_one cenv p a in bind_spec_parts cenv ps rest)
+
+and bind_spec_one = fn cenv -> fn (p: str) -> fn (v: Val) ->
+  if str_len p > 0 && str_eq (char_at p 0) "(" then
+    bind_destructure cenv (substring p 1 (str_len p - 1)) v
+  else if str_eq p "" then ()
+  else let _ = map_set cenv p v in ()
+
+// split a spec on top-level commas ("a,(b,c),*r" -> [a; (b,c); *r]).
+and spec_split = fn (spec: str) -> fn (i: int) -> fn (depth: int) -> fn (cur: str) -> fn (acc: str list) ->
+  if i >= str_len spec then rev_app (Cons (cur, acc)) Nil
+  else
+    let c = char_at spec i in
+    if str_eq c "(" then spec_split spec (i + 1) (depth + 1) (cur ++ c) acc
+    else if str_eq c ")" then spec_split spec (i + 1) (depth - 1) (cur ++ c) acc
+    else if str_eq c "," && depth == 0 then spec_split spec (i + 1) depth "" (Cons (cur, acc))
+    else spec_split spec (i + 1) depth (cur ++ c) acc
 
 // block predicates on a list (run the block per element, short-circuiting).
 and arr_detect = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
@@ -3414,6 +3498,40 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let _ = bind_params frame world blk name params defaults args in
      (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
 
+// class-variable helpers: the owning class is self's class (or the class
+// itself in a class body); reads walk the superclass chain.
+and cvar_cls = fn env -> fn world ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has env "self" then
+    (match map_get env "self" with
+     | VObj id -> map_get ocls (str_of_int id)
+     | VClass c -> c
+     | _ -> "Object")
+  else "Object"
+
+and cvar_get = fn env -> fn world -> fn (name: str) ->
+  cvar_get_from world (cvar_cls env world) name
+
+and cvar_get_from = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has cvars (cls ++ "@" ++ name) then map_get cvars (cls ++ "@" ++ name)
+  else if map_has sup cls then cvar_get_from world (map_get sup cls) name
+  else VNil
+
+and cvar_set = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
+  let cls = cvar_cls env world in
+  let owner0 = cvar_owner world cls name in
+  let owner = if str_eq owner0 "" then cls else owner0 in
+  map_set cvars (owner ++ "@" ++ name) v
+
+and cvar_owner = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if map_has cvars (cls ++ "@" ++ name) then cls
+  else if map_has sup cls then
+    let up = cvar_owner world (map_get sup cls) name in
+    (if str_eq up "" then cls else up)
+  else ""
+
 // is `cls` the class `target` or a descendant of it? (plus universal roots)
 and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
   let (meths, sup, ocls, ivars) = world in
@@ -3891,6 +4009,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SIVarAssign (name, e) ->
     let (meths, sup, ocls, ivars) = world in
     let v = eval_e env world blk e in
+    if str_len name > 0 && str_eq (char_at name 0) "@" then
+      let _ = cvar_set env world (substring name 1 (str_len name)) v in FNext v
+    else
     (match map_get env "self" with
      | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ name) v in FNext v
      | VMain -> let _ = map_set ivars ("main@" ++ name) v in FNext v
