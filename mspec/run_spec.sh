@@ -15,6 +15,7 @@ cp "$spec" "$tmp/language/"
 # fixture files the spec may require_relative
 specdir="$(cd "$(dirname "$spec")" && pwd)"
 [ -d "$specdir/fixtures" ] && cp -R "$specdir/fixtures" "$tmp/language/fixtures"
+[ -d "$specdir/../fixtures" ] && cp -R "$specdir/../fixtures" "$tmp/fixtures"
 cp "$here/spec_helper.rb" "$tmp/spec_helper.rb"
 base="$(basename "$spec" .rb)"
 cat > "$tmp/driver.rb" <<EOF
