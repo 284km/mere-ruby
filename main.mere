@@ -1395,6 +1395,18 @@ and starts_block = fn toks ->
 // parse `{ |p,..| stmt }` (single statement) or `do |p,..| stmts end`.
 // a `|a=5|` default becomes a prologue statement: the bind sets missing
 // args to nil, so a nil param takes its default (explicit nil is rare).
+// recover the (name, default) pairs a block encodes as leading nil-check
+// prologue statements, so the argument fill can order optionals correctly.
+and block_defaults = fn (body: Stmt list) ->
+  match body with
+  | Cons (SIf (Cons ((cond, Cons (SAssign (n, d), Nil)), Nil), Nil), rest) ->
+    (match cond with
+     | EMethod (EVar cn, m, Nil) ->
+       if str_eq m "nil?" && str_eq cn n then Cons ((n, d), block_defaults rest)
+       else Nil
+     | _ -> Nil)
+  | _ -> Nil
+
 and defaults_prologue = fn (ds: (str * Expr) list) -> fn (body: Stmt list) ->
   match ds with
   | Nil -> body
@@ -4248,7 +4260,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // names first assigned INSIDE the block are also block-local: collect
   // the assignment targets not yet bound outside, delete them afterwards.
   let created = fresh_targets cenv (deep_targets body) in
-  let _ = bind_block_params cenv params argvals in
+  let _ = bind_block_params cenv world encl (block_defaults body) params argvals in
   let f = block_body_flow cenv world encl body in
   let _ = restore_params cenv saved in
   let _ = drop_created cenv created in
@@ -4355,7 +4367,7 @@ and flow_value = fn (f: Flow) ->
   match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
-and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val list) ->
+and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * Expr) list) -> fn (params0: str list) -> fn (argvals0: Val list) ->
   // numbered parameters: a block without explicit params binds _1.._9.
   let _ = (match params0 with
            | Nil -> bind_numbered cenv argvals0 1
@@ -4395,22 +4407,43 @@ and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val l
        (match params with
         | Cons (_, Cons (_, _)) -> (match argvals0 with Cons (VArr id, Nil) -> deref id | _ -> argvals0)
         | _ -> argvals0)) in
+  // defaults (from the block body's nil-check prologue) drive the Ruby
+  // fill order: leading requireds, then trailing requireds, then optionals.
   if has_splat params then
-    // fixed params around the splat bind positionally; the splat (possibly
-    // anonymous `*`) takes the middle.
     let before = take_until_splat params in
     let after = after_splat params in
     let sname = splat_name params in
-    let nb = list_str_len before in
+    let pre = req_pre before bdefaults in
+    let opts = drop_req_pre before bdefaults in
+    let npre = list_str_len pre in
+    let nopt = list_str_len opts in
     let na = list_str_len after in
     let nv = vlen argvals in
-    let sc = nv - nb - na in
-    let sc = if sc < 0 then 0 else sc in
-    let _ = bind_seq cenv before (vtake argvals nb) in
-    let _ = if str_eq sname "" then () else map_set cenv sname (arr_new (vtake (vdrop argvals nb) sc)) in
-    let _ = bind_seq cenv after (vdrop argvals (nb + sc)) in
+    let middle = nv - npre - na in
+    let middle = if middle < 0 then 0 else middle in
+    let kopt = if middle > nopt then nopt else middle in
+    let sc = middle - kopt in
+    let _ = bind_seq cenv pre (vtake argvals npre) in
+    let _ = bind_defaulted cenv world blk opts bdefaults (vtake (vdrop argvals npre) kopt) in
+    let _ = if str_eq sname "" then () else map_set cenv sname (arr_new (vtake (vdrop argvals (npre + kopt)) sc)) in
+    let _ = bind_seq cenv after (vdrop argvals (npre + kopt + sc)) in
     ()
-  else bind_block_seq cenv params argvals
+  else
+    let pre = req_pre params bdefaults in
+    let rest1 = drop_req_pre params bdefaults in
+    let opts = opt_run rest1 bdefaults in
+    let post = drop_opt_run rest1 bdefaults in
+    let npre = list_str_len pre in
+    let nopt = list_str_len opts in
+    let npost = list_str_len post in
+    let nv = vlen argvals in
+    let kopt0 = nv - npre - npost in
+    let kopt0 = if kopt0 < 0 then 0 else kopt0 in
+    let kopt = if kopt0 > nopt then nopt else kopt0 in
+    let _ = bind_seq cenv pre (vtake argvals npre) in
+    let _ = bind_defaulted cenv world blk opts bdefaults (vtake (vdrop argvals npre) kopt) in
+    let _ = bind_seq cenv post (vdrop argvals (npre + kopt)) in
+    ()
 
 and bind_block_kws = fn cenv -> fn (kws: str list) -> fn (kwhash: Val list) ->
   match kws with
