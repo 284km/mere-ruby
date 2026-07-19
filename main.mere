@@ -857,10 +857,15 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), Nil), r2)
     else if str_eq id "while" then
       let (c, r2) = parse_expr r in
-      (SWhile (c, Cons (s, Nil)), r2)
+      // `begin ... end while cond` is do-while: run the body once, then loop.
+      (match s with
+       | SBegin (_, _, _, _) -> (SBegin (Cons (s, Cons (SWhile (c, Cons (s, Nil)), Nil)), Nil, Nil, Nil), r2)
+       | _ -> (SWhile (c, Cons (s, Nil)), r2))
     else if str_eq id "until" then
       let (c, r2) = parse_expr r in
-      (SWhile (EUn ("!", c), Cons (s, Nil)), r2)
+      (match s with
+       | SBegin (_, _, _, _) -> (SBegin (Cons (s, Cons (SWhile (EUn ("!", c), Cons (s, Nil)), Nil)), Nil, Nil, Nil), r2)
+       | _ -> (SWhile (EUn ("!", c), Cons (s, Nil)), r2))
     else (s, toks)
   | _ -> (s, toks)
 
@@ -1007,12 +1012,15 @@ and parse_stmt = fn toks ->
       (match r with
        | Cons (TP p, r2) ->
          if str_eq p "=" && not (is_keyword id) then
-           // `var = begin ... end` binds the begin's value; `Const = expr`
-           // is a constant assignment (routed to the consts table at eval).
+           // `var = begin/case/if/unless ... end` binds the construct's value;
+           // otherwise it is an ordinary assignment (`Const = expr` routes to
+           // the consts table at eval).
            (match r2 with
             | Cons (TId bg, r3) ->
-              if str_eq bg "begin" then
-                let (sb, r4) = parse_begin r3 in (SLocalFrom (id, sb), r4)
+              if str_eq bg "begin" then let (sb, r4) = parse_begin r3 in (SLocalFrom (id, sb), r4)
+              else if str_eq bg "case" then let (sb, r4) = parse_case r3 in (SLocalFrom (id, sb), r4)
+              else if str_eq bg "if" then let (sb, r4) = parse_if r3 false in (SLocalFrom (id, sb), r4)
+              else if str_eq bg "unless" then let (sb, r4) = parse_if r3 true in (SLocalFrom (id, sb), r4)
               else let (e, r3b) = parse_expr r2 in (SAssign (id, e), r3b)
             | _ -> let (e, r3c) = parse_expr r2 in (SAssign (id, e), r3c))
          else if not (str_eq (opassign_base p) "") && not (is_keyword id) && not (is_cap id) then
@@ -1163,7 +1171,11 @@ and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
   | _ -> fail "mere-ruby: unterminated case"
 
 and parse_when_vals = fn toks -> fn (acc: Expr list) ->
-  let (e, r) = parse_expr toks in
+  // `when *ary` splices the array's elements as candidates.
+  let (e, r) =
+    (match toks with
+     | Cons (TP star, r0) -> if str_eq star "*" then let (inner, r1) = parse_expr r0 in (ESplat inner, r1) else parse_expr toks
+     | _ -> parse_expr toks) in
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then parse_when_vals r2 (Cons (e, acc))
@@ -2660,7 +2672,22 @@ and run_case = fn env -> fn world -> fn blk -> fn (v: Val) -> fn whens -> fn (el
 and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr list) ->
   match vs with
   | Nil -> false
-  | Cons (e, t) -> rb_eq (eval_e env world blk e) v || when_matches env world blk v t
+  | Cons (e, t) ->
+    (match e with
+     | ESplat inner -> (match eval_e env world blk inner with VArr id -> when_any_eq v (deref id) | _ -> false)
+     | _ -> case_eqq world (eval_e env world blk e) v)
+    || when_matches env world blk v t
+
+// Ruby's `===` as used by case/when: a Range tests membership, a Class tests
+// is-a, anything else tests ==.
+and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
+  match cand with
+  | VRange (lo, hi, excl) -> (match v with VInt n -> n >= lo && (if excl then n < hi else n <= hi) | _ -> false)
+  | VClass c -> (match v with VObj id -> let (m, s, ocls, iv) = world in obj_is_a world (map_get ocls (str_of_int id)) c | _ -> obj_is_a world (class_name v) c)
+  | _ -> rb_eq cand v
+
+and when_any_eq = fn (v: Val) -> fn (xs: Val list) ->
+  match xs with Nil -> false | Cons (h, t) -> rb_eq h v || when_any_eq v t
 
 // subjectless case: the first when whose any condition is truthy wins.
 and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt list) ->
@@ -2674,7 +2701,14 @@ and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt 
 and any_truthy = fn env -> fn world -> fn blk -> fn (vs: Expr list) ->
   match vs with
   | Nil -> false
-  | Cons (e, t) -> truthy (eval_e env world blk e) || any_truthy env world blk t
+  | Cons (e, t) ->
+    (match e with
+     | ESplat inner -> (match eval_e env world blk inner with VArr id -> any_val_truthy (deref id) | _ -> false)
+     | _ -> truthy (eval_e env world blk e))
+    || any_truthy env world blk t
+
+and any_val_truthy = fn (xs: Val list) ->
+  match xs with Nil -> false | Cons (h, t) -> truthy h || any_val_truthy t
 
 and puts_args = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
   match es with
