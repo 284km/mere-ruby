@@ -177,6 +177,9 @@ let proc_store = map_new ();
 let lambda_ids = map_new ();
 // class variables (@@x): "Cls@x" -> value, resolved up the superclass chain.
 let cvars = map_new ();
+// regex capture-group spans recorded during the latest match attempt
+// ("sN"/"eN" -> string index).
+let rx_caps = map_new ();
 // expression-position flow (break/next/redo/return inside an expression)
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
@@ -446,11 +449,14 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // a backslash at end of line continues the logical line.
       lex_go s (i + 2)
     else if str_eq c "/" && regex_position s i then
-      // a minimal regex literal: lexed as a plain string token (patterns
-      // are parsed but matchers may ignore them). Heuristic: a / directly
-      // after ( , = ~ ! | & or a newline starts a regex, not a division.
+      // a minimal regex literal. With #{...} interpolation it desugars to
+      // (string-concat).__regex; otherwise a plain TRegex token.
       let (lit, j) = scan_regex s (i + 1) "" in
-      Cons (TRegex lit, lex_go s j)
+      if rx_has_interp lit 0 then
+        let toks = lex_go (rx_interp_src lit) 0 in
+        tapp (Cons (TP "(s", drop_eof toks))
+             (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", lex_go s j))))
+      else Cons (TRegex lit, lex_go s j)
     else if str_eq c "%" && percent_body s i >= 0 then
       // %(...) / %q(...) / %Q(...) raw strings; %w(...) a word array.
       let b = percent_body s i in
@@ -609,6 +615,26 @@ and scan_op_sym = fn (s: str) -> fn (i: int) ->
           str_eq two "<<" || str_eq two ">>" || str_eq two "**" || str_eq two "[]" ||
           str_eq two "=~" then (two, i + 2)
   else (substring s i (i + 1), i + 1)
+
+and rx_has_interp = fn (lit: str) -> fn (i: int) ->
+  if i + 1 >= str_len lit then false
+  else if str_eq (char_at lit i) "#" && str_eq (char_at lit (i + 1)) "\{" then true
+  else rx_has_interp lit (i + 1)
+
+// rebuild the regex body as double-quoted-string SOURCE so the normal
+// interpolation lexer produces the concat tokens.
+and rx_interp_src = fn (lit: str) ->
+  "\"" ++ rx_escape_dq lit 0 ++ "\""
+
+and rx_escape_dq = fn (lit: str) -> fn (i: int) ->
+  if i >= str_len lit then ""
+  else
+    let c = char_at lit i in
+    if str_eq c "\"" then "\\\"" ++ rx_escape_dq lit (i + 1)
+    else if str_eq c "\\" && i + 1 < str_len lit then
+      // keep regex escapes as-is through the string lexer
+      "\\\\" ++ char_at lit (i + 1) ++ rx_escape_dq lit (i + 2)
+    else c ++ rx_escape_dq lit (i + 1)
 
 // is the / at i in a value position (a regex) rather than a division?
 and regex_position = fn (s: str) -> fn (i: int) ->
@@ -1931,6 +1957,9 @@ and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
       let (b, r3) = parse_stmts (skip_then r2) Nil in
       parse_whens subj r3 (Cons ((vs, b), acc))
     else if str_eq id "else" then
+      let _ = (match acc with
+               | Nil -> fail "mere-ruby: case with else but no when"
+               | _ -> ()) in
       let (b, r2) = parse_stmts r Nil in
       (SCase (subj, rev_app acc Nil, b), expect_kw r2 "end")
     else if str_eq id "end" then
@@ -2449,6 +2478,7 @@ let rec to_s = fn (v: Val) ->
   | VHsh _ -> inspect v
   | VSym s -> s
   | VClass c -> c
+  | VRegex p -> "(?-mix:" ++ p ++ ")"
   | VObj _ -> "#<object>"   // disp (world-aware) overrides for objects
   | VRange (lo, hi, excl) ->
     str_of_int lo ++ (if excl then "..." else "..") ++ str_of_int hi
@@ -2799,8 +2829,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "=~" then
       (let vb = eval_e env world blk b in
        match va0 with
-       | VStr sv -> (match vb with VRegex p -> rx_index p sv | _ -> VNil)
-       | VRegex p -> (match vb with VStr sv -> rx_index p sv | _ -> VNil)
+       | VStr sv -> (match vb with VRegex p -> rx_do_match world p sv | _ -> VNil)
+       | VRegex p -> (match vb with VStr sv -> rx_do_match world p sv | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = eval_e env world blk b in
@@ -3481,6 +3511,8 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VArr id -> arr_new (deref id) | _ -> recv)
   else if str_eq name "itself" then recv
   else if str_eq name "tap" then recv
+  else if str_eq name "__regex" then
+    (match recv with VStr sp -> VRegex sp | _ -> fail "no __regex")
   else if str_eq name "to_sym" then
     (match recv with VStr s -> VSym s | VSym s -> VSym s | _ -> fail "no to_sym")
   else if str_eq name "equal?" then
@@ -3641,6 +3673,8 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
   (match map_get meths name with
    | Meth (params, defaults, body) ->
      let frame = map_new () in
+     // top-level methods run with main as self (their @ivars live there).
+     let _ = map_set frame "self" (if map_has env "self" then map_get env "self" else VMain) in
      let _ = bind_params frame world blk name params defaults args in
      (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
 
@@ -4378,7 +4412,10 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
 // is-a, anything else tests ==.
 and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
   match cand with
-  | VRegex p -> (match v with VStr sv -> rx_match p sv | _ -> false)
+  | VRegex p ->
+    (match v with
+     | VStr sv -> (match rx_do_match world p sv with VNil -> false | _ -> true)
+     | _ -> false)
   | VRange (lo, hi, excl) -> (match v with VInt n -> n >= lo && (if excl then n < hi else n <= hi) | _ -> false)
   | VClass c -> (match v with VObj id -> let (m, s, ocls, iv) = world in obj_is_a world (map_get ocls (str_of_int id)) c | _ -> obj_is_a world (class_name v) c)
   | _ -> rb_eq cand v
@@ -4411,6 +4448,15 @@ and rx_scan = fn (pat: str) -> fn (s: str) -> fn (i: int) ->
 and rx_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
   if p >= str_len pat then true
   else if str_eq (char_at pat p) "$" && p + 1 >= str_len pat then i >= str_len s
+  else if str_eq (char_at pat p) "(" then
+    // a capture group opens: record the start, skip a (?<name> header.
+    let g = rx_count pat "(" p + 1 in
+    let _ = map_set rx_caps ("s" ++ str_of_int g) i in
+    rx_here pat (rx_group_hdr pat (p + 1)) s i
+  else if str_eq (char_at pat p) ")" then
+    let g = rx_count pat ")" p + 1 in
+    let _ = map_set rx_caps ("e" ++ str_of_int g) i in
+    rx_here pat (p + 1) s i
   else
     let elen = (if str_eq (char_at pat p) "\\" && p + 1 < str_len pat then 2 else 1) in
     let quant = (if p + elen < str_len pat then char_at pat (p + elen) else "") in
@@ -4421,6 +4467,63 @@ and rx_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
     else
       (if i < str_len s && rx_elem pat p (char_at s i)
        then rx_here pat (p + elen) s (i + 1) else false)
+
+// count occurrences of ch in pat before position p.
+and rx_count = fn (pat: str) -> fn (ch: str) -> fn (p: int) ->
+  rx_count_go pat ch p 0 0
+and rx_count_go = fn (pat: str) -> fn (ch: str) -> fn (p: int) -> fn (i: int) -> fn (n: int) ->
+  if i >= p then n
+  else rx_count_go pat ch p (i + 1) (if str_eq (char_at pat i) ch then n + 1 else n)
+
+// skip a (?<name> / (?: / (?-mix: style group header (just past it).
+and rx_group_hdr = fn (pat: str) -> fn (p: int) ->
+  if p < str_len pat && str_eq (char_at pat p) "?" then rx_hdr_end pat (p + 1)
+  else p
+and rx_hdr_end = fn (pat: str) -> fn (p: int) ->
+  if p >= str_len pat then p
+  else
+    let c = char_at pat p in
+    if str_eq c ":" || str_eq c ">" then p + 1
+    else if str_eq c ")" then p   // (?flags) with no body — leave at )
+    else rx_hdr_end pat (p + 1)
+
+// run a match and publish $~ (a MatchData instance) and $1..$9 globals.
+and rx_do_match = fn world -> fn (pat: str) -> fn (sv: str) ->
+  let _ = rx_clear_caps 1 in
+  let r = rx_index pat sv in
+  let _ = rx_publish world pat sv r in
+  r
+
+and rx_clear_caps = fn (i: int) ->
+  if i > 9 then ()
+  else
+    let _ = if map_has rx_caps ("s" ++ str_of_int i) then map_delete rx_caps ("s" ++ str_of_int i) else () in
+    let _ = if map_has rx_caps ("e" ++ str_of_int i) then map_delete rx_caps ("e" ++ str_of_int i) else () in
+    rx_clear_caps (i + 1)
+
+and rx_publish = fn world -> fn (pat: str) -> fn (sv: str) -> fn (r: Val) ->
+  (match r with
+   | VNil ->
+     let _ = map_set globals "~" VNil in rx_pub_groups sv 1 false
+   | _ ->
+     let (meths, sup, ocls, ivars) = world in
+     let id = map_len ocls in
+     let _ = map_set ocls (str_of_int id) "MatchData" in
+     let _ = map_set globals "~" (VObj id) in
+     rx_pub_groups sv 1 true)
+
+and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
+  if i > 9 then ()
+  else
+    let k_s = "s" ++ str_of_int i in
+    let k_e = "e" ++ str_of_int i in
+    let v = if ok && map_has rx_caps k_s && map_has rx_caps k_e then
+              (let a = map_get rx_caps k_s in
+               let b = map_get rx_caps k_e in
+               if b >= a then VStr (substring sv a b) else VNil)
+            else VNil in
+    let _ = map_set globals (str_of_int i) v in
+    rx_pub_groups sv (i + 1) ok
 
 // zero-or-more of the element at p, then the rest (greedy with backtrack).
 and rx_many = fn (pat: str) -> fn (p: int) -> fn (elen: int) -> fn (s: str) -> fn (i: int) ->
