@@ -180,6 +180,9 @@ let cvars = map_new ();
 // regex capture-group spans recorded during the latest match attempt
 // ("sN"/"eN" -> string index).
 let rx_caps = map_new ();
+// nesting depth of active catch(:tag) blocks (throw without any catch
+// raises UncaughtThrowError immediately).
+let catch_depth = map_new ();
 // expression-position flow (break/next/redo/return inside an expression)
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
@@ -2727,6 +2730,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | _ -> flow_value (run_stmts env world blk prog2))
        | _ -> fail "mere-ruby: eval expects a string")
     else if map_has meths name then call_method env world noblk name args
+    else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
+      (match args with
+       | Cons (t, rest) ->
+         let v = (match rest with Cons (v2, _) -> v2 | Nil -> VNil) in
+         let d = (if map_has catch_depth "n" then (match map_get catch_depth "n" with VInt dn -> dn | _ -> 0) else 0) in
+         if catch_tag_active t d then flow_rethrow_tagged "throw" t v
+         else raise_exc world "UncaughtThrowError" ("uncaught throw " ++ inspect t)
+       | _ -> fail "mere-ruby: throw expects a tag")
     // Kernel#p: inspect-print each arg; returns the value (or array).
     else if str_eq name "p" || str_eq name "pp" then
       let _ = p_print args in
@@ -2736,8 +2747,30 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
     let newblk = (true, bp, bb, env) in
+    // Kernel#loop: run the block until break (or a StopIteration raise).
+    if str_eq name "loop" && (if map_has meths "loop" then false else true) then
+      run_loop_builtin env world blk (true, bp, bb, env)
+    // catch(:tag) { ... throw :tag, v ... } via the flow-signal unwind.
+    else if str_eq name "catch" && (if map_has meths "catch" then false else true) then
+      (let tag = (match args with Cons (t, _) -> t | _ -> VNil) in
+       let d0 = (if map_has catch_depth "n" then (match map_get catch_depth "n" with VInt dn -> dn | _ -> 0) else 0) in
+       let _ = map_set catch_depth "n" (VInt (d0 + 1)) in
+       let _ = map_set catch_depth ("t" ++ str_of_int (d0 + 1)) tag in
+       let f = try_or (fn (u: unit) -> run_block world blk (true, bp, bb, env) Nil) (FRaise VNil) in
+       let _ = map_set catch_depth "n" (VInt d0) in
+       (match f with
+        | FRaise _ ->
+          if map_has flow_sig "k" then
+            let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+            let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+            let tg = (if map_has flow_sig "tag" then map_get flow_sig "tag" else VNil) in
+            let _ = map_delete flow_sig "k" in
+            if str_eq k "throw" && rb_eq tg tag then v
+            else flow_rethrow_tagged k tg v
+          else fail "mere-ruby: (ruby exception raised)"
+        | other -> flow_value other))
     // proc { } / lambda { } capture the block as a first-class VProc.
-    if str_eq name "proc" || str_eq name "lambda" then
+    else if str_eq name "proc" || str_eq name "lambda" then
       (let id = map_len proc_store in
        let _ = map_set proc_store (str_of_int id) (true, bp, bb, env) in
        let _ = if str_eq name "lambda" then map_set lambda_ids (str_of_int id) VNil else () in
@@ -2987,7 +3020,9 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // Ruby block params are block-local: save any outer bindings of the
   // param names and restore them after the block (for-loops keep their
   // variable via an explicit assignment to a hidden __for param).
-  let saved = save_params cenv params Nil in
+  let saved = save_params cenv (match params with
+    | Nil -> Cons ("_1", Cons ("_2", Cons ("_3", Cons ("_4", Cons ("_5", Cons ("_6", Cons ("_7", Cons ("_8", Cons ("_9", Nil)))))))))
+    | _ -> params) Nil in
   // names first assigned INSIDE the block are also block-local: collect
   // the assignment targets not yet bound outside, delete them afterwards.
   let created = fresh_targets cenv (deep_targets body) in
@@ -3097,6 +3132,10 @@ and flow_value = fn (f: Flow) ->
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
 and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val list) ->
+  // numbered parameters: a block without explicit params binds _1.._3.
+  let _ = (match params0 with
+           | Nil -> bind_numbered cenv argvals0 1
+           | _ -> ()) in
   // &blk params bind nil (blocks aren't re-passed through block params).
   let params = strip_block_params params0 in
   let _ = (let b = block_param_name params0 in if str_eq b "" then () else map_set cenv b VNil) in
@@ -3121,6 +3160,13 @@ and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val l
     let _ = bind_seq cenv after (vdrop argvals (nb + sc)) in
     ()
   else bind_block_seq cenv params argvals
+
+and bind_numbered = fn cenv -> fn (argvals: Val list) -> fn (n: int) ->
+  if n > 9 then ()
+  else
+    (match argvals with
+     | Nil -> let _ = map_set cenv ("_" ++ str_of_int n) VNil in bind_numbered cenv Nil (n + 1)
+     | Cons (a, rest) -> let _ = map_set cenv ("_" ++ str_of_int n) a in bind_numbered cenv rest (n + 1))
 
 and bind_block_seq = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
   match params with
@@ -3503,7 +3549,12 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
 and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let cls = class_name recv in
-  if has_meth world cls name then
+  // is_a? / kind_of? walk the real (exception) hierarchy.
+  if (str_eq name "is_a?" || str_eq name "kind_of?") then
+    (match args with
+     | Cons (VClass c, _) -> VBool (obj_is_a world cls c)
+     | _ -> VBool false)
+  else if has_meth world cls name then
     (if vischeck && meth_private world cls name
      then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
      else invoke world noblk recv cls name args)
@@ -4404,6 +4455,36 @@ and flow_throw = fn (kind: str) -> fn (v: Val) ->
   let _ = map_set flow_sig "v" v in
   fail "mere-ruby: (flow signal)"
 
+and flow_rethrow_tagged = fn (kind: str) -> fn (tag: Val) -> fn (v: Val) ->
+  let _ = map_set flow_sig "k" (VStr kind) in
+  let _ = map_set flow_sig "tag" tag in
+  let _ = map_set flow_sig "v" v in
+  fail "mere-ruby: (flow signal)"
+
+and catch_tag_active = fn (t: Val) -> fn (d: int) ->
+  if d <= 0 then false
+  else if map_has catch_depth ("t" ++ str_of_int d) && rb_eq (map_get catch_depth ("t" ++ str_of_int d)) t then true
+  else catch_tag_active t (d - 1)
+
+and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
+  let _ = tick () in
+  let f = try_or (fn (u: unit) -> run_block world blk theblk Nil) (FRaise VNil) in
+  (match f with
+   | FBreak v -> v
+   | FRaise _ ->
+     if map_has flow_sig "k" then
+       let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+       let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+       let _ = map_delete flow_sig "k" in
+       if str_eq k "break" then v else flow_throw k v
+     else
+       // a StopIteration ends the loop quietly; other exceptions re-raise.
+       let (meths, sup, ocls, ivars) = world in
+       let ecls = (if map_has ivars "$exc" then (match map_get ivars "$exc" with VExc (c, _) -> c | _ -> "") else "") in
+       if str_eq ecls "StopIteration" then let _ = map_delete ivars "$exc" in VNil
+       else fail "mere-ruby: (ruby exception raised)"
+   | _ -> run_loop_builtin env world blk theblk)
+
 // run a loop body once, converting flow signals; redo reruns the body
 // without re-evaluating the loop condition.
 and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
@@ -4679,6 +4760,7 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "ScriptError" "Exception" in
   let _ = map_set sup "SyntaxError" "ScriptError" in
   let _ = map_set sup "LocalJumpError" "StandardError" in
+  let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
   // built-in value classes, so reopened methods resolve up the real chain
   // (class Integer / class Object monkey-patching reaches every value).
   let _ = map_set sup "Integer" "Numeric" in

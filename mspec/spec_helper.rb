@@ -31,7 +31,7 @@ class PositiveMatcher
       $mspec_fail += 1
       puts "FAILED: expected #{klass} to be raised"
     rescue Exception => e
-      if klass.nil? || e.class.to_s == klass.to_s
+      if klass.nil? || e.class.to_s == klass.to_s || e.is_a?(klass)
         $mspec_pass += 1
       else
         $mspec_fail += 1
