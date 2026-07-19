@@ -739,6 +739,8 @@ and parse_primary = fn toks ->
       (match r with
        | Cons (TP p, r2) ->
          if str_eq p "(" then let (argv, r3) = parse_call_args r2 in (EYield argv, r3)
+         // `yield [0]` passes an array literal (not an index on the result).
+         else if str_eq p "[" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
          else (EYield Nil, r)
        | Cons (TNL, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
@@ -1044,6 +1046,7 @@ and parse_stmt_id = fn toks ->
     else if str_eq id "while" then parse_while r false
     else if str_eq id "until" then parse_while r true
     else if str_eq id "case" then parse_case r
+    else if str_eq id "for" then parse_for r
     else if str_eq id "def" then parse_def r
     else if str_eq id "class" then parse_class r
     else if str_eq id "module" then parse_class r   // modules parse like classes (methods/consts)
@@ -1132,6 +1135,9 @@ and parse_stmt_id = fn toks ->
               else if str_eq bg "case" then let (sb, r4) = parse_case r3 in (SLocalFrom (id, sb), r4)
               else if str_eq bg "if" then let (sb, r4) = parse_if r3 false in (SLocalFrom (id, sb), r4)
               else if str_eq bg "unless" then let (sb, r4) = parse_if r3 true in (SLocalFrom (id, sb), r4)
+              // chained assignment `a = b = ... = e` binds right-to-left.
+              else if (match r3 with Cons (TP eq2, _) -> str_eq eq2 "=" | _ -> false) && not (is_keyword bg) then
+                let (s2, r4) = parse_stmt r2 in (SLocalFrom (id, s2), r4)
               else let (e, r3b) = parse_expr r2 in (SAssign (id, e), r3b)
             | _ -> let (e, r3c) = parse_expr r2 in (SAssign (id, e), r3c))
          else if not (str_eq (opassign_base p) "") && not (is_keyword id) && not (is_cap id) then
@@ -1260,6 +1266,22 @@ and parse_if_tail = fn toks ->
       (Cons ((c, b), clauses), els, r4)
     else fail ("mere-ruby: expected elsif/else/end, got " ++ id)
   | _ -> fail "mere-ruby: unterminated if"
+
+// `for x in e [do] body end` — each over e with x as the block param.
+// The block shares the enclosing env, so (like Ruby's for) x leaks out.
+and parse_for = fn toks ->
+  match toks with
+  | Cons (TId v, r) ->
+    (match r with
+     | Cons (TId kwin, r2) ->
+       if str_eq kwin "in" then
+         let (e, r3) = parse_expr r2 in
+         let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
+         let (body, r4) = parse_stmts r3b Nil in
+         (SExpr (EMethodB (e, "each", Nil, Cons (v, Nil), body)), expect_kw r4 "end")
+       else fail "mere-ruby: expected in after for"
+     | _ -> fail "mere-ruby: expected in after for")
+  | _ -> fail "mere-ruby: expected a variable after for"
 
 and parse_while = fn toks -> fn (negate: bool) ->
   let (cond0, r) = parse_expr toks in
@@ -2137,25 +2159,39 @@ and flow_value = fn (f: Flow) ->
   match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
 
 // block arity is lenient: missing args bind nil, extra args are dropped.
-and bind_block_params = fn cenv -> fn (params: str list) -> fn (argvals0: Val list) ->
+and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val list) ->
+  // &blk params bind nil (blocks aren't re-passed through block params).
+  let params = strip_block_params params0 in
+  let _ = (let b = block_param_name params0 in if str_eq b "" then () else map_set cenv b VNil) in
   // auto-splat: a block with 2+ params given a single array destructures it.
   let argvals =
     (match params with
      | Cons (_, Cons (_, _)) -> (match argvals0 with Cons (VArr id, Nil) -> deref id | _ -> argvals0)
      | _ -> argvals0) in
+  if has_splat params then
+    // fixed params around the splat bind positionally; the splat (possibly
+    // anonymous `*`) takes the middle.
+    let before = take_until_splat params in
+    let after = after_splat params in
+    let sname = splat_name params in
+    let nb = list_str_len before in
+    let na = list_str_len after in
+    let nv = vlen argvals in
+    let sc = nv - nb - na in
+    let sc = if sc < 0 then 0 else sc in
+    let _ = bind_seq cenv before (vtake argvals nb) in
+    let _ = if str_eq sname "" then () else map_set cenv sname (arr_new (vtake (vdrop argvals nb) sc)) in
+    let _ = bind_seq cenv after (vdrop argvals (nb + sc)) in
+    ()
+  else bind_block_seq cenv params argvals
+
+and bind_block_seq = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
   match params with
   | Nil -> ()
   | Cons (p, ps) ->
-    if str_len p > 0 && str_eq (char_at p 0) "*" then
-      // *rest collects the remaining args (fixed params after a splat are rare
-      // in blocks and not distributed here).
-      let _ = map_set cenv (substring p 1 (str_len p)) (arr_new argvals) in ()
-    else if str_len p > 0 && str_eq (char_at p 0) "&" then
-      let _ = map_set cenv (substring p 1 (str_len p)) VNil in bind_block_params cenv ps argvals
-    else
-      (match argvals with
-       | Nil -> let _ = map_set cenv p VNil in bind_block_params cenv ps Nil
-       | Cons (a, rest) -> let _ = map_set cenv p a in bind_block_params cenv ps rest)
+    (match argvals with
+     | Nil -> let _ = map_set cenv p VNil in bind_block_seq cenv ps Nil
+     | Cons (a, rest) -> let _ = map_set cenv p a in bind_block_seq cenv ps rest)
 
 // block predicates on a list (run the block per element, short-circuiting).
 and arr_detect = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
