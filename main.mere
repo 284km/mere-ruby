@@ -1142,6 +1142,15 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
        // `recv.(args)` is shorthand for `recv.call(args)`.
        | Cons (TP lp, r2) ->
          if str_eq lp "(" then let (argv, r3) = parse_call_args r2 in attach_block_method recv "call" argv r3
+         // `recv.=~(x)` / `recv.+(y)` — explicit operator-method calls.
+         else if is_op_method_name lp then
+           (match r2 with
+            | Cons (TP lp2, r3) ->
+              if str_eq lp2 "(" then
+                let (argv, r4) = parse_call_args r3 in
+                parse_postfix_more (EMethod (recv, lp, argv)) r4
+              else parse_postfix_more (EMethod (recv, lp, Nil)) r2
+            | _ -> parse_postfix_more (EMethod (recv, lp, Nil)) r2)
          else fail "mere-ruby: expected method name after ."
        | _ -> fail "mere-ruby: expected method name after .")
     // index: recv[i] -> recv.[](i); recv[i] = v -> recv.[]=(i, v)
@@ -1151,7 +1160,13 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
       (match r3 with
        | Cons (TP eq, r4) ->
          if str_eq eq "=" then
-           let (rhs, r5) = parse_expr r4 in
+           let (rhs, r5) =
+             (match r4 with
+              | Cons (TP st2, r4b) ->
+                if str_eq st2 "*" then
+                  let (inner, r5b) = parse_expr r4b in (EArr (Cons (ESplat inner, Nil)), r5b)
+                else parse_expr r4
+              | _ -> parse_expr r4) in
            (EMethod (recv, "[]=", eapp idxs (Cons (rhs, Nil))), r5)
          // recv[i] op= v desugars through a read-modify-write ([]= of
          // [] op v); ||= and &&= use their short-circuit operators.
@@ -1328,13 +1343,23 @@ and parse_pipe_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) li
       pipe_after ("(" ++ spec ++ ")") r2 acc ds
     else fail "mere-ruby: bad block params"
   | Cons (TId name, r) ->
-    // `a=default` — an optional parameter.
+    // `a=default` — an optional parameter; `k:` / `k: default` — keyword.
     (match r with
      | Cons (TP eq, r2) ->
        if str_eq eq "=" then
          // parse above `|`'s precedence so the closing bar stays the closer
          let (d, r3) = parse_bin r2 5 in
          pipe_after name r3 acc (Cons ((name, d), ds))
+       else if str_eq eq ":" then
+         (match r2 with
+          | Cons (TP nx, _) ->
+            if str_eq nx "," || str_eq nx "|" then pipe_after (name ++ ":") r2 acc ds
+            else
+              let (d, r3) = parse_bin r2 5 in
+              pipe_after (name ++ ":") r3 acc (Cons ((name, d), ds))
+          | _ ->
+            let (d, r3) = parse_bin r2 5 in
+            pipe_after (name ++ ":") r3 acc (Cons ((name, d), ds)))
        else pipe_after name r acc ds
      | _ -> pipe_after name r acc ds)
   | _ -> fail "mere-ruby: expected block parameter"
@@ -2180,9 +2205,9 @@ and parse_stmt_id = fn toks ->
     else if str_eq id "until" then let (s, r2) = parse_while r true in stmt_postfix s r2
     else if str_eq id "case" then let (s, r2) = parse_case r in stmt_postfix s r2
     else if str_eq id "for" then parse_for r
-    else if str_eq id "def" then parse_def r
-    else if str_eq id "class" then parse_class r
-    else if str_eq id "module" then parse_class r   // modules parse like classes (methods/consts)
+    else if str_eq id "def" then let (s, r2) = parse_def r in stmt_postfix s r2
+    else if str_eq id "class" then let (s, r2) = parse_class r in stmt_postfix s r2
+    else if str_eq id "module" then let (s, r2) = parse_class r in stmt_postfix s r2
     else if str_eq id "begin" then let (s, r2) = parse_begin r in stmt_postfix s r2
     else if str_eq id "attr_accessor" then parse_attr "rw" r
     else if str_eq id "attr_reader" then parse_attr "r" r
@@ -3979,11 +4004,26 @@ and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val l
           | Cons (VHsh hx, _) -> let _ = map_set cenv dsname (VHsh hx) in vtake argvals0 (n - 1)
           | _ -> let _ = map_set cenv dsname (VHsh Nil) in argvals0)
        else let _ = map_set cenv dsname (VHsh Nil) in argvals0) in
+  // keyword params (`k:` names): peel the trailing hash and bind them
+  // (a nil bind lets the defaults prologue apply); the presence of any
+  // keyword param disables auto-splat.
+  let kws = kw_params params in
+  let params = pos_params params in
+  let argvals0 =
+    (match kws with
+     | Nil -> argvals0
+     | _ ->
+       let (rest, kwhash) = peel_trailing_hash argvals0 in
+       let _ = bind_block_kws cenv kws kwhash in
+       rest) in
   // auto-splat: a block with 2+ params given a single array destructures it.
   let argvals =
-    (match params with
-     | Cons (_, Cons (_, _)) -> (match argvals0 with Cons (VArr id, Nil) -> deref id | _ -> argvals0)
-     | _ -> argvals0) in
+    (match kws with
+     | Cons (_, _) -> argvals0
+     | Nil ->
+       (match params with
+        | Cons (_, Cons (_, _)) -> (match argvals0 with Cons (VArr id, Nil) -> deref id | _ -> argvals0)
+        | _ -> argvals0)) in
   if has_splat params then
     // fixed params around the splat bind positionally; the splat (possibly
     // anonymous `*`) takes the middle.
@@ -4000,6 +4040,15 @@ and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val l
     let _ = bind_seq cenv after (vdrop argvals (nb + sc)) in
     ()
   else bind_block_seq cenv params argvals
+
+and bind_block_kws = fn cenv -> fn (kws: str list) -> fn (kwhash: Val list) ->
+  match kws with
+  | Nil -> ()
+  | Cons (p, rest) ->
+    let nm = substring p 0 (str_len p - 1) in
+    let v = if hash_haskey kwhash (VSym nm) then hash_get kwhash (VSym nm) else VNil in
+    let _ = map_set cenv nm v in
+    bind_block_kws cenv rest kwhash
 
 and bind_numbered = fn cenv -> fn (argvals: Val list) -> fn (n: int) ->
   if n > 9 then ()
@@ -4399,6 +4448,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     (if vischeck && meth_private world cls name
      then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
      else invoke world noblk recv cls name args)
+  // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
+  else if str_eq name "=~" then
+    (match recv with
+     | VRegex p -> (match args with Cons (VStr sv, _) -> rx_do_match world p sv | _ -> VNil)
+     | VStr sv -> (match args with Cons (VRegex p, _) -> rx_do_match world p sv | _ -> VNil)
+     | _ -> VNil)
   else prim_method recv name args
 
 // does `recv` respond to `name`? (used by respond_to?)
