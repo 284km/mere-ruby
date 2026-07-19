@@ -1988,7 +1988,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls)
      // `blk` (the enclosing method's block) is threaded so a yield inside
      // the iterated block reaches it (e.g. `@xs.each { |n| yield(n) }`).
-     | _ -> builtin_iter world blk newblk recv name args)
+     | _ ->
+       // a reopened built-in class's method (with the call-site block) wins
+       // over the hardcoded iterators.
+       let pcls = class_name recv in
+       if has_meth world pcls name then invoke world newblk recv pcls name args
+       else builtin_iter world blk newblk recv name args)
   | EArr items -> arr_new (eval_args env world blk items)
   | EHsh items -> VHsh (eval_args env world blk items)
   | EUn (op, a) ->
@@ -2462,7 +2467,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
     then flow_value (run_block world noblk blk args)
     else if str_eq s "&blk" && str_eq name "class" then VClass "Proc"
-    else prim_method recv name args
+    else dispatch_prim env world blk recv name args vischeck
   | VProc pid ->
     // call/./[]/yield run the stored block; class reports Proc.
     if str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===" then
@@ -2481,8 +2486,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       flow_value (run_block world noblk theblk args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "arity" then VInt 0
-    else prim_method recv name args
-  | _ -> prim_method recv name args
+    else dispatch_prim env world blk recv name args vischeck
+  | _ -> dispatch_prim env world blk recv name args vischeck
+
+// dispatch on a primitive receiver: reopened built-in classes win (class
+// Integer / class Object monkey-patching), then the hardcoded prims.
+and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let cls = class_name recv in
+  if has_meth world cls name then
+    (if vischeck && meth_private world cls name
+     then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
+     else invoke world noblk recv cls name args)
+  else prim_method recv name args
 
 // does `recv` respond to `name`? (used by respond_to?)
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
@@ -2656,7 +2672,13 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
        else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
-     | _ -> raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'"))
+     | VMain -> raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
+     | other ->
+       // primitive self (a reopened built-in class's method body): user
+       // methods first, then the built-in prims (implicit-self upcase etc.).
+       let cls = class_name other in
+       if has_meth world cls name then invoke world noblk other cls name args
+       else prim_method other name args)
   else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
 
 // top-level method call: fresh frame, no self; blk is installed for yield.
@@ -2693,7 +2715,10 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   else if map_has meths (cls ++ "#" ++ name) then true
   else if includes_has world cls name then true
   else if map_has sup cls then has_meth world (map_get sup cls) name
-  else false
+  // every class without a declared superclass inherits from Object,
+  // so `class Object; def m; end` reaches all values.
+  else if str_eq cls "Object" then false
+  else has_meth world "Object" name
 
 // does any module `include`d into `cls` define `name` as an instance method?
 and includes_has = fn world -> fn (cls: str) -> fn (name: str) ->
@@ -2716,7 +2741,8 @@ and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   if map_has meths (cls ++ "#" ++ name) then map_get meths (cls ++ "#" ++ name)
   else if includes_has world cls name then mod_lookup world (str_split (map_get includes cls) "|") name
   else if map_has sup cls then lookup_meth world (map_get sup cls) name
-  else fail ("mere-ruby: undefined method '" ++ name ++ "' for an instance of " ++ cls)
+  else if str_eq cls "Object" then fail ("mere-ruby: undefined method '" ++ name ++ "'")
+  else lookup_meth world "Object" name
 
 // like lookup_meth but also returns the class the method was found in, so
 // `super` can resume the lookup from that class's superclass.
@@ -2725,7 +2751,8 @@ and lookup_meth_cls = fn world -> fn (cls: str) -> fn (name: str) ->
   if map_has meths (cls ++ "#" ++ name) then (map_get meths (cls ++ "#" ++ name), cls)
   else if includes_has world cls name then (mod_lookup world (str_split (map_get includes cls) "|") name, cls)
   else if map_has sup cls then lookup_meth_cls world (map_get sup cls) name
-  else fail ("mere-ruby: undefined method '" ++ name ++ "' for an instance of " ++ cls)
+  else if str_eq cls "Object" then fail ("mere-ruby: undefined method '" ++ name ++ "'")
+  else lookup_meth_cls world "Object" name
 
 // invoke an instance method: fresh frame binding self + params; blk is the
 // block passed at the call site (installed for yield inside the body).
@@ -3275,6 +3302,20 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "NoMethodError" "NameError" in
   let _ = map_set sup "StopIteration" "StandardError" in
   let _ = map_set sup "FrozenError" "RuntimeError" in
+  // built-in value classes, so reopened methods resolve up the real chain
+  // (class Integer / class Object monkey-patching reaches every value).
+  let _ = map_set sup "Integer" "Numeric" in
+  let _ = map_set sup "Float" "Numeric" in
+  let _ = map_set sup "Numeric" "Object" in
+  let _ = map_set sup "String" "Object" in
+  let _ = map_set sup "Array" "Object" in
+  let _ = map_set sup "Hash" "Object" in
+  let _ = map_set sup "Symbol" "Object" in
+  let _ = map_set sup "Range" "Object" in
+  let _ = map_set sup "Proc" "Object" in
+  let _ = map_set sup "NilClass" "Object" in
+  let _ = map_set sup "TrueClass" "Object" in
+  let _ = map_set sup "FalseClass" "Object" in
   let world = (meths, sup, ocls, ivars) in
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
   let _ = map_set env "self" VMain in   // top-level self is `main`
