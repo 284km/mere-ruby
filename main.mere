@@ -33,6 +33,7 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ESym of str          // :name
           | ESelf                // self
           | EConst of str        // a capitalized name (a class reference)
+          | EConstOrNil of str   // a const read that yields nil when undefined
           | EIVar of str         // @name
           | EMethod of Expr * str * Expr list  // recv.name(args)
           // M4 blocks / iterators:
@@ -61,6 +62,7 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // 2k: super. bool = zsuper (bare `super`, forward current args);
           // when false the args are explicit (super() or super(a, b)).
           | ESuper of bool * Expr list
+          | ESuperB of bool * Expr list * str list * Stmt list  // super with a block
           // 2m: `&expr` block-pass marker in an argument list (only &:sym is
           // turned into a real block; other forms are best-effort).
           | EBlockPass of Expr
@@ -516,6 +518,12 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // lowercase %w/%i words are raw; %W/%I words interpolate.
       if is_percent_w s i then
         Cons (TP " [", pw_words (str_eq (char_at s (i + 1)) "W") lit 0 (lex_go s j))
+      // %r{...} is a regex (with optional interpolation).
+      else if str_eq (char_at s (i + 1)) "r" then
+        (if rx_has_interp lit 0 then
+           tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src lit) 0)))
+                (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", lex_go s j))))
+         else Cons (TRegex lit, lex_go s j))
       // %s{...} is a symbol; %i{...} a symbol array.
       else if str_eq (char_at s (i + 1)) "s" then Cons (TSym lit, lex_go s j)
       else if str_eq (char_at s (i + 1)) "i" || str_eq (char_at s (i + 1)) "I" then
@@ -580,16 +588,26 @@ and percent_body = fn (s: str) -> fn (i: int) ->
   if i + 1 >= str_len s then 0 - 1
   else
     let c1 = char_at s (i + 1) in
+    // Bracket delimiters ( { [ < are unambiguous openers. Other clean
+    // delimiters (', |, / ...) start a bare percent string only in value
+    // position, to avoid stealing the modulo operator.
     if is_pct_open c1 then i + 2
+    else if is_pct_delim c1 && regex_position s i then i + 2
     else if (str_eq c1 "q" || str_eq c1 "Q" || str_eq c1 "w" || str_eq c1 "i" || str_eq c1 "s" ||
-             str_eq c1 "W" || str_eq c1 "I")
-            && i + 2 < str_len s && is_pct_open (char_at s (i + 2)) then i + 3
+             str_eq c1 "W" || str_eq c1 "I" || str_eq c1 "r")
+            && i + 2 < str_len s && is_pct_delim (char_at s (i + 2)) then i + 3
     else 0 - 1
 
-and is_pct_open = fn (c: str) -> str_eq c "(" || str_eq c "\{" || str_eq c "["
+// a percent-literal delimiter: any non-alphanumeric, non-space char.
+and is_pct_delim = fn (c: str) ->
+  (if is_alnum c then false else true) &&
+  (if str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "=" then false else true)
+
+and is_pct_open = fn (c: str) -> str_eq c "(" || str_eq c "\{" || str_eq c "[" || str_eq c "<"
 
 and pct_close_of = fn (c: str) ->
-  if str_eq c "(" then ")" else if str_eq c "\{" then "}" else "]"
+  if str_eq c "(" then ")" else if str_eq c "\{" then "}"
+  else if str_eq c "[" then "]" else if str_eq c "<" then ">" else c
 
 and is_percent_w = fn (s: str) -> fn (i: int) ->
   i + 1 < str_len s && (str_eq (char_at s (i + 1)) "w" || str_eq (char_at s (i + 1)) "W")
@@ -599,7 +617,14 @@ and scan_balanced2 = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: s
   if i >= str_len s then fail "mere-ruby: unterminated % literal"
   else
     let c = char_at s i in
-    if str_eq c op then scan_balanced2 s (i + 1) (depth + 1) (acc ++ c) op clo
+    // a backslash escapes the delimiter (and itself) inside the body.
+    if str_eq c "\\" && i + 1 < str_len s &&
+       (str_eq (char_at s (i + 1)) op || str_eq (char_at s (i + 1)) clo || str_eq (char_at s (i + 1)) "\\") then
+      scan_balanced2 s (i + 2) depth (acc ++ char_at s (i + 1)) op clo
+    // when open and close differ (brackets) nesting counts; otherwise the
+    // first delimiter closes.
+    else if str_eq c op && (if str_eq op clo then false else true) then
+      scan_balanced2 s (i + 1) (depth + 1) (acc ++ c) op clo
     else if str_eq c clo then
       (if depth == 1 then (acc, i + 1) else scan_balanced2 s (i + 1) (depth - 1) (acc ++ c) op clo)
     else scan_balanced2 s (i + 1) depth (acc ++ c) op clo
@@ -1519,11 +1544,16 @@ and parse_primary = fn toks ->
        | _ -> let (es, r2) = parse_puts_args r Nil in (ERaise es, r2))
     else if str_eq id "super" then
       // `super` forwards the current args; `super(...)` / `super()` are explicit.
-      (match r with
-       | Cons (TP p, r2) ->
-         if str_eq p "(" then let (argv, r3) = parse_call_args r2 in (ESuper (false, argv), r3)
-         else (ESuper (true, Nil), r)
-       | _ -> (ESuper (true, Nil), r))
+      let (zs, argv, r1) =
+        (match r with
+         | Cons (TP p, r2) ->
+           if str_eq p "(" then let (a, r3) = parse_call_args r2 in (false, a, r3)
+           else (true, Nil, r)
+         | _ -> (true, Nil, r)) in
+      // `super { ... }` / `super do ... end` passes an explicit block.
+      if starts_block r1 then
+        let (bp, bb, r4) = parse_block r1 in (ESuperB (zs, argv, bp, bb), r4)
+      else (ESuper (zs, argv), r1)
     else if str_eq id "not" then
       // `not(x)` / `not x` — negation; with parens the chain continues
       // on the negated value (not(true).should == ...).
@@ -2346,6 +2376,11 @@ and parse_stmt = fn toks ->
     if str_eq sc "::" && is_cap a && is_cap cn then
       (if str_eq eq "=" then
          let (e, r2) = parse_expr r in (SAssign (a ++ "::" ++ cn, e), r2)
+       else if not (str_eq (opassign_base eq) "") then
+         // `A::C op= e` -> `A::C = A::C op e` (a nil read when undefined).
+         let full = a ++ "::" ++ cn in
+         let (e, r2) = parse_expr r in
+         (SAssign (full, EBin (opassign_base eq, EConstOrNil full, e)), r2)
        else if str_eq eq "::" then
          (match scoped_const_path (a ++ "::" ++ cn) r with
           | (full, r2b) ->
@@ -2849,6 +2884,9 @@ and parse_def = fn toks ->
            (match r1 with
             | Cons (TP lp, Cons (TId _, Cons (TP rp, _))) ->
               if str_eq lp "(" && (str_eq rp ")" || str_eq rp ",") then (name ++ "=", r1) else (name, r)
+            // `def foobar=(*)` — a setter taking an anonymous splat.
+            | Cons (TP lp, Cons (TP st, _)) ->
+              if str_eq lp "(" && (str_eq st "*" || str_eq st "**") then (name ++ "=", r1) else (name, r)
             | _ -> (name, r))
          else (name, r)
        | _ -> (name, r)) in
@@ -3447,6 +3485,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ESym s -> VSym s
   | ESelf -> if map_has env "self" then map_get env "self" else VNil
   | EConst name -> if map_has consts name then map_get consts name else VClass name
+  | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
   | EIVar name ->
     let (meths, sup, ocls, ivars) = world in
     // a name still starting with @ is a class variable (@@x).
@@ -3555,6 +3594,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                else eval_args env world blk arges in
     let supercls = if map_has sup defcls then map_get sup defcls else "" in
     invoke world blk recv supercls meth args
+  | ESuperB (zsuper, arges, bp, bb) ->
+    let (meths, sup, ocls, ivars) = world in
+    let defcls = (match map_get env "__defcls" with VClass c -> c | _ -> "") in
+    let meth = (match map_get env "__meth" with VStr s -> s | _ -> "") in
+    let recv = if map_has env "self" then map_get env "self" else VMain in
+    let args = if zsuper then
+                 (if map_has env "__params" then
+                    (match map_get env "__params" with
+                     | VArr pid -> zsuper_args env (deref pid)
+                     | _ -> (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
+                  else (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
+               else eval_args env world blk arges in
+    let supercls = if map_has sup defcls then map_get sup defcls else "" in
+    invoke world (true, bp, bb, env) recv supercls meth args
   | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
   | EAssign (name, e) ->
     let v = eval_e env world blk e in
@@ -4668,6 +4721,8 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
     (match recv with VStr sp -> VRegex sp | _ -> fail "no __regex")
+  else if str_eq name "source" then
+    (match recv with VRegex p -> VStr p | _ -> fail "no source")
   else if str_eq name "casecmp?" then
     (match recv with
      | VStr a -> (match args with Cons (VStr b2, _) -> VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
