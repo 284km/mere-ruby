@@ -94,11 +94,31 @@ class NegativeMatcher
 end
 
 class Object
-  def should
-    PositiveMatcher.new(self)
+  def should(matcher = nil)
+    if matcher.nil?
+      PositiveMatcher.new(self)
+    else
+      if matcher.match?(self)
+        $mspec_pass += 1
+      else
+        $mspec_fail += 1
+        puts "FAILED: #{$mspec_it}: matcher did not match #{self.inspect}"
+      end
+      nil
+    end
   end
-  def should_not
-    NegativeMatcher.new(self)
+  def should_not(matcher = nil)
+    if matcher.nil?
+      NegativeMatcher.new(self)
+    else
+      if matcher.match?(self)
+        $mspec_fail += 1
+        puts "FAILED: #{$mspec_it}: matcher matched #{self.inspect}"
+      else
+        $mspec_pass += 1
+      end
+      nil
+    end
   end
 end
 
@@ -133,6 +153,75 @@ def platform_is(*args); end
 def platform_is_not(*args); end
 def suppress_warning
   yield
+end
+
+# Matcher objects for the `x.should be_nil` style.
+class BeMatcher
+  def initialize(kind); @kind = kind; end
+  def match?(actual)
+    case @kind
+    when :nil then actual.nil?
+    when :true then actual == true
+    when :false then actual == false
+    when :empty then actual.empty?
+    end
+  end
+end
+
+def be_nil; BeMatcher.new(:nil); end
+def be_true; BeMatcher.new(:true); end
+def be_false; BeMatcher.new(:false); end
+def be_empty; BeMatcher.new(:empty); end
+
+# A minimal mock: records should_receive expectations (parallel arrays —
+# the host may lack mutable hashes) and answers via method_missing.
+class MockExpectation
+  def initialize(sym); @sym = sym; @value = nil; end
+  def and_return(v); @value = v; self; end
+  def and_raise(*a); self; end
+  def with(*a); self; end
+  def twice; self; end
+  def once; self; end
+  def at_least(*a); self; end
+  def any_number_of_times; self; end
+  def exactly(*a); self; end
+  def times; self; end
+  def value; @value; end
+  def sym; @sym; end
+end
+
+class MockObject
+  def initialize(name)
+    @name = name
+    @syms = []
+    @exps = []
+  end
+  def should_receive(sym)
+    e = MockExpectation.new(sym)
+    @syms << sym
+    @exps << e
+    e
+  end
+  def should_not_receive(sym)
+    MockExpectation.new(sym)
+  end
+  def method_missing(sym, *args)
+    i = 0
+    while i < @syms.length
+      return @exps[i].value if @syms[i] == sym
+      i += 1
+    end
+    nil
+  end
+  def respond_to?(sym); true; end
+end
+
+def mock(name); MockObject.new(name); end
+def mock_int(n); n; end
+def flunk(msg = nil)
+  $mspec_fail += 1
+  puts "FAILED: #{$mspec_it}: flunked"
+  nil
 end
 
 def mspec_report
