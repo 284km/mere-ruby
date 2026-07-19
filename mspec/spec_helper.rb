@@ -140,7 +140,7 @@ class Object
   end
 end
 
-def describe(desc)
+def describe(desc, *opts)
   prev_b = $mspec_before
   prev_a = $mspec_after
   $mspec_desc = desc
@@ -149,7 +149,7 @@ def describe(desc)
   $mspec_after = prev_a
 end
 
-def context(desc)
+def context(desc, *opts)
   prev_b = $mspec_before
   prev_a = $mspec_after
   $mspec_desc = desc
@@ -158,7 +158,7 @@ def context(desc)
   $mspec_after = prev_a
 end
 
-def it(desc)
+def it(desc, *opts)
   $mspec_it = desc
   begin
     $mspec_before.call if $mspec_before
