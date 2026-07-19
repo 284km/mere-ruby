@@ -41,6 +41,15 @@ class PositiveMatcher
     end
     nil
   end
+  def is_a?(klass)
+    if @actual.is_a?(klass)
+      $mspec_pass += 1
+    else
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected a #{klass}, got #{@actual.inspect}"
+    end
+    nil
+  end
   def !=(expected)
     if @actual != expected
       $mspec_pass += 1

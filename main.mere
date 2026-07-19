@@ -20,7 +20,7 @@
 
 // ---- values and syntax trees --------------------------------------------
 type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
-         | TSym of str | TP of str | TNL | TEOF;
+         | TSym of str | TP of str | TRegex of str | TNL | TEOF;
 
 // EHsh / VHsh hold interleaved [k1, v1, k2, v2, ...] lists (M0
 // simplification: literal order is preserved, which matches Ruby's
@@ -64,7 +64,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ELambda of str list * Stmt list
           // G2: a statement (if/unless/case/begin) used as an expression,
           // e.g. `if c ... end.should == x`.
-          | EStmt of Stmt;
+          | EStmt of Stmt
+          // G2: /pattern/ regex literal (minimal engine: ^ $ . \d +).
+          | ERegex of str;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -127,6 +129,7 @@ type Val = VInt of int | VFlt of float | VStr of str | VBool of bool
          | VRange of int * int * bool
          | VExc of str * str    // exception: class name, message
          | VProc of int         // a proc/lambda: a handle into proc_store
+         | VRegex of str        // /pattern/ (minimal matcher)
          | VMain;               // the top-level `self` (main), class Object
 
 // A user method: parameter names, defaults ((name, default-expr) for
@@ -365,6 +368,9 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // $global: keep the leading $ in the identifier text
       let j = scan_ident s (i + 1) in
       Cons (TId (substring s i j), lex_go s j)
+    else if str_eq c "$" && i + 1 < str_len s then
+      // special globals ($~ $1 $! $& ...) lex as identifiers (default nil).
+      Cons (TId (substring s i (i + 2)), lex_go s (i + 2))
     else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
       // :symbol — include a trailing ? or ! (e.g. :even?, :sort!), guarding !=.
       let j0 = scan_ident s (i + 1) in
@@ -381,12 +387,25 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let (segs, j) = lex_dstr s (i + 2) "" in
       tapp (Cons (TP "(", Cons (TStrL "", segs)))
            (Cons (TP ")", Cons (TP ".", Cons (TId "to_sym", lex_go s j))))
+    else if str_eq c "<" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "<"
+            && (str_eq (char_at s (i + 2)) "~" || str_eq (char_at s (i + 2)) "-")
+            && is_alpha (char_at s (i + 3)) then
+      // heredoc <<~ID / <<-ID: the body starts on the NEXT line and runs to
+      // the terminator line. The rest of the current line lexes first, then
+      // the body is spliced in as a string token.
+      let squiggly = str_eq (char_at s (i + 2)) "~" in
+      let idend = scan_ident s (i + 3) in
+      let hid = substring s (i + 3) idend in
+      let nl = find_nl s idend in
+      let (body, after) = heredoc_body s (nl + 1) hid squiggly in
+      let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
+      Cons (TStrL body, tapp linetoks (Cons (TNL, lex_go s after)))
     else if str_eq c "/" && regex_position s i then
       // a minimal regex literal: lexed as a plain string token (patterns
       // are parsed but matchers may ignore them). Heuristic: a / directly
       // after ( , = ~ ! | & or a newline starts a regex, not a division.
       let (lit, j) = scan_regex s (i + 1) "" in
-      Cons (TStrL lit, lex_go s j)
+      Cons (TRegex lit, lex_go s j)
     else if str_eq c "%" && percent_body s i >= 0 then
       // %(...) / %q(...) / %Q(...) raw strings; %w(...) a word array.
       let b = percent_body s i in
@@ -466,14 +485,75 @@ and pw_end = fn (t: str) -> fn (i: int) ->
 and pw_skip = fn (t: str) -> fn (j: int) ->
   if j < str_len t && (str_eq (char_at t j) " " || str_eq (char_at t j) "\n") then pw_skip t (j + 1) else j
 
+and find_nl = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i
+  else if str_eq (char_at s i) "\n" then i
+  else find_nl s (i + 1)
+
+// collect heredoc lines from `i` until the terminator line; returns
+// (body, index-after-terminator-line). squiggly strips the common indent.
+and heredoc_body = fn (s: str) -> fn (i: int) -> fn (hid: str) -> fn (squiggly: bool) ->
+  let (lines, after) = heredoc_lines s i hid Nil in
+  let body = if squiggly then hd_join (hd_strip lines (hd_min_indent lines 9999)) else hd_join lines in
+  (body, after)
+
+and heredoc_lines = fn (s: str) -> fn (i: int) -> fn (hid: str) -> fn (acc: str list) ->
+  if i >= str_len s then (rev_app_str acc Nil, i)
+  else
+    let nl = find_nl s i in
+    let line = substring s i nl in
+    if str_eq (hd_lstrip line) hid then (rev_app_str acc Nil, if nl < str_len s then nl + 1 else nl)
+    else heredoc_lines s (if nl < str_len s then nl + 1 else nl) hid (Cons (line, acc))
+
+and rev_app_str = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_app_str t (Cons (h, acc))
+
+and hd_lstrip = fn (line: str) ->
+  if str_len line > 0 && (str_eq (char_at line 0) " " || str_eq (char_at line 0) "\t")
+  then hd_lstrip (substring line 1 (str_len line)) else line
+
+and hd_indent_of = fn (line: str) -> fn (n: int) ->
+  if n < str_len line && str_eq (char_at line n) " " then hd_indent_of line (n + 1) else n
+
+and hd_min_indent = fn (lines: str list) -> fn (best: int) ->
+  match lines with
+  | Nil -> best
+  | Cons (l, r) ->
+    if str_eq (hd_lstrip l) "" then hd_min_indent r best
+    else let ind = hd_indent_of l 0 in hd_min_indent r (if ind < best then ind else best)
+
+and hd_strip = fn (lines: str list) -> fn (n: int) ->
+  match lines with
+  | Nil -> Nil
+  | Cons (l, r) ->
+    let l2 = if str_len l >= n then substring l n (str_len l) else "" in
+    Cons (l2, hd_strip r n)
+
+and hd_join = fn (lines: str list) ->
+  match lines with Nil -> "" | Cons (l, r) -> l ++ "\n" ++ hd_join r
+
 // is the / at i in a value position (a regex) rather than a division?
 and regex_position = fn (s: str) -> fn (i: int) ->
   let p = prev_nonspace s (i - 1) in
   if p < 0 then true
   else
     let c = char_at s p in
-    str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
-    str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n"
+    if str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
+       str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n" then true
+    else if is_alpha c then
+      // after a keyword (when /re/, match =~ style) it's a regex too.
+      let w = word_ending_at s p in
+      str_eq w "when" || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
+      str_eq w "then" || str_eq w "return" || str_eq w "if" || str_eq w "unless"
+    else false
+
+and word_ending_at = fn (s: str) -> fn (p: int) ->
+  let b = word_start s p in
+  substring s b (p + 1)
+
+and word_start = fn (s: str) -> fn (p: int) ->
+  if p > 0 && (is_alnum (char_at s (p - 1)) || str_eq (char_at s (p - 1)) "_")
+  then word_start s (p - 1) else p
 
 and prev_nonspace = fn (s: str) -> fn (i: int) ->
   if i < 0 then 0 - 1
@@ -602,6 +682,17 @@ let rec parse_expr = fn toks ->
 and list_append_str = fn (xs: str list) -> fn (ys: str list) ->
   match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append_str t ys)
 
+// bare lambda params: `-> x, y { ... }` (up to the block opener).
+and lambda_bare_params = fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TId n, r) ->
+    (match r with
+     | Cons (TP c, r2) ->
+       if str_eq c "," then lambda_bare_params r2 (Cons (n, acc))
+       else (rev_app (Cons (n, acc)) Nil, r)
+     | _ -> (rev_app (Cons (n, acc)) Nil, r))
+  | _ -> (rev_app acc Nil, toks)
+
 // the inside of ( ... ): an and/or expression, optionally with a trailing
 // statement modifier — `(i += 1 until i > 9)` is a while-statement value.
 // A leading break/next/return statement (with its modifier) also works:
@@ -693,6 +784,12 @@ and parse_postfix = fn toks ->
 
 and parse_postfix_more = fn (recv: Expr) -> fn toks ->
   match toks with
+  // a newline followed by .method continues the chain (leading-dot style).
+  | Cons (TNL, _) ->
+    let t2 = skip_nls toks in
+    (match t2 with
+     | Cons (TP dot, _) -> if str_eq dot "." then parse_postfix_more recv t2 else (recv, toks)
+     | _ -> (recv, toks))
   | Cons (TP dot, r) ->
     if str_eq dot "." then
       (match r with
@@ -827,6 +924,7 @@ and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) ->
 and parse_primary = fn toks ->
   match toks with
   | Cons (TInt n, r) -> (EInt n, r)
+  | Cons (TRegex p, r) -> (ERegex p, r)
   | Cons (TFlt f, r) -> (EFlt f, r)
   | Cons (TStrL s, r) -> (EStrL s, r)
   | Cons (TSym s, r) -> (ESym s, r)
@@ -915,10 +1013,12 @@ and parse_primary = fn toks ->
       // leading ::Const — a top-level constant, read by bare name.
       (match r with Cons (TId n, r2) -> (EConst n, r2) | _ -> fail "mere-ruby: expected constant after ::")
     else if str_eq p "->" then
-      // -> (params) { body } / -> { body } lambda literal.
+      // -> (params) { body } / -> x { body } / -> { body } lambda literal.
       let (params, r1) =
         (match r with
          | Cons (TP lp, r2) -> if str_eq lp "(" then let (ps, ds, r3) = parse_params r2 Nil Nil in (ps, r3) else (Nil, r)
+         | Cons (TId n, r2) ->
+           if str_eq n "do" then (Nil, r) else lambda_bare_params r Nil
          | _ -> (Nil, r)) in
       let (bp, bb, r4) = parse_block r1 in
       let allp = list_append_str params bp in
@@ -2069,6 +2169,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // a statement in expression position: its value is the flow's value
     // (escapes other than raise are absorbed here).
     flow_value (exec_stmt env world blk s)
+  | ERegex p -> VRegex p
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -2894,7 +2995,7 @@ and class_name = fn (recv: Val) ->
   | VBool b -> if b then "TrueClass" else "FalseClass"
   | VNil -> "NilClass" | VArr _ -> "Array" | VHsh _ -> "Hash" | VSym _ -> "Symbol"
   | VRange _ -> "Range" | VClass _ -> "Class" | VObj _ -> "Object"
-  | VExc (c, _) -> c | VProc _ -> "Proc" | VMain -> "Object"
+  | VExc (c, _) -> c | VProc _ -> "Proc" | VRegex _ -> "Regexp" | VMain -> "Object"
 
 and range_to_a = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (VInt i, range_to_a (i + 1) last)
@@ -3524,12 +3625,54 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
 // is-a, anything else tests ==.
 and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
   match cand with
+  | VRegex p -> (match v with VStr sv -> rx_match p sv | _ -> false)
   | VRange (lo, hi, excl) -> (match v with VInt n -> n >= lo && (if excl then n < hi else n <= hi) | _ -> false)
   | VClass c -> (match v with VObj id -> let (m, s, ocls, iv) = world in obj_is_a world (map_get ocls (str_of_int id)) c | _ -> obj_is_a world (class_name v) c)
   | _ -> rb_eq cand v
 
 and when_any_eq = fn (v: Val) -> fn (xs: Val list) ->
   match xs with Nil -> false | Cons (h, t) -> rb_eq h v || when_any_eq v t
+
+// a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
+// and + * on single elements. Backtracking, no groups.
+and rx_match = fn (pat: str) -> fn (s: str) ->
+  if str_len pat > 0 && str_eq (char_at pat 0) "^" then rx_here pat 1 s 0
+  else rx_scan pat s 0
+
+and rx_scan = fn (pat: str) -> fn (s: str) -> fn (i: int) ->
+  if rx_here pat 0 s i then true
+  else if i >= str_len s then false
+  else rx_scan pat s (i + 1)
+
+and rx_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
+  if p >= str_len pat then true
+  else if str_eq (char_at pat p) "$" && p + 1 >= str_len pat then i >= str_len s
+  else
+    let elen = (if str_eq (char_at pat p) "\\" && p + 1 < str_len pat then 2 else 1) in
+    let quant = (if p + elen < str_len pat then char_at pat (p + elen) else "") in
+    if str_eq quant "+" then
+      (if i < str_len s && rx_elem pat p (char_at s i)
+       then rx_many pat p elen s (i + 1) else false)
+    else if str_eq quant "*" then rx_many pat p elen s i
+    else
+      (if i < str_len s && rx_elem pat p (char_at s i)
+       then rx_here pat (p + elen) s (i + 1) else false)
+
+// zero-or-more of the element at p, then the rest (greedy with backtrack).
+and rx_many = fn (pat: str) -> fn (p: int) -> fn (elen: int) -> fn (s: str) -> fn (i: int) ->
+  if i < str_len s && rx_elem pat p (char_at s i) && rx_many pat p elen s (i + 1) then true
+  else rx_here pat (p + elen + 1) s i
+
+and rx_elem = fn (pat: str) -> fn (p: int) -> fn (c: str) ->
+  let pc = char_at pat p in
+  if str_eq pc "." then true
+  else if str_eq pc "\\" then
+    let e = char_at pat (p + 1) in
+    if str_eq e "d" then is_digit c
+    else if str_eq e "w" then is_alnum c || str_eq c "_"
+    else if str_eq e "s" then str_eq c " " || str_eq c "\t" || str_eq c "\n"
+    else str_eq c e
+  else str_eq pc c
 
 // subjectless case: the first when whose any condition is truthy wins.
 and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt list) ->
@@ -3572,6 +3715,11 @@ and puts_one = fn world -> fn (v: Val) ->
     if has_meth world cls "to_s" then
       (match invoke world noblk v cls "to_s" Nil with VStr s -> print s | other -> print (to_s other))
     else print ("#<" ++ cls ++ ">")
+  // a string already ending in a newline doesn't get another (Ruby puts).
+  | VStr s ->
+    if str_len s > 0 && str_eq (char_at s (str_len s - 1)) "\n"
+    then print (substring s 0 (str_len s - 1))
+    else print s
   | _ -> print (to_s v)
 
 and puts_each = fn world -> fn (xs: Val list) ->
