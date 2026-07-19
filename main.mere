@@ -974,6 +974,8 @@ and parse_stmt = fn toks ->
        | _ -> (SExpr ENil, r))
     else if str_eq id "private" || str_eq id "public" || str_eq id "protected" ||
             str_eq id "module_function" || str_eq id "extend" ||
+            str_eq id "private_class_method" || str_eq id "public_class_method" ||
+            str_eq id "private_constant" || str_eq id "using" ||
             str_eq id "require" || str_eq id "require_relative" then
       // visibility / mixin-into-singleton / require: accepted as no-ops.
       (match r with
@@ -1272,11 +1274,17 @@ and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list)
       parse_params_after "*__fwd" r acc defs
     else fail ("mere-ruby: expected parameter name, got " ++ p)
   | Cons (TId name, r) ->
-    // optional default: `name = expr`
+    // optional default `name = expr`; keyword param `name:` / `name: default`
+    // (stored as "name:" in the param list, bound from the trailing hash).
     (match r with
      | Cons (TP eq, r2) ->
        if str_eq eq "=" then
          let (e, r3) = parse_expr r2 in parse_params_after name r3 acc (Cons ((name, e), defs))
+       else if str_eq eq ":" then
+         (match r2 with
+          | Cons (TP q, _) -> if str_eq q "," || str_eq q ")" then parse_params_after (name ++ ":") r2 acc defs
+                              else let (e, r3) = parse_expr r2 in parse_params_after (name ++ ":") r3 acc (Cons ((name ++ ":", e), defs))
+          | _ -> let (e, r3) = parse_expr r2 in parse_params_after (name ++ ":") r3 acc (Cons ((name ++ ":", e), defs)))
        else parse_params_after name r acc defs
      | _ -> parse_params_after name r acc defs)
   | _ -> fail "mere-ruby: expected parameter name"
@@ -2494,11 +2502,39 @@ and strip_block_params = fn (params: str list) ->
   | Nil -> Nil
   | Cons (p, r) -> if is_block_param p then strip_block_params r else Cons (p, strip_block_params r)
 
-and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params0: str list) -> fn (defaults: (str * Expr) list) -> fn (args: Val list) ->
+// keyword params are stored as "name:"; they bind from the trailing hash arg.
+and is_kw_param = fn (p: str) -> str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":"
+
+and kw_params = fn (params: str list) ->
+  match params with Nil -> Nil | Cons (p, r) -> if is_kw_param p then Cons (p, kw_params r) else kw_params r
+
+and pos_params = fn (params: str list) ->
+  match params with Nil -> Nil | Cons (p, r) -> if is_kw_param p then pos_params r else Cons (p, pos_params r)
+
+and peel_trailing_hash = fn (args: Val list) ->
+  match rev_app args Nil with
+  | Cons (VHsh xs, rrest) -> (rev_app rrest Nil, xs)
+  | _ -> (args, (Nil : Val list))
+
+and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn (defaults: (str * Expr) list) -> fn (kwhash: Val list) ->
+  match kws with
+  | Nil -> ()
+  | Cons (p, rest) ->
+    let nm = substring p 0 (str_len p - 1) in
+    let v = if hash_haskey kwhash (VSym nm) then hash_get kwhash (VSym nm)
+            else if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
+    let _ = map_set frame nm v in bind_kw_params frame world blk rest defaults kwhash
+
+and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params0: str list) -> fn (defaults: (str * Expr) list) -> fn (args0: Val list) ->
   let bname = block_param_name params0 in
-  let params = strip_block_params params0 in
+  let params1 = strip_block_params params0 in
   let _ = if str_eq bname "" then ()
           else let (has, _, _, _) = blk in map_set frame bname (if has then VSym "&blk" else VNil) in
+  let kws = kw_params params1 in
+  let params = pos_params params1 in
+  // peel the trailing hash for keyword args (only when the method has some).
+  let (args, kwhash) = (match kws with Nil -> (args0, (Nil : Val list)) | _ -> peel_trailing_hash args0) in
+  let _ = bind_kw_params frame world blk kws defaults kwhash in
   if has_splat params then
     // *rest collects the middle; fixed params before/after bind positionally.
     let before = take_until_splat params in
