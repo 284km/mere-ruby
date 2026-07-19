@@ -97,7 +97,10 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SUndef of str list
           // 2t: visibility — `private` / `private :m, :n` (mode, names;
           // empty names = switch the mode for subsequent defs).
-          | SVis of str * str list;
+          | SVis of str * str list
+          // 2u: declare locals as nil if not yet bound — Ruby defines the
+          // targets of an assignment even when a guard skips executing it.
+          | SDeclare of str list;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -866,10 +869,10 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
   | Cons (TId id, r) ->
     if str_eq id "if" then
       let (c, r2) = parse_expr r in
-      (SIf (Cons ((c, Cons (s, Nil)), Nil), Nil), r2)
+      (SIf (Cons ((c, Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "unless" then
       let (c, r2) = parse_expr r in
-      (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), Nil), r2)
+      (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "while" then
       let (c, r2) = parse_expr r in
       // `begin ... end while cond` is do-while: run the body once, then loop.
@@ -883,6 +886,17 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
        | _ -> (SWhile (EUn ("!", c), Cons (s, Nil)), r2))
     else (s, toks)
   | _ -> (s, toks)
+
+// Ruby defines the local targets of an assignment at parse time, so a
+// modifier-guarded assignment that never runs still leaves nil locals.
+// The skipped branch declares them (only if not already bound).
+and decl_of = fn (s: Stmt) ->
+  match s with
+  | SAssign (n, _) ->
+    if str_len n > 0 && (str_eq (char_at n 0) "$" || is_upper_first n) then Nil
+    else Cons (SDeclare (Cons (n, Nil)), Nil)
+  | SMultiAssign (ts, _) -> Cons (SDeclare ts, Nil)
+  | _ -> Nil
 
 // a statement that begins `id ,` (a bare non-keyword identifier then a
 // comma) or `* id` is a multiple assignment target list.
@@ -2564,21 +2578,67 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   let (args, kwhash) = (match kws with Nil -> (args0, (Nil : Val list)) | _ -> peel_trailing_hash args0) in
   let _ = bind_kw_params frame world blk kws defaults kwhash in
   if has_splat params then
-    // *rest collects the middle; fixed params before/after bind positionally.
+    // *rest collects the middle. Ruby fills required params first (leading
+    // requireds, then post-splat requireds), then optionals left-to-right,
+    // then the splat takes what remains.
     let before = take_until_splat params in
     let after = after_splat params in
     let sname = splat_name params in
-    let nb = list_str_len before in
+    let pre = req_pre before defaults in
+    let opts = drop_req_pre before defaults in
+    let npre = list_str_len pre in
+    let nopt = list_str_len opts in
     let na = list_str_len after in
     let nv = vlen args in
-    let sc = nv - nb - na in
-    let sc = if sc < 0 then 0 else sc in
-    // fixed params before the splat may have defaults when args run short.
-    let _ = bind_defaulted frame world blk before defaults (vtake args nb) in
-    let _ = map_set frame sname (arr_new (vtake (vdrop args nb) sc)) in
-    let _ = bind_seq frame after (vdrop args (nb + sc)) in
+    let middle = nv - npre - na in
+    let middle = if middle < 0 then 0 else middle in
+    let kopt = if middle > nopt then nopt else middle in
+    let sc = middle - kopt in
+    let _ = bind_seq frame pre (vtake args npre) in
+    let _ = bind_defaulted frame world blk opts defaults (vtake (vdrop args npre) kopt) in
+    let _ = map_set frame sname (arr_new (vtake (vdrop args (npre + kopt)) sc)) in
+    let _ = bind_seq frame after (vdrop args (npre + kopt + sc)) in
     ()
-  else bind_defaulted frame world blk params defaults args
+  else
+    // no splat: requireds may follow the optional run (a, o=1, p1, p2) —
+    // requireds bind first, optionals share what's left.
+    let pre = req_pre params defaults in
+    let rest1 = drop_req_pre params defaults in
+    let opts = opt_run rest1 defaults in
+    let post = drop_opt_run rest1 defaults in
+    let npre = list_str_len pre in
+    let nopt = list_str_len opts in
+    let npost = list_str_len post in
+    let nv = vlen args in
+    let kopt0 = nv - npre - npost in
+    let kopt0 = if kopt0 < 0 then 0 else kopt0 in
+    let kopt = if kopt0 > nopt then nopt else kopt0 in
+    let _ = bind_seq frame pre (vtake args npre) in
+    let _ = bind_defaulted frame world blk opts defaults (vtake (vdrop args npre) kopt) in
+    let _ = bind_seq frame post (vdrop args (npre + kopt)) in
+    ()
+
+// split params around the optional (defaulted) run: leading requireds,
+// then the optional run, then trailing requireds.
+and req_pre = fn (params: str list) -> fn (defaults: (str * Expr) list) ->
+  match params with
+  | Nil -> Nil
+  | Cons (p, r) -> if has_default defaults p then Nil else Cons (p, req_pre r defaults)
+
+and drop_req_pre = fn (params: str list) -> fn (defaults: (str * Expr) list) ->
+  match params with
+  | Nil -> Nil
+  | Cons (p, r) -> if has_default defaults p then params else drop_req_pre r defaults
+
+and opt_run = fn (params: str list) -> fn (defaults: (str * Expr) list) ->
+  match params with
+  | Nil -> Nil
+  | Cons (p, r) -> if has_default defaults p then Cons (p, opt_run r defaults) else Nil
+
+and drop_opt_run = fn (params: str list) -> fn (defaults: (str * Expr) list) ->
+  match params with
+  | Nil -> Nil
+  | Cons (p, r) -> if has_default defaults p then drop_opt_run r defaults else params
 
 // positional binding with defaults: a param with no arg takes its default
 // expression (evaluated in the frame), else nil.
@@ -2679,6 +2739,17 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          else ()
        | _ -> ()) in
     register_class_v world cls rest vis2
+
+// bind each plain-local target to nil unless already bound ("*name" strips
+// the splat prefix; @ivars, $globals and constants are skipped).
+and declare_nils = fn env -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n0, rest) ->
+    let n = if str_len n0 > 0 && str_eq (char_at n0 0) "*" then substring n0 1 (str_len n0) else n0 in
+    let skip = str_len n == 0 || str_eq (char_at n 0) "@" || str_eq (char_at n 0) "$" || is_upper_first n in
+    let _ = if skip then () else if map_has env n then () else map_set env n VNil in
+    declare_nils env rest
 
 // mark (private=true) or unmark each `cls#name` in the privates table.
 and mark_vis = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (priv: bool) ->
@@ -2788,6 +2859,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = undef_top meths names in FNext VNil
   | SVis (_, _) -> FNext VNil   // top-level visibility: no-op
+  | SDeclare names ->
+    let _ = declare_nils env names in FNext VNil
   | SReturn e -> FReturn (eval_e env world blk e)
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
