@@ -79,6 +79,7 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | EFlow of str * Expr
           // G3: safe navigation a&.b(args) — nil receiver yields nil.
           | ESafe of Expr * str * Expr list
+          | ESafeB of Expr * str * Expr list * str list * Stmt list  // a&.m { blk }
           // G3: **hash argument at a call site.
           | EKwSplat of Expr;
 
@@ -1071,9 +1072,10 @@ and paren_expr_body = fn toks ->
        | EAssign (anm, v0) ->
          let (more, r3) = parse_rhs_list (skip_nls r2b) Nil in
          (EAssign (anm, EArr (Cons (v0, more))), expect (skip_nls r3) ")")
-       // `(a[1, 2] = 4, 5)` — the last []= argument grows into an array.
+       // `(a[1, 2] = 4, 5)` / `(o.foo = 1, 2)` — the last setter argument
+       // grows into an array of the comma values.
        | EMethod (recv, mn, margs) ->
-         if str_eq mn "[]=" then
+         if str_eq mn "[]=" || (str_len mn > 0 && str_eq (char_at mn (str_len mn - 1)) "=") then
            let (more, r3) = parse_rhs_list (skip_nls r2b) Nil in
            (EMethod (recv, mn, grow_last_arg margs more), expect (skip_nls r3) ")")
          else (e, expect r2 ")")
@@ -1268,10 +1270,16 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
           | Cons (TP p2, r3) ->
             if str_eq p2 "(" then
               let (argv, r4) = parse_call_args r3 in
-              parse_postfix_more (ESafe (recv, name, argv)) r4
+              if starts_block r4 then
+                let (bp, bb, r5) = parse_block r4 in
+                parse_postfix_more (ESafeB (recv, name, argv, bp, bb)) r5
+              else parse_postfix_more (ESafe (recv, name, argv)) r4
             else if str_eq p2 "=" then
               let (rhs, r4) = parse_expr r3 in
               (ESafe (recv, name ++ "=", Cons (rhs, Nil)), r4)
+            else if starts_block r2 then
+              let (bp, bb, r4) = parse_block r2 in
+              parse_postfix_more (ESafeB (recv, name, Nil, bp, bb)) r4
             else parse_postfix_more (ESafe (recv, name, Nil)) r2
           | _ -> parse_postfix_more (ESafe (recv, name, Nil)) r2)
        | _ -> fail "mere-ruby: expected method name after &.")
@@ -2041,13 +2049,13 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       let c = cond_ff c0 in
       (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "while" then
-      let (c, r2) = parse_expr r in
+      let (c, r2) = parse_andor r in
       // `begin ... end while cond` is do-while: run the body once, then loop.
       (match s with
        | SBegin (_, _, _, _) -> (SDoWhile (s, c), r2)
        | _ -> (SWhile (c, Cons (s, Nil)), r2))
     else if str_eq id "until" then
-      let (c, r2) = parse_expr r in
+      let (c, r2) = parse_andor r in
       (match s with
        | SBegin (_, _, _, _) -> (SDoWhile (s, EUn ("!", c)), r2)
        | _ -> (SWhile (EUn ("!", c), Cons (s, Nil)), r2))
@@ -3633,6 +3641,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EFlow (kind, e) ->
     let v = eval_e env world blk e in
     flow_throw kind v
+  | ESafeB (recv_e, name, arges, bp, bb) ->
+    let recv = eval_e env world blk recv_e in
+    (match recv with
+     | VNil -> VNil
+     | _ ->
+       let args = eval_args env world blk arges in
+       invoke_with_block env world blk recv name args (true, bp, bb, env))
   | ESafe (recv_e, name, arges) ->
     (match eval_e env world blk recv_e with
      | VNil -> VNil
@@ -4411,24 +4426,24 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "none?" then arr_none world encl theblk xs
     else if str_eq name "find_index" || str_eq name "index" then arr_find_index world encl theblk xs 0
     else if str_eq name "flat_map" || str_eq name "collect_concat" then iter_result (arr_map world encl theblk xs Nil) recv
-    else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Array")
+    else prim_method recv name args
   | VHsh xs ->
     if str_eq name "each" then iter_each_result (hash_each world encl theblk xs) recv
     else if str_eq name "select" then iter_result (hash_filter world encl theblk xs Nil) recv
-    else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Hash")
+    else prim_method recv name args
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
     if str_eq name "each" then iter_each_result (range_each world encl theblk lo last) recv
     else if str_eq name "map" then iter_result (range_map world encl theblk lo last Nil) recv
-    else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Range")
+    else prim_method recv name args
   | VInt n ->
     if str_eq name "times" then iter_each_result (range_each world encl theblk 0 (n - 1)) recv
     else if str_eq name "upto" then
       (match args with
        | Cons (VInt m, _) -> iter_each_result (range_each world encl theblk n m) recv
        | _ -> fail "mere-ruby: upto needs an integer")
-    else fail ("mere-ruby: undefined block method '" ++ name ++ "' on Integer")
-  | _ -> fail ("mere-ruby: undefined block method '" ++ name ++ "' for this value")
+    else prim_method recv name args
+  | _ -> prim_method recv name args
 
 // unwrap an iterator's Flow: break -> its value; else the iterator's
 // natural result (`dflt`, e.g. the receiver, or the value FNext carries).
