@@ -94,7 +94,10 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SAlias of str * str
           | SInclude of str
           // 2n: `undef name[, name]` removes method definitions.
-          | SUndef of str list;
+          | SUndef of str list
+          // 2t: visibility — `private` / `private :m, :n` (mode, names;
+          // empty names = switch the mode for subsequent defs).
+          | SVis of str * str list;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -153,6 +156,9 @@ let consts = map_new ();
 // modules mixed into a class via `include`: class name -> "M1|M2|..." of the
 // included module names (searched after the class's own methods + ancestors).
 let includes = map_new ();
+// private methods: "Cls#name" -> present. Checked only on explicit-receiver
+// dispatch (implicit-self calls and send bypass, as in Ruby).
+let privates = map_new ();
 let is_upper_first = fn (id: str) ->
   str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
 // iteration budget: a top-level counter ticked once per loop iteration so
@@ -973,8 +979,17 @@ and parse_stmt = fn toks ->
        | Cons (TId m, r2) -> let (_, r3) = maybe_more_names r2 in (SInclude m, r3)
        | _ -> (SExpr ENil, r))
     else if str_eq id "private" || str_eq id "public" || str_eq id "protected" ||
-            str_eq id "module_function" || str_eq id "extend" ||
-            str_eq id "private_class_method" || str_eq id "public_class_method" ||
+            str_eq id "private_class_method" then
+      // visibility: bare form switches the mode for subsequent defs; the
+      // named form (`private :m, :n`) marks those methods.
+      let mode = if str_eq id "public" then "public" else "private" in
+      (match r with
+       | Cons (TNL, _) -> ((if str_eq id "private_class_method" then SExpr ENil else SVis (mode, Nil)), r)
+       | Cons (TEOF, _) -> ((if str_eq id "private_class_method" then SExpr ENil else SVis (mode, Nil)), r)
+       | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis (mode, names), r2)
+       | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
+    else if str_eq id "module_function" || str_eq id "extend" ||
+            str_eq id "public_class_method" ||
             str_eq id "private_constant" || str_eq id "using" ||
             str_eq id "require" || str_eq id "require_relative" then
       // visibility / mixin-into-singleton / require: accepted as no-ops.
@@ -1712,7 +1727,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | EMethod (recv, name, _) ->
        let (meths, sup, ocls, ivars) = world in
        (match eval_e env world blk recv with
-        | VObj id -> if has_meth world (map_get ocls (str_of_int id)) name then VStr "method" else VNil
+        | VObj id ->
+          let cls = map_get ocls (str_of_int id) in
+          if has_meth world cls name && (if meth_private world cls name then false else true)
+          then VStr "method" else VNil
         | VClass c -> if str_eq name "new" || has_meth world c name then VStr "method" else VNil
         | _ -> VStr "method")
      | EYield _ -> let (has, _, _, _) = blk in if has then VStr "yield" else VNil
@@ -1780,15 +1798,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // send / __send__ dispatch a runtime method name; respond_to? probes it.
     if str_eq name "send" || str_eq name "__send__" || str_eq name "public_send" then
       (match args with
-       | Cons (VSym m, rest) -> invoke_val env world blk recv m rest
-       | Cons (VStr m, rest) -> invoke_val env world blk recv m rest
+       | Cons (VSym m, rest) -> invoke_val_c env world blk recv m rest false
+       | Cons (VStr m, rest) -> invoke_val_c env world blk recv m rest false
        | _ -> fail "mere-ruby: send expects a method name")
     else if str_eq name "respond_to?" then
       (match args with
        | Cons (VSym m, _) -> VBool (responds world recv m)
        | Cons (VStr m, _) -> VBool (responds world recv m)
        | _ -> VBool false)
-    else invoke_val env world blk recv name args
+    else invoke_val_c env world blk recv name args true
   | EMethodB (recv_e, name, arges, bp, bb) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
@@ -1804,7 +1822,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
        let cls = map_get ocls (str_of_int id) in
-       if has_meth world cls name then invoke world newblk recv cls name args
+       if has_meth world cls name then
+         (if meth_private world cls name
+          then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
+          else invoke world newblk recv cls name args)
        // Enumerable: synthesize block iterators from the user's `each`.
        else if has_meth world cls "each" && is_enum_method name then
          builtin_iter world blk newblk (enum_collect world recv cls) name args
@@ -2185,19 +2206,26 @@ and hash_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (a
 // all non-mutating. Indexing (`[]`) and the read-heavy Enumerable methods
 // live here; block-taking iterators live in builtin_iter.
 // dispatch method `name` on any receiver value (the core of `recv.name`,
-// also reused by send/__send__).
-and invoke_val = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+// also reused by send/__send__). `vischeck` enforces private on explicit-
+// receiver calls; send/__send__ pass false (they bypass visibility).
+and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   match recv with
   | VClass c ->
     if str_eq name "new" then new_obj world c args
     else if str_eq name "name" then VStr c
-    else if has_meth world c name then invoke world noblk recv c name args
+    else if has_meth world c name then
+      (if vischeck && meth_private world c name
+       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ c)
+       else invoke world noblk recv c name args)
     else prim_method recv name args
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int id) in
-    if has_meth world cls name then invoke world noblk recv cls name args
+    if has_meth world cls name then
+      (if vischeck && meth_private world cls name
+       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
+       else invoke world noblk recv cls name args)
     else if str_eq name "class" then VClass cls
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
@@ -2593,17 +2621,29 @@ and bind_seq = fn frame -> fn (params: str list) -> fn (args: Val list) ->
 
 // register a class body: instance methods and attr_* accessors.
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  register_class_v world cls body "public"
+
+// walk the class body tracking the current visibility mode (a bare
+// `private` marks every subsequent def private until `public`).
+and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (vis: str) ->
   let (meths, sup, ocls, ivars) = world in
   match body with
   | Nil -> ()
   | Cons (s, rest) ->
+    let vis2 = (match s with SVis (m, Nil) -> m | _ -> vis) in
     let _ =
       (match s with
+       // named form: mark (or unmark) those methods directly.
+       | SVis (m, names) ->
+         (match names with
+          | Nil -> ()
+          | _ -> mark_vis meths cls names (str_eq m "private"))
        | SDef (mname, params, defs, mbody) ->
          // a receiver-qualified name (def C.m -> "C#m") registers as-is;
          // a plain name registers under the enclosing class.
          let key = if str_contains mname "#" then mname else cls ++ "#" ++ mname in
-         let _ = map_set meths key (Meth (params, defs, mbody)) in ()
+         let _ = map_set meths key (Meth (params, defs, mbody)) in
+         if str_eq vis2 "private" then map_set privates key VNil else ()
        | SAttr (mode, syms) -> add_attrs world cls mode syms
        // a nested class / module registers under its qualified name so that
        // `Outer::Inner` resolves (and reports its full name).
@@ -2638,7 +2678,23 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
             | _ -> ())
          else ()
        | _ -> ()) in
-    register_class world cls rest
+    register_class_v world cls rest vis2
+
+// mark (private=true) or unmark each `cls#name` in the privates table.
+and mark_vis = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (priv: bool) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let key = cls ++ "#" ++ n in
+    let _ = if priv then map_set privates key VNil
+            else if map_has privates key then map_delete privates key else () in
+    mark_vis meths cls rest priv
+
+// is the method (as found from `cls`) private? Resolves the defining class
+// so a private method inherited by a subclass stays private.
+and meth_private = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (m, defcls) = lookup_meth_cls world cls name in
+  map_has privates (defcls ++ "#" ++ name)
 
 // remove each top-level method entry.
 and undef_top = fn meths -> fn (names: str list) ->
@@ -2731,6 +2787,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SUndef names ->
     let (meths, sup, ocls, ivars) = world in
     let _ = undef_top meths names in FNext VNil
+  | SVis (_, _) -> FNext VNil   // top-level visibility: no-op
   | SReturn e -> FReturn (eval_e env world blk e)
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
