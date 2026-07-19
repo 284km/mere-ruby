@@ -636,10 +636,22 @@ and utf8_of = fn (cp: int) ->
 
 // heredoc body as token(s): interpolated bodies route through the
 // double-quoted string lexer.
-and heredoc_tok = fn (body: str) ->
+and heredoc_tok = fn (body0: str) ->
+  let body = hd_line_cont body0 0 in
   if rx_has_interp body 0 then
     tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src body) 0))) (Cons (TP ")", Nil))
   else Cons (TStrL body, Nil)
+
+// backslash-newline in an interpolating heredoc is a line continuation
+// (dropped); an escaped backslash stays.
+and hd_line_cont = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then ""
+  else
+    let c = char_at s i in
+    if str_eq c "\\" && i + 1 < str_len s then
+      (if str_eq (char_at s (i + 1)) "\n" then hd_line_cont s (i + 2)
+       else c ++ char_at s (i + 1) ++ hd_line_cont s (i + 2))
+    else c ++ hd_line_cont s (i + 1)
 
 and find_nl = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i
@@ -718,11 +730,24 @@ and rx_escape_dq = fn (lit: str) -> fn (i: int) ->
   if i >= str_len lit then ""
   else
     let c = char_at lit i in
-    if str_eq c "\"" then "\\\"" ++ rx_escape_dq lit (i + 1)
+    // an interpolation is code: copy it verbatim (its own quotes/escapes
+    // must reach the code lexer untouched).
+    if str_eq c "#" && i + 1 < str_len lit && str_eq (char_at lit (i + 1)) "\{" then
+      let j = interp_close lit (i + 2) 1 in
+      substring lit i j ++ rx_escape_dq lit j
+    else if str_eq c "\"" then "\\\"" ++ rx_escape_dq lit (i + 1)
     else if str_eq c "\\" && i + 1 < str_len lit then
       // keep regex escapes as-is through the string lexer
       "\\\\" ++ char_at lit (i + 1) ++ rx_escape_dq lit (i + 2)
     else c ++ rx_escape_dq lit (i + 1)
+
+// index just past the `}` closing an interpolation (brace depth counting).
+and interp_close = fn (lit: str) -> fn (i: int) -> fn (depth: int) ->
+  if i >= str_len lit then i
+  else if str_eq (char_at lit i) "\{" then interp_close lit (i + 1) (depth + 1)
+  else if str_eq (char_at lit i) "}" then
+    (if depth == 1 then i + 1 else interp_close lit (i + 1) (depth - 1))
+  else interp_close lit (i + 1) depth
 
 // is the / at i in a value position (a regex) rather than a division?
 and regex_position = fn (s: str) -> fn (i: int) ->
@@ -2548,6 +2573,34 @@ let str_capitalize = fn (s: str) ->
 let rec str_chars_val = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Nil else Cons (VStr (char_at s i), str_chars_val s (i + 1));
 
+// the source file's magic comment ("# -*- encoding: us-ascii -*-",
+// "# coding: utf-8"): the upcased encoding name, or "" if none. Scans the
+// first line (the second when the first is a shebang) for "coding".
+let rec coding_name_at = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then ""
+  else
+    let c = char_at s i in
+    if (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || str_eq c "-" || str_eq c "_"
+    then char_at s i ++ coding_name_at s (i + 1)
+    else "";
+let rec scan_coding_line = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then ""
+  else if str_eq (char_at s i) "\n" then ""
+  else if i + 6 <= str_len s && str_eq (substring s i (i + 6)) "coding" then
+    // skip "coding", optional spaces, ":" or "=", spaces, then the name.
+    let rec skip = fn (j: int) ->
+      if j >= str_len s then j
+      else if str_eq (char_at s j) " " || str_eq (char_at s j) ":" || str_eq (char_at s j) "=" then skip (j + 1)
+      else j in
+    coding_name_at s (skip (i + 6))
+  else scan_coding_line s (i + 1);
+let rec line_end = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i else if str_eq (char_at s i) "\n" then i else line_end s (i + 1);
+let src_coding = fn (src: str) ->
+  let start = (if str_len src >= 2 && str_eq (substring src 0 2) "#!" then line_end src 0 + 1 else 0) in
+  if start < str_len src && str_eq (char_at src start) "#" then str_upcase (scan_coding_line src start)
+  else "";
+
 // index into a Val list (nil beyond the end); supports Ruby negative
 // indices (-1 = last).
 let rec val_nth = fn (xs: Val list) -> fn (i: int) ->
@@ -2631,6 +2684,10 @@ let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
       else if str_eq c "\"" then "\\\""
       else if str_eq c "\n" then "\\n"
       else if str_eq c "\t" then "\\t"
+      // a literal #{ / #$ / #@ would read as interpolation: escape the #.
+      else if str_eq c "#" && i + 1 < str_len s &&
+              (str_eq (char_at s (i + 1)) "\{" || str_eq (char_at s (i + 1)) "$" || str_eq (char_at s (i + 1)) "@")
+      then "\\#"
       else c in
     esc_str s (i + 1) (acc ++ piece);
 
@@ -3847,6 +3904,10 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "abs" then
     (match recv with VInt n -> VInt (if n < 0 then 0 - n else n) | VFlt f -> VFlt (if f < 0.0 then 0.0 - f else f) | _ -> fail "no abs")
   // String
+  else if str_eq name "encoding" then
+    (match recv with
+     | VStr _ -> (if map_has load_ctx "coding" then map_get load_ctx "coding" else VStr "UTF-8")
+     | _ -> fail "no encoding")
   else if str_eq name "upcase" then (match recv with VStr s -> VStr (str_upcase s) | _ -> fail "no upcase")
   else if str_eq name "downcase" then (match recv with VStr s -> VStr (str_downcase s) | _ -> fail "no downcase")
   else if str_eq name "capitalize" then (match recv with VStr s -> VStr (str_capitalize s) | _ -> fail "no capitalize")
@@ -4605,9 +4666,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          let _ = map_set fenv "self" VMain in
          let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else VStr ".") in
          let _ = map_set load_ctx "dir" (VStr (dirname_of full)) in
+         // the file's magic comment sets the script encoding while it runs.
+         let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else VStr "UTF-8") in
+         let cod = src_coding src in
+         let _ = if str_eq cod "" then () else map_set load_ctx "coding" (VStr cod) in
          let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
          let f = run_stmts fenv world noblk2 prog2 in
          let _ = map_set load_ctx "dir" saved in
+         let _ = map_set load_ctx "coding" savedc in
          (match f with
           | FRaise v -> FRaise v
           | _ -> FNext (VBool true))
@@ -5071,6 +5137,13 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set load_ctx "dir" (VStr (dirname_of path)) in
   let _ = map_set loaded_files path VNil in
   let src = read_file path in
+  let cod0 = src_coding src in
+  let _ = map_set load_ctx "coding" (VStr (if str_eq cod0 "" then "UTF-8" else cod0)) in
+  // Encoding constants compare by name (String#encoding returns the same).
+  let _ = map_set consts "Encoding::US_ASCII" (VStr "US-ASCII") in
+  let _ = map_set consts "Encoding::UTF_8" (VStr "UTF-8") in
+  let _ = map_set consts "Encoding::ASCII_8BIT" (VStr "ASCII-8BIT") in
+  let _ = map_set consts "Encoding::BINARY" (VStr "ASCII-8BIT") in
   let toks = lex_go src 0 in
   let (prog, rest) = parse_stmts toks Nil in
   let _ =
