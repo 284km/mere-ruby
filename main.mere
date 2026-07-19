@@ -519,6 +519,9 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
           // (x.foo [0]) from indexing (x.foo[0]).
           Cons (TP " [", lex_go s (i + 1))
         else if is_punct1 c then Cons (TP c, lex_go s (i + 1))
+        // backslash-newline continues the statement on the next line.
+        else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
+          lex_go s (i + 2)
         else fail ("mere-ruby: unexpected character: " ++ c)
 
 // scan a double-quoted string body from i, returning the token segments
@@ -1361,6 +1364,10 @@ and parse_primary = fn toks ->
     else if str_eq id "until" then let (s, r2) = parse_while r true in (EStmt s, r2)
     else if str_eq id "case" then let (s, r2) = parse_case r in (EStmt s, r2)
     else if str_eq id "begin" then let (s, r2) = parse_begin r in (EStmt s, r2)
+    // def/class in expression position (def evaluates to the method name
+    // as a symbol; class to its body's last value).
+    else if str_eq id "def" then let (s, r2) = parse_def r in (EStmt s, r2)
+    else if str_eq id "class" then let (s, r2) = parse_class r in (EStmt s, r2)
     else if is_keyword id then fail ("mere-ruby: unexpected keyword: " ++ id)
     else
       // `name(args)` / `name(args) { block }` / `name { block }` / bare name.
@@ -3692,9 +3699,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     let cls = map_get ocls (str_of_int id) in
     if has_meth world cls name then
       (if vischeck && meth_private world cls name
-       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
+       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
        else invoke world noblk recv cls name args)
-    else if str_eq name "class" then VClass cls
+    else if str_eq name "class" then VClass (display_cls world cls)
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
     else if is_prim_method name then prim_method recv name args
@@ -3704,7 +3711,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       if str_eq name "to_a" || str_eq name "entries" then coll else prim_method coll name args
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
     // an object has no such method — raise a catchable NoMethodError.
-    else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls)
+    else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls world cls)
   | VSym s ->
     if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
     then flow_value (run_block world noblk blk args)
@@ -3782,13 +3789,13 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then
          (if meth_private world cls name
-          then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
+          then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
           else invoke world newblk recv cls name args)
        // Enumerable: synthesize block iterators from the user's `each`.
        else if has_meth world cls "each" && is_enum_method name then
          builtin_iter world blk newblk (enum_collect world recv cls) name args
        else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
-       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls world cls)
      // `blk` (the enclosing method's block) is threaded so a yield inside
      // the iterated block reaches it (e.g. `@xs.each { |n| yield(n) }`).
      | _ ->
@@ -3810,7 +3817,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> VBool false)
   else if has_meth world cls name then
     (if vischeck && meth_private world cls name
-     then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ cls)
+     then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
      else invoke world noblk recv cls name args)
   else prim_method recv name args
 
@@ -4387,6 +4394,36 @@ and bind_seq = fn frame -> fn (params: str list) -> fn (args: Val list) ->
 // register a class body: declarations register, everything else EXECUTES
 // (a Ruby class body is code). Returns the escaping Flow (break/raise in
 // the body propagates out) or FNext when the walk completes.
+// the receiver part of a qualified method name ("C#m" -> "C").
+and recv_base = fn (nm: str) -> recv_base_go nm 0
+
+and recv_base_go = fn (nm: str) -> fn (i: int) ->
+  if i >= str_len nm then nm
+  else if str_eq (char_at nm i) "#" then substring nm 0 i
+  else recv_base_go nm (i + 1)
+
+// the object's singleton class name, creating it on first use. A singleton
+// class name is "(sng:<obj id>)" with the object's current class as its
+// superclass; class-name display walks past it (see display_cls).
+and singleton_cls_of = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  let cur = map_get ocls (str_of_int id) in
+  if is_sng_cls cur then cur
+  else
+    let sname = "(sng:" ++ str_of_int id ++ ")" in
+    let _ = map_set sup sname cur in
+    let _ = map_set ocls (str_of_int id) sname in
+    sname
+
+and is_sng_cls = fn (c: str) ->
+  str_len c >= 5 && str_eq (substring c 0 5) "(sng:"
+
+// the class an object reports (its first non-singleton ancestor).
+and display_cls = fn world -> fn (c: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if is_sng_cls c then (if map_has sup c then display_cls world (map_get sup c) else "Object")
+  else c
+
 // the bare method name from a possibly receiver-qualified one ("C#m" -> "m");
 // `def` evaluates to the method name as a symbol.
 and meth_base = fn (nm: str) ->
@@ -4616,7 +4653,22 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | _ -> run_case env world blk (eval_e env world blk subj) whens els)
   | SDef (name, params, defs, body) ->
     let (meths, sup, ocls, ivars) = world in
-    let _ = map_set meths name (Meth (params, defs, body)) in FNext VNil
+    // `def recv.m` where recv is a live local naming an object defines a
+    // singleton method: the object gets its own hidden class (superclass =
+    // its current class) and the method registers there.
+    let key =
+      (if str_contains name "#" then
+         let recv = recv_base name in
+         let m = meth_base name in
+         if map_has env recv then
+           (match map_get env recv with
+            | VObj id -> singleton_cls_of world id ++ "#" ++ m
+            | VClass c -> c ++ "#" ++ m
+            | _ -> name)
+         else name
+       else name) in
+    let _ = map_set meths key (Meth (params, defs, body)) in
+    FNext (VSym (meth_base name))
   | SClass (name, super, body) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = if str_eq super "" then () else map_set sup name super in
@@ -5117,7 +5169,7 @@ and puts_one = fn world -> fn (v: Val) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
     if has_meth world cls "to_s" then
       (match invoke world noblk v cls "to_s" Nil with VStr s -> print s | other -> print (to_s other))
-    else print ("#<" ++ cls ++ ">")
+    else print ("#<" ++ display_cls world cls ++ ">")
   // a string already ending in a newline doesn't get another (Ruby puts).
   | VStr s ->
     if str_len s > 0 && str_eq (char_at s (str_len s - 1)) "\n"
