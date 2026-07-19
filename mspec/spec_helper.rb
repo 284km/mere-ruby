@@ -7,6 +7,7 @@ $mspec_pass = 0
 $mspec_fail = 0
 $mspec_err = 0
 $mspec_desc = ""
+$mspec_it = ""
 
 class SpecFailure < StandardError; end
 
@@ -14,12 +15,29 @@ class PositiveMatcher
   def initialize(actual)
     @actual = actual
   end
+  # x.should.raise(Klass[, pattern]) — @actual is a proc; the pattern (a
+  # regex source string here) is accepted but not matched.
+  def raise(klass = nil, pattern = nil)
+    begin
+      @actual.call
+      $mspec_fail += 1
+      puts "FAILED: expected #{klass} to be raised"
+    rescue Exception => e
+      if klass.nil? || e.class.to_s == klass.to_s
+        $mspec_pass += 1
+      else
+        $mspec_fail += 1
+        puts "FAILED: raised #{e.class}, expected #{klass}"
+      end
+    end
+    nil
+  end
   def ==(expected)
     if @actual == expected
       $mspec_pass += 1
     else
       $mspec_fail += 1
-      puts "FAILED: expected #{expected.inspect}, got #{@actual.inspect}"
+      puts "FAILED: #{$mspec_it}: expected #{expected.inspect}, got #{@actual.inspect}"
     end
     nil
   end
@@ -69,6 +87,7 @@ def context(desc)
 end
 
 def it(desc)
+  $mspec_it = desc
   begin
     yield
   rescue SpecFailure

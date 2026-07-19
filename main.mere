@@ -59,7 +59,12 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // turned into a real block; other forms are best-effort).
           | EBlockPass of Expr
           // G2: assignment as an expression (`true && x = 1`, `f(x = 2)`).
-          | EAssign of str * Expr;
+          | EAssign of str * Expr
+          // G2: -> (params) { body } lambda literal.
+          | ELambda of str list * Stmt list
+          // G2: a statement (if/unless/case/begin) used as an expression,
+          // e.g. `if c ... end.should == x`.
+          | EStmt of Stmt;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -287,7 +292,7 @@ let rec lex_sq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 let is_punct2 = fn (p: str) ->
   str_eq p "**" || str_eq p "==" || str_eq p "!=" || str_eq p "<=" ||
   str_eq p ">=" || str_eq p "&&" || str_eq p "||" || str_eq p "=>" ||
-  str_eq p ".." || str_eq p "<<" || str_eq p "::" ||
+  str_eq p ".." || str_eq p "<<" || str_eq p "::" || str_eq p "->" ||
   str_eq p "+=" || str_eq p "-=" || str_eq p "*=" || str_eq p "/=" || str_eq p "%=";
 
 let is_punct1 = fn (c: str) ->
@@ -376,6 +381,12 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let (segs, j) = lex_dstr s (i + 2) "" in
       tapp (Cons (TP "(", Cons (TStrL "", segs)))
            (Cons (TP ")", Cons (TP ".", Cons (TId "to_sym", lex_go s j))))
+    else if str_eq c "/" && regex_position s i then
+      // a minimal regex literal: lexed as a plain string token (patterns
+      // are parsed but matchers may ignore them). Heuristic: a / directly
+      // after ( , = ~ ! | & or a newline starts a regex, not a division.
+      let (lit, j) = scan_regex s (i + 1) "" in
+      Cons (TStrL lit, lex_go s j)
     else if str_eq c "%" && percent_body s i >= 0 then
       // %(...) / %q(...) / %Q(...) raw strings; %w(...) a word array.
       let b = percent_body s i in
@@ -453,7 +464,33 @@ and pw_end = fn (t: str) -> fn (i: int) ->
   if i >= str_len t || str_eq (char_at t i) " " || str_eq (char_at t i) "\n" then i else pw_end t (i + 1)
 
 and pw_skip = fn (t: str) -> fn (j: int) ->
-  if j < str_len t && (str_eq (char_at t j) " " || str_eq (char_at t j) "\n") then pw_skip t (j + 1) else j;
+  if j < str_len t && (str_eq (char_at t j) " " || str_eq (char_at t j) "\n") then pw_skip t (j + 1) else j
+
+// is the / at i in a value position (a regex) rather than a division?
+and regex_position = fn (s: str) -> fn (i: int) ->
+  let p = prev_nonspace s (i - 1) in
+  if p < 0 then true
+  else
+    let c = char_at s p in
+    str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
+    str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n"
+
+and prev_nonspace = fn (s: str) -> fn (i: int) ->
+  if i < 0 then 0 - 1
+  else if str_eq (char_at s i) " " then prev_nonspace s (i - 1)
+  else i
+
+// scan the regex body to the closing unescaped /, skipping trailing flags.
+and scan_regex = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then fail "mere-ruby: unterminated regex"
+  else
+    let c = char_at s i in
+    if str_eq c "\\" && i + 1 < str_len s then scan_regex s (i + 2) (acc ++ c ++ char_at s (i + 1))
+    else if str_eq c "/" then (acc, skip_regex_flags s (i + 1))
+    else scan_regex s (i + 1) (acc ++ c)
+
+and skip_regex_flags = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && is_alpha (char_at s i) then skip_regex_flags s (i + 1) else i;
 
 // ---- parser (precedence climbing) ---------------------------------------
 let is_keyword = fn (id: str) ->
@@ -562,10 +599,41 @@ let rec parse_expr = fn toks ->
     else (cond, r)
   | _ -> (cond, r)
 
-// expr [and|or expr]* — the low-precedence word operators (paren context).
+and list_append_str = fn (xs: str list) -> fn (ys: str list) ->
+  match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append_str t ys)
+
+// the inside of ( ... ): an and/or expression, optionally with a trailing
+// statement modifier — `(i += 1 until i > 9)` is a while-statement value.
+// A leading break/next/return statement (with its modifier) also works:
+// `(break 123 until false)`.
+and paren_body = fn toks ->
+  match toks with
+  | Cons (TId w, _) ->
+    if str_eq w "break" || str_eq w "next" || str_eq w "return" then
+      let (s0, r0) = parse_stmt toks in
+      let (s1, r1) = apply_modifier s0 r0 in
+      (EStmt s1, expect r1 ")")
+    else paren_expr_body toks
+  | _ -> paren_expr_body toks
+
+and paren_expr_body = fn toks ->
+  let (e, r2) = parse_andor toks in
+  match r2 with
+  | Cons (TId w, _) ->
+    if str_eq w "while" || str_eq w "until" || str_eq w "if" || str_eq w "unless" || str_eq w "rescue" then
+      let (s2, r3) = apply_modifier (SExpr e) r2 in
+      (EStmt s2, expect r3 ")")
+    else (e, expect r2 ")")
+  | _ -> (e, expect r2 ")")
+
+// expr [and|or expr]* — the low-precedence word operators (paren context);
+// `not expr` negates at the same low precedence.
 and parse_andor = fn toks ->
-  let (e, r) = parse_expr toks in
-  parse_andor_more e r
+  match toks with
+  | Cons (TId w, r) ->
+    if str_eq w "not" then let (e, r2) = parse_expr r in parse_andor_more (EUn ("!", e)) r2
+    else let (e, r2) = parse_expr toks in parse_andor_more e r2
+  | _ -> let (e, r) = parse_expr toks in parse_andor_more e r
 
 and parse_andor_more = fn (lhs: Expr) -> fn toks ->
   match toks with
@@ -791,6 +859,14 @@ and parse_primary = fn toks ->
          if str_eq p "(" then let (argv, r3) = parse_call_args r2 in (ESuper (false, argv), r3)
          else (ESuper (true, Nil), r)
        | _ -> (ESuper (true, Nil), r))
+    else if str_eq id "not" then
+      // `not(x)` / `not x` — negation; with parens the chain continues
+      // on the negated value (not(true).should == ...).
+      (match r with
+       | Cons (TP lp, _) ->
+         if str_eq lp "(" then let (e, r2) = parse_primary r in (EUn ("!", e), r2)
+         else let (e, r2) = parse_expr r in (EUn ("!", e), r2)
+       | _ -> let (e, r2) = parse_expr r in (EUn ("!", e), r2))
     else if str_eq id "defined?" then
       // defined?(e) or defined? e — never evaluates e for its value.
       (match r with
@@ -806,6 +882,10 @@ and parse_primary = fn toks ->
          if str_eq p "=" then
            // assignment as an expression: `true && x = 1` binds rightmost.
            let (e, r3) = parse_expr r2 in (EAssign (id, e), r3)
+         else if not (str_eq (opassign_base p) "") then
+           // op-assign as an expression: `(i += 1) >= 5`.
+           let (e, r3) = parse_expr r2 in
+           (EAssign (id, EBin (opassign_base p, EVar id, e)), r3)
          else if str_eq p "(" then
            let (argv, r3) = parse_call_args r2 in
            let (argv2, hasbp, bp0, bb0) = extract_block_pass argv in
@@ -827,13 +907,22 @@ and parse_primary = fn toks ->
       (match r with
        | Cons (TP rp, r1) ->
          if str_eq rp ")" then (ENil, r1)
-         else let (e, r2) = parse_andor r in (e, expect r2 ")")
-       | _ -> let (e, r2) = parse_andor r in (e, expect r2 ")"))
+         else paren_body r
+       | _ -> paren_body r)
     else if str_eq p "[" then parse_array r
     else if str_eq p "\{" then parse_hash r
     else if str_eq p "::" then
       // leading ::Const — a top-level constant, read by bare name.
       (match r with Cons (TId n, r2) -> (EConst n, r2) | _ -> fail "mere-ruby: expected constant after ::")
+    else if str_eq p "->" then
+      // -> (params) { body } / -> { body } lambda literal.
+      let (params, r1) =
+        (match r with
+         | Cons (TP lp, r2) -> if str_eq lp "(" then let (ps, ds, r3) = parse_params r2 Nil Nil in (ps, r3) else (Nil, r)
+         | _ -> (Nil, r)) in
+      let (bp, bb, r4) = parse_block r1 in
+      let allp = list_append_str params bp in
+      (ELambda (allp, bb), r4)
     else fail ("mere-ruby: unexpected token: " ++ p)
   | _ -> fail "mere-ruby: unexpected end of input"
 
@@ -964,10 +1053,10 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
   match toks with
   | Cons (TId id, r) ->
     if str_eq id "if" then
-      let (c, r2) = parse_expr r in
+      let (c, r2) = parse_andor r in
       (SIf (Cons ((c, Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "unless" then
-      let (c, r2) = parse_expr r in
+      let (c, r2) = parse_andor r in
       (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "while" then
       let (c, r2) = parse_expr r in
@@ -984,14 +1073,29 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       // `expr rescue fallback` — a one-line begin/rescue.
       let (h, r2) = parse_stmt r in
       (SBegin (Cons (s, Nil), Cons ((Nil, "", Cons (h, Nil)), Nil), Nil, Nil), r2)
-    else if str_eq id "and" then
+    else if str_eq id "and" || str_eq id "or" then
       // lowest-precedence: `x = 1 and y = 2` runs the second statement
-      // only when the first one's value is truthy.
+      // only when the first one's value is truthy. After break/next/
+      // return the left side has no value — a SyntaxError in Ruby.
+      let _ = (match s with
+               | SBreak _ -> fail "mere-ruby: void value expression"
+               | SNext _ -> fail "mere-ruby: void value expression"
+               | SReturn _ -> fail "mere-ruby: void value expression"
+               | _ -> ()) in
       let (s2, r2) = parse_stmt r in
-      apply_modifier (SAndThen (s, s2)) r2
-    else if str_eq id "or" then
-      let (s2, r2) = parse_stmt r in
-      apply_modifier (SOrElse (s, s2)) r2
+      apply_modifier (if str_eq id "and" then SAndThen (s, s2) else SOrElse (s, s2)) r2
+    else (s, toks)
+  | _ -> (s, toks)
+
+// `if ... end.method` — a control construct used as an expression with a
+// trailing method chain (common in specs: `unless x ... end.should == y`).
+and stmt_postfix = fn (s: Stmt) -> fn toks ->
+  match toks with
+  | Cons (TP dot, _) ->
+    if str_eq dot "." then
+      let (e0, r1) = parse_postfix_more (EStmt s) toks in
+      let (e, r2) = parse_more e0 r1 1 in
+      (SExpr e, r2)
     else (s, toks)
   | _ -> (s, toks)
 
@@ -1091,16 +1195,16 @@ and parse_stmt_id = fn toks ->
        | Cons (TNL, _) -> (SPuts Nil, r)
        | Cons (TEOF, _) -> (SPuts Nil, r)
        | _ -> let (es, r2) = parse_puts_args r Nil in (SPuts es, r2))
-    else if str_eq id "if" then parse_if r false
-    else if str_eq id "unless" then parse_if r true
-    else if str_eq id "while" then parse_while r false
-    else if str_eq id "until" then parse_while r true
-    else if str_eq id "case" then parse_case r
+    else if str_eq id "if" then let (s, r2) = parse_if r false in stmt_postfix s r2
+    else if str_eq id "unless" then let (s, r2) = parse_if r true in stmt_postfix s r2
+    else if str_eq id "while" then let (s, r2) = parse_while r false in stmt_postfix s r2
+    else if str_eq id "until" then let (s, r2) = parse_while r true in stmt_postfix s r2
+    else if str_eq id "case" then let (s, r2) = parse_case r in stmt_postfix s r2
     else if str_eq id "for" then parse_for r
     else if str_eq id "def" then parse_def r
     else if str_eq id "class" then parse_class r
     else if str_eq id "module" then parse_class r   // modules parse like classes (methods/consts)
-    else if str_eq id "begin" then parse_begin r
+    else if str_eq id "begin" then let (s, r2) = parse_begin r in stmt_postfix s r2
     else if str_eq id "attr_accessor" then parse_attr "rw" r
     else if str_eq id "attr_reader" then parse_attr "r" r
     else if str_eq id "attr_writer" then parse_attr "w" r
@@ -1299,7 +1403,7 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
   | _ -> fail "mere-ruby: expected :symbol"
 
 and parse_if = fn toks -> fn (negate: bool) ->
-  let (cond0, r) = parse_expr toks in
+  let (cond0, r) = parse_andor toks in
   let cond = if negate then EUn ("!", cond0) else cond0 in
   let (body, r2) = parse_stmts (skip_then r) Nil in
   let (clauses, els, r3) = parse_if_tail r2 in
@@ -1339,7 +1443,7 @@ and parse_for = fn toks ->
   | _ -> fail "mere-ruby: expected a variable after for"
 
 and parse_while = fn toks -> fn (negate: bool) ->
-  let (cond0, r) = parse_expr toks in
+  let (cond0, r) = parse_andor toks in
   let cond = if negate then EUn ("!", cond0) else cond0 in
   let (body, r2) = parse_stmts (skip_then r) Nil in
   (SWhile (cond, body), expect_kw r2 "end")
@@ -1956,6 +2060,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             else if is_upper_first name then map_set consts name v
             else map_set env name v in
     v
+  | ELambda (ps, body) ->
+    let id = map_len proc_store in
+    let _ = map_set proc_store (str_of_int id) (true, ps, body, env) in
+    let _ = map_set lambda_ids (str_of_int id) VNil in
+    VProc id
+  | EStmt s ->
+    // a statement in expression position: its value is the flow's value
+    // (escapes other than raise are absorbed here).
+    flow_value (exec_stmt env world blk s)
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -1983,13 +2096,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    // eval "code" re-enters the interpreter in the CURRENT env.
+    // eval "code" re-enters the interpreter in the CURRENT env; a parse
+    // failure surfaces as a catchable SyntaxError.
     if str_eq name "eval" then
       (match args with
        | Cons (VStr code, _) ->
-         let toks = lex_go code 0 in
-         let (prog2, _) = parse_stmts toks Nil in
-         flow_value (run_stmts env world blk prog2)
+         let sentinel = Cons (SDeclare (Cons ("__syntax_error__", Nil)), Nil) in
+         let prog2 = try_or (fn (u: unit) ->
+           let toks = lex_go code 0 in
+           let (p2, _) = parse_stmts toks Nil in p2) sentinel in
+         (match prog2 with
+          | Cons (SDeclare (Cons (m, Nil)), Nil) ->
+            if str_eq m "__syntax_error__" then raise_exc world "SyntaxError" "syntax error"
+            else flow_value (run_stmts env world blk prog2)
+          | _ -> flow_value (run_stmts env world blk prog2))
        | _ -> fail "mere-ruby: eval expects a string")
     else if map_has meths name then call_method env world noblk name args
     else try_self_call env world name args
@@ -2241,10 +2361,68 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // param names and restore them after the block (for-loops keep their
   // variable via an explicit assignment to a hidden __for param).
   let saved = save_params cenv params Nil in
+  // names first assigned INSIDE the block are also block-local: collect
+  // the assignment targets not yet bound outside, delete them afterwards.
+  let created = fresh_targets cenv (deep_targets body) in
   let _ = bind_block_params cenv params argvals in
   let f = run_stmts cenv world encl body in
   let _ = restore_params cenv saved in
+  let _ = drop_created cenv created in
   f
+
+// deep scan for local-assignment targets (stops at def/class boundaries;
+// the hidden for-loop assignment is excluded so `for` keeps leaking).
+and deep_targets = fn (body: Stmt list) ->
+  match body with
+  | Nil -> Nil
+  | Cons (s, rest) -> list_append_str (stmt_targets s) (deep_targets rest)
+
+and stmt_targets = fn (s: Stmt) ->
+  match s with
+  | SAssign (n, e) ->
+    (match e with EVar h -> (if str_eq h "__for" then Nil else Cons (n, Nil)) | _ -> Cons (n, Nil))
+  | SLocalFrom (n, s2) -> Cons (n, stmt_targets s2)
+  | SMultiAssign (ts, _) -> ts
+  | SIf (clauses, els) -> list_append_str (clauses_targets clauses) (deep_targets els)
+  | SWhile (_, b) -> deep_targets b
+  | SCase (_, whens, els) -> list_append_str (whens_targets whens) (deep_targets els)
+  | SBegin (b, rescues, els, ens) ->
+    list_append_str (deep_targets b)
+      (list_append_str (rescues_targets rescues) (list_append_str (deep_targets els) (deep_targets ens)))
+  | SAndThen (a, b) -> list_append_str (stmt_targets a) (stmt_targets b)
+  | SOrElse (a, b) -> list_append_str (stmt_targets a) (stmt_targets b)
+  | _ -> Nil
+
+and clauses_targets = fn clauses ->
+  match clauses with
+  | Nil -> Nil
+  | Cons (cl, rest) -> let (c, b) = cl in list_append_str (deep_targets b) (clauses_targets rest)
+
+and whens_targets = fn whens ->
+  match whens with
+  | Nil -> Nil
+  | Cons (w, rest) -> let (vs, b) = w in list_append_str (deep_targets b) (whens_targets rest)
+
+and rescues_targets = fn rescues ->
+  match rescues with
+  | Nil -> Nil
+  | Cons (rc, rest) ->
+    let (cs, v, b) = rc in list_append_str (deep_targets b) (rescues_targets rest)
+
+and fresh_targets = fn cenv -> fn (names: str list) ->
+  match names with
+  | Nil -> Nil
+  | Cons (n, rest) ->
+    let skip = str_len n == 0 || str_eq (char_at n 0) "@" || str_eq (char_at n 0) "$" ||
+               str_eq (char_at n 0) "*" || is_upper_first n || map_has cenv n in
+    if skip then fresh_targets cenv rest else Cons (n, fresh_targets cenv rest)
+
+and drop_created = fn cenv -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let _ = if map_has cenv n then map_delete cenv n else () in
+    drop_created cenv rest
 
 and save_params = fn cenv -> fn (params: str list) -> fn acc ->
   match params with
@@ -3072,6 +3250,26 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
      | FNext _ -> register_class_v world cls rest vis2 cenv
      | esc -> esc)
 
+// shallow scan of a body for local-assignment targets (if-branch locals
+// must exist as nil even when the branch did not run).
+and body_targets = fn (body: Stmt list) ->
+  match body with
+  | Nil -> Nil
+  | Cons (s, rest) ->
+    (match s with
+     | SAssign (n, _) -> Cons (n, body_targets rest)
+     | SLocalFrom (n, _) -> Cons (n, body_targets rest)
+     | SMultiAssign (ts, _) -> list_append_str ts (body_targets rest)
+     | _ -> body_targets rest)
+
+and declare_clause_targets = fn env -> fn clauses ->
+  match clauses with
+  | Nil -> ()
+  | Cons (cl, rest) ->
+    let (c, b) = cl in
+    let _ = declare_nils env (body_targets b) in
+    declare_clause_targets env rest
+
 // bind each plain-local target to nil unless already bound ("*name" strips
 // the splat prefix; @ivars, $globals and constants are skipped).
 and declare_nils = fn env -> fn (names: str list) ->
@@ -3168,7 +3366,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (match map_get env "self" with
      | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ name) v in FNext v
      | _ -> fail "mere-ruby: @ivar assignment outside an object")
-  | SIf (clauses, els) -> run_if env world blk clauses els
+  | SIf (clauses, els) ->
+    // after the if, declare (as nil) any assignment targets in branches
+    // that did not run — Ruby defines locals at parse time.
+    let f = run_if env world blk clauses els in
+    let _ = declare_clause_targets env clauses in
+    let _ = declare_nils env (body_targets els) in
+    f
   | SWhile (cond, body) -> run_while env world blk cond body
   | SCase (subj, whens, els) ->
     (match subj with
@@ -3406,6 +3610,9 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "NoMethodError" "NameError" in
   let _ = map_set sup "StopIteration" "StandardError" in
   let _ = map_set sup "FrozenError" "RuntimeError" in
+  let _ = map_set sup "ScriptError" "Exception" in
+  let _ = map_set sup "SyntaxError" "ScriptError" in
+  let _ = map_set sup "LocalJumpError" "StandardError" in
   // built-in value classes, so reopened methods resolve up the real chain
   // (class Integer / class Object monkey-patching reaches every value).
   let _ = map_set sup "Integer" "Numeric" in
