@@ -381,13 +381,16 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // special globals ($~ $1 $! $& ...) lex as identifiers (default nil).
       Cons (TId (substring s i (i + 2)), lex_go s (i + 2))
     else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
-      // :symbol — include a trailing ? or ! (e.g. :even?, :sort!), guarding !=.
+      // :symbol — include a trailing ? ! or = (:even?, :sort!, :m=),
+      // guarding != == and the hash rocket =>.
       let j0 = scan_ident s (i + 1) in
       let j =
         if j0 < str_len s then
           let cj = char_at s j0 in
+          let nj = if j0 + 1 < str_len s then char_at s (j0 + 1) else "" in
           if str_eq cj "?" then j0 + 1
-          else if str_eq cj "!" && (j0 + 1 >= str_len s || (if str_eq (char_at s (j0 + 1)) "=" then false else true)) then j0 + 1
+          else if str_eq cj "!" && (if str_eq nj "=" then false else true) then j0 + 1
+          else if str_eq cj "=" && (if str_eq nj "=" || str_eq nj ">" || str_eq nj "~" then false else true) then j0 + 1
           else j0
         else j0 in
       Cons (TSym (substring s (i + 1) j), lex_go s j)
@@ -433,6 +436,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       else
         let two = if i + 2 <= str_len s then substring s i (i + 2) else "" in
         if is_punct2 two then Cons (TP two, lex_go s (i + 2))
+        else if str_eq c "[" && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t") then
+          // whitespace before [ distinguishes an argument array literal
+          // (x.foo [0]) from indexing (x.foo[0]).
+          Cons (TP " [", lex_go s (i + 1))
         else if is_punct1 c then Cons (TP c, lex_go s (i + 1))
         else fail ("mere-ruby: unexpected character: " ++ c)
 
@@ -731,9 +738,7 @@ and paren_body = fn toks ->
   match skip_nls toks with
   | Cons (TId w, _) ->
     if str_eq w "break" || str_eq w "next" || str_eq w "return" then
-      let (s0, r0) = parse_stmt (skip_nls toks) in
-      let (s1, r1) = apply_modifier s0 r0 in
-      (EStmt s1, expect r1 ")")
+      paren_seq (skip_nls toks) Nil
     // a statement keyword opens a statement sequence: (def f; end; 'f').
     else if str_eq w "def" || str_eq w "class" || str_eq w "module" ||
             str_eq w "begin" || str_eq w "while" || str_eq w "until" ||
@@ -860,6 +865,11 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
             else if str_eq p "=" then
               let (rhs, r4) = parse_expr r3 in
               (EMethod (recv, name ++ "=", Cons (rhs, Nil)), r4)
+            // attribute op-assign: recv.m ||= v -> recv.m= (recv.m || v).
+            else if not (str_eq (opassign_base p) "") then
+              let (rhs, r4) = parse_expr (skip_nls r3) in
+              let cur = EMethod (recv, name, Nil) in
+              (EMethod (recv, name ++ "=", Cons (EBin (opassign_base p, cur, rhs), Nil)), r4)
             else attach_block_method recv name Nil r2
           | _ -> attach_block_method recv name Nil r2)
        // `recv.(args)` is shorthand for `recv.call(args)`.
@@ -876,6 +886,12 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
          if str_eq eq "=" then
            let (rhs, r5) = parse_expr r4 in
            (EMethod (recv, "[]=", Cons (idx, Cons (rhs, Nil))), r5)
+         // recv[i] op= v desugars through a read-modify-write ([]= of
+         // [] op v); ||= and &&= use their short-circuit operators.
+         else if not (str_eq (opassign_base eq) "") then
+           let (rhs, r5) = parse_expr (skip_nls r4) in
+           let cur = EMethod (recv, "[]", Cons (idx, Nil)) in
+           (EMethod (recv, "[]=", Cons (idx, Cons (EBin (opassign_base eq, cur, rhs), Nil))), r5)
          else parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3
        | _ -> parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3)
     // scope resolution: Foo::Bar (nested constant, looked up by bare name)
@@ -906,11 +922,15 @@ and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr li
     let (bp, bb, r) = parse_block toks in
     // continue the chain: `arr.map { } .sum` etc.
     parse_postfix_more (EMethodB (recv, name, argv, bp, bb)) r
-  // paren-less argument on a dotted call: `x.should be_nil` / `a.push v`.
-  else if (match argv with Nil -> true | _ -> false) && starts_bare_arg toks then
+  // paren-less argument on a dotted call: `x.should be_nil` / `a.push v` /
+  // `ScratchPad.record []` (a space before [ means an array argument).
+  else if (match argv with Nil -> true | _ -> false) && (starts_bare_arg toks || starts_sp_bracket toks) then
     let (es, r2) = parse_puts_args toks Nil in
     parse_postfix_more (EMethod (recv, name, es)) r2
   else parse_postfix_more (EMethod (recv, name, argv)) toks
+
+and starts_sp_bracket = fn toks ->
+  match toks with Cons (TP lb, _) -> str_eq lb " [" | _ -> false
 
 // does a paren-less argument start here? (an identifier that isn't a
 // keyword/modifier, or a literal)
@@ -1116,7 +1136,7 @@ and parse_primary = fn toks ->
          if str_eq rp ")" then (ENil, r1)
          else paren_body r
        | _ -> paren_body r)
-    else if str_eq p "[" then parse_array r
+    else if str_eq p "[" || str_eq p " [" then parse_array r
     else if str_eq p "\{" then parse_hash r
     else if str_eq p "::" then
       // leading ::Const — a top-level constant, read by bare name.
@@ -1725,6 +1745,19 @@ and parse_def = fn toks ->
          if str_eq dot "." then
            (match r1 with
             | Cons (TId n2, r2) -> if str_eq name0 "self" then (n2, r2) else (name0 ++ "#" ++ n2, r2)
+            // def self.<< / def self.[] — an operator singleton method.
+            | Cons (TP op2, r2) ->
+              if str_eq op2 "[" then
+                (match r2 with
+                 | Cons (TP rb2, r3) ->
+                   if str_eq rb2 "]" then
+                     (match r3 with
+                      | Cons (TP eq2, r4) -> if str_eq eq2 "=" then ("[]=", r4) else ("[]", r3)
+                      | _ -> ("[]", r3))
+                   else (name0, r0)
+                 | _ -> (name0, r0))
+              else if is_op_method_name op2 then (op2, r2)
+              else (name0, r0)
             | _ -> (name0, r0))
          else (name0, r0)
        | _ -> (name0, r0)) in
@@ -2442,6 +2475,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if has_meth world ocl op then
          let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
          invoke world noblk va0 ocl op (Cons (eval_e env world blk b, Nil))
+       else eval_bin_prim env world blk op va0 b
+     // a class-level operator (def self.<<) dispatches too.
+     | VClass c ->
+       if has_meth world c op then
+         let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+         invoke world noblk va0 c op (Cons (eval_e env world blk b, Nil))
        else eval_bin_prim env world blk op va0 b
      | _ -> eval_bin_prim env world blk op va0 b)
 

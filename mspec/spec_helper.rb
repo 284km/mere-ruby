@@ -11,6 +11,14 @@ $mspec_it = ""
 
 class SpecFailure < StandardError; end
 
+# mspec's scratch storage helper.
+class ScratchPad
+  def self.record(x); $scratch = x; end
+  def self.<<(x); $scratch << x; end
+  def self.recorded; $scratch; end
+  def self.clear; $scratch = nil; end
+end
+
 class PositiveMatcher
   def initialize(actual)
     @actual = actual
