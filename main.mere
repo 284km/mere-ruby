@@ -797,7 +797,8 @@ and regex_position = fn (s: str) -> fn (i: int) ->
   else
     let c = char_at s p in
     if str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
-       str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n" || str_eq c ";" then true
+       str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n" || str_eq c ";" ||
+       str_eq c "<" || str_eq c "[" || str_eq c "\{" then true
     else if is_alpha c then
       // after a keyword (when /re/, match =~ style) it's a regex too.
       let w = word_ending_at s p in
@@ -949,6 +950,22 @@ and eapp = fn (xs: Expr list) -> fn (ys: Expr list) ->
   match xs with Nil -> ys | Cons (h, t) -> Cons (h, eapp t ys)
 
 // bare lambda params: `-> x, y { ... }` (up to the block opener).
+// if the LAST default expr is a call that captured a block, strip the
+// block off and hand it back (it was really the lambda's body).
+and last_default_block = fn (ds: (str * Expr) list) ->
+  match ds with
+  | Nil -> (false, (Nil : (str * Expr) list), (Nil : str list), (Nil : Stmt list))
+  | Cons ((n, d), Nil) ->
+    (match d with
+     | ECallB (cn, cargs, cbp, cbb) ->
+       (true, Cons ((n, ECall (cn, cargs)), Nil), cbp, cbb)
+     | EMethodB (crecv, cn, cargs, cbp, cbb) ->
+       (true, Cons ((n, EMethod (crecv, cn, cargs)), Nil), cbp, cbb)
+     | _ -> (false, Cons ((n, d), Nil), Nil, Nil))
+  | Cons (h, t) ->
+    (match last_default_block t with
+     | (ok, t2, sbp, sbb) -> (ok, Cons (h, t2), sbp, sbb))
+
 and psplat_any = fn (ps: str list) ->
   match ps with
   | Nil -> false
@@ -1259,8 +1276,15 @@ and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr li
   // `ScratchPad.record []` (a space before [ means an array argument).
   else if (match argv with Nil -> true | _ -> false) && (starts_bare_arg toks || starts_sp_bracket toks) then
     let (es, r2) = parse_puts_args toks Nil in
-    parse_postfix_more (EMethod (recv, name, es)) r2
+    // `obj.meth :arg do |x| ... end` — a do-block after bare args.
+    if starts_do_block r2 then
+      let (bp, bb, r3) = parse_block r2 in
+      parse_postfix_more (EMethodB (recv, name, es, bp, bb)) r3
+    else parse_postfix_more (EMethod (recv, name, es)) r2
   else parse_postfix_more (EMethod (recv, name, argv)) toks
+
+and starts_do_block = fn toks ->
+  match toks with Cons (TId d, _) -> str_eq d "do" | _ -> false
 
 and starts_sp_bracket = fn toks ->
   match toks with Cons (TP lb, _) -> str_eq lb " [" | _ -> false
@@ -1628,7 +1652,19 @@ and parse_primary = fn toks ->
            if str_eq n "do" then ((Nil : str list), (Nil : (str * Expr) list), r)
            else lambda_bare_params r Nil Nil
          | _ -> (Nil, Nil, r)) in
-      let (bp, bb, r4) = parse_block r1 in
+      // `-> a=a() { a }` — the default's call grabs the brace block; when no
+      // block opener follows, take that block back as the lambda body.
+      let (lds, r1, swallowed) =
+        (match starts_block r1 with
+         | true -> (lds, r1, (false, (Nil : str list), (Nil : Stmt list)))
+         | false ->
+           (match last_default_block lds with
+            | (true, lds2, sbp, sbb) -> (lds2, r1, (true, sbp, sbb))
+            | (false, _, _, _) -> (lds, r1, (false, Nil, Nil)))) in
+      let (bp, bb, r4) =
+        (match swallowed with
+         | (true, sbp, sbb) -> (sbp, sbb, r1)
+         | (false, _, _) -> parse_block r1) in
       let allp = list_append_str params bp in
       // optional params (defaults) relax the strict lambda arity check via
       // a hidden anonymous splat; kw defaults keep their own binding.
@@ -1747,7 +1783,12 @@ and parse_hash_items = fn toks -> fn (acc: Expr list) ->
 and hash_items_sep = fn r3 -> fn (acc: Expr list) ->
   match skip_nls r3 with
   | Cons (TP p, r4) ->
-    if str_eq p "," then parse_hash_items (skip_nls r4) acc
+    if str_eq p "," then
+      (match skip_nls r4 with
+       | Cons (TP rb, r5) ->
+         if str_eq rb "}" then (EHsh (rev_app acc Nil), r5)
+         else parse_hash_items (skip_nls r4) acc
+       | _ -> parse_hash_items (skip_nls r4) acc)
     else if str_eq p "}" then (EHsh (rev_app acc Nil), r4)
     else fail ("mere-ruby: expected , or } in hash, got " ++ p)
   | _ -> fail "mere-ruby: unterminated hash literal"
@@ -1807,7 +1848,15 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
   match toks with
   | Cons (TId name, Cons (TP colon, r0)) ->
     if str_eq colon ":" then
-      let (v, r1) = parse_expr r0 in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp)))
+      // `m(a:, b:)` — an omitted value reads the same-named variable.
+      (match r0 with
+       | Cons (TP nx, _) ->
+         if str_eq nx "," || str_eq nx ")" then
+           parse_call_sep r0 pos (Cons (EVar name, Cons (ESym name, hp)))
+         else
+           let (v, r1) = parse_expr r0 in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp)))
+       | _ ->
+         let (v, r1) = parse_expr r0 in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp))))
     else parse_call_pos_arg toks pos hp
   | Cons (TP star, r0) ->
     if str_eq star "*" then
@@ -3268,6 +3317,7 @@ and inspect = fn (v: Val) ->
   | VNil -> "nil"
   | VArr id -> "[" ++ join_inspect (deref id) "" ++ "]"
   | VHsh xs -> "\{" ++ join_pairs xs "" ++ "}"
+  | VRegex p -> "/" ++ p ++ "/"
   | VSym sy ->
     // a symbol that isn't a plain identifier / valid operator name inspects
     // quoted and escaped (:"foo bar", :"9", :"a\nb").
