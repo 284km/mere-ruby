@@ -68,7 +68,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           // G2: /pattern/ regex literal (minimal engine: ^ $ . \d +).
           | ERegex of str
           // G2: break/next/redo/return in EXPRESSION position (fail-unwind).
-          | EFlow of str * Expr;
+          | EFlow of str * Expr
+          // G3: safe navigation a&.b(args) — nil receiver yields nil.
+          | ESafe of Expr * str * Expr list;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -305,7 +307,7 @@ let is_punct2 = fn (p: str) ->
   str_eq p "**" || str_eq p "==" || str_eq p "!=" || str_eq p "<=" ||
   str_eq p ">=" || str_eq p "&&" || str_eq p "||" || str_eq p "=>" ||
   str_eq p ".." || str_eq p "<<" || str_eq p "::" || str_eq p "->" ||
-  str_eq p "=~" || str_eq p "!~" ||
+  str_eq p "=~" || str_eq p "!~" || str_eq p "&." ||
   str_eq p "+=" || str_eq p "-=" || str_eq p "*=" || str_eq p "/=" || str_eq p "%=";
 
 let is_punct1 = fn (c: str) ->
@@ -314,7 +316,7 @@ let is_punct1 = fn (c: str) ->
   str_eq c "(" || str_eq c ")" || str_eq c "[" || str_eq c "]" ||
   str_eq c "\{" || str_eq c "}" || str_eq c "," || str_eq c "=" ||
   str_eq c "." || str_eq c "|" || str_eq c "&" ||
-  str_eq c "?" || str_eq c ":";
+  str_eq c "?" || str_eq c ":" || str_eq c "~";
 
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
@@ -839,6 +841,8 @@ and parse_unary = fn toks ->
       let (e, r) = parse_unary rest in (EUn ("-", e), r)
     else if str_eq op "!" then
       let (e, r) = parse_unary rest in (EUn ("!", e), r)
+    else if str_eq op "~" then
+      let (e, r) = parse_unary rest in (EUn ("~", e), r)
     else parse_pow toks
   | _ -> parse_pow toks
 
@@ -907,6 +911,21 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
            (EMethod (recv, "[]=", Cons (idx, Cons (EBin (opassign_base eq, cur, rhs), Nil))), r5)
          else parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3
        | _ -> parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3)
+    // safe navigation: a&.b / a&.b(args) — nil receiver short-circuits.
+    else if str_eq dot "&." then
+      (match r with
+       | Cons (TId name, r2) ->
+         (match r2 with
+          | Cons (TP p2, r3) ->
+            if str_eq p2 "(" then
+              let (argv, r4) = parse_call_args r3 in
+              parse_postfix_more (ESafe (recv, name, argv)) r4
+            else if str_eq p2 "=" then
+              let (rhs, r4) = parse_expr r3 in
+              (ESafe (recv, name ++ "=", Cons (rhs, Nil)), r4)
+            else parse_postfix_more (ESafe (recv, name, Nil)) r2
+          | _ -> parse_postfix_more (ESafe (recv, name, Nil)) r2)
+       | _ -> fail "mere-ruby: expected method name after &.")
     // scope resolution: Foo::Bar (nested constant, looked up by bare name)
     // or Foo::meth(...) (module/class method call).
     else if str_eq dot "::" then
@@ -1401,6 +1420,18 @@ and parse_alias_name = fn toks ->
   match toks with
   | Cons (TId n, r) -> (n, r)
   | Cons (TSym n, r) -> (n, r)
+  | Cons (TP op, r) ->
+    if is_op_method_name op then (op, r)
+    else if str_eq op "[" then
+      (match r with
+       | Cons (TP rb2, r2) ->
+         if str_eq rb2 "]" then
+           (match r2 with
+            | Cons (TP eq2, r3) -> if str_eq eq2 "=" then ("[]=", r3) else ("[]", r2)
+            | _ -> ("[]", r2))
+         else fail "mere-ruby: expected a name in alias"
+       | _ -> fail "mere-ruby: expected a name in alias")
+    else fail "mere-ruby: expected a name in alias"
   | _ -> fail "mere-ruby: expected a name in alias"
 
 // consume optional `, Name, Name` after `include M` (ignored).
@@ -1698,20 +1729,59 @@ and parse_if_tail = fn toks ->
 // `for x in e [do] body end` — each over e with x as the block param.
 // The block shares the enclosing env, so (like Ruby's for) x leaks out.
 and parse_for = fn toks ->
+  let (vars, r2) = parse_for_vars toks Nil in
+  let (e, r3) = parse_expr r2 in
+  let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
+  let (body, r4) = parse_stmts r3b Nil in
+  (match vars with
+   | Cons (v, Nil) ->
+     // the hidden __for param keeps v assigned in the SHARED scope, so
+     // v survives the loop (block params themselves are block-local).
+     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (SAssign (v, EVar "__for"), body))), expect_kw r4 "end")
+   | _ ->
+     // multiple targets destructure via a multi-assign from __for.
+     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil),
+        Cons (SMultiAssign (vars, Cons (EVar "__for", Nil)), body))), expect_kw r4 "end"))
+
+// target list before `in`: a name, `name,`, `a, b`, `a, *`, `a, *rest`.
+and parse_for_vars = fn toks -> fn (acc: str list) ->
   match toks with
   | Cons (TId v, r) ->
-    (match r with
-     | Cons (TId kwin, r2) ->
-       if str_eq kwin "in" then
-         let (e, r3) = parse_expr r2 in
-         let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
-         let (body, r4) = parse_stmts r3b Nil in
-         // the hidden __for param keeps v assigned in the SHARED scope, so
-         // v survives the loop (block params themselves are block-local).
-         (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (SAssign (v, EVar "__for"), body))), expect_kw r4 "end")
-       else fail "mere-ruby: expected in after for"
-     | _ -> fail "mere-ruby: expected in after for")
+    if str_eq v "in" then (rev_app acc Nil, r)
+    else
+      (match r with
+       | Cons (TP c, r2) ->
+         if str_eq c "," then
+           // `for i, in` — a trailing comma destructures (i = first elem).
+           (match r2 with
+            | Cons (TId nx, r3) ->
+              if str_eq nx "in" then (rev_app (Cons ("*", Cons (v, acc))) Nil, r3)
+              else parse_for_vars r2 (Cons (v, acc))
+            | _ -> parse_for_vars r2 (Cons (v, acc)))
+         else fail "mere-ruby: expected in after for"
+       | Cons (TId kwin, r2) ->
+         if str_eq kwin "in" then (rev_app (Cons (v, acc)) Nil, r2)
+         else fail "mere-ruby: expected in after for"
+       | _ -> fail "mere-ruby: expected in after for")
+  | Cons (TP star, r) ->
+    if str_eq star "*" then
+      (match r with
+       | Cons (TId n, r2) ->
+         if str_eq n "in" then (rev_app (Cons ("*", acc)) Nil, r2)
+         else parse_for_vars2 ("*" ++ n) r2 acc
+       | _ -> fail "mere-ruby: expected in after for")
+    else fail "mere-ruby: expected a variable after for"
   | _ -> fail "mere-ruby: expected a variable after for"
+
+and parse_for_vars2 = fn (t: str) -> fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TP c, r) ->
+    if str_eq c "," then parse_for_vars r (Cons (t, acc))
+    else fail "mere-ruby: expected in after for"
+  | Cons (TId kwin, r) ->
+    if str_eq kwin "in" then (rev_app (Cons (t, acc)) Nil, r)
+    else fail "mere-ruby: expected in after for"
+  | _ -> fail "mere-ruby: expected in after for"
 
 and parse_while = fn toks -> fn (negate: bool) ->
   let (cond0, r) = parse_andor toks in
@@ -1869,6 +1939,11 @@ and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list)
       (match r with
        | Cons (TId name, r2) -> parse_params_after ("&" ++ name) r2 acc defs
        | _ -> parse_params_after "&" r acc defs)
+    else if str_eq p "**" then
+      // **kwargs collects the trailing keyword hash.
+      (match r with
+       | Cons (TId name, r2) -> parse_params_after ("**" ++ name) r2 acc defs
+       | _ -> parse_params_after "**" r acc defs)
     else if str_eq p "..." then
       // argument forwarding: `def m(...)` collects positional args in *__fwd.
       parse_params_after "*__fwd" r acc defs
@@ -1908,6 +1983,9 @@ and parse_bare_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) 
     else if str_eq p "&" then
       (match r with Cons (TId n, r2) -> parse_bare_after ("&" ++ n) r2 acc defs
                   | _ -> parse_bare_after "&" r acc defs)
+    else if str_eq p "**" then
+      (match r with Cons (TId n, r2) -> parse_bare_after ("**" ++ n) r2 acc defs
+                  | _ -> parse_bare_after "**" r acc defs)
     else if str_eq p "..." then parse_bare_after "*__fwd" r acc defs
     else fail ("mere-ruby: expected parameter name, got " ++ p)
   | Cons (TId name, r) ->
@@ -2393,6 +2471,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EFlow (kind, e) ->
     let v = eval_e env world blk e in
     flow_throw kind v
+  | ESafe (recv_e, name, arges) ->
+    (match eval_e env world blk recv_e with
+     | VNil -> VNil
+     | recv ->
+       let args = eval_args env world blk arges in
+       invoke_val_c env world blk recv name args true)
   | ERegex p -> VRegex p
   | EYield arges ->
     let args = eval_args env world blk arges in
@@ -2496,6 +2580,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EUn (op, a) ->
     if str_eq op "!" then
       (if truthy (eval_e env world blk a) then VBool false else VBool true)
+    else if str_eq op "~" then
+      (match eval_e env world blk a with
+       | VInt n -> VInt (0 - n - 1)   // bitwise not
+       | _ -> fail "mere-ruby: unary ~ on non-integer")
     else
       (match eval_e env world blk a with
        | VInt n -> VInt (0 - n)
@@ -3475,7 +3563,9 @@ and zsuper_args = fn env -> fn (ps: Val list) ->
      | _ -> zsuper_args env rest)
 
 // keyword params are stored as "name:"; they bind from the trailing hash arg.
-and is_kw_param = fn (p: str) -> str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":"
+and is_kw_param = fn (p: str) ->
+  (str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":") ||
+  (str_len p > 1 && str_eq (substring p 0 2) "**")
 
 and kw_params = fn (params: str list) ->
   match params with Nil -> Nil | Cons (p, r) -> if is_kw_param p then Cons (p, kw_params r) else kw_params r
@@ -3492,6 +3582,11 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
   match kws with
   | Nil -> ()
   | Cons (p, rest) ->
+    if str_len p > 1 && str_eq (substring p 0 2) "**" then
+      // **kwargs takes the whole keyword hash.
+      let _ = map_set frame (substring p 2 (str_len p)) (VHsh kwhash) in
+      bind_kw_params frame world blk rest defaults kwhash
+    else
     let nm = substring p 0 (str_len p - 1) in
     let v = if hash_haskey kwhash (VSym nm) then hash_get kwhash (VSym nm)
             else if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
