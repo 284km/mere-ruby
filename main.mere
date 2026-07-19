@@ -201,6 +201,9 @@ let flow_sig = map_new ();
 // flip-flop operator state: one on/off flag per lexical site. Sites are
 // numbered at parse time (map_len allocates), so each eval gets fresh ones.
 let ff_state = map_new ();
+// parser modes: "nobrace" suppresses brace-block attachment (lambda
+// parameter defaults — the { after them is the lambda body).
+let parser_flags = map_new ();
 // require bookkeeping: "dir" = the current file's directory (require_relative
 // resolves against it); loaded_files dedups double-loads.
 let load_ctx = map_new ();
@@ -982,11 +985,14 @@ and plain_defaults = fn (ds: (str * Expr) list) ->
 and lambda_bare_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
   | Cons (TId n, r) ->
-    // `-> a=default { ... }` — an optional bare parameter.
+    // `-> a=default { ... }` — an optional bare parameter. The default
+    // parses with brace-blocks off: the { belongs to the lambda body.
     (match r with
      | Cons (TP eq, r2) ->
        if str_eq eq "=" then
+         let _ = map_set parser_flags "nobrace" VNil in
          let (d, r3) = parse_bin r2 5 in
+         let _ = map_delete parser_flags "nobrace" in
          lambda_bare_after n r3 acc (Cons ((n, d), ds))
        else lambda_bare_after n r acc ds
      | _ -> lambda_bare_after n r acc ds)
@@ -1313,13 +1319,19 @@ and starts_bare_arg = fn toks ->
 // `{ |__bp| __bp.sym }`. Returns (args-without-bp, found?, bparams, bbody).
 and extract_block_pass = fn (argv: Expr list) ->
   match rev_app argv Nil with
-  | Cons (EBlockPass (ESym s), rrest) ->
-    (rev_app rrest Nil, true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil))
+  | Cons (EBlockPass be, rrest) ->
+    (match be with
+     | ESym s ->
+       (rev_app rrest Nil, true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil))
+     // general &expr (a proc): a wrapper block that calls it.
+     | _ ->
+       (rev_app rrest Nil, true, Cons ("*__ba", Nil),
+        Cons (SExpr (EMethod (be, "call", Cons (ESplat (EVar "__ba"), Nil))), Nil)))
   | _ -> (argv, false, (Nil : str list), (Nil : Stmt list))
 
 and starts_block = fn toks ->
   match toks with
-  | Cons (TP p, _) -> str_eq p "\{"
+  | Cons (TP p, _) -> str_eq p "\{" && (if map_has parser_flags "nobrace" then false else true)
   | Cons (TId d, _) -> str_eq d "do"
   | _ -> false
 
@@ -1868,8 +1880,13 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
       // `foo(...)` forwards the collected forwarding args.
       parse_call_sep r0 (Cons (ESplat (EVar "__fwd"), pos)) hp
     else if str_eq star "&" then
-      // block-pass `&:sym` / `&expr` — recorded as a trailing marker arg.
-      let (be, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EBlockPass be, pos)) hp
+      // block-pass `&:sym` / `&expr`; bare `&` forwards the anonymous block.
+      (match r0 with
+       | Cons (TP nx, _) ->
+         if str_eq nx ")" || str_eq nx "," then
+           parse_call_sep r0 (Cons (EBlockPass (EVar "__anonblk"), pos)) hp
+         else let (be, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EBlockPass be, pos)) hp
+       | _ -> let (be, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EBlockPass be, pos)) hp)
     else parse_call_pos_arg toks pos hp
   | _ -> parse_call_pos_arg toks pos hp
 
@@ -1922,6 +1939,20 @@ and parse_puts_args = fn toks -> fn (acc: Expr list) ->
     else parse_puts_args_pos toks acc
   | _ -> parse_puts_args_pos toks acc
 
+and parse_bare_rockets = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
+  match toks with
+  | Cons (TP c, r) ->
+    if str_eq c "," then
+      (match skip_nls r with
+       | Cons (TNL, _) -> (rev_app (Cons (EHsh (rev_app hp Nil), pos)) Nil, toks)
+       | rr ->
+         let (k, r2) = parse_expr rr in
+         let r3 = expect r2 "=>" in
+         let (v, r4) = parse_expr (skip_nls r3) in
+         parse_bare_rockets r4 pos (Cons (v, Cons (k, hp))))
+    else (rev_app (Cons (EHsh (rev_app hp Nil), pos)) Nil, toks)
+  | _ -> (rev_app (Cons (EHsh (rev_app hp Nil), pos)) Nil, toks)
+
 and parse_bare_kw_pairs = fn toks -> fn (kname: str) -> fn (acc: Expr list) ->
   let (v, r) = parse_expr toks in
   let acc2 = Cons (v, Cons (ESym kname, acc)) in
@@ -1941,6 +1972,10 @@ and parse_puts_args_pos = fn toks -> fn (acc: Expr list) ->
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then parse_puts_args (skip_nls r2) (Cons (e, acc))
+    // trailing `k => v` pairs collect into one Hash argument.
+    else if str_eq p "=>" then
+      let (v, r3) = parse_expr (skip_nls r2) in
+      parse_bare_rockets r3 acc (Cons (v, Cons (e, Nil)))
     else (rev_app (Cons (e, acc)) Nil, r)
   | _ -> (rev_app (Cons (e, acc)) Nil, r)
 
@@ -2866,10 +2901,11 @@ and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list)
        | Cons (TId name, r2) -> parse_params_after ("*" ++ name) r2 acc defs
        | _ -> parse_params_after "*" r acc defs)
     else if str_eq p "&" then
-      // &block capture: stored as "&name" in the param list.
+      // &block capture: stored as "&name"; a bare & (anonymous forwarding)
+      // gets a hidden name so `c(&)` can re-pass it.
       (match r with
        | Cons (TId name, r2) -> parse_params_after ("&" ++ name) r2 acc defs
-       | _ -> parse_params_after "&" r acc defs)
+       | _ -> parse_params_after "&__anonblk" r acc defs)
     else if str_eq p "**" then
       // **kwargs collects the trailing keyword hash.
       (match r with
