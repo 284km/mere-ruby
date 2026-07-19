@@ -951,6 +951,15 @@ and paren_expr_body = fn toks ->
   else
   let (e, r2) = parse_andor toks in
   match r2 with
+  // `(args = 1, 2, 3)` — an assignment's extra comma values build an array.
+  | Cons (TP c0, r2b) ->
+    if str_eq c0 "," then
+      (match e with
+       | EAssign (anm, v0) ->
+         let (more, r3) = parse_rhs_list (skip_nls r2b) Nil in
+         (EAssign (anm, EArr (Cons (v0, more))), expect (skip_nls r3) ")")
+       | _ -> (e, expect r2 ")"))
+    else (e, expect r2 ")")
   | Cons (TId w, _) ->
     if str_eq w "while" || str_eq w "until" || str_eq w "if" || str_eq w "unless" || str_eq w "rescue" then
       let (s2, r3) = apply_modifier (SExpr e) r2 in
@@ -1203,17 +1212,26 @@ and starts_block = fn toks ->
   | _ -> false
 
 // parse `{ |p,..| stmt }` (single statement) or `do |p,..| stmts end`.
+// a `|a=5|` default becomes a prologue statement: the bind sets missing
+// args to nil, so a nil param takes its default (explicit nil is rare).
+and defaults_prologue = fn (ds: (str * Expr) list) -> fn (body: Stmt list) ->
+  match ds with
+  | Nil -> body
+  | Cons ((n, d), rest) ->
+    Cons (SIf (Cons ((EMethod (EVar n, "nil?", Nil), Cons (SAssign (n, d), Nil)), Nil), Nil),
+          defaults_prologue rest body)
+
 and parse_block = fn toks ->
   match toks with
   | Cons (TP brace, r) ->
     if str_eq brace "\{" then
-      let (bp, r2) = parse_block_params r in
+      let (bp, ds, r2) = parse_block_params_d r in
       let (body, r3) = parse_brace_stmts r2 Nil in
-      (bp, body, r3)
+      (bp, defaults_prologue ds body, r3)
     else fail "mere-ruby: expected block"
   | Cons (TId d, r) ->
     if str_eq d "do" then
-      let (bp, r2) = parse_block_params r in
+      let (bp, ds0, r2) = parse_block_params_d r in
       let (body0, r3) = parse_stmts r2 Nil in
       // do-blocks accept trailing rescue/ensure (an implicit begin).
       let (body, r5) =
@@ -1226,7 +1244,7 @@ and parse_block = fn toks ->
              (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
            else (body0, r3)
          | _ -> (body0, r3)) in
-      (bp, body, expect_kw r5 "end")
+      (bp, defaults_prologue ds0 body, expect_kw r5 "end")
     else fail "mere-ruby: expected block"
   | _ -> fail "mere-ruby: expected block"
 
@@ -1244,28 +1262,46 @@ and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
     parse_brace_stmts r1 (Cons (s, acc))
 
 and parse_block_params = fn toks ->
+  let (bp, ds, r) = parse_block_params_d toks in
+  (bp, r)
+
+// like parse_block_params but also returns (name, default-expr) pairs for
+// optional params (`|a=5, b=4|`); parse_block turns them into a prologue.
+and parse_block_params_d = fn toks ->
   let t = skip_nls toks in
   match t with
   | Cons (TP bar, r) ->
-    if str_eq bar "|" then parse_pipe_params r Nil
-    else if str_eq bar "||" then (Nil, r)   // `{ || body }` — empty params
-    else (Nil, t)
-  | _ -> (Nil, t)
+    if str_eq bar "|" then parse_pipe_params r Nil Nil
+    else if str_eq bar "||" then ((Nil : str list), (Nil : (str * Expr) list), r)
+    else (Nil, Nil, t)
+  | _ -> (Nil, Nil, t)
 
-and parse_pipe_params = fn toks -> fn (acc: str list) ->
+and parse_pipe_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
   | Cons (TP bar, r) ->
-    if str_eq bar "|" then (rev_app acc Nil, r)
+    if str_eq bar "|" then (rev_app acc Nil, rev_app ds Nil, r)
     else if str_eq bar "*" then
-      (match r with Cons (TId n, r2) -> pipe_after ("*" ++ n) r2 acc | _ -> pipe_after "*" r acc)
+      (match r with Cons (TId n, r2) -> pipe_after ("*" ++ n) r2 acc ds | _ -> pipe_after "*" r acc ds)
+    else if str_eq bar "**" then
+      // `**kw` — keyword-splat: collects a trailing hash argument (or {}).
+      (match r with Cons (TId n, r2) -> pipe_after ("**" ++ n) r2 acc ds | _ -> pipe_after "**" r acc ds)
     else if str_eq bar "&" then
-      (match r with Cons (TId n, r2) -> pipe_after ("&" ++ n) r2 acc | _ -> pipe_after "&" r acc)
+      (match r with Cons (TId n, r2) -> pipe_after ("&" ++ n) r2 acc ds | _ -> pipe_after "&" r acc ds)
     else if str_eq bar "(" then
       // nested destructuring |(a, (b, c))| — encoded as a spec string.
       let (spec, r2) = pipe_group r "" in
-      pipe_after ("(" ++ spec ++ ")") r2 acc
+      pipe_after ("(" ++ spec ++ ")") r2 acc ds
     else fail "mere-ruby: bad block params"
-  | Cons (TId name, r) -> pipe_after name r acc
+  | Cons (TId name, r) ->
+    // `a=default` — an optional parameter.
+    (match r with
+     | Cons (TP eq, r2) ->
+       if str_eq eq "=" then
+         // parse above `|`'s precedence so the closing bar stays the closer
+         let (d, r3) = parse_bin r2 5 in
+         pipe_after name r3 acc (Cons ((name, d), ds))
+       else pipe_after name r acc ds
+     | _ -> pipe_after name r acc ds)
   | _ -> fail "mere-ruby: expected block parameter"
 
 // tokens of a nested destructure group (after the opening paren) encoded
@@ -1282,11 +1318,11 @@ and pipe_group = fn toks -> fn (acc: str) ->
   | Cons (TId n, r) -> pipe_group r (acc ++ n)
   | _ -> fail "mere-ruby: bad block params"
 
-and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) ->
+and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) list) ->
   match toks with
   | Cons (TP p, r) ->
-    if str_eq p "," then parse_pipe_params r (Cons (name, acc))
-    else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, r)
+    if str_eq p "," then parse_pipe_params r (Cons (name, acc)) ds
+    else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, rev_app ds Nil, r)
     else fail "mere-ruby: expected , or | in block params"
   | _ -> fail "mere-ruby: unterminated block params"
 
@@ -1556,7 +1592,13 @@ and parse_hash_items = fn toks -> fn (acc: Expr list) ->
   let r3 = skip_nls r3a in
   match r3 with
   | Cons (TP p, r4) ->
-    if str_eq p "," then parse_hash_items (skip_nls r4) (Cons (v, Cons (k, acc)))
+    if str_eq p "," then
+      // `{a: 1, b: 2,}` — a hanging comma before the closing brace.
+      (match skip_nls r4 with
+       | Cons (TP rb, r5) ->
+         if str_eq rb "}" then (EHsh (rev_app (Cons (v, Cons (k, acc))) Nil), r5)
+         else parse_hash_items (skip_nls r4) (Cons (v, Cons (k, acc)))
+       | _ -> parse_hash_items (skip_nls r4) (Cons (v, Cons (k, acc))))
     else if str_eq p "}" then (EHsh (rev_app (Cons (v, Cons (k, acc))) Nil), r4)
     else fail ("mere-ruby: expected , or } in hash, got " ++ p)
   | _ -> fail "mere-ruby: unterminated hash literal"
@@ -1630,6 +1672,19 @@ and parse_puts_args = fn toks -> fn (acc: Expr list) ->
     if str_eq colon ":" then
       let (hp, r) = parse_bare_kw_pairs r0 kname Nil in
       (rev_app (Cons (EHsh hp, acc)) Nil, r)
+    else parse_puts_args_pos toks acc
+  // splat / block-pass arguments in a paren-less call: `send :m=, *x, 1`.
+  | Cons (TP st, r0) ->
+    if str_eq st "*" then
+      let (inner, r1) = parse_expr r0 in
+      (match r1 with
+       | Cons (TP c2, r2) ->
+         if str_eq c2 "," then parse_puts_args (skip_nls r2) (Cons (ESplat inner, acc))
+         else (rev_app (Cons (ESplat inner, acc)) Nil, r1)
+       | _ -> (rev_app (Cons (ESplat inner, acc)) Nil, r1))
+    else if str_eq st "&" then
+      let (inner, r1) = parse_expr r0 in
+      (rev_app (Cons (EBlockPass inner, acc)) Nil, r1)
     else parse_puts_args_pos toks acc
   | _ -> parse_puts_args_pos toks acc
 
@@ -1973,6 +2028,13 @@ and sassign_rhs = fn (id: str) -> fn toks ->
       | _ -> (SAssign (id, single), r))
    | _ -> (SAssign (id, EArr es), r))
 
+// `break 1, 2` / `next a, b` — several values build an array.
+and flow_values = fn toks -> fn (mk: Expr -> Stmt) ->
+  let (es, r) = parse_rhs_list toks Nil in
+  (match es with
+   | Cons (e, Nil) -> (mk e, r)
+   | _ -> (mk (EArr es), r))
+
 and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
   let (e, r) =
     (match toks with
@@ -2062,6 +2124,13 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TNL, _) -> (SReturn ENil, r)
        | Cons (TEOF, _) -> (SReturn ENil, r)
+       | Cons (TP rp, _) ->
+         if str_eq rp "}" || str_eq rp ")" || str_eq rp ";" then (SReturn ENil, r)
+         else
+           let (es, r2) = parse_rhs_list r Nil in
+           (match es with
+            | Cons (e, Nil) -> (SReturn e, r2)
+            | _ -> (SReturn (EArr es), r2))
        | _ ->
          // `return a, b` returns an array of the values.
          let (es, r2) = parse_rhs_list r Nil in
@@ -2073,13 +2142,19 @@ and parse_stmt_id = fn toks ->
        | Cons (TNL, _) -> (SBreak ENil, r)
        | Cons (TEOF, _) -> (SBreak ENil, r)
        | Cons (TId k, _) -> if stops_value k then (SBreak ENil, r) else let (e, r2) = parse_expr r in (SBreak e, r2)
-       | _ -> let (e, r2) = parse_expr r in (SBreak e, r2))
+       | Cons (TP p, _) ->
+         if str_eq p "}" || str_eq p ")" || str_eq p ";" then (SBreak ENil, r)
+         else flow_values r (fn e -> SBreak e)
+       | _ -> flow_values r (fn e -> SBreak e))
     else if str_eq id "next" then
       (match r with
        | Cons (TNL, _) -> (SNext ENil, r)
        | Cons (TEOF, _) -> (SNext ENil, r)
        | Cons (TId k, _) -> if stops_value k then (SNext ENil, r) else let (e, r2) = parse_expr r in (SNext e, r2)
-       | _ -> let (e, r2) = parse_expr r in (SNext e, r2))
+       | Cons (TP p, _) ->
+         if str_eq p "}" || str_eq p ")" || str_eq p ";" then (SNext ENil, r)
+         else flow_values r (fn e -> SNext e)
+       | _ -> flow_values r (fn e -> SNext e))
     else if is_ivar id then
       // @name = expr / @name += expr, else an expression (@name read).
       let nm = substring id 1 (str_len id) in
@@ -3403,6 +3478,17 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
 
 and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
 
+// `**kw` params: the name after the double splat (or "").
+and is_dsplat = fn (p: str) -> str_len p >= 2 && str_eq (substring p 0 2) "**"
+and dsplat_name = fn (ps: str list) ->
+  match ps with
+  | Nil -> ""
+  | Cons (p, r) -> if is_dsplat p then substring p 2 (str_len p) else dsplat_name r
+and drop_dsplat = fn (ps: str list) ->
+  match ps with
+  | Nil -> Nil
+  | Cons (p, r) -> if is_dsplat p then drop_dsplat r else Cons (p, drop_dsplat r)
+
 and has_splat = fn (ts: str list) ->
   match ts with Nil -> false | Cons (t, r) -> if tgt_is_splat t then true else has_splat r
 
@@ -3713,6 +3799,18 @@ and bind_block_params = fn cenv -> fn (params0: str list) -> fn (argvals0: Val l
   // &blk params bind nil (blocks aren't re-passed through block params).
   let params = strip_block_params params0 in
   let _ = (let b = block_param_name params0 in if str_eq b "" then () else map_set cenv b VNil) in
+  // `**kw` — a keyword-splat: capture a trailing hash argument (or {}).
+  let dsname = dsplat_name params in
+  let params = drop_dsplat params in
+  let argvals0 =
+    (if str_eq dsname "" then argvals0
+     else
+       let n = vlen argvals0 in
+       if n > 0 then
+         (match vdrop argvals0 (n - 1) with
+          | Cons (VHsh hx, _) -> let _ = map_set cenv dsname (VHsh hx) in vtake argvals0 (n - 1)
+          | _ -> let _ = map_set cenv dsname (VHsh Nil) in argvals0)
+       else let _ = map_set cenv dsname (VHsh Nil) in argvals0) in
   // auto-splat: a block with 2+ params given a single array destructures it.
   let argvals =
     (match params with
@@ -4618,6 +4716,18 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
                      let _ = map_set proc_store (str_of_int pid) blk in
                      VProc pid)
                   else VNil) in
+  // `**kw` — a keyword-splat: capture a trailing hash argument (or {}).
+  let dsname = dsplat_name params1 in
+  let params1 = drop_dsplat params1 in
+  let args0 =
+    (if str_eq dsname "" then args0
+     else
+       let n = vlen args0 in
+       if n > 0 then
+         (match vdrop args0 (n - 1) with
+          | Cons (VHsh hx, _) -> let _ = map_set frame dsname (VHsh hx) in vtake args0 (n - 1)
+          | _ -> let _ = map_set frame dsname (VHsh Nil) in args0)
+       else let _ = map_set frame dsname (VHsh Nil) in args0) in
   let kws = kw_params params1 in
   let params = pos_params params1 in
   // peel the trailing hash for keyword args (only when the method has some).
