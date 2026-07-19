@@ -1818,18 +1818,43 @@ and parse_if_tail = fn toks ->
 // The block shares the enclosing env, so (like Ruby's for) x leaks out.
 and parse_for = fn toks ->
   let (vars, r2) = parse_for_vars toks Nil in
-  let (e, r3) = parse_expr r2 in
-  let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
-  let (body, r4) = parse_stmts r3b Nil in
+  let (e0, r3) = parse_expr r2 in
+  // `for i in x do ... end` — a bare-variable iterable grabs the do-block
+  // as its own; unwrap it back into the loop body.
+  let (e, body, r4) =
+    (match e0 with
+     | ECallB (nm, Nil, bps, bb) ->
+       (match bps with Nil -> (EVar nm, bb, r3) | _ -> (e0, Nil, r3))
+     | _ ->
+       let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
+       let (b, r4b) = parse_stmts r3b Nil in
+       (e0, b, expect_kw r4b "end")) in
   (match vars with
    | Cons (v, Nil) ->
      // the hidden __for param keeps v assigned in the SHARED scope, so
      // v survives the loop (block params themselves are block-local).
-     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (SAssign (v, EVar "__for"), body))), expect_kw r4 "end")
+     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (SAssign (v, EVar "__for"), body))), r4)
    | _ ->
-     // multiple targets destructure via a multi-assign from __for.
-     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil),
-        Cons (SMultiAssign (vars, Cons (EVar "__for", Nil)), body))), expect_kw r4 "end"))
+     // multiple targets: real (auto-splatting) block params __f0.., then a
+     // prologue assigns them into the SHARED scope names.
+     let (params, prologue) = for_multi_binding vars 0 in
+     (SExpr (EMethodB (e, "each", Nil, params, list_append_stmt prologue body)), r4))
+
+and list_append_stmt = fn (xs: Stmt list) -> fn (ys: Stmt list) ->
+  match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append_stmt t ys)
+
+// vars -> (block params, prologue stmts): v -> __fN + v = __fN;
+// *x -> *__fN + x = __fN; bare * -> anonymous *.
+and for_multi_binding = fn (vars: str list) -> fn (n: int) ->
+  match vars with
+  | Nil -> (Nil, Nil)
+  | Cons (v, rest) ->
+    let (ps, ss) = for_multi_binding rest (n + 1) in
+    if str_eq v "*" then (Cons ("*", ps), ss)
+    else if str_len v > 0 && str_eq (char_at v 0) "*" then
+      let nm = substring v 1 (str_len v) in
+      (Cons ("*__f" ++ str_of_int n, ps), Cons (SAssign (nm, EVar ("__f" ++ str_of_int n)), ss))
+    else (Cons ("__f" ++ str_of_int n, ps), Cons (SAssign (v, EVar ("__f" ++ str_of_int n)), ss))
 
 // target list before `in`: a name, `name,`, `a, b`, `a, *`, `a, *rest`.
 and parse_for_vars = fn toks -> fn (acc: str list) ->
@@ -2954,7 +2979,11 @@ and deep_targets = fn (body: Stmt list) ->
 and stmt_targets = fn (s: Stmt) ->
   match s with
   | SAssign (n, e) ->
-    (match e with EVar h -> (if str_eq h "__for" then Nil else Cons (n, Nil)) | _ -> Cons (n, Nil))
+    (match e with
+     | EVar h ->
+       // assignments from the hidden for-loop params leak by design.
+       if str_len h > 2 && str_eq (substring h 0 3) "__f" then Nil else Cons (n, Nil)
+     | _ -> Cons (n, Nil))
   | SLocalFrom (n, s2) -> Cons (n, stmt_targets s2)
   | SMultiAssign (ts, _) -> ts
   | SIf (clauses, els) -> list_append_str (clauses_targets clauses) (deep_targets els)
