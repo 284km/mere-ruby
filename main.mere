@@ -37,6 +37,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | EMethod of Expr * str * Expr list  // recv.name(args)
           // M4 blocks / iterators:
           | ERange of Expr * Expr * bool         // lo..hi (bool = exclusive)
+          // a range in condition position: the flip-flop operator. The int
+          // is the site id keying its hidden on/off state.
+          | EFlipFlop of int * Expr * Expr * bool
           | EYield of Expr list                  // yield(args)
           // a call/method with a trailing block { |bp| body }: block params
           // and block body come last.
@@ -189,6 +192,9 @@ let catch_depth = map_new ();
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
 let flow_sig = map_new ();
+// flip-flop operator state: one on/off flag per lexical site. Sites are
+// numbered at parse time (map_len allocates), so each eval gets fresh ones.
+let ff_state = map_new ();
 // require bookkeeping: "dir" = the current file's directory (require_relative
 // resolves against it); loaded_files dedups double-loads.
 let load_ctx = map_new ();
@@ -1590,10 +1596,12 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
   match toks with
   | Cons (TId id, r) ->
     if str_eq id "if" then
-      let (c, r2) = parse_andor r in
+      let (c0, r2) = parse_andor r in
+      let c = cond_ff c0 in
       (SIf (Cons ((c, Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "unless" then
-      let (c, r2) = parse_andor r in
+      let (c0, r2) = parse_andor r in
+      let c = cond_ff c0 in
       (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), decl_of s), r2)
     else if str_eq id "while" then
       let (c, r2) = parse_expr r in
@@ -1971,8 +1979,22 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
      | _ -> (rev_app (Cons (s, acc)) Nil, r))
   | _ -> fail "mere-ruby: expected :symbol"
 
+// a range in an if/unless condition is the flip-flop operator; allocate its
+// state site here (parse time), reaching through !/&&/|| combinations.
+and cond_ff = fn (e: Expr) ->
+  match e with
+  | ERange (a, b, excl) ->
+    let n = map_len ff_state in
+    let _ = map_set ff_state (str_of_int n) (VBool false) in
+    EFlipFlop (n, a, b, excl)
+  | EBin (op, l, r) ->
+    if str_eq op "&&" || str_eq op "||" then EBin (op, cond_ff l, cond_ff r) else e
+  | EUn (op, x) -> if str_eq op "!" then EUn (op, cond_ff x) else e
+  | _ -> e
+
 and parse_if = fn toks -> fn (negate: bool) ->
-  let (cond0, r) = parse_andor toks in
+  let (cond1, r) = parse_andor toks in
+  let cond0 = cond_ff cond1 in
   let cond = if negate then EUn ("!", cond0) else cond0 in
   let (body, r2) = parse_stmts (skip_then r) Nil in
   let (clauses, els, r3) = parse_if_tail r2 in
@@ -1986,7 +2008,8 @@ and parse_if_tail = fn toks ->
       let (b, r2) = parse_stmts r Nil in
       (Nil, b, expect_kw r2 "end")
     else if str_eq id "elsif" then
-      let (c, r2) = parse_expr r in
+      let (c0, r2) = parse_expr r in
+      let c = cond_ff c0 in
       let (b, r3) = parse_stmts (skip_then r2) Nil in
       let (clauses, els, r4) = parse_if_tail r3 in
       (Cons ((c, b), clauses), els, r4)
@@ -2730,6 +2753,27 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          if map_has ivars k then map_get ivars k else VNil
        | _ -> VNil)
     else VNil
+  // the flip-flop operator: off -> the left condition may switch it on;
+  // on -> the right condition may switch it off. `...` (exclusive) skips
+  // the right condition on the switching-on iteration; `..` checks it at
+  // once (a single-element range fires exactly one iteration).
+  | EFlipFlop (site, c1, c2, excl) ->
+    let key = str_of_int site in
+    let on = (match map_get ff_state key with VBool b -> b | _ -> false) in
+    if on then
+      let v2 = eval_e env world blk c2 in
+      let _ = if truthy v2 then map_set ff_state key (VBool false) else () in
+      VBool true
+    else
+      let v1 = eval_e env world blk c1 in
+      if truthy v1 then
+        let _ = map_set ff_state key (VBool true) in
+        let _ = (if excl then ()
+                 else
+                   let v2 = eval_e env world blk c2 in
+                   if truthy v2 then map_set ff_state key (VBool false) else ()) in
+        VBool true
+      else VBool false
   | ERange (loe, hie, excl) ->
     (match eval_e env world blk loe with
      | VInt lo ->
@@ -2867,9 +2911,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | Cons (SDeclare (Cons (m, Nil)), Nil) ->
             if str_eq m "__syntax_error__" then raise_exc world "SyntaxError" "syntax error"
             else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+            else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
             else eval_run env world blk prog2
           | _ ->
             if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+            else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
             else eval_run env world blk prog2)
        | _ -> fail "mere-ruby: eval expects a string")
     else if map_has meths name then call_method env world noblk name args
@@ -3897,6 +3943,13 @@ and val_list_len = fn (xs: Val list) ->
   match xs with Nil -> 0 | Cons (_, t) -> 1 + val_list_len t
 
 // a bare name that is neither a local nor a top-level method is an
+// an undefined name referenced bare could have been a variable (NameError);
+// one called with arguments is unambiguously a method (NoMethodError).
+and undef_call_exc = fn world -> fn (name: str) -> fn (args: Val list) ->
+  match args with
+  | Nil -> raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
+  | _ -> raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
+
 // implicit-self method call (a method calling a sibling method).
 and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
@@ -3906,20 +3959,20 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
      | VObj id ->
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
-       else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
-     | VMain -> raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
+       else undef_call_exc world name args
+     | VMain -> undef_call_exc world name args
      | VClass c ->
        // class-level self (class << self body / class methods).
        if str_eq name "new" then new_obj world c args
        else if has_meth world c name then invoke world noblk (VClass c) c name args
-       else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
+       else undef_call_exc world name args
      | other ->
        // primitive self (a reopened built-in class's method body): user
        // methods first, then the built-in prims (implicit-self upcase etc.).
        let cls = class_name other in
        if has_meth world cls name then invoke world noblk other cls name args
        else prim_method other name args)
-  else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
+  else undef_call_exc world name args
 
 // top-level method call: fresh frame, no self; blk is installed for yield.
 and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
@@ -4676,6 +4729,35 @@ and invalid_flow_in_defs = fn (body: Stmt list) ->
      | SDef (_, _, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
      | SClass (_, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
      | _ -> invalid_flow_in_defs rest)
+
+// `a = if ... end` where EVERY branch ends in `return` is Ruby's "void
+// value expression" SyntaxError (a value-less if cannot be assigned).
+and ends_in_return = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, Nil) -> (match st with SReturn _ -> true | _ -> false)
+  | Cons (_, rest) -> ends_in_return rest
+
+and all_branches_return = fn clauses ->
+  match clauses with
+  | Nil -> true
+  | Cons ((_, b), rest) -> ends_in_return b && all_branches_return rest
+
+and has_void_assign = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, rest) ->
+    (match st with
+     | SLocalFrom (_, s2) ->
+       (match s2 with
+        | SIf (clauses, els) ->
+          (match els with
+           | Nil -> has_void_assign rest
+           | _ -> (all_branches_return clauses && ends_in_return els) || has_void_assign rest)
+        | _ -> has_void_assign rest)
+     | SDef (_, _, _, b) -> has_void_assign b || has_void_assign rest
+     | SClass (_, _, b) -> has_void_assign b || has_void_assign rest
+     | _ -> has_void_assign rest)
 
 and direct_invalid_flow = fn (body: Stmt list) ->
   match body with
