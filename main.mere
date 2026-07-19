@@ -57,7 +57,9 @@ type Expr = EInt of int | EFlt of float | EStrL of str | EBool of bool
           | ESuper of bool * Expr list
           // 2m: `&expr` block-pass marker in an argument list (only &:sym is
           // turned into a real block; other forms are best-effort).
-          | EBlockPass of Expr;
+          | EBlockPass of Expr
+          // G2: assignment as an expression (`true && x = 1`, `f(x = 2)`).
+          | EAssign of str * Expr;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -100,7 +102,12 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SVis of str * str list
           // 2u: declare locals as nil if not yet bound — Ruby defines the
           // targets of an assignment even when a guard skips executing it.
-          | SDeclare of str list;
+          | SDeclare of str list
+          // G2: require / require_relative (bool = relative), path expr.
+          | SRequire of bool * Expr
+          // G2: low-precedence `stmt and stmt` / `stmt or stmt`.
+          | SAndThen of Stmt * Stmt
+          | SOrElse of Stmt * Stmt;
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -153,6 +160,18 @@ let arr_set = fn (id: int) -> fn (xs: Val list) ->
 let proc_store = map_new ();
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// require bookkeeping: "dir" = the current file's directory (require_relative
+// resolves against it); loaded_files dedups double-loads.
+let load_ctx = map_new ();
+let loaded_files = map_new ();
+let rec last_slash = fn (s: str) -> fn (i: int) -> fn (best: int) ->
+  if i >= str_len s then best
+  else last_slash s (i + 1) (if str_eq (char_at s i) "/" then i else best);
+let dirname_of = fn (p: str) ->
+  let ls = last_slash p 0 (0 - 1) in
+  if ls < 0 then "." else substring p 0 ls;
+let ends_with_rb = fn (p: str) ->
+  str_len p >= 3 && str_eq (substring p (str_len p - 3) (str_len p)) ".rb";
 // global variables ($name) live in another top-level captured Map.
 let globals = map_new ();
 // constants (Capitalized names) live in another; a class name that is not
@@ -543,6 +562,19 @@ let rec parse_expr = fn toks ->
     else (cond, r)
   | _ -> (cond, r)
 
+// expr [and|or expr]* — the low-precedence word operators (paren context).
+and parse_andor = fn toks ->
+  let (e, r) = parse_expr toks in
+  parse_andor_more e r
+
+and parse_andor_more = fn (lhs: Expr) -> fn toks ->
+  match toks with
+  | Cons (TId w, r) ->
+    if str_eq w "and" then let (rhs, r2) = parse_expr r in parse_andor_more (EBin ("&&", lhs, rhs)) r2
+    else if str_eq w "or" then let (rhs, r2) = parse_expr r in parse_andor_more (EBin ("||", lhs, rhs)) r2
+    else (lhs, toks)
+  | _ -> (lhs, toks)
+
 and parse_range = fn toks ->
   let (lo, r) = parse_bin toks 1 in
   match r with
@@ -771,7 +803,10 @@ and parse_primary = fn toks ->
       // `name(args)` / `name(args) { block }` / `name { block }` / bare name.
       (match r with
        | Cons (TP p, r2) ->
-         if str_eq p "(" then
+         if str_eq p "=" then
+           // assignment as an expression: `true && x = 1` binds rightmost.
+           let (e, r3) = parse_expr r2 in (EAssign (id, e), r3)
+         else if str_eq p "(" then
            let (argv, r3) = parse_call_args r2 in
            let (argv2, hasbp, bp0, bb0) = extract_block_pass argv in
            if hasbp then (ECallB (id, argv2, bp0, bb0), r3)
@@ -787,8 +822,13 @@ and parse_primary = fn toks ->
          else (EVar id, r))
   | Cons (TP p, r) ->
     if str_eq p "(" then
-      let (e, r2) = parse_expr r in
-      (e, expect r2 ")")
+      // () is nil; inside parens the word operators and/or (lowest
+      // precedence) are usable: (a and b).
+      (match r with
+       | Cons (TP rp, r1) ->
+         if str_eq rp ")" then (ENil, r1)
+         else let (e, r2) = parse_andor r in (e, expect r2 ")")
+       | _ -> let (e, r2) = parse_andor r in (e, expect r2 ")"))
     else if str_eq p "[" then parse_array r
     else if str_eq p "\{" then parse_hash r
     else if str_eq p "::" then
@@ -944,6 +984,14 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
       // `expr rescue fallback` — a one-line begin/rescue.
       let (h, r2) = parse_stmt r in
       (SBegin (Cons (s, Nil), Cons ((Nil, "", Cons (h, Nil)), Nil), Nil, Nil), r2)
+    else if str_eq id "and" then
+      // lowest-precedence: `x = 1 and y = 2` runs the second statement
+      // only when the first one's value is truthy.
+      let (s2, r2) = parse_stmt r in
+      apply_modifier (SAndThen (s, s2)) r2
+    else if str_eq id "or" then
+      let (s2, r2) = parse_stmt r in
+      apply_modifier (SOrElse (s, s2)) r2
     else (s, toks)
   | _ -> (s, toks)
 
@@ -1078,10 +1126,13 @@ and parse_stmt_id = fn toks ->
        | Cons (TEOF, _) -> ((if str_eq id "private_class_method" then SExpr ENil else SVis (mode, Nil)), r)
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis (mode, names), r2)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
+    else if str_eq id "require" || str_eq id "require_relative" then
+      // load a file into the same world (each file gets a fresh top-level).
+      let (e, r2) = parse_expr r in
+      (SRequire (str_eq id "require_relative", e), r2)
     else if str_eq id "module_function" || str_eq id "extend" ||
             str_eq id "public_class_method" ||
-            str_eq id "private_constant" || str_eq id "using" ||
-            str_eq id "require" || str_eq id "require_relative" then
+            str_eq id "private_constant" || str_eq id "using" then
       // visibility / mixin-into-singleton / require: accepted as no-ops.
       (match r with
        | Cons (TNL, _) -> (SExpr ENil, r)
@@ -1898,6 +1949,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let supercls = if map_has sup defcls then map_get sup defcls else "" in
     invoke world blk recv supercls meth args
   | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
+  | EAssign (name, e) ->
+    let v = eval_e env world blk e in
+    let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
+            then map_set globals (substring name 1 (str_len name)) v
+            else if is_upper_first name then map_set consts name v
+            else map_set env name v in
+    v
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -1925,7 +1983,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    if map_has meths name then call_method env world noblk name args
+    // eval "code" re-enters the interpreter in the CURRENT env.
+    if str_eq name "eval" then
+      (match args with
+       | Cons (VStr code, _) ->
+         let toks = lex_go code 0 in
+         let (prog2, _) = parse_stmts toks Nil in
+         flow_value (run_stmts env world blk prog2)
+       | _ -> fail "mere-ruby: eval expects a string")
+    else if map_has meths name then call_method env world noblk name args
     else try_self_call env world name args
   | ECallB (name, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
@@ -3130,8 +3196,44 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = undef_top meths names in FNext VNil
   | SVis (_, _) -> FNext VNil   // top-level visibility: no-op
+  | SAndThen (s1, s2) ->
+    (match exec_stmt env world blk s1 with
+     | FNext v -> if truthy v then exec_stmt env world blk s2 else FNext v
+     | esc -> esc)
+  | SOrElse (s1, s2) ->
+    (match exec_stmt env world blk s1 with
+     | FNext v -> if truthy v then FNext v else exec_stmt env world blk s2
+     | esc -> esc)
   | SDeclare names ->
     let _ = declare_nils env names in FNext VNil
+  | SRequire (rel, e) ->
+    (match eval_e env world blk e with
+     | VStr p0 ->
+       let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
+       let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> d | _ -> ".") else ".") in
+       let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else dir ++ "/" ++ p1 in
+       if map_has loaded_files full then FNext (VBool false)
+       else
+         let _ = map_set loaded_files full VNil in
+         let src = read_file full in
+         let toks = lex_go src 0 in
+         let (prog2, rest2) = parse_stmts toks Nil in
+         let _ = (match rest2 with
+                  | Cons (TEOF, _) -> ()
+                  | _ -> fail ("mere-ruby: unexpected token at top level in " ++ full)) in
+         // the required file runs with its own top-level locals but the
+         // same world (classes/methods/consts/globals are shared).
+         let fenv = map_new () in
+         let _ = map_set fenv "self" VMain in
+         let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else VStr ".") in
+         let _ = map_set load_ctx "dir" (VStr (dirname_of full)) in
+         let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
+         let f = run_stmts fenv world noblk2 prog2 in
+         let _ = map_set load_ctx "dir" saved in
+         (match f with
+          | FRaise v -> FRaise v
+          | _ -> FNext (VBool true))
+     | _ -> FNext VNil)
   | SReturn e -> FReturn (eval_e env world blk e)
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
@@ -3277,6 +3379,8 @@ and puts_each = fn world -> fn (xs: Val list) ->
 // value with no trailing newline (bootstraptest's `print(begin; ...; end)`
 // model, used by the --eval-print harness mode).
 let run_prog = fn (path: str) -> fn (print_result: bool) ->
+  let _ = map_set load_ctx "dir" (VStr (dirname_of path)) in
+  let _ = map_set loaded_files path VNil in
   let src = read_file path in
   let toks = lex_go src 0 in
   let (prog, rest) = parse_stmts toks Nil in
