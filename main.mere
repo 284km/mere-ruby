@@ -449,7 +449,17 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let nl = find_nl s idend in
       let (body, after) = heredoc_body s (nl + 1) hid squiggly in
       let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
-      Cons (TStrL body, tapp linetoks (Cons (TNL, lex_go s after)))
+      tapp (heredoc_tok body) (tapp linetoks (Cons (TNL, lex_go s after)))
+    else if str_eq c "<" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "<"
+            && is_upper (char_at s (i + 2)) && regex_position s i then
+      // bare <<HERE heredoc (an UPPERCASE id in value position; `a << B`
+      // shift stays an operator because of the position check).
+      let idend = scan_ident s (i + 2) in
+      let hid = substring s (i + 2) idend in
+      let nl = find_nl s idend in
+      let (body, after) = heredoc_body s (nl + 1) hid false in
+      let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
+      tapp (heredoc_tok body) (tapp linetoks (Cons (TNL, lex_go s after)))
     else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
       // a backslash at end of line continues the logical line.
       lex_go s (i + 2)
@@ -497,7 +507,17 @@ and lex_dstr = fn (s: str) -> fn (i: int) -> fn (lit: str) ->
     if str_eq c "\"" then (Cons (TP "+", Cons (TStrL lit, Nil)), i + 1)
     else if str_eq c "\\" && i + 1 < str_len s then
       let e = char_at s (i + 1) in
-      let piece = if str_eq e "n" then "\n" else if str_eq e "t" then "\t" else e in
+      if str_eq e "u" && i + 5 < str_len s then
+        // \uXXXX — emit UTF-8 bytes for the codepoint.
+        let cp = hex4 s (i + 2) in
+        lex_dstr s (i + 6) (lit ++ utf8_of cp)
+      else
+      let piece = if str_eq e "n" then "\n" else if str_eq e "t" then "\t"
+                  else if str_eq e "r" then chr 13 else if str_eq e "e" then chr 27
+                  else if str_eq e "a" then chr 7 else if str_eq e "b" then chr 8
+                  else if str_eq e "f" then chr 12 else if str_eq e "v" then chr 11
+                  else if str_eq e "0" then chr 0 else if str_eq e "s" then " "
+                  else e in
       lex_dstr s (i + 2) (lit ++ piece)
     else if str_eq c "#" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\{" then
       let close = find_close_brace s (i + 2) 0 in
@@ -566,6 +586,31 @@ and scan_exponent = fn (s: str) -> fn (i: int) ->
     let j = (if i + 1 < str_len s && (str_eq (char_at s (i + 1)) "-" || str_eq (char_at s (i + 1)) "+") then i + 2 else i + 1) in
     (if j < str_len s && is_digit (char_at s j) then scan_base s j 10 else i)
   else i
+
+and is_upper = fn (c: str) -> let o = ord c in o >= 65 && o <= 90
+
+and hexv = fn (c: str) ->
+  let o = ord c in
+  if o >= 48 && o <= 57 then o - 48
+  else if o >= 97 && o <= 102 then o - 87
+  else if o >= 65 && o <= 70 then o - 55
+  else 0
+
+and hex4 = fn (s: str) -> fn (i: int) ->
+  hexv (char_at s i) * 4096 + hexv (char_at s (i + 1)) * 256 +
+  hexv (char_at s (i + 2)) * 16 + hexv (char_at s (i + 3))
+
+and utf8_of = fn (cp: int) ->
+  if cp < 128 then chr cp
+  else if cp < 2048 then chr (192 + cp / 64) ++ chr (128 + (cp - cp / 64 * 64))
+  else chr (224 + cp / 4096) ++ chr (128 + (cp / 64 - cp / 4096 * 64)) ++ chr (128 + (cp - cp / 64 * 64))
+
+// heredoc body as token(s): interpolated bodies route through the
+// double-quoted string lexer.
+and heredoc_tok = fn (body: str) ->
+  if rx_has_interp body 0 then
+    tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src body) 0))) (Cons (TP ")", Nil))
+  else Cons (TStrL body, Nil)
 
 and find_nl = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i
@@ -1346,6 +1391,29 @@ and parse_array = fn toks ->
   | _ -> parse_arr_items toks Nil
 
 and parse_arr_items = fn toks -> fn (acc: Expr list) ->
+  // splat element [*x] and symbol-key trailing hash [.., k: v] forms.
+  match toks with
+  | Cons (TP st, r0b) ->
+    if str_eq st "*" then
+      let (inner, r1) = parse_expr r0b in
+      arr_items_sep (skip_nls r1) (Cons (ESplat inner, acc))
+    else parse_arr_expr toks acc
+  | Cons (TId n, Cons (TP col, r0c)) ->
+    if str_eq col ":" then
+      let (v, r1) = parse_expr (skip_nls r0c) in
+      arr_hash_items (skip_nls r1) acc (Cons (v, Cons (ESym n, Nil)))
+    else parse_arr_expr toks acc
+  | _ -> parse_arr_expr toks acc
+
+and arr_items_sep = fn r -> fn (acc: Expr list) ->
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_arr_items (skip_nls r2) acc
+    else if str_eq p "]" then (EArr (rev_app acc Nil), r2)
+    else fail ("mere-ruby: expected , or ] in array, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated array literal"
+
+and parse_arr_expr = fn toks -> fn (acc: Expr list) ->
   let (e, r0) = parse_expr toks in
   let r = skip_nls r0 in   // allow a newline before the , or ]
   match r with
@@ -1365,10 +1433,21 @@ and arr_hash_items = fn toks -> fn (acc: Expr list) -> fn (hp: Expr list) ->
   | Cons (TP p, r) ->
     if str_eq p "]" then (EArr (rev_app acc (Cons (EHsh (rev_app hp Nil), Nil))), r)
     else if str_eq p "," then
-      let (k, r2) = parse_expr (skip_nls r) in
-      let r3 = expect r2 "=>" in
-      let (v, r4) = parse_expr (skip_nls r3) in
-      arr_hash_items r4 acc (Cons (v, Cons (k, hp)))
+      (match skip_nls r with
+       | Cons (TId n2, Cons (TP c2, r2b)) ->
+         if str_eq c2 ":" then
+           let (v, r4) = parse_expr (skip_nls r2b) in
+           arr_hash_items (skip_nls r4) acc (Cons (v, Cons (ESym n2, hp)))
+         else
+           let (k, r2) = parse_expr (skip_nls r) in
+           let r3 = expect r2 "=>" in
+           let (v, r4) = parse_expr (skip_nls r3) in
+           arr_hash_items (skip_nls r4) acc (Cons (v, Cons (k, hp)))
+       | other ->
+         let (k, r2) = parse_expr other in
+         let r3 = expect r2 "=>" in
+         let (v, r4) = parse_expr (skip_nls r3) in
+         arr_hash_items (skip_nls r4) acc (Cons (v, Cons (k, hp))))
     else fail ("mere-ruby: expected , or ] in array hash, got " ++ p)
   | _ -> fail "mere-ruby: unterminated array literal"
 
@@ -2926,7 +3005,10 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Nil -> Nil
   // splat argument: expand an array's elements into the argument list.
   | Cons (ESplat e, t) ->
-    let spread = (match eval_e env world blk e with VArr id -> deref id | v -> Cons (v, Nil)) in
+    let spread = (match eval_e env world blk e with
+                  | VArr id -> deref id
+                  | VNil -> Nil   // [*nil] is empty
+                  | v -> Cons (v, Nil)) in
     list_append spread (eval_args env world blk t)
   // **h passes the hash itself (it lands as the trailing keyword hash).
   | Cons (EKwSplat e, t) ->
@@ -3632,6 +3714,13 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr a -> (match args with Cons (VStr b2, _) -> VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
      | _ -> fail "no casecmp?")
+  else if str_eq name "ord" then
+    (match recv with
+     | VStr sv -> (if str_len sv > 0 then VInt (ord (char_at sv 0)) else fail "no ord")
+     | VInt n -> VInt n
+     | _ -> fail "no ord")
+  else if str_eq name "chr" then
+    (match recv with VInt n -> VStr (chr n) | VStr sv -> VStr (substring sv 0 1) | _ -> fail "no chr")
   else if str_eq name "to_sym" then
     (match recv with VStr s -> VSym s | VSym s -> VSym s | _ -> fail "no to_sym")
   else if str_eq name "equal?" then
