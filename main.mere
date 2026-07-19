@@ -318,7 +318,7 @@ let is_punct1 = fn (c: str) ->
   str_eq c "(" || str_eq c ")" || str_eq c "[" || str_eq c "]" ||
   str_eq c "\{" || str_eq c "}" || str_eq c "," || str_eq c "=" ||
   str_eq c "." || str_eq c "|" || str_eq c "&" ||
-  str_eq c "?" || str_eq c ":" || str_eq c "~";
+  str_eq c "?" || str_eq c ":" || str_eq c "~" || str_eq c "^";
 
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
@@ -1502,7 +1502,12 @@ and parse_one_target = fn toks ->
   | _ -> fail "mere-ruby: bad assignment target"
 
 and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
-  let (e, r) = parse_expr toks in
+  let (e, r) =
+    (match toks with
+     | Cons (TP star, r0) ->
+       if str_eq star "*" then let (inner, r1) = parse_expr r0 in (ESplat inner, r1)
+       else parse_expr toks
+     | _ -> parse_expr toks) in
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then parse_rhs_list r2 (Cons (e, acc))
@@ -1656,10 +1661,14 @@ and parse_qualified_name = fn (acc: str) -> fn toks ->
 
 and parse_class = fn toks ->
   match toks with
-  // `class ::C` defines C at the top level (flat model: same as class C).
-  | Cons (TP sc, Cons (TId name0, r0)) ->
-    if str_eq sc "::" then
-      let (name, r) = parse_qualified_name name0 r0 in
+  // `class << self ... end` — the singleton class: its defs register as
+  // class-level methods of the ENCLOSING class (flat-table model).
+  | Cons (TP sc0, Cons (TId slf, r0)) ->
+    if str_eq sc0 "<<" then
+      let (body, r5) = parse_stmts r0 Nil in
+      (SClass ("<<singleton", "", body), expect_kw r5 "end")
+    else if str_eq sc0 "::" then
+      let (name, r) = parse_qualified_name slf r0 in
       parse_class_rest name r
     else fail "mere-ruby: expected class name after class"
   | Cons (TId name0, r0) ->
@@ -2154,15 +2163,44 @@ let rec val_intersect = fn (xs: Val list) -> fn (ys: Val list) ->
   | Nil -> Nil
   | Cons (h, t) -> if val_member ys h then Cons (h, val_intersect t ys) else val_intersect t ys;
 
+let rec bits_of = fn (n: int) -> fn (k: int) ->
+  // 63 low bits of n as a list (two's-complement not handled; specs use
+  // small non-negative ints for bitwise tests).
+  if k == 0 then Nil else Cons (floor_mod n 2, bits_of (n / 2) (k - 1));
+let rec bits_val = fn (bs: int list) -> fn (place: int) ->
+  match bs with Nil -> 0 | Cons (b, t) -> b * place + bits_val t (place * 2);
+let rec bits_zip = fn (op: str) -> fn (xs: int list) -> fn (ys: int list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (x, xt) ->
+    (match ys with
+     | Nil -> Nil
+     | Cons (y, yt) ->
+       let b = if str_eq op "&" then (if x == 1 && y == 1 then 1 else 0)
+               else if str_eq op "|" then (if x == 1 || y == 1 then 1 else 0)
+               else (if x != y then 1 else 0) in
+       Cons (b, bits_zip op xt yt));
+let int_bitop = fn (op: str) -> fn (x: int) -> fn (y: int) ->
+  bits_val (bits_zip op (bits_of x 62) (bits_of y 62)) 1;
+
 let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   if str_eq op "|" then
     (match va with
      | VArr x -> (match vb with VArr y -> arr_new (val_dedup_into (deref y) (val_dedup_into (deref x) Nil)) | _ -> fail "mere-ruby: | type error")
+     | VInt x -> (match vb with VInt y -> VInt (int_bitop "|" x y) | _ -> fail "mere-ruby: | type error")
+     | VBool x -> (match vb with VBool y -> VBool (x || y) | _ -> fail "mere-ruby: | type error")
      | _ -> fail "mere-ruby: | type error")
   else if str_eq op "&" then
     (match va with
      | VArr x -> (match vb with VArr y -> arr_new (val_intersect (val_dedup_into (deref x) Nil) (deref y)) | _ -> fail "mere-ruby: & type error")
+     | VInt x -> (match vb with VInt y -> VInt (int_bitop "&" x y) | _ -> fail "mere-ruby: & type error")
+     | VBool x -> (match vb with VBool y -> VBool (x && y) | _ -> fail "mere-ruby: & type error")
      | _ -> fail "mere-ruby: & type error")
+  else if str_eq op "^" then
+    (match va with
+     | VInt x -> (match vb with VInt y -> VInt (int_bitop "^" x y) | _ -> fail "mere-ruby: ^ type error")
+     | VBool x -> (match vb with VBool y -> VBool (if x then (if y then false else true) else y) | _ -> fail "mere-ruby: ^ type error")
+     | _ -> fail "mere-ruby: ^ type error")
   else
   if str_eq op "+" then
     (match va with
@@ -3481,6 +3519,11 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
        else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
      | VMain -> raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
+     | VClass c ->
+       // class-level self (class << self body / class methods).
+       if str_eq name "new" then new_obj world c args
+       else if has_meth world c name then invoke world noblk (VClass c) c name args
+       else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
      | other ->
        // primitive self (a reopened built-in class's method body): user
        // methods first, then the built-in prims (implicit-self upcase etc.).
@@ -3858,6 +3901,10 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        // a nested class / module registers under its qualified name so that
        // `Outer::Inner` resolves (and reports its full name).
        | SClass (cname, csuper, cbody) ->
+         if str_eq cname "<<singleton" then
+           // class << self: body methods become class-level (same table).
+           register_class world cls cbody
+         else
          let full = cls ++ "::" ++ cname in
          let _ = if str_eq csuper "" then () else map_set sup full csuper in
          register_class world full cbody
