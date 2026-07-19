@@ -910,6 +910,9 @@ let rec parse_expr = fn toks ->
 and list_append_str = fn (xs: str list) -> fn (ys: str list) ->
   match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append_str t ys)
 
+and eapp = fn (xs: Expr list) -> fn (ys: Expr list) ->
+  match xs with Nil -> ys | Cons (h, t) -> Cons (h, eapp t ys)
+
 // bare lambda params: `-> x, y { ... }` (up to the block opener).
 and lambda_bare_params = fn toks -> fn (acc: str list) ->
   match toks with
@@ -1099,26 +1102,21 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
        | _ -> fail "mere-ruby: expected method name after .")
     // index: recv[i] -> recv.[](i); recv[i] = v -> recv.[]=(i, v)
     else if str_eq dot "[" then
-      let (idx, r2) =
-        (match r with
-         | Cons (TP st, r0) ->
-           if str_eq st "*" then let (i2, r1) = parse_expr r0 in (ESplat i2, r1)
-           else parse_expr r
-         | _ -> parse_expr r) in
-      let r3 = expect r2 "]" in
+      // one or more comma-separated indices (a[i], a[start, len], a[*idx]).
+      let (idxs, r3) = parse_x_idx r Nil in
       (match r3 with
        | Cons (TP eq, r4) ->
          if str_eq eq "=" then
            let (rhs, r5) = parse_expr r4 in
-           (EMethod (recv, "[]=", Cons (idx, Cons (rhs, Nil))), r5)
+           (EMethod (recv, "[]=", eapp idxs (Cons (rhs, Nil))), r5)
          // recv[i] op= v desugars through a read-modify-write ([]= of
          // [] op v); ||= and &&= use their short-circuit operators.
          else if not (str_eq (opassign_base eq) "") then
            let (rhs, r5) = parse_expr (skip_nls r4) in
-           let cur = EMethod (recv, "[]", Cons (idx, Nil)) in
-           (EMethod (recv, "[]=", Cons (idx, Cons (EBin (opassign_base eq, cur, rhs), Nil))), r5)
-         else parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3
-       | _ -> parse_postfix_more (EMethod (recv, "[]", Cons (idx, Nil))) r3)
+           let cur = EMethod (recv, "[]", idxs) in
+           (EMethod (recv, "[]=", eapp idxs (Cons (EBin (opassign_base eq, cur, rhs), Nil))), r5)
+         else parse_postfix_more (EMethod (recv, "[]", idxs)) r3
+       | _ -> parse_postfix_more (EMethod (recv, "[]", idxs)) r3)
     // safe navigation: a&.b / a&.b(args) — nil receiver short-circuits.
     else if str_eq dot "&." then
       (match r with
@@ -2403,7 +2401,9 @@ and parse_when_vals = fn toks -> fn (acc: Expr list) ->
 and parse_def = fn toks ->
   match toks with
   // operator method names: def ==, def <=>, def []=, def +, def <<, ...
-  | Cons (TP op1, r0) ->
+  | Cons (TP op0, r0) ->
+    // the lexer space-marks a bracket after "def " — same as a plain [.
+    let op1 = if str_eq op0 " [" then "[" else op0 in
     let (name, r) =
       if str_eq op1 "[" then
         (match r0 with
@@ -3406,6 +3406,29 @@ and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
 and has_splat = fn (ts: str list) ->
   match ts with Nil -> false | Cons (t, r) -> if tgt_is_splat t then true else has_splat r
 
+// Array#[](start, len): negative start counts from the end; start just past
+// the end yields []; out of range or negative length yields nil.
+and arr_slice = fn (xs: Val list) -> fn (st0: int) -> fn (len: int) ->
+  let n = val_list_len xs in
+  let st = if st0 < 0 then n + st0 else st0 in
+  if st < 0 || st > n || len < 0 then VNil
+  else arr_new (vtake (vdrop xs st) len)
+
+// Array#[]=(start, len, v): replace len elements at start with v (an array
+// splices its elements in); writes past the end pad with nils.
+and arr_splice = fn (xs: Val list) -> fn (st0: int) -> fn (len0: int) -> fn (v: Val) ->
+  let n = val_list_len xs in
+  let st1 = if st0 < 0 then n + st0 else st0 in
+  let st = if st1 < 0 then 0 else st1 in
+  let len = if len0 < 0 then 0 else len0 in
+  let pre = (if st <= n then vtake xs st else list_append xs (nil_pad (st - n))) in
+  let post = vdrop xs (st + len) in
+  let ins = (match v with VArr id2 -> deref id2 | other -> Cons (other, Nil)) in
+  list_append pre (list_append ins post)
+
+and nil_pad = fn (k: int) ->
+  if k <= 0 then (Nil : Val list) else Cons (VNil, nil_pad (k - 1))
+
 and vlen = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + vlen t
 and vtake = fn (xs: Val list) -> fn (n: int) ->
   if n <= 0 then Nil else (match xs with Nil -> Nil | Cons (h, t) -> Cons (h, vtake t (n - 1)))
@@ -4189,7 +4212,18 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh xs -> VBool (hash_len xs == 0) | _ -> fail "mere-ruby: no empty?")
   else if str_eq name "[]" then
     (match recv with
-     | VArr id -> let xs = deref id in (match args with Cons (VInt i, _) -> val_nth xs (if i < 0 then val_list_len xs + i else i) | _ -> VNil)
+     | VArr id ->
+       let xs = deref id in
+       (match args with
+        | Cons (VInt i, Cons (VInt len, _)) -> arr_slice xs i len
+        | Cons (VRange (lo, hi, excl), _) ->
+          let n = val_list_len xs in
+          let st = if lo < 0 then n + lo else lo in
+          let en0 = if hi < 0 then n + hi else hi in
+          let en = if excl then en0 - 1 else en0 in
+          arr_slice xs st (en - st + 1)
+        | Cons (VInt i, _) -> val_nth xs (if i < 0 then val_list_len xs + i else i)
+        | _ -> VNil)
      | VStr s -> (match args with Cons (VInt i, _) -> let j = if i < 0 then str_len s + i else i in if j >= 0 && j < str_len s then VStr (substring s j (j + 1)) else VNil | _ -> VNil)
      | VHsh xs -> (match args with Cons (k, _) -> hash_get xs k | _ -> VNil)
      | _ -> fail "mere-ruby: no []")
@@ -4271,6 +4305,15 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VArr id ->
        (match args with
+        | Cons (VInt i, Cons (VInt len, Cons (v, Nil))) ->
+          let _ = arr_set id (arr_splice (deref id) i len v) in v
+        | Cons (VRange (lo, hi, excl), Cons (v, Nil)) ->
+          let xs = deref id in
+          let n = val_list_len xs in
+          let st = if lo < 0 then n + lo else lo in
+          let en0 = if hi < 0 then n + hi else hi in
+          let en = if excl then en0 - 1 else en0 in
+          let _ = arr_set id (arr_splice xs st (en - st + 1) v) in v
         | Cons (VInt i, Cons (v, _)) ->
           let xs = deref id in
           let n = val_list_len xs in
