@@ -638,7 +638,7 @@ and pw_words = fn (interp: bool) -> fn (t: str) -> fn (i: int) -> fn rest ->
   if i >= str_len t then Cons (TP "]", rest)
   else if str_eq (char_at t i) " " || str_eq (char_at t i) "\n" then pw_words interp t (i + 1) rest
   else
-    let (w, j) = pw_word t i "" in
+    let (w, j) = pw_word interp t i "" in
     let k = pw_skip t j in
     if k >= str_len t then pw_tok interp w (Cons (TP "]", rest))
     else pw_tok interp w (Cons (TP ",", pw_words interp t k rest))
@@ -648,7 +648,7 @@ and pi_words = fn (interp: bool) -> fn (t: str) -> fn (i: int) -> fn rest ->
   if i >= str_len t then Cons (TP "]", rest)
   else if str_eq (char_at t i) " " || str_eq (char_at t i) "\n" then pi_words interp t (i + 1) rest
   else
-    let (w, j) = pw_word t i "" in
+    let (w, j) = pw_word interp t i "" in
     let k = pw_skip t j in
     if k >= str_len t then pi_tok interp w (Cons (TP "]", rest))
     else pi_tok interp w (Cons (TP ",", pi_words interp t k rest))
@@ -665,13 +665,24 @@ and pw_tok = fn (interp: bool) -> fn (w: str) -> fn rest ->
     Cons (TP "(s", tapp (drop_eof (lex_go (rx_interp_src w) 0)) (Cons (TP ")", rest)))
   else Cons (TStrL w, rest)
 
-and pw_word = fn (t: str) -> fn (i: int) -> fn (acc: str) ->
+and pw_word = fn (interp: bool) -> fn (t: str) -> fn (i: int) -> fn (acc: str) ->
   if i >= str_len t then (acc, i)
   else
     let c = char_at t i in
-    if str_eq c "\\" && i + 1 < str_len t then pw_word t (i + 2) (acc ++ char_at t (i + 1))
+    // In %W/%I (interp) a backslash-escape expands C-style (\t \n \s);
+    // in %w/%i it keeps the next character literally (\ joins words).
+    if str_eq c "\\" && i + 1 < str_len t then
+      let nx = char_at t (i + 1) in
+      let piece = (if interp then
+                     (if str_eq nx "t" then "\t" else if str_eq nx "n" then "\n"
+                      else if str_eq nx "s" then " " else if str_eq nx "r" then "\r"
+                      else if str_eq nx "e" then chr 27 else nx)
+                   // %w keeps a literal backslash except before space / \ / nl.
+                   else if str_eq nx " " || str_eq nx "\\" || str_eq nx "\n" then nx
+                   else "\\" ++ nx) in
+      pw_word interp t (i + 2) (acc ++ piece)
     else if str_eq c " " || str_eq c "\n" then (acc, i)
-    else pw_word t (i + 1) (acc ++ c)
+    else pw_word interp t (i + 1) (acc ++ c)
 
 and pw_skip = fn (t: str) -> fn (j: int) ->
   if j < str_len t && (str_eq (char_at t j) " " || str_eq (char_at t j) "\n") then pw_skip t (j + 1) else j
@@ -3920,6 +3931,15 @@ and hsh_eval_items = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                 Cons (eval_e env world blk v, hsh_eval_items env world blk rest))
         | Nil -> Cons (eval_e env world blk k, Nil)))
 
+// object identity (equal?): reference types are identical only when they
+// are the same handle; immediates compare by value.
+and rb_identical = fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VArr ia -> (match b with VArr ib -> ia == ib | _ -> false)
+  | VObj ia -> (match b with VObj ib -> ia == ib | _ -> false)
+  | VHsh _ -> false
+  | _ -> rb_eq a b
+
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
   | Nil -> Nil
@@ -3928,6 +3948,21 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
     let spread = (match eval_e env world blk e with
                   | VArr id -> deref id
                   | VNil -> Nil   // [*nil] is empty
+                  // a non-array splat calls to_a if the object responds to
+                  // it: a real/singleton method, or a user respond_to? that
+                  // answers true (covering method_missing mocks).
+                  | VObj oid ->
+                    let (m2, sp2, ocls2, iv2) = world in
+                    let ocl2 = map_get ocls2 (str_of_int oid) in
+                    let coerce =
+                      (if has_meth world ocl2 "to_a" then true
+                       else if has_meth world ocl2 "respond_to?" then
+                         truthy (invoke_val_c env world blk (VObj oid) "respond_to?" (Cons (VSym "to_a", Nil)) false)
+                       else false) in
+                    if coerce then
+                      (match invoke_val_c env world blk (VObj oid) "to_a" Nil false with
+                       | VArr aid -> deref aid | other -> Cons (other, Nil))
+                    else Cons (VObj oid, Nil)
                   | v -> Cons (v, Nil)) in
     list_append spread (eval_args env world blk t)
   // **h passes the hash itself (it lands as the trailing keyword hash).
@@ -4789,7 +4824,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "to_sym" then
     (match recv with VStr s -> VSym s | VSym s -> VSym s | _ -> fail "no to_sym")
   else if str_eq name "equal?" then
-    (match args with Cons (b, _) -> VBool (rb_eq recv b) | _ -> VBool false)
+    (match args with Cons (b, _) -> VBool (rb_identical recv b) | _ -> VBool false)
   else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
     (match args with
      | Cons (VClass c, _) ->

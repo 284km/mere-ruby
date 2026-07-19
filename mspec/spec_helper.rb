@@ -58,6 +58,15 @@ class PositiveMatcher
     end
     nil
   end
+  def equal?(expected)
+    if @actual.equal?(expected)
+      $mspec_pass += 1
+    else
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected to be identical"
+    end
+    nil
+  end
   def !=(expected)
     if @actual != expected
       $mspec_pass += 1
@@ -86,6 +95,15 @@ class NegativeMatcher
     if @actual == expected
       $mspec_fail += 1
       puts "FAILED: expected not #{expected.inspect}"
+    else
+      $mspec_pass += 1
+    end
+    nil
+  end
+  def equal?(expected)
+    if @actual.equal?(expected)
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected not to be identical"
     else
       $mspec_pass += 1
     end
