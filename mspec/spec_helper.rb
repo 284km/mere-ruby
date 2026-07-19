@@ -123,19 +123,29 @@ class Object
 end
 
 def describe(desc)
+  prev_b = $mspec_before
+  prev_a = $mspec_after
   $mspec_desc = desc
   yield
+  $mspec_before = prev_b
+  $mspec_after = prev_a
 end
 
 def context(desc)
+  prev_b = $mspec_before
+  prev_a = $mspec_after
   $mspec_desc = desc
   yield
+  $mspec_before = prev_b
+  $mspec_after = prev_a
 end
 
 def it(desc)
   $mspec_it = desc
   begin
+    $mspec_before.call if $mspec_before
     yield
+    $mspec_after.call if $mspec_after
   rescue SpecFailure
     # already tallied
   rescue Exception => e
@@ -145,8 +155,8 @@ def it(desc)
 end
 
 def it_behaves_like(*args); end
-def before(*args); end
-def after(*args); end
+def before(kind = nil, &blk); $mspec_before = blk; end
+def after(kind = nil, &blk); $mspec_after = blk; end
 def guard(*args); end
 def ruby_version_is(*args); end
 def platform_is(*args); end
