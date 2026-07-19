@@ -16,6 +16,7 @@ cp "$spec" "$tmp/language/"
 specdir="$(cd "$(dirname "$spec")" && pwd)"
 [ -d "$specdir/fixtures" ] && cp -R "$specdir/fixtures" "$tmp/language/fixtures"
 [ -d "$specdir/../fixtures" ] && cp -R "$specdir/../fixtures" "$tmp/fixtures"
+[ -d "$specdir/shared" ] && cp -R "$specdir/shared" "$tmp/language/shared"
 cp "$here/spec_helper.rb" "$tmp/spec_helper.rb"
 base="$(basename "$spec" .rb)"
 cat > "$tmp/driver.rb" <<EOF
