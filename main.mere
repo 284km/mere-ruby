@@ -1221,7 +1221,7 @@ and parse_primary = fn toks ->
          if str_eq p "(" then let (e, r3) = parse_expr r2 in (EDefined e, expect r3 ")")
          else let (e, r3) = parse_unary r in (EDefined e, r3)
        | _ -> let (e, r3) = parse_unary r in (EDefined e, r3))
-    else if str_eq id "break" || str_eq id "next" || str_eq id "return" || str_eq id "redo" then
+    else if str_eq id "break" || str_eq id "next" || str_eq id "return" || str_eq id "redo" || str_eq id "retry" then
       // flow keywords in expression position (ternary branches, call args).
       (match r with
        | Cons (TNL, _) -> (EFlow (id, ENil), r)
@@ -1229,13 +1229,13 @@ and parse_primary = fn toks ->
        | Cons (TP p, _) ->
          if str_eq p ")" || str_eq p "}" || str_eq p "]" || str_eq p "," ||
             str_eq p ":" || str_eq p ";" then (EFlow (id, ENil), r)
-         else if str_eq id "redo" then (EFlow (id, ENil), r)
+         else if str_eq id "redo" || str_eq id "retry" then (EFlow (id, ENil), r)
          else let (e, r2) = parse_expr r in (EFlow (id, e), r2)
        | Cons (TId w, _) ->
-         if stops_value w || str_eq id "redo" then (EFlow (id, ENil), r)
+         if stops_value w || str_eq id "redo" || str_eq id "retry" then (EFlow (id, ENil), r)
          else let (e, r2) = parse_expr r in (EFlow (id, e), r2)
        | _ ->
-         if str_eq id "redo" then (EFlow (id, ENil), r)
+         if str_eq id "redo" || str_eq id "retry" then (EFlow (id, ENil), r)
          else let (e, r2) = parse_expr r in (EFlow (id, e), r2))
     else if str_eq id "if" then
       // statement constructs usable as expressions (call args etc.).
@@ -2270,6 +2270,10 @@ let rec list_append = fn (xs: Val list) -> fn (ys: Val list) ->
 
 let rec val_member = fn (xs: Val list) -> fn (v: Val) ->
   match xs with Nil -> false | Cons (h, t) -> rb_eq h v || val_member t v;
+let rec val_remove = fn (xs: Val list) -> fn (v: Val) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if rb_eq h v then val_remove t v else Cons (h, val_remove t v);
 // append ys to acc keeping first occurrences only (Array#| semantics).
 let rec val_dedup_into = fn (xs: Val list) -> fn (acc: Val list) ->
   match xs with
@@ -2726,8 +2730,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          (match prog2 with
           | Cons (SDeclare (Cons (m, Nil)), Nil) ->
             if str_eq m "__syntax_error__" then raise_exc world "SyntaxError" "syntax error"
-            else flow_value (run_stmts env world blk prog2)
-          | _ -> flow_value (run_stmts env world blk prog2))
+            else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+            else eval_run env world blk prog2
+          | _ ->
+            if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+            else eval_run env world blk prog2)
        | _ -> fail "mere-ruby: eval expects a string")
     else if map_has meths name then call_method env world noblk name args
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
@@ -3047,6 +3054,7 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
       if str_eq k "break" then FBreak v
       else if str_eq k "next" then FLoopNext v
       else if str_eq k "redo" then let _ = tick () in block_body_flow cenv world encl body
+      else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       else flow_rethrow k v
     else fail "mere-ruby: (ruby exception raised)"
   | other -> other
@@ -3683,6 +3691,17 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // Array mutation (in place; VArr is a handle into the shared store).
   else if str_eq name "push" || str_eq name "append" then
     (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (list_append (deref id) (Cons (v, Nil))) in recv | Nil -> recv) | _ -> fail "no push")
+  else if str_eq name "delete" then
+    (match recv with
+     | VArr id ->
+       (match args with
+        | Cons (v, _) ->
+          let xs = deref id in
+          let had = val_member xs v in
+          let _ = arr_set id (val_remove xs v) in
+          if had then v else VNil
+        | Nil -> VNil)
+     | _ -> fail "no delete")
   else if str_eq name "pop" then
     (match recv with VArr id -> let xs = deref id in (match xs with Nil -> VNil | _ -> let _ = arr_set id (val_init xs) in val_last xs) | _ -> fail "no pop")
   else if str_eq name "shift" then
@@ -3888,6 +3907,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
       let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
       let _ = map_delete flow_sig "k" in
       if str_eq k "return" then FNext v
+      else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       else flow_rethrow k v
     else fail "mere-ruby: (ruby exception raised)"
   | other -> other
@@ -4361,7 +4381,26 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SReturn e -> FReturn (eval_e env world blk e)
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
-  | SBegin (body, rescues, els, ens) ->
+  | SBegin (body, rescues, els, ens) -> run_begin env world blk body rescues els ens
+  | SLocalFrom (name, s) ->
+    (match exec_stmt env world blk s with
+     | FNext v -> let _ = map_set env name v in FNext v
+     | other -> other)
+  | SMultiAssign (targets, rhs) ->
+    // build the value list: a single array RHS is destructured; several
+    // values (or a single non-array) form the list.
+    (match rhs with
+     | Cons (single, Nil) ->
+       let rv = eval_e env world blk single in
+       let values = (match rv with VArr id -> deref id | v -> Cons (v, Nil)) in
+       let _ = assign_targets env world targets values in
+       FNext rv   // the statement's value is the RHS itself (nil stays falsy)
+     | _ ->
+       let values = eval_args env world blk rhs in
+       let _ = assign_targets env world targets values in
+       FNext (arr_new values))
+
+and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescues -> fn (els: Stmt list) -> fn (ens: Stmt list) ->
     let (meths, sup, ocls, ivars) = world in
     let caught = FRaise VNil in
     // run the body; a raise unwinds via fail and try_or yields `caught`.
@@ -4391,31 +4430,29 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // ensure always runs; an escape (return/break/next) inside ensure
     // OVERRIDES the pending outcome and swallows a pending exception.
     let ensf = (match ens with Nil -> FNext VNil | _ -> run_stmts env world blk ens) in
+    // a flow signal raised inside a rescue handler: retry re-runs the
+    // whole begin; anything else (redo/break/...) keeps unwinding to the
+    // enclosing loop/block after ensure has run.
+    let hflowk = (match outcome with
+                  | FRaise _ ->
+                    if map_has flow_sig "k" then (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") else ""
+                  | _ -> "") in
+    let hflowv = (if str_eq hflowk "" then VNil else (if map_has flow_sig "v" then map_get flow_sig "v" else VNil)) in
+    let _ = if str_eq hflowk "" then () else map_delete flow_sig "k" in
     (match ensf with
      | FNext _ ->
-       if str_eq flowk "" then
+       if str_eq hflowk "retry" then run_begin env world blk body rescues els ens
+       else if not (str_eq hflowk "") then flow_rethrow hflowk hflowv
+       else if str_eq flowk "retry" then
+         // retry NOT in a rescue handler is invalid (SyntaxError in Ruby).
+         FRaise (raise_exc world "SyntaxError" "Invalid retry")
+       else if str_eq flowk "" then
          (match outcome with
           | FRaise _ -> fail "mere-ruby: (exception propagates after ensure)"
           | other -> other)
        else flow_rethrow flowk flowv
      | esc -> esc)
-  | SLocalFrom (name, s) ->
-    (match exec_stmt env world blk s with
-     | FNext v -> let _ = map_set env name v in FNext v
-     | other -> other)
-  | SMultiAssign (targets, rhs) ->
-    // build the value list: a single array RHS is destructured; several
-    // values (or a single non-array) form the list.
-    (match rhs with
-     | Cons (single, Nil) ->
-       let rv = eval_e env world blk single in
-       let values = (match rv with VArr id -> deref id | v -> Cons (v, Nil)) in
-       let _ = assign_targets env world targets values in
-       FNext rv   // the statement's value is the RHS itself (nil stays falsy)
-     | _ ->
-       let values = eval_args env world blk rhs in
-       let _ = assign_targets env world targets values in
-       FNext (arr_new values))
+
 
 and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) ->
   match clauses with
@@ -4447,6 +4484,43 @@ and run_dowhile = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (cond: Expr
    | _ ->
      if truthy (eval_e env world blk cond) then run_dowhile env world blk s cond
      else FNext VNil)
+
+// does any def/class body contain a directly-invalid retry/redo?
+// (Ruby rejects them at parse time; blocks and loops are legal homes.)
+and invalid_flow_in_defs = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, rest) ->
+    (match st with
+     | SDef (_, _, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
+     | SClass (_, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
+     | _ -> invalid_flow_in_defs rest)
+
+and direct_invalid_flow = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, rest) ->
+    (match st with
+     | SExpr e ->
+       (match e with
+        | EFlow (k, _) -> str_eq k "retry" || str_eq k "redo"
+        | _ -> false) || direct_invalid_flow rest
+     | _ -> direct_invalid_flow rest)
+
+// run eval'd code; a bare retry signal surfacing here is Ruby's
+// parse-time SyntaxError equivalent.
+and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
+  let f = try_or (fn (u: unit) -> run_stmts env world blk prog2) (FRaise VNil) in
+  (match f with
+   | FRaise _ ->
+     if map_has flow_sig "k" then
+       let k = (match map_get flow_sig "k" with VStr kk -> kk | _ -> "") in
+       let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+       let _ = map_delete flow_sig "k" in
+       if str_eq k "retry" then raise_exc world "SyntaxError" "Invalid retry"
+       else let _ = flow_rethrow k v in VNil
+     else fail "mere-ruby: (ruby exception raised)"
+   | other -> flow_value other)
 
 // park a flow kind+value and unwind via fail; a runner up the stack
 // converts it back into a Flow (or a method return value).
@@ -4498,6 +4572,7 @@ and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
       if str_eq k "break" then FBreak v
       else if str_eq k "next" then FLoopNext v
       else if str_eq k "redo" then let _ = tick () in while_body_flow env world blk body
+      else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       else flow_rethrow k v
     else fail "mere-ruby: (ruby exception raised)"
   | other -> other
