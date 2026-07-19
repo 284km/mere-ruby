@@ -107,6 +107,9 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // or more expressions (one array is destructured; several values
           // form the array).
           | SMultiAssign of str list * Expr list
+          // multiple assignment with complex targets (foo[0], bar.baz = ...):
+          // each target is EVar / EIVar / ESplat / EMethod (indexing or attr).
+          | SMultiAssignX of Expr list * Expr list
           // 2h: `alias new old` (copy a method); `include M` (mix a module's
           // instance methods into the class).
           | SAlias of str * str
@@ -1706,12 +1709,29 @@ and stmt_postfix = fn (s: Stmt) -> fn toks ->
 // Ruby defines the local targets of an assignment at parse time, so a
 // modifier-guarded assignment that never runs still leaves nil locals.
 // The skipped branch declares them (only if not already bound).
+// the plain-local names among complex assignment targets (for nil-declare).
+and x_target_names = fn (ts: Expr list) ->
+  match ts with
+  | Nil -> Nil
+  | Cons (t, r) ->
+    (match t with
+     | EVar n ->
+       if str_len n > 0 && (str_eq (char_at n 0) "$" || is_upper_first n) then x_target_names r
+       else Cons (n, x_target_names r)
+     | ESplat inner ->
+       (match inner with
+        | EVar n -> Cons (n, x_target_names r)
+        | _ -> x_target_names r)
+     | EArr inner -> list_append_str (x_target_names inner) (x_target_names r)
+     | _ -> x_target_names r)
+
 and decl_of = fn (s: Stmt) ->
   match s with
   | SAssign (n, _) ->
     if str_len n > 0 && (str_eq (char_at n 0) "$" || is_upper_first n) then Nil
     else Cons (SDeclare (Cons (n, Nil)), Nil)
   | SMultiAssign (ts, _) -> Cons (SDeclare ts, Nil)
+  | SMultiAssignX (ts, _) -> Cons (SDeclare (x_target_names ts), Nil)
   | _ -> Nil
 
 // a statement that begins `id ,` (a bare non-keyword identifier then a
@@ -1761,6 +1781,128 @@ and parse_multi = fn toks ->
   let (rhs, r2) = parse_rhs_list r Nil in
   (SMultiAssign (targets, rhs), r2)
 
+// multiple assignment whose targets include indexing / attribute writes
+// (`foo[0], bar.baz = a, b`). Targets parse as postfix chains; the writer
+// invokes m= / []= at assignment time.
+and parse_multix = fn toks ->
+  let (targets, r) = parse_x_targets toks Nil in
+  let (rhs, r2) = parse_rhs_list r Nil in
+  (SMultiAssignX (targets, rhs), r2)
+
+and parse_x_targets = fn toks -> fn (acc: Expr list) ->
+  let (t, r) =
+    (match toks with
+     | Cons (TP star, r0) ->
+       if str_eq star "*" then let (inner, r1) = parse_x_target1 r0 in (ESplat inner, r1)
+       else parse_x_target1 toks
+     | _ -> parse_x_target1 toks) in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then
+      // `a, = 1` — a trailing comma ends the target list.
+      (match r2 with
+       | Cons (TP eq2, r3) ->
+         if str_eq eq2 "=" then (rev_app (Cons (t, acc)) Nil, r3)
+         else parse_x_targets r2 (Cons (t, acc))
+       | _ -> parse_x_targets r2 (Cons (t, acc)))
+    else if str_eq p "=" then (rev_app (Cons (t, acc)) Nil, r2)
+    else fail ("mere-ruby: expected , or = in multiple assignment, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated multiple-assignment targets"
+
+// one assignment target: a name (local/@ivar/$global) followed by .attr /
+// [index] chains. Unlike parse_postfix this never consumes `= rhs`.
+and parse_x_target1 = fn toks ->
+  match toks with
+  | Cons (TId nm, r) ->
+    if is_ivar nm then parse_x_chain (EIVar (substring nm 1 (str_len nm))) r
+    else parse_x_chain (EVar nm) r
+  // a parenthesized group destructures one value: ((a, b), c) = ...
+  | Cons (TP lp, r) ->
+    if str_eq lp "(" then let (ts, r2) = parse_x_group r Nil in (EArr ts, r2)
+    else fail "mere-ruby: bad assignment target"
+  | _ -> fail "mere-ruby: bad assignment target"
+
+and parse_x_group = fn toks -> fn (acc: Expr list) ->
+  let (t, r) =
+    (match toks with
+     | Cons (TP star, r0) ->
+       if str_eq star "*" then let (i, r1) = parse_x_target1 r0 in (ESplat i, r1)
+       else parse_x_target1 toks
+     | _ -> parse_x_target1 toks) in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then
+      (match r2 with
+       // `(e,)` — a trailing comma inside the group
+       | Cons (TP rp, r3) ->
+         if str_eq rp ")" then (rev_app (Cons (t, acc)) Nil, r3)
+         else parse_x_group r2 (Cons (t, acc))
+       | _ -> parse_x_group r2 (Cons (t, acc)))
+    else if str_eq p ")" then (rev_app (Cons (t, acc)) Nil, r2)
+    else fail ("mere-ruby: expected , or ) in grouped target, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated grouped target"
+
+and parse_x_chain = fn (recv: Expr) -> fn toks ->
+  match toks with
+  | Cons (TP p, r) ->
+    if str_eq p "." then
+      (match r with
+       | Cons (TId m, r2) -> parse_x_chain (EMethod (recv, m, Nil)) r2
+       | _ -> fail "mere-ruby: bad assignment target")
+    else if str_eq p "[" then
+      let (idxs, r2) = parse_x_idx r Nil in
+      parse_x_chain (EMethod (recv, "[]", idxs)) r2
+    else (recv, toks)
+  | _ -> (recv, toks)
+
+and parse_x_idx = fn toks -> fn (acc: Expr list) ->
+  let (e, r) = parse_expr toks in
+  match r with
+  | Cons (TP p, r2) ->
+    if str_eq p "," then parse_x_idx r2 (Cons (e, acc))
+    else if str_eq p "]" then (rev_app (Cons (e, acc)) Nil, r2)
+    else fail ("mere-ruby: expected , or ] in index target, got " ++ p)
+  | _ -> fail "mere-ruby: unterminated index target"
+
+// does this statement look like a complex multiple assignment? Scan to a
+// top-level `=` requiring a top-level `,` first; two adjacent value tokens
+// (a paren-less command call) or a structural keyword call it off.
+and looks_like_multix = fn toks ->
+  match toks with
+  | Cons (TId nm, _) -> if is_keyword nm then false else scan_mx toks 0 false false
+  // a leading group: a comma or splat at depth 1 marks targets too ((*a) = ...)
+  | Cons (TP lp, _) -> if str_eq lp "(" then scan_mx toks 0 false true else false
+  | _ -> false
+
+and scan_mx = fn toks -> fn (depth: int) -> fn (seen: bool) -> fn (grp: bool) ->
+  match toks with
+  | Nil -> false
+  | Cons (TNL, _) -> false
+  | Cons (TEOF, _) -> false
+  | Cons (TId w, r) ->
+    if str_eq w "do" || str_eq w "then" || str_eq w "if" || str_eq w "unless" ||
+       str_eq w "while" || str_eq w "until" || str_eq w "and" || str_eq w "or" ||
+       str_eq w "rescue" then false
+    else
+      (match r with
+       | Cons (TId _, _) -> if depth == 0 then false else scan_mx r depth seen grp
+       | Cons (TInt _, _) -> if depth == 0 then false else scan_mx r depth seen grp
+       | Cons (TFlt _, _) -> if depth == 0 then false else scan_mx r depth seen grp
+       | Cons (TStrL _, _) -> if depth == 0 then false else scan_mx r depth seen grp
+       | Cons (TSym _, _) -> if depth == 0 then false else scan_mx r depth seen grp
+       | _ -> scan_mx r depth seen grp)
+  | Cons (TP p, r) ->
+    if str_eq p "(" || str_eq p "[" || str_eq p " [" || str_eq p "\{" || str_eq p "(s" then
+      scan_mx r (depth + 1) seen grp
+    else if str_eq p ")" || str_eq p "]" || str_eq p "}" then scan_mx r (depth - 1) seen grp
+    else if depth == 0 && str_eq p "," then scan_mx r depth true grp
+    else if grp && depth == 1 && (str_eq p "," || str_eq p "*") then scan_mx r depth true grp
+    else if depth == 0 && str_eq p "=" then seen
+    else if depth == 0 && str_eq p "?" then false
+    else if depth == 0 && (if str_eq (opassign_base p) "" then false else true) then false
+    else scan_mx r depth seen grp
+  | Cons (_, r) -> scan_mx r depth seen grp
+
 and parse_target_list = fn toks -> fn (acc: str list) ->
   let (t, r) = parse_one_target toks in
   match r with
@@ -1793,7 +1935,8 @@ and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
   | _ -> (rev_app (Cons (e, acc)) Nil, r)
 
 and parse_stmt = fn toks ->
-  if looks_like_multi toks then parse_multi toks else
+  if looks_like_multix toks then parse_multix toks
+  else if looks_like_multi toks then parse_multi toks else
   match toks with
   // scoped constant assignment: `A::C = e` / leading `::C = e`.
   | Cons (TId a, Cons (TP sc, Cons (TId cn, Cons (TP eq, r)))) ->
@@ -3192,8 +3335,11 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   if str_len tgt > 0 && str_eq (char_at tgt 0) "$" then
     let _ = map_set globals (substring tgt 1 (str_len tgt)) v in ()
   else if str_len tgt > 0 && str_eq (char_at tgt 0) "@" then
+    let n = substring tgt 1 (str_len tgt) in
     (match map_get env "self" with
-     | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ substring tgt 1 (str_len tgt)) v in ()
+     | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ n) v in ()
+     | VMain -> let _ = map_set ivars ("main@" ++ n) v in ()
+     | VClass c -> let _ = map_set ivars ("cls:" ++ c ++ "@" ++ n) v in ()
      | _ -> ())
   else let _ = map_set env tgt v in ()
 
@@ -3216,6 +3362,65 @@ and assign_parallel = fn env -> fn world -> fn (targets: str list) -> fn (values
     (match values with
      | Nil -> let _ = assign_one env world t VNil in assign_parallel env world ts Nil
      | Cons (v, vs) -> let _ = assign_one env world t v in assign_parallel env world ts vs)
+
+// complex multiple-assignment targets: write one value to one target.
+and assign_x_one = fn env -> fn world -> fn blk -> fn (t: Expr) -> fn (v: Val) ->
+  match t with
+  | EVar n -> assign_one env world n v
+  | EIVar n -> assign_one env world ("@" ++ n) v
+  | ESplat inner -> assign_x_one env world blk inner v
+  // a grouped target destructures its value like a nested masgn.
+  | EArr ts ->
+    let vals = (match v with VArr id -> deref id | other -> Cons (other, Nil)) in
+    assign_x_targets env world blk ts vals
+  | EMethod (recv, m, args) ->
+    let rv = eval_e env world blk recv in
+    let argvals = eval_args env world blk args in
+    let _ = invoke_val_c env world blk rv (m ++ "=") (vappend argvals (Cons (v, Nil))) false in
+    ()
+  | _ -> ()
+
+and vappend = fn (a: Val list) -> fn (b: Val list) ->
+  match a with Nil -> b | Cons (h, t) -> Cons (h, vappend t b)
+
+and x_is_splat = fn (t: Expr) -> match t with ESplat _ -> true | _ -> false
+and xhas_splat = fn (ts: Expr list) ->
+  match ts with Nil -> false | Cons (t, r) -> if x_is_splat t then true else xhas_splat r
+and xlen = fn (ts: Expr list) -> match ts with Nil -> 0 | Cons (_, t) -> 1 + xlen t
+and xbefore_splat = fn (ts: Expr list) ->
+  match ts with Nil -> Nil | Cons (t, r) -> if x_is_splat t then Nil else Cons (t, xbefore_splat r)
+and xafter_splat = fn (ts: Expr list) ->
+  match ts with Nil -> Nil | Cons (t, r) -> if x_is_splat t then r else xafter_splat r
+and xsplat_tgt = fn (ts: Expr list) ->
+  match ts with
+  | Nil -> ENil
+  | Cons (t, r) -> (match t with ESplat inner -> inner | _ -> xsplat_tgt r)
+
+and assign_x_parallel = fn env -> fn world -> fn blk -> fn (targets: Expr list) -> fn (values: Val list) ->
+  match targets with
+  | Nil -> ()
+  | Cons (t, ts) ->
+    (match values with
+     | Nil -> let _ = assign_x_one env world blk t VNil in assign_x_parallel env world blk ts Nil
+     | Cons (v, vs) -> let _ = assign_x_one env world blk t v in assign_x_parallel env world blk ts vs)
+
+and assign_x_targets = fn env -> fn world -> fn blk -> fn (targets: Expr list) -> fn (values: Val list) ->
+  // a lone grouped target is the whole target list: (b, c) = [1, 2]
+  match targets with
+  | Cons (EArr inner, Nil) -> assign_x_targets env world blk inner values
+  | _ ->
+  if xhas_splat targets then
+    let before = xbefore_splat targets in
+    let after = xafter_splat targets in
+    let nb = xlen before in
+    let na = xlen after in
+    let nv = vlen values in
+    let sc = nv - nb - na in
+    let sc = if sc < 0 then 0 else sc in
+    let _ = assign_x_parallel env world blk before (vtake values nb) in
+    let _ = assign_x_one env world blk (xsplat_tgt targets) (arr_new (vtake (vdrop values nb) sc)) in
+    assign_x_parallel env world blk after (vdrop values (nb + sc))
+  else assign_x_parallel env world blk targets values
 
 and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values: Val list) ->
   if has_splat targets then
@@ -3355,6 +3560,7 @@ and stmt_targets = fn (s: Stmt) ->
      | _ -> Cons (n, Nil))
   | SLocalFrom (n, s2) -> Cons (n, stmt_targets s2)
   | SMultiAssign (ts, _) -> ts
+  | SMultiAssignX (ts, _) -> x_target_names ts
   | SIf (clauses, els) -> list_append_str (clauses_targets clauses) (deep_targets els)
   | SWhile (_, b) -> deep_targets b
   | SCase (_, whens, els) -> list_append_str (whens_targets whens) (deep_targets els)
@@ -4555,6 +4761,7 @@ and body_targets = fn (body: Stmt list) ->
      | SAssign (n, _) -> Cons (n, body_targets rest)
      | SLocalFrom (n, _) -> Cons (n, body_targets rest)
      | SMultiAssign (ts, _) -> list_append_str ts (body_targets rest)
+     | SMultiAssignX (ts, _) -> list_append_str (x_target_names ts) (body_targets rest)
      | _ -> body_targets rest)
 
 and declare_clause_targets = fn env -> fn clauses ->
@@ -4777,6 +4984,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | _ ->
        let values = eval_args env world blk rhs in
        let _ = assign_targets env world targets values in
+       FNext (arr_new values))
+  | SMultiAssignX (targets, rhs) ->
+    (match rhs with
+     | Cons (single, Nil) ->
+       let rv = eval_e env world blk single in
+       let values = (match rv with VArr id -> deref id | v -> Cons (v, Nil)) in
+       let _ = assign_x_targets env world blk targets values in
+       FNext rv
+     | _ ->
+       let values = eval_args env world blk rhs in
+       let _ = assign_x_targets env world blk targets values in
        FNext (arr_new values))
 
 and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescues -> fn (els: Stmt list) -> fn (ens: Stmt list) ->
