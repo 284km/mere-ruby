@@ -6205,6 +6205,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
     // Encoding objects: name/to_s give the label, inspect is #<Encoding:name>.
+    else if str_eq cls "MatchData" && (str_eq name "[]" || str_eq name "to_a" || str_eq name "captures") then
+      (if str_eq name "[]" then
+         (match args with Cons (VInt n, _) -> (if map_has ivars (str_of_int id ++ "@" ++ str_of_int n) then map_get ivars (str_of_int id ++ "@" ++ str_of_int n) else VNil) | _ -> VNil)
+       else arr_new (matchdata_arr ivars id (if str_eq name "captures" then 1 else 0)))
     else if str_eq cls "Encoding" && (str_eq name "name" || str_eq name "to_s") then
       (if map_has ivars (str_of_int id ++ "@name") then map_get ivars (str_of_int id ++ "@name") else mkstr "")
     else if str_eq cls "Encoding" && str_eq name "inspect" then
@@ -6504,6 +6508,17 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> recv)
   else if str_eq name "between?" then
     (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
+  // String#match? / #match (and the Regexp receiver forms).
+  else if str_eq name "match?" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
+    (match recv with
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex p, _) -> VBool (rx_match p sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) sv) | _ -> VBool false)
+     | VRegex p -> (match args with Cons (VStr sv, _) -> VBool (rx_match p (sget sv)) | _ -> VBool false)
+     | _ -> VBool false)
+  else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
+    (match recv with
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex p, _) -> (let _ = rx_do_match world p sv in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+     | VRegex p -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+     | _ -> VNil)
   // fetch raises a catchable KeyError / IndexError when absent (no default/block).
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
     (match recv with
@@ -8639,6 +8654,19 @@ and rx_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
     let g = rx_count pat ")" p + 1 in
     let _ = map_set rx_caps ("e" ++ str_of_int g) i in
     rx_here pat (p + 1) s i
+  // \1..\9 backreference: match the text captured by that group (with an
+  // optional +/* quantifier). Empty/uncaptured groups fail.
+  else if str_eq (char_at pat p) "\\" && p + 1 < str_len pat && is_digit (char_at pat (p + 1)) then
+    let g = ord (char_at pat (p + 1)) - 48 in
+    let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
+    (if map_has rx_caps ks && map_has rx_caps ke then
+       let cap = substring s (map_get rx_caps ks) (map_get rx_caps ke) in
+       let clen = str_len cap in
+       let quant = (if p + 2 < str_len pat then char_at pat (p + 2) else "") in
+       if str_eq quant "+" then (if backref_at s i cap clen then rx_backref_many pat (p + 3) s (i + clen) cap clen else false)
+       else if str_eq quant "*" then rx_backref_many pat (p + 3) s i cap clen
+       else (if backref_at s i cap clen then rx_here pat (p + 2) s (i + clen) else false)
+     else false)
   else
     let elen = rx_elen pat p in
     let quant = (if p + elen < str_len pat then char_at pat (p + elen) else "") in
@@ -8649,6 +8677,17 @@ and rx_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
     else
       (if i < str_len s && rx_elem pat p (char_at s i)
        then rx_here pat (p + elen) s (i + 1) else false)
+
+and backref_at = fn (s: str) -> fn (i: int) -> fn (cap: str) -> fn (clen: int) ->
+  clen > 0 && i + clen <= str_len s && str_eq (substring s i (i + clen)) cap
+
+and rx_backref_many = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) -> fn (cap: str) -> fn (clen: int) ->
+  if backref_at s i cap clen && rx_backref_many pat p s (i + clen) cap clen then true
+  else rx_here pat p s i
+
+and rxe_backref_many = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) -> fn (cap: str) -> fn (clen: int) ->
+  if backref_at s i cap clen then (let r = rxe_backref_many pat p s (i + clen) cap clen in if r >= 0 then r else rxe_here pat p s i)
+  else rxe_here pat p s i
 
 // count occurrences of ch in pat before position p.
 and rx_count = fn (pat: str) -> fn (ch: str) -> fn (p: int) ->
@@ -8692,7 +8731,32 @@ and rx_publish = fn world -> fn (pat: str) -> fn (sv: str) -> fn (r: Val) ->
      let id = map_len ocls in
      let _ = map_set ocls (str_of_int id) "MatchData" in
      let _ = map_set globals "~" (VObj id) in
+     // store the whole match (group 0) and groups 1..9 on the object so
+     // MatchData#[] can read them later (globals get clobbered by re-matches).
+     let st = (match r with VInt p -> p | _ -> 0) in
+     let en = (let e = rxe_here pat (rxe_start pat) sv st in if e < 0 then st else e) in
+     let _ = map_set ivars (str_of_int id ++ "@0") (mkstr (substring sv st en)) in
+     let _ = rx_store_groups ivars id sv 1 in
      rx_pub_groups sv 1 true)
+
+and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
+  if g > 9 then ()
+  else
+    let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
+    let _ = (if map_has rx_caps ks && map_has rx_caps ke then
+               let a = map_get rx_caps ks in let b = map_get rx_caps ke in
+               (if b >= a then map_set ivars (str_of_int id ++ "@" ++ str_of_int g) (mkstr (substring sv a b)) else ())
+             else ()) in
+    rx_store_groups ivars id sv (g + 1)
+
+// MatchData#to_a (start=0, incl. whole match) / #captures (start=1).
+and md_max_group = fn ivars -> fn (id: int) -> fn (g: int) ->
+  if g < 1 then 0 else if map_has ivars (str_of_int id ++ "@" ++ str_of_int g) then g else md_max_group ivars id (g - 1)
+and md_collect = fn ivars -> fn (id: int) -> fn (i: int) -> fn (hi: int) ->
+  if i > hi then Nil
+  else Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int i) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i) else VNil), md_collect ivars id (i + 1) hi)
+and matchdata_arr = fn ivars -> fn (id: int) -> fn (start: int) ->
+  md_collect ivars id start (md_max_group ivars id 9)
 
 and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
   if i > 9 then ()
@@ -8773,6 +8837,17 @@ and rxe_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
     let g = rx_count pat ")" p + 1 in
     let _ = map_set rx_caps ("e" ++ str_of_int g) i in
     rxe_here pat (p + 1) s i
+  else if str_eq (char_at pat p) "\\" && p + 1 < str_len pat && is_digit (char_at pat (p + 1)) then
+    let g = ord (char_at pat (p + 1)) - 48 in
+    let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
+    (if map_has rx_caps ks && map_has rx_caps ke then
+       let cap = substring s (map_get rx_caps ks) (map_get rx_caps ke) in
+       let clen = str_len cap in
+       let quant = (if p + 2 < str_len pat then char_at pat (p + 2) else "") in
+       if str_eq quant "+" then (if backref_at s i cap clen then rxe_backref_many pat (p + 3) s (i + clen) cap clen else 0 - 1)
+       else if str_eq quant "*" then rxe_backref_many pat (p + 3) s i cap clen
+       else (if backref_at s i cap clen then rxe_here pat (p + 2) s (i + clen) else 0 - 1)
+     else 0 - 1)
   else
     let elen = rx_elen pat p in
     let quant = (if p + elen < str_len pat then char_at pat (p + elen) else "") in
