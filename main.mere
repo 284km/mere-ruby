@@ -147,7 +147,7 @@ type Stmt = SPuts of Expr list | SExpr of Expr
 // by all aliases. VHsh stays an immutable value list (hash mutation is a
 // later milestone).
 type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
-         | VNil | VArr of int | VHsh of Val list
+         | VNil | VArr of int | VHsh of int
          | VObj of int | VClass of str | VSym of str
          | VRange of int * int * bool
          | VExc of str * str    // exception: class name, message
@@ -198,6 +198,17 @@ let mkstr = fn (s: str) ->
 let sget = fn (id: int) -> vec_get str_store id;
 let sset = fn (id: int) -> fn (s: str) ->
   let _ = vec_set str_store id s in ();
+// hashes are mutable reference types too: VHsh is a HANDLE into hash_store,
+// which holds the interleaved [k1,v1,k2,v2,...] pair list. Aliases share one
+// mutable hash (h[k]=v is seen through every reference).
+let hash_store = vec_new () in
+let mkhash = fn (xs: Val list) ->
+  let id = vec_len hash_store in
+  let _ = vec_push hash_store xs in
+  VHsh id;
+let hderef = fn (id: int) -> vec_get hash_store id;
+let hset = fn (id: int) -> fn (xs: Val list) ->
+  let _ = vec_set hash_store id xs in ();
 // procs/lambdas are handles into this store, which holds their block
 // (has, params, body, captured env) — the env is a Map, so like arrays a
 // proc lives behind an int handle rather than inside the Val variant.
@@ -3318,7 +3329,7 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
      | _ -> false)
   | VNil -> (match vb with VNil -> true | _ -> false)
   | VArr x -> (match vb with VArr y -> if x == y then true else eq_list (deref x) (deref y) | _ -> false)
-  | VHsh xs -> (match vb with VHsh ys -> eq_list xs ys | _ -> false)
+  | VHsh xs -> let xs = hderef xs in (match vb with VHsh ys -> let ys = hderef ys in eq_list xs ys | _ -> false)
   // object identity (same handle); classes and symbols by value.
   | VObj x -> (match vb with VObj y -> x == y | _ -> false)
   | VClass x -> (match vb with VClass y -> str_eq x y | _ -> false)
@@ -3757,6 +3768,22 @@ let rec hash_pairs = fn (xs: Val list) ->
   | Cons (k, rest) -> (match rest with Cons (v, t) -> Cons (arr_new (Cons (k, Cons (v, Nil))), hash_pairs t) | Nil -> Nil);
 let rec hash_len = fn (xs: Val list) ->
   match xs with Nil -> 0 | Cons (_, rest) -> (match rest with Cons (_, t) -> 1 + hash_len t | Nil -> 0);
+// update key k to v (in place order), or append if absent.
+let rec hash_put = fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+  match xs with
+  | Nil -> Cons (k, Cons (v, Nil))
+  | Cons (k2, rest) ->
+    (match rest with
+     | Cons (v2, t) -> if rb_eq k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put t k v))
+     | Nil -> Cons (k, Cons (v, Nil)));
+// remove key k, returning the new pair list.
+let rec hash_del = fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (k2, rest) ->
+    (match rest with
+     | Cons (v2, t) -> if rb_eq k2 k then t else Cons (k2, Cons (v2, hash_del t k))
+     | Nil -> Nil);
 
 // ---- printing (Ruby's to_s / inspect / puts) -----------------------------
 let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
@@ -3804,7 +3831,7 @@ and inspect = fn (v: Val) ->
       let r = "[" ++ join_inspect (deref id) "" ++ "]" in
       let _ = map_delete insp_seen (str_of_int id) in
       r
-  | VHsh xs -> "\{" ++ join_pairs xs "" ++ "}"
+  | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs xs "" ++ "}"
   | VRegex p -> "/" ++ p ++ "/"
   | VSym sy ->
     // a symbol that isn't a plain identifier / valid operator name inspects
@@ -4276,6 +4303,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                && (is_str_mut name || str_eq name "[]=")
                && (if has_meth world "String" name then false else true) then
          (match recv with VStr h -> str_mut_do h name args | _ -> VNil)
+       // in-place hash mutation: rewrite the receiver's store entry.
+       else if (match recv with VHsh _ -> true | _ -> false)
+               && (str_eq name "[]=" || str_eq name "store")
+               && (if has_meth world "Hash" name then false else true) then
+         (match recv with
+          | VHsh h -> (match args with Cons (k, Cons (v, _)) -> let _ = hset h (hash_put (hderef h) k v) in v | _ -> VNil)
+          | _ -> VNil)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
        // assigned value as its expression result, not the writer's return.
        else if is_setter_name name then
@@ -4288,7 +4322,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let newblk = (true, bp, bb, env) in
     invoke_with_block env world blk recv name args newblk
   | EArr items -> arr_new (eval_args env world blk items)
-  | EHsh items -> VHsh (hsh_eval_items env world blk items)
+  | EHsh items -> mkhash (hsh_eval_items env world blk items)
   | EUn (op, a) ->
     if str_eq op "!" then
       (let v = eval_e env world blk a in
@@ -4388,7 +4422,7 @@ and hsh_eval_items = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
      | EKwSplat e ->
        (match rest0 with
         | Cons (_, rest) ->
-          let pairs = (match eval_e env world blk e with VHsh xs -> xs | _ -> Nil) in
+          let pairs = (match eval_e env world blk e with VHsh xs -> let xs = hderef xs in xs | _ -> Nil) in
           list_append pairs (hsh_eval_items env world blk rest)
         | Nil -> Nil)
      | _ ->
@@ -4406,7 +4440,7 @@ and rb_identical = fn (a: Val) -> fn (b: Val) ->
   | VObj ia -> (match b with VObj ib -> ia == ib | _ -> false)
   // strings are handles: equal? is object identity, not content equality.
   | VStr ia -> (match b with VStr ib -> ia == ib | _ -> false)
-  | VHsh _ -> false
+  | VHsh ia -> (match b with VHsh ib -> ia == ib | _ -> false)
   | _ -> rb_eq a b
 
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
@@ -4416,7 +4450,7 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Cons (ESplat e, t) ->
     let spread = (match eval_e env world blk e with
                   | VArr id -> deref id
-                  | VHsh xs -> hash_to_a xs   // *hash spreads as [k, v] pairs
+                  | VHsh xs -> let xs = hderef xs in hash_to_a xs   // *hash spreads as [k, v] pairs
                   | VNil -> Nil   // [*nil] is empty
                   // a non-array splat calls to_a if the object responds to
                   // it: a real/singleton method, or a user respond_to? that
@@ -4494,6 +4528,12 @@ and nil_pad = fn (k: int) ->
   if k <= 0 then (Nil : Val list) else Cons (VNil, nil_pad (k - 1))
 
 and vlen = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + vlen t
+and val_repeat = fn (n: int) -> fn (v: Val) ->
+  if n <= 0 then Nil else Cons (v, val_repeat (n - 1) v)
+// Array.new(n) { |i| ... }: element i is the block's value for index i.
+and array_new_blk = fn world -> fn encl -> fn theblk -> fn (n: int) -> fn (i: int) ->
+  if i >= n then Nil
+  else Cons (flow_value (run_block world encl theblk (Cons (VInt i, Nil))), array_new_blk world encl theblk n (i + 1))
 and vtake = fn (xs: Val list) -> fn (n: int) ->
   if n <= 0 then Nil else (match xs with Nil -> Nil | Cons (h, t) -> Cons (h, vtake t (n - 1)))
 and vdrop = fn (xs: Val list) -> fn (n: int) ->
@@ -4834,9 +4874,9 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
        let n = vlen argvals0 in
        if n > 0 then
          (match vdrop argvals0 (n - 1) with
-          | Cons (VHsh hx, _) -> let _ = map_set cenv dsname (VHsh hx) in vtake argvals0 (n - 1)
-          | _ -> let _ = map_set cenv dsname (VHsh Nil) in argvals0)
-       else let _ = map_set cenv dsname (VHsh Nil) in argvals0) in
+          | Cons (VHsh hx, _) -> let hx = hderef hx in let _ = map_set cenv dsname (mkhash hx) in vtake argvals0 (n - 1)
+          | _ -> let _ = map_set cenv dsname (mkhash Nil) in argvals0)
+       else let _ = map_set cenv dsname (mkhash Nil) in argvals0) in
   // keyword params (`k:` names): peel the trailing hash and bind them
   // (a nil bind lets the defaults prologue apply); the presence of any
   // keyword param disables auto-splat.
@@ -5047,10 +5087,13 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "find_index" || str_eq name "index" then arr_find_index world encl theblk xs 0
     else if str_eq name "flat_map" || str_eq name "collect_concat" then iter_result (arr_map world encl theblk xs Nil) recv
     else prim_method recv name args
-  | VHsh xs ->
-    if str_eq name "each" then iter_each_result (hash_each world encl theblk xs) recv
-    else if str_eq name "select" then iter_result (hash_filter world encl theblk xs Nil) recv
-    else prim_method recv name args
+  | VHsh xs -> let xs = hderef xs in
+    if str_eq name "each" || str_eq name "each_pair" then iter_each_result (hash_each world encl theblk xs) recv
+    else if str_eq name "select" || str_eq name "filter" then iter_result (hash_filter world encl theblk xs Nil true) recv
+    else if str_eq name "reject" then iter_result (hash_filter world encl theblk xs Nil false) recv
+    // other Enumerable methods iterate the [k,v] pairs as an array; the
+    // block's |k, v| params auto-splat each pair.
+    else builtin_iter world encl theblk (arr_new (hash_to_a xs)) name args
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
     if str_eq name "each" then iter_each_result (range_each world encl theblk lo last) recv
@@ -5151,16 +5194,18 @@ and hash_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
      | Nil -> FNext VNil)
 
 // hash.select { |k, v| ... } keeps matching pairs, rebuilding a Hash.
-and hash_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
+and hash_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) -> fn (keep: bool) ->
   match xs with
-  | Nil -> FNext (VHsh (val_rev acc Nil))
+  | Nil -> FNext (mkhash (val_rev acc Nil))
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
        (match run_block world encl theblk (Cons (k, Cons (v, Nil))) with
         | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
-        | f -> hash_filter world encl theblk t (if truthy (flow_value f) then Cons (v, Cons (k, acc)) else acc))
-     | Nil -> FNext (VHsh (val_rev acc Nil)))
+        | f -> let cond = truthy (flow_value f) in
+               let take = if keep then cond else (if cond then false else true) in
+               hash_filter world encl theblk t (if take then Cons (v, Cons (k, acc)) else acc) keep)
+     | Nil -> FNext (mkhash (val_rev acc Nil)))
 
 // core methods on primitive receivers (String / Array / Hash / Integer),
 // all non-mutating. Indexing (`[]`) and the read-heavy Enumerable methods
@@ -5183,6 +5228,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       let hi = (match args with Cons (_, Cons (VInt b, _)) -> b | _ -> 4611686018427387903) in
       let excl = (match args with Cons (_, Cons (_, Cons (e, _))) -> truthy e | _ -> false) in
       VRange (lo, hi, excl)
+    else if str_eq c "Hash" && str_eq name "new" then mkhash Nil
+    else if str_eq c "Array" && str_eq name "new" then
+      (match args with
+       | Cons (VInt n, Cons (d, _)) -> arr_new (val_repeat n d)
+       | Cons (VInt n, _) -> arr_new (val_repeat n VNil)
+       | _ -> arr_new Nil)
     else if str_eq name "new" then new_obj world c args
     else if str_eq name "name" then mkstr c
     else if str_eq name "const_defined?" then
@@ -5343,6 +5394,9 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (let (h3, ps3, bb3, e3) = newblk in
           let _ = flow_value (register_class world c bb3) in
           VClass c)
+       else if str_eq c "Array" && str_eq name "new" then
+         (match args with Cons (VInt n, _) -> arr_new (array_new_blk world blk newblk n 0) | _ -> arr_new Nil)
+       else if str_eq c "Hash" && str_eq name "new" then mkhash Nil
        else if str_eq name "new" then new_obj world c args
        else if has_meth world c name then invoke world newblk recv c name args
        else prim_method recv name args
@@ -5492,7 +5546,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "dup" || str_eq name "clone" then
     // strings are handles now: dup MUST copy, else mutating the dup would
     // write through to the original.
-    (match recv with VArr id -> arr_new (deref id) | VStr h -> mkstr (sget h) | _ -> recv)
+    (match recv with VArr id -> arr_new (deref id) | VStr h -> mkstr (sget h) | VHsh h -> mkhash (hderef h) | _ -> recv)
   else if str_eq name "itself" then recv
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
@@ -5530,17 +5584,17 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "to_a" then
     (match recv with
      | VArr id -> VArr id
-     | VHsh xs -> arr_new (hash_to_a xs)
+     | VHsh xs -> let xs = hderef xs in arr_new (hash_to_a xs)
      | VRange (lo, hi, excl) -> arr_new (range_to_a lo (if excl then hi - 1 else hi))
      | _ -> fail "mere-ruby: no to_a")
   else if str_eq name "size" || str_eq name "length" then
     (match recv with
      | VArr id -> VInt (val_list_len (deref id)) | VStr s -> let s = sget s in VInt (str_len s)
-     | VHsh xs -> VInt (hash_len xs) | _ -> fail "mere-ruby: no size")
+     | VHsh xs -> let xs = hderef xs in VInt (hash_len xs) | _ -> fail "mere-ruby: no size")
   else if str_eq name "empty?" then
     (match recv with
      | VArr id -> VBool (val_list_len (deref id) == 0) | VStr s -> let s = sget s in VBool (str_len s == 0)
-     | VHsh xs -> VBool (hash_len xs == 0) | _ -> fail "mere-ruby: no empty?")
+     | VHsh xs -> let xs = hderef xs in VBool (hash_len xs == 0) | _ -> fail "mere-ruby: no empty?")
   else if str_eq name "[]" then
     (match recv with
      | VArr id ->
@@ -5577,7 +5631,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // s["sub"]: the substring itself if present, else nil.
         | Cons (VStr sub, _) -> let sub = sget sub in if str_contains s sub then mkstr sub else VNil
         | _ -> VNil)
-     | VHsh xs -> (match args with Cons (k, _) -> hash_get xs k | _ -> VNil)
+     | VHsh xs -> let xs = hderef xs in (match args with Cons (k, _) -> hash_get xs k | _ -> VNil)
      | _ -> fail "mere-ruby: no []")
   // Integer
   else if str_eq name "even?" then (match recv with VInt n -> VBool (floor_mod n 2 == 0) | _ -> fail "no even?")
@@ -5661,7 +5715,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr s -> let s = sget s in (match args with Cons (VStr sub, _) -> let sub = sget sub in VBool (str_contains s sub) | _ -> VBool false)
      | VArr id -> (match args with Cons (v, _) -> VBool (val_contains (deref id) v) | _ -> VBool false)
-     | VHsh xs -> (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false)
+     | VHsh xs -> let xs = hderef xs in (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false)
      | _ -> fail "no include?")
   else if str_eq name "start_with?" then
     (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in VBool (str_starts_with s p) | _ -> VBool false) | _ -> fail "no start_with?")
@@ -5725,7 +5779,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> fail "no count")
   else if str_eq name "join" then
     (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join xs sep "" true) | _ -> mkstr (val_join xs "" "" true)) | _ -> fail "no join")
-  else if str_eq name "to_h" then (match recv with VArr id -> VHsh (val_to_h (deref id)) | VHsh xs -> VHsh xs | _ -> fail "no to_h")
+  else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh xs -> mkhash (hderef xs) | _ -> fail "no to_h")
   // Hash
   // Array mutation (in place; VArr is a handle into the shared store).
   else if str_eq name "push" || str_eq name "append" then
@@ -5788,10 +5842,10 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let _ = arr_set id (val_set_at xs j v) in v
         | _ -> VNil)
      | _ -> fail "no []=")
-  else if str_eq name "keys" then (match recv with VHsh xs -> arr_new (hash_keys xs) | _ -> fail "no keys")
-  else if str_eq name "values" then (match recv with VHsh xs -> arr_new (hash_values xs) | _ -> fail "no values")
+  else if str_eq name "keys" then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_keys xs) | _ -> fail "no keys")
+  else if str_eq name "values" then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values xs) | _ -> fail "no values")
   else if str_eq name "key?" || str_eq name "has_key?" then
-    (match recv with VHsh xs -> (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false) | _ -> fail "no key?")
+    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false) | _ -> fail "no key?")
   else fail ("mere-ruby: undefined method '" ++ name ++ "' for this value")
 
 and class_name = fn (recv: Val) ->
@@ -6020,6 +6074,14 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
 
 // allocate an object, then run initialize if the class defines one.
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
+  // built-in mutable containers construct their store-backed value, not a
+  // generic object (so Array.new / Hash.new via any dispatch path work).
+  if str_eq cls "Hash" then mkhash Nil
+  else if str_eq cls "Array" then
+    (match args with Cons (VInt n, Cons (d, _)) -> arr_new (val_repeat n d) | Cons (VInt n, _) -> arr_new (val_repeat n VNil) | _ -> arr_new Nil)
+  else if str_eq cls "String" then
+    (match args with Cons (VStr h, _) -> mkstr (sget h) | _ -> mkstr "")
+  else
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in   // placeholder cenv (unused; must be Map[str,Val])
   let id = map_len ocls in
@@ -6084,7 +6146,7 @@ and pos_params = fn (params: str list) ->
 
 and peel_trailing_hash = fn (args: Val list) ->
   match rev_app args Nil with
-  | Cons (VHsh xs, rrest) -> (rev_app rrest Nil, xs)
+  | Cons (VHsh xs, rrest) -> let xs = hderef xs in (rev_app rrest Nil, xs)
   | _ -> (args, (Nil : Val list))
 
 and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn (defaults: (str * Expr) list) -> fn (kwhash: Val list) ->
@@ -6093,7 +6155,7 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
   | Cons (p, rest) ->
     if str_len p > 1 && str_eq (substring p 0 2) "**" then
       // **kwargs takes the whole keyword hash.
-      let _ = map_set frame (substring p 2 (str_len p)) (VHsh kwhash) in
+      let _ = map_set frame (substring p 2 (str_len p)) (mkhash kwhash) in
       bind_kw_params frame world blk rest defaults kwhash
     else
     let nm = substring p 0 (str_len p - 1) in
@@ -6122,9 +6184,9 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
        let n = vlen args0 in
        if n > 0 then
          (match vdrop args0 (n - 1) with
-          | Cons (VHsh hx, _) -> let _ = map_set frame dsname (VHsh hx) in vtake args0 (n - 1)
-          | _ -> let _ = map_set frame dsname (VHsh Nil) in args0)
-       else let _ = map_set frame dsname (VHsh Nil) in args0) in
+          | Cons (VHsh hx, _) -> let hx = hderef hx in let _ = map_set frame dsname (mkhash hx) in vtake args0 (n - 1)
+          | _ -> let _ = map_set frame dsname (mkhash Nil) in args0)
+       else let _ = map_set frame dsname (mkhash Nil) in args0) in
   let kws = kw_params params1 in
   let params = pos_params params1 in
   // peel the trailing hash for keyword args (only when the method has some).
