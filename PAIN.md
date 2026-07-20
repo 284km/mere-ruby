@@ -31,6 +31,31 @@ prevent this class of surprise. (2) `vec` covered the need completely —
 the pain is discoverability, not capability: the codegen error message
 mentioning `vec_len` was how this author learned vectors existed.
 
+## M8. Three different integer widths collide when building a bignum
+
+Implementing arbitrary-precision integers surfaced that Mere's `int` has
+*two* widths and a UB trap, all at once:
+
+1. **Runtime is 64-bit.** The generated C uses `int64_t`, so at run time
+   `int` is a signed 64-bit value (max 9223372036854775807).
+2. **The compiler is 63-bit.** `mere.exe` is OCaml, whose native `int` is
+   63-bit. Writing the literal `9223372036854775807` in a `.mere` source
+   file makes the compiler's `int_of_string` overflow and abort with
+   `Failure("int_of_string")` — you cannot name the runtime maximum
+   directly. Work-around: compute it, `4611686018427387903 * 2 + 1`
+   (2^62-1 is exactly the OCaml max and is writable).
+3. **`clang -O2` deletes overflow checks.** Signed overflow is UB in C, so
+   the natural `let r = a + b in if r < 0 then ...overflowed...` is
+   optimised away — the compiler assumes it can't happen. Overflow must be
+   detected *before* the operation, via bound pre-checks
+   (`a > int_max - b`), never after.
+
+None of these is visible until a program needs a value past 2^62. A note
+in the Mere docs about the compile-time literal ceiling (and that the
+runtime is wider than the compiler's `int`) would save the surprise.
+Also, `of` and `signed` are reserved (Mere keyword / C keyword) and can't
+be used as `let` names — the C one only surfaces at the clang stage.
+
 ## M6. A caught `fail` printed to stderr — FIXED upstream (Mere v0.1.67)
 
 Ruby exceptions have no native counterpart in Mere, so `begin/rescue` is
