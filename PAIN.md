@@ -3,6 +3,34 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
+## M7. `Map` is a linear-scan assoc array — a dense-int-keyed store degrades O(n²)
+
+Ruby strings are mutable reference types, so the interpreter's `VStr`
+became a handle into a global string store. First cut: a `Map` keyed by
+`str_of_int id` — the same pattern the array store had used all along.
+Result: an eval-heavy test went from 0.21s to 18.8s (90x), with correct
+output.
+
+The C backend's `Map` is a linear-scan pair of parallel arrays:
+`map_set` scans all existing keys (strcmp each) before appending, and
+`map_get` scans from the front. For a store whose keys are dense
+integers 0..n-1 that is the worst case twice over — every allocation is
+O(n), the total is O(n²), and the strcmp is against keys that only
+differ in their last characters. Strings allocate far more often than
+arrays (every literal evaluation, every `to_s`, every concat), which is
+why the array store never made this visible.
+
+The fix was already in the language: `vec_new`/`vec_push`/`vec_get`/
+`vec_set` are O(1) and exactly fit an append-only handle store. Swapping
+the store restored the original runtime to the second.
+
+Two findings for Mere: (1) `Map`'s complexity is a silent trap — nothing
+in its API distinguishes it from a hash table until a workload leans on
+it; a hashed implementation (or a documented complexity note) would
+prevent this class of surprise. (2) `vec` covered the need completely —
+the pain is discoverability, not capability: the codegen error message
+mentioning `vec_len` was how this author learned vectors existed.
+
 ## M6. A caught `fail` printed to stderr — FIXED upstream (Mere v0.1.67)
 
 Ruby exceptions have no native counterpart in Mere, so `begin/rescue` is
