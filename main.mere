@@ -3366,6 +3366,7 @@ let cmp_vals = fn (va: Val) -> fn (vb: Val) ->
       (match vb with
        | VStr y -> let y = sget y in str_compare x y
        | _ -> fail "mere-ruby: comparison of incompatible types")
+    | VSym x -> (match vb with VSym y -> str_compare x y | _ -> fail "mere-ruby: comparison of incompatible types")
     | _ -> fail "mere-ruby: comparison of incompatible types";
 
 let rec list_append = fn (xs: Val list) -> fn (ys: Val list) ->
@@ -5086,6 +5087,13 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "none?" then arr_none world encl theblk xs
     else if str_eq name "find_index" || str_eq name "index" then arr_find_index world encl theblk xs 0
     else if str_eq name "flat_map" || str_eq name "collect_concat" then iter_result (arr_map world encl theblk xs Nil) recv
+    else if str_eq name "min_by" then arr_min_by world encl theblk xs false
+    else if str_eq name "max_by" then arr_min_by world encl theblk xs true
+    else if str_eq name "sort_by" then iter_result (FNext (arr_new (extract_vals (sort_by_key (arr_keyed world encl theblk xs))))) recv
+    else if str_eq name "sum" then (match args with Cons (init, _) -> arr_sum_blk world encl theblk xs init | Nil -> arr_sum_blk world encl theblk xs (VInt 0))
+    else if str_eq name "partition" then arr_partition world encl theblk xs Nil Nil
+    else if str_eq name "group_by" then arr_group_by world encl theblk xs Nil
+    else if str_eq name "each_with_object" then (match args with Cons (o, _) -> arr_each_with_object world encl theblk xs o | Nil -> VNil)
     else prim_method recv name args
   | VHsh xs -> let xs = hderef xs in
     if str_eq name "each" || str_eq name "each_pair" then iter_each_result (hash_each world encl theblk xs) recv
@@ -5098,7 +5106,8 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     let last = if excl then hi - 1 else hi in
     if str_eq name "each" then iter_each_result (range_each world encl theblk lo last) recv
     else if str_eq name "map" then iter_result (range_map world encl theblk lo last Nil) recv
-    else prim_method recv name args
+    // other Enumerable methods operate on the materialised elements.
+    else builtin_iter world encl theblk (arr_new (range_to_a lo last)) name args
   | VInt n ->
     if str_eq name "times" then iter_each_result (range_each world encl theblk 0 (n - 1)) recv
     else if str_eq name "upto" then
@@ -5172,6 +5181,65 @@ and arr_reduce = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (ac
     (match run_block world encl theblk (Cons (acc, Cons (h, Nil))) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | f -> arr_reduce world encl theblk t (flow_value f))
+
+// min_by / max_by: the element whose block value is smallest / largest.
+and arr_min_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (want_max: bool) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (h, t) -> arr_min_by_go world encl theblk t h (flow_value (run_block world encl theblk (Cons (h, Nil)))) want_max
+and arr_min_by_go = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (best: Val) -> fn (bestk: Val) -> fn (want_max: bool) ->
+  match xs with
+  | Nil -> best
+  | Cons (h, t) ->
+    let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+    let c = cmp_vals k bestk in
+    let better = if want_max then c > 0 else c < 0 in
+    if better then arr_min_by_go world encl theblk t h k want_max
+    else arr_min_by_go world encl theblk t best bestk want_max
+
+// sort_by: sort elements by their block value (decorate-sort-undecorate).
+and arr_keyed = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) ->
+    let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+    Cons (arr_new (Cons (k, Cons (h, Nil))), arr_keyed world encl theblk t)
+and pair_key = fn (p: Val) -> match p with VArr id -> (match deref id with Cons (k, _) -> k | _ -> VNil) | _ -> VNil
+and pair_val = fn (p: Val) -> match p with VArr id -> (match deref id with Cons (_, Cons (v, _)) -> v | _ -> VNil) | _ -> VNil
+and insert_by_key = fn (p: Val) -> fn (ps: Val list) ->
+  match ps with Nil -> Cons (p, Nil) | Cons (h, t) -> if cmp_vals (pair_key p) (pair_key h) <= 0 then Cons (p, ps) else Cons (h, insert_by_key p t)
+and sort_by_key = fn (ps: Val list) -> match ps with Nil -> Nil | Cons (h, t) -> insert_by_key h (sort_by_key t)
+and extract_vals = fn (ps: Val list) -> match ps with Nil -> Nil | Cons (h, t) -> Cons (pair_val h, extract_vals t)
+
+// sum with a block: total of the block values (starting from init).
+and arr_sum_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) -> arr_sum_blk world encl theblk t (arith_bin "+" acc (flow_value (run_block world encl theblk (Cons (h, Nil)))))
+
+// partition: [elements where block is truthy, the rest].
+and arr_partition = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (yes: Val list) -> fn (no: Val list) ->
+  match xs with
+  | Nil -> arr_new (Cons (arr_new (val_rev yes Nil), Cons (arr_new (val_rev no Nil), Nil)))
+  | Cons (h, t) ->
+    if truthy (flow_value (run_block world encl theblk (Cons (h, Nil))))
+    then arr_partition world encl theblk t (Cons (h, yes)) no
+    else arr_partition world encl theblk t yes (Cons (h, no))
+
+// group_by: hash of block-value -> array of elements (first-seen order).
+and arr_group_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> mkhash acc
+  | Cons (h, t) ->
+    let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+    let lst = (match hash_get acc k with VArr id -> list_append (deref id) (Cons (h, Nil)) | _ -> Cons (h, Nil)) in
+    arr_group_by world encl theblk t (hash_put acc k (arr_new lst))
+
+// each_with_object(o): run block with (elem, o) for each; return o.
+and arr_each_with_object = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (o: Val) ->
+  match xs with
+  | Nil -> o
+  | Cons (h, t) -> let _ = flow_value (run_block world encl theblk (Cons (h, Cons (o, Nil)))) in arr_each_with_object world encl theblk t o
 
 and arr_count_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (n: int) ->
   match xs with
