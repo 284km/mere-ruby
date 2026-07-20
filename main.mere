@@ -3666,7 +3666,7 @@ let mul_int_ov = fn (a: int) -> fn (b: int) ->
               else (if b > 0 then a < int_min / b else b < int_max / a) in
     if ovf then norm_big (big_mul_s (str_of_int a) (str_of_int b)) else VInt (a * b);
 
-let cmp_vals = fn (va: Val) -> fn (vb: Val) ->
+let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
   // bignum (or bignum vs int): compare exact decimal values, not floats.
   if (match va with VBig _ -> true | _ -> false) && (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
      || (match vb with VBig _ -> true | _ -> false) && (match va with VInt _ -> true | _ -> false)
@@ -3698,7 +3698,16 @@ let cmp_vals = fn (va: Val) -> fn (vb: Val) ->
        | VStr y -> let y = sget y in str_compare x y
        | _ -> fail "mere-ruby: comparison of incompatible types")
     | VSym x -> (match vb with VSym y -> str_compare x y | _ -> fail "mere-ruby: comparison of incompatible types")
-    | _ -> fail "mere-ruby: comparison of incompatible types";
+    // Array <=> Array: element-wise, then by length (Ruby semantics).
+    | VArr x -> (match vb with VArr y -> arr_cmp (deref x) (deref y) | _ -> fail "mere-ruby: comparison of incompatible types")
+    | _ -> fail "mere-ruby: comparison of incompatible types"
+and arr_cmp = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> 0 | _ -> 0 - 1)
+  | Cons (h, t) ->
+    (match ys with
+     | Nil -> 1
+     | Cons (h2, t2) -> let c = cmp_vals h h2 in if c == 0 then arr_cmp t t2 else c);
 
 let rec list_append = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append t ys);
@@ -6264,6 +6273,12 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // over the hardcoded iterators.
        let pcls = class_name recv in
        if has_meth world pcls name then invoke world newblk recv pcls name args
+       // Hash#merge/merge!/update with a conflict block.
+       else if (str_eq name "merge" || str_eq name "merge!" || str_eq name "update") && (match recv with VHsh _ -> true | _ -> false) then
+         (match recv with
+          | VHsh h -> let merged = hash_merge_block world newblk (hderef h) args in
+            (if str_eq name "merge" then mkhash merged else let _ = hset h merged in recv)
+          | _ -> recv)
        // String#gsub/sub with a block: the block computes each replacement.
        else if (str_eq name "gsub" || str_eq name "sub") && (match recv with VStr _ -> true | _ -> false) then
          (match recv with
@@ -6757,7 +6772,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VInt n, _) -> let k = if n < 0 then 0 else n in arr_new (vdrop xs (if len - k < 0 then 0 else len - k))
         | _ -> val_nth xs (len - 1))
      | _ -> fail "no last")
-  else if str_eq name "sort" then (match recv with VArr id -> arr_new (val_sort (deref id)) | _ -> fail "no sort")
+  else if str_eq name "sort" then (match recv with VArr id -> arr_new (val_sort (deref id)) | VHsh xs -> arr_new (val_sort (hash_pairs (hderef xs))) | _ -> fail "no sort")
   else if str_eq name "uniq" then (match recv with VArr id -> arr_new (val_uniq (deref id) Nil) | _ -> fail "no uniq")
   else if str_eq name "flatten" then
     (match recv with VArr id -> (match args with Cons (VInt d, _) -> arr_new (val_flatten (deref id) d) | _ -> arr_new (val_flatten (deref id) (0 - 1))) | _ -> fail "no flatten")
@@ -6804,6 +6819,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VArr id -> let xs = deref id in (match args with Cons (v, _) -> VInt (val_count_eq xs v) | Nil -> VInt (val_list_len xs))
      | VStr s -> let s = sget s in (match args with Cons (VStr _, _) -> VInt (str_count_sets s (collect_str_args args)) | _ -> VInt 0)
+     | VHsh xs -> VInt (vlen (hash_keys (hderef xs)))
      | _ -> fail "no count")
   else if str_eq name "join" then
     (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join xs sep "" true) | _ -> mkstr (val_join xs "" "" true)) | _ -> fail "no join")
@@ -6876,6 +6892,8 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (k, _) -> VBool (hash_haskey xs k) | _ -> VBool false) | _ -> fail "no key?")
   else if str_eq name "has_value?" || str_eq name "value?" then
     (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (v, _) -> VBool (hash_has_value xs v) | _ -> VBool false) | _ -> fail "no value?")
+  else if str_eq name "each_pair" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with VHsh xs -> arr_new (hash_pairs (hderef xs)) | _ -> VNil)
   else if str_eq name "merge" then
     (match recv with VHsh xs -> mkhash (hash_merge_all (hderef xs) args) | _ -> fail "no merge")
   else if str_eq name "merge!" || str_eq name "update" then
@@ -6928,6 +6946,27 @@ and apply_bin_vals = fn world -> fn blk -> fn (op: str) -> fn (a: Val) -> fn (b:
   let _ = map_set e2 "__ra" a in
   let _ = map_set e2 "__rb" b in
   eval_e e2 world blk (EBin (op, EVar "__ra", EVar "__rb"))
+
+// Hash#merge with a conflict block: on a duplicate key, the value is
+// block(key, old_value, new_value). Folds every VHsh argument left to right.
+and hash_merge_block = fn world -> fn nb -> fn (base: Val list) -> fn (args: Val list) ->
+  match args with
+  | Nil -> base
+  | Cons (VHsh o, t) -> hash_merge_block world nb (hash_merge_one_block world nb base (hderef o)) t
+  | Cons (_, t) -> hash_merge_block world nb base t
+
+and hash_merge_one_block = fn world -> fn nb -> fn (base: Val list) -> fn (other: Val list) ->
+  match other with
+  | Nil -> base
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       let amb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+       let nv = (if hash_haskey base k
+                 then flow_value (run_block world amb nb (Cons (k, Cons (hash_get base k, Cons (v, Nil)))))
+                 else v) in
+       hash_merge_one_block world nb (hash_put base k nv) t
+     | Nil -> base)
 
 // ---- sprintf/format/`%` string formatting -------------------------------
 // %[flags][width][.prec]type ; flags: - + 0 space # ; types: d i u s f x X o b c
