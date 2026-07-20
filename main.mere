@@ -222,6 +222,14 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
 let hash_dflt = map_new () in
 let hdflt_set = fn (id: int) -> fn (v: Val) -> let _ = map_set hash_dflt (str_of_int id) v in ();
 let hdflt_get = fn (id: int) -> if map_has hash_dflt (str_of_int id) then map_get hash_dflt (str_of_int id) else VNil;
+// per-string encoding label (str handle id -> encoding name); default UTF-8.
+let str_enc = map_new () in
+let senc_set = fn (id: int) -> fn (nm: str) -> let _ = map_set str_enc (str_of_int id) nm in ();
+let senc_get = fn (id: int) -> if map_has str_enc (str_of_int id) then map_get str_enc (str_of_int id) else "UTF-8";
+// the shared Encoding objects, keyed by canonical name; enc_name maps an
+// Encoding object's handle id -> name so the (world-free) printer can format it.
+let enc_objs = map_new () in
+let enc_name = map_new () in
 // procs/lambdas are handles into this store, which holds their block
 // (has, params, body, captured env) — the env is a Map, so like arrays a
 // proc lives behind an int handle rather than inside the Val variant.
@@ -3926,6 +3934,8 @@ let flt_round = fn (x: float) -> if x < 0.0 then flt_ceil (x - 0.5) else flt_flo
 let int_round_place = fn (x: int) -> fn (m: int) ->
   if x >= 0 then ((x + m / 2) / m) * m else 0 - (((0 - x) + m / 2) / m) * m;
 
+let rec str_ascii_only = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then true else if ord (char_at s i) >= 128 then false else str_ascii_only s (i + 1);
 let str_swapcase = fn (s: str) ->
   let rec go = fn (i: int) -> fn (acc: str) ->
     if i >= str_len s then acc
@@ -4286,7 +4296,7 @@ let rec to_s = fn (v: Val) ->
   | VSym s -> s
   | VClass c -> c
   | VRegex p -> "(?-mix:" ++ p ++ ")"
-  | VObj _ -> "#<object>"   // disp (world-aware) overrides for objects
+  | VObj id -> if map_has enc_name (str_of_int id) then map_get enc_name (str_of_int id) else "#<object>"   // Encoding#to_s is its name; disp (world-aware) overrides other objects
   | VRange (lo, hi, excl) ->
     str_of_int lo ++ (if excl then "..." else "..") ++ str_of_int hi
   | VExc (_, m) -> m   // Ruby: an exception's to_s is its message
@@ -4311,6 +4321,7 @@ and inspect = fn (v: Val) ->
     // a symbol that isn't a plain identifier / valid operator name inspects
     // quoted and escaped (:"foo bar", :"9", :"a\nb").
     if sym_plain sy then ":" ++ sy else ":\"" ++ esc_str sy 0 "" ++ "\""
+  | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ map_get enc_name (str_of_int id) ++ ">" else "#<object>"
   | _ -> to_s v
 
 and sym_plain = fn (sy: str) ->
@@ -5938,6 +5949,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       (match args with Cons (v, _) -> VBool (map_has ivars (str_of_int id ++ "@" ++ ivar_arg_name (to_s v))) | _ -> VBool false)
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
+    // Encoding objects: name/to_s give the label, inspect is #<Encoding:name>.
+    else if str_eq cls "Encoding" && (str_eq name "name" || str_eq name "to_s") then
+      (if map_has ivars (str_of_int id ++ "@name") then map_get ivars (str_of_int id ++ "@name") else mkstr "")
+    else if str_eq cls "Encoding" && str_eq name "inspect" then
+      mkstr ("#<Encoding:" ++ (if map_has ivars (str_of_int id ++ "@name") then to_s (map_get ivars (str_of_int id ++ "@name")) else "") ++ ">")
     else if is_prim_method name then prim_method recv name args
     // Enumerable (no block): to_a returns the collected array; others delegate.
     else if has_meth world cls "each" && is_enum_method name then
@@ -6364,8 +6380,17 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // String
   else if str_eq name "encoding" then
     (match recv with
-     | VStr _ -> (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8")
+     | VStr h -> let nm = senc_get h in (if map_has enc_objs nm then map_get enc_objs nm else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else mkstr nm)
      | _ -> fail "no encoding")
+  else if str_eq name "force_encoding" then
+    (match recv with VStr h -> (match args with Cons (VStr nm, _) -> let _ = senc_set h (sget nm) in recv | Cons (VObj _, _) -> (match args with Cons (e, _) -> let _ = senc_set h (to_s e) in recv | _ -> recv) | _ -> recv) | _ -> fail "no force_encoding")
+  else if str_eq name "b" then
+    (match recv with VStr h -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id "ASCII-8BIT" in c | _ -> c) | _ -> fail "no b")
+  else if str_eq name "bytesize" then (match recv with VStr h -> VInt (str_len (sget h)) | _ -> fail "no bytesize")
+  else if str_eq name "ascii_only?" then (match recv with VStr h -> VBool (str_ascii_only (sget h) 0) | _ -> VBool false)
+  else if str_eq name "valid_encoding?" then (match recv with VStr _ -> VBool true | _ -> VBool false)
+  else if str_eq name "encode" || str_eq name "encode!" then
+    (match recv with VStr h -> (match args with Cons (nm, _) -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id (to_s nm) in c | _ -> c) | _ -> recv) | _ -> fail "no encode")
   else if str_eq name "upcase" then (match recv with VStr s -> let s = sget s in mkstr (str_upcase s) | _ -> fail "no upcase")
   else if str_eq name "downcase" then (match recv with VStr s -> let s = sget s in mkstr (str_downcase s) | _ -> fail "no downcase")
   else if str_eq name "capitalize" then (match recv with VStr s -> let s = sget s in mkstr (str_capitalize s) | _ -> fail "no capitalize")
@@ -8086,6 +8111,7 @@ and puts_one = fn world -> fn (v: Val) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
     if has_meth world cls "to_s" then
       (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in print s | other -> print (to_s other))
+    else if map_has enc_name (str_of_int id) then print (map_get enc_name (str_of_int id))
     else print ("#<" ++ display_cls world cls ++ ">")
   // a string already ending in a newline doesn't get another (Ruby puts).
   | VStr s -> let s = sget s in
@@ -8108,11 +8134,6 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let src = read_file path in
   let cod0 = src_coding src in
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
-  // Encoding constants compare by name (String#encoding returns the same).
-  let _ = map_set consts "Encoding::US_ASCII" (mkstr "US-ASCII") in
-  let _ = map_set consts "Encoding::UTF_8" (mkstr "UTF-8") in
-  let _ = map_set consts "Encoding::ASCII_8BIT" (mkstr "ASCII-8BIT") in
-  let _ = map_set consts "Encoding::BINARY" (mkstr "ASCII-8BIT") in
   let toks = lex_go src 0 in
   let (prog, rest) = parse_stmts toks Nil in
   let _ =
@@ -8124,6 +8145,22 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let sup = map_new () in
   let ocls = map_new () in
   let ivars = map_new () in
+  // Encoding objects (VObj of class Encoding, name in @name). Shared instances
+  // stored in enc_objs; the constants point at them. String#encoding returns
+  // the matching one, so `x.encoding == Encoding::UTF_8` holds by identity.
+  let mk_enc = fn (nm: str) ->
+    let id = map_len ocls in
+    let _ = map_set ocls (str_of_int id) "Encoding" in
+    let _ = map_set ivars (str_of_int id ++ "@name") (mkstr nm) in
+    let o = VObj id in
+    let _ = map_set enc_objs nm o in
+    let _ = map_set enc_name (str_of_int id) nm in o in
+  let _ = map_set consts "Encoding::UTF_8" (mk_enc "UTF-8") in
+  let _ = map_set consts "Encoding::US_ASCII" (mk_enc "US-ASCII") in
+  let _ = map_set consts "Encoding::ASCII_8BIT" (mk_enc "ASCII-8BIT") in
+  let _ = map_set consts "Encoding::BINARY" (if map_has enc_objs "ASCII-8BIT" then map_get enc_objs "ASCII-8BIT" else mkstr "ASCII-8BIT") in
+  let _ = map_set consts "Encoding::ISO_8859_1" (mk_enc "ISO-8859-1") in
+  let _ = map_set consts "Encoding::ASCII" (if map_has enc_objs "US-ASCII" then map_get enc_objs "US-ASCII" else mkstr "US-ASCII") in
   let _ = map_set sup "StandardError" "Exception" in
   let _ = map_set sup "RuntimeError" "StandardError" in
   let _ = map_set sup "ArgumentError" "StandardError" in
