@@ -161,6 +161,7 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          | VRange of int * int * bool
          | VExc of str * str    // exception: class name, message
          | VProc of int         // a proc/lambda: a handle into proc_store
+         | VBind of int         // a Binding: a handle into bind_store (captured env)
          | VRegex of str        // /pattern/ (minimal matcher)
          | VMain;               // the top-level `self` (main), class Object
 
@@ -236,6 +237,10 @@ let enc_name = map_new () in
 let proc_store = map_new ();
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// Binding objects: id -> the captured local-variable env (which already
+// holds "self"). `binding` captures the current env; eval(str, b) and
+// b.eval(str) re-enter the interpreter against it.
+let bind_store = map_new ();
 // class variables (@@x): "Cls@x" -> value, resolved up the superclass chain.
 let cvars = map_new ();
 // regex capture-group spans recorded during the latest match attempt
@@ -4719,6 +4724,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     if map_has env name then map_get env name
     else if map_has meths name then call_method env world noblk name Nil
+    // Kernel#binding: capture the current locals env (which holds "self").
+    else if str_eq name "binding" then
+      let id = map_len bind_store in
+      let _ = map_set bind_store (str_of_int id) env in
+      VBind id
     else try_self_call env world name Nil
   | ECall (name, arges) ->
     let (meths, sup, ocls, ivars) = world in
@@ -4745,11 +4755,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match args with Cons (VArr id, _) -> VArr id | Cons (VNil, _) -> arr_new Nil | Nil -> arr_new Nil | Cons (v, _) -> arr_new (Cons (v, Nil)))
     else if str_eq name "Hash" then
       (match args with Cons (VHsh h, _) -> VHsh h | _ -> mkhash Nil)
-    // eval "code" re-enters the interpreter in the CURRENT env; a parse
+    // Kernel#binding: capture the current locals env (which holds "self")
+    // as a first-class Binding, unless the user redefined `binding`.
+    else if str_eq name "binding" && (if map_has meths "binding" then false else true) then
+      let id = map_len bind_store in
+      let _ = map_set bind_store (str_of_int id) env in
+      VBind id
+    // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
+    // against that captured env; otherwise it uses the CURRENT env. A parse
     // failure surfaces as a catchable SyntaxError.
     else if str_eq name "eval" then
       (match args with
-       | Cons (VStr code, _) -> let code = sget code in
+       | Cons (VStr code, rest) -> let code = sget code in
+         let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> env) in
          let sentinel = Cons (SDeclare (Cons ("__syntax_error__", Nil)), Nil) in
          let prog2 = try_or (fn (u: unit) ->
            let toks = lex_go code 0 in
@@ -4759,11 +4777,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             if str_eq m "__syntax_error__" then raise_exc world "SyntaxError" "syntax error"
             else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
             else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
-            else eval_run env world blk prog2
+            else eval_run eenv world blk prog2
           | _ ->
             if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
             else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
-            else eval_run env world blk prog2)
+            else eval_run eenv world blk prog2)
        | _ -> fail "mere-ruby: eval expects a string")
     else if map_has meths name then call_method env world noblk name args
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
@@ -6090,6 +6108,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
     else if str_eq name "arity" then VInt 0
     else dispatch_prim env world blk recv name args vischeck
+  | VBind bid ->
+    // binding.eval(str) runs str against the captured env; local_variable_get
+    // reads one captured local. class reports Binding.
+    let benv = map_get bind_store (str_of_int bid) in
+    if str_eq name "eval" then
+      (match args with
+       | Cons (VStr code, _) -> let code = sget code in
+         let toks = lex_go code 0 in
+         let (p2, _) = parse_stmts toks Nil in
+         eval_run benv world blk p2
+       | _ -> fail "mere-ruby: Binding#eval expects a string")
+    else if str_eq name "local_variable_get" then
+      (match args with Cons (VSym n, _) -> (if map_has benv n then map_get benv n else VNil) | _ -> VNil)
+    else if str_eq name "local_variable_set" then
+      (match args with Cons (VSym n, Cons (v, _)) -> let _ = map_set benv n v in v | _ -> VNil)
+    else if str_eq name "local_variable_defined?" then
+      (match args with Cons (VSym n, _) -> VBool (map_has benv n) | _ -> VBool false)
+    else if str_eq name "receiver" || str_eq name "self" then
+      (if map_has benv "self" then map_get benv "self" else VMain)
+    else if str_eq name "class" then VClass "Binding"
+    else dispatch_prim env world blk recv name args vischeck
   | _ -> dispatch_prim env world blk recv name args vischeck
 
 // dispatch `recv.name(args) { block }` — shared by literal-block calls and
@@ -6729,7 +6768,7 @@ and class_name = fn (recv: Val) ->
   | VBool b -> if b then "TrueClass" else "FalseClass"
   | VNil -> "NilClass" | VArr _ -> "Array" | VHsh _ -> "Hash" | VSym _ -> "Symbol"
   | VRange _ -> "Range" | VClass c -> (if map_has modules c then "Module" else "Class") | VObj _ -> "Object"
-  | VExc (c, _) -> c | VProc _ -> "Proc" | VRegex _ -> "Regexp" | VMain -> "Object"
+  | VExc (c, _) -> c | VProc _ -> "Proc" | VBind _ -> "Binding" | VRegex _ -> "Regexp" | VMain -> "Object"
 
 and range_to_a = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (VInt i, range_to_a (i + 1) last)
