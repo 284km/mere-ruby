@@ -4081,6 +4081,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | Cons (VSym m, _) -> VBool (responds world recv m)
           | Cons (VStr m, _) -> VBool (responds world recv m)
           | _ -> VBool false)
+       // in-place string mutation: compute the new string and write it back
+       // to the receiver's lvalue (unless the class redefines the method).
+       else if (match recv with VStr _ -> true | _ -> false)
+               && (is_str_mut name || str_eq name "[]=")
+               && (if has_meth world "String" name then false else true) then
+         (let s = (match recv with VStr s -> s | _ -> "") in
+          let (nv, rv) = (if str_eq name "[]=" then str_index_set s args
+                          else str_mut_apply s name args) in
+          let _ = str_wb env recv_e nv in rv)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
        // assigned value as its expression result, not the writer's return.
        else if is_setter_name name then
@@ -4124,6 +4133,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     // an object whose class defines the operator dispatches to it.
     let va0 = eval_e env world blk a in
+    // `s << x` on a string appends in place: write the result back to the
+    // receiver's lvalue (see the string-mutation note above).
+    if str_eq op "<<" && (match va0 with VStr _ -> true | _ -> false) then
+      (let x = (match va0 with VStr s -> s | _ -> "") in
+       match eval_e env world blk b with
+       | VStr y -> let nv = VStr (x ++ y) in let _ = str_wb env a nv in nv
+       | _ -> fail "mere-ruby: << string needs a string")
+    else
     (match va0 with
      | VObj oid ->
        let (meths, sup, ocls, ivars) = world in
@@ -5165,6 +5182,62 @@ and is_prim_method = fn (name: str) ->
   str_eq name "instance_of?" || str_eq name "respond_to?" || str_eq name "send" ||
   str_eq name "__send__" || str_eq name "hash" || str_eq name "object_id" ||
   str_eq name "==" || str_eq name "!="
+
+// ---- in-place string mutation (lvalue write-back model) -----------------
+// mere strings are value types, so a mutating method computes the new string
+// and writes it back to the receiver's lvalue (a local var). This makes
+// `s << x`, `s.upcase!`, loop-building etc. behave, but does not share
+// mutation through a prior alias (`b = a; b << x` leaves a unchanged) — that
+// would need a handle-based VStr.
+and str_wb = fn env -> fn (recv_e: Expr) -> fn (v: Val) ->
+  (match recv_e with EVar n -> let _ = map_set env n v in () | _ -> ())
+
+and str_concat_vals = fn (args: Val list) ->
+  match args with
+  | Nil -> ""
+  | Cons (v, rest) -> (match v with VStr s -> s | _ -> to_s v) ++ str_concat_vals rest
+
+// bang methods that delegate to an existing non-bang string transform.
+and str_bang_base_ok = fn (b: str) ->
+  str_eq b "upcase" || str_eq b "downcase" || str_eq b "capitalize" ||
+  str_eq b "reverse" || str_eq b "strip" || str_eq b "succ" ||
+  str_eq b "next" || str_eq b "delete"
+
+and is_str_mut = fn (name: str) ->
+  str_eq name "concat" || str_eq name "replace" || str_eq name "clear" ||
+  str_eq name "prepend"
+  || (let n = str_len name in
+      n > 1 && str_eq (char_at name (n - 1)) "!" && str_bang_base_ok (substring name 0 (n - 1)))
+
+// returns (new-string value written back, method's return value).
+and str_mut_apply = fn (s: str) -> fn (name: str) -> fn (args: Val list) ->
+  if str_eq name "clear" then (VStr "", VStr "")
+  else if str_eq name "replace" then
+    (match args with Cons (v, _) -> (let ns = VStr (match v with VStr a -> a | _ -> to_s v) in (ns, ns))
+                   | Nil -> (VStr s, VStr s))
+  else if str_eq name "concat" then (let ns = VStr (s ++ str_concat_vals args) in (ns, ns))
+  else if str_eq name "prepend" then (let ns = VStr (str_concat_vals args ++ s) in (ns, ns))
+  else
+    // bang: compute via the non-bang base; nil return when unchanged.
+    let base = substring name 0 (str_len name - 1) in
+    (match prim_method (VStr s) base args with
+     | VStr ns -> if str_eq ns s then (VStr s, VNil) else (VStr ns, VStr ns)
+     | other -> (VStr s, other))
+
+// `s[i] = r` / `s[i, len] = r`: splice the replacement in. Returns
+// (new-string, assigned value). Out-of-range indices are clamped.
+and str_index_set = fn (s: str) -> fn (args: Val list) ->
+  let n = str_len s in
+  (match args with
+   | Cons (VInt i, Cons (VStr r, Nil)) ->
+     let idx = if i < 0 then n + i else i in
+     let e = if idx + 1 > n then n else idx + 1 in
+     (VStr (substring s 0 idx ++ r ++ substring s e n), VStr r)
+   | Cons (VInt i, Cons (VInt len, Cons (VStr r, Nil))) ->
+     let idx = if i < 0 then n + i else i in
+     let e = if idx + len > n then n else idx + len in
+     (VStr (substring s 0 idx ++ r ++ substring s e n), VStr r)
+   | _ -> (VStr s, VNil))
 
 and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // universal
