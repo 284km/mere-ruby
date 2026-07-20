@@ -4215,6 +4215,15 @@ let rec val_nth = fn (xs: Val list) -> fn (i: int) ->
   | Nil -> VNil
   | Cons (h, t) -> if i == 0 then h else val_nth t (i - 1);
 
+let rec val_len_i = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + val_len_i t;
+
+// gather elements at each given index (Array#values_at); negative = from end.
+let rec arr_values_at = fn (xs: Val list) -> fn (idxs: Val list) ->
+  match idxs with
+  | Nil -> Nil
+  | Cons (VInt i, t) -> Cons (val_nth xs (if i < 0 then val_len_i xs + i else i), arr_values_at xs t)
+  | Cons (_, t) -> arr_values_at xs t;
+
 let rec val_list_of_strs = fn (ss: str list) ->
   match ss with Nil -> Nil | Cons (h, t) -> Cons (mkstr h, val_list_of_strs t);
 
@@ -5868,6 +5877,18 @@ and arr_reverse_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   arr_each world encl theblk (val_rev xs Nil)
 
 // keep (want=true) or drop (want=false) elements by block truthiness.
+// insertion sort using a block comparator (a.sort { |x,y| ... }).
+and sort_blk = fn world -> fn theblk -> fn (xs: Val list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> insert_blk world theblk h (sort_blk world theblk t)
+
+and insert_blk = fn world -> fn theblk -> fn (x: Val) -> fn (sorted: Val list) ->
+  match sorted with
+  | Nil -> Cons (x, Nil)
+  | Cons (h, t) ->
+    let amb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+    let c = (match flow_value (run_block world amb theblk (Cons (x, Cons (h, Nil)))) with VInt n -> n | _ -> 0) in
+    if c <= 0 then Cons (x, sorted) else Cons (h, insert_blk world theblk x t)
+
 and arr_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) -> fn (want: bool) ->
   match xs with
   | Nil -> FNext (arr_new (val_rev acc Nil))
@@ -6273,6 +6294,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // over the hardcoded iterators.
        let pcls = class_name recv in
        if has_meth world pcls name then invoke world newblk recv pcls name args
+       // in-place Array mutators taking a block: map!/select!/reject!/etc.
+       else if (str_eq name "map!" || str_eq name "collect!") && (match recv with VArr _ -> true | _ -> false) then
+         (match recv with VArr id -> (match arr_map world blk newblk (deref id) Nil with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+       else if (str_eq name "select!" || str_eq name "keep_if" || str_eq name "filter!") && (match recv with VArr _ -> true | _ -> false) then
+         (match recv with VArr id -> (match arr_filter world blk newblk (deref id) Nil true with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+       else if (str_eq name "reject!" || str_eq name "delete_if") && (match recv with VArr _ -> true | _ -> false) then
+         (match recv with VArr id -> (match arr_filter world blk newblk (deref id) Nil false with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+       // sort / sort! with a comparator block.
+       else if str_eq name "sort" && (match recv with VArr _ -> true | _ -> false) then
+         (match recv with VArr id -> arr_new (sort_blk world newblk (deref id)) | _ -> recv)
+       else if str_eq name "sort!" && (match recv with VArr _ -> true | _ -> false) then
+         (match recv with VArr id -> let _ = arr_set id (sort_blk world newblk (deref id)) in recv | _ -> recv)
        // Hash#merge/merge!/update with a conflict block.
        else if (str_eq name "merge" || str_eq name "merge!" || str_eq name "update") && (match recv with VHsh _ -> true | _ -> false) then
          (match recv with
@@ -6827,7 +6860,17 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // Hash
   // Array mutation (in place; VArr is a handle into the shared store).
   else if str_eq name "push" || str_eq name "append" then
-    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (list_append (deref id) (Cons (v, Nil))) in recv | Nil -> recv) | _ -> fail "no push")
+    (match recv with VArr id -> let _ = arr_set id (list_append (deref id) args) in recv | _ -> fail "no push")
+  else if str_eq name "sort!" then
+    (match recv with VArr id -> let _ = arr_set id (val_sort (deref id)) in recv | _ -> fail "no sort!")
+  else if str_eq name "reverse!" then
+    (match recv with VArr id -> let _ = arr_set id (val_rev (deref id) Nil) in recv | _ -> fail "no reverse!")
+  else if str_eq name "uniq!" then
+    (match recv with VArr id -> let _ = arr_set id (val_uniq (deref id) Nil) in recv | _ -> fail "no uniq!")
+  else if str_eq name "insert" then
+    (match recv with VArr id -> (match args with Cons (VInt i, rest) -> let xs = deref id in let n = val_list_len xs in let k = (if i < 0 then n + i + 1 else i) in let _ = arr_set id (list_append (vtake xs k) (list_append rest (vdrop xs k))) in recv | _ -> recv) | _ -> fail "no insert")
+  else if str_eq name "fill" then
+    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (val_repeat (val_list_len (deref id)) v) in recv | _ -> recv) | _ -> fail "no fill")
   else if str_eq name "delete" then
     (match recv with
      | VArr id ->
@@ -6837,6 +6880,14 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let had = val_member xs v in
           let _ = arr_set id (val_remove xs v) in
           if had then v else VNil
+        | Nil -> VNil)
+     | VHsh h ->
+       (match args with
+        | Cons (k, _) ->
+          let xs = hderef h in
+          let had = hash_haskey xs k in
+          let v = (if had then hash_get xs k else VNil) in
+          let _ = hset h (hash_del xs k) in v
         | Nil -> VNil)
      | VStr s -> let s = sget s in (match args with Cons (VStr _, _) -> mkstr (str_delete_sets s (collect_str_args args)) | _ -> mkstr s)
      | _ -> fail "no delete")
@@ -6906,7 +6957,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "key" then
     (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (v, _) -> hash_key_of xs v | _ -> VNil) | _ -> fail "no key")
   else if str_eq name "values_at" then
-    (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values_at xs args) | _ -> fail "no values_at")
+    (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values_at xs args) | VArr id -> arr_new (arr_values_at (deref id) args) | _ -> fail "no values_at")
   else if str_eq name "dig" then
     (match recv with
      | VHsh xs -> let xs = hderef xs in (match args with Cons (k, rest) -> let v = hash_get xs k in (match rest with Nil -> v | _ -> if (match v with VNil -> true | _ -> false) then VNil else prim_method v "dig" rest) | _ -> VNil)
