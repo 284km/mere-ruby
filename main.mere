@@ -6214,6 +6214,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
     // Thread#join / #value: the block already ran synchronously.
     else if str_eq cls "Thread" && (str_eq name "join" || str_eq name "value") then recv
+    // Comparable#clamp / #between? on a user object with <=>.
+    else if (str_eq name "clamp" || str_eq name "between?") && has_meth world cls "<=>" then
+      (if str_eq name "between?" then (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
+       else (match args with Cons (lo, Cons (hi, _)) -> (if cmp_vals_w world recv lo < 0 then lo else if cmp_vals_w world recv hi > 0 then hi else recv) | _ -> recv))
     // an object has no such method — raise a catchable NoMethodError.
     else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls world cls)
   | VSym s ->
@@ -6483,14 +6487,21 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     (match recv with VArr id -> (match args with Cons (VInt k, _) -> arr_new (arr_permutations (deref id) k) | _ -> arr_new (arr_permutations (deref id) (vlen (deref id)))) | _ -> recv)
   else if str_eq name "product" && (match recv with VArr _ -> true | _ -> false) then
     (match recv with VArr id -> (match args with Cons (VArr oid, _) -> arr_new (arr_product2 (deref id) (deref oid)) | _ -> arr_new Nil) | _ -> recv)
-  // Comparable#clamp / #between? (any comparable receiver).
+  // Comparable#clamp / #between? (any comparable receiver, incl. user <=>).
   else if str_eq name "clamp" then
     (match args with
      | Cons (VRange (lo, hi, _), _) -> (if cmp_vals recv (VInt lo) < 0 then VInt lo else if cmp_vals recv (VInt hi) > 0 then VInt hi else recv)
-     | Cons (lo, Cons (hi, _)) -> (if cmp_vals recv lo < 0 then lo else if cmp_vals recv hi > 0 then hi else recv)
+     | Cons (lo, Cons (hi, _)) -> (if cmp_vals_w world recv lo < 0 then lo else if cmp_vals_w world recv hi > 0 then hi else recv)
      | _ -> recv)
   else if str_eq name "between?" then
-    (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals recv lo >= 0 && cmp_vals recv hi <= 0) | _ -> VBool false)
+    (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
+  // sort/min/max of an array of user objects use their <=> (pure cmp_vals can't).
+  else if str_eq name "sort" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | _ -> false) | _ -> false) then
+    (match recv with VArr id -> arr_new (sort_w world (deref id)) | _ -> recv)
+  else if str_eq name "min" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | _ -> false) | _ -> false) then
+    (match recv with VArr id -> (match sort_w world (deref id) with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
+  else if str_eq name "max" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | _ -> false) | _ -> false) then
+    (match recv with VArr id -> (match val_rev (sort_w world (deref id)) Nil with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
   // reduce/inject symbol form (no block): `[1,2,3].reduce(:+)` /
   // `.inject(init, :*)`. The block form is handled in invoke_with_block.
   else if (str_eq name "reduce" || str_eq name "inject") &&
@@ -7111,6 +7122,28 @@ and reduce_sym_go = fn env -> fn world -> fn blk -> fn (xs: Val list) -> fn (acc
   match xs with
   | Nil -> acc
   | Cons (h, t) -> reduce_sym_go env world blk t (apply_bin_vals world blk sym acc h) sym
+
+// world-aware compare: a VObj with a user <=> uses it; everything else
+// falls back to the pure cmp_vals. Lets sort/min/max/clamp work on
+// Comparable user objects.
+and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VObj oid ->
+    let (meths, sup, ocls, ivars) = world in
+    let ocl = map_get ocls (str_of_int oid) in
+    if has_meth world ocl "<=>" then
+      let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
+      (match invoke world noblk a ocl "<=>" (Cons (b, Nil)) with VInt n -> n | _ -> 0)
+    else cmp_vals a b
+  | _ -> cmp_vals a b
+
+// insertion sort using the world-aware comparator.
+and sort_w = fn world -> fn (xs: Val list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> insert_w world h (sort_w world t)
+and insert_w = fn world -> fn (x: Val) -> fn (sorted: Val list) ->
+  match sorted with
+  | Nil -> Cons (x, Nil)
+  | Cons (h, t) -> if cmp_vals_w world x h <= 0 then Cons (x, sorted) else Cons (h, insert_w world x t)
 
 // apply a binary operator (named by a symbol like :+) to two runtime values
 // by evaluating a real EBin over a scratch env — reuses all operator logic.
