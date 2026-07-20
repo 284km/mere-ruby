@@ -4838,6 +4838,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#print: write each arg's to_s (no separators, no newline).
     else if str_eq name "print" && (if map_has meths "print" then false else true) then
       let _ = print_each world args in VNil
+    // Kernel#format / #sprintf: sprintf-style formatting.
+    else if (str_eq name "format" || str_eq name "sprintf") && (if map_has meths name then false else true) then
+      (match args with Cons (VStr h, rest) -> mkstr (rb_format (sget h) rest) | _ -> mkstr "")
     else try_self_call_x env world name args true
   | ECallB (name, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
@@ -5031,9 +5034,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op ">=" then VBool (cmp_vals va0 (eval_e env world blk b) >= 0)
     else
       let vb = eval_e env world blk b in
+      // `"fmt" % arg` / `"fmt" % [args]` is sprintf-style formatting.
+      if str_eq op "%" && (match va0 with VStr _ -> true | _ -> false) then
+        (match va0 with
+         | VStr h -> mkstr (rb_format (sget h) (match vb with VArr id -> deref id | _ -> Cons (vb, Nil)))
+         | _ -> va0)
       // integer division / modulo by zero raises a real ZeroDivisionError
       // (a proper Ruby exception, so `rescue ZeroDivisionError` catches it).
-      if (str_eq op "/" || str_eq op "%") && (match vb with VInt z -> z == 0 | _ -> false)
+      else if (str_eq op "/" || str_eq op "%") && (match vb with VInt z -> z == 0 | _ -> false)
       then raise_exc world "ZeroDivisionError" "divided by 0"
       else arith_bin op va0 vb
 
@@ -6883,6 +6891,105 @@ and apply_bin_vals = fn world -> fn blk -> fn (op: str) -> fn (a: Val) -> fn (b:
   let _ = map_set e2 "__rb" b in
   eval_e e2 world blk (EBin (op, EVar "__ra", EVar "__rb"))
 
+// ---- sprintf/format/`%` string formatting -------------------------------
+// %[flags][width][.prec]type ; flags: - + 0 space # ; types: d i u s f x X o b c
+and rb_format = fn (fmt: str) -> fn (args: Val list) -> rb_format_go fmt 0 args ""
+
+and rb_format_go = fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (acc: str) ->
+  let n = str_len fmt in
+  if i >= n then acc
+  else
+    let c = char_at fmt i in
+    if str_eq c "%" then
+      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go fmt (i + 2) args (acc ++ "%")
+       else
+         let (flags, i1) = rb_fmt_flags fmt (i + 1) "" in
+         let (width, i2) = rb_fmt_digits fmt i1 0 false in
+         let (prec, i3) = rb_fmt_prec fmt i2 in
+         let typ = (if i3 < n then char_at fmt i3 else "") in
+         (match args with
+          | Cons (av, rest) -> rb_format_go fmt (i3 + 1) rest (acc ++ rb_fmt_one flags width prec typ av)
+          | Nil -> rb_format_go fmt (i3 + 1) Nil (acc ++ rb_fmt_one flags width prec typ VNil)))
+    else rb_format_go fmt (i + 1) args (acc ++ c)
+
+and rb_fmt_flags = fn (fmt: str) -> fn (i: int) -> fn (acc: str) ->
+  if i < str_len fmt &&
+     (let c = char_at fmt i in str_eq c "-" || str_eq c "+" || str_eq c "0" || str_eq c " " || str_eq c "#")
+  then rb_fmt_flags fmt (i + 1) (acc ++ char_at fmt i)
+  else (acc, i)
+
+and rb_fmt_digits = fn (fmt: str) -> fn (i: int) -> fn (acc: int) -> fn (seen: bool) ->
+  if i < str_len fmt && is_digit (char_at fmt i)
+  then rb_fmt_digits fmt (i + 1) (acc * 10 + (ord (char_at fmt i) - 48)) true
+  else ((if seen then acc else 0 - 1), i)
+
+and rb_fmt_prec = fn (fmt: str) -> fn (i: int) ->
+  if i < str_len fmt && str_eq (char_at fmt i) "." then
+    let (p, j) = rb_fmt_digits fmt (i + 1) 0 false in ((if p < 0 then 0 else p), j)
+  else (0 - 1, i)
+
+and fmt_to_int = fn (av: Val) ->
+  match av with VInt n -> n | VFlt f -> int_of_float f | VStr h -> int_of_str (sget h) | _ -> 0
+
+and rb_pad_str = fn (s: str) -> fn (flags: str) -> fn (width: int) ->
+  let len = str_len s in
+  if width <= len then s
+  else if str_contains flags "-" then s ++ str_repeat " " (width - len)
+  else str_repeat " " (width - len) ++ s
+
+and rb_pad_num = fn (sign: str) -> fn (ds: str) -> fn (flags: str) -> fn (width: int) ->
+  let body = sign ++ ds in
+  let len = str_len body in
+  if width <= len then body
+  else if str_contains flags "-" then body ++ str_repeat " " (width - len)
+  else if str_contains flags "0" then sign ++ str_repeat "0" (width - len) ++ ds
+  else str_repeat " " (width - len) ++ body
+
+and ascii_up = fn (s: str) -> ascii_up_go s 0 ""
+and ascii_up_go = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
+  else let c = char_at s i in
+       ascii_up_go s (i + 1) (acc ++ (if c >= "a" && c <= "z" then chr (ord c - 32) else c))
+
+and pow10i = fn (p: int) -> if p <= 0 then 1 else 10 * pow10i (p - 1)
+
+and pad_frac = fn (s: str) -> fn (prec: int) ->
+  if str_len s >= prec then s else str_repeat "0" (prec - str_len s) ++ s
+
+and fmt_float_abs = fn (av: Val) -> fn (prec: int) ->
+  let f0 = to_f av in
+  let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
+  let scalei = pow10i prec in
+  let si = int_of_float (f * float_of_int scalei + 0.5) in
+  if prec == 0 then int_to_base si 10
+  else
+    let ip = si / scalei in
+    let fp = si - ip * scalei in
+    int_to_base ip 10 ++ "." ++ pad_frac (int_to_base fp 10) prec
+
+and rb_fmt_one = fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (typ: str) -> fn (av: Val) ->
+  if str_eq typ "d" || str_eq typ "i" || str_eq typ "u" then
+    let n = fmt_to_int av in
+    let neg = n < 0 in
+    let ds = int_to_base (if neg then 0 - n else n) 10 in
+    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
+    rb_pad_num sign ds flags width
+  else if str_eq typ "s" then
+    let s0 = to_s av in
+    let s = (if prec >= 0 && str_len s0 > prec then substring s0 0 prec else s0) in
+    rb_pad_str s flags width
+  else if str_eq typ "f" then
+    let neg = (to_f av < 0.0) in
+    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
+    rb_pad_num sign (fmt_float_abs av (if prec < 0 then 6 else prec)) flags width
+  else if str_eq typ "x" then rb_pad_num "" (int_to_base (fmt_to_int av) 16) flags width
+  else if str_eq typ "X" then rb_pad_num "" (ascii_up (int_to_base (fmt_to_int av) 16)) flags width
+  else if str_eq typ "o" then rb_pad_num "" (int_to_base (fmt_to_int av) 8) flags width
+  else if str_eq typ "b" then rb_pad_num "" (int_to_base (fmt_to_int av) 2) flags width
+  else if str_eq typ "c" then (match av with VInt n -> chr n | VStr h -> sget h | _ -> to_s av)
+  else if str_eq typ "" then ""
+  else "%" ++ typ
+
 and range_step_arr = fn (i: int) -> fn (last: int) -> fn (n: int) ->
   if n <= 0 then Nil
   else if i > last then Nil else Cons (VInt i, range_step_arr (i + n) last n)
@@ -7025,6 +7132,7 @@ and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
 and is_kernel_builtin = fn (name: str) ->
   str_eq name "puts" || str_eq name "p" || str_eq name "pp" || str_eq name "print" ||
+  str_eq name "format" || str_eq name "sprintf" ||
   str_eq name "raise" || str_eq name "loop" || str_eq name "catch" || str_eq name "throw" ||
   str_eq name "proc" || str_eq name "lambda" || str_eq name "eval" || str_eq name "require" ||
   str_eq name "require_relative" || str_eq name "block_given?"
