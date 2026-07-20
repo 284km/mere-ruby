@@ -4492,6 +4492,48 @@ and vtake = fn (xs: Val list) -> fn (n: int) ->
 and vdrop = fn (xs: Val list) -> fn (n: int) ->
   if n <= 0 then xs else (match xs with Nil -> Nil | Cons (_, t) -> vdrop t (n - 1))
 
+// flatten nested arrays up to `depth` levels; depth < 0 means unlimited.
+// A handle already on the flatten stack (self-referential array) is skipped
+// rather than recursed into — avoids the infinite recursion / segfault.
+and val_flatten = fn (xs: Val list) -> fn (depth: int) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VArr id, t) ->
+    if depth == 0 then Cons (VArr id, val_flatten t depth)
+    else if map_has insp_seen (str_of_int id) then val_flatten t depth
+    else
+      let _ = map_set insp_seen (str_of_int id) 1 in
+      let inner = val_flatten (deref id) (if depth < 0 then depth else depth - 1) in
+      let _ = map_delete insp_seen (str_of_int id) in
+      list_append inner (val_flatten t depth)
+  | Cons (h, t) -> Cons (h, val_flatten t depth)
+and val_compact = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VNil, t) -> val_compact t
+  | Cons (h, t) -> Cons (h, val_compact t)
+// nth element of a list or VNil (for zip padding).
+and val_at_or_nil = fn (xs: Val list) -> fn (i: int) ->
+  match xs with Nil -> VNil | Cons (h, t) -> if i <= 0 then h else val_at_or_nil t (i - 1)
+// zip: build [self[i], others[0][i], others[1][i], ...] for each i.
+and val_zip = fn (xs: Val list) -> fn (others: Val list) -> fn (i: int) -> fn (total: int) ->
+  if i >= total then Nil
+  else Cons (arr_new (Cons (val_at_or_nil xs i, val_zip_row others i)), val_zip xs others (i + 1) total)
+and val_zip_row = fn (others: Val list) -> fn (i: int) ->
+  match others with
+  | Nil -> Nil
+  | Cons (VArr id, t) -> Cons (val_at_or_nil (deref id) i, val_zip_row t i)
+  | Cons (_, t) -> Cons (VNil, val_zip_row t i)
+// transpose: rows -> columns (assumes rectangular).
+and val_transpose = fn (rows: Val list) -> fn (col: int) -> fn (ncols: int) ->
+  if col >= ncols then Nil
+  else Cons (arr_new (val_transpose_col rows col), val_transpose rows (col + 1) ncols)
+and val_transpose_col = fn (rows: Val list) -> fn (col: int) ->
+  match rows with
+  | Nil -> Nil
+  | Cons (VArr id, t) -> Cons (val_at_or_nil (deref id) col, val_transpose_col t col)
+  | Cons (_, t) -> Cons (VNil, val_transpose_col t col)
+
 // assign values to targets in parallel (no splat); missing values are nil.
 and assign_parallel = fn env -> fn world -> fn (targets: str list) -> fn (values: Val list) ->
   match targets with
@@ -5632,6 +5674,25 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> fail "no last")
   else if str_eq name "sort" then (match recv with VArr id -> arr_new (val_sort (deref id)) | _ -> fail "no sort")
   else if str_eq name "uniq" then (match recv with VArr id -> arr_new (val_uniq (deref id) Nil) | _ -> fail "no uniq")
+  else if str_eq name "flatten" then
+    (match recv with VArr id -> (match args with Cons (VInt d, _) -> arr_new (val_flatten (deref id) d) | _ -> arr_new (val_flatten (deref id) (0 - 1))) | _ -> fail "no flatten")
+  else if str_eq name "compact" then (match recv with VArr id -> arr_new (val_compact (deref id)) | _ -> fail "no compact")
+  else if str_eq name "take" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (deref id) n) | _ -> arr_new Nil) | _ -> fail "no take")
+  else if str_eq name "drop" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vdrop (deref id) n) | _ -> recv) | _ -> fail "no drop")
+  else if str_eq name "zip" then
+    (match recv with VArr id -> let xs = deref id in arr_new (val_zip xs args 0 (val_list_len xs)) | _ -> fail "no zip")
+  else if str_eq name "transpose" then
+    (match recv with
+     | VArr id -> let rows = deref id in
+       (match rows with Nil -> arr_new Nil | Cons (VArr r0, _) -> arr_new (val_transpose rows 0 (val_list_len (deref r0))) | _ -> fail "transpose: not an array of arrays")
+     | _ -> fail "no transpose")
+  else if str_eq name "rotate" then
+    (match recv with
+     | VArr id -> let xs = deref id in let len = val_list_len xs in
+       if len == 0 then arr_new Nil
+       else let n0 = (match args with Cons (VInt n, _) -> n | _ -> 1) in
+            let k = floor_mod n0 len in arr_new (list_append (vdrop xs k) (vtake xs k))
+     | _ -> fail "no rotate")
   else if str_eq name "min" then (match recv with VArr id -> (match deref id with Nil -> VNil | Cons (h, t) -> val_min t h) | _ -> fail "no min")
   else if str_eq name "max" then (match recv with VArr id -> (match deref id with Nil -> VNil | Cons (h, t) -> val_max t h) | _ -> fail "no max")
   else if str_eq name "sum" then (match recv with VArr id -> val_sum (deref id) (VInt 0) | _ -> fail "no sum")
@@ -5667,6 +5728,10 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Nil -> VNil)
      | VStr s -> let s = sget s in (match args with Cons (VStr _, _) -> mkstr (str_delete_sets s (collect_str_args args)) | _ -> mkstr s)
      | _ -> fail "no delete")
+  else if str_eq name "flatten!" then
+    (match recv with VArr id -> let flat = val_flatten (deref id) (match args with Cons (VInt d, _) -> d | _ -> 0 - 1) in let _ = arr_set id flat in recv | _ -> fail "no flatten!")
+  else if str_eq name "compact!" then
+    (match recv with VArr id -> let xs = deref id in let c = val_compact xs in let _ = arr_set id c in (if val_list_len c == val_list_len xs then VNil else recv) | _ -> fail "no compact!")
   else if str_eq name "pop" then
     (match recv with VArr id -> let xs = deref id in (match xs with Nil -> VNil | _ -> let _ = arr_set id (val_init xs) in val_last xs) | _ -> fail "no pop")
   else if str_eq name "shift" then
