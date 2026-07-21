@@ -283,6 +283,15 @@ let enc_name = map_new () in
 let proc_store = map_new ();
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// refinements. `refine Target do ... end` (inside a Module.new body) records,
+// per refinery module, the target class and a fresh impl class holding the
+// refined methods. `using refinery` activates them into ref_active (target
+// class name -> impl class name); register_class save/restores ref_active so a
+// `using` inside a module body is scoped to that body (Ruby's lexical scope).
+let refine_cnt = map_new ();   // "<refinery>"      -> VInt count
+let refine_tgt = map_new ();   // "<refinery>#<i>"  -> VStr target class
+let refine_cls = map_new ();   // "<refinery>#<i>"  -> VStr impl class
+let ref_active = map_new ();   // "<target>"        -> VStr impl class
 // Binding objects: id -> the captured local-variable env (which already
 // holds "self"). `binding` captures the current env; eval(str, b) and
 // b.eval(str) re-enter the interpreter against it.
@@ -2936,8 +2945,9 @@ and parse_stmt_id = fn toks ->
       (SRequire (str_eq id "require_relative", e), r2)
     else if str_eq id "module_function" || str_eq id "extend" ||
             str_eq id "public_class_method" ||
-            str_eq id "private_constant" || str_eq id "using" then
+            str_eq id "private_constant" then
       // visibility / mixin-into-singleton / require: accepted as no-ops.
+      // (`using` is NOT here — it parses as a real call so refinements activate.)
       (match r with
        | Cons (TNL, _) -> (SExpr ENil, r)
        | Cons (TEOF, _) -> (SExpr ENil, r)
@@ -5396,6 +5406,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match args with Cons (VArr id, _) -> VArr id | Cons (VNil, _) -> arr_new Nil | Nil -> arr_new Nil | Cons (v, _) -> arr_new (Cons (v, Nil)))
     else if str_eq name "Hash" then
       (match args with Cons (VHsh h, _) -> VHsh h | _ -> mkhash Nil)
+    // using refinery — activate the refinery's refinements into ref_active.
+    // The scope is bounded by the enclosing module/class body (register_class
+    // save/restores ref_active), matching Ruby's lexical activation.
+    else if str_eq name "using" && (match args with Cons (VClass _, _) -> true | _ -> false) then
+      (let refinery = (match args with Cons (VClass r, _) -> r | _ -> "") in
+       let n = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt k -> k | _ -> 0) else 0) in
+       let _ = activate_refinements refinery 0 n in
+       VNil)
     // Kernel#binding: capture the current locals env (which holds "self")
     // as a first-class Binding, unless the user redefined `binding`.
     else if str_eq name "binding" && (if map_has meths "binding" then false else true) then
@@ -5488,6 +5506,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let _ = map_set meths (c ++ "#" ++ nm) (Meth (ps2, Nil, bb2)) in
          VSym nm
        | _ -> VNil)
+    // refine Target do <defs> end — inside a Module.new body (self is the
+    // refinery module). Run the block's defs into a fresh impl class and record
+    // the (refinery, target, impl) triple for a later `using`.
+    else if str_eq name "refine" && (match args with Cons (VClass _, _) -> true | _ -> false) && (match map_get env "self" with VClass _ -> true | _ -> false) then
+      (let refinery = (match map_get env "self" with VClass rc -> rc | _ -> "") in
+       let target = (match args with Cons (VClass t, _) -> t | _ -> "") in
+       let i = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt n -> n | _ -> 0) else 0) in
+       let impl = "Refine_" ++ refinery ++ "_" ++ str_of_int i in
+       let _ = flow_value (register_class world impl bb) in
+       let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
+       let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl) in
+       let _ = map_set refine_cnt refinery (VInt (i + 1)) in
+       VClass impl)
     else if map_has meths name then call_method env world newblk name args
     // implicit self: a bare `each { }` inside a method is `self.each { }`.
     else if map_has env "self" then
@@ -7193,14 +7224,26 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let (h3, ps3, bb3, e3) = newblk in
           let _ = flow_value (register_class world anon bb3) in
           VClass anon)
-       // Module.new { } — an anonymous module whose body is the block (run as
-       // module-body statements, like Class.new; registered so #class is Module).
+       // Module.new { } — an anonymous module whose body is the block. Run the
+       // block as a closure (outer locals stay visible/assignable) with self
+       // rebound to the module, so top-level defs land on it (SDef keys off
+       // self's class) and refine/using inside see the module as self.
        else if str_eq c "Module" && str_eq name "new" then
          (let (meths2, sup2, ocls2, iv2) = world in
           let anon = "AnonModule_" ++ str_of_int (map_len ocls2) in
           let _ = map_set modules anon VNil in
           let (h3, ps3, bb3, e3) = newblk in
-          let _ = flow_value (register_class world anon bb3) in
+          let saved_self = if map_has e3 "self" then map_get e3 "self" else VNil in
+          let _ = map_set e3 "self" (VClass anon) in
+          let saved_cref = cur_lex () in
+          let _ = set_lex anon in
+          // a `using` inside the block is scoped to it (like register_class):
+          // snapshot/restore ref_active so refinements don't leak past the body.
+          let saved_ref = map_copy ref_active in
+          let _ = flow_value (run_block world blk newblk (Cons (VClass anon, Nil))) in
+          let _ = restore_ref_active saved_ref in
+          let _ = set_lex saved_cref in
+          let _ = map_set e3 "self" saved_self in
           VClass anon)
        else if str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "instance_eval" then
          // returns the block's value (Ruby), running the body as class-body
@@ -8884,10 +8927,33 @@ and meth_base_go = fn (nm: str) -> fn (i: int) -> fn (start: int) ->
   else if str_eq (char_at nm i) "#" then meth_base_go nm (i + 1) (i + 1)
   else meth_base_go nm (i + 1) start
 
+// activate refinery's refinements: for each recorded (target, impl), point the
+// target class at the impl in ref_active.
+and activate_refinements = fn (refinery: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then ()
+  else
+    let key = refinery ++ "#" ++ str_of_int i in
+    let tgt = (match map_get refine_tgt key with VStr h -> sget h | _ -> "") in
+    let impl = map_get refine_cls key in
+    let _ = if str_eq tgt "" then () else map_set ref_active tgt impl in
+    activate_refinements refinery (i + 1) n
+
+// clear ref_active and repopulate from `saved` (restore a scope's snapshot).
+and restore_ref_active = fn saved ->
+  let cur = map_new () in
+  let _ = map_iter ref_active (fn (k: str) -> fn (v: Val) -> map_set cur k v) in
+  let _ = map_iter cur (fn (k: str) -> fn (v: Val) -> if map_has ref_active k then map_delete ref_active k else ()) in
+  let _ = map_iter saved (fn (k: str) -> fn (v: Val) -> map_set ref_active k v) in
+  ()
+
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  // a `using` inside this body is scoped to it: snapshot/restore ref_active.
+  let saved = map_copy ref_active in
   let cenv = map_new () in
   let _ = map_set cenv "self" (VClass cls) in
-  register_class_v world cls body "public" cenv
+  let r = register_class_v world cls body "public" cenv in
+  let _ = restore_ref_active saved in
+  r
 
 // walk the class body tracking the current visibility mode (a bare
 // `private` marks every subsequent def private until `public`).
@@ -9712,6 +9778,10 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
 and when_any_eq = fn (v: Val) -> fn (xs: Val list) ->
   match xs with Nil -> false | Cons (h, t) -> rb_eq h v || when_any_eq v t
 
+// the active refinement impl class for a target ("" if none/not a string).
+and ref_impl = fn (target: str) ->
+  if map_has ref_active target then (match map_get ref_active target with VStr h -> sget h | _ -> "") else ""
+
 // ---- pattern matching (case/in) -----------------------------------------
 and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> fn (has_else: bool) -> fn (els: Stmt list) ->
   match clauses with
@@ -9736,6 +9806,13 @@ and pat_match = fn env -> fn world -> fn blk -> fn (p: Pat) -> fn (v: Val) ->
     // a proc/lambda value pattern matches when `pattern === object` is truthy.
     (match cand with
      | VProc _ -> truthy (invoke_val_c env world blk cand "===" (Cons (v, Nil)) false)
+     // a refinement of the class's singleton #=== (refine C.singleton_class)
+     // overrides `C === obj` in a constant pattern.
+     | VClass c ->
+       let sk = "(sng:" ++ c ++ ")" in
+       if map_has ref_active sk && has_meth world (ref_impl sk) "===" then
+         truthy (invoke world (false, (Nil : str list), (Nil : Stmt list), env) cand (ref_impl sk) "===" (Cons (v, Nil)))
+       else case_eqq world cand v
      | _ -> case_eqq world cand v)
   | PPin e -> rb_eq (eval_e env world blk e) v
   | PAltP alts -> pat_match_any env world blk alts v
@@ -9766,7 +9843,14 @@ and pat_match_array = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn
 // used directly; a VObj must define #deconstruct returning an Array.
 and deconstruct_of = fn env -> fn world -> fn blk -> fn (v: Val) ->
   match v with
-  | VArr id -> (true, deref id)
+  | VArr id ->
+    // an active refinement of Array#deconstruct takes precedence over using
+    // the array's own elements.
+    if map_has ref_active "Array" && has_meth world (ref_impl "Array") "deconstruct" then
+      (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v (ref_impl "Array") "deconstruct" Nil with
+       | VArr id2 -> (true, deref id2)
+       | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct must return Array") in (false, (Nil : Val list)))
+    else (true, deref id)
   | VObj oid ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int oid) in
@@ -9880,7 +9964,12 @@ and pat_match_hash = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list
 
 and deconstruct_keys_of = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (items: (str * Pat) list) -> fn (rest: str) ->
   match v with
-  | VHsh id -> (true, hderef id)
+  | VHsh id ->
+    if map_has ref_active "Hash" && has_meth world (ref_impl "Hash") "deconstruct_keys" then
+      (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v (ref_impl "Hash") "deconstruct_keys" (Cons (VNil, Nil)) with
+       | VHsh id2 -> (true, hderef id2)
+       | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct_keys must return Hash") in (false, (Nil : Val list)))
+    else (true, hderef id)
   | VObj oid ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int oid) in
