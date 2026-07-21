@@ -10,9 +10,12 @@ pass=0; fail=0; err=0; total=0
 for rb in "$dir"/p*.rb; do
   [ -f "$rb" ] || continue
   exp=$(cat "${rb%.rb}.exp")
+  # per-test interpreter flags (e.g. --enable-frozen-string-literal), if any.
+  flags=""
+  [ -f "${rb%.rb}.flags" ] && flags=$(cat "${rb%.rb}.flags")
   # per-test wall-clock cap so a runaway loop can't stall the run
   # (portable timeout via perl's alarm, since `timeout` may be absent).
-  got=$(perl -e 'alarm 5; exec @ARGV' "$mr" --eval-print "$rb" 2>/dev/null)
+  got=$(perl -e 'alarm 5; exec @ARGV' "$mr" $flags --eval-print "$rb" 2>/dev/null)
   code=$?
   total=$((total + 1))
   if [ "$got" = "$exp" ] && [ "$code" -eq 0 ]; then
