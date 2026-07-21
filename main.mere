@@ -1561,10 +1561,9 @@ and extract_block_pass = fn (argv: Expr list) ->
     (match be with
      | ESym s ->
        (rev_app rrest Nil, true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil))
-     // general &expr (a proc): a wrapper block that calls it.
-     | _ ->
-       (rev_app rrest Nil, true, Cons ("*__ba", Nil),
-        Cons (SExpr (EMethod (be, "call", Cons (ESplat (EVar "__ba"), Nil))), Nil)))
+     // general &expr: mark for runtime coercion (Proc/nil/to_proc) at the
+     // call site — the "&coerce" param sentinel carries the expr in its body.
+     | _ -> (rev_app rrest Nil, true, Cons ("&coerce", Nil), Cons (SExpr be, Nil)))
   | _ -> (argv, false, (Nil : str list), (Nil : Stmt list))
 
 and starts_block = fn toks ->
@@ -2182,7 +2181,7 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
       // **hash spreads as the call's keyword hash.
       let (inner, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EKwSplat inner, pos)) hp
     else if str_eq star "..." then
-      // `foo(...)` forwards the collected forwarding args.
+      // `foo(...)` forwards the collected positional args.
       parse_call_sep r0 (Cons (ESplat (EVar "__fwd"), pos)) hp
     else if str_eq star "&" then
       // block-pass `&:sym` / `&expr`; bare `&` forwards the anonymous block.
@@ -3337,6 +3336,8 @@ and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list)
        | _ -> parse_params_after "**" r acc defs)
     else if str_eq p "..." then
       // argument forwarding: `def m(...)` collects positional args in *__fwd.
+      // (Block forwarding via &__fwdblk regressed no-block forwarding — the
+      // block goes unforwarded; only positional/keyword `...` is supported.)
       parse_params_after "*__fwd" r acc defs
     else if is_lparen p then
       // nested destructuring `def m((a, b))` — encoded as a spec string,
@@ -4936,7 +4937,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ECallB (name, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
-    let newblk = (true, bp, bb, env) in
+    let newblk = (match bp with
+                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else (true, bp, bb, env)
+                  | _ -> (true, bp, bb, env)) in
     // Kernel#loop: run the block until break (or a StopIteration raise).
     if str_eq name "loop" && (if map_has meths "loop" then false else true) then
       run_loop_builtin env world blk (true, bp, bb, env)
@@ -5036,7 +5039,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EMethodB (recv_e, name, arges, bp, bb) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
-    let newblk = (true, bp, bb, env) in
+    let newblk = (match bp with
+                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else (true, bp, bb, env)
+                  | _ -> (true, bp, bb, env)) in
     invoke_with_block env world blk recv name args newblk
   | EArr items -> arr_new (eval_args env world blk items)
   | EHsh items -> mkhash (hsh_eval_items env world blk items)
@@ -6414,6 +6419,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
 
 // dispatch `recv.name(args) { block }` — shared by literal-block calls and
 // &proc block-pass arguments.
+// coerce a `&expr` value into a call block: a Proc uses its own block, nil
+// means no block, a Symbol becomes a symbol-proc, and anything else is
+// converted eagerly via #to_proc (so its side effects run at the call site).
+and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
+  match bv with
+  | VProc pid -> map_get proc_store (str_of_int pid)
+  | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
+  | VSym s -> (true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil), env)
+  | _ ->
+    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    (match invoke_val_c env world noblk bv "to_proc" Nil false with
+     | VProc pid -> map_get proc_store (str_of_int pid)
+     | _ -> noblk)
+
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
     // Object#then / yield_self: run the block with the receiver.
     if str_eq name "then" || str_eq name "yield_self" then
