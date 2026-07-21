@@ -109,6 +109,10 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // M6: begin body / rescue clauses (class names, var, handler) /
           // else body / ensure body.
           | SBegin of Stmt list * (str list * str * Stmt list) list * Stmt list * Stmt list
+          // BEGIN { } runs first in its code unit (hoisted); END { } runs at
+          // exit. Distinct from a plain begin/end so run_prog/eval can order them.
+          | SPreexe of Stmt list
+          | SAtExit of Stmt list
           // `var = <stmt>` where stmt is a begin/end used as a value: run
           // the statement, bind its value (else propagate return/raise).
           | SLocalFrom of str * Stmt
@@ -2827,7 +2831,7 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TP br, r2) ->
          let (body, r3) = parse_brace_stmts r2 Nil in
-         (SBegin (body, Nil, Nil, Nil), r3)
+         (if str_eq id "BEGIN" then SPreexe body else SAtExit body, r3)
        | _ -> fail "mere-ruby: expected block after BEGIN")
     else if str_eq id "puts" then
       (match r with
@@ -8628,6 +8632,35 @@ and add_attrs = fn world -> fn (cls: str) -> fn (mode: str) -> fn (syms: str lis
 // run a statement list; stop and propagate on an explicit return. The
 // value of the list is its last statement's value (Ruby's implicit
 // return), or nil when empty.
+// run a code unit honouring BEGIN/END: every top-level BEGIN body runs first
+// (in appearance order), then the remaining statements, then every END body.
+// Nested BEGIN/END (inside a block/method) is left in `run_mid` and reaches
+// exec_stmt, where BEGIN raises the required SyntaxError.
+and hoist_run = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
+  let _ = run_pre env world blk prog in
+  let r = run_stmts env world blk (filter_mid prog) in
+  let _ = run_post env world blk prog in
+  r
+
+and run_pre = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
+  match prog with
+  | Nil -> ()
+  | Cons (SPreexe body, rest) -> (match run_stmts env world blk body with _ -> run_pre env world blk rest)
+  | Cons (_, rest) -> run_pre env world blk rest
+
+and run_post = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
+  match prog with
+  | Nil -> ()
+  | Cons (SAtExit body, rest) -> (match run_stmts env world blk body with _ -> run_post env world blk rest)
+  | Cons (_, rest) -> run_post env world blk rest
+
+and filter_mid = fn (prog: Stmt list) ->
+  match prog with
+  | Nil -> Nil
+  | Cons (SPreexe _, rest) -> filter_mid rest
+  | Cons (SAtExit _, rest) -> filter_mid rest
+  | Cons (s, rest) -> Cons (s, filter_mid rest)
+
 and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   match prog with
   | Nil -> FNext VNil
@@ -8830,6 +8863,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
   | SBegin (body, rescues, els, ens) -> run_begin env world blk body rescues els ens
+  // reached only when nested (top-level BEGIN/END are handled by hoist_run):
+  // a BEGIN inside a block/method is a SyntaxError; a nested END just runs.
+  | SPreexe _ -> (let _ = raise_exc world "SyntaxError" "BEGIN is permitted only at toplevel" in FNext VNil)
+  | SAtExit body -> run_stmts env world blk body
   | SLocalFrom (name, s) ->
     (match exec_stmt env world blk s with
      | FNext v -> let _ = map_set env name v in FNext v
@@ -9046,7 +9083,7 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   // so a read that lexically precedes the assignment (or a nested eval sharing
   // the same binding) sees nil rather than a NameError.
   let _ = declare_nils env (body_targets prog2) in
-  let f = try_or (fn (u: unit) -> run_stmts env world blk prog2) (FRaise VNil) in
+  let f = try_or (fn (u: unit) -> hoist_run env world blk prog2) (FRaise VNil) in
   (match f with
    | FRaise _ ->
      if map_has flow_sig "k" then
@@ -9684,7 +9721,7 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
   let _ = map_set env "self" VMain in   // top-level self is `main`
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-  let final = run_stmts env world noblk prog in
+  let final = hoist_run env world noblk prog in
   if print_result then
     (match final with
      | FNext (VObj id) ->
