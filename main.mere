@@ -326,6 +326,21 @@ let protecteds = map_new ();  // protected methods (callable only same-class)
 let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
 let is_upper_first = fn (id: str) ->
   str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
+// Kernel#local_variables: the local names bound in `env`, as symbols in
+// insertion order. Internal slots (self, __cref, __for, &block, globals,
+// ivars, constants) are hidden so the result matches Ruby's.
+let local_vars_of = fn env ->
+  let tmp = map_new () in
+  let _ = map_iter env (fn (k: str) -> fn (v: Val) ->
+    let skip = str_len k == 0
+               || (str_len k >= 2 && str_eq (substring k 0 2) "__")
+               || str_eq k "self"
+               || str_eq (char_at k 0) "&"
+               || str_eq (char_at k 0) "$"
+               || str_eq (char_at k 0) "@"
+               || is_upper_first k in
+    if skip then () else (let m = map_len tmp in map_set tmp (str_of_int m) (VSym k))) in
+  arr_new (idx_to_list tmp 0 (map_len tmp));
 // iteration budget: a top-level counter ticked once per loop iteration so
 // an infinite loop fails fast (a catchable error) instead of hanging.
 let step_budget = map_new ();
@@ -4891,6 +4906,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     if map_has env name then map_get env name
     else if map_has meths name then call_method env world noblk name Nil
+    // Kernel#local_variables: the locals visible in the current scope.
+    else if str_eq name "local_variables" then local_vars_of env
     // Kernel#binding: capture the current locals env (which holds "self").
     else if str_eq name "binding" then
       let id = map_len bind_store in
@@ -4935,6 +4952,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // against that captured env; otherwise it uses the CURRENT env. A parse
     // failure surfaces as a catchable SyntaxError.
     else if str_eq name "eval" then do_eval env world blk args
+    else if str_eq name "local_variables" && (if map_has meths name then false else true) then local_vars_of env
     else if map_has meths name then call_method env world noblk name args
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
       (match args with
@@ -4962,6 +4980,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | Cons (VSym m, rest) -> if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis
        | Cons (VStr m, rest) -> let m = sget m in (if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis)
        | _ -> fail "mere-ruby: send expects a method name")
+    // enum_for(:m) / to_enum(:m): an Enumerator that drives self.m on #each.
+    else if (str_eq name "enum_for" || str_eq name "to_enum") && (if map_has meths name then false else true) then
+      (let recv = if map_has env "self" then map_get env "self" else VMain in
+       match args with
+       | Cons (VSym m, _) -> make_enum world recv m
+       | Cons (VStr m, _) -> make_enum world recv (sget m)
+       | _ -> make_enum world recv "each")
     else try_self_call_x env world name args true
   | ECallB (name, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
@@ -6538,6 +6563,22 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     // Object#tap: run the block with the receiver, then return the receiver.
     else if str_eq name "tap" then
       let _ = flow_value (run_block world blk newblk (Cons (recv, Nil))) in recv
+    // Enumerator#each { block }: drive the captured @recv.@meth with this
+    // block. `for x in enum_for(:m)` desugars to `enum.each { |__for| ... }`,
+    // and #each just forwards to the underlying method (whose `yield` runs the
+    // block); the method's return value becomes #each's (and the loop's) value.
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator") | _ -> false)
+            && str_eq name "each" then
+      (match recv with
+       | VObj id ->
+         (let (m0, s0, ocls0, ivars0) = world in
+          let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
+          let meth2 = (match (if map_has ivars0 (str_of_int id ++ "@meth") then map_get ivars0 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
+          (match recv2 with
+           | VMain -> if map_has m0 meth2 then (let e2 = map_copy env in let _ = map_set e2 "self" recv2 in call_method e2 world newblk meth2 args)
+                      else invoke_with_block env world blk recv2 meth2 args newblk
+           | _ -> invoke_with_block env world blk recv2 meth2 args newblk))
+       | _ -> VNil)
     // instance_eval/instance_exec (block form) on a non-class receiver: run
     // the block with `self` rebound to the receiver. instance_exec forwards
     // the call args to the block; instance_eval passes the receiver itself.
@@ -7900,6 +7941,16 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
       else flow_rethrow k v
     else fail "mere-ruby: (ruby exception raised)"
   | other -> other
+
+// an Enumerator is a plain object of the synthetic class "Enumerator" whose
+// @recv / @meth ivars remember the receiver and method to drive on #each.
+and make_enum = fn world -> fn (recv: Val) -> fn (meth: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = map_len ocls in
+  let _ = map_set ocls (str_of_int id) "Enumerator" in
+  let _ = map_set ivars (str_of_int id ++ "@recv") recv in
+  let _ = map_set ivars (str_of_int id ++ "@meth") (mkstr meth) in
+  VObj id
 
 // allocate an object, then run initialize if the class defines one.
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
