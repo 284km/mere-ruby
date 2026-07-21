@@ -235,6 +235,13 @@ let cli_fsl = map_new () in   // key "on" present => --enable-frozen-string-lite
 let cli_file = map_new () in  // key "p" -> the running script's path (__FILE__)
 let fsl_on = fn () -> map_has cli_fsl "on";
 let script_file = fn () -> if map_has cli_file "p" then map_get cli_file "p" else "-";
+// lexical constant scope (cref): the class whose body is currently being run
+// ("" = top level). Captured per method at `def` time (meth_cref) and consulted
+// when resolving a bare Constant, so `Const` means the lexically-nearest one.
+let lex_cref = map_new () in
+let cur_lex = fn () -> if map_has lex_cref "c" then map_get lex_cref "c" else "";
+let set_lex = fn (c: str) -> let _ = map_set lex_cref "c" c in ();
+let meth_cref = map_new () in
 // the shared Encoding objects, keyed by canonical name; enc_name maps an
 // Encoding object's handle id -> name so the (world-free) printer can format it.
 let enc_objs = map_new () in
@@ -2732,7 +2739,9 @@ and parse_stmt = fn toks ->
     else parse_stmt_id toks
   | Cons (TP sc, Cons (TId cn, Cons (TP eq, r))) ->
     if str_eq sc "::" && str_eq eq "=" && is_cap cn then
-      let (e, r2) = parse_expr r in (SAssign (cn, e), r2)
+      // `::Const = v` assigns a TOP-LEVEL constant; keep the :: so a class
+      // body doesn't treat it as a class-local constant.
+      let (e, r2) = parse_expr r in (SAssign ("::" ++ cn, e), r2)
     else let (e, r2) = parse_expr toks in (SExpr e, r2)
   | Cons (TId id, r) -> parse_stmt_id toks
   | _ ->
@@ -4604,15 +4613,21 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ESym s -> VSym s
   | ESelf -> if map_has env "self" then map_get env "self" else VNil
   | EConst name ->
-    if map_has consts name then map_get consts name
-    // `Recv::CONST` where CONST is undefined and Recv defines const_missing.
-    else if str_contains name "::" then
-      let rc = recv_of_scoped name in
-      let cn = const_of_scoped name in
-      if has_meth world rc "const_missing" then
-        invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
+    // scoped `A::B` keeps its existing handling; a bare `Const` resolves
+    // through the lexical scope (cref) first, then top level.
+    if str_contains name "::" then
+      (if map_has consts name then map_get consts name
+       else
+         let rc = recv_of_scoped name in
+         let cn = const_of_scoped name in
+         if has_meth world rc "const_missing" then
+           invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
+         else VClass name)
+    else
+      let cref = (if map_has env "__cref" then (match map_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
+      if (if str_eq cref "" then false else true) && map_has consts (cref ++ "::" ++ name) then map_get consts (cref ++ "::" ++ name)
+      else if map_has consts name then map_get consts name
       else VClass name
-    else VClass name
   | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
   | EScopedRead (recv_e, cn) ->
     (match eval_e env world blk recv_e with
@@ -6261,7 +6276,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     // code as class-body statements (def defines methods of the class).
     else if (str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "class_exec" || str_eq name "module_exec") && (match args with Cons (VStr _, _) -> true | _ -> false) then
       (match args with
-       | Cons (VStr code, _) -> let (p2, _) = parse_stmts (lex_go (sget code) 0) Nil in flow_value (register_class world c p2)
+       | Cons (VStr code, _) -> let (p2, _) = parse_stmts (lex_go (sget code) 0) Nil in
+         // string-form *_eval sets the lexical scope (cref) to the receiver.
+         let saved = cur_lex () in let _ = set_lex c in
+         let r = flow_value (register_class world c p2) in
+         let _ = set_lex saved in r
        | _ -> VClass c)
     else if str_eq c "Struct" && str_eq name "new" then struct_build world args
     // Math module functions (only sqrt-derived ones; no trig/log builtin).
@@ -6483,9 +6502,9 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = flow_value (register_class world anon bb3) in
           VClass anon)
        else if str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "instance_eval" then
-         (let (h3, ps3, bb3, e3) = newblk in
-          let _ = flow_value (register_class world c bb3) in
-          VClass c)
+         // returns the block's value (Ruby), running the body as class-body
+         // statements; a bare Const inside uses the call site's lexical scope.
+         (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class world c bb3))
        else if str_eq c "Array" && str_eq name "new" then
          (match args with Cons (VInt n, _) -> arr_new (array_new_blk world blk newblk n 0) | _ -> arr_new Nil)
        else if str_eq c "Hash" && str_eq name "new" then mkhash Nil
@@ -6593,6 +6612,9 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
        else
        let env2 = map_new () in
        let _ = map_set env2 "self" recv in
+       // string-form instance_eval resolves bare constants in the receiver's
+       // class scope (cref).
+       let _ = map_set env2 "__cref" (mkstr (class_name recv)) in
        eval_run env2 world blk p2
      | _ -> VNil)
   // is_a? / kind_of? walk the real (exception) hierarchy.
@@ -7606,6 +7628,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let frame = map_new () in
      // top-level methods run with main as self (their @ivars live there).
      let _ = map_set frame "self" (if map_has env "self" then map_get env "self" else VMain) in
+     let _ = map_set frame "__cref" (mkstr (if map_has meth_cref name then map_get meth_cref name else "")) in
      let _ = bind_params frame world blk name params defaults args in
      (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
 
@@ -7735,6 +7758,8 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
     // hidden bindings so `super` can resume lookup above the defining class.
     let _ = map_set frame "__defcls" (VClass defcls) in
     let _ = map_set frame "__meth" (mkstr name) in
+    // lexical scope (cref) for bare-constant resolution in the body.
+    let _ = map_set frame "__cref" (mkstr (if map_has meth_cref (defcls ++ "#" ++ name) then map_get meth_cref (defcls ++ "#" ++ name) else "")) in
     let _ = map_set frame "__args" (arr_new args) in
     let _ = map_set frame "__params" (arr_new (param_names_vals params)) in
     let _ = bind_params frame world blk name params defaults args in
@@ -8151,6 +8176,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // a plain name registers under the enclosing class.
          let key = if str_contains mname "#" then mname else cls ++ "#" ++ mname in
          let _ = map_set meths key (Meth (params, defs, mbody)) in
+         let _ = map_set meth_cref key (cur_lex ()) in
          let _ = if map_has undefs key then map_delete undefs key else () in
          // receiver-qualified / singleton defs are always public.
          let _ = if (if is_selfdef then false else true) && (if str_contains mname "#" then false else true) then
@@ -8175,16 +8201,21 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                        else csuper) in
          let _ = if str_eq qsuper "" then () else map_set sup full qsuper in
          let _ = if map_has consts full then () else map_set consts full (VClass full) in
-         register_class world full cbody
+         let saved_lex = cur_lex () in
+         let _ = set_lex full in
+         let r = register_class world full cbody in
+         let _ = set_lex saved_lex in
+         r
        // a constant assignment in the body runs at definition time; stored
-       // both by qualified name (`Klass::CONST`) and bare name (lexical use).
+       // stored under the qualified name only (`Klass::CONST`), so it does not
+       // clobber a top-level constant of the same name; bare lookups find it
+       // via the lexical scope (cref).
        | SAssign (aname, e) ->
-         if is_upper_first aname then
+         if is_upper_first aname && (if str_contains aname "::" then false else true) then
            let v = eval_e cenv world noblk e in
-           let _ = map_set consts aname v in
            let _ = map_set consts (cls ++ "::" ++ aname) v in
            FNext VNil
-         else exec_stmt cenv world noblk s   // a local in the class body
+         else exec_stmt cenv world noblk s   // a local / scoped assign in the body
        // `alias new old` inside the class copies the method entry.
        | SAlias (n1, n2) ->
          let _ = if map_has meths (cls ++ "#" ++ n2) then map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2))
@@ -8376,6 +8407,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
             then map_set globals (substring name 1 (str_len name)) v
+            else if str_len name >= 2 && str_eq (substring name 0 2) "::" then map_set consts (substring name 2 (str_len name)) v
             else if is_upper_first name then map_set consts name v
             else map_set env name v in
     FNext v
@@ -8434,6 +8466,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           | _ -> name)
        else name) in
     let _ = map_set meths key (Meth (params, defs, body)) in
+    let _ = map_set meth_cref key (cur_lex ()) in
     FNext (VSym (meth_base name))
   | SClass (name, super0, body) ->
     let (meths, sup, ocls, ivars) = world in
@@ -8470,7 +8503,12 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // record the class itself as a defined constant (const_defined? etc.).
     let _ = if map_has consts name then () else map_set consts name (VClass name) in
     // a break/raise escaping the class body propagates (a body is code).
-    register_class world name body
+    // set the lexical scope (cref) to this class while its body runs.
+    let saved_lex = cur_lex () in
+    let _ = set_lex name in
+    let r = register_class world name body in
+    let _ = set_lex saved_lex in
+    r
   | SAttr (_, _) -> FNext VNil
   | SAlias (n1, n2) ->
     let (meths, sup, ocls, ivars) = world in
@@ -9314,6 +9352,14 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set consts "Encoding::ASCII" (if map_has enc_objs "US-ASCII" then map_get enc_objs "US-ASCII" else mkstr "US-ASCII") in
   let _ = map_set consts "Math::PI" (VFlt 3.141592653589793) in
   let _ = map_set consts "Math::E" (VFlt 2.718281828459045) in
+  // TOPLEVEL_BINDING: a binding whose lexical scope is the top level, so
+  // eval("Const", TOPLEVEL_BINDING) resolves constants at the top level.
+  let _ = (let tenv = map_new () in
+           let _ = map_set tenv "__cref" (mkstr "") in
+           let _ = map_set tenv "self" VMain in
+           let bid = map_len bind_store in
+           let _ = map_set bind_store (str_of_int bid) tenv in
+           map_set consts "TOPLEVEL_BINDING" (VBind bid)) in
   // Exception#initialize(msg = nil) sets @message, so a user exception's
   // `super(msg)` records the message (read back by make_exc_w).
   let _ = map_set meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("message", EVar "msg"), Nil))) in
