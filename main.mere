@@ -85,7 +85,11 @@ type Expr = EInt of int | EBig of str | ERat of int | EImag of int | EFlt of flo
           | ESafe of Expr * str * Expr list
           | ESafeB of Expr * str * Expr list * str list * Stmt list  // a&.m { blk }
           // G3: **hash argument at a call site.
-          | EKwSplat of Expr;
+          | EKwSplat of Expr
+          // one-line pattern matching: `expr in pat` yields true/false;
+          // `expr => pat` matches-or-raises NoMatchingPatternError (value nil).
+          | EMatchTest of Expr * Pat
+          | EMatchBind of Expr * Pat;
 
 // SIf: clause list ((condition, body) pairs — the if plus each elsif)
 // and the else body (Nil when absent). unless / until desugar to a
@@ -147,7 +151,26 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SOrElse of Stmt * Stmt
           // G2: `begin ... end while/until c` — run body, then loop while
           // the (already-negated-for-until) condition holds.
-          | SDoWhile of Stmt * Expr;
+          | SDoWhile of Stmt * Expr
+          // pattern matching `case subj / in pat [guard] / ... [else] / end`.
+          // Each clause is (pattern, guard-expr, body); the guard is EBool true
+          // when absent (an `unless` guard is negated at parse time). The bool
+          // is has-else; els is the else body (run when no pattern matches, or
+          // NoMatchingPatternError is raised when has-else is false).
+          | SCaseIn of Expr * (Pat * Expr * Stmt list) list * bool * Stmt list;
+
+// A case/in pattern.
+type Pat = PVar of str                       // binds a local (`_`/`_x` allowed, repeatable)
+         | PVal of Expr                      // value pattern — matched with === (case_eqq)
+         | PPin of Expr                      // ^expr — matched with == (rb_eq)
+         | PSplatP of str                    // *name array element ("" = anonymous)
+         | PArrP of Pat list                 // [p, ...] (a PSplatP element = splat)
+         // {k: p, ...}; rest: "" open (extra keys allowed unless empty),
+         // "nil" = **nil (no extra keys), "*" = ** anonymous rest, else **name.
+         | PHashP of (str * Pat) list * str
+         | PAltP of Pat list                 // p | p | ...
+         | PAsP of Pat * str                 // pat => name
+         | PConstP of Expr * Pat;            // Const[..] / Const(..): === then match inner
 
 // VObj holds an object id (a handle into the world's object tables);
 // VClass holds a class name. VSym is a Ruby symbol. VRange is lo..hi with
@@ -1077,7 +1100,9 @@ and regex_position = fn (s: str) -> fn (i: int) ->
       // after a keyword (when /re/, match =~ style) it's a regex too.
       let w = word_ending_at s p in
       str_eq w "when" || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
-      str_eq w "then" || str_eq w "return" || str_eq w "if" || str_eq w "unless"
+      str_eq w "then" || str_eq w "return" || str_eq w "if" || str_eq w "unless" ||
+      // `in /re/` — a pattern-matching clause takes a regex value pattern.
+      str_eq w "in"
     else false
 
 and word_ending_at = fn (s: str) -> fn (p: int) ->
@@ -1131,7 +1156,9 @@ let is_ivar = fn (id: str) -> str_len id > 0 && str_eq (char_at id 0) "@";
 // stop before them without consuming.
 let is_block_stop = fn (id: str) ->
   str_eq id "end" || str_eq id "else" || str_eq id "elsif" || str_eq id "when" ||
-  str_eq id "rescue" || str_eq id "ensure";
+  str_eq id "rescue" || str_eq id "ensure" ||
+  // `in` starts the next clause of a case/in; it never begins a statement.
+  str_eq id "in";
 
 // keywords that end an optional value (for break/next/return): block
 // closers plus trailing statement modifiers (`next if c`, `break unless c`).
@@ -1328,7 +1355,9 @@ and paren_expr_body = fn toks ->
   match r2 with
   // `(args = 1, 2, 3)` — an assignment's extra comma values build an array.
   | Cons (TP c0, r2b) ->
-    if str_eq c0 "," then
+    if str_eq c0 "=>" then
+      let (pat, r3) = parse_pattern_top r2b in (EMatchBind (e, pat), expect (skip_nls r3) ")")
+    else if str_eq c0 "," then
       (match e with
        | EAssign (anm, v0) ->
          let (more, r3) = parse_rhs_list (skip_nls r2b) Nil in
@@ -1342,8 +1371,10 @@ and paren_expr_body = fn toks ->
          else (e, expect r2 ")")
        | _ -> (e, expect r2 ")"))
     else (e, expect r2 ")")
-  | Cons (TId w, _) ->
-    if str_eq w "while" || str_eq w "until" || str_eq w "if" || str_eq w "unless" || str_eq w "rescue" then
+  | Cons (TId w, rrest) ->
+    if str_eq w "in" then
+      let (pat, r3) = parse_pattern_top rrest in (EMatchTest (e, pat), expect (skip_nls r3) ")")
+    else if str_eq w "while" || str_eq w "until" || str_eq w "if" || str_eq w "unless" || str_eq w "rescue" then
       let (s2, r3) = apply_modifier (SExpr e) r2 in
       (match r3 with
        | Cons (TNL, _) ->
@@ -2404,8 +2435,20 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
 // single statement.
 and apply_modifier = fn (s: Stmt) -> fn toks ->
   match toks with
+  // one-line pattern matching at statement level: `expr => pat` (bind-or-raise)
+  // and `expr in pat` (boolean). Only a plain expression statement qualifies.
+  | Cons (TP arrow, r) ->
+    if str_eq arrow "=>" then
+      (match s with
+       | SExpr e -> let (pat, r2) = parse_pattern_top r in apply_modifier (SExpr (EMatchBind (e, pat))) r2
+       | _ -> (s, toks))
+    else (s, toks)
   | Cons (TId id, r) ->
-    if str_eq id "if" then
+    if str_eq id "in" then
+      (match s with
+       | SExpr e -> let (pat, r2) = parse_pattern_top r in apply_modifier (SExpr (EMatchTest (e, pat))) r2
+       | _ -> (s, toks))
+    else if str_eq id "if" then
       let (c0, r2) = parse_andor r in
       let c = cond_ff c0 in
       (SIf (Cons ((c, Cons (s, Nil)), Nil), decl_of s), r2)
@@ -2955,7 +2998,8 @@ and parse_stmt_id = fn toks ->
          if str_eq p "=" && not (is_keyword id) then
            // `var = begin/case/if/unless ... end` binds the construct's value;
            // otherwise it is an ordinary assignment (`Const = expr` routes to
-           // the consts table at eval).
+           // the consts table at eval). A newline may follow the `=`.
+           let r2 = skip_nls r2 in
            (match r2 with
             | Cons (TId bg, r3) ->
               if str_eq bg "begin" then let (sb, r4) = parse_begin r3 in construct_assign id sb r4
@@ -3275,7 +3319,323 @@ and parse_case = fn toks ->
   // conditions are truthiness tests rather than === against a subject.
   match toks with
   | Cons (TNL, _) -> parse_whens ECaseNone toks Nil
-  | _ -> let (subj, r) = parse_expr toks in parse_whens subj r Nil
+  | _ ->
+    let (subj, r) = parse_expr toks in
+    // `in` after the subject selects pattern matching; `when` the classic form.
+    (match skip_nls r with
+     | Cons (TId kw, _) -> if str_eq kw "in" then parse_case_in subj r Nil else parse_whens subj r Nil
+     | _ -> parse_whens subj r Nil)
+
+// pattern-matching case: parse `in <pattern> [if|unless <cond>] [then] body`
+// clauses, an optional `else`, and the closing `end`.
+and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TId id, r) ->
+    if str_eq id "in" then
+      let (pat, r2) = parse_pattern_top r in
+      let (guard, r3) = parse_in_guard r2 in
+      let (b, r4) = parse_stmts (skip_then r3) Nil in
+      parse_case_in subj r4 (Cons ((pat, guard, b), acc))
+    else if str_eq id "else" then
+      let (b, r2) = parse_stmts r Nil in
+      (SCaseIn (subj, rev_app acc Nil, true, b), expect_kw r2 "end")
+    else if str_eq id "end" then
+      (SCaseIn (subj, rev_app acc Nil, false, Nil), r)
+    else fail ("mere-ruby: expected in/else/end in case, got " ++ id)
+  | _ -> fail "mere-ruby: unterminated case/in"
+
+// an optional guard after a pattern: `if COND` / `unless COND`.
+and parse_in_guard = fn toks ->
+  match toks with
+  | Cons (TId id, r) ->
+    if str_eq id "if" then let (c, r2) = parse_andor r in (c, r2)
+    else if str_eq id "unless" then let (c, r2) = parse_andor r in (EUn ("!", c), r2)
+    else (EBool true, toks)
+  | _ -> (EBool true, toks)
+
+// a top-level pattern (the direct operand of `in` or one-line `=>`/`in`).
+// Bare forms without brackets/braces are allowed here: `in 0, 1, 2` is an
+// array pattern and `in a:, b:` is a hash pattern.
+and parse_pattern_top = fn toks ->
+  // bare hash pattern: starts with a `label:` or `**`.
+  if starts_hash_pattern toks then
+    let (items, rest, r) = parse_hash_pat_items toks Nil "" in
+    (PHashP (items, rest), r)
+  else
+    let (p, r) = parse_pattern toks in
+    // bare array pattern: a top-level comma joins elements without brackets.
+    (match r with
+     | Cons (TP c, r2) ->
+       if str_eq c "," then
+         let (rest, r3) = parse_bare_arr r2 Nil in
+         (PArrP (Cons (p, rest)), r3)
+       else (p, r)
+     | _ -> (p, r))
+
+// elements of a bracket-less array pattern (`in 0, 1, *rest`), terminated by
+// end-of-clause rather than `]`. Called right after a separating comma.
+and parse_bare_arr = fn toks -> fn (acc: Pat list) ->
+  // called right after a separating comma; a terminator here means a trailing
+  // comma (`0, 1,`) which makes the pattern match partially — append a splat.
+  match toks with
+  | Cons (TNL, _) -> (rev_app (Cons (PSplatP "", acc)) Nil, toks)
+  | Cons (TEOF, _) -> (rev_app (Cons (PSplatP "", acc)) Nil, toks)
+  | Cons (TId g, _) -> if str_eq g "then" || str_eq g "if" || str_eq g "unless" then (rev_app (Cons (PSplatP "", acc)) Nil, toks) else parse_bare_arr_one toks acc
+  | Cons (TP p, _) -> if str_eq p ")" || str_eq p ";" then (rev_app (Cons (PSplatP "", acc)) Nil, toks) else parse_bare_arr_one toks acc
+  | _ -> parse_bare_arr_one toks acc
+
+and parse_bare_arr_one = fn toks -> fn (acc: Pat list) ->
+  let (p, r) = parse_pattern toks in
+  let acc2 = Cons (p, acc) in
+  (match r with
+   | Cons (TP c, r2) -> if str_eq c "," then parse_bare_arr r2 acc2 else (rev_app acc2 Nil, r)
+   | _ -> (rev_app acc2 Nil, r))
+
+// does the token stream begin a bare (brace-less) hash pattern?
+and starts_hash_pattern = fn toks ->
+  match toks with
+  | Cons (TId _, Cons (TP colon, _)) -> str_eq colon ":"
+  | Cons (TStrL _, Cons (TP colon, _)) -> str_eq colon ":"
+  | Cons (TP op, Cons (TStrL _, Cons (TP plus, Cons (TStrL _, Cons (TP cp, Cons (TP colon, _)))))) -> str_eq op "(s" && str_eq plus "+" && str_eq cp ")" && str_eq colon ":"
+  | Cons (TP dsp, _) -> str_eq dsp "**"
+  | _ -> false
+
+// a full pattern including alternation `p1 | p2 | ...` and the trailing
+// as-binding `pat => name`.
+and parse_pattern = fn toks ->
+  let (p, r) = parse_pattern_alt toks in
+  // `pat => name` binds the whole matched value to a local.
+  (match r with
+   | Cons (TP arrow, r2) ->
+     if str_eq arrow "=>" then
+       (match r2 with
+        | Cons (TId nm, r3) -> (PAsP (p, nm), r3)
+        | _ -> fail "mere-ruby: expected name after => in pattern")
+     else (p, r)
+   | _ -> (p, r))
+
+and parse_pattern_alt = fn toks ->
+  let (p, r) = parse_pattern_prim toks in
+  (match r with
+   | Cons (TP bar, r2) ->
+     if str_eq bar "|" then
+       let (alts, r3) = parse_alt_rest r2 (Cons (p, Nil)) in
+       (PAltP alts, r3)
+     else (p, r)
+   | _ -> (p, r))
+
+and parse_alt_rest = fn toks -> fn (acc: Pat list) ->
+  let (p, r) = parse_pattern_prim toks in
+  let acc2 = rev_app (Cons (p, rev_app acc Nil)) Nil in
+  (match r with
+   | Cons (TP bar, r2) -> if str_eq bar "|" then parse_alt_rest r2 acc2 else (acc2, r)
+   | _ -> (acc2, r))
+
+// a primary pattern (no alternation / as-binding at this level).
+and parse_pattern_prim = fn toks ->
+  match toks with
+  // array pattern [ ... ]
+  | Cons (TP lb, r) ->
+    if str_eq lb "[" || str_eq lb " [" then
+      let (elems, r2) = parse_arr_pat_elems r Nil in
+      (PArrP elems, r2)
+    // hash pattern { ... }
+    else if str_eq lb "\{" then
+      let (items, rest, r2) = parse_hash_pat_brace r in
+      (PHashP (items, rest), r2)
+    // ^pin
+    else if str_eq lb "^" then parse_pin r
+    // *splat (only valid inside an array; encode as a splat element)
+    else if str_eq lb "*" then
+      (match r with
+       | Cons (TId nm, r2) -> (PSplatP nm, r2)
+       | _ -> (PSplatP "", r))
+    // **rest at top level of a bare hash pattern handled elsewhere; a bare
+    // parenthesised pattern `(pat)` just groups.
+    else if is_lparen lb then
+      let (p, r2) = parse_pattern (skip_nls r) in (p, expect (skip_nls r2) ")")
+    else
+      // any other leading token: a value pattern (literal / range / etc.).
+      let (e, r2) = parse_pat_value toks in (PVal e, r2)
+  // a bare identifier: a variable binding when lowercase, else a value/const.
+  | Cons (TId nm, r) ->
+    if is_upper_first nm then parse_const_pattern toks
+    else if str_eq nm "nil" || str_eq nm "true" || str_eq nm "false" then
+      let (e, r2) = parse_pat_value toks in (PVal e, r2)
+    else
+      // a lowercase name binds, unless a following `..`/`...` makes it a
+      // range value pattern.
+      (match r with
+       | Cons (TP dots, _) -> if str_eq dots ".." || str_eq dots "..." then let (e, r2) = parse_pat_value toks in (PVal e, r2) else (PVar nm, r)
+       | _ -> (PVar nm, r))
+  | _ -> let (e, r) = parse_pat_value toks in (PVal e, r)
+
+// a value pattern's expression: like parse_range but with the binary layer
+// capped so alternation `|` (prec 5) is NOT consumed here — it belongs to the
+// pattern grammar. Handles literals, unary minus, ranges, symbols, regexps.
+and parse_pat_value = fn toks ->
+  let (lo, r) = parse_bin toks 6 in
+  match r with
+  | Cons (TP op, rest) ->
+    if str_eq op ".." || str_eq op "..." then
+      let excl = str_eq op "..." in
+      (match rest with
+       | Cons (TP p2, _) ->
+         if str_eq p2 ")" || str_eq p2 "]" || str_eq p2 "," || str_eq p2 ";" || str_eq p2 "}" || str_eq p2 "|" then (ERange (lo, EInt 4611686018427387903, excl), rest)
+         else let (hi, r2) = parse_bin rest 6 in (ERange (lo, hi, excl), r2)
+       | Cons (TNL, _) -> (ERange (lo, EInt 4611686018427387903, excl), rest)
+       | Cons (TEOF, _) -> (ERange (lo, EInt 4611686018427387903, excl), rest)
+       | Cons (TId g, _) -> if str_eq g "then" || str_eq g "if" || str_eq g "unless" then (ERange (lo, EInt 4611686018427387903, excl), rest) else let (hi, r2) = parse_bin rest 6 in (ERange (lo, hi, excl), r2)
+       | _ -> let (hi, r2) = parse_bin rest 6 in (ERange (lo, hi, excl), r2))
+    else (lo, r)
+  | _ -> (lo, r)
+
+// read a bare constant reference (`Foo`, `Foo::Bar`) WITHOUT consuming a
+// trailing `[` / `(` — those introduce the deconstruct sub-pattern.
+and parse_pat_const = fn toks ->
+  match toks with
+  | Cons (TP colons, Cons (TId nm, r)) -> if str_eq colons "::" then parse_pat_const_more (EConst nm) r else fail "mere-ruby: bad constant pattern"
+  | Cons (TId nm, r) -> parse_pat_const_more (EConst nm) r
+  | _ -> fail "mere-ruby: expected a constant in pattern"
+
+and parse_pat_const_more = fn (e: Expr) -> fn toks ->
+  match toks with
+  | Cons (TP cc, Cons (TId nm2, r2)) -> if str_eq cc "::" then parse_pat_const_more (EScopedRead (e, nm2)) r2 else (e, toks)
+  | _ -> (e, toks)
+
+// `^name` / `^@x` / `^@@x` / `^$x` / `^(expr)`.
+and parse_pin = fn toks ->
+  match toks with
+  | Cons (TP lp, r) ->
+    if is_lparen lp then let (e, r2) = parse_expr r in (PPin e, expect r2 ")")
+    else if str_eq lp "@" then (match r with Cons (TId nm, r2) -> (PPin (EIVar nm), r2) | _ -> fail "mere-ruby: bad ^@ pattern")
+    else if str_eq lp "$" then (match r with Cons (TId nm, r2) -> (PPin (EVar ("$" ++ nm)), r2) | _ -> fail "mere-ruby: bad ^$ pattern")
+    else fail "mere-ruby: bad ^ pattern"
+  | Cons (TId nm, r) ->
+    // `^@x` / `^@@x` lex as an @-prefixed identifier; `^$g` as a $-name.
+    if str_len nm >= 1 && str_eq (char_at nm 0) "@" then (PPin (EIVar (substring nm 1 (str_len nm))), r)
+    else if str_len nm >= 1 && str_eq (char_at nm 0) "$" then (PPin (EVar nm), r)
+    else (PPin (EVar nm), r)
+  | _ -> let (e, r) = parse_primary toks in (PPin e, r)
+
+// `Const`, `Const[...]`, `Const(...)`, `Const(id: p, ...)`; a bare Const is a
+// value pattern (=== the class).
+and parse_const_pattern = fn toks ->
+  let (ce, r) = parse_pat_const toks in
+  (match r with
+   | Cons (TP lb, r2) ->
+     if str_eq lb " [" || str_eq lb "[" then
+       // the item/element parsers already consume the closing ] themselves.
+       (if starts_hash_pattern r2 then
+          let (items, rest, r3) = parse_hash_pat_items r2 Nil "" in
+          (PConstP (ce, PHashP (items, rest)), r3)
+        else
+          let (elems, r3) = parse_arr_pat_elems r2 Nil in
+          (PConstP (ce, PArrP elems), r3))
+     else if str_eq lb " (" || is_lparen lb then
+       (if starts_hash_pattern r2 then
+          let (items, rest, r3) = parse_hash_pat_items r2 Nil "" in
+          (PConstP (ce, PHashP (items, rest)), r3)
+        else
+          let (elems, r3) = parse_arr_pat_elems_paren r2 Nil in
+          (PConstP (ce, PArrP elems), r3))
+     else (PVal ce, r)
+   | _ -> (PVal ce, r))
+
+// elements of an array pattern up to the closing `]`.
+and parse_arr_pat_elems = fn toks -> fn (acc: Pat list) ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TP rb, r) ->
+    if str_eq rb "]" then (rev_app acc Nil, r)
+    else parse_arr_pat_one t acc
+  | _ -> parse_arr_pat_one t acc
+
+and parse_arr_pat_one = fn toks -> fn (acc: Pat list) ->
+  let (p, r) = parse_pattern toks in
+  let acc2 = Cons (p, acc) in
+  (match skip_nls r with
+   | Cons (TP c, r2) ->
+     if str_eq c "," then
+       // a trailing comma before `]` makes the pattern match partially from the
+       // start (`[0, 1, ]` == `[0, 1, *]`): append an anonymous splat.
+       (match skip_nls r2 with
+        | Cons (TP rb, r3) -> if str_eq rb "]" then (rev_app (Cons (PSplatP "", acc2)) Nil, r3) else parse_arr_pat_elems (skip_nls r2) acc2
+        | _ -> parse_arr_pat_elems (skip_nls r2) acc2)
+     else if str_eq c "]" then (rev_app acc2 Nil, r2)
+     else fail ("mere-ruby: expected , or ] in array pattern, got " ++ c)
+   | _ -> fail "mere-ruby: unterminated array pattern")
+
+// like parse_arr_pat_elems but closes on `)` (Const(pat, ...) form).
+and parse_arr_pat_elems_paren = fn toks -> fn (acc: Pat list) ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TP rb, r) -> if str_eq rb ")" then (rev_app acc Nil, r) else parse_arr_pat_one_p t acc
+  | _ -> parse_arr_pat_one_p t acc
+
+and parse_arr_pat_one_p = fn toks -> fn (acc: Pat list) ->
+  let (p, r) = parse_pattern toks in
+  let acc2 = Cons (p, acc) in
+  (match skip_nls r with
+   | Cons (TP c, r2) ->
+     if str_eq c "," then
+       (match skip_nls r2 with
+        | Cons (TP rb, r3) -> if str_eq rb ")" then (rev_app acc2 Nil, r3) else parse_arr_pat_elems_paren (skip_nls r2) acc2
+        | _ -> parse_arr_pat_elems_paren (skip_nls r2) acc2)
+     else if str_eq c ")" then (rev_app acc2 Nil, r2)
+     else fail ("mere-ruby: expected , or ) in pattern, got " ++ c)
+   | _ -> fail "mere-ruby: unterminated pattern")
+
+// a brace hash pattern `{ ... }` — consume up to `}`.
+and parse_hash_pat_brace = fn toks ->
+  match skip_nls toks with
+  | Cons (TP rb, r) -> if str_eq rb "}" then (Nil, "", r) else parse_hash_pat_items toks Nil ""
+  | _ -> parse_hash_pat_items toks Nil ""
+
+// hash-pattern items: (label, sub-pattern) pairs plus a rest tag. Stops at
+// `}` / `]` / `)` / end-of-clause. `rest` accumulates the **-form.
+and parse_hash_pat_items = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) ->
+  let t = skip_nls toks in
+  match t with
+  | Cons (TP dsp, r0) ->
+    if str_eq dsp "**" then
+      // **nil / **name / ** (anonymous)
+      (match r0 with
+       | Cons (TId nm, r1) -> if str_eq nm "nil" then hash_pat_sep r1 acc "nil" else hash_pat_sep r1 acc nm
+       | _ -> hash_pat_sep r0 acc "*")
+    else if str_eq dsp "}" || str_eq dsp "]" || str_eq dsp ")" then (rev_app acc Nil, rest, r0)
+    else parse_hash_pat_kv t acc rest
+  | _ -> parse_hash_pat_kv t acc rest
+
+and parse_hash_pat_kv = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) ->
+  // key: `label:` (identifier) or `"string":` (symbol key).
+  let (key, r2) =
+    (match toks with
+     | Cons (TId nm, Cons (TP colon, r0)) -> if str_eq colon ":" then (nm, r0) else fail "mere-ruby: expected label in hash pattern"
+     | Cons (TStrL s, Cons (TP colon, r0)) -> if str_eq colon ":" then (s, r0) else fail "mere-ruby: expected label in hash pattern"
+     // a "string": key (double-quoted, no interpolation) lexes as `(s "" + s )`.
+     | Cons (TP op, Cons (TStrL empty, Cons (TP plus, Cons (TStrL s, Cons (TP cp, Cons (TP colon, r0)))))) ->
+       if str_eq op "(s" && str_eq plus "+" && str_eq cp ")" && str_eq colon ":" then (s, r0) else fail "mere-ruby: expected a label as the key in the hash pattern"
+     | _ -> fail "mere-ruby: expected a label as the key in the hash pattern") in
+  // an omitted value (`a:`) binds the key name; otherwise parse a sub-pattern.
+  // Do NOT skip newlines here: a newline / `;` ends a brace-less hash pattern.
+  let (sub, r3) =
+    (match r2 with
+     | Cons (TP p, _) -> if str_eq p "," || str_eq p "}" || str_eq p "]" || str_eq p ")" then (PVar key, r2) else parse_pattern r2
+     | Cons (TId gg, _) -> if str_eq gg "then" || str_eq gg "if" || str_eq gg "unless" then (PVar key, r2) else parse_pattern r2
+     | Cons (TNL, _) -> (PVar key, r2)
+     | Cons (TEOF, _) -> (PVar key, r2)
+     | _ -> parse_pattern r2) in
+  hash_pat_sep r3 (Cons ((key, sub), acc)) rest
+
+and hash_pat_sep = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) ->
+  match skip_nls toks with
+  | Cons (TP c, r) ->
+    if str_eq c "," then parse_hash_pat_items r acc rest
+    else if str_eq c "}" || str_eq c "]" || str_eq c ")" then (rev_app acc Nil, rest, r)
+    else (rev_app acc Nil, rest, toks)
+  | _ -> (rev_app acc Nil, rest, toks)
 
 and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
   let t = skip_nls toks in
@@ -4949,6 +5309,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | FLoopNext v -> flow_throw "next" v
      | FReturn v -> flow_throw "return" v
      | FRaise v -> v)
+  | EMatchTest (e, pat) ->
+    let v = eval_e env world blk e in
+    if pat_match env world blk pat v then VBool true else VBool false
+  | EMatchBind (e, pat) ->
+    let v = eval_e env world blk e in
+    let _ = if pat_match env world blk pat v then () else (let _ = raise_exc world "NoMatchingPatternError" (inspect v) in ()) in
+    VNil
   | EFlow (kind, e) ->
     let v = eval_e env world blk e in
     flow_throw kind v
@@ -5831,6 +6198,7 @@ and stmt_targets = fn (s: Stmt) ->
   | SIf (clauses, els) -> list_append_str (clauses_targets clauses) (deep_targets els)
   | SWhile (_, b) -> deep_targets b
   | SCase (_, whens, els) -> list_append_str (whens_targets whens) (deep_targets els)
+  | SCaseIn (_, clauses, _, els) -> list_append_str (clauses_pat_vars clauses) (list_append_str (clausesin_targets clauses) (deep_targets els))
   | SBegin (b, rescues, els, ens) ->
     list_append_str (deep_targets b)
       (list_append_str (rescues_targets rescues) (list_append_str (deep_targets els) (deep_targets ens)))
@@ -5839,6 +6207,9 @@ and stmt_targets = fn (s: Stmt) ->
   // `/re/ =~ s` declares the regex's named captures as locals (block-local
   // inside a block, so they don't leak, matching Ruby's parse-time behaviour).
   | SExpr (EBin (o, a2, _)) -> if str_eq o "=~" then (match a2 with ERegex pat -> rx_capture_names pat 0 | _ -> Nil) else Nil
+  // one-line pattern matching declares its pattern variables as locals.
+  | SExpr (EMatchBind (_, pat)) -> pat_vars pat
+  | SExpr (EMatchTest (_, pat)) -> pat_vars pat
   | _ -> Nil
 
 and clauses_targets = fn clauses ->
@@ -8831,6 +9202,12 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (match subj with
      | ECaseNone -> run_case_truthy env world blk whens els
      | _ -> run_case env world blk (eval_e env world blk subj) whens els)
+  | SCaseIn (subj, clauses, has_else, els) ->
+    // Ruby declares every pattern variable at parse time (they exist as nil
+    // even when no clause matches). Pre-declare, then try each clause.
+    let _ = declare_nils env (clauses_pat_vars clauses) in
+    let v = eval_e env world blk subj in
+    run_case_in env world blk v clauses has_else els
   | SDef (name, params, defs, body) ->
     let (meths, sup, ocls, ivars) = world in
     // `def recv.m` where recv is a live local naming an object defines a
@@ -9325,6 +9702,258 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
 
 and when_any_eq = fn (v: Val) -> fn (xs: Val list) ->
   match xs with Nil -> false | Cons (h, t) -> rb_eq h v || when_any_eq v t
+
+// ---- pattern matching (case/in) -----------------------------------------
+and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> fn (has_else: bool) -> fn (els: Stmt list) ->
+  match clauses with
+  | Nil ->
+    if has_else then run_stmts env world blk els
+    else let _ = raise_exc world "NoMatchingPatternError" (inspect v) in FNext VNil
+  | Cons (cl, rest) ->
+    let (pat, guard, body) = cl in
+    // the guard is only evaluated when the pattern matched (&& short-circuits).
+    if pat_match env world blk pat v && truthy (eval_e env world blk guard)
+    then run_stmts env world blk body
+    else run_case_in env world blk v rest has_else els
+
+// match a value against a pattern, binding variables into env as a side
+// effect. Bindings made before a later sub-pattern fails are left in place
+// (matching Ruby, which does not roll them back).
+and pat_match = fn env -> fn world -> fn blk -> fn (p: Pat) -> fn (v: Val) ->
+  match p with
+  | PVar nm -> let _ = map_set env nm v in true
+  | PVal e ->
+    let cand = eval_e env world blk e in
+    // a proc/lambda value pattern matches when `pattern === object` is truthy.
+    (match cand with
+     | VProc _ -> truthy (invoke_val_c env world blk cand "===" (Cons (v, Nil)) false)
+     | _ -> case_eqq world cand v)
+  | PPin e -> rb_eq (eval_e env world blk e) v
+  | PAltP alts -> pat_match_any env world blk alts v
+  | PAsP (sub, nm) -> if pat_match env world blk sub v then (let _ = map_set env nm v in true) else false
+  | PArrP elems -> pat_match_array env world blk elems v
+  | PHashP (items, rest) -> pat_match_hash env world blk items rest v
+  | PConstP (ce, inner) ->
+    let cls = eval_e env world blk ce in
+    if case_eqq world cls v then pat_match env world blk inner v else false
+  | PSplatP _ -> true
+
+and pat_match_any = fn env -> fn world -> fn blk -> fn (alts: Pat list) -> fn (v: Val) ->
+  match alts with
+  | Nil -> false
+  | Cons (a, rest) -> if pat_match env world blk a v then true else pat_match_any env world blk rest v
+
+and pat_match_array = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn (v: Val) ->
+  let (ok, xs) = deconstruct_of env world blk v in
+  if ok then
+    let ns = count_splats elems in
+    if ns == 0 then
+      (if val_list_len xs == pat_list_len elems then match_seq env world blk elems xs else false)
+    else if ns == 1 then match_one_splat env world blk elems xs
+    else match_find env world blk elems xs
+  else false
+
+// deconstruct a value into a Val list for an array pattern. Real arrays are
+// used directly; a VObj must define #deconstruct returning an Array.
+and deconstruct_of = fn env -> fn world -> fn blk -> fn (v: Val) ->
+  match v with
+  | VArr id -> (true, deref id)
+  | VObj oid ->
+    let (meths, sup, ocls, ivars) = world in
+    let cls = map_get ocls (str_of_int oid) in
+    if has_meth world cls "deconstruct" then
+      (match invoke_val_c env world blk v "deconstruct" Nil false with
+       | VArr id2 -> (true, deref id2)
+       | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct must return Array") in (false, (Nil : Val list)))
+    else (false, (Nil : Val list))
+  | _ -> (false, (Nil : Val list))
+
+and count_splats = fn (ps: Pat list) ->
+  match ps with Nil -> 0 | Cons (p, r) -> (match p with PSplatP _ -> 1 | _ -> 0) + count_splats r
+
+and pat_list_len = fn (ps: Pat list) ->
+  match ps with Nil -> 0 | Cons (_, r) -> 1 + pat_list_len r
+
+// match each pattern against each value, in order, requiring equal length.
+and match_seq = fn env -> fn world -> fn blk -> fn (ps: Pat list) -> fn (xs: Val list) ->
+  match ps with
+  | Nil -> (match xs with Nil -> true | _ -> false)
+  | Cons (p, pr) ->
+    (match xs with
+     | Nil -> false
+     | Cons (x, xr) -> if pat_match env world blk p x then match_seq env world blk pr xr else false)
+
+// [pre..., *rest, post...] — one splat. pre/post match the ends; rest binds
+// the middle slice as an Array.
+and match_one_splat = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn (xs: Val list) ->
+  let (pre, splatname, post) = split_at_splat elems (Nil : Pat list) in
+  let np = pat_list_len pre in
+  let nq = pat_list_len post in
+  let n = val_list_len xs in
+  if n < np + nq then false
+  else
+    let prexs = val_take xs np in
+    let midxs = val_slice xs np (n - nq) in
+    let postxs = val_drop xs (n - nq) in
+    if match_seq env world blk pre prexs && match_seq env world blk post postxs then
+      let _ = if str_eq splatname "" then () else map_set env splatname (arr_new midxs) in true
+    else false
+
+// split an element list around its (single) splat: (pre, name, post).
+and split_at_splat = fn (elems: Pat list) -> fn (pre: Pat list) ->
+  match elems with
+  | Nil -> (rev_pats pre, "", (Nil : Pat list))
+  | Cons (p, r) ->
+    (match p with
+     | PSplatP nm -> (rev_pats pre, nm, r)
+     | _ -> split_at_splat r (Cons (p, pre)))
+
+and rev_pats = fn (ps: Pat list) -> rev_pats_go ps (Nil : Pat list)
+and rev_pats_go = fn (ps: Pat list) -> fn (acc: Pat list) ->
+  match ps with Nil -> acc | Cons (p, r) -> rev_pats_go r (Cons (p, acc))
+
+// find pattern [*pre, mid..., *post]: locate the leftmost window matching the
+// fixed middle; bind pre/post splats to the surrounding slices.
+and match_find = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn (xs: Val list) ->
+  let preName = splat_name_of (pat_head elems) in
+  let mids = pat_middle elems in
+  let postName = splat_name_of (pat_last elems) in
+  let midlen = pat_list_len mids in
+  let n = val_list_len xs in
+  find_window env world blk mids midlen xs n 0 preName postName
+
+and find_window = fn env -> fn world -> fn blk -> fn (mids: Pat list) -> fn (midlen: int) -> fn (xs: Val list) -> fn (n: int) -> fn (start: int) -> fn (preName: str) -> fn (postName: str) ->
+  if start + midlen > n then false
+  else
+    let window = val_slice xs start (start + midlen) in
+    if match_seq env world blk mids window then
+      let _ = if str_eq preName "" then () else map_set env preName (arr_new (val_take xs start)) in
+      let _ = if str_eq postName "" then () else map_set env postName (arr_new (val_drop xs (start + midlen))) in
+      true
+    else find_window env world blk mids midlen xs n (start + 1) preName postName
+
+and splat_name_of = fn (p: Pat) -> match p with PSplatP nm -> nm | _ -> ""
+and pat_head = fn (ps: Pat list) -> match ps with Cons (p, _) -> p | Nil -> PSplatP ""
+and pat_last = fn (ps: Pat list) -> match ps with Nil -> PSplatP "" | Cons (p, Nil) -> p | Cons (_, r) -> pat_last r
+// the elements strictly between the first and last.
+and pat_middle = fn (ps: Pat list) ->
+  match ps with
+  | Nil -> Nil
+  | Cons (_, r) -> pat_drop_last r
+and pat_drop_last = fn (ps: Pat list) ->
+  match ps with
+  | Nil -> Nil
+  | Cons (_, Nil) -> Nil
+  | Cons (p, r) -> Cons (p, pat_drop_last r)
+
+// ---- Val-list slicing helpers -------------------------------------------
+and val_take = fn (xs: Val list) -> fn (k: int) ->
+  if k <= 0 then (Nil : Val list)
+  else (match xs with Nil -> Nil | Cons (h, t) -> Cons (h, val_take t (k - 1)))
+and val_drop = fn (xs: Val list) -> fn (k: int) ->
+  if k <= 0 then xs
+  else (match xs with Nil -> Nil | Cons (_, t) -> val_drop t (k - 1))
+and val_slice = fn (xs: Val list) -> fn (lo: int) -> fn (hi: int) ->
+  val_take (val_drop xs lo) (hi - lo)
+
+// ---- hash patterns -------------------------------------------------------
+and pat_match_hash = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list) -> fn (rest: str) -> fn (v: Val) ->
+  let (ok, pairs) = deconstruct_keys_of env world blk v items rest in
+  if ok then
+    // `{}` (no keys, no rest) matches only an empty hash.
+    if (match items with Nil -> true | _ -> false) && str_eq rest "" then val_list_len pairs == 0
+    else if match_hash_items env world blk items pairs then
+      (if str_eq rest "nil" then hash_only_keys pairs items
+       else if str_eq rest "" || str_eq rest "*" then true
+       else let _ = map_set env rest (hash_without pairs items) in true)
+    else false
+  else false
+
+and deconstruct_keys_of = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (items: (str * Pat) list) -> fn (rest: str) ->
+  match v with
+  | VHsh id -> (true, hderef id)
+  | VObj oid ->
+    let (meths, sup, ocls, ivars) = world in
+    let cls = map_get ocls (str_of_int oid) in
+    if has_meth world cls "deconstruct_keys" then
+      // Ruby passes the list of requested keys, or nil when a **rest binding is
+      // present (the method may then need every key).
+      let named_rest = if str_eq rest "" || str_eq rest "nil" || str_eq rest "*" then false else true in
+      let karg = if named_rest then VNil else arr_new (hash_key_syms items) in
+      (match invoke_val_c env world blk v "deconstruct_keys" (Cons (karg, Nil)) false with
+       | VHsh id2 -> (true, hderef id2)
+       | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct_keys must return Hash") in (false, (Nil : Val list)))
+    else (false, (Nil : Val list))
+  | _ -> (false, (Nil : Val list))
+
+and hash_key_syms = fn (items: (str * Pat) list) ->
+  match items with Nil -> Nil | Cons (kp, r) -> let (k, _) = kp in Cons (VSym k, hash_key_syms r)
+
+and match_hash_items = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list) -> fn (pairs: Val list) ->
+  match items with
+  | Nil -> true
+  | Cons (kp, rest) ->
+    let (k, sub) = kp in
+    let (found, hv) = hash_lookup pairs (VSym k) in
+    if found then (if pat_match env world blk sub hv then match_hash_items env world blk rest pairs else false)
+    else false
+
+// scan interleaved [k1,v1,k2,v2,...] for a key equal to target.
+and hash_lookup = fn (pairs: Val list) -> fn (target: Val) ->
+  match pairs with
+  | Nil -> (false, VNil)
+  | Cons (k, Cons (v, rest)) -> if rb_eq k target then (true, v) else hash_lookup rest target
+  | _ -> (false, VNil)
+
+// every key in the hash is one of the pattern keys (for **nil).
+and hash_only_keys = fn (pairs: Val list) -> fn (items: (str * Pat) list) ->
+  match pairs with
+  | Nil -> true
+  | Cons (k, Cons (_, rest)) -> if item_has_key items k then hash_only_keys rest items else false
+  | _ -> true
+
+and item_has_key = fn (items: (str * Pat) list) -> fn (k: Val) ->
+  match items with Nil -> false | Cons (kp, r) -> let (nm, _) = kp in (rb_eq (VSym nm) k) || item_has_key r k
+
+// a fresh hash of the pairs whose keys are NOT named in the pattern (**rest).
+and hash_without = fn (pairs: Val list) -> fn (items: (str * Pat) list) ->
+  mkhash (hash_without_go pairs items)
+and hash_without_go = fn (pairs: Val list) -> fn (items: (str * Pat) list) ->
+  match pairs with
+  | Cons (k, Cons (v, rest)) -> if item_has_key items k then hash_without_go rest items else Cons (k, Cons (v, hash_without_go rest items))
+  | _ -> Nil
+
+// collect the pattern variables bound across all clauses (declared as nil at
+// entry, matching Ruby's parse-time hoisting).
+and clauses_pat_vars = fn clauses ->
+  match clauses with
+  | Nil -> Nil
+  | Cons (cl, rest) -> let (p, g, b) = cl in list_append_str (pat_vars p) (clauses_pat_vars rest)
+
+and pat_vars = fn (p: Pat) ->
+  match p with
+  | PVar nm -> Cons (nm, Nil)
+  | PVal _ -> Nil
+  | PPin _ -> Nil
+  | PSplatP nm -> if str_eq nm "" then Nil else Cons (nm, Nil)
+  | PArrP elems -> pats_vars elems
+  | PHashP (items, rest) ->
+    let base = hash_items_vars items in
+    if str_eq rest "" || str_eq rest "nil" || str_eq rest "*" then base else Cons (rest, base)
+  | PAltP alts -> pats_vars alts
+  | PAsP (sub, nm) -> Cons (nm, pat_vars sub)
+  | PConstP (_, inner) -> pat_vars inner
+
+and pats_vars = fn (ps: Pat list) ->
+  match ps with Nil -> Nil | Cons (p, r) -> list_append_str (pat_vars p) (pats_vars r)
+
+and hash_items_vars = fn (items: (str * Pat) list) ->
+  match items with Nil -> Nil | Cons (kp, r) -> let (k, sub) = kp in list_append_str (pat_vars sub) (hash_items_vars r)
+
+and clausesin_targets = fn clauses ->
+  match clauses with
+  | Nil -> Nil
+  | Cons (cl, rest) -> let (p, g, b) = cl in list_append_str (deep_targets b) (clausesin_targets rest)
 
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
@@ -9953,6 +10582,8 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "SyntaxError" "ScriptError" in
   let _ = map_set sup "LocalJumpError" "StandardError" in
   let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
+  let _ = map_set sup "NoMatchingPatternError" "StandardError" in
+  let _ = map_set sup "NoMatchingPatternKeyError" "NoMatchingPatternError" in
   // built-in value classes, so reopened methods resolve up the real chain
   // (class Integer / class Object monkey-patching reaches every value).
   let _ = map_set sup "Integer" "Numeric" in
