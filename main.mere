@@ -3411,9 +3411,37 @@ and pp_has_real = fn (names: str list) ->
 and check_dup_vars = fn (p: Pat) ->
   if pp_has_dup (pp_names p Nil) then fail "mere-ruby: duplicated variable name in pattern" else ()
 
+// `^name` may only pin a variable already bound to its LEFT in the pattern (or
+// a pre-existing local). Pinning a name that the SAME pattern binds later
+// (`in [^n, n]`) is a SyntaxError ("no such local variable"); `[n, ^n]` is ok.
+and check_pin_order = fn (p: Pat) ->
+  let all = pp_names p Nil in
+  let (bad, _) = pp_pin_walk p all Nil in
+  if bad then fail "mere-ruby: no such local variable in pattern (pinned before bound)" else ()
+and pp_pin_walk = fn (p: Pat) -> fn (all: str list) -> fn (seen: str list) ->
+  match p with
+  | PVar n -> (false, Cons (n, seen))
+  | PPin e -> (match e with EVar n -> ((pp_mem all n) && (if pp_mem seen n then false else true), seen) | _ -> (false, seen))
+  | PSplatP n -> (false, if str_eq n "" then seen else Cons (n, seen))
+  | PArrP es -> pp_pin_walk_list es all seen
+  | PHashP (items, _) -> pp_pin_walk_hitems items all seen
+  | PAltP alts -> pp_pin_walk_list alts all seen
+  | PAsP (sub, n) -> let (b, s) = pp_pin_walk sub all seen in (b, Cons (n, s))
+  | PConstP (_, inner) -> pp_pin_walk inner all seen
+  | _ -> (false, seen)
+and pp_pin_walk_list = fn (es: Pat list) -> fn (all: str list) -> fn (seen: str list) ->
+  match es with
+  | Nil -> (false, seen)
+  | Cons (p, r) -> let (b, s) = pp_pin_walk p all seen in if b then (true, s) else pp_pin_walk_list r all s
+and pp_pin_walk_hitems = fn (items: (str * Pat) list) -> fn (all: str list) -> fn (seen: str list) ->
+  match items with
+  | Nil -> (false, seen)
+  | Cons (kp, r) -> let (k, sub) = kp in let (b, s) = pp_pin_walk sub all seen in if b then (true, s) else pp_pin_walk_hitems r all s
+
 and parse_pattern_top = fn toks ->
   let (p, r) = parse_pattern_top0 toks in
   let _ = check_dup_vars p in
+  let _ = check_pin_order p in
   (p, r)
 
 and parse_pattern_top0 = fn toks ->
@@ -9846,6 +9874,18 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
 and when_any_eq = fn (v: Val) -> fn (xs: Val list) ->
   match xs with Nil -> false | Cons (h, t) -> rb_eq h v || when_any_eq v t
 
+// `cand === v` as used by value/pin patterns: a proc/lambda calls itself, a
+// class consults an active singleton-#=== refinement, otherwise case_eqq.
+and match_eqq = fn env -> fn world -> fn blk -> fn (cand: Val) -> fn (v: Val) ->
+  match cand with
+  | VProc _ -> truthy (invoke_val_c env world blk cand "===" (Cons (v, Nil)) false)
+  | VClass c ->
+    let sk = "(sng:" ++ c ++ ")" in
+    if map_has ref_active sk && has_meth world (ref_impl sk) "===" then
+      truthy (invoke world (false, (Nil : str list), (Nil : Stmt list), env) cand (ref_impl sk) "===" (Cons (v, Nil)))
+    else case_eqq world cand v
+  | _ -> case_eqq world cand v
+
 // the active refinement impl class for a target ("" if none/not a string).
 and ref_impl = fn (target: str) ->
   if map_has ref_active target then (match map_get ref_active target with VStr h -> sget h | _ -> "") else ""
@@ -9869,19 +9909,7 @@ and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> f
 and pat_match = fn env -> fn world -> fn blk -> fn (p: Pat) -> fn (v: Val) ->
   match p with
   | PVar nm -> let _ = map_set env nm v in true
-  | PVal e ->
-    let cand = eval_e env world blk e in
-    // a proc/lambda value pattern matches when `pattern === object` is truthy.
-    (match cand with
-     | VProc _ -> truthy (invoke_val_c env world blk cand "===" (Cons (v, Nil)) false)
-     // a refinement of the class's singleton #=== (refine C.singleton_class)
-     // overrides `C === obj` in a constant pattern.
-     | VClass c ->
-       let sk = "(sng:" ++ c ++ ")" in
-       if map_has ref_active sk && has_meth world (ref_impl sk) "===" then
-         truthy (invoke world (false, (Nil : str list), (Nil : Stmt list), env) cand (ref_impl sk) "===" (Cons (v, Nil)))
-       else case_eqq world cand v
-     | _ -> case_eqq world cand v)
+  | PVal e -> match_eqq env world blk (eval_e env world blk e) v
   | PPin e -> rb_eq (eval_e env world blk e) v
   | PAltP alts -> pat_match_any env world blk alts v
   | PAsP (sub, nm) -> if pat_match env world blk sub v then (let _ = map_set env nm v in true) else false
