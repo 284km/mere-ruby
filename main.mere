@@ -4064,6 +4064,12 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
     (match vb with VRange (d, e, f) -> a == d && b == e && (if c then f else (if f then false else true)) | _ -> false)
   | VExc (c, m) -> (match vb with VExc (d, n) -> str_eq c d && str_eq m n | _ -> false)
   | VMain -> (match vb with VMain -> true | _ -> false)
+  // regexes / procs / bindings compare by pattern text / handle identity (and
+  // never equal a different kind) — without these arms rb_eq is non-exhaustive
+  // and aborts when a regex/proc reaches it (e.g. a `^regex` pin).
+  | VRegex p -> (match vb with VRegex q -> str_eq p q | _ -> false)
+  | VProc x -> (match vb with VProc y -> x == y | _ -> false)
+  | VBind x -> (match vb with VBind y -> x == y | _ -> false)
 
 and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -5468,6 +5474,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else try_self_call env world name Nil
   | ECall (name, arges) ->
     let (meths, sup, ocls, ivars) = world in
+    // `refine X.singleton_class do...end` mis-parses: the do-block binds to the
+    // inner `.singleton_class` (an EMethodB), leaving refine block-less. Recover
+    // it — the refined target is the method call without the block, and the
+    // block body is the refine body. (Scoped to refine to avoid a general
+    // do-block precedence change.)
+    if str_eq name "refine" && (match map_get env "self" with VClass _ -> true | _ -> false) && (match arges with Cons (EMethodB (_, _, _, _, _), Nil) -> true | _ -> false) then
+      (match arges with
+       | Cons (EMethodB (mrecv, mm, margs, mbp, mbb), Nil) ->
+         (match eval_e env world blk (EMethod (mrecv, mm, margs)) with
+          | VClass tcls -> do_refine world (match map_get env "self" with VClass rc -> rc | _ -> "") tcls mbb
+          | _ -> VNil)
+       | _ -> VNil)
+    else
     let args = eval_args env world blk arges in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     // Kernel conversion functions: Integer()/Float()/String()/Array()/
@@ -5600,13 +5619,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "refine" && (match args with Cons (VClass _, _) -> true | _ -> false) && (match map_get env "self" with VClass _ -> true | _ -> false) then
       (let refinery = (match map_get env "self" with VClass rc -> rc | _ -> "") in
        let target = (match args with Cons (VClass t, _) -> t | _ -> "") in
-       let i = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt n -> n | _ -> 0) else 0) in
-       let impl = "Refine_" ++ refinery ++ "_" ++ str_of_int i in
-       let _ = flow_value (register_class world impl bb) in
-       let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
-       let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl) in
-       let _ = map_set refine_cnt refinery (VInt (i + 1)) in
-       VClass impl)
+       do_refine world refinery target bb)
     else if map_has meths name then call_method env world newblk name args
     // implicit self: a bare `each { }` inside a method is `self.each { }`.
     else if map_has env "self" then
@@ -9048,6 +9061,17 @@ and meth_base_go = fn (nm: str) -> fn (i: int) -> fn (start: int) ->
   else if str_eq (char_at nm i) "#" then meth_base_go nm (i + 1) (i + 1)
   else meth_base_go nm (i + 1) start
 
+// register a refinement of `target` under `refinery`: run its body into a
+// fresh impl class and record the triple for a later `using`.
+and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: Stmt list) ->
+  let i = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt n -> n | _ -> 0) else 0) in
+  let impl = "Refine_" ++ refinery ++ "_" ++ str_of_int i in
+  let _ = flow_value (register_class world impl bb) in
+  let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
+  let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl) in
+  let _ = map_set refine_cnt refinery (VInt (i + 1)) in
+  VClass impl
+
 // activate refinery's refinements: for each recorded (target, impl), point the
 // target class at the impl in ref_active.
 and activate_refinements = fn (refinery: str) -> fn (i: int) -> fn (n: int) ->
@@ -9943,7 +9967,9 @@ and pat_match = fn env -> fn world -> fn blk -> fn (p: Pat) -> fn (v: Val) ->
   match p with
   | PVar nm -> let _ = map_set env nm v in true
   | PVal e -> match_eqq env world blk (eval_e env world blk e) v
-  | PPin e -> rb_eq (eval_e env world blk e) v
+  // a pin `^expr` matches via `expr === value` (so ^(/re/), ^(range), ^Class
+  // work), matching Ruby.
+  | PPin e -> match_eqq env world blk (eval_e env world blk e) v
   | PAltP alts -> pat_match_any env world blk alts v
   | PAsP (sub, nm) -> if pat_match env world blk sub v then (let _ = map_set env nm v in true) else false
   | PArrP elems -> pat_match_array env world blk elems v
