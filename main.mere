@@ -292,6 +292,11 @@ let enc_name = map_new () in
 let proc_store = map_new ();
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// a sentinel prepended to a block's params when a lambda is installed as a
+// block (via &lambda): run_block detects it, strips it, and enforces strict
+// arity (a lambda yielded to raises ArgumentError on a count mismatch, unlike
+// a plain block). This threads lambda-ness through the existing 4-tuple.
+let lambda_blk_marker = "__lambda_blk__";
 // hash handles that originate from keyword-argument syntax (`key: v` / `**h`)
 // at a call site, as opposed to a positional `{...}` literal or hash variable.
 // Ruby 3.0 keeps these separate: only a kwarg-origin trailing hash binds to a
@@ -5786,7 +5791,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let recv = eval_e env world blk recv_e in
        let args = eval_args env world blk (rev_app rrest Nil) in
        (match eval_e env world blk be with
-        | VProc pid -> invoke_with_block env world blk recv name args (map_get proc_store (str_of_int pid))
+        | VProc pid -> invoke_with_block env world blk recv name args (proc_as_block pid)
         | VSym snm ->
           let cenv2 = map_new () in
           invoke_with_block env world blk recv name args
@@ -6425,7 +6430,12 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
 // `encl` as the active block so a yield inside it reaches the enclosing
 // method's block.
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
-  let (has, params, body, cenv) = theblk in
+  let (has, params0, body, cenv) = theblk in
+  // a lambda installed as a block carries a marker: strip it and enforce
+  // strict arity (a plain block stays lenient).
+  let is_lam = (match params0 with Cons (m, _) -> str_eq m lambda_blk_marker | _ -> false) in
+  let params = if is_lam then (match params0 with Cons (_, rest) -> rest | _ -> params0) else params0 in
+  let _ = if is_lam then lambda_arity_check world params (vlen argvals) else () in
   // Ruby block params are block-local: save any outer bindings of the
   // param names and restore them after the block (for-loops keep their
   // variable via an explicit assignment to a hidden __for param).
@@ -7505,19 +7515,40 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
   | _ -> dispatch_prim env world blk recv name args vischeck
 
 // dispatch `recv.name(args) { block }` — shared by literal-block calls and
+// strict-arity check shared by a direct lambda call and a lambda-as-block:
+// an explicit param list must receive exactly that many args (a splat or a
+// param-less body absorbs any count); otherwise ArgumentError.
+and lambda_arity_check = fn world -> fn (ps: str list) -> fn (nargs: int) ->
+  let nps = list_str_len (strip_block_params ps) in
+  (match ps with
+   | Nil -> ()
+   | _ ->
+     if has_splat ps then ()
+     else if nps == nargs then ()
+     else let _ = raise_exc world "ArgumentError"
+            ("wrong number of arguments (given " ++ str_of_int nargs ++ ", expected " ++ str_of_int nps ++ ")") in ())
+
+// the block tuple for a proc used as a block; a lambda gets the marker
+// prepended to its params so run_block enforces strict arity.
+and proc_as_block = fn (pid: int) ->
+  let t = map_get proc_store (str_of_int pid) in
+  if map_has lambda_ids (str_of_int pid) then
+    (match t with (h, ps, b, e) -> (h, Cons (lambda_blk_marker, ps), b, e))
+  else t
+
 // &proc block-pass arguments.
 // coerce a `&expr` value into a call block: a Proc uses its own block, nil
 // means no block, a Symbol becomes a symbol-proc, and anything else is
 // converted eagerly via #to_proc (so its side effects run at the call site).
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
-  | VProc pid -> map_get proc_store (str_of_int pid)
+  | VProc pid -> proc_as_block pid
   | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
   | VSym s -> (true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil), env)
   | _ ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     (match invoke_val_c env world noblk bv "to_proc" Nil false with
-     | VProc pid -> map_get proc_store (str_of_int pid)
+     | VProc pid -> proc_as_block pid
      | _ -> noblk)
 
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
