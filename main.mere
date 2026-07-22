@@ -42,6 +42,10 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           | EScopedRead of Expr * str  // recv::Const read (runtime recv)
           | EIVar of str         // @name
           | EMethod of Expr * str * Expr list  // recv.name(args)
+          // op-assign on an attribute / index, evaluating recv (and indices)
+          // exactly once: recv.name op= rhs / recv[idx..] op= rhs.
+          | EAttrOp of Expr * str * str * Expr
+          | EIdxOp of Expr * Expr list * str * Expr
           // M4 blocks / iterators:
           | ERange of Expr * Expr * bool         // lo..hi (bool = exclusive)
           // `name [items]` (space before bracket): indexing when name is a
@@ -1595,11 +1599,10 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
             else if str_eq p "=" then
               let (rhs, r4) = parse_expr r3 in
               (EMethod (recv, name ++ "=", Cons (rhs, Nil)), r4)
-            // attribute op-assign: recv.m ||= v -> recv.m= (recv.m || v).
+            // attribute op-assign: recv evaluated exactly once.
             else if not (str_eq (opassign_base p) "") then
               let (rhs, r4) = parse_expr (skip_nls r3) in
-              let cur = EMethod (recv, name, Nil) in
-              (EMethod (recv, name ++ "=", Cons (EBin (opassign_base p, cur, rhs), Nil)), r4)
+              (EAttrOp (recv, name, opassign_base p, rhs), r4)
             else attach_block_method recv name Nil r2
           | _ -> attach_block_method recv name Nil r2)
        // `recv.(args)` is shorthand for `recv.call(args)`.
@@ -1637,7 +1640,7 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
          // `recv[] op= v` -> `recv[]= (recv[] op v)`.
          else if not (str_eq (opassign_base eq) "") then
            let (rhs, r5) = parse_expr (skip_nls r0e) in
-           (EMethod (recv, "[]=", Cons (EBin (opassign_base eq, EMethod (recv, "[]", Nil), rhs), Nil)), r5)
+           (EIdxOp (recv, Nil, opassign_base eq, rhs), r5)
          else (match r with Cons (_, r0f) -> parse_postfix_more (EMethod (recv, "[]", Nil)) r0f | _ -> (recv, toks))
        | Cons (_, r0e) -> parse_postfix_more (EMethod (recv, "[]", Nil)) r0e
        | _ -> (recv, toks))
@@ -1659,8 +1662,7 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
          // [] op v); ||= and &&= use their short-circuit operators.
          else if not (str_eq (opassign_base eq) "") then
            let (rhs, r5) = parse_expr (skip_nls r4) in
-           let cur = EMethod (recv, "[]", idxs) in
-           (EMethod (recv, "[]=", eapp idxs (Cons (EBin (opassign_base eq, cur, rhs), Nil))), r5)
+           (EIdxOp (recv, idxs, opassign_base eq, rhs), r5)
          else parse_postfix_more (EMethod (recv, "[]", idxs)) r3
        | _ -> parse_postfix_more (EMethod (recv, "[]", idxs)) r3)
     // safe navigation: a&.b / a&.b(args) — nil receiver short-circuits.
@@ -5825,6 +5827,43 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          if has_meth world pcls name then invoke world newblk other pcls name args
          else fail ("mere-ruby: undefined method '" ++ name ++ "' (with block)"))
     else fail ("mere-ruby: undefined method '" ++ name ++ "' (with block)")
+  // recv.name op= rhs — evaluate recv once (bound to a temp), then read/op/
+  // write the attribute through the normal method dispatch.
+  | EAttrOp (recv_e, name, op, rhs_e) ->
+    let r = eval_e env world blk recv_e in
+    let e2 = map_copy env in
+    let _ = map_set e2 "__opr" r in
+    // self-receiver keeps ESelf so private accessors stay reachable (self is
+    // side-effect-free, so evaluating it twice is harmless).
+    let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
+    let cur = eval_e e2 world blk (EMethod (rx, name, Nil)) in
+    if str_eq op "||" then
+      (if truthy cur then cur
+       else let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))))
+    else if str_eq op "&&" then
+      (if truthy cur then (let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil)))) else cur)
+    else
+      let v = eval_e env world blk rhs_e in
+      let _ = map_set e2 "__opv" (apply_bin_vals world blk op cur v) in
+      eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil)))
+  // recv[idx..] op= rhs — evaluate recv and the indices once (bound to temps).
+  | EIdxOp (recv_e, idx_es, op, rhs_e) ->
+    let r = eval_e env world blk recv_e in
+    let idxs = eval_args env world blk idx_es in
+    let e2 = map_copy env in
+    let _ = map_set e2 "__opr" r in
+    let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
+    let ies = idx_temp_exprs e2 idxs 0 in
+    let cur = eval_e e2 world blk (EMethod (rx, "[]", ies)) in
+    if str_eq op "||" then
+      (if truthy cur then cur
+       else let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))))
+    else if str_eq op "&&" then
+      (if truthy cur then (let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil))))) else cur)
+    else
+      let v = eval_e env world blk rhs_e in
+      let _ = map_set e2 "__opv" (apply_bin_vals world blk op cur v) in
+      eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil))))
   | EMethod (recv_e, name, arges) ->
     // a trailing &proc / &var argument becomes the call's block.
     (match rev_app arges Nil with
@@ -6042,6 +6081,13 @@ and rb_identical = fn (a: Val) -> fn (b: Val) ->
   | VStr ia -> (match b with VStr ib -> ia == ib | _ -> false)
   | VHsh ia -> (match b with VHsh ib -> ia == ib | _ -> false)
   | _ -> rb_eq a b
+
+// bind index values to hidden temp vars (__opi0..) in e2 for op-assign, and
+// return EVar references to them (so the index is not re-evaluated).
+and idx_temp_exprs = fn e2 -> fn (idxs: Val list) -> fn (n: int) ->
+  match idxs with
+  | Nil -> (Nil : Expr list)
+  | Cons (v, rest) -> let nm = "__opi" ++ str_of_int n in let _ = map_set e2 nm v in Cons (EVar nm, idx_temp_exprs e2 rest (n + 1))
 
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
