@@ -292,6 +292,10 @@ let refine_cnt = map_new ();   // "<refinery>"      -> VInt count
 let refine_tgt = map_new ();   // "<refinery>#<i>"  -> VStr target class
 let refine_cls = map_new ();   // "<refinery>#<i>"  -> VStr impl class
 let ref_active = map_new ();   // "<target>"        -> VStr impl class
+// per-case memo of #deconstruct / #deconstruct_keys results, so a case with
+// several `in` clauses calls the method once (Ruby caches). Keyed by value
+// handle; cleared at the start of each case.
+let deco_memo = map_new ();
 // Binding objects: id -> the captured local-variable env (which already
 // holds "self"). `binding` captures the current env; eval(str, b) and
 // b.eval(str) re-enter the interpreter against it.
@@ -8938,6 +8942,12 @@ and activate_refinements = fn (refinery: str) -> fn (i: int) -> fn (n: int) ->
     let _ = if str_eq tgt "" then () else map_set ref_active tgt impl in
     activate_refinements refinery (i + 1) n
 
+// delete every entry from a map.
+and map_clear = fn m ->
+  let cur = map_new () in
+  let _ = map_iter m (fn (k: str) -> fn (v: Val) -> map_set cur k v) in
+  map_iter cur (fn (k: str) -> fn (v: Val) -> if map_has m k then map_delete m k else ())
+
 // clear ref_active and repopulate from `saved` (restore a scope's snapshot).
 and restore_ref_active = fn saved ->
   let cur = map_new () in
@@ -9281,6 +9291,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // Ruby declares every pattern variable at parse time (they exist as nil
     // even when no clause matches). Pre-declare, then try each clause.
     let _ = declare_nils env (clauses_pat_vars clauses) in
+    // #deconstruct(_keys) is cached across this case's clauses (called once).
+    let _ = map_clear deco_memo in
     let v = eval_e env world blk subj in
     run_case_in env world blk v clauses has_else els
   | SDef (name, params, defs, body) ->
@@ -9844,22 +9856,31 @@ and pat_match_array = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn
 and deconstruct_of = fn env -> fn world -> fn blk -> fn (v: Val) ->
   match v with
   | VArr id ->
-    // an active refinement of Array#deconstruct takes precedence over using
-    // the array's own elements.
-    if map_has ref_active "Array" && has_meth world (ref_impl "Array") "deconstruct" then
-      (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v (ref_impl "Array") "deconstruct" Nil with
-       | VArr id2 -> (true, deref id2)
-       | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct must return Array") in (false, (Nil : Val list)))
+    let hk = hng_key v in
+    // a singleton #deconstruct (def arr.deconstruct) or an active Array
+    // refinement is used in preference to the array's own elements; otherwise
+    // the elements are the deconstruction (Array#deconstruct returns self).
+    if (if str_eq hk "" then false else map_has hng_store hk) && has_meth world (map_get hng_store hk) "deconstruct" then
+      call_deco env world blk v (map_get hng_store hk)
+    else if map_has ref_active "Array" && has_meth world (ref_impl "Array") "deconstruct" then
+      call_deco env world blk v (ref_impl "Array")
     else (true, deref id)
   | VObj oid ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int oid) in
-    if has_meth world cls "deconstruct" then
-      (match invoke_val_c env world blk v "deconstruct" Nil false with
-       | VArr id2 -> (true, deref id2)
-       | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct must return Array") in (false, (Nil : Val list)))
+    if has_meth world cls "deconstruct" then call_deco env world blk v cls
     else (false, (Nil : Val list))
   | _ -> (false, (Nil : Val list))
+
+// invoke recv.deconstruct on class `cls`, memoised per case; the result must be
+// an Array (else TypeError). Returns (ok, elements).
+and call_deco = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (cls: str) ->
+  let mk = "d:" ++ hng_key v ++ (match v with VObj oid -> "obj:" ++ str_of_int oid | _ -> "") in
+  if map_has deco_memo mk then (match map_get deco_memo mk with VArr id2 -> (true, deref id2) | _ -> (false, (Nil : Val list)))
+  else
+    (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v cls "deconstruct" Nil with
+     | VArr id2 -> let _ = map_set deco_memo mk (VArr id2) in (true, deref id2)
+     | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct must return Array") in (false, (Nil : Val list)))
 
 and count_splats = fn (ps: Pat list) ->
   match ps with Nil -> 0 | Cons (p, r) -> (match p with PSplatP _ -> 1 | _ -> 0) + count_splats r
