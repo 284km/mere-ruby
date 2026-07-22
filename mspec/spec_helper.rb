@@ -261,6 +261,22 @@ def be_true; BeMatcher.new(:true); end
 def be_false; BeMatcher.new(:false); end
 def be_empty; BeMatcher.new(:empty); end
 
+# x.should be_kind_of(K) / be_an_instance_of(K): a class-parameterised matcher.
+class KindOfMatcher
+  def initialize(klass, exact); @klass = klass; @exact = exact; end
+  def match?(actual)
+    if @exact
+      actual.instance_of?(@klass)
+    else
+      actual.kind_of?(@klass)
+    end
+  end
+end
+
+def be_kind_of(k); KindOfMatcher.new(k, false); end
+def be_an_instance_of(k); KindOfMatcher.new(k, true); end
+def be_instance_of(k); KindOfMatcher.new(k, true); end
+
 # A minimal mock: records should_receive expectations (parallel arrays —
 # the host may lack mutable hashes) and answers via method_missing.
 class MockExpectation
