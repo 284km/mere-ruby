@@ -114,6 +114,9 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           | SReturn of Expr
           | SBreak of Expr | SNext of Expr
           | SClass of str * str * Stmt list
+          // like SClass but the superclass is a runtime expression (evaluated
+          // to a Class; a non-Class / module / singleton raises TypeError).
+          | SClassE of str * Expr * Stmt list
           | SIVarAssign of str * Expr
           | SAttr of str * str list
           // M6: begin body / rescue clauses (class names, var, handler) /
@@ -3135,31 +3138,45 @@ and parse_class = fn toks ->
     parse_class_rest name r
   | _ -> fail "mere-ruby: expected class name after class"
 
-and parse_class_rest = fn (name: str) -> fn r ->
-    let (super, r2) =
-      (match r with
-       | Cons (TP lt, r3) ->
-         if str_eq lt "<" then
-           // the superclass may be qualified (`< A::B`) or top-level (`< ::B`).
-           (match r3 with
-            | Cons (TId sup0, r4) -> parse_qualified_name sup0 r4
-            | Cons (TP cc, Cons (TId sup0, r4)) -> if str_eq cc "::" then parse_qualified_name sup0 r4 else fail "mere-ruby: expected superclass name"
-            | _ -> fail "mere-ruby: expected superclass name")
-         else ("", r)
-       | _ -> ("", r)) in
+and parse_class_body_tail = fn r2 ->
     let (body0, r5a) = parse_stmts r2 Nil in
     // class-body-level rescue/ensure wraps the body in an implicit begin.
-    let (body, r5) =
-      (match r5a with
-       | Cons (TId k, _) ->
-         if str_eq k "rescue" || str_eq k "ensure" then
-           let (rescues, ra) = parse_rescues r5a Nil in
-           let (els, rb) = parse_opt_kw_block ra "else" in
-           let (ens, rc) = parse_opt_kw_block rb "ensure" in
-           (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
-         else (body0, r5a)
-       | _ -> (body0, r5a)) in
-    (SClass (name, super, body), expect_kw r5 "end")
+    (match r5a with
+     | Cons (TId k, _) ->
+       if str_eq k "rescue" || str_eq k "ensure" then
+         let (rescues, ra) = parse_rescues r5a Nil in
+         let (els, rb) = parse_opt_kw_block ra "else" in
+         let (ens, rc) = parse_opt_kw_block rb "ensure" in
+         (Cons (SBegin (body0, rescues, els, ens), Nil), rc)
+       else (body0, r5a)
+     | _ -> (body0, r5a))
+
+and parse_class_rest = fn (name: str) -> fn r ->
+    (match r with
+     | Cons (TP lt, r3) ->
+       if str_eq lt "<" then
+         // `< ::B` is a top-level constant; otherwise parse the superclass as an
+         // expression. A plain constant keeps the fast name path (SClass); any
+         // other expression (method call, self, paren, literal) becomes SClassE.
+         (if (match r3 with Cons (TP cc, Cons (TId _, _)) -> str_eq cc "::" | _ -> false) then
+            (match r3 with
+             | Cons (TP _, Cons (TId sup0, r4)) ->
+               let (nm, r4b) = parse_qualified_name sup0 r4 in
+               let (body, r5) = parse_class_body_tail r4b in
+               (SClass (name, nm, body), expect_kw r5 "end")
+             | _ -> fail "mere-ruby: expected superclass name")
+          else
+            let (se, r4) = parse_expr r3 in
+            let (body, r5) = parse_class_body_tail r4 in
+            (match se with
+             | EConst nm -> (SClass (name, nm, body), expect_kw r5 "end")
+             | _ -> (SClassE (name, se, body), expect_kw r5 "end")))
+       else
+         let (body, r5) = parse_class_body_tail r in
+         (SClass (name, "", body), expect_kw r5 "end")
+     | _ ->
+       let (body, r5) = parse_class_body_tail r in
+       (SClass (name, "", body), expect_kw r5 "end"))
 
 // begin body rescue* [else] [ensure] end
 and parse_begin = fn toks ->
@@ -7126,7 +7143,7 @@ and body_defines = fn (body: Stmt list) ->
   match body with
   | Nil -> false
   | Cons (s, rest) ->
-    (match s with SDef (_, _, _, _) -> true | SClass (_, _, _) -> true | SAssign (n, _) -> is_upper_first n | _ -> false)
+    (match s with SDef (_, _, _, _) -> true | SClass (_, _, _) -> true | SClassE (_, _, _) -> true | SAssign (n, _) -> is_upper_first n | _ -> false)
     || body_defines rest
 
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
@@ -7197,6 +7214,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Math"))
     else if str_eq name "new" then new_obj world c args
     else if str_eq name "name" then mkstr c
+    // Class#superclass: the recorded superclass, else Object (BasicObject has
+    // none; Object's is BasicObject).
+    else if str_eq name "superclass" then
+      (let (_, sup0, _, _) = world in
+       if str_eq c "BasicObject" then VNil
+       else if map_has sup0 c then VClass (map_get sup0 c)
+       else if str_eq c "Object" then VClass "BasicObject"
+       else VClass "Object")
     else if str_eq name "const_defined?" then
       (match args with
        | Cons (VSym n, _) -> VBool (map_has consts n)
@@ -9383,6 +9408,23 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let r = register_class world full cbody in
          let _ = set_lex saved_lex in
          r
+       // nested class with a runtime-expression superclass: evaluate it first.
+       | SClassE (cname, se, cbody) ->
+         let scv = eval_e cenv world noblk se in
+         (match scv with
+          | VClass sc ->
+            if map_has modules sc || (str_len sc >= 5 && str_eq (substring sc 0 5) "(sng:") then
+              (let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
+            else
+              let full = if str_len cname >= 2 && str_eq (substring cname 0 2) "::" then substring cname 2 (str_len cname) else cls ++ "::" ++ cname in
+              let _ = map_set sup full sc in
+              let _ = if map_has consts full then () else map_set consts full (VClass full) in
+              let saved_lex = cur_lex () in
+              let _ = set_lex full in
+              let r = register_class world full cbody in
+              let _ = set_lex saved_lex in
+              r
+          | _ -> let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
        // a constant assignment in the body runs at definition time; stored
        // stored under the qualified name only (`Klass::CONST`), so it does not
        // clobber a top-level constant of the same name; bare lookups find it
@@ -9758,6 +9800,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let r = register_class world name body in
     let _ = set_lex saved_lex in
     r
+  | SClassE (name, supExpr, body) ->
+    // evaluate the superclass expression, then reuse the SClass path. A
+    // non-Class value, a module, or a singleton class is not a valid
+    // superclass and raises TypeError (Ruby semantics).
+    let scv = eval_e env world blk supExpr in
+    (match scv with
+     | VClass sc ->
+       if map_has modules sc || (str_len sc >= 5 && str_eq (substring sc 0 5) "(sng:") then
+         (let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
+       else exec_stmt env world blk (SClass (name, sc, body))
+     | _ -> let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
   | SAttr (_, _) -> FNext VNil
   | SAlias (n1, n2) ->
     let (meths, sup, ocls, ivars) = world in
@@ -9965,6 +10018,7 @@ and invalid_flow_in_defs = fn (body: Stmt list) ->
     (match st with
      | SDef (_, _, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
      | SClass (_, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
+     | SClassE (_, _, b) -> direct_invalid_flow b || invalid_flow_in_defs rest
      | _ -> invalid_flow_in_defs rest)
 
 // `a = if ... end` where EVERY branch ends in `return` is Ruby's "void
@@ -9994,6 +10048,7 @@ and has_void_assign = fn (body: Stmt list) ->
         | _ -> has_void_assign rest)
      | SDef (_, _, _, b) -> has_void_assign b || has_void_assign rest
      | SClass (_, _, b) -> has_void_assign b || has_void_assign rest
+     | SClassE (_, _, b) -> has_void_assign b || has_void_assign rest
      | _ -> has_void_assign rest)
 
 and direct_invalid_flow = fn (body: Stmt list) ->
