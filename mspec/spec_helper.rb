@@ -295,6 +295,22 @@ end
 
 def raise_error(klass = nil, msg = nil, pat = nil, &blk); RaiseErrorMatcher.new(klass); end
 
+# x.should equal(y) — object identity.
+class EqualMatcher
+  def initialize(expected); @expected = expected; end
+  def match?(actual); actual.equal?(@expected); end
+end
+def equal(expected); EqualMatcher.new(expected); end
+
+# x.should include(a, b, ...) — every argument is a member.
+class IncludeMatcher
+  def initialize(members); @members = members; end
+  def match?(actual)
+    @members.all? { |m| actual.include?(m) }
+  end
+end
+def include(*members); IncludeMatcher.new(members); end
+
 # A minimal mock: records should_receive expectations (parallel arrays —
 # the host may lack mutable hashes) and answers via method_missing.
 class MockExpectation
