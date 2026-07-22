@@ -23,13 +23,13 @@ type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
          | TBig of str  // an integer literal too large for a machine int
          // Rational literal as (num, den) canonical decimal strings (bignum /
          // exact-decimal safe); Complex (imaginary) literal `4i`.
-         | TRat of str * str | TImag of int
+         | TRat of str * str | TImag of int | TImagF of float
          | TSym of str | TP of str | TRegex of str | TNL | TEOF;
 
 // EHsh / VHsh hold interleaved [k1, v1, k2, v2, ...] lists (M0
 // simplification: literal order is preserved, which matches Ruby's
 // insertion-ordered Hash for programs that only build literals).
-type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EFlt of float | EStrL of str | EBool of bool
+type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImagF of float | EFlt of float | EStrL of str | EBool of bool
           | ENil | EArr of Expr list | EHsh of Expr list
           | EBin of str * Expr * Expr | EUn of str * Expr
           | EVar of str | ECall of str * Expr list
@@ -192,7 +192,7 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          | VBig of str
          // Rational num/den (den > 0, gcd-reduced) and Complex real/imag.
          | VRat of str * str
-         | VCpx of int * int
+         | VCpx of Val * Val
          | VNil | VArr of int | VHsh of int
          | VObj of int | VClass of str | VSym of str
          | VRange of int * int * bool
@@ -560,6 +560,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
             let ip = strip_us (substring s i j) 0 "" in
             let fd = strip_us (substring s (j + 1) k0) 0 "" in
             Cons (TRat (ip ++ fd, pow10_str (str_len fd)), lex_go s (k0 + 1))
+          // decimal-fraction Complex literal: 0.6i == Complex(0, 0.6).
+          else if k < str_len s && str_eq (char_at s k) "i"
+             && (k + 1 >= str_len s || (let nc = char_at s (k + 1) in if is_alnum nc || str_eq nc "_" then false else true)) then
+            Cons (TImagF (float_of_str (strip_us (substring s i k) 0 "")), lex_go s (k + 1))
           else
             Cons (TFlt (float_of_str (strip_us (substring s i k) 0 "")), lex_go s k)
         else
@@ -1701,6 +1705,7 @@ and starts_bare_arg = fn toks ->
   | Cons (TBig _, _) -> true
   | Cons (TRat _, _) -> true
   | Cons (TImag _, _) -> true
+  | Cons (TImagF _, _) -> true
   | Cons (TFlt _, _) -> true
   | Cons (TStrL _, _) -> true
   | Cons (TSym _, _) -> true
@@ -1908,6 +1913,7 @@ and parse_primary = fn toks ->
   | Cons (TBig b, r) -> (EBig b, r)
   | Cons (TRat n, r) -> (ERat n, r)
   | Cons (TImag n, r) -> (EImag n, r)
+  | Cons (TImagF f, r) -> (EImagF f, r)
   | Cons (TRegex p, r) -> (ERegex p, r)
   | Cons (TFlt f, r) -> (EFlt f, r)
   | Cons (TStrL s, r) -> (EStrL s, r)
@@ -4076,7 +4082,7 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   // canonical form: a VBig never equals a VInt; two VBig equal iff same string.
   | VBig x -> (match vb with VBig y -> str_eq x y | _ -> false)
   | VRat (n, d) -> (match vb with VRat (n2, d2) -> str_eq n n2 && str_eq d d2 | VInt m -> str_eq d "1" && str_eq n (str_of_int m) | VFlt f -> feq (float_of_str n / float_of_str d) f | _ -> false)
-  | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> r == r2 && i == i2 | VInt m -> i == 0 && r == m | _ -> false)
+  | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> rb_eq r r2 && rb_eq i i2 | VInt m -> rb_eq i (VInt 0) && rb_eq r (VInt m) | _ -> false)
   | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in str_eq x y | _ -> false)
   | VBool x ->
     (match vb with
@@ -4254,16 +4260,6 @@ let rat_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
     else if str_eq op "-" then rat_sub_s an ad bn bd
     else if str_eq op "*" then rat_mul_s an ad bn bd
     else rat_div_s an ad bn bd;
-// +,-,* when at least one operand is Complex (integer components).
-let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
-  let ar = (match va with VCpx (r, i) -> r | VInt n -> n | _ -> 0) in
-  let ai = (match va with VCpx (r, i) -> i | _ -> 0) in
-  let br = (match vb with VCpx (r, i) -> r | VInt n -> n | _ -> 0) in
-  let bi = (match vb with VCpx (r, i) -> i | _ -> 0) in
-  if str_eq op "+" then VCpx (ar + br, ai + bi)
-  else if str_eq op "-" then VCpx (ar - br, ai - bi)
-  else if str_eq op "*" then VCpx (ar * br - ai * bi, ar * bi + ai * br)
-  else fail "mere-ruby: complex division unsupported";
 
 // does a magnitude fit in a signed 64-bit int?
 let big_fits = fn (mag: str) ->
@@ -4276,6 +4272,32 @@ let norm_big = fn (sval: str) ->
   if big_fits m then VInt (int_of_str canon) else VBig canon;
 // signed decimal of a numeric value.
 let num_dec = fn (v: Val) -> match v with VInt n -> str_of_int n | VBig s -> s | _ -> "0";
+// negate / sign / abs on a boxed numeric value (used by Complex components).
+let num_neg = fn (v: Val) -> match v with
+  | VInt n -> VInt (0 - n) | VFlt f -> VFlt (0.0 - f)
+  | VBig s -> norm_big (big_neg_s s) | VRat (n, d) -> VRat (big_neg_s n, d) | _ -> v;
+let num_isneg = fn (v: Val) -> match v with
+  | VInt n -> n < 0 | VFlt f -> f < 0.0 | VBig s -> big_sign s < 0 | VRat (n, d) -> big_sign n < 0 | _ -> false;
+let num_abs = fn (v: Val) -> if num_isneg v then num_neg v else v;
+// +,-,* on two boxed numerics: exact int when both are VInt, else via float.
+let num_bin = fn (o: str) -> fn (x: Val) -> fn (y: Val) ->
+  match x with
+  | VInt a -> (match y with
+     | VInt b -> if str_eq o "+" then VInt (a + b) else if str_eq o "-" then VInt (a - b) else VInt (a * b)
+     | _ -> let fa = float_of_int a in let fb = to_f y in
+            if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb))
+  | _ -> let fa = to_f x in let fb = to_f y in
+         if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb);
+// +,-,* when at least one operand is Complex (components are boxed numerics).
+let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
+  let ar = (match va with VCpx (r, i) -> r | v -> v) in
+  let ai = (match va with VCpx (r, i) -> i | _ -> VInt 0) in
+  let br = (match vb with VCpx (r, i) -> r | v -> v) in
+  let bi = (match vb with VCpx (r, i) -> i | _ -> VInt 0) in
+  if str_eq op "+" then VCpx (num_bin "+" ar br, num_bin "+" ai bi)
+  else if str_eq op "-" then VCpx (num_bin "-" ar br, num_bin "-" ai bi)
+  else if str_eq op "*" then VCpx (num_bin "-" (num_bin "*" ar br) (num_bin "*" ai bi), num_bin "+" (num_bin "*" ar bi) (num_bin "*" ai br))
+  else fail "mere-ruby: complex division unsupported";
 // int add/sub/mul that promote to bignum exactly on overflow. The checks
 // are done BEFORE the operation (signed overflow is UB in C and clang -O2
 // would optimise away any after-the-fact `r < 0` test).
@@ -5082,7 +5104,7 @@ let rec to_s = fn (v: Val) ->
   | VInt n -> str_of_int n
   | VBig s -> s
   | VRat (n, d) -> n ++ "/" ++ d
-  | VCpx (r, i) -> str_of_int r ++ (if i < 0 then "-" ++ str_of_int (0 - i) else "+" ++ str_of_int i) ++ "i"
+  | VCpx (r, i) -> to_s r ++ (if num_isneg i then "-" else "+") ++ to_s (num_abs i) ++ "i"
   | VFlt f -> rb_float_str f
   | VStr s -> let s = sget s in s
   | VBool b -> if b then "true" else "false"
@@ -5209,7 +5231,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EInt n -> VInt n
   | EBig b -> VBig b
   | ERat (n, d) -> mk_rat_s n d
-  | EImag n -> VCpx (0, n)
+  | EImag n -> VCpx (VInt 0, VInt n)
+  | EImagF f -> VCpx (VInt 0, VFlt f)
   | EFlt f -> VFlt f
   | EStrL s -> (let v = mkstr s in (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
   | EBool b -> VBool b
@@ -5550,7 +5573,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "Rational" then
       (match args with Cons (a, Cons (b, _)) -> mk_rat_s (num_dec a) (num_dec b) | Cons (a, _) -> mk_rat_s (num_dec a) "1" | _ -> mk_rat_s "0" "1")
     else if str_eq name "Complex" then
-      (match args with Cons (VInt r, Cons (VInt i, _)) -> VCpx (r, i) | Cons (VInt r, _) -> VCpx (r, 0) | _ -> VCpx (0, 0))
+      (match args with Cons (r, Cons (i, _)) -> VCpx (r, i) | Cons (r, _) -> VCpx (r, VInt 0) | _ -> VCpx (VInt 0, VInt 0))
     else if str_eq name "Array" then
       (match args with Cons (VArr id, _) -> VArr id | Cons (VNil, _) -> arr_new Nil | Nil -> arr_new Nil | Cons (v, _) -> arr_new (Cons (v, Nil)))
     else if str_eq name "Hash" then
@@ -5770,7 +5793,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | VBig s -> if str_eq op "-" then norm_big (big_neg_s s) else VBig s
        | VFlt f -> VFlt (0.0 - f)
        | VRat (n, d) -> if str_eq op "-" then VRat (big_neg_s n, d) else VRat (n, d)
-       | VCpx (r, i) -> if str_eq op "-" then VCpx (0 - r, 0 - i) else VCpx (r, i)
+       | VCpx (r, i) -> if str_eq op "-" then VCpx (num_neg r, num_neg i) else VCpx (r, i)
        // unary -/+ on an object dispatch to its -@ / +@ method.
        | other -> invoke_val_c env world blk other (op ++ "@") Nil false)
   | EBin (op, a, b) ->
@@ -7964,10 +7987,10 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "numerator" then (match recv with VRat (n, d) -> norm_big n | VInt n -> VInt n | _ -> fail "no numerator")
   else if str_eq name "denominator" then (match recv with VRat (n, d) -> norm_big d | VInt n -> VInt 1 | _ -> fail "no denominator")
   else if str_eq name "to_r" then (match recv with VRat (n, d) -> recv | VInt n -> mk_rat n 1 | _ -> fail "no to_r")
-  else if str_eq name "real" then (match recv with VCpx (r, i) -> VInt r | VRat (n, d) -> recv | _ -> recv)
-  else if str_eq name "imaginary" || str_eq name "imag" then (match recv with VCpx (r, i) -> VInt i | _ -> VInt 0)
+  else if str_eq name "real" then (match recv with VCpx (r, i) -> r | VRat (n, d) -> recv | _ -> recv)
+  else if str_eq name "imaginary" || str_eq name "imag" then (match recv with VCpx (r, i) -> i | _ -> VInt 0)
   else if str_eq name "real?" then (match recv with VCpx (r, i) -> VBool false | _ -> VBool true)
-  else if str_eq name "conjugate" || str_eq name "conj" then (match recv with VCpx (r, i) -> VCpx (r, 0 - i) | _ -> recv)
+  else if str_eq name "conjugate" || str_eq name "conj" then (match recv with VCpx (r, i) -> VCpx (r, num_neg i) | _ -> recv)
   // String
   else if str_eq name "encoding" then
     (match recv with
