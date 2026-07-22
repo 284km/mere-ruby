@@ -234,6 +234,15 @@ def ruby_exe(code = nil, *rest, **opts)
   __ruby_exe(code.to_s)
 end
 
+# mspec's `evaluate <<-ruby do ... end`: run the code (which defines methods
+# or sets ivars) and then the block, on the same fresh object so state set by
+# the code is visible to the block's assertions.
+def evaluate(code, &block)
+  o = Object.new
+  o.instance_eval(code)
+  o.instance_eval(&block)
+end
+
 # Matcher objects for the `x.should be_nil` style.
 class BeMatcher
   def initialize(kind); @kind = kind; end
