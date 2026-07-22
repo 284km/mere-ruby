@@ -183,6 +183,57 @@ def suppress_warning
   yield
 end
 
+# Run a Ruby snippet and return its captured stdout. Real mspec spawns a
+# subprocess; this shim runs it in-process — close enough for self-contained
+# snippets that just print. mere-ruby intercepts `__ruby_exe` with a native
+# primitive (captures interpreter output); under real ruby the pure-Ruby
+# definition below runs instead (redirects $stdout to a capture object).
+class MSpecStdoutCapture
+  def initialize
+    @buf = ""
+  end
+  def write(*a)
+    a.each { |x| @buf << x.to_s }
+    nil
+  end
+  def print(*a)
+    a.each { |x| @buf << x.to_s }
+    nil
+  end
+  def puts(*a)
+    if a.empty?
+      @buf << "\n"
+    else
+      a.each { |x| s = x.to_s; @buf << s; @buf << "\n" unless s.end_with?("\n") }
+    end
+    nil
+  end
+  def <<(x)
+    @buf << x.to_s
+    self
+  end
+  def string
+    @buf
+  end
+end
+
+def __ruby_exe(code)
+  old = $stdout
+  cap = MSpecStdoutCapture.new
+  $stdout = cap
+  begin
+    eval(code.to_s)
+  rescue Exception
+  ensure
+    $stdout = old
+  end
+  cap.string
+end
+
+def ruby_exe(code = nil, *rest, **opts)
+  __ruby_exe(code.to_s)
+end
+
 # Matcher objects for the `x.should be_nil` style.
 class BeMatcher
   def initialize(kind); @kind = kind; end

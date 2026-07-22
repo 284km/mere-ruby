@@ -358,6 +358,21 @@ let parser_flags = map_new ();
 // resolves against it); loaded_files dedups double-loads.
 let load_ctx = map_new ();
 let loaded_files = map_new ();
+// Kernel#ruby_exe support: a redirectable output sink. While io_cap["on"] is
+// set, puts/print/p append to io_cap["buf"] instead of the real stdout, so
+// __ruby_exe can capture a snippet's output (an in-process approximation of
+// mspec's subprocess ruby_exe).
+let io_cap = map_new ();
+let out_print = fn (s: str) ->
+  if map_has io_cap "on" then
+    (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
+     map_set io_cap "buf" (mkstr (cur ++ s ++ "\n")))
+  else print s;
+let out_print_no_nl = fn (s: str) ->
+  if map_has io_cap "on" then
+    (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
+     map_set io_cap "buf" (mkstr (cur ++ s)))
+  else print_no_nl s;
 let rec last_slash = fn (s: str) -> fn (i: int) -> fn (best: int) ->
   if i >= str_len s then best
   else last_slash s (i + 1) (if str_eq (char_at s i) "/" then i else best);
@@ -5596,6 +5611,24 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // against that captured env; otherwise it uses the CURRENT env. A parse
     // failure surfaces as a catchable SyntaxError.
     else if str_eq name "eval" then do_eval env world blk args
+    // __ruby_exe("code"): run the snippet at a fresh top level (fresh locals,
+    // self=main; classes/consts/globals shared) with stdout captured, and
+    // return the captured output. The mspec shim's ruby_exe delegates here —
+    // an in-process approximation of mspec's real subprocess ruby_exe.
+    else if str_eq name "__ruby_exe" then
+      (match args with
+       | Cons (VStr h, _) -> let code = sget h in
+         let had_on = map_has io_cap "on" in
+         let saved_buf = (if map_has io_cap "buf" then map_get io_cap "buf" else mkstr "") in
+         let _ = map_set io_cap "on" (VBool true) in
+         let _ = map_set io_cap "buf" (mkstr "") in
+         let fenv = map_new () in
+         let _ = map_set fenv "self" VMain in
+         let _ = try_or (fn (u: unit) -> let _ = do_eval fenv world noblk (Cons (mkstr code, Nil)) in VNil) VNil in
+         let out = (match map_get io_cap "buf" with VStr b -> sget b | _ -> "") in
+         let _ = if had_on then map_set io_cap "buf" saved_buf else map_delete io_cap "on" in
+         mkstr out
+       | _ -> mkstr "")
     else if str_eq name "local_variables" && (if map_has meths name then false else true) then local_vars_of env
     else if map_has meths name then call_method env world noblk name args
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
@@ -7214,7 +7247,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        | Cons (a, Cons (b, _)) ->
          let n1 = (match a with VSym s -> s | VStr h -> sget h | _ -> "") in
          let n2 = (match b with VSym s -> s | VStr h -> sget h | _ -> "") in
-         let _ = if map_has methsA (c ++ "#" ++ n2) then map_set methsA (c ++ "#" ++ n1) (map_get methsA (c ++ "#" ++ n2)) else () in
+         let _ = if map_has methsA (c ++ "#" ++ n2) then map_set methsA (c ++ "#" ++ n1) (map_get methsA (c ++ "#" ++ n2))
+                 else () in
          VSym n1
        | _ -> VNil)
     // GC.start / GC.enable / GC.disable / GC.stress= are no-ops.
@@ -9561,7 +9595,7 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   match s with
   | SPuts es ->
-    let _ = (match es with Nil -> print "" | _ -> puts_args env world blk es) in
+    let _ = (match es with Nil -> out_print "" | _ -> puts_args env world blk es) in
     FNext VNil
   | SExpr e -> FNext (eval_e env world blk e)
   | SAssign (name, e) ->
@@ -10918,20 +10952,20 @@ and print_each = fn world -> fn (args: Val list) ->
 // like puts_one but without the trailing newline (for Kernel#print).
 and puts_one_nonl = fn world -> fn (v: Val) ->
   match v with
-  | VStr s -> let s = sget s in print_no_nl s
+  | VStr s -> let s = sget s in out_print_no_nl s
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int id) in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
     if has_meth world cls "to_s" then
-      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in print_no_nl s | other -> print_no_nl (to_s other))
-    else print_no_nl (to_s v)
-  | _ -> print_no_nl (to_s v)
+      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in out_print_no_nl s | other -> out_print_no_nl (to_s other))
+    else out_print_no_nl (to_s v)
+  | _ -> out_print_no_nl (to_s v)
 
 and p_print = fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (v, t) -> let _ = print (inspect v) in p_print t
+  | Cons (v, t) -> let _ = out_print (inspect v) in p_print t
 
 and puts_args = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
   match es with
@@ -10951,15 +10985,15 @@ and puts_one = fn world -> fn (v: Val) ->
     let cls = map_get ocls (str_of_int id) in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
     if has_meth world cls "to_s" then
-      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in print s | other -> print (to_s other))
-    else if map_has enc_name (str_of_int id) then print (map_get enc_name (str_of_int id))
-    else print ("#<" ++ display_cls world cls ++ ">")
+      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in out_print s | other -> out_print (to_s other))
+    else if map_has enc_name (str_of_int id) then out_print (map_get enc_name (str_of_int id))
+    else out_print ("#<" ++ display_cls world cls ++ ">")
   // a string already ending in a newline doesn't get another (Ruby puts).
   | VStr s -> let s = sget s in
     if str_len s > 0 && str_eq (char_at s (str_len s - 1)) "\n"
-    then print (substring s 0 (str_len s - 1))
-    else print s
-  | _ -> print (to_s v)
+    then out_print (substring s 0 (str_len s - 1))
+    else out_print s
+  | _ -> out_print (to_s v)
 
 and puts_each = fn world -> fn (xs: Val list) ->
   match xs with
