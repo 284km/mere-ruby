@@ -277,6 +277,24 @@ def be_kind_of(k); KindOfMatcher.new(k, false); end
 def be_an_instance_of(k); KindOfMatcher.new(k, true); end
 def be_instance_of(k); KindOfMatcher.new(k, true); end
 
+# -> { ... }.should raise_error(Klass) — run the proc and check the raised
+# exception's class. Message/pattern/block args are accepted but not matched
+# (the existing `raise` matcher does the same), so mere and ruby agree as long
+# as they raise the same class.
+class RaiseErrorMatcher
+  def initialize(klass); @klass = klass; end
+  def match?(actual)
+    begin
+      actual.call
+      false
+    rescue Exception => e
+      @klass.nil? || e.is_a?(@klass)
+    end
+  end
+end
+
+def raise_error(klass = nil, msg = nil, pat = nil, &blk); RaiseErrorMatcher.new(klass); end
+
 # A minimal mock: records should_receive expectations (parallel arrays —
 # the host may lack mutable hashes) and answers via method_missing.
 class MockExpectation
