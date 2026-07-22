@@ -322,6 +322,10 @@ let dm_captured = map_new ();
 let kwarg_marks = map_new ();
 let mark_kw = fn (id: int) -> let _ = map_set kwarg_marks (str_of_int id) VNil in ();
 let is_kw_hash = fn (v: Val) -> match v with VHsh id -> map_has kwarg_marks (str_of_int id) | _ -> false;
+// methods marked `ruby2_keywords` (by bare name): a trailing `key:` hash they
+// receive into *args keeps its kwarg mark instead of being demoted, so a later
+// re-splat forwards it as keywords. Cleared when the method is redefined.
+let r2k_methods = map_new ();
 // refinements. `refine Target do ... end` (inside a Module.new body) records,
 // per refinery module, the target class and a fresh impl class holding the
 // refined methods. `using refinery` activates them into ref_active (target
@@ -5741,6 +5745,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let _ = if had_on then map_set io_cap "buf" saved_buf else map_delete io_cap "on" in
          mkstr out
        | _ -> mkstr "")
+    // `ruby2_keywords :m` (or `ruby2_keywords def m ... end`, whose def
+    // returns :m): mark method m so it keeps a `key:` hash's kwarg-ness.
+    else if str_eq name "ruby2_keywords" && (if map_has meths name then false else true) then
+      (let _ = (match args with Cons (VSym s, _) -> map_set r2k_methods s VNil | _ -> ()) in
+       (match args with Cons (a, _) -> a | _ -> VNil))
     else if str_eq name "local_variables" && (if map_has meths name then false else true) then local_vars_of env
     else if map_has meths name then call_method env world noblk name args
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
@@ -7445,6 +7454,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        else if map_has sup0 c then VClass (map_get sup0 c)
        else if str_eq c "Object" then VClass "BasicObject"
        else VClass "Object")
+    // Hash.ruby2_keywords_hash?(h): whether h carries the ruby2_keywords flag.
+    // mere does not expose that flag on a hash value, so it is never true here
+    // (the spec only ever asserts false).
+    else if str_eq name "ruby2_keywords_hash?" then VBool false
     else if str_eq name "const_defined?" then
       // look in the receiver's own namespace (C::name); top-level constants
       // live in Object, so Object also consults the bare name.
@@ -9509,8 +9522,9 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
   let want_kw = (match kws with Nil -> (if str_eq dsname "" then false else true) | _ -> true) in
   // no keyword params: a `key:` hash is absorbed positionally, so clear its
   // kwarg mark (Ruby demotes it; a later *args re-splat stays positional).
-  // `...` forwarding (*__fwd) is exempt — it forwards keywords faithfully.
-  let _ = if want_kw || str_list_has params1 "*__fwd" then () else unmark_kwargs args0 in
+  // `...` forwarding (*__fwd) and ruby2_keywords methods are exempt — both
+  // forward a `key:` hash's keyword-ness faithfully.
+  let _ = if want_kw || str_list_has params1 "*__fwd" || map_has r2k_methods (meth_base name) then () else unmark_kwargs args0 in
   let (args, kwhash) = if want_kw then peel_kw_hash args0 else (args0, (Nil : Val list)) in
   let _ = if str_eq dsname "" then ()
           else map_set frame dsname (mkhash (kwhash_drop kwhash (kw_names_of kws))) in
@@ -10260,6 +10274,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else name) in
     let _ = map_set meths key (Meth (params, defs, body)) in
     let _ = map_set meth_cref key (cur_lex ()) in
+    // a (re)definition is not ruby2_keywords until explicitly marked; clear any
+    // stale mark so a later plain `def m` does not inherit an earlier one.
+    let _ = if map_has r2k_methods (meth_base name) then map_delete r2k_methods (meth_base name) else () in
     FNext (VSym (meth_base name))
   // `class << <expr>` — open the singleton class of the evaluated receiver.
   // Immediates (Integer/Float/Symbol) have no singleton class (TypeError);
