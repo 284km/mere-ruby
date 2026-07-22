@@ -2117,6 +2117,7 @@ and parse_primary = fn toks ->
     else if str_eq id "unless" then let (s, r2) = parse_if r true in (EStmt s, r2)
     else if str_eq id "while" then let (s, r2) = parse_while r false in (EStmt s, r2)
     else if str_eq id "until" then let (s, r2) = parse_while r true in (EStmt s, r2)
+    else if str_eq id "for" then let (s, r2) = parse_for r in (EStmt s, r2)
     else if str_eq id "case" then let (s, r2) = parse_case r in (EStmt s, r2)
     else if str_eq id "begin" then let (s, r2) = parse_begin r in (EStmt s, r2)
     // def/class in expression position (def evaluates to the method name
@@ -2836,6 +2837,16 @@ and parse_x_chain = fn (recv: Expr) -> fn toks ->
     else if str_eq p "[" then
       let (idxs, r2) = parse_x_idx r Nil in
       parse_x_chain (EMethod (recv, "[]", idxs)) r2
+    else if str_eq p "&." then
+      (match r with
+       | Cons (TId m, r2) -> parse_x_chain (ESafe (recv, m, Nil)) r2
+       | _ -> fail "mere-ruby: bad assignment target")
+    else if str_eq p "::" then
+      (match r with
+       | Cons (TId cn, r2) ->
+         let recv2 = (match recv with EVar n -> (if is_upper_first n then EConst n else recv) | _ -> recv) in
+         parse_x_chain (EScopedRead (recv2, cn)) r2
+       | _ -> fail "mere-ruby: bad assignment target")
     else (recv, toks)
   | _ -> (recv, toks)
 
@@ -3042,7 +3053,7 @@ and parse_stmt_id = fn toks ->
     else if str_eq id "while" then let (s, r2) = parse_while r false in stmt_postfix s r2
     else if str_eq id "until" then let (s, r2) = parse_while r true in stmt_postfix s r2
     else if str_eq id "case" then let (s, r2) = parse_case r in stmt_postfix s r2
-    else if str_eq id "for" then parse_for r
+    else if str_eq id "for" then let (s, r2) = parse_for r in stmt_postfix s r2
     else if str_eq id "def" then let (s, r2) = parse_def r in stmt_postfix s r2
     else if str_eq id "class" then let (s, r2) = parse_class r in stmt_postfix s r2
     else if str_eq id "module" then let (s, r2) = parse_class r in stmt_postfix (mark_module s) r2
@@ -3390,18 +3401,22 @@ and parse_if_tail = fn toks ->
 // `for x in e [do] body end` — each over e with x as the block param.
 // The block shares the enclosing env, so (like Ruby's for) x leaks out.
 and parse_for = fn toks ->
+  // a complex loop target (`for obj.attr in`, `for arr[i] in`, `for C::X in`,
+  // `for obj&.attr in`) is parsed as an assignment-target expression and driven
+  // through the same setter machinery as multiple assignment.
+  if for_targets_complex toks then
+    let (targets, r2) = parse_for_xtargets toks Nil in
+    let (e0, r3) = parse_expr r2 in
+    let (e, body, r4) = parse_for_iter e0 r3 in
+    (match targets with
+     | Cons (t, Nil) ->
+       (SExpr (EMethodB (e, "each", Nil, Cons ("__forv", Nil), Cons (for_xassign t (EVar "__forv"), body))), r4)
+     | _ ->
+       (SExpr (EMethodB (e, "each", Nil, Cons ("*__forv", Nil), Cons (SMultiAssignX (targets, Cons (ESplat (EVar "__forv"), Nil)), body))), r4))
+  else
   let (vars, r2) = parse_for_vars toks Nil in
   let (e0, r3) = parse_expr r2 in
-  // `for i in x do ... end` — a bare-variable iterable grabs the do-block
-  // as its own; unwrap it back into the loop body.
-  let (e, body, r4) =
-    (match e0 with
-     | ECallB (nm, Nil, bps, bb) ->
-       (match bps with Nil -> (EVar nm, bb, r3) | _ -> (e0, Nil, r3))
-     | _ ->
-       let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
-       let (b, r4b) = parse_stmts r3b Nil in
-       (e0, b, expect_kw r4b "end")) in
+  let (e, body, r4) = parse_for_iter e0 r3 in
   (match vars with
    | Cons (v, Nil) ->
      // the hidden __for param keeps v assigned in the SHARED scope, so
@@ -3412,6 +3427,46 @@ and parse_for = fn toks ->
      // prologue assigns them into the SHARED scope names.
      let (params, prologue) = for_multi_binding vars 0 in
      (SExpr (EMethodB (e, "each", Nil, params, list_append_stmt prologue body)), r4))
+
+// `for i in x do ... end` — a bare-variable iterable grabs the do-block as its
+// own; unwrap it back into the loop body. Shared by both for-target paths.
+and parse_for_iter = fn (e0: Expr) -> fn r3 ->
+  match e0 with
+  | ECallB (nm, Nil, bps, bb) -> (match bps with Nil -> (EVar nm, bb, r3) | _ -> (e0, Nil, r3))
+  | _ ->
+    let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
+    let (b, r4b) = parse_stmts r3b Nil in
+    (e0, b, expect_kw r4b "end")
+
+// does the for-target list (up to `in`) contain a complex chain?
+and for_targets_complex = fn toks ->
+  match toks with
+  | Nil -> false
+  | Cons (TNL, _) -> false
+  | Cons (TEOF, _) -> false
+  | Cons (TId w, r) -> if str_eq w "in" then false else for_targets_complex r
+  | Cons (TP p, r) ->
+    if str_eq p "." || str_eq p "[" || str_eq p "::" || str_eq p "&." then true
+    else for_targets_complex r
+  | Cons (_, r) -> for_targets_complex r
+
+// parse comma-separated complex for-targets, terminated by `in`.
+and parse_for_xtargets = fn toks -> fn (acc: Expr list) ->
+  let (t, r) = parse_x_target1 toks in
+  match r with
+  | Cons (TP c, r2) -> if str_eq c "," then parse_for_xtargets r2 (Cons (t, acc)) else fail "mere-ruby: expected in after for"
+  | Cons (TId kw, r2) -> if str_eq kw "in" then (rev_app (Cons (t, acc)) Nil, r2) else fail "mere-ruby: expected in after for"
+  | _ -> fail "mere-ruby: expected in after for"
+
+// build the statement that assigns one for-iteration value to a complex target.
+and for_xassign = fn (t: Expr) -> fn (rhs: Expr) ->
+  match t with
+  | EMethod (recv, m, args) -> if str_eq m "[]" then SExpr (EMethod (recv, "[]=", eapp args (Cons (rhs, Nil)))) else SExpr (EMethod (recv, m ++ "=", Cons (rhs, Nil)))
+  | ESafe (recv, m, args) -> SExpr (ESafe (recv, m ++ "=", eapp args (Cons (rhs, Nil))))
+  | EScopedRead (recv, cn) -> SExpr (EScopedAssign (recv, cn, rhs))
+  | EIVar n -> SAssign ("@" ++ n, rhs)
+  | EVar n -> SAssign (n, rhs)
+  | _ -> SExpr rhs
 
 and list_append_stmt = fn (xs: Stmt list) -> fn (ys: Stmt list) ->
   match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append_stmt t ys)
@@ -6333,6 +6388,17 @@ and assign_x_one = fn env -> fn world -> fn blk -> fn (t: Expr) -> fn (v: Val) -
     let argvals = eval_args env world blk args in
     let _ = invoke_val_c env world blk rv (m ++ "=") (vappend argvals (Cons (v, Nil))) false in
     ()
+  // `recv::CONST = v` — assign a constant in the receiver module's namespace.
+  | EScopedRead (recv, cn) ->
+    (match eval_e env world blk recv with
+     | VClass c -> let _ = map_set consts (c ++ "::" ++ cn) v in ()
+     | other -> let _ = raise_exc world "TypeError" (inspect other ++ " is not a class/module") in ())
+  // `recv&.attr = v` — assign only when the receiver is non-nil.
+  | ESafe (recv, m, args) ->
+    (match eval_e env world blk recv with
+     | VNil -> ()
+     | rv -> let argvals = eval_args env world blk args in
+             let _ = invoke_val_c env world blk rv (m ++ "=") (vappend argvals (Cons (v, Nil))) false in ())
   | _ -> ()
 
 // Pre-evaluate a complex masgn target's receiver (and index/method args) into
