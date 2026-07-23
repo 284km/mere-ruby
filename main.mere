@@ -40,6 +40,7 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           | EConstOrNil of str   // a const read that yields nil when undefined
           | EScopedAssign of Expr * str * Expr  // recv::Const = value (runtime recv)
           | EScopedRead of Expr * str  // recv::Const read (runtime recv)
+          | EScopedReadOrNil of Expr * str  // recv::Const read, nil if undefined (for ||=)
           | EIVar of str         // @name
           | EMethod of Expr * str * Expr list  // recv.name(args)
           // op-assign on an attribute / index, evaluating recv (and indices)
@@ -428,6 +429,13 @@ let parser_flags = map_new ();
 // carries this sentinel so the parser can reject a numbered parameter in the
 // body (`proc { || _1 }` is a SyntaxError); it is stripped before the block runs.
 let empty_bp_marker = "~emptyparams~";
+// parse-time gensym for op-assign temporaries (so `(expr)::C op= v` evaluates
+// the receiver expression exactly once).
+let tmp_ctr = map_new ();
+let fresh_tmp = fn () ->
+  let n = (if map_has tmp_ctr "n" then (match map_get tmp_ctr "n" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set tmp_ctr "n" (VInt (n + 1)) in
+  "~opasgn~" ++ str_of_int n;
 let resc_ctr = map_new ();
 let fresh_resc = fn () ->
   let n = (if map_has resc_ctr "n" then (match map_get resc_ctr "n" with VInt k -> k | _ -> 0) else 0) in
@@ -1806,9 +1814,16 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
             if is_lparen p then let (argv, r4) = parse_call_args r3 in attach_block_method recv name argv r4
             // recv::Const = value : a runtime-receiver constant assignment.
             else if is_cap name && str_eq p "=" then let (v, r4) = parse_expr r3 in (EScopedAssign (recv, name, v), r4)
-            // recv::Const op= value -> recv::Const = recv::Const op value.
+            // recv::Const op= value -> t = recv; t::Const = t::Const op value,
+            // evaluating the receiver expression exactly once (side effects).
             else if is_cap name && (if str_eq (opassign_base p) "" then false else true) then
-              let (v, r4) = parse_expr r3 in (EScopedAssign (recv, name, EBin (opassign_base p, EScopedRead (recv, name), v)), r4)
+              let (v, r4) = parse_expr r3 in
+              let tmp = fresh_tmp () in
+              let base = opassign_base p in
+              // `||=` treats an undefined constant as nil (then assigns); other
+              // op-assigns read first, so an undefined constant raises NameError.
+              let readx = if str_eq base "||" then EScopedReadOrNil (EVar tmp, name) else EScopedRead (EVar tmp, name) in
+              (EStmt (SBegin (Cons (SAssign (tmp, recv), Cons (SExpr (EScopedAssign (EVar tmp, name, EBin (base, readx, v))), Nil)), Nil, Nil, Nil)), r4)
             else if is_cap name then parse_postfix_more mkread r2
             else attach_block_method recv name Nil r2
           | _ ->
@@ -3104,6 +3119,11 @@ and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
     else (rev_app (Cons (e, acc)) Nil, r)
   | _ -> (rev_app (Cons (e, acc)) Nil, r)
 
+// the read side of a constant op-assign: `||=` treats an undefined constant as
+// nil (then assigns); every other op reads it first (NameError if undefined).
+and opasgn_const_read = fn (base: str) -> fn (full: str) ->
+  if str_eq base "||" then EConstOrNil full else EConst full
+
 and parse_stmt = fn toks ->
   if looks_like_multix toks then parse_multix toks
   else if looks_like_multi toks then parse_multi toks else
@@ -3117,10 +3137,11 @@ and parse_stmt = fn toks ->
       (if str_eq eq "=" then
          let (e, r2) = parse_expr r in (SAssign (a ++ "::" ++ cn, e), r2)
        else if not (str_eq (opassign_base eq) "") then
-         // `A::C op= e` -> `A::C = A::C op e` (a nil read when undefined).
+         // `A::C op= e` -> `A::C = A::C op e`. `||=` reads undefined as nil;
+         // other ops read first, so an undefined constant raises NameError.
          let full = a ++ "::" ++ cn in
          let (e, r2) = parse_expr r in
-         (SAssign (full, EBin (opassign_base eq, EConstOrNil full, e)), r2)
+         (SAssign (full, EBin (opassign_base eq, opasgn_const_read (opassign_base eq) full, e)), r2)
        else if str_eq eq "::" then
          (match scoped_const_path (a ++ "::" ++ cn) r with
           | (full, r2b) ->
@@ -3130,7 +3151,7 @@ and parse_stmt = fn toks ->
                // `A::B::C op= e` -> `A::B::C = A::B::C op e` (nil read when undefined).
                else if not (str_eq (opassign_base eq2) "") then
                  let (e, r4) = parse_expr r3 in
-                 (SAssign (full, EBin (opassign_base eq2, EConstOrNil full, e)), r4)
+                 (SAssign (full, EBin (opassign_base eq2, opasgn_const_read (opassign_base eq2) full, e)), r4)
                else parse_stmt_id toks
              | _ -> parse_stmt_id toks))
        else parse_stmt_id toks)
@@ -3144,7 +3165,7 @@ and parse_stmt = fn toks ->
       // `::Const op= e` -> `::Const = ::Const op e`. The write target keeps the
       // `::` (stored top-level as the bare name), so the read uses the bare name.
       let (e, r2) = parse_expr r in
-      (SAssign ("::" ++ cn, EBin (opassign_base eq, EConstOrNil cn, e)), r2)
+      (SAssign ("::" ++ cn, EBin (opassign_base eq, opasgn_const_read (opassign_base eq) cn, e)), r2)
     else let (e, r2) = parse_expr toks in (SExpr e, r2)
   | Cons (TId id, r) -> parse_stmt_id toks
   | _ ->
@@ -5686,6 +5707,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else raise_exc world "NameError" ("uninitialized constant " ++ cn)
      // `obj::CONST` where obj is not a class/module is a TypeError (Ruby).
      | other -> raise_exc world "TypeError" (inspect other ++ " is not a class/module"))
+  | EScopedReadOrNil (recv_e, cn) ->
+    (match eval_e env world blk recv_e with
+     | VClass c -> let key = c ++ "::" ++ cn in
+       (if map_has consts key then map_get consts key
+        else if map_has consts cn then map_get consts cn else VNil)
+     | _ -> VNil)
   | EScopedAssign (recv_e, cn, val_e) ->
     let rv = eval_e env world blk recv_e in
     let v = eval_e env world blk val_e in
