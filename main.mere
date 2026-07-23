@@ -7082,7 +7082,15 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
 and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
   let f = try_or (fn (u: unit) -> run_stmts cenv world encl body) (FRaise VNil) in
   match f with
-  | FReturn v -> flow_rethrow "return" v   // statement return-in-block unwinds too
+  | FReturn v ->
+    // a return from a block/proc returns from the frame that DEFINED it (a
+    // method or an enclosing lambda call), targeted so it passes through any
+    // method that merely yielded the block. Falls back to a plain return if
+    // that frame is unknown or already gone (a proc whose home has returned).
+    let home = (if map_has cenv "__fid" then (match map_get cenv "__fid" with VInt t -> t | _ -> 0) else 0) in
+    if home == 0 || (if map_has live_frames (str_of_int home) then false else true)
+    then flow_rethrow "return" v
+    else flow_throw_returnret home v
   | FRaise _ ->
     if map_has flow_sig "k" then
       let k = (match map_get flow_sig "k" with VStr kk -> let kk = sget kk in kk | _ -> "") in
@@ -8256,19 +8264,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
           (match theblk with (h2, ps, b2, e2) -> lambda_arity_check world ps b2 (vlen args))
         else () in
       if map_has lambda_ids (str_of_int pid) then
-        // a lambda is method-like: `return` returns from the LAMBDA. Pass the
-        // block WITH its lambda marker so run_block enforces strict arity and
-        // does not auto-splat a single Array argument.
-        let f = try_or (fn (u: unit) -> run_block world noblk (proc_as_block pid) args) (FRaise VNil) in
-        (match f with
-         | FRaise _ ->
-           if map_has flow_sig "k" then
-             let k = (match map_get flow_sig "k" with VStr kk -> let kk = sget kk in kk | _ -> "") in
-             let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
-             let _ = map_delete flow_sig "k" in
-             if str_eq k "return" then v else flow_throw k v
-           else fail "mere-ruby: (ruby exception raised)"
-         | other -> flow_value other)
+        // a lambda is method-like: it establishes a return-boundary frame, so a
+        // `return` from the lambda (or from a proc created inside it) returns
+        // from the LAMBDA. Give the body env a fresh __fid for the call so
+        // procs created inside record it as their home, and consume a return
+        // targeted at that frame. Pass the lambda marker for strict arity.
+        (match theblk with (h2, ps2, b2, e2) ->
+          let lfid = next_fid () in
+          let had = map_has e2 "__fid" in
+          let saved = (if had then map_get e2 "__fid" else VNil) in
+          let _ = map_set e2 "__fid" (VInt lfid) in
+          let _ = map_set live_frames (str_of_int lfid) (VBool true) in
+          let f = try_or (fn (u: unit) -> run_block world noblk (proc_as_block pid) args) (FRaise VNil) in
+          let _ = map_delete live_frames (str_of_int lfid) in
+          let _ = if had then map_set e2 "__fid" saved else map_delete e2 "__fid" in
+          (match f with
+           | FRaise _ ->
+             if map_has flow_sig "k" then
+               let k = (match map_get flow_sig "k" with VStr kk -> let kk = sget kk in kk | _ -> "") in
+               let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+               let tgt = (if map_has flow_sig "fid" then (match map_get flow_sig "fid" with VInt t -> t | _ -> 0) else 0) in
+               if str_eq k "return" then (let _ = map_delete flow_sig "k" in v)
+               else if str_eq k "returnret" then
+                 // consume iff this lambda is the target; else keep propagating
+                 // (flow_sig still holds k/fid/v, so just re-raise).
+                 (if tgt == lfid then (let _ = map_delete flow_sig "k" in let _ = map_delete flow_sig "fid" in v)
+                  else (let _ = tgt in fail "mere-ruby: (flow signal)"))
+               else if str_eq k "breakret" then (let _ = tgt in fail "mere-ruby: (flow signal)")
+               else (let _ = map_delete flow_sig "k" in flow_throw k v)
+             else fail "mere-ruby: (ruby exception raised)"
+           | other -> flow_value other))
       else flow_value (run_block world noblk (proc_as_block pid) args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
@@ -10121,13 +10146,13 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
       let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
       let _ = map_delete flow_sig "k" in
       if str_eq k "return" then FNext v
-      else if str_eq k "breakret" then
-        // a break unwinding to its block's home frame: consume it here iff this
-        // is that frame, otherwise keep propagating to the outer method.
+      else if str_eq k "breakret" || str_eq k "returnret" then
+        // a break/return unwinding to its block's home frame: consume it here
+        // iff this is that frame, otherwise keep propagating to the outer method.
         let target = (if map_has flow_sig "fid" then (match map_get flow_sig "fid" with VInt t -> t | _ -> 0) else 0) in
         let myfid = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> t | _ -> 0) else 0) in
         if target == myfid then (let _ = map_delete flow_sig "fid" in FNext v)
-        else (let _ = map_set flow_sig "k" (mkstr "breakret") in
+        else (let _ = map_set flow_sig "k" (mkstr k) in
               let _ = map_set flow_sig "fid" (VInt target) in
               let _ = map_set flow_sig "v" v in
               fail "mere-ruby: (flow signal)")
@@ -11811,6 +11836,14 @@ and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
 // method_body_flow whose frame id matches returns v; others keep propagating.
 and flow_throw_breakret = fn (fid: int) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr "breakret") in
+  let _ = map_set flow_sig "fid" (VInt fid) in
+  let _ = map_set flow_sig "v" v in
+  fail "mere-ruby: (flow signal)"
+
+// `return` from inside a block/proc unwinds to the block's defining frame
+// (a method OR a lambda call), passing through any method that merely yielded.
+and flow_throw_returnret = fn (fid: int) -> fn (v: Val) ->
+  let _ = map_set flow_sig "k" (mkstr "returnret") in
   let _ = map_set flow_sig "fid" (VInt fid) in
   let _ = map_set flow_sig "v" v in
   fail "mere-ruby: (flow signal)"
