@@ -6950,34 +6950,19 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   // outer binding afterwards, so they do not leak).
   let _ = bind_block_locals cenv params in
   let params = drop_block_locals params in
-  // `**kw` — a keyword-splat: capture a trailing hash argument (or {}).
+  // `**kw` (keyword-splat) + explicit `key:` params share ONE trailing
+  // kwarg-origin hash (`key:` / `**h`); a positional {...} stays positional
+  // (Ruby 3 separation). Peel it once, bind the explicit keywords (a missing
+  // required keyword raises ArgumentError), then give **kw the leftover keys.
+  // The presence of any keyword param disables auto-splat.
   let dsname = dsplat_name params in
   let params = drop_dsplat params in
-  let argvals0 =
-    (if str_eq dsname "" then argvals0
-     else
-       let n = vlen argvals0 in
-       if n > 0 then
-         // only a kwarg-origin hash (`key:` / `**h`) feeds **kwrest; a
-         // positional {...} stays in the positional list (Ruby 3 separation).
-         (match vdrop argvals0 (n - 1) with
-          | Cons (VHsh hx, _) ->
-            if is_kw_hash (VHsh hx) then (let hx = hderef hx in let _ = map_set cenv dsname (mkhash hx) in vtake argvals0 (n - 1))
-            else (let _ = map_set cenv dsname (mkhash Nil) in argvals0)
-          | _ -> let _ = map_set cenv dsname (mkhash Nil) in argvals0)
-       else let _ = map_set cenv dsname (mkhash Nil) in argvals0) in
-  // keyword params (`k:` names): peel only a kwarg-origin trailing hash
-  // (`key:` / `**h`), leaving a positional {...} argument in place (Ruby 3
-  // separation); the presence of any keyword param disables auto-splat.
   let kws = kw_params params in
   let params = pos_params params in
-  let argvals0 =
-    (match kws with
-     | Nil -> argvals0
-     | _ ->
-       let (rest, kwhash) = peel_kw_hash argvals0 in
-       let _ = bind_block_kws cenv kws kwhash in
-       rest) in
+  let want_kw = (match kws with Nil -> (if str_eq dsname "" then false else true) | _ -> true) in
+  let (argvals0, kwhash) = if want_kw then peel_kw_hash argvals0 else (argvals0, (Nil : Val list)) in
+  let _ = bind_block_kws cenv world bdefaults kws kwhash in
+  let _ = if str_eq dsname "" then () else map_set cenv dsname (mkhash (kwhash_drop kwhash (kw_names_of kws))) in
   // auto-splat: a block with 2+ params given a single value destructures
   // an Array directly, or an object via to_ary. Lambdas do NOT auto-splat —
   // a single argument stays a single argument (with strict arity).
@@ -7027,10 +7012,10 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
     let middle = if middle < 0 then 0 else middle in
     let kopt = if middle > nopt then nopt else middle in
     let sc = middle - kopt in
-    let _ = bind_seq cenv pre (vtake argvals npre) in
+    let _ = bind_seq cenv world pre (vtake argvals npre) in
     let _ = bind_defaulted cenv world blk opts bdefaults (vtake (vdrop argvals npre) kopt) in
     let _ = if str_eq sname "" then () else map_set cenv sname (arr_new (vtake (vdrop argvals (npre + kopt)) sc)) in
-    let _ = bind_seq cenv after (vdrop argvals (npre + kopt + sc)) in
+    let _ = bind_seq cenv world after (vdrop argvals (npre + kopt + sc)) in
     ()
   else
     let pre = req_pre params bdefaults in
@@ -7044,19 +7029,24 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
     let kopt0 = nv - npre - npost in
     let kopt0 = if kopt0 < 0 then 0 else kopt0 in
     let kopt = if kopt0 > nopt then nopt else kopt0 in
-    let _ = bind_seq cenv pre (vtake argvals npre) in
+    let _ = bind_seq cenv world pre (vtake argvals npre) in
     let _ = bind_defaulted cenv world blk opts bdefaults (vtake (vdrop argvals npre) kopt) in
-    let _ = bind_seq cenv post (vdrop argvals (npre + kopt)) in
+    let _ = bind_seq cenv world post (vdrop argvals (npre + kopt)) in
     ()
 
-and bind_block_kws = fn cenv -> fn (kws: str list) -> fn (kwhash: Val list) ->
+and bind_block_kws = fn cenv -> fn world -> fn (bdefaults: (str * Expr) list) -> fn (kws: str list) -> fn (kwhash: Val list) ->
   match kws with
   | Nil -> ()
   | Cons (p, rest) ->
     let nm = substring p 0 (str_len p - 1) in
-    let v = if hash_haskey kwhash (VSym nm) then hash_get kwhash (VSym nm) else VNil in
-    let _ = map_set cenv nm v in
-    bind_block_kws cenv rest kwhash
+    // a keyword arg that is present binds; a missing OPTIONAL keyword binds nil
+    // (the body's nil-check prologue then applies its default); a missing
+    // REQUIRED keyword (no default) raises ArgumentError.
+    let _ =
+      if hash_haskey kwhash (VSym nm) then map_set cenv nm (hash_get kwhash (VSym nm))
+      else if has_default bdefaults nm then map_set cenv nm VNil
+      else (let _ = raise_exc world "ArgumentError" ("missing keyword: :" ++ nm) in ()) in
+    bind_block_kws cenv world bdefaults rest kwhash
 
 and bind_numbered = fn cenv -> fn (argvals: Val list) -> fn (n: int) ->
   if n > 9 then ()
@@ -7065,29 +7055,31 @@ and bind_numbered = fn cenv -> fn (argvals: Val list) -> fn (n: int) ->
      | Nil -> let _ = map_set cenv ("_" ++ str_of_int n) VNil in bind_numbered cenv Nil (n + 1)
      | Cons (a, rest) -> let _ = map_set cenv ("_" ++ str_of_int n) a in bind_numbered cenv rest (n + 1))
 
-and bind_block_seq = fn cenv -> fn (params: str list) -> fn (argvals: Val list) ->
+and bind_block_seq = fn cenv -> fn world -> fn (params: str list) -> fn (argvals: Val list) ->
   match params with
   | Nil -> ()
   | Cons (p, ps) ->
     (match argvals with
-     | Nil -> let _ = bind_one_bparam cenv p VNil in bind_block_seq cenv ps Nil
-     | Cons (a, rest) -> let _ = bind_one_bparam cenv p a in bind_block_seq cenv ps rest)
+     | Nil -> let _ = bind_one_bparam cenv world p VNil in bind_block_seq cenv world ps Nil
+     | Cons (a, rest) -> let _ = bind_one_bparam cenv world p a in bind_block_seq cenv world ps rest)
 
-and bind_one_bparam = fn cenv -> fn (p: str) -> fn (v: Val) ->
+and bind_one_bparam = fn cenv -> fn world -> fn (p: str) -> fn (v: Val) ->
   // a ;block-local always starts nil (it never takes an argument).
   if str_len p > 0 && str_eq (char_at p 0) ";" then
     let _ = map_set cenv (substring p 1 (str_len p)) VNil in ()
   else if str_len p > 0 && str_eq (char_at p 0) "(" then
-    bind_destructure cenv (substring p 1 (str_len p - 1)) v
+    bind_destructure cenv world (substring p 1 (str_len p - 1)) v
   else let _ = map_set cenv p v in ()
 
-// bind a destructure spec ("a,(b,c),*r") against a value (arrays spread).
-and bind_destructure = fn cenv -> fn (spec: str) -> fn (v: Val) ->
+// bind a destructure spec ("a,(b,c),*r") against a value. An Array spreads; a
+// non-Array is coerced via #to_ary (Ruby's destructure protocol), wrapping a
+// non-responding object as [obj] and raising TypeError on a bad #to_ary.
+and bind_destructure = fn cenv -> fn world -> fn (spec: str) -> fn (v: Val) ->
   let parts = spec_split spec 0 0 "" Nil in
-  let vals = (match v with VArr id -> deref id | other -> Cons (other, Nil)) in
-  bind_spec_parts cenv parts vals
+  let vals = (match v with VArr id -> deref id | other -> coerce_massign cenv world other false) in
+  bind_spec_parts cenv world parts vals
 
-and bind_spec_parts = fn cenv -> fn (parts: str list) -> fn (vals: Val list) ->
+and bind_spec_parts = fn cenv -> fn world -> fn (parts: str list) -> fn (vals: Val list) ->
   match parts with
   | Nil -> ()
   | Cons (p, ps) ->
@@ -7098,15 +7090,15 @@ and bind_spec_parts = fn cenv -> fn (parts: str list) -> fn (vals: Val list) ->
       let take = if take < 0 then 0 else take in
       let nm = substring p 1 (str_len p) in
       let _ = if str_eq nm "" then () else map_set cenv nm (arr_new (vtake vals take)) in
-      bind_spec_parts cenv ps (vdrop vals take)
+      bind_spec_parts cenv world ps (vdrop vals take)
     else
       (match vals with
-       | Nil -> let _ = bind_spec_one cenv p VNil in bind_spec_parts cenv ps Nil
-       | Cons (a, rest) -> let _ = bind_spec_one cenv p a in bind_spec_parts cenv ps rest)
+       | Nil -> let _ = bind_spec_one cenv world p VNil in bind_spec_parts cenv world ps Nil
+       | Cons (a, rest) -> let _ = bind_spec_one cenv world p a in bind_spec_parts cenv world ps rest)
 
-and bind_spec_one = fn cenv -> fn (p: str) -> fn (v: Val) ->
+and bind_spec_one = fn cenv -> fn world -> fn (p: str) -> fn (v: Val) ->
   if str_len p > 0 && str_eq (char_at p 0) "(" then
-    bind_destructure cenv (substring p 1 (str_len p - 1)) v
+    bind_destructure cenv world (substring p 1 (str_len p - 1)) v
   else if str_eq p "" then ()
   else let _ = map_set cenv p v in ()
 
@@ -8378,7 +8370,7 @@ and is_prim_method = fn (name: str) ->
   str_eq name "tap" || str_eq name "is_a?" || str_eq name "kind_of?" ||
   str_eq name "instance_of?" || str_eq name "respond_to?" || str_eq name "send" ||
   str_eq name "__send__" || str_eq name "hash" || str_eq name "object_id" ||
-  str_eq name "==" || str_eq name "!="
+  str_eq name "==" || str_eq name "!=" || str_eq name "equal?"
 
 // ---- in-place string mutation --------------------------------------------
 // VStr is a handle into str_store, so a mutating method rewrites the store
@@ -9804,10 +9796,10 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
     let middle = if middle < 0 then 0 else middle in
     let kopt = if middle > nopt then nopt else middle in
     let sc = middle - kopt in
-    let _ = bind_seq frame pre (vtake args npre) in
+    let _ = bind_seq frame world pre (vtake args npre) in
     let _ = bind_defaulted frame world blk opts defaults (vtake (vdrop args npre) kopt) in
     let _ = map_set frame sname (arr_new (vtake (vdrop args (npre + kopt)) sc)) in
-    let _ = bind_seq frame after (vdrop args (npre + kopt + sc)) in
+    let _ = bind_seq frame world after (vdrop args (npre + kopt + sc)) in
     ()
   else
     // no splat: requireds may follow the optional run (a, o=1, p1, p2) —
@@ -9823,9 +9815,9 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
     let kopt0 = nv - npre - npost in
     let kopt0 = if kopt0 < 0 then 0 else kopt0 in
     let kopt = if kopt0 > nopt then nopt else kopt0 in
-    let _ = bind_seq frame pre (vtake args npre) in
+    let _ = bind_seq frame world pre (vtake args npre) in
     let _ = bind_defaulted frame world blk opts defaults (vtake (vdrop args npre) kopt) in
-    let _ = bind_seq frame post (vdrop args (npre + kopt)) in
+    let _ = bind_seq frame world post (vdrop args (npre + kopt)) in
     ()
 
 // split params around the optional (defaulted) run: leading requireds,
@@ -9870,14 +9862,14 @@ and bind_defaulted = fn frame -> fn world -> fn blk -> fn (params: str list) -> 
   | Nil -> ()
   | Cons (p, ps) ->
     (match args with
-     | Cons (a, rest) -> let _ = bind_seq_one frame p a in bind_defaulted frame world blk ps defaults rest
+     | Cons (a, rest) -> let _ = bind_seq_one frame world p a in bind_defaulted frame world blk ps defaults rest
      | Nil ->
        // Ruby declares the parameter (as nil) before its default runs, so a
        // self-referential default like `a = a` sees nil.
        let v = (if has_default defaults p
                 then (let _ = map_set frame p VNil in eval_e frame world blk (get_default defaults p))
                 else VNil) in
-       let _ = bind_seq_one frame p v in bind_defaulted frame world blk ps defaults Nil)
+       let _ = bind_seq_one frame world p v in bind_defaulted frame world blk ps defaults Nil)
 
 and has_default = fn (defaults: (str * Expr) list) -> fn (p: str) ->
   match defaults with Nil -> false | Cons (d, r) -> let (n, _) = d in if str_eq n p then true else has_default r p
@@ -9898,18 +9890,18 @@ and bind_strict = fn frame -> fn (name: str) -> fn (params: str list) -> fn (arg
 
 // positional binding without an arity check (used for the fixed params
 // around a splat); missing args bind nil.
-and bind_seq = fn frame -> fn (params: str list) -> fn (args: Val list) ->
+and bind_seq = fn frame -> fn world -> fn (params: str list) -> fn (args: Val list) ->
   match params with
   | Nil -> ()
   | Cons (p, ps) ->
     (match args with
-     | Nil -> let _ = bind_seq_one frame p VNil in bind_seq frame ps Nil
-     | Cons (a, r) -> let _ = bind_seq_one frame p a in bind_seq frame ps r)
+     | Nil -> let _ = bind_seq_one frame world p VNil in bind_seq frame world ps Nil
+     | Cons (a, r) -> let _ = bind_seq_one frame world p a in bind_seq frame world ps r)
 
 // bind one positional param, destructuring a `(a, b)` spec param.
-and bind_seq_one = fn frame -> fn (p: str) -> fn (v: Val) ->
+and bind_seq_one = fn frame -> fn world -> fn (p: str) -> fn (v: Val) ->
   if str_len p > 0 && str_eq (char_at p 0) "(" then
-    bind_destructure frame (substring p 1 (str_len p - 1)) v
+    bind_destructure frame world (substring p 1 (str_len p - 1)) v
   else map_set frame p v
 
 // register a class body: declarations register, everything else EXECUTES
