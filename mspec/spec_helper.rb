@@ -181,6 +181,10 @@ def it_behaves_like(*args); end
 def before(kind = nil, &blk); $mspec_before = blk; end
 def after(kind = nil, &blk); $mspec_after = blk; end
 def guard(*args); end
+# mspec numeric boundary helpers (mspec/helpers/numeric.rb).
+def bignum_value(plus = 0); 2**64 + plus; end
+def fixnum_max; 2**62 - 1; end
+def fixnum_min; -(2**62); end
 def ruby_version_is(*args); end
 def platform_is(*args); end
 def platform_is_not(*args); end
