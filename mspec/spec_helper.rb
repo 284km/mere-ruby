@@ -158,12 +158,17 @@ def context(desc, *opts)
   $mspec_after = prev_a
 end
 
-def it(desc, *opts)
+def it(desc, *opts, &blk)
   $mspec_it = desc
+  # Run before/example/after on ONE fresh example object (like real mspec), so
+  # @ivars set in `before` are visible to the example, each example starts
+  # clean, and matcher methods (include, equal, ...) resolve to the shim
+  # definitions instead of a self=main built-in such as Module#include.
+  env = Object.new
   begin
-    $mspec_before.call if $mspec_before
-    yield
-    $mspec_after.call if $mspec_after
+    env.instance_exec(&$mspec_before) if $mspec_before
+    env.instance_exec(&blk) if blk
+    env.instance_exec(&$mspec_after) if $mspec_after
   rescue SpecFailure
     # already tallied
   rescue Exception => e
