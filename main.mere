@@ -5808,6 +5808,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else try_self_call env world name Nil
   | ECall (name, arges) ->
     let (meths, sup, ocls, ivars) = world in
+    // a paren-less call with a trailing `&expr` block-pass (`send :m, :a, &pr`)
+    // routes through the block-call path, exactly like the parenthesized form
+    // (otherwise the proc would be passed as a positional argument).
+    if (match rev_app arges Nil with Cons (EBlockPass _, _) -> true | _ -> false) then
+      (match rev_app arges Nil with
+       | Cons (EBlockPass be, rrest) ->
+         eval_e env world blk (ECallB (name, rev_app rrest Nil, Cons ("&coerce", Nil), Cons (SExpr be, Nil)))
+       | _ -> VNil)
+    else
     // `refine X.singleton_class do...end` mis-parses: the do-block binds to the
     // inner `.singleton_class` (an EMethodB), leaving refine block-less. Recover
     // it — the refined target is the method call without the block, and the
@@ -7577,6 +7586,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     else if str_eq c "Hash" && str_eq name "[]" then
       (match args with Cons (VHsh h, _) -> mkhash (hderef h) | _ -> mkhash Nil)
     else if str_eq c "Array" && str_eq name "[]" then arr_new args
+    // Module#ruby2_keywords via a receiver path (e.g. `send :ruby2_keywords,
+    // :m` routes here): mark the named method, same as the bare-call handler.
+    else if str_eq name "ruby2_keywords" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      (let _ = (match args with
+                | Cons (VSym s, _) -> map_set r2k_methods s VNil
+                | Cons (VStr s, _) -> map_set r2k_methods (sget s) VNil
+                | _ -> ()) in
+       VNil)
     // Klass.class_eval("code") / module_eval / *_exec with a string: run the
     // code as class-body statements (def defines methods of the class).
     else if (str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "class_exec" || str_eq name "module_exec") && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -9226,6 +9243,11 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
      | VObj id ->
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
+       // the string form of instance_eval/instance_exec on an object self
+       // (e.g. inside an instance_exec block) routes to the prim dispatcher,
+       // exactly like the VMain special case below.
+       else if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
+       then invoke_val_c env world noblk (VObj id) name args false
        else if has_meth world cls "method_missing" then invoke world noblk (VObj id) cls "method_missing" (Cons (VSym name, args))
        else undef_call_exc_x world name args explicit
      // top-level self is main (an Object); route the string form of
@@ -10167,6 +10189,10 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                  then (let mk = "(sng:" ++ cls ++ ")#" ++ mname in let _ = map_set meths mk (Meth (params, defs, mbody)) in map_set meth_cref mk (cur_lex ()))
                  else () in
          let _ = if map_has undefs key then map_delete undefs key else () in
+         // a (re)definition is not ruby2_keywords until explicitly marked:
+         // clear any stale mark (the mark table is keyed by bare name, so a
+         // plain `def m` must not inherit an earlier `ruby2_keywords def m`).
+         let _ = if map_has r2k_methods (meth_base mname) then map_delete r2k_methods (meth_base mname) else () in
          // receiver-qualified / singleton defs are always public.
          let _ = if (if is_selfdef then false else true) && (if str_contains mname "#" then false else true) then
                    (if str_eq vis2 "private" then map_set privates key VNil
