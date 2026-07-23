@@ -5737,11 +5737,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      | _ -> (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
-    let supercls = if is_sng_cls defcls then sng_supername world defcls else if map_has sup defcls then map_get sup defcls else "" in
-    // no superclass method: a catchable NoMethodError (not a hard fail).
-    // an empty supercls resolves to Object (mirrors lookup_meth_cls).
-    if has_meth world (if str_eq supercls "" then "Object" else supercls) meth then invoke world superblk recv supercls meth args
-    else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'")
+    // resume the method search in the receiver's ancestor chain, strictly
+    // after the class/module the current method is defined in — so super walks
+    // included modules too. A singleton-class defcls uses the singleton chain.
+    if is_sng_cls defcls then
+      (let supercls = sng_supername world defcls in
+       if has_meth world supercls meth then invoke world superblk recv supercls meth args
+       else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
+    else
+      (let a2 = lookup_anc world (anc_after (ancestors_of world (dispatch_cls_of world recv)) defcls) meth in
+       if str_eq a2 "" then raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'")
+       else run_meth world superblk recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
   | ESuperB (zsuper, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
     let defcls = (match map_get env "__defcls" with VClass c -> c | _ -> "") in
@@ -5754,9 +5760,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      | _ -> (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
-    let supercls = if is_sng_cls defcls then sng_supername world defcls else if map_has sup defcls then map_get sup defcls else "" in
-    if has_meth world (if str_eq supercls "" then "Object" else supercls) meth then invoke world (true, bp, bb, env) recv supercls meth args
-    else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'")
+    if is_sng_cls defcls then
+      (let supercls = sng_supername world defcls in
+       if has_meth world supercls meth then invoke world (true, bp, bb, env) recv supercls meth args
+       else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
+    else
+      (let a2 = lookup_anc world (anc_after (ancestors_of world (dispatch_cls_of world recv)) defcls) meth in
+       if str_eq a2 "" then raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'")
+       else run_meth world (true, bp, bb, env) recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
   | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
   | EAssign (name, e) ->
     let v = eval_e env world blk e in
@@ -9541,17 +9552,21 @@ and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
 // `super` can resume the lookup from that class's superclass.
 and lookup_meth_cls = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
-  if map_has meths (cls ++ "#" ++ name) then (map_get meths (cls ++ "#" ++ name), cls)
-  else if includes_has world cls name then (mod_lookup world (str_split (map_get includes cls) "|") name, cls)
-  else if map_has sup cls then lookup_meth_cls world (map_get sup cls) name
-  else if is_sng_cls cls then lookup_meth_cls world (sng_supername world cls) name
-  else if str_eq cls "Object" then fail ("mere-ruby: undefined method '" ++ name ++ "'")
-  else lookup_meth_cls world "Object" name
+  // resolve along the linearized ancestor chain so the returned defining class
+  // is the actual module/class the method lives in (super resumes from there).
+  let a = lookup_anc world (ancestors_of world cls) name in
+  if str_eq a "" then fail ("mere-ruby: undefined method '" ++ name ++ "'")
+  else (map_get meths (a ++ "#" ++ name), a)
 
 // invoke an instance method: fresh frame binding self + params; blk is the
 // block passed at the call site (installed for yield inside the body).
 and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
   let (m, defcls) = lookup_meth_cls world cls name in
+  run_meth world blk recv defcls name m args
+
+// run a resolved method with __defcls set to the ancestor it was found in (so
+// a bare `super` resumes from the right point in the receiver's chain).
+and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) ->
   match m with
   | Meth (params, defaults, body) ->
     // a method defined via define_method yields to the block captured at
@@ -9573,6 +9588,47 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
     let _ = map_set frame "__params" (arr_new (param_names_vals params)) in
     let _ = bind_params frame world blk name params defaults args in
     (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v)
+
+// the linearized ancestor chain of a class: the class, then its included
+// modules (later includes first, MRO order), then the superclass's chain.
+and rev_strs = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_strs t (Cons (h, acc))
+and ancestors_of = fn world -> fn (cls: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let mods = if map_has includes cls then rev_strs (str_split (map_get includes cls) "|") Nil else Nil in
+  let rest = if map_has sup cls then ancestors_of world (map_get sup cls)
+             else if is_sng_cls cls then ancestors_of world (sng_supername world cls)
+             else if str_eq cls "BasicObject" then Nil
+             else if str_eq cls "Object" then Cons ("BasicObject", Nil)
+             else ancestors_of world "Object" in
+  Cons (cls, list_append_str mods rest)
+// the ancestor sublist strictly after the first occurrence of `x`.
+and anc_after = fn (anc: str list) -> fn (x: str) ->
+  match anc with Nil -> Nil | Cons (a, rest) -> if str_eq a x then rest else anc_after rest x
+// the class where method dispatch for `recv` begins (its object class, or the
+// value's class for a primitive) — the head of its ancestor chain.
+// resolve a bare constant name `m` referenced inside class `cls`: try each
+// enclosing namespace of cls (cls::m, then strip the last ::segment, ...),
+// then the bare name; return the first that names a class/module, else `m`.
+and resolve_scope_name = fn (cls: str) -> fn (m: str) ->
+  if str_contains m "::" then m
+  else if (if str_eq cls "" then false else true) && (map_has consts (cls ++ "::" ++ m) || map_has modules (cls ++ "::" ++ m)) then cls ++ "::" ++ m
+  else if str_contains cls "::" then resolve_scope_name (strip_last_ns cls) m
+  else m
+and strip_last_ns = fn (s: str) -> strip_last_ns_go s (str_len s - 1)
+and strip_last_ns_go = fn (s: str) -> fn (i: int) ->
+  if i <= 0 then ""
+  else if str_eq (char_at s i) ":" && str_eq (char_at s (i - 1)) ":" then substring s 0 (i - 1)
+  else strip_last_ns_go s (i - 1)
+and dispatch_cls_of = fn world -> fn (recv: Val) ->
+  let (meths, sup, ocls, ivars) = world in
+  match recv with VObj id -> map_get ocls (str_of_int id) | VClass c -> c | _ -> class_name recv
+// the first ancestor in `anc` that defines `name`, or "" if none.
+and lookup_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
+  let (meths, _, _, _) = world in
+  match anc with
+  | Nil -> ""
+  | Cons (a, rest) -> if map_has meths (a ++ "#" ++ name) then a else lookup_anc world rest name
 
 // ---- Struct.new(:a, :b) --------------------------------------------------
 // synthesize an anonymous class with rw accessors, a positional initialize,
@@ -10455,7 +10511,11 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          FNext VNil
        // `include M` records the module for method lookup fallback.
        | SInclude m ->
-         let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ m else m) in
+         // resolve the module name in the enclosing lexical scope so a nested
+         // `include ModA` records the qualified name (NS::ModA), matching where
+         // its methods live.
+         let mq = resolve_scope_name cls m in
+         let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ mq else mq) in
          FNext VNil
        // `undef name` removes the method from this class.
        | SUndef names -> let _ = undef_check world cls names in let _ = undef_all meths cls names in FNext VNil
