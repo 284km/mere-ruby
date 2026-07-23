@@ -424,6 +424,10 @@ let ff_state = map_new ();
 let parser_flags = map_new ();
 // parse-time gensym counter for `rescue E => <complex lvalue>`: the exception
 // binds to a fresh temp, then a synthesized assignment writes it to the target.
+// a block written with an explicit-but-empty parameter list (`{ || ... }`)
+// carries this sentinel so the parser can reject a numbered parameter in the
+// body (`proc { || _1 }` is a SyntaxError); it is stripped before the block runs.
+let empty_bp_marker = "~emptyparams~";
 let resc_ctr = map_new ();
 let fresh_resc = fn () ->
   let n = (if map_has resc_ctr "n" then (match map_get resc_ctr "n" with VInt k -> k | _ -> 0) else 0) in
@@ -1973,7 +1977,7 @@ and parse_block_params_d = fn toks ->
   match t with
   | Cons (TP bar, r) ->
     if str_eq bar "|" then parse_pipe_params r Nil Nil
-    else if str_eq bar "||" then ((Nil : str list), (Nil : (str * Expr) list), r)
+    else if str_eq bar "||" then (Cons (empty_bp_marker, Nil), (Nil : (str * Expr) list), r)
     else (Nil, Nil, t)
   | _ -> (Nil, Nil, t)
 
@@ -2327,6 +2331,9 @@ and parse_primary = fn toks ->
            if str_eq n "do" then ((Nil : str list), (Nil : (str * Expr) list), r)
            else lambda_bare_params r Nil Nil
          | _ -> (Nil, Nil, r)) in
+      // `-> () { _1 }` has an explicit (empty) parameter list, which forbids a
+      // numbered parameter in the body (checked once the body is parsed).
+      let empty_parens = (match params with Nil -> (match r with Cons (TP lp, _) -> str_eq lp "(" | _ -> false) | _ -> false) in
       // `-> a=a() { a }` — the default's call grabs the brace block; when no
       // block opener follows, take that block back as the lambda body.
       let (lds, r1, swallowed) =
@@ -2340,6 +2347,9 @@ and parse_primary = fn toks ->
         (match swallowed with
          | (true, sbp, sbb) -> (sbp, sbb, r1)
          | (false, _, _) -> parse_block r1) in
+      // carry the empty-params sentinel so a numbered param in the body is
+      // rejected (numbered_misuse_expr checks a non-empty ELambda param list).
+      let params = if empty_parens then Cons (empty_bp_marker, Nil) else params in
       let allp = list_append_str params bp in
       // optional params (defaults) relax the strict lambda arity check via
       // a hidden anonymous splat; kw defaults keep their own binding.
@@ -7002,6 +7012,9 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // strict arity (a plain block stays lenient).
   let is_lam = (match params0 with Cons (m, _) -> str_eq m lambda_blk_marker | _ -> false) in
   let params = if is_lam then (match params0 with Cons (_, rest) -> rest | _ -> params0) else params0 in
+  // an explicit-empty param list (`{ || .. }` / `-> () { .. }`) runs with zero
+  // params; the sentinel only served to reject numbered params at parse time.
+  let params = (match params with Cons (m, Nil) -> if str_eq m empty_bp_marker then (Nil : str list) else params | _ -> params) in
   let _ = if is_lam then lambda_arity_check world params body (vlen argvals) else () in
   // Ruby block params are block-local: save any outer bindings of the
   // param names and restore them after the block (for-loops keep their
@@ -8198,6 +8211,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       else flow_value (run_block world noblk (proc_as_block pid) args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
+    else if str_eq name "parameters" then
+      (match map_get proc_store (str_of_int pid) with
+       (h, ps, body, e) ->
+         let is_lam = map_has lambda_ids (str_of_int pid) in
+         (match strip_block_params ps with
+          // no explicit params: the numbered parameters _1.._N, required for a
+          // lambda and optional for a proc.
+          | Nil -> arr_new (numbered_params_meta is_lam 1 (max_numbered_stmts body))
+          | ps1 -> arr_new (param_meta_list is_lam ps1)))
     else if str_eq name "arity" then
       (match map_get proc_store (str_of_int pid) with
        (h, ps, body, e) ->
@@ -8246,6 +8268,20 @@ and imax = fn (a: int) -> fn (b: int) -> if a > b then a else b
 // the highest numbered parameter (_1..) referenced in a block body, else 0.
 // Over-detection is safe (it only relaxes the arity-0 check / grows arity),
 // so descend broadly.
+// `[[:req, :_1], ...]` (lambda) / `[[:opt, :_1], ...]` (proc) for _1.._n.
+and numbered_params_meta = fn (is_lam: bool) -> fn (i: int) -> fn (n: int) ->
+  if i > n then Nil
+  else Cons (arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym ("_" ++ str_of_int i), Nil))), numbered_params_meta is_lam (i + 1) n)
+// #parameters metadata for an explicit block/lambda parameter list.
+and param_meta_list = fn (is_lam: bool) -> fn (ps: str list) ->
+  match ps with
+  | Nil -> Nil
+  | Cons (p, rest) ->
+    let pair = (if str_len p >= 2 && str_eq (substring p 0 2) "**" then arr_new (Cons (VSym "keyrest", Cons (VSym (substring p 2 (str_len p)), Nil)))
+                else if str_len p > 0 && str_eq (char_at p 0) "*" then arr_new (Cons (VSym "rest", Cons (VSym (substring p 1 (str_len p)), Nil)))
+                else if str_len p > 0 && str_eq (char_at p 0) "&" then arr_new (Cons (VSym "block", Cons (VSym (substring p 1 (str_len p)), Nil)))
+                else arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym p, Nil)))) in
+    Cons (pair, param_meta_list is_lam rest)
 and max_numbered_stmts = fn (body: Stmt list) ->
   match body with
   | Nil -> 0
@@ -8303,11 +8339,71 @@ and numbered_misuse_clauses = fn (clauses: (Expr * Stmt list) list) ->
 and blk_num_bad = fn (bp: str list) -> fn (bb: Stmt list) ->
   // a block with explicit params AND a numbered param in its body is invalid.
   (match bp with Nil -> false | _ -> max_numbered_stmts bb > 0)
+// a numbered param referenced in THIS block's scope (does not descend into a
+// nested block/lambda body, which starts its own numbered-param scope).
+and own_num_stmts = fn (b: Stmt list) -> match b with Nil -> 0 | Cons (s, r) -> imax (own_num_stmt s) (own_num_stmts r)
+and own_num_stmt = fn (s: Stmt) ->
+  match s with
+  | SExpr e -> own_num_expr e
+  | SAssign (n, e) -> imax (numbered_digit n) (own_num_expr e)
+  | SReturn e -> own_num_expr e
+  | SIVarAssign (_, e) -> own_num_expr e
+  | SPuts es -> own_num_exprs es
+  | SWhile (c, bd) -> imax (own_num_expr c) (own_num_stmts bd)
+  | SIf (cl, els) -> imax (own_num_clauses cl) (own_num_stmts els)
+  | _ -> 0
+and own_num_clauses = fn (cl: (Expr * Stmt list) list) -> match cl with Nil -> 0 | Cons ((c, bd), r) -> imax (imax (own_num_expr c) (own_num_stmts bd)) (own_num_clauses r)
+and own_num_expr = fn (e: Expr) ->
+  match e with
+  | EVar n -> numbered_digit n
+  | EBin (_, a, b) -> imax (own_num_expr a) (own_num_expr b)
+  | EUn (_, a) -> own_num_expr a
+  | ECall (_, args) -> own_num_exprs args
+  | EMethod (r, _, args) -> imax (own_num_expr r) (own_num_exprs args)
+  | EMethodB (r, _, args, _, _) -> imax (own_num_expr r) (own_num_exprs args)
+  | ECallB (_, args, _, _) -> own_num_exprs args
+  | EArr es -> own_num_exprs es
+  | EHsh es -> own_num_exprs es
+  | ETern (a, b, c) -> imax (imax (own_num_expr a) (own_num_expr b)) (own_num_expr c)
+  | EYield es -> own_num_exprs es
+  | _ -> 0
+and own_num_exprs = fn (es: Expr list) -> match es with Nil -> 0 | Cons (e, r) -> imax (own_num_expr e) (own_num_exprs r)
+// a nested block/lambda (in this scope) whose OWN scope references a numbered param.
+and nested_num_stmts = fn (b: Stmt list) -> match b with Nil -> false | Cons (s, r) -> nested_num_stmt s || nested_num_stmts r
+and nested_num_stmt = fn (s: Stmt) ->
+  match s with
+  | SExpr e -> nested_num_expr e
+  | SAssign (_, e) -> nested_num_expr e
+  | SReturn e -> nested_num_expr e
+  | SIVarAssign (_, e) -> nested_num_expr e
+  | SPuts es -> nested_num_exprs es
+  | SWhile (c, bd) -> nested_num_expr c || nested_num_stmts bd
+  | SIf (cl, els) -> nested_num_clauses cl || nested_num_stmts els
+  | _ -> false
+and nested_num_clauses = fn (cl: (Expr * Stmt list) list) -> match cl with Nil -> false | Cons ((c, bd), r) -> nested_num_expr c || nested_num_stmts bd || nested_num_clauses r
+and nested_num_expr = fn (e: Expr) ->
+  match e with
+  | ELambda (ps, b) -> (match ps with Nil -> own_num_stmts b > 0 || nested_num_stmts b | _ -> nested_num_stmts b)
+  | ECallB (_, args, bp, bb) -> (match bp with Nil -> own_num_stmts bb > 0 || nested_num_stmts bb | _ -> nested_num_stmts bb) || nested_num_exprs args
+  | EMethodB (r, _, args, bp, bb) -> (match bp with Nil -> own_num_stmts bb > 0 || nested_num_stmts bb | _ -> nested_num_stmts bb) || nested_num_expr r || nested_num_exprs args
+  | EBin (_, a, b) -> nested_num_expr a || nested_num_expr b
+  | EUn (_, a) -> nested_num_expr a
+  | ECall (_, args) -> nested_num_exprs args
+  | EMethod (r, _, args) -> nested_num_expr r || nested_num_exprs args
+  | EArr es -> nested_num_exprs es
+  | EHsh es -> nested_num_exprs es
+  | ETern (a, b, c) -> nested_num_expr a || nested_num_expr b || nested_num_expr c
+  | _ -> false
+and nested_num_exprs = fn (es: Expr list) -> match es with Nil -> false | Cons (e, r) -> nested_num_expr e || nested_num_exprs r
+// a block using a numbered param whose body also has a nested block using one
+// is a SyntaxError ("numbered parameter is already used in outer block").
+and num_nested_bad = fn (bb: Stmt list) -> own_num_stmts bb > 0 && nested_num_stmts bb
+
 and numbered_misuse_expr = fn (e: Expr) ->
   match e with
-  | ELambda (ps, b) -> (match ps with Nil -> numbered_misuse_stmts b | _ -> if max_numbered_stmts b > 0 then true else numbered_misuse_stmts b)
-  | ECallB (_, args, bp, bb) -> blk_num_bad bp bb || numbered_misuse_exprs args || numbered_misuse_stmts bb
-  | EMethodB (r, _, args, bp, bb) -> blk_num_bad bp bb || numbered_misuse_expr r || numbered_misuse_exprs args || numbered_misuse_stmts bb
+  | ELambda (ps, b) -> (match ps with Nil -> num_nested_bad b || numbered_misuse_stmts b | _ -> if max_numbered_stmts b > 0 then true else numbered_misuse_stmts b)
+  | ECallB (_, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_exprs args || numbered_misuse_stmts bb
+  | EMethodB (r, _, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_expr r || numbered_misuse_exprs args || numbered_misuse_stmts bb
   | EBin (_, a, b) -> numbered_misuse_expr a || numbered_misuse_expr b
   | EUn (_, a) -> numbered_misuse_expr a
   | ECall (_, args) -> numbered_misuse_exprs args
@@ -8319,7 +8415,9 @@ and numbered_misuse_expr = fn (e: Expr) ->
 and numbered_misuse_exprs = fn (es: Expr list) ->
   match es with Nil -> false | Cons (e, r) -> numbered_misuse_expr e || numbered_misuse_exprs r
 
-and lambda_arity_check = fn world -> fn (ps: str list) -> fn (body: Stmt list) -> fn (nargs: int) ->
+and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) -> fn (nargs: int) ->
+  // an explicit-empty param list (`{ || }`) behaves like zero params.
+  let ps = (match ps0 with Cons (m, Nil) -> if str_eq m empty_bp_marker then (Nil : str list) else ps0 | _ -> ps0) in
   let nps = list_str_len (strip_block_params ps) in
   (match ps with
    // no explicit params: arity 0 (strict) unless the body uses numbered
@@ -10032,7 +10130,7 @@ and block_param_name = fn (params: str list) ->
 and strip_block_params = fn (params: str list) ->
   match params with
   | Nil -> Nil
-  | Cons (p, r) -> if is_block_param p then strip_block_params r else Cons (p, strip_block_params r)
+  | Cons (p, r) -> if is_block_param p || str_eq p empty_bp_marker then strip_block_params r else Cons (p, strip_block_params r)
 
 // explicit block-local names (encoded ";name"): bind each to a fresh nil.
 and bind_block_locals = fn cenv -> fn (params: str list) ->
