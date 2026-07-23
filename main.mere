@@ -422,6 +422,22 @@ let ff_state = map_new ();
 // parser modes: "nobrace" suppresses brace-block attachment (lambda
 // parameter defaults — the { after them is the lambda body).
 let parser_flags = map_new ();
+// parse-time gensym counter for `rescue E => <complex lvalue>`: the exception
+// binds to a fresh temp, then a synthesized assignment writes it to the target.
+let resc_ctr = map_new ();
+let fresh_resc = fn () ->
+  let n = (if map_has resc_ctr "n" then (match map_get resc_ctr "n" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set resc_ctr "n" (VInt (n + 1)) in
+  "__resc~" ++ str_of_int n;
+// a non-constant rescue class expression (`rescue rescuer`, `rescue -> {..}.call`)
+// is stashed here and referenced from the class list by a "@rexpr~N" sentinel;
+// it is evaluated at match time (so `rescue <expr>` runs only when needed).
+let resc_exprs = map_new ();
+let resc_reg = fn (e: Expr) ->
+  let n = (if map_has resc_ctr "e" then (match map_get resc_ctr "e" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set resc_ctr "e" (VInt (n + 1)) in
+  let _ = map_set resc_exprs (str_of_int n) e in
+  "@rexpr~" ++ str_of_int n;
 // require bookkeeping: "dir" = the current file's directory (require_relative
 // resolves against it); loaded_files dedups double-loads.
 let load_ctx = map_new ();
@@ -3307,13 +3323,13 @@ and parse_class = fn toks ->
          // Only `self` keeps the enclosing-class (named) path.
          if (if str_eq slf "self" then false else true) then
            let (recv, r2) = parse_expr r0 in
-           let (body, r5) = parse_stmts r2 Nil in (SSingletonE (recv, body), expect_kw r5 "end")
+           let (body, r5) = parse_class_body_tail r2 in (SSingletonE (recv, body), expect_kw r5 "end")
          else
-           let (body, r5) = parse_stmts r1 Nil in (SClass ("<<singleton", slf, body), expect_kw r5 "end")
+           let (body, r5) = parse_class_body_tail r1 in (SClass ("<<singleton", slf, body), expect_kw r5 "end")
        // `class << <expr>` — a paren-expr / literal / ivar receiver.
        | _ ->
          let (recv, r2) = parse_expr r0 in
-         let (body, r5) = parse_stmts r2 Nil in (SSingletonE (recv, body), expect_kw r5 "end"))
+         let (body, r5) = parse_class_body_tail r2 in (SSingletonE (recv, body), expect_kw r5 "end"))
     else if str_eq sc0 "::" then
       // `class ::C` — a top-level constant regardless of nesting. Keep the `::`
       // prefix so exec treats it as top-level (not qualified under the encloser).
@@ -3378,47 +3394,72 @@ and parse_rescues = fn toks -> fn acc ->
   match toks with
   | Cons (TId id, r) ->
     if str_eq id "rescue" then
-      let (classes, var, r2) = parse_rescue_head r in
+      let (classes, var, prefix, r2) = parse_rescue_head r in
       let (handler, r3) = parse_stmts r2 Nil in
+      // a complex capture target injects an assignment at the handler's top.
+      let handler = (match prefix with Nil -> handler | Cons (s, _) -> Cons (s, handler)) in
       parse_rescues r3 (Cons ((classes, var, handler), acc))
     else (rev_app acc Nil, toks)
   | _ -> (rev_app acc Nil, toks)
 
-// `rescue [C1, C2] [=> var]` up to the newline.
+// `rescue [C1, C2] [=> target]` up to the newline. A bare local target keeps
+// the string-var fast path; a complex lvalue (@ivar, obj.setter, obj&.setter,
+// arr[i], C::X) binds the exception to a temp and returns an assignment to
+// splice at the top of the handler body.
 and parse_rescue_head = fn toks ->
   let (classes, r) = parse_rescue_classes toks Nil in
-  let (var, r2) =
+  let (var, prefix, r2) =
     (match r with
      | Cons (TP p, r3) ->
        if str_eq p "=>" then
-         (match r3 with Cons (TId v, r4) -> (v, r4) | _ -> fail "mere-ruby: rescue => needs a variable")
-       else ("", r)
-     | _ -> ("", r)) in
-  (classes, var, expect_end r2)
+         (let (tgt, r4) = parse_x_target1 r3 in
+          (match tgt with
+           | EVar nm -> (nm, Nil, r4)
+           | _ -> let tmp = fresh_resc () in (tmp, Cons (SMultiAssignX (Cons (tgt, Nil), Cons (EVar tmp, Nil)), Nil), r4)))
+       else ("", Nil, r)
+     | _ -> ("", Nil, r)) in
+  (classes, var, prefix, expect_end r2)
 
 and parse_rescue_classes = fn toks -> fn (acc: str list) ->
   match toks with
   | Cons (TId c, r) ->
+    // a bare constant matches by name (cheap path); a lowercase identifier is
+    // a runtime expression (`rescue rescuer`).
     if is_cap c then
       let (full, r0) = scoped_name c r in
       (match r0 with
        | Cons (TP p, r2) ->
          if str_eq p "," then parse_rescue_classes r2 (Cons (full, acc))
+         // a constant that continues (`.foo` / `::` handled by scoped_name) is
+         // just the constant here; `=>` / newline end the class list.
          else (rev_app (Cons (full, acc)) Nil, r0)
        | _ -> (rev_app (Cons (full, acc)) Nil, r0))
-    else (rev_app acc Nil, toks)
-  // `rescue *x` — splat a runtime array of exception classes (stored as "*x"
-  // and expanded when the rescue is matched).
+    else parse_rescue_expr_item toks acc false
+  // `rescue *x` / `rescue *(expr)` — splat a runtime array of exception classes.
   | Cons (TP star, r) ->
     if str_eq star "*" then
       (match r with
        | Cons (TId v, r2) ->
-         (match r2 with
+         if is_cap v || (if str_len v > 0 then (if str_eq (char_at v 0) "@" then true else str_eq (char_at v 0) "$") else false)
+         then parse_rescue_expr_item r acc true  // `*Const` / `*@x` as an expr
+         else (match r2 with
           | Cons (TP p, r3) -> if str_eq p "," then parse_rescue_classes r3 (Cons ("*" ++ v, acc)) else (rev_app (Cons ("*" ++ v, acc)) Nil, r2)
           | _ -> (rev_app (Cons ("*" ++ v, acc)) Nil, r2))
-       | _ -> (rev_app acc Nil, toks))
+       | _ -> parse_rescue_expr_item r acc true)
+    // a parenthesized / lambda expression class (`rescue (expr)` / `rescue -> {..}`);
+    // any other punctuation (`=>`, newline, `then`, `;`) ends the class list.
+    else if is_lparen star || str_eq star "->" then parse_rescue_expr_item toks acc false
     else (rev_app acc Nil, toks)
   | _ -> (rev_app acc Nil, toks)
+
+// parse one non-constant rescue class as a runtime expression, register it,
+// and continue with the "@rexpr~N" sentinel (splat prefixes it with "*").
+and parse_rescue_expr_item = fn toks -> fn (acc: str list) -> fn (splat: bool) ->
+  let (e, r) = parse_bin toks 1 in
+  let sentinel = (if splat then "*" else "") ++ resc_reg e in
+  (match r with
+   | Cons (TP p, r2) -> if str_eq p "," then parse_rescue_classes r2 (Cons (sentinel, acc)) else (rev_app (Cons (sentinel, acc)) Nil, r)
+   | _ -> (rev_app (Cons (sentinel, acc)) Nil, r))
 
 and parse_opt_kw_block = fn toks -> fn (kw: str) ->
   match toks with
@@ -6851,23 +6892,34 @@ and exc_is_a = fn world -> fn (ecls: str) -> fn (target: str) ->
 and class_names_of = fn (xs: Val list) ->
   match xs with Nil -> Nil | Cons (VClass c, t) -> Cons (c, class_names_of t) | Cons (_, t) -> class_names_of t
 
-// expand any "*var" entry (from rescue *var) into the array's class names.
-and expand_rescue_classes = fn env -> fn (classes: str list) ->
+// expand "*var" (rescue *var) into the array's class names, and "@rexpr~N"
+// (a non-constant class expression) by evaluating the stashed expression at
+// match time. A "*"-prefixed sentinel splats the evaluated array.
+and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str list) ->
   match classes with
   | Nil -> Nil
   | Cons (c, rest) ->
     if str_len c > 0 && str_eq (char_at c 0) "*" then
-      let vn = substring c 1 (str_len c) in
-      let arr = if map_has env vn then map_get env vn else VNil in
-      (match arr with VArr id -> list_append_str (class_names_of (deref id)) (expand_rescue_classes env rest) | _ -> expand_rescue_classes env rest)
-    else Cons (c, expand_rescue_classes env rest)
+      let inner = substring c 1 (str_len c) in
+      // "*@rexpr~N": splat the evaluated expression; "*var": splat the local.
+      let arr = if str_len inner > 0 && str_eq (char_at inner 0) "@" && str_contains inner "rexpr~"
+                then eval_e env world blk (map_get resc_exprs (substring inner 7 (str_len inner)))
+                else (if map_has env inner then map_get env inner else VNil) in
+      (match arr with VArr id -> list_append_str (class_names_of (deref id)) (expand_rescue_classes env world blk rest) | _ -> expand_rescue_classes env world blk rest)
+    else if str_len c > 6 && str_eq (substring c 0 7) "@rexpr~" then
+      // a non-constant class expression: evaluate; a Class/Module contributes
+      // its name, anything else is a TypeError (class or module required).
+      (match eval_e env world blk (map_get resc_exprs (substring c 7 (str_len c))) with
+       | VClass cn -> Cons (cn, expand_rescue_classes env world blk rest)
+       | _ -> (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in Nil))
+    else Cons (c, expand_rescue_classes env world blk rest)
 
 and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
   match rescues with
   | Nil -> re_raise world exc
   | Cons (rc, rest) ->
     let (classes0, var, handler) = rc in
-    let classes = expand_rescue_classes env classes0 in
+    let classes = expand_rescue_classes env world blk classes0 in
     if rescue_matches world exc classes then
       let _ = if str_eq var "" then () else map_set env var exc in
       // $! holds the exception being handled (so a bare `raise` re-raises it);
