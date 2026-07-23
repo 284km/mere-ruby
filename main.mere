@@ -332,6 +332,10 @@ let alias_origin = map_new ();
 // the original name an alias was made from, keyed "Cls#newname" -> old name,
 // so a `super` inside the aliased method searches for the SOURCE method name.
 let alias_srcname = map_new ();
+// alias_method whose SOURCE is a builtin (e.g. `alias_method :plus, :+` on a
+// String subclass): keyed "Cls#newname" -> builtin op name. Dispatched by
+// delegating to prim_method on the receiver, since the source has no AST body.
+let builtin_alias = map_new ();
 // hash handles that originate from keyword-argument syntax (`key: v` / `**h`)
 // at a call site, as opposed to a positional `{...}` literal or hash variable.
 // Ruby 3.0 keeps these separate: only a kwarg-origin trailing hash binds to a
@@ -6257,10 +6261,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // through the receiver dispatcher so builtins (module_eval/class_eval/
          // new/...) and Module/Class fallbacks all apply, not just own methods.
          invoke_with_block env world blk (VClass c) name args newblk
+       // implicit self-send on a primitive: honour a subclass tag (own method
+       // or alias-to-builtin) before falling back to the base primitive class.
        | other ->
-         let pcls = class_name other in
-         if has_meth world pcls name then invoke world newblk other pcls name args
-         else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'"))
+         let hk = hng_key other in
+         let tagged = if str_eq hk "" then false else map_has hng_store hk in
+         let tagcls = if tagged then map_get hng_store hk else "" in
+         if tagged && has_meth world tagcls name then invoke world newblk other tagcls name args
+         else if tagged && (if str_eq (blt_alias_lookup world (ancestors_of world tagcls) name) "" then false else true) then
+           (let src = blt_alias_lookup world (ancestors_of world tagcls) name in
+            match args with
+            | Cons (arg, _) -> if is_binary_op_name src then arith_bin src other arg else prim_method other src args
+            | Nil -> prim_method other src args)
+         else
+           let pcls = class_name other in
+           if has_meth world pcls name then invoke world newblk other pcls name args
+           else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'"))
     else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
   // recv.name op= rhs — evaluate recv once (bound to a temp), then read/op/
   // write the attribute through the normal method dispatch.
@@ -6445,7 +6461,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
          invoke world noblk va0 ("(sng:" ++ c ++ ")") op (Cons (eval_e env world blk b, Nil))
        else eval_bin_prim env world blk op va0 b
-     | _ -> eval_bin_prim env world blk op va0 b)
+     // a primitive tagged as a subclass instance (String/Array/Hash subclass)
+     // whose subclass defines the operator dispatches to that override.
+     | _ ->
+       let hk = hng_key va0 in
+       if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) op then
+         let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+         invoke world noblk va0 (map_get hng_store hk) op (Cons (eval_e env world blk b, Nil))
+       else eval_bin_prim env world blk op va0 b)
 
 and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val) -> fn (b: Expr) ->
     if str_eq op "==" then VBool (rb_eq va0 (eval_e env world blk b))
@@ -7469,7 +7492,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   match recv with
   | VArr id -> let xs = deref id in
     if str_eq name "each" then iter_each_result (arr_each world encl theblk xs) recv
-    else if str_eq name "map" then iter_result (arr_map world encl theblk xs Nil) recv
+    else if str_eq name "map" || str_eq name "collect" then iter_result (arr_map world encl theblk xs Nil) recv
     else if str_eq name "select" then iter_result (arr_filter world encl theblk xs Nil true) recv
     else if str_eq name "reject" then iter_result (arr_filter world encl theblk xs Nil false) recv
     else if str_eq name "each_with_index" then iter_each_result (arr_each_idx world encl theblk xs 0) recv
@@ -7518,7 +7541,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   | VRange (lo, hi, excl) ->
     let last = if excl then hi - 1 else hi in
     if str_eq name "each" then iter_each_result (range_each world encl theblk lo last) recv
-    else if str_eq name "map" then iter_result (range_map world encl theblk lo last Nil) recv
+    else if str_eq name "map" || str_eq name "collect" then iter_result (range_map world encl theblk lo last Nil) recv
     // other Enumerable methods operate on the materialised elements.
     else builtin_iter world encl theblk (arr_new (range_to_a lo last)) name args
   | VInt n ->
@@ -7831,12 +7854,37 @@ and body_defines = fn (body: Stmt list) ->
     (match s with SDef (_, _, _, _) -> true | SClass (_, _, _) -> true | SClassE (_, _, _) -> true | SAssign (n, _) -> is_upper_first n | _ -> false)
     || body_defines rest
 
+// a builtin binary operator that arith_bin evaluates (used to route an
+// alias-to-builtin like `alias_method :plus, :+` to arith_bin).
+and is_binary_op_name = fn (s: str) ->
+  str_eq s "+" || str_eq s "-" || str_eq s "*" || str_eq s "/" || str_eq s "%" ||
+  str_eq s "**" || str_eq s "<<" || str_eq s ">>" || str_eq s "&" || str_eq s "|" ||
+  str_eq s "^" || str_eq s "<" || str_eq s ">" || str_eq s "<=" || str_eq s ">=" ||
+  str_eq s "<=>"
+
+// resolve an alias-to-builtin along cls's ancestor chain: returns the builtin
+// source name (e.g. "+") for `name`, or "" if none.
+and blt_alias_lookup = fn world -> fn (anc: str list) -> fn (name: str) ->
+  match anc with
+  | Nil -> ""
+  | Cons (a, rest) ->
+    if map_has builtin_alias (a ++ "#" ++ name) then map_get builtin_alias (a ++ "#" ++ name)
+    else blt_alias_lookup world rest name
+
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // a singleton method defined on this exact String/Array/Hash wins.
   let hk = hng_key recv in
   if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) name then
     invoke world noblk recv (map_get hng_store hk) name args
+  // an alias-to-builtin (`alias_method :plus, :+`) delegates under the source
+  // builtin name: a binary operator goes through arith_bin (prim_method has no
+  // "+"), everything else through prim_method.
+  else if (if str_eq hk "" then false else true) && map_has hng_store hk && (if str_eq (blt_alias_lookup world (ancestors_of world (map_get hng_store hk)) name) "" then false else true) then
+    (let src = blt_alias_lookup world (ancestors_of world (map_get hng_store hk)) name in
+     match args with
+     | Cons (arg, _) -> if is_binary_op_name src then arith_bin src recv arg else prim_method recv src args
+     | Nil -> prim_method recv src args)
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
   else if str_eq name "extend" && (match recv with VClass _ -> true | VObj _ -> true | _ -> false) then
@@ -7875,6 +7923,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       // with the subclass so its own methods dispatch (super reaches Array).
       (let v = array_new_args args in
        let _ = (match v with VArr _ -> map_set hng_store (hng_key v) c | _ -> ()) in v)
+    // a subclass of String with no own #initialize is backed by real string
+    // storage and tagged so its own methods dispatch (super reaches String).
+    else if str_eq name "new" && (if str_eq c "String" then false else obj_is_a world c "String") && (if has_meth world c "initialize" then false else true) then
+      (let v = (match args with Cons (VStr h, _) -> mkstr (sget h) | _ -> mkstr "") in
+       let _ = (match v with VStr _ -> map_set hng_store (hng_key v) c | _ -> ()) in v)
     // Hash[k => v, ...] / Hash[{...}] and Array[...] constructor syntax.
     else if str_eq c "Hash" && str_eq name "[]" then
       (match args with Cons (VHsh h, _) -> mkhash (hderef h) | _ -> mkhash Nil)
@@ -8100,7 +8153,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                    (let _ = map_set methsA (c ++ "#" ++ n1) (map_get methsA (origin ++ "#" ++ n2)) in
                     let _ = if str_eq origin c then () else map_set alias_origin (c ++ "#" ++ n1) origin in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
-                 else () in
+                 // source is a builtin (no AST body) — remember it delegates to
+                 // prim_method under the builtin name (e.g. String#+).
+                 else map_set builtin_alias (c ++ "#" ++ n1) n2 in
          VSym n1
        | _ -> VNil)
     // GC.start / GC.enable / GC.disable / GC.stress= are no-ops.
@@ -9756,6 +9811,24 @@ and undef_call_exc_x = fn world -> fn (name: str) -> fn (args: Val list) -> fn (
            else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
   | _ -> raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
 
+// implicit-self send when self is a primitive: honour a subclass tag (its own
+// method, then an alias-to-builtin) before the base primitive class + prims.
+and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let hk = hng_key other in
+  let tagged = if str_eq hk "" then false else map_has hng_store hk in
+  let tagcls = if tagged then map_get hng_store hk else "" in
+  if tagged && has_meth world tagcls name then invoke world noblk other tagcls name args
+  else if tagged && (if str_eq (blt_alias_lookup world (ancestors_of world tagcls) name) "" then false else true) then
+    (let src = blt_alias_lookup world (ancestors_of world tagcls) name in
+     match args with
+     | Cons (arg, _) -> if is_binary_op_name src then arith_bin src other arg else prim_method other src args
+     | Nil -> prim_method other src args)
+  else
+    let cls = class_name other in
+    if has_meth world cls name then invoke world noblk other cls name args
+    else prim_method other name args
+
 and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -9784,10 +9857,7 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        // through the receiver dispatcher so builtins like module_eval/class_eval
        // apply; invoke_val_c raises NoMethodError itself if truly undefined.
        else invoke_val_c env world noblk (VClass c) name args false
-     | other ->
-       let cls = class_name other in
-       if has_meth world cls name then invoke world noblk other cls name args
-       else prim_method other name args)
+     | other -> prim_self_send env world other name args)
   else undef_call_exc_x world name args explicit
 
 // implicit-self method call (a method calling a sibling method).
@@ -9814,9 +9884,7 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
      | other ->
        // primitive self (a reopened built-in class's method body): user
        // methods first, then the built-in prims (implicit-self upcase etc.).
-       let cls = class_name other in
-       if has_meth world cls name then invoke world noblk other cls name args
-       else prim_method other name args)
+       prim_self_send env world other name args)
   else undef_call_exc world name args
 
 // top-level method call: fresh frame, no self; blk is installed for yield.
