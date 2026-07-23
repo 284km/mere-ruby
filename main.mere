@@ -300,6 +300,11 @@ let enc_name = map_new () in
 // (has, params, body, captured env) — the env is a Map, so like arrays a
 // proc lives behind an int handle rather than inside the Val variant.
 let proc_store = map_new ();
+// proc id -> the block in scope where the proc/lambda was created, so that
+// `yield` inside a proc body resolves to the DEFINING method's block (Ruby
+// semantics), not the block of whatever method later runs the proc.
+let proc_yblk = map_new ();
+let yblk_marker = "__yblk__~";
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
 // a sentinel prepended to a block's params when a lambda is installed as a
@@ -5787,6 +5792,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ELambda (ps, body) ->
     let id = map_len proc_store in
     let _ = map_set proc_store (str_of_int id) (true, ps, body, env) in
+    let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
     let _ = map_set lambda_ids (str_of_int id) VNil in
     VProc id
   | EStmt s ->
@@ -6054,6 +6060,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "proc" || str_eq name "lambda" then
       (let id = map_len proc_store in
        let _ = map_set proc_store (str_of_int id) (true, bp, bb, env) in
+       let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
        let _ = if str_eq name "lambda" then map_set lambda_ids (str_of_int id) VNil else () in
        VProc id)
     // define_method(:name) { ... } as a genuine method call (self is a class):
@@ -6860,7 +6867,16 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
   // clear it here to keep it from leaking into a later method's frame.
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
-  let (has, params0, body, cenv) = theblk in
+  let (has, params00, body, cenv) = theblk in
+  // a proc/lambda that captured its defining method's block carries a yblk
+  // marker: strip it and use that captured block as `encl` so `yield` inside
+  // the proc body resolves to the defining method's block, not the caller's.
+  let (encl, params0) = (match params00 with
+    | Cons (m, rest) ->
+      if str_len m > 9 && str_eq (substring m 0 9) yblk_marker
+      then (map_get proc_yblk (substring m 9 (str_len m)), rest)
+      else (encl, params00)
+    | _ -> (encl, params00)) in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
   let is_lam = (match params0 with Cons (m, _) -> str_eq m lambda_blk_marker | _ -> false) in
@@ -8008,7 +8024,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
              if str_eq k "return" then v else flow_throw k v
            else fail "mere-ruby: (ruby exception raised)"
          | other -> flow_value other)
-      else flow_value (run_block world noblk theblk args)
+      else flow_value (run_block world noblk (proc_as_block pid) args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
     else if str_eq name "arity" then
@@ -8173,8 +8189,13 @@ and lambda_arity_check = fn world -> fn (ps: str list) -> fn (body: Stmt list) -
 // prepended to its params so run_block enforces strict arity.
 and proc_as_block = fn (pid: int) ->
   let t = map_get proc_store (str_of_int pid) in
-  if map_has lambda_ids (str_of_int pid) then
-    (match t with (h, ps, b, e) -> (h, Cons (lambda_blk_marker, ps), b, e))
+  // a lambda enforces strict arity; a proc that captured a defining-method
+  // block carries a yblk marker so run_block reinstates that block for `yield`.
+  let t = (if map_has lambda_ids (str_of_int pid) then
+             (match t with (h, ps, b, e) -> (h, Cons (lambda_blk_marker, ps), b, e))
+           else t) in
+  if map_has proc_yblk (str_of_int pid) then
+    (match t with (h, ps, b, e) -> (h, Cons (yblk_marker ++ str_of_int pid, ps), b, e))
   else t
 
 // &proc block-pass arguments.
@@ -8258,7 +8279,9 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // Proc.new { } captures the block; Class.new { } makes an anonymous
        // class whose body is the block; class_eval reopens the class.
        if str_eq c "Proc" && str_eq name "new" then
-         (let id = map_len proc_store in let _ = map_set proc_store (str_of_int id) newblk in VProc id)
+         (let id = map_len proc_store in let _ = map_set proc_store (str_of_int id) newblk in
+          let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
+          VProc id)
        // Thread.new { } runs the block synchronously but with a FRESH catch
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
