@@ -417,6 +417,9 @@ let insp_seen = map_new ();
 // nesting depth of active catch(:tag) blocks (throw without any catch
 // raises UncaughtThrowError immediately).
 let catch_depth = map_new ();
+// true while running directly inside a Thread.new block (reset on entering a
+// method, which is a return boundary): a bare `return` there is a LocalJumpError.
+let thread_flag = map_new ();
 // expression-position flow (break/next/redo/return inside an expression)
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
@@ -8290,7 +8293,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       if str_eq name "to_a" || str_eq name "entries" then coll else prim_method coll name args
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
     // Thread#join / #value: the block already ran synchronously.
-    else if str_eq cls "Thread" && (str_eq name "join" || str_eq name "value") then recv
+    else if str_eq cls "Thread" && str_eq name "value" then
+      (match recv with
+       | VObj tid -> if map_has ivars (str_of_int tid ++ "@__tval") then map_get ivars (str_of_int tid ++ "@__tval") else recv
+       | _ -> recv)
+    else if str_eq cls "Thread" && str_eq name "join" then recv
     // Comparable#clamp / #between? on a user object with <=>.
     else if (str_eq name "clamp" || str_eq name "between?") && has_meth world cls "<=>" then
       (if str_eq name "between?" then (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
@@ -8700,11 +8707,17 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if str_eq c "Thread" && str_eq name "new" then
          (let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
           let _ = map_set catch_depth "n" (VInt 0) in
-          let _ = flow_value (run_block world blk newblk Nil) in
+          // a bare `return` inside the block is a LocalJumpError, not a return.
+          let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
+          let _ = map_set thread_flag "n" (VBool true) in
+          let tval = flow_value (run_block world blk newblk Nil) in
+          let _ = map_set thread_flag "n" savedtf in
           let _ = map_set catch_depth "n" saved in
           let (m3, s3, ocls3, iv3) = world in
           let tid = map_len ocls3 in
           let _ = map_set ocls3 (str_of_int tid) "Thread" in
+          // Thread#value/#join returns the block's value (see the value handler).
+          let _ = map_set iv3 (str_of_int tid ++ "@__tval") tval in
           VObj tid)
        else if str_eq c "Class" && str_eq name "new" then
          (let (meths2, sup2, ocls2, iv2) = world in
@@ -10206,7 +10219,12 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // it; once the body has unwound to here (any outcome) the frame is done.
   let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> str_of_int t | _ -> "") else "") in
   let _ = if str_eq fidk "" then () else map_set live_frames fidk (VBool true) in
+  // a method call is a `return` boundary: a return inside the body returns from
+  // this method, even when the call happens inside a Thread.new block.
+  let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
+  let _ = map_set thread_flag "n" (VBool false) in
   let f = try_or (fn (u: unit) -> run_stmts frame world blk body) (FRaise VNil) in
+  let _ = map_set thread_flag "n" savedtf in
   let _ = if str_eq fidk "" then () else map_delete live_frames fidk in
   match f with
   | FRaise _ ->
@@ -11534,7 +11552,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           | FRaise v -> FRaise v
           | _ -> FNext (VBool true))
      | _ -> FNext VNil)
-  | SReturn e -> FReturn (eval_e env world blk e)
+  | SReturn e ->
+    let v = eval_e env world blk e in
+    // a bare `return` directly inside a Thread.new block cannot return across
+    // the thread boundary — it raises LocalJumpError (catchable in the block).
+    if (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false)
+    then (let _ = raise_exc world "LocalJumpError" "unexpected return" in FRaise VNil)
+    else FReturn v
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
   | SBegin (body, rescues, els, ens) -> run_begin env world blk body rescues els ens
