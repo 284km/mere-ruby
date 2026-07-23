@@ -366,6 +366,17 @@ let fresh_anon = fn (prefix: str) ->
   let n = (if map_has struct_ctr "n" then (match map_get struct_ctr "n" with VInt k -> k | _ -> 0) else 0) in
   let _ = map_set struct_ctr "n" (VInt (n + 1)) in
   prefix ++ str_of_int n;
+// break-through-yield home tracking: each method invocation gets a unique
+// frame id; a block captured by a `&blk` param remembers the frame it was
+// passed to (its "home"), so a `break` inside it — even after the block has
+// been delegated down through other methods — unwinds to that home method.
+let next_fid = fn () ->
+  let n = (if map_has struct_ctr "f" then (match map_get struct_ctr "f" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set struct_ctr "f" (VInt (n + 1)) in
+  n + 1;
+let proc_home = map_new ();     // str(proc id) -> VInt home-frame-id
+let pending_home = map_new ();  // single slot: home fid of a &proc being passed as a block
+let live_frames = map_new ();   // str(fid) -> VBool true while that method frame is on the stack
 let is_anon_cls = fn (c: str) ->
   (str_len c >= 10 && str_eq (substring c 0 10) "AnonClass_") || (str_len c >= 11 && str_eq (substring c 0 11) "AnonModule_");
 // name_anon (records a constant name for an anonymous class/module the first
@@ -5739,11 +5750,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (has, bparams, bbody, cenv) = blk in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     // `break` inside the yielded block terminates the method the block was
-    // passed to (i.e. this yielding method), making its call return the break
-    // value. Re-signal it as a return so it unwinds to the nearest method
-    // boundary (running any intervening ensure blocks).
+    // passed to. For a literal block that is this method; for a block forwarded
+    // here via `&proc` it is the block's home frame (recorded in __blk_home).
+    // Re-signal as a targeted break-return so it unwinds to that frame's method
+    // boundary (running any intervening ensure blocks). If the home method has
+    // already returned, that is a LocalJumpError.
     if has then (match run_block world noblk blk args with
-                 | FBreak v -> flow_throw "return" v
+                 | FBreak v ->
+                     let target = (if map_has env "__blk_home" then map_get env "__blk_home"
+                                   else if map_has env "__fid" then map_get env "__fid" else VInt 0) in
+                     let tk = (match target with VInt t -> str_of_int t | _ -> "") in
+                     if str_eq tk "" || (if map_has live_frames tk then false else true)
+                     then raise_exc world "LocalJumpError" "break from proc-closure"
+                     else flow_throw_breakret (match target with VInt t -> t | _ -> 0) v
                  | other -> flow_value other)
     else raise_exc world "LocalJumpError" "no block given (yield)"
   | ERaise arges ->
@@ -6737,6 +6756,10 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
 // `encl` as the active block so a yield inside it reaches the enclosing
 // method's block.
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
+  // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
+  // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
+  // clear it here to keep it from leaking into a later method's frame.
+  let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
   let (has, params0, body, cenv) = theblk in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
@@ -7973,7 +7996,10 @@ and proc_as_block = fn (pid: int) ->
 // converted eagerly via #to_proc (so its side effects run at the call site).
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
-  | VProc pid -> proc_as_block pid
+  | VProc pid ->
+    // forward the proc's home frame so the callee's `break` targets it.
+    let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
+    proc_as_block pid
   | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
   | VSym s -> (true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil), env)
   | _ ->
@@ -9219,6 +9245,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
   (match map_get meths name with
    | Meth (params, defaults, body) ->
      let frame = map_new () in
+     let _ = map_set frame "__fid" (VInt (next_fid ())) in
      // top-level methods run with main as self (their @ivars live there).
      let _ = map_set frame "self" (if map_has env "self" then map_get env "self" else VMain) in
      let _ = map_set frame "__cref" (mkstr (if map_has meth_cref name then map_get meth_cref name else "")) in
@@ -9357,6 +9384,7 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
                       then (match map_get dm_captured (defcls ++ "#" ++ name) with VProc pid -> map_get proc_store (str_of_int pid) | _ -> blk)
                       else blk) in
     let frame = map_new () in
+    let _ = map_set frame "__fid" (VInt (next_fid ())) in
     let _ = map_set frame "self" recv in
     // hidden bindings so `super` can resume lookup above the defining class.
     let _ = map_set frame "__defcls" (VClass defcls) in
@@ -9410,7 +9438,12 @@ and struct_build = fn world -> fn (args: Val list) ->
 // run a method body, converting a `return` flow signal into the method's
 // return value (any other signal or a real exception keeps unwinding).
 and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
+  // mark this frame live so a break targeting it (via a block's home) can find
+  // it; once the body has unwound to here (any outcome) the frame is done.
+  let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> str_of_int t | _ -> "") else "") in
+  let _ = if str_eq fidk "" then () else map_set live_frames fidk (VBool true) in
   let f = try_or (fn (u: unit) -> run_stmts frame world blk body) (FRaise VNil) in
+  let _ = if str_eq fidk "" then () else map_delete live_frames fidk in
   match f with
   | FRaise _ ->
     if map_has flow_sig "k" then
@@ -9418,6 +9451,16 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
       let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
       let _ = map_delete flow_sig "k" in
       if str_eq k "return" then FNext v
+      else if str_eq k "breakret" then
+        // a break unwinding to its block's home frame: consume it here iff this
+        // is that frame, otherwise keep propagating to the outer method.
+        let target = (if map_has flow_sig "fid" then (match map_get flow_sig "fid" with VInt t -> t | _ -> 0) else 0) in
+        let myfid = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> t | _ -> 0) else 0) in
+        if target == myfid then (let _ = map_delete flow_sig "fid" in FNext v)
+        else (let _ = map_set flow_sig "k" (mkstr "breakret") in
+              let _ = map_set flow_sig "fid" (VInt target) in
+              let _ = map_set flow_sig "v" v in
+              fail "mere-ruby: (flow signal)")
       else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       else flow_rethrow k v
     else fail "mere-ruby: (ruby exception raised)"
@@ -9660,15 +9703,23 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
     let _ = map_set frame nm v in bind_kw_params frame world blk rest defaults kwhash
 
 and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params0: str list) -> fn (defaults: (str * Expr) list) -> fn (args0: Val list) ->
+  // a block forwarded as `&proc` carries its home frame in pending_home;
+  // record it on this frame so a `break` in that block unwinds to the home.
+  let _ = if map_has pending_home "v" then
+            (let _ = map_set frame "__blk_home" (map_get pending_home "v") in map_delete pending_home "v")
+          else () in
   let bname = block_param_name params0 in
   let params1 = strip_block_params params0 in
-  // &blk captures the block as a real proc (storable, re-passable).
+  // &blk captures the block as a real proc (storable, re-passable). The proc's
+  // home is this method's frame (the block was passed here as a literal), or
+  // the inherited home if this method's block was itself a forwarded proc.
   let _ = if str_eq bname "" then ()
           else let (has, _, _, _) = blk in
                map_set frame bname
                  (if has then
                     (let pid = map_len proc_store in
                      let _ = map_set proc_store (str_of_int pid) blk in
+                     let _ = map_set proc_home (str_of_int pid) (if map_has frame "__blk_home" then map_get frame "__blk_home" else (if map_has frame "__fid" then map_get frame "__fid" else VInt 0)) in
                      VProc pid)
                   else VNil) in
   // `**kw` (keyword-splat) and `key:` parameters share ONE trailing
@@ -10951,6 +11002,14 @@ and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
 
 and flow_rethrow = fn (k: str) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr k) in
+  let _ = map_set flow_sig "v" v in
+  fail "mere-ruby: (flow signal)"
+
+// a break unwinding to a specific method frame (its block's home). The nearest
+// method_body_flow whose frame id matches returns v; others keep propagating.
+and flow_throw_breakret = fn (fid: int) -> fn (v: Val) ->
+  let _ = map_set flow_sig "k" (mkstr "breakret") in
+  let _ = map_set flow_sig "fid" (VInt fid) in
   let _ = map_set flow_sig "v" v in
   fail "mere-ruby: (flow signal)"
 
