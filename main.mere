@@ -2153,13 +2153,18 @@ and parse_primary = fn toks ->
            // defined?(x = 2) and friends answer "assignment" unevaluated.
            if defined_assignish r2 then
              let (_, r3) = parse_stmt r2 in (EStrL "assignment", expect r3 ")")
+           // defined?(if.../while.../case... end) answers "expression".
+           else if defined_compound r2 then
+             let (_, r3) = parse_stmt r2 in (EStrL "expression", expect r3 ")")
            else
            // defined?(puts) — a keyword-named method probes as a plain call.
+           // parse the inner expression at the lowest precedence so the word
+           // operators `and`/`or`/`not` are allowed (`defined?(a and b)`).
            (match r2 with
             | Cons (TId w, Cons (TP rp, r4)) ->
               if str_eq rp ")" then (EDefined (EVar w), r4)
-              else let (e, r3) = parse_expr r2 in (EDefined e, expect r3 ")")
-            | _ -> let (e, r3) = parse_expr r2 in (EDefined e, expect r3 ")"))
+              else let (e, r3) = parse_andor r2 in (EDefined e, expect r3 ")")
+            | _ -> let (e, r3) = parse_andor r2 in (EDefined e, expect r3 ")"))
          // `defined? a = 10` (no parens) — an assignment is unevaluated.
          else if defined_assignish r then
            let (_, r3) = parse_stmt r in (EStrL "assignment", r3)
@@ -3483,6 +3488,16 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
 // state site here (parse time), reaching through !/&&/|| combinations.
 // scan (depth-aware) for a top-level assignment operator before the
 // closing paren — defined?(x = 2) / defined?(@x ||= 1) forms.
+// `defined?(<compound statement>)` — if/unless/case/while/until/for/begin —
+// always answers "expression" in Ruby; parse it as a statement (correctly
+// consuming to the matching `end`) rather than as an expression.
+and defined_compound = fn toks ->
+  match toks with
+  | Cons (TId w, _) ->
+    str_eq w "if" || str_eq w "unless" || str_eq w "case" || str_eq w "while" ||
+    str_eq w "until" || str_eq w "for" || str_eq w "begin"
+  | _ -> false
+
 and defined_assignish = fn toks -> defined_assign_go toks 0
 
 and defined_assign_go = fn toks -> fn (depth: int) ->
@@ -3667,7 +3682,12 @@ and parse_for_vars2 = fn (t: str) -> fn toks -> fn (acc: str list) ->
   | _ -> fail "mere-ruby: expected in after for"
 
 and parse_while = fn toks -> fn (negate: bool) ->
+  // the condition must not swallow the loop's `do` as a block argument
+  // (`while x do y end` = while x; then y; not x { y }).
+  let had = map_has parser_flags "nodo" in
+  let _ = map_set parser_flags "nodo" VNil in
   let (cond0, r) = parse_andor toks in
+  let _ = if had then () else map_delete parser_flags "nodo" in
   let cond = if negate then EUn ("!", cond0) else cond0 in
   let (body, r2) = parse_stmts (skip_then r) Nil in
   (SWhile (cond, body), expect_kw r2 "end")
@@ -5773,7 +5793,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | EMethod (recv, name, _) ->
        let (meths, sup, ocls, ivars) = world in
        // evaluating the receiver may raise (undefined var); defined? is nil.
-       let rv = try_or (fn (u: unit) -> eval_e env world blk recv) (VSym "__mere_defined_fail__") in
+       // A throw/break/next in the receiver, however, escapes normally.
+       let rv = defined_eval_recv env world blk recv in
        if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then VNil else
        (match rv with
         | VObj id ->
@@ -5788,7 +5809,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | EScopedRead (recv, cn) ->
        // defined?(recv::Const): the receiver may raise or be a non-class
        // (e.g. `a::B` where a() returns nil) — then the const is undefined.
-       let rv = try_or (fn (u: unit) -> eval_e env world blk recv) (VSym "__mere_defined_fail__") in
+       let rv = defined_eval_recv env world blk recv in
        if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then VNil
        else (match rv with
              | VClass c -> if map_has consts (c ++ "::" ++ cn) then mkstr "constant" else VNil
@@ -11562,6 +11583,18 @@ and flow_rethrow = fn (k: str) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr k) in
   let _ = map_set flow_sig "v" v in
   fail "mere-ruby: (flow signal)"
+
+// evaluate a defined? receiver, returning a sentinel VSym on a genuine
+// exception raise (so defined? answers nil), but RE-PROPAGATING a pending
+// flow signal (throw/break/next/return) so `defined?(throw(:x).foo)` performs
+// the throw normally instead of swallowing it.
+and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
+  let rv = try_or (fn (u: unit) -> eval_e env world blk recv) (VSym "__mere_defined_fail__") in
+  // a pending flow signal (flow_sig still holds "k") means the receiver did a
+  // throw/break/next; re-fail so it propagates instead of being swallowed.
+  if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) && map_has flow_sig "k"
+  then fail "mere-ruby: (flow signal)"
+  else rv
 
 // a break unwinding to a specific method frame (its block's home). The nearest
 // method_body_flow whose frame id matches returns v; others keep propagating.
