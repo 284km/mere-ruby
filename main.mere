@@ -461,6 +461,15 @@ let resc_reg = fn (e: Expr) ->
 // resolves against it); loaded_files dedups double-loads.
 let load_ctx = map_new ();
 let loaded_files = map_new ();
+// __ENCODING__ is a parse-time constant: the source encoding of the file (or
+// eval string) being parsed. The parser captures the current script encoding
+// (load_ctx "coding", set before lex/parse by run_prog/require/eval) into the
+// EVar name as "__ENCODING__~<NAME>"; eval resolves it to the Encoding object.
+let enc_pseudo_var = fn (id: str) ->
+  if str_eq id "__ENCODING__" then
+    (let c = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr s -> sget s | _ -> "UTF-8") else "UTF-8") in
+     EVar ("__ENCODING__~" ++ (if str_eq c "" then "UTF-8" else c)))
+  else EVar id;
 // Kernel#ruby_exe support: a redirectable output sink. While io_cap["on"] is
 // set, puts/print/p append to io_cap["buf"] instead of the real stdout, so
 // __ruby_exe can capture a snippet's output (an in-process approximation of
@@ -2299,7 +2308,7 @@ and parse_primary = fn toks ->
            (if starts_block r2b then
               let (bp, bb, r4) = parse_block r2b in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2b))
-         else (EVar id, r)
+         else (enc_pseudo_var id, r)
        | _ ->
          if starts_block r then
            let (bp, bb, r4) = parse_block r in (ECallB (id, Nil, bp, bb), r4)
@@ -2315,7 +2324,7 @@ and parse_primary = fn toks ->
            (if starts_block r2 then
               let (bp, bb, r4) = parse_block r2 in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2))
-         else (EVar id, r))
+         else (enc_pseudo_var id, r))
   | Cons (TP p, r) ->
     if str_eq p "(s" then
       // a desugared string literal: ("" + seg + ...) with a marked opener
@@ -3320,6 +3329,8 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TP p, r2) ->
          if str_eq p "=" && not (is_keyword id) then
+           // assigning to the __ENCODING__ pseudo-variable is a SyntaxError.
+           if str_eq id "__ENCODING__" then fail "mere-ruby: Can't assign to __ENCODING__" else
            // `var = begin/case/if/unless ... end` binds the construct's value;
            // otherwise it is an ordinary assignment (`Const = expr` routes to
            // the consts table at eval). A newline may follow the `=`.
@@ -6027,6 +6038,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // (0). It keeps fixtures/specs that merely mention __LINE__ from crashing;
     // any spec that asserts on the actual line will still DIFF under byte-match.
     else if str_eq name "__LINE__" then VInt 0
+    // __ENCODING__ was captured at parse time as "__ENCODING__~<NAME>";
+    // resolve to the identity Encoding object (BINARY aliases ASCII-8BIT).
+    else if str_len name >= 12 && str_eq (substring name 0 12) "__ENCODING__" then
+      (let nm = (if str_len name > 13 then str_upcase (substring name 13 (str_len name)) else "UTF-8") in
+       let nm2 = (if str_eq nm "BINARY" then "ASCII-8BIT" else nm) in
+       if map_has enc_objs nm2 then map_get enc_objs nm2
+       else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else mkstr nm2)
     else if str_eq name "block_given?" then (let (has, _, _, _) = blk in VBool has)
     else if str_len name > 0 && str_eq (char_at name 0) "$" then
       (let k = substring name 1 (str_len name) in if map_has globals k then map_get globals k else VNil)
@@ -11569,6 +11587,12 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else
          let _ = map_set loaded_files full VNil in
          let src = read_file full in
+         // the file's magic comment sets the script encoding for parse (a
+         // parse-time __ENCODING__ capture) and while it runs; a file with no
+         // magic comment is UTF-8 (per file, not inherited), as in Ruby.
+         let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
+         let cod = src_coding src in
+         let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
          let toks = lex_go src 0 in
          let (prog2, rest2) = parse_stmts toks Nil in
          let _ = (match rest2 with
@@ -11580,10 +11604,6 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          let _ = map_set fenv "self" VMain in
          let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
          let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
-         // the file's magic comment sets the script encoding while it runs.
-         let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
-         let cod = src_coding src in
-         let _ = if str_eq cod "" then () else map_set load_ctx "coding" (mkstr cod) in
          let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
          let f = run_stmts fenv world noblk2 prog2 in
          let _ = map_set load_ctx "dir" saved in
@@ -11856,12 +11876,20 @@ and direct_invalid_flow = fn (body: Stmt list) ->
 // catchable SyntaxError. Shared by the `eval(...)` call and `send(:eval,...)`.
 and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
   match args with
-  | Cons (VStr code, rest) -> let code = sget code in
+  | Cons (VStr code, rest) ->
+    let codelbl = senc_get code in
+    let code = sget code in
     let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> env) in
     let sentinel = Cons (SDeclare (Cons ("__syntax_error__", Nil)), Nil) in
+    // the eval'd string's encoding (its magic comment, else its own label)
+    // is the script encoding while parsing it (__ENCODING__ capture).
+    let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
+    let cod = src_coding code in
+    let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then str_upcase codelbl else cod)) in
     let prog2 = try_or (fn (u: unit) ->
       let toks = lex_go code 0 in
       let (p2, _) = parse_stmts toks Nil in p2) sentinel in
+    let _ = map_set load_ctx "coding" savedc in
     (match prog2 with
      | Cons (SDeclare (Cons (m, Nil)), Nil) ->
        if str_eq m "__syntax_error__" then raise_exc world "SyntaxError" "syntax error"
