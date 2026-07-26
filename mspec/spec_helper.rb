@@ -184,6 +184,10 @@ def it_behaves_like(*args); end
 def before(kind = nil, &blk); $mspec_before = blk; end
 def after(kind = nil, &blk); $mspec_after = blk; end
 def guard(*args); end
+# mspec platform guards: this shim runs everywhere, so the block runs.
+def not_supported_on(*args); yield if block_given?; end
+# known-MRI-bug guard: skipped (like ruby_version_is), same on both sides.
+def ruby_bug(*args); end
 # mspec numeric boundary helpers (mspec/helpers/numeric.rb).
 def bignum_value(plus = 0); 2**64 + plus; end
 def fixnum_max; 2**62 - 1; end
