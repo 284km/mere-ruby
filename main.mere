@@ -7694,6 +7694,18 @@ and arr_cycle = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (n: 
      | FNext _ -> arr_cycle world encl theblk xs (if n < 0 then n else n - 1)
      | other -> other)
 
+// enumerable methods that, called WITHOUT a block, return an Enumerator.
+and enum_needs_block = fn (name: str) ->
+  str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
+  str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_all" ||
+  str_eq name "flat_map" || str_eq name "collect_concat" || str_eq name "partition" ||
+  str_eq name "group_by" || str_eq name "sort_by" || str_eq name "min_by" || str_eq name "max_by" ||
+  str_eq name "minmax_by" || str_eq name "each_with_index" || str_eq name "each_with_object" ||
+  str_eq name "filter_map" || str_eq name "take_while" || str_eq name "drop_while" ||
+  str_eq name "each_entry" || str_eq name "chunk" || str_eq name "chunk_while" ||
+  str_eq name "slice_when" || str_eq name "reverse_each" || str_eq name "each_char" ||
+  str_eq name "each_byte" || str_eq name "each_line"
+
 and is_enum_method = fn (name: str) ->
   str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
   str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_index" ||
@@ -8278,6 +8290,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
     else if str_eq c "Encoding" && str_eq name "locale_charmap" then mkstr "UTF-8"
+    // Enumerator.new requires a block (the legacy obj/method form is gone).
+    else if str_eq c "Enumerator" && str_eq name "new" then
+      raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..)"
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
     else if str_eq c "Regexp" && (str_eq name "new" || str_eq name "compile") then
@@ -8840,6 +8855,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     else if is_prim_method name then prim_method recv name args
     // Enumerable (no block): to_a returns the collected array; others delegate.
     else if has_meth world cls "each" && is_enum_method name then
+      if enum_needs_block name then make_enum_a world recv name args
+      else
       let coll = enum_collect world recv cls in
       if str_eq name "to_a" || str_eq name "entries" then coll else dispatch_prim env world blk coll name args vischeck
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
@@ -9287,6 +9304,17 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // Thread.new { } runs the block synchronously but with a FRESH catch
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
+       else if str_eq c "Enumerator" && str_eq name "produce" then
+         // Enumerator.produce(initial) { |x| next } — an infinite generator:
+         // store the step block + seed; enum_take drives it boundedly.
+         (let pid = map_len proc_store in
+          let _ = map_set proc_store (str_of_int pid) newblk in
+          let (m3, s3, ocls3, iv3) = world in
+          let eid = map_len ocls3 in
+          let _ = map_set ocls3 (str_of_int eid) "Enumerator" in
+          let _ = map_set iv3 (str_of_int eid ++ "@__e_step") (VProc pid) in
+          let _ = map_set iv3 (str_of_int eid ++ "@__e_seed") (match args with Cons (v, _) -> v | _ -> VNil) in
+          VObj eid)
        else if str_eq c "Enumerator" && str_eq name "new" then
          // Enumerator.new(size = nil) { |y| ... }: store the generator block
          // as a proc, and the optional size (#size returns / calls it).
@@ -9487,6 +9515,10 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p pf sv | _ -> VNil)
      | VStr sv -> let sv = sget sv in (match args with Cons (VRegex (p, pf), _) -> rx_do_match world p pf sv | _ -> VNil)
      | _ -> VNil)
+  // enumerable methods without a block return an Enumerator over recv.<name>
+  // (Ruby: [1,2].map => #<Enumerator: [1, 2]:map>).
+  else if enum_needs_block name && (match recv with VArr _ -> true | VHsh _ -> true | VRange (_, _, _) -> true | _ -> false) then
+    make_enum_a world recv name args
   // Enumerable extras needing === / world (blockless array forms).
   else if (str_eq name "grep" || str_eq name "grep_v") && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
@@ -10976,7 +11008,26 @@ and enum_take = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) ->
                    Cons (SIf (Cons ((EBin (">=", EMethod (EVar "__acc", "length", Nil), EInt n),
                                      Cons (SBreak ENil, Nil)), Nil), Nil), Nil))) in
   let collector = (true, Cons ("*__e", Nil), body, cenv2) in
-  let _ = (if map_has ivars0 (str_of_int eid ++ "@__e_blk") then
+  let _ = (if map_has ivars0 (str_of_int eid ++ "@__e_step") then
+             // produce form: yield seed, then step(prev) forever (bounded by
+             // the collector's break -> StopIteration).
+             (match map_get ivars0 (str_of_int eid ++ "@__e_step") with
+              | VProc spid ->
+                (let seed = (if map_has ivars0 (str_of_int eid ++ "@__e_seed") then map_get ivars0 (str_of_int eid ++ "@__e_seed") else VNil) in
+                 let f = try_or (fn (u: unit) -> let _ = enum_produce_go env world blk collector (map_get proc_store (str_of_int spid)) seed in FNext VNil) (FRaise VNil) in
+                 (match f with
+                  | FRaise _ ->
+                    (let ecls = (if map_has ivars0 "$exc" then (match map_get ivars0 "$exc" with VExc (c2, _) -> c2 | _ -> "") else "") in
+                     if str_eq ecls "StopIteration" then (let _ = map_delete ivars0 "$exc" in ())
+                     else if map_has flow_sig "k" then
+                       (let k = (match map_get flow_sig "k" with VStr kk -> sget kk | _ -> "") in
+                        let v2 = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+                        let _ = map_delete flow_sig "k" in
+                        if str_eq k "break" then () else (let _ = flow_rethrow k v2 in ()))
+                     else fail "mere-ruby: (ruby exception raised)")
+                  | _ -> ()))
+              | _ -> ())
+           else if map_has ivars0 (str_of_int eid ++ "@__e_blk") then
              (match map_get ivars0 (str_of_int eid ++ "@__e_blk") with
               | VProc gpid ->
                 let bpid = map_len proc_store in
@@ -11008,6 +11059,15 @@ and enum_take = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) ->
               let _ = invoke_with_block env world blk recv2 meth2 eargs collector in
               ())) in
   accv
+
+// Enumerator.produce driver: yield v to the collector block, then step.
+and enum_produce_go = fn env -> fn world -> fn blk -> fn collector -> fn stepblk -> fn (v: Val) ->
+  let _ = tick () in
+  (match run_block world blk collector (Cons (v, Nil)) with
+   | FBreak _ -> ()
+   | _ ->
+     let nv = flow_value (run_block world blk stepblk (Cons (v, Nil))) in
+     enum_produce_go env world blk collector stepblk nv)
 
 // an Enumerator is a plain object of the synthetic class "Enumerator" whose
 // @recv / @meth ivars remember the receiver and method to drive on #each.
