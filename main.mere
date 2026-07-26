@@ -258,7 +258,7 @@ type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
            | IBOL | IEOL | IBOS | IEOS | IEOSNL
            | IWordB of bool | IBackref of int * bool
            | ILook of int * bool | ILookB of int * int * bool
-           | IMark of int | ICheck of int
+           | IMark of int | ICheck of int * int
            | IOk | IMatch
            | IMeta of int * int;
 // VM results: a match's end index + capture saves (immutable assoc list,
@@ -12756,7 +12756,10 @@ and rxc_patch_all = fn prog -> fn (ats: int list) -> fn (target: int) ->
 and rxc_nullable = fn (n: RNode) ->
   match n with
   | NChar _ -> false | NCharCI _ -> false | NAny -> false | NAnyNL -> false
-  | NClass (_, _, _) -> false | NBackref (_, _) -> false
+  | NClass (_, _, _) -> false
+  // a backreference to an empty (or unset-then-set) group matches "" — treat
+  // as nullable so star loops over it get the empty-iteration guard.
+  | NBackref (_, _) -> true
   | NSeq xs -> rxc_null_all xs
   | NAlt xs -> rxc_null_any xs
   | NRep (b, lo, _, _) -> lo == 0 || rxc_nullable b
@@ -12833,7 +12836,8 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
        let bstart = (if guard then bodypc + 1 else bodypc) in
        let _ = (if guard then map_set prog (str_of_int bodypc) (IMark (100000 + l1)) else ()) in
        let bend = rxc_emit prog bstart b in
-       let cend = (if guard then (let _ = map_set prog (str_of_int bend) (ICheck (100000 + l1)) in bend + 1) else bend) in
+       // ICheck's second arg is the loop exit (jmp-pc + 1), known statically.
+       let cend = (if guard then (let _ = map_set prog (str_of_int bend) (ICheck (100000 + l1, bend + 2)) in bend + 1) else bend) in
        let _ = map_set prog (str_of_int cend) (IJmp l1) in
        let out = cend + 1 in
        let _ = map_set prog (str_of_int l1) (if greedy then ISplit (bodypc, out) else ISplit (out, bodypc)) in
@@ -12981,8 +12985,14 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   | IJmp t -> rxv_run prog s t i saves bt
   | ISave slot -> rxv_run prog s (pc + 1) i (Cons ((slot, i), saves)) bt
   | IMark k -> rxv_run prog s (pc + 1) i (Cons ((k, i), saves)) bt
-  | ICheck k ->
-    if rxv_slot_get saves k == i then rxv_fail prog s bt
+  | ICheck (k, out) ->
+    // Onigmo's empty check: an iteration that consumed nothing AND changed no
+    // capture ends the loop here (keeping this iteration's captures, no
+    // backtracking into other alternatives); one that changed a capture is
+    // allowed to continue (e.g. /(a|\2b|())*/ needs the () iteration).
+    if rxv_slot_get saves k == i then
+      (if rxv_caps_changed saves k then rxv_run prog s (pc + 1) i saves bt
+       else rxv_run prog s out i saves bt)
     else rxv_run prog s (pc + 1) i saves bt
   | IBOL ->
     // line start: position 0, or right after a \n — but NOT the end-of-string
@@ -13029,6 +13039,23 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
        | RFail ->
          if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
   | IMeta (_, _) -> rxv_fail prog s bt
+
+// did this loop iteration (the saves newer than the most recent `k` mark
+// entry) change any capture slot's value vs before the iteration?
+and rxv_caps_changed = fn (saves: (int * int) list) -> fn (k: int) ->
+  rxv_caps_walk saves k Nil
+and rxv_caps_walk = fn (saves: (int * int) list) -> fn (k: int) -> fn (newer: (int * int) list) ->
+  match saves with
+  | Nil -> false
+  | Cons ((k2, v), rest) ->
+    if k2 == k then rxv_caps_diff newer rest
+    else rxv_caps_walk rest k (Cons ((k2, v), newer))
+and rxv_caps_diff = fn (newer: (int * int) list) -> fn (older: (int * int) list) ->
+  match newer with
+  | Nil -> false
+  | Cons ((slot, v), rest) ->
+    if slot < 100000 && (let old = rxv_slot_get older slot in (if old == v then false else true)) then true
+    else rxv_caps_diff rest older
 
 and rxv_fail = fn prog -> fn (s: str) -> fn (bt: (int * int * ((int * int) list)) list) ->
   match bt with
@@ -13280,8 +13307,9 @@ and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) ->
      let _ = rx_pub_groups sv 1 false in
      VNil)
   | RHit (st, en, saves) ->
-    (let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat))) in
-     let _ = rx_publish_at world sv st en in
+    (let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
+     let _ = rxv_export_caps saves ng in
+     let _ = rx_publish_at world sv st en ng in
      VInt st)
 
 // index of the next `>` at or after p (for a (?<name> header).
@@ -13337,16 +13365,19 @@ and rx_publish = fn world -> fn (pat: str) -> fn (sv: str) -> fn (r: Val) ->
    | _ ->
      let st = (match r with VInt p -> p | _ -> 0) in
      let en = (let e = rxe_alts pat (rxe_start pat) sv st in if e < 0 then st else e) in
-     rx_publish_at world sv st en)
+     rx_publish_at world sv st en (0 - 1))
 
 // publish a match at (st, en): a MatchData in $~ (group 0 = the whole match,
-// groups 1..9 read from rx_caps) and the $1..$9 globals.
-and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) ->
+// groups 1..9 read from rx_caps) and the $1..$9 globals. ng >= 0 records the
+// pattern's group count on the object (so #to_a nil-fills unparticipated
+// groups); -1 = unknown (legacy engine).
+and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> fn (ng: int) ->
   let (meths, sup, ocls, ivars) = world in
   let id = map_len ocls in
   let _ = map_set ocls (str_of_int id) "MatchData" in
   let _ = map_set globals "~" (VObj id) in
   let _ = map_set ivars (str_of_int id ++ "@0") (mkstr (substring sv st en)) in
+  let _ = (if ng >= 0 then map_set ivars (str_of_int id ++ "@__ng") (VInt ng) else ()) in
   let _ = rx_store_groups ivars id sv 1 in
   rx_pub_groups sv 1 true
 
@@ -13367,7 +13398,11 @@ and md_collect = fn ivars -> fn (id: int) -> fn (i: int) -> fn (hi: int) ->
   if i > hi then Nil
   else Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int i) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i) else VNil), md_collect ivars id (i + 1) hi)
 and matchdata_arr = fn ivars -> fn (id: int) -> fn (start: int) ->
-  md_collect ivars id start (md_max_group ivars id 9)
+  // with a recorded group count, nil-fill unparticipated trailing groups.
+  let hi = (if map_has ivars (str_of_int id ++ "@__ng")
+            then (match map_get ivars (str_of_int id ++ "@__ng") with VInt n -> n | _ -> md_max_group ivars id 9)
+            else md_max_group ivars id 9) in
+  md_collect ivars id start hi
 
 and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
   if i > 9 then ()
@@ -13657,9 +13692,10 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
   | RNoHit -> acc ++ substring s i n
   | RHit (st, en, saves) ->
     let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
-    let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat))) in
+    let ng2 = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
+    let _ = rxv_export_caps saves ng2 in
     let m = substring s st en in
-    let _ = rx_publish_at world s st en in
+    let _ = rx_publish_at world s st en ng2 in
     let rep = to_s (flow_value (run_block world nb newblk (Cons (mkstr m, Nil)))) in
     if en <= st then
       (let acc2 = acc ++ substring s i st ++ rep in
