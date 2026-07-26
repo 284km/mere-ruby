@@ -1836,7 +1836,32 @@ and parse_unary = fn toks ->
   match toks with
   | Cons (TP op, rest) ->
     if str_eq op "-" then
-      let (e, r) = parse_unary rest in (EUn ("-", e), r)
+      // a minus directly on a numeric literal folds into the literal, so a
+      // postfix call sees the negative value: -2.abs == 2 (but ** still
+      // binds tighter: -2**2 == -4, which the fold skips).
+      (match rest with
+       | Cons (TInt n, r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (EInt (0 - n)) r1)
+       | Cons (TFlt f, r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (EFlt (0.0 - f)) r1)
+       | Cons (TBig b, r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (EBig ("-" ++ b)) r1)
+       | Cons (TRat (n, d), r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (ERat ("-" ++ n, d)) r1)
+       | Cons (TImag n, r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (EImag (0 - n)) r1)
+       | Cons (TImagF f, r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (EImagF (0.0 - f)) r1)
+       | Cons (TImagRat (n, d), r1) ->
+         (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
+          else neg_lit_tail (EImagRat ("-" ++ n, d)) r1)
+       | _ -> let (e, r) = parse_unary rest in (EUn ("-", e), r))
     else if str_eq op "+" then
       // unary + is identity (+"str" is an unfrozen dup — same value here).
       parse_unary rest
@@ -1846,6 +1871,18 @@ and parse_unary = fn toks ->
       let (e, r) = parse_unary rest in (EUn ("~", e), r)
     else parse_pow toks
   | _ -> parse_pow toks
+
+and neg_next_pow = fn toks ->
+  match toks with Cons (TP p2, _) -> str_eq p2 "**" | _ -> false
+// postfix chain on a folded negative literal, keeping parse_pow's ** tail
+// ((-2).abs ** 2 parses like 2 ** 2).
+and neg_lit_tail = fn (lit: Expr) -> fn toks ->
+  let (b, r) = parse_postfix_more lit toks in
+  (match r with
+   | Cons (TP p2, rest2) ->
+     if str_eq p2 "**" then (let (e, r2) = parse_unary rest2 in (EBin ("**", b, e), r2))
+     else (b, r)
+   | _ -> (b, r))
 
 and parse_pow = fn toks ->
   let (b, r) = parse_postfix toks in
@@ -4924,16 +4961,48 @@ let num_bin = fn (o: str) -> fn (x: Val) -> fn (y: Val) ->
             if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb))
   | _ -> let fa = to_f x in let fb = to_f y in
          if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb);
-// +,-,* when at least one operand is Complex (components are boxed numerics).
+// component arithmetic inside a Complex: Rational components stay exact
+// (num_bin would fall back to float).
+let cpx_comp = fn (op: str) -> fn (x: Val) -> fn (y: Val) ->
+  if (match x with VRat _ -> true | _ -> false) || (match y with VRat _ -> true | _ -> false)
+  then rat_arith op x y
+  else num_bin op x y;
+// component quo for Complex division: exact (Rational) for non-floats, and
+// a den-1 Rational canonicalizes back to an integer (CRuby's f_divide does
+// this — bare 2.quo(2) stays (1/1), but Complex(4,2)/2 is (2+1i)).
+let cpx_quo = fn (x: Val) -> fn (y: Val) ->
+  if (match x with VFlt _ -> true | _ -> false) || (match y with VFlt _ -> true | _ -> false)
+  then VFlt (to_f x / to_f y)
+  else
+    let xr = (match x with VRat _ -> x | VInt n -> mk_rat n 1 | VBig b -> mk_rat_s b "1" | v -> v) in
+    (match rat_arith "/" xr y with
+     | VRat (n, d) -> if str_eq d "1" then norm_big n else VRat (n, d)
+     | v -> v);
+// +,-,*,/ when at least one operand is Complex (components are boxed numerics).
 let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   let ar = (match va with VCpx (r, i) -> r | v -> v) in
   let ai = (match va with VCpx (r, i) -> i | _ -> VInt 0) in
   let br = (match vb with VCpx (r, i) -> r | v -> v) in
   let bi = (match vb with VCpx (r, i) -> i | _ -> VInt 0) in
-  if str_eq op "+" then VCpx (num_bin "+" ar br, num_bin "+" ai bi)
-  else if str_eq op "-" then VCpx (num_bin "-" ar br, num_bin "-" ai bi)
-  else if str_eq op "*" then VCpx (num_bin "-" (num_bin "*" ar br) (num_bin "*" ai bi), num_bin "+" (num_bin "*" ar bi) (num_bin "*" ai br))
-  else fail "mere-ruby: complex division unsupported";
+  if str_eq op "+" then VCpx (cpx_comp "+" ar br, cpx_comp "+" ai bi)
+  else if str_eq op "-" then VCpx (cpx_comp "-" ar br, cpx_comp "-" ai bi)
+  else if str_eq op "*" then VCpx (cpx_comp "-" (cpx_comp "*" ar br) (cpx_comp "*" ai bi), cpx_comp "+" (cpx_comp "*" ar bi) (cpx_comp "*" ai br))
+  else if str_eq op "/" then
+    (match bi with
+     // a real divisor divides each component independently (CRuby does the
+     // same, so an integer component stays exact next to a float one).
+     | VInt 0 -> VCpx (cpx_quo ar br, cpx_quo ai br)
+     | _ ->
+       // (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c^2+d^2), per-component quo.
+       let den = cpx_comp "+" (cpx_comp "*" br br) (cpx_comp "*" bi bi) in
+       VCpx (cpx_quo (cpx_comp "+" (cpx_comp "*" ar br) (cpx_comp "*" ai bi)) den,
+             cpx_quo (cpx_comp "-" (cpx_comp "*" ai br) (cpx_comp "*" ar bi)) den))
+  else fail "mere-ruby: complex operator unsupported";
+// integer powers of a Complex (negative exponents via the reciprocal).
+let rec cpx_pow = fn (base: Val) -> fn (n: int) ->
+  if n == 0 then VCpx (VInt 1, VInt 0)
+  else if n < 0 then cpx_arith "/" (VCpx (VInt 1, VInt 0)) (cpx_pow base (0 - n))
+  else cpx_arith "*" base (cpx_pow base (n - 1));
 // int add/sub/mul that promote to bignum exactly on overflow. The checks
 // are done BEFORE the operation (signed overflow is UB in C and clang -O2
 // would optimise away any after-the-fact `r < 0` test).
@@ -5082,8 +5151,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/")
   then rat_arith op va vb
   else if ((match va with VCpx _ -> true | _ -> false) || (match vb with VCpx _ -> true | _ -> false))
-     && (str_eq op "+" || str_eq op "-" || str_eq op "*")
+     && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/")
   then cpx_arith op va vb
+  else if (match va with VCpx _ -> true | _ -> false) && str_eq op "**" then
+    (match vb with
+     | VInt n -> cpx_pow va n
+     | _ -> fail "mere-ruby: ** complex exponent unsupported")
   else if str_eq op "|" then
     (match va with
      | VArr x -> (match vb with VArr y -> arr_new (val_dedup_into (deref y) (val_dedup_into (deref x) Nil)) | _ -> fail "mere-ruby: | type error")
@@ -5798,7 +5871,13 @@ and inspect = fn (v: Val) ->
       r
   | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs xs "" ++ "}"
   | VRat (n, d) -> "(" ++ to_s v ++ ")"
-  | VCpx (r, i) -> "(" ++ to_s v ++ ")"
+  | VCpx (r, i) ->
+    // Rational components are parenthesized in inspect, and a parenthesized
+    // imaginary part takes an explicit *: ((11/25)+(2/25)*i).
+    let ia = num_abs i in
+    "(" ++ (match r with VRat _ -> "(" ++ to_s r ++ ")" | _ -> to_s r)
+        ++ (if num_isneg i then "-" else "+")
+        ++ (match ia with VRat _ -> "(" ++ to_s ia ++ ")*i" | _ -> to_s ia ++ "i") ++ ")"
   | VRegex (p, fl) ->
     // Regexp#inspect shows the m,i,x flags in canonical order.
     "/" ++ p ++ "/" ++ (if str_contains fl "m" then "m" else "") ++ (if str_contains fl "i" then "i" else "") ++ (if str_contains fl "x" then "x" else "")
@@ -10315,6 +10394,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> fail "no divmod")
   else if str_eq name "fdiv" then
     (match recv with
+     | VCpx (r, i) -> (match args with Cons (b, _) -> VCpx (VFlt (to_f r / to_f b), VFlt (to_f i / to_f b)) | _ -> VNil)
      | VInt a -> (match args with Cons (b, _) -> VFlt (to_f (VInt a) / to_f b) | _ -> VNil)
      | VFlt a -> (match args with Cons (b, _) -> VFlt (a / to_f b) | _ -> VNil)
      | _ -> fail "no fdiv")
@@ -10327,8 +10407,19 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "negative?" then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> fail "no negative?")
   else if str_eq name "succ" || str_eq name "next" then (match recv with VInt n -> VInt (n + 1) | VStr s -> mkstr (str_succ (sget s)) | _ -> fail "no succ")
   else if str_eq name "pred" then (match recv with VInt n -> VInt (n - 1) | _ -> fail "no pred")
-  else if str_eq name "abs" then
-    (match recv with VInt n -> VInt (if n < 0 then 0 - n else n) | VFlt f -> VFlt (if f < 0.0 then 0.0 - f else f) | _ -> fail "no abs")
+  else if str_eq name "abs" || str_eq name "magnitude" then
+    (match recv with
+     | VInt n -> VInt (if n < 0 then 0 - n else n)
+     | VFlt f -> VFlt (if f < 0.0 then 0.0 - f else f)
+     | VBig b -> num_abs recv
+     | VRat (n, d) -> num_abs recv
+     | VCpx (r, i) ->
+       // an axis-aligned complex keeps the component's exactness (CRuby
+       // special-cases both axes); otherwise the float hypotenuse.
+       (if rb_eq i (VInt 0) then num_abs r
+        else if rb_eq r (VInt 0) then num_abs i
+        else VFlt (sqrt (to_f (cpx_comp "+" (cpx_comp "*" r r) (cpx_comp "*" i i)))))
+     | _ -> fail "no abs")
   else if str_eq name "nan?" then (match recv with VFlt f -> VBool (if f == f then false else true) | _ -> VBool false)
   else if str_eq name "infinite?" then
     (match recv with VFlt f -> (if (if f == f then false else true) then VNil else if (if f == 0.0 then false else true) && f * 0.5 == f then VInt (if f > 0.0 then 1 else 0 - 1) else VNil) | _ -> VNil)
@@ -10358,6 +10449,38 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "imaginary" || str_eq name "imag" then (match recv with VCpx (r, i) -> i | _ -> VInt 0)
   else if str_eq name "real?" then (match recv with VCpx (r, i) -> VBool false | _ -> VBool true)
   else if str_eq name "conjugate" || str_eq name "conj" then (match recv with VCpx (r, i) -> VCpx (r, num_neg i) | _ -> recv)
+  else if str_eq name "abs2" then
+    (match recv with
+     | VCpx (r, i) -> cpx_comp "+" (cpx_comp "*" r r) (cpx_comp "*" i i)
+     | v -> cpx_comp "*" v v)
+  else if str_eq name "arg" || str_eq name "angle" || str_eq name "phase" then
+    (match recv with
+     | VCpx (r, i) -> VFlt (atan2 (to_f i) (to_f r))
+     // a real numeric: 0 (exact) when non-negative, pi when negative.
+     | v -> (if num_isneg v then VFlt (atan2 0.0 (0.0 - 1.0)) else VInt 0))
+  else if str_eq name "quo" then
+    (match args with
+     | Cons (b, _) ->
+       (match recv with
+        | VCpx (r, i) -> cpx_arith "/" recv b
+        | v ->
+          // bare quo is NOT canonicalized: 2.quo(2) == (1/1).
+          (if (match v with VFlt _ -> true | _ -> false) || (match b with VFlt _ -> true | _ -> false)
+           then VFlt (to_f v / to_f b)
+           else rat_arith "/" (match v with VRat _ -> v | VInt n -> mk_rat n 1 | VBig bb -> mk_rat_s bb "1" | x -> x) b))
+     | _ -> fail "no quo")
+  else if str_eq name "polar" then
+    (match recv with
+     | VCpx (r, i) ->
+       (let m = (if rb_eq i (VInt 0) then num_abs r
+                 else if rb_eq r (VInt 0) then num_abs i
+                 else VFlt (sqrt (to_f (cpx_comp "+" (cpx_comp "*" r r) (cpx_comp "*" i i))))) in
+        arr_new (Cons (m, Cons (VFlt (atan2 (to_f i) (to_f r)), Nil))))
+     | v -> arr_new (Cons (num_abs v, Cons (VFlt (atan2 0.0 (to_f v)), Nil))))
+  else if str_eq name "rect" || str_eq name "rectangular" then
+    (match recv with
+     | VCpx (r, i) -> arr_new (Cons (r, Cons (i, Nil)))
+     | v -> arr_new (Cons (v, Cons (VInt 0, Nil))))
   // String
   else if str_eq name "encoding" then
     (match recv with
