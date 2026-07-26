@@ -227,6 +227,30 @@ type Meth = Meth of str list * (str * Expr) list * Stmt list;
 type Flow = FNext of Val | FReturn of Val | FRaise of Val
           | FBreak of Val | FLoopNext of Val;
 
+// ---- regex AST (compiled engine) -----------------------------------------
+// Character-class atoms. Ranges compare byte strings directly (Mere string
+// comparison is lexicographic on bytes).
+type RCls = CChr of str | CRange of str * str
+          | CDigit | CWord | CSpace | CHex
+          | CNDigit | CNWord | CNSpace | CNHex
+          | CPosix of str * bool;
+// Pattern AST. The i/m/x flags are fully resolved at PARSE time: i turns
+// letters into NCharCI and sets the class ci bit, m turns `.` into NAnyNL,
+// x is consumed by the parser (whitespace/#-comments). Ruby's ^/$ are always
+// line anchors (m affects only `.`); \A/\z/\Z are the string anchors.
+// NFlagsRest is parser-internal: `(?im)` applies to the rest of the sequence.
+type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
+           | NClass of RCls list * bool * bool     // items, negated, ci
+           | NSeq of RNode list | NAlt of RNode list
+           | NRep of RNode * int * int * bool      // body, min, max (-1 = inf), greedy
+           | NGroup of RNode * int * str           // body, gnum (0 = shy), name
+           | NBackref of int * bool                // group, ci
+           | NBOL | NEOL | NBOS | NEOS | NEOSNL
+           | NWordB of bool
+           | NLook of RNode * bool | NLookB of RNode * bool   // body, negated
+           | NFlagsRest of str
+           | NEmpty;
+
 // ---- mutable-array store (M10) ------------------------------------------
 // A single top-level Map captured by every function below (no threading):
 // id (as str) -> the array's contents (a Val list). Arrays are handles
@@ -12386,6 +12410,301 @@ and clausesin_targets = fn clauses ->
   match clauses with
   | Nil -> Nil
   | Cons (cl, rest) -> let (p, g, b) = cl in list_append_str (deep_targets b) (clausesin_targets rest)
+
+// ---- regex pattern parser (compiled engine) -------------------------------
+// Parses a Ruby regex body into RNode (types near Flow). Flags are resolved
+// here: i -> NCharCI / class ci, m -> NAnyNL, x -> whitespace + #-comments
+// skipped. Unsupported constructs `fail`; during the migration the caller
+// falls back to the legacy matcher below.
+
+and rxp_parse = fn (pat: str) -> fn (fl: str) ->
+  let (n, p, g) = rxp_alt pat 0 fl 1 in
+  if p < str_len pat then fail "mere-ruby: regexp parse: unmatched )" else n
+
+// number of capture groups in a parsed pattern (next-gnum - 1 from a reparse
+// is avoided: count NGroup nodes with gnum > 0).
+and rxp_ngroups = fn (n: RNode) ->
+  match n with
+  | NSeq xs -> rxp_ngroups_list xs
+  | NAlt xs -> rxp_ngroups_list xs
+  | NRep (b, _, _, _) -> rxp_ngroups b
+  | NGroup (b, gn, _) -> (if gn > 0 then 1 else 0) + rxp_ngroups b
+  | NLook (b, _) -> rxp_ngroups b
+  | NLookB (b, _) -> rxp_ngroups b
+  | _ -> 0
+and rxp_ngroups_list = fn (xs: RNode list) ->
+  match xs with Nil -> 0 | Cons (h, t) -> rxp_ngroups h + rxp_ngroups_list t
+
+// alternation: seq ('|' seq)*
+and rxp_alt = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  let (first, p2, g2) = rxp_seq pat p fl g in
+  rxp_alt_more pat p2 fl g2 (Cons (first, Nil))
+and rxp_alt_more = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) -> fn (acc: RNode list) ->
+  if p < str_len pat && str_eq (char_at pat p) "|" then
+    let (n, p2, g2) = rxp_seq pat (p + 1) fl g in
+    rxp_alt_more pat p2 fl g2 (Cons (n, acc))
+  else
+    (match acc with
+     | Cons (only, Nil) -> (only, p, g)
+     | _ -> (NAlt (rev_app acc Nil), p, g))
+
+// sequence: atoms (each with an optional quantifier) until '|' / ')' / end.
+and rxp_seq = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  rxp_seq_go pat p fl g Nil
+and rxp_seq_go = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) -> fn (acc: RNode list) ->
+  let p = (if str_contains fl "x" then rxp_skip_x pat p else p) in
+  if p >= str_len pat || str_eq (char_at pat p) "|" || str_eq (char_at pat p) ")" then
+    (match acc with
+     | Nil -> (NEmpty, p, g)
+     | Cons (only, Nil) -> (only, p, g)
+     | _ -> (NSeq (rev_app acc Nil), p, g))
+  else
+    let (atom, p2, g2) = rxp_atom pat p fl g in
+    (match atom with
+     // `(?im)` applies to the rest of the sequence (approximation of Ruby's
+     // to-end-of-enclosing-group scope).
+     | NFlagsRest fl2 ->
+       let (restn, p3, g3) = rxp_seq_go pat p2 fl2 g2 Nil in
+       (match acc with
+        | Nil -> (restn, p3, g3)
+        | _ -> (NSeq (rev_app acc (Cons (restn, Nil))), p3, g3))
+     | _ ->
+       let (q, p3) = rxp_quant pat atom p2 in
+       rxp_seq_go pat p3 fl g2 (Cons (q, acc)))
+
+// x-flag: skip whitespace and #-comments (a `\ ` escaped space stays literal).
+and rxp_skip_x = fn (pat: str) -> fn (p: int) ->
+  if p >= str_len pat then p
+  else
+    let c = char_at pat p in
+    if str_eq c " " || str_eq c "\t" || str_eq c "\n" then rxp_skip_x pat (p + 1)
+    else if str_eq c "#" then rxp_skip_x pat (rxp_line_end pat p)
+    else p
+and rxp_line_end = fn (pat: str) -> fn (p: int) ->
+  if p >= str_len pat then p
+  else if str_eq (char_at pat p) "\n" then p + 1
+  else rxp_line_end pat (p + 1)
+
+// one quantifier after an atom: * + ? {n,m}, each optionally lazy (?).
+and rxp_quant = fn (pat: str) -> fn (atom: RNode) -> fn (p: int) ->
+  if p >= str_len pat then (atom, p)
+  else
+    let c = char_at pat p in
+    if str_eq c "*" then rxp_lazy pat atom 0 (0 - 1) (p + 1)
+    else if str_eq c "+" then rxp_lazy pat atom 1 (0 - 1) (p + 1)
+    else if str_eq c "?" then rxp_lazy pat atom 0 1 (p + 1)
+    else if str_eq c "\{" then
+      (let (found, lo, hi, p2) = rxp_braces pat (p + 1) in
+       if found then rxp_lazy pat atom lo hi p2 else (atom, p))
+    else (atom, p)
+and rxp_lazy = fn (pat: str) -> fn (atom: RNode) -> fn (lo: int) -> fn (hi: int) -> fn (p: int) ->
+  if p < str_len pat && str_eq (char_at pat p) "?" then (NRep (atom, lo, hi, false), p + 1)
+  else if p < str_len pat && str_eq (char_at pat p) "+" then fail "mere-ruby: regexp: possessive quantifier unsupported"
+  else (NRep (atom, lo, hi, true), p)
+
+// {n} {n,} {n,m} {,m}; a brace that is not a quantifier stays a literal.
+and rxp_braces = fn (pat: str) -> fn (p: int) ->
+  let (lo, p2, ok1) = rxp_num pat p 0 false in
+  if p2 < str_len pat && str_eq (char_at pat p2) "," then
+    (let (hi, p3, ok2) = rxp_num pat (p2 + 1) 0 false in
+     if p3 < str_len pat && str_eq (char_at pat p3) "}" && (ok1 || ok2) then
+       (let lo2 = (if ok1 then lo else 0) in
+        let hi2 = (if ok2 then hi else (0 - 1)) in
+        let _ = (if lo2 > 1000 || hi2 > 1000 then fail "mere-ruby: regexp: quantifier too large" else ()) in
+        let _ = (if ok2 && lo2 > hi2 then fail "mere-ruby: regexp: bad repeat range" else ()) in
+        (true, lo2, hi2, p3 + 1))
+     else (false, 0, 0, p))
+  else if p2 < str_len pat && str_eq (char_at pat p2) "}" && ok1 then
+    (let _ = (if lo > 1000 then fail "mere-ruby: regexp: quantifier too large" else ()) in
+     (true, lo, lo, p2 + 1))
+  else (false, 0, 0, p)
+and rxp_num = fn (pat: str) -> fn (p: int) -> fn (acc: int) -> fn (found: bool) ->
+  if p < str_len pat && char_at pat p >= "0" && char_at pat p <= "9" then
+    rxp_num pat (p + 1) (acc * 10 + int_of_str (char_at pat p)) true
+  else (acc, p, found)
+
+// a single atom: group, class, ., anchors, escape, or a literal byte.
+and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  let c = char_at pat p in
+  if str_eq c "(" then rxp_group pat (p + 1) fl g
+  else if str_eq c "[" then
+    (let (items, neg, p2) = rxp_class pat (p + 1) in
+     (NClass (items, neg, str_contains fl "i"), p2, g))
+  else if str_eq c "." then ((if str_contains fl "m" then NAnyNL else NAny), p + 1, g)
+  else if str_eq c "^" then (NBOL, p + 1, g)
+  else if str_eq c "$" then (NEOL, p + 1, g)
+  else if str_eq c "\\" then rxp_escape pat (p + 1) fl g
+  else if str_eq c "*" || str_eq c "+" || str_eq c "?" then fail "mere-ruby: regexp: nothing to repeat"
+  else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
+
+and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  if p >= str_len pat then fail "mere-ruby: regexp: trailing backslash"
+  else
+    let c = char_at pat p in
+    if str_eq c "d" then (NClass (Cons (CDigit, Nil), false, false), p + 1, g)
+    else if str_eq c "D" then (NClass (Cons (CDigit, Nil), true, false), p + 1, g)
+    else if str_eq c "w" then (NClass (Cons (CWord, Nil), false, false), p + 1, g)
+    else if str_eq c "W" then (NClass (Cons (CWord, Nil), true, false), p + 1, g)
+    else if str_eq c "s" then (NClass (Cons (CSpace, Nil), false, false), p + 1, g)
+    else if str_eq c "S" then (NClass (Cons (CSpace, Nil), true, false), p + 1, g)
+    else if str_eq c "h" then (NClass (Cons (CHex, Nil), false, false), p + 1, g)
+    else if str_eq c "H" then (NClass (Cons (CHex, Nil), true, false), p + 1, g)
+    else if str_eq c "b" then (NWordB true, p + 1, g)
+    else if str_eq c "B" then (NWordB false, p + 1, g)
+    else if str_eq c "A" then (NBOS, p + 1, g)
+    else if str_eq c "z" then (NEOS, p + 1, g)
+    else if str_eq c "Z" then (NEOSNL, p + 1, g)
+    else if str_eq c "n" then (NChar "\n", p + 1, g)
+    else if str_eq c "t" then (NChar "\t", p + 1, g)
+    else if str_eq c "r" then (NChar "\r", p + 1, g)
+    else if str_eq c "f" then (NChar (chr 12), p + 1, g)
+    else if str_eq c "v" then (NChar (chr 11), p + 1, g)
+    else if str_eq c "e" then (NChar (chr 27), p + 1, g)
+    else if str_eq c "a" then (NChar (chr 7), p + 1, g)
+    else if str_eq c "x" then rxp_hex pat (p + 1) g
+    else if c >= "1" && c <= "9" then (NBackref (int_of_str c, str_contains fl "i"), p + 1, g)
+    else if str_eq c "G" || str_eq c "k" || str_eq c "g" || str_eq c "p" || str_eq c "u" ||
+            str_eq c "K" || str_eq c "R" || str_eq c "X" || str_eq c "0" then
+      fail "mere-ruby: regexp: unsupported escape"
+    else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
+
+and rxp_hexv = fn (c: str) ->
+  if (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F") then str_to_int_base c 16
+  else 0 - 1
+and rxp_hex = fn (pat: str) -> fn (p: int) -> fn (g: int) ->
+  if p >= str_len pat || rxp_hexv (char_at pat p) < 0 then fail "mere-ruby: regexp: bad \\x"
+  else
+    let h1 = rxp_hexv (char_at pat p) in
+    if p + 1 < str_len pat && rxp_hexv (char_at pat (p + 1)) >= 0 then
+      (NChar (chr (h1 * 16 + rxp_hexv (char_at pat (p + 1)))), p + 2, g)
+    else (NChar (chr h1), p + 1, g)
+
+// group forms: (...) (?:...) (?<name>...) (?'name'...) (?=...) (?!...)
+// (?<=...) (?<!...) (?imx-imx:...) (?imx-imx).
+and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  if p < str_len pat && str_eq (char_at pat p) "?" then
+    (let c2 = (if p + 1 < str_len pat then char_at pat (p + 1) else "") in
+     if str_eq c2 ":" then
+       (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
+        (NGroup (n, 0, ""), rxp_close pat p2, g2))
+     else if str_eq c2 "=" then
+       (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
+        (NLook (n, false), rxp_close pat p2, g2))
+     else if str_eq c2 "!" then
+       (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
+        (NLook (n, true), rxp_close pat p2, g2))
+     else if str_eq c2 "<" then
+       (let c3 = (if p + 2 < str_len pat then char_at pat (p + 2) else "") in
+        if str_eq c3 "=" then
+          (let (n, p2, g2) = rxp_alt pat (p + 3) fl g in
+           (NLookB (n, false), rxp_close pat p2, g2))
+        else if str_eq c3 "!" then
+          (let (n, p2, g2) = rxp_alt pat (p + 3) fl g in
+           (NLookB (n, true), rxp_close pat p2, g2))
+        else
+          (let (nm, p2) = rxp_name pat (p + 2) ">" "" in
+           let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
+           (NGroup (n, g, nm), rxp_close pat p3, g2)))
+     else if str_eq c2 "'" then
+       (let (nm, p2) = rxp_name pat (p + 2) "'" "" in
+        let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
+        (NGroup (n, g, nm), rxp_close pat p3, g2))
+     else
+       // (?imx-imx:...) scoped or (?imx-imx) rest-of-sequence flags.
+       let (fl2, p2, colon) = rxp_flags pat (p + 1) fl "" false in
+       if colon then
+         (let (n, p3, g2) = rxp_alt pat p2 fl2 g in
+          (NGroup (n, 0, ""), rxp_close pat p3, g2))
+       else (NFlagsRest fl2, p2, g))
+  else
+    let (n, p2, g2) = rxp_alt pat p fl (g + 1) in
+    (NGroup (n, g, ""), rxp_close pat p2, g2)
+
+// read [imx]*(-[imx]*)? up to ':' (scoped) or ')' (rest). `neg` = after '-'.
+and rxp_flags = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (seen: str) -> fn (neg: bool) ->
+  if p >= str_len pat then fail "mere-ruby: regexp: unterminated (?flags"
+  else
+    let c = char_at pat p in
+    if str_eq c ":" then (fl, p + 1, true)
+    else if str_eq c ")" then (fl, p + 1, false)
+    else if str_eq c "-" then (if neg then fail "mere-ruby: regexp: bad flags" else rxp_flags pat (p + 1) fl seen true)
+    else if str_eq c "i" || str_eq c "m" || str_eq c "x" then
+      (let fl2 = (if neg then rxp_flag_del fl c else (if str_contains fl c then fl else fl ++ c)) in
+       rxp_flags pat (p + 1) fl2 (seen ++ c) neg)
+    // a/d/u (char-class semantics selectors) are accepted and ignored.
+    else if str_eq c "a" || str_eq c "d" || str_eq c "u" then rxp_flags pat (p + 1) fl seen neg
+    else fail "mere-ruby: regexp: unknown inline flag"
+and rxp_flag_del = fn (fl: str) -> fn (c: str) ->
+  rxp_flag_del_go fl c 0 ""
+and rxp_flag_del_go = fn (fl: str) -> fn (c: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len fl then acc
+  else if str_eq (char_at fl i) c then rxp_flag_del_go fl c (i + 1) acc
+  else rxp_flag_del_go fl c (i + 1) (acc ++ char_at fl i)
+
+and rxp_close = fn (pat: str) -> fn (p: int) ->
+  if p < str_len pat && str_eq (char_at pat p) ")" then p + 1
+  else fail "mere-ruby: regexp: unmatched ("
+
+and rxp_name = fn (pat: str) -> fn (p: int) -> fn (term: str) -> fn (acc: str) ->
+  if p >= str_len pat then fail "mere-ruby: regexp: unterminated group name"
+  else if str_eq (char_at pat p) term then (acc, p + 1)
+  else rxp_name pat (p + 1) term (acc ++ char_at pat p)
+
+// character class [...]: items, negated, resume position (after ']').
+and rxp_class = fn (pat: str) -> fn (p: int) ->
+  let (neg, p2) = (if p < str_len pat && str_eq (char_at pat p) "^" then (true, p + 1) else (false, p)) in
+  rxp_class_items pat p2 neg Nil true
+and rxp_class_items = fn (pat: str) -> fn (p: int) -> fn (neg: bool) -> fn (acc: RCls list) -> fn (first: bool) ->
+  if p >= str_len pat then fail "mere-ruby: regexp: unterminated class"
+  else
+    let c = char_at pat p in
+    if str_eq c "]" && (if first then false else true) then (rev_app acc Nil, neg, p + 1)
+    else if str_eq c "[" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) ":" then
+      (let (nm, negp, p2) = rxp_posix pat (p + 2) in
+       rxp_class_items pat p2 neg (Cons (CPosix (nm, negp), acc)) false)
+    else if str_eq c "[" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) "]" then
+      // "[]" — a literal '[' then closing... treat '[' as a literal member.
+      rxp_class_items pat (p + 1) neg (Cons (CChr "[", acc)) false
+    else
+      let (lo, p2) = rxp_class_atom pat p in
+      (match lo with
+       | CChr ch ->
+         if p2 + 1 <= str_len pat && p2 < str_len pat && str_eq (char_at pat p2) "-"
+            && p2 + 1 < str_len pat && (if str_eq (char_at pat (p2 + 1)) "]" then false else true) then
+           (let (hi, p3) = rxp_class_atom pat (p2 + 1) in
+            match hi with
+            | CChr ch2 -> rxp_class_items pat p3 neg (Cons (CRange (ch, ch2), acc)) false
+            | _ -> fail "mere-ruby: regexp: bad class range")
+         else rxp_class_items pat p2 neg (Cons (lo, acc)) false
+       | _ -> rxp_class_items pat p2 neg (Cons (lo, acc)) false)
+and rxp_class_atom = fn (pat: str) -> fn (p: int) ->
+  let c = char_at pat p in
+  if str_eq c "\\" && p + 1 < str_len pat then
+    (let e = char_at pat (p + 1) in
+     if str_eq e "d" then (CDigit, p + 2) else if str_eq e "D" then (CNDigit, p + 2)
+     else if str_eq e "w" then (CWord, p + 2) else if str_eq e "W" then (CNWord, p + 2)
+     else if str_eq e "s" then (CSpace, p + 2) else if str_eq e "S" then (CNSpace, p + 2)
+     else if str_eq e "h" then (CHex, p + 2) else if str_eq e "H" then (CNHex, p + 2)
+     else if str_eq e "n" then (CChr "\n", p + 2) else if str_eq e "t" then (CChr "\t", p + 2)
+     else if str_eq e "r" then (CChr "\r", p + 2)
+     else if str_eq e "f" then (CChr (chr 12), p + 2) else if str_eq e "v" then (CChr (chr 11), p + 2)
+     else if str_eq e "e" then (CChr (chr 27), p + 2) else if str_eq e "a" then (CChr (chr 7), p + 2)
+     else if str_eq e "b" then (CChr (chr 8), p + 2)   // \b inside a class is backspace
+     else if str_eq e "x" then
+       (let h1 = rxp_hexv (char_at pat (p + 2)) in
+        if h1 < 0 then fail "mere-ruby: regexp: bad \\x in class"
+        else if p + 3 < str_len pat && rxp_hexv (char_at pat (p + 3)) >= 0 then
+          (CChr (chr (h1 * 16 + rxp_hexv (char_at pat (p + 3)))), p + 4)
+        else (CChr (chr h1), p + 3))
+     else (CChr e, p + 2))
+  else (CChr c, p + 1)
+and rxp_posix = fn (pat: str) -> fn (p: int) ->
+  let (negp, p2) = (if p < str_len pat && str_eq (char_at pat p) "^" then (true, p + 1) else (false, p)) in
+  rxp_posix_name pat p2 negp ""
+and rxp_posix_name = fn (pat: str) -> fn (p: int) -> fn (negp: bool) -> fn (acc: str) ->
+  if p + 1 < str_len pat && str_eq (char_at pat p) ":" && str_eq (char_at pat (p + 1)) "]" then (acc, negp, p + 2)
+  else if p >= str_len pat then fail "mere-ruby: regexp: unterminated posix class"
+  else rxp_posix_name pat (p + 1) negp (acc ++ char_at pat p)
 
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
