@@ -464,6 +464,16 @@ let rx_caps = map_new ();
 // patterns the new engine cannot compile (the legacy matcher handles them).
 let rx_progs = map_new ();
 let rx_bad = map_new ();
+// lenient regex-parse mode: set while VALIDATING a regex literal at ruby-parse
+// time — constructs the engine does not support yet are accepted (they fall
+// back to the legacy matcher at runtime), while truly invalid syntax still
+// fails (a Ruby SyntaxError / RegexpError).
+let rx_lenient = map_new ();
+// regex literals recorded by the ruby parser ("e<i>" -> "flags\nbody", "n" =
+// count, "done" = validated prefix); validated right after each parse (eval /
+// require / main), so an invalid literal is a parse-time SyntaxError while
+// engine-unsupported ones pass (legacy fallback).
+let rx_pending = map_new ();
 // array handles currently being inspected — breaks self-referential arrays
 // (Ruby prints such a cycle as "[...]") instead of recursing forever.
 let insp_seen = map_new ();
@@ -917,14 +927,17 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // lowercase %w/%i words are raw; %W/%I words interpolate.
       if is_percent_w s i then
         Cons (TP " [", pw_words (str_eq (char_at s (i + 1)) "W") lit 0 (lex_go s j))
-      // %r{...}flags is a regex (with optional interpolation).
+      // %r{...}flags is a regex (with optional interpolation). The body is
+      // re-scanned keeping backslashes (%r?\?? is the regex /\?/, so the
+      // escape must survive into the pattern, unlike %q string unescaping).
       else if str_eq (char_at s (i + 1)) "r" then
-        (let fj = skip_regex_flags s j in
-         let fl = substring s j fj in
-         if rx_has_interp lit 0 then
-           tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src lit) 0)))
+        (let (rlit, rj) = scan_pct_regex s b 1 "" opener (pct_close_of opener) in
+         let fj = skip_regex_flags s rj in
+         let fl = substring s rj fj in
+         if rx_has_interp rlit 0 then
+           tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src rlit) 0)))
                 (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl, Cons (TP ")", lex_go s fj)))))))
-         else Cons (TRegex (lit, fl), lex_go s fj))
+         else Cons (TRegex (rlit, fl), lex_go s fj))
       // %x{...} is a command literal (same as backticks): a call to the `
       // method with the interpolated body.
       else if str_eq (char_at s (i + 1)) "x" then
@@ -1044,8 +1057,11 @@ and percent_body = fn (s: str) -> fn (i: int) ->
 
 // a percent-literal delimiter: any non-alphanumeric, non-space char.
 and is_pct_delim = fn (c: str) ->
-  (if is_alnum c then false else true) &&
-  (if str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "=" then false else true)
+  // any non-alnum, non-whitespace char; _ and = are valid Ruby delimiters
+  // (the bare-% form is still guarded by regex_position at the caller).
+  str_eq c "_" || str_eq c "=" ||
+  ((if is_alnum c then false else true) &&
+   (if str_eq c " " || str_eq c "\t" || str_eq c "\n" then false else true))
 
 and is_pct_open = fn (c: str) -> str_eq c "(" || str_eq c "\{" || str_eq c "[" || str_eq c "<"
 
@@ -1057,6 +1073,30 @@ and is_percent_w = fn (s: str) -> fn (i: int) ->
   i + 1 < str_len s && (str_eq (char_at s (i + 1)) "w" || str_eq (char_at s (i + 1)) "W")
 
 // raw scan to the balanced closing delimiter; returns (body, index-after).
+and rx_is_meta = fn (c: str) ->
+  str_eq c "$" || str_eq c "^" || str_eq c "*" || str_eq c "+" || str_eq c "." ||
+  str_eq c "?" || str_eq c "|" || str_eq c "}" || str_eq c ")" || str_eq c ">" ||
+  str_eq c "]" || str_eq c "(" || str_eq c "\{" || str_eq c "[" || str_eq c "<" || str_eq c "\\"
+
+// like scan_balanced2 but for %r regex bodies: an escaped delimiter keeps
+// its backslash only when the delimiter is a regex metacharacter (%r(\() is
+// /\(/ but %r-\-- is /-/, matching Ruby's source normalization); any other
+// backslash pair is copied verbatim for the regex parser.
+and scan_pct_regex = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: str) -> fn (op: str) -> fn (clo: str) ->
+  if i >= str_len s then fail "mere-ruby: unterminated %r literal"
+  else
+    let c = char_at s i in
+    if str_eq c "\\" && i + 1 < str_len s then
+      (let nx = char_at s (i + 1) in
+       if (str_eq nx op || str_eq nx clo) && (if rx_is_meta nx then false else true) then
+         scan_pct_regex s (i + 2) depth (acc ++ nx) op clo
+       else scan_pct_regex s (i + 2) depth (acc ++ c ++ nx) op clo)
+    else if str_eq c op && (if str_eq op clo then false else true) then
+      scan_pct_regex s (i + 1) (depth + 1) (acc ++ c) op clo
+    else if str_eq c clo then
+      (if depth == 1 then (acc, i + 1) else scan_pct_regex s (i + 1) (depth - 1) (acc ++ c) op clo)
+    else scan_pct_regex s (i + 1) depth (acc ++ c) op clo
+
 and scan_balanced2 = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: str) -> fn (op: str) -> fn (clo: str) ->
   if i >= str_len s then fail "mere-ruby: unterminated % literal"
   else
@@ -1392,7 +1432,13 @@ and scan_regex = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
     else scan_regex s (i + 1) (acc ++ c)
 
 and skip_regex_flags = fn (s: str) -> fn (i: int) ->
-  if i < str_len s && is_alpha (char_at s i) then skip_regex_flags s (i + 1) else i;
+  if i < str_len s && is_alpha (char_at s i) then
+    (let c = char_at s i in
+     if str_eq c "i" || str_eq c "m" || str_eq c "x" || str_eq c "o" ||
+        str_eq c "u" || str_eq c "n" || str_eq c "s" || str_eq c "e"
+     then skip_regex_flags s (i + 1)
+     else fail ("mere-ruby: unknown regexp option - " ++ c))
+  else i;
 
 // ---- parser (precedence climbing) ---------------------------------------
 let is_keyword = fn (id: str) ->
@@ -2177,7 +2223,14 @@ and parse_primary = fn toks ->
   | Cons (TRat n, r) -> (ERat n, r)
   | Cons (TImag n, r) -> (EImag n, r)
   | Cons (TImagF f, r) -> (EImagF f, r)
-  | Cons (TRegex p, r) -> (ERegex p, r)
+  | Cons (TRegex p, r) ->
+    // record the literal for post-parse validation (rx_check_pending): an
+    // invalid regex is a parse-time SyntaxError, unsupported ones pass.
+    let (rbody, rfl) = p in
+    let n = (if map_has rx_pending "n" then (match map_get rx_pending "n" with VInt k -> k | _ -> 0) else 0) in
+    let _ = map_set rx_pending ("e" ++ str_of_int n) (mkstr (rfl ++ "\n" ++ rbody)) in
+    let _ = map_set rx_pending "n" (VInt (n + 1)) in
+    (ERegex p, r)
   | Cons (TFlt f, r) -> (EFlt f, r)
   | Cons (TStrL s, r) -> (EStrL s, r)
   | Cons (TSym s, r) -> (ESym s, r)
@@ -5604,6 +5657,14 @@ let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
       else if str_eq c "\"" then "\\\""
       else if str_eq c "\n" then "\\n"
       else if str_eq c "\t" then "\\t"
+      else if str_eq c "\r" then "\\r"
+      else if ord c == 12 then "\\f"
+      else if ord c == 11 then "\\v"
+      else if ord c == 8 then "\\b"
+      else if ord c == 7 then "\\a"
+      else if ord c == 27 then "\\e"
+      // remaining control bytes inspect as \uXXXX, as in Ruby.
+      else if ord c < 32 || ord c == 127 then "\\u" ++ hex4 (ord c)
       // a literal #{ / #$ / #@ would read as interpolation: escape the #.
       else if str_eq c "#" && i + 1 < str_len s &&
               (str_eq (char_at s (i + 1)) "\{" || str_eq (char_at s (i + 1)) "$" || str_eq (char_at s (i + 1)) "@")
@@ -8068,6 +8129,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        let _ = map_iter enc_objs (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
     else if str_eq c "Encoding" && str_eq name "locale_charmap" then mkstr "UTF-8"
+    // Regexp.new / Regexp.compile: build from a source string (options: an
+    // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
+    else if str_eq c "Regexp" && (str_eq name "new" || str_eq name "compile") then
+      (match args with
+       | Cons (VStr src, rest) ->
+         (let body = sget src in
+          let fl = (match rest with
+                    | Cons (VBool true, _) -> "i"
+                    | Cons (VInt opt, _) ->
+                      (if opt - (opt / 2) * 2 == 1 then "i" else "") ++
+                      (if (opt / 2) - (opt / 4) * 2 == 1 then "x" else "") ++
+                      (if (opt / 4) - (opt / 8) * 2 == 1 then "m" else "")
+                    | Cons (VStr fs, _) -> sget fs
+                    | _ -> "") in
+          if rx_validate body fl then VRegex (body, fl)
+          else raise_exc world "RegexpError" "invalid regular expression")
+       | Cons (VRegex (b2, f2), _) -> VRegex (b2, f2)
+       | _ -> fail "mere-ruby: Regexp.new expects a string")
     // Math module functions (only sqrt-derived ones; no trig/log builtin).
     else if str_eq c "Math" then
       (if str_eq name "sqrt" then (match args with Cons (v, _) -> VFlt (sqrt (to_f v)) | _ -> VFlt 0.0)
@@ -11693,6 +11772,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
          let toks = lex_go src 0 in
          let (prog2, rest2) = parse_stmts toks Nil in
+         let _ = rx_check_pending () in
          let _ = (match rest2 with
                   | Cons (TEOF, _) -> ()
                   | _ -> fail ("mere-ruby: unexpected token at top level in " ++ full)) in
@@ -11986,7 +12066,8 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then str_upcase codelbl else cod)) in
     let prog2 = try_or (fn (u: unit) ->
       let toks = lex_go code 0 in
-      let (p2, _) = parse_stmts toks Nil in p2) sentinel in
+      let (p2, _) = parse_stmts toks Nil in
+      let _ = rx_check_pending () in p2) sentinel in
     let _ = map_set load_ctx "coding" savedc in
     (match prog2 with
      | Cons (SDeclare (Cons (m, Nil)), Nil) ->
@@ -12501,7 +12582,7 @@ and rxp_seq_go = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) -> 
         | Nil -> (restn, p3, g3)
         | _ -> (NSeq (rev_app acc (Cons (restn, Nil))), p3, g3))
      | _ ->
-       let (q, p3) = rxp_quant pat atom p2 in
+       let (q, p3) = rxp_quant pat atom p2 fl in
        rxp_seq_go pat p3 fl g2 (Cons (q, acc)))
 
 // x-flag: skip whitespace and #-comments (a `\ ` escaped space stays literal).
@@ -12520,23 +12601,27 @@ and rxp_line_end = fn (pat: str) -> fn (p: int) ->
 // quantifiers after an atom: * + ? {n,m}, each optionally lazy (?). Nested
 // quantifiers stack (/a***/ = ((a*)*)*); after an EXACT {n} a `?` is another
 // quantifier, not a lazy marker (/a{2}?/ = (a{2})?).
-and rxp_quant = fn (pat: str) -> fn (atom: RNode) -> fn (p: int) ->
+and rxp_quant = fn (pat: str) -> fn (atom: RNode) -> fn (p: int) -> fn (fl: str) ->
+  // x-mode: a quantifier may be separated from its atom by whitespace.
+  let p = (if str_contains fl "x" then rxp_skip_x pat p else p) in
   if p >= str_len pat then (atom, p)
   else
     let c = char_at pat p in
-    if str_eq c "*" then (let (n2, p2) = rxp_lazy pat atom 0 (0 - 1) (p + 1) in rxp_quant pat n2 p2)
-    else if str_eq c "+" then (let (n2, p2) = rxp_lazy pat atom 1 (0 - 1) (p + 1) in rxp_quant pat n2 p2)
-    else if str_eq c "?" then (let (n2, p2) = rxp_lazy pat atom 0 1 (p + 1) in rxp_quant pat n2 p2)
+    if str_eq c "*" then (let (n2, p2) = rxp_lazy pat atom 0 (0 - 1) (p + 1) fl in rxp_quant pat n2 p2 fl)
+    else if str_eq c "+" then (let (n2, p2) = rxp_lazy pat atom 1 (0 - 1) (p + 1) fl in rxp_quant pat n2 p2 fl)
+    else if str_eq c "?" then (let (n2, p2) = rxp_lazy pat atom 0 1 (p + 1) fl in rxp_quant pat n2 p2 fl)
     else if str_eq c "\{" then
       (let (found, lo, hi, p2) = rxp_braces pat (p + 1) in
        if found then
-         (if lo == hi then rxp_quant pat (NRep (atom, lo, hi, true)) p2
-          else (let (n2, p3) = rxp_lazy pat atom lo hi p2 in rxp_quant pat n2 p3))
+         (if lo == hi then rxp_quant pat (NRep (atom, lo, hi, true)) p2 fl
+          else (let (n2, p3) = rxp_lazy pat atom lo hi p2 fl in rxp_quant pat n2 p3 fl))
        else (atom, p))
     else (atom, p)
-and rxp_lazy = fn (pat: str) -> fn (atom: RNode) -> fn (lo: int) -> fn (hi: int) -> fn (p: int) ->
+and rxp_lazy = fn (pat: str) -> fn (atom: RNode) -> fn (lo: int) -> fn (hi: int) -> fn (p: int) -> fn (fl: str) ->
+  let p = (if str_contains fl "x" then rxp_skip_x pat p else p) in
   if p < str_len pat && str_eq (char_at pat p) "?" then (NRep (atom, lo, hi, false), p + 1)
-  else if p < str_len pat && str_eq (char_at pat p) "+" then fail "mere-ruby: regexp: possessive quantifier unsupported"
+  else if p < str_len pat && str_eq (char_at pat p) "+" then
+    (if map_has rx_lenient "n" then (NRep (atom, lo, hi, true), p + 1) else fail "mere-ruby: regexp: possessive quantifier unsupported")
   else (NRep (atom, lo, hi, true), p)
 
 // {n} {n,} {n,m} {,m}; a brace that is not a quantifier stays a literal.
@@ -12547,12 +12632,12 @@ and rxp_braces = fn (pat: str) -> fn (p: int) ->
      if p3 < str_len pat && str_eq (char_at pat p3) "}" && (ok1 || ok2) then
        (let lo2 = (if ok1 then lo else 0) in
         let hi2 = (if ok2 then hi else (0 - 1)) in
-        let _ = (if lo2 > 1000 || hi2 > 1000 then fail "mere-ruby: regexp: quantifier too large" else ()) in
+        let _ = (if (lo2 > 1000 || hi2 > 1000) && (if map_has rx_lenient "n" then false else true) then fail "mere-ruby: regexp: quantifier too large" else ()) in
         let _ = (if ok2 && lo2 > hi2 then fail "mere-ruby: regexp: bad repeat range" else ()) in
         (true, lo2, hi2, p3 + 1))
      else (false, 0, 0, p))
   else if p2 < str_len pat && str_eq (char_at pat p2) "}" && ok1 then
-    (let _ = (if lo > 1000 then fail "mere-ruby: regexp: quantifier too large" else ()) in
+    (let _ = (if lo > 1000 && (if map_has rx_lenient "n" then false else true) then fail "mere-ruby: regexp: quantifier too large" else ()) in
      (true, lo, lo, p2 + 1))
   else (false, 0, 0, p)
 and rxp_num = fn (pat: str) -> fn (p: int) -> fn (acc: int) -> fn (found: bool) ->
@@ -12600,10 +12685,36 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
     else if str_eq c "a" then (NChar (chr 7), p + 1, g)
     else if str_eq c "x" then rxp_hex pat (p + 1) g
     else if c >= "1" && c <= "9" then (NBackref (int_of_str c, str_contains fl "i"), p + 1, g)
-    else if str_eq c "G" || str_eq c "k" || str_eq c "g" || str_eq c "p" || str_eq c "u" ||
-            str_eq c "K" || str_eq c "R" || str_eq c "X" || str_eq c "0" then
-      fail "mere-ruby: regexp: unsupported escape"
+    // \cX / \C-X control escapes: the char's code masked to the control range.
+    else if str_eq c "c" then
+      (if p + 1 < str_len pat then (NChar (chr (rxp_ord (char_at pat (p + 1)) - (rxp_ord (char_at pat (p + 1)) / 32) * 32)), p + 2, g)
+       else fail "mere-ruby: regexp parse: bad \\c")
+    else if str_eq c "C" then
+      (if p + 2 < str_len pat && str_eq (char_at pat (p + 1)) "-" then
+         (NChar (chr (rxp_ord (char_at pat (p + 2)) - (rxp_ord (char_at pat (p + 2)) / 32) * 32)), p + 3, g)
+       else fail "mere-ruby: regexp parse: bad \\C-")
+    // \0nn octal escape (up to two more octal digits).
+    else if str_eq c "0" then rxp_oct pat (p + 1) g 0 2
+    // \R: a line break (\r\n or a single line-break char).
+    else if str_eq c "R" then
+      (NGroup (NAlt (Cons (NSeq (Cons (NChar "\r", Cons (NChar "\n", Nil))),
+                           Cons (NClass (Cons (CChr "\n", Cons (CChr "\r", Cons (CChr (chr 11), Cons (CChr (chr 12), Nil)))), false, false), Nil))), 0, ""),
+       p + 1, g)
+    else if str_eq c "G" || str_eq c "k" || str_eq c "g" || str_eq c "p" ||
+            str_eq c "K" || str_eq c "X" || str_eq c "u" then
+      (if map_has rx_lenient "n" then (NEmpty, p + 1, g) else fail "mere-ruby: regexp: unsupported escape")
     else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
+
+// byte ordinal (parse-time only; compiled programs are cached).
+and rxp_ord = fn (c: str) -> rxp_ord_go c 0
+and rxp_ord_go = fn (c: str) -> fn (n: int) ->
+  if n > 255 then 0 else if str_eq (chr n) c then n else rxp_ord_go c (n + 1)
+
+// \0[oo]: octal char escape.
+and rxp_oct = fn (pat: str) -> fn (p: int) -> fn (g: int) -> fn (acc: int) -> fn (k: int) ->
+  if k > 0 && p < str_len pat && char_at pat p >= "0" && char_at pat p <= "7" then
+    rxp_oct pat (p + 1) g (acc * 8 + int_of_str (char_at pat p)) (k - 1)
+  else (NChar (chr acc), p, g)
 
 and rxp_hexv = fn (c: str) ->
   if (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F") then str_to_int_base c 16
@@ -12640,12 +12751,20 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
            (NLookB (n, true), rxp_close pat p2, g2))
         else
           (let (nm, p2) = rxp_name pat (p + 2) ">" "" in
+           let _ = rxp_name_check nm in
            let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
            (NGroup (n, g, nm), rxp_close pat p3, g2)))
      else if str_eq c2 "'" then
        (let (nm, p2) = rxp_name pat (p + 2) "'" "" in
+        let _ = rxp_name_check nm in
         let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
         (NGroup (n, g, nm), rxp_close pat p3, g2))
+     // (?(cond)...) conditional, (?>...) atomic, (?~...) absent: valid Ruby
+     // that this engine defers — lenient validation skips the balanced group.
+     else if str_eq c2 "(" || str_eq c2 ">" || str_eq c2 "~" || str_eq c2 "#" then
+       (if str_eq c2 "#" then (NEmpty, rxp_skip_group pat p 1, g)   // (?# comment) is fully supported by skipping
+        else if map_has rx_lenient "n" then (NEmpty, rxp_skip_group pat p 1, g)
+        else fail "mere-ruby: regexp: unsupported group")
      else
        // (?imx-imx:...) scoped or (?imx-imx) rest-of-sequence flags.
        let (fl2, p2, colon) = rxp_flags pat (p + 1) fl "" false in
@@ -12670,6 +12789,7 @@ and rxp_flags = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (seen: str) -
        rxp_flags pat (p + 1) fl2 (seen ++ c) neg)
     // a/d/u (char-class semantics selectors) are accepted and ignored.
     else if str_eq c "a" || str_eq c "d" || str_eq c "u" then rxp_flags pat (p + 1) fl seen neg
+    else if map_has rx_lenient "n" then rxp_flags pat (p + 1) fl seen neg
     else fail "mere-ruby: regexp: unknown inline flag"
 and rxp_flag_del = fn (fl: str) -> fn (c: str) ->
   rxp_flag_del_go fl c 0 ""
@@ -12681,6 +12801,63 @@ and rxp_flag_del_go = fn (fl: str) -> fn (c: str) -> fn (i: int) -> fn (acc: str
 and rxp_close = fn (pat: str) -> fn (p: int) ->
   if p < str_len pat && str_eq (char_at pat p) ")" then p + 1
   else fail "mere-ruby: regexp: unmatched ("
+
+// skip a balanced group body (p is just after the opening paren's contents
+// start); returns the position after the matching ")".
+and rxp_skip_group = fn (pat: str) -> fn (p: int) -> fn (depth: int) ->
+  if p >= str_len pat then fail "mere-ruby: regexp: unmatched ("
+  else
+    let c = char_at pat p in
+    if str_eq c "\\" then rxp_skip_group pat (p + 2) depth
+    else if str_eq c "[" then rxp_skip_group pat (rxp_skip_class pat (p + 1)) depth
+    else if str_eq c "(" then rxp_skip_group pat (p + 1) (depth + 1)
+    else if str_eq c ")" then (if depth == 1 then p + 1 else rxp_skip_group pat (p + 1) (depth - 1))
+    else rxp_skip_group pat (p + 1) depth
+and rxp_skip_class = fn (pat: str) -> fn (p: int) ->
+  if p >= str_len pat then fail "mere-ruby: regexp: unterminated class"
+  else
+    let c = char_at pat p in
+    if str_eq c "\\" then rxp_skip_class pat (p + 2)
+    else if str_eq c "]" then p + 1
+    else rxp_skip_class pat (p + 1)
+
+// a capture-group name cannot start with a digit or a minus.
+and rxp_name_check = fn (nm: str) ->
+  if str_len nm == 0 then fail "mere-ruby: regexp parse: empty group name"
+  else
+    let c = char_at nm 0 in
+    if (c >= "0" && c <= "9") || str_eq c "-" then fail "mere-ruby: regexp parse: bad group name"
+    else ()
+
+// validate a regex literal at ruby-parse time: lenient mode accepts the
+// constructs the engine defers to the legacy matcher, so only genuinely
+// invalid syntax fails here (Ruby's SyntaxError; RegexpError via Regexp.new).
+and rx_validate = fn (body: str) -> fn (fl: str) ->
+  let _ = map_set rx_lenient "n" VNil in
+  let ok = try_or (fn (u: unit) -> let _ = rxp_parse body fl in true) false in
+  let _ = map_delete rx_lenient "n" in
+  ok
+
+// validate the regex literals recorded since the last check; the first
+// invalid one fails (a SyntaxError at the enclosing parse boundary).
+and rx_check_pending = fn (u: unit) ->
+  let n = (if map_has rx_pending "n" then (match map_get rx_pending "n" with VInt k -> k | _ -> 0) else 0) in
+  let d = (if map_has rx_pending "done" then (match map_get rx_pending "done" with VInt k -> k | _ -> 0) else 0) in
+  let _ = rx_check_go d n in
+  map_set rx_pending "done" (VInt n)
+and rx_check_go = fn (i: int) -> fn (n: int) ->
+  if i >= n then ()
+  else
+    let k = (match map_get rx_pending ("e" ++ str_of_int i) with VStr h -> sget h | _ -> "") in
+    let nl = rx_key_nl k 0 in
+    let fl = substring k 0 nl in
+    let body = substring k (nl + 1) (str_len k) in
+    if rx_validate body fl then rx_check_go (i + 1) n
+    else fail "mere-ruby: regexp: invalid regular expression"
+and rx_key_nl = fn (k: str) -> fn (i: int) ->
+  if i >= str_len k then i
+  else if str_eq (char_at k i) "\n" then i
+  else rx_key_nl k (i + 1)
 
 and rxp_name = fn (pat: str) -> fn (p: int) -> fn (term: str) -> fn (acc: str) ->
   if p >= str_len pat then fail "mere-ruby: regexp: unterminated group name"
@@ -13799,6 +13976,7 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
   let toks = lex_go src 0 in
   let (prog, rest) = parse_stmts toks Nil in
+  let _ = rx_check_pending () in
   let _ =
     (match rest with
      | Cons (TEOF, _) -> ()
@@ -13841,6 +14019,9 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set consts "Encoding::SHIFT_JIS" (mk_enc "Shift_JIS") in
   let _ = map_set consts "Encoding::Shift_JIS" (if map_has enc_objs "Shift_JIS" then map_get enc_objs "Shift_JIS" else mkstr "Shift_JIS") in
   let _ = map_set consts "Encoding::EUC_JP" (mk_enc "EUC-JP") in
+  let _ = map_set consts "Regexp::IGNORECASE" (VInt 1) in
+  let _ = map_set consts "Regexp::EXTENDED" (VInt 2) in
+  let _ = map_set consts "Regexp::MULTILINE" (VInt 4) in
   let _ = map_set consts "Math::PI" (VFlt 3.141592653589793) in
   let _ = map_set consts "Math::E" (VFlt 2.718281828459045) in
   // TOPLEVEL_BINDING: a binding whose lexical scope is the top level, so
@@ -13864,6 +14045,7 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "ZeroDivisionError" "StandardError" in
   let _ = map_set sup "NotImplementedError" "StandardError" in
   let _ = map_set sup "EncodingError" "StandardError" in
+  let _ = map_set sup "RegexpError" "StandardError" in
   let _ = map_set sup "Encoding::UndefinedConversionError" "EncodingError" in
   let _ = map_set sup "Encoding::CompatibilityError" "EncodingError" in
   let _ = map_set sup "NameError" "StandardError" in
