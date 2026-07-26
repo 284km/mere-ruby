@@ -3379,6 +3379,17 @@ and parse_stmt_id = fn toks ->
        | Cons (TNL, _) -> (SVis (mode, Nil), r)
        | Cons (TEOF, _) -> (SVis (mode, Nil), r)
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis (mode, names), r2)
+       // `private def m ... end` — the arg is a method definition; parse it,
+       // then mark it (def evaluates to its name symbol in Ruby).
+       | Cons (TId dw, _) ->
+         if str_eq dw "def" then
+           (let (ds, r2) = parse_stmt r in
+            match ds with
+            | SDef (dn, _, _, _) ->
+              let base = if str_len dn > 5 && str_eq (substring dn 0 5) "self." then dn else dn in
+              (SBegin (Cons (ds, Cons (SVis (mode, Cons (base, Nil)), Nil)), Nil, Nil, Nil), r2)
+            | _ -> (ds, r2))
+         else let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
     else if str_eq id "require" || str_eq id "require_relative" then
       // load a file into the same world (each file gets a fresh top-level).
@@ -8281,13 +8292,51 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     // class, as symbols (enumerated from the method table via map_iter). The
     // inherited form (no arg / true) is not distinguished — own methods only.
     else if str_eq name "instance_methods" then
+      // no arg / true: inherited methods included (the ancestor walk of
+      // collect_methods, privates excluded); false: own methods only.
+      (let inherited = (match args with Cons (VBool false, _) -> false | _ -> true) in
+       if inherited then
+         (let names = map_new () in
+          let _ = collect_methods world c names in
+          let out = map_new () in
+          let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
+          arr_new (idx_to_list out 0 (map_len out)))
+       else
+         (let (meths0, _, _, _) = world in
+          let pfx = c ++ "#" in
+          let plen = str_len pfx in
+          let tmp = map_new () in
+          let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
+            if str_len k > plen && str_eq (substring k 0 plen) pfx
+               && (if str_contains (substring k plen (str_len k)) "#" then false else true)
+            then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
+            else ()) in
+          arr_new (idx_to_list tmp 0 (map_len tmp))))
+    // method_defined? family: resolve the defining ancestor, then check the
+    // visibility tables. method_defined? is true for public + protected.
+    else if str_eq name "method_defined?" || str_eq name "public_method_defined?" ||
+            str_eq name "private_method_defined?" || str_eq name "protected_method_defined?" then
       (let (meths0, _, _, _) = world in
-       let pfx = c ++ "#" in
+       let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr h2, _) -> sget h2 | _ -> "") in
+       let origin = (if map_has meths0 (c ++ "#" ++ nm) then c else lookup_anc world (ancestors_of world c) nm) in
+       if str_eq origin "" then VBool false
+       else
+         // meth_private/meth_protected are the dispatch oracles (they also see
+         // the inline `private def` regime, not just the privates table).
+         let priv = meth_private world c nm in
+         let prot = meth_protected world c nm in
+         if str_eq name "method_defined?" then VBool (if priv then false else true)
+         else if str_eq name "public_method_defined?" then VBool (if priv || prot then false else true)
+         else if str_eq name "private_method_defined?" then VBool priv
+         else VBool prot)
+    // singleton_methods: the class's own singleton-class methods.
+    else if str_eq name "singleton_methods" then
+      (let (meths0, _, _, _) = world in
+       let pfx = "(sng:" ++ c ++ ")#" in
        let plen = str_len pfx in
        let tmp = map_new () in
        let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
          if str_len k > plen && str_eq (substring k 0 plen) pfx
-            && (if str_contains (substring k plen (str_len k)) "#" then false else true)
          then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -8474,6 +8523,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        let out = map_new () in
        let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
        arr_new (idx_to_list out 0 (map_len out)))
+    // Object#singleton_methods: methods defined on this object's singleton.
+    else if str_eq name "singleton_methods" then
+      (let (meths9, _, _, _) = world in
+       let pfx = "(sng:" ++ str_of_int id ++ ")#" in
+       let plen = str_len pfx in
+       let tmp = map_new () in
+       let _ = map_iter meths9 (fn (k: str) -> fn (v: Meth) ->
+         if str_len k > plen && str_eq (substring k 0 plen) pfx
+         then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
+         else ()) in
+       arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if str_eq name "instance_variable_get" then
       (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_arg_name (to_s v) in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
     else if str_eq name "instance_variable_set" then
@@ -11345,6 +11405,11 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
   let cscope = (if map_has cenv "__cscope" then (match map_get cenv "__cscope" with VStr s -> let s = sget s in s | _ -> cls) else cls) in
   match body with
   | Nil -> FNext VNil
+  // a rescue-less `begin ... end` grouping in a class body is spliced inline,
+  // so def / visibility-mode threading applies to its statements (needed for
+  // `private def m ... end`, which the parser lowers to begin(def; private :m)).
+  | Cons (SBegin (bbody, Nil, Nil, Nil), rest) ->
+    register_class_v world cls (list_append_stmt bbody rest) vis cenv
   | Cons (s, rest) ->
     let vis2 = (match s with SVis (m, Nil) -> m | _ -> vis) in
     let f =
