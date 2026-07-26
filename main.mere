@@ -6512,11 +6512,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // named group (only for a literal regex on the LHS, per Ruby).
     else if str_eq op "=~" && (match a with ERegex _ -> true | _ -> false) then
       (match a with
-       | ERegex (pat, _) ->
+       | ERegex (pat, pfl) ->
          let vb = eval_e env world blk b in
          (match vb with
           | VStr sv -> let sv = sget sv in
-            let r = rx_do_match world pat sv in
+            let r = rx_do_match world pat pfl sv in
             let _ = set_named_caps env pat 0 0 in r
           | _ -> VNil)
        | _ -> VNil)
@@ -6572,8 +6572,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "=~" then
       (let vb = eval_e env world blk b in
        match va0 with
-       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, _) -> rx_do_match world p sv | _ -> VNil)
-       | VRegex (p, _) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p sv | _ -> VNil)
+       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> rx_do_match world p pf sv | _ -> VNil)
+       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p pf sv | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = eval_e env world blk b in
@@ -9005,8 +9005,8 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
   else if str_eq name "=~" then
     (match recv with
-     | VRegex (p, _) -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p sv | _ -> VNil)
-     | VStr sv -> let sv = sget sv in (match args with Cons (VRegex (p, _), _) -> rx_do_match world p sv | _ -> VNil)
+     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p pf sv | _ -> VNil)
+     | VStr sv -> let sv = sget sv in (match args with Cons (VRegex (p, pf), _) -> rx_do_match world p pf sv | _ -> VNil)
      | _ -> VNil)
   // block-less enumerators: return an array standing in for the Enumerator
   // (so `.to_a` / `.map` / `.each` chain naturally). Ambiguous bare `.map` /
@@ -9055,8 +9055,8 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> VBool false)
   else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
     (match recv with
-     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, _), _) -> (let _ = rx_do_match world p sv in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
-     | VRegex (p, _) -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> (let _ = rx_do_match world p pf sv in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p pf (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
      | _ -> VNil)
   // fetch raises a catchable KeyError / IndexError when absent (no default/block).
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
@@ -12126,9 +12126,9 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
       let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
       truthy (invoke world noblk0 cand ocl "===" (Cons (v, Nil)))
     else rb_eq cand v
-  | VRegex (p, _) ->
+  | VRegex (p, pf) ->
     (match v with
-     | VStr sv -> let sv = sget sv in (match rx_do_match world p sv with VNil -> false | _ -> true)
+     | VStr sv -> let sv = sget sv in (match rx_do_match world p pf sv with VNil -> false | _ -> true)
      | _ -> false)
   | VRange (lo, hi, excl) ->
     (match v with
@@ -13230,11 +13230,44 @@ and rx_hdr_end = fn (pat: str) -> fn (p: int) ->
     else rx_hdr_end pat (p + 1)
 
 // run a match and publish $~ (a MatchData instance) and $1..$9 globals.
-and rx_do_match = fn world -> fn (pat: str) -> fn (sv: str) ->
+// number of capture groups in a compiled program.
+and rxv_prog_ng = fn prog ->
+  match map_get prog "meta" with IMeta (_, ng) -> ng | _ -> 0
+
+// export a hit's capture saves into rx_caps ("s{g}"/"e{g}"), so the existing
+// consumers (rx_publish_at / rx_expand_rep / rx_scan_groups) work unchanged.
+and rxv_export_caps = fn (saves: (int * int) list) -> fn (ng: int) ->
   let _ = rx_clear_caps 1 in
-  let r = rx_index pat sv in
-  let _ = rx_publish world pat sv r in
-  r
+  rxv_export_go saves ng 1
+and rxv_export_go = fn (saves: (int * int) list) -> fn (ng: int) -> fn (g: int) ->
+  if g > ng || g > 9 then ()
+  else
+    let a = rxv_slot_get saves (2 * g) in
+    let b = rxv_slot_get saves (2 * g + 1) in
+    let _ = (if a >= 0 && b >= 0 then
+               (let _ = map_set rx_caps ("s" ++ str_of_int g) a in
+                map_set rx_caps ("e" ++ str_of_int g) b)
+             else ()) in
+    rxv_export_go saves ng (g + 1)
+
+// =~ / .match / ===: run the match and publish $~ / $1..$9. New engine with
+// legacy fallback for uncompilable patterns.
+and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) ->
+  match rxv_search pat fl sv 0 with
+  | RBadPat ->
+    (let _ = rx_clear_caps 1 in
+     let r = rx_index pat sv in
+     let _ = rx_publish world pat sv r in
+     r)
+  | RNoHit ->
+    (let _ = rx_clear_caps 1 in
+     let _ = map_set globals "~" VNil in
+     let _ = rx_pub_groups sv 1 false in
+     VNil)
+  | RHit (st, en, saves) ->
+    (let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat))) in
+     let _ = rx_publish_at world sv st en in
+     VInt st)
 
 // index of the next `>` at or after p (for a (?<name> header).
 and rx_name_end = fn (pat: str) -> fn (p: int) ->
@@ -13287,17 +13320,20 @@ and rx_publish = fn world -> fn (pat: str) -> fn (sv: str) -> fn (r: Val) ->
    | VNil ->
      let _ = map_set globals "~" VNil in rx_pub_groups sv 1 false
    | _ ->
-     let (meths, sup, ocls, ivars) = world in
-     let id = map_len ocls in
-     let _ = map_set ocls (str_of_int id) "MatchData" in
-     let _ = map_set globals "~" (VObj id) in
-     // store the whole match (group 0) and groups 1..9 on the object so
-     // MatchData#[] can read them later (globals get clobbered by re-matches).
      let st = (match r with VInt p -> p | _ -> 0) in
      let en = (let e = rxe_alts pat (rxe_start pat) sv st in if e < 0 then st else e) in
-     let _ = map_set ivars (str_of_int id ++ "@0") (mkstr (substring sv st en)) in
-     let _ = rx_store_groups ivars id sv 1 in
-     rx_pub_groups sv 1 true)
+     rx_publish_at world sv st en)
+
+// publish a match at (st, en): a MatchData in $~ (group 0 = the whole match,
+// groups 1..9 read from rx_caps) and the $1..$9 globals.
+and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = map_len ocls in
+  let _ = map_set ocls (str_of_int id) "MatchData" in
+  let _ = map_set globals "~" (VObj id) in
+  let _ = map_set ivars (str_of_int id ++ "@0") (mkstr (substring sv st en)) in
+  let _ = rx_store_groups ivars id sv 1 in
+  rx_pub_groups sv 1 true
 
 and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
   if g > 9 then ()
