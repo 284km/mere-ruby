@@ -250,6 +250,21 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
            | NLook of RNode * bool | NLookB of RNode * bool   // body, negated
            | NFlagsRest of str
            | NEmpty;
+// Compiled instructions (a program is an int-key Map "0".."N-1" -> RInst,
+// plus "meta" -> IMeta (count, ngroups) and "name:<x>" -> IMeta (gnum, 0)).
+type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
+           | IClass of RCls list * bool * bool
+           | ISplit of int * int | IJmp of int | ISave of int
+           | IBOL | IEOL | IBOS | IEOS | IEOSNL
+           | IWordB of bool | IBackref of int * bool
+           | ILook of int * bool | ILookB of int * int * bool
+           | IMark of int | ICheck of int
+           | IOk | IMatch
+           | IMeta of int * int;
+// VM results: a match's end index + capture saves (immutable assoc list,
+// newest first), and the search wrapper's hit / no-hit / uncompilable-pattern.
+type RxRes = RFound of int * (int * int) list | RFail;
+type RxHit = RHit of int * int * (int * int) list | RNoHit | RBadPat;
 
 // ---- mutable-array store (M10) ------------------------------------------
 // A single top-level Map captured by every function below (no threading):
@@ -445,6 +460,10 @@ let cvars = map_new ();
 // regex capture-group spans recorded during the latest match attempt
 // ("sN"/"eN" -> string index).
 let rx_caps = map_new ();
+// compiled-regex program cache: "flags<SOH>pattern" -> prog map; rx_bad marks
+// patterns the new engine cannot compile (the legacy matcher handles them).
+let rx_progs = map_new ();
+let rx_bad = map_new ();
 // array handles currently being inspected — breaks self-referential arrays
 // (Ruby prints such a cycle as "[...]") instead of recursing forever.
 let insp_seen = map_new ();
@@ -6559,8 +6578,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "!~" then
       (let vb = eval_e env world blk b in
        match va0 with
-       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, _) -> VBool (if rx_match p sv then false else true) | _ -> VBool true)
-       | VRegex (p, _) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p sv then false else true) | _ -> VBool true)
+       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | _ -> VBool true)
     else if str_eq op "<=>" then
       (let vb = eval_e env world blk b in
@@ -9031,8 +9050,8 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // String#match? / #match (and the Regexp receiver forms).
   else if str_eq name "match?" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
     (match recv with
-     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, _), _) -> VBool (rx_match p sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) sv) | _ -> VBool false)
-     | VRegex (p, _) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p (sget sv)) | _ -> VBool false)
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> VBool (rx_match p pf sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv) | _ -> VBool false)
+     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | _ -> VBool false)
      | _ -> VBool false)
   else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
     (match recv with
@@ -12706,9 +12725,326 @@ and rxp_posix_name = fn (pat: str) -> fn (p: int) -> fn (negp: bool) -> fn (acc:
   else if p >= str_len pat then fail "mere-ruby: regexp: unterminated posix class"
   else rxp_posix_name pat (p + 1) negp (acc ++ char_at pat p)
 
+// ---- regex compiler (RNode -> instruction program) ------------------------
+// A program is an int-key Map ("0".."N-1" -> RInst) built by rxc_emit, which
+// returns the next free pc. Forward jump targets are reserved with -1 and
+// patched (rxc_patch). Loop-guard mark slots use 100000+pc (disjoint from
+// the 2g/2g+1 capture slots).
+
+and rxc_patch = fn prog -> fn (at: int) -> fn (target: int) ->
+  match map_get prog (str_of_int at) with
+  | ISplit (a, b) -> map_set prog (str_of_int at) (ISplit ((if a < 0 then target else a), (if b < 0 then target else b)))
+  | IJmp _ -> map_set prog (str_of_int at) (IJmp target)
+  | _ -> ()
+and rxc_patch_all = fn prog -> fn (ats: int list) -> fn (target: int) ->
+  match ats with Nil -> () | Cons (a, rest) -> let _ = rxc_patch prog a target in rxc_patch_all prog rest target
+
+// nullable: can the node match the empty string? (drives the empty-loop guard)
+and rxc_nullable = fn (n: RNode) ->
+  match n with
+  | NChar _ -> false | NCharCI _ -> false | NAny -> false | NAnyNL -> false
+  | NClass (_, _, _) -> false | NBackref (_, _) -> false
+  | NSeq xs -> rxc_null_all xs
+  | NAlt xs -> rxc_null_any xs
+  | NRep (b, lo, _, _) -> lo == 0 || rxc_nullable b
+  | NGroup (b, _, _) -> rxc_nullable b
+  | _ -> true
+and rxc_null_all = fn (xs: RNode list) ->
+  match xs with Nil -> true | Cons (h, t) -> rxc_nullable h && rxc_null_all t
+and rxc_null_any = fn (xs: RNode list) ->
+  match xs with Nil -> false | Cons (h, t) -> rxc_nullable h || rxc_null_any t
+
+// fixed byte width of a node (-1 = variable), for lookbehind.
+and rxc_width = fn (n: RNode) ->
+  match n with
+  | NChar _ -> 1 | NCharCI _ -> 1 | NAny -> 1 | NAnyNL -> 1 | NClass (_, _, _) -> 1
+  | NSeq xs -> rxc_width_sum xs
+  | NAlt xs -> rxc_width_alt xs
+  | NRep (b, lo, hi, _) -> (let w = rxc_width b in if w < 0 || (if hi == lo then false else true) then 0 - 1 else w * lo)
+  | NGroup (b, _, _) -> rxc_width b
+  | NBackref (_, _) -> 0 - 1
+  | NEmpty -> 0 | NBOL -> 0 | NEOL -> 0 | NBOS -> 0 | NEOS -> 0 | NEOSNL -> 0
+  | NWordB _ -> 0 | NLook (_, _) -> 0 | NLookB (_, _) -> 0
+  | NFlagsRest _ -> 0
+and rxc_width_sum = fn (xs: RNode list) ->
+  match xs with
+  | Nil -> 0
+  | Cons (h, t) ->
+    let w = rxc_width h in
+    if w < 0 then 0 - 1 else (let r = rxc_width_sum t in if r < 0 then 0 - 1 else w + r)
+and rxc_width_alt = fn (xs: RNode list) ->
+  match xs with
+  | Nil -> 0
+  | Cons (h, Nil) -> rxc_width h
+  | Cons (h, t) ->
+    let w = rxc_width h in
+    let r = rxc_width_alt t in
+    if w < 0 || r < 0 || (if w == r then false else true) then 0 - 1 else w
+
+and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
+  match n with
+  | NEmpty -> pc
+  | NFlagsRest _ -> pc
+  | NChar c -> let _ = map_set prog (str_of_int pc) (IChar c) in pc + 1
+  | NCharCI c -> let _ = map_set prog (str_of_int pc) (ICharCI c) in pc + 1
+  | NAny -> let _ = map_set prog (str_of_int pc) IAny in pc + 1
+  | NAnyNL -> let _ = map_set prog (str_of_int pc) IAnyNL in pc + 1
+  | NClass (items, neg, ci) -> let _ = map_set prog (str_of_int pc) (IClass (items, neg, ci)) in pc + 1
+  | NBOL -> let _ = map_set prog (str_of_int pc) IBOL in pc + 1
+  | NEOL -> let _ = map_set prog (str_of_int pc) IEOL in pc + 1
+  | NBOS -> let _ = map_set prog (str_of_int pc) IBOS in pc + 1
+  | NEOS -> let _ = map_set prog (str_of_int pc) IEOS in pc + 1
+  | NEOSNL -> let _ = map_set prog (str_of_int pc) IEOSNL in pc + 1
+  | NWordB b -> let _ = map_set prog (str_of_int pc) (IWordB b) in pc + 1
+  | NBackref (g, ci) -> let _ = map_set prog (str_of_int pc) (IBackref (g, ci)) in pc + 1
+  | NSeq xs -> rxc_emit_seq prog pc xs
+  | NAlt xs ->
+    let (pc2, jmps) = rxc_emit_alt prog pc xs Nil in
+    let _ = rxc_patch_all prog jmps pc2 in
+    pc2
+  | NGroup (b, gn, nm) ->
+    if gn == 0 then rxc_emit prog pc b
+    else
+      (let _ = (if str_eq nm "" then () else map_set prog ("name:" ++ nm) (IMeta (gn, 0))) in
+       let _ = map_set prog (str_of_int pc) (ISave (2 * gn)) in
+       let pc2 = rxc_emit prog (pc + 1) b in
+       let _ = map_set prog (str_of_int pc2) (ISave (2 * gn + 1)) in
+       pc2 + 1)
+  | NRep (b, lo, hi, greedy) ->
+    let pc2 = rxc_emit_times prog pc b lo in
+    if hi < 0 then
+      // star loop: L1 split(body, out) / body [guarded] jmp L1 / out.
+      (let l1 = pc2 in
+       let bodypc = l1 + 1 in
+       let guard = rxc_nullable b in
+       let bstart = (if guard then bodypc + 1 else bodypc) in
+       let _ = (if guard then map_set prog (str_of_int bodypc) (IMark (100000 + l1)) else ()) in
+       let bend = rxc_emit prog bstart b in
+       let cend = (if guard then (let _ = map_set prog (str_of_int bend) (ICheck (100000 + l1)) in bend + 1) else bend) in
+       let _ = map_set prog (str_of_int cend) (IJmp l1) in
+       let out = cend + 1 in
+       let _ = map_set prog (str_of_int l1) (if greedy then ISplit (bodypc, out) else ISplit (out, bodypc)) in
+       out)
+    else
+      // (hi - lo) optional copies, all exiting to the shared out label.
+      (let (pc3, pends) = rxc_emit_opts prog pc2 b (hi - lo) greedy Nil in
+       let _ = rxc_patch_all prog pends pc3 in
+       pc3)
+  | NLook (b, negd) ->
+    // jmp AFTER; SUB: body IOk; AFTER: ILook(SUB, neg).
+    (let subpc = pc + 1 in
+     let pc2 = rxc_emit prog subpc b in
+     let _ = map_set prog (str_of_int pc2) IOk in
+     let _ = map_set prog (str_of_int pc) (IJmp (pc2 + 1)) in
+     let _ = map_set prog (str_of_int (pc2 + 1)) (ILook (subpc, negd)) in
+     pc2 + 2)
+  | NLookB (b, negd) ->
+    (let w = rxc_width b in
+     let _ = (if w < 0 then fail "mere-ruby: regexp: variable-length lookbehind unsupported" else ()) in
+     let subpc = pc + 1 in
+     let pc2 = rxc_emit prog subpc b in
+     let _ = map_set prog (str_of_int pc2) IOk in
+     let _ = map_set prog (str_of_int pc) (IJmp (pc2 + 1)) in
+     let _ = map_set prog (str_of_int (pc2 + 1)) (ILookB (subpc, w, negd)) in
+     pc2 + 2)
+and rxc_emit_seq = fn prog -> fn (pc: int) -> fn (xs: RNode list) ->
+  match xs with Nil -> pc | Cons (h, t) -> rxc_emit_seq prog (rxc_emit prog pc h) t
+and rxc_emit_times = fn prog -> fn (pc: int) -> fn (b: RNode) -> fn (k: int) ->
+  if k <= 0 then pc else rxc_emit_times prog (rxc_emit prog pc b) b (k - 1)
+and rxc_emit_opts = fn prog -> fn (pc: int) -> fn (b: RNode) -> fn (k: int) -> fn (greedy: bool) -> fn (pends: int list) ->
+  if k <= 0 then (pc, pends)
+  else
+    let bodypc = pc + 1 in
+    let pc2 = rxc_emit prog bodypc b in
+    let _ = map_set prog (str_of_int pc) (if greedy then ISplit (bodypc, 0 - 1) else ISplit (0 - 1, bodypc)) in
+    rxc_emit_opts prog pc2 b (k - 1) greedy (Cons (pc, pends))
+and rxc_emit_alt = fn prog -> fn (pc: int) -> fn (xs: RNode list) -> fn (jmps: int list) ->
+  match xs with
+  | Nil -> (pc, jmps)
+  | Cons (b, Nil) -> (rxc_emit prog pc b, jmps)
+  | Cons (b, rest) ->
+    let bodypc = pc + 1 in
+    let pc2 = rxc_emit prog bodypc b in
+    let _ = map_set prog (str_of_int pc) (ISplit (bodypc, pc2 + 1)) in
+    let _ = map_set prog (str_of_int pc2) (IJmp (0 - 1)) in
+    rxc_emit_alt prog (pc2 + 1) rest (Cons (pc2, jmps))
+
+// compile (with per-pattern cache); fails on unsupported constructs.
+and rxc_get = fn (pat: str) -> fn (fl: str) ->
+  let key = fl ++ chr 1 ++ pat in
+  if map_has rx_progs key then map_get rx_progs key
+  else
+    let n = rxp_parse pat fl in
+    let prog = map_new () in
+    let ng = rxp_ngroups n in
+    let endpc = rxc_emit prog 0 n in
+    let _ = map_set prog (str_of_int endpc) IMatch in
+    let _ = map_set prog ("meta") (IMeta (endpc + 1, ng)) in
+    let _ = map_set rx_progs key prog in
+    prog
+
+// ---- regex VM (single executor: end index + immutable capture saves) ------
+
+and rxv_slot_get = fn (saves: (int * int) list) -> fn (k: int) ->
+  match saves with
+  | Nil -> 0 - 1
+  | Cons ((k2, v), rest) -> if k2 == k then v else rxv_slot_get rest k
+
+and rxv_is_word = fn (c: str) ->
+  (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || str_eq c "_"
+
+and rxv_cls_one = fn (it: RCls) -> fn (c: str) ->
+  match it with
+  | CChr x -> str_eq x c
+  | CRange (lo, hi) -> c >= lo && c <= hi
+  | CDigit -> c >= "0" && c <= "9"
+  | CNDigit -> if c >= "0" && c <= "9" then false else true
+  | CWord -> rxv_is_word c
+  | CNWord -> if rxv_is_word c then false else true
+  | CSpace -> str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "\r" || str_eq c (chr 12) || str_eq c (chr 11)
+  | CNSpace -> if str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "\r" || str_eq c (chr 12) || str_eq c (chr 11) then false else true
+  | CHex -> (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+  | CNHex -> if (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F") then false else true
+  | CPosix (nm, negp) ->
+    let r = rxv_posix nm c in
+    if negp then (if r then false else true) else r
+and rxv_posix = fn (nm: str) -> fn (c: str) ->
+  if str_eq nm "alpha" then (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+  else if str_eq nm "alnum" then (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
+  else if str_eq nm "digit" then c >= "0" && c <= "9"
+  else if str_eq nm "xdigit" then (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+  else if str_eq nm "space" then str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "\r" || str_eq c (chr 12) || str_eq c (chr 11)
+  else if str_eq nm "upper" then c >= "A" && c <= "Z"
+  else if str_eq nm "lower" then c >= "a" && c <= "z"
+  else if str_eq nm "word" then rxv_is_word c
+  else if str_eq nm "blank" then str_eq c " " || str_eq c "\t"
+  else if str_eq nm "cntrl" then c < " " || str_eq c (chr 127)
+  else if str_eq nm "print" then c >= " " && (if str_eq c (chr 127) then false else true)
+  else if str_eq nm "graph" then c > " " && (if str_eq c (chr 127) then false else true)
+  else if str_eq nm "punct" then (c > " " && c < "0") || (c > "9" && c < "A") || (c > "Z" && c < "a" && (if str_eq c "_" then false else true)) || (c > "z" && c <= "~")
+  else if str_eq nm "ascii" then c <= chr 127
+  else fail "mere-ruby: regexp: unknown posix class"
+
+and rxv_cls = fn (items: RCls list) -> fn (neg: bool) -> fn (ci: bool) -> fn (c: str) ->
+  let hit = rxv_cls_list items c || (ci && rxv_cls_list items (rxv_swapcase c)) in
+  if neg then (if hit then false else true) else hit
+and rxv_cls_list = fn (items: RCls list) -> fn (c: str) ->
+  match items with Nil -> false | Cons (h, t) -> rxv_cls_one h c || rxv_cls_list t c
+and rxv_swapcase = fn (c: str) ->
+  if c >= "a" && c <= "z" then str_upcase c
+  else if c >= "A" && c <= "Z" then str_downcase_c c
+  else c
+and str_downcase_c = fn (c: str) ->
+  str_downcase_c_go c 0
+and str_downcase_c_go = fn (c: str) -> fn (i: int) ->
+  if i >= 26 then c
+  else if str_eq (char_at "ABCDEFGHIJKLMNOPQRSTUVWXYZ" i) c then char_at "abcdefghijklmnopqrstuvwxyz" i
+  else str_downcase_c_go c (i + 1)
+
+and rxv_fetch = fn prog -> fn (pc: int) -> map_get prog (str_of_int pc)
+
+and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
+           -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
+  match rxv_fetch prog pc with
+  | IMatch -> RFound (i, saves)
+  | IOk -> RFound (i, saves)
+  | IChar c ->
+    if i < str_len s && str_eq (char_at s i) c then rxv_run prog s (pc + 1) (i + 1) saves bt
+    else rxv_fail prog s bt
+  | ICharCI c ->
+    if i < str_len s && (str_eq (char_at s i) c || str_eq (rxv_swapcase (char_at s i)) c || str_eq (char_at s i) (rxv_swapcase c))
+    then rxv_run prog s (pc + 1) (i + 1) saves bt
+    else rxv_fail prog s bt
+  | IAny ->
+    if i < str_len s && (if str_eq (char_at s i) "\n" then false else true) then rxv_run prog s (pc + 1) (i + 1) saves bt
+    else rxv_fail prog s bt
+  | IAnyNL ->
+    if i < str_len s then rxv_run prog s (pc + 1) (i + 1) saves bt
+    else rxv_fail prog s bt
+  | IClass (items, neg, ci) ->
+    if i < str_len s && rxv_cls items neg ci (char_at s i) then rxv_run prog s (pc + 1) (i + 1) saves bt
+    else rxv_fail prog s bt
+  | ISplit (a, b) -> rxv_run prog s a i saves (Cons ((b, i, saves), bt))
+  | IJmp t -> rxv_run prog s t i saves bt
+  | ISave slot -> rxv_run prog s (pc + 1) i (Cons ((slot, i), saves)) bt
+  | IMark k -> rxv_run prog s (pc + 1) i (Cons ((k, i), saves)) bt
+  | ICheck k ->
+    if rxv_slot_get saves k == i then rxv_fail prog s bt
+    else rxv_run prog s (pc + 1) i saves bt
+  | IBOL ->
+    if i == 0 || str_eq (char_at s (i - 1)) "\n" then rxv_run prog s (pc + 1) i saves bt
+    else rxv_fail prog s bt
+  | IEOL ->
+    if i >= str_len s || str_eq (char_at s i) "\n" then rxv_run prog s (pc + 1) i saves bt
+    else rxv_fail prog s bt
+  | IBOS -> if i == 0 then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt
+  | IEOS -> if i >= str_len s then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt
+  | IEOSNL ->
+    if i >= str_len s || (i == str_len s - 1 && str_eq (char_at s i) "\n") then rxv_run prog s (pc + 1) i saves bt
+    else rxv_fail prog s bt
+  | IWordB want ->
+    (let w1 = i > 0 && rxv_is_word (char_at s (i - 1)) in
+     let w2 = i < str_len s && rxv_is_word (char_at s i) in
+     let atb = (if w1 then (if w2 then false else true) else w2) in
+     if (if want then atb else (if atb then false else true)) then rxv_run prog s (pc + 1) i saves bt
+     else rxv_fail prog s bt)
+  | IBackref (g, ci) ->
+    (let a = rxv_slot_get saves (2 * g) in
+     let b = rxv_slot_get saves (2 * g + 1) in
+     if a < 0 || b < a then rxv_fail prog s bt
+     else
+       let seg = substring s a b in
+       let here = (if i + (b - a) <= str_len s then substring s i (i + (b - a)) else "") in
+       let eqv = (if ci then str_eq (str_upcase seg) (str_upcase here) else str_eq seg here) in
+       if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
+       else rxv_fail prog s bt)
+  | ILook (sub, negd) ->
+    (match rxv_run prog s sub i saves Nil with
+     | RFound (_, sv2) ->
+       if negd then rxv_fail prog s bt else rxv_run prog s (pc + 1) i sv2 bt
+     | RFail ->
+       if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
+  | ILookB (sub, w, negd) ->
+    (if i - w < 0 then (if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
+     else
+       match rxv_run prog s sub (i - w) saves Nil with
+       | RFound (e, sv2) ->
+         if e == i then (if negd then rxv_fail prog s bt else rxv_run prog s (pc + 1) i sv2 bt)
+         else (if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
+       | RFail ->
+         if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
+  | IMeta (_, _) -> rxv_fail prog s bt
+
+and rxv_fail = fn prog -> fn (s: str) -> fn (bt: (int * int * ((int * int) list)) list) ->
+  match bt with
+  | Nil -> RFail
+  | Cons ((pc, i, saves), rest) -> rxv_run prog s pc i saves rest
+
+// search: the leftmost match at or after `start` (compile cached; RBadPat
+// when the new engine cannot handle the pattern -> caller uses the legacy one).
+and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int) ->
+  let key = fl ++ chr 1 ++ pat in
+  if map_has rx_bad key then RBadPat
+  else
+    let ok = try_or (fn (u: unit) -> let _ = rxc_get pat fl in true) false in
+    if ok then rxv_search_go (map_get rx_progs key) s start (str_len s)
+    else (let _ = map_set rx_bad key VNil in RBadPat)
+and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
+  if i > len then RNoHit
+  else
+    match rxv_run prog s 0 i Nil Nil with
+    | RFound (e, sv) -> RHit (i, e, sv)
+    | RFail -> rxv_search_go prog s (i + 1) len
+
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
-and rx_match = fn (pat: str) -> fn (s: str) ->
+and rx_match = fn (pat: str) -> fn (fl: str) -> fn (s: str) ->
+  match rxv_search pat fl s 0 with
+  | RHit (_, _, _) -> true
+  | RNoHit -> false
+  | RBadPat -> rx_match_legacy pat s
+
+and rx_match_legacy = fn (pat: str) -> fn (s: str) ->
   if str_len pat > 0 && str_eq (char_at pat 0) "^" then rx_alts pat 1 s 0
   else rx_scan pat s 0
 
