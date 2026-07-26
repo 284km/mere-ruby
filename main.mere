@@ -8930,7 +8930,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (match recv with
           | VStr s -> let s = sget s in
             (match args with
-             | Cons (VRegex (pat, _), _) -> mkstr (rx_gsub_blk world newblk pat s (str_eq name "gsub") 0 "")
+             | Cons (VRegex (pat, pf), _) -> mkstr (rx_gsub_blk2 world newblk pat pf s (str_eq name "gsub") 0 "")
              | Cons (VStr pat, _) -> mkstr (rx_gsub_blk world newblk (sget pat) s (str_eq name "gsub") 0 "")
              | _ -> mkstr s)
           | _ -> recv)
@@ -9291,18 +9291,29 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           if st < 0 || st > n || len < 0 then VNil
           else let en = if st + len > n then n else st + len in mkstr (utf8_substr s st (en - st))
         // s[/re/] -> whole match; s[/re/, g] -> capture group g (nil if none).
-        | Cons (VRegex (pat, _), rest) ->
-          let _ = rx_clear_caps 1 in
-          let st = rx_find_start pat s 0 in
-          if st < 0 then VNil
-          else
-            let en = (let e = rxe_alts pat (rxe_start pat) s st in if e < 0 then st else e) in
-            (match rest with
-             | Cons (VInt g, _) ->
-               if g == 0 then mkstr (substring s st en)
-               else (let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
-                     if map_has rx_caps ks && map_has rx_caps ke then mkstr (substring s (map_get rx_caps ks) (map_get rx_caps ke)) else VNil)
-             | _ -> mkstr (substring s st en))
+        | Cons (VRegex (pat, pf), rest) ->
+          (match rxv_search pat pf s 0 with
+           | RBadPat ->
+             (let _ = rx_clear_caps 1 in
+              let st = rx_find_start pat s 0 in
+              if st < 0 then VNil
+              else
+                let en = (let e = rxe_alts pat (rxe_start pat) s st in if e < 0 then st else e) in
+                (match rest with
+                 | Cons (VInt g, _) ->
+                   if g == 0 then mkstr (substring s st en)
+                   else (let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
+                         if map_has rx_caps ks && map_has rx_caps ke then mkstr (substring s (map_get rx_caps ks) (map_get rx_caps ke)) else VNil)
+                 | _ -> mkstr (substring s st en)))
+           | RNoHit -> VNil
+           | RHit (st, en, saves) ->
+             let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat))) in
+             (match rest with
+              | Cons (VInt g, _) ->
+                if g == 0 then mkstr (substring s st en)
+                else (let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
+                      if map_has rx_caps ks && map_has rx_caps ke then mkstr (substring s (map_get rx_caps ks) (map_get rx_caps ke)) else VNil)
+              | _ -> mkstr (substring s st en)))
         // s[lo..hi] / s[lo...hi]: codepoint substring over the (clamped) range.
         | Cons (VRange (lo, hi, excl), _) ->
           let st = if lo <= 0 - 4611686018427387903 then 0 else if lo < 0 then n + lo else lo in
@@ -9465,9 +9476,9 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr pat, Cons (VStr rep, _)) ->
           let pat = sget pat in let rep = sget rep in
           mkstr (if str_eq name "gsub" then str_gsub_lit s pat rep else str_sub_lit s pat rep)
-        | Cons (VRegex (pat, _), Cons (VStr rep, _)) ->
+        | Cons (VRegex (pat, pf), Cons (VStr rep, _)) ->
           let rep = sget rep in
-          mkstr (rx_gsub_go pat s rep 0 (str_eq name "gsub") "")
+          mkstr (rx_gsub_go2 pat pf s rep 0 (str_eq name "gsub") "")
         | _ -> mkstr s)
      | _ -> fail "no sub")
   else if str_eq name "chars" then (match recv with VStr s -> let s = sget s in arr_new (utf8_chars_val s 0) | _ -> fail "no chars")
@@ -9475,8 +9486,8 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr s -> let s = sget s in
        (match args with
-        | Cons (VRegex (pat, _), _) -> arr_new (rx_scan_all pat s 0 (rx_group_count pat 0 0))
-        | Cons (VStr pat, _) -> let pat = sget pat in arr_new (rx_scan_all pat s 0 (rx_group_count pat 0 0))
+        | Cons (VRegex (pat, pf), _) -> arr_new (rx_scan_all2 pat pf s 0)
+        | Cons (VStr pat, _) -> let pat = sget pat in arr_new (rx_scan_all2 pat "" s 0)
         | _ -> arr_new Nil)
      | _ -> fail "no scan")
   else if str_eq name "lines" then (match recv with VStr s -> let s = sget s in arr_new (val_list_of_strs (str_lines_go s 0 0 (str_len s))) | _ -> fail "no lines")
@@ -12972,7 +12983,9 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     if rxv_slot_get saves k == i then rxv_fail prog s bt
     else rxv_run prog s (pc + 1) i saves bt
   | IBOL ->
-    if i == 0 || str_eq (char_at s (i - 1)) "\n" then rxv_run prog s (pc + 1) i saves bt
+    // line start: position 0, or right after a \n — but NOT the end-of-string
+    // position after a trailing \n (there is no empty last line in Ruby).
+    if i == 0 || (i < str_len s && str_eq (char_at s (i - 1)) "\n") then rxv_run prog s (pc + 1) i saves bt
     else rxv_fail prog s bt
   | IEOL ->
     if i >= str_len s || str_eq (char_at s i) "\n" then rxv_run prog s (pc + 1) i saves bt
@@ -13603,6 +13616,57 @@ and rx_scan_all = fn (pat: str) -> fn (s: str) -> fn (i: int) -> fn (ng: int) ->
     let item = (if ng == 0 then mkstr (substring s st en) else arr_new (rx_scan_groups s 1 ng)) in
     let nexti = (if en > st then en else st + 1) in
     Cons (item, rx_scan_all pat s nexti ng)
+
+// ---- new-engine consumers (scan / gsub / gsub-block), legacy fallback -----
+
+and rx_scan_all2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) ->
+  match rxv_search pat fl s i with
+  | RBadPat -> rx_scan_all pat s i (rx_group_count pat 0 0)
+  | RNoHit -> Nil
+  | RHit (st, en, saves) ->
+    let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
+    let _ = rxv_export_caps saves ng in
+    let item = (if ng == 0 then mkstr (substring s st en) else arr_new (rx_scan_groups s 1 ng)) in
+    let nexti = (if en > st then en else st + 1) in
+    Cons (item, rx_scan_all2 pat fl s nexti)
+
+and rx_gsub_go2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn (acc: str) ->
+  let n = str_len s in
+  match rxv_search pat fl s i with
+  | RBadPat -> rx_gsub_go pat s rep i all acc
+  | RNoHit -> acc ++ substring s i n
+  | RHit (st, en, saves) ->
+    let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat))) in
+    if en <= st then
+      // zero-width match: insert the replacement here, copy one char, advance.
+      (let acc2 = acc ++ substring s i st ++ rx_expand_rep rep s st st 0 "" in
+       if all then
+         (if st >= n then acc2 else rx_gsub_go2 pat fl s rep (st + 1) all (acc2 ++ substring s st (st + 1)))
+       else acc2 ++ substring s st n)
+    else
+      (let acc2 = acc ++ substring s i st ++ rx_expand_rep rep s st en 0 "" in
+       if all then rx_gsub_go2 pat fl s rep en all acc2
+       else acc2 ++ substring s en n)
+
+and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (all: bool) -> fn (i: int) -> fn (acc: str) ->
+  let n = str_len s in
+  match rxv_search pat fl s i with
+  | RBadPat -> rx_gsub_blk world newblk pat s all i acc
+  | RNoHit -> acc ++ substring s i n
+  | RHit (st, en, saves) ->
+    let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+    let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat))) in
+    let m = substring s st en in
+    let _ = rx_publish_at world s st en in
+    let rep = to_s (flow_value (run_block world nb newblk (Cons (mkstr m, Nil)))) in
+    if en <= st then
+      (let acc2 = acc ++ substring s i st ++ rep in
+       if all then (if st >= n then acc2 else rx_gsub_blk2 world newblk pat fl s all (st + 1) (acc2 ++ substring s st (st + 1)))
+       else acc2 ++ substring s st n)
+    else
+      (let acc2 = acc ++ substring s i st ++ rep in
+       if all then rx_gsub_blk2 world newblk pat fl s all en acc2
+       else acc2 ++ substring s en n)
 
 // subjectless case: the first when whose any condition is truthy wins.
 and run_case_truthy = fn env -> fn world -> fn blk -> fn whens -> fn (els: Stmt list) ->
