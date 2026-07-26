@@ -1,4 +1,5 @@
 // mere-ruby — a Ruby subset interpreter written in pure Mere. M0 + M1.
+extern fn getenv: str -> str;
 //
 // M0: literals (integer, float, string, true/false/nil, array, hash),
 // operators with Ruby precedence (** right-assoc, unary - !, * / %, + -,
@@ -6660,6 +6661,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // a yielder in a generator block: y << value.
        else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
+       // File / IO handles: f << data appends (write).
+       else if (str_eq ocl "File" || str_eq ocl "IO") && str_eq op "<<" then
+         invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
        // enumerator chaining: e1 + e2.
        else if (str_eq ocl "Enumerator" || str_eq ocl "Enumerator::Chain") && str_eq op "+" then
          invoke_val_c env world blk va0 "+" (Cons (eval_e env world blk b, Nil)) false
@@ -8337,6 +8341,52 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     // Enumerator.new requires a block (the legacy obj/method form is gone).
     else if str_eq c "Enumerator" && str_eq name "new" then
       raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..)"
+    // File class methods over the native externs (read/write/exist?/...).
+    else if str_eq c "File" then
+      (if str_eq name "read" then
+         (match args with
+          | Cons (VStr ph, _) ->
+            (let path = sget ph in
+             if file_exists path then mkstr (read_file path)
+             else raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path))
+          | _ -> raise_exc world "TypeError" "no implicit conversion into String")
+       else if str_eq name "write" then
+         (match args with
+          | Cons (VStr ph, Cons (v, _)) ->
+            (let content = (match v with VStr ch -> sget ch | _ -> to_s v) in
+             let _ = write_file (sget ph) content in
+             VInt (str_len content))
+          | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
+       else if str_eq name "exist?" || str_eq name "exists?" || str_eq name "file?" then
+         (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
+       else if str_eq name "basename" then
+         (match args with Cons (VStr ph, _) -> mkstr (basename_of (sget ph)) | _ -> mkstr "")
+       else if str_eq name "dirname" then
+         (match args with Cons (VStr ph, _) -> mkstr (dirname_of (sget ph)) | _ -> mkstr "")
+       else if str_eq name "join" then mkstr (file_join_go args "")
+       else if str_eq name "expand_path" then
+         (match args with
+          | Cons (VStr ph, _) ->
+            (let path = sget ph in
+             if str_len path > 0 && str_eq (char_at path 0) "/" then mkstr path
+             else mkstr (getenv "PWD" ++ "/" ++ path))
+          | _ -> mkstr "")
+       else if str_eq name "delete" || str_eq name "unlink" then
+         (match args with
+          | Cons (VStr ph, _) -> (let _ = run ("rm -f " ++ shq (sget ph)) in VInt 1)
+          | _ -> VInt 0)
+       else if str_eq name "new" || str_eq name "open" then file_open_obj world args
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
+    // Dir class methods (pwd via env, mkdir via the shell).
+    else if str_eq c "Dir" then
+      (if str_eq name "pwd" || str_eq name "getwd" then mkstr (getenv "PWD")
+       else if str_eq name "mkdir" then
+         (match args with
+          | Cons (VStr ph, _) -> (let _ = run ("mkdir -p " ++ shq (sget ph)) in VInt 0)
+          | _ -> VInt 0)
+       else if str_eq name "exist?" || str_eq name "exists?" then
+         (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Dir"))
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
     else if str_eq c "Regexp" && (str_eq name "new" || str_eq name "compile") then
@@ -8751,6 +8801,68 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                 | Nil -> VNil
                 | _ -> arr_new args) in
        lz_step env world blk id v)
+    // File handles from File.open/File.new: buffered writes, read-through
+    // reads, #gets tracked by @__f_pos.
+    else if str_eq cls "File" && map_has ivars (str_of_int id ++ "@__f_path") then
+      (let k = str_of_int id in
+       let path = (match map_get ivars (k ++ "@__f_path") with VStr h -> sget h | _ -> "") in
+       let mode = (match map_get ivars (k ++ "@__f_mode") with VStr h -> sget h | _ -> "") in
+       if str_eq name "read" then mkstr (if file_exists path then read_file path else "")
+       else if str_eq name "write" || str_eq name "print" || str_eq name "<<" then
+         (let piece = io_join_go args "" in
+          let cur = (match map_get ivars (k ++ "@__f_buf") with VStr h -> sget h | _ -> "") in
+          let _ = map_set ivars (k ++ "@__f_buf") (mkstr (cur ++ piece)) in
+          if str_eq name "<<" then recv
+          else if str_eq name "write" then VInt (str_len piece) else VNil)
+       else if str_eq name "puts" then
+         (let piece = file_puts_str args "" in
+          let cur = (match map_get ivars (k ++ "@__f_buf") with VStr h -> sget h | _ -> "") in
+          let _ = map_set ivars (k ++ "@__f_buf") (mkstr (cur ++ piece)) in
+          VNil)
+       else if str_eq name "gets" || str_eq name "readline" then
+         (let content = (if file_exists path then read_file path else "") in
+          let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
+          if pos >= str_len content then
+            (if str_eq name "readline" then raise_exc world "EOFError" "end of file reached" else VNil)
+          else
+            let e = line_end_from content pos in
+            let _ = map_set ivars (k ++ "@__f_pos") (VInt e) in
+            mkstr (substring content pos e))
+       else if str_eq name "each_line" || str_eq name "readlines" then
+         (let content = (if file_exists path then read_file path else "") in
+          let av = file_lines_arr content 0 in
+          if str_eq name "readlines" then av
+          else invoke_val_c env world blk av "each" Nil vischeck)
+       else if str_eq name "close" then (let _ = file_close_obj world id in VNil)
+       else if str_eq name "closed?" then VBool (str_eq mode "")
+       else if str_eq name "path" || str_eq name "to_path" then mkstr path
+       else if str_eq name "rewind" then (let _ = map_set ivars (k ++ "@__f_pos") (VInt 0) in VInt 0)
+       else if str_eq name "eof?" || str_eq name "eof" then
+         (let content = (if file_exists path then read_file path else "") in
+          let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
+          VBool (pos >= str_len content))
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of File"))
+    // STDOUT / STDERR: IO objects keyed by @__io_fd (1 = out, 2 = err).
+    else if str_eq cls "IO" && map_has ivars (str_of_int id ++ "@__io_fd") then
+      (let fd = (match map_get ivars (str_of_int id ++ "@__io_fd") with VInt n -> n | _ -> 1) in
+       if str_eq name "puts" then
+         (let _ = (if fd == 2 then (match args with Nil -> print_err "" | _ -> err_puts_each world args)
+                   else (match args with Nil -> out_print "" | _ -> puts_each world args)) in
+          VNil)
+       else if str_eq name "print" then
+         (let _ = (if fd == 2 then print_err (io_join_go args "") else print_each world args) in VNil)
+       else if str_eq name "write" then
+         (let s2 = io_join_go args "" in
+          let _ = (if fd == 2 then print_err s2 else out_print_no_nl s2) in
+          VInt (str_len s2))
+       else if str_eq name "<<" then
+         (let s2 = io_join_go args "" in
+          let _ = (if fd == 2 then print_err s2 else out_print_no_nl s2) in
+          recv)
+       else if str_eq name "flush" || str_eq name "sync=" then recv
+       else if str_eq name "sync" then VBool false
+       else if str_eq name "fileno" then VInt fd
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
     // Enumerator::Lazy surface without a block: take/drop extend the pipeline,
     // first/to_a/force run it (bounded), eager materializes.
     else if str_eq cls "Enumerator::Lazy" then
@@ -9319,6 +9431,17 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          VSym nm
        | _ -> VNil)
+    // File#each_line { block }: materialize the lines and drive Array#each.
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "File") | _ -> false)
+            && (str_eq name "each_line" || str_eq name "each") then
+      (match recv with
+       | VObj id ->
+         (let (m0, s0, ocls0, iv0) = world in
+          let path = (match (if map_has iv0 (str_of_int id ++ "@__f_path") then map_get iv0 (str_of_int id ++ "@__f_path") else VNil) with VStr h -> sget h | _ -> "") in
+          let content = (if file_exists path then read_file path else "") in
+          let av = file_lines_arr content 0 in
+          invoke_with_block env world blk av "each" Nil newblk)
+       | _ -> VNil)
     // Enumerator#each { block }: drive the captured @recv.@meth with this
     // block. `for x in enum_for(:m)` desugars to `enum.each { |__for| ... }`,
     // and #each just forwards to the underlying method (whose `yield` runs the
@@ -9419,6 +9542,13 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (let id = map_len proc_store in let _ = map_set proc_store (str_of_int id) newblk in
           let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
           VProc id)
+       // File.open(path, mode) { |f| ... }: open, run the block with the
+       // handle, flush/close on exit, return the block's value.
+       else if str_eq c "File" && (str_eq name "open" || str_eq name "new") then
+         (let fobj = file_open_obj world args in
+          let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
+          let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
+          r)
        // Thread.new { } runs the block synchronously but with a FRESH catch
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
@@ -11247,6 +11377,106 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
       | FRaise _ -> fail "mere-ruby: (ruby exception raised)"
       | _ -> VBool true))
   else raise_exc world "LoadError" ("cannot load such file -- " ++ p0)
+
+// File.basename: the path's final component.
+and basename_of = fn (path: str) ->
+  basename_go path (str_len path - 1)
+and basename_go = fn (path: str) -> fn (i: int) ->
+  if i < 0 then path
+  else if str_eq (char_at path i) "/" then substring path (i + 1) (str_len path)
+  else basename_go path (i - 1)
+and file_join_go = fn (args: Val list) -> fn (acc: str) ->
+  match args with
+  | Nil -> acc
+  | Cons (v, rest) ->
+    let piece = (match v with VStr h -> sget h | _ -> to_s v) in
+    file_join_go rest (if str_eq acc "" then piece else acc ++ "/" ++ piece)
+// single-quote a string for the shell (used by the run-backed helpers).
+and shq = fn (s2: str) ->
+  "'" ++ shq_go s2 0 "" ++ "'"
+and shq_go = fn (s2: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s2 then acc
+  else
+    let c = char_at s2 i in
+    shq_go s2 (i + 1) (acc ++ (if str_eq c "'" then "'\\''" else c))
+
+// a File object: @__f_path/@__f_mode/@__f_buf/@__f_pos. Writes buffer and
+// flush on #close (or at the end of a File.open block); reads go straight
+// through the read_file extern. Mode "" marks the handle closed.
+and file_open_obj = fn world -> fn (args: Val list) ->
+  let (meths, sup, ocls, ivars) = world in
+  let path = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
+  let mode = (match args with Cons (_, Cons (VStr h, _)) -> sget h | _ -> "r") in
+  if (str_contains mode "r" && (if str_contains mode "+" then false else true))
+     && (if file_exists path then false else true) then
+    raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path)
+  else
+    // w truncates at open, so an unwritten-then-closed file ends up empty.
+    let _ = (if str_contains mode "w" then write_file path "" else ()) in
+    let id = map_len ocls in
+    let _ = map_set ocls (str_of_int id) "File" in
+    let _ = map_set ivars (str_of_int id ++ "@__f_path") (mkstr path) in
+    let _ = map_set ivars (str_of_int id ++ "@__f_mode") (mkstr mode) in
+    let _ = map_set ivars (str_of_int id ++ "@__f_buf") (mkstr "") in
+    let _ = map_set ivars (str_of_int id ++ "@__f_pos") (VInt 0) in
+    VObj id
+and file_close_obj = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  let k = str_of_int id in
+  let path = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with VStr h -> sget h | _ -> "") in
+  let mode = (match (if map_has ivars (k ++ "@__f_mode") then map_get ivars (k ++ "@__f_mode") else VNil) with VStr h -> sget h | _ -> "") in
+  let buf = (match (if map_has ivars (k ++ "@__f_buf") then map_get ivars (k ++ "@__f_buf") else VNil) with VStr h -> sget h | _ -> "") in
+  let _ =
+    (if str_contains mode "w" then write_file path buf
+     else if str_contains mode "a" then
+       write_file path ((if file_exists path then read_file path else "") ++ buf)
+     else ()) in
+  map_set ivars (k ++ "@__f_mode") (mkstr "")
+// the index one past this line's newline (or end of string).
+and line_end_from = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i
+  else if str_eq (char_at s i) "\n" then i + 1
+  else line_end_from s (i + 1)
+// puts semantics onto stderr: arrays flatten, one trailing newline per item
+// (print_err itself appends the newline).
+and err_puts_each = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (VArr aid, t) -> let _ = err_puts_each world (deref aid) in err_puts_each world t
+  | Cons (VStr sh, t) ->
+    let s2 = sget sh in
+    let _ = print_err (if str_len s2 > 0 && str_eq (char_at s2 (str_len s2 - 1)) "\n"
+                       then substring s2 0 (str_len s2 - 1) else s2) in
+    err_puts_each world t
+  | Cons (h, t) -> let _ = print_err (to_s h) in err_puts_each world t
+and io_join_go = fn (args: Val list) -> fn (acc: str) ->
+  match args with
+  | Nil -> acc
+  | Cons (VStr h, t) -> io_join_go t (acc ++ sget h)
+  | Cons (h, t) -> io_join_go t (acc ++ to_s h)
+// puts rendered into a string (for a File's write buffer): arrays flatten,
+// each item gets exactly one trailing newline.
+and file_puts_str = fn (args: Val list) -> fn (acc: str) ->
+  match args with
+  | Nil -> (if str_eq acc "" then "\n" else acc)
+  | Cons (h, t) -> file_puts_str_go (Cons (h, t)) acc
+and file_puts_str_go = fn (args: Val list) -> fn (acc: str) ->
+  match args with
+  | Nil -> acc
+  | Cons (VArr aid, t) -> file_puts_str_go t (file_puts_str_go (deref aid) acc)
+  | Cons (VStr sh, t) ->
+    let s2 = sget sh in
+    let s3 = (if str_len s2 > 0 && str_eq (char_at s2 (str_len s2 - 1)) "\n" then s2 else s2 ++ "\n") in
+    file_puts_str_go t (acc ++ s3)
+  | Cons (h, t) -> file_puts_str_go t (acc ++ to_s h ++ "\n")
+// split content into an array of lines, each keeping its newline.
+and file_lines_arr = fn (content: str) -> fn (i: int) ->
+  arr_new (file_lines_go content i)
+and file_lines_go = fn (content: str) -> fn (i: int) ->
+  if i >= str_len content then (Nil : Val list)
+  else
+    let e = line_end_from content i in
+    Cons (mkstr (substring content i e), file_lines_go content e)
 
 // an Enumerator::Lazy: a source (anything with #each) + a pipeline of ops
 // ([kind, payload] pairs: procs for map/select/..., ints for take/drop).
@@ -15071,6 +15301,11 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "FrozenError" "RuntimeError" in
   let _ = map_set sup "ScriptError" "Exception" in
   let _ = map_set sup "SyntaxError" "ScriptError" in
+  let _ = map_set sup "LoadError" "ScriptError" in
+  let _ = map_set sup "IOError" "StandardError" in
+  let _ = map_set sup "SystemCallError" "StandardError" in
+  let _ = map_set sup "Errno::ENOENT" "SystemCallError" in
+  let _ = map_set sup "EOFError" "IOError" in
   let _ = map_set sup "LocalJumpError" "StandardError" in
   let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
   let _ = map_set sup "NoMatchingPatternError" "StandardError" in
@@ -15103,6 +15338,23 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let lf0 = arr_new Nil in
   let _ = map_set globals "\"" lf0 in
   let _ = map_set globals "LOADED_FEATURES" lf0 in
+  // STDOUT / STDERR / STDIN: IO objects keyed by @__io_fd; $stdout/$stderr
+  // are globals holding the same objects.
+  let outid = map_len ocls in
+  let _ = map_set ocls (str_of_int outid) "IO" in
+  let _ = map_set ivars (str_of_int outid ++ "@__io_fd") (VInt 1) in
+  let _ = map_set consts "STDOUT" (VObj outid) in
+  let _ = map_set globals "stdout" (VObj outid) in
+  let errid = map_len ocls in
+  let _ = map_set ocls (str_of_int errid) "IO" in
+  let _ = map_set ivars (str_of_int errid ++ "@__io_fd") (VInt 2) in
+  let _ = map_set consts "STDERR" (VObj errid) in
+  let _ = map_set globals "stderr" (VObj errid) in
+  let inid = map_len ocls in
+  let _ = map_set ocls (str_of_int inid) "IO" in
+  let _ = map_set ivars (str_of_int inid ++ "@__io_fd") (VInt 0) in
+  let _ = map_set consts "STDIN" (VObj inid) in
+  let _ = map_set globals "stdin" (VObj inid) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let final = hoist_run env world noblk prog in
   if print_result then
