@@ -484,6 +484,11 @@ let catch_depth = map_new ();
 // true while running directly inside a Thread.new block (reset on entering a
 // method, which is a return boundary): a bare `return` there is a LocalJumpError.
 let thread_flag = map_new ();
+// synchronous-thread model state: the current Thread object, and a registry
+// of every spawned thread (for Thread.list / ThreadGroup#list).
+let cur_thr = map_new ();
+let all_thr = map_new ();
+let dfl_tg = map_new ();
 // expression-position flow (break/next/redo/return inside an expression)
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
@@ -6529,6 +6534,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             else flow_rethrow_tagged k tg v
           else fail "mere-ruby: (ruby exception raised)"
         | other -> flow_value other))
+    // Kernel#fork { }: not implemented (no process extern) — Ruby's own
+    // NotImplementedError contract for fork-less platforms.
+    else if str_eq name "fork" && (if map_has meths "fork" then false else true) then
+      raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
     // proc { } / lambda { } capture the block as a first-class VProc.
     else if str_eq name "proc" || str_eq name "lambda" then
       (let id = map_len proc_store in
@@ -8508,6 +8517,47 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     // Enumerator.new requires a block (the legacy obj/method form is gone).
     else if str_eq c "Enumerator" && str_eq name "new" then
       raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..)"
+    // Thread class methods (synchronous model; see the Thread.new boundary).
+    else if str_eq c "Thread" then
+      (let (mth0, sup0, ocl0, ivars) = world in
+       if str_eq name "current" then
+         (if map_has cur_thr "v" then map_get cur_thr "v" else VNil)
+       else if str_eq name "main" then
+         (if map_has all_thr "0" then map_get all_thr "0" else VNil)
+       // pass is a scheduling no-op: the calling thread just continues. A
+       // body that spins on it forever parks via the iteration budget.
+       else if str_eq name "pass" then VNil
+       else if str_eq name "stop" then
+         (if in_thread () then raise_exc world "__ThreadPark" "sleep"
+          else raise_exc world "ThreadError" "stopping only thread\n\tnote: use sleep to stop forever")
+       else if str_eq name "exit" then
+         (if in_thread () then raise_exc world "__ThreadPark" "kill" else VNil)
+       else if str_eq name "kill" then
+         (match args with
+          | Cons (t, _) -> invoke_val_c env world blk t "kill" Nil false
+          | _ -> VNil)
+       else if str_eq name "list" then
+         (let out = map_new () in
+          let _ = map_iter all_thr (fn (k2: str) -> fn (t: Val) ->
+            (match t with
+             | VObj tid2 ->
+               (match (if map_has ivars (str_of_int tid2 ++ "@__tst") then map_get ivars (str_of_int tid2 ++ "@__tst") else VBool false) with
+                | VStr _ -> let i2 = map_len out in map_set out (str_of_int i2) t
+                | _ -> ())
+             | _ -> ())) in
+          arr_new (idx_to_list out 0 (map_len out)))
+       else if str_eq name "new" || str_eq name "start" || str_eq name "fork" then
+         raise_exc world "ThreadError" "must be called with a block"
+       else if str_eq name "abort_on_exception" || str_eq name "report_on_exception" then VBool false
+       else if str_eq name "abort_on_exception=" || str_eq name "report_on_exception=" then
+         (match args with Cons (v, _) -> v | _ -> VNil)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Thread"))
+    // ThreadGroup: groups are markers on thread objects (@__tgrp).
+    else if str_eq c "ThreadGroup" && str_eq name "new" then
+      (let (mth0, sup0, ocl0, iv0) = world in
+       let id2 = map_len ocl0 in
+       let _ = map_set ocl0 (str_of_int id2) "ThreadGroup" in
+       VObj id2)
     // Complex class methods: polar / rectangular constructors. A Complex
     // argument with a zero imaginary part demotes to its real part
     // (CRuby's nucomp_real_check); otherwise TypeError "not a real".
@@ -9000,6 +9050,62 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                 | Nil -> VNil
                 | _ -> arr_new args) in
        lz_step env world blk id v)
+    // ThreadGroup instances: #add marks the thread, #list scans the registry.
+    else if str_eq cls "ThreadGroup" then
+      (if str_eq name "add" then
+         (match args with
+          | Cons (VObj tid2, _) -> let _ = map_set ivars (str_of_int tid2 ++ "@__tgrp") recv in recv
+          | _ -> recv)
+       else if str_eq name "list" then
+         (let out = map_new () in
+          let _ = map_iter all_thr (fn (k2: str) -> fn (t: Val) ->
+            (match t with
+             | VObj tid2 ->
+               (let alive2 = (match (if map_has ivars (str_of_int tid2 ++ "@__tst") then map_get ivars (str_of_int tid2 ++ "@__tst") else VBool false) with VStr _ -> true | _ -> false) in
+                let grp = (if map_has ivars (str_of_int tid2 ++ "@__tgrp") then map_get ivars (str_of_int tid2 ++ "@__tgrp")
+                           else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil) in
+                if alive2 && rb_eq grp recv then (let i2 = map_len out in map_set out (str_of_int i2) t) else ())
+             | _ -> ())) in
+          arr_new (idx_to_list out 0 (map_len out)))
+       else if str_eq name "enclose" || str_eq name "enclosed?" then VBool false
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ThreadGroup"))
+    // Mutex (synchronous model): the owner is a thread object; a lock held
+    // by a dead thread is reacquirable, a re-lock by the owner (or a lock
+    // held by a live other thread, which would block forever) is ThreadError.
+    else if str_eq cls "Mutex" then
+      (let k = str_of_int id in
+       let owner = (if map_has ivars (k ++ "@__mown") then map_get ivars (k ++ "@__mown") else VNil) in
+       let cur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+       let owner_alive =
+         (match owner with
+          | VObj oid2 -> (match (if map_has ivars (str_of_int oid2 ++ "@__tst") then map_get ivars (str_of_int oid2 ++ "@__tst") else VBool false) with VStr _ -> true | _ -> false)
+          | _ -> false) in
+       let cur_locks = (match cur with
+                        | VObj cid2 -> (match (if map_has ivars (str_of_int cid2 ++ "@__nlk") then map_get ivars (str_of_int cid2 ++ "@__nlk") else VInt 0) with VInt n2 -> n2 | _ -> 0)
+                        | _ -> 0) in
+       let lk_inc = fn (d: int) ->
+         (match cur with
+          | VObj cid2 -> map_set ivars (str_of_int cid2 ++ "@__nlk") (VInt (cur_locks + d))
+          | _ -> ()) in
+       if str_eq name "lock" then
+         // a re-lock by the owner deadlocks; a lock held by a parked thread
+         // while we already hold another mutex is a real cycle (fatal);
+         // otherwise the parked owner never resumes, so blocking "until it
+         // releases" resolves to its death and the lock is taken.
+         (if owner_alive && rb_eq owner cur then raise_exc world "ThreadError" "deadlock; recursive locking"
+          else if owner_alive && cur_locks > 0 then raise_exc world "fatal" "No live threads left. Deadlock?"
+          else let _ = map_set ivars (k ++ "@__mown") cur in let _ = lk_inc 1 in recv)
+       else if str_eq name "try_lock" then
+         (if owner_alive then VBool false
+          else let _ = map_set ivars (k ++ "@__mown") cur in let _ = lk_inc 1 in VBool true)
+       else if str_eq name "unlock" then
+         (if owner_alive && rb_eq owner cur then (let _ = map_set ivars (k ++ "@__mown") VNil in let _ = lk_inc (0 - 1) in recv)
+          else raise_exc world "ThreadError" "Attempt to unlock a mutex which is not locked")
+       else if str_eq name "locked?" then VBool owner_alive
+       else if str_eq name "owned?" then VBool (owner_alive && rb_eq owner cur)
+       else if str_eq name "sleep" then
+         (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Mutex"))
     // File handles from File.open/File.new: buffered writes, read-through
     // reads, #gets tracked by @__f_pos.
     else if str_eq cls "File" && map_has ivars (str_of_int id ++ "@__f_path") then
@@ -9255,9 +9361,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
     // a user exception object answers #message / #to_s with its @message.
     else if (str_eq name "message" || str_eq name "to_s") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (if map_has ivars (str_of_int id ++ "@message") then map_get ivars (str_of_int id ++ "@message") else mkstr cls)
-    else if str_eq cls "MatchData" && (str_eq name "[]" || str_eq name "to_a" || str_eq name "captures") then
+    else if str_eq cls "MatchData" && (str_eq name "[]" || str_eq name "to_a" || str_eq name "captures" || str_eq name "size" || str_eq name "length") then
       (if str_eq name "[]" then
          (match args with Cons (VInt n, _) -> (if map_has ivars (str_of_int id ++ "@" ++ str_of_int n) then map_get ivars (str_of_int id ++ "@" ++ str_of_int n) else VNil) | _ -> VNil)
+       else if str_eq name "size" || str_eq name "length" then
+         VInt (val_list_len (matchdata_arr ivars id 0))
        else arr_new (matchdata_arr ivars id (if str_eq name "captures" then 1 else 0)))
     else if str_eq cls "Encoding" && (str_eq name "name" || str_eq name "to_s") then
       (if map_has ivars (str_of_int id ++ "@name") then map_get ivars (str_of_int id ++ "@name") else mkstr "")
@@ -9316,12 +9424,84 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       let coll = enum_collect world recv cls in
       if str_eq name "to_a" || str_eq name "entries" then coll else dispatch_prim env world blk coll name args vischeck
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
-    // Thread#join / #value: the block already ran synchronously.
-    else if str_eq cls "Thread" && str_eq name "value" then
+    // Thread instance surface (synchronous model): the body already ran to
+    // completion, a park, or an exception (see the Thread.new boundary).
+    else if str_eq cls "Thread" then
       (match recv with
-       | VObj tid -> if map_has ivars (str_of_int tid ++ "@__tval") then map_get ivars (str_of_int tid ++ "@__tval") else recv
+       | VObj tid ->
+         (let k = str_of_int tid in
+          let tst = (if map_has ivars (k ++ "@__tst") then map_get ivars (k ++ "@__tst") else VBool false) in
+          let alive = (match tst with VStr _ -> true | _ -> false) in
+          if str_eq name "join" || str_eq name "value" then
+            (if map_has ivars (k ++ "@__texc") then flow_value (re_raise world (map_get ivars (k ++ "@__texc")))
+             else if str_eq name "value" then
+               (if map_has ivars (k ++ "@__tval") then map_get ivars (k ++ "@__tval") else VNil)
+             else recv)
+          else if str_eq name "status" then tst
+          else if str_eq name "alive?" then VBool alive
+          else if str_eq name "stop?" then
+            VBool (if alive then (match tst with VStr h -> str_eq (sget h) "sleep" | _ -> false) else true)
+          else if str_eq name "kill" || str_eq name "exit" || str_eq name "terminate" then
+            (let _ = (if alive then map_set ivars (k ++ "@__tst") (VBool false) else ()) in recv)
+          else if str_eq name "raise" then
+            // raising into a parked thread kills it with the exception (join
+            // re-raises); raising into a dead thread is a no-op.
+            (let _ =
+               (if alive then
+                  let exc = (match args with
+                             | Cons (VClass ec, Cons (VStr mh, _)) -> VExc (ec, sget mh)
+                             | Cons (VClass ec, _) -> VExc (ec, ec)
+                             | Cons (VStr mh, _) -> VExc ("RuntimeError", sget mh)
+                             | _ -> VExc ("RuntimeError", "")) in
+                  let _ = map_set ivars (k ++ "@__texc") exc in
+                  map_set ivars (k ++ "@__tst") VNil
+                else ()) in
+             VNil)
+          else if str_eq name "wakeup" || str_eq name "run" then
+            (let _ = (if alive then map_set ivars (k ++ "@__tst") (mkstr "run") else ()) in recv)
+          else if str_eq name "name" then
+            (if map_has ivars (k ++ "@__tname") then map_get ivars (k ++ "@__tname") else VNil)
+          else if str_eq name "name=" then
+            (match args with Cons (v, _) -> let _ = map_set ivars (k ++ "@__tname") v in v | _ -> VNil)
+          else if str_eq name "[]" || str_eq name "thread_variable_get" then
+            (match args with
+             | Cons (kv, _) ->
+               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+                if map_has ivars (k ++ "@__tl_" ++ kk) then map_get ivars (k ++ "@__tl_" ++ kk) else VNil)
+             | _ -> VNil)
+          else if str_eq name "[]=" || str_eq name "thread_variable_set" then
+            (match args with
+             | Cons (kv, Cons (v, _)) ->
+               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+                let _ = map_set ivars (k ++ "@__tl_" ++ kk) v in v)
+             | _ -> VNil)
+          else if str_eq name "key?" || str_eq name "thread_variable?" then
+            (match args with
+             | Cons (kv, _) ->
+               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+                VBool (map_has ivars (k ++ "@__tl_" ++ kk)))
+             | _ -> VBool false)
+          else if str_eq name "fetch" then
+            (match args with
+             | Cons (kv, rest) ->
+               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+                if map_has ivars (k ++ "@__tl_" ++ kk) then map_get ivars (k ++ "@__tl_" ++ kk)
+                else (match rest with
+                      | Cons (d, _) -> d
+                      | Nil -> raise_exc world "KeyError" ("key not found: :" ++ kk)))
+             | _ -> VNil)
+          else if str_eq name "group" then
+            (if map_has ivars (k ++ "@__tgrp") then map_get ivars (k ++ "@__tgrp")
+             else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil)
+          else if str_eq name "abort_on_exception" || str_eq name "report_on_exception" then VBool false
+          else if str_eq name "abort_on_exception=" || str_eq name "report_on_exception=" then
+            (match args with Cons (v, _) -> v | _ -> VNil)
+          else if str_eq name "priority" then VInt 0
+          else if str_eq name "priority=" then (match args with Cons (v, _) -> v | _ -> VNil)
+          else if str_eq name "inspect" || str_eq name "to_s" then
+            mkstr ("#<Thread " ++ (match tst with VStr h -> sget h | VBool _ -> "dead" | _ -> "dead") ++ ">")
+          else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Thread"))
        | _ -> recv)
-    else if str_eq cls "Thread" && str_eq name "join" then recv
     // Comparable#clamp / #between? on a user object with <=>.
     else if (str_eq name "clamp" || str_eq name "between?") && has_meth world cls "<=>" then
       (if str_eq name "between?" then (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
@@ -9696,6 +9876,15 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           | VNil -> flow_value (run_block world blk newblk (Cons (mkstr k2, Nil)))
           | v -> (if str_eq name "delete" then (let _ = map_set env_ovr k2 VNil in v) else v))
        | _ -> VNil)
+    // Mutex#synchronize { }: lock, run, unlock (returns the block's value).
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Mutex") | _ -> false)
+            && str_eq name "synchronize" then
+      (let _ = invoke_val_c env world blk recv "lock" Nil false in
+       let r = flow_value (run_block world blk newblk Nil) in
+       let _ = invoke_val_c env world blk recv "unlock" Nil false in
+       r)
+    // Thread.new/start/fork with a block routes through the class-method
+    // dispatcher below (same file), so nothing needed here.
     // File#each_line { block }: materialize the lines and drive Array#each.
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "File") | _ -> false)
             && (str_eq name "each_line" || str_eq name "each") then
@@ -9814,6 +10003,69 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
           let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
           r)
+       // Thread.new/start/fork { }: the synchronous thread model. The body
+       // runs immediately as the "thread"; scheduler points (sleep /
+       // Thread.pass / Thread.stop) park it by raising the internal
+       // __ThreadPark (which runs ensure blocks and is invisible to a bare
+       // rescue), and an exhausted iteration budget parks a spinning body
+       // ("preempted, never rescheduled"). The object records the outcome:
+       // completed (value), parked (status run/sleep), or died (exception,
+       // re-raised by join/value).
+       else if str_eq c "Thread" && (str_eq name "new" || str_eq name "start" || str_eq name "fork") then
+         (let (m3, s3, ocls3, iv3) = world in
+          let tid = map_len ocls3 in
+          let _ = map_set ocls3 (str_of_int tid) "Thread" in
+          let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
+          let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
+          let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+          let _ = map_set cur_thr "v" (VObj tid) in
+          let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
+          let _ = map_set catch_depth "n" (VInt 0) in
+          let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
+          let _ = map_set thread_flag "n" (VBool true) in
+          // $~ is per-thread in Ruby: the body starts with a fresh one and
+          // the spawner's is restored afterwards.
+          let savedtilde = (if map_has globals "~" then map_get globals "~" else VNil) in
+          let _ = map_set globals "~" VNil in
+          let savedbud = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
+          let _ = map_set step_budget "n" 2000 in
+          let result = try_or (fn (u: unit) -> run_block world blk newblk args) (FRaise VNil) in
+          let remaining = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
+          let newbud = savedbud - (2000 - remaining) in
+          let _ = map_set step_budget "n" (if newbud < 1000 then 1000 else newbud) in
+          let _ = map_set globals "~" savedtilde in
+          let _ = map_set thread_flag "n" savedtf in
+          let _ = map_set catch_depth "n" saved in
+          let _ = map_set cur_thr "v" savedcur in
+          let _ =
+            (match result with
+             | FRaise _ ->
+               (let exc = (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) in
+                let _ = (if map_has iv3 "$exc" then map_delete iv3 "$exc" else ()) in
+                let _ = (if map_has prim_missing "n" then map_delete prim_missing "n" else ()) in
+                let _ = (if map_has flow_sig "k" then map_delete flow_sig "k" else ()) in
+                match exc with
+                | VExc (c2, m2) ->
+                  (if str_eq c2 "__ThreadPark" then
+                     (if str_eq m2 "kill" then map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)
+                      else map_set iv3 (str_of_int tid ++ "@__tst") (mkstr m2))
+                   else
+                     let _ = map_set iv3 (str_of_int tid ++ "@__texc") exc in
+                     map_set iv3 (str_of_int tid ++ "@__tst") VNil)
+                | VNil ->
+                  // no recorded ruby exception: budget exhaustion = a spinning
+                  // body that was "preempted" (parked running).
+                  (if remaining <= 0 then map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run")
+                   else
+                     let _ = map_set iv3 (str_of_int tid ++ "@__texc") (VExc ("StandardError", "error")) in
+                     map_set iv3 (str_of_int tid ++ "@__tst") VNil)
+                | other ->
+                  let _ = map_set iv3 (str_of_int tid ++ "@__texc") other in
+                  map_set iv3 (str_of_int tid ++ "@__tst") VNil)
+             | other ->
+               let _ = map_set iv3 (str_of_int tid ++ "@__tval") (flow_value other) in
+               map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)) in
+          VObj tid)
        // Thread.new { } runs the block synchronously but with a FRESH catch
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
@@ -9839,21 +10091,6 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set iv3 (str_of_int eid ++ "@__e_blk") (VProc pid) in
           let _ = (match args with Cons (sz, _) -> map_set iv3 (str_of_int eid ++ "@__e_size") sz | _ -> ()) in
           VObj eid)
-       else if str_eq c "Thread" && str_eq name "new" then
-         (let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
-          let _ = map_set catch_depth "n" (VInt 0) in
-          // a bare `return` inside the block is a LocalJumpError, not a return.
-          let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
-          let _ = map_set thread_flag "n" (VBool true) in
-          let tval = flow_value (run_block world blk newblk Nil) in
-          let _ = map_set thread_flag "n" savedtf in
-          let _ = map_set catch_depth "n" saved in
-          let (m3, s3, ocls3, iv3) = world in
-          let tid = map_len ocls3 in
-          let _ = map_set ocls3 (str_of_int tid) "Thread" in
-          // Thread#value/#join returns the block's value (see the value handler).
-          let _ = map_set iv3 (str_of_int tid ++ "@__tval") tval in
-          VObj tid)
        else if str_eq c "Class" && str_eq name "new" then
          (let (meths2, sup2, ocls2, iv2) = world in
           let anon = fresh_anon "AnonClass_" in
@@ -11110,6 +11347,14 @@ and undef_call_exc = fn world -> fn (name: str) -> fn (args: Val list) ->
 // `explicit` = the call had parentheses (foo()) so it is unambiguously a
 // method call -> NoMethodError even with no arguments.
 and undef_call_exc_x = fn world -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
+  // last-resort Kernel methods that reach here as bare names (the ECall
+  // path handles the argument forms in try_self_call_x).
+  if str_eq name "sleep" then
+    (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+  else if str_eq name "fork" then
+    raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
+  else if str_eq name "exit" then exit 0
+  else
   match args with
   | Nil -> if explicit then raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
            else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
@@ -11151,6 +11396,14 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   else if str_eq name "abort" then
     (let _ = (match args with Cons (VStr mh, _) -> print_err (sget mh) | _ -> ()) in
      exit 1)
+  // Kernel#sleep: inside a synchronous thread it parks the thread; on the
+  // main thread it is a scheduling no-op (there is nobody to switch to).
+  else if str_eq name "sleep" && (match args with Nil -> true | Cons (VInt _, _) -> true | Cons (VFlt _, _) -> true | _ -> false) then
+    (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+  // Kernel#fork is not implemented (no process extern) — Ruby's own
+  // NotImplementedError contract for platforms without fork.
+  else if str_eq name "fork" then
+    raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
   // expression-position require("x") / require_relative("x") (the statement
   // forms parse as SRequire; parenthesized calls arrive here).
   else if (str_eq name "require" || str_eq name "require_relative") && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -11670,6 +11923,8 @@ and load_path_go = fn (dirs: Val list) -> fn (p1: str) ->
 and rb_load = fn env -> fn world -> fn (p0: str) ->
   let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> sget d | _ -> ".") else ".") in
   let full = if str_len p0 > 0 && str_eq (char_at p0 0) "/" then p0
+             else if str_len p0 >= 2 && (str_eq (substring p0 0 2) "./" || (str_len p0 >= 3 && str_eq (substring p0 0 3) "../")) then
+               env_get "PWD" ++ "/" ++ p0
              else (let hit = load_path_find world p0 in
                    if str_eq hit "" then dir ++ "/" ++ p0 else hit) in
   if is_reg_file full then
@@ -11794,6 +12049,9 @@ and shq_go = fn (s2: str) -> fn (i: int) -> fn (acc: str) ->
     let c = char_at s2 i in
     shq_go s2 (i + 1) (acc ++ (if str_eq c "'" then "'\\''" else c))
 
+// inside a synchronous thread body?
+and in_thread = fn (u: unit) ->
+  if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false
 // nucomp_real_check: a Complex with zero imaginary demotes to its real
 // part; a Complex with a nonzero one is "not a real".
 and cpx_realize_args = fn world -> fn (args: Val list) ->
@@ -13371,12 +13629,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
        let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
        // require_relative: against the requiring file's dir; require: an
-       // absolute path directly, else the $LOAD_PATH dirs, else the dir.
+       // absolute path directly, an explicit ./ or ../ against the process
+       // CWD (as in Ruby), else the $LOAD_PATH dirs, else the dir.
        let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
                   else if rel then dir ++ "/" ++ p1
+                  else if str_len p1 >= 2 && (str_eq (substring p1 0 2) "./" || (str_len p1 >= 3 && str_eq (substring p1 0 3) "../")) then
+                    env_get "PWD" ++ "/" ++ p1
                   else (let hit = load_path_find world p1 in
                         if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
        if map_has loaded_files full then FNext (VBool false)
+       else if (if is_reg_file full then false else true) then
+         FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0))
        else
          let _ = map_set loaded_files full VNil in
          let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
@@ -15720,6 +15983,8 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "SystemCallError" "StandardError" in
   let _ = map_set sup "Errno::ENOENT" "SystemCallError" in
   let _ = map_set sup "EOFError" "IOError" in
+  let _ = map_set sup "ThreadError" "StandardError" in
+  let _ = map_set sup "fatal" "Exception" in
   let _ = map_set sup "LocalJumpError" "StandardError" in
   let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
   let _ = map_set sup "NoMatchingPatternError" "StandardError" in
@@ -15769,6 +16034,20 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set ivars (str_of_int inid ++ "@__io_fd") (VInt 0) in
   let _ = map_set consts "STDIN" (VObj inid) in
   let _ = map_set globals "stdin" (VObj inid) in
+  // the main Thread object (always index 0 of the registry), the default
+  // ThreadGroup, and the thread-related constants.
+  let mainid = map_len ocls in
+  let _ = map_set ocls (str_of_int mainid) "Thread" in
+  let _ = map_set ivars (str_of_int mainid ++ "@__tst") (mkstr "run") in
+  let _ = map_set cur_thr "v" (VObj mainid) in
+  let _ = map_set all_thr "0" (VObj mainid) in
+  let tgid = map_len ocls in
+  let _ = map_set ocls (str_of_int tgid) "ThreadGroup" in
+  let _ = map_set dfl_tg "v" (VObj tgid) in
+  let _ = map_set consts "ThreadGroup" (VClass "ThreadGroup") in
+  let _ = map_set consts "ThreadGroup::Default" (VObj tgid) in
+  let _ = map_set consts "ThreadError" (VClass "ThreadError") in
+  let _ = map_set consts "Thread::Mutex" (VClass "Mutex") in
   // ENV (reads go through getenv, writes overlay), ARGV, $0/$PROGRAM_NAME.
   let envid = map_len ocls in
   let _ = map_set ocls (str_of_int envid) "EnvHash" in
