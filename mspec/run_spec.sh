@@ -1,9 +1,9 @@
 #!/bin/sh
 # Run a real spec/ruby file through the minimal mspec shim, under BOTH
-# mere-ruby and ruby, and diff the outputs. The spec file is copied into a
-# temp layout that mirrors its depth under spec/ruby (language/x_spec.rb,
-# core/encoding/x_spec.rb, ...) so that its `require_relative '../spec_helper'`
-# or '../../spec_helper' resolves to the shim.
+# mere-ruby and ruby, and diff the outputs. The spec tree (core/, language/,
+# shared/, fixtures/) is cloned into a temp dir with the shim installed as
+# spec_helper.rb, so every require_relative (../spec_helper,
+# ../../spec_helper, sibling shared/, cross-directory shared/) resolves.
 #
 #   ./run_spec.sh <path/to/some_spec.rb> [--keep]
 spec="$1"
@@ -12,19 +12,27 @@ here="$(cd "$(dirname "$0")" && pwd)"
 mr="$here/../mere-ruby"
 tmp="$(mktemp -d)"
 specdir="$(cd "$(dirname "$spec")" && pwd)"
-# subpath under spec/ruby (e.g. "language", "core/encoding"); default language.
+# subpath under spec/ruby (e.g. "language", "core/enumerator"); the spec root.
 case "$specdir" in
-  */spec/ruby/*) sub="${specdir#*/spec/ruby/}" ;;
-  *) sub="language" ;;
+  */spec/ruby/*)
+    sub="${specdir#*/spec/ruby/}"
+    specroot="${specdir%/$sub}"
+    ;;
+  *) sub="language"; specroot="" ;;
 esac
-mkdir -p "$tmp/$sub"
-cp "$spec" "$tmp/$sub/"
-# fixture files the spec may require_relative
-[ -d "$specdir/fixtures" ] && cp -R "$specdir/fixtures" "$tmp/$sub/fixtures"
-[ -d "$specdir/shared" ] && cp -R "$specdir/shared" "$tmp/$sub/shared"
-parent="$(dirname "$sub")"
-[ "$parent" = "." ] && parent=""
-[ -d "$specdir/../fixtures" ] && mkdir -p "$tmp/$parent" && cp -R "$specdir/../fixtures" "$tmp/${parent:+$parent/}fixtures"
+if [ -n "$specroot" ]; then
+  # clone the relevant trees (APFS copy-on-write when available).
+  for d in core language shared fixtures; do
+    [ -d "$specroot/$d" ] || continue
+    cp -Rc "$specroot/$d" "$tmp/$d" 2>/dev/null || cp -R "$specroot/$d" "$tmp/$d"
+  done
+else
+  mkdir -p "$tmp/$sub"
+  cp "$spec" "$tmp/$sub/"
+  [ -d "$specdir/fixtures" ] && cp -R "$specdir/fixtures" "$tmp/$sub/fixtures"
+  [ -d "$specdir/shared" ] && cp -R "$specdir/shared" "$tmp/$sub/shared"
+fi
+# the shim replaces the real mspec spec_helper.
 cp "$here/spec_helper.rb" "$tmp/spec_helper.rb"
 base="$(basename "$spec" .rb)"
 cat > "$tmp/driver.rb" <<EOF

@@ -181,6 +181,7 @@ def it(desc, *opts, &blk)
 end
 
 def it_behaves_like(*args); end
+def it_should_behave_like(*args); end
 def before(kind = nil, &blk); $mspec_before = blk; end
 def after(kind = nil, &blk); $mspec_after = blk; end
 def guard(*args); end

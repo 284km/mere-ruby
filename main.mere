@@ -7672,13 +7672,22 @@ and enum_collect = fn world -> fn (recv: Val) -> fn (cls: str) ->
    | VArr _ ->
      let cenv = map_new () in
      let _ = map_set cenv "__acc" accv in
-     let collector = (true, Cons ("__e", Nil), Cons (SExpr (EMethod (EVar "__acc", "push", Cons (EVar "__e", Nil))), Nil), cenv) in
+     // splat param: a multi-value yield gathers as an array element,
+     // a single-value yield stays the bare value (Enumerable#to_a rules).
+     let collector = (true, Cons ("*__e", Nil),
+                      Cons (SExpr (EMethod (EVar "__acc", "push",
+                        Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
+                                     EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
+                                     EVar "__e"), Nil))), Nil),
+                      cenv) in
      let _ = invoke world collector recv cls "each" Nil in accv
    | _ -> accv)
 
 // cycle: iterate the list n times (n < 0 = forever, until a break unwinds).
 and arr_cycle = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (n: int) ->
   if n == 0 then FNext VNil
+  // cycling an empty collection yields nothing and returns nil immediately.
+  else if (match xs with Nil -> true | _ -> false) then FNext VNil
   else
     let _ = tick () in
     (match arr_each world encl theblk xs with
@@ -7768,9 +7777,22 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | _ -> arr_new Nil)
     else if str_eq name "each_entry" then iter_each_result (arr_each world encl theblk xs) recv
     else if str_eq name "cycle" then
+      // cycle(n = nil): nil/absent = forever; a Float truncates; anything
+      // else must #to_int (TypeError otherwise); extra args ArgumentError.
       (match args with
+       | Nil -> iter_each_result (arr_cycle world encl theblk xs (0 - 1)) recv
+       | Cons (_, Cons (_, _)) -> raise_exc world "ArgumentError" "wrong number of arguments (given 2, expected 0..1)"
+       | Cons (VNil, _) -> iter_each_result (arr_cycle world encl theblk xs (0 - 1)) recv
        | Cons (VInt n, _) -> iter_each_result (arr_cycle world encl theblk xs n) recv
-       | _ -> iter_each_result (arr_cycle world encl theblk xs (0 - 1)) recv)
+       | Cons (VFlt f, _) -> iter_each_result (arr_cycle world encl theblk xs (int_of_float f)) recv
+       | Cons (VObj oid2, _) ->
+         (let (m9, s9, o9, i9) = world in
+          if has_meth world (map_get o9 (str_of_int oid2)) "to_int" then
+            (match invoke world (false, (Nil : str list), (Nil : Stmt list), map_new ()) (VObj oid2) (map_get o9 (str_of_int oid2)) "to_int" Nil with
+             | VInt n -> iter_each_result (arr_cycle world encl theblk xs n) recv
+             | _ -> raise_exc world "TypeError" "can't convert to Integer (to_int gave non-Integer)")
+          else raise_exc world "TypeError" ("no implicit conversion into Integer"))
+       | _ -> raise_exc world "TypeError" "no implicit conversion into Integer")
     else if str_eq name "each_slice" then (match args with Cons (VInt n, _) -> iter_each_result (arr_each world encl theblk (val_slices xs n)) recv | _ -> recv)
     else if str_eq name "each_cons" then (match args with Cons (VInt n, _) -> iter_each_result (arr_each world encl theblk (val_cons_windows xs n)) recv | _ -> recv)
     else prim_method recv name args
@@ -8713,6 +8735,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
            let v = val_nth xs pos in
            let _ = (if str_eq name "next" then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
            v)
+    // with_index(offset = 0) without a block: an Enumerator of [elem, i+offset]
+    // pairs; with_object handled by the with-block dispatcher.
+    else if str_eq cls "Enumerator" && (str_eq name "with_index" || str_eq name "each_with_index") && (let (h9, _, _, _) = blk in (if h9 then false else true)) then
+      (let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
+       let av = enum_to_arr env world blk id in
+       (match av with
+        | VArr aid2 -> (let _ = () in make_enum world (arr_new (with_index_pairs_off (deref aid2) off)) "each")
+        | _ -> VNil))
     // first / take are bounded (usable on infinite generators).
     else if str_eq cls "Enumerator" && (str_eq name "first" || str_eq name "take") then
       (let n = (match args with Cons (VInt k, _) -> k | _ -> 1) in
@@ -9214,10 +9244,20 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     // other Enumerator methods (map/select/... with a block): materialize the
     // elements, then run the array operation with the same block.
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator") | _ -> false)
-            && (is_enum_method name || str_eq name "each_with_index" || str_eq name "with_index" || str_eq name "each_slice" || str_eq name "each_cons") then
+            && (is_enum_method name || str_eq name "each_with_index" || str_eq name "with_index" || str_eq name "with_object" || str_eq name "each_slice" || str_eq name "each_cons") then
       (match recv with
        | VObj id ->
-         invoke_with_block env world blk (enum_to_arr env world blk id) (if str_eq name "with_index" then "each_with_index" else name) args newblk
+         (if str_eq name "with_index" && (match args with Cons (VInt _, _) -> true | _ -> false) then
+            // with_index(offset): iterate [elem, i+offset] pairs with the block.
+            (let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
+             let av = enum_to_arr env world blk id in
+             (match av with
+              | VArr aid2 -> invoke_with_block env world blk (arr_new (with_index_pairs_off (deref aid2) off)) "each" Nil newblk
+              | _ -> VNil))
+          else if str_eq name "with_object" then
+            invoke_with_block env world blk (enum_to_arr env world blk id) "each_with_object" args newblk
+          else
+            invoke_with_block env world blk (enum_to_arr env world blk id) (if str_eq name "with_index" then "each_with_index" else name) args newblk)
        | _ -> VNil)
     // instance_eval/instance_exec (block form) on a non-class receiver: run
     // the block with `self` rebound to the receiver. instance_exec forwards
@@ -10988,6 +11028,11 @@ and arr_count_truthy = fn (xs: Val list) -> fn (acc: int) ->
   match xs with
   | Nil -> acc
   | Cons (h, t) -> arr_count_truthy t (if truthy h then acc + 1 else acc)
+
+and with_index_pairs_off = fn (xs: Val list) -> fn (i: int) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> Cons (arr_new (Cons (h, Cons (VInt i, Nil))), with_index_pairs_off t (i + 1))
 
 and enum_args_str = fn (xs: Val list) ->
   match xs with
