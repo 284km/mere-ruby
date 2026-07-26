@@ -4960,6 +4960,17 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
     // Array <=> Array: element-wise, then by length (Ruby semantics).
     | VArr x -> (match vb with VArr y -> arr_cmp (deref x) (deref y) | _ -> fail "mere-ruby: comparison of incompatible types")
     | _ -> fail "mere-ruby: comparison of incompatible types"
+// would cmp_vals fail on this pair? (the < family raises ArgumentError)
+and cmp_incompatible = fn (va: Val) -> fn (vb: Val) ->
+  if is_num va && is_num vb then false
+  else
+    (match va with
+     | VStr _ -> (match vb with VStr _ -> false | _ -> true)
+     | VSym _ -> (match vb with VSym _ -> false | _ -> true)
+     | VArr _ -> (match vb with VArr _ -> false | _ -> true)
+     | VRat (_, _) -> (if is_num vb then false else true)
+     | _ -> true)
+
 and arr_cmp = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
   | Nil -> (match ys with Nil -> 0 | _ -> 0 - 1)
@@ -6649,6 +6660,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // a yielder in a generator block: y << value.
        else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
+       // enumerator chaining: e1 + e2.
+       else if (str_eq ocl "Enumerator" || str_eq ocl "Enumerator::Chain") && str_eq op "+" then
+         invoke_val_c env world blk va0 "+" (Cons (eval_e env world blk b, Nil)) false
        // Comparable: derive < > <= >= from a user-defined <=> when the
        // operator itself is not defined.
        else if (str_eq op "<" || str_eq op ">" || str_eq op "<=" || str_eq op ">=") && has_meth world ocl "<=>" then
@@ -6656,6 +6670,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           match c with
           | VInt n -> VBool (if str_eq op "<" then n < 0 else if str_eq op ">" then n > 0 else if str_eq op "<=" then n <= 0 else n >= 0)
           | _ -> raise_exc world "ArgumentError" "comparison failed")
+       // Comparable#==: derive from a user <=> (0 = equal, nil/other = not).
+       else if str_eq op "==" && has_meth world ocl "<=>" && (if has_meth world ocl "==" then false else true) then
+         (match invoke world noblk va0 ocl "<=>" (Cons (eval_e env world blk b, Nil)) with
+          | VInt n -> VBool (n == 0)
+          | _ -> VBool false)
        else eval_bin_prim env world blk op va0 b
      // a class-level operator (def self.<<) dispatches too.
      | VClass c ->
@@ -6693,10 +6712,15 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       (let vb = eval_e env world blk b in
        let c = cmp_vals va0 vb in
        VInt (if c < 0 then 0 - 1 else if c > 0 then 1 else 0))
-    else if str_eq op "<" then VBool (cmp_vals va0 (eval_e env world blk b) < 0)
-    else if str_eq op "<=" then VBool (cmp_vals va0 (eval_e env world blk b) <= 0)
-    else if str_eq op ">" then VBool (cmp_vals va0 (eval_e env world blk b) > 0)
-    else if str_eq op ">=" then VBool (cmp_vals va0 (eval_e env world blk b) >= 0)
+    else if str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=" then
+      // incomparable operands raise ArgumentError with Ruby's message
+      // ("comparison of String with 7 failed": numbers by value, others by class).
+      (let vb = eval_e env world blk b in
+       if cmp_incompatible va0 vb then
+         raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else class_name vb) ++ " failed")
+       else
+         let c = cmp_vals va0 vb in
+         VBool (if str_eq op "<" then c < 0 else if str_eq op "<=" then c <= 0 else if str_eq op ">" then c > 0 else c >= 0))
     else
       let vb = eval_e env world blk b in
       // `"fmt" % arg` / `"fmt" % [args]` is sprintf-style formatting.
@@ -8192,6 +8216,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                    else true) in
      if exists then mk_bound_method world recv owner nm
      else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for an instance of " ++ display_cls world (dispatch_cls_of world recv)))
+  // Enumerable#lazy: a Lazy over any enumerable receiver.
+  else if str_eq name "lazy"
+          && (match recv with
+              | VArr _ -> true | VRange (_, _, _) -> true | VHsh _ -> true
+              | VObj oid5 -> (let (m9, s9, o9, i9) = world in
+                              let ocl5 = map_get o9 (str_of_int oid5) in
+                              (if has_meth world ocl5 "lazy" then false else true)
+                              && (has_meth world ocl5 "each" || str_eq ocl5 "Enumerator" || str_eq ocl5 "Enumerator::Chain"))
+              | _ -> false) then
+    mk_lazy world recv Nil
+  // Enumerable#chain(*others): an Enumerator::Chain of self and the others.
+  else if str_eq name "chain"
+          && (match recv with
+              | VArr _ -> true | VRange (_, _, _) -> true | VHsh _ -> true
+              | VObj oid4 -> (let (m9, s9, o9, i9) = world in
+                              let ocl4 = map_get o9 (str_of_int oid4) in
+                              (if has_meth world ocl4 "chain" then false else true)
+                              && (has_meth world ocl4 "each" || str_eq ocl4 "Enumerator" || str_eq ocl4 "Enumerator::Chain"))
+              | _ -> false) then
+    mk_chain world (Cons (recv, args))
   // recv.enum_for(:m) / recv.to_enum(:m) — an Enumerator over recv.m (the
   // bare-call form has its own handler; this is the explicit-receiver one).
   else if (str_eq name "enum_for" || str_eq name "to_enum")
@@ -8700,6 +8744,43 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
              | other -> (if str_eq name "<<" then recv else flow_value other))
           | _ -> VNil)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Enumerator::Yielder"))
+    // the lazy-pipeline driver callback (see lz_run).
+    else if str_eq cls "Enumerator::LzDrv" && str_eq name "__lzstep" then
+      (let v = (match args with
+                | Cons (a1, Nil) -> a1
+                | Nil -> VNil
+                | _ -> arr_new args) in
+       lz_step env world blk id v)
+    // Enumerator::Lazy surface without a block: take/drop extend the pipeline,
+    // first/to_a/force run it (bounded), eager materializes.
+    else if str_eq cls "Enumerator::Lazy" then
+      (if str_eq name "take" || str_eq name "drop" then
+         (match args with
+          | Cons (VInt n, _) -> lz_extend world id name (VInt n)
+          | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
+       else if str_eq name "first" then
+         (match args with
+          | Cons (VInt n, _) -> lz_run env world blk id n VNil
+          | _ -> (match lz_run env world blk id 1 VNil with
+                  | VArr aid -> val_nth (deref aid) 0
+                  | _ -> VNil))
+       else if str_eq name "to_a" || str_eq name "force" then lz_run env world blk id (0 - 1) VNil
+       else if str_eq name "eager" then make_enum world (lz_run env world blk id (0 - 1) VNil) "each"
+       else if str_eq name "lazy" then recv
+       else if str_eq name "inspect" || str_eq name "to_s" then mkstr "#<Enumerator::Lazy>"
+       else if is_enum_method name then
+         invoke_val_c env world blk (lz_run env world blk id (0 - 1) VNil) name args vischeck
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Enumerator::Lazy"))
+    // Enumerator#+ / Chain#+: a chain of self and the given enumerators.
+    else if (str_eq cls "Enumerator" || str_eq cls "Enumerator::Chain") && str_eq name "+" then
+      (let base = (if str_eq cls "Enumerator::Chain" then chain_srcs world id else Cons (recv, Nil)) in
+       mk_chain world (list_append base args))
+    // Enumerator::Chain surface: each is handled by the block dispatcher;
+    // everything enumerable materializes.
+    else if str_eq cls "Enumerator::Chain"
+            && (is_enum_method name || str_eq name "size" || str_eq name "each_slice" || str_eq name "each_cons") then
+      (let av = chain_to_arr env world blk id in
+       invoke_val_c env world blk av name args vischeck)
     // Enumerator#inspect: "#<Enumerator: <recv>:<meth>(args)>".
     else if str_eq cls "Enumerator" && (str_eq name "inspect" || str_eq name "to_s") then
       (if map_has ivars (str_of_int id ++ "@recv") then
@@ -8758,6 +8839,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        (match av with
         | VArr aid2 -> (let _ = () in make_enum world (arr_new (with_index_pairs_off (deref aid2) off)) "each")
         | _ -> VNil))
+    // next_values / peek_values: like next/peek but every yield is an array.
+    else if str_eq cls "Enumerator" && (str_eq name "next_values" || str_eq name "peek_values") then
+      (let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
+       let av = enum_take_m env world blk id (pos + 1) true in
+       let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
+       if pos >= val_list_len xs then raise_exc world "StopIteration" "iteration reached an end"
+       else
+         let v = val_nth xs pos in
+         let _ = (if str_eq name "next_values" then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
+         v)
     // first / take are bounded (usable on infinite generators).
     else if str_eq cls "Enumerator" && (str_eq name "first" || str_eq name "take") then
       (let n = (match args with Cons (VInt k, _) -> k | _ -> 1) in
@@ -9257,6 +9348,33 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
            | VMain -> if map_has m0 meth2 then (let e2 = map_copy env in let _ = map_set e2 "self" recv2 in call_method e2 world newblk meth2 args)
                       else invoke_with_block env world blk recv2 meth2 args newblk
            | _ -> invoke_with_block env world blk recv2 meth2 args newblk))
+       | _ -> VNil)
+    // Enumerator::Lazy with a block: pipeline ops are appended lazily; #each
+    // drives the pipeline with the block as the final consumer.
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator::Lazy") | _ -> false) then
+      (match recv with
+       | VObj id ->
+         (if str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
+             str_eq name "find_all" || str_eq name "reject" || str_eq name "filter_map" ||
+             str_eq name "take_while" || str_eq name "drop_while" then
+            (let pid = map_len proc_store in
+             let _ = map_set proc_store (str_of_int pid) newblk in
+             let kind = (if str_eq name "collect" then "map"
+                         else if str_eq name "filter" || str_eq name "find_all" then "select"
+                         else name) in
+             lz_extend world id kind (VProc pid))
+          else if str_eq name "each" then
+            (let pid = map_len proc_store in
+             let _ = map_set proc_store (str_of_int pid) newblk in
+             let _ = lz_run env world blk id (0 - 1) (VProc pid) in
+             recv)
+          else invoke_with_block env world blk (lz_run env world blk id (0 - 1) VNil) name args newblk)
+       | _ -> VNil)
+    // Enumerator::Chain#each { }: drive each source's #each with the block.
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator::Chain") | _ -> false)
+            && str_eq name "each" then
+      (match recv with
+       | VObj id -> (let _ = chain_drive env world blk (chain_srcs world id) newblk in recv)
        | _ -> VNil)
     // other Enumerator methods (map/select/... with a block): materialize the
     // elements, then run the array operation with the same block.
@@ -10994,15 +11112,20 @@ and enum_to_arr = fn env -> fn world -> fn blk -> fn (eid: int) ->
 // like enum_to_arr but bounded: the collector breaks out after n elements
 // (so infinite generators can serve first/take/next). n < 0 = unbounded.
 and enum_take = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) ->
+  enum_take_m env world blk eid n false
+// values mode (next_values/peek_values): every yield gathers as an array,
+// even single- and zero-value yields.
+and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -> fn (vals: bool) ->
   let (m0, s0, ocls0, ivars0) = world in
   let accv = arr_new Nil in
   if n == 0 then accv else
   let cenv2 = map_new () in
   let _ = map_set cenv2 "__acc" accv in
-  let pushst = SExpr (EMethod (EVar "__acc", "push",
+  let pushst = (if vals then SExpr (EMethod (EVar "__acc", "push", Cons (EVar "__e", Nil)))
+                else SExpr (EMethod (EVar "__acc", "push",
                 Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
                              EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
-                             EVar "__e"), Nil))) in
+                             EVar "__e"), Nil)))) in
   let body = (if n < 0 then Cons (pushst, Nil)
               else Cons (pushst,
                    Cons (SIf (Cons ((EBin (">=", EMethod (EVar "__acc", "length", Nil), EInt n),
@@ -11059,6 +11182,153 @@ and enum_take = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) ->
               let _ = invoke_with_block env world blk recv2 meth2 eargs collector in
               ())) in
   accv
+
+// an Enumerator::Lazy: a source (anything with #each) + a pipeline of ops
+// ([kind, payload] pairs: procs for map/select/..., ints for take/drop).
+and mk_lazy = fn world -> fn (src: Val) -> fn (ops: Val list) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = map_len ocls in
+  let _ = map_set ocls (str_of_int id) "Enumerator::Lazy" in
+  let _ = map_set ivars (str_of_int id ++ "@__lz_src") src in
+  let _ = map_set ivars (str_of_int id ++ "@__lz_ops") (arr_new ops) in
+  VObj id
+and lz_src = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  (if map_has ivars (str_of_int id ++ "@__lz_src") then map_get ivars (str_of_int id ++ "@__lz_src") else VNil)
+and lz_ops = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  (match (if map_has ivars (str_of_int id ++ "@__lz_ops") then map_get ivars (str_of_int id ++ "@__lz_ops") else VNil) with
+   | VArr aid -> deref aid
+   | _ -> Nil)
+and lz_extend = fn world -> fn (id: int) -> fn (kind: str) -> fn (payload: Val) ->
+  mk_lazy world (lz_src world id) (list_append (lz_ops world id) (Cons (arr_new (Cons (VStr (mkstr_h kind), Cons (payload, Nil))), Nil)))
+// intern a plain string as a VStr handle payload.
+and mkstr_h = fn (s2: str) -> (match mkstr s2 with VStr h -> h | _ -> 0)
+
+// run the pipeline: drive src.each; each element passes through the ops on a
+// driver object (Enumerator::LzDrv), accumulating survivors (bound < 0 =
+// all; the driver raises StopIteration to stop the source).
+and lz_run = fn env -> fn world -> fn blk -> fn (id: int) -> fn (bound: int) -> fn (fin: Val) ->
+  let (m0, s0, ocls0, ivars0) = world in
+  let accv = arr_new Nil in
+  let did = map_len ocls0 in
+  let _ = map_set ocls0 (str_of_int did) "Enumerator::LzDrv" in
+  let _ = map_set ivars0 (str_of_int did ++ "@__acc") accv in
+  let _ = map_set ivars0 (str_of_int did ++ "@__ops") (arr_new (lz_ops world id)) in
+  let _ = map_set ivars0 (str_of_int did ++ "@__bound") (VInt bound) in
+  let _ = (match fin with VNil -> () | _ -> map_set ivars0 (str_of_int did ++ "@__fin") fin) in
+  let cenv2 = map_new () in
+  let _ = map_set cenv2 "__lzobj" (VObj did) in
+  let collector = (true, Cons ("*__e", Nil),
+                   Cons (SExpr (EMethod (EVar "__lzobj", "__lzstep", Cons (ESplat (EVar "__e"), Nil))), Nil),
+                   cenv2) in
+  let f = try_or (fn (u: unit) -> let _ = invoke_with_block env world blk (lz_src world id) "each" Nil collector in FNext VNil) (FRaise VNil) in
+  let _ = (match f with
+           | FRaise _ ->
+             (if map_has flow_sig "k" then
+                (let k = (match map_get flow_sig "k" with VStr kk -> sget kk | _ -> "") in
+                 let v2 = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+                 let _ = map_delete flow_sig "k" in
+                 if str_eq k "break" then () else (let _ = flow_rethrow k v2 in ()))
+              else
+                let ecls = (if map_has ivars0 "$exc" then (match map_get ivars0 "$exc" with VExc (c2, _) -> c2 | _ -> "") else "") in
+                if str_eq ecls "StopIteration" then (let _ = map_delete ivars0 "$exc" in ())
+                else fail "mere-ruby: (ruby exception raised)")
+           | _ -> ()) in
+  accv
+
+// one element through the pipeline (called from the collector via __lzstep).
+and lz_step = fn env -> fn world -> fn blk -> fn (did: int) -> fn (v0: Val) ->
+  let (m0, s0, ocls0, ivars0) = world in
+  let ops = (match (if map_has ivars0 (str_of_int did ++ "@__ops") then map_get ivars0 (str_of_int did ++ "@__ops") else VNil) with VArr aid -> deref aid | _ -> Nil) in
+  lz_step_ops env world blk did ops 0 v0
+and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val list) -> fn (i: int) -> fn (v: Val) ->
+  let (m0, s0, ocls0, ivars0) = world in
+  match ops with
+  | Nil ->
+    // survivor: hand to the final consumer or accumulate (bound-checked).
+    (match (if map_has ivars0 (str_of_int did ++ "@__fin") then map_get ivars0 (str_of_int did ++ "@__fin") else VNil) with
+     | VProc fpid ->
+       let _ = flow_value (run_block world blk (map_get proc_store (str_of_int fpid)) (Cons (v, Nil))) in
+       VNil
+     | _ ->
+       (match (if map_has ivars0 (str_of_int did ++ "@__acc") then map_get ivars0 (str_of_int did ++ "@__acc") else VNil) with
+        | VArr aid ->
+          let _ = arr_set aid (list_append (deref aid) (Cons (v, Nil))) in
+          let bound = (match (if map_has ivars0 (str_of_int did ++ "@__bound") then map_get ivars0 (str_of_int did ++ "@__bound") else VNil) with VInt bn -> bn | _ -> 0 - 1) in
+          if bound >= 0 && val_list_len (deref aid) >= bound then raise_exc world "StopIteration" "iteration reached an end"
+          else VNil
+        | _ -> VNil))
+  | Cons (opv, rest) ->
+    let (kind, payload) = (match opv with
+                           | VArr oaid -> (match deref oaid with
+                                           | Cons (VStr kh, Cons (pl, _)) -> (sget kh, pl)
+                                           | _ -> ("", VNil))
+                           | _ -> ("", VNil)) in
+    let callp = fn (pv: Val) ->
+      (match payload with
+       | VProc ppid -> flow_value (run_block world blk (map_get proc_store (str_of_int ppid)) (Cons (pv, Nil)))
+       | _ -> VNil) in
+    if str_eq kind "map" then lz_step_ops env world blk did rest (i + 1) (callp v)
+    else if str_eq kind "select" then
+      (if truthy (callp v) then lz_step_ops env world blk did rest (i + 1) v else VNil)
+    else if str_eq kind "reject" then
+      (if truthy (callp v) then VNil else lz_step_ops env world blk did rest (i + 1) v)
+    else if str_eq kind "filter_map" then
+      (let r = callp v in if truthy r then lz_step_ops env world blk did rest (i + 1) r else VNil)
+    else if str_eq kind "take_while" then
+      (if truthy (callp v) then lz_step_ops env world blk did rest (i + 1) v
+       else raise_exc world "StopIteration" "iteration reached an end")
+    else if str_eq kind "drop_while" then
+      (let fk = str_of_int did ++ "@__dw" ++ str_of_int i in
+       if map_has ivars0 fk then lz_step_ops env world blk did rest (i + 1) v
+       else if truthy (callp v) then VNil
+       else (let _ = map_set ivars0 fk (VBool true) in lz_step_ops env world blk did rest (i + 1) v))
+    else if str_eq kind "take" then
+      (let n = (match payload with VInt tn -> tn | _ -> 0) in
+       let ck = str_of_int did ++ "@__tk" ++ str_of_int i in
+       let c = (match (if map_has ivars0 ck then map_get ivars0 ck else VNil) with VInt cn -> cn | _ -> 0) in
+       if c >= n then raise_exc world "StopIteration" "iteration reached an end"
+       else (let _ = map_set ivars0 ck (VInt (c + 1)) in lz_step_ops env world blk did rest (i + 1) v))
+    else if str_eq kind "drop" then
+      (let n = (match payload with VInt dn -> dn | _ -> 0) in
+       let ck = str_of_int did ++ "@__dp" ++ str_of_int i in
+       let c = (match (if map_has ivars0 ck then map_get ivars0 ck else VNil) with VInt cn -> cn | _ -> 0) in
+       if c < n then (let _ = map_set ivars0 ck (VInt (c + 1)) in VNil)
+       else lz_step_ops env world blk did rest (i + 1) v)
+    else lz_step_ops env world blk did rest (i + 1) v
+
+// an Enumerator::Chain over a list of sources (each must respond to #each).
+and mk_chain = fn world -> fn (srcs: Val list) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = map_len ocls in
+  let _ = map_set ocls (str_of_int id) "Enumerator::Chain" in
+  let _ = map_set ivars (str_of_int id ++ "@__ch") (arr_new srcs) in
+  VObj id
+and chain_srcs = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  (match (if map_has ivars (str_of_int id ++ "@__ch") then map_get ivars (str_of_int id ++ "@__ch") else VNil) with
+   | VArr aid -> deref aid
+   | _ -> Nil)
+// materialize a chain: drive each source's #each into one collector.
+and chain_to_arr = fn env -> fn world -> fn blk -> fn (id: int) ->
+  let accv = arr_new Nil in
+  let cenv2 = map_new () in
+  let _ = map_set cenv2 "__acc" accv in
+  let collector = (true, Cons ("*__e", Nil),
+                   Cons (SExpr (EMethod (EVar "__acc", "push",
+                     Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
+                                  EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
+                                  EVar "__e"), Nil))), Nil),
+                   cenv2) in
+  let _ = chain_drive env world blk (chain_srcs world id) collector in
+  accv
+and chain_drive = fn env -> fn world -> fn blk -> fn (srcs: Val list) -> fn theblk ->
+  match srcs with
+  | Nil -> ()
+  | Cons (src, rest) ->
+    let _ = invoke_with_block env world blk src "each" Nil theblk in
+    chain_drive env world blk rest theblk
 
 // Enumerator.produce driver: yield v to the collector block, then step.
 and enum_produce_go = fn env -> fn world -> fn blk -> fn collector -> fn stepblk -> fn (v: Val) ->
@@ -14690,6 +14960,9 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set consts "Encoding::SHIFT_JIS" (mk_enc "Shift_JIS") in
   let _ = map_set consts "Encoding::Shift_JIS" (if map_has enc_objs "Shift_JIS" then map_get enc_objs "Shift_JIS" else mkstr "Shift_JIS") in
   let _ = map_set consts "Encoding::EUC_JP" (mk_enc "EUC-JP") in
+  let _ = map_set consts "Enumerator::Chain" (VClass "Enumerator::Chain") in
+  let _ = map_set consts "Enumerator::Yielder" (VClass "Enumerator::Yielder") in
+  let _ = map_set consts "Enumerator::Lazy" (VClass "Enumerator::Lazy") in
   let _ = map_set consts "Regexp::IGNORECASE" (VInt 1) in
   let _ = map_set consts "Regexp::EXTENDED" (VInt 2) in
   let _ = map_set consts "Regexp::MULTILINE" (VInt 4) in
