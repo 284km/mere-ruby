@@ -8617,35 +8617,76 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
           | _ -> VBool false)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Method"))
     // Enumerator::Yielder: << / yield / call forward to the driving block.
+    // A break from that block (a bounded materialization) propagates as a
+    // break flow so the generator's own loop stops.
     else if str_eq cls "Enumerator::Yielder" then
       (if str_eq name "<<" || str_eq name "yield" || str_eq name "call" then
          (match (if map_has ivars (str_of_int id ++ "@__y_blk") then map_get ivars (str_of_int id ++ "@__y_blk") else VNil) with
           | VProc bpid ->
-            let r = flow_value (run_block world (false, (Nil : str list), (Nil : Stmt list), env) (map_get proc_store (str_of_int bpid)) args) in
-            (if str_eq name "<<" then recv else r)
+            (match run_block world (false, (Nil : str list), (Nil : Stmt list), env) (map_get proc_store (str_of_int bpid)) args with
+             | FBreak v -> raise_exc world "StopIteration" "iteration reached an end"
+             | FNext r -> (if str_eq name "<<" then recv else r)
+             | other -> (if str_eq name "<<" then recv else flow_value other))
           | _ -> VNil)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Enumerator::Yielder"))
+    // Enumerator#inspect: "#<Enumerator: <recv>:<meth>(args)>".
+    else if str_eq cls "Enumerator" && (str_eq name "inspect" || str_eq name "to_s") then
+      (if map_has ivars (str_of_int id ++ "@recv") then
+         (let recv2 = map_get ivars (str_of_int id ++ "@recv") in
+          let meth2 = to_s (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else mkstr "each") in
+          let argstr = (match (if map_has ivars (str_of_int id ++ "@eargs") then map_get ivars (str_of_int id ++ "@eargs") else VNil) with
+                        | VArr aid2 -> "(" ++ enum_args_str (deref aid2) ++ ")"
+                        | _ -> "") in
+          mkstr ("#<Enumerator: " ++ to_s (invoke_val_c env world blk recv2 "inspect" Nil false) ++ ":" ++ meth2 ++ argstr ++ ">"))
+       else mkstr "#<Enumerator: generator>")
+    // Enumerator#size: the size given to Enumerator.new (a proc is called),
+    // nil for an unsized generator, else the materialized length.
+    else if str_eq cls "Enumerator" && str_eq name "size" then
+      (if map_has ivars (str_of_int id ++ "@__e_size") then
+         (match map_get ivars (str_of_int id ++ "@__e_size") with
+          | VProc spid -> invoke_val_c env world blk (VProc spid) "call" Nil false
+          | VObj oid2 ->
+            (let (m9, s9, o9, i9) = world in
+             if has_meth world (map_get o9 (str_of_int oid2)) "call"
+             then invoke_val_c env world blk (VObj oid2) "call" Nil false
+             else VObj oid2)
+          | v -> v)
+       else if map_has ivars (str_of_int id ++ "@__e_blk") then VNil
+       else
+         (match enum_to_arr env world blk id with
+          | VArr aid2 -> VInt (val_list_len (deref aid2))
+          | _ -> VNil))
     // Enumerator without a block: enum methods materialize the elements and
     // delegate to the array implementation.
     else if str_eq cls "Enumerator"
-            && (is_enum_method name || str_eq name "size" || str_eq name "each_with_index" ||
-                str_eq name "take" || str_eq name "drop" || str_eq name "each_slice" || str_eq name "each_cons") then
+            && (if str_eq name "first" || str_eq name "take" then false else true)
+            && (is_enum_method name || str_eq name "each_with_index" ||
+                str_eq name "drop" || str_eq name "each_slice" || str_eq name "each_cons") then
       (let av = enum_to_arr env world blk id in
        invoke_val_c env world blk av name args vischeck)
-    // external iteration (re-drive style: the enumerator is re-run and indexed
-    // by @__e_pos — O(n^2) overall but correct for pure sources).
+    // external iteration (re-drive style: the enumerator is re-run, bounded
+    // to pos+1 elements, and indexed by @__e_pos — O(n^2) overall but correct
+    // for pure sources, and safe for infinite generators).
     else if str_eq cls "Enumerator" && (str_eq name "next" || str_eq name "peek" || str_eq name "rewind") then
       (if str_eq name "rewind" then
          (let _ = map_set ivars (str_of_int id ++ "@__e_pos") (VInt 0) in recv)
        else
          let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
-         let av = enum_to_arr env world blk id in
+         let av = enum_take env world blk id (pos + 1) in
          let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
          if pos >= val_list_len xs then raise_exc world "StopIteration" "iteration reached an end"
          else
            let v = val_nth xs pos in
            let _ = (if str_eq name "next" then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
            v)
+    // first / take are bounded (usable on infinite generators).
+    else if str_eq cls "Enumerator" && (str_eq name "first" || str_eq name "take") then
+      (let n = (match args with Cons (VInt k, _) -> k | _ -> 1) in
+       let av = enum_take env world blk id n in
+       if str_eq name "take" then av
+       else (match args with
+             | Cons (VInt _, _) -> av
+             | _ -> (match av with VArr aid -> val_nth (deref aid) 0 | _ -> VNil)))
     // UnboundMethod: bind / bind_call and the reflection getters.
     else if str_eq cls "UnboundMethod" then
       (let ucls = (match map_get ivars (str_of_int id ++ "@__um_cls") with VStr h -> sget h | _ -> "") in
@@ -9173,13 +9214,15 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
        else if str_eq c "Enumerator" && str_eq name "new" then
-         // Enumerator.new { |y| ... }: store the generator block as a proc.
+         // Enumerator.new(size = nil) { |y| ... }: store the generator block
+         // as a proc, and the optional size (#size returns / calls it).
          (let pid = map_len proc_store in
           let _ = map_set proc_store (str_of_int pid) newblk in
           let (m3, s3, ocls3, iv3) = world in
           let eid = map_len ocls3 in
           let _ = map_set ocls3 (str_of_int eid) "Enumerator" in
           let _ = map_set iv3 (str_of_int eid ++ "@__e_blk") (VProc pid) in
+          let _ = (match args with Cons (sz, _) -> map_set iv3 (str_of_int eid ++ "@__e_size") sz | _ -> ()) in
           VObj eid)
        else if str_eq c "Thread" && str_eq name "new" then
          (let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
@@ -9388,10 +9431,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     make_enum world recv name
   else if str_eq name "each_index" && (match recv with VArr _ -> true | _ -> false) then
     make_enum world recv name
+  else if (str_eq name "each_slice" || str_eq name "each_cons") && (match recv with VArr _ -> true | VRange _ -> true | _ -> false) then
+    make_enum_a world recv name args
   else if str_eq name "upto" && (match recv with VInt _ -> true | _ -> false) then
-    (match recv with VInt a -> (match args with Cons (VInt b, _) -> arr_new (range_to_a a b) | _ -> recv) | _ -> recv)
+    make_enum_a world recv name args
   else if str_eq name "downto" && (match recv with VInt _ -> true | _ -> false) then
-    (match recv with VInt a -> (match args with Cons (VInt b, _) -> arr_new (downto_arr a b) | _ -> recv) | _ -> recv)
+    make_enum_a world recv name args
   else if str_eq name "bytes" && (match recv with VStr _ -> true | _ -> false) then
     (match recv with VStr s -> arr_new (str_bytes_val (sget s) 0) | _ -> recv)
   else if str_eq name "combination" && (match recv with VArr _ -> true | _ -> false) then
@@ -10815,23 +10860,28 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
     else fail "mere-ruby: (ruby exception raised)"
   | other -> other
 
-// materialize an Enumerator (either the @recv/@meth form or a generator
-// created by Enumerator.new { |y| ... }) into an array, by driving its
-// iteration with a collector block. Multi-value yields become arrays
-// (splat param: 0/1 values collapse, 2+ stay a list), like Enumerator#to_a.
+// materialize an Enumerator into an array (unbounded enum_take).
 and enum_to_arr = fn env -> fn world -> fn blk -> fn (eid: int) ->
+  enum_take env world blk eid (0 - 1)
+
+// like enum_to_arr but bounded: the collector breaks out after n elements
+// (so infinite generators can serve first/take/next). n < 0 = unbounded.
+and enum_take = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) ->
   let (m0, s0, ocls0, ivars0) = world in
   let accv = arr_new Nil in
+  if n == 0 then accv else
   let cenv2 = map_new () in
   let _ = map_set cenv2 "__acc" accv in
-  let collector = (true, Cons ("*__e", Nil),
-                   Cons (SExpr (EMethod (EVar "__acc", "push",
-                     Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
-                                  EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
-                                  EVar "__e"), Nil))), Nil),
-                   cenv2) in
+  let pushst = SExpr (EMethod (EVar "__acc", "push",
+                Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
+                             EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
+                             EVar "__e"), Nil))) in
+  let body = (if n < 0 then Cons (pushst, Nil)
+              else Cons (pushst,
+                   Cons (SIf (Cons ((EBin (">=", EMethod (EVar "__acc", "length", Nil), EInt n),
+                                     Cons (SBreak ENil, Nil)), Nil), Nil), Nil))) in
+  let collector = (true, Cons ("*__e", Nil), body, cenv2) in
   let _ = (if map_has ivars0 (str_of_int eid ++ "@__e_blk") then
-             // generator form: run the block with a yielder wired to the collector.
              (match map_get ivars0 (str_of_int eid ++ "@__e_blk") with
               | VProc gpid ->
                 let bpid = map_len proc_store in
@@ -10839,25 +10889,48 @@ and enum_to_arr = fn env -> fn world -> fn blk -> fn (eid: int) ->
                 let yid = map_len ocls0 in
                 let _ = map_set ocls0 (str_of_int yid) "Enumerator::Yielder" in
                 let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
-                let _ = flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil))) in
-                ()
+                // a break escaping the generator (no loop of its own) ends here.
+                let f = try_or (fn (u: unit) -> let _ = run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil)) in FNext VNil) (FRaise VNil) in
+                (match f with
+                 | FRaise _ ->
+                   (if map_has flow_sig "k" then
+                      (let k = (match map_get flow_sig "k" with VStr kk -> sget kk | _ -> "") in
+                       let v2 = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+                       let _ = map_delete flow_sig "k" in
+                       if str_eq k "break" then () else (let _ = flow_rethrow k v2 in ()))
+                    else
+                      // the bounded collector ends the generator by raising
+                      // StopIteration (consumed here); anything else re-raises.
+                      let ecls = (if map_has ivars0 "$exc" then (match map_get ivars0 "$exc" with VExc (c2, _) -> c2 | _ -> "") else "") in
+                      if str_eq ecls "StopIteration" then (let _ = map_delete ivars0 "$exc" in ())
+                      else fail "mere-ruby: (ruby exception raised)")
+                 | _ -> ())
               | _ -> ())
            else
-             // @recv/@meth form: drive recv.meth with the collector block.
              (let recv2 = (if map_has ivars0 (str_of_int eid ++ "@recv") then map_get ivars0 (str_of_int eid ++ "@recv") else VNil) in
               let meth2 = (match (if map_has ivars0 (str_of_int eid ++ "@meth") then map_get ivars0 (str_of_int eid ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
-              let _ = invoke_with_block env world blk recv2 meth2 Nil collector in
+              let eargs = (match (if map_has ivars0 (str_of_int eid ++ "@eargs") then map_get ivars0 (str_of_int eid ++ "@eargs") else VNil) with VArr aid2 -> deref aid2 | _ -> Nil) in
+              let _ = invoke_with_block env world blk recv2 meth2 eargs collector in
               ())) in
   accv
 
 // an Enumerator is a plain object of the synthetic class "Enumerator" whose
 // @recv / @meth ivars remember the receiver and method to drive on #each.
+and enum_args_str = fn (xs: Val list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (v, Nil) -> inspect v
+  | Cons (v, rest) -> inspect v ++ ", " ++ enum_args_str rest
+
 and make_enum = fn world -> fn (recv: Val) -> fn (meth: str) ->
+  make_enum_a world recv meth Nil
+and make_enum_a = fn world -> fn (recv: Val) -> fn (meth: str) -> fn (eargs: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let id = map_len ocls in
   let _ = map_set ocls (str_of_int id) "Enumerator" in
   let _ = map_set ivars (str_of_int id ++ "@recv") recv in
   let _ = map_set ivars (str_of_int id ++ "@meth") (mkstr meth) in
+  let _ = (match eargs with Nil -> () | _ -> map_set ivars (str_of_int id ++ "@eargs") (arr_new eargs)) in
   VObj id
 
 // allocate an object, then run initialize if the class defines one.
