@@ -293,6 +293,33 @@ def be_kind_of(k); KindOfMatcher.new(k, false); end
 def be_an_instance_of(k); KindOfMatcher.new(k, true); end
 def be_instance_of(k); KindOfMatcher.new(k, true); end
 
+# reflection matchers: obj.should have_instance_method(:m) etc. `predicate` is
+# the query method sent to the subject.
+class HaveMethodMatcher
+  def initialize(predicate, name); @predicate = predicate; @name = name; end
+  def match?(subject); subject.send(@predicate, @name); end
+end
+def have_instance_method(name, inc = true); HaveMethodMatcher.new(:instance_method_defined_shim, name); end
+def have_public_instance_method(name, inc = true); HaveMethodMatcher.new(:public_method_defined?, name); end
+def have_private_instance_method(name, inc = true); HaveMethodMatcher.new(:private_method_defined?, name); end
+def have_protected_instance_method(name, inc = true); HaveMethodMatcher.new(:protected_method_defined?, name); end
+def have_method(name, inc = true); HaveMethodMatcher.new(:respond_to?, name); end
+def have_public_method(name, inc = true); HaveMethodMatcher.new(:respond_to?, name); end
+class Module
+  # have_instance_method accepts any visibility; method_defined? excludes
+  # private, so OR the family for the matcher's semantics.
+  def instance_method_defined_shim(name)
+    method_defined?(name) || private_method_defined?(name) || protected_method_defined?(name)
+  end
+end
+
+# obj.should be_ancestor_of(mod): self appears in mod.ancestors.
+class AncestorOfMatcher
+  def initialize(mod); @mod = mod; end
+  def match?(subject); @mod.ancestors.include?(subject); end
+end
+def be_ancestor_of(mod); AncestorOfMatcher.new(mod); end
+
 # -> { ... }.should raise_error(Klass) — run the proc and check the raised
 # exception's class. Message/pattern/block args are accepted but not matched
 # (the existing `raise` matcher does the same), so mere and ruby agree as long
