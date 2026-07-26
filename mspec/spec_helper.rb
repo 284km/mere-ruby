@@ -141,6 +141,9 @@ class Object
 end
 
 def describe(desc, *opts)
+  # a shared example group (describe :name, shared: true) is only a template;
+  # real mspec registers it for it_behaves_like (a no-op here), so skip it.
+  return if opts.any? { |o| o.is_a?(Hash) && o[:shared] }
   prev_b = $mspec_before
   prev_a = $mspec_after
   $mspec_desc = desc
