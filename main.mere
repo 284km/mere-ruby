@@ -549,6 +549,12 @@ let out_print_no_nl = fn (s: str) ->
     (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
      map_set io_cap "buf" (mkstr (cur ++ s)))
   else print_no_nl s;
+// ENV writes overlay the real environment (there is no setenv extern);
+// VNil marks a deleted key. cli_argv holds the script's ARGV.
+let env_ovr = map_new ();
+let cli_argv = map_new ();
+let rec strs_to_vals = fn (xs: str list) ->
+  match xs with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (mkstr h, strs_to_vals t);
 let rec last_slash = fn (s: str) -> fn (i: int) -> fn (best: int) ->
   if i >= str_len s then best
   else last_slash s (i + 1) (if str_eq (char_at s i) "/" then i else best);
@@ -8369,7 +8375,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
           | Cons (VStr ph, _) ->
             (let path = sget ph in
              if str_len path > 0 && str_eq (char_at path 0) "/" then mkstr path
-             else mkstr (getenv "PWD" ++ "/" ++ path))
+             else mkstr (env_get "PWD" ++ "/" ++ path))
           | _ -> mkstr "")
        else if str_eq name "delete" || str_eq name "unlink" then
          (match args with
@@ -8379,7 +8385,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
     // Dir class methods (pwd via env, mkdir via the shell).
     else if str_eq c "Dir" then
-      (if str_eq name "pwd" || str_eq name "getwd" then mkstr (getenv "PWD")
+      (if str_eq name "pwd" || str_eq name "getwd" then mkstr (env_get "PWD")
        else if str_eq name "mkdir" then
          (match args with
           | Cons (VStr ph, _) -> (let _ = run ("mkdir -p " ++ shq (sget ph)) in VInt 0)
@@ -8863,6 +8869,42 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        else if str_eq name "sync" then VBool false
        else if str_eq name "fileno" then VInt fd
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
+    // ENV: reads consult the write overlay first, then the real environment
+    // (env_is_set + getenv, so set-but-empty reads as "" like Ruby).
+    else if str_eq cls "EnvHash" then
+      (let lookup = fn (k2: str) ->
+         (if map_has env_ovr k2 then map_get env_ovr k2
+          else if env_is_set k2 then mkstr (getenv k2)
+          else VNil) in
+       if str_eq name "[]" then
+         (match args with Cons (VStr kh, _) -> lookup (sget kh) | _ -> VNil)
+       else if str_eq name "[]=" || str_eq name "store" then
+         (match args with
+          | Cons (VStr kh, Cons (v, _)) -> let _ = map_set env_ovr (sget kh) v in v
+          | _ -> VNil)
+       else if str_eq name "fetch" then
+         (match args with
+          | Cons (VStr kh, rest) ->
+            let k2 = sget kh in
+            (match lookup k2 with
+             | VNil -> (match rest with
+                        | Cons (d, _) -> d
+                        | Nil -> raise_exc world "KeyError" ("key not found: \"" ++ k2 ++ "\""))
+             | v -> v)
+          | _ -> VNil)
+       else if str_eq name "key?" || str_eq name "has_key?" || str_eq name "include?" || str_eq name "member?" then
+         (match args with
+          | Cons (VStr kh, _) -> VBool (match lookup (sget kh) with VNil -> false | _ -> true)
+          | _ -> VBool false)
+       else if str_eq name "delete" then
+         (match args with
+          | Cons (VStr kh, _) ->
+            let k2 = sget kh in
+            let old = lookup k2 in
+            let _ = map_set env_ovr k2 VNil in
+            old
+          | _ -> VNil)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for ENV"))
     // Enumerator::Lazy surface without a block: take/drop extend the pipeline,
     // first/to_a/force run it (bounded), eager materializes.
     else if str_eq cls "Enumerator::Lazy" then
@@ -10833,6 +10875,15 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   // Kernel#load.
   else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false) then
     (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
+  // Kernel#exit / Kernel#abort — terminate through the native exit.
+  else if str_eq name "exit" then
+    (match args with
+     | Cons (VInt n, _) -> exit n
+     | Cons (VBool b, _) -> exit (if b then 0 else 1)
+     | _ -> exit 0)
+  else if str_eq name "abort" then
+    (let _ = (match args with Cons (VStr mh, _) -> print_err (sget mh) | _ -> ()) in
+     exit 1)
   // expression-position require("x") / require_relative("x") (the statement
   // forms parse as SRequire; parenthesized calls arrive here).
   else if (str_eq name "require" || str_eq name "require_relative") && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -11391,6 +11442,13 @@ and file_join_go = fn (args: Val list) -> fn (acc: str) ->
   | Cons (v, rest) ->
     let piece = (match v with VStr h -> sget h | _ -> to_s v) in
     file_join_go rest (if str_eq acc "" then piece else acc ++ "/" ++ piece)
+// is this environment variable set? getenv is libc getenv and returns
+// NULL — a crash — for unset names, so probe with printenv first (which
+// also distinguishes set-but-empty, exit 0, from unset, exit 1).
+and env_is_set = fn (k2: str) ->
+  run ("printenv " ++ shq k2 ++ " > /dev/null 2>&1") == 0
+and env_get = fn (k2: str) ->
+  if env_is_set k2 then getenv k2 else ""
 // single-quote a string for the shell (used by the run-backed helpers).
 and shq = fn (s2: str) ->
   "'" ++ shq_go s2 0 "" ++ "'"
@@ -15355,6 +15413,13 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set ivars (str_of_int inid ++ "@__io_fd") (VInt 0) in
   let _ = map_set consts "STDIN" (VObj inid) in
   let _ = map_set globals "stdin" (VObj inid) in
+  // ENV (reads go through getenv, writes overlay), ARGV, $0/$PROGRAM_NAME.
+  let envid = map_len ocls in
+  let _ = map_set ocls (str_of_int envid) "EnvHash" in
+  let _ = map_set consts "ENV" (VObj envid) in
+  let _ = map_set consts "ARGV" (if map_has cli_argv "v" then map_get cli_argv "v" else arr_new Nil) in
+  let _ = map_set globals "0" (mkstr path) in
+  let _ = map_set globals "PROGRAM_NAME" (mkstr path) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let final = hoist_run env world noblk prog in
   if print_result then
@@ -15384,8 +15449,8 @@ let run_cli = fn () ->
   | Cons (a0, rest) ->
     if str_eq a0 "--eval-print" then
       (match rest with
-       | Cons (path, _) -> let _ = map_set cli_file "p" path in let _ = run_prog path true in 0
+       | Cons (path, rest2) -> let _ = map_set cli_file "p" path in let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest2)) in let _ = run_prog path true in 0
        | Nil -> let _ = print "usage: mere-ruby --eval-print <script.rb>" in 2)
-    else let _ = map_set cli_file "p" a0 in let _ = run_prog a0 false in 0;
+    else let _ = map_set cli_file "p" a0 in let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest)) in let _ = run_prog a0 false in 0;
 
 exit (run_cli ())
