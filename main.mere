@@ -24,7 +24,7 @@ type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
          // Rational literal as (num, den) canonical decimal strings (bignum /
          // exact-decimal safe); Complex (imaginary) literal `4i`.
          | TRat of str * str | TImag of int | TImagF of float
-         | TSym of str | TP of str | TRegex of str | TNL | TEOF;
+         | TSym of str | TP of str | TRegex of str * str | TNL | TEOF;
 
 // EHsh / VHsh hold interleaved [k1, v1, k2, v2, ...] lists (M0
 // simplification: literal order is preserved, which matches Ruby's
@@ -84,8 +84,8 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           // G2: a statement (if/unless/case/begin) used as an expression,
           // e.g. `if c ... end.should == x`.
           | EStmt of Stmt
-          // G2: /pattern/ regex literal (minimal engine: ^ $ . \d +).
-          | ERegex of str
+          // G2: /pattern/ regex literal (body, flags e.g. "im").
+          | ERegex of str * str
           // G2: break/next/redo/return in EXPRESSION position (fail-unwind).
           | EFlow of str * Expr
           // G3: safe navigation a&.b(args) — nil receiver yields nil.
@@ -207,7 +207,7 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          | VExc of str * str    // exception: class name, message
          | VProc of int         // a proc/lambda: a handle into proc_store
          | VBind of int         // a Binding: a handle into bind_store (captured env)
-         | VRegex of str        // /pattern/ (minimal matcher)
+         | VRegex of str * str  // /pattern/flags (minimal matcher)
          | VMain;               // the top-level `self` (main), class Object
 
 // A user method: parameter names, defaults ((name, default-expr) for
@@ -859,13 +859,13 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       lex_go s (i + 2)
     else if str_eq c "/" && regex_position s i then
       // a minimal regex literal. With #{...} interpolation it desugars to
-      // (string-concat).__regex; otherwise a plain TRegex token.
-      let (lit, j) = scan_regex s (i + 1) "" in
+      // (string-concat).__regex("flags"); otherwise a plain TRegex token.
+      let (lit, fl, j) = scan_regex s (i + 1) "" in
       if rx_has_interp lit 0 then
         let toks = lex_go (rx_interp_src lit) 0 in
         tapp (Cons (TP "(s", drop_eof toks))
-             (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", lex_go s j))))
-      else Cons (TRegex lit, lex_go s j)
+             (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl, Cons (TP ")", lex_go s j)))))))
+      else Cons (TRegex (lit, fl), lex_go s j)
     else if str_eq c "%" && percent_body s i >= 0 then
       // %(...) / %q(...) / %Q(...) raw strings; %w(...) a word array.
       let b = percent_body s i in
@@ -874,12 +874,14 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // lowercase %w/%i words are raw; %W/%I words interpolate.
       if is_percent_w s i then
         Cons (TP " [", pw_words (str_eq (char_at s (i + 1)) "W") lit 0 (lex_go s j))
-      // %r{...} is a regex (with optional interpolation).
+      // %r{...}flags is a regex (with optional interpolation).
       else if str_eq (char_at s (i + 1)) "r" then
-        (if rx_has_interp lit 0 then
+        (let fj = skip_regex_flags s j in
+         let fl = substring s j fj in
+         if rx_has_interp lit 0 then
            tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src lit) 0)))
-                (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", lex_go s j))))
-         else Cons (TRegex lit, lex_go s j))
+                (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl, Cons (TP ")", lex_go s fj)))))))
+         else Cons (TRegex (lit, fl), lex_go s fj))
       // %x{...} is a command literal (same as backticks): a call to the `
       // method with the interpolated body.
       else if str_eq (char_at s (i + 1)) "x" then
@@ -1334,13 +1336,16 @@ and prev_nonspace = fn (s: str) -> fn (i: int) ->
 
 and is_lparen = fn (p: str) -> str_eq p "(" || str_eq p " ("
 
-// scan the regex body to the closing unescaped /, skipping trailing flags.
+// scan the regex body to the closing unescaped /, returning the trailing
+// flags ("im"...) alongside the body and the resume position.
 and scan_regex = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
   if i >= str_len s then fail "mere-ruby: unterminated regex"
   else
     let c = char_at s i in
     if str_eq c "\\" && i + 1 < str_len s then scan_regex s (i + 2) (acc ++ c ++ char_at s (i + 1))
-    else if str_eq c "/" then (acc, skip_regex_flags s (i + 1))
+    else if str_eq c "/" then
+      (let fj = skip_regex_flags s (i + 1) in
+       (acc, substring s (i + 1) fj, fj))
     else scan_regex s (i + 1) (acc ++ c)
 
 and skip_regex_flags = fn (s: str) -> fn (i: int) ->
@@ -4553,7 +4558,7 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   // regexes / procs / bindings compare by pattern text / handle identity (and
   // never equal a different kind) — without these arms rb_eq is non-exhaustive
   // and aborts when a regex/proc reaches it (e.g. a `^regex` pin).
-  | VRegex p -> (match vb with VRegex q -> str_eq p q | _ -> false)
+  | VRegex (p, pf) -> (match vb with VRegex (q, qf) -> str_eq p q && str_eq pf qf | _ -> false)
   | VProc x -> (match vb with VProc y -> x == y | _ -> false)
   | VBind x -> (match vb with VBind y -> x == y | _ -> false)
 
@@ -5582,7 +5587,11 @@ let rec to_s = fn (v: Val) ->
   | VHsh _ -> inspect v
   | VSym s -> s
   | VClass c -> c
-  | VRegex p -> "(?-mix:" ++ p ++ ")"
+  | VRegex (p, fl) ->
+    // Regexp#to_s: "(?<on>-<off>:body)" with the m,i,x flags split by state.
+    let on = (if str_contains fl "m" then "m" else "") ++ (if str_contains fl "i" then "i" else "") ++ (if str_contains fl "x" then "x" else "") in
+    let off = (if str_contains fl "m" then "" else "m") ++ (if str_contains fl "i" then "" else "i") ++ (if str_contains fl "x" then "" else "x") in
+    "(?" ++ on ++ (if str_eq off "" then "" else "-" ++ off) ++ ":" ++ p ++ ")"
   | VObj id -> if map_has enc_name (str_of_int id) then map_get enc_name (str_of_int id) else "#<object>"   // Encoding#to_s is its name; disp (world-aware) overrides other objects
   | VRange (lo, hi, excl) ->
     str_of_int lo ++ (if excl then "..." else "..") ++ str_of_int hi
@@ -5605,7 +5614,9 @@ and inspect = fn (v: Val) ->
   | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs xs "" ++ "}"
   | VRat (n, d) -> "(" ++ to_s v ++ ")"
   | VCpx (r, i) -> "(" ++ to_s v ++ ")"
-  | VRegex p -> "/" ++ p ++ "/"
+  | VRegex (p, fl) ->
+    // Regexp#inspect shows the m,i,x flags in canonical order.
+    "/" ++ p ++ "/" ++ (if str_contains fl "m" then "m" else "") ++ (if str_contains fl "i" then "i" else "") ++ (if str_contains fl "x" then "x" else "")
   | VSym sy ->
     // a symbol that isn't a plain identifier / valid operator name inspects
     // quoted and escaped (:"foo bar", :"9", :"a\nb").
@@ -6458,7 +6469,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // named group (only for a literal regex on the LHS, per Ruby).
     else if str_eq op "=~" && (match a with ERegex _ -> true | _ -> false) then
       (match a with
-       | ERegex pat ->
+       | ERegex (pat, _) ->
          let vb = eval_e env world blk b in
          (match vb with
           | VStr sv -> let sv = sget sv in
@@ -6518,14 +6529,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "=~" then
       (let vb = eval_e env world blk b in
        match va0 with
-       | VStr sv -> let sv = sget sv in (match vb with VRegex p -> rx_do_match world p sv | _ -> VNil)
-       | VRegex p -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p sv | _ -> VNil)
+       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, _) -> rx_do_match world p sv | _ -> VNil)
+       | VRegex (p, _) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p sv | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = eval_e env world blk b in
        match va0 with
-       | VStr sv -> let sv = sget sv in (match vb with VRegex p -> VBool (if rx_match p sv then false else true) | _ -> VBool true)
-       | VRegex p -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p sv then false else true) | _ -> VBool true)
+       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, _) -> VBool (if rx_match p sv then false else true) | _ -> VBool true)
+       | VRegex (p, _) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p sv then false else true) | _ -> VBool true)
        | _ -> VBool true)
     else if str_eq op "<=>" then
       (let vb = eval_e env world blk b in
@@ -7208,7 +7219,7 @@ and expr_pat_vars = fn (e: Expr) ->
   | EMatchBind (_, pat) -> pat_vars pat
   | EMatchTest (_, pat) -> pat_vars pat
   | EBin (o, a, b) ->
-    let capt = if str_eq o "=~" then (match a with ERegex pat -> rx_capture_names pat 0 | _ -> Nil) else Nil in
+    let capt = if str_eq o "=~" then (match a with ERegex (pat, _) -> rx_capture_names pat 0 | _ -> Nil) else Nil in
     list_append_str capt (list_append_str (expr_pat_vars a) (expr_pat_vars b))
   | EUn (_, a) -> expr_pat_vars a
   | EMethod (recv, _, args) -> list_append_str (expr_pat_vars recv) (exprs_pat_vars args)
@@ -8876,7 +8887,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (match recv with
           | VStr s -> let s = sget s in
             (match args with
-             | Cons (VRegex pat, _) -> mkstr (rx_gsub_blk world newblk pat s (str_eq name "gsub") 0 "")
+             | Cons (VRegex (pat, _), _) -> mkstr (rx_gsub_blk world newblk pat s (str_eq name "gsub") 0 "")
              | Cons (VStr pat, _) -> mkstr (rx_gsub_blk world newblk (sget pat) s (str_eq name "gsub") 0 "")
              | _ -> mkstr s)
           | _ -> recv)
@@ -8951,8 +8962,8 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
   else if str_eq name "=~" then
     (match recv with
-     | VRegex p -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p sv | _ -> VNil)
-     | VStr sv -> let sv = sget sv in (match args with Cons (VRegex p, _) -> rx_do_match world p sv | _ -> VNil)
+     | VRegex (p, _) -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p sv | _ -> VNil)
+     | VStr sv -> let sv = sget sv in (match args with Cons (VRegex (p, _), _) -> rx_do_match world p sv | _ -> VNil)
      | _ -> VNil)
   // block-less enumerators: return an array standing in for the Enumerator
   // (so `.to_a` / `.map` / `.each` chain naturally). Ambiguous bare `.map` /
@@ -8996,13 +9007,13 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // String#match? / #match (and the Regexp receiver forms).
   else if str_eq name "match?" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
     (match recv with
-     | VStr h -> let sv = sget h in (match args with Cons (VRegex p, _) -> VBool (rx_match p sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) sv) | _ -> VBool false)
-     | VRegex p -> (match args with Cons (VStr sv, _) -> VBool (rx_match p (sget sv)) | _ -> VBool false)
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, _), _) -> VBool (rx_match p sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) sv) | _ -> VBool false)
+     | VRegex (p, _) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p (sget sv)) | _ -> VBool false)
      | _ -> VBool false)
   else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
     (match recv with
-     | VStr h -> let sv = sget h in (match args with Cons (VRegex p, _) -> (let _ = rx_do_match world p sv in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
-     | VRegex p -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, _), _) -> (let _ = rx_do_match world p sv in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+     | VRegex (p, _) -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
      | _ -> VNil)
   // fetch raises a catchable KeyError / IndexError when absent (no default/block).
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
@@ -9159,9 +9170,9 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "hash" then VInt (val_hash recv)
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
-    (match recv with VStr sp -> let sp = sget sp in VRegex sp | _ -> fail "no __regex")
+    (match recv with VStr sp -> let sp = sget sp in VRegex (sp, (match args with Cons (VStr f, _) -> sget f | _ -> "")) | _ -> fail "no __regex")
   else if str_eq name "source" then
-    (match recv with VRegex p -> mkstr p | _ -> fail "no source")
+    (match recv with VRegex (p, _) -> mkstr p | _ -> fail "no source")
   else if str_eq name "casecmp?" then
     (match recv with
      | VStr a -> let a = sget a in (match args with Cons (VStr b2, _) -> let b2 = sget b2 in VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
@@ -9237,7 +9248,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           if st < 0 || st > n || len < 0 then VNil
           else let en = if st + len > n then n else st + len in mkstr (utf8_substr s st (en - st))
         // s[/re/] -> whole match; s[/re/, g] -> capture group g (nil if none).
-        | Cons (VRegex pat, rest) ->
+        | Cons (VRegex (pat, _), rest) ->
           let _ = rx_clear_caps 1 in
           let st = rx_find_start pat s 0 in
           if st < 0 then VNil
@@ -9411,7 +9422,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr pat, Cons (VStr rep, _)) ->
           let pat = sget pat in let rep = sget rep in
           mkstr (if str_eq name "gsub" then str_gsub_lit s pat rep else str_sub_lit s pat rep)
-        | Cons (VRegex pat, Cons (VStr rep, _)) ->
+        | Cons (VRegex (pat, _), Cons (VStr rep, _)) ->
           let rep = sget rep in
           mkstr (rx_gsub_go pat s rep 0 (str_eq name "gsub") "")
         | _ -> mkstr s)
@@ -9421,7 +9432,7 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr s -> let s = sget s in
        (match args with
-        | Cons (VRegex pat, _) -> arr_new (rx_scan_all pat s 0 (rx_group_count pat 0 0))
+        | Cons (VRegex (pat, _), _) -> arr_new (rx_scan_all pat s 0 (rx_group_count pat 0 0))
         | Cons (VStr pat, _) -> let pat = sget pat in arr_new (rx_scan_all pat s 0 (rx_group_count pat 0 0))
         | _ -> arr_new Nil)
      | _ -> fail "no scan")
@@ -12072,7 +12083,7 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
       let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
       truthy (invoke world noblk0 cand ocl "===" (Cons (v, Nil)))
     else rb_eq cand v
-  | VRegex p ->
+  | VRegex (p, _) ->
     (match v with
      | VStr sv -> let sv = sget sv in (match rx_do_match world p sv with VNil -> false | _ -> true)
      | _ -> false)
