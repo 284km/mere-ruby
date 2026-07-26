@@ -10345,6 +10345,14 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let _ = arr_set id (vdrop xs k) in arr_new (vtake xs k)
         | _ -> (match xs with Nil -> VNil | Cons (h, t) -> let _ = arr_set id t in h))
      | _ -> fail "no shift")
+  // Array#replace: swap in the other array's contents (aliases see it).
+  else if str_eq name "replace" && (match recv with VArr _ -> true | _ -> false) then
+    (match recv with
+     | VArr id ->
+       (match args with
+        | Cons (VArr oid, _) -> let _ = arr_set id (deref oid) in recv
+        | _ -> recv)
+     | _ -> recv)
   else if str_eq name "unshift" || str_eq name "prepend" then
     (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (Cons (v, deref id)) in recv | Nil -> recv) | _ -> fail "no unshift")
   else if str_eq name "concat" then
@@ -10692,6 +10700,19 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   // bare method(:name) — Kernel#method on the implicit self.
   if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
+  // Kernel#load.
+  else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false) then
+    (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
+  // expression-position require("x") / require_relative("x") (the statement
+  // forms parse as SRequire; parenthesized calls arrive here).
+  else if (str_eq name "require" || str_eq name "require_relative") && (match args with Cons (VStr _, _) -> true | _ -> false) then
+    (match args with
+     | Cons (VStr ph, _) ->
+       (match exec_stmt env world noblk (SRequire (str_eq name "require_relative", EStrL (sget ph))) with
+        | FNext v -> v
+        | FRaise _ -> fail "mere-ruby: (ruby exception raised)"
+        | _ -> VNil)
+     | _ -> VNil)
   else
   if map_has env "self" then
     (match map_get env "self" with
@@ -11182,6 +11203,50 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
               let _ = invoke_with_block env world blk recv2 meth2 eargs collector in
               ())) in
   accv
+
+// search the $LOAD_PATH directories for a feature file ("" = not found).
+and load_path_find = fn world -> fn (p1: str) ->
+  (match (if map_has globals "LOAD_PATH" then map_get globals "LOAD_PATH" else VNil) with
+   | VArr aid -> load_path_go (deref aid) p1
+   | _ -> "")
+and load_path_go = fn (dirs: Val list) -> fn (p1: str) ->
+  match dirs with
+  | Nil -> ""
+  | Cons (VStr dh, rest) ->
+    (let cand = sget dh ++ "/" ++ p1 in
+     if file_exists cand then cand else load_path_go rest p1)
+  | Cons (_, rest) -> load_path_go rest p1
+
+// Kernel#load: run the file (no .rb auto-append, no dedup); resolves against
+// the $LOAD_PATH, then the current dir. Returns true.
+and rb_load = fn env -> fn world -> fn (p0: str) ->
+  let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> sget d | _ -> ".") else ".") in
+  let full = if str_len p0 > 0 && str_eq (char_at p0 0) "/" then p0
+             else (let hit = load_path_find world p0 in
+                   if str_eq hit "" then dir ++ "/" ++ p0 else hit) in
+  if file_exists full then
+    (let src = read_file full in
+     let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
+     let cod = src_coding src in
+     let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
+     let toks = lex_go src 0 in
+     let (prog2, rest2) = parse_stmts toks Nil in
+     let _ = rx_check_pending () in
+     let _ = (match rest2 with
+              | Cons (TEOF, _) -> ()
+              | _ -> fail ("mere-ruby: unexpected token at top level in " ++ full)) in
+     let fenv = map_new () in
+     let _ = map_set fenv "self" VMain in
+     let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
+     let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
+     let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
+     let f = run_stmts fenv world noblk2 prog2 in
+     let _ = map_set load_ctx "dir" saved in
+     let _ = map_set load_ctx "coding" savedc in
+     (match f with
+      | FRaise _ -> fail "mere-ruby: (ruby exception raised)"
+      | _ -> VBool true))
+  else raise_exc world "LoadError" ("cannot load such file -- " ++ p0)
 
 // an Enumerator::Lazy: a source (anything with #each) + a pipeline of ops
 // ([kind, payload] pairs: procs for map/select/..., ints for take/drop).
@@ -12672,10 +12737,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | VStr p0 -> let p0 = sget p0 in
        let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
        let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
-       let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else dir ++ "/" ++ p1 in
+       // require_relative: against the requiring file's dir; require: an
+       // absolute path directly, else the $LOAD_PATH dirs, else the dir.
+       let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
+                  else if rel then dir ++ "/" ++ p1
+                  else (let hit = load_path_find world p1 in
+                        if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
        if map_has loaded_files full then FNext (VBool false)
        else
          let _ = map_set loaded_files full VNil in
+         let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
+                  | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
+                  | _ -> ()) in
          let src = read_file full in
          // the file's magic comment sets the script encoding for parse (a
          // parse-time __ENCODING__ capture) and while it runs; a file with no
@@ -15022,6 +15095,14 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = register_builtin_consts () in
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
   let _ = map_set env "self" VMain in   // top-level self is `main`
+  // $: / $LOAD_PATH are the SAME array (aliased by handle); likewise $" /
+  // $LOADED_FEATURES. require searches the load path and records features.
+  let lp0 = arr_new Nil in
+  let _ = map_set globals ":" lp0 in
+  let _ = map_set globals "LOAD_PATH" lp0 in
+  let lf0 = arr_new Nil in
+  let _ = map_set globals "\"" lf0 in
+  let _ = map_set globals "LOADED_FEATURES" lf0 in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let final = hoist_run env world noblk prog in
   if print_result then
