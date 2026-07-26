@@ -6433,6 +6433,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let target = (match args with Cons (VClass t, _) -> t | _ -> "") in
        do_refine world refinery target bb)
     else if map_has meths name then call_method env world newblk name args
+    // bare method(:name) — Kernel#method on the implicit self.
+    else if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+      invoke_val_c env world newblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
     // implicit self: a bare `each { }` inside a method is `self.each { }`.
     else if map_has env "self" then
       (match map_get env "self" with
@@ -8081,6 +8084,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
         if rx_validate body fl then VRegex (body, fl)
         else raise_exc world "RegexpError" "invalid regular expression")
      | _ -> VNil)
+  // Kernel#method(:name): a bound Method object (NameError when undefined).
+  // A user-defined `method` method on the receiver's class wins.
+  else if str_eq name "method"
+          && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false)
+          && (match recv with
+              | VObj oid2 -> (let (m9, s9, o9, i9) = world in
+                              if has_meth world (map_get o9 (str_of_int oid2)) "method" then false else true)
+              | _ -> true) then
+    (let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr h2, _) -> sget h2 | _ -> "") in
+     let owner = bm_owner_of world recv nm in
+     let exists = (if str_eq owner "" then
+                     (match recv with
+                      | VMain -> (let (m9, _, _, _) = world in map_has m9 nm)
+                      | _ -> responds world recv nm)
+                   else true) in
+     if exists then mk_bound_method world recv owner nm
+     else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for an instance of " ++ display_cls world (dispatch_cls_of world recv)))
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
   else if str_eq name "extend" && (match recv with VClass _ -> true | VObj _ -> true | _ -> false) then
@@ -8464,6 +8484,74 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
     // an object's singleton class (created on first use).
     else if str_eq name "singleton_class" then VClass (singleton_cls_of world id)
+    // bound Method objects (Kernel#method): call/[]/===, reflection getters,
+    // unbind, to_proc (a proc closing over the receiver).
+    else if str_eq cls "Method" then
+      (let mnm = (match map_get ivars (str_of_int id ++ "@__m_name") with VStr h -> sget h | _ -> "") in
+       let mown = (match map_get ivars (str_of_int id ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
+       let mrecv = (if map_has ivars (str_of_int id ++ "@__m_recv") then map_get ivars (str_of_int id ++ "@__m_recv") else VMain) in
+       if str_eq name "call" || str_eq name "[]" || str_eq name "===" then
+         (match mrecv with
+          | VMain -> call_method env world blk mnm args
+          | _ -> invoke_val_c env world blk mrecv mnm args false)
+       else if str_eq name "name" then VSym mnm
+       else if str_eq name "receiver" then mrecv
+       else if str_eq name "owner" then (if str_eq mown "" then VClass (class_name mrecv) else VClass mown)
+       else if str_eq name "arity" then VInt (bm_arity world mown mnm)
+       else if str_eq name "unbind" then
+         (let uid = map_len ocls in
+          let _ = map_set ocls (str_of_int uid) "UnboundMethod" in
+          let _ = map_set ivars (str_of_int uid ++ "@__um_cls") (mkstr (if str_eq mown "" then class_name mrecv else mown)) in
+          let _ = map_set ivars (str_of_int uid ++ "@__um_name") (mkstr mnm) in
+          VObj uid)
+       else if str_eq name "to_proc" then
+         (let benv = map_new () in
+          let _ = map_set benv "__m_self" mrecv in
+          let body = (match mrecv with
+                      | VMain -> Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Nil))), Nil)
+                      | _ -> Cons (SExpr (EMethod (EVar "__m_self", mnm, Cons (ESplat (EVar "__a"), Nil))), Nil)) in
+          let pid = map_len proc_store in
+          let _ = map_set proc_store (str_of_int pid) (true, Cons ("*__a", Nil), body, benv) in
+          VProc pid)
+       else if str_eq name "inspect" || str_eq name "to_s" then
+         mkstr ("#<Method: " ++ (if str_eq mown "" then class_name mrecv else mown) ++ "#" ++ mnm ++ ">")
+       else if str_eq name "==" || str_eq name "eql?" then
+         (match args with
+          | Cons (VObj oid2, _) ->
+            VBool (str_eq (map_get ocls (str_of_int oid2)) "Method"
+                   && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__m_name"))) mnm
+                   && rb_identical mrecv (if map_has ivars (str_of_int oid2 ++ "@__m_recv") then map_get ivars (str_of_int oid2 ++ "@__m_recv") else VMain))
+          | _ -> VBool false)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Method"))
+    // UnboundMethod: bind / bind_call and the reflection getters.
+    else if str_eq cls "UnboundMethod" then
+      (let ucls = (match map_get ivars (str_of_int id ++ "@__um_cls") with VStr h -> sget h | _ -> "") in
+       let unm = (match map_get ivars (str_of_int id ++ "@__um_name") with VStr h -> sget h | _ -> "") in
+       if str_eq name "bind" || str_eq name "bind_call" then
+         (let target = (match args with Cons (v, _) -> v | _ -> VNil) in
+          let tcls = dispatch_cls_of world target in
+          let ok = (match target with
+                    | VObj tid -> obj_is_a world (map_get ocls (str_of_int tid)) ucls
+                    | _ -> obj_is_a world (class_name target) ucls || str_eq (class_name target) ucls) in
+          if ok then
+            (if str_eq name "bind" then mk_bound_method world target ucls unm
+             else (match args with
+                   | Cons (_, rest) -> invoke_val_c env world blk target unm rest false
+                   | _ -> VNil))
+          else raise_exc world "TypeError" ("bind argument must be an instance of " ++ ucls))
+       else if str_eq name "name" then VSym unm
+       else if str_eq name "owner" then VClass ucls
+       else if str_eq name "arity" then VInt (bm_arity world ucls unm)
+       else if str_eq name "inspect" || str_eq name "to_s" then
+         mkstr ("#<UnboundMethod: " ++ ucls ++ "#" ++ unm ++ ">")
+       else if str_eq name "==" || str_eq name "eql?" then
+         (match args with
+          | Cons (VObj oid2, _) ->
+            VBool (str_eq (map_get ocls (str_of_int oid2)) "UnboundMethod"
+                   && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__um_cls"))) ucls
+                   && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__um_name"))) unm)
+          | _ -> VBool false)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of UnboundMethod"))
     // Encoding objects: name/to_s give the label, inspect is #<Encoding:name>.
     // a user exception object answers #message / #to_s with its @message.
     else if (str_eq name "message" || str_eq name "to_s") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
@@ -9202,6 +9290,57 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   else prim_method recv name args
 
 // does `recv` respond to `name`? (used by respond_to?)
+// a bound Method object: a synthetic-class VObj carrying receiver + name
+// (+ the owner class resolved at creation time, for #owner/#unbind).
+and mk_bound_method = fn world -> fn (recv: Val) -> fn (owner: str) -> fn (nm: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = map_len ocls in
+  let _ = map_set ocls (str_of_int id) "Method" in
+  let _ = map_set ivars (str_of_int id ++ "@__m_name") (mkstr nm) in
+  let _ = map_set ivars (str_of_int id ++ "@__m_owner") (mkstr owner) in
+  let _ = map_set ivars (str_of_int id ++ "@__m_recv") recv in
+  VObj id
+
+// the class a receiver's method named nm is found in ("" = builtin/unknown).
+and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  match recv with
+  | VMain -> ""
+  | VObj oid ->
+    (let ocl = map_get ocls (str_of_int oid) in
+     if map_has meths (ocl ++ "#" ++ nm) then ocl else lookup_anc world (ancestors_of world ocl) nm)
+  | VClass c2 ->
+    (let sng = "(sng:" ++ c2 ++ ")" in
+     if map_has meths (sng ++ "#" ++ nm) then sng else lookup_anc world (ancestors_of world sng) nm)
+  | other ->
+    (let cn = class_name other in
+     if map_has meths (cn ++ "#" ++ nm) then cn else lookup_anc world (ancestors_of world cn) nm)
+
+// Method#arity from a user method's params/defaults (-1 for builtins).
+and bm_arity = fn world -> fn (owner: str) -> fn (nm: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if str_eq owner "" then 0 - 1
+  else if map_has meths (owner ++ "#" ++ nm) then
+    (match map_get meths (owner ++ "#" ++ nm) with
+     | Meth (params, defaults, _) -> bm_arity_go params defaults 0 false)
+  else if map_has meths nm then
+    (match map_get meths nm with Meth (params, defaults, _) -> bm_arity_go params defaults 0 false)
+  else 0 - 1
+and bm_arity_go = fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (req: int) -> fn (opt: bool) ->
+  match params with
+  | Nil -> if opt then 0 - (req + 1) else req
+  | Cons (pp, rest) ->
+    if str_len pp > 0 && (str_eq (char_at pp 0) "*" || str_eq (char_at pp 0) "&") then
+      bm_arity_go rest defaults req (opt || str_eq (char_at pp 0) "*")
+    else if str_len pp > 0 && str_eq (char_at pp (str_len pp - 1)) ":" then
+      bm_arity_go rest defaults req opt
+    else if bm_has_default defaults pp then bm_arity_go rest defaults req true
+    else bm_arity_go rest defaults (req + 1) opt
+and bm_has_default = fn (defaults: (str * Expr) list) -> fn (pp: str) ->
+  match defaults with
+  | Nil -> false
+  | Cons ((dn, _), rest) -> str_eq dn pp || bm_has_default rest pp
+
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VObj id -> let (meths, sup, ocls, ivars) = world in has_meth world (map_get ocls (str_of_int id)) name || is_prim_method name
@@ -10096,6 +10235,10 @@ and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> 
 and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // bare method(:name) — Kernel#method on the implicit self.
+  if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+    invoke_val_c env world noblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
+  else
   if map_has env "self" then
     (match map_get env "self" with
      | VObj id ->
@@ -10128,6 +10271,9 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
 and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+    invoke_val_c env world noblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
+  else
   if map_has env "self" then
     (match map_get env "self" with
      | VObj id ->
