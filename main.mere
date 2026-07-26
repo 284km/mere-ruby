@@ -6778,8 +6778,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // a yielder in a generator block: y << value.
        else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
-       // File / IO handles: f << data appends (write).
-       else if (str_eq ocl "File" || str_eq ocl "IO") && str_eq op "<<" then
+       // File / IO handles and queues: recv << data.
+       else if (str_eq ocl "File" || str_eq ocl "IO" || str_eq ocl "Queue" || str_eq ocl "SizedQueue") && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
        // enumerator chaining: e1 + e2.
        else if (str_eq ocl "Enumerator" || str_eq ocl "Enumerator::Chain") && str_eq op "+" then
@@ -8552,6 +8552,25 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
        else if str_eq name "abort_on_exception=" || str_eq name "report_on_exception=" then
          (match args with Cons (v, _) -> v | _ -> VNil)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Thread"))
+    // Queue / SizedQueue / ConditionVariable constructors.
+    else if (str_eq c "Queue" || str_eq c "SizedQueue") && str_eq name "new" then
+      (let (mth0, sup0, ocl0, iv0) = world in
+       let id2 = map_len ocl0 in
+       let _ = map_set ocl0 (str_of_int id2) c in
+       let _ = map_set iv0 (str_of_int id2 ++ "@__q") (arr_new Nil) in
+       let _ = (if str_eq c "SizedQueue" then
+                  (match args with
+                   | Cons (VInt mx, _) ->
+                     (if mx <= 0 then (let _ = raise_exc world "ArgumentError" "queue size must be positive" in ())
+                      else map_set iv0 (str_of_int id2 ++ "@__qmax") (VInt mx))
+                   | _ -> let _ = raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)" in ())
+                else ()) in
+       VObj id2)
+    else if str_eq c "ConditionVariable" && str_eq name "new" then
+      (let (mth0, sup0, ocl0, iv0) = world in
+       let id2 = map_len ocl0 in
+       let _ = map_set ocl0 (str_of_int id2) "ConditionVariable" in
+       VObj id2)
     // ThreadGroup: groups are markers on thread objects (@__tgrp).
     else if str_eq c "ThreadGroup" && str_eq name "new" then
       (let (mth0, sup0, ocl0, iv0) = world in
@@ -9069,6 +9088,65 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
           arr_new (idx_to_list out 0 (map_len out)))
        else if str_eq name "enclose" || str_eq name "enclosed?" then VBool false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ThreadGroup"))
+    // Queue / SizedQueue (synchronous model): a plain FIFO. A pop that
+    // would block forever (empty, not closed, nobody left to push) is the
+    // deadlock fatal; the non-blocking form is ThreadError.
+    else if str_eq cls "Queue" || str_eq cls "SizedQueue" then
+      (let k = str_of_int id in
+       let qv = (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else arr_new Nil) in
+       let items = (match qv with VArr aid -> deref aid | _ -> Nil) in
+       let closed = map_has ivars (k ++ "@__qclosed") in
+       if str_eq name "push" || str_eq name "<<" || str_eq name "enq" then
+         (if closed then raise_exc world "ClosedQueueError" "queue closed"
+          else
+            let full = (match (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil) with
+                        | VInt mx -> val_list_len items >= mx
+                        | _ -> false) in
+            if full && (match args with Cons (_, Cons (VBool true, _)) -> false | _ -> true) then
+              // a blocking push with no consumer: parks a thread, fatal
+              // deadlock on the main thread.
+              (if in_thread () then raise_exc world "__ThreadPark" "sleep"
+               else raise_exc world "fatal" "No live threads left. Deadlock?")
+            else if full then raise_exc world "ThreadError" "queue full"
+            else
+              (match args with
+               | Cons (v, _) -> let _ = (match qv with VArr aid -> arr_set aid (list_append items (Cons (v, Nil))) | _ -> ()) in recv
+               | _ -> recv))
+       else if str_eq name "pop" || str_eq name "shift" || str_eq name "deq" then
+         (match items with
+          | Cons (h, t) ->
+            let _ = (match qv with VArr aid -> arr_set aid t | _ -> ()) in h
+          | Nil ->
+            (if closed then VNil
+             else if (match args with Cons (VBool true, _) -> true | _ -> false) then
+               raise_exc world "ThreadError" "queue empty"
+             // a blocking pop with no producer: parks a thread, fatal
+             // deadlock on the main thread.
+             else if in_thread () then raise_exc world "__ThreadPark" "sleep"
+             else raise_exc world "fatal" "No live threads left. Deadlock?"))
+       else if str_eq name "empty?" then VBool (match items with Nil -> true | _ -> false)
+       else if str_eq name "size" || str_eq name "length" then VInt (val_list_len items)
+       else if str_eq name "clear" then
+         (let _ = (match qv with VArr aid -> arr_set aid Nil | _ -> ()) in recv)
+       else if str_eq name "close" then
+         (let _ = map_set ivars (k ++ "@__qclosed") (VBool true) in recv)
+       else if str_eq name "closed?" then VBool closed
+       else if str_eq name "num_waiting" then VInt 0
+       else if str_eq name "max" then
+         (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil)
+       else if str_eq name "max=" then
+         (match args with Cons (VInt mx, _) -> let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VInt mx | _ -> VNil)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls))
+    // ConditionVariable (synchronous model): wait returns immediately (there
+    // is nobody to signal us later); signal/broadcast are no-ops.
+    else if str_eq cls "ConditionVariable" then
+      (if str_eq name "wait" then
+         // waiting with nobody left to signal: parks a thread, and is the
+         // real deadlock on the main thread (as in Ruby).
+         (if in_thread () then raise_exc world "__ThreadPark" "sleep"
+          else raise_exc world "fatal" "No live threads left. Deadlock?")
+       else if str_eq name "signal" || str_eq name "broadcast" then recv
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ConditionVariable"))
     // Mutex (synchronous model): the owner is a thread object; a lock held
     // by a dead thread is reacquirable, a re-lock by the owner (or a lock
     // held by a live other thread, which would block forever) is ThreadError.
@@ -15985,6 +16063,7 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "EOFError" "IOError" in
   let _ = map_set sup "ThreadError" "StandardError" in
   let _ = map_set sup "fatal" "Exception" in
+  let _ = map_set sup "ClosedQueueError" "StopIteration" in
   let _ = map_set sup "LocalJumpError" "StandardError" in
   let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
   let _ = map_set sup "NoMatchingPatternError" "StandardError" in
@@ -16048,6 +16127,13 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set consts "ThreadGroup::Default" (VObj tgid) in
   let _ = map_set consts "ThreadError" (VClass "ThreadError") in
   let _ = map_set consts "Thread::Mutex" (VClass "Mutex") in
+  let _ = map_set consts "Queue" (VClass "Queue") in
+  let _ = map_set consts "SizedQueue" (VClass "SizedQueue") in
+  let _ = map_set consts "ConditionVariable" (VClass "ConditionVariable") in
+  let _ = map_set consts "Thread::Queue" (VClass "Queue") in
+  let _ = map_set consts "Thread::SizedQueue" (VClass "SizedQueue") in
+  let _ = map_set consts "Thread::ConditionVariable" (VClass "ConditionVariable") in
+  let _ = map_set consts "ClosedQueueError" (VClass "ClosedQueueError") in
   // ENV (reads go through getenv, writes overlay), ARGV, $0/$PROGRAM_NAME.
   let envid = map_len ocls in
   let _ = map_set ocls (str_of_int envid) "EnvHash" in
