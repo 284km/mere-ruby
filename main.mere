@@ -6646,6 +6646,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
        if has_meth world ocl op then
          invoke world noblk va0 ocl op (Cons (eval_e env world blk b, Nil))
+       // a yielder in a generator block: y << value.
+       else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
+         invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
        // Comparable: derive < > <= >= from a user-defined <=> when the
        // operator itself is not defined.
        else if (str_eq op "<" || str_eq op ">" || str_eq op "<=" || str_eq op ">=") && has_meth world ocl "<=>" then
@@ -7689,6 +7692,15 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   // each iterator returns a Flow: FBreak v (a `break v` fired — that value
   // becomes the whole call's result) or FNext <natural result>.
   match recv with
+  // String iterators with a block (each_char/each_byte/each_line); other
+  // enum methods iterate the chars.
+  | VStr h ->
+    (let sv = sget h in
+     if str_eq name "each_char" then iter_each_result (arr_each world encl theblk (utf8_chars_val sv 0)) recv
+     else if str_eq name "each_byte" then iter_each_result (arr_each world encl theblk (str_bytes_val sv 0)) recv
+     else if str_eq name "each_line" then iter_each_result (arr_each world encl theblk (val_list_of_strs (str_lines_go sv 0 0 (str_len sv)))) recv
+     else if str_eq name "each_with_index" then iter_each_result (arr_each world encl theblk (with_index_pairs (utf8_chars_val sv 0) 0)) recv
+     else prim_method recv name args)
   | VArr id -> let xs = deref id in
     if str_eq name "each" then iter_each_result (arr_each world encl theblk xs) recv
     else if str_eq name "map" || str_eq name "collect" then iter_result (arr_map world encl theblk xs Nil) recv
@@ -8112,6 +8124,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                    else true) in
      if exists then mk_bound_method world recv owner nm
      else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for an instance of " ++ display_cls world (dispatch_cls_of world recv)))
+  // recv.enum_for(:m) / recv.to_enum(:m) — an Enumerator over recv.m (the
+  // bare-call form has its own handler; this is the explicit-receiver one).
+  else if (str_eq name "enum_for" || str_eq name "to_enum")
+          && (match recv with
+              | VObj oid3 -> (let (m9, s9, o9, i9) = world in
+                              if has_meth world (map_get o9 (str_of_int oid3)) name then false else true)
+              | _ -> true) then
+    (match args with
+     | Cons (VSym m, _) -> make_enum world recv m
+     | Cons (VStr m, _) -> make_enum world recv (sget m)
+     | _ -> make_enum world recv "each")
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
   else if str_eq name "extend" && (match recv with VClass _ -> true | VObj _ -> true | _ -> false) then
@@ -8593,6 +8616,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                    && rb_identical mrecv (if map_has ivars (str_of_int oid2 ++ "@__m_recv") then map_get ivars (str_of_int oid2 ++ "@__m_recv") else VMain))
           | _ -> VBool false)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Method"))
+    // Enumerator::Yielder: << / yield / call forward to the driving block.
+    else if str_eq cls "Enumerator::Yielder" then
+      (if str_eq name "<<" || str_eq name "yield" || str_eq name "call" then
+         (match (if map_has ivars (str_of_int id ++ "@__y_blk") then map_get ivars (str_of_int id ++ "@__y_blk") else VNil) with
+          | VProc bpid ->
+            let r = flow_value (run_block world (false, (Nil : str list), (Nil : Stmt list), env) (map_get proc_store (str_of_int bpid)) args) in
+            (if str_eq name "<<" then recv else r)
+          | _ -> VNil)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Enumerator::Yielder"))
+    // Enumerator without a block: enum methods materialize the elements and
+    // delegate to the array implementation.
+    else if str_eq cls "Enumerator"
+            && (is_enum_method name || str_eq name "size" || str_eq name "each_with_index" ||
+                str_eq name "take" || str_eq name "drop" || str_eq name "each_slice" || str_eq name "each_cons") then
+      (let av = enum_to_arr env world blk id in
+       invoke_val_c env world blk av name args vischeck)
+    // external iteration (re-drive style: the enumerator is re-run and indexed
+    // by @__e_pos — O(n^2) overall but correct for pure sources).
+    else if str_eq cls "Enumerator" && (str_eq name "next" || str_eq name "peek" || str_eq name "rewind") then
+      (if str_eq name "rewind" then
+         (let _ = map_set ivars (str_of_int id ++ "@__e_pos") (VInt 0) in recv)
+       else
+         let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
+         let av = enum_to_arr env world blk id in
+         let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
+         if pos >= val_list_len xs then raise_exc world "StopIteration" "iteration reached an end"
+         else
+           let v = val_nth xs pos in
+           let _ = (if str_eq name "next" then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
+           v)
     // UnboundMethod: bind / bind_call and the reflection getters.
     else if str_eq cls "UnboundMethod" then
       (let ucls = (match map_get ivars (str_of_int id ++ "@__um_cls") with VStr h -> sget h | _ -> "") in
@@ -9062,12 +9115,34 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
       (match recv with
        | VObj id ->
          (let (m0, s0, ocls0, ivars0) = world in
+          if map_has ivars0 (str_of_int id ++ "@__e_blk") then
+            // generator form: run the stored block with a yielder that
+            // forwards each y << v / y.yield(v) to the caller's block.
+            (match map_get ivars0 (str_of_int id ++ "@__e_blk") with
+             | VProc gpid ->
+               let bpid = map_len proc_store in
+               let _ = map_set proc_store (str_of_int bpid) newblk in
+               let yid = map_len ocls0 in
+               let _ = map_set ocls0 (str_of_int yid) "Enumerator::Yielder" in
+               let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
+               let _ = flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil))) in
+               recv
+             | _ -> VNil)
+          else
           let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
           let meth2 = (match (if map_has ivars0 (str_of_int id ++ "@meth") then map_get ivars0 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
           (match recv2 with
            | VMain -> if map_has m0 meth2 then (let e2 = map_copy env in let _ = map_set e2 "self" recv2 in call_method e2 world newblk meth2 args)
                       else invoke_with_block env world blk recv2 meth2 args newblk
            | _ -> invoke_with_block env world blk recv2 meth2 args newblk))
+       | _ -> VNil)
+    // other Enumerator methods (map/select/... with a block): materialize the
+    // elements, then run the array operation with the same block.
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator") | _ -> false)
+            && (is_enum_method name || str_eq name "each_with_index" || str_eq name "with_index" || str_eq name "each_slice" || str_eq name "each_cons") then
+      (match recv with
+       | VObj id ->
+         invoke_with_block env world blk (enum_to_arr env world blk id) (if str_eq name "with_index" then "each_with_index" else name) args newblk
        | _ -> VNil)
     // instance_eval/instance_exec (block form) on a non-class receiver: run
     // the block with `self` rebound to the receiver. instance_exec forwards
@@ -9097,6 +9172,15 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // Thread.new { } runs the block synchronously but with a FRESH catch
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
+       else if str_eq c "Enumerator" && str_eq name "new" then
+         // Enumerator.new { |y| ... }: store the generator block as a proc.
+         (let pid = map_len proc_store in
+          let _ = map_set proc_store (str_of_int pid) newblk in
+          let (m3, s3, ocls3, iv3) = world in
+          let eid = map_len ocls3 in
+          let _ = map_set ocls3 (str_of_int eid) "Enumerator" in
+          let _ = map_set iv3 (str_of_int eid ++ "@__e_blk") (VProc pid) in
+          VObj eid)
        else if str_eq c "Thread" && str_eq name "new" then
          (let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
           let _ = map_set catch_depth "n" (VInt 0) in
@@ -9286,25 +9370,24 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p pf sv | _ -> VNil)
      | VStr sv -> let sv = sget sv in (match args with Cons (VRegex (p, pf), _) -> rx_do_match world p pf sv | _ -> VNil)
      | _ -> VNil)
-  // block-less enumerators: return an array standing in for the Enumerator
-  // (so `.to_a` / `.map` / `.each` chain naturally). Ambiguous bare `.map` /
-  // `.with_index` are intentionally left out.
+  // block-less enumerators return a real Enumerator over recv.<name>
+  // (materialized on demand by enum_to_arr; supports next/peek/to_a/map...).
   else if str_eq name "each_with_index" then
     (match recv with
-     | VArr id -> arr_new (with_index_pairs (deref id) 0)
-     | VRange (lo, hi, excl) -> arr_new (with_index_pairs (range_to_a lo (if excl then hi - 1 else hi)) 0)
-     | VStr s -> arr_new (with_index_pairs (utf8_chars_val (sget s) 0) 0)
+     | VArr _ -> make_enum world recv name
+     | VRange (_, _, _) -> make_enum world recv name
+     | VStr _ -> make_enum world recv name
      | _ -> prim_method recv name args)
   else if str_eq name "each_char" && (match recv with VStr _ -> true | _ -> false) then
-    (match recv with VStr s -> arr_new (utf8_chars_val (sget s) 0) | _ -> recv)
+    make_enum world recv name
   else if str_eq name "each_byte" && (match recv with VStr _ -> true | _ -> false) then
-    (match recv with VStr s -> arr_new (str_bytes_val (sget s) 0) | _ -> recv)
+    make_enum world recv name
   else if str_eq name "times" && (match recv with VInt _ -> true | _ -> false) then
-    (match recv with VInt n -> arr_new (if n <= 0 then Nil else range_to_a 0 (n - 1)) | _ -> recv)
+    make_enum world recv name
   else if str_eq name "each" && (match recv with VArr _ -> true | VRange _ -> true | _ -> false) then
-    (match recv with VRange (lo, hi, excl) -> arr_new (range_to_a lo (if excl then hi - 1 else hi)) | _ -> recv)
+    make_enum world recv name
   else if str_eq name "each_index" && (match recv with VArr _ -> true | _ -> false) then
-    (match recv with VArr id -> arr_new (range_to_a 0 (vlen (deref id) - 1)) | _ -> recv)
+    make_enum world recv name
   else if str_eq name "upto" && (match recv with VInt _ -> true | _ -> false) then
     (match recv with VInt a -> (match args with Cons (VInt b, _) -> arr_new (range_to_a a b) | _ -> recv) | _ -> recv)
   else if str_eq name "downto" && (match recv with VInt _ -> true | _ -> false) then
@@ -10731,6 +10814,41 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
       else flow_rethrow k v
     else fail "mere-ruby: (ruby exception raised)"
   | other -> other
+
+// materialize an Enumerator (either the @recv/@meth form or a generator
+// created by Enumerator.new { |y| ... }) into an array, by driving its
+// iteration with a collector block. Multi-value yields become arrays
+// (splat param: 0/1 values collapse, 2+ stay a list), like Enumerator#to_a.
+and enum_to_arr = fn env -> fn world -> fn blk -> fn (eid: int) ->
+  let (m0, s0, ocls0, ivars0) = world in
+  let accv = arr_new Nil in
+  let cenv2 = map_new () in
+  let _ = map_set cenv2 "__acc" accv in
+  let collector = (true, Cons ("*__e", Nil),
+                   Cons (SExpr (EMethod (EVar "__acc", "push",
+                     Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
+                                  EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
+                                  EVar "__e"), Nil))), Nil),
+                   cenv2) in
+  let _ = (if map_has ivars0 (str_of_int eid ++ "@__e_blk") then
+             // generator form: run the block with a yielder wired to the collector.
+             (match map_get ivars0 (str_of_int eid ++ "@__e_blk") with
+              | VProc gpid ->
+                let bpid = map_len proc_store in
+                let _ = map_set proc_store (str_of_int bpid) collector in
+                let yid = map_len ocls0 in
+                let _ = map_set ocls0 (str_of_int yid) "Enumerator::Yielder" in
+                let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
+                let _ = flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil))) in
+                ()
+              | _ -> ())
+           else
+             // @recv/@meth form: drive recv.meth with the collector block.
+             (let recv2 = (if map_has ivars0 (str_of_int eid ++ "@recv") then map_get ivars0 (str_of_int eid ++ "@recv") else VNil) in
+              let meth2 = (match (if map_has ivars0 (str_of_int eid ++ "@meth") then map_get ivars0 (str_of_int eid ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
+              let _ = invoke_with_block env world blk recv2 meth2 Nil collector in
+              ())) in
+  accv
 
 // an Enumerator is a plain object of the synthetic class "Enumerator" whose
 // @recv / @meth ivars remember the receiver and method to drive on #each.
