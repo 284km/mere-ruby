@@ -379,6 +379,11 @@ let dm_captured = map_new ();
 // `super` inside such a method raises RuntimeError in Ruby, since a block has
 // no fixed argument list to forward.
 let dm_methods = map_new ();
+// a define_method block/lambda is a closure over the scope where it was
+// defined, so the defined method's body can read those locals. Keyed
+// "Cls#name" -> VProc whose stored block carries the captured env; run_meth
+// seeds the call frame from it (see dm_store_closure).
+let dm_closenv = map_new ();
 // an aliased method remembers the class/module its source was defined in,
 // keyed "Cls#newname" -> origin class. A `super` inside the aliased method
 // resumes above the ORIGIN, not above the class the alias lives in.
@@ -6693,6 +6698,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let (_, ps2, bb2, _) = newblk in
          let _ = map_set meths (c ++ "#" ++ nm) (Meth (ps2, Nil, bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
+         let _ = dm_store_closure (c ++ "#" ++ nm) newblk in
          // capture the block active here so a `yield` in the defined method
          // reaches it (Ruby's define_method closure semantics).
          let _ = (match blk with
@@ -9047,6 +9053,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              let ps2 = (match ps2 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps2 | _ -> ps2) in
              let _ = map_set meths0 (c ++ "#" ++ nm) (Meth (ps2, Nil, bb2)) in
              let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
+             let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
              VSym nm)
         | _ -> VSym nm))
     // instance_methods(false): the method names defined directly on this
@@ -10351,6 +10358,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          let (h2, ps2, bb2, e2) = newblk in
          let _ = map_set meths (c ++ "#" ++ nm) (Meth (ps2, Nil, bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
+         let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
          VSym nm
        | _ -> VNil)
     // ENV.fetch / ENV.delete with a block: the block supplies the value for
@@ -11001,8 +11009,13 @@ and is_prim_method = fn (name: str) ->
   str_eq name "dup" || str_eq name "clone" || str_eq name "itself" ||
   str_eq name "tap" || str_eq name "is_a?" || str_eq name "kind_of?" ||
   str_eq name "instance_of?" || str_eq name "respond_to?" || str_eq name "send" ||
-  str_eq name "__send__" || str_eq name "hash" || str_eq name "object_id" ||
-  str_eq name "==" || str_eq name "!=" || str_eq name "equal?"
+  str_eq name "__send__" || str_eq name "public_send" || str_eq name "hash" ||
+  str_eq name "object_id" || str_eq name "==" || str_eq name "!=" || str_eq name "equal?" ||
+  // reflection primitives, so respond_to? and implicit-self dispatch reach them
+  str_eq name "instance_variable_get" || str_eq name "instance_variable_set" ||
+  str_eq name "instance_variable_defined?" || str_eq name "instance_variables" ||
+  str_eq name "methods" || str_eq name "public_methods" || str_eq name "singleton_methods" ||
+  str_eq name "method" || str_eq name "extend" || str_eq name "define_singleton_method"
 
 // ---- in-place string mutation --------------------------------------------
 // VStr is a handle into str_store, so a mutating method rewrites the store
@@ -12161,6 +12174,11 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        // exactly like the VMain special case below.
        else if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
        then invoke_val_c env world noblk (VObj id) name args false
+       // a bare call to an Enumerable-mixin method or a universal primitive
+       // (instance_variable_get, send, methods, ...) with implicit self routes
+       // through the receiver dispatcher, exactly as self.name would, and
+       // ahead of method_missing since a real method wins.
+       else if is_enum_method name || is_prim_method name then invoke_val_c env world noblk (VObj id) name args false
        else if has_meth world cls "method_missing" then invoke world noblk (VObj id) cls "method_missing" (Cons (VSym name, args))
        else undef_call_exc_x world name args explicit
      // top-level self is main (an Object); route the string form of
@@ -12373,6 +12391,13 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
   let (m, defcls) = lookup_meth_cls world cls name in
   run_meth world blk recv defcls name m args
 
+// remember the closure (env-carrying block) behind a define_method, so the
+// defined method body can read the locals captured where it was defined.
+and dm_store_closure = fn (key: str) -> fn b ->
+  let pid = map_len proc_store in
+  let _ = map_set proc_store (str_of_int pid) b in
+  map_set dm_closenv key (VProc pid)
+
 // run a resolved method with __defcls set to the ancestor it was found in (so
 // a bare `super` resumes from the right point in the receiver's chain).
 and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (name: str) -> fn (m: Meth) -> fn (args: Val list) ->
@@ -12386,6 +12411,14 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
                       then (match map_get dm_captured (defcls ++ "#" ++ name) with VProc pid -> map_get proc_store (str_of_int pid) | _ -> blk)
                       else blk) in
     let frame = map_new () in
+    // a define_method body is a closure: seed the frame with the locals
+    // captured where the block/lambda was defined, before the method's own
+    // self/args/params override the interpreter-internal and parameter keys.
+    let _ = (if map_has dm_closenv (defcls ++ "#" ++ name) then
+               (match map_get dm_closenv (defcls ++ "#" ++ name) with
+                | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> map_iter cenv (fn (k: str) -> fn (v: Val) -> map_set frame k v))
+                | _ -> ())
+             else ()) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
     let _ = map_set frame "self" recv in
     // hidden bindings so `super` can resume lookup above the defining class.
