@@ -8674,7 +8674,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
   else if str_eq name "extend" && (match recv with VClass _ -> true | VObj _ -> true | _ -> false) then
-    (let sc = (match recv with VClass c -> "(sng:" ++ c ++ ")" | VObj id -> "(sng:" ++ str_of_int id ++ ")" | _ -> "") in
+    // extend mixes a module's instance methods in as singleton methods of the
+    // receiver. For an object that means materialising its singleton class (so
+    // dispatch actually runs through it); for a class it is the metaclass.
+    (let sc = (match recv with VClass c -> "(sng:" ++ c ++ ")" | VObj id -> singleton_cls_of world id | _ -> "") in
      let _ = extend_all sc args in
      recv)
   else
@@ -12494,6 +12497,14 @@ and dispatch_cls_of = fn world -> fn (recv: Val) ->
          then map_get hng_store hk else class_name recv
 // `extend`: append each module's name to the receiver singleton's includes,
 // so its instance methods become singleton methods (found via the sng chain).
+// fire a module's `self.included(base)` hook, if defined, after `base`
+// includes it (the ActiveSupport::Concern entry point).
+and run_included_hook = fn world -> fn (mq: str) -> fn (base: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  if has_meth world ("(sng:" ++ mq ++ ")") "included"
+  then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "included" (Cons (VClass base, Nil)) in ())
+  else ()
+
 and extend_all = fn (sc: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
@@ -12554,6 +12565,19 @@ and struct_index_body = fn (ms: str list) -> fn (i: int) ->
     ETern (EBin ("||", EBin ("==", EVar "__k", ESym m), EBin ("==", EVar "__k", EInt i)),
            EIVar m, struct_index_body r (i + 1))
 
+// keyword_init: true among the Struct.new arguments?
+and struct_kw_init = fn (args: Val list) ->
+  match args with
+  | Nil -> false
+  | Cons (VHsh h, _) -> (match hash_lookup (hderef h) (VSym "keyword_init") with (true, VBool b) -> b | _ -> false)
+  | Cons (_, r) -> struct_kw_init r
+// members as keyword parameter names ("x" -> "x:") for a keyword_init struct.
+and struct_kw_params = fn (ms: str list) ->
+  match ms with Nil -> Nil | Cons (m, r) -> Cons (m ++ ":", struct_kw_params r)
+// each member defaults to nil, so a missing keyword yields nil (not an error).
+and struct_kw_defaults = fn (ms: str list) ->
+  match ms with Nil -> Nil | Cons (m, r) -> Cons ((m ++ ":", ENil), struct_kw_defaults r)
+
 // #each body: with no block, return an Enumerator (via enum_for(:each), like
 // CRuby); otherwise yield each member value in turn and return self.
 and struct_each_body = fn (ms: str list) ->
@@ -12584,7 +12608,12 @@ and struct_build = fn world -> fn (args: Val list) ->
   let anon = "Struct_" ++ str_of_int n in
   let _ = map_set sup anon "Struct" in
   let _ = add_attrs world anon "rw" members in
-  let _ = map_set meths (anon ++ "#initialize") (Meth (members, Nil, struct_init_body members)) in
+  // keyword_init structs take their members as (nil-defaulted) keyword params;
+  // positional structs take them positionally.
+  let kw = struct_kw_init args in
+  let _ = map_set meths (anon ++ "#initialize")
+            (if kw then Meth (struct_kw_params members, struct_kw_defaults members, struct_init_body members)
+             else Meth (members, Nil, struct_init_body members)) in
   let toa = Cons (SReturn (EArr (struct_ivar_reads members)), Nil) in
   let _ = map_set meths (anon ++ "#to_a") (Meth (Nil, Nil, toa)) in
   let _ = map_set meths (anon ++ "#to_ary") (Meth (Nil, Nil, toa)) in
@@ -13999,6 +14028,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // its methods live.
          let mq = resolve_scope_name cls m in
          let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ mq else mq) in
+         let _ = run_included_hook world mq cls in
          FNext VNil
        // `undef name` removes the method from this class.
        | SUndef names -> let _ = undef_check world cls names in let _ = undef_all meths cls names in FNext VNil
@@ -14433,6 +14463,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | VClass c ->
        let mq = (if map_has env m then (match map_get env m with VClass mc -> mc | _ -> resolve_scope_name c m) else resolve_scope_name c m) in
        let _ = map_set includes c (if map_has includes c then (map_get includes c) ++ "|" ++ mq else mq) in
+       let _ = run_included_hook world mq c in
        FNext VNil
      | _ -> FNext VNil)
   | SUndef names ->
