@@ -306,6 +306,21 @@ class BeMatcher
   end
 end
 
+# mspec numeric tolerance (mspec/helpers/numeric.rb) and the be_close /
+# be_within float matchers.
+TOLERANCE = 0.00003 unless defined?(TOLERANCE)
+class CloseMatcher
+  def initialize(expected, tolerance); @expected = expected; @tolerance = tolerance; end
+  def match?(actual); (actual - @expected).abs <= @tolerance; end
+end
+def be_close(expected, tolerance = TOLERANCE); CloseMatcher.new(expected, tolerance); end
+class WithinMatcher
+  def initialize(tolerance); @tolerance = tolerance; @expected = nil; end
+  def of(expected); @expected = expected; self; end
+  def match?(actual); (actual - @expected).abs <= @tolerance; end
+end
+def be_within(tolerance); WithinMatcher.new(tolerance); end
+
 def be_nil; BeMatcher.new(:nil); end
 def be_true; BeMatcher.new(:true); end
 def be_false; BeMatcher.new(:false); end
