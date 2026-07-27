@@ -205,6 +205,14 @@ def it(desc, *opts, &blk)
   end
 end
 
+# mspec: `specify` is an alias of `it` (a describe-less example).
+def specify(desc = nil, *opts, &blk); it(desc, *opts, &blk); end
+# mspec's evaluate DSL prefixes example descriptions via SpecEvaluate.desc=;
+# the shim ignores the prefix (descriptions still print per example).
+module SpecEvaluate
+  def self.desc=(x); @desc = x; end
+  def self.desc; @desc; end
+end
 def it_behaves_like(*args); end
 def it_should_behave_like(*args); end
 def before(kind = nil, &blk); $mspec_before = blk; end
