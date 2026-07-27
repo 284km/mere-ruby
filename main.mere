@@ -9316,6 +9316,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match args with Cons (v, Cons (value, _)) -> let _ = map_set ivars (str_of_int id ++ "@" ++ ivar_arg_name (to_s v)) value in value | _ -> VNil)
     else if str_eq name "instance_variable_defined?" then
       (match args with Cons (v, _) -> VBool (map_has ivars (str_of_int id ++ "@" ++ ivar_arg_name (to_s v))) | _ -> VBool false)
+    // Object#instance_variables: this object's own @ivars, as :@name symbols.
+    else if str_eq name "instance_variables" then
+      (let pfx = str_of_int id ++ "@" in
+       let plen = str_len pfx in
+       let tmp = map_new () in
+       let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+         if str_len k > plen && str_eq (substring k 0 plen) pfx
+         then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@" ++ substring k plen (str_len k))))
+         else ()) in
+       arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with Cons (VClass c, _) -> VBool (obj_is_a world cls c) | _ -> VBool false)
     // an object's singleton class (created on first use).
@@ -11162,8 +11172,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
     (match args with
      | Cons (VClass c, _) ->
-       VBool (str_eq (class_name recv) c || str_eq c "Object" ||
-              (str_eq c "Numeric" && (match recv with VInt _ -> true | VFlt _ -> true | _ -> false)))
+       let cn = class_name recv in
+       // instance_of? is exact class; is_a?/kind_of? also count the value's
+       // superclasses and included modules. prim_method is world-free, so the
+       // primitive ancestry (Kernel/Object for all, Numeric/Comparable for the
+       // number-and-string types, Enumerable for the collections) is inlined.
+       let numeric = (match recv with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat _ -> true | VCpx _ -> true | _ -> false) in
+       let comparable = (match recv with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat _ -> true | VStr _ -> true | _ -> false) in
+       let enumerable = (match recv with VArr _ -> true | VHsh _ -> true | VRange _ -> true | _ -> false) in
+       if str_eq name "instance_of?" then VBool (str_eq cn c)
+       else VBool (str_eq cn c || str_eq c "Object" || str_eq c "BasicObject" || str_eq c "Kernel"
+                   || (str_eq c "Numeric" && numeric)
+                   || (str_eq c "Comparable" && comparable)
+                   || (str_eq c "Enumerable" && enumerable))
      | _ -> VBool false)
   else if str_eq name "message" then (match recv with VExc (_, m) -> mkstr m | _ -> mkstr (to_s recv))
   else if str_eq name "to_i" then
@@ -12226,14 +12247,11 @@ and cvar_owner = fn world -> fn (cls: str) -> fn (name: str) ->
 
 // is `cls` the class `target` or a descendant of it? (plus universal roots)
 and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
-  let (meths, sup, ocls, ivars) = world in
-  if str_eq cls target then true
-  else if str_eq target "Object" || str_eq target "BasicObject" then true
-  // a singleton class's superclass chain runs through sng_supername (its
-  // entries are not in the plain `sup` map), ending at Class -> Module -> ...
-  else if is_sng_cls cls then obj_is_a world (sng_supername world cls) target
-  else if map_has sup cls then obj_is_a world (map_get sup cls) target
-  else false
+  // membership in the full ancestor chain, which unlike the bare `sup` chain
+  // also counts included modules (Comparable, Enumerable, Kernel, ...), so
+  // is_a?/kind_of? agree with Module#ancestors.
+  str_eq cls target || str_eq target "Object" || str_eq target "BasicObject"
+  || pp_mem (ancestors_of world cls) target
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
 and is_kernel_builtin = fn (name: str) ->
@@ -12453,6 +12471,30 @@ and struct_ivar_reads = fn (ms: str list) ->
 and struct_sym_lits = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, struct_sym_lits r)
 
+// interleaved [:m1, @m1, :m2, @m2, ...] for a #to_h returning EHsh.
+and struct_to_h_pairs = fn (ms: str list) ->
+  match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, Cons (EIVar m, struct_to_h_pairs r))
+
+// #[] body: return the ivar whose member symbol or 0-based index matches __k.
+and struct_index_body = fn (ms: str list) -> fn (i: int) ->
+  match ms with
+  | Nil -> ENil
+  | Cons (m, r) ->
+    ETern (EBin ("||", EBin ("==", EVar "__k", ESym m), EBin ("==", EVar "__k", EInt i)),
+           EIVar m, struct_index_body r (i + 1))
+
+// #each body: with no block, return an Enumerator (via enum_for(:each), like
+// CRuby); otherwise yield each member value in turn and return self.
+and struct_each_body = fn (ms: str list) ->
+  Cons (SIf (Cons ((EUn ("!", EVar "block_given?"),
+                    Cons (SReturn (ECall ("enum_for", Cons (ESym "each", Nil))), Nil)), Nil),
+             Nil),
+        struct_each_yields ms)
+and struct_each_yields = fn (ms: str list) ->
+  match ms with
+  | Nil -> Cons (SReturn ESelf, Nil)
+  | Cons (m, r) -> Cons (SExpr (EYield (Cons (EIVar m, Nil))), struct_each_yields r)
+
 and struct_init_body = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (SIVarAssign (m, EVar m), struct_init_body r)
 
@@ -12478,6 +12520,11 @@ and struct_build = fn world -> fn (args: Val list) ->
   let _ = map_set meths (anon ++ "#values") (Meth (Nil, Nil, toa)) in
   let _ = map_set meths (anon ++ "#deconstruct") (Meth (Nil, Nil, toa)) in
   let _ = map_set meths (anon ++ "#members") (Meth (Nil, Nil, Cons (SReturn (EArr (struct_sym_lits members)), Nil))) in
+  // #members is also a class method (Struct.members).
+  let _ = map_set meths ("(sng:" ++ anon ++ ")#members") (Meth (Nil, Nil, Cons (SReturn (EArr (struct_sym_lits members)), Nil))) in
+  let _ = map_set meths (anon ++ "#to_h") (Meth (Nil, Nil, Cons (SReturn (EHsh (struct_to_h_pairs members)), Nil))) in
+  let _ = map_set meths (anon ++ "#[]") (Meth (Cons ("__k", Nil), Nil, Cons (SReturn (struct_index_body members 0), Nil))) in
+  let _ = map_set meths (anon ++ "#each") (Meth (Nil, Nil, struct_each_body members)) in
   let _ = map_set meths (anon ++ "#==")
             (Meth (Cons ("o", Nil), Nil,
                    Cons (SReturn (EBin ("==", EMethod (ESelf, "to_a", Nil), EMethod (EVar "o", "to_a", Nil))), Nil))) in
@@ -16745,6 +16792,16 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "Module" "Object" in
   let _ = map_set sup "Integer" "Numeric" in
   let _ = map_set sup "Float" "Numeric" in
+  // Float constants (INFINITY/NAN built from float division; the bounds are
+  // IEEE-754 double literals).
+  let _ = map_set consts "Float::INFINITY" (VFlt (1.0 / 0.0)) in
+  let _ = map_set consts "Float::NAN" (VFlt (0.0 / 0.0)) in
+  // module ancestry: Numeric and String are Comparable; every Object is a
+  // Kernel. This makes Integer.ancestors / String.ancestors and is_a? agree
+  // with CRuby ([Integer, Numeric, Comparable, Object, Kernel, BasicObject]).
+  let _ = map_set includes "Numeric" "Comparable" in
+  let _ = map_set includes "String" "Comparable" in
+  let _ = map_set includes "Object" "Kernel" in
   let _ = map_set sup "Numeric" "Object" in
   let _ = map_set sup "String" "Object" in
   let _ = map_set sup "Array" "Object" in
