@@ -431,6 +431,23 @@ class MockObject
     nil
   end
   def respond_to?(sym); true; end
+  # to_s / inspect are real Object methods (not method_missing), so route them
+  # through the expectation list when mocked; otherwise a stable name (never a
+  # heap address, which would make failure output nondeterministic).
+  def __mock_answer(sym)
+    i = 0
+    while i < @syms.length
+      return [true, @exps[i].value] if @syms[i] == sym
+      i += 1
+    end
+    [false, nil]
+  end
+  def to_s
+    ok, v = __mock_answer(:to_s); ok ? v : "#<MockObject #{@name}>"
+  end
+  def inspect
+    ok, v = __mock_answer(:inspect); ok ? v : "#<MockObject #{@name}>"
+  end
 end
 
 def mock(name); MockObject.new(name); end
