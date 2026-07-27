@@ -318,6 +318,10 @@ let sfrozen_set = fn (id: int) -> let _ = map_set str_frozen (str_of_int id) "1"
 let sfrozen_get = fn (id: int) -> map_has str_frozen (str_of_int id);
 // frozen state of ordinary objects (keyed by object id string), consulted by
 // #frozen? on the object and on its singleton class.
+// frozen state of arrays / hashes (keyed by handle id).
+let coll_frozen = map_new () in
+let cfrozen_set = fn (id: int) -> let _ = map_set coll_frozen (str_of_int id) "1" in ();
+let cfrozen_get = fn (id: int) -> map_has coll_frozen (str_of_int id);
 let obj_frozen = map_new () in
 let ofrozen_set = fn (id: int) -> let _ = map_set obj_frozen (str_of_int id) "1" in ();
 let ofrozen_get = fn (id: int) -> map_has obj_frozen (str_of_int id);
@@ -6703,6 +6707,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | _ ->
        let recv = eval_e env world blk recv_e in
        let args = eval_args env world blk arges in
+       // a mutating call on a frozen String/Array/Hash raises FrozenError
+       // before the in-place fast paths below (which bypass invoke_val_c).
+       let _ = (if is_mutating_method name && val_is_frozen recv
+                then let _ = raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) in ()
+                else ()) in
        // a `self.`-receiver call may reach private methods (always for a
        // setter, and generally in modern Ruby).
        let vis = (match recv_e with ESelf -> false | _ -> true) in
@@ -6801,6 +6810,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     // an object whose class defines the operator dispatches to it.
     let va0 = eval_e env world blk a in
+    // `<<` mutates a String/Array receiver in place — FrozenError first.
+    let _ = (if str_eq op "<<" && val_is_frozen va0
+             then let _ = raise_exc world "FrozenError" ("can't modify frozen " ++ class_name va0 ++ ": " ++ inspect va0) in ()
+             else ()) in
     // `s << x` on a string appends in place (store rewrite: aliases see it).
     // An integer appends the codepoint's character, as in Ruby.
     if str_eq op "<<" && (match va0 with VStr _ -> true | _ -> false) then
@@ -8406,6 +8419,11 @@ and blt_alias_lookup = fn world -> fn (anc: str list) -> fn (name: str) ->
 
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // a mutating method on a frozen String / Array / Hash raises FrozenError
+  // before any dispatch (CRuby's message: `can't modify frozen X: <inspect>`).
+  if is_mutating_method name && val_is_frozen recv then
+    raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+  else
   // a singleton method defined on this exact String/Array/Hash wins.
   let hk = hng_key recv in
   if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) name then
@@ -10789,6 +10807,27 @@ and str_bang_base_ok = fn (b: str) ->
   str_eq b "chop" || str_eq b "sub" || str_eq b "gsub" ||
   str_eq b "tr" || str_eq b "squeeze"
 
+// is this value frozen? (used by the mutation guard)
+and val_is_frozen = fn (recv: Val) ->
+  match recv with
+  | VStr id -> sfrozen_get id
+  | VArr id -> cfrozen_get id
+  | VHsh id -> cfrozen_get id
+  | VObj id -> ofrozen_get id
+  | _ -> false
+// method names that mutate the receiver in place (String / Array / Hash).
+// A trailing-! method is always a mutator; the rest are the non-! in-place
+// operations. dup/clone/freeze are NOT mutators.
+and is_mutating_method = fn (name: str) ->
+  str_eq name "<<" || str_eq name "push" || str_eq name "append" ||
+  str_eq name "pop" || str_eq name "shift" || str_eq name "unshift" ||
+  str_eq name "prepend" || str_eq name "insert" || str_eq name "concat" ||
+  str_eq name "[]=" || str_eq name "store" || str_eq name "delete" ||
+  str_eq name "delete_at" || str_eq name "delete_if" || str_eq name "fill" ||
+  str_eq name "clear" || str_eq name "replace" || str_eq name "keep_if" ||
+  str_eq name "update" || str_eq name "merge!"
+  || (let n = str_len name in
+      n > 1 && str_eq (char_at name (n - 1)) "!")
 and is_str_mut = fn (name: str) ->
   str_eq name "concat" || str_eq name "replace" || str_eq name "clear" ||
   str_eq name "prepend"
@@ -10862,8 +10901,8 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // numbers/symbols/nil/booleans are always frozen; a string is frozen if
     // it was created under --enable-frozen-string-literal or explicitly frozen.
     // an object's singleton class is frozen exactly when the object is.
-    VBool (match recv with VInt _ -> true | VFlt _ -> true | VBool _ -> true | VNil -> true | VSym _ -> true | VStr id -> sfrozen_get id | VObj id -> ofrozen_get id | VClass c -> is_sng_cls c && ofrozen_key (sng_inner c) | _ -> false)
-  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
+    VBool (match recv with VInt _ -> true | VFlt _ -> true | VBool _ -> true | VNil -> true | VSym _ -> true | VStr id -> sfrozen_get id | VArr id -> cfrozen_get id | VHsh id -> cfrozen_get id | VObj id -> ofrozen_get id | VClass c -> is_sng_cls c && ofrozen_key (sng_inner c) | _ -> false)
+  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set id in recv | VHsh id -> let _ = cfrozen_set id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
   else if str_eq name "dup" || str_eq name "clone" then
     // strings are handles now: dup MUST copy, else mutating the dup would
     // write through to the original.
