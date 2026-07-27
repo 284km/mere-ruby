@@ -76,6 +76,16 @@ class PositiveMatcher
     end
     nil
   end
+  # x.should.empty? — bare predicate forwarding (a subset: just empty?).
+  def empty?
+    if @actual.empty?
+      $mspec_pass += 1
+    else
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected #{@actual.inspect} to be empty"
+    end
+    nil
+  end
   def =~(pattern)
     if @actual =~ pattern
       $mspec_pass += 1
@@ -90,6 +100,15 @@ end
 class NegativeMatcher
   def initialize(actual)
     @actual = actual
+  end
+  def empty?
+    if @actual.empty?
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected #{@actual.inspect} not to be empty"
+    else
+      $mspec_pass += 1
+    end
+    nil
   end
   def ==(expected)
     if @actual == expected
@@ -111,6 +130,12 @@ class NegativeMatcher
   end
 end
 
+# Stable display for failure messages: a Proc inspects with a heap address
+# (nondeterministic across runs and hosts), so show a fixed token instead.
+def mspec_show(x)
+  x.is_a?(Proc) ? "#<Proc>" : x.inspect
+end
+
 class Object
   def should(matcher = nil)
     if matcher.nil?
@@ -120,7 +145,7 @@ class Object
         $mspec_pass += 1
       else
         $mspec_fail += 1
-        puts "FAILED: #{$mspec_it}: matcher did not match #{self.inspect}"
+        puts "FAILED: #{$mspec_it}: matcher did not match #{mspec_show(self)}"
       end
       nil
     end
@@ -131,7 +156,7 @@ class Object
     else
       if matcher.match?(self)
         $mspec_fail += 1
-        puts "FAILED: #{$mspec_it}: matcher matched #{self.inspect}"
+        puts "FAILED: #{$mspec_it}: matcher matched #{mspec_show(self)}"
       else
         $mspec_pass += 1
       end
@@ -338,6 +363,8 @@ class RaiseErrorMatcher
 end
 
 def raise_error(klass = nil, msg = nil, pat = nil, &blk); RaiseErrorMatcher.new(klass); end
+# mspec's stricter variant (also checks the message under -W); class-only here.
+def raise_consistent_error(klass = nil, msg = nil, &blk); RaiseErrorMatcher.new(klass); end
 
 # x.should equal(y) — object identity.
 class EqualMatcher
