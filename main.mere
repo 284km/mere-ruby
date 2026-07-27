@@ -1835,14 +1835,21 @@ and parse_range = fn toks ->
   | Cons (TP op, rest) ->
     if str_eq op ".." || str_eq op "..." then
       let excl = str_eq op "..." in
-      // endless range: (1..) — no upper bound expression follows.
+      // endless range: (1..) — no upper bound expression follows. Stops at a
+      // closing punctuator, a newline/EOF, or a keyword that begins the next
+      // clause (`then`/`do`/`if`/`unless`/`end`/`while`/`until`) — e.g. a
+      // `when 90.. then` in a case expression.
       (match rest with
        | Cons (TP p2, _) ->
-         if str_eq p2 ")" || str_eq p2 "]" || str_eq p2 "," || str_eq p2 ";" then
+         if str_eq p2 ")" || str_eq p2 "]" || str_eq p2 "," || str_eq p2 ";" || str_eq p2 "}" || str_eq p2 "|" then
            (ERange (lo, EInt 4611686018427387903, excl), rest)
          else let (hi, r2) = parse_bin rest 1 in (ERange (lo, hi, excl), r2)
        | Cons (TNL, _) -> (ERange (lo, EInt 4611686018427387903, excl), rest)
        | Cons (TEOF, _) -> (ERange (lo, EInt 4611686018427387903, excl), rest)
+       | Cons (TId g, _) ->
+         if str_eq g "then" || str_eq g "do" || str_eq g "if" || str_eq g "unless" || str_eq g "end" || str_eq g "while" || str_eq g "until"
+         then (ERange (lo, EInt 4611686018427387903, excl), rest)
+         else let (hi, r2) = parse_bin rest 1 in (ERange (lo, hi, excl), r2)
        | _ -> let (hi, r2) = parse_bin rest 1 in (ERange (lo, hi, excl), r2))
     else (lo, r)
   | _ -> (lo, r)
@@ -6687,7 +6694,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | VObj id ->
          let cls = map_get ocls (str_of_int id) in
          if has_meth world cls name then invoke world newblk (VObj id) cls name args
-         else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
+         // not an own method — route through the receiver dispatcher so
+         // Enumerable-mixin methods (map/inject/sort_by with a block, driven
+         // by the object's #each), method_missing, and builtin fallbacks all
+         // apply, exactly as `self.name { }` would.
+         else invoke_with_block env world blk (VObj id) name args newblk
        // inside a class method, a bare call with a block is self.name { }.
        | VClass c ->
          // a bare block call inside a class method is `self.name { }`; route
@@ -10551,6 +10562,16 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set iv3 (str_of_int eid ++ "@__e_blk") (VProc pid) in
           let _ = (match args with Cons (sz, _) -> map_set iv3 (str_of_int eid ++ "@__e_size") sz | _ -> ()) in
           VObj eid)
+       // Struct.new(:a, :b) do ... end — build the struct class, then run the
+       // block with self = the new class so its `def`s become instance methods.
+       else if str_eq c "Struct" && str_eq name "new" then
+         (match struct_build world args with
+          | VClass anon ->
+            (let (h3, ps3, bb3, e3) = newblk in
+             let bcref = (if map_has e3 "__cref" then (match map_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
+             let _ = flow_value (register_class_blk world anon bb3 bcref) in
+             VClass anon)
+          | other -> other)
        else if str_eq c "Class" && str_eq name "new" then
          (let (meths2, sup2, ocls2, iv2) = world in
           let anon = fresh_anon "AnonClass_" in
@@ -12026,6 +12047,11 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
      | VObj id ->
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
+       // an Enumerable-mixin method (map/count/inject/...) or a name the
+       // object responds to (method_missing) with implicit self routes through
+       // the receiver dispatcher, exactly as `self.name` would; a genuinely
+       // undefined bare name still raises NameError.
+       else if is_enum_method name || responds world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
        else undef_call_exc world name args
      | VMain ->
        if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
@@ -14696,6 +14722,11 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
   | VRange (lo, hi, excl) ->
     (match v with
      | VInt n -> n >= lo && (if excl then n < hi else n <= hi)
+     // a Float (or other numeric) member compares against the int bounds by
+     // value, so `(90..) === 91.6` and `(0.0..1.0) === 0.5` cover correctly.
+     | VFlt f -> f >= float_of_int lo && (if excl then f < float_of_int hi else f <= float_of_int hi)
+     | VBig _ -> (let f = to_f v in f >= float_of_int lo && (if excl then f < float_of_int hi else f <= float_of_int hi))
+     | VRat _ -> (let f = to_f v in f >= float_of_int lo && (if excl then f < float_of_int hi else f <= float_of_int hi))
      // a Time value tests membership by its ordinal (Time ranges are stored as
      // ordinal ranges), so `(t1..t2) === t` works.
      | VObj id -> let (m2, s2, ocls2, iv2) = world in
