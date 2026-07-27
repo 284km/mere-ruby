@@ -155,6 +155,27 @@ and under `./mere-ruby` and diffs the output byte-for-byte. The corpus covers
 the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
+## Conformance (ruby/spec)
+
+Ruby has no normative written spec — CRuby (MRI) is the definition, and
+[ruby/spec](https://github.com/ruby/spec) is the community's executable
+conformance suite that the other alternative implementations (JRuby,
+TruffleRuby, Opal, Artichoke) target. mere-ruby measures against it too.
+
+`mspec/scoreboard.sh` sweeps ruby/spec directories, runs each spec file under
+both mere-ruby and `ruby` through a minimal mspec shim, and compares
+byte-for-byte. It writes `SPEC_STATUS.md` (a per-group MATCH / DIFF / CRASH /
+SKIP table) and `mspec/tags/*.txt` (the per-file list of what does *not*
+match). Those tag files are the honest, checked-in record of the gap — the
+same idea as the tags/filter files every other implementation keeps. Passing
+100% is a non-goal (only MRI does, because the specs are derived from it); the
+target is the `language` and `core` groups, with `command_line` low-priority
+and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
+
+A DIFF is usually fidelity, not breakage: real programs (the corpus) match
+exactly while a value class scores low on ruby/spec because of an error
+message, a frozen-object check, or an exotic coercion path.
+
 ## Why it exists
 
 mere-ruby is a dogfood program for Mere — the start of a long-running probe:
