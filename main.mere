@@ -2795,8 +2795,16 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
       // **hash spreads as the call's keyword hash.
       let (inner, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EKwSplat inner, pos)) hp
     else if str_eq star "..." then
-      // `foo(...)` forwards the collected positional args.
-      parse_call_sep r0 (Cons (ESplat (EVar "__fwd"), pos)) hp
+      // `foo(...)` (immediately closed) forwards the collected positional
+      // args; `foo(...expr)` is a beginless exclusive range argument.
+      (match r0 with
+       | Cons (TP q, _) ->
+         if str_eq q ")" then parse_call_sep r0 (Cons (ESplat (EVar "__fwd"), pos)) hp
+         else let (hi, r1) = parse_expr r0 in
+              parse_call_sep r1 (Cons (ERange (EInt (0 - 4611686018427387903), hi, true), pos)) hp
+       | _ ->
+         let (hi, r1) = parse_expr r0 in
+         parse_call_sep r1 (Cons (ERange (EInt (0 - 4611686018427387903), hi, true), pos)) hp)
     else if str_eq star "&" then
       // block-pass `&:sym` / `&expr`; bare `&` forwards the anonymous block.
       (match r0 with
@@ -9069,12 +9077,43 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                 | Nil -> VNil
                 | _ -> arr_new args) in
        lz_step env world blk id v)
+    // Fiber instances (synchronous): resume runs the stored block once.
+    else if str_eq cls "Fiber" then
+      (let k = str_of_int id in
+       if str_eq name "resume" then
+         (if map_has ivars (k ++ "@__fb_done") then raise_exc world "FiberError" "dead fiber called"
+          else
+            let _ = map_set ivars (k ++ "@__fb_done") (VBool true) in
+            (match (if map_has ivars (k ++ "@__fb_blk") then map_get ivars (k ++ "@__fb_blk") else VNil) with
+             | VProc pid ->
+               (let noblk2 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                // the fiber is its own ownership context (Mutex#owned? is
+                // per fiber): run the body with itself as the current thread.
+                let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+                let _ = map_set cur_thr "v" recv in
+                let r = flow_value (run_block world noblk2 (map_get proc_store (str_of_int pid)) args) in
+                let _ = map_set cur_thr "v" savedcur in
+                r)
+             | _ -> VNil))
+       else if str_eq name "alive?" then VBool (if map_has ivars (k ++ "@__fb_done") then false else true)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Fiber"))
     // ThreadGroup instances: #add marks the thread, #list scans the registry.
     else if str_eq cls "ThreadGroup" then
       (if str_eq name "add" then
          (match args with
-          | Cons (VObj tid2, _) -> let _ = map_set ivars (str_of_int tid2 ++ "@__tgrp") recv in recv
+          | Cons (VObj tid2, _) ->
+            // moving into an enclosed group — or out of one — is ThreadError.
+            let cur_grp = (if map_has ivars (str_of_int tid2 ++ "@__tgrp") then map_get ivars (str_of_int tid2 ++ "@__tgrp")
+                           else if map_has dfl_tg "v" then map_get dfl_tg "v" else VNil) in
+            let grp_enc = fn (g: Val) ->
+              (match g with VObj gid2 -> map_has ivars (str_of_int gid2 ++ "@__tgenc") | _ -> false) in
+            if grp_enc recv then raise_exc world "ThreadError" "can't move to the enclosed thread group"
+            else if grp_enc cur_grp then raise_exc world "ThreadError" "can't move from the enclosed thread group"
+            else let _ = map_set ivars (str_of_int tid2 ++ "@__tgrp") recv in recv
           | _ -> recv)
+       else if str_eq name "enclose" then
+         (let _ = map_set ivars (str_of_int id ++ "@__tgenc") (VBool true) in recv)
+       else if str_eq name "enclosed?" then VBool (map_has ivars (str_of_int id ++ "@__tgenc"))
        else if str_eq name "list" then
          (let out = map_new () in
           let _ = map_iter all_thr (fn (k2: str) -> fn (t: Val) ->
@@ -9086,7 +9125,6 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
                 if alive2 && rb_eq grp recv then (let i2 = map_len out in map_set out (str_of_int i2) t) else ())
              | _ -> ())) in
           arr_new (idx_to_list out 0 (map_len out)))
-       else if str_eq name "enclose" || str_eq name "enclosed?" then VBool false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ThreadGroup"))
     // Queue / SizedQueue (synchronous model): a plain FIFO. A pop that
     // would block forever (empty, not closed, nobody left to push) is the
@@ -9166,11 +9204,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: s
           | VObj cid2 -> map_set ivars (str_of_int cid2 ++ "@__nlk") (VInt (cur_locks + d))
           | _ -> ()) in
        if str_eq name "lock" then
-         // a re-lock by the owner deadlocks; a lock held by a parked thread
-         // while we already hold another mutex is a real cycle (fatal);
-         // otherwise the parked owner never resumes, so blocking "until it
-         // releases" resolves to its death and the lock is taken.
+         // a re-lock by the owner deadlocks. A lock held by a live other
+         // thread blocks: a thread that blocks parks (it never resumes);
+         // the main thread blocking on a parked owner while holding another
+         // mutex is a real cycle (fatal), otherwise the parked owner never
+         // resumes, so blocking "until it releases" resolves to its death
+         // and the lock is taken.
          (if owner_alive && rb_eq owner cur then raise_exc world "ThreadError" "deadlock; recursive locking"
+          else if owner_alive && in_thread () then raise_exc world "__ThreadPark" "sleep"
           else if owner_alive && cur_locks > 0 then raise_exc world "fatal" "No live threads left. Deadlock?"
           else let _ = map_set ivars (k ++ "@__mown") cur in let _ = lk_inc 1 in recv)
        else if str_eq name "try_lock" then
@@ -9954,13 +9995,23 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           | VNil -> flow_value (run_block world blk newblk (Cons (mkstr k2, Nil)))
           | v -> (if str_eq name "delete" then (let _ = map_set env_ovr k2 VNil in v) else v))
        | _ -> VNil)
-    // Mutex#synchronize { }: lock, run, unlock (returns the block's value).
+    // Mutex#synchronize { }: lock, run, unlock — the unlock behaves like an
+    // ensure (a raising block still releases before the raise continues).
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Mutex") | _ -> false)
             && str_eq name "synchronize" then
       (let _ = invoke_val_c env world blk recv "lock" Nil false in
-       let r = flow_value (run_block world blk newblk Nil) in
-       let _ = invoke_val_c env world blk recv "unlock" Nil false in
-       r)
+       let result = try_or (fn (u: unit) -> run_block world blk newblk Nil) (FRaise VNil) in
+       (match result with
+        | FRaise _ ->
+          let (m0, s0, ocls0, iv0) = world in
+          let exc = (if map_has iv0 "$exc" then map_get iv0 "$exc" else VNil) in
+          let _ = invoke_val_c env world blk recv "unlock" Nil false in
+          (match exc with
+           | VNil -> fail "mere-ruby: (ruby exception raised)"
+           | e -> flow_value (re_raise world e))
+        | other ->
+          let _ = invoke_val_c env world blk recv "unlock" Nil false in
+          flow_value other))
     // Thread.new/start/fork with a block routes through the class-method
     // dispatcher below (same file), so nothing needed here.
     // File#each_line { block }: materialize the lines and drive Array#each.
@@ -10081,6 +10132,16 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
           let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
           r)
+       // Fiber.new { }: minimal synchronous fiber — #resume runs the whole
+       // body once (no suspension points in this model).
+       else if str_eq c "Fiber" && str_eq name "new" then
+         (let pid = map_len proc_store in
+          let _ = map_set proc_store (str_of_int pid) newblk in
+          let (m3, s3, ocls3, iv3) = world in
+          let fid = map_len ocls3 in
+          let _ = map_set ocls3 (str_of_int fid) "Fiber" in
+          let _ = map_set iv3 (str_of_int fid ++ "@__fb_blk") (VProc pid) in
+          VObj fid)
        // Thread.new/start/fork { }: the synchronous thread model. The body
        // runs immediately as the "thread"; scheduler points (sleep /
        // Thread.pass / Thread.stop) park it by raising the internal
@@ -16064,6 +16125,7 @@ let run_prog = fn (path: str) -> fn (print_result: bool) ->
   let _ = map_set sup "ThreadError" "StandardError" in
   let _ = map_set sup "fatal" "Exception" in
   let _ = map_set sup "ClosedQueueError" "StopIteration" in
+  let _ = map_set sup "FiberError" "StandardError" in
   let _ = map_set sup "LocalJumpError" "StandardError" in
   let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
   let _ = map_set sup "NoMatchingPatternError" "StandardError" in
