@@ -13,6 +13,23 @@ mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ```
 
+## In the browser
+
+mere-ruby also compiles straight to WebAssembly, so it runs Ruby entirely
+client-side — no server, no filesystem. The playground under [`docs/`](docs/)
+is a single page that fetches `mere-ruby.wasm`, hands the editor's source to
+`run_cli` (via a `read_file` sentinel), and shows the output:
+
+```sh
+mere -w main.mere | wat2wasm --enable-tail-call - -o docs/mere-ruby.wasm
+# or: docs/build.sh
+cd docs && python3 -m http.server   # then open http://localhost:8000/
+```
+
+This needs Mere **v0.1.127+**, whose Wasm backend widened `int` to 64 bits —
+without it `1234567890123 + 1` (and any Ruby integer past 2³¹) could not run
+in the browser.
+
 ## What M0 covers
 
 - **Literals**: integers, floats, double- and single-quoted strings
