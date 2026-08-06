@@ -6077,7 +6077,11 @@ and join_pairs = fn (xs: Val list) -> fn (acc: str) ->
      | Nil -> acc);
 
 // Array#join — placed after to_s (which it uses on each element).
-let rec val_join = fn (xs: Val list) -> fn (sep: str) -> fn (acc: str) -> fn (first: bool) ->
+// `es` stringifies a leaf element. Ruby's Array#join calls #to_s on each
+// element, so the caller (which has `world`) passes a world-aware es that
+// invokes a user-defined to_s on objects; val_join itself predates the
+// object machinery, hence the callback rather than a direct invoke.
+let rec val_join = fn (es: Val -> str) -> fn (xs: Val list) -> fn (sep: str) -> fn (acc: str) -> fn (first: bool) ->
   match xs with
   | Nil -> acc
   | Cons (h, t) ->
@@ -6086,11 +6090,11 @@ let rec val_join = fn (xs: Val list) -> fn (sep: str) -> fn (acc: str) -> fn (fi
                  | VArr id ->
                    if map_has insp_seen (str_of_int id) then ""
                    else let _ = map_set insp_seen (str_of_int id) 1 in
-                        let r = val_join (deref id) sep "" true in
+                        let r = val_join es (deref id) sep "" true in
                         let _ = map_delete insp_seen (str_of_int id) in r
-                 | _ -> to_s h) in
+                 | _ -> es h) in
     let acc2 = if first then piece else acc ++ sep ++ piece in
-    val_join t sep acc2 false;
+    val_join es t sep acc2 false;
 
 // ---- evaluator + driver (one mutual recursion) ---------------------------
 // `env` is a Map[str, Val] of local variables (including "self" inside a
@@ -6631,7 +6635,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                 else true) then
       mkstr ""
     else if str_eq name "p" || str_eq name "pp" then
-      let _ = p_print args in
+      let _ = p_print_w env world args in
       (match args with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new args)
     // Kernel#print: write each arg's to_s (no separators, no newline).
     else if str_eq name "print" && (if map_has meths "print" then false else true) then
@@ -8582,6 +8586,48 @@ and coerce_dyck_go = fn env -> fn world -> fn (conv: str) -> fn (args: Val list)
               | _ -> a) in
     Cons (a2, coerce_dyck_go env world conv rest)
 
+// world-aware inspect: like the value-level `inspect`, but an object element
+// gets its user-defined #inspect (Ruby's Array/Hash#inspect call #inspect on
+// each element). `inspect` predates the object world and can't dispatch, so
+// this variant carries `world` and recurses through containers. Objects with
+// no #inspect fall back to the default rendering. (Lives in this rec group so
+// it can reach has_meth / invoke.)
+and inspect_w = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VObj oid ->
+    let (m2, s2, ocls2, iv2) = world in
+    let cls = map_get ocls2 (str_of_int oid) in
+    if has_meth world cls "inspect"
+    then (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v cls "inspect" Nil with VStr s -> sget s | other -> to_s other)
+    else inspect v
+  | VArr id ->
+    if map_has insp_seen (str_of_int id) then "[...]"
+    else
+      let _ = map_set insp_seen (str_of_int id) 1 in
+      let r = "[" ++ join_inspect_w env world (deref id) "" ++ "]" in
+      let _ = map_delete insp_seen (str_of_int id) in
+      r
+  | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs_w env world xs "" ++ "}"
+  | _ -> inspect v
+
+and join_inspect_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) ->
+    let piece = if str_eq acc "" then inspect_w env world h else acc ++ ", " ++ inspect_w env world h in
+    join_inspect_w env world t piece
+
+and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       let pair = inspect_w env world k ++ "=>" ++ inspect_w env world v in
+       let acc2 = if str_eq acc "" then pair else acc ++ ", " ++ pair in
+       join_pairs_w env world t acc2
+     | Nil -> acc)
+
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   let recv = recv0 in
   let name = name0 in
@@ -8600,6 +8646,32 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // before any dispatch (CRuby's message: `can't modify frozen X: <inspect>`).
   if is_mutating_method name && val_is_frozen recv then
     raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+  else
+  // Array#join calls #to_s on each element. prim_method (the value-level
+  // fallback) has no `world`, so dispatch a user-defined to_s here where it
+  // does, then hand val_join a world-aware element stringifier.
+  if str_eq name "join" && (match recv with VArr _ -> true | _ -> false) then
+    (let es = fn (v: Val) ->
+       (match v with
+        | VObj oid ->
+          let (m2, s2, ocls2, iv2) = world in
+          let cls = map_get ocls2 (str_of_int oid) in
+          if has_meth world cls "to_s"
+          then (match invoke world noblk v cls "to_s" Nil with VStr s -> sget s | other -> to_s other)
+          else to_s v
+        | _ -> to_s v) in
+     match recv with
+     | VArr id -> let xs = deref id in
+       (match args with
+        | Cons (VStr sep, _) -> mkstr (val_join es xs (sget sep) "" true)
+        | _ -> mkstr (val_join es xs "" "" true))
+     | _ -> VNil)
+  // Array/Hash #inspect (and #to_s, which aliases it) call #inspect on each
+  // element; dispatch a user-defined #inspect here where `world` is in scope.
+  else if (str_eq name "inspect" || str_eq name "to_s")
+          && (match recv with VArr _ -> true | VHsh _ -> true | _ -> false)
+          && not (has_meth world (class_name recv) name) then
+    mkstr (inspect_w env world recv)
   else
   // a singleton method defined on this exact String/Array/Hash wins.
   let hk = hng_key recv in
@@ -11652,7 +11724,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh xs -> VInt (vlen (hash_keys (hderef xs)))
      | _ -> fail "no count")
   else if str_eq name "join" then
-    (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join xs sep "" true) | _ -> mkstr (val_join xs "" "" true)) | _ -> fail "no join")
+    // Value-level fallback: no `world` here, so objects stringify to the
+    // default. invoke_val_c intercepts join with a world-aware element
+    // stringifier before reaching this path (so user #to_s is honored).
+    (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join to_s xs sep "" true) | _ -> mkstr (val_join to_s xs "" "" true)) | _ -> fail "no join")
   else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh xs -> mkhash (hderef xs) | _ -> fail "no to_h")
   // Array#pack — a small but common subset: "U"/"U*" encode integer codepoints
   // as UTF-8, "C"/"c" pack the low byte of each integer. A bare directive packs
@@ -16747,6 +16822,13 @@ and p_print = fn (args: Val list) ->
   match args with
   | Nil -> ()
   | Cons (v, t) -> let _ = out_print (inspect v) in p_print t
+
+// Kernel#p / #pp use #inspect, which for objects/containers must reach a
+// user-defined #inspect — so go through the world-aware inspect_w.
+and p_print_w = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> ()
+  | Cons (v, t) -> let _ = out_print (inspect_w env world v) in p_print_w env world t
 
 and puts_args = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
   match es with
