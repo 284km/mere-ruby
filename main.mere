@@ -246,9 +246,10 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
            | NRep of RNode * int * int * bool      // body, min, max (-1 = inf), greedy
            | NGroup of RNode * int * str           // body, gnum (0 = shy), name
            | NBackref of int * bool                // group, ci
-           | NBOL | NEOL | NBOS | NEOS | NEOSNL
+           | NBOL | NEOL | NBOS | NEOS | NEOSNL | NGANCHOR
            | NWordB of bool
            | NLook of RNode * bool | NLookB of RNode * bool   // body, negated
+           | NAtomic of RNode                       // (?>...) atomic group
            | NFlagsRest of str
            | NEmpty;
 // Compiled instructions (a program is an int-key Map "0".."N-1" -> RInst,
@@ -256,9 +257,10 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
 type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
            | IClass of RCls list * bool * bool
            | ISplit of int * int | IJmp of int | ISave of int
-           | IBOL | IEOL | IBOS | IEOS | IEOSNL
+           | IBOL | IEOL | IBOS | IEOS | IEOSNL | IGANCHOR
            | IWordB of bool | IBackref of int * bool
            | ILook of int * bool | ILookB of int * int * bool
+           | IAtomic of int
            | IMark of int | ICheck of int * int
            | IOk | IMatch
            | IMeta of int * int;
@@ -474,6 +476,10 @@ let rx_caps = map_new ();
 // patterns the new engine cannot compile (the legacy matcher handles them).
 let rx_progs = map_new ();
 let rx_bad = map_new ();
+// \G anchor position: the start offset of the current search (scan/gsub pass
+// it the cursor). \G (IGANCHOR) matches only when the cursor sits exactly
+// here, so scan/gsub produce contiguous, gap-free matches like Ruby.
+let rx_ganchor = map_new ();
 // lenient regex-parse mode: set while VALIDATING a regex literal at ruby-parse
 // time — constructs the engine does not support yet are accepted (they fall
 // back to the legacy matcher at runtime), while truly invalid syntax still
@@ -10803,6 +10809,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              | Cons (VStr pat, _) -> mkstr (rx_gsub_blk world newblk (sget pat) s (str_eq name "gsub") 0 "")
              | _ -> mkstr s)
           | _ -> recv)
+       // String#scan with a block: yield each match (the capture array when
+       // the pattern has groups, else the matched string), publish $~ per
+       // match, and return the receiver. Without a block, scan returns the
+       // array (handled by prim_method); the block form was previously unhandled
+       // and silently dropped the block.
+       else if str_eq name "scan" && (match recv with VStr _ -> true | _ -> false) then
+         (match recv with
+          | VStr s -> let s = sget s in
+            (match args with
+             | Cons (VRegex (pat, pf), _) -> let _ = rx_scan_blk world newblk pat pf s 0 in recv
+             | _ -> builtin_iter world blk newblk recv name args)
+          | _ -> recv)
        else builtin_iter world blk newblk recv name args)
 
 // dispatch on a primitive receiver: reopened built-in classes win (class
@@ -15388,6 +15406,7 @@ and rxp_ngroups = fn (n: RNode) ->
   | NGroup (b, gn, _) -> (if gn > 0 then 1 else 0) + rxp_ngroups b
   | NLook (b, _) -> rxp_ngroups b
   | NLookB (b, _) -> rxp_ngroups b
+  | NAtomic b -> rxp_ngroups b
   | _ -> 0
 and rxp_ngroups_list = fn (xs: RNode list) ->
   match xs with Nil -> 0 | Cons (h, t) -> rxp_ngroups h + rxp_ngroups_list t
@@ -15544,7 +15563,9 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
       (NGroup (NAlt (Cons (NSeq (Cons (NChar "\r", Cons (NChar "\n", Nil))),
                            Cons (NClass (Cons (CChr "\n", Cons (CChr "\r", Cons (CChr (chr 11), Cons (CChr (chr 12), Nil)))), false, false), Nil))), 0, ""),
        p + 1, g)
-    else if str_eq c "G" || str_eq c "k" || str_eq c "g" || str_eq c "p" ||
+    // \G: anchor to where this match attempt starts (the scan/gsub cursor).
+    else if str_eq c "G" then (NGANCHOR, p + 1, g)
+    else if str_eq c "k" || str_eq c "g" || str_eq c "p" ||
             str_eq c "K" || str_eq c "X" || str_eq c "u" then
       (if map_has rx_lenient "n" then (NEmpty, p + 1, g) else fail "mere-ruby: regexp: unsupported escape")
     else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
@@ -15603,9 +15624,15 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
         let _ = rxp_name_check nm in
         let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
         (NGroup (n, g, nm), rxp_close pat p3, g2))
-     // (?(cond)...) conditional, (?>...) atomic, (?~...) absent: valid Ruby
-     // that this engine defers — lenient validation skips the balanced group.
-     else if str_eq c2 "(" || str_eq c2 ">" || str_eq c2 "~" || str_eq c2 "#" then
+     // (?>...) atomic (possessive) group — non-capturing; once its body
+     // matches, backtracking never re-enters it. Captures inside keep their
+     // own group numbers, so the body parses with the current counter `g`.
+     else if str_eq c2 ">" then
+       (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
+        (NAtomic n, rxp_close pat p2, g2))
+     // (?(cond)...) conditional, (?~...) absent: valid Ruby that this engine
+     // defers — lenient validation skips the balanced group.
+     else if str_eq c2 "(" || str_eq c2 "~" || str_eq c2 "#" then
        (if str_eq c2 "#" then (NEmpty, rxp_skip_group pat p 1, g)   // (?# comment) is fully supported by skipping
         else if map_has rx_lenient "n" then (NEmpty, rxp_skip_group pat p 1, g)
         else fail "mere-ruby: regexp: unsupported group")
@@ -15805,8 +15832,9 @@ and rxc_width = fn (n: RNode) ->
   | NRep (b, lo, hi, _) -> (let w = rxc_width b in if w < 0 || (if hi == lo then false else true) then 0 - 1 else w * lo)
   | NGroup (b, _, _) -> rxc_width b
   | NBackref (_, _) -> 0 - 1
-  | NEmpty -> 0 | NBOL -> 0 | NEOL -> 0 | NBOS -> 0 | NEOS -> 0 | NEOSNL -> 0
+  | NEmpty -> 0 | NBOL -> 0 | NEOL -> 0 | NBOS -> 0 | NEOS -> 0 | NEOSNL -> 0 | NGANCHOR -> 0
   | NWordB _ -> 0 | NLook (_, _) -> 0 | NLookB (_, _) -> 0
+  | NAtomic b -> rxc_width b
   | NFlagsRest _ -> 0
 and rxc_width_sum = fn (xs: RNode list) ->
   match xs with
@@ -15837,6 +15865,7 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   | NBOS -> let _ = map_set prog (str_of_int pc) IBOS in pc + 1
   | NEOS -> let _ = map_set prog (str_of_int pc) IEOS in pc + 1
   | NEOSNL -> let _ = map_set prog (str_of_int pc) IEOSNL in pc + 1
+  | NGANCHOR -> let _ = map_set prog (str_of_int pc) IGANCHOR in pc + 1
   | NWordB b -> let _ = map_set prog (str_of_int pc) (IWordB b) in pc + 1
   | NBackref (g, ci) -> let _ = map_set prog (str_of_int pc) (IBackref (g, ci)) in pc + 1
   | NSeq xs -> rxc_emit_seq prog pc xs
@@ -15889,6 +15918,15 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
      let _ = map_set prog (str_of_int pc2) IOk in
      let _ = map_set prog (str_of_int pc) (IJmp (pc2 + 1)) in
      let _ = map_set prog (str_of_int (pc2 + 1)) (ILookB (subpc, w, negd)) in
+     pc2 + 2)
+  | NAtomic b ->
+    // Same shape as a lookahead sub-program, but IAtomic CONSUMES the body's
+    // match: jmp AFTER; SUB: body IOk; AFTER: IAtomic(SUB).
+    (let subpc = pc + 1 in
+     let pc2 = rxc_emit prog subpc b in
+     let _ = map_set prog (str_of_int pc2) IOk in
+     let _ = map_set prog (str_of_int pc) (IJmp (pc2 + 1)) in
+     let _ = map_set prog (str_of_int (pc2 + 1)) (IAtomic subpc) in
      pc2 + 2)
 and rxc_emit_seq = fn prog -> fn (pc: int) -> fn (xs: RNode list) ->
   match xs with Nil -> pc | Cons (h, t) -> rxc_emit_seq prog (rxc_emit prog pc h) t
@@ -16029,6 +16067,10 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     if i >= str_len s || str_eq (char_at s i) "\n" then rxv_run prog s (pc + 1) i saves bt
     else rxv_fail prog s bt
   | IBOS -> if i == 0 then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt
+  | IGANCHOR ->
+    // \G: match only at the search's start offset (set by rxv_search).
+    (let g = (if map_has rx_ganchor "g" then map_get rx_ganchor "g" else 0) in
+     if i == g then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
   | IEOS -> if i >= str_len s then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt
   | IEOSNL ->
     if i >= str_len s || (i == str_len s - 1 && str_eq (char_at s i) "\n") then rxv_run prog s (pc + 1) i saves bt
@@ -16055,6 +16097,14 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
        if negd then rxv_fail prog s bt else rxv_run prog s (pc + 1) i sv2 bt
      | RFail ->
        if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
+  | IAtomic sub ->
+    // Run the body on a FRESH backtrack stack (its internal choices stay
+    // contained); take its first match, consume to that end, keep its
+    // captures, and continue with the OUTER stack — so we never backtrack
+    // back into the group. That is atomic-group / possessive semantics.
+    (match rxv_run prog s sub i saves Nil with
+     | RFound (e, sv2) -> rxv_run prog s (pc + 1) e sv2 bt
+     | RFail -> rxv_fail prog s bt)
   | ILookB (sub, w, negd) ->
     (if i - w < 0 then (if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
      else
@@ -16092,6 +16142,8 @@ and rxv_fail = fn prog -> fn (s: str) -> fn (bt: (int * int * ((int * int) list)
 // when the new engine cannot handle the pattern -> caller uses the legacy one).
 and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int) ->
   let key = fl ++ chr 1 ++ pat in
+  // record this search's start offset so \G (IGANCHOR) can anchor to it.
+  let _ = map_set rx_ganchor "g" start in
   if map_has rx_bad key then RBadPat
   else
     let ok = try_or (fn (u: unit) -> let _ = rxc_get pat fl in true) false in
@@ -16731,6 +16783,24 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
       (let acc2 = acc ++ substring s i st ++ rep in
        if all then rx_gsub_blk2 world newblk pat fl s all en acc2
        else acc2 ++ substring s en n)
+
+// String#scan with a block: walk matches from cursor `i`, yielding each to
+// the block (the capture array when the pattern has groups, else the matched
+// string), publishing $~/$1.. per match so the block can read them. Mirrors
+// rx_scan_all2's cursor advance (zero-width matches step one char).
+and rx_scan_blk = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) ->
+  match rxv_search pat fl s i with
+  | RBadPat -> ()
+  | RNoHit -> ()
+  | RHit (st, en, saves) ->
+    let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
+    let _ = rxv_export_caps saves ng in
+    let _ = rx_publish_at world s st en ng in
+    let item = (if ng == 0 then mkstr (substring s st en) else arr_new (rx_scan_groups s 1 ng)) in
+    let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+    let _ = flow_value (run_block world nb newblk (Cons (item, Nil))) in
+    let nexti = (if en > st then en else st + 1) in
+    rx_scan_blk world newblk pat fl s nexti
 
 // gsub/sub with a Hash replacement: each match is looked up in the hash and
 // replaced by the (to_s of the) value, or by "" when the key is absent.
