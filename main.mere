@@ -9693,6 +9693,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
           VBool (pos >= str_len content))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of File"))
+    // ARGF (no-block methods): read / readlines / to_a over the ARGV files
+    // (or stdin). The block form of each is handled in the block dispatch.
+    else if str_eq cls "ARGF" then
+      (if str_eq name "read" then mkstr (argf_input ())
+       else if str_eq name "readlines" || str_eq name "to_a" then
+         arr_new (val_list_of_strs (str_lines_go (argf_input ()) 0 0 (str_len (argf_input ()))))
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for ARGF"))
     // STDOUT / STDERR: IO objects keyed by @__io_fd (1 = out, 2 = err).
     else if str_eq cls "IO" && map_has ivars (str_of_int id ++ "@__io_fd") then
       (let fd = (match map_get ivars (str_of_int id ++ "@__io_fd") with VInt n -> n | _ -> 1) in
@@ -10777,7 +10784,17 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
        let cls = map_get ocls (str_of_int id) in
-       if has_meth world cls name then
+       // ARGF.each with a block: each(nil) yields the whole ARGV/stdin stream
+       // as one record; plain each / each_line yields it line by line.
+       if str_eq cls "ARGF" && (str_eq name "each" || str_eq name "each_line") then
+         (match args with
+          | Cons (VNil, _) ->
+            let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+            let _ = flow_value (run_block world nb newblk (Cons (mkstr (argf_input ()), Nil))) in recv
+          | _ ->
+            let inp = argf_input () in
+            let _ = arr_each world blk newblk (val_list_of_strs (str_lines_go inp 0 0 (str_len inp))) in recv)
+       else if has_meth world cls name then
          (if meth_private world cls name
           then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls world cls)
           else invoke world newblk recv cls name args)
@@ -11710,7 +11727,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "each_index" then
     (match recv with VArr id -> arr_new (int_range_list 0 (val_list_len (deref id))) | _ -> fail "no each_index")
   else if str_eq name "rindex" then
-    (match recv with VArr id -> (match args with Cons (v, _) -> (let n = val_rindex (deref id) v 0 (0 - 1) in if n < 0 then VNil else VInt n) | _ -> VNil) | _ -> fail "no rindex")
+    // recv may be an Array (last matching element) or a String (last matching
+    // substring). This branch precedes the String-only rindex below and used
+    // to `fail` on a String, shadowing it — handle both here.
+    (match recv with
+     | VArr id -> (match args with Cons (v, _) -> (let n = val_rindex (deref id) v 0 (0 - 1) in if n < 0 then VNil else VInt n) | _ -> VNil)
+     | VStr s -> let s = sget s in
+       (match args with
+        | Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt i
+        | _ -> VNil)
+     | _ -> fail "no rindex")
   else if str_eq name "tally" then (match recv with VArr id -> val_tally (deref id) Nil | _ -> fail "no tally")
   else if str_eq name "minmax" then (match recv with VArr id -> val_minmax (deref id) | _ -> fail "no minmax")
   else if str_eq name "each_slice" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (val_slices (deref id) n) | _ -> recv) | _ -> fail "no each_slice")
@@ -13089,6 +13115,20 @@ and rb_readlines = fn (u: unit) ->
   match rb_gets () with
   | VNil -> Nil
   | v -> Cons (v, rb_readlines ())
+
+// ARGF input: the concatenation of every file named in ARGV (read via
+// read_file), or stdin when ARGV is empty — the stream ARGF presents.
+and argf_input = fn (u: unit) ->
+  let av = (if map_has cli_argv "v" then map_get cli_argv "v" else arr_new Nil) in
+  match av with
+  | VArr id -> (match deref id with Nil -> read_stdin () | paths -> argf_concat paths "")
+  | _ -> read_stdin ()
+and argf_concat = fn (paths: Val list) -> fn (acc: str) ->
+  match paths with
+  | Nil -> acc
+  | Cons (p, t) ->
+    let s = (match p with VStr h -> try_or (fn (u: unit) -> read_file (sget h)) "" | _ -> "") in
+    argf_concat t (acc ++ s)
 
 and line_end_from = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i
@@ -17172,6 +17212,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set ocls (str_of_int envid) "EnvHash" in
   let _ = map_set consts "ENV" (VObj envid) in
   let _ = map_set consts "ARGV" (if map_has cli_argv "v" then map_get cli_argv "v" else arr_new Nil) in
+  // ARGF: the pseudo-file over the ARGV filenames (or stdin). Its methods
+  // (read / each / each(nil)) are dispatched specially on class "ARGF".
+  let argfid = map_len ocls in
+  let _ = map_set ocls (str_of_int argfid) "ARGF" in
+  let _ = map_set consts "ARGF" (VObj argfid) in
   let _ = map_set globals "0" (mkstr name) in
   let _ = map_set globals "PROGRAM_NAME" (mkstr name) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
