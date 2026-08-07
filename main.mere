@@ -9036,11 +9036,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
     // File class methods over the native externs (read/write/exist?/...).
     else if str_eq c "File" then
-      (if str_eq name "read" then
+      (if str_eq name "read" || str_eq name "binread" then
+         // read / binread both slurp the whole file; mere str is byte-safe
+         // (length header), so binary content with NULs round-trips. binread
+         // tags the result ASCII-8BIT so slicing/indexing is byte-based.
          (match args with
           | Cons (VStr ph, _) ->
             (let path = sget ph in
-             if file_exists path then mkstr (read_file path)
+             if file_exists path then
+               (let r = mkstr (read_file path) in
+                if str_eq name "binread" then (match r with VStr rid -> let _ = senc_set rid "ASCII-8BIT" in r | _ -> r) else r)
              else raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path))
           | _ -> raise_exc world "TypeError" "no implicit conversion into String")
        else if str_eq name "write" then
@@ -10997,15 +11002,22 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     (match recv with VStr s -> arr_new (str_bytes_val (sget s) 0) | _ -> recv)
   // String#unpack — the inverse of the Array#pack subset: "U*" yields
   // codepoints, "C*"/"c*" (and anything else, as a default) yields bytes.
-  else if str_eq name "unpack" && (match recv with VStr _ -> true | _ -> false) then
+  else if (str_eq name "unpack" || str_eq name "unpack1") && (match recv with VStr _ -> true | _ -> false) then
     (match recv with
      | VStr s ->
        (match args with
         | Cons (VStr fmt, _) ->
-          let d = (let f = sget fmt in if str_len f > 0 then char_at f 0 else "") in
-          if str_eq d "U" then arr_new (utf8_codepoints (sget s) 0)
-          else arr_new (str_bytes_val (sget s) 0)
-        | _ -> arr_new Nil)
+          let f = sget fmt in
+          let d0 = (if str_len f > 0 then char_at f 0 else "") in
+          // "U" (UTF-8 codepoints) keeps its own path; everything else goes
+          // through the byte-directive unpacker (N/n/V/v/C/c/H/a/A + count/*).
+          let arr = (if str_eq d0 "U" then arr_new (utf8_codepoints (sget s) 0)
+                     else rb_unpack (sget s) f) in
+          // unpack1 returns just the first element (nil when empty).
+          if str_eq name "unpack1" then
+            (match arr with VArr id -> (match deref id with Cons (v, _) -> v | Nil -> VNil) | _ -> VNil)
+          else arr
+        | _ -> if str_eq name "unpack1" then VNil else arr_new Nil)
      | _ -> recv)
   else if str_eq name "combination" && (match recv with VArr _ -> true | _ -> false) then
     (match recv with VArr id -> (match args with Cons (VInt k, _) -> arr_new (arr_combinations (deref id) k) | _ -> arr_new Nil) | _ -> recv)
@@ -11405,13 +11417,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
             arr_new (vtake (vdrop xs st) len)
         | Cons (VInt i, _) -> val_nth xs (if i < 0 then val_list_len xs + i else i)
         | _ -> VNil)
-     | VStr s -> let s = sget s in let n = utf8_len s in
+     | VStr sid ->
+       // ASCII-8BIT (binary) strings index by BYTE; text strings by codepoint.
+       let ascii8 = str_eq (senc_get sid) "ASCII-8BIT" in
+       let s = sget sid in let n = utf8_len s in
        (match args with
-        // s[i, len]: codepoint substring of length len from i (negative i back).
+        // s[i, len]: substring of length len from i (negative i counts back).
+        // Byte-indexed for binary, codepoint-indexed otherwise.
         | Cons (VInt i, Cons (VInt len, _)) ->
-          let st = if i < 0 then n + i else i in
-          if st < 0 || st > n || len < 0 then VNil
-          else let en = if st + len > n then n else st + len in mkstr (utf8_substr s st (en - st))
+          if ascii8 then
+            (let bn = str_len s in
+             let st = if i < 0 then bn + i else i in
+             if st < 0 || st > bn || len < 0 then VNil
+             else let en = if st + len > bn then bn else st + len in
+                  (match mkstr (substring s st en) with VStr rid -> let _ = senc_set rid "ASCII-8BIT" in VStr rid | r -> r))
+          else
+            (let st = if i < 0 then n + i else i in
+             if st < 0 || st > n || len < 0 then VNil
+             else let en = if st + len > n then n else st + len in mkstr (utf8_substr s st (en - st)))
         // s[/re/] -> whole match; s[/re/, g] -> capture group g (nil if none).
         | Cons (VRegex (pat, pf), rest) ->
           (match rxv_search pat pf s 0 with
@@ -11825,16 +11848,21 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let fmt = sget fmt in
           if str_len fmt == 0 then mkstr "" else
           let d = char_at fmt 0 in
-          let cnt = (if str_len fmt < 2 then 1
-                     else if str_eq (char_at fmt 1) "*" then (0 - 1) else 1) in
+          // parse a proper count: number, '*' (all), or 1. (rb_count handles it.)
+          let (cnt0, _fi) = rb_count fmt (str_len fmt) 1 in
+          let cnt = (if cnt0 < 0 then vlen xs else cnt0) in
           let rec pk = fn (ys: Val list) -> fn (k: int) ->
-            if k == 0 then "" else
+            if k <= 0 then "" else
             (match ys with
              | Nil -> ""
              | Cons (v, t) ->
                let n = (match v with VInt m -> m | _ -> 0) in
                let piece = (if str_eq d "U" then utf8_enc n
-                            else if str_eq d "C" || str_eq d "c" then chr (n - (n / 256) * 256)
+                            else if str_eq d "C" || str_eq d "c" then chr (floor_mod n 256)
+                            else if str_eq d "N" then rb_be_bytes n 4
+                            else if str_eq d "n" then rb_be_bytes n 2
+                            else if str_eq d "V" then rb_le_bytes n 4
+                            else if str_eq d "v" then rb_le_bytes n 2
                             else utf8_enc n) in
                piece ++ pk t (k - 1)) in
           mkstr (pk xs cnt)
@@ -13152,6 +13180,85 @@ and argf_concat = fn (paths: Val list) -> fn (acc: str) ->
   | Cons (p, t) ->
     let s = (match p with VStr h -> try_or (fn (u: unit) -> read_file (sget h)) "" | _ -> "") in
     argf_concat t (acc ++ s)
+
+// --- String#unpack (a byte-safe subset) --------------------------------
+// A byte at index i (0..255). char_at/ord are byte-safe on the length-header
+// str representation, so embedded NULs read fine.
+and rb_sbyte = fn (s: str) -> fn (i: int) -> ord (char_at s i)
+// n big-endian bytes at i as an unsigned integer.
+and rb_be = fn (s: str) -> fn (i: int) -> fn (n: int) -> fn (acc: int) ->
+  if n <= 0 then acc else rb_be s (i + 1) (n - 1) (acc * 256 + rb_sbyte s i)
+// n little-endian bytes at i (mul starts at 1, grows *256).
+and rb_le = fn (s: str) -> fn (i: int) -> fn (n: int) -> fn (mul: int) -> fn (acc: int) ->
+  if n <= 0 then acc else rb_le s (i + 1) (n - 1) (mul * 256) (acc + rb_sbyte s i * mul)
+and rb_hexdig = fn (d: int) -> if d < 10 then chr (48 + d) else chr (87 + d)
+and rb_hex_of = fn (s: str) -> fn (i: int) -> fn (last: int) -> fn (acc: str) ->
+  if i >= last then acc
+  else let b = rb_sbyte s i in rb_hex_of s (i + 1) last (acc ++ rb_hexdig (b / 16) ++ rb_hexdig (floor_mod b 16))
+and rb_str_of_bytes = fn (s: str) -> fn (i: int) -> fn (last: int) -> fn (acc: str) ->
+  if i >= last then acc else rb_str_of_bytes s (i + 1) last (acc ++ char_at s i)
+// read a count after a directive: an integer, '*' (rest), or 1 (default).
+// returns (count_or_-1_for_star, next_fmt_index).
+and rb_count = fn (fmt: str) -> fn (fl: int) -> fn (fi: int) ->
+  if fi >= fl then (1, fi)
+  else if str_eq (char_at fmt fi) "*" then (0 - 1, fi + 1)
+  else if is_digit_ch (char_at fmt fi) then rb_count_go fmt fl fi 0
+  else (1, fi)
+and rb_count_go = fn (fmt: str) -> fn (fl: int) -> fn (fi: int) -> fn (acc: int) ->
+  if fi >= fl then (acc, fi)
+  else let c = char_at fmt fi in
+       if is_digit_ch c then rb_count_go fmt fl (fi + 1) (acc * 10 + (ord c - 48)) else (acc, fi)
+and is_digit_ch = fn (c: str) -> str_len c == 1 && ord c >= 48 && ord c <= 57
+// unpack `s` per `fmt`, accumulating Vals (newest-first, reversed at the end).
+and rb_unpack = fn (s: str) -> fn (fmt: str) ->
+  arr_new (rev_vals (rb_unpack_go s (str_len s) 0 fmt (str_len fmt) 0 Nil))
+and rev_vals = fn (xs: Val list) -> rev_vals_go xs Nil
+and rev_vals_go = fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_vals_go t (Cons (h, acc))
+and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str) -> fn (fl: int) -> fn (fi: int) -> fn (acc: Val list) ->
+  if fi >= fl then acc
+  else
+    let d = char_at fmt fi in
+    if str_eq d " " then rb_unpack_go s slen si fmt fl (fi + 1) acc
+    else
+      let (cnt, fi2) = rb_count fmt fl (fi + 1) in
+      // width per element for fixed-width directives (0 = string-consuming)
+      let w = (if str_eq d "N" || str_eq d "V" then 4
+               else if str_eq d "n" || str_eq d "v" then 2
+               else if str_eq d "C" || str_eq d "c" then 1
+               else 0) in
+      if w > 0 then
+        // repeat the fixed-width read `cnt` times (or until end for '*').
+        let reps = (if cnt < 0 then floor_div (slen - si) w else cnt) in
+        rb_unpack_fixed s slen si fmt fl fi2 d w reps acc
+      else if str_eq d "H" then
+        // hex string of `cnt` NIBBLES (or all remaining bytes for '*').
+        let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
+        let nb = floor_div (nib + 1) 2 in
+        let last = (if si + nb < slen then si + nb else slen) in
+        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr (rb_hex_of s si last ""), acc))
+      else if str_eq d "a" || str_eq d "A" then
+        let take = (if cnt < 0 then slen - si else cnt) in
+        let last = (if si + take < slen then si + take else slen) in
+        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr (rb_str_of_bytes s si last ""), acc))
+      else rb_unpack_go s slen si fmt fl fi2 acc  // unknown directive: skip
+// pack helpers: an integer's low w bytes, big- or little-endian.
+and rb_be_bytes = fn (n: int) -> fn (w: int) ->
+  if w <= 0 then "" else rb_be_bytes (floor_div n 256) (w - 1) ++ chr (floor_mod n 256)
+and rb_le_bytes = fn (n: int) -> fn (w: int) ->
+  if w <= 0 then "" else chr (floor_mod n 256) ++ rb_le_bytes (floor_div n 256) (w - 1)
+and rb_unpack_fixed = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str) -> fn (fl: int) -> fn (fi2: int) -> fn (d: str) -> fn (w: int) -> fn (reps: int) -> fn (acc: Val list) ->
+  if reps <= 0 then rb_unpack_go s slen si fmt fl fi2 acc
+  else if si + w > slen then rb_unpack_fixed s slen si fmt fl fi2 d w 0 (Cons (VNil, acc))  // short: nil, stop
+  else
+    let v = (if str_eq d "N" then rb_be s si 4 0
+             else if str_eq d "n" then rb_be s si 2 0
+             else if str_eq d "V" then rb_le s si 4 1 0
+             else if str_eq d "v" then rb_le s si 2 1 0
+             else if str_eq d "C" then rb_sbyte s si
+             else // "c": signed byte
+               let b = rb_sbyte s si in (if b >= 128 then b - 256 else b)) in
+    rb_unpack_fixed s slen (si + w) fmt fl fi2 d w (reps - 1) (Cons (VInt v, acc))
 
 and line_end_from = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i
