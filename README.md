@@ -116,7 +116,10 @@ world is a *tuple* of maps rather than a record.
 
 - **Blocks** (`{ |x| ... }` and `do |x| ... end`) as true closures: a
   block captures its defining scope and reads and mutates the enclosing
-  locals — the counterpoint to M2's flat method scope.
+  locals — the counterpoint to M2's flat method scope. Its params and the
+  locals it first assigns are block-local, living in a per-invocation frame
+  chained to that scope, so each iteration gets its own binding and a
+  `lambda` created inside the block keeps them after the block returns.
 - **Built-in iterators** taking a block: `each`, `map`, `select`,
   `each_with_index` on arrays; `times` and `upto` on integers.
 - **Ranges**: `1..5` (inclusive) and `1...5` (exclusive), with `.each`,

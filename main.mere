@@ -431,13 +431,76 @@ let deco_memo = map_new ();
 // b.eval(str) re-enter the interpreter against it.
 let bind_store = map_new ();
 // snapshot a locals env by value: `binding` must capture the scope AS IT IS
-// at capture time, isolated from later block-local teardown (drop_created)
-// and from same-named variables assigned in an enclosing scope afterward.
-// The copy is still a persistent mutable Map, so eval(str, b) can define and
-// read locals in the binding's own scope across calls.
+// at capture time, isolated from same-named variables assigned in an
+// enclosing scope afterward. The copy is still a persistent mutable Map, so
+// eval(str, b) can define and read locals in the binding's own scope across
+// calls. (A chained env is flattened first — see lv_flat.)
 let map_copy = fn m ->
   let d = map_new () in
   let _ = map_iter m (fn (k: str) -> fn (v: Val) -> map_set d k v) in
+  d;
+
+// ---- lexical scope chain ------------------------------------------------
+// A locals env is a Map, but Ruby blocks nest scopes: a block's params and
+// the locals it first assigns are block-local, while a name bound further
+// out stays the SAME cell (assigning it inside the block is visible after).
+// So a block body runs in a fresh child frame linked to its defining scope:
+// lookup walks the chain, and assignment writes to the frame that already
+// binds the name, otherwise declaring it in the innermost one. Because a
+// proc/lambda captures the frame itself, the block-locals it closes over
+// outlive the invocation — Ruby's closure semantics, which a single flat map
+// with save/restore teardown could not express (the teardown deleted the
+// very bindings the closure had captured).
+let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
+let lv_ctr = map_new ();   // "n" -> next frame id
+let lv_child = fn parent ->
+  let e = map_new () in
+  let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
+  let _ = map_set lv_ctr "n" (n + 1) in
+  let _ = map_set e "__eid" (VInt n) in
+  let _ = map_set lv_up (str_of_int n) parent in
+  e;
+// (has_parent, parent). There is no null env, so a root echoes itself back.
+let lv_parent_of = fn env ->
+  if map_has env "__eid" then
+    (match map_get env "__eid" with
+     | VInt n ->
+       let k = str_of_int n in
+       if map_has lv_up k then (true, map_get lv_up k) else (false, env)
+     | _ -> (false, env))
+  else (false, env);
+// the frame that binds `n`, or `env` itself when no frame in the chain does
+// (so a fresh assignment declares the local in the innermost frame).
+// (found, frame) — the frame in the chain that binds `n`. When nothing binds
+// it the flag is false and the frame is meaningless: callers that declare
+// (lv_set) must fall back to the INNERMOST env they were handed, or a fresh
+// block-local would be created out in the method scope and leak.
+let rec lv_owner = fn env -> fn (n: str) ->
+  if map_has env n then (true, env)
+  else let (has, p) = lv_parent_of env in
+       if has then lv_owner p n else (false, env);
+let lv_has = fn env -> fn (n: str) -> let (found, _) = lv_owner env n in found;
+let lv_get = fn env -> fn (n: str) ->
+  let (found, f) = lv_owner env n in
+  if found then map_get f n else VNil;
+let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
+  let (found, f) = lv_owner env n in
+  map_set (if found then f else env) n v;
+let lv_del = fn env -> fn (n: str) ->
+  let (found, f) = lv_owner env n in
+  if found then map_delete f n else ();
+// flatten a chain into one detached map (inner shadows outer). `binding` and
+// the env copies that install a different self must not write back through
+// the chain, so the flattened copy carries no parent link.
+let rec lv_flat_into = fn env -> fn d ->
+  let (has, p) = lv_parent_of env in
+  let _ = if has then lv_flat_into p d else () in
+  let _ = map_iter env (fn (k: str) -> fn (v: Val) -> map_set d k v) in
+  ();
+let lv_flat = fn env ->
+  let d = map_new () in
+  let _ = lv_flat_into env d in
+  let _ = if map_has d "__eid" then map_delete d "__eid" else () in
   d;
 // read a map whose keys are "0".."n-1" (insertion order) back into a list;
 // used to collect map_iter results (which can only side-effect) into an array.
@@ -618,7 +681,9 @@ let is_upper_first = fn (id: str) ->
 // ivars, constants) are hidden so the result matches Ruby's.
 let local_vars_of = fn env ->
   let tmp = map_new () in
-  let _ = map_iter env (fn (k: str) -> fn (v: Val) ->
+  // the whole chain is in scope here, outermost first (a block sees the
+  // method's locals as well as its own).
+  let _ = map_iter (lv_flat env) (fn (k: str) -> fn (v: Val) ->
     let skip = str_len k == 0
                || (str_len k >= 2 && str_eq (substring k 0 2) "__")
                || str_eq k "self"
@@ -1445,8 +1510,8 @@ and resolve_scoped_base = fn env -> fn (name: str) ->
   if i < 0 then name
   else
     let head = substring name 0 i in
-    if map_has env head then
-      (match map_get env head with VClass c -> c ++ "::" ++ substring name (i + 2) (str_len name) | _ -> name)
+    if lv_has env head then
+      (match lv_get env head with VClass c -> c ++ "::" ++ substring name (i + 2) (str_len name) | _ -> name)
     else name
 
 and rx_has_interp = fn (lit: str) -> fn (i: int) ->
@@ -6152,7 +6217,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EBool b -> VBool b
   | ENil -> VNil
   | ESym s -> VSym s
-  | ESelf -> if map_has env "self" then map_get env "self" else VNil
+  | ESelf -> if lv_has env "self" then lv_get env "self" else VNil
   | EConst name ->
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
@@ -6168,7 +6233,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
          else raise_exc world "NameError" ("uninitialized constant " ++ name))
     else
-      let cref = (if map_has env "__cref" then (match map_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
+      let cref = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
       // walk the full lexical nesting (M::Base -> M -> top), not just one level.
       let key = lex_const_key cref name in
       if (if str_eq key "" then false else true) then map_get consts key
@@ -6202,8 +6267,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if str_len name > 0 && str_eq (char_at name 0) "@" then
       cvar_get env world (substring name 1 (str_len name))
     else
-    if map_has env "self" then
-      (match map_get env "self" with
+    if lv_has env "self" then
+      (match lv_get env "self" with
        | VObj id ->
          let k = str_of_int id ++ "@" ++ name in
          if map_has ivars k then map_get ivars k else VNil
@@ -6237,7 +6302,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         VBool true
       else VBool false
   | EAmbigIdx (name, items) ->
-    if map_has env name then eval_e env world blk (EMethod (EVar name, "[]", items))
+    if lv_has env name then eval_e env world blk (EMethod (EVar name, "[]", items))
     else eval_e env world blk (ECall (name, Cons (EArr items, Nil)))
   | ERange (loe, hie, excl) ->
     (match eval_e env world blk loe with
@@ -6293,8 +6358,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if str_eq name "yield" then (let (has, _, _, _) = blk in if has then mkstr "yield" else VNil)
        else if str_eq name "super" then
          (let (m2, s2, o2, i2) = world in
-          let defcls = (match (if map_has env "__defcls" then map_get env "__defcls" else VNil) with VClass c -> c | _ -> "") in
-          let meth = (match (if map_has env "__meth" then map_get env "__meth" else VNil) with VStr s -> sget s | _ -> "") in
+          let defcls = (match (if lv_has env "__defcls" then lv_get env "__defcls" else VNil) with VClass c -> c | _ -> "") in
+          let meth = (match (if lv_has env "__meth" then lv_get env "__meth" else VNil) with VStr s -> sget s | _ -> "") in
           if str_eq defcls "" || str_eq meth "" then VNil
           else if (let sc = (if map_has s2 defcls then map_get s2 defcls else "Object") in has_meth world sc meth) then mkstr "super"
           else VNil)
@@ -6310,21 +6375,21 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if str_len name > 0 && str_eq (char_at name 0) "@" then
          let (m2, s2, o2, ivars2) = world in
          let iv = substring name 1 (str_len name) in
-         (match map_get env "self" with
+         (match lv_get env "self" with
           | VObj id -> if map_has ivars2 (str_of_int id ++ "@" ++ iv) then mkstr "instance-variable" else VNil
           | VMain -> if map_has ivars2 ("main@" ++ iv) then mkstr "instance-variable" else VNil
           | VClass c -> if map_has ivars2 ("cls:" ++ c ++ "@" ++ iv) then mkstr "instance-variable" else VNil
           | _ -> VNil)
        else if is_upper_first name then
          (if map_has consts name then mkstr "constant" else VNil)
-       else if map_has env name then mkstr "local-variable"
+       else if lv_has env name then mkstr "local-variable"
        else if is_method_defined env world name || is_kernel_builtin name then mkstr "method"
        else VNil
      | ECall (name, _) -> if is_method_defined env world name || is_kernel_builtin name then mkstr "method" else VNil
      | ECallB (name, _, _, _) -> if is_method_defined env world name || is_kernel_builtin name then mkstr "method" else VNil
      | EIVar name ->
        let (meths, sup, ocls, ivars) = world in
-       (match map_get env "self" with
+       (match lv_get env "self" with
         | VObj id -> if map_has ivars (str_of_int id ++ "@" ++ name) then mkstr "instance-variable" else VNil
         | VMain -> if map_has ivars ("main@" ++ name) then mkstr "instance-variable" else VNil
         | VClass c -> if map_has ivars ("cls:" ++ c ++ "@" ++ name) then mkstr "instance-variable" else VNil
@@ -6358,9 +6423,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | _ -> mkstr "expression")   // literals, operators, ranges, ternary, etc.
   | ESuper (zsuper, arges) ->
     let (meths, sup, ocls, ivars) = world in
-    let defcls = (match map_get env "__defcls" with VClass c -> c | _ -> "") in
-    let meth = (match map_get env "__meth" with VStr s -> let s = sget s in s | _ -> "") in
-    let recv = if map_has env "self" then map_get env "self" else VMain in
+    let defcls = (match lv_get env "__defcls" with VClass c -> c | _ -> "") in
+    let meth = (match lv_get env "__meth" with VStr s -> let s = sget s in s | _ -> "") in
+    let recv = if lv_has env "self" then lv_get env "self" else VMain in
     // a bare (implicit-args) `super` from a define_method-defined method has no
     // fixed argument list to forward, so Ruby raises RuntimeError.
     if zsuper && map_has dm_methods (defcls ++ "#" ++ meth) then
@@ -6375,11 +6440,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // zsuper forwards the CURRENT parameter values (defaults applied,
     // splat expanded), not the original call arguments.
     let args = if zsuper then
-                 (if map_has env "__params" then
-                    (match map_get env "__params" with
+                 (if lv_has env "__params" then
+                    (match lv_get env "__params" with
                      | VArr pid -> zsuper_all env (deref pid)
-                     | _ -> (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
-                  else (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
+                     | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
+                  else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
     // resume the method search in the receiver's ancestor chain, strictly
     // after the class/module the current method is defined in — so super walks
@@ -6394,15 +6459,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else run_meth world superblk recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
   | ESuperB (zsuper, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
-    let defcls = (match map_get env "__defcls" with VClass c -> c | _ -> "") in
-    let meth = (match map_get env "__meth" with VStr s -> let s = sget s in s | _ -> "") in
-    let recv = if map_has env "self" then map_get env "self" else VMain in
+    let defcls = (match lv_get env "__defcls" with VClass c -> c | _ -> "") in
+    let meth = (match lv_get env "__meth" with VStr s -> let s = sget s in s | _ -> "") in
+    let recv = if lv_has env "self" then lv_get env "self" else VMain in
     let args = if zsuper then
-                 (if map_has env "__params" then
-                    (match map_get env "__params" with
+                 (if lv_has env "__params" then
+                    (match lv_get env "__params" with
                      | VArr pid -> zsuper_all env (deref pid)
-                     | _ -> (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
-                  else (match map_get env "__args" with VArr id -> deref id | _ -> Nil))
+                     | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
+                  else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
     if is_sng_cls defcls then
       (let supercls = sng_supername world defcls in
@@ -6420,7 +6485,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             else if str_len name > 0 && str_eq (char_at name 0) "@"
             then assign_one env world name v
             else if is_upper_first name then (let _ = map_set consts name v in name_anon name v)
-            else map_set env name v in
+            else lv_set env name v in
     v
   | ELambda (ps, body) ->
     let id = map_len proc_store in
@@ -6475,8 +6540,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // already returned, that is a LocalJumpError.
     if has then (match run_block world noblk blk args with
                  | FBreak v ->
-                     let target = (if map_has env "__blk_home" then map_get env "__blk_home"
-                                   else if map_has env "__fid" then map_get env "__fid" else VInt 0) in
+                     let target = (if lv_has env "__blk_home" then lv_get env "__blk_home"
+                                   else if lv_has env "__fid" then lv_get env "__fid" else VInt 0) in
                      let tk = (match target with VInt t -> str_of_int t | _ -> "") in
                      if str_eq tk "" || (if map_has live_frames tk then false else true)
                      then raise_exc world "LocalJumpError" "break from proc-closure"
@@ -6521,14 +6586,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    if map_has env name then map_get env name
+    if lv_has env name then lv_get env name
     else if map_has meths name then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if str_eq name "local_variables" then local_vars_of env
     // Kernel#binding: capture the current locals env (which holds "self").
     else if str_eq name "binding" then
       let id = map_len bind_store in
-      let _ = map_set bind_store (str_of_int id) (map_copy env) in
+      let _ = map_set bind_store (str_of_int id) (lv_flat env) in
       VBind id
     // paren-less Kernel#gets / readline / readlines (`line = gets`).
     else if str_eq name "gets" && (if map_has meths "gets" then false else true) then rb_gets ()
@@ -6552,11 +6617,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // it — the refined target is the method call without the block, and the
     // block body is the refine body. (Scoped to refine to avoid a general
     // do-block precedence change.)
-    if str_eq name "refine" && (match map_get env "self" with VClass _ -> true | _ -> false) && (match arges with Cons (EMethodB (_, _, _, _, _), Nil) -> true | _ -> false) then
+    if str_eq name "refine" && (match lv_get env "self" with VClass _ -> true | _ -> false) && (match arges with Cons (EMethodB (_, _, _, _, _), Nil) -> true | _ -> false) then
       (match arges with
        | Cons (EMethodB (mrecv, mm, margs, mbp, mbb), Nil) ->
          (match eval_e env world blk (EMethod (mrecv, mm, margs)) with
-          | VClass tcls -> do_refine world (match map_get env "self" with VClass rc -> rc | _ -> "") tcls mbb
+          | VClass tcls -> do_refine world (match lv_get env "self" with VClass rc -> rc | _ -> "") tcls mbb
           | _ -> VNil)
        | _ -> VNil)
     else
@@ -6598,7 +6663,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // as a first-class Binding, unless the user redefined `binding`.
     else if str_eq name "binding" && (if map_has meths "binding" then false else true) then
       let id = map_len bind_store in
-      let _ = map_set bind_store (str_of_int id) (map_copy env) in
+      let _ = map_set bind_store (str_of_int id) (lv_flat env) in
       VBind id
     // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
     // against that captured env; otherwise it uses the CURRENT env. A parse
@@ -6647,8 +6712,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // `cmd` command literal → the ` method. mere cannot spawn a subprocess, so
     // the default returns "" unless self (or the top level) defines its own `.
     else if str_eq name "`" && (if map_has meths "`" then false else true)
-            && (if map_has env "self" then
-                  (match map_get env "self" with
+            && (if lv_has env "self" then
+                  (match lv_get env "self" with
                    | VObj id -> let (mm, sp, ocls, iv) = world in (if has_meth world (map_get ocls (str_of_int id)) "`" then false else true)
                    | _ -> true)
                 else true) then
@@ -6667,7 +6732,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match args with Cons (VStr h, rest) -> mkstr (rb_format (sget h) rest) | _ -> mkstr "")
     // implicit-self send/__send__/public_send: dispatch the named method on self.
     else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (if map_has meths name then false else true) then
-      (let recv = if map_has env "self" then map_get env "self" else VMain in
+      (let recv = if lv_has env "self" then lv_get env "self" else VMain in
        let vis = str_eq name "public_send" in
        match args with
        | Cons (VSym m, rest) -> if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis
@@ -6675,7 +6740,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> fail "mere-ruby: send expects a method name")
     // enum_for(:m) / to_enum(:m): an Enumerator that drives self.m on #each.
     else if (str_eq name "enum_for" || str_eq name "to_enum") && (if map_has meths name then false else true) then
-      (let recv = if map_has env "self" then map_get env "self" else VMain in
+      (let recv = if lv_has env "self" then lv_get env "self" else VMain in
        match args with
        | Cons (VSym m, _) -> make_enum world recv m
        | Cons (VStr m, _) -> make_enum world recv (sget m)
@@ -6731,8 +6796,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // register the passed block as an instance method. Works when reached
     // from inside another method (e.g. a Module helper forwarding &block),
     // not just as a literal class-body statement.
-    else if str_eq name "define_method" && map_has env "self" && (match map_get env "self" with VClass _ -> true | _ -> false) then
-      (match map_get env "self" with
+    else if str_eq name "define_method" && lv_has env "self" && (match lv_get env "self" with VClass _ -> true | _ -> false) then
+      (match lv_get env "self" with
        | VClass c ->
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | _ -> "") in
          let (_, ps2, bb2, _) = newblk in
@@ -6751,17 +6816,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // refine Target do <defs> end — inside a Module.new body (self is the
     // refinery module). Run the block's defs into a fresh impl_cls class and record
     // the (refinery, target, impl_cls) triple for a later `using`.
-    else if str_eq name "refine" && (match args with Cons (VClass _, _) -> true | _ -> false) && (match map_get env "self" with VClass _ -> true | _ -> false) then
-      (let refinery = (match map_get env "self" with VClass rc -> rc | _ -> "") in
+    else if str_eq name "refine" && (match args with Cons (VClass _, _) -> true | _ -> false) && (match lv_get env "self" with VClass _ -> true | _ -> false) then
+      (let refinery = (match lv_get env "self" with VClass rc -> rc | _ -> "") in
        let target = (match args with Cons (VClass t, _) -> t | _ -> "") in
        do_refine world refinery target bb)
     else if map_has meths name then call_method env world newblk name args
     // bare method(:name) — Kernel#method on the implicit self.
     else if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
-      invoke_val_c env world newblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
+      invoke_val_c env world newblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
     // implicit self: a bare `each { }` inside a method is `self.each { }`.
-    else if map_has env "self" then
-      (match map_get env "self" with
+    else if lv_has env "self" then
+      (match lv_get env "self" with
        | VObj id ->
          let cls = map_get ocls (str_of_int id) in
          if has_meth world cls name then invoke world newblk (VObj id) cls name args
@@ -6797,7 +6862,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // write the attribute through the normal method dispatch.
   | EAttrOp (recv_e, name, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
-    let e2 = map_copy env in
+    let e2 = lv_flat env in
     let _ = map_set e2 "__opr" r in
     // self-receiver keeps ESelf so private accessors stay reachable (self is
     // side-effect-free, so evaluating it twice is harmless).
@@ -6816,7 +6881,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EIdxOp (recv_e, idx_es, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
     let idxs = eval_args env world blk idx_es in
-    let e2 = map_copy env in
+    let e2 = lv_flat env in
     let _ = map_set e2 "__opr" r in
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
     let ies = idx_temp_exprs e2 idxs 0 in
@@ -7221,7 +7286,7 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
     let _ = map_set globals (substring tgt 1 (str_len tgt)) v in ()
   else if str_len tgt > 0 && str_eq (char_at tgt 0) "@" then
     let n = substring tgt 1 (str_len tgt) in
-    (match map_get env "self" with
+    (match lv_get env "self" with
      | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ n) v in ()
      | VMain -> let _ = map_set ivars ("main@" ++ n) v in ()
      | VClass c -> let _ = map_set ivars ("cls:" ++ c ++ "@" ++ n) v in ()
@@ -7230,7 +7295,7 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   // table, so a later bare-Const read finds the assigned value.
   else if is_upper_first tgt && (if str_contains tgt "::" then false else true) then
     let _ = map_set consts tgt v in ()
-  else let _ = map_set env tgt v in ()
+  else let _ = lv_set env tgt v in ()
 
 and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
 
@@ -7396,7 +7461,7 @@ and prep_x_target = fn env -> fn world -> fn blk -> fn (t: Expr) ->
   | EMethod (recv, m, args) ->
     let rv = eval_e env world blk recv in
     let rnm = fresh_anon "__mlr" in
-    let _ = map_set env rnm rv in
+    let _ = lv_set env rnm rv in
     EMethod (EVar rnm, m, prep_x_args env world blk args)
   | ESplat inner -> ESplat (prep_x_target env world blk inner)
   | EArr ts -> EArr (prep_x_targets env world blk ts)
@@ -7407,12 +7472,12 @@ and prep_x_args = fn env -> fn world -> fn blk -> fn (args: Expr list) ->
   | Cons (ESplat inner, rest) ->
     let av = eval_e env world blk inner in
     let anm = fresh_anon "__mla" in
-    let _ = map_set env anm av in
+    let _ = lv_set env anm av in
     Cons (ESplat (EVar anm), prep_x_args env world blk rest)
   | Cons (a, rest) ->
     let av = eval_e env world blk a in
     let anm = fresh_anon "__mla" in
-    let _ = map_set env anm av in
+    let _ = lv_set env anm av in
     Cons (EVar anm, prep_x_args env world blk rest)
 and prep_x_targets = fn env -> fn world -> fn blk -> fn (ts: Expr list) ->
   match ts with
@@ -7623,7 +7688,7 @@ and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str lis
       // "*@rexpr~N": splat the evaluated expression; "*var": splat the local.
       let arr = if str_len inner > 0 && str_eq (char_at inner 0) "@" && str_contains inner "rexpr~"
                 then eval_e env world blk (map_get resc_exprs (substring inner 7 (str_len inner)))
-                else (if map_has env inner then map_get env inner else VNil) in
+                else (if lv_has env inner then lv_get env inner else VNil) in
       (match arr with VArr id -> list_append_str (class_names_of (deref id)) (expand_rescue_classes env world blk rest) | _ -> expand_rescue_classes env world blk rest)
     else if str_len c > 6 && str_eq (substring c 0 7) "@rexpr~" then
       // a non-constant class expression: evaluate; a Class/Module contributes
@@ -7640,7 +7705,7 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
     let (classes0, var, handler) = rc in
     let classes = expand_rescue_classes env world blk classes0 in
     if rescue_matches world exc classes then
-      let _ = if str_eq var "" then () else map_set env var exc in
+      let _ = if str_eq var "" then () else lv_set env var exc in
       // $! holds the exception being handled (so a bare `raise` re-raises it);
       // run_begin restores $! to its pre-begin value when the construct ends.
       let _ = map_set globals "!" exc in
@@ -7661,10 +7726,10 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
   fail "mere-ruby: (built-in exception raised)"
 
 // run `theblk` and return the resulting Flow, so break/next inside the
-// block reach the iterating method. Its params bind into its own captured
-// env (so it sees and mutates the enclosing locals); the body runs with
-// `encl` as the active block so a yield inside it reaches the enclosing
-// method's block.
+// block reach the iterating method. Its params bind into a fresh frame
+// chained to the env the block captured (so it still sees and mutates the
+// enclosing locals); the body runs with `encl` as the active block so a
+// yield inside it reaches the enclosing method's block.
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
@@ -7688,32 +7753,42 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // params; the sentinel only served to reject numbered params at parse time.
   let params = (match params with Cons (m, Nil) -> if str_eq m empty_bp_marker then (Nil : str list) else params | _ -> params) in
   let _ = if is_lam then lambda_arity_check world params body (vlen argvals) else () in
-  // Ruby block params are block-local: save any outer bindings of the
-  // param names and restore them after the block (for-loops keep their
-  // variable via an explicit assignment to a hidden __for param).
-  let saved = save_params cenv (match params with
-    | Nil -> Cons ("_1", Cons ("_2", Cons ("_3", Cons ("_4", Cons ("_5", Cons ("_6", Cons ("_7", Cons ("_8", Cons ("_9", Nil)))))))))
-    | _ -> params) Nil in
-  // names first assigned INSIDE the block are also block-local: collect
-  // the assignment targets not yet bound outside, delete them afterwards.
-  let created = fresh_targets cenv (deep_targets body) in
-  let _ = bind_block_params cenv world encl (block_defaults body) params argvals is_lam in
-  // A raising body must still restore block-local params and drop the locals
-  // it created, or those bindings leak into the captured env and are visible
-  // to later invocations of sibling blocks (e.g. mspec examples sharing a
-  // scope). Catch the raise, run the cleanup, then re-raise the same exception
-  // (its details are already stored in ivars "$exc").
+  // The block's params and the locals it first assigns are block-local, so
+  // the body runs in a FRESH frame chained to the block's defining scope.
+  // Names bound further out resolve through the chain and stay one shared
+  // cell; the frame itself is what a proc/lambda created inside the block
+  // captures, so those block-locals outlive this invocation (Ruby's closure
+  // semantics). Nothing has to be torn down afterwards — the frame is simply
+  // unreachable once the block returns, unless a closure kept it.
+  // `for` is the exception: it is not a scope in Ruby, so its desugared
+  // block (a hidden "__f..." param) runs directly in the enclosing env and
+  // leaves its loop variable and body locals behind, exactly as Ruby does.
+  let benv = if is_for_params params then cenv else lv_child cenv in
+  let _ = bind_block_params benv world encl (block_defaults body) params argvals is_lam in
+  // A raising body used to need explicit cleanup here (restoring saved params
+  // and dropping created locals) or the bindings leaked into the shared env
+  // and were visible to later sibling blocks; with a per-invocation frame the
+  // raise path cannot leak. The flag still distinguishes a raise from a
+  // normal return so the exception is re-raised (details live in ivars "$exc").
   let _ = map_set flow_sig "__blk_ok" (VBool false) in
   let f = try_or (fn (u: unit) ->
-                    let r = block_body_flow cenv world encl body in
+                    let r = block_body_flow benv world encl body in
                     let _ = map_set flow_sig "__blk_ok" (VBool true) in
                     r)
                  (FRaise VNil) in
   let ok = (if map_has flow_sig "__blk_ok" then (match map_get flow_sig "__blk_ok" with VBool b -> b | _ -> false) else false) in
   let _ = if map_has flow_sig "__blk_ok" then map_delete flow_sig "__blk_ok" else () in
-  let _ = restore_params cenv saved in
-  let _ = drop_created cenv created in
   if ok then f else fail "mere-ruby: (ruby exception raised)"
+
+// `for` desugars to `each` with a hidden "__for" / "__forv" / "__f<n>" param
+// and an assignment from it; Ruby's `for` shares the enclosing scope, so that
+// block must not open a frame of its own.
+and is_for_params = fn (ps: str list) ->
+  match ps with
+  | Cons (p0, _) ->
+    let p = if str_len p0 > 0 && str_eq (char_at p0 0) "*" then substring p0 1 (str_len p0) else p0 in
+    str_len p > 2 && str_eq (substring p 0 3) "__f"
+  | _ -> false
 
 // run a block body once, converting flow signals: break/next become Flows
 // for the iterator; return keeps unwinding to the enclosing method; redo
@@ -7726,7 +7801,8 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
     // method or an enclosing lambda call), targeted so it passes through any
     // method that merely yielded the block. Falls back to a plain return if
     // that frame is unknown or already gone (a proc whose home has returned).
-    let home = (if map_has cenv "__fid" then (match map_get cenv "__fid" with VInt t -> t | _ -> 0) else 0) in
+    // __fid lives in the defining method's frame, so read it through the chain.
+    let home = (if lv_has cenv "__fid" then (match lv_get cenv "__fid" with VInt t -> t | _ -> 0) else 0) in
     if home == 0 || (if map_has live_frames (str_of_int home) then false else true)
     then flow_rethrow "return" v
     else flow_throw_returnret home v
@@ -7818,48 +7894,6 @@ and rescues_targets = fn rescues ->
   | Cons (rc, rest) ->
     let (cs, v, b) = rc in list_append_str (deep_targets b) (rescues_targets rest)
 
-and fresh_targets = fn cenv -> fn (names: str list) ->
-  match names with
-  | Nil -> Nil
-  | Cons (n, rest) ->
-    let skip = str_len n == 0 || str_eq (char_at n 0) "@" || str_eq (char_at n 0) "$" ||
-               str_eq (char_at n 0) "*" || is_upper_first n || map_has cenv n in
-    if skip then fresh_targets cenv rest else Cons (n, fresh_targets cenv rest)
-
-and drop_created = fn cenv -> fn (names: str list) ->
-  match names with
-  | Nil -> ()
-  | Cons (n, rest) ->
-    let _ = if map_has cenv n then map_delete cenv n else () in
-    drop_created cenv rest
-
-and save_params = fn cenv -> fn (params: str list) -> fn acc ->
-  match params with
-  | Nil -> acc
-  | Cons (p0, r) ->
-    // a destructure param `(a,b)` is block-local for each of its leaf names.
-    if str_len p0 > 0 && str_eq (char_at p0 0) "(" then
-      save_params cenv r (save_name_list cenv (spec_names (substring p0 1 (str_len p0 - 1))) acc)
-    else
-    let p = if str_len p0 > 0 && (str_eq (char_at p0 0) "*" || str_eq (char_at p0 0) "&" || str_eq (char_at p0 0) ";")
-            then substring p0 1 (str_len p0) else p0 in
-    if str_eq p "" then save_params cenv r acc
-    else save_params cenv r (Cons ((p, map_has cenv p, (if map_has cenv p then map_get cenv p else VNil)), acc))
-
-and save_name_list = fn cenv -> fn (names: str list) -> fn acc ->
-  match names with
-  | Nil -> acc
-  | Cons (p, r) -> save_name_list cenv r (Cons ((p, map_has cenv p, (if map_has cenv p then map_get cenv p else VNil)), acc))
-
-and restore_params = fn cenv -> fn saved ->
-  match saved with
-  | Nil -> ()
-  | Cons (t, r) ->
-    let (p, had, v) = t in
-    let _ = if had then map_set cenv p v
-            else (if map_has cenv p then map_delete cenv p else ()) in
-    restore_params cenv r
-
 and flow_value = fn (f: Flow) ->
   match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
 
@@ -7873,8 +7907,8 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   let params = strip_block_params params0 in
   let _ = (let b = block_param_name params0 in if str_eq b "" then () else map_set cenv b VNil) in
   // explicit block-locals (`|x; a, b|`, encoded ";name") start as fresh nil
-  // locals and are excluded from positional binding (save_params restores the
-  // outer binding afterwards, so they do not leak).
+  // locals in this frame and are excluded from positional binding; the outer
+  // binding of the same name is untouched, so they do not leak.
   let _ = bind_block_locals cenv params in
   let params = drop_block_locals params in
   // `**kw` (keyword-splat) + explicit `key:` params share ONE trailing
@@ -9203,6 +9237,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
             if str_len k > plen && str_eq (substring k 0 plen) pfx
                && (if str_contains (substring k plen (str_len k)) "#" then false else true)
+               // instance_methods is public + protected; private ones are
+               // reported only by private_instance_methods (the inherited
+               // branch above already filters them via collect_methods).
+               && (if map_has privates k then false else true)
             then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
             else ()) in
           arr_new (idx_to_list tmp 0 (map_len tmp))))
@@ -9738,6 +9776,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "flush" || str_eq name "sync=" then recv
        else if str_eq name "sync" then VBool false
        else if str_eq name "fileno" then VInt fd
+       // Mere has no isatty capability, and the browser build has no terminal
+       // at all, so an IO here is never a tty. That matches the redirected /
+       // piped case exactly (which is how CRuby answers under the harnesses),
+       // and libraries that colorize only for a tty degrade to plain output.
+       else if str_eq name "tty?" || str_eq name "isatty" then VBool false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
     // ENV: reads consult the write overlay first, then the real environment
     // (env_is_set + getenv, so set-but-empty reads as "" like Ruby).
@@ -10562,7 +10605,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
           let meth2 = (match (if map_has ivars0 (str_of_int id ++ "@meth") then map_get ivars0 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
           (match recv2 with
-           | VMain -> if map_has m0 meth2 then (let e2 = map_copy env in let _ = map_set e2 "self" recv2 in call_method e2 world newblk meth2 args)
+           | VMain -> if map_has m0 meth2 then (let e2 = lv_flat env in let _ = map_set e2 "self" recv2 in call_method e2 world newblk meth2 args)
                       else invoke_with_block env world blk recv2 meth2 args newblk
            | _ -> invoke_with_block env world blk recv2 meth2 args newblk))
        | _ -> VNil)
@@ -10623,7 +10666,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // rebind self in a COPY of the block's captured env, not the shared
        // env itself: a nested call of the same proc (`pr.call` inside the
        // instance_eval'd pr) must still see the proc's own lexical self.
-       let e3c = map_copy e3 in
+       let e3c = lv_flat e3 in
        let _ = map_set e3c "self" recv in
        let blkargs = if str_eq name "instance_exec" then args else Cons (recv, Nil) in
        flow_value (run_block world blk (h3, ps3, bb3, e3c) blkargs))
@@ -10747,7 +10790,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (match struct_build world args with
           | VClass anon ->
             (let (h3, ps3, bb3, e3) = newblk in
-             let bcref = (if map_has e3 "__cref" then (match map_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
+             let bcref = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
              let _ = flow_value (register_class_blk world anon bb3 bcref) in
              VClass anon)
           | other -> other)
@@ -10758,7 +10801,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let (h3, ps3, bb3, e3) = newblk in
           // a block is not a constant scope: classes/constants defined in it
           // go to the block's LEXICAL scope (its captured cref; "" = toplevel).
-          let bcref = (if map_has e3 "__cref" then (match map_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
+          let bcref = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
           let _ = flow_value (register_class_blk world anon bb3 bcref) in
           VClass anon)
        // Module.new { } — an anonymous module whose body is the block. Run the
@@ -10770,8 +10813,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let anon = fresh_anon "AnonModule_" in
           let _ = map_set modules anon VNil in
           let (h3, ps3, bb3, e3) = newblk in
-          let saved_self = if map_has e3 "self" then map_get e3 "self" else VNil in
-          let _ = map_set e3 "self" (VClass anon) in
+          let saved_self = if lv_has e3 "self" then lv_get e3 "self" else VNil in
+          let _ = lv_set e3 "self" (VClass anon) in
           let saved_cref = cur_lex () in
           let _ = set_lex anon in
           // a `using` inside the block is scoped to it (like register_class):
@@ -10780,14 +10823,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = flow_value (run_block world blk newblk (Cons (VClass anon, Nil))) in
           let _ = restore_ref_active saved_ref in
           let _ = set_lex saved_cref in
-          let _ = map_set e3 "self" saved_self in
+          let _ = lv_set e3 "self" saved_self in
           VClass anon)
        else if str_eq name "class_eval" || str_eq name "module_eval" then
          // run the body as class-body statements (defs go to the class), but a
          // bare Const inside resolves in the BLOCK's lexical scope (Ruby: a
          // block does not open a constant scope), not the receiver's namespace.
          (let (h3, ps3, bb3, e3) = newblk in
-          let cscope = (if map_has e3 "__cref" then (match map_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
+          let cscope = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
           flow_value (register_class_blk world c bb3 cscope))
        else if str_eq name "instance_eval" then
          (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class world c bb3))
@@ -12332,7 +12375,7 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // bare method(:name) — Kernel#method on the implicit self.
   if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
-    invoke_val_c env world noblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
+    invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
   // Kernel#load.
   else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false) then
     (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
@@ -12364,8 +12407,8 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
         | _ -> VNil)
      | _ -> VNil)
   else
-  if map_has env "self" then
-    (match map_get env "self" with
+  if lv_has env "self" then
+    (match lv_get env "self" with
      | VObj id ->
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
@@ -12402,10 +12445,10 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
-    invoke_val_c env world noblk (if map_has env "self" then map_get env "self" else VMain) "method" args false
+    invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
   else
-  if map_has env "self" then
-    (match map_get env "self" with
+  if lv_has env "self" then
+    (match lv_get env "self" with
      | VObj id ->
        let cls = map_get ocls (str_of_int id) in
        if has_meth world cls name then invoke world noblk (VObj id) cls name args
@@ -12440,7 +12483,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let frame = map_new () in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
      // top-level methods run with main as self (their @ivars live there).
-     let _ = map_set frame "self" (if map_has env "self" then map_get env "self" else VMain) in
+     let _ = map_set frame "self" (if lv_has env "self" then lv_get env "self" else VMain) in
      let _ = map_set frame "__cref" (mkstr (if map_has meth_cref name then map_get meth_cref name else "")) in
      let _ = bind_params frame world blk name params defaults args in
      (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v))
@@ -12453,7 +12496,7 @@ and cvar_cls = fn env -> fn world ->
   // `extend` still reads the module's cvar. "" means the top-level scope.
   let (meths, sup, ocls, ivars) = world in
   // purely lexical: no enclosing class/module cref => top-level scope ("").
-  if map_has env "__cref" then (match map_get env "__cref" with VStr s -> let s = sget s in s | _ -> "")
+  if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> let s = sget s in s | _ -> "")
   else ""
 
 and cvar_get = fn env -> fn world -> fn (name: str) ->
@@ -12521,8 +12564,8 @@ and is_kernel_builtin = fn (name: str) ->
 and is_method_defined = fn env -> fn world -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if map_has meths name then true
-  else if map_has env "self" then
-    (match map_get env "self" with
+  else if lv_has env "self" then
+    (match lv_get env "self" with
      | VObj id -> has_meth world (map_get ocls (str_of_int id)) name
      | _ -> false)
   else false
@@ -12531,7 +12574,7 @@ and is_method_defined = fn env -> fn world -> fn (name: str) ->
 // Kernel private method of the same name, per Ruby's method lookup)?
 and self_user_defines = fn env -> fn world -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
-  match (if map_has env "self" then map_get env "self" else VMain) with
+  match (if lv_has env "self" then lv_get env "self" else VMain) with
   | VObj oid -> has_meth world (map_get ocls (str_of_int oid)) name
   | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name
   | VMain -> map_has meths name
@@ -12616,7 +12659,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // self/args/params override the interpreter-internal and parameter keys.
     let _ = (if map_has dm_closenv (defcls ++ "#" ++ name) then
                (match map_get dm_closenv (defcls ++ "#" ++ name) with
-                | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> map_iter cenv (fn (k: str) -> fn (v: Val) -> map_set frame k v))
+                | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> map_iter (lv_flat cenv) (fn (k: str) -> fn (v: Val) -> map_set frame k v))
                 | _ -> ())
              else ()) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
@@ -13611,11 +13654,11 @@ and zsuper_args = fn env -> fn (ps: Val list) ->
        else if str_eq (char_at p (str_len p - 1)) ":" then zsuper_args env rest
        else if str_eq (char_at p 0) "*" then
          let nm = substring p 1 (str_len p) in
-         (if str_eq nm "" || not (map_has env nm) then zsuper_args env rest
-          else (match map_get env nm with
+         (if str_eq nm "" || not (lv_has env nm) then zsuper_args env rest
+          else (match lv_get env nm with
                 | VArr id -> list_append (deref id) (zsuper_args env rest)
                 | v -> Cons (v, zsuper_args env rest)))
-       else Cons ((if map_has env p then map_get env p else VNil), zsuper_args env rest)
+       else Cons ((if lv_has env p then lv_get env p else VNil), zsuper_args env rest)
      | _ -> zsuper_args env rest)
 
 // zsuper also forwards the current method's keyword parameters (`name:`) and
@@ -13629,11 +13672,11 @@ and zsuper_kw_pairs = fn env -> fn (ps: Val list) ->
     if str_len p > 1 && str_eq (substring p 0 2) "**" then
       let nm = substring p 2 (str_len p) in
       (if str_eq nm "" then zsuper_kw_pairs env rest
-       else if map_has env nm then (match map_get env nm with VHsh id -> list_append (hderef id) (zsuper_kw_pairs env rest) | _ -> zsuper_kw_pairs env rest)
+       else if lv_has env nm then (match lv_get env nm with VHsh id -> list_append (hderef id) (zsuper_kw_pairs env rest) | _ -> zsuper_kw_pairs env rest)
        else zsuper_kw_pairs env rest)
     else if str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":" then
       let nm = substring p 0 (str_len p - 1) in
-      (if map_has env nm then Cons (VSym nm, Cons (map_get env nm, zsuper_kw_pairs env rest)) else zsuper_kw_pairs env rest)
+      (if lv_has env nm then Cons (VSym nm, Cons (lv_get env nm, zsuper_kw_pairs env rest)) else zsuper_kw_pairs env rest)
     else zsuper_kw_pairs env rest
   | Cons (_, rest) -> zsuper_kw_pairs env rest
 
@@ -14030,8 +14073,8 @@ and sng_cls_of_val = fn world -> fn (v: Val) -> fn (enclosing: str) ->
 
 and sng_target_cls = fn world -> fn env -> fn (tgt: str) -> fn (enclosing: str) ->
   if str_eq tgt "self" then
-    (if map_has env "self" then sng_cls_of_val world (map_get env "self") enclosing else enclosing)
-  else if map_has env tgt then sng_cls_of_val world (map_get env tgt) enclosing
+    (if lv_has env "self" then sng_cls_of_val world (lv_get env "self") enclosing else enclosing)
+  else if lv_has env tgt then sng_cls_of_val world (lv_get env tgt) enclosing
   else enclosing
 
 // singleton class for a handle-based value (String/Array/Hash), created on
@@ -14064,10 +14107,22 @@ and meth_base_go = fn (nm: str) -> fn (i: int) -> fn (start: int) ->
 
 // register a refinement of `target` under `refinery`: run its body into a
 // fresh impl_cls class and record the triple for a later `using`.
+// Ruby forces a few hook methods private the moment they are defined, whatever
+// the surrounding visibility mode is — so they never show up in
+// instance_methods and cannot be called with an explicit receiver.
+and always_private_meth = fn (name: str) ->
+  str_eq name "initialize" || str_eq name "initialize_copy" ||
+  str_eq name "initialize_clone" || str_eq name "initialize_dup" ||
+  str_eq name "respond_to_missing?"
+
 and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: Stmt list) ->
   let i = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt n -> n | _ -> 0) else 0) in
   let impl_cls = "Refine_" ++ refinery ++ "_" ++ str_of_int i in
-  let _ = flow_value (register_class world impl_cls bb) in
+  // The body is a BLOCK, so it does not open a constant scope: `refine String
+  // do Presenter … end` inside `module M` must see M's constants, not the
+  // synthetic Refine_M_0 namespace. Defs still land on impl_cls; only the
+  // lexical scope for constant lookup is the enclosing module.
+  let _ = flow_value (register_class_blk world impl_cls bb refinery) in
   let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
   let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl_cls) in
   let _ = map_set refine_cnt refinery (VInt (i + 1)) in
@@ -14240,7 +14295,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let _ = if map_has r2k_methods (meth_base mname) then map_delete r2k_methods (meth_base mname) else () in
          // receiver-qualified / singleton defs are always public.
          let _ = if (if is_selfdef then false else true) && (if str_contains mname "#" then false else true) then
-                   (if str_eq vis2 "private" then map_set privates key VNil
+                   (if str_eq vis2 "private" || always_private_meth (meth_base mname) then map_set privates key VNil
                     else if str_eq vis2 "protected" then map_set protecteds key VNil
                     else ())
                  else () in
@@ -14392,7 +14447,7 @@ and declare_nils = fn env -> fn (names: str list) ->
   | Cons (n0, rest) ->
     let n = if str_len n0 > 0 && str_eq (char_at n0 0) "*" then substring n0 1 (str_len n0) else n0 in
     let skip = str_len n == 0 || str_eq (char_at n 0) "@" || str_eq (char_at n 0) "$" || is_upper_first n in
-    let _ = if skip then () else if map_has env n then () else map_set env n VNil in
+    let _ = if skip then () else if lv_has env n then () else lv_set env n VNil in
     declare_nils env rest
 
 // mark (private=true) or unmark each `cls#name` in the privates table.
@@ -14442,9 +14497,9 @@ and meth_protected = fn world -> fn (cls: str) -> fn (name: str) ->
 // a protected call is allowed when the caller's self is a kind of the
 // method's class.
 and protected_ok = fn env -> fn world -> fn (cls: str) ->
-  if map_has env "self" then
+  if lv_has env "self" then
     (let (meths, sup, ocls, ivars) = world in
-     match map_get env "self" with
+     match lv_get env "self" with
      | VObj id -> obj_is_a world (map_get ocls (str_of_int id)) cls
      | _ -> false)
   else false
@@ -14569,14 +14624,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = (if str_len name > 0 && str_eq (char_at name 0) "$" then ()
              else if is_upper_first name then ()
              else if str_contains name "::" then ()
-             else if map_has env name then ()
-             else map_set env name VNil) in
+             else if lv_has env name then ()
+             else lv_set env name VNil) in
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
             then map_set globals (substring name 1 (str_len name)) v
             else if str_len name >= 2 && str_eq (substring name 0 2) "::" then (let cn = substring name 2 (str_len name) in let _ = map_set consts cn v in name_anon cn v)
             else if is_upper_first name then (let _ = map_set consts name v in name_anon name v)
-            else map_set env name v in
+            else lv_set env name v in
     FNext v
   | SIVarAssign (name, e) ->
     let (meths, sup, ocls, ivars) = world in
@@ -14584,7 +14639,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     if str_len name > 0 && str_eq (char_at name 0) "@" then
       let _ = cvar_set env world (substring name 1 (str_len name)) v in FNext v
     else
-    (match map_get env "self" with
+    (match lv_get env "self" with
      | VObj id -> let _ = map_set ivars (str_of_int id ++ "@" ++ name) v in FNext v
      | VMain -> let _ = map_set ivars ("main@" ++ name) v in FNext v
      | VClass c -> let _ = map_set ivars ("cls:" ++ c ++ "@" ++ name) v in FNext v
@@ -14619,8 +14674,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       // (bare name); on an object/class it is that receiver's singleton method.
       (if str_len name > 5 && str_eq (substring name 0 5) "self." then
          let m = substring name 5 (str_len name) in
-         (if map_has env "self" then
-            (match map_get env "self" with
+         (if lv_has env "self" then
+            (match lv_get env "self" with
              | VObj id -> singleton_cls_of world id ++ "#" ++ m
              | VClass c -> "(sng:" ++ c ++ ")#" ++ m
              | _ -> m)
@@ -14628,8 +14683,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else if str_contains name "#" then
          let recv = recv_base name in
          let m = meth_base name in
-         if map_has env recv then
-           (match map_get env recv with
+         if lv_has env recv then
+           (match lv_get env recv with
             | VObj id -> singleton_cls_of world id ++ "#" ++ m
             | VClass c -> "(sng:" ++ c ++ ")#" ++ m
             | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
@@ -14641,8 +14696,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          else if is_upper_first recv && map_has consts recv && (match map_get consts recv with VClass _ -> true | _ -> false) then "(sng:" ++ recv ++ ")#" ++ m
          else name
        // a nested `def` inside a method body defines on self's class.
-       else if map_has env "self" then
-         (match map_get env "self" with
+       else if lv_has env "self" then
+         (match lv_get env "self" with
           | VObj id -> map_get ocls (str_of_int id) ++ "#" ++ name
           | VClass c -> c ++ "#" ++ name
           // nil/true/false are singletons: def in their instance_eval defines
@@ -14687,7 +14742,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       // methods are private top-level methods; mere has no distinct main
       // singleton, so run the body at top level (self stays main) and its
       // `def`s register as bare top-level methods.
-      (if str_eq super0 "self" && map_has env "self" && (match map_get env "self" with VMain -> true | _ -> false) then
+      (if str_eq super0 "self" && lv_has env "self" && (match lv_get env "self" with VMain -> true | _ -> false) then
          run_stmts env world blk body
        else register_class_lex world (sng_target_cls world env super0 "Object") body)
     // `class Base::Name` where Base is nil/true/false or a non-class value
@@ -14696,7 +14751,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             (let b = recv_of_scoped name in
              str_eq b "nil" || str_eq b "true" || str_eq b "false" ||
              (map_has consts b && (match map_get consts b with VClass _ -> false | _ -> true)) ||
-             (map_has env b && (match map_get env b with VClass _ -> false | _ -> true))) then
+             (lv_has env b && (match lv_get env b with VClass _ -> false | _ -> true))) then
       (let _ = raise_exc world "TypeError" (recv_of_scoped name ++ " is not a class/module") in FNext VNil)
     else
     // a bare class name reached here inside a class/module body (via control
@@ -14772,9 +14827,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // adds the module to that class's ancestor chain; at the top level with no
     // class self it is a no-op. `m` may name a local variable holding a module
     // (e.g. an anonymous `Module.new`), not just a constant.
-    (match (if map_has env "self" then map_get env "self" else VMain) with
+    (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c ->
-       let mq = (if map_has env m then (match map_get env m with VClass mc -> mc | _ -> resolve_scope_name c m) else resolve_scope_name c m) in
+       let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> resolve_scope_name c m) else resolve_scope_name c m) in
        let _ = map_set includes c (if map_has includes c then (map_get includes c) ++ "|" ++ mq else mq) in
        let _ = run_included_hook world mq c in
        FNext VNil
@@ -14783,7 +14838,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let (meths, sup, ocls, ivars) = world in
     // when self is a class (class_eval / a block run as a class body), undef
     // targets that class and raises NameError for a missing name.
-    (match (if map_has env "self" then map_get env "self" else VMain) with
+    (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c -> let _ = undef_check world c names in let _ = undef_all meths c names in FNext VNil
      | _ -> let _ = undef_top meths names in FNext VNil)
   | SVis (_, _) -> FNext VNil   // top-level visibility: no-op
@@ -14863,7 +14918,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SAtExit body -> run_stmts env world blk body
   | SLocalFrom (name, s) ->
     (match exec_stmt env world blk s with
-     | FNext v -> let _ = map_set env name v in FNext v
+     | FNext v -> let _ = lv_set env name v in FNext v
      | other -> other)
   | SMultiAssign (targets, rhs) ->
     // build the value list: a single array RHS is destructured; several
@@ -15338,7 +15393,14 @@ and refined_impl_go = fn world -> fn (ancs: str list) -> fn (name: str) ->
   | Nil -> ""
   | Cons (a, rest) ->
     let ic = ref_impl a in
+    // An active refinement sits immediately in FRONT of the class it refines,
+    // so it beats that class's own method...
     if (if str_eq ic "" then false else true) && has_meth world ic name then ic
+    // ...but only that one. A method defined on a nearer ancestor still wins
+    // over a refinement of something further up the chain — Presenter#red
+    // (Presenter < String) must beat `refine String do def red …`, or wrapping
+    // inside the refined method recurses forever.
+    else if has_meth world a name then ""
     else refined_impl_go world rest name
 
 // ---- pattern matching (case/in) -----------------------------------------
@@ -15359,13 +15421,13 @@ and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> f
 // (matching Ruby, which does not roll them back).
 and pat_match = fn env -> fn world -> fn blk -> fn (p: Pat) -> fn (v: Val) ->
   match p with
-  | PVar nm -> let _ = map_set env nm v in true
+  | PVar nm -> let _ = lv_set env nm v in true
   | PVal e -> match_eqq env world blk (eval_e env world blk e) v
   // a pin `^expr` matches via `expr === value` (so ^(/re/), ^(range), ^Class
   // work), matching Ruby.
   | PPin e -> match_eqq env world blk (eval_e env world blk e) v
   | PAltP alts -> pat_match_any env world blk alts v
-  | PAsP (sub, nm) -> if pat_match env world blk sub v then (let _ = map_set env nm v in true) else false
+  | PAsP (sub, nm) -> if pat_match env world blk sub v then (let _ = lv_set env nm v in true) else false
   | PArrP elems -> pat_match_array env world blk elems v
   | PHashP (items, rest) -> pat_match_hash env world blk items rest v
   | PConstP (ce, inner) ->
@@ -15447,7 +15509,7 @@ and match_one_splat = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn
     let midxs = val_slice xs np (n - nq) in
     let postxs = val_drop xs (n - nq) in
     if match_seq env world blk pre prexs && match_seq env world blk post postxs then
-      let _ = if str_eq splatname "" then () else map_set env splatname (arr_new midxs) in true
+      let _ = if str_eq splatname "" then () else lv_set env splatname (arr_new midxs) in true
     else false
 
 // split an element list around its (single) splat: (pre, name, post).
@@ -15478,8 +15540,8 @@ and find_window = fn env -> fn world -> fn blk -> fn (mids: Pat list) -> fn (mid
   else
     let window = val_slice xs start (start + midlen) in
     if match_seq env world blk mids window then
-      let _ = if str_eq preName "" then () else map_set env preName (arr_new (val_take xs start)) in
-      let _ = if str_eq postName "" then () else map_set env postName (arr_new (val_drop xs (start + midlen))) in
+      let _ = if str_eq preName "" then () else lv_set env preName (arr_new (val_take xs start)) in
+      let _ = if str_eq postName "" then () else lv_set env postName (arr_new (val_drop xs (start + midlen))) in
       true
     else find_window env world blk mids midlen xs n (start + 1) preName postName
 
@@ -15516,7 +15578,7 @@ and pat_match_hash = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list
     else if match_hash_items env world blk items pairs then
       (if str_eq rest "nil" then hash_only_keys pairs items
        else if str_eq rest "" || str_eq rest "*" then true
-       else let _ = map_set env rest (hash_without pairs items) in true)
+       else let _ = lv_set env rest (hash_without pairs items) in true)
     else false
   else false
 
@@ -16635,7 +16697,7 @@ and set_named_caps = fn env -> fn (pat: str) -> fn (p: int) -> fn (gidx: int) ->
          let nend = rx_name_end pat (p + 3) in
          let name = substring pat (p + 3) nend in
          let g = gidx + 1 in
-         let _ = map_set env name (if map_has globals (str_of_int g) then map_get globals (str_of_int g) else VNil) in
+         let _ = lv_set env name (if map_has globals (str_of_int g) then map_get globals (str_of_int g) else VNil) in
          set_named_caps env pat (nend + 1) g
        else if str_eq (char_at pat (p + 1)) "?" then set_named_caps env pat (p + 1) gidx
        else set_named_caps env pat (p + 1) (gidx + 1))
@@ -17306,7 +17368,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let world = (meths, sup, ocls, ivars) in
   let _ = register_builtin_consts () in
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
-  let _ = map_set env "self" VMain in   // top-level self is `main`
+  let _ = lv_set env "self" VMain in   // top-level self is `main`
   // $: / $LOAD_PATH are the SAME array (aliased by handle); likewise $" /
   // $LOADED_FEATURES. require searches the load path and records features.
   let lp0 = arr_new Nil in
