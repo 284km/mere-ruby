@@ -315,6 +315,11 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
 let hash_dflt = map_new () in
 let hdflt_set = fn (id: int) -> fn (v: Val) -> let _ = map_set hash_dflt (str_of_int id) v in ();
 let hdflt_get = fn (id: int) -> if map_has hash_dflt (str_of_int id) then map_get hash_dflt (str_of_int id) else VNil;
+// Hash.new { |h, k| ... }: the block form of the default, kept as a proc
+// handle per hash so a miss can call it with (hash, key).
+let hash_dproc = map_new () in
+let hdproc_set = fn (id: int) -> fn (v: Val) -> let _ = map_set hash_dproc (str_of_int id) v in ();
+let hdproc_get = fn (id: int) -> if map_has hash_dproc (str_of_int id) then map_get hash_dproc (str_of_int id) else VNil;
 // per-string encoding label (str handle id -> encoding name); default UTF-8.
 let str_enc = map_new () in
 let senc_set = fn (id: int) -> fn (nm: str) -> let _ = map_set str_enc (str_of_int id) nm in ();
@@ -8329,7 +8334,10 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   | VStr h ->
     (let sv = sget h in
      if str_eq name "each_char" then iter_each_result (arr_each world encl theblk (utf8_chars_val sv 0)) recv
-     else if str_eq name "each_byte" then iter_each_result (arr_each world encl theblk (str_bytes_val sv 0)) recv
+     else if str_eq name "each_byte" || str_eq name "bytes" then iter_each_result (arr_each world encl theblk (str_bytes_val sv 0)) recv
+     // the plural forms take a block too, iterating instead of collecting.
+     else if str_eq name "chars" then iter_each_result (arr_each world encl theblk (utf8_chars_val sv 0)) recv
+     else if str_eq name "codepoints" then iter_each_result (arr_each world encl theblk (utf8_codepoints sv 0)) recv
      else if str_eq name "each_codepoint" then iter_each_result (arr_each world encl theblk (utf8_codepoints sv 0)) recv
      else if str_eq name "each_line" then iter_each_result (arr_each world encl theblk (val_list_of_strs (str_lines_go sv 0 0 (str_len sv)))) recv
      else if str_eq name "each_with_index" then iter_each_result (arr_each world encl theblk (with_index_pairs (utf8_chars_val sv 0) 0)) recv
@@ -8340,6 +8348,15 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "select" || str_eq name "filter" then iter_result (arr_filter world encl theblk xs Nil true) recv
     else if str_eq name "reject" then iter_result (arr_filter world encl theblk xs Nil false) recv
     else if str_eq name "each_with_index" then iter_each_result (arr_each_idx world encl theblk xs 0) recv
+    // combination / permutation with a block yield each one and return self.
+    else if str_eq name "combination" then
+      (match args with
+       | Cons (VInt k, _) -> iter_each_result (arr_each world encl theblk (arr_combinations xs k)) recv
+       | _ -> recv)
+    else if str_eq name "permutation" then
+      (match args with
+       | Cons (VInt k, _) -> iter_each_result (arr_each world encl theblk (arr_permutations xs k)) recv
+       | _ -> iter_each_result (arr_each world encl theblk (arr_permutations xs (val_list_len xs))) recv)
     else if str_eq name "reduce" || str_eq name "inject" then
       (match args with
        | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
@@ -8975,6 +8992,34 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         | Cons (VStr sep, _) -> mkstr (val_join es xs (sget sep) "" true)
         | _ -> mkstr (val_join es xs "" "" true))
      | _ -> VNil)
+  // A Hash built with a block calls it on a miss. prim_method's [] can only
+  // see the plain default, so the block form is answered here, where a proc
+  // can actually be run.
+  // Hash#to_proc: a one-argument proc that looks the key up in this hash, so
+  // `[:a, :b].map(&h)` works. Built the same way as Method#to_proc.
+  else if str_eq name "to_proc" && (match recv with VHsh _ -> true | _ -> false) then
+    (let benv = map_new () in
+     let _ = map_set benv "__h_self" recv in
+     let body = Cons (SExpr (EMethod (EVar "__h_self", "[]", Cons (EVar "__k", Nil))), Nil) in
+     let pid = map_len proc_store in
+     let _ = map_set proc_store (str_of_int pid) (true, Cons ("__k", Nil), body, benv) in
+     let _ = map_set lambda_ids (str_of_int pid) VNil in
+     VProc pid)
+  else if str_eq name "default_proc" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with VHsh hid -> hdproc_get hid | _ -> VNil)
+  else if str_eq name "[]" && (match recv with VHsh hid -> (match hdproc_get hid with VProc _ -> true | _ -> false) | _ -> false)
+          && (match args with
+              | Cons (k, _) -> (match recv with VHsh hid -> (if hash_haskey (hderef hid) k then false else true) | _ -> false)
+              | _ -> false) then
+    (match recv with
+     | VHsh hid ->
+       (match args with
+        | Cons (k, _) ->
+          (match hdproc_get hid with
+           | VProc pid -> flow_value (run_block world noblk (proc_as_block pid) (Cons (recv, Cons (k, Nil))))
+           | _ -> VNil)
+        | _ -> VNil)
+     | _ -> VNil)
   // Array's searches compare with `element == obj`, so a user-defined == on an
   // element decides the answer. rb_eq is structural and has no world to
   // dispatch with, so when an element carries its own ==, the search runs here
@@ -9124,6 +9169,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Hash" && str_eq name "new" then
       (let hv = mkhash Nil in (match args with Cons (d, _) -> (match hv with VHsh id -> let _ = hdflt_set id d in hv | _ -> hv) | _ -> hv))
     else if str_eq c "Array" && str_eq name "new" then array_new_args args
+    // allocate makes an empty instance without running #initialize.
+    else if str_eq name "allocate" && (str_eq c "Array" || str_eq c "Hash" || str_eq c "String") then
+      (if str_eq c "Array" then arr_new Nil else if str_eq c "Hash" then mkhash Nil else mkstr "")
     // a subclass of Array with no own #initialize behaves as a plain array
     // (Class.new(Array).new([0,1]) is [0,1]); back it with real array storage
     // so #deconstruct and the other array methods work.
@@ -9140,6 +9188,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else
          (let v = array_new_args args in
           let _ = (match v with VArr _ -> map_set hng_store (hng_key v) c | _ -> ()) in v))
+    // a subclass of Hash is backed by real hash storage and tagged with the
+    // subclass, the same way an Array subclass is — otherwise h[:k] = v on an
+    // instance has nowhere to write.
+    else if str_eq name "new" && (if str_eq c "Hash" then false else obj_is_a world c "Hash") then
+      (if has_meth world c "initialize" then
+         (let v = mkhash Nil in
+          let _ = map_set hng_store (hng_key v) c in
+          let _ = invoke world noblk v c "initialize" args in
+          v)
+       else
+         (let v = mkhash Nil in
+          let _ = (match args with Cons (d, _) -> (match v with VHsh hid -> hdflt_set hid d | _ -> ()) | _ -> ()) in
+          let _ = map_set hng_store (hng_key v) c in v))
     // a subclass of String with no own #initialize is backed by real string
     // storage and tagged so its own methods dispatch (super reaches String).
     else if str_eq name "new" && (if str_eq c "String" then false else obj_is_a world c "String") && (if has_meth world c "initialize" then false else true) then
@@ -11140,7 +11201,13 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class world c bb3))
        else if str_eq c "Array" && str_eq name "new" then
          (match args with Cons (VInt n, _) -> arr_new (array_new_blk world blk newblk n 0) | _ -> arr_new Nil)
-       else if str_eq c "Hash" && str_eq name "new" then mkhash Nil
+       // Hash.new { |h, k| ... }: the block becomes the default for a miss.
+       else if str_eq c "Hash" && str_eq name "new" then
+         (let hv = mkhash Nil in
+          let pid = map_len proc_store in
+          let _ = map_set proc_store (str_of_int pid) newblk in
+          let _ = (match hv with VHsh hid -> hdproc_set hid (VProc pid) | _ -> ()) in
+          hv)
        else if str_eq name "new" then new_obj_wb world c args newblk
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world newblk recv ("(sng:" ++ c ++ ")") name args
        else if has_meth world "Module" name then invoke world newblk recv "Module" name args
@@ -11896,6 +11963,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // the implicit-conversion protocol: unlike to_s / to_a / to_i these exist
   // only on the type itself, which is exactly what makes them useful for
   // duck-typing (`if x.respond_to? :to_str`).
+  // String#initialize replaces the contents; with no argument it leaves the
+  // string as it is (which is what `send(:initialize)` on a live string does).
+  else if str_eq name "initialize" && (match recv with VStr _ -> true | _ -> false) then
+    (match recv with
+     | VStr h -> (match args with Cons (VStr o, _) -> let _ = sset h (sget o) in recv | _ -> recv)
+     | _ -> recv)
   else if str_eq name "to_str" then
     (match recv with VStr _ -> recv | _ -> fail "no to_str")
   else if str_eq name "to_ary" then
@@ -11938,6 +12011,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (float_of_str n / float_of_str d) | VStr s -> VFlt (float_of_str (sget s)) | _ -> fail "mere-ruby: no to_f")
   // to_a returns self for a plain Array, but a plain Array (not the subclass)
   // for a subclass instance.
+  // Enumerable#entries is to_a under another name.
+  else if str_eq name "entries" then
+    (match recv with
+     | VArr id -> arr_new (deref id)
+     | VHsh h -> arr_new (hash_to_a (hderef h))
+     | VRange (lo, hi, excl) -> arr_new (range_to_a lo (if excl then hi - 1 else hi))
+     | _ -> fail "no entries")
   else if str_eq name "to_a" && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
      | VArr id -> if str_eq (hng_key recv) "" || (if map_has hng_store (hng_key recv) then false else true)
