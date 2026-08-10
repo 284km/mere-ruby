@@ -8796,6 +8796,64 @@ and coerce_dyck_go = fn env -> fn world -> fn (conv: str) -> fn (args: Val list)
 // this variant carries `world` and recurses through containers. Objects with
 // no #inspect fall back to the default rendering. (Lives in this rec group so
 // it can reach has_meth / invoke.)
+// `a == b` with a dispatched to its own == when it defines one.
+and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VObj _ ->
+    if has_meth world (dispatch_cls_of world a) "=="
+    then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
+    else rb_eq a b
+  | _ -> rb_eq a b
+
+// does any element (or any element of a nested pair) define its own ==? Only
+// then is the slow, dispatching search worth taking.
+and elem_has_user_eq = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (h, t) ->
+    (match h with
+     | VObj _ -> if has_meth world (dispatch_cls_of world h) "==" then true else elem_has_user_eq world t
+     // one level in, for the pairs assoc/rassoc look at — and no deeper, or a
+     // self-referential array (a = []; a << a) would never bottom out.
+     | VArr aid -> if shallow_has_user_eq world (deref aid) then true else elem_has_user_eq world t
+     | _ -> elem_has_user_eq world t)
+
+and shallow_has_user_eq = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (h, t) ->
+    (match h with
+     | VObj _ -> if has_meth world (dispatch_cls_of world h) "==" then true else shallow_has_user_eq world t
+     | _ -> shallow_has_user_eq world t)
+
+and val_member_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) ->
+  match xs with
+  | Nil -> false
+  | Cons (h, t) -> if rb_eq_w env world h v then true else val_member_w env world t v
+
+and val_index_of_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) -> fn (i: int) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (h, t) -> if rb_eq_w env world h v then VInt i else val_index_of_w env world t v (i + 1)
+
+and val_rindex_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) -> fn (i: int) -> fn (best: Val) ->
+  match xs with
+  | Nil -> best
+  | Cons (h, t) -> val_rindex_w env world t v (i + 1) (if rb_eq_w env world h v then VInt i else best)
+
+// assoc/rassoc: the element is a pair; pos picks which half is compared.
+and arr_assoc_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (pos: int) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (h, t) ->
+    (match h with
+     | VArr aid ->
+       let inner = deref aid in
+       let cand = (if pos == 0 then (match inner with Cons (a, _) -> a | Nil -> VNil)
+                   else (match inner with Cons (_, Cons (b, _)) -> b | _ -> VNil)) in
+       if rb_eq_w env world cand k then h else arr_assoc_w env world t k pos
+     | _ -> arr_assoc_w env world t k pos)
+
 and inspect_w = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VObj oid ->
@@ -8877,6 +8935,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        (match args with
         | Cons (VStr sep, _) -> mkstr (val_join es xs (sget sep) "" true)
         | _ -> mkstr (val_join es xs "" "" true))
+     | _ -> VNil)
+  // Array's searches compare with `element == obj`, so a user-defined == on an
+  // element decides the answer. rb_eq is structural and has no world to
+  // dispatch with, so when an element carries its own ==, the search runs here
+  // where it does. Arrays of plain values keep the existing (faster) path.
+  else if (str_eq name "include?" || str_eq name "index" || str_eq name "find_index"
+           || str_eq name "rindex" || str_eq name "assoc" || str_eq name "rassoc")
+          && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Cons (_, _) -> true | _ -> false)
+          && (match recv with VArr id -> elem_has_user_eq world (deref id) | _ -> false) then
+    (match recv with
+     | VArr id ->
+       let xs = deref id in
+       (match args with
+        | Cons (v, _) ->
+          if str_eq name "include?" then VBool (val_member_w env world xs v)
+          else if str_eq name "assoc" then arr_assoc_w env world xs v 0
+          else if str_eq name "rassoc" then arr_assoc_w env world xs v 1
+          else if str_eq name "rindex" then val_rindex_w env world xs v 0 VNil
+          else val_index_of_w env world xs v 0
+        | _ -> VNil)
      | _ -> VNil)
   // Array/Hash #inspect (and #to_s, which aliases it) call #inspect on each
   // element; dispatch a user-defined #inspect here where `world` is in scope.
