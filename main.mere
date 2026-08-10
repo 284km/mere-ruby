@@ -330,10 +330,12 @@ let sfrozen_set = fn (id: int) -> let _ = map_set str_frozen (str_of_int id) "1"
 let sfrozen_get = fn (id: int) -> map_has str_frozen (str_of_int id);
 // frozen state of ordinary objects (keyed by object id string), consulted by
 // #frozen? on the object and on its singleton class.
-// frozen state of arrays / hashes (keyed by handle id).
+// frozen state of arrays / hashes. Arrays and hashes live in separate stores,
+// so their handle ids overlap: the key needs the kind ("a" / "h") or freezing
+// array #7 would make hash #7 report frozen too.
 let coll_frozen = map_new () in
-let cfrozen_set = fn (id: int) -> let _ = map_set coll_frozen (str_of_int id) "1" in ();
-let cfrozen_get = fn (id: int) -> map_has coll_frozen (str_of_int id);
+let cfrozen_set = fn (k: str) -> fn (id: int) -> let _ = map_set coll_frozen (k ++ str_of_int id) "1" in ();
+let cfrozen_get = fn (k: str) -> fn (id: int) -> map_has coll_frozen (k ++ str_of_int id);
 let obj_frozen = map_new () in
 let ofrozen_set = fn (id: int) -> let _ = map_set obj_frozen (str_of_int id) "1" in ();
 let ofrozen_get = fn (id: int) -> map_has obj_frozen (str_of_int id);
@@ -7501,6 +7503,10 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   let (meths, sup, ocls, ivars) = world in
   if str_len tgt > 0 && str_eq (char_at tgt 0) "$" then
     let _ = map_set globals (substring tgt 1 (str_len tgt)) v in ()
+  // "@@x" is a class variable, not an ivar named "@x" — same split SIVarAssign
+  // makes, needed here so `@@a, @@b = ...` writes class variables.
+  else if str_len tgt > 1 && str_eq (substring tgt 0 2) "@@" then
+    let _ = cvar_set env world (substring tgt 2 (str_len tgt)) v in ()
   else if str_len tgt > 0 && str_eq (char_at tgt 0) "@" then
     let n = substring tgt 1 (str_len tgt) in
     (match lv_get env "self" with
@@ -9609,6 +9615,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
        else if str_eq name "exist?" || str_eq name "exists?" || str_eq name "file?" then
          (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
+       // File.fnmatch?(pattern, path): the same matcher Dir.glob uses.
+       else if str_eq name "fnmatch" || str_eq name "fnmatch?" then
+         (match args with
+          | Cons (VStr pp, Cons (VStr sp, _)) -> VBool (glob_any (glob_fnm_flags args) (glob_expand (sget pp)) (sget sp))
+          | _ -> VBool false)
        else if str_eq name "basename" then
          (match args with Cons (VStr ph, _) -> mkstr (basename_of (sget ph)) | _ -> mkstr "")
        else if str_eq name "dirname" then
@@ -9645,6 +9656,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | _ -> VInt 0)
        else if str_eq name "exist?" || str_eq name "exists?" then
          (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
+       // Dir.glob(pat[, base:]) / Dir[pat, ...]: `base:` arrives as a trailing
+       // hash. Several patterns union (Dir[] takes varargs, glob an array).
+       else if str_eq name "glob" || str_eq name "[]" then
+         (let base = (match glob_base_arg args with VStr h -> sget h | _ -> "") in
+          let pats = glob_pat_args (glob_drop_opts args) in
+          arr_new (val_uniq (glob_all ("p" ++ glob_fnm_flags args) pats base) Nil))
+       else if str_eq name "entries" || str_eq name "children" then
+         (match args with
+          | Cons (VStr ph, _) ->
+            // glob_lines keeps find's own "." line as a glob candidate; a
+            // directory listing names only what is inside.
+            (let kids = glob_drop_dot (glob_lines (glob_find (sget ph) 1) 0) in
+             let names = val_sort (glob_strs kids) in
+             arr_new (if str_eq name "entries" then Cons (mkstr ".", Cons (mkstr "..", names)) else names))
+          | _ -> arr_new Nil)
+       else if str_eq name "home" then mkstr (env_get "HOME")
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Dir"))
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
@@ -11980,8 +12007,8 @@ and str_bang_base_ok = fn (b: str) ->
 and val_is_frozen = fn (recv: Val) ->
   match recv with
   | VStr id -> sfrozen_get id
-  | VArr id -> cfrozen_get id
-  | VHsh id -> cfrozen_get id
+  | VArr id -> cfrozen_get "a" id
+  | VHsh id -> cfrozen_get "h" id
   | VObj id -> ofrozen_get id
   | _ -> false
 // method names that mutate the receiver in place (String / Array / Hash).
@@ -12104,8 +12131,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // numbers/symbols/nil/booleans are always frozen; a string is frozen if
     // it was created under --enable-frozen-string-literal or explicitly frozen.
     // an object's singleton class is frozen exactly when the object is.
-    VBool (match recv with VInt _ -> true | VFlt _ -> true | VBool _ -> true | VNil -> true | VSym _ -> true | VStr id -> sfrozen_get id | VArr id -> cfrozen_get id | VHsh id -> cfrozen_get id | VObj id -> ofrozen_get id | VClass c -> is_sng_cls c && ofrozen_key (sng_inner c) | _ -> false)
-  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set id in recv | VHsh id -> let _ = cfrozen_set id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
+    VBool (match recv with VInt _ -> true | VFlt _ -> true | VBool _ -> true | VNil -> true | VSym _ -> true | VStr id -> sfrozen_get id | VArr id -> cfrozen_get "a" id | VHsh id -> cfrozen_get "h" id | VObj id -> ofrozen_get id | VClass c -> is_sng_cls c && ofrozen_key (sng_inner c) | _ -> false)
+  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set "a" id in recv | VHsh id -> let _ = cfrozen_set "h" id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
   // String#-@ interns: a frozen string is returned as is, otherwise a frozen
   // copy. (CRuby also deduplicates; that is unobservable apart from identity,
   // and mere-ruby strings are handles, so a fresh frozen copy behaves the
@@ -12122,7 +12149,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "dup" || str_eq name "clone" then
     // strings are handles now: dup MUST copy, else mutating the dup would
     // write through to the original.
-    (match recv with VArr id -> arr_new (deref id) | VStr h -> mkstr (sget h) | VHsh h -> mkhash (hderef h) | _ -> recv)
+    (let cp = (match recv with VArr id -> arr_new (deref id) | VStr h -> mkstr (sget h) | VHsh h -> mkhash (hderef h) | _ -> recv) in
+     // #clone carries the frozen state over, #dup drops it. `clone(freeze: false)` opts out.
+     let was_frozen = (match recv with VStr id -> sfrozen_get id | VArr id -> cfrozen_get "a" id | VHsh id -> cfrozen_get "h" id | _ -> false) in
+     let keep = str_eq name "clone" && was_frozen &&
+       (match args with
+        | Cons (VHsh h, Nil) -> (match hash_get (hderef h) (VSym "freeze") with VBool b -> b | _ -> true)
+        | _ -> true) in
+     let _ = if keep then (match cp with VStr id -> let _ = sfrozen_set id in () | VArr id -> let _ = cfrozen_set "a" id in () | VHsh id -> let _ = cfrozen_set "h" id in () | _ -> ()) else () in
+     cp)
   else if str_eq name "itself" then recv
   else if str_eq name "hash" then VInt (val_hash recv)
   else if str_eq name "tap" then recv
@@ -13737,6 +13772,14 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // override of one has to reach them here — they are ancestors in Ruby, and
   // therefore win over method_missing.
   if is_prim_method meth then prim_method recv meth args
+  // BasicObject#initialize is an ancestor too: it takes no arguments and does
+  // nothing, so `super()` from an initialize with no user-defined superclass
+  // method has somewhere to land instead of raising.
+  else if str_eq meth "initialize" then
+    (match args with
+     | Nil -> VNil
+     | _ -> raise_exc world "ArgumentError"
+              ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)"))
   else if has_meth world dcls "method_missing"
   then invoke world superblk recv dcls "method_missing" (Cons (VSym meth, args))
   // Ruby defines the definition hooks as no-ops on Class/Module/BasicObject,
@@ -14123,6 +14166,289 @@ and shq_go = fn (s2: str) -> fn (i: int) -> fn (acc: str) ->
   else
     let c = char_at s2 i in
     shq_go s2 (i + 1) (acc ++ (if str_eq c "'" then "'\\''" else c))
+
+// Libraries mere-ruby ships as source instead of searching for on disk: they
+// are pure Ruby in CRuby too, but they live in the stdlib, which mere-ruby has
+// no copy of. "" means "not one of ours, go look for a file".
+and stdlib_src = fn (name: str) ->
+  let n = (if ends_with_rb name then substring name 0 (str_len name - 3) else name) in
+  // Thread bodies run synchronously here, so a monitor never actually blocks:
+  // the counter is kept so mon_owned? and re-entry answer honestly.
+  if str_eq n "monitor" then
+    "module MonitorMixin\n" ++
+    "  class ConditionVariable\n" ++
+    "    def initialize(monitor); @monitor = monitor; end\n" ++
+    "    def wait(timeout = nil); false; end\n" ++
+    "    def signal; nil; end\n" ++
+    "    def broadcast; nil; end\n" ++
+    "  end\n" ++
+    "  def initialize(*args)\n" ++
+    "    super\n" ++
+    "    mon_initialize\n" ++
+    "  end\n" ++
+    "  def mon_initialize; @mon_count = 0; self; end\n" ++
+    "  def mon_enter; @mon_count = (@mon_count || 0) + 1; nil; end\n" ++
+    "  def mon_exit; @mon_count = (@mon_count || 1) - 1; nil; end\n" ++
+    "  def mon_owned?; (@mon_count || 0) > 0; end\n" ++
+    "  def mon_locked?; mon_owned?; end\n" ++
+    "  def mon_check_owner; nil; end\n" ++
+    "  def mon_try_enter; mon_enter; true; end\n" ++
+    "  def try_mon_enter; mon_try_enter; end\n" ++
+    "  def mon_synchronize\n" ++
+    "    mon_enter\n" ++
+    "    begin\n" ++
+    "      yield\n" ++
+    "    ensure\n" ++
+    "      mon_exit\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def synchronize(&b); mon_synchronize(&b); end\n" ++
+    "  def new_cond; MonitorMixin::ConditionVariable.new(self); end\n" ++
+    "end\n" ++
+    "class Monitor\n" ++
+    "  include MonitorMixin\n" ++
+    "  def initialize; mon_initialize; end\n" ++
+    "  def enter; mon_enter; end\n" ++
+    "  def exit; mon_exit; end\n" ++
+    "  def try_enter; mon_try_enter; end\n" ++
+    "  def owned?; mon_owned?; end\n" ++
+    "end\n"
+  else ""
+
+// --- glob ------------------------------------------------------------------
+// Dir.glob / File.fnmatch?. The entry list comes from find(1) (there is no
+// directory-listing extern the Wasm backend supports), but every pattern
+// character is interpreted here, so a path with shell metacharacters can never
+// reach the command line.
+
+// `{a,b}` alternation: the list of brace-free patterns a pattern stands for.
+and glob_brace_open = fn (p: str) -> fn (i: int) ->
+  if i >= str_len p then 0 - 1
+  else if str_eq (char_at p i) "\\" then glob_brace_open p (i + 2)
+  else if str_eq (char_at p i) "\{" then i
+  else glob_brace_open p (i + 1)
+and glob_brace_close = fn (p: str) -> fn (i: int) -> fn (d: int) ->
+  if i >= str_len p then 0 - 1
+  else
+    let c = char_at p i in
+    if str_eq c "\\" then glob_brace_close p (i + 2) d
+    else if str_eq c "\{" then glob_brace_close p (i + 1) (d + 1)
+    else if str_eq c "}" then (if d == 1 then i else glob_brace_close p (i + 1) (d - 1))
+    else glob_brace_close p (i + 1) d
+// split the body at top-level commas ("a,{b,c}" -> ["a"; "{b,c}"]).
+and glob_brace_split = fn (b: str) -> fn (i: int) -> fn (st: int) -> fn (d: int) ->
+  if i >= str_len b then Cons (substring b st i, Nil)
+  else
+    let c = char_at b i in
+    if str_eq c "\{" then glob_brace_split b (i + 1) st (d + 1)
+    else if str_eq c "}" then glob_brace_split b (i + 1) st (d - 1)
+    else if str_eq c "," && d == 0 then Cons (substring b st i, glob_brace_split b (i + 1) (i + 1) 0)
+    else glob_brace_split b (i + 1) st d
+and glob_expand = fn (p: str) ->
+  let o = glob_brace_open p 0 in
+  if o < 0 then Cons (p, Nil)
+  else
+    let c = glob_brace_close p (o + 1) 1 in
+    if c < 0 then Cons (p, Nil)
+    else
+      glob_expand_alts (glob_brace_split (substring p (o + 1) c) 0 0 0)
+        (substring p 0 o) (substring p (c + 1) (str_len p))
+and glob_expand_alts = fn (alts: str list) -> fn (pre: str) -> fn (post: str) ->
+  match alts with
+  | Nil -> (Nil : str list)
+  | Cons (a, rest) -> sappend (glob_expand (pre ++ a ++ post)) (glob_expand_alts rest pre post)
+and sappend = fn (a: str list) -> fn (b: str list) ->
+  match a with Nil -> b | Cons (h, t) -> Cons (h, sappend t b)
+
+// "." at the start of a name is only matched by a literal "." in the pattern
+// (that is what keeps `*` from picking up dotfiles). `fl` carries the mode:
+// "p" = FNM_PATHNAME — "*", "?" and "[" stop at "/" and every component start
+// protects its dot, which is how Dir.glob matches. "d" = FNM_DOTMATCH.
+and glob_dot_at = fn (fl: str) -> fn (s: str) -> fn (j: int) ->
+  if str_contains fl "d" then false
+  else j < str_len s && str_eq (char_at s j) "." &&
+       (j == 0 || (str_contains fl "p" && str_eq (char_at s (j - 1)) "/"))
+// does a wildcard refuse to step over s[j]? only under FNM_PATHNAME.
+and glob_sep_at = fn (fl: str) -> fn (s: str) -> fn (j: int) ->
+  str_contains fl "p" && j < str_len s && str_eq (char_at s j) "/"
+and glob_comp_end = fn (s: str) -> fn (j: int) ->
+  if j >= str_len s then j else if str_eq (char_at s j) "/" then j else glob_comp_end s (j + 1)
+
+// does the brace-free pattern `p` match the whole path `s`?
+and glob_match = fn (fl: str) -> fn (p: str) -> fn (s: str) -> glob_go fl p 0 s 0
+and glob_go = fn (fl: str) -> fn (p: str) -> fn (i: int) -> fn (s: str) -> fn (j: int) ->
+  if i >= str_len p then j >= str_len s
+  else
+    let c = char_at p i in
+    if str_eq c "*" then
+      (if i + 1 < str_len p && str_eq (char_at p (i + 1)) "*" then
+         // "**" crosses directories; "**/" also stands for zero components.
+         (if i + 2 < str_len p && str_eq (char_at p (i + 2)) "/"
+          then (if glob_go fl p (i + 3) s j then true else glob_star_dirs fl p (i + 3) s j)
+          else glob_star_any fl p (i + 2) s j)
+       else glob_star1 fl p (i + 1) s j)
+    else if str_eq c "?" then
+      (if j < str_len s && (if glob_sep_at fl s j then false else true) &&
+          (if glob_dot_at fl s j then false else true)
+       then glob_go fl p (i + 1) s (j + 1) else false)
+    else if str_eq c "[" then glob_class fl p i s j
+    else if str_eq c "\\" && i + 1 < str_len p then
+      (if j < str_len s && str_eq (char_at p (i + 1)) (char_at s j) then glob_go fl p (i + 2) s (j + 1) else false)
+    else (if j < str_len s && str_eq c (char_at s j) then glob_go fl p (i + 1) s (j + 1) else false)
+// "*": zero or more characters, stopping at "/" under FNM_PATHNAME.
+and glob_star1 = fn (fl: str) -> fn (p: str) -> fn (i: int) -> fn (s: str) -> fn (j: int) ->
+  if glob_go fl p i s j then true
+  else if j >= str_len s then false
+  else if glob_sep_at fl s j then false
+  else if glob_dot_at fl s j then false
+  else glob_star1 fl p i s (j + 1)
+// bare "**": any number of characters, crossing "/" but never entering a
+// component that starts with ".".
+and glob_star_any = fn (fl: str) -> fn (p: str) -> fn (i: int) -> fn (s: str) -> fn (j: int) ->
+  if glob_go fl p i s j then true
+  else if j >= str_len s then false
+  else if glob_dot_at fl s j then false
+  else glob_star_any fl p i s (j + 1)
+// "**/": try the rest of the pattern at each following component start, but
+// never descend through a component whose name starts with ".".
+and glob_star_dirs = fn (fl: str) -> fn (p: str) -> fn (i: int) -> fn (s: str) -> fn (j: int) ->
+  if glob_dot_at fl s j then false
+  else
+    let e = glob_comp_end s j in
+    if e >= str_len s then false
+    else
+      let k = e + 1 in
+      if glob_go fl p i s k then true else glob_star_dirs fl p i s k
+// "[abc]" / "[a-z]" / "[^a]".
+and glob_class = fn (fl: str) -> fn (p: str) -> fn (i: int) -> fn (s: str) -> fn (j: int) ->
+  if j >= str_len s then false
+  else if glob_sep_at fl s j then false
+  else if glob_dot_at fl s j then false
+  else
+    let neg = i + 1 < str_len p && (str_eq (char_at p (i + 1)) "^" || str_eq (char_at p (i + 1)) "!") in
+    let st = if neg then i + 2 else i + 1 in
+    let e = glob_class_end p st in
+    if e < 0 then false
+    else
+      let hit = glob_class_has p st e (char_at s j) in
+      if (if neg then (if hit then false else true) else hit) then glob_go fl p (e + 1) s (j + 1) else false
+and glob_class_end = fn (p: str) -> fn (i: int) ->
+  if i >= str_len p then 0 - 1
+  else if str_eq (char_at p i) "]" then i
+  else glob_class_end p (i + 1)
+and glob_class_has = fn (p: str) -> fn (i: int) -> fn (e: int) -> fn (c: str) ->
+  if i >= e then false
+  else if i + 2 < e && str_eq (char_at p (i + 1)) "-" then
+    (if char_at p i <= c && c <= char_at p (i + 2) then true else glob_class_has p (i + 3) e c)
+  else if str_eq (char_at p i) c then true
+  else glob_class_has p (i + 1) e c
+
+// the longest leading run of the pattern with no metacharacter, cut at the
+// last "/" — the directory find(1) can start from.
+and glob_first_meta = fn (p: str) -> fn (i: int) ->
+  if i >= str_len p then str_len p
+  else
+    let c = char_at p i in
+    if str_eq c "*" || str_eq c "?" || str_eq c "[" || str_eq c "\{" || str_eq c "\\" then i
+    else glob_first_meta p (i + 1)
+and glob_last_slash = fn (p: str) -> fn (i: int) -> fn (lim: int) -> fn (best: int) ->
+  if i >= lim then best
+  else glob_last_slash p (i + 1) lim (if str_eq (char_at p i) "/" then i else best)
+and glob_slashes = fn (p: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= str_len p then n else glob_slashes p (i + 1) (if str_eq (char_at p i) "/" then n + 1 else n)
+
+// relative paths under `root`, one per line, "./" stripped by the caller.
+and glob_find = fn (root: str) -> fn (depth: int) ->
+  let tmpf = "/tmp/.mrb_glob_" ++ str_of_int (random_int 100000000) in
+  let dflag = (if depth > 0 then " -maxdepth " ++ str_of_int depth else "") in
+  let _ = run ("cd " ++ shq root ++ " 2> /dev/null && find ." ++ dflag ++ " -print > " ++ shq tmpf ++ " 2> /dev/null") in
+  let content = (if file_exists tmpf then read_file tmpf else "") in
+  let _ = run ("rm -f " ++ shq tmpf) in
+  content
+and glob_lines = fn (content: str) -> fn (i: int) ->
+  if i >= str_len content then (Nil : str list)
+  else
+    let e = line_end_from content i in
+    let stop = (if e > i && str_eq (char_at content (e - 1)) "\n" then e - 1 else e) in
+    let ln = substring content i stop in
+    // find prints the root itself as "." and everything else as "./x/y".
+    // "." stays a candidate: Ruby's FNM_DOTMATCH globs list it, and without
+    // that flag the dot rule filters it out anyway.
+    let rel = (if str_len ln > 2 && str_eq (substring ln 0 2) "./" then substring ln 2 (str_len ln)
+               else if str_eq ln "." then "." else "") in
+    if str_eq rel "" then glob_lines content e else Cons (rel, glob_lines content e)
+and glob_keep = fn (fl: str) -> fn (pats: str list) -> fn (pre: str) -> fn (rels: str list) ->
+  match rels with
+  | Nil -> (Nil : Val list)
+  | Cons (r, rest) ->
+    if glob_any fl pats r then Cons (mkstr (pre ++ r), glob_keep fl pats pre rest)
+    else glob_keep fl pats pre rest
+// File::FNM_* bits (PATHNAME = 2, DOTMATCH = 4) as the matcher's flag string.
+and glob_fnm_flags = fn (args: Val list) ->
+  match args with
+  | Nil -> ""
+  | Cons (VInt n, _) ->
+    (if (n / 2) - (n / 4) * 2 == 1 then "p" else "") ++ (if (n / 4) - (n / 8) * 2 == 1 then "d" else "")
+  | Cons (_, t) -> glob_fnm_flags t
+and glob_any = fn (fl: str) -> fn (pats: str list) -> fn (r: str) ->
+  match pats with Nil -> false | Cons (p, t) -> if glob_match fl p r then true else glob_any fl t r
+
+// Dir.glob(pattern, base:) -> the matching paths, sorted, relative to the
+// pattern (Ruby sorts by default and returns base-relative paths).
+and glob_paths = fn (fl: str) -> fn (pat0: str) -> fn (base: str) ->
+  let pats0 = glob_expand pat0 in
+  // a pattern with no metacharacter at all is just a file test
+  let m = glob_first_meta pat0 0 in
+  if m >= str_len pat0 then
+    (let full = (if str_eq base "" || str_eq (char_at pat0 0) "/" then pat0 else base ++ "/" ++ pat0) in
+     if file_exists full then Cons (mkstr pat0, Nil) else Nil)
+  else
+    let sl = glob_last_slash pat0 0 m (0 - 1) in
+    let pre = (if sl < 0 then "" else substring pat0 0 (sl + 1)) in
+    let root0 = (if sl < 0 then "" else substring pat0 0 (if sl == 0 then 1 else sl)) in
+    let root = (if str_len root0 > 0 && str_eq (char_at root0 0) "/" then root0
+                else if str_eq base "" then (if str_eq root0 "" then "." else root0)
+                else (if str_eq root0 "" then base else base ++ "/" ++ root0)) in
+    // strip the static prefix from each alternative, so matching is relative
+    let pats = glob_strip_pre pats0 (str_len pre) in
+    let deep = glob_any_deep pats in
+    let depth = (if deep then 0 else glob_slashes (glob_head pats) 0 0 + 1) in
+    val_sort (glob_keep fl pats pre (glob_lines (glob_find root depth) 0))
+and glob_strip_pre = fn (pats: str list) -> fn (n: int) ->
+  match pats with
+  | Nil -> (Nil : str list)
+  | Cons (p, t) -> Cons ((if str_len p >= n then substring p n (str_len p) else p), glob_strip_pre t n)
+and glob_any_deep = fn (pats: str list) ->
+  match pats with Nil -> false | Cons (p, t) -> if str_contains p "**" then true else glob_any_deep t
+and glob_head = fn (pats: str list) -> match pats with Nil -> "" | Cons (p, _) -> p
+// argument shuffling for Dir.glob / Dir[]: a trailing hash is the option hash
+// (only `base:` is honoured), everything else is a pattern or array of them.
+and glob_base_arg = fn (args: Val list) ->
+  match args with
+  | Nil -> VNil
+  | Cons (VHsh h, Nil) -> hash_get (hderef h) (VSym "base")
+  | Cons (_, t) -> glob_base_arg t
+and glob_drop_opts = fn (args: Val list) ->
+  match args with
+  | Nil -> (Nil : Val list)
+  | Cons (VHsh _, Nil) -> Nil
+  | Cons (a, t) -> Cons (a, glob_drop_opts t)
+and glob_pat_args = fn (args: Val list) ->
+  match args with
+  | Nil -> (Nil : str list)
+  | Cons (VStr h, t) -> Cons (sget h, glob_pat_args t)
+  | Cons (VArr id, t) -> sappend (glob_pat_args (deref id)) (glob_pat_args t)
+  | Cons (_, t) -> glob_pat_args t
+and glob_all = fn (fl: str) -> fn (pats: str list) -> fn (base: str) ->
+  match pats with
+  | Nil -> (Nil : Val list)
+  | Cons (p, t) -> vappend (glob_paths fl p base) (glob_all fl t base)
+and glob_drop_dot = fn (xs: str list) ->
+  match xs with
+  | Nil -> (Nil : str list)
+  | Cons (h, t) -> if str_eq h "." then glob_drop_dot t else Cons (h, glob_drop_dot t)
+and glob_strs = fn (xs: str list) ->
+  match xs with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (mkstr h, glob_strs t)
 
 // inside a synchronous thread body?
 and in_thread = fn (u: unit) ->
@@ -15890,14 +16216,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // startup and the require is satisfied here rather than searched for.
        else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb") && (if is_reg_file full then false else true) then
          FNext (VBool true)
-       else if (if is_reg_file full then false else true) then
+       else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
          FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0))
        else
          let _ = map_set loaded_files full VNil in
          let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
                   | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
                   | _ -> ()) in
-         let src = read_file full in
+         // a shipped library (see stdlib_src) has no file to read
+         let src = (if is_reg_file full then read_file full else stdlib_src p0) in
          // the file's magic comment sets the script encoding for parse (a
          // parse-time __ENCODING__ capture) and while it runs; a file with no
          // magic comment is UTF-8 (per file, not inherited), as in Ruby.
@@ -18435,6 +18762,16 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr "arm64-darwin22", Cons (mkstr "ruby_version", Cons (mkstr "3.2.0", Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr "/usr/lib/ruby", Cons (mkstr "rubylibprefix", Cons (mkstr "/usr/lib/ruby", Nil))))))))))))))))))) in
   let _ = map_set consts "RbConfig::CONFIG" rbc in
   let _ = map_set consts "RbConfig::TOPDIR" (mkstr "/usr") in
+  // File::FNM_* — the flag bits File.fnmatch? and Dir.glob take.
+  let _ = map_set consts "File::FNM_NOESCAPE" (VInt 1) in
+  let _ = map_set consts "File::FNM_PATHNAME" (VInt 2) in
+  let _ = map_set consts "File::FNM_DOTMATCH" (VInt 4) in
+  let _ = map_set consts "File::FNM_CASEFOLD" (VInt 8) in
+  let _ = map_set consts "File::FNM_EXTGLOB" (VInt 16) in
+  let _ = map_set consts "File::FNM_SYSCASE" (VInt 0) in
+  let _ = map_set consts "File::SEPARATOR" (mkstr "/") in
+  let _ = map_set consts "File::ALT_SEPARATOR" VNil in
+  let _ = map_set consts "File::PATH_SEPARATOR" (mkstr ":") in
   let _ = map_set consts "RUBY_VERSION" (mkstr "3.2.2") in
   let _ = map_set consts "RUBY_ENGINE" (mkstr "ruby") in
   let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "3.2.2") in

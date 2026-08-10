@@ -24,12 +24,14 @@ status=0
 for f in $files; do
   src="$root/test/rubygems/$f"
   [ -f "$src" ] || { echo "skip $f (not found)"; continue; }
-  # Same test body for both, differing only in how the checkout's lib gets on
-  # the load path: ruby takes -I (it has its own RubyGems preloaded, and -I is
-  # what makes the checkout win), mere-ruby has no -I flag and no preloaded
-  # RubyGems, so it unshifts $LOAD_PATH in the source.
+  # Same test body for both, differing only in how the checkout's RubyGems gets
+  # loaded: ruby takes -I (it has its own RubyGems preloaded, and -I is what
+  # makes the checkout win), mere-ruby has no -I flag and nothing preloaded, so
+  # it unshifts $LOAD_PATH and requires rubygems in the source. Both sides then
+  # enter the test with the same RubyGems in memory, which is what makes the
+  # tallies comparable.
   { cat "$src"; echo; echo 'Gem::TestCase.run_all'; } > "$tmp/$f"
-  { echo "\$LOAD_PATH.unshift(\"$root/lib\")"; cat "$tmp/$f"; } > "$tmp/mr_$f"
+  { echo "\$LOAD_PATH.unshift(\"$root/lib\")"; echo 'require "rubygems"'; cat "$tmp/$f"; } > "$tmp/mr_$f"
   rb="$(cd "$tmp" && RUBYOPT= ruby -I"$root/lib" "$f" 2>&1 | tail -1)"
   mrout="$(cd "$tmp" && perl -e 'alarm 120; exec @ARGV' "$mr" "mr_$f" 2>&1 | tail -1)"
   if [ "$rb" = "$mrout" ]; then
