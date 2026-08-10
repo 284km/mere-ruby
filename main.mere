@@ -1,5 +1,7 @@
 // mere-ruby — a Ruby subset interpreter written in pure Mere. M0 + M1.
-extern fn getenv: str -> str;
+// NOTE: no `extern fn getenv` — an extern returning `str` yields a raw C
+// pointer, not a Mere string, and using it for anything but printing
+// segfaults. The environment is read through env(1); see env_load.
 //
 // M0: literals (integer, float, string, true/false/nil, array, hash),
 // operators with Ruby precedence (** right-assoc, unary - !, * / %, + -,
@@ -647,6 +649,8 @@ let out_print_no_nl = fn (s: str) ->
 // ENV writes overlay the real environment (there is no setenv extern);
 // VNil marks a deleted key. cli_argv holds the script's ARGV.
 let env_ovr = map_new ();
+// the real environment, dumped once on first read (see env_load).
+let env_cache = map_new ();
 let cli_argv = map_new ();
 // Encoding.default_internal (nil unless assigned; ENV reads honor it) and
 // default_external (UTF-8 unless assigned).
@@ -657,9 +661,14 @@ let rec strs_to_vals = fn (xs: str list) ->
 let rec last_slash = fn (s: str) -> fn (i: int) -> fn (best: int) ->
   if i >= str_len s then best
   else last_slash s (i + 1) (if str_eq (char_at s i) "/" then i else best);
+// Ruby strips trailing slashes first ("a/" -> "."), and a path whose only
+// slash is the leading one has "/" as its directory ("/x" -> "/").
+let rec strip_trail_slash = fn (p: str) -> fn (i: int) ->
+  if i > 0 && str_eq (char_at p i) "/" then strip_trail_slash p (i - 1) else substring p 0 (i + 1);
 let dirname_of = fn (p: str) ->
-  let ls = last_slash p 0 (0 - 1) in
-  if ls < 0 then "." else substring p 0 ls;
+  let q = strip_trail_slash p (str_len p - 1) in
+  let ls = last_slash q 0 (0 - 1) in
+  if ls < 0 then "." else if ls == 0 then "/" else substring q 0 ls;
 let ends_with_rb = fn (p: str) ->
   str_len p >= 3 && str_eq (substring p (str_len p - 3) (str_len p)) ".rb";
 // global variables ($name) live in another top-level captured Map.
@@ -939,13 +948,19 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
             if str_len ds < 19 || (str_len ds == 19 && str_compare ds "9223372036854775807" <= 0)
             then Cons (TInt (parse_base s i j 10 0), lex_go s j)
             else Cons (TBig ds, lex_go s j)
-    else if str_eq c "?" && i + 1 < str_len s &&
-            (is_alnum (char_at s (i + 1)) || str_eq (char_at s (i + 1)) "\\") then
-      // character literal ?a (or ?\n / ?\t).
+    else if str_eq c "?" && i + 1 < str_len s && is_char_lit s i then
+      // character literal: `?x` is the one-character string "x", for ANY
+      // character that is not whitespace — `?/` and `?,` count, which is how
+      // `dir.chomp(?/)` reads. (See is_char_lit for the ternary boundary.)
       let n = char_at s (i + 1) in
       if str_eq n "\\" && i + 2 < str_len s then
         let e = char_at s (i + 2) in
-        let ch = if str_eq e "n" then "\n" else if str_eq e "t" then "\t" else e in
+        let ch = if str_eq e "n" then "\n" else if str_eq e "t" then "\t"
+                 else if str_eq e "r" then chr 13 else if str_eq e "s" then " "
+                 else if str_eq e "0" then chr 0 else if str_eq e "e" then chr 27
+                 else if str_eq e "a" then chr 7 else if str_eq e "b" then chr 8
+                 else if str_eq e "f" then chr 12 else if str_eq e "v" then chr 11
+                 else e in
         Cons (TStrL ch, lex_go s (i + 3))
       else Cons (TStrL n, lex_go s (i + 2))
     else if str_eq c "\"" then
@@ -1574,6 +1589,24 @@ and interp_close = fn (lit: str) -> fn (i: int) -> fn (depth: int) ->
   else if str_eq (char_at lit i) "}" then
     (if depth == 1 then i + 1 else interp_close lit (i + 1) (depth - 1))
   else interp_close lit (i + 1) depth
+
+// `?x` at s[i]: a character literal, or the "?" of a ternary? Whitespace after
+// the "?" is always a ternary. A word character starts a literal only when
+// nothing identifier-ish follows, so `cond ?abc : def` stays a ternary while
+// `p ?a` is the one-character string. Any OTHER character (`?/`, `?,`, `?"`)
+// starts a literal only where a value could start — the same test the lexer
+// uses to tell a regex from a division — so `x > 3 ?"big":"small"` is still a
+// ternary. `p ?/` needs the parens Ruby would want anyway: without a local
+// variable table there is nothing here to tell a method call from a value.
+and is_char_lit = fn (s: str) -> fn (i: int) ->
+  let n = char_at s (i + 1) in
+  if str_eq n " " || str_eq n "\n" || str_eq n "\t" || str_eq n "\r" then false
+  else if str_eq n "\\" then true
+  else if is_alnum n || str_eq n "_" then
+    (if i + 2 >= str_len s then true
+     else let n2 = char_at s (i + 2) in
+          if is_alnum n2 || str_eq n2 "_" then false else true)
+  else regex_position s i
 
 // is the / at i in a value position (a regex) rather than a division?
 and regex_position = fn (s: str) -> fn (i: int) ->
@@ -3286,6 +3319,16 @@ and maybe_more_names = fn toks ->
   | _ -> (0, toks)
 
 // extend a constant name with any trailing `::Name` scope segments.
+// split a qualified constant name at its FIRST "::" ("A::B::C" -> "A", "B::C").
+and dcolon_at = fn (n: str) -> fn (i: int) ->
+  if i + 1 >= str_len n then str_len n
+  else if str_eq (char_at n i) ":" && str_eq (char_at n (i + 1)) ":" then i
+  else dcolon_at n (i + 1)
+and const_head = fn (n: str) -> substring n 0 (dcolon_at n 0)
+and const_tail = fn (n: str) ->
+  let i = dcolon_at n 0 in
+  if i + 2 >= str_len n then "" else substring n (i + 2) (str_len n)
+
 and scoped_name = fn (acc: str) -> fn toks ->
   match toks with
   | Cons (TP p, Cons (TId n, r)) -> if str_eq p "::" then scoped_name (acc ++ "::" ++ n) r else (acc, toks)
@@ -3641,8 +3684,18 @@ and parse_stmt_id = fn toks ->
       // for now; extra modules are consumed and ignored).
       (match r with
        | Cons (TId m, r2) -> let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude full, r3)
+       // `include ::A::B` — a path anchored at the top level reads the same
+       // here, because constants are stored under their qualified name.
+       | Cons (TP sc, Cons (TId m, r2)) ->
+         if str_eq sc "::"
+         then (let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude full, r3))
+         else (SExpr ENil, r)
        | _ -> (SExpr ENil, r))
-    else if str_eq id "private" || str_eq id "public" || str_eq id "protected" then
+    // The parenthesised form (`private(*names)`) is left to the ordinary call
+    // path below: its arguments can be computed at runtime, which a static
+    // SVis name list cannot express.
+    else if (str_eq id "private" || str_eq id "public" || str_eq id "protected") &&
+            (match r with Cons (TP lp, _) -> (if is_lparen lp then false else true) | _ -> true) then
       // visibility: bare form switches the mode for subsequent defs; the
       // named form (`private :m, :n`) marks those methods.
       let mode = if str_eq id "public" then "public" else if str_eq id "protected" then "protected" else "private" in
@@ -3668,7 +3721,8 @@ and parse_stmt_id = fn toks ->
       (SRequire (str_eq id "require_relative", e), r2)
     // bare `module_function` switches the enclosing module body into a mode
     // where subsequent defs are also module methods (see register_class_v).
-    else if str_eq id "module_function" then
+    else if str_eq id "module_function" &&
+            (match r with Cons (TP lp, _) -> (if is_lparen lp then false else true) | _ -> true) then
       (match r with
        | Cons (TNL, _) -> (SVis ("module_function", Nil), r)
        | Cons (TEOF, _) -> (SVis ("module_function", Nil), r)
@@ -3677,7 +3731,8 @@ and parse_stmt_id = fn toks ->
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis ("module_function", names), r2)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
     // `private_class_method :m` marks a class method private (in register_class_v).
-    else if str_eq id "private_class_method" then
+    else if str_eq id "private_class_method" &&
+            (match r with Cons (TP lp, _) -> (if is_lparen lp then false else true) | _ -> true) then
       (match r with
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis ("private_class_method", names), r2)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
@@ -3696,6 +3751,13 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TNL, _) -> (SExpr (ECall ("extend", Nil)), r)
        | Cons (TEOF, _) -> (SExpr (ECall ("extend", Nil)), r)
+       // `extend ::A::B` — a leading "::" only anchors at the top level here,
+       // where a value has to start; `a::B` elsewhere is still scope
+       // resolution on `a`, so this is not a general paren-less argument form.
+       | Cons (TP sc, Cons (TId m, r2)) ->
+         if str_eq sc "::"
+         then (let (full, r2b) = scoped_name m r2 in (SExpr (ECall ("extend", Cons (EConst full, Nil))), r2b))
+         else (let (es, r2) = parse_rhs_list r Nil in (SExpr (ECall ("extend", es)), r2))
        | _ -> let (es, r2) = parse_rhs_list r Nil in (SExpr (ECall ("extend", es)), r2))
     else if str_eq id "return" then
       (match r with
@@ -4625,7 +4687,8 @@ and parse_when_vals = fn toks -> fn (acc: Expr list) ->
      | _ -> parse_expr toks) in
   match r with
   | Cons (TP p, r2) ->
-    if str_eq p "," then parse_when_vals r2 (Cons (e, acc))
+    // a `when` value list may wrap after the comma (`when A,\n     B then`).
+    if str_eq p "," then parse_when_vals (skip_nls r2) (Cons (e, acc))
     else (rev_app (Cons (e, acc)) Nil, r)
   | _ -> (rev_app (Cons (e, acc)) Nil, r)
 
@@ -4783,7 +4846,11 @@ and uniq_param = fn (name: str) -> fn (acc: str list) ->
      else u)
   else name
 
-and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
+and parse_params = fn toks0 -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
+  // a parenthesised parameter list may wrap across lines, so newlines inside
+  // it are not statement separators (`def m(a,\n  b: 1)`). The paren-less form
+  // below is the opposite: there a newline ends the list.
+  let toks = skip_nls toks0 in
   match toks with
   | Cons (TP p, r) ->
     if str_eq p ")" then (rev_app acc Nil, rev_app defs Nil, r)
@@ -4833,7 +4900,8 @@ and parse_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list)
      | _ -> parse_params_after (uniq_param name acc) r acc defs)
   | _ -> fail "mere-ruby: expected parameter name"
 
-and parse_params_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
+and parse_params_after = fn (name: str) -> fn toks0 -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
+  let toks = skip_nls toks0 in
   match toks with
   | Cons (TP p, r) ->
     if str_eq p "," then parse_params r (Cons (name, acc)) defs
@@ -6396,6 +6464,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if str_contains name "::" then
       (if map_has consts name then map_get consts name
        else
+         // the leading segment can itself be lexically scoped: inside
+         // `module B`, `E::K` means `B::E::K`. Resolve the head through the
+         // cref chain before giving up on the qualified name.
+         let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
+         let hk = lex_const_key cref0 (const_head name) in
+         if (if str_eq hk "" then false else true) && map_has consts (hk ++ "::" ++ const_tail name)
+         then map_get consts (hk ++ "::" ++ const_tail name)
+         else
          let rc = recv_of_scoped name in
          let cn = const_of_scoped name in
          // top-level constants live in Object's namespace, so Object::X reads
@@ -6574,7 +6650,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         | VMain -> if map_has ivars ("main@" ++ name) then mkstr "instance-variable" else VNil
         | VClass c -> if map_has ivars ("cls:" ++ c ++ "@" ++ name) then mkstr "instance-variable" else VNil
         | _ -> VNil)
-     | EConst name -> if map_has consts name then mkstr "constant" else VNil
+     | EConst name ->
+       // a qualified name's head can be lexically scoped: inside `module M`,
+       // `I::K` is `M::I::K` (the same walk EConst's evaluation does).
+       (if map_has consts name then mkstr "constant"
+        else if str_contains name "::" then
+          (let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else cur_lex ()) in
+           let hk = lex_const_key cref0 (const_head name) in
+           if (if str_eq hk "" then false else true) && map_has consts (hk ++ "::" ++ const_tail name)
+           then mkstr "constant" else VNil)
+        else VNil)
      | EMethod (recv, name, _) ->
        let (meths, sup, ocls, ivars) = world in
        // evaluating the receiver may raise (undefined var); defined? is nil.
@@ -9621,9 +9706,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | Cons (VStr pp, Cons (VStr sp, _)) -> VBool (glob_any (glob_fnm_flags args) (glob_expand (sget pp)) (sget sp))
           | _ -> VBool false)
        else if str_eq name "basename" then
-         (match args with Cons (VStr ph, _) -> mkstr (basename_of (sget ph)) | _ -> mkstr "")
+         (match args with
+          | Cons (VStr ph, Cons (VStr sf, _)) -> mkstr (basename_suffix (basename_of (sget ph)) (sget sf))
+          | Cons (VStr ph, _) -> mkstr (basename_of (sget ph))
+          | _ -> mkstr "")
        else if str_eq name "dirname" then
          (match args with Cons (VStr ph, _) -> mkstr (dirname_of (sget ph)) | _ -> mkstr "")
+       // File.extname: the last dot and after, in the basename — "" when the
+       // name has no dot, or begins with the only one (".bashrc").
+       else if str_eq name "extname" then
+         (match args with Cons (VStr ph, _) -> mkstr (extname_of (basename_of (sget ph))) | _ -> mkstr "")
+       else if str_eq name "directory?" then
+         (match args with
+          | Cons (VStr ph, _) -> VBool (run ("test -d " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
+          | _ -> VBool false)
+       else if str_eq name "size" then
+         (match args with Cons (VStr ph, _) -> VInt (str_len (if file_exists (sget ph) then read_file (sget ph) else "")) | _ -> VInt 0)
+       else if str_eq name "size?" then
+         (match args with
+          | Cons (VStr ph, _) ->
+            (let n = str_len (if file_exists (sget ph) then read_file (sget ph) else "") in
+             if n > 0 then VInt n else VNil)
+          | _ -> VNil)
+       else if str_eq name "readlines" then
+         (match args with
+          | Cons (VStr ph, _) ->
+            (let c = (if file_exists (sget ph) then read_file (sget ph) else "") in
+             arr_new (val_list_of_strs (str_lines_go c 0 0 (str_len c))))
+          | _ -> arr_new Nil)
+       else if str_eq name "absolute_path" then
+         (match args with
+          | Cons (VStr ph, rest) ->
+            (let p1 = sget ph in
+             if str_len p1 > 0 && str_eq (char_at p1 0) "/" then mkstr p1
+             else mkstr ((match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") ++ "/" ++ p1))
+          | _ -> mkstr "")
        else if str_eq name "join" then mkstr (file_join_go args "")
        else if str_eq name "expand_path" then
          // File.expand_path(path[, base]): a relative path resolves against
@@ -9770,6 +9887,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // define_method(:name, unbound_or_proc): the non-block form. An
     // UnboundMethod transplants its body into `c` (super then resolves in c's
     // own ancestor chain); a Proc/lambda installs its body as the method.
+    // `private(*names)` and friends as a genuine call. The statement parser
+    // handles the bare and `:sym`-list forms; this is the parenthesised one,
+    // whose argument list is only known once it has been evaluated.
+    else if str_eq name "private" || str_eq name "public" || str_eq name "protected" ||
+            str_eq name "module_function" || str_eq name "private_class_method" then
+      (let (meths0, sup0, ocls0, ivars0) = world in
+       let names = vis_arg_names args in
+       let _ = (match names with
+                | Nil -> ()
+                | _ -> if str_eq name "module_function" then modfunc_promote world c names
+                       else if str_eq name "private_class_method" then mark_vis_mode meths0 ("(sng:" ++ c ++ ")") names "private"
+                       else mark_vis_mode meths0 c names name) in
+       // Ruby returns the argument, or the list of them when given several.
+       match args with Nil -> VNil | Cons (a, Nil) -> a | _ -> arr_new args)
     else if str_eq name "define_method" && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
@@ -9835,17 +9966,34 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          else if str_eq name "public_method_defined?" then VBool (if priv || prot then false else true)
          else if str_eq name "private_method_defined?" then VBool priv
          else VBool prot)
-    // singleton_methods: the class's own singleton-class methods.
+    // Module#methods: the class-method names reachable from this class — its
+    // own singleton methods plus the ones it inherits. Like Object#methods,
+    // the builtins that live in the primitive table are not enumerated.
+    else if str_eq name "methods" || str_eq name "public_methods" then
+      (let names = map_new () in
+       let _ = collect_cls_methods world c names in
+       let out = map_new () in
+       let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
+       arr_new (idx_to_list out 0 (map_len out)))
+    // singleton_methods(all = true): the class methods, inherited ones
+    // included. `singleton_methods(false)` is this class's own only.
     else if str_eq name "singleton_methods" then
-      (let (meths0, _, _, _) = world in
-       let pfx = "(sng:" ++ c ++ ")#" in
-       let plen = str_len pfx in
-       let tmp = map_new () in
-       let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
-         if str_len k > plen && str_eq (substring k 0 plen) pfx
-         then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
-         else ()) in
-       arr_new (idx_to_list tmp 0 (map_len tmp)))
+      (if (match args with Cons (VBool false, _) -> true | _ -> false) then
+         (let (meths0, _, _, _) = world in
+          let pfx = "(sng:" ++ c ++ ")#" in
+          let plen = str_len pfx in
+          let tmp = map_new () in
+          let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
+            if str_len k > plen && str_eq (substring k 0 plen) pfx
+            then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
+            else ()) in
+          arr_new (idx_to_list tmp 0 (map_len tmp)))
+       else
+         (let names = map_new () in
+          let _ = collect_cls_methods world c names in
+          let out = map_new () in
+          let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
+          arr_new (idx_to_list out 0 (map_len out))))
     // private_instance_methods(false) / public_instance_methods(false): the
     // own methods split by the visibility table.
     else if str_eq name "private_instance_methods" || str_eq name "public_instance_methods" then
@@ -10378,8 +10526,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // and libraries that colorize only for a tty degrade to plain output.
        else if str_eq name "tty?" || str_eq name "isatty" then VBool false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
-    // ENV: reads consult the write overlay first, then the real environment
-    // (env_is_set + getenv, so set-but-empty reads as "" like Ruby).
+    // ENV: reads consult the write overlay first, then the environment table
+    // (so a set-but-empty variable reads as "" like Ruby).
     else if str_eq cls "EnvHash" then
       (if str_eq name "[]" then
          (match args with Cons (kv, _) -> env_lookup_v (env_key_of env world kv) | _ -> VNil)
@@ -10431,6 +10579,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (if map_has hit "k" then map_get hit "k"
              else env_key_scan (env_all_pairs ()) target)
           | _ -> VNil)
+       // ENV.to_hash / to_h / keys / values / size: the real environment with
+       // the write overlay applied (a VNil entry in the overlay is a deletion).
+       else if str_eq name "to_hash" || str_eq name "to_h" then mkhash (env_hash_list ())
+       else if str_eq name "keys" then arr_new (env_hl_keys (env_hash_list ()))
+       else if str_eq name "values" then arr_new (env_hl_values (env_hash_list ()))
+       else if str_eq name "size" || str_eq name "length" || str_eq name "count" then
+         VInt (val_list_len (env_hl_keys (env_hash_list ())))
+       else if str_eq name "empty?" then
+         VBool (match env_hash_list () with Nil -> true | _ -> false)
+       else if str_eq name "to_a" then arr_new (env_hl_pairs (env_hash_list ()))
+       // ENV.replace(hash): the environment becomes exactly this hash, so
+       // every key it does not mention is deleted.
+       else if str_eq name "replace" then
+         (match args with
+          | Cons (VHsh h, _) ->
+            let _ = env_del_keys (env_hl_keys (env_hash_list ())) in
+            let _ = env_set_pairs (hderef h) in recv
+          | _ -> recv)
+       else if str_eq name "update" || str_eq name "merge!" then
+         (match args with Cons (VHsh h, _) -> let _ = env_set_pairs (hderef h) in recv | _ -> recv)
+       else if str_eq name "clear" then
+         (let _ = env_del_keys (env_hl_keys (env_hash_list ())) in recv)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for ENV"))
     // Enumerator::Lazy surface without a block: take/drop extend the pipeline,
     // first/to_a/force run it (bounded), eager materializes.
@@ -13422,6 +13592,12 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
      | VMain ->
        if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
        then dispatch_prim env world noblk VMain name args false
+       // main IS an Object, so a method added by reopening Object — or Kernel,
+       // which Object includes — is callable bare here, exactly as a
+       // top-level `def` is. Libraries add their conversion functions that way
+       // (`Kernel#Pathname`, `Kernel#Rainbow`).
+       else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
+       else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
        else undef_call_exc_x world name args explicit
      | VClass c ->
        if str_eq name "new" then new_obj world c args
@@ -14070,8 +14246,20 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
   else raise_exc world "LoadError" ("cannot load such file -- " ++ p0)
 
 // File.basename: the path's final component.
+// Ruby strips trailing slashes first, so basename("a/") is "a" and the root
+// "/" is its own basename.
 and basename_of = fn (path: str) ->
-  basename_go path (str_len path - 1)
+  let q = strip_trail_slash path (str_len path - 1) in
+  if str_eq q "/" then "/" else basename_go q (str_len q - 1)
+// File.basename(path, suffix): drop the suffix when it matches, or drop any
+// extension when the suffix is ".*".
+and basename_suffix = fn (b: str) -> fn (suf: str) ->
+  if str_eq suf ".*" then
+    (let e = extname_of b in if str_eq e "" then b else substring b 0 (str_len b - str_len e))
+  else if str_len suf > 0 && str_len b > str_len suf &&
+          str_eq (substring b (str_len b - str_len suf) (str_len b)) suf
+  then substring b 0 (str_len b - str_len suf)
+  else b
 and basename_go = fn (path: str) -> fn (i: int) ->
   if i < 0 then path
   else if str_eq (char_at path i) "/" then substring path (i + 1) (str_len path)
@@ -14082,18 +14270,31 @@ and file_join_go = fn (args: Val list) -> fn (acc: str) ->
   | Cons (v, rest) ->
     let piece = (match v with VStr h -> sget h | _ -> to_s v) in
     file_join_go rest (if str_eq acc "" then piece else acc ++ "/" ++ piece)
-// is this environment variable set? getenv is libc getenv and returns
-// NULL — a crash — for unset names, so probe with printenv first (which
-// also distinguishes set-but-empty, exit 0, from unset, exit 1).
+// The environment, read once into a table. It cannot be read with libc
+// getenv: an `extern fn ... -> str` hands back the raw C pointer, which is
+// NOT a Mere string, so anything but printing it (str_len, ++, substring)
+// reads a garbage length prefix and segfaults. A process's environ does not
+// change under it, so one dump plus the write overlay is a faithful ENV —
+// and it costs one subprocess instead of one per read.
+and env_load = fn (u: unit) ->
+  if map_has env_cache "\0loaded" then ()
+  else
+    let _ = map_set env_cache "\0loaded" (mkstr "1") in
+    env_cache_fill (env_all_pairs ())
+and env_cache_fill = fn (ps: (str * str) list) ->
+  match ps with
+  | Nil -> ()
+  | Cons ((k, v), t) -> let _ = map_set env_cache k (mkstr v) in env_cache_fill t
 and env_is_set = fn (k2: str) ->
-  run ("printenv " ++ shq k2 ++ " > /dev/null 2>&1") == 0
+  let _ = env_load () in map_has env_cache k2
 and env_get = fn (k2: str) ->
-  if env_is_set k2 then getenv k2 else ""
+  let _ = env_load () in
+  if map_has env_cache k2 then (match map_get env_cache k2 with VStr h -> sget h | _ -> "") else ""
 // one ENV read: the write overlay wins (VNil = deleted), then the real
 // environment.
 and env_lookup_v = fn (k2: str) ->
   let v = (if map_has env_ovr k2 then map_get env_ovr k2
-           else if env_is_set k2 then mkstr (getenv k2)
+           else if env_is_set k2 then mkstr (env_get k2)
            else VNil) in
   // reads carry Encoding.default_internal when set, else the locale (UTF-8).
   (match v with
@@ -14146,6 +14347,53 @@ and env_eq_at = fn (content: str) -> fn (j: int) -> fn (stop: int) ->
   if j >= stop then (0 - 1)
   else if str_eq (char_at content j) "=" then j
   else env_eq_at content (j + 1) stop
+// ENV as an interleaved [k1, v1, k2, v2, ...] hash body: the environment in
+// its own order with the write overlay applied, then the keys the overlay
+// added. A VNil overlay entry is a deleted key.
+and env_hash_list = fn (u: unit) ->
+  let ps = env_all_pairs () in
+  vappend (env_pairs_hl ps) (env_ovr_only ps)
+and env_pairs_hl = fn (ps: (str * str) list) ->
+  match ps with
+  | Nil -> (Nil : Val list)
+  | Cons ((k, v), t) ->
+    if map_has env_ovr k then
+      (match map_get env_ovr k with
+       | VNil -> env_pairs_hl t
+       | ov -> Cons (mkstr k, Cons (ov, env_pairs_hl t)))
+    else Cons (mkstr k, Cons (mkstr v, env_pairs_hl t))
+and env_ovr_only = fn (ps: (str * str) list) ->
+  let out = map_new () in
+  let _ = map_iter env_ovr (fn (k: str) -> fn (v: Val) ->
+    match v with
+    | VNil -> ()
+    | _ -> if spairs_has ps k then () else (let i = map_len out in
+             let _ = map_set out (str_of_int i) (mkstr k) in
+             map_set out (str_of_int (i + 1)) v)) in
+  idx_to_list out 0 (map_len out)
+and spairs_has = fn (ps: (str * str) list) -> fn (k: str) ->
+  match ps with Nil -> false | Cons ((k2, _), t) -> if str_eq k2 k then true else spairs_has t k
+and env_hl_keys = fn (xs: Val list) ->
+  match xs with Cons (k, Cons (_, t)) -> Cons (k, env_hl_keys t) | _ -> (Nil : Val list)
+and env_hl_values = fn (xs: Val list) ->
+  match xs with Cons (_, Cons (v, t)) -> Cons (v, env_hl_values t) | _ -> (Nil : Val list)
+and env_hl_pairs = fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) -> Cons (arr_new (Cons (k, Cons (v, Nil))), env_hl_pairs t)
+  | _ -> (Nil : Val list)
+// mark each of these keys deleted in the write overlay.
+and env_del_keys = fn (ks: Val list) ->
+  match ks with
+  | Nil -> ()
+  | Cons (VStr h, t) -> let _ = map_set env_ovr (sget h) VNil in env_del_keys t
+  | Cons (_, t) -> env_del_keys t
+and env_set_pairs = fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    let _ = map_set env_ovr (match k with VStr h -> sget h | VSym s2 -> s2 | other -> to_s other) v in
+    env_set_pairs t
+  | _ -> ()
+
 // reverse lookup for ENV.key: first key whose value matches (skipping keys
 // the overlay shadows).
 and env_key_scan = fn (pairs: (str * str) list) -> fn (target: str) ->
@@ -14159,6 +14407,15 @@ and env_key_scan = fn (pairs: (str * str) list) -> fn (target: str) ->
 and is_reg_file = fn (p1: str) ->
   file_exists p1 && run ("test -f " ++ shq p1 ++ " 2> /dev/null") == 0
 // single-quote a string for the shell (used by the run-backed helpers).
+// the extension of a file name: from its last dot to the end, "" when there
+// is no dot or the dot starts the name (".bashrc" has no extension). A
+// trailing dot IS the extension ("x." -> "."), as in Ruby 3.
+and extname_of = fn (b: str) ->
+  let i = last_dot_at b (str_len b - 1) in
+  if i <= 0 then "" else substring b i (str_len b)
+and last_dot_at = fn (b: str) -> fn (i: int) ->
+  if i < 0 then 0 - 1 else if str_eq (char_at b i) "." then i else last_dot_at b (i - 1)
+
 and shq = fn (s2: str) ->
   "'" ++ shq_go s2 0 "" ++ "'"
 and shq_go = fn (s2: str) -> fn (i: int) -> fn (acc: str) ->
@@ -14212,6 +14469,196 @@ and stdlib_src = fn (name: str) ->
     "  def exit; mon_exit; end\n" ++
     "  def try_enter; mon_try_enter; end\n" ++
     "  def owned?; mon_owned?; end\n" ++
+    "end\n"
+  // Pathname is pure Ruby in CRuby too, but it lives in the stdlib, which
+  // mere-ruby has no copy of. Every method here delegates to File / Dir.
+  else if str_eq n "pathname" then
+    "class Pathname\n" ++
+    "  SEPARATOR = \"/\"\n" ++
+    "  def initialize(path)\n" ++
+    "    @path = path.to_s\n" ++
+    "  end\n" ++
+    "  def to_s\n" ++
+    "    @path\n" ++
+    "  end\n" ++
+    "  def to_str\n" ++
+    "    @path\n" ++
+    "  end\n" ++
+    "  def to_path\n" ++
+    "    @path\n" ++
+    "  end\n" ++
+    "  def inspect\n" ++
+    "    \"#<Pathname:\" + @path + \">\"\n" ++
+    "  end\n" ++
+    "  def freeze\n" ++
+    "    @path.freeze\n" ++
+    "    super\n" ++
+    "  end\n" ++
+    "  def ==(other)\n" ++
+    "    other.is_a?(Pathname) && other.to_s == @path\n" ++
+    "  end\n" ++
+    "  def eql?(other)\n" ++
+    "    self == other\n" ++
+    "  end\n" ++
+    "  def <=>(other)\n" ++
+    "    return nil unless other.is_a?(Pathname)\n" ++
+    "    @path <=> other.to_s\n" ++
+    "  end\n" ++
+    "  def hash\n" ++
+    "    @path.hash\n" ++
+    "  end\n" ++
+    "  def +(other)\n" ++
+    "    o = other.to_s\n" ++
+    "    return Pathname.new(o) if o.start_with?(\"/\")\n" ++
+    "    return Pathname.new(o) if @path.empty?\n" ++
+    "    return Pathname.new(@path + o) if @path.end_with?(\"/\")\n" ++
+    "    Pathname.new(@path + \"/\" + o)\n" ++
+    "  end\n" ++
+    "  def /(other)\n" ++
+    "    self + other\n" ++
+    "  end\n" ++
+    "  def join(*others)\n" ++
+    "    others.inject(self) do |acc, o|\n" ++
+    "      acc + o\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def basename(*args)\n" ++
+    "    Pathname.new(File.basename(@path, *args))\n" ++
+    "  end\n" ++
+    "  def dirname\n" ++
+    "    Pathname.new(File.dirname(@path))\n" ++
+    "  end\n" ++
+    "  def parent\n" ++
+    "    dirname\n" ++
+    "  end\n" ++
+    "  def extname\n" ++
+    "    File.extname(@path)\n" ++
+    "  end\n" ++
+    "  def expand_path(*args)\n" ++
+    "    Pathname.new(File.expand_path(@path, *args))\n" ++
+    "  end\n" ++
+    "  def absolute?\n" ++
+    "    @path.start_with?(\"/\")\n" ++
+    "  end\n" ++
+    "  def relative?\n" ++
+    "    !absolute?\n" ++
+    "  end\n" ++
+    "  def root?\n" ++
+    "    @path == \"/\"\n" ++
+    "  end\n" ++
+    "  def exist?\n" ++
+    "    File.exist?(@path)\n" ++
+    "  end\n" ++
+    "  def file?\n" ++
+    "    File.file?(@path)\n" ++
+    "  end\n" ++
+    "  def directory?\n" ++
+    "    Dir.exist?(@path)\n" ++
+    "  end\n" ++
+    "  def size\n" ++
+    "    File.size(@path)\n" ++
+    "  end\n" ++
+    "  def read(*args)\n" ++
+    "    File.read(@path, *args)\n" ++
+    "  end\n" ++
+    "  def readlines(*args)\n" ++
+    "    File.readlines(@path, *args)\n" ++
+    "  end\n" ++
+    "  def binread(*args)\n" ++
+    "    File.read(@path, *args)\n" ++
+    "  end\n" ++
+    "  def write(content)\n" ++
+    "    File.write(@path, content)\n" ++
+    "  end\n" ++
+    "  def open(*args, &block)\n" ++
+    "    File.open(@path, *args, &block)\n" ++
+    "  end\n" ++
+    "  def each_line(&block)\n" ++
+    "    readlines.each(&block)\n" ++
+    "  end\n" ++
+    "  def unlink\n" ++
+    "    File.delete(@path)\n" ++
+    "  end\n" ++
+    "  def delete\n" ++
+    "    unlink\n" ++
+    "  end\n" ++
+    "  def mkdir\n" ++
+    "    Dir.mkdir(@path)\n" ++
+    "  end\n" ++
+    "  def mkpath\n" ++
+    "    Dir.mkdir(@path)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def sub(*args, &block)\n" ++
+    "    Pathname.new(@path.sub(*args, &block))\n" ++
+    "  end\n" ++
+    "  def sub_ext(repl)\n" ++
+    "    ext = File.extname(@path)\n" ++
+    "    base = ext.empty? ? @path : @path[0, @path.length - ext.length]\n" ++
+    "    Pathname.new(base + repl)\n" ++
+    "  end\n" ++
+    "  def split\n" ++
+    "    [dirname, basename]\n" ++
+    "  end\n" ++
+    "  def each_filename\n" ++
+    "    @path.split(\"/\").each do |seg|\n" ++
+    "      yield seg unless seg.empty?\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def children\n" ++
+    "    Dir.children(@path).sort.map do |c|\n" ++
+    "      self + c\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def entries\n" ++
+    "    Dir.entries(@path).sort.map do |c|\n" ++
+    "      Pathname.new(c)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def glob(pattern)\n" ++
+    "    Dir.glob(pattern, base: @path).map do |c|\n" ++
+    "      self + c\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def cleanpath\n" ++
+    "    parts = []\n" ++
+    "    abs = @path.start_with?(\"/\")\n" ++
+    "    @path.split(\"/\").each do |seg|\n" ++
+    "      next if seg.empty?\n" ++
+    "      next if seg == \".\"\n" ++
+    "      if seg == \"..\" && !parts.empty? && parts.last != \"..\"\n" ++
+    "        parts.pop\n" ++
+    "      else\n" ++
+    "        parts.push(seg)\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    out = parts.join(\"/\")\n" ++
+    "    out = \"/\" + out if abs\n" ++
+    "    out = \".\" if out.empty?\n" ++
+    "    Pathname.new(out)\n" ++
+    "  end\n" ++
+    "  def realpath\n" ++
+    "    expand_path\n" ++
+    "  end\n" ++
+    "  def relative_path_from(base)\n" ++
+    "    base = Pathname.new(base) unless base.is_a?(Pathname)\n" ++
+    "    dest = cleanpath.to_s.split(\"/\")\n" ++
+    "    src = base.cleanpath.to_s.split(\"/\")\n" ++
+    "    while !dest.empty? && !src.empty? && dest.first == src.first\n" ++
+    "      dest.shift\n" ++
+    "      src.shift\n" ++
+    "    end\n" ++
+    "    ups = src.map do |_ignored|\n" ++
+    "      \"..\"\n" ++
+    "    end\n" ++
+    "    parts = ups + dest\n" ++
+    "    Pathname.new(parts.empty? ? \".\" : parts.join(\"/\"))\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "module Kernel\n" ++
+    "  def Pathname(path)\n" ++
+    "    path.is_a?(Pathname) ? path : Pathname.new(path)\n" ++
+    "  end\n" ++
     "end\n"
   else ""
 
@@ -15342,6 +15789,18 @@ and sng_inner = fn (c: str) -> substring c 5 (str_len c - 1)
 // keeps its recorded superclass (the object's class).
 // collect public+protected method names (excluding privates) along a class's
 // ancestor chain into `names` (keyed by name, VSym value, for dedup).
+// the class methods of `cls` and of every class it inherits from, as symbols.
+and collect_cls_methods = fn world -> fn (cls: str) -> fn names ->
+  let (meths0, sup0, _, _) = world in
+  let pfx = "(sng:" ++ cls ++ ")#" in
+  let plen = str_len pfx in
+  let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
+    if str_len k > plen && str_eq (substring k 0 plen) pfx
+       && (if map_has privates k then false else true)
+    then (let nm = substring k plen (str_len k) in if map_has names nm then () else map_set names nm (VSym nm))
+    else ()) in
+  if map_has sup0 cls then collect_cls_methods world (map_get sup0 cls) names else ()
+
 and collect_methods = fn world -> fn (cls: str) -> fn names ->
   let (meths0, sup0, _, _) = world in
   let pfx = cls ++ "#" in
@@ -15804,6 +16263,14 @@ and modfunc_promote = fn world -> fn (cls: str) -> fn (names: str list) ->
     let src = cls ++ "#" ++ n in
     let _ = if map_has meths src then map_set meths ("(sng:" ++ cls ++ ")#" ++ n) (map_get meths src) else () in
     modfunc_promote world cls rest
+
+// the :sym / "str" arguments of a visibility call, as plain names.
+and vis_arg_names = fn (args: Val list) ->
+  match args with
+  | Nil -> (Nil : str list)
+  | Cons (VSym s, t) -> Cons (s, vis_arg_names t)
+  | Cons (VStr h, t) -> Cons (sget h, vis_arg_names t)
+  | Cons (_, t) -> vis_arg_names t
 
 and mark_vis_mode = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (mode: str) ->
   match names with
