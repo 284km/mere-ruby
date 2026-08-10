@@ -8326,6 +8326,12 @@ and is_enum_method = fn (name: str) ->
 // enclosing method's block (threaded so a yield inside the iterated block
 // reaches it); `theblk` is the block being iterated.
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  // The frozen check in invoke_val_c only guards the non-block dispatch, so a
+  // block-form mutator (delete_if / keep_if / map! / sort! ...) reached this
+  // far without one.
+  if is_mutating_method name && val_is_frozen recv then
+    raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+  else
   // each iterator returns a Flow: FBreak v (a `break v` fired — that value
   // becomes the whole call's result) or FNext <natural result>.
   match recv with
@@ -9171,7 +9177,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Array" && str_eq name "new" then array_new_args args
     // allocate makes an empty instance without running #initialize.
     else if str_eq name "allocate" && (str_eq c "Array" || str_eq c "Hash" || str_eq c "String") then
-      (if str_eq c "Array" then arr_new Nil else if str_eq c "Hash" then mkhash Nil else mkstr "")
+      (match args with
+       | Cons (_, _) -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
+       | Nil -> (if str_eq c "Array" then arr_new Nil else if str_eq c "Hash" then mkhash Nil else mkstr ""))
     // a subclass of Array with no own #initialize behaves as a plain array
     // (Class.new(Array).new([0,1]) is [0,1]); back it with real array storage
     // so #deconstruct and the other array methods work.
@@ -11238,6 +11246,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
      // `blk` (the enclosing method's block) is threaded so a yield inside
      // the iterated block reaches it (e.g. `@xs.each { |n| yield(n) }`).
      | _ ->
+       // the in-place mutators below are reached with a block, ahead of
+       // builtin_iter's guard, so the frozen check has to happen here too.
+       if is_mutating_method name && val_is_frozen recv then
+         raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+       else
        // a reopened built-in class's method (with the call-site block) wins
        // over the hardcoded iterators.
        let pcls = class_name recv in
@@ -11459,6 +11472,9 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p pf (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
      | _ -> VNil)
   // fetch raises a catchable KeyError / IndexError when absent (no default/block).
+  else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false)
+          && (match args with Nil -> true | _ -> false) then
+    prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)"
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
     (match recv with
      | VHsh h -> let xs = hderef h in (match args with Cons (k, rest) -> (if hash_haskey xs k then hash_get xs k else (match rest with Cons (d, _) -> d | Nil -> raise_exc world "KeyError" ("key not found: " ++ inspect k))) | _ -> VNil)
@@ -11951,6 +11967,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr a -> let a = sget a in (match args with Cons (VStr b2, _) -> let b2 = sget b2 in VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
      | _ -> fail "no casecmp?")
+  else if str_eq name "ord" && (match recv with VStr h -> str_len (sget h) == 0 | _ -> false) then
+    prim_raise "ArgumentError" "empty string"
   else if str_eq name "ord" then
     (match recv with
      | VStr sv -> let sv = sget sv in (if str_len sv > 0 then VInt (match utf8_cp sv 0 with (c, l) -> c) else fail "no ord")
@@ -12440,6 +12458,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "minmax" then (match recv with VArr id -> val_minmax (deref id) | _ -> fail "no minmax")
   else if str_eq name "each_slice" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (val_slices (deref id) n) | _ -> recv) | _ -> fail "no each_slice")
   else if str_eq name "each_cons" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (val_cons_windows (deref id) n) | _ -> recv) | _ -> fail "no each_cons")
+  else if (str_eq name "take" || str_eq name "drop")
+          && (match args with Cons (VInt n, _) -> n < 0 | _ -> false) then
+    prim_raise "ArgumentError" ("attempt to " ++ name ++ " negative size")
   else if str_eq name "take" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (deref id) n) | _ -> arr_new Nil) | _ -> fail "no take")
   else if str_eq name "drop" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vdrop (deref id) n) | _ -> recv) | _ -> fail "no drop")
   else if str_eq name "zip" then
@@ -12660,11 +12681,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    | Nil -> recv)
      | _ -> fail "no concat")
   else if str_eq name "clear" then
+    (match args with
+     | Cons (_, _) -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
+     | Nil ->
     (match recv with
      | VArr id -> let _ = arr_set id Nil in recv
      | VHsh h -> let _ = hset h Nil in recv
      | VStr h -> let _ = sset h "" in recv
-     | _ -> fail "no clear")
+     | _ -> fail "no clear"))
   else if str_eq name "[]=" then
     (match recv with
      | VArr id ->
