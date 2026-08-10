@@ -2502,7 +2502,13 @@ and parse_primary = fn toks ->
            let (argv, r3) = parse_call_args r2 in (ECall (id, argv), r3)
          else if str_eq eq "=" then let (e, r3) = parse_expr r2 in (EAssign (id, e), r3)
          else (EConst id, r)
-       | _ -> (EConst id, r))
+       // `Array licenses` / `Integer str` — the paren-less form of the same
+       // call. A constant takes no argument, so a bare argument here settles
+       // it as a method call. (`Foo::Bar`, `Foo.m` and a plain `Foo` reach
+       // this with a token that starts no argument, and stay constants.)
+       | _ ->
+         if starts_bare_arg r then let (argv, r3) = parse_puts_args r Nil in (ECall (id, argv), r3)
+         else (EConst id, r))
     else if str_eq id "yield" then
       (match r with
        | Cons (TP p, r2) ->
@@ -2533,8 +2539,13 @@ and parse_primary = fn toks ->
         (match r with
          | Cons (TP p, r2) ->
            if is_lparen p then let (a, r3) = parse_call_args r2 in (false, a, r3)
+           // `super x` / `super "msg", y` — paren-less arguments, like any
+           // other command call. Without this the bare form parsed as zsuper
+           // and the argument was left dangling.
+           else if starts_bare_arg r then let (a, r3) = parse_puts_args r Nil in (false, a, r3)
            else (true, Nil, r)
-         | _ -> (true, Nil, r)) in
+         | _ -> if starts_bare_arg r then let (a, r3) = parse_puts_args r Nil in (false, a, r3)
+                else (true, Nil, r)) in
       // `super { ... }` / `super do ... end` passes an explicit block.
       if starts_block r1 then
         let (bp, bb, r4) = parse_block r1 in (ESuperB (zs, argv, bp, bb), r4)
@@ -3022,6 +3033,14 @@ and parse_puts_args = fn toks -> fn (acc: Expr list) ->
     // positional path, so `p (1..3).to_a` still groups-then-chains.
     if str_eq st "(" then
       let (a, r1) = parse_call_args r0 in (rev_app acc a, r1)
+    // a keyword splat in a paren-less call: `mkdir_p subdir, **options`.
+    else if str_eq st "**" then
+      let (inner, r1) = parse_expr r0 in
+      (match r1 with
+       | Cons (TP c2, r2) ->
+         if str_eq c2 "," then parse_puts_args (skip_nls r2) (Cons (EKwSplat inner, acc))
+         else (rev_app (Cons (EKwSplat inner, acc)) Nil, r1)
+       | _ -> (rev_app (Cons (EKwSplat inner, acc)) Nil, r1))
     // splat / block-pass arguments in a paren-less call: `send :m=, *x, 1`.
     else if str_eq st "*" then
       let (inner, r1) = parse_expr r0 in
@@ -3951,7 +3970,8 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
   | Cons (TSym s, r) ->
     (match r with
      | Cons (TP p, r2) ->
-       if str_eq p "," then parse_sym_list r2 (Cons (s, acc))
+       // an attr list can wrap after a comma, like any argument list.
+       if str_eq p "," then parse_sym_list (skip_nls r2) (Cons (s, acc))
        else (rev_app (Cons (s, acc)) Nil, r)
      | _ -> (rev_app (Cons (s, acc)) Nil, r))
   | _ -> fail "mere-ruby: expected :symbol"
@@ -9060,6 +9080,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            | _ -> VNil)
         | _ -> VNil)
      | _ -> VNil)
+  // Time instance methods. The object carries a single ordinal, so the zone
+  // conversions are identity and #to_i hands the ordinal back.
+  else if (match recv with
+           | VObj oid -> (let (_, _, ocls9, _) = world in str_eq (map_get ocls9 (str_of_int oid)) "Time")
+           | _ -> false)
+          && (str_eq name "utc" || str_eq name "getutc" || str_eq name "localtime"
+              || str_eq name "getlocal" || str_eq name "round" || str_eq name "to_i"
+              || str_eq name "to_time" || str_eq name "utc?"
+              || str_eq name "year" || str_eq name "month" || str_eq name "mon"
+              || str_eq name "day" || str_eq name "mday" || str_eq name "hour"
+              || str_eq name "min" || str_eq name "sec") then
+    (match recv with
+     | VObj oid ->
+       let (_, _, _, iv9) = world in
+       let k = str_of_int oid ++ "@__utc" in
+       if str_eq name "to_i" then
+         (if map_has iv9 (str_of_int oid ++ "@__epoch")
+          then map_get iv9 (str_of_int oid ++ "@__epoch")
+          else VInt (time_ord_of world recv))
+       else if str_eq name "utc?" then VBool (map_has iv9 k)
+       // .utc / .getutc mark the zone; Time.now is local, so utc? is false
+       // until one of them is called.
+       else if str_eq name "utc" || str_eq name "getutc" then (let _ = map_set iv9 k (VBool true) in recv)
+       else if str_eq name "year" || str_eq name "month" || str_eq name "mon"
+            || str_eq name "day" || str_eq name "mday" || str_eq name "hour"
+            || str_eq name "min" || str_eq name "sec" then
+         (let (yy, mo, dd, hh, mi, ss) = time_parts (time_ord_of world recv) in
+          if str_eq name "year" then VInt yy
+          else if str_eq name "month" || str_eq name "mon" then VInt mo
+          else if str_eq name "day" || str_eq name "mday" then VInt dd
+          else if str_eq name "hour" then VInt hh
+          else if str_eq name "min" then VInt mi
+          else VInt ss)
+       else recv
+     | _ -> recv)
   // Array's searches compare with `element == obj`, so a user-defined == on an
   // element decides the answer. rb_eq is structural and has no world to
   // dispatch with, so when an element carries its own ==, the search runs here
@@ -9210,6 +9265,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let hv = mkhash Nil in (match args with Cons (d, _) -> (match hv with VHsh id -> let _ = hdflt_set id d in hv | _ -> hv) | _ -> hv))
     else if str_eq c "Array" && str_eq name "new" then array_new_args args
     // allocate makes an empty instance without running #initialize.
+    // Time.now / Time.at(sec): the same minimal Time object new_obj builds,
+    // seeded from the clock rather than from calendar arguments.
+    // Time.utc / .gm / .local / .mktime build from calendar parts, like Time.new.
+    else if str_eq c "Time" && (str_eq name "utc" || str_eq name "gm"
+                                || str_eq name "local" || str_eq name "mktime") then
+      (let (m9, s9, ocls9, iv9) = world in
+       let id = map_len ocls9 in
+       let _ = map_set ocls9 (str_of_int id) "Time" in
+       let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord args)) in
+       let _ = (if str_eq name "utc" || str_eq name "gm" then map_set iv9 (str_of_int id ++ "@__utc") (VBool true) else ()) in
+       VObj id)
+    else if str_eq c "Time" && (str_eq name "now" || str_eq name "at") then
+      (let (m9, s9, ocls9, iv9) = world in
+       let id = map_len ocls9 in
+       let _ = map_set ocls9 (str_of_int id) "Time" in
+       let secs = (match args with
+                   | Cons (VInt n, _) -> n
+                   | Cons (VFlt f, _) -> int_of_float f
+                   | _ -> int_of_float (time ())) in
+       let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord_of_epoch secs)) in
+       let _ = map_set iv9 (str_of_int id ++ "@__epoch") (VInt secs) in
+       VObj id)
     else if str_eq name "allocate" && (str_eq c "Array" || str_eq c "Hash" || str_eq c "String") then
       (match args with
        | Cons (_, _) -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
@@ -9846,6 +9923,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                                            else if map_has consts (c ++ "::" ++ n) then map_get consts (c ++ "::" ++ n)
                                            else raise_exc world "NameError" ("uninitialized constant " ++ n))
        | _ -> VNil)
+    // Module#deprecate_constant marks a constant as deprecated; the constant
+    // keeps working and CRuby only warns on use, which mere-ruby does not do.
+    else if str_eq name "deprecate_constant" then recv
     else if str_eq name "const_set" then
       (match args with
        | Cons (v, Cons (value, _)) -> let _ = map_set consts (to_s v) value in value
@@ -13631,6 +13711,9 @@ and struct_kw_init = fn (args: Val list) ->
 and struct_kw_params = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (m ++ ":", struct_kw_params r)
 // each member defaults to nil, so a missing keyword yields nil (not an error).
+and struct_pos_defaults = fn (ms: str list) ->
+  match ms with Nil -> Nil | Cons (m, r) -> Cons ((m, ENil), struct_pos_defaults r)
+
 and struct_kw_defaults = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons ((m ++ ":", ENil), struct_kw_defaults r)
 
@@ -13669,7 +13752,9 @@ and struct_build = fn world -> fn (args: Val list) ->
   let kw = struct_kw_init args in
   let _ = map_set meths (anon ++ "#initialize")
             (if kw then Meth (struct_kw_params members, struct_kw_defaults members, struct_init_body members)
-             else Meth (members, Nil, struct_init_body members)) in
+             // Positional members default to nil: Struct.new(:a, :b).new takes
+             // 0..2 arguments in Ruby, filling what is missing.
+             else Meth (members, struct_pos_defaults members, struct_init_body members)) in
   let toa = Cons (SReturn (EArr (struct_ivar_reads members)), Nil) in
   let _ = map_set meths (anon ++ "#to_a") (Meth (Nil, Nil, toa)) in
   let _ = map_set meths (anon ++ "#to_ary") (Meth (Nil, Nil, toa)) in
@@ -14363,6 +14448,42 @@ and make_enum_a = fn world -> fn (recv: Val) -> fn (meth: str) -> fn (eargs: Val
   VObj id
 
 // allocate an object, then run initialize if the class defines one.
+// Howard Hinnant's civil_from_days: the calendar date for a day count since
+// the epoch. Time.now would otherwise store epoch seconds while Time.new
+// stores the packed ordinal below — two encodings in one ivar.
+and civil_from_days = fn (z0: int) ->
+  let z = z0 + 719468 in
+  let era = (if z >= 0 then z else z - 146096) / 146097 in
+  let doe = z - era * 146097 in
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365 in
+  let y = yoe + era * 400 in
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100) in
+  let mp = (5 * doy + 2) / 153 in
+  let d = doy - (153 * mp + 2) / 5 + 1 in
+  let m = (if mp < 10 then mp + 3 else mp - 9) in
+  ((if m <= 2 then y + 1 else y), m, d)
+
+// the packed ordinal for an epoch-seconds instant (Time.now / Time.at).
+and time_ord_of_epoch = fn (secs: int) ->
+  let days = (if secs >= 0 then secs / 86400 else (secs - 86399) / 86400) in
+  let rem = secs - days * 86400 in
+  let (y, m, d) = civil_from_days days in
+  time_ord (Cons (VInt y, Cons (VInt m, Cons (VInt d,
+    Cons (VInt (rem / 3600), Cons (VInt (rem / 60 - (rem / 3600) * 60), Cons (VInt (rem - (rem / 60) * 60), Nil)))))))
+
+// the calendar parts back out of a packed ordinal.
+and time_parts = fn (n: int) ->
+  let s = n - (n / 60) * 60 in
+  let n1 = n / 60 in
+  let mi = n1 - (n1 / 60) * 60 in
+  let n2 = n1 / 60 in
+  let h = n2 - (n2 / 24) * 24 in
+  let n3 = n2 / 24 in
+  let d = n3 - (n3 / 32) * 32 in
+  let n4 = n3 / 32 in
+  let mo = n4 - (n4 / 13) * 13 in
+  (n4 / 13, mo, d, h, mi, s)
+
 // encode Time.new(y[,m,d,h,mi,s]) args into a monotonic ordinal for comparison.
 and time_ord = fn (args: Val list) ->
   let y = (match args with Cons (VInt a, _) -> a | _ -> 1970) in
@@ -15684,6 +15805,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                   else (let hit = load_path_find world p1 in
                         if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
        if map_has loaded_files full then FNext (VBool false)
+       // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
+       // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
+       // startup and the require is satisfied here rather than searched for.
+       else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb") && (if is_reg_file full then false else true) then
+         FNext (VBool true)
        else if (if is_reg_file full then false else true) then
          FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0))
        else
@@ -18210,6 +18336,33 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let outid = map_len ocls in
   let _ = map_set ocls (str_of_int outid) "IO" in
   let _ = map_set ivars (str_of_int outid ++ "@__io_fd") (VInt 1) in
+  // The RUBY_* description constants. RUBY_ENGINE says "ruby" rather than
+  // "mere-ruby" on purpose: every gate here is a byte comparison against
+  // MRI, so MRI's is the behaviour being emulated, and a library that
+  // branches on the engine should take the same branch CRuby would. The
+  // version tracks the ruby the corpus and specs are compared against.
+  // Marshal's format version. The module itself is not implemented; these
+  // are the two constants libraries read to stamp a serialised format.
+  let mid = map_len ocls in
+  let _ = map_set ocls (str_of_int mid) "Module" in
+  let _ = map_set consts "Marshal" (VClass "Marshal") in
+  let _ = map_set consts "Marshal::MAJOR_VERSION" (VInt 4) in
+  let _ = map_set consts "Marshal::MINOR_VERSION" (VInt 8) in
+  // RbConfig::CONFIG — the handful of keys libraries actually read. mere-ruby
+  // reports the ruby it is compared against; there is no separate build to
+  // describe.
+  let _ = map_set consts "RbConfig" (VClass "RbConfig") in
+  let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr "arm64-darwin22", Cons (mkstr "ruby_version", Cons (mkstr "3.2.0", Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr "/usr/lib/ruby", Cons (mkstr "rubylibprefix", Cons (mkstr "/usr/lib/ruby", Nil))))))))))))))))))) in
+  let _ = map_set consts "RbConfig::CONFIG" rbc in
+  let _ = map_set consts "RbConfig::TOPDIR" (mkstr "/usr") in
+  let _ = map_set consts "RUBY_VERSION" (mkstr "3.2.2") in
+  let _ = map_set consts "RUBY_ENGINE" (mkstr "ruby") in
+  let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "3.2.2") in
+  let _ = map_set consts "RUBY_PATCHLEVEL" (VInt 53) in
+  let _ = map_set consts "RUBY_RELEASE_DATE" (mkstr "2023-03-30") in
+  let _ = map_set consts "RUBY_PLATFORM" (mkstr "arm64-darwin22") in
+  let _ = map_set consts "RUBY_DESCRIPTION" (mkstr "ruby 3.2.2 (2023-03-30 revision e51014f9c0) [arm64-darwin22]") in
+  let _ = map_set consts "RUBY_COPYRIGHT" (mkstr "ruby - Copyright (C) 1993-2023 Yukihiro Matsumoto") in
   let _ = map_set consts "STDOUT" (VObj outid) in
   let _ = map_set globals "stdout" (VObj outid) in
   let errid = map_len ocls in
