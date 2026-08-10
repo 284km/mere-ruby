@@ -5874,6 +5874,18 @@ let rec val_nth = fn (xs: Val list) -> fn (i: int) ->
   match xs with
   | Nil -> VNil
   | Cons (h, t) -> if i == 0 then h else val_nth t (i - 1);
+// Array#shuffle: pull a random element out at a time. O(n^2) on a list, but
+// the arrays this runs on are small and it keeps the shuffle uniform.
+// (vtake / vdrop live further down, so the removal is spelled out here.)
+let rec val_without_nth = fn (xs: Val list) -> fn (i: int) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if i == 0 then t else Cons (h, val_without_nth t (i - 1));
+let rec val_shuffle = fn (xs: Val list) -> fn (n: int) ->
+  if n <= 0 then (Nil : Val list)
+  else
+    let i = random_int n in
+    Cons (val_nth xs i, val_shuffle (val_without_nth xs i) (n - 1));
 
 let rec val_len_i = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + val_len_i t;
 // Array set-op / assoc helpers (world-free; used by prim_method).
@@ -5912,7 +5924,22 @@ let rec succ_at = fn (s: str) -> fn (i: int) ->
     else if str_eq c "9" then succ_at (set_char s i "0") (i - 1)
     else if is_alnum c then set_char s i (chr (ord c + 1))
     else succ_at s (i - 1);
-let str_succ = fn (s: str) -> if str_len s == 0 then "" else succ_at s (str_len s - 1);
+// succ_at only advances alphanumerics — Ruby's rule when the string HAS one.
+// With none, Ruby increments the rightmost byte instead (with carry), so
+// "*+".succ is "*," and "\xff".succ is "\x01\x00".
+let rec succ_byte_at = fn (s: str) -> fn (i: int) ->
+  if i < 0 then chr 1 ++ s
+  else
+    let o = ord (char_at s i) in
+    if o == 255 then succ_byte_at (set_char s i (chr 0)) (i - 1)
+    else set_char s i (chr (o + 1));
+let rec has_alnum_go = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then false
+  else if is_alnum (char_at s i) then true else has_alnum_go s (i + 1);
+let str_succ = fn (s: str) ->
+  if str_len s == 0 then ""
+  else if has_alnum_go s 0 then succ_at s (str_len s - 1)
+  else succ_byte_at s (str_len s - 1);
 
 // gather elements at each given index (Array#values_at); negative = from end.
 let rec arr_values_at = fn (xs: Val list) -> fn (idxs: Val list) ->
@@ -8340,6 +8367,13 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   | VStr h ->
     (let sv = sget h in
      if str_eq name "each_char" then iter_each_result (arr_each world encl theblk (utf8_chars_val sv 0)) recv
+     // String#upto(limit) walks self, self.succ, ... up to limit.
+     else if str_eq name "upto" then
+       (match args with
+        | Cons (VStr lim, rest) ->
+          let excl = (match rest with Cons (b, _) -> truthy b | _ -> false) in
+          iter_each_result (arr_each world encl theblk (str_upto_list sv (sget lim) excl 0)) recv
+        | _ -> recv)
      else if str_eq name "each_byte" || str_eq name "bytes" then iter_each_result (arr_each world encl theblk (str_bytes_val sv 0)) recv
      // the plural forms take a block too, iterating instead of collecting.
      else if str_eq name "chars" then iter_each_result (arr_each world encl theblk (utf8_chars_val sv 0)) recv
@@ -9226,6 +9260,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let _ = map_set hng_store (hng_key v) c in v)
     else if str_eq name "[]" && obj_is_a world c "Hash" then
       (match args with Cons (VHsh h, _) -> mkhash (hderef h) | _ -> mkhash Nil)
+    else if str_eq c "Hash" && str_eq name "try_convert" then
+      (match args with
+       | Cons (VHsh hid, _) -> VHsh hid
+       | Cons (VObj oid, _) -> (if responds world (VObj oid) "to_hash" then invoke_val_c env world noblk (VObj oid) "to_hash" Nil false else VNil)
+       | _ -> VNil)
     else if str_eq c "Array" && str_eq name "try_convert" then
       (match args with
        | Cons (VArr aid, _) -> VArr aid
@@ -11742,6 +11781,27 @@ and is_prim_method = fn (name: str) ->
 // ---- in-place string mutation --------------------------------------------
 // VStr is a handle into str_store, so a mutating method rewrites the store
 // entry in place and EVERY alias sees the change (Ruby reference semantics).
+// "a".upto("c") -> ["a", "b", "c"]. Ruby stops when the value passes the
+// limit in length or order; the guard also bounds a runaway succ chain.
+and str_upto_list = fn (a: str) -> fn (b: str) -> fn (excl: bool) -> fn (n: int) ->
+  if n > 100000 then Nil
+  else if str_len a > str_len b then Nil
+  else if str_len a == str_len b && str_compare a b > 0 then Nil
+  else if excl && str_eq a b then Nil
+  else
+    // a succ that cannot advance would otherwise spin to the guard above.
+    let nx = str_succ a in
+    Cons (mkstr a, (if str_eq a b || str_eq nx a then Nil else str_upto_list nx b excl (n + 1)))
+
+// String#dump: inspect, and additionally escape anything non-ASCII so the
+// result is a plain-ASCII literal (which is what dump promises).
+and str_dump_go = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
+  else
+    let c = char_at s i in
+    let o = ord c in
+    str_dump_go s (i + 1) (acc ++ (if o >= 128 then "\\u" ++ hex4 o else c))
+
 and str_concat_vals = fn (args: Val list) ->
   match args with
   | Nil -> ""
@@ -11912,6 +11972,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VRegex (p, _) -> mkstr p | _ -> fail "no source")
   // casecmp is the three-way form of casecmp? (nil when the other side is
   // not a string, which is how callers tell "incomparable" from "unequal").
+  else if str_eq name "dump" && (match recv with VStr _ -> true | _ -> false) then
+    (match recv with VStr h -> mkstr (str_dump_go (inspect (VStr h)) 0 "") | _ -> VNil)
   else if str_eq name "casecmp" then
     (match recv with
      | VStr a -> let a = str_downcase (sget a) in
@@ -12722,6 +12784,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "merge!" || str_eq name "update" then
     (match recv with VHsh h -> let _ = hset h (hash_merge_all (hderef h) args) in recv | _ -> fail "no merge!")
   else if str_eq name "default" then (match recv with VHsh hid -> hdflt_get hid | _ -> VNil)
+  else if str_eq name "default=" then
+    (match recv with
+     | VHsh hid -> (match args with Cons (d, _) -> let _ = hdflt_set hid d in d | _ -> VNil)
+     | _ -> VNil)
+  // sample / shuffle
+  else if str_eq name "sample" then
+    (match recv with
+     | VArr id -> let xs = deref id in let n = val_list_len xs in
+       (if n == 0 then VNil else val_nth xs (random_int n))
+     | _ -> fail "no sample")
+  else if str_eq name "shuffle" then
+    (match recv with
+     | VArr id -> let xs = deref id in arr_new (val_shuffle xs (val_list_len xs))
+     | _ -> fail "no shuffle")
+  else if str_eq name "shuffle!" then
+    (match recv with
+     | VArr id -> let xs = deref id in let _ = arr_set id (val_shuffle xs (val_list_len xs)) in recv
+     | _ -> fail "no shuffle!")
   // replace swaps the contents in place, so every alias of the hash sees it.
   else if str_eq name "replace" && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
