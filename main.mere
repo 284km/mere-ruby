@@ -674,6 +674,14 @@ let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
 // "undefined method" failure parks the method name here; the begin/rescue
 // catch site turns it into a proper NoMethodError (Ruby's class for it).
 let prim_missing = map_new ();
+// prim_method has no `world` to build an exception with, so a TYPED failure
+// parks its class and message here and fails; the begin/rescue catch site
+// turns that into the real Ruby exception. Same channel as the "n" slot above,
+// generalised from the one NoMethodError case it was built for.
+let prim_raise = fn (cls: str) -> fn (msg: str) ->
+  let _ = map_set prim_missing "c" (mkstr cls) in
+  let _ = map_set prim_missing "m" (mkstr msg) in
+  fail ("mere-ruby: " ++ cls ++ ": " ++ msg);
 let is_upper_first = fn (id: str) ->
   str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
 // Kernel#local_variables: the local names bound in `env`, as symbols in
@@ -5970,6 +5978,20 @@ let rec hash_haskey = fn (xs: Val list) -> fn (k: Val) ->
   match xs with
   | Nil -> false
   | Cons (k2, rest) -> (match rest with Cons (_, t) -> if rb_eq k2 k then true else hash_haskey t k | Nil -> false);
+// Hash#fetch_values(*keys): the values in the order asked for.
+let rec hash_fetch_values = fn (xs: Val list) -> fn (ks: Val list) ->
+  match ks with
+  | Nil -> Nil
+  | Cons (k, rest) -> Cons (hash_get xs k, hash_fetch_values xs rest);
+// Hash#except(*keys): every pair whose key was not named.
+let rec hash_except = fn (xs: Val list) -> fn (ks: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       if val_member ks k then hash_except t ks else Cons (k, Cons (v, hash_except t ks))
+     | Nil -> Nil);
 let rec hash_pairs = fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
@@ -8358,6 +8380,18 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "reject" then iter_result (hash_filter world encl theblk xs Nil false) recv
     else if str_eq name "transform_values" then iter_result (FNext (mkhash (hash_tv world encl theblk xs))) recv
     else if str_eq name "transform_keys" then iter_result (FNext (mkhash (hash_tk world encl theblk xs))) recv
+    else if str_eq name "each_key" then iter_each_result (hash_each_one world encl theblk xs true) recv
+    else if str_eq name "each_value" then iter_each_result (hash_each_one world encl theblk xs false) recv
+    // delete_if / keep_if filter IN PLACE: the receiver is a handle, so the
+    // kept pairs are written back to it instead of returned as a new hash.
+    else if str_eq name "delete_if" || str_eq name "reject!" ||
+            str_eq name "keep_if" || str_eq name "select!" then
+      (let keep = str_eq name "keep_if" || str_eq name "select!" in
+       let f = hash_filter world encl theblk xs Nil keep in
+       let _ = (match f with
+                | FNext (VHsh nid) -> (match recv with VHsh hid -> hset hid (hderef nid) | _ -> ())
+                | _ -> ()) in
+       iter_each_result f recv)
     // other Enumerable methods iterate the [k,v] pairs as an array; the
     // block's |k, v| params auto-splat each pair.
     else builtin_iter world encl theblk (arr_new (hash_to_a xs)) name args
@@ -8626,6 +8660,18 @@ and hash_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
        (match run_block world encl theblk (Cons (k, Cons (v, Nil))) with
         | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
         | _ -> hash_each world encl theblk t)
+     | Nil -> FNext VNil)
+
+// each_key / each_value yield one half of each pair (not the pair).
+and hash_each_one = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (want_key: bool) ->
+  match xs with
+  | Nil -> FNext VNil
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v, t) ->
+       (match run_block world encl theblk (Cons ((if want_key then k else v), Nil)) with
+        | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
+        | _ -> hash_each_one world encl theblk t want_key)
      | Nil -> FNext VNil)
 
 // hash.select { |k, v| ... } keeps matching pairs, rebuilding a Hash.
@@ -9268,6 +9314,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let (meths0, sup0, ocls0, ivars0) = world in
        let mname = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
        let origin = if map_has meths0 (c ++ "#" ++ mname) then c else lookup_anc world (ancestors_of world c) mname in
+       // a builtin method has no entry in the user method table, but it is
+       // still a method of the class and reflection must see it.
+       let origin = if str_eq origin "" && builtin_has_meth c mname then c else origin in
        if str_eq origin "" then raise_exc world "NameError" ("undefined method '" ++ mname ++ "' for class '" ++ c ++ "'")
        else
          (let id = map_len ocls0 in
@@ -10049,11 +10098,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "inspect" || str_eq name "to_s" then
          mkstr ("#<UnboundMethod: " ++ ucls ++ "#" ++ unm ++ ">")
        else if str_eq name "==" || str_eq name "eql?" then
+         // two names for one builtin implementation are one method, so compare
+         // through canon_alias (String#size == String#length).
          (match args with
           | Cons (VObj oid2, _) ->
             VBool (str_eq (map_get ocls (str_of_int oid2)) "UnboundMethod"
                    && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__um_cls"))) ucls
-                   && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__um_name"))) unm)
+                   && str_eq (canon_alias ucls (to_s (map_get ivars (str_of_int oid2 ++ "@__um_name"))))
+                             (canon_alias ucls unm))
           | _ -> VBool false)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of UnboundMethod"))
     // Encoding objects: name/to_s give the label, inspect is #<Encoding:name>.
@@ -11270,8 +11322,8 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   | VProc _ -> is_prim_method name || is_proc_method name
   // the implicit-conversion protocol is per type, so a duck-type check
   // (`x.respond_to? :to_str`) tells strings from everything else.
-  | VArr _ -> is_prim_method name || str_eq name "to_ary" || str_eq name "to_a"
-  | VHsh _ -> is_prim_method name || str_eq name "to_hash" || str_eq name "to_h"
+  | VArr _ -> is_prim_method name || is_arr_method name
+  | VHsh _ -> is_prim_method name || is_hash_method name
   | VInt _ -> is_prim_method name || str_eq name "to_int"
   | _ -> is_prim_method name
 
@@ -11294,7 +11346,127 @@ and is_str_method = fn (name: str) ->
   str_eq name "sub" || str_eq name "gsub" || str_eq name "tr" || str_eq name "replace" ||
   str_eq name "concat" || str_eq name "to_i" || str_eq name "to_f" || str_eq name "to_sym" ||
   str_eq name "each_char" || str_eq name "each_line" || str_eq name "count" ||
-  str_eq name "scan" || str_eq name "match" || str_eq name "match?"
+  str_eq name "scan" || str_eq name "match" || str_eq name "match?" ||
+  str_eq name "size" || str_eq name "slice" || str_eq name "succ" || str_eq name "succ!" ||
+  str_eq name "next" || str_eq name "next!" || str_eq name "intern" || str_eq name "to_str" ||
+  str_eq name "dedup" || str_eq name "===" || str_eq name "[]" || str_eq name "[]="
+
+// Array's and Hash's builtin method names. Dispatch itself is a name chain
+// rather than a table, so these lists are what reflection (instance_method /
+// respond_to?) has to consult — without them a container answers `false` to
+// respond_to?(:map), which duck-typing code reads as "not enumerable".
+// eql? — == with no numeric conversion, so 1.eql?(1.0) is false. Containers
+// compare element-wise by the same rule ([1].eql?([1.0]) is false too).
+and rb_eql = fn (a: Val) -> fn (b: Val) ->
+  if str_eq (class_name a) (class_name b) then
+    (match a with
+     | VArr ia -> (match b with VArr ib -> val_eql_list (deref ia) (deref ib) | _ -> false)
+     | _ -> rb_eq a b)
+  else false
+
+and val_eql_list = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> true | _ -> false)
+  | Cons (x, xt) ->
+    (match ys with
+     | Nil -> false
+     | Cons (y, yt) -> if rb_eql x y then val_eql_list xt yt else false)
+
+and is_arr_method = fn (name: str) ->
+  str_eq name "length" || str_eq name "size" || str_eq name "push" || str_eq name "append" ||
+  str_eq name "pop" || str_eq name "shift" || str_eq name "unshift" || str_eq name "prepend" ||
+  str_eq name "map" || str_eq name "collect" || str_eq name "map!" || str_eq name "collect!" ||
+  str_eq name "select" || str_eq name "filter" || str_eq name "select!" || str_eq name "filter!" ||
+  str_eq name "reject" || str_eq name "reject!" || str_eq name "find" || str_eq name "detect" ||
+  str_eq name "find_index" || str_eq name "index" || str_eq name "rindex" || str_eq name "include?" ||
+  str_eq name "first" || str_eq name "last" || str_eq name "each" || str_eq name "each_index" ||
+  str_eq name "each_with_index" || str_eq name "each_with_object" || str_eq name "reverse" ||
+  str_eq name "reverse!" || str_eq name "reverse_each" || str_eq name "sort" || str_eq name "sort!" ||
+  str_eq name "sort_by" || str_eq name "join" || str_eq name "flatten" || str_eq name "flatten!" ||
+  str_eq name "compact" || str_eq name "compact!" || str_eq name "uniq" || str_eq name "uniq!" ||
+  str_eq name "empty?" || str_eq name "[]" || str_eq name "[]=" || str_eq name "slice" ||
+  str_eq name "slice!" || str_eq name "concat" || str_eq name "reduce" || str_eq name "inject" ||
+  str_eq name "to_a" || str_eq name "to_ary" || str_eq name "count" || str_eq name "min" ||
+  str_eq name "max" || str_eq name "minmax" || str_eq name "sum" || str_eq name "zip" ||
+  str_eq name "take" || str_eq name "take_while" || str_eq name "drop" || str_eq name "drop_while" ||
+  str_eq name "group_by" || str_eq name "partition" || str_eq name "flat_map" ||
+  str_eq name "any?" || str_eq name "all?" || str_eq name "none?" || str_eq name "one?" ||
+  str_eq name "delete" || str_eq name "delete_at" || str_eq name "delete_if" || str_eq name "keep_if" ||
+  str_eq name "clear" || str_eq name "replace" || str_eq name "fill" || str_eq name "insert" ||
+  str_eq name "rotate" || str_eq name "sample" || str_eq name "shuffle" || str_eq name "at" ||
+  str_eq name "fetch" || str_eq name "values_at" || str_eq name "assoc" || str_eq name "tally" ||
+  str_eq name "each_slice" || str_eq name "each_cons" || str_eq name "cycle"
+
+and is_hash_method = fn (name: str) ->
+  str_eq name "length" || str_eq name "size" || str_eq name "[]" || str_eq name "[]=" ||
+  str_eq name "store" || str_eq name "fetch" || str_eq name "delete" || str_eq name "each" ||
+  str_eq name "each_pair" || str_eq name "each_key" || str_eq name "each_value" ||
+  str_eq name "keys" || str_eq name "values" || str_eq name "key" || str_eq name "key?" ||
+  str_eq name "has_key?" || str_eq name "include?" || str_eq name "member?" ||
+  str_eq name "value?" || str_eq name "has_value?" || str_eq name "empty?" ||
+  str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
+  str_eq name "select!" || str_eq name "filter!" || str_eq name "reject" || str_eq name "reject!" ||
+  str_eq name "merge" || str_eq name "merge!" || str_eq name "update" || str_eq name "to_a" ||
+  str_eq name "to_h" || str_eq name "to_hash" || str_eq name "invert" || str_eq name "sort" ||
+  str_eq name "sort_by" || str_eq name "min_by" || str_eq name "max_by" || str_eq name "count" ||
+  str_eq name "sum" || str_eq name "find" || str_eq name "detect" || str_eq name "any?" ||
+  str_eq name "all?" || str_eq name "none?" || str_eq name "group_by" || str_eq name "partition" ||
+  str_eq name "each_with_object" || str_eq name "each_with_index" || str_eq name "reduce" ||
+  str_eq name "inject" || str_eq name "dig" || str_eq name "values_at" || str_eq name "fetch_values" ||
+  str_eq name "transform_values" || str_eq name "transform_keys" || str_eq name "delete_if" ||
+  str_eq name "keep_if" || str_eq name "clear" || str_eq name "replace" || str_eq name "default" ||
+  str_eq name "default=" || str_eq name "compact" || str_eq name "except" || str_eq name "slice" ||
+  str_eq name "flat_map" || str_eq name "sort!" || str_eq name "first"
+
+// Ruby gives several builtin methods two names for the same implementation, so
+// `String.instance_method(:size) == String.instance_method(:length)` is true.
+// Dispatch treats them as separate names; this collapses each pair onto one
+// canonical name so reflection can see that they are one method.
+and canon_alias = fn (cls: str) -> fn (n: str) ->
+  if str_eq cls "String" then
+    (if str_eq n "size" then "length"
+     else if str_eq n "===" then "=="
+     else if str_eq n "dedup" then "-@"
+     else if str_eq n "next" then "succ"
+     else if str_eq n "next!" then "succ!"
+     else if str_eq n "intern" then "to_sym"
+     else if str_eq n "slice" then "[]"
+     else if str_eq n "to_str" then "to_s"
+     else n)
+  else if str_eq cls "Array" then
+    (if str_eq n "length" then "size"
+     else if str_eq n "append" then "push"
+     else if str_eq n "collect" then "map"
+     else if str_eq n "collect!" then "map!"
+     else if str_eq n "detect" then "find"
+     else if str_eq n "filter" then "select"
+     else if str_eq n "filter!" then "select!"
+     else if str_eq n "index" then "find_index"
+     else if str_eq n "prepend" then "unshift"
+     else if str_eq n "slice" then "[]"
+     else if str_eq n "to_s" then "inspect"
+     else n)
+  else if str_eq cls "Hash" then
+    (if str_eq n "size" then "length"
+     else if str_eq n "each" then "each_pair"
+     else if str_eq n "filter" then "select"
+     else if str_eq n "filter!" then "select!"
+     else if str_eq n "has_key?" then "include?"
+     else if str_eq n "key?" then "include?"
+     else if str_eq n "member?" then "include?"
+     else if str_eq n "has_value?" then "value?"
+     else if str_eq n "store" then "[]="
+     else if str_eq n "update" then "merge!"
+     else if str_eq n "to_s" then "inspect"
+     else n)
+  else n
+
+// does builtin class `cls` provide method `name`? (reflection only)
+and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
+  if str_eq cls "String" then is_str_method name || is_prim_method name
+  else if str_eq cls "Array" then is_arr_method name || is_prim_method name
+  else if str_eq cls "Hash" then is_hash_method name || is_prim_method name
+  else is_prim_method name
 
 // a curated set of universally-available primitive method names.
 and is_prim_method = fn (name: str) ->
@@ -11307,6 +11479,7 @@ and is_prim_method = fn (name: str) ->
   str_eq name "instance_of?" || str_eq name "respond_to?" || str_eq name "send" ||
   str_eq name "__send__" || str_eq name "public_send" || str_eq name "hash" ||
   str_eq name "object_id" || str_eq name "==" || str_eq name "!=" || str_eq name "equal?" ||
+  str_eq name "eql?" ||
   // reflection primitives, so respond_to? and implicit-self dispatch reach them
   str_eq name "instance_variable_get" || str_eq name "instance_variable_set" ||
   str_eq name "instance_variable_defined?" || str_eq name "instance_variables" ||
@@ -11465,7 +11638,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // and mere-ruby strings are handles, so a fresh frozen copy behaves the
   // same for every operation except equal?.) String#+@ is the inverse: a
   // mutable string, dup'd only when the receiver is frozen.
-  else if str_eq name "-@" then
+  else if str_eq name "-@" || str_eq name "dedup" then
     (match recv with
      | VStr id -> if sfrozen_get id then recv else (let s2 = mkstr (sget id) in (match s2 with VStr h2 -> let _ = sfrozen_set h2 in s2 | _ -> s2))
      | _ -> recv)
@@ -11484,6 +11657,59 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VStr sp -> let sp = sget sp in VRegex (sp, (match args with Cons (VStr f, _) -> sget f | _ -> "")) | _ -> fail "no __regex")
   else if str_eq name "source" then
     (match recv with VRegex (p, _) -> mkstr p | _ -> fail "no source")
+  // casecmp is the three-way form of casecmp? (nil when the other side is
+  // not a string, which is how callers tell "incomparable" from "unequal").
+  else if str_eq name "casecmp" then
+    (match recv with
+     | VStr a -> let a = str_downcase (sget a) in
+       (match args with
+        | Cons (VStr b2, _) -> let b2 = str_downcase (sget b2) in
+          VInt (let c = str_compare a b2 in if c < 0 then 0 - 1 else if c > 0 then 1 else 0)
+        | _ -> VNil)
+     | _ -> fail "no casecmp")
+  // byte-level access. mere-ruby strings are byte-safe (a length header, not
+  // NUL termination), so these are plain indexing rather than a re-encode.
+  else if str_eq name "getbyte" then
+    (match recv with
+     | VStr h -> let a = sget h in
+       (match args with
+        | Cons (VInt i0, _) -> let i = if i0 < 0 then i0 + str_len a else i0 in
+          if i < 0 || i >= str_len a then VNil else VInt (ord (char_at a i))
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
+        | _ -> VNil)
+     | _ -> fail "no getbyte")
+  else if str_eq name "setbyte" then
+    (match recv with
+     | VStr h -> let a = sget h in
+       (match args with
+        | Cons (VInt i0, Cons (VInt b, _)) ->
+          let i = if i0 < 0 then i0 + str_len a else i0 in
+          if i < 0 || i >= str_len a then VNil
+          else let _ = sset h (substring a 0 i ++ chr b ++ substring a (i + 1) (str_len a)) in VInt b
+        | _ -> VNil)
+     | _ -> fail "no setbyte")
+  else if str_eq name "byteslice" then
+    (match recv with
+     | VStr h -> let a = sget h in let len = str_len a in
+       (match args with
+        | Cons (VInt i0, Cons (VInt n0, _)) ->
+          let i = if i0 < 0 then i0 + len else i0 in
+          if i < 0 || i > len || n0 < 0 then VNil
+          else mkstr (substring a i (if i + n0 > len then len else i + n0))
+        | Cons (VInt i0, _) ->
+          let i = if i0 < 0 then i0 + len else i0 in
+          if i < 0 || i >= len then VNil else mkstr (substring a i (i + 1))
+        | _ -> VNil)
+     | _ -> fail "no byteslice")
+  else if str_eq name "byteindex" || str_eq name "byterindex" then
+    (match recv with
+     | VStr h -> let a = sget h in
+       (match args with
+        | Cons (VStr sb, _) -> let sb = sget sb in
+          if str_eq name "byteindex" then (let i = str_find_from a sb 0 in if i < 0 then VNil else VInt i)
+          else (let i = str_rindex_go a sb (str_len a - str_len sb) in if i < 0 then VNil else VInt i)
+        | _ -> VNil)
+     | _ -> fail "no byteindex")
   else if str_eq name "casecmp?" then
     (match recv with
      | VStr a -> let a = sget a in (match args with Cons (VStr b2, _) -> let b2 = sget b2 in VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
@@ -11495,7 +11721,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> fail "no ord")
   else if str_eq name "chr" then
     (match recv with VInt n -> mkstr (chr n) | VStr sv -> let sv = sget sv in mkstr (utf8_char sv 0) | _ -> fail "no chr")
-  else if str_eq name "to_sym" then
+  else if str_eq name "to_sym" || str_eq name "intern" then
     (match recv with VStr s -> let s = sget s in VSym s | VSym s -> VSym s | _ -> fail "no to_sym")
   // the implicit-conversion protocol: unlike to_s / to_a / to_i these exist
   // only on the type itself, which is exactly what makes them useful for
@@ -11508,6 +11734,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VInt _ -> recv | VBig _ -> recv | _ -> fail "no to_int")
   else if str_eq name "to_hash" then
     (match recv with VHsh _ -> recv | _ -> fail "no to_hash")
+  // eql? is == without any numeric conversion, so it also demands one class.
+  else if str_eq name "eql?" then
+    (match args with Cons (b, _) -> VBool (rb_eql recv b) | _ -> VBool false)
   else if str_eq name "equal?" then
     (match args with Cons (b, _) -> VBool (rb_identical recv b) | _ -> VBool false)
   else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
@@ -11971,7 +12200,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // `1.step(10, 3).to_a`/`.each`/`.map` work like the Range form.
      | VInt lo -> (match args with Cons (VInt limit, Cons (VInt n, _)) -> arr_new (range_step_arr lo limit n) | Cons (VInt limit, _) -> arr_new (range_step_arr lo limit 1) | _ -> fail "no step")
      | _ -> fail "no step")
-  else if str_eq name "index" then
+  else if str_eq name "index" || (str_eq name "find_index" && (match recv with VArr _ -> true | _ -> false)) then
     (match recv with
      | VArr id -> (match args with Cons (v, _) -> val_index_of (deref id) v 0 | _ -> VNil)
      | VStr s -> let s = sget s in (match args with Cons (VStr sub, Cons (VInt off, _)) -> let st = (if off < 0 then str_len s + off else off) in let i = str_find_from s (sget sub) (if st < 0 then 0 else st) in (if i < 0 then VNil else VInt i) | Cons (VStr sub, _) -> let i = str_find_from s (sget sub) 0 in (if i < 0 then VNil else VInt i) | _ -> VNil)
@@ -12073,6 +12302,30 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let _ = arr_set id (vtake xs (len - k)) in arr_new (vdrop xs (len - k))
         | _ -> (match xs with Nil -> VNil | _ -> let _ = arr_set id (val_init xs) in val_last xs))
      | _ -> fail "no pop")
+  // Array#at(i): index without the slice forms (negative counts from the end).
+  else if str_eq name "at" then
+    (match recv with
+     | VArr id ->
+       let xs = deref id in
+       let len = val_list_len xs in
+       (match args with
+        | Cons (VInt i0, _) -> let i = if i0 < 0 then i0 + len else i0 in
+          if i < 0 || i >= len then VNil else val_nth xs i
+        | _ -> VNil)
+     | _ -> fail "no at")
+  // Array#delete_at(i): remove and return that element (nil if out of range).
+  else if str_eq name "delete_at" then
+    (match recv with
+     | VArr id ->
+       let xs = deref id in
+       let len = val_list_len xs in
+       (match args with
+        | Cons (VInt i0, _) -> let i = if i0 < 0 then i0 + len else i0 in
+          if i < 0 || i >= len then VNil
+          else let v = val_nth xs i in
+               let _ = arr_set id (list_append (vtake xs i) (vdrop xs (i + 1))) in v
+        | _ -> VNil)
+     | _ -> fail "no delete_at")
   // Array#slice!(i) / slice!(start, len) / slice!(range): cut the elements out
   // and return them (nil / the element, matching Array#slice's return shape).
   else if str_eq name "slice!" then
@@ -12163,6 +12416,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "merge!" || str_eq name "update" then
     (match recv with VHsh h -> let _ = hset h (hash_merge_all (hderef h) args) in recv | _ -> fail "no merge!")
   else if str_eq name "default" then (match recv with VHsh hid -> hdflt_get hid | _ -> VNil)
+  // replace swaps the contents in place, so every alias of the hash sees it.
+  else if str_eq name "replace" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     | VHsh h -> (match args with Cons (VHsh o, _) -> let _ = hset h (hderef o) in recv | _ -> recv)
+     | _ -> recv)
+  else if str_eq name "fetch_values" then
+    (match recv with
+     | VHsh xs -> let xs = hderef xs in arr_new (hash_fetch_values xs args)
+     | _ -> fail "no fetch_values")
+  else if str_eq name "except" then
+    (match recv with VHsh xs -> mkhash (hash_except (hderef xs) args) | _ -> fail "no except")
   else if str_eq name "invert" then
     (match recv with VHsh xs -> mkhash (hash_invert (hderef xs)) | _ -> fail "no invert")
   else if str_eq name "fetch" then
@@ -15148,10 +15412,15 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
        | FRaise _ ->
          if str_eq flowk "" then
            let exc = (if map_has ivars "$exc" then map_get ivars "$exc"
+                      else if map_has prim_missing "c" then
+                        VExc ((match map_get prim_missing "c" with VStr h -> sget h | _ -> "StandardError"),
+                              (match map_get prim_missing "m" with VStr h -> sget h | _ -> ""))
                       else if map_has prim_missing "n" then VExc ("NoMethodError", "undefined method '" ++ (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") ++ "'")
                       else VExc ("StandardError", "error")) in
            let _ = map_delete ivars "$exc" in
            let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
+           let _ = if map_has prim_missing "c" then map_delete prim_missing "c" else () in
+           let _ = if map_has prim_missing "m" then map_delete prim_missing "m" else () in
            run_rescues env world blk exc rescues
          else FRaise VNil   // flow pending — skip rescue
        | FReturn v -> FReturn v

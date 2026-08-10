@@ -10,12 +10,16 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 - **CRASH** mere-ruby aborts where ruby does not (missing feature)
 - **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable)
 
+> **Sweep dates.** `language` and `core/{string,array,hash}` were re-measured on 2026-08-10
+> against the current ruby/spec; the other rows are from an earlier sweep against an older
+> revision of the suite and read a little high. Re-run `scoreboard.sh` to refresh them.
+
 | group | MATCH | DIFF | CRASH | SKIP | total |
 |---|---|---|---|---|---|
-| language | 43 | 15 | 7 | 2 | 67 |
-| core/string | 28 | 83 | 2 | 1 | 114 |
-| core/array | 27 | 70 | 5 | 0 | 102 |
-| core/hash | 25 | 43 | 1 | 0 | 69 |
+| language | 41 | 16 | 7 | 3 | 67 |
+| core/string | 23 | 65 | 2 | 24 | 114 |
+| core/array | 26 | 73 | 6 | 0 | 105 |
+| core/hash | 22 | 45 | 2 | 0 | 69 |
 | core/integer | 22 | 38 | 2 | 5 | 67 |
 | core/float | 33 | 15 | 2 | 0 | 50 |
 | core/numeric | 29 | 11 | 5 | 1 | 46 |
