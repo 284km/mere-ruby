@@ -678,6 +678,11 @@ let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
 // prim_method has no `world` to build an exception, so its terminal
 // "undefined method" failure parks the method name here; the begin/rescue
 // catch site turns it into a proper NoMethodError (Ruby's class for it).
+// Module#autoload: a constant that names a file to load the first time the
+// constant is read. Keyed by the qualified constant ("Gem::Requirement") or
+// the bare name at top level; the entry is removed before the file runs, so a
+// file that fails to define the constant cannot loop.
+let autoloads = map_new ();
 let prim_missing = map_new ();
 // prim_method has no `world` to build an exception with, so a TYPED failure
 // parks its class and message here and fails; the begin/rescue catch site
@@ -6396,6 +6401,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          if str_eq rc "Object" && map_has consts cn then map_get consts cn
          else if has_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
+         else if autoload_fire env world blk name then eval_e env world blk (EConst name)
          else raise_exc world "NameError" ("uninitialized constant " ++ name))
     else
       let cref = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
@@ -6403,6 +6409,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let key = lex_const_key cref name in
       if (if str_eq key "" then false else true) then map_get consts key
       else if map_has consts name then map_get consts name
+      // an autoload registered under the lexical scope, or at top level
+      else if autoload_fire env world blk (if str_eq cref "" then name else cref ++ "::" ++ name)
+              || autoload_fire env world blk name then eval_e env world blk (EConst name)
       else raise_exc world "NameError" ("uninitialized constant " ++ name)
   | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
   | EScopedRead (recv_e, cn) ->
@@ -6411,6 +6420,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let key = c ++ "::" ++ cn in
        if map_has consts key then map_get consts key
        else if map_has consts cn then map_get consts cn
+       else if autoload_fire env world blk key || autoload_fire env world blk cn then
+         (if map_has consts key then map_get consts key
+          else if map_has consts cn then map_get consts cn
+          else raise_exc world "NameError" ("uninitialized constant " ++ cn))
        else raise_exc world "NameError" ("uninitialized constant " ++ cn)
      // `obj::CONST` where obj is not a class/module is a TypeError (Ruby).
      | other -> raise_exc world "TypeError" (inspect other ++ " is not a class/module"))
@@ -6742,7 +6755,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // File.dirname(File.realpath(__FILE__))). A relative script dir is joined
     // with PWD.
     else if str_eq name "__dir__" then
-      (let d = dirname_of (script_file ()) in
+      // the directory of the file this expression is IN, which during a
+      // require is the required file's — that is how a library points at its
+      // own siblings (File.expand_path("x", __dir__)). load_ctx tracks it for
+      // require_relative already; script_file is only the fallback.
+      (let d = (if map_has load_ctx "dir"
+                then (match map_get load_ctx "dir" with VStr h -> sget h | _ -> dirname_of (script_file ()))
+                else dirname_of (script_file ())) in
        mkstr (if str_len d > 0 && str_eq (char_at d 0) "/" then d
               else if str_eq d "." then env_get "PWD"
               else env_get "PWD" ++ "/" ++ d))
@@ -6806,7 +6825,28 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     // Kernel conversion functions: Integer()/Float()/String()/Array()/
     // Rational()/Complex()/Hash().
-    if str_eq name "Integer" then
+    // top-level `autoload :Const, "path"` (implicit self is main, so it
+    // registers in Object's namespace like Ruby's Kernel#autoload).
+    if str_eq name "autoload" && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
+      (match args with
+       | Cons (nm, Cons (pv, _)) ->
+         let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+         // a bare autoload inside a module body registers in THAT module, not
+         // at top level: self is the module there.
+         let ns = (match lv_get env "self" with VClass c0 -> (if str_eq c0 "Object" then "" else c0) | _ -> "") in
+         let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
+         let _ = map_set autoloads key (mkstr (match pv with VStr h -> sget h | _ -> "")) in
+         VNil
+       | _ -> VNil)
+    else if str_eq name "autoload?" && (match args with Cons (_, _) -> true | _ -> false) then
+      (match args with
+       | Cons (nm, _) ->
+         let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+         let ns = (match lv_get env "self" with VClass c0 -> (if str_eq c0 "Object" then "" else c0) | _ -> "") in
+         let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
+         (if map_has autoloads key then map_get autoloads key else VNil)
+       | _ -> VNil)
+    else if str_eq name "Integer" then
       (match args with
        | Cons (VInt n, _) -> VInt n
        | Cons (VBig s, _) -> VBig s
@@ -8953,6 +8993,18 @@ and arr_assoc_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (
        if rb_eq_w env world cand k then h else arr_assoc_w env world t k pos
      | _ -> arr_assoc_w env world t k pos)
 
+// If `key` has a pending autoload, consume it and load the file. Returns
+// whether anything was loaded, so the caller can retry the lookup.
+and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
+  if map_has autoloads key then
+    (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
+     // removed FIRST: a file that does not define the constant must fail as a
+     // NameError, not spin here.
+     let _ = map_delete autoloads key in
+     if str_eq path "" then false
+     else (let _ = exec_stmt env world blk (SRequire (false, EStrL path)) in true))
+  else false
+
 and inspect_w = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VObj oid ->
@@ -9563,11 +9615,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with Cons (VStr ph, _) -> mkstr (dirname_of (sget ph)) | _ -> mkstr "")
        else if str_eq name "join" then mkstr (file_join_go args "")
        else if str_eq name "expand_path" then
+         // File.expand_path(path[, base]): a relative path resolves against
+         // base when given (that is how a library says "next to this file",
+         // File.expand_path("x", __dir__)), and against the CWD otherwise.
          (match args with
-          | Cons (VStr ph, _) ->
+          | Cons (VStr ph, rest) ->
             (let path = sget ph in
              if str_len path > 0 && str_eq (char_at path 0) "/" then mkstr path
-             else mkstr (env_get "PWD" ++ "/" ++ path))
+             else
+               let base = (match rest with
+                           | Cons (VStr b, _) -> let b = sget b in
+                             (if str_len b > 0 && str_eq (char_at b 0) "/" then b
+                              else env_get "PWD" ++ "/" ++ b)
+                           | _ -> env_get "PWD") in
+               mkstr (base ++ "/" ++ path))
           | _ -> mkstr "")
        else if str_eq name "delete" || str_eq name "unlink" then
          (match args with
@@ -9922,6 +9983,25 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (v, _) -> let n = to_s v in (if map_has consts n then map_get consts n
                                            else if map_has consts (c ++ "::" ++ n) then map_get consts (c ++ "::" ++ n)
                                            else raise_exc world "NameError" ("uninitialized constant " ++ n))
+       | _ -> VNil)
+    // Module#autoload(:Const, path) / #autoload?(:Const). The registration is
+    // qualified with the receiver, so Gem.autoload :Requirement, "..." answers
+    // a later Gem::Requirement.
+    else if str_eq name "autoload" then
+      (match args with
+       | Cons (nm, Cons (pv, _)) ->
+         let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+         let pth = (match pv with VStr h -> sget h | _ -> "") in
+         let key = (if str_eq c "Object" then cn else c ++ "::" ++ cn) in
+         let _ = map_set autoloads key (mkstr pth) in
+         VNil
+       | _ -> VNil)
+    else if str_eq name "autoload?" then
+      (match args with
+       | Cons (nm, _) ->
+         let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+         let key = (if str_eq c "Object" then cn else c ++ "::" ++ cn) in
+         (if map_has autoloads key then map_get autoloads key else VNil)
        | _ -> VNil)
     // Module#deprecate_constant marks a constant as deprecated; the constant
     // keeps working and CRuby only warns on use, which mere-ruby does not do.
