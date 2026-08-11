@@ -8,10 +8,17 @@ hierarchies, `map`/`select`/`reduce` chains, hashes) prints byte-identical
 output to the reference `ruby`.
 
 ```sh
-mere -c main.mere > mr.c && clang -O2 mr.c -o mere-ruby
+mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x8000000 mr.c -o mere-ruby
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ```
+
+`-stack_size` is not optional. Parsing and evaluating recurse over the
+statement list, so native stack use grows with program size; on the
+default 8 MB main-thread stack a program of roughly 8000 statements
+segfaults before the interpreter's own `SystemStackError` guard can see
+it. 128 MB puts the ceiling out of reach of real input. See
+[PAIN.md](PAIN.md) §M9.
 
 ## In the browser
 

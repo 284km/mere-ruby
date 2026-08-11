@@ -3,6 +3,51 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
+## M9. Native stack, not heap, is what a big input costs — and a Mere program cannot raise its own
+
+Loading a dozen real gems into one process died with SIGSEGV, while any
+one of them alone was fine. Two earlier "it must be the stack"
+hypotheses in this project had both turned out wrong, so this one was
+measured rather than assumed — and it reduced to three programs with no
+gems in sight:
+
+```ruby
+def m0; 0; end        # ... x N
+a = [1, 1, 1, ...]    # N elements
+x = 1 + 1 + 1 + ...   # N terms
+```
+
+All three crash, and all three crash at the *same* scale: N=4000 runs,
+N=8000 segfaults. Not a gem mechanism at all — **program size**. The
+interpreter's walk over a statement list, an argument list, or a
+left-leaning expression spine is ordinary non-tail recursion, so native
+stack use is O(input length), and macOS hands the main thread 8 MB.
+Raising `ulimit -s` to 64 MB made all three pass unchanged, which is
+what turned a guess into a measurement.
+
+The Ruby-visible half of this was already handled: mere-ruby counts
+interpreter depth and raises `SystemStackError` for runaway *Ruby*
+recursion. But that counter never sees the parser, so a program that is
+merely long dies below it, in C, with no diagnosis.
+
+The pain is that Mere has no answer of its own here. A program cannot
+grow its own stack (no thread with a chosen stack size, no `setrlimit`
+binding), and the recursion is idiomatic Mere — variant + `match` +
+recursion over `list` is *the* shape for a compiler, and the C backend
+does not turn it into a loop. So the fix has to live outside the
+language, in the link step of whatever embeds it:
+
+```sh
+clang -O2 -Wl,-stack_size,0x8000000 mr.c -o mere-ruby
+```
+
+128 MB, and the 12-gem batch runs to completion. It is the right fix —
+one flag, no code change, and the `SystemStackError` guard still trips
+exactly as before for genuine infinite recursion, so nothing is masked.
+But it is a fix a Mere user has to already know to reach for, and the
+Wasm backend, whose stack is fixed by the host, has no equivalent knob
+at all.
+
 ## M7. `Map` is a linear-scan assoc array — a dense-int-keyed store degrades O(n²)
 
 Ruby strings are mutable reference types, so the interpreter's `VStr`
