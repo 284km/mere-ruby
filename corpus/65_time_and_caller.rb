@@ -37,3 +37,40 @@ p Time.utc(2020, 5, 6).ymd
 # Kernel#caller: mere-ruby keeps no call stack, so the array is empty
 p caller.class, caller.empty?
 p caller_locations.class
+
+# Constants come from the ancestors of the enclosing class too: an included
+# module's constants are visible in the including class, and a subclass sees
+# its superclass's.
+module Holder
+  module PAT
+    ESC = "esc"
+  end
+  TOP = "top"
+end
+class UserOfHolder
+  include Holder
+  def a; PAT::ESC; end
+  def b; TOP; end
+end
+p UserOfHolder.new.a, UserOfHolder.new.b
+
+class BaseWithConst
+  BK = "base"
+end
+class SubOfBase < BaseWithConst
+  def c; BK; end
+end
+p SubOfBase.new.c
+
+# ...but the lexical scope still wins over an ancestor's
+module Outer2
+  SHARED = :lexical
+  module Mixin
+    SHARED = :from_mixin
+  end
+  class Both
+    include Mixin
+    def which; SHARED; end
+  end
+end
+p Outer2::Both.new.which
