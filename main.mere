@@ -7044,6 +7044,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let _ = map_set bind_store (str_of_int id) (lv_flat env) in
       VBind id
     // paren-less Kernel#rand / gets / readline / readlines (`line = gets`).
+    else if (str_eq name "caller" || str_eq name "caller_locations") && (if map_has meths name then false else true) then arr_new Nil
     else if str_eq name "print" && (if map_has meths "print" then false else true) then VNil
     else if str_eq name "rand" && (if map_has meths "rand" then false else true) then rand_val world Nil
     else if str_eq name "srand" && (if map_has meths "srand" then false else true) then VInt 0
@@ -7540,6 +7541,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if (str_eq op "==" || str_eq op "eql?")
                && (str_eq ocl "Method" || str_eq ocl "UnboundMethod" || exc_is_a world ocl "Exception")
                && (if has_meth world ocl op then false else true) then
+         invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
+       // Time's arithmetic is a primitive, not an entry in the method table.
+       else if str_eq ocl "Time" && (str_eq op "+" || str_eq op "-") then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        else eval_bin_prim env world blk op va0 b
      // a class-level operator (def self.<<) dispatches too.
@@ -9459,19 +9463,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               || str_eq name "to_time" || str_eq name "utc?"
               || str_eq name "year" || str_eq name "month" || str_eq name "mon"
               || str_eq name "day" || str_eq name "mday" || str_eq name "hour"
-              || str_eq name "min" || str_eq name "sec") then
+              || str_eq name "min" || str_eq name "sec"
+              || str_eq name "wday" || str_eq name "yday" || str_eq name "usec"
+              || str_eq name "+" || str_eq name "-") then
     (match recv with
      | VObj oid ->
        let (_, _, _, iv9) = world in
        let k = str_of_int oid ++ "@__utc" in
-       if str_eq name "to_i" then
-         (if map_has iv9 (str_of_int oid ++ "@__epoch")
-          then map_get iv9 (str_of_int oid ++ "@__epoch")
-          else VInt (time_ord_of world recv))
+       // #to_i is epoch seconds. A Time built from calendar parts only carries
+       // the packed ordinal, which is monotonic but is NOT an epoch, so it has
+       // to be converted rather than handed back.
+       if str_eq name "to_i" then prim_time_epoch world recv
        else if str_eq name "utc?" then VBool (map_has iv9 k)
        // .utc / .getutc mark the zone; Time.now is local, so utc? is false
        // until one of them is called.
        else if str_eq name "utc" || str_eq name "getutc" then (let _ = map_set iv9 k (VBool true) in recv)
+       // Time + n / Time - n shift by seconds; Time - Time is the difference
+       // in seconds (a Float in Ruby).
+       else if str_eq name "+" || str_eq name "-" then
+         (let ep = (match prim_time_epoch world recv with VInt n -> n | _ -> 0) in
+          match args with
+          | Cons (VObj oid2, _) ->
+            (if str_eq name "-" then VFlt (float_of_int (ep - (match prim_time_epoch world (VObj oid2) with VInt n -> n | _ -> 0)))
+             else raise_exc world "TypeError" "time + time?")
+          | Cons (v, _) ->
+            (let d = (match v with VInt n -> n | VFlt f -> int_of_float f | _ -> 0) in
+             make_time_at world (if str_eq name "-" then ep - d else ep + d))
+          | _ -> recv)
+       // 1970-01-01 was a Thursday, so day 0 is wday 4.
+       else if str_eq name "wday" then
+         (let ep = (match prim_time_epoch world recv with VInt n -> n | _ -> 0) in
+          VInt (imod (idiv_floor ep 86400 + 4) 7))
+       else if str_eq name "yday" then
+         (let (yy, mo, dd, hh, mi, ss) = time_parts (time_ord_of world recv) in
+          VInt (yday_of yy mo dd))
+       else if str_eq name "usec" then VInt 0
        else if str_eq name "year" || str_eq name "month" || str_eq name "mon"
             || str_eq name "day" || str_eq name "mday" || str_eq name "hour"
             || str_eq name "min" || str_eq name "sec" then
@@ -13959,6 +13985,11 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   // main thread it is a scheduling no-op (there is nobody to switch to).
   else if str_eq name "sleep" && (match args with Nil -> true | Cons (VInt _, _) -> true | Cons (VFlt _, _) -> true | _ -> false) then
     (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+  // Kernel#caller / caller_locations: mere-ruby keeps no call stack, so the
+  // honest answer is an empty backtrace rather than a NoMethodError. Callers
+  // that log it print nothing; callers that index it get nil.
+  else if (str_eq name "caller" || str_eq name "caller_locations") && (if map_has meths name then false else true) then
+    arr_new Nil
   // Kernel#rand: a Float in [0, 1) with no argument, an Integer in [0, n)
   // with a positive one, and a member of a Range.
   else if (str_eq name "rand" || str_eq name "srand") && (if map_has meths name then false else true) then
@@ -14083,6 +14114,10 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
        // the receiver dispatcher, exactly as `self.name` would; a genuinely
        // undefined bare name still raises NameError.
        else if is_enum_method name || responds world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
+       // a synthetic class's methods live in the primitive dispatcher, not the
+       // method table, so an implicit-self call inside a reopened Time (or
+       // MatchData, ...) has to be routed there too.
+       else if str_eq cls "Time" || str_eq cls "MatchData" then invoke_val_c env world noblk (VObj id) name args false
        else undef_call_exc world name args
      | VMain ->
        if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
@@ -15791,6 +15826,88 @@ and stdlib_src = fn (name: str) ->
     "    alphanumeric(((n * 4) + 2) / 3)\n" ++
     "  end\n" ++
     "end\n"
+  // `time`: the formatters and a parser for the shapes libraries exchange.
+  // NOT the full stdlib -- mere-ruby's Time has no zone, so a parsed time
+  // without one is UTC where CRuby would make it local.
+  else if str_eq n "time" then
+    "# A subset of the stdlib `time`, built on mere-ruby's Time -- which has no\n" ++
+    "# concept of a zone and is always UTC. So `Time.parse(\"2023-11-15 07:13:20\")`\n" ++
+    "# reads that as UTC, where CRuby would read it as local time.\n" ++
+    "class Time\n" ++
+    "  RFC2822_DAY_NAME = %w[Sun Mon Tue Wed Thu Fri Sat]\n" ++
+    "  RFC2822_MONTH_NAME = %w[Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec]\n" ++
+    "\n" ++
+    "  def self.pad2(n)\n" ++
+    "    n < 10 ? \"0\" + n.to_s : n.to_s\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.pad4(n)\n" ++
+    "    s = n.to_s\n" ++
+    "    s = \"0\" + s while s.length < 4\n" ++
+    "    s\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def iso8601(_fraction_digits = 0)\n" ++
+    "    Time.pad4(year) + \"-\" + Time.pad2(month) + \"-\" + Time.pad2(day) +\n" ++
+    "      \"T\" + Time.pad2(hour) + \":\" + Time.pad2(min) + \":\" + Time.pad2(sec) + \"Z\"\n" ++
+    "  end\n" ++
+    "  alias_method :xmlschema, :iso8601\n" ++
+    "\n" ++
+    "  def httpdate\n" ++
+    "    RFC2822_DAY_NAME[wday] + \", \" + Time.pad2(day) + \" \" +\n" ++
+    "      RFC2822_MONTH_NAME[month - 1] + \" \" + Time.pad4(year) + \" \" +\n" ++
+    "      Time.pad2(hour) + \":\" + Time.pad2(min) + \":\" + Time.pad2(sec) + \" GMT\"\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def rfc2822\n" ++
+    "    RFC2822_DAY_NAME[wday] + \", \" + day.to_s + \" \" +\n" ++
+    "      RFC2822_MONTH_NAME[month - 1] + \" \" + Time.pad4(year) + \" \" +\n" ++
+    "      Time.pad2(hour) + \":\" + Time.pad2(min) + \":\" + Time.pad2(sec) + \" -0000\"\n" ++
+    "  end\n" ++
+    "  alias_method :rfc822, :rfc2822\n" ++
+    "\n" ++
+    "  def self.digits(str)\n" ++
+    "    str.scan(/\\d+/).map \{ |s| s.to_i }\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # Parses the shapes libraries actually exchange: ISO 8601 / XML Schema,\n" ++
+    "  # RFC 2822 and HTTP dates. Anything else raises, rather than guessing.\n" ++
+    "  def self.parse(str, _now = nil)\n" ++
+    "    s = str.to_s.strip\n" ++
+    "    m = /\\A(\\d\{4})-(\\d\{2})-(\\d\{2})(?:[Tt ](\\d\{2}):(\\d\{2})(?::(\\d\{2}))?)?/.match(s)\n" ++
+    "    if m\n" ++
+    "      return utc(m[1].to_i, m[2].to_i, m[3].to_i,\n" ++
+    "                 (m[4] || \"0\").to_i, (m[5] || \"0\").to_i, (m[6] || \"0\").to_i)\n" ++
+    "    end\n" ++
+    "    m = /(\\d\{1,2})\\s+([A-Za-z]\{3})\\s+(\\d\{4})\\s+(\\d\{2}):(\\d\{2}):(\\d\{2})/.match(s)\n" ++
+    "    if m\n" ++
+    "      mon = RFC2822_MONTH_NAME.index(m[2]) \n" ++
+    "      raise ArgumentError, \"no time information in #\{str.inspect}\" if mon.nil?\n" ++
+    "      return utc(m[3].to_i, mon + 1, m[1].to_i, m[4].to_i, m[5].to_i, m[6].to_i)\n" ++
+    "    end\n" ++
+    "    raise ArgumentError, \"no time information in #\{str.inspect}\"\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.iso8601(str)\n" ++
+    "    parse(str)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.xmlschema(str)\n" ++
+    "    parse(str)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.rfc2822(str)\n" ++
+    "    parse(str)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.rfc822(str)\n" ++
+    "    parse(str)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.httpdate(str)\n" ++
+    "    parse(str)\n" ++
+    "  end\n" ++
+    "end\n"
   else ""
 
 // --- glob ------------------------------------------------------------------
@@ -16448,6 +16565,50 @@ and civil_from_days = fn (z0: int) ->
   ((if m <= 2 then y + 1 else y), m, d)
 
 // the packed ordinal for an epoch-seconds instant (Time.now / Time.at).
+// the epoch seconds behind a Time value (the @__epoch ivar when it was built
+// from one, else derived from the packed ordinal).
+and prim_time_epoch = fn world -> fn (v: Val) ->
+  let (_, _, _, iv9) = world in
+  match v with
+  | VObj oid ->
+    (if map_has iv9 (str_of_int oid ++ "@__epoch") then map_get iv9 (str_of_int oid ++ "@__epoch")
+     else VInt (epoch_of_ord (time_ord_of world v)))
+  | _ -> VInt 0
+// floor division / modulo, so a pre-1970 epoch still lands on the right day.
+and idiv_floor = fn (a: int) -> fn (b: int) ->
+  let q = a / b in if a < 0 && q * b > a then q - 1 else q
+and imod = fn (a: int) -> fn (b: int) -> let m = a - (idiv_floor a b) * b in m
+// day of the year, 1-based.
+and yday_of = fn (y: int) -> fn (m: int) -> fn (d: int) ->
+  d + yday_months y 1 m 0
+and yday_months = fn (y: int) -> fn (i: int) -> fn (m: int) -> fn (acc: int) ->
+  if i >= m then acc else yday_months y (i + 1) m (acc + days_in_month y i)
+and days_in_month = fn (y: int) -> fn (m: int) ->
+  if m == 2 then (if is_leap_year y then 29 else 28)
+  else if m == 4 || m == 6 || m == 9 || m == 11 then 30
+  else 31
+and is_leap_year = fn (y: int) ->
+  (y - (y / 4) * 4 == 0 && (if y - (y / 100) * 100 == 0 then y - (y / 400) * 400 == 0 else true))
+// epoch seconds from a packed ordinal (the inverse of time_ord_of_epoch).
+and epoch_of_ord = fn (n: int) ->
+  let (y, mo, d, h, mi, sec) = time_parts n in
+  days_from_civil y mo d * 86400 + h * 3600 + mi * 60 + sec
+// days since 1970-01-01 (Hinnant's algorithm, the inverse of civil_from_days).
+and days_from_civil = fn (y0: int) -> fn (m: int) -> fn (d: int) ->
+  let y = (if m <= 2 then y0 - 1 else y0) in
+  let era = (if y >= 0 then y else y - 399) / 400 in
+  let yoe = y - era * 400 in
+  let doy = (153 * (if m > 2 then m - 3 else m + 9) + 2) / 5 + d - 1 in
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy in
+  era * 146097 + doe - 719468
+// a fresh Time object at these epoch seconds.
+and make_time_at = fn world -> fn (secs: int) ->
+  let (m9, s9, ocls9, iv9) = world in
+  let id = map_len ocls9 in
+  let _ = map_set ocls9 (str_of_int id) "Time" in
+  let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord_of_epoch secs)) in
+  let _ = map_set iv9 (str_of_int id ++ "@__epoch") (VInt secs) in
+  VObj id
 and time_ord_of_epoch = fn (secs: int) ->
   let days = (if secs >= 0 then secs / 86400 else (secs - 86399) / 86400) in
   let rem = secs - days * 86400 in
