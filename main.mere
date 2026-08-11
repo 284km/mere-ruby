@@ -2159,7 +2159,14 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
        | Cons (TId name, r2) ->
          (match r2 with
           | Cons (TP p, r3) ->
-            if is_lparen p then
+            // `recv.name (expr), more` (space before the paren): the group is
+            // the FIRST argument of a paren-less list, so a following comma
+            // continues that list and a trailing `.m` binds to the group --
+            // `a.insert (i || -1), v` is a two-argument call, not `insert(i)`.
+            if str_eq p " (" then
+              let (es, r4) = parse_puts_args r2 Nil in
+              attach_block_method recv name es r4
+            else if is_lparen p then
               let (argv, r4) = parse_call_args r3 in
               attach_block_method recv name argv r4
             else if str_eq p "=" then
@@ -2233,11 +2240,18 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
        | _ -> parse_postfix_more (EMethod (recv, "[]", idxs)) r3)
     // safe navigation: a&.b / a&.b(args) — nil receiver short-circuits.
     else if str_eq dot "&." then
-      (match r with
-       | Cons (TId name, r2) ->
-         (match r2 with
-          | Cons (TP p2, r3) ->
-            if str_eq p2 "(" then
+      let (name, r2) = safe_nav_name r in
+      (match r2 with
+       | Cons (TP p2, r3) ->
+            // space-paren: the group is the first of a paren-less argument
+            // list, exactly as for `.` above.
+            if str_eq p2 " (" then
+              let (es, r4) = parse_puts_args r2 Nil in
+              if starts_block r4 then
+                let (bp, bb, r5) = parse_block r4 in
+                parse_postfix_more (ESafeB (recv, name, es, bp, bb)) r5
+              else parse_postfix_more (ESafe (recv, name, es)) r4
+            else if str_eq p2 "(" then
               let (argv, r4) = parse_call_args r3 in
               if starts_block r4 then
                 let (bp, bb, r5) = parse_block r4 in
@@ -2254,8 +2268,12 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               let (bp, bb, r4) = parse_block r2 in
               parse_postfix_more (ESafeB (recv, name, Nil, bp, bb)) r4
             else parse_postfix_more (ESafe (recv, name, Nil)) r2
-          | _ -> parse_postfix_more (ESafe (recv, name, Nil)) r2)
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected method name after &.")) in fail "mere-ruby: expected method name after &."))
+       // `do` is a name token, so a do-block lands here rather than above.
+       | _ ->
+         if starts_block r2 then
+           let (bp, bb, r4) = parse_block r2 in
+           parse_postfix_more (ESafeB (recv, name, Nil, bp, bb)) r4
+         else parse_postfix_more (ESafe (recv, name, Nil)) r2)
     // scope resolution: Foo::Bar (nested constant, looked up by bare name)
     // or Foo::meth(...) (module/class method call).
     else if str_eq dot "::" then
@@ -2291,6 +2309,19 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
   | _ -> (recv, toks)
 
 // a trailing `{ }` / `do end` block turns a method call into EMethodB.
+// the method name after `&.`. Usually an ordinary name, but an operator
+// method may be written out the same way it can after `.`:
+// `mapping&.[](key)`, `x&.+(y)`.
+and safe_nav_name = fn toks ->
+  match toks with
+  | Cons (TId name, r) -> (name, r)
+  | Cons (TP lb, r) ->
+    if str_eq lb "[" && (match r with Cons (TP rb, _) -> str_eq rb "]" | _ -> false) then
+      (match r with Cons (_, r2) -> ("[]", r2) | _ -> ("[]", r))
+    else if is_op_method_name lb then (lb, r)
+    else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected method name after &.")) in fail "mere-ruby: expected method name after &.")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected method name after &.")) in fail "mere-ruby: expected method name after &.")
+
 and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr list) -> fn toks ->
   // paren-less block-pass: `recv.meth &blk` (the " &" token = space-before,
   // no-space-after). Turn the following expr into a block-pass argument.
@@ -9327,6 +9358,15 @@ and const_walk_head = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (head
 and const_walk_go = fn env -> fn world -> fn blk -> fn (sofar: str) -> fn (rest: str) ->
   if str_eq rest "" then (if map_has consts sofar then map_get consts sofar else VNil)
   else
+    // A constant bound to a module IS that module's namespace, so follow the
+    // binding before appending: after `REGEXP = RFC2396_REGEXP`,
+    // `REGEXP::PATTERN` has to find `RFC2396_REGEXP::PATTERN`.
+    // ...and a constant bound to anything else is not a namespace at all.
+    let sofar = (if map_has consts sofar then
+                   (match map_get consts sofar with
+                    | VClass c -> c
+                    | other -> (let _ = raise_exc world "TypeError" (inspect other ++ " is not a class/module") in sofar))
+                 else sofar) in
     let seg = const_head rest in
     let key = sofar ++ "::" ++ seg in
     if map_has consts key then const_walk_go env world blk key (const_tail rest)
@@ -10504,8 +10544,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // keeps working and CRuby only warns on use, which mere-ruby does not do.
     else if str_eq name "deprecate_constant" then recv
     else if str_eq name "const_set" then
+      // the constant belongs to the RECEIVER's namespace, the same key rule
+      // const_get and autoload use -- writing it bare put `Schemes.const_set
+      // "HTTP", URI::HTTP` at top level, where a later `HTTP` would find it.
       (match args with
-       | Cons (v, Cons (value, _)) -> let _ = map_set consts (to_s v) value in value
+       | Cons (v, Cons (value, _)) ->
+         let key = (if str_eq c "Object" then to_s v else c ++ "::" ++ to_s v) in
+         let _ = map_set consts key value in value
        | _ -> VNil)
     else if has_meth world ("(sng:" ++ c ++ ")") name then
       (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name

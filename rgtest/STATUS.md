@@ -32,8 +32,8 @@ Loaded straight from a rubygems checkout, no shims:
 | file | ruby | mere-ruby |
 |---|---|---|
 | `test_gem_version.rb` | pass=32 fail=0 err=0 | pass=26 fail=0 err=6 |
-| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=18 fail=0 err=17 |
-| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=11 fail=0 err=21 |
+| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=19 fail=0 err=16 |
+| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=19 fail=0 err=13 |
 
 The ruby column is not 100% either: the shim deliberately does not reproduce
 the sandbox (temp gem home, installed gem fixtures) the real helper builds, so
