@@ -3074,7 +3074,10 @@ and parse_puts_args = fn toks -> fn (acc: Expr list) ->
     // separates arguments (parse_expr would instead read `(a, b)` as a grouped
     // expression and choke on the comma). A space-paren (" (") is left to the
     // positional path, so `p (1..3).to_a` still groups-then-chains.
-    if str_eq st "(" then
+    // ...only at the FIRST argument, though: after a comma we are already
+    // inside the list, so `p 1, (2).abs` is a grouped expression to chain
+    // from, not a second argument list.
+    if str_eq st "(" && (match acc with Nil -> true | _ -> false) then
       let (a, r1) = parse_call_args r0 in (rev_app acc a, r1)
     // a keyword splat in a paren-less call: `mkdir_p subdir, **options`.
     else if str_eq st "**" then
@@ -6849,7 +6852,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = map_set ivars "$exc" exc in
     fail "mere-ruby: (ruby exception raised)"
   | EVar name ->
-    if str_eq name "__FILE__" then (let v = mkstr (script_file ()) in (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
+    if str_eq name "__FILE__" then
+      (let f = (if map_has load_ctx "file"
+                then (match map_get load_ctx "file" with VStr h -> let h = sget h in (if str_eq h "" then script_file () else h) | _ -> script_file ())
+                else script_file ()) in
+       let v = mkstr f in (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
     // Kernel#__dir__: the directory of the current file, absolute (like Ruby's
     // File.dirname(File.realpath(__FILE__))). A relative script dir is joined
     // with PWD.
@@ -7073,8 +7080,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
     let newblk = (match bp with
-                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else (true, bp, bb, env)
-                  | _ -> (true, bp, bb, env)) in
+                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else blk_capture blk (true, bp, bb, env) bb
+                  | _ -> blk_capture blk (true, bp, bb, env) bb) in
     // Kernel#loop: run the block until break (or a StopIteration raise).
     if str_eq name "loop" && (if map_has meths "loop" then false else true) then
       run_loop_builtin env world blk (true, bp, bb, env)
@@ -7117,7 +7124,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | VClass c ->
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | _ -> "") in
          let (_, ps2, bb2, _) = newblk in
-         let _ = map_set meths (c ++ "#" ++ nm) (Meth (ps2, Nil, bb2)) in
+         let _ = map_set meths (c ++ "#" ++ nm) (Meth (drop_yblk_params ps2, Nil, bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) newblk in
          // capture the block active here so a `yield` in the defined method
@@ -7271,8 +7278,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
     let newblk = (match bp with
-                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else (true, bp, bb, env)
-                  | _ -> (true, bp, bb, env)) in
+                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else blk_capture blk (true, bp, bb, env) bb
+                  | _ -> blk_capture blk (true, bp, bb, env) bb) in
     invoke_with_block env world blk recv name args newblk
   | EArr items -> arr_new (eval_args env world blk items)
   // fold the evaluated pairs through hash_put so duplicate keys (from an
@@ -8061,6 +8068,23 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
 // chained to the env the block captured (so it still sees and mutates the
 // enclosing locals); the body runs with `encl` as the active block so a
 // yield inside it reaches the enclosing method's block.
+// A block can carry more than one yblk marker (a literal that yields, later
+// handed on as a proc): peel them all, innermost wins.
+and strip_yblk_markers = fn encl -> fn (ps: str list) ->
+  match ps with
+  | Cons (m, rest) ->
+    if str_len m > 9 && str_eq (substring m 0 9) yblk_marker
+    then strip_yblk_markers (map_get proc_yblk (substring m 9 (str_len m))) rest
+    else (encl, ps)
+  | _ -> (encl, ps)
+// the same peel, when only the parameter list matters (a block that becomes a
+// method body: the marker is bookkeeping, not a parameter).
+and drop_yblk_params = fn (ps: str list) ->
+  match ps with
+  | Cons (m, rest) ->
+    if str_len m > 9 && str_eq (substring m 0 9) yblk_marker then drop_yblk_params rest else ps
+  | _ -> ps
+
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
@@ -8070,12 +8094,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // a proc/lambda that captured its defining method's block carries a yblk
   // marker: strip it and use that captured block as `encl` so `yield` inside
   // the proc body resolves to the defining method's block, not the caller's.
-  let (encl, params0) = (match params00 with
-    | Cons (m, rest) ->
-      if str_len m > 9 && str_eq (substring m 0 9) yblk_marker
-      then (map_get proc_yblk (substring m 9 (str_len m)), rest)
-      else (encl, params00)
-    | _ -> (encl, params00)) in
+  let (encl, params0) = strip_yblk_markers encl params00 in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
   let is_lam = (match params0 with Cons (m, _) -> str_eq m lambda_blk_marker | _ -> false) in
@@ -10273,6 +10292,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Module/Class are callable on any class.
     else if has_meth world "Module" name then invoke world noblk recv "Module" name args
     else if has_meth world "Class" name then invoke world noblk recv "Class" name args
+    // a class that does `extend Enumerable` and defines `self.each` gets the
+    // Enumerable surface on the class object itself (Gem::Specification is
+    // built that way: `Gem::Specification.count`, `.find`, `.select`).
+    else if has_meth world ("(sng:" ++ c ++ ")") "each" && is_enum_method name then
+      (if enum_needs_block name then make_enum_a world recv name args
+       else
+         let coll = enum_collect world recv ("(sng:" ++ c ++ ")") in
+         if str_eq name "to_a" || str_eq name "entries" then coll
+         else dispatch_prim env world blk coll name args vischeck)
     else prim_method recv name args
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
@@ -11330,6 +11358,21 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
 
 // the block tuple for a proc used as a block; a lambda gets the marker
 // prepended to its params so run_block enforces strict arity.
+// A block literal whose body yields remembers the block that was active where
+// it was written, so the yield still reaches THAT method's block after the
+// literal has been handed to another method (which installs its own). Only
+// bodies that actually yield pay for this.
+and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
+  match cur with
+  | (true, _, _, _) ->
+    (if bare_yield_stmts body then
+       (let pid = map_len proc_store in
+        let _ = map_set proc_store (str_of_int pid) cur in
+        let _ = map_set proc_yblk (str_of_int pid) cur in
+        match theblk with (h, ps, b, e) -> (h, Cons (yblk_marker ++ str_of_int pid, ps), b, e))
+     else theblk)
+  | _ -> theblk
+
 and proc_as_block = fn (pid: int) ->
   let t = map_get proc_store (str_of_int pid) in
   // a lambda enforces strict arity; a proc that captured a defining-method
@@ -11375,13 +11418,30 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     // recv.define_method(:name) { block } with an explicit class receiver:
     // register the block as an instance method of that class (used on singleton
     // classes, e.g. (class << obj; self).define_method(...)).
+    // define_singleton_method(:name) { }: the same as define_method, but the
+    // method lands in the receiver's singleton namespace, so it is a class
+    // method (or an object's own method).
+    else if str_eq name "define_singleton_method" then
+      (let (meths, sup, ocls, ivars) = world in
+       let target = (match recv with
+                     | VClass c -> "(sng:" ++ c ++ ")"
+                     | VObj id -> singleton_cls_of world id
+                     | _ -> "") in
+       let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr s2, _) -> sget s2 | _ -> "") in
+       if str_eq target "" then raise_exc world "TypeError" "can't define singleton"
+       else
+         (let (h2, ps2, bb2, e2) = newblk in
+          let _ = map_set meths (target ++ "#" ++ nm) (Meth (drop_yblk_params ps2, Nil, bb2)) in
+          let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
+          let _ = dm_store_closure (target ++ "#" ++ nm) (h2, ps2, bb2, e2) in
+          VSym nm))
     else if str_eq name "define_method" && (match recv with VClass _ -> true | _ -> false) then
       (match recv with
        | VClass c ->
          let (meths, sup, ocls, ivars) = world in
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | _ -> "") in
          let (h2, ps2, bb2, e2) = newblk in
-         let _ = map_set meths (c ++ "#" ++ nm) (Meth (ps2, Nil, bb2)) in
+         let _ = map_set meths (c ++ "#" ++ nm) (Meth (drop_yblk_params ps2, Nil, bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
          VSym nm
@@ -11696,6 +11756,10 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world newblk recv ("(sng:" ++ c ++ ")") name args
        else if has_meth world "Module" name then invoke world newblk recv "Module" name args
        else if has_meth world "Class" name then invoke world newblk recv "Class" name args
+       // `extend Enumerable` + `def self.each`: the block iterators come from
+       // the class's own each, exactly as they do for an instance.
+       else if has_meth world ("(sng:" ++ c ++ ")") "each" && is_enum_method name then
+         builtin_iter world blk newblk (enum_collect world recv ("(sng:" ++ c ++ ")")) name args
        else prim_method recv name args
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
@@ -11787,6 +11851,40 @@ and ivar_arg_name = fn (nm: str) ->
 and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let cls = class_name recv in
+  // The @ivar reflection primitives on a receiver that is not a plain object:
+  // main and the mutable primitives get storage keyed the same way their
+  // singleton classes are; an immediate cannot hold one (Ruby: FrozenError).
+  if str_eq name "instance_variable_get" || str_eq name "instance_variable_set" ||
+     str_eq name "instance_variable_defined?" || str_eq name "instance_variables" then
+    (let (_, _, _, ivars0) = world in
+     let base = (match recv with
+                 | VMain -> "main"
+                 | VStr _ -> hng_key recv | VArr _ -> hng_key recv | VHsh _ -> hng_key recv
+                 | _ -> "") in
+     if str_eq name "instance_variables" then
+       (let pfx = base ++ "@" in
+        let plen = str_len pfx in
+        let tmp = map_new () in
+        let _ = if str_eq base "" then () else
+          map_iter ivars0 (fn (k: str) -> fn (v: Val) ->
+            if str_len k > plen && str_eq (substring k 0 plen) pfx
+            then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@" ++ substring k plen (str_len k))))
+            else ()) in
+        arr_new (idx_to_list tmp 0 (map_len tmp)))
+     else if str_eq name "instance_variable_set" then
+       (if str_eq base "" then raise_exc world "FrozenError" ("can't modify frozen " ++ cls ++ ": " ++ inspect recv)
+        else match args with
+             | Cons (v, Cons (value, _)) -> let _ = map_set ivars0 (base ++ "@" ++ ivar_arg_name (to_s v)) value in value
+             | _ -> VNil)
+     else
+       (match args with
+        | Cons (v, _) ->
+          (let k = base ++ "@" ++ ivar_arg_name (to_s v) in
+           if str_eq base "" then (if str_eq name "instance_variable_defined?" then VBool false else VNil)
+           else if str_eq name "instance_variable_defined?" then VBool (map_has ivars0 k)
+           else if map_has ivars0 k then map_get ivars0 k else VNil)
+        | _ -> VNil))
+  else
   // singleton_class: true/false/nil answer their class; immediates raise
   // TypeError; an object gets its own (hidden) singleton class.
   if str_eq name "singleton_class" then
@@ -11868,6 +11966,22 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
        (match args with
         | Cons (pat, _) -> VBool (arr_count_eqq world (deref aid) pat 0 == 1)
         | _ -> VBool (arr_count_truthy (deref aid) 0 == 1))
+     | _ -> VNil)
+  // any? / all? / none? without a block: truthiness of the elements, or how
+  // many are `pattern === element` when one is given (the same shape one?
+  // already had).
+  else if (str_eq name "any?" || str_eq name "all?" || str_eq name "none?")
+          && (match recv with VArr _ -> true | VHsh _ -> true | VRange _ -> true | _ -> false) then
+    (match (match recv with VArr _ -> recv | _ -> prim_method recv "to_a" Nil) with
+     | VArr aid ->
+       (let xs = deref aid in
+        let n = val_list_len xs in
+        let hits = (match args with
+                    | Cons (pat, _) -> arr_count_eqq world xs pat 0
+                    | _ -> arr_count_truthy xs 0) in
+        if str_eq name "any?" then VBool (hits > 0)
+        else if str_eq name "none?" then VBool (hits == 0)
+        else VBool (hits == n))
      | _ -> VNil)
   else if str_eq name "minmax" && (match recv with VArr _ -> true | _ -> false) then
     arr_new (Cons (prim_method recv "min" Nil, Cons (prim_method recv "max" Nil, Nil)))
@@ -12251,7 +12365,8 @@ and str_bang_base_ok = fn (b: str) ->
   str_eq b "next" || str_eq b "delete" || str_eq b "swapcase" ||
   str_eq b "lstrip" || str_eq b "rstrip" || str_eq b "chomp" ||
   str_eq b "chop" || str_eq b "sub" || str_eq b "gsub" ||
-  str_eq b "tr" || str_eq b "squeeze"
+  str_eq b "tr" || str_eq b "squeeze" ||
+  str_eq b "delete_prefix" || str_eq b "delete_suffix"
 
 // is this value frozen? (used by the mutation guard)
 and val_is_frozen = fn (recv: Val) ->
@@ -12700,6 +12815,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> fail "no coerce")
   else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0") | _ -> fail "no zero?")
+  // Numeric#nonzero?: self, or nil when it IS zero — the idiom behind
+  // `(a <=> b).nonzero? || ...` in a multi-key comparator.
+  else if str_eq name "nonzero?" then
+    (match recv with
+     | VInt n -> (if n == 0 then VNil else recv)
+     | VFlt f -> (if f == 0.0 then VNil else recv)
+     | VBig s2 -> (if str_eq s2 "0" then VNil else recv)
+     | VRat (n, d) -> (if big_sign n == 0 then VNil else recv)
+     | _ -> fail "no nonzero?")
   else if str_eq name "positive?" then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> fail "no positive?")
   else if str_eq name "negative?" then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> fail "no negative?")
   else if str_eq name "succ" || str_eq name "next" then (match recv with VInt n -> VInt (n + 1) | VStr s -> mkstr (str_succ (sget s)) | _ -> fail "no succ")
@@ -13706,6 +13830,9 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        // (`Kernel#Pathname`, `Kernel#Rainbow`).
        else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
        else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
+       // a universal primitive (instance_variable_get, frozen?, send, ...)
+       // with an implicit self at the top level, exactly as `self.name` would
+       else if is_prim_method name then dispatch_prim env world noblk VMain name args false
        else undef_call_exc_x world name args explicit
      | VClass c ->
        if str_eq name "new" then new_obj world c args
@@ -13738,6 +13865,11 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
      | VMain ->
        if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
        then dispatch_prim env world noblk VMain name args false
+       // main IS an Object: a method added by reopening Object or Kernel is
+       // callable bare, and so is a universal primitive.
+       else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
+       else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
+       else if is_prim_method name then dispatch_prim env world noblk VMain name args false
        else undef_call_exc world name args
      | VClass c ->
        // class-level self (class << self body / class methods): route through
@@ -14343,10 +14475,15 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      let fenv = map_new () in
      let _ = map_set fenv "self" VMain in
      let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
+     let savedf = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
      let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
+     // __FILE__ inside a required file is THAT file, not the script that
+     // started everything — libraries build sibling paths out of it.
+     let _ = map_set load_ctx "file" (mkstr full) in
      let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
      let f = run_stmts fenv world noblk2 prog2 in
      let _ = map_set load_ctx "dir" saved in
+     let _ = map_set load_ctx "file" savedf in
      let _ = map_set load_ctx "coding" savedc in
      (match f with
       | FRaise _ -> fail "mere-ruby: (ruby exception raised)"
@@ -14965,6 +15102,69 @@ and stdlib_src = fn (name: str) ->
     "module Enumerable\n" ++
     "  def to_set\n" ++
     "    Set.new(self)\n" ++
+    "  end\n" ++
+    "end\n"
+  // Forwardable / SingleForwardable: delegation built on define_method,
+  // where CRuby's builds source strings. Same surface.
+  else if str_eq n "forwardable" then
+    "module Forwardable\n" ++
+    "  def def_instance_delegator(accessor, method, ali = method)\n" ++
+    "    accessor = accessor.to_s\n" ++
+    "    define_method(ali) do |*args, &block|\n" ++
+    "      target = accessor.start_with?(\"@\") ? instance_variable_get(accessor) : __send__(accessor)\n" ++
+    "      target.__send__(method, *args, &block)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def def_instance_delegators(accessor, *methods)\n" ++
+    "    methods.each do |m|\n" ++
+    "      def_instance_delegator(accessor, m)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def instance_delegate(hash)\n" ++
+    "    hash.each do |methods, accessor|\n" ++
+    "      methods = [methods] unless methods.is_a?(Array)\n" ++
+    "      methods.each do |m|\n" ++
+    "        def_instance_delegator(accessor, m)\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  alias_method :def_delegator, :def_instance_delegator\n" ++
+    "  alias_method :def_delegators, :def_instance_delegators\n" ++
+    "  alias_method :delegate, :instance_delegate\n" ++
+    "end\n" ++
+    "\n" ++
+    "module SingleForwardable\n" ++
+    "  def def_single_delegator(accessor, method, ali = method)\n" ++
+    "    accessor = accessor.to_s\n" ++
+    "    define_singleton_method(ali) do |*args, &block|\n" ++
+    "      target = accessor.start_with?(\"@\") ? instance_variable_get(accessor) : __send__(accessor)\n" ++
+    "      target.__send__(method, *args, &block)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def def_single_delegators(accessor, *methods)\n" ++
+    "    methods.each do |m|\n" ++
+    "      def_single_delegator(accessor, m)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  alias_method :def_delegator, :def_single_delegator\n" ++
+    "  alias_method :def_delegators, :def_single_delegators\n" ++
+    "end\n"
+  // Singleton: the memoised instance plus the clone/dup refusals.
+  else if str_eq n "singleton" then
+    "module Singleton\n" ++
+    "  module SingletonClassMethods\n" ++
+    "    def instance\n" ++
+    "      @singleton__instance__ ||= new\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.included(klass)\n" ++
+    "    klass.extend(SingletonClassMethods)\n" ++
+    "  end\n" ++
+    "  def clone\n" ++
+    "    raise TypeError, \"can't clone instance of singleton \" + self.class.to_s\n" ++
+    "  end\n" ++
+    "  def dup\n" ++
+    "    raise TypeError, \"can't dup instance of singleton \" + self.class.to_s\n" ++
     "  end\n" ++
     "end\n"
   else ""
@@ -16746,7 +16946,10 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
      // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
      // startup and the require is satisfied here rather than searched for.
-     else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb") && (if is_reg_file full then false else true) then
+     // rbconfig has no file here (see above); `thread` is a no-op in Ruby 3,
+     // where the feature is built into the interpreter.
+     else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb" ||
+              str_eq p0 "thread" || str_eq p0 "thread.rb") && (if is_reg_file full then false else true) then
        FNext (VBool true)
      else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
@@ -16775,10 +16978,15 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let fenv = map_new () in
        let _ = map_set fenv "self" VMain in
        let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
+       let savedf = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
        let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
+       // __FILE__ inside a required file is THAT file, not the script that
+       // started everything — libraries build sibling paths out of it.
+       let _ = map_set load_ctx "file" (mkstr full) in
        let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
        let f = run_stmts fenv world noblk2 prog2 in
        let _ = map_set load_ctx "dir" saved in
+       let _ = map_set load_ctx "file" savedf in
        let _ = map_set load_ctx "coding" savedc in
        (match f with
         | FRaise v -> FRaise v
@@ -19382,6 +19590,7 @@ and puts_each = fn world -> fn (xs: Val list) ->
 // host can call run_src with source handed in as a string.
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set load_ctx "dir" (mkstr (dirname_of name)) in
+  let _ = map_set load_ctx "file" (mkstr name) in
   let _ = map_set loaded_files name VNil in
   let cod0 = src_coding src in
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in

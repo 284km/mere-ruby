@@ -40,7 +40,11 @@ require_relative "spec_helper"
 require_relative "$sub/$base"
 mspec_report
 EOF
-out_m="$("$mr" "$tmp/driver.rb" 2>&1)"
+# Bound the mere-ruby run HERE, not only in the caller: scoreboard.sh's alarm
+# kills this script, but the child would keep spinning (a runaway spec used to
+# leave one behind per sweep, and they pile up until the machine is out of
+# memory). SIGKILL after the deadline so nothing survives.
+out_m="$(perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1)"
 out_r="$(ruby -W0 "$tmp/driver.rb" 2>&1)"
 echo "--- mere-ruby:"; echo "$out_m"
 echo "--- ruby:";      echo "$out_r"
