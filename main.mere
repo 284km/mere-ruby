@@ -1147,7 +1147,20 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
          str_eq three "<=>" || str_eq three "===" then Cons (TP three, lex_go s (i + 3))
       else
         let two = if i + 2 <= str_len s then substring s i (i + 2) else "" in
-        if str_eq two "::" && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
+        // `def foo = expr` (space before the `=`) is an endless method;
+        // `def foo= v` (no space) defines a setter. Ruby tells them apart by
+        // exactly that spacing, so the lexer marks the endless one -- and only
+        // there, where the token before is a name and the one before that is
+        // `def`, so no ordinary assignment is affected.
+        if str_eq two "==" || str_eq two "=>" || str_eq two "=~" then Cons (TP two, lex_go s (i + 2))
+        else if str_eq c "=" && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
+                && (let pj = prev_nonspace s (i - 1) in
+                    pj >= 0 && (let pc = char_at s pj in is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!")
+                    && (let nm_start = word_start_at s pj in
+                        let pj2 = prev_nonspace s (nm_start - 1) in
+                        pj2 >= 0 && str_eq (word_ending_at s pj2) "def")) then
+          Cons (TP " =", lex_go s (i + 1))
+        else if str_eq two "::" && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
            && i + 2 < str_len s && is_upper_first (char_at s (i + 2))
            // only after something that could BE a command: an identifier, and
            // not `class ::C` / `module ::M`, where the constant is the name
@@ -1653,6 +1666,12 @@ and word_ending_at = fn (s: str) -> fn (p: int) ->
 and word_start = fn (s: str) -> fn (p: int) ->
   if p > 0 && (is_alnum (char_at s (p - 1)) || str_eq (char_at s (p - 1)) "_")
   then word_start s (p - 1) else p
+
+// the first index of the identifier that ends at p.
+and word_start_at = fn (s: str) -> fn (p: int) ->
+  if p <= 0 then 0
+  else (let c = char_at s (p - 1) in
+        if is_alnum c || str_eq c "_" then word_start_at s (p - 1) else p)
 
 and prev_nonspace = fn (s: str) -> fn (i: int) ->
   if i < 0 then 0 - 1
@@ -3318,6 +3337,8 @@ and const_fold_str = fn (e: Expr) ->
 
 and parse_alias_name = fn toks ->
   match toks with
+  // `alias expires_at= expires=` — a setter's name carries its `=`.
+  | Cons (TId n, Cons (TP eq, r)) -> if str_eq eq "=" then (n ++ "=", r) else (n, Cons (TP eq, r))
   | Cons (TId n, r) -> (n, r)
   | Cons (TSym n, r) -> (n, r)
   | Cons (TP op, r) ->
@@ -4857,6 +4878,16 @@ and parse_def = fn toks ->
             // `def location=((a, b))` — one whose parameter destructures.
             | Cons (TP lp, Cons (TP st, _)) ->
               if str_eq lp "(" && (str_eq st "*" || str_eq st "**" || is_lparen st) then (name ++ "=", r1) else (name, r)
+            // `def value= value` — a setter whose parameter has no parens. An
+            // endless method cannot look like this: its body would have to be
+            // a bare name followed by a newline, which is a name, not a body.
+            | Cons (TId pn, r2) ->
+              (if is_keyword pn then (name, r)
+               else match r2 with
+                    | Cons (TNL, _) -> (name ++ "=", r1)
+                    | Cons (TEOF, _) -> (name ++ "=", r1)
+                    | Cons (TP semi, _) -> if str_eq semi ";" then (name ++ "=", r1) else (name, r)
+                    | _ -> (name, r))
             | _ -> (name, r))
          else (name, r)
        | _ -> (name, r)) in
@@ -4871,7 +4902,7 @@ and parse_def = fn toks ->
     // endless method `def name(params) = expr` — body is a single expression.
     (match r2 with
      | Cons (TP eq, r3) ->
-       if str_eq eq "=" then
+       if str_eq eq "=" || str_eq eq " =" then
          let (e, r4) = parse_expr r3 in (SDef (name, params, defs, Cons (SExpr e, Nil)), r4)
        else parse_def_body name params defs r2
      | _ -> parse_def_body name params defs r2)
@@ -11221,8 +11252,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                  // consume iff this lambda is the target; else keep propagating
                  // (flow_sig still holds k/fid/v, so just re-raise).
                  (if tgt == lfid then (let _ = map_delete flow_sig "k" in let _ = map_delete flow_sig "fid" in v)
-                  else (let _ = tgt in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")))
-               else if str_eq k "breakret" then (let _ = tgt in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)"))
+                  else (let _ = tgt in (let m = "mere-ruby: (unhandled return past its frame)" in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)))
+               else if str_eq k "breakret" then (let _ = tgt in (let m = "mere-ruby: (unhandled break past its frame)" in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
                else (let _ = map_delete flow_sig "k" in flow_throw k v)
              else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
            | other -> flow_value other))
@@ -14500,7 +14531,8 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
         else (let _ = map_set flow_sig "k" (mkstr k) in
               let _ = map_set flow_sig "fid" (VInt target) in
               let _ = map_set flow_sig "v" v in
-              (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)"))
+              (let m = "mere-ruby: (unhandled " ++ k ++ " looking for its frame)" in
+               let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
       else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       else flow_rethrow k v
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
@@ -18155,13 +18187,17 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
 and flow_throw = fn (kind: str) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr kind) in
   let _ = map_set flow_sig "v" v in
-  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")
+  // name the kind: an escaped break / next / return / throw that nothing
+  // caught is otherwise indistinguishable at the top level.
+  (let m = "mere-ruby: (unhandled " ++ kind ++ ")" in
+   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
 
 and flow_rethrow_tagged = fn (kind: str) -> fn (tag: Val) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr kind) in
   let _ = map_set flow_sig "tag" tag in
   let _ = map_set flow_sig "v" v in
-  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")
+  (let m = "mere-ruby: (unhandled " ++ kind ++ ", tagged)" in
+   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
 
 and catch_tag_active = fn (t: Val) -> fn (d: int) ->
   if d <= 0 then false
@@ -18208,7 +18244,8 @@ and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
 and flow_rethrow = fn (k: str) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr k) in
   let _ = map_set flow_sig "v" v in
-  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")
+  (let m = "mere-ruby: (unhandled " ++ k ++ ")" in
+   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
 
 // evaluate a defined? receiver, returning a sentinel VSym on a genuine
 // exception raise (so defined? answers nil), but RE-PROPAGATING a pending
@@ -18219,7 +18256,8 @@ and defined_eval_recv = fn env -> fn world -> fn blk -> fn (recv: Expr) ->
   // a pending flow signal (flow_sig still holds "k") means the receiver did a
   // throw/break/next; re-fail so it propagates instead of being swallowed.
   if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) && map_has flow_sig "k"
-  then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")
+  then (let m = "mere-ruby: (unhandled flow signal inside defined?)" in
+        let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
   else rv
 
 // a break unwinding to a specific method frame (its block's home). The nearest
@@ -18228,7 +18266,8 @@ and flow_throw_breakret = fn (fid: int) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr "breakret") in
   let _ = map_set flow_sig "fid" (VInt fid) in
   let _ = map_set flow_sig "v" v in
-  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")
+  (let m = "mere-ruby: (unhandled break out of a block)" in
+   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
 
 // `return` from inside a block/proc unwinds to the block's defining frame
 // (a method OR a lambda call), passing through any method that merely yielded.
@@ -18236,7 +18275,8 @@ and flow_throw_returnret = fn (fid: int) -> fn (v: Val) ->
   let _ = map_set flow_sig "k" (mkstr "returnret") in
   let _ = map_set flow_sig "fid" (VInt fid) in
   let _ = map_set flow_sig "v" v in
-  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (flow signal)")) in fail "mere-ruby: (flow signal)")
+  (let m = "mere-ruby: (unhandled return out of a block)" in
+   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
 
 // Ruby's `when` uses ===; for the value classes in this subset that is
 // plain equality.
