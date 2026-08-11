@@ -649,6 +649,8 @@ let out_print_no_nl = fn (s: str) ->
 // ENV writes overlay the real environment (there is no setenv extern);
 // VNil marks a deleted key. cli_argv holds the script's ARGV.
 let env_ovr = map_new ();
+// `alias $NEW $OLD`: the new name reads and writes the old one's slot.
+let gvar_alias = map_new ();
 // LoadError#path: the message determines the path, so the raise records it
 // here rather than widening VExc (which carries only a class and a message).
 let le_path = map_new ();
@@ -6781,7 +6783,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           else VNil)
        // $globals and @/@@-prefixed names have their own categories.
        else if str_len name > 0 && str_eq (char_at name 0) "$" then
-         (let k = substring name 1 (str_len name) in
+         (let k = gvar_slot (substring name 1 (str_len name)) in
           if str_len k == 1 && k >= "1" && k <= "9" then
             (if map_has globals k && truthy (map_get globals k) then mkstr "global-variable" else VNil)
           else if map_has globals k then mkstr "global-variable" else VNil)
@@ -6918,7 +6920,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EAssign (name, e) ->
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
-            then map_set globals (substring name 1 (str_len name)) v
+            then map_set globals (gvar_slot (substring name 1 (str_len name))) v
             else if str_len name > 0 && str_eq (char_at name 0) "@"
             then assign_one env world name v
             else if is_upper_first name then
@@ -7031,7 +7033,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else mkstr nm2)
     else if str_eq name "block_given?" then (let (has, _, _, _) = blk in VBool has)
     else if str_len name > 0 && str_eq (char_at name 0) "$" then
-      (let k = substring name 1 (str_len name) in if map_has globals k then map_get globals k else VNil)
+      (let k = gvar_slot (substring name 1 (str_len name)) in
+       // $& / $` / $' are views on the last match, which is what $~ holds.
+       if (str_eq k "&" || str_eq k "`" || str_eq k "'") && map_has globals "~" then
+         (match map_get globals "~" with
+          | VObj mid ->
+            (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+             if str_eq k "&" then invoke_val_c env world nb (VObj mid) "[]" (Cons (VInt 0, Nil)) false
+             else if str_eq k "`" then invoke_val_c env world nb (VObj mid) "pre_match" Nil false
+             else invoke_val_c env world nb (VObj mid) "post_match" Nil false)
+          | _ -> VNil)
+       else if map_has globals k then map_get globals k else VNil)
     else
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -7762,10 +7774,14 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
 // ---- multiple assignment ------------------------------------------------
+// the slot a global name refers to, following any `alias` chain.
+and gvar_slot = fn (k: str) ->
+  if map_has gvar_alias k then (match map_get gvar_alias k with VStr h -> gvar_slot (sget h) | _ -> k) else k
+
 and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   let (meths, sup, ocls, ivars) = world in
   if str_len tgt > 0 && str_eq (char_at tgt 0) "$" then
-    let _ = map_set globals (substring tgt 1 (str_len tgt)) v in ()
+    let _ = map_set globals (gvar_slot (substring tgt 1 (str_len tgt))) v in ()
   // "@@x" is a class variable, not an ivar named "@x" — same split SIVarAssign
   // makes, needed here so `@@a, @@b = ...` writes class variables.
   else if str_len tgt > 1 && str_eq (substring tgt 0 2) "@@" then
@@ -11132,6 +11148,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let msg = (match msgv with VStr h -> sget h | VNil -> disp | other -> to_s other) in
        if str_eq msg "" then mkstr disp
        else mkstr ("#<" ++ disp ++ ": " ++ msg ++ ">"))
+    else if str_eq cls "MatchData" &&
+            (str_eq name "pre_match" || str_eq name "post_match" ||
+             str_eq name "begin" || str_eq name "end" || str_eq name "string") then
+      (let src = (if map_has ivars (str_of_int id ++ "@__src") then (match map_get ivars (str_of_int id ++ "@__src") with VStr h -> sget h | _ -> "") else "") in
+       let st = (if map_has ivars (str_of_int id ++ "@__st") then (match map_get ivars (str_of_int id ++ "@__st") with VInt n -> n | _ -> 0) else 0) in
+       let en = (if map_has ivars (str_of_int id ++ "@__en") then (match map_get ivars (str_of_int id ++ "@__en") with VInt n -> n | _ -> 0) else 0) in
+       if str_eq name "pre_match" then mkstr (substring src 0 st)
+       else if str_eq name "post_match" then mkstr (substring src en (str_len src))
+       else if str_eq name "string" then mkstr src
+       // only group 0's span is recorded, which is what these are asked for
+       else if str_eq name "begin" then VInt st
+       else VInt en)
     else if str_eq cls "MatchData" && (str_eq name "[]" || str_eq name "to_a" || str_eq name "captures" || str_eq name "size" || str_eq name "length") then
       (if str_eq name "[]" then
          (match args with Cons (VInt n, _) -> (if map_has ivars (str_of_int id ++ "@" ++ str_of_int n) then map_get ivars (str_of_int id ++ "@" ++ str_of_int n) else VNil) | _ -> VNil)
@@ -16128,6 +16156,36 @@ and stdlib_src = fn (name: str) ->
     "    \"#<Tempfile:\" + @path + \">\"\n" ++
     "  end\n" ++
     "end\n"
+  // `English`: readable names for the punctuation globals, which is exactly a
+  // file of `alias $NEW $OLD` lines.
+  else if str_eq n "English" then
+    "# `English` gives the punctuation globals readable names. mere-ruby aliases the\n" ++
+    "# ones it actually tracks; the rest would be lies.\n" ++
+    "alias $ERROR_INFO $!\n" ++
+    "alias $ERROR_POSITION $@\n" ++
+    "alias $FS $;\n" ++
+    "alias $FIELD_SEPARATOR $;\n" ++
+    "alias $OFS $,\n" ++
+    "alias $OUTPUT_FIELD_SEPARATOR $,\n" ++
+    "alias $RS $/\n" ++
+    "alias $INPUT_RECORD_SEPARATOR $/\n" ++
+    "alias $ORS $\\\n" ++
+    "alias $OUTPUT_RECORD_SEPARATOR $\\\n" ++
+    "alias $INPUT_LINE_NUMBER $.\n" ++
+    "alias $NR $.\n" ++
+    "alias $LAST_READ_LINE $_\n" ++
+    "alias $DEFAULT_OUTPUT $>\n" ++
+    "alias $DEFAULT_INPUT $<\n" ++
+    "alias $PID $$\n" ++
+    "alias $PROCESS_ID $$\n" ++
+    "alias $CHILD_STATUS $?\n" ++
+    "alias $LAST_MATCH_INFO $~\n" ++
+    "alias $IGNORECASE $=\n" ++
+    "alias $ARGV $*\n" ++
+    "alias $MATCH $&\n" ++
+    "alias $PREMATCH $`\n" ++
+    "alias $POSTMATCH $'\n" ++
+    "alias $LAST_PAREN_MATCH $+\n"
   else ""
 
 // --- glob ------------------------------------------------------------------
@@ -18034,7 +18092,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              else lv_set env name VNil) in
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
-            then map_set globals (substring name 1 (str_len name)) v
+            then map_set globals (gvar_slot (substring name 1 (str_len name))) v
             else if str_len name >= 2 && str_eq (substring name 0 2) "::" then (let cn = substring name 2 (str_len name) in let _ = map_set consts cn v in name_anon cn v)
             else if is_upper_first name then
               (let key = const_assign_key env name in
@@ -18228,6 +18286,12 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SAttr (_, _) -> FNext VNil
   | SAlias (n1, n2) ->
     let (meths, sup, ocls, ivars) = world in
+    // `alias $NEW $OLD` aliases a global, not a method: record the redirect so
+    // the new name reads and writes the old one's slot (this is all `English`
+    // is).
+    if str_len n1 > 0 && str_eq (char_at n1 0) "$" && str_len n2 > 0 && str_eq (char_at n2 0) "$" then
+      (let _ = map_set gvar_alias (substring n1 1 (str_len n1)) (mkstr (substring n2 1 (str_len n2))) in FNext VNil)
+    else
     let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
     FNext VNil
   | SInclude m ->
@@ -20138,6 +20202,11 @@ and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> 
   let _ = map_set ocls (str_of_int id) "MatchData" in
   let _ = map_set globals "~" (VObj id) in
   let _ = map_set ivars (str_of_int id ++ "@0") (mkstr (substring sv st en)) in
+  // keep the subject and the span, so #pre_match / #post_match / #begin / #end
+  // (and $` / $' / $&, which are derived from them) can be answered.
+  let _ = map_set ivars (str_of_int id ++ "@__src") (mkstr sv) in
+  let _ = map_set ivars (str_of_int id ++ "@__st") (VInt st) in
+  let _ = map_set ivars (str_of_int id ++ "@__en") (VInt en) in
   let _ = (if ng >= 0 then map_set ivars (str_of_int id ++ "@__ng") (VInt ng) else ()) in
   let _ = rx_store_groups ivars id sv 1 in
   rx_pub_groups sv 1 true
