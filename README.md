@@ -20,6 +20,25 @@ segfaults before the interpreter's own `SystemStackError` guard can see
 it. 128 MB puts the ceiling out of reach of real input. See
 [PAIN.md](PAIN.md) §M9.
 
+## The load path
+
+mere-ruby ships a handful of pure-Ruby libraries compiled in (`monitor`,
+`stringio`, `strscan`, `set`, `pathname`, `time`, `delegate`, `English`,
+…) and those always win over a file of the same name. Everything else is
+searched for on `$LOAD_PATH`, which starts **empty** — mere-ruby has no
+stdlib directory of its own to seed it with. `-I` and `RUBYLIB` fill it,
+in that order, exactly as in ruby:
+
+```sh
+./mere-ruby -I/path/to/ruby/lib/ruby/3.2.0 script.rb
+RUBYLIB=/path/to/ruby/lib/ruby/3.2.0 ./mere-ruby script.rb
+```
+
+Pointed at a CRuby installation's stdlib, mere-ruby runs a good deal of
+it directly — `shellwords`, `fileutils`, `racc`, `uri` all parse and
+load. Anything backed by a C extension (`openssl`, `zlib`, `socket`,
+`digest`) does not, and never will here.
+
 ## In the browser
 
 mere-ruby also compiles straight to WebAssembly, so it runs Ruby entirely

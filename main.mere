@@ -657,6 +657,8 @@ let le_path = map_new ();
 // the real environment, dumped once on first read (see env_load).
 let env_cache = map_new ();
 let cli_argv = map_new ();
+// key "v" -> the -I directories, ":"-joined in the order they were given.
+let cli_inc = map_new ();
 // Encoding.default_internal (nil unless assigned; ENV reads honor it) and
 // default_external (UTF-8 unless assigned).
 let def_int_enc = map_new ();
@@ -1945,11 +1947,9 @@ and paren_body = fn toks ->
 
 and paren_expr_body = fn toks ->
   if looks_like_multix toks then
-    let (s2, r2) = parse_multix toks in
-    (EStmt s2, expect (skip_nls r2) ")")
+    let (s2, r2) = parse_multix toks in paren_after_stmt s2 r2
   else if looks_like_multi toks then
-    let (s2, r2) = parse_multi toks in
-    (EStmt s2, expect (skip_nls r2) ")")
+    let (s2, r2) = parse_multi toks in paren_after_stmt s2 r2
   else
   let (e, r2) = parse_andor toks in
   match r2 with
@@ -1993,6 +1993,14 @@ and paren_expr_body = fn toks ->
        if str_eq rp ")" then (e, r3) else paren_seq (skip_nls r2) (Cons (SExpr e, Nil))
      | _ -> paren_seq (skip_nls r2) (Cons (SExpr e, Nil)))
   | _ -> (e, expect r2 ")")
+
+// a multiple assignment inside a paren group: `)` ends it, but a `;` means it
+// was only the first statement of a sequence --
+// `until (parent, base = File.split(p); parent == p)` in fileutils.
+and paren_after_stmt = fn (s2: Stmt) -> fn r2 ->
+  (match skip_nls r2 with
+   | Cons (TP rp, r3) -> if str_eq rp ")" then (EStmt s2, r3) else paren_seq (skip_nls r2) (Cons (s2, Nil))
+   | _ -> paren_seq (skip_nls r2) (Cons (s2, Nil)))
 
 and paren_seq = fn toks -> fn (acc: Stmt list) ->
   let (s0, r0) = parse_stmt toks in
@@ -3399,6 +3407,10 @@ and parse_alias_name = fn toks ->
   | Cons (TId n, r) -> (n, r)
   | Cons (TSym n, r) -> (n, r)
   | Cons (TP op, r) ->
+    // the lexer marks a space-before punctuator (" &", " (", " [") so a
+    // paren-less call can be told from an operator; in `alias intersection &`
+    // the marker is noise and the name is the bare operator.
+    let op = (if str_len op > 1 && str_eq (char_at op 0) " " then substring op 1 (str_len op) else op) in
     // an interpolated symbol :"#{...}" lexes as ("" + ...).to_sym; fold it.
     if str_eq op "(s" then
       (let (e, r2) = parse_primary toks in
@@ -4913,7 +4925,7 @@ and parse_def = fn toks ->
       (match r with
        | Cons (TP p, r3) -> if is_lparen p then parse_params r3 Nil Nil else (Nil, Nil, r)
        | _ -> (Nil, Nil, r)) in
-    parse_def_body name params defs r2
+    parse_def_tail name params defs r2
   | Cons (TId name0, r0) ->
     // `def recv.name` — a singleton method. `def self.m` drops self. and
     // registers on the enclosing class/module; `def C.m` registers under
@@ -4979,21 +4991,27 @@ and parse_def = fn toks ->
          else (Nil, Nil, r)
        | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
-    // endless method `def name(params) = expr` — body is a single expression.
-    (match r2 with
-     | Cons (TP eq, r3) ->
-       if str_eq eq "=" || str_eq eq " =" then
-         let (e, r4) = parse_expr r3 in (SDef (name, params, defs, Cons (SExpr e, Nil)), r4)
-       else parse_def_body name params defs r2
-     | _ -> parse_def_body name params defs r2)
+    parse_def_tail name params defs r2
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected method name after def")) in fail "mere-ruby: expected method name after def")
+
+// endless method `def name(params) = expr` — body is a single expression;
+// otherwise the body runs to `end`. Operator-named defs take this path too
+// (`def >>(k) = Bits.new(@n >> k)`).
+and parse_def_tail = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
+  (match r2 with
+   | Cons (TP eq, r3) ->
+     if str_eq eq "=" || str_eq eq " =" then
+       let (e, r4) = parse_expr r3 in (SDef (name, params, defs, Cons (SExpr e, Nil)), r4)
+     else parse_def_body name params defs r2
+   | _ -> parse_def_body name params defs r2)
 
 and is_op_method_name = fn (op: str) ->
   str_eq op "==" || str_eq op "!=" || str_eq op "<=>" || str_eq op "===" ||
   str_eq op "<" || str_eq op ">" || str_eq op "<=" || str_eq op ">=" ||
   str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/" ||
-  str_eq op "%" || str_eq op "**" || str_eq op "<<" || str_eq op "!" ||
-  str_eq op "=~" || str_eq op "!~" || str_eq op "|" || str_eq op "&" || str_eq op "^"
+  str_eq op "%" || str_eq op "**" || str_eq op "<<" || str_eq op ">>" || str_eq op "!" ||
+  str_eq op "=~" || str_eq op "!~" || str_eq op "|" || str_eq op "&" || str_eq op "^" ||
+  str_eq op "~"
 
 and parse_def_body = fn (name: str) -> fn (params: str list) -> fn (defs: (str * Expr) list) -> fn r2 ->
     let (body0, r4) = parse_stmts r2 Nil in
@@ -7504,6 +7522,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq op "~" then
       (match eval_e env world blk a with
        | VInt n -> VInt (0 - n - 1)   // bitwise not
+       // `~obj` dispatches to the object's own `~` (IPAddr defines one).
+       | VObj id ->
+         let (m2, s2, ocls2, iv2) = world in
+         let cls = map_get ocls2 (str_of_int id) in
+         if has_meth world cls "~" then invoke_val_c env world blk (VObj id) "~" Nil false
+         else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unary ~ on non-integer")) in fail "mere-ruby: unary ~ on non-integer")
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unary ~ on non-integer")) in fail "mere-ruby: unary ~ on non-integer"))
     else
       (match eval_e env world blk a with
@@ -14918,6 +14942,25 @@ and env_is_set = fn (k2: str) ->
 and env_get = fn (k2: str) ->
   let _ = env_load () in
   if map_has env_cache k2 then (match map_get env_cache k2 with VStr h -> sget h | _ -> "") else ""
+// the initial $LOAD_PATH: -I directories, then RUBYLIB, as ruby orders them.
+// Empty entries are dropped, so an unset RUBYLIB contributes nothing.
+and lp_seed = fn () ->
+  let incs = (if map_has cli_inc "v" then (match map_get cli_inc "v" with VStr h -> sget h | _ -> "") else "") in
+  drop_empty (list_append_str (split_colon incs 0 "" Nil) (split_colon (env_get "RUBYLIB") 0 "" Nil))
+// split on ':' -- the separator ruby uses for -I chains and RUBYLIB.
+and split_colon = fn (s: str) -> fn (i: int) -> fn (cur: str) -> fn (acc: str list) ->
+  if i >= str_len s then rev_strs_l (Cons (cur, acc)) Nil
+  else if str_eq (char_at s i) ":" then split_colon s (i + 1) "" (Cons (cur, acc))
+  else split_colon s (i + 1) (cur ++ char_at s i) acc
+and rev_strs_l = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_strs_l t (Cons (h, acc))
+and add_inc = fn (d: str) ->
+  let cur = (if map_has cli_inc "v" then (match map_get cli_inc "v" with VStr h -> sget h | _ -> "") else "") in
+  map_set cli_inc "v" (mkstr (if str_eq cur "" then d else cur ++ ":" ++ d))
+and drop_empty = fn (xs: str list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if str_eq h "" then drop_empty t else Cons (h, drop_empty t)
 // one ENV read: the write overlay wins (VNil = deleted), then the real
 // environment.
 and env_lookup_v = fn (k2: str) ->
@@ -18070,8 +18113,11 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // startup and the require is satisfied here rather than searched for.
      // rbconfig has no file here (see above); `thread` is a no-op in Ruby 3,
      // where the feature is built into the interpreter.
-     else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb" ||
-              str_eq p0 "thread" || str_eq p0 "thread.rb") && (if is_reg_file full then false else true) then
+     // These win over anything on the $LOAD_PATH: a mere-ruby that is pointed
+     // at CRuby's stdlib (-I / RUBYLIB) must still use its OWN rbconfig, and
+     // must not read CRuby's thread.rb.
+     else if str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb" ||
+             str_eq p0 "thread" || str_eq p0 "thread.rb" then
        FNext (VBool true)
      else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
@@ -18081,8 +18127,11 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
                 | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
                 | _ -> ()) in
-       // a shipped library (see stdlib_src) has no file to read
-       let src = (if is_reg_file full then read_file full else stdlib_src p0) in
+       // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
+       // that feature, so it wins over a file of the same name on the load
+       // path -- CRuby's monitor.rb would only `require "monitor.so"` here.
+       let shipped = stdlib_src p0 in
+       let src = (if str_eq shipped "" then read_file full else shipped) in
        // the file's magic comment sets the script encoding for parse (a
        // parse-time __ENCODING__ capture) and while it runs; a file with no
        // magic comment is UTF-8 (per file, not inherited), as in Ruby.
@@ -20896,7 +20945,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = lv_set env "self" VMain in   // top-level self is `main`
   // $: / $LOAD_PATH are the SAME array (aliased by handle); likewise $" /
   // $LOADED_FEATURES. require searches the load path and records features.
-  let lp0 = arr_new Nil in
+  // -I comes first, then RUBYLIB -- the order ruby itself builds them in.
+  // mere-ruby has no compiled-in stdlib directory, so without one of these
+  // a default gem (shellwords, fileutils) is simply not on disk anywhere it
+  // knows to look, and rubygems cannot help: default gems have no lib dir.
+  let lp0 = arr_new (strs_to_vals (lp_seed ())) in
   let _ = map_set globals ":" lp0 in
   let _ = map_set globals "LOAD_PATH" lp0 in
   let lf0 = arr_new Nil in
@@ -21052,6 +21105,13 @@ let rec take_flags = fn (argl: str list) ->
   | Cons (a, rest) ->
     if str_eq a "--enable-frozen-string-literal" then let _ = map_set cli_fsl "on" "1" in take_flags rest
     else if str_eq a "--disable-frozen-string-literal" then let _ = (if map_has cli_fsl "on" then map_delete cli_fsl "on" else ()) in take_flags rest
+    // -I<dir> / -I <dir>: prepend to $LOAD_PATH, in the order given.
+    else if str_len a > 2 && str_eq (substring a 0 2) "-I" then
+      let _ = add_inc (substring a 2 (str_len a)) in take_flags rest
+    else if str_eq a "-I" then
+      (match rest with
+       | Cons (d, rest2) -> let _ = add_inc d in take_flags rest2
+       | Nil -> Nil)
     else Cons (a, take_flags rest);
 
 let run_cli = fn () ->
