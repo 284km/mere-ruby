@@ -649,6 +649,9 @@ let out_print_no_nl = fn (s: str) ->
 // ENV writes overlay the real environment (there is no setenv extern);
 // VNil marks a deleted key. cli_argv holds the script's ARGV.
 let env_ovr = map_new ();
+// LoadError#path: the message determines the path, so the raise records it
+// here rather than widening VExc (which carries only a class and a message).
+let le_path = map_new ();
 // the real environment, dumped once on first read (see env_load).
 let env_cache = map_new ();
 let cli_argv = map_new ();
@@ -3813,7 +3816,14 @@ and parse_stmt_id = fn toks ->
            let (e, r3) = parse_expr (skip_nls r2) in (SIVarAssign (nm, e), r3)
          else if not (str_eq (opassign_base p) "") then
            let (e, r3) = parse_expr (skip_nls r2) in
-           (SIVarAssign (nm, EBin (opassign_base p, EIVar nm, e)), r3)
+           // `@@x ||= v` defines the class variable when it is not defined
+           // yet (Ruby special-cases that read); every other op-assign, and
+           // every op-assign on an @ivar, reads normally.
+           (let base = opassign_base p in
+            let readx = (if str_eq base "||" && str_len nm > 0 && str_eq (char_at nm 0) "@"
+                         then ECall ("__cvar_or_nil", Cons (EStrL (substring nm 1 (str_len nm)), Nil))
+                         else EIVar nm) in
+            (SIVarAssign (nm, EBin (base, readx, e)), r3))
          else let (e, r4) = parse_expr toks in (SExpr e, r4)
        | _ -> let (e, r5) = parse_expr toks in (SExpr e, r5))
     else
@@ -6464,14 +6474,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if str_contains name "::" then
       (if map_has consts name then map_get consts name
        else
-         // the leading segment can itself be lexically scoped: inside
-         // `module B`, `E::K` means `B::E::K`. Resolve the head through the
-         // cref chain before giving up on the qualified name.
+         // walk the segments left to right: the head can itself be lexically
+         // scoped (inside `module B`, `E::K` means `B::E::K`), and any segment
+         // may still be only an autoload registration, whose file has to run
+         // before the next segment even exists.
          let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
-         let hk = lex_const_key cref0 (const_head name) in
-         if (if str_eq hk "" then false else true) && map_has consts (hk ++ "::" ++ const_tail name)
-         then map_get consts (hk ++ "::" ++ const_tail name)
-         else
+         (match const_walk env world blk cref0 name with
+          | VNil ->
          let rc = recv_of_scoped name in
          let cn = const_of_scoped name in
          // top-level constants live in Object's namespace, so Object::X reads
@@ -6480,7 +6489,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          else if has_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
          else if autoload_fire env world blk name then eval_e env world blk (EConst name)
-         else raise_exc world "NameError" ("uninitialized constant " ++ name))
+         else raise_exc world "NameError" ("uninitialized constant " ++ name)
+          | found -> found))
     else
       let cref = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
       // walk the full lexical nesting (M::Base -> M -> top), not just one level.
@@ -6761,7 +6771,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             then map_set globals (substring name 1 (str_len name)) v
             else if str_len name > 0 && str_eq (char_at name 0) "@"
             then assign_one env world name v
-            else if is_upper_first name then (let _ = map_set consts name v in name_anon name v)
+            else if is_upper_first name then
+              (let key = const_assign_key env name in
+               let _ = map_set consts key v in name_anon key v)
             else lv_set env name v in
     v
   | ELambda (ps, body) ->
@@ -7600,10 +7612,21 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
      | VClass c -> let _ = map_set ivars ("cls:" ++ c ++ "@" ++ n) v in ()
      | _ -> ())
   // a constant target (Capitalized, unqualified) is stored in the constant
-  // table, so a later bare-Const read finds the assigned value.
+  // table, so a later bare-Const read finds the assigned value. It belongs to
+  // the enclosing class/module — the class-body walker namespaces the
+  // assignments it can see, but one nested in an if/unless only reaches here.
   else if is_upper_first tgt && (if str_contains tgt "::" then false else true) then
-    let _ = map_set consts tgt v in ()
+    (let _ = map_set consts (const_assign_key env tgt) v in ())
   else let _ = lv_set env tgt v in ()
+
+// where a constant assignment lands: the enclosing class/module, else the top
+// level. The class-body walker namespaces the assignments it can see directly;
+// one nested in an if/unless only reaches the ordinary statement path, so the
+// lexical scope has to be consulted here too.
+and const_assign_key = fn env -> fn (name: str) ->
+  let lex0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else "") in
+  let lex = (if str_eq lex0 "" then cur_lex () else lex0) in
+  if str_eq lex "" then name else lex ++ "::" ++ name
 
 and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
 
@@ -9086,6 +9109,34 @@ and arr_assoc_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (
 
 // If `key` has a pending autoload, consume it and load the file. Returns
 // whether anything was loaded, so the caller can retry the lookup.
+// Resolve `A::B::C` one segment at a time, firing an autoload whenever the
+// next segment is not there yet. VNil means "not found" (a constant whose
+// value really is nil falls through to the caller's NameError).
+and const_walk = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (name: str) ->
+  let hk = const_walk_head env world blk cref (const_head name) in
+  if str_eq hk "" then VNil else const_walk_go env world blk hk (const_tail name)
+// the first segment: lexically scoped, top level, or still only an autoload.
+// "" means it could not be resolved at all.
+and const_walk_head = fn env -> fn world -> fn blk -> fn (cref: str) -> fn (head: str) ->
+  let k = lex_const_key cref head in
+  if (if str_eq k "" then false else true) then k
+  else if map_has consts head then head
+  else if autoload_fire env world blk (if str_eq cref "" then head else cref ++ "::" ++ head)
+          || autoload_fire env world blk head then
+    (let k2 = lex_const_key cref head in
+     if (if str_eq k2 "" then false else true) then k2
+     else if map_has consts head then head else "")
+  else ""
+and const_walk_go = fn env -> fn world -> fn blk -> fn (sofar: str) -> fn (rest: str) ->
+  if str_eq rest "" then (if map_has consts sofar then map_get consts sofar else VNil)
+  else
+    let seg = const_head rest in
+    let key = sofar ++ "::" ++ seg in
+    if map_has consts key then const_walk_go env world blk key (const_tail rest)
+    else if autoload_fire env world blk key && map_has consts key
+    then const_walk_go env world blk key (const_tail rest)
+    else VNil
+
 and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
   if map_has autoloads key then
     (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
@@ -9705,6 +9756,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with
           | Cons (VStr pp, Cons (VStr sp, _)) -> VBool (glob_any (glob_fnm_flags args) (glob_expand (sget pp)) (sget sp))
           | _ -> VBool false)
+       // File.realpath / realdirpath: the absolute path, raising when it does
+       // not exist. mere-ruby has no lstat, so symlinks are NOT resolved —
+       // the result is expand_path's, which differs only under a symlink.
+       else if str_eq name "realpath" || str_eq name "realdirpath" then
+         (match args with
+          | Cons (VStr ph, rest) ->
+            (let p1 = sget ph in
+             let base = (match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") in
+             let abs = (if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else base ++ "/" ++ p1) in
+             let full = path_norm abs in
+             if file_exists full then mkstr full
+             else raise_exc world "Errno::ENOENT" ("No such file or directory @ realpath_rec - " ++ full))
+          | _ -> mkstr "")
+       // File.path(obj): the string form of a path — the object itself when it
+       // is already a String, else its #to_path.
+       else if str_eq name "path" then
+         (match args with
+          | Cons (VStr ph, _) -> mkstr (sget ph)
+          | Cons (v, _) -> invoke_val_c env world noblk v "to_path" Nil false
+          | _ -> mkstr "")
        else if str_eq name "basename" then
          (match args with
           | Cons (VStr ph, Cons (VStr sf, _)) -> mkstr (basename_suffix (basename_of (sget ph)) (sget sf))
@@ -9746,17 +9817,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // File.expand_path(path[, base]): a relative path resolves against
          // base when given (that is how a library says "next to this file",
          // File.expand_path("x", __dir__)), and against the CWD otherwise.
+         // "~" is the home directory, and "." / ".." segments are resolved.
          (match args with
           | Cons (VStr ph, rest) ->
-            (let path = sget ph in
-             if str_len path > 0 && str_eq (char_at path 0) "/" then mkstr path
+            (let path = tilde_expand (sget ph) in
+             if str_len path > 0 && str_eq (char_at path 0) "/" then mkstr (path_norm path)
              else
                let base = (match rest with
-                           | Cons (VStr b, _) -> let b = sget b in
+                           | Cons (VStr b, _) -> let b = tilde_expand (sget b) in
                              (if str_len b > 0 && str_eq (char_at b 0) "/" then b
                               else env_get "PWD" ++ "/" ++ b)
                            | _ -> env_get "PWD") in
-               mkstr (base ++ "/" ++ path))
+               mkstr (path_norm (base ++ "/" ++ path)))
           | _ -> mkstr "")
        else if str_eq name "delete" || str_eq name "unlink" then
          (match args with
@@ -10155,9 +10227,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // const_get(:Name) reads a constant; const_set(:Name, v) defines one.
     else if str_eq name "const_get" then
       (match args with
-       | Cons (v, _) -> let n = to_s v in (if map_has consts n then map_get consts n
-                                           else if map_has consts (c ++ "::" ++ n) then map_get consts (c ++ "::" ++ n)
-                                           else raise_exc world "NameError" ("uninitialized constant " ++ n))
+       | Cons (v, _) ->
+         (let n = to_s v in
+          let key = (if str_eq c "Object" then n else c ++ "::" ++ n) in
+          if map_has consts key then map_get consts key
+          else if map_has consts n then map_get consts n
+          // the constant may only be registered as an autoload so far
+          else if autoload_fire env world blk key || autoload_fire env world blk n then
+            (if map_has consts key then map_get consts key
+             else if map_has consts n then map_get consts n
+             else raise_exc world "NameError" ("uninitialized constant " ++ n))
+          else raise_exc world "NameError" ("uninitialized constant " ++ n))
        | _ -> VNil)
     // Module#autoload(:Const, path) / #autoload?(:Const). The registration is
     // qualified with the receiver, so Gem.autoload :Requirement, "..." answers
@@ -12445,6 +12525,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    || (str_eq c "Enumerable" && enumerable))
      | _ -> VBool false)
   else if str_eq name "message" then (match recv with VExc (_, m) -> mkstr m | _ -> mkstr (to_s recv))
+  // LoadError#path: the file that could not be loaded (nil for a LoadError
+  // raised with any other message).
+  else if str_eq name "path" then
+    (match recv with
+     | VExc (_, m) -> (if map_has le_path m then map_get le_path m else VNil)
+     | _ -> VNil)
   else if str_eq name "to_i" then
     (match recv with
      | VInt n -> VInt n | VFlt f -> VInt (int_of_float f)
@@ -13559,6 +13645,28 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   // NotImplementedError contract for platforms without fork.
   else if str_eq name "fork" then
     raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
+  // `@@x ||= v`'s read: the class variable's value, or nil when it has never
+  // been assigned (a bare read of an undefined class variable is a NameError).
+  else if str_eq name "__cvar_or_nil" && (match args with Cons (VStr _, _) -> true | _ -> false) then
+    (match args with
+     | Cons (VStr nh, _) ->
+       (let cn = sget nh in
+        let cls0 = cvar_cls env world in
+        if str_eq cls0 "" then VNil
+        else if cvar_defined_from world cls0 cn then cvar_get_from world cls0 cn
+        else VNil)
+     | _ -> VNil)
+  // the loader itself, reachable only through the default Kernel#require (and
+  // through any alias of it — which is how RubyGems keeps the original around
+  // while replacing `require`).
+  else if (str_eq name "__builtin_require" || str_eq name "__builtin_require_relative") &&
+          (match args with Cons (VStr _, _) -> true | _ -> false) then
+    (match args with
+     | Cons (VStr ph, _) ->
+       (match do_require env world noblk (str_eq name "__builtin_require_relative") (sget ph) with
+        | FNext v -> v
+        | _ -> VNil)
+     | _ -> VNil)
   // expression-position require("x") / require_relative("x") (the statement
   // forms parse as SRequire; parenthesized calls arrive here).
   else if (str_eq name "require" || str_eq name "require_relative") && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -14243,7 +14351,9 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      (match f with
       | FRaise _ -> fail "mere-ruby: (ruby exception raised)"
       | _ -> VBool true))
-  else raise_exc world "LoadError" ("cannot load such file -- " ++ p0)
+  else
+    (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
+     raise_exc world "LoadError" ("cannot load such file -- " ++ p0))
 
 // File.basename: the path's final component.
 // Ruby strips trailing slashes first, so basename("a/") is "a" and the root
@@ -14415,6 +14525,37 @@ and extname_of = fn (b: str) ->
   if i <= 0 then "" else substring b i (str_len b)
 and last_dot_at = fn (b: str) -> fn (i: int) ->
   if i < 0 then 0 - 1 else if str_eq (char_at b i) "." then i else last_dot_at b (i - 1)
+
+// "~" / "~/x" is the home directory (Ruby's expand_path does this; "~user"
+// needs a passwd lookup mere-ruby has no way to do, so it is left alone).
+and tilde_expand = fn (p: str) ->
+  if str_eq p "~" then env_get "HOME"
+  else if str_len p >= 2 && str_eq (substring p 0 2) "~/" then env_get "HOME" ++ substring p 1 (str_len p)
+  else p
+// resolve "." and ".." segments and collapse repeated slashes. Purely textual,
+// as Ruby's expand_path is — nothing here touches the filesystem.
+and path_norm = fn (p: str) ->
+  let abs = str_len p > 0 && str_eq (char_at p 0) "/" in
+  let body = path_join (path_keep (path_split p 0 0 Nil) Nil) in
+  if abs then "/" ++ body else if str_eq body "" then "." else body
+and path_split = fn (p: str) -> fn (i: int) -> fn (st: int) -> fn (acc: str list) ->
+  if i >= str_len p then rev_strs (Cons (substring p st i, acc)) Nil
+  else if str_eq (char_at p i) "/" then path_split p (i + 1) (i + 1) (Cons (substring p st i, acc))
+  else path_split p (i + 1) st acc
+and path_keep = fn (segs: str list) -> fn (acc: str list) ->
+  match segs with
+  | Nil -> rev_strs acc Nil
+  | Cons (sg, t) ->
+    if str_eq sg "" || str_eq sg "." then path_keep t acc
+    else if str_eq sg ".." then (match acc with Nil -> path_keep t acc | Cons (_, r) -> path_keep t r)
+    else path_keep t (Cons (sg, acc))
+and rev_strs = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_strs t (Cons (h, acc))
+and path_join = fn (xs: str list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (h, Nil) -> h
+  | Cons (h, t) -> h ++ "/" ++ path_join t
 
 and shq = fn (s2: str) ->
   "'" ++ shq_go s2 0 "" ++ "'"
@@ -14658,6 +14799,172 @@ and stdlib_src = fn (name: str) ->
     "module Kernel\n" ++
     "  def Pathname(path)\n" ++
     "    path.is_a?(Pathname) ? path : Pathname.new(path)\n" ++
+    "  end\n" ++
+    "end\n"
+  // Set is pure Ruby in CRuby too (a Hash with true values, which is exactly
+  // what this is), but it lives in the stdlib.
+  else if str_eq n "set" then
+    "class Set\n" ++
+    "  include Enumerable\n" ++
+    "\n" ++
+    "  def self.[](*items)\n" ++
+    "    new(items)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def initialize(enum = nil)\n" ++
+    "    @hash = \{}\n" ++
+    "    enum.each \{ |x| @hash[x] = true } if enum\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def initialize_copy(orig)\n" ++
+    "    @hash = orig.to_h_internal.dup\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def to_h_internal\n" ++
+    "    @hash\n" ++
+    "  end\n" ++
+    "  protected :to_h_internal\n" ++
+    "\n" ++
+    "  def each(&block)\n" ++
+    "    return to_enum(:each) unless block\n" ++
+    "    @hash.each_key(&block)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def size\n" ++
+    "    @hash.size\n" ++
+    "  end\n" ++
+    "  alias_method :length, :size\n" ++
+    "  alias_method :count, :size\n" ++
+    "\n" ++
+    "  def empty?\n" ++
+    "    @hash.empty?\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def include?(o)\n" ++
+    "    @hash.key?(o)\n" ++
+    "  end\n" ++
+    "  alias_method :member?, :include?\n" ++
+    "  alias_method :===, :include?\n" ++
+    "\n" ++
+    "  def add(o)\n" ++
+    "    @hash[o] = true\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  alias_method :<<, :add\n" ++
+    "\n" ++
+    "  def add?(o)\n" ++
+    "    return nil if include?(o)\n" ++
+    "    add(o)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def delete(o)\n" ++
+    "    @hash.delete(o)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def delete?(o)\n" ++
+    "    return nil unless include?(o)\n" ++
+    "    delete(o)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def merge(*enums)\n" ++
+    "    enums.each \{ |e| e.each \{ |x| @hash[x] = true } }\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def to_a\n" ++
+    "    @hash.keys\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def to_set\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def dup\n" ++
+    "    Set.new(to_a)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def clear\n" ++
+    "    @hash = \{}\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def |(other)\n" ++
+    "    Set.new(to_a + other.to_a)\n" ++
+    "  end\n" ++
+    "  alias_method :union, :|\n" ++
+    "  alias_method :+, :|\n" ++
+    "\n" ++
+    "  def &(other)\n" ++
+    "    Set.new(to_a.select \{ |x| other.include?(x) })\n" ++
+    "  end\n" ++
+    "  alias_method :intersection, :&\n" ++
+    "\n" ++
+    "  def -(other)\n" ++
+    "    Set.new(to_a.reject \{ |x| other.include?(x) })\n" ++
+    "  end\n" ++
+    "  alias_method :difference, :-\n" ++
+    "\n" ++
+    "  def ^(other)\n" ++
+    "    (self | other) - (self & other)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def subset?(other)\n" ++
+    "    to_a.all? \{ |x| other.include?(x) }\n" ++
+    "  end\n" ++
+    "  alias_method :<=, :subset?\n" ++
+    "\n" ++
+    "  def superset?(other)\n" ++
+    "    other.to_a.all? \{ |x| include?(x) }\n" ++
+    "  end\n" ++
+    "  alias_method :>=, :superset?\n" ++
+    "\n" ++
+    "  def proper_subset?(other)\n" ++
+    "    size < other.size && subset?(other)\n" ++
+    "  end\n" ++
+    "  alias_method :<, :proper_subset?\n" ++
+    "\n" ++
+    "  def proper_superset?(other)\n" ++
+    "    size > other.size && superset?(other)\n" ++
+    "  end\n" ++
+    "  alias_method :>, :proper_superset?\n" ++
+    "\n" ++
+    "  def disjoint?(other)\n" ++
+    "    (self & other).empty?\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def intersect?(other)\n" ++
+    "    !disjoint?(other)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def ==(other)\n" ++
+    "    return false unless other.is_a?(Set)\n" ++
+    "    size == other.size && subset?(other)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def eql?(other)\n" ++
+    "    self == other\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def hash\n" ++
+    "    to_a.sort_by \{ |x| x.to_s }.hash\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def freeze\n" ++
+    "    @hash.freeze\n" ++
+    "    super\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def inspect\n" ++
+    "    \"#<Set: \{\" + to_a.map \{ |x| x.inspect }.join(\", \") + \"}>\"\n" ++
+    "  end\n" ++
+    "  alias_method :to_s, :inspect\n" ++
+    "end\n" ++
+    "\n" ++
+    "module Enumerable\n" ++
+    "  def to_set\n" ++
+    "    Set.new(self)\n" ++
     "  end\n" ++
     "end\n"
   else ""
@@ -16119,7 +16426,12 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // then bare) — so `module M; class C; class Sub < C` finds `M::C`, and a
          // sibling nested class its qualified form. resolve_scope_name returns the
          // bare name unchanged when nothing matches (e.g. a top-level superclass).
-         let qsuper = (if str_eq csuper "" then "" else resolve_scope_name cscope csuper) in
+         // a nested `module` carries the "(module)" marker instead of a
+         // superclass: record its module-ness (that is what makes #class
+         // answer Module) and give it no superclass.
+         let is_mod = str_eq csuper "(module)" in
+         let _ = if is_mod then (let _ = map_set modules full VNil in ()) else () in
+         let qsuper = (if str_eq csuper "" || is_mod then "" else resolve_scope_name cscope csuper) in
          let was_new = if map_has consts full then false else true in
          // reopening an existing class with a different, explicit superclass is
          // a TypeError (the superclass stays unchanged).
@@ -16415,6 +16727,63 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
         | FLoopNext v -> FLoopNext v
         | FNext _ -> run_stmts env world blk rest))
 
+// The loader behind `require` / `require_relative`: resolve the path, run the
+// file once, and record it. Reached through Kernel#require (see SRequire), so
+// a replaced `require` can still get here by calling the original.
+and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
+     let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
+     let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
+     // require_relative: against the requiring file's dir; require: an
+     // absolute path directly, an explicit ./ or ../ against the process
+     // CWD (as in Ruby), else the $LOAD_PATH dirs, else the dir.
+     let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
+                else if rel then dir ++ "/" ++ p1
+                else if str_len p1 >= 2 && (str_eq (substring p1 0 2) "./" || (str_len p1 >= 3 && str_eq (substring p1 0 3) "../")) then
+                  env_get "PWD" ++ "/" ++ p1
+                else (let hit = load_path_find world p1 in
+                      if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
+     if map_has loaded_files full then FNext (VBool false)
+     // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
+     // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
+     // startup and the require is satisfied here rather than searched for.
+     else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb") && (if is_reg_file full then false else true) then
+       FNext (VBool true)
+     else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
+       (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
+        FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0)))
+     else
+       let _ = map_set loaded_files full VNil in
+       let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
+                | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
+                | _ -> ()) in
+       // a shipped library (see stdlib_src) has no file to read
+       let src = (if is_reg_file full then read_file full else stdlib_src p0) in
+       // the file's magic comment sets the script encoding for parse (a
+       // parse-time __ENCODING__ capture) and while it runs; a file with no
+       // magic comment is UTF-8 (per file, not inherited), as in Ruby.
+       let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
+       let cod = src_coding src in
+       let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
+       let toks = lex_go src 0 in
+       let (prog2, rest2) = parse_stmts toks Nil in
+       let _ = rx_check_pending () in
+       let _ = (match rest2 with
+                | Cons (TEOF, _) -> ()
+                | _ -> fail ("mere-ruby: unexpected token at top level in " ++ full)) in
+       // the required file runs with its own top-level locals but the
+       // same world (classes/methods/consts/globals are shared).
+       let fenv = map_new () in
+       let _ = map_set fenv "self" VMain in
+       let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
+       let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
+       let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
+       let f = run_stmts fenv world noblk2 prog2 in
+       let _ = map_set load_ctx "dir" saved in
+       let _ = map_set load_ctx "coding" savedc in
+       (match f with
+        | FRaise v -> FRaise v
+        | _ -> FNext (VBool true))
+
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   match s with
   | SPuts es ->
@@ -16440,7 +16809,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
             then map_set globals (substring name 1 (str_len name)) v
             else if str_len name >= 2 && str_eq (substring name 0 2) "::" then (let cn = substring name 2 (str_len name) in let _ = map_set consts cn v in name_anon cn v)
-            else if is_upper_first name then (let _ = map_set consts name v in name_anon name v)
+            else if is_upper_first name then
+              (let key = const_assign_key env name in
+               let _ = map_set consts key v in name_anon key v)
             else lv_set env name v in
     FNext v
   | SIVarAssign (name, e) ->
@@ -16665,58 +17036,20 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = declare_nils env names in FNext VNil
   | SRequire (rel, e) ->
     (match eval_e env world blk e with
-     | VStr p0 -> let p0 = sget p0 in
-       let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
-       let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
-       // require_relative: against the requiring file's dir; require: an
-       // absolute path directly, an explicit ./ or ../ against the process
-       // CWD (as in Ruby), else the $LOAD_PATH dirs, else the dir.
-       let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
-                  else if rel then dir ++ "/" ++ p1
-                  else if str_len p1 >= 2 && (str_eq (substring p1 0 2) "./" || (str_len p1 >= 3 && str_eq (substring p1 0 3) "../")) then
-                    env_get "PWD" ++ "/" ++ p1
-                  else (let hit = load_path_find world p1 in
-                        if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
-       if map_has loaded_files full then FNext (VBool false)
-       // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
-       // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
-       // startup and the require is satisfied here rather than searched for.
-       else if (str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb") && (if is_reg_file full then false else true) then
-         FNext (VBool true)
-       else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
-         FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0))
-       else
-         let _ = map_set loaded_files full VNil in
-         let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
-                  | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
-                  | _ -> ()) in
-         // a shipped library (see stdlib_src) has no file to read
-         let src = (if is_reg_file full then read_file full else stdlib_src p0) in
-         // the file's magic comment sets the script encoding for parse (a
-         // parse-time __ENCODING__ capture) and while it runs; a file with no
-         // magic comment is UTF-8 (per file, not inherited), as in Ruby.
-         let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
-         let cod = src_coding src in
-         let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
-         let toks = lex_go src 0 in
-         let (prog2, rest2) = parse_stmts toks Nil in
-         let _ = rx_check_pending () in
-         let _ = (match rest2 with
-                  | Cons (TEOF, _) -> ()
-                  | _ -> fail ("mere-ruby: unexpected token at top level in " ++ full)) in
-         // the required file runs with its own top-level locals but the
-         // same world (classes/methods/consts/globals are shared).
-         let fenv = map_new () in
-         let _ = map_set fenv "self" VMain in
-         let saved = (if map_has load_ctx "dir" then map_get load_ctx "dir" else mkstr ".") in
-         let _ = map_set load_ctx "dir" (mkstr (dirname_of full)) in
-         let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
-         let f = run_stmts fenv world noblk2 prog2 in
-         let _ = map_set load_ctx "dir" saved in
-         let _ = map_set load_ctx "coding" savedc in
-         (match f with
-          | FRaise v -> FRaise v
-          | _ -> FNext (VBool true))
+     | VStr p0 ->
+       // `require` is a real Kernel method, so a library that replaces it is
+       // honoured — RubyGems does exactly that, to activate a gem when the
+       // file asked for is not on the load path. The statement form is a call
+       // to whatever `require` currently resolves to; __builtin_require (the
+       // loader itself) is what the default Kernel#require calls.
+       (let mname = (if rel then "require_relative" else "require") in
+        let self0 = (if lv_has env "self" then lv_get env "self" else VMain) in
+        let (meths0, _, _, _) = world in
+        let dc = dispatch_cls_of world self0 in
+        if has_meth world dc mname then FNext (invoke world blk self0 dc mname (Cons (VStr p0, Nil)))
+        else if map_has meths0 ("Object#" ++ mname) then FNext (invoke world blk self0 "Object" mname (Cons (VStr p0, Nil)))
+        else if map_has meths0 ("Kernel#" ++ mname) then FNext (invoke world blk self0 "Kernel" mname (Cons (VStr p0, Nil)))
+        else do_require env world blk rel (sget p0))
      | _ -> FNext VNil)
   | SReturn e ->
     let v = eval_e env world blk e in
@@ -19116,6 +19449,13 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
            map_set consts "TOPLEVEL_BINDING" (VBind bid)) in
   // Exception#initialize(msg = nil) sets @message, so a user exception's
   // `super(msg)` records the message (read back by make_exc_w).
+  // `require` and `require_relative` are ordinary Kernel methods whose bodies
+  // call the loader, so a library can replace them (RubyGems does) and alias
+  // the original away first. SRequire dispatches to whatever they resolve to.
+  let _ = map_set meths "Kernel#require"
+    (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require", Cons (EVar "path", Nil))), Nil))) in
+  let _ = map_set meths "Kernel#require_relative"
+    (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
   let _ = map_set meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("message", EVar "msg"), Nil))) in
   // NameError#initialize(msg = nil, name = nil): also records the offending
   // name (NoMethodError inherits this). #name reads it back.
