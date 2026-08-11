@@ -12003,6 +12003,10 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // Enumerable: synthesize block iterators from the user's `each`.
        else if has_meth world cls "each" && is_enum_method name then
          builtin_iter world blk newblk (enum_collect world recv cls) name args
+       // a synthetic class's own method, reached with a block in hand (often a
+       // nil one, from `__send__(m, *args, &block)` forwarding): the block
+       // dispatcher has no branch for it, so hand it to the plain one.
+       else if builtin_obj_has cls name then invoke_val_c env world blk recv name args false
        else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls world cls)
      // `blk` (the enclosing method's block) is threaded so a yield inside
@@ -12361,6 +12365,25 @@ and bm_has_default = fn (defaults: (str * Expr) list) -> fn (pp: str) ->
   | Nil -> false
   | Cons ((dn, _), rest) -> str_eq dn pp || bm_has_default rest pp
 
+// The synthetic classes whose methods live in the primitive dispatcher rather
+// than the method table. respond_to? has to know about them, or a delegator
+// asked to forward `write` to a File decides the File cannot take it.
+and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
+  if str_eq cls "File" || str_eq cls "IO" then
+    str_eq name "read" || str_eq name "write" || str_eq name "print" || str_eq name "puts" ||
+    str_eq name "<<" || str_eq name "gets" || str_eq name "readline" || str_eq name "each_line" ||
+    str_eq name "readlines" || str_eq name "to_a" || str_eq name "close" || str_eq name "closed?" ||
+    str_eq name "path" || str_eq name "to_path" || str_eq name "rewind" || str_eq name "eof?" ||
+    str_eq name "eof" || str_eq name "flush" || str_eq name "sync" || str_eq name "sync=" ||
+    str_eq name "fileno" || str_eq name "tty?" || str_eq name "isatty"
+  else if str_eq cls "Time" then
+    str_eq name "to_i" || str_eq name "utc" || str_eq name "getutc" || str_eq name "utc?" ||
+    str_eq name "year" || str_eq name "month" || str_eq name "mon" || str_eq name "day" ||
+    str_eq name "mday" || str_eq name "hour" || str_eq name "min" || str_eq name "sec" ||
+    str_eq name "wday" || str_eq name "yday" || str_eq name "usec" ||
+    str_eq name "+" || str_eq name "-"
+  else false
+
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VObj id ->
@@ -12373,7 +12396,7 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
     if has_meth world cls "respond_to?" then
       truthy (invoke world nb (VObj id) cls "respond_to?" (Cons (VSym name, Nil)))
     else
-    has_meth world cls name || is_prim_method name
+    has_meth world cls name || is_prim_method name || builtin_obj_has cls name
     // respond_to_missing?(name, include_private=false): a method_missing-based
     // object can claim to respond to names it has no real method for.
     || (has_meth world cls "respond_to_missing?"
@@ -16006,6 +16029,104 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "  klass.class_eval(&block) if block\n" ++
     "  klass\n" ++
+    "end\n"
+  // `tempfile`: a File under a generated name. There is no O_EXCL here, so
+  // the name is made unique by a counter and randomness, not by an atomic
+  // create -- do not rely on it against a hostile /tmp.
+  else if str_eq n "tempfile" then
+    "require \"delegate\"\n" ++
+    "\n" ++
+    "# `tempfile`: a File under a generated name, deleted on #close!/#unlink.\n" ++
+    "# mere-ruby has no O_EXCL, so the name is made unique by a counter plus a\n" ++
+    "# random suffix rather than by an atomic create.\n" ++
+    "class Tempfile < DelegateClass(File)\n" ++
+    "  @@sequence = 0\n" ++
+    "\n" ++
+    "  attr_reader :path\n" ++
+    "\n" ++
+    "  def self.tmpdir\n" ++
+    "    ENV[\"TMPDIR\"] || \"/tmp\"\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.next_name(basename, extension)\n" ++
+    "    @@sequence += 1\n" ++
+    "    # no getpid here, so uniqueness comes from a counter plus randomness\n" ++
+    "    basename.to_s + \"-\" + @@sequence.to_s + \"-\" +\n" ++
+    "      rand(1_000_000_000).to_s + \"-\" + rand(1_000_000_000).to_s + extension.to_s\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.create(basename = \"\", tmpdir = nil, mode: nil, **_opts)\n" ++
+    "    t = new(basename, tmpdir)\n" ++
+    "    return t unless block_given?\n" ++
+    "    begin\n" ++
+    "      yield t\n" ++
+    "    ensure\n" ++
+    "      t.close!\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.open(*args, **opts)\n" ++
+    "    t = new(*args, **opts)\n" ++
+    "    return t unless block_given?\n" ++
+    "    begin\n" ++
+    "      yield t\n" ++
+    "    ensure\n" ++
+    "      t.close\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def initialize(basename = \"\", tmpdir = nil, mode: nil, **_opts)\n" ++
+    "    base, ext = if basename.is_a?(Array)\n" ++
+    "      [basename[0], basename[1]]\n" ++
+    "    else\n" ++
+    "      [basename, \"\"]\n" ++
+    "    end\n" ++
+    "    dir = tmpdir || Tempfile.tmpdir\n" ++
+    "    @path = dir + \"/\" + Tempfile.next_name(base, ext)\n" ++
+    "    File.write(@path, \"\")\n" ++
+    "    @unlinked = false\n" ++
+    "    @tmpfile = File.open(@path, \"w+\")\n" ++
+    "    super(@tmpfile)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def open\n" ++
+    "    @tmpfile.close rescue nil\n" ++
+    "    @tmpfile = File.open(@path, \"r\")\n" ++
+    "    __setobj__(@tmpfile)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def close(unlink_now = false)\n" ++
+    "    @tmpfile.close rescue nil\n" ++
+    "    unlink if unlink_now\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def close!\n" ++
+    "    close(true)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def unlink\n" ++
+    "    return if @unlinked\n" ++
+    "    File.delete(@path) rescue nil\n" ++
+    "    @unlinked = true\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  alias_method :delete, :unlink\n" ++
+    "\n" ++
+    "  def size\n" ++
+    "    @tmpfile.flush rescue nil\n" ++
+    "    File.exist?(@path) ? File.size(@path) : 0\n" ++
+    "  end\n" ++
+    "  alias_method :length, :size\n" ++
+    "\n" ++
+    "  def to_s\n" ++
+    "    @path\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def inspect\n" ++
+    "    \"#<Tempfile:\" + @path + \">\"\n" ++
+    "  end\n" ++
     "end\n"
   else ""
 
