@@ -3708,17 +3708,29 @@ and parse_stmt_id = fn toks ->
     else if str_eq id "class" then let (s, r2) = parse_class r in stmt_postfix s r2
     else if str_eq id "module" then let (s, r2) = parse_class r in stmt_postfix (mark_module s) r2
     else if str_eq id "begin" then let (s, r2) = parse_begin r in stmt_postfix s r2
-    else if str_eq id "attr_accessor" then parse_attr "rw" r
-    else if str_eq id "attr_reader" then parse_attr "r" r
-    else if str_eq id "attr_writer" then parse_attr "w" r
+    // `attr_accessor :a, :b` names the attributes statically, but these are
+    // methods: `attr_writer name` passes a variable. A non-symbol argument
+    // makes it an ordinary call.
+    else if str_eq id "attr_accessor" || str_eq id "attr_reader" || str_eq id "attr_writer" then
+      (let mode = (if str_eq id "attr_accessor" then "rw" else if str_eq id "attr_reader" then "r" else "w") in
+       match r with
+       | Cons (TSym _, _) -> parse_attr mode r
+       | _ -> let (es, r2) = parse_puts_args r Nil in apply_modifier (SExpr (ECall (id, es))) r2)
     // `attr :sym` (and `attr :a, :b`) is the classic reader-only form.
     else if str_eq id "attr" && (match r with Cons (TSym _, _) -> true | _ -> false) then parse_attr "r" r
     else if str_eq id "alias" then
       // `alias new old` — names may be bare or :symbols.
       let (n1, r1) = parse_alias_name r in
       let (n2, r2) = parse_alias_name r1 in (SAlias (n1, n2), r2)
-    else if str_eq id "undef" || str_eq id "undef_method" then
-      let (names, r2) = parse_undef_names r Nil in (SUndef names, r2)
+    else if str_eq id "undef" then
+      let (names, r2) = parse_undef_names r Nil in apply_modifier (SUndef names) r2
+    // `undef_method :a, :b` names methods statically, but it is a method, not
+    // a keyword: `undef_method(name) if defined?` passes a variable and takes
+    // a modifier, so anything that does not start with a symbol is a call.
+    else if str_eq id "undef_method" then
+      (match r with
+       | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in apply_modifier (SUndef names) r2
+       | _ -> let (es, r2) = parse_puts_args r Nil in apply_modifier (SExpr (ECall ("undef_method", es))) r2)
     else if str_eq id "include" || str_eq id "prepend" then
       // `include M[, N]` — mix module instance methods in (first module only
       // for now; extra modules are consumed and ignored).
@@ -10280,6 +10292,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       else lookup_anc world (ancestors_of world c) n2 in
          let _ = if map_has methsA (origin ++ "#" ++ n2) then
                    (let _ = map_set methsA (c ++ "#" ++ n1) (map_get methsA (origin ++ "#" ++ n2)) in
+                    // the alias keeps the ORIGINAL's lexical scope, so constants
+                    // its body names still resolve where they were written
+                    // (RubyGems aliases Kernel#require and its body reads
+                    // Kernel::RUBYGEMS_ACTIVATION_MONITOR).
+                    let _ = if map_has meth_cref (origin ++ "#" ++ n2)
+                            then map_set meth_cref (c ++ "#" ++ n1) (map_get meth_cref (origin ++ "#" ++ n2))
+                            else () in
                     let _ = if str_eq origin c then () else map_set alias_origin (c ++ "#" ++ n1) origin in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // source is a builtin (no AST body) — remember it delegates to
@@ -10302,6 +10321,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          let _ = if map_has consts n then map_delete consts n else () in
          old
        | _ -> VNil)
+    // attr_accessor / attr_reader / attr_writer called with values (a name
+    // computed at run time), rather than the literal-symbol statement form.
+    else if str_eq name "attr_accessor" || str_eq name "attr_reader" ||
+            str_eq name "attr_writer" || str_eq name "attr" then
+      (let mode = (if str_eq name "attr_reader" || str_eq name "attr" then "r"
+                   else if str_eq name "attr_writer" then "w" else "rw") in
+       let _ = add_attrs world c mode (vis_arg_names args) in
+       VNil)
     // remove_method(:m) / undef_method(:m): drop the instance method m from
     // this class (used e.g. on a singleton class to undo a class method).
     else if str_eq name "remove_method" || str_eq name "undef_method" then
@@ -17211,7 +17238,11 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          else exec_stmt cenv world noblk s   // a local / scoped assign in the body
        // `alias new old` inside the class copies the method entry.
        | SAlias (n1, n2) ->
-         let _ = if map_has meths (cls ++ "#" ++ n2) then map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2))
+         let _ = if map_has meths (cls ++ "#" ++ n2) then
+                   (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
+                    // an alias keeps the original's lexical scope (see alias_method)
+                    if map_has meth_cref (cls ++ "#" ++ n2)
+                    then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (cls ++ "#" ++ n2)) else ())
                  else () in
          FNext VNil
        // `include M` records the module for method lookup fallback.
