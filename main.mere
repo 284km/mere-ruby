@@ -7653,6 +7653,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | _ -> VBool true)
+    // For a class/module these five are the SUBCLASS partial order, not a
+    // value comparison, so they have to reach the class dispatcher rather
+    // than cmp_vals (which has no ordering for a class and raises).
+    else if (str_eq op "<" || str_eq op "<=" || str_eq op ">" ||
+             str_eq op ">=" || str_eq op "<=>") &&
+            (match va0 with VClass _ -> true | _ -> false) then
+      invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
     else if str_eq op "<=>" then
       (let vb = eval_e env world blk b in
        // <=> on incomparable operands is nil (not an error), unlike < > etc.
@@ -10450,6 +10457,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // for a singleton class this is the metaclass chain down to Class.
     else if str_eq name "ancestors" then
       arr_new (anc_vclasses (ancestors_of world c))
+    // Module#< / <= / > / >= / <=> : the subclass partial order. Unrelated
+    // modules compare to nil, which is what makes sorting a list of classes
+    // raise "comparison of Class with Class failed" until <=> exists.
+    else if str_eq name "<" || str_eq name "<=" || str_eq name ">" ||
+            str_eq name ">=" || str_eq name "<=>" then
+      (match args with
+       | Cons (VClass t, _) ->
+         let same = str_eq c t in
+         let below = (if same then false else pp_mem (ancestors_of world c) t) in
+         let above = (if same then false else pp_mem (ancestors_of world t) c) in
+         if str_eq name "<=>" then
+           (if same then VInt 0 else if below then VInt (0 - 1) else if above then VInt 1 else VNil)
+         else if same then VBool (str_eq name "<=" || str_eq name ">=")
+         else if below then VBool (str_eq name "<" || str_eq name "<=")
+         else if above then VBool (str_eq name ">" || str_eq name ">=")
+         else VNil
+       // `A < 1` is a TypeError in Ruby; `A <=> 1` is just nil.
+       | Cons (_, _) ->
+         if str_eq name "<=>" then VNil
+         else raise_exc world "TypeError" "compared with non class/module"
+       | _ -> VNil)
     // is_a?/kind_of?: a class/module is an INSTANCE of Class/Module (a singleton
     // class of Class's singleton class at the same nesting); walk that chain.
     // instance_of? checks the exact class only.
@@ -10501,6 +10529,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | _ -> VNil)
     // GC.start / GC.enable / GC.disable / GC.stress= are no-ops.
     else if str_eq c "GC" && (str_eq name "start" || str_eq name "enable" || str_eq name "disable" || str_eq name "stress=" || str_eq name "stress") then VNil
+    // Process.clock_gettime(clock_id) -- one clock behind every id, in
+    // seconds as a Float. Enough for the elapsed-time measurements libraries
+    // use it for; not a separate CPU-time source.
+    else if str_eq c "Process" && str_eq name "clock_gettime" then VFlt (time ())
     // remove_const(:Name) deletes the constant, returning its value.
     else if str_eq name "remove_const" then
       (match args with
@@ -12374,15 +12406,22 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   else if str_eq name "between?" then
     (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
   // String#match? / #match (and the Regexp receiver forms).
-  else if str_eq name "match?" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
+  // A Symbol answers both by way of its name, and a String argument on either
+  // side is a PATTERN, not a literal (`"abc".match("b")`, `/b/.match(:abc)`).
+  else if str_eq name "match?" && (match recv with VStr _ -> true | VRegex _ -> true | VSym _ -> true | _ -> false) then
     (match recv with
+     | VSym s -> (match args with Cons (VRegex (p, pf), _) -> VBool (rx_match p pf s) | Cons (VStr p, _) -> VBool (rx_match (sget p) "" s) | _ -> VBool false)
      | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> VBool (rx_match p pf sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv) | _ -> VBool false)
-     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | _ -> VBool false)
+     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | Cons (VSym sv, _) -> VBool (rx_match p pf sv) | _ -> VBool false)
      | _ -> VBool false)
-  else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | _ -> false) then
-    (match recv with
-     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> (let _ = rx_do_match world p pf sv in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
-     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> (let _ = rx_do_match world p pf (sget sv) in if map_has globals "~" then map_get globals "~" else VNil) | _ -> VNil)
+  else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | VSym _ -> true | _ -> false) then
+    (let hit = (fn (p: str) -> fn (pf: str) -> fn (sv: str) ->
+                  let _ = rx_do_match world p pf sv in
+                  if map_has globals "~" then map_get globals "~" else VNil) in
+     match recv with
+     | VSym s -> (match args with Cons (VRegex (p, pf), _) -> hit p pf s | Cons (VStr p, _) -> hit (sget p) "" s | _ -> VNil)
+     | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> hit p pf sv | Cons (VStr p, _) -> hit (sget p) "" sv | _ -> VNil)
+     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> hit p pf (sget sv) | Cons (VSym sv, _) -> hit p pf sv | _ -> VNil)
      | _ -> VNil)
   // fetch raises a catchable KeyError / IndexError when absent (no default/block).
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false)
@@ -12394,11 +12433,11 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VArr id -> let ys = deref id in let n = val_list_len ys in (match args with Cons (VInt i, rest) -> let j = (if i < 0 then n + i else i) in (if j >= 0 && j < n then val_nth ys j else (match rest with Cons (d, _) -> d | Nil -> raise_exc world "IndexError" ("index " ++ str_of_int i ++ " outside of array bounds: -" ++ str_of_int n ++ "..." ++ str_of_int n))) | _ -> VNil)
      | _ -> VNil)
   // sort/min/max of an array of user objects use their <=> (pure cmp_vals can't).
-  else if str_eq name "sort" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | _ -> false) | _ -> false) then
+  else if str_eq name "sort" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> arr_new (sort_w world (deref id)) | _ -> recv)
-  else if str_eq name "min" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | _ -> false) | _ -> false) then
+  else if str_eq name "min" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> (match sort_w world (deref id) with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
-  else if str_eq name "max" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | _ -> false) | _ -> false) then
+  else if str_eq name "max" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> (match val_rev (sort_w world (deref id)) Nil with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
   // reduce/inject symbol form (no block): `[1,2,3].reduce(:+)` /
   // `.inject(init, :*)`. The block form is handled in invoke_with_block.
@@ -13782,6 +13821,16 @@ and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
       let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
       (match invoke world noblk a ocl "<=>" (Cons (b, Nil)) with VInt n -> n | _ -> 0)
     else cmp_vals a b
+  // classes/modules order by the subclass relation (Module#<=>), so a list of
+  // them sorts; unrelated ones answer nil, which sorts as equal here.
+  | VClass ca ->
+    (match b with
+     | VClass cb ->
+       if str_eq ca cb then 0
+       else if pp_mem (ancestors_of world ca) cb then 0 - 1
+       else if pp_mem (ancestors_of world cb) ca then 1
+       else 0
+     | _ -> cmp_vals a b)
   | _ -> cmp_vals a b
 
 // insertion sort using the world-aware comparator.
@@ -17643,6 +17692,12 @@ and register_builtin_consts = fn (u: unit) ->
     Cons ("SignalException", Cons ("Interrupt", Cons ("SystemExit",
     Cons ("FloatDomainError", Cons ("StopIteration",
     Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+  // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
+  // distinct names for it rather than distinct sources.
+  let _ = map_set consts "Process::CLOCK_REALTIME" (VInt 0) in
+  let _ = map_set consts "Process::CLOCK_MONOTONIC" (VInt 6) in
+  let _ = map_set consts "Process::CLOCK_PROCESS_CPUTIME_ID" (VInt 12) in
+  let _ = map_set consts "Process::CLOCK_THREAD_CPUTIME_ID" (VInt 16) in
   reg_mod_list (Cons ("Comparable", Cons ("Enumerable", Cons ("Kernel", Cons ("Math", Nil)))))
 
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
@@ -18155,13 +18210,36 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // started everything — libraries build sibling paths out of it.
        let _ = map_set load_ctx "file" (mkstr full) in
        let noblk2 = (false, (Nil : str list), (Nil : Stmt list), fenv) in
-       let f = run_stmts fenv world noblk2 prog2 in
+       // a raise unwinds through Mere's `fail`, so catch it here the way every
+       // other body-runner does -- the exception itself is already in $exc.
+       let f = try_or (fn (u: unit) -> run_stmts fenv world noblk2 prog2) (FRaise VNil) in
        let _ = map_set load_ctx "dir" saved in
        let _ = map_set load_ctx "file" savedf in
        let _ = map_set load_ctx "coding" savedc in
        (match f with
-        | FRaise v -> FRaise v
+        // A require that raised did NOT load the feature. Ruby takes it back
+        // out of $LOADED_FEATURES so a later require retries; leaving it
+        // marked hands the next requirer a half-initialised library and the
+        // failure resurfaces somewhere unrelated (excon dies on openssl.so,
+        // then fog-aws reports a missing Process.clock_gettime).
+        | FRaise v ->
+          let _ = map_delete loaded_files full in
+          let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
+                   | VArr lfid -> arr_set lfid (vals_without (deref lfid) full)
+                   | _ -> ()) in
+          // ...then let the unwind continue: `require` is reached through a
+          // method call, which propagates a `fail`, not a Flow.
+          fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
         | _ -> FNext (VBool true))
+
+// a Val list with every string equal to `s` removed.
+and vals_without = fn (xs: Val list) -> fn (s: str) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) ->
+    (match h with
+     | VStr sh -> if str_eq (sget sh) s then vals_without t s else Cons (h, vals_without t s)
+     | _ -> Cons (h, vals_without t s))
 
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   match s with
