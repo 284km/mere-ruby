@@ -884,6 +884,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     if str_eq c " " || str_eq c "\t" || str_eq c "\r" then lex_go s (i + 1)
     else if str_eq c "\n" || str_eq c ";" then Cons (TNL, lex_go s (i + 1))
     else if str_eq c "#" then lex_go s (skip_comment s i)
+    // `=begin` ... `=end` block comment: both markers sit at column 0.
+    else if str_eq c "=" && (i == 0 || str_eq (char_at s (i - 1)) "\n")
+            && i + 6 <= str_len s && str_eq (substring s i (i + 6)) "=begin" then
+      lex_go s (skip_block_comment s i)
     else if is_digit c then
       // 0x / 0o / 0b / 0d prefixed integers.
       if str_eq c "0" && i + 1 < str_len s &&
@@ -1551,7 +1555,11 @@ and scan_op_sym = fn (s: str) -> fn (i: int) ->
   if str_eq three "===" || str_eq three "<=>" || str_eq three "[]=" || str_eq three "**=" then (three, i + 3)
   else if str_eq two "==" || str_eq two "!=" || str_eq two "<=" || str_eq two ">=" ||
           str_eq two "<<" || str_eq two ">>" || str_eq two "**" || str_eq two "[]" ||
-          str_eq two "=~" then (two, i + 2)
+          str_eq two "=~" ||
+          // the unary method names :-@ and :+@ (`-@` is what `''.respond_to?`
+          // is asked about to see whether a String can be frozen-deduped).
+          // `:~@` / `:!@` are NOT here: Ruby folds those to :~ and :!.
+          str_eq two "-@" || str_eq two "+@" then (two, i + 2)
   else (substring s i (i + 1), i + 1)
 
 // split a scoped constant name at the LAST `::`: recv part and const name.
@@ -1672,6 +1680,22 @@ and word_start_at = fn (s: str) -> fn (p: int) ->
   if p <= 0 then 0
   else (let c = char_at s (p - 1) in
         if is_alnum c || str_eq c "_" then word_start_at s (p - 1) else p)
+
+// skip from `=begin` to just past the line holding its `=end` (both at
+// column 0, as Ruby requires).
+and skip_block_comment = fn (s: str) -> fn (i: int) ->
+  let e = block_comment_end s i in
+  if e < 0 then str_len s else e
+and block_comment_end = fn (s: str) -> fn (i: int) ->
+  let ln = bc_line_end s i in
+  if ln >= str_len s then 0 - 1
+  else if ln + 4 <= str_len s && str_eq (substring s ln (ln + 4)) "=end" then bc_line_end s ln
+  else block_comment_end s ln
+// the index just past the newline that ends the line starting at i.
+and bc_line_end = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then str_len s
+  else if str_eq (char_at s i) "\n" then i + 1
+  else bc_line_end s (i + 1)
 
 and prev_nonspace = fn (s: str) -> fn (i: int) ->
   if i < 0 then 0 - 1
@@ -4304,8 +4328,31 @@ and for_multi_binding = fn (vars: str list) -> fn (n: int) ->
     else (Cons ("__f" ++ str_of_int n, ps), Cons (for_assign v (EVar ("__f" ++ str_of_int n)), ss))
 
 // target list before `in`: a name, `name,`, `a, b`, `a, *`, `a, *rest`.
+// the names inside `for (a, b) in ...`, up to the closing paren.
+and parse_for_group = fn toks -> fn (acc: str list) ->
+  match toks with
+  | Cons (TId v, r) ->
+    (match r with
+     | Cons (TP p, r2) ->
+       if str_eq p "," then parse_for_group r2 (Cons (v, acc))
+       else if str_eq p ")" then (rev_app (Cons (v, acc)) Nil, r2)
+       else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected , or ) in a for target")) in fail "mere-ruby: expected , or ) in a for target")
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated for target")) in fail "mere-ruby: unterminated for target"))
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected a variable in a for target")) in fail "mere-ruby: expected a variable in a for target")
+
 and parse_for_vars = fn toks -> fn (acc: str list) ->
   match toks with
+  // `for (a, b) in pairs` — the parens only group the destructuring, exactly
+  // as `for a, b in pairs` does.
+  | Cons (TP lp, r0) ->
+    if is_lparen lp then
+      (let (vs, r1) = parse_for_group r0 Nil in
+       match r1 with
+       | Cons (TId kw, r2) ->
+         if str_eq kw "in" then (rev_app (rev_app vs acc) Nil, r2)
+         else parse_for_vars r1 (rev_app vs acc)
+       | _ -> parse_for_vars r1 (rev_app vs acc))
+    else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected a variable after for")) in fail "mere-ruby: expected a variable after for")
   | Cons (TId v, r) ->
     if str_eq v "in" then (rev_app acc Nil, r)
     else
