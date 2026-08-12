@@ -55,8 +55,14 @@ RUBYLIB=/path/to/ruby/lib/ruby/3.2.0 ./mere-ruby script.rb
 
 Pointed at a CRuby installation's stdlib, mere-ruby runs a good deal of
 it directly — `shellwords`, `fileutils`, `racc`, `uri` all parse and
-load. Anything backed by a C extension (`openssl`, `zlib`, `socket`,
-`digest`) does not, and never will here.
+load.
+
+A C extension is not automatically out of reach, but it has to be
+answered rather than found. `digest` and `date` ship as Ruby source,
+`zlib` comes from a vendored Mere package (above), and `rbconfig` and
+`thread` are satisfied without a file. `socket` and `openssl` are not
+answered: the first is a capability nobody has forced yet, the second is
+a binding to a third-party C library and is deliberately out of scope.
 
 ## In the browser
 
