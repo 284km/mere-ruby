@@ -67,16 +67,6 @@ method table for a known origin. Every other part of the trick works:
 the unbound method is produced, binds, and returns the right answer for
 a module that does not override `name`.
 
-## `Hash#compare_by_identity`
-
-Not implemented; `sidekiq-pro` needs it.
-
-The hash store is a flat `[k, v, k, v, …]` value list and every lookup
-goes through `hash_get` / `hash_haskey`, which take the *list* and not
-the hash's handle — so there is nowhere to consult a per-hash flag
-without threading the id through all of them (26 call sites) or changing
-the store's shape.
-
 ## `MatchData#[](start, length)`
 
 Returns only the first element instead of a slice.
