@@ -2394,8 +2394,10 @@ and starts_bare_arg = fn toks ->
   | Cons (TStrL _, _) -> true
   | Cons (TSym _, _) -> true
   | Cons (TRegex _, _) -> true
-  // dq string, unary ~, lambda, or a top-level constant path (` ::Const`)
-  | Cons (TP p, _) -> str_eq p "(s" || str_eq p "~" || str_eq p "->" || str_eq p " ::"
+  // dq string, unary ~ / !, lambda, or a top-level constant path (` ::Const`).
+  // `f !x` can only be a negated argument: a method named f! lexes as one
+  // token, and `a ! b` is not Ruby.
+  | Cons (TP p, _) -> str_eq p "(s" || str_eq p "~" || str_eq p "!" || str_eq p "->" || str_eq p " ::"
   | _ -> false
 
 // A trailing `&:sym` block-pass arg becomes a real one-param block
@@ -2825,8 +2827,10 @@ and parse_primary = fn toks ->
            (if starts_block r2b then
               let (bp, bb, r4) = parse_block r2b in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2b))
-         // `foo ~x` — a unary-complement argument in a paren-less call.
-         else if str_eq p "~" then
+         // `foo ~x` / `foo !x` — a unary-operator argument in a paren-less
+         // call. Ruby has no binary `!`, and a method named `foo!` lexes as
+         // one token, so a bare `!` here can only start an argument.
+         else if str_eq p "~" || str_eq p "!" then
            let (es, r2b) = parse_puts_args r Nil in (ECall (id, es), r2b)
          // `foo ::Const` — the lexer only marks " ::" where a value can start.
          else if str_eq p " ::" then
@@ -3161,7 +3165,22 @@ and parse_call_sep = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
 and finish_call_args = fn (pos: Expr list) -> fn (hp: Expr list) ->
   match hp with
   | Nil -> rev_app pos Nil
-  | _ -> rev_app pos (Cons (EKwHash (rev_app hp Nil), Nil))
+  | _ ->
+    // `f(a: 1, **h)` -- a keyword splat belongs to the SAME keyword hash as
+    // the explicit pairs, not to the positional list, or the callee sees two
+    // arguments. Lift it out and splice it (doubled: the marker
+    // hsh_eval_items uses), after the pairs so a later splat wins.
+    let ps = rev_app pos Nil in
+    eapp (drop_kwsplats ps) (Cons (EKwHash (eapp (rev_app hp Nil) (kwsplats_doubled ps)), Nil))
+
+and drop_kwsplats = fn (xs: Expr list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> (match h with EKwSplat _ -> drop_kwsplats t | _ -> Cons (h, drop_kwsplats t))
+and kwsplats_doubled = fn (xs: Expr list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> (match h with EKwSplat e -> Cons (EKwSplat e, Cons (EKwSplat e, kwsplats_doubled t)) | _ -> kwsplats_doubled t)
 
 // ---- statements — SAME mutual-recursion group as the expression parser,
 // because a block body (`{ ... }` / `do ... end`) parses statements while
@@ -3231,6 +3250,23 @@ and parse_bare_kw_pairs = fn toks -> fn (kname: str) -> fn (acc: Expr list) ->
       (match skip_nls r2 with
        | Cons (TId k2, Cons (TP colon2, r3)) ->
          if str_eq colon2 ":" then parse_bare_kw_pairs r3 k2 acc2
+         else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected keyword argument")) in fail "mere-ruby: expected keyword argument")
+       // `m f, filename: filename, **kwargs` -- the splat joins these pairs
+       // (doubled, the marker hsh_eval_items uses), it is not a new argument.
+       | Cons (TP dsp, r3) ->
+         if str_eq dsp "**" then
+           (let (inner, r4) = parse_expr r3 in
+            let acc3 = Cons (EKwSplat inner, Cons (EKwSplat inner, acc2)) in
+            match r4 with
+            | Cons (TP c3, r5) ->
+              if str_eq c3 "," then
+                (match skip_nls r5 with
+                 | Cons (TId k3, Cons (TP colon3, r6)) ->
+                   if str_eq colon3 ":" then parse_bare_kw_pairs r6 k3 acc3
+                   else (rev_app acc3 Nil, r4)
+                 | _ -> (rev_app acc3 Nil, r4))
+              else (rev_app acc3 Nil, r4)
+            | _ -> (rev_app acc3 Nil, r4))
          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected keyword argument")) in fail "mere-ruby: expected keyword argument")
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected keyword argument")) in fail "mere-ruby: expected keyword argument"))
     else (rev_app acc2 Nil, r)
@@ -4924,6 +4960,9 @@ and parse_def = fn toks ->
     let (params, defs, r2) =
       (match r with
        | Cons (TP p, r3) -> if is_lparen p then parse_params r3 Nil Nil else (Nil, Nil, r)
+       // an operator method takes paren-less parameters too: `def []= k, v`
+       // is how psych's Coder writes its setter.
+       | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
     parse_def_tail name params defs r2
   | Cons (TId name0, r0) ->
@@ -5140,6 +5179,17 @@ and parse_bare_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) 
      | Cons (TP eq, r2) ->
        if str_eq eq "=" then
          let (e, r3) = parse_expr r2 in parse_bare_after name r3 acc (Cons ((name, e), defs))
+       // keyword parameter `name:` / `name: default`, encoded exactly as the
+       // parenthesised form does ("name:" in the list, default keyed under
+       // it). `def initialize class_loader, strict_integer: false` -- psych.
+       else if str_eq eq ":" then
+         let kn = name ++ ":" in
+         (match r2 with
+          | Cons (TP q, _) -> if str_eq q "," then parse_bare_after kn r2 acc defs
+                              else let (e, r3) = parse_expr r2 in parse_bare_after kn r3 acc (Cons ((kn, e), defs))
+          // `def m a, k:` with no default: the list ends at the newline.
+          | Cons (TNL, _) -> parse_bare_after kn r2 acc defs
+          | _ -> let (e, r3) = parse_expr r2 in parse_bare_after kn r3 acc (Cons ((kn, e), defs)))
        else parse_bare_after name r acc defs
      | _ -> parse_bare_after name r acc defs)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected parameter name")) in fail "mere-ruby: expected parameter name")
