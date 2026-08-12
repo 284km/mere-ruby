@@ -99,6 +99,22 @@ Two were not, and both hid a real problem rather than causing one:
 A corpus program may write into `/tmp`, but it must create everything it
 reads and delete it afterwards.
 
+## Corpus programs must be self-contained
+
+Two were not, and both hid a real problem rather than causing one:
+
+- `76_zlib.rb` read a zlib stream from `/tmp` that an earlier ad-hoc run had
+  left there. When `/tmp` was cleared the gate stopped at that program — with
+  `set -e`, silently, so `run_corpus.sh` reported the seventy-five programs
+  before it and exited non-zero. The stream is inline now.
+- `88_utf8_names_and_toplevel_const.rb` printed a non-ASCII symbol, and
+  `Symbol#inspect` escapes those when the default external encoding is not
+  UTF-8 — so the expected output depended on the shell's locale rather than
+  on the interpreter. It compares bytes now.
+
+A corpus program may write into `/tmp`, but it must create everything it
+reads and delete it afterwards.
+
 ## sidekiq-pro does not finish loading in a batch
 
 Loaded after two dozen other gems it does not fail at all: it was still

@@ -34,7 +34,6 @@ Every change is checked against the reference `ruby` before it lands:
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
 ./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # real gems, loaded
-#   (with a stdlib, measure in two runs -- see gemtest/README.md)
 ```
 
 Each harness derives what it needs from the arguments; nothing is left in
