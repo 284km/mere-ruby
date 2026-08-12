@@ -44,6 +44,20 @@ require now promises more than the object delivers. A program that
 requires it and then uses a lazy enumerator will fail later, and further
 from the cause than a LoadError would have been.
 
+## YAML is a loader subset, and `require "yaml"` can be lost after a failed load
+
+`yaml` / `psych` ship as Ruby source: block mappings and sequences, flow
+collections, the implicit scalar types (including YAML 1.1's rule that a
+float needs a decimal point *and* a signed exponent, so `1.0e3` is a
+String), comments, and multiple documents. No emitter, no anchors or
+aliases, no explicit tags, no block scalars (`|` / `>`).
+
+Separately: after a gem fails partway through its own load, a later
+`require "yaml"` can return without defining `YAML`. jp_prefecture loads
+on its own and after eleven other gems, but not after `dry-logic`
+specifically. `require "psych"` is unaffected in the same state, so it is
+not simply the feature staying marked. Not yet isolated.
+
 ## `Hash#compare_by_identity`
 
 Not implemented; `sidekiq-pro` needs it.

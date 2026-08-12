@@ -14391,14 +14391,26 @@ and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> 
        | Nil -> prim_method other src args)
     else prim_method other name args
 
+// does the implicit self define `name` itself? A Kernel built-in must not
+// outrank a method the receiver actually has.
+and self_defines = fn env -> fn world -> fn (name: str) ->
+  let sv = (if lv_has env "self" then lv_get env "self" else VMain) in
+  (match sv with
+   | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name || has_meth world c name
+   | VObj oid -> let (_, _, ocls0, _) = world in has_meth world (map_get ocls0 (str_of_int oid)) name
+   | _ -> false)
+
 and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // bare method(:name) — Kernel#method on the implicit self.
   if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
-  // Kernel#load.
-  else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false) then
+  // Kernel#load -- unless the implicit self defines its own `load`, which is
+  // not exotic: a YAML or JSON module calling its own load from load_file
+  // would otherwise reach Kernel's and try to run the data as Ruby.
+  else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false)
+          && (if self_defines env world name then false else true) then
     (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
   // Kernel#exit / Kernel#abort — terminate through the native exit.
   else if str_eq name "exit" then
@@ -17054,6 +17066,343 @@ and stdlib_src = fn (name: str) ->
     "  def second = @second || 0\n" ++
     "  def sec = second\n" ++
     "end\n"
+  else if str_eq n "yaml" || str_eq n "psych" then
+    "# A YAML *loader* subset: block mappings, block sequences, flow collections,\n" ++
+    "# the scalar types Ruby maps, comments, and multiple documents. No emitter, no\n" ++
+    "# anchors/aliases, no tags beyond the implicit ones. Enough for the\n" ++
+    "# configuration and data files gems actually ship.\n" ++
+    "module Psych\n" ++
+    "  class SyntaxError < StandardError; end\n" ++
+    "  class DisallowedClass < StandardError; end\n" ++
+    "\n" ++
+    "  # one physical line, already split into indent / content\n" ++
+    "  class Line\n" ++
+    "    attr_reader :indent, :text\n" ++
+    "    def initialize(indent, text)\n" ++
+    "      @indent = indent\n" ++
+    "      @text = text\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.strip_comment(s)\n" ++
+    "    out = +\"\"\n" ++
+    "    i = 0\n" ++
+    "    quote = nil\n" ++
+    "    while i < s.length\n" ++
+    "      c = s[i]\n" ++
+    "      if quote\n" ++
+    "        out << c\n" ++
+    "        if c == \"\\\\\" && quote == '\"' && i + 1 < s.length\n" ++
+    "          out << s[i + 1]\n" ++
+    "          i += 1\n" ++
+    "        elsif c == quote\n" ++
+    "          quote = nil\n" ++
+    "        end\n" ++
+    "      elsif c == '\"' || c == \"'\"\n" ++
+    "        quote = c\n" ++
+    "        out << c\n" ++
+    "      elsif c == \"#\" && (i == 0 || s[i - 1] == \" \" || s[i - 1] == \"\\t\")\n" ++
+    "        break\n" ++
+    "      else\n" ++
+    "        out << c\n" ++
+    "      end\n" ++
+    "      i += 1\n" ++
+    "    end\n" ++
+    "    out.rstrip\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.lines_of(src)\n" ++
+    "    out = []\n" ++
+    "    src.to_s.split(\"\\n\", -1).each do |raw|\n" ++
+    "      body = strip_comment(raw)\n" ++
+    "      next if body.strip.empty?\n" ++
+    "      indent = 0\n" ++
+    "      indent += 1 while indent < body.length && body[indent] == \" \"\n" ++
+    "      out << Line.new(indent, body[indent..] || \"\")\n" ++
+    "    end\n" ++
+    "    out\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # ---- scalars ------------------------------------------------------------\n" ++
+    "\n" ++
+    "  def self.unescape_double(s)\n" ++
+    "    out = +\"\"\n" ++
+    "    i = 0\n" ++
+    "    while i < s.length\n" ++
+    "      c = s[i]\n" ++
+    "      if c == \"\\\\\" && i + 1 < s.length\n" ++
+    "        i += 1\n" ++
+    "        case s[i]\n" ++
+    "        when \"n\" then out << \"\\n\"\n" ++
+    "        when \"t\" then out << \"\\t\"\n" ++
+    "        when \"r\" then out << \"\\r\"\n" ++
+    "        when \"0\" then out << \"\\0\"\n" ++
+    "        when \"\\\\\" then out << \"\\\\\"\n" ++
+    "        when '\"' then out << '\"'\n" ++
+    "        else out << s[i]\n" ++
+    "        end\n" ++
+    "      else\n" ++
+    "        out << c\n" ++
+    "      end\n" ++
+    "      i += 1\n" ++
+    "    end\n" ++
+    "    out\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  INT_RE = /\\A[-+]?\\d+\\z/\n" ++
+    "  # YAML 1.1: a float needs a decimal point, and an exponent needs a SIGN.\n" ++
+    "  # So \"1e3\" and \"1.0e3\" are Strings; \"1.0e+3\" and \"1.0E-3\" are Floats.\n" ++
+    "  FLOAT_RE = /\\A[-+]?(?:\\d+\\.\\d*|\\.\\d+)(?:[eE][-+]\\d+)?\\z/\n" ++
+    "  INF_RE = /\\A[-+]?\\.(?:inf|Inf|INF)\\z/\n" ++
+    "  NAN_RE = /\\A\\.(?:nan|NaN|NAN)\\z/\n" ++
+    "\n" ++
+    "  def self.scalar(s)\n" ++
+    "    t = s.strip\n" ++
+    "    return nil if t.empty?\n" ++
+    "    if t.start_with?('\"') && t.end_with?('\"') && t.length >= 2\n" ++
+    "      return unescape_double(t[1..-2])\n" ++
+    "    end\n" ++
+    "    if t.start_with?(\"'\") && t.end_with?(\"'\") && t.length >= 2\n" ++
+    "      return t[1..-2].gsub(\"''\", \"'\")\n" ++
+    "    end\n" ++
+    "    return nil if t == \"~\" || t == \"null\" || t == \"Null\" || t == \"NULL\"\n" ++
+    "    return true if t == \"true\" || t == \"True\" || t == \"TRUE\"\n" ++
+    "    return false if t == \"false\" || t == \"False\" || t == \"FALSE\"\n" ++
+    "    return t[1..].to_sym if t.start_with?(\":\") && t.length > 1\n" ++
+    "    return (t.start_with?(\"-\") ? -Float::INFINITY : Float::INFINITY) if INF_RE.match?(t)\n" ++
+    "    return Float::NAN if NAN_RE.match?(t)\n" ++
+    "    return t.to_i if INT_RE.match?(t)\n" ++
+    "    return t.to_f if FLOAT_RE.match?(t)\n" ++
+    "    if t.start_with?(\"[\") && t.end_with?(\"]\")\n" ++
+    "      return flow_seq(t[1..-2])\n" ++
+    "    end\n" ++
+    "    if t.start_with?(\"\{\") && t.end_with?(\"}\")\n" ++
+    "      return flow_map(t[1..-2])\n" ++
+    "    end\n" ++
+    "    t\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # split on commas that are not inside quotes or nested brackets\n" ++
+    "  def self.split_flow(s)\n" ++
+    "    parts = []\n" ++
+    "    cur = +\"\"\n" ++
+    "    depth = 0\n" ++
+    "    quote = nil\n" ++
+    "    i = 0\n" ++
+    "    while i < s.length\n" ++
+    "      c = s[i]\n" ++
+    "      if quote\n" ++
+    "        cur << c\n" ++
+    "        quote = nil if c == quote\n" ++
+    "      elsif c == '\"' || c == \"'\"\n" ++
+    "        quote = c\n" ++
+    "        cur << c\n" ++
+    "      elsif c == \"[\" || c == \"\{\"\n" ++
+    "        depth += 1\n" ++
+    "        cur << c\n" ++
+    "      elsif c == \"]\" || c == \"}\"\n" ++
+    "        depth -= 1\n" ++
+    "        cur << c\n" ++
+    "      elsif c == \",\" && depth == 0\n" ++
+    "        parts << cur\n" ++
+    "        cur = +\"\"\n" ++
+    "      else\n" ++
+    "        cur << c\n" ++
+    "      end\n" ++
+    "      i += 1\n" ++
+    "    end\n" ++
+    "    parts << cur unless cur.strip.empty? && parts.empty? && s.strip.empty?\n" ++
+    "    parts << cur if !cur.strip.empty? && parts.last != cur\n" ++
+    "    parts.reject \{ |x| x.strip.empty? }\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.flow_seq(inner)\n" ++
+    "    split_flow(inner).map \{ |x| scalar(x) }\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.flow_map(inner)\n" ++
+    "    h = \{}\n" ++
+    "    split_flow(inner).each do |pair|\n" ++
+    "      k, v = split_key(pair)\n" ++
+    "      next unless k\n" ++
+    "      h[scalar(k)] = scalar(v)\n" ++
+    "    end\n" ++
+    "    h\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # split \"key: value\" at the first colon that ends a key (followed by space\n" ++
+    "  # or end of string), skipping quotes. Returns nil when the line is not a pair.\n" ++
+    "  def self.split_key(s)\n" ++
+    "    quote = nil\n" ++
+    "    i = 0\n" ++
+    "    while i < s.length\n" ++
+    "      c = s[i]\n" ++
+    "      if quote\n" ++
+    "        quote = nil if c == quote\n" ++
+    "      elsif c == '\"' || c == \"'\"\n" ++
+    "        quote = c\n" ++
+    "      elsif c == \":\" && (i + 1 == s.length || s[i + 1] == \" \")\n" ++
+    "        return [s[0, i], s[(i + 1)..] || \"\"]\n" ++
+    "      end\n" ++
+    "      i += 1\n" ++
+    "    end\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # ---- block structure ----------------------------------------------------\n" ++
+    "\n" ++
+    "  # parse the lines at `lines[idx]`'s indentation as one node; returns\n" ++
+    "  # [value, next_index].\n" ++
+    "  def self.parse_node(lines, idx, indent)\n" ++
+    "    return [nil, idx] if idx >= lines.size\n" ++
+    "    line = lines[idx]\n" ++
+    "    return [nil, idx] if line.indent < indent\n" ++
+    "    if line.text.start_with?(\"- \") || line.text == \"-\"\n" ++
+    "      parse_seq(lines, idx, line.indent)\n" ++
+    "    else\n" ++
+    "      parse_map(lines, idx, line.indent)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.parse_seq(lines, idx, indent)\n" ++
+    "    out = []\n" ++
+    "    while idx < lines.size\n" ++
+    "      line = lines[idx]\n" ++
+    "      break if line.indent < indent\n" ++
+    "      break unless line.text.start_with?(\"- \") || line.text == \"-\"\n" ++
+    "      rest = line.text == \"-\" ? \"\" : line.text[2..]\n" ++
+    "      if rest.strip.empty?\n" ++
+    "        idx += 1\n" ++
+    "        if idx < lines.size && lines[idx].indent > indent\n" ++
+    "          v, idx = parse_node(lines, idx, lines[idx].indent)\n" ++
+    "          out << v\n" ++
+    "        else\n" ++
+    "          out << nil\n" ++
+    "        end\n" ++
+    "      elsif (kv = split_key(rest))\n" ++
+    "        # \"- key: value\" opens a mapping whose keys align past the dash\n" ++
+    "        sub = [Line.new(indent + 2, rest)]\n" ++
+    "        j = idx + 1\n" ++
+    "        while j < lines.size && lines[j].indent > indent\n" ++
+    "          sub << lines[j]\n" ++
+    "          j += 1\n" ++
+    "        end\n" ++
+    "        v, = parse_map(sub, 0, indent + 2)\n" ++
+    "        out << v\n" ++
+    "        idx = j\n" ++
+    "      elsif rest.strip.start_with?(\"-\")\n" ++
+    "        # \"- - a\" : a nested sequence starting on the same line\n" ++
+    "        sub = [Line.new(indent + 2, rest.strip)]\n" ++
+    "        j = idx + 1\n" ++
+    "        while j < lines.size && lines[j].indent > indent\n" ++
+    "          sub << lines[j]\n" ++
+    "          j += 1\n" ++
+    "        end\n" ++
+    "        v, = parse_seq(sub, 0, indent + 2)\n" ++
+    "        out << v\n" ++
+    "        idx = j\n" ++
+    "      else\n" ++
+    "        out << scalar(rest)\n" ++
+    "        idx += 1\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    [out, idx]\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.parse_map(lines, idx, indent)\n" ++
+    "    out = \{}\n" ++
+    "    while idx < lines.size\n" ++
+    "      line = lines[idx]\n" ++
+    "      break if line.indent < indent\n" ++
+    "      break if line.indent > indent\n" ++
+    "      kv = split_key(line.text)\n" ++
+    "      break unless kv\n" ++
+    "      key = scalar(kv[0])\n" ++
+    "      rest = kv[1].strip\n" ++
+    "      if rest.empty?\n" ++
+    "        idx += 1\n" ++
+    "        if idx < lines.size && (lines[idx].indent > indent ||\n" ++
+    "             (lines[idx].indent == indent && (lines[idx].text.start_with?(\"- \") || lines[idx].text == \"-\")))\n" ++
+    "          v, idx = parse_node(lines, idx, lines[idx].indent)\n" ++
+    "          out[key] = v\n" ++
+    "        else\n" ++
+    "          out[key] = nil\n" ++
+    "        end\n" ++
+    "      else\n" ++
+    "        out[key] = scalar(rest)\n" ++
+    "        idx += 1\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    [out, idx]\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # ---- documents ----------------------------------------------------------\n" ++
+    "\n" ++
+    "  def self.split_documents(src)\n" ++
+    "    docs = [[]]\n" ++
+    "    lines_of(src).each do |line|\n" ++
+    "      if line.indent == 0 && (line.text == \"---\" || line.text.start_with?(\"--- \"))\n" ++
+    "        docs << []\n" ++
+    "        rest = line.text == \"---\" ? \"\" : line.text[4..]\n" ++
+    "        docs.last << Line.new(0, rest) unless rest.to_s.strip.empty?\n" ++
+    "      elsif line.indent == 0 && line.text == \"...\"\n" ++
+    "        docs << []\n" ++
+    "      else\n" ++
+    "        docs.last << line\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    docs.reject(&:empty?)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.parse_document(lines)\n" ++
+    "    return nil if lines.empty?\n" ++
+    "    v, = parse_node(lines, 0, lines[0].indent)\n" ++
+    "    v\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.load(src, filename: nil, fallback: nil, symbolize_names: false, **_opts)\n" ++
+    "    docs = split_documents(src)\n" ++
+    "    return fallback if docs.empty?\n" ++
+    "    v = parse_document(docs.first)\n" ++
+    "    v = deep_symbolize(v) if symbolize_names\n" ++
+    "    v.nil? ? fallback : v\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.unsafe_load(src, **opts) = load(src, **opts)\n" ++
+    "\n" ++
+    "  def self.safe_load(src, permitted_classes = [], permitted_symbols = [],\n" ++
+    "                     aliases = false, filename = nil, **opts)\n" ++
+    "    load(src, **opts)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.load_stream(src, **_opts)\n" ++
+    "    split_documents(src).map \{ |d| parse_document(d) }\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.load_file(path, **opts)\n" ++
+    "    load(File.read(path), **opts)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.unsafe_load_file(path, **opts) = load_file(path, **opts)\n" ++
+    "  def self.safe_load_file(path, **opts) = load_file(path, **opts)\n" ++
+    "\n" ++
+    "  def self.parse(src, **_opts)\n" ++
+    "    parse_document(split_documents(src).first)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.deep_symbolize(v)\n" ++
+    "    case v\n" ++
+    "    when Hash\n" ++
+    "      h = \{}\n" ++
+    "      v.each \{ |k, val| h[k.respond_to?(:to_sym) ? k.to_sym : k] = deep_symbolize(val) }\n" ++
+    "      h\n" ++
+    "    when Array then v.map \{ |x| deep_symbolize(x) }\n" ++
+    "    else v\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "YAML = Psych\n"
   else if str_eq n "English" then
     "# `English` gives the punctuation globals readable names. mere-ruby aliases the\n" ++
     "# ones it actually tracks; the rest would be lies.\n" ++
@@ -18973,6 +19322,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
              // Enumerator has been built in since 1.9; requiring it is a no-op
              // in ruby too.
              str_eq p0 "enumerator" || str_eq p0 "enumerator.rb" ||
+             // psych.so: the parser is shipped as Ruby source (stdlib_src),
+             // so the extension is never looked for.
+             str_eq p0 "psych.so" ||
              // zlib is a C extension in CRuby; here it is the vendored mgz
              // package, already built in, so the require is satisfied and the
              // .so is never looked for.
