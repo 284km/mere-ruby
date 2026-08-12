@@ -52,11 +52,6 @@ float needs a decimal point *and* a signed exponent, so `1.0e3` is a
 String), comments, and multiple documents. No emitter, no anchors or
 aliases, no explicit tags, no block scalars (`|` / `>`).
 
-Separately: after a gem fails partway through its own load, a later
-`require "yaml"` can return without defining `YAML`. jp_prefecture loads
-on its own and after eleven other gems, but not after `dry-logic`
-specifically. `require "psych"` is unaffected in the same state, so it is
-not simply the feature staying marked. Not yet isolated.
 
 ## `UnboundMethod#bind_call` re-dispatches by name
 
