@@ -5852,9 +5852,10 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: % supports integers only in M0")) in fail "mere-ruby: % supports integers only in M0"))
   else if str_eq op "**" then
     (match va with
-     | VInt x -> (match vb with VInt y -> if y < 0 then VFlt (pow_flt (float_of_int x) y) else norm_big (big_pow (str_of_int x) y "1") | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** float exponent unsupported in M0")) in fail "mere-ruby: ** float exponent unsupported in M0"))
+     // a Float exponent makes the whole thing a Float, whatever the base is
+     | VInt x -> (match vb with VInt y -> if y < 0 then mk_rat_s "1" (big_pow (str_of_int x) (0 - y) "1") else norm_big (big_pow (str_of_int x) y "1") | VFlt y -> VFlt (f_pow (float_of_int x) y) | VBig y -> VFlt (f_pow (float_of_int x) (float_of_str y)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
      | VBig x -> (match vb with VInt y -> if y < 0 then VFlt (pow_flt (float_of_str x) y) else norm_big (big_pow x y "1") | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
-     | VFlt x -> (match vb with VInt y -> VFlt (pow_flt x y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** float exponent unsupported in M0")) in fail "mere-ruby: ** float exponent unsupported in M0"))
+     | VFlt x -> (match vb with VInt y -> VFlt (pow_flt x y) | VFlt y -> VFlt (f_pow x y) | VBig y -> VFlt (f_pow x (float_of_str y)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
   else if str_eq op "<<" then
     // array append (mutating, returns the same array); string concat;
@@ -6546,10 +6547,20 @@ let rec esc_str = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 
 // render a float as Ruby does, including Infinity / -Infinity / NaN.
 // (NaN fails self-equality; +/-inf is unchanged by halving.)
+// insert ".0" before the `e` when the mantissa carries no decimal point.
+let rec exp_with_point = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then s
+  else if str_eq (char_at s i) "." then s
+  else if str_eq (char_at s i) "e" || str_eq (char_at s i) "E" then
+    substring s 0 i ++ ".0" ++ substring s i (str_len s)
+  else exp_with_point s (i + 1);
+// render a float as Ruby does, including Infinity / -Infinity / NaN.
 let rb_float_str = fn (f: float) ->
   if (if f == f then false else true) then "NaN"
   else if (if f == 0.0 then false else true) && f * 0.5 == f then (if f > 0.0 then "Infinity" else "-Infinity")
-  else str_of_float f;
+  // Ruby always shows a fractional part before the exponent: 1.0e-06, never
+  // 1e-06. str_of_float drops it when the mantissa is whole.
+  else exp_with_point (str_of_float f) 0;
 
 let rec to_s = fn (v: Val) ->
   match v with
@@ -12747,6 +12758,7 @@ and is_arr_method = fn (name: str) ->
   str_eq name "reverse!" || str_eq name "reverse_each" || str_eq name "sort" || str_eq name "sort!" ||
   str_eq name "sort_by" || str_eq name "join" || str_eq name "flatten" || str_eq name "flatten!" ||
   str_eq name "compact" || str_eq name "compact!" || str_eq name "uniq" || str_eq name "uniq!" ||
+  str_eq name "resolve_feature_path" ||
   str_eq name "empty?" || str_eq name "[]" || str_eq name "[]=" || str_eq name "slice" ||
   str_eq name "slice!" || str_eq name "concat" || str_eq name "reduce" || str_eq name "inject" ||
   str_eq name "to_a" || str_eq name "to_ary" || str_eq name "count" || str_eq name "min" ||
@@ -13571,6 +13583,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr "last") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'last'")) in fail "mere-ruby: undefined method 'last'")))
   else if str_eq name "sort" then (match recv with VArr id -> arr_new (val_sort (deref id)) | VHsh xs -> arr_new (val_sort (hash_pairs (hderef xs))) | _ -> (let _ = map_set prim_missing "n" (mkstr "sort") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sort'")) in fail "mere-ruby: undefined method 'sort'")))
   else if str_eq name "uniq" then (match recv with VArr id -> arr_new (val_uniq (deref id) Nil) | _ -> (let _ = map_set prim_missing "n" (mkstr "uniq") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq'")) in fail "mere-ruby: undefined method 'uniq'")))
+  // $LOAD_PATH.resolve_feature_path(feature) -> [:rb, absolute_path] or nil.
+  // In CRuby this lives only on the $LOAD_PATH object; here it is an Array
+  // method, because rubygems calls it and nothing else in reach does.
+  else if str_eq name "resolve_feature_path" && (match recv with VArr _ -> true | _ -> false) then
+    (match args with
+     | Cons (fv, _) ->
+       let f = (match fv with VStr h -> sget h | VSym sy -> sy | _ -> "") in
+       let f1 = (if ends_with_rb f then f else f ++ ".rb") in
+       let hit = (match recv with VArr aid -> load_path_go (deref aid) f1 | _ -> "") in
+       (if str_eq hit "" then VNil
+        else arr_new (Cons (VSym "rb", Cons (mkstr hit, Nil))))
+     | _ -> VNil)
   else if str_eq name "flatten" then
     // Hash#flatten is one level: [k1, v1, k2, v2, ...].
     (match recv with
@@ -18946,6 +18970,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // must not read CRuby's thread.rb.
      else if str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb" ||
              str_eq p0 "thread" || str_eq p0 "thread.rb" ||
+             // Enumerator has been built in since 1.9; requiring it is a no-op
+             // in ruby too.
+             str_eq p0 "enumerator" || str_eq p0 "enumerator.rb" ||
              // zlib is a C extension in CRuby; here it is the vendored mgz
              // package, already built in, so the require is satisfied and the
              // .so is never looked for.
