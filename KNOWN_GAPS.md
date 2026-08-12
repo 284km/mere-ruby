@@ -98,3 +98,20 @@ Two were not, and both hid a real problem rather than causing one:
 
 A corpus program may write into `/tmp`, but it must create everything it
 reads and delete it afterwards.
+
+## sidekiq-pro does not finish loading in a batch
+
+On its own, `sidekiq-pro` fails in seconds — `Process.clock_gettime` is
+undefined "for an instance of Process", even though `::Process.clock_gettime`
+works at the top level and inside a module that shadows `Process`. That one
+is unresolved.
+
+Loaded after two dozen other gems it does not fail at all: it was still
+running after 34 minutes. This is not a regression — before non-ASCII
+identifiers were accepted, sidekiq's `api.rb` (which contains
+`alias_method :<emoji>, :clear`) stopped the load at the lexer, so the gem
+gave up early. It now parses and gets much further, and that path is slow
+enough to look like a hang.
+
+Until it is diagnosed, `gemtest/run.sh` on the full list will not finish
+with a stdlib on `-I`. Measure it as two runs (`GEMLIST` takes a subset).

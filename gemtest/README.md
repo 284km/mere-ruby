@@ -29,11 +29,16 @@ lived in /tmp, and a cleared /tmp took the measurement with it.)
 
 | | loads |
 |---|---|
-| on what mere-ruby ships | **16 / 29** |
-| with a CRuby stdlib on `-I` | **18 / 29** |
+| on what mere-ruby ships | **16 / 29** — one run |
+| with a CRuby stdlib on `-I` | **18 / 29** — two runs, see below |
+
+The stdlib figure is two runs because `sidekiq-pro` does not finish inside a
+batch (`KNOWN_GAPS.md`): gems 1-24 give 14 ok / 10 fail, the four after
+sidekiq-pro give 4 ok, and sidekiq-pro itself fails in seconds when run
+alone. Counting it as the failure it is, that is 18 loading.
 
 Every remaining failure names its own cause. Four are C extensions
-(`socket.so` twice, `openssl.so` twice), one is a gem that is not
-installed, and the rest are recorded in [KNOWN_GAPS.md](../KNOWN_GAPS.md)
-or still being chased. That breakdown is the value of the run: it is a
-list of named work, not a score.
+(`socket.so` twice, `openssl.so` twice), one is a gem that is not installed,
+and the rest are recorded in [KNOWN_GAPS.md](../KNOWN_GAPS.md) or still being
+chased. That breakdown is the value of the run: it is a list of named work,
+not a score.
