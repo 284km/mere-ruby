@@ -751,8 +751,11 @@ let rec rev_app = fn xs -> fn acc ->
   match xs with Nil -> acc | Cons (h, t) -> rev_app t (Cons (h, acc));
 
 let is_digit = fn (c: str) -> let o = ord c in o >= 48 && o <= 57;
+// Ruby identifiers may contain any non-ASCII character, and the lexer walks
+// bytes, so every byte of a UTF-8 sequence (>= 0x80) counts as a name byte.
+// sidekiq writes `alias_method :\u{1F4A3}, :clear`.
 let is_alpha = fn (c: str) ->
-  let o = ord c in (o >= 97 && o <= 122) || (o >= 65 && o <= 90) || o == 95;
+  let o = ord c in (o >= 97 && o <= 122) || (o >= 65 && o <= 90) || o == 95 || o >= 128;
 let is_alnum = fn (c: str) -> is_digit c || is_alpha c;
 
 // ---- lexer ---------------------------------------------------------------
@@ -1172,7 +1175,16 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
                     pj >= 0 && (let pc = char_at s pj in is_alnum pc || str_eq pc "_" || str_eq pc "?" || str_eq pc "!")
                     && (let nm_start = word_start_at s pj in
                         let pj2 = prev_nonspace s (nm_start - 1) in
-                        pj2 >= 0 && str_eq (word_ending_at s pj2) "def")) then
+                        pj2 >= 0 &&
+                        (str_eq (word_ending_at s pj2) "def"
+                         // ...or a singleton method: `def self.name = expr`,
+                         // where the token before the name is the dot.
+                         || (str_eq (char_at s pj2) "."
+                             && (let pj3 = prev_nonspace s (pj2 - 1) in
+                                 pj3 >= 0 &&
+                                 (let rs = word_start_at s pj3 in
+                                  let pj4 = prev_nonspace s (rs - 1) in
+                                  pj4 >= 0 && str_eq (word_ending_at s pj4) "def")))))) then
           Cons (TP " =", lex_go s (i + 1))
         else if str_eq two "::" && i > 0 && (str_eq (char_at s (i - 1)) " " || str_eq (char_at s (i - 1)) "\t")
            && i + 2 < str_len s && is_upper_first (char_at s (i + 2))
@@ -2891,8 +2903,11 @@ and parse_primary = fn toks ->
     else if str_eq p "[" || str_eq p " [" then parse_array r
     else if str_eq p "\{" then parse_hash r
     else if str_eq p "::" || str_eq p " ::" then
-      // leading ::Const — a top-level constant, read by bare name.
-      (match r with Cons (TId n, r2) -> (EConst n, r2) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected constant after ::")) in fail "mere-ruby: expected constant after ::"))
+      // leading ::Const — a TOP-LEVEL constant. Keep the prefix: read by bare
+      // name it would find a nested constant of the same name instead, which
+      // is exactly what `::Process` inside Sidekiq (which has its own
+      // Process) is written to avoid.
+      (match r with Cons (TId n, r2) -> (EConst ("::" ++ n), r2) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: expected constant after ::")) in fail "mere-ruby: expected constant after ::"))
     else if str_eq p ".." || str_eq p "..." then
       // beginless range (..5)
       let (hi, r2) = parse_bin r 1 in
@@ -6835,9 +6850,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ESym s -> VSym s
   | ESelf -> if lv_has env "self" then lv_get env "self" else VNil
   | EConst name ->
+    // `::Name` is top level and nothing else -- no lexical walk.
+    if str_len name > 2 && str_eq (substring name 0 2) "::" then
+      (let n = substring name 2 (str_len name) in
+       if map_has consts n then map_get consts n
+       else if autoload_fire env world blk n then eval_e env world blk (EConst ("::" ++ n))
+       else raise_exc world "NameError" ("uninitialized constant " ++ n))
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
-    if str_contains name "::" then
+    else if str_contains name "::" then
       (if map_has consts name then map_get consts name
        else
          // walk the segments left to right: the head can itself be lexically
@@ -7030,7 +7051,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | EConst name ->
        // a qualified name's head can be lexically scoped: inside `module M`,
        // `I::K` is `M::I::K` (the same walk EConst's evaluation does).
-       (if map_has consts name then mkstr "constant"
+       // `::Name` carries its prefix and is top level only.
+       (if str_len name > 2 && str_eq (substring name 0 2) "::" then
+          (if map_has consts (substring name 2 (str_len name)) then mkstr "constant" else VNil)
+        else if map_has consts name then mkstr "constant"
         else if str_contains name "::" then
           (let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else cur_lex ()) in
            let hk = lex_const_key cref0 (const_head name) in
@@ -7495,6 +7519,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
             if str_eq k "throw" && rb_eq tg tag then v
             else flow_rethrow_tagged k tg v
           else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
@@ -8478,10 +8503,12 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
   // remember WHERE, while the loader still knows: load_ctx "file" is restored
   // as each require returns, so by the time an error reaches the top level it
   // names the entry script and not the library that actually failed.
-  let _ = map_set prim_missing "f" (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
+  let _ = (if map_has prim_missing "f" then ()
+           else map_set prim_missing "f" (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "")) in
   let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
   // a real Ruby exception must never inherit a stale internal-failure message
   let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
   (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (built-in exception raised)")) in fail "mere-ruby: (built-in exception raised)")
 
 // run `theblk` and return the resulting Flow, so break/next inside the
@@ -8585,6 +8612,7 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
       if str_eq k "break" then FBreak v
       else if str_eq k "next" then FLoopNext v
       else if str_eq k "redo" then let _ = tick () in block_body_flow cenv world encl body
@@ -10385,7 +10413,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Nil -> VRegex ("(?!)", "")
        | _ -> VRegex (rx_union_go alts "" true, ""))
     // Math module functions (only sqrt-derived ones; no trig/log builtin).
-    else if str_eq c "Math" then
+    // ...only for the functions Math actually has; anything else (Module's own
+    // methods, `class`, `name`, ...) falls through to the general dispatcher.
+    else if str_eq c "Math" && (if is_module_method name then false else true)
+            && (if is_prim_method name then false else true) then
       (if str_eq name "sqrt" then (match args with Cons (v, _) -> VFlt (sqrt (to_f v)) | _ -> VFlt 0.0)
        else if str_eq name "hypot" then (match args with Cons (a, Cons (b, _)) -> VFlt (sqrt (to_f a * to_f a + to_f b * to_f b)) | _ -> VFlt 0.0)
        else if str_eq name "sin" then (match args with Cons (v, _) -> VFlt (sin (to_f v)) | _ -> VFlt 0.0)
@@ -10858,7 +10889,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // `Kernel.raise` / `Kernel.format` / ... : the module-function form of the
     // private Kernel methods, which is how a library reaches them past a
     // possible override (`::Kernel::raise ::ArgumentError, "..."`).
-    else if str_eq c "Kernel" then
+    // ...only for the module functions; Module's own methods (`class`, `name`,
+    // ...) fall through to the general dispatcher, as for Math above.
+    else if str_eq c "Kernel" && (if is_module_method name then false else true)
+            && (if str_eq name "class" then false else true) then
       // `raise` is an expression form, not an entry in the method table.
       (if str_eq name "raise" || str_eq name "fail" then
          (let (_, _, _, iv0) = world in
@@ -11711,20 +11745,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                if str_eq k "return" then (let _ = map_delete flow_sig "k" in
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
-            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in v)
+            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in v)
                else if str_eq k "returnret" then
                  // consume iff this lambda is the target; else keep propagating
                  // (flow_sig still holds k/fid/v, so just re-raise).
                  (if tgt == lfid then (let _ = map_delete flow_sig "k" in
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
-            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in let _ = map_delete flow_sig "fid" in v)
+            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in let _ = map_delete flow_sig "fid" in v)
                   else (let _ = tgt in (let m = "mere-ruby: (unhandled return past its frame)" in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)))
                else if str_eq k "breakret" then (let _ = tgt in (let m = "mere-ruby: (unhandled break past its frame)" in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
                else (let _ = map_delete flow_sig "k" in
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
-            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in flow_throw k v)
+            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in flow_throw k v)
              else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
            | other -> flow_value other))
       else flow_value (run_block world noblk (proc_as_block pid) args)
@@ -15232,6 +15269,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
       if str_eq k "return" then FNext v
       else if str_eq k "breakret" || str_eq k "returnret" then
         // a break/return unwinding to its block's home frame: consume it here
@@ -15293,6 +15331,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
                         if str_eq k "break" then () else (let _ = flow_rethrow k v2 in ()))
                      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)"))
                   | _ -> ()))
@@ -15316,6 +15355,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
                        if str_eq k "break" then () else (let _ = flow_rethrow k v2 in ()))
                     else
                       // the bounded collector ends the generator by raising
@@ -18110,6 +18150,7 @@ and lz_run = fn env -> fn world -> fn blk -> fn (id: int) -> fn (bound: int) -> 
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
                  if str_eq k "break" then () else (let _ = flow_rethrow k v2 in ()))
               else
                 let ecls = (if map_has ivars0 "$exc" then (match map_get ivars0 "$exc" with VExc (c2, _) -> c2 | _ -> "") else "") in
@@ -19004,8 +19045,10 @@ and register_builtin_consts = fn (u: unit) ->
   let _ = map_set consts "Process::CLOCK_MONOTONIC" (VInt 6) in
   let _ = map_set consts "Process::CLOCK_PROCESS_CPUTIME_ID" (VInt 12) in
   let _ = map_set consts "Process::CLOCK_THREAD_CPUTIME_ID" (VInt 16) in
+  // these are Modules in ruby, not Classes -- #class must say so
   reg_mod_list (Cons ("Comparable", Cons ("Enumerable", Cons ("Kernel", Cons ("Math",
-    Cons ("Zlib", Cons ("Zlib::Deflate", Cons ("Zlib::Inflate", Nil))))))))
+    Cons ("Process", Cons ("GC", Cons ("ObjectSpace", Cons ("Marshal", Cons ("Signal",
+    Cons ("Zlib", Cons ("Zlib::Deflate", Cons ("Zlib::Inflate", Nil)))))))))))))
 
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved_lex = cur_lex () in
@@ -19537,8 +19580,20 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
        let cod = src_coding src in
        let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
-       let toks = lex_go src 0 in
-       let (prog2, rest2) = parse_stmts toks Nil in
+       // a lex/parse failure is a `fail`, not a raise, so it never reaches
+       // raise_exc's bookkeeping -- record the file here so the report names
+       // it rather than the entry script.
+       // try_or's fallback is an ordinary value, evaluated eagerly, so the
+       // failure has to be signalled through a flag rather than in it.
+       let pok = map_new () in
+       let (prog2, rest2) =
+         try_or (fn (u: unit) ->
+                   let r = parse_stmts (lex_go src 0) Nil in
+                   let _ = map_set pok "y" 1 in r)
+                (Nil, Nil) in
+       let _ = if map_has pok "y" then () else
+                 (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
+                  let _ = fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: parse failed") else "mere-ruby: parse failed") in ()) in
        let _ = rx_check_pending () in
        let _ = (match rest2 with
                 | Cons (TEOF, _) -> ()
@@ -19966,6 +20021,7 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
            let _ = if map_has prim_missing "c" then map_delete prim_missing "c" else () in
            let _ = if map_has prim_missing "m" then map_delete prim_missing "m" else () in
            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
            run_rescues env world blk exc rescues
          else FRaise VNil   // flow pending — skip rescue
        | FReturn v -> FReturn v
@@ -20200,6 +20256,7 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
        if str_eq k "retry" then raise_exc world "SyntaxError" "Invalid retry"
        else let _ = flow_rethrow k v in VNil
      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
@@ -20240,6 +20297,7 @@ and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
        if str_eq k "break" then v else flow_throw k v
      else
        // a StopIteration ends the loop quietly; other exceptions re-raise.
@@ -20262,6 +20320,7 @@ and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
             // a CONSUMED flow signal must not leave its internal message behind:
             // the next real failure would be reported as that instead.
             let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+           let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
       if str_eq k "break" then FBreak v
       else if str_eq k "next" then FLoopNext v
       else if str_eq k "redo" then let _ = tick () in while_body_flow env world blk body
@@ -22544,7 +22603,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
        (let m = (if map_has prim_missing "i"
                  then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: failed")
                  else "mere-ruby: failed") in
-        let _ = print_err m in exit 1)) in
+        let _ = print_err (if str_eq (err_where name) name then m else err_where name ++ ": " ++ m) in exit 1)) in
   if print_result then
     (match final with
      | FNext (VObj id) ->

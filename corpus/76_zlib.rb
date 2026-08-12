@@ -32,8 +32,12 @@ p Zlib::DEFAULT_COMPRESSION
   p [s.bytesize, Zlib::Inflate.inflate(d) == s]
 end
 
-# a stream written by the real zlib decompresses here
-p Zlib::Inflate.inflate(File.binread("/tmp/z_ruby.bin"))
+# a stream written by the real zlib decompresses here. The bytes are inline on
+# purpose: a corpus program must not depend on a file some earlier run left in
+# /tmp -- this one did, and the gate silently stopped at it once /tmp was clean.
+REAL_ZLIB = [120, 156, 203, 72, 205, 201, 201, 87, 200, 192, 32, 203, 243, 139,
+             114, 82, 144, 73, 0, 67, 183, 15, 137].pack("C*")
+p Zlib::Inflate.inflate(REAL_ZLIB)
 
 # ...and the compressor actually compresses
 big = "abcdefgh" * 400

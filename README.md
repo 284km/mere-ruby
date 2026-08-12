@@ -24,6 +24,22 @@ Divergences that are understood and deliberately unfixed are tracked in
 [KNOWN_GAPS.md](KNOWN_GAPS.md), with what each costs and what fixing it
 would take — separately from what nobody has looked at yet.
 
+## Gates
+
+Every change is checked against the reference `ruby` before it lands:
+
+```sh
+./run_corpus.sh                                  # 88 programs, byte-for-byte
+./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
+./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
+./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
+./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # real gems, loaded
+```
+
+Each harness derives what it needs from the arguments; nothing is left in
+`/tmp` between runs. Two of them used to be, and a cleared `/tmp` quietly
+took the measurement with it.
+
 ## Vendored packages
 
 `zlib` is a C extension in CRuby. Here it is [mgz](https://github.com/284km/mgz)

@@ -76,3 +76,25 @@ a module that does not override `name`.
 Not implemented. zeitwerk uses it to notice when an explicit namespace
 constant is defined, so `dry-logic` (and anything else that loads
 zeitwerk's full autoloader) stops there.
+
+## `Kernel.puts` and the other Kernel module functions
+
+`Kernel.puts "x"` raises NoMethodError; the private Kernel methods are
+reachable as `puts` but not as `Kernel.puts`. Long-standing, unrelated
+to the dispatch order — it fails the same way at any commit tried.
+
+## Corpus programs must be self-contained
+
+Two were not, and both hid a real problem rather than causing one:
+
+- `76_zlib.rb` read a zlib stream from `/tmp` that an earlier ad-hoc run had
+  left there. When `/tmp` was cleared the gate stopped at that program — with
+  `set -e`, silently, so `run_corpus.sh` reported the seventy-five programs
+  before it and exited non-zero. The stream is inline now.
+- `88_utf8_names_and_toplevel_const.rb` printed a non-ASCII symbol, and
+  `Symbol#inspect` escapes those when the default external encoding is not
+  UTF-8 — so the expected output depended on the shell's locale rather than
+  on the interpreter. It compares bytes now.
+
+A corpus program may write into `/tmp`, but it must create everything it
+reads and delete it afterwards.
