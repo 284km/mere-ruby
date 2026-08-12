@@ -6796,7 +6796,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // top-level constants live in Object's namespace, so Object::X reads
          // the bare top-level X.
          if str_eq rc "Object" && map_has consts cn then map_get consts cn
-         else if has_meth world rc "const_missing" then
+         else if has_meth world ("(sng:" ++ rc ++ ")") "const_missing" || has_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
          else if autoload_fire env world blk name then eval_e env world blk (EConst name)
          else raise_exc world "NameError" ("uninitialized constant " ++ name)
@@ -8979,6 +8979,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "each_with_object" then (match args with Cons (o, _) -> arr_each_with_object world encl theblk xs o | Nil -> VNil)
     else if str_eq name "take_while" then iter_result (arr_take_while world encl theblk xs Nil) recv
     else if str_eq name "drop_while" then iter_result (arr_drop_while world encl theblk xs) recv
+    // to_h { |k, v| [k2, v2] } -- the block maps each element to a pair
+    else if str_eq name "to_h" then
+      (match arr_map world encl theblk xs Nil with
+       | FNext (VArr aid) -> mkhash (val_to_h (deref aid))
+       | FBreak v -> v
+       | _ -> mkhash Nil)
     else if str_eq name "filter_map" then iter_result (arr_filter_map world encl theblk xs Nil) recv
     else if str_eq name "find_all" then iter_result (arr_filter world encl theblk xs Nil true) recv
     else if str_eq name "reverse_each" then iter_each_result (arr_reverse_each world encl theblk xs) recv
@@ -10734,6 +10740,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (if map_has consts key then map_get consts key
              else if map_has consts n then map_get consts n
              else raise_exc world "NameError" ("uninitialized constant " ++ n))
+          // const_missing is the documented hook and const_get has to honour
+          // it, not just a bare `Const` reference: regexp_parser resolves its
+          // per-ruby-version syntax classes entirely through const_get.
+          else if has_meth world ("(sng:" ++ c ++ ")") "const_missing" || has_meth world c "const_missing" then
+            invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym n, Nil)) false
           else raise_exc world "NameError" ("uninitialized constant " ++ n))
        | _ -> VNil)
     // Module#autoload(:Const, path) / #autoload?(:Const). The registration is
@@ -13731,7 +13742,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // default. invoke_val_c intercepts join with a world-aware element
     // stringifier before reaching this path (so user #to_s is honored).
     (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join to_s xs sep "" true) | _ -> mkstr (val_join to_s xs "" "" true)) | _ -> (let _ = map_set prim_missing "n" (mkstr "join") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'join'")) in fail "mere-ruby: undefined method 'join'")))
-  else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh xs -> mkhash (hderef xs) | _ -> (let _ = map_set prim_missing "n" (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
+  // NilClass#to_h is {} (and #to_a is []), which is how a library writes
+  // `maybe_nil.to_h.map { ... }` without a guard.
+  else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh xs -> mkhash (hderef xs) | VNil -> mkhash Nil | _ -> (let _ = map_set prim_missing "n" (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
   // Array#pack — a small but common subset: "U"/"U*" encode integer codepoints
   // as UTF-8, "C"/"c" pack the low byte of each integer. A bare directive packs
   // one element, "*" packs all. (Other directives are not implemented.)
@@ -14493,6 +14506,16 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   // the loader itself, reachable only through the default Kernel#require (and
   // through any alias of it — which is how RubyGems keeps the original around
   // while replacing `require`).
+  // the body of Module#const_missing: raise with ruby's message, which names
+  // the receiver unless it is Object.
+  else if str_eq name "__const_missing_raise" then
+    (match args with
+     | Cons (owner, Cons (cn, _)) ->
+       let n = (match cn with VSym sy -> sy | VStr h -> sget h | _ -> to_s cn) in
+       let oc = (match owner with VClass c2 -> c2 | _ -> "Object") in
+       raise_exc world "NameError"
+         ("uninitialized constant " ++ (if str_eq oc "Object" then n else oc ++ "::" ++ n))
+     | _ -> VNil)
   else if (str_eq name "__builtin_require" || str_eq name "__builtin_require_relative") &&
           (match args with Cons (VStr _, _) -> true | _ -> false) then
     (match args with
@@ -22160,6 +22183,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // `require` and `require_relative` are ordinary Kernel methods whose bodies
   // call the loader, so a library can replace them (RubyGems does) and alias
   // the original away first. SRequire dispatches to whatever they resolve to.
+  // Module#const_missing as a real method, so a library hook that handles
+  // some names and calls `super` for the rest has somewhere to land.
+  let _ = map_set meths "Module#const_missing"
+    (Meth (Cons ("name", Nil), Nil,
+           Cons (SExpr (ECall ("__const_missing_raise", Cons (ESelf, Cons (EVar "name", Nil)))), Nil))) in
   let _ = map_set meths "Kernel#require"
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require", Cons (EVar "path", Nil))), Nil))) in
   let _ = map_set meths "Kernel#require_relative"
