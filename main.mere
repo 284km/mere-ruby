@@ -271,6 +271,12 @@ type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
 type RxRes = RFound of int * (int * int) list | RFail;
 type RxHit = RHit of int * int * (int * int) list | RNoHit | RBadPat;
 
+// DEFLATE comes from the mgz package, vendored under .mere_modules/. Zlib's
+// streams are the same RFC 1951 body under a different wrapper, so mere-ruby
+// only adds the zlib header/Adler-32 around what mgz already computes.
+import "mgz/inflate.mere";
+import "mgz/deflate.mere";
+
 // ---- mutable-array store (M10) ------------------------------------------
 // A single top-level Map captured by every function below (no threading):
 // id (as str) -> the array's contents (a Val list). Arrays are handles
@@ -10615,6 +10621,35 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | _ -> VNil)
     // GC.start / GC.enable / GC.disable / GC.stress= are no-ops.
     else if str_eq c "GC" && (str_eq name "start" || str_eq name "enable" || str_eq name "disable" || str_eq name "stress=" || str_eq name "stress") then VNil
+    // Zlib.crc32(str, seed) / Zlib.adler32(str, seed), and the two stream
+    // methods, reached as Zlib::Deflate.deflate / Zlib::Inflate.inflate.
+    else if (str_eq c "Zlib" || str_eq c "Zlib::Deflate" || str_eq c "Zlib::Inflate")
+            && (str_eq name "crc32" || str_eq name "adler32" ||
+                str_eq name "deflate" || str_eq name "inflate") then
+      (let sv = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
+       let v = str_to_bytevec sv in
+       if str_eq name "crc32" then
+         (match args with
+          // crc32(str, seed): continue a running CRC, which is how a PNG
+          // chunk's checksum covers the type and the content together.
+          | Cons (_, Cons (VInt seed, _)) -> VInt (bit_xor (crc32_cont (bit_xor seed mask32) v) mask32)
+          | _ -> VInt (crc32_vec v))
+       else if str_eq name "adler32" then
+         (match args with
+          | Cons (_, Cons (VInt seed, _)) -> VInt (adler32_vec v seed)
+          | Nil -> VInt 1
+          | _ -> VInt (adler32_vec v 1))
+       else if str_eq name "deflate" then
+         // Not shipped. Three different implementations of the compressing side
+         // -- mgz's dynamic-Huffman path, mgz's stored path, and a stored-block
+         // writer written directly here -- each produce a stream CRuby's
+         // inflater rejects, while equivalent code is correct standalone and in
+         // small programs. Decompression, CRC-32 and Adler-32 all verify, so
+         // this raises rather than emitting bytes that only look right.
+         // See PAIN.md.
+         raise_exc world "NotImplementedError" "Zlib::Deflate.deflate is not implemented in mere-ruby (inflate, crc32 and adler32 are)"
+       else
+         mkstr (bytevec_to_str (inflate (bytevec_pad v) (zlib_body_start v))))
     // Process.clock_gettime(clock_id) -- one clock behind every id, in
     // seconds as a Float. Enough for the elapsed-time measurements libraries
     // use it for; not a separate CPU-time source.
@@ -14114,6 +14149,112 @@ and downto_arr = fn (a: int) -> fn (b: int) ->
 
 and str_bytes_val = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Nil else Cons (VInt (ord (char_at s i)), str_bytes_val s (i + 1))
+
+// ---- Zlib -----------------------------------------------------------------
+// The DEFLATE engine is the vendored mgz package; everything here is the
+// bridge: mere-ruby's byte-holding String to and from a Mere byte vector, and
+// zlib's wrapper (RFC 1950) around the same RFC 1951 body mgz produces for
+// gzip. A String is a length-carrying handle, so NUL and high bytes survive.
+and str_to_bytevec = fn (s: str) ->
+  let v = vec_new () in
+  let n = str_len s in
+  let rec go = fn (i: int) ->
+    if i >= n then v else (let _ = vec_push v (ord (char_at s i)) in go (i + 1)) in
+  go 0
+
+// Built through a list + str_join rather than repeated `++`, which would be
+// quadratic over a compressed stream.
+and bytevec_to_str = fn v ->
+  let n = vec_len v in
+  let rec go = fn (i: int) -> fn (acc: str list) ->
+    if i < 0 then str_join "" acc else go (i - 1) (Cons (chr (vec_get v i), acc)) in
+  go (n - 1) Nil
+
+// CRC-32 continued from a running value (mgz's crc32_vec always starts and
+// ends fresh); Zlib.crc32's seed argument needs the resumable form.
+and crc32_cont = fn (crc0: int) -> fn v ->
+  let n = vec_len v in
+  let rec go = fn (i: int) -> fn (crc: int) ->
+    if i >= n then crc else go (i + 1) (crc_byte crc (vec_get v i)) in
+  go 0 crc0
+
+// Adler-32 (RFC 1950 §9): the zlib stream's checksum, where gzip uses CRC-32.
+and adler32_vec = fn v -> fn (seed: int) ->
+  let n = vec_len v in
+  let rec go = fn (i: int) -> fn (a: int) -> fn (b: int) ->
+    if i >= n then bit_or (bit_shl b 16) a
+    else let a2 = floor_mod (a + (vec_get v i : int)) 65521 in
+         go (i + 1) a2 (floor_mod (b + a2) 65521) in
+  go 0 (bit_and seed 0xFFFF) (bit_and (bit_shr seed 16) 0xFFFF)
+
+// zlib wrapper: CMF/FLG chosen so the 16-bit header is a multiple of 31,
+// then the DEFLATE body, then Adler-32 big-endian.
+and zlib_wrap = fn body -> fn (adler: int) ->
+  let out = vec_new () in
+  let _ = vec_push out 0x78 in
+  let _ = vec_push out 0x9C in
+  let n = vec_len body in
+  let rec cp = fn (i: int) ->
+    if i >= n then () else (let _ = vec_push out (vec_get body i) in cp (i + 1)) in
+  let _ = cp 0 in
+  let _ = vec_push out (bit_and (bit_shr adler 24) 255) in
+  let _ = vec_push out (bit_and (bit_shr adler 16) 255) in
+  let _ = vec_push out (bit_and (bit_shr adler 8) 255) in
+  let _ = vec_push out (bit_and adler 255) in
+  out
+
+// A zlib stream starts with CMF/FLG; a raw DEFLATE stream does not, so accept
+// both (Ruby's Zlib::Inflate.inflate is given zlib streams, but chunky_png
+// hands raw bodies around too).
+// The bit reader fetches a byte whenever its buffer runs dry, so a stream
+// that ends exactly on a byte boundary reads one past the end. gzip's 8-byte
+// trailer absorbed that; a zlib stream's 4-byte Adler-32 does not always.
+// Padding is safe: inflate stops at the BFINAL block, never at the end.
+and bytevec_pad = fn v ->
+  let out = vec_new () in
+  let n = vec_len v in
+  let rec cp = fn (i: int) ->
+    if i >= n then () else (let _ = vec_push out (vec_get v i) in cp (i + 1)) in
+  let _ = cp 0 in
+  let rec z = fn (i: int) ->
+    if i >= 8 then () else (let _ = vec_push out 0 in z (i + 1)) in
+  let _ = z 0 in
+  out
+
+// RFC 1951 3.2.4 stored blocks: a byte-aligned header (BFINAL, BTYPE=00),
+// LEN and its one's complement little-endian, then the bytes verbatim. Valid
+// DEFLATE that every inflater accepts; it just does not compress.
+and deflate_stored_bytes = fn v ->
+  let out = vec_new () in
+  let n = vec_len v in
+  let rec blocks = fn (off: int) ->
+    let left = n - off in
+    let len = if left > 65535 then 65535 else left in
+    let last = if off + len >= n then 1 else 0 in
+    let _ = vec_push out last in
+    let _ = vec_push out (bit_and len 255) in
+    let _ = vec_push out (bit_and (bit_shr len 8) 255) in
+    let _ = vec_push out (bit_and (bit_xor len 0xFFFF) 255) in
+    let _ = vec_push out (bit_and (bit_shr (bit_xor len 0xFFFF) 8) 255) in
+    let rec cp = fn (i: int) ->
+      if i >= len then () else (let _ = vec_push out (vec_get v (off + i)) in cp (i + 1)) in
+    let _ = cp 0 in
+    if off + len >= n then () else blocks (off + len) in
+  // an empty input still needs one final, empty stored block
+  let _ = if n == 0 then
+            (let _ = vec_push out 1 in
+             let _ = vec_push out 0 in
+             let _ = vec_push out 0 in
+             let _ = vec_push out 255 in
+             let _ = vec_push out 255 in ())
+          else blocks 0 in
+  out
+
+and zlib_body_start = fn v ->
+  if vec_len v >= 2
+     && bit_and (vec_get v 0) 15 == 8
+     && floor_mod (bit_shl (vec_get v 0) 8 + (vec_get v 1 : int)) 31 == 0
+  then 2 else 0
 
 // prepend `h` to each combination array in `combos`.
 and combos_prepend = fn (h: Val) -> fn (combos: Val list) ->
@@ -18284,11 +18425,18 @@ and register_builtin_consts = fn (u: unit) ->
     Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
   // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
   // distinct names for it rather than distinct sources.
+  // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
+  // per block on its own, so the level is accepted and ignored.
+  let _ = map_set consts "Zlib::NO_COMPRESSION" (VInt 0) in
+  let _ = map_set consts "Zlib::BEST_SPEED" (VInt 1) in
+  let _ = map_set consts "Zlib::BEST_COMPRESSION" (VInt 9) in
+  let _ = map_set consts "Zlib::DEFAULT_COMPRESSION" (VInt (0 - 1)) in
   let _ = map_set consts "Process::CLOCK_REALTIME" (VInt 0) in
   let _ = map_set consts "Process::CLOCK_MONOTONIC" (VInt 6) in
   let _ = map_set consts "Process::CLOCK_PROCESS_CPUTIME_ID" (VInt 12) in
   let _ = map_set consts "Process::CLOCK_THREAD_CPUTIME_ID" (VInt 16) in
-  reg_mod_list (Cons ("Comparable", Cons ("Enumerable", Cons ("Kernel", Cons ("Math", Nil)))))
+  reg_mod_list (Cons ("Comparable", Cons ("Enumerable", Cons ("Kernel", Cons ("Math",
+    Cons ("Zlib", Cons ("Zlib::Deflate", Cons ("Zlib::Inflate", Nil))))))))
 
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved_lex = cur_lex () in
@@ -18762,7 +18910,11 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // at CRuby's stdlib (-I / RUBYLIB) must still use its OWN rbconfig, and
      // must not read CRuby's thread.rb.
      else if str_eq p0 "rbconfig" || str_eq p0 "rbconfig.rb" ||
-             str_eq p0 "thread" || str_eq p0 "thread.rb" then
+             str_eq p0 "thread" || str_eq p0 "thread.rb" ||
+             // zlib is a C extension in CRuby; here it is the vendored mgz
+             // package, already built in, so the require is satisfied and the
+             // .so is never looked for.
+             str_eq p0 "zlib" || str_eq p0 "zlib.rb" || str_eq p0 "zlib.so" then
        FNext (VBool true)
      else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in

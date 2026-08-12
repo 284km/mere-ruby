@@ -20,6 +20,25 @@ segfaults before the interpreter's own `SystemStackError` guard can see
 it. 128 MB puts the ceiling out of reach of real input. See
 [PAIN.md](PAIN.md) §M9.
 
+## Vendored packages
+
+`zlib` is a C extension in CRuby. Here it is [mgz](https://github.com/284km/mgz)
+— gzip in pure Mere — vendored under `.mere_modules/` and imported, so a
+checkout needs its submodule:
+
+```sh
+git clone --recurse-submodules <this repo>
+# or, in an existing checkout:
+git submodule update --init
+```
+
+What that gives you is `Zlib.crc32`, `Zlib.adler32` and
+`Zlib::Inflate.inflate`, each verified against CRuby.
+`Zlib::Deflate.deflate` raises `NotImplementedError`: three separate
+implementations of the compressing side produced streams CRuby's inflater
+rejects, while the same code is correct standalone — see [PAIN.md](PAIN.md)
+§M10. Emitting bytes that only look right would be worse than saying so.
+
 ## The load path
 
 mere-ruby ships a handful of pure-Ruby libraries compiled in (`monitor`,

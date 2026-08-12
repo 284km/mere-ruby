@@ -3,6 +3,52 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
+## M10. An imported module is correct alone and wrong inside a big program
+
+mgz -- gzip in pure Mere, already byte-verified against the system tools
+-- was split into importable modules and vendored here under
+`.mere_modules/`. Decompression came across intact. Compression did not,
+in two different ways, and neither is visible from the Mere source.
+
+**First it would not compile.** The lifted C function for `find_match`'s
+inner `mlen` still referenced `mu_p` in its body but no longer took it as
+a parameter:
+
+    error: use of undeclared identifier 'mu_p'
+
+The reduction is two copies of `deflate.mere` differing **only** in one
+identifier: the position named `p` gives four such errors, the same file
+with it named `pos` builds clean. Nothing else changes -- same structure,
+same nesting, same captures. It is not simply "a name the host also
+uses": `main.mere` binds `pos` in thirteen places and that is fine.
+Standalone, and imported into a *small* program, `p` is fine too.
+
+**Then it produced wrong bytes.** With the rename in place the build
+succeeds and `Zlib::Deflate.deflate` returns a stream CRuby's inflater
+rejects -- `invalid stored block lengths`. That is true of all three
+implementations tried:
+
+| compressor | result |
+|---|---|
+| mgz `deflate_body` (dynamic Huffman) | stream rejected |
+| mgz `deflate_stored` (stored blocks) | `invalid stored block lengths` |
+| a stored-block writer written directly in `main.mere` | `invalid stored block lengths` |
+
+The third one is the striking case: it does not go through mgz at all,
+it is twenty lines of `vec_push`, and the same shape works in a small
+program. Its output is missing the LEN high byte.
+
+Decompression is *not* affected and is genuinely shipped:
+`Zlib::Inflate.inflate` reads what CRuby's `Zlib::Deflate.deflate`
+writes, byte-identically, and `Zlib.crc32` / `Zlib.adler32` match CRuby
+including the seeded form. So the same vendored package, in the same
+program, is right on one side and wrong on the other.
+
+mere-ruby therefore ships inflate and the checksums and raises
+`NotImplementedError` from `deflate`, rather than emitting bytes that
+only look right. The compile failure was loud; this second one is not,
+and that is the part worth fixing upstream.
+
 ## M9. Native stack, not heap, is what a big input costs — and a Mere program cannot raise its own
 
 Loading a dozen real gems into one process died with SIGSEGV, while any
