@@ -20,6 +20,10 @@ segfaults before the interpreter's own `SystemStackError` guard can see
 it. 128 MB puts the ceiling out of reach of real input. See
 [PAIN.md](PAIN.md) §M9.
 
+Divergences that are understood and deliberately unfixed are tracked in
+[KNOWN_GAPS.md](KNOWN_GAPS.md), with what each costs and what fixing it
+would take — separately from what nobody has looked at yet.
+
 ## Vendored packages
 
 `zlib` is a C extension in CRuby. Here it is [mgz](https://github.com/284km/mgz)
