@@ -101,11 +101,6 @@ reads and delete it afterwards.
 
 ## sidekiq-pro does not finish loading in a batch
 
-On its own, `sidekiq-pro` fails in seconds — `Process.clock_gettime` is
-undefined "for an instance of Process", even though `::Process.clock_gettime`
-works at the top level and inside a module that shadows `Process`. That one
-is unresolved.
-
 Loaded after two dozen other gems it does not fail at all: it was still
 running after 34 minutes. This is not a regression — before non-ASCII
 identifiers were accepted, sidekiq's `api.rb` (which contains
