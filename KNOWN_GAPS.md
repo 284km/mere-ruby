@@ -58,6 +58,20 @@ on its own and after eleven other gems, but not after `dry-logic`
 specifically. `require "psych"` is unaffected in the same state, so it is
 not simply the feature staying marked. Not yet isolated.
 
+## `UnboundMethod#bind_call` re-dispatches by name
+
+`Module.instance_method(:name).bind_call(mod)` returns whatever `mod.name`
+returns, including an override. In Ruby the unbound method is the
+*builtin* one and sees past any `def self.name` — which is the entire
+reason zeitwerk holds onto it.
+
+`bind_call` calls back through ordinary dispatch, so for a
+builtin-backed origin there is no way to ask for the builtin
+specifically. Fixing it means a dispatch entry point that skips the user
+method table for a known origin. Every other part of the trick works:
+the unbound method is produced, binds, and returns the right answer for
+a module that does not override `name`.
+
 ## `Hash#compare_by_identity`
 
 Not implemented; `sidekiq-pro` needs it.
