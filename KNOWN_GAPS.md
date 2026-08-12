@@ -67,10 +67,6 @@ method table for a known origin. Every other part of the trick works:
 the unbound method is produced, binds, and returns the right answer for
 a module that does not override `name`.
 
-## `MatchData#[](start, length)`
-
-Returns only the first element instead of a slice.
-
 ## Integer `**` with a negative base and fractional exponent
 
 `(-8) ** (1.0/3)` is `NaN` here; Ruby returns a Complex.
