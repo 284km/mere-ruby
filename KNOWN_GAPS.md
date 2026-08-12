@@ -74,3 +74,9 @@ Returns only the first element instead of a slice.
 ## Integer `**` with a negative base and fractional exponent
 
 `(-8) ** (1.0/3)` is `NaN` here; Ruby returns a Complex.
+
+## `TracePoint`
+
+Not implemented. zeitwerk uses it to notice when an explicit namespace
+constant is defined, so `dry-logic` (and anything else that loads
+zeitwerk's full autoloader) stops there.

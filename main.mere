@@ -8475,6 +8475,10 @@ and re_raise = fn world -> fn (exc: Val) ->
 and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
   let (meths, sup, ocls, ivars) = world in
   let _ = map_set ivars "$exc" (VExc (cls, msg)) in
+  // remember WHERE, while the loader still knows: load_ctx "file" is restored
+  // as each require returns, so by the time an error reaches the top level it
+  // names the entry script and not the library that actually failed.
+  let _ = map_set prim_missing "f" (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
   let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
   // a real Ruby exception must never inherit a stale internal-failure message
   let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
@@ -19013,6 +19017,21 @@ and call_inherited = fn world -> fn env -> fn (super_name: str) -> fn (sub_name:
       let _ = invoke_val_c env world nb (VClass super_name) "inherited" (Cons (VClass sub_name, Nil)) false in ()
     else ()
 
+// like register_class, but the body's lexical scope (for constant lookup and
+// for nested definitions) stays whatever encloses it -- `class << self`.
+and register_class_sng = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  let saved = map_copy ref_active in
+  let lex = cur_lex () in
+  let cenv = map_new () in
+  let _ = map_set cenv "self" (VClass cls) in
+  let _ = map_set cenv "__cscope" (mkstr lex) in
+  let _ = map_set cenv "__cref" (mkstr lex) in
+  let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
+  let _ = restore_ref_active saved in
+  (match r with
+   | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
+   | _ -> r)
+
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // a `using` inside this body is scoped to it: snapshot/restore ref_active.
   let saved = map_copy ref_active in
@@ -19115,7 +19134,10 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        | SClass (cname, csuper, cbody) ->
          if str_eq cname "<<singleton" then
            // class << self / class << obj: open the target's singleton class.
-           register_class world (sng_target_cls world cenv csuper cls) cbody
+           // Its body's constant lookup continues the ENCLOSING lexical scope
+           // (ruby walks the cref chain), so a bare constant inside it still
+           // resolves against the module that encloses it.
+           register_class_sng world (sng_target_cls world cenv csuper cls) cbody
          else
          // `class ::C` inside a class body is a TOP-LEVEL constant (not nested
          // under the enclosing class): strip the `::` and don't qualify.
@@ -19686,7 +19708,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       // `def`s register as bare top-level methods.
       (if str_eq super0 "self" && lv_has env "self" && (match lv_get env "self" with VMain -> true | _ -> false) then
          run_stmts env world blk body
-       else register_class_lex world (sng_target_cls world env super0 "Object") body)
+       // A `class << self` body's constant lookup continues the ENCLOSING
+       // lexical scope -- ruby walks the cref chain, so `Internal` inside
+       // `module Zeitwerk; module X; class << self` finds Zeitwerk::Internal.
+       // Only the def target is the singleton class.
+       else register_class_sng world (sng_target_cls world env super0 "Object") body)
     // `class Base::Name` where Base is nil/true/false or a non-class value
     // is a TypeError (nil is not a class/module).
     else if str_contains name "::" &&
@@ -22184,6 +22210,11 @@ and puts_each = fn world -> fn (xs: Val list) ->
 // Evaluate Ruby source directly (no filesystem). `name` seeds $0 / PROGRAM_NAME
 // and the load-path dir. run_prog reads a file and delegates here; a Wasm/browser
 // host can call run_src with source handed in as a string.
+// the file that was loading when the error was raised, else the entry script.
+let err_where = fn (name: str) ->
+  let f = (if map_has prim_missing "f" then (match map_get prim_missing "f" with VStr h -> sget h | _ -> "") else "") in
+  if str_eq f "" || str_eq f name then name else f;
+
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set load_ctx "dir" (mkstr (dirname_of name)) in
   let _ = map_set load_ctx "file" (mkstr name) in
@@ -22474,13 +22505,13 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = if map_has ranok "y" then () else
     (let exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
      match exc with
-     | VExc (ec, em) -> let _ = print_err (name ++ ": " ++ em ++ " (" ++ ec ++ ")") in exit 1
+     | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in exit 1
      | VObj eid ->
        (let ec = map_get ocls (str_of_int eid) in
         let em = (if map_has ivars (str_of_int eid ++ "@message")
                   then (match map_get ivars (str_of_int eid ++ "@message") with VStr h -> sget h | other -> to_s other)
                   else ec) in
-        let _ = print_err (name ++ ": " ++ em ++ " (" ++ ec ++ ")") in exit 1)
+        let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in exit 1)
      // an interpreter-internal failure, not a Ruby exception: say so plainly.
      | _ ->
        (let m = (if map_has prim_missing "i"
