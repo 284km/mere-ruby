@@ -3,51 +3,69 @@
 A dogfood log: what implementing a Ruby subset interpreter surfaced
 about Mere itself.
 
-## M10. An imported module is correct alone and wrong inside a big program
+## M11. `str_join` loses embedded NUL bytes — C backend only
 
-mgz -- gzip in pure Mere, already byte-verified against the system tools
--- was split into importable modules and vendored here under
-`.mere_modules/`. Decompression came across intact. Compression did not,
-in two different ways, and neither is visible from the Mere source.
+mere-ruby's `Zlib::Deflate.deflate` returned streams CRuby rejected with
+`invalid stored block lengths`, and I spent a while blaming the
+compressor. It was the four-line bridge that turns a byte vector back
+into a String:
 
-**First it would not compile.** The lifted C function for `find_match`'s
-inner `mlen` still referenced `mu_p` in its body but no longer took it as
-a parameter:
+```mere
+str_join "" (list of chr bytes)
+```
+
+The reduction:
+
+```mere
+let a = chr 0;
+let b = chr 65;
+str_join "" (Cons (b, Cons (a, Cons (b, Nil))))
+```
+
+| backend | bytes |
+|---|---|
+| interpreter | `65, 0, 65` |
+| C | `65, 65, 0` |
+
+The **length is right** and the bytes are all present — they are in the
+wrong order. `str_join` computes the total correctly but copies with
+NUL-terminated semantics, so the non-zero bytes compact to the front and
+the tail is left zeroed. `++` is correct on both backends; only `str_join`
+diverges.
+
+That shape is nasty in exactly the way a wrong length would not be:
+`str_len` agrees, a text round trip agrees, and the corruption only shows
+on data that contains a zero byte. Every compressed stream contains one.
+
+mere-ruby now builds the string by halving concatenation with `++`
+(O(n log n), and correct), and compresses for real: the system zlib
+accepts what `Zlib::Deflate.deflate` writes here.
+
+There is an older note in this project's own memory that Mere's `str` is
+NUL-terminated and binary should cross boundaries as hex. That note was
+right, and I talked myself out of it because mere-ruby's *String* is a
+length-carrying handle. It is — but the Mere `str` inside it is not, and
+the bridge builds one.
+
+## M10. The lambda lifter drops a capture, chosen by name
+
+Vendoring mgz under `.mere_modules/` and importing it into mere-ruby's
+~21k-line `main.mere` produced C that would not compile. The lifted
+function for `find_match`'s inner `mlen` still referenced `mu_p` in its
+body but no longer took it as a parameter:
 
     error: use of undeclared identifier 'mu_p'
 
 The reduction is two copies of `deflate.mere` differing **only** in one
 identifier: the position named `p` gives four such errors, the same file
-with it named `pos` builds clean. Nothing else changes -- same structure,
+with it named `pos` builds clean. Nothing else changes — same structure,
 same nesting, same captures. It is not simply "a name the host also
 uses": `main.mere` binds `pos` in thirteen places and that is fine.
-Standalone, and imported into a *small* program, `p` is fine too.
+Compiled standalone, and imported into a *small* program, `p` is fine
+too — so the analysis depends on the importing program.
 
-**Then it produced wrong bytes.** With the rename in place the build
-succeeds and `Zlib::Deflate.deflate` returns a stream CRuby's inflater
-rejects -- `invalid stored block lengths`. That is true of all three
-implementations tried:
-
-| compressor | result |
-|---|---|
-| mgz `deflate_body` (dynamic Huffman) | stream rejected |
-| mgz `deflate_stored` (stored blocks) | `invalid stored block lengths` |
-| a stored-block writer written directly in `main.mere` | `invalid stored block lengths` |
-
-The third one is the striking case: it does not go through mgz at all,
-it is twenty lines of `vec_push`, and the same shape works in a small
-program. Its output is missing the LEN high byte.
-
-Decompression is *not* affected and is genuinely shipped:
-`Zlib::Inflate.inflate` reads what CRuby's `Zlib::Deflate.deflate`
-writes, byte-identically, and `Zlib.crc32` / `Zlib.adler32` match CRuby
-including the seeded form. So the same vendored package, in the same
-program, is right on one side and wrong on the other.
-
-mere-ruby therefore ships inflate and the checksums and raises
-`NotImplementedError` from `deflate`, rather than emitting bytes that
-only look right. The compile failure was loud; this second one is not,
-and that is the part worth fixing upstream.
+At least it is loud: a C compile error, not a wrong answer. mgz now calls
+the position `pos`, with a comment saying why.
 
 ## M9. Native stack, not heap, is what a big input costs — and a Mere program cannot raise its own
 

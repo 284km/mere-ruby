@@ -32,12 +32,11 @@ git clone --recurse-submodules <this repo>
 git submodule update --init
 ```
 
-What that gives you is `Zlib.crc32`, `Zlib.adler32` and
-`Zlib::Inflate.inflate`, each verified against CRuby.
-`Zlib::Deflate.deflate` raises `NotImplementedError`: three separate
-implementations of the compressing side produced streams CRuby's inflater
-rejects, while the same code is correct standalone — see [PAIN.md](PAIN.md)
-§M10. Emitting bytes that only look right would be worse than saying so.
+That gives you `Zlib.crc32` (including the seeded form a PNG chunk
+needs), `Zlib.adler32`, `Zlib::Inflate.inflate` and
+`Zlib::Deflate.deflate` — real dynamic-Huffman compression, not stored
+blocks. Verified both directions against CRuby: mere-ruby reads what the
+system zlib writes, and the system zlib reads what mere-ruby writes.
 
 ## The load path
 
