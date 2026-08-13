@@ -109,26 +109,6 @@ with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
 caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
 
-## The primitive dispatcher's internal `no <name>` failures
-
-A handful of primitives (`to_i`, `to_f`, `to_a`, `size`, `empty?`, `[]`) raise
-a mere-ruby StandardError rather than a Ruby NoMethodError when the receiver
-is of a type they do not handle — `1.length` is not caught by
-`rescue NoMethodError`. The receiver is named in the message now
-(`mere-ruby: no [] for nil`), which is what made several gem failures
-one-step diagnoses instead of bisections. Fixing it properly means a
-"not applicable" signal from `prim_method_raw` back to the caller, which has
-the world and can raise the real error.
-
-## `$~` is global, not frame-local
-
-Ruby scopes `$~` (and with it `$1`, `Regexp.last_match`) to the method frame
-that performed the match, so a match inside a method is invisible to its
-caller. Here it is one global, so a match performed anywhere is still
-readable afterwards. Nothing in the gem sample depends on the difference;
-it shows up as `Regexp.last_match` answering a stale MatchData where ruby
-answers nil.
-
 ## An endless range is stored as one that ends at the largest integer
 
 `Float::INFINITY` as a range bound becomes the largest integer, because a
