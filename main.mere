@@ -7637,10 +7637,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: send expects a method name")) in fail "mere-ruby: send expects a method name"))
     // enum_for(:m) / to_enum(:m): an Enumerator that drives self.m on #each.
     else if (str_eq name "enum_for" || str_eq name "to_enum") && (if map_has meths name then false else true) then
+      // `to_enum(:m, a, b)` records a and b: they are the arguments the
+      // method is called with when the enumerator is driven.
       (let recv = if lv_has env "self" then lv_get env "self" else VMain in
        match args with
-       | Cons (VSym m, _) -> make_enum world recv m
-       | Cons (VStr m, _) -> make_enum world recv (sget m)
+       | Cons (VSym m, rest) -> make_enum_a world recv m rest
+       | Cons (VStr m, rest) -> make_enum_a world recv (sget m) rest
        | _ -> make_enum world recv "each")
     // Kernel#gets / readline / readlines: read stdin (slurped once). gets and
     // readlines cover the common `while line = gets` / batch cases; readline
@@ -10109,8 +10111,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                               if has_meth world (map_get o9 (str_of_int oid3)) name then false else true)
               | _ -> true) then
     (match args with
-     | Cons (VSym m, _) -> make_enum world recv m
-     | Cons (VStr m, _) -> make_enum world recv (sget m)
+     | Cons (VSym m, rest) -> make_enum_a world recv m rest
+     | Cons (VStr m, rest) -> make_enum_a world recv (sget m) rest
      | _ -> make_enum world recv "each")
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
@@ -12404,10 +12406,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           else
           let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
           let meth2 = (match (if map_has ivars0 (str_of_int id ++ "@meth") then map_get ivars0 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
-          (match recv2 with
-           | VMain -> if map_has m0 meth2 then (let e2 = lv_flat env in let _ = map_set e2 "self" recv2 in call_method e2 world newblk meth2 args)
-                      else invoke_with_block env world blk recv2 meth2 args newblk
-           | _ -> invoke_with_block env world blk recv2 meth2 args newblk))
+          // the arguments `to_enum(:m, a, b)` recorded are the call's, not
+          // whatever was handed to `each`.
+          let eargs = (match (if map_has ivars0 (str_of_int id ++ "@eargs") then map_get ivars0 (str_of_int id ++ "@eargs") else VNil) with VArr aid3 -> deref aid3 | _ -> Nil) in
+          let cargs = (match eargs with Nil -> args | _ -> eargs) in
+          drive_enum env world blk recv2 meth2 cargs newblk)
        | _ -> VNil)
     // Enumerator::Lazy with a block: pipeline ops are appended lazily; #each
     // drives the pipeline with the block as the final consumer.
@@ -13108,6 +13111,8 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   // what the dispatcher actually implements.
   | VInt _ -> is_prim_method name || is_num_method name
   | VFlt _ -> is_prim_method name || is_num_method name
+  | VRange (_, _, _) ->
+    is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
   | _ -> is_prim_method name
 
 // Proc/lambda method names, for respond_to?.
@@ -13257,7 +13262,7 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   // rubocop-ast asks `::Range.instance_method(:minmax).owner` to decide
   // whether it has to patch around an old ruby's Range#minmax.
   else if str_eq cls "Range" then
-    range_delegate_name name || is_enum_method name || is_prim_method name
+    is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
   else if str_eq cls "Module" || str_eq cls "Class" then
     is_module_method name || is_prim_method name
   // zeitwerk branches on UnboundMethod.method_defined?(:bind_call)
@@ -13435,8 +13440,16 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
        if str_eq ns2 s then VNil else let _ = sset h ns2 in VStr h
      | other -> other)
 
+// Range's own methods (not the ones it borrows from Array by materialising).
+and is_range_method = fn (name: str) ->
+  str_eq name "begin" || str_eq name "end" || str_eq name "exclude_end?" ||
+  str_eq name "size" || str_eq name "count" || str_eq name "length" ||
+  str_eq name "cover?" || str_eq name "include?" || str_eq name "member?" ||
+  str_eq name "step" || str_eq name "to_a" || str_eq name "each"
+
 and range_delegate_name = fn (name: str) ->
   str_eq name "each_slice" || str_eq name "each_cons" || str_eq name "zip" ||
+  str_eq name "first" || str_eq name "last" || str_eq name "min" || str_eq name "max" ||
   str_eq name "take" || str_eq name "drop" || str_eq name "values_at" ||
   str_eq name "rotate" || str_eq name "combination" || str_eq name "permutation" ||
   str_eq name "each_index" || str_eq name "product" || str_eq name "join" ||
@@ -13481,7 +13494,8 @@ and sym_str_resym = fn (name: str) ->
 
 and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // a Range delegates array-only enumeration methods to its materialised form.
-  if (match recv with VRange _ -> true | _ -> false) && range_delegate_name name then
+  if (match recv with VRange _ -> true | _ -> false) && range_delegate_name name
+     && (if str_eq name "last" then (match args with Nil -> false | _ -> true) else true) then
     (match recv with VRange (lo, hi, excl) -> prim_method (arr_new (range_to_a lo (if excl then hi - 1 else hi))) name args | _ -> VNil)
   // Hash#store is Hash#[]= under another name, and a bare `store` inside a
   // Hash subclass reaches the primitive dispatcher directly (i18n's
@@ -13710,6 +13724,23 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // ruby has no Integer#length. concurrent-ruby derives FIXNUM_BIT_SIZE
   // from `0.size * 8`.
   else if str_eq name "size" && (match recv with VInt _ -> true | _ -> false) then VInt 8
+  // Range#cover? / #include? / #member?: the endpoints answer directly.
+  else if (str_eq name "cover?" || str_eq name "include?" || str_eq name "member?")
+          && (match recv with VRange _ -> true | _ -> false) then
+    (match recv with
+     | VRange (lo, hi, excl) ->
+       (match args with
+        | Cons (VInt v, _) -> VBool (v >= lo && (if excl then v < hi else v <= hi))
+        | Cons (VFlt f, _) -> VBool (f >= float_of_int lo && (if excl then f < float_of_int hi else f <= float_of_int hi))
+        | _ -> VBool false)
+     | _ -> VBool false)
+  // Range#size / #count / #length: how many elements it enumerates.
+  else if (str_eq name "size" || str_eq name "length" || str_eq name "count")
+          && (match recv with VRange _ -> true | _ -> false)
+          && (match args with Nil -> true | _ -> false) then
+    (match recv with
+     | VRange (lo, hi, excl) -> (let n = (if excl then hi - 1 else hi) - lo + 1 in VInt (if n < 0 then 0 else n))
+     | _ -> VNil)
   else if str_eq name "size" || str_eq name "length" then
     (match recv with
      | VArr id -> VInt (val_list_len (deref id)) | VStr s -> let s = sget s in VInt (utf8_len s)
@@ -14083,6 +14114,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "end_with?" then
     (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in VBool (str_ends_with s p) | _ -> VBool false) | _ -> (let _ = map_set prim_missing "n" (mkstr "end_with?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'end_with?'")) in fail "mere-ruby: undefined method 'end_with?'")))
   // Array
+  // Range#begin / #end / #exclude_end? -- the endpoints as WRITTEN, which is
+  // what an arity range is read with (`node.arity_range.begin`). Bare `last`
+  // is the written end too; only `last(n)` counts elements.
+  else if (str_eq name "begin" || str_eq name "end" || str_eq name "exclude_end?"
+           || (str_eq name "last" && (match args with Nil -> true | _ -> false)))
+          && (match recv with VRange _ -> true | _ -> false) then
+    (match recv with
+     | VRange (lo, hi, excl) ->
+       (if str_eq name "begin" then VInt lo
+        else if str_eq name "exclude_end?" then VBool excl
+        else VInt hi)
+     | _ -> VNil)
   else if str_eq name "first" then
     (match recv with
      | VArr id ->
@@ -15862,7 +15905,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
              (let recv2 = (if map_has ivars0 (str_of_int eid ++ "@recv") then map_get ivars0 (str_of_int eid ++ "@recv") else VNil) in
               let meth2 = (match (if map_has ivars0 (str_of_int eid ++ "@meth") then map_get ivars0 (str_of_int eid ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
               let eargs = (match (if map_has ivars0 (str_of_int eid ++ "@eargs") then map_get ivars0 (str_of_int eid ++ "@eargs") else VNil) with VArr aid2 -> deref aid2 | _ -> Nil) in
-              let _ = invoke_with_block env world blk recv2 meth2 eargs collector in
+              let _ = drive_enum env world blk recv2 meth2 eargs collector in
               ())) in
   accv
 
@@ -18936,6 +18979,25 @@ and enum_args_str = fn (xs: Val list) ->
   | Nil -> ""
   | Cons (v, Nil) -> inspect v
   | Cons (v, rest) -> inspect v ++ ", " ++ enum_args_str rest
+
+// Drive an Enumerator's source method. `to_enum(:name)` keeps working when
+// `name` is PRIVATE -- ruby's Enumerator calls it the way `send` does, and
+// `to_enum(__method__)` inside a private method is the standard shape (it is
+// what rubocop-ast's compiler uses). Everything else stays on the ordinary
+// block dispatcher, which knows the builtins.
+and drive_enum = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (meth: str) -> fn (args: Val list) -> fn newblk ->
+  let (m0, _, _, _) = world in
+  match recv with
+  // a top-level method has no class to look it up in
+  | VMain ->
+    (if map_has m0 meth
+     then (let e2 = lv_flat env in let _ = map_set e2 "self" recv in call_method e2 world newblk meth args)
+     else invoke_with_block env world blk recv meth args newblk)
+  | VObj _ ->
+    (let cls = dispatch_cls_of world recv in
+     if has_meth world cls meth then invoke world newblk recv cls meth args
+     else invoke_with_block env world blk recv meth args newblk)
+  | _ -> invoke_with_block env world blk recv meth args newblk
 
 and make_enum = fn world -> fn (recv: Val) -> fn (meth: str) ->
   make_enum_a world recv meth Nil

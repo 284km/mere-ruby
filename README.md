@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 98 programs, byte-for-byte
+./run_corpus.sh                                  # 99 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -102,8 +102,9 @@ Against a sample of 29 installed gems, `gemtest/run.sh` loads **18** with
 a CRuby stdlib on `-I` and **16** on what mere-ruby ships. Of the eleven
 that do not: seven stop at a C extension (`openssl` ×4, `socket` ×2,
 protobuf ×1), one is not installed, and three are named gaps —
-`TracePoint`, a Railtie `initializer`, and one unresolved call inside
-rubocop's own loading. devise now loads the whole activesupport / i18n /
+`TracePoint`, a Railtie `initializer`, and a native crash partway through
+rubocop's own loading (`gemtest/run.sh` runs one gem per process, so that
+costs the measurement one gem rather than every gem after it). devise now loads the whole activesupport / i18n /
 concurrent-ruby stack before it reaches `openssl`, and rubocop-rails reads
 unicode-display_width's gzipped `Marshal` index and gets as far as
 rubocop itself.

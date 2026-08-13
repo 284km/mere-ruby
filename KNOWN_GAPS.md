@@ -185,12 +185,14 @@ readable afterwards. Nothing in the gem sample depends on the difference;
 it shows up as `Regexp.last_match` answering a stale MatchData where ruby
 answers nil.
 
-## rubocop stops at a private method call
+## rubocop crashes the interpreter with a native signal
 
-With `method_added`, `Regexp.last_match`, `__method__` and a non-shadowed
-`binding`, rubocop-ast's pattern compiler runs, and `require "rubocop"` now
-reaches `enforce_same_captures` — a private method called from a public one
-in the same class, which mere-ruby refuses. The obvious shapes of that call
-(same class, subclass, with a block-pass, through `to_enum(__method__)`) all
-work in isolation, so the difference is in how that particular call is
-dispatched; it needs its own reduction.
+`require "rubocop"` gets through rubocop-ast's pattern compiler and then dies
+with SIGBUS — a native crash, not a Ruby exception, so nothing catches it and
+nothing names it. The recursion guard is not what trips (it is set at 15 000
+and the stack takes 100 000 frames), so this is some other unbounded native
+recursion: the parser and the expression evaluator both recurse outside the
+guard, which only counts Ruby method calls.
+
+The gem harness runs one gem per process now, so this costs the measurement
+one gem instead of every gem after it.

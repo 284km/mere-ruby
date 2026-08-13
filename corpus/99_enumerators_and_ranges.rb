@@ -1,0 +1,61 @@
+# An Enumerator built by `to_enum` remembers the arguments it was given and
+# drives its method the way `send` does (so a private one still runs), and a
+# Range answers about its own endpoints without materialising itself.
+
+class Walker
+  def pairs(a, b)
+    return to_enum(:pairs, a, b) unless block_given?
+    a.each { |x| b.each { |y| yield [x, y] } }
+  end
+
+  def public_each(enum, &block)
+    hidden(enum, &block)
+  end
+
+  def enum_of(enum)
+    hidden(enum)
+  end
+
+  private
+
+  def hidden(enum)
+    return to_enum(__method__, enum) unless block_given?
+    enum.map { |x| yield x }
+  end
+end
+
+w = Walker.new
+p w.pairs([1, 2], [:a]).to_a
+p w.pairs([1], [:a, :b]).map { |x| x }
+p w.public_each([1, 2]) { |x| x * 2 }
+e = w.enum_of([1, 2, 3])
+p e.class
+p e.to_a
+p e.map { |x| x * 10 }
+p e.first(2)
+
+def top_pairs(a)
+  return to_enum(:top_pairs, a) unless block_given?
+  a.each { |x| yield x }
+end
+p top_pairs([4, 5]).to_a
+
+# the builtin enumerators still behave
+p [1, 2, 3].each_slice(2).to_a
+p %w[a b].each_with_index.to_a
+p [3, 1].each_entry.to_a
+
+# Range: the endpoints as written
+r = (1..5)
+x = (1...5)
+p [r.begin, r.end, r.exclude_end?]
+p [x.begin, x.end, x.exclude_end?]
+p [r.first, r.last, r.min, r.max, r.size, r.count]
+p [x.first, x.last, x.min, x.max, x.size, x.count]
+p [x.first(2), x.last(2), r.last(2)]
+p [r.include?(5), x.include?(5), r.cover?(0), x.cover?(4)]
+p r.to_a
+p r.respond_to?(:begin)
+p Range.instance_method(:begin).owner
+last = (0..0)
+p [(1..2), (3..4)].map { |q| last = last.begin + q.begin..last.max + q.max }
