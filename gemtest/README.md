@@ -25,6 +25,12 @@ one. The harness itself carries no paths — everything comes from the arguments
 and the environment, so it survives a clean machine. (It did not always: it
 lived in /tmp, and a cleared /tmp took the measurement with it.)
 
+**One gem per process** (`load_one.rb`). A gem that crashes the interpreter
+outright — a native signal, not a Ruby exception — used to take every gem
+after it down with it, and the tally silently shrank to whatever came before
+the crash. Twenty-nine startups is the price of a gate that keeps reporting;
+a signal shows up as `CRASH <gem>`.
+
 ## Where it stands (2026-08-13)
 
 | | loads |
@@ -32,14 +38,11 @@ lived in /tmp, and a cleared /tmp took the measurement with it.)
 | on what mere-ruby ships | **16 / 29** |
 | with a CRuby stdlib on `-I` | **18 / 29** |
 
-Both are single runs of the whole list; the stdlib one takes about five
-minutes.
-
-Every remaining failure names its own cause. With a stdlib on `-I`: four are
-C extensions (`openssl.so` three times, `socket.so` twice), one is a gem that
-is not installed, and the rest — a Rails Railtie method, `TracePoint`, a parse
-error in devise, a version constant in rubocop-rails, a nil receiver in sassc
-— are recorded in [KNOWN_GAPS.md](../KNOWN_GAPS.md) or still being chased.
+Every remaining failure names its own cause. With a stdlib on `-I`: seven are
+C extensions (`openssl.so` four times, `socket.so` twice, protobuf once), one
+is a gem that is not installed, and the rest — a Rails Railtie method,
+`TracePoint`, and a native crash partway through rubocop's own loading — are
+recorded in [KNOWN_GAPS.md](../KNOWN_GAPS.md) or still being chased.
 
 Without the stdlib, six of the thirteen failures are only "a pure-Ruby
 stdlib library is not here" (`net/protocol`, `ipaddr`, `open-uri`,
