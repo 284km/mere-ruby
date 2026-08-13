@@ -409,6 +409,10 @@ let hook_flags = map_new ();
 // Marshal's symbol table: symbols are written once and back-referenced by
 // index afterwards, so a load has to remember them in order.
 let mrsh_syms = map_new ();
+// Marshal.dump's own symbol table: the format writes a symbol once and refers
+// to it by index afterwards, and every UTF-8 String carries the :E ivar, so
+// without the table the output is valid but never byte-identical to ruby's.
+let mrsh_dsyms = map_new ();
 // the position a lookbehind body must end at, so that its own backtracking
 // picks a branch of the right length. Saved and restored around each attempt
 // (a lookbehind may contain another one).
@@ -2218,7 +2222,8 @@ and parse_unary = fn toks ->
           else neg_lit_tail (EInt (0 - n)) r1)
        | Cons (TFlt f, r1) ->
          (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
-          else neg_lit_tail (EFlt (0.0 - f)) r1)
+          // `0.0 - f` loses the sign of a zero (it is +0.0); multiplying keeps it.
+          else neg_lit_tail (EFlt (f * (0.0 - 1.0))) r1)
        | Cons (TBig b, r1) ->
          (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
           else neg_lit_tail (EBig ("-" ++ b)) r1)
@@ -2230,7 +2235,7 @@ and parse_unary = fn toks ->
           else neg_lit_tail (EImag (0 - n)) r1)
        | Cons (TImagF f, r1) ->
          (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
-          else neg_lit_tail (EImagF (0.0 - f)) r1)
+          else neg_lit_tail (EImagF (f * (0.0 - 1.0))) r1)
        | Cons (TImagRat (n, d), r1) ->
          (if neg_next_pow r1 then (let (e, r) = parse_unary rest in (EUn ("-", e), r))
           else neg_lit_tail (EImagRat ("-" ++ n, d)) r1)
@@ -5794,7 +5799,7 @@ let big_even = fn (s: str) ->
   str_eq c "0" || str_eq c "2" || str_eq c "4" || str_eq c "6" || str_eq c "8";
 // negate / sign / abs on a boxed numeric value (used by Complex components).
 let num_neg = fn (v: Val) -> match v with
-  | VInt n -> VInt (0 - n) | VFlt f -> VFlt (0.0 - f)
+  | VInt n -> VInt (0 - n) | VFlt f -> VFlt (f * (0.0 - 1.0))
   | VBig s -> norm_big (big_neg_s s) | VRat (n, d) -> VRat (big_neg_s n, d) | _ -> v;
 let num_isneg = fn (v: Val) -> match v with
   | VInt n -> n < 0 | VFlt f -> f < 0.0 | VBig s -> big_sign s < 0 | VRat (n, d) -> big_sign n < 0 | _ -> false;
@@ -8028,7 +8033,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match eval_e env world blk a with
        | VInt n -> VInt (0 - n)
        | VBig s -> if str_eq op "-" then norm_big (big_neg_s s) else VBig s
-       | VFlt f -> VFlt (0.0 - f)
+       | VFlt f -> VFlt (f * (0.0 - 1.0))
        | VRat (n, d) -> if str_eq op "-" then VRat (big_neg_s n, d) else VRat (n, d)
        | VCpx (r, i) -> if str_eq op "-" then VCpx (num_neg r, num_neg i) else VCpx (r, i)
        // unary -/+ on an object dispatch to its -@ / +@ method.
@@ -11155,7 +11160,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else raise_exc world "Zlib::GzipFile::Error" "not in gzip format")
        else
          mkstr (bytevec_to_str (inflate (bytevec_pad v) (zlib_body_start v))))
-    // Marshal.load: the reader half of the format (dump is not implemented).
+    else if str_eq c "Marshal" && str_eq name "dump" then
+      (match args with
+       | Cons (v, _) ->
+         (let out = mkstr (mrsh_dump world v) in
+          let _ = (match out with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in out)
+       | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
+    // Marshal.load: the reader half of the same subset.
     else if str_eq c "Marshal" && (str_eq name "load" || str_eq name "restore") then
       (match args with
        | Cons (VStr h, _) -> mrsh_load world (sget h)
@@ -15697,15 +15708,17 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
                | _ -> if map_has dm_captured (defcls ++ "#" ++ name)
                       then (match map_get dm_captured (defcls ++ "#" ++ name) with VProc pid -> map_get proc_store (str_of_int pid) | _ -> blk)
                       else blk) in
-    let frame = map_new () in
-    // a define_method body is a closure: seed the frame with the locals
-    // captured where the block/lambda was defined, before the method's own
-    // self/args/params override the interpreter-internal and parameter keys.
-    let _ = (if map_has dm_closenv (defcls ++ "#" ++ name) then
-               (match map_get dm_closenv (defcls ++ "#" ++ name) with
-                | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> map_iter (lv_flat cenv) (fn (k: str) -> fn (v: Val) -> map_set frame k v))
-                | _ -> ())
-             else ()) in
+    // a define_method body is a closure: its frame is a CHILD of the scope the
+    // block was written in, so the body reads those locals -- and writes reach
+    // them, which copying the values in could not do (`define_method(:bump) {
+    // counter += 1 }` has to increment the caller's counter, not a copy that
+    // is thrown away after every call). The method's own self / args / params
+    // are set below and shadow anything of the same name.
+    let frame = (if map_has dm_closenv (defcls ++ "#" ++ name) then
+                   (match map_get dm_closenv (defcls ++ "#" ++ name) with
+                    | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
+                    | _ -> map_new ())
+                 else map_new ()) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
     let _ = map_set frame "self" recv in
     // hidden bindings so `super` can resume lookup above the defining class.
@@ -19521,6 +19534,120 @@ and mrsh_ivars = fn world -> fn (s: str) -> fn (i: int) -> fn (n: int) -> fn (ow
                  | _ -> ()) in
         mrsh_ivars world s j2 (n - 1) owner)
 
+// ---- Marshal.dump: the writer half of the same subset -------------------
+// The length/count encoding: 0 is one zero byte, a small number rides in one
+// byte biased by 5, and anything else is a signed byte count followed by that
+// many little-endian bytes.
+and mrsh_dump_long = fn (n: int) ->
+  if n == 0 then chr 0
+  else if n > 0 && n < 123 then chr (n + 5)
+  else if n < 0 && n > (0 - 124) then chr (256 + n - 5)
+  else if n > 0 then (let c = mrsh_bytes_needed n 0 in chr c ++ mrsh_le_bytes n c)
+  else (let c = mrsh_bytes_needed (0 - n - 1) 0 in chr (256 - c) ++ mrsh_le_bytes (n + mrsh_pow256 c) c)
+
+and mrsh_bytes_needed = fn (n: int) -> fn (acc: int) ->
+  if n == 0 then (if acc == 0 then 1 else acc) else mrsh_bytes_needed (n / 256) (acc + 1)
+
+and mrsh_le_bytes = fn (n: int) -> fn (c: int) ->
+  if c <= 0 then "" else chr (n - (n / 256) * 256) ++ mrsh_le_bytes (n / 256) (c - 1)
+
+// a symbol is written out once; later mentions are ";" plus its index.
+and mrsh_dump_sym = fn (nm: str) ->
+  if map_has mrsh_dsyms nm then
+    (match map_get mrsh_dsyms nm with VInt k -> ";" ++ mrsh_dump_long k | _ -> "")
+  else
+    (let k = map_len mrsh_dsyms in
+     let _ = map_set mrsh_dsyms nm (VInt k) in
+     ":" ++ mrsh_dump_long (str_len nm) ++ nm)
+
+and mrsh_dump_val = fn world -> fn (v: Val) ->
+  match v with
+  | VNil -> "0"
+  | VBool b -> (if b then "T" else "F")
+  | VInt n -> "i" ++ mrsh_dump_long n
+  | VSym nm -> mrsh_dump_sym nm
+  | VFlt f -> (let t = mrsh_float_text f in "f" ++ mrsh_dump_long (str_len t) ++ t)
+  | VStr h ->
+    // a BINARY string is written bare; any other encoding rides in the `I`
+    // wrapper as the :E ivar (true = UTF-8), which is what load reads back.
+    (let body = sget h in
+     let enc = senc_get h in
+     let raw = "\"" ++ mrsh_dump_long (str_len body) ++ body in
+     if str_eq enc "ASCII-8BIT" then raw
+     else if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then
+       "I" ++ raw ++ mrsh_dump_long 1 ++ mrsh_dump_sym "E" ++ (if str_eq enc "UTF-8" then "T" else "F")
+     else "I" ++ raw ++ mrsh_dump_long 1 ++ mrsh_dump_sym "encoding"
+          ++ "\"" ++ mrsh_dump_long (str_len enc) ++ enc)
+  | VArr id -> (let xs = deref id in "[" ++ mrsh_dump_long (vals_len xs 0) ++ mrsh_dump_vals world xs)
+  | VHsh h ->
+    // the pair list is flat: [k1, v1, k2, v2, ...], so the count is half of it
+    (let xs = hderef h in "\{" ++ mrsh_dump_long (vals_len xs 0 / 2) ++ mrsh_dump_vals world xs)
+  | _ -> (let _ = raise_exc world "TypeError" ("no _dump_data is defined for class " ++ class_name v) in "")
+
+// Marshal writes a float as its shortest decimal digits: no trailing ".0", an
+// exponent with neither "+" nor leading zeros (3.0e-05 is "3e-5"), and the
+// exponent form whenever the plain one would need trailing zeros (100.0 is
+// "1e2", 123000.0 is "1.23e5", but 105.0 stays "105").
+and mrsh_float_text = fn (f: float) ->
+  let t = rb_float_str f in
+  if str_eq t "Infinity" then "inf"
+  else if str_eq t "-Infinity" then "-inf"
+  else if str_eq t "NaN" then "nan"
+  else
+    let i = mrsh_e_at t 0 in
+    if i < 0 then
+      (let plain = mrsh_strip_dot0 t in
+       if str_contains plain "." then plain else mrsh_int_form plain)
+    else mrsh_strip_dot0 (substring t 0 i) ++ "e" ++ mrsh_strip_exp (substring t (i + 1) (str_len t))
+
+// an integral value whose digits end in zeros is written in exponent form.
+and mrsh_int_form = fn (t: str) ->
+  let neg = str_len t > 0 && str_eq (char_at t 0) "-" in
+  let d = (if neg then substring t 1 (str_len t) else t) in
+  if str_len d < 2 then t
+  else if (if str_eq (char_at d (str_len d - 1)) "0" then false else true) then t
+  else
+    let core = mrsh_rstrip_zeros d in
+    if str_len core == 0 then t
+    else
+      let mant = (if str_len core == 1 then core
+                  else substring core 0 1 ++ "." ++ substring core 1 (str_len core)) in
+      (if neg then "-" else "") ++ mant ++ "e" ++ str_of_int (str_len d - 1)
+
+and mrsh_rstrip_zeros = fn (d: str) ->
+  if str_len d > 0 && str_eq (char_at d (str_len d - 1)) "0"
+  then mrsh_rstrip_zeros (substring d 0 (str_len d - 1)) else d
+
+and mrsh_e_at = fn (t: str) -> fn (i: int) ->
+  if i >= str_len t then (0 - 1)
+  else if str_eq (char_at t i) "e" || str_eq (char_at t i) "E" then i
+  else mrsh_e_at t (i + 1)
+
+and mrsh_strip_dot0 = fn (t: str) ->
+  let n = str_len t in
+  if n >= 2 && str_eq (substring t (n - 2) n) ".0" then substring t 0 (n - 2) else t
+
+and mrsh_strip_exp = fn (e: str) ->
+  if str_len e == 0 then e
+  else if str_eq (char_at e 0) "+" then mrsh_strip_zeros (substring e 1 (str_len e))
+  else if str_eq (char_at e 0) "-" then "-" ++ mrsh_strip_zeros (substring e 1 (str_len e))
+  else mrsh_strip_zeros e
+
+and mrsh_strip_zeros = fn (e: str) ->
+  if str_len e > 1 && str_eq (char_at e 0) "0" then mrsh_strip_zeros (substring e 1 (str_len e)) else e
+
+and vals_len = fn (xs: Val list) -> fn (acc: int) ->
+  match xs with Nil -> acc | Cons (_, t) -> vals_len t (acc + 1)
+
+and mrsh_dump_vals = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (h, t) -> mrsh_dump_val world h ++ mrsh_dump_vals world t
+
+and mrsh_dump = fn world -> fn (v: Val) ->
+  let _ = map_clear mrsh_dsyms in
+  chr 4 ++ chr 8 ++ mrsh_dump_val world v
+
 and mrsh_load = fn world -> fn (s: str) ->
   if str_len s < 3 then raise_exc world "ArgumentError" "marshal data too short"
   else if (if mrsh_at s 0 == 4 && mrsh_at s 1 <= 8 then false else true) then
@@ -20486,6 +20613,17 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                     | Cons (ESym nm, _) ->
                       (let _ = map_set meths (cls ++ "#" ++ nm) (Meth (bp, Nil, bb)) in
                        let _ = map_set dm_methods (cls ++ "#" ++ nm) VNil in
+                       // the block is a CLOSURE: the class body it was written
+                       // in may itself be inside a method (`Class.new do
+                       // define_method(:n) { n } end`), and those locals are
+                       // gone by the time the method runs unless they are kept
+                       // here. The call form of define_method already did this.
+                       let _ = dm_store_closure (cls ++ "#" ++ nm) (false, bp, bb, cenv) in
+                       // ...and it is defined HERE, lexically: `def` records
+                       // that so a class variable and a bare constant in the
+                       // body resolve against this class, and a method built
+                       // from a block needs it just as much.
+                       let _ = map_set meth_cref (cls ++ "#" ++ nm) (cur_lex ()) in
                        // define_method adds a method, so the hook fires for it too
                        run_method_added world cls nm)
                     | _ -> ()) in
