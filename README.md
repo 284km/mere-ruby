@@ -8,7 +8,7 @@ hierarchies, `map`/`select`/`reduce` chains, hashes) prints byte-identical
 output to the reference `ruby`.
 
 ```sh
-mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x8000000 mr.c -o mere-ruby
+mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ```
@@ -17,7 +17,13 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x8000000 mr.c -o mere-rub
 statement list, so native stack use grows with program size; on the
 default 8 MB main-thread stack a program of roughly 8000 statements
 segfaults before the interpreter's own `SystemStackError` guard can see
-it. 128 MB puts the ceiling out of reach of real input. See
+it. 512 MB was measured, not guessed: at that size both plain recursion
+and a heavy frame (block, hash, string, begin/rescue) reach 100 000
+native frames. The interpreter's own guard sits at 15 000 — deep enough
+for rubocop-ast's recursive-descent pattern compiler, which needs more
+than 10 000, and low enough that a RUNAWAY recursion trips the catchable
+`SystemStackError` before it has committed much of that stack, which is
+what a batch of programs in one process depends on. See
 [PAIN.md](PAIN.md) §M9.
 
 Divergences that are understood and deliberately unfixed are tracked in

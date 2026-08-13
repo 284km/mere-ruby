@@ -102,10 +102,16 @@ does not turn it into a loop. So the fix has to live outside the
 language, in the link step of whatever embeds it:
 
 ```sh
-clang -O2 -Wl,-stack_size,0x8000000 mr.c -o mere-ruby
+clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
 ```
 
-128 MB, and the 12-gem batch runs to completion. It is the right fix —
+512 MB, and the gem batch runs to completion. (128 MB was enough until a
+gem with a recursive-descent compiler — rubocop's node patterns — needed
+more than 10 000 nested Ruby calls.) The two numbers are coupled: the
+interpreter's `SystemStackError` guard has to be deep enough for real
+code and shallow enough that a runaway recursion trips it before it has
+committed the whole stack — a batch of programs in one process is killed
+outright otherwise, which is how 50 000 was found to be too generous. It is the right fix —
 one flag, no code change, and the `SystemStackError` guard still trips
 exactly as before for genuine infinite recursion, so nothing is masked.
 But it is a fix a Mere user has to already know to reach for, and the

@@ -164,3 +164,14 @@ already does.
 reads it back), but the same bytes sent through `print`/`$stdout.write` stop
 at the first zero byte. The Mere-level fix exists upstream (`print_bytes`,
 v0.1.216+); mere-ruby's own output path has not moved to it yet.
+
+## rubocop's own load recurses without bound
+
+rubocop-ast loads (it needs more than 10 000 nested Ruby calls, which is why
+the interpreter's stack guard moved to 15 000), but `require "rubocop"` then
+recurses until the process dies: with the guard removed entirely it is
+OOM-killed rather than finishing, so the depth is unbounded, not merely deep.
+Something in that load is a cycle — the guard turning it into a catchable
+`SystemStackError` is what keeps the gem batch reporting instead of being
+killed. Finding the cycle needs a call-path trace, which the interpreter does
+not keep yet.
