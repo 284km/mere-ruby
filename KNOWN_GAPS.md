@@ -134,11 +134,33 @@ one-step diagnoses instead of bisections. Fixing it properly means a
 "not applicable" signal from `prim_method_raw` back to the caller, which has
 the world and can raise the real error.
 
-## `Marshal` is not implemented
+## `Marshal.dump` is not implemented
 
-`Marshal.load` / `Marshal.dump` raise; only `Marshal::MAJOR_VERSION` and
-`MINOR_VERSION` exist. It is what stops rubocop-rails: unicode-display_width
-ships its index as a gzipped marshal dump and reads it at load time with
-`Zlib::GzipReader.new(file).read` — so that gem needs both the reader and
-the format. mgz (the vendored zlib) can already inflate a gzip member, so
-the reader is the smaller half.
+`Marshal.load` reads the subset a data file uses — nil / true / false,
+Integer, Symbol (with the back-reference table), String (with its encoding),
+Array, Hash, Float, and the ivar wrapper. An object, an object link (`@`),
+a Bignum or a user class names its own tag in the error rather than loading
+something wrong. There is no `dump`: writing the format is a separate piece
+of work and nothing in the gem sample needs it.
+
+## A `define_method` body does not close over its defining scope
+
+```ruby
+outer = 7
+K = Class.new do
+  define_method(:seen) { outer }   # NameError when called
+end
+```
+
+The block is stored as an AST and re-bound at call time, so its enclosing
+locals are gone. `class_eval` with a block, and the class body itself, do
+keep that scope — only the method built from a block loses it. Fixing it
+means storing the defining environment alongside the body, the way a Proc
+already does.
+
+## `print` truncates a binary string at its first NUL
+
+`Zlib.gzip(x)` written with `File#write` is byte-exact (the system `zlib`
+reads it back), but the same bytes sent through `print`/`$stdout.write` stop
+at the first zero byte. The Mere-level fix exists upstream (`print_bytes`,
+v0.1.216+); mere-ruby's own output path has not moved to it yet.

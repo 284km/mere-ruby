@@ -29,7 +29,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 95 programs, byte-for-byte
+./run_corpus.sh                                  # 97 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -78,7 +78,8 @@ load.
 
 A C extension is not automatically out of reach, but it has to be
 answered rather than found. `digest`, `date` and `etc` ship as Ruby
-source, `zlib` comes from a vendored Mere package (above), and `rbconfig`,
+source, `zlib`'s compression comes from a vendored Mere package (above)
+with its stream classes shipped as Ruby source over it, and `rbconfig`,
 `thread` and `fiber` are satisfied without a file (`fiber.so` is loaded
 before any Ruby runs in CRuby 3.x, so `require "fiber"` returns false
 there too). `socket` and `openssl` are not answered: the first is a
@@ -89,10 +90,11 @@ Against a sample of 29 installed gems, `gemtest/run.sh` loads **18** with
 a CRuby stdlib on `-I` and **16** on what mere-ruby ships. Of the eleven
 that do not: seven stop at a C extension (`openssl` ×4, `socket` ×2,
 protobuf ×1), one is not installed, and three are named gaps —
-`TracePoint`, a Railtie `initializer`, and `Zlib::GzipReader` +
-`Marshal.load` for a gem's compressed data file. devise now loads the
-whole activesupport / i18n / concurrent-ruby stack before it reaches
-`openssl`.
+`TracePoint`, a Railtie `initializer`, and one unresolved call inside
+rubocop's own loading. devise now loads the whole activesupport / i18n /
+concurrent-ruby stack before it reaches `openssl`, and rubocop-rails reads
+unicode-display_width's gzipped `Marshal` index and gets as far as
+rubocop itself.
 
 ## In the browser
 
