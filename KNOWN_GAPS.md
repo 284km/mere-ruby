@@ -99,30 +99,37 @@ Two were not, and both hid a real problem rather than causing one:
 A corpus program may write into `/tmp`, but it must create everything it
 reads and delete it afterwards.
 
-## Corpus programs must be self-contained
+## `private_constant` and `private_class_method` are parsed and ignored
 
-Two were not, and both hid a real problem rather than causing one:
+`private_constant :A` accepts its arguments (including across a newline) but
+records nothing, so `Consts.constants` still lists `A` and `Consts::A` still
+reads. Nothing in the gem sample depends on the constant actually being
+hidden — it depends on the call not being a parse error, which it no longer
+is. Making it real means a per-constant flag consulted by `constants`, by
+qualified reads, and by `const_get`.
 
-- `76_zlib.rb` read a zlib stream from `/tmp` that an earlier ad-hoc run had
-  left there. When `/tmp` was cleared the gate stopped at that program — with
-  `set -e`, silently, so `run_corpus.sh` reported the seventy-five programs
-  before it and exited non-zero. The stream is inline now.
-- `88_utf8_names_and_toplevel_const.rb` printed a non-ASCII symbol, and
-  `Symbol#inspect` escapes those when the default external encoding is not
-  UTF-8 — so the expected output depended on the shell's locale rather than
-  on the interpreter. It compares bytes now.
+## `caller_locations` answers with one frame, even at the top level
 
-A corpus program may write into `/tmp`, but it must create everything it
-reads and delete it afterwards.
+mere-ruby keeps no call stack. `caller` is `[]`, and `caller_locations`
+returns a single `Thread::Backtrace::Location` for the file being executed,
+with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
+`module_eval`. For a method called from a library's body that frame IS the
+caller's file, so the answer is right where it matters; at the top level Ruby
+would return an empty array and mere-ruby still returns the frame.
 
-## sidekiq-pro does not finish loading in a batch
+## `Kernel.format` and friends on a BasicObject-derived class
 
-Loaded after two dozen other gems it does not fail at all: it was still
-running after 34 minutes. This is not a regression — before non-ASCII
-identifiers were accepted, sidekiq's `api.rb` (which contains
-`alias_method :<emoji>, :clear`) stopped the load at the lexer, so the gem
-gave up early. It now parses and gets much further, and that path is slow
-enough to look like a hang.
+`::Kernel.format(...)` raises NoMethodError, the same gap as `Kernel.puts`
+above. It shows up in code that deliberately inherits from BasicObject and
+reaches for Kernel by name.
 
-Until it is diagnosed, `gemtest/run.sh` on the full list will not finish
-with a stdlib on `-I`. Measure it as two runs (`GEMLIST` takes a subset).
+## The primitive dispatcher's internal `no <name>` failures
+
+A handful of primitives (`to_i`, `to_f`, `to_a`, `size`, `empty?`, `[]`) raise
+a mere-ruby StandardError rather than a Ruby NoMethodError when the receiver
+is of a type they do not handle — `1.length` is not caught by
+`rescue NoMethodError`. The receiver is named in the message now
+(`mere-ruby: no [] for nil`), which is what made several gem failures
+one-step diagnoses instead of bisections. Fixing it properly means a
+"not applicable" signal from `prim_method_raw` back to the caller, which has
+the world and can raise the real error.

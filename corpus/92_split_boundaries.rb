@@ -1,0 +1,17 @@
+# String#split: zero-width matches, the limit argument, and the empty
+# separator all have rules of their own.
+p "abc".split("")
+p "abc".split(//)
+p "".split(",")
+p "".split(/,/)
+p "aXbXc".split(/(?=X)/)
+p "aXbXc".split(/(?<=X)/)
+p "a1b2c".split(/(?<=\d)/)
+p "hello world".split(/o/, 2)
+p "a,b,c".split(/,/, 2)
+p "a,b,c".split(",", 2)
+p "a,b,,".split(/,/)
+p "a,b,,".split(/,/, -1)
+p "a1b22c".split(/(\d+)/)
+p " a  b ".split(" ")
+p "a-b_c".split(/[-_]/)
