@@ -1,5 +1,9 @@
 #!/bin/sh
-# Load every gem in gems.txt under mere-ruby and print the tally.
+# Load every gem in gems.txt under mere-ruby AND under the reference ruby, and
+# compare. The reference run is the point: two gems in the list (action_tracer,
+# letter_opener_web) cannot be required outside a Rails application, and CRuby
+# fails them with `uninitialized constant Rails` exactly as mere-ruby does.
+# Counting those against the interpreter overstated the gap by two.
 #
 #   ./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib-dir]
 #
@@ -20,11 +24,14 @@ stdlib="$3"
 inc=""
 [ -n "$stdlib" ] && inc="-I$stdlib"
 list="${GEMLIST:-$here/gems.txt}"
-ok=0; bad=0
+ok=0; bad=0; skip=0
 while IFS= read -r line; do
   g=$(printf '%s' "$line" | tr -d '\r' | sed 's/^ *//;s/ *$//')
   [ -z "$g" ] && continue
   case "$g" in \#*) continue;; esac
+  # what the reference ruby makes of it, in the same gem home
+  rout=$(GEM_HOME="$gem_home" GEM_PATH="$gem_home" \
+         ruby "$here/load_one.rb" "$g" 2>/dev/null)
   out=$(GEM_HOME="$gem_home" GEM_PATH="$gem_home" RUBYGEMS_LIB="$rubygems/lib" \
         "$mr" $inc "$here/load_one.rb" "$g" 2>/dev/null)
   code=$?
@@ -32,9 +39,18 @@ while IFS= read -r line; do
     # a native signal: the interpreter died rather than raising
     echo "CRASH $g  (exit $code)"
     bad=$((bad + 1))
-  else
-    echo "$out"
-    case "$out" in OK*) ok=$((ok + 1));; *) bad=$((bad + 1));; esac
+    continue
   fi
+  case "$rout" in
+    OK*)
+      echo "$out"
+      case "$out" in OK*) ok=$((ok + 1));; *) bad=$((bad + 1));; esac
+      ;;
+    *)
+      # ruby cannot load it here either — not a statement about mere-ruby
+      echo "SKIP $g  (ruby: ${rout#FAIL* })"
+      skip=$((skip + 1))
+      ;;
+  esac
 done < "$list"
-echo "TOTAL ok=$ok fail=$bad"
+echo "TOTAL ok=$ok fail=$bad skip=$skip (of $((ok + bad)) gems ruby itself loads)"

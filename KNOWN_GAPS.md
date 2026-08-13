@@ -78,11 +78,14 @@ the last place (`1.0000000000000002` where ruby prints `1.0`). Closing it
 means a two-part pi and an argument reduction, for an input shape nothing in
 the sample uses.
 
-## `TracePoint`
+## `TracePoint` implements one event
 
-Not implemented. zeitwerk uses it to notice when an explicit namespace
-constant is defined, so `dry-logic` (and anything else that loads
-zeitwerk's full autoloader) stops there.
+`TracePoint.new(:class)` fires when a class or module body is entered, which
+is the event zeitwerk watches to notice an explicit namespace — dry-logic
+loads on it. `#enable`, `#disable`, `#enabled?`, `#self` and `#event` are
+there; the block form of enable/disable and every other event (`:call`,
+`:line`, `:return`, …) are not. Firing costs one lookup per class body while
+no tracepoint is enabled.
 
 ## Corpus programs must be self-contained
 

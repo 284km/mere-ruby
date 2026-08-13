@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 106 programs, byte-for-byte
+./run_corpus.sh                                  # 107 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -100,11 +100,12 @@ rubocop-rails is the first gem in the sample to ask for it — and the
 second is a binding to a third-party C library, deliberately out of
 scope.
 
-Against a sample of 29 installed gems, `gemtest/run.sh` loads **18** with
-a CRuby stdlib on `-I` and **16** on what mere-ruby ships. Of the eleven
-that do not: eight stop at a C extension (`openssl` ×4, `socket` ×3,
-protobuf ×1), one is not installed, and two are named gaps —
-`TracePoint` and a Railtie `initializer`. devise loads the whole
+Against a sample of 29 installed gems — of which the reference ruby itself
+loads **27** here, two needing a Rails application to exist —
+`gemtest/run.sh` loads **19** with a CRuby stdlib on `-I` and **17** on
+what mere-ruby ships. **Every one of the eight that fail stops at a C
+extension**: `openssl` ×4, `socket` ×3, protobuf ×1. Nothing else in the
+sample is blocked by the interpreter. devise loads the whole
 activesupport / i18n / concurrent-ruby stack before it reaches `openssl`,
 and rubocop-rails reads unicode-display_width's gzipped `Marshal` index,
 compiles rubocop-ast's node patterns, and gets through most of rubocop

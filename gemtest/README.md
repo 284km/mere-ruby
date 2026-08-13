@@ -31,6 +31,13 @@ after it down with it, and the tally silently shrank to whatever came before
 the crash. Twenty-nine startups is the price of a gate that keeps reporting;
 a signal shows up as `CRASH <gem>`.
 
+**Every gem is loaded under the reference ruby too**, and a gem ruby cannot
+load here either is reported as `SKIP`, not as a failure. Two in the list
+(`action_tracer`, `letter_opener_web`) require a Rails application to exist:
+CRuby fails them with `uninitialized constant Rails` exactly as mere-ruby
+does, and counting those against the interpreter overstated the gap by two.
+The denominator in the summary line is the number of gems ruby itself loads.
+
 ## Where it stands (2026-08-13)
 
 | | loads |

@@ -3816,6 +3816,10 @@ and parse_x_chain = fn (recv: Expr) -> fn toks ->
   | _ -> (recv, toks)
 
 and parse_x_idx = fn toks -> fn (acc: Expr list) ->
+  // an index may be written across lines -- `new_site[\n  /re/, 1\n]`
+  // (addressable) -- so newlines are skipped where a paren-less argument list
+  // would skip them: before an index, and after each comma.
+  let toks = skip_nls toks in
   let (e, r) =
     (match toks with
      | Cons (TP st, r0) ->
@@ -3824,7 +3828,7 @@ and parse_x_idx = fn toks -> fn (acc: Expr list) ->
        else if str_eq st "&" || str_eq st " &" then let (i, r1) = parse_expr r0 in (EBlockPass i, r1)
        else parse_expr toks
      | _ -> parse_expr toks) in
-  match r with
+  match skip_nls r with
   | Cons (TP p, r2) ->
     if str_eq p "," then parse_x_idx r2 (Cons (e, acc))
     else if str_eq p "]" then (rev_app (Cons (e, acc)) Nil, r2)
@@ -5428,13 +5432,15 @@ and parse_params = fn toks0 -> fn (acc: str list) -> fn (defs: (str * Expr) list
          // optional `name = expr`: uniquify a duplicate `_` and key the default
          // under the SAME unique name so it stays associated with this position.
          let un = uniq_param name acc in
-         let (e, r3) = parse_expr r2 in parse_params_after un r3 acc (Cons ((un, e), defs))
+         // the default may start on the NEXT line -- addressable writes
+         // `def self.normalize_component(component, character_class=\n  CONST,`
+         let (e, r3) = parse_expr (skip_nls r2) in parse_params_after un r3 acc (Cons ((un, e), defs))
        else if str_eq eq ":" then
          let un = uniq_param (name ++ ":") acc in
-         (match r2 with
+         (match skip_nls r2 with
           | Cons (TP q, _) -> if str_eq q "," || str_eq q ")" then parse_params_after un r2 acc defs
-                              else let (e, r3) = parse_expr r2 in parse_params_after un r3 acc (Cons ((un, e), defs))
-          | _ -> let (e, r3) = parse_expr r2 in parse_params_after un r3 acc (Cons ((un, e), defs)))
+                              else let (e, r3) = parse_expr (skip_nls r2) in parse_params_after un r3 acc (Cons ((un, e), defs))
+          | _ -> let (e, r3) = parse_expr (skip_nls r2) in parse_params_after un r3 acc (Cons ((un, e), defs)))
        else parse_params_after (uniq_param name acc) r acc defs
      | _ -> parse_params_after (uniq_param name acc) r acc defs)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected parameter name" ++ parsing_file ()))) in fail ("mere-ruby: expected parameter name" ++ parsing_file ()))
@@ -6404,6 +6410,10 @@ let rec str_find_from = fn (s: str) -> fn (pat: str) -> fn (i: int) ->
   if i + m > n then 0 - 1
   else if str_eq (substring s i (i + m)) pat then i
   else str_find_from s pat (i + 1);
+// the LAST occurrence of pat, or -1.
+let rec str_rfind = fn (s: str) -> fn (pat: str) -> fn (i: int) -> fn (best: int) ->
+  let j = str_find_from s pat i in
+  if j < 0 then best else str_rfind s pat (j + 1) j;
 // expand \&/\0 (whole match m), \\ and \x in a replacement for a string
 // pattern; \1..\9 become empty (a string pattern has no capture groups).
 let rec lit_expand_rep = fn (rep: str) -> fn (m: str) -> fn (i: int) -> fn (acc: str) ->
@@ -10240,10 +10250,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               | _ -> true) then
     (let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr h2, _) -> sget h2 | _ -> "") in
      let owner = bm_owner_of world recv nm in
+     // a binary operator on a primitive is dispatched by arith_bin rather than
+     // being an entry anywhere, so respond_to? does not know it; `1.method(:+)`
+     // is still a Method (and #call routes it back to arith_bin).
      let exists = (if str_eq owner "" then
                      (match recv with
                       | VMain -> (let (m9, _, _, _) = world in map_has m9 nm)
-                      | _ -> responds world recv nm)
+                      | _ -> responds world recv nm || is_binary_op_name nm)
                    else true) in
      if exists then mk_bound_method world recv owner nm
      else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for an instance of " ++ display_cls world (dispatch_cls_of world recv)))
@@ -10280,12 +10293,30 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | _ -> make_enum world recv "each")
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
-  else if str_eq name "extend" && (match recv with VClass _ -> true | VObj _ -> true | _ -> false) then
+  else if str_eq name "extend" && (match recv with VClass _ -> true | VObj _ -> true
+                                         | VStr _ -> true | VArr _ -> true | VHsh _ -> true
+                                         | _ -> false) then
     // extend mixes a module's instance methods in as singleton methods of the
     // receiver. For an object that means materialising its singleton class (so
-    // dispatch actually runs through it); for a class it is the metaclass.
-    (let sc = (match recv with VClass c -> "(sng:" ++ c ++ ")" | VObj id -> singleton_cls_of world id | _ -> "") in
+    // dispatch actually runs through it); for a class it is the metaclass; a
+    // mutable primitive has one too (`ARGV.extend(OptionParser::Arguable)` is
+    // how optparse installs itself, and ARGV is an Array).
+    (let sc = (match recv with
+               | VClass c -> "(sng:" ++ c ++ ")"
+               | VObj id -> singleton_cls_of world id
+               | VStr _ -> prim_sng_cls world recv "String"
+               | VArr _ -> prim_sng_cls world recv "Array"
+               | VHsh _ -> prim_sng_cls world recv "Hash"
+               | _ -> "") in
      let _ = extend_all sc args in
+     // ...and dispatch for a primitive goes through its tagged class, so the
+     // singleton has to become that tag or the mixed-in methods are invisible
+     // (its superclass is the class the value had, so nothing else moves).
+     let _ = (match recv with
+              | VStr _ -> map_set hng_store (hng_key recv) sc
+              | VArr _ -> map_set hng_store (hng_key recv) sc
+              | VHsh _ -> map_set hng_store (hng_key recv) sc
+              | _ -> ()) in
      // `M.extended(base)` fires after the mixin, the mirror of `included`.
      // ActiveSupport::LazyLoadHooks initialises its hook tables there, so
      // without it `@load_hooks` stays nil.
@@ -10641,6 +10672,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              let _ = write_file (sget ph) content in
              VInt (str_len content))
           | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
+       // File.split(path) -> [dirname, basename]
+       else if str_eq name "split" then
+         (match args with
+          | Cons (VStr ph, _) -> let ph = sget ph in
+            arr_new (Cons (mkstr (dirname_of ph), Cons (mkstr (basename_of ph), Nil)))
+          | _ -> raise_exc world "TypeError" "no implicit conversion into String")
        else if str_eq name "exist?" || str_eq name "exists?" || str_eq name "file?" then
          (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
        // File.fnmatch?(pattern, path): the same matcher Dir.glob uses.
@@ -11189,6 +11226,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else raise_exc world "Zlib::GzipFile::Error" "not in gzip format")
        else
          mkstr (bytevec_to_str (inflate (bytevec_pad v) (zlib_body_start v))))
+    // TracePoint#enable / #disable tell the interpreter whether to fire at all.
+    else if str_eq c "TracePoint" && str_eq name "__active" then
+      (let _ = (match args with
+                | Cons (VBool true, _) -> map_set hook_flags "tp" VNil
+                | _ -> if map_has hook_flags "tp" then map_delete hook_flags "tp" else ()) in VNil)
     else if str_eq c "Marshal" && str_eq name "dump" then
       (match args with
        | Cons (v, _) ->
@@ -11390,7 +11432,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        if str_eq name "call" || str_eq name "[]" || str_eq name "===" then
          (match mrecv with
           | VMain -> call_method env world blk mnm args
-          | _ -> invoke_val_c env world blk mrecv mnm args false)
+          // a binary operator on a primitive is not in the method table -- it
+          // is arith_bin -- so `1.method(:+)` has to route there, the same way
+          // an alias to a builtin operator does.
+          | _ ->
+            if is_binary_op_name mnm
+               && (if has_meth world (dispatch_cls_of world mrecv) mnm then false else true) then
+              (match args with
+               | Cons (a1, _) -> arith_bin mnm mrecv a1
+               | Nil -> invoke_val_c env world blk mrecv mnm args false)
+            else invoke_val_c env world blk mrecv mnm args false)
        else if str_eq name "name" then VSym mnm
        else if str_eq name "receiver" then mrecv
        else if str_eq name "owner" then (if str_eq mown "" then VClass (class_name mrecv) else VClass mown)
@@ -11402,11 +11453,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let _ = map_set ivars (str_of_int uid ++ "@__um_name") (mkstr mnm) in
           VObj uid)
        else if str_eq name "to_proc" then
-         (let benv = map_new () in
+         // The proc calls the method with the receiver as SELF and no explicit
+          // receiver, because `method(:x)` may name a private method and a
+          // Method object is allowed to call one (zeitwerk passes
+          // `&method(:tracepoint_class_callback)`, which is private).
+          (let benv = map_new () in
           let _ = map_set benv "__m_self" mrecv in
+          let _ = map_set benv "self" mrecv in
+          // the proc calls the Method OBJECT, so it inherits everything #call
+          // already handles: a private method, and a builtin operator.
+          let _ = map_set benv "__m_meth" (VObj id) in
           let body = (match mrecv with
                       | VMain -> Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Nil))), Nil)
-                      | _ -> Cons (SExpr (EMethod (EVar "__m_self", mnm, Cons (ESplat (EVar "__a"), Nil))), Nil)) in
+                      | _ -> Cons (SExpr (EMethod (EVar "__m_meth", "call", Cons (ESplat (EVar "__a"), Nil))), Nil)) in
           let pid = map_len proc_store in
           let _ = map_set proc_store (str_of_int pid) (true, Cons ("*__a", Nil), body, benv) in
           VProc pid)
@@ -13048,8 +13107,14 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> VNil)
   // is_a? / kind_of? walk the real (exception) hierarchy.
   else if (str_eq name "is_a?" || str_eq name "kind_of?") then
-    (match args with
-     | Cons (VClass c, _) -> VBool (obj_is_a world cls c)
+    // an extended primitive is_a? the module it was extended with, so the
+    // question is asked of the tagged class (its singleton, when there is
+    // one) rather than of the bare class name.
+    (let tag = (let hk = hng_key recv in
+                if (if str_eq hk "" then false else true) && map_has hng_store hk
+                then map_get hng_store hk else cls) in
+     match args with
+     | Cons (VClass c, _) -> VBool (obj_is_a world tag c || obj_is_a world cls c)
      | _ -> VBool false)
   else if has_meth world cls name then
     (if vischeck && meth_private world cls name
@@ -13309,19 +13374,41 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
                 || builtin_class_method c name || str_eq name "autoload"
                 || str_eq name "autoload?" || str_eq name "define_method"
                 || str_eq name "instance_variable_set" || str_eq name "private_method_defined?"
-  | VStr _ -> is_prim_method name || is_str_method name || str_eq name "to_str"
+  // A primitive may be an instance of a SUBCLASS with methods of its own --
+  // optparse's CompletingHash < Hash defines #match, and `respond_to?(:match)`
+  // is what decides whether optparse accepts it. Calling the method already
+  // worked; only the question was answered wrong.
+  | VStr _ -> prim_user_has world recv name || is_prim_method name || is_str_method name || str_eq name "to_str"
   | VProc _ -> is_prim_method name || is_proc_method name
   // the implicit-conversion protocol is per type, so a duck-type check
   // (`x.respond_to? :to_str`) tells strings from everything else.
-  | VArr _ -> is_prim_method name || is_arr_method name
-  | VHsh _ -> is_prim_method name || is_hash_method name
+  | VArr _ -> prim_user_has world recv name || is_prim_method name || is_arr_method name
+  | VHsh _ -> prim_user_has world recv name || is_prim_method name || is_hash_method name
   // the numeric primitives, so `5.method(:abs)` and respond_to? agree with
   // what the dispatcher actually implements.
-  | VInt _ -> is_prim_method name || is_num_method name
-  | VFlt _ -> is_prim_method name || is_num_method name
+  | VInt _ -> prim_user_has world recv name || is_prim_method name || is_num_method name
+  | VFlt _ -> prim_user_has world recv name || is_prim_method name || is_num_method name
   | VRange (_, _, _) ->
     is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
+  // a Regexp had no entry at all, so it denied `match` -- and optparse asks
+  // exactly that before accepting a pattern (`pat.respond_to?(:match) or
+  // raise`), which is where its load stopped.
+  | VRegex (_, _) -> is_regex_method name || is_prim_method name
   | _ -> is_prim_method name
+
+// Regexp method names the dispatcher implements, for respond_to?.
+and is_regex_method = fn (name: str) ->
+  str_eq name "match" || str_eq name "match?" || str_eq name "=~" ||
+  str_eq name "===" || str_eq name "source" || str_eq name "options" ||
+  str_eq name "names" || str_eq name "named_captures" || str_eq name "casefold?" ||
+  str_eq name "encoding" || str_eq name "to_s" || str_eq name "inspect"
+
+// does the value's class (a builtin subclass, or a reopened builtin) define
+// this method in ruby?
+and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
+  let c = dispatch_cls_of world recv in
+  (if str_eq c "" then false else has_meth world c name)
+  && (if meth_private world c name then false else true)
 
 // Proc/lambda method names, for respond_to?.
 and is_proc_method = fn (name: str) ->
@@ -20484,6 +20571,14 @@ and register_class_sng = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
    | _ -> r)
 
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  // ruby's TracePoint(:class) fires when a class or module body is ENTERED --
+  // zeitwerk watches for exactly that to notice an explicit namespace. The
+  // flag is set by TracePoint#enable, so a program with no tracepoint pays one
+  // map lookup per class body.
+  let _ = (if map_has hook_flags "tp" then
+             (let noblk0 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+              let _ = invoke world noblk0 (VClass "TracePoint") "(sng:TracePoint)" "__fire" (Cons (VClass cls, Nil)) in ())
+           else ()) in
   // a `using` inside this body is scoped to it: snapshot/restore ref_active.
   let saved = map_copy ref_active in
   let cenv = map_new () in
@@ -21246,6 +21341,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       named_class_of_al env world blk
         (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> "") else cur_lex ())
         super0 in
+    // a superclass that names no constant is a NameError, as in ruby -- not a
+    // class with a dangling parent. action_tracer writes `class Railtie <
+    // ::Rails::Railtie`, and without Rails loaded that silently produced a
+    // class whose methods were missing much later.
+    let _ = (if str_eq super0 "" || str_eq super0 "(module)" then ()
+             else if map_has consts super0 || map_has modules super0 || map_has sup super0 then ()
+             else
+               (let ci = first_colon2 super0 0 in
+                let head = (if ci < 0 then super0 else substring super0 0 ci) in
+                let miss = (if map_has consts head then super0 else head) in
+                let _ = raise_exc world "NameError" ("uninitialized constant " ++ miss) in ())) in
     let is_module = str_eq super0 "(module)" in
     // reopening: `module C` on an existing class (or `class C` on a module)
     // is a TypeError; so is `class C < D` with a different superclass.
@@ -23802,6 +23908,105 @@ let err_where = fn (name: str) ->
   let f = (if map_has prim_missing "f" then (match map_get prim_missing "f" with VStr h -> sget h | _ -> "") else "") in
   if str_eq f "" || str_eq f name then name else f;
 
+// ObjectSpace::WeakMap: a Hash that does not keep its keys alive. mere-ruby
+// frees nothing, so the weakness has no observable effect here -- what matters
+// is that the class EXISTS, because activesupport's DescendantsTracker builds
+// one at load time and railties stops there otherwise.
+let core_prelude =
+  "module ObjectSpace\n" ++
+  "  class WeakMap\n" ++
+  "    include Enumerable\n" ++
+  // (no braces in this source: a `{` in a Mere string starts an interpolation)
+  "    def initialize; @h = Hash.new; end\n" ++
+  "    def [](k); @h[k]; end\n" ++
+  "    def []=(k, v); @h[k] = v; v; end\n" ++
+  "    def key?(k); @h.key?(k); end\n" ++
+  "    def include?(k); @h.key?(k); end\n" ++
+  "    def member?(k); @h.key?(k); end\n" ++
+  "    def delete(k); @h.delete(k); end\n" ++
+  "    def size; @h.size; end\n" ++
+  "    def length; @h.size; end\n" ++
+  "    def keys; @h.keys; end\n" ++
+  "    def values; @h.values; end\n" ++
+  "    def each(&b); @h.each(&b); self; end\n" ++
+  "    def each_pair(&b); @h.each(&b); self; end\n" ++
+  "    def each_key(&b); @h.each_key(&b); self; end\n" ++
+  "    def each_value(&b); @h.each_value(&b); self; end\n" ++
+  // (no #{} in this source: Mere interpolates its own strings the same way)
+  "    def inspect; '#<ObjectSpace::WeakMap:size=' + @h.size.to_s + '>'; end\n" ++
+  "  end\n" ++
+  "  class WeakKeyMap < WeakMap\n" ++
+  "    def getkey(k); @h.key?(k) ? k : nil; end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // TracePoint, enough of it for zeitwerk: the :class event, which fires when
+  // a class or module body is entered. `#self` cannot be written with `def`
+  // (it is a keyword), so it is defined the way ruby's C code effectively
+  // does -- through define_method.
+  "class TracePoint\n" ++
+  "  def self.__points\n" ++
+  "    @points = Array.new if @points.nil?\n" ++
+  "    @points\n" ++
+  "  end\n" ++
+  "  def self.__fire(mod)\n" ++
+  "    __points.each do |tp|\n" ++
+  "      tp.__call(mod)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  def initialize(*events, &blk)\n" ++
+  "    @events = events\n" ++
+  "    @blk = blk\n" ++
+  "    @enabled = false\n" ++
+  "    @tp_self = nil\n" ++
+  "  end\n" ++
+  "  def enabled?\n" ++
+  "    @enabled\n" ++
+  "  end\n" ++
+  "  def event\n" ++
+  "    @event\n" ++
+  "  end\n" ++
+  "  define_method(:self) do\n" ++
+  "    @tp_self\n" ++
+  "  end\n" ++
+  "  def enable\n" ++
+  "    unless @enabled\n" ++
+  "      @enabled = true\n" ++
+  "      TracePoint.__points.push(self)\n" ++
+  "      TracePoint.__active(true)\n" ++
+  "    end\n" ++
+  "    false\n" ++
+  "  end\n" ++
+  "  def disable\n" ++
+  "    was = @enabled\n" ++
+  "    @enabled = false\n" ++
+  "    TracePoint.__points.delete(self)\n" ++
+  "    TracePoint.__active(TracePoint.__points.size > 0)\n" ++
+  "    was\n" ++
+  "  end\n" ++
+  "  def __call(mod)\n" ++
+  "    return nil unless @enabled\n" ++
+  "    @tp_self = mod\n" ++
+  "    @event = :class\n" ++
+  "    r = @blk.call(self)\n" ++
+  "    @tp_self = nil\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "end\n";
+
+// define each CONST=encoding-name pair of the table above, `|`-separated.
+let rec enc_define_all = fn mk -> fn (t: str) -> fn (i: int) ->
+  if i >= str_len t then ()
+  else
+    let e = (let j = str_find_from t "|" i in if j < 0 then str_len t else j) in
+    let item = substring t i e in
+    let eq = str_find_from item "=" 0 in
+    let _ = (if eq < 0 then () else
+               (let cname = substring item 0 eq in
+                let ename = substring item (eq + 1) (str_len item) in
+                map_set consts ("Encoding::" ++ cname) (mk ename))) in
+    enc_define_all mk t (e + 1);
+
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set load_ctx "dir" (mkstr (dirname_of name)) in
   let _ = map_set load_ctx "file" (mkstr name) in
@@ -23823,7 +24028,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // Encoding objects (VObj of class Encoding, name in @name). Shared instances
   // stored in enc_objs; the constants point at them. String#encoding returns
   // the matching one, so `x.encoding == Encoding::UTF_8` holds by identity.
+  // one object per encoding NAME: ruby's aliases are the same object
+  // (Encoding::BIG5.equal?(Encoding::Big5)), and String#encoding compares by
+  // identity.
   let mk_enc = fn (nm: str) ->
+    if map_has enc_objs nm then map_get enc_objs nm else
     let id = map_len ocls in
     let _ = map_set ocls (str_of_int id) "Encoding" in
     let _ = map_set ivars (str_of_int id ++ "@name") (mkstr nm) in
@@ -23854,6 +24063,61 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set consts "Encoding::SHIFT_JIS" (mk_enc "Shift_JIS") in
   let _ = map_set consts "Encoding::Shift_JIS" (if map_has enc_objs "Shift_JIS" then map_get enc_objs "Shift_JIS" else mkstr "Shift_JIS") in
   let _ = map_set consts "Encoding::EUC_JP" (mk_enc "EUC-JP") in
+  // ...and every other Encoding constant ruby defines, as CONST=name pairs.
+  // mere-ruby transcodes only a handful of these; a constant EXISTING is not a
+  // claim that it does. activesupport indexes a table by these objects, so a
+  // missing one stopped railties at Encoding::GB18030.
+  let enc_table =
+    "UTF_8_HFS=UTF8-MAC|UTF_8_MAC=UTF8-MAC|UCS_2BE=UTF-16BE|UCS_4BE=UTF-32BE|CP932=Windows-31" ++
+    "J|CsWindows31J=Windows-31J|UCS_4LE=UTF-32LE|SJIS=Windows-31J|PCK=Windows-31J|CSWINDOWS31" ++
+    "J=Windows-31J|CP1251=Windows-1251|CP1252=Windows-1252|CP1250=Windows-1250|CP1254=Windows" ++
+    "-1254|CP1257=Windows-1257|CP1253=Windows-1253|UTF8_DOCOMO=UTF8-DoCoMo|SJIS_DoCoMo=SJIS-D" ++
+    "oCoMo|UTF8_DoCoMo=UTF8-DoCoMo|UTF8_KDDI=UTF8-KDDI|SJIS_KDDI=SJIS-KDDI|SJIS_DOCOMO=SJIS-D" ++
+    "oCoMo|Stateless_ISO_2022_JP_KDDI=stateless-ISO-2022-JP-KDDI|STATELESS_ISO_2022_JP_KDDI=s" ++
+    "tateless-ISO-2022-JP-KDDI|UTF8_SOFTBANK=UTF8-SoftBank|SJIS_SoftBank=SJIS-SoftBank|UTF8_S" ++
+    "oftBank=UTF8-SoftBank|SJIS_SOFTBANK=SJIS-SoftBank|Big5=Big5|BIG5=Big5|Big5_HKSCS=Big5-HK" ++
+    "SCS|BIG5_HKSCS=Big5-HKSCS|Big5_UAO=Big5-UAO|BIG5_UAO=Big5-UAO|CESU_8=CESU-8|CP949=CP949|" ++
+    "Emacs_Mule=Emacs-Mule|EMACS_MULE=Emacs-Mule|EUC_KR=EUC-KR|EUC_TW=EUC-TW|GB18030=GB18030|" ++
+    "GBK=GBK|ISO_8859_2=ISO-8859-2|ISO_8859_3=ISO-8859-3|ISO_8859_4=ISO-8859-4|ISO_8859_5=ISO" ++
+    "-8859-5|ISO_8859_6=ISO-8859-6|ISO_8859_7=ISO-8859-7|ISO_8859_8=ISO-8859-8|ISO_8859_9=ISO" ++
+    "-8859-9|ISO_8859_10=ISO-8859-10|ISO_8859_11=ISO-8859-11|ISO_8859_13=ISO-8859-13|ISO_8859" ++
+    "_14=ISO-8859-14|ISO_8859_15=ISO-8859-15|ISO_8859_16=ISO-8859-16|KOI8_R=KOI8-R|KOI8_U=KOI" ++
+    "8-U|Windows_31J=Windows-31J|WINDOWS_31J=Windows-31J|Windows_1250=Windows-1250|WINDOWS_12" ++
+    "50=Windows-1250|Windows_1251=Windows-1251|WINDOWS_1251=Windows-1251|Windows_1252=Windows" ++
+    "-1252|WINDOWS_1252=Windows-1252|Windows_1253=Windows-1253|WINDOWS_1253=Windows-1253|Wind" ++
+    "ows_1254=Windows-1254|WINDOWS_1254=Windows-1254|Windows_1257=Windows-1257|WINDOWS_1257=W" ++
+    "indows-1257|CP437=IBM437|IBM720=IBM720|CP720=IBM720|IBM737=IBM737|CP737=IBM737|IBM775=IB" ++
+    "M775|CP775=IBM775|CP850=CP850|IBM850=CP850|IBM852=IBM852|CP852=CP852|IBM855=IBM855|CP855" ++
+    "=CP855|IBM857=IBM857|CP857=IBM857|IBM860=IBM860|CP860=IBM860|IBM861=IBM861|CP861=IBM861|" ++
+    "IBM862=IBM862|CP862=IBM862|IBM863=IBM863|CP863=IBM863|IBM864=IBM864|CP864=IBM864|IBM865=" ++
+    "IBM865|CP865=IBM865|IBM866=IBM866|CP866=IBM866|IBM869=IBM869|CP869=IBM869|Windows_1258=W" ++
+    "indows-1258|WINDOWS_1258=Windows-1258|CP1258=Windows-1258|GB1988=GB1988|MacCentEuro=macC" ++
+    "entEuro|MACCENTEURO=macCentEuro|MacCroatian=macCroatian|MACCROATIAN=macCroatian|MacCyril" ++
+    "lic=macCyrillic|MACCYRILLIC=macCyrillic|MacGreek=macGreek|MACGREEK=macGreek|MacIceland=m" ++
+    "acIceland|MACICELAND=macIceland|MacRoman=macRoman|MACROMAN=macRoman|MacRomania=macRomani" ++
+    "a|MACROMANIA=macRomania|MacThai=macThai|MACTHAI=macThai|MacTurkish=macTurkish|MACTURKISH" ++
+    "=macTurkish|MacUkraine=macUkraine|MACUKRAINE=macUkraine|CP950=CP950|Big5_HKSCS_2008=Big5" ++
+    "-HKSCS|BIG5_HKSCS_2008=Big5-HKSCS|CP951=CP951|EBCDIC_CP_US=IBM037|Stateless_ISO_2022_JP=" ++
+    "stateless-ISO-2022-JP|STATELESS_ISO_2022_JP=stateless-ISO-2022-JP|EucJP=EUC-JP|EUCJP=EUC" ++
+    "-JP|EucJP_ms=eucJP-ms|EUCJP_MS=eucJP-ms|EUC_JP_MS=eucJP-ms|CP51932=CP51932|EUC_JIS_2004=" ++
+    "EUC-JIS-2004|EUC_JISX0213=EUC-JIS-2004|EucKR=EUC-KR|EUCKR=EUC-KR|EucTW=EUC-TW|EUCTW=EUC-" ++
+    "TW|GB2312=GB2312|EUC_CN=GB2312|EucCN=GB2312|EUCCN=GB2312|GB12345=GB12345|CP936=GBK|ISO20" ++
+    "22_JP=ISO-2022-JP|ISO2022_JP2=ISO-2022-JP-2|ISO8859_1=ISO-8859-1|ISO8859_2=ISO-8859-2|IS" ++
+    "O8859_3=ISO-8859-3|ISO8859_5=ISO-8859-5|ISO8859_6=ISO-8859-6|ISO8859_4=ISO-8859-4|WINDOW" ++
+    "S_1256=Windows-1256|CP1256=Windows-1256|Windows_1256=Windows-1256|ISO8859_8=ISO-8859-8|W" ++
+    "indows_1255=Windows-1255|ISO8859_7=ISO-8859-7|CP1255=Windows-1255|ISO8859_9=ISO-8859-9|W" ++
+    "INDOWS_1255=Windows-1255|ISO8859_11=ISO-8859-11|TIS_620=TIS-620|ISO8859_10=ISO-8859-10|W" ++
+    "INDOWS_874=Windows-874|CP874=Windows-874|Windows_874=Windows-874|ISO8859_14=ISO-8859-14|" ++
+    "ISO8859_15=ISO-8859-15|ISO8859_13=ISO-8859-13|CP878=KOI8-R|MacJapanese=MacJapanese|ISO88" ++
+    "59_16=ISO-8859-16|MacJapan=MacJapanese|MACJAPAN=MacJapanese|MACJAPANESE=MacJapanese|ANSI" ++
+    "_X3_4_1968=US-ASCII|CP65001=UTF-8|UTF8_MAC=UTF8-MAC|CP65000=UTF-7" in
+  let _ = enc_define_all mk_enc enc_table 0 in
+  // the exception classes and the converter live in the same namespace
+  let _ = map_set consts "Encoding::CompatibilityError" (VClass "Encoding::CompatibilityError") in
+  let _ = map_set consts "Encoding::UndefinedConversionError" (VClass "Encoding::UndefinedConversionError") in
+  let _ = map_set consts "Encoding::InvalidByteSequenceError" (VClass "Encoding::InvalidByteSequenceError") in
+  let _ = map_set consts "Encoding::ConverterNotFoundError" (VClass "Encoding::ConverterNotFoundError") in
+  let _ = map_set consts "Encoding::Converter" (VClass "Encoding::Converter") in
   let _ = map_set consts "Enumerator::Chain" (VClass "Enumerator::Chain") in
   let _ = map_set consts "Enumerator::Yielder" (VClass "Enumerator::Yielder") in
   let _ = map_set consts "Enumerator::Lazy" (VClass "Enumerator::Lazy") in
@@ -24001,7 +24265,19 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // reports the ruby it is compared against; there is no separate build to
   // describe.
   let _ = map_set consts "RbConfig" (VClass "RbConfig") in
-  let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr "arm64-darwin22", Cons (mkstr "ruby_version", Cons (mkstr "3.2.0", Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr "/usr/lib/ruby", Cons (mkstr "rubylibprefix", Cons (mkstr "/usr/lib/ruby", Nil))))))))))))))))))) in
+  // These paths are a fiction -- there is no ruby installation to describe --
+  // but rubygems computes `Gem.default_dir` from rubylibprefix and
+  // ruby_version, and DEFAULT gem specs live under it
+  // (`specifications/default`, 71 of them in a 3.2 tree). Deriving the prefix
+  // from GEM_HOME makes the fiction agree with the tree mere-ruby was pointed
+  // at, so `net-protocol` and the rest are found rather than missing.
+  let gh0 = env_get "GEM_HOME" in
+  let gi = (if str_len gh0 > 0 then str_rfind gh0 "/gems/" 0 (0 - 1) else (0 - 1)) in
+  let ghver = (if gi > 0 then substring gh0 (gi + 6) (str_len gh0) else "") in
+  let ok = gi > 0 && str_len ghver > 0 && (if str_contains ghver "/" then false else true) in
+  let rlp = (if ok then substring gh0 0 gi else "/usr/lib/ruby") in
+  let rver = (if ok then ghver else "3.2.0") in
+  let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr "arm64-darwin22", Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr rlp, Cons (mkstr "rubylibprefix", Cons (mkstr rlp, Nil))))))))))))))))))) in
   let _ = map_set consts "RbConfig::CONFIG" rbc in
   let _ = map_set consts "RbConfig::TOPDIR" (mkstr "/usr") in
   // File::FNM_* — the flag bits File.fnmatch? and Dir.glob take.
@@ -24083,6 +24359,12 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set globals "0" (mkstr name) in
   let _ = map_set globals "PROGRAM_NAME" (mkstr name) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // A small core prelude, written in ruby and run before the program: classes
+  // that are core (no `require` names them) but are ordinary objects, so
+  // writing them in ruby is shorter and clearer than a builtin. It runs as its
+  // own program, so it does not shift the script's line numbers.
+  let _ = (let (pprog, _) = parse_stmts (lex_go core_prelude 0) Nil in
+           hoist_run env world noblk pprog) in
   // An exception nobody rescued: report it the way Ruby does and exit 1,
   // instead of letting the interpreter's own `fail` message be the last word.
   // (Until this, every uncaught Ruby exception read as "(ruby exception
