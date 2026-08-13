@@ -59,3 +59,13 @@ p r.respond_to?(:begin)
 p Range.instance_method(:begin).owner
 last = (0..0)
 p [(1..2), (3..4)].map { |q| last = last.begin + q.begin..last.max + q.max }
+
+# min / max come from the endpoints, so they must not enumerate: an endless
+# range would never finish. (What `end` reports for one is a known gap.)
+p [(1..5).min, (1..5).max, (1...5).min, (1...5).max]
+p [(5..1).min, (5..1).max, (1..1).min, (1...1).max]
+p [(1..5).min(2), (1..5).max(2)]
+endless = (1..Float::INFINITY)
+p endless.begin
+p endless.include?(10**9)
+p endless.cover?(0)

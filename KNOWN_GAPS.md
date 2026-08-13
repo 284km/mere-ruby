@@ -185,14 +185,20 @@ readable afterwards. Nothing in the gem sample depends on the difference;
 it shows up as `Regexp.last_match` answering a stale MatchData where ruby
 answers nil.
 
-## rubocop crashes the interpreter with a native signal
+## An endless range is stored as one that ends at the largest integer
 
-`require "rubocop"` gets through rubocop-ast's pattern compiler and then dies
-with SIGBUS — a native crash, not a Ruby exception, so nothing catches it and
-nothing names it. The recursion guard is not what trips (it is set at 15 000
-and the stack takes 100 000 frames), so this is some other unbounded native
-recursion: the parser and the expression evaluator both recurse outside the
-guard, which only counts Ruby method calls.
+`Float::INFINITY` as a range bound becomes the largest integer, because a
+Range here holds two integers. `(1..Float::INFINITY).end` therefore answers
+that number where ruby answers `Infinity`, and arithmetic on it overflows
+into a Bignum — which, as a bound, is clamped back rather than refused.
+Membership, `begin`, `min`/`max` and iteration bounds all behave; only the
+reported endpoint differs. Fixing it properly means a Range of two values
+rather than two integers.
 
-The gem harness runs one gem per process now, so this costs the measurement
-one gem instead of every gem after it.
+## rubocop stops at a lexer gap
+
+`require "rubocop"` now gets through rubocop-ast's pattern compiler (that is
+where it used to crash the interpreter outright: `min`/`max` on an endless
+arity range materialised it element by element, which the recursion guard
+never sees because it counts Ruby calls, not interpreter recursion). What
+stops it now is a catchable `unexpected character: \` from the lexer.
