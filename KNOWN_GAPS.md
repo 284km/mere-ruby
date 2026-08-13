@@ -165,16 +165,16 @@ reads it back), but the same bytes sent through `print`/`$stdout.write` stop
 at the first zero byte. The Mere-level fix exists upstream (`print_bytes`,
 v0.1.216+); mere-ruby's own output path has not moved to it yet.
 
-## rubocop's own load recurses without bound
+## `printf` rounds halves away from zero, C rounds them to even
 
-rubocop-ast loads (it needs more than 10 000 nested Ruby calls, which is why
-the interpreter's stack guard moved to 15 000), but `require "rubocop"` then
-recurses until the process dies: with the guard removed entirely it is
-OOM-killed rather than finishing, so the depth is unbounded, not merely deep.
-Something in that load is a cycle — the guard turning it into a catchable
-`SystemStackError` is what keeps the gem batch reporting instead of being
-killed. Finding the cycle needs a call-path trace, which the interpreter does
-not keep yet.
+```ruby
+format("%.3e", 1234.5)   # ruby: "1.234e+03"   mere-ruby: "1.235e+03"
+format("%.2f", 0.125)    # ruby: "0.12"        mere-ruby: "0.13"
+```
+
+Ruby hands the number to C's `printf`, which rounds a tie to the even digit;
+this implementation formats the digits itself and rounds a tie away from zero.
+Only exact ties differ, and only the printed form — no arithmetic is affected.
 
 ## `$~` is global, not frame-local
 
@@ -195,12 +195,33 @@ Membership, `begin`, `min`/`max` and iteration bounds all behave; only the
 reported endpoint differs. Fixing it properly means a Range of two values
 rather than two integers.
 
-## rubocop stops at `signature`
+## `Object#methods` lists only the methods defined in Ruby
 
-`require "rubocop"` gets through rubocop-ast entirely now — the pattern
-compiler, the generated matchers, all of it. What stops it is an undefined
-`signature` method further in. Everything before it was a real gap in
-mere-ruby (a crash from materialising an endless range, a heredoc that did
-not process its escapes, `with_index` losing the source method's meaning, a
-regex literal after `elsif`, `Regexp#options`), so the remaining one is
-worth the same treatment.
+`1.methods`, `nil.methods`, `[].methods` answer with the methods *defined in
+Ruby* on the receiver's class chain — the builtins are branches in a
+dispatcher, not entries in a table, so they cannot be enumerated. The call
+answers rather than raising, which is what code like rubocop's
+`nil.methods - Object.new.methods` needs; the answer is a subset rather than
+a wrong shape. A plain object's `methods` is complete, since all of its
+methods are Ruby-defined.
+
+## `puts` and `raise` cannot be local variable names
+
+Every other command word can (`require = ...`, `include = ...`,
+`attr_accessor = ...`), but these two are treated as reserved words by the
+lexer and the expression parser, so `puts = 1` is a parse error where Ruby
+assigns. No installed gem does it — the tree was searched before the two were
+left out. Fixing it means letting them read as ordinary identifiers in
+expression position, which is where their statement syntax is decided.
+
+## rubocop stops at `socket.so`
+
+`require "rubocop"` now gets through rubocop-ast (pattern compiler, generated
+matchers, visitor registry) and most of rubocop itself; it ends at a C
+extension, which is the documented boundary. Everything before it was a real
+gap and is fixed: an alias that did not fire `method_added` (which left the
+visitor registry short and made the pattern compiler recurse forever — that
+is what the old "recurses without bound" entry here was), `%<name>s` /
+`%{name}` format references, `:!~`, a space-marked `[` after a complete
+expression, `define_method :"on_#{type}" do` losing its block, and
+`protected :a, :b` not clearing an earlier `private`.
