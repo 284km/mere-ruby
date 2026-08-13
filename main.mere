@@ -659,16 +659,28 @@ let enc_pseudo_var = fn (id: str) ->
 // __ruby_exe can capture a snippet's output (an in-process approximation of
 // mspec's subprocess ruby_exe).
 let io_cap = map_new ();
+// A ruby String may hold a zero byte, and `print` / `print_no_nl` write with
+// the C string functions, which stop there: `print Zlib.gzip(x)` came out as
+// the two bytes before the first NUL. `print_bytes` writes a length, so the
+// I/O boundary is crossed as bytes. It is only used when the string actually
+// holds a NUL, so the ordinary path is untouched.
+let rec str_has_nul_go = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then false
+  else if ord (char_at s i) == 0 then true
+  else str_has_nul_go s (i + 1);
+let str_has_nul = fn (s: str) -> str_has_nul_go s 0;
+let out_write_raw = fn (s: str) ->
+  if str_has_nul s then print_bytes (bytes_of_str s) else print_no_nl s;
 let out_print = fn (s: str) ->
   if map_has io_cap "on" then
     (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
      map_set io_cap "buf" (mkstr (cur ++ s ++ "\n")))
-  else print s;
+  else out_write_raw (s ++ "\n");
 let out_print_no_nl = fn (s: str) ->
   if map_has io_cap "on" then
     (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
      map_set io_cap "buf" (mkstr (cur ++ s)))
-  else print_no_nl s;
+  else out_write_raw s;
 // ENV writes overlay the real environment (there is no setenv extern);
 // VNil marks a deleted key. cli_argv holds the script's ARGV.
 let env_ovr = map_new ();
@@ -706,6 +718,11 @@ let globals = map_new ();
 // constants (Capitalized names) live in another; a class name that is not
 // an assigned constant reads as VClass.
 let consts = map_new ();
+// `private_constant :NAME` — the fully qualified names that may not be read
+// through the scope operator. The constant itself stays in `consts`: it is
+// still readable by the lexical name from inside its own module, and
+// const_get still answers, exactly as in ruby.
+let private_consts = map_new ();
 // modules mixed into a class via `include`: class name -> "M1|M2|..." of the
 // included module names (searched after the class's own methods + ancestors).
 let includes = map_new ();
@@ -4138,8 +4155,13 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis ("private_class_method", names), r2)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
-    else if str_eq id "public_class_method" ||
-            str_eq id "private_constant" then
+    else if str_eq id "private_constant" then
+      (match r with
+       | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis ("private_constant", names), r2)
+       | Cons (TNL, _) -> (SExpr ENil, r)
+       | Cons (TEOF, _) -> (SExpr ENil, r)
+       | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
+    else if str_eq id "public_class_method" then
       // visibility / require: accepted as no-ops.
       // (`using` is NOT here — it parses as a real call so refinements activate.)
       (match r with
@@ -7080,7 +7102,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
     else if str_contains name "::" then
-      (if map_has consts name then map_get consts name
+      // the scope operator is exactly what `private_constant` closes off; the
+      // lexical name (the `else` branch below) still reads it.
+      (if map_has private_consts name then
+         raise_exc world "NameError" ("private constant " ++ name ++ " referenced")
+       else if map_has consts name then map_get consts name
        else
          // walk the segments left to right: the head can itself be lexically
          // scoped (inside `module B`, `E::K` means `B::E::K`), and any segment
@@ -7888,6 +7914,23 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let _ = map_set e2 "__opv" (apply_bin_vals world blk op cur v) in
       eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil))))
   | EMethod (recv_e, name, arges) ->
+    // `Kernel.puts` / `::Kernel.format`: the Kernel module functions are
+    // reachable as private instance methods (`puts`) but had no module-method
+    // form, which is what code that inherits from BasicObject reaches for.
+    // The receiver is matched syntactically -- a `Kernel` constant, qualified
+    // or not -- so the implicit-self implementation can be reused whole.
+    if (match recv_e with
+        | EConst c -> (str_eq c "Kernel" || str_eq c "::Kernel")
+        | _ -> false)
+       && is_kernel_modfunc name
+       && (let (mk, _, _, _) = world in if map_has mk ("(sng:Kernel)#" ++ name) then false else true) then
+      // `puts` is a STATEMENT in this parser, so ECall would not find it; the
+      // rest of the module functions are ordinary implicit-self calls.
+      (if str_eq name "puts" then
+         (let vs = eval_args env world blk arges in
+          let _ = (match vs with Nil -> puts_one world (mkstr "") | _ -> puts_each world vs) in VNil)
+       else eval_e env world blk (ECall (name, arges)))
+    else
     // a trailing &proc / &var argument becomes the call's block.
     (match rev_app arges Nil with
      | Cons (EBlockPass be, rrest) ->
@@ -11041,6 +11084,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let _ = map_iter consts (fn (k: str) -> fn (v: Val) ->
          if str_len k > plen && str_eq (substring k 0 plen) pfx
             && (if str_contains (substring k plen (str_len k)) "::" then false else true)
+            && (if map_has private_consts k then false else true)
          then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -14857,16 +14901,52 @@ and pow10i = fn (p: int) -> if p <= 0 then 1 else 10 * pow10i (p - 1)
 and pad_frac = fn (s: str) -> fn (prec: int) ->
   if str_len s >= prec then s else str_repeat "0" (prec - str_len s) ++ s
 
+// C's printf rounds a TIE to the even digit (round-half-to-even), and ruby
+// hands the number to C. This formatter builds the digits itself, so it has to
+// make the same choice: `%.2f` of 0.125 is "0.12", not "0.13".
+// Every caller has already taken the absolute value, so int_of_float floors.
+and round_half_even = fn (x: float) ->
+  let n = int_of_float x in
+  let frac = x - float_of_int n in
+  if frac > 0.5 then n + 1
+  else if frac < 0.5 then n
+  else if n - (n / 2) * 2 == 0 then n else n + 1
+
+// The exact integer a large float stands for. Every double >= 2**53 is an
+// integer, and halving one is exact, so it is (a countable mantissa) * 2**k.
+// `%f` used to scale such a value into an int and print the overflow --
+// `format("%.2f", 6.02e23)` came out as digits nobody wrote.
+and float_big_int_str = fn (f: float) -> float_big_go f 0
+and float_big_go = fn (f: float) -> fn (k: int) ->
+  if f >= 9007199254740992.0 then float_big_go (f / 2.0) (k + 1)
+  else big_mul_s (int_to_base (int_of_float f) 10) (big_pow "2" k "1")
+
 and fmt_float_abs = fn (av: Val) -> fn (prec: int) ->
   let f0 = to_f av in
   let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
+  // 10**19 does not fit in an int, so a precision past that is padded rather
+  // than computed (ruby prints the exact binary expansion there).
+  let prec = (if prec > 18 then 18 else prec) in
+  let pad0 = str_repeat "0" (if prec > 18 then prec - 18 else 0) in
   let scalei = pow10i prec in
-  let si = int_of_float (f * float_of_int scalei + 0.5) in
-  if prec == 0 then int_to_base si 10
+  if f >= 9007199254740992.0 then
+    (if prec <= 0 then float_big_int_str f
+     else float_big_int_str f ++ "." ++ str_repeat "0" prec)
+  // the whole value scaled at once keeps a tie a tie (see fmt_sci_abs); only
+  // when that product leaves the int range is the split needed.
+  else if f * float_of_int scalei < 4600000000000000000.0 then
+    let si = round_half_even (f * float_of_int scalei) in
+    (if prec == 0 then int_to_base si 10
+     else
+       let ip = si / scalei in
+       let fp = si - ip * scalei in
+       int_to_base ip 10 ++ "." ++ pad_frac (int_to_base fp 10) prec)
   else
-    let ip = si / scalei in
-    let fp = si - ip * scalei in
-    int_to_base ip 10 ++ "." ++ pad_frac (int_to_base fp 10) prec
+    let ip0 = int_of_float f in
+    let fr0 = round_half_even ((f - float_of_int ip0) * float_of_int scalei) in
+    let (ip, fp) = (if fr0 >= scalei then (ip0 + 1, fr0 - scalei) else (ip0, fr0)) in
+    (if prec == 0 then int_to_base ip 10
+     else int_to_base ip 10 ++ "." ++ pad_frac (int_to_base fp 10) prec)
 
 and sci_norm_up = fn (f: float) -> fn (e: int) -> if f >= 10.0 then sci_norm_up (f / 10.0) (e + 1) else (f, e)
 and sci_norm_down = fn (f: float) -> fn (e: int) -> if f < 1.0 then sci_norm_down (f * 10.0) (e - 1) else (f, e)
@@ -14877,7 +14957,16 @@ and fmt_sci_abs = fn (av: Val) -> fn (prec: int) -> fn (upper: bool) ->
   let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
   let (m0, e0) = (if f == 0.0 then (0.0, 0) else (let (m1, e1) = sci_norm_up f 0 in sci_norm_down m1 e1)) in
   let scalei = pow10i prec in
-  let mr0 = int_of_float (m0 * float_of_int scalei + 0.5) in
+  // Scale the ORIGINAL value once, rather than the mantissa the normalisation
+  // loop divided down: `12.345 / 10 * 1000` is 1234.5000000000002, which is no
+  // longer the tie that ruby rounds to even (it prints 1.234e+01). One
+  // multiply by an exact power of ten keeps the tie a tie. Very large or very
+  // small exponents fall back, since 10**19 does not fit in an int.
+  let k = prec - e0 in
+  let scaled =
+    (if k >= 0 then (if k <= 18 then f * float_of_int (pow10i k) else m0 * float_of_int scalei)
+     else (if 0 - k <= 18 then f / float_of_int (pow10i (0 - k)) else m0 * float_of_int scalei)) in
+  let mr0 = round_half_even scaled in
   let (mr, e) = (if mr0 >= 10 * scalei then (mr0 / 10, e0 + 1) else (mr0, e0)) in
   let ip = mr / scalei in
   let fp = mr - ip * scalei in
@@ -14901,24 +14990,34 @@ and g_e_index = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then (0 - 1)
   else if str_eq (char_at s i) "e" || str_eq (char_at s i) "E" then i else g_e_index s (i + 1)
 // decimal exponent of av (from a precision-0 scientific rendering).
-and g_exp_of = fn (av: Val) ->
-  let s = fmt_sci_abs av 0 false in
+// %g chooses its style from the exponent of the value ROUNDED to p
+// significant digits (C's rule), so the rounding has to use p-1 decimals: at 0
+// decimals 98765.4321 became 1e+05 and the choice was made for the wrong
+// decade (it printed 98765, dropping a digit ruby keeps).
+and g_exp_of = fn (av: Val) -> fn (p: int) ->
+  let s = fmt_sci_abs av (if p > 0 then p - 1 else 0) false in
   let ei = g_e_index s 0 in
   if ei < 0 then 0
   else let rest = substring s (ei + 1) (str_len s) in
        int_of_str (if str_len rest > 0 && str_eq (char_at rest 0) "+" then substring rest 1 (str_len rest) else rest)
 // %g: %f when the exponent is in [-4, precision), else %e, with trailing
 // zeros stripped (the no-'#'-flag behaviour).
-and fmt_g_abs = fn (av: Val) -> fn (prec: int) -> fn (upper: bool) ->
+// `alt` is the `#` flag: keep the trailing zeros and the decimal point that
+// %g otherwise strips (`format("%#g", 1.0)` is "1.00000").
+and fmt_g_abs = fn (av: Val) -> fn (prec: int) -> fn (upper: bool) -> fn (alt: bool) ->
   let p0 = (if prec < 0 then 6 else prec) in
   let p = (if p0 == 0 then 1 else p0) in
-  let x = g_exp_of av in
+  let x = g_exp_of av p in
   if x >= (0 - 4) && x < p then
-    g_rstrip_zeros (fmt_float_abs av (let q = p - 1 - x in if q < 0 then 0 else q))
+    (let q = (let q0 = p - 1 - x in if q0 < 0 then 0 else q0) in
+     let body = fmt_float_abs av q in
+     if alt then (if q == 0 then body ++ "." else body) else g_rstrip_zeros body)
   else
     let se = fmt_sci_abs av (p - 1) upper in
     let ei = g_e_index se 0 in
-    (if ei < 0 then g_rstrip_zeros se else g_rstrip_zeros (substring se 0 ei) ++ substring se ei (str_len se))
+    (if alt then se
+     else if ei < 0 then g_rstrip_zeros se
+     else g_rstrip_zeros (substring se 0 ei) ++ substring se ei (str_len se))
 
 and rb_fmt_one = fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (typ: str) -> fn (av: Val) ->
   if str_eq typ "d" || str_eq typ "i" || str_eq typ "u" then
@@ -14942,7 +15041,7 @@ and rb_fmt_one = fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (typ
   else if str_eq typ "g" || str_eq typ "G" then
     let neg = (to_f av < 0.0) in
     let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
-    rb_pad_num sign (fmt_g_abs av prec (str_eq typ "G")) flags width
+    rb_pad_num sign (fmt_g_abs av prec (str_eq typ "G") (str_contains flags "#")) flags width
   else if str_eq typ "x" then rb_pad_num "" (int_to_base (fmt_to_int av) 16) flags width
   else if str_eq typ "X" then rb_pad_num "" (ascii_up (int_to_base (fmt_to_int av) 16)) flags width
   else if str_eq typ "o" then rb_pad_num "" (int_to_base (fmt_to_int av) 8) flags width
@@ -15466,13 +15565,37 @@ and obj_is_a = fn world -> fn (cls: str) -> fn (target: str) ->
   || pp_mem (ancestors_of world cls) target
 
 // walk the ancestor chain: does `cls` (or a superclass) define `name`?
+// The Kernel module functions this interpreter implements as implicit-self
+// CALLS, so `Kernel.format` can be answered by evaluating `format`. The ones
+// the parser turns into statements are NOT here: `raise` and `require` have
+// their own receiver-dispatch path already, and routing them through a call
+// would undo it. `puts` is a statement too and is special-cased at the call
+// site, since it had no module-method form at all.
+and is_kernel_modfunc = fn (name: str) ->
+  str_eq name "puts" || str_eq name "p" || str_eq name "pp" || str_eq name "print" ||
+  str_eq name "printf" || str_eq name "format" || str_eq name "sprintf" ||
+  str_eq name "warn" || str_eq name "rand" || str_eq name "srand" ||
+  str_eq name "sleep" || str_eq name "gets" || str_eq name "binding" ||
+  str_eq name "caller" || str_eq name "caller_locations" ||
+  str_eq name "Integer" || str_eq name "Float" || str_eq name "String" ||
+  str_eq name "Array" || str_eq name "Hash" || str_eq name "Rational" ||
+  str_eq name "Complex"
+
 and is_kernel_builtin = fn (name: str) ->
   str_eq name "puts" || str_eq name "p" || str_eq name "pp" || str_eq name "print" ||
   str_eq name "printf" ||
   str_eq name "format" || str_eq name "sprintf" ||
   str_eq name "raise" || str_eq name "loop" || str_eq name "catch" || str_eq name "throw" ||
   str_eq name "proc" || str_eq name "lambda" || str_eq name "eval" || str_eq name "require" ||
-  str_eq name "require_relative" || str_eq name "block_given?"
+  str_eq name "require_relative" || str_eq name "block_given?" ||
+  // the conversion functions and the rest of the module's public surface, so
+  // `Kernel.format` reaches the same implementation `format` does.
+  str_eq name "Integer" || str_eq name "Float" || str_eq name "String" ||
+  str_eq name "Array" || str_eq name "Hash" || str_eq name "Rational" ||
+  str_eq name "Complex" || str_eq name "warn" || str_eq name "rand" ||
+  str_eq name "srand" || str_eq name "sleep" || str_eq name "gets" ||
+  str_eq name "exit" || str_eq name "at_exit" || str_eq name "binding" ||
+  str_eq name "caller" || str_eq name "caller_locations" || str_eq name "__method__"
 
 // is `name` callable here — a top-level method, or a method on self's class?
 and is_method_defined = fn env -> fn world -> fn (name: str) ->
@@ -20198,6 +20321,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                   | Nil -> ()
                   | _ -> if str_eq m "module_function" then modfunc_promote world cls names
                          else if str_eq m "private_class_method" then mark_vis_mode meths ("(sng:" ++ cls ++ ")") names "private"
+                         else if str_eq m "private_constant" then mark_private_consts cls names
                          else mark_vis_mode meths cls names m) in
          FNext VNil
        | SDef (mname0, params, defs, mbody) ->
@@ -20437,6 +20561,13 @@ and vis_arg_names = fn (args: Val list) ->
   | Cons (VSym s, t) -> Cons (s, vis_arg_names t)
   | Cons (VStr h, t) -> Cons (sget h, vis_arg_names t)
   | Cons (_, t) -> vis_arg_names t
+
+and mark_private_consts = fn (cls: str) -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let _ = map_set private_consts (cls ++ "::" ++ n) VNil in
+    mark_private_consts cls rest
 
 and mark_vis_mode = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (mode: str) ->
   match names with

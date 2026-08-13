@@ -77,12 +77,6 @@ Not implemented. zeitwerk uses it to notice when an explicit namespace
 constant is defined, so `dry-logic` (and anything else that loads
 zeitwerk's full autoloader) stops there.
 
-## `Kernel.puts` and the other Kernel module functions
-
-`Kernel.puts "x"` raises NoMethodError; the private Kernel methods are
-reachable as `puts` but not as `Kernel.puts`. Long-standing, unrelated
-to the dispatch order — it fails the same way at any commit tried.
-
 ## Corpus programs must be self-contained
 
 Two were not, and both hid a real problem rather than causing one:
@@ -99,15 +93,6 @@ Two were not, and both hid a real problem rather than causing one:
 A corpus program may write into `/tmp`, but it must create everything it
 reads and delete it afterwards.
 
-## `private_constant` and `private_class_method` are parsed and ignored
-
-`private_constant :A` accepts its arguments (including across a newline) but
-records nothing, so `Consts.constants` still lists `A` and `Consts::A` still
-reads. Nothing in the gem sample depends on the constant actually being
-hidden — it depends on the call not being a parse error, which it no longer
-is. Making it real means a per-constant flag consulted by `constants`, by
-qualified reads, and by `const_get`.
-
 ## `caller_locations` answers with one frame, even at the top level
 
 mere-ruby keeps no call stack. `caller` is `[]`, and `caller_locations`
@@ -116,12 +101,6 @@ with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
 `module_eval`. For a method called from a library's body that frame IS the
 caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
-
-## `Kernel.format` and friends on a BasicObject-derived class
-
-`::Kernel.format(...)` raises NoMethodError, the same gap as `Kernel.puts`
-above. It shows up in code that deliberately inherits from BasicObject and
-reaches for Kernel by name.
 
 ## The primitive dispatcher's internal `no <name>` failures
 
@@ -157,24 +136,6 @@ locals are gone. `class_eval` with a block, and the class body itself, do
 keep that scope — only the method built from a block loses it. Fixing it
 means storing the defining environment alongside the body, the way a Proc
 already does.
-
-## `print` truncates a binary string at its first NUL
-
-`Zlib.gzip(x)` written with `File#write` is byte-exact (the system `zlib`
-reads it back), but the same bytes sent through `print`/`$stdout.write` stop
-at the first zero byte. The Mere-level fix exists upstream (`print_bytes`,
-v0.1.216+); mere-ruby's own output path has not moved to it yet.
-
-## `printf` rounds halves away from zero, C rounds them to even
-
-```ruby
-format("%.3e", 1234.5)   # ruby: "1.234e+03"   mere-ruby: "1.235e+03"
-format("%.2f", 0.125)    # ruby: "0.12"        mere-ruby: "0.13"
-```
-
-Ruby hands the number to C's `printf`, which rounds a tie to the even digit;
-this implementation formats the digits itself and rounds a tie away from zero.
-Only exact ties differ, and only the printed form — no arithmetic is affected.
 
 ## `$~` is global, not frame-local
 
