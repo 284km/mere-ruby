@@ -25,7 +25,10 @@ for rb in "$dir"/*/p*.rb; do
   exp=$(cat "${rb%.rb}.exp")
   flags=""
   [ -f "${rb%.rb}.flags" ] && flags=$(cat "${rb%.rb}.flags")
-  got=$(perl -e 'alarm 15; exec @ARGV' "$here/../mere-ruby" $flags --eval-print "$rb" 2>/dev/null)
+  # 60s, not 15: the largest generated test (a 241k-line if/else chain) runs
+  # in ~16s here, so a 15s alarm made the tally flip between pass and err run
+  # to run. A gate has to measure the interpreter, not the cutoff.
+  got=$(perl -e 'alarm 60; exec @ARGV' "$here/../mere-ruby" $flags --eval-print "$rb" 2>/dev/null)
   code=$?
   total=$((total + 1))
   if [ "$got" = "$exp" ] && [ "$code" -eq 0 ]; then pass=$((pass + 1))

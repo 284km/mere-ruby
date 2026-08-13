@@ -175,3 +175,22 @@ Something in that load is a cycle — the guard turning it into a catchable
 `SystemStackError` is what keeps the gem batch reporting instead of being
 killed. Finding the cycle needs a call-path trace, which the interpreter does
 not keep yet.
+
+## `$~` is global, not frame-local
+
+Ruby scopes `$~` (and with it `$1`, `Regexp.last_match`) to the method frame
+that performed the match, so a match inside a method is invisible to its
+caller. Here it is one global, so a match performed anywhere is still
+readable afterwards. Nothing in the gem sample depends on the difference;
+it shows up as `Regexp.last_match` answering a stale MatchData where ruby
+answers nil.
+
+## rubocop stops at a private method call
+
+With `method_added`, `Regexp.last_match`, `__method__` and a non-shadowed
+`binding`, rubocop-ast's pattern compiler runs, and `require "rubocop"` now
+reaches `enforce_same_captures` — a private method called from a public one
+in the same class, which mere-ruby refuses. The obvious shapes of that call
+(same class, subclass, with a block-pass, through `to_enum(__method__)`) all
+work in isolation, so the difference is in how that particular call is
+dispatched; it needs its own reduction.

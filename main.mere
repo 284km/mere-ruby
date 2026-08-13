@@ -396,6 +396,16 @@ let anon_name = map_new ();
 // `yield` inside the defined method reaches that block. Keyed "Cls#name" ->
 // VProc of the captured block (installed by invoke when the call site passes
 // no block of its own).
+// The name of the method running at each call depth. One map_set per call,
+// on the same path that already counts depth, so it costs a store and no
+// bookkeeping -- and it is the only thing resembling a backtrace mere-ruby
+// has. MERE_RUBY_STACKTRACE=1 dumps the innermost frames when the recursion
+// guard trips, which is how an unbounded recursion names itself.
+let call_names = map_new ();
+// set the first time any class defines `method_added`, so the per-def hook
+// check is a single map lookup in the overwhelmingly common case (nobody
+// defines one) rather than an ancestor walk.
+let hook_flags = map_new ();
 // Marshal's symbol table: symbols are written once and back-referenced by
 // index afterwards, so a load has to remember them in order.
 let mrsh_syms = map_new ();
@@ -7384,6 +7394,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                 then (match map_get load_ctx "file" with VStr h -> let h = sget h in (if str_eq h "" then script_file () else h) | _ -> script_file ())
                 else script_file ()) in
        let v = mkstr f in (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
+    // Kernel#__method__: the name of the method being run, as a Symbol (nil at
+    // the top level). The frame already carries it for `super`.
+    else if str_eq name "__method__" then
+      (if lv_has env "__meth"
+       then (match lv_get env "__meth" with VStr h -> VSym (sget h) | _ -> VNil)
+       else VNil)
     // Kernel#__dir__: the directory of the current file, absolute (like Ruby's
     // File.dirname(File.realpath(__FILE__))). A relative script dir is joined
     // with PWD.
@@ -7429,8 +7445,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if map_has meths name then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if str_eq name "local_variables" then local_vars_of env
-    // Kernel#binding: capture the current locals env (which holds "self").
-    else if str_eq name "binding" then
+    // Kernel#binding: capture the current locals env (which holds "self") --
+    // unless the receiver has its own `binding` (rubocop-ast's compiler holds
+    // its variable bindings in an `attr_reader :binding`, and a builtin must
+    // not shadow a real method).
+    else if str_eq name "binding" && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = map_len bind_store in
       let _ = map_set bind_store (str_of_int id) (lv_flat env) in
       VBind id
@@ -7534,7 +7553,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        VNil)
     // Kernel#binding: capture the current locals env (which holds "self")
     // as a first-class Binding, unless the user redefined `binding`.
-    else if str_eq name "binding" && (if map_has meths "binding" then false else true) then
+    else if str_eq name "binding" && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = map_len bind_store in
       let _ = map_set bind_store (str_of_int id) (lv_flat env) in
       VBind id
@@ -10582,6 +10601,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
        | Cons (VRegex (b2, f2), _) -> VRegex (b2, f2)
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: Regexp.new expects a string")) in fail "mere-ruby: Regexp.new expects a string"))
+    // Regexp.last_match / .last_match(n): the same MatchData `$~` holds, which
+    // is how a `method =~ /re/` test reads its capture afterwards.
+    else if str_eq c "Regexp" && str_eq name "last_match" then
+      (let md = (if map_has globals "~" then map_get globals "~" else VNil) in
+       match args with
+       | Cons (ix, _) -> (match md with VNil -> VNil | _ -> invoke_val_c env world blk md "[]" (Cons (ix, Nil)) false)
+       | Nil -> md)
     else if str_eq c "Regexp" && (str_eq name "escape" || str_eq name "quote") then
       (match args with Cons (VStr s, _) -> mkstr (rx_escape (sget s)) | Cons (VSym s, _) -> mkstr (rx_escape s) | Cons (v, _) -> mkstr (rx_escape (to_s v)) | _ -> mkstr "")
     else if str_eq c "Regexp" && str_eq name "union" then
@@ -15139,6 +15165,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
    | Meth (params, defaults, body) ->
      let frame = map_new () in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
+     let _ = map_set frame "__meth" (mkstr name) in
      // top-level methods run with main as self (their @ivars live there).
      let _ = map_set frame "self" (if lv_has env "self" then lv_get env "self" else VMain) in
      let _ = map_set frame "__cref" (mkstr (if map_has meth_cref name then map_get meth_cref name else "")) in
@@ -15432,6 +15459,14 @@ and dispatch_cls_of = fn world -> fn (recv: Val) ->
          then map_get hng_store hk else class_name recv
 // `extend`: append each module's name to the receiver singleton's includes,
 // so its instance methods become singleton methods (found via the sng chain).
+// fire `method_added(:name)` on the class that just gained an instance method.
+and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  if (if map_has hook_flags "ma" then false else true) then ()
+  else if has_meth world ("(sng:" ++ cls ++ ")") "method_added"
+  then (let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") "method_added" (Cons (VSym nm, Nil)) in ())
+  else ()
+
 // fire a module's `self.included(base)` hook, if defined, after `base`
 // includes it (the ActiveSupport::Concern entry point).
 and run_included_hook = fn world -> fn (mq: str) -> fn (base: str) ->
@@ -15663,6 +15698,14 @@ and struct_build = fn world -> fn (args: Val list) ->
                    Cons (SReturn (EBin ("==", EMethod (ESelf, "to_a", Nil), EMethod (EVar "o", "to_a", Nil))), Nil))) in
   VClass anon
 
+// the innermost `n` recorded call names, outermost of that window first.
+and stack_dump = fn (cd: int) -> fn (n: int) -> fn (acc: str) ->
+  if n <= 0 || cd <= 0 then acc
+  else
+    (let k = str_of_int (cd - 1) in
+     let nm = (if map_has call_names k then (match map_get call_names k with VStr h -> sget h | _ -> "?") else "?") in
+     stack_dump (cd - 1) (n - 1) (acc ++ "  " ++ str_of_int (cd - 1) ++ " " ++ nm ++ "\n"))
+
 // run a method body, converting a `return` flow signal into the method's
 // return value (any other signal or a real exception keeps unwinding).
 and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
@@ -15683,9 +15726,19 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // process has to survive that. The old 1500 predates the -stack_size flag
   // entirely and stopped rubocop-ast mid-load: it needs more than 10000,
   // because each Ruby call costs several interpreter frames.
-  if cd >= 15000 then (let _ = raise_exc world "SystemStackError" "stack level too deep (SystemStackError)" in FRaise VNil)
+  if cd >= 15000 then
+    (let _ = (if str_eq (env_get "MERE_RUBY_STACKTRACE") "" then ()
+              else print_err ("[stack] innermost frames:\n" ++ stack_dump cd 40 "")) in
+     let _ = raise_exc world "SystemStackError" "stack level too deep (SystemStackError)" in FRaise VNil)
   else
   let _ = map_set struct_ctr "cd" (VInt (cd + 1)) in
+  let _ = map_set call_names (str_of_int cd)
+            (mkstr ((match (if map_has frame "__defcls" then map_get frame "__defcls" else VNil) with
+                     | VClass c -> c ++ "#"
+                     | _ -> "")
+                    ++ (if map_has frame "__meth"
+                        then (match map_get frame "__meth" with VStr h -> sget h | _ -> "?")
+                        else "?"))) in
   // mark this frame live so a break targeting it (via a block's home) can find
   // it; once the body has unwound to here (any outcome) the frame is done.
   let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> str_of_int t | _ -> "") else "") in
@@ -19890,7 +19943,14 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                    else if is_selfdef then "(sng:" ++ cls ++ ")#" ++ mname
                    else cls ++ "#" ++ mname in
          let _ = map_set meths key (Meth (params, defs, mbody)) in
+         let _ = (if str_eq (meth_base mname) "method_added" then map_set hook_flags "ma" VNil else ()) in
          let _ = map_set meth_cref key (cur_lex ()) in
+         // Module#method_added fires after the method exists. rubocop-ast
+         // builds its visitor registry in one (`@registry[$1] = method if
+         // method =~ /^visit_(.*)/`), and without the hook every lookup misses
+         // and its compiler recurses forever on the fallback visitor.
+         let _ = (if is_selfdef || str_contains mname "#" then ()
+                  else run_method_added world cls (meth_base mname)) in
          // `module_function` mode: the instance method is ALSO a module method,
          // so register it in the module's singleton namespace too.
          let _ = if str_eq vis2 "module_function" && (if is_selfdef then false else true) && (if str_contains mname "#" then false else true)
@@ -20025,7 +20085,11 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        | SExpr (ECallB (fname, fargs, bp, bb)) ->
          if str_eq fname "define_method" then
            let _ = (match fargs with
-                    | Cons (ESym nm, _) -> let _ = map_set meths (cls ++ "#" ++ nm) (Meth (bp, Nil, bb)) in map_set dm_methods (cls ++ "#" ++ nm) VNil
+                    | Cons (ESym nm, _) ->
+                      (let _ = map_set meths (cls ++ "#" ++ nm) (Meth (bp, Nil, bb)) in
+                       let _ = map_set dm_methods (cls ++ "#" ++ nm) VNil in
+                       // define_method adds a method, so the hook fires for it too
+                       run_method_added world cls nm)
                     | _ -> ()) in
            FNext VNil
          else exec_stmt cenv world noblk s

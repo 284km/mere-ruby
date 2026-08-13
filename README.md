@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 97 programs, byte-for-byte
+./run_corpus.sh                                  # 98 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -45,6 +45,12 @@ Every change is checked against the reference `ruby` before it lands:
 Each harness derives what it needs from the arguments; nothing is left in
 `/tmp` between runs. Two of them used to be, and a cleared `/tmp` quietly
 took the measurement with it.
+
+`MERE_RUBY_STACKTRACE=1` makes the recursion guard dump the innermost call
+names before it raises. mere-ruby keeps no backtrace, so this is the only
+view into a runaway recursion — it is what named rubocop's as an eight-frame
+cycle through a fallback visitor, and from there the cause (a `method_added`
+hook that never fired) was one test away.
 
 ## Vendored packages
 
