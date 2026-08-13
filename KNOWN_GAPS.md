@@ -195,10 +195,12 @@ Membership, `begin`, `min`/`max` and iteration bounds all behave; only the
 reported endpoint differs. Fixing it properly means a Range of two values
 rather than two integers.
 
-## rubocop stops at a lexer gap
+## rubocop stops at `signature`
 
-`require "rubocop"` now gets through rubocop-ast's pattern compiler (that is
-where it used to crash the interpreter outright: `min`/`max` on an endless
-arity range materialised it element by element, which the recursion guard
-never sees because it counts Ruby calls, not interpreter recursion). What
-stops it now is a catchable `unexpected character: \` from the lexer.
+`require "rubocop"` gets through rubocop-ast entirely now — the pattern
+compiler, the generated matchers, all of it. What stops it is an undefined
+`signature` method further in. Everything before it was a real gap in
+mere-ruby (a crash from materialising an endless range, a heredoc that did
+not process its escapes, `with_index` losing the source method's meaning, a
+regex literal after `elsif`, `Regexp#options`), so the remaining one is
+worth the same treatment.

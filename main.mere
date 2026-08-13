@@ -1532,10 +1532,27 @@ and utf8_of = fn (cp: int) ->
 // heredoc body as token(s): interpolated bodies route through the
 // double-quoted string lexer.
 and heredoc_tok = fn (body0: str) ->
+  // An interpolating heredoc is a double-quoted string: `\\` is one
+  // backslash, `\t` is a tab. Both forms therefore go through the string
+  // lexer -- emitting the body raw when it happened to contain no `#{}` left
+  // its escapes unprocessed, and rubocop's compiler writes `end \\` into
+  // generated code, which came out as two backslashes and would not lex.
   let body = hd_line_cont body0 0 in
-  if rx_has_interp body 0 then
-    tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src body) 0))) (Cons (TP ")", Nil))
-  else Cons (TStrL body, Nil)
+  tapp (Cons (TP "(s", drop_eof (lex_go ("\"" ++ hd_escape_dq body 0 ++ "\"") 0))) (Cons (TP ")", Nil))
+
+// quote a heredoc body so the string lexer sees exactly it: an interpolation
+// is code and is copied whole, an escape pair is copied whole (the lexer
+// processes it), and a bare `"` is escaped so it does not end the literal.
+and hd_escape_dq = fn (lit: str) -> fn (i: int) ->
+  if i >= str_len lit then ""
+  else
+    let c = char_at lit i in
+    if str_eq c "#" && i + 1 < str_len lit && str_eq (char_at lit (i + 1)) "\{" then
+      (let j = interp_close lit (i + 2) 1 in substring lit i j ++ hd_escape_dq lit j)
+    else if str_eq c "\\" && i + 1 < str_len lit then
+      (c ++ char_at lit (i + 1)) ++ hd_escape_dq lit (i + 2)
+    else if str_eq c "\"" then "\\\"" ++ hd_escape_dq lit (i + 1)
+    else c ++ hd_escape_dq lit (i + 1)
 
 // backslash-newline in an interpolating heredoc is a line continuation
 // (dropped); an escaped backslash stays.
@@ -1721,6 +1738,12 @@ and regex_position = fn (s: str) -> fn (i: int) ->
       let w = word_ending_at s p in
       str_eq w "when" || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
       str_eq w "then" || str_eq w "return" || str_eq w "if" || str_eq w "unless" ||
+      // every keyword a CONDITION can follow, not just `if` -- rubocop writes
+      // `elsif /\A[ \t]+\z/.match?(x)`, and a `/` there is a regex, not a
+      // division.
+      str_eq w "elsif" || str_eq w "while" || str_eq w "until" || str_eq w "case" ||
+      str_eq w "yield" || str_eq w "break" || str_eq w "next" || str_eq w "raise" ||
+      str_eq w "puts" || str_eq w "p" ||
       // `in /re/` — a pattern-matching clause takes a regex value pattern.
       str_eq w "in"
     else false
@@ -12451,12 +12474,26 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             && (is_enum_method name || str_eq name "each_with_index" || str_eq name "with_index" || str_eq name "with_object" || str_eq name "each_slice" || str_eq name "each_cons") then
       (match recv with
        | VObj id ->
-         (if str_eq name "with_index" && (match args with Cons (VInt _, _) -> true | _ -> false) then
-            // with_index(offset): iterate [elem, i+offset] pairs with the block.
-            (let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
+         (if str_eq name "with_index" then
+            // `with_index` keeps the SOURCE method's meaning: `map.with_index`
+            // collects the block's values, `select.with_index` keeps elements,
+            // `each.with_index` answers the receiver. So pair the elements with
+            // their index and run that source method over the pairs.
+            (let (_, _, _, iv9) = world in
+             let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
+             let src = (match (if map_has iv9 (str_of_int id ++ "@meth") then map_get iv9 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
              let av = enum_to_arr env world blk id in
              (match av with
-              | VArr aid2 -> invoke_with_block env world blk (arr_new (with_index_pairs_off (deref aid2) off)) "each" Nil newblk
+              | VArr aid2 ->
+                (let pairs = arr_new (with_index_pairs_off (deref aid2) off) in
+                 let r = invoke_with_block env world blk pairs (if str_eq src "each" then "each" else src) Nil newblk in
+                 // a filtering source answers with elements, not with pairs
+                 if str_eq src "select" || str_eq src "filter" || str_eq src "find_all"
+                    || str_eq src "reject" || str_eq src "take_while" || str_eq src "drop_while" then
+                   (match r with VArr rid -> arr_new (pair_firsts (deref rid)) | _ -> r)
+                 else if str_eq src "each" then
+                   (if map_has iv9 (str_of_int id ++ "@recv") then map_get iv9 (str_of_int id ++ "@recv") else r)
+                 else r)
               | _ -> VNil))
           else if str_eq name "with_object" then
             invoke_with_block env world blk (enum_to_arr env world blk id) "each_with_object" args newblk
@@ -13583,6 +13620,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
     (match recv with VStr sp -> let sp = sget sp in VRegex (sp, (match args with Cons (VStr f, _) -> sget f | _ -> "")) | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
+  // Regexp#options: the same bits Regexp::IGNORECASE and friends name.
+  else if str_eq name "options" && (match recv with VRegex _ -> true | _ -> false) then
+    (match recv with
+     | VRegex (_, fl) ->
+       VInt ((if str_contains fl "i" then 1 else 0)
+             + (if str_contains fl "x" then 2 else 0)
+             + (if str_contains fl "m" then 4 else 0))
+     | _ -> VInt 0)
   else if str_eq name "source" then
     (match recv with VRegex (p, _) -> mkstr p | _ -> (let _ = map_set prim_missing "n" (mkstr "source") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'source'")) in fail "mere-ruby: undefined method 'source'")))
   // casecmp is the three-way form of casecmp? (nil when the other side is
@@ -18991,6 +19036,12 @@ and arr_count_truthy = fn (xs: Val list) -> fn (acc: int) ->
   | Nil -> acc
   | Cons (h, t) -> arr_count_truthy t (if truthy h then acc + 1 else acc)
 
+// the first element of each [elem, index] pair
+and pair_firsts = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> Cons ((match h with VArr aid -> (match deref aid with Cons (a, _) -> a | _ -> h) | _ -> h), pair_firsts t)
+
 and with_index_pairs_off = fn (xs: Val list) -> fn (i: int) ->
   match xs with
   | Nil -> Nil
@@ -19889,6 +19940,13 @@ and register_builtin_consts = fn (u: unit) ->
   // distinct names for it rather than distinct sources.
   // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
   // per block on its own, so the level is accepted and ignored.
+  // Regexp's option bits, as Regexp#options reports them and Regexp.new takes
+  // them (rubocop reads NOENCODING off a parsed regexp).
+  let _ = map_set consts "Regexp::IGNORECASE" (VInt 1) in
+  let _ = map_set consts "Regexp::EXTENDED" (VInt 2) in
+  let _ = map_set consts "Regexp::MULTILINE" (VInt 4) in
+  let _ = map_set consts "Regexp::FIXEDENCODING" (VInt 16) in
+  let _ = map_set consts "Regexp::NOENCODING" (VInt 32) in
   let _ = map_set consts "Zlib::NO_COMPRESSION" (VInt 0) in
   let _ = map_set consts "Zlib::BEST_SPEED" (VInt 1) in
   let _ = map_set consts "Zlib::BEST_COMPRESSION" (VInt 9) in
