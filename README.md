@@ -29,7 +29,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 94 programs, byte-for-byte
+./run_corpus.sh                                  # 95 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -87,11 +87,12 @@ third-party C library and is deliberately out of scope.
 
 Against a sample of 29 installed gems, `gemtest/run.sh` loads **18** with
 a CRuby stdlib on `-I` and **16** on what mere-ruby ships. Of the eleven
-that do not: six stop at a C extension (`openssl` ×4, `socket` ×2), one
-is not installed, and four are named gaps — `TracePoint`, a Railtie
-`initializer`, `Regexp::Syntax::V3_2_2`, and a nil receiver in sassc.
-devise now loads the whole activesupport / i18n / concurrent-ruby stack
-before it reaches `openssl`.
+that do not: seven stop at a C extension (`openssl` ×4, `socket` ×2,
+protobuf ×1), one is not installed, and three are named gaps —
+`TracePoint`, a Railtie `initializer`, and `Zlib::GzipReader` +
+`Marshal.load` for a gem's compressed data file. devise now loads the
+whole activesupport / i18n / concurrent-ruby stack before it reaches
+`openssl`.
 
 ## In the browser
 

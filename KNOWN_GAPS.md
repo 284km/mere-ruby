@@ -133,3 +133,12 @@ is of a type they do not handle — `1.length` is not caught by
 one-step diagnoses instead of bisections. Fixing it properly means a
 "not applicable" signal from `prim_method_raw` back to the caller, which has
 the world and can raise the real error.
+
+## `Marshal` is not implemented
+
+`Marshal.load` / `Marshal.dump` raise; only `Marshal::MAJOR_VERSION` and
+`MINOR_VERSION` exist. It is what stops rubocop-rails: unicode-display_width
+ships its index as a gzipped marshal dump and reads it at load time with
+`Zlib::GzipReader.new(file).read` — so that gem needs both the reader and
+the format. mgz (the vendored zlib) can already inflate a gzip member, so
+the reader is the smaller half.

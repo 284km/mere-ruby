@@ -1029,7 +1029,21 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if str_eq c "$" && i + 1 < str_len s then
       // special globals ($~ $1 $! $& ...) lex as identifiers (default nil).
       Cons (TId (substring s i (i + 2)), lex_go s (i + 2))
-    else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
+    // A `:` GLUED to the end of an identifier is a label, not the start of a
+    // symbol: `def f(red:nil)` and `{a:1}` are `red:` / `a:` followed by a
+    // value, which is how ruby reads them. Only a colon that does not follow
+    // a name character can open a symbol.
+    else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1))
+            && (if i > 0 then
+                  (let pc = char_at s (i - 1) in
+                   // `?` and `!` end a method NAME (`empty?:`), but standing
+                   // alone they are operators -- `!:sym` is a negated symbol.
+                   if str_eq pc "?" || str_eq pc "!" then
+                     (if i > 1 then (let pc2 = char_at s (i - 2) in
+                                     if is_alnum pc2 || str_eq pc2 "_" then false else true)
+                      else true)
+                   else if is_alnum pc || str_eq pc "_" then false else true)
+                else true) then
       // :symbol — include a trailing ? ! or = (:even?, :sort!, :m=),
       // guarding != == and the hash rocket =>.
       let j0 = scan_ident s (i + 1) in
@@ -3153,15 +3167,18 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
   match toks with
   | Cons (TId name, Cons (TP colon, r0)) ->
     if str_eq colon ":" then
-      // `m(a:, b:)` — an omitted value reads the same-named variable.
-      (match r0 with
+      // `m(a:, b:)` — an omitted value reads the same-named variable. The
+      // delimiter that says the value was omitted may be on the NEXT line
+      // (sass-embedded writes a multi-line call that way), and a value may
+      // equally start there, so the decision is made after the newlines.
+      (match skip_nls r0 with
        | Cons (TP nx, _) ->
          if str_eq nx "," || str_eq nx ")" then
-           parse_call_sep r0 pos (Cons (EVar name, Cons (ESym name, hp)))
+           parse_call_sep (skip_nls r0) pos (Cons (EVar name, Cons (ESym name, hp)))
          else
-           let (v, r1) = parse_expr r0 in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp)))
+           let (v, r1) = parse_expr (skip_nls r0) in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp)))
        | _ ->
-         let (v, r1) = parse_expr r0 in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp))))
+         let (v, r1) = parse_expr (skip_nls r0) in parse_call_sep r1 pos (Cons (v, Cons (ESym name, hp))))
     else parse_call_pos_arg toks pos hp
   | Cons (TP star, r0) ->
     if str_eq star "*" then
@@ -7825,6 +7842,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | VStr sv -> let sv = sget sv in
             let r = rx_do_match world pat pfl sv in
             let _ = set_named_caps env pat 0 0 in r
+          // a Symbol matches like its name
+          | VSym sv ->
+            let r = rx_do_match world pat pfl sv in
+            let _ = set_named_caps env pat 0 0 in r
           | _ -> VNil)
        | _ -> VNil)
     else
@@ -7911,17 +7932,21 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "!=" then
       (if rb_eq va0 (eval_e env world blk b) then VBool false else VBool true)
     else if str_eq op "===" then VBool (case_eqq world va0 (eval_e env world blk b))
+    // A Symbol matches like its name does (`:V3_2_2 =~ /\AV\d+/` is 0):
+    // regexp_parser selects its version constants that way.
     else if str_eq op "=~" then
       (let vb = eval_e env world blk b in
        match va0 with
        | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> rx_do_match world p pf sv | _ -> VNil)
-       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p pf sv | _ -> VNil)
+       | VSym sv -> (match vb with VRegex (p, pf) -> rx_do_match world p pf sv | _ -> VNil)
+       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p pf sv | VSym sv -> rx_do_match world p pf sv | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = eval_e env world blk b in
        match va0 with
        | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
-       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       | VSym sv -> (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | VSym sv -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | _ -> VBool true)
     // For a class/module these five are the SUBCLASS partial order, not a
     // value comparison, so they have to reach the class dispatcher rather
@@ -9132,8 +9157,8 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "chunk" then arr_new (arr_chunk world encl theblk xs)
     else if str_eq name "slice_when" then arr_new (arr_slice_when world encl theblk xs)
     else if str_eq name "chunk_while" then arr_new (arr_chunk_while world encl theblk xs)
-    else if str_eq name "sort_by" then iter_result (FNext (arr_new (extract_vals (sort_by_key (arr_keyed world encl theblk xs))))) recv
-    else if str_eq name "sort_by!" then (let _ = arr_set id (extract_vals (sort_by_key (arr_keyed world encl theblk xs))) in iter_result (FNext recv) recv)
+    else if str_eq name "sort_by" then iter_result (FNext (arr_new (extract_vals (sort_by_key world (arr_keyed world encl theblk xs))))) recv
+    else if str_eq name "sort_by!" then (let _ = arr_set id (extract_vals (sort_by_key world (arr_keyed world encl theblk xs))) in iter_result (FNext recv) recv)
     else if str_eq name "sum" then (match args with Cons (init, _) -> arr_sum_blk world encl theblk xs init | Nil -> arr_sum_blk world encl theblk xs (VInt 0))
     else if str_eq name "partition" then arr_partition world encl theblk xs Nil Nil
     else if str_eq name "group_by" then arr_group_by world encl theblk xs Nil
@@ -9406,9 +9431,11 @@ and arr_keyed = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
     Cons (arr_new (Cons (k, Cons (h, Nil))), arr_keyed world encl theblk t)
 and pair_key = fn (p: Val) -> match p with VArr id -> (match deref id with Cons (k, _) -> k | _ -> VNil) | _ -> VNil
 and pair_val = fn (p: Val) -> match p with VArr id -> (match deref id with Cons (_, Cons (v, _)) -> v | _ -> VNil) | _ -> VNil
-and insert_by_key = fn (p: Val) -> fn (ps: Val list) ->
-  match ps with Nil -> Cons (p, Nil) | Cons (h, t) -> if cmp_vals (pair_key p) (pair_key h) <= 0 then Cons (p, ps) else Cons (h, insert_by_key p t)
-and sort_by_key = fn (ps: Val list) -> match ps with Nil -> Nil | Cons (h, t) -> insert_by_key h (sort_by_key t)
+// the world-aware comparator: a sort_by key may be an OBJECT with its own
+// `<=>` (regexp_parser sorts its version constants by Gem::Version).
+and insert_by_key = fn world -> fn (p: Val) -> fn (ps: Val list) ->
+  match ps with Nil -> Cons (p, Nil) | Cons (h, t) -> if cmp_vals_w world (pair_key p) (pair_key h) <= 0 then Cons (p, ps) else Cons (h, insert_by_key world p t)
+and sort_by_key = fn world -> fn (ps: Val list) -> match ps with Nil -> Nil | Cons (h, t) -> insert_by_key world h (sort_by_key world t)
 and extract_vals = fn (ps: Val list) -> match ps with Nil -> Nil | Cons (h, t) -> Cons (pair_val h, extract_vals t)
 
 // Array.new(size[, fill]) / Array.new(other_array) (copy) / Array.new -> [].
@@ -9458,13 +9485,17 @@ and arr_count_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn 
      | f -> arr_count_blk world encl theblk t (if truthy (flow_value f) then n + 1 else n))
 
 // hash.each { |k, v| ... } iterates key/value pairs of the flat list.
+// Hash#each yields ONE value -- the [key, value] pair -- which a `|k, v|`
+// block auto-splats. Yielding two looks the same for that shape but not for
+// `|pair|` or `|(k, v)|`, where ruby hands over the pair itself (sassc builds
+// its unit conversion table with the parenthesised form).
 and hash_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> FNext VNil
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
-       (match run_block world encl theblk (Cons (k, Cons (v, Nil))) with
+       (match run_block world encl theblk (Cons (arr_new (Cons (k, Cons (v, Nil))), Nil)) with
         | FBreak bv -> FBreak bv | FReturn bv -> FReturn bv
         | _ -> hash_each world encl theblk t)
      | Nil -> FNext VNil)
@@ -9777,6 +9808,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // refined methods (they live in the refinement's impl_cls, dispatched normally).
   let refimpl = refined_impl_for world recv name in
   if (if str_eq refimpl "" then false else true) then invoke world blk recv refimpl name args
+  else
+  // Enumerable#to_set lives in the `set` library, which ruby 3.1+ loads on
+  // demand rather than making you require it.
+  if str_eq name "to_set" && (if has_meth world "Enumerable" "to_set" then false else true) then
+    (let _ = exec_stmt env world blk (SRequire (false, EStrL "set")) in
+     invoke_val_c env world blk recv name args vischeck)
   else
   // in-place String / Hash mutation, here rather than only on the explicit-
   // receiver path: a bare `gsub!` inside a String subclass, and `send(:upcase!)`,
@@ -22814,6 +22851,9 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set includes "String" "Comparable" in
   // the collections include Enumerable, which is what `Array.include?
   // Enumerable` and `[].is_a? Enumerable` ask about.
+  // ruby 3.1+ has Set without a require: the constant is an autoload of the
+  // library mere-ruby ships. (`to_set` triggers the same load, in invoke_val_c.)
+  let _ = map_set autoloads "Set" (mkstr "set") in
   let _ = map_set includes "Array" "Enumerable" in
   let _ = map_set includes "Hash" "Enumerable" in
   let _ = map_set includes "Range" "Enumerable" in
