@@ -67,9 +67,16 @@ method table for a known origin. Every other part of the trick works:
 the unbound method is produced, binds, and returns the right answer for
 a module that does not override `name`.
 
-## Integer `**` with a negative base and fractional exponent
+## `**` with a negative base agrees with ruby except in the last ulp
 
-`(-8) ** (1.0/3)` is `NaN` here; Ruby returns a Complex.
+A negative base raised to a non-integer power answers the principal Complex
+root, and a half-integer exponent (a quarter turn) is exact — `(-8) ** 0.5` is
+`(0.0+2.8284271247461903i)`, not `(1.7e-16+2.82…i)`. Any other angle goes
+through `cos(pi*y)`, where multiplying by pi rounds first: ruby computes the
+same product to more than double precision, so `(-8) ** (1.0/3)` differs in
+the last place (`1.0000000000000002` where ruby prints `1.0`). Closing it
+means a two-part pi and an argument reduction, for an input shape nothing in
+the sample uses.
 
 ## `TracePoint`
 
