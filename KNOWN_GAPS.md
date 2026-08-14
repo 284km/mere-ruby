@@ -202,16 +202,34 @@ questions wrongly, which is worse than not loading — so it is left out. This
 is where devise stops, having loaded activesupport, i18n, concurrent-ruby and
 its own Concerns first.
 
-## Loading all of rubocop slows to a crawl
+## A method call costs ~12 KB that is never given back
 
-`require "rubocop"` now gets past `socket` and through 537 of its ~600
-requires, then effectively stops: the rate falls from 196 requires in the
-first 30 seconds to 5 in the sixth, with 4–15 GB resident, and the process is
-eventually killed. It is NOT a loop — progress continues the whole time, and
-the node-pattern compiler (the earlier suspect) compiles map_to_set's pattern
-in isolation without trouble. Something in the interpreter is superlinear in
-the number of definitions already made. The gem gate now bounds each gem at
-120 seconds so this reports as `TIMEOUT` instead of hanging the run.
+The interpreter allocates in a region it never reclaims, so **memory is linear
+in the number of calls executed** — 100k calls is 1.2 GB, 200k is 2.4 GB, 400k
+is 4.9 GB (`bench/alloc_per_call.sh`). Definitions are cheap by comparison:
+1600 classes with two methods each is 0.10s and 75 MB.
+
+That is the whole of the rubocop timeout. `require "rubocop"` is ~250 files
+and some millions of calls; it reaches tens of GB, the machine starts faulting
+for every access, and the gem gate's 120-second bound reports `TIMEOUT`. For a
+library that does finish, `rubocop-ast` is CRuby 0.3s / 50 MB against
+mere-ruby 6.5s / 5.45 GB — 20× the time and 108× the memory.
+
+A profile of the slow load spends half its samples in `strcmp`, which is a
+symptom rather than a cause: with a working set that never stops growing, the
+string compare behind every map lookup and every `str_eq` in the dispatch
+chains is a cache miss.
+
+Two earlier readings of this were wrong and are worth recording. It is not
+superlinear in the number of definitions (definitions measure linear and
+cheap). And `racc/cparse` did not take 61 seconds — a require that *raises*
+never returns, so a trace that closes files on return charges everything after
+the raise to it; `bench/require_trace.rb` closes them in an `ensure`.
+
+Fixing it means reclaiming per-call memory — a region per call with the result
+copied out — which is the same shape as the per-request reclamation mkv needed,
+and is complicated here by frames that legitimately escape (closures, bindings,
+`define_method` bodies).
 
 ## The Wasm playground cannot currently be rebuilt
 
