@@ -248,11 +248,13 @@ So the honest statement is: allocation per call is now within ~2× of what a
 tree-walking interpreter of this shape costs, and the remaining factor is that
 **nothing is ever collected**, not that temporaries are held too long.
 
-## The Wasm playground cannot currently be rebuilt
+## The Wasm playground has no sockets, no files, and no stderr of its own
 
-`docs/build.sh` fails in the vendored mgz package (`unbound variable: skip` in
-`deflate.mere`, Wasm codegen only) with the current Mere. The checked-in
-`docs/mere-ruby.wasm` still works; it was built with an earlier compiler. The
-socket capability's host imports are stubbed in `docs/index.html` for the day
-the build works again, but they are unverified for exactly that reason.
+`docs/build.sh` works again (Mere v0.1.259 — four Wasm-backend bugs, of which
+the first was `unbound variable: skip` in the vendored mgz package). What the
+page cannot give the module, it stubs: every socket call fails, so
+`TCPSocket.new` raises `Errno::ECONNREFUSED`; `File.read` of a real path
+returns nil; and stderr is a separate import now, which the page routes to the
+same output panel the program's own output goes to. A program that needs any
+of those needs the native build.
 
