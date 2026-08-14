@@ -112,15 +112,16 @@ with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
 caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
 
-## An endless range is stored as one that ends at the largest integer
+## A Range walks integers and strings, and nothing else
 
-`Float::INFINITY` as a range bound becomes the largest integer, because a
-Range here holds two integers. `(1..Float::INFINITY).end` therefore answers
-that number where ruby answers `Infinity`, and arithmetic on it overflows
-into a Bignum — which, as a bound, is clamped back rather than refused.
-Membership, `begin`, `min`/`max` and iteration bounds all behave; only the
-reported endpoint differs. Fixing it properly means a Range of two values
-rather than two integers.
+A Range holds its bounds as values, so `("a".."e")`, `(1.0..2.0)`, `(1..)`
+and `(..5)` are all Ranges with the bounds that were written. Comparison —
+`cover?`, `include?`, `===`, `min`/`max`, `size` — works for any bound that
+answers `<=>`. *Enumerating* one is the narrower thing: `each`/`to_a`/`map`
+walk an integer range or a string range (by `succ`), and any other element
+type raises `TypeError: can't iterate from …` rather than calling the
+object's own `succ`. A Date range, which ruby enumerates, is the case this
+excludes.
 
 ## `Object#methods` lists only the methods defined in Ruby
 
