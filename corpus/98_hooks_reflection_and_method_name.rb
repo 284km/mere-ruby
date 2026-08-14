@@ -92,3 +92,17 @@ end
 TracedK98.new.m
 set_trace_func(nil)
 p calls > 0
+
+# `define_method` with no receiver defines where self is: on a class inside a
+# class body, and on Object at the top level (which is where a top-level `def`
+# goes too, so the next line can call it).
+one98 = 1
+define_method(:top_defined) do
+  one98
+end
+p top_defined
+p 3.times.map { |i| top_defined + i }
+define_method(:with_return) do
+  1.tap { return :ok }
+end
+p with_return
