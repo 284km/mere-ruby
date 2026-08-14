@@ -850,6 +850,38 @@ let prim_missing = map_new ();
 // A parse error is raised deep in the parser, which has no idea which file it
 // is reading: a gem's syntax error arrived as a bare "unexpected token: =",
 // and finding the file cost a scan of the whole gem. `require`/`load` park the
+// Which line the parser had reached. Tokens carry no position (a Tok is a
+// bare variant), so this is derived: the statement loop remembers how many
+// newlines were still AHEAD of it, and the line is the file's total minus
+// that. Counting the newlines consumed instead would be wrong -- the parser
+// backtracks, and a global counter counts the re-scans twice. A parse error
+// that names only the file sends the reader to grep; "near line 87" sends
+// them to the line.
+let parse_line = map_new ();
+// Counted, not derived: the statement loop adds the newlines it skips and the
+// one that ends each statement. Two other shapes were tried and both were
+// worse -- counting the newlines LEFT costs O(n) per statement, and stashing
+// the token list costs a deep COPY per statement (map_set copies its value),
+// which took a 241k-line test from 10 seconds to over 75. Newlines consumed
+// inside a single expression are not counted, so this is a lower bound, which
+// is why the message says "near".
+let parse_line_add = fn (k: int) ->
+  let n = (if map_has parse_line "n" then map_get parse_line "n" else 0) in
+  map_set parse_line "n" (n + k);
+// The count is an UPPER bound: the parser backtracks, and a re-scanned block
+// body is counted twice. The file's own line count (one pass, at the start of
+// the parse -- not per statement) clamps it, so the number always names a line
+// that exists.
+let parse_line_reset = fn (lines: int) ->
+  let _ = map_set parse_line "n" 0 in
+  map_set parse_line "max" lines;
+let parse_line_now = fn () ->
+  if map_has parse_line "n" then
+    (let n = map_get parse_line "n" + 1 in
+     let mx = (if map_has parse_line "max" then map_get parse_line "max" else 0) in
+     if mx > 0 && n > mx then mx else n)
+  else 0;
+
 // path here for the duration of the parse so the message can say it.
 // A string passed to eval / class_eval has no file at all, so a parse error in
 // one has to quote the string instead: the alternative is a bare "expected
@@ -859,11 +891,13 @@ let set_parsing_eval = fn (code: str) ->
     (mkstr ("(eval) " ++ substring code 0 (if str_len code > 60 then 60 else str_len code)));
 
 let parsing_file = fn () ->
+  let ln = parse_line_now () in
+  let where = (if ln > 0 then " near line " ++ str_of_int (ln + 1) else "") in
   (if map_has load_ctx "parsing" then
      (match map_get load_ctx "parsing" with
-      | VStr d -> (let f = sget d in if str_eq f "" then "" else " in " ++ f)
-      | _ -> "")
-   else "");
+      | VStr d -> (let f = sget d in if str_eq f "" then where else " in " ++ f ++ where)
+      | _ -> where)
+   else where);
 // prim_method has no `world` to build an exception with, so a TYPED failure
 // parks its class and message here and fails; the begin/rescue catch site
 // turns that into the real Ruby exception. Same channel as the "n" slot above,
@@ -999,12 +1033,12 @@ let rec find_close_brace = fn (s: str) -> fn (i: int) -> fn (depth: int) ->
 // drops the backslash (Ruby: "\q" == "q"). Returns (decoded, index after
 // the closing quote).
 let rec lex_dq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated string")) in fail "mere-ruby: unterminated string")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated string" ++ parsing_file ()))) in fail ("mere-ruby: unterminated string" ++ parsing_file ()))
   else
     let c = char_at s i in
     if str_eq c "\"" then (acc, i + 1)
     else if str_eq c "\\" then
-      (if i + 1 >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated string")) in fail "mere-ruby: unterminated string")
+      (if i + 1 >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated string" ++ parsing_file ()))) in fail ("mere-ruby: unterminated string" ++ parsing_file ()))
        else
          let e = char_at s (i + 1) in
          let piece =
@@ -1017,7 +1051,7 @@ let rec lex_dq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 // single-quoted string body: only \' and \\ are escapes; anything else
 // after a backslash keeps the backslash (Ruby semantics).
 let rec lex_sq = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated string")) in fail "mere-ruby: unterminated string")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated string" ++ parsing_file ()))) in fail ("mere-ruby: unterminated string" ++ parsing_file ()))
   else
     let c = char_at s i in
     if str_eq c "'" then (acc, i + 1)
@@ -1416,7 +1450,7 @@ and lex_dstr = fn (s: str) -> fn (i: int) -> fn (lit: str) -> lex_dstr_t "\"" s 
 // like lex_dstr but with a caller-chosen terminator char (`"` for strings,
 // backtick for command literals) — same interpolation/escape handling.
 and lex_dstr_t = fn (term: str) -> fn (s: str) -> fn (i: int) -> fn (lit: str) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated string")) in fail "mere-ruby: unterminated string")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated string" ++ parsing_file ()))) in fail ("mere-ruby: unterminated string" ++ parsing_file ()))
   else
     let c = char_at s i in
     if str_eq c term then (Cons (TP "+", Cons (TStrL lit, Nil)), i + 1)
@@ -1461,7 +1495,7 @@ and lex_dstr_t = fn (term: str) -> fn (s: str) -> fn (i: int) -> fn (lit: str) -
 // \u{XXXX YYYY ...}: hex codepoints (space-separated) up to the closing
 // brace; returns the UTF-8 bytes and the index after the "}".
 and scan_u_braced = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (cp: int) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated backslash-u")) in fail "mere-ruby: unterminated backslash-u")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated backslash-u" ++ parsing_file ()))) in fail ("mere-ruby: unterminated backslash-u" ++ parsing_file ()))
   else
     let c = char_at s i in
     if str_eq c "}" then (acc ++ (if cp > 0 then utf8_of cp else ""), i + 1)
@@ -1513,7 +1547,7 @@ and rx_is_meta = fn (c: str) ->
 // /\(/ but %r-\-- is /-/, matching Ruby's source normalization); any other
 // backslash pair is copied verbatim for the regex parser.
 and scan_pct_regex = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: str) -> fn (op: str) -> fn (clo: str) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated %r literal")) in fail "mere-ruby: unterminated %r literal")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated %r literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated %r literal" ++ parsing_file ()))
   else
     let c = char_at s i in
     if str_eq c "\\" && i + 1 < str_len s then
@@ -1528,7 +1562,7 @@ and scan_pct_regex = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: s
     else scan_pct_regex s (i + 1) depth (acc ++ c) op clo
 
 and scan_balanced2 = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: str) -> fn (op: str) -> fn (clo: str) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated % literal")) in fail "mere-ruby: unterminated % literal")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated % literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated % literal" ++ parsing_file ()))
   else
     let c = char_at s i in
     // a backslash escapes the delimiter (and itself) inside the body.
@@ -1942,7 +1976,7 @@ and is_lparen = fn (p: str) -> str_eq p "(" || str_eq p " ("
 // scan the regex body to the closing unescaped /, returning the trailing
 // flags ("im"...) alongside the body and the resume position.
 and scan_regex = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
-  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated regex")) in fail "mere-ruby: unterminated regex")
+  if i >= str_len s then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated regex" ++ parsing_file ()))) in fail ("mere-ruby: unterminated regex" ++ parsing_file ()))
   else
     let c = char_at s i in
     // `\/` escapes the DELIMITER, and ruby keeps only the slash in the
@@ -2050,7 +2084,7 @@ let expect = fn toks -> fn (want: str) ->
 // expression and statement parsers (one merged group) can use them.
 let expect_end = fn toks ->
   match toks with
-  | Cons (TNL, r) -> r
+  | Cons (TNL, r) -> (let _ = parse_line_add 1 in r)
   | Cons (TEOF, _) -> toks
   // a statement may also be terminated by a block-closing keyword on the
   // same line (e.g. `def m() 1 end`), left unconsumed for the caller.
@@ -2082,6 +2116,22 @@ let skip_then = fn toks ->
 
 let rec skip_nls = fn toks ->
   match toks with Cons (TNL, r) -> skip_nls r | _ -> toks;
+
+// the same, reporting how many newlines it passed: the statement loop keeps
+// the line counter with this, and no other caller cares.
+let rec skip_nls_n = fn toks -> fn (k: int) ->
+  match toks with Cons (TNL, r) -> skip_nls_n r (k + 1) | _ -> (toks, k);
+
+// how many newline tokens this stream holds (once per file, to clamp the
+// running count -- never per statement)
+let rec count_nls = fn toks ->
+  match toks with
+  | Nil -> 0
+  | Cons (TNL, r) -> 1 + count_nls r
+  | Cons (_, r) -> count_nls r;
+
+
+
 
 // A symbol token whose name is not identifier-shaped can only have been
 // written in quoted form (`:'"'`), and inside a ternary that is the colon plus
@@ -2268,7 +2318,7 @@ and paren_seq = fn toks -> fn (acc: Stmt list) ->
        if str_eq rp2 ")" then (EStmt (SBegin (rev_app (Cons (s1, acc)) Nil, Nil, Nil, Nil)), r3)
        else paren_seq (skip_nls r1) (Cons (s1, acc))
      | _ -> paren_seq (skip_nls r1) (Cons (s1, acc)))
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated paren sequence")) in fail "mere-ruby: unterminated paren sequence")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated paren sequence" ++ parsing_file ()))) in fail ("mere-ruby: unterminated paren sequence" ++ parsing_file ()))
 
 // expr [and|or expr]* — the low-precedence word operators (paren context);
 // `not expr` negates at the same low precedence.
@@ -2752,7 +2802,7 @@ and parse_brace_stmts = fn toks -> fn (acc: Stmt list) ->
     if str_eq p "}" then (rev_app acc Nil, r)
     else let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
          parse_brace_stmts r1 (Cons (s, acc))
-  | Cons (TEOF, _) -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated block")) in fail "mere-ruby: unterminated block")
+  | Cons (TEOF, _) -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated block" ++ parsing_file ()))) in fail ("mere-ruby: unterminated block" ++ parsing_file ()))
   | _ ->
     let (s0, r0) = parse_stmt t in let (s, r1) = apply_modifier s0 r0 in
     parse_brace_stmts r1 (Cons (s, acc))
@@ -2859,7 +2909,7 @@ and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (ds: (str
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected , or | in block params" ++ parsing_file ()))) in fail ("mere-ruby: expected , or | in block params" ++ parsing_file ()))
   // `|one; bl|` — the ; (lexed as a newline) starts the block-local names.
   | Cons (TNL, r) -> parse_block_locals r (Cons (name, acc)) ds
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated block params")) in fail "mere-ruby: unterminated block params")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated block params" ++ parsing_file ()))) in fail ("mere-ruby: unterminated block params" ++ parsing_file ()))
 
 // fold any string literals immediately following `e` into it (Ruby's
 // adjacent-string-literal concatenation).
@@ -3272,7 +3322,7 @@ and arr_items_sep = fn r -> fn (acc: Expr list) ->
        | _ -> parse_arr_items (skip_nls r2) acc)
     else if str_eq p "]" then (EArr (rev_app acc Nil), r2)
     else (let __fm = ("mere-ruby: expected , or ] in array, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated array literal")) in fail "mere-ruby: unterminated array literal")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated array literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated array literal" ++ parsing_file ()))
 
 and parse_arr_expr = fn toks -> fn (acc: Expr list) ->
   let (e, r0) = parse_expr toks in
@@ -3291,7 +3341,7 @@ and parse_arr_expr = fn toks -> fn (acc: Expr list) ->
       let (v, r3) = parse_expr (skip_nls r2) in
       arr_hash_items r3 acc (Cons (v, Cons (e, Nil)))
     else (let __fm = ("mere-ruby: expected , or ] in array, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated array literal")) in fail "mere-ruby: unterminated array literal")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated array literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated array literal" ++ parsing_file ()))
 
 // remaining k => v pairs of an array's trailing hash (hp is reversed v,k).
 and arr_hash_items = fn toks -> fn (acc: Expr list) -> fn (hp: Expr list) ->
@@ -3315,7 +3365,7 @@ and arr_hash_items = fn toks -> fn (acc: Expr list) -> fn (hp: Expr list) ->
          let (v, r4) = parse_expr (skip_nls r3) in
          arr_hash_items (skip_nls r4) acc (Cons (v, Cons (k, hp))))
     else (let __fm = ("mere-ruby: expected , or ] in array hash, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated array literal")) in fail "mere-ruby: unterminated array literal")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated array literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated array literal" ++ parsing_file ()))
 
 and parse_hash = fn toks ->
   // a multiline hash literal may break after `{` (and before `}`).
@@ -3355,7 +3405,7 @@ and hash_items_sep = fn r3 -> fn (acc: Expr list) ->
        | _ -> parse_hash_items (skip_nls r4) acc)
     else if str_eq p "}" then (EHsh (rev_app acc Nil), r4)
     else (let __fm = ("mere-ruby: expected , or } in hash, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated hash literal")) in fail "mere-ruby: unterminated hash literal")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated hash literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated hash literal" ++ parsing_file ()))
 
 and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
   // `name: value` symbol-key shorthand is equivalent to `:name => value`.
@@ -3393,7 +3443,7 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
        | _ -> parse_hash_items (skip_nls r4) (Cons (v, Cons (k, acc))))
     else if str_eq p "}" then (EHsh (rev_app (Cons (v, Cons (k, acc))) Nil), r4)
     else (let __fm = ("mere-ruby: expected , or } in hash, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated hash literal")) in fail "mere-ruby: unterminated hash literal")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated hash literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated hash literal" ++ parsing_file ()))
 
 // call arguments after the opening `(` (already consumed); handles the
 // empty `()` case.
@@ -3477,7 +3527,7 @@ and parse_call_sep = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
        | _ -> parse_call_go (skip_nls r) pos hp)
     else if str_eq p ")" then (finish_call_args pos hp, r)
     else (let __fm = ("mere-ruby: expected , or ) in argument list, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated argument list")) in fail "mere-ruby: unterminated argument list")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated argument list" ++ parsing_file ()))) in fail ("mere-ruby: unterminated argument list" ++ parsing_file ()))
 
 and finish_call_args = fn (pos: Expr list) -> fn (hp: Expr list) ->
   match hp with
@@ -3622,17 +3672,20 @@ and parse_puts_args_pos = fn toks -> fn (acc: Expr list) ->
 // parse statements until a block-closing keyword (end / else / elsif /
 // when) or EOF; the closer is left unconsumed for the caller.
 and parse_stmts = fn toks -> fn (acc: Stmt list) ->
-  let t = skip_nls toks in
+  let (t, skipped) = skip_nls_n toks 0 in
+  let _ = parse_line_add skipped in
   match t with
   | Cons (TEOF, _) -> (rev_app acc Nil, t)
   | Cons (TId id, _) ->
     if is_block_stop id then (rev_app acc Nil, t)
     else
       let (s0, r0) = parse_stmt t in
+      let (s0, r0) = grow_setter_stmt s0 r0 in
       let (s, r) = apply_modifier s0 r0 in
       parse_stmts (expect_end r) (Cons (s, acc))
   | _ ->
     let (s0, r0) = parse_stmt t in
+    let (s0, r0) = grow_setter_stmt s0 r0 in
     let (s, r) = apply_modifier s0 r0 in
     parse_stmts (expect_end r) (Cons (s, acc))
 
@@ -3847,6 +3900,22 @@ and parse_multi = fn toks ->
 // (`foo[0], bar.baz = a, b`). Targets parse as postfix chains; the writer
 // invokes m= / []= at assignment time.
 // replace the last argument v with [v, more...] (multi-value []= RHS).
+// `a[i] = 1, 2` and `o.x = 1, 2` assign the ARRAY: the values after the comma
+// grow the setter's last argument. The parenthesised form `(a[i] = 1, 2)`
+// already did this; a bare statement did not, and stopped at the comma.
+and grow_setter_stmt = fn (s: Stmt) -> fn toks ->
+  match toks with
+  | Cons (TP c, r1) when str_eq c "," ->
+    (match s with
+     | SExpr (EMethod (recv, mn, margs)) ->
+       (if str_eq mn "[]=" || (str_len mn > 1 && str_eq (char_at mn (str_len mn - 1)) "="
+                               && (if str_eq mn "==" then false else true)) then
+          (let (more, r2) = parse_rhs_list (skip_nls r1) Nil in
+           (SExpr (EMethod (recv, mn, grow_last_arg margs more)), r2))
+        else (s, toks))
+     | _ -> (s, toks))
+  | _ -> (s, toks)
+
 and grow_last_arg = fn (args: Expr list) -> fn (more: Expr list) ->
   match args with
   | Nil -> Cons (EArr more, Nil)
@@ -3883,7 +3952,7 @@ and parse_x_targets = fn toks -> fn (acc: Expr list) ->
        | _ -> parse_x_targets (skip_nls r2) (Cons (t, acc)))
     else if str_eq p "=" then (rev_app (Cons (t, acc)) Nil, r2)
     else (let __fm = ("mere-ruby: expected , or = in multiple assignment, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated multiple-assignment targets")) in fail "mere-ruby: unterminated multiple-assignment targets")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated multiple-assignment targets" ++ parsing_file ()))) in fail ("mere-ruby: unterminated multiple-assignment targets" ++ parsing_file ()))
 
 // one assignment target: a name (local/@ivar/$global) followed by .attr /
 // [index] chains. Unlike parse_postfix this never consumes `= rhs`.
@@ -3921,7 +3990,7 @@ and parse_x_group = fn toks -> fn (acc: Expr list) ->
        | _ -> parse_x_group r2 (Cons (t, acc)))
     else if str_eq p ")" then (rev_app (Cons (t, acc)) Nil, r2)
     else (let __fm = ("mere-ruby: expected , or ) in grouped target, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated grouped target")) in fail "mere-ruby: unterminated grouped target")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated grouped target" ++ parsing_file ()))) in fail ("mere-ruby: unterminated grouped target" ++ parsing_file ()))
 
 and parse_x_chain = fn (recv: Expr) -> fn toks ->
   match toks with
@@ -3978,7 +4047,7 @@ and parse_x_idx = fn toks -> fn (acc: Expr list) ->
       let (pairs, r4) = parse_x_idx_pairs r3 (Cons (v, Cons (e, Nil))) in
       (rev_app (Cons (EHsh (rev_app pairs Nil), acc)) Nil, r4)
     else (let __fm = ("mere-ruby: expected , or ] in index target, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated index target")) in fail "mere-ruby: unterminated index target")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated index target" ++ parsing_file ()))) in fail ("mere-ruby: unterminated index target" ++ parsing_file ()))
 
 and parse_x_idx_pairs = fn toks -> fn (acc: Expr list) ->
   match toks with
@@ -3995,7 +4064,7 @@ and parse_x_idx_pairs = fn toks -> fn (acc: Expr list) ->
        | Cons (TP a, r3) -> if str_eq a "=>" then (let (v, r4) = parse_expr r3 in parse_x_idx_pairs r4 (Cons (v, Cons (k, acc)))) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected => in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected => in index hash" ++ parsing_file ()))
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected => in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected => in index hash" ++ parsing_file ()))))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected , or ] in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected , or ] in index hash" ++ parsing_file ()))
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated index hash")) in fail "mere-ruby: unterminated index hash")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated index hash" ++ parsing_file ()))) in fail ("mere-ruby: unterminated index hash" ++ parsing_file ()))
 
 // does this statement look like a complex multiple assignment? Scan to a
 // top-level `=` requiring a top-level `,` first; two adjacent value tokens
@@ -4052,7 +4121,7 @@ and parse_target_list = fn toks -> fn (acc: str list) ->
     if str_eq p "," then parse_target_list r2 (Cons (t, acc))
     else if str_eq p "=" then (rev_app (Cons (t, acc)) Nil, r2)
     else (let __fm = ("mere-ruby: expected , or = in multiple assignment, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated multiple-assignment targets")) in fail "mere-ruby: unterminated multiple-assignment targets")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated multiple-assignment targets" ++ parsing_file ()))) in fail ("mere-ruby: unterminated multiple-assignment targets" ++ parsing_file ()))
 
 and parse_one_target = fn toks ->
   match toks with
@@ -4737,7 +4806,7 @@ and parse_if_tail = fn toks ->
       let (clauses, els, r4) = parse_if_tail r3 in
       (Cons ((c, b), clauses), els, r4)
     else (let __fm = ("mere-ruby: expected elsif/else/end, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated if")) in fail "mere-ruby: unterminated if")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated if" ++ parsing_file ()))) in fail ("mere-ruby: unterminated if" ++ parsing_file ()))
 
 // `for x in e [do] body end` — each over e with x as the block param.
 // The block shares the enclosing env, so (like Ruby's for) x leaks out.
@@ -4851,7 +4920,7 @@ and parse_for_group = fn toks -> fn (acc: str list) ->
        if str_eq p "," then parse_for_group r2 (Cons (v, acc))
        else if str_eq p ")" then (rev_app (Cons (v, acc)) Nil, r2)
        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected , or ) in a for target" ++ parsing_file ()))) in fail ("mere-ruby: expected , or ) in a for target" ++ parsing_file ()))
-     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated for target")) in fail "mere-ruby: unterminated for target"))
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated for target" ++ parsing_file ()))) in fail ("mere-ruby: unterminated for target" ++ parsing_file ())))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a variable in a for target" ++ parsing_file ()))) in fail ("mere-ruby: expected a variable in a for target" ++ parsing_file ()))
 
 and parse_for_vars = fn toks -> fn (acc: str list) ->
@@ -4958,7 +5027,7 @@ and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
     else if str_eq id "end" then
       (SCaseIn (subj, rev_app acc Nil, false, Nil), r)
     else (let __fm = ("mere-ruby: expected in/else/end in case, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated case/in")) in fail "mere-ruby: unterminated case/in")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated case/in" ++ parsing_file ()))) in fail ("mere-ruby: unterminated case/in" ++ parsing_file ()))
 
 // an optional guard after a pattern: `if COND` / `unless COND`.
 and parse_in_guard = fn toks ->
@@ -5251,7 +5320,7 @@ and parse_arr_pat_one = fn toks -> fn (acc: Pat list) ->
         | _ -> parse_arr_pat_elems (skip_nls r2) acc2)
      else if str_eq c "]" then (rev_app acc2 Nil, r2)
      else (let __fm = ("mere-ruby: expected , or ] in array pattern, got " ++ c ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated array pattern")) in fail "mere-ruby: unterminated array pattern"))
+   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated array pattern" ++ parsing_file ()))) in fail ("mere-ruby: unterminated array pattern" ++ parsing_file ())))
 
 // like parse_arr_pat_elems but closes on `)` (Const(pat, ...) form).
 and parse_arr_pat_elems_paren = fn toks -> fn (acc: Pat list) ->
@@ -5271,7 +5340,7 @@ and parse_arr_pat_one_p = fn toks -> fn (acc: Pat list) ->
         | _ -> parse_arr_pat_elems_paren (skip_nls r2) acc2)
      else if str_eq c ")" then (rev_app acc2 Nil, r2)
      else (let __fm = ("mere-ruby: expected , or ) in pattern, got " ++ c ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated pattern")) in fail "mere-ruby: unterminated pattern"))
+   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated pattern" ++ parsing_file ()))) in fail ("mere-ruby: unterminated pattern" ++ parsing_file ())))
 
 // a brace hash pattern `{ ... }` — consume up to `}`.
 and parse_hash_pat_brace = fn toks ->
@@ -5345,7 +5414,7 @@ and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
     else if str_eq id "end" then
       (SCase (subj, rev_app acc Nil, Nil), r)
     else (let __fm = ("mere-ruby: expected when/else/end in case, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated case")) in fail "mere-ruby: unterminated case")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated case" ++ parsing_file ()))) in fail ("mere-ruby: unterminated case" ++ parsing_file ()))
 
 and parse_when_vals = fn toks -> fn (acc: Expr list) ->
   // `when *ary` splices the array's elements as candidates.
@@ -5614,7 +5683,7 @@ and parse_params_after = fn (name: str) -> fn toks0 -> fn (acc: str list) -> fn 
     if str_eq p "," then parse_params r (Cons (name, acc)) defs
     else if str_eq p ")" then (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, r)
     else (let __fm = ("mere-ruby: expected , or ) in parameters, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated parameter list")) in fail "mere-ruby: unterminated parameter list")
+  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated parameter list" ++ parsing_file ()))) in fail ("mere-ruby: unterminated parameter list" ++ parsing_file ()))
 
 // paren-less method params: `def m a, o=1, *r, &b` — terminated by newline
 // (any non-comma token) rather than `)`.
@@ -12576,6 +12645,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (VStr code, _) -> let code = sget code in
          let _ = set_parsing_eval code in
          let toks = lex_go code 0 in
+         let _ = parse_line_reset (count_nls toks) in
          let (p2, _) = parse_stmts toks Nil in
          let _ = map_set load_ctx "parsing" (mkstr "") in
          eval_run benv world blk p2
@@ -13496,6 +13566,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
        let code = sget code in
        let _ = set_parsing_eval code in
        let toks = lex_go code 0 in
+       let _ = parse_line_reset (count_nls toks) in
        let (p2, _) = parse_stmts toks Nil in
        let _ = map_set load_ctx "parsing" (mkstr "") in
        if imm_no_singleton recv && body_defines p2 then raise_exc world "TypeError" "can't define singleton"
@@ -17160,6 +17231,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
      let _ = map_set load_ctx "parsing" (mkstr full) in
      let toks = lex_go src 0 in
+     let _ = parse_line_reset (count_nls toks) in
      let (prog2, rest2) = parse_stmts toks Nil in
      let _ = map_set load_ctx "parsing" (mkstr "") in
      let _ = rx_check_pending () in
@@ -22377,9 +22449,11 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // failure has to be signalled through a flag rather than in it.
        let pok = map_new () in
        let _ = map_set load_ctx "parsing" (mkstr full) in
-       let (prog2, rest2) =
+         let (prog2, rest2) =
          try_or (fn (u: unit) ->
-                   let r = parse_stmts (lex_go src 0) Nil in
+                   let tk = lex_go src 0 in
+                   let _ = parse_line_reset (count_nls tk) in
+                   let r = parse_stmts tk Nil in
                    let _ = map_set pok "y" 1 in r)
                 (Nil, Nil) in
        let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -23039,6 +23113,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let _ = set_parsing_eval code in
     let prog2 = try_or (fn (u: unit) ->
       let toks = lex_go code 0 in
+      let _ = parse_line_reset (count_nls toks) in
       let (p2, _) = parse_stmts toks Nil in
       let _ = rx_check_pending () in p2) sentinel in
     let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -25405,6 +25480,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let cod0 = src_coding src in
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
   let toks = lex_go src 0 in
+  let _ = parse_line_reset (count_nls toks) in
   let (prog, rest) = parse_stmts toks Nil in
   let _ = rx_check_pending () in
   let _ =

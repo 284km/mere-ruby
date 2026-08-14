@@ -53,3 +53,24 @@ class Ver
 end
 p [Ver.new(3), Ver.new(1)].sort_by { |v| v }.map(&:n)
 p [Ver.new(3), Ver.new(1)].min.n
+
+# `a[i] = 1, 2` and `o.x = 1, 2` assign the ARRAY: the values after the comma
+# grow the setter's last argument, the same as ruby's implicit array on the
+# right of any assignment.
+a = [1, 2, 3, 4, 5, 6]
+a[3, 2] = "a", "b", "c", "d"
+p a
+b = [1, 2, 3]
+b[0] = 7, 8
+p b
+c = [1, 2]
+c[0..1] = 7, 8
+p c
+h = {}
+h[:k] = 7, 8
+p h
+S95 = Struct.new(:v)
+s = S95.new(1)
+s.v = 7, 8
+p s.v
+p (a[0] = 9)          # the parenthesised form was already right
