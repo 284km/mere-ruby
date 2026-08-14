@@ -29,6 +29,13 @@ for rb in "$dir"/*/p*.rb; do
   [ -f "$rb" ] || continue
   flags=""
   [ -f "${rb%.rb}.flags" ] && flags=$(cat "${rb%.rb}.flags")
+  # a pair whose expectation the reference ruby cannot reproduce is drift, not
+  # a cause worth grouping (see all.sh)
+  if [ "${BT_NO_DRIFT_CHECK:-}" != 1 ]; then
+    exp=$(cat "${rb%.rb}.exp")
+    rbgot=$(perl -e 'alarm 20; exec @ARGV' ruby $flags -e 'print(eval(File.read(ARGV[0]), TOPLEVEL_BINDING, ARGV[0]))' "$rb" 2>/dev/null)
+    [ "$rbgot" != "$exp" ] && continue
+  fi
   if [ "$mode" = fail ]; then
     # a FAIL ran to completion and printed the wrong thing: group by what it
     # printed, next to what was wanted
