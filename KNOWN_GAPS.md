@@ -78,14 +78,22 @@ the last place (`1.0000000000000002` where ruby prints `1.0`). Closing it
 means a two-part pi and an argument reduction, for an input shape nothing in
 the sample uses.
 
-## `TracePoint` implements one event
+## Tracing sees calls, returns and class bodies — not lines
 
 `TracePoint.new(:class)` fires when a class or module body is entered, which
 is the event zeitwerk watches to notice an explicit namespace — dry-logic
 loads on it. `#enable`, `#disable`, `#enabled?`, `#self` and `#event` are
-there; the block form of enable/disable and every other event (`:call`,
-`:line`, `:return`, …) are not. Firing costs one lookup per class body while
-no tracepoint is enabled.
+there; the block form of enable/disable and every other event are not.
+
+`set_trace_func(proc)` installs a tracer and fires it for **call**, **return**
+and **class**. Ruby also has `line`, `end`, `c-call`, `c-return`, `raise` and
+`b-call`, and passes a real line number and a Binding; here the line is 0 and
+the binding is nil, because this interpreter keeps neither at run time. A
+tracer that counts calls or watches classes works; one that follows lines does
+not, and one that prints its events prints fewer of them.
+
+Both cost one map lookup while nothing is installed — per class body for
+TracePoint, per method call for set_trace_func.
 
 ## Corpus programs must be self-contained
 

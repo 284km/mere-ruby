@@ -433,6 +433,11 @@ let call_names = map_new ();
 // check is a single map lookup in the overwhelmingly common case (nobody
 // defines one) rather than an ancestor walk.
 let hook_flags = map_new ();
+
+// Kernel#set_trace_func: the proc ruby hands every event to. Kept behind a
+// flag in hook_flags, so a program that never installs one pays a single map
+// lookup per method call -- the same shape TracePoint(:class) uses.
+let trace_fn = map_new ();
 // Marshal's symbol table: symbols are written once and back-referenced by
 // index afterwards, so a load has to remember them in order.
 let mrsh_syms = map_new ();
@@ -16323,6 +16328,17 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false)
           && (if self_defines env world name then false else true) then
     (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
+  // `set_trace_func(proc)` installs the tracer, `set_trace_func(nil)` removes
+  // it. The proc arrives as an ARGUMENT, not a block, so this is the ordinary
+  // call path rather than the block-taking one.
+  else if str_eq name "set_trace_func" then
+    (match args with
+     | Cons (VProc pid, _) ->
+       (let _ = map_set trace_fn "p" (VProc pid) in
+        let _ = map_set hook_flags "stf" VNil in VProc pid)
+     | _ ->
+       (let _ = (if map_has trace_fn "p" then map_delete trace_fn "p" else ()) in
+        let _ = (if map_has hook_flags "stf" then map_delete hook_flags "stf" else ()) in VNil))
   // Kernel#exit / Kernel#abort — terminate through the native exit, running
   // the at_exit handlers first (which is the only chance they get).
   else if str_eq name "exit" then
@@ -16640,6 +16656,7 @@ and is_kernel_builtin = fn (name: str) ->
   str_eq name "Complex" || str_eq name "warn" || str_eq name "rand" ||
   str_eq name "srand" || str_eq name "sleep" || str_eq name "gets" ||
   str_eq name "exit" || str_eq name "at_exit" || str_eq name "binding" ||
+  str_eq name "set_trace_func" ||
   str_eq name "caller" || str_eq name "caller_locations" || str_eq name "__method__"
 
 // is `name` callable here — a top-level method, or a method on self's class?
@@ -16797,7 +16814,9 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // invisible to the method. A block is NOT a frame here -- it shares the
     // method's, which is ruby's rule too.
     let mstate = rx_state_save () in
+    let _ = fire_trace world "call" name defcls in
     let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
+    let _ = fire_trace world "return" name defcls in
     let _ = rx_state_restore mstate in
     out
 
@@ -16924,6 +16943,25 @@ and run_included_hook = fn world -> fn (mq: str) -> fn (base: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   if has_meth world ("(sng:" ++ mq ++ ")") "included"
   then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "included" (Cons (VClass base, Nil)) in ())
+  else ()
+
+// Hand one event to the installed trace func. Ruby passes six arguments
+// (event, file, line, id, binding, classname); the line is 0 and the binding
+// nil here -- this interpreter keeps neither at run time -- and the events are
+// the ones it can produce: call / return / class / end.
+and fire_trace = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) ->
+  if map_has hook_flags "stf" && (if map_has trace_fn "busy" then false else true) then
+    (match (if map_has trace_fn "p" then map_get trace_fn "p" else VNil) with
+     | VProc pid ->
+       // the tracer's own calls must not trace, or the first event never ends
+       (let _ = map_set trace_fn "busy" VNil in
+        let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+        let file = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
+        let argv = Cons (mkstr ev, Cons (file, Cons (VInt 0,
+                     Cons (VSym mname, Cons (VNil, Cons (VClass cls, Nil)))))) in
+        let _ = try_or (fn (u: unit) -> run_block world nb (proc_as_block pid) argv) (FNext VNil) in
+        let _ = map_delete trace_fn "busy" in ())
+     | _ -> ())
   else ()
 
 and run_prepended_hook = fn world -> fn (mq: str) -> fn (base: str) ->
@@ -22017,6 +22055,7 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
              (let noblk0 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
               let _ = invoke world noblk0 (VClass "TracePoint") "(sng:TracePoint)" "__fire" (Cons (VClass cls, Nil)) in ())
            else ()) in
+  let _ = fire_trace world "class" cls cls in
   // a `using` inside this body is scoped to it: snapshot/restore ref_active.
   let saved = map_copy ref_active in
   let cenv = map_new () in

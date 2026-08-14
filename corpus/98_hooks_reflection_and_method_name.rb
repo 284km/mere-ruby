@@ -67,3 +67,28 @@ p Holder.new.read
 x = 42
 b = binding
 p b.local_variable_get(:x)
+
+# set_trace_func installs a tracer. What every ruby agrees on is that the
+# program still runs the same with one installed, that the proc is what the
+# call answers, and that nil takes it off again. (WHICH events fire is where
+# this interpreter is a subset -- see KNOWN_GAPS.)
+set_trace_func(proc { })
+x98 = (raise rescue true)
+p x98
+p [1, 2].map { |x| x * 2 }
+p false.tap { |x| x }
+tracer = proc { }
+p set_trace_func(tracer).equal?(tracer)
+p set_trace_func(nil)
+
+# ...and a tracer sees the calls it wraps
+calls = 0
+set_trace_func(proc { |ev, file, line, id, bind, cls| calls += 1 if ev == "call" })
+class TracedK98
+  def m
+    2
+  end
+end
+TracedK98.new.m
+set_trace_func(nil)
+p calls > 0
