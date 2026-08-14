@@ -96,3 +96,20 @@ p Range.instance_method(:minmax).owner
 p [1, 2, 2].to_set.size
 p Set.new([1, 2]).include?(2)
 p({ a: 1 }.to_a.to_set.size)
+
+# Hash[...] takes three shapes: one Hash, one array of [k, v] pairs, or a flat
+# even-length list. (A 1-element pair means a nil value.)
+p Hash[:a, 1, :b, 2]
+p Hash[[[:a, :b], [:c, :d]]]
+p Hash[[[:a]]]
+p Hash[{ x: 1 }]
+p Hash[]
+p Hash[a: 1, b: 2]                 # labels inside an index are one Hash argument
+p Hash["k" => 1, b: 2]
+def herr
+  yield
+rescue => e
+  [e.class, e.message]
+end
+p herr { Hash[:a] }
+p herr { Hash[[[:a, :b, :c]]] }

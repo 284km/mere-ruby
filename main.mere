@@ -3951,6 +3951,14 @@ and parse_x_idx = fn toks -> fn (acc: Expr list) ->
   // (addressable) -- so newlines are skipped where a paren-less argument list
   // would skip them: before an index, and after each comma.
   let toks = skip_nls toks in
+  // `recv[k: v, ...]` — labels are one trailing Hash argument, the same as
+  // `recv[k => v]`, and `Hash[a: 1]` is how ruby's own specs write it.
+  match toks with
+  | Cons (TId lbl, Cons (TP lc, lr)) when str_eq lc ":" ->
+    (let (v, r1) = parse_expr (skip_nls lr) in
+     let (pairs, r2) = parse_x_idx_pairs r1 (Cons (v, Cons (ESym lbl, Nil))) in
+     (rev_app (Cons (EHsh (rev_app pairs Nil), acc)) Nil, r2))
+  | _ ->
   let (e, r) =
     (match toks with
      | Cons (TP st, r0) ->
@@ -3977,10 +3985,15 @@ and parse_x_idx_pairs = fn toks -> fn (acc: Expr list) ->
   | Cons (TP p, r) ->
     if str_eq p "]" then (acc, r)
     else if str_eq p "," then
+      (match skip_nls r with
+       | Cons (TId lbl2, Cons (TP lc2, lr2)) when str_eq lc2 ":" ->
+         (let (v, r4) = parse_expr (skip_nls lr2) in
+          parse_x_idx_pairs r4 (Cons (v, Cons (ESym lbl2, acc))))
+       | _ ->
       let (k, r2) = parse_expr r in
       (match r2 with
        | Cons (TP a, r3) -> if str_eq a "=>" then (let (v, r4) = parse_expr r3 in parse_x_idx_pairs r4 (Cons (v, Cons (k, acc)))) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected => in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected => in index hash" ++ parsing_file ()))
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected => in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected => in index hash" ++ parsing_file ())))
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected => in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected => in index hash" ++ parsing_file ()))))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected , or ] in index hash" ++ parsing_file ()))) in fail ("mere-ruby: expected , or ] in index hash" ++ parsing_file ()))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unterminated index hash")) in fail "mere-ruby: unterminated index hash")
 
@@ -10672,8 +10685,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let v = (match args with Cons (VStr h, _) -> mkstr (sget h) | _ -> mkstr "") in
           let _ = (match v with VStr _ -> map_set hng_store (hng_key v) c | _ -> ()) in v))
     // Hash[k => v, ...] / Hash[{...}] and Array[...] constructor syntax.
-    else if str_eq c "Hash" && str_eq name "[]" then
-      (match args with Cons (VHsh h, _) -> mkhash (hderef h) | _ -> mkhash Nil)
+    // Hash[...] takes three shapes: one Hash, one array of [k, v] pairs, or a
+    // flat even-length argument list. Only the first was built; the other two
+    // answered an empty hash, which is a wrong answer rather than an error.
+    else if str_eq c "Hash" && str_eq name "[]" then hash_bracket world args
     else if str_eq c "Array" && str_eq name "[]" then arr_new args
     // A subclass inherits the [] constructor: MyArray[1, 2] builds an array
     // tagged with the subclass, WITHOUT calling the subclass's #initialize
@@ -10681,8 +10696,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "[]" && obj_is_a world c "Array" then
       (let v = arr_new args in
        let _ = map_set hng_store (hng_key v) c in v)
-    else if str_eq name "[]" && obj_is_a world c "Hash" then
-      (match args with Cons (VHsh h, _) -> mkhash (hderef h) | _ -> mkhash Nil)
+    else if str_eq name "[]" && obj_is_a world c "Hash" then hash_bracket world args
     else if str_eq c "Hash" && str_eq name "try_convert" then
       (match args with
        | Cons (VHsh hid, _) -> VHsh hid
@@ -15397,6 +15411,35 @@ and rng_is_int = fn (v: Val) -> match v with VInt _ -> true | _ -> false
 // only if `lo <=> hi` answers -- so `(1.."x")` is an ArgumentError rather than
 // a range that raises later, somewhere else. An absent bound constrains
 // nothing, and an object is taken at its word if its class defines `<=>`.
+// `Hash[...]`: one Hash, one array of [k, v] pairs (a 1-element pair means a
+// nil value), or a flat even-length list. An odd list or a wrong-sized pair is
+// an ArgumentError, in ruby's words.
+and hash_bracket = fn world -> fn (args: Val list) ->
+  match args with
+  | Cons (VHsh h, Nil) -> mkhash (hderef h)
+  | Cons (VArr id, Nil) -> mkhash (hash_from_pairs world (deref id))
+  | Nil -> mkhash Nil
+  | _ ->
+    // a flat list IS the internal shape (k, v, k, v ...)
+    (if imod (val_list_len args) 2 == 0 then mkhash args
+     else raise_exc world "ArgumentError" "odd number of arguments for Hash")
+
+and hash_from_pairs = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (x, rest) ->
+    (match x with
+     | VArr pid ->
+       (match deref pid with
+        | Cons (k, Cons (v, Nil)) -> Cons (k, Cons (v, hash_from_pairs world rest))
+        | Cons (k, Nil) -> Cons (k, Cons (VNil, hash_from_pairs world rest))
+        | other ->
+          (let n = val_list_len other in
+           let _ = raise_exc world "ArgumentError"
+             ("invalid number of elements (" ++ str_of_int n ++ " for 1..2)") in Nil))
+     | _ ->
+       (let _ = raise_exc world "ArgumentError" "wrong element type (expected array)" in Nil))
+
 and rng_num_kind = fn (v: Val) ->
   match v with
   | VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true
