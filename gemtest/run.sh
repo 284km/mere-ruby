@@ -32,9 +32,17 @@ while IFS= read -r line; do
   # what the reference ruby makes of it, in the same gem home
   rout=$(GEM_HOME="$gem_home" GEM_PATH="$gem_home" \
          ruby "$here/load_one.rb" "$g" 2>/dev/null)
+  # 120s, and a gem that needs longer is a failure in practice: every gem that
+  # loads at all loads in seconds. Without the alarm a gem that never finishes
+  # (rubocop's cop loading slows to a crawl, see KNOWN_GAPS) hangs the gate.
   out=$(GEM_HOME="$gem_home" GEM_PATH="$gem_home" RUBYGEMS_LIB="$rubygems/lib" \
-        "$mr" $inc "$here/load_one.rb" "$g" 2>/dev/null)
+        perl -e 'alarm 120; exec @ARGV' "$mr" $inc "$here/load_one.rb" "$g" 2>/dev/null)
   code=$?
+  if [ $code -eq 142 ] || [ $code -eq 14 ]; then
+    echo "TIMEOUT $g  (over 120s)"
+    bad=$((bad + 1))
+    continue
+  fi
   if [ $code -ne 0 ]; then
     # a native signal: the interpreter died rather than raising
     echo "CRASH $g  (exit $code)"

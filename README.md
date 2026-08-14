@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 107 programs, byte-for-byte
+./run_corpus.sh                                  # 108 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -94,22 +94,27 @@ source, `zlib`'s compression comes from a vendored Mere package (above)
 with its stream classes shipped as Ruby source over it, and `rbconfig`,
 `thread` and `fiber` are satisfied without a file (`fiber.so` is loaded
 before any Ruby runs in CRuby 3.x, so `require "fiber"` returns false
-there too). `socket` and `openssl` are not answered: the first is a
-capability of the interpreter that nothing has needed until now —
-rubocop-rails is the first gem in the sample to ask for it — and the
-second is a binding to a third-party C library, deliberately out of
-scope.
+there too). `socket` is answered by the interpreter itself: `TCPSocket`,
+`TCPServer` and the rest are Ruby source over Mere's own socket FFI, so a
+program here really does connect, listen, accept and exchange bytes —
+zero bytes included. UDP and UNIX sockets exist but refuse
+(`NotImplementedError`), because a socket library that silently does
+nothing moves a failure away from its cause. `openssl` is not answered: a
+TLS stack is a binding to a third-party C library, deliberately out of
+scope, and linking one would make the (native-only) dependency reach the
+Wasm build too.
 
 Against a sample of 29 installed gems — of which the reference ruby itself
 loads **27** here, two needing a Rails application to exist —
-`gemtest/run.sh` loads **19** with a CRuby stdlib on `-I` and **17** on
-what mere-ruby ships. **Every one of the eight that fail stops at a C
-extension**: `openssl` ×4, `socket` ×3, protobuf ×1. Nothing else in the
-sample is blocked by the interpreter. devise loads the whole
-activesupport / i18n / concurrent-ruby stack before it reaches `openssl`,
-and rubocop-rails reads unicode-display_width's gzipped `Marshal` index,
-compiles rubocop-ast's node patterns, and gets through most of rubocop
-itself before asking for `socket`.
+`gemtest/run.sh` loads **20** with a CRuby stdlib on `-I` and **17** on
+what mere-ruby ships. Of the seven that do not: six stop at a C extension
+(`openssl` ×5, protobuf ×1) and one, rubocop-rails, runs out of the gate's
+120-second budget while loading rubocop's ~600 cop files (see
+[KNOWN_GAPS.md](KNOWN_GAPS.md) — it is a slowdown, not a hang). devise
+loads the whole activesupport / i18n / concurrent-ruby stack before it
+reaches `openssl`, and rubocop-rails reads unicode-display_width's gzipped
+`Marshal` index, compiles rubocop-ast's node patterns, and gets through
+rubocop's cops one by one.
 
 ## In the browser
 

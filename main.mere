@@ -282,6 +282,24 @@ import "mgz/deflate.mere";
 // id (as str) -> the array's contents (a Val list). Arrays are handles
 // (VArr id) into it, so aliases share one mutable list. A fresh id is
 // map_len arr_store (arrays are never removed — memory grows, acceptable).
+
+// ---- TCP (the `socket` capability) ---------------------------------------
+// Mere's own byte-level socket FFI: the same externs mkv uses. Reads and
+// writes cross through the shared byte arena (`mem_*`), so a payload with a
+// zero byte survives. The Wasm host has no sockets and stubs these to -1.
+extern fn tcp_connect: str -> int -> int;
+extern fn tcp_listen: int -> int;
+extern fn tcp_accept: int -> int;
+extern fn tcp_read: int -> int -> int -> int;
+extern fn tcp_write: int -> int -> int -> int;
+extern fn tcp_close: int -> unit;
+extern fn tcp_set_timeout: int -> int -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_to_str: int -> int -> str;
+extern fn mem_copy_str: int -> int -> str -> int;
+extern fn mem_set_u8: int -> int -> int -> int;
+// one arena block, reused: 64 KiB is the read size and the write chunk.
+
 let arr_store = map_new () in
 let arr_new = fn (xs: Val list) ->
   let id = map_len arr_store in
@@ -570,6 +588,12 @@ let is_anon_cls = fn (c: str) ->
 // below, since it recurses through the receiver's constants.
 // singleton methods on handle-based values (String/Array/Hash): keyed by
 // "str:<h>" / "arr:<h>" / "hsh:<h>" -> the value's singleton class name.
+// one arena block, reused: 64 KiB is the read size and the write chunk.
+let tcp_buf = map_new ();
+let tcp_arena = fn () ->
+  if map_has tcp_buf "p" then (match map_get tcp_buf "p" with VInt p -> p | _ -> 0)
+  else (let p = mem_alloc 65536 in let _ = map_set tcp_buf "p" (VInt p) in p);
+
 let hng_store = map_new ();
 // class variables (@@x): "Cls@x" -> value, resolved up the superclass chain.
 let cvars = map_new ();
@@ -673,6 +697,16 @@ let rec str_has_nul_go = fn (s: str) -> fn (i: int) ->
   else if ord (char_at s i) == 0 then true
   else str_has_nul_go s (i + 1);
 let str_has_nul = fn (s: str) -> str_has_nul_go s 0;
+// Copy a string into the byte arena and write it. `mem_copy_str` walks a C
+// string and stops at a zero byte, so a payload that has one is copied byte by
+// byte instead -- the same split the output path makes.
+let rec tcp_put_bytes = fn (p: int) -> fn (s: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then () else (let _ = mem_set_u8 p i (ord (char_at s i)) in tcp_put_bytes p s (i + 1) n);
+let tcp_put = fn (fd: int) -> fn (s: str) ->
+  let p = tcp_arena () in
+  let n = str_len s in
+  let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
+  tcp_write fd p n;
 let out_write_raw = fn (s: str) ->
   if str_has_nul s then print_bytes (bytes_of_str s) else print_no_nl s;
 let out_print = fn (s: str) ->
@@ -1123,6 +1157,11 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
             && is_alpha (char_at s (i + 2)) then
       let j = scan_ident s (i + 2) in
       Cons (TSym (substring s (i + 1) j), lex_go s j)
+    // `:$&` / `:$'` / `:$1` -- a symbol naming one of the punctuation globals.
+    // rubocop's Style/PerlBackrefs matches on exactly these.
+    else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "$"
+            && is_gvar_punct (char_at s (i + 2)) then
+      Cons (TSym (substring s (i + 1) (i + 3)), lex_go s (i + 3))
     else if str_eq c ":" && i + 1 < str_len s && is_op_sym_start (char_at s (i + 1)) then
       // operator symbols: :=== :== :<=> :+ :[] :[]= etc.
       let (opname, j) = scan_op_sym s (i + 1) in
@@ -1651,6 +1690,14 @@ and hd_strip = fn (lines: str list) -> fn (n: int) ->
 and hd_join = fn (lines: str list) ->
   match lines with Nil -> "" | Cons (l, r) -> l ++ "\n" ++ hd_join r
 
+// the one-character globals: $& $` $' $+ $~ $! $@ $/ $\\ $, $; $. $< $> $_ $* $$ $? $: $0-9
+and is_gvar_punct = fn (c: str) ->
+  str_eq c "&" || str_eq c "`" || str_eq c "'" || str_eq c "+" || str_eq c "~" ||
+  str_eq c "!" || str_eq c "@" || str_eq c "/" || str_eq c "," || str_eq c ";" ||
+  str_eq c "." || str_eq c "<" || str_eq c ">" || str_eq c "_" || str_eq c "*" ||
+  str_eq c "$" || str_eq c "?" || str_eq c ":" || str_eq c "\"" ||
+  str_eq c "\\" || str_eq c "=" || is_digit c
+
 and is_op_sym_start = fn (c: str) ->
   str_eq c "=" || str_eq c "<" || str_eq c ">" || str_eq c "+" || str_eq c "-" ||
   str_eq c "*" || str_eq c "/" || str_eq c "%" || str_eq c "[" || str_eq c "!" ||
@@ -1970,6 +2017,14 @@ let skip_then = fn toks ->
 let rec skip_nls = fn toks ->
   match toks with Cons (TNL, r) -> skip_nls r | _ -> toks;
 
+// A symbol token whose name is not identifier-shaped can only have been
+// written in quoted form (`:'"'`), and inside a ternary that is the colon plus
+// a string rather than a symbol.
+let sym_looks_quoted = fn (sy: str) ->
+  if str_len sy == 0 then true
+  else (let c = char_at sy 0 in
+        if is_alpha c || str_eq c "_" || str_eq c "@" || str_eq c "$" then false else true);
+
 // a range `lo..hi` / `lo...hi` sits above the binary operators (very low
 // precedence in Ruby).
 let rec parse_expr = fn toks ->
@@ -1978,6 +2033,14 @@ let rec parse_expr = fn toks ->
   | Cons (TP op, rest) ->
     if str_eq op "?" then
       let (then_e, r2) = parse_expr (skip_nls rest) in
+      // Inside a ternary, a `:` that the lexer read as the start of a QUOTED
+      // symbol is the ternary's colon and a string: rexml writes
+      // `x.include?('"')?"'":'"'` with no spaces, where `:'"'` is a colon and
+      // the one-character string. Ruby resolves it the same way, from context.
+      let r2 = (match r2 with
+                | Cons (TSym sy, r2b) ->
+                  if sym_looks_quoted sy then Cons (TP ":", Cons (TStrL sy, r2b)) else r2
+                | _ -> r2) in
       (match r2 with
        | Cons (TP colon, r3) ->
          if str_eq colon ":" then let (else_e, r4) = parse_expr (skip_nls r3) in (ETern (cond, then_e, else_e), r4)
@@ -5266,7 +5329,9 @@ and parse_def_inner = fn toks ->
     let (name, r) =
       (match r0 with
        | Cons (TP dot, r1) ->
-         if str_eq dot "." then
+         // `def Klass::name` is the same definition as `def Klass.name` (rexml
+         // writes `def Document::entity_expansion_text_limit=(val)`).
+         if str_eq dot "." || str_eq dot "::" then
            (match r1 with
             | Cons (TId n2, r2) -> if str_eq name0 "self" then ("self." ++ n2, r2) else (name0 ++ "#" ++ n2, r2)
             // def self.<< / def obj.== / def obj.[] — an operator singleton
@@ -5298,7 +5363,11 @@ and parse_def_inner = fn toks ->
          if str_eq eq "=" then
            (match r1 with
             | Cons (TP lp, Cons (TId _, Cons (TP rp, _))) ->
-              if str_eq lp "(" && (str_eq rp ")" || str_eq rp ",") then (name ++ "=", r1) else (name, r)
+              // `=` third: the parameter has a DEFAULT (`def variables=( vars={} )`,
+              // rexml). An endless def cannot reach here -- the lexer marks its
+              // spaced `=` as a different token.
+              if str_eq lp "(" && (str_eq rp ")" || str_eq rp "," || str_eq rp "=")
+              then (name ++ "=", r1) else (name, r)
             // `def foobar=(*)` — a setter taking an anonymous splat, and
             // `def location=((a, b))` — one whose parameter destructures.
             | Cons (TP lp, Cons (TP st, _)) ->
@@ -6990,6 +7059,10 @@ and sym_plain = fn (sy: str) ->
               else if str_eq (char_at sy 0) "@" || str_eq (char_at sy 0) "$" then 1
               else 0) in
     if st >= str_len sy then false
+    // `:$&` and friends: a global's name may be one punctuation character, and
+    // ruby prints those unquoted.
+    else if st == 1 && str_eq (char_at sy 0) "$" && str_len sy == 2
+            && is_gvar_punct (char_at sy 1) then true
     else if is_alpha (char_at sy st) || str_eq (char_at sy st) "_" then sym_ident_rest sy (st + 1)
     else false
 
@@ -11226,6 +11299,40 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else raise_exc world "Zlib::GzipFile::Error" "not in gzip format")
        else
          mkstr (bytevec_to_str (inflate (bytevec_pad v) (zlib_body_start v))))
+    // The socket capability: the raw fd operations the `socket` library (Ruby
+    // source, see stdlib_src) builds TCPSocket / TCPServer on. Only names
+    // starting with __ are answered, so a program's own `class Socket` is not
+    // silently given these.
+    else if str_eq c "Socket" && str_len name > 2 && str_eq (substring name 0 2) "__" then
+      (if str_eq name "__connect" then
+         (match args with
+          | Cons (VStr h, Cons (VInt port, _)) -> VInt (tcp_connect (sget h) port)
+          | _ -> VInt (0 - 1))
+       else if str_eq name "__listen" then
+         (match args with Cons (VInt port, _) -> VInt (tcp_listen port) | _ -> VInt (0 - 1))
+       else if str_eq name "__accept" then
+         (match args with Cons (VInt fd, _) -> VInt (tcp_accept fd) | _ -> VInt (0 - 1))
+       else if str_eq name "__read" then
+         // a short read is normal; "" means the peer closed (or the read timed
+         // out). The bytes are BINARY -- nothing here knows their encoding.
+         (match args with
+          | Cons (VInt fd, Cons (VInt cap, _)) ->
+            (let p = tcp_arena () in
+             let n = tcp_read fd p (if cap > 65536 then 65536 else cap) in
+             if n <= 0 then (let v = mkstr "" in
+                             let _ = (match v with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in v)
+             else (let v = mkstr (mem_to_str p n) in
+                   let _ = (match v with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in v))
+          | _ -> mkstr "")
+       else if str_eq name "__write" then
+         (match args with
+          | Cons (VInt fd, Cons (VStr h, _)) -> VInt (tcp_put fd (sget h))
+          | _ -> VInt (0 - 1))
+       else if str_eq name "__close" then
+         (match args with Cons (VInt fd, _) -> (let _ = tcp_close fd in VNil) | _ -> VNil)
+       else if str_eq name "__timeout" then
+         (match args with Cons (VInt fd, Cons (VInt ms, _)) -> VInt (tcp_set_timeout fd ms) | _ -> VInt 0)
+       else VNil)
     // TracePoint#enable / #disable tell the interpreter whether to fire at all.
     else if str_eq c "TracePoint" && str_eq name "__active" then
       (let _ = (match args with
@@ -16664,6 +16771,286 @@ and shq_go = fn (s2: str) -> fn (i: int) -> fn (acc: str) ->
 // no copy of. "" means "not one of ours, go look for a file".
 and stdlib_src = fn (name: str) ->
   let n = (if ends_with_rb name then substring name 0 (str_len name - 3) else name) in
+  // socket: TCPSocket / TCPServer over the interpreter's fd primitives, which
+  // are Mere's own TCP externs. UNIX and UDP sockets are NOT provided as
+  // working classes -- they exist and raise NotImplementedError, because a
+  // socket library that silently does nothing moves the failure away from its
+  // cause (see KNOWN_GAPS on `require "enumerator"`).
+  // io/wait: the readiness predicates. A mere-ruby socket read BLOCKS -- there
+  // is no select here -- so waiting for readability is the identity, and
+  // `ready?` answers "unknown" rather than a guess. net/protocol and resolv
+  // require this file for those three names.
+  if str_eq n "io/wait" then
+    "class BasicSocket\n" ++
+    "  def wait_readable(timeout = nil)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def wait_writable(timeout = nil)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def wait(*args)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def ready?\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class IO\n" ++
+    "  def wait_readable(timeout = nil)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def wait_writable(timeout = nil)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def ready?\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "end\n"
+  else if str_eq n "socket" then
+    "class SocketError < StandardError; end\n" ++
+    "class BasicSocket\n" ++
+    "  def self.for_fd(fd)\n" ++
+    "    s = allocate\n" ++
+    "    s.__setup(fd)\n" ++
+    "    s\n" ++
+    "  end\n" ++
+    "  def __setup(fd)\n" ++
+    "    @fd = fd\n" ++
+    "    @closed = false\n" ++
+    "    @rbuf = \"\".b\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def fileno\n" ++
+    "    @fd\n" ++
+    "  end\n" ++
+    "  def closed?\n" ++
+    "    @closed\n" ++
+    "  end\n" ++
+    "  def close\n" ++
+    "    return nil if @closed\n" ++
+    "    @closed = true\n" ++
+    "    Socket.__close(@fd)\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def write(data)\n" ++
+    "    s = data.to_s\n" ++
+    "    n = Socket.__write(@fd, s)\n" ++
+    "    raise SocketError, \"write failed\" if n < 0\n" ++
+    "    n\n" ++
+    "  end\n" ++
+    "  def <<(data)\n" ++
+    "    write(data)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def print(*args)\n" ++
+    "    args.each \{ |a| write(a.to_s) }\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def puts(*args)\n" ++
+    "    if args.empty?\n" ++
+    "      write(\"\\n\")\n" ++
+    "    else\n" ++
+    "      args.each do |a|\n" ++
+    "        s = a.to_s\n" ++
+    "        write(s)\n" ++
+    "        write(\"\\n\") unless s.end_with?(\"\\n\")\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def flush\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def sync\n" ++
+    "    true\n" ++
+    "  end\n" ++
+    "  def sync=(v)\n" ++
+    "    v\n" ++
+    "  end\n" ++
+    "  def setsockopt(*args)\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def __fill\n" ++
+    "    return false if @closed\n" ++
+    "    chunk = Socket.__read(@fd, 65536)\n" ++
+    "    return false if chunk.nil? || chunk.empty?\n" ++
+    "    @rbuf << chunk\n" ++
+    "    true\n" ++
+    "  end\n" ++
+    "  def read(len = nil)\n" ++
+    "    if len.nil?\n" ++
+    "      @rbuf << \"\" while __fill\n" ++
+    "      out = @rbuf\n" ++
+    "      @rbuf = \"\".b\n" ++
+    "      return out\n" ++
+    "    end\n" ++
+    "    @rbuf << \"\" while @rbuf.bytesize < len && __fill\n" ++
+    "    return nil if @rbuf.empty? && len > 0\n" ++
+    "    out = @rbuf[0, len]\n" ++
+    "    @rbuf = @rbuf[len, @rbuf.bytesize - len] || \"\".b\n" ++
+    "    out\n" ++
+    "  end\n" ++
+    "  def readpartial(maxlen)\n" ++
+    "    __fill if @rbuf.empty?\n" ++
+    "    raise EOFError, \"end of file reached\" if @rbuf.empty?\n" ++
+    "    read(maxlen < @rbuf.bytesize ? maxlen : @rbuf.bytesize)\n" ++
+    "  end\n" ++
+    "  def recv(maxlen)\n" ++
+    "    readpartial(maxlen)\n" ++
+    "  end\n" ++
+    "  def send(data, flags = 0)\n" ++
+    "    write(data)\n" ++
+    "  end\n" ++
+    "  def eof?\n" ++
+    "    return false unless @rbuf.empty?\n" ++
+    "    !__fill\n" ++
+    "  end\n" ++
+    "  def gets(sep = \"\\n\")\n" ++
+    "    i = @rbuf.index(sep)\n" ++
+    "    while i.nil?\n" ++
+    "      break unless __fill\n" ++
+    "      i = @rbuf.index(sep)\n" ++
+    "    end\n" ++
+    "    return nil if @rbuf.empty?\n" ++
+    "    if i.nil?\n" ++
+    "      out = @rbuf\n" ++
+    "      @rbuf = \"\".b\n" ++
+    "      out\n" ++
+    "    else\n" ++
+    "      read(i + sep.bytesize)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def each_line(sep = \"\\n\")\n" ++
+    "    while (line = gets(sep))\n" ++
+    "      yield line\n" ++
+    "    end\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def timeout=(sec)\n" ++
+    "    Socket.__timeout(@fd, (sec * 1000).to_i)\n" ++
+    "    sec\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class IPSocket < BasicSocket\n" ++
+    "  def addr\n" ++
+    "    [\"AF_INET\", @port.to_i, @host.to_s, @host.to_s]\n" ++
+    "  end\n" ++
+    "  def peeraddr\n" ++
+    "    addr\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class TCPSocket < IPSocket\n" ++
+    "  def initialize(host = nil, port = nil, local_host = nil, local_port = nil)\n" ++
+    "    @host = host\n" ++
+    "    @port = port\n" ++
+    "    fd = Socket.__connect(host.to_s, port.to_i)\n" ++
+    "    if fd < 0\n" ++
+    "      raise Errno::ECONNREFUSED, \"Connection refused - connect(2) for #\{host}:#\{port}\"\n" ++
+    "    end\n" ++
+    "    __setup(fd)\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class TCPServer < TCPSocket\n" ++
+    "  def initialize(host = nil, port = nil)\n" ++
+    "    port = host if port.nil?\n" ++
+    "    @host = \"0.0.0.0\"\n" ++
+    "    @port = port.to_i\n" ++
+    "    fd = Socket.__listen(@port)\n" ++
+    "    raise Errno::EADDRINUSE, \"Address already in use - bind(2) for port #\{port}\" if fd < 0\n" ++
+    "    @port = Socket.__port(fd) if @port == 0\n" ++
+    "    __setup(fd)\n" ++
+    "  end\n" ++
+    "  def accept\n" ++
+    "    fd = Socket.__accept(@fd)\n" ++
+    "    raise SocketError, \"accept failed\" if fd < 0\n" ++
+    "    TCPSocket.for_fd(fd)\n" ++
+    "  end\n" ++
+    "  def accept_nonblock\n" ++
+    "    accept\n" ++
+    "  end\n" ++
+    "  def listen(backlog)\n" ++
+    "    0\n" ++
+    "  end\n" ++
+    "  def addr\n" ++
+    "    [\"AF_INET\", @port.to_i, \"0.0.0.0\", \"0.0.0.0\"]\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class Socket < BasicSocket\n" ++
+    "  AF_UNSPEC = 0\n" ++
+    "  AF_UNIX = 1\n" ++
+    "  AF_INET = 2\n" ++
+    "  AF_INET6 = 30\n" ++
+    "  PF_UNSPEC = 0\n" ++
+    "  PF_UNIX = 1\n" ++
+    "  PF_INET = 2\n" ++
+    "  PF_INET6 = 30\n" ++
+    "  SOCK_STREAM = 1\n" ++
+    "  SOCK_DGRAM = 2\n" ++
+    "  SOL_SOCKET = 65535\n" ++
+    "  SO_REUSEADDR = 4\n" ++
+    "  SO_KEEPALIVE = 8\n" ++
+    "  IPPROTO_TCP = 6\n" ++
+    "  IPPROTO_UDP = 17\n" ++
+    "  TCP_NODELAY = 1\n" ++
+    "  SHUT_RD = 0\n" ++
+    "  SHUT_WR = 1\n" ++
+    "  SHUT_RDWR = 2\n" ++
+    "  def self.tcp(host, port)\n" ++
+    "    s = TCPSocket.new(host, port)\n" ++
+    "    return s unless block_given?\n" ++
+    "    begin\n" ++
+    "      yield s\n" ++
+    "    ensure\n" ++
+    "      s.close\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.gethostname\n" ++
+    "    \"localhost\"\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class Addrinfo\n" ++
+    "  def self.tcp(host, port)\n" ++
+    "    new(host, port)\n" ++
+    "  end\n" ++
+    "  def initialize(host, port)\n" ++
+    "    @host = host\n" ++
+    "    @port = port\n" ++
+    "  end\n" ++
+    "  def ip_address\n" ++
+    "    @host.to_s\n" ++
+    "  end\n" ++
+    "  def ip_port\n" ++
+    "    @port.to_i\n" ++
+    "  end\n" ++
+    "  def afamily\n" ++
+    "    Socket::AF_INET\n" ++
+    "  end\n" ++
+    "  def pfamily\n" ++
+    "    Socket::PF_INET\n" ++
+    "  end\n" ++
+    "  def socktype\n" ++
+    "    Socket::SOCK_STREAM\n" ++
+    "  end\n" ++
+    "  def to_s\n" ++
+    "    \"#\{@host}:#\{@port}\"\n" ++
+    "  end\n" ++
+    "  def inspect\n" ++
+    "    \"#<Addrinfo: #\{@host}:#\{@port} TCP>\"\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class UDPSocket < IPSocket\n" ++
+    "  def initialize(*args)\n" ++
+    "    raise NotImplementedError, \"UDPSocket is not implemented (mere-ruby speaks TCP only)\"\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class UNIXSocket < BasicSocket\n" ++
+    "  def initialize(*args)\n" ++
+    "    raise NotImplementedError, \"UNIXSocket is not implemented (mere-ruby speaks TCP only)\"\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class UNIXServer < UNIXSocket\n" ++
+    "end\n"
+  else
   // Thread bodies run synchronously here, so a monitor never actually blocks:
   // the counter is kept so mon_owned? and re-entry answer honestly.
   if str_eq n "monitor" then
@@ -20502,7 +20889,10 @@ and register_builtin_consts = fn (u: unit) ->
     Cons ("NoMemoryError", Cons ("SecurityError", Cons ("SystemStackError",
     Cons ("SignalException", Cons ("Interrupt", Cons ("SystemExit",
     Cons ("FloatDomainError", Cons ("StopIteration",
-    Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+    // the errno classes a socket raises
+    Cons ("Errno::ENOENT", Cons ("Errno::ECONNREFUSED", Cons ("Errno::ECONNRESET",
+    Cons ("Errno::EADDRINUSE", Cons ("Errno::EPIPE", Cons ("Errno::EAGAIN",
+    Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
   // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
   // distinct names for it rather than distinct sources.
   // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
@@ -21364,7 +21754,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              else if already && (if is_module then false else true) && was_module then
                let _ = raise_exc world "TypeError" (name ++ " is not a class") in ()
              else if already && (if is_module then false else true) && (if str_eq super0 "" then false else true) &&
-                     (let existing = (if map_has sup name then map_get sup name else "Object") in
+                     // the roots' superclasses are implicit -- there is no table
+                     // entry -- so reading an absent one as "Object" made
+                     // `class Object < BasicObject` (pp.rb) a mismatch. Putting
+                     // Object in the table instead makes every ancestor walk
+                     // recurse: this is the narrow half of that fix.
+                     (let existing = (if map_has sup name then map_get sup name
+                                      else if str_eq name "Object" then "BasicObject"
+                                      else "Object") in
                       if str_eq existing super0 then false else true) then
                let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ name) in ()
              else ()) in
@@ -24175,7 +24572,15 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set sup "LoadError" "ScriptError" in
   let _ = map_set sup "IOError" "StandardError" in
   let _ = map_set sup "SystemCallError" "StandardError" in
+  // File IS an IO in ruby, and rexml reopens `class File < IO`: without the
+  // relation registered that reopening is a superclass mismatch.
+  let _ = map_set sup "File" "IO" in
   let _ = map_set sup "Errno::ENOENT" "SystemCallError" in
+  let _ = map_set sup "Errno::ECONNREFUSED" "SystemCallError" in
+  let _ = map_set sup "Errno::ECONNRESET" "SystemCallError" in
+  let _ = map_set sup "Errno::EADDRINUSE" "SystemCallError" in
+  let _ = map_set sup "Errno::EPIPE" "SystemCallError" in
+  let _ = map_set sup "Errno::EAGAIN" "SystemCallError" in
   let _ = map_set sup "EOFError" "IOError" in
   let _ = map_set sup "ThreadError" "StandardError" in
   let _ = map_set sup "fatal" "Exception" in

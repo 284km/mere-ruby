@@ -141,14 +141,40 @@ assigns. No installed gem does it — the tree was searched before the two were
 left out. Fixing it means letting them read as ordinary identifiers in
 expression position, which is where their statement syntax is decided.
 
-## rubocop stops at `socket.so`
+## `socket` speaks TCP, and only TCP
 
-`require "rubocop"` now gets through rubocop-ast (pattern compiler, generated
-matchers, visitor registry) and most of rubocop itself; it ends at a C
-extension, which is the documented boundary. Everything before it was a real
-gap and is fixed: an alias that did not fire `method_added` (which left the
-visitor registry short and made the pattern compiler recurse forever — that
-is what the old "recurses without bound" entry here was), `%<name>s` /
-`%{name}` format references, `:!~`, a space-marked `[` after a complete
-expression, `define_method :"on_#{type}" do` losing its block, and
-`protected :a, :b` not clearing an earlier `private`.
+`TCPSocket`, `TCPServer`, `BasicSocket`, `IPSocket`, `Socket` (constants and
+`Socket.tcp`) and a minimal `Addrinfo` are real, over Mere's own socket FFI:
+connect, listen, accept, read, write, close, timeout. `UDPSocket`,
+`UNIXSocket` and `UNIXServer` exist — code that mentions them loads — but
+every one of their methods raises `NotImplementedError` rather than silently
+doing nothing.
+
+Two known holes inside TCP itself:
+
+- **A listener cannot report the port it got.** `TCPServer.new(0)` binds an
+  ephemeral port, and there is no `getsockname` in the FFI to read it back, so
+  `#addr` answers 0. Tests that ask the kernel for a free port need a fixed one
+  here.
+- **There is no `select`.** A read blocks; `io/wait`'s `wait_readable` is the
+  identity and `ready?` answers nil rather than guessing.
+
+## Loading all of rubocop slows to a crawl
+
+`require "rubocop"` now gets past `socket` and through 537 of its ~600
+requires, then effectively stops: the rate falls from 196 requires in the
+first 30 seconds to 5 in the sixth, with 4–15 GB resident, and the process is
+eventually killed. It is NOT a loop — progress continues the whole time, and
+the node-pattern compiler (the earlier suspect) compiles map_to_set's pattern
+in isolation without trouble. Something in the interpreter is superlinear in
+the number of definitions already made. The gem gate now bounds each gem at
+120 seconds so this reports as `TIMEOUT` instead of hanging the run.
+
+## The Wasm playground cannot currently be rebuilt
+
+`docs/build.sh` fails in the vendored mgz package (`unbound variable: skip` in
+`deflate.mere`, Wasm codegen only) with the current Mere. The checked-in
+`docs/mere-ruby.wasm` still works; it was built with an earlier compiler. The
+socket capability's host imports are stubbed in `docs/index.html` for the day
+the build works again, but they are unverified for exactly that reason.
+
