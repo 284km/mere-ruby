@@ -5734,7 +5734,9 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   | VClass x -> (match vb with VClass y -> str_eq x y | _ -> false)
   | VSym x -> (match vb with VSym y -> str_eq x y | _ -> false)
   | VRange (a, b, c) ->
-    (match vb with VRange (d, e, f) -> a == d && b == e && (if c then f else (if f then false else true)) | _ -> false)
+    (match vb with
+     | VRange (d, e, f) -> rb_eq a d && rb_eq b e && (if c then f else (if f then false else true))
+     | _ -> false)
   | VExc (c, m) -> (match vb with VExc (d, n) -> str_eq c d && str_eq m n | _ -> false)
   | VMain -> (match vb with VMain -> true | _ -> false)
   // regexes / procs / bindings compare by pattern text / handle identity (and
@@ -7113,6 +7115,18 @@ and inspect = fn (v: Val) ->
       let _ = map_delete insp_seen (str_of_int id) in
       r
   | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs xs "" ++ "}"
+  // a Range shows its bounds INSPECTED -- `("a".."c").inspect` is
+  // `"a".."c"`, where its to_s is `a..c`. An absent bound shows as nothing.
+  | VRange (lo, hi, excl) ->
+    // A missing bound shows as nothing (`1..`, `..5`) -- but a range with
+    // NEITHER bound has to show something, and ruby writes `nil..nil` there.
+    (match lo with
+     | VNil -> (match hi with VNil -> "nil" | _ -> "")
+     | _ -> inspect lo)
+    ++ (if excl then "..." else "..")
+    ++ (match hi with
+        | VNil -> (match lo with VNil -> "nil" | _ -> "")
+        | _ -> inspect hi)
   | VRat (n, d) -> "(" ++ to_s v ++ ")"
   | VCpx (r, i) ->
     // Rational components are parenthesized in inspect, and a parenthesized
@@ -7409,7 +7423,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // stays a Range, a float bound stays a float, a Time bound stays a Time.
     (let lo = eval_e env world blk loe in
      let hi = eval_e env world blk hie in
-     VRange (lo, hi, excl))
+     if rng_bad_bounds world lo hi then raise_exc world "ArgumentError" "bad value for range"
+     else VRange (lo, hi, excl))
   | ETern (cond, then_e, else_e) ->
     if truthy (eval_e env world blk cond) then eval_e env world blk then_e
     else eval_e env world blk else_e
@@ -10001,6 +10016,45 @@ and coerce_int_args = fn env -> fn world -> fn (args: Val list) ->
               | _ -> a) in
     Cons (a2, coerce_int_args env world rest)
 
+// A count / index argument is an Integer or something that converts to one:
+// ruby truncates a Float and refuses everything else by name. `[1,2,3].first(2.5)`
+// answered 1 here -- the Float went through untouched and was taken for the
+// no-argument form. (`sum` is deliberately NOT one of these: its argument is an
+// initial value, and `[1,2].sum(0.0)` has to stay a Float.)
+and coerce_count_args = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  match args with
+  | Nil -> Nil
+  | Cons (a, rest) ->
+    let a2 = (match a with
+              | VFlt f -> VInt (int_of_float f)
+              | VStr _ -> raise_exc world "TypeError" "no implicit conversion of String into Integer"
+              | VNil -> raise_exc world "TypeError" "no implicit conversion from nil into Integer"
+              | VSym _ -> raise_exc world "TypeError" "no implicit conversion of Symbol into Integer"
+              | VBool b -> raise_exc world "TypeError"
+                             ("no implicit conversion of " ++ (if b then "true" else "false") ++ " into Integer")
+              | VObj _ ->
+                (if responds world a "to_int"
+                 then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+                       invoke_val_c env world nb a "to_int" Nil false)
+                 else raise_exc world "TypeError"
+                        ("no implicit conversion of " ++ class_name a ++ " into Integer"))
+              | _ -> a) in
+    // ...and a negative count is refused, in the words the method uses: ruby
+    // says "attempt to take negative size" for take and "negative array size"
+    // for first, and a Range adds "(or size too big)" to the latter.
+    let _ = (match a2 with
+             | VInt n ->
+               (if n < 0 then
+                  (let _ = raise_exc world "ArgumentError"
+                     (if str_eq name "take" then "attempt to take negative size"
+                      else if str_eq name "drop" then "attempt to drop negative size"
+                      else if (match recv with VRange (_, _, _) -> true | _ -> false)
+                      then "negative array size (or size too big)"
+                      else "negative array size") in ())
+                else ())
+             | _ -> ()) in
+    Cons (a2, coerce_count_args env world recv name rest)
+
 and coerce_dyck_args = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list) ->
   let conv = (match recv with VStr _ -> "to_str" | VArr _ -> "to_ary" | _ -> "") in
   if str_eq conv "" then args
@@ -10184,10 +10238,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               // the index/count arguments take an Integer, and CRuby asks a
               // non-Integer for #to_int before giving up. (`intersect?` and
               // friends want an Array, which the same machinery converts.)
-              else if (match recv with VStr _ -> true | VArr _ -> true | _ -> false)
+              // a Range's first / last / take / drop count the same way an
+              // Array's do, so they take the same Integer conversion
+              // the count-taking ones convert or refuse by name; the rest keep
+              // the older, permissive conversion (`sum`'s argument is a value,
+              // not a count, and `[]` also takes a Range or a Regexp)
+              else if (match recv with VStr _ -> true | VArr _ -> true | VRange (_, _, _) -> true | _ -> false)
+                      && (str_eq name "first" || str_eq name "last"
+                          || str_eq name "take" || str_eq name "drop")
+              then coerce_count_args env world recv name args0
+              else if (match recv with VStr _ -> true | VArr _ -> true | VRange (_, _, _) -> true | _ -> false)
                       && (str_eq name "at" || str_eq name "delete_at" || str_eq name "[]"
-                          || str_eq name "first" || str_eq name "last"
-                          || str_eq name "take" || str_eq name "drop"
                           || str_eq name "rotate" || str_eq name "fetch"
                           || str_eq name "sum" || str_eq name "byteslice")
               then coerce_int_args env world args0
@@ -10536,7 +10597,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       let lo = (match args with Cons (a, _) -> a | _ -> VNil) in
       let hi = (match args with Cons (_, Cons (b, _)) -> b | _ -> VNil) in
       let excl = (match args with Cons (_, Cons (_, Cons (e, _))) -> truthy e | _ -> false) in
-      VRange (lo, hi, excl)
+      if rng_bad_bounds world lo hi then raise_exc world "ArgumentError" "bad value for range"
+      else VRange (lo, hi, excl)
     else if str_eq c "Hash" && str_eq name "new" then
       (let hv = mkhash Nil in (match args with Cons (d, _) -> (match hv with VHsh id -> let _ = hdflt_set id d in hv | _ -> hv) | _ -> hv))
     else if str_eq c "Array" && str_eq name "new" then array_new_args args
@@ -13691,6 +13753,9 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name "year" || str_eq name "month" || str_eq name "mon" || str_eq name "day" ||
     str_eq name "mday" || str_eq name "hour" || str_eq name "min" || str_eq name "sec" ||
     str_eq name "wday" || str_eq name "yday" || str_eq name "usec" ||
+    // Time compares, which is what makes (t1..t2) a range
+    str_eq name "<=>" || str_eq name "<" || str_eq name "<=" ||
+    str_eq name ">" || str_eq name ">=" ||
     str_eq name "+" || str_eq name "-"
   else false
 
@@ -13912,6 +13977,8 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   // whether it has to patch around an old ruby's Range#minmax.
   else if str_eq cls "Range" then
     is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
+  else if str_eq cls "Numeric" || str_eq cls "Integer" || str_eq cls "Float" then
+    is_num_method name || is_prim_method name
   else if str_eq cls "Module" || str_eq cls "Class" then
     is_module_method name || is_prim_method name
   // zeitwerk branches on UnboundMethod.method_defined?(:bind_call)
@@ -14653,6 +14720,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      then arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
                      else if is_num o then arr_new (Cons (o, Cons (recv, Nil)))
                      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: coerce non-numeric")) in fail "mere-ruby: coerce non-numeric"))
+        // Float#coerce answers two Floats: `2.5.coerce(1)` is [1.0, 2.5], not
+        // [1, 2.5] -- the point of coercing is that both sides end up alike.
+        | VFlt _ -> (if is_num o then arr_new (Cons (VFlt (to_f o), Cons (recv, Nil)))
+                     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: coerce non-numeric")) in fail "mere-ruby: coerce non-numeric"))
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0") | _ -> (let _ = map_set prim_missing "n" (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
@@ -15322,6 +15393,46 @@ and rng_is_int = fn (v: Val) -> match v with VInt _ -> true | _ -> false
 // end", which is what makes `a[1..]` and `a[..3]` work.
 // does this range contain the value? A comparison, so it holds for numbers,
 // strings and anything else with <=>; an absent bound does not constrain.
+// A Range's bounds have to be comparable with each other -- ruby builds one
+// only if `lo <=> hi` answers -- so `(1.."x")` is an ArgumentError rather than
+// a range that raises later, somewhere else. An absent bound constrains
+// nothing, and an object is taken at its word if its class defines `<=>`.
+and rng_num_kind = fn (v: Val) ->
+  match v with
+  | VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat (_, _) -> true
+  | _ -> false
+
+and rng_obj_cls = fn world -> fn (v: Val) ->
+  let (meths, sup, ocls, ivars) = world in
+  match v with VObj id -> map_get ocls (str_of_int id) | _ -> ""
+
+and rng_bad_bounds = fn world -> fn (lo: Val) -> fn (hi: Val) ->
+  match lo with
+  | VNil -> false
+  | _ ->
+    (match hi with
+     | VNil -> false
+     | _ ->
+       // every numeric kind compares with every other: a Bignum bound is what
+       // sidekiq-pro's (0..2**64) has, and `is_num` does not count those.
+       if rng_num_kind lo && rng_num_kind hi then false
+       else if (match lo with VStr _ -> true | _ -> false)
+               && (match hi with VStr _ -> true | _ -> false) then false
+       else if (match lo with VSym _ -> true | _ -> false)
+               && (match hi with VSym _ -> true | _ -> false) then false
+       else (match lo with
+             // an object is comparable if its class defines `<=>` -- in ruby
+             // OR as a builtin. Time and Rational carry theirs in the
+             // dispatcher, not the method table, and (Time.now..Time.now) is
+             // a range sidekiq-pro builds.
+             | VObj _ ->
+               (let c = rng_obj_cls world lo in
+                if has_meth world c "<=>" || builtin_anc_has world c "<=>" || builtin_obj_has c "<=>"
+                then false else true)
+             | VRat (_, _) -> false
+             | VCpx (_, _) -> true
+             | _ -> true))
+
 and rng_covers = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
   (match lo with VNil -> true | _ -> cmp_vals v lo >= 0)
   && (match hi with
@@ -22068,11 +22179,19 @@ and undef_top = fn meths -> fn (names: str list) ->
 // remove each `cls#name` method entry.
 // `undef name` raises NameError when the method is not defined on the class
 // (nor inherited / a primitive), matching Ruby.
+and builtin_anc_has = fn world -> fn (cls: str) -> fn (name: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  if str_eq cls "" then false
+  else if builtin_has_meth cls name then true
+  else if map_has sup cls then builtin_anc_has world (map_get sup cls) name
+  else false
+
 and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   match names with
   | Nil -> ()
   | Cons (n, rest) ->
-    if has_meth world cls n || is_prim_method n then undef_check world cls rest
+    if has_meth world cls n || is_prim_method n || builtin_anc_has world cls n
+    then undef_check world cls rest
     else (let _ = raise_exc world "NameError" ("undefined method '" ++ n ++ "' for class '" ++ cls ++ "'") in ())
 
 and undef_all = fn meths -> fn (cls: str) -> fn (names: str list) ->

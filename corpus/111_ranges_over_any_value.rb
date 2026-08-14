@@ -40,3 +40,30 @@ p err { (..5).min }
 p err { (..5).first }
 p err { (..5).each { } }
 p err { (1..5).each_entry.to_a.size }
+
+# A Range's bounds have to be comparable with each other: ruby builds one only
+# if `lo <=> hi` answers, so this is an ArgumentError rather than a range that
+# fails later somewhere else.
+p err { Range.new(1, "x") }
+p err { (1.."x") }
+p err { Range.new(Object.new, Object.new) }
+p Range.new(nil, nil).inspect          # neither bound: "nil..nil", not ".."
+p [(1..).inspect, (..5).inspect, ("a".."c").inspect, ("a".."c").to_s]
+p Range.new("a", "c") == ("a".."c")    # equal by VALUE, not by handle
+p [(1..2).eql?(1..2), (1..2) == (1...2)]
+
+# a count argument converts (Float truncates) or is refused by name
+p [(2..5).first(2.5), (2..5).take(2.0), [1, 2, 3].first(2.5), [1, 2, 3].last(1.9)]
+p err { (2..5).first(-1) }
+p err { (2..5).take(-1) }
+p err { [1, 2, 3].first("x") }
+p err { [1, 2, 3].drop(-1) }
+p [1, 2].sum(0.0)                      # not a count: stays a Float
+
+# Numeric#coerce, and undef'ing what a class inherits from a builtin
+p [1.coerce(2.0), 2.5.coerce(1), 1.coerce(2)]
+class NoCoerce < Numeric
+  undef_method :coerce
+end
+p NoCoerce.new.respond_to?(:coerce)
+p Integer.instance_method(:coerce).owner
