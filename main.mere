@@ -3185,7 +3185,9 @@ and parse_primary = fn toks ->
       let pds = plain_defaults lds in
       let allp2 = (match pds with
                    | Nil -> allp
-                   | _ -> if psplat_any allp then allp else list_append_str allp (Cons ("*", Nil))) in
+                   // named, so it can be told apart from a splat the source
+                   // actually wrote: `->(a, b=1){}.parameters` must not report it.
+                   | _ -> if psplat_any allp then allp else list_append_str allp (Cons ("*__opt", Nil))) in
       (ELambda (allp2, defaults_prologue pds bb), r4)
     else (let __fm = ("mere-ruby: unexpected token: " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let __fm = ("mere-ruby: unexpected end of input" ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
@@ -11575,6 +11577,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "receiver" then mrecv
        else if str_eq name "owner" then (if str_eq mown "" then VClass (class_name mrecv) else VClass mown)
        else if str_eq name "arity" then VInt (bm_arity world mown mnm)
+       else if str_eq name "parameters" then
+         bm_params world (if str_eq mown "" then class_name mrecv else mown) mnm
        else if str_eq name "unbind" then
          (let uid = map_len ocls in
           let _ = map_set ocls (str_of_int uid) "UnboundMethod" in
@@ -12054,6 +12058,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "name" then VSym unm
        else if str_eq name "owner" then VClass ucls
        else if str_eq name "arity" then VInt (bm_arity world ucls unm)
+       else if str_eq name "parameters" then bm_params world ucls unm
        else if str_eq name "inspect" || str_eq name "to_s" then
          mkstr ("#<UnboundMethod: " ++ ucls ++ "#" ++ unm ++ ">")
        else if str_eq name "==" || str_eq name "eql?" then
@@ -12382,11 +12387,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match map_get proc_store (str_of_int pid) with
        (h, ps, body, e) ->
          let is_lam = map_has lambda_ids (str_of_int pid) in
-         (match strip_block_params ps with
+         (match strip_marker_params ps with
           // no explicit params: the numbered parameters _1.._N, required for a
           // lambda and optional for a proc.
           | Nil -> arr_new (numbered_params_meta is_lam 1 (max_numbered_stmts body))
-          | ps1 -> arr_new (param_meta_list is_lam ps1)))
+          | ps1 -> arr_new (param_meta_of is_lam ps1 (block_defaults body))))
     else if str_eq name "arity" then
       (match map_get proc_store (str_of_int pid) with
        (h, ps0, body, e) ->
@@ -12395,10 +12400,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match strip_block_params ps with
           // no explicit params: arity is the highest numbered parameter used.
           | Nil -> VInt (max_numbered_stmts body)
-          // explicit params: count of positional params, negative when a
-          // splat makes the count a lower bound.
-          | ps1 -> let n = list_str_len (pos_params ps1) in
-                   if has_splat ps1 then VInt (0 - n) else VInt n))
+          // explicit params: the MANDATORY positional ones, negative when a
+          // splat or a default makes the count a lower bound. The defaults
+          // live in the body prologue, not in the parameter list.
+          | ps1 -> VInt (blk_arity (map_has lambda_ids (str_of_int pid)) ps1 (block_defaults body))))
     else dispatch_prim env world blk recv name args vischeck
   | VBind bid ->
     // binding.eval(str) runs str against the captured env; local_variable_get
@@ -12444,15 +12449,89 @@ and numbered_params_meta = fn (is_lam: bool) -> fn (i: int) -> fn (n: int) ->
   if i > n then Nil
   else Cons (arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym ("_" ++ str_of_int i), Nil))), numbered_params_meta is_lam (i + 1) n)
 // #parameters metadata for an explicit block/lambda parameter list.
-and param_meta_list = fn (is_lam: bool) -> fn (ps: str list) ->
+// the parameters with a default dropped, and whether any has one: a block's
+// defaults are a prologue in its body, so the list alone cannot say.
+and params_wo_defaults = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
   match ps with
   | Nil -> Nil
+  | Cons ("*__opt", rest) -> params_wo_defaults rest ds
+  | Cons (p, rest) -> if bm_has_default ds p then params_wo_defaults rest ds else Cons (p, params_wo_defaults rest ds)
+
+// `&blk` is a parameter (ruby reports it); the empty-params sentinel is not.
+and strip_marker_params = fn (params: str list) ->
+  match params with
+  | Nil -> Nil
+  | Cons (p, r) -> if str_eq p empty_bp_marker then strip_marker_params r else Cons (p, strip_marker_params r)
+
+// A proc and a lambda count the same mandatory arguments; they differ in
+// whether an OPTIONAL one makes the count a lower bound (a lambda checks its
+// arity, a proc does not). A required keyword adds one argument to both.
+and blk_arity = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Expr) list) ->
+  let n = mandatory_pos_count (pos_params ps) ds + (if kw_any ps ds true then 1 else 0) in
+  // `**k` is not a positional splat: it does not relax a proc's count.
+  if pos_splat_any ps || (is_lam && (block_default_any (pos_params ps) ds || kw_any ps ds false))
+  then 0 - (n + 1) else n
+
+and pos_splat_any = fn (ps: str list) ->
+  match ps with
+  | Nil -> false
+  | Cons (p, r) ->
+    (str_len p > 0 && str_eq (char_at p 0) "*" && (if str_len p >= 2 && str_eq (substring p 0 2) "**" then false else true))
+    || pos_splat_any r
+
+// required (`want_req`) or optional keyword parameters, `**rest` counting as
+// an optional one.
+and kw_any = fn (ps: str list) -> fn (ds: (str * Expr) list) -> fn (want_req: bool) ->
+  match ps with
+  | Nil -> false
   | Cons (p, rest) ->
-    let pair = (if str_len p >= 2 && str_eq (substring p 0 2) "**" then arr_new (Cons (VSym "keyrest", Cons (VSym (substring p 2 (str_len p)), Nil)))
-                else if str_len p > 0 && str_eq (char_at p 0) "*" then arr_new (Cons (VSym "rest", Cons (VSym (substring p 1 (str_len p)), Nil)))
-                else if str_len p > 0 && str_eq (char_at p 0) "&" then arr_new (Cons (VSym "block", Cons (VSym (substring p 1 (str_len p)), Nil)))
-                else arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym p, Nil)))) in
-    Cons (pair, param_meta_list is_lam rest)
+    (if str_len p >= 2 && str_eq (substring p 0 2) "**" then (if want_req then kw_any rest ds want_req else true)
+     else if str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":" then
+       (let has = bm_has_default ds p || bm_has_default ds (substring p 0 (str_len p - 1)) in
+        if (if want_req then (if has then false else true) else has) then true else kw_any rest ds want_req)
+     else kw_any rest ds want_req)
+
+// how many positional parameters MUST be given a value.
+and mandatory_pos_count = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
+  match ps with
+  | Nil -> 0
+  | Cons (p, rest) ->
+    if str_len p > 0 && (str_eq (char_at p 0) "*" || str_eq (char_at p 0) "&") then mandatory_pos_count rest ds
+    else if bm_has_default ds p then mandatory_pos_count rest ds
+    else 1 + mandatory_pos_count rest ds
+
+and block_default_any = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
+  match ps with
+  | Nil -> false
+  | Cons (p, rest) -> bm_has_default ds p || block_default_any rest ds
+
+and param_meta_of = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Expr) list) ->
+  match ps with
+  | Nil -> Nil
+  // the splat a lambda with defaults carries internally is not a parameter
+  | Cons ("*__opt", rest) -> param_meta_of is_lam rest ds
+  // an attr_writer's argument has no name to report
+  | Cons ("__attr_v", rest) -> Cons (arr_new (Cons (VSym "req", Nil)), param_meta_of is_lam rest ds)
+  | Cons (p, rest) ->
+    let pair =
+      (if str_len p >= 2 && str_eq (substring p 0 2) "**" then
+         (let n = substring p 2 (str_len p) in
+          if str_eq n "nil" then arr_new (Cons (VSym "nokey", Nil))
+          else arr_new (Cons (VSym "keyrest", Cons (VSym (if str_eq n "" then "**" else n), Nil))))
+       else if str_len p > 0 && str_eq (char_at p 0) "*" then
+         (let n = substring p 1 (str_len p) in
+          arr_new (Cons (VSym "rest", Cons (VSym (if str_eq n "" then "*" else n), Nil))))
+       else if str_len p > 0 && str_eq (char_at p 0) "&" then
+         (let n = substring p 1 (str_len p) in
+          arr_new (Cons (VSym "block", Cons (VSym (if str_eq n "" then "&" else n), Nil))))
+       // a keyword is stored as "name:"; it is required unless it has a default
+       else if str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":" then
+         (let n = substring p 0 (str_len p - 1) in
+          arr_new (Cons (VSym (if bm_has_default ds p || bm_has_default ds n then "key" else "keyreq"), Cons (VSym n, Nil))))
+       else if bm_has_default ds p then arr_new (Cons (VSym "opt", Cons (VSym p, Nil)))
+       // a block's positional parameters are all optional; a lambda's are not
+       else arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym p, Nil)))) in
+    Cons (pair, param_meta_of is_lam rest ds)
 and max_numbered_stmts = fn (body: Stmt list) ->
   match body with
   | Nil -> 0
@@ -13442,23 +13521,41 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
 // Method#arity from a user method's params/defaults (-1 for builtins).
 and bm_arity = fn world -> fn (owner: str) -> fn (nm: str) ->
   let (meths, sup, ocls, ivars) = world in
-  if str_eq owner "" then 0 - 1
-  else if map_has meths (owner ++ "#" ++ nm) then
+  if map_has meths (owner ++ "#" ++ nm) then
     (match map_get meths (owner ++ "#" ++ nm) with
-     | Meth (params, defaults, _) -> bm_arity_go params defaults 0 false)
+     | Meth (params, defaults, _) -> bm_arity_go params defaults 0 false false false)
   else if map_has meths nm then
-    (match map_get meths nm with Meth (params, defaults, _) -> bm_arity_go params defaults 0 false)
+    (match map_get meths nm with Meth (params, defaults, _) -> bm_arity_go params defaults 0 false false false)
   else 0 - 1
-and bm_arity_go = fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (req: int) -> fn (opt: bool) ->
+// The keywords contribute ONE argument between them (the hash): a required
+// keyword makes it mandatory, an optional one only makes the count a lower
+// bound. `def f(y:, z:)` is arity 1, `def f(x, y: 1)` is -2.
+and bm_arity_go = fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (req: int) -> fn (opt: bool) -> fn (kreq: bool) -> fn (kopt: bool) ->
   match params with
-  | Nil -> if opt then 0 - (req + 1) else req
+  | Nil ->
+    (let req = (if kreq then req + 1 else req) in
+     if opt || (kopt && (if kreq then false else true)) then 0 - (req + 1) else req)
   | Cons (pp, rest) ->
-    if str_len pp > 0 && (str_eq (char_at pp 0) "*" || str_eq (char_at pp 0) "&") then
-      bm_arity_go rest defaults req (opt || str_eq (char_at pp 0) "*")
+    if str_len pp >= 2 && str_eq (substring pp 0 2) "**" then
+      bm_arity_go rest defaults req opt kreq true
+    else if str_len pp > 0 && (str_eq (char_at pp 0) "*" || str_eq (char_at pp 0) "&") then
+      bm_arity_go rest defaults req (opt || str_eq (char_at pp 0) "*") kreq kopt
     else if str_len pp > 0 && str_eq (char_at pp (str_len pp - 1)) ":" then
-      bm_arity_go rest defaults req opt
-    else if bm_has_default defaults pp then bm_arity_go rest defaults req true
-    else bm_arity_go rest defaults (req + 1) opt
+      (if bm_has_default defaults pp then bm_arity_go rest defaults req opt kreq true
+       else bm_arity_go rest defaults req opt true kopt)
+    else if bm_has_default defaults pp then bm_arity_go rest defaults req true kreq kopt
+    else bm_arity_go rest defaults (req + 1) opt kreq kopt
+
+// Method#parameters: the declaration in order. Whether a name is required or
+// optional is the presence of a DEFAULT, which is kept in its own list.
+and bm_params = fn world -> fn (owner: str) -> fn (nm: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let key = owner ++ "#" ++ nm in
+  if map_has meths key then
+    (match map_get meths key with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
+  else if map_has meths nm then
+    (match map_get meths nm with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
+  else arr_new Nil
 and bm_has_default = fn (defaults: (str * Expr) list) -> fn (pp: str) ->
   match defaults with
   | Nil -> false
@@ -21800,8 +21897,10 @@ and add_attrs = fn world -> fn (cls: str) -> fn (mode: str) -> fn (syms: str lis
     let _ =
       if str_eq mode "w" || str_eq mode "rw" then
         map_set meths (cls ++ "#" ++ name ++ "=")
-          (Meth (Cons ("v", Nil), Nil,
-                 Cons (SIVarAssign (name, EVar "v"), Cons (SReturn (EVar "v"), Nil))))
+          // the parameter is nameless in ruby (the writer is C-defined), and
+          // `parameters` reports it that way: [[:req]].
+          (Meth (Cons ("__attr_v", Nil), Nil,
+                 Cons (SIVarAssign (name, EVar "__attr_v"), Cons (SReturn (EVar "__attr_v"), Nil))))
       else () in
     add_attrs world cls mode rest
 
