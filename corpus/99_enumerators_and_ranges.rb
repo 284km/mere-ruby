@@ -76,3 +76,21 @@ p [10.%(3), 6543.21.%(137), 1.+(2), 7./(2), 2.**(10), 5.<=>(3), 1.<(2)]
 p [10.modulo(3), 10.div(3), 10.fdiv(4), 10.remainder(3), (-7).remainder(3), (-7).div(3)]
 # Float#% is floored, like Integer#%: the sign follows the divisor
 p [6543.21 % 137, 7.5 % 2, -7.5 % 2, -7 % 3, 7 % -3]
+
+# Float#next_float / #prev_float step by one ulp. (There is no way to look at
+# a float's bits here, so the step is found by doubling and halving until the
+# sum changes -- which lands on exactly the same value.)
+p [1.0.next_float, 1.0.prev_float, 2.0.next_float, 0.5.prev_float]
+p [1.0.next_float > 1.0, 1.0.prev_float < 1.0, 1e10.next_float > 1e10]
+p [(1.0.next_float - 1.0) > 0, 1.0.next_float.prev_float == 1.0]
+
+# object_id is stable per object, and equal values that ARE the same object
+# (integers, symbols, nil) answer the same id
+o1 = Object.new
+o2 = Object.new
+p [o1.object_id == o1.object_id, o1.object_id == o2.object_id]
+p [1.object_id == 1.object_id, :sym.object_id == :sym.object_id]
+p [nil.object_id == nil.object_id, true.object_id == true.object_id]
+p [o1.object_id.class, 1.object_id.class]
+s1 = "a"
+p s1.object_id == s1.object_id
