@@ -394,6 +394,10 @@ let enc_name = map_new () in
 // ivars through, and bootstraptest PRINTS its results -- a MatchData that
 // printed as "#<object>" is how this was found.
 let md_whole = map_new () in
+// A Time's instant, by object id. Comparison (cmp_vals) has no world to reach
+// the ivars through, and a Range of Times has to be able to compare its
+// bounds -- `(t1..t2).cover?(t)` is the case that found this.
+let time_inst = map_new () in
 // dummy encodings (stateful/wide converters, CRuby's list); a dummy is never
 // ASCII-compatible, and neither is any UTF-16/UTF-32 variant.
 let enc_is_dummy = fn (nm: str) ->
@@ -6219,6 +6223,14 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
       (match vb with
        | VStr y -> let y = sget y in str_compare x y
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
+    // two Times order by their instant (recorded in time_ord when built)
+    | VObj x ->
+      (match vb with
+       | VObj y when map_has time_inst (str_of_int x) && map_has time_inst (str_of_int y) ->
+         (let a1 = map_get time_inst (str_of_int x) in
+          let b1 = map_get time_inst (str_of_int y) in
+          if a1 < b1 then 0 - 1 else if b1 < a1 then 1 else 0)
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
     | VSym x -> (match vb with VSym y -> str_compare x y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
     // Array <=> Array: element-wise, then by length (Ruby semantics).
     | VArr x -> (match vb with VArr y -> arr_cmp (deref x) (deref y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
@@ -8526,6 +8538,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
        if has_meth world ocl op then
          invoke world noblk va0 ocl op (Cons (eval_e env world blk b, Nil))
+       // a builtin-backed class may answer the operator without a method-table
+       // entry: Time compares by its instant, and `t1 < t2` has to reach that
+       // rather than fall through to "no method".
+       else if builtin_obj_has ocl op then
+         invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // a yielder in a generator block: y << value.
        else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
@@ -8551,7 +8568,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // (not the meths table), so route the operator there rather than
        // falling through to rb_eq (which is object identity).
        else if (str_eq op "==" || str_eq op "eql?")
-               && (str_eq ocl "Method" || str_eq ocl "UnboundMethod" || exc_is_a world ocl "Exception")
+               && (str_eq ocl "Method" || str_eq ocl "UnboundMethod" || str_eq ocl "Time"
+                   || exc_is_a world ocl "Exception")
                && (if has_meth world ocl op then false else true) then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // Time's arithmetic is a primitive, not an entry in the method table.
@@ -8746,6 +8764,9 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                   | VArr id -> deref id
                   | VHsh xs -> let xs = hderef xs in hash_to_a xs   // *hash spreads as [k, v] pairs
                   | VNil -> Nil   // [*nil] is empty
+                  // `[*(0..2)]` is [0, 1, 2]: a splat asks for to_a, and a
+                  // Range has one. It used to spread as the Range itself.
+                  | VRange (lo, hi, excl) -> range_vals world lo hi excl
                   // a non-array splat calls to_a if the object responds to
                   // it: a real/singleton method, or a user respond_to? that
                   // answers true (covering method_missing mocks).
@@ -10611,7 +10632,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               || str_eq name "day" || str_eq name "mday" || str_eq name "hour"
               || str_eq name "min" || str_eq name "sec"
               || str_eq name "wday" || str_eq name "yday" || str_eq name "usec"
-              || str_eq name "+" || str_eq name "-") then
+              || str_eq name "+" || str_eq name "-"
+              // two Times compare by their instant, not by identity:
+              // `Time.at(1) + 1 == Time.at(2)` is true
+              || str_eq name "==" || str_eq name "eql?" || str_eq name "<=>"
+              || str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">=") then
     (match recv with
      | VObj oid ->
        let (_, _, _, iv9) = world in
@@ -10619,7 +10644,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // #to_i is epoch seconds. A Time built from calendar parts only carries
        // the packed ordinal, which is monotonic but is NOT an epoch, so it has
        // to be converted rather than handed back.
-       if str_eq name "to_i" then prim_time_epoch world recv
+       if str_eq name "==" || str_eq name "eql?" || str_eq name "<=>"
+          || str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">=" then
+         (let x = (match prim_time_epoch world recv with VInt n -> n | _ -> 0) in
+          match args with
+          | Cons (VObj oid2, _) ->
+            (let (_, _, ocls2, _) = world in
+             if str_eq (map_get ocls2 (str_of_int oid2)) "Time" then
+               (let y = (match prim_time_epoch world (VObj oid2) with VInt n -> n | _ -> 0) in
+                let d = (if x < y then 0 - 1 else if y < x then 1 else 0) in
+                if str_eq name "==" || str_eq name "eql?" then VBool (d == 0)
+                else if str_eq name "<=>" then VInt d
+                else if str_eq name "<" then VBool (d < 0)
+                else if str_eq name "<=" then VBool (d <= 0)
+                else if str_eq name ">" then VBool (d > 0)
+                else VBool (d >= 0))
+             else (if str_eq name "==" || str_eq name "eql?" then VBool false else VNil))
+          | _ -> (if str_eq name "==" || str_eq name "eql?" then VBool false else VNil))
+       else if str_eq name "to_i" then prim_time_epoch world recv
        // #to_f is the same instant as a Float. The clock here has one-second
        // resolution, so the fraction is always .0 -- Process.clock_gettime is
        // the one to measure with.
@@ -10862,6 +10904,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let id = map_len ocls9 in
        let _ = map_set ocls9 (str_of_int id) "Time" in
        let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord args)) in
+       let _ = map_set time_inst (str_of_int id) (time_ord args) in
        let _ = (if str_eq name "utc" || str_eq name "gm" then map_set iv9 (str_of_int id ++ "@__utc") (VBool true) else ()) in
        VObj id)
     else if str_eq c "Time" && (str_eq name "now" || str_eq name "at") then
@@ -10873,6 +10916,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | Cons (VFlt f, _) -> int_of_float f
                    | _ -> int_of_float (time ())) in
        let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord_of_epoch secs)) in
+       let _ = map_set time_inst (str_of_int id) (time_ord_of_epoch secs) in
        let _ = map_set iv9 (str_of_int id ++ "@__epoch") (VInt secs) in
        VObj id)
     else if str_eq name "allocate" && (str_eq c "Array" || str_eq c "Hash" || str_eq c "String") then
@@ -13190,7 +13234,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
       flow_value (run_block world blk newblk (Cons (recv, Nil)))
     // Object#tap: run the block with the receiver, then return the receiver.
     else if str_eq name "tap" then
-      let _ = flow_value (run_block world blk newblk (Cons (recv, Nil))) in recv
+      // `x.tap { break v }` answers v -- a break leaves the METHOD, and tap
+      // returning its receiver regardless swallowed it.
+      (match run_block world blk newblk (Cons (recv, Nil)) with
+       | FBreak bv -> bv
+       | other -> (let _ = flow_value other in recv))
     // recv.send(:m, args) { block } — forward the block to the sent method.
     else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
       (match args with
@@ -14017,7 +14065,7 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name "wday" || str_eq name "yday" || str_eq name "usec" ||
     // Time compares, which is what makes (t1..t2) a range
     str_eq name "<=>" || str_eq name "<" || str_eq name "<=" ||
-    str_eq name ">" || str_eq name ">=" ||
+    str_eq name ">" || str_eq name ">=" || str_eq name "eql?" ||
     str_eq name "+" || str_eq name "-"
   else false
 
@@ -21101,6 +21149,7 @@ and make_time_at = fn world -> fn (secs: int) ->
   let id = map_len ocls9 in
   let _ = map_set ocls9 (str_of_int id) "Time" in
   let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord_of_epoch secs)) in
+  let _ = map_set time_inst (str_of_int id) (time_ord_of_epoch secs) in
   let _ = map_set iv9 (str_of_int id ++ "@__epoch") (VInt secs) in
   VObj id
 and time_ord_of_epoch = fn (secs: int) ->
@@ -21445,6 +21494,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
      let id = map_len ocls in
      let _ = map_set ocls (str_of_int id) "Time" in
      let _ = map_set ivars (str_of_int id ++ "@__t") (VInt (time_ord args)) in
+     let _ = map_set time_inst (str_of_int id) (time_ord args) in
      VObj id)
   else
   let (meths, sup, ocls, ivars) = world in

@@ -94,3 +94,23 @@ p [nil.object_id == nil.object_id, true.object_id == true.object_id]
 p [o1.object_id.class, 1.object_id.class]
 s1 = "a"
 p s1.object_id == s1.object_id
+
+# A splat asks for to_a, and a Range has one: `[*(0..2)]` is [0, 1, 2].
+p [*(0..2)]
+p [*(0...3)]
+p [*("a".."c")]
+p [1, *(2..4), 5]
+def splat99(*a)
+  a
+end
+p splat99(*(1..3))
+
+# `break` inside a block leaves the METHOD, tap included
+p false.tap { break true }
+p 1.23.tap { break :b }
+p [1, 2].tap { |a| a.first }
+
+# two Times compare by their instant, not by identity
+t99 = Time.at(1)
+p [(t99 + 1) == Time.at(2), t99 < Time.at(2), (t99 <=> Time.at(2)), t99 == t99]
+p [(t99..Time.at(3)).class, (t99..Time.at(3)).cover?(Time.at(2))]
