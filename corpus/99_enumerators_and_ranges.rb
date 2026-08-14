@@ -69,3 +69,10 @@ endless = (1..Float::INFINITY)
 p endless.begin
 p endless.include?(10**9)
 p endless.cover?(0)
+
+# An operator written as a METHOD is the operator, and the named forms are the
+# same arithmetic: `10.%(3)` and `10.modulo(3)` are `10 % 3`.
+p [10.%(3), 6543.21.%(137), 1.+(2), 7./(2), 2.**(10), 5.<=>(3), 1.<(2)]
+p [10.modulo(3), 10.div(3), 10.fdiv(4), 10.remainder(3), (-7).remainder(3), (-7).div(3)]
+# Float#% is floored, like Integer#%: the sign follows the divisor
+p [6543.21 % 137, 7.5 % 2, -7.5 % 2, -7 % 3, 7 % -3]
