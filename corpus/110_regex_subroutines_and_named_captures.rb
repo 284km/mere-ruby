@@ -51,3 +51,13 @@ p RFC3986.match("not a uri").nil?
 
 # the socket errnos exist, and EWOULDBLOCK IS EAGAIN here
 p [Errno::EINPROGRESS.ancestors.include?(SystemCallError), Errno::EWOULDBLOCK.name]
+
+# MatchData prints as the WHOLE match (to_s) and shows its groups (inspect).
+m110 = /t(r)(u)e/.match("a true story")
+p m110.to_s
+p m110.inspect
+print m110
+puts
+p [m110[0], m110[1], m110.pre_match, m110.post_match]
+p /(?<x>b)(?<y>c)/.match("abcd").inspect
+p /nope/.match("abc").inspect

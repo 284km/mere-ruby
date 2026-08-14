@@ -35,9 +35,23 @@ begin
 rescue Exception => e
   warn "load warning: #{e.class}: #{e.message}"
 end
+# CRuby's runner does not run the test source bare: it writes
+#
+#   class BT_Skip < Exception; end; def skip(msg) = raise(BT_Skip, msg.to_s)
+#   print(begin; <src>; rescue BT_Skip; $!.message; end)
+#
+# so a test may call `skip`, and what it prints is the value's to_s. Ours
+# printed the value the same way but omitted the prelude, which turned every
+# skipping test into an error about an undefined `skip`.
+PRELUDE = <<~RB
+  class BT_Skip < Exception; end
+  def skip(msg)
+    raise(BT_Skip, msg.to_s)
+  end
+RB
 PAIRS.each_with_index do |(e, c, flag), i|
   File.write("#{out}/p#{i}.exp", e)
-  File.write("#{out}/p#{i}.rb", c)
+  File.write("#{out}/p#{i}.rb", "#{PRELUDE}begin\n#{c}\nrescue BT_Skip\n$!.message\nend\n")
   File.write("#{out}/p#{i}.flags", flag) if flag
 end
 puts PAIRS.size

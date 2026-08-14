@@ -1,9 +1,11 @@
 #!/bin/sh
-# Why do the bootstraptest pairs ERROR? `all.sh` counts pass / fail / err, and
-# err (a non-zero exit) is the biggest of the three -- but a count does not say
-# whether it is 300 causes or 3. This groups the error MESSAGES.
+# Why do the bootstraptest pairs not pass? `all.sh` counts pass / fail / err,
+# but a count does not say whether it is 300 causes or 3. This groups them:
+# an ERR (non-zero exit) by its message, a FAIL (ran, wrong output) by what it
+# printed instead.
 #
 #   ./bootstraptest/triage.sh <path/to/ruby/checkout> [pairs_dir]
+#   ./bootstraptest/triage.sh --fail <path/to/ruby/checkout> [pairs_dir]
 #
 # Writes bootstraptest/ERRORS.txt (one line per erroring pair, message first,
 # sorted so the same cause groups together) and prints the top causes with a
@@ -14,16 +16,30 @@
 # look different.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
-ruby_src="${1:?usage: triage.sh <ruby-checkout> [pairs_dir]}"
+mode=err
+if [ "${1:-}" = "--fail" ]; then mode=fail; shift; fi
+ruby_src="${1:?usage: triage.sh [--fail] <ruby-checkout> [pairs_dir]}"
 dir="${2:-/tmp/mrb_bt}"
 [ -d "$dir" ] || { echo "no pairs in $dir -- run all.sh first"; exit 2; }
 out="$here/ERRORS.txt"
+[ "$mode" = fail ] && out="$here/FAILS.txt"
 : > "$out"
 
 for rb in "$dir"/*/p*.rb; do
   [ -f "$rb" ] || continue
   flags=""
   [ -f "${rb%.rb}.flags" ] && flags=$(cat "${rb%.rb}.flags")
+  if [ "$mode" = fail ]; then
+    # a FAIL ran to completion and printed the wrong thing: group by what it
+    # printed, next to what was wanted
+    got=$(perl -e 'alarm 60; exec @ARGV' "$here/../mere-ruby" $flags --eval-print "$rb" 2>/dev/null)
+    [ $? -ne 0 ] && continue
+    want=$(cat "${rb%.rb}.exp")
+    [ "$got" = "$want" ] && continue
+    printf 'want %s | got %s\t%s\n' "$(printf '%s' "$want" | tr '\n' ' ' | cut -c1-60)" \
+      "$(printf '%s' "$got" | tr '\n' ' ' | cut -c1-60)" "$rb" >> "$out"
+    continue
+  fi
   msg=$(perl -e 'alarm 60; exec @ARGV' "$here/../mere-ruby" $flags --eval-print "$rb" 2>&1 >/dev/null)
   code=$?
   [ $code -eq 0 ] && continue
@@ -43,7 +59,7 @@ for rb in "$dir"/*/p*.rb; do
 done
 
 sort "$out" -o "$out"
-echo "erroring pairs: $(wc -l < "$out" | tr -d ' ')"
+echo "$mode pairs: $(wc -l < "$out" | tr -d ' ')"
 echo
 echo "top causes:"
 cut -f1 "$out" | sort | uniq -c | sort -rn | head -20
