@@ -205,20 +205,24 @@ its own Concerns first.
 ## A method call costs ~12 KB that is never given back
 
 The interpreter allocates in a region it never reclaims, so **memory is linear
-in the number of calls executed** — 100k calls is 1.2 GB, 200k is 2.4 GB, 400k
-is 4.9 GB (`bench/alloc_per_call.sh`). Definitions are cheap by comparison:
-1600 classes with two methods each is 0.10s and 75 MB.
+in the number of calls executed** — 100k calls is 0.9 GB, 200k is 1.8 GB, 400k
+is 3.6 GB (`bench/alloc_per_call.sh`). Definitions are cheap by comparison:
+1600 classes with two methods each is 0.06s and 25 MB.
 
 That is the whole of the rubocop timeout. `require "rubocop"` is ~250 files
-and some millions of calls; it reaches tens of GB, the machine starts faulting
-for every access, and the gem gate's 120-second bound reports `TIMEOUT`. For a
-library that does finish, `rubocop-ast` is CRuby 0.3s / 50 MB against
-mere-ruby 6.5s / 5.45 GB — 20× the time and 108× the memory.
+and some millions of calls; it reaches tens of GB (117 GB peak footprint on a
+ten-minute run), the machine starts faulting for every access, and the gem
+gate's 120-second bound reports `TIMEOUT`. For a library that does finish,
+`rubocop-ast` is CRuby 0.3s / 50 MB against mere-ruby 4.5s / 3.2 GB — 15× the
+time and 64× the memory.
 
-A profile of the slow load spends half its samples in `strcmp`, which is a
-symptom rather than a cause: with a working set that never stops growing, the
-string compare behind every map lookup and every `str_eq` in the dispatch
-chains is a cache miss.
+A profile of the slow load spent half its samples in `strcmp`. Half of that
+turned out to be a cause rather than a symptom: the C backend emitted a fresh
+region copy of every string literal *at every evaluation*, so each `str_eq
+name "..."` in the dispatch chains allocated and memcpy'd before comparing.
+Making literals static constants (Mere v0.1.258) took 32% off both time and
+memory here; memoizing the ancestor chain took a little more. What is left is
+the allocation that is inherent to the design above.
 
 Two earlier readings of this were wrong and are worth recording. It is not
 superlinear in the number of definitions (definitions measure linear and

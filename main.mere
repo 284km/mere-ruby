@@ -514,6 +514,25 @@ let map_copy = fn m ->
 // outlive the invocation — Ruby's closure semantics, which a single flat map
 // with save/restore teardown could not express (the teardown deleted the
 // very bindings the closure had captured).
+// The ancestor chain of a class is asked for on EVERY dispatch -- `i + 1`
+// asks whether Integer (then Numeric, then Object) redefines `+` -- and
+// rebuilding it means splitting the include lists and appending fresh string
+// lists each time. It changes only when someone includes, prepends, or names
+// a superclass, so it is memoized against a counter those bump.
+//
+// MERE_RUBY_NO_MRO_CACHE=1 turns the memo off and recomputes every time: the
+// old definition kept as an oracle, so the two can be compared over the whole
+// corpus rather than trusted.
+let mro_gen = map_new ();
+let mro_anc = map_new ();      // cls -> its linearized ancestors
+let mro_anc_gen = map_new ();  // cls -> the generation that list was built at
+let mro_mods = map_new ();     // cls -> the modules included into it, expanded
+let mro_mods_gen = map_new ();
+let mro_bump = fn () ->
+  let n = (if map_has mro_gen "n" then map_get mro_gen "n" else 0) in
+  map_set mro_gen "n" (n + 1);
+let mro_now = fn () -> if map_has mro_gen "n" then map_get mro_gen "n" else 0;
+
 let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
 let lv_ctr = map_new ();   // "n" -> next frame id
 let lv_child = fn parent ->
@@ -794,6 +813,14 @@ let includes = map_new ();
 // comes BEFORE the class in its ancestors, so its methods win and their
 // `super` reaches the class's own definition.
 let prepends = map_new ();
+
+// Writing any of these three invalidates the memoized ancestor chains, so the
+// writes go through here rather than being spread across seventeen call sites
+// that each have to remember. (`sup` lives in the world tuple, so it is passed
+// in; includes and prepends are globals.)
+let set_sup = fn m -> fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set m k v;
+let set_inc = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set includes k v;
+let set_pre = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set prepends k v;
 // names declared with `module` (vs `class`) so Module#class differs.
 let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
@@ -10485,7 +10512,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Class" && str_eq name "new" then
       (let (meths2, sup2, ocls2, iv2) = world in
        let anon = fresh_anon "AnonClass_" in
-       let _ = (match args with Cons (VClass sc, _) -> map_set sup2 anon sc | _ -> ()) in
+       let _ = (match args with Cons (VClass sc, _) -> set_sup sup2 anon sc | _ -> ()) in
        VClass anon)
     // Module.new — an anonymous module (registered in `modules` so #class is
     // Module); its constants/methods live under the fresh name's namespace.
@@ -12254,7 +12281,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // it (the new id has none).
        let _ = if str_eq name "clone" && is_sng_cls cls then
                  (let nsng = "(sng:" ++ str_of_int nid ++ ")" in
-                  let _ = map_set sup nsng realcls in
+                  let _ = set_sup sup nsng realcls in
                   let _ = map_set ocls (str_of_int nid) nsng in
                   let mpre = cls ++ "#" in
                   let tm = map_new () in
@@ -13143,7 +13170,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if str_eq c "Class" && str_eq name "new" then
          (let (meths2, sup2, ocls2, iv2) = world in
           let anon = fresh_anon "AnonClass_" in
-          let _ = (match args with Cons (VClass sc, _) -> map_set sup2 anon sc | _ -> ()) in
+          let _ = (match args with Cons (VClass sc, _) -> set_sup sup2 anon sc | _ -> ()) in
           let (h3, ps3, bb3, e3) = newblk in
           // a block is not a constant scope: classes/constants defined in it
           // go to the block's LEXICAL scope (its captured cref; "" = toplevel).
@@ -16283,7 +16310,23 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
 // gets both -- so the search has to walk each module's own includes, not just
 // the names listed on the class. That is the list `ancestors` already reports.
 and cls_mod_ancestors = fn world -> fn (cls: str) ->
-  if map_has includes cls then expand_mods world (str_split (map_get includes cls) "|") else Nil
+  let g = mro_now () in
+  if mro_cache_on () && map_has mro_mods_gen cls && map_get mro_mods_gen cls == g
+  then map_get mro_mods cls
+  else
+    (let r = (if map_has includes cls then expand_mods world (str_split (map_get includes cls) "|") else Nil) in
+     let _ = (if mro_cache_on () then
+                (let _ = map_set mro_mods cls r in map_set mro_mods_gen cls g)
+              else ()) in
+     r)
+
+// the memo is on unless the environment turns it off (see mro_gen).
+and mro_cache_on = fn () ->
+  if map_has mro_gen "off" then (match map_get mro_gen "off" with 1 -> false | _ -> true)
+  else
+    (let off = (if str_eq (env_get "MERE_RUBY_NO_MRO_CACHE") "" then 0 else 1) in
+     let _ = map_set mro_gen "off" off in
+     (match off with 1 -> false | _ -> true))
 
 and prepends_has = fn world -> fn (cls: str) -> fn (name: str) ->
   if map_has prepends cls
@@ -16409,6 +16452,17 @@ and mod_ancestors = fn world -> fn (m: str) ->
 and expand_mods = fn world -> fn (mods: str list) ->
   match mods with Nil -> Nil | Cons (h, t) -> list_append_str (mod_ancestors world h) (expand_mods world t)
 and ancestors_of = fn world -> fn (cls: str) ->
+  let g = mro_now () in
+  if mro_cache_on () && map_has mro_anc_gen cls && map_get mro_anc_gen cls == g
+  then map_get mro_anc cls
+  else
+    (let r = ancestors_of_raw world cls in
+     let _ = (if mro_cache_on () then
+                (let _ = map_set mro_anc cls r in map_set mro_anc_gen cls g)
+              else ()) in
+     r)
+
+and ancestors_of_raw = fn world -> fn (cls: str) ->
   let (meths, sup, ocls, ivars) = world in
   let pre = if map_has prepends cls then expand_mods world (rev_strs (str_split (map_get prepends cls) "|") Nil) else Nil in
   let mods = if map_has includes cls then expand_mods world (rev_strs (str_split (map_get includes cls) "|") Nil) else Nil in
@@ -16522,7 +16576,7 @@ and extend_all = fn (sc: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
   | Cons (VClass m, rest) ->
-    let _ = map_set includes sc (if map_has includes sc then (map_get includes sc) ++ "|" ++ m else m) in
+    let _ = set_inc sc (if map_has includes sc then (map_get includes sc) ++ "|" ++ m else m) in
     extend_all sc rest
   | Cons (_, rest) -> extend_all sc rest
 // find a bare constant by walking the lexical nesting of `cref` upward
@@ -16610,8 +16664,8 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
        (match args with
         | Cons (VClass b9, _) ->
           (let _ = (if str_eq meth "prepend_features"
-                    then map_set prepends b9 (if map_has prepends b9 then (map_get prepends b9) ++ "|" ++ m9 else m9)
-                    else map_set includes b9 (if map_has includes b9 then (map_get includes b9) ++ "|" ++ m9 else m9)) in
+                    then set_pre b9 (if map_has prepends b9 then (map_get prepends b9) ++ "|" ++ m9 else m9)
+                    else set_inc b9 (if map_has includes b9 then (map_get includes b9) ++ "|" ++ m9 else m9)) in
            VClass b9)
         | _ -> VNil)
      | _ -> VNil)
@@ -16719,7 +16773,7 @@ and struct_build = fn world -> fn (args: Val list) ->
   let n = (if map_has struct_ctr "n" then (match map_get struct_ctr "n" with VInt k -> k | _ -> 0) else 0) in
   let _ = map_set struct_ctr "n" (VInt (n + 1)) in
   let anon = "Struct_" ++ str_of_int n in
-  let _ = map_set sup anon "Struct" in
+  let _ = set_sup sup anon "Struct" in
   let _ = add_attrs world anon "rw" members in
   // keyword_init structs take their members as (nil-defaulted) keyword params;
   // positional structs take them positionally.
@@ -21270,7 +21324,7 @@ and prim_sng_cls = fn world -> fn (recv: Val) -> fn (basecls: str) ->
   let hk = hng_key recv in
   let sname = "(sng:" ++ hk ++ ")" in
   let base = if map_has hng_store hk then map_get hng_store hk else basecls in
-  let _ = if map_has sup2 sname then () else map_set sup2 sname base in
+  let _ = if map_has sup2 sname then () else set_sup sup2 sname base in
   sname
 
 and singleton_cls_of = fn world -> fn (id: int) ->
@@ -21279,7 +21333,7 @@ and singleton_cls_of = fn world -> fn (id: int) ->
   if is_sng_cls cur then cur
   else
     let sname = "(sng:" ++ str_of_int id ++ ")" in
-    let _ = map_set sup sname cur in
+    let _ = set_sup sup sname cur in
     let _ = map_set ocls (str_of_int id) sname in
     sname
 
@@ -21393,7 +21447,7 @@ and hng_cls_of = fn world -> fn (recv: Val) -> fn (typename: str) ->
   if map_has hng_store k then map_get hng_store k
   else
     let sname = "(sng:" ++ k ++ ")" in
-    let _ = map_set sup sname typename in
+    let _ = set_sup sup sname typename in
     let _ = map_set hng_store k sname in
     sname
 
@@ -21730,7 +21784,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                     && (let existing = (if map_has sup full then map_get sup full else "Object") in if str_eq existing qsuper then false else true)
                  then let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ full) in ()
                  else () in
-         let _ = if str_eq qsuper "" then () else map_set sup full qsuper in
+         let _ = if str_eq qsuper "" then () else set_sup sup full qsuper in
          let _ = if map_has consts full then () else map_set consts full (VClass full) in
          let _ = if was_new then call_inherited world cenv qsuper full else () in
          let saved_lex = cur_lex () in
@@ -21756,7 +21810,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                 // display name stay `full` (name_anon), so X.name == full and
                 // X.superclass is the old class object.
                 (let internal = fresh_anon "AnonClass_" in
-                 let _ = map_set sup internal sc in
+                 let _ = set_sup sup internal sc in
                  let _ = map_set consts full (VClass internal) in
                  let _ = name_anon full (VClass internal) in
                  let _ = call_inherited world cenv sc internal in
@@ -21766,7 +21820,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                  let _ = set_lex saved_lex in
                  r)
               else
-              let _ = if str_eq sc full then () else map_set sup full sc in
+              let _ = if str_eq sc full then () else set_sup sup full sc in
               let _ = if map_has consts full then () else map_set consts full (VClass full) in
               let _ = if was_new && (if str_eq sc full then false else true) then call_inherited world cenv sc full else () in
               let saved_lex = cur_lex () in
@@ -21901,14 +21955,14 @@ and do_include = fn world -> fn (base: str) -> fn (mq: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "append_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
-           else map_set includes base (if map_has includes base then (map_get includes base) ++ "|" ++ mq else mq)) in
+           else set_inc base (if map_has includes base then (map_get includes base) ++ "|" ++ mq else mq)) in
   run_included_hook world mq base
 
 and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "prepend_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepend_features" (Cons (VClass base, Nil)) in ())
-           else map_set prepends base (if map_has prepends base then (map_get prepends base) ++ "|" ++ mq else mq)) in
+           else set_pre base (if map_has prepends base then (map_get prepends base) ++ "|" ++ mq else mq)) in
   run_prepended_hook world mq base
 
 and prep_each = fn world -> fn (c: str) -> fn (args: Val list) ->
@@ -22413,7 +22467,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       // `class X < remove_const(:X)` at the top level: same collision-rename
       // as the nested path (the constant/display name stays `name`).
       (let internal = fresh_anon "AnonClass_" in
-       let _ = map_set sup internal super0 in
+       let _ = set_sup sup internal super0 in
        let _ = map_set consts name (VClass internal) in
        let _ = name_anon name (VClass internal) in
        let _ = call_inherited world env super0 internal in
@@ -22428,7 +22482,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        r)
     else
     let super = (if is_module then (let _ = map_set modules name VNil in "") else super0) in
-    let _ = if str_eq super "" || str_eq super name then () else map_set sup name super in
+    let _ = if str_eq super "" || str_eq super name then () else set_sup sup name super in
     // record the class itself as a defined constant (const_defined? etc.).
     let _ = if map_has consts name then () else map_set consts name (VClass name) in
     // fire the inherited hook for a freshly-created subclass.
