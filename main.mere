@@ -152,7 +152,7 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // 2h: `alias new old` (copy a method); `include M` (mix a module's
           // instance methods into the class).
           | SAlias of str * str
-          | SInclude of str
+          | SInclude of str * bool   // module name, prepend?
           // 2n: `undef name[, name]` removes method definitions.
           | SUndef of str list
           // 2t: visibility — `private` / `private :m, :n` (mode, names;
@@ -656,6 +656,11 @@ let dfl_tg = map_new ();
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
 let flow_sig = map_new ();
+
+// Blocks registered with Kernel#at_exit, keyed by the order they were given:
+// they run in the REVERSE of it, after the program (and after an uncaught
+// exception has been reported), and before an explicit `exit`.
+let at_exits = map_new ();
 // flip-flop operator state: one on/off flag per lexical site. Sites are
 // numbered at parse time (map_len allocates), so each eval gets fresh ones.
 let ff_state = map_new ();
@@ -784,6 +789,11 @@ let private_consts = map_new ();
 // modules mixed into a class via `include`: class name -> "M1|M2|..." of the
 // included module names (searched after the class's own methods + ancestors).
 let includes = map_new ();
+
+// `prepend`ed modules, by class: unlike an included one, a prepended module
+// comes BEFORE the class in its ancestors, so its methods win and their
+// `super` reaches the class's own definition.
+let prepends = map_new ();
 // names declared with `module` (vs `class`) so Module#class differs.
 let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
@@ -4195,13 +4205,13 @@ and parse_stmt_id = fn toks ->
        // `include Rails.application.routes.url_helpers` — the module is the
        // value of an expression, so this is a real call, resolved at run time.
        | Cons (TId m, Cons (TP dot, _)) when str_eq dot "." ->
-         (let (es, r2) = parse_puts_args r Nil in (SExpr (ECall ("include", es)), r2))
-       | Cons (TId m, r2) -> let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude full, r3)
+         (let (es, r2) = parse_puts_args r Nil in (SExpr (ECall (id, es)), r2))
+       | Cons (TId m, r2) -> let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude (full, str_eq id "prepend"), r3)
        // `include ::A::B` — a path anchored at the top level reads the same
        // here, because constants are stored under their qualified name.
        | Cons (TP sc, Cons (TId m, r2)) ->
          if str_eq sc "::" || str_eq sc " ::"
-         then (let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude full, r3))
+         then (let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude (full, str_eq id "prepend"), r3))
          else (SExpr ENil, r)
        | _ -> (SExpr ENil, r))
     // The parenthesised form (`private(*names)`) is left to the ordinary call
@@ -7922,6 +7932,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             else flow_rethrow_tagged k tg v
           else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
         | other -> flow_value other))
+    // Kernel#at_exit { }: remember the block and answer it as a Proc.
+    else if str_eq name "at_exit" && (if map_has meths "at_exit" then false else true) then
+      (let pid = map_len proc_store in
+       let _ = map_set proc_store (str_of_int pid) (true, bp, bb, env) in
+       let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
+       VProc pid)
     // Kernel#fork { }: not implemented (no process extern) — Ruby's own
     // NotImplementedError contract for fork-less platforms.
     else if str_eq name "fork" && (if map_has meths "fork" then false else true) then
@@ -10204,6 +10220,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      VProc pid)
   else if str_eq name "default_proc" && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with VHsh hid -> hdproc_get hid | _ -> VNil)
+  // `h.default_proc = proc { |hash, key| ... }`: the same default a block
+  // given to Hash.new installs, set after the fact. nil removes it.
+  else if str_eq name "default_proc=" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     | VHsh hid ->
+       (match args with
+        | Cons (VProc pid, _) ->
+          let _ = (if map_has hash_dflt (str_of_int hid) then map_delete hash_dflt (str_of_int hid) else ()) in
+          let _ = hdproc_set hid (VProc pid) in VProc pid
+        | Cons (VNil, _) ->
+          let _ = (if map_has hash_dproc (str_of_int hid) then map_delete hash_dproc (str_of_int hid) else ()) in VNil
+        | Cons (other, _) -> raise_exc world "TypeError" ("wrong default_proc type " ++ class_name other ++ " (expected Proc)")
+        | _ -> VNil)
+     | _ -> VNil)
   else if str_eq name "[]" && (match recv with VHsh hid -> (match hdproc_get hid with VProc _ -> true | _ -> false) | _ -> false)
           && (match args with
               | Cons (k, _) -> (match recv with VHsh hid -> (if hash_haskey (hderef hid) k then false else true) | _ -> false)
@@ -10987,7 +11017,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "instance_method" then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let mname = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
-       let origin = if map_has meths0 (c ++ "#" ++ mname) then c else lookup_anc world (ancestors_of world c) mname in
+       let origin = (let a = lookup_anc world (ancestors_of world c) mname in
+                     if str_eq a "" && map_has meths0 (c ++ "#" ++ mname) then c else a) in
        // a builtin method has no entry in the user method table, but it is
        // still a method of the class and reflection must see it.
        let origin = if str_eq origin "" && builtin_has_meth c mname then c else origin in
@@ -11005,6 +11036,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // result of an expression rather than a constant path.
     else if str_eq name "include" && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (let _ = incl_each world c args in recv)
+    // Module#prepend(M): like include, but M goes in FRONT of the class.
+    else if str_eq name "prepend" && (match args with Cons (VClass _, _) -> true | _ -> false) then
+      (let _ = prep_each world c args in recv)
     // `private(*names)` and friends as a genuine call. The statement parser
     // handles the bare and `:sym`-list forms; this is the parenthesised one,
     // whose argument list is only known once it has been evaluated.
@@ -12721,6 +12755,31 @@ and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
      else theblk)
   | _ -> theblk
 
+// The at_exit handlers, newest first. They are taken out of the store before
+// any of them runs, so a handler that calls `exit` (or registers another one)
+// cannot make them run twice.
+and at_exit_list = fn (i: int) -> fn (n: int) -> fn (acc: Val list) ->
+  if i >= n then acc
+  else at_exit_list (i + 1) n (if map_has at_exits (str_of_int i) then Cons (map_get at_exits (str_of_int i), acc) else acc)
+
+and run_at_exits = fn world ->
+  let n = map_len at_exits in
+  if n == 0 then ()
+  else
+    (let xs = at_exit_list 0 n Nil in
+     let _ = map_clear at_exits in
+     run_at_exit_procs world xs)
+
+and run_at_exit_procs = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (VProc pid, rest) ->
+    // one handler raising does not stop the others, as in ruby
+    let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+    let _ = try_or (fn (u: unit) -> run_block world nb (proc_as_block pid) Nil) (FNext VNil) in
+    run_at_exit_procs world rest
+  | Cons (_, rest) -> run_at_exit_procs world rest
+
 and proc_as_block = fn (pid: int) ->
   let t = map_get proc_store (str_of_int pid) in
   // a lambda enforces strict arity; a proc that captured a defining-method
@@ -13510,13 +13569,16 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
   | VMain -> ""
   | VObj oid ->
     (let ocl = map_get ocls (str_of_int oid) in
-     if map_has meths (ocl ++ "#" ++ nm) then ocl else lookup_anc world (ancestors_of world ocl) nm)
+     let a = lookup_anc world (ancestors_of world ocl) nm in
+     if str_eq a "" && map_has meths (ocl ++ "#" ++ nm) then ocl else a)
   | VClass c2 ->
     (let sng = "(sng:" ++ c2 ++ ")" in
-     if map_has meths (sng ++ "#" ++ nm) then sng else lookup_anc world (ancestors_of world sng) nm)
+     let a = lookup_anc world (ancestors_of world sng) nm in
+     if str_eq a "" && map_has meths (sng ++ "#" ++ nm) then sng else a)
   | other ->
     (let cn = class_name other in
-     if map_has meths (cn ++ "#" ++ nm) then cn else lookup_anc world (ancestors_of world cn) nm)
+     let a = lookup_anc world (ancestors_of world cn) nm in
+     if str_eq a "" && map_has meths (cn ++ "#" ++ nm) then cn else a)
 
 // Method#arity from a user method's params/defaults (-1 for builtins).
 and bm_arity = fn world -> fn (owner: str) -> fn (nm: str) ->
@@ -13739,7 +13801,8 @@ and is_hash_method = fn (name: str) ->
   str_eq name "inject" || str_eq name "dig" || str_eq name "values_at" || str_eq name "fetch_values" ||
   str_eq name "transform_values" || str_eq name "transform_keys" || str_eq name "delete_if" ||
   str_eq name "keep_if" || str_eq name "clear" || str_eq name "replace" || str_eq name "default" ||
-  str_eq name "default=" || str_eq name "compact" || str_eq name "except" || str_eq name "slice" ||
+  str_eq name "default=" || str_eq name "default_proc" || str_eq name "default_proc=" ||
+  str_eq name "compact" || str_eq name "except" || str_eq name "slice" ||
   str_eq name "flat_map" || str_eq name "sort!" || str_eq name "first"
 
 // Ruby gives several builtin methods two names for the same implementation, so
@@ -15069,7 +15132,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Nil -> recv)
      | _ -> recv)
   else if str_eq name "unshift" || str_eq name "prepend" then
-    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (Cons (v, deref id)) in recv | Nil -> recv) | _ -> (let _ = map_set prim_missing "n" (mkstr "unshift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'unshift'")) in fail "mere-ruby: undefined method 'unshift'")))
+    // every argument goes in front, in order: [1].unshift(9, 8) is [9, 8, 1]
+    (match recv with VArr id -> (match args with Nil -> recv | _ -> let _ = arr_set id (list_append args (deref id)) in recv) | _ -> (let _ = map_set prim_missing "n" (mkstr "unshift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'unshift'")) in fail "mere-ruby: undefined method 'unshift'")))
   else if str_eq name "concat" then
     (match recv with
      | VArr id -> (match args with
@@ -15125,7 +15189,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "default" then (match recv with VHsh hid -> hdflt_get hid | _ -> VNil)
   else if str_eq name "default=" then
     (match recv with
-     | VHsh hid -> (match args with Cons (d, _) -> let _ = hdflt_set hid d in d | _ -> VNil)
+     | VHsh hid ->
+       (match args with
+        | Cons (d, _) ->
+          let _ = (if map_has hash_dproc (str_of_int hid) then map_delete hash_dproc (str_of_int hid) else ()) in
+          let _ = hdflt_set hid d in d
+        | _ -> VNil)
      | _ -> VNil)
   // sample / shuffle
   else if str_eq name "sample" then
@@ -15840,14 +15909,17 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
   else if str_eq name "load" && (match args with Cons (VStr _, _) -> true | _ -> false)
           && (if self_defines env world name then false else true) then
     (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
-  // Kernel#exit / Kernel#abort — terminate through the native exit.
+  // Kernel#exit / Kernel#abort — terminate through the native exit, running
+  // the at_exit handlers first (which is the only chance they get).
   else if str_eq name "exit" then
-    (match args with
+    (let _ = run_at_exits world in
+     match args with
      | Cons (VInt n, _) -> exit n
      | Cons (VBool b, _) -> exit (if b then 0 else 1)
      | _ -> exit 0)
   else if str_eq name "abort" then
     (let _ = (match args with Cons (VStr mh, _) -> print_err (sget mh) | _ -> ()) in
+     let _ = run_at_exits world in
      exit 1)
   // Kernel#sleep: inside a synchronous thread it parks the thread; on the
   // main thread it is a scheduling no-op (there is nobody to switch to).
@@ -16180,6 +16252,7 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if str_eq cls "" then false
   else if map_has undefs (cls ++ "#" ++ name) then false   // undef'd here: blocked
+  else if prepends_has world cls name then true
   else if map_has meths (cls ++ "#" ++ name) then true
   else if includes_has world cls name then true
   else if map_has sup cls then has_meth world (map_get sup cls) name
@@ -16196,6 +16269,11 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
 // the names listed on the class. That is the list `ancestors` already reports.
 and cls_mod_ancestors = fn world -> fn (cls: str) ->
   if map_has includes cls then expand_mods world (str_split (map_get includes cls) "|") else Nil
+
+and prepends_has = fn world -> fn (cls: str) -> fn (name: str) ->
+  if map_has prepends cls
+  then any_mod_has world (expand_mods world (str_split (map_get prepends cls) "|")) name
+  else false
 
 and includes_has = fn world -> fn (cls: str) -> fn (name: str) ->
   if map_has includes cls then any_mod_has world (cls_mod_ancestors world cls) name else false
@@ -16317,13 +16395,14 @@ and expand_mods = fn world -> fn (mods: str list) ->
   match mods with Nil -> Nil | Cons (h, t) -> list_append_str (mod_ancestors world h) (expand_mods world t)
 and ancestors_of = fn world -> fn (cls: str) ->
   let (meths, sup, ocls, ivars) = world in
+  let pre = if map_has prepends cls then expand_mods world (rev_strs (str_split (map_get prepends cls) "|") Nil) else Nil in
   let mods = if map_has includes cls then expand_mods world (rev_strs (str_split (map_get includes cls) "|") Nil) else Nil in
   let rest = if map_has sup cls then ancestors_of world (map_get sup cls)
              else if is_sng_cls cls then ancestors_of world (sng_supername world cls)
              else if str_eq cls "BasicObject" then Nil
              else if str_eq cls "Object" then Cons ("BasicObject", Nil)
              else ancestors_of world "Object" in
-  Cons (cls, list_append_str mods rest)
+  list_append_str pre (Cons (cls, list_append_str mods rest))
 // ancestor names as class values (Module#ancestors).
 and anc_vclasses = fn (anc: str list) ->
   match anc with Nil -> Nil | Cons (a, rest) -> Cons (VClass a, anc_vclasses rest)
@@ -16404,6 +16483,12 @@ and run_included_hook = fn world -> fn (mq: str) -> fn (base: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   if has_meth world ("(sng:" ++ mq ++ ")") "included"
   then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "included" (Cons (VClass base, Nil)) in ())
+  else ()
+
+and run_prepended_hook = fn world -> fn (mq: str) -> fn (base: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  if has_meth world ("(sng:" ++ mq ++ ")") "prepended"
+  then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepended" (Cons (VClass base, Nil)) in ())
   else ()
 
 // fire each extended module's `self.extended(base)` hook.
@@ -21688,13 +21773,17 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let _ = run_method_added world cls n1 in
          FNext VNil
        // `include M` records the module for method lookup fallback.
-       | SInclude m ->
+       | SInclude (m, pre) ->
          // resolve the module name in the enclosing lexical scope so a nested
          // `include ModA` records the qualified name (NS::ModA), matching where
          // its methods live.
          let mq = named_class_of_al cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cls (resolve_scope_name cls m) in
-         let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ mq else mq) in
-         let _ = run_included_hook world mq cls in
+         let _ = (if pre then
+                    (let _ = map_set prepends cls (if map_has prepends cls then (map_get prepends cls) ++ "|" ++ mq else mq) in
+                     run_prepended_hook world mq cls)
+                  else
+                    (let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ mq else mq) in
+                     run_included_hook world mq cls)) in
          FNext VNil
        // `undef name` removes the method from this class.
        | SUndef names -> let _ = undef_check world cls names in let _ = undef_all meths cls names in FNext VNil
@@ -21777,6 +21866,15 @@ and modfunc_promote = fn world -> fn (cls: str) -> fn (names: str list) ->
 
 // the :sym / "str" arguments of a visibility call, as plain names.
 // record each module argument of a runtime `include` on the class.
+and prep_each = fn world -> fn (c: str) -> fn (args: Val list) ->
+  match args with
+  | Nil -> ()
+  | Cons (VClass m, t) ->
+    (let _ = map_set prepends c (if map_has prepends c then (map_get prepends c) ++ "|" ++ m else m) in
+     let _ = run_prepended_hook world m c in
+     prep_each world c t)
+  | Cons (_, t) -> prep_each world c t
+
 and incl_each = fn world -> fn (c: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
@@ -22329,7 +22427,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     else
     let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
     FNext VNil
-  | SInclude m ->
+  | SInclude (m, pre) ->
     // a runtime `include Mod` (e.g. inside a class method, self = the class)
     // adds the module to that class's ancestor chain; at the top level with no
     // class self it is a no-op. `m` may name a local variable holding a module
@@ -22337,9 +22435,12 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c ->
        let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> named_class_of_al env world blk c (resolve_scope_name c m)) else named_class_of_al env world blk c (resolve_scope_name c m)) in
-       let _ = map_set includes c (if map_has includes c then (map_get includes c) ++ "|" ++ mq else mq) in
-       let _ = run_included_hook world mq c in
-       FNext VNil
+       (if pre then
+          (let _ = map_set prepends c (if map_has prepends c then (map_get prepends c) ++ "|" ++ mq else mq) in
+           let _ = run_prepended_hook world mq c in FNext VNil)
+        else
+          (let _ = map_set includes c (if map_has includes c then (map_get includes c) ++ "|" ++ mq else mq) in
+           let _ = run_included_hook world mq c in FNext VNil))
      | _ -> FNext VNil)
   | SUndef names ->
     let (meths, sup, ocls, ivars) = world in
@@ -25429,16 +25530,17 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
                         let r = hoist_run env world noblk prog in
                         let _ = map_set ranok "y" (VBool true) in r)
                      (FNext VNil) in
-  let _ = if map_has ranok "y" then () else
+  let _ = if map_has ranok "y" then run_at_exits world else
     (let exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
      match exc with
-     | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in exit 1
+     | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in let _ = run_at_exits world in exit 1
      | VObj eid ->
        (let ec = map_get ocls (str_of_int eid) in
         let em = (if map_has ivars (str_of_int eid ++ "@message")
                   then (match map_get ivars (str_of_int eid ++ "@message") with VStr h -> sget h | other -> to_s other)
                   else ec) in
-        let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in exit 1)
+        let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in
+        let _ = run_at_exits world in exit 1)
      // an interpreter-internal failure, not a Ruby exception: say so plainly.
      | _ ->
        (let m = (if map_has prim_missing "i"
