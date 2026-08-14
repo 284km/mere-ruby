@@ -202,7 +202,7 @@ questions wrongly, which is worse than not loading — so it is left out. This
 is where devise stops, having loaded activesupport, i18n, concurrent-ruby and
 its own Concerns first.
 
-## A method call costs ~12 KB that is never given back
+## A method call costs ~9 KB that is never given back
 
 The interpreter allocates in a region it never reclaims, so **memory is linear
 in the number of calls executed** — 100k calls is 0.9 GB, 200k is 1.8 GB, 400k
