@@ -164,7 +164,9 @@ the real OpenSSL, not merely against themselves.
 `OpenSSL::SSL`, `X509` and `PKey` are **not defined at all** — not even as
 classes that raise. A gem that needs TLS should fail on the constant it
 actually needs (`uninitialized constant OpenSSL::SSL`), which names the
-missing capability, rather than load and fail somewhere further away.
+missing capability, rather than load and fail somewhere further away. This is
+where excon, fog-aws and aws-sdk-s3 stop, and all three stop there having
+loaded everything else.
 `OpenSSL::Cipher` is the one exception: its `CipherError` is a class that
 activesupport names at load time, so the class exists and `Cipher.new`
 raises.
