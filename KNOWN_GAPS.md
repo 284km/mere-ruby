@@ -230,10 +230,23 @@ cheap). And `racc/cparse` did not take 61 seconds — a require that *raises*
 never returns, so a trace that closes files on return charges everything after
 the raise to it; `bench/require_trace.rb` closes them in an `ensure`.
 
-Fixing it means reclaiming per-call memory — a region per call with the result
-copied out — which is the same shape as the per-request reclamation mkv needed,
-and is complicated here by frames that legitimately escape (closures, bindings,
-`define_method` bodies).
+**A region per call is not the fix, and that was measured rather than
+reasoned.** Wrapping every method body in `region R { }` reclaims **6.4%** of
+what a call allocates: Mere's `map_new` and closure environments take the
+default region explicitly, so the frame — the biggest thing a call builds —
+never lands in the block region at all. Patching the generated C so both
+follow the *current* region raises it to **17%**.
+
+The other 83% is writes into global maps, and those are the Ruby heap: the
+string / array / hash / object stores, which every value lives in and which
+outlive any call by construction. No call-scoped region can reclaim them.
+Reclaiming them means collecting the stores — reference counting or a GC over
+the store maps — which is a different and much larger piece of work than the
+escape analysis a per-call region would have needed.
+
+So the honest statement is: allocation per call is now within ~2× of what a
+tree-walking interpreter of this shape costs, and the remaining factor is that
+**nothing is ever collected**, not that temporaries are held too long.
 
 ## The Wasm playground cannot currently be rebuilt
 

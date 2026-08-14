@@ -88,8 +88,13 @@ rescue TypeError => e
 end
 
 # at_exit runs its blocks in the reverse of the order they were given, after
-# everything else -- so these three lines are the last output of this program.
+# everything else. `END { }` is the same list, not a second one -- and an END
+# registers ONCE however many times control reaches it, which is why the loop
+# below adds one line and not ten. So the last six lines of this program are
+# the registrations in reverse.
 at_exit { puts "bye1" }
+END { puts "END1" }
 at_exit { puts "bye2" }
 p at_exit { puts "bye3" }.class
+10.times { END { puts "END-in-a-loop" } }
 puts "body"

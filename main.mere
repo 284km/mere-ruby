@@ -133,7 +133,7 @@ type Stmt = SPuts of Expr list | SExpr of Expr
           // BEGIN { } runs first in its code unit (hoisted); END { } runs at
           // exit. Distinct from a plain begin/end so run_prog/eval can order them.
           | SPreexe of Stmt list
-          | SAtExit of Stmt list
+          | SAtExit of int * Stmt list   // END { }: site id, body
           // `class << <expr>` — open the singleton class of an arbitrary
           // expression receiver (a literal / paren-expr / ivar), the general
           // form of `class << self` / `class << obj`.
@@ -680,6 +680,15 @@ let flow_sig = map_new ();
 // they run in the REVERSE of it, after the program (and after an uncaught
 // exception has been reported), and before an explicit `exit`.
 let at_exits = map_new ();
+
+// One END { } in the source registers once, however many times control
+// reaches it: the parser numbers the sites and this remembers which have
+// registered. (`END` inside a loop is the case ruby names explicitly.)
+let end_sites = map_new ();
+let end_ctr = map_new ();
+let end_site_next = fn () ->
+  let n = (if map_has end_ctr "n" then map_get end_ctr "n" else 0) in
+  let _ = map_set end_ctr "n" (n + 1) in n;
 // flip-flop operator state: one on/off flag per lexical site. Sites are
 // numbered at parse time (map_len allocates), so each eval gets fresh ones.
 let ff_state = map_new ();
@@ -4169,7 +4178,8 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TP br, r2) ->
          let (body, r3) = parse_brace_stmts r2 Nil in
-         (if str_eq id "BEGIN" then SPreexe body else SAtExit body, r3)
+         (if str_eq id "BEGIN" then SPreexe body
+          else (let n = end_site_next () in SAtExit (n, body)), r3)
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected block after BEGIN" ++ parsing_file ()))) in fail ("mere-ruby: expected block after BEGIN" ++ parsing_file ())))
     else if str_eq id "puts" then
       (match r with
@@ -22117,14 +22127,12 @@ and run_pre = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
 and run_post = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   match prog with
   | Nil -> ()
-  | Cons (SAtExit body, rest) -> (match run_stmts env world blk body with _ -> run_post env world blk rest)
   | Cons (_, rest) -> run_post env world blk rest
 
 and filter_mid = fn (prog: Stmt list) ->
   match prog with
   | Nil -> Nil
   | Cons (SPreexe _, rest) -> filter_mid rest
-  | Cons (SAtExit _, rest) -> filter_mid rest
   | Cons (s, rest) -> Cons (s, filter_mid rest)
 
 and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
@@ -22584,7 +22592,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // reached only when nested (top-level BEGIN/END are handled by hoist_run):
   // a BEGIN inside a block/method is a SyntaxError; a nested END just runs.
   | SPreexe _ -> (let _ = raise_exc world "SyntaxError" "BEGIN is permitted only at toplevel" in FNext VNil)
-  | SAtExit body -> run_stmts env world blk body
+  | SAtExit (site, body) ->
+    (let k = str_of_int site in
+     if map_has end_sites k then FNext VNil
+     else
+       (let _ = map_set end_sites k VNil in
+        let pid = map_len proc_store in
+        let _ = map_set proc_store (str_of_int pid) (true, (Nil : str list), body, env) in
+        let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
+        FNext VNil))
   | SLocalFrom (name, s) ->
     (match exec_stmt env world blk s with
      | FNext v -> let _ = lv_set env name v in FNext v
