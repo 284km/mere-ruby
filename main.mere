@@ -7507,7 +7507,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // `super` from a `def self.new` override is Class#new: allocate and
        // run initialize, exactly as the built-in path would have.
        else if str_eq meth "new" then (match recv with VClass c9 -> new_obj_wb world c9 args superblk | _ -> raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
-       else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
+       // the methods Class/Module themselves provide (append_features,
+       // autoload, method_missing, ...) are ancestors of a singleton too, so
+       // `super` from a `def self.` override of one lands there rather than
+       // running out of chain.
+       else super_missing world superblk recv meth args)
     else
       (let a2 = lookup_anc world (anc_after (ancestors_of world (super_base world recv)) defcls) meth in
        if str_eq a2 "" then super_missing world superblk recv meth args
@@ -16590,6 +16594,22 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // so an override that ends with `super` (the documented way to write one)
   // must not blow up when nothing else in the chain defines them.
   else if is_definition_hook meth then VNil
+  // `super` from an `append_features` / `prepend_features` override IS the
+  // default include: adding the module to the base's ancestors is what
+  // Module#append_features does, and ActiveSupport::Concern's override ends
+  // with `super` precisely to get it.
+  else if (str_eq meth "append_features" || str_eq meth "prepend_features")
+          && (match recv with VClass _ -> true | _ -> false) then
+    (match recv with
+     | VClass m9 ->
+       (match args with
+        | Cons (VClass b9, _) ->
+          (let _ = (if str_eq meth "prepend_features"
+                    then map_set prepends b9 (if map_has prepends b9 then (map_get prepends b9) ++ "|" ++ m9 else m9)
+                    else map_set includes b9 (if map_has includes b9 then (map_get includes b9) ++ "|" ++ m9 else m9)) in
+           VClass b9)
+        | _ -> VNil)
+     | _ -> VNil)
   // `super` from a `new` defined in an EXTENDED module (concurrent-ruby's
   // SafeInitialization wraps construction that way) is Class#new: allocate and
   // run initialize, exactly as the built-in path would have. The singleton
@@ -21784,12 +21804,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // `include ModA` records the qualified name (NS::ModA), matching where
          // its methods live.
          let mq = named_class_of_al cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cls (resolve_scope_name cls m) in
-         let _ = (if pre then
-                    (let _ = map_set prepends cls (if map_has prepends cls then (map_get prepends cls) ++ "|" ++ mq else mq) in
-                     run_prepended_hook world mq cls)
-                  else
-                    (let _ = map_set includes cls (if map_has includes cls then (map_get includes cls) ++ "|" ++ mq else mq) in
-                     run_included_hook world mq cls)) in
+         let _ = (if pre then do_prepend world cls mq else do_include world cls mq) in
          FNext VNil
        // `undef name` removes the method from this class.
        | SUndef names -> let _ = undef_check world cls names in let _ = undef_all meths cls names in FNext VNil
@@ -21872,22 +21887,35 @@ and modfunc_promote = fn world -> fn (cls: str) -> fn (names: str list) ->
 
 // the :sym / "str" arguments of a visibility call, as plain names.
 // record each module argument of a runtime `include` on the class.
+// `include M` in one place. Module#append_features is the hook that actually
+// performs the include, and a module may override it -- ActiveSupport::Concern
+// does, and that override is where a Concern's ClassMethods get extended and
+// its `included do` block runs. When the module has one, IT decides what
+// including means; its `super` lands on the default (super_missing).
+and do_include = fn world -> fn (base: str) -> fn (mq: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "append_features"
+           then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
+           else map_set includes base (if map_has includes base then (map_get includes base) ++ "|" ++ mq else mq)) in
+  run_included_hook world mq base
+
+and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "prepend_features"
+           then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepend_features" (Cons (VClass base, Nil)) in ())
+           else map_set prepends base (if map_has prepends base then (map_get prepends base) ++ "|" ++ mq else mq)) in
+  run_prepended_hook world mq base
+
 and prep_each = fn world -> fn (c: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (VClass m, t) ->
-    (let _ = map_set prepends c (if map_has prepends c then (map_get prepends c) ++ "|" ++ m else m) in
-     let _ = run_prepended_hook world m c in
-     prep_each world c t)
+  | Cons (VClass m, t) -> (let _ = do_prepend world c m in prep_each world c t)
   | Cons (_, t) -> prep_each world c t
 
 and incl_each = fn world -> fn (c: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (VClass m, t) ->
-    (let _ = map_set includes c (if map_has includes c then (map_get includes c) ++ "|" ++ m else m) in
-     let _ = run_included_hook world m c in
-     incl_each world c t)
+  | Cons (VClass m, t) -> (let _ = do_include world c m in incl_each world c t)
   | Cons (_, t) -> incl_each world c t
 
 and vis_arg_names = fn (args: Val list) ->
@@ -22441,12 +22469,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c ->
        let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> named_class_of_al env world blk c (resolve_scope_name c m)) else named_class_of_al env world blk c (resolve_scope_name c m)) in
-       (if pre then
-          (let _ = map_set prepends c (if map_has prepends c then (map_get prepends c) ++ "|" ++ mq else mq) in
-           let _ = run_prepended_hook world mq c in FNext VNil)
-        else
-          (let _ = map_set includes c (if map_has includes c then (map_get includes c) ++ "|" ++ mq else mq) in
-           let _ = run_included_hook world mq c in FNext VNil))
+       (let _ = (if pre then do_prepend world c mq else do_include world c mq) in FNext VNil)
      | _ -> FNext VNil)
   | SUndef names ->
     let (meths, sup, ocls, ivars) = world in

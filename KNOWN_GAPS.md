@@ -193,6 +193,15 @@ Two known holes inside TCP itself:
 - **There is no `select`.** A read blocks; `io/wait`'s `wait_readable` is the
   identity and `ready?` answers nil rather than guessing.
 
+## `bigdecimal` is not implemented
+
+`require "bigdecimal"` is a LoadError: it is a C extension, and a faithful
+BigDecimal needs arbitrary-precision integers, which mere-ruby does not have
+either. A Float-backed stand-in would load and then answer arithmetic
+questions wrongly, which is worse than not loading — so it is left out. This
+is where devise stops, having loaded activesupport, i18n, concurrent-ruby and
+its own Concerns first.
+
 ## Loading all of rubocop slows to a crawl
 
 `require "rubocop"` now gets past `socket` and through 537 of its ~600
