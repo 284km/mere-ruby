@@ -1920,7 +1920,11 @@ and regex_position = fn (s: str) -> fn (i: int) ->
        str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n" || str_eq c ";" ||
        str_eq c "<" || str_eq c "[" || str_eq c "\{" ||
        // ternary branches: `c ? /re/ : /re/` — a `/` after `?` or `:` starts a regex.
-       str_eq c "?" || str_eq c ":" then true
+       str_eq c "?" || str_eq c ":" ||
+       // a range bound: `(//..//)` is a Range of two empty regexes, which is
+       // how ruby's own specs name the type. A `/` after `.` cannot be
+       // division -- there is no value to divide.
+       str_eq c "." then true
     else if is_alpha c then
       // after a keyword (when /re/, match =~ style) it's a regex too.
       let w = word_ending_at s p in
@@ -2679,6 +2683,18 @@ and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr li
     else parse_postfix_more (EMethod (recv, name, es)) r2
   else parse_postfix_more (EMethod (recv, name, argv)) toks
 
+// `name [items]` is an index or a call with an array argument, and eval
+// decides -- unless a `do` block follows, which only a CALL can take. Ruby's
+// own specs are written that way (`argf [@file1, @file2] do ... end`), and 42
+// of the 75 files the parse sweep could not read were this one shape.
+and ambig_or_call = fn (id: str) -> fn (ae: Expr) -> fn toks ->
+  if starts_do_block toks then
+    (let (bp, bb, r) = parse_block toks in (ECallB (id, Cons (ae, Nil), bp, bb), r))
+  else
+    (match ae with
+     | EArr items -> (EAmbigIdx (id, items), toks)
+     | other -> (ECall (id, Cons (other, Nil)), toks))
+
 and starts_do_block = fn toks ->
   match toks with Cons (TId d, _) -> str_eq d "do" | _ -> false
 
@@ -3154,15 +3170,12 @@ and parse_primary = fn toks ->
             match r2b with
             | Cons (TP cm, r2c) ->
               if str_eq cm "," then
-                let (es, r2d) = parse_puts_args (skip_nls r2c) (Cons (ae, Nil)) in (ECall (id, es), r2d)
-              else
-                (match ae with
-                 | EArr items -> (EAmbigIdx (id, items), r2b)
-                 | other -> (ECall (id, Cons (other, Nil)), r2b))
-            | _ ->
-              (match ae with
-               | EArr items -> (EAmbigIdx (id, items), r2b)
-               | other -> (ECall (id, Cons (other, Nil)), r2b)))
+                (let (es, r2d) = parse_puts_args (skip_nls r2c) (Cons (ae, Nil)) in
+                 if starts_do_block r2d
+                 then (let (bp, bb, r2e) = parse_block r2d in (ECallB (id, es, bp, bb), r2e))
+                 else (ECall (id, es), r2d))
+              else ambig_or_call id ae r2b
+            | _ -> ambig_or_call id ae r2b)
          // a double-quoted string argument: `d "desc" do ... end`.
          else if str_eq p "(s" then
            // An interpolated string lexes as a GROUP, and a chained call on it
@@ -4728,6 +4741,17 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
        if str_eq p "," then parse_sym_list (skip_nls r2) (Cons (s, acc))
        else (rev_app (Cons (s, acc)) Nil, r)
      | _ -> (rev_app (Cons (s, acc)) Nil, r))
+  // ...and a name may be written as a STRING: `attr_accessor :a, "b"`. A
+  // double-quoted string lexes as an interpolation GROUP, so it is parsed as
+  // an expression and folded, the way alias names are.
+  | Cons (TP grp, _) when str_eq grp "(s" ->
+    (let (e, r) = parse_primary toks in
+     let nm = const_fold_str e in
+     match r with
+     | Cons (TP p, r2) ->
+       if str_eq p "," then parse_sym_list (skip_nls r2) (Cons (nm, acc))
+       else (rev_app (Cons (nm, acc)) Nil, r)
+     | _ -> (rev_app (Cons (nm, acc)) Nil, r))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected :symbol" ++ parsing_file ()))) in fail ("mere-ruby: expected :symbol" ++ parsing_file ()))
 
 // a range in an if/unless condition is the flip-flop operator; allocate its
@@ -15526,6 +15550,10 @@ and rng_bad_bounds = fn world -> fn (lo: Val) -> fn (hi: Val) ->
   | _ ->
     (match hi with
      | VNil -> false
+     // equal bounds always compare: Object#<=> answers 0 for a pair it
+     // considers ==, whatever the class, which is why ruby builds `(//..//)`
+     // (two empty Regexps) and refuses `(/a/../b/)`.
+     | _ when rb_eq lo hi -> false
      | _ ->
        // every numeric kind compares with every other: a Bignum bound is what
        // sidekiq-pro's (0..2**64) has, and `is_num` does not count those.
@@ -25939,6 +25967,22 @@ let rec take_flags = fn (argl: str list) ->
        | Nil -> Nil)
     else Cons (a, take_flags rest);
 
+// `mere-ruby --parse-only FILE`: read and parse, run nothing. A parse error is
+// the one failure that takes a WHOLE file with it, so it is worth being able
+// to ask about it in isolation -- over a few thousand files, without executing
+// any of them. Exit 0 = parsed, 1 = did not.
+let parse_only = fn (path: str) ->
+  let src = read_file path in
+  let _ = map_set load_ctx "parsing" (mkstr path) in
+  let toks = lex_go src 0 in
+  let _ = parse_line_reset (count_nls toks) in
+  let (prog, rest) = parse_stmts toks Nil in
+  let _ = rx_check_pending () in
+  match rest with
+  | Cons (TEOF, _) -> 0
+  | _ ->
+    let _ = print_err ("mere-ruby: unexpected token at top level" ++ parsing_file ()) in 1;
+
 let run_cli = fn () ->
   match take_flags (args ()) with
   | Nil ->
@@ -25951,7 +25995,11 @@ let run_cli = fn () ->
     if str_eq src "" then let _ = print "usage: mere-ruby <script.rb>" in 2
     else let _ = run_src src false "(playground)" in 0
   | Cons (a0, rest) ->
-    if str_eq a0 "--eval-print" then
+    if str_eq a0 "--parse-only" then
+      (match rest with
+       | Cons (path, _) -> parse_only path
+       | Nil -> let _ = print "usage: mere-ruby --parse-only <script.rb>" in 2)
+    else if str_eq a0 "--eval-print" then
       (match rest with
        | Cons (path, rest2) -> let _ = map_set cli_file "p" path in let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest2)) in let _ = run_prog path true in 0
        | Nil -> let _ = print "usage: mere-ruby --eval-print <script.rb>" in 2)

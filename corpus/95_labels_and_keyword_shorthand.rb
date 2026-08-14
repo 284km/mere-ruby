@@ -74,3 +74,30 @@ s = S95.new(1)
 s.v = 7, 8
 p s.v
 p (a[0] = 9)          # the parenthesised form was already right
+
+# `f [1, 2] do ... end` is a CALL with an array argument -- an index cannot
+# take a block, which is what settles the ambiguity ruby settles by the space.
+def takes_arr(a)
+  yield a
+end
+takes_arr [1, 2] do |x|
+  p x
+end
+arr95 = [9, 8]
+p arr95[0]
+p arr95 [1]
+
+# an attribute name may be written as a string
+class Attr95
+  attr_accessor :a, "b"
+  attr_reader "c"
+end
+o95 = Attr95.new
+o95.a = 1
+o95.b = 2
+p [o95.a, o95.b, o95.respond_to?(:c)]
+
+# `//` is an empty Regexp, and a Range of two EQUAL bounds is always valid
+# (Object#<=> answers 0 for a pair it considers ==)
+p (//..//).class
+p [(/a/ =~ ""), ("x" =~ //)]
