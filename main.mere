@@ -1212,6 +1212,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // $global: keep the leading $ in the identifier text
       let j = scan_ident s (i + 1) in
       Cons (TId (substring s i j), lex_go s j)
+    // `$-0` / `$-w` and the rest of the dash globals are THREE characters:
+    // taking two would leave a bare `0` behind and the statement fell apart.
+    else if str_eq c "$" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "-" then
+      Cons (TId (substring s i (i + 3)), lex_go s (i + 3))
     else if str_eq c "$" && i + 1 < str_len s then
       // special globals ($~ $1 $! $& ...) lex as identifiers (default nil).
       Cons (TId (substring s i (i + 2)), lex_go s (i + 2))
@@ -1257,6 +1261,11 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
             && is_alpha (char_at s (i + 2)) then
       let j = scan_ident s (i + 2) in
       Cons (TSym (substring s (i + 1) j), lex_go s j)
+    // `:$-w` and the rest of the dash globals name themselves as symbols too
+    // (ruby's Symbol#inspect spec lists them), and they are three characters.
+    else if str_eq c ":" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "$"
+            && str_eq (char_at s (i + 2)) "-" then
+      Cons (TSym (substring s (i + 1) (i + 4)), lex_go s (i + 4))
     // `:$&` / `:$'` / `:$1` -- a symbol naming one of the punctuation globals.
     // rubocop's Style/PerlBackrefs matches on exactly these.
     else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "$"
@@ -4338,18 +4347,35 @@ and parse_stmt_id = fn toks ->
        // value of an expression, so this is a real call, resolved at run time.
        | Cons (TId m, Cons (TP dot, _)) when str_eq dot "." ->
          (let (es, r2) = parse_puts_args r Nil in (SExpr (ECall (id, es)), r2))
-       | Cons (TId m, r2) -> let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude (full, str_eq id "prepend"), r3)
+       | Cons (TId m, r2) ->
+         (let (full, r2b) = scoped_name m r2 in
+          // `include ModuleSpecs::MVars.dup` — a scoped name with a CALL on
+          // it is a value like any other, so it resolves at run time. Only a
+          // bare path is the static form.
+          match r2b with
+          | Cons (TP dt3, _) when str_eq dt3 "." ->
+            (let (es, r4) = parse_puts_args r Nil in (SExpr (ECall (id, es)), r4))
+          | _ -> let (_, r3) = maybe_more_names r2b in (SInclude (full, str_eq id "prepend"), r3))
        // `include ::A::B` — a path anchored at the top level reads the same
        // here, because constants are stored under their qualified name.
-       | Cons (TP sc, Cons (TId m, r2)) ->
-         if str_eq sc "::" || str_eq sc " ::"
-         then (let (full, r2b) = scoped_name m r2 in let (_, r3) = maybe_more_names r2b in (SInclude (full, str_eq id "prepend"), r3))
-         else (SExpr ENil, r)
+       | Cons (TP sc, Cons (TId m, r2)) when str_eq sc "::" || str_eq sc " ::" ->
+         (let (full, r2b) = scoped_name m r2 in
+          let (_, r3) = maybe_more_names r2b in (SInclude (full, str_eq id "prepend"), r3))
+       // `include(M, N)` — the parenthesised form, which takes as many modules
+       // as it is given. It used to fall through to an empty expression that
+       // consumed nothing: with one module the leftover `(M)` parsed as a
+       // statement of its own and the include silently did NOTHING.
+       | Cons (TP lp, r2) when is_lparen lp ->
+         (let (es, r3) = parse_call_args r2 in (SExpr (ECall (id, es)), r3))
        | _ -> (SExpr ENil, r))
     // The parenthesised form (`private(*names)`) is left to the ordinary call
     // path below: its arguments can be computed at runtime, which a static
     // SVis name list cannot express.
     else if (str_eq id "private" || str_eq id "public" || str_eq id "protected") &&
+            // `private.should ...` — a bare visibility call used as a RECEIVER
+            // (it answers nil). A `.` after the word means it is an expression,
+            // not the statement form that switches the mode.
+            (match r with Cons (TP dt, _) -> (if str_eq dt "." then false else true) | _ -> true) &&
             (match r with Cons (TP lp, _) -> (if is_lparen lp then false else true) | _ -> true) then
       // visibility: bare form switches the mode for subsequent defs; the
       // named form (`private :m, :n`) marks those methods.
@@ -4377,6 +4403,9 @@ and parse_stmt_id = fn toks ->
     // bare `module_function` switches the enclosing module body into a mode
     // where subsequent defs are also module methods (see register_class_v).
     else if str_eq id "module_function" &&
+            // as above: `module_function.should ...` is a receiver, not the
+            // statement that switches the mode
+            (match r with Cons (TP dt2, _) -> (if str_eq dt2 "." then false else true) | _ -> true) &&
             (match r with Cons (TP lp, _) -> (if is_lparen lp then false else true) | _ -> true) then
       (match r with
        | Cons (TNL, _) -> (SVis ("module_function", Nil), r)
@@ -4730,7 +4759,13 @@ and parse_opt_kw_block = fn toks -> fn (kw: str) ->
   | _ -> (Nil, toks)
 
 and parse_attr = fn (mode: str) -> fn toks ->
-  let (syms, r) = parse_sym_list toks Nil in (SAttr (mode, syms), r)
+  let (syms, r) = parse_sym_list toks Nil in
+  // `attr :a, true` is ruby's old spelling of attr_accessor (and `, false` of
+  // attr_reader). The flag is not a name, so parse_sym_list leaves it here.
+  match r with
+  | Cons (TId flag, r2) when str_eq flag "true" -> (SAttr ("rw", syms), r2)
+  | Cons (TId flag, r2) when str_eq flag "false" -> (SAttr ("r", syms), r2)
+  | _ -> (SAttr (mode, syms), r)
 
 and parse_sym_list = fn toks -> fn (acc: str list) ->
   match toks with
@@ -4752,6 +4787,9 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
        if str_eq p "," then parse_sym_list (skip_nls r2) (Cons (nm, acc))
        else (rev_app (Cons (nm, acc)) Nil, r)
      | _ -> (rev_app (Cons (nm, acc)) Nil, r))
+  // the trailing `true` / `false` of `attr :a, true` ends the list
+  | Cons (TId flag, _) when str_eq flag "true" || str_eq flag "false" ->
+    (rev_app acc Nil, toks)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected :symbol" ++ parsing_file ()))) in fail ("mere-ruby: expected :symbol" ++ parsing_file ()))
 
 // a range in an if/unless condition is the flip-flop operator; allocate its
@@ -7268,6 +7306,9 @@ and sym_plain = fn (sy: str) ->
     // ruby prints those unquoted.
     else if st == 1 && str_eq (char_at sy 0) "$" && str_len sy == 2
             && is_gvar_punct (char_at sy 1) then true
+    // ...and `:$-w`: the dash globals print unquoted too.
+    else if st == 1 && str_eq (char_at sy 0) "$" && str_len sy == 3
+            && str_eq (char_at sy 1) "-" then true
     else if is_alpha (char_at sy st) || str_eq (char_at sy st) "_" then sym_ident_rest sy (st + 1)
     else false
 
@@ -22229,17 +22270,25 @@ and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
            else set_pre base (if map_has prepends base then (map_get prepends base) ++ "|" ++ mq else mq)) in
   run_prepended_hook world mq base
 
+// `include(M, N)` / `prepend(M, N)` put M nearest: ruby takes the list from
+// the RIGHT, so the first argument ends up in front of the others.
 and prep_each = fn world -> fn (c: str) -> fn (args: Val list) ->
+  prep_each_go world c (rev_app args Nil)
+
+and prep_each_go = fn world -> fn (c: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (VClass m, t) -> (let _ = do_prepend world c m in prep_each world c t)
-  | Cons (_, t) -> prep_each world c t
+  | Cons (VClass m, t) -> (let _ = do_prepend world c m in prep_each_go world c t)
+  | Cons (_, t) -> prep_each_go world c t
 
 and incl_each = fn world -> fn (c: str) -> fn (args: Val list) ->
+  incl_each_go world c (rev_app args Nil)
+
+and incl_each_go = fn world -> fn (c: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (VClass m, t) -> (let _ = do_include world c m in incl_each world c t)
-  | Cons (_, t) -> incl_each world c t
+  | Cons (VClass m, t) -> (let _ = do_include world c m in incl_each_go world c t)
+  | Cons (_, t) -> incl_each_go world c t
 
 and vis_arg_names = fn (args: Val list) ->
   match args with

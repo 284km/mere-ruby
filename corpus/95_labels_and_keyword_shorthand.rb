@@ -101,3 +101,50 @@ p [o95.a, o95.b, o95.respond_to?(:c)]
 # (Object#<=> answers 0 for a pair it considers ==)
 p (//..//).class
 p [(/a/ =~ ""), ("x" =~ //)]
+
+# `include(M, N)` takes the list from the right, so M ends up nearest -- and
+# the parenthesised form used to consume nothing at all, which meant a lone
+# `include(M)` silently did not include.
+module Mod95a
+  def a95; :a; end
+end
+module Mod95b
+  def b95; :b; end
+end
+class Host95
+  include(Mod95a, Mod95b)
+end
+p [Host95.new.a95, Host95.new.b95, Host95.ancestors.first(3)]
+class Host95b
+  prepend(Mod95a, Mod95b)
+end
+p Host95b.ancestors.first(3)
+class Host95c
+  include(Mod95a)
+end
+p Host95c.ancestors.include?(Mod95a)
+
+# `include Expr.method` is a value like any other
+class Host95d
+  include Mod95a.dup
+end
+p Host95d.new.a95
+
+# a bare visibility word can be a receiver: it answers nil
+class Vis95
+  def m95; end
+  p [private.nil?, public.nil?, protected.nil?]
+end
+
+# `attr :name, true` is the old spelling of attr_accessor
+class Attr95b
+  attr :x, true
+  attr :y, false
+end
+a95b = Attr95b.new
+a95b.x = 1
+p [a95b.x, a95b.respond_to?(:y=)]
+
+# the dash globals, as names and as symbols
+$-w = true
+p [$-w, :$-w, :$-0]
