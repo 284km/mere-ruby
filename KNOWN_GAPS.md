@@ -141,6 +141,18 @@ assigns. No installed gem does it — the tree was searched before the two were
 left out. Fixing it means letting them read as ordinary identifiers in
 expression position, which is where their statement syntax is decided.
 
+## The regex engine has no true subroutine calls
+
+`\g<name>` is implemented by INLINING the named group's pattern at the call
+site (its captures made shy), which is what ruby's RFC3986 URI pattern needs
+and what makes `require "uri"` work here. A group that calls itself would
+inline forever, so genuine recursion — `(?<p>\(\g<p>*\))` for balanced
+parens — is not supported. Real subroutine calls need a call stack in the VM.
+
+A MatchData holds 64 capture groups (ruby exposes only `$1`..`$9` as globals,
+but `m[10]` and `m[:name]` are answered up to 64). A pattern with more than
+that silently keeps the first 64.
+
 ## `openssl` is a hash function, and nothing else
 
 `require "openssl"` gives `OpenSSL::Digest` (SHA1, SHA256, MD5 — the digests

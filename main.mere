@@ -616,6 +616,17 @@ let rx_ganchor = map_new ();
 // back to the legacy matcher at runtime), while truly invalid syntax still
 // fails (a Ruby SyntaxError / RegexpError).
 let rx_lenient = map_new ();
+// Named groups seen so far in the pattern being parsed: the number (for
+// `\k<name>`) and the body (for `\g<name>`, which re-matches the group's
+// pattern at the call site). Cleared at the start of every parse.
+let rx_gnums = map_new ();
+let rx_gbodies = map_new ();
+// Per compiled pattern (same key as rx_progs): its named groups, as
+// "name=number|name=number|...". A MatchData answers `m[:name]` from this.
+let rx_prog_names = map_new ();
+// the cache key of the pattern currently being matched, so the MatchData it
+// publishes can name its groups.
+let rx_cur = map_new ();
 // regex literals recorded by the ruby parser ("e<i>" -> "flags\nbody", "n" =
 // count, "done" = validated prefix); validated right after each parse (eval /
 // require / main), so an invalid literal is a parse-time SyntaxError while
@@ -12131,9 +12142,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // only group 0's span is recorded, which is what these are asked for
        else if str_eq name "begin" then VInt st
        else VInt en)
+    // MatchData#names / #named_captures: the pattern's named groups.
+    else if str_eq cls "MatchData" && (str_eq name "names" || str_eq name "named_captures") then
+      (let nms = md_names ivars id in
+       if str_eq name "names" then arr_new (strs_to_vals nms)
+       else mkhash (md_named_pairs world ivars id nms))
     else if str_eq cls "MatchData" && (str_eq name "[]" || str_eq name "to_a" || str_eq name "captures" || str_eq name "size" || str_eq name "length" || str_eq name "values_at") then
       (if str_eq name "values_at" then
-         arr_new (md_values_at ivars id args)
+         arr_new (md_values_at world ivars id args)
        else if str_eq name "[]" then
          // like Array#[]: an index, a (start, length) pair, a Range, and a
          // negative index counting from the end of the group list
@@ -12151,6 +12167,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | Cons (VInt n, _) ->
             (let i2 = (if n < 0 then n0 + n else n) in
              if map_has ivars (str_of_int id ++ "@" ++ str_of_int i2) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i2) else VNil)
+          // by NAME: `m[:scheme]` / `m["scheme"]`, resolved through the group
+          // names recorded when the pattern was compiled.
+          | Cons (VSym nm, _) -> md_by_name world ivars id nm
+          | Cons (VStr nh, _) -> md_by_name world ivars id (sget nh)
           | _ -> VNil)
        else if str_eq name "size" || str_eq name "length" then
          VInt (val_list_len (matchdata_arr ivars id 0))
@@ -21074,7 +21094,26 @@ and register_builtin_consts = fn (u: unit) ->
     // the errno classes a socket raises
     Cons ("Errno::ENOENT", Cons ("Errno::ECONNREFUSED", Cons ("Errno::ECONNRESET",
     Cons ("Errno::EADDRINUSE", Cons ("Errno::EPIPE", Cons ("Errno::EAGAIN",
-    Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+    Cons ("Errno::EINPROGRESS",
+    Cons ("Errno::EALREADY",
+    Cons ("Errno::EISCONN",
+    Cons ("Errno::ENOTCONN",
+    Cons ("Errno::ETIMEDOUT",
+    Cons ("Errno::EHOSTUNREACH",
+    Cons ("Errno::ENETUNREACH",
+    Cons ("Errno::ECONNABORTED",
+    Cons ("Errno::EBADF",
+    Cons ("Errno::EINTR",
+    Cons ("Errno::EINVAL",
+    Cons ("Errno::EMFILE",
+    Cons ("Errno::ENOTDIR",
+    Cons ("Errno::EEXIST",
+    Cons ("Errno::EACCES",
+    Cons ("Errno::ENOSPC",
+    Cons ("Errno::ESPIPE",
+    Cons ("Errno::ENOMEM",
+    Cons ("Errno::EIO",
+    Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
   // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
   // distinct names for it rather than distinct sources.
   // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
@@ -22870,8 +22909,25 @@ and clausesin_targets = fn clauses ->
 // falls back to the legacy matcher below.
 
 and rxp_parse = fn (pat: str) -> fn (fl: str) ->
+  let _ = map_clear rx_gnums in
+  let _ = map_clear rx_gbodies in
   let (n, p, g) = rxp_alt pat 0 fl 1 in
   if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )") else n
+
+// An inlined `\g<name>` body must not re-capture: the same group numbers are
+// already spoken for by the definition, so every group in the copy goes shy.
+and rxp_shy = fn (n: RNode) ->
+  match n with
+  | NSeq xs -> NSeq (rxp_shy_list xs)
+  | NAlt xs -> NAlt (rxp_shy_list xs)
+  | NRep (b, lo, hi, gr) -> NRep (rxp_shy b, lo, hi, gr)
+  | NGroup (b, _, _) -> NGroup (rxp_shy b, 0, "")
+  | NLook (b, neg) -> NLook (rxp_shy b, neg)
+  | NLookB (b, neg) -> NLookB (rxp_shy b, neg)
+  | NAtomic b -> NAtomic (rxp_shy b)
+  | other -> other
+and rxp_shy_list = fn (xs: RNode list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> Cons (rxp_shy h, rxp_shy_list t)
 
 // number of capture groups in a parsed pattern (next-gnum - 1 from a reparse
 // is avoided: count NGroup nodes with gnum > 0).
@@ -22960,8 +23016,12 @@ and rxp_quant = fn (pat: str) -> fn (atom: RNode) -> fn (p: int) -> fn (fl: str)
 and rxp_lazy = fn (pat: str) -> fn (atom: RNode) -> fn (lo: int) -> fn (hi: int) -> fn (p: int) -> fn (fl: str) ->
   let p = (if str_contains fl "x" then rxp_skip_x pat p else p) in
   if p < str_len pat && str_eq (char_at pat p) "?" then (NRep (atom, lo, hi, false), p + 1)
+  // a POSSESSIVE quantifier is the greedy one wrapped in an atomic group:
+  // `a*+` is exactly `(?>a*)`, which this engine already has. Reading it as
+  // plain greedy (the old lenient path) was wrong -- greedy gives back what it
+  // took, possessive does not, and ruby's RFC3986 URI pattern depends on it.
   else if p < str_len pat && str_eq (char_at pat p) "+" then
-    (if map_has rx_lenient "n" then (NRep (atom, lo, hi, true), p + 1) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: possessive quantifier unsupported")) in fail "mere-ruby: regexp: possessive quantifier unsupported"))
+    (NAtomic (NRep (atom, lo, hi, true)), p + 1)
   else (NRep (atom, lo, hi, true), p)
 
 // {n} {n,} {n,m} {,m}; a brace that is not a quantifier stays a literal.
@@ -23025,6 +23085,26 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
     else if str_eq c "a" then (NChar (chr 7), p + 1, g)
     else if str_eq c "x" then rxp_hex pat (p + 1) g
     else if c >= "1" && c <= "9" then (NBackref (int_of_str c, str_contains fl "i"), p + 1, g)
+    // `\k<name>` -- a backreference by name, and `\g<name>` -- a SUBROUTINE
+    // call, which re-matches that group's pattern here. The call is inlined
+    // (the group's body is spliced in, its own captures made shy) rather than
+    // executed through a call stack: ruby's RFC3986 URI pattern defines its
+    // pieces with `(?<seg>...){0}` and calls them, and nothing there recurses.
+    else if (str_eq c "k" || str_eq c "g") && p + 1 < str_len pat
+            && (str_eq (char_at pat (p + 1)) "<" || str_eq (char_at pat (p + 1)) "'") then
+      (let close = (if str_eq (char_at pat (p + 1)) "<" then ">" else "'") in
+       let (nm, p2) = rxp_name pat (p + 2) close "" in
+       if str_eq c "k" then
+         (if map_has rx_gnums nm
+          then (NBackref ((match map_get rx_gnums nm with VInt k -> k | _ -> 0), str_contains fl "i"), p2, g)
+          else (let __fm = ("mere-ruby: regexp parse: undefined group name reference: " ++ nm) in
+                let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm))
+       else
+         (if map_has rx_gbodies nm
+          then (let src = (match map_get rx_gbodies nm with VStr h -> sget h | _ -> "") in
+                let (nb, _, _) = rxp_alt src 0 fl 1 in (rxp_shy nb, p2, g))
+          else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
+                let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
     // \cX / \C-X control escapes: the char's code masked to the control range.
     else if str_eq c "c" then
       (if p + 1 < str_len pat then (NChar (chr (rxp_ord (char_at pat (p + 1)) - (rxp_ord (char_at pat (p + 1)) / 32) * 32)), p + 2, g)
@@ -23095,11 +23175,15 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
           (let (nm, p2) = rxp_name pat (p + 2) ">" "" in
            let _ = rxp_name_check nm in
            let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
+           let _ = map_set rx_gnums nm (VInt g) in
+           let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
            (NGroup (n, g, nm), rxp_close pat p3, g2)))
      else if str_eq c2 "'" then
        (let (nm, p2) = rxp_name pat (p + 2) "'" "" in
         let _ = rxp_name_check nm in
         let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
+        let _ = map_set rx_gnums nm (VInt g) in
+        let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
         (NGroup (n, g, nm), rxp_close pat p3, g2))
      // (?>...) atomic (possessive) group — non-capturing; once its body
      // matches, backtracking never re-enters it. Captures inside keep their
@@ -23455,7 +23539,84 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
     let _ = map_set prog (str_of_int endpc) IMatch in
     let _ = map_set prog ("meta") (IMeta (endpc + 1, ng)) in
     let _ = map_set rx_progs key prog in
+    // the names are still in rx_gnums from the parse just above
+    let _ = map_set rx_prog_names key (mkstr (rx_names_join ())) in
     prog
+
+// the parse's named groups, flattened to "name=number|..." (insertion order is
+// not preserved by the map, so the list is sorted by number when it is read).
+// the group number a name was compiled to, or -1.
+and md_name_num = fn ivars -> fn (id: int) -> fn (nm: str) ->
+  let key = (if map_has ivars (str_of_int id ++ "@__key")
+             then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+  if str_eq key "" then (0 - 1)
+  else if map_has rx_prog_names key then
+    (let tbl = (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") in
+     md_find_name tbl nm)
+  else (0 - 1)
+
+and md_find_name = fn (tbl: str) -> fn (nm: str) ->
+  md_find_name_go (str_split tbl "|") nm
+
+and md_find_name_go = fn (items: str list) -> fn (nm: str) ->
+  match items with
+  | Nil -> (0 - 1)
+  | Cons (it, rest) ->
+    (let i = str_find_from it "=" 0 in
+     if i >= 0 && str_eq (substring it 0 i) nm
+     then int_of_str (substring it (i + 1) (str_len it))
+     else md_find_name_go rest nm)
+
+and md_by_name = fn world -> fn ivars -> fn (id: int) -> fn (nm: str) ->
+  let k = md_name_num ivars id nm in
+  if k < 0 then raise_exc world "IndexError" ("undefined group name reference: " ++ nm)
+  else if map_has ivars (str_of_int id ++ "@" ++ str_of_int k)
+  then map_get ivars (str_of_int id ++ "@" ++ str_of_int k) else VNil
+
+// the pattern's group names, in group-number order.
+and md_names = fn ivars -> fn (id: int) ->
+  let key = (if map_has ivars (str_of_int id ++ "@__key")
+             then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+  if str_eq key "" || (if map_has rx_prog_names key then false else true) then Nil
+  else
+    (let tbl = (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") in
+     if str_eq tbl "" then Nil else md_names_sorted (str_split tbl "|") 1 Nil)
+
+// pick the name whose number is `k`, walking k upward: the table is small.
+and md_names_sorted = fn (items: str list) -> fn (k: int) -> fn (acc: str list) ->
+  if k > 99 then rev_strs acc Nil
+  else
+    (let hit = md_name_at items k in
+     if str_eq hit "" then md_names_sorted items (k + 1) acc
+     else md_names_sorted items (k + 1) (Cons (hit, acc)))
+
+// name => capture, interleaved for mkhash.
+and md_named_pairs = fn world -> fn ivars -> fn (id: int) -> fn (nms: str list) ->
+  match nms with
+  | Nil -> Nil
+  | Cons (nm, rest) ->
+    Cons (mkstr nm, Cons (md_by_name world ivars id nm, md_named_pairs world ivars id rest))
+
+and md_name_at = fn (items: str list) -> fn (k: int) ->
+  match items with
+  | Nil -> ""
+  | Cons (it, rest) ->
+    (let i = str_find_from it "=" 0 in
+     if i >= 0 && str_eq (substring it (i + 1) (str_len it)) (str_of_int k)
+     then substring it 0 i else md_name_at rest k)
+
+and rx_names_join = fn (u: unit) ->
+  let acc = map_new () in
+  let _ = map_iter rx_gnums (fn (k: str) -> fn (v: Val) ->
+            map_set acc k (match v with VInt i -> str_of_int i | _ -> "0")) in
+  rx_names_fold acc
+
+and rx_names_fold = fn m ->
+  let out = map_new () in
+  let _ = map_set out "s" "" in
+  let _ = map_iter m (fn (k: str) -> fn (v: str) ->
+            map_set out "s" ((map_get out "s") ++ (if str_eq (map_get out "s") "" then "" else "|") ++ k ++ "=" ++ v)) in
+  map_get out "s"
 
 // ---- regex VM (single executor: end index + immutable capture saves) ------
 
@@ -23659,7 +23820,7 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
   if map_has rx_bad key then RBadPat
   else
     let ok = try_or (fn (u: unit) -> let _ = rxc_get pat fl in true) false in
-    if ok then rxv_search_go (map_get rx_progs key) s start (str_len s)
+    if ok then (let _ = map_set rx_cur "k" (mkstr key) in rxv_search_go (map_get rx_progs key) s start (str_len s))
     else (let _ = map_set rx_bad key VNil in RBadPat)
 and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
   if i > len then RNoHit
@@ -23872,7 +24033,9 @@ and rxv_export_caps = fn (saves: (int * int) list) -> fn (ng: int) ->
   let _ = rx_clear_caps 1 in
   rxv_export_go saves ng 1
 and rxv_export_go = fn (saves: (int * int) list) -> fn (ng: int) -> fn (g: int) ->
-  if g > ng || g > 9 then ()
+  // 64, not 9: `$1`..`$9` are all ruby exposes as globals, but MatchData
+  // answers every group, and ruby's own URI pattern has fifteen.
+  if g > ng || g > 64 then ()
   else
     let a = rxv_slot_get saves (2 * g) in
     let b = rxv_slot_get saves (2 * g + 1) in
@@ -23942,7 +24105,7 @@ and rx_capture_names = fn (pat: str) -> fn (p: int) ->
     else rx_capture_names pat (p + 1)
 
 and rx_clear_caps = fn (i: int) ->
-  if i > 9 then ()
+  if i > 64 then ()
   else
     let _ = if map_has rx_caps ("s" ++ str_of_int i) then map_delete rx_caps ("s" ++ str_of_int i) else () in
     let _ = if map_has rx_caps ("e" ++ str_of_int i) then map_delete rx_caps ("e" ++ str_of_int i) else () in
@@ -23973,11 +24136,14 @@ and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> 
   let _ = map_set ivars (str_of_int id ++ "@__st") (VInt st) in
   let _ = map_set ivars (str_of_int id ++ "@__en") (VInt en) in
   let _ = (if ng >= 0 then map_set ivars (str_of_int id ++ "@__ng") (VInt ng) else ()) in
+  // the pattern this match came from, so #[](:name) / #names / #named_captures
+  // can look its group names up (rx_prog_names, keyed the same way).
+  let _ = (if map_has rx_cur "k" then map_set ivars (str_of_int id ++ "@__key") (map_get rx_cur "k") else ()) in
   let _ = rx_store_groups ivars id sv 1 in
   rx_pub_groups sv 1 true
 
 and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
-  if g > 9 then ()
+  if g > 64 then ()
   else
     let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
     let _ = (if map_has rx_caps ks && map_has rx_caps ke then
@@ -23993,13 +24159,16 @@ and md_collect = fn ivars -> fn (id: int) -> fn (i: int) -> fn (hi: int) ->
   if i > hi then Nil
   else Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int i) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i) else VNil), md_collect ivars id (i + 1) hi)
 // MatchData#values_at(*indices)
-and md_values_at = fn ivars -> fn (id: int) -> fn (idxs: Val list) ->
+and md_values_at = fn world -> fn ivars -> fn (id: int) -> fn (idxs: Val list) ->
   match idxs with
   | Nil -> Nil
   | Cons (VInt n, t) ->
     Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int n) then map_get ivars (str_of_int id ++ "@" ++ str_of_int n) else VNil),
-          md_values_at ivars id t)
-  | Cons (_, t) -> Cons (VNil, md_values_at ivars id t)
+          md_values_at world ivars id t)
+  // a name is as good as a number here, as in ruby
+  | Cons (VSym nm, t) -> Cons (md_by_name world ivars id nm, md_values_at world ivars id t)
+  | Cons (VStr nh, t) -> Cons (md_by_name world ivars id (sget nh), md_values_at world ivars id t)
+  | Cons (_, t) -> Cons (VNil, md_values_at world ivars id t)
 
 and matchdata_arr = fn ivars -> fn (id: int) -> fn (start: int) ->
   // with a recorded group count, nil-fill unparticipated trailing groups.
@@ -24763,6 +24932,27 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set sup "Errno::EADDRINUSE" "SystemCallError" in
   let _ = map_set sup "Errno::EPIPE" "SystemCallError" in
   let _ = map_set sup "Errno::EAGAIN" "SystemCallError" in
+  // EWOULDBLOCK IS EAGAIN here, and ruby gives them one class, not two
+  let _ = map_set consts "Errno::EWOULDBLOCK" (VClass "Errno::EAGAIN") in
+  let _ = map_set sup "Errno::EINPROGRESS" "SystemCallError" in
+  let _ = map_set sup "Errno::EALREADY" "SystemCallError" in
+  let _ = map_set sup "Errno::EISCONN" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOTCONN" "SystemCallError" in
+  let _ = map_set sup "Errno::ETIMEDOUT" "SystemCallError" in
+  let _ = map_set sup "Errno::EHOSTUNREACH" "SystemCallError" in
+  let _ = map_set sup "Errno::ENETUNREACH" "SystemCallError" in
+  let _ = map_set sup "Errno::ECONNABORTED" "SystemCallError" in
+  let _ = map_set sup "Errno::EBADF" "SystemCallError" in
+  let _ = map_set sup "Errno::EINTR" "SystemCallError" in
+  let _ = map_set sup "Errno::EINVAL" "SystemCallError" in
+  let _ = map_set sup "Errno::EMFILE" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOTDIR" "SystemCallError" in
+  let _ = map_set sup "Errno::EEXIST" "SystemCallError" in
+  let _ = map_set sup "Errno::EACCES" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOSPC" "SystemCallError" in
+  let _ = map_set sup "Errno::ESPIPE" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOMEM" "SystemCallError" in
+  let _ = map_set sup "Errno::EIO" "SystemCallError" in
   let _ = map_set sup "EOFError" "IOError" in
   let _ = map_set sup "ThreadError" "StandardError" in
   let _ = map_set sup "fatal" "Exception" in
