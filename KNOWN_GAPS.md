@@ -141,6 +141,25 @@ assigns. No installed gem does it — the tree was searched before the two were
 left out. Fixing it means letting them read as ordinary identifiers in
 expression position, which is where their statement syntax is decided.
 
+## `openssl` is a hash function, and nothing else
+
+`require "openssl"` gives `OpenSSL::Digest` (SHA1, SHA256, MD5 — the digests
+mere-ruby already ships, wearing OpenSSL's class shape) and `OpenSSL::HMAC`,
+written out in ruby: it is two hashes and an xor. Both were compared against
+the real OpenSSL, not merely against themselves.
+
+`OpenSSL::SSL`, `X509` and `PKey` are **not defined at all** — not even as
+classes that raise. A gem that needs TLS should fail on the constant it
+actually needs (`uninitialized constant OpenSSL::SSL`), which names the
+missing capability, rather than load and fail somewhere further away.
+`OpenSSL::Cipher` is the one exception: its `CipherError` is a class that
+activesupport names at load time, so the class exists and `Cipher.new`
+raises.
+
+Linking real TLS would be a decision, not a gap: Mere has `tcp_starttls`
+(OpenSSL, native only), so the cost is a permanent libssl dependency that the
+Wasm target cannot carry.
+
 ## `socket` speaks TCP, and only TCP
 
 `TCPSocket`, `TCPServer`, `BasicSocket`, `IPSocket`, `Socket` (constants and
