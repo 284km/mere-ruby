@@ -266,3 +266,28 @@ returns nil; and stderr is a separate import now, which the page routes to the
 same output panel the program's own output goes to. A program that needs any
 of those needs the native build.
 
+
+## `pack`/`unpack` cover the integer, string and float directives, not all of them
+
+`pack("E")` and its family (`E`/`e`/`G`/`g`/`D`/`d`/`F`/`f`) hand out real
+IEEE-754 bytes, recovered by arithmetic rather than by looking at the
+representation: scale the value into `[1, 2)` to find the exponent, and the
+remaining fraction is an exact integer. Zero (both signs), subnormals,
+infinities and NaN are all handled, and `unpack` inverts every one of them.
+The directives that remain unimplemented are the width-suffixed and
+platform-dependent integer ones (`l`, `q`, `w`, `j`, `!`-suffixed), `B`/`b`
+bit strings, `M`/`m`/`u` encodings, and `@`/`X` positioning.
+
+## A String's instance variables do not survive `dup`
+
+`str.instance_variable_set(:@x, 1)` works, and so does reading it back — the
+storage is keyed by the string's handle. `dup` copies the string but not that
+storage, so the copy answers nil. An object's `dup` does copy its ivars; this
+is the primitive path, which does not have the world to copy them through.
+
+## A character literal is one BYTE unless it is an escape
+
+`?a`, `?\001`, `?\x41`, `?\n`, `?\s` and `?\u00e9` all read as ruby reads
+them. A literal *multibyte* character — `?é` written directly — takes only its
+first byte, because the source is scanned as bytes there. Written as an escape
+it is correct, and inside a string (`"é"`) it is correct either way.

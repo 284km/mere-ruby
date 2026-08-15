@@ -6,6 +6,11 @@
 #
 #   ./parsetest/run.sh <dir> [dir ...]
 #
+# The tree the recorded FAILURES.txt is measured over is a ruby checkout's
+# whole spec/ (ruby-spec, plus the bundler and mspec suites vendored under it)
+# and a rubygems checkout's lib/ -- about 5400 files ruby -c accepts. Sweeping
+# a NARROWER tree gives a smaller number that is not comparable with it.
+#
 # The reference is `ruby -c`: a file CRuby itself rejects (newer syntax than
 # the reference ruby, or a fixture that is deliberately broken) is SKIPped, so
 # the number counts only syntax that ruby accepts and mere-ruby does not.
@@ -22,6 +27,10 @@ out="$here/FAILURES.txt"
 ok=0; bad=0; skip=0
 for dir in "$@"; do
   [ -d "$dir" ] || { echo "skip $dir (not a directory)"; continue; }
+  # the recorded list names each file relative to the swept tree's parent
+  # (spec/ruby/core/array/... ), never by the absolute path it happened to
+  # live at on one machine: where the checkout sits is not part of the finding.
+  root="$(cd "$dir/.." && pwd)/"
   # find is the only way to enumerate a tree here, and -print0 would need xargs
   # to survive spaces; the corpora in question have none.
   for f in $(find "$dir" -name '*.rb' -type f | sort); do
@@ -37,7 +46,8 @@ for dir in "$@"; do
       bad=$((bad + 1))
       # strip the absolute path: the message repeats it, and the list is
       # easier to group by construct without it
-      printf '%s\t%s\n' "$(printf '%s' "$msg" | sed "s#$f##g" | tr '\n' ' ')" "$f" >> "$out"
+      printf '%s\t%s\n' "$(printf '%s' "$msg" | sed "s#$f##g" | tr '\n' ' ')" \
+        "$(printf '%s' "$f" | sed "s#^$root##")" >> "$out"
     fi
   done
 done
