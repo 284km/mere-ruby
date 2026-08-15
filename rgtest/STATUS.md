@@ -27,13 +27,13 @@ Loaded straight from a rubygems checkout, no shims:
 | `Gem::Dependency` (`requirement` / `type` / `match?` / `=~`) | byte-identical |
 | `lib/**/*.rb` that mere-ruby's parser accepts | **330 / 428** |
 
-## The test suite (2026-08-13)
+## The test suite (2026-08-15)
 
 | file | ruby | mere-ruby |
 |---|---|---|
 | `test_gem_version.rb` | pass=32 fail=0 err=0 | pass=29 fail=0 err=3 |
 | `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=25 fail=0 err=10 |
-| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=20 fail=0 err=12 |
+| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=21 fail=0 err=11 |
 
 The ruby column is not 100% either: the shim deliberately does not reproduce
 the sandbox (temp gem home, installed gem fixtures) the real helper builds, so
