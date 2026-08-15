@@ -481,6 +481,12 @@ let builtin_alias = map_new ();
 // `Warning[:deprecated] = true` — the warning-category switches, remembered so
 // a program reads back what it set.
 let warn_cats = map_new ();
+// `trace_var(:$g) { }`: the proc to run when that global is assigned. Behind
+// the "gvt" hook flag, so an untraced program pays one map lookup per global
+// write and nothing else.
+let gvar_traces = map_new ();
+// `/.../o` results, keyed by the literal's source site (file:offset).
+let rx_once = map_new ();
 // hash handles that originate from keyword-argument syntax (`key: v` / `**h`)
 // at a call site, as opposed to a positional `{...}` literal or hash variable.
 // Ruby 3.0 keeps these separate: only a kwarg-origin trailing hash binds to a
@@ -1126,6 +1132,21 @@ let is_punct1 = fn (c: str) ->
 // "1" followed by n zeros — denominator for a decimal-fraction Rational literal.
 let rec pow10_str = fn (n: int) -> if n <= 0 then "1" else pow10_str (n - 1) ++ "0";
 
+// Can the `:` at `i` open a SYMBOL? Not when it is glued to the end of a
+// name -- `{a:1}` and `f(red:nil)` are labels -- and that is true whatever
+// follows the colon, a bare name or a quote (`{x:'true'}`).
+let colon_opens_sym = fn (s: str) -> fn (i: int) ->
+  if i > 0 then
+    (let pc = char_at s (i - 1) in
+     // `?` and `!` end a method NAME (`empty?:`), but standing alone they are
+     // operators -- `!:sym` is a negated symbol.
+     if str_eq pc "?" || str_eq pc "!" then
+       (if i > 1 then (let pc2 = char_at s (i - 2) in
+                       if is_alnum pc2 || str_eq pc2 "_" then false else true)
+        else true)
+     else if is_alnum pc || str_eq pc "_" then false else true)
+  else true;
+
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
   else
@@ -1292,16 +1313,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     // value, which is how ruby reads them. Only a colon that does not follow
     // a name character can open a symbol.
     else if str_eq c ":" && i + 1 < str_len s && is_alpha (char_at s (i + 1))
-            && (if i > 0 then
-                  (let pc = char_at s (i - 1) in
-                   // `?` and `!` end a method NAME (`empty?:`), but standing
-                   // alone they are operators -- `!:sym` is a negated symbol.
-                   if str_eq pc "?" || str_eq pc "!" then
-                     (if i > 1 then (let pc2 = char_at s (i - 2) in
-                                     if is_alnum pc2 || str_eq pc2 "_" then false else true)
-                      else true)
-                   else if is_alnum pc || str_eq pc "_" then false else true)
-                else true) then
+            && colon_opens_sym s i then
       // :symbol — include a trailing ? ! or = (:even?, :sort!, :m=),
       // guarding != == and the hash rocket =>.
       let j0 = scan_ident s (i + 1) in
@@ -1317,8 +1329,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
           else j0
         else j0 in
       Cons (TSym (substring s (i + 1) j), lex_go s j)
-    else if str_eq c ":" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "'" then
-      // :'quoted symbol'
+    else if str_eq c ":" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "'"
+            && colon_opens_sym s i then
+      // :'quoted symbol' -- unless the colon closes a label, in which case
+      // `{x:'true'}` is the key x and the STRING 'true'.
       let (lit, j) = lex_sq s (i + 2) "" in
       Cons (TSym lit, lex_go s j)
     else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "@" && str_eq (char_at s (i + 2)) "@" then
@@ -1405,8 +1419,11 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let (lit, fl, j) = scan_regex s (i + 1) "" in
       if rx_has_interp lit 0 then
         let toks = lex_go (rx_interp_src lit) 0 in
+        // the literal's own offset goes with it: `/#{x}/o` builds ONCE, and
+        // "once" means once per SITE, which is what the offset names.
         tapp (Cons (TP "(s", drop_eof toks))
-             (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl, Cons (TP ")", lex_go s j)))))))
+             (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl,
+               Cons (TP ",", Cons (TInt i, Cons (TP ")", lex_go s j)))))))))
       else Cons (TRegex (lit, fl), lex_go s j)
     else if str_eq c "%" && percent_body s i >= 0 then
       // %(...) / %q(...) / %Q(...) raw strings; %w(...) a word array.
@@ -1425,7 +1442,8 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
          let fl = substring s rj fj in
          if rx_has_interp rlit 0 then
            tapp (Cons (TP "(s", drop_eof (lex_go (rx_interp_src rlit) 0)))
-                (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl, Cons (TP ")", lex_go s fj)))))))
+                (Cons (TP ")", Cons (TP ".", Cons (TId "__regex", Cons (TP "(", Cons (TStrL fl,
+                  Cons (TP ",", Cons (TInt i, Cons (TP ")", lex_go s fj)))))))))
          else Cons (TRegex (rlit, fl), lex_go s fj))
       // %x{...} is a command literal (same as backticks): a call to the `
       // method with the interpolated body.
@@ -7976,12 +7994,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then VNil else
        (match rv with
         | VObj id ->
-          let cls = map_get ocls (str_of_int id) in
-          if has_meth world cls name &&
-             (if meth_private world cls name then false
-              else if meth_protected world cls name then protected_ok env world cls
-              else true)
-          then mkstr "method" else VNil
+          // ruby answers `defined?(o.m)` by ASKING the object: a singleton or
+          // user-defined respond_to? decides it, and a method the dispatcher
+          // implements (`o.to_s`) counts as much as one in the table.
+          (let cls = map_get ocls (str_of_int id) in
+           if has_meth world cls name then
+             (if meth_private world cls name then VNil
+              else if meth_protected world cls name
+              then (if protected_ok env world cls then mkstr "method" else VNil)
+              else mkstr "method")
+           // a method the dispatcher implements (`o.to_s`) is defined too...
+           else if is_prim_method name || builtin_obj_has cls name then mkstr "method"
+           // ...and so is one the object only CLAIMS, through respond_to? or
+           // respond_to_missing? -- which is why ruby ends up asking it.
+           else if responds world rv name then mkstr "method" else VNil)
         | VClass c -> if str_eq name "new" || has_meth world c name || has_meth world ("(sng:" ++ c ++ ")") name then mkstr "method" else VNil
         | _ -> mkstr "method")
      | EScopedRead (recv, cn) ->
@@ -8042,6 +8068,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else run_meth world superblk recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
   | ESuperB (zsuper, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
+    // a block written at a call site captures the ENCLOSING method's block, so
+    // `yield` inside it reaches the caller's block rather than nothing --
+    // `super { |x| yield(x) }` depends on it, exactly as `m { yield }` does.
+    let (sbh, sbp, sbb, sbe) = blk_capture blk (true, bp, bb, env) bb in
     let defcls = (match lv_get env "__defcls" with VClass c -> c | _ -> "") in
     let meth = (match lv_get env "__meth" with VStr s -> let s = sget s in s | _ -> "") in
     let recv = if lv_has env "self" then lv_get env "self" else VMain in
@@ -8054,23 +8084,23 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                else eval_args env world blk arges in
     if is_sng_cls defcls then
       (let supercls = sng_supername world defcls in
-       if has_meth world supercls meth then invoke world (true, bp, bb, env) recv supercls meth args
+       if has_meth world supercls meth then invoke world (sbh, sbp, sbb, sbe) recv supercls meth args
        // a definition hook (inherited / included / ...) is a no-op in Ruby,
        // so `super` from an override of one has somewhere to land.
        else if is_definition_hook meth then VNil
        // `super` from a `def self.new` override is Class#new: allocate and
        // run initialize, exactly as the built-in path would have.
-       else if str_eq meth "new" then (match recv with VClass c9 -> new_obj_wb world c9 args (true, bp, bb, env) | _ -> raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
+       else if str_eq meth "new" then (match recv with VClass c9 -> new_obj_wb world c9 args (sbh, sbp, sbb, sbe) | _ -> raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
        else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
     else
       (let a2 = lookup_anc world (anc_after (ancestors_of world (super_base world recv)) defcls) meth in
-       if str_eq a2 "" then super_missing world (true, bp, bb, env) recv meth args
-       else run_meth world (true, bp, bb, env) recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
+       if str_eq a2 "" then super_missing world (sbh, sbp, sbb, sbe) recv meth args
+       else run_meth world (sbh, sbp, sbb, sbe) recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
   | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
   | EAssign (name, e) ->
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
-            then map_set globals (gvar_slot (substring name 1 (str_len name))) v
+            then gvar_write world (gvar_slot (substring name 1 (str_len name))) v
             else if str_len name > 0 && str_eq (char_at name 0) "@"
             then assign_one env world name v
             else if is_upper_first name then
@@ -8437,6 +8467,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#loop: run the block until break (or a StopIteration raise).
     if str_eq name "loop" && (if map_has meths "loop" then false else true) then
       run_loop_builtin env world blk (true, bp, bb, env)
+    // `trace_var(:$g) { |v| ... }` in its block form: the block is the tracer.
+    else if str_eq name "trace_var" && (if map_has meths "trace_var" then false else true) then
+      (let pid = map_len proc_store in
+       let _ = map_set proc_store (str_of_int pid) (true, bp, bb, env) in
+       match args with
+       | Cons (gv, _) ->
+         (let gn = gvar_trace_name (to_s gv) in
+          let _ = map_set gvar_traces gn (VProc pid) in
+          let _ = map_set hook_flags "gvt" VNil in VNil)
+       | _ -> VNil)
     // catch(:tag) { ... throw :tag, v ... } via the flow-signal unwind.
     else if str_eq name "catch" && (if map_has meths "catch" then false else true) then
       (let tag = (match args with Cons (t, _) -> t | _ -> VNil) in
@@ -9057,10 +9097,45 @@ and all_digits = fn (s: str) -> fn (i: int) ->
 and gvar_slot = fn (k: str) ->
   if map_has gvar_alias k then (match map_get gvar_alias k with VStr h -> gvar_slot (sget h) | _ -> k) else k
 
+// the slot name a `trace_var(:$g)` argument names ("$g" / :$g / "g" -> "g")
+// `/#{expr}/o` interpolates ONCE: the first value built at that source site
+// is the regex from then on. The site is named by the literal's offset, which
+// the lexer passes along; without the o flag nothing is remembered.
+and rx_build_once = fn (body: str) -> fn (fl: str) -> fn (args: Val list) ->
+  if str_contains fl "o" then
+    (let site = (match args with Cons (_, Cons (VInt n, _)) -> n | _ -> 0 - 1) in
+     if site < 0 then VRegex (body, fl)
+     else
+       (let f = (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h -> sget h | _ -> "") else "") in
+        let k = f ++ ":" ++ str_of_int site in
+        if map_has rx_once k then map_get rx_once k
+        else (let v = VRegex (body, fl) in let _ = map_set rx_once k v in v)))
+  else VRegex (body, fl)
+
+and gvar_trace_name = fn (n: str) ->
+  gvar_slot (if str_len n > 0 && str_eq (char_at n 0) "$" then substring n 1 (str_len n) else n)
+// run the tracer for a global that has one. Every global write goes through
+// gvar_write, so a traced variable fires wherever it is assigned.
+and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
+  let _ = map_set globals slot v in
+  if map_has hook_flags "gvt" && map_has gvar_traces slot
+     && (if map_has trace_fn "gvbusy" then false else true) then
+    (match map_get gvar_traces slot with
+     | VProc pid ->
+       (let _ = map_set trace_fn "gvbusy" VNil in
+        let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+        // a raise inside the tracer belongs to the ASSIGNMENT: ruby lets it
+        // out, so the rescue around `$var = 100` is the one that sees it.
+        // The busy flag is cleared first, or the unwind would leave it set.
+        let _ = map_delete trace_fn "gvbusy" in
+        let _ = run_block world nb (proc_as_block pid) (Cons (v, Nil)) in ())
+     | _ -> ())
+  else ()
+
 and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   let (meths, sup, ocls, ivars) = world in
   if str_len tgt > 0 && str_eq (char_at tgt 0) "$" then
-    let _ = map_set globals (gvar_slot (substring tgt 1 (str_len tgt))) v in ()
+    let _ = gvar_write world (gvar_slot (substring tgt 1 (str_len tgt))) v in ()
   // "@@x" is a class variable, not an ivar named "@x" — same split SIVarAssign
   // makes, needed here so `@@a, @@b = ...` writes class variables.
   else if str_len tgt > 1 && str_eq (substring tgt 0 2) "@@" then
@@ -11041,7 +11116,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | VStr sp ->
        (let body = sget sp in
         let fl = (match args with Cons (VStr f, _) -> sget f | _ -> "") in
-        if rx_validate body fl then VRegex (body, fl)
+        if rx_validate body fl then rx_build_once body fl args
         // name the pattern: a runtime-built regex is usually assembled from
         // pieces, and the text is the only way to see which piece is bad.
         else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
@@ -11613,6 +11688,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              arr_new (if str_eq name "entries" then Cons (mkstr ".", Cons (mkstr "..", names)) else names))
           | _ -> arr_new Nil)
        else if str_eq name "home" then mkstr (env_get "HOME")
+       // Dir.open(path) -> a Dir object (the instance side is Ruby, see the
+       // prelude); with a block it yields the object and answers the block.
+       else if str_eq name "open" || str_eq name "new" then
+         (match args with
+          | Cons (VStr ph, _) -> new_obj world "Dir" (Cons (mkstr (sget ph), Nil))
+          | _ -> VNil)
+       // Dir.mktmpdir / Dir.tmpdir: `tmpdir` is a stdlib file in CRuby; here
+       // the one thing it adds is this directory name.
+       else if str_eq name "tmpdir" then
+         (let t = env_get "TMPDIR" in mkstr (if str_eq t "" then "/tmp" else t))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Dir"))
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
@@ -11628,7 +11713,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       (if (opt / 4) - (opt / 8) * 2 == 1 then "m" else "")
                     | Cons (VStr fs, _) -> sget fs
                     | _ -> "") in
-          if rx_validate body fl then VRegex (body, fl)
+          if rx_validate body fl then rx_build_once body fl args
           else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
        | Cons (VRegex (b2, f2), _) -> VRegex (b2, f2)
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: Regexp.new expects a string")) in fail "mere-ruby: Regexp.new expects a string"))
@@ -13468,6 +13553,15 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
 // it was written, so the yield still reaches THAT method's block after the
 // literal has been handed to another method (which installs its own). Only
 // bodies that actually yield pay for this.
+// `public def m` at the top level: copy the top-level method into Object's
+// table, where every receiver's lookup ends up.
+and publish_toplevel = fn meths -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let _ = (if map_has meths n then map_set meths ("Object#" ++ n) (map_get meths n) else ()) in
+    publish_toplevel meths rest
+
 and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
   match cur with
   | (true, _, _, _) ->
@@ -14388,7 +14482,12 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
     // the object; a spec mock answers true here). Only consult it when the
     // class defines its own (not the builtin), to avoid recursion.
     if has_meth world cls "respond_to?" then
-      truthy (invoke world nb (VObj id) cls "respond_to?" (Cons (VSym name, Nil)))
+      // ruby passes the include_all flag only to a respond_to? that TAKES it
+      // (it looks at the arity), so a one-parameter override still works and
+      // a two-parameter one does not get an ArgumentError.
+      (let extra = (match lookup_meth world cls "respond_to?" with
+                    | Meth (ps, ds, _) -> (if mandatory_pos_count ps ds >= 2 then Cons (VBool false, Nil) else Nil)) in
+       truthy (invoke world nb (VObj id) cls "respond_to?" (Cons (VSym name, extra))))
     else
     // a private method does not answer respond_to? (ruby needs the
     // include_all argument for that), so `private :m` really hides it.
@@ -14428,8 +14527,11 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   // a Regexp had no entry at all, so it denied `match` -- and optparse asks
   // exactly that before accepting a pattern (`pat.respond_to?(:match) or
   // raise`), which is where its load stopped.
-  | VRegex (_, _) -> is_regex_method name || is_prim_method name
-  | _ -> is_prim_method name
+  | VRegex (_, _) -> prim_user_has world recv name || is_regex_method name || is_prim_method name
+  // every other primitive -- Symbol, nil, true/false -- can have methods too,
+  // through its own class or through a reopened Kernel: `module Kernel; def m`
+  // makes `:sym.respond_to?(:m)` true, and asking the table is what says so.
+  | _ -> prim_user_has world recv name || is_prim_method name
 
 // Regexp method names the dispatcher implements, for respond_to?.
 and is_regex_method = fn (name: str) ->
@@ -15014,7 +15116,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "hash" then VInt (val_hash recv)
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
-    (match recv with VStr sp -> let sp = sget sp in VRegex (sp, (match args with Cons (VStr f, _) -> sget f | _ -> "")) | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
+    (match recv with VStr sp -> let sp = sget sp in rx_build_once sp (match args with Cons (VStr f, _) -> sget f | _ -> "") args | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
   // Regexp#options: the same bits Regexp::IGNORECASE and friends name.
   else if str_eq name "options" && (match recv with VRegex _ -> true | _ -> false) then
     (match recv with
@@ -16840,6 +16942,27 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
      | _ ->
        (let _ = (if map_has trace_fn "p" then map_delete trace_fn "p" else ()) in
         let _ = (if map_has hook_flags "stf" then map_delete hook_flags "stf" else ()) in VNil))
+  // `trace_var(:$g) { |v| ... }` runs the block on every assignment to that
+  // global; `untrace_var(:$g)` takes it off. The proc may arrive as an
+  // argument or as a block, so both are accepted here.
+  else if str_eq name "trace_var" then
+    (match args with
+     | Cons (gv, rest) ->
+       (let gn = gvar_trace_name (to_s gv) in
+        let pv = (match rest with Cons (VProc pid, _) -> VProc pid | _ -> VNil) in
+        match pv with
+        | VProc _ -> (let _ = map_set gvar_traces gn pv in
+                      let _ = map_set hook_flags "gvt" VNil in VNil)
+        | _ -> VNil)
+     | _ -> VNil)
+  else if str_eq name "untrace_var" then
+    (match args with
+     | Cons (gv, _) ->
+       (let gn = gvar_trace_name (to_s gv) in
+        let _ = (if map_has gvar_traces gn then map_delete gvar_traces gn else ()) in
+        let _ = (if map_len gvar_traces == 0 && map_has hook_flags "gvt"
+                 then map_delete hook_flags "gvt" else ()) in VNil)
+     | _ -> VNil)
   // Kernel#exit / Kernel#abort — terminate through the native exit, running
   // the at_exit handlers first (which is the only chance they get).
   else if str_eq name "exit" then
@@ -17066,8 +17189,10 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      // a top-level method is a frame too, so `$~` is scoped to it as well.
      let mstate = rx_state_save () in
      let _ = fire_trace world "call" name "Object" in
+     let _ = fire_tp world "call" name "Object" in
      let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
      let _ = fire_trace world "return" name "Object" in
+     let _ = fire_tp world "return" name "Object" in
      let _ = rx_state_restore mstate in
      out)
 
@@ -17325,8 +17450,10 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // method's, which is ruby's rule too.
     let mstate = rx_state_save () in
     let _ = fire_trace world "call" name defcls in
+    let _ = fire_tp world "call" name defcls in
     let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
     let _ = fire_trace world "return" name defcls in
+    let _ = fire_tp world "return" name defcls in
     let _ = rx_state_restore mstate in
     out
 
@@ -17472,6 +17599,25 @@ and fire_trace = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) ->
         let _ = try_or (fn (u: unit) -> run_block world nb (proc_as_block pid) argv) (FNext VNil) in
         let _ = map_delete trace_fn "busy" in ())
      | _ -> ())
+  else ()
+
+// ...and to any TracePoint watching that event. `set_trace_func` and
+// TracePoint are two views on the same three events, so they fire from the
+// same place; a program with neither installed pays one map lookup.
+and fire_tp = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) ->
+  // `tp.enable` arms the hook inside its own frame, so the RETURN from enable
+  // would be the first event -- ruby arms it after that frame instead. Its
+  // own :return events are the difference, so they are not reported.
+  if map_has hook_flags "tp" && (if map_has trace_fn "tpbusy" then false else true)
+     && (if str_eq cls "TracePoint" && str_eq ev "return" then false else true) then
+    (let _ = map_set trace_fn "tpbusy" VNil in
+     let noblk0 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+     let file = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
+     let _ = try_or (fn (u: unit) ->
+               let _ = invoke world noblk0 (VClass "TracePoint") "(sng:TracePoint)" "__fire_ev"
+                         (Cons (VSym ev, Cons (VSym mname, Cons (VClass cls, Cons (file, Nil))))) in VNil)
+               VNil in
+     let _ = map_delete trace_fn "tpbusy" in ())
   else ()
 
 and run_prepended_hook = fn world -> fn (mq: str) -> fn (base: str) ->
@@ -23158,7 +23304,9 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
              // zlib is a C extension in CRuby; here the compression itself is
              // the vendored mgz package and the stream classes are shipped as
              // Ruby source (stdlib_src), so the .so is never looked for.
-             str_eq p0 "zlib.so" then
+             str_eq p0 "zlib.so" ||
+             // tmpdir's one addition, Dir.tmpdir, is a primitive here
+             str_eq p0 "tmpdir" || str_eq p0 "tmpdir.rb" then
        FNext (VBool true)
      else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
@@ -23266,7 +23414,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              else lv_set env name VNil) in
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
-            then map_set globals (gvar_slot (substring name 1 (str_len name))) v
+            then gvar_write world (gvar_slot (substring name 1 (str_len name))) v
             else if str_len name >= 2 && str_eq (substring name 0 2) "::" then (let cn = substring name 2 (str_len name) in let _ = map_set consts cn v in name_anon cn v)
             else if is_upper_first name then
               (let key = const_assign_key env name in
@@ -23556,7 +23704,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c -> let _ = undef_check world c names in let _ = undef_all meths c names in FNext VNil
      | _ -> let _ = undef_top meths names in FNext VNil)
-  | SVis (_, _) -> FNext VNil   // top-level visibility: no-op
+  // Top-level visibility is a no-op except for one case that is observable:
+  // a top-level `def` is a PRIVATE method of Object, and `public def m` (or
+  // `public :m`) makes it public -- so `"str".m` and `:sym.m` work. Copying it
+  // into Object's table is what makes every receiver find it; a plain
+  // top-level def stays where it is, reachable only without a receiver.
+  | SVis (mode, names) ->
+    let (meths, sup, ocls, ivars) = world in
+    let _ = (if str_eq mode "public" then publish_toplevel meths names else ()) in
+    FNext VNil
   | SDoWhile (s2, cond) -> run_dowhile env world blk s2 cond
   | SAndThen (s1, s2) ->
     (match exec_stmt env world blk s1 with
@@ -26206,6 +26362,45 @@ let core_prelude =
   "    def getkey(k); @h.key?(k) ? k : nil; end\n" ++
   "  end\n" ++
   "end\n" ++
+  // Dir.open answers a Dir OBJECT (the class methods above are the rest of
+  // Dir). Only the instance side needs Ruby: the listing itself comes from
+  // the class methods, which are primitives.
+  "class Dir\n" ++
+  "  def initialize(path)\n" ++
+  "    @path = path\n" ++
+  "    @pos = 0\n" ++
+  "  end\n" ++
+  "  def path\n" ++
+  "    @path\n" ++
+  "  end\n" ++
+  "  def to_path\n" ++
+  "    @path\n" ++
+  "  end\n" ++
+  "  def entries\n" ++
+  "    Dir.entries(@path)\n" ++
+  "  end\n" ++
+  "  def children\n" ++
+  "    Dir.children(@path)\n" ++
+  "  end\n" ++
+  "  def each(&b)\n" ++
+  "    entries.each(&b)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def read\n" ++
+  "    e = entries\n" ++
+  "    return nil if @pos >= e.size\n" ++
+  "    v = e[@pos]\n" ++
+  "    @pos = @pos + 1\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "  def rewind\n" ++
+  "    @pos = 0\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def close\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "end\n" ++
   // TracePoint, enough of it for zeitwerk: the :class event, which fires when
   // a class or module body is entered. `#self` cannot be written with `def`
   // (it is a keyword), so it is defined the way ruby's C code effectively
@@ -26218,6 +26413,12 @@ let core_prelude =
   "  def self.__fire(mod)\n" ++
   "    __points.each do |tp|\n" ++
   "      tp.__call(mod)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  def self.__fire_ev(ev, mid, cls, path)\n" ++
+  "    __points.each do |tp|\n" ++
+  "      tp.__call_ev(ev, mid, cls, path)\n" ++
   "    end\n" ++
   "    nil\n" ++
   "  end\n" ++
@@ -26253,11 +26454,37 @@ let core_prelude =
   "  end\n" ++
   "  def __call(mod)\n" ++
   "    return nil unless @enabled\n" ++
+  "    return nil unless @events.empty? || @events.include?(:class)\n" ++
   "    @tp_self = mod\n" ++
   "    @event = :class\n" ++
   "    r = @blk.call(self)\n" ++
   "    @tp_self = nil\n" ++
   "    r\n" ++
+  "  end\n" ++
+  "  def __call_ev(ev, mid, cls, path)\n" ++
+  "    return nil unless @enabled\n" ++
+  "    return nil unless @events.empty? || @events.include?(ev)\n" ++
+  "    @event = ev\n" ++
+  "    @method_id = mid\n" ++
+  "    @defined_class = cls\n" ++
+  "    @path = path\n" ++
+  "    @tp_self = nil\n" ++
+  "    @blk.call(self)\n" ++
+  "  end\n" ++
+  "  def method_id\n" ++
+  "    @method_id\n" ++
+  "  end\n" ++
+  "  def callee_id\n" ++
+  "    @method_id\n" ++
+  "  end\n" ++
+  "  def defined_class\n" ++
+  "    @defined_class\n" ++
+  "  end\n" ++
+  "  def path\n" ++
+  "    @path\n" ++
+  "  end\n" ++
+  "  def lineno\n" ++
+  "    0\n" ++
   "  end\n" ++
   "end\n";
 

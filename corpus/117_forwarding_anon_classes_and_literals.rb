@@ -83,3 +83,83 @@ pt = Point.new(1, "a")
 p pt
 p pt.inspect
 p [pt.to_s, Struct.new(:z).new(9)]
+
+# a `:` glued to a name is a LABEL whatever follows it, quote included
+p({x:'true'})
+p [**{x:'true'}][0][:x]
+p({a:'1', b:"2", c:3})
+p :'quoted sym'
+
+# `public def` at the top level puts the method on Object, where every
+# receiver's lookup ends up; a plain top-level def stays private
+public def shout_it
+  itself
+end
+p [1.shout_it, :s.shout_it, "x".shout_it]
+def kept_private; :p; end
+begin
+  1.kept_private
+rescue NoMethodError
+  p :private_stays_private
+end
+
+# TracePoint sees calls and returns, not just class bodies
+seen = []
+tp = TracePoint.new(:call, :return) { |ev| seen << [ev.event, ev.method_id] }
+def traced_one; 1; end
+tp.enable
+traced_one
+tp.disable
+# only the traced method's own events: whether ENABLING reports its own
+# return is a CRuby frame detail, not something to pin down here
+p seen.select { |e| e[1] == :traced_one }
+
+# a block written at a call site captures the enclosing method's block, so
+# `yield` inside a block passed to super reaches the caller's
+class SuperBase
+  def go; yield("o"); end
+end
+class SuperSub < SuperBase
+  def go; super { |x| yield(x + "k") }; end
+end
+p SuperSub.new.go { |x| x }
+
+# defined?(recv.meth) asks the object
+o = Object.new
+p [defined?(o.to_s), defined?(o.nope)]
+
+# a global can be traced
+watched = []
+trace_var(:$g_watched) { |v| watched << v }
+$g_watched = 1
+$g_watched = 2
+untrace_var(:$g_watched)
+$g_watched = 3
+p watched
+
+# Dir.open answers a Dir object
+Dir.mkdir("/tmp/mrb_corpus_dir") unless Dir.exist?("/tmp/mrb_corpus_dir")
+d = Dir.open("/tmp/mrb_corpus_dir")
+p [d.path, d.class, d.children.sort, d.close]
+
+# `/#{x}/o` interpolates ONCE per source site
+def once_rx(expr)
+  /#{expr}/o
+end
+once_rx("a"); once_rx("b")
+p once_rx("c").source
+def plain_rx(expr)
+  /#{expr}/
+end
+p [plain_rx("a").source, plain_rx("b").source]
+
+# a raise inside a var tracer belongs to the assignment
+def assign_traced
+  $g_raiser = 1
+rescue
+  :rescued
+end
+p assign_traced
+trace_var(:$g_raiser) { raise }
+p assign_traced
+untrace_var(:$g_raiser)

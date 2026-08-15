@@ -86,11 +86,18 @@ loads on it. `#enable`, `#disable`, `#enabled?`, `#self` and `#event` are
 there; the block form of enable/disable and every other event are not.
 
 `set_trace_func(proc)` installs a tracer and fires it for **call**, **return**
-and **class**. Ruby also has `line`, `end`, `c-call`, `c-return`, `raise` and
+and **class**, and a `TracePoint` watching `:call` / `:return` / `:class` fires
+from the same place (with `#method_id`, `#callee_id`, `#defined_class`, `#path`
+and `#event`). Ruby also has `line`, `end`, `c-call`, `c-return`, `raise` and
 `b-call`, and passes a real line number and a Binding; here the line is 0 and
 the binding is nil, because this interpreter keeps neither at run time. A
 tracer that counts calls or watches classes works; one that follows lines does
 not, and one that prints its events prints fewer of them.
+
+`c_call` / `c_return` are a distinction this interpreter does not have: an attr
+accessor is a C method in CRuby and an ordinary one here, so those events would
+be reported for a different set of methods than ruby reports them for. They are
+not fired at all rather than fired wrongly.
 
 Both cost one map lookup while nothing is installed — per class body for
 TracePoint, per method call for set_trace_func.
@@ -291,3 +298,13 @@ is the primitive path, which does not have the world to copy them through.
 them. A literal *multibyte* character — `?é` written directly — takes only its
 first byte, because the source is scanned as bytes there. Written as an escape
 it is correct, and inside a string (`"é"`) it is correct either way.
+
+## A top-level `def` is reachable without a receiver, or on Object if made public
+
+Ruby puts a top-level `def` on Object as a **private** method. Here it lives in
+a table of its own, which is what a bare call looks in; `"str".m` therefore
+raises NoMethodError, exactly as it does in ruby for a private method. What
+`public def m` (or `public :m`) adds is a copy in Object's table, so every
+receiver finds it — which is the whole observable difference between the two
+in ruby. A top-level method that is redefined *after* being made public
+updates the original, not the copy.
