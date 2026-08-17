@@ -15456,6 +15456,27 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           if j >= 0 && j < n then mkstr (utf8_char s j) else VNil
         // s["sub"]: the substring itself if present, else nil.
         | Cons (VStr sub, _) -> let sub = sget sub in if str_contains s sub then mkstr sub else VNil
+        // A Float index is truncated toward zero, the way Ruby does it -- but
+        // Inf and NaN are not indices at all and are a RangeError there. This
+        // arm and the one below used to be a single `VNil`: every argument that
+        // was not an Integer, a Range, a Regexp or a String came back as nil, so
+        // `"abc"[Object.new]` was a value rather than the TypeError it is in
+        // Ruby. Found by the bootstraptest pair that walked into it.
+        | Cons (VFlt f, rest) ->
+          (if flt_is_nan f then prim_raise "RangeError" "float NaN out of range of integer"
+           else if flt_is_inf f then
+             prim_raise "RangeError" ("float " ++ (if f > 0.0 then "Inf" else "-Inf")
+                                      ++ " out of range of integer")
+           else prim_method recv name (Cons (VInt (int_of_float f), rest)))
+        // A number too big for an index is an Integer, so it is not a
+        // conversion problem: Ruby calls it a RangeError.
+        | Cons (VBig _, _) ->
+          prim_raise "RangeError" "bignum too big to convert into `long'"
+        | Cons (other, _) ->
+          prim_raise "TypeError"
+            (match other with
+             | VNil -> "no implicit conversion from nil to integer"
+             | _ -> "no implicit conversion of " ++ class_name other ++ " into Integer")
         | _ -> VNil)
      | VHsh hid -> let xs = hderef hid in let ci = hcbi_on hid in (match args with Cons (k, _) -> if hash_haskey_x ci xs k then hash_get_x ci xs k else hdflt_get hid | _ -> VNil)
      // Integer#[i]: bit i of the number (0 for out-of-range high bits).
@@ -25381,10 +25402,17 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     then rxv_run prog s (pc + 1) (i + 1) saves bt
     else rxv_fail prog s bt
   | IAny ->
-    if i < str_len s && (if str_eq (char_at s i) "\n" then false else true) then rxv_run prog s (pc + 1) (i + 1) saves bt
+    // Ruby's `.` is one CHARACTER. This VM walks bytes, so on a UTF-8 subject it
+    // consumed one byte of a multibyte character: `"こんにちは"[/に./]` came back
+    // as "に\xE3" -- the first byte of what should have been the next character,
+    // which is not even a valid string. Literals and classes still compare byte
+    // by byte (a literal's own bytes line up with the subject's); making the
+    // classes character-aware is the rest of that question and not this fix.
+    if i < str_len s && (if str_eq (char_at s i) "\n" then false else true)
+    then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
     else rxv_fail prog s bt
   | IAnyNL ->
-    if i < str_len s then rxv_run prog s (pc + 1) (i + 1) saves bt
+    if i < str_len s then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
     else rxv_fail prog s bt
   | IClass (items, neg, ci) ->
     if i < str_len s && rxv_cls items neg ci (char_at s i) then rxv_run prog s (pc + 1) (i + 1) saves bt
@@ -25607,16 +25635,17 @@ and rx_here = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
     let quant = (if p + elen < str_len pat then char_at pat (p + elen) else "") in
     if str_eq quant "+" then
       (if i < str_len s && rx_elem pat p (char_at s i)
-       then rx_many pat p elen s (i + 1) else false)
+       then rx_many pat p elen s (i + rx_step pat p s i) else false)
     else if str_eq quant "*" then rx_many pat p elen s i
     // `x?` — zero or one, greedy: try matching the element then the rest,
     // otherwise skip the element (both element and `?` are consumed).
     else if str_eq quant "?" then
-      (if i < str_len s && rx_elem pat p (char_at s i) && rx_here pat (p + elen + 1) s (i + 1) then true
+      (if i < str_len s && rx_elem pat p (char_at s i)
+          && rx_here pat (p + elen + 1) s (i + rx_step pat p s i) then true
        else rx_here pat (p + elen + 1) s i)
     else
       (if i < str_len s && rx_elem pat p (char_at s i)
-       then rx_here pat (p + elen) s (i + 1) else false)
+       then rx_here pat (p + elen) s (i + rx_step pat p s i) else false)
 
 // index of the `]` closing a char class opened at p (past any escapes).
 // index of the `)` matching an already-entered group (call with depth 1 just
@@ -25879,8 +25908,19 @@ and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
 
 // zero-or-more of the element at p, then the rest (greedy with backtrack).
 and rx_many = fn (pat: str) -> fn (p: int) -> fn (elen: int) -> fn (s: str) -> fn (i: int) ->
-  if i < str_len s && rx_elem pat p (char_at s i) && rx_many pat p elen s (i + 1) then true
+  if i < str_len s && rx_elem pat p (char_at s i)
+     && rx_many pat p elen s (i + rx_step pat p s i) then true
   else rx_here pat (p + elen + 1) s i
+
+// How many bytes of the subject one element consumes. `.` is Ruby's "any
+// character", and this engine walks bytes -- so on a UTF-8 string it used to
+// consume ONE BYTE of a multibyte character: `"こんにちは"[/に./]` came back as
+// "に\xE3", the first byte of what should have been the next character. A
+// literal in the pattern is still matched byte by byte (its own bytes line up
+// with the subject's), and a character class is still a byte test; those are
+// the deeper part of Q-bytes-vs-characters and are not this fix.
+and rx_step = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
+  if str_eq (char_at pat p) "." then utf8_clen s i else 1
 
 and rx_elem = fn (pat: str) -> fn (p: int) -> fn (c: str) ->
   let pc = char_at pat p in
