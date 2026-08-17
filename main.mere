@@ -8777,9 +8777,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | Cons (VStr m, rest) -> let m = sget m in (if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis)
           | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: send expects a method name")) in fail "mere-ruby: send expects a method name"))
        else if str_eq name "respond_to?" then
-         (match args with
-          | Cons (VSym m, _) -> VBool (responds world recv m)
-          | Cons (VStr m, _) -> let m = sget m in VBool (responds world recv m)
+         // respond_to?(name, include_all): the second argument was ignored here
+         // too -- this arm is the one a plain value reaches.
+         (let all = (match args with
+                     | Cons (_, Cons (VBool b, _)) -> b
+                     | Cons (_, Cons (VNil, _)) -> false
+                     | Cons (_, Cons (_, _)) -> true
+                     | _ -> false) in
+          let ask = (fn (m: str) ->
+            if responds world recv m then true
+            else if all then has_meth world (class_name recv) m
+            else false) in
+          match args with
+          | Cons (VSym m, _) -> VBool (ask m)
+          | Cons (VStr m, _) -> let m = sget m in VBool (ask m)
           | _ -> VBool false)
        // in-place string mutation: rewrite the receiver's store entry, so
        // every alias sees it (unless the class redefines the method).
@@ -9514,7 +9525,18 @@ and coerce_massign = fn env -> fn world -> fn (rv: Val) -> fn (lone_splat: bool)
     // or a method_missing that answers for :to_ary. Ruby reaches all four --
     // rb_check_funcall ends at method_missing -- and this stopped at the first
     // two, so `a, = obj` on a method_missing mock did not destructure at all.
-    let can = (match rv with
+    // A conversion asks the object for #to_ary regardless of VISIBILITY: Ruby's
+    // rb_check_funcall does not consult respond_to? for a private method, so
+    // `class NilClass; private; def to_ary; [1,2]; end; end` makes `a, b = nil`
+    // destructure there. `responds` deliberately hides private methods (that is
+    // what `private :m` means for respond_to?), which is right for respond_to?
+    // and wrong for this.
+    let priv_conv = (match rv with
+                     | VObj _ -> false
+                     | _ ->
+                       let c0 = class_name rv in
+                       has_meth world c0 "to_ary" && meth_private world c0 "to_ary") in
+    let can = priv_conv || (match rv with
                | VObj oid ->
                  let (m2, sp2, ocls2, iv2) = world in
                  let ocl2 = map_get ocls2 (str_of_int oid) in
@@ -11236,6 +11258,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else val_index_of_w env world xs v 0
         | _ -> VNil)
      | _ -> VNil)
+  // #dup / #clone on a String, Array or Hash must carry the instance variables
+  // over. They are keyed by the VALUE HANDLE for these types (there is no
+  // object id), and the primitive that makes the copy has no `world` to read
+  // them from -- so the copy came back without them: `s.dup` lost an @ivar that
+  // `s.instance_variable_set` had just put there. The object path already
+  // copied its ivars; this is the same thing for the handle-keyed ones.
+  else if (str_eq name "dup" || str_eq name "clone")
+          && (match recv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | _ -> false)
+          && not (has_meth world (class_name recv) name) then
+    (let cp = prim_method recv name args in
+     let (_, _, _, ivars9) = world in
+     let oldp = hng_key recv ++ "@" in
+     let newp = hng_key cp ++ "@" in
+     let tmp9 = map_new () in
+     let _ = (if str_eq (hng_key cp) "" then () else
+                map_iter ivars9 (fn (k: str) -> fn (v: Val) ->
+                  if str_len k > str_len oldp && str_eq (substring k 0 (str_len oldp)) oldp
+                  then map_set tmp9 (newp ++ substring k (str_len oldp) (str_len k)) v
+                  else ())) in
+     let _ = map_iter tmp9 (fn (k: str) -> fn (v: Val) -> map_set ivars9 k v) in
+     cp)
   // Array/Hash #inspect (and #to_s, which aliases it) call #inspect on each
   // element; dispatch a user-defined #inspect here where `world` is in scope.
   else if (str_eq name "inspect" || str_eq name "to_s")
@@ -12210,9 +12253,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "singleton_class?" then VBool (is_sng_cls c)
     // respond_to? on a class/module (also reachable via send).
     else if str_eq name "respond_to?" then
-      (match args with
-       | Cons (VSym m, _) -> VBool (responds world recv m)
-       | Cons (VStr m, _) -> let m = sget m in VBool (responds world recv m)
+      // respond_to?(name, include_all) -- the second argument was ignored, so a
+      // private method stayed hidden even when the caller asked to see it. The
+      // conversion protocol does not go through here (it ignores visibility on
+      // its own), but a program that asks this question deserves the answer.
+      (let all = (match args with
+                  | Cons (_, Cons (VBool b, _)) -> b
+                  | Cons (_, Cons (VNil, _)) -> false
+                  | Cons (_, Cons (_, _)) -> true
+                  | _ -> false) in
+       let ask = (fn (m: str) ->
+         if responds world recv m then true
+         else if all then
+           (let c0 = class_name recv in
+            (match recv with
+             | VObj oid -> (let (_, _, ocls0, _) = world in has_meth world (map_get ocls0 (str_of_int oid)) m)
+             | _ -> has_meth world c0 m))
+         else false) in
+       match args with
+       | Cons (VSym m, _) -> VBool (ask m)
+       | Cons (VStr m, _) -> let m = sget m in VBool (ask m)
        | _ -> VBool false)
     // Module#ancestors: the lookup chain (self, included modules, supers);
     // for a singleton class this is the metaclass chain down to Class.
