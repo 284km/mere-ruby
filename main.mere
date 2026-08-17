@@ -9500,6 +9500,11 @@ and coerce_massign = fn env -> fn world -> fn (rv: Val) -> fn (lone_splat: bool)
     // to_ary counts; otherwise a user respond_to? that answers true (covering
     // method_missing mocks). Only invoke respond_to? when it is user-defined,
     // matching the RHS-splat to_a path.
+    // The same protocol the block-splat path already used, which this was a
+    // poorer copy of: a real to_ary, a user respond_to?, a respond_to_missing?,
+    // or a method_missing that answers for :to_ary. Ruby reaches all four --
+    // rb_check_funcall ends at method_missing -- and this stopped at the first
+    // two, so `a, = obj` on a method_missing mock did not destructure at all.
     let can = (match rv with
                | VObj oid ->
                  let (m2, sp2, ocls2, iv2) = world in
@@ -9507,7 +9512,9 @@ and coerce_massign = fn env -> fn world -> fn (rv: Val) -> fn (lone_splat: bool)
                  if has_meth world ocl2 "to_ary" then true
                  else if has_meth world ocl2 "respond_to?" then
                    truthy (invoke_val_c env world noblk rv "respond_to?" (Cons (VSym "to_ary", Nil)) false)
-                 else false
+                 else if has_meth world ocl2 "respond_to_missing?" then
+                   truthy (invoke_val_c env world noblk rv "respond_to_missing?" (Cons (VSym "to_ary", Cons (VBool false, Nil))) false)
+                 else has_meth world ocl2 "method_missing"
                | _ -> responds world rv "to_ary") in
     if can then
       (match invoke_val_c env world noblk rv "to_ary" Nil false with
@@ -10898,7 +10905,20 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
                  then (match map_get anon_name cls with VStr h -> sget h ++ " " | _ -> "") else "") in
        let ms = (match map_get struct_mem cls with VArr aid -> deref aid | _ -> Nil) in
        "#<struct " ++ nm ++ struct_fields env world oid ms "" ++ ">")
-    else inspect v
+    // Ruby's default: `#<ClassName:0xADDR>`, and with instance variables
+    // `#<C:0xADDR @a=1, @b="x">`. This printed `#<object>` for every object of
+    // every class, which is the one thing an inspect is for -- telling them
+    // apart. The address is this interpreter's object id in Ruby's 16-digit
+    // shape; it is not a memory address there either, only a number nobody
+    // should compare.
+    // Encoding and MatchData have inspects of their own in the value-level
+    // printer, which knows them by their side tables; only an object with no
+    // other answer gets the default one.
+    else if map_has enc_name (str_of_int oid) then inspect v
+    else if map_has md_whole (str_of_int oid) then inspect v
+    else
+      (let ivs = obj_ivar_dump env world oid cls in
+       "#<" ++ cls ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
   | VArr id ->
     if map_has insp_seen (str_of_int id) then "[...]"
     else
@@ -10908,6 +10928,44 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
       r
   | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs_w env world xs "" ++ "}"
   | _ -> inspect v
+
+// the object id as Ruby shows it: 0x + 16 hex digits
+and hex_pad16 = fn (n: int) ->
+  let h = int_to_base n 16 in
+  let rec pad = fn (k: int) -> fn (acc: str) -> if k <= 0 then acc else pad (k - 1) ("0" ++ acc) in
+  pad (16 - str_len h) "" ++ h
+
+// `@a=1, @b="x"` for the object's own instance variables, in the order they
+// were first set (which is the order Ruby shows them in).
+and obj_ivar_dump = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
+  let (_, _, _, iv) = world in
+  let names = ivar_names_of iv oid in
+  ivar_dump_go env world iv oid names ""
+
+// the object's own @ivar names, in the order the map holds them (which is the
+// order they were first set -- the order Ruby shows them in)
+and ivar_names_of = fn iv -> fn (oid: int) ->
+  let pfx = str_of_int oid ++ "@" in
+  let plen = str_len pfx in
+  let tmp = map_new () in
+  let _ = map_iter iv (fn (k: str) -> fn (v: Val) ->
+    if str_len k > plen && str_eq (substring k 0 plen) pfx
+    then (let m = map_len tmp in map_set tmp (str_of_int m) (mkstr (substring k plen (str_len k))))
+    else ()) in
+  ivar_names_go tmp 0 (map_len tmp) Nil
+
+and ivar_names_go = fn tmp -> fn (i: int) -> fn (n: int) -> fn (acc: str list) ->
+  if i >= n then rev_app acc Nil
+  else ivar_names_go tmp (i + 1) n
+         (Cons ((match map_get tmp (str_of_int i) with VStr h -> sget h | _ -> ""), acc))
+
+and ivar_dump_go = fn env -> fn world -> fn iv -> fn (oid: int) -> fn (names: str list) -> fn (acc: str) ->
+  match names with
+  | Nil -> acc
+  | Cons (n, t) ->
+    let v = map_get iv (str_of_int oid ++ "@" ++ n) in
+    ivar_dump_go env world iv oid t
+      (acc ++ (if str_eq acc "" then "" else ", ") ++ "@" ++ n ++ "=" ++ inspect_w env world v)
 
 and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> fn (acc: str) ->
   match ms with
@@ -11183,6 +11241,32 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               | _ -> false)
           && not (has_meth world (class_name recv) name) then
     mkstr (inspect_w env world recv)
+  // An ordinary object's own #inspect / #to_s need the world too, to name the
+  // class: `p obj` reached inspect_w and said `#<C:0x.. @a=1>`, while
+  // `obj.inspect` went to the value-level fallback and said `#<object>` -- two
+  // answers to the same question depending on how it was asked. #to_s is the
+  // class and address without the ivars, as it is in Ruby.
+  else if (str_eq name "inspect" || str_eq name "to_s")
+          && (match recv with
+              | VObj oid ->
+                (let (_, _, ocls9, _) = world in
+                 let c9 = map_get ocls9 (str_of_int oid) in
+                 (if map_has enc_name (str_of_int oid) then false
+                  else if map_has md_whole (str_of_int oid) then false
+                  else if map_has struct_mem c9 then false
+                  // the object's OWN class, not `class_name recv` -- that
+                  // answers "Object" here, so a class with its own #to_s had it
+                  // bypassed by this arm
+                  else if has_meth world c9 name then false
+                  else true))
+              | _ -> false) then
+    (match recv with
+     | VObj oid ->
+       let (_, _, ocls9, _) = world in
+       let c9 = map_get ocls9 (str_of_int oid) in
+       if str_eq name "to_s" then mkstr ("#<" ++ c9 ++ ":0x" ++ hex_pad16 oid ++ ">")
+       else mkstr (inspect_w env world recv)
+     | _ -> mkstr (inspect_w env world recv))
   else
   // a singleton method defined on this exact String/Array/Hash wins.
   let hk = hng_key recv in
