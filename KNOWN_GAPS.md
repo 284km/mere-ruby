@@ -85,6 +85,15 @@ is the event zeitwerk watches to notice an explicit namespace — dry-logic
 loads on it. `#enable`, `#disable`, `#enabled?`, `#self` and `#event` are
 there; the block form of enable/disable and every other event are not.
 
+`#enable` takes `target:` and narrows a tracepoint to one method, matching it by
+name — `tp.enable(target: method(:foo))` fires for `foo` and nothing else. Ruby
+matches the method *object*, so a same-named method on another class would be
+told apart there and not here; `target_line:` and `target_thread:` are accepted
+and ignored. A tracepoint created for an event this interpreter never fires
+(`:line` most of all) enables quietly and simply never runs its block, which is
+a wrong answer rather than a refusal — a program that asks "did my line tracer
+fire?" is told no.
+
 `set_trace_func(proc)` installs a tracer and fires it for **call**, **return**
 and **class**, and a `TracePoint` watching `:call` / `:return` / `:class` fires
 from the same place (with `#method_id`, `#callee_id`, `#defined_class`, `#path`
