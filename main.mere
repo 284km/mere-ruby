@@ -6820,6 +6820,17 @@ let utf8_len = fn (s: str) -> utf8_len_go s 0 0;
 // byte offset of the k-th codepoint (clamped to str_len).
 let rec utf8_boff = fn (s: str) -> fn (k: int) -> fn (i: int) ->
   if k <= 0 || i >= str_len s then i else utf8_boff s (k - 1) (i + utf8_clen s i);
+// the character starting at BYTE offset i ("" if out of range). utf8_char takes
+// a codepoint index and has to walk from the start to find it; the regex engine
+// already holds byte offsets, so it needs this one.
+// How many characters precede BYTE offset b. Ruby reports every position -- =~,
+// index, rindex, MatchData#begin/#end -- in characters, and this engine works in
+// bytes: on "日本語abc" they came back as 6 / 9 / 10 where Ruby says 2 / 3 / 4.
+// On an ASCII string the two are equal, which is why it never showed.
+let utf8_cidx = fn (s: str) -> fn (b: int) ->
+  utf8_len (substring s 0 (if b < 0 then 0 else if b > str_len s then str_len s else b));
+let utf8_char_at = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then "" else substring s i (i + utf8_clen s i);
 // the k-th codepoint as a string ("" if out of range).
 let utf8_char = fn (s: str) -> fn (k: int) ->
   let off = utf8_boff s k 0 in
@@ -12979,8 +12990,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "post_match" then mkstr (substring src en (str_len src))
        else if str_eq name "string" then mkstr src
        // only group 0's span is recorded, which is what these are asked for
-       else if str_eq name "begin" then VInt st
-       else VInt en)
+       else
+         // #begin(n) / #end(n): group n's span when it has one, else group 0's
+         (let gk = (match args with Cons (VInt g, _) -> g | _ -> 0) in
+          let kst = str_of_int id ++ "@__st" ++ str_of_int gk in
+          let ken = str_of_int id ++ "@__en" ++ str_of_int gk in
+          let gst = (if gk > 0 && map_has ivars kst then (match map_get ivars kst with VInt n -> n | _ -> st) else st) in
+          let gen = (if gk > 0 && map_has ivars ken then (match map_get ivars ken with VInt n -> n | _ -> en) else en) in
+          if str_eq name "begin" then VInt (utf8_cidx src gst) else VInt (utf8_cidx src gen)))
     // MatchData#to_s is the WHOLE match, and #inspect shows it with its
     // groups. bootstraptest prints its results (`print(...)`, so to_s), and a
     // MatchData printed as "#<object>" is how this was noticed.
@@ -15894,7 +15911,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VArr id -> (match args with Cons (v, _) -> (let n = val_rindex (deref id) v 0 (0 - 1) in if n < 0 then VNil else VInt n) | _ -> VNil)
      | VStr s -> let s = sget s in
        (match args with
-        | Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt i
+        // characters, like every other position Ruby reports
+        | Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt (utf8_cidx s i)
         | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "rindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rindex'")) in fail "mere-ruby: undefined method 'rindex'")))
   else if str_eq name "tally" then (match recv with VArr id -> val_tally (deref id) Nil | _ -> (let _ = map_set prim_missing "n" (mkstr "tally") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tally'")) in fail "mere-ruby: undefined method 'tally'")))
@@ -15935,11 +15953,37 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "index" || (str_eq name "find_index" && (match recv with VArr _ -> true | _ -> false)) then
     (match recv with
      | VArr id -> (match args with Cons (v, _) -> val_index_of (deref id) v 0 | _ -> VNil)
-     | VStr s -> let s = sget s in (match args with Cons (VStr sub, Cons (VInt off, _)) -> let st = (if off < 0 then str_len s + off else off) in let i = str_find_from s (sget sub) (if st < 0 then 0 else st) in (if i < 0 then VNil else VInt i) | Cons (VStr sub, _) -> let i = str_find_from s (sget sub) 0 in (if i < 0 then VNil else VInt i) | _ -> VNil)
+     | VStr s ->
+       let s = sget s in
+       // Ruby's index counts CHARACTERS, both in the offset it takes and the
+       // position it returns; this searched and answered in bytes, so
+       // `"日本語abc".index("a")` was 9 where Ruby says 3. And a Regexp argument
+       // fell through to nil rather than searching at all.
+       (match args with
+        | Cons (VStr sub, Cons (VInt off, _)) ->
+          let cn = utf8_len s in
+          let cst = (if off < 0 then cn + off else off) in
+          let bst = utf8_boff s (if cst < 0 then 0 else cst) 0 in
+          let i = str_find_from s (sget sub) bst in
+          (if i < 0 then VNil else VInt (utf8_cidx s i))
+        | Cons (VStr sub, _) ->
+          let i = str_find_from s (sget sub) 0 in
+          (if i < 0 then VNil else VInt (utf8_cidx s i))
+        | Cons (VRegex (pat, pf), rest) ->
+          let bst = (match rest with
+                     | Cons (VInt off, _) ->
+                       let cn = utf8_len s in
+                       let cst = (if off < 0 then cn + off else off) in
+                       utf8_boff s (if cst < 0 then 0 else cst) 0
+                     | _ -> 0) in
+          (match rxv_search pat pf s bst with
+           | RHit (st, _, _) -> VInt (utf8_cidx s st)
+           | _ -> VNil)
+        | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "index") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'index'")) in fail "mere-ruby: undefined method 'index'")))
   else if str_eq name "rindex" then
     (match recv with
-     | VStr s -> let s = sget s in (match args with Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt i | _ -> VNil)
+     | VStr s -> let s = sget s in (match args with Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt (utf8_cidx s i) | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "rindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rindex'")) in fail "mere-ruby: undefined method 'rindex'")))
   else if str_eq name "count" then
     (match recv with
@@ -25035,7 +25079,12 @@ and rxp_class_atom = fn (pat: str) -> fn (p: int) ->
           (CChr (chr (h1 * 16 + rxp_hexv (char_at pat (p + 3)))), p + 4)
         else (CChr (chr h1), p + 3))
      else (CChr e, p + 2))
-  else (CChr c, p + 1)
+  // A literal in a class is one CHARACTER. As one byte, `[あ-ん]` became a range
+  // between two bytes of two different characters, and matching it against a
+  // byte of the subject produced "\xE3" -- half a character, and not a string
+  // Ruby would ever hand back. Comparing whole UTF-8 characters as strings is
+  // the same order as comparing codepoints, so CRange needs nothing else.
+  else (CChr (utf8_char_at pat p), p + utf8_clen pat p)
 and rxp_posix = fn (pat: str) -> fn (p: int) ->
   let (negp, p2) = (if p < str_len pat && str_eq (char_at pat p) "^" then (true, p + 1) else (false, p)) in
   rxp_posix_name pat p2 negp ""
@@ -25415,7 +25464,8 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     if i < str_len s then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
     else rxv_fail prog s bt
   | IClass (items, neg, ci) ->
-    if i < str_len s && rxv_cls items neg ci (char_at s i) then rxv_run prog s (pc + 1) (i + 1) saves bt
+    if i < str_len s && rxv_cls items neg ci (utf8_char_at s i)
+    then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
     else rxv_fail prog s bt
   | ISplit (a, b) -> rxv_run prog s a i saves (Cons ((b, i, saves), bt))
   | IJmp t -> rxv_run prog s t i saves bt
@@ -25541,7 +25591,10 @@ and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
   else
     match rxv_run prog s 0 i Nil Nil with
     | RFound (e, sv) -> RHit (i, e, sv)
-    | RFail -> rxv_search_go prog s (i + 1) len
+    // Restart at the next CHARACTER: stepping a byte at a time made a scan over
+    // a multibyte string try positions inside a character, so `"こんにちは"
+    // .split(//)` reported 15 pieces where Ruby says 5.
+    | RFail -> rxv_search_go prog s (i + (if i < str_len s then utf8_clen s i else 1)) len
 
 // a minimal regex engine: literals, ^ $ anchors, . any, \d \w \s classes,
 // and + * on single elements. Backtracking, no groups.
@@ -25778,7 +25831,8 @@ and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) ->
     (let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
      let _ = rxv_export_caps saves ng in
      let _ = rx_publish_at world sv st en ng in
-     VInt st)
+     // the position Ruby reports is in characters, not bytes
+     VInt (utf8_cidx sv st))
 
 // index of the next `>` at or after p (for a (?<name> header).
 and rx_name_end = fn (pat: str) -> fn (p: int) ->
@@ -25864,7 +25918,14 @@ and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
     let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
     let _ = (if map_has rx_caps ks && map_has rx_caps ke then
                let a = map_get rx_caps ks in let b = map_get rx_caps ke in
-               (if b >= a then map_set ivars (str_of_int id ++ "@" ++ str_of_int g) (mkstr (substring sv a b)) else ())
+               (if b >= a then
+                  // the span too, not only the text: #begin(n) / #end(n) had
+                  // nothing but group 0's span to answer from, so `begin(1)`
+                  // reported where the whole match started
+                  (let _ = map_set ivars (str_of_int id ++ "@__st" ++ str_of_int g) (VInt a) in
+                   let _ = map_set ivars (str_of_int id ++ "@__en" ++ str_of_int g) (VInt b) in
+                   map_set ivars (str_of_int id ++ "@" ++ str_of_int g) (mkstr (substring sv a b)))
+                else ())
              else ()) in
     rx_store_groups ivars id sv (g + 1)
 
@@ -26271,9 +26332,13 @@ and rx_split_go_l = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) 
   | RHit (st, en, saves) ->
     let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
     if en <= st then
-      (if st == i then rx_split_go_l pat fl s i (st + 1) lim n acc
+      // An empty match advances by one CHARACTER, not one byte: `split(//)` over
+      // a multibyte string used to cut between the bytes of a character and
+      // report 15 pieces for a five-character string.
+      (let step = (if st < str_len s then utf8_clen s st else 1) in
+       if st == i then rx_split_go_l pat fl s i (st + step) lim n acc
        else if st >= str_len s then rev_app acc (Cons (mkstr (substring s i (str_len s)), Nil))
-       else rx_split_go_l pat fl s st (st + 1) lim (n + 1) (rx_split_caps saves ng s 1 (Cons (mkstr (substring s i st), acc))))
+       else rx_split_go_l pat fl s st (st + step) lim (n + 1) (rx_split_caps saves ng s 1 (Cons (mkstr (substring s i st), acc))))
     else rx_split_go_l pat fl s en en lim (n + 1) (rx_split_caps saves ng s 1 (Cons (mkstr (substring s i st), acc)))
 and rx_split_caps = fn (saves: (int * int) list) -> fn (ng: int) -> fn (s: str) -> fn (g: int) -> fn (acc: Val list) ->
   if g > ng then acc
