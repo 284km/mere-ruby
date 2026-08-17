@@ -34,3 +34,31 @@ end
   end
 end
 p s.slice(1.9, 1)
+
+# Every position Ruby reports is a CHARACTER index -- =~, index, rindex,
+# MatchData#begin/#end. This engine works in bytes, so on a multibyte string
+# they came back as byte offsets: "日本語abc".index("a") was 9 where Ruby says 3.
+# On an ASCII string the two are equal, which is why it never showed.
+t = "日本語abc"
+p(t =~ /語/)
+p t.index(/語/)
+p t.index("語")
+p t.index("a")
+p t.index("語", 1)
+p t.rindex("語")
+p t.index("zz")
+m = t.match(/語(a)/)
+p m.begin(0)
+p m.end(0)
+p m.begin(1)
+p m.end(1)
+
+# character classes are characters too, and an empty match steps a character
+u = "こんにちは"
+p u[/[あ-ん]/]
+p u[/[^a]/]
+p u.gsub(/[^ん]/, "-")
+p u.split(//).length
+p u.split(//) == u.chars
+p "тест"[/[а-я]+/]
+p "aあb"[/a.b/]
