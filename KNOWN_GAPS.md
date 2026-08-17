@@ -317,3 +317,26 @@ raises NoMethodError, exactly as it does in ruby for a private method. What
 receiver finds it — which is the whole observable difference between the two
 in ruby. A top-level method that is redefined *after* being made public
 updates the original, not the copy.
+
+## `block_given?` inside a define_method body sees only the immediate frame
+
+A `define_method` body is a block, and Ruby's `block_given?` inside it asks about
+the frame the block was **written in** — never about the call that reached the
+method. `C.new.dm { }` answered `true` here, where Ruby answers `false`; it does
+now too, and a body defined inside a method that *was* called with a block
+answers `true`, as Ruby does.
+
+What is still missing is the propagation **through an intervening block**:
+
+```ruby
+def mk; SomeClass.module_eval { define_method(:m) { block_given? } }; end
+mk { }        # Ruby: m answers true. Here: false.
+```
+
+Ruby's rule reaches past any number of blocks to the enclosing *method* frame;
+this records the answer at the `define_method` call itself, so a block in between
+loses it. `define_method` written directly in the method works.
+
+`yield` inside a define_method body is a SyntaxError in Ruby and is accepted here
+(it reaches the block captured at definition time). `|&b|` receives the caller's
+block in both, which is the supported way to take one.
