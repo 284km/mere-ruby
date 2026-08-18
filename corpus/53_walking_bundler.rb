@@ -121,3 +121,22 @@ class Plain
   def initialize; super(); @set = true; end
 end
 p Plain.new.instance_variable_get(:@set)
+
+# A binary operator at the end of a line continues onto the next one. `&` was
+# read as a paren-less block-pass marker (`foo &blk`) whenever a space came
+# before it, and a newline after it did not rule that out -- molinillo writes an
+# Array intersection in exactly that shape. `**` is parsed apart from the other
+# operators, so it needed the same continuation of its own.
+intersecting =
+  [1, 2, 3, 4] &
+  [2, 4, 6]
+p intersecting
+p(2 **
+  10)
+p(3 &
+  1)
+# ... and `&` directly before a name is still a block pass
+def takes_block(&b); b.call(7); end
+doubler = ->(n) { n * 2 }
+p takes_block(&doubler)
+p [1, 2, 3].map(&:to_s)
