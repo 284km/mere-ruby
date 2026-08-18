@@ -326,7 +326,12 @@ method. `C.new.dm { }` answered `true` here, where Ruby answers `false`; it does
 now too, and a body defined inside a method that *was* called with a block
 answers `true`, as Ruby does.
 
-What is still missing is the propagation **through an intervening block**:
+Ordinary blocks were fixed in a later slice: `def m; [1].each { block_given? }; end`
+called as `m { }` answers true, because a block asks about the enclosing *method*
+frame, which now records whether its call was given one.
+
+What is still missing is that propagation reaching a **define_method written
+inside a block**:
 
 ```ruby
 def mk; SomeClass.module_eval { define_method(:m) { block_given? } }; end

@@ -32,3 +32,20 @@ class F
 end
 p F.new.amp { :got }
 p F.new.amp
+
+# `block_given?` inside a BLOCK asks about the enclosing METHOD frame, and
+# Ruby's rule reaches it through any number of blocks. Reading the block value
+# threaded through evaluation answered about the innermost block call instead,
+# so a plain `def m; [1].each { block_given? }; end` was false however m was
+# called.
+def outer_each; [1].each { |_| p block_given? }; end
+outer_each { }
+outer_each
+
+def nested; [1].each { [2].each { p block_given? } }; end
+nested { }
+nested
+
+def with_lambda; l = lambda { block_given? }; p l.call; end
+with_lambda { }
+with_lambda
