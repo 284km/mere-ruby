@@ -765,10 +765,29 @@ let loaded_files = map_new ();
 // eval string) being parsed. The parser captures the current script encoding
 // (load_ctx "coding", set before lex/parse by run_prog/require/eval) into the
 // EVar name as "__ENCODING__~<NAME>"; eval resolves it to the Encoding object.
+// The file whose source is being parsed right now. do_require sets "parsing"
+// before it lexes; the entry script's "file" is set before parsing it. Reading
+// it at PARSE time is the point: `__FILE__`, `__dir__` and `require_relative`
+// name the file their expression is WRITTEN in, and the loader's idea of the
+// current file is whatever it is loading at the moment the code RUNS. A method
+// or a block that runs after its own file finished loading saw the wrong one --
+// bundler's settings.rb hands a block containing `require_relative` to
+// SharedHelpers.filesystem_access, which yields it from another file entirely.
+let parse_time_file = fn (u: unit) ->
+  let p = (if map_has load_ctx "parsing" then (match map_get load_ctx "parsing" with VStr h -> sget h | _ -> "") else "") in
+  if str_eq p "" then
+    (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h -> sget h | _ -> "") else "")
+  else p;
 let enc_pseudo_var = fn (id: str) ->
   if str_eq id "__ENCODING__" then
     (let c = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr s -> sget s | _ -> "UTF-8") else "UTF-8") in
      EVar ("__ENCODING__~" ++ (if str_eq c "" then "UTF-8" else c)))
+  // `__FILE__` / `__dir__` carry the parsed file in the EVar name, exactly as
+  // __ENCODING__ carries the encoding. Without a file to name (an eval string
+  // before anything has been loaded) the dynamic reading in eval_e is kept.
+  else if str_eq id "__FILE__" || str_eq id "__dir__" then
+    (let f = parse_time_file () in
+     if str_eq f "" then EVar id else EVar (id ++ "~" ++ f))
   else EVar id;
 // Kernel#ruby_exe support: a redirectable output sink. While io_cap["on"] is
 // set, puts/print/p append to io_cap["buf"] instead of the real stdout, so
@@ -1529,6 +1548,11 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
                 && i + 1 < str_len s
                 && (let nc = char_at s (i + 1) in
                     if str_eq nc " " then false else if str_eq nc "\t" then false
+                    // ... and a NEWLINE after it means the operand is on the
+                    // next line, which a block-pass argument cannot be: this is
+                    // the trailing-operator style, `a.all_requirements &` then
+                    // the rest (molinillo writes an Array intersection that way).
+                    else if str_eq nc "\n" then false
                     else if str_eq nc "&" then false else if str_eq nc "=" then false
                     else if str_eq nc "." then false else true)
                 && (let pj = prev_nonspace s (i - 1) in
@@ -2556,7 +2580,7 @@ and neg_lit_tail = fn (lit: Expr) -> fn toks ->
   let (b, r) = parse_postfix_more lit toks in
   (match r with
    | Cons (TP p2, rest2) ->
-     if str_eq p2 "**" then (let (e, r2) = parse_unary rest2 in (EBin ("**", b, e), r2))
+     if str_eq p2 "**" then (let (e, r2) = parse_unary (skip_nls rest2) in (EBin ("**", b, e), r2))
      else (b, r)
    | _ -> (b, r))
 
@@ -2564,8 +2588,10 @@ and parse_pow = fn toks ->
   let (b, r) = parse_postfix toks in
   match r with
   | Cons (TP op, rest) ->
+    // `**` is parsed here rather than in parse_more, so the trailing-operator
+    // line continuation parse_more does has to be repeated.
     if str_eq op "**" then
-      let (e, r2) = parse_unary rest in (EBin ("**", b, e), r2)
+      let (e, r2) = parse_unary (skip_nls rest) in (EBin ("**", b, e), r2)
     else (b, r)
   | _ -> (b, r)
 
@@ -4554,7 +4580,15 @@ and parse_stmt_id = fn toks ->
             (match r with Cons (TP dt, _) -> (if str_eq dt "." || str_eq dt "&." then false else true) | _ -> true) then
       // load a file into the same world (each file gets a fresh top-level).
       let (e, r2) = parse_expr r in
-      (SRequire (str_eq id "require_relative", e), r2)
+      // A `require_relative` means "next to the file I am written in", which is
+      // not always the file the loader is in when it runs (see
+      // parse_time_file). Join it here instead: the result is an absolute path,
+      // so `require` uses it directly rather than searching $LOAD_PATH -- and
+      // ruby's own LoadError for a missing sibling names the expanded path too.
+      (let src = parse_time_file () in
+       if str_eq id "require_relative" && (if str_eq src "" then false else true)
+       then (SRequire (false, ECall ("__builtin_relpath", Cons (EStrL src, Cons (e, Nil)))), r2)
+       else (SRequire (str_eq id "require_relative", e), r2))
     // bare `module_function` switches the enclosing module body into a mode
     // where subsequent defs are also module methods (see register_class_v).
     else if str_eq id "module_function" &&
@@ -8351,7 +8385,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let _ = map_set ivars "$exc" exc in
     (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
   | EVar name ->
-    if str_eq name "__FILE__" then
+    // `__FILE__` / `__dir__` with the parsed file attached (see enc_pseudo_var).
+    if str_len name > 9 && str_eq (substring name 0 9) "__FILE__~" then
+      (let v = mkstr (substring name 9 (str_len name)) in
+       (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
+    else if str_len name > 8 && str_eq (substring name 0 8) "__dir__~" then
+      (let d = dirname_of (substring name 8 (str_len name)) in
+       mkstr (if str_len d > 0 && str_eq (char_at d 0) "/" then d
+              else if str_eq d "." then env_get "PWD"
+              else env_get "PWD" ++ "/" ++ d))
+    else if str_eq name "__FILE__" then
       (let f = (if map_has load_ctx "file"
                 then (match map_get load_ctx "file" with VStr h -> let h = sget h in (if str_eq h "" then script_file () else h) | _ -> script_file ())
                 else script_file ()) in
@@ -13516,6 +13559,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       else
       let coll = enum_collect world recv cls in
       if str_eq name "to_a" || str_eq name "entries" then coll else dispatch_prim env world blk coll name args vischeck
+    // The string form of instance_eval/instance_exec has to be answered BEFORE
+    // method_missing. A class that defines method_missing -- bundler's Dsl does,
+    // to name an unknown Gemfile directive -- was asked about `instance_eval`
+    // itself, and since the Gemfile DSL *is* `instance_eval(contents, path, 1)`,
+    // that answer replaced the whole evaluation. The branch that handled this
+    // sat further down the same chain, where those classes never reached it.
+    else if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false) then
+      dispatch_prim env world blk recv name args vischeck
     else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
     // Thread instance surface (synchronous model): the body already ran to
     // completion, a park, or an exception (see the Thread.new boundary).
@@ -13599,9 +13650,6 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_eq name "clamp" || str_eq name "between?") && has_meth world cls "<=>" then
       (if str_eq name "between?" then (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
        else (match args with Cons (lo, Cons (hi, _)) -> (if cmp_vals_w world recv lo < 0 then lo else if cmp_vals_w world recv hi > 0 then hi else recv) | _ -> recv))
-    // string-form instance_eval/instance_exec runs code with self = the object.
-    else if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false) then
-      dispatch_prim env world blk recv name args vischeck
     // an object has no such method — raise a catchable NoMethodError.
     else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls world cls)
   | VSym s ->
@@ -14094,6 +14142,37 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
       (match args with
        | Cons (VSym m, rest) -> invoke_with_block env world blk recv m rest newblk
        | Cons (VStr m, rest) -> invoke_with_block env world blk recv (sget m) rest newblk
+       | _ -> VNil)
+    // `Method#call` with a BLOCK. tsort builds `method(:tsort_each_node)` and
+    // calls it with the block that visits each node, so the block has to reach
+    // the method the object names. The plain dispatcher hands a method no block
+    // -- that is what makes it the plain one -- so re-dispatch on the Method's
+    // own receiver here, carrying the block written at this call site, exactly
+    // as `send` above forwards one.
+    else if (str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "===")
+            && (if has_meth world "Method" name then false else true)
+            && (match recv with
+                | VObj mid -> (let (_, _, ocls9, _) = world in str_eq (map_get ocls9 (str_of_int mid)) "Method")
+                | _ -> false) then
+      (match recv with
+       | VObj mid ->
+         (let (_, _, _, ivars9) = world in
+          let mnm = (match map_get ivars9 (str_of_int mid ++ "@__m_name") with VStr h -> sget h | _ -> "") in
+          let mrecv = (if map_has ivars9 (str_of_int mid ++ "@__m_recv") then map_get ivars9 (str_of_int mid ++ "@__m_recv") else VMain) in
+          let mown = (match map_get ivars9 (str_of_int mid ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
+          match mrecv with
+          | VMain -> call_method env world newblk mnm args
+          | _ ->
+            // A Method object may call a PRIVATE method -- it was obtained by
+            // name, so calling it is not an implicit-receiver call. tsort does
+            // exactly this: `tsort_each_node` is private in bundler's SpecSet.
+            // The ordinary route through the block dispatcher applies
+            // visibility, so invoke the method itself when it can be found.
+            (let dcls = dispatch_cls_of world mrecv in
+             let owner = (if str_eq mown "" then dcls else mown) in
+             if has_meth world owner mnm then invoke world newblk mrecv owner mnm args
+             else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
+             else invoke_with_block env world blk mrecv mnm args newblk))
        | _ -> VNil)
     // recv.define_method(:name) { block } with an explicit class receiver:
     // register the block as an instance method of that class (used on singleton
@@ -15780,6 +15859,21 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    || (str_eq c "Enumerable" && enumerable))
      | _ -> VBool false)
   else if str_eq name "message" then (match recv with VExc (_, m) -> mkstr m | _ -> mkstr (to_s recv))
+  // Exception#backtrace / #backtrace_locations on a BUILT-IN exception (the
+  // representation that carries only a class and a message): mere-ruby captures
+  // no call stack, so the answer is nil -- the same answer an exception OBJECT
+  // gives until set_backtrace is called. Answering at all is what matters: a
+  // library reads a backtrace while REPORTING an error, so a NoMethodError here
+  // replaces the error being reported and hides it (bundler's eval_gemfile
+  // builds its DSLError out of `e.backtrace`). set_backtrace is not here: there
+  // is nowhere to store it on this representation, and answering nil afterwards
+  // would be a lie rather than a gap.
+  else if str_eq name "backtrace" || str_eq name "backtrace_locations" then
+    (match recv with
+     | VExc (_, _) -> VNil
+     | _ -> (let _ = map_set prim_missing "n" (mkstr name) in
+             (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in
+              fail ("mere-ruby: undefined method '" ++ name ++ "'"))))
   // LoadError#path: the file that could not be loaded (nil for a LoadError
   // raised with any other message).
   else if str_eq name "path" then
@@ -17633,6 +17727,20 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        raise_exc world "NameError"
          ("uninitialized constant " ++ (if str_eq oc "Object" then n else oc ++ "::" ++ n))
      | _ -> VNil)
+  // The path a `require_relative` written in <file> names: its sibling, made
+  // absolute. A path that is already absolute is itself (ruby resolves one that
+  // way too).
+  else if str_eq name "__builtin_relpath" && (match args with Cons (VStr _, Cons (_, _)) -> true | _ -> false) then
+    (match args with
+     | Cons (VStr fh, Cons (pv, _)) ->
+       (let p = (match pv with VStr ph -> sget ph | other -> to_s other) in
+        if str_len p > 0 && str_eq (char_at p 0) "/" then mkstr p
+        else (let d0 = dirname_of (sget fh) in
+              let d = (if str_len d0 > 0 && str_eq (char_at d0 0) "/" then d0
+                       else if str_eq d0 "." then env_get "PWD"
+                       else env_get "PWD" ++ "/" ++ d0) in
+              mkstr (d ++ "/" ++ p)))
+     | _ -> VNil)
   else if (str_eq name "__builtin_require" || str_eq name "__builtin_require_relative") &&
           (match args with Cons (VStr _, _) -> true | _ -> false) then
     (match args with
@@ -19472,6 +19580,12 @@ and stdlib_src = fn (name: str) ->
   else if str_eq n "pathname" then
     "class Pathname\n" ++
     "  SEPARATOR = \"/\"\n" ++
+    "  def self.pwd\n" ++
+    "    new(Dir.pwd)\n" ++
+    "  end\n" ++
+    "  def self.getwd\n" ++
+    "    new(Dir.pwd)\n" ++
+    "  end\n" ++
     "  def initialize(path)\n" ++
     "    @path = path.to_s\n" ++
     "  end\n" ++
@@ -23317,7 +23431,12 @@ and register_builtin_consts = fn (u: unit) ->
     Cons ("Errno::ESPIPE",
     Cons ("Errno::ENOMEM",
     Cons ("Errno::EIO",
-    Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+    // bundler rescues EPROTO by name, and asks whether ENOTSUP exists.
+    // An errno name has to be added in TWO places: here, and the `sup` table
+    // below -- a class registered without its parent is an Errno that is not a
+    // SystemCallError, which `rescue SystemCallError` then walks straight past.
+    Cons ("Errno::EPROTO", Cons ("Errno::ENOTSUP",
+    Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
   // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
   // distinct names for it rather than distinct sources.
   // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
@@ -23343,7 +23462,11 @@ and register_builtin_consts = fn (u: unit) ->
     // Warning is a module a program reopens (`module Warning; def warn`) and
     // whose category switches it reads and writes as `Warning[:deprecated]`.
     Cons ("Warning",
-    Cons ("Zlib", Cons ("Zlib::Deflate", Cons ("Zlib::Inflate", Nil))))))))))))))
+    // Errno is a module holding the SystemCallError subclasses; the classes
+    // were here but the namespace itself was not, and libraries pass it around
+    // as a value (`const_get_safely(:ENOTSUP, Errno)`).
+    Cons ("Errno",
+    Cons ("Zlib", Cons ("Zlib::Deflate", Cons ("Zlib::Inflate", Nil)))))))))))))))
 
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved_lex = cur_lex () in
@@ -27472,6 +27595,8 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set sup "Errno::ESPIPE" "SystemCallError" in
   let _ = map_set sup "Errno::ENOMEM" "SystemCallError" in
   let _ = map_set sup "Errno::EIO" "SystemCallError" in
+  let _ = map_set sup "Errno::EPROTO" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOTSUP" "SystemCallError" in
   let _ = map_set sup "EOFError" "IOError" in
   let _ = map_set sup "ThreadError" "StandardError" in
   let _ = map_set sup "fatal" "Exception" in

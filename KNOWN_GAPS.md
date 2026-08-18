@@ -136,6 +136,16 @@ with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
 caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
 
+`Exception#backtrace` is the same gap seen from the other side: it answers
+`nil` rather than the frames the exception was raised through. It has to
+answer *something*, because a library reads a backtrace while it is
+**reporting** an error — bundler's `eval_gemfile` builds its `DSLError` out of
+`e.backtrace` — so raising NoMethodError there replaces the error being
+reported with one about the reporting. `set_backtrace` stores and returns a
+value on an exception object; on the built-in representation (a class and a
+message, no identity) there is nowhere to store one, so it is absent rather
+than a setter whose value cannot be read back.
+
 ## A Range walks integers and strings, and nothing else
 
 A Range holds its bounds as values, so `("a".."e")`, `(1.0..2.0)`, `(1..)`
