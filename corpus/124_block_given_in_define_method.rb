@@ -49,3 +49,20 @@ nested
 def with_lambda; l = lambda { block_given? }; p l.call; end
 with_lambda { }
 with_lambda
+
+# ...and the same answer reaches a define_method written INSIDE a block. Ruby's
+# rule goes past any number of blocks to the enclosing method frame; this is the
+# class-body statement form of define_method, which is where a
+# `module_eval { define_method ... }` lands -- the fifth place this interpreter
+# registers one, and the only one that was not recording the answer.
+class ViaModuleEval
+  def mk; ViaModuleEval.module_eval { define_method(:m) { block_given? } }; end
+end
+ViaModuleEval.new.mk { }
+p ViaModuleEval.new.m
+
+class ViaClassEval
+  def mk; ViaClassEval.class_eval { define_method(:m) { block_given? } }; end
+end
+ViaClassEval.new.mk        # no block this time
+p ViaClassEval.new.m
