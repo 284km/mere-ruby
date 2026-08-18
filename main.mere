@@ -9001,45 +9001,59 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // Time's arithmetic is a primitive, not an entry in the method table.
        else if str_eq ocl "Time" && (str_eq op "+" || str_eq op "-") then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
-       else eval_bin_prim env world blk op va0 b
+       else eval_bin_prim env world blk op va0 (eval_e env world blk b)
      // a class-level operator (def self.<<) dispatches too.
      | VClass c ->
        if has_meth world ("(sng:" ++ c ++ ")") op then
          let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
          invoke world noblk va0 ("(sng:" ++ c ++ ")") op (Cons (eval_e env world blk b, Nil))
-       else eval_bin_prim env world blk op va0 b
+       else eval_bin_prim env world blk op va0 (eval_e env world blk b)
      // a primitive tagged as a subclass instance (String/Array/Hash subclass)
      // whose subclass defines the operator dispatches to that override.
      | _ ->
+       // Evaluate the right operand FIRST, then choose. Ruby's order is
+       // receiver, arguments, dispatch, and the argument can change what
+       // dispatch finds: `str + f(str)` where f opens `class << str` and
+       // defines `#+` has to reach the new method. Looking the receiver's
+       // singleton up before the argument ran meant it never could.
+       let vb = eval_e env world blk b in
        let hk = hng_key va0 in
        if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) op then
          let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-         invoke world noblk va0 (map_get hng_store hk) op (Cons (eval_e env world blk b, Nil))
+         invoke world noblk va0 (map_get hng_store hk) op (Cons (vb, Nil))
        // a builtin value class (Integer/Float/String/Array/...) whose operator
        // the user reopened and redefined: dispatch to that method instead of
        // the primitive. Only when the method actually exists in the table
        // (untouched builtins have no entry, so this is a no-op for them).
        else if (let c = class_name va0 in has_meth world c op) then
          (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-          invoke world noblk va0 (class_name va0) op (Cons (eval_e env world blk b, Nil)))
-       else eval_bin_prim env world blk op va0 b)
+          invoke world noblk va0 (class_name va0) op (Cons (vb, Nil)))
+       else eval_bin_prim env world blk op va0 vb)
 
-and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val) -> fn (b: Expr) ->
-    if str_eq op "==" then VBool (rb_eq va0 (eval_e env world blk b))
+// v0.1: takes the right operand as a VALUE, not as an expression. Ruby's
+// order is receiver, then arguments, then dispatch -- and evaluating the
+// argument can change what dispatch finds, because it can open the
+// receiver's singleton class and define the operator there. Deciding first
+// and evaluating second made `str + f(str)`, where f defines `#+` on str,
+// use the primitive. Every operator here evaluates both sides anyway (the
+// short-circuit ones are Logic, not Bin), so nothing is evaluated that was
+// not before.
+and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val) -> fn (vb: Val) ->
+    if str_eq op "==" then VBool (rb_eq va0 (vb))
     else if str_eq op "!=" then
-      (if rb_eq va0 (eval_e env world blk b) then VBool false else VBool true)
-    else if str_eq op "===" then VBool (case_eqq world va0 (eval_e env world blk b))
+      (if rb_eq va0 (vb) then VBool false else VBool true)
+    else if str_eq op "===" then VBool (case_eqq world va0 (vb))
     // A Symbol matches like its name does (`:V3_2_2 =~ /\AV\d+/` is 0):
     // regexp_parser selects its version constants that way.
     else if str_eq op "=~" then
-      (let vb = eval_e env world blk b in
+      (let vb = vb in
        match va0 with
        | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> rx_do_match world p pf sv | _ -> VNil)
        | VSym sv -> (match vb with VRegex (p, pf) -> rx_do_match world p pf sv | _ -> VNil)
        | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p pf sv | VSym sv -> rx_do_match world p pf sv | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
-      (let vb = eval_e env world blk b in
+      (let vb = vb in
        match va0 with
        | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | VSym sv -> (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
@@ -9051,9 +9065,9 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if (str_eq op "<" || str_eq op "<=" || str_eq op ">" ||
              str_eq op ">=" || str_eq op "<=>") &&
             (match va0 with VClass _ -> true | _ -> false) then
-      invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
+      invoke_val_c env world blk va0 op (Cons (vb, Nil)) false
     else if str_eq op "<=>" then
-      (let vb = eval_e env world blk b in
+      (let vb = vb in
        // <=> on incomparable operands is nil (not an error), unlike < > etc.
        if cmp_incompatible va0 vb then VNil
        else let c = cmp_vals va0 vb in
@@ -9061,14 +9075,14 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=" then
       // incomparable operands raise ArgumentError with Ruby's message
       // ("comparison of String with 7 failed": numbers by value, others by class).
-      (let vb = eval_e env world blk b in
+      (let vb = vb in
        if cmp_incompatible va0 vb then
          raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else class_name vb) ++ " failed")
        else
          let c = cmp_vals va0 vb in
          VBool (if str_eq op "<" then c < 0 else if str_eq op "<=" then c <= 0 else if str_eq op ">" then c > 0 else c >= 0))
     else
-      let vb = eval_e env world blk b in
+      let vb = vb in
       // `"fmt" % arg` / `"fmt" % [args]` is sprintf-style formatting.
       if str_eq op "%" && (match va0 with VStr _ -> true | _ -> false) then
         (match va0 with
