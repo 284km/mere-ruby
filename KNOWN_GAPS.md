@@ -326,21 +326,11 @@ method. `C.new.dm { }` answered `true` here, where Ruby answers `false`; it does
 now too, and a body defined inside a method that *was* called with a block
 answers `true`, as Ruby does.
 
-Ordinary blocks were fixed in a later slice: `def m; [1].each { block_given? }; end`
-called as `m { }` answers true, because a block asks about the enclosing *method*
-frame, which now records whether its call was given one.
-
-What is still missing is that propagation reaching a **define_method written
-inside a block**:
-
-```ruby
-def mk; SomeClass.module_eval { define_method(:m) { block_given? } }; end
-mk { }        # Ruby: m answers true. Here: false.
-```
-
-Ruby's rule reaches past any number of blocks to the enclosing *method* frame;
-this records the answer at the `define_method` call itself, so a block in between
-loses it. `define_method` written directly in the method works.
+Both were fixed in later slices: a block asks about the enclosing *method* frame,
+which records whether its call was given one, and a `define_method` written
+inside a block records that same answer from the environment it was written in.
+`def mk; C.module_eval { define_method(:m) { block_given? } }; end` called as
+`mk { }` answers true, as it does in Ruby.
 
 `yield` inside a define_method body is a SyntaxError in Ruby and is accepted here
 (it reaches the block captured at definition time). `|&b|` receives the caller's
