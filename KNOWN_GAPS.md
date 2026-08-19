@@ -111,6 +111,18 @@ not fired at all rather than fired wrongly.
 Both cost one map lookup while nothing is installed — per class body for
 TracePoint, per method call for set_trace_func.
 
+## Replacing `puts` (or `warn`, `format`, ...) in `Kernel` does not take effect
+
+A handful of Kernel methods are answered before the method table is consulted --
+`puts`, `print`, `printf`, `format`/`sprintf`, `warn`, `gets`, `readline(s)` --
+each guarded by "unless something defines this name". The guard asks for a
+BARE name, which is where a top-level `def puts` lands, so that override works;
+`module Kernel; def puts; end` registers `Kernel#puts` and the guard does not
+see it, so the builtin still wins.
+
+`require` is not in that set (it is a real entry in the table), which is why
+rubygems can replace it -- see corpus/141.
+
 ## `File#fileno` refuses: there is no descriptor to report
 
 A File here is a path, a mode, a read position and a write buffer; the host
@@ -162,6 +174,14 @@ with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
 `module_eval`. For a method called from a library's body that frame IS the
 caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
+
+`Bundler.setup` stops here, and `bundlertest/run.sh` records it: bundler's
+vendored thor derives a namespace from `caller[1]`, so it wants two frames of a
+stack that does not exist. One synthetic frame is a fiction this interpreter has
+already committed to (above); two, with the file of a caller it cannot know, is
+a different claim, and thor would name its commands after the wrong file. Every
+step before it -- reading the Gemfile, resolving it, building the definition --
+answers what ruby answers with the same rubygems and bundler.
 
 `Exception#backtrace` is the same gap seen from the other side: it answers
 `nil` rather than the frames the exception was raised through. It has to

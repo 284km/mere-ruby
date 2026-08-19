@@ -23551,6 +23551,30 @@ and register_builtin_consts = fn (u: unit) ->
     Cons ("Errno",
     Cons ("Zlib", Cons ("Zlib::Deflate", Cons ("Zlib::Inflate", Nil)))))))))))))))
 
+// `alias new old` in the body of `cls`. Both the class-body walker and the
+// STATEMENT form need it: an alias written inside an `if`, an `unless` or a
+// block is not a top-level statement of the body, so the walker never sees it
+// and it reaches exec_stmt instead -- which aliased BARE names (top-level
+// methods) and left the class without the method. rubygems guards its
+// `alias gem_original_require require` with `unless defined?(...)`, so the one
+// alias the whole of `require` hangs off was the one that did not happen.
+and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let _ = if map_has meths (cls ++ "#" ++ n2) then
+            (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
+             // an alias keeps the original's lexical scope (see alias_method)
+             if map_has meth_cref (cls ++ "#" ++ n2)
+             then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (cls ++ "#" ++ n2)) else ())
+          // the source is a BUILTIN (no AST body): record that the new name
+          // delegates to prim_method under the old one, exactly as alias_method
+          // does. `alias _pack pack` in a reopened Array is how a wrapper keeps
+          // hold of the original.
+          else map_set builtin_alias (cls ++ "#" ++ n1) n2 in
+  // an alias ADDS a method, so `method_added` fires for the new name --
+  // rubocop-ast registers its visitors from that hook and writes
+  // `alias visit_number visit_symbol`, so an alias that stays quiet leaves the
+  // visitor unregistered and the compiler recurses forever.
+  run_method_added world cls n1
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved_lex = cur_lex () in
   let _ = set_lex cls in
@@ -23804,23 +23828,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
            FNext VNil
          else exec_stmt cenv world noblk s   // a local / scoped assign in the body
        // `alias new old` inside the class copies the method entry.
-       | SAlias (n1, n2) ->
-         let _ = if map_has meths (cls ++ "#" ++ n2) then
-                   (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
-                    // an alias keeps the original's lexical scope (see alias_method)
-                    if map_has meth_cref (cls ++ "#" ++ n2)
-                    then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (cls ++ "#" ++ n2)) else ())
-                 // the source is a BUILTIN (no AST body): record that the new
-                 // name delegates to prim_method under the old one, exactly as
-                 // alias_method does. `alias _pack pack` in a reopened Array is
-                 // how a wrapper keeps hold of the original.
-                 else map_set builtin_alias (cls ++ "#" ++ n1) n2 in
-         // an alias ADDS a method, so `method_added` fires for the new name --
-         // rubocop-ast registers its visitors from that hook and writes
-         // `alias visit_number visit_symbol`, so an alias that stays quiet
-         // leaves the visitor unregistered and the compiler recurses forever.
-         let _ = run_method_added world cls n1 in
-         FNext VNil
+       | SAlias (n1, n2) -> let _ = do_class_alias world cls n1 n2 in FNext VNil
        // `include M` records the module for method lookup fallback.
        | SInclude (m, pre) ->
          // resolve the module name in the enclosing lexical scope so a nested
@@ -24558,8 +24566,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     if str_len n1 > 0 && str_eq (char_at n1 0) "$" && str_len n2 > 0 && str_eq (char_at n2 0) "$" then
       (let _ = map_set gvar_alias (substring n1 1 (str_len n1)) (mkstr (substring n2 1 (str_len n2))) in FNext VNil)
     else
-    let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
-    FNext VNil
+    // self is a class inside a class/module body (and inside class_eval), so the
+    // alias belongs to that class -- the bare-name form is for a top-level
+    // `alias`, where the methods really are bare.
+    (match (if lv_has env "self" then lv_get env "self" else VMain) with
+     | VClass c -> let _ = do_class_alias world c n1 n2 in FNext VNil
+     | _ ->
+       let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
+       FNext VNil)
   | SInclude (m, pre) ->
     // a runtime `include Mod` (e.g. inside a class method, self = the class)
     // adds the module to that class's ancestor chain; at the top level with no
@@ -27818,6 +27832,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr "arm64-darwin22", Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr rlp, Cons (mkstr "rubylibprefix", Cons (mkstr rlp, Nil))))))))))))))))))) in
   let _ = map_set consts "RbConfig::CONFIG" rbc in
   let _ = map_set consts "RbConfig::TOPDIR" (mkstr "/usr") in
+  // rbconfig.rb also defines a TOP-LEVEL `CROSS_COMPILING` (nil for a native
+  // build), and standing in for that file means standing in for what it
+  // defines: bundler's rubygems_ext.rb reads `CROSS_COMPILING || RUBY_PLATFORM`
+  // and a missing constant is a NameError there, not a nil.
+  let _ = map_set consts "CROSS_COMPILING" VNil in
   // File::FNM_* — the flag bits File.fnmatch? and Dir.glob take.
   let _ = map_set consts "File::FNM_NOESCAPE" (VInt 1) in
   let _ = map_set consts "File::FNM_PATHNAME" (VInt 2) in
