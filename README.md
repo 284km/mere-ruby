@@ -108,21 +108,20 @@ Wasm build too.
 Against a sample of 29 installed gems — of which the reference ruby itself
 loads **27** here, two needing a Rails application to exist —
 `gemtest/run.sh` loads **21** with a CRuby stdlib on `-I` and **17** on
-what mere-ruby ships. Of the six that do not: three stop at a C extension
-(`openssl`, `bigdecimal.so`, protobuf), two at a regular expression this
-engine rejects — a character class written out of raw control bytes — and
-one, rubocop-rails, runs out of the gate's 120-second budget while loading
-rubocop's ~600 cop files (see [KNOWN_GAPS.md](KNOWN_GAPS.md) — it is a
-slowdown, not a hang). devise loads the whole activesupport / i18n /
-concurrent-ruby stack before it reaches its extension, and rubocop-rails
-reads unicode-display_width's gzipped `Marshal` index, compiles
-rubocop-ast's node patterns, and gets through rubocop's cops one by one.
+what mere-ruby ships. With the stdlib, every one of the six that do not is a
+boundary this README already names: `openssl` three times (aws-sdk-s3, excon,
+fog-aws), `bigdecimal.so` once (devise, which loads the whole activesupport /
+i18n / concurrent-ruby stack before it gets there), protobuf once
+(sassc-embedded), and rubocop-rails running past the gate's 120-second budget
+while loading rubocop's ~600 cop files (see [KNOWN_GAPS.md](KNOWN_GAPS.md) —
+it is a slowdown, not a hang; it reads unicode-display_width's gzipped
+`Marshal` index and compiles rubocop-ast's node patterns on the way).
 
-Without a stdlib on `-I` the four extra failures are what that stdlib was
-answering: five of the ten are a pure-Ruby library that is simply not here
-(`net/protocol`, `ipaddr`, `open-uri`, `shellwords`, `cgi/escape`), and two
-ask `File.const_defined?`, which is missing. That difference is what the two
-numbers are for.
+Without a stdlib on `-I`, ten fail, and the four extra ones are what that
+stdlib was answering: seven of the ten are a pure-Ruby library that is simply
+not here (`net/protocol`, `ipaddr` ×3, `open-uri`, `shellwords`, `cgi/escape`)
+and two ask for `File#fileno`. That difference is what the two numbers are
+for.
 
 ## In the browser
 

@@ -48,19 +48,20 @@ of the 29, the other two needing a Rails application to exist.
 | on what mere-ruby ships | **17 / 27** |
 | with a CRuby stdlib on `-I` | **21 / 27** |
 
-Every remaining failure names its own cause. With a stdlib on `-I`, six are
-left: `openssl` (aws-sdk-s3), `bigdecimal.so` (devise), protobuf
-(sassc-embedded), a regular expression this engine rejects — a character class
-written out of raw control bytes — in excon and fog-aws, and rubocop-rails
-running past the gate's 120-second budget (a slowdown, not a hang; see
-[KNOWN_GAPS.md](../KNOWN_GAPS.md)).
+Every remaining failure names its own cause, and with a stdlib on `-I` all six
+are boundaries that are already written down: `openssl` (aws-sdk-s3, excon,
+fog-aws), `bigdecimal.so` (devise), protobuf (sassc-embedded), and
+rubocop-rails past the 120-second budget (a slowdown, not a hang; see
+[KNOWN_GAPS.md](../KNOWN_GAPS.md)). Two of those used to stop earlier, at a
+character class written out of raw control bytes that the regex engine
+rejected — the kind of finding this list exists to produce.
 
 Without the stdlib, ten fail, and the four extra ones are what that stdlib was
-answering. Five of the ten are a pure-Ruby library that is not here
-(`net/protocol`, `ipaddr`, `open-uri`, `shellwords`, `cgi/escape`) and two ask
-`File.const_defined?`, which is missing. That difference is what the two
-numbers are for: the first says how far mere-ruby gets alone, the second what
-is left when the libraries it does not ship are handed to it.
+answering: seven are a pure-Ruby library that is not here (`net/protocol`,
+`ipaddr` ×3, `open-uri`, `shellwords`, `cgi/escape`) and two ask for
+`File#fileno`. That difference is what the two numbers are for: the first says
+how far mere-ruby gets alone, the second what is left when the libraries it
+does not ship are handed to it.
 
 That breakdown is the value of the run: it is a list of named work, not a
 score.

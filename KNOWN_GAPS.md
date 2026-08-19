@@ -111,6 +111,21 @@ not fired at all rather than fired wrongly.
 Both cost one map lookup while nothing is installed — per class body for
 TracePoint, per method call for set_trace_func.
 
+## A Proc made by `Method#to_proc` drops a block passed to its own `#call`
+
+`m = obj.method(:each_thing); m.call { ... }` reaches the method with the block,
+and so does `m.call(&blk)`. Going through `to_proc` does not: the Proc it builds
+runs a body that calls the Method with the arguments it was given and no block,
+so a block handed to the Proc is lost.
+
+Fixing it means giving that generated body a block to forward, and a block is
+not a value here: it lives in a frame's environment (the Q-001 region wall), so
+a `&blk` parameter binds a sentinel and `.call` on the sentinel is special-cased
+to run the *ambient* block. A Proc built once and called later has no ambient
+block to name. The shapes that reach a method with a block -- `m.call { }`,
+`m.call(&blk)`, `obj.send(:m) { }`, `&method(:m)` as a block argument -- all
+work; this is the one that does not.
+
 ## Corpus programs must be self-contained
 
 Two were not, and both hid a real problem rather than causing one:
