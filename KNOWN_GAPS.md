@@ -111,6 +111,18 @@ not fired at all rather than fired wrongly.
 Both cost one map lookup while nothing is installed — per class body for
 TracePoint, per method call for set_trace_func.
 
+## `File#fileno` refuses: there is no descriptor to report
+
+A File here is a path, a mode, a read position and a write buffer; the host
+interface reads and writes whole files. `fileno` therefore has nothing to
+answer, and it raises NotImplementedError rather than inventing a number --
+the same choice the UDP and UNIX sockets make. `flush`, `sync`, `sync=`,
+`tty?` and `isatty` are real: the buffer exists, so flushing it is a real
+operation, `sync = true` makes each write flush, and a file is not a terminal.
+
+sidekiq-pro and devise ask for `fileno` when they are loaded without a CRuby
+stdlib on `-I`, and stop there.
+
 ## A Proc made by `Method#to_proc` drops a block passed to its own `#call`
 
 `m = obj.method(:each_thing); m.call { ... }` reaches the method with the block,
