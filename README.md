@@ -107,15 +107,22 @@ Wasm build too.
 
 Against a sample of 29 installed gems — of which the reference ruby itself
 loads **27** here, two needing a Rails application to exist —
-`gemtest/run.sh` loads **20** with a CRuby stdlib on `-I` and **17** on
-what mere-ruby ships. Of the seven that do not: six stop at a C extension
-(`openssl` ×5, protobuf ×1) and one, rubocop-rails, runs out of the gate's
-120-second budget while loading rubocop's ~600 cop files (see
-[KNOWN_GAPS.md](KNOWN_GAPS.md) — it is a slowdown, not a hang). devise
-loads the whole activesupport / i18n / concurrent-ruby stack before it
-reaches `openssl`, and rubocop-rails reads unicode-display_width's gzipped
-`Marshal` index, compiles rubocop-ast's node patterns, and gets through
-rubocop's cops one by one.
+`gemtest/run.sh` loads **21** with a CRuby stdlib on `-I` and **17** on
+what mere-ruby ships. Of the six that do not: three stop at a C extension
+(`openssl`, `bigdecimal.so`, protobuf), two at a regular expression this
+engine rejects — a character class written out of raw control bytes — and
+one, rubocop-rails, runs out of the gate's 120-second budget while loading
+rubocop's ~600 cop files (see [KNOWN_GAPS.md](KNOWN_GAPS.md) — it is a
+slowdown, not a hang). devise loads the whole activesupport / i18n /
+concurrent-ruby stack before it reaches its extension, and rubocop-rails
+reads unicode-display_width's gzipped `Marshal` index, compiles
+rubocop-ast's node patterns, and gets through rubocop's cops one by one.
+
+Without a stdlib on `-I` the four extra failures are what that stdlib was
+answering: five of the ten are a pure-Ruby library that is simply not here
+(`net/protocol`, `ipaddr`, `open-uri`, `shellwords`, `cgi/escape`), and two
+ask `File.const_defined?`, which is missing. That difference is what the two
+numbers are for.
 
 ## In the browser
 

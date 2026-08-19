@@ -38,24 +38,29 @@ CRuby fails them with `uninitialized constant Rails` exactly as mere-ruby
 does, and counting those against the interpreter overstated the gap by two.
 The denominator in the summary line is the number of gems ruby itself loads.
 
-## Where it stands (2026-08-13)
+## Where it stands (2026-08-19)
+
+The denominator is the number of gems the reference ruby itself loads here: 27
+of the 29, the other two needing a Rails application to exist.
 
 | | loads |
 |---|---|
-| on what mere-ruby ships | **16 / 29** |
-| with a CRuby stdlib on `-I` | **18 / 29** |
+| on what mere-ruby ships | **17 / 27** |
+| with a CRuby stdlib on `-I` | **21 / 27** |
 
-Every remaining failure names its own cause. With a stdlib on `-I`: seven are
-C extensions (`openssl.so` four times, `socket.so` twice, protobuf once), one
-is a gem that is not installed, and the rest — a Rails Railtie method,
-`TracePoint`, and a native crash partway through rubocop's own loading — are
-recorded in [KNOWN_GAPS.md](../KNOWN_GAPS.md) or still being chased.
+Every remaining failure names its own cause. With a stdlib on `-I`, six are
+left: `openssl` (aws-sdk-s3), `bigdecimal.so` (devise), protobuf
+(sassc-embedded), a regular expression this engine rejects — a character class
+written out of raw control bytes — in excon and fog-aws, and rubocop-rails
+running past the gate's 120-second budget (a slowdown, not a hang; see
+[KNOWN_GAPS.md](../KNOWN_GAPS.md)).
 
-Without the stdlib, six of the thirteen failures are only "a pure-Ruby
-stdlib library is not here" (`net/protocol`, `ipaddr`, `open-uri`,
-`shellwords`, `cgi/escape`). That difference is what the two numbers are
-for: the first says how far mere-ruby gets alone, the second what is left
-when the libraries it does not ship are handed to it.
+Without the stdlib, ten fail, and the four extra ones are what that stdlib was
+answering. Five of the ten are a pure-Ruby library that is not here
+(`net/protocol`, `ipaddr`, `open-uri`, `shellwords`, `cgi/escape`) and two ask
+`File.const_defined?`, which is missing. That difference is what the two
+numbers are for: the first says how far mere-ruby gets alone, the second what
+is left when the libraries it does not ship are handed to it.
 
 That breakdown is the value of the run: it is a list of named work, not a
 score.
