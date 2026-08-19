@@ -111,17 +111,20 @@ not fired at all rather than fired wrongly.
 Both cost one map lookup while nothing is installed — per class body for
 TracePoint, per method call for set_trace_func.
 
-## Replacing `puts` (or `warn`, `format`, ...) in `Kernel` does not take effect
+## An alias of a builtin Kernel method cannot be called with no receiver
 
-A handful of Kernel methods are answered before the method table is consulted --
-`puts`, `print`, `printf`, `format`/`sprintf`, `warn`, `gets`, `readline(s)` --
-each guarded by "unless something defines this name". The guard asks for a
-BARE name, which is where a top-level `def puts` lands, so that override works;
-`module Kernel; def puts; end` registers `Kernel#puts` and the guard does not
-see it, so the builtin still wins.
+`alias original_puts puts` inside `module Kernel` records that the new name
+delegates to the builtin `puts`, because `puts` has no entry in the method table
+to copy (it is a statement in this parser). That delegation is read when there is
+a receiver -- `STDOUT.original_puts` style dispatch -- and not on the
+implicit-self path, so a bare `original_puts "x"` raises NoMethodError.
 
-`require` is not in that set (it is a real entry in the table), which is why
-rubygems can replace it -- see corpus/141.
+Reaching the builtin *past* an override is the other half of it: the wrapper
+that aliases `puts` and then defines `puts` wants the alias to reach the ORIGINAL,
+which means suppressing the very override check that makes the wrapper work.
+Overriding these methods works (corpus/142); keeping hold of the original does
+not. `require` is not affected -- it is a real entry in the table, which is why
+rubygems can wrap it (corpus/141).
 
 ## `File#fileno` refuses: there is no descriptor to report
 
