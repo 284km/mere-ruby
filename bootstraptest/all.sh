@@ -11,6 +11,15 @@
 # No `set -e`: a test whose interpreter exits non-zero is a RESULT (err), not
 # a reason to stop counting -- that is the whole point of the tally.
 here="$(cd "$(dirname "$0")" && pwd)"
+# The reference ruby's own output depends on its default external encoding:
+# with the locale unset (or not UTF-8) `p "にち"` escapes to "\u306B\u3061",
+# while mere-ruby has one behaviour and prints the bytes. That made corpus/118
+# fail on a machine where LANG is not set -- the interpreter measuring the same
+# as ever, the environment answering differently. -Eutf-8 pins the reference
+# instead of trusting the shell (a locale name would need that locale to exist;
+# this option does not).
+RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
+export RUBYOPT
 ruby_src="$1"
 dir="${2:-/tmp/mrb_bt}"
 [ -d "$ruby_src/bootstraptest" ] || { echo "usage: all.sh <ruby-checkout> [pairs_dir]"; exit 2; }

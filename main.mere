@@ -8503,7 +8503,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "readline" && (if map_has meths "readline" || self_defines env world "readline" then false else true) then
       (match rb_gets () with VNil -> raise_exc world "EOFError" "end of file reached" | v -> v)
     else if str_eq name "readlines" && (if map_has meths "readlines" || self_defines env world "readlines" then false else true) then arr_new (rb_readlines ())
-    else try_self_call env world name Nil
+    else try_self_call env world VNil name Nil
   | ECall (name, arges) ->
     let (meths, sup, ocls, ivars) = world in
     // a paren-less call with a trailing `&expr` block-pass (`send :m, :a, &pr`)
@@ -8692,7 +8692,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "readline" && (if map_has meths "readline" || self_defines env world "readline" then false else true) then
       (match rb_gets () with VNil -> raise_exc world "EOFError" "end of file reached" | v -> v)
     else if str_eq name "readlines" && (if map_has meths "readlines" || self_defines env world "readlines" then false else true) then arr_new (rb_readlines ())
-    else try_self_call_x env world name args true
+    else try_self_call_x env world VNil name args true
   | ECallB (name, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
@@ -11967,7 +11967,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else raise_exc world "TypeError" "not a real")
        | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
     // File class methods over the native externs (read/write/exist?/...).
-    else if str_eq c "File" then
+    // `File` is a class, so `Module`'s own methods have to reach the generic
+    // class dispatch below rather than stop at this namespace's terminal
+    // NoMethodError -- `File.const_defined?` is what devise and sidekiq-pro ask
+    // when they check for a constant before using it. (Math and Kernel decline
+    // the same set for the same reason, a few branches down.)
+    else if str_eq c "File" && (if is_module_method name then false else true) then
       (if str_eq name "read" || str_eq name "binread" then
          // read / binread both slurp the whole file; mere str is byte-safe
          // (length header), so binary content with NULs round-trips. binread
@@ -12796,7 +12801,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let _ = map_set iv0 "$exc" exc in
           (let m = "mere-ruby: (ruby exception raised)" in
            let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
-       else try_self_call_x env world name args true)
+       else try_self_call_x env world recv name args true)
     // a class that does `extend Enumerable` and defines `self.each` gets the
     // Enumerable surface on the class object itself (Gem::Specification is
     // built that way: `Gem::Specification.count`, `.find`, `.select`).
@@ -16895,7 +16900,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh h -> (let _ = (match args with Cons (d, _) -> hdflt_set h d | Nil -> ()) in VNil)
      | VStr h -> (let _ = (match args with Cons (v, _) -> sset h (match v with VStr a -> sget a | _ -> to_s v) | Nil -> ()) in VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in (let __fm = ("mere-ruby: undefined method '" ++ name ++ "' for this value") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
-  else (let _ = map_set prim_missing "n" (mkstr name) in (let __fm = ("mere-ruby: undefined method '" ++ name ++ "' for this value") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm))
+  // A class receiver ends up here (invoke_val_c's VClass arm falls through to
+  // the primitive dispatcher), and this is the terminal that answers for an
+  // unknown name -- so record WHO it was asked of, not just the name. Without
+  // it `Gem::Platform.match` reported `undefined method 'match'` and finding
+  // the receiver took a separate probe.
+  else (let _ = map_set prim_missing "n" (mkstr name) in
+        let _ = map_set prim_missing "rv" (mkstr (prim_blame recv)) in
+        let _ = map_set prim_missing "rvn" (mkstr name) in
+        (let __fm = ("mere-ruby: undefined method '" ++ name ++ "'" ++ prim_blame recv) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm))
+// prim_method has no `world`, so this describes the receiver without one: a
+// class or module by name, a primitive by its class. An object needs `world` to
+// name its class, and the world-aware path (undef_blame) covers those.
+and prim_blame = fn (recv: Val) ->
+  (match recv with
+   | VClass c -> " for " ++ (if map_has modules c then "module " else "class ") ++ c
+   | VMain -> " for main"
+   | VObj _ -> ""
+   | other -> " for an instance of " ++ class_name other)
 
 and class_name = fn (recv: Val) ->
   match recv with
@@ -17563,12 +17585,23 @@ and val_list_len = fn (xs: Val list) ->
 // a bare name that is neither a local nor a top-level method is an
 // an undefined name referenced bare could have been a variable (NameError);
 // one called with arguments is unambiguously a method (NoMethodError).
-and undef_call_exc = fn world -> fn (name: str) -> fn (args: Val list) ->
-  undef_call_exc_x world name args false
+and undef_call_exc = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
+  undef_call_exc_x world blame name args false
+// Who the method was wanted from. A NoMethodError that names only the method is
+// a diagnosis with the subject removed: `undefined method 'match'` cost a probe
+// to find out it was Gem::Platform. The wording follows the "for an instance of
+// X" already used here (ruby 3.4's), not 3.2's "X:Class".
+and undef_blame = fn world -> fn (blame: Val) ->
+  (match blame with
+   | VNil -> ""
+   | VMain -> " for main"
+   | VClass c -> " for " ++ (if map_has modules c then "module " else "class ") ++ c
+   | VObj _ -> " for an instance of " ++ display_cls world (dispatch_cls_of world blame)
+   | other -> " for an instance of " ++ class_name other)
 
 // `explicit` = the call had parentheses (foo()) so it is unambiguously a
 // method call -> NoMethodError even with no arguments.
-and undef_call_exc_x = fn world -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
+and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   // last-resort Kernel methods that reach here as bare names (the ECall
   // path handles the argument forms in try_self_call_x).
   if str_eq name "sleep" then
@@ -17578,9 +17611,9 @@ and undef_call_exc_x = fn world -> fn (name: str) -> fn (args: Val list) -> fn (
   else if str_eq name "exit" then exit 0
   else
   match args with
-  | Nil -> if explicit then raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
-           else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'")
-  | _ -> raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
+  | Nil -> if explicit then raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame)
+           else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'" ++ undef_blame world blame)
+  | _ -> raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame)
 
 // implicit-self send when self is a primitive: honour a subclass tag (its own
 // method, then an alias-to-builtin) before the base primitive class + prims.
@@ -17620,9 +17653,12 @@ and self_defines = fn env -> fn world -> fn (name: str) ->
    | VObj oid -> let (_, _, ocls0, _) = world in has_meth world (map_get ocls0 (str_of_int oid)) name
    | _ -> false)
 
-and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
+and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // VNil = "blame whatever self turned out to be"; a caller that routed an
+  // explicit receiver through here passes that receiver instead.
+  let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
   // bare method(:name) — Kernel#method on the implicit self.
   if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
@@ -17776,7 +17812,7 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        // ahead of method_missing since a real method wins.
        else if is_enum_method name || is_prim_method name then invoke_val_c env world noblk (VObj id) name args false
        else if has_meth world cls "method_missing" then invoke world noblk (VObj id) cls "method_missing" (Cons (VSym name, args))
-       else undef_call_exc_x world name args explicit
+       else undef_call_exc_x world (blamed (VObj id)) name args explicit
      // top-level self is main (an Object); route the string form of
      // instance_eval/instance_exec to the prim dispatcher (self stays main).
      | VMain ->
@@ -17791,7 +17827,7 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        // a universal primitive (instance_variable_get, frozen?, send, ...)
        // with an implicit self at the top level, exactly as `self.name` would
        else if is_prim_method name then dispatch_prim env world noblk VMain name args false
-       else undef_call_exc_x world name args explicit
+       else undef_call_exc_x world (blamed VMain) name args explicit
      | VClass c ->
        // a `def self.new` outranks the built-in allocation here exactly as it
        // does for an explicit receiver -- a bare `new` inside another class
@@ -17803,7 +17839,7 @@ and try_self_call_x = fn env -> fn world -> fn (name: str) -> fn (args: Val list
        // apply; invoke_val_c raises NoMethodError itself if truly undefined.
        else invoke_val_c env world noblk (VClass c) name args false
      | other -> prim_self_send env world other name args)
-  else undef_call_exc_x world name args explicit
+  else undef_call_exc_x world (blamed VMain) name args explicit
 
 // implicit-self method call (a method calling a sibling method).
 // does the current self's class define this method? The stdin builtins (gets /
@@ -17836,9 +17872,10 @@ and self_defines = fn env -> fn world -> fn (name: str) ->
      | _ -> false)
   else false
 
-and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
+and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
   if str_eq name "method" && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
   else
@@ -17856,7 +17893,7 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
        // method table, so an implicit-self call inside a reopened Time (or
        // MatchData, ...) has to be routed there too.
        else if str_eq cls "Time" || str_eq cls "MatchData" then invoke_val_c env world noblk (VObj id) name args false
-       else undef_call_exc world name args
+       else undef_call_exc world (blamed (VObj id)) name args
      | VMain ->
        if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
        then dispatch_prim env world noblk VMain name args false
@@ -17865,7 +17902,7 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
        else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
        else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
        else if is_prim_method name then dispatch_prim env world noblk VMain name args false
-       else undef_call_exc world name args
+       else undef_call_exc world (blamed VMain) name args
      | VClass c ->
        // class-level self (class << self body / class methods): route through
        // the receiver dispatcher so class/module builtins (name, constants,
@@ -17880,7 +17917,7 @@ and try_self_call = fn env -> fn world -> fn (name: str) -> fn (args: Val list) 
        // primitive self (a reopened built-in class's method body): user
        // methods first, then the built-in prims (implicit-self upcase etc.).
        prim_self_send env world other name args)
-  else undef_call_exc world name args
+  else undef_call_exc world (blamed VMain) name args
 
 // top-level method call: fresh frame, no self; blk is installed for yield.
 and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
@@ -24627,7 +24664,10 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
                       else if map_has prim_missing "c" then
                         VExc ((match map_get prim_missing "c" with VStr h -> sget h | _ -> "StandardError"),
                               (match map_get prim_missing "m" with VStr h -> sget h | _ -> ""))
-                      else if map_has prim_missing "n" then VExc ("NoMethodError", "undefined method '" ++ (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") ++ "'")
+                      else if map_has prim_missing "n" then VExc ("NoMethodError", "undefined method '" ++ (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") ++ "'" ++ (if map_has prim_missing "rv" && map_has prim_missing "rvn"
+                                     && str_eq (match map_get prim_missing "rvn" with VStr h -> sget h | _ -> "")
+                                               (match map_get prim_missing "n" with VStr h -> sget h | _ -> "")
+                                   then (match map_get prim_missing "rv" with VStr h -> sget h | _ -> "") else ""))
                       // an interpreter-internal failure that is not a Ruby
                       // exception: `fail` records its message on the way out
                       // (try_or discards it), so a rescue sees what actually
@@ -24637,6 +24677,8 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
                       else VExc ("StandardError", "error")) in
            let _ = map_delete ivars "$exc" in
            let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
+           let _ = if map_has prim_missing "rv" then map_delete prim_missing "rv" else () in
+           let _ = if map_has prim_missing "rvn" then map_delete prim_missing "rvn" else () in
            let _ = if map_has prim_missing "c" then map_delete prim_missing "c" else () in
            let _ = if map_has prim_missing "m" then map_delete prim_missing "m" else () in
            let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
@@ -25841,7 +25883,23 @@ and rxp_class_atom = fn (pat: str) -> fn (p: int) ->
   // byte of the subject produced "\xE3" -- half a character, and not a string
   // Ruby would ever hand back. Comparing whole UTF-8 characters as strings is
   // the same order as comparing codepoints, so CRange needs nothing else.
-  else (CChr (utf8_char_at pat p), p + utf8_clen pat p)
+  // ... but only when the bytes at p really are one character. utf8_clen trusts
+  // the lead byte, so a byte that cannot start a sequence (a continuation byte,
+  // or 0xF8+) claimed 2 or 4 bytes and swallowed whatever followed -- including
+  // the `]`. excon builds `[#{Regexp.escape((0x80..0xff).map(&:chr).join)}]`,
+  // where every member is such a byte: one of them failed to parse, two
+  // "worked", three failed again, which is the parity of a swallowed byte.
+  else (let l = rxp_clen pat p in (CChr (substring pat p (p + l)), p + l))
+and rxp_clen = fn (pat: str) -> fn (p: int) ->
+  let n = str_len pat in
+  let bt = fn (k: int) -> if k < n then ord (char_at pat k) else 0 in
+  let cont = fn (k: int) -> k < n && bt k >= 128 && bt k < 192 in
+  let b0 = bt p in
+  if b0 < 192 then 1
+  else if b0 < 224 then (if cont (p + 1) then 2 else 1)
+  else if b0 < 240 then (if cont (p + 1) && cont (p + 2) then 3 else 1)
+  else if b0 < 248 then (if cont (p + 1) && cont (p + 2) && cont (p + 3) then 4 else 1)
+  else 1
 and rxp_posix = fn (pat: str) -> fn (p: int) ->
   let (negp, p2) = (if p < str_len pat && str_eq (char_at pat p) "^" then (true, p + 1) else (false, p)) in
   rxp_posix_name pat p2 negp ""

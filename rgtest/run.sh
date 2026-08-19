@@ -9,6 +9,15 @@
 # With no test files it runs the pure-Ruby core: version, requirement,
 # dependency — the classes that drive gem activation.
 set -u
+# The reference ruby's own output depends on its default external encoding:
+# with the locale unset (or not UTF-8) `p "にち"` escapes to "\u306B\u3061",
+# while mere-ruby has one behaviour and prints the bytes. That made corpus/118
+# fail on a machine where LANG is not set -- the interpreter measuring the same
+# as ever, the environment answering differently. -Eutf-8 pins the reference
+# instead of trusting the shell (a locale name would need that locale to exist;
+# this option does not).
+RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
+export RUBYOPT
 here="$(cd "$(dirname "$0")" && pwd)"
 mr="$here/../mere-ruby"
 root="${1:?usage: run.sh <path/to/rubygems> [test_file ...]}"
