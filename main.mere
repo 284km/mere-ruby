@@ -13099,11 +13099,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let k = str_of_int id in
        let path = (match map_get ivars (k ++ "@__f_path") with VStr h -> sget h | _ -> "") in
        let mode = (match map_get ivars (k ++ "@__f_mode") with VStr h -> sget h | _ -> "") in
-       if str_eq name "read" then mkstr (if file_exists path then read_file path else "")
+       // read CONSUMES: a second `f.read` is "" in ruby, and `eof?` after one is
+       // true. This kept the position untouched, so eof? answered false with the
+       // whole file already handed over.
+       if str_eq name "read" then
+         (let content = (if file_exists path then read_file path else "") in
+          let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
+          let _ = map_set ivars (k ++ "@__f_pos") (VInt (str_len content)) in
+          mkstr (if pos >= str_len content then "" else substring content pos (str_len content)))
        else if str_eq name "write" || str_eq name "print" || str_eq name "<<" then
          (let piece = io_join_go args "" in
           let cur = (match map_get ivars (k ++ "@__f_buf") with VStr h -> sget h | _ -> "") in
           let _ = map_set ivars (k ++ "@__f_buf") (mkstr (cur ++ piece)) in
+          let _ = (if map_has ivars (k ++ "@__f_sync") then (let _ = file_flush_obj world id in ()) else ()) in
           if str_eq name "<<" then recv
           else if str_eq name "write" then VInt (str_len piece) else VNil)
        else if str_eq name "puts" then
@@ -13133,6 +13141,31 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let content = (if file_exists path then read_file path else "") in
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
           VBool (pos >= str_len content))
+       // These four were promised by `responds` and not implemented: respond_to?
+       // said yes and calling raised NoMethodError, which is worse than either
+       // answer alone (a library that checks first still breaks).
+       // A write here lands in @__f_buf and reaches the file at close, so flush
+       // is the real thing: put the buffer out now. `sync = true` then means
+       // every write flushes, which is what ruby's flag means too.
+       else if str_eq name "flush" then (let _ = file_flush_obj world id in recv)
+       else if str_eq name "sync" then
+         VBool (map_has ivars (k ++ "@__f_sync"))
+       else if str_eq name "sync=" then
+         (match args with
+          | Cons (v, _) ->
+            (let _ = (if truthy v then map_set ivars (k ++ "@__f_sync") (VBool true)
+                      else (if map_has ivars (k ++ "@__f_sync") then map_delete ivars (k ++ "@__f_sync") else ())) in
+             let _ = (if truthy v then (let _ = file_flush_obj world id in ()) else ()) in v)
+          | _ -> VNil)
+       // a file is not a terminal, and here nothing is
+       else if str_eq name "tty?" || str_eq name "isatty" then VBool false
+       // There is no descriptor to report: a File here is a path, a mode and a
+       // buffer (see file_close_obj), and the host interface reads and writes
+       // whole files. Refusing says so where a made-up number would not -- the
+       // same choice as the UDP and UNIX sockets.
+       else if str_eq name "fileno" then
+         raise_exc world "NotImplementedError"
+           "fileno is not available: mere-ruby's File has no descriptor"
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of File"))
     // ARGF (no-block methods): read / readlines / to_a over the ARGV files
     // (or stdin). The block form of each is handled in the block dispatch.
@@ -21965,17 +21998,30 @@ and file_open_obj = fn world -> fn (args: Val list) ->
     let _ = map_set ivars (str_of_int id ++ "@__f_buf") (mkstr "") in
     let _ = map_set ivars (str_of_int id ++ "@__f_pos") (VInt 0) in
     VObj id
-and file_close_obj = fn world -> fn (id: int) ->
+// Put what has been written out to the file and keep the handle open. close does
+// the same and then marks the handle closed; a buffer that has already been
+// flushed is empty, so flushing twice writes nothing twice.
+and file_flush_obj = fn world -> fn (id: int) ->
   let (meths, sup, ocls, ivars) = world in
   let k = str_of_int id in
   let path = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with VStr h -> sget h | _ -> "") in
   let mode = (match (if map_has ivars (k ++ "@__f_mode") then map_get ivars (k ++ "@__f_mode") else VNil) with VStr h -> sget h | _ -> "") in
   let buf = (match (if map_has ivars (k ++ "@__f_buf") then map_get ivars (k ++ "@__f_buf") else VNil) with VStr h -> sget h | _ -> "") in
+  // Append, for both w and a: file_open_obj already truncated a `w` at open, so
+  // what is in the buffer is what has not reached the file yet. (Overwriting
+  // with the buffer, which close used to do, empties the file if anything was
+  // flushed before it.)
   let _ =
-    (if str_contains mode "w" then write_file path buf
-     else if str_contains mode "a" then
-       write_file path ((if file_exists path then read_file path else "") ++ buf)
+    (if str_eq buf "" then ()
+     else if str_contains mode "w" || str_contains mode "a" then
+       (let _ = write_file path ((if file_exists path then read_file path else "") ++ buf) in ())
      else ()) in
+  map_set ivars (k ++ "@__f_buf") (mkstr "")
+and file_close_obj = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  let k = str_of_int id in
+  // one path for getting bytes out, so a close after a flush cannot undo it
+  let _ = file_flush_obj world id in
   map_set ivars (k ++ "@__f_mode") (mkstr "")
 // the index one past this line's newline (or end of string).
 // Kernel#gets: slurp stdin once, then return the next line (including its

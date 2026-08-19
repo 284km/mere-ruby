@@ -17,6 +17,13 @@
 # Writes SPEC_STATUS.md (summary table) and mspec/tags/<group>.txt (the
 # per-file DIFF/CRASH records — the "known not passing" list).
 set -u
+# Pin the reference's encoding, as run_corpus.sh and bootstraptest do: with the
+# locale unset, ruby's default external encoding is US-ASCII and `inspect`
+# escapes every non-ASCII byte, while mere-ruby prints the bytes -- core/string
+# is full of specs where that decides the verdict. The table below was measured
+# WITHOUT this, so pinning it and re-sweeping have to happen together.
+RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
+export RUBYOPT
 here="$(cd "$(dirname "$0")" && pwd)"
 root="${1:?usage: scoreboard.sh <spec-root> [dir ...]}"
 shift
