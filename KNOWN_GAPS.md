@@ -584,9 +584,31 @@ NoMethodError or NameError message is a DIFF **by construction** -- not a missin
 feature, and not something a corpus program can hold, since the corpus is
 byte-exact against 3.2.2. corpus/151 prints `e.class` for that reason.
 
-How many of the 556 DIFFs are only this has not been measured. It is worth
-measuring before working any single DIFF down: a wording difference and a wrong
-answer are the same verdict today.
+**It has been measured, and it is negligible**: of 6791 failing examples across
+the 629 DIFF/CRASH files, **12** are a message whose shape differs (`mspec/classify.sh`,
+which buckets mere-ruby's own FAILED/ERROR lines by cause rather than by file).
+So the DIFFs are real gaps, and changing the wording policy would buy almost
+nothing. The ranked causes, from the same run:
+
+| cause | examples |
+|---|---|
+| `NoMethodError` -- the method does not exist | 1168 |
+| an encoding tag (`expected #<Encoding:US-ASCII>, got #<Encoding:UTF-8>`) | 816 |
+| `ArgumentError` / `TypeError` expected and not raised | 673 |
+| errors out with NameError / ArgumentError / StandardError | 476 |
+| a method answering nil where a number belongs | 700+ |
+| the wording of a message | 12 |
+
+The encoding row was **774 of its 816 in one file**, `core/integer/chr_spec.rb`,
+and one method: `Integer#chr` tagged everything UTF-8. It is now 25 (see the chr
+entry below). A concentration like that is what the classifier is for -- a
+per-file list makes every cause look equally rare, and the largest one had no
+name.
+
+One thing the classifier makes plain: **a file's verdict and its examples are
+different measurements**. `chr_spec.rb` went from 774 failing examples to 25 and
+is still a DIFF, because a file MATCHes only when every example does. Progress on
+a cause has to be counted in examples.
 
 ## instance_variable_get accepts a name that is not an instance variable name
 
@@ -605,3 +627,19 @@ which is what `rescue SystemCallError => e` reports and what bundler prints), so
 the gap is in the class, not in the file layer: it needs a strerror table, and a
 table of some names would answer wrongly for the rest -- worse than answering
 short. `corpus/152` covers the raises that come from the interpreter.
+
+## `Integer#chr` answers a byte or a codepoint, and knows when it cannot
+
+With no encoding argument `n.chr` is a BYTE: US-ASCII under 128, ASCII-8BIT at or
+above it, `RangeError: N out of char range` outside 0..255. With one it is a
+codepoint in that encoding -- UTF-8 to 0x10FFFF, US-ASCII to 0x7F (beyond it,
+`invalid codepoint 0x80 in US-ASCII`), ASCII-8BIT / BINARY / ISO-8859-1 to 0xFF.
+`Integer#to_s` is US-ASCII too, in any base.
+
+For an encoding whose character table this interpreter does not have (Shift_JIS,
+EUC-JP, CESU-8), two things can still be said, because they hold in every
+encoding: a negative number and one past Unicode's last codepoint are out of char
+range. Producing the bytes for a codepoint that IS valid needs the table, and
+that is refused with NotImplementedError rather than answered with a byte that
+means something else -- which leaves about 14 of chr_spec's examples failing, the
+ones that ask what is invalid in Shift_JIS.
