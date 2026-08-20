@@ -199,12 +199,18 @@ caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
 
 There IS a call stack now: `caller` answers real frames, formatted as the
-reference ruby writes them, and an uncaught error names `file:line:in 'meth'`.
-Two things it does not do yet. A frame belonging to a BLOCK is labelled with the
-enclosing method, where ruby writes `block in meth`. And `Exception#backtrace`
-is still nil: the frames exist while the raise is unwinding, but nothing copies
-them into the exception (the built-in exception representation has nowhere to put
-them -- see below).
+reference ruby writes them, an uncaught error names `file:line:in 'meth'`, and
+`Exception#backtrace` answers the frames of the raise.
+
+Two limits. A frame belonging to a BLOCK is labelled with the enclosing method,
+where ruby writes `block in meth`. And a backtrace belongs to the raise that is
+IN FLIGHT: the built-in exception representation is a class and a message with no
+identity, so there is nowhere on it to keep a copy. The frames live in one slot,
+answered for the exception in `$!`; an exception that was rescued and put aside
+answers nil rather than another raise's frames. Capturing them costs 4-6% on an
+ordinary program and 9% on one that raises in a loop -- measured, not guessed,
+and the reason a lazy capture is impossible is that the frames are overwritten
+by whatever the handler calls next.
 
 `Bundler.setup` still stops, and `bundlertest/run.sh` records it, but no longer
 for want of a stack: thor's `caller[1]` is answered, and what fails now is
