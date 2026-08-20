@@ -42,15 +42,50 @@ peak() {
   if [ "$lo" = "$hi" ]; then echo "$lo"; else echo "$lo-$hi"; fi
 }
 
+# The region runtime, counted from inside. Peak RSS cannot answer "was this
+# reclaimed?" on its own: a region block in a recursive function's body stops
+# clang from turning the self-call into a loop, so the stack grows ~250 bytes an
+# iteration and swamps a heap that is being handed back correctly. Reading the
+# generated C's own counters separates the two, and this is the measurement that
+# corrected an earlier conclusion here (see KNOWN_GAPS).
+region_accounting() {  # $1 = .mere file -> "init=N bytes=N acquire=N release=N"
+  "$mere" -c "$1" > "$tmp/acct.c" 2> "$tmp/acct.err" || { echo "(compile failed)"; return; }
+  python3 - "$tmp/acct.c" "$tmp/acct_i.c" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+s = s.replace("static void __lang_region_init(",
+  "static unsigned long long __ri_b=0,__ri_c=0,__acq=0,__rel=0;\nstatic void __lang_region_init(", 1)
+for fn, stmt in (("static void __lang_region_init(", "__ri_b += (unsigned long long)cap; __ri_c++;"),
+                 ("static __lang_region* __lang_region_block_acquire(void) {", "__acq++;"),
+                 ("static void __lang_region_block_release(__lang_region* r) {", "__rel++;")):
+    i = s.index(fn); j = s.index("{", i)
+    s = s[:j+1] + "\n  " + stmt + "\n" + s[j+1:]
+k = s.rindex("return 0;")
+s = s[:k] + 'fprintf(stderr, "init=%llu bytes=%llu acquire=%llu release=%llu\\n", __ri_c, __ri_b, __acq, __rel);\n  ' + s[k:]
+open(dst, "w", encoding="utf-8").write(s)
+PYEOF
+  clang -O2 "$tmp/acct_i.c" -o "$tmp/acct.bin" 2>/dev/null || { echo "(build failed)"; return; }
+  "$tmp/acct.bin" 2>&1 >/dev/null | tr -d '\n'
+}
+
+echo "== 0. is a Map created inside a region block reclaimed? (1M blocks)"
+printf "%-34s %s\n" "$(basename "$d/p6_map_in_region_accounted.mere")" "$(region_accounting "$d/p6_map_in_region_accounted.mere")"
+echo "   acquire == release and a handful of inits means yes: the region is reused,"
+echo "   and the map, its keys and its values go with it."
+echo
+
 echo "== 1. does the language give a container's memory back? (1M iterations each)"
 printf "%-20s %-11s %s\n" "probe" "peak MiB" "what it asks"
-for p in p3_baseline p1_delete p2_overwrite p5_map_per_call p4_map_in_region; do
+for p in p8_pure_recursion p3_baseline p1_delete p2_overwrite p7_strings_no_region p5_map_per_call p4_map_in_region; do
   case $p in
-    p3_baseline)      q="build 1M strings, store none";;
-    p1_delete)        q="map_set then map_delete each time";;
-    p2_overwrite)     q="map_set the same key each time";;
-    p5_map_per_call)  q="a fresh Map per iteration";;
-    p4_map_in_region) q="... the same, inside region R { }";;
+    p8_pure_recursion)     q="a recursion that allocates NOTHING (the floor)";;
+    p3_baseline)           q="build 1M strings, store none";;
+    p1_delete)             q="map_set then map_delete each time";;
+    p2_overwrite)          q="map_set the same key each time";;
+    p7_strings_no_region)  q="1M strings, no region block";;
+    p5_map_per_call)       q="a fresh Map per iteration";;
+    p4_map_in_region)      q="... the same, inside region R { } (see part 0)";;
   esac
   "$mere" -c "$d/$p.mere" > "$tmp/$p.c" 2> "$tmp/$p.err" \
     && clang -O2 "$tmp/$p.c" -o "$tmp/$p.bin" 2>/dev/null
