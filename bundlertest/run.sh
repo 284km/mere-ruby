@@ -10,10 +10,14 @@
 #
 # e.g. .../lib/ruby/3.2.0 and .../lib/ruby/gems/3.2.0
 #
-# One step is expected NOT to agree: `setup`. It used to stop for want of a call
-# stack (thor reads `caller[1]`); that is answered now, and it stops further in.
-# The step is recorded as DIVERGE rather than dropped, and this gate fails if it
-# ever starts agreeing -- a boundary that has moved has to be noticed.
+# Every step agrees now, `setup` included -- it is the last one to have. It went
+# thor's caller[1], then comparison through a user <=>, then module_function's
+# scope, then an exception that kept neither class nor message, then `rescue *[]`
+# swallowing everything, then an ensure body that consumed the exception it ran
+# under, and finally File.open refusing the Pathname bundler writes the lockfile
+# through. Each was recorded here as a DIVERGE while it lasted, and each retired
+# because this gate fails when a recorded divergence starts agreeing. Set
+# DIVERGING to a step name again when the next boundary appears.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -22,7 +26,7 @@ gem_home="${2:?usage: run.sh <stdlib-dir> <gem-home>}"
 [ -f "$stdlib/rubygems.rb" ] || { echo "no rubygems.rb under $stdlib"; exit 2; }
 RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
 export RUBYOPT
-DIVERGING=setup
+DIVERGING=""
 
 run() {  # $1 = interpreter command line
   GEM_HOME="$gem_home" GEM_PATH="$gem_home" \

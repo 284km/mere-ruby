@@ -227,10 +227,10 @@ ordinary program and 9% on one that raises in a loop -- measured, not guessed,
 and the reason a lazy capture is impossible is that the frames are overwritten
 by whatever the handler calls next.
 
-`Bundler.setup` still stops, and `bundlertest/run.sh` records it, but no longer
-for want of a stack: thor's `caller[1]` is answered, and what fails now is
-further in. Every step before it -- reading the Gemfile, resolving it, building
-the definition -- answers what ruby answers with the same rubygems and bundler.
+`Bundler.setup` answers what ruby answers now, and `bundlertest/run.sh` has no
+recorded divergence left: reading the Gemfile, resolving it, building the
+definition and setting up the load paths all agree, with the same rubygems and
+bundler on both sides.
 
 `Exception#backtrace` is the same gap seen from the other side: it answers
 `nil` rather than the frames the exception was raised through. It has to
@@ -473,13 +473,16 @@ of the last raise, and the frames of the spot that reports the loss:
   as `StandardError` with an interpreter message. bundler's `Definition#lock` does
   this on every write.
 
-Both are covered by `corpus/150_exception_identity.rb`. A third loss is still
-open, and the diagnostic names the spot: the placeholder is signalled from a
-block's flow handler (a block whose body failed after the slot was already
-consumed) on the path through `bundler/definition.rb:327:in 'filesystem_access'`.
-It is the reason `Bundler.setup` stops after "Resolving dependencies...". What is
-*not* yet known is which construct inside that block consumes the slot; the next
-step is a repro, not a patch.
+Both are covered by `corpus/150_exception_identity.rb`.
+
+A third report of the same placeholder was **not** a lost exception, which is
+worth keeping written down: the diagnostic said the last raise was shallower
+than the report, and that reads as "something destroyed it" only if you assume a
+raise happened at all. Nothing had. `File.open` was refusing bundler's Pathname
+below the level that has a ruby exception to raise (see the path-argument entry),
+so there was no exception to lose. The lesson is about the diagnostic, not the
+bug: "no raise since" and "the raise was destroyed" produce the same evidence,
+and only reproducing the failing call separates them.
 
 ## Error message wording follows ruby 3.4, and every gate compares against 3.2.2
 
@@ -501,3 +504,14 @@ answer are the same verdict today.
 an instance variable name` in ruby. Here it answers nil -- a silently wrong
 answer, the kind that is worse than a refusal. `instance_variable_set` has the
 same hole.
+
+## Errno exceptions raised from ruby code do not prefix the system message
+
+`raise Errno::ENOENT, "boom"` reads `No such file or directory - boom` in ruby:
+an Errno class puts its own strerror text in front of whatever message it is
+given. Here the message is `boom`. The Errno exceptions this interpreter raises
+itself carry ruby's full text (`No such file or directory @ rb_sysopen - path`,
+which is what `rescue SystemCallError => e` reports and what bundler prints), so
+the gap is in the class, not in the file layer: it needs a strerror table, and a
+table of some names would answer wrongly for the rest -- worse than answering
+short. `corpus/152` covers the raises that come from the interpreter.

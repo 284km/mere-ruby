@@ -35,12 +35,13 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 139 programs, byte-for-byte
+./run_corpus.sh                                  # 151 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
-./mspec/scoreboard.sh <ruby>/spec/ruby language core/string core/array core/hash
+./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
 ./parsetest/run.sh <dir> [dir ...]               # can it READ the ruby that exists?
 ./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # real gems, loaded
+./bundlertest/run.sh <stdlib-dir> <gem-home>     # how far bundler gets, step by step
 ```
 
 Each harness derives what it needs from the arguments; nothing is left in
@@ -104,6 +105,17 @@ nothing moves a failure away from its cause. `openssl` is not answered: a
 TLS stack is a binding to a third-party C library, deliberately out of
 scope, and linking one would make the (native-only) dependency reach the
 Wasm build too.
+
+RubyGems and Bundler are the ones that matter, because everything else is
+loaded through them: pointed at a CRuby stdlib, `require "rubygems"` works,
+`require "bundler"` works, a real `Gemfile` evaluates, and **`Bundler.setup`
+answers what ruby answers** — resolving the dependencies and setting up the load
+paths. `bundlertest/run.sh` compares that step by step against the reference and
+has no recorded divergence left; the walls it worked through, in order, were
+thor's `caller[1]`, comparison through a user `<=>`, `module_function`'s scope,
+an exception that kept neither class nor message, `rescue *[]` swallowing
+everything, an `ensure` body consuming the exception it ran under, and
+`File.open` refusing the `Pathname` bundler writes the lockfile through.
 
 Against a sample of 29 installed gems — of which the reference ruby itself
 loads **27** here, two needing a Rails application to exist —
@@ -301,6 +313,11 @@ same idea as the tags/filter files every other implementation keeps. Passing
 100% is a non-goal (only MRI does, because the specs are derived from it); the
 target is the `language` and `core` groups, with `command_line` low-priority
 and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
+
+The record covers **1049 spec files** across 26 groups: **414 MATCH, 603 DIFF,
+26 CRASH**, 5 SKIP, 1 SLOW. Run with no directories, the sweep refreshes exactly
+the groups the table already has, so the numbers above are reproducible rather
+than a snapshot.
 
 A DIFF is usually fidelity, not breakage: real programs (the corpus) match
 exactly while a value class scores low on ruby/spec because of an error
