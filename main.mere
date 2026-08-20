@@ -11421,6 +11421,13 @@ and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
   let recv = recv0 in
   let name = name0 in
+  // File.read(pathname), Dir.glob(pathname), IO.write(pathname, s): a path
+  // argument may be any object with #to_path (see to_path_str).
+  let args0 = (match recv with
+               | VClass fc ->
+                 (if str_eq fc "File" || str_eq fc "IO" || str_eq fc "Dir" || str_eq fc "FileUtils"
+                  then path_args (false, (Nil : str list), (Nil : Stmt list), env) world name args0 else args0)
+               | _ -> args0) in
   // duck-type String/Array args via to_str/to_ary for the methods that need a
   // same-type arg (skip index/predicate names where an object arg is valid).
   let args = (if (match recv with VStr _ -> true | VArr _ -> true | _ -> false)
@@ -12188,7 +12195,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // NoMethodError -- `File.const_defined?` is what devise and sidekiq-pro ask
     // when they check for a constant before using it. (Math and Kernel decline
     // the same set for the same reason, a few branches down.)
-    else if str_eq c "File" && (if is_module_method name then false else true) then
+    // IO.read / IO.write and friends are the same methods as File's in ruby (File
+    // < IO, and these are IO's own class methods), so the branch answers for both
+    // rather than a second copy drifting from this one.
+    else if (str_eq c "File"
+             || (str_eq c "IO"
+                 && (str_eq name "read" || str_eq name "write" || str_eq name "binread"
+                     || str_eq name "binwrite" || str_eq name "readlines" || str_eq name "foreach")))
+            && (if is_module_method name then false else true) then
       (if str_eq name "read" || str_eq name "binread" then
          // read / binread both slurp the whole file; mere str is byte-safe
          // (length header), so binary content with NULs round-trips. binread
@@ -14643,7 +14657,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // File.open(path, mode) { |f| ... }: open, run the block with the
        // handle, flush/close on exit, return the block's value.
        else if str_eq c "File" && (str_eq name "open" || str_eq name "new") then
-         (let fobj = file_open_obj world args in
+         (let fobj = file_open_obj world (path_args (false, (Nil : str list), (Nil : Stmt list), env) world "open" args) in
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
           let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
           r)
@@ -22303,6 +22317,37 @@ and cpx_realize_args = fn world -> fn (args: Val list) ->
 // a File object: @__f_path/@__f_mode/@__f_buf/@__f_pos. Writes buffer and
 // flush on #close (or at the end of a File.open block); reads go straight
 // through the read_file extern. Mode "" marks the handle closed.
+// A path argument in ruby is any object that answers #to_path, and Pathname is
+// the one that matters: bundler writes its lockfile as
+// `filesystem_access(file) {|p| File.open(p, "wb") {|f| ... } }`, where p is a
+// Pathname. Refusing it is what stopped Bundler.setup, and it arrived at the top
+// as an interpreter placeholder rather than an error naming a path, because the
+// refusal happens below the level that has a ruby exception to raise.
+//
+// The no-block value comes from the caller: this runs at the dispatch head,
+// before the local one is built.
+and to_path_str = fn nb -> fn world -> fn (v: Val) ->
+  (match v with
+   | VObj _ ->
+     (let cls = dispatch_cls_of world v in
+      if has_meth world cls "to_path"
+      then (match invoke world nb v cls "to_path" Nil with
+            | VStr h -> VStr h
+            | _ -> v)
+      else v)
+   | _ -> v)
+
+// Only the leading argument, and the second of the two-path calls: File.write's
+// content is not a path, however many methods it happens to answer.
+and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  (match args with
+   | Nil -> Nil
+   | Cons (a, rest) ->
+     Cons (to_path_str nb world a,
+           (if str_eq name "rename" || str_eq name "symlink" || str_eq name "link"
+            then (match rest with Cons (b, r2) -> Cons (to_path_str nb world b, r2) | Nil -> Nil)
+            else rest)))
+
 and file_open_obj = fn world -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let path = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
@@ -22311,8 +22356,25 @@ and file_open_obj = fn world -> fn (args: Val list) ->
      && (if file_exists path then false else true) then
     raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path)
   else
-    // w truncates at open, so an unwritten-then-closed file ends up empty.
-    let _ = (if str_contains mode "w" then write_file path "" else ()) in
+    // w truncates at open, so an unwritten-then-closed file ends up empty; a
+    // creates the file when it is absent. Either way the open is the moment ruby
+    // reports a path it cannot write -- a missing directory above all, which is
+    // what `File.open(dir/x, "wb")` hit here and reported as an interpreter
+    // placeholder, since a failed primitive write has no ruby exception of its
+    // own. The check is the write's own result, not `test -d`: that costs a
+    // subprocess per open, and `run` is a constant 127 in the Wasm build, which
+    // would make every write in the playground raise.
+    let creating = str_contains mode "w"
+                   || (str_contains mode "a" && (if file_exists path then false else true)) in
+    // BEFORE the write, not after: the primitive write to a path whose directory
+    // is missing fails at the Mere level, which is a failure with no ruby
+    // exception in it -- the top reported StandardError with no message at all.
+    // file_exists answers true for a directory, so the parent is the whole test,
+    // and it costs no subprocess (`run` is a constant 127 in the Wasm build).
+    if creating && (if file_exists (dirname_of path) then false else true) then
+      raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path)
+    else
+    let _ = (if creating then write_file path "" else ()) in
     let id = map_len ocls in
     let _ = map_set ocls (str_of_int id) "File" in
     let _ = map_set ivars (str_of_int id ++ "@__f_path") (mkstr path) in
