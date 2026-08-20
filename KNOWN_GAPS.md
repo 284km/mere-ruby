@@ -392,6 +392,89 @@ So the honest statement is: allocation per call is now within ~2× of what a
 tree-walking interpreter of this shape costs, and the remaining factor is that
 **nothing is ever collected**, not that temporaries are held too long.
 
+### What the language allows (measured, `bench/reclaim.sh`)
+
+Reclamation was investigated before being attempted, and the first question is
+not how to collect but whether anything *can* be given back. Asked in Mere, 1M
+iterations each (peak MiB):
+
+| what | peak | entries left |
+|---|---|---|
+| build 1M strings, store none | 170 | — |
+| `map_set` then `map_delete` each time | 231 | 0 |
+| `map_set` the same key each time | 200 | 1 |
+| a fresh `Map` per iteration | 521 | — |
+| ... the same, inside `region R { }` | 247 | — |
+
+Nothing gives a container's memory back: not `map_delete`, not overwriting a
+key, and **not a region block** -- a `Map` created inside one is still there when
+it exits (26 MiB at 100k iterations against 247 at 1M: linear, not flat). What a
+region block *does* reclaim is the values allocated in its body, which is the 2x
+between the last two rows. This matches Mere's memory model: containers carry
+identity and keep their own binding region.
+
+Two consequences for this interpreter. **The Ruby heap cannot shrink while it
+lives in Mere `Map`s** -- and the handle scheme rules out even trying, since
+`arr_new` takes its id from `map_len arr_store`, so deleting an entry makes the
+next handle collide with a live one. Any collector has to replace handle issuing
+with a counter and a free list first. And **the frame is the bigger half**: 200k
+plain calls leak 2588 MiB while adding *nothing* to any store -- that is `env` (a
+`map_new` per call) and the temporaries a call builds, neither of which a region
+block can take back today.
+
+Where the entries actually go, at 200k iterations of each shape:
+
+| workload | peak MiB | stores that grew |
+|---|---|---|
+| 200k interpolated strings | 3249 | none -- all temporaries |
+| 200k objects with 2 ivars | 6339 | `arr_store` +4/iter, `ivars` +2, `ocls` +1 |
+| 200k top-level calls | 2588 | none -- all temporaries |
+
+And the size of the prize, on identical work with an identical live set (a
+1000-node list summed 2000 times): **ruby 33 MiB against 11222-15267 MiB** --
+two and a half orders of magnitude.
+
+That last figure is a range for a reason worth recording. The program allocates
+the same bytes every time, but once a run holds several GB the OS starts
+compressing pages, and `maximum resident set size` then moves by a factor of two
+between runs of the *same binary* (measured: 6227, 10614, 13346, 15664, 15803
+MiB). Under ~6 GiB the same measurement repeats exactly (6286 MiB three times out
+of three). So peak RSS is a usable number for the small cases and an
+order-of-magnitude one for the large; `bench/reclaim.sh` prints a range over
+three runs rather than one figure, and `bench/alloc_sites.sh` is where the
+deterministic per-call counts live, since it counts inside the region allocator
+instead of asking the OS.
+
+### Two wastes the census found, and what they were worth
+
+`senc_set` recorded `"UTF-8"` for every string, in a map whose *absence* of an
+entry already means UTF-8: 200k interpolated strings left **1.2M permanent
+entries** saying nothing. Skipping the default (and clearing a tag when one is
+there, which is a real change) takes that to **0** -- but peak RSS moves about
+1%, because 1.2M entries are ~34 bytes each and the memory is in the strings and
+the frames. **Entry counts are not proportional to memory**, which is worth
+knowing before optimising against a census.
+
+Every call into a user-defined method stores `__args` and `__params` as two fresh
+arrays in `arr_store`, permanently, and the only reader of either is a bare
+`super`. Removing them entirely (which breaks `super`) is worth **6.6%** on
+object-heavy code -- 6286 MiB to 5874, three runs each, identical every time --
+and nothing at all on top-level calls, which do not take that path. Doing it
+properly needs a per-method "contains a bare super" flag, computed once and
+cached; it is recorded here rather than done, because 6.6% does not change what
+the interpreter can run.
+
+### What would change it
+
+A per-call region reclaims 6.4% today, 17% with the generated C patched so
+`map_new` follows the current region. The rest is the `Map`s themselves. The one
+capability that would change the picture is upstream: **a container whose memory
+dies with its region** (or can be freed), which would let a region-per-call take
+the whole frame -- the 13.4 KB a call leaks now. Failing that, the alternative
+inside this repo is to stop using Mere `Map`s for the Ruby heap and put objects
+in a self-managed arena with its own free lists, which is a rewrite of the value
+representation rather than an addition to it.
+
 ## The Wasm playground has no sockets, no files, and no stderr of its own
 
 `docs/build.sh` works again (Mere v0.1.259 — four Wasm-backend bugs, of which
