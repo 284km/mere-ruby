@@ -439,11 +439,36 @@ But the conclusion that follows is the opposite of the earlier one. **Reclamatio
 does not wait on new language support.** A per-call `region R { }` in the
 interpreter's own source would put the frame's `map_new` in that region -- the
 typer binds a container created inside a block to the block's region, the way it
-already does for `strbuf_new` -- and the block would hand it back. Two things
-have to be measured before believing it will work: what the region-escape check
-says about an interpreter that stores Ruby values into program-lifetime maps
-(copy-on-store should make it sound on the C backend), and what the lost tail
-call costs a tree-walking interpreter that is not tail-recursive anyway.
+already does for `strbuf_new` -- and the block would hand it back. A prototype was written, and it does not compile yet -- for two reasons that are
+worth more than a working patch would have been.
+
+**A frame has two lifetimes, and the typer said so.** Wrapping `run_meth`'s body
+in `region CALL { }` fails with `expected &__heap unit, got &CALL unit` on the
+frame binding: a `define_method` body's frame is a child of the scope the block
+was written in, so a closure reads it after the call returns and it has to live
+as long as that closure; an ordinary method's frame is reachable only while the
+call runs. They were one `if` with two branches, and the language refused to give
+them one type. Written the other way round -- one lifetime for both -- a closure
+would be reading a freed region.
+
+**A shared helper cannot be region-polymorphic inside a recursive group.** Split
+the two lifetimes into two branches and give them a common `run_meth_in frame
+...` and the same error moves to the call: the helper's frame parameter unifies
+with `__heap` from the first branch. Annotating it `Map['r, str, Val]` does not
+help. `let rec ... and ...` is monomorphic in its own group, and this interpreter
+is one enormous group.
+
+**And closure environments always take the default region.** In the generated C
+there are 2558 references to the default region against 1346 to the current one,
+and **2548 of those are closure environments** -- so even with the block in
+place, every closure the body builds would stay. That is consistent with the
+older measurement: patching the generated C so `map_new` follows the current
+region reclaimed 17%, and the rest is mostly these.
+
+So the two things reclamation now waits on are named and measured, and both are
+in the language rather than here: region-polymorphic functions inside a
+mutually recursive group, and closure environments that follow the current
+region.
 
 ### Two wastes the census found, and what they were worth
 
