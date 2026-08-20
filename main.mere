@@ -27,7 +27,7 @@ type Tok = TInt of int | TFlt of float | TStrL of str | TId of str
          // Rational literal as (num, den) canonical decimal strings (bignum /
          // exact-decimal safe); Complex (imaginary) literal `4i`.
          | TRat of str * str | TImag of int | TImagF of float | TImagRat of str * str
-         | TSym of str | TP of str | TRegex of str * str | TNL | TEOF;
+         | TSym of str | TP of str | TRegex of str * str | TNL of int | TEOF;
 
 // EHsh / VHsh hold interleaved [k1, v1, k2, v2, ...] lists (M0
 // simplification: literal order is preserved, which matches Ruby's
@@ -789,6 +789,11 @@ let enc_pseudo_var = fn (id: str) ->
     (let f = parse_time_file () in
      if str_eq f "" then EVar id else EVar (id ++ "~" ++ f))
   else EVar id;
+// `__LINE__` is the line it is WRITTEN on, so it is a literal from here -- the
+// same reasoning as __FILE__ above. Line 0 means the lexer had nothing to say
+// (an eval string with no newline in it at all), and eval_e's fallback answers.
+let enc_pseudo_var_at = fn (id: str) -> fn (line: int) ->
+  if str_eq id "__LINE__" && line > 0 then EInt line else enc_pseudo_var id;
 // Kernel#ruby_exe support: a redirectable output sink. While io_cap["on"] is
 // set, puts/print/p append to io_cap["buf"] instead of the real stdout, so
 // __ruby_exe can capture a snippet's output (an in-process approximation of
@@ -1176,7 +1181,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
   else
     let c = char_at s i in
     if str_eq c " " || str_eq c "\t" || str_eq c "\r" then lex_go s (i + 1)
-    else if str_eq c "\n" || str_eq c ";" then Cons (TNL, lex_go s (i + 1))
+    else if str_eq c "\n" || str_eq c ";" then Cons (TNL i, lex_go s (i + 1))
     else if str_eq c "#" then lex_go s (skip_comment s i)
     // `=begin` ... `=end` block comment: both markers sit at column 0.
     else if str_eq c "=" && (i == 0 || str_eq (char_at s (i - 1)) "\n")
@@ -1411,7 +1416,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let (body, after) = heredoc_body s (nl + 1) hid squiggly in
       let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
       let bodytok = (if quoted && str_eq q0 "'" then Cons (TStrL body, Nil) else heredoc_tok body) in
-      tapp bodytok (tapp linetoks (Cons (TNL, lex_go s after)))
+      tapp bodytok (tapp linetoks (Cons (TNL nl, lex_go s after)))
     else if str_eq c "<" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "<"
             && (str_eq (char_at s (i + 2)) "\"" || str_eq (char_at s (i + 2)) "'") && regex_position s i then
       // <<"ID" (interpolating) / <<'ID' (raw) quoted heredocs.
@@ -1423,7 +1428,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let (body, after) = heredoc_body s (nl + 1) hid false in
       let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
       let bodytok = (if str_eq q "'" then Cons (TStrL body, Nil) else heredoc_tok body) in
-      tapp bodytok (tapp linetoks (Cons (TNL, lex_go s after)))
+      tapp bodytok (tapp linetoks (Cons (TNL nl, lex_go s after)))
     else if str_eq c "<" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "<"
             && is_upper (char_at s (i + 2)) && regex_position s i then
       // bare <<HERE heredoc (an UPPERCASE id in value position; `a << B`
@@ -1433,7 +1438,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       let nl = find_nl s idend in
       let (body, after) = heredoc_body s (nl + 1) hid false in
       let linetoks = drop_eof (lex_go (substring s idend nl) 0) in
-      tapp (heredoc_tok body) (tapp linetoks (Cons (TNL, lex_go s after)))
+      tapp (heredoc_tok body) (tapp linetoks (Cons (TNL nl, lex_go s after)))
     else if str_eq c "\\" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\n" then
       // a backslash at end of line continues the logical line.
       lex_go s (i + 2)
@@ -2220,7 +2225,7 @@ let expect = fn toks -> fn (want: str) ->
 // expression and statement parsers (one merged group) can use them.
 let expect_end = fn toks ->
   match toks with
-  | Cons (TNL, r) -> (let _ = parse_line_add 1 in r)
+  | Cons (TNL _, r) -> (let _ = parse_line_add 1 in r)
   | Cons (TEOF, _) -> toks
   // a statement may also be terminated by a block-closing keyword on the
   // same line (e.g. `def m() 1 end`), left unconsumed for the caller.
@@ -2244,26 +2249,52 @@ let skip_then = fn toks ->
   | Cons (TId id, r) ->
     if str_eq id "then" || str_eq id "do" then r else toks
   // `if cond;\n then body` — a `then` after a newline is still redundant.
-  | Cons (TNL, r) ->
+  | Cons (TNL _, r) ->
     (match r with
      | Cons (TId id, r2) -> if str_eq id "then" then r2 else toks
      | _ -> toks)
   | _ -> toks;
 
 let rec skip_nls = fn toks ->
-  match toks with Cons (TNL, r) -> skip_nls r | _ -> toks;
+  match toks with Cons (TNL _, r) -> skip_nls r | _ -> toks;
 
 // the same, reporting how many newlines it passed: the statement loop keeps
 // the line counter with this, and no other caller cares.
 let rec skip_nls_n = fn toks -> fn (k: int) ->
-  match toks with Cons (TNL, r) -> skip_nls_n r (k + 1) | _ -> (toks, k);
+  match toks with Cons (TNL _, r) -> skip_nls_n r (k + 1) | _ -> (toks, k);
 
 // how many newline tokens this stream holds (once per file, to clamp the
 // running count -- never per statement)
+// Turn each TNL's byte offset into the 1-based line it ends. One pass: the
+// offsets increase along the stream, so the source is scanned once and never
+// re-scanned. Everything downstream (`__LINE__`, and the line an error names)
+// reads the number rather than counting newlines again, which is what made the
+// old count an upper bound -- the parser backtracks, and a re-scanned block body
+// was counted twice.
+let rec nl_count_to = fn (s: str) -> fn (i: int) -> fn (stop: int) -> fn (acc: int) ->
+  if i >= stop || i >= str_len s then acc
+  else nl_count_to s (i + 1) stop (if str_eq (char_at s i) "\n" then acc + 1 else acc);
+let rec number_nls_go = fn (s: str) -> fn toks -> fn (off: int) -> fn (line: int) ->
+  match toks with
+  | Nil -> (Nil : Tok list)
+  | Cons (TNL o, r) ->
+    // a `;` sits on the line it ends, so counting the newlines between the last
+    // mark and this offset is right for both
+    let ln = line + nl_count_to s off o 0 in
+    Cons (TNL ln, number_nls_go s r (if o > off then o else off) ln)
+  | Cons (t, r) -> Cons (t, number_nls_go s r off line);
+let number_nls = fn (s: str) -> fn toks -> number_nls_go s toks 0 1;
+// the line a token sits on: the next newline mark in the stream ends its line
+let rec tok_line = fn toks ->
+  match toks with
+  | Cons (TNL n, _) -> n
+  | Cons (TEOF, _) -> 0
+  | Cons (_, r) -> tok_line r
+  | Nil -> 0;
 let rec count_nls = fn toks ->
   match toks with
   | Nil -> 0
-  | Cons (TNL, r) -> 1 + count_nls r
+  | Cons (TNL _, r) -> 1 + count_nls r
   | Cons (_, r) -> count_nls r;
 
 
@@ -2416,7 +2447,7 @@ and paren_expr_body = fn toks ->
     else if str_eq w "while" || str_eq w "until" || str_eq w "if" || str_eq w "unless" || str_eq w "rescue" then
       let (s2, r3) = apply_modifier (SExpr e) r2 in
       (match r3 with
-       | Cons (TNL, _) ->
+       | Cons (TNL _, _) ->
          // `; more` after the modifier — continue the paren sequence.
          (match skip_nls r3 with
           | Cons (TP rp2, r4) ->
@@ -2426,7 +2457,7 @@ and paren_expr_body = fn toks ->
        | _ -> (EStmt s2, expect r3 ")"))
     else (e, expect r2 ")")
   // `; more` — the paren holds a statement sequence; its value is the last.
-  | Cons (TNL, _) ->
+  | Cons (TNL _, _) ->
     (match skip_nls r2 with
      | Cons (TP rp, r3) ->
        if str_eq rp ")" then (e, r3) else paren_seq (skip_nls r2) (Cons (SExpr e, Nil))
@@ -2448,7 +2479,7 @@ and paren_seq = fn toks -> fn (acc: Stmt list) ->
   | Cons (TP rp, r2) ->
     if str_eq rp ")" then (EStmt (SBegin (rev_app (Cons (s1, acc)) Nil, Nil, Nil, Nil)), r2)
     else (let __fm = ("mere-ruby: expected ) in paren sequence, got " ++ rp ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-  | Cons (TNL, _) ->
+  | Cons (TNL _, _) ->
     (match skip_nls r1 with
      | Cons (TP rp2, r3) ->
        if str_eq rp2 ")" then (EStmt (SBegin (rev_app (Cons (s1, acc)) Nil, Nil, Nil, Nil)), r3)
@@ -2489,7 +2520,7 @@ and parse_range = fn toks ->
          if str_eq p2 ")" || str_eq p2 "]" || str_eq p2 "," || str_eq p2 ";" || str_eq p2 "}" || str_eq p2 "|" then
            (ERange (lo, ENil, excl), rest)
          else let (hi, r2) = parse_bin rest 1 in (ERange (lo, hi, excl), r2)
-       | Cons (TNL, _) -> (ERange (lo, ENil, excl), rest)
+       | Cons (TNL _, _) -> (ERange (lo, ENil, excl), rest)
        | Cons (TEOF, _) -> (ERange (lo, ENil, excl), rest)
        | Cons (TId g, _) ->
          if str_eq g "then" || str_eq g "do" || str_eq g "if" || str_eq g "unless" || str_eq g "end" || str_eq g "while" || str_eq g "until"
@@ -2604,7 +2635,7 @@ and parse_postfix = fn toks ->
 and parse_postfix_more = fn (recv: Expr) -> fn toks ->
   match toks with
   // a newline followed by .method continues the chain (leading-dot style).
-  | Cons (TNL, _) ->
+  | Cons (TNL _, _) ->
     let t2 = skip_nls toks in
     (match t2 with
      | Cons (TP dot, _) -> if str_eq dot "." then parse_postfix_more recv t2 else (recv, toks)
@@ -2992,7 +3023,7 @@ and parse_pipe_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) li
   match toks with
   // `|one; bl|` — names after a semicolon (lexed as TNL) are block-locals:
   // encoded with a ; prefix, they always bind nil.
-  | Cons (TNL, r) -> parse_block_locals r acc ds
+  | Cons (TNL _, r) -> parse_block_locals r acc ds
   | Cons (TP bar, r) ->
     if str_eq bar "|" then (rev_app acc Nil, rev_app ds Nil, r)
     else if str_eq bar "*" then
@@ -3074,7 +3105,7 @@ and pipe_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (ds: (str
     else if str_eq p "|" then (rev_app (Cons (name, acc)) Nil, rev_app ds Nil, r)
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected , or | in block params" ++ parsing_file ()))) in fail ("mere-ruby: expected , or | in block params" ++ parsing_file ()))
   // `|one; bl|` — the ; (lexed as a newline) starts the block-local names.
-  | Cons (TNL, r) -> parse_block_locals r (Cons (name, acc)) ds
+  | Cons (TNL _, r) -> parse_block_locals r (Cons (name, acc)) ds
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated block params" ++ parsing_file ()))) in fail ("mere-ruby: unterminated block params" ++ parsing_file ()))
 
 // fold any string literals immediately following `e` into it (Ruby's
@@ -3163,14 +3194,14 @@ and parse_primary = fn toks ->
          // `yield [0]` passes an array literal (not an index on the result).
          else if str_eq p "[" || str_eq p " [" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
          else (EYield Nil, r)
-       | Cons (TNL, _) -> (EYield Nil, r)
+       | Cons (TNL _, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
        // `yield end` / `yield if c` — a stop keyword ends a bare yield.
        | Cons (TId w, _) -> if stops_value w then (EYield Nil, r) else let (es, r2) = parse_puts_args r Nil in (EYield es, r2)
        | _ -> let (es, r2) = parse_puts_args r Nil in (EYield es, r2))
     else if str_eq id "raise" then
       (match r with
-       | Cons (TNL, _) -> (ERaise Nil, r)
+       | Cons (TNL _, _) -> (ERaise Nil, r)
        | Cons (TEOF, _) -> (ERaise Nil, r)
        // bare raise before a modifier/terminator keyword takes no args.
        | Cons (TId w, _) ->
@@ -3247,7 +3278,7 @@ and parse_primary = fn toks ->
     else if str_eq id "break" || str_eq id "next" || str_eq id "return" || str_eq id "redo" || str_eq id "retry" then
       // flow keywords in expression position (ternary branches, call args).
       (match r with
-       | Cons (TNL, _) -> (EFlow (id, ENil), r)
+       | Cons (TNL _, _) -> (EFlow (id, ENil), r)
        | Cons (TEOF, _) -> (EFlow (id, ENil), r)
        | Cons (TP p, _) ->
          if str_eq p ")" || str_eq p "}" || str_eq p "]" || str_eq p "," ||
@@ -3362,7 +3393,7 @@ and parse_primary = fn toks ->
            (if starts_block r2b then
               let (bp, bb, r4) = parse_block r2b in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2b))
-         else (enc_pseudo_var id, r)
+         else (enc_pseudo_var_at id (tok_line r), r)
        | _ ->
          if starts_block r then
            let (bp, bb, r4) = parse_block r in (ECallB (id, Nil, bp, bb), r4)
@@ -3378,7 +3409,7 @@ and parse_primary = fn toks ->
            (if starts_block r2 then
               let (bp, bb, r4) = parse_block r2 in (ECallB (id, es, bp, bb), r4)
             else (ECall (id, es), r2))
-         else (enc_pseudo_var id, r))
+         else (enc_pseudo_var_at id (tok_line r), r))
   | Cons (TP p, r) ->
     if str_eq p "(s" then
       // a desugared string literal: ("" + seg + ...) with a marked opener
@@ -3800,7 +3831,7 @@ and parse_bare_rockets = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
   | Cons (TP c, r) ->
     if str_eq c "," then
       (match skip_nls r with
-       | Cons (TNL, _) -> (rev_app (Cons (EKwHash (rev_app hp Nil), pos)) Nil, toks)
+       | Cons (TNL _, _) -> (rev_app (Cons (EKwHash (rev_app hp Nil), pos)) Nil, toks)
        | rr ->
          let (k, r2) = parse_expr rr in
          let r3 = expect r2 "=>" in
@@ -4272,7 +4303,7 @@ and looks_like_multix = fn toks ->
 and scan_mx = fn toks -> fn (depth: int) -> fn (seen: bool) -> fn (grp: bool) ->
   match toks with
   | Nil -> false
-  | Cons (TNL, _) -> false
+  | Cons (TNL _, _) -> false
   | Cons (TEOF, _) -> false
   | Cons (TId w, r) ->
     if str_eq w "do" || str_eq w "then" || str_eq w "if" || str_eq w "unless" ||
@@ -4456,7 +4487,7 @@ and parse_stmt_id = fn toks ->
             // guard; the other statement-leading names did not.
             (match r with Cons (TP dt, _) -> (if str_eq dt "." || str_eq dt "&." then false else true) | _ -> true) then
       (match r with
-       | Cons (TNL, _) -> (SPuts Nil, r)
+       | Cons (TNL _, _) -> (SPuts Nil, r)
        | Cons (TEOF, _) -> (SPuts Nil, r)
        // `puts if c` / `puts unless c`: a statement modifier, not an argument.
        | Cons (TId w, _) ->
@@ -4556,7 +4587,7 @@ and parse_stmt_id = fn toks ->
       // named form (`private :m, :n`) marks those methods.
       let mode = if str_eq id "public" then "public" else if str_eq id "protected" then "protected" else "private" in
       (match r with
-       | Cons (TNL, _) -> (SVis (mode, Nil), r)
+       | Cons (TNL _, _) -> (SVis (mode, Nil), r)
        | Cons (TEOF, _) -> (SVis (mode, Nil), r)
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis (mode, names), r2)
        // `private def m ... end` — the arg is a method definition; parse it,
@@ -4597,7 +4628,7 @@ and parse_stmt_id = fn toks ->
             (match r with Cons (TP dt2, _) -> (if str_eq dt2 "." then false else true) | _ -> true) &&
             (match r with Cons (TP lp, _) -> (if is_lparen lp then false else true) | _ -> true) then
       (match r with
-       | Cons (TNL, _) -> (SVis ("module_function", Nil), r)
+       | Cons (TNL _, _) -> (SVis ("module_function", Nil), r)
        | Cons (TEOF, _) -> (SVis ("module_function", Nil), r)
        // `module_function :a, :b` promotes those named methods (handled in
        // register_class_v's named-SVis branch).
@@ -4612,14 +4643,14 @@ and parse_stmt_id = fn toks ->
     else if str_eq id "private_constant" then
       (match r with
        | Cons (TSym _, _) -> let (names, r2) = parse_undef_names r Nil in (SVis ("private_constant", names), r2)
-       | Cons (TNL, _) -> (SExpr ENil, r)
+       | Cons (TNL _, _) -> (SExpr ENil, r)
        | Cons (TEOF, _) -> (SExpr ENil, r)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
     else if str_eq id "public_class_method" then
       // visibility / require: accepted as no-ops.
       // (`using` is NOT here — it parses as a real call so refinements activate.)
       (match r with
-       | Cons (TNL, _) -> (SExpr ENil, r)
+       | Cons (TNL _, _) -> (SExpr ENil, r)
        | Cons (TEOF, _) -> (SExpr ENil, r)
        | _ -> let (_, r2) = parse_rhs_list r Nil in (SExpr ENil, r2))
     else if str_eq id "extend" &&
@@ -4633,7 +4664,7 @@ and parse_stmt_id = fn toks ->
       // singleton class (self, in a class/module body). Parse as a real call
       // so the eval-time handler records the singleton include.
       (match r with
-       | Cons (TNL, _) -> (SExpr (ECall ("extend", Nil)), r)
+       | Cons (TNL _, _) -> (SExpr (ECall ("extend", Nil)), r)
        | Cons (TEOF, _) -> (SExpr (ECall ("extend", Nil)), r)
        // `extend ::A::B` — a leading "::" only anchors at the top level here,
        // where a value has to start; `a::B` elsewhere is still scope
@@ -4645,7 +4676,7 @@ and parse_stmt_id = fn toks ->
        | _ -> let (es, r2) = parse_rhs_list r Nil in (SExpr (ECall ("extend", es)), r2))
     else if str_eq id "return" then
       (match r with
-       | Cons (TNL, _) -> (SReturn ENil, r)
+       | Cons (TNL _, _) -> (SReturn ENil, r)
        | Cons (TEOF, _) -> (SReturn ENil, r)
        // `return if c` / `return unless c` — a value-less return under a
        // statement modifier (the caller attaches the modifier).
@@ -4672,7 +4703,7 @@ and parse_stmt_id = fn toks ->
           | _ -> (SReturn (EArr es), r2)))
     else if str_eq id "break" then
       (match r with
-       | Cons (TNL, _) -> (SBreak ENil, r)
+       | Cons (TNL _, _) -> (SBreak ENil, r)
        | Cons (TEOF, _) -> (SBreak ENil, r)
        | Cons (TId k, _) -> if stops_value k then (SBreak ENil, r) else let (e, r2) = parse_expr r in (SBreak e, r2)
        | Cons (TP p, _) ->
@@ -4681,7 +4712,7 @@ and parse_stmt_id = fn toks ->
        | _ -> flow_values r (fn e -> SBreak e))
     else if str_eq id "next" then
       (match r with
-       | Cons (TNL, _) -> (SNext ENil, r)
+       | Cons (TNL _, _) -> (SNext ENil, r)
        | Cons (TEOF, _) -> (SNext ENil, r)
        | Cons (TId k, _) -> if stops_value k then (SNext ENil, r) else let (e, r2) = parse_expr r in (SNext e, r2)
        | Cons (TP p, _) ->
@@ -5012,7 +5043,7 @@ and defined_assignish = fn toks -> defined_assign_go toks 0
 and defined_assign_go = fn toks -> fn (depth: int) ->
   match toks with
   | Nil -> false
-  | Cons (TNL, _) -> false
+  | Cons (TNL _, _) -> false
   | Cons (TEOF, _) -> false
   | Cons (TP p, r) ->
     if is_lparen p || str_eq p "[" || str_eq p " [" || str_eq p "\{" || str_eq p "(s" then
@@ -5125,7 +5156,7 @@ and parse_for_iter = fn (e0: Expr) -> fn r3 ->
 and for_targets_complex = fn toks ->
   match toks with
   | Nil -> false
-  | Cons (TNL, _) -> false
+  | Cons (TNL _, _) -> false
   | Cons (TEOF, _) -> false
   | Cons (TId w, r) -> if str_eq w "in" then false else for_targets_complex r
   | Cons (TP p, r) ->
@@ -5251,7 +5282,7 @@ and parse_case = fn toks ->
   // `case` immediately followed by a newline is subjectless: the when
   // conditions are truthiness tests rather than === against a subject.
   match toks with
-  | Cons (TNL, _) -> parse_whens ECaseNone toks Nil
+  | Cons (TNL _, _) -> parse_whens ECaseNone toks Nil
   // ... and so is `case when c then v end` on one line: `when` cannot start a
   // subject expression, so its presence here means there is no subject.
   | Cons (TId kw0, _) -> if str_eq kw0 "when" then parse_whens ECaseNone toks Nil else parse_case_subj toks
@@ -5279,7 +5310,7 @@ and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
       // which a value pattern does not consume) is a SyntaxError in Ruby.
       let _ = (match r3 with
                | Cons (TId g, _) -> if str_eq g "then" || is_block_stop g then () else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))) in fail ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))
-               | Cons (TNL, _) -> ()
+               | Cons (TNL _, _) -> ()
                | Cons (TEOF, _) -> ()
                | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))) in fail ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))) in
       let (b, r4) = parse_stmts (skip_then r3) Nil in
@@ -5391,7 +5422,7 @@ and parse_bare_arr = fn toks -> fn (acc: Pat list) ->
   // called right after a separating comma; a terminator here means a trailing
   // comma (`0, 1,`) which makes the pattern match partially — append a splat.
   match toks with
-  | Cons (TNL, _) -> (rev_app (Cons (PSplatP "", acc)) Nil, toks)
+  | Cons (TNL _, _) -> (rev_app (Cons (PSplatP "", acc)) Nil, toks)
   | Cons (TEOF, _) -> (rev_app (Cons (PSplatP "", acc)) Nil, toks)
   | Cons (TId g, _) -> if str_eq g "then" || str_eq g "if" || str_eq g "unless" then (rev_app (Cons (PSplatP "", acc)) Nil, toks) else parse_bare_arr_one toks acc
   | Cons (TP p, _) -> if str_eq p ")" || str_eq p ";" then (rev_app (Cons (PSplatP "", acc)) Nil, toks) else parse_bare_arr_one toks acc
@@ -5502,7 +5533,7 @@ and parse_pat_value = fn toks ->
        | Cons (TP p2, _) ->
          if str_eq p2 ")" || str_eq p2 "]" || str_eq p2 "," || str_eq p2 ";" || str_eq p2 "}" || str_eq p2 "|" then (ERange (lo, ENil, excl), rest)
          else let (hi, r2) = parse_unary rest in (ERange (lo, hi, excl), r2)
-       | Cons (TNL, _) -> (ERange (lo, ENil, excl), rest)
+       | Cons (TNL _, _) -> (ERange (lo, ENil, excl), rest)
        | Cons (TEOF, _) -> (ERange (lo, ENil, excl), rest)
        | Cons (TId g, _) -> if str_eq g "then" || str_eq g "if" || str_eq g "unless" then (ERange (lo, ENil, excl), rest) else let (hi, r2) = parse_unary rest in (ERange (lo, hi, excl), r2)
        | _ -> let (hi, r2) = parse_unary rest in (ERange (lo, hi, excl), r2))
@@ -5642,7 +5673,7 @@ and parse_hash_pat_kv = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) 
     (match r2 with
      | Cons (TP p, _) -> if str_eq p "," || str_eq p "}" || str_eq p "]" || str_eq p ")" then (PVar key, r2) else parse_pattern r2
      | Cons (TId gg, _) -> if str_eq gg "then" || str_eq gg "if" || str_eq gg "unless" then (PVar key, r2) else parse_pattern r2
-     | Cons (TNL, _) -> (PVar key, r2)
+     | Cons (TNL _, _) -> (PVar key, r2)
      | Cons (TEOF, _) -> (PVar key, r2)
      | _ -> parse_pattern r2) in
   // Ruby rejects a duplicated key name in a hash pattern.
@@ -5835,7 +5866,7 @@ and parse_def_inner = fn toks ->
             | Cons (TId pn, r2) ->
               (if is_keyword pn then (name, r)
                else match r2 with
-                    | Cons (TNL, _) -> (name ++ "=", r1)
+                    | Cons (TNL _, _) -> (name ++ "=", r1)
                     | Cons (TEOF, _) -> (name ++ "=", r1)
                     | Cons (TP semi, _) -> if str_eq semi ";" then (name ++ "=", r1) else (name, r)
                     | _ -> (name, r))
@@ -6011,7 +6042,7 @@ and parse_bare_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) 
           | Cons (TP q, _) -> if str_eq q "," then parse_bare_after kn r2 acc defs
                               else let (e, r3) = parse_expr r2 in parse_bare_after kn r3 acc (Cons ((kn, e), defs))
           // `def m a, k:` with no default: the list ends at the newline.
-          | Cons (TNL, _) -> parse_bare_after kn r2 acc defs
+          | Cons (TNL _, _) -> parse_bare_after kn r2 acc defs
           | _ -> let (e, r3) = parse_expr r2 in parse_bare_after kn r3 acc (Cons ((kn, e), defs)))
        else parse_bare_after name r acc defs
      | _ -> parse_bare_after name r acc defs)
@@ -13792,7 +13823,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match args with
        | Cons (VStr code, _) -> let code = sget code in
          let _ = set_parsing_eval code in
-         let toks = lex_go code 0 in
+         let toks = number_nls code (lex_go code 0) in
          let _ = parse_line_reset (count_nls toks) in
          let (p2, _) = parse_stmts toks Nil in
          let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -14761,7 +14792,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | Cons (VStr code, _) ->
        let code = sget code in
        let _ = set_parsing_eval code in
-       let toks = lex_go code 0 in
+       let toks = number_nls code (lex_go code 0) in
        let _ = parse_line_reset (count_nls toks) in
        let (p2, _) = parse_stmts toks Nil in
        let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -18901,7 +18932,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      let cod = src_coding src in
      let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
      let _ = map_set load_ctx "parsing" (mkstr full) in
-     let toks = lex_go src 0 in
+     let toks = number_nls src (lex_go src 0) in
      let _ = parse_line_reset (count_nls toks) in
      let (prog2, rest2) = parse_stmts toks Nil in
      let _ = map_set load_ctx "parsing" (mkstr "") in
@@ -24215,7 +24246,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = map_set load_ctx "parsing" (mkstr full) in
          let (prog2, rest2) =
          try_or (fn (u: unit) ->
-                   let tk = lex_go src 0 in
+                   let tk = number_nls src (lex_go src 0) in
                    let _ = parse_line_reset (count_nls tk) in
                    let r = parse_stmts tk Nil in
                    let _ = map_set pok "y" 1 in r)
@@ -24972,7 +25003,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then str_upcase codelbl else cod)) in
     let _ = set_parsing_eval code in
     let prog2 = try_or (fn (u: unit) ->
-      let toks = lex_go code 0 in
+      let toks = number_nls code (lex_go code 0) in
       let _ = parse_line_reset (count_nls toks) in
       let (p2, _) = parse_stmts toks Nil in
       let _ = rx_check_pending () in p2) sentinel in
@@ -24985,7 +25016,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
          // an unexpected token; reproduce the common identifier case (e.g.
          // eval("1ir") lexes as `1 ir`).
          (let msg = try_or (fn (u: unit) ->
-            let toks2 = lex_go code 0 in
+            let toks2 = number_nls code (lex_go code 0) in
             let (st1, rest1) = parse_stmt toks2 in
             (match skip_nls rest1 with
              | Cons (TId _, _) -> ": syntax error, unexpected local variable or method, expecting end-of-input"
@@ -27539,7 +27570,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set loaded_files name VNil in
   let cod0 = src_coding src in
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
-  let toks = lex_go src 0 in
+  let toks = number_nls src (lex_go src 0) in
   let _ = parse_line_reset (count_nls toks) in
   let (prog, rest) = parse_stmts toks Nil in
   let _ = rx_check_pending () in
@@ -27960,7 +27991,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // that are core (no `require` names them) but are ordinary objects, so
   // writing them in ruby is shorter and clearer than a builtin. It runs as its
   // own program, so it does not shift the script's line numbers.
-  let _ = (let (pprog, _) = parse_stmts (lex_go core_prelude 0) Nil in
+  let _ = (let (pprog, _) = parse_stmts (number_nls core_prelude (lex_go core_prelude 0)) Nil in
            hoist_run env world noblk pprog) in
   // An exception nobody rescued: report it the way Ruby does and exit 1,
   // instead of letting the interpreter's own `fail` message be the last word.
@@ -28026,7 +28057,7 @@ let rec take_flags = fn (argl: str list) ->
 let parse_only = fn (path: str) ->
   let src = read_file path in
   let _ = map_set load_ctx "parsing" (mkstr path) in
-  let toks = lex_go src 0 in
+  let toks = number_nls src (lex_go src 0) in
   let _ = parse_line_reset (count_nls toks) in
   let (prog, rest) = parse_stmts toks Nil in
   let _ = rx_check_pending () in
