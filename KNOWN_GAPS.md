@@ -674,9 +674,25 @@ appearing twice in the ancestor chain (which made thor's `super`-calling
 `method_added` recurse 15000 deep), and `Array#*` with a String separator, which
 `ui/shell.rb` uses to join its wrapped lines.
 
-What stops it now is measured and small to state: **`require "bundler/cli"`
-raises `Bundler::GemfileNotFound` at load time**, where ruby loads the file
-without touching a Gemfile. Something in that file's body is being evaluated
-eagerly here that ruby leaves for later. Until that is found, every `bundle`
-subcommand answers "Could not locate Gemfile", including `bundle version`, which
-needs no Gemfile at all.
+That `require "bundler/cli"` raised `Bundler::GemfileNotFound` was NOT eager
+evaluation, which is what the first guess said. ruby evaluates the same
+`method_option ... :lazy_default => Bundler.settings[...]` at class-body time;
+the difference was that `Bundler.settings` **rescues its own GemfileNotFound**
+and the rescue did not match, because a rescue clause's bare name was compared as
+text rather than resolved through its lexical scope. Five more walls came down
+after it (Exception#cause on both representations, RUBY_REVISION, RbConfig.ruby,
+`yield "str"`, and a module appearing twice in the chain), and `bundle` now runs
+bundler's own code from end to end of its startup.
+
+What stops `bundle --version` now, measured: **`IO.pipe` is not implemented**
+(thor asks for it while working out the terminal width), and thor registers
+bundler's private helpers as commands, printing a `[WARNING] Attempted to create
+command "current_command" without usage or description` for each -- its
+`no_commands` / `public_method_defined?` guard is not answering the way ruby's
+does. Neither is fatal to bundler's own logic; the pipe is.
+
+Also open, and found while fixing the rescue clause: a rescue whose class name
+resolves to nothing should raise NameError (ruby does) and here it simply does
+not match, so the original exception continues. And `Exception#cause` on the
+built-in class-and-message representation is always nil, since there is nowhere
+on it to record one -- an exception OBJECT records its cause properly.
