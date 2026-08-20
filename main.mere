@@ -347,6 +347,13 @@ let stdin_src_pos = map_new ();
 // which holds the interleaved [k1,v1,k2,v2,...] pair list. Aliases share one
 // mutable hash (h[k]=v is seen through every reference).
 let hash_store = vec_new () in
+// The signal names a program may trap. mere-ruby never delivers one -- nothing
+// here is a source of signals -- so this is a NAME table, used by Signal.list and
+// Signal.signame, and the handlers a program registers live in signal_traps
+// unread. A CLI traps INT before doing anything else, so answering matters more
+// than refusing; the limit is in KNOWN_GAPS.
+let signal_traps = map_new ();
+let signal_names = "EXIT:0 IOT:6 EMT:7 CLD:20 HUP:1 INT:2 QUIT:3 ILL:4 TRAP:5 ABRT:6 FPE:8 KILL:9 BUS:10 SEGV:11 SYS:12 PIPE:13 ALRM:14 TERM:15 URG:16 STOP:17 TSTP:18 CONT:19 CHLD:20 TTIN:21 TTOU:22 IO:23 XCPU:24 XFSZ:25 VTALRM:26 PROF:27 WINCH:28 INFO:29 USR1:30 USR2:31";
 let mkhash = fn (xs: Val list) ->
   let id = vec_len hash_store in
   let _ = vec_push hash_store xs in
@@ -7264,6 +7271,25 @@ let str_to_int_base = fn (s: str) -> fn (base: int) ->
   if str_len s > 0 && str_eq (char_at s 0) "-" then 0 - str_to_int_base_go s base (1 + base_prefix_len s 1 base) 0
   else str_to_int_base_go s base (base_prefix_len s 0 base) 0;
 
+// Walk the "NAME:NUM NAME:NUM" table above. Two readers: Signal.list wants the
+// pairs as a Hash, Signal.signame wants the name for a number.
+let rec signal_scan = fn (i: int) -> fn (start: int) -> fn (acc: Val list) ->
+  if i > str_len signal_names then rev_app acc Nil
+  else if i == str_len signal_names || str_eq (char_at signal_names i) " " then
+    (let tok = substring signal_names start i in
+     let colon = str_index_of tok ":" in
+     if colon < 0 then signal_scan (i + 1) (i + 1) acc
+     else (let nm = substring tok 0 colon in
+           let num = str_to_int_base (substring tok (colon + 1) (str_len tok)) 10 in
+           signal_scan (i + 1) (i + 1) (Cons (VInt num, Cons (mkstr nm, acc)))))
+  else signal_scan (i + 1) start acc;
+let signal_list_pairs = fn (u: unit) -> signal_scan 0 0 Nil;
+let rec signal_name_go = fn (xs: Val list) -> fn (n: int) ->
+  match xs with
+  | Cons (VStr h, Cons (VInt v, rest)) -> if v == n then sget h else signal_name_go rest n
+  | _ -> "";
+let signal_name_of = fn (n: int) -> signal_name_go (signal_list_pairs ()) n;
+
 
 // float floor/ceil/round built on int_of_float (which truncates toward 0).
 let flt_floor = fn (x: float) -> let t = int_of_float x in if float_of_int t > x then t - 1 else t;
@@ -9469,6 +9495,18 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
               && (match vb with VObj _ -> true | _ -> false)
               && responds world vb "to_int" then
         arith_bin op va0 (invoke_val_c env world blk vb "to_int" Nil false)
+      // `arr * "sep"` is `arr.join(sep)`, not repetition -- ruby's Array#* takes
+      // either. bundler's ui/shell.rb writes `...collect { ... } * "\n"`, and
+      // refusing the String stopped `bundle --version` there. A STRING receiver
+      // still refuses a String argument, which is what ruby does.
+      else if str_eq op "*"
+              && (match va0 with VArr _ -> true | _ -> false)
+              && (match vb with VStr _ -> true | _ -> false) then
+        (match (va0, vb) with
+         | (VArr aid, VStr sh) ->
+           (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+            invoke_val_c env world nb va0 "join" (Cons (vb, Nil)) false)
+         | _ -> arith_bin op va0 vb)
       // ...and an object that cannot become an Integer is refused, rather than
       // repeated some number of times nobody asked for
       else if str_eq op "*"
@@ -12952,6 +12990,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          VSym n1
        | _ -> VNil)
     // GC.start / GC.enable / GC.disable / GC.stress= are no-ops.
+    // Signal.trap / Signal.list. The handler is RECORDED and returned as the
+    // previous one, and it is never called: nothing in this runtime delivers a
+    // signal, so there is no source for it to come from. Refusing instead would
+    // be worse in a specific way -- every CLI traps INT on its first line (the
+    // `bundle` executable does, line 5), so refusing stops the program before it
+    // starts, while accepting loses only a handler that could never fire. The
+    // limit is written down in KNOWN_GAPS rather than hidden.
+    else if str_eq c "Signal" && (str_eq name "trap" || str_eq name "list" || str_eq name "signame") then
+      (if str_eq name "list" then
+         mkhash (signal_list_pairs ())
+       else if str_eq name "signame" then
+         (match args with
+          | Cons (VInt n, _) -> (let nm = signal_name_of n in if str_eq nm "" then VNil else mkstr nm)
+          | _ -> VNil)
+       else
+         (let sg = (match args with Cons (VStr h, _) -> sget h | Cons (VSym sy, _) -> sy | Cons (VInt n, _) -> signal_name_of n | _ -> "") in
+          let prev = (if map_has signal_traps sg then map_get signal_traps sg else mkstr "DEFAULT") in
+          let hnd = (match args with
+                     | Cons (_, Cons (v, _)) -> v
+                     | _ -> (match blk with (true, _, _, _) -> mkstr "(block)" | _ -> mkstr "DEFAULT")) in
+          let _ = map_set signal_traps sg hnd in
+          prev))
     else if str_eq c "GC" && (str_eq name "start" || str_eq name "enable" || str_eq name "disable" || str_eq name "stress=" || str_eq name "stress") then VNil
     // Zlib.crc32(str, seed) / Zlib.adler32(str, seed), and the two stream
     // methods, reached as Zlib::Deflate.deflate / Zlib::Inflate.inflate.
@@ -13164,8 +13224,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // possible override (`::Kernel::raise ::ArgumentError, "..."`).
     // ...only for the module functions; Module's own methods (`class`, `name`,
     // ...) fall through to the general dispatcher, as for Math above.
+    // `to_s` and `inspect` are Module's here too, for the same reason `class` is:
+    // `Kernel.to_s` is "Kernel", and routing it to the module FUNCTION answered
+    // "main" -- the module function runs with self = main, which is exactly
+    // right for `Kernel.puts` and exactly wrong for a description of the module.
     else if str_eq c "Kernel" && (if is_module_method name then false else true)
-            && (if str_eq name "class" then false else true) then
+            && (if str_eq name "class" || str_eq name "to_s" || str_eq name "inspect" then false else true) then
       // `raise` is an expression form, not an entry in the method table.
       (if str_eq name "raise" || str_eq name "fail" then
          (let (_, _, _, iv0) = world in
@@ -14620,6 +14684,17 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
              else invoke_with_block env world blk mrecv mnm args newblk))
        | _ -> VNil)
+    // `Signal.trap("INT") do ... end` -- the form every CLI actually writes, and
+    // a block-carrying call never reaches the plain dispatcher where the rest of
+    // Signal lives. The handler is recorded and never called (nothing here
+    // delivers a signal); what matters is that the program starts.
+    else if str_eq name "trap"
+            && (match recv with VClass sc -> str_eq sc "Signal" | _ -> false) then
+      (let sg = (match args with Cons (VStr h, _) -> sget h | Cons (VSym sy, _) -> sy
+                               | Cons (VInt n, _) -> signal_name_of n | _ -> "") in
+       let prev = (if map_has signal_traps sg then map_get signal_traps sg else mkstr "DEFAULT") in
+       let _ = map_set signal_traps sg (mkstr "(block)") in
+       prev)
     // `pr.call(x) { ... }` -- a Proc called with a block. The block belongs to
     // the proc's BODY (that is what makes `Method#to_proc` able to forward one:
     // `method(:m).to_proc.call(5) { }` has to reach `m`'s yield), and without
@@ -18881,7 +18956,24 @@ and ancestors_of_raw = fn world -> fn (cls: str) ->
              else if str_eq cls "BasicObject" then Nil
              else if str_eq cls "Object" then Cons ("BasicObject", Nil)
              else ancestors_of world "Object" in
-  list_append_str pre (Cons (cls, list_append_str mods rest))
+  // A module already in the chain is NOT re-inserted: ruby keeps the position it
+  // already had, so `class B < A; include M; end` where A includes M answers
+  // [B, A, M, ...] and not [B, M, A, M, ...]. Without this the chain held the
+  // same module twice, and `super` from the first occurrence found the second --
+  // an infinite recursion. thor's `method_added` calls `super(meth)` on its
+  // first line, and every Thor subclass extends the module its parent already
+  // extends, so `bundle` recursed 15000 deep before the guard caught it.
+  // Deduped keeping the LAST occurrence, which is the one ruby keeps.
+  anc_dedupe (list_append_str pre (Cons (cls, list_append_str mods rest)))
+
+// Drop every occurrence of a name that appears again later in the list.
+and anc_dedupe = fn (xs: str list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if str_list_has t h then anc_dedupe t else Cons (h, anc_dedupe t)
+
+and str_list_has = fn (xs: str list) -> fn (x: str) ->
+  match xs with Nil -> false | Cons (h, t) -> if str_eq h x then true else str_list_has t x
 // ancestor names as class values (Module#ancestors).
 and anc_vclasses = fn (anc: str list) ->
   match anc with Nil -> Nil | Cons (a, rest) -> Cons (VClass a, anc_vclasses rest)
@@ -28846,6 +28938,17 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // instead of letting the interpreter's own `fail` message be the last word.
   // (Until this, every uncaught Ruby exception read as "(ruby exception
   // raised)", which named neither the class nor the message.)
+  // ruby LOADS RUBYGEMS BEFORE the program (that is what `--disable=gems` turns
+  // off), and mere-ruby did not: `bundle --version` reached line 15 and stopped
+  // at `uninitialized constant Gem::Requirement`, because bundler expects the
+  // gem library to be there already. So when rubygems can be FOUND on the load
+  // path, it is required first, exactly as ruby does; when it cannot (no -I, no
+  // RUBYLIB -- the corpus, the playground) nothing happens and nothing slows
+  // down. MERE_RUBY_NO_GEMS=1 is the `--disable=gems` of this interpreter.
+  let _ = (if str_eq (env_get "MERE_RUBY_NO_GEMS") ""
+              && (if str_eq (load_path_find world "rubygems.rb") "" then false else true)
+           then (let _ = try_or (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> ())) () in ())
+           else ()) in
   let ranok = map_new () in
   let final = try_or (fn (u: unit) ->
                         let r = hoist_run env world noblk prog in
