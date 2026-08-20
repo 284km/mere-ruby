@@ -56,3 +56,13 @@ p Object.ancestors.map(&:to_s)
 # `arr * "sep"` is join, not repetition -- ruby's Array#* takes either
 p [[1, 2] * ",", [1, 2] * 2, [] * "-", ["a", "b"] * ""]
 p [[1, [2, 3]] * ", "]
+
+# The depth guard's message is ruby's four words. It used to name its own class,
+# which the reporter then added again: "stack level too deep (SystemStackError)
+# (SystemStackError)".
+def deep(n); deep(n + 1); end
+begin
+  deep(0)
+rescue SystemStackError => e
+  p [e.class, e.message]
+end
