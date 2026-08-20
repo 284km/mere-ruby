@@ -134,13 +134,6 @@ returns self, or a copy with a new message) and `#cause` (the exception that was
 in flight when this one was raised) are not implemented, and `respond_to?`
 answers false for them rather than promising what is not there.
 
-## `Array#max(n)` answers with the element, not an array of n
-
-`[3, 1].max(1)` is `[3]` in ruby and `3` here, and the same for `min(n)`. The
-count argument is ignored rather than refused, which is the wrong shape rather
-than a wrong order -- code that calls `.max(1).map` gets a NoMethodError on the
-element.
-
 ## `encode` has no character tables, and `$?` is not set
 
 Transcoding here works by codepoints: a string is decoded to codepoints and
@@ -173,20 +166,22 @@ operation, `sync = true` makes each write flush, and a file is not a terminal.
 sidekiq-pro and devise ask for `fileno` when they are loaded without a CRuby
 stdlib on `-I`, and stop there.
 
-## A Proc made by `Method#to_proc` drops a block passed to its own `#call`
+## A block's own `&b` parameter used to bind nil, and the comment said why
 
-`m = obj.method(:each_thing); m.call { ... }` reaches the method with the block,
-and so does `m.call(&blk)`. Going through `to_proc` does not: the Proc it builds
-runs a body that calls the Method with the arguments it was given and no block,
-so a block handed to the Proc is lost.
+`proc { |x, &b| b.call(x) }.call(7) { |v| v + 1 }` is 8 in ruby and was
+NoMethodError on nil here, because the binder set a block parameter to nil with a
+comment stating that blocks are not re-passed through block params. They are, and
+the mechanism the comment implied was missing -- capturing a block as a real Proc
+-- was already there, three hundred lines away, in the binder for *method*
+parameters. **A comment that explains why something is not done outlives the
+reason**, and it is read as a decision rather than a gap.
 
-Fixing it means giving that generated body a block to forward, and a block is
-not a value here: it lives in a frame's environment (the Q-001 region wall), so
-a `&blk` parameter binds a sentinel and `.call` on the sentinel is special-cased
-to run the *ambient* block. A Proc built once and called later has no ambient
-block to name. The shapes that reach a method with a block -- `m.call { }`,
-`m.call(&blk)`, `obj.send(:m) { }`, `&method(:m)` as a block argument -- all
-work; this is the one that does not.
+That was also the whole of the `Method#to_proc` gap: the Proc it builds forwards
+`(*args, &blk)` to the method, so with the block parameter bound
+`method(:m).to_proc.call(5) { }` reaches m's yield. The Proc also answers the
+METHOD's arity and is a lambda, where the forwarder's own `*args` would say -1
+and false -- kept in a side table rather than by rewriting the forwarder.
+`corpus/153` covers all of it.
 
 ## Corpus programs must be self-contained
 
@@ -209,16 +204,28 @@ reads and delete it afterwards.
 mere-ruby keeps no call stack. `caller` is `[]`, and `caller_locations`
 returns a single `Thread::Backtrace::Location` for the file being executed,
 with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
-`module_eval`. For a method called from a library's body that frame IS the
-caller's file, so the answer is right where it matters; at the top level Ruby
-would return an empty array and mere-ruby still returns the frame.
+`module_eval`. `caller_locations` now answers one Location per frame, built from
+the same per-depth arrays `caller` reads, and a Location prints as the frame it
+names. It used to answer a single location with an empty label and lineno 0, and
+its comment said there was no call stack and no line tracking to build them from
+-- true when written, and untrue since the frames and the line markers landed:
+`caller` was updated and this was not. A Location's printed form has to be
+answered TWICE, in the dispatcher and in the value printer, because an element
+inside an array goes through the second one (`Encoding` and `MatchData` are in
+the same position).
 
 There IS a call stack now: `caller` answers real frames, formatted as the
 reference ruby writes them, an uncaught error names `file:line:in 'meth'`, and
 `Exception#backtrace` answers the frames of the raise.
 
-Two limits. A frame belonging to a BLOCK is labelled with the enclosing method,
-where ruby writes `block in meth`. And a backtrace belongs to the raise that is
+Two limits. **A block gets no frame at all**: inside `[1].each { }` in a method
+`outer`, ruby's labels are `["block in outer", "each", "outer"]` and this answers
+`["outer", "<main>"]` -- the block and the builtin that called it are both
+missing, rather than the block being mislabelled. Giving a block a frame means
+three more per-depth entries per block invocation, and the reclamation
+measurements above say what that costs: a call already leaks 13.4 KB and nothing
+is ever given back. So this is a cost decision waiting on reclamation, not an
+oversight. And a backtrace belongs to the raise that is
 IN FLIGHT: the built-in exception representation is a class and a message with no
 identity, so there is nowhere on it to keep a copy. The frames live in one slot,
 answered for the exception in `$!`; an exception that was rescued and put aside

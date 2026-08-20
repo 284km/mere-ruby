@@ -439,6 +439,9 @@ let proc_yblk = map_new ();
 let yblk_marker = "__yblk__~";
 // proc ids created via `lambda` — lambdas check arity strictly on call.
 let lambda_ids = map_new ();
+// A proc built from something that already knows its arity (Method#to_proc,
+// where ruby's answer is the METHOD's arity, not the `*args` forwarder's).
+let proc_arity = map_new ();
 // a sentinel prepended to a block's params when a lambda is installed as a
 // block (via &lambda): run_block detects it, strips it, and enforces strict
 // arity (a lambda yielded to raises ArgumentError on a count mismatch, unlike
@@ -2819,7 +2822,15 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               if starts_block r4 then
                 let (bp, bb, r5) = parse_block r4 in
                 parse_postfix_more (ESafeB (recv, name, argv, bp, bb)) r5
-              else parse_postfix_more (ESafe (recv, name, argv)) r4
+              else
+                // `a&.map(&:to_s)`: a trailing block-PASS is a block too, and
+                // safe navigation used to keep it as an argument -- which the
+                // dispatcher then read as `map(:to_s)`, i.e. an Enumerator with
+                // a stray argument rather than a mapped array. `.map(&:to_s)`
+                // went through this same rewrite; only `&.` did not.
+                (let (argv2, hasbp, bp2, bb2) = extract_block_pass argv in
+                 if hasbp then parse_postfix_more (ESafeB (recv, name, argv2, bp2, bb2)) r4
+                 else parse_postfix_more (ESafe (recv, name, argv)) r4)
             else if str_eq p2 "=" then
               let (rhs, r4) = parse_expr (skip_nls r3) in
               (ESafe (recv, name ++ "=", Cons (rhs, Nil)), r4)
@@ -8660,7 +8671,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "caller" && (if map_has meths name then false else true) then
       arr_new (caller_frames 1)
     else if str_eq name "caller_locations" && (if map_has meths name then false else true) then
-      arr_new (Cons (caller_location world (), Nil))
+      arr_new (caller_locs world 1 (0 - 1))
     else if str_eq name "print" && (if kernel_overridden env world "print" then false else true) then VNil
     else if str_eq name "rand" && (if map_has meths "rand" then false else true) then rand_val world Nil
     else if str_eq name "srand" && (if map_has meths "srand" then false else true) then VInt 0
@@ -10003,6 +10014,60 @@ and make_exc_w = fn world -> fn (args: Val list) ->
   | Cons (VObj id, _) -> VObj id
   | _ -> make_exc args
 
+// An Errno class puts the system's own text in front of whatever message it is
+// given: `raise Errno::ENOENT, "boom"` reads "No such file or directory - boom",
+// and with no message it reads the text alone. The table covers exactly the
+// names registered as classes (reg_cls_list) -- the two lists have to agree, and
+// `errno_desc_missing` is what a gate asks to find out that they do not, since a
+// name with a class and no text would silently lose its prefix instead of
+// failing.
+and errno_desc = fn (n: str) ->
+  if str_eq n "ENOENT" then "No such file or directory"
+  else if str_eq n "ECONNREFUSED" then "Connection refused"
+  else if str_eq n "ECONNRESET" then "Connection reset by peer"
+  else if str_eq n "EADDRINUSE" then "Address already in use"
+  else if str_eq n "EPIPE" then "Broken pipe"
+  else if str_eq n "EAGAIN" then "Resource temporarily unavailable"
+  else if str_eq n "EINPROGRESS" then "Operation now in progress"
+  else if str_eq n "EALREADY" then "Operation already in progress"
+  else if str_eq n "EISCONN" then "Socket is already connected"
+  else if str_eq n "ENOTCONN" then "Socket is not connected"
+  else if str_eq n "ETIMEDOUT" then "Operation timed out"
+  else if str_eq n "EHOSTUNREACH" then "No route to host"
+  else if str_eq n "ENETUNREACH" then "Network is unreachable"
+  else if str_eq n "ECONNABORTED" then "Software caused connection abort"
+  else if str_eq n "EBADF" then "Bad file descriptor"
+  else if str_eq n "EINTR" then "Interrupted system call"
+  else if str_eq n "EINVAL" then "Invalid argument"
+  else if str_eq n "EMFILE" then "Too many open files"
+  else if str_eq n "ENOTDIR" then "Not a directory"
+  else if str_eq n "EEXIST" then "File exists"
+  else if str_eq n "EACCES" then "Permission denied"
+  else if str_eq n "ENOSPC" then "No space left on device"
+  else if str_eq n "ESPIPE" then "Illegal seek"
+  else if str_eq n "ENOMEM" then "Cannot allocate memory"
+  else if str_eq n "EIO" then "Input/output error"
+  else if str_eq n "EPROTO" then "Protocol error"
+  else if str_eq n "ENOTSUP" then "Operation not supported"
+  else ""
+
+// Every registered Errno name that has no text above. Empty is the only correct
+// answer; anything in it is a name whose messages are quietly short.
+and errno_desc_missing = fn (names: str list) ->
+  (match names with
+   | Nil -> Nil
+   | Cons (n, rest) ->
+     (let short = (if str_len n > 7 && str_eq (substring n 0 7) "Errno::" then substring n 7 (str_len n) else "") in
+      if str_eq short "" then errno_desc_missing rest
+      else if str_eq (errno_desc short) "" then Cons (n, errno_desc_missing rest)
+      else errno_desc_missing rest))
+
+and errno_message = fn (c: str) -> fn (given: str) -> fn (have_msg: bool) ->
+  (let d = errno_desc (substring c 7 (str_len c)) in
+   if str_eq d "" then (if have_msg then given else c)
+   else if have_msg then d ++ " - " ++ given
+   else d)
+
 and make_exc = fn (args: Val list) ->
   match args with
   // bare `raise` yields a RuntimeError whose message is empty (not the
@@ -10010,7 +10075,12 @@ and make_exc = fn (args: Val list) ->
   | Nil -> VExc ("RuntimeError", "")
   | Cons (VStr msg, _) -> let msg = sget msg in VExc ("RuntimeError", msg)
   | Cons (VClass c, rest) ->
-    (match rest with Cons (VStr m, _) -> let m = sget m in VExc (c, m) | _ -> VExc (c, c))
+    (let is_errno = str_len c > 7 && str_eq (substring c 0 7) "Errno::" in
+     match rest with
+     | Cons (VStr m, _) ->
+       (let m = sget m in
+        if is_errno then VExc (c, errno_message c m true) else VExc (c, m))
+     | _ -> (if is_errno then VExc (c, errno_message c "" false) else VExc (c, c)))
   | Cons (VExc (c, m), _) -> VExc (c, m)
   | Cons (v, _) -> VExc ("RuntimeError", to_s v)
 
@@ -10336,9 +10406,20 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   let _ = (match params0 with
            | Nil -> bind_numbered cenv argvals0 1
            | _ -> ()) in
-  // &blk params bind nil (blocks aren't re-passed through block params).
+  // A block's own `&b` parameter binds the block given at the CALL SITE, the
+  // same way a method's does -- the comment here used to claim blocks are not
+  // re-passed through block params, and `proc {|x, &b| b.call(x) }.call(7) { }`
+  // says otherwise (ruby answers 8; this answered NoMethodError on nil). It is
+  // also what makes `Method#to_proc` able to carry a block to the method.
   let params = strip_block_params params0 in
-  let _ = (let b = block_param_name params0 in if str_eq b "" then () else map_set cenv b VNil) in
+  let _ = (let b = block_param_name params0 in
+           if str_eq b "" then ()
+           else map_set cenv b
+                  (let (has, _, _, _) = blk in
+                   if has then (let pid = map_len proc_store in
+                                let _ = map_set proc_store (str_of_int pid) blk in
+                                VProc pid)
+                   else VNil)) in
   // explicit block-locals (`|x; a, b|`, encoded ";name") start as fresh nil
   // locals in this frame and are excluded from positional binding; the outer
   // binding of the same name is untouched, so they do not leak.
@@ -11350,6 +11431,17 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // other answer gets the default one.
     else if map_has enc_name (str_of_int oid) then inspect v
     else if map_has md_whole (str_of_int oid) then inspect v
+    // A backtrace Location reads as the frame it names, and it has to be
+    // answered HERE as well as in the dispatcher: an element inside an array is
+    // formatted by this printer, not by a to_s call, so `p caller_locations`
+    // showed the raw object while `p loc.to_s` was already right. Two printers,
+    // one answer needed in both.
+    else if str_eq cls "Thread::Backtrace::Location" then
+      (let gv = fn (k: str) -> (if map_has iv2 (str_of_int oid ++ "@" ++ k) then map_get iv2 (str_of_int oid ++ "@" ++ k) else VNil) in
+       let pth = (match gv "path" with VStr h -> sget h | _ -> "") in
+       let lno = (match gv "lineno" with VInt n -> n | _ -> 0) in
+       let lbl = (match gv "label" with VStr h -> sget h | _ -> "") in
+       inspect (mkstr (pth ++ ":" ++ str_of_int lno ++ ":in `" ++ lbl ++ "'")))
     else
       (let ivs = obj_ivar_dump env world oid cls in
        "#<" ++ cls ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
@@ -11741,6 +11833,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                   // correctly are the ones raised as a class and a message,
                   // which are a different representation and never come here.
                   else if exc_is_a world c9 "Exception" then false
+                  // A backtrace Location prints as the frame it names --
+                  // "path:line:in `label'" for to_s, and that string's inspect
+                  // for inspect, which is how `p caller_locations` reads in ruby.
+                  else if str_eq c9 "Thread::Backtrace::Location" then false
                   else true))
               | _ -> false) then
     (match recv with
@@ -11750,6 +11846,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        if str_eq name "to_s" then mkstr ("#<" ++ c9 ++ ":0x" ++ hex_pad16 oid ++ ">")
        else mkstr (inspect_w env world recv)
      | _ -> mkstr (inspect_w env world recv))
+  // A backtrace Location prints as the frame it names: "path:line:in `label'"
+  // for to_s, and that string's inspect for inspect, which is how
+  // `p caller_locations` reads in ruby.
+  else if (str_eq name "to_s" || str_eq name "inspect")
+          && (match recv with
+              | VObj lid -> (let (_, _, ocls8, _) = world in str_eq (map_get ocls8 (str_of_int lid)) "Thread::Backtrace::Location")
+              | _ -> false) then
+    (match recv with
+     | VObj lid ->
+       (let (_, _, _, ivars8) = world in
+        let gv = fn (k: str) -> (if map_has ivars8 (str_of_int lid ++ "@" ++ k) then map_get ivars8 (str_of_int lid ++ "@" ++ k) else VNil) in
+        let pth = (match gv "path" with VStr h -> sget h | _ -> "") in
+        let lno = (match gv "lineno" with VInt n -> n | _ -> 0) in
+        let lbl = (match gv "label" with VStr h -> sget h | _ -> "") in
+        let fs = pth ++ ":" ++ str_of_int lno ++ ":in `" ++ lbl ++ "'" in
+        if str_eq name "to_s" then mkstr fs else mkstr (inspect (mkstr fs)))
+     | _ -> VNil)
   else
   // a singleton method defined on this exact String/Array/Hash wins.
   let hk = hng_key recv in
@@ -12653,23 +12766,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if str_eq name "class_variable_get" then
       (match args with
-       | Cons (v, _) -> let nm = ivar_arg_name (ivar_arg_name (to_s v)) in
+       | Cons (v, _) -> let nm = cvar_name_checked world (to_s v) in
          (if cvar_overtaken world c nm then raise_exc world "RuntimeError" ("class variable @@" ++ nm ++ " of " ++ c ++ " is overtaken by " ++ c)
           else if cvar_defined_from world c nm then cvar_get_from world c nm
           else raise_exc world "NameError" ("uninitialized class variable @@" ++ nm ++ " in " ++ c))
        | _ -> VNil)
     else if str_eq name "class_variable_set" then
       (match args with
-       | Cons (v, Cons (value, _)) -> let nm = ivar_arg_name (ivar_arg_name (to_s v)) in
+       | Cons (v, Cons (value, _)) -> let nm = cvar_name_checked world (to_s v) in
          let owner0 = cvar_owner world c nm in
          let owner = if str_eq owner0 "" then c else owner0 in
          let _ = map_set cvars (owner ++ "@" ++ nm) value in value
        | _ -> VNil)
     else if str_eq name "class_variable_defined?" then
-      (match args with Cons (v, _) -> VBool (map_has cvars (c ++ "@" ++ ivar_arg_name (ivar_arg_name (to_s v)))) | _ -> VBool false)
+      (match args with Cons (v, _) -> VBool (map_has cvars (c ++ "@" ++ cvar_name_checked world (to_s v))) | _ -> VBool false)
     else if str_eq name "remove_class_variable" then
       (match args with
-       | Cons (v, _) -> let k = c ++ "@" ++ ivar_arg_name (ivar_arg_name (to_s v)) in
+       | Cons (v, _) -> let k = c ++ "@" ++ cvar_name_checked world (to_s v) in
          let old = (if map_has cvars k then map_get cvars k else VNil) in
          let _ = if map_has cvars k then map_delete cvars k else () in old
        | _ -> VNil)
@@ -12687,17 +12800,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if str_eq name "instance_variable_get" then
       (let (_, _, _, ivars0) = world in
-       match args with Cons (v, _) -> let k = "cls:" ++ c ++ "@" ++ ivar_arg_name (to_s v) in (if map_has ivars0 k then map_get ivars0 k else VNil) | _ -> VNil)
+       match args with Cons (v, _) -> let k = "cls:" ++ c ++ "@" ++ ivar_name_checked world (to_s v) in (if map_has ivars0 k then map_get ivars0 k else VNil) | _ -> VNil)
     else if str_eq name "instance_variable_set" then
       (let (_, _, _, ivars0) = world in
-       match args with Cons (v, Cons (value, _)) -> let _ = map_set ivars0 ("cls:" ++ c ++ "@" ++ ivar_arg_name (to_s v)) value in value | _ -> VNil)
+       match args with Cons (v, Cons (value, _)) -> let _ = map_set ivars0 ("cls:" ++ c ++ "@" ++ ivar_name_checked world (to_s v)) value in value | _ -> VNil)
     else if str_eq name "instance_variable_defined?" then
       (let (_, _, _, ivars0) = world in
-       match args with Cons (v, _) -> VBool (map_has ivars0 ("cls:" ++ c ++ "@" ++ ivar_arg_name (to_s v))) | _ -> VBool false)
+       match args with Cons (v, _) -> VBool (map_has ivars0 ("cls:" ++ c ++ "@" ++ ivar_name_checked world (to_s v))) | _ -> VBool false)
     else if str_eq name "remove_instance_variable" then
       (let (_, _, _, ivars0) = world in
        match args with
-       | Cons (v, _) -> let k = "cls:" ++ c ++ "@" ++ ivar_arg_name (to_s v) in
+       | Cons (v, _) -> let k = "cls:" ++ c ++ "@" ++ ivar_name_checked world (to_s v) in
          let old = (if map_has ivars0 k then map_get ivars0 k else VNil) in
          let _ = if map_has ivars0 k then map_delete ivars0 k else () in old
        | _ -> VNil)
@@ -13088,15 +13201,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if str_eq name "instance_variable_get" then
-      (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_arg_name (to_s v) in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
+      (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_name_checked world (to_s v) in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
     else if str_eq name "instance_variable_set" then
       (let _ = (if val_is_frozen recv
                 then (let _ = raise_exc world "FrozenError"
                                 ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) in ())
                 else ()) in
-       match args with Cons (v, Cons (value, _)) -> let _ = map_set ivars (str_of_int id ++ "@" ++ ivar_arg_name (to_s v)) value in value | _ -> VNil)
+       match args with Cons (v, Cons (value, _)) -> let _ = map_set ivars (str_of_int id ++ "@" ++ ivar_name_checked world (to_s v)) value in value | _ -> VNil)
     else if str_eq name "instance_variable_defined?" then
-      (match args with Cons (v, _) -> VBool (map_has ivars (str_of_int id ++ "@" ++ ivar_arg_name (to_s v))) | _ -> VBool false)
+      (match args with Cons (v, _) -> VBool (map_has ivars (str_of_int id ++ "@" ++ ivar_name_checked world (to_s v))) | _ -> VBool false)
     // Object#instance_variables: this object's own @ivars, as :@name symbols.
     else if str_eq name "instance_variables" then
       (let pfx = str_of_int id ++ "@" in
@@ -13153,11 +13266,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // the proc calls the Method OBJECT, so it inherits everything #call
           // already handles: a private method, and a builtin operator.
           let _ = map_set benv "__m_meth" (VObj id) in
+          // ... and the block the caller gives the PROC belongs to the method:
+          // `method(:m).to_proc.call(5) { }` must reach m's yield, so the proc
+          // takes a block parameter and passes it on.
           let body = (match mrecv with
-                      | VMain -> Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Nil))), Nil)
-                      | _ -> Cons (SExpr (EMethod (EVar "__m_meth", "call", Cons (ESplat (EVar "__a"), Nil))), Nil)) in
+                      | VMain -> Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)
+                      | _ -> Cons (SExpr (EMethod (EVar "__m_meth", "call", Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)) in
           let pid = map_len proc_store in
-          let _ = map_set proc_store (str_of_int pid) (true, Cons ("*__a", Nil), body, benv) in
+          let _ = map_set proc_store (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
+          // ruby's Method#to_proc answers the METHOD's arity and is a lambda;
+          // the forwarder's own `*__a` would say -1 and "not a lambda".
+          let _ = map_set proc_arity (str_of_int pid) (VInt (bm_arity world mown mnm)) in
+          let _ = map_set lambda_ids (str_of_int pid) VNil in
           VProc pid)
        else if str_eq name "inspect" || str_eq name "to_s" then
          mkstr ("#<Method: " ++ (if str_eq mown "" then class_name mrecv else mown) ++ "#" ++ mnm ++ ">")
@@ -14037,6 +14157,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // lambda and optional for a proc.
           | Nil -> arr_new (numbered_params_meta is_lam 1 (max_numbered_stmts body))
           | ps1 -> arr_new (param_meta_of is_lam ps1 (block_defaults body))))
+    else if str_eq name "arity" && map_has proc_arity (str_of_int pid) then
+      map_get proc_arity (str_of_int pid)
     else if str_eq name "arity" then
       (match map_get proc_store (str_of_int pid) with
        (h, ps0, body, e) ->
@@ -14477,6 +14599,16 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              if has_meth world owner mnm then invoke world newblk mrecv owner mnm args
              else if has_meth world dcls mnm then invoke world newblk mrecv dcls mnm args
              else invoke_with_block env world blk mrecv mnm args newblk))
+       | _ -> VNil)
+    // `pr.call(x) { ... }` -- a Proc called with a block. The block belongs to
+    // the proc's BODY (that is what makes `Method#to_proc` able to forward one:
+    // `method(:m).to_proc.call(5) { }` has to reach `m`'s yield), and without
+    // this arm the receiver was a Proc whose `call` could not be found at all,
+    // which reported as NoMethodError on Proc.
+    else if (str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield")
+            && (match recv with VProc _ -> true | _ -> false) then
+      (match recv with
+       | VProc pid -> flow_value (run_block world newblk (map_get proc_store (str_of_int pid)) args)
        | _ -> VNil)
     // recv.define_method(:name) { block } with an explicit class receiver:
     // register the block as an instance method of that class (used on singleton
@@ -14941,6 +15073,28 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
 and ivar_arg_name = fn (nm: str) ->
   if str_len nm > 0 && str_eq (char_at nm 0) "@" then substring nm 1 (str_len nm) else nm
 
+// ruby REFUSES a name that is not shaped like the variable being asked for,
+// rather than answering nil for one that could never exist: "x", "@@x", "@",
+// "@1" and "@ x" are all NameError from instance_variable_get, and "x" / "@x"
+// from class_variable_get. Answering nil instead is the kind of wrong answer
+// that is worse than a refusal -- the caller cannot tell "not set" from
+// "could never be set". The wording follows the same choice as the rest of the
+// errors here (ruby 3.4's straight quotes, not 3.2's `x').
+and ivar_name_shaped = fn (nm: str) ->
+  str_len nm >= 2 && str_eq (char_at nm 0) "@"
+  && (if str_eq (char_at nm 1) "@" then false else is_alpha (char_at nm 1))
+and cvar_name_shaped = fn (nm: str) ->
+  str_len nm >= 3 && str_eq (substring nm 0 2) "@@" && is_alpha (char_at nm 2)
+
+and ivar_name_checked = fn world -> fn (nm: str) ->
+  if ivar_name_shaped nm then ivar_arg_name nm
+  else (let _ = raise_exc world "NameError"
+                  ("'" ++ nm ++ "' is not allowed as an instance variable name") in "")
+and cvar_name_checked = fn world -> fn (nm: str) ->
+  if cvar_name_shaped nm then ivar_arg_name (ivar_arg_name nm)
+  else (let _ = raise_exc world "NameError"
+                  ("'" ++ nm ++ "' is not allowed as a class variable name") in "")
+
 and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let cls = class_name recv in
@@ -14967,12 +15121,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      else if str_eq name "instance_variable_set" then
        (if str_eq base "" then raise_exc world "FrozenError" ("can't modify frozen " ++ cls ++ ": " ++ inspect recv)
         else match args with
-             | Cons (v, Cons (value, _)) -> let _ = map_set ivars0 (base ++ "@" ++ ivar_arg_name (to_s v)) value in value
+             | Cons (v, Cons (value, _)) -> let _ = map_set ivars0 (base ++ "@" ++ ivar_name_checked world (to_s v)) value in value
              | _ -> VNil)
      else
        (match args with
         | Cons (v, _) ->
-          (let k = base ++ "@" ++ ivar_arg_name (to_s v) in
+          (let k = base ++ "@" ++ ivar_name_checked world (to_s v) in
            if str_eq base "" then (if str_eq name "instance_variable_defined?" then VBool false else VNil)
            else if str_eq name "instance_variable_defined?" then VBool (map_has ivars0 k)
            else if map_has ivars0 k then map_get ivars0 k else VNil)
@@ -18086,7 +18240,9 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // answer rather than nil. activesupport's mattr_accessor passes
   // path/lineno to module_eval.
   else if str_eq name "caller_locations" && (if map_has meths name then false else true) then
-    arr_new (Cons (caller_location world (), Nil))
+    (let skip = (match args with Cons (VInt n, _) -> n | _ -> 1) in
+     let want = (match args with Cons (_, Cons (VInt m, _)) -> m | _ -> 0 - 1) in
+     arr_new (caller_locs world skip want))
   // Kernel#rand: a Float in [0, 1) with no argument, an Integer in [0, n)
   // with a positive one, and a member of a Range.
   else if (str_eq name "rand" || str_eq name "srand") && (if map_has meths name then false else true) then
@@ -23262,6 +23418,43 @@ and caller_frames = fn (skip: int) ->
   vdrop all skip
 and vdrop = fn (xs: Val list) -> fn (n: int) ->
   if n <= 0 then xs else (match xs with Nil -> (Nil : Val list) | Cons (_, t) -> vdrop t (n - 1))
+// One Location per frame, from the same per-depth arrays `caller` reads. The
+// previous version answered ONE location with an empty label and lineno 0, and
+// said in its comment that there was no call stack and no line tracking to build
+// them from -- true when it was written, and not true since the frames and the
+// line markers landed. A comment that explains why something cannot be done
+// outlives the reason.
+and caller_loc_list = fn world -> fn (i: int) ->
+  if i < 0 then (Nil : Val list)
+  else Cons (loc_obj world (frame_file i) (frame_line i) (frame_label_at i), caller_loc_list world (i - 1))
+
+and caller_locs = fn world -> fn (skip: int) -> fn (want: int) ->
+  let cd = caller_depth () in
+  let here = loc_obj world (cur_file ()) (cur_line ())
+               (if cd <= 0 then "<main>" else meth_label (cur_meth ())) in
+  let all = (if cd <= 0 then Cons (here, (Nil : Val list)) else Cons (here, caller_loc_list world (cd - 1))) in
+  (if want < 0 then vdrop all skip else vtake (vdrop all skip) want)
+
+and vtake = fn (xs: Val list) -> fn (n: int) ->
+  if n <= 0 then (Nil : Val list)
+  else (match xs with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (h, vtake t (n - 1)))
+
+and loc_obj = fn world -> fn (path: str) -> fn (line: int) -> fn (label: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let cls = "Thread::Backtrace::Location" in
+  let _ = (if map_has consts cls then ()
+           else (let _ = map_set consts cls (VClass cls) in
+                 let _ = add_attrs world cls "r" (Cons ("path", Cons ("lineno", Cons ("label", Cons ("absolute_path", Nil))))) in
+                 ())) in
+  (match new_obj world cls Nil with
+   | VObj id ->
+     (let _ = map_set ivars (str_of_int id ++ "@path") (mkstr path) in
+      let _ = map_set ivars (str_of_int id ++ "@absolute_path") (mkstr path) in
+      let _ = map_set ivars (str_of_int id ++ "@lineno") (VInt line) in
+      let _ = map_set ivars (str_of_int id ++ "@label") (mkstr label) in
+      VObj id)
+   | other -> other)
+
 and caller_location = fn world -> fn (u: unit) ->
   let (meths, sup, ocls, ivars) = world in
   let cls = "Thread::Backtrace::Location" in
@@ -23899,11 +24092,35 @@ and restore_ref_active = fn saved ->
 // register_class instead, keeping the block's own lexical scope.)
 // register the built-in class / module names as constants so a bare reference
 // resolves; a genuinely-undefined constant then raises NameError.
+and errno_check = fn (names: str list) ->
+  if str_eq (env_get "MERE_RUBY_ERRNO_CHECK") "" then ()
+  else (match errno_desc_missing names with
+        | Nil -> print_err "errno_desc: every registered name has its text\n"
+        | miss -> print_err ("errno_desc MISSING:" ++ errno_names_str miss ++ "\n"))
+
+and errno_names_str = fn (ns: str list) ->
+  (match ns with Nil -> "" | Cons (n, t) -> " " ++ n ++ errno_names_str t)
+
 and reg_class_list = fn (ns: str list) ->
   match ns with Nil -> () | Cons (n, t) -> let _ = if map_has consts n then () else map_set consts n (VClass n) in reg_class_list t
 and reg_mod_list = fn (ns: str list) ->
   match ns with Nil -> () | Cons (n, t) -> let _ = (if map_has consts n then () else map_set consts n (VClass n)) in let _ = map_set modules n VNil in reg_mod_list t
 and register_builtin_consts = fn (u: unit) ->
+  // MERE_RUBY_ERRNO_CHECK=1 answers the one question the strerror table cannot
+  // answer for itself: is there a registered Errno class with no text? Such a
+  // name loses its prefix silently -- `raise Errno::EXYZ, "m"` would read "m"
+  // where ruby reads "<text> - m" -- so the two lists are checked against each
+  // other rather than trusted to stay in step. run_corpus.sh runs this first.
+  let _ = errno_check (Cons ("Errno::ENOENT", Cons ("Errno::ECONNREFUSED", Cons ("Errno::ECONNRESET",
+    Cons ("Errno::EADDRINUSE", Cons ("Errno::EPIPE", Cons ("Errno::EAGAIN",
+    Cons ("Errno::EINPROGRESS", Cons ("Errno::EALREADY", Cons ("Errno::EISCONN",
+    Cons ("Errno::ENOTCONN", Cons ("Errno::ETIMEDOUT", Cons ("Errno::EHOSTUNREACH",
+    Cons ("Errno::ENETUNREACH", Cons ("Errno::ECONNABORTED", Cons ("Errno::EBADF",
+    Cons ("Errno::EINTR", Cons ("Errno::EINVAL", Cons ("Errno::EMFILE",
+    Cons ("Errno::ENOTDIR", Cons ("Errno::EEXIST", Cons ("Errno::EACCES",
+    Cons ("Errno::ENOSPC", Cons ("Errno::ESPIPE", Cons ("Errno::ENOMEM",
+    Cons ("Errno::EIO", Cons ("Errno::EPROTO", Cons ("Errno::ENOTSUP",
+    Nil)))))))))))))))))))))))))))) in
   let _ = reg_class_list (Cons ("Object", Cons ("BasicObject", Cons ("Module", Cons ("Class",
     Cons ("Integer", Cons ("Float", Cons ("Numeric", Cons ("String", Cons ("Array", Cons ("Hash",
     Cons ("Symbol", Cons ("Range", Cons ("Proc", Cons ("NilClass", Cons ("TrueClass", Cons ("FalseClass",
