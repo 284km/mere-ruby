@@ -643,3 +643,40 @@ range. Producing the bytes for a codepoint that IS valid needs the table, and
 that is refused with NotImplementedError rather than answered with a byte that
 means something else -- which leaves about 14 of chr_spec's examples failing, the
 ones that ask what is invalid in Shift_JIS.
+
+## A signal handler is recorded and never delivered
+
+`Signal.trap` / `Kernel#trap` accept a handler, return the previous one, and
+store it unread; `Signal.list` and `Signal.signame` answer from a name table.
+Nothing in this interpreter delivers a signal -- there is no source for one -- so
+the handler cannot fire. Refusing instead was measurably worse: every CLI traps
+INT on its first line (`bundle` does, line 5), so refusing stops the program
+before it starts, while accepting loses only a handler that could never run.
+
+`Process.kill` is not implemented, which keeps the picture consistent: nothing
+sends a signal here and nothing receives one.
+
+## rubygems is preloaded when it can be found, as ruby does
+
+ruby loads rubygems before the program (`--disable=gems` turns that off), and
+this did not: `bundle --version` stopped at `uninitialized constant
+Gem::Requirement`, because bundler expects the gem library to be there already.
+Now, if `rubygems.rb` is on the load path, it is required first. With no `-I` and
+no `RUBYLIB` -- the corpus, the playground -- nothing is found and nothing is
+loaded, so nothing slows down. `MERE_RUBY_NO_GEMS=1` is this interpreter's
+`--disable=gems`.
+
+## How far `bundle` gets as a command
+
+`bundle` now runs bundler's own code rather than failing in the interpreter: four
+walls came down for that -- `Signal.trap`, the rubygems preload, a module
+appearing twice in the ancestor chain (which made thor's `super`-calling
+`method_added` recurse 15000 deep), and `Array#*` with a String separator, which
+`ui/shell.rb` uses to join its wrapped lines.
+
+What stops it now is measured and small to state: **`require "bundler/cli"`
+raises `Bundler::GemfileNotFound` at load time**, where ruby loads the file
+without touching a Gemfile. Something in that file's body is being evaluated
+eagerly here that ruby leaves for later. Until that is found, every `bundle`
+subcommand answers "Could not locate Gemfile", including `bundle version`, which
+needs no Gemfile at all.
