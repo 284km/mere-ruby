@@ -198,13 +198,18 @@ with `lineno` 0 — which is what activesupport's `mattr_accessor` passes to
 caller's file, so the answer is right where it matters; at the top level Ruby
 would return an empty array and mere-ruby still returns the frame.
 
-`Bundler.setup` stops here, and `bundlertest/run.sh` records it: bundler's
-vendored thor derives a namespace from `caller[1]`, so it wants two frames of a
-stack that does not exist. One synthetic frame is a fiction this interpreter has
-already committed to (above); two, with the file of a caller it cannot know, is
-a different claim, and thor would name its commands after the wrong file. Every
-step before it -- reading the Gemfile, resolving it, building the definition --
-answers what ruby answers with the same rubygems and bundler.
+There IS a call stack now: `caller` answers real frames, formatted as the
+reference ruby writes them, and an uncaught error names `file:line:in 'meth'`.
+Two things it does not do yet. A frame belonging to a BLOCK is labelled with the
+enclosing method, where ruby writes `block in meth`. And `Exception#backtrace`
+is still nil: the frames exist while the raise is unwinding, but nothing copies
+them into the exception (the built-in exception representation has nowhere to put
+them -- see below).
+
+`Bundler.setup` still stops, and `bundlertest/run.sh` records it, but no longer
+for want of a stack: thor's `caller[1]` is answered, and what fails now is
+further in. Every step before it -- reading the Gemfile, resolving it, building
+the definition -- answers what ruby answers with the same rubygems and bundler.
 
 `Exception#backtrace` is the same gap seen from the other side: it answers
 `nil` rather than the frames the exception was raised through. It has to
