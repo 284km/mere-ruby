@@ -10,10 +10,10 @@
 #
 # e.g. .../lib/ruby/3.2.0 and .../lib/ruby/gems/3.2.0
 #
-# One step is expected NOT to agree: `setup` reaches bundler's vendored thor,
-# which reads `caller[1]`, and mere-ruby keeps no call stack (KNOWN_GAPS.md).
-# That is recorded here as DIVERGE rather than dropped, and this gate fails if
-# it ever starts agreeing -- a boundary that has moved has to be noticed.
+# One step is expected NOT to agree: `setup`. It used to stop for want of a call
+# stack (thor reads `caller[1]`); that is answered now, and it stops further in.
+# The step is recorded as DIVERGE rather than dropped, and this gate fails if it
+# ever starts agreeing -- a boundary that has moved has to be noticed.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -40,7 +40,7 @@ for step in versions dsl definition setup; do
       echo "RETIRE  $step  both say [$a] -- the recorded divergence is gone, update run.sh and KNOWN_GAPS.md"
       fail=1
     else
-      echo "DIVERGE $step  ruby[$a]  mere-ruby[$b]  (no call stack; KNOWN_GAPS.md)"
+      echo "DIVERGE $step  ruby[$a]  mere-ruby[$b]  (see KNOWN_GAPS.md)"
     fi
   elif [ "$a" = "$b" ] && [ -n "$a" ]; then
     echo "MATCH   $step  [$a]"
