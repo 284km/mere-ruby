@@ -6498,6 +6498,25 @@ let mul_int_ov = fn (a: int) -> fn (b: int) ->
               else (if b > 0 then a < int_min / b else b < int_max / a) in
     if ovf then norm_big (big_mul_s (str_of_int a) (str_of_int b)) else VInt (a * b);
 
+// The class name for a comparison failure's message. `class_name` is defined
+// much later in the file and this is needed here; an object cannot be named
+// precisely without `world`, which a value-level comparison does not have, so it
+// is "Object" -- one side named exactly is enough to see what was compared.
+let cmp_type_name = fn (v: Val) ->
+  (match v with
+   | VInt _ -> "Integer" | VBig _ -> "Integer" | VFlt _ -> "Float"
+   | VRat (_, _) -> "Rational"
+   | VStr _ -> "String" | VSym _ -> "Symbol" | VArr _ -> "Array" | VHsh _ -> "Hash"
+   | VNil -> "NilClass" | VBool b -> (if b then "TrueClass" else "FalseClass")
+   | VProc _ -> "Proc" | VClass _ -> "Class" | VExc (c, _) -> c | VMain -> "Object"
+   | _ -> "Object");
+// ruby raises ArgumentError here, naming both sides. This used to leak an
+// interpreter-internal `fail` ("comparison of incompatible types"), which became
+// a bare StandardError with no idea what was compared -- the `<` family already
+// raised the right thing, so only the paths that call this one (sort, min, max)
+// were affected, and they are exactly the ones where knowing the types matters.
+let cmp_fail = fn (va: Val) -> fn (vb: Val) ->
+  prim_raise "ArgumentError" ("comparison of " ++ cmp_type_name va ++ " with " ++ cmp_type_name vb ++ " failed");
 let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
   // bignum (or bignum vs int): compare exact decimal values, not floats.
   if (match va with VBig _ -> true | _ -> false) && (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
@@ -6528,7 +6547,7 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
     | VStr x -> let x = sget x in
       (match vb with
        | VStr y -> let y = sget y in str_compare x y
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
+       | _ -> cmp_fail va vb)
     // two Times order by their instant (recorded in time_ord when built)
     | VObj x ->
       (match vb with
@@ -6536,11 +6555,11 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
          (let a1 = map_get time_inst (str_of_int x) in
           let b1 = map_get time_inst (str_of_int y) in
           if a1 < b1 then 0 - 1 else if b1 < a1 then 1 else 0)
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
-    | VSym x -> (match vb with VSym y -> str_compare x y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
+       | _ -> cmp_fail va vb)
+    | VSym x -> (match vb with VSym y -> str_compare x y | _ -> cmp_fail va vb)
     // Array <=> Array: element-wise, then by length (Ruby semantics).
-    | VArr x -> (match vb with VArr y -> arr_cmp (deref x) (deref y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types"))
-    | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: comparison of incompatible types")) in fail "mere-ruby: comparison of incompatible types")
+    | VArr x -> (match vb with VArr y -> arr_cmp (deref x) (deref y) | _ -> cmp_fail va vb)
+    | _ -> cmp_fail va vb
 // would cmp_vals fail on this pair? (the < family raises ArgumentError)
 and cmp_incompatible = fn (va: Val) -> fn (vb: Val) ->
   if is_num va && is_num vb then false
@@ -9342,7 +9361,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       (let vb = vb in
        // <=> on incomparable operands is nil (not an error), unlike < > etc.
        if cmp_incompatible va0 vb then VNil
-       else let c = cmp_vals va0 vb in
+       // world-aware, so `[obj] <=> [obj]` reaches the elements' own <=>: the
+       // value-level comparator cannot call one, and this is an OPERATOR, so it
+       // never passes through the dispatcher where the world-aware paths live.
+       else let c = cmp_vals_w world va0 vb in
        VInt (if c < 0 then 0 - 1 else if c > 0 then 1 else 0))
     else if str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=" then
       // incomparable operands raise ArgumentError with Ruby's message
@@ -15018,7 +15040,14 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
         else VBool (hits == n))
      | _ -> VNil)
   else if str_eq name "minmax" && (match recv with VArr _ -> true | _ -> false) then
-    arr_new (Cons (prim_method recv "min" Nil, Cons (prim_method recv "max" Nil, Nil)))
+    // through the world-aware sort, so an array of objects uses their <=>; the
+    // value-level min/max this used to call cannot reach one.
+    (match recv with
+     | VArr id ->
+       (let sorted = sort_w world (deref id) in
+        arr_new (Cons ((match sorted with Nil -> VNil | Cons (h, _) -> h),
+                       Cons ((match val_rev sorted Nil with Nil -> VNil | Cons (h, _) -> h), Nil))))
+     | _ -> VNil)
   else if str_eq name "each_entry" && (match recv with VArr _ -> true | _ -> false) then
     make_enum world recv "each"
   else if str_eq name "cycle" && (match recv with VArr _ -> true | VRange _ -> true | _ -> false) then
@@ -15133,6 +15162,21 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     (match recv with VArr id -> (match sort_w world (deref id) with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
   else if str_eq name "max" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
     (match recv with VArr id -> (match val_rev (sort_w world (deref id)) Nil with Nil -> VNil | Cons (h, _) -> h) | _ -> VNil)
+  // ... and the ones that were NOT here, which is why they still could not reach
+  // a user <=>: sort! (in place), minmax, and the pair sort behind Hash#sort.
+  else if str_eq name "<=>" && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Cons (VArr _, _) -> true | _ -> false) then
+    (match recv with
+     | VArr x -> (match args with
+                  | Cons (VArr y, _) -> VInt (arr_cmp_w world (deref x) (deref y))
+                  | _ -> VNil)
+     | _ -> VNil)
+  else if str_eq name "sort!" && (match recv with VArr id -> (match deref id with Cons (VObj _, _) -> true | Cons (VClass _, _) -> true | _ -> false) | _ -> false) then
+    (match recv with VArr id -> (let _ = arr_set id (sort_w world (deref id)) in recv) | _ -> recv)
+  else if str_eq name "sort" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     | VHsh h -> arr_new (sort_w world (hash_pairs (hderef h)))
+     | _ -> VNil)
   // reduce/inject symbol form (no block): `[1,2,3].reduce(:+)` /
   // `.inject(init, :*)`. The block form is handled in invoke_with_block.
   else if (str_eq name "reduce" || str_eq name "inject") &&
@@ -17347,7 +17391,23 @@ and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
        else if pp_mem (ancestors_of world cb) ca then 1
        else 0
      | _ -> cmp_vals a b)
+  // Array vs Array element-wise, with the world: falling through to cmp_vals
+  // here meant `[obj] <=> [obj]` (and Hash#sort, which compares [k, v] pairs)
+  // could not reach a user <=>.
+  | VArr x ->
+    (match b with
+     | VArr y -> arr_cmp_w world (deref x) (deref y)
+     | _ -> cmp_vals a b)
   | _ -> cmp_vals a b
+and arr_cmp_w = fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> 0 | _ -> 0 - 1)
+  | Cons (x, xt) ->
+    (match ys with
+     | Nil -> 1
+     | Cons (y, yt) ->
+       (let c = cmp_vals_w world x y in
+        if c == 0 then arr_cmp_w world xt yt else c))
 
 // insertion sort using the world-aware comparator.
 and sort_w = fn world -> fn (xs: Val list) ->
@@ -24181,7 +24241,15 @@ and modfunc_promote = fn world -> fn (cls: str) -> fn (names: str list) ->
   | Nil -> ()
   | Cons (n, rest) ->
     let src = cls ++ "#" ++ n in
-    let _ = if map_has meths src then map_set meths ("(sng:" ++ cls ++ ")#" ++ n) (map_get meths src) else () in
+    let dst = "(sng:" ++ cls ++ ")#" ++ n in
+    let _ = if map_has meths src then map_set meths dst (map_get meths src) else () in
+    // ... and with it the LEXICAL SCOPE the method was written in. Without this
+    // the copy resolved bare constants from the top level, so a module_function
+    // could not see a constant of its own module: bundler's GemHelpers has
+    // `module_function :platform_specificity_match`, whose body names
+    // PlatformMatch, defined further down the same module. (alias_method copies
+    // meth_cref for the same reason.)
+    let _ = if map_has meth_cref src then map_set meth_cref dst (map_get meth_cref src) else () in
     modfunc_promote world cls rest
 
 // the :sym / "str" arguments of a visibility call, as plain names.
