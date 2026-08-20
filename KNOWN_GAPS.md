@@ -126,6 +126,26 @@ Overriding these methods works (corpus/142); keeping hold of the original does
 not. `require` is not affected -- it is a real entry in the table, which is why
 rubygems can wrap it (corpus/141).
 
+## `encode` has no character tables, and `$?` is not set
+
+Transcoding here works by codepoints: a string is decoded to codepoints and
+re-encoded. That covers UTF-8, UTF-16BE/LE (surrogate pairs included),
+ISO-8859-1 and the ASCII range of anything ASCII-compatible -- ASCII being the
+one range every ASCII-compatible encoding agrees on. It does not cover the
+encodings that need a TABLE: `"あ".encode("Shift_JIS")` is 2 bytes in ruby and
+`Encoding::UndefinedConversionError` here. Refusing is the point; the branch
+this replaced emitted the codepoint as a single byte for every target it did not
+know, so `"ab".encode("UTF-16BE").bytesize` answered 2 where ruby says 4, and a
+Latin-1 character "converted" to Shift_JIS by accident.
+
+A command literal and `system` do run the command (Mere's `run`, through a file
+for the output, since `run` answers with the exit status). Two limits: `$?` is
+not set, because there is no Process::Status here, so code that reads
+`$?.success?` gets a NoMethodError on nil rather than an answer; and `system`
+answers false both for a command that ran and failed and for one that could not
+be executed, where ruby answers false and nil. On the Wasm host `run` is 127 by
+construction, so a browser sees every command as not found -- which it is.
+
 ## `File#fileno` refuses: there is no descriptor to report
 
 A File here is a path, a mode, a read position and a write buffer; the host
