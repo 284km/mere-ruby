@@ -401,56 +401,49 @@ tree-walking interpreter of this shape costs, and the remaining factor is that
 
 ### What the language allows (measured, `bench/reclaim.sh`)
 
-Reclamation was investigated before being attempted, and the first question is
-not how to collect but whether anything *can* be given back. Asked in Mere, 1M
-iterations each (peak MiB):
+**A container created inside `region R { }` IS reclaimed with the block.** A
+million such blocks, each building a Map with a key and a value:
 
-| what | peak | entries left |
+    init=2  bytes=5242880  acquire=1000000  release=1000000
+
+The region is acquired and released a million times, reused every time, and the
+region allocator asked malloc for 5 MiB in total. The map, its keys and its
+values go with the block.
+
+**This corrects the opposite conclusion recorded here earlier**, and the way it
+was wrong is the useful part. Those probes measured peak RSS, and peak RSS grew
+linearly with the iteration count -- so the report said "a Map created inside a
+region block is still there when it exits". What actually grew was the STACK: a
+region block in a recursive function's body stops clang turning the self-call
+into a loop (the C codegen says so in its own comment), so the recursion keeps
+about 250 bytes a frame. Three probes separate it:
+
+| probe | peak MiB | what it says |
 |---|---|---|
-| build 1M strings, store none | 170 | — |
-| `map_set` then `map_delete` each time | 231 | 0 |
-| `map_set` the same key each time | 200 | 1 |
-| a fresh `Map` per iteration | 521 | — |
-| ... the same, inside `region R { }` | 247 | — |
+| a recursion that allocates nothing | 1 | the tail call IS optimized when nothing interferes |
+| the same plus 1M strings, no region block | 162 | strings in the default region stay |
+| the same with a region block and a Map | 247 | heap is 5 MiB (above); the rest is stack |
 
-Nothing gives a container's memory back: not `map_delete`, not overwriting a
-key, and **not a region block** -- a `Map` created inside one is still there when
-it exits (26 MiB at 100k iterations against 247 at 1M: linear, not flat). What a
-region block *does* reclaim is the values allocated in its body, which is the 2x
-between the last two rows. This matches Mere's memory model: containers carry
-identity and keep their own binding region.
+**Peak RSS cannot answer "was this reclaimed?"** — it answers "how much did the
+process hold", which sums a reclaimed heap and an un-optimized stack. The harness
+now reads the region runtime's own counters, which is the measurement that can.
 
-Two consequences for this interpreter. **The Ruby heap cannot shrink while it
-lives in Mere `Map`s** -- and the handle scheme rules out even trying, since
-`arr_new` takes its id from `map_len arr_store`, so deleting an entry makes the
-next handle collide with a live one. Any collector has to replace handle issuing
-with a counter and a free list first. And **the frame is the bigger half**: 200k
-plain calls leak 2588 MiB while adding *nothing* to any store -- that is `env` (a
-`map_new` per call) and the temporaries a call builds, neither of which a region
-block can take back today.
+What is still true from the earlier round: `map_delete` and overwriting a key do
+not give memory back **within a living container** (231 MiB after a million
+set-then-delete pairs, zero entries left), and the handle scheme forbids deleting
+anyway, since `arr_new` takes its id from `map_len arr_store`. And the frame is
+still the bigger half of what this interpreter leaks: 200k plain method calls
+cost 2588 MiB while adding nothing to any store.
 
-Where the entries actually go, at 200k iterations of each shape:
-
-| workload | peak MiB | stores that grew |
-|---|---|---|
-| 200k interpolated strings | 3249 | none -- all temporaries |
-| 200k objects with 2 ivars | 6339 | `arr_store` +4/iter, `ivars` +2, `ocls` +1 |
-| 200k top-level calls | 2588 | none -- all temporaries |
-
-And the size of the prize, on identical work with an identical live set (a
-1000-node list summed 2000 times): **ruby 33 MiB against 11222-15267 MiB** --
-two and a half orders of magnitude.
-
-That last figure is a range for a reason worth recording. The program allocates
-the same bytes every time, but once a run holds several GB the OS starts
-compressing pages, and `maximum resident set size` then moves by a factor of two
-between runs of the *same binary* (measured: 6227, 10614, 13346, 15664, 15803
-MiB). Under ~6 GiB the same measurement repeats exactly (6286 MiB three times out
-of three). So peak RSS is a usable number for the small cases and an
-order-of-magnitude one for the large; `bench/reclaim.sh` prints a range over
-three runs rather than one figure, and `bench/alloc_sites.sh` is where the
-deterministic per-call counts live, since it counts inside the region allocator
-instead of asking the OS.
+But the conclusion that follows is the opposite of the earlier one. **Reclamation
+does not wait on new language support.** A per-call `region R { }` in the
+interpreter's own source would put the frame's `map_new` in that region -- the
+typer binds a container created inside a block to the block's region, the way it
+already does for `strbuf_new` -- and the block would hand it back. Two things
+have to be measured before believing it will work: what the region-escape check
+says about an interpreter that stores Ruby values into program-lifetime maps
+(copy-on-store should make it sound on the C backend), and what the lost tail
+call costs a tree-walking interpreter that is not tail-recursive anyway.
 
 ### Two wastes the census found, and what they were worth
 
@@ -471,10 +464,21 @@ properly needs a per-method "contains a bare super" flag, computed once and
 cached; it is recorded here rather than done, because 6.6% does not change what
 the interpreter can run.
 
+### What tagging an encoding costs, and it is measurable
+
+`Integer#to_s` answers US-ASCII now, which is right, and 200k interpolated
+strings therefore leave **200k permanent entries** in the encoding map -- one per
+number that became text. Correctness bought a per-temporary entry, at ~34 bytes
+each. The census is what makes that visible rather than mysterious, and it is a
+reason the encoding side table wants to become something reclaimable rather than
+a program-lifetime map.
+
 ### What would change it
 
 A per-call region reclaims 6.4% today, 17% with the generated C patched so
-`map_new` follows the current region. The rest is the `Map`s themselves. The one
+`map_new` follows the current region -- and the paragraph above says why that
+patch is not the only way: the language already reclaims a container bound to a
+block's region, so the interpreter's own source is where the block belongs. The rest is the `Map`s themselves. The one
 capability that would change the picture is upstream: **a container whose memory
 dies with its region** (or can be freed), which would let a region-per-call take
 the whole frame -- the 13.4 KB a call leaks now. Failing that, the alternative
