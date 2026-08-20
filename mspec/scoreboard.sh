@@ -13,7 +13,15 @@
 #
 # Usage:
 #   ./scoreboard.sh <spec-root> [dir ...]     # e.g. .../spec/ruby language core/array
-#   ./scoreboard.sh <spec-root>               # default: language + core
+#   ./scoreboard.sh <spec-root>               # default: re-sweep every group the
+#                                             # recorded table already has a row for
+#
+# The default used to read "language core", which measured language ALONE: there
+# are no *_spec.rb directly under core/, so that word was skipped in silence
+# while the table kept its core rows from an older run -- a refresh that looked
+# whole and was not. The default now comes from the record itself, so the
+# invitation at the bottom of SPEC_STATUS.md ("re-run to refresh") is true, and a
+# group added to the table is swept from then on without editing this script.
 # Writes SPEC_STATUS.md (summary table) and mspec/tags/<group>.txt (the
 # per-file DIFF/CRASH records — the "known not passing" list).
 set -u
@@ -28,7 +36,12 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="${1:?usage: scoreboard.sh <spec-root> [dir ...]}"
 shift
 dirs="$*"
-[ -n "$dirs" ] || dirs="language core"
+if [ -z "$dirs" ]; then
+  # column 1 of the recorded table, minus the header rows
+  # ... and not the header, whose first cell reads "group"
+  dirs="$(sed -n 's/^| \([a-z][a-z_/-]*\) |.*/\1/p' "$here/../SPEC_STATUS.md" 2>/dev/null | grep -v '^group$' | tr '\n' ' ')"
+  [ -n "$dirs" ] || dirs="language"
+fi
 tagdir="$here/tags"
 mkdir -p "$tagdir"
 # write to a per-pid temp and move into place at the end, so two runs never
