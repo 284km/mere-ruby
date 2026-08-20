@@ -480,3 +480,24 @@ consumed) on the path through `bundler/definition.rb:327:in 'filesystem_access'`
 It is the reason `Bundler.setup` stops after "Resolving dependencies...". What is
 *not* yet known is which construct inside that block consumes the slot; the next
 step is a repro, not a patch.
+
+## Error message wording follows ruby 3.4, and every gate compares against 3.2.2
+
+`undefined method 'x' for an instance of C` is 3.4's wording, chosen here on
+purpose (`undef_blame`): it names the receiver, where 3.2's `for x:C` names the
+receiver's inspect output. The reference ruby in every gate is 3.2.2, which also
+quotes differently (`` `x' `` against `'x'`). So any spec file that prints a
+NoMethodError or NameError message is a DIFF **by construction** -- not a missing
+feature, and not something a corpus program can hold, since the corpus is
+byte-exact against 3.2.2. corpus/151 prints `e.class` for that reason.
+
+How many of the 556 DIFFs are only this has not been measured. It is worth
+measuring before working any single DIFF down: a wording difference and a wrong
+answer are the same verdict today.
+
+## instance_variable_get accepts a name that is not an instance variable name
+
+`Object.new.instance_variable_get("x")` raises `NameError: 'x' is not allowed as
+an instance variable name` in ruby. Here it answers nil -- a silently wrong
+answer, the kind that is worse than a refusal. `instance_variable_set` has the
+same hole.
