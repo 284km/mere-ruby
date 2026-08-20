@@ -47,3 +47,29 @@ The `ensure` in the wrapper is the whole trick. A require that RAISES (every
 C extension does here) never returns, so without it every second after the
 raise is charged to the file that raised — which is how `racc/cparse`, a
 require that fails in 2 seconds, once looked like it took 61.
+
+## `alloc_sites.sh`
+
+```
+./bench/alloc_sites.sh [path/to/mr.c]
+```
+
+`alloc_per_call.sh` says how much memory a call costs; this says what it is made
+of, by building a copy of the generated C with a counter and a size histogram
+inside the region allocator. As of 2026-08-20:
+
+| program | allocations/call | bytes/call |
+|---|---|---|
+| `def f; end` called 100k times | **240** | **7377** |
+| `100000.times { }` (no call) | 130 | 3722 |
+| `def f(a); a + 1; end` | 249 | 8182 |
+
+19 of every 24 allocations are 32 bytes or less. That is the shape any
+reclamation work has to move: hundreds of small objects, not one big buffer.
+
+**The generated C is not text.** mere-ruby embeds Ruby sources as string
+literals, including bytes that are not valid UTF-8, and its longest line is
+397386 bytes: `awk '{print}'` over `mr.c` loses 11 bytes and the copy stops
+compiling *at a line nowhere near the edit*. LC_ALL=C does not save it. The
+splice here is done with `grep -b` and `head -c` / `tail -c` for that reason,
+and anything else that edits generated C should be too.

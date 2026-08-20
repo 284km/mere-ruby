@@ -293,6 +293,20 @@ in the number of calls executed** — 100k calls is 0.9 GB, 200k is 1.8 GB, 400k
 is 3.6 GB (`bench/alloc_per_call.sh`). Definitions are cheap by comparison:
 1600 classes with two methods each is 0.06s and 25 MB.
 
+What that 9 KB is made of, measured with `bench/alloc_sites.sh` (2026-08-20):
+**240 allocations per empty method call, 7.4 KB of them requested**, and 19 in
+every 24 are 32 bytes or smaller. It is not one big allocation that could be
+made lazy -- it is hundreds of small ones, so reclaiming any of it means
+reclaiming *objects*, which is a garbage collector or reference counting rather
+than a tweak. A bare block iteration is 130 allocations and 3.7 KB, so the frame
+machinery is most of it either way.
+
+One tempting shortcut was measured and does NOT work: the region doubles its
+block size and abandons the previous block, so the waste looked like it might be
+the 2x between 7.4 KB requested and ~9.5 KB resident. Capping the growth at 8 MB
+changed 400k calls from 3.947 GB to 3.958 GB -- nothing. The resident bytes are
+the requested bytes; there is no packaging to win back.
+
 That is the whole of the rubocop timeout. `require "rubocop"` is ~250 files
 and some millions of calls; it reaches tens of GB (117 GB peak footprint on a
 ten-minute run), the machine starts faulting for every access, and the gem
