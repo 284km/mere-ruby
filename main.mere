@@ -1848,10 +1848,18 @@ and hex4 = fn (s: str) -> fn (i: int) ->
   hexv (char_at s i) * 4096 + hexv (char_at s (i + 1)) * 256 +
   hexv (char_at s (i + 2)) * 16 + hexv (char_at s (i + 3))
 
+// UTF-8 for one codepoint. This is the lexer's copy (utf8_enc, further down, is
+// the runtime's) and it had no FOUR-byte branch: every codepoint above U+FFFF
+// went through the three-byte arithmetic and overflowed, so `"\u{1F600}"` lexed
+// to [255, 152, 128] rather than [240, 159, 152, 128] -- wrong bytes, quietly.
+// The same emoji written literally in the source was always fine, which is what
+// hid it: the two paths do not share an encoder.
 and utf8_of = fn (cp: int) ->
   if cp < 128 then chr cp
   else if cp < 2048 then chr (192 + cp / 64) ++ chr (128 + (cp - cp / 64 * 64))
-  else chr (224 + cp / 4096) ++ chr (128 + (cp / 64 - cp / 4096 * 64)) ++ chr (128 + (cp - cp / 64 * 64))
+  else if cp < 65536 then chr (224 + cp / 4096) ++ chr (128 + (cp / 64 - cp / 4096 * 64)) ++ chr (128 + (cp - cp / 64 * 64))
+  else chr (240 + cp / 262144) ++ chr (128 + (cp / 4096 - cp / 262144 * 64))
+       ++ chr (128 + (cp / 64 - cp / 4096 * 64)) ++ chr (128 + (cp - cp / 64 * 64))
 
 // heredoc body as token(s): interpolated bodies route through the
 // double-quoted string lexer.
@@ -7004,9 +7012,43 @@ let rec utf8_codepoints = fn (s: str) -> fn (i: int) ->
 
 // ---- transcoding between UTF-8 / ISO-8859-1 / US-ASCII (formula-based) ----
 // decode source bytes to a codepoint list (UTF-8 multibyte; else byte=cp).
+// UTF-16, both ways. `encode` used to answer the SAME BYTES for every target it
+// did not know: `"ab".encode("UTF-16BE").bytesize` was 2 where ruby says 4,
+// because a non-UTF-8 target fell into the one-byte-per-codepoint branch. UTF-16
+// is written out properly here, and a target that would need a mapping this does
+// not have now refuses instead (see encode_cps).
+let utf16_enc = fn (cp: int) -> fn (be: bool) ->
+  if cp < 65536 then
+    (let hi = cp / 256 in
+     let lo = cp - hi * 256 in
+     if be then chr hi ++ chr lo else chr lo ++ chr hi)
+  else
+    (let v = cp - 65536 in
+     let w1 = 55296 + v / 1024 in
+     let w2 = 56320 + (v - (v / 1024) * 1024) in
+     let b = fn (w: int) -> (let h = w / 256 in let l = w - h * 256 in if be then chr h ++ chr l else chr l ++ chr h) in
+     b w1 ++ b w2);
+let utf16_cp = fn (s: str) -> fn (i: int) -> fn (be: bool) ->
+  let byte = fn (k: int) -> if k < str_len s then ord (char_at s k) else 0 in
+  let unit = fn (k: int) -> (if be then byte k * 256 + byte (k + 1) else byte (k + 1) * 256 + byte k) in
+  let u = unit i in
+  if u >= 55296 && u < 56320 && i + 3 < str_len s then
+    (let u2 = unit (i + 2) in ((u - 55296) * 1024 + (u2 - 56320) + 65536, 4))
+  else (u, 2);
+// An encoding NAME is ASCII, so comparing it case-insensitively needs no more
+// than this (str_upcase is defined further down the file).
+let rec enc_up_go = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
+  else (let c = ord (char_at s i) in
+        enc_up_go s (i + 1) (acc ++ (if c >= 97 && c <= 122 then chr (c - 32) else char_at s i)));
+let enc_up = fn (s: str) -> enc_up_go s 0 "";
+let enc_is_utf16 = fn (nm: str) -> let t = enc_up nm in str_eq t "UTF-16BE" || str_eq t "UTF-16LE";
+let enc_utf16_be = fn (nm: str) -> str_eq (enc_up nm) "UTF-16BE";
 let rec decode_cps = fn (s: str) -> fn (from: str) -> fn (i: int) ->
   if i >= str_len s then Nil
-  else if str_eq from "UTF-8" then (match utf8_cp s i with (c, l) -> Cons (c, decode_cps s from (i + l)))
+  else if str_eq (enc_up from) "UTF-8" then (match utf8_cp s i with (c, l) -> Cons (c, decode_cps s from (i + l)))
+  else if enc_is_utf16 from then
+    (match utf16_cp s i (enc_utf16_be from) with (c, l) -> Cons (c, decode_cps s from (i + l)))
   else Cons (ord (char_at s i), decode_cps s from (i + 1));
 // encode codepoints to the target; second tuple element is false on an
 // undefined conversion (a codepoint the target can't represent).
@@ -7014,9 +7056,16 @@ let rec encode_cps = fn (cps: int list) -> fn (to: str) -> fn (acc: str) ->
   match cps with
   | Nil -> (acc, true)
   | Cons (cp, t) ->
-    if str_eq to "UTF-8" then encode_cps t to (acc ++ utf8_enc cp)
-    else if cp <= (if str_eq to "US-ASCII" then 127 else 255) then encode_cps t to (acc ++ chr cp)
-    else (acc, false);
+    (let tu = enc_up to in
+     if str_eq tu "UTF-8" then encode_cps t to (acc ++ utf8_enc cp)
+     else if enc_is_utf16 to then encode_cps t to (acc ++ utf16_enc cp (enc_utf16_be to))
+     // ISO-8859-1 is the only single-byte target whose upper half this knows;
+     // for any other name only ASCII is safe, because ASCII is the one range
+     // every ASCII-compatible encoding agrees on. Above that, refuse: emitting
+     // the codepoint as one byte is what made Shift_JIS "work" by accident.
+     else if cp <= (if str_eq tu "ISO-8859-1" || str_eq tu "ASCII-8BIT" || str_eq tu "BINARY" then 255 else 127)
+     then encode_cps t to (acc ++ chr cp)
+     else (acc, false));
 let enc_canon = fn (nm: str) -> if str_eq nm "BINARY" || str_eq nm "binary" then "ASCII-8BIT" else nm;
 // transcode s from one encoding to another; returns (bytes, ok). ASCII-8BIT
 // on either side is a relabel (bytes unchanged); same encoding is a no-op.
@@ -8684,15 +8733,37 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          else raise_exc world "UncaughtThrowError" ("uncaught throw " ++ inspect t)
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: throw expects a tag")) in fail "mere-ruby: throw expects a tag"))
     // Kernel#p: inspect-print each arg; returns the value (or array).
-    // `cmd` command literal → the ` method. mere cannot spawn a subprocess, so
-    // the default returns "" unless self (or the top level) defines its own `.
+    // `cmd` command literal → the ` method. Mere HAS had a subprocess since
+    // v0.1.13 (`run`, the mk dogfood's), so returning "" here was a silent wrong
+    // answer -- the comment that used to be here said mere could not spawn one.
+    // The output is captured through a file because `run` answers with the exit
+    // status, not the output; stdout only, as ruby's backticks are.
+    // On the Wasm host `run` is 127 ("command not found") by construction, so a
+    // browser gets an empty string for a command that genuinely did not run.
     else if str_eq name "`" && (if map_has meths "`" then false else true)
             && (if lv_has env "self" then
                   (match lv_get env "self" with
                    | VObj id -> let (mm, sp, ocls, iv) = world in (if has_meth world (map_get ocls (str_of_int id)) "`" then false else true)
                    | _ -> true)
                 else true) then
-      mkstr ""
+      (match args with
+       | Cons (VStr cs, _) ->
+         (let cmd = sget cs in
+          let tmp = "/tmp/mrb_cmd_" ++ str_of_int (getpid ()) ++ ".out" in
+          let _ = run (cmd ++ " > " ++ shq tmp) in
+          let out = (if file_exists tmp then read_file tmp else "") in
+          let _ = run ("rm -f " ++ shq tmp) in
+          mkstr out)
+       | _ -> mkstr "")
+    // Kernel#system: the same command, reporting only whether it succeeded.
+    // Ruby answers nil when the command could not be executed at all and false
+    // when it ran and failed; `run` reports one status for both, so this says
+    // false for both and KNOWN_GAPS records that it does not tell them apart.
+    else if str_eq name "system" && (if kernel_overridden env world "system" then false else true)
+            && (match args with Cons (VStr _, _) -> true | _ -> false) then
+      (match args with
+       | Cons (VStr cs, _) -> VBool (run (sget cs) == 0)
+       | _ -> VBool false)
     else if str_eq name "p" || str_eq name "pp" then
       let _ = p_print_w env world args in
       (match args with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new args)
