@@ -455,3 +455,28 @@ inside a block records that same answer from the environment it was written in.
 `yield` inside a define_method body is a SyntaxError in Ruby and is accepted here
 (it reaches the block captured at definition time). `|&b|` receives the caller's
 block in both, which is the supported way to take one.
+
+## An exception in flight lives in one slot, and that slot has been consumed twice
+
+The pending exception is one entry (`$exc`) plus a few keys recording where it was
+raised. Anything that *handles* an exception consumes them, so any handling that
+happens while an exception is already in flight destroys the one in flight. Two
+such places were found by asking the interpreter where the loss happened rather
+than by guessing — `MERE_RUBY_LOST_EXC=1` prints the internal message, the frames
+of the last raise, and the frames of the spot that reports the loss:
+
+- `rescue *[]` — an empty splat — rescued *everything*, because it reached the
+  matcher as the same empty list that a bare `rescue` does. In ruby it rescues
+  nothing. bundler writes `rescue *[const_get_safely(:ENOTSUP, Errno)].compact`.
+- an `ensure` body that handles an exception — inline, or inside a method it calls
+  — consumed the slot of the exception it was running under, which then came out
+  as `StandardError` with an interpreter message. bundler's `Definition#lock` does
+  this on every write.
+
+Both are covered by `corpus/150_exception_identity.rb`. A third loss is still
+open, and the diagnostic names the spot: the placeholder is signalled from a
+block's flow handler (a block whose body failed after the slot was already
+consumed) on the path through `bundler/definition.rb:327:in 'filesystem_access'`.
+It is the reason `Bundler.setup` stops after "Resolving dependencies...". What is
+*not* yet known is which construct inside that block consumes the slot; the next
+step is a repro, not a patch.

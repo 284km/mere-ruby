@@ -15,7 +15,11 @@
 # the reference ruby, or a fixture that is deliberately broken) is SKIPped, so
 # the number counts only syntax that ruby accepts and mere-ruby does not.
 #
-# Writes parsetest/FAILURES.txt -- one line per file, with the parse error and
+# Writes parsetest/FAILURES.txt -- ONE record, so two sweeps at once produce a
+# file that is neither of them: a narrower sweep running alongside a full one
+# left 8 of its lines in a full sweep's record here, and the tally printed at
+# the end (39) no longer matched the file (47). Run one sweep at a time.
+# One line per file, with the parse error and
 # the line it names, sorted so the same construct groups together.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"

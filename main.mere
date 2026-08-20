@@ -10060,7 +10060,20 @@ and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str lis
       let arr = if str_len inner > 0 && str_eq (char_at inner 0) "@" && str_contains inner "rexpr~"
                 then eval_e env world blk (map_get resc_exprs (substring inner 7 (str_len inner)))
                 else (if lv_has env inner then lv_get env inner else VNil) in
-      (match arr with VArr id -> list_append_str (class_names_of (deref id)) (expand_rescue_classes env world blk rest) | _ -> expand_rescue_classes env world blk rest)
+      (match arr with
+       | VArr id ->
+         (let names = class_names_of (deref id) in
+          let rest2 = expand_rescue_classes env world blk rest in
+          match names with
+          // An EMPTY splat rescues NOTHING in ruby -- `rescue *[]` is not a bare
+          // `rescue`, which rescues StandardError. Both arrived here as an empty
+          // list, so this clause caught everything and swallowed the exception:
+          // bundler writes `rescue *[const_get_safely(:ENOTSUP, Errno)].compact`,
+          // and when that constant is absent the array is empty. A name nothing
+          // can be keeps the two apart.
+          | Nil -> Cons ("(empty rescue splat)", rest2)
+          | _ -> list_append_str names rest2)
+       | _ -> expand_rescue_classes env world blk rest)
     else if str_len c > 6 && str_eq (substring c 0 7) "@rexpr~" then
       // a non-constant class expression: evaluate; a Class/Module contributes
       // its name, anything else is a TypeError (class or module required).
@@ -25099,7 +25112,23 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
                       // (try_or discards it), so a rescue sees what actually
                       // happened instead of a bare "error".
                       else if map_has prim_missing "i" then
-                        VExc ("StandardError", (match map_get prim_missing "i" with VStr h -> sget h | _ -> "error"))
+                        // MERE_RUBY_LOST_EXC=1 names the place where a Ruby
+                        // exception arrived with no class or message of its own.
+                        // That happens when something swallowed it and let the
+                        // internal failure through instead, and it is otherwise
+                        // invisible: the report says StandardError and points at
+                        // the top of the program. Two of today's bugs were found
+                        // with exactly this print.
+                        (let _ = (if str_eq (env_get "MERE_RUBY_LOST_EXC") "" then ()
+                                  else print_err ("[lost] internal="
+                                                  ++ (match map_get prim_missing "i" with VStr h -> sget h | _ -> "?")
+                                                  // where the LAST raise happened: raise_bt is not cleared when a
+                                                  // rescue handles one, so it still names the exception that went
+                                                  // missing -- which the frames below cannot, they are where the
+                                                  // loss was noticed after everything deeper had unwound.
+                                                  ++ "\n       last raise=" ++ inspect (if map_has raise_bt "v" then map_get raise_bt "v" else VNil)
+                                                  ++ "\n       here=" ++ inspect (arr_new (caller_frames 0)))) in
+                         VExc ("StandardError", (match map_get prim_missing "i" with VStr h -> sget h | _ -> "error")))
                       else VExc ("StandardError", "error")) in
            let _ = map_delete ivars "$exc" in
            let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
@@ -25145,7 +25174,27 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
              // whatever it was before this begin). It stayed set here, so an
              // ensure could not tell "we are unwinding" from "we recovered".
              | _ -> map_set globals "!" prev_bang) in
+    // The ensure body runs while an exception may still be IN FLIGHT, and the
+    // pending exception lives in one global slot ($exc, plus where it was
+    // raised). Any rescue INSIDE the ensure body -- or inside anything it calls
+    // -- consumes that slot when it handles its own exception, and the pending
+    // one then propagates with no class or message: bundler's Definition#lock
+    // does exactly this, and the report said StandardError with an interpreter
+    // message. So the slot is saved across the ensure body and put back.
+    let saved_exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
+    let saved_had = map_has ivars "$exc" in
+    let saved_rl = (if map_has prim_missing "rl" then map_get prim_missing "rl" else VNil) in
+    let saved_rm = (if map_has prim_missing "rm" then map_get prim_missing "rm" else VNil) in
+    let saved_rf = (if map_has prim_missing "rf" then map_get prim_missing "rf" else VNil) in
+    let saved_i = (if map_has prim_missing "i" then map_get prim_missing "i" else VNil) in
     let ensf = (match ens with Nil -> FNext VNil | _ -> run_stmts env world blk ens) in
+    let _ = (if saved_had && (if map_has ivars "$exc" then false else true)
+             then (let _ = map_set ivars "$exc" saved_exc in
+                   let _ = (match saved_rl with VNil -> () | v -> map_set prim_missing "rl" v) in
+                   let _ = (match saved_rm with VNil -> () | v -> map_set prim_missing "rm" v) in
+                   let _ = (match saved_rf with VNil -> () | v -> map_set prim_missing "rf" v) in
+                   (match saved_i with VNil -> () | v -> map_set prim_missing "i" v))
+             else ()) in
     // a flow signal raised inside a rescue handler: retry re-runs the
     // whole begin; anything else (redo/break/...) keeps unwinding to the
     // enclosing loop/block after ensure has run.
