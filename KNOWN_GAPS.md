@@ -126,6 +126,13 @@ Overriding these methods works (corpus/142); keeping hold of the original does
 not. `require` is not affected -- it is a real entry in the table, which is why
 rubygems can wrap it (corpus/141).
 
+## `Array#max(n)` answers with the element, not an array of n
+
+`[3, 1].max(1)` is `[3]` in ruby and `3` here, and the same for `min(n)`. The
+count argument is ignored rather than refused, which is the wrong shape rather
+than a wrong order -- code that calls `.max(1).map` gets a NoMethodError on the
+element.
+
 ## `encode` has no character tables, and `$?` is not set
 
 Transcoding here works by codepoints: a string is decoded to codepoints and
