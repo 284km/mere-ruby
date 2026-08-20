@@ -32,8 +32,18 @@ Loaded straight from a rubygems checkout, no shims:
 | file | ruby | mere-ruby |
 |---|---|---|
 | `test_gem_version.rb` | pass=32 fail=0 err=0 | pass=29 fail=0 err=3 |
-| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=25 fail=0 err=10 |
-| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=21 fail=0 err=11 |
+| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=25 fail=8 err=2 |
+| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=21 fail=1 err=10 |
+
+Eight of test_gem_requirement's examples moved from err to FAIL, with the pass
+count unchanged, when a rescue clause's bare constant started resolving through
+its lexical scope: rubygems' own rescues began working, so those examples now RUN
+and compare instead of aborting. More reach, not a regression -- and what they
+compare is worth naming. `test_parse` reads
+`expected ["=", #<Gem::Version "1">], got ["=", #<Gem::Version "1">]`: the same
+text, not equal. `test_initialize_copy` wants a different object from `dup` and
+`test_parse_deduplication` wants the same object from a cache. Equality and
+identity on Gem::Version, in other words, which is where this suite goes next.
 
 The ruby column is not 100% either: the shim deliberately does not reproduce
 the sandbox (temp gem home, installed gem fixtures) the real helper builds, so

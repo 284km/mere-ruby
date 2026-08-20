@@ -3272,6 +3272,21 @@ and parse_primary = fn toks ->
          if is_lparen p then let (argv, r3) = parse_call_args r2 in (EYield argv, r3)
          // `yield [0]` passes an array literal (not an index on the result).
          else if str_eq p "[" || str_eq p " [" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
+         // A double-quoted string is lexed as `TP "(s"` -- the open of the
+         // interpolation desugaring -- and `is_lparen` only knows "(" and " (",
+         // so `yield "k", 2` fell into the no-argument case and the statement
+         // parser then said "expected end of statement". rubygems' config_file.rb
+         // writes `yield "config_file_name", @config_file_name if @config_file_name`.
+         //
+         // ONLY that token is added. Widening the test to "anything that is not a
+         // closer starts an argument" -- the rule `raise` uses -- broke three
+         // inputs that had always worked: `cond ? yield : x` (a parse error, then
+         // an infinite loop once the colon was half-handled), and `yield + 10`,
+         // which ruby reads as `(yield) + 10` and that read as `yield(+10)`.
+         // `yield + 10` against `yield +10` is decided by the space AFTER the
+         // operator, which the token does not carry, so the operators stay on the
+         // no-argument side where they have always been.
+         else if str_eq p "(s" || str_eq p " (s" then let (es, r3) = parse_puts_args r Nil in (EYield es, r3)
          else (EYield Nil, r)
        | Cons (TNL _, _) -> (EYield Nil, r)
        | Cons (TEOF, _) -> (EYield Nil, r)
@@ -10054,10 +10069,25 @@ and make_exc_w = fn world -> fn (args: Val list) ->
       let noblk = (false, (Nil : str list), (Nil : Stmt list), ivars) in
       let _ = invoke world noblk (VObj id) c "initialize" rest in
       let _ = if map_has ivars (str_of_int id ++ "@message") then () else map_set ivars (str_of_int id ++ "@message") (mkstr c) in
+      // whatever was in flight when this was raised becomes its cause, as ruby does
+      let _ = (if map_has globals "!" then (match map_get globals "!" with
+                                            | VNil -> ()
+                                            | prev -> (if rb_identical prev (VObj id) then () else map_set ivars (str_of_int id ++ "@__cause") prev))
+               else ()) in
       VObj id
     else make_exc args
-  // raising an already-built exception instance (e.g. `raise Err.new(...)`).
-  | Cons (VObj id, _) -> VObj id
+  // raising an already-built exception instance (e.g. `raise Err.new(...)`) --
+  // which also picks up a cause, since that is decided at the RAISE and not at
+  // the construction. bundler raises this shape throughout.
+  | Cons (VObj id, _) ->
+    (let (meths2, sup2, ocls2, ivars2) = world in
+     let _ = (if map_has ivars2 (str_of_int id ++ "@__cause") then ()
+              else (if map_has globals "!"
+                    then (match map_get globals "!" with
+                          | VNil -> ()
+                          | prev -> (if rb_identical prev (VObj id) then () else map_set ivars2 (str_of_int id ++ "@__cause") prev))
+                    else ())) in
+     VObj id)
   | _ -> make_exc args
 
 // An Errno class puts the system's own text in front of whatever message it is
@@ -10208,7 +10238,17 @@ and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str lis
       (match eval_e env world blk (map_get resc_exprs (substring c 7 (str_len c))) with
        | VClass cn -> Cons (cn, expand_rescue_classes env world blk rest)
        | _ -> (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in Nil))
-    else Cons (c, expand_rescue_classes env world blk rest)
+    // A plain name in a rescue clause is a CONSTANT, and it resolves through the
+    // lexical scope like any other: inside `module Ns`, `rescue MyError` means
+    // `Ns::MyError`. It used to be passed through as the bare text, so the clause
+    // never matched the class that was raised -- `Bundler.settings` rescues its
+    // own `GemfileNotFound` that way, which is why every `bundle` subcommand
+    // answered "Could not locate Gemfile" (ruby answers the settings object).
+    // A name that resolves to nothing is kept as written.
+    else (let cref = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else "") in
+          let r = named_class_of_al env world blk cref c in
+          Cons ((if map_has consts r || map_has modules r then r else c),
+                expand_rescue_classes env world blk rest))
 
 and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
   match rescues with
@@ -13012,6 +13052,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                      | _ -> (match blk with (true, _, _, _) -> mkstr "(block)" | _ -> mkstr "DEFAULT")) in
           let _ = map_set signal_traps sg hnd in
           prev))
+    // RbConfig.ruby -- the path to "the ruby". RbConfig::CONFIG already carries a
+    // borrowed one (derived from GEM_HOME, so the fiction agrees with the tree
+    // this interpreter was pointed at), and this answers the same string rather
+    // than inventing a second one. It is a fact about the CRuby installation on
+    // the load path, NOT about mere-ruby: a program that re-executes it runs
+    // CRuby, which is the caveat KNOWN_GAPS records. Answering nothing was worse
+    // in a measurable way -- `bundle --version` stopped here.
+    else if str_eq c "RbConfig" && str_eq name "ruby" then
+      (match (if map_has consts "RbConfig::CONFIG" then map_get consts "RbConfig::CONFIG" else VNil) with
+       | VHsh hid -> (match hash_lookup (hderef hid) (mkstr "bindir") with
+                      | (true, VStr h) -> mkstr (sget h ++ "/ruby")
+                      | _ -> mkstr "/usr/bin/ruby")
+       | _ -> mkstr "/usr/bin/ruby")
     else if str_eq c "GC" && (str_eq name "start" || str_eq name "enable" || str_eq name "disable" || str_eq name "stress=" || str_eq name "stress") then VNil
     // Zlib.crc32(str, seed) / Zlib.adler32(str, seed), and the two stream
     // methods, reached as Zlib::Deflate.deflate / Zlib::Inflate.inflate.
@@ -13923,6 +13976,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // flows through — dispatch to to_s rather than reading @message directly.
     else if str_eq name "message" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv "to_s" Nil false
+    // Exception#cause: the exception that was IN FLIGHT when this one was raised,
+    // which ruby records at raise time. Recorded here for an exception OBJECT (a
+    // `@__cause` ivar written where the raise happens); the lightweight
+    // class-and-message representation has nowhere to keep one, so it answers
+    // nil -- which is also ruby's answer whenever nothing was in flight, the
+    // common case. bundler's friendly_errors reads it on every error.
+    else if str_eq name "cause" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
+      (match recv with
+       | VObj eid -> (let (_, _, _, iv9) = world in
+                      if map_has iv9 (str_of_int eid ++ "@__cause") then map_get iv9 (str_of_int eid ++ "@__cause") else VNil)
+       | _ -> VNil)
     // Exception#full_message: the frame it was raised on, the message and the
     // class, as ruby's default (its highlight: and order: options are ignored).
     else if str_eq name "full_message" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
@@ -15613,7 +15677,7 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
     // in (respond_to?(:message) said false while #message worked, which is the
     // pair of answers a library checks before calling)
     || (exc_is_a world cls "Exception"
-        && (str_eq name "message" || str_eq name "backtrace" || str_eq name "set_backtrace"
+        && (str_eq name "message" || str_eq name "backtrace" || str_eq name "set_backtrace" || str_eq name "cause"
             || str_eq name "backtrace_locations" || str_eq name "full_message"))
     // respond_to_missing?(name, include_private=false): a method_missing-based
     // object can claim to respond to names it has no real method for.
@@ -16484,6 +16548,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    || (str_eq c "Enumerable" && enumerable))
      | _ -> VBool false)
   else if str_eq name "message" then (match recv with VExc (_, m) -> mkstr m | _ -> mkstr (to_s recv))
+  // Exception#cause on the built-in representation: nil. There is nowhere on a
+  // class-and-message pair to record what was in flight, and nil is also ruby's
+  // answer whenever nothing was -- the common case. An exception OBJECT records
+  // its cause for real (see @__cause). Answering at all is the point: bundler's
+  // friendly_errors reads `e.cause` on every error it reports, so a NoMethodError
+  // here replaces the error being reported.
+  else if str_eq name "cause" then VNil
   // Exception#backtrace / #backtrace_locations on a BUILT-IN exception (the
   // representation that carries only a class and a message): mere-ruby captures
   // no call stack, so the answer is nil -- the same answer an exception OBJECT
@@ -28879,6 +28950,12 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "3.2.2") in
   let _ = map_set consts "RUBY_PATCHLEVEL" (VInt 53) in
   let _ = map_set consts "RUBY_RELEASE_DATE" (mkstr "2023-03-30") in
+  // The reference ruby's own revision. Like the RbConfig paths this is a
+  // borrowed fact rather than a description of this interpreter -- there is no
+  // git revision of mere-ruby to report here -- and it is what a program that
+  // prints its ruby's identity expects to find. bundler's version command reads
+  // it, so its absence was a NameError in the middle of `bundle --version`.
+  let _ = map_set consts "RUBY_REVISION" (mkstr "e51014f9c05aa65cbf203442d37fef7c12390015") in
   let _ = map_set consts "RUBY_PLATFORM" (mkstr "arm64-darwin22") in
   let _ = map_set consts "RUBY_DESCRIPTION" (mkstr "ruby 3.2.2 (2023-03-30 revision e51014f9c0) [arm64-darwin22]") in
   let _ = map_set consts "RUBY_COPYRIGHT" (mkstr "ruby - Copyright (C) 1993-2023 Yukihiro Matsumoto") in
