@@ -749,12 +749,29 @@ after it (Exception#cause on both representations, RUBY_REVISION, RbConfig.ruby,
 `yield "str"`, and a module appearing twice in the chain), and `bundle` now runs
 bundler's own code from end to end of its startup.
 
-What stops `bundle --version` now, measured: **`IO.pipe` is not implemented**
-(thor asks for it while working out the terminal width), and thor registers
-bundler's private helpers as commands, printing a `[WARNING] Attempted to create
-command "current_command" without usage or description` for each -- its
-`no_commands` / `public_method_defined?` guard is not answering the way ruby's
-does. Neither is fatal to bundler's own logic; the pipe is.
+What stops `bundle --version`, measured with a backtrace rather than guessed:
+
+    NotImplementedError: IO.pipe is not implemented here
+      bundler/cli.rb:34:in `dispatch'
+      thor/base.rb:485:in `start'
+      bundler/cli.rb:28:in `start'
+
+`dispatch` sends `warn_on_outdated_bundler`, which in ruby returns immediately for
+a parseable command -- `PARSEABLE_COMMANDS` is `%w[check config help exec platform
+show version]` and it is asked `PARSEABLE_COMMANDS.include?(current_command.name)`.
+Here that early return is **not taken**, so bundler goes on to its version check,
+which reaches Open3 and therefore `IO.pipe`. The constant is right (verified) and
+`Bundler::CLI.respond_to?(:current_command)` is false, so what is wrong is thor's
+per-invocation state -- `current_command` is not naming the command being run.
+That is the thing to fix, and it is the same family as the `[WARNING] Attempted to
+create command "current_command"` lines: thor's `no_commands` guard is not
+answering the way ruby's does, so bundler's private helpers are registered as
+commands and its invocation state is not what thor expects.
+
+`IO.pipe` itself now refuses by name -- a real pipe pair needs the OS and nothing
+here can hand one out (the socket FFI has no pipes, and `run` shells out instead
+of plumbing descriptors). A named refusal is worth more than a NoMethodError on
+IO: it says which primitive is missing.
 
 Also open, and found while fixing the rescue clause: a rescue whose class name
 resolves to nothing should raise NameError (ruby does) and here it simply does
