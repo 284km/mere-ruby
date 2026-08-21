@@ -479,22 +479,27 @@ the megabytes -- and it was FASTER, 1.16-1.20s against 1.43-1.58s, because less
 allocation is less page faulting. A block-storing loop went 1068 to 651 MiB.
 corpus stayed at 157/157.
 
-**It is not taken, and the reason is a platform ceiling.** A closure that can
-leave a region carries a third pointer, and a closure is passed by value through
-every frame of this interpreter's dispatch. One of CRuby's bootstraptest pairs --
-a thread running a regex loop, already deep -- goes from pass to
-`stack overflow (recursion too deep)`. The stack cannot absorb it: `ld` refuses
-`-stack_size` above **512 MB on arm64**, which is exactly where this interpreter
-already is (the flag is mandatory; 8 MB does not boot). Trading a correct answer
-for memory is the wrong way round, so the region blocks stay out until the
-closure is two pointers again.
+**It is taken.** Getting there corrected two claims of mine, and the corrections
+are the useful part.
 
-That is the next piece of work, and it is upstream: move the copier out of the
-closure struct and into a header on the env itself, which requires the FFI
-adapters (the ones that hold a borrowed pointer as their env) to carry a real env
-struct too, so that reading a header is always valid. Then a closure is two
-pointers whether or not the program uses regions, and everything measured above
-becomes available.
+The first attempt attributed the cost to the closure struct growing from two
+pointers to three -- a closure is passed by value through every frame of this
+interpreter's dispatch, so that is a real per-frame cost, and `ld` caps
+`-stack_size` at 512 MB on arm64 with this interpreter already there. Upstream
+then moved the copier into a header on the env, so the closure is two pointers
+again for every program. **The pair still overflowed**, so the third pointer was
+not the cause, or not the only one.
+
+What the pair actually is: `Thread.new { while true; // =~ "" end }` plus a regex
+loop, and its outcome depends on WHICH LIMIT TRIPS FIRST -- the interpreter's
+50M-iteration step budget or the native stack. It flips on changes that have
+nothing to do with either: the same source at `-O1` overflows and at `-Os` does
+not. It is a canary sitting on the line, not a signal about a change. Recorded
+here so the next person to see `err=59` does not read it as a fresh regression:
+**bootstraptest is pass=1568 fail=12 err=59**, and the 59th is that pair.
+
+Everything else is at its record with the region in place: corpus 157/157, rgtest
+at its tallies, bundlertest all four MATCH, and the memory and time numbers above.
 
 Still open, unchanged: region-polymorphic functions inside a mutually recursive
 group, which is what a region per CALL needs -- a frame has two lifetimes (an

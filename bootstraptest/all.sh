@@ -34,6 +34,12 @@ done
 # does not produce is DRIFT -- ruby 3.4 froze string literals and changed
 # Hash#inspect, and "fixing" those here would break the corpus. Set
 # BT_NO_DRIFT_CHECK=1 to skip the check (it doubles the run time).
+# One pair is a CANARY rather than a signal: test_thread/p24 runs a thread with
+# `while true; // =~ "" end`, and whether it finishes depends on which limit trips
+# first -- the interpreter's step budget or the native stack. The same source
+# overflows at -O1 and does not at -Os, so it moves on changes that have nothing
+# to do with it. err=59 with that pair inside is the recorded state; err=58
+# without it was the state before the closure-env work upstream.
 pass=0; fail=0; err=0; drift=0; total=0
 for rb in "$dir"/*/p*.rb; do
   [ -f "$rb" ] || continue
