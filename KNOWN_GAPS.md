@@ -760,13 +760,24 @@ What stops `bundle --version`, measured with a backtrace rather than guessed:
 a parseable command -- `PARSEABLE_COMMANDS` is `%w[check config help exec platform
 show version]` and it is asked `PARSEABLE_COMMANDS.include?(current_command.name)`.
 Here that early return is **not taken**, so bundler goes on to its version check,
-which reaches Open3 and therefore `IO.pipe`. The constant is right (verified) and
-`Bundler::CLI.respond_to?(:current_command)` is false, so what is wrong is thor's
-per-invocation state -- `current_command` is not naming the command being run.
-That is the thing to fix, and it is the same family as the `[WARNING] Attempted to
-create command "current_command"` lines: thor's `no_commands` guard is not
-answering the way ruby's does, so bundler's private helpers are registered as
-commands and its invocation state is not what thor expects.
+which reaches Open3 and therefore `IO.pipe`.
+
+Half of that is now fixed, and the half tells the story. thor asks
+`public_method_defined?(meth)` inside `method_added` and returns unless the method
+is public -- and this interpreter fired the hook BEFORE recording the visibility,
+so every one of bundler's `private` helpers looked public to thor and was
+registered as a command. Six of them, warned about by name. **The hook fires after
+the visibility now, and those warnings are gone (6 to 0).** The same commit fixed
+where the hook fires at all: a `def` inside a block or an `if` never reached it,
+because it was fired from the class-body walker rather than from the place a
+method is installed -- which is the shape `no_commands do ... def ... end` needs.
+
+What remains: `current_command` still does not name the command being run, so the
+early return is still missed. It is not the visibility and not the hook -- both
+are verified against ruby, as is reopening a nested class and overriding a private
+method through it (all in `corpus/158` and probes). Something else in thor's
+per-invocation state is wrong, and the next step is to find what `dispatch` passes
+into it.
 
 `IO.pipe` itself now refuses by name -- a real pipe pair needs the OS and nothing
 here can hand one out (the socket FFI has no pipes, and `run` shells out instead
