@@ -506,6 +506,68 @@ group, which is what a region per CALL needs -- a frame has two lifetimes (an
 ordinary method's dies with the call, a define_method body's is read by a closure
 afterwards) and every frame-taking function here is in one recursive group.
 
+### Where the remaining memory sits, split by pool (2026-08-22)
+
+`bench/region_split.sh` counts every bump allocation into one of two pools with
+opposite fates: the DEFAULT region (nothing reclaims it, ever) and BLOCK regions
+(statement regions; handed back at each block's exit). 200k iterations each,
+after the v0.1.294 leak fix below:
+
+| workload | peak MiB | def bumped | def blocks | blk high-water |
+|---|---|---|---|---|
+| `i += 1` and nothing else | -- | 38 | 60 | **1024** |
+| temp strings (w1) | 929 | 138 | 252 | **1024** |
+| dead objects (w2) | 1795 | **1051** | **2044** | 1025 |
+| plain calls (w3) | 1133 | 352 | 508 | **1025** |
+
+Three mechanisms, now separately sized:
+
+**A loop is one statement, so the statement region does not help inside it.**
+The while's own region holds every iteration's temporaries until the loop ends:
+~1 GB high-water even for a body of `i += 1` (4-13 KB per iteration). The
+statement-region work reclaims BETWEEN statements; a 200k-iteration loop never
+gets there. The counterpart move -- a region per loop ITERATION -- needs no
+region-polymorphic helper for the same reason statements did not: an iteration
+creates no frame. Untried, and it is the largest single number in every
+workload above.
+
+**A local-variable write permanently costs 60-190 bytes.** Differential probes
+(1 vs 4 writes per iteration): an int overwrite is ~64 B, a small string ~178 B,
+copied into the env map's region -- the default -- where the orphaned previous
+copy is unreachable and unreclaimed. `map_set` on a bump arena never reuses the
+slot. This is the whole of w3's def growth: its census shows NO store growing;
+352 MiB of def is nothing but assignment copies.
+
+**Dead guest objects are the def majority in object code, and the oracle says
+they are all collectable.** w2's 200k objects leave 1.4M store entries
+(ivars 2/obj, ocls 1/obj, arr_store 2/`new` + 2/instance-call -- the recorded
+`__args`/`__params` pair) and 1051 MiB of def. The same program under ruby holds
+**17,657 live slots after GC.start** -- less than an empty interpreter's
+baseline. Everything mere-ruby keeps here, a guest collector may take.
+
+And one runtime inefficiency that costs time rather than footprint: statement
+regions NEST, the region-struct cache is one deep, and releases arrive out of
+cache order -- so w2/w3 malloc and free ~196 GB of 1 MB seed blocks over a run
+(`blk_blocks_cum`). A small stack of cached regions would end it.
+
+### The formatter leaked, and it wore the mask of a different problem
+
+Mere v0.1.294 (2026-08-22): both native backends copied every asprintf result
+into the region at the `__lang_str_of_cstr` boundary and never freed the buffer
+-- 160 bytes per `str_of_int`, quadratic for `show` of a list. Found by
+`bench/region_reuse.sh` asking an unrelated question: whether a region whose
+chain GREW past one block hands memory back in reusable form (the property a
+compacting collector stands on). The answer looked like no -- peak grew ~38 MiB
+per sibling region, linear in the count -- while the runtime's own counters
+said everything was returned. Both meters were honest; the gap between "we
+returned it" and "it came back" was a third party holding it.
+
+With the fix, the original question answers itself: 1, 8, and 32 sibling ~64 MB
+grown regions all peak at 36-39 MiB. **Released grown chains are fully reusable
+through plain libc; a compaction loop's footprint is bounded by about one live
+generation, and no runtime block pool is needed.** On this interpreter the fix
+alone was worth 16-30% of peak: w1 1297 -> 929, w2 2555 -> 1795, w3 1354 -> 1133.
+
 ### Two wastes the census found, and what they were worth
 
 `senc_set` recorded `"UTF-8"` for every string, in a map whose *absence* of an
