@@ -25869,27 +25869,58 @@ and run_if = fn env -> fn world -> fn blk -> fn clauses -> fn (els: Stmt list) -
     else run_if env world blk rest els
 
 and run_while = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stmt list) ->
-  if truthy (eval_e env world blk cond) then
-    let _ = tick () in
-    (match while_body_flow env world blk body with
-     | FReturn v -> FReturn v
-     | FRaise v -> FRaise v
-     | FBreak v -> FNext v          // break exits the loop with its value
-     | FLoopNext _ -> run_while env world blk cond body   // next: skip to next iteration
-     | FNext _ -> run_while env world blk cond body)
-  else FNext VNil
+  // A REGION PER ITERATION -- the loop-shaped sibling of run_stmts' region per
+  // statement. A loop is ONE statement, so the statement region cannot hand
+  // anything back until the loop ends: 200k iterations of a body as small as
+  // `i += 1` held ~1 GB of per-iteration temporaries in the enclosing
+  // statement's region (bench/region_split.sh, 2026-08-22).
+  //
+  // The region wraps the WHOLE iteration -- condition included -- because a
+  // first version wrapped only the body and a 10M-iteration loop still held
+  // 19 GB: ~1.9 KB per iteration of condition temporaries and flow copies
+  // accumulated in the while-statement's region. The price of wrapping the
+  // condition is one encoding trick: "condition false" must leave the block
+  // as a Flow value, and FBreak VNil already means exactly "leave the loop
+  // with nil" to the match below, so a natural exit borrows break's shape.
+  //
+  // The self-call stays a TAIL call with the region block in the body -- that
+  // was measured, not assumed (10M-deep tail recursion with a region inside,
+  // default 8 MB stack, peak 1 MiB): block regions are heap structs behind a
+  // per-thread cache, so nothing of the region lives in this frame. An
+  // iteration creates no frame of its own, so no region-polymorphic helper is
+  // needed -- the same reason the statement region could be taken.
+  match region ITER {
+    if truthy (eval_e env world blk cond) then
+      let _ = tick () in
+      while_body_flow env world blk body
+    else FBreak VNil               // condition false: leave the loop with nil
+  } with
+  | FReturn v -> FReturn v
+  | FRaise v -> FRaise v
+  | FBreak v -> FNext v            // break exits the loop with its value
+  | FLoopNext _ -> run_while env world blk cond body   // next: skip to next iteration
+  | FNext _ -> run_while env world blk cond body
 
 // begin..end while/until: the body runs at least once INSIDE the loop
 // context (so break/next/redo on the first pass behave correctly).
 and run_dowhile = fn env -> fn world -> fn blk -> fn (s: Stmt) -> fn (cond: Expr) ->
-  let _ = tick () in
-  (match while_body_flow env world blk (Cons (s, Nil)) with
-   | FReturn v -> FReturn v
-   | FRaise v -> FRaise v
-   | FBreak v -> FNext v
-   | _ ->
-     if truthy (eval_e env world blk cond) then run_dowhile env world blk s cond
-     else FNext VNil)
+  // Same region-per-iteration as run_while (see the comment there); the body
+  // runs first, then the condition -- inside the same region -- decides
+  // between continuing (FNext) and leaving (FBreak VNil, break's shape).
+  match region ITER {
+    let _ = tick () in
+    match while_body_flow env world blk (Cons (s, Nil)) with
+    | FReturn v -> FReturn v
+    | FRaise v -> FRaise v
+    | FBreak v -> FBreak v
+    | _ ->
+      if truthy (eval_e env world blk cond) then FNext VNil
+      else FBreak VNil
+  } with
+  | FReturn v -> FReturn v
+  | FRaise v -> FRaise v
+  | FBreak v -> FNext v
+  | _ -> run_dowhile env world blk s cond
 
 // is there a `yield` that is NOT lexically inside a method definition?
 // Ruby rejects that at parse time ("Invalid yield") — a class/module/singleton
@@ -26118,6 +26149,10 @@ and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
 // run a loop body once, converting flow signals; redo reruns the body
 // without re-evaluating the loop condition.
 and while_body_flow = fn env -> fn world -> fn blk -> fn (body: Stmt list) ->
+  // The region per iteration lives in run_while / run_dowhile (wrapping the
+  // condition too), NOT here -- a second block here would nest inside it and
+  // thrash the one-deep region cache. redo's re-entry below therefore runs
+  // inside the same iteration's region, which is what redo means.
   let f = try_or (fn (u: unit) -> run_stmts env world blk body) (FRaise VNil) in
   match f with
   | FRaise _ ->

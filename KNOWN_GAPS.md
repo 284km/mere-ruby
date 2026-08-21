@@ -428,6 +428,13 @@ about 250 bytes a frame. Three probes separate it:
 process hold", which sums a reclaimed heap and an un-optimized stack. The harness
 now reads the region runtime's own counters, which is the measurement that can.
 
+(2026-08-22 correction: the "~250 bytes a frame of stack" attribution above was
+itself wrong. Those probes format a string per iteration, and each format leaked
+its asprintf buffer -- the v0.1.294 leak below. With the leak fixed, the
+region+Map probe peaks at **1 MiB**, not 247; and a region block in a 10M-deep
+tail recursion runs in the default 8 MB stack with a 1 MiB peak, so the
+self-call stays a tail call. The numbers in the table above are of their date.)
+
 What is still true from the earlier round: `map_delete` and overwriting a key do
 not give memory back **within a living container** (231 MiB after a million
 set-then-delete pairs, zero entries left), and the handle scheme forbids deleting
@@ -549,6 +556,55 @@ And one runtime inefficiency that costs time rather than footprint: statement
 regions NEST, the region-struct cache is one deep, and releases arrive out of
 cache order -- so w2/w3 malloc and free ~196 GB of 1 MB seed blocks over a run
 (`blk_blocks_cum`). A small stack of cached regions would end it.
+
+### A region per loop iteration (taken, 2026-08-22)
+
+The largest number in the pool split -- ~1 GB of block high-water held because a
+loop is one statement -- is gone. `run_while` / `run_dowhile` wrap each
+iteration, CONDITION INCLUDED, in `region ITER { }`; "condition false" leaves
+the block as `FBreak VNil`, which already means "leave the loop with nil" to
+the match around it. A first version wrapped only the body and a 10M-iteration
+loop still held 19 GB of condition temporaries and flow copies; wrapping the
+condition took it to 2.2 GB, all of it the def-region write cost below.
+
+| workload | before | after | blk high-water |
+|---|---|---|---|
+| `i += 1` x200k | 807 | **46** | 1024 -> 9 |
+| temp strings (w1) | 929 | **142** | 1024 -> 9 |
+| dead objects (w2) | 1795 | **1021** | 1025 -> 10 |
+| plain calls (w3) | 1133 | **359** | 1025 -> 10 |
+
+w2's remainder is the def region almost exactly (1051 bumped): dead guest
+objects, the collector's half of the problem, untouched by construction. Time
+got slightly better (w3 1.33s -> 1.27s), as with the statement region. The
+self-call stays a tail call with the region in the body -- measured, 10M deep,
+default stack, 1 MiB peak -- because block regions are heap structs behind a
+per-thread cache since v0.1.290-293.
+
+The one-deep cache is now the visible cost: the iteration region nests inside
+the while-STATEMENT's region and around the body's statement regions, releases
+arrive out of cache order, and one 1 MB seed is malloc'd and freed per
+iteration (~200 GB of churn per 200k x N-statement run, `blk_blocks_cum`).
+Time says libc absorbs it; a small stack of cached regions upstream would end
+it.
+
+Loop-flow semantics against ruby: break-with-value, next, redo, begin/end
+while, until, a raise crossing iterations, and a stored string outliving its
+iteration all match byte-for-byte. Gates: corpus 158/158, bootstraptest
+pass=1570 fail=12 err=58 (one better than the record; the canary pair fell on
+its passing side), parsetest 34 (was 37), rgtest / bundlertest at their
+tallies.
+
+### gemtest went red the day the rubygems preload landed, and nobody ran it
+
+The interpreter preloads the stdlib's rubygems now; gemtest exists to load a
+CHECKOUT's rubygems. Both at once redefine `Gem::LoadError` with different
+parents, so every gem "CRASH"ed with a superclass mismatch -- ok=0 fail=29,
+both with and without the loop change, which is what cleared the loop change.
+The gate now sets `MERE_RUBY_NO_GEMS=1` (the preload's own escape hatch):
+ok=21 fail=6 skip=2, its recorded shape. The lesson is the CI one at repo
+scale: a gate that is not in the routinely-run set is not green, it is
+unknown.
 
 ### The formatter leaked, and it wore the mask of a different problem
 
