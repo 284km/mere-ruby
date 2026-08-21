@@ -35,7 +35,12 @@ while IFS= read -r line; do
   # 120s, and a gem that needs longer is a failure in practice: every gem that
   # loads at all loads in seconds. Without the alarm a gem that never finishes
   # (rubocop's cop loading slows to a crawl, see KNOWN_GAPS) hangs the gate.
-  out=$(GEM_HOME="$gem_home" GEM_PATH="$gem_home" RUBYGEMS_LIB="$rubygems/lib" \
+  # MERE_RUBY_NO_GEMS: the interpreter preloads the stdlib's rubygems on its
+  # own now, and this gate exists to load the CHECKOUT's rubygems -- both at
+  # once redefine Gem::LoadError with different parents (superclass mismatch,
+  # every gem "CRASH"). The gate went red the day the preload landed and
+  # nobody ran it until 2026-08-22.
+  out=$(MERE_RUBY_NO_GEMS=1 GEM_HOME="$gem_home" GEM_PATH="$gem_home" RUBYGEMS_LIB="$rubygems/lib" \
         perl -e 'alarm 120; exec @ARGV' "$mr" $inc "$here/load_one.rb" "$g" 2>/dev/null)
   code=$?
   if [ $code -eq 142 ] || [ $code -eq 14 ]; then
