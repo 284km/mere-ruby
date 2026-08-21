@@ -465,10 +465,41 @@ place, every closure the body builds would stay. That is consistent with the
 older measurement: patching the generated C so `map_new` follows the current
 region reclaimed 17%, and the rest is mostly these.
 
-So the two things reclamation now waits on are named and measured, and both are
-in the language rather than here: region-polymorphic functions inside a
-mutually recursive group, and closure environments that follow the current
-region.
+One of those two landed upstream and was then measured here, which changed what is
+left. Closure environments now follow the current region and carry a copier that
+lets them leave one -- so a region block in this interpreter's own source can
+reclaim what it allocates.
+
+A region **per statement** (every statement of a body but the last, whose value is
+discarded) was tried, and it works: it needs no region-polymorphic helper, because
+a statement creates no frame. Measured on 200k plain method calls it was **1181
+MiB against 1358-1996 before, and the same number three times out of three** --
+bounding what is live is what makes peak RSS repeatable, which is worth as much as
+the megabytes -- and it was FASTER, 1.16-1.20s against 1.43-1.58s, because less
+allocation is less page faulting. A block-storing loop went 1068 to 651 MiB.
+corpus stayed at 157/157.
+
+**It is not taken, and the reason is a platform ceiling.** A closure that can
+leave a region carries a third pointer, and a closure is passed by value through
+every frame of this interpreter's dispatch. One of CRuby's bootstraptest pairs --
+a thread running a regex loop, already deep -- goes from pass to
+`stack overflow (recursion too deep)`. The stack cannot absorb it: `ld` refuses
+`-stack_size` above **512 MB on arm64**, which is exactly where this interpreter
+already is (the flag is mandatory; 8 MB does not boot). Trading a correct answer
+for memory is the wrong way round, so the region blocks stay out until the
+closure is two pointers again.
+
+That is the next piece of work, and it is upstream: move the copier out of the
+closure struct and into a header on the env itself, which requires the FFI
+adapters (the ones that hold a borrowed pointer as their env) to carry a real env
+struct too, so that reading a header is always valid. Then a closure is two
+pointers whether or not the program uses regions, and everything measured above
+becomes available.
+
+Still open, unchanged: region-polymorphic functions inside a mutually recursive
+group, which is what a region per CALL needs -- a frame has two lifetimes (an
+ordinary method's dies with the call, a define_method body's is read by a closure
+afterwards) and every frame-taking function here is in one recursive group.
 
 ### Two wastes the census found, and what they were worth
 
