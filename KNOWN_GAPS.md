@@ -772,12 +772,27 @@ where the hook fires at all: a `def` inside a block or an `if` never reached it,
 because it was fired from the class-body walker rather than from the place a
 method is installed -- which is the shape `no_commands do ... def ... end` needs.
 
-What remains: `current_command` still does not name the command being run, so the
-early return is still missed. It is not the visibility and not the hook -- both
-are verified against ruby, as is reopening a nested class and overriding a private
-method through it (all in `corpus/158` and probes). Something else in thor's
-per-invocation state is wrong, and the next step is to find what `dispatch` passes
-into it.
+What remains is one call, and the hunt for it ruled out a lot -- worth writing
+down so the next attempt does not repeat it. Not the aliases (`normalize_command_name("--version")`
+answers `"version"`, and `map` / `all_aliases` are identical to ruby's); not the
+command registry (`all_commands.key?("version")` is true and its value is a
+`Thor::Command`, though mere-ruby registers 29 commands against ruby's 31, which
+is its own thread to pull); not the visibility or the hook (both now verified);
+not hash aliasing through calls and ivars; and **not
+`warn_on_outdated_bundler`** -- running with `BUNDLE_DISABLE_VERSION_CHECK=true`,
+which returns that method early, changes nothing, so the pipe is reached from
+`print_command`'s side of `dispatch`'s block. thor gets its terminal width from
+backticks (`stty size`), not from Open3, so the pipe is somewhere else again.
+
+Two things made the caller hard to name, and both are gaps of their own:
+
+- **A block has no frame**, so `dispatch`'s `super do |i| ... end` is the innermost
+  thing a backtrace shows: the two methods it sends are invisible.
+- **A user-defined singleton method on a builtin class does not win.** `def
+  IO.pipe(*a); ...; end` is ignored -- the builtin branch answers first -- so the
+  usual trick of overriding a primitive to print `caller` does not work here. That
+  is a fidelity gap in its own right: in ruby a singleton definition on IO wins
+  over IO's own method.
 
 `IO.pipe` itself now refuses by name -- a real pipe pair needs the OS and nothing
 here can hand one out (the socket FFI has no pipes, and `run` shells out instead
