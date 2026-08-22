@@ -57,7 +57,26 @@ status_final="$here/../SPEC_STATUS.md"
 # mere-ruby side stops before it prints a tally, under this build and under the
 # build before it.)
 TIMEOUT=60
-run_one() {  # $1 = spec file -> echoes MATCH/DIFF/CRASH/SKIP/TIMEOUT
+# A verdict alone does not say WHERE to work. The sweep used to compute one and
+# throw the output away (`rm -f "$raw"` below), so 603 DIFFs were 603 unknowns:
+# the tags files named the files and nothing else. Classifying by message first
+# is the difference between fixing one name and guessing among hundreds -- on
+# this codebase a batch of 346 errors turned out to be 194 instances of ONE name.
+#
+# So run_one now echoes "VERDICT<TAB>CAUSE":
+#   CRASH -> the abort message from the mere-ruby side
+#   DIFF  -> the first line where the two sides disagree
+# Only the leading "path:line:" is stripped. The message itself is kept whole,
+# quoted identifiers included: normalising it further merges causes that are
+# genuinely different, and a bucket that mixes them cannot be acted on.
+strip_noise() {  # stdin -> stdout, a line usable as a bucket key
+  sed -e 's|^[^ ]*\.rb:[0-9]*: |*.rb:N: |' \
+      -e 's|/[^ ]*/mrb_[A-Za-z0-9]*|TMPDIR|g' \
+      -e 's|/var/folders/[^ ]*|TMPDIR|g' \
+      -e 's|0x[0-9a-f]*|0xADDR|g'
+}
+
+run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   # Through a FILE, not a pipe: the alarm's status has to be perl's, and `$?`
   # after a pipeline is the last stage's (`tr` always succeeds). Read off an
   # empty output, a killed run is indistinguishable from an abort. (`pipefail`
@@ -73,15 +92,40 @@ run_one() {  # $1 = spec file -> echoes MATCH/DIFF/CRASH/SKIP/TIMEOUT
   # that are not there in C.
   out="$(LC_ALL=C tr -d '\0' < "$raw")"
   rm -f "$raw"
-  case $rc in 142|14) echo TIMEOUT; return;; esac
+  case $rc in 142|14) printf 'TIMEOUT\t-\n'; return;; esac
   verdict="$(printf '%s' "$out" | tail -1)"
-  if [ "$verdict" = "MATCH" ]; then echo MATCH; return; fi
+  if [ "$verdict" = "MATCH" ]; then printf 'MATCH\t-\n'; return; fi
   # ruby side empty tally => unmeasurable (ruby itself didn't run the examples)
   rb="$(printf '%s' "$out" | sed -n '/--- ruby:/,$p' | grep -a 'pass=' | tail -1)"
   mr="$(printf '%s' "$out" | sed -n '/--- mere-ruby:/,/--- ruby:/p' | grep -a 'pass=' | tail -1)"
-  if [ -z "$rb" ]; then echo SKIP; return; fi
-  if [ -z "$mr" ]; then echo CRASH; return; fi
-  echo DIFF
+  if [ -z "$rb" ]; then printf 'SKIP\t-\n'; return; fi
+
+  # Split the two sides. `--- ruby:` also ends the mere-ruby side, and the very
+  # last line is run_spec.sh's own verdict, which belongs to neither.
+  mr_f="$(mktemp)"; rb_f="$(mktemp)"
+  printf '%s\n' "$out" | sed -n '/^--- mere-ruby:/,/^--- ruby:/p' \
+    | sed '1d;$d' | strip_noise > "$mr_f"
+  printf '%s\n' "$out" | sed -n '/^--- ruby:/,$p' \
+    | sed '1d;$d' | strip_noise > "$rb_f"
+
+  if [ -z "$mr" ]; then
+    # CRASH: the cause is why it stopped -- the last thing it said. An empty
+    # mere-ruby side means it died before printing anything at all, which is a
+    # different finding and worth its own bucket rather than a blank.
+    cause="$(grep -av '^$' "$mr_f" | tail -1)"
+    [ -n "$cause" ] || cause="(no output before aborting)"
+    rm -f "$mr_f" "$rb_f"
+    printf 'CRASH\t%s\n' "$cause"
+    return
+  fi
+
+  # DIFF: the first line the two sides disagree on. Not the tally -- the tally
+  # says how many examples differ, never which behaviour is wrong.
+  cause="$(diff "$mr_f" "$rb_f" 2>/dev/null | grep -a '^<' | head -1 | cut -c3-)"
+  [ -n "$cause" ] || cause="$(diff "$mr_f" "$rb_f" 2>/dev/null | grep -a '^>' | head -1 | cut -c3-)"
+  [ -n "$cause" ] || cause="(tallies differ, lines identical)"
+  rm -f "$mr_f" "$rb_f"
+  printf 'DIFF\t%s\n' "$cause"
 }
 
 # expand each requested dir to the group name + its spec files
@@ -114,14 +158,18 @@ for d in $dirs; do
   : > "$tagdir/$group.txt"
   for f in $files; do
     tot=$((tot+1))
-    v="$(run_one "$f")"
+    vc="$(run_one "$f")"
+    v="${vc%%	*}"       # before the tab
+    cause="${vc#*	}"    # after it
     rel="${f#$root/}"
+    # The cause is the third field, tab-separated, so the first two stay
+    # readable as before and a cause containing spaces survives whole.
     case "$v" in
       MATCH) m=$((m+1)) ;;
-      DIFF)  df=$((df+1)); echo "DIFF  $rel"  >> "$tagdir/$group.txt" ;;
-      CRASH) cr=$((cr+1)); echo "CRASH $rel"  >> "$tagdir/$group.txt" ;;
-      SKIP)  sk=$((sk+1)); echo "SKIP  $rel"  >> "$tagdir/$group.txt" ;;
-      TIMEOUT) to=$((to+1)); echo "SLOW  $rel"  >> "$tagdir/$group.txt" ;;
+      DIFF)  df=$((df+1)); printf 'DIFF  %s\t%s\n'  "$rel" "$cause" >> "$tagdir/$group.txt" ;;
+      CRASH) cr=$((cr+1)); printf 'CRASH %s\t%s\n'  "$rel" "$cause" >> "$tagdir/$group.txt" ;;
+      SKIP)  sk=$((sk+1)); printf 'SKIP  %s\n'       "$rel" >> "$tagdir/$group.txt" ;;
+      TIMEOUT) to=$((to+1)); printf 'SLOW  %s\n'     "$rel" >> "$tagdir/$group.txt" ;;
     esac
   done
   echo "| $d | $m | $df | $cr | $sk | $to | $tot |" >> "$rows"

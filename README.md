@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 151 programs, byte-for-byte
+./run_corpus.sh                                  # 159 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -308,7 +308,12 @@ TruffleRuby, Opal, Artichoke) target. mere-ruby measures against it too.
 both mere-ruby and `ruby` through a minimal mspec shim, and compares
 byte-for-byte. It writes `SPEC_STATUS.md` (a per-group MATCH / DIFF / CRASH /
 SKIP table) and `mspec/tags/*.txt` (the per-file list of what does *not*
-match). Those tag files are the honest, checked-in record of the gap — the
+match, each row carrying WHY it does not).
+
+`./mspec/causes.sh` then groups those rows by cause and writes
+[`CAUSES.md`](CAUSES.md). That is the number worth acting on: the table says how
+many files disagree, and this says how many NAMES they come down to. It reads
+the tags files only, so the bucket key can be retuned without re-sweeping. Those tag files are the honest, checked-in record of the gap — the
 same idea as the tags/filter files every other implementation keeps. Passing
 100% is a non-goal (only MRI does, because the specs are derived from it); the
 target is the `language` and `core` groups, with `command_line` low-priority
