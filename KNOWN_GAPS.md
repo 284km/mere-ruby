@@ -639,6 +639,33 @@ byte-heavy store (20 KB per entry) under-collects -- an allocation-volume
 counter is a language lane; vec dead slots are stubs forever (id reuse needs
 a free list); and frame env maps remain the largest uncollected share.
 
+### The interpreter minted a string id per method call, for backtraces (2026-08-22)
+
+The largest string churn in the interpreter was its own position bookkeeping:
+every call recorded its name, file and method as VStr Vals -- one fresh
+str_store slot PER RECORDING, immediately overwritten. Measured: one slot per
+`i += 1` (operator dispatch records too), eleven per `P.new`; a 45-second run
+minted 2.6M slots, and since vec ids are positional, every collection walks
+every slot ever minted, forever. The bookkeeping maps (call_names, call_files,
+call_meths, cur_pos "m"/"f") hold RAW strs now: an overwrite is map-internal,
+reclaimable by the map's own compaction, and no id is ever issued. A 10k-
+iteration `i += 1` loop went from 10,209 str slots to 202; w3 (plain calls)
+from 359 to 287 MiB, w1 142 -> 134, w2 1104 -> 1078.
+
+Top-level while chunking was attempted AGAIN on top of this (its first
+precondition, the churn, now fixed) and held back AGAIN, one bug further in:
+w2 with chunking measured 816 MiB at normal speed (the storm is gone), but
+bundler's definition/setup steps regressed to DSLError. Bisected: the churn
+fix alone keeps bundler green; the chunking's byte-pressure trigger makes a
+collection fire at a NEW moment between the probe's statements, and that
+collection eats something bundler needs -- a missed root. The root list was
+classified from setter sites whose value argument is a LITERAL constructor;
+setters that store a VARIABLE were classified by hand, and at least one
+Val-holding global slipped through. Precondition for the third attempt: a
+root classifier that covers variable-argument setters (or: enumerate the gap
+by diffing "maps whose values unify with Val" from the typer's view against
+the root list).
+
 ### What the collector still cannot reach, measured to its edges (2026-08-22)
 
 Three measurements close the day, each naming the next wall precisely:
