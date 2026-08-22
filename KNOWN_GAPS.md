@@ -639,6 +639,34 @@ byte-heavy store (20 KB per entry) under-collects -- an allocation-volume
 counter is a language lane; vec dead slots are stubs forever (id reuse needs
 a free list); and frame env maps remain the largest uncollected share.
 
+### `require "rubocop"` loads (2026-08-23)
+
+The 68 GB arena had a name after all: **an infinite ancestor walk**, triggered
+twelve requires in by pp.rb. Two fidelity bugs, found by correlating the
+require timeline with >128 MB block allocations, then prefix-bisecting pp.rb:
+
+- **`class Object < BasicObject` (pp.rb line 609) put a cycle into the
+  default ancestor chain.** The reopen legitimately writes
+  sup["Object"] = "BasicObject" -- but four walkers (has_meth, lookup_meth,
+  meth_private, meth_protected) knew only "Object" as their terminal and
+  defaulted everything else to Object: BasicObject -> Object -> BasicObject,
+  forever, allocating per step -- one method call after the reopen was the
+  whole 68 GB. The walkers now know the real root (BasicObject terminal,
+  Object -> BasicObject by default), matching what ancestors_of_raw always
+  knew; the superclass-mismatch check's default had the same blind spot.
+- **`class << ENV` (pp.rb line 389) hid ENV's builtins.** Opening an object's
+  singleton retags ocls with the singleton-class name so mixed-in methods
+  dispatch -- but the builtin arms match by class NAME, and "(sng:...)"
+  matches none of them: ENV['HOME'] was a NoMethodError for every reader
+  after pp loaded. When the singleton chain does not answer a name, dispatch
+  falls back to the singleton's superclass, where the builtins live.
+
+With both fixed: `require "rubocop"` -- ~250 files, the load that defined
+this interpreter's memory problem -- **completes: OK in 89 s at 19.8 GB
+peak**, against 117 GB and a 10-minute timeout when this arc began. The
+remaining 19.8 GB is dominated by frames (the env-store lane), which is now
+the last big number standing.
+
 ### The collector reaches inside require chains now, and what it found there (2026-08-23)
 
 Four pieces landed together, each gated on corpus/bundler (bootstraptest on
