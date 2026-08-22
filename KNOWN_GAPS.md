@@ -639,6 +639,42 @@ byte-heavy store (20 KB per entry) under-collects -- an allocation-volume
 counter is a language lane; vec dead slots are stubs forever (id reuse needs
 a free list); and frame env maps remain the largest uncollected share.
 
+### What the collector still cannot reach, measured to its edges (2026-08-22)
+
+Three measurements close the day, each naming the next wall precisely:
+
+**`require "rubocop"` is one statement, so the collector never runs.** 88 GB
+peak, died at ~155 s -- barely moved from the pre-collector 117 GB, and the
+byte-pressure trigger (below) moved it not at all, because the entire ~250-file
+load happens INSIDE one top-level `require`: the safepoint discipline (collect
+only at the driver's loop head, where no arena handle is on the interpreter's
+stack) never gets a turn. rubocop-ast, which loads as its own statement chain,
+went 3.2 GB -> 0.99 GB. The lesson generalizes: this collector helps programs
+whose life is many statements, and a safepoint INSIDE the call stack -- which
+is the frame-collection problem again -- is what rubocop-class loads need.
+
+**A byte-pressure trigger exists upstream now (mere v0.1.299 map_bytes /
+vec_bytes) and it fixed the byte-blind case**: a store of 20 KB values went
+365 -> 190 MiB. Absolute byte floors do NOT work -- vec stub mass grows
+monotonically past any constant and pins the pressure true (a collection per
+iteration, each copying every slot ever issued). Incremental (2x the
+post-collection baseline) is the shape that held.
+
+**Top-level while chunking was built, measured, and REVERTED.** Bounded
+stretches of a top-level while with collections between them work
+mechanically (corpus stayed green), but the measurement found a pre-existing
+churn this file had never seen: w2-shaped code creates ~30-60 VStr per
+iteration (invisible before -- they accumulated silently in the default
+region; the collector makes them visible because every one becomes a vec slot
+that every blank-and-compact pass walks), and late in a run each collection
+is O(slots-ever) against a trigger interval that stopped scaling with it. A
+GC storm: 164 collections in 45 s. Until the per-iteration string churn is
+attributed (its source is NOT obvious: the workload allocates no Ruby
+strings) and the trigger charges the vec-scan cost on the byte axis the way
+it does on the entry axis, the chunking stays out. The branch's diff is
+preserved in this entry's history; corpus/bootstraptest were green when
+reverted -- the revert is about the storm, not correctness.
+
 ### gemtest went red the day the rubygems preload landed, and nobody ran it
 
 The interpreter preloads the stdlib's rubygems now; gemtest exists to load a
