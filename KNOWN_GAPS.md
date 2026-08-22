@@ -639,6 +639,50 @@ byte-heavy store (20 KB per entry) under-collects -- an allocation-volume
 counter is a language lane; vec dead slots are stubs forever (id reuse needs
 a free list); and frame env maps remain the largest uncollected share.
 
+### The collector reaches inside require chains now, and what it found there (2026-08-23)
+
+Four pieces landed together, each gated on corpus/bundler (bootstraptest on
+the final tree):
+
+- **The world's region loop is gone.** Since map_compact, every store --
+  ivars and ocls included -- reclaims by rebuilding in place through its
+  stable handle, so a collection is a plain function (gc_collect, its scratch
+  in its own `region GCC` block) callable from any depth, and the driver is
+  plain recursion. The carry, the cursor tuples and the arena swap all
+  dissolved.
+- **Top-level while chunking shipped on the third attempt**, after classifier
+  v2 -- which reads the GENERATED C's map value types instead of guessing
+  from setter sites -- found 12 missed roots (load_ctx, holding the current
+  require's file and dir as VStr, was the one that broke bundler). w2-shaped
+  loops: 1020 -> ~815 MiB.
+- **In-stack safepoints**: between any two statements of any body, when no
+  eval context above may hold an unrooted in-flight value (gc_unsafe == 0)
+  and the stores have outgrown gc_collect's own thresholds. Method and block
+  bodies count as unsafe -- their callers' half-evaluated expressions are
+  invisible to the mark -- EXCEPT a call that is exactly `name literal...`
+  as a whole statement (the gc_bare baton): literal arguments admit no
+  intervening call to steal the baton, and a bare statement holds nothing
+  else, which is precisely the shape of a require chain under rubygems'
+  Kernel#require replacement.
+- **A region per call, body only.** The 2026-08-20 attempt died on the
+  frame's type; creating the frame OUTSIDE and running only the body inside
+  `region MCALL` passes the typer, and nested calls' machinery now dies with
+  the nearest enclosing call instead of landing in whatever ancestor
+  statement's arena was current.
+
+What rubocop measured after all of it: **still ~88 GB**, and the pool split
+finally names the remaining two beasts precisely. (1) The default region
+holds 12 GB at 75 seconds -- frames, the D-lane, as expected. (2) In the
+final phase ONE block arena's doubling chain explodes from ~2.7 GB live to
+~68 GB (blk_bump +86 GB in the same phase) -- a single held region absorbing
+a giant allocation episode, present before the per-call region and not
+dented by it. Unattributed. The next probe is a require-timeline correlation
+(bench/require_trace.rb) to name the file being loaded when it detonates,
+and the candidate mechanisms to check first are: a giant while inside a
+method whose per-iteration copy-outs cascade into a held arena; a single
+method body whose MCALL arena absorbs a parse; and the collection itself
+running inside region GCC against some store it walks quadratically.
+
 ### The interpreter minted a string id per method call, for backtraces (2026-08-22)
 
 The largest string churn in the interpreter was its own position bookkeeping:

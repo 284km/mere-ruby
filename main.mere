@@ -8187,6 +8187,336 @@ let rec val_join = fn (es: Val -> str) -> fn (xs: Val list) -> fn (sep: str) -> 
 // (shared), so a block reads and mutates the enclosing locals. "No block"
 // is (false, (Nil : str list), (Nil : Stmt list), env) with any env as an unused placeholder. This is
 // the counterpoint to method scope: methods are flat, blocks capture.
+// ---- collection state, global so a safepoint can live at ANY depth ------
+// gc_state: "t" = the entry threshold, "b" = the byte baseline -- both set by
+// gc_collect itself after each collection, read by gc_pressure wherever it is
+// called from. gc_unsafe: a depth counter of eval contexts that may hold
+// UNROOTED in-flight values (method and block bodies -- their callers'
+// half-evaluated expressions are invisible to the mark); a safepoint may
+// collect only at zero. A bare `require` chain (the builtin SRequire path)
+// never passes through run_meth, so a required file's statement boundaries
+// sit at zero -- which is exactly where a gem load needs its collections.
+let gc_state = map_new ();
+let gc_unsafe = map_new ();
+let gc_unsafe_push = fn (u: unit) ->
+  let n = (if map_has gc_unsafe "n" then map_get gc_unsafe "n" else 0) in
+  map_set gc_unsafe "n" (n + 1);
+let gc_unsafe_pop = fn (u: unit) ->
+  let n = (if map_has gc_unsafe "n" then map_get gc_unsafe "n" else 0) in
+  map_set gc_unsafe "n" (if n > 0 then n - 1 else 0);
+// MERE_RUBY_GC_LOG: the env readers live inside the interpreter group,
+// after this block -- so the DRIVER (run_src) reads the variable once and
+// records it in gc_state ("log": 1/0); the collector only looks it up.
+let gc_log_on = fn (u: unit) ->
+  (if map_has gc_state "log" then map_get gc_state "log" else 0) == 1;
+
+let gc_safe_now = fn (u: unit) ->
+  (if map_has gc_unsafe "n" then map_get gc_unsafe "n" else 0) == 0;
+
+// The bare-call baton: a statement that is exactly `name arg...` with every
+// argument a literal or a variable read sets it, and the next run_meth entry
+// consumes it and SKIPS the unsafe count -- soundly, because literal
+// arguments admit no intervening call to steal the baton, and a bare
+// statement holds nothing else in flight. This is what keeps a required
+// file's statement boundaries collectable when rubygems has replaced
+// Kernel#require with a Ruby method: the require chain is bare calls all
+// the way down.
+let gc_bare = map_new ();
+let gc_arg_simple = fn (e: Expr) ->
+  match e with
+  | EStrL _ -> true | EInt _ -> true | EVar _ -> true | ESym _ -> true
+  | EBool _ -> true | ENil -> true | EFlt _ -> true
+  | _ -> false;
+let rec gc_args_simple = fn (es: Expr list) ->
+  match es with
+  | Nil -> true
+  | Cons (e, rest) -> gc_arg_simple e && gc_args_simple rest;
+
+let gc_store_bytes = fn (u: unit) ->
+  vec_bytes str_store + map_bytes arr_store + vec_bytes hash_store;
+
+// Pressure is INCREMENTAL on both axes. Entries: the amortized threshold in
+// the driver. Bytes (mere v0.1.299): growth over the post-collection baseline
+// -- an ABSOLUTE byte floor dies of stub mass (vec ids are positional and
+// never removed), and pinned pressure permanently true at 64 MB in its first
+// version: a collection per iteration, each copying every slot ever issued.
+let gc_pressure = fn world ->
+  let (_, _, ocls, ivars) = world in
+  let limit = (if map_has gc_state "t" then map_get gc_state "t" else 4000) in
+  let bbase = (if map_has gc_state "b" then map_get gc_state "b" else 0) in
+  map_len ivars + map_len ocls > limit
+  || gc_store_bytes () > bbase * 2 + 33554432;
+
+
+// nth suffix of a list -- the driver's cursor walks the top-level statement
+// list this way, so the carry holds an int, never AST.
+let rec gc_suffix = fn (xs: Stmt list) -> fn (n: int) ->
+  if n <= 0 then xs
+  else (match xs with Nil -> Nil | Cons (_, r) -> gc_suffix r (n - 1));
+
+// ---- The collector -------------------------------------------------------
+// Mark every reachable object id, then rebuild ivars / ocls keeping only live
+// entries. The world maps live in a region loop's arena (see run_src), so the
+// REBUILD is what reclaims: the driver passes fresh maps born in the loop's
+// lexical scope, fills them here, and Continue deep-copies them into the next
+// arena -- everything not copied (dead entries, dead map-internal copies, the
+// old maps themselves) is released with the old arena.
+//
+// What is a root: the top-level env, $globals, constants, encoding objects,
+// signal handlers, match data, ARGV, the flow-signal slot -- and, because this
+// slice does not compact them, EVERY entry of arr_store / hash_store /
+// proc_store / bind_store (a proc's captured env included). ivars keys that
+// are not "<id>@..." ("$exc", "cls:Name@x") are always kept. Objects live in
+// ivars only through their owner: a second fixpoint pass marks values of
+// entries whose owner is live, until the live set stops growing.
+let rec gc_mark_val = fn live -> fn (v: Val) ->
+  match v with
+  | VObj id -> let k = "o" ++ str_of_int id in
+               (if map_has live k then () else (let _ = map_set live k VNil in ()))
+  | VStr id -> let k = "s" ++ str_of_int id in
+               (if map_has live k then () else (let _ = map_set live k VNil in ()))
+  | VArr id -> let k = "a" ++ str_of_int id in
+               (if map_has live k then ()
+                else let _ = map_set live k VNil in gc_mark_vals live (deref id))
+  | VHsh id -> let k = "h" ++ str_of_int id in
+               (if map_has live k then ()
+                else let _ = map_set live k VNil in gc_mark_vals live (hderef id))
+  | VProc id -> let k = "p" ++ str_of_int id in
+                (if map_has live k then ()
+                 else let _ = map_set live k VNil in
+                      (if map_has proc_store (str_of_int id)
+                       then (let (_, _, _, penv) = map_get proc_store (str_of_int id) in
+                             map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
+                       else ()))
+  | VBind id -> let k = "b" ++ str_of_int id in
+                (if map_has live k then ()
+                 else let _ = map_set live k VNil in
+                      (if map_has bind_store (str_of_int id)
+                       then map_iter (map_get bind_store (str_of_int id))
+                              (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)
+                       else ()))
+  | VRange (a, b, _) -> let _ = gc_mark_val live a in gc_mark_val live b
+  | VCpx (a, b) -> let _ = gc_mark_val live a in gc_mark_val live b
+  | _ -> ()
+and gc_mark_vals = fn live -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ()
+  | Cons (v, rest) -> let _ = gc_mark_val live v in gc_mark_vals live rest;
+
+// owner id of an ivars key: "123@x" -> "123"; "" when the key has no numeric
+// owner (specials and class ivars -- those entries are kept unconditionally).
+let gc_owner_of = fn (k: str) ->
+  if str_len k == 0 then ""
+  else if is_digit (char_at k 0) then
+    (let i = str_index_of k "@" in
+     if i > 0 then substring k 0 i else "")
+  else "";
+
+// fixpoint: values of entries whose owner is live (or ownerless) are marked;
+// repeat until the live set stops growing.
+let gc_fixpoint = fn ivars -> fn live ->
+  let rec go = fn (guard: int) ->
+    let before = map_len live in
+    let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+      let owner = gc_owner_of k in
+      if str_eq owner "" then gc_mark_val live v
+      else if map_has live ("o" ++ owner) then gc_mark_val live v
+      else ()) in
+    let _ = (if gc_log_on () then print_err ("gc: fixpoint pass live=" ++ str_of_int (map_len live)) else ()) in
+    if map_len live > before && guard > 0 then go (guard - 1) else () in
+  go 1000000;
+
+// the root scan, shared by every collection. EVERY top-level map that holds
+// Val values is a root -- the list was built by classifying all 120 globals
+// by their setter sites, and the first version, which picked ten of them by
+// intuition, collected the current Thread object out from under bundler
+// (Monitor#synchronize then raised ThreadError). The type checker keeps this
+// list honest in one direction: a non-Val map here is a build error. A MISSING
+// map is the direction to fear when adding a new global store.
+let gc_mark_roots = fn env -> fn live ->
+  let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
+  let mkenv = fn (k: str) -> fn (benv) ->
+    map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
+  let _ = map_iter env mk in
+  let _ = map_iter globals mk in
+  let _ = map_iter consts mk in
+  let _ = map_iter enc_objs mk in
+  let _ = map_iter signal_traps mk in
+  let _ = map_iter dm_captured mk in
+  let _ = map_iter dm_closenv mk in
+  let _ = map_iter dm_methods mk in
+  let _ = map_iter flow_sig mk in
+  let _ = map_iter cli_argv mk in
+  let _ = map_iter all_thr mk in
+  let _ = map_iter at_exits mk in
+  let _ = map_iter autoloads mk in
+  let _ = map_iter call_lines mk in
+  let _ = map_iter catch_depth mk in
+  let _ = map_iter cur_pos mk in
+  let _ = map_iter cur_thr mk in
+  let _ = map_iter cvars mk in
+  let _ = map_iter deco_memo mk in
+  let _ = map_iter def_ext_enc mk in
+  let _ = map_iter def_int_enc mk in
+  let _ = map_iter dfl_tg mk in
+  let _ = map_iter end_sites mk in
+  let _ = map_iter env_ovr mk in
+  let _ = map_iter env_cache mk in
+  let _ = map_iter ff_state mk in
+  let _ = map_iter gvar_alias mk in
+  let _ = map_iter gvar_traces mk in
+  let _ = map_iter hash_dflt mk in
+  let _ = map_iter hash_dproc mk in
+  let _ = map_iter hook_flags mk in
+  let _ = map_iter io_cap mk in
+  let _ = map_iter kwarg_marks mk in
+  let _ = map_iter lambda_ids mk in
+  let _ = map_iter le_path mk in
+  let _ = map_iter live_frames mk in
+  let _ = map_iter loaded_files mk in
+  let _ = map_iter modules mk in
+  let _ = map_iter mrsh_dsyms mk in
+  let _ = map_iter mrsh_syms mk in
+  let _ = map_iter parser_flags mk in
+  let _ = map_iter pending_home mk in
+  let _ = map_iter prim_missing mk in
+  let _ = map_iter private_consts mk in
+  let _ = map_iter privates mk in
+  let _ = map_iter proc_arity mk in
+  let _ = map_iter proc_home mk in
+  let _ = map_iter protecteds mk in
+  let _ = map_iter r2k_methods mk in
+  let _ = map_iter raise_bt mk in
+  let _ = map_iter refine_cnt mk in
+  let _ = map_iter resc_ctr mk in
+  let _ = map_iter rx_bad mk in
+  let _ = map_iter rx_gnums mk in
+  let _ = map_iter rx_lenient mk in
+  let _ = map_iter struct_ctr mk in
+  let _ = map_iter struct_mem mk in
+  let _ = map_iter tcp_buf mk in
+  let _ = map_iter thread_flag mk in
+  let _ = map_iter tmp_ctr mk in
+  let _ = map_iter trace_fn mk in
+  let _ = map_iter undefs mk in
+  let _ = map_iter warn_cats mk in
+  let _ = map_iter rx_once mk in
+  // The second sweep of missed roots -- found by classifier v2, which reads
+  // the GENERATED C's map value types instead of guessing from setter sites
+  // (v1 read literal-constructor setters only and missed variable-argument
+  // ones). load_ctx is the one that bit: it holds the current require's file
+  // and directory as VStr, a collection at a new moment blanked those
+  // strings, and bundler's Gemfile resolution died three calls later.
+  let _ = map_iter load_ctx mk in
+  let _ = map_iter anon_name mk in
+  let _ = map_iter cli_inc mk in
+  let _ = map_iter dm_had_blk mk in
+  let _ = map_iter ref_active mk in
+  let _ = map_iter refine_cls mk in
+  let _ = map_iter refine_tgt mk in
+  let _ = map_iter rx_cur mk in
+  let _ = map_iter rx_gbodies mk in
+  let _ = map_iter rx_pending mk in
+  let _ = map_iter rx_prog_names mk in
+  let _ = map_iter gc_cenv0 mk in
+  // arr_store and hash_store are NOT roots since the collector took them on:
+  // a reachable array or hash is marked through the VArr / VHsh arms, and an
+  // unreachable one is exactly what gets dropped and compacted away.
+  let _ = map_iter proc_store (fn (k: str) -> fn pe ->
+    let (_, _, _, penv) = pe in
+    map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
+  // blk tuples captured for yield: their env member holds Vals
+  let _ = map_iter proc_yblk (fn (k: str) -> fn b ->
+    let (_, _, _, benv) = b in
+    map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
+  let _ = map_iter bind_store mkenv in
+  // the scope-chain parents: env maps linked by id, each holding Vals
+  let _ = map_iter lv_up mkenv in
+  ();
+
+// THE COLLECTION, as a plain function. Everything it needs reaches it
+// through stable handles: the world maps are rebuilt IN PLACE (survivors
+// out, map_clear, survivors back, map_compact -- their handles never move,
+// mere v0.1.297/298), the value stores compact their own arenas, and the
+// scratch maps live in this function's own `region GCC` block and die with
+// it. Because nothing swaps, this is callable from ANY stack depth whose
+// in-flight values are rooted -- which is what a safepoint inside a require
+// chain needs (the driver's between-statement safepoints are the trivially
+// safe case).
+let gc_collect = fn env -> fn world ->
+  region GCC {
+    let (meths, sup, ocls, ivars) = world in
+    let gclog = gc_log_on () in
+    let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)) else ()) in
+    let live = map_new () in
+    let _ = gc_mark_roots env live in
+    let _ = gc_fixpoint ivars live in
+    // ivars / ocls: same clear-and-reset as every other store now (the region
+    // loop that used to carry them is gone -- compaction made it redundant).
+    let ivsave = map_new () in
+    let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+      let owner = gc_owner_of k in
+      if str_eq owner "" then (let _ = map_set ivsave k v in ())
+      else if map_has live ("o" ++ owner) then (let _ = map_set ivsave k v in ())
+      else ()) in
+    let _ = map_clear ivars in
+    let _ = map_iter ivsave (fn (k: str) -> fn (v: Val) -> map_set ivars k v) in
+    let _ = map_compact ivars in
+    let ocsave = map_new () in
+    let _ = map_iter ocls (fn (k: str) -> fn (v: str) ->
+      if str_len k > 0 && is_digit (char_at k 0)
+      then (if map_has live ("o" ++ k) then (let _ = map_set ocsave k v in ()) else ())
+      else (let _ = map_set ocsave k v in ())) in
+    let _ = map_clear ocls in
+    let _ = map_iter ocsave (fn (k: str) -> fn (v: str) -> map_set ocls k v) in
+    let _ = map_compact ocls in
+    let liveAK = map_new () in
+    let _ = map_iter arr_store (fn (k: str) -> fn (xs: Val list) ->
+      if map_has live ("a" ++ k) then (let _ = map_set liveAK k xs in ()) else ()) in
+    let _ = map_clear arr_store in
+    let _ = map_iter liveAK (fn (k: str) -> fn (xs: Val list) -> map_set arr_store k xs) in
+    let _ = map_compact arr_store in
+    let rec blank_h = fn (i: int) ->
+      if i >= vec_len hash_store then ()
+      else
+        let _ = (if map_has live ("h" ++ str_of_int i) then ()
+                 else (match hderef i with
+                       | Nil -> ()
+                       | _ -> (let _ = hset i (Nil : Val list) in ()))) in
+        blank_h (i + 1) in
+    let _ = blank_h 0 in
+    let _ = vec_compact hash_store in
+    let rec blank_s = fn (i: int) ->
+      if i >= vec_len str_store then ()
+      else
+        let _ = (if map_has live ("s" ++ str_of_int i) then ()
+                 else (if str_eq (sget i) "" then () else sset i "")) in
+        blank_s (i + 1) in
+    let _ = blank_s 0 in
+    let _ = vec_compact str_store in
+    let liveE = map_new () in
+    let _ = map_iter str_enc (fn (k: str) -> fn (v: str) ->
+      if map_has live ("s" ++ k) then (let _ = map_set liveE k v in ()) else ()) in
+    let _ = map_clear str_enc in
+    let _ = map_iter liveE (fn (k: str) -> fn (v: str) -> map_set str_enc k v) in
+    let _ = map_compact str_enc in
+    let liveF = map_new () in
+    let _ = map_iter str_frozen (fn (k: str) -> fn (v: str) ->
+      if map_has live ("s" ++ k) then (let _ = map_set liveF k v in ()) else ()) in
+    let _ = map_clear str_frozen in
+    let _ = map_iter liveF (fn (k: str) -> fn (v: str) -> map_set str_frozen k v) in
+    let _ = map_compact str_frozen in
+    let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len ivars)) else ()) in
+    // the next thresholds, set HERE so any caller at any depth inherits the
+    // same amortization: entries = live + max(scan/2, 4000); bytes = the
+    // post-collection baseline (gc_pressure fires at 2x it plus 32 MB).
+    let scan = map_len arr_store + vec_len hash_store + vec_len str_store in
+    let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
+    let _ = map_set gc_state "t" (map_len ivars + map_len ocls + delta) in
+    let _ = map_set gc_state "b" (gc_store_bytes ()) in
+    ()
+  };
+
 let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   match e with
   | ESplat inner -> eval_e env world blk inner   // bare splat: evaluate inner
@@ -10395,7 +10725,11 @@ and is_for_params = fn (ps: str list) ->
 // for the iterator; return keeps unwinding to the enclosing method; redo
 // reruns the block body.
 and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
+  // A block body runs inside its ITERATOR's evaluation: unrooted values are
+  // in flight above it, so its statement boundaries are not safepoints.
+  let _ = gc_unsafe_push () in
   let f = try_or (fn (u: unit) -> run_stmts cenv world encl body) (FRaise VNil) in
+  let _ = gc_unsafe_pop () in
   match f with
   | FReturn v ->
     // a return from a block/proc returns from the frame that DEFINED it (a
@@ -19485,6 +19819,14 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
      raise_exc world "SystemStackError" "stack level too deep" in FRaise VNil)
   else
   let _ = map_set struct_ctr "cd" (VInt (cd + 1)) in
+  // A method body may run with UNROOTED values in flight above it (the
+  // caller's half-evaluated expression); a safepoint may not collect while
+  // any such context is on the stack. Two exceptions stay collectable:
+  // bare SRequire chains (never come through here) and bare literal-arg
+  // calls carrying the gc_bare baton (rubygems' Kernel#require, and every
+  // `require "x"` under it).
+  let gcbare = map_has gc_bare "y" in
+  let _ = (if gcbare then map_delete gc_bare "y" else gc_unsafe_push ()) in
   let _ = map_set call_names_s (str_of_int cd)
             ((match (if map_has frame "__defcls" then map_get frame "__defcls" else VNil) with
               | VClass c -> c ++ "#"
@@ -19509,10 +19851,22 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // this method, even when the call happens inside a Thread.new block.
   let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
   let _ = map_set thread_flag "n" (VBool false) in
-  let f = try_or (fn (u: unit) -> run_stmts frame world blk body) (FRaise VNil) in
+  // A REGION PER CALL, body only. The 2026-08-20 attempt wrapped the whole
+  // call and died on the frame's type (a container born in a block binds to
+  // the block, and a frame captured by define_method must outlive it). The
+  // frame is created OUTSIDE and only the body runs inside: locals write
+  // into the frame by copy-on-store (its region, not this one), ivars into
+  // the world stores, and the Flow result is copied out -- while the call
+  // MACHINERY of every nested call (argument lists, dispatch strings), which
+  // used to land in whatever ancestor statement's region was current and be
+  // HELD for that statement's whole extent (13 GB live and climbing at 75
+  // seconds into a rubocop load, the require chain's arenas), now dies when
+  // the nearest enclosing call returns.
+  let f = try_or (fn (u: unit) -> region MCALL { run_stmts frame world blk body }) (FRaise VNil) in
   // restore depth: runs whether the body returned normally, re-raised, or
   // emitted a flow signal (try_or has already caught any fail by this point).
   let _ = map_set struct_ctr "cd" (VInt cd) in
+  let _ = (if gcbare then () else gc_unsafe_pop ()) in
   // ... and with it the caller's line and file, for the same reason
   let _ = map_set cur_pos "l" (VInt (match map_get call_lines (str_of_int cd) with VInt n -> n | _ -> 0)) in
   let _ = map_set cur_pos_s "f" (if map_has call_files_s (str_of_int cd) then map_get call_files_s (str_of_int cd) else "") in
@@ -25078,7 +25432,44 @@ and add_attrs = fn world -> fn (cls: str) -> fn (mode: str) -> fn (syms: str lis
 // (in appearance order), then the remaining statements, then every END body.
 // Nested BEGIN/END (inside a block/method) is left in `run_mid` and reaches
 // exec_stmt, where BEGIN raises the required SyntaxError.
-and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (limit: int) -> fn (lastv: Val) ->
+// A TOP-LEVEL while runs its iterations under the collector's eye: the
+// driver's safepoint is between statements, and a program that is one big
+// `while` never reaches it. Iterations keep their own region (run_while's
+// discipline); between iterations -- where nothing of any arena is held --
+// the store pressure is checked, and the driver collects and RE-ENTERS the
+// same while statement: the condition re-evaluates against the same env, so
+// pausing between iterations is invisible to the program. Answers: 0 =
+// pressure (collect, re-enter), 1 = loop finished, 2 = a non-FNext flow
+// ended the program.
+//
+// Shipped on the THIRD attempt. The first stormed (the per-call VStr churn,
+// killed at its source); the second broke bundler (a collection at a new
+// moment blanked load_ctx's strings -- a missed root, found by reading the
+// generated C's map value types instead of guessing from setter sites). The
+// CONDITION evaluates inside the iteration's region (outside it, every
+// iteration's condition temporaries landed in the driver's loop arena, which
+// only swaps at a collection: 12 GB held on a 10M-iteration loop), and the
+// budget forces a safepoint every 100k iterations even without pressure, for
+// the same reason: the safepoint is what swaps that arena.
+and run_while_top = fn env -> fn world -> fn blk -> fn (cond: Expr) -> fn (body: Stmt list) -> fn (budget: int) ->
+  (match region ITER {
+     if truthy (eval_e env world blk cond) then
+       let _ = tick () in
+       (match while_body_flow env world blk body with
+        | FReturn v -> FReturn v
+        | FRaise v -> FRaise v
+        | FBreak _ -> FBreak VNil
+        | _ -> FNext VNil)
+     else FBreak VNil
+   } with
+   | FReturn _ -> 2
+   | FRaise _ -> 2
+   | FBreak _ -> 1
+   | _ ->
+     if budget <= 0 || gc_pressure world then 0
+     else run_while_top env world blk cond body (budget - 1))
+
+and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (lastv: Val) ->
   // The chunk runner behind the collector's driver (run_src): top-level
   // statements, each under its own region STMT exactly as run_stmts does,
   // until the object stores grow past `limit`. Returns (consumed, flag, last):
@@ -25087,12 +25478,21 @@ and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (li
   // unwinds to the driver's try_or, whose default is flag 3.
   match rem with
   | Nil -> (0, 1, lastv)
+  // A top-level while is the one statement whose INSIDE the collector can
+  // see (run_while_top). 0 consumed on pressure = the driver re-enters this
+  // same statement after collecting.
+  | Cons (SWhile (c, b), rest) ->
+    (match run_while_top env world blk c b 100000 with
+     | 0 -> (0, 0, lastv)
+     | 1 ->
+       (if gc_pressure world then (1, 0, VNil)
+        else let (cn, f, lv) = run_until_gc env world blk rest VNil in (cn + 1, f, lv))
+     | _ -> (0, 2, lastv))
   | Cons (s, rest) ->
     (match region STMT { exec_stmt env world blk s } with
      | FNext v ->
-       let (_, _, ocls, ivars) = world in
-       (if map_len ivars + map_len ocls > limit then (1, 0, v)
-        else let (c, f, lv) = run_until_gc env world blk rest limit v in (c + 1, f, lv))
+       (if gc_pressure world then (1, 0, v)
+        else let (c, f, lv) = run_until_gc env world blk rest v in (c + 1, f, lv))
      | _ -> (0, 2, lastv))
 
 and hoist_run = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
@@ -25153,7 +25553,19 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
         | FRaise v -> FRaise v
         | FBreak v -> FBreak v
         | FLoopNext v -> FLoopNext v
-        | FNext _ -> run_stmts env world blk rest))
+        | FNext _ ->
+          // THE IN-STACK SAFEPOINT. Between two statements of ANY body, when
+          // no eval context above may hold an unrooted value (gc_unsafe == 0
+          // -- true exactly for chains of top-level statements and builtin
+          // SRequire loads, the shape of a gem load under MERE_RUBY_NO_GEMS)
+          // and the stores have outgrown the thresholds gc_collect maintains,
+          // collect right here. This is what a one-statement `require` of a
+          // 250-file tree needs: without it the driver's between-statement
+          // safepoint never gets a turn and the whole load runs uncollected
+          // (measured at 88 GB on rubocop).
+          let _ = (if gc_safe_now () && gc_pressure world
+                   then (let _ = gc_collect env world in ()) else ()) in
+          run_stmts env world blk rest))
 
 // The loader behind `require` / `require_relative`: resolve the path, run the
 // file once, and record it. Reached through Kernel#require (see SRequire), so
@@ -25299,7 +25711,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     else
     let _ = (match es with Nil -> out_print "" | _ -> puts_args env world blk es) in
     FNext VNil
-  | SExpr e -> FNext (eval_e env world blk e)
+  | SExpr e ->
+    let barecall = (match e with
+                    | ECall (_, cargs) -> gc_args_simple cargs
+                    | _ -> false) in
+    let _ = (if barecall then map_set gc_bare "y" 0 else ()) in
+    let v = eval_e env world blk e in
+    let _ = (if map_has gc_bare "y" then map_delete gc_bare "y" else ()) in
+    FNext v
   | SAssign (name, e) ->
     // `A::C = v` where A is not a class/module is a TypeError.
     let _ = (if str_contains name "::" then
@@ -28700,188 +29119,6 @@ let store_stats = fn world ->
   let _ = row "loaded_files" (map_len loaded_files) in
   row "insp_seen" (map_len insp_seen);
 
-// nth suffix of a list -- the driver's cursor walks the top-level statement
-// list this way, so the carry holds an int, never AST.
-let rec gc_suffix = fn (xs: Stmt list) -> fn (n: int) ->
-  if n <= 0 then xs
-  else (match xs with Nil -> Nil | Cons (_, r) -> gc_suffix r (n - 1));
-
-// ---- The collector -------------------------------------------------------
-// Mark every reachable object id, then rebuild ivars / ocls keeping only live
-// entries. The world maps live in a region loop's arena (see run_src), so the
-// REBUILD is what reclaims: the driver passes fresh maps born in the loop's
-// lexical scope, fills them here, and Continue deep-copies them into the next
-// arena -- everything not copied (dead entries, dead map-internal copies, the
-// old maps themselves) is released with the old arena.
-//
-// What is a root: the top-level env, $globals, constants, encoding objects,
-// signal handlers, match data, ARGV, the flow-signal slot -- and, because this
-// slice does not compact them, EVERY entry of arr_store / hash_store /
-// proc_store / bind_store (a proc's captured env included). ivars keys that
-// are not "<id>@..." ("$exc", "cls:Name@x") are always kept. Objects live in
-// ivars only through their owner: a second fixpoint pass marks values of
-// entries whose owner is live, until the live set stops growing.
-let rec gc_mark_val = fn live -> fn (v: Val) ->
-  match v with
-  | VObj id -> let k = "o" ++ str_of_int id in
-               (if map_has live k then () else (let _ = map_set live k VNil in ()))
-  | VStr id -> let k = "s" ++ str_of_int id in
-               (if map_has live k then () else (let _ = map_set live k VNil in ()))
-  | VArr id -> let k = "a" ++ str_of_int id in
-               (if map_has live k then ()
-                else let _ = map_set live k VNil in gc_mark_vals live (deref id))
-  | VHsh id -> let k = "h" ++ str_of_int id in
-               (if map_has live k then ()
-                else let _ = map_set live k VNil in gc_mark_vals live (hderef id))
-  | VProc id -> let k = "p" ++ str_of_int id in
-                (if map_has live k then ()
-                 else let _ = map_set live k VNil in
-                      (if map_has proc_store (str_of_int id)
-                       then (let (_, _, _, penv) = map_get proc_store (str_of_int id) in
-                             map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
-                       else ()))
-  | VBind id -> let k = "b" ++ str_of_int id in
-                (if map_has live k then ()
-                 else let _ = map_set live k VNil in
-                      (if map_has bind_store (str_of_int id)
-                       then map_iter (map_get bind_store (str_of_int id))
-                              (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)
-                       else ()))
-  | VRange (a, b, _) -> let _ = gc_mark_val live a in gc_mark_val live b
-  | VCpx (a, b) -> let _ = gc_mark_val live a in gc_mark_val live b
-  | _ -> ()
-and gc_mark_vals = fn live -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> ()
-  | Cons (v, rest) -> let _ = gc_mark_val live v in gc_mark_vals live rest;
-
-// owner id of an ivars key: "123@x" -> "123"; "" when the key has no numeric
-// owner (specials and class ivars -- those entries are kept unconditionally).
-let gc_owner_of = fn (k: str) ->
-  if str_len k == 0 then ""
-  else if is_digit (char_at k 0) then
-    (let i = str_index_of k "@" in
-     if i > 0 then substring k 0 i else "")
-  else "";
-
-// fixpoint: values of entries whose owner is live (or ownerless) are marked;
-// repeat until the live set stops growing.
-let gc_fixpoint = fn ivars -> fn live ->
-  let rec go = fn (guard: int) ->
-    let before = map_len live in
-    let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-      let owner = gc_owner_of k in
-      if str_eq owner "" then gc_mark_val live v
-      else if map_has live ("o" ++ owner) then gc_mark_val live v
-      else ()) in
-    let _ = (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then ()
-             else print_err ("gc: fixpoint pass live=" ++ str_of_int (map_len live))) in
-    if map_len live > before && guard > 0 then go (guard - 1) else () in
-  go 1000000;
-
-// rebuild: fill iv2 / oc2 (born in the loop's arena) with the live entries.
-let gc_rebuild = fn ivars -> fn ocls -> fn live -> fn iv2 -> fn oc2 ->
-  let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-    let owner = gc_owner_of k in
-    if str_eq owner "" then map_set iv2 k v
-    else if map_has live ("o" ++ owner) then map_set iv2 k v
-    else ()) in
-  let _ = map_iter ocls (fn (k: str) -> fn (v: str) ->
-    if str_len k > 0 && is_digit (char_at k 0)
-    then (if map_has live ("o" ++ k) then (let _ = map_set oc2 k v in ()) else ())
-    else (let _ = map_set oc2 k v in ())) in    // "$next" and any non-id key
-  ();
-
-// the root scan, shared by every collection. EVERY top-level map that holds
-// Val values is a root -- the list was built by classifying all 120 globals
-// by their setter sites, and the first version, which picked ten of them by
-// intuition, collected the current Thread object out from under bundler
-// (Monitor#synchronize then raised ThreadError). The type checker keeps this
-// list honest in one direction: a non-Val map here is a build error. A MISSING
-// map is the direction to fear when adding a new global store.
-let gc_mark_roots = fn env -> fn live ->
-  let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
-  let mkenv = fn (k: str) -> fn (benv) ->
-    map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
-  let _ = map_iter env mk in
-  let _ = map_iter globals mk in
-  let _ = map_iter consts mk in
-  let _ = map_iter enc_objs mk in
-  let _ = map_iter signal_traps mk in
-  let _ = map_iter dm_captured mk in
-  let _ = map_iter dm_closenv mk in
-  let _ = map_iter dm_methods mk in
-  let _ = map_iter flow_sig mk in
-  let _ = map_iter cli_argv mk in
-  let _ = map_iter all_thr mk in
-  let _ = map_iter at_exits mk in
-  let _ = map_iter autoloads mk in
-  let _ = map_iter call_lines mk in
-  let _ = map_iter catch_depth mk in
-  let _ = map_iter cur_pos mk in
-  let _ = map_iter cur_thr mk in
-  let _ = map_iter cvars mk in
-  let _ = map_iter deco_memo mk in
-  let _ = map_iter def_ext_enc mk in
-  let _ = map_iter def_int_enc mk in
-  let _ = map_iter dfl_tg mk in
-  let _ = map_iter end_sites mk in
-  let _ = map_iter env_ovr mk in
-  let _ = map_iter env_cache mk in
-  let _ = map_iter ff_state mk in
-  let _ = map_iter gvar_alias mk in
-  let _ = map_iter gvar_traces mk in
-  let _ = map_iter hash_dflt mk in
-  let _ = map_iter hash_dproc mk in
-  let _ = map_iter hook_flags mk in
-  let _ = map_iter io_cap mk in
-  let _ = map_iter kwarg_marks mk in
-  let _ = map_iter lambda_ids mk in
-  let _ = map_iter le_path mk in
-  let _ = map_iter live_frames mk in
-  let _ = map_iter loaded_files mk in
-  let _ = map_iter modules mk in
-  let _ = map_iter mrsh_dsyms mk in
-  let _ = map_iter mrsh_syms mk in
-  let _ = map_iter parser_flags mk in
-  let _ = map_iter pending_home mk in
-  let _ = map_iter prim_missing mk in
-  let _ = map_iter private_consts mk in
-  let _ = map_iter privates mk in
-  let _ = map_iter proc_arity mk in
-  let _ = map_iter proc_home mk in
-  let _ = map_iter protecteds mk in
-  let _ = map_iter r2k_methods mk in
-  let _ = map_iter raise_bt mk in
-  let _ = map_iter refine_cnt mk in
-  let _ = map_iter resc_ctr mk in
-  let _ = map_iter rx_bad mk in
-  let _ = map_iter rx_gnums mk in
-  let _ = map_iter rx_lenient mk in
-  let _ = map_iter struct_ctr mk in
-  let _ = map_iter struct_mem mk in
-  let _ = map_iter tcp_buf mk in
-  let _ = map_iter thread_flag mk in
-  let _ = map_iter tmp_ctr mk in
-  let _ = map_iter trace_fn mk in
-  let _ = map_iter undefs mk in
-  let _ = map_iter warn_cats mk in
-  let _ = map_iter rx_once mk in
-  // arr_store and hash_store are NOT roots since the collector took them on:
-  // a reachable array or hash is marked through the VArr / VHsh arms, and an
-  // unreachable one is exactly what gets dropped and compacted away.
-  let _ = map_iter proc_store (fn (k: str) -> fn pe ->
-    let (_, _, _, penv) = pe in
-    map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
-  // blk tuples captured for yield: their env member holds Vals
-  let _ = map_iter proc_yblk (fn (k: str) -> fn b ->
-    let (_, _, _, benv) = b in
-    map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
-  let _ = map_iter bind_store mkenv in
-  // the scope-chain parents: env maps linked by id, each holding Vals
-  let _ = map_iter lv_up mkenv in
-  ();
-
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set load_ctx "dir" (mkstr (dirname_of name)) in
   let _ = map_set load_ctx "file" (mkstr name) in
@@ -28897,7 +29134,6 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
      | Cons (TEOF, _) -> ()
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in fail ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in
   let env = map_new () in
-  let ranok = map_new () in
   // The program's middle (non-BEGIN/END) statements, computed once, OUTSIDE
   // the loop: the carried cursor is an INDEX into this default-region list,
   // so no AST ever crosses arenas.
@@ -28907,163 +29143,13 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // inside the loop would be typed GCW and the typer refuses to store it into
   // bind_store -- correctly, it would die with the arena).
   let __tenv0 = map_new () in
-  // THE WORLD LIVES IN A REGION LOOP'S ARENA. The four world maps (and only
-  // they) are created inside `region GCW loop`, so their region is the loop's
-  // current arena and a future Continue can compact them: copy the live
-  // entries into the next arena and release this one, dead entries and dead
-  // map-internal copies staying behind. This first slice runs the whole
-  // program in ONE iteration (Done at the end; Continue untaken) -- it proves
-  // the world can live there at all: the interpreter group's map types
-  // generalize over the region slot and instantiate at GCW here, which was
-  // measured on a small probe before this restructure trusted it at 29k lines.
-  // env stays OUTSIDE the loop: frame envs share its type everywhere, and a
-  // frame captured by a proc must outlive any single arena (lane (2) of the
-  // reclamation notes).
-  region GCW loop __gcw {
-  match __gcw with
-  | Some st ->
-    // ---- the collector's driver ----
-    // carry = (world, cursor, kind, lastv, threshold):
-    //   cursor < gc_total   -> statements remain; run a chunk
-    //   cursor = gc_total   -> finished normally (print lastv if asked)
-    //   cursor = gc_total+1 -> a non-FNext flow ended the program (no print)
-    //   cursor = gc_total+2 -> a raise ended it ($exc is in ivars)
-    let (world, cursor, lastv, thresh) = st in
-    let (meths, sup, ocls, ivars) = world in
-    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-    if cursor < gc_total then
-      let r3 = try_or (fn (u: unit) ->
-                 run_until_gc env world noblk (gc_suffix gc_mids cursor) thresh lastv)
-               ((0, 3, VNil)) in
-      let (consumed, flag, v2) = r3 in
-      (if flag == 0 then
-        // limit hit at a safepoint: nothing of the arena is held above us.
-        // Mark from the roots, rebuild into maps born HERE (this lexical
-        // scope is the loop's, so they are arena maps), and swap.
-        (let gclog = (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then false else true) in
-         let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)) else ()) in
-         let live = map_new () in
-         let _ = gc_mark_roots env live in
-         let _ = (if gclog then print_err ("gc: roots done live=" ++ str_of_int (map_len live)) else ()) in
-         let _ = gc_fixpoint ivars live in
-         let iv2 = map_new () in
-         let oc2 = map_new () in
-         let _ = gc_rebuild ivars ocls live iv2 oc2 in
-         // Strings, arrays and hashes (v0.1.297 map_compact / vec_compact):
-         // these stores stay GLOBAL -- threading them through their access
-         // paths costs the transitive closure of 518 functions, measured --
-         // and instead each store drops its dead entries and swaps its own
-         // private arena generation. Vec ids are positional, so a dead slot
-         // is BLANKED (the id stays valid-and-empty forever; ~17 bytes of
-         // stub against the string it used to hold); map ids are counter-
-         // allocated, so dead entries are deleted outright.
-         // Mass deletion goes clear-and-reset, never key-by-key: map_delete
-         // rebuilds the hash index into the map's region PER CALL, and the
-         // first version of this block watched arr_store's fresh private
-         // arena double to 68 GB from exactly that (mere v0.1.298 has the
-         // full story). The survivor lists live in the loop's arena and die
-         // at the swap.
-         let liveAK = map_new () in
-         let _ = map_iter arr_store (fn (k: str) -> fn (xs: Val list) ->
-           if map_has live ("a" ++ k) then (let _ = map_set liveAK k xs in ()) else ()) in
-         let _ = map_clear arr_store in
-         let _ = map_iter liveAK (fn (k: str) -> fn (xs: Val list) -> map_set arr_store k xs) in
-         let _ = map_compact arr_store in
-         // blank ONCE: a slot blanked by an earlier collection is not live and
-         // must not be re-blanked -- each re-blank would allocate a fresh ""
-         // copy in the store's arena, and with ids monotonic the re-blank set
-         // only grows. (First version re-blanked every dead slot every
-         // collection: 100+ collections x ~1M slots of allocation.)
-         let rec blank_h = fn (i: int) ->
-           if i >= vec_len hash_store then ()
-           else
-             let _ = (if map_has live ("h" ++ str_of_int i) then ()
-                      else (match hderef i with
-                            | Nil -> ()
-                            | _ -> (let _ = hset i (Nil : Val list) in ()))) in
-             blank_h (i + 1) in
-         let _ = blank_h 0 in
-         let _ = vec_compact hash_store in
-         let rec blank_s = fn (i: int) ->
-           if i >= vec_len str_store then ()
-           else
-             let _ = (if map_has live ("s" ++ str_of_int i) then ()
-                      else (if str_eq (sget i) "" then () else sset i "")) in
-             blank_s (i + 1) in
-         let _ = blank_s 0 in
-         let _ = vec_compact str_store in
-         // side tables keyed by string id: without this they pin nothing (the
-         // string is blanked either way) but they grow forever; and str_enc
-         // was measured at 200k entries on a string-heavy run.
-         let liveE = map_new () in
-         let _ = map_iter str_enc (fn (k: str) -> fn (v: str) ->
-           if map_has live ("s" ++ k) then (let _ = map_set liveE k v in ()) else ()) in
-         let _ = map_clear str_enc in
-         let _ = map_iter liveE (fn (k: str) -> fn (v: str) -> map_set str_enc k v) in
-         let _ = map_compact str_enc in
-         let liveF = map_new () in
-         let _ = map_iter str_frozen (fn (k: str) -> fn (v: str) ->
-           if map_has live ("s" ++ k) then (let _ = map_set liveF k v in ()) else ()) in
-         let _ = map_clear str_frozen in
-         let _ = map_iter liveF (fn (k: str) -> fn (v: str) -> map_set str_frozen k v) in
-         let _ = map_compact str_frozen in
-         let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len iv2)) else ()) in
-         // the next threshold charges each collection's COST against the
-         // garbage that accumulates before the next one. A collection scans
-         // arr_store / hash_store whole (this slice does not compact them), so
-         // triggering on ivars growth alone went quadratic (450 collections
-         // over an 800k-entry arr_store, +28% wall time), while triggering on
-         // the full scan size collected twice and reclaimed almost nothing.
-         // Amortized in both directions: live size plus HALF the scan size,
-         // floored -- each collection's scan is then paid for by at least
-         // that much new garbage, and reclaim still happens several times a
-         // run. Measured on 200k dead objects: 1012 -> 876 MiB, and FASTER
-         // (2.43s vs 2.56s): less allocation is less page faulting, again.
-         // the scan now includes the vec stores: their ids are positional and
-         // never removed, so a collection walks every slot EVER created --
-         // charging the trigger with that walk is what keeps the total
-         // collection cost proportional to total allocation. (Without it the
-         // deletion of arr_store entries shrank the old scan term to its
-         // floor, collections fired every ~4000 entries, and a 200k-object
-         // run spent 83 seconds walking a million string slots 100 times.)
-         let scan = map_len arr_store + vec_len hash_store + vec_len str_store in
-         let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
-         let t2 = map_len iv2 + map_len oc2 + delta in
-         Continue ((meths, sup, oc2, iv2), cursor + consumed, v2, t2))
-      else if flag == 1 then Continue (world, gc_total, v2, thresh)
-      else if flag == 2 then Continue (world, gc_total + 1, lastv, thresh)
-      else Continue (world, gc_total + 2, lastv, thresh))
-    else
-      // ---- finish: reporting, at_exit, optional print ----
-      let _ = (if str_eq (env_get "MERE_RUBY_STORE_STATS") "" then () else store_stats world) in
-      let _ = if cursor <= gc_total + 1 then run_at_exits world else
-        (let exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
-         match exc with
-         | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in let _ = run_at_exits world in exit 1
-         | VObj eid ->
-           (let ec = map_get ocls (str_of_int eid) in
-            let em = (if map_has ivars (str_of_int eid ++ "@message")
-                      then (match map_get ivars (str_of_int eid ++ "@message") with VStr h -> sget h | other -> to_s other)
-                      else ec) in
-            let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in
-            let _ = run_at_exits world in exit 1)
-         | _ ->
-           (let m = (if map_has prim_missing "i"
-                     then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: failed")
-                     else "mere-ruby: failed") in
-            let _ = print_err (if str_eq (err_where name) name then m else err_where name ++ ": " ++ m) in exit 1)) in
-      let _ =
-        (if print_result && cursor == gc_total then
-          (match lastv with
-           | VObj id ->
-             let cls = map_get ocls (str_of_int id) in
-             if has_meth world cls "to_s" then
-               (match invoke world noblk (VObj id) cls "to_s" Nil with VStr s -> let s = sget s in print_no_nl s | other -> print_no_nl (to_s other))
-             else print_no_nl (to_s (VObj id))
-           | v -> print_no_nl (to_s v))
-        else ()) in
-      Done ()
-  | None ->
+  // THE WORLD is four maps created here and threaded as `world` -- and since
+  // mere v0.1.297 every store (these four included) reclaims by rebuilding IN
+  // PLACE through its stable handle (survivors out, map_clear, survivors
+  // back, map_compact). The region loop that used to carry them across
+  // arenas is gone: compaction made the swap redundant, and a collection is
+  // a plain function (gc_collect) callable from any depth whose in-flight
+  // values are rooted.
   let meths = map_new () in
   let sup = map_new () in
   let ocls = map_new () in
@@ -29498,10 +29584,62 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
               && (if str_eq (load_path_find world "rubygems.rb") "" then false else true)
            then (let _ = try_or (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> ())) () in ())
            else ()) in
+  let _ = map_set gc_state "log" (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then 0 else 1) in
   let _ = run_pre env world noblk prog in
-  let _ = map_set ranok "y" (VBool true) in
-  Continue (world, 0, VNil, 4000)
-  };
+  // The driver: plain recursion, no carry -- the collection is a function
+  // now (gc_collect) and every store rebuilds in place through stable
+  // handles, so nothing needs an arena swap. Each chunk runs inside its own
+  // region DRV block: the per-iteration flow copies and driver temporaries
+  // that used to land in the carried loop's arena die at the chunk boundary
+  // instead.
+  let rec gc_drive = fn (cursor: int) -> fn (lastv: Val) ->
+    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    // the stack is trivially clean here; a raise anywhere below may have
+    // skipped gc_unsafe pops, so the counter self-heals at each chunk.
+    let _ = map_set gc_unsafe "n" 0 in
+    if cursor < gc_total then
+      let r3 = try_or (fn (u: unit) ->
+                 region DRV {
+                   run_until_gc env world noblk (gc_suffix gc_mids cursor) lastv
+                 })
+               ((0, 3, VNil)) in
+      let (consumed, flag, v2) = r3 in
+      (if flag == 0 then
+        (let _ = gc_collect env world in
+         gc_drive (cursor + consumed) v2)
+      else if flag == 1 then gc_drive gc_total v2
+      else if flag == 2 then gc_drive (gc_total + 1) lastv
+      else gc_drive (gc_total + 2) lastv)
+    else
+      // ---- finish: reporting, at_exit, optional print ----
+      let (meths, sup, ocls, ivars) = world in
+      let _ = (if str_eq (env_get "MERE_RUBY_STORE_STATS") "" then () else store_stats world) in
+      let _ = if cursor <= gc_total + 1 then run_at_exits world else
+        (let exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
+         match exc with
+         | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in let _ = run_at_exits world in exit 1
+         | VObj eid ->
+           (let ec = map_get ocls (str_of_int eid) in
+            let em = (if map_has ivars (str_of_int eid ++ "@message")
+                      then (match map_get ivars (str_of_int eid ++ "@message") with VStr h -> sget h | other -> to_s other)
+                      else ec) in
+            let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in
+            let _ = run_at_exits world in exit 1)
+         | _ ->
+           (let m = (if map_has prim_missing "i"
+                     then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: failed")
+                     else "mere-ruby: failed") in
+            let _ = print_err (if str_eq (err_where name) name then m else err_where name ++ ": " ++ m) in exit 1)) in
+      (if print_result && cursor == gc_total then
+        (match lastv with
+         | VObj id ->
+           let cls = map_get ocls (str_of_int id) in
+           if has_meth world cls "to_s" then
+             (match invoke world noblk (VObj id) cls "to_s" Nil with VStr sh -> let s2 = sget sh in print_no_nl s2 | other -> print_no_nl (to_s other))
+           else print_no_nl (to_s (VObj id))
+         | v -> print_no_nl (to_s v))
+      else ()) in
+  gc_drive 0 VNil;
 
 
 let run_prog = fn (path: str) -> fn (print_result: bool) ->
