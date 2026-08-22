@@ -595,6 +595,50 @@ pass=1570 fail=12 err=58 (one better than the record; the canary pair fell on
 its passing side), parsetest 34 (was 37), rgtest / bundlertest at their
 tallies.
 
+### Strings, arrays and hashes are collected too (slice 2, 2026-08-22)
+
+The collector now takes the value stores, with ZERO threading: mere v0.1.297
+gave containers `map_compact` / `vec_compact` (a compacted container owns its
+own arena and swaps generations -- semantically invisible, allocator-visible),
+so the globals stay global and their helpers keep their shape. The planned
+alternative -- threading the stores through their access paths -- was measured
+first and killed by the measurement: 518 functions in the transitive no-world
+closure, on top of ~2100 direct call sites.
+
+At a collection, after ivars/ocls rebuild: dead arrays are dropped from
+arr_store (survivors out, `map_clear`, survivors back, compact), dead hash and
+string slots are blanked ONCE in their vecs (ids are positional, so a dead id
+stays valid-and-empty: ~17 bytes of stub forever), both vecs compact, and the
+str_enc / str_frozen side tables are filtered the same way. Array ids come
+from a counter now (map_len shrinks when entries drop). VStr joined the mark.
+
+What it took to get right, each measured:
+
+- `map_delete` rebuilds the hash index INTO THE MAP'S REGION per call --
+  deleting a store's dead entries key by key grew its fresh private arena to
+  68 GB. mere v0.1.298's `map_clear` is the mass-deletion primitive; the
+  clear-and-reset pattern replaced every deletion loop. (This interpreter
+  also had its OWN `map_clear` -- a delete-per-key quadratic version --
+  shadowing the builtin; it is gone and its six callers now hit the builtin.)
+- The trigger charges the vec scans: a collection walks every slot EVER
+  created (positional ids), so the scan term includes `vec_len str_store` --
+  without it, arr_store's deletion shrank the old term to its floor and a
+  200k-object run collected 100+ times, 83 seconds of walking a million
+  string slots.
+- Blanking is idempotent-guarded: re-blanking every dead slot every
+  collection allocated a fresh "" per slot per collection.
+
+Measured: a string-dominated run (20k dead objects x 20 KB strings) peaks at
+365 MiB against slice 1's 464. A frame-dominated run is unchanged (1059 vs
+1001 within arena-slack noise) -- frames were never this slice's target.
+corpus 158/158, bootstraptest pass=1570 fail=12 err=58 (the record),
+bundlertest 4 MATCH, gemtest 21/6/2.
+
+Honest limits, recorded as next lanes: the trigger counts ENTRIES, so a
+byte-heavy store (20 KB per entry) under-collects -- an allocation-volume
+counter is a language lane; vec dead slots are stubs forever (id reuse needs
+a free list); and frame env maps remain the largest uncollected share.
+
 ### gemtest went red the day the rubygems preload landed, and nobody ran it
 
 The interpreter preloads the stdlib's rubygems now; gemtest exists to load a
