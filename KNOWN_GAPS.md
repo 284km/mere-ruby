@@ -339,6 +339,58 @@ questions wrongly, which is worse than not loading — so it is left out. This
 is where devise stops, having loaded activesupport, i18n, concurrent-ruby and
 its own Concerns first.
 
+## Integers wider than int64 were a different value with fewer methods
+
+Fixed, and worth recording because of the shape rather than the bug. An integer
+that does not fit in an int64 is held as a decimal string (`VBig`) rather than a
+machine word, and the arms that handle it were written one at a time:
+
+| | `2**62` | `2**63` and up |
+|---|---|---|
+| `+ - * / % & \| ^ even?` | worked | worked |
+| `>> << ~` | worked | **"type error"** |
+| `bit_length` `digits` `to_r` | worked | **"undefined method"** |
+
+`1 << 64` was worse than either: it returned **0**, and `1 << 63` returned a
+negative number, because the native shift wraps at 64 bits. A wrong answer with
+no error is the one failure a corpus cannot catch, and nothing in a program that
+stays under 2**63 can produce it.
+
+Two things came out of fixing it:
+
+- **Shifts are arithmetic, so they are arithmetic.** `x << n` is `x * 2**n` and
+  `x >> n` is `x` floor-divided by `2**n`; the bignum divide already floors, so
+  `-1 >> 1 == -1` follows without a special case. The native path is kept, but
+  guarded by a **round trip** (`shr_int (shl_int x n) n == x`) rather than by a
+  hand-written bit bound -- a bound would be a claim about where the shift
+  overflows, and the round trip is a check of it.
+- **`divmod` already had its wide arm.** The mechanism existed and had been
+  applied once. That is the same shape as the self-referential containers below,
+  and it is worth looking for the OTHER arms whenever one is written.
+
+`corpus/159_wide_integers_and_cycles.rb` pins the boundary from both sides.
+
+## A container that contained itself died in three of four places
+
+Fixed. `[1, [...]]` printed correctly, and the same cycle:
+
+- in a **hash** ran the stack out (`{:x=>{...}}` is what ruby prints)
+- through **`Array#hash`** ran the stack out
+- through **`Array#<=>`** ran the stack out
+
+One guard, `insp_seen`, written once for arrays inside the printer, in a file
+with two printers and two other walks that recurse through the same values.
+
+The interesting part is the key. Array handles come from one counter and hash
+handles from another, both starting at zero, so a guard keyed on the bare
+integer would have made "array 3" and "hash 3" the same entry -- and an array
+that merely sat inside hash 3 would print `[...]`. The key carries the kind
+(`a3` / `h3`), and the corpus program checks the case that would have caught it.
+
+The non-printing walks use their own map rather than sharing the printer's: a
+mark left by an inspect in progress would make a hash computed underneath it
+return the cycle constant instead of the real value.
+
 ## A method call costs ~9 KB that is never given back
 
 The interpreter allocates in a region it never reclaims, so **memory is linear
@@ -1228,3 +1280,21 @@ resolves to nothing should raise NameError (ruby does) and here it simply does
 not match, so the original exception continues. And `Exception#cause` on the
 built-in class-and-message representation is always nil, since there is nowhere
 on it to record one -- an exception OBJECT records its cause properly.
+## `rationalize` is not answered, and now says so
+
+`Numeric#rationalize` returns the SIMPLEST rational within the receiver's
+precision -- `0.3.rationalize` is `(3/10)`, where `0.3.to_r` is the float's
+exact value `(5404319552844595/18014398509481984)`. Those are two different
+algorithms, and only the second one is implemented.
+
+The name used to be in `is_num_method`, the curated list of primitive method
+names, with nothing behind it. That made `respond_to?(:rationalize)` answer
+**true** and the call raise -- the list asserted a method the dispatcher did
+not have. It is out of the list now, so `respond_to?` answers false: a
+divergence from ruby that is at least honest about which way it goes.
+
+`integer?` and `to_c` were in the same state and are now implemented, so the
+list and the dispatcher agree on everything else it claims. What found all
+three was counting from the definition side -- every name the list asserts,
+against every name that appears in a dispatch condition -- rather than reading
+the list and believing it.

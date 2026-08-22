@@ -803,9 +803,20 @@ let rx_cur = map_new ();
 // require / main), so an invalid literal is a parse-time SyntaxError while
 // engine-unsupported ones pass (legacy fallback).
 let rx_pending = map_new ();
-// array handles currently being inspected — breaks self-referential arrays
-// (Ruby prints such a cycle as "[...]") instead of recursing forever.
+// container handles currently being inspected — breaks self-referential
+// structures (Ruby prints such a cycle as "[...]" / "{...}") instead of
+// recursing forever.
+//
+// ⚠ The key carries the KIND ("a3" / "h3"). Array ids come from arr_ctr and
+// hash ids from vec_len hash_store: two independent counters, so bare integers
+// would make array 3 and hash 3 the same entry and print "[...]" for an array
+// that merely sat inside hash 3.
 let insp_seen = map_new ();
+// container handles on the current traversal for the NON-printing walks
+// (Array#hash, Array#<=>). Deliberately not insp_seen: a mark left by a printer
+// would make a hash computed inside it return the cycle constant instead of the
+// real value, and the two walks can in principle nest.
+let cyc_seen = map_new ();
 // nesting depth of active catch(:tag) blocks (throw without any catch
 // raises UncaughtThrowError immediately).
 let catch_depth = map_new ();
@@ -6520,6 +6531,27 @@ let norm_big = fn (sval: str) ->
   if big_fits m then VInt (int_of_str canon) else VBig canon;
 // signed decimal of a numeric value.
 let num_dec = fn (v: Val) -> match v with VInt n -> str_of_int n | VBig s -> s | _ -> "0";
+
+// ---- integer shifts, total over the int64 boundary ----------------------
+// A shift is arithmetic: `x << n` is x * 2**n, `x >> n` is x floor-divided by
+// 2**n. big_divmod_s already floors, which is what makes the negative cases
+// (`-1 >> 1 == -1`) agree with ruby for free.
+//
+// Going through the bignum path is what makes them TOTAL. Before this,
+// `(2**64) >> 3` raised "type error" -- and `1 << 64` returned **0**, and
+// `1 << 63` returned a negative number, because shl_int wraps at 64 bits.
+// The silent wrong answer is the worse of the two: nothing in a program that
+// stays under 2**63 can ever show it.
+let two_pow_s = fn (n: int) -> big_pow "2" n "1";
+let shl_big = fn (va: Val) -> fn (n: int) -> norm_big (big_mul_s (num_dec va) (two_pow_s n));
+let shr_big = fn (va: Val) -> fn (n: int) -> norm_big (big_div_s (num_dec va) (two_pow_s n));
+
+// The native fast path, guarded by a ROUND TRIP rather than by a bit count:
+// shifting back has to give the operand again. `int_bit_length` is defined
+// further down the file, and a hand-written bound would be a claim about
+// shl_int's overflow rather than a check of it.
+let shl_int_fits = fn (x: int) -> fn (n: int) ->
+  n >= 0 && n < 62 && shr_int (shl_int x n) n == x;
 // the exact numerator/denominator of a value, as decimal strings. A float is
 // doubled until it is integral, which is exact: 2.54 becomes
 // 2.54*2^k over 2^k. Beyond 62 doublings the numerator would leave int64,
@@ -6686,7 +6718,20 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
        | _ -> cmp_fail va vb)
     | VSym x -> (match vb with VSym y -> str_compare x y | _ -> cmp_fail va vb)
     // Array <=> Array: element-wise, then by length (Ruby semantics).
-    | VArr x -> (match vb with VArr y -> arr_cmp (deref x) (deref y) | _ -> cmp_fail va vb)
+    // Two self-referential arrays compared element-wise recursed forever. When
+    // the SAME pair comes round again the walk has proved them equal so far, so
+    // the cycle compares equal -- which is the answer ruby gives.
+    | VArr x ->
+      (match vb with
+       | VArr y ->
+         let k = "c" ++ str_of_int x ++ ":" ++ str_of_int y in
+         if map_has cyc_seen k then 0
+         else
+           let _ = map_set cyc_seen k 1 in
+           let r = arr_cmp (deref x) (deref y) in
+           let _ = map_delete cyc_seen k in
+           r
+       | _ -> cmp_fail va vb)
     | _ -> cmp_fail va vb
 // would cmp_vals fail on this pair? (the < family raises ArgumentError)
 and cmp_incompatible = fn (va: Val) -> fn (vb: Val) ->
@@ -6721,7 +6766,16 @@ let rec val_hash = fn (v: Val) ->
   | VBool b -> if b then 1 else 0
   | VNil -> 0
   | VFlt f -> int_of_float f
-  | VArr id -> arr_hash_go (deref id) 17
+  // A self-referential array used to recurse until the stack died. The cycle
+  // contributes a constant: ruby only requires that equal values hash equal,
+  // and two arrays that cycle at the same position agree on it.
+  | VArr id ->
+    if map_has cyc_seen ("a" ++ str_of_int id) then 4919
+    else
+      let _ = map_set cyc_seen ("a" ++ str_of_int id) 1 in
+      let r = arr_hash_go (deref id) 17 in
+      let _ = map_delete cyc_seen ("a" ++ str_of_int id) in
+      r
   | _ -> 0
 and str_hash_go = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
   if i >= str_len s then acc
@@ -7108,11 +7162,28 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
     (match va with
      | VArr id -> let _ = arr_set id (list_append (deref id) (Cons (vb, Nil))) in va
      | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in mkstr (x ++ y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << string needs a string")) in fail "mere-ruby: << string needs a string"))
-     | VInt x -> (match vb with VInt y -> VInt (shl_int x y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
+     | VInt x ->
+       (match vb with
+        | VInt y ->
+          if y < 0 then shr_big va (0 - y)
+          else if shl_int_fits x y then VInt (shl_int x y)
+          else shl_big va y
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
+     | VBig _ ->
+       (match vb with
+        | VInt y -> if y < 0 then shr_big va (0 - y) else shl_big va y
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
   else if str_eq op ">>" then
     (match va with
-     | VInt x -> (match vb with VInt y -> VInt (shr_int x y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
+     | VInt x ->
+       (match vb with
+        | VInt y -> if y < 0 then shl_big va (0 - y) else VInt (shr_int x y)
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
+     | VBig _ ->
+       (match vb with
+        | VInt y -> if y < 0 then shl_big va (0 - y) else shr_big va y
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
   else (let __fm = ("mere-ruby: unknown operator: " ++ op) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
 
@@ -7344,6 +7415,26 @@ let rec int_pow_mod = fn (b: int) -> fn (e: int) -> fn (m: int) ->
   else let r = b * int_pow_mod b (e - 1) m in r - (r / m) * m;
 let rec int_bit_length = fn (n: int) ->
   if n == 0 then 0 else 1 + int_bit_length (n / 2);
+
+// ---- the same three questions, asked of a bignum -------------------------
+// `123.bit_length` answered and `(2**63).bit_length` said "undefined method",
+// which is the shape this file keeps producing: the small-value branch exists,
+// the wide one was never written, and no program that stays under 2**63 can
+// tell. `divmod` had already been given its VBig arm -- these three had not.
+//
+// Counting by repeated division is O(bits) bignum divisions. That is fine at
+// spec sizes and it is exact; a decimal-length estimate would be neither.
+let rec big_bit_length_go = fn (m: str) -> fn (acc: int) ->
+  if str_eq m "0" then acc else big_bit_length_go (big_div_s m "2") (acc + 1);
+// ruby's bit_length for a negative n is the length of ~n, i.e. of -n-1.
+let big_bit_length = fn (b: str) ->
+  big_bit_length_go (big_mag (if big_sign b < 0 then big_sub_s (big_neg_s b) "1" else b)) 0;
+
+// digits: least significant first, like Integer#digits. Negative receivers
+// raise Math::DomainError in ruby, which the caller checks for.
+let rec big_digits_go = fn (m: str) -> fn (base: str) ->
+  if str_eq m "0" then Nil
+  else Cons (norm_big (big_mod_s m base), big_digits_go (big_div_s m base) base);
 // digit value of a base-N char (0-9a-z), or -1.
 let hexval = fn (c: str) ->
   let o = ord c in
@@ -8079,13 +8170,22 @@ and inspect = fn (v: Val) ->
      "\"" ++ esc_str_b sv 0 "" (str_eq e "ASCII-8BIT" || str_eq e "BINARY" || str_eq e "US-ASCII") ++ "\"")
   | VNil -> "nil"
   | VArr id ->
-    if map_has insp_seen (str_of_int id) then "[...]"
+    if map_has insp_seen ("a" ++ str_of_int id) then "[...]"
     else
-      let _ = map_set insp_seen (str_of_int id) 1 in
+      let _ = map_set insp_seen ("a" ++ str_of_int id) 1 in
       let r = "[" ++ join_inspect (deref id) "" ++ "]" in
-      let _ = map_delete insp_seen (str_of_int id) in
+      let _ = map_delete insp_seen ("a" ++ str_of_int id) in
       r
-  | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs xs "" ++ "}"
+  // A self-referential HASH used to recurse until the stack died, while the
+  // array beside it printed "[...]". One guard, applied to one of the two
+  // container kinds -- in both printers.
+  | VHsh hid ->
+    if map_has insp_seen ("h" ++ str_of_int hid) then "\{...}"
+    else
+      let _ = map_set insp_seen ("h" ++ str_of_int hid) 1 in
+      let r = "\{" ++ join_pairs (hderef hid) "" ++ "}" in
+      let _ = map_delete insp_seen ("h" ++ str_of_int hid) in
+      r
   // a Range shows its bounds INSPECTED -- `("a".."c").inspect` is
   // `"a".."c"`, where its to_s is `a..c`. An absent bound shows as nothing.
   | VRange (lo, hi, excl) ->
@@ -8220,10 +8320,10 @@ let rec val_join = fn (es: Val -> str) -> fn (xs: Val list) -> fn (sep: str) -> 
     // Ruby joins nested arrays recursively with the same separator.
     let piece = (match h with
                  | VArr id ->
-                   if map_has insp_seen (str_of_int id) then ""
-                   else let _ = map_set insp_seen (str_of_int id) 1 in
+                   if map_has insp_seen ("a" ++ str_of_int id) then ""
+                   else let _ = map_set insp_seen ("a" ++ str_of_int id) 1 in
                         let r = val_join es (deref id) sep "" true in
-                        let _ = map_delete insp_seen (str_of_int id) in r
+                        let _ = map_delete insp_seen ("a" ++ str_of_int id) in r
                  | _ -> es h) in
     let acc2 = if first then piece else acc ++ sep ++ piece in
     val_join es t sep acc2 false;
@@ -9664,6 +9764,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq op "~" then
       (match eval_e env world blk a with
        | VInt n -> VInt (0 - n - 1)   // bitwise not
+       // ~x is -x-1 at every width, so the bignum case is the same identity
+       // rather than a bit operation. It used to fall through to "non-integer".
+       | VBig b -> norm_big (big_sub_s (big_neg_s b) "1")
        // `~obj` dispatches to the object's own `~` (IPAddr defines one).
        | VObj id ->
          let (m2, s2, ocls2, iv2) = world in
@@ -10193,11 +10296,11 @@ and val_flatten = fn (xs: Val list) -> fn (depth: int) ->
   | Nil -> Nil
   | Cons (VArr id, t) ->
     if depth == 0 then Cons (VArr id, val_flatten t depth)
-    else if map_has insp_seen (str_of_int id) then val_flatten t depth
+    else if map_has insp_seen ("a" ++ str_of_int id) then val_flatten t depth
     else
-      let _ = map_set insp_seen (str_of_int id) 1 in
+      let _ = map_set insp_seen ("a" ++ str_of_int id) 1 in
       let inner = val_flatten (deref id) (if depth < 0 then depth else depth - 1) in
-      let _ = map_delete insp_seen (str_of_int id) in
+      let _ = map_delete insp_seen ("a" ++ str_of_int id) in
       list_append inner (val_flatten t depth)
   | Cons (h, t) -> Cons (h, val_flatten t depth)
 and val_compact = fn (xs: Val list) ->
@@ -11951,13 +12054,19 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        // `#<#<Class:0x..>:0x..>` in ruby, not `#<AnonClass_0:0x..>`.
        "#<" ++ cls_display world cls ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
   | VArr id ->
-    if map_has insp_seen (str_of_int id) then "[...]"
+    if map_has insp_seen ("a" ++ str_of_int id) then "[...]"
     else
-      let _ = map_set insp_seen (str_of_int id) 1 in
+      let _ = map_set insp_seen ("a" ++ str_of_int id) 1 in
       let r = "[" ++ join_inspect_w env world (deref id) "" ++ "]" in
-      let _ = map_delete insp_seen (str_of_int id) in
+      let _ = map_delete insp_seen ("a" ++ str_of_int id) in
       r
-  | VHsh xs -> let xs = hderef xs in "\{" ++ join_pairs_w env world xs "" ++ "}"
+  | VHsh hid ->
+    if map_has insp_seen ("h" ++ str_of_int hid) then "\{...}"
+    else
+      let _ = map_set insp_seen ("h" ++ str_of_int hid) 1 in
+      let r = "\{" ++ join_pairs_w env world (hderef hid) "" ++ "}" in
+      let _ = map_delete insp_seen ("h" ++ str_of_int hid) in
+      r
   // the singleton class OF AN OBJECT: `#<Class:#<Object:0x..>>`, which needs the
   // world to name the object's class -- the world-free printer leaves it as the
   // bookkeeping name, and this is the only place that can do better.
@@ -16371,7 +16480,11 @@ and is_num_method = fn (name: str) ->
   str_eq name "finite?" || str_eq name "infinite?" || str_eq name "nan?" ||
   str_eq name "next_float" || str_eq name "prev_float" ||
   str_eq name "between?" || str_eq name "clamp" || str_eq name "coerce" ||
-  str_eq name "numerator" || str_eq name "denominator" || str_eq name "rationalize" ||
+  str_eq name "numerator" || str_eq name "denominator" ||
+  // `rationalize` is NOT claimed: ruby returns the SIMPLEST rational within the
+  // float's precision, which is a different algorithm from to_r's exact value.
+  // Claiming the name with to_r behind it would make respond_to? true and the
+  // answer quietly wrong -- an absent distinction is better left absent.
   str_eq name "<=>" || str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">="
 
 and is_prim_method = fn (name: str) ->
@@ -17270,8 +17383,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "gcdlcm" then
     (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
   else if str_eq name "digits" then
-    (match recv with VInt n -> (match args with Cons (VInt base, _) -> arr_new (int_digits n base) | _ -> arr_new (int_digits n 10)) | _ -> (let _ = map_set prim_missing "n" (mkstr "digits") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'digits'")) in fail "mere-ruby: undefined method 'digits'")))
-  else if str_eq name "bit_length" then (match recv with VInt n -> VInt (int_bit_length (if n < 0 then 0 - n - 1 else n)) | _ -> (let _ = map_set prim_missing "n" (mkstr "bit_length") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit_length'")) in fail "mere-ruby: undefined method 'bit_length'")))
+    (match recv with
+     | VInt n -> (match args with Cons (VInt base, _) -> arr_new (int_digits n base) | _ -> arr_new (int_digits n 10))
+     | VBig b -> (match args with Cons (bs, _) -> arr_new (big_digits_go (big_mag b) (num_dec bs)) | _ -> arr_new (big_digits_go (big_mag b) "10"))
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "digits") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'digits'")) in fail "mere-ruby: undefined method 'digits'")))
+  else if str_eq name "bit_length" then (match recv with VInt n -> VInt (int_bit_length (if n < 0 then 0 - n - 1 else n)) | VBig b -> VInt (big_bit_length b) | _ -> (let _ = map_set prim_missing "n" (mkstr "bit_length") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit_length'")) in fail "mere-ruby: undefined method 'bit_length'")))
   else if str_eq name "divmod" then
     (match recv with
      | VInt a -> (match args with Cons (VInt b, _) -> arr_new (Cons (VInt (floor_div a b), Cons (VInt (floor_mod a b), Nil))) | Cons (VBig b, _) -> arr_new (Cons (norm_big (big_div_s (str_of_int a) b), Cons (norm_big (big_mod_s (str_of_int a) b), Nil))) | Cons (VFlt b, _) -> let q = flt_floor (float_of_int a / b) in arr_new (Cons (VInt q, Cons (VFlt (float_of_int a - float_of_int q * b), Nil))) | _ -> VNil)
@@ -17316,6 +17432,23 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0") | _ -> (let _ = map_set prim_missing "n" (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
+  // Numeric#integer?. `is_num_method` has claimed this name all along with no
+  // branch behind it, so `respond_to?(:integer?)` said true and the call
+  // raised. A name list is a claim, not an implementation -- three of the
+  // names it asserted (integer?, to_c, rationalize) had nothing behind them.
+  // Numeric#to_c: the same value with a zero imaginary part. Complex() itself
+  // has worked all along -- this name was in the list with nothing behind it.
+  else if str_eq name "to_c" then
+    (match recv with
+     | VCpx (r, i) -> recv
+     | VInt _ -> VCpx (recv, VInt 0) | VBig _ -> VCpx (recv, VInt 0)
+     | VFlt _ -> VCpx (recv, VInt 0) | VRat _ -> VCpx (recv, VInt 0)
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "to_c") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_c'")) in fail "mere-ruby: undefined method 'to_c'")))
+  else if str_eq name "integer?" then
+    (match recv with
+     | VInt _ -> VBool true | VBig _ -> VBool true
+     | VFlt _ -> VBool false | VRat _ -> VBool false
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "integer?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'integer?'")) in fail "mere-ruby: undefined method 'integer?'")))
   // Numeric#nonzero?: self, or nil when it IS zero — the idiom behind
   // `(a <=> b).nonzero? || ...` in a multi-key comparator.
   else if str_eq name "nonzero?" then
@@ -17383,7 +17516,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VInt n -> VInt n | VFlt f -> VInt (int_of_float f) | _ -> (let _ = map_set prim_missing "n" (mkstr "truncate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'truncate'")) in fail "mere-ruby: undefined method 'truncate'")))
   else if str_eq name "numerator" then (match recv with VRat (n, d) -> norm_big n | VInt n -> VInt n | _ -> (let _ = map_set prim_missing "n" (mkstr "numerator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'numerator'")) in fail "mere-ruby: undefined method 'numerator'")))
   else if str_eq name "denominator" then (match recv with VRat (n, d) -> norm_big d | VInt n -> VInt 1 | _ -> (let _ = map_set prim_missing "n" (mkstr "denominator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'denominator'")) in fail "mere-ruby: undefined method 'denominator'")))
-  else if str_eq name "to_r" then (match recv with VRat (n, d) -> recv | VInt n -> mk_rat n 1 | _ -> (let _ = map_set prim_missing "n" (mkstr "to_r") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_r'")) in fail "mere-ruby: undefined method 'to_r'")))
+  // Float#to_r is the float's EXACT value, not a rounded one: 0.1 becomes
+  // 3602879701896397/36028797018963968. flt_rat_parts already computes that
+  // pair for Rational(), so the branch was missing rather than the arithmetic.
+  else if str_eq name "to_r" then (match recv with VRat (n, d) -> recv | VInt n -> mk_rat n 1 | VBig b -> mk_rat_s b "1" | VFlt f -> (match flt_rat_parts f 0 with (n, d) -> mk_rat_s n d) | _ -> (let _ = map_set prim_missing "n" (mkstr "to_r") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_r'")) in fail "mere-ruby: undefined method 'to_r'")))
   else if str_eq name "real" then (match recv with VCpx (r, i) -> r | VRat (n, d) -> recv | _ -> recv)
   else if str_eq name "imaginary" || str_eq name "imag" then (match recv with VCpx (r, i) -> i | _ -> VInt 0)
   else if str_eq name "real?" then (match recv with VCpx (r, i) -> VBool false | _ -> VBool true)
@@ -18279,7 +18415,16 @@ and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
   // could not reach a user <=>.
   | VArr x ->
     (match b with
-     | VArr y -> arr_cmp_w world (deref x) (deref y)
+     // the same cycle guard as cmp_vals: this path exists so a user <=> can be
+     // reached, and it recursed forever on the same input.
+     | VArr y ->
+       let k = "c" ++ str_of_int x ++ ":" ++ str_of_int y in
+       if map_has cyc_seen k then 0
+       else
+         let _ = map_set cyc_seen k 1 in
+         let r = arr_cmp_w world (deref x) (deref y) in
+         let _ = map_delete cyc_seen k in
+         r
      | _ -> cmp_vals a b)
   | _ -> cmp_vals a b
 and arr_cmp_w = fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
