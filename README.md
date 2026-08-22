@@ -319,14 +319,29 @@ same idea as the tags/filter files every other implementation keeps. Passing
 target is the `language` and `core` groups, with `command_line` low-priority
 and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
 
-The record covers **1049 spec files** across 26 groups: **414 MATCH, 603 DIFF,
-26 CRASH**, 5 SKIP, 1 SLOW. Run with no directories, the sweep refreshes exactly
+The record covers **1054 spec files** across 26 groups: **421 MATCH, 605 DIFF,
+22 CRASH**, 5 SKIP, 1 SLOW. Run with no directories, the sweep refreshes exactly
 the groups the table already has, so the numbers above are reproducible rather
 than a snapshot.
 
-A DIFF is usually fidelity, not breakage: real programs (the corpus) match
-exactly while a value class scores low on ruby/spec because of an error
-message, a frozen-object check, or an exotic coercion path.
+**97% of the files run on both sides** (MATCH + DIFF); 22 abort. So the gap is
+mostly not "cannot", and a group score reads low for a reason worth naming
+rather than for breakage -- real programs (the corpus) match exactly while a
+value class scores low on an error message or a frozen-object check.
+
+Naming it is what `CAUSES.md` is for. Grouped by cause, the 605 DIFFs come down
+to **125 kinds**, and the two largest are `NoMethodError` (139 files) and
+`NameError` (68): a third of the gap is a name that is not there, which is
+missing surface rather than wrong behaviour. Because ruby/spec is laid out as
+`core/<class>/<method>_spec.rb`, those files name the absent methods
+themselves -- `CAUSES.md` ends with that list, per class.
+
+⚠ Re-sweeping also showed the previous table had drifted 3 files from the
+committed interpreter: two `language` files and one `core/queue` file were
+recorded as MATCH and fail under the binary they were supposed to describe (and
+under the one before it). A record refreshed only when someone remembers is a
+claim about the past, so the invitation to re-run at the bottom of the table is
+the load-bearing part of it.
 
 ## Why it exists
 
