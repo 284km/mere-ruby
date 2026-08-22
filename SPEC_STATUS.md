@@ -13,26 +13,26 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 42 | 19 | 4 | 2 | 0 | 67 |
+| language | 40 | 21 | 4 | 2 | 0 | 67 |
 | core/string | 32 | 81 | 1 | 0 | 0 | 114 |
-| core/array | 49 | 51 | 5 | 0 | 0 | 105 |
-| core/hash | 32 | 36 | 1 | 0 | 0 | 69 |
+| core/array | 49 | 53 | 3 | 0 | 0 | 105 |
+| core/hash | 32 | 37 | 0 | 0 | 0 | 69 |
 | core/range | 17 | 16 | 1 | 0 | 1 | 35 |
 | core/comparable | 5 | 2 | 0 | 0 | 0 | 7 |
-| core/complex | 15 | 28 | 0 | 0 | 0 | 43 |
+| core/complex | 16 | 27 | 0 | 0 | 0 | 43 |
 | core/env | 10 | 35 | 0 | 0 | 0 | 45 |
-| core/exception | 10 | 26 | 3 | 0 | 0 | 39 |
+| core/exception | 11 | 25 | 3 | 0 | 0 | 39 |
 | core/false | 2 | 7 | 0 | 0 | 0 | 9 |
 | core/float | 25 | 24 | 1 | 0 | 0 | 50 |
-| core/integer | 16 | 48 | 6 | 0 | 0 | 70 |
+| core/integer | 18 | 47 | 5 | 0 | 0 | 70 |
 | core/kernel | 46 | 67 | 3 | 2 | 0 | 118 |
 | core/matchdata | 8 | 22 | 0 | 0 | 0 | 30 |
 | core/method | 8 | 18 | 0 | 0 | 0 | 26 |
 | core/mutex | 3 | 4 | 0 | 0 | 0 | 7 |
 | core/nil | 9 | 9 | 0 | 0 | 0 | 18 |
 | core/numeric | 26 | 18 | 1 | 1 | 0 | 46 |
-| core/queue | 10 | 5 | 0 | 0 | 0 | 15 |
-| core/rational | 9 | 23 | 0 | 0 | 0 | 32 |
+| core/queue | 9 | 6 | 0 | 0 | 0 | 15 |
+| core/rational | 10 | 22 | 0 | 0 | 0 | 32 |
 | core/sizedqueue | 11 | 5 | 0 | 0 | 0 | 16 |
 | core/struct | 8 | 22 | 0 | 0 | 0 | 30 |
 | core/symbol | 12 | 17 | 0 | 0 | 0 | 29 |
