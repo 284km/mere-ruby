@@ -606,6 +606,60 @@ ok=21 fail=6 skip=2, its recorded shape. The lesson is the CI one at repo
 scale: a gate that is not in the routinely-run set is not green, it is
 unknown.
 
+### A guest collector, over the world the region loop carries (2026-08-22)
+
+The interpreter now has a garbage collector for Ruby objects. The world's four
+maps (meths / sup / ocls / ivars) are created inside `region GCW loop` in
+run_src -- they were already threaded through every function, so not one call
+site changed -- and the driver runs top-level statements in chunks: when the
+object stores grow past a threshold at a safepoint (the loop head, where
+nothing on the interpreter's own stack holds an arena handle), it marks every
+reachable object id from the roots, rebuilds ivars / ocls with only the live
+entries into maps born in the loop's scope, and `Continue` swaps arenas. The
+copy is the compaction; dead entries and every dead map-internal copy stay
+behind in the released arena.
+
+What made it possible, and what it cost to learn:
+
+- **Object ids come from a counter now** (`"$next"` inside ocls, seeded from
+  map_len on first use), not from `map_len ocls` -- with entries being dropped,
+  map_len shrinks and a fresh object would collide with a survivor.
+- **One line had pinned the whole world to `__heap`.** Five sites built a
+  placeholder blk tuple with `ivars` in the env slot ("unused; must be
+  Map[str,Val]"). That unified the world's region with the env region -- envs
+  are genuinely __heap, through bind_store -- and the carried world became a
+  type error 5,000 lines away. The placeholder is now one shared empty map
+  (per-call `map_new` placeholders cost ~200 bytes per `new` -- measured as a
+  112 MiB regression before being shared).
+- **The root set is every Val-holding global, classified from all 120
+  setter sites, not picked by intuition.** The intuitive ten collected the
+  current Thread object out from under bundler (Monitor#synchronize raised
+  ThreadError). The type checker keeps the list honest in one direction only
+  -- a non-Val map here will not build; a MISSING map is the direction to fear.
+  The env-shaped stores (bind_store, lv_up scope-chain parents, proc_store /
+  proc_yblk captured envs) are walked through their map values.
+- **The collection trigger charges cost against garbage**: a collection scans
+  arr_store / hash_store whole (not compacted in this slice), so triggering on
+  ivars growth alone went quadratic (450 collections, +28% time) and
+  triggering on total size collected twice and reclaimed nothing. Live size
+  plus half the scan size: several collections a run, and FASTER than no
+  collector on the collector's home turf (2.42s vs 2.56s -- less allocation is
+  less page faulting).
+
+Measured, 200k dead objects of 10 ivars across 200k top-level statements:
+**1012 -> 848 MiB**, faster. Final census after 20k dead objects: ivars=298,
+ocls=174 -- bounded. corpus 158/158, bundlertest 4 MATCH, gemtest 21/6/2,
+rgtest at its tallies.
+
+What this slice does NOT collect, in order of size: frame env maps (lane (2);
+they are __heap by unification with captured envs), arr_store / hash_store /
+str_store entries (their helpers close over the globals; threading them
+through ~500-1300 call sites is the next slice), and anything inside a single
+top-level statement -- the safepoint is the loop head, so a program that is
+one big `while` never collects (w2: +8% peak from the second arena's doubling
+slack, the honest price until top-level whiles run chunked, which is the
+planned counterpart of the statement chunking).
+
 ### The formatter leaked, and it wore the mask of a different problem
 
 Mere v0.1.294 (2026-08-22): both native backends copied every asprintf result
