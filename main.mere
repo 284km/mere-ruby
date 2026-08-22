@@ -634,6 +634,69 @@ let rec lv_owner = fn env -> fn (n: str) ->
   if map_has env n then (true, env)
   else let (has, p) = lv_parent_of env in
        if has then lv_owner p n else (false, env);
+// A frame that ESCAPES its call -- a proc/lambda body, a captured yield
+// block, a Thread body -- must never be recycled into the frame pool, and
+// neither may any parent on its scope chain (the proc reads and writes
+// through the chain). Marked at the choke points where an env leaves the
+// call's extent; run_meth recycles only unmarked frames.
+let rec mark_captured = fn env ->
+  if map_has env "__captured" then ()
+  else
+    let _ = map_set env "__captured" (VBool true) in
+    (match lv_parent_of env with
+     | (true, p) -> mark_captured p
+     | _ -> ());
+
+// The choke points: every proc-shaped store goes through these, so the
+// capture marking cannot be forgotten at one of the twenty-two write sites.
+// THE FRAME POOL. A method call's frame dies at return unless captured
+// (mark_captured above); a dead frame is recycled -- entries wiped, its
+// private arena wound back to one warm 4 KB seed (mere v0.1.300) -- and
+// parked here for the next call. Frames were the single largest unreclaimed
+// share (12 GB of a rubocop load): every call allocated ~1.8 KB of map
+// machinery into the default region, permanently. Pooled, a call's frame
+// costs its ENTRIES only, in an arena that is handed back at return.
+let frame_pool = vec_new ();
+let frame_pool_n = map_new ();
+let pool_ctr = fn (k: str) ->
+  map_set frame_pool_n k ((if map_has frame_pool_n k then map_get frame_pool_n k else 0) + 1);
+let frame_pool_get = fn (u: unit) ->
+  let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
+  if n > 0 then
+    (let _ = pool_ctr "hits" in
+     let _ = map_set frame_pool_n "n" (n - 1) in
+     vec_get frame_pool (n - 1))
+  else
+    (let _ = pool_ctr "news" in
+     let f = map_new () in
+     let _ = map_recycle f in   // promote: give it its own arena from birth
+     f);
+let frame_pool_put = fn f ->
+  // count the bytes this frame's arena held BEFORE the wind-back: that sum is
+  // the deterministic answer to "was anything reclaimed" that peak RSS is not
+  // (peak RSS above a few GB varies 2x between identical runs, recorded below).
+  let _ = map_set frame_pool_n "bytes"
+    ((if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) + map_bytes f) in
+  let _ = map_recycle f in
+  let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
+  // cap the pool at the deepest call stack seen; past that, drop the frame
+  // (its arena was already wound back, so the residue is the struct alone).
+  if n >= 4096 then (pool_ctr "drops")
+  else
+    (let _ = pool_ctr "puts" in
+     let _ = (if n < vec_len frame_pool then vec_set frame_pool n f
+              else vec_push frame_pool f) in
+     map_set frame_pool_n "n" (n + 1));
+
+let store_proc = fn (k: str) -> fn entry ->
+  let (_, _, _, penv) = entry in
+  let _ = mark_captured penv in
+  map_set proc_store k entry;
+let store_yblk = fn (k: str) -> fn b ->
+  let (_, _, _, cenv) = b in
+  let _ = mark_captured cenv in
+  map_set proc_yblk k b;
+
 let lv_has = fn env -> fn (n: str) -> let (found, _) = lv_owner env n in found;
 let lv_get = fn env -> fn (n: str) ->
   let (found, f) = lv_owner env n in
@@ -8879,8 +8942,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     v
   | ELambda (ps, body) ->
     let id = map_len proc_store in
-    let _ = map_set proc_store (str_of_int id) (true, ps, body, env) in
-    let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
+    let _ = store_proc (str_of_int id) (true, ps, body, env) in
+    let _ = if (let (h, _, _, _) = blk in h) then store_yblk (str_of_int id) blk else () in
     let _ = map_set lambda_ids (str_of_int id) VNil in
     VProc id
   | EStmt s ->
@@ -9302,7 +9365,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // `trace_var(:$g) { |v| ... }` in its block form: the block is the tracer.
     else if str_eq name "trace_var" && (if map_has meths "trace_var" then false else true) then
       (let pid = map_len proc_store in
-       let _ = map_set proc_store (str_of_int pid) (true, bp, bb, env) in
+       let _ = store_proc (str_of_int pid) (true, bp, bb, env) in
        match args with
        | Cons (gv, _) ->
          (let gn = gvar_trace_name (to_s gv) in
@@ -9339,7 +9402,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#at_exit { }: remember the block and answer it as a Proc.
     else if str_eq name "at_exit" && (if map_has meths "at_exit" then false else true) then
       (let pid = map_len proc_store in
-       let _ = map_set proc_store (str_of_int pid) (true, bp, bb, env) in
+       let _ = store_proc (str_of_int pid) (true, bp, bb, env) in
        let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
        VProc pid)
     // Kernel#fork { }: not implemented (no process extern) — Ruby's own
@@ -9349,8 +9412,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // proc { } / lambda { } capture the block as a first-class VProc.
     else if str_eq name "proc" || str_eq name "lambda" then
       (let id = map_len proc_store in
-       let _ = map_set proc_store (str_of_int id) (true, bp, bb, env) in
-       let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
+       let _ = store_proc (str_of_int id) (true, bp, bb, env) in
+       let _ = if (let (h, _, _, _) = blk in h) then store_yblk (str_of_int id) blk else () in
        let _ = if str_eq name "lambda" then map_set lambda_ids (str_of_int id) VNil else () in
        VProc id)
     // define_method(:name) { ... } as a genuine method call (self is a class):
@@ -9379,7 +9442,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // reaches it (Ruby's define_method closure semantics).
          let _ = (match blk with
                   | (true, _, _, _) -> let pid = map_len proc_store in
-                    let _ = map_set proc_store (str_of_int pid) blk in
+                    let _ = store_proc (str_of_int pid) blk in
                     map_set dm_captured key (VProc pid)
                   | _ -> if map_has dm_captured key then map_delete dm_captured key else ()) in
           // `block_given?` inside the body asks about THIS frame -- the one the
@@ -10857,7 +10920,7 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
            else map_set cenv b
                   (let (has, _, _, _) = blk in
                    if has then (let pid = map_len proc_store in
-                                let _ = map_set proc_store (str_of_int pid) blk in
+                                let _ = store_proc (str_of_int pid) blk in
                                 VProc pid)
                    else VNil)) in
   // explicit block-locals (`|x; a, b|`, encoded ";name") start as fresh nil
@@ -12074,7 +12137,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      let _ = map_set benv "__h_self" recv in
      let body = Cons (SExpr (EMethod (EVar "__h_self", "[]", Cons (EVar "__k", Nil))), Nil) in
      let pid = map_len proc_store in
-     let _ = map_set proc_store (str_of_int pid) (true, Cons ("__k", Nil), body, benv) in
+     let _ = store_proc (str_of_int pid) (true, Cons ("__k", Nil), body, benv) in
      let _ = map_set lambda_ids (str_of_int pid) VNil in
      VProc pid)
   else if str_eq name "default_proc" && (match recv with VHsh _ -> true | _ -> false) then
@@ -13780,7 +13843,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       | VMain -> Cons (SExpr (ECall (mnm, Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)
                       | _ -> Cons (SExpr (EMethod (EVar "__m_meth", "call", Cons (ESplat (EVar "__a"), Cons (EBlockPass (EVar "__b"), Nil)))), Nil)) in
           let pid = map_len proc_store in
-          let _ = map_set proc_store (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
+          let _ = store_proc (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
           // ruby's Method#to_proc answers the METHOD's arity and is a lambda;
           // the forwarder's own `*__a` would say -1 and "not a lambda".
           let _ = map_set proc_arity (str_of_int pid) (VInt (bm_arity world mown mnm)) in
@@ -15010,8 +15073,8 @@ and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
   | (true, _, _, _) ->
     (if bare_yield_stmts body then
        (let pid = map_len proc_store in
-        let _ = map_set proc_store (str_of_int pid) cur in
-        let _ = map_set proc_yblk (str_of_int pid) cur in
+        let _ = store_proc (str_of_int pid) cur in
+        let _ = store_yblk (str_of_int pid) cur in
         match theblk with (h, ps, b, e) -> (h, Cons (yblk_marker ++ str_of_int pid, ps), b, e))
      else theblk)
   | _ -> theblk
@@ -15227,7 +15290,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             (match map_get ivars0 (str_of_int id ++ "@__e_blk") with
              | VProc gpid ->
                let bpid = map_len proc_store in
-               let _ = map_set proc_store (str_of_int bpid) newblk in
+               let _ = store_proc (str_of_int bpid) newblk in
                let yid = alloc_oid ocls0 in
                let _ = map_set ocls0 (str_of_int yid) "Enumerator::Yielder" in
                let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
@@ -15252,14 +15315,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              str_eq name "find_all" || str_eq name "reject" || str_eq name "filter_map" ||
              str_eq name "take_while" || str_eq name "drop_while" then
             (let pid = map_len proc_store in
-             let _ = map_set proc_store (str_of_int pid) newblk in
+             let _ = store_proc (str_of_int pid) newblk in
              let kind = (if str_eq name "collect" then "map"
                          else if str_eq name "filter" || str_eq name "find_all" then "select"
                          else name) in
              lz_extend world id kind (VProc pid))
           else if str_eq name "each" then
             (let pid = map_len proc_store in
-             let _ = map_set proc_store (str_of_int pid) newblk in
+             let _ = store_proc (str_of_int pid) newblk in
              let _ = lz_run env world blk id (0 - 1) (VProc pid) in
              recv)
           else invoke_with_block env world blk (lz_run env world blk id (0 - 1) VNil) name args newblk)
@@ -15324,8 +15387,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // Proc.new { } captures the block; Class.new { } makes an anonymous
        // class whose body is the block; class_eval reopens the class.
        if str_eq c "Proc" && str_eq name "new" then
-         (let id = map_len proc_store in let _ = map_set proc_store (str_of_int id) newblk in
-          let _ = if (let (h, _, _, _) = blk in h) then map_set proc_yblk (str_of_int id) blk else () in
+         (let id = map_len proc_store in let _ = store_proc (str_of_int id) newblk in
+          let _ = if (let (h, _, _, _) = blk in h) then store_yblk (str_of_int id) blk else () in
           VProc id)
        // File.open(path, mode) { |f| ... }: open, run the block with the
        // handle, flush/close on exit, return the block's value.
@@ -15338,7 +15401,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // body once (no suspension points in this model).
        else if str_eq c "Fiber" && str_eq name "new" then
          (let pid = map_len proc_store in
-          let _ = map_set proc_store (str_of_int pid) newblk in
+          let _ = store_proc (str_of_int pid) newblk in
           let (m3, s3, ocls3, iv3) = world in
           let fid = alloc_oid ocls3 in
           let _ = map_set ocls3 (str_of_int fid) "Fiber" in
@@ -15365,6 +15428,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
           let _ = map_set thread_flag "n" (VBool true) in
           // $~ is per-thread in Ruby: the body starts with a fresh one and
+                 // the Thread body outlives this call: its env chain is captured.
+                 let _ = (let (_, _, _, tcenv) = newblk in mark_captured tcenv) in
           // the spawner's is restored afterwards.
           let savedtilde = (if map_has globals "~" then map_get globals "~" else VNil) in
           let _ = map_set globals "~" VNil in
@@ -15414,7 +15479,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          // Enumerator.produce(initial) { |x| next } — an infinite generator:
          // store the step block + seed; enum_take drives it boundedly.
          (let pid = map_len proc_store in
-          let _ = map_set proc_store (str_of_int pid) newblk in
+          let _ = store_proc (str_of_int pid) newblk in
           let (m3, s3, ocls3, iv3) = world in
           let eid = alloc_oid ocls3 in
           let _ = map_set ocls3 (str_of_int eid) "Enumerator" in
@@ -15425,7 +15490,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          // Enumerator.new(size = nil) { |y| ... }: store the generator block
          // as a proc, and the optional size (#size returns / calls it).
          (let pid = map_len proc_store in
-          let _ = map_set proc_store (str_of_int pid) newblk in
+          let _ = store_proc (str_of_int pid) newblk in
           let (m3, s3, ocls3, iv3) = world in
           let eid = alloc_oid ocls3 in
           let _ = map_set ocls3 (str_of_int eid) "Enumerator" in
@@ -15492,7 +15557,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if str_eq c "Hash" && str_eq name "new" then
          (let hv = mkhash Nil in
           let pid = map_len proc_store in
-          let _ = map_set proc_store (str_of_int pid) newblk in
+          let _ = store_proc (str_of_int pid) newblk in
           let _ = (match hv with VHsh hid -> hdproc_set hid (VProc pid) | _ -> ()) in
           hv)
        else if str_eq name "new" then new_obj_wb world c args newblk
@@ -16676,7 +16741,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VSym sy ->
        (let pid = map_len proc_store in
-        let _ = map_set proc_store (str_of_int pid)
+        let _ = store_proc (str_of_int pid)
                   (true, Cons (lambda_blk_marker, Cons ("__bp", Cons ("*__ba", Nil))),
                    Cons (SExpr (EMethod (EVar "__bp", sy, Cons (ESplat (EVar "__ba"), Nil))), Nil),
                    map_new ()) in
@@ -19040,11 +19105,12 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      // a top-level `define_method` is a CLOSURE: its body reads the locals of
      // the scope it was written in, so the frame is a child of that scope
      // rather than a fresh one. (run_meth does the same for a class's.)
+    let from_pool = (if map_has dm_closenv name then false else true) in
      let frame = (if map_has dm_closenv name then
                     (match map_get dm_closenv name with
                      | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
-                     | _ -> map_new ())
-                  else map_new ()) in
+                     | _ -> frame_pool_get ())
+                  else frame_pool_get ()) in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
      let _ = map_set frame "__meth" (mkstr name) in
      // Whether THIS call was given a block. `block_given?` asks about the
@@ -19062,6 +19128,12 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let _ = fire_trace world "call" name "Object" in
      let _ = fire_tp world "call" name "Object" in
      let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
+    // the frame dies here unless something captured it (or its chain):
+    // recycled and pooled, its arena wound back to the warm seed. Safe on
+    // every exit path -- method_body_flow converts raises to Flow values,
+    // so this line always runs.
+    let _ = (if from_pool && (if map_has frame "__captured" then false else true)
+             then frame_pool_put frame else ()) in
      let _ = fire_trace world "return" name "Object" in
      let _ = fire_tp world "return" name "Object" in
      let _ = rx_state_restore mstate in
@@ -19290,7 +19362,7 @@ and invoke = fn world -> fn blk -> fn (recv: Val) -> fn (cls: str) -> fn (name: 
 // defined method body can read the locals captured where it was defined.
 and dm_store_closure = fn (key: str) -> fn b ->
   let pid = map_len proc_store in
-  let _ = map_set proc_store (str_of_int pid) b in
+  let _ = store_proc (str_of_int pid) b in
   map_set dm_closenv key (VProc pid)
 
 // run a resolved method with __defcls set to the ancestor it was found in (so
@@ -19311,11 +19383,15 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // counter += 1 }` has to increment the caller's counter, not a copy that
     // is thrown away after every call). The method's own self / args / params
     // are set below and shadow anything of the same name.
+    // the plain frame comes from the pool (returned at the restore point
+    // below unless captured); a define_method body's frame is a scope-chain
+    // child and stays unpooled -- its parent chain is captured by definition.
+    let from_pool = (if map_has dm_closenv (defcls ++ "#" ++ name) then false else true) in
     let frame = (if map_has dm_closenv (defcls ++ "#" ++ name) then
                    (match map_get dm_closenv (defcls ++ "#" ++ name) with
                     | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
-                    | _ -> map_new ())
-                 else map_new ()) in
+                    | _ -> frame_pool_get ())
+                 else frame_pool_get ()) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
     // A body that came from define_method is a BLOCK, and a block's
     // `block_given?` asks about the frame it was written in -- never about the
@@ -19358,6 +19434,12 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     let _ = fire_trace world "call" name defcls in
     let _ = fire_tp world "call" name defcls in
     let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
+    // the frame dies here unless something captured it (or its chain):
+    // recycled and pooled, its arena wound back to the warm seed. Safe on
+    // every exit path -- method_body_flow converts raises to Flow values,
+    // so this line always runs.
+    let _ = (if from_pool && (if map_has frame "__captured" then false else true)
+             then frame_pool_put frame else ()) in
     let _ = fire_trace world "return" name defcls in
     let _ = fire_tp world "return" name defcls in
     let _ = rx_state_restore mstate in
@@ -19977,7 +20059,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
              (match map_get ivars0 (str_of_int eid ++ "@__e_blk") with
               | VProc gpid ->
                 let bpid = map_len proc_store in
-                let _ = map_set proc_store (str_of_int bpid) collector in
+                let _ = store_proc (str_of_int bpid) collector in
                 let yid = alloc_oid ocls0 in
                 let _ = map_set ocls0 (str_of_int yid) "Enumerator::Yielder" in
                 let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
@@ -24348,7 +24430,7 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
                map_set frame bname
                  (if has then
                     (let pid = map_len proc_store in
-                     let _ = map_set proc_store (str_of_int pid) blk in
+                     let _ = store_proc (str_of_int pid) blk in
                      let _ = map_set proc_home (str_of_int pid) (if map_has frame "__blk_home" then map_get frame "__blk_home" else (if map_has frame "__fid" then map_get frame "__fid" else VInt 0)) in
                      VProc pid)
                   else VNil) in
@@ -26139,7 +26221,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      else
        (let _ = map_set end_sites k VNil in
         let pid = map_len proc_store in
-        let _ = map_set proc_store (str_of_int pid) (true, (Nil : str list), body, env) in
+        let _ = store_proc (str_of_int pid) (true, (Nil : str list), body, env) in
         let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
         FNext VNil))
   | SLocalFrom (name, s) ->
@@ -29125,6 +29207,11 @@ let store_stats = fn world ->
   let _ = row "bind_store" (map_len bind_store) in
   let _ = row "lv_up" (map_len lv_up) in
   let _ = row "live_frames" (map_len live_frames) in
+  let _ = row "pool_hits" (if map_has frame_pool_n "hits" then map_get frame_pool_n "hits" else 0) in
+  let _ = row "pool_news" (if map_has frame_pool_n "news" then map_get frame_pool_n "news" else 0) in
+  let _ = row "pool_puts" (if map_has frame_pool_n "puts" then map_get frame_pool_n "puts" else 0) in
+  let _ = row "pool_drops" (if map_has frame_pool_n "drops" then map_get frame_pool_n "drops" else 0) in
+  let _ = row "pool_bytes_wound_back" (if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) in
   let _ = row "call_names" (map_len call_names_s) in
   let _ = row "call_lines" (map_len call_lines) in
   let _ = row "rx_progs" (map_len rx_progs) in
