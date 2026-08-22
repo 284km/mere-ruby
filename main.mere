@@ -13670,7 +13670,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else prim_method recv name args
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
-    let cls = map_get ocls (str_of_int id) in
+    // `class << obj` retags ocls with the singleton-class name so mixed-in
+    // methods dispatch; but the BUILTIN arms below match by class NAME, and
+    // "(sng:...)" matches none of them -- pp.rb's `class << ENV` made
+    // ENV['HOME'] a NoMethodError for every later reader. When the singleton
+    // chain does not answer the name, dispatch by the singleton's superclass
+    // (the class the object had), which is where the builtins live.
+    let cls = (let c0 = map_get ocls (str_of_int id) in
+               if is_sng_cls c0 && (if has_meth world c0 name then false else true)
+               then sng_supername world c0 else c0) in
     if has_meth world cls name then
       (if vischeck && meth_private world cls name
        then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls_msg world cls)
@@ -15520,6 +15528,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // nil one, from `__send__(m, *args, &block)` forwarding): the block
        // dispatcher has no branch for it, so hand it to the plain one.
        else if builtin_obj_has cls name then invoke_val_c env world blk recv name args false
+       else if is_sng_cls cls && builtin_obj_has (sng_supername world cls) name then invoke_val_c env world blk recv name args false
        else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world cls)
      // `blk` (the enclosing method's block) is threaded so a yield inside
@@ -19196,9 +19205,15 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   else if includes_has world cls name then true
   else if map_has sup cls then has_meth world (map_get sup cls) name
   else if is_sng_cls cls then has_meth world (sng_supername world cls) name
-  // every class without a declared superclass inherits from Object,
-  // so `class Object; def m; end` reaches all values.
-  else if str_eq cls "Object" then false
+  // every class without a declared superclass inherits from Object; the ROOT
+  // is BasicObject (Object -> BasicObject by default), so a reopen of the
+  // form `class Object < BasicObject` (pp.rb does exactly this) writes a sup
+  // entry that agrees with the default chain instead of forming a cycle with
+  // it. The old terminal knew only "Object", and that reopen made every
+  // lookup walk Object -> BasicObject -> Object forever -- 64 GB of arena in
+  // one method call.
+  else if str_eq cls "BasicObject" then false
+  else if str_eq cls "Object" then has_meth world "BasicObject" name
   else has_meth world "Object" name
 
 // does any module `include`d into `cls` define `name` as an instance method?
@@ -19251,7 +19266,8 @@ and lookup_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   else if includes_has world cls name then mod_lookup world (cls_mod_ancestors world cls) name
   else if map_has sup cls then lookup_meth world (map_get sup cls) name
   else if is_sng_cls cls then lookup_meth world (sng_supername world cls) name
-  else if str_eq cls "Object" then (let __fm = ("mere-ruby: undefined method '" ++ name ++ "'") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
+  else if str_eq cls "BasicObject" then (let __fm = ("mere-ruby: undefined method '" ++ name ++ "'") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
+  else if str_eq cls "Object" then lookup_meth world "BasicObject" name
   else lookup_meth world "Object" name
 
 // like lookup_meth but also returns the class the method was found in, so
@@ -25081,7 +25097,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // reopening an existing class with a different, explicit superclass is
          // a TypeError (the superclass stays unchanged).
          let _ = if (if was_new then false else true) && (if str_eq qsuper "" then false else true)
-                    && (let existing = (if map_has sup full then map_get sup full else "Object") in if str_eq existing qsuper then false else true)
+                    && (let existing = (if map_has sup full then map_get sup full else if str_eq full "Object" then "BasicObject" else "Object") in if str_eq existing qsuper then false else true)
                  then let _ = raise_exc world "TypeError" ("superclass mismatch for class " ++ full) in ()
                  else () in
          let _ = if str_eq qsuper "" then () else set_sup sup full qsuper in
@@ -25337,7 +25353,8 @@ and meth_protected = fn world -> fn (cls: str) -> fn (name: str) ->
   else if map_has protecteds (cls ++ "#" ++ name) then true
   else if map_has meths (cls ++ "#" ++ name) then false
   else if map_has sup cls then meth_protected world (map_get sup cls) name
-  else if str_eq cls "Object" then false
+  else if str_eq cls "BasicObject" then false
+  else if str_eq cls "Object" then meth_protected world "BasicObject" name
   else meth_protected world "Object" name
 
 // a protected call is allowed when the caller's self is a kind of the
@@ -25358,7 +25375,8 @@ and meth_private = fn world -> fn (cls: str) -> fn (name: str) ->
   else if map_has privates (cls ++ "#" ++ name) then true
   else if map_has meths (cls ++ "#" ++ name) then false   // public definition here
   else if map_has sup cls then meth_private world (map_get sup cls) name
-  else if str_eq cls "Object" then false
+  else if str_eq cls "BasicObject" then false
+  else if str_eq cls "Object" then meth_private world "BasicObject" name
   else meth_private world "Object" name
 
 // remove each top-level method entry.
@@ -25582,6 +25600,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                   env_get "PWD" ++ "/" ++ p1
                 else (let hit = load_path_find world p1 in
                       if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
+     let _ = (if gc_log_on () then print_err ("gc: require " ++ full) else ()) in
      if map_has loaded_files full then FNext (VBool false)
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
      // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
