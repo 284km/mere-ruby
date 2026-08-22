@@ -327,8 +327,12 @@ let alloc_oid = fn om ->
   let _ = map_set om "$next" (str_of_int (id + 1)) in
   id;
 let arr_store = map_new () in
+// Array ids come from a counter: the collector deletes dead entries now, so
+// map_len shrinks and a length-derived id would collide with a survivor's.
+let arr_ctr = map_new () in
 let arr_new = fn (xs: Val list) ->
-  let id = map_len arr_store in
+  let id = (if map_has arr_ctr "n" then map_get arr_ctr "n" else 0) in
+  let _ = map_set arr_ctr "n" (id + 1) in
   let _ = map_set arr_store (str_of_int id) xs in
   VArr id;
 let deref = fn (id: int) -> map_get arr_store (str_of_int id);
@@ -24381,12 +24385,6 @@ and activate_refinements = fn (refinery: str) -> fn (i: int) -> fn (n: int) ->
     let _ = if str_eq tgt "" then () else map_set ref_active tgt impl_cls in
     activate_refinements refinery (i + 1) n
 
-// delete every entry from a map.
-and map_clear = fn m ->
-  let cur = map_new () in
-  let _ = map_iter m (fn (k: str) -> fn (v: Val) -> map_set cur k v) in
-  map_iter cur (fn (k: str) -> fn (v: Val) -> if map_has m k then map_delete m k else ())
-
 // clear ref_active and repopulate from `saved` (restore a scope's snapshot).
 and restore_ref_active = fn saved ->
   let cur = map_new () in
@@ -28726,6 +28724,8 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VObj id -> let k = "o" ++ str_of_int id in
                (if map_has live k then () else (let _ = map_set live k VNil in ()))
+  | VStr id -> let k = "s" ++ str_of_int id in
+               (if map_has live k then () else (let _ = map_set live k VNil in ()))
   | VArr id -> let k = "a" ++ str_of_int id in
                (if map_has live k then ()
                 else let _ = map_set live k VNil in gc_mark_vals live (deref id))
@@ -28773,6 +28773,8 @@ let gc_fixpoint = fn ivars -> fn live ->
       if str_eq owner "" then gc_mark_val live v
       else if map_has live ("o" ++ owner) then gc_mark_val live v
       else ()) in
+    let _ = (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then ()
+             else print_err ("gc: fixpoint pass live=" ++ str_of_int (map_len live))) in
     if map_len live > before && guard > 0 then go (guard - 1) else () in
   go 1000000;
 
@@ -28865,11 +28867,9 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter undefs mk in
   let _ = map_iter warn_cats mk in
   let _ = map_iter rx_once mk in
-  let _ = map_iter arr_store (fn (k: str) -> fn (xs: Val list) -> gc_mark_vals live xs) in
-  let rec hs = fn (i: int) ->
-    if i >= vec_len hash_store then ()
-    else let _ = gc_mark_vals live (vec_get hash_store i) in hs (i + 1) in
-  let _ = hs 0 in
+  // arr_store and hash_store are NOT roots since the collector took them on:
+  // a reachable array or hash is marked through the VArr / VHsh arms, and an
+  // unreachable one is exactly what gets dropped and compacted away.
   let _ = map_iter proc_store (fn (k: str) -> fn pe ->
     let (_, _, _, penv) = pe in
     map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
@@ -28940,12 +28940,74 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
         // limit hit at a safepoint: nothing of the arena is held above us.
         // Mark from the roots, rebuild into maps born HERE (this lexical
         // scope is the loop's, so they are arena maps), and swap.
-        (let live = map_new () in
+        (let gclog = (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then false else true) in
+         let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)) else ()) in
+         let live = map_new () in
          let _ = gc_mark_roots env live in
+         let _ = (if gclog then print_err ("gc: roots done live=" ++ str_of_int (map_len live)) else ()) in
          let _ = gc_fixpoint ivars live in
          let iv2 = map_new () in
          let oc2 = map_new () in
          let _ = gc_rebuild ivars ocls live iv2 oc2 in
+         // Strings, arrays and hashes (v0.1.297 map_compact / vec_compact):
+         // these stores stay GLOBAL -- threading them through their access
+         // paths costs the transitive closure of 518 functions, measured --
+         // and instead each store drops its dead entries and swaps its own
+         // private arena generation. Vec ids are positional, so a dead slot
+         // is BLANKED (the id stays valid-and-empty forever; ~17 bytes of
+         // stub against the string it used to hold); map ids are counter-
+         // allocated, so dead entries are deleted outright.
+         // Mass deletion goes clear-and-reset, never key-by-key: map_delete
+         // rebuilds the hash index into the map's region PER CALL, and the
+         // first version of this block watched arr_store's fresh private
+         // arena double to 68 GB from exactly that (mere v0.1.298 has the
+         // full story). The survivor lists live in the loop's arena and die
+         // at the swap.
+         let liveAK = map_new () in
+         let _ = map_iter arr_store (fn (k: str) -> fn (xs: Val list) ->
+           if map_has live ("a" ++ k) then (let _ = map_set liveAK k xs in ()) else ()) in
+         let _ = map_clear arr_store in
+         let _ = map_iter liveAK (fn (k: str) -> fn (xs: Val list) -> map_set arr_store k xs) in
+         let _ = map_compact arr_store in
+         // blank ONCE: a slot blanked by an earlier collection is not live and
+         // must not be re-blanked -- each re-blank would allocate a fresh ""
+         // copy in the store's arena, and with ids monotonic the re-blank set
+         // only grows. (First version re-blanked every dead slot every
+         // collection: 100+ collections x ~1M slots of allocation.)
+         let rec blank_h = fn (i: int) ->
+           if i >= vec_len hash_store then ()
+           else
+             let _ = (if map_has live ("h" ++ str_of_int i) then ()
+                      else (match hderef i with
+                            | Nil -> ()
+                            | _ -> (let _ = hset i (Nil : Val list) in ()))) in
+             blank_h (i + 1) in
+         let _ = blank_h 0 in
+         let _ = vec_compact hash_store in
+         let rec blank_s = fn (i: int) ->
+           if i >= vec_len str_store then ()
+           else
+             let _ = (if map_has live ("s" ++ str_of_int i) then ()
+                      else (if str_eq (sget i) "" then () else sset i "")) in
+             blank_s (i + 1) in
+         let _ = blank_s 0 in
+         let _ = vec_compact str_store in
+         // side tables keyed by string id: without this they pin nothing (the
+         // string is blanked either way) but they grow forever; and str_enc
+         // was measured at 200k entries on a string-heavy run.
+         let liveE = map_new () in
+         let _ = map_iter str_enc (fn (k: str) -> fn (v: str) ->
+           if map_has live ("s" ++ k) then (let _ = map_set liveE k v in ()) else ()) in
+         let _ = map_clear str_enc in
+         let _ = map_iter liveE (fn (k: str) -> fn (v: str) -> map_set str_enc k v) in
+         let _ = map_compact str_enc in
+         let liveF = map_new () in
+         let _ = map_iter str_frozen (fn (k: str) -> fn (v: str) ->
+           if map_has live ("s" ++ k) then (let _ = map_set liveF k v in ()) else ()) in
+         let _ = map_clear str_frozen in
+         let _ = map_iter liveF (fn (k: str) -> fn (v: str) -> map_set str_frozen k v) in
+         let _ = map_compact str_frozen in
+         let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len iv2)) else ()) in
          // the next threshold charges each collection's COST against the
          // garbage that accumulates before the next one. A collection scans
          // arr_store / hash_store whole (this slice does not compact them), so
@@ -28957,7 +29019,14 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
          // that much new garbage, and reclaim still happens several times a
          // run. Measured on 200k dead objects: 1012 -> 876 MiB, and FASTER
          // (2.43s vs 2.56s): less allocation is less page faulting, again.
-         let scan = map_len arr_store + vec_len hash_store in
+         // the scan now includes the vec stores: their ids are positional and
+         // never removed, so a collection walks every slot EVER created --
+         // charging the trigger with that walk is what keeps the total
+         // collection cost proportional to total allocation. (Without it the
+         // deletion of arr_store entries shrank the old scan term to its
+         // floor, collections fired every ~4000 entries, and a 200k-object
+         // run spent 83 seconds walking a million string slots 100 times.)
+         let scan = map_len arr_store + vec_len hash_store + vec_len str_store in
          let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
          let t2 = map_len iv2 + map_len oc2 + delta in
          Continue ((meths, sup, oc2, iv2), cursor + consumed, v2, t2))
