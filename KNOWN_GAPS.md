@@ -937,6 +937,40 @@ today, same binary semantics; the non-reproducibility section above exists for
 a reason). The mountain that remains is the other stores -- str_store /
 arr_store / ivars and friends, the "next slice" threading already recorded.
 
+### The mountain was not the stores, and "the last statement runs bare" (2026-08-22)
+
+The prediction above was wrong, and the byte rows that `MERE_RUBY_STORE_STATS=1`
+now prints are what killed it: after the frame pool, ALL the object stores
+together hold ~430 MB of a ~10 GB rubocop load. The resident memory lives in
+REGIONS -- and sampling the default region's allocation sites (a scratch
+instrumented build; the sampler pairs each allocation's PC with its caller)
+named two causes, one here and one upstream.
+
+Here: `run_stmts` wrapped every statement of a body in `region STMT { }` --
+EXCEPT the last one, whose value is the body's result and which therefore ran
+bare, "into whatever region is current". When the current region is the
+default one and the last statement is `require "rubocop"`, the entire 250-file
+subtree runs with every method call's copy-out (~600 bytes each, one per
+call, 3.3 GB of a load) and every statement's scratch going to the region
+that never frees. The last statement now runs under the same region and
+per-type copy-out as every other statement; sound by the same two rules
+(flow values copy out, stores copy in on write).
+
+Upstream (mere v0.1.301): a `fail` that longjmped out of nested region blocks
+leaked every chain it jumped over -- recorded in the compiler as acceptable
+when regions were rare. An interpreter that wraps every call in a region and
+models every guest exception as a fail leaked ~1 MB per caught failure
+(measured: 2,000 rescues = 2.1 GB; flat at 4 MB with the fix). The C backend
+now unwinds an active-region stack from try_or's catch arm.
+
+Measured after both (same day, same machine, three runs each): rubocop load
+11.2-12.6 -> **9.1-10.1 GB**, time unchanged; w1/w2/w3 unchanged (their
+last statements were cheap). What remains is quantized arena slack (the
+default region's doubling chain counts 17.2 GB of address space for ~2 GB
+of use -- blocks that grew and were abandoned half-empty) plus what the load
+genuinely keeps live; the next honest step is a compacting pass or a
+smaller-doubling policy, not another leak hunt.
+
 ## The Wasm playground has no sockets, no files, and no stderr of its own
 
 `docs/build.sh` works again (Mere v0.1.259 — four Wasm-backend bugs, of which
