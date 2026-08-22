@@ -898,6 +898,45 @@ inside this repo is to stop using Mere `Map`s for the Ruby heap and put objects
 in a self-managed arena with its own free lists, which is a rewrite of the value
 representation rather than an addition to it.
 
+### The upstream capability arrived, and the frames came back (2026-08-22)
+
+Mere v0.1.300 added `map_recycle`: wipe a map AND wind its private arena back
+to one warm 4 KB seed, freeing the growth blocks through libc. That is the
+"container whose memory dies" the paragraph above asked for, in the form this
+interpreter can actually use -- not tied to a region's lexical extent, because
+a frame's extent is dynamic (it dies at return, UNLESS a proc captured it).
+
+On top of it, the frame pool: `call_method` / `run_meth` take each method
+call's frame from a pool of recycled frames and hand it back at return. The
+one soundness question is capture -- a proc, a captured yield block, or a
+Thread body holds its env beyond the call -- and the answer is a `__captured`
+mark written at the choke points every proc-shaped store already goes through
+(`store_proc` / `store_yblk`, wrapping the twenty-two `proc_store` and four
+`proc_yblk` write sites), walking the scope chain via `lv_parent_of`. A marked
+frame is simply never pooled. Bindings need nothing: `binding` stores an
+`lv_flat` copy, not the frame.
+
+Measured (all on the same day, same machine, three runs each):
+
+| workload | before | after |
+|---|---|---|
+| dead objects (w2) | 815 MiB | **454 MiB** |
+| plain calls (w3) | 296 MiB | **174 MiB** |
+| rubocop load, peak RSS | 12.1-13.9 GB | 11.2-12.6 GB |
+| rubocop load, frames created | one per call | **5,967 for 5.47M calls** |
+
+The counters (`MERE_RUBY_STORE_STATS=1` prints them) are the deterministic
+answer peak RSS is not at this scale: 5.47M method calls were served by 5,967
+actual frames (916x reuse, zero pool drops), and 22.4 GB of frame-arena bytes
+were wound back over the load -- with the caveat that ~4 KB of that figure per
+return is the seed floor, so it measures traffic through the pool, not what
+the old code would have leaked. What peak RSS does say: the frame share of a
+rubocop load is gone (the honest ~1.5 GB, not the 12 GB a single noisy run
+suggested the day before -- yesterday's 19.8 GB baseline measured 12.1-13.9
+today, same binary semantics; the non-reproducibility section above exists for
+a reason). The mountain that remains is the other stores -- str_store /
+arr_store / ivars and friends, the "next slice" threading already recorded.
+
 ## The Wasm playground has no sockets, no files, and no stderr of its own
 
 `docs/build.sh` works again (Mere v0.1.259 — four Wasm-backend bugs, of which
