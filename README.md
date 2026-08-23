@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 159 programs, byte-for-byte
+./run_corpus.sh                                  # 160 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -319,7 +319,7 @@ same idea as the tags/filter files every other implementation keeps. Passing
 target is the `language` and `core` groups, with `command_line` low-priority
 and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
 
-The record covers **1054 spec files** across 26 groups: **421 MATCH, 605 DIFF,
+The record covers **1054 spec files** across 26 groups: **428 MATCH, 598 DIFF,
 22 CRASH**, 5 SKIP, 1 SLOW. Run with no directories, the sweep refreshes exactly
 the groups the table already has, so the numbers above are reproducible rather
 than a snapshot.
@@ -330,8 +330,8 @@ rather than for breakage -- real programs (the corpus) match exactly while a
 value class scores low on an error message or a frozen-object check.
 
 Naming it is what `CAUSES.md` is for. Grouped by cause, the 605 DIFFs come down
-to **125 kinds**, and the two largest are `NoMethodError` (139 files) and
-`NameError` (68): a third of the gap is a name that is not there, which is
+to a bounded number of **kinds**, and the two largest are `NoMethodError` and
+`NameError`: a third of the gap is a name that is not there, which is
 missing surface rather than wrong behaviour. Because ruby/spec is laid out as
 `core/<class>/<method>_spec.rb`, those files name the absent methods
 themselves -- `CAUSES.md` ends with that list, per class.

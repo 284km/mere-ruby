@@ -1298,3 +1298,79 @@ list and the dispatcher agree on everything else it claims. What found all
 three was counting from the definition side -- every name the list asserts,
 against every name that appears in a dispatch condition -- rather than reading
 the list and believing it.
+
+## ENV shadowed everything it had not thought of
+
+Fixed. ENV's dispatch matched on the RECEIVER -- "is this the EnvHash object?"
+-- and then handled a fixed list of names, ending in
+
+```
+else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for ENV")
+```
+
+That last line is the bug. A branch keyed on the receiver **ends the search**, so
+every name it did not enumerate was reported absent, including the ones no
+object gets to decline: `ENV.equal?(ENV)`, `.frozen?`, `.hash`, `.itself`,
+`.object_id` all raised on the one object in the program where they do not work.
+Some universal names happened to be answered earlier in the chain and worked,
+which is why this looked like a scatter of missing methods rather than one
+structural fault.
+
+Two changes, and the second is the one worth copying:
+
+- The arm now declines the universal protocol (`is_prim_method`), keeping only
+  `to_s` and `inspect`, which ENV genuinely owns. Anything else falls through to
+  the code that answers it for every other object.
+- **What ENV answers, it answers as a hash** -- because it is one. The fallback
+  builds a hash from the environment and re-dispatches, which is where `each`,
+  `invert`, `select`, `values_at`, `slice`, `except`, `merge`, `rassoc`,
+  `has_value?`, `group_by`, `sum` and the rest come from. The mutating names
+  delegate the same way and then write the resulting hash back.
+
+A delegation like that has one hazard: a mutator that runs on the **copy**
+reports success while the environment stands still. That is a silently wrong
+answer, so the fallback refuses anything ending in `!` or `=` that it has not
+explicitly handled. It is a rule rather than a list, so a name nobody thought of
+fails loudly. (Without a block those same names do not mutate at all -- they
+answer an enumerator -- so that path is exempt, deliberately.)
+
+`ENV.shift` and `ENV.rehash` are implemented; `ENV.delete_if` with no block
+answers a hash where ruby answers an Enumerator, which is the general
+enumerator-from-a-method gap rather than an ENV one. `ENV.class` is still
+`EnvHash` where ruby says `Object`.
+
+Delegating found two bugs that had nothing to do with ENV, below.
+
+## `Hash#slice` returned the value instead of the sub-hash
+
+Fixed. `slice` was an unconditional alias of `[]`, which is right for String and
+Array and wrong for Hash: `{"a"=>1,"b"=>2}.slice("a")` answered `1` instead of
+`{"a"=>1}`. A value where a Hash belongs, and quiet about it -- nothing raises,
+the caller just gets the wrong type.
+
+It surfaced by delegating ENV to Hash, which is the general shape: **routing one
+implementation through another tests the second one with inputs it had not seen.**
+
+## "A bang method answers nil when it changed nothing" was a rule applied to two methods
+
+Fixed. Ruby's in-place methods answer `nil` when they made no modification, and
+`self` when they did. mere-ruby had that for `Array#compact!` and
+`String#upcase!` and not for:
+
+| | before | ruby |
+|---|---|---|
+| `[1,2].reject! { false }` | `[1, 2]` | `nil` |
+| `[1,2].select! { true }` | `[1, 2]` | `nil` |
+| `[1,2].uniq!` | `[1, 2]` | `nil` |
+| `[1,2].flatten!` | `[1, 2]` | `nil` |
+| `{"a"=>1}.reject! { false }` | `{"a"=>1}` | `nil` |
+| `{"a"=>1}.select! { true }` | `{"a"=>1}` | `nil` |
+
+`delete_if` and `keep_if` answer self either way and were already right, which is
+what made the inconsistency easy to miss: two of the five names in the same
+branch had the opposite contract, correctly.
+
+`flatten!` needed a different test from the others. Length cannot see it --
+`[[1],[2]]` flattens to `[1,2]`, same length, different value -- so it asks
+whether any element was an array. A rule copied without checking what it is
+measuring gives the wrong answer in exactly one of the six cases.

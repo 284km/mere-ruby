@@ -15,12 +15,12 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 |---|---|---|---|---|---|---|
 | language | 40 | 21 | 4 | 2 | 0 | 67 |
 | core/string | 32 | 81 | 1 | 0 | 0 | 114 |
-| core/array | 49 | 53 | 3 | 0 | 0 | 105 |
+| core/array | 50 | 52 | 3 | 0 | 0 | 105 |
 | core/hash | 32 | 37 | 0 | 0 | 0 | 69 |
 | core/range | 17 | 16 | 1 | 0 | 1 | 35 |
 | core/comparable | 5 | 2 | 0 | 0 | 0 | 7 |
 | core/complex | 16 | 27 | 0 | 0 | 0 | 43 |
-| core/env | 10 | 35 | 0 | 0 | 0 | 45 |
+| core/env | 16 | 29 | 0 | 0 | 0 | 45 |
 | core/exception | 11 | 25 | 3 | 0 | 0 | 39 |
 | core/false | 2 | 7 | 0 | 0 | 0 | 9 |
 | core/float | 25 | 24 | 1 | 0 | 0 | 50 |

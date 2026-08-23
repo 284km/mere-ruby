@@ -6783,6 +6783,15 @@ and str_hash_go = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
 and arr_hash_go = fn (xs: Val list) -> fn (acc: int) ->
   match xs with Nil -> acc | Cons (h, t) -> arr_hash_go t (floor_mod (acc * 31 + val_hash h) 1000000007);
 
+// Does this list have an array element? flatten! answers nil when there was
+// nothing nested to flatten -- and LENGTH cannot tell: [[1],[2]] flattens to
+// [1,2], same length, different value.
+let rec has_arr_elem = fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (VArr _, _) -> true
+  | Cons (_, t) -> has_arr_elem t;
+
 // flatten one level: array elements are spliced, others kept (for flat_map).
 let rec flatten1 = fn (xs: Val list) ->
   match xs with
@@ -7913,6 +7922,19 @@ let rec hash_except = fn (xs: Val list) -> fn (ks: Val list) ->
      | Cons (v, t) ->
        if val_member ks k then hash_except t ks else Cons (k, Cons (v, hash_except t ks))
      | Nil -> Nil);
+// Hash#slice is the complement of #except: KEEP the listed keys, in the order
+// ruby returns them (the argument order, not the hash's). `slice` used to be an
+// unconditional alias of `[]`, which is right for String and Array and wrong
+// for Hash -- `{"A"=>"1"}.slice("A")` answered `"1"` instead of `{"A"=>"1"}`.
+// A value where a Hash belongs: wrong, and quiet about it.
+let rec hash_slice = fn (xs: Val list) -> fn (ks: Val list) ->
+  match ks with
+  | Nil -> Nil
+  | Cons (k, t) ->
+    // ⚠ a key whose value IS nil must still be kept, so ask whether the key is
+    //   there rather than whether the value is non-nil.
+    if hash_haskey xs k then Cons (k, Cons (hash_get xs k, hash_slice xs t))
+    else hash_slice xs t;
 let rec hash_pairs = fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
@@ -11446,13 +11468,23 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     // delete_if / keep_if filter IN PLACE: the receiver is a handle, so the
     // kept pairs are written back to it instead of returned as a new hash.
     else if str_eq name "delete_if" || str_eq name "reject!" ||
-            str_eq name "keep_if" || str_eq name "select!" then
-      (let keep = str_eq name "keep_if" || str_eq name "select!" in
+            str_eq name "keep_if" || str_eq name "filter!" || str_eq name "select!" then
+      (let keep = str_eq name "keep_if" || str_eq name "select!" || str_eq name "filter!" in
+       // ⚠ the BANG names answer nil when nothing changed; delete_if / keep_if
+       //   always answer self. That is a rule about the name, not a per-method
+       //   choice, and it was implemented for Array#compact! and String#upcase!
+       //   while reject! / select! / uniq! / flatten! returned self either way.
+       let bang = str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!" in
+       let before = val_list_len xs in
        let f = hash_filter world encl theblk xs Nil keep in
-       let _ = (match f with
-                | FNext (VHsh nid) -> (match recv with VHsh hid -> hset hid (hderef nid) | _ -> ())
-                | _ -> ()) in
-       iter_each_result f recv)
+       let changed = (match f with
+                      | FNext (VHsh nid) ->
+                        let after = val_list_len (hderef nid) in
+                        let _ = (match recv with VHsh hid -> hset hid (hderef nid) | _ -> ()) in
+                        not (before == after)
+                      | _ -> false) in
+       if bang && not changed then (match f with FNext _ -> VNil | other -> iter_each_result other recv)
+       else iter_each_result f recv)
     // other Enumerable methods iterate the [k,v] pairs as an array; the
     // block's |k, v| params auto-splat each pair.
     else builtin_iter world encl theblk (arr_new (hash_to_a xs)) name args
@@ -12017,7 +12049,11 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
   | VObj oid ->
     let (m2, s2, ocls2, iv2) = world in
     let cls = map_get ocls2 (str_of_int oid) in
-    if has_meth world cls "inspect"
+    // ⚠ `p ENV` and `ENV.inspect` are the same question. They reached different
+    //   code and gave different answers -- the printer said #<EnvHash:0x..>
+    //   while the method said the environment. Ask once, here.
+    if str_eq cls "EnvHash" then inspect_w env world (mkhash (env_hash_list ()))
+    else if has_meth world cls "inspect"
     then (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v cls "inspect" Nil with VStr s -> sget s | other -> to_s other)
     // `#<struct S a=1, b=2>` -- named when the class was assigned to a
     // constant, and with no address anywhere, so it compares byte for byte.
@@ -12414,6 +12450,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      cp)
   // Array/Hash #inspect (and #to_s, which aliases it) call #inspect on each
   // element; dispatch a user-defined #inspect here where `world` is in scope.
+  // ENV names itself: `ENV.to_s` is the string "ENV" and `ENV.inspect` is the
+  // environment's contents. Both used to reach the ordinary-object printer and
+  // answer `#<EnvHash:0x..>`, which leaks a class name that ruby does not have
+  // (ENV.class is Object there).
+  else if (str_eq name "inspect" || str_eq name "to_s")
+          && (match recv with
+              | VObj oid -> (let (_, _, ocls9, _) = world in str_eq (map_get ocls9 (str_of_int oid)) "EnvHash")
+              | _ -> false) then
+    (if str_eq name "to_s" then mkstr "ENV"
+     else mkstr (inspect_w env world (mkhash (env_hash_list ()))))
   else if (str_eq name "inspect" || str_eq name "to_s")
           && (match recv with VArr _ -> true | VHsh _ -> true | _ -> false)
           && not (has_meth world (class_name recv) name) then
@@ -14251,7 +14297,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
     // ENV: reads consult the write overlay first, then the environment table
     // (so a set-but-empty variable reads as "" like Ruby).
-    else if str_eq cls "EnvHash" then
+    // ENV's own surface. The universal object protocol is NOT ENV's business:
+    // this arm used to capture every name and end in "undefined method for ENV",
+    // which is how `ENV.equal?(ENV)`, `.frozen?`, `.hash`, `.itself`, `.dup`
+    // came to raise on an object where they work on every other. A branch that
+    // matches on the RECEIVER has to say which NAMES it is answering for, or it
+    // shadows everything it did not think of.
+    //
+    // to_s and inspect are the exceptions ENV does own (ruby answers "ENV" and
+    // the environment's contents, not #<Object:0x..>).
+    else if str_eq cls "EnvHash"
+            && (if is_prim_method name
+                then str_eq name "to_s" || str_eq name "inspect"
+                else true) then
       (if str_eq name "[]" then
          (match args with Cons (kv, _) -> env_lookup_v (env_key_of env world kv) | _ -> VNil)
        else if str_eq name "[]=" || str_eq name "store" then
@@ -14324,7 +14382,39 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with Cons (VHsh h, _) -> let _ = env_set_pairs (hderef h) in recv | _ -> recv)
        else if str_eq name "clear" then
          (let _ = env_del_keys (env_hl_keys (env_hash_list ())) in recv)
-       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for ENV"))
+       // ENV's to_s is the literal "ENV"; its inspect is the environment.
+       else if str_eq name "to_s" then mkstr "ENV"
+       else if str_eq name "inspect" then
+         invoke_val_c env world blk (mkhash (env_hash_list ())) "inspect" Nil false
+       // ENV.shift removes and returns the first pair, or nil when empty.
+       else if str_eq name "shift" then
+         (match env_hash_list () with
+          | Cons (k, Cons (v, _)) ->
+            let _ = env_del_keys (Cons (k, Nil)) in
+            arr_new (Cons (k, Cons (v, Nil)))
+          | _ -> VNil)
+       // ENV.rehash answers nil: there is no table to rebuild.
+       else if str_eq name "rehash" then VNil
+       // ⚠ A mutator must not reach the delegation below: it would run on the
+       // COPY and report success while the environment stayed as it was --
+       // a silently wrong answer, which is the one failure a corpus cannot see.
+       // The test is a RULE (a trailing ! or =), so a name nobody thought of
+       // fails loudly instead of quietly.
+       //
+       // reject! / select! / filter! / delete_if / keep_if are exempt HERE
+       // because this arm is the one reached with NO block, and without a block
+       // they do not mutate anything -- they answer an enumerator over the
+       // pairs. The hazard the rule guards against cannot arise.
+       else if (str_ends_with name "!" || str_ends_with name "=")
+               && not (str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!") then
+         raise_exc world "NotImplementedError"
+           ("mere-ruby: ENV." ++ name ++ " is not implemented (it would change the environment)")
+       // Everything else ENV answers, it answers AS a hash -- which is what it
+       // is. Delegating gets each / invert / select / values_at / slice /
+       // except / merge / rassoc / has_value? and the rest with ruby's own
+       // semantics, instead of twenty-five arms written one at a time. A name
+       // Hash does not have raises NoMethodError from Hash, naming Hash.
+       else invoke_val_c env world blk (mkhash (env_hash_list ())) name args false)
     // Enumerator::Lazy surface without a block: take/drop extend the pipeline,
     // first/to_a/force run it (bounded), eager materializes.
     else if str_eq cls "Enumerator::Lazy" then
@@ -15354,6 +15444,37 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           | VNil -> flow_value (run_block world blk newblk (Cons (mkstr k2, Nil)))
           | v -> (if str_eq name "delete" then (let _ = map_set env_ovr k2 VNil in v) else v))
        | _ -> VNil)
+    // ENV with a block. Same idea as the block-free arm: what ENV answers, it
+    // answers as a hash. Delegate to a hash built from the environment, and for
+    // the mutating names write the hash back afterwards -- which gets ruby's
+    // own semantics for each / each_pair / select / reject / delete_if /
+    // keep_if / partition / group_by / sum / min_by / ... instead of an arm per
+    // name, each written once and each able to be subtly different.
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "EnvHash") | _ -> false) then
+      (// ⚠ a mutator this does not know about must not run on the copy and
+       //   report success while the environment stands still. Ends in ! or = is
+       //   a rule; the three that end in neither are named.
+       if (str_ends_with name "!" || str_ends_with name "=")
+          && not (str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!") then
+         raise_exc world "NotImplementedError"
+           ("mere-ruby: ENV." ++ name ++ " is not implemented (it would change the environment)")
+       else
+         let mutates = str_eq name "delete_if" || str_eq name "keep_if"
+                       || str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!" in
+         // the names whose answer is ENV itself rather than a new collection
+         let self_ret = mutates || str_eq name "each" || str_eq name "each_pair"
+                        || str_eq name "each_key" || str_eq name "each_value" in
+         let h = mkhash (env_hash_list ()) in
+         let r = invoke_with_block env world blk h name args newblk in
+         let _ = (if mutates
+                  then (let _ = env_del_keys (env_hl_keys (env_hash_list ())) in
+                        (match h with VHsh hid -> env_set_pairs (hderef hid) | _ -> ()))
+                  else ()) in
+         // reject!/select!/filter! answer nil when nothing changed; the rest of
+         // the self-returning names answer ENV.
+         (match r with
+          | VNil -> if mutates then VNil else (if self_ret then recv else r)
+          | other -> if self_ret then recv else other))
     // Mutex#synchronize { }: lock, run, unlock — the unlock behaves like an
     // ensure (a raising block still releases before the raise continues).
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Mutex") | _ -> false)
@@ -15720,10 +15841,31 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // in-place Array mutators taking a block: map!/select!/reject!/etc.
        else if (str_eq name "map!" || str_eq name "collect!") && (match recv with VArr _ -> true | _ -> false) then
          (match recv with VArr id -> (match arr_map world blk newblk (deref id) Nil with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+       // ⚠ select! / reject! answer nil when nothing was removed; keep_if and
+       //   delete_if answer self either way. Same rule as Hash's, and it was
+       //   missing on both sides.
        else if (str_eq name "select!" || str_eq name "keep_if" || str_eq name "filter!") && (match recv with VArr _ -> true | _ -> false) then
-         (match recv with VArr id -> (match arr_filter world blk newblk (deref id) Nil true with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+         (match recv with
+          | VArr id ->
+            let before = val_list_len (deref id) in
+            (match arr_filter world blk newblk (deref id) Nil true with
+             | FNext (VArr nid) ->
+               let _ = arr_set id (deref nid) in
+               if str_eq name "keep_if" then recv
+               else if val_list_len (deref id) == before then VNil else recv
+             | other -> flow_value other)
+          | _ -> recv)
        else if (str_eq name "reject!" || str_eq name "delete_if") && (match recv with VArr _ -> true | _ -> false) then
-         (match recv with VArr id -> (match arr_filter world blk newblk (deref id) Nil false with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+         (match recv with
+          | VArr id ->
+            let before = val_list_len (deref id) in
+            (match arr_filter world blk newblk (deref id) Nil false with
+             | FNext (VArr nid) ->
+               let _ = arr_set id (deref nid) in
+               if str_eq name "delete_if" then recv
+               else if val_list_len (deref id) == before then VNil else recv
+             | other -> flow_value other)
+          | _ -> recv)
        // sort / sort! with a comparator block.
        else if str_eq name "sort" && (match recv with VArr _ -> true | _ -> false) then
          (match recv with VArr id -> arr_new (sort_blk world newblk (deref id)) | _ -> recv)
@@ -17595,6 +17737,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> mkstr (str_chomp s))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "chomp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chomp'")) in fail "mere-ruby: undefined method 'chomp'")))
   else if str_eq name "chop" then (match recv with VStr s -> mkstr (str_chop (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "chop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chop'")) in fail "mere-ruby: undefined method 'chop'")))
+  // Hash#slice returns a sub-hash; for String and Array slice IS []
+  else if str_eq name "slice" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with VHsh xs -> mkhash (hash_slice (hderef xs) args) | _ -> recv)
   else if str_eq name "slice" then prim_method recv "[]" args
   else if str_eq name "tr" then
     (match recv with
@@ -17929,7 +18074,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "reverse!" then
     (match recv with VArr id -> let _ = arr_set id (val_rev (deref id) Nil) in recv | _ -> (let _ = map_set prim_missing "n" (mkstr "reverse!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse!'")) in fail "mere-ruby: undefined method 'reverse!'")))
   else if str_eq name "uniq!" then
-    (match recv with VArr id -> let _ = arr_set id (val_uniq (deref id) Nil) in recv | _ -> (let _ = map_set prim_missing "n" (mkstr "uniq!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq!'")) in fail "mere-ruby: undefined method 'uniq!'")))
+    (match recv with VArr id -> let before = val_list_len (deref id) in let _ = arr_set id (val_uniq (deref id) Nil) in (if val_list_len (deref id) == before then VNil else recv) | _ -> (let _ = map_set prim_missing "n" (mkstr "uniq!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq!'")) in fail "mere-ruby: undefined method 'uniq!'")))
   else if str_eq name "insert" then
     (match recv with
      | VArr id -> (match args with Cons (VInt i, rest) -> let xs = deref id in let n = val_list_len xs in let k = (if i < 0 then n + i + 1 else i) in let _ = arr_set id (list_append (vtake xs k) (list_append rest (vdrop xs k))) in recv | _ -> recv)
@@ -17961,7 +18106,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr s -> let s = sget s in (match args with Cons (VStr _, _) -> mkstr (str_delete_sets s (collect_str_args args)) | _ -> mkstr s)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "delete") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete'")) in fail "mere-ruby: undefined method 'delete'")))
   else if str_eq name "flatten!" then
-    (match recv with VArr id -> let flat = val_flatten (deref id) (match args with Cons (VInt d, _) -> d | _ -> 0 - 1) in let _ = arr_set id flat in recv | _ -> (let _ = map_set prim_missing "n" (mkstr "flatten!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten!'")) in fail "mere-ruby: undefined method 'flatten!'")))
+    // nil when nothing was nested to flatten (the same rule as compact!)
+    (match recv with VArr id -> let d0 = (match args with Cons (VInt d, _) -> d | _ -> 0 - 1) in let nested = has_arr_elem (deref id) in let flat = val_flatten (deref id) d0 in let _ = arr_set id flat in (if d0 == 0 then VNil else if nested then recv else VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "flatten!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten!'")) in fail "mere-ruby: undefined method 'flatten!'")))
   else if str_eq name "compact!" then
     (match recv with VArr id -> let xs = deref id in let c = val_compact xs in let _ = arr_set id c in (if val_list_len c == val_list_len xs then VNil else recv) | _ -> (let _ = map_set prim_missing "n" (mkstr "compact!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact!'")) in fail "mere-ruby: undefined method 'compact!'")))
   else if str_eq name "pop" then

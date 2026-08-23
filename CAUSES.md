@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 627 files.
+Classified: 620 files.
 
 ## CRASH — 22 files, 13 kinds
 
@@ -52,46 +52,48 @@ Classified: 627 files.
 
 </details>
 
-## DIFF — 605 files, 125 kinds
+## DIFF — 598 files, 124 kinds
 
 | files | kind |
 |---|---|
-| 139 | `ERROR NoMethodError` |
+| 126 | `ERROR NoMethodError` |
 | 68 | `ERROR NameError` |
 | 29 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 29 | `FAILED expected "S", got "S"` |
+| 28 | `FAILED expected "S", got "S"` |
 | 28 | `ERROR StandardError` |
 | 26 | `ERROR ArgumentError` |
-| 21 | `FAILED expected true, got false` |
-| 21 | `FAILED expected TypeError to be raised` |
+| 24 | `FAILED expected TypeError to be raised` |
+| 23 | `FAILED expected true, got false` |
 | 21 | `FAILED expected N, got N` |
-| 19 | `FAILED expected ArgumentError to be raised` |
+| 20 | `FAILED expected ArgumentError to be raised` |
 | 17 | `FAILED expected N, got nil` |
-| 14 | `FAILED expected to be identical` |
+| 16 | `FAILED expected to be identical` |
 | 12 | `FAILED expected false, got true` |
+| 6 | `FAILED expected "S", got nil` |
 | 6 | `ERROR TypeError` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
 | 5 | `FAILED expected not N` |
-| 5 | `FAILED expected "S", got nil` |
-| 4 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 4 | `FAILED expected LocalJumpError to be raised` |
-| 3 | `FAILED raised NoMethodError, expected TypeError` |
+| 3 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 3 | `FAILED matcher did not match #<OBJ>` |
 | 3 | `FAILED expected [N, N, N, N], got []` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
-| 3 | `FAILED expected "S" to match` |
 | 2 | `FAILED raised StandardError, expected ZeroDivisionError` |
+| 2 | `FAILED raised NoMethodError, expected TypeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NameError, expected TypeError` |
 | 2 | `FAILED expected nil, got N` |
+| 2 | `FAILED expected ["S", "S"], got nil` |
 | 2 | `FAILED expected ["S", "S", "S"], got ["S", "S", "S"]` |
 | 2 | `FAILED expected ZeroDivisionError to be raised` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
+| 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR SystemStackError` |
+| 2 | `ERROR FrozenError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `FAILED raised StandardError, expected IndexError` |
@@ -101,12 +103,12 @@ Classified: 627 files.
 | 1 | `FAILED raised NoMethodError, expected IndexError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
-| 1 | `FAILED expected {}, got nil` |
 | 1 | `FAILED expected {N=>N, N=>N}, got {}` |
 | 1 | `FAILED expected {N=>N, N=>N}, got {N=>N}` |
 | 1 | `FAILED expected {:SYM=>N}, got {}` |
 | 1 | `FAILED expected {:SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {:SYM=>N, :SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
+| 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S", "S"=>"S"}, got {:SYM=>"S", :SYM=>"S", :SYM=>nil}` |
 | 1 | `FAILED expected true, got nil` |
@@ -114,8 +116,6 @@ Classified: 627 files.
 | 1 | `FAILED expected not {N=>N}` |
 | 1 | `FAILED expected not nil` |
 | 1 | `FAILED expected nil, got []` |
-| 1 | `FAILED expected nil, got [[...]]` |
-| 1 | `FAILED expected nil, got [N, N, N]` |
 | 1 | `FAILED expected nil, got "S"` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
@@ -128,6 +128,7 @@ Classified: 627 files.
 | 1 | `FAILED expected [[N, N], [N, N], [N, N]], got [[N, N], [N, N], [N, N]]` |
 | 1 | `FAILED expected [[N, N, N], [N, N, N], [N, N, N], [N, N, N], [N, N, N], [N, N, N]], got [[N, N], [N, N]]` |
 | 1 | `FAILED expected [[:SYM], [:SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]]` |
+| 1 | `FAILED expected [["S", "S"], ["S", "S"]], got [[["S", "S"]], [["S", "S"]]]` |
 | 1 | `FAILED expected [NaN], got [NaN]` |
 | 1 | `FAILED expected [N, N], got nil` |
 | 1 | `FAILED expected [N, N], got []` |
@@ -144,7 +145,6 @@ Classified: 627 files.
 | 1 | `FAILED expected [:SYM, :SYM, N], got [:SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
 | 1 | `FAILED expected ["S", N, "S", N, N, "S", nil, "S"], got ["S", N, "S", N, N, "S", "S"]` |
-| 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S"], got []` |
 | 1 | `FAILED expected ["S", "S"], got ["S"]` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
@@ -178,7 +178,6 @@ Classified: 627 files.
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
-| 1 | `ERROR FrozenError` |
 | 1 | `ERROR Errno::ENOENT` |
 | 1 | `ERROR Encoding::UndefinedConversionError` |
 
@@ -186,24 +185,25 @@ Classified: 627 files.
 
 | files | cause |
 |---|---|
-| 21 | `FAILED: expected TypeError to be raised` |
-| 19 | `FAILED: expected ArgumentError to be raised` |
+| 24 | `FAILED: expected TypeError to be raised` |
+| 20 | `FAILED: expected ArgumentError to be raised` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
 | 5 | `FAILED: expected not 0` |
-| 4 | `FAILED: raised NoMethodError, expected ArgumentError` |
+| 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
 | 4 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `pass=2 fail=0 err=0` |
-| 3 | `FAILED: retains compare_by_identity flag: expected true, got false` |
-| 3 | `FAILED: raised NoMethodError, expected TypeError` |
+| 3 | `FAILED: raised NoMethodError, expected ArgumentError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
 | 3 | `FAILED: always returns the same string: expected to be identical` |
 | 2 | `FAILED: yields in turn the last length-1 values from the array: expected [2, 3, 4, 5], got []` |
 | 2 | `FAILED: tries to convert length to an integer using to_int: expected "^_^", got "^"` |
+| 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns self: expected to be identical` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised StandardError, expected ZeroDivisionError` |
+| 2 | `FAILED: raised NoMethodError, expected TypeError` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: raised NameError, expected TypeError` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
@@ -225,7 +225,6 @@ Classified: 627 files.
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: uses eql? semantics: expected [1.0, 1], got [1.0]` |
 | 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
-| 1 | `FAILED: uses Kahan's compensated summation algorithm for precise sum of float numbers: expected 50.0, got 50.00000000000001` |
 
 </details>
 
@@ -238,10 +237,10 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| env (28) | `clear delete_if each_key each_pair each each_value except filter has_key has_value invert keep_if key length member merge rassoc rehash reject replace select shift slice store to_h update value values_at` |
 | kernel (23) | `Rational __method__ binding chomp chop comparison enum_for fail format global_variables initialize_clone initialize_copy initialize_dup instance_variable_get lambda loop method public_send respond_to_missing select singleton_method test warn` |
 | rational (15) | `ceil div divide divmod floor magnitude marshal_dump minus multiply plus quo rationalize round truncate zero` |
 | integer (15) | `case_compare ceildiv denominator div fdiv gcd numerator ord pred rationalize remainder round size succ try_convert` |
+| env (15) | `delete_if each_key each each_value filter has_key has_value keep_if key length member reject select store update` |
 | struct (13) | `deconstruct_keys deconstruct dig each_pair element_reference element_set filter initialize keyword_init length new size values_at` |
 | exception (13) | `backtrace_locations backtrace detailed_message errno exception interrupt io_error key_error load_error signal_exception syntax_error system_call_error uncaught_throw_error` |
 | complex (12) | `angle conj constants denominator imag integer magnitude marshal_dump numerator phase quo rect` |
