@@ -29,11 +29,15 @@ trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/pre.c" <<'PRE'
 #include <dlfcn.h>
 #define __DS_N 65536
-/* two tables: keyed by the direct caller of region_alloc, and by that
-   caller's caller — the second names WHICH map a shared map runtime is
-   filling, which the first cannot. ra(1) is safe here because the build
-   keeps frame pointers (-fno-omit-frame-pointer below). */
-static struct { void* a; unsigned long long c, b; } __ds0[__DS_N], __ds1[__DS_N];
+/* THREE tables: the direct caller of region_alloc, its caller, and one more.
+   Each level answers a different question and none of them answers the next
+   one: level 0 names the allocating helper (__mcopy_Val), level 1 names the
+   runtime that called it (mere_map_str_Val_set) — and stops there, because a
+   shared map runtime is the same code for every map. Level 2 is the first
+   level that names the INTERPRETER function doing the writing, which is what
+   a fix has to be written against. Frame pointers are kept (see the clang
+   flags below) so walking two frames up is defined. */
+static struct { void* a; unsigned long long c, b; } __ds0[__DS_N], __ds1[__DS_N], __ds2[__DS_N];
 static void __ds_note_in(void* ra, unsigned long long n,
                          struct { void* a; unsigned long long c, b; } * t) {
   unsigned long long h = ((unsigned long long)ra) >> 2;
@@ -44,9 +48,10 @@ static void __ds_note_in(void* ra, unsigned long long n,
     if (t[k].a == 0)  { t[k].a = ra; t[k].c = 1; t[k].b = n; return; }
   }
 }
-static void __ds_note(void* ra0, void* ra1, unsigned long long n) {
+static void __ds_note(void* ra0, void* ra1, void* ra2, unsigned long long n) {
   __ds_note_in(ra0, n, __ds0);
   __ds_note_in(ra1, n, __ds1);
+  __ds_note_in(ra2, n, __ds2);
 }
 static void __ds_dump(const char* tag,
                       struct { void* a; unsigned long long c, b; } * t) {
@@ -66,6 +71,7 @@ static void __attribute__((destructor)) __ds_report(void) {
   fprintf(stderr, "DEFSITES base=%p\n", base);
   __ds_dump("SITE", __ds0);
   __ds_dump("UPSITE", __ds1);
+  __ds_dump("UP2SITE", __ds2);
 }
 PRE
 
@@ -90,7 +96,8 @@ anchor = b"size_t aligned = (n + 7) & ~((size_t)7);"
 i = b.index(anchor)
 j = b.index(b"\n", i)
 b = b[:j] + (b"\n  if (shared) __ds_note(__builtin_return_address(0),"
-             b" __builtin_return_address(1), aligned);") + b[j:]
+             b" __builtin_return_address(1), __builtin_return_address(2),"
+             b" aligned);") + b[j:]
 
 open(dst, "wb").write(b)
 PYEOF
@@ -104,7 +111,7 @@ clang -O2 -fno-omit-frame-pointer -Wl,-no_deduplicate -Wl,-stack_size,0x20000000
 
 # --- run and symbolize --------------------------------------------------------
 "$tmp/mr" "$1" > /dev/null 2> "$tmp/err" || true
-grep -E '^(DEFSITES|SITE|UPSITE)' "$tmp/err" > "$tmp/sites" || {
+grep -E '^(DEFSITES|SITE|UPSITE|UP2SITE)' "$tmp/err" > "$tmp/sites" || {
   echo "no DEFSITES output — did the workload crash?"; tail -5 "$tmp/err"; exit 1; }
 
 base=$(sed -n 's/^DEFSITES base=\(.*\)/\1/p' "$tmp/sites")
@@ -129,5 +136,6 @@ show_table() { # $1 = SITE|UPSITE, $2 = heading
   printf 'default-region total: %s MiB across the listed %s rows\n' "$(mib "$total")" "$tag"
 }
 
-show_table SITE   "site (caller of region_alloc)"
-show_table UPSITE "one level up (caller's caller)"
+show_table SITE    "site (caller of region_alloc)"
+show_table UPSITE  "one level up (caller's caller)"
+show_table UP2SITE "two levels up (the interpreter function)"

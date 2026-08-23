@@ -8704,6 +8704,12 @@ let gc_collect = fn env -> fn world ->
     let _ = map_compact call_meths_s in
     let _ = map_compact cur_pos_s in
     let _ = map_compact call_lines in
+    // cur_pos: two keys, one write per STATEMENT executed (the SLine marker) --
+    // 14.9M writes and 456 MB of orphaned boxes in a rubocop load, the second
+    // biggest emitter after `globals`. Safe to compact because its only reader
+    // extracts the int (a Val read out of a compacted map must not be held:
+    // see thread_flag).
+    let _ = map_compact cur_pos in
     let _ = map_compact live_frames in
     let _ = map_compact struct_ctr in
     let _ = map_compact thread_flag in
@@ -15672,7 +15678,12 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set cur_thr "v" (VObj tid) in
           let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
           let _ = map_set catch_depth "n" (VInt 0) in
-          let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
+          // the BOOL, not the Val holding it: thread_flag is compacted at a
+          // safepoint, and a Val read out of it is a pointer into the arena
+          // that compaction frees. The body below runs safepoints, so keeping
+          // the box across it would restore from freed memory -- which reads
+          // back correctly almost always, and is a use-after-free every time.
+          let savedtf = (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false) in
           let _ = map_set thread_flag "n" (VBool true) in
           // $~ is per-thread in Ruby: the body starts with a fresh one and
                  // the Thread body outlives this call: its env chain is captured.
@@ -15687,7 +15698,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let newbud = savedbud - (2000 - remaining) in
           let _ = map_set step_budget "n" (if newbud < 1000 then 1000 else newbud) in
           let _ = map_set globals "~" savedtilde in
-          let _ = map_set thread_flag "n" savedtf in
+          let _ = map_set thread_flag "n" (VBool savedtf) in
           let _ = map_set catch_depth "n" saved in
           let _ = map_set cur_thr "v" savedcur in
           let _ =
@@ -19756,13 +19767,32 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
 // the ten globals a match publishes: `$~` and the numbered groups. The frame
 // starts with them EMPTY -- a method that has not matched sees nil, whatever
 // its caller did -- and they are put back on the way out.
+// `$~` is scoped to a method call, so every call saves it and clears the slot,
+// and restores it on the way out. Both of those used to WRITE unconditionally,
+// twice per call -- and a write to a map orphans the value it replaced in the
+// map's arena forever. For a slot that is already clear (no regex has matched
+// in this program, or the last one was already consumed) the pair wrote VNil
+// over VNil 11 million times in a rubocop load: 500 MB of the default region,
+// for a value that did not change.
+//
+// So: read, compare, write only if it differs. `globals` is deliberately NOT
+// compacted -- the Val returned here is a pointer into its arena and is held
+// across the whole call body, which compaction would free (see thread_flag) --
+// and it does not need to be, because a write that does not happen needs no
+// reclaiming.
 and rx_state_save = fn (u: unit) ->
   if map_has globals "~" then
     (let v = map_get globals "~" in
-     let _ = map_set globals "~" VNil in v)
+     match v with
+     | VNil -> v
+     | _ -> (let _ = map_set globals "~" VNil in v))
   else VNil
 
-and rx_state_restore = fn (v: Val) -> map_set globals "~" v
+and rx_state_restore = fn (v: Val) ->
+  let cur = (if map_has globals "~" then map_get globals "~" else VNil) in
+  match v with
+  | VNil -> (match cur with VNil -> () | _ -> (let _ = map_set globals "~" VNil in ()))
+  | _ -> (let _ = map_set globals "~" v in ())
 
 // the linearized ancestor chain of a class: the class, then its included
 // modules (later includes first, MRO order), then the superclass's chain.
@@ -20255,8 +20285,14 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let _ = if str_eq fidk "" then () else map_set live_frames fidk (VBool true) in
   // a method call is a `return` boundary: a return inside the body returns from
   // this method, even when the call happens inside a Thread.new block.
-  let savedtf = (if map_has thread_flag "n" then map_get thread_flag "n" else VBool false) in
-  let _ = map_set thread_flag "n" (VBool false) in
+  // The BOOL, not the Val (see the Thread.new site): thread_flag is compacted
+  // at a safepoint and the body below hits safepoints, so a Val read out of it
+  // must not be held across the call. Writing only when the value CHANGES is
+  // the other half: this runs once per method call, and every write orphans
+  // the previous box in the map's arena forever -- 5.5M writes for one bit
+  // that is already false almost every time.
+  let savedtf = (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false) in
+  let _ = if savedtf then map_set thread_flag "n" (VBool false) else () in
   // A REGION PER CALL, body only. The 2026-08-20 attempt wrapped the whole
   // call and died on the frame's type (a container born in a block binds to
   // the block, and a frame captured by define_method must outlive it). The
@@ -20277,7 +20313,11 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let _ = map_set cur_pos "l" (VInt (match map_get call_lines (str_of_int cd) with VInt n -> n | _ -> 0)) in
   let _ = map_set cur_pos_s "f" (if map_has call_files_s (str_of_int cd) then map_get call_files_s (str_of_int cd) else "") in
   let _ = map_set cur_pos_s "m" (if map_has call_meths_s (str_of_int cd) then map_get call_meths_s (str_of_int cd) else "") in
-  let _ = map_set thread_flag "n" savedtf in
+  // read, compare, write only if it differs -- the body may have left the flag
+  // set (a nested Thread.new), so "skip the restore because we skipped the
+  // entry write" would be wrong.
+  let nowtf = (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false) in
+  let _ = if nowtf == savedtf then () else map_set thread_flag "n" (VBool savedtf) in
   let _ = if str_eq fidk "" then () else map_delete live_frames fidk in
   match f with
   | FRaise _ ->
@@ -29569,6 +29609,20 @@ let store_stats = fn world ->
   let _ = row "meth_cref" (map_len meth_cref) in
   let _ = row "dm_methods" (map_len dm_methods) in
   let _ = row "loaded_files" (map_len loaded_files) in
+  // The call-bookkeeping maps' ARENAS. gc_collect compacts these, which moves
+  // their write churn out of the default region and into a private arena --
+  // and a private arena is invisible to MERE_REGION_STATS. Without these rows
+  // the compaction would look like the memory vanished when it only left the
+  // frame the other meter can see.
+  let _ = row "bytes_call_names" (map_bytes call_names_s) in
+  let _ = row "bytes_call_files" (map_bytes call_files_s) in
+  let _ = row "bytes_call_meths" (map_bytes call_meths_s) in
+  let _ = row "bytes_cur_pos" (map_bytes cur_pos_s) in
+  let _ = row "bytes_call_lines" (map_bytes call_lines) in
+  let _ = row "bytes_live_frames" (map_bytes live_frames) in
+  let _ = row "bytes_struct_ctr" (map_bytes struct_ctr) in
+  let _ = row "bytes_thread_flag" (map_bytes thread_flag) in
+  let _ = row "bytes_gc_bare" (map_bytes gc_bare) in
   row "insp_seen" (map_len insp_seen);
 
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
