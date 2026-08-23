@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 620 files.
+Classified: 610 files.
 
 ## CRASH — 22 files, 13 kinds
 
@@ -52,20 +52,20 @@ Classified: 620 files.
 
 </details>
 
-## DIFF — 598 files, 124 kinds
+## DIFF — 588 files, 124 kinds
 
 | files | kind |
 |---|---|
-| 126 | `ERROR NoMethodError` |
+| 111 | `ERROR NoMethodError` |
 | 68 | `ERROR NameError` |
 | 29 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 29 | `ERROR StandardError` |
 | 28 | `FAILED expected "S", got "S"` |
-| 28 | `ERROR StandardError` |
 | 26 | `ERROR ArgumentError` |
 | 24 | `FAILED expected TypeError to be raised` |
 | 23 | `FAILED expected true, got false` |
+| 23 | `FAILED expected ArgumentError to be raised` |
 | 21 | `FAILED expected N, got N` |
-| 20 | `FAILED expected ArgumentError to be raised` |
 | 17 | `FAILED expected N, got nil` |
 | 16 | `FAILED expected to be identical` |
 | 12 | `FAILED expected false, got true` |
@@ -91,6 +91,7 @@ Classified: 620 files.
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
+| 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR FrozenError` |
@@ -151,7 +152,6 @@ Classified: 620 files.
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
-| 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
@@ -186,7 +186,7 @@ Classified: 620 files.
 | files | cause |
 |---|---|
 | 24 | `FAILED: expected TypeError to be raised` |
-| 20 | `FAILED: expected ArgumentError to be raised` |
+| 23 | `FAILED: expected ArgumentError to be raised` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
 | 5 | `FAILED: expected not 0` |
 | 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
@@ -238,25 +238,25 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | kernel (23) | `Rational __method__ binding chomp chop comparison enum_for fail format global_variables initialize_clone initialize_copy initialize_dup instance_variable_get lambda loop method public_send respond_to_missing select singleton_method test warn` |
-| rational (15) | `ceil div divide divmod floor magnitude marshal_dump minus multiply plus quo rationalize round truncate zero` |
-| integer (15) | `case_compare ceildiv denominator div fdiv gcd numerator ord pred rationalize remainder round size succ try_convert` |
 | env (15) | `delete_if each_key each each_value filter has_key has_value keep_if key length member reject select store update` |
+| rational (14) | `ceil div divide divmod floor magnitude marshal_dump minus multiply plus quo round truncate zero` |
 | struct (13) | `deconstruct_keys deconstruct dig each_pair element_reference element_set filter initialize keyword_init length new size values_at` |
 | exception (13) | `backtrace_locations backtrace detailed_message errno exception interrupt io_error key_error load_error signal_exception syntax_error system_call_error uncaught_throw_error` |
-| complex (12) | `angle conj constants denominator imag integer magnitude marshal_dump numerator phase quo rect` |
+| integer (11) | `case_compare ceildiv div gcd ord pred remainder round size succ try_convert` |
 | symbol (10) | `all_symbols case_compare encoding id2name intern match name next size slice` |
 | string (10) | `each_grapheme_cluster grapheme_clusters inspect scrub to_c to_r to_sym undump unicode_normalize unicode_normalized` |
-| numeric (10) | `angle conj denominator fdiv i imag modulo numerator phase rect` |
 | matchdata (10) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match offset regexp` |
+| complex (10) | `angle conj constants imag integer magnitude marshal_dump phase quo rect` |
 | method (9) | `case_compare clone curry element_reference hash original_name source_location super_method to_proc` |
-| float (7) | `angle case_compare denominator numerator phase quo rationalize` |
 | unboundmethod (6) | `bind_call clone hash original_name source_location super_method` |
+| numeric (6) | `angle conj imag modulo phase rect` |
 | sizedqueue (5) | `deq enq length push shift` |
 | queue (5) | `deq enq length push shift` |
 | array (5) | `bsearch_index bsearch delete_if repeated_combination repeated_permutation` |
 | language (4) | `alias keyword_arguments metaclass order` |
 | hash (4) | `compact deconstruct_keys fetch_values transform_values` |
-| nil (3) | `rationalize to_c to_r` |
+| float (4) | `angle case_compare phase quo` |
+| nil (2) | `to_c to_r` |
 | range (1) | `step` |
 | comparable (1) | `equal_value` |
 

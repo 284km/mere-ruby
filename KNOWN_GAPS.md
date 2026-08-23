@@ -1374,3 +1374,46 @@ branch had the opposite contract, correctly.
 `[[1],[2]]` flattens to `[1,2]`, same length, different value -- so it asks
 whether any element was an array. A rule copied without checking what it is
 measuring gives the wrong answer in exactly one of the six cases.
+
+## The numeric protocol was answered by some of the classes that share it
+
+Fixed. `numerator` / `denominator` are Numeric's, not Rational's: Integer and
+Rational answered them and Float and Complex said "undefined method". `fdiv` was
+missing on Rational. `Numeric#i` was missing everywhere. `polar` returned a Float
+angle where ruby returns the Integer `0` for a non-negative real.
+
+Measuring it mattered more than the list did. The absent-name list built from
+spec filenames suggested fifteen names each under `integer` and `rational`; a
+matrix of every protocol name against every receiver showed **most of the
+protocol was already there** and the real gap was five rows. `conj`, `imag`,
+`real`, `angle`, `rect`, `abs2`, `magnitude`, `to_c` all worked on all four.
+
+The first matrix was wrong, which is worth recording too: it called `quo` and
+`fdiv` with **no argument**, so both showed as absent on every receiver. A probe
+that does not pass what the method needs measures the arity error, not the
+method. Re-run with arguments, they were fine.
+
+## `rationalize` is implemented, and it is not `to_r`
+
+`Numeric#rationalize` answers the SIMPLEST fraction within the receiver's
+precision; `to_r` answers the exact value. `0.3.rationalize` is `(3/10)` where
+`0.3.to_r` is `(5404319552844595/18014398509481984)`.
+
+This file used to say the name was deliberately unclaimed, because putting
+`to_r` behind it would be "a wrong answer wearing a right one's face". That was
+the right call on the wrong premise: the simplest-fraction search is a **defined
+algorithm** -- the continued-fraction descent through the Stern-Brocot tree,
+which is what CRuby's `nurat_rationalize_internal` runs -- so it could be
+implemented exactly rather than approximated.
+
+The interval is what needed care. With an explicit tolerance it is
+`[x-|eps|, x+|eps|]`. With none, it is **half an ulp on each side**, taken from
+the neighbouring floats (`prev_float` / `next_float`) rather than from the
+denominator of the exact expansion: `1.5`'s exact pair is `3/2`, so a
+denominator-derived interval would be `±1/4` and happen to give the right answer,
+while `0.3`'s would be `±1/2^55` and give back the exact value instead of
+`(3/10)`. One case agreeing is not the interval being right.
+
+The name went back into `is_num_method` **with** the implementation. A claim
+removed while a thing is absent and restored when it exists is the only order in
+which a name list stays true.
