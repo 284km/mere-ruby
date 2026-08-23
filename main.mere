@@ -1144,6 +1144,24 @@ let local_vars_of = fn env ->
                || is_upper_first k in
     if skip then () else (let m = map_len tmp in map_set tmp (str_of_int m) (VSym k))) in
   arr_new (idx_to_list tmp 0 (map_len tmp));
+// Kernel#global_variables: every global the program can read, as symbols. The
+// `globals` map keys are stored WITHOUT the sigil ("~" is $~), so the sigil is
+// put back here; the ones ruby always has are added whether or not this program
+// has touched them, because `global_variables.include?(:$stdout)` is true in a
+// program that never mentions $stdout.
+let global_vars_of = fn (u: unit) ->
+  let tmp = map_new () in
+  let add1 = fn (nm: str) ->
+    (if map_has tmp nm then () else (let m = map_len tmp in map_set tmp nm (VSym nm))) in
+  let _ = map_iter globals (fn (k: str) -> fn (v: Val) -> add1 ("$" ++ k)) in
+  let _ = map_iter gvar_alias (fn (k: str) -> fn (v: Val) -> add1 ("$" ++ k)) in
+  let rec addall = fn (xs: str list) ->
+    (match xs with Nil -> () | Cons (h, t) -> (let _ = add1 h in addall t)) in
+  let _ = addall (str_split "$stdout|$stderr|$stdin|$PROGRAM_NAME|$0|$!|$~|$LOAD_PATH|$LOADED_FEATURES|$,|$;|$/|$*|$$|$?|$DEBUG|$VERBOSE" "|") in
+  let ordered = map_new () in
+  let _ = map_iter tmp (fn (k: str) -> fn (v: Val) ->
+    (let m = map_len ordered in map_set ordered (str_of_int m) v)) in
+  arr_new (idx_to_list ordered 0 (map_len ordered));
 // iteration budget: a top-level counter ticked once per loop iteration so
 // an infinite loop fails fast (a catchable error) instead of hanging.
 let step_budget = map_new ();
@@ -9405,6 +9423,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if map_has meths name then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if str_eq name "local_variables" then local_vars_of env
+    else if str_eq name "global_variables" && (if map_has meths name then false else true) then global_vars_of ()
     // Kernel#binding: capture the current locals env (which holds "self") --
     // unless the receiver has its own `binding` (rubocop-ast's compiler holds
     // its variable bindings in an `attr_reader :binding`, and a builtin must
@@ -9554,6 +9573,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (let _ = (match args with Cons (VSym s, _) -> map_set r2k_methods s VNil | _ -> ()) in
        (match args with Cons (a, _) -> a | _ -> VNil))
     else if str_eq name "local_variables" && (if map_has meths name then false else true) then local_vars_of env
+    else if str_eq name "global_variables" && (if map_has meths name then false else true) then global_vars_of ()
     else if map_has meths name then call_method env world noblk name args
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
       (match args with
@@ -9612,6 +9632,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#format / #sprintf: sprintf-style formatting.
     else if (str_eq name "format" || str_eq name "sprintf") && (if kernel_overridden env world name then false else true) then
       (match args with Cons (VStr h, rest) -> mkstr (rb_format (sget h) rest) | _ -> mkstr "")
+    // Kernel#fail is Kernel#raise. `raise` is a parser keyword here (ERaise), so
+    // `fail` could not borrow that path and had no branch of its own: `fail "x"`
+    // reported an undefined method while `Kernel.fail "x"` worked. This is the
+    // same signal ERaise ends up sending -- $exc, the raise site, the backtrace,
+    // then the interpreter's own failure carrying the placeholder message.
+    else if str_eq name "fail" && (if kernel_overridden env world "fail" then false else true) then
+      (let (_, _, _, iv0) = world in
+       let exc = (match args with
+                  | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
+                            then map_get globals "!" else make_exc_w world Nil)
+                  | _ -> make_exc_w world args) in
+       let _ = map_set iv0 "$exc" exc in
+       let _ = note_raise_site () in
+       let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
+       (let m = "mere-ruby: (ruby exception raised)" in
+        let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
     // implicit-self send/__send__/public_send: dispatch the named method on self.
     else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (if map_has meths name then false else true) then
       (let recv = if lv_has env "self" then lv_get env "self" else VMain in
@@ -10131,8 +10167,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       invoke_val_c env world blk va0 op (Cons (vb, Nil)) false
     else if str_eq op "<=>" then
       (let vb = vb in
-       // <=> on incomparable operands is nil (not an error), unlike < > etc.
-       if cmp_incompatible va0 vb then VNil
+       // Object#<=> answers 0 for two values that are ==, even when neither has
+       // an ordering: `o <=> o` is 0 and `o <=> other` is nil. The identity case
+       // has to come BEFORE the incomparable test, which would call them both
+       // unorderable and answer nil. (`<=>` is an operator, so it never reaches
+       // the dispatcher arm that carries the rest of Object's protocol.)
+       if cmp_incompatible va0 vb && rb_eq va0 vb then VInt 0
+       else if cmp_incompatible va0 vb then VNil
        // world-aware, so `[obj] <=> [obj]` reaches the elements' own <=>: the
        // value-level comparator cannot call one, and this is an OPERATOR, so it
        // never passes through the dispatcher where the world-aware paths live.
@@ -10779,15 +10820,42 @@ and make_exc_w = fn world -> fn (args: Val list) ->
   // raising an already-built exception instance (e.g. `raise Err.new(...)`) --
   // which also picks up a cause, since that is decided at the RAISE and not at
   // the construction. bundler raises this shape throughout.
-  | Cons (VObj id, _) ->
+  | Cons (VObj id, rest) ->
     (let (meths2, sup2, ocls2, ivars2) = world in
-     let _ = (if map_has ivars2 (str_of_int id ++ "@__cause") then ()
-              else (if map_has globals "!"
-                    then (match map_get globals "!" with
-                          | VNil -> ()
-                          | prev -> (if rb_identical prev (VObj id) then () else map_set ivars2 (str_of_int id ++ "@__cause") prev))
-                    else ())) in
-     VObj id)
+     let ocl = map_get ocls2 (str_of_int id) in
+     // `raise obj` / `fail obj, msg` where obj is NOT an exception: ruby calls
+     // obj.exception(msg) and raises what that returns, and refuses anything
+     // else with a TypeError. Without this the object's own class name became
+     // the exception class, so `raise obj, "..."` reported `(sng:111)` -- an
+     // internal singleton-class name, escaping into a program's output. The
+     // method is usually a SINGLETON one (`def obj.exception`), which is why
+     // the lookup is against the receiver's class as recorded, singleton and
+     // all, rather than against its nominal class.
+     // an object that is neither an exception nor answers #exception cannot be
+     // raised at all: ruby says TypeError rather than inventing an exception
+     // class out of the object's own class name (which is how `(sng:111)` and
+     // `Object` reached a program's stderr as exception class names).
+     if (if obj_is_a world ocl "Exception" then false else true)
+        && (if has_meth world ocl "exception" then false else true) then
+       raise_exc world "TypeError" "exception class/object expected"
+     else if (if obj_is_a world ocl "Exception" then false else true)
+        && has_meth world ocl "exception" then
+       (let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        let r = invoke world noblk (VObj id) ocl "exception" rest in
+        match r with
+        | VExc (_, _) -> r
+        | VObj rid ->
+          (if obj_is_a world (map_get ocls2 (str_of_int rid)) "Exception" then r
+           else raise_exc world "TypeError" "exception object expected")
+        | _ -> raise_exc world "TypeError" "exception object expected")
+     else
+       (let _ = (if map_has ivars2 (str_of_int id ++ "@__cause") then ()
+                 else (if map_has globals "!"
+                       then (match map_get globals "!" with
+                             | VNil -> ()
+                             | prev -> (if rb_identical prev (VObj id) then () else map_set ivars2 (str_of_int id ++ "@__cause") prev))
+                       else ())) in
+        VObj id))
   | _ -> make_exc args
 
 // An Errno class puts the system's own text in front of whatever message it is
@@ -16724,6 +16792,13 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      else if str_eq n "update" then "merge!"
      else if str_eq n "to_s" then "inspect"
      else n)
+  // Kernel's aliases, from the oracle's words the same way the numeric ones are
+  // ("Kernel#fail is an alias of Kernel#raise").
+  else if str_eq cls "Kernel" || str_eq cls "Object" then
+    (if str_eq n "fail" then "raise"
+     else if str_eq n "format" then "sprintf"
+     else if str_eq n "enum_for" then "to_enum"
+     else n)
   // The numeric tower shares one set of aliases across five classes, so the
   // row is written once and reached by all of them. WHICH name is canonical is
   // not derivable from this implementation -- the arms are written
@@ -16848,7 +16923,14 @@ and is_prim_method = fn (name: str) ->
   str_eq name "instance_variable_get" || str_eq name "instance_variable_set" ||
   str_eq name "instance_variable_defined?" || str_eq name "instance_variables" ||
   str_eq name "methods" || str_eq name "public_methods" || str_eq name "singleton_methods" ||
-  str_eq name "method" || str_eq name "extend" || str_eq name "define_singleton_method"
+  str_eq name "method" || str_eq name "extend" || str_eq name "define_singleton_method" ||
+  // Object#<=>, which every object has in ruby: `obj.<=>(obj)` is 0 and
+  // `obj.<=>(other)` is nil. Claiming it is what makes the EXPLICIT call reach
+  // a primitive arm at all (the operator form never goes through the
+  // dispatcher). The copy hooks are deliberately NOT claimed here: a claim
+  // shadows a user's definition, and dup/clone have to reach the user's
+  // initialize_copy, not a no-op primitive.
+  str_eq name "<=>"
 
 // ---- in-place string mutation --------------------------------------------
 // VStr is a handle into str_store, so a mutating method rewrites the store
@@ -17286,6 +17368,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "__interp_str" then
     (match recv with VStr h -> mkstr (sget h) | _ -> mkstr (to_s recv))
   else if str_eq name "itself" then recv
+  // Object#<=>: 0 for a pair that is ==, nil otherwise. The LAST arm any <=>
+  // reaches (Integer, String, Array, Time all have earlier ones), so it answers
+  // only for values with no ordering of their own -- where ruby still says
+  // "equal to itself, incomparable to anything else".
+  else if str_eq name "<=>" then
+    (match args with
+     | Cons (b, _) -> (if rb_eq recv b then VInt 0 else VNil)
+     | _ -> VNil)
   else if str_eq name "hash" then VInt (val_hash recv)
   else if str_eq name "tap" then recv
   else if str_eq name "__regex" then
@@ -18737,7 +18827,16 @@ and rng_bad_bounds = fn world -> fn (lo: Val) -> fn (hi: Val) ->
              // a range sidekiq-pro builds.
              | VObj _ ->
                (let c = rng_obj_cls world lo in
-                if has_meth world c "<=>" || builtin_anc_has world c "<=>" || builtin_obj_has c "<=>"
+                // "does the class define <=>" is NOT the question ruby asks --
+                // ruby asks whether `lo <=> hi` ANSWERS. The two came apart the
+                // moment Object#<=> existed: every class inherits it, so the
+                // definition test became true for everything and
+                // `Range.new(Object.new, Object.new)` stopped raising. The
+                // universal one answers only for a pair that is ==, and that
+                // case is already decided above, so what counts here is a <=>
+                // the class brings ITSELF: from ruby (has_meth) or from the
+                // dispatcher (builtin_obj_has -- Time and friends).
+                if has_meth world c "<=>" || builtin_obj_has c "<=>"
                 then false else true)
              | VRat (_, _) -> false
              | VCpx (_, _) -> true

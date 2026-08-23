@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 566 files.
+Classified: 575 files.
 
 ## CRASH — 22 files, 13 kinds
 
@@ -52,77 +52,71 @@ Classified: 566 files.
 
 </details>
 
-## DIFF — 544 files, 123 kinds
+## DIFF — 553 files, 115 kinds
 
 | files | kind |
 |---|---|
-| 92 | `ERROR NoMethodError` |
-| 46 | `ERROR NameError` |
-| 28 | `ERROR StandardError` |
-| 27 | `FAILED expected "S", got "S"` |
-| 26 | `ERROR ArgumentError` |
-| 24 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 23 | `FAILED matcher did not match #<OBJ>` |
-| 21 | `FAILED expected true, got false` |
-| 21 | `FAILED expected TypeError to be raised` |
-| 21 | `FAILED expected N, got N` |
-| 19 | `FAILED expected ArgumentError to be raised` |
-| 17 | `FAILED expected N, got nil` |
-| 14 | `FAILED expected to be identical` |
-| 11 | `FAILED expected false, got true` |
+| 84 | `ERROR NoMethodError` |
+| 46 | `FAILED matcher did not match Kernel` |
+| 41 | `FAILED matcher did not match #<OBJ>` |
+| 38 | `ERROR NameError` |
+| 26 | `FAILED expected "S", got "S"` |
+| 26 | `ERROR StandardError` |
+| 22 | `ERROR ArgumentError` |
+| 21 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 19 | `FAILED expected N, got nil` |
+| 19 | `FAILED expected N, got N` |
+| 18 | `FAILED expected true, got false` |
+| 16 | `FAILED expected TypeError to be raised` |
+| 16 | `FAILED expected ArgumentError to be raised` |
+| 13 | `FAILED expected to be identical` |
+| 10 | `FAILED expected false, got true` |
 | 6 | `FAILED expected "S", got nil` |
 | 6 | `ERROR TypeError` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED expected not N` |
-| 4 | `FAILED expected LocalJumpError to be raised` |
-| 3 | `FAILED raised NoMethodError, expected ArgumentError` |
+| 3 | `FAILED matcher did not match nil` |
+| 3 | `FAILED matcher did not match false` |
 | 3 | `FAILED expected [N, N, N, N], got []` |
 | 3 | `FAILED expected SyntaxError to be raised` |
-| 3 | `FAILED expected NoMethodError to be raised` |
-| 2 | `FAILED raised NoMethodError, expected TypeError` |
-| 2 | `FAILED raised NoMethodError, expected SignalException` |
-| 2 | `FAILED raised NameError, expected TypeError` |
+| 2 | `FAILED matcher did not match true` |
 | 2 | `FAILED matcher did not match N` |
 | 2 | `FAILED matcher did not match #<OBJ>:NxADDR>` |
 | 2 | `FAILED expected nil, got N` |
 | 2 | `FAILED expected ["S", "S"], got nil` |
 | 2 | `FAILED expected ["S", "S", "S"], got ["S", "S", "S"]` |
 | 2 | `FAILED expected ThreadError to be raised` |
-| 2 | `FAILED expected RangeError to be raised` |
-| 2 | `FAILED expected NameError to be raised` |
+| 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected IndexError to be raised` |
-| 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR FrozenError` |
-| 1 | `sh: feature_N: command not found` |
 | 1 | `FAILED raised StandardError, expected IndexError` |
-| 1 | `FAILED raised RuntimeError, expected NoMethodError` |
+| 1 | `FAILED raised NoMethodError, expected TypeError` |
 | 1 | `FAILED raised NoMethodError, expected IndexError` |
-| 1 | `FAILED raised NameError, expected ArgumentError` |
-| 1 | `FAILED matcher did not match true` |
-| 1 | `FAILED matcher did not match nil` |
+| 1 | `FAILED raised NoMethodError, expected ArgumentError` |
+| 1 | `FAILED matcher matched [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED matcher did not match Rational` |
+| 1 | `FAILED matcher did not match Range` |
 | 1 | `FAILED matcher did not match Complex` |
+| 1 | `FAILED matcher did not match "a.rb:N: Some runtime error (RuntimeError)` |
+| 1 | `FAILED matcher did not match "S"` |
 | 1 | `FAILED expected {N=>N, N=>N}, got {}` |
 | 1 | `FAILED expected {N=>N, N=>N}, got {N=>N}` |
-| 1 | `FAILED expected {:SYM=>N}, got {}` |
 | 1 | `FAILED expected {:SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {:SYM=>N, :SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
 | 1 | `FAILED expected {"S"=>N, "S"=>N}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S", "S"=>"S"}, got {:SYM=>"S", :SYM=>"S", :SYM=>nil}` |
-| 1 | `FAILED expected true, got nil` |
-| 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected not {N=>N}` |
 | 1 | `FAILED expected not nil` |
 | 1 | `FAILED expected nil, got []` |
 | 1 | `FAILED expected nil, got "S"` |
-| 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a #<OBJ>>, got #<OBJ>` |
 | 1 | `FAILED expected [{}, nil], got nil` |
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
+| 1 | `FAILED expected [], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
 | 1 | `FAILED expected [[N], {:SYM=>N}, #<OBJ>], got [[N], {:SYM=>N}, #<OBJ>]` |
 | 1 | `FAILED expected [[N, N], [N, N]], got [[N, nil], [N, nil]]` |
@@ -132,29 +126,28 @@ Classified: 566 files.
 | 1 | `FAILED expected [["S", "S"], ["S", "S"]], got [[["S", "S"]], [["S", "S"]]]` |
 | 1 | `FAILED expected [NaN], got [NaN]` |
 | 1 | `FAILED expected [N, N], got nil` |
-| 1 | `FAILED expected [N, N], got []` |
 | 1 | `FAILED expected [N, N], got [N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N], got []` |
 | 1 | `FAILED expected [N, N, N], got [N, N, N]` |
-| 1 | `FAILED expected [N, N, N], got [#<OBJ>]` |
 | 1 | `FAILED expected [N, N, N, [N, N]], got [N, N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N], got [N, N, #<OBJ>, N, N, #<OBJ>]` |
 | 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N], got [N, N, N, N, N]` |
 | 1 | `FAILED expected [N, "S", "S", "S", N], got ["S", "S", "S"]` |
 | 1 | `FAILED expected [:SYM, :SYM, N], got [:SYM, :SYM, :SYM]` |
-| 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
 | 1 | `FAILED expected ["S", N, "S", N, N, "S", nil, "S"], got ["S", N, "S", N, N, "S", "S"]` |
 | 1 | `FAILED expected ["S", "S"], got []` |
 | 1 | `FAILED expected ["S", "S"], got ["S"]` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S"]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
+| 1 | `FAILED expected RangeError to be raised` |
+| 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
+| 1 | `FAILED expected LocalJumpError to be raised` |
 | 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected FrozenError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
@@ -162,8 +155,6 @@ Classified: 566 files.
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
-| 1 | `FAILED expected #<OBJ>, got nil` |
-| 1 | `FAILED expected "a.rb:N: Some runtime error (RuntimeError)` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\u{N}\"S", got "S"\uNFN\uN\uN\uN\"S"` |
@@ -174,6 +165,7 @@ Classified: 566 files.
 | 1 | `FAILED expected "S", got " hello world` |
 | 1 | `FAILED expected "S", got "` |
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
+| 1 | `FAILED expected "S" to match` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
@@ -184,17 +176,17 @@ Classified: 566 files.
 
 | files | cause |
 |---|---|
-| 21 | `FAILED: expected TypeError to be raised` |
-| 19 | `FAILED: expected ArgumentError to be raised` |
+| 40 | `FAILED: is a private method: matcher did not match Kernel` |
+| 16 | `FAILED: expected TypeError to be raised` |
+| 16 | `FAILED: expected ArgumentError to be raised` |
 | 5 | `FAILED: expected not 0` |
 | 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
-| 4 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `pass=2 fail=0 err=0` |
 | 3 | `FAILED: raises RangeError: matcher did not match #<Proc>` |
 | 3 | `FAILED: raises ArgumentError when passed more than one argument: matcher did not match #<Proc>` |
-| 3 | `FAILED: raised NoMethodError, expected ArgumentError` |
+| 3 | `FAILED: is a private instance method: matcher did not match Kernel` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
-| 3 | `FAILED: expected NoMethodError to be raised` |
+| 3 | `FAILED: calls #initialize_copy on the new instance: expected 1000904, got nil` |
 | 3 | `FAILED: always returns the same string: expected to be identical` |
 | 2 | `FAILED: yields in turn the last length-1 values from the array: expected [2, 3, 4, 5], got []` |
 | 2 | `FAILED: tries to convert length to an integer using to_int: expected "^_^", got "^"` |
@@ -202,16 +194,12 @@ Classified: 566 files.
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns self: matcher did not match #<#<Class:0xADDR>:0xADDR>` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
-| 2 | `FAILED: raised NoMethodError, expected TypeError` |
-| 2 | `FAILED: raised NoMethodError, expected SignalException` |
-| 2 | `FAILED: raised NameError, expected TypeError` |
+| 2 | `FAILED: raises a TypeError if #to_int does not return an Integer: matcher did not match #<Proc>` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
 | 2 | `FAILED: expected ThreadError to be raised` |
-| 2 | `FAILED: expected RangeError to be raised` |
-| 2 | `FAILED: expected NameError to be raised` |
+| 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: expected IndexError to be raised` |
 | 2 | `FAILED: calls #initialize_copy on the new instance: expected 2003088, got nil` |
-| 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=56 fail=0 err=1` |
 | 1 | `pass=53 fail=0 err=0` |
 | 1 | `FAILED: yields each element to the block even if the array is changed during iteration: expected [1, 2, 3, 4, 5, 7, 9], got [1, 2, 3, 4, 5]` |
@@ -224,6 +212,10 @@ Classified: 566 files.
 | 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
 | 1 | `FAILED: uses Kahan's compensated summation algorithm for precise sum of float numbers: expected 50.0, got 50.00000000000001` |
 | 1 | `FAILED: uses #each to extract arguments' elements when #to_ary fails: expected [[1, 3], [2, 4]], got [[1, nil], [2, nil]]` |
+| 1 | `FAILED: updates string metadata: expected "king", got "King"` |
+| 1 | `FAILED: updates string metadata: expected "aSSET", got "aßET"` |
+| 1 | `FAILED: tries to convert the passed argument to an Integer using #to_int: expected "a", got nil` |
+| 1 | `FAILED: tries to convert the passed argument to a hash using #to_hash: expected {1=>2, 3=>4}, got {}` |
 
 </details>
 
@@ -236,14 +228,14 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (23) | `Rational __method__ binding chomp chop comparison enum_for fail format global_variables initialize_clone initialize_copy initialize_dup instance_variable_get lambda loop method public_send respond_to_missing select singleton_method test warn` |
 | env (15) | `delete_if each_key each each_value filter has_key has_value keep_if key length member reject select store update` |
-| exception (13) | `backtrace_locations backtrace detailed_message errno exception interrupt io_error key_error load_error signal_exception syntax_error system_call_error uncaught_throw_error` |
+| exception (12) | `backtrace detailed_message errno exception interrupt io_error key_error load_error signal_exception syntax_error system_call_error uncaught_throw_error` |
 | symbol (10) | `all_symbols case_compare encoding id2name intern match name next size slice` |
 | string (10) | `each_grapheme_cluster grapheme_clusters inspect scrub to_c to_r to_sym undump unicode_normalize unicode_normalized` |
 | matchdata (10) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match offset regexp` |
 | method (9) | `case_compare clone curry element_reference hash original_name source_location super_method to_proc` |
 | struct (8) | `deconstruct dig element_reference element_set filter initialize keyword_init new` |
+| kernel (8) | `Rational __method__ initialize_copy instance_variable_get method private_methods protected_methods singleton_method` |
 | unboundmethod (6) | `bind_call clone hash original_name source_location super_method` |
 | sizedqueue (5) | `deq enq length push shift` |
 | queue (5) | `deq enq length push shift` |
@@ -254,6 +246,5 @@ class column says where the weight sits.
 | hash (4) | `compact deconstruct_keys fetch_values transform_values` |
 | nil (2) | `to_c to_r` |
 | range (1) | `step` |
-| comparable (1) | `equal_value` |
 
 _Generated by `mspec/causes.sh`._
