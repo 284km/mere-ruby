@@ -6544,6 +6544,60 @@ let cpx_common_den = fn (a: Val) -> fn (b: Val) ->
 let num_scale_to = fn (v: Val) -> fn (den: str) ->
   norm_big (big_mul_s (rat_num_of v) (big_div_s den (rat_den_of v)));
 
+// Rational's rounding family, as ONE function over the four modes. The
+// denominator is positive and the sign lives in the numerator (mk_rat_s
+// normalizes both), and big_divmod_s already floors toward -infinity with the
+// remainder taking the divisor's sign -- which is Ruby's integer division --
+// so `floor` is the division itself and the other three are one step from it.
+// `round` is half AWAY FROM ZERO (ruby: (1/2r).round == 1, (-1/2r).round == -1),
+// which is why it is computed on the magnitude and given the sign back rather
+// than by adding a half and flooring.
+let rat_int_mode = fn (mode: str) -> fn (n: str) -> fn (d: str) ->
+  if str_eq mode "round" then
+    (let sg = big_sign n in
+     let m = big_mag n in
+     let q = big_div_s (big_add_s (big_mul_s m "2") d) (big_mul_s d "2") in
+     with_sign sg q)
+  else
+    (let dm = big_divmod_s n d in
+     let q = (match dm with (q, r) -> q) in
+     let r = (match dm with (q, r) -> r) in
+     if str_eq mode "floor" then q
+     else if str_eq mode "ceil" then (if str_eq r "0" then q else big_add_s q "1")
+     // truncate: toward zero, so a negative with a remainder is one above floor
+     else (if str_eq r "0" then q
+           else if big_sign n < 0 then big_add_s q "1" else q));
+// The precision form. ruby answers an INTEGER for precision <= 0 and a
+// RATIONAL for precision > 0 -- `Rational(1,3).ceil(2)` is `(17/50)`, not 0.34 --
+// so the two cases return different classes on purpose.
+// How many decimal places make n/d EXACT, or -1 when it never terminates:
+// strip the 2s and 5s from the denominator and see whether anything is left.
+// (1/2 needs 1 place, 1/8 needs 3, 1/3 never terminates.) Rounding a rational
+// to more places than it needs cannot change it, which is the only reason
+// `Rational(3,2).round(2_097_171)` can answer at all -- ruby/spec asks for
+// exactly that (issue #6605), and computing 10**2097171 to find out is not an
+// answer, it is a hang.
+let rec rat_strip_25 = fn (d: str) -> fn (c2: int) -> fn (c5: int) ->
+  (match big_divmod_s d "2" with
+   | (q, r) -> if str_eq r "0" then rat_strip_25 q (c2 + 1) c5
+               else (match big_divmod_s d "5" with
+                     | (q5, r5) -> if str_eq r5 "0" then rat_strip_25 q5 c2 (c5 + 1)
+                                   else (d, c2, c5)));
+let rat_exact_digits = fn (d: str) ->
+  match rat_strip_25 d 0 0 with
+  | (rest, c2, c5) -> if str_eq rest "1" then (if c2 > c5 then c2 else c5) else 0 - 1;
+let rat_round_prec = fn (mode: str) -> fn (n: str) -> fn (d: str) -> fn (p: int) ->
+  if p == 0 then norm_big (rat_int_mode mode n d)
+  else if p > 0 then
+    (let need = rat_exact_digits d in
+     if need >= 0 && p >= need then VRat (n, d)
+     else
+       let m = big_pow "10" p "1" in
+       mk_rat_s (rat_int_mode mode (big_mul_s n m) d) m)
+  else
+    (let m = big_pow "10" (0 - p) "1" in
+     norm_big (big_mul_s (rat_int_mode mode n (big_mul_s d m)) m));
+
 // ---- the simplest rational in an interval --------------------------------
 // `rationalize` is NOT to_r: ruby answers the SIMPLEST fraction within the
 // value's precision, so 0.3.rationalize is (3/10) where 0.3.to_r is
@@ -16670,6 +16724,23 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      else if str_eq n "update" then "merge!"
      else if str_eq n "to_s" then "inspect"
      else n)
+  // The numeric tower shares one set of aliases across five classes, so the
+  // row is written once and reached by all of them. WHICH name is canonical is
+  // not derivable from this implementation -- the arms are written
+  // `"rect" || "rectangular"` for the convenience of the code, and ruby says
+  // rect is the alias -- so the direction comes from the oracle: each of these
+  // is a ruby/spec assertion of the form "X is an alias of Y".
+  else if str_eq cls "Complex" || str_eq cls "Rational" || str_eq cls "Numeric"
+          || str_eq cls "Integer" || str_eq cls "Float" then
+    (if str_eq n "angle" then "arg"
+     else if str_eq n "phase" then "arg"
+     else if str_eq n "conj" then "conjugate"
+     else if str_eq n "imag" then "imaginary"
+     else if str_eq n "magnitude" then "abs"
+     else if str_eq n "rect" then "rectangular"
+     else if str_eq n "quo" then "/"
+     else if str_eq n "modulo" then "%"
+     else n)
   else n
 
 // does builtin class `cls` provide method `name`? (reflection only)
@@ -16684,7 +16755,11 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   // whether it has to patch around an old ruby's Range#minmax.
   else if str_eq cls "Range" then
     is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
-  else if str_eq cls "Numeric" || str_eq cls "Integer" || str_eq cls "Float" then
+  // Complex and Rational were missing from this row while their methods were
+  // implemented, so `Complex.instance_method(:arg)` raised NameError for a
+  // method that answers when called. They are Numerics: same list.
+  else if str_eq cls "Numeric" || str_eq cls "Integer" || str_eq cls "Float"
+          || str_eq cls "Complex" || str_eq cls "Rational" then
     is_num_method name || is_prim_method name
   else if str_eq cls "Module" || str_eq cls "Class" then
     is_module_method name || is_prim_method name
@@ -16742,6 +16817,18 @@ and is_num_method = fn (name: str) ->
   // absent and came back with the implementation -- which is the only order in
   // which a name list stays true.
   str_eq name "rationalize" || str_eq name "i" ||
+  // The complex protocol, which every Numeric answers -- 1.imaginary is 0,
+  // 1.conj is 1, (-1).arg is pi. All fourteen were IMPLEMENTED (the arms are
+  // written `"imaginary" || "imag"`, and each has a non-Complex case) and none
+  // was claimed here, so calling them worked and asking about them did not:
+  // `Complex.instance_method(:angle)` raised NameError, which is what fifteen
+  // ruby/spec files check. Enumerated by diffing the names the numeric arm
+  // answers against the names this list claims, rather than by remembering.
+  str_eq name "real" || str_eq name "real?" || str_eq name "imaginary" ||
+  str_eq name "imag" || str_eq name "conjugate" || str_eq name "conj" ||
+  str_eq name "abs2" || str_eq name "arg" || str_eq name "angle" ||
+  str_eq name "phase" || str_eq name "polar" || str_eq name "rect" ||
+  str_eq name "rectangular" || str_eq name "quo" ||
   str_eq name "<=>" || str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">="
 
 and is_prim_method = fn (name: str) ->
@@ -17024,7 +17111,21 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // method.
   // `modulo` / `div` / `fdiv` / `remainder` are the named forms of the same
   // arithmetic; they were in the numeric method LIST but had no branch.
-  if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder")
+  // Rational#div is EXACT: the floor of the fraction, not of a float that
+  // rounded it first (Rational(10**20+1, 3).div(1) has no float answer). It
+  // goes before the numeric branch below, which converts through to_f.
+  if str_eq name "div" && (match recv with VRat _ -> true | _ -> false)
+     && (match args with Cons (_, Nil) -> true | _ -> false) then
+    (match args with
+     | Cons (b, _) ->
+       (match rat_arith "/" recv b with
+        | VRat (qn, qd) -> norm_big (rat_int_mode "floor" qn qd)
+        | VInt qi -> VInt qi
+        | VBig qb -> norm_big qb
+        | VFlt qf -> VInt (flt_floor qf)
+        | v -> v)
+     | _ -> VNil)
+  else if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder")
      && is_num recv && (match args with Cons (a1, Nil) -> is_num a1 | _ -> false) then
     (match args with
      | Cons (a1, _) ->
@@ -17651,6 +17752,20 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBig a -> (match args with Cons (b, _) -> let bd = num_dec b in arr_new (Cons (norm_big (big_div_s a bd), Cons (norm_big (big_mod_s a bd), Nil))) | _ -> VNil)
      // Float#divmod: quotient floored to an Integer, remainder a Float.
      | VFlt a -> (match args with Cons (b, _) -> let bf = to_f b in let q = flt_floor (a / bf) in arr_new (Cons (VInt q, Cons (VFlt (a - float_of_int q * bf), Nil))) | _ -> VNil)
+     // Rational#divmod: the quotient is the FLOOR of the exact division (an
+     // Integer) and the remainder is what is left over, so it is computed from
+     // the quotient rather than by a second division.
+     | VRat (rn, rd) ->
+       (match args with
+        | Cons (b, _) ->
+          (let q = (match rat_arith "/" recv b with
+                    | VRat (qn, qd) -> norm_big (rat_int_mode "floor" qn qd)
+                    | VInt qi -> VInt qi
+                    | VBig qb -> norm_big qb
+                    | VFlt qf -> VInt (flt_floor qf)
+                    | v -> v) in
+           arr_new (Cons (q, Cons (rat_arith "-" recv (rat_arith "*" q b), Nil))))
+        | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "divmod") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'divmod'")) in fail "mere-ruby: undefined method 'divmod'")))
   else if str_eq name "fdiv" then
     (match recv with
@@ -17691,7 +17806,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: coerce non-numeric")) in fail "mere-ruby: coerce non-numeric"))
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
-  else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0") | _ -> (let _ = map_set prim_missing "n" (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
+  else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
+     | VRat (rn, rd) -> VBool (str_eq rn "0")
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
   // Numeric#integer?. `is_num_method` has claimed this name all along with no
   // branch behind it, so `respond_to?(:integer?)` said true and the call
   // raised. A name list is a claim, not an implementation -- three of the
@@ -17707,6 +17824,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "integer?" then
     (match recv with
      | VInt _ -> VBool true | VBig _ -> VBool true
+     // a Complex is never an integer, not even Complex(2, 0) -- the question is
+     // about the CLASS, not the value (ruby: Complex(2,0).integer? is false)
+     | VCpx _ -> VBool false
      | VFlt _ -> VBool false | VRat _ -> VBool false
      | _ -> (let _ = map_set prim_missing "n" (mkstr "integer?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'integer?'")) in fail "mere-ruby: undefined method 'integer?'")))
   // Numeric#nonzero?: self, or nil when it IS zero — the idiom behind
@@ -17761,25 +17881,44 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (floor_div n m * m)) | _ -> VInt n)
      | VFlt f -> (match args with Cons (VInt d, _) -> if d <= 0 then VInt (flt_floor f) else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_floor (f * m)) / m)) | _ -> VInt (flt_floor f))
+     // Rational: the rounding family over the exact fraction. Precision 0
+     // (or absent) answers an Integer, a positive precision a Rational.
+     | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "floor" rn rd p | _ -> norm_big (rat_int_mode "floor" rn rd))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "floor") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'floor'")) in fail "mere-ruby: undefined method 'floor'")))
   else if str_eq name "ceil" then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (0 - (floor_div (0 - n) m) * m)) | _ -> VInt n)
      | VFlt f -> (match args with Cons (VInt d, _) -> if d <= 0 then VInt (flt_ceil f) else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_ceil (f * m)) / m)) | _ -> VInt (flt_ceil f))
+     // Rational: the rounding family over the exact fraction. Precision 0
+     // (or absent) answers an Integer, a positive precision a Rational.
+     | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "ceil" rn rd p | _ -> norm_big (rat_int_mode "ceil" rn rd))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "ceil") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ceil'")) in fail "mere-ruby: undefined method 'ceil'")))
   else if str_eq name "round" then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else VInt (int_round_place n (int_pow 10 (0 - d))) | _ -> VInt n)
      | VFlt f -> (match args with Cons (VInt d, _) -> if d <= 0 then VInt (flt_round f) else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_round (f * m)) / m)) | _ -> VInt (flt_round f))
+     // Rational: the rounding family over the exact fraction. Precision 0
+     // (or absent) answers an Integer, a positive precision a Rational.
+     | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "round" rn rd p | _ -> norm_big (rat_int_mode "round" rn rd))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "round") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'round'")) in fail "mere-ruby: undefined method 'round'")))
   else if str_eq name "truncate" then
-    (match recv with VInt n -> VInt n | VFlt f -> VInt (int_of_float f) | _ -> (let _ = map_set prim_missing "n" (mkstr "truncate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'truncate'")) in fail "mere-ruby: undefined method 'truncate'")))
+    (match recv with VInt n -> VInt n | VFlt f -> VInt (int_of_float f)
+     | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "truncate" rn rd p | _ -> norm_big (rat_int_mode "truncate" rn rd))
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "truncate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'truncate'")) in fail "mere-ruby: undefined method 'truncate'")))
   // ⚠ numerator/denominator are the whole numeric tower's, not Rational's alone.
   //   Integer and Rational answered; Float and Complex said "undefined method".
   //   A Float's pair is its EXACT value (0.1 -> 3602879701896397/36028797018963968),
   //   which flt_rat_parts already computes for to_r.
   //   A Complex's is its parts over their common denominator.
   else if str_eq name "numerator" then (match recv with VRat (n, d) -> norm_big n | VInt n -> VInt n | VBig b -> norm_big b | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big n2 | v -> v) | VCpx (r, i) -> (let dn = cpx_common_den r i in VCpx (num_scale_to r dn, num_scale_to i dn)) | _ -> (let _ = map_set prim_missing "n" (mkstr "numerator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'numerator'")) in fail "mere-ruby: undefined method 'numerator'")))
+  // marshal_dump: the pair a Marshal round-trip needs. Ruby has these as
+  // private methods on both classes, so a direct call is a NoMethodError in
+  // ruby too and the specs reach them through `send`.
+  else if str_eq name "marshal_dump" then
+    (match recv with
+     | VRat (n, d) -> arr_new (Cons (norm_big n, Cons (norm_big d, Nil)))
+     | VCpx (r, i) -> arr_new (Cons (r, Cons (i, Nil)))
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "marshal_dump") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'marshal_dump'")) in fail "mere-ruby: undefined method 'marshal_dump'")))
   else if str_eq name "denominator" then (match recv with VRat (n, d) -> norm_big d | VInt n -> VInt 1 | VBig _ -> VInt 1 | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big d2 | v -> VInt 1) | VCpx (r, i) -> norm_big (cpx_common_den r i) | _ -> (let _ = map_set prim_missing "n" (mkstr "denominator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'denominator'")) in fail "mere-ruby: undefined method 'denominator'")))
   // Float#to_r is the float's EXACT value, not a rounded one: 0.1 becomes
   // 3602879701896397/36028797018963968. flt_rat_parts already computes that
@@ -30044,6 +30183,8 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set consts "Float::MIN_10_EXP" (VInt (0 - 307)) in
   let _ = map_set consts "Float::MAX_10_EXP" (VInt 308) in
   let _ = map_set consts "Float::RADIX" (VInt 2) in
+  // Complex::I -- the imaginary unit, the one constant the complex class has.
+  let _ = map_set consts "Complex::I" (VCpx (VInt 0, VInt 1)) in
   // module ancestry: Numeric and String are Comparable; every Object is a
   // Kernel. This makes Integer.ancestors / String.ancestors and is_a? agree
   // with CRuby ([Integer, Numeric, Comparable, Object, Kernel, BasicObject]).
