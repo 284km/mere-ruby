@@ -34,7 +34,7 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 | core/queue | 9 | 6 | 0 | 0 | 0 | 15 |
 | core/rational | 10 | 22 | 0 | 0 | 0 | 32 |
 | core/sizedqueue | 11 | 5 | 0 | 0 | 0 | 16 |
-| core/struct | 8 | 22 | 0 | 0 | 0 | 30 |
+| core/struct | 9 | 21 | 0 | 0 | 0 | 30 |
 | core/symbol | 12 | 17 | 0 | 0 | 0 | 29 |
 | core/threadgroup | 5 | 0 | 0 | 0 | 0 | 5 |
 | core/true | 2 | 7 | 0 | 0 | 0 | 9 |

@@ -35,7 +35,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 161 programs, byte-for-byte
+./run_corpus.sh                                  # 162 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -319,7 +319,7 @@ same idea as the tags/filter files every other implementation keeps. Passing
 target is the `language` and `core` groups, with `command_line` low-priority
 and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
 
-The record covers **1054 spec files** across 26 groups: **438 MATCH, 588 DIFF,
+The record covers **1054 spec files** across 26 groups: **439 MATCH, 587 DIFF,
 22 CRASH**, 5 SKIP, 1 SLOW. Run with no directories, the sweep refreshes exactly
 the groups the table already has, so the numbers above are reproducible rather
 than a snapshot.

@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 610 files.
+Classified: 609 files.
 
 ## CRASH — 22 files, 13 kinds
 
@@ -52,13 +52,13 @@ Classified: 610 files.
 
 </details>
 
-## DIFF — 588 files, 124 kinds
+## DIFF — 587 files, 125 kinds
 
 | files | kind |
 |---|---|
-| 111 | `ERROR NoMethodError` |
-| 68 | `ERROR NameError` |
-| 29 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 107 | `ERROR NoMethodError` |
+| 67 | `ERROR NameError` |
+| 30 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 29 | `ERROR StandardError` |
 | 28 | `FAILED expected "S", got "S"` |
 | 26 | `ERROR ArgumentError` |
@@ -66,8 +66,8 @@ Classified: 610 files.
 | 23 | `FAILED expected true, got false` |
 | 23 | `FAILED expected ArgumentError to be raised` |
 | 21 | `FAILED expected N, got N` |
+| 17 | `FAILED expected to be identical` |
 | 17 | `FAILED expected N, got nil` |
-| 16 | `FAILED expected to be identical` |
 | 12 | `FAILED expected false, got true` |
 | 6 | `FAILED expected "S", got nil` |
 | 6 | `ERROR TypeError` |
@@ -92,6 +92,7 @@ Classified: 610 files.
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
+| 2 | `FAILED expected IndexError to be raised` |
 | 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR FrozenError` |
@@ -110,6 +111,7 @@ Classified: 610 files.
 | 1 | `FAILED expected {:SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {:SYM=>N, :SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
+| 1 | `FAILED expected {"S"=>N, "S"=>N}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S", "S"=>"S"}, got {:SYM=>"S", :SYM=>"S", :SYM=>nil}` |
 | 1 | `FAILED expected true, got nil` |
@@ -156,7 +158,6 @@ Classified: 610 files.
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected Kernel, got Module` |
-| 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected FrozenError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got [:SYM, :SYM]` |
@@ -211,6 +212,7 @@ Classified: 610 files.
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: expected RangeError to be raised` |
 | 2 | `FAILED: expected NameError to be raised` |
+| 2 | `FAILED: expected IndexError to be raised` |
 | 2 | `FAILED: calls #initialize_copy on the new instance: expected 2003088, got nil` |
 | 2 | `ERROR: with no arguments (precision = 0) returns an integer: NoMethodError` |
 | 1 | `sh: feature_14386: command not found` |
@@ -224,7 +226,6 @@ Classified: 610 files.
 | 1 | `FAILED: uses the default proc to compute a default value, passing given key: expected [{}, nil], got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: uses eql? semantics: expected [1.0, 1], got [1.0]` |
-| 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
 
 </details>
 
@@ -240,7 +241,6 @@ class column says where the weight sits.
 | kernel (23) | `Rational __method__ binding chomp chop comparison enum_for fail format global_variables initialize_clone initialize_copy initialize_dup instance_variable_get lambda loop method public_send respond_to_missing select singleton_method test warn` |
 | env (15) | `delete_if each_key each each_value filter has_key has_value keep_if key length member reject select store update` |
 | rational (14) | `ceil div divide divmod floor magnitude marshal_dump minus multiply plus quo round truncate zero` |
-| struct (13) | `deconstruct_keys deconstruct dig each_pair element_reference element_set filter initialize keyword_init length new size values_at` |
 | exception (13) | `backtrace_locations backtrace detailed_message errno exception interrupt io_error key_error load_error signal_exception syntax_error system_call_error uncaught_throw_error` |
 | integer (11) | `case_compare ceildiv div gcd ord pred remainder round size succ try_convert` |
 | symbol (10) | `all_symbols case_compare encoding id2name intern match name next size slice` |
@@ -248,6 +248,7 @@ class column says where the weight sits.
 | matchdata (10) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match offset regexp` |
 | complex (10) | `angle conj constants imag integer magnitude marshal_dump phase quo rect` |
 | method (9) | `case_compare clone curry element_reference hash original_name source_location super_method to_proc` |
+| struct (8) | `deconstruct dig element_reference element_set filter initialize keyword_init new` |
 | unboundmethod (6) | `bind_call clone hash original_name source_location super_method` |
 | numeric (6) | `angle conj imag modulo phase rect` |
 | sizedqueue (5) | `deq enq length push shift` |

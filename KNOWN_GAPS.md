@@ -1417,3 +1417,24 @@ while `0.3`'s would be `±1/2^55` and give back the exact value instead of
 The name went back into `is_num_method` **with** the implementation. A claim
 removed while a thing is absent and restored when it exists is the only order in
 which a name list stays true.
+
+## A Struct answered part of its own read surface
+
+Fixed. `to_a`, `values`, `members`, `to_h`, `[]` and `each` were generated for
+every Struct class; `size`, `length`, `values_at`, `dig`, `deconstruct_keys` and
+`each_pair` were not. Part of one protocol implemented and the rest never reached
+for -- the same shape as ENV's missing Hash methods and the numeric tower's
+missing arms, in a third place.
+
+They are defined in terms of `to_a` and `to_h` rather than per member, so a
+struct of any width gets them and each answer has one source. `deconstruct_keys`
+is `to_h.slice(*(keys || members))`, which makes the `nil` case fall out.
+
+**The yield was one file.** `core/struct` went 8 to 9 MATCH for six methods,
+where ENV's structural fix moved six. That is worth calibrating against: the
+absent-names table in `CAUSES.md` ranks files by their **first** divergence, so
+supplying the name it names often just reveals the next thing wrong in the same
+file. Five of the remaining 21 are still NoMethodError, three NameError, and the
+rest are argument checks and a `to_h` on a keyword-init struct.
+
+The table says where to look, not how much each fix is worth.
