@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 575 files.
+Classified: 573 files.
 
 ## CRASH — 22 files, 13 kinds
 
@@ -52,21 +52,21 @@ Classified: 575 files.
 
 </details>
 
-## DIFF — 553 files, 115 kinds
+## DIFF — 551 files, 118 kinds
 
 | files | kind |
 |---|---|
-| 84 | `ERROR NoMethodError` |
+| 79 | `ERROR NoMethodError` |
 | 46 | `FAILED matcher did not match Kernel` |
 | 41 | `FAILED matcher did not match #<OBJ>` |
 | 38 | `ERROR NameError` |
-| 26 | `FAILED expected "S", got "S"` |
+| 27 | `FAILED expected "S", got "S"` |
 | 26 | `ERROR StandardError` |
-| 22 | `ERROR ArgumentError` |
 | 21 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 19 | `FAILED expected N, got nil` |
 | 19 | `FAILED expected N, got N` |
 | 18 | `FAILED expected true, got false` |
+| 18 | `ERROR ArgumentError` |
 | 16 | `FAILED expected TypeError to be raised` |
 | 16 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected to be identical` |
@@ -79,6 +79,7 @@ Classified: 575 files.
 | 3 | `FAILED matcher did not match false` |
 | 3 | `FAILED expected [N, N, N, N], got []` |
 | 3 | `FAILED expected SyntaxError to be raised` |
+| 3 | `FAILED expected :SYM, got nil` |
 | 2 | `FAILED matcher did not match true` |
 | 2 | `FAILED matcher did not match N` |
 | 2 | `FAILED matcher did not match #<OBJ>:NxADDR>` |
@@ -90,6 +91,7 @@ Classified: 575 files.
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected IndexError to be raised` |
 | 2 | `ERROR SystemStackError` |
+| 2 | `ERROR RuntimeError` |
 | 2 | `ERROR FrozenError` |
 | 1 | `FAILED raised StandardError, expected IndexError` |
 | 1 | `FAILED raised NoMethodError, expected TypeError` |
@@ -115,6 +117,7 @@ Classified: 575 files.
 | 1 | `FAILED expected nil, got "S"` |
 | 1 | `FAILED expected a #<OBJ>>, got #<OBJ>` |
 | 1 | `FAILED expected [{}, nil], got nil` |
+| 1 | `FAILED expected [], got nil` |
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
 | 1 | `FAILED expected [], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
@@ -144,13 +147,14 @@ Classified: 575 files.
 | 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
+| 1 | `FAILED expected N, got true` |
 | 1 | `FAILED expected N, got (N+Ni)` |
+| 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected LocalJumpError to be raised` |
 | 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected FrozenError to be raised` |
-| 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got [:SYM, :SYM]` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
@@ -167,7 +171,6 @@ Classified: 575 files.
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
 | 1 | `FAILED expected "S" to match` |
 | 1 | `ERROR SyntaxError` |
-| 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
 | 1 | `ERROR Errno::ENOENT` |
 | 1 | `ERROR Encoding::UndefinedConversionError` |
@@ -229,13 +232,13 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | env (15) | `delete_if each_key each each_value filter has_key has_value keep_if key length member reject select store update` |
-| exception (12) | `backtrace detailed_message errno exception interrupt io_error key_error load_error signal_exception syntax_error system_call_error uncaught_throw_error` |
 | symbol (10) | `all_symbols case_compare encoding id2name intern match name next size slice` |
 | string (10) | `each_grapheme_cluster grapheme_clusters inspect scrub to_c to_r to_sym undump unicode_normalize unicode_normalized` |
 | matchdata (10) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match offset regexp` |
 | method (9) | `case_compare clone curry element_reference hash original_name source_location super_method to_proc` |
 | struct (8) | `deconstruct dig element_reference element_set filter initialize keyword_init new` |
 | kernel (8) | `Rational __method__ initialize_copy instance_variable_get method private_methods protected_methods singleton_method` |
+| exception (7) | `backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | unboundmethod (6) | `bind_call clone hash original_name source_location super_method` |
 | sizedqueue (5) | `deq enq length push shift` |
 | queue (5) | `deq enq length push shift` |

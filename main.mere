@@ -10849,13 +10849,37 @@ and make_exc_w = fn world -> fn (args: Val list) ->
            else raise_exc world "TypeError" "exception object expected")
         | _ -> raise_exc world "TypeError" "exception object expected")
      else
-       (let _ = (if map_has ivars2 (str_of_int id ++ "@__cause") then ()
+       // `raise exc` is the exception itself; `raise exc, msg` is
+       // exc.exception(msg) -- a COPY carrying the new message, which is the
+       // same protocol as the non-exception case above and the reason ruby's
+       // rule can be stated once. Going through invoke means a class that
+       // overrides #exception decides.
+       (let base = (match rest with
+                    | Nil -> VObj id
+                    | Cons (VNil, _) -> VObj id
+                    | Cons (m, _) ->
+                      // a class that overrides #exception decides; otherwise the
+                      // copy is built here rather than through invoke, which
+                      // only looks in the method table and cannot see the
+                      // primitive arm that implements Exception#exception.
+                      (if has_meth world ocl "exception" then
+                         (let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+                          invoke world noblk (VObj id) ocl "exception" rest)
+                       else
+                         (let nid = alloc_oid ocls2 in
+                          let _ = map_set ocls2 (str_of_int nid) ocl in
+                          let _ = map_set ivars2 (str_of_int nid ++ "@message") m in
+                          let _ = (if map_has ivars2 (str_of_int id ++ "@__bt")
+                                   then map_set ivars2 (str_of_int nid ++ "@__bt") (map_get ivars2 (str_of_int id ++ "@__bt")) else ()) in
+                          VObj nid))) in
+        let bid = (match base with VObj b -> b | _ -> id) in
+        let _ = (if map_has ivars2 (str_of_int bid ++ "@__cause") then ()
                  else (if map_has globals "!"
                        then (match map_get globals "!" with
                              | VNil -> ()
-                             | prev -> (if rb_identical prev (VObj id) then () else map_set ivars2 (str_of_int id ++ "@__cause") prev))
+                             | prev -> (if rb_identical prev base then () else map_set ivars2 (str_of_int bid ++ "@__cause") prev))
                        else ())) in
-        VObj id))
+        base))
   | _ -> make_exc args
 
 // An Errno class puts the system's own text in front of whatever message it is
@@ -14800,6 +14824,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "set_backtrace" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (match args with Cons (v, _) -> let _ = map_set ivars (str_of_int id ++ "@__bt") v in v | _ -> VNil)
     else if str_eq name "backtrace_locations" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then VNil
+    // LoadError#path / SyntaxError#path on an exception OBJECT: whatever was
+    // recorded, nil otherwise. (The loader raises the pair representation, and
+    // that path is answered from the message elsewhere -- two representations,
+    // one question, and neither may shadow the other.)
+    else if str_eq name "path" && (exc_is_a world cls "LoadError" || exc_is_a world cls "SyntaxError")
+            && (if has_meth world cls name then false else true) then
+      (if map_has ivars (str_of_int id ++ "@__path") then map_get ivars (str_of_int id ++ "@__path") else VNil)
+    // Exception#exception: self with no argument, and a COPY carrying the new
+    // message with one. This is the method half of the protocol raise uses on a
+    // non-exception object (make_exc_w); ruby exposes both, and `raise exc, msg`
+    // goes through this one.
+    else if str_eq name "exception" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
+      (match args with
+       | Nil -> recv
+       | Cons (VNil, _) -> recv
+       | Cons (m, _) ->
+         (let nid = alloc_oid ocls in
+          let _ = map_set ocls (str_of_int nid) cls in
+          let _ = map_set ivars (str_of_int nid ++ "@message") m in
+          let _ = (if map_has ivars (str_of_int id ++ "@__bt")
+                   then map_set ivars (str_of_int nid ++ "@__bt") (map_get ivars (str_of_int id ++ "@__bt")) else ()) in
+          VObj nid))
+    // Exception#detailed_message (ruby 3.2): the message with the class in
+    // parentheses -- what an uncaught exception's first line reads. RuntimeError
+    // with the default message is the one case that prints bare, because
+    // "unhandled exception" already says which class it was.
+    else if str_eq name "detailed_message" && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
+      (let msg = (if map_has ivars (str_of_int id ++ "@message")
+                  then to_s (map_get ivars (str_of_int id ++ "@message")) else cls) in
+       mkstr (msg ++ " (" ++ cls ++ ")"))
     // Exception#== : same class, equal message, and equal backtrace.
     else if (str_eq name "==" || str_eq name "eql?") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (match args with
@@ -19621,6 +19675,25 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // while replacing `require`).
   // the body of Module#const_missing: raise with ruby's message, which names
   // the receiver unless it is Object.
+  // the body of SystemCallError#initialize: an Errno class's message is the
+  // system's own text (errno_message), which is what `raise Errno::EINVAL`
+  // already produced -- the constructor now asks the same function instead of
+  // falling back to the class name. `self` is the exception being built, so its
+  // CLASS is the Errno name.
+  else if str_eq name "__errno_message" then
+    (match args with
+     | Cons (slf, Cons (m, _)) ->
+       (let (m9, s9, ocls9, i9) = world in
+        let c = (match slf with VObj oid -> map_get ocls9 (str_of_int oid) | other -> class_name other) in
+        let has = (match m with VNil -> false | _ -> true) in
+        let given = (match m with VStr h -> sget h | VNil -> "" | other -> to_s other) in
+        if str_len c > 7 && str_eq (substring c 0 7) "Errno::"
+        then mkstr (errno_message c given has)
+        // the base class is not an errno: ruby still prefixes it, with the text
+        // it uses when it has no number to look up.
+        else if str_eq c "SystemCallError" then (if has then mkstr ("unknown error - " ++ given) else VNil)
+        else (if has then mkstr given else VNil))
+     | _ -> VNil)
   else if str_eq name "__const_missing_raise" then
     (match args with
      | Cons (owner, Cons (cn, _)) ->
@@ -30185,10 +30258,79 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set meths "Kernel#require_relative"
     (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
   let _ = map_set meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("message", EVar "msg"), Nil))) in
+  // An Errno class's message is the SYSTEM's text, and `.new` has to say the
+  // same thing `raise` does: `Errno::EINVAL.new.message` is "Invalid argument",
+  // not the class name, and with an argument it reads "<text> - <arg>". raise
+  // went through errno_message and `.new` did not, so the two disagreed about
+  // the same exception -- one primitive, called from the constructor, is what
+  // keeps them from drifting again.
+  let _ = map_set meths "SystemCallError#initialize"
+    (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil),
+           Cons (SIVarAssign ("message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Nil)))), Nil))) in
   // NameError#initialize(msg = nil, name = nil): also records the offending
   // name (NoMethodError inherits this). #name reads it back.
   let _ = map_set meths "NameError#initialize" (Meth (Cons ("msg", Cons ("name", Nil)), Cons (("msg", ENil), Cons (("name", ENil), Nil)), Cons (SIVarAssign ("message", EVar "msg"), Cons (SIVarAssign ("__name", EVar "name"), Nil)))) in
   let _ = map_set meths "NameError#name" (Meth (Nil, Nil, Cons (SExpr (EIVar "__name"), Nil))) in
+  // The exception classes whose constructor takes MORE than a message. Ruby
+  // gives each of them a reader for what it recorded, and ruby/spec asks for
+  // exactly that pairing -- a constructor that accepts the argument and a
+  // reader that gives it back. All of them are synthesized the same way as
+  // Exception#initialize above: params, defaults, body. A keyword parameter is
+  // a param name ending in ":", which is how the binder recognizes one.
+  //
+  // NameError also takes `receiver:`, and NoMethodError adds the arguments of
+  // the failed call. `super` in a user subclass reaches these, so the ivars are
+  // named __-prefixed to stay out of the way of a subclass's own.
+  let _ = map_set meths "NameError#initialize"
+    (Meth (Cons ("msg", Cons ("name", Cons ("receiver:", Nil))),
+           Cons (("msg", ENil), Cons (("name", ENil), Cons (("receiver:", ENil), Nil))),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__name", EVar "name"),
+               Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))) in
+  let _ = map_set meths "NameError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
+  let _ = map_set meths "NoMethodError#initialize"
+    (Meth (Cons ("msg", Cons ("name", Cons ("args", Cons ("priv", Cons ("receiver:", Nil))))),
+           Cons (("msg", ENil), Cons (("name", ENil), Cons (("args", ENil), Cons (("priv", EBool false), Cons (("receiver:", ENil), Nil))))),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__name", EVar "name"),
+               Cons (SIVarAssign ("__args", EVar "args"),
+                 Cons (SIVarAssign ("__priv", EVar "priv"),
+                   Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))))) in
+  let _ = map_set meths "NoMethodError#args" (Meth (Nil, Nil, Cons (SExpr (EIVar "__args"), Nil))) in
+  let _ = map_set meths "NoMethodError#private_call?" (Meth (Nil, Nil, Cons (SExpr (EIVar "__priv"), Nil))) in
+  // KeyError and FrozenError take their extra state as keywords only.
+  let _ = map_set meths "KeyError#initialize"
+    (Meth (Cons ("msg", Cons ("receiver:", Cons ("key:", Nil))),
+           Cons (("msg", ENil), Cons (("receiver:", ENil), Cons (("key:", ENil), Nil))),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__recv", EVar "receiver"),
+               Cons (SIVarAssign ("__key", EVar "key"), Nil))))) in
+  let _ = map_set meths "KeyError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
+  let _ = map_set meths "KeyError#key" (Meth (Nil, Nil, Cons (SExpr (EIVar "__key"), Nil))) in
+  let _ = map_set meths "FrozenError#initialize"
+    (Meth (Cons ("msg", Cons ("receiver:", Nil)),
+           Cons (("msg", ENil), Cons (("receiver:", ENil), Nil)),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__recv", EVar "receiver"), Nil)))) in
+  let _ = map_set meths "FrozenError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
+  // SystemExit carries the exit status, positionally, before the message.
+  let _ = map_set meths "SystemExit#initialize"
+    (Meth (Cons ("status", Cons ("msg", Nil)),
+           Cons (("status", EInt 0), Cons (("msg", ENil), Nil)),
+           Cons (SIVarAssign ("__status", EVar "status"),
+             Cons (SIVarAssign ("message", EVar "msg"), Nil)))) in
+  let _ = map_set meths "SystemExit#status" (Meth (Nil, Nil, Cons (SExpr (EIVar "__status"), Nil))) in
+  let _ = map_set meths "SystemExit#success?"
+    (Meth (Nil, Nil, Cons (SExpr (EBin ("==", EIVar "__status", EInt 0)), Nil))) in
+  // LoadError#path and SyntaxError#path get NO method-table entry: `path` is
+  // already answered for the PAIR representation (the VExc the loader raises)
+  // by looking the path up from the message, and a method-table entry SHADOWS
+  // that -- corpus 55 caught exactly that, reading nil for a file the loader
+  // had just named. The object representation is answered in the exception arms
+  // instead, where it cannot shadow anything.
+  // UncaughtThrowError#tag / #value: what `throw` was called with.
+  let _ = map_set meths "UncaughtThrowError#tag" (Meth (Nil, Nil, Cons (SExpr (EIVar "__tag"), Nil))) in
+  let _ = map_set meths "UncaughtThrowError#value" (Meth (Nil, Nil, Cons (SExpr (EIVar "__value"), Nil))) in
   let _ = map_set sup "StandardError" "Exception" in
   let _ = map_set sup "RuntimeError" "StandardError" in
   let _ = map_set sup "ArgumentError" "StandardError" in
