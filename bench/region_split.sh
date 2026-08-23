@@ -65,6 +65,19 @@ i = b.index(b"size_t aligned = (n + 7) & ~((size_t)7);")
 j = b.index(b"\n", i)
 b = b[:j] + b"\n  if (shared) __def_bump += aligned; else __blk_bump += aligned;" + b[j:]
 
+# v0.1.307: oversize allocations take a dedicated block that bypasses
+# add_block -- classify it here too, or region_free's subtraction underflows
+# __blk_blk_live into a 2^64-ish max. 'shared' is in scope (same function).
+try:
+    i = b.index(b"big->pad = aligned;")
+    j = b.index(b"\n", i)
+    ins = (b"\n      if (shared) __def_blk_cum += aligned;"
+           b"\n      else { __blk_blk_cum += aligned; __blk_blk_live += aligned;"
+           b"\n             if (__blk_blk_live > __blk_blk_max) __blk_blk_max = __blk_blk_live; }")
+    b = b[:j] + ins + b[j:]
+except ValueError:
+    pass  # pre-v0.1.307 mr.c: no dedicated-block branch
+
 open(dst, "wb").write(b)
 PYEOF
 
