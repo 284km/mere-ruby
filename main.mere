@@ -8513,8 +8513,9 @@ let gc_pressure = fn world ->
   let (_, _, ocls, ivars) = world in
   let limit = (if map_has gc_state "t" then map_get gc_state "t" else 4000) in
   let bbase = (if map_has gc_state "b" then map_get gc_state "b" else 0) in
+  let tight = (if map_has gc_state "tight" then map_get gc_state "tight" else 0) == 1 in
   map_len ivars + map_len ocls > limit
-  || gc_store_bytes () > bbase * 2 + 33554432;
+  || gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432);
 
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
@@ -8700,7 +8701,7 @@ let gc_mark_roots = fn env -> fn live ->
     map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
   let _ = map_iter bind_store mkenv in
   // the scope-chain parents: env maps linked by id, each holding Vals
-  let _ = map_iter lv_up mkenv in
+  let _ = (if (if map_has gc_state "nolvup" then map_get gc_state "nolvup" else 0) == 1 then () else map_iter lv_up mkenv) in
   ();
 
 // THE COLLECTION, as a plain function. Everything it needs reaches it
@@ -26183,8 +26184,15 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
           // 250-file tree needs: without it the driver's between-statement
           // safepoint never gets a turn and the whole load runs uncollected
           // (measured at 88 GB on rubocop).
-          let _ = (if gc_safe_now () && gc_pressure world
-                   then (let _ = gc_collect env world in ()) else ()) in
+          let _ = (if (if map_has gc_state "tight" then map_get gc_state "tight" else 0) == 1
+                   then (if gc_pressure world
+                         then (if gc_safe_now ()
+                               then (let _ = gc_collect env world in ())
+                               else (let bn = (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+                                     let _ = map_set gc_state "blocked" (bn + 1) in ()))
+                         else ())
+                   else (if gc_safe_now () && gc_pressure world
+                         then (let _ = gc_collect env world in ()) else ())) in
           run_stmts env world blk rest))
 
 // The loader behind `require` / `require_relative`: resolve the path, run the
@@ -29778,6 +29786,7 @@ let store_stats = fn world ->
   let _ = row "bytes_struct_ctr" (map_bytes struct_ctr) in
   let _ = row "bytes_thread_flag" (map_bytes thread_flag) in
   let _ = row "bytes_gc_bare" (map_bytes gc_bare) in
+  let _ = row "gc_blocked" (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
   row "insp_seen" (map_len insp_seen);
 
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
@@ -30246,6 +30255,21 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
            then (let _ = try_or (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> ())) () in ())
            else ()) in
   let _ = map_set gc_state "log" (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then 0 else 1) in
+  // Two diagnostics for the collector, both off unless asked for. They exist
+  // because the questions they answer came up and could not be answered by
+  // reading the code:
+  //   MERE_RUBY_GC_NO_LVUP_ROOT=1 stops rooting lv_up. UNSOUND -- a closure
+  //     can lose its outer scope -- and for measurement only: it answers "how
+  //     much is the scope-chain table PINNING?". Answer, on a rubocop load:
+  //     nothing (str_store moved by 24 bytes), which killed a plan to prune it.
+  //   MERE_RUBY_GC_TIGHT=1 makes the byte trigger fire at baseline + 8 MB
+  //     instead of 2x + 32 MB, and counts the safepoints that pressure wanted
+  //     and could not have (the gc_blocked row of MERE_RUBY_STORE_STATS).
+  //     Answer, on the same load: 2 collections against 18.8M blocked checks,
+  //     which is how "the collector is starved of safe points, not of
+  //     pressure" stopped being a guess.
+  let _ = map_set gc_state "nolvup" (if str_eq (env_get "MERE_RUBY_GC_NO_LVUP_ROOT") "" then 0 else 1) in
+  let _ = map_set gc_state "tight" (if str_eq (env_get "MERE_RUBY_GC_TIGHT") "" then 0 else 1) in
   let _ = run_pre env world noblk prog in
   // The driver: plain recursion, no carry -- the collection is a function
   // now (gc_collect) and every store rebuilds in place through stable
