@@ -11,7 +11,22 @@ output to the reference `ruby`.
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
+./clitest/run.sh    # diff the driver's argv handling against the real ruby
 ```
+
+The driver takes the shapes ruby's does:
+
+```sh
+mere-ruby script.rb a b      # ARGV = ["a", "b"]
+mere-ruby -e 'puts 1+1'      # repeated -e are lines of ONE program
+mere-ruby -I lib script.rb   # -Idir or -I dir; flags AFTER the script are its own
+echo 'puts 1' | mere-ruby -  # `-` is stdin; a BARE mere-ruby prints usage
+mere-ruby -v                 # the same string RUBY_DESCRIPTION returns
+mere-ruby -h
+```
+
+An unrecognised option is an error, not a filename. A bare `mere-ruby` does
+not read stdin though ruby does — see [KNOWN_GAPS.md](KNOWN_GAPS.md).
 
 `-stack_size` is not optional. Parsing and evaluating recurse over the
 statement list, so native stack use grows with program size; on the

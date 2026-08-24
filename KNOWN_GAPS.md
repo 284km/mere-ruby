@@ -5,6 +5,32 @@ not fixed yet — as opposed to the things nobody has looked at. Each entry
 says what it costs and what fixing it would take, so the decision can be
 revisited rather than rediscovered.
 
+## A bare `mere-ruby` prints usage; ruby reads stdin
+
+```sh
+echo 'puts 1' | ruby           # ruby: 1
+echo 'puts 1' | mere-ruby      # mere-ruby: usage: ... (exit 2)
+echo 'puts 1' | mere-ruby -    # mere-ruby: 1
+```
+
+`-` reads the program from stdin and agrees with ruby. What diverges is the
+*bare* invocation with no arguments at all.
+
+**Why it is still here.** `read_stdin` blocks until EOF, so making the bare
+form read stdin means a caller that runs the binary with no arguments and no
+input HANGS instead of failing. A hanging gate is worse than a failing one:
+the failing one names a defect, the hanging one has to be killed from outside
+and reports nothing. Every caller that wants stdin can write `-`, which is
+what a pipeline writes anyway.
+
+**What fixing it would take.** A way to ask whether stdin is a terminal.
+`isatty` exists inside the C backend's terminal builtins but is not reachable
+as a Mere function, so this needs a host builtin (`stdin_is_tty : unit ->
+bool`) before the bare form can read stdin only when something is piped in.
+Until then the gate records this as a DELIBERATE divergence with a bounded
+wait, so a regression to blocking fails rather than hangs
+(`clitest/run.sh`).
+
 ## `p -1` parses as `p - 1`
 
 ```ruby
