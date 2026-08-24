@@ -28,6 +28,33 @@ mere-ruby -h
 An unrecognised option is an error, not a filename. A bare `mere-ruby` does
 not read stdin though ruby does — see [KNOWN_GAPS.md](KNOWN_GAPS.md).
 
+## Installing under rbenv
+
+```sh
+# Install the build on this machine. The base URL has to point at the tarball
+# that was just made -- with the default (a release URL) ruby-build would go
+# and download a DIFFERENT one, which is a 404 until that release exists.
+./packaging/rbenv/package.sh 0.1.0 "file://$PWD/dist"
+rbenv install dist/mere-ruby-0.1.0
+
+# Publishing: the default base URL is the GitHub release for the tag, so
+# upload dist/*.tar.gz to it and ship dist/mere-ruby-0.1.0 as the definition.
+./packaging/rbenv/package.sh 0.1.0
+```
+
+rbenv needs nothing but a `bin/ruby` under `$(rbenv root)/versions/<name>/`, and
+the definition is plain shell that ruby-build *sources* — so it carries its own
+`build_package_*` function and no patch to ruby-build is required. The version
+name deliberately has no platform in it (a `.ruby-version` naming one platform is
+wrong on every other machine); the definition picks its tarball from `uname` and
+refuses, by name, a platform it has no build for.
+
+What this does **not** get you is `gem install` or `bundle install`. Those need a
+C-extension story and a memory footprint this does not have yet — `require
+"rubocop"` costs single-digit gigabytes. ruby-build's `mruby` and `picoruby`
+definitions ship without RubyGems too, so the bar for being installable is lower
+than the bar for being useful to a Gemfile.
+
 `-stack_size` is not optional. Parsing and evaluating recurse over the
 statement list, so native stack use grows with program size; on the
 default 8 MB main-thread stack a program of roughly 8000 statements
