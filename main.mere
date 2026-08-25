@@ -10154,7 +10154,21 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     if str_eq op "==" then VBool (rb_eq va0 (vb))
     else if str_eq op "!=" then
       (if rb_eq va0 (vb) then VBool false else VBool true)
-    else if str_eq op "===" then VBool (case_eqq world va0 (vb))
+    else if str_eq op "===" then
+      // TWO QUESTIONS, ONE NAME. `when` needs a truth value, and that is what
+      // case_eqq answers. The OPERATOR returns whatever the receiver's #===
+      // returned, and for a callable that is the call's own result: ruby's
+      // `m === 1` is 1, not true. Answering the `when` question here made a
+      // Method comparison print a boolean where ruby prints the value.
+      (if (match va0 with
+           | VObj oid9 -> (let (_, _, ocls9, _) = world in
+                           let c9 = map_get ocls9 (str_of_int oid9) in
+                           str_eq c9 "Method" || str_eq c9 "Proc")
+           | VProc _ -> true
+           | _ -> false)
+       then (let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+             invoke_val_c gc_cenv0 world noblk va0 "call" (Cons (vb, Nil)) false)
+       else VBool (case_eqq world va0 (vb)))
     // A Symbol matches like its name does (`:V3_2_2 =~ /\AV\d+/` is 0):
     // regexp_parser selects its version constants that way.
     else if str_eq op "=~" then
@@ -14258,6 +14272,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "name" then VSym mnm
        else if str_eq name "receiver" then mrecv
        else if str_eq name "owner" then (if str_eq mown "" then VClass (class_name mrecv) else VClass mown)
+       // The same four as UnboundMethod (see there): the defined-as name, the
+       // definition further up, a copy, and a hash. A bound Method's owner may
+       // be empty (a method reached on a primitive receiver), in which case the
+       // receiver's class is the owner -- the same fallback #owner uses.
+       else if str_eq name "original_name" then
+         (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
+          VSym (if map_has alias_srcname (ocl ++ "#" ++ mnm)
+                then (match map_get alias_srcname (ocl ++ "#" ++ mnm) with s2 -> s2)
+                else canon_alias ocl mnm))
+       else if str_eq name "super_method" then
+         (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
+          let above = lookup_anc_above world (ancestors_of world ocl) ocl mnm in
+          if str_eq above "" then VNil else make_unbound_method world above mnm)
+       else if str_eq name "clone" || str_eq name "dup" then recv
+       else if str_eq name "hash" then
+         (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
+          VInt (val_hash (mkstr (ocl ++ "#" ++ mnm))))
        else if str_eq name "arity" then VInt (bm_arity world mown mnm)
        else if str_eq name "parameters" then
          bm_params world (if str_eq mown "" then class_name mrecv else mown) mnm
@@ -14831,6 +14862,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "owner" then VClass ucls
        else if str_eq name "arity" then VInt (bm_arity world ucls unm)
        else if str_eq name "parameters" then bm_params world ucls unm
+       // original_name: the name this method was DEFINED as, which differs from
+       // #name only for an alias -- and alias_srcname already records that pair
+       // (it exists so that `super` inside an aliased method searches for the
+       // source name). Reading it here rather than keeping a second table.
+       else if str_eq name "original_name" then
+         VSym (if map_has alias_srcname (ucls ++ "#" ++ unm)
+               then (match map_get alias_srcname (ucls ++ "#" ++ unm) with s2 -> s2)
+               else canon_alias ucls unm)
+       // super_method: the same name found further up the ancestors, as an
+       // UnboundMethod, or nil when this is the topmost definition.
+       else if str_eq name "super_method" then
+         (let anc = ancestors_of world ucls in
+          let above = lookup_anc_above world anc ucls unm in
+          if str_eq above "" then VNil
+          else make_unbound_method world above unm)
+       // clone: a Method object is immutable here, so a copy is a fresh handle
+       // onto the same (class, name) pair -- which is what ruby's clone gives
+       // for one (== is by owner and name, and the specs compare that way).
+       else if str_eq name "clone" || str_eq name "dup" then
+         make_unbound_method world ucls unm
+       else if str_eq name "hash" then VInt (val_hash (mkstr (ucls ++ "#" ++ unm)))
        else if str_eq name "inspect" || str_eq name "to_s" then
          mkstr ("#<UnboundMethod: " ++ ucls ++ "#" ++ unm ++ ">")
        else if str_eq name "==" || str_eq name "eql?" then
@@ -16886,6 +16938,16 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      else if str_eq n "format" then "sprintf"
      else if str_eq n "enum_for" then "to_enum"
      else n)
+  // Queue / SizedQueue: the same five aliases in both classes, so one row.
+  // The direction is the spec's own wording ("Queue#deq is an alias of
+  // Queue#pop", "Queue#push is an alias of Queue#<<").
+  else if str_eq cls "Queue" || str_eq cls "SizedQueue" then
+    (if str_eq n "deq" then "pop"
+     else if str_eq n "shift" then "pop"
+     else if str_eq n "enq" then "<<"
+     else if str_eq n "push" then "<<"
+     else if str_eq n "length" then "size"
+     else n)
   // The numeric tower shares one set of aliases across five classes, so the
   // row is written once and reached by all of them. WHICH name is canonical is
   // not derivable from this implementation -- the arms are written
@@ -16926,6 +16988,19 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   else if str_eq cls "Module" || str_eq cls "Class" then
     is_module_method name || is_prim_method name
   // zeitwerk branches on UnboundMethod.method_defined?(:bind_call)
+  // Queue and SizedQueue: their methods live in the primitive dispatcher, so
+  // without a row here `Queue.instance_method(:deq)` raised NameError for a
+  // method that works when called -- and every one of their eleven spec files
+  // opens by comparing two of these as UnboundMethods. Enumerated from the
+  // dispatcher's own arms rather than from memory.
+  else if str_eq cls "Queue" || str_eq cls "SizedQueue" then
+    str_eq name "push" || str_eq name "<<" || str_eq name "enq" ||
+    str_eq name "pop" || str_eq name "shift" || str_eq name "deq" ||
+    str_eq name "size" || str_eq name "length" || str_eq name "empty?" ||
+    str_eq name "clear" || str_eq name "close" || str_eq name "closed?" ||
+    str_eq name "num_waiting" ||
+    (str_eq cls "SizedQueue" && (str_eq name "max" || str_eq name "max=")) ||
+    is_prim_method name
   else if str_eq cls "UnboundMethod" || str_eq cls "Method" then
     str_eq name "bind" || str_eq name "bind_call" || str_eq name "call" ||
     str_eq name "unbind" || str_eq name "owner" || str_eq name "arity" ||
@@ -20592,6 +20667,25 @@ and lookup_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
   match anc with
   | Nil -> ""
   | Cons (a, rest) -> if map_has meths (a ++ "#" ++ name) then a else lookup_anc world rest name
+
+// The ancestor that defines `name` ABOVE `from` -- what Method#super_method
+// answers about. Walks past `from` first, so a class that defines the method
+// itself does not find itself.
+and lookup_anc_above = fn world -> fn (anc: str list) -> fn (from: str) -> fn (name: str) ->
+  match anc with
+  | Nil -> ""
+  | Cons (a, rest) -> if str_eq a from then lookup_anc world rest name
+                      else lookup_anc_above world rest from name
+
+// An UnboundMethod object for (class, name). One place, because three callers
+// build one now (instance_method, super_method, clone).
+and make_unbound_method = fn world -> fn (cls: str) -> fn (nm: str) ->
+  let (_, _, ocls0, ivars0) = world in
+  let id = alloc_oid ocls0 in
+  let _ = map_set ocls0 (str_of_int id) "UnboundMethod" in
+  let _ = map_set ivars0 (str_of_int id ++ "@__um_cls") (mkstr cls) in
+  let _ = map_set ivars0 (str_of_int id ++ "@__um_name") (mkstr nm) in
+  VObj id
 
 // ---- Struct.new(:a, :b) --------------------------------------------------
 // synthesize an anonymous class with rw accessors, a positional initialize,
@@ -25817,6 +25911,11 @@ and register_builtin_consts = fn (u: unit) ->
 // alias the whole of `require` hangs off was the one that did not happen.
 and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
   let (meths, sup, ocls, ivars) = world in
+  // the name this alias was made FROM, which is what Method#original_name
+  // answers. alias_method recorded it and the `alias` keyword did not, so the
+  // same alias written two ways gave two different original_names -- one
+  // fact, two writers, and only one of them wrote.
+  let _ = (if str_eq n1 n2 then () else map_set alias_srcname (cls ++ "#" ++ n1) n2) in
   let _ = if map_has meths (cls ++ "#" ++ n2) then
             (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
              // an alias keeps the original's lexical scope (see alias_method)
@@ -27663,6 +27762,20 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
 // Ruby's `===` as used by case/when: a Range tests membership, a Class tests
 // is-a, anything else tests ==.
 and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
+  // A Method (or Proc) on the left of `===` is CALLED with the right operand:
+  // that is how `case x when some_method` works, and it is the same trap
+  // Object#<=> was in -- `===` is an operator, so it never passes through the
+  // dispatcher where Method#=== lives, and the comparison silently answered
+  // false for a callable. `m.send(:===, 1)` worked, `m === 1` did not.
+  if (match cand with
+      | VObj oid -> (let (_, _, ocls9, _) = world in
+                     let c9 = map_get ocls9 (str_of_int oid) in
+                     str_eq c9 "Method" || str_eq c9 "Proc")
+      | VProc _ -> true
+      | _ -> false)
+  then (let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        truthy (invoke_val_c gc_cenv0 world noblk cand "call" (Cons (v, Nil)) false))
+  else
   // true / false / nil have no `===` of their own in Ruby, so theirs is
   // Object#===, which calls `==` -- a program that redefines TrueClass#== sees
   // `true === x` follow it. (Integer DOES have its own ===, which is why a
