@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 573 files.
+Classified: 554 files.
 
 ## CRASH — 22 files, 13 kinds
 
@@ -52,36 +52,36 @@ Classified: 573 files.
 
 </details>
 
-## DIFF — 551 files, 118 kinds
+## DIFF — 532 files, 122 kinds
 
 | files | kind |
 |---|---|
-| 79 | `ERROR NoMethodError` |
-| 46 | `FAILED matcher did not match Kernel` |
-| 41 | `FAILED matcher did not match #<OBJ>` |
-| 38 | `ERROR NameError` |
+| 81 | `ERROR NoMethodError` |
+| 45 | `FAILED matcher did not match #<OBJ>` |
+| 41 | `ERROR NameError` |
 | 27 | `FAILED expected "S", got "S"` |
 | 26 | `ERROR StandardError` |
 | 21 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 20 | `FAILED expected N, got N` |
+| 19 | `FAILED expected true, got false` |
 | 19 | `FAILED expected N, got nil` |
-| 19 | `FAILED expected N, got N` |
-| 18 | `FAILED expected true, got false` |
-| 18 | `ERROR ArgumentError` |
+| 19 | `ERROR ArgumentError` |
 | 16 | `FAILED expected TypeError to be raised` |
 | 16 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected to be identical` |
 | 10 | `FAILED expected false, got true` |
+| 9 | `FAILED matcher did not match Kernel` |
 | 6 | `FAILED expected "S", got nil` |
 | 6 | `ERROR TypeError` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED expected not N` |
 | 3 | `FAILED matcher did not match nil` |
 | 3 | `FAILED matcher did not match false` |
+| 3 | `FAILED matcher did not match N` |
 | 3 | `FAILED expected [N, N, N, N], got []` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
 | 2 | `FAILED matcher did not match true` |
-| 2 | `FAILED matcher did not match N` |
 | 2 | `FAILED matcher did not match #<OBJ>:NxADDR>` |
 | 2 | `FAILED expected nil, got N` |
 | 2 | `FAILED expected ["S", "S"], got nil` |
@@ -90,6 +90,7 @@ Classified: 573 files.
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected IndexError to be raised` |
+| 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR FrozenError` |
@@ -98,6 +99,7 @@ Classified: 573 files.
 | 1 | `FAILED raised NoMethodError, expected IndexError` |
 | 1 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 1 | `FAILED matcher matched [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM, :SYM, :SYM]` |
+| 1 | `FAILED matcher did not match []` |
 | 1 | `FAILED matcher did not match Rational` |
 | 1 | `FAILED matcher did not match Range` |
 | 1 | `FAILED matcher did not match Complex` |
@@ -111,6 +113,7 @@ Classified: 573 files.
 | 1 | `FAILED expected {"S"=>N, "S"=>N}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S", "S"=>"S"}, got {:SYM=>"S", :SYM=>"S", :SYM=>nil}` |
+| 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected not {N=>N}` |
 | 1 | `FAILED expected not nil` |
 | 1 | `FAILED expected nil, got []` |
@@ -143,6 +146,7 @@ Classified: 573 files.
 | 1 | `FAILED expected ["S", "S"], got []` |
 | 1 | `FAILED expected ["S", "S"], got ["S"]` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected RangeError to be raised` |
@@ -169,19 +173,19 @@ Classified: 573 files.
 | 1 | `FAILED expected "S", got " hello world` |
 | 1 | `FAILED expected "S", got "` |
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
-| 1 | `FAILED expected "S" to match` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR RangeError` |
 | 1 | `ERROR Errno::ENOENT` |
 | 1 | `ERROR Encoding::UndefinedConversionError` |
+| 1 | `(eval):N: warning: too many arguments for format string` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 40 | `FAILED: is a private method: matcher did not match Kernel` |
 | 16 | `FAILED: expected TypeError to be raised` |
 | 16 | `FAILED: expected ArgumentError to be raised` |
+| 5 | `FAILED: is a private method: matcher did not match Kernel` |
 | 5 | `FAILED: expected not 0` |
 | 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
 | 3 | `pass=2 fail=0 err=0` |
@@ -232,12 +236,12 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | env (15) | `delete_if each_key each each_value filter has_key has_value keep_if key length member reject select store update` |
+| kernel (13) | `Rational __method__ binding initialize_copy instance_variable_get lambda loop method private_methods protected_methods singleton_method test warn` |
 | symbol (10) | `all_symbols case_compare encoding id2name intern match name next size slice` |
 | string (10) | `each_grapheme_cluster grapheme_clusters inspect scrub to_c to_r to_sym undump unicode_normalize unicode_normalized` |
 | matchdata (10) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match offset regexp` |
 | method (9) | `case_compare clone curry element_reference hash original_name source_location super_method to_proc` |
 | struct (8) | `deconstruct dig element_reference element_set filter initialize keyword_init new` |
-| kernel (8) | `Rational __method__ initialize_copy instance_variable_get method private_methods protected_methods singleton_method` |
 | exception (7) | `backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | unboundmethod (6) | `bind_call clone hash original_name source_location super_method` |
 | sizedqueue (5) | `deq enq length push shift` |
