@@ -25,6 +25,17 @@
 # Writes SPEC_STATUS.md (summary table) and mspec/tags/<group>.txt (the
 # per-file DIFF/CRASH records — the "known not passing" list).
 set -u
+# LC_ALL=C for the WHOLE script, not just the `tr` below. Pinning one tool was
+# half the fix: `run_one` also puts the captured output through `sed` and `grep`,
+# and a spec whose output carries bytes that are not valid UTF-8 (core/string's
+# chars, chr, grapheme_clusters) makes BSD sed exit "illegal byte sequence" too.
+# An empty `rb` is read as "ruby did not run this file" -- SKIP -- so the verdict
+# became a fact about the operator's locale. Measured on core/string with one and
+# the same binary: ja_JP.UTF-8 gave 32/69/1 with 12 SKIP, LC_ALL=C gave 30/79/1
+# with 4. The 2026-08-19 fix named `tr` because `tr` was what had failed that day;
+# the exposure was never tool-specific.
+LC_ALL=C
+export LC_ALL
 # Pin the reference's encoding, as run_corpus.sh and bootstraptest do: with the
 # locale unset, ruby's default external encoding is US-ASCII and `inspect`
 # escapes every non-ASCII byte, while mere-ruby prints the bytes -- core/string

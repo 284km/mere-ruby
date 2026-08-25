@@ -24,6 +24,10 @@ dir="${2:-/tmp/mrb_bt}"
 out="$here/ERRORS.txt"
 [ "$mode" = fail ] && out="$here/FAILS.txt"
 : > "$out"
+# Pairs that ran past the alarm, kept apart from the causes (see the timeout arm
+# below). Written in both modes so the file never describes an older run.
+slowout="$here/SLOW.txt"
+: > "$slowout"
 
 for rb in "$dir"/*/p*.rb; do
   [ -f "$rb" ] || continue
@@ -50,8 +54,12 @@ for rb in "$dir"/*/p*.rb; do
   msg=$(perl -e 'alarm 60; exec @ARGV' "$here/../mere-ruby" $flags --eval-print "$rb" 2>&1 >/dev/null)
   code=$?
   [ $code -eq 0 ] && continue
+  # A timeout is not a cause, it is the harness's limit -- grouping it with the
+  # NoMethodErrors put a pair that moves with machine load into the same tally
+  # as pairs that move with the interpreter. It goes to its own file so
+  # "err pairs" counts what the name says. all.sh keys on the same two codes.
   if [ $code -eq 142 ] || [ $code -eq 14 ]; then
-    printf '(timeout)\t%s\n' "$rb" >> "$out"
+    printf '(timeout)\t%s\n' "$rb" >> "$slowout"
     continue
   fi
   # last line of stderr, minus the parts that differ between two reports of
@@ -67,6 +75,8 @@ done
 
 sort "$out" -o "$out"
 echo "$mode pairs: $(wc -l < "$out" | tr -d ' ')"
+nslow=$(wc -l < "$slowout" | tr -d ' ')
+[ "$nslow" -gt 0 ] && echo "slow pairs: $nslow (ran past the alarm -- see bootstraptest/SLOW.txt)"
 echo
 echo "top causes:"
 cut -f1 "$out" | sort | uniq -c | sort -rn | head -20

@@ -79,6 +79,7 @@ Every change is checked against the reference `ruby` before it lands:
 ```sh
 ./run_corpus.sh                                  # 162 programs, byte-for-byte
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
+./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
 ./parsetest/run.sh <dir> [dir ...]               # can it READ the ruby that exists?
@@ -89,6 +90,14 @@ Every change is checked against the reference `ruby` before it lands:
 Each harness derives what it needs from the arguments; nothing is left in
 `/tmp` between runs. Two of them used to be, and a cleared `/tmp` quietly
 took the measurement with it.
+
+Run the sweep with `mspec/rss_guard.sh` alongside it, and run it ALONE. The sweep
+bounds time per file and not bytes, and five spec files drive this interpreter
+past 6GB — `core/integer/even_spec.rb` reaches 15.3GB in under five seconds. The
+guard turns that into one recorded CRASH instead of a machine that stops
+responding. Starting a second harness next to the sweep is what took this machine
+down once: bootstraptest extracts a 121k-line generated program, and the two peaks
+land together.
 
 `MERE_RUBY_STACKTRACE=1` makes the recursion guard dump the innermost call
 names before it raises. mere-ruby keeps no backtrace, so this is the only

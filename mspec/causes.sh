@@ -19,6 +19,20 @@
 #   KIND  the shape, with values masked -- what to work on
 #   CAUSE the line as recorded -- what exactly to reproduce
 set -u
+# LC_ALL=C for the whole script, for the same reason scoreboard.sh pins it on its
+# `tr`: the recorded lines carry bytes that are not valid UTF-8 (core/string's
+# chars, chr, grapheme_clusters put raw bytes in a failure message). Under a
+# UTF-8 locale awk stops on them -- "towc: multibyte conversion failure" -- and
+# what it has classified so far is written out as if it were everything. Measured
+# in ja_JP.UTF-8 this file claimed to classify 430 records with 24 CRASHes, where
+# the tags hold 581 and 29. A record that silently loses a third of its input is
+# worse than one that fails, because the ranking still looks plausible.
+#
+# scoreboard.sh got this fix on 2026-08-19 and this script did not, which is the
+# same shape as the bootstraptest SLOW column: one fact about this project, more
+# than one place that has to know it, and only one of them told.
+LC_ALL=C
+export LC_ALL
 here="$(cd "$(dirname "$0")" && pwd)"
 tagdir="$here/tags"
 out="$here/../CAUSES.md"

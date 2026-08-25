@@ -34,13 +34,23 @@ done
 # does not produce is DRIFT -- ruby 3.4 froze string literals and changed
 # Hash#inspect, and "fixing" those here would break the corpus. Set
 # BT_NO_DRIFT_CHECK=1 to skip the check (it doubles the run time).
-# One pair is a CANARY rather than a signal: test_thread/p24 runs a thread with
-# `while true; // =~ "" end`, and whether it finishes depends on which limit trips
-# first -- the interpreter's step budget or the native stack. The same source
-# overflows at -O1 and does not at -Os, so it moves on changes that have nothing
-# to do with it. err=59 with that pair inside is the recorded state; err=58
-# without it was the state before the closure-env work upstream.
-pass=0; fail=0; err=0; drift=0; total=0
+# Two pairs move on things that are not the interpreter, so neither belongs in
+# err. test_thread/p24 runs a thread with `while true; // =~ "" end` and finishes
+# or does not depending on which limit trips first -- the step budget or the
+# native stack -- so it flips between -O1 and -Os. test_yjit_30k_methods/p0 is
+# 121k lines and takes ~87s unloaded against the alarm below, so it flips with
+# machine load. The second one cost a whole investigation: the tally read
+# 1571/12/57 against a recorded 1572/12/56, and rebuilding the recorded commit
+# reproduced 57 with a byte-identical err set -- the regression was in the meter,
+# not the interpreter.
+#
+# A timeout is therefore its own verdict (SLOW), the way mspec/scoreboard.sh has
+# counted it since 2026-08-19: it says "ran past this harness's limit", which is
+# not what err says ("the interpreter exited non-zero"). Raising the alarm is not
+# the fix -- it was already raised once (15 -> 60, see below) and a bigger
+# generated test walked past the new number too. Only a separate column stops the
+# tally from moving when nothing did.
+pass=0; fail=0; err=0; slow=0; drift=0; total=0
 for rb in "$dir"/*/p*.rb; do
   [ -f "$rb" ] || continue
   exp=$(cat "${rb%.rb}.exp")
@@ -60,8 +70,12 @@ for rb in "$dir"/*/p*.rb; do
   got=$(perl -e 'alarm 60; exec @ARGV' "$here/../mere-ruby" $flags --eval-print "$rb" 2>/dev/null)
   code=$?
   total=$((total + 1))
+  # 142 is perl's exit after the alarm signal (128+SIGALRM), 14 the bare signal
+  # number -- triage.sh keys on the same two, so the two scripts agree on what a
+  # timeout is rather than each deciding for itself.
   if [ "$got" = "$exp" ] && [ "$code" -eq 0 ]; then pass=$((pass + 1))
+  elif [ "$code" -eq 142 ] || [ "$code" -eq 14 ]; then slow=$((slow + 1))
   elif [ "$code" -ne 0 ]; then err=$((err + 1))
   else fail=$((fail + 1)); fi
 done
-echo "pass=$pass fail=$fail err=$err drift=$drift total=$total (of $((total - drift)) pairs the reference ruby reproduces)"
+echo "pass=$pass fail=$fail err=$err slow=$slow drift=$drift total=$total (of $((total - drift)) pairs the reference ruby reproduces)"

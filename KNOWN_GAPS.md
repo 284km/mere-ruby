@@ -1464,3 +1464,142 @@ file. Five of the remaining 21 are still NoMethodError, three NameError, and the
 rest are argument checks and a `to_h` on a keyword-init struct.
 
 The table says where to look, not how much each fix is worth.
+
+## A pair that takes 87 seconds is not an error, and the tally said it was
+
+`bootstraptest/test_yjit_30k_methods/p0` is a generated program of **121,024
+lines** that sums to 1000000. mere-ruby gets the right answer and takes about
+**87 seconds** on an unloaded machine. The harness's alarm is 60. So the pair
+timed out, `perl` exited 142, and `all.sh` counted it under `err` — the same
+column as a `NoMethodError`.
+
+That put a number which moves with **machine load** into a gate. It cost a whole
+investigation: the tally read `1571/12/57` against a recorded `1572/12/56`, which
+reads exactly like a regression from the change in the working tree. It was not.
+Rebuilding the recorded commit and running it produced **57**, with an err set
+that was **byte-identical** to the new one. Nothing had regressed; the meter had
+moved.
+
+`mspec/scoreboard.sh` already knew this. It grew a **SLOW** column on 2026-08-19
+for the same reason — "ran past this harness's per-file limit — working, not
+aborting" is a different claim from "the interpreter aborted". bootstraptest never
+got that fix, so one fact about this project had two writers and only one of them
+had written it down.
+
+Now `all.sh` reports `slow=` as its own column and `triage.sh` writes the timed-out
+pairs to `bootstraptest/SLOW.txt` instead of grouping them with the causes. Both
+key on exit 142/14 so the two scripts cannot disagree about what a timeout is.
+
+**Raising the alarm is not the fix.** It was already raised once — 15 to 60,
+because a 241k-line if/else chain ran ~16s and flipped the tally run to run — and
+a bigger generated test walked past the new number anyway. A limit that a passing
+program can cross will always be crossed by the next one; only a separate verdict
+stops the tally from moving when nothing did.
+
+The pair itself stays unpassed, and that is the honest reading: this is a
+tree-walking interpreter, and 121k lines of generated method definitions cost 87
+seconds. That is a speed gap, recorded as one, in a column that says so.
+
+## Five spec files allocate past 6GB, and the sweep only bounds time
+
+Measured with `mspec/rss_guard.sh` polling every 5s during a full sweep:
+
+| file | RSS when the guard saw it |
+|---|---|
+| `core/integer/even_spec.rb` | **15.3GB** (reached in under 5s) |
+| `core/integer/*` (a second file) | 14.5GB |
+| `core/method/call_spec.rb` | 6.8GB |
+| `core/method/*` (a second file) | 6.7GB |
+| `core/rational/to_f_spec.rb` | 6.9GB |
+
+`run_one` puts a 60s alarm on each file and no bound at all on bytes. Those are
+not symmetric: at this interpreter's measured allocation rate (~2.7GB/s) a 60s
+alarm still permits ~160GB, and macOS offers no `ulimit -v`/`-d` to fall back on.
+The sweep is therefore a harness that can take the machine with it, and did.
+
+The five show up in `mspec/tags/` as CRASH with the cause `(no output before
+aborting)` — which reads as "the interpreter aborted" when what happened is that
+the guard shot it. That text is the honest limit of where the bound currently
+sits: outside `run_spec.sh`, where mere-ruby's exit status is no longer visible.
+Moving it inside would let a killed run have a verdict of its own, the way a
+timeout does.
+
+What the numbers are NOT is a claim about which construct is at fault. A 15GB
+`even?` spec says a bignum path is running away; it does not say which one. That
+is the next measurement, not a conclusion from this one.
+
+## The record was measured a slice at a time, and the untouched groups drifted
+
+A full 28-group re-sweep against the same binary the previous slices were built
+with put the total at **491/1081 MATCH** where the checked-in table said
+**517/1072**. Nothing regressed between those two runs; the table had simply never
+been remeasured for the groups each slice did not name:
+
+| group | recorded | measured |
+|---|---|---|
+| core/float | 38 | **29** |
+| core/kernel | 54 | **47** |
+| core/integer | 27 | **20** |
+| core/method | 13 | **8** |
+| core/proc | 9 | **5** |
+| core/complex | 29 | **26** |
+| core/unboundmethod | 9 | **7** |
+
+Against that, `core/env` moved 16 to 25 and `core/exception` and `core/rational`
+each gained one, so the net is -26 across 1081 files. The gains are this session's
+work; the losses were already pushed.
+
+The rule the slices followed was "gate on corpus, bootstraptest, and a sweep of the
+group you touched". The group is the wrong unit when the change is not group-shaped:
+the alias and reflection work touched `original_name`, `canon_alias`,
+`builtin_has_meth` and `===` on callables — machinery every builtin class goes
+through — and then swept `core/method`, `core/unboundmethod`, `core/queue` and
+`core/sizedqueue`, because those were the groups the work was *about*.
+
+Confirmed with the binaries rather than inferred: sweeping `core/float` with the
+previous commit's binary also gives 29/50, so this is the state that was already
+pushed, not something the working tree did. `Float.instance_method(:inspect) ==
+Float.instance_method(:to_s)` is `true` in ruby and `false` here, and
+`original_name` answers `:inspect` where ruby answers `:to_s` — builtin aliases
+are not in the table the new code consults.
+
+Two file counts also moved (`core/integer` 67 to 70, `core/method` 25 to 26): the
+ruby checkout the specs come from is newer than the run that recorded those rows.
+A row carries no note of what it was measured against, which is why this took a
+rebuild of two older binaries to tell apart from a regression.
+
+## The locale fix named a tool, and the exposure was never tool-specific
+
+`scoreboard.sh` has pinned `LC_ALL=C` on one `tr` since 2026-08-19, because that
+`tr` was what failed the day the bug was found: a spec whose output carries bytes
+that are not valid UTF-8 (core/string's `chars`, `chr`, `grapheme_clusters`) made
+it exit, the captured output came back empty, and the verdict became SKIP.
+
+`run_one` also puts that same output through `sed` and `grep`. BSD `sed` exits
+"illegal byte sequence" on the same bytes, an empty `rb` is read as "ruby did not
+run this file", and the verdict is SKIP again — by a second route that the first
+fix did not close. Measured on core/string with one binary and one spec tree:
+
+| locale | MATCH | DIFF | CRASH | SKIP |
+|---|---|---|---|---|
+| ja_JP.UTF-8 | 32 | 69 | 1 | **12** |
+| LC_ALL=C | 32 | 81 | 1 | **0** |
+
+`mspec/causes.sh` had it a third time, in awk: it stopped on the first bad byte
+with "towc: multibyte conversion failure" and then wrote out what it had
+classified so far as though that were everything — 430 records and 24 CRASHes
+where the tags hold 584 and 28. A record that silently drops a third of its input
+is worse than one that fails, because the ranking it prints still looks plausible.
+
+Both scripts now export `LC_ALL=C` for their whole body rather than for the tool
+that happened to fail. The check that this is enough is not that the number looks
+right: core/string swept twice in a row gives 32/81/1/0 both times, and that
+agrees with what the table already said, which is what a reproducible measurement
+of an unchanged group is supposed to do.
+
+This one cost a wrong conclusion before it was found. The contaminated sweep
+showed several groups losing MATCH, and the first reading was that the record had
+drifted; the second reading was that the locale explained it. Re-measuring under
+`LC_ALL=C` settled it: **core/string and core/symbol were the locale, and the
+other groups had really regressed.** Two causes were live at once, and each one
+was a complete-sounding explanation of the other's evidence.

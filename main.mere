@@ -11595,7 +11595,19 @@ and enum_needs_block = fn (name: str) ->
   str_eq name "filter_map" || str_eq name "take_while" || str_eq name "drop_while" ||
   str_eq name "each_entry" || str_eq name "chunk" || str_eq name "chunk_while" ||
   str_eq name "slice_when" || str_eq name "reverse_each" || str_eq name "each_char" ||
-  str_eq name "each_byte" || str_eq name "each_line" || str_eq name "each_codepoint"
+  str_eq name "each_byte" || str_eq name "each_line" || str_eq name "each_codepoint" ||
+  // Every method that YIELDS returns an Enumerator when called without a block
+  // -- that is the convention, not a property of the ones listed above, and
+  // these eight were yielding without being listed. `{}.each_key` raised
+  // NoMethodError where ruby hands back an Enumerator, and ENV inherits the
+  // same answer through its hash delegation. The list is the gate's only input
+  // (one site: dispatch checks it before the with-block arms), so a name that
+  // yields and is missing here has no blockless form at all.
+  str_eq name "each" || str_eq name "each_pair" || str_eq name "each_key" ||
+  str_eq name "each_value" || str_eq name "delete_if" || str_eq name "keep_if" ||
+  str_eq name "select!" || str_eq name "reject!" || str_eq name "filter!" ||
+  str_eq name "each_index" || str_eq name "map!" || str_eq name "collect!" ||
+  str_eq name "each_with_index"
 
 and is_enum_method = fn (name: str) ->
   str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
@@ -14278,13 +14290,31 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // receiver's class is the owner -- the same fallback #owner uses.
        else if str_eq name "original_name" then
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
-          VSym (if map_has alias_srcname (ocl ++ "#" ++ mnm)
-                then (match map_get alias_srcname (ocl ++ "#" ++ mnm) with s2 -> s2)
-                else canon_alias ocl mnm))
+          VSym (defined_as_name world ocl mnm))
        else if str_eq name "super_method" then
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
           let above = lookup_anc_above world (ancestors_of world ocl) ocl mnm in
           if str_eq above "" then VNil else make_unbound_method world above mnm)
+       // Method#==: the same receiver, the same owner, and the same definition --
+       // two ALIASES of one method are equal (ruby: `m.method(:each) ==
+       // m.method(:each_pair)`), which is what canon_alias decides. There was
+       // no arm at all here, so comparing two Method objects fell through to
+       // object identity and every such assertion was false. UnboundMethod had
+       // this and bound Method did not: one question, two implementations, and
+       // only one of them answered.
+       else if str_eq name "==" || str_eq name "eql?" then
+         (match args with
+          | Cons (VObj oid2, _) ->
+            (let (_, _, ocls2, ivars2) = world in
+             if str_eq (map_get ocls2 (str_of_int oid2)) "Method" then
+               (let own2 = (match map_get ivars2 (str_of_int oid2 ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
+                let nm2 = (match map_get ivars2 (str_of_int oid2 ++ "@__m_name") with VStr h -> sget h | _ -> "") in
+                let rc2 = (if map_has ivars2 (str_of_int oid2 ++ "@__m_recv") then map_get ivars2 (str_of_int oid2 ++ "@__m_recv") else VMain) in
+                VBool (str_eq own2 mown
+                       && str_eq (defined_as_name world mown nm2) (defined_as_name world mown mnm)
+                       && rb_identical rc2 mrecv))
+             else VBool false)
+          | _ -> VBool false)
        else if str_eq name "clone" || str_eq name "dup" then recv
        else if str_eq name "hash" then
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
@@ -14867,9 +14897,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // (it exists so that `super` inside an aliased method searches for the
        // source name). Reading it here rather than keeping a second table.
        else if str_eq name "original_name" then
-         VSym (if map_has alias_srcname (ucls ++ "#" ++ unm)
-               then (match map_get alias_srcname (ucls ++ "#" ++ unm) with s2 -> s2)
-               else canon_alias ucls unm)
+         VSym (defined_as_name world ucls unm)
        // super_method: the same name found further up the ancestors, as an
        // UnboundMethod, or nil when this is the topmost definition.
        else if str_eq name "super_method" then
@@ -14892,8 +14920,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | Cons (VObj oid2, _) ->
             VBool (str_eq (map_get ocls (str_of_int oid2)) "UnboundMethod"
                    && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__um_cls"))) ucls
-                   && str_eq (canon_alias ucls (to_s (map_get ivars (str_of_int oid2 ++ "@__um_name"))))
-                             (canon_alias ucls unm))
+                   && str_eq (defined_as_name world ucls (to_s (map_get ivars (str_of_int oid2 ++ "@__um_name"))))
+                             (defined_as_name world ucls unm))
           | _ -> VBool false)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of UnboundMethod"))
     // Encoding objects: name/to_s give the label, inspect is #<Encoding:name>.
@@ -16638,7 +16666,13 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
   | VObj oid ->
     (let ocl = map_get ocls (str_of_int oid) in
      let a = lookup_anc world (ancestors_of world ocl) nm in
-     if str_eq a "" && map_has meths (ocl ++ "#" ++ nm) then ocl else a)
+     if str_eq a "" && map_has meths (ocl ++ "#" ++ nm) then ocl
+     // a method the object has as a BUILTIN is owned by its class too. Leaving
+     // this empty made #owner fall back to a generic class name, and it also
+     // decided Method equality: two aliases of one ENV method compared unequal
+     // because the alias table is keyed by owner and the owner was blank.
+     else if str_eq a "" && builtin_obj_has ocl nm then ocl
+     else a)
   | VClass c2 ->
     (let sng = "(sng:" ++ c2 ++ ")" in
      let a = lookup_anc world (ancestors_of world sng) nm in
@@ -16695,7 +16729,30 @@ and bm_has_default = fn (defaults: (str * Expr) list) -> fn (pp: str) ->
 // than the method table. respond_to? has to know about them, or a delegator
 // asked to forward `write` to a File decides the File cannot take it.
 and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
-  if str_eq cls "File" || str_eq cls "IO" then
+  // ENV: one object whose methods all live in the dispatcher, so nothing knew
+  // it had any -- `ENV.respond_to?(:each)` was false and `ENV.method(:each)`
+  // raised NameError while `ENV.each` iterated. It answers the Hash surface
+  // (its arm delegates the rest to a hash copy) plus the keys-and-values
+  // methods of its own.
+  if str_eq cls "EnvHash" then
+    is_hash_method name || is_enum_method name ||
+    str_eq name "[]" || str_eq name "[]=" || str_eq name "store" ||
+    str_eq name "fetch" || str_eq name "delete" || str_eq name "key?" ||
+    str_eq name "has_key?" || str_eq name "include?" || str_eq name "member?" ||
+    str_eq name "has_value?" || str_eq name "value?" || str_eq name "key" ||
+    str_eq name "keys" || str_eq name "values" || str_eq name "values_at" ||
+    str_eq name "each" || str_eq name "each_pair" || str_eq name "each_key" ||
+    str_eq name "each_value" || str_eq name "size" || str_eq name "length" ||
+    str_eq name "empty?" || str_eq name "clear" || str_eq name "to_h" ||
+    str_eq name "to_hash" || str_eq name "to_a" || str_eq name "update" ||
+    str_eq name "merge!" || str_eq name "delete_if" || str_eq name "keep_if" ||
+    str_eq name "select" || str_eq name "select!" || str_eq name "filter" ||
+    str_eq name "filter!" || str_eq name "reject" || str_eq name "reject!" ||
+    str_eq name "assoc" || str_eq name "rassoc" || str_eq name "invert" ||
+    str_eq name "index" || str_eq name "slice" || str_eq name "except" ||
+    str_eq name "dig" || str_eq name "fetch_values" || str_eq name "rehash" ||
+    str_eq name "replace" || str_eq name "shift" || str_eq name "freeze"
+  else if str_eq cls "File" || str_eq cls "IO" then
     str_eq name "read" || str_eq name "write" || str_eq name "print" || str_eq name "puts" ||
     str_eq name "<<" || str_eq name "gets" || str_eq name "readline" || str_eq name "each_line" ||
     str_eq name "readlines" || str_eq name "to_a" || str_eq name "close" || str_eq name "closed?" ||
@@ -16894,6 +16951,16 @@ and is_hash_method = fn (name: str) ->
 // `String.instance_method(:size) == String.instance_method(:length)` is true.
 // Dispatch treats them as separate names; this collapses each pair onto one
 // canonical name so reflection can see that they are one method.
+// The name a method is DEFINED as, for `cls#n`: an alias made in ruby resolves
+// through alias_srcname, and an alias of a BUILTIN through canon_alias. Method
+// equality and #original_name both ask this one question, and asking only half
+// of it made `m.method(:foo) == m.method(:bar)` false for a ruby-level alias
+// while it was true for a builtin one.
+and defined_as_name = fn world -> fn (cls: str) -> fn (n: str) ->
+  if map_has alias_srcname (cls ++ "#" ++ n)
+  then (match map_get alias_srcname (cls ++ "#" ++ n) with s2 -> s2)
+  else canon_alias cls n
+
 and canon_alias = fn (cls: str) -> fn (n: str) ->
   if str_eq cls "String" then
     (if str_eq n "size" then "length"
@@ -16937,6 +17004,21 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
     (if str_eq n "fail" then "raise"
      else if str_eq n "format" then "sprintf"
      else if str_eq n "enum_for" then "to_enum"
+     else n)
+  // ENV (an object, internally class EnvHash): its aliases, from the specs'
+  // wording ("ENV.has_key? is an alias of ENV.include?"). ENV is one object
+  // rather than a class, so these are compared as Method objects, and Method
+  // equality goes through this table.
+  else if str_eq cls "EnvHash" then
+    (if str_eq n "each" then "each_pair"
+     else if str_eq n "has_key?" then "include?"
+     else if str_eq n "key?" then "include?"
+     else if str_eq n "member?" then "include?"
+     else if str_eq n "has_value?" then "value?"
+     else if str_eq n "length" then "size"
+     else if str_eq n "store" then "[]="
+     else if str_eq n "update" then "merge!"
+     else if str_eq n "filter!" then "select!"
      else n)
   // Queue / SizedQueue: the same five aliases in both classes, so one row.
   // The direction is the spec's own wording ("Queue#deq is an alias of
