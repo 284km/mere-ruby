@@ -20,6 +20,13 @@
 #
 # Writes mspec/DIFF_CAUSES.txt (the ranked causes) and mspec/DIFF_LINES.txt
 # (one line per failing example, so a cause can be traced back to its files).
+#
+# Both are CHECKED IN and public, so the recorded line gets the same treatment
+# scoreboard.sh gives its causes: $HOME, the tmpdir and heap addresses masked,
+# and a length cap. core/kernel/__dir___spec.rb reports the directory it ran in,
+# which put the operator's home path into this file and kept it there across
+# seven commits -- and `grep` did not show it, because a record with invalid
+# UTF-8 bytes reads as binary. mspec/record_hygiene.sh is the check for both.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -48,6 +55,10 @@ for g in $groups; do
             -e 's/^FAILED: .*: \(expected .*\)$/FAILED\t\1/' \
             -e 's/^FAILED: \(.*\)$/FAILED\t\1/' \
             -e 's/^ERROR: \(.*\)$/ERROR\t\1/' \
+      | sed -e "s|${HOME}|HOME|g" \
+            -e 's|/var/folders/[^ ]*|TMPDIR|g' \
+            -e 's|0x[0-9a-f]*|0xADDR|g' \
+      | awk -v n=300 '{ if (length($0) > n) print substr($0,1,n) " ...[clipped]"; else print $0 }' \
       | while IFS= read -r rec; do printf '%s\t%s\t%s\n' "$g" "$f" "$rec" >> "$lines"; done
   done
 done
