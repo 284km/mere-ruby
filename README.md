@@ -81,6 +81,7 @@ Every change is checked against the reference `ruby` before it lands:
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
+./mspec/record_hygiene.sh                        # the records name no machine and no operator
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
 ./parsetest/run.sh <dir> [dir ...]               # can it READ the ruby that exists?
 ./gemtest/run.sh <gem-home> <rubygems-checkout> [stdlib]   # real gems, loaded

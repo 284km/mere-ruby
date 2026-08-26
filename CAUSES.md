@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 584 files.
+Classified: 568 files.
 
-## CRASH — 28 files, 16 kinds
+## CRASH — 27 files, 16 kinds
 
 | files | kind |
 |---|---|
-| 6 | `(no output before aborting)` |
 | 5 | `stack overflow (recursion too deep)` |
+| 5 | `(no output before aborting)` |
 | 2 | `ERROR StandardError` |
 | 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 2 | `*.rb:N: mere-ruby: expected block in TMPDIR near line N` |
@@ -37,8 +37,8 @@ Classified: 584 files.
 
 | files | cause |
 |---|---|
-| 6 | `(no output before aborting)` |
 | 5 | `stack overflow (recursion too deep)` |
+| 5 | `(no output before aborting)` |
 | 1 | `FAILED: supports float formats using %e: expected "9.000000e+00", got "%*e"` |
 | 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
@@ -59,22 +59,22 @@ Classified: 584 files.
 
 </details>
 
-## DIFF — 556 files, 129 kinds
+## DIFF — 541 files, 130 kinds
 
 | files | kind |
 |---|---|
 | 83 | `ERROR NoMethodError` |
 | 35 | `ERROR NameError` |
-| 31 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 30 | `ERROR StandardError` |
 | 29 | `FAILED expected "S", got "S"` |
 | 26 | `FAILED expected TypeError to be raised` |
-| 26 | `FAILED expected N, got N` |
+| 24 | `FAILED expected N, got N` |
 | 24 | `FAILED expected ArgumentError to be raised` |
 | 23 | `FAILED expected true, got false` |
 | 23 | `ERROR ArgumentError` |
 | 19 | `FAILED expected to be identical` |
 | 16 | `FAILED expected N, got nil` |
+| 16 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 13 | `FAILED expected false, got true` |
 | 6 | `pass=N fail=N err=N` |
 | 6 | `FAILED expected "S", got nil` |
@@ -104,6 +104,7 @@ Classified: 584 files.
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
+| 2 | `FAILED expected N ...[clipped]` |
 | 2 | `FAILED expected IndexError to be raised` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -175,7 +176,7 @@ Classified: 584 files.
 | 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
-[a process environment dump was removed from this record]
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "VSCODE_CRASH_R ...[clipped]` |
 | 1 | `FAILED expected "a.rb:N: Some runtime error (RuntimeError)` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |

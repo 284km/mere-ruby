@@ -81,10 +81,33 @@ TIMEOUT=60
 # quoted identifiers included: normalising it further merges causes that are
 # genuinely different, and a bucket that mixes them cannot be acted on.
 strip_noise() {  # stdin -> stdout, a line usable as a bucket key
+  # $HOME goes the way of the tmpdir and the address: a recorded line is checked
+  # into a PUBLIC repo, and the operator's home path is neither a property of the
+  # interpreter nor something to publish. This is the same masking rule the other
+  # two already are, applied to the third thing that identifies the machine.
   sed -e 's|^[^ ]*\.rb:[0-9]*: |*.rb:N: |' \
       -e 's|/[^ ]*/mrb_[A-Za-z0-9]*|TMPDIR|g' \
       -e 's|/var/folders/[^ ]*|TMPDIR|g' \
+      -e "s|${HOME}|HOME|g" \
       -e 's|0x[0-9a-f]*|0xADDR|g'
+}
+
+# A cause is a SUMMARY -- the one line the two sides first disagree on, kept so
+# the failures can be grouped and one of them reproduced. It is not the output.
+#
+# Nothing enforced that until core/env taught it: those specs print ENV, so once
+# `ENV.filter` became reflectable here the first differing line was a Method whose
+# inspect carries the entire process environment. An 11KB "cause" went into
+# mspec/tags/ and CAUSES.md and was pushed -- PATH, HOME, SSH_AUTH_SOCK, session
+# ids and an internal package-index host, in a public repo, inside a field whose
+# whole job is to be a short label.
+#
+# The cap is the fix rather than a mask for ENV specifically: the field's contract
+# is "short enough to read in a table", and any object with a large inspect --
+# a big hash, a long array, a deep struct -- reaches it the same way.
+CAUSE_MAX=${CAUSE_MAX:-240}
+clip_cause() {  # $1 = cause -> echoes it, bounded
+  printf '%s' "$1" | awk -v n="$CAUSE_MAX" '{ if (length($0) > n) print substr($0,1,n) " ...[clipped]"; else print $0 }'
 }
 
 run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
@@ -123,7 +146,7 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
     # CRASH: the cause is why it stopped -- the last thing it said. An empty
     # mere-ruby side means it died before printing anything at all, which is a
     # different finding and worth its own bucket rather than a blank.
-    cause="$(grep -av '^$' "$mr_f" | tail -1)"
+    cause="$(clip_cause "$(grep -av '^$' "$mr_f" | tail -1)")"
     [ -n "$cause" ] || cause="(no output before aborting)"
     rm -f "$mr_f" "$rb_f"
     printf 'CRASH\t%s\n' "$cause"
@@ -132,8 +155,8 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
 
   # DIFF: the first line the two sides disagree on. Not the tally -- the tally
   # says how many examples differ, never which behaviour is wrong.
-  cause="$(diff "$mr_f" "$rb_f" 2>/dev/null | grep -a '^<' | head -1 | cut -c3-)"
-  [ -n "$cause" ] || cause="$(diff "$mr_f" "$rb_f" 2>/dev/null | grep -a '^>' | head -1 | cut -c3-)"
+  cause="$(clip_cause "$(diff "$mr_f" "$rb_f" 2>/dev/null | grep -a '^<' | head -1 | cut -c3-)")"
+  [ -n "$cause" ] || cause="$(clip_cause "$(diff "$mr_f" "$rb_f" 2>/dev/null | grep -a '^>' | head -1 | cut -c3-)")"
   [ -n "$cause" ] || cause="(tallies differ, lines identical)"
   rm -f "$mr_f" "$rb_f"
   printf 'DIFF\t%s\n' "$cause"

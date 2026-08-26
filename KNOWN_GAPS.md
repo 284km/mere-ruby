@@ -1603,3 +1603,34 @@ drifted; the second reading was that the locale explained it. Re-measuring under
 `LC_ALL=C` settled it: **core/string and core/symbol were the locale, and the
 other groups had really regressed.** Two causes were live at once, and each one
 was a complete-sounding explanation of the other's evidence.
+
+## A cause field held the whole process environment, and it was published
+
+`core/env`'s specs print ENV. Once `ENV.filter` became reflectable here, the first
+line on which mere-ruby and ruby disagree became a Method object whose inspect
+carries **the entire environment** — and that line is copied verbatim into
+`mspec/tags/` and `CAUSES.md` as the DIFF's cause.
+
+So an 11KB "cause" was committed and pushed to a public repo, containing `PATH`,
+`HOME`, `SSH_AUTH_SOCK`, `SECURITYSESSIONID`, a session id, and an internal
+package-index host. One commit, at the tip; every earlier one is clean, because
+before that fix `ENV.filter` raised NameError and the cause was one short line.
+
+Three things were wrong, and only the first is about ENV:
+
+- `strip_noise` masked the tmpdir and heap addresses and not `$HOME`. Those are
+  the same kind of thing — text that identifies the machine rather than the
+  interpreter — and only two of the three were named.
+- **The cause field had no bound.** Its contract is "short enough to read in a
+  table"; nothing enforced it. ENV is merely the first object big enough to show
+  that. A large hash, a long array or a deep struct reaches it the same way, so
+  the fix is a cap (`CAUSE_MAX`, 240 chars) rather than a mask for ENV.
+- There was no check. `mspec/record_hygiene.sh` is now one, and it is a real
+  detector rather than a claim: run against the leaking records it named both
+  files and every pattern, and it fails the gate rather than warning.
+
+What it does NOT fix is the group being environment-dependent at all. `core/env`
+measures the process it runs in, so its MATCH count moves between sessions with
+no change to the interpreter — 43 in one session and 25 in another, from the same
+binary. A gate whose subject includes its own execution environment cannot be
+compared across runs, and that one is still open.
