@@ -26,8 +26,10 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 # true -- and, for the same reason, beside the ruby VERSION it claims to be.
 # main.mere reports `ruby 3.2.2`; ruby 3.4 changed Hash#inspect to put spaces
 # around `=>`, so a newer oracle reports `{"k" => nil}` where this reports
-# `{"k"=>nil}`. Both are right for the version each is answering as. CI pins
-# the oracle to 3.2.
+# `{"k"=>nil}`. And 3.2.11 stopped warning on a `$=` read where 3.2.2 still
+# warns -- a difference inside one minor version. Every axis of the string this
+# reports has to match, so CI pins the oracle to exactly 3.2.2 on darwin. None
+# of those three differences was a defect on either side.
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ./clitest/run.sh    # diff the driver's argv handling against the real ruby
