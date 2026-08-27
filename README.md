@@ -9,11 +9,21 @@ output to the reference `ruby`.
 
 ```sh
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
-# On Linux, neither flag is right: the main thread's stack is `ulimit -s`, not
-# the linker's, and mainline clang caps bracket nesting at 256 where the
-# emitted C goes deeper. There:
+# That line is macOS's. On Linux all three pieces differ, and none of them was
+# written down until CI ran it somewhere else:
 #   clang -O2 -fbracket-depth=1024 mr.c -lm -o mere-ruby && ulimit -s 524288
-# `-lm` because libm is a separate library there and part of libSystem here.
+#   -Wl,-stack_size  Mach-O only; the main thread's stack there is `ulimit -s`
+#   -fbracket-depth  mainline clang caps nesting at 256, Apple's allows more
+#   -lm              libm is separate there and part of libSystem here
+#
+# The CORPUS is a macOS gate on purpose. run_corpus.sh diffs this interpreter
+# against the ruby on the machine, and this one reports
+# RUBY_PLATFORM = "arm64-darwin22" wherever it runs -- its socket constants are
+# the BSD ones to match (SOL_SOCKET 65535, AF_INET6 30, SO_REUSEADDR 4). Run it
+# beside a Linux ruby and corpus/108_sockets.rb reports a difference that is
+# real and is not a defect: two platforms' constants, correctly reported by
+# each. Comparing like with like means running where the identity it claims is
+# true.
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ./clitest/run.sh    # diff the driver's argv handling against the real ruby
