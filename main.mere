@@ -7389,14 +7389,30 @@ let shift_case = fn (s: str) -> fn (lo: int) -> fn (hi: int) -> fn (delta: int) 
 // and still produced the right digest. Mere started refusing the read in
 // v0.1.275; `b` keeps the answer the same by supplying the 0 that the old
 // out-of-bounds read returned.
+// codepoint and byte length at byte i. A byte that does not START a valid
+// sequence (a lone continuation byte, a truncated sequence, 0xF8+) is ONE
+// one-byte character whose "codepoint" is the byte value — the same walk
+// ruby's broken-string operations do. Believing such a byte's advertised
+// length made "\xFF" claim four bytes (a garbage codepoint near 3.4M, which
+// a set range like "\x00-\xFF" then expanded into millions of characters).
 let utf8_cp = fn (s: str) -> fn (i: int) ->
   let n = str_len s in
-  let b = fn (k: int) -> if k < n then ord (char_at s k) else 0 in
+  let b = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let cont = fn (k: int) -> (let v = b k in v >= 128 && v < 192) in
   let b0 = b i in
   if b0 < 128 then (b0, 1)
-  else if b0 < 224 then ((b0 - 192) * 64 + (b (i + 1) - 128), 2)
-  else if b0 < 240 then ((b0 - 224) * 4096 + (b (i + 1) - 128) * 64 + (b (i + 2) - 128), 3)
-  else ((b0 - 240) * 262144 + (b (i + 1) - 128) * 4096 + (b (i + 2) - 128) * 64 + (b (i + 3) - 128), 4);
+  else if b0 < 192 then (b0, 1)
+  else if b0 < 224 then
+    (if cont (i + 1) then ((b0 - 192) * 64 + (b (i + 1) - 128), 2) else (b0, 1))
+  else if b0 < 240 then
+    (if cont (i + 1) && cont (i + 2)
+     then ((b0 - 224) * 4096 + (b (i + 1) - 128) * 64 + (b (i + 2) - 128), 3)
+     else (b0, 1))
+  else if b0 < 248 then
+    (if cont (i + 1) && cont (i + 2) && cont (i + 3)
+     then ((b0 - 240) * 262144 + (b (i + 1) - 128) * 4096 + (b (i + 2) - 128) * 64 + (b (i + 3) - 128), 4)
+     else (b0, 1))
+  else (b0, 1);
 // encode a codepoint back to UTF-8 bytes.
 let utf8_enc = fn (cp: int) ->
   if cp < 128 then chr cp
@@ -7583,6 +7599,17 @@ let int_to_base = fn (n: int) -> fn (base: int) ->
   if n == 0 then "0"
   else if n < 0 then "-" ++ int_to_base_go (0 - n) base ""
   else int_to_base_go n base "";
+// a bignum's decimal digit string (optionally "-" prefixed) rendered in
+// base N, by repeated division; the divisor is one digit wide so each step
+// is a single big_divmod_s. Integer#to_s(base) fed a VBig used to answer in
+// decimal no matter what base it was asked for.
+let rec big_to_base_go = fn (v: str) -> fn (bs: str) -> fn (base: int) -> fn (acc: str) ->
+  if str_eq v "0" then (if str_eq acc "" then "0" else acc)
+  else (match big_divmod_s v bs with (q, r) -> big_to_base_go q bs base (int_to_base (int_of_str r) base ++ acc));
+let big_to_base_s = fn (s0: str) -> fn (base: int) ->
+  let neg = str_len s0 > 0 && str_eq (substring s0 0 1) "-" in
+  let s = (if neg then substring s0 1 (str_len s0) else s0) in
+  (if neg then "-" else "") ++ big_to_base_go s (int_to_base base 10) base "";
 let rec int_digits_go = fn (n: int) -> fn (base: int) ->
   if n == 0 then Nil else Cons (VInt (n - (n / base) * base), int_digits_go (n / base) base);
 let int_digits = fn (n: int) -> fn (base: int) ->
@@ -7680,14 +7707,18 @@ let str_swapcase = fn (s: str) ->
   go 0 "";
 
 let is_ws_ch = fn (c: str) ->
-  str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "\r";
+  str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "\r"
+  || (str_len c == 1 && (let o = ord c in o == 11 || o == 12));
+// the strip family also removes NUL, which split's whitespace does not.
+let is_strip_ch = fn (c: str) ->
+  is_ws_ch c || (str_len c == 1 && ord c == 0);
 
 let str_lstrip = fn (s: str) ->
   let n = str_len s in
-  let rec go = fn (i: int) -> if i < n && is_ws_ch (char_at s i) then go (i + 1) else i in
+  let rec go = fn (i: int) -> if i < n && is_strip_ch (char_at s i) then go (i + 1) else i in
   substring s (go 0) n;
 let str_rstrip = fn (s: str) ->
-  let rec go = fn (i: int) -> if i >= 0 && is_ws_ch (char_at s i) then go (i - 1) else i in
+  let rec go = fn (i: int) -> if i >= 0 && is_strip_ch (char_at s i) then go (i - 1) else i in
   substring s 0 (go (str_len s - 1) + 1);
 
 // awk-mode split: on runs of whitespace, leading whitespace stripped, no
@@ -7711,6 +7742,20 @@ let str_chomp = fn (s: str) ->
   if n >= 2 && str_eq (substring s (n - 2) n) "\r\n" then substring s 0 (n - 2)
   else if n >= 1 && (str_eq (char_at s (n - 1)) "\n" || str_eq (char_at s (n - 1)) "\r") then substring s 0 (n - 1)
   else s;
+// chomp with an explicit separator: "" strips every trailing line ending
+// (\r\n pairs and \n, never a bare \r), "\n" behaves like the default, and
+// any other separator is removed once from the end.
+let str_chomp_sep = fn (s: str) -> fn (sep: str) ->
+  if str_eq sep "\n" then str_chomp s
+  else if str_eq sep "" then
+    (let rec back = fn (j: int) ->
+       if j >= 2 && str_eq (substring s (j - 2) j) "\r\n" then back (j - 2)
+       else if j >= 1 && str_eq (char_at s (j - 1)) "\n" then back (j - 1)
+       else j in
+     substring s 0 (back (str_len s)))
+  else
+    (let ns = str_len s in let ms = str_len sep in
+     if ms > 0 && ns >= ms && str_eq (substring s (ns - ms) ns) sep then substring s 0 (ns - ms) else s);
 // remove the last character (a trailing \r\n counts as one).
 let str_chop = fn (s: str) ->
   let n = str_len s in
@@ -7723,6 +7768,29 @@ let rec str_find_from = fn (s: str) -> fn (pat: str) -> fn (i: int) ->
   if i + m > n then 0 - 1
   else if str_eq (substring s i (i + m)) pat then i
   else str_find_from s pat (i + 1);
+// split into pieces each KEEPING the separator; "" is paragraph mode (pieces
+// end at a run of two or more newlines, the whole run staying attached).
+let str_lines_sep = fn (s: str) -> fn (sep: str) ->
+  let n = str_len s in
+  if str_eq sep "" then
+    (let rec eat_nl = fn (j: int) -> if j < n && str_eq (char_at s j) "\n" then eat_nl (j + 1) else j in
+     let rec go = fn (start: int) -> fn (i: int) ->
+       if i >= n then (if start < n then Cons (substring s start n, (Nil : str list)) else Nil)
+       else if str_eq (char_at s i) "\n" && i + 1 < n && str_eq (char_at s (i + 1)) "\n" then
+         (let stop = eat_nl (i + 1) in
+          Cons (substring s start stop, go stop stop))
+       else go start (i + 1) in
+     go 0 0)
+  else
+    (let m = str_len sep in
+     let rec go = fn (start: int) ->
+       if start >= n then (Nil : str list)
+       else
+         let i = str_find_from s sep start in
+         (if i < 0 then Cons (substring s start n, Nil)
+          else Cons (substring s start (i + m), go (i + m))) in
+     go 0);
+
 // the LAST occurrence of pat, or -1.
 let rec str_rfind = fn (s: str) -> fn (pat: str) -> fn (i: int) -> fn (best: int) ->
   let j = str_find_from s pat i in
@@ -7766,13 +7834,30 @@ let rec str_chars_val = fn (s: str) -> fn (i: int) ->
 // ---- char-set string methods (tr / count / delete / squeeze) -------------
 let rec range_chars = fn (lo: int) -> fn (hi: int) ->
   if lo > hi then "" else chr lo ++ range_chars (lo + 1) hi;
-// expand a tr/count set spec ("a-z0-9") into the explicit character list.
+// a codepoint range as UTF-8 characters ("あ-う" spans by codepoint).
+let rec cp_range_chars = fn (lo: int) -> fn (hi: int) ->
+  if lo > hi then "" else utf8_enc lo ++ cp_range_chars (lo + 1) hi;
+// expand a tr/count set spec ("a-z0-9") into the explicit character list:
+// characters, not bytes; a backslash protects the next character (so "\\-"
+// is a hyphen); a trailing "-" is a literal hyphen.
 let rec str_expand_set = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
   let n = str_len s in
   if i >= n then acc
-  else if i + 2 < n && str_eq (char_at s (i + 1)) "-" then
-    str_expand_set s (i + 3) (acc ++ range_chars (ord (char_at s i)) (ord (char_at s (i + 2))))
-  else str_expand_set s (i + 1) (acc ++ char_at s i);
+  else
+    let w = utf8_clen s i in
+    let c = substring s i (i + w) in
+    if str_eq c "\\" && i + w < n then
+      (let w2 = utf8_clen s (i + w) in
+       str_expand_set s (i + w + w2) (acc ++ substring s (i + w) (i + w + w2)))
+    else if i + w < n && str_eq (char_at s (i + w)) "-" && i + w + 1 < n then
+      (let lo = (match utf8_cp s i with (cp, _) -> cp) in
+       let hi = (match utf8_cp s (i + w + 1) with (cp, _) -> cp) in
+       let w3 = utf8_clen s (i + w + 1) in
+       if lo > hi then
+         (let _ = prim_raise "ArgumentError"
+                    ("invalid range \"" ++ substring s i (i + w + 1 + w3) ++ "\" in string transliteration") in "")
+       else str_expand_set s (i + w + 1 + w3) (acc ++ cp_range_chars lo hi))
+    else str_expand_set s (i + w) (acc ++ c);
 // The character index of `c` in `set` (-1 if absent). These helpers all used to
 // walk BYTES: `"日本語".tr("日", "X")` replaced each byte of 日 that appeared in
 // the set, producing "XXXX\x9C\xAC..." -- not a string Ruby would ever return.
@@ -7833,6 +7918,40 @@ let str_squeeze = fn (s: str) -> fn (set0: str) -> fn (use_set: bool) ->
       if str_eq c prev && (if use_set then str_set_has set0 c else true) then go (i + w) c acc
       else go (i + w) c (acc ++ c) in
   go 0 "" "";
+// squeeze against SEVERAL set arguments: ruby intersects them, exactly as
+// count and delete do.
+let str_squeeze_sets = fn (s: str) -> fn (sets: str list) ->
+  let rec go = fn (i: int) -> fn (prev: str) -> fn (acc: str) ->
+    if i >= str_len s then acc
+    else
+      let c = utf8_char_at s i in
+      let w = utf8_clen s i in
+      if str_eq c prev && all_sets_has sets c then go (i + w) c acc
+      else go (i + w) c (acc ++ c) in
+  go 0 "" "";
+// tr, but consecutive characters TRANSLATED to the same character collapse
+// to one; an untranslated duplicate stays ("hello".tr_s("el","hx") keeps the
+// h that was already an h and squeezes only the translated xx).
+let str_tr_s = fn (s: str) -> fn (from0: str) -> fn (to0: str) ->
+  let neg = str_len from0 >= 2 && str_eq (char_at from0 0) "^" in
+  let from = str_expand_set (if neg then substring from0 1 (str_len from0) else from0) 0 "" in
+  let to = str_expand_set to0 0 "" in
+  let tcn = utf8_len to in
+  let rec go = fn (i: int) -> fn (prev: str) -> fn (prev_tr: bool) -> fn (acc: str) ->
+    if i >= str_len s then acc
+    else
+      let c = utf8_char_at s i in
+      let w = utf8_clen s i in
+      let k = char_pos from c 0 in
+      let hit = (if neg then k < 0 else k >= 0) in
+      let nc = (if hit then (if tcn == 0 then ""
+                             else if neg then utf8_char to (tcn - 1)
+                             else if k >= tcn then utf8_char to (tcn - 1)
+                             else utf8_char to k)
+                else c) in
+      if hit && prev_tr && str_eq nc prev then go (i + w) prev true acc
+      else go (i + w) nc hit (acc ++ nc) in
+  go 0 "" false "";
 
 // ---- padding (ljust / rjust / center) ------------------------------------
 // Ruby's widths are in characters: `"日本語abcあ".ljust(9, ".")` pads a
@@ -7939,17 +8058,29 @@ let rec val_rindex = fn (xs: Val list) -> fn (v: Val) -> fn (i: int) -> fn (best
 // prepending a digit/letter when the carry runs off the left end.
 let set_char = fn (s: str) -> fn (i: int) -> fn (c: str) ->
   substring s 0 i ++ c ++ substring s (i + 1) (str_len s);
-let rec succ_at = fn (s: str) -> fn (i: int) ->
+// succ's alphanumerics are ASCII ONLY: is_alnum is the LEXER's question
+// (every byte >= 0x80 is an identifier byte there), and borrowing it here
+// made "\xFF" an alphanumeric whose successor was chr 256.
+let is_alnum_ascii = fn (c: str) ->
+  let o = ord c in (o >= 48 && o <= 57) || (o >= 97 && o <= 122) || (o >= 65 && o <= 90);
+// `lastp` is the position of the leftmost alphanumeric the carry wrapped: a
+// carry with no alphanumeric further left INSERTS its new digit/letter THERE
+// ("/[]9999".succ is "/[]10000", not "1/[]0000" -- the carry skips over
+// non-alphanumerics but lands next to the run it grew out of).
+let rec succ_at = fn (s: str) -> fn (i: int) -> fn (lastp: int) ->
   if i < 0 then
-    (let f = char_at s 0 in
-     (if is_digit f then "1" else if f >= "a" && f <= "z" then "a" else if f >= "A" && f <= "Z" then "A" else "") ++ s)
+    (if lastp < 0 then s
+     else
+       let f = char_at s lastp in
+       let ins = (if is_digit f then "1" else if f >= "a" && f <= "z" then "a" else "A") in
+       substring s 0 lastp ++ ins ++ substring s lastp (str_len s))
   else
     let c = char_at s i in
-    if str_eq c "z" then succ_at (set_char s i "a") (i - 1)
-    else if str_eq c "Z" then succ_at (set_char s i "A") (i - 1)
-    else if str_eq c "9" then succ_at (set_char s i "0") (i - 1)
-    else if is_alnum c then set_char s i (chr (ord c + 1))
-    else succ_at s (i - 1);
+    if str_eq c "z" then succ_at (set_char s i "a") (i - 1) i
+    else if str_eq c "Z" then succ_at (set_char s i "A") (i - 1) i
+    else if str_eq c "9" then succ_at (set_char s i "0") (i - 1) i
+    else if is_alnum_ascii c then set_char s i (chr (ord c + 1))
+    else succ_at s (i - 1) lastp;
 // succ_at only advances alphanumerics — Ruby's rule when the string HAS one.
 // With none, Ruby increments the rightmost byte instead (with carry), so
 // "*+".succ is "*," and "\xff".succ is "\x01\x00".
@@ -7961,11 +8092,18 @@ let rec succ_byte_at = fn (s: str) -> fn (i: int) ->
     else set_char s i (chr (o + 1));
 let rec has_alnum_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then false
-  else if is_alnum (char_at s i) then true else has_alnum_go s (i + 1);
+  else if is_alnum_ascii (char_at s i) then true else has_alnum_go s (i + 1);
 let str_succ = fn (s: str) ->
   if str_len s == 0 then ""
-  else if has_alnum_go s 0 then succ_at s (str_len s - 1)
+  else if has_alnum_go s 0 then succ_at s (str_len s - 1) (0 - 1)
   else succ_byte_at s (str_len s - 1);
+// String#upto between two one-character ASCII strings walks BYTE values
+// ("9".upto("A") passes through ":" .. "@"), where the general walk is
+// succ-based and would jump from "9" to "10".
+let rec rb_upto_bytes = fn (a: int) -> fn (b: int) -> fn (excl: bool) ->
+  if a > b then (Nil : Val list)
+  else if excl && a == b then (Nil : Val list)
+  else Cons (mkstr (chr a), rb_upto_bytes (a + 1) b excl);
 
 // gather elements at each given index (Array#values_at); negative = from end.
 let rec arr_values_at = fn (xs: Val list) -> fn (idxs: Val list) ->
@@ -9514,10 +9652,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | Cons (VFlt f, _) -> VInt (int_of_float f)
        | Cons (VRat (n, d), _) -> norm_big (big_div_s n d)
        | Cons (VStr s, Cons (VInt base, _)) -> VInt (str_to_int_base (sget s) base)
-       | Cons (VStr s, _) -> let s = sget s in
-         (match try_or (fn (u: unit) -> VInt (int_of_str s)) (VSym "__int_fail__") with
-          | VSym m -> if str_eq m "__int_fail__" then raise_exc world "ArgumentError" ("invalid value for Integer(): \"" ++ s ++ "\"") else VInt (int_of_str s)
-          | r -> r)
+       | Cons (VStr s, _) -> rb_int_parse (sget s)
        | _ -> raise_exc world "TypeError" "can't convert to Integer")
     else if str_eq name "Float" then (match args with Cons (VStr s, _) -> VFlt (float_of_str (sget s)) | Cons (v, _) -> VFlt (to_f v) | _ -> VFlt 0.0)
     else if str_eq name "String" then (match args with Cons (v, _) -> mkstr (to_s v) | _ -> mkstr "")
@@ -9640,11 +9775,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Kernel#printf: format, then write it (no newline).
     else if str_eq name "printf" && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
-                | Cons (VStr h, rest) -> out_print_no_nl (rb_format (sget h) rest)
+                | Cons (VStr h, rest) -> out_print_no_nl (rb_format env world (sget h) rest)
                 | _ -> ()) in VNil)
     // Kernel#format / #sprintf: sprintf-style formatting.
     else if (str_eq name "format" || str_eq name "sprintf") && (if kernel_overridden env world name then false else true) then
-      (match args with Cons (VStr h, rest) -> mkstr (rb_format (sget h) rest) | _ -> mkstr "")
+      (match args with Cons (VStr h, rest) -> mkstr (rb_format env world (sget h) rest) | _ -> mkstr "")
     // Kernel#fail is Kernel#raise. `raise` is a parser keyword here (ERaise), so
     // `fail` could not borrow that path and had no branch of its own: `fail "x"`
     // reported an undefined method while `Kernel.fail "x"` worked. This is the
@@ -10220,7 +10355,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       // `"fmt" % arg` / `"fmt" % [args]` is sprintf-style formatting.
       if str_eq op "%" && (match va0 with VStr _ -> true | _ -> false) then
         (match va0 with
-         | VStr h -> mkstr (rb_format (sget h) (match vb with VArr id -> deref id | _ -> Cons (vb, Nil)))
+         | VStr h -> mkstr (rb_format env world (sget h) (rb_fmt_args env world vb))
          | _ -> va0)
       // INTEGER division / modulo by zero raises a real ZeroDivisionError.
       // Float operands instead yield Infinity / -Infinity / NaN (as in Ruby).
@@ -11650,14 +11785,32 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        (match args with
         | Cons (VStr lim, rest) ->
           let excl = (match rest with Cons (b, _) -> truthy b | _ -> false) in
-          iter_each_result (arr_each world encl theblk (str_upto_list sv (sget lim) excl 0)) recv
-        | _ -> recv)
+          let b = sget lim in
+          let lst = (if str_len sv == 1 && str_len b == 1 && ord sv < 128 && ord b < 128
+                     then rb_upto_bytes (ord sv) (ord b) excl
+                     else str_upto_list sv b excl 0) in
+          iter_each_result (arr_each world encl theblk lst) recv
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
      else if str_eq name "each_byte" || str_eq name "bytes" then iter_each_result (arr_each world encl theblk (str_bytes_val sv 0)) recv
      // the plural forms take a block too, iterating instead of collecting.
      else if str_eq name "chars" then iter_each_result (arr_each world encl theblk (utf8_chars_val sv 0)) recv
      else if str_eq name "codepoints" then iter_each_result (arr_each world encl theblk (utf8_codepoints sv 0)) recv
      else if str_eq name "each_codepoint" then iter_each_result (arr_each world encl theblk (utf8_codepoints sv 0)) recv
-     else if str_eq name "each_line" then iter_each_result (arr_each world encl theblk (val_list_of_strs (str_lines_go sv 0 0 (str_len sv)))) recv
+     else if str_eq name "each_line" then
+       // each_line(sep = $/): the same separator rules as String#lines.
+       (let sepv = (match args with
+                    | Cons (VStr sp, _) -> VStr sp
+                    | Cons (VNil, _) -> VNil
+                    | _ -> (if map_has globals "/" then map_get globals "/" else mkstr "\n")) in
+        let ls = (match sepv with
+                  | VNil -> (if str_len sv == 0 then (Nil : Val list) else Cons (mkstr sv, Nil))
+                  | VStr sph ->
+                    let sep = sget sph in
+                    (if str_eq sep "\n" then val_list_of_strs (str_lines_go sv 0 0 (str_len sv))
+                     else val_list_of_strs (str_lines_sep sv sep))
+                  | _ -> val_list_of_strs (str_lines_go sv 0 0 (str_len sv))) in
+        iter_each_result (arr_each world encl theblk ls) recv)
      else if str_eq name "each_with_index" then iter_each_result (arr_each world encl theblk (with_index_pairs (utf8_chars_val sv 0) 0)) recv
      else prim_method recv name args)
   | VArr id -> let xs = deref id in
@@ -12162,10 +12315,34 @@ and coerce_int_args = fn env -> fn world -> fn (args: Val list) ->
               | VObj _ ->
                 (if responds world a "to_int"
                  then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-                       invoke_val_c env world nb a "to_int" Nil false)
+                       // adopt only a real Integer: a mock answers nil for
+                       // methods it was not told about, and nil is a decline.
+                       (match invoke_val_c env world nb a "to_int" Nil false with
+                        | VInt x -> VInt x
+                        | VBig b -> VBig b
+                        | _ -> a))
                  else a)
               | _ -> a) in
     Cons (a2, coerce_int_args env world rest)
+
+// string-method arguments that may be either a string or a count: ask for
+// #to_str first, then #to_int, and keep the original when both decline (a
+// declined argument then earns the method's own TypeError, not a nil).
+and coerce_str_int_args = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> Nil
+  | Cons (a, rest) ->
+    let a2 = (match a with
+              | VObj _ ->
+                let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+                let r1 = (if responds world a "to_str" then invoke_val_c env world nb a "to_str" Nil false else VNil) in
+                (match r1 with
+                 | VStr _ -> r1
+                 | _ ->
+                   let r2 = (if responds world a "to_int" then invoke_val_c env world nb a "to_int" Nil false else VNil) in
+                   (match r2 with VInt _ -> r2 | _ -> a))
+              | _ -> a) in
+    Cons (a2, coerce_str_int_args env world rest)
 
 // A count / index argument is an Integer or something that converts to one:
 // ruby truncates a Float and refuses everything else by name. `[1,2,3].first(2.5)`
@@ -12218,7 +12395,12 @@ and coerce_dyck_go = fn env -> fn world -> fn (conv: str) -> fn (args: Val list)
               | VObj _ ->
                 (if responds world a conv
                  then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-                       invoke_val_c env world nb a conv Nil false)
+                       // adopt only a real conversion: a mock answers nil for
+                       // methods it was not told about, and nil is a decline.
+                       (match invoke_val_c env world nb a conv Nil false with
+                        | VStr x -> (if str_eq conv "to_str" then VStr x else a)
+                        | VArr x -> (if str_eq conv "to_ary" then VArr x else a)
+                        | _ -> a))
                  else a)
               | _ -> a) in
     Cons (a2, coerce_dyck_go env world conv rest)
@@ -12488,7 +12670,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                      || str_eq name "start_with?" || str_eq name "end_with?"
                      || str_eq name "insert" || str_eq name "index" || str_eq name "rindex"
                      || str_eq name "delete_prefix" || str_eq name "delete_suffix")
-              then coerce_dyck_args env world recv args0
+              then (match recv with
+                    | VStr _ -> coerce_str_int_args env world args0
+                    | _ -> coerce_dyck_args env world recv args0)
+              // the rest of the String methods whose argument is a string, a
+              // pattern, or a count: to_str first, to_int second, per argument.
+              else if (match recv with VStr _ -> true | _ -> false)
+                      && (str_eq name "include?" || str_eq name "casecmp" || str_eq name "casecmp?"
+                          || str_eq name "byteindex" || str_eq name "byterindex"
+                          || str_eq name "chomp" || str_eq name "chomp!"
+                          || str_eq name "split" || str_eq name "squeeze" || str_eq name "squeeze!"
+                          || str_eq name "count" || str_eq name "delete" || str_eq name "delete!"
+                          || str_eq name "tr" || str_eq name "tr!" || str_eq name "tr_s" || str_eq name "tr_s!"
+                          || str_eq name "partition" || str_eq name "rpartition" || str_eq name "upto"
+                          || str_eq name "each_line" || str_eq name "lines"
+                          || str_eq name "center" || str_eq name "ljust" || str_eq name "rjust"
+                          || str_eq name "delete_prefix!" || str_eq name "delete_suffix!"
+                          || str_eq name "[]=" || str_eq name "slice" || str_eq name "slice!")
+              then coerce_str_int_args env world args0
               // the index/count arguments take an Integer, and CRuby asks a
               // non-Integer for #to_int before giving up. (`intersect?` and
               // friends want an Array, which the same machinery converts.)
@@ -16525,6 +16724,9 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     make_enum world recv name
   else if str_eq name "each_codepoint" && (match recv with VStr _ -> true | _ -> false) then
     make_enum world recv name
+  else if (str_eq name "upto" || str_eq name "each_line" || str_eq name "each_grapheme_cluster")
+          && (match recv with VStr _ -> true | _ -> false) then
+    make_enum_a world recv name args
   else if str_eq name "times" && (match recv with VInt _ -> true | _ -> false) then
     make_enum world recv name
   else if str_eq name "each" && (match recv with VArr _ -> true | VRange _ -> true | _ -> false) then
@@ -16585,6 +16787,60 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> VBool (rx_match p pf sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv) | _ -> VBool false)
      | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | Cons (VSym sv, _) -> VBool (rx_match p pf sv) | _ -> VBool false)
      | _ -> VBool false)
+  // String#index/rindex/byteindex/byterindex/partition/rpartition with a
+  // Regexp: search (with a character offset where one is taken), publish $~
+  // like =~ does, and answer in characters (bytes for the byte pair).
+  // prim_method has no world, so the regexp forms live here.
+  else if (str_eq name "index" || str_eq name "rindex" || str_eq name "byteindex" || str_eq name "byterindex"
+           || str_eq name "partition" || str_eq name "rpartition")
+          && (match recv with VStr _ -> true | _ -> false)
+          && (match args with Cons (VRegex (_, _), _) -> true | _ -> false) then
+    (match recv with
+     | VStr h ->
+       let sv = sget h in
+       (match args with
+        | Cons (VRegex (p, pf), rest) ->
+          let cn = utf8_len sv in
+          let n = str_len sv in
+          if str_eq name "index" || str_eq name "byteindex" then
+            (let off0 = (match rest with Cons (VInt o, _) -> o | _ -> 0) in
+             let lim = (if str_eq name "index" then cn else n) in
+             let off = (if off0 < 0 then lim + off0 else off0) in
+             if off < 0 || off > lim then (let _ = map_set globals "~" VNil in VNil)
+             else
+               let bst = (if str_eq name "index" then utf8_boff sv off 0 else off) in
+               (match rx_idx_pub world p pf sv bst with
+                | VInt ci -> (if str_eq name "index" then VInt ci else VInt (utf8_boff sv ci 0))
+                | other -> other))
+          else if str_eq name "rindex" || str_eq name "byterindex" then
+            (let lim0 = (if str_eq name "rindex" then cn else n) in
+             let off0 = (match rest with Cons (VInt o, _) -> o | _ -> lim0) in
+             let off = (if off0 < 0 then lim0 + off0 else off0) in
+             if off < 0 then (let _ = map_set globals "~" VNil in VNil)
+             else
+               let blim = (if str_eq name "rindex" then utf8_boff sv (if off > cn then cn else off) 0
+                           else (if off > n then n else off)) in
+               (match rx_last_pub world p pf sv blim with
+                | VInt ci -> (if str_eq name "rindex" then VInt ci else VInt (utf8_boff sv ci 0))
+                | other -> other))
+          else if str_eq name "partition" then
+            (match rxv_search p pf sv 0 with
+             | RHit (st, en, saves) ->
+               (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
+                let _ = rxv_export_caps saves ng in
+                let _ = rx_publish_at world sv st en ng in
+                arr_new (Cons (mkstr (substring sv 0 st), Cons (mkstr (substring sv st en), Cons (mkstr (substring sv en n), Nil)))))
+             | _ -> (let _ = map_set globals "~" VNil in
+                     arr_new (Cons (mkstr sv, Cons (mkstr "", Cons (mkstr "", Nil))))))
+          else
+            (let (st, en) = rx_last_hit p pf sv 0 n (0 - 1) (0 - 1) in
+             if st < 0 then (let _ = map_set globals "~" VNil in
+                             arr_new (Cons (mkstr "", Cons (mkstr "", Cons (mkstr sv, Nil)))))
+             else
+               (let _ = rx_last_pub world p pf sv n in
+                arr_new (Cons (mkstr (substring sv 0 st), Cons (mkstr (substring sv st en), Cons (mkstr (substring sv en n), Nil))))))
+        | _ -> VNil)
+     | _ -> VNil)
   else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | VSym _ -> true | _ -> false) then
     (let hit = (fn (p: str) -> fn (pf: str) -> fn (sv: str) ->
                   let _ = rx_do_match world p pf sv in
@@ -17365,25 +17621,46 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "concat" then let _ = sset h (s ++ str_concat_vals args) in VStr h
   else if str_eq name "prepend" then let _ = sset h (str_concat_vals args ++ s) in VStr h
   else if str_eq name "[]=" then
+    // positions are CHARACTERS (an index into "あa" at 1 is the "a"), and a
+    // position outside the string is an IndexError / RangeError, not a clamp.
+    // A Float position truncates (0.5 indexes at 0), as #to_int would.
     (let n = str_len s in
+     let cn = utf8_len s in
+     let args = (let fix = fn (v: Val) -> (match v with VFlt f2 -> VInt (int_of_float f2) | _ -> v) in
+                 match args with
+                 | Cons (a2, Cons (b2, Cons (c2, Nil))) -> Cons (fix a2, Cons (fix b2, Cons (c2, Nil)))
+                 | Cons (a2, Cons (b2, Nil)) -> Cons (fix a2, Cons (b2, Nil))
+                 | _ -> args) in
      match args with
      | Cons (VInt i, Cons (VStr r, Nil)) ->
-       let idx = if i < 0 then n + i else i in
-       let e = if idx + 1 > n then n else idx + 1 in
-       let _ = sset h (substring s 0 idx ++ sget r ++ substring s e n) in VStr r
+       let ci = (if i < 0 then cn + i else i) in
+       (if ci < 0 || ci > cn then prim_raise "IndexError" ("index " ++ str_of_int i ++ " out of string")
+        else
+          let b0 = utf8_boff s ci 0 in
+          let b1 = (if ci >= cn then n else utf8_boff s (ci + 1) 0) in
+          let _ = sset h (substring s 0 b0 ++ sget r ++ substring s b1 n) in VStr r)
      | Cons (VInt i, Cons (VInt len, Cons (VStr r, Nil))) ->
-       let idx = if i < 0 then n + i else i in
-       let e = if idx + len > n then n else idx + len in
-       let _ = sset h (substring s 0 idx ++ sget r ++ substring s e n) in VStr r
-     // s[m..n] = r : splice over the (clamped) range.
+       let ci = (if i < 0 then cn + i else i) in
+       (if len < 0 then prim_raise "IndexError" ("negative length " ++ str_of_int len)
+        else if ci < 0 || ci > cn then prim_raise "IndexError" ("index " ++ str_of_int i ++ " out of string")
+        else
+          let ce = (if ci + len > cn then cn else ci + len) in
+          let b0 = utf8_boff s ci 0 in
+          let b1 = utf8_boff s ce 0 in
+          let _ = sset h (substring s 0 b0 ++ sget r ++ substring s b1 n) in VStr r)
+     // s[m..n] = r : splice over the range (out of bounds is a RangeError).
      | Cons (VRange (lov, hiv, excl), Cons (VStr r, Nil)) ->
-       let (st, en1) = rng_slice_bounds lov hiv excl n in
-       let e = if en1 > n then n else if en1 < st then st else en1 in
-       let _ = sset h (substring s 0 st ++ sget r ++ substring s e n) in VStr r
-     // s["sub"] = r : replace the first occurrence of sub.
+       let (st, en1) = rng_slice_bounds lov hiv excl cn in
+       (if st < 0 || st > cn then prim_raise "RangeError" (inspect (VRange (lov, hiv, excl)) ++ " out of range")
+        else
+          let ce = (if en1 > cn then cn else if en1 < st then st else en1) in
+          let b0 = utf8_boff s st 0 in
+          let b1 = utf8_boff s ce 0 in
+          let _ = sset h (substring s 0 b0 ++ sget r ++ substring s b1 n) in VStr r)
+     // s["sub"] = r : replace the first occurrence of sub, which must exist.
      | Cons (VStr sub, Cons (VStr r, Nil)) ->
        let sub = sget sub in let i = str_find_from s sub 0 in
-       (if i < 0 then VStr r
+       (if i < 0 then prim_raise "IndexError" "string not matched"
         else let _ = sset h (substring s 0 i ++ sget r ++ substring s (i + str_len sub) n) in VStr r)
      | _ -> VNil)
   else
@@ -17656,6 +17933,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // a number's decimal (or base-N) text is US-ASCII in ruby, not the default
      | VInt n -> (let r = (match args with Cons (VInt base, _) -> mkstr (int_to_base n (check_radix base)) | _ -> mkstr (to_s recv)) in
                   (match r with VStr rid -> (let _ = senc_set rid "US-ASCII" in r) | _ -> r))
+     | VBig bs -> (let r = (match args with Cons (VInt base, _) -> mkstr (big_to_base_s bs (check_radix base)) | _ -> mkstr bs) in
+                   (match r with VStr rid -> (let _ = senc_set rid "US-ASCII" in r) | _ -> r))
      // String#to_s answers the receiver ITSELF, not a copy -- `s.to_s.equal?(s)`
      // is true, and code that calls to_s defensively then mutates relies on it.
      // A subclass instance is the exception: it converts down to a new String.
@@ -17782,17 +18061,34 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "byteslice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'byteslice'")) in fail "mere-ruby: undefined method 'byteslice'")))
   else if str_eq name "byteindex" || str_eq name "byterindex" then
+    // BYTE offsets in, byte position out; an offset that lands inside a
+    // multi-byte character is an IndexError, not a silent adjustment.
     (match recv with
      | VStr h -> let a = sget h in
+       let n = str_len a in
        (match args with
-        | Cons (VStr sb, _) -> let sb = sget sb in
-          if str_eq name "byteindex" then (let i = str_find_from a sb 0 in if i < 0 then VNil else VInt i)
-          else (let i = str_rindex_go a sb (str_len a - str_len sb) in if i < 0 then VNil else VInt i)
-        | _ -> VNil)
+        | Cons (VStr sb, rest) ->
+          let off0 = (match rest with
+                      | Cons (VInt o, _) -> o
+                      | _ -> (if str_eq name "byteindex" then 0 else n)) in
+          let off = (if off0 < 0 then n + off0 else off0) in
+          (if off < 0 || off > n then VNil
+           else if off < n && (let o = ord (char_at a off) in o >= 128 && o < 192)
+           then prim_raise "IndexError" ("offset " ++ str_of_int off ++ " does not land on character boundary")
+           else
+             let sb = sget sb in
+             if str_eq name "byteindex" then (let i = str_find_from a sb off in if i < 0 then VNil else VInt i)
+             else (let top = n - str_len sb in
+                   let from = (if off > top then top else off) in
+                   let i = str_rindex_go a sb from in
+                   if i < 0 then VNil else VInt i))
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "byteindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'byteindex'")) in fail "mere-ruby: undefined method 'byteindex'")))
   else if str_eq name "casecmp?" then
+    // an argument that offers no string conversion answers nil, not false.
     (match recv with
-     | VStr a -> let a = sget a in (match args with Cons (VStr b2, _) -> let b2 = sget b2 in VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VBool false)
+     | VStr a -> let a = sget a in (match args with Cons (VStr b2, _) -> let b2 = sget b2 in VBool (str_eq (str_downcase a) (str_downcase b2)) | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "casecmp?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp?'")) in fail "mere-ruby: undefined method 'casecmp?'")))
   else if str_eq name "ord" && (match recv with VStr h -> str_len (sget h) == 0 | _ -> false) then
     prim_raise "ArgumentError" "empty string"
@@ -18454,17 +18750,25 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "capitalize" then (match recv with VStr s -> let s = sget s in mkstr (str_capitalize s) | _ -> (let _ = map_set prim_missing "n" (mkstr "capitalize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'capitalize'")) in fail "mere-ruby: undefined method 'capitalize'")))
   else if str_eq name "reverse" then
     (match recv with VStr s -> let s = sget s in mkstr (utf8_reverse s) | VArr id -> arr_new (val_rev (deref id) Nil) | _ -> (let _ = map_set prim_missing "n" (mkstr "reverse") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse'")) in fail "mere-ruby: undefined method 'reverse'")))
-  else if str_eq name "strip" then (match recv with VStr s -> let s = sget s in mkstr (str_trim s) | _ -> (let _ = map_set prim_missing "n" (mkstr "strip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'strip'")) in fail "mere-ruby: undefined method 'strip'")))
+  else if str_eq name "strip" then (match recv with VStr s -> let s = sget s in mkstr (str_lstrip (str_rstrip s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "strip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'strip'")) in fail "mere-ruby: undefined method 'strip'")))
   else if str_eq name "swapcase" then (match recv with VStr s -> mkstr (str_swapcase_u (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "swapcase") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'swapcase'")) in fail "mere-ruby: undefined method 'swapcase'")))
   else if str_eq name "lstrip" then (match recv with VStr s -> mkstr (str_lstrip (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "lstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lstrip'")) in fail "mere-ruby: undefined method 'lstrip'")))
   else if str_eq name "rstrip" then (match recv with VStr s -> mkstr (str_rstrip (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "rstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rstrip'")) in fail "mere-ruby: undefined method 'rstrip'")))
   else if str_eq name "chomp" then
+    // the default separator is $/ (nil there means "remove nothing").
     (match recv with
      | VStr s -> let s = sget s in
        (match args with
-        | Cons (VStr suf, _) -> let suf = sget suf in let ns = str_len s in let ms = str_len suf in
-          if ms > 0 && ns >= ms && str_eq (substring s (ns - ms) ns) suf then mkstr (substring s 0 (ns - ms)) else mkstr s
-        | _ -> mkstr (str_chomp s))
+        | Cons (VStr suf, _) -> mkstr (str_chomp_sep s (sget suf))
+        | Cons (VNil, _) -> mkstr s
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Nil ->
+          (if map_has globals "/" then
+             (match map_get globals "/" with
+              | VStr g -> mkstr (str_chomp_sep s (sget g))
+              | VNil -> mkstr s
+              | _ -> mkstr (str_chomp s))
+           else mkstr (str_chomp s)))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "chomp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chomp'")) in fail "mere-ruby: undefined method 'chomp'")))
   else if str_eq name "chop" then (match recv with VStr s -> mkstr (str_chop (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "chop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chop'")) in fail "mere-ruby: undefined method 'chop'")))
   // Hash#slice returns a sub-hash; for String and Array slice IS []
@@ -18475,14 +18779,29 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr s -> let s = sget s in (match args with Cons (VStr f, Cons (VStr t, _)) -> mkstr (str_tr s (sget f) (sget t)) | _ -> mkstr s)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "tr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr'")) in fail "mere-ruby: undefined method 'tr'")))
-  // tr_s: translate, then squeeze runs of the translated (target) characters.
+  // tr_s: translate, squeezing runs the TRANSLATION created (never runs that
+  // were already in the input untranslated).
   else if str_eq name "tr_s" then
     (match recv with
-     | VStr s -> let s = sget s in (match args with Cons (VStr f, Cons (VStr t, _)) -> let tt = sget t in mkstr (str_squeeze (str_tr s (sget f) tt) tt true) | _ -> mkstr s)
+     | VStr s -> let s = sget s in
+       (match args with
+        | Cons (VStr f, Cons (VStr t, _)) -> mkstr (str_tr_s s (sget f) (sget t))
+        | Cons (_, Nil) -> prim_raise "ArgumentError" "wrong number of arguments (given 1, expected 2)"
+        | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "tr_s") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr_s'")) in fail "mere-ruby: undefined method 'tr_s'")))
   else if str_eq name "squeeze" then
     (match recv with
-     | VStr s -> let s = sget s in (match args with Cons (VStr set, _) -> mkstr (str_squeeze s (sget set) true) | _ -> mkstr (str_squeeze s "" false))
+     | VStr s -> let s = sget s in
+       (match args with
+        | Nil -> mkstr (str_squeeze s "" false)
+        | _ ->
+          // every VStr argument is a set; ruby intersects them all.
+          let rec setsof = fn (xs: Val list) ->
+            (match xs with
+             | Nil -> (Nil : str list)
+             | Cons (VStr h2, t) -> Cons (sget h2, setsof t)
+             | Cons (other, _) -> (let _ = prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String") in (Nil : str list))) in
+          mkstr (str_squeeze_sets s (setsof args)))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "squeeze") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'squeeze'")) in fail "mere-ruby: undefined method 'squeeze'")))
   else if str_eq name "ljust" then
     (match recv with
@@ -18503,7 +18822,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr sep, _) -> let sep = sget sep in let i = str_find_from s sep 0 in
           if i < 0 then arr_new (Cons (mkstr s, Cons (mkstr "", Cons (mkstr "", Nil))))
           else arr_new (Cons (mkstr (substring s 0 i), Cons (mkstr sep, Cons (mkstr (substring s (i + str_len sep) (str_len s)), Nil))))
-        | _ -> arr_new (Cons (mkstr s, Cons (mkstr "", Cons (mkstr "", Nil)))))
+        | Cons (other, _) -> prim_raise "TypeError" ("type mismatch: " ++ class_name other ++ " given")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "partition") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'partition'")) in fail "mere-ruby: undefined method 'partition'")))
   else if str_eq name "rpartition" then
     (match recv with
@@ -18512,7 +18832,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr sep, _) -> let sep = sget sep in let i = str_rindex_go s sep (str_len s - str_len sep) in
           if i < 0 then arr_new (Cons (mkstr "", Cons (mkstr "", Cons (mkstr s, Nil))))
           else arr_new (Cons (mkstr (substring s 0 i), Cons (mkstr sep, Cons (mkstr (substring s (i + str_len sep) (str_len s)), Nil))))
-        | _ -> arr_new (Cons (mkstr "", Cons (mkstr "", Cons (mkstr s, Nil)))))
+        | Cons (other, _) -> prim_raise "TypeError" ("type mismatch: " ++ class_name other ++ " given")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "rpartition") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rpartition'")) in fail "mere-ruby: undefined method 'rpartition'")))
   else if str_eq name "delete_prefix" then
     (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in (if str_starts_with s p then mkstr (substring s (str_len p) (str_len s)) else mkstr s) | _ -> mkstr s) | _ -> (let _ = map_set prim_missing "n" (mkstr "delete_prefix") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_prefix'")) in fail "mere-ruby: undefined method 'delete_prefix'")))
@@ -18555,14 +18876,29 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // `lines(chomp: true)` drops each terminator, which is what a caller
   // splitting input almost always wants.
   else if str_eq name "lines" then (match recv with VStr s -> let s = sget s in
-      (let ls = val_list_of_strs (str_lines_go s 0 0 (str_len s)) in
-       let chomped = (match args with
-                      | Cons (VHsh hid, _) ->
-                        (match hash_lookup (hderef hid) (VSym "chomp") with
-                         | (true, cv) -> truthy cv
-                         | _ -> false)
-                      | _ -> false) in
-       if chomped then arr_new (val_map_chomp ls) else arr_new ls) | _ -> (let _ = map_set prim_missing "n" (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
+      // lines(sep = $/, chomp: false): a custom separator stays attached to
+      // each piece, "" is paragraph mode, and $/ = nil means one piece.
+      (let copt = (let rec last_hash = fn (xs: Val list) -> fn (acc: bool) ->
+                     (match xs with
+                      | Nil -> acc
+                      | Cons (VHsh hid, t) ->
+                        last_hash t (match hash_lookup (hderef hid) (VSym "chomp") with
+                                     | (true, cv) -> truthy cv
+                                     | _ -> acc)
+                      | Cons (_, t) -> last_hash t acc) in
+                   last_hash args false) in
+       let sepv = (match args with
+                   | Cons (VStr sp, _) -> VStr sp
+                   | Cons (VNil, _) -> VNil
+                   | _ -> (if map_has globals "/" then map_get globals "/" else mkstr "\n")) in
+       let ls = (match sepv with
+                 | VNil -> (if str_len s == 0 then (Nil : Val list) else Cons (mkstr s, Nil))
+                 | VStr sph ->
+                   let sep = sget sph in
+                   (if str_eq sep "\n" then val_list_of_strs (str_lines_go s 0 0 (str_len s))
+                    else val_list_of_strs (str_lines_sep s sep))
+                 | _ -> val_list_of_strs (str_lines_go s 0 0 (str_len s))) in
+       if copt then arr_new (val_map_chomp ls) else arr_new ls) | _ -> (let _ = map_set prim_missing "n" (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
   else if str_eq name "split" then
     (match recv with
      | VStr s ->
@@ -18586,7 +18922,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr "split") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'split'")) in fail "mere-ruby: undefined method 'split'")))
   else if str_eq name "include?" then
     (match recv with
-     | VStr s -> let s = sget s in (match args with Cons (VStr sub, _) -> let sub = sget sub in VBool (str_contains s sub) | _ -> VBool false)
+     | VStr s -> let s = sget s in
+       (match args with
+        | Cons (VStr sub, _) -> let sub = sget sub in VBool (str_contains s sub)
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | VArr id -> (match args with Cons (v, _) -> VBool (val_contains (deref id) v) | _ -> VBool false)
      | VHsh hid -> let xs = hderef hid in (match args with Cons (k, _) -> VBool (hash_haskey_x (hcbi_on hid) xs k) | _ -> VBool false)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "include?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'include?'")) in fail "mere-ruby: undefined method 'include?'")))
@@ -18676,10 +19016,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VArr id -> (match args with Cons (v, _) -> (let n = val_rindex (deref id) v 0 (0 - 1) in if n < 0 then VNil else VInt n) | _ -> VNil)
      | VStr s -> let s = sget s in
+       let cn = utf8_len s in
        (match args with
-        // characters, like every other position Ruby reports
-        | Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt (utf8_cidx s i)
-        | _ -> VNil)
+        // the match may START at or before the (character) position; the
+        // default is the end of the string. Answers in characters.
+        | Cons (VStr sub, rest) ->
+          let cst = (match rest with
+                     | Cons (VInt off, _) -> (if off < 0 then cn + off else off)
+                     | _ -> cn) in
+          (if cst < 0 then VNil
+           else
+             let sub = sget sub in
+             let bst = utf8_boff s (if cst > cn then cn else cst) 0 in
+             let top = str_len s - str_len sub in
+             let from = (if bst > top then top else bst) in
+             let i = str_rindex_go s sub from in
+             (if i < 0 then VNil else VInt (utf8_cidx s i)))
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "rindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rindex'")) in fail "mere-ruby: undefined method 'rindex'")))
   else if str_eq name "tally" then (match recv with VArr id -> val_tally (deref id) Nil | _ -> (let _ = map_set prim_missing "n" (mkstr "tally") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tally'")) in fail "mere-ruby: undefined method 'tally'")))
   else if str_eq name "minmax" then (match recv with VArr id -> val_minmax (deref id) | _ -> (let _ = map_set prim_missing "n" (mkstr "minmax") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'minmax'")) in fail "mere-ruby: undefined method 'minmax'")))
@@ -18727,11 +19081,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        // fell through to nil rather than searching at all.
        (match args with
         | Cons (VStr sub, Cons (VInt off, _)) ->
+          // an offset outside the string (either side) finds nothing.
           let cn = utf8_len s in
           let cst = (if off < 0 then cn + off else off) in
-          let bst = utf8_boff s (if cst < 0 then 0 else cst) 0 in
-          let i = str_find_from s (sget sub) bst in
-          (if i < 0 then VNil else VInt (utf8_cidx s i))
+          (if cst < 0 || cst > cn then VNil
+           else
+             let bst = utf8_boff s cst 0 in
+             let i = str_find_from s (sget sub) bst in
+             (if i < 0 then VNil else VInt (utf8_cidx s i)))
         | Cons (VStr sub, _) ->
           let i = str_find_from s (sget sub) 0 in
           (if i < 0 then VNil else VInt (utf8_cidx s i))
@@ -18745,12 +19102,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (match rxv_search pat pf s bst with
            | RHit (st, _, _) -> VInt (utf8_cidx s st)
            | _ -> VNil)
-        | _ -> VNil)
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "index") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'index'")) in fail "mere-ruby: undefined method 'index'")))
-  else if str_eq name "rindex" then
-    (match recv with
-     | VStr s -> let s = sget s in (match args with Cons (VStr sub, _) -> let sub = sget sub in let i = str_rindex_go s sub (str_len s - str_len sub) in if i < 0 then VNil else VInt (utf8_cidx s i) | _ -> VNil)
-     | _ -> (let _ = map_set prim_missing "n" (mkstr "rindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rindex'")) in fail "mere-ruby: undefined method 'rindex'")))
   else if str_eq name "count" then
     (match recv with
      | VArr id -> let xs = deref id in (match args with Cons (v, _) -> VInt (val_count_eq xs v) | Nil -> VInt (val_list_len xs))
@@ -18810,7 +19164,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VArr id -> (match args with Cons (VInt i, rest) -> let xs = deref id in let n = val_list_len xs in let k = (if i < 0 then n + i + 1 else i) in let _ = arr_set id (list_append (vtake xs k) (list_append rest (vdrop xs k))) in recv | _ -> recv)
      // the position is in characters: inserting at 1 used to land inside the
      // first character and produce "\xE6X\x97\xA5..."
-     | VStr h -> (match args with Cons (VInt i, Cons (VStr ins, _)) -> let s = sget h in let ins = sget ins in let cn = utf8_len s in let ck = (if i < 0 then cn + i + 1 else i) in let k = utf8_boff s (if ck < 0 then 0 else ck) 0 in let _ = sset h (substring s 0 k ++ ins ++ substring s k (str_len s)) in recv | _ -> recv)
+     | VStr h ->
+       (match args with
+        | Cons (VInt i, Cons (VStr ins, _)) ->
+          let s = sget h in let ins = sget ins in
+          let cn = utf8_len s in
+          let ck = (if i < 0 then cn + i + 1 else i) in
+          (if ck < 0 || ck > cn then prim_raise "IndexError" ("index " ++ str_of_int i ++ " out of string")
+           else let k = utf8_boff s ck 0 in
+                let _ = sset h (substring s 0 k ++ ins ++ substring s k (str_len s)) in recv)
+        | Cons (VInt _, Cons (other, _)) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "insert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'insert'")) in fail "mere-ruby: undefined method 'insert'")))
   else if str_eq name "fill" then
     (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (val_repeat (val_list_len (deref id)) v) in recv | _ -> recv) | _ -> (let _ = map_set prim_missing "n" (mkstr "fill") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fill'")) in fail "mere-ruby: undefined method 'fill'")))
@@ -19361,39 +19726,141 @@ and hash_merge_one_block = fn world -> fn nb -> fn (base: Val list) -> fn (other
 
 // ---- sprintf/format/`%` string formatting -------------------------------
 // %[flags][width][.prec]type ; flags: - + 0 space # ; types: d i u s f x X o b c
-and rb_format = fn (fmt: str) -> fn (args: Val list) -> rb_format_go fmt 0 args ""
+// ---- Kernel#sprintf / String#% ---------------------------------------------
+// One pass over the format string. How the arguments are referenced --
+// sequentially (%s), by number (%1$s), or by name (%<x>s / %{x}) -- is a
+// property of the WHOLE format, so `mode` rides along the entire pass and
+// mixing two styles is an ArgumentError no matter how far apart they sit.
+// mode: 0 = undecided, 1 = sequential, 2 = numbered, 3 = named.
+and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) ->
+  let (out, used, mode) = rb_format_go env world fmt 0 args 0 0 "" in
+  // leftover arguments are an error only under $DEBUG, and only for the
+  // sequential style: numbered and named formats may leave arguments unread.
+  let dbg = (if map_has globals "DEBUG" then (match map_get globals "DEBUG" with VNil -> false | VBool b -> b | _ -> true) else false) in
+  if dbg && mode <= 1 && used < val_list_len args then
+    (let _ = prim_raise "ArgumentError" "too many arguments for format string" in out)
+  else out
 
-and rb_format_go = fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (acc: str) ->
+and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
   let n = str_len fmt in
-  if i >= n then acc
+  if i >= n then (acc, nextarg, mode)
   else
     let c = char_at fmt i in
     if str_eq c "%" then
-      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go fmt (i + 2) args (acc ++ "%")
+      (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go env world fmt (i + 2) args nextarg mode (acc ++ "%")
        // `%{name}` substitutes the hash entry with no format spec at all, and
        // `%<name>05.2f` names the argument for one. rubocop-ast generates its
        // node matchers this way, so a format that does not substitute becomes a
        // syntax error somewhere else entirely.
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "\{" then
          let (key, j) = rb_fmt_name fmt (i + 2) "" "}" in
-         rb_format_go fmt j args (acc ++ rb_fmt_one "" (0 - 1) (0 - 1) "s" (rb_fmt_named args key "\{" "}"))
+         let m2 = rb_fmt_to_named mode in
+         rb_format_go env world fmt j args nextarg m2 (acc ++ rb_fmt_one env world "" (0 - 1) (0 - 1) false "s" (rb_fmt_named args key "\{" "}"))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "<" then
-         let (key, j) = rb_fmt_name fmt (i + 2) "" ">" in
+         let (key, j0) = rb_fmt_name fmt (i + 2) "" ">" in
          let av = rb_fmt_named args key "<" ">" in
-         let (flags, i1) = rb_fmt_flags fmt j "" in
-         let (width, i2) = rb_fmt_digits fmt i1 0 false in
-         let (prec, i3) = rb_fmt_prec fmt i2 in
-         let typ = (if i3 < n then char_at fmt i3 else "") in
-         rb_format_go fmt (i3 + 1) args (acc ++ rb_fmt_one flags width prec typ av)
+         let m2 = rb_fmt_to_named mode in
+         // the spec after the name formats exactly this one value: run the
+         // directive parser over a one-element argument list in numbered mode
+         // with the position preset, so a stray %s inside cannot consume the
+         // real argument list.
+         let (piece, j, na9, m9) = rb_fmt_dir env world fmt j0 (Cons (av, Nil)) 0 2 "" (0 - 1) false (0 - 1) false 1 in
+         let _ = na9 in
+         let _ = m9 in
+         rb_format_go env world fmt j args nextarg m2 (acc ++ piece)
        else
-         let (flags, i1) = rb_fmt_flags fmt (i + 1) "" in
-         let (width, i2) = rb_fmt_digits fmt i1 0 false in
-         let (prec, i3) = rb_fmt_prec fmt i2 in
-         let typ = (if i3 < n then char_at fmt i3 else "") in
-         (match args with
-          | Cons (av, rest) -> rb_format_go fmt (i3 + 1) rest (acc ++ rb_fmt_one flags width prec typ av)
-          | Nil -> rb_format_go fmt (i3 + 1) Nil (acc ++ rb_fmt_one flags width prec typ VNil)))
-    else rb_format_go fmt (i + 1) args (acc ++ c)
+         let (piece, j, na2, m2) = rb_fmt_dir env world fmt (i + 1) args nextarg mode "" (0 - 1) false (0 - 1) false 0 in
+         rb_format_go env world fmt j args na2 m2 (acc ++ piece))
+    else rb_format_go env world fmt (i + 1) args nextarg mode (acc ++ c)
+
+// a named reference may not mix with the sequential or numbered styles.
+and rb_fmt_to_named = fn (mode: int) ->
+  if mode == 1 || mode == 2 then (let _ = prim_raise "ArgumentError" "named after unnumbered or numbered format" in 3) else 3
+
+// one directive, from the char after '%'. flags/width/prec/pos accumulate as
+// the spec is read left to right; `pset` tells "no precision" apart from an
+// explicit one (a negative star precision means none was given). Returns the
+// formatted piece, the index past the type char, the argument cursor, and mode.
+and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) ->
+  fn (nextarg: int) -> fn (mode: int) -> fn (flags: str) -> fn (width: int) -> fn (wset: bool) ->
+  fn (prec: int) -> fn (pset: bool) -> fn (pos: int) ->
+  let n = str_len fmt in
+  if i >= n then (let _ = prim_raise "ArgumentError" "incomplete format specifier; use %% (double %) instead" in ("", i, nextarg, mode))
+  else
+    let c = char_at fmt i in
+    if str_eq c "-" || str_eq c "+" || str_eq c " " || str_eq c "#" || str_eq c "0" then
+      rb_fmt_dir env world fmt (i + 1) args nextarg mode (flags ++ c) width wset prec pset pos
+    else if is_digit c then
+      let (k, j) = rb_fmt_digits fmt i 0 false in
+      (if j < n && str_eq (char_at fmt j) "$" then
+         (if pos > 0 then (let _ = prim_raise "ArgumentError" ("value given twice - " ++ int_to_base k 10 ++ "$") in ("", j, nextarg, mode))
+          else if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in ("", j, nextarg, mode))
+          else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in ("", j, nextarg, mode))
+          else rb_fmt_dir env world fmt (j + 1) args nextarg 2 flags width wset prec pset k)
+       else if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", j, nextarg, mode))
+       else rb_fmt_dir env world fmt j args nextarg mode flags k true prec pset pos)
+    else if str_eq c "*" then
+      (if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
+       else
+         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode in
+         (if w < 0 then rb_fmt_dir env world fmt j args na2 m2 (flags ++ "-") (0 - w) true prec pset pos
+          else rb_fmt_dir env world fmt j args na2 m2 flags w true prec pset pos))
+    else if str_eq c "." then
+      (if pset then (let _ = prim_raise "ArgumentError" "precision given twice" in ("", i, nextarg, mode))
+       else if i + 1 < n && str_eq (char_at fmt (i + 1)) "*" then
+         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args nextarg mode in
+         rb_fmt_dir env world fmt j args na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
+       else
+         let (p, j) = rb_fmt_digits fmt (i + 1) 0 false in
+         rb_fmt_dir env world fmt j args nextarg mode flags width wset (if p < 0 then 0 else p) true pos)
+    else if rb_fmt_is_type c then
+      let (av, na2, m2) =
+        (if pos > 0 then (rb_fmt_posarg args pos, nextarg, mode)
+         else if mode == 2 || mode == 3 then (let _ = prim_raise "ArgumentError" ("unnumbered(" ++ int_to_base (nextarg + 1) 10 ++ ") mixed with numbered") in (VNil, nextarg, mode))
+         else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (VNil, nextarg, mode))
+         else (val_nth args nextarg, nextarg + 1, 1)) in
+      (rb_fmt_one env world flags width prec pset c av, i + 1, na2, m2)
+    else (let _ = prim_raise "ArgumentError" ("malformed format string - %" ++ c) in ("", i + 1, nextarg, mode))
+
+and rb_fmt_is_type = fn (c: str) ->
+  str_eq c "d" || str_eq c "i" || str_eq c "u" || str_eq c "s" || str_eq c "p" || str_eq c "c"
+  || str_eq c "b" || str_eq c "B" || str_eq c "o" || str_eq c "x" || str_eq c "X"
+  || str_eq c "e" || str_eq c "E" || str_eq c "f" || str_eq c "g" || str_eq c "G"
+
+// `*` reads its number from the arguments: a bare `*` takes the next
+// sequential argument, `*3$` a numbered one. Digits NOT followed by '$' are
+// left unconsumed -- ruby re-reads them after the star, so `%*5s` is a
+// width-given-twice error, not width 5.
+and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) ->
+  let n = str_len fmt in
+  let (k, j) = rb_fmt_digits fmt i 0 false in
+  if k >= 0 && j < n && str_eq (char_at fmt j) "$" then
+    (if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in (0, j + 1, nextarg, mode))
+     else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in (0, j + 1, nextarg, mode))
+     else (rb_fmt_int env world (rb_fmt_posarg args k), j + 1, nextarg, 2))
+  else
+    (if mode == 2 || mode == 3 then (let _ = prim_raise "ArgumentError" ("unnumbered(" ++ int_to_base (nextarg + 1) 10 ++ ") mixed with numbered") in (0, i, nextarg, mode))
+     else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (0, i, nextarg, mode))
+     else (rb_fmt_int env world (val_nth args nextarg), i, nextarg + 1, 1))
+
+and rb_fmt_posarg = fn (args: Val list) -> fn (k: int) ->
+  if k > val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in VNil)
+  else val_nth args (k - 1)
+
+// `"fmt" % arg`: an Array (or anything answering #to_ary, nil result meaning
+// "no, wrap me") is the whole argument list; any other value is one argument.
+and rb_fmt_args = fn env -> fn world -> fn (vb: Val) ->
+  match vb with
+  | VArr id -> deref id
+  | VObj _ ->
+    (if responds world vb "to_ary" then
+       (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+        match invoke_val_c env world nb vb "to_ary" Nil false with
+        | VArr id -> deref id
+        | VNil -> Cons (vb, Nil)
+        | other -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name vb ++ " to Array (" ++ class_name vb ++ "#to_ary gives " ++ class_name other ++ ")") in Cons (vb, Nil)))
+     else Cons (vb, Nil))
+  | _ -> Cons (vb, Nil)
 
 // the name inside %{...} / %<...>, and the index just past its closing brace.
 and rb_fmt_name = fn (fmt: str) -> fn (i: int) -> fn (acc: str) -> fn (close: str) ->
@@ -19414,24 +19881,213 @@ and rb_fmt_named = fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (c
      else prim_raise "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
    | _ -> prim_raise "ArgumentError" "one hash required")
 
-and rb_fmt_flags = fn (fmt: str) -> fn (i: int) -> fn (acc: str) ->
-  if i < str_len fmt &&
-     (let c = char_at fmt i in str_eq c "-" || str_eq c "+" || str_eq c "0" || str_eq c " " || str_eq c "#")
-  then rb_fmt_flags fmt (i + 1) (acc ++ char_at fmt i)
-  else (acc, i)
-
 and rb_fmt_digits = fn (fmt: str) -> fn (i: int) -> fn (acc: int) -> fn (seen: bool) ->
   if i < str_len fmt && is_digit (char_at fmt i)
   then rb_fmt_digits fmt (i + 1) (acc * 10 + (ord (char_at fmt i) - 48)) true
   else ((if seen then acc else 0 - 1), i)
 
-and rb_fmt_prec = fn (fmt: str) -> fn (i: int) ->
-  if i < str_len fmt && str_eq (char_at fmt i) "." then
-    let (p, j) = rb_fmt_digits fmt (i + 1) 0 false in ((if p < 0 then 0 else p), j)
-  else (0 - 1, i)
+// Kernel#Integer's coercion, as sprintf applies it to %d/%i/%u arguments and
+// to star width/precision: Integers pass, a Float must be finite and
+// truncates, a String parses by Integer()'s strict syntax, and an object is
+// asked for #to_int then #to_i -- a nil answer from either means "declined",
+// not zero (the mspec mocks answer nil for everything they were not told).
+and rb_fmt_int_v = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VInt x -> VInt x
+  | VBig s -> VBig s
+  | VFlt f ->
+    (if str_len (float_special f) > 0 then (let _ = prim_raise "FloatDomainError" (float_special f) in VNil) else VInt (int_of_float f))
+  | VNil -> (let _ = prim_raise "TypeError" "can't convert nil into Integer" in VNil)
+  | VStr h -> rb_int_parse (sget h)
+  | _ ->
+    let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let ti = (if responds world v "to_int" then invoke_val_c env world nb v "to_int" Nil false else VNil) in
+    (match ti with
+     | VInt x -> VInt x
+     | VBig s -> VBig s
+     | _ ->
+       let ti2 = (if responds world v "to_i" then invoke_val_c env world nb v "to_i" Nil false else VNil) in
+       (match ti2 with
+        | VInt x -> VInt x
+        | VBig s -> VBig s
+        | _ -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name v ++ " into Integer") in VNil)))
 
-and fmt_to_int = fn (av: Val) ->
-  match av with VInt n -> n | VFlt f -> int_of_float f | VStr h -> int_of_str (sget h) | _ -> 0
+and rb_fmt_int = fn env -> fn world -> fn (v: Val) ->
+  match rb_fmt_int_v env world v with
+  | VInt x -> x
+  | VBig s -> int_of_str s
+  | _ -> 0
+
+// Kernel#Integer's string syntax: optional surrounding whitespace, optional
+// sign, an optional base prefix (0x 0b 0o 0d, or a bare leading 0 meaning
+// octal), then digits of that base with single underscores strictly BETWEEN
+// digits. Anything else is an ArgumentError, never a zero.
+and rb_int_parse = fn (s0: str) ->
+  let n0 = str_len s0 in
+  let lo = rb_int_ltrim s0 0 in
+  let hi = rb_int_rtrim s0 n0 in
+  if lo >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+  else
+    let (neg, i1) = (let c = char_at s0 lo in
+                     if str_eq c "-" then (true, lo + 1)
+                     else if str_eq c "+" then (false, lo + 1) else (false, lo)) in
+    if i1 >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+    else
+      let (base, i2) =
+        (if str_eq (char_at s0 i1) "0" && i1 + 1 < hi then
+           (let c2 = char_at s0 (i1 + 1) in
+            if str_eq c2 "x" || str_eq c2 "X" then (16, i1 + 2)
+            else if str_eq c2 "b" || str_eq c2 "B" then (2, i1 + 2)
+            else if str_eq c2 "o" || str_eq c2 "O" then (8, i1 + 2)
+            else if str_eq c2 "d" || str_eq c2 "D" then (10, i1 + 2)
+            else (8, i1 + 1))
+         else (10, i1)) in
+      let v = rb_int_digits s0 i2 hi base false false (VInt 0) in
+      (match v with
+       | VInt x -> VInt (if neg then 0 - x else x)
+       | VBig s -> norm_big (if neg then "-" ++ s else s)
+       | other -> other)
+
+and rb_int_ltrim = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && rb_int_is_sp (char_at s i) then rb_int_ltrim s (i + 1) else i
+and rb_int_rtrim = fn (s: str) -> fn (j: int) ->
+  if j > 0 && rb_int_is_sp (char_at s (j - 1)) then rb_int_rtrim s (j - 1) else j
+and rb_int_is_sp = fn (c: str) ->
+  let o = ord c in o == 32 || (o >= 9 && o <= 13)
+
+and rb_int_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (base: int) ->
+  fn (prev_us: bool) -> fn (seen: bool) -> fn (acc: Val) ->
+  if i >= hi then
+    (if seen && prev_us == false then acc
+     else (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil))
+  else
+    let c = char_at s0 i in
+    if str_eq c "_" then
+      (if seen == false || prev_us
+       then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+       else rb_int_digits s0 (i + 1) hi base true seen acc)
+    else
+      let dv = rb_digit_val_x c in
+      (if dv < 0 || dv >= base
+       then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+       else rb_int_digits s0 (i + 1) hi base false true (rb_int_acc acc base dv))
+
+// grows the parse accumulator, escaping to a bignum before machine overflow.
+and rb_int_acc = fn (acc: Val) -> fn (base: int) -> fn (dv: int) ->
+  match acc with
+  | VInt x -> (if x > 280000000000000000 then rb_int_acc (VBig (int_to_base x 10)) base dv else VInt (x * base + dv))
+  | VBig s -> VBig (big_add_s (big_mul_s s (int_to_base base 10)) (int_to_base dv 10))
+  | _ -> acc
+
+and rb_digit_val_x = fn (c: str) ->
+  let o = ord c in
+  if o >= 48 && o <= 57 then o - 48
+  else if o >= 97 && o <= 122 then o - 87
+  else if o >= 65 && o <= 90 then o - 55
+  else 0 - 1
+
+and rb_hexf = fn (ds: str) -> fn (i: int) -> fn (acc: float) ->
+  if i >= str_len ds then acc
+  else rb_hexf ds (i + 1) (acc * 16.0 + float_of_int (rb_digit_val_x (char_at ds i)))
+
+and rb_powf = fn (b: float) -> fn (e: int) ->
+  if e <= 0 then 1.0 else b * rb_powf b (e - 1)
+
+// sprintf's %e/%f/%g string argument: laxer than Kernel#Float (".5" parses)
+// but still strict about junk -- "5x", "0b1", "10e10.5", doubled underscores
+// and a bare "." are ArgumentErrors, never zero. Hex ("0xA", with optional
+// fraction and p-exponent) is accepted, as Kernel#Float accepts it.
+and rb_flt_parse = fn (s0: str) ->
+  let hi = rb_int_rtrim s0 (str_len s0) in
+  let lo = rb_int_ltrim s0 0 in
+  if lo >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+  else
+    let (neg, i1) = (let c = char_at s0 lo in
+                     if str_eq c "-" then (true, lo + 1)
+                     else if str_eq c "+" then (false, lo + 1) else (false, lo)) in
+    let sgn = (if neg then 0.0 - 1.0 else 1.0) in
+    if i1 >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+    else if str_eq (char_at s0 i1) "0" && i1 + 1 < hi
+            && (str_eq (char_at s0 (i1 + 1)) "x" || str_eq (char_at s0 (i1 + 1)) "X") then
+      // hex: digits [. digits] [p exp]
+      let (ds, i2) = rb_flt_digits s0 (i1 + 2) hi true false "" in
+      let (fs, i3) = (if i2 < hi && str_eq (char_at s0 i2) "."
+                      then rb_flt_digits s0 (i2 + 1) hi true false ""
+                      else ("", i2)) in
+      if str_len ds == 0 && str_len fs == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      else
+        let (pexp, i4) =
+          (if i3 < hi && (str_eq (char_at s0 i3) "p" || str_eq (char_at s0 i3) "P") then
+             (let (pneg, ip) = (if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "-" then (true, i3 + 2)
+                                else if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "+" then (false, i3 + 2)
+                                else (false, i3 + 1)) in
+              let (es, i5) = rb_flt_digits s0 ip hi false false "" in
+              if str_len es == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (0, i5))
+              else ((if pneg then 0 - int_of_str es else int_of_str es), i5))
+           else (0, i3)) in
+        if i4 < hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+        else
+          let iv = rb_hexf ds 0 0.0 in
+          let fv = (if str_len fs == 0 then 0.0 else rb_hexf fs 0 0.0 / rb_powf 16.0 (str_len fs)) in
+          sgn * (iv + fv) * (if pexp >= 0 then rb_powf 2.0 pexp else 1.0 / rb_powf 2.0 (0 - pexp))
+    else
+      // decimal: digits [. digits] [e [sign] digits], each digit run allowing
+      // single underscores between digits.
+      let (ds, i2) = rb_flt_digits s0 i1 hi false false "" in
+      let (fs, i3, dotted) = (if i2 < hi && str_eq (char_at s0 i2) "."
+                              then (match rb_flt_digits s0 (i2 + 1) hi false false "" with (a, b) -> (a, b, true))
+                              else ("", i2, false)) in
+      if str_len ds == 0 && str_len fs == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      else if dotted && str_len fs == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      else
+        let (es, i4) =
+          (if i3 < hi && (str_eq (char_at s0 i3) "e" || str_eq (char_at s0 i3) "E") then
+             (let (eneg, ip) = (if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "-" then (true, i3 + 2)
+                                else if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "+" then (false, i3 + 2)
+                                else (false, i3 + 1)) in
+              let (e1, i5) = rb_flt_digits s0 ip hi false false "" in
+              if str_len e1 == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in ("", i5))
+              else ((if eneg then "-" ++ e1 else e1), i5))
+           else ("", i3)) in
+        if i4 < hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+        else
+          float_of_str ((if neg then "-" else "")
+                        ++ (if str_len ds == 0 then "0" else ds)
+                        ++ (if str_len fs > 0 then "." ++ fs else "")
+                        ++ (if str_len es > 0 then "e" ++ es else ""))
+
+// one run of digits with single underscores strictly between digits; stops
+// at the first non-digit and hands back the cleaned digits and that index.
+and rb_flt_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (hex: bool) -> fn (prev_us: bool) -> fn (acc: str) ->
+  if i >= hi then
+    (if prev_us then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
+  else
+    let c = char_at s0 i in
+    if str_eq c "_" then
+      (if str_len acc == 0 || prev_us
+       then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i))
+       else rb_flt_digits s0 (i + 1) hi hex true acc)
+    else
+      let dv = rb_digit_val_x c in
+      (if dv < 0 || dv >= (if hex then 16 else 10)
+       then (if prev_us then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
+       else rb_flt_digits s0 (i + 1) hi hex false (acc ++ c))
+
+// %f/%e/%g argument: Float() semantics (a String parses; nil refuses).
+and rb_fmt_flt = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VFlt f -> f
+  | VInt x -> float_of_int x
+  | VBig _ -> to_f v
+  | VRat (_, _) -> to_f v
+  | VNil -> (let _ = prim_raise "TypeError" "can't convert nil into Float" in 0.0)
+  | VStr h -> rb_flt_parse (sget h)
+  | VObj _ ->
+    let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+    (if responds world v "to_f"
+     then (match invoke_val_c env world nb v "to_f" Nil false with VFlt f -> f | VInt x -> float_of_int x | _ -> 0.0)
+     else (let _ = prim_raise "TypeError" ("can't convert " ++ class_name v ++ " into Float") in 0.0))
+  | _ -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name v ++ " into Float") in 0.0)
 
 and rb_pad_str = fn (s: str) -> fn (flags: str) -> fn (width: int) ->
   // the width is in characters: `"%-5s" % "あ"` pads a one-character string to
@@ -19447,6 +20103,23 @@ and rb_pad_num = fn (sign: str) -> fn (ds: str) -> fn (flags: str) -> fn (width:
   if width <= len then body
   else if str_contains flags "-" then body ++ str_repeat " " (width - len)
   else if str_contains flags "0" then sign ++ str_repeat "0" (width - len) ++ ds
+  else str_repeat " " (width - len) ++ body
+
+// "Inf"/"NaN" for a non-finite float, "" for a finite one. NaN is the value
+// that is not equal to itself; the sign of -NaN is never shown, and -Inf's
+// sign comes from the caller's f < 0.0 (false for NaN, so it needs no case).
+and float_special = fn (f: float) ->
+  if f == f then
+    (if f > 1.7976931348623157e308 || f < (0.0 - 1.7976931348623157e308) then "Inf" else "")
+  else "NaN"
+
+// Inf/NaN take no digits, no zero padding, and no precision: the body is the
+// word, the sign obeys the flags, and padding is spaces even under '0'.
+and rb_pad_special = fn (sign: str) -> fn (word: str) -> fn (flags: str) -> fn (width: int) ->
+  let body = sign ++ word in
+  let len = str_len body in
+  if width <= len then body
+  else if str_contains flags "-" then body ++ str_repeat " " (width - len)
   else str_repeat " " (width - len) ++ body
 
 and ascii_up = fn (s: str) -> ascii_up_go s 0 ""
@@ -19578,36 +20251,138 @@ and fmt_g_abs = fn (av: Val) -> fn (prec: int) -> fn (upper: bool) -> fn (alt: b
      else if ei < 0 then g_rstrip_zeros se
      else g_rstrip_zeros (substring se 0 ei) ++ substring se ei (str_len se))
 
-and rb_fmt_one = fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (typ: str) -> fn (av: Val) ->
+and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (pset: bool) -> fn (typ: str) -> fn (av: Val) ->
   if str_eq typ "d" || str_eq typ "i" || str_eq typ "u" then
-    let n = fmt_to_int av in
-    let neg = n < 0 in
-    let ds = int_to_base (if neg then 0 - n else n) 10 in
-    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
-    rb_pad_num sign ds flags width
+    let (neg, ds) =
+      (match rb_fmt_int_v env world av with
+       | VBig s -> (if str_len s > 0 && str_eq (substring s 0 1) "-" then (true, substring s 1 (str_len s)) else (false, s))
+       | VInt x -> (x < 0, int_to_base (if x < 0 then 0 - x else x) 10)
+       | _ -> (false, "0")) in
+    rb_fmt_intlike flags width prec pset neg ds 10 ""
+  else if str_eq typ "b" || str_eq typ "B" || str_eq typ "o" || str_eq typ "x" || str_eq typ "X" then
+    let base = (if str_eq typ "o" then 8 else if str_eq typ "x" || str_eq typ "X" then 16 else 2) in
+    let (neg, ds) =
+      (match rb_fmt_int_v env world av with
+       | VBig s ->
+         (if str_len s > 0 && str_eq (substring s 0 1) "-"
+          then (true, big_to_base_s (substring s 1 (str_len s)) base)
+          else (false, big_to_base_s s base))
+       | VInt x -> (x < 0, int_to_base (if x < 0 then 0 - x else x) base)
+       | _ -> (false, "0")) in
+    let pfx0 = (if str_contains flags "#"
+                then (if str_eq typ "o" then "0" else if str_eq typ "x" || str_eq typ "X" then "0x" else "0b")
+                else "") in
+    // no prefix on a zero (%#x % 0 is "0"), nor on an octal already led by 0.
+    let pfx = (if str_eq typ "o" then (if str_len ds > 0 && str_eq (substring ds 0 1) "0" then "" else pfx0)
+               else if str_eq ds "0" then "" else pfx0) in
+    let body = rb_fmt_intlike flags width prec pset neg ds base pfx in
+    (if str_eq typ "X" || str_eq typ "B" then ascii_up body else body)
   else if str_eq typ "s" then
-    let s0 = to_s av in
-    let s = (if prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
+    let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let s0 = (match av with
+              | VStr h -> sget h
+              | _ -> (match invoke_val_c env world nb av "to_s" Nil false with VStr h2 -> sget h2 | other -> to_s other)) in
+    let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
     rb_pad_str s flags width
-  else if str_eq typ "f" then
-    let neg = (to_f av < 0.0) in
-    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
-    rb_pad_num sign (fmt_float_abs av (if prec < 0 then 6 else prec)) flags width
-  else if str_eq typ "e" || str_eq typ "E" then
-    let neg = (to_f av < 0.0) in
-    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
-    rb_pad_num sign (fmt_sci_abs av (if prec < 0 then 6 else prec) (str_eq typ "E")) flags width
-  else if str_eq typ "g" || str_eq typ "G" then
-    let neg = (to_f av < 0.0) in
-    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
-    rb_pad_num sign (fmt_g_abs av prec (str_eq typ "G") (str_contains flags "#")) flags width
-  else if str_eq typ "x" then rb_pad_num "" (int_to_base (fmt_to_int av) 16) flags width
-  else if str_eq typ "X" then rb_pad_num "" (ascii_up (int_to_base (fmt_to_int av) 16)) flags width
-  else if str_eq typ "o" then rb_pad_num "" (int_to_base (fmt_to_int av) 8) flags width
-  else if str_eq typ "b" then rb_pad_num "" (int_to_base (fmt_to_int av) 2) flags width
-  else if str_eq typ "c" then (match av with VInt n -> chr n | VStr h -> sget h | _ -> to_s av)
+  else if str_eq typ "p" then
+    let s0 = inspect_w env world av in
+    let s = (if pset && prec >= 0 && utf8_len s0 > prec then utf8_substr s0 0 prec else s0) in
+    rb_pad_str s flags width
+  else if str_eq typ "c" then
+    // each conversion may DECLINE by answering nil (the mspec mocks answer
+    // nil for whatever they were not told): to_str, then to_ary, then to_int.
+    let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+    let first_ch = fn (s0: str) -> (if str_len s0 == 0 then "" else utf8_substr s0 0 1) in
+    let s = (match av with
+      | VStr h -> first_ch (sget h)
+      | VInt cp -> utf8_enc cp
+      | _ ->
+        let ts = (if responds world av "to_str" then invoke_val_c env world nb av "to_str" Nil false else VNil) in
+        (match ts with
+         | VStr h -> first_ch (sget h)
+         | _ ->
+           let ta = (if responds world av "to_ary" then invoke_val_c env world nb av "to_ary" Nil false else VNil) in
+           (match ta with
+            | VArr id -> (match deref id with
+                          | Cons (VInt cp, _) -> utf8_enc cp
+                          | Cons (VStr h, _) -> first_ch (sget h)
+                          | _ -> "")
+            | _ ->
+              let ti = (if responds world av "to_int" then invoke_val_c env world nb av "to_int" Nil false else VNil) in
+              (match ti with
+               | VInt cp -> utf8_enc cp
+               | _ -> (let _ = prim_raise "TypeError" ("no implicit conversion of " ++ class_name av ++ " into Integer") in ""))))) in
+    rb_pad_str s flags width
+  else if str_eq typ "f" || str_eq typ "e" || str_eq typ "E" || str_eq typ "g" || str_eq typ "G" then
+    let fv = rb_fmt_flt env world av in
+    let sign = (if fv < 0.0 then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
+    let sp = float_special fv in
+    if str_len sp > 0 then rb_pad_special sign sp flags width
+    else
+      let p = (if pset && prec >= 0 then prec else if str_eq typ "g" || str_eq typ "G" then 0 - 1 else 6) in
+      let body = (if str_eq typ "f" then fmt_float_abs (VFlt fv) p
+                  else if str_eq typ "g" || str_eq typ "G" then fmt_g_abs (VFlt fv) p (str_eq typ "G") (str_contains flags "#")
+                  else fmt_sci_abs (VFlt fv) p (str_eq typ "E")) in
+      rb_pad_num sign body flags width
   else if str_eq typ "" then ""
   else "%" ++ typ
+
+// shared integer body. Base 10 negatives always carry '-'; the radix bases
+// print ruby's two's-complement ".." form unless a sign flag asks otherwise.
+// A precision zero-pads the digits and turns the '0' flag off (C's rule);
+// the ".." form pads with the REPEATING digit instead, and the dots count
+// toward both the precision and a zero-padded width.
+and rb_fmt_intlike = fn (flags: str) -> fn (width: int) -> fn (prec: int) -> fn (pset: bool) ->
+  fn (neg: bool) -> fn (ds0: str) -> fn (base: int) -> fn (pfx: str) ->
+  let dots = (if neg then (if base == 10 then false
+                           else if str_contains flags "+" then false
+                           else if str_contains flags " " then false else true)
+              else false) in
+  if dots then
+    let rd = int_to_base (base - 1) base in
+    let comp0 = rb_fmt_comp ds0 base in
+    let comp1 = (if pset && prec - 2 > str_len comp0 then str_repeat rd (prec - 2 - str_len comp0) ++ comp0 else comp0) in
+    let comp2 = (if pset then comp1
+                 else if str_contains flags "0" && (if str_contains flags "-" then false else true)
+                         && width - 2 - str_len pfx > str_len comp1
+                 then str_repeat rd (width - 2 - str_len pfx - str_len comp1) ++ comp1
+                 else comp1) in
+    rb_pad_special "" (pfx ++ ".." ++ comp2) flags width
+  else
+    let ds2 = (if pset && prec == 0 && str_eq ds0 "0" then ""
+               else if pset && prec > str_len ds0 then str_repeat "0" (prec - str_len ds0) ++ ds0
+               else ds0) in
+    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
+    let fl2 = (if pset then rb_flags_no0 flags 0 "" else flags) in
+    rb_pad_num (sign ++ pfx) ds2 fl2 width
+
+and rb_flags_no0 = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
+  else rb_flags_no0 s (i + 1) (acc ++ (if str_eq (char_at s i) "0" then "" else char_at s i))
+
+// digits of base^k - v (v given as the digit string of |value|, k = one more
+// than its length): the two's-complement tail that follows "..". School
+// subtraction right to left; the repeated leading digit collapses to one copy.
+and rb_fmt_comp = fn (ds: str) -> fn (base: int) ->
+  let k = str_len ds + 1 in
+  let rec go = fn (i: int) -> fn (borrow: int) -> fn (acc: str) ->
+    if i >= k then acc
+    else
+      let sv = (if i < str_len ds then rb_digit_val (char_at ds (str_len ds - 1 - i)) else 0) in
+      let d0 = 0 - sv - borrow in
+      let (d, b2) = (if d0 < 0 then (d0 + base, 1) else (d0, 0)) in
+      go (i + 1) b2 (int_to_base d base ++ acc) in
+  let raw = go 0 0 "" in
+  let rd = int_to_base (base - 1) base in
+  let rec strip = fn (s: str) ->
+    if str_len s >= 2 && str_eq (substring s 0 1) rd && str_eq (substring s 1 2) rd
+    then strip (substring s 1 (str_len s))
+    else s in
+  strip raw
+
+and rb_digit_val = fn (c: str) ->
+  let o = ord c in
+  if o >= 48 && o <= 57 then o - 48 else if o >= 97 then o - 87 else o - 55
 
 and range_step_arr = fn (i: int) -> fn (last: int) -> fn (n: int) ->
   if n <= 0 then Nil
@@ -29534,6 +30309,53 @@ and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) ->
      let _ = rx_publish_at world sv st en ng in
      // the position Ruby reports is in characters, not bytes
      VInt (utf8_cidx sv st))
+
+// String#index(regexp, offset): search from a byte offset, publish $~ and
+// the groups exactly as =~ does, and answer the hit in CHARACTERS (or nil).
+and rx_idx_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (bst: int) ->
+  match rxv_search p pf sv bst with
+  | RHit (st, en, saves) ->
+    (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
+     let _ = rxv_export_caps saves ng in
+     let _ = rx_publish_at world sv st en ng in
+     VInt (utf8_cidx sv st))
+  | _ ->
+    (let _ = rx_clear_caps 1 in
+     let _ = map_set globals "~" VNil in
+     let _ = rx_pub_groups sv 1 false in
+     VNil)
+
+// byte span of the LAST match whose start is at or before `limit` bytes
+// ((-1,-1) when there is none). An empty match still advances the scan.
+and rx_last_hit = fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (from: int) -> fn (limit: int) -> fn (bs: int) -> fn (be: int) ->
+  if from > str_len sv then (bs, be)
+  else
+    match rxv_search p pf sv from with
+    | RHit (st, en, _) ->
+      // advance one byte past the START, not to the end: rpartition's last
+      // match may overlap an earlier one (/l./ in "hello!" hits 2 then 3).
+      (if st > limit then (bs, be)
+       else rx_last_hit p pf sv (st + 1) limit st en)
+    | _ -> (bs, be)
+
+// String#rindex(regexp, pos): the last match starting at or before the byte
+// limit, published like =~, answered in characters (or nil).
+and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (limit: int) ->
+  let (st, en) = rx_last_hit p pf sv 0 limit (0 - 1) (0 - 1) in
+  let _ = en in
+  if st < 0 then
+    (let _ = rx_clear_caps 1 in
+     let _ = map_set globals "~" VNil in
+     let _ = rx_pub_groups sv 1 false in
+     VNil)
+  else
+    (match rxv_search p pf sv st with
+     | RHit (st2, en2, saves) ->
+       (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
+        let _ = rxv_export_caps saves ng in
+        let _ = rx_publish_at world sv st2 en2 ng in
+        VInt (utf8_cidx sv st2))
+     | _ -> VNil)
 
 // index of the next `>` at or after p (for a (?<name> header).
 and rx_name_end = fn (pat: str) -> fn (p: int) ->

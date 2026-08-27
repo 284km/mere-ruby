@@ -86,6 +86,19 @@ class PositiveMatcher
     end
     nil
   end
+  # real mspec forwards any other message to the value and asserts a truthy
+  # answer: `"ab".should.include?("a")`, `x.should.between?(1, 2)`. A value
+  # that does not answer the message raises NoMethodError, which is the
+  # example's own bug to surface.
+  def method_missing(sym, *args, &blk)
+    if @actual.__send__(sym, *args, &blk)
+      $mspec_pass += 1
+    else
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected truthy from ##{sym}"
+    end
+    nil
+  end
   def =~(pattern)
     if @actual =~ pattern
       $mspec_pass += 1
@@ -105,6 +118,16 @@ class NegativeMatcher
     if @actual.empty?
       $mspec_fail += 1
       puts "FAILED: #{$mspec_it}: expected #{@actual.inspect} not to be empty"
+    else
+      $mspec_pass += 1
+    end
+    nil
+  end
+  # see PositiveMatcher#method_missing; here a truthy answer is the failure.
+  def method_missing(sym, *args, &blk)
+    if @actual.__send__(sym, *args, &blk)
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected falsy from ##{sym}"
     else
       $mspec_pass += 1
     end
