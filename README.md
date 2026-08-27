@@ -9,6 +9,10 @@ output to the reference `ruby`.
 
 ```sh
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
+# On Linux, neither flag is right: the main thread's stack is `ulimit -s`, not
+# the linker's, and mainline clang caps bracket nesting at 256 where the
+# emitted C goes deeper. There:
+#   clang -O2 -fbracket-depth=1024 mr.c -o mere-ruby && ulimit -s 524288
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ./clitest/run.sh    # diff the driver's argv handling against the real ruby
