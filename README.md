@@ -23,7 +23,11 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 # beside a Linux ruby and corpus/108_sockets.rb reports a difference that is
 # real and is not a defect: two platforms' constants, correctly reported by
 # each. Comparing like with like means running where the identity it claims is
-# true.
+# true -- and, for the same reason, beside the ruby VERSION it claims to be.
+# main.mere reports `ruby 3.2.2`; ruby 3.4 changed Hash#inspect to put spaces
+# around `=>`, so a newer oracle reports `{"k" => nil}` where this reports
+# `{"k"=>nil}`. Both are right for the version each is answering as. CI pins
+# the oracle to 3.2.
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ./clitest/run.sh    # diff the driver's argv handling against the real ruby
