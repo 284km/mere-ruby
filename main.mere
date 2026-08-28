@@ -13930,7 +13930,10 @@ and is_binary_op_name = fn (s: str) ->
   str_eq s "+" || str_eq s "-" || str_eq s "*" || str_eq s "/" || str_eq s "%" ||
   str_eq s "**" || str_eq s "<<" || str_eq s ">>" || str_eq s "&" || str_eq s "|" ||
   str_eq s "^" || str_eq s "<" || str_eq s ">" || str_eq s "<=" || str_eq s ">=" ||
-  str_eq s "<=>"
+  // == / === / != are dispatched the same way (eval_bin_prim, not a table
+  // entry), so reflection has to count them as operators too: `Float#===` is
+  // the alias of `Float#==` a spec compares as UnboundMethods.
+  str_eq s "<=>" || str_eq s "==" || str_eq s "===" || str_eq s "!="
 
 // resolve an alias-to-builtin along cls's ancestor chain: returns the builtin
 // source name (e.g. "+") for `name`, or "" if none.
@@ -15570,6 +15573,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // a builtin method has no entry in the user method table, but it is
        // still a method of the class and reflection must see it.
        let origin = if str_eq origin "" && builtin_has_meth c mname then c else origin in
+       // an OPERATOR on a builtin is dispatched by eval_bin_prim rather than
+       // being an entry anywhere, so the per-class name lists do not mention
+       // it -- `1.method(:+)` already had this fallback and
+       // `Float.instance_method(:===)` did not, which is the same fact asked
+       // through two doors.
+       let origin = if str_eq origin "" && is_binary_op_name mname && builtin_cls_name c then c else origin in
        if str_eq origin "" then raise_exc world "NameError" ("undefined method '" ++ mname ++ "' for class '" ++ c ++ "'")
        else
          (let id = alloc_oid ocls0 in
@@ -16318,7 +16327,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 // false.method(:to_s)` compared "" against "" and never
                 // reached FalseClass's inspect/to_s pair. #owner and #hash
                 // already fall back to the receiver's class; equality now does.
-                let ocl9 = (if str_eq mown "" then class_name mrecv else mown) in
+                // ...and for a CLASS receiver that fallback is the class
+                // itself, not `Class`: `Complex.method(:rect)` is a method of
+                // Complex's singleton, and the alias table is keyed by
+                // Complex ("Class" has no rect/rectangular row and never will).
+                let ocl9 = (if str_eq mown "" then
+                              (match mrecv with VClass c9 -> c9 | _ -> class_name mrecv)
+                            else mown) in
                 VBool (str_eq own2 mown
                        && str_eq (defined_as_name world ocl9 nm2) (defined_as_name world ocl9 mnm)
                        && rb_identical rc2 mrecv))
@@ -19618,6 +19633,8 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
   // `"rect" || "rectangular"` for the convenience of the code, and ruby says
   // rect is the alias -- so the direction comes from the oracle: each of these
   // is a ruby/spec assertion of the form "X is an alias of Y".
+  else if str_eq cls "Symbol" then
+    (if str_eq n "===" then "==" else if str_eq n "size" then "length" else n)
   else if str_eq cls "Complex" || str_eq cls "Rational" || str_eq cls "Numeric"
           || str_eq cls "Integer" || str_eq cls "Float" then
     (if str_eq n "angle" then "arg"
@@ -19638,6 +19655,10 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      // inspect/to_s collapses for Integer and Float and not for Complex or
      // Rational, so this cannot go in the shared list either.
      else if str_eq n "inspect" && (str_eq cls "Integer" || str_eq cls "Float") then "to_s"
+     // ...and neither does `===`: it IS `==` for Integer and Float (as it is
+     // for String and Symbol) and is NOT for Complex, Rational or Numeric.
+     // Asked of the oracle per class, one class at a time.
+     else if str_eq n "===" && (str_eq cls "Integer" || str_eq cls "Float") then "=="
      else if str_eq n "to_int" && str_eq cls "Float" then "to_i"
      else if str_eq n "next" && str_eq cls "Integer" then "succ"
      else n)
@@ -19681,13 +19702,47 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
     str_eq name "bind" || str_eq name "bind_call" || str_eq name "call" ||
     str_eq name "unbind" || str_eq name "owner" || str_eq name "arity" ||
     str_eq name "name" || is_prim_method name
+  // Symbol's own methods (the same set the zero-arity table lists for a
+  // Symbol receiver), so `Symbol.instance_method(:size)` finds the method
+  // whose pair with :length a spec compares.
+  else if str_eq cls "Symbol" then
+    str_eq name "length" || str_eq name "size" || str_eq name "empty?" ||
+    str_eq name "to_sym" || str_eq name "to_s" || str_eq name "id2name" ||
+    str_eq name "succ" || str_eq name "next" || str_eq name "to_proc" ||
+    str_eq name "upcase" || str_eq name "downcase" || str_eq name "capitalize" ||
+    str_eq name "swapcase" || str_eq name "start_with?" || str_eq name "end_with?" ||
+    str_eq name "match" || str_eq name "match?" || str_eq name "[]" ||
+    str_eq name "encoding" || is_prim_method name
+  // KERNEL's own methods are the module-function list -- the same one
+  // private_instance_methods and public_methods enumerate. Without this row
+  // `Kernel.instance_method(:raise)` raised NameError for a method every
+  // program calls, and the six specs that compare an alias pair as
+  // UnboundMethods (fail/raise, format/sprintf, enum_for/to_enum) could not
+  // even build the pair.
+  else if str_eq cls "Kernel" then
+    is_kernel_builtin name || is_prim_method name
   else is_prim_method name
+
+// is this one of the classes whose instances the primitive layer implements?
+// (the operator fallback above asks it: a user class's `:+` really is absent
+// unless its table says otherwise.)
+and builtin_cls_name = fn (cls: str) ->
+  str_eq cls "String" || str_eq cls "Array" || str_eq cls "Hash" ||
+  str_eq cls "Integer" || str_eq cls "Float" || str_eq cls "Numeric" ||
+  str_eq cls "Complex" || str_eq cls "Rational" || str_eq cls "Range" ||
+  str_eq cls "Symbol" || str_eq cls "TrueClass" || str_eq cls "FalseClass" ||
+  str_eq cls "NilClass" || str_eq cls "Kernel" || str_eq cls "Comparable"
 
 // class methods mere-ruby implements on a built-in namespace. `responds` has
 // to know them or `Process.method(:clock_gettime)` raises -- timeout.rb opens
 // with exactly that line.
 and builtin_class_method = fn (cls: str) -> fn (name: str) ->
-  if str_eq cls "Process" then str_eq name "clock_gettime"
+  // Complex.rect / .rectangular / .polar are class methods of the primitive
+  // layer, so `Complex.method(:rect)` (which a spec compares with
+  // `Complex.method(:rectangular)`) has to find them.
+  if str_eq cls "Complex" then
+    str_eq name "rect" || str_eq name "rectangular" || str_eq name "polar"
+  else if str_eq cls "Process" then str_eq name "clock_gettime"
   else if str_eq cls "GC" then
     str_eq name "start" || str_eq name "enable" || str_eq name "disable" ||
     str_eq name "stress" || str_eq name "stress="
@@ -19746,6 +19801,11 @@ and is_num_method = fn (name: str) ->
 
 and is_prim_method = fn (name: str) ->
   str_eq name "to_s" || str_eq name "inspect" || str_eq name "class" ||
+  // to_enum / enum_for answer for EVERY receiver here (they build an
+  // Enumerator over the named method), so the claim and the implementation
+  // agree -- respond_to? said false while the call worked, and
+  // `Kernel.instance_method(:to_enum)` raised for a method that answers.
+  str_eq name "to_enum" || str_eq name "enum_for" ||
   str_eq name "nil?" || str_eq name "frozen?" || str_eq name "freeze" ||
   // unary -/+ on a string (intern / unfreeze); harmless on other values
   str_eq name "-@" || str_eq name "+@" ||
