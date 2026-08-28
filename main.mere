@@ -17347,8 +17347,16 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           | VStr sid -> let s0 = sget sid in
             (let r = (match args with
                       | Cons (VRegex (pat, pf), _) -> rx_gsub_blk2 world newblk pat pf s0 (str_eq name "gsub" || str_eq name "gsub!") 0 ""
-                      | Cons (VStr pat, _) -> rx_gsub_blk world newblk (sget pat) s0 (str_eq name "gsub" || str_eq name "gsub!") 0 ""
+                      | Cons (VStr pat, _) -> rx_gsub_blk2 world newblk (rx_escape (sget pat)) "" s0 (str_eq name "gsub" || str_eq name "gsub!") 0 ""
                       | _ -> s0) in
+             // the block may have run its own matches: $~ afterwards is THIS
+             // method's last (gsub) / first (sub) match again.
+             let _ = (match args with
+                      | Cons (VRegex (pat, pf), _) ->
+                        (if str_eq name "gsub" || str_eq name "gsub!" then (let _ = rb_scan_lastpub world pat pf s0 in ()) else (let _ = rb_sub_firstpub world pat pf s0 in ()))
+                      | Cons (VStr pat, _) ->
+                        (if str_eq name "gsub" || str_eq name "gsub!" then (let _ = rb_scan_lastpub world (rx_escape (sget pat)) "" s0 in ()) else (let _ = rb_sub_firstpub world (rx_escape (sget pat)) "" s0 in ()))
+                      | _ -> ()) in
              if str_eq name "gsub!" || str_eq name "sub!" then
                (if str_eq r s0 then VNil else (let _ = sset sid r in recv))
              else mkstr r)
@@ -17647,47 +17655,80 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VStr h -> let sv = sget h in (match args with Cons (VRegex (p, pf), _) -> VBool (rx_match p pf sv) | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv) | _ -> VBool false)
      | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | Cons (VSym sv, _) -> VBool (rx_match p pf sv) | _ -> VBool false)
      | _ -> VBool false)
-  // gsub/sub with a HASH replacement: each match keys into the hash through
-  // the world (so a default_proc / default value answers missing keys).
+  // gsub/sub with a String or Hash replacement, handled where `world` is:
+  // $~ ends up holding the last (gsub) / first (sub) match, hash values go
+  // through the world (default_proc answers missing keys, values #to_s),
+  // and the result's encoding is negotiated PIECE BY PIECE, which is how an
+  // ASCII-only prefix lets an incompatible replacement flip the encoding.
   else if (str_eq name "gsub" || str_eq name "sub" || str_eq name "gsub!" || str_eq name "sub!")
           && (match recv with VStr _ -> true | _ -> false)
-          && (match args with Cons (_, Cons (VHsh _, _)) -> true | _ -> false) then
+          && (match args with
+              | Cons (VRegex (_, _), Cons (VStr _, Nil)) -> true
+              | Cons (VStr _, Cons (VStr _, Nil)) -> true
+              | Cons (VRegex (_, _), Cons (VHsh _, Nil)) -> true
+              | Cons (VStr _, Cons (VHsh _, Nil)) -> true
+              | _ -> false) then
     (match recv with
      | VStr h ->
        (let s0 = sget h in
+        let e0 = enc_canon_name (senc_get h) in
         let (pat, pf) = (match args with
                          | Cons (VRegex (p9, f9), _) -> (p9, f9)
                          | Cons (VStr p9, _) -> (rx_escape (sget p9), "")
                          | _ -> ("", "")) in
-        let hsh = (match args with Cons (_, Cons (hv, _)) -> hv | _ -> VNil) in
+        let repv = (match args with Cons (_, Cons (rv, _)) -> rv | _ -> VNil) in
         let all = str_eq name "gsub" || str_eq name "gsub!" in
         let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-        let rec go = fn (i: int) -> fn (acc: str) ->
-          (let n = str_len s0 in
-           match rxv_search pat pf s0 i with
-           | RNoHit -> acc ++ substring s0 i n
-           | RBadPat -> acc ++ substring s0 i n
+        let n = str_len s0 in
+        // (acc, accenc) — the encoding folds along with the text.
+        let app = fn (acc: str) -> fn (ae: str) -> fn (piece: str) -> fn (pe: str) ->
+          (let ae2 = enc_compat2 ae acc pe piece in
+           if str_eq ae2 "" then
+             (let _ = prim_raise "Encoding::CompatibilityError"
+                        ("incompatible character encodings: " ++ ae ++ " and " ++ pe) in (acc, ae))
+           else (acc ++ piece, ae2)) in
+        let rec go = fn (i: int) -> fn (acc: str) -> fn (ae: str) -> fn (found: bool) ->
+          (match rxv_search pat pf s0 i with
+           | RNoHit ->
+             (let _ = (if found then () else
+                         (let _ = rx_clear_caps 1 in
+                          let _ = map_set globals "~" VNil in
+                          let _ = rx_pub_groups s0 1 false in ())) in
+              app acc ae (substring s0 i n) e0)
+           | RBadPat -> (acc ++ substring s0 i n, ae)
            | RHit (st, en, saves) ->
              let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
              let _ = rxv_export_caps saves ng in
-             let m = substring s0 st en in
              let _ = rx_publish_at world s0 st en ng in
-             let rep = (match invoke_val_c env world nb hsh "[]" (Cons (mkstr m, Nil)) false with
-                        | VStr rh -> sget rh
-                        | VNil -> ""
-                        | other -> to_s other) in
+             let (rep, re9) = (match repv with
+                               | VStr rh -> (rx_expand_rep (sget rh) s0 st en 0 "", enc_canon_name (senc_get rh))
+                               | VHsh _ ->
+                                 (let m = substring s0 st en in
+                                  match invoke_val_c env world nb repv "[]" (Cons (mkstr m, Nil)) false with
+                                  | VStr rh2 -> (sget rh2, enc_canon_name (senc_get rh2))
+                                  | VNil -> ("", "US-ASCII")
+                                  | ov ->
+                                    (if has_meth world (class_name ov) "to_s"
+                                     then (match invoke world nb ov (class_name ov) "to_s" Nil with VStr rh3 -> (sget rh3, enc_canon_name (senc_get rh3)) | o2 -> (to_s o2, "UTF-8"))
+                                     else (to_s ov, "UTF-8")))
+                               | _ -> ("", "US-ASCII")) in
+             let (acc1, ae1) = app acc ae (substring s0 i st) e0 in
+             let (acc2, ae2) = app acc1 ae1 rep re9 in
              let w9 = (if st < n then utf8_clen s0 st else 1) in
              if en <= st then
-               (let acc2 = acc ++ substring s0 i st ++ rep in
-                if all then (if st >= n then acc2 else go (st + w9) (acc2 ++ substring s0 st (st + w9)))
-                else acc2 ++ substring s0 st n)
+               (if all then
+                  (if st >= n then (acc2, ae2)
+                   else (match app acc2 ae2 (substring s0 st (st + w9)) e0 with
+                         | (acc3, ae3) -> go (st + w9) acc3 ae3 true))
+                else app acc2 ae2 (substring s0 st n) e0)
              else
-               (let acc2 = acc ++ substring s0 i st ++ rep in
-                if all then go en acc2 else acc2 ++ substring s0 en n)) in
-        let r = go 0 "" in
-        (if str_eq name "gsub!" || str_eq name "sub!" then
-           (if str_eq r s0 then VNil else (let _ = sset h r in recv))
-         else (let c = mkstr r in (match c with VStr rid -> (let _ = senc_set rid (senc_get h) in c) | _ -> c))))
+               (if all then go en acc2 ae2 true
+                else app acc2 ae2 (substring s0 en n) e0)) in
+        match go 0 "" e0 false with
+        | (r, re) ->
+          (if str_eq name "gsub!" || str_eq name "sub!" then
+             (if str_eq r s0 then VNil else (let _ = sset h r in let _ = senc_set h re in recv))
+           else (let c = mkstr r in (match c with VStr rid -> (let _ = senc_set rid re in c) | _ -> c))))
      | _ -> VNil)
   // blockless String#scan leaves $~ holding the LAST match (nil when none),
   // and every piece carries the receiver's encoding; the prim below has no
@@ -31534,6 +31575,18 @@ and rb_scan_lastpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) 
       let _ = map_set globals "~" VNil in
       let _ = rx_pub_groups sv 1 false in ()))
 
+// after sub, $~ is the FIRST match's MatchData (nil when none).
+and rb_sub_firstpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) ->
+  match rxv_search pat pf sv 0 with
+  | RHit (st, en, saves) ->
+    (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
+     let _ = rxv_export_caps saves ng in
+     let _ = rx_publish_at world sv st en ng in ())
+  | _ ->
+    (let _ = rx_clear_caps 1 in
+     let _ = map_set globals "~" VNil in
+     let _ = rx_pub_groups sv 1 false in ())
+
 // index of the next `>` at or after p (for a (?<name> header).
 and rx_name_end = fn (pat: str) -> fn (p: int) ->
   if p >= str_len pat then p
@@ -31843,7 +31896,9 @@ and rx_expand_rep = fn (rep: str) -> fn (s: str) -> fn (mst: int) -> fn (men: in
                       (let a = map_get rx_caps gs in let b = map_get rx_caps ge in if b >= a then substring s a b else "")
                     else "" in
         rx_expand_rep rep s mst men (i + 2) (acc ++ piece)
-      else rx_expand_rep rep s mst men (i + 2) (acc ++ d)
+      else if str_eq d "\\" then rx_expand_rep rep s mst men (i + 2) (acc ++ "\\")
+      // an unknown escape stays as written, backslash included.
+      else rx_expand_rep rep s mst men (i + 2) (acc ++ "\\" ++ d)
     else rx_expand_rep rep s mst men (i + 1) (acc ++ c)
 
 // gsub/sub with a BLOCK: for each match, publish $~/$1..$9, call the block
@@ -31861,7 +31916,12 @@ and rx_gsub_blk = fn world -> fn newblk -> fn (pat: str) -> fn (s: str) -> fn (a
     let en = if en0 < 0 then st else en0 in
     let m = substring s st en in
     let _ = rx_publish world pat s (VInt st) in
-    let rep = to_s (flow_value (run_block world nb newblk (Cons (mkstr m, Nil)))) in
+    let rv9 = flow_value (run_block world nb newblk (Cons (mkstr m, Nil))) in
+    let rep = (match rv9 with
+               | VStr rh -> sget rh
+               | _ -> (if has_meth world (class_name rv9) "to_s"
+                       then (match invoke world nb rv9 (class_name rv9) "to_s" Nil with VStr rh2 -> sget rh2 | o2 -> to_s o2)
+                       else to_s rv9)) in
     if en <= st then
       // zero-width match: insert the replacement, copy one char, advance.
       let acc2 = acc ++ substring s i st ++ rep in
