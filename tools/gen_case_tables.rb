@@ -3,12 +3,11 @@
 # downcase(:fold) for casecmp?'s folding). Only mappings the arithmetic core
 # (ASCII, Latin-1, Greek, Cyrillic offsets) does NOT already cover are listed.
 # Entries are "CP:CP[ CP...]" hex, comma-separated; three tables: UP, DOWN, FOLD.
+# only ASCII is excluded: the arithmetic core answers Latin-1/Greek/Cyrillic
+# too, but claiming a range here silently drops its irregular members (the
+# first version dropped 0xDF, and eszett stopped upcasing).
 def covered_arith(cp)
-  return true if cp < 0x80                    # ASCII
-  return true if (0xC0..0xFF).cover?(cp)      # Latin-1
-  return true if (0x391..0x3C9).cover?(cp)    # Greek core
-  return true if (0x400..0x45F).cover?(cp)    # Cyrillic core
-  false
+  cp < 0x80
 end
 def table(kind)
   rows = []
