@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 518 files.
+Classified: 503 files.
 
 ## CRASH — 27 files, 15 kinds
 
@@ -57,25 +57,25 @@ Classified: 518 files.
 
 </details>
 
-## DIFF — 491 files, 123 kinds
+## DIFF — 476 files, 123 kinds
 
 | files | kind |
 |---|---|
 | 72 | `ERROR NoMethodError` |
-| 36 | `FAILED expected truthy from #include?` |
 | 33 | `ERROR NameError` |
 | 29 | `ERROR StandardError` |
 | 23 | `FAILED expected true, got false` |
 | 21 | `FAILED expected TypeError to be raised` |
 | 21 | `FAILED expected N, got N` |
+| 20 | `FAILED expected truthy from #include?` |
 | 19 | `FAILED expected ArgumentError to be raised` |
-| 18 | `ERROR ArgumentError` |
-| 16 | `FAILED expected to be identical` |
+| 17 | `FAILED expected to be identical` |
+| 14 | `ERROR ArgumentError` |
 | 11 | `FAILED expected N, got nil` |
+| 11 | `FAILED expected "S", got "S"` |
 | 10 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 10 | `FAILED expected "S", got "S"` |
+| 8 | `pass=N fail=N err=N` |
 | 7 | `FAILED expected false, got true` |
-| 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
 | 5 | `FAILED expected not N` |
 | 5 | `FAILED expected "S", got nil` |
@@ -174,7 +174,7 @@ Classified: 518 files.
 | 1 | `FAILED expected :SYM, got [:SYM, :SYM]` |
 | 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
-| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "CLAUD ...[clipped]` |
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "VSCODE_CRASH_R ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
@@ -190,19 +190,22 @@ Classified: 518 files.
 | files | cause |
 |---|---|
 | 21 | `FAILED: expected TypeError to be raised` |
-| 19 | `FAILED: is a public method: expected truthy from #include?` |
 | 19 | `FAILED: expected ArgumentError to be raised` |
-| 10 | `FAILED: is a private method: expected truthy from #include?` |
+| 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
 | 5 | `FAILED: expected not 0` |
 | 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
+| 4 | `FAILED: is a public method: expected truthy from #include?` |
 | 4 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `pass=2 fail=0 err=0` |
 | 3 | `FAILED: raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
 | 3 | `FAILED: always returns the same string: expected to be identical` |
+| 2 | `pass=73 fail=0 err=0` |
+| 2 | `pass=70 fail=0 err=0` |
 | 2 | `FAILED: yields in turn the last length-1 values from the array: expected [2, 3, 4, 5], got []` |
+| 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns the original name even when aliased twice: expected :foo, got :bar` |
 | 2 | `FAILED: returns self: expected to be identical` |
@@ -219,16 +222,13 @@ Classified: 518 files.
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 1 | `sh: feature_14386: command not found` |
-| 1 | `pass=73 fail=0 err=0` |
-| 1 | `pass=70 fail=0 err=0` |
+| 1 | `pass=211 fail=0 err=0` |
 | 1 | `FAILED: yields each element to the block even if the array is changed during iteration: expected [1, 2, 3, 4, 5, 7, 9], got [1, 2, 3, 4, 5]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: uses the last value of a duplicated key: expected {:a=>3, :b=>2}, got {:a=>1, :b=>2, :a=>3}` |
 | 1 | `FAILED: uses the default proc to compute a default value, passing given key: expected [{}, nil], got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
-| 1 | `FAILED: uses eql? semantics: expected [1.0, 1], got [1.0]` |
-| 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
 
 </details>
 

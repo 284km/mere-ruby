@@ -25,7 +25,7 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 | core/false | 2 | 7 | 0 | 0 | 0 | 9 |
 | core/float | 32 | 17 | 1 | 0 | 0 | 50 |
 | core/integer | 23 | 41 | 6 | 0 | 0 | 70 |
-| core/kernel | 27 | 86 | 3 | 2 | 0 | 118 |
+| core/kernel | 42 | 71 | 3 | 2 | 0 | 118 |
 | core/matchdata | 9 | 21 | 0 | 0 | 0 | 30 |
 | core/method | 10 | 15 | 1 | 0 | 0 | 26 |
 | core/mutex | 3 | 4 | 0 | 0 | 0 | 7 |
