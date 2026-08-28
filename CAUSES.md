@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 503 files.
+Classified: 479 files.
 
-## CRASH — 27 files, 15 kinds
+## CRASH — 26 files, 15 kinds
 
 | files | kind |
 |---|---|
-| 6 | `(no output before aborting)` |
 | 5 | `stack overflow (recursion too deep)` |
+| 5 | `(no output before aborting)` |
 | 2 | `ERROR StandardError` |
 | 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 2 | `*.rb:N: mere-ruby: expected block in TMPDIR near line N` |
@@ -36,8 +36,8 @@ Classified: 503 files.
 
 | files | cause |
 |---|---|
-| 6 | `(no output before aborting)` |
 | 5 | `stack overflow (recursion too deep)` |
+| 5 | `(no output before aborting)` |
 | 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m < 0 and n >= 0: StandardError` |
@@ -57,25 +57,25 @@ Classified: 503 files.
 
 </details>
 
-## DIFF — 476 files, 123 kinds
+## DIFF — 453 files, 123 kinds
 
 | files | kind |
 |---|---|
-| 72 | `ERROR NoMethodError` |
+| 69 | `ERROR NoMethodError` |
 | 33 | `ERROR NameError` |
-| 29 | `ERROR StandardError` |
 | 23 | `FAILED expected true, got false` |
-| 21 | `FAILED expected TypeError to be raised` |
 | 21 | `FAILED expected N, got N` |
+| 21 | `ERROR StandardError` |
 | 20 | `FAILED expected truthy from #include?` |
 | 19 | `FAILED expected ArgumentError to be raised` |
-| 17 | `FAILED expected to be identical` |
+| 18 | `FAILED expected TypeError to be raised` |
+| 14 | `FAILED expected to be identical` |
 | 14 | `ERROR ArgumentError` |
 | 11 | `FAILED expected N, got nil` |
 | 11 | `FAILED expected "S", got "S"` |
-| 10 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 8 | `pass=N fail=N err=N` |
 | 7 | `FAILED expected false, got true` |
+| 6 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
 | 5 | `FAILED expected not N` |
 | 5 | `FAILED expected "S", got nil` |
@@ -101,6 +101,7 @@ Classified: 503 files.
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
+| 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected N ...[clipped]` |
 | 2 | `FAILED expected (N/N), got (N/N)` |
 | 2 | `ERROR SystemStackError` |
@@ -165,7 +166,6 @@ Classified: 503 files.
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected N, got true` |
-| 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
@@ -189,19 +189,17 @@ Classified: 503 files.
 
 | files | cause |
 |---|---|
-| 21 | `FAILED: expected TypeError to be raised` |
 | 19 | `FAILED: expected ArgumentError to be raised` |
+| 18 | `FAILED: expected TypeError to be raised` |
 | 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
 | 5 | `FAILED: expected not 0` |
 | 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
 | 4 | `FAILED: is a public method: expected truthy from #include?` |
 | 4 | `FAILED: expected LocalJumpError to be raised` |
-| 3 | `pass=2 fail=0 err=0` |
 | 3 | `FAILED: raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
-| 3 | `FAILED: always returns the same string: expected to be identical` |
 | 2 | `pass=73 fail=0 err=0` |
 | 2 | `pass=70 fail=0 err=0` |
 | 2 | `FAILED: yields in turn the last length-1 values from the array: expected [2, 3, 4, 5], got []` |
@@ -229,6 +227,8 @@ Classified: 503 files.
 | 1 | `FAILED: uses the last value of a duplicated key: expected {:a=>3, :b=>2}, got {:a=>1, :b=>2, :a=>3}` |
 | 1 | `FAILED: uses the default proc to compute a default value, passing given key: expected [{}, nil], got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
+| 1 | `FAILED: uses eql? semantics: expected [1.0, 1], got [1.0]` |
+| 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
 
 </details>
 
@@ -241,7 +241,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (18) | `__method__ binding chomp chop enum_for fail format initialize_copy instance_variable_get lambda loop method private_methods protected_methods public_send singleton_method test warn` |
+| kernel (17) | `__method__ binding chomp chop enum_for fail format initialize_copy instance_variable_get lambda loop method private_methods protected_methods public_send test warn` |
 | integer (11) | `case_compare ceildiv div gcd ord pred remainder round size succ try_convert` |
 | symbol (9) | `all_symbols case_compare id2name intern match name next size slice` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
@@ -255,7 +255,6 @@ class column says where the weight sits.
 | hash (4) | `compact deconstruct_keys fetch_values transform_values` |
 | array (4) | `bsearch_index bsearch repeated_combination repeated_permutation` |
 | numeric (3) | `integer modulo real` |
-| nil (2) | `to_c to_r` |
 | complex (2) | `quo rect` |
 | threadgroup (1) | `list` |
 | range (1) | `step` |

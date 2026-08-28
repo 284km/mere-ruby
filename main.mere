@@ -7552,20 +7552,27 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | VArr x -> (match vb with VArr y -> arr_new (val_dedup_into (deref y) (val_dedup_into (deref x) Nil)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
      | VInt x -> (match vb with VInt y -> VInt (int_bitop "|" x y) | VBig y -> big_bitop_v "|" (str_of_int x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
      | VBig x -> big_bitop_v "|" x (num_dec vb)
-     | VBool x -> (match vb with VBool y -> VBool (x || y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
+     // TrueClass#| / FalseClass#| / NilClass#| take ANY object and ask only
+     // whether it is truthy (`false | 5` is true, `false | nil` is false).
+     // Demanding a boolean made `false & nil` -- which the specs open with --
+     // an internal type error escaping as StandardError.
+     | VBool x -> VBool (x || truthy vb)
+     | VNil -> VBool (truthy vb)
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
   else if str_eq op "&" then
     (match va with
      | VArr x -> (match vb with VArr y -> arr_new (val_intersect (val_dedup_into (deref x) Nil) (deref y)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
      | VInt x -> (match vb with VInt y -> VInt (int_bitop "&" x y) | VBig y -> big_bitop_v "&" (str_of_int x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
      | VBig x -> big_bitop_v "&" x (num_dec vb)
-     | VBool x -> (match vb with VBool y -> VBool (x && y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
+     | VBool x -> VBool (x && truthy vb)
+     | VNil -> VBool false
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
   else if str_eq op "^" then
     (match va with
      | VInt x -> (match vb with VInt y -> VInt (int_bitop "^" x y) | VBig y -> big_bitop_v "^" (str_of_int x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ^ type error")) in fail "mere-ruby: ^ type error"))
      | VBig x -> big_bitop_v "^" x (num_dec vb)
-     | VBool x -> (match vb with VBool y -> VBool (if x then (if y then false else true) else y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ^ type error")) in fail "mere-ruby: ^ type error"))
+     | VBool x -> (let y = truthy vb in VBool (if x then (if y then false else true) else y))
+     | VNil -> VBool (truthy vb)
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ^ type error")) in fail "mere-ruby: ^ type error"))
   else
   if str_eq op "+" then
@@ -14823,6 +14830,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    else true) in
      if exists then mk_bound_method world recv owner nm
      else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for an instance of " ++ display_cls_msg world (dispatch_cls_of world recv)))
+  // Object#singleton_method(name): the method only if it is defined on the
+  // receiver's OWN singleton (for true/false/nil, `def (false).foo` puts it on
+  // FalseClass -- they have no singleton class to put it on), else ruby's
+  // NameError naming the receiver. `method` would answer for an inherited one,
+  // which is the difference between the two.
+  else if str_eq name "singleton_method"
+          && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+    (let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr h2, _) -> sget h2 | _ -> "") in
+     let sng = (match recv with
+                | VObj oid3 -> singleton_cls_of world oid3
+                | VClass c3 -> "(sng:" ++ c3 ++ ")"
+                | VNil -> "NilClass"
+                | VBool b3 -> (if b3 then "TrueClass" else "FalseClass")
+                | other -> (let hk3 = hng_key other in
+                            if (if str_eq hk3 "" then false else true) && map_has hng_store hk3
+                            then map_get hng_store hk3 else "")) in
+     if (if str_eq sng "" then false else true) && has_own_meth world sng nm
+     then mk_bound_method world recv sng nm
+     else raise_exc world "NameError"
+            ("undefined singleton method '" ++ nm ++ "' for " ++ inspect recv))
   // Enumerable#lazy: a Lazy over any enumerable receiver.
   else if str_eq name "lazy"
           && (match recv with
@@ -14891,6 +14918,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // a singleton class cannot be instantiated: new / allocate raise TypeError.
     if is_sng_cls c && (str_eq name "new" || str_eq name "allocate") then
       raise_exc world "TypeError" "can't create instance of singleton class"
+    // true / false / nil are the ONLY instances of their classes: ruby gives
+    // those three classes no allocator (TypeError) and no `new` at all
+    // (NoMethodError) -- two different refusals, which is what the specs
+    // check one after the other.
+    else if (str_eq c "TrueClass" || str_eq c "FalseClass" || str_eq c "NilClass")
+            && (str_eq name "new" || str_eq name "allocate")
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      (if str_eq name "allocate"
+       then raise_exc world "TypeError" ("allocator undefined for " ++ c)
+       else raise_exc world "NoMethodError" ("undefined method 'new' for class " ++ c))
     // Class#allocate: an instance with no ivars and NO initialize call. This
     // is how a class that builds its instances some other way (Date, from a
     // Julian day) gets an object to fill in.
@@ -16276,8 +16313,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                (let own2 = (match map_get ivars2 (str_of_int oid2 ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
                 let nm2 = (match map_get ivars2 (str_of_int oid2 ++ "@__m_name") with VStr h -> sget h | _ -> "") in
                 let rc2 = (if map_has ivars2 (str_of_int oid2 ++ "@__m_recv") then map_get ivars2 (str_of_int oid2 ++ "@__m_recv") else VMain) in
+                // A PRIMITIVE receiver's Method has no owner recorded, and the
+                // alias table is keyed by CLASS: `false.method(:inspect) ==
+                // false.method(:to_s)` compared "" against "" and never
+                // reached FalseClass's inspect/to_s pair. #owner and #hash
+                // already fall back to the receiver's class; equality now does.
+                let ocl9 = (if str_eq mown "" then class_name mrecv else mown) in
                 VBool (str_eq own2 mown
-                       && str_eq (defined_as_name world mown nm2) (defined_as_name world mown mnm)
+                       && str_eq (defined_as_name world ocl9 nm2) (defined_as_name world ocl9 mnm)
                        && rb_identical rc2 mrecv))
              else VBool false)
           | _ -> VBool false)
@@ -19526,9 +19569,19 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
   else if str_eq cls "MatchData" || str_eq cls "Regexp" then
     (if str_eq n "eql?" then "=="
      else n)
-  else if str_eq cls "TrueClass" || str_eq cls "FalseClass" || str_eq cls "NilClass" then
+  else if str_eq cls "TrueClass" then
+    (if str_eq n "inspect" then "to_s" else n)
+  // FalseClass#^ and NilClass#^ ARE FalseClass#| / NilClass#| (both answer
+  // "is the other operand truthy"); TrueClass#^ is not (it negates).
+  else if str_eq cls "FalseClass" then
     (if str_eq n "inspect" then "to_s"
+     else if str_eq n "^" then "|"
      else n)
+  // NilClass#inspect is NOT #to_s: they answer "nil" and "". The three
+  // singletons were sharing one arm, which only became visible once Method
+  // equality started reaching this table for a primitive receiver.
+  else if str_eq cls "NilClass" then
+    (if str_eq n "^" then "|" else n)
   else if str_eq cls "Module" || str_eq cls "Class" then
     (if str_eq n "module_eval" then "class_eval"
      else if str_eq n "module_exec" then "class_exec"
@@ -20297,6 +20350,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr h -> (let hk = hng_key recv in
                   if (if str_eq hk "" then false else true) && map_has hng_store hk
                   then mkstr (sget h) else recv)
+     // true / false / nil each have ONE to_s string, frozen: ruby answers the
+     // same object every time (`false.to_s.equal?(false.to_s)`), which a fresh
+     // mkstr per call cannot. The intern table `-str` uses answers it.
+     | VBool _ -> str_fstring (mkstr (to_s recv))
+     | VNil -> str_fstring (mkstr "")
      // a Symbol's text carries the encoding to_sym recorded for it.
      | VSym sy ->
        (let c = mkstr sy in
@@ -20304,7 +20362,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
          | VStr cid -> (let _ = (if map_has sym_enc sy then senc_set cid (map_get sym_enc sy) else ()) in c)
          | _ -> c))
      | _ -> mkstr (to_s recv))
-  else if str_eq name "inspect" then mkstr (inspect recv)
+  // true / false / nil inspect to their ONE frozen string too (for the two
+  // booleans `inspect` and `to_s` are the same method, so they must also be
+  // the same object).
+  else if str_eq name "inspect" then
+    (match recv with
+     | VBool _ -> str_fstring (mkstr (inspect recv))
+     | VNil -> str_fstring (mkstr "nil")
+     | _ -> mkstr (inspect recv))
   else if str_eq name "class" then
     // a primitive tagged as a user subclass instance (`class P < String`)
     // reports the subclass, not the builtin base — so `self.class` (and thus
@@ -21126,6 +21191,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VCpx (r, i) -> recv
      | VInt _ -> VCpx (recv, VInt 0) | VBig _ -> VCpx (recv, VInt 0)
      | VFlt _ -> VCpx (recv, VInt 0) | VRat _ -> VCpx (recv, VInt 0)
+     // nil answers the same three conversions Integer does: (0+0i), (0/1), 0.
+     | VNil -> VCpx (VInt 0, VInt 0)
      | VStr h ->
        (let e = enc_canon_name (senc_get h) in
         if enc_ascii_compat e then rb_str_to_c (sget h)
@@ -21233,7 +21300,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // Float#to_r is the float's EXACT value, not a rounded one: 0.1 becomes
   // 3602879701896397/36028797018963968. flt_rat_parts already computes that
   // pair for Rational(), so the branch was missing rather than the arithmetic.
-  else if str_eq name "to_r" then (match recv with VRat (n, d) -> recv | VInt n -> mk_rat n 1 | VBig b -> mk_rat_s b "1" | VFlt f -> (match flt_rat_parts f 0 with (n, d) -> mk_rat_s n d) | VStr h -> rb_str_to_r (sget h) | _ -> (let _ = map_set prim_missing "n" (mkstr "to_r") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_r'")) in fail "mere-ruby: undefined method 'to_r'")))
+  else if str_eq name "to_r" then (match recv with VRat (n, d) -> recv | VInt n -> mk_rat n 1 | VBig b -> mk_rat_s b "1" | VFlt f -> (match flt_rat_parts f 0 with (n, d) -> mk_rat_s n d) | VStr h -> rb_str_to_r (sget h) | VNil -> mk_rat_s "0" "1" | _ -> (let _ = map_set prim_missing "n" (mkstr "to_r") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_r'")) in fail "mere-ruby: undefined method 'to_r'")))
   else if str_eq name "real" then (match recv with VCpx (r, i) -> r | VRat (n, d) -> recv | _ -> recv)
   else if str_eq name "imaginary" || str_eq name "imag" then (match recv with VCpx (r, i) -> i | _ -> VInt 0)
   else if str_eq name "real?" then (match recv with VCpx (r, i) -> VBool false | _ -> VBool true)
@@ -21275,6 +21342,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // which is a different question from to_r's exact value. Integer, Rational and
   // nil answer without searching; a Float searches the half-ulp interval around
   // itself, and an explicit eps searches [x-|eps|, x+|eps|].
+  // NilClass#rationalize is (0/1) whatever the (single) argument -- computing
+  // the tolerance interval first asked nil for arithmetic and failed. Two
+  // arguments is ruby's arity error.
+  else if str_eq name "rationalize" && (match recv with VNil -> true | _ -> false) then
+    (match args with
+     | Cons (_, Cons (_, _)) ->
+       prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+     | _ -> mk_rat_s "0" "1")
   else if str_eq name "rationalize" then
     (let bounds =
        (match args with
