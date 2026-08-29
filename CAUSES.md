@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 392 files.
+Classified: 389 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,7 +53,7 @@ Classified: 392 files.
 
 </details>
 
-## DIFF — 371 files, 101 kinds
+## DIFF — 368 files, 101 kinds
 
 | files | kind |
 |---|---|
@@ -70,18 +70,17 @@ Classified: 392 files.
 | 8 | `FAILED expected N, got nil` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 8 | `FAILED expected "S", got "S"` |
-| 7 | `FAILED expected false, got true` |
+| 6 | `FAILED expected false, got true` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
-| 4 | `FAILED expected not N` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected LocalJumpError to be raised` |
 | 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED raised StandardError, expected ZeroDivisionError` |
+| 3 | `FAILED expected not N` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
-| 3 | `FAILED expected :SYM, got :SYM` |
 | 3 | `FAILED expected "S" to match` |
 | 3 | `ERROR TypeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
@@ -96,6 +95,7 @@ Classified: 392 files.
 | 2 | `FAILED expected NameError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected N ...[clipped]` |
+| 2 | `FAILED expected :SYM, got :SYM` |
 | 2 | `FAILED expected (N/N), got (N/N)` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR SystemStackError` |
@@ -168,9 +168,9 @@ Classified: 392 files.
 | 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
 | 4 | `FAILED: is a public method: expected truthy from #include?` |
-| 4 | `FAILED: expected not 0` |
 | 4 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `FAILED: raised StandardError, expected ZeroDivisionError` |
+| 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `pass=55 fail=0 err=0` |

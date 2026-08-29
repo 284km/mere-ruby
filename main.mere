@@ -6799,6 +6799,17 @@ and hash_eq_unordered = fn (xs: Val list) -> fn (ys: Val list) ->
 and hash_eq_unordered_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val list) ->
   if vllen xs == vllen ys then hash_eq_go_x ident xs ys else false;
 
+// Two keys are the same key when they are EQL?, which is not ==: 1 and 1.0 are
+// equal and not eql?, so `{4 => 0}.include?(4.0)` is false and a hash can hold
+// both. Ruby's rule is "same #hash and #eql?"; across the numeric classes that
+// comes down to the class having to match, which is what this checks.
+let hkey_eql = fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VInt _ -> (match b with VFlt _ -> false | VRat (_, _) -> false | _ -> rb_eq a b)
+  | VBig _ -> (match b with VFlt _ -> false | VRat (_, _) -> false | _ -> rb_eq a b)
+  | VFlt _ -> (match b with VInt _ -> false | VBig _ -> false | VRat (_, _) -> false | _ -> rb_eq a b)
+  | VRat (_, _) -> (match b with VInt _ -> false | VBig _ -> false | VFlt _ -> false | _ -> rb_eq a b)
+  | _ -> rb_eq a b;
 let hkey_same = fn (ident: bool) -> fn (a: Val) -> fn (b: Val) ->
   if ident then
     (match a with
@@ -6808,8 +6819,8 @@ let hkey_same = fn (ident: bool) -> fn (a: Val) -> fn (b: Val) ->
      | VObj x -> (match b with VObj y -> x == y | _ -> false)
      | VProc x -> (match b with VProc y -> x == y | _ -> false)
      // Integers, Symbols, nil and the booleans are their own identity
-     | _ -> rb_eq a b)
-  else rb_eq a b;
+     | _ -> hkey_eql a b)
+  else hkey_eql a b;
 let rec hash_get_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
   match xs with
   | Nil -> VNil
@@ -7362,7 +7373,10 @@ let rec val_hash = fn (v: Val) ->
   // contributes a constant: ruby only requires that equal values hash equal,
   // and two arrays that cycle at the same position agree on it.
   | VArr id ->
-    if map_has cyc_seen ("a" ++ str_of_int id) then 4919
+    // the same collapse-to-a-constant rule the hash arm uses: a cycle detected
+    // at the ARRAY level has to raise the flag too, or a hash that cycles
+    // THROUGH an array (`h[:x] = [h]`) answers a different number per wrapping.
+    if map_has cyc_seen ("a" ++ str_of_int id) then (let _ = map_set cyc_flag "f" 1 in 4919)
     else
       let _ = map_set cyc_seen ("a" ++ str_of_int id) 1 in
       let r = arr_hash_go (deref id) 17 in
@@ -7374,6 +7388,21 @@ let rec val_hash = fn (v: Val) ->
   // (A PROC deliberately does NOT hash by id: `proc(&body)` hands back a fresh
   // proc here where ruby hands back `body` itself, so an id-based hash would
   // make Proc#hash unstable -- a distinction this runtime does not keep.)
+  // a Hash hashes ORDER-INSENSITIVELY: each pair contributes, and the pairs
+  // are combined with a commutative operation so `{a: 1, b: 2}` and
+  // `{b: 2, a: 1}` agree. Every hash answered 0.
+  | VHsh hid ->
+    (if map_has cyc_seen ("h" ++ str_of_int hid) then (let _ = map_set cyc_flag "f" 1 in 5077)
+     else
+       (let _ = map_set cyc_seen ("h" ++ str_of_int hid) 1 in
+        let rec go = fn (ys: Val list) -> fn (acc: int) ->
+          (match ys with
+           | Cons (k, Cons (v, t)) ->
+             go t (floor_mod (acc + floor_mod ((val_hash k * 31 + val_hash v) * 7919 + 13) 1000000007) 1000000007)
+           | _ -> acc) in
+        let r = go (hderef hid) 271 in
+        let _ = map_delete cyc_seen ("h" ++ str_of_int hid) in
+        r))
   | VObj oid -> floor_mod (oid * 2654435761 + 11) 1000000007
   | _ -> 0
 and str_hash_go = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
@@ -9777,11 +9806,11 @@ let rec hash_to_a = fn (xs: Val list) ->
 let rec hash_get = fn (xs: Val list) -> fn (k: Val) ->
   match xs with
   | Nil -> VNil
-  | Cons (k2, rest) -> (match rest with Cons (v, t) -> if rb_eq k2 k then v else hash_get t k | Nil -> VNil);
+  | Cons (k2, rest) -> (match rest with Cons (v, t) -> if hkey_eql k2 k then v else hash_get t k | Nil -> VNil);
 let rec hash_haskey = fn (xs: Val list) -> fn (k: Val) ->
   match xs with
   | Nil -> false
-  | Cons (k2, rest) -> (match rest with Cons (_, t) -> if rb_eq k2 k then true else hash_haskey t k | Nil -> false);
+  | Cons (k2, rest) -> (match rest with Cons (_, t) -> if hkey_eql k2 k then true else hash_haskey t k | Nil -> false);
 // Hash#rassoc(value): the first [key, value] pair with that value.
 let rec hash_rassoc = fn (xs: Val list) -> fn (v: Val) ->
   match xs with
@@ -9830,7 +9859,7 @@ let rec hash_put = fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
   | Nil -> Cons (k, Cons (v, Nil))
   | Cons (k2, rest) ->
     (match rest with
-     | Cons (v2, t) -> if rb_eq k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put t k v))
+     | Cons (v2, t) -> if hkey_eql k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put t k v))
      | Nil -> Cons (k, Cons (v, Nil)));
 // merge other's pairs into base (other wins on conflict).
 let rec hash_merge = fn (base: Val list) -> fn (other: Val list) ->
@@ -9870,7 +9899,7 @@ let rec hash_del = fn (xs: Val list) -> fn (k: Val) ->
   | Nil -> Nil
   | Cons (k2, rest) ->
     (match rest with
-     | Cons (v2, t) -> if rb_eq k2 k then t else Cons (k2, Cons (v2, hash_del t k))
+     | Cons (v2, t) -> if hkey_eql k2 k then t else Cons (k2, Cons (v2, hash_del t k))
      | Nil -> Nil);
 
 // ---- printing (Ruby's to_s / inspect / puts) -----------------------------
@@ -16188,6 +16217,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   else if str_eq name "hash" && (match recv with VArr _ -> true | _ -> false)
           && (if prim_user_has world recv "hash" then false else true) then
     (match recv with VArr id9 -> VInt (arr_hash_w env world id9) | _ -> VNil)
+  // a HASH hashes the same way an array does, cycle rule included: once a
+  // self-reference is seen the whole answer is one constant, so a recursive
+  // hash agrees with itself however deeply it is wrapped.
+  else if str_eq name "hash" && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv "hash" then false else true) then
+    (let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
+     let r9 = val_hash recv in
+     VInt (if map_has cyc_flag "f" then 5077 else r9))
   // Array#initialize (reached through `send`, since it is private): the same
   // conversions and refusals Array.new gets. The primitive had neither, so a
   // size of 2**62 recursed until the stack died and #to_ary was never asked.
@@ -23931,8 +23968,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "assoc" then
     (match recv with
      | VArr id -> (match args with Cons (k, _) -> arr_assoc (deref id) k 0 | _ -> VNil)
+     // Hash#assoc compares with `==`, NOT with the eql? a LOOKUP uses:
+     // `{1.0 => :a}.assoc(1)` is [1.0, :a] while `{1.0 => :a}[1]` is nil.
      | VHsh h -> let xs = hderef h in
-       (match args with Cons (k, _) -> if hash_haskey xs k then arr_new (Cons (k, Cons (hash_get xs k, Nil))) else VNil | _ -> VNil)
+       (match args with
+        | Cons (k, _) ->
+          (let rec go = fn (ys: Val list) ->
+             (match ys with
+              | Cons (k2, Cons (v2, t)) ->
+                (if rb_eq k2 k then arr_new (Cons (k2, Cons (v2, Nil))) else go t)
+              | _ -> VNil) in
+           go xs)
+        | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "assoc") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'assoc'")) in fail "mere-ruby: undefined method 'assoc'")))
   else if str_eq name "rassoc" then
     (match recv with
