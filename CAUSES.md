@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 381 files.
+Classified: 379 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,11 +53,11 @@ Classified: 381 files.
 
 </details>
 
-## DIFF — 360 files, 99 kinds
+## DIFF — 358 files, 99 kinds
 
 | files | kind |
 |---|---|
-| 60 | `ERROR NoMethodError` |
+| 59 | `ERROR NoMethodError` |
 | 22 | `ERROR NameError` |
 | 20 | `FAILED expected truthy from #include?` |
 | 19 | `FAILED expected N, got N` |
@@ -88,7 +88,6 @@ Classified: 381 files.
 | 2 | `FAILED raised NameError, expected TypeError` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected nil, got N` |
-| 2 | `FAILED expected ["S", "S"], got nil` |
 | 2 | `FAILED expected ZeroDivisionError to be raised` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
@@ -136,6 +135,7 @@ Classified: 381 files.
 | 1 | `FAILED expected [N, N, N], got [#<OBJ>]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
+| 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
@@ -223,7 +223,7 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
-| language (4) | `alias keyword_arguments metaclass module` |
+| language (3) | `alias metaclass module` |
 | numeric (2) | `integer real` |
 | threadgroup (1) | `list` |
 | range (1) | `step` |
