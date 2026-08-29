@@ -11602,7 +11602,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          else
            let pcls = class_name other in
            if has_meth world pcls name then invoke world newblk other pcls name args
-           else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'"))
+           // ...and a BUILTIN with a block is still reachable from a bare call:
+           // `frozen_hash.instance_eval { initialize { 5 } }` has to reach
+           // Hash#initialize (it answered "undefined method 'initialize'").
+           else invoke_with_block env world blk other name args newblk)
     else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'")
   // recv.name op= rhs — evaluate recv once (bound to a temp), then read/op/
   // write the attribute through the normal method dispatch.
@@ -16039,6 +16042,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         let out = hash_merge Nil (go (hderef hid)) in
         if str_eq name "transform_keys!" then (let _ = hset hid out in recv) else mkhash out)
      | _ -> recv)
+  // Hash#initialize on a FROZEN hash refuses (it replaces the default either
+  // way), and the primitive has no way to know it was frozen.
+  else if str_eq name "initialize" && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv "initialize" then false else true) then
+    (match recv with
+     | VHsh hid9 ->
+       (if cfrozen_get "h" hid9 then
+          raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+        else prim_method recv "initialize" args)
+     | _ -> VNil)
   // Hash#fetch takes a key and at most one default; Hash#deconstruct_keys takes
   // exactly one argument. Both accepted any number.
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | _ -> false)
@@ -20110,6 +20123,22 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
           let _ = (match hv with VHsh hid -> hdproc_set hid (VProc pid) | _ -> ()) in
           hv))
+       // a SUBCLASS of Hash built with a block is still a hash: it is tagged and
+       // its #initialize runs against real hash storage (`self[:k] = v` in there
+       // has to work). Without this arm the block form made a plain object and
+       // the first `[]=` inside initialize was a NoMethodError.
+       else if str_eq name "new" && (if str_eq c "Hash" then false else obj_is_a world c "Hash") then
+         (let v9 = mkhash Nil in
+          let _ = map_set hng_store (hng_key v9) c in
+          let _ = (if has_meth world c "initialize"
+                   then (let _ = invoke world newblk v9 c "initialize" args in ())
+                   else (match v9 with
+                         | VHsh hid9 ->
+                           (let pid9 = (let np9 = map_len proc_store in
+                                        let _ = store_proc (str_of_int np9) newblk in np9) in
+                            let _ = hdproc_set hid9 (VProc pid9) in ())
+                         | _ -> ())) in
+          v9)
        else if str_eq name "new" then new_obj_wb world c args newblk
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world newblk recv ("(sng:" ++ c ++ ")") name args
        else if has_meth world "Module" name then invoke world newblk recv "Module" name args
@@ -20204,6 +20233,22 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             (let (st, broke, bv) = sort_blk_b world newblk (deref id) in
              let _ = arr_set id st in
              if broke then bv else recv)
+          | _ -> recv)
+       // `h.send(:initialize) { |h, k| ... }` installs the block as the hash's
+       // default_proc (and, like the value form, refuses when frozen).
+       else if str_eq name "initialize" && (match recv with VHsh _ -> true | _ -> false) then
+         (match recv with
+          | VHsh hid9 ->
+            (if cfrozen_get "h" hid9 then
+               raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+             else
+               (let pid9 = (if map_has pending_srcproc "v" then map_get pending_srcproc "v"
+                            else (let np9 = map_len proc_store in
+                                  let _ = store_proc (str_of_int np9) newblk in np9)) in
+                let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+                let _ = (if map_has hash_dflt (str_of_int hid9) then map_delete hash_dflt (str_of_int hid9) else ()) in
+                let _ = hdproc_set hid9 (VProc pid9) in
+                recv))
           | _ -> recv)
        // Hash#delete with a block: the block runs (with the key) when the key
        // is not there, and its value is the answer.
@@ -24003,7 +24048,21 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VNil, Nil) -> arr_new (val_flatten (deref id) (0 - 1))
         | Cons (other, Nil) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
         | _ -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)"))
-     | VHsh h -> arr_new (hderef h)
+     // Hash#flatten(depth): depth 1 (the default) is the flat [k, v, k, v ...]
+     // list, and a DEEPER argument flattens the array values that far --
+     // `{a: [1, [2]]}.flatten(2)` is [:a, 1, [2]]. Any depth answered the same
+     // one-level list, and a non-Integer was accepted.
+     | VHsh h ->
+       (match args with
+        | Nil -> arr_new (hderef h)
+        | Cons (VInt d9, Nil) ->
+          (if d9 <= 1 then arr_new (hderef h)
+           else arr_new (val_flatten (hderef h) (d9 - 1)))
+        | Cons (VNil, Nil) -> arr_new (val_flatten (hderef h) (0 - 1))
+        | Cons (other9, Nil) ->
+          prim_raise "TypeError" ("no implicit conversion of " ++ class_name other9 ++ " into Integer")
+        | _ -> prim_raise "ArgumentError"
+                 ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)"))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "flatten") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten'")) in fail "mere-ruby: undefined method 'flatten'")))
   // (a HASH drops its nil-VALUED pairs; compact! answers nil when there were
   // none, which is the rule about the NAME, not about the type.)
@@ -24639,7 +24698,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (let _ = (match args with
                  | Nil -> arr_set id (Nil : Val list)
                  | _ -> (match array_new_args args with VArr src -> arr_set id (deref src) | _ -> ())) in recv)
-     | VHsh h -> (let _ = (match args with Cons (d, _) -> hdflt_set h d | Nil -> ()) in VNil)
+     // Hash#initialize resets the DEFAULT (and clears the default_proc) without
+     // touching the pairs, and answers self. It answered nil and left a
+     // previously set default in place.
+     | VHsh h ->
+       (let _ = (if map_has hash_dproc (str_of_int h) then map_delete hash_dproc (str_of_int h) else ()) in
+        let _ = (match args with
+                 | Cons (d, _) -> hdflt_set h d
+                 | Nil -> (if map_has hash_dflt (str_of_int h) then map_delete hash_dflt (str_of_int h) else ())) in
+        recv)
      | VStr h -> (let _ = (match args with Cons (v, _) -> sset h (match v with VStr a -> sget a | _ -> to_s v) | Nil -> ()) in VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in (let __fm = ("mere-ruby: undefined method '" ++ name ++ "' for this value") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
   // A class receiver ends up here (invoke_val_c's VClass arm falls through to

@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 386 files.
+Classified: 384 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,7 +53,7 @@ Classified: 386 files.
 
 </details>
 
-## DIFF — 365 files, 101 kinds
+## DIFF — 363 files, 99 kinds
 
 | files | kind |
 |---|---|
@@ -120,7 +120,6 @@ Classified: 386 files.
 | 1 | `FAILED expected truthy from #<=` |
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
-| 1 | `FAILED expected not nil` |
 | 1 | `FAILED expected falsy from #include?` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
@@ -146,7 +145,6 @@ Classified: 386 files.
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected IndexError to be raised` |
-| 1 | `FAILED expected :SYM, got [:SYM, :SYM]` |
 | 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
 | 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
