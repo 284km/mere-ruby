@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 417 files.
+Classified: 413 files.
 
-## CRASH — 23 files, 13 kinds
+## CRASH — 21 files, 13 kinds
 
 | files | kind |
 |---|---|
-| 5 | `stack overflow (recursion too deep)` |
 | 4 | `(no output before aborting)` |
+| 3 | `stack overflow (recursion too deep)` |
 | 2 | `ERROR StandardError` |
 | 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 2 | `*.rb:N: mere-ruby: expected block in TMPDIR near line N` |
@@ -34,8 +34,8 @@ Classified: 417 files.
 
 | files | cause |
 |---|---|
-| 5 | `stack overflow (recursion too deep)` |
 | 4 | `(no output before aborting)` |
+| 3 | `stack overflow (recursion too deep)` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m < 0 and n >= 0: StandardError` |
 | 1 | `ERROR: rescuing SignalException raises a SignalException when sent a signal: NoMethodError` |
@@ -53,7 +53,7 @@ Classified: 417 files.
 
 </details>
 
-## DIFF — 394 files, 109 kinds
+## DIFF — 392 files, 108 kinds
 
 | files | kind |
 |---|---|
@@ -61,7 +61,7 @@ Classified: 417 files.
 | 22 | `ERROR NameError` |
 | 20 | `FAILED expected truthy from #include?` |
 | 20 | `FAILED expected true, got false` |
-| 20 | `FAILED expected N, got N` |
+| 19 | `FAILED expected N, got N` |
 | 19 | `ERROR StandardError` |
 | 15 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected to be identical` |
@@ -141,7 +141,6 @@ Classified: 417 files.
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N], got [#<OBJ>]` |
-| 1 | `FAILED expected [N, N, N, N], got [nil, nil, nil, nil]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |

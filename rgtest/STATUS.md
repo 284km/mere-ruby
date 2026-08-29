@@ -32,7 +32,7 @@ Loaded straight from a rubygems checkout, no shims:
 | file | ruby | mere-ruby |
 |---|---|---|
 | `test_gem_version.rb` | pass=32 fail=0 err=0 | pass=29 fail=0 err=3 |
-| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=25 fail=8 err=2 |
+| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=26 fail=7 err=2 |
 | `test_gem_dependency.rb` | pass=22 fail=0 err=10 | **byte-identical** |
 
 `test_gem_dependency.rb` was `pass=21 fail=1 err=10` and became byte-identical

@@ -852,6 +852,10 @@ let insp_seen = map_new ();
 // would make a hash computed inside it return the cycle constant instead of the
 // real value, and the two walks can in principle nest.
 let cyc_seen = map_new ();
+// set while an array hash walks into a cycle: once a self-reference is seen,
+// the WHOLE hash collapses to one constant, which is how ruby makes
+// `rec.hash == [rec].hash == [[rec]].hash` for `rec = []; rec << rec`.
+let cyc_flag = map_new ();
 // nesting depth of active catch(:tag) blocks (throw without any catch
 // raises UncaughtThrowError immediately).
 let catch_depth = map_new ();
@@ -13671,6 +13675,35 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                 | _ -> 0) in
        let tuples = (if str_eq name "repeated_combination" then arr_rep_combos xs k else arr_rep_perms xs k) in
        iter_each_result (arr_each world encl theblk tuples) recv)
+    // Array#initialize(n) { |i| ... } (through `send`): each index gets the
+    // block's value, and a break answers its value with the prefix kept.
+    else if str_eq name "initialize" then
+      (match args with
+       | Cons (_, Cons (_, Cons (_, _))) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..2)")
+       | _ ->
+         (let a9 = coerce_int_args gc_cenv0 world args in
+          let n9 = array_new_size gc_cenv0 world a9 in
+          // start EMPTY and let the filler grow it, so a break leaves exactly
+          // the values the block produced (pre-filling with nils left them).
+          let _ = arr_set id (Nil : Val list) in
+          match arr_fill_go world encl theblk true id VNil 0 n9 with
+          | FBreak v -> v
+          | _ -> recv))
+    // fill with a block: the block is handed each INDEX and its answer fills
+    // that position (the value forms live in the non-block dispatcher).
+    else if str_eq name "fill" then
+      (match args with
+       | Cons (_, Cons (_, Cons (_, _))) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..2)")
+       | _ ->
+         (let n = val_list_len xs in
+          let (b9, l9) = arr_fill_span gc_cenv0 world n args in
+          match arr_fill_go world encl theblk true id VNil b9 l9 with
+          | FBreak v -> v
+          | _ -> recv))
     // zip with a block yields each tuple and answers NIL (not self).
     else if str_eq name "zip" then
       (match arr_each world encl theblk (val_zip xs args 0 (val_list_len xs)) with
@@ -14223,6 +14256,38 @@ and array_new_args = fn (args: Val list) ->
   | Cons (VArr aid, _) -> arr_new (deref aid)
   | _ -> arr_new Nil
 
+// Array.new / Array#initialize's size: refused BEFORE anything is built.
+// A negative size and one past the array ceiling are both ruby's
+// ArgumentError; `Array.new(2**62)` otherwise recursed until the stack died.
+and array_new_size = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Cons (VInt n, _) ->
+    (if n < 0 then (let _ = raise_exc world "ArgumentError" "negative array size" in 0)
+     else if n > 1073741823 then (let _ = raise_exc world "ArgumentError" "array size too big" in 0)
+     else n)
+  | Cons (VBig _, _) -> (let _ = raise_exc world "ArgumentError" "array size too big" in 0)
+  | Nil -> 0
+  // an ARRAY as the size (with a second argument) is not a size at all, and
+  // neither is a String or any other value that has no #to_int.
+  | Cons (other, _) ->
+    (let _ = raise_exc world "TypeError"
+               ("no implicit conversion of " ++ class_name other ++ " into Integer") in 0)
+
+// the arguments of Array.new / #initialize, with the conversions ruby applies:
+// an object offering #to_ary IS the array, otherwise the first argument is a
+// size (through #to_int) and the second the filler.
+and array_init_args = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> Nil
+  | Cons (VArr _, Nil) -> args
+  | Cons (a0, rest) ->
+    (match a0 with
+     | VObj _ ->
+       (match conv_try env world a0 "to_ary" with
+        | VArr x9 -> (match rest with Nil -> Cons (VArr x9, Nil) | _ -> coerce_int_args env world args)
+        | _ -> coerce_int_args env world args)
+     | _ -> coerce_int_args env world args)
+
 // sum with a block: total of the block values (starting from init).
 and arr_sum_blk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val) ->
   match xs with
@@ -14730,6 +14795,105 @@ and rb_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
 
 // `xs <=> ys` element by element, answering VNil the moment a pair does not
 // compare (ruby's Array#<=>), and the length difference when every pair is 0.
+// Array#fill's span: (start, length) in element positions, from either
+// (start), (start, length) or (range). Ruby's rules differ between the two
+// spellings on purpose -- an index before the front CLAMPS to 0, a range that
+// begins before it is a RangeError -- and a negative or zero length means
+// "change nothing" rather than an error.
+and arr_fill_span = fn env -> fn world -> fn (n: int) -> fn (idxargs: Val list) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let toi9 = fn (v: Val) ->
+    (match v with
+     | VInt k -> k
+     | VFlt f -> int_of_float f
+     | VBig _ -> (let _ = raise_exc world "RangeError" "bignum too big to convert into `long'" in 0)
+     | VObj _ ->
+       (match conv_try env world v "to_int" with
+        | VInt k -> k
+        | _ -> (let _ = raise_exc world "TypeError"
+                          ("no implicit conversion of " ++ class_name v ++ " into Integer") in 0))
+     | other -> (let _ = raise_exc world "TypeError"
+                           ("no implicit conversion of " ++ class_name other ++ " into Integer") in 0)) in
+  // a range bound may be nil (endless / beginless), and an object bound
+  // converts through #to_int like any other.
+  let bnd9 = fn (v: Val) -> fn (dflt: int) ->
+    (match v with VNil -> dflt | other -> toi9 other) in
+  // the ONE-argument form asks the range protocol first, exactly as a subscript
+  // does: an object answering #begin and #end is a range, and a permissive mock
+  // becomes nil..nil -- the whole array. (With a length argument there is no
+  // range, so the object goes straight to #to_int and may be refused.)
+  let idxargs = (match idxargs with
+                 | Cons (VObj _, Nil) ->
+                   (match idxargs with
+                    | Cons (o9, Nil) ->
+                      (if responds world o9 "begin" && responds world o9 "end" then
+                         (let bv9 = invoke_val_c env world nb9 o9 "begin" Nil false in
+                          let ev9 = invoke_val_c env world nb9 o9 "end" Nil false in
+                          let ex9 = (if responds world o9 "exclude_end?"
+                                     then truthy (invoke_val_c env world nb9 o9 "exclude_end?" Nil false)
+                                     else false) in
+                          Cons (VRange (bv9, ev9, ex9), Nil))
+                       else idxargs)
+                    | _ -> idxargs)
+                 | _ -> idxargs) in
+  match idxargs with
+  | Nil -> (0, n)
+  | Cons (VNil, Nil) -> (0, n)
+  | Cons (VRange (lo, hi, ex), rest9) ->
+    (match rest9 with
+     | Cons (_, _) ->
+       (let _ = raise_exc world "TypeError" "wrong number of arguments" in (0, 0))
+     | Nil ->
+       (let b0 = bnd9 lo 0 in
+        let b = (if b0 < 0 then n + b0 else b0) in
+        if b < 0 then
+          (let _ = raise_exc world "RangeError"
+                     (inspect (VRange (lo, hi, ex)) ++ " out of range") in (0, 0))
+        else
+          // an ENDLESS range covers to the end whether or not it is exclusive:
+          // `(3...)` has no end to exclude, and treating nil as "n-1, minus one
+          // for the dots" dropped the last element.
+          (match hi with
+           | VNil -> (b, (if n - b < 0 then 0 else n - b))
+           | _ ->
+             (let e0 = bnd9 hi (n - 1) in
+              let e1 = (if e0 < 0 then n + e0 else e0) in
+              let e2 = (if ex then e1 - 1 else e1) in
+              (b, (if e2 < b then 0 else e2 - b + 1))))))
+  | Cons (st, rest9) ->
+    (let s0 = toi9 st in
+     let sb = (if s0 < 0 then (let k = n + s0 in if k < 0 then 0 else k) else s0) in
+     match rest9 with
+     | Nil -> (sb, (if n - sb < 0 then 0 else n - sb))
+     | Cons (VNil, _) -> (sb, (if n - sb < 0 then 0 else n - sb))
+     | Cons (l9, _) -> (sb, toi9 l9))
+
+// fill positions beg .. beg+len-1, WRITING AFTER EACH ONE so a block that
+// raises leaves the earlier positions changed (and the element it raised on
+// untouched), and padding with nils when the span starts past the end.
+and arr_fill_go = fn world -> fn encl -> fn theblk -> fn (useblk: bool) -> fn (id: int) ->
+                  fn (fillv: Val) -> fn (beg: int) -> fn (len: int) ->
+  let rec go = fn (i: int) ->
+    (if i >= beg + len then FNext VNil
+     else
+       (match (if useblk then run_block world encl theblk (Cons (VInt i, Nil)) else FNext fillv) with
+        | FBreak v -> FBreak v
+        | FReturn v -> FReturn v
+        | f ->
+          (let v9 = (if useblk then flow_value f else fillv) in
+           let cur = deref id in
+           let n9 = val_list_len cur in
+           let base = (if i >= n9 then list_append cur (val_repeat (i - n9 + 1) VNil) else cur) in
+           let _ = arr_set id (val_set_at base i v9) in
+           go (i + 1)))) in
+  // a span that cannot exist is refused BEFORE anything is written: ruby has an
+  // array-size ceiling and raises rather than trying, and `fill(10, 1, 2**62-1)`
+  // otherwise walks until the machine gives out (it took the spec run with it).
+  if len <= 0 then FNext VNil
+  else if beg + len > 1073741823 then
+    (let _ = raise_exc world "RangeError" "array size too big" in FNext VNil)
+  else go beg
+
 and arr_sum_w = fn env -> fn world -> fn (xs: Val list) -> fn (init: Val) ->
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let exact = fn (v: Val) -> (match v with VInt _ -> true | VBig _ -> true | _ -> false) in
@@ -14849,6 +15013,41 @@ and cmp_comparable = fn (a: Val) -> fn (b: Val) ->
       | (VNil, VNil) -> true
       | (VBool _, VBool _) -> true
       | _ -> false)
+
+// Array#hash with the world: an element's #hash is DISPATCHED (and its answer
+// asked #to_int when it is not an Integer), and a cycle anywhere collapses the
+// whole answer to a constant so that a self-referential array hashes the same
+// however deeply it is wrapped. arr_hash_go can do neither -- it has no world,
+// and its per-array guard made the answer depend on the nesting depth.
+and arr_hash_w = fn env -> fn world -> fn (id: int) ->
+  let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
+  let r = arr_hash_rec env world id in
+  if map_has cyc_flag "f" then 4919 else r
+
+and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
+  if map_has cyc_seen ("h" ++ str_of_int id) then (let _ = map_set cyc_flag "f" 1 in 4919)
+  else
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let _ = map_set cyc_seen ("h" ++ str_of_int id) 1 in
+     let rec go = fn (ys: Val list) -> fn (acc: int) ->
+       (match ys with
+        | Nil -> acc
+        | Cons (h, t) ->
+          (let hv = (match h with
+                     | VArr aid -> arr_hash_rec env world aid
+                     | VObj _ ->
+                       (let r9 = invoke_val_c env world nb9 h "hash" Nil false in
+                        match r9 with
+                        | VInt n -> n
+                        | VObj _ ->
+                          (match invoke_val_c env world nb9 r9 "to_int" Nil false with
+                           | VInt n -> n | _ -> 0)
+                        | other -> val_hash other)
+                     | _ -> val_hash h) in
+           go t (floor_mod (acc * 31 + hv) 1000000007))) in
+     let r = go (deref id) 17 in
+     let _ = map_delete cyc_seen ("h" ++ str_of_int id) in
+     r)
 
 and arr_eq_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -15726,6 +15925,52 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // where a naive fold gives 50.00000000000001), and anything else folds with
   // a real `+`, so an object's own + is called. val_sum used arith_bin, which
   // can do neither.
+  else if str_eq name "hash" && (match recv with VArr _ -> true | _ -> false)
+          && (if prim_user_has world recv "hash" then false else true) then
+    (match recv with VArr id9 -> VInt (arr_hash_w env world id9) | _ -> VNil)
+  // Array#initialize (reached through `send`, since it is private): the same
+  // conversions and refusals Array.new gets. The primitive had neither, so a
+  // size of 2**62 recursed until the stack died and #to_ary was never asked.
+  else if str_eq name "initialize" && (match recv with VArr _ -> true | _ -> false)
+          && (if prim_user_has world recv "initialize" then false else true) then
+    // an ARRAY refuses #initialize when frozen even with no arguments (it
+    // replaces the contents either way). A STRING does not -- the no-argument
+    // form changes nothing there -- so this cannot live in is_mutating_method,
+    // which only knows the name.
+    (if val_is_frozen recv then
+       raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+     else
+     (match args with
+     | Cons (_, Cons (_, Cons (_, _))) ->
+       raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..2)")
+     | _ ->
+       (let a9 = array_init_args env world args in
+        let _ = (match a9 with
+                 | Cons (VArr _, Nil) -> 0
+                 | Nil -> 0
+                 | _ -> array_new_size env world a9) in
+        prim_method recv "initialize" a9)))
+  // Array#fill without a block: (filler), (filler, start), (filler, start,
+  // length) or (filler, range). Only the first form existed -- everything else
+  // filled the whole array, and the block forms did nothing at all.
+  else if str_eq name "fill" && (match recv with VArr _ -> true | _ -> false)
+          && (if prim_user_has world recv "fill" then false else true) then
+    (match recv with
+     | VArr id ->
+       (match args with
+        | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 0..3)"
+        | Cons (_, Cons (_, Cons (_, Cons (_, _)))) ->
+          raise_exc world "ArgumentError"
+            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..3)")
+        | Cons (fv, idxs) ->
+          (let n = val_list_len (deref id) in
+           let (b9, l9) = arr_fill_span env world n idxs in
+           let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+           match arr_fill_go world noblk9 noblk9 false id fv b9 l9 with
+           | FBreak v -> v
+           | _ -> recv))
+     | _ -> VNil)
   else if str_eq name "sum" && (match recv with VArr _ -> true | _ -> false)
           && (if prim_user_has world recv "sum" then false else true)
           && (match args with Nil -> true | Cons (_, Nil) -> true | _ -> false) then
@@ -16134,7 +16379,19 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Array.new(n) takes a COUNT, so an object that answers #to_int is one --
     // `Array.new(o)` came back empty rather than [nil].
     else if str_eq c "Array" && str_eq name "new" then
-      array_new_args (coerce_int_args env world args)
+      (match args with
+       | Cons (_, Cons (_, Cons (_, _))) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..2)")
+       | _ ->
+         (let a9 = array_init_args env world args in
+          match a9 with
+          | Cons (VArr aid9, Nil) -> arr_new (deref aid9)
+          | Nil -> arr_new (Nil : Val list)
+          | _ -> (let n9 = array_new_size env world a9 in
+                  match a9 with
+                  | Cons (_, Cons (d9, _)) -> arr_new (val_repeat n9 d9)
+                  | _ -> arr_new (val_repeat n9 VNil))))
     // allocate makes an empty instance without running #initialize.
     // Time.now / Time.at(sec): the same minimal Time object new_obj builds,
     // seeded from the clock rather than from calendar arguments.
@@ -19453,7 +19710,22 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if str_eq name "instance_eval" then
          (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class world c bb3))
        else if str_eq c "Array" && str_eq name "new" then
-         (match args with Cons (VInt n, _) -> arr_new (array_new_blk world blk newblk n 0) | _ -> arr_new Nil)
+         // Array.new(n) { |i| ... }: the block's value per index, with the same
+         // size refusal the value form gets (and a break answers its value).
+         (match args with
+          | Nil -> arr_new (Nil : Val list)
+          | _ ->
+            (let a9 = coerce_int_args env world args in
+             let n9 = array_new_size env world a9 in
+             let av9 = arr_new (Nil : Val list) in
+             match av9 with
+             | VArr aid9 ->
+               // a `break` in the block is the CALL's answer, not the array
+               // (array_new_blk read the break value as an element).
+               (match arr_fill_go world blk newblk true aid9 VNil 0 n9 with
+                | FBreak v -> v
+                | _ -> av9)
+             | _ -> av9))
        // Hash.new { |h, k| ... }: the block becomes the default for a miss.
        else if str_eq c "Hash" && str_eq name "new" then
          (let hv = mkhash Nil in
@@ -23875,10 +24147,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // to it. Returns nil, as Ruby's does.
   else if str_eq name "initialize" then
     (match recv with
+     // Array#initialize REPLACES self (it is what `Array.new` runs), and
+     // answers self rather than nil -- `[].send(:initialize, 3, :a)` is
+     // [:a, :a, :a]. It also refuses a negative or impossible size, which is
+     // checked in the world-level arm that converts the arguments.
      | VArr id ->
        (let _ = (match args with
-                 | Nil -> ()
-                 | _ -> (match array_new_args args with VArr src -> arr_set id (deref src) | _ -> ())) in VNil)
+                 | Nil -> arr_set id (Nil : Val list)
+                 | _ -> (match array_new_args args with VArr src -> arr_set id (deref src) | _ -> ())) in recv)
      | VHsh h -> (let _ = (match args with Cons (d, _) -> hdflt_set h d | Nil -> ()) in VNil)
      | VStr h -> (let _ = (match args with Cons (v, _) -> sset h (match v with VStr a -> sget a | _ -> to_s v) | Nil -> ()) in VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in (let __fm = ("mere-ruby: undefined method '" ++ name ++ "' for this value") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
