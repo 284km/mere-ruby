@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 413 files.
+Classified: 398 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,20 +53,20 @@ Classified: 413 files.
 
 </details>
 
-## DIFF — 392 files, 108 kinds
+## DIFF — 377 files, 103 kinds
 
 | files | kind |
 |---|---|
 | 65 | `ERROR NoMethodError` |
 | 22 | `ERROR NameError` |
 | 20 | `FAILED expected truthy from #include?` |
-| 20 | `FAILED expected true, got false` |
 | 19 | `FAILED expected N, got N` |
 | 19 | `ERROR StandardError` |
-| 15 | `FAILED expected ArgumentError to be raised` |
+| 16 | `FAILED expected true, got false` |
+| 14 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected to be identical` |
-| 13 | `ERROR ArgumentError` |
 | 11 | `FAILED expected TypeError to be raised` |
+| 9 | `ERROR ArgumentError` |
 | 8 | `FAILED expected N, got nil` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 8 | `FAILED expected "S", got "S"` |
@@ -77,13 +77,13 @@ Classified: 413 files.
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected LocalJumpError to be raised` |
 | 4 | `FAILED expected "S", got nil` |
-| 4 | `ERROR TypeError` |
 | 3 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
 | 3 | `FAILED expected :SYM, got :SYM` |
 | 3 | `FAILED expected "S" to match` |
+| 3 | `ERROR TypeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED raised NameError, expected TypeError` |
@@ -106,9 +106,6 @@ Classified: 413 files.
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
-| 1 | `FAILED matcher did not match #<OBJ>` |
-| 1 | `FAILED expected {N=>N, N=>N}, got {}` |
-| 1 | `FAILED expected {N=>N, N=>N}, got {N=>N}` |
 | 1 | `FAILED expected {:SYM=>N}, got {}` |
 | 1 | `FAILED expected {:SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
@@ -122,13 +119,11 @@ Classified: 413 files.
 | 1 | `FAILED expected truthy from #<=` |
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
-| 1 | `FAILED expected not {N=>N}` |
 | 1 | `FAILED expected not nil` |
 | 1 | `FAILED expected falsy from #include?` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
 | 1 | `FAILED expected a #<OBJ>>, got #<OBJ>` |
-| 1 | `FAILED expected [{}, nil], got nil` |
 | 1 | `FAILED expected [], got nil` |
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
 | 1 | `FAILED expected [], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
@@ -170,11 +165,10 @@ Classified: 413 files.
 
 | files | cause |
 |---|---|
-| 15 | `FAILED: expected ArgumentError to be raised` |
+| 14 | `FAILED: expected ArgumentError to be raised` |
 | 11 | `FAILED: expected TypeError to be raised` |
 | 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
-| 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
 | 4 | `FAILED: is a public method: expected truthy from #include?` |
 | 4 | `FAILED: expected not 0` |
 | 4 | `FAILED: expected LocalJumpError to be raised` |
@@ -205,11 +199,12 @@ Classified: 413 files.
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
-| 1 | `FAILED: uses the default proc to compute a default value, passing given key: expected [{}, nil], got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
-| 1 | `FAILED: tries to convert the passed argument to a hash using #to_hash: expected {1=>2, 3=>4}, got {}` |
-| 1 | `FAILED: tries to convert the passed argument to a hash using #to_hash: expected {1=>2, 3=>4}, got {3=>4}` |
+| 1 | `FAILED: the String shows the method name, Module defined in and Module extracted from: expected "#<UnboundMethod:0xADDR>" to match` |
+| 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
+| 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
+| 1 | `FAILED: samples evenly: expected truthy from #<=` |
 
 </details>
 

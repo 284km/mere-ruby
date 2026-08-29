@@ -502,6 +502,11 @@ let proc_arity = map_new ();
 // arity (a lambda yielded to raises ArgumentError on a count mismatch, unlike
 // a plain block). This threads lambda-ness through the existing 4-tuple.
 let lambda_blk_marker = "__lambda_blk__";
+// `m(&pr)`: the PROC the block came from. `Hash.new(&pr).default_proc` has to
+// be pr itself, and a block carries no identity of its own -- the same
+// carry-the-origin slot pattern `pending_home` already uses, written by
+// coerce_to_block and cleared by every other block path so it is never stale.
+let pending_srcproc = map_new ();
 // display name for an anonymous class/module once it is assigned to a
 // constant (internal "AnonClass_N"/"AnonModule_N" -> the constant's name).
 let anon_name = map_new ();
@@ -856,6 +861,19 @@ let cyc_seen = map_new ();
 // the WHOLE hash collapses to one constant, which is how ruby makes
 // `rec.hash == [rec].hash == [[rec]].hash` for `rec = []; rec << rec`.
 let cyc_flag = map_new ();
+// Hash#compare_by_identity: the marked hashes, by handle id. Their lookups
+// compare keys with `equal?` rather than `==`, so two equal Strings are two
+// different keys.
+let hcbi = map_new ();
+let hcbi_on = fn (id: int) -> map_has hcbi (str_of_int id);
+// a hash DERIVED from one that compares by identity keeps the flag: select,
+// reject, except, slice, dup and clone all answer a compare_by_identity? hash
+// in ruby. Every derived hash was built with a plain mkhash, which loses it.
+let hcbi_copy = fn (src: int) -> fn (dst: Val) ->
+  match dst with
+  | VHsh d -> (if map_has hcbi (str_of_int src) then map_set hcbi (str_of_int d) 1 else ())
+  | _ -> ();
+
 // nesting depth of active catch(:tag) blocks (throw without any catch
 // raises UncaughtThrowError immediately).
 let catch_depth = map_new ();
@@ -6688,7 +6706,22 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
      | _ -> false)
   | VNil -> (match vb with VNil -> true | _ -> false)
   | VArr x -> (match vb with VArr y -> if x == y then true else eq_list (deref x) (deref y) | _ -> false)
-  | VHsh xs -> let xs = hderef xs in (match vb with VHsh ys -> let ys = hderef ys in hash_eq_unordered xs ys | _ -> false)
+  // two hashes are == only if they compare keys the SAME WAY: a
+  // compare_by_identity hash is never == a plain one, and two identity hashes
+  // are compared BY IDENTITY (which is how a dup of one, holding two distinct
+  // but equal-looking keys, comes out equal to it).
+  | VHsh xs0 ->
+    (match vb with
+     | VHsh ys0 ->
+       // ...and the flags are compared only when BOTH have pairs: two empty
+       // hashes are equal however they look keys up (ruby's rule exactly).
+       (let e9 = (match hderef xs0 with Nil -> true | _ -> false) in
+        let f9 = (match hderef ys0 with Nil -> true | _ -> false) in
+        if e9 || f9 then hash_eq_unordered (hderef xs0) (hderef ys0)
+        else if (if hcbi_on xs0 then true else false) == (if hcbi_on ys0 then true else false)
+        then hash_eq_unordered_x (hcbi_on xs0) (hderef xs0) (hderef ys0)
+        else false)
+     | _ -> false)
   // object identity (same handle); classes and symbols by value.
   | VObj x -> (match vb with VObj y -> x == y | _ -> false)
   | VClass x -> (match vb with VClass y -> str_eq x y | _ -> false)
@@ -6731,14 +6764,67 @@ and hlookup_eq = fn (ys: Val list) -> fn (k: Val) ->
   match ys with
   | Cons (yk, Cons (yv, rest)) -> if rb_eq k yk then Cons (yv, Nil) else hlookup_eq rest k
   | _ -> Nil
+// ...and the identity form, which is the same walk with `equal?` for the key.
+and hlookup_eq_x = fn (ident: bool) -> fn (ys: Val list) -> fn (k: Val) ->
+  match ys with
+  | Cons (yk, Cons (yv, rest)) ->
+    // (hkey_same's rule, written out: it is defined after this rec group.)
+    (let same9 = (if ident then
+                    (match (k, yk) with
+                     | (VStr x9, VStr y9) -> x9 == y9
+                     | (VArr x9, VArr y9) -> x9 == y9
+                     | (VHsh x9, VHsh y9) -> x9 == y9
+                     | (VObj x9, VObj y9) -> x9 == y9
+                     | (VProc x9, VProc y9) -> x9 == y9
+                     | _ -> rb_eq k yk)
+                  else rb_eq k yk) in
+     if same9 then Cons (yv, Nil) else hlookup_eq_x ident rest k)
+  | _ -> Nil
 and hash_eq_go = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
   | Cons (k, Cons (v, rest)) ->
     (match hlookup_eq ys k with Cons (yv, _) -> if rb_eq v yv then hash_eq_go rest ys else false | _ -> false)
   | _ -> true
+and hash_eq_go_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, rest)) ->
+    (match hlookup_eq_x ident ys k with
+     | Cons (yv, _) -> (if rb_eq v yv then hash_eq_go_x ident rest ys else false)
+     | _ -> false)
+  | _ -> true
 and vllen = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + vllen t
 and hash_eq_unordered = fn (xs: Val list) -> fn (ys: Val list) ->
-  if vllen xs == vllen ys then hash_eq_go xs ys else false;
+  if vllen xs == vllen ys then hash_eq_go xs ys else false
+and hash_eq_unordered_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val list) ->
+  if vllen xs == vllen ys then hash_eq_go_x ident xs ys else false;
+
+let hkey_same = fn (ident: bool) -> fn (a: Val) -> fn (b: Val) ->
+  if ident then
+    (match a with
+     | VStr x -> (match b with VStr y -> x == y | _ -> false)
+     | VArr x -> (match b with VArr y -> x == y | _ -> false)
+     | VHsh x -> (match b with VHsh y -> x == y | _ -> false)
+     | VObj x -> (match b with VObj y -> x == y | _ -> false)
+     | VProc x -> (match b with VProc y -> x == y | _ -> false)
+     // Integers, Symbols, nil and the booleans are their own identity
+     | _ -> rb_eq a b)
+  else rb_eq a b;
+let rec hash_get_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (k2, rest) -> (match rest with Cons (v, t) -> if hkey_same ident k2 k then v else hash_get_x ident t k | Nil -> VNil);
+let rec hash_haskey_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> false
+  | Cons (k2, rest) -> (match rest with Cons (_, t) -> if hkey_same ident k2 k then true else hash_haskey_x ident t k | Nil -> false);
+let rec hash_put_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+  match xs with
+  | Nil -> Cons (k, Cons (v, Nil))
+  | Cons (k2, rest) ->
+    (match rest with
+     | Cons (v2, t) -> if hkey_same ident k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put_x ident t k v))
+     | Nil -> Cons (k, Cons (v, Nil)));
+
 
 // numeric / string ordering: negative | zero | positive like a compare fn.
 // ---- bignum: schoolbook arithmetic on canonical decimal strings ----------
@@ -9737,37 +9823,6 @@ let rec hash_pairs = fn (xs: Val list) ->
 let rec hash_len = fn (xs: Val list) ->
   match xs with Nil -> 0 | Cons (_, rest) -> (match rest with Cons (_, t) -> 1 + hash_len t | Nil -> 0);
 // update key k to v (in place order), or append if absent.
-// Hash#compare_by_identity: the marked hashes, by handle id. Their lookups
-// compare keys with `equal?` rather than `==`, so two equal Strings are two
-// different keys.
-let hcbi = map_new ();
-let hcbi_on = fn (id: int) -> map_has hcbi (str_of_int id);
-let hkey_same = fn (ident: bool) -> fn (a: Val) -> fn (b: Val) ->
-  if ident then
-    (match a with
-     | VStr x -> (match b with VStr y -> x == y | _ -> false)
-     | VArr x -> (match b with VArr y -> x == y | _ -> false)
-     | VHsh x -> (match b with VHsh y -> x == y | _ -> false)
-     | VObj x -> (match b with VObj y -> x == y | _ -> false)
-     | VProc x -> (match b with VProc y -> x == y | _ -> false)
-     // Integers, Symbols, nil and the booleans are their own identity
-     | _ -> rb_eq a b)
-  else rb_eq a b;
-let rec hash_get_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
-  match xs with
-  | Nil -> VNil
-  | Cons (k2, rest) -> (match rest with Cons (v, t) -> if hkey_same ident k2 k then v else hash_get_x ident t k | Nil -> VNil);
-let rec hash_haskey_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
-  match xs with
-  | Nil -> false
-  | Cons (k2, rest) -> (match rest with Cons (_, t) -> if hkey_same ident k2 k then true else hash_haskey_x ident t k | Nil -> false);
-let rec hash_put_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
-  match xs with
-  | Nil -> Cons (k, Cons (v, Nil))
-  | Cons (k2, rest) ->
-    (match rest with
-     | Cons (v2, t) -> if hkey_same ident k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put_x ident t k v))
-     | Nil -> Cons (k, Cons (v, Nil)));
 
 let rec hash_put = fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
   match xs with
@@ -11359,8 +11414,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
     let newblk = (match bp with
-                  | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else blk_capture blk (true, bp, bb, env) bb
-                  | _ -> blk_capture blk (true, bp, bb, env) bb) in
+                  | Cons (c, Nil) ->
+                    (if str_eq c "&coerce"
+                     then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
+                     else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+                           blk_capture blk (true, bp, bb, env) bb))
+                  | _ -> (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+                          blk_capture blk (true, bp, bb, env) bb)) in
     // Kernel#loop: run the block until break (or a StopIteration raise).
     if str_eq name "loop" && (if map_has meths "loop" then false else true) then
       run_loop_builtin env world blk (true, bp, bb, env)
@@ -11990,6 +12050,28 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              str_eq op ">=" || str_eq op "<=>") &&
             (match va0 with VClass _ -> true | _ -> false) then
       invoke_val_c env world blk va0 op (Cons (vb, Nil)) false
+    // Hash#< / #<= / #> / #>= are the SUBSET relation, not a value comparison:
+    // `h1 <= h2` is "every pair of h1 is in h2", and the strict forms also
+    // require different sizes. They had no arm at all, so the pair fell through
+    // to the value comparison and raised.
+    else if (str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">=")
+            && (match va0 with VHsh _ -> true | _ -> false) then
+      (match va0 with
+       | VHsh ha ->
+         (match vb with
+          | VHsh hb ->
+            (let xs = hderef ha in
+             let ys = hderef hb in
+             let na = hash_len xs in
+             let nb2 = hash_len ys in
+             let ci = hcbi_on ha || hcbi_on hb in
+             if str_eq op "<" then VBool (na < nb2 && hash_subset_of world xs ys ci)
+             else if str_eq op "<=" then VBool (hash_subset_of world xs ys ci)
+             else if str_eq op ">" then VBool (nb2 < na && hash_subset_of world ys xs ci)
+             else VBool (hash_subset_of world ys xs ci))
+          | _ -> raise_exc world "TypeError"
+                   ("no implicit conversion of " ++ class_name vb ++ " into Hash"))
+       | _ -> VNil)
     // Array <=> Array through the OPERATOR: the same element-by-element answer
     // the method form gives, nil included. This arm was missing, so the pair
     // fell through to the value-level comparison, which raises where ruby
@@ -13002,6 +13084,12 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
   // clear it here to keep it from leaking into a later method's frame.
   let _ = if map_has pending_home "v" then map_delete pending_home "v" else () in
+  // ...and the pending SOURCE PROC with it: it is only valid between
+  // `m(&pr)`'s conversion and the method reading it. Once any block body
+  // starts running, a `Hash.new { }` inside would otherwise pick up the proc
+  // that was passed to the OUTER call (`instance_exec(&blk)` made every hash
+  // built inside default to blk itself, which then ran again).
+  let _ = if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else () in
   let (has, params00, body, cenv) = theblk in
   // a proc/lambda that captured its defining method's block carries a yblk
   // marker: strip it and use that captured block as `encl` so `yield` inside
@@ -13856,8 +13944,13 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else prim_method recv name args
   | VHsh xs -> let xs = hderef xs in
     if str_eq name "each" || str_eq name "each_pair" then iter_each_result (hash_each world encl theblk xs) recv
-    else if str_eq name "select" || str_eq name "filter" then iter_result (hash_filter world encl theblk xs Nil true) recv
-    else if str_eq name "reject" then iter_result (hash_filter world encl theblk xs Nil false) recv
+    // select / reject answer a NEW hash, which keeps the receiver's
+    // compare_by_identity flag (ruby's rule for every derived hash).
+    else if str_eq name "select" || str_eq name "filter" || str_eq name "reject" then
+      (let src9 = (match recv with VHsh h9 -> h9 | _ -> 0) in
+       match hash_filter world encl theblk xs Nil (if str_eq name "reject" then false else true) with
+       | FNext r9 -> (let _ = hcbi_copy src9 r9 in iter_result (FNext r9) recv)
+       | other -> iter_result other recv)
     else if str_eq name "transform_values" then iter_result (FNext (mkhash (hash_tv world encl theblk xs))) recv
     else if str_eq name "transform_keys" then iter_result (FNext (mkhash (hash_tk world encl theblk xs))) recv
     else if str_eq name "each_key" then iter_each_result (hash_each_one world encl theblk xs true) recv
@@ -15019,6 +15112,14 @@ and cmp_comparable = fn (a: Val) -> fn (b: Val) ->
 // whole answer to a constant so that a self-referential array hashes the same
 // however deeply it is wrapped. arr_hash_go can do neither -- it has no world,
 // and its per-array guard made the answer depend on the nesting depth.
+// is every pair of `xs` present in `ys` with an equal value? (Hash#<=)
+and hash_subset_of = fn world -> fn (xs: Val list) -> fn (ys: Val list) -> fn (ci: bool) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (if hash_haskey_x ci ys k && rb_eq (hash_get_x ci ys k) v
+     then hash_subset_of world t ys ci else false)
+  | _ -> true
+
 and arr_hash_w = fn env -> fn world -> fn (id: int) ->
   let _ = (if map_has cyc_flag "f" then map_delete cyc_flag "f" else ()) in
   let r = arr_hash_rec env world id in
@@ -15464,6 +15565,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                           || str_eq name "product"
                           || str_eq name "zip")
               then coerce_dyck_args env world recv args0
+              // Hash's hash-taking methods accept anything with #to_hash
+              // (merge, update, replace) -- an object argument was skipped
+              // entirely, so `h.merge(obj)` answered h unchanged.
+              else if (match recv with VHsh _ -> true | _ -> false)
+                      && (str_eq name "merge" || str_eq name "merge!"
+                          || str_eq name "update" || str_eq name "replace") then
+                (let rec ch9 = fn (az: Val list) ->
+                   (match az with
+                    | Nil -> (Nil : Val list)
+                    | Cons (a9, t9) ->
+                      (let a2 = (match a9 with
+                                 | VObj _ -> (match conv_try env world a9 "to_hash" with
+                                              | VHsh x9 -> VHsh x9
+                                              | _ -> a9)
+                                 | _ -> a9) in
+                       Cons (a2, ch9 t9))) in
+                 ch9 args0)
               // Array#join / Array#* take a STRING separator: #to_str decides,
               // and `*` falls back to the Integer meaning when it is absent.
               // An EMPTY array's join must not ask at all -- the spec pins
@@ -15794,17 +15912,50 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     (match recv with VHsh hid -> hdproc_get hid | _ -> VNil)
   // `h.default_proc = proc { |hash, key| ... }`: the same default a block
   // given to Hash.new installs, set after the fact. nil removes it.
+  // Hash#default(key) with a default PROC calls it with (hash, key); with no
+  // argument the proc is not called at all. The primitive has no world to call
+  // it with, so it answered the (absent) plain default.
+  else if str_eq name "default" && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (_, _) -> true | _ -> false) then
+    (match recv with
+     | VHsh hid ->
+       (match hdproc_get hid with
+        | VProc pid9 ->
+          (match args with
+           | Cons (k9, _) -> flow_value (run_block world noblk (proc_as_block pid9) (Cons (recv, Cons (k9, Nil))))
+           | Nil -> hdflt_get hid)
+        | _ -> hdflt_get hid)
+     | _ -> VNil)
   else if str_eq name "default_proc=" && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
      | VHsh hid ->
-       (match args with
-        | Cons (VProc pid, _) ->
-          let _ = (if map_has hash_dflt (str_of_int hid) then map_delete hash_dflt (str_of_int hid) else ()) in
-          let _ = hdproc_set hid (VProc pid) in VProc pid
-        | Cons (VNil, _) ->
-          let _ = (if map_has hash_dproc (str_of_int hid) then map_delete hash_dproc (str_of_int hid) else ()) in VNil
-        | Cons (other, _) -> raise_exc world "TypeError" ("wrong default_proc type " ++ class_name other ++ " (expected Proc)")
-        | _ -> VNil)
+       // a frozen hash refuses it; a non-Proc is asked #to_proc; and a LAMBDA
+       // must take exactly two arguments (hash, key) -- ruby checks the arity
+       // and answers TypeError, not a call-time ArgumentError.
+       (if cfrozen_get "h" hid then
+          raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+        else
+        (let a0 = (match args with
+                   | Cons (VProc p9, _) -> VProc p9
+                   | Cons (VNil, _) -> VNil
+                   | Cons (o9, _) ->
+                     (match conv_try env world o9 "to_proc" with
+                      | VProc p9 -> VProc p9
+                      | _ -> raise_exc world "TypeError"
+                               ("wrong default_proc type " ++ class_name o9 ++ " (expected Proc)"))
+                   | Nil -> VNil) in
+         match a0 with
+         | VProc pid ->
+           (let ar9 = (match map_get proc_store (str_of_int pid) with
+                       | (_, ps9, _, _) -> mandatory_pos_count ps9 (Nil : (str * Expr) list)) in
+            if map_has lambda_ids (str_of_int pid) && (if ar9 == 2 then false else true) then
+              raise_exc world "TypeError" "default_proc takes two arguments (2 for 1)"
+            else
+              (let _ = (if map_has hash_dflt (str_of_int hid) then map_delete hash_dflt (str_of_int hid) else ()) in
+               let _ = hdproc_set hid (VProc pid) in
+               (match args with Cons (orig9, _) -> orig9 | Nil -> VProc pid)))
+         | _ ->
+           (let _ = (if map_has hash_dproc (str_of_int hid) then map_delete hash_dproc (str_of_int hid) else ()) in VNil)))
      | _ -> VNil)
   else if str_eq name "[]" && (match recv with VHsh hid -> (match hdproc_get hid with VProc _ -> true | _ -> false) | _ -> false)
           && (match args with
@@ -16375,7 +16526,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       if rng_bad_bounds world lo hi then raise_exc world "ArgumentError" "bad value for range"
       else VRange (lo, hi, excl)
     else if str_eq c "Hash" && str_eq name "new" then
-      (let hv = mkhash Nil in (match args with Cons (d, _) -> (match hv with VHsh id -> let _ = hdflt_set id d in hv | _ -> hv) | _ -> hv))
+      // at most ONE default value (and never together with a block, which the
+      // block form refuses): `Hash.new(5, 6)` is a wrong-arity call.
+      (match args with
+       | Cons (_, Cons (_, _)) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+       | _ ->
+         (let hv = mkhash Nil in
+          (match args with
+           | Cons (d, _) -> (match hv with VHsh id -> let _ = hdflt_set id d in hv | _ -> hv)
+           | _ -> hv)))
     // Array.new(n) takes a COUNT, so an object that answers #to_int is one --
     // `Array.new(o)` came back empty rather than [nil].
     else if str_eq c "Array" && str_eq name "new" then
@@ -16481,7 +16642,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Hash" && str_eq name "try_convert" then
       (match args with
        | Cons (VHsh hid, _) -> VHsh hid
-       | Cons (VObj oid, _) -> (if responds world (VObj oid) "to_hash" then invoke_val_c env world noblk (VObj oid) "to_hash" Nil false else VNil)
+       // a #to_hash answering nil declines; one answering a NON-hash is the
+       // object lying about its type, which is a TypeError rather than itself.
+       | Cons (VObj oid, _) ->
+         (if responds world (VObj oid) "to_hash" then
+            (match invoke_val_c env world noblk (VObj oid) "to_hash" Nil false with
+             | VHsh r9 -> VHsh r9
+             | VNil -> VNil
+             | ov -> raise_exc world "TypeError"
+                       ("can't convert " ++ class_name (VObj oid) ++ " into Hash ("
+                        ++ class_name (VObj oid) ++ "#to_hash gives " ++ class_name ov ++ ")"))
+          else VNil)
        | _ -> VNil)
     else if str_eq c "Array" && str_eq name "try_convert" then
       (match args with
@@ -19211,6 +19382,7 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   | VProc pid ->
     // forward the proc's home frame so the callee's `break` targets it.
     let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
+    let _ = map_set pending_srcproc "v" pid in
     proc_as_block pid
   | VNil -> (false, (Nil : str list), (Nil : Stmt list), env)
   | VSym s -> (true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil), env)
@@ -19728,11 +19900,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              | _ -> av9))
        // Hash.new { |h, k| ... }: the block becomes the default for a miss.
        else if str_eq c "Hash" && str_eq name "new" then
+         (match args with
+          | Cons (_, _) ->
+            raise_exc world "ArgumentError" "wrong number of arguments (given 1, expected 0)"
+          | Nil ->
          (let hv = mkhash Nil in
-          let pid = map_len proc_store in
-          let _ = store_proc (str_of_int pid) newblk in
+          // `Hash.new(&pr)`: the default_proc IS pr, not a copy of its body.
+          let pid = (if map_has pending_srcproc "v" then map_get pending_srcproc "v"
+                     else (let np = map_len proc_store in
+                           let _ = store_proc (str_of_int np) newblk in np)) in
+          let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
           let _ = (match hv with VHsh hid -> hdproc_set hid (VProc pid) | _ -> ()) in
-          hv)
+          hv))
        else if str_eq name "new" then new_obj_wb world c args newblk
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world newblk recv ("(sng:" ++ c ++ ")") name args
        else if has_meth world "Module" name then invoke world newblk recv "Module" name args
@@ -22044,7 +22223,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (let cp = (match recv with
                | VArr id -> arr_new (deref id)
                | VStr h -> (let c2 = mkstr (sget h) in (match c2 with VStr nid -> (let _ = senc_set nid (senc_get h) in c2) | _ -> c2))
-               | VHsh h -> mkhash (hderef h)
+               // a copy of a compare_by_identity hash compares that way too.
+               | VHsh h -> (let c3 = mkhash (hderef h) in let _ = hcbi_copy h c3 in c3)
                | _ -> recv) in
      // #clone carries the frozen state over, #dup drops it. `clone(freeze: false)` opts out.
      let was_frozen = (match recv with VStr id -> sfrozen_get id | VArr id -> cfrozen_get "a" id | VHsh id -> cfrozen_get "h" id | _ -> false) in
@@ -23233,7 +23413,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr "chop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chop'")) in fail "mere-ruby: undefined method 'chop'")))
   // Hash#slice returns a sub-hash; for String and Array slice IS []
   else if str_eq name "slice" && (match recv with VHsh _ -> true | _ -> false) then
-    (match recv with VHsh xs -> mkhash (hash_slice (hderef xs) args) | _ -> recv)
+    (match recv with
+     | VHsh xs -> (let r9 = mkhash (hash_slice (hderef xs) args) in
+                   let _ = hcbi_copy xs r9 in r9)
+     | _ -> recv)
   else if str_eq name "slice" then prim_method recv "[]" args
   else if str_eq name "tr" then
     (match recv with
@@ -23785,7 +23968,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // with `equal?`. Ruby rehashes on the spot, and an already-populated hash
   // can end up with duplicate-looking keys -- so do the same.
   else if str_eq name "compare_by_identity" && (match recv with VHsh _ -> true | _ -> false) then
-    (match recv with VHsh hid -> let _ = map_set hcbi (str_of_int hid) 1 in recv | _ -> recv)
+    (match recv with
+     // marking a hash changes how it looks keys up, which a frozen hash refuses.
+     | VHsh hid -> (if cfrozen_get "h" hid then
+                      prim_raise "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+                    else (let _ = map_set hcbi (str_of_int hid) 1 in recv))
+     | _ -> recv)
   else if str_eq name "compare_by_identity?" then
     (match recv with VHsh hid -> VBool (hcbi_on hid) | _ -> VBool false)
   else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh xs -> mkhash (hderef xs) | VNil -> mkhash Nil | _ -> (let _ = map_set prim_missing "n" (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
@@ -24083,18 +24271,34 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "each_pair" && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with VHsh xs -> arr_new (hash_pairs (hderef xs)) | _ -> VNil)
   else if str_eq name "merge" then
-    (match recv with VHsh xs -> mkhash (hash_merge_all (hderef xs) args) | _ -> (let _ = map_set prim_missing "n" (mkstr "merge") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge'")) in fail "mere-ruby: undefined method 'merge'")))
+    // merge answers a NEW hash that keeps the receiver's default, default_proc
+    // and compare_by_identity flag (it is derived from it, not built fresh).
+    (match recv with VHsh xs -> (let r9 = mkhash (hash_merge_all (hderef xs) args) in
+                                 let _ = hcbi_copy xs r9 in
+                                 let _ = (match r9 with
+                                          | VHsh d9 ->
+                                            (let _ = (match hdflt_get xs with
+                                                      | VNil -> () | dv -> (let _ = hdflt_set d9 dv in ())) in
+                                             (match hdproc_get xs with
+                                              | VProc pp -> (let _ = hdproc_set d9 (VProc pp) in ())
+                                              | _ -> ()))
+                                          | _ -> ()) in
+                                 r9)
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "merge") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge'")) in fail "mere-ruby: undefined method 'merge'")))
   else if str_eq name "merge!" || str_eq name "update" then
     (match recv with VHsh h -> let _ = hset h (hash_merge_all (hderef h) args) in recv | _ -> (let _ = map_set prim_missing "n" (mkstr "merge!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge!'")) in fail "mere-ruby: undefined method 'merge!'")))
   else if str_eq name "default" then (match recv with VHsh hid -> hdflt_get hid | _ -> VNil)
   else if str_eq name "default=" then
     (match recv with
      | VHsh hid ->
-       (match args with
-        | Cons (d, _) ->
-          let _ = (if map_has hash_dproc (str_of_int hid) then map_delete hash_dproc (str_of_int hid) else ()) in
-          let _ = hdflt_set hid d in d
-        | _ -> VNil)
+       (if cfrozen_get "h" hid then
+          prim_raise "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+        else
+        (match args with
+         | Cons (d, _) ->
+           let _ = (if map_has hash_dproc (str_of_int hid) then map_delete hash_dproc (str_of_int hid) else ()) in
+           let _ = hdflt_set hid d in d
+         | _ -> VNil))
      | _ -> VNil)
   // sample / shuffle
   else if str_eq name "sample" then
@@ -24113,14 +24317,32 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // replace swaps the contents in place, so every alias of the hash sees it.
   else if str_eq name "replace" && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
-     | VHsh h -> (match args with Cons (VHsh o, _) -> let _ = hset h (hderef o) in recv | _ -> recv)
+     // replace takes on the ARGUMENT's default, default_proc and identity flag
+     // and DROPS its own -- self becomes a copy of the other hash.
+     | VHsh h ->
+       (match args with
+        | Cons (VHsh o, _) ->
+          (let _ = hset h (hderef o) in
+           let _ = (if map_has hcbi (str_of_int h) then map_delete hcbi (str_of_int h) else ()) in
+           let _ = hcbi_copy o recv in
+           let _ = (match hdflt_get o with
+                    | VNil -> (let _ = hdflt_set h VNil in ())
+                    | dv -> (let _ = hdflt_set h dv in ())) in
+           let _ = (match hdproc_get o with
+                    | VProc pp -> (let _ = hdproc_set h (VProc pp) in ())
+                    | _ -> (if map_has hash_dproc (str_of_int h) then map_delete hash_dproc (str_of_int h) else ())) in
+           recv)
+        | Cons (other, _) ->
+          prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Hash")
+        | _ -> recv)
      | _ -> recv)
   else if str_eq name "fetch_values" then
     (match recv with
      | VHsh xs -> let xs = hderef xs in arr_new (hash_fetch_values xs args)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "fetch_values") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fetch_values'")) in fail "mere-ruby: undefined method 'fetch_values'")))
   else if str_eq name "except" then
-    (match recv with VHsh xs -> mkhash (hash_except (hderef xs) args) | _ -> (let _ = map_set prim_missing "n" (mkstr "except") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'except'")) in fail "mere-ruby: undefined method 'except'")))
+    (match recv with VHsh xs -> (let r9 = mkhash (hash_except (hderef xs) args) in
+                                 let _ = hcbi_copy xs r9 in r9) | _ -> (let _ = map_set prim_missing "n" (mkstr "except") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'except'")) in fail "mere-ruby: undefined method 'except'")))
   else if str_eq name "invert" then
     (match recv with VHsh xs -> mkhash (hash_invert (hderef xs)) | _ -> (let _ = map_set prim_missing "n" (mkstr "invert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'invert'")) in fail "mere-ruby: undefined method 'invert'")))
   else if str_eq name "fetch" then
