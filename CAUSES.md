@@ -10,25 +10,23 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 432 files.
+Classified: 417 files.
 
-## CRASH — 26 files, 15 kinds
+## CRASH — 23 files, 13 kinds
 
 | files | kind |
 |---|---|
 | 5 | `stack overflow (recursion too deep)` |
-| 5 | `(no output before aborting)` |
+| 4 | `(no output before aborting)` |
 | 2 | `ERROR StandardError` |
 | 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 2 | `*.rb:N: mere-ruby: expected block in TMPDIR near line N` |
-| 1 | `FAILED expected true, got false` |
 | 1 | `ERROR NoMethodError` |
 | 1 | `*.rb:N: wrong number of arguments (given N, expected N) (ArgumentError)` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
 | 1 | `*.rb:N: undefined method 'S' for an instance of Object (NoMethodError)` |
 | 1 | `*.rb:N: mere-ruby: unterminated string in TMPDIR near line N` |
-| 1 | `*.rb:N: mere-ruby: unexpected end of input in TMPDIR near line N` |
 | 1 | `*.rb:N: mere-ruby: undefined method 'S' for class KernelSpecs::CalleeTest` |
 | 1 | `*.rb:N: mere-ruby: undefined method 'S' for class DefineSingletonMethodSpecClass` |
 
@@ -37,8 +35,7 @@ Classified: 432 files.
 | files | cause |
 |---|---|
 | 5 | `stack overflow (recursion too deep)` |
-| 5 | `(no output before aborting)` |
-| 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
+| 4 | `(no output before aborting)` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m < 0 and n >= 0: StandardError` |
 | 1 | `ERROR: rescuing SignalException raises a SignalException when sent a signal: NoMethodError` |
@@ -47,7 +44,6 @@ Classified: 432 files.
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
 | 1 | `*.rb:N: undefined method 'each' for an instance of Object (NoMethodError)` |
 | 1 | `*.rb:N: mere-ruby: unterminated string in TMPDIR near line 645` |
-| 1 | `*.rb:N: mere-ruby: unexpected end of input in TMPDIR near line 91` |
 | 1 | `*.rb:N: mere-ruby: undefined method 'define_singleton_method' for class DefineSingletonMethodSpecClass` |
 | 1 | `*.rb:N: mere-ruby: undefined method '__callee__' for class KernelSpecs::CalleeTest` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 66` |
@@ -57,23 +53,23 @@ Classified: 432 files.
 
 </details>
 
-## DIFF — 406 files, 115 kinds
+## DIFF — 394 files, 109 kinds
 
 | files | kind |
 |---|---|
 | 65 | `ERROR NoMethodError` |
 | 22 | `ERROR NameError` |
-| 21 | `FAILED expected true, got false` |
-| 21 | `FAILED expected N, got N` |
 | 20 | `FAILED expected truthy from #include?` |
+| 20 | `FAILED expected true, got false` |
+| 20 | `FAILED expected N, got N` |
 | 19 | `ERROR StandardError` |
 | 15 | `FAILED expected ArgumentError to be raised` |
-| 14 | `ERROR ArgumentError` |
 | 13 | `FAILED expected to be identical` |
+| 13 | `ERROR ArgumentError` |
 | 11 | `FAILED expected TypeError to be raised` |
-| 10 | `FAILED expected "S", got "S"` |
 | 8 | `FAILED expected N, got nil` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 8 | `FAILED expected "S", got "S"` |
 | 7 | `FAILED expected false, got true` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
@@ -83,7 +79,6 @@ Classified: 432 files.
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `ERROR TypeError` |
 | 3 | `FAILED raised StandardError, expected ZeroDivisionError` |
-| 3 | `FAILED expected [N, N, N, N], got []` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
@@ -99,6 +94,7 @@ Classified: 432 files.
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
+| 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected N ...[clipped]` |
 | 2 | `FAILED expected (N/N), got (N/N)` |
 | 2 | `ERROR SystemStackError` |
@@ -128,7 +124,6 @@ Classified: 432 files.
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected not {N=>N}` |
 | 1 | `FAILED expected not nil` |
-| 1 | `FAILED expected nil, got []` |
 | 1 | `FAILED expected falsy from #include?` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
@@ -140,24 +135,19 @@ Classified: 432 files.
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
 | 1 | `FAILED expected [[N], {:SYM=>N}, #<OBJ>], got [[N], {:SYM=>N}, #<OBJ>]` |
 | 1 | `FAILED expected [[N, N], [N, N], [N, N]], got [[N, N], [N, N], [N, N]]` |
-| 1 | `FAILED expected [[N, N, N], [N, N, N], [N, N, N], [N, N, N], [N, N, N], [N, N, N]], got [[N, N], [N, N]]` |
 | 1 | `FAILED expected [["S", "S"], ["S", "S"]], got [[["S", "S"]], [["S", "S"]]]` |
 | 1 | `FAILED expected [N, N], got nil` |
 | 1 | `FAILED expected [N, N], got []` |
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N], got [#<OBJ>]` |
-| 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N]` |
-| 1 | `FAILED expected [N, N, N, N, N, N, N], got [N, N, N, N, N]` |
+| 1 | `FAILED expected [N, N, N, N], got [nil, nil, nil, nil]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
-| 1 | `FAILED expected [:SYM, :SYM, N], got [:SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
-| 1 | `FAILED expected ["S", N, "S", N, N, "S", nil, "S"], got ["S", N, "S", N, N, "S", "S"]` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected N, got true` |
-| 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
@@ -194,7 +184,6 @@ Classified: 432 files.
 | 3 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `pass=55 fail=0 err=0` |
 | 2 | `pass=52 fail=0 err=0` |
-| 2 | `FAILED: yields in turn the last length-1 values from the array: expected [2, 3, 4, 5], got []` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns the original name even when aliased twice: expected :foo, got :bar` |
@@ -215,12 +204,13 @@ Classified: 432 files.
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=157 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
-| 1 | `FAILED: yields each element to the block even if the array is changed during iteration: expected [1, 2, 3, 4, 5, 7, 9], got [1, 2, 3, 4, 5]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: uses the default proc to compute a default value, passing given key: expected [{}, nil], got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
+| 1 | `FAILED: tries to convert the passed argument to a hash using #to_hash: expected {1=>2, 3=>4}, got {}` |
+| 1 | `FAILED: tries to convert the passed argument to a hash using #to_hash: expected {1=>2, 3=>4}, got {3=>4}` |
 
 </details>
 
