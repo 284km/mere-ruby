@@ -16021,10 +16021,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   else if (str_eq name "transform_keys" || str_eq name "transform_values"
            || str_eq name "transform_keys!" || str_eq name "transform_values!")
           && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv name then false else true)
           && (match args with Nil -> true | _ -> false) then
     make_enum_a world recv name args
   else if (str_eq name "transform_keys" || str_eq name "transform_keys!")
           && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv name then false else true)
           && (match args with Cons (VHsh _, _) -> true | _ -> false) then
     (match (recv, args) with
      | (VHsh hid, Cons (VHsh mid, _)) ->
@@ -16040,6 +16042,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // Hash#fetch takes a key and at most one default; Hash#deconstruct_keys takes
   // exactly one argument. Both accepted any number.
   else if str_eq name "fetch" && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv "fetch" then false else true)
           && (match args with
               | Nil -> true
               | Cons (_, Cons (_, Cons (_, _))) -> true
@@ -16047,13 +16050,32 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     raise_exc world "ArgumentError"
       ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
   else if str_eq name "deconstruct_keys" && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv "deconstruct_keys" then false else true)
           && (match args with Cons (_, Nil) -> false | _ -> true) then
     raise_exc world "ArgumentError"
       ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
+  // `h[missing]` asks the RECEIVER for its default, so a subclass that
+  // overrides #default answers it (the primitive read the stored default and
+  // never asked). The plain default is what Hash#default itself answers, so
+  // this only needs to fire when the class has its own.
+  else if str_eq name "[]" && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (_, Nil) -> true | _ -> false)
+          && has_meth world (dispatch_cls_of world recv) "default"
+          && (match recv with
+              | VHsh hid9 -> (match args with
+                              | Cons (k9, _) -> (if hash_haskey_x (hcbi_on hid9) (hderef hid9) k9 then false else true)
+                              | _ -> false)
+              | _ -> false) then
+    (match args with
+     | Cons (k9, _) -> invoke_val_c env world noblk recv "default" (Cons (k9, Nil)) false
+     | _ -> VNil)
   // Hash#default(key) with a default PROC calls it with (hash, key); with no
   // argument the proc is not called at all. The primitive has no world to call
   // it with, so it answered the (absent) plain default.
   else if str_eq name "default" && (match recv with VHsh _ -> true | _ -> false)
+          // ...unless the receiver's class has its own #default (a subclass
+          // hook): a builtin arm must never win over a definition.
+          && (if prim_user_has world recv "default" then false else true)
           && (match args with Cons (_, _) -> true | _ -> false) then
     (match recv with
      | VHsh hid ->
@@ -16064,7 +16086,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            | Nil -> hdflt_get hid)
         | _ -> hdflt_get hid)
      | _ -> VNil)
-  else if str_eq name "default_proc=" && (match recv with VHsh _ -> true | _ -> false) then
+  else if str_eq name "default_proc=" && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv "default_proc=" then false else true) then
     (match recv with
      | VHsh hid ->
        // a frozen hash refuses it; a non-Proc is asked #to_proc; and a LAMBDA
@@ -16776,7 +16799,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Hash[...] takes three shapes: one Hash, one array of [k, v] pairs, or a
     // flat even-length argument list. Only the first was built; the other two
     // answered an empty hash, which is a wrong answer rather than an error.
-    else if str_eq c "Hash" && str_eq name "[]" then hash_bracket world args
+    else if str_eq c "Hash" && str_eq name "[]" then
+      // a SINGLE argument may be an object offering #to_hash or #to_ary --
+      // `Hash[obj]` was a wrong-arity error for anything but a Hash or Array.
+      (let a9 = (match args with
+                 | Cons (VObj _, Nil) ->
+                   (match args with
+                    | Cons (o9, Nil) ->
+                      (match conv_try env world o9 "to_hash" with
+                       | VHsh x9 -> Cons (VHsh x9, Nil)
+                       | _ -> (match conv_try env world o9 "to_ary" with
+                               | VArr y9 -> Cons (VArr y9, Nil)
+                               | _ -> args))
+                    | _ -> args)
+                 | _ -> args) in
+       hash_bracket world a9)
     else if str_eq c "Array" && str_eq name "[]" then arr_new args
     // A subclass inherits the [] constructor: MyArray[1, 2] builds an array
     // tagged with the subclass, WITHOUT calling the subclass's #initialize
@@ -18609,6 +18646,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match map_get ivars (str_of_int id ++ "@recv") with
           | VStr rh -> VInt (str_rblen rh)
           | _ -> VNil)
+       // a per-element yielder over a HASH knows its size without running --
+       // and MUST not run: materialising `h.transform_values!` would perform
+       // the transformation, so asking its size changed the hash.
+       else if (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
+                | VStr mh -> (let m9 = sget mh in
+                              str_eq m9 "transform_values" || str_eq m9 "transform_values!"
+                              || str_eq m9 "transform_keys" || str_eq m9 "transform_keys!"
+                              || str_eq m9 "each_key" || str_eq m9 "each_value"
+                              || str_eq m9 "each_pair" || str_eq m9 "delete_if" || str_eq m9 "keep_if")
+                | _ -> false)
+               && (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                   | VHsh _ -> true | _ -> false) then
+         (match map_get ivars (str_of_int id ++ "@recv") with
+          | VHsh rh9 -> VInt (hash_len (hderef rh9))
+          | _ -> VNil)
        else
          (match enum_to_arr env world blk id with
           | VArr aid2 -> VInt (val_list_len (deref aid2))
@@ -20153,6 +20205,21 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              let _ = arr_set id st in
              if broke then bv else recv)
           | _ -> recv)
+       // Hash#delete with a block: the block runs (with the key) when the key
+       // is not there, and its value is the answer.
+       else if str_eq name "delete" && (match recv with VHsh _ -> true | _ -> false) then
+         (match recv with
+          | VHsh h9 ->
+            (match args with
+             | Cons (k9, _) ->
+               (let xs9 = hderef h9 in
+                let ci9 = hcbi_on h9 in
+                if hash_haskey_x ci9 xs9 k9 then
+                  (let v9 = hash_get_x ci9 xs9 k9 in
+                   let _ = hset h9 (hash_del xs9 k9) in v9)
+                else flow_value (run_block world blk newblk (Cons (k9, Nil))))
+             | _ -> VNil)
+          | _ -> VNil)
        // Array#delete with a block: the block runs when NOTHING matched (its
        // value becomes the answer). The block form reached the plain prim,
        // which has no block and answered nil.
@@ -24659,7 +24726,9 @@ and rng_is_int = fn (v: Val) -> match v with VInt _ -> true | _ -> false
 // an ArgumentError, in ruby's words.
 and hash_bracket = fn world -> fn (args: Val list) ->
   match args with
-  | Cons (VHsh h, Nil) -> mkhash (hderef h)
+  // `Hash[other]` copies the pairs AND the identity flag in ruby 3.2 (the spec
+  // says it should not, and ruby fails its own spec there).
+  | Cons (VHsh h, Nil) -> (let r9 = mkhash (hderef h) in let _ = hcbi_copy h r9 in r9)
   | Cons (VArr id, Nil) -> mkhash (hash_from_pairs world (deref id))
   | Nil -> mkhash Nil
   | _ ->
