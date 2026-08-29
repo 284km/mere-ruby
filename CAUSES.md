@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 471 files.
+Classified: 432 files.
 
-## CRASH — 27 files, 15 kinds
+## CRASH — 26 files, 15 kinds
 
 | files | kind |
 |---|---|
-| 6 | `(no output before aborting)` |
 | 5 | `stack overflow (recursion too deep)` |
+| 5 | `(no output before aborting)` |
 | 2 | `ERROR StandardError` |
 | 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 2 | `*.rb:N: mere-ruby: expected block in TMPDIR near line N` |
@@ -36,8 +36,8 @@ Classified: 471 files.
 
 | files | cause |
 |---|---|
-| 6 | `(no output before aborting)` |
 | 5 | `stack overflow (recursion too deep)` |
+| 5 | `(no output before aborting)` |
 | 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m < 0 and n >= 0: StandardError` |
@@ -57,30 +57,30 @@ Classified: 471 files.
 
 </details>
 
-## DIFF — 444 files, 124 kinds
+## DIFF — 406 files, 115 kinds
 
 | files | kind |
 |---|---|
-| 69 | `ERROR NoMethodError` |
-| 23 | `ERROR NameError` |
-| 22 | `FAILED expected true, got false` |
+| 65 | `ERROR NoMethodError` |
+| 22 | `ERROR NameError` |
+| 21 | `FAILED expected true, got false` |
 | 21 | `FAILED expected N, got N` |
-| 21 | `ERROR StandardError` |
 | 20 | `FAILED expected truthy from #include?` |
-| 19 | `FAILED expected ArgumentError to be raised` |
-| 18 | `FAILED expected TypeError to be raised` |
-| 14 | `FAILED expected to be identical` |
+| 19 | `ERROR StandardError` |
+| 15 | `FAILED expected ArgumentError to be raised` |
 | 14 | `ERROR ArgumentError` |
-| 11 | `FAILED expected N, got nil` |
-| 11 | `FAILED expected "S", got "S"` |
+| 13 | `FAILED expected to be identical` |
+| 11 | `FAILED expected TypeError to be raised` |
+| 10 | `FAILED expected "S", got "S"` |
+| 8 | `FAILED expected N, got nil` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 7 | `FAILED expected false, got true` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
-| 5 | `FAILED expected not N` |
-| 5 | `FAILED expected "S", got nil` |
+| 4 | `FAILED expected not N` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected LocalJumpError to be raised` |
+| 4 | `FAILED expected "S", got nil` |
 | 4 | `ERROR TypeError` |
 | 3 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED expected [N, N, N, N], got []` |
@@ -89,11 +89,9 @@ Classified: 471 files.
 | 3 | `FAILED expected :SYM, got nil` |
 | 3 | `FAILED expected :SYM, got :SYM` |
 | 3 | `FAILED expected "S" to match` |
-| 3 | `ERROR FrozenError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED raised NameError, expected TypeError` |
-| 2 | `FAILED matcher did not match #<OBJ>` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected nil, got N` |
 | 2 | `FAILED expected ["S", "S"], got nil` |
@@ -112,11 +110,11 @@ Classified: 471 files.
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
+| 1 | `FAILED matcher did not match #<OBJ>` |
 | 1 | `FAILED expected {N=>N, N=>N}, got {}` |
 | 1 | `FAILED expected {N=>N, N=>N}, got {N=>N}` |
 | 1 | `FAILED expected {:SYM=>N}, got {}` |
 | 1 | `FAILED expected {:SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
-| 1 | `FAILED expected {:SYM=>N, :SYM=>N}, got {:SYM=>N, :SYM=>N, :SYM=>N}` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
 | 1 | `FAILED expected {"S"=>N, "S"=>N}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
@@ -141,24 +139,17 @@ Classified: 471 files.
 | 1 | `FAILED expected [], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
 | 1 | `FAILED expected [[N], {:SYM=>N}, #<OBJ>], got [[N], {:SYM=>N}, #<OBJ>]` |
-| 1 | `FAILED expected [[N, N], [N, N]], got [[N, nil], [N, nil]]` |
 | 1 | `FAILED expected [[N, N], [N, N], [N, N]], got [[N, N], [N, N], [N, N]]` |
 | 1 | `FAILED expected [[N, N, N], [N, N, N], [N, N, N], [N, N, N], [N, N, N], [N, N, N]], got [[N, N], [N, N]]` |
 | 1 | `FAILED expected [["S", "S"], ["S", "S"]], got [[["S", "S"]], [["S", "S"]]]` |
-| 1 | `FAILED expected [NaN], got [NaN]` |
 | 1 | `FAILED expected [N, N], got nil` |
 | 1 | `FAILED expected [N, N], got []` |
-| 1 | `FAILED expected [N, N], got [N]` |
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
-| 1 | `FAILED expected [N, N, N], got []` |
-| 1 | `FAILED expected [N, N, N], got [N, N, N]` |
 | 1 | `FAILED expected [N, N, N], got [#<OBJ>]` |
-| 1 | `FAILED expected [N, N, N, [N, N]], got [N, N, N, N, N]` |
-| 1 | `FAILED expected [N, N, N, N], got [N, N, #<OBJ>, N, N, #<OBJ>]` |
 | 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N], got [N, N, N, N, N]` |
-| 1 | `FAILED expected [N, "S", "S", "S", N], got ["S", "S", "S"]` |
+| 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [:SYM, :SYM, N], got [:SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
 | 1 | `FAILED expected ["S", N, "S", N, N, "S", nil, "S"], got ["S", N, "S", N, N, "S", "S"]` |
@@ -175,7 +166,7 @@ Classified: 471 files.
 | 1 | `FAILED expected :SYM, got [:SYM, :SYM]` |
 | 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
-| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "VSCODE_CRASH_R ...[clipped]` |
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
@@ -190,19 +181,19 @@ Classified: 471 files.
 
 | files | cause |
 |---|---|
-| 19 | `FAILED: expected ArgumentError to be raised` |
-| 18 | `FAILED: expected TypeError to be raised` |
+| 15 | `FAILED: expected ArgumentError to be raised` |
+| 11 | `FAILED: expected TypeError to be raised` |
 | 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
-| 5 | `FAILED: expected not 0` |
 | 4 | `FAILED: retains compare_by_identity flag: expected true, got false` |
 | 4 | `FAILED: is a public method: expected truthy from #include?` |
+| 4 | `FAILED: expected not 0` |
 | 4 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `FAILED: raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
-| 2 | `pass=73 fail=0 err=0` |
-| 2 | `pass=70 fail=0 err=0` |
+| 2 | `pass=55 fail=0 err=0` |
+| 2 | `pass=52 fail=0 err=0` |
 | 2 | `FAILED: yields in turn the last length-1 values from the array: expected [2, 3, 4, 5], got []` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
@@ -220,15 +211,15 @@ Classified: 471 files.
 | 2 | `FAILED: expected NameError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
+| 2 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
 | 1 | `sh: feature_14386: command not found` |
-| 1 | `pass=211 fail=0 err=0` |
+| 1 | `pass=157 fail=0 err=0` |
+| 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: yields each element to the block even if the array is changed during iteration: expected [1, 2, 3, 4, 5, 7, 9], got [1, 2, 3, 4, 5]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
-| 1 | `FAILED: uses the last value of a duplicated key: expected {:a=>3, :b=>2}, got {:a=>1, :b=>2, :a=>3}` |
 | 1 | `FAILED: uses the default proc to compute a default value, passing given key: expected [{}, nil], got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
-| 1 | `FAILED: uses eql? semantics: expected [1.0, 1], got [1.0]` |
 | 1 | `FAILED: uses block to sort array if passed a block: expected [[3, 4], [2, 9], [1, 2]], got [[1, 2], [2, 9], [3, 4]]` |
 
 </details>
@@ -254,8 +245,7 @@ class column says where the weight sits.
 | rational (4) | `divide minus multiply plus` |
 | language (4) | `alias keyword_arguments metaclass module` |
 | hash (4) | `compact deconstruct_keys fetch_values transform_values` |
-| array (4) | `bsearch_index bsearch repeated_combination repeated_permutation` |
-| numeric (3) | `integer modulo real` |
+| numeric (2) | `integer real` |
 | threadgroup (1) | `list` |
 | range (1) | `step` |
 

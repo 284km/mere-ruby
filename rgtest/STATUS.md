@@ -27,13 +27,19 @@ Loaded straight from a rubygems checkout, no shims:
 | `Gem::Dependency` (`requirement` / `type` / `match?` / `=~`) | byte-identical |
 | `lib/**/*.rb` that mere-ruby's parser accepts | **330 / 428** |
 
-## The test suite (2026-08-15)
+## The test suite (2026-08-29)
 
 | file | ruby | mere-ruby |
 |---|---|---|
 | `test_gem_version.rb` | pass=32 fail=0 err=0 | pass=29 fail=0 err=3 |
 | `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=25 fail=8 err=2 |
-| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | pass=21 fail=1 err=10 |
+| `test_gem_dependency.rb` | pass=22 fail=0 err=10 | **byte-identical** |
+
+`test_gem_dependency.rb` was `pass=21 fail=1 err=10` and became byte-identical
+during the Array arc (2026-08-29), which changed several equality paths at once
+(a search compares with the ELEMENT's `#==`; `3.0 == obj` asks the object;
+`Array#==` dispatches per element). Which of them the one failing example
+needed was not isolated.
 
 Eight of test_gem_requirement's examples moved from err to FAIL, with the pass
 count unchanged, when a rescue clause's bare constant started resolving through

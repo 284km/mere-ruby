@@ -6696,7 +6696,19 @@ and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
   | Cons (h, t) ->
     (match ys with
      | Nil -> false
-     | Cons (h2, t2) -> rb_eq h h2 && eq_list t t2)
+     // Array#== compares each pair with rb_equal, which checks IDENTITY before
+     // ==: `[nan] == [nan]` is true for the same Float object even though
+     // `nan == nan` is false. A Float here has no identity to check, so two
+     // NaNs in the same position are taken as that case -- the other one (two
+     // separately produced NaNs, false in ruby) is not expressible.
+     | Cons (h2, t2) ->
+       ((match (h, h2) with
+         // (NaN is the value that is not equal to itself; flt_is_nan is
+         // defined further down the file than this.)
+         | (VFlt f1, VFlt f2) ->
+           (if f1 == f1 then rb_eq h h2 else (if f2 == f2 then false else true))
+         | _ -> rb_eq h h2)
+        && eq_list t t2))
 // Hash#== is order-insensitive: same size and every key maps to an equal
 // value (both are flat [k,v,k,v,...] lists; keys are unique in a hash).
 and hlookup_eq = fn (ys: Val list) -> fn (k: Val) ->
@@ -7253,6 +7265,13 @@ let rec val_hash = fn (v: Val) ->
       let r = arr_hash_go (deref id) 17 in
       let _ = map_delete cyc_seen ("a" ++ str_of_int id) in
       r
+  // an object with no #hash of its own hashes by IDENTITY, so two distinct
+  // objects land in different buckets. Every object answered 0, which made
+  // uniq compare unrelated objects with #eql? and dedup them.
+  // (A PROC deliberately does NOT hash by id: `proc(&body)` hands back a fresh
+  // proc here where ruby hands back `body` itself, so an id-based hash would
+  // make Proc#hash unstable -- a distinction this runtime does not keep.)
+  | VObj oid -> floor_mod (oid * 2654435761 + 11) 1000000007
   | _ -> 0
 and str_hash_go = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
   if i >= str_len s then acc
@@ -7603,7 +7622,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   else if str_eq op "*" then
     (match va with
      | VStr x -> (match vb with VInt y -> (let r = mkstr (str_repeat (sget x) y) in (match r with VStr rid -> let _ = senc_set rid (senc_get x) in r | _ -> r)) | _ -> conv_err vb "Integer")
-     | VArr x -> (match vb with VInt y -> arr_new (list_rep (deref x) y) | _ -> conv_err vb "Integer")
+     // a NEGATIVE count is ruby's ArgumentError, not an empty array: `a * -1`
+     // was answering [] (list_rep stops at zero either way).
+     | VArr x -> (match vb with
+                  | VInt y -> (if y < 0 then prim_raise "ArgumentError" "negative argument"
+                               else arr_new (list_rep (deref x) y))
+                  | _ -> conv_err vb "Integer")
      | VInt x -> (match vb with VInt y -> mul_int_ov x y | VBig y -> norm_big (big_mul_s (str_of_int x) y) | VFlt y -> VFlt (float_of_int x * y) | _ -> coerce_err vb (conv_name va))
      | VBig x -> (match vb with VInt y -> norm_big (big_mul_s x (str_of_int y)) | VBig y -> norm_big (big_mul_s x y) | VFlt y -> VFlt (float_of_str x * y) | _ -> coerce_err vb (conv_name va))
      | VFlt x -> (match vb with VInt y -> VFlt (x * float_of_int y) | VBig y -> VFlt (x * float_of_str y) | VFlt y -> VFlt (x * y) | _ -> coerce_err vb (conv_name va))
@@ -9522,7 +9546,34 @@ let rec rb_upto_bytes = fn (a: int) -> fn (b: int) -> fn (excl: bool) ->
 let rec arr_values_at = fn (xs: Val list) -> fn (idxs: Val list) ->
   match idxs with
   | Nil -> Nil
+  // an index past the end contributes nil (that IS the answer), so this walks
+  // every subscript rather than dropping the ones that miss.
   | Cons (VInt i, t) -> Cons (val_nth xs (if i < 0 then val_len_i xs + i else i), arr_values_at xs t)
+  // a RANGE subscript contributes its whole span (`[1,2,3].values_at(0..1)`
+  // is [1, 2]), and an out-of-range tail contributes nils, exactly as an
+  // integer subscript past the end does.
+  | Cons (VRange (lov, hiv, ex), t) ->
+    // the bounds rule is rng_slice_bounds', written out here because that
+    // function is defined thousands of lines further down -- but with ruby's
+    // `err=1` variant: the END is NOT clamped to the length, so a range that
+    // runs past the end contributes its whole width as nils
+    // (`[].values_at(1..3)` is [nil, nil, nil], not []). Only a negative
+    // begin that stays negative after wrapping is out of range.
+    (let n = val_len_i xs in
+     let st0 = (match lov with VInt a -> a | _ -> 0) in
+     let st = (if st0 < 0 then n + st0 else st0) in
+     let en = (match hiv with
+               | VInt b -> (let b2 = (if b < 0 then n + b else b) in if ex then b2 else b2 + 1)
+               | _ -> n) in
+     let side = fn (v: Val) -> (match v with VInt a -> str_of_int a | _ -> "") in
+     if st < 0 then
+       prim_raise "RangeError"
+         (side lov ++ (if ex then "..." else "..") ++ side hiv ++ " out of range")
+     else
+       (let rec span = fn (k: int) ->
+          if k >= en then arr_values_at xs t
+          else Cons (val_nth xs k, span (k + 1)) in
+        span st))
   | Cons (_, t) -> arr_values_at xs t;
 
 let rec val_list_of_strs = fn (ss: str list) ->
@@ -11535,8 +11586,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let recv = eval_e env world blk recv_e in
        let args = eval_args env world blk arges in
        // a mutating call on a frozen String/Array/Hash raises FrozenError
-       // before the in-place fast paths below (which bypass invoke_val_c).
+       // before the in-place fast paths below (which bypass invoke_val_c) --
+       // except for a yielder called with NO block, which mutates nothing and
+       // hands back an Enumerator (the error waits for its #each).
        let _ = (if is_mutating_method name && val_is_frozen recv
+                   && (if enum_needs_block name then false else true)
+                   && (if delete_is_noop env world recv name args then false else true)
                 then let _ = raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) in ()
                 else ()) in
        // a `self.`-receiver call may reach private methods (always for a
@@ -11733,6 +11788,27 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // BasicObject#!= is `==` negated, so a class that redefines only `==`
     // still answers `!=` through it. A class with its own `!=` keeps it, and
     // an untouched builtin has neither in the table and pays one lookup.
+    // `3.0 == obj` where obj carries its own == is ruby's num_equal: the
+    // comparison is REVERSED (`obj == 3.0`) rather than answered false,
+    // because a numeric cannot know about the object and the object can.
+    // `[2, 3.0, 3, x].find_index(x)` is 1 in ruby for exactly this reason.
+    if (str_eq op "==" || str_eq op "!=")
+       && (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | _ -> false)
+       // ...unless the receiver's own class redefined == (corpus/134 pins that
+       // `1 == 2` follows a redefined Integer#==), which the arms below reach.
+       && (if has_meth world (dispatch_cls_of world va0) "==" then false else true) then
+      (let bv9 = eval_e env world blk b in
+       match bv9 with
+       | VObj _ ->
+         (if has_meth world (dispatch_cls_of world bv9) "==" then
+            (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+             let r9 = truthy (invoke world noblk bv9 (dispatch_cls_of world bv9) "==" (Cons (va0, Nil))) in
+             VBool (if str_eq op "==" then r9 else (if r9 then false else true)))
+          else VBool (if str_eq op "==" then rb_eq va0 bv9 else (if rb_eq va0 bv9 then false else true)))
+       // not an object: the ordinary structural answer (arith_bin has no
+       // equality -- routing == there was "unknown operator: ==").
+       | _ -> VBool (if str_eq op "==" then rb_eq va0 bv9 else (if rb_eq va0 bv9 then false else true)))
+    else
     if str_eq op "!=" && (let dc = dispatch_cls_of world va0 in
                           has_meth world dc "==" && (if has_meth world dc "!=" then false else true)) then
       (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -11826,9 +11902,24 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
 // short-circuit ones are Logic, not Bin), so nothing is evaluated that was
 // not before.
 and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val) -> fn (vb: Val) ->
-    if str_eq op "==" then VBool (rb_eq va0 (vb))
+    // Array#== compares ELEMENT BY ELEMENT with each element's own ==, so an
+    // array of objects that define == compares by their rule. rb_eq is
+    // structural and cannot dispatch, so a pair of arrays whose elements carry
+    // a user == is compared here (`[obj] == [obj2]` answered false).
+    if str_eq op "==" then
+      (match (va0, vb) with
+       | (VArr xa, VArr xb) ->
+         (if elem_has_user_eq world (deref xa) || elem_has_user_eq world (deref xb)
+          then VBool (arr_eq_w env world (deref xa) (deref xb))
+          else VBool (rb_eq va0 (vb)))
+       | _ -> VBool (rb_eq va0 (vb)))
     else if str_eq op "!=" then
-      (if rb_eq va0 (vb) then VBool false else VBool true)
+      (match (va0, vb) with
+       | (VArr xa, VArr xb) ->
+         (if elem_has_user_eq world (deref xa) || elem_has_user_eq world (deref xb)
+          then VBool (if arr_eq_w env world (deref xa) (deref xb) then false else true)
+          else (if rb_eq va0 (vb) then VBool false else VBool true))
+       | _ -> (if rb_eq va0 (vb) then VBool false else VBool true))
     else if str_eq op "===" then
       // TWO QUESTIONS, ONE NAME. `when` needs a truth value, and that is what
       // case_eqq answers. The OPERATOR returns whatever the receiver's #===
@@ -11996,6 +12087,26 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       // conversion asked for is #to_int. The `+` case above already did this
       // for to_str/to_ary; repetition was left refusing an object that answers
       // to_int, which the index and count methods have accepted for a while.
+      // an ARRAY receiver asks #to_str FIRST: `[:a,:b,:c] * obj` where obj has
+      // both conversions is the JOIN ("a2b2c"), not the repetition. A String
+      // receiver has only the count meaning, so it skips this arm.
+      // (asked at most ONCE each: a mock counts its calls, so the decision and
+      // the use have to share the one conversion.)
+      else if str_eq op "*"
+              && (match va0 with VArr _ -> true | _ -> false)
+              && (match vb with VObj _ -> true | _ -> false)
+              && (responds world vb "to_str" || responds world vb "to_int") then
+        (let sv = (if responds world vb "to_str"
+                   then invoke_val_c env world blk vb "to_str" Nil false else VNil) in
+         match sv with
+         | VStr _ ->
+           (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+            invoke_val_c env world nb va0 "join" (Cons (sv, Nil)) false)
+         | _ ->
+           (if responds world vb "to_int"
+            then arith_bin op va0 (invoke_val_c env world blk vb "to_int" Nil false)
+            else raise_exc world "TypeError"
+                   ("no implicit conversion of " ++ class_name vb ++ " into Integer")))
       else if str_eq op "*"
               && (match va0 with VStr _ -> true | VArr _ -> true | _ -> false)
               && (match vb with VObj _ -> true | _ -> false)
@@ -13237,24 +13348,55 @@ and spec_split = fn (spec: str) -> fn (i: int) -> fn (depth: int) -> fn (cur: st
 // bsearch over a list (val_nth is O(n) but fine for spec sizes). The block
 // returns either a bool (find-minimum: first true) or an Integer (find-any:
 // 0 = hit, <0 search left, >0 search right). Returns the matching index or -1.
+// Answers (index, broke, break_value): a `break` in the block leaves BSEARCH,
+// so it cannot be read as a search answer (flow_value alone turned `break 1234`
+// into "the block said 1234" and the search went on). A NUMERIC result is a
+// three-way comparison against zero -- including a FLOAT one, which used to
+// fall in the catch-all and always search left -- and anything that is not
+// numeric, true, false or nil is ruby's TypeError.
 and arr_bsearch = fn world -> fn encl -> fn theblk -> fn (vec: Val list) -> fn (lo: int) -> fn (hi: int) ->
-  if lo >= hi then (if lo < val_list_len vec then arr_bsearch_check world encl theblk vec lo else (0 - 1))
+  if lo >= hi then
+    (if lo < val_list_len vec then arr_bsearch_check world encl theblk vec lo
+     else (0 - 1, false, VNil))
   else
     let mid = (lo + hi) / 2 in
-    (match flow_value (run_block world encl theblk (Cons (val_nth vec mid, Nil))) with
-     | VBool true -> arr_bsearch world encl theblk vec lo mid
-     | VBool false -> arr_bsearch world encl theblk vec (mid + 1) hi
-     | VNil -> arr_bsearch world encl theblk vec (mid + 1) hi
-     | VInt 0 -> mid
-     | VInt k -> if k < 0 then arr_bsearch world encl theblk vec lo mid else arr_bsearch world encl theblk vec (mid + 1) hi
-     | _ -> arr_bsearch world encl theblk vec lo mid)
+    (match run_block world encl theblk (Cons (val_nth vec mid, Nil)) with
+     | FBreak bv -> (0 - 1, true, bv)
+     | fl ->
+       (match flow_value fl with
+        | VBool true -> arr_bsearch world encl theblk vec lo mid
+        | VBool false -> arr_bsearch world encl theblk vec (mid + 1) hi
+        | VNil -> arr_bsearch world encl theblk vec (mid + 1) hi
+        | VInt 0 -> (mid, false, VNil)
+        | VInt k -> if k < 0 then arr_bsearch world encl theblk vec lo mid else arr_bsearch world encl theblk vec (mid + 1) hi
+        | VFlt f ->
+          (if f == 0.0 then (mid, false, VNil)
+           else if f < 0.0 then arr_bsearch world encl theblk vec lo mid
+           else arr_bsearch world encl theblk vec (mid + 1) hi)
+        | VBig b -> (if big_sign b < 0 then arr_bsearch world encl theblk vec lo mid
+                     else arr_bsearch world encl theblk vec (mid + 1) hi)
+        | other ->
+          (let _ = raise_exc world "TypeError"
+                     ("wrong argument type " ++ class_name other
+                      ++ " (must be numeric, true, false or nil)") in (0 - 1, false, VNil))))
 // at convergence (lo==hi), verify the candidate actually satisfies the block
 // (find-minimum can converge on a position past the last true).
 and arr_bsearch_check = fn world -> fn encl -> fn theblk -> fn (vec: Val list) -> fn (i: int) ->
-  (match flow_value (run_block world encl theblk (Cons (val_nth vec i, Nil))) with
-   | VBool true -> i
-   | VInt 0 -> i
-   | _ -> (0 - 1))
+  (match run_block world encl theblk (Cons (val_nth vec i, Nil)) with
+   | FBreak bv -> (0 - 1, true, bv)
+   | fl ->
+     (match flow_value fl with
+      | VBool true -> (i, false, VNil)
+      | VInt 0 -> (i, false, VNil)
+      | VFlt f -> (if f == 0.0 then (i, false, VNil) else (0 - 1, false, VNil))
+      | VBool false -> (0 - 1, false, VNil)
+      | VNil -> (0 - 1, false, VNil)
+      | VInt _ -> (0 - 1, false, VNil)
+      | VBig _ -> (0 - 1, false, VNil)
+      | other ->
+        (let _ = raise_exc world "TypeError"
+                   ("wrong argument type " ++ class_name other
+                    ++ " (must be numeric, true, false or nil)") in (0 - 1, false, VNil))))
 and arr_detect = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> VNil
@@ -13310,6 +13452,21 @@ and arr_cycle = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (n: 
      | FNext _ -> arr_cycle world encl theblk xs (if n < 0 then n else n - 1)
      | other -> other)
 
+// the yielders that take no arguments at all (so a blockless call WITH one is
+// a wrong-arity error rather than an Enumerator). each_slice / each_cons /
+// cycle / each_with_object / each_line take arguments and are deliberately not
+// here.
+and enum_zero_arity = fn (name: str) ->
+  str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
+  str_eq name "find_all" || str_eq name "reject" || str_eq name "flat_map" ||
+  str_eq name "collect_concat" || str_eq name "partition" || str_eq name "group_by" ||
+  str_eq name "sort_by" || str_eq name "sort_by!" || str_eq name "min_by" || str_eq name "max_by" ||
+  str_eq name "minmax_by" || str_eq name "filter_map" || str_eq name "take_while" ||
+  str_eq name "drop_while" || str_eq name "each_with_index" || str_eq name "delete_if" ||
+  str_eq name "keep_if" || str_eq name "select!" || str_eq name "filter!" || str_eq name "reject!" ||
+  str_eq name "each_index" || str_eq name "map!" || str_eq name "collect!" ||
+  str_eq name "bsearch" || str_eq name "bsearch_index" || str_eq name "reverse_each"
+
 // enumerable methods that, called WITHOUT a block, return an Enumerator.
 and enum_needs_block = fn (name: str) ->
   str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
@@ -13332,7 +13489,12 @@ and enum_needs_block = fn (name: str) ->
   str_eq name "each_value" || str_eq name "delete_if" || str_eq name "keep_if" ||
   str_eq name "select!" || str_eq name "reject!" || str_eq name "filter!" ||
   str_eq name "each_index" || str_eq name "map!" || str_eq name "collect!" ||
-  str_eq name "each_with_index"
+  str_eq name "each_with_index" ||
+  // bsearch / bsearch_index / the repeated_* generators yield too, and a
+  // blockless call to any of them is an Enumerator like every other yielder
+  // (these four answered NoMethodError instead).
+  str_eq name "bsearch" || str_eq name "bsearch_index" ||
+  str_eq name "repeated_combination" || str_eq name "repeated_permutation"
 
 and is_enum_method = fn (name: str) ->
   str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
@@ -13469,6 +13631,25 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
       (match args with
        | Cons (VInt k, _) -> iter_each_result (arr_each world encl theblk (arr_permutations xs k)) recv
        | _ -> iter_each_result (arr_each world encl theblk (arr_permutations xs (val_list_len xs))) recv)
+    // product with a block yields every tuple and answers SELF (the block form
+    // reached prim_method, which has no product at all: NoMethodError).
+    else if str_eq name "product" then
+      (let _ = arr_product_guard (val_list_len xs) args in
+       iter_each_result (arr_each world encl theblk (arr_product_n xs args)) recv)
+    // the repeated_* generators with a block yield each tuple and answer self
+    // (a Float length truncates -- the block path does no conversion).
+    else if str_eq name "repeated_combination" || str_eq name "repeated_permutation" then
+      (let k = (match args with
+                | Cons (VInt k9, _) -> k9
+                | Cons (VFlt f9, _) -> int_of_float f9
+                | _ -> 0) in
+       let tuples = (if str_eq name "repeated_combination" then arr_rep_combos xs k else arr_rep_perms xs k) in
+       iter_each_result (arr_each world encl theblk tuples) recv)
+    // zip with a block yields each tuple and answers NIL (not self).
+    else if str_eq name "zip" then
+      (match arr_each world encl theblk (val_zip xs args 0 (val_list_len xs)) with
+       | FBreak v -> v
+       | _ -> VNil)
     else if str_eq name "reduce" || str_eq name "inject" then
       (match args with
        | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
@@ -13479,11 +13660,16 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "all?" then arr_all world encl theblk xs
     else if str_eq name "none?" then arr_none world encl theblk xs
     else if str_eq name "find_index" || str_eq name "index" then arr_find_index world encl theblk xs 0
+    // rindex with a block is the same search from the other end (it had no
+    // block form at all and answered nil).
+    else if str_eq name "rindex" then
+      iter_result (arr_rindex_blk world encl theblk id (val_list_len xs)) recv
     else if str_eq name "bsearch" || str_eq name "bsearch_index" then
       (let vec = xs in
        let n = val_list_len vec in
-       let idx = arr_bsearch world encl theblk vec 0 n in
-       if idx < 0 then VNil
+       let (idx, broke, bv) = arr_bsearch world encl theblk vec 0 n in
+       if broke then bv
+       else if idx < 0 then VNil
        else if str_eq name "bsearch_index" then VInt idx else val_nth vec idx)
     else if str_eq name "flat_map" || str_eq name "collect_concat" then
       (match arr_map world encl theblk xs Nil with
@@ -13495,8 +13681,17 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "chunk" then arr_new (arr_chunk world encl theblk xs)
     else if str_eq name "slice_when" then arr_new (arr_slice_when world encl theblk xs)
     else if str_eq name "chunk_while" then arr_new (arr_chunk_while world encl theblk xs)
-    else if str_eq name "sort_by" then iter_result (FNext (arr_new (extract_vals (sort_by_key world (arr_keyed world encl theblk xs))))) recv
-    else if str_eq name "sort_by!" then (let _ = arr_set id (extract_vals (sort_by_key world (arr_keyed world encl theblk xs))) in iter_result (FNext recv) recv)
+    else if str_eq name "sort_by" then
+      (let (pairs, broke, bv) = arr_keyed_b world encl theblk xs in
+       if broke then bv
+       else iter_result (FNext (arr_new (extract_vals (sort_by_key world pairs)))) recv)
+    else if str_eq name "sort_by!" then
+      (let (pairs, broke, bv) = arr_keyed_b world encl theblk xs in
+       // a break leaves the array as it was (ruby's write-back is what the
+       // break jumps over) and answers the break value.
+       if broke then bv
+       else (let _ = arr_set id (extract_vals (sort_by_key world pairs)) in
+             iter_result (FNext recv) recv))
     else if str_eq name "sum" then (match args with Cons (init, _) -> arr_sum_blk world encl theblk xs init | Nil -> arr_sum_blk world encl theblk xs (VInt 0))
     else if str_eq name "partition" then arr_partition world encl theblk xs Nil Nil
     else if str_eq name "group_by" then arr_group_by world encl theblk xs Nil
@@ -13506,9 +13701,23 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     // to_h { |k, v| [k2, v2] } -- the block maps each element to a pair
     else if str_eq name "to_h" then
       (match arr_map world encl theblk xs Nil with
-       | FNext (VArr aid) -> mkhash (val_to_h (deref aid))
+       // the block's answers go through the SAME validation as plain elements,
+       // so a block returning a 3-element array is an ArgumentError.
+       | FNext (VArr aid) -> mkhash (hash_merge Nil (arr_to_h_pairs gc_cenv0 world (deref aid) 0))
        | FBreak v -> v
        | _ -> mkhash Nil)
+    // uniq / uniq! with a block: the block computes the KEY for each element,
+    // yielded in order, and the first element per key survives.
+    else if str_eq name "uniq" || str_eq name "uniq!" then
+      (match arr_map world encl theblk xs Nil with
+       | FNext (VArr kid) ->
+         (let out = arr_uniq_w gc_cenv0 world xs (deref kid) (Nil : Val list) in
+          if str_eq name "uniq" then arr_new out
+          else (let changed = (if val_list_len out == val_list_len xs then false else true) in
+                let _ = arr_set id out in
+                if changed then recv else VNil))
+       | FBreak v -> v
+       | _ -> recv)
     else if str_eq name "filter_map" then iter_result (arr_filter_map world encl theblk xs Nil) recv
     else if str_eq name "find_all" then iter_result (arr_filter world encl theblk xs Nil true) recv
     else if str_eq name "reverse_each" then iter_each_result (arr_reverse_each world encl theblk xs) recv
@@ -13601,6 +13810,15 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "upto" then
       (match args with
        | Cons (VInt m, _) -> iter_each_result (range_each world encl theblk n m) recv
+       // a FLOAT limit is allowed: it truncates, and Float::INFINITY means no
+       // limit at all (`10.upto(Float::INFINITY)` is how an unbounded counter
+       // is written -- it was refusing with "upto needs an integer").
+       | Cons (VFlt f, _) ->
+         iter_each_result
+           (range_each world encl theblk n
+              (if flt_is_inf f && f > 0.0 then 4611686018427387903
+               else if flt_is_nan f || flt_is_inf f then n - 1
+               else int_of_float f)) recv
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: upto needs an integer")) in fail "mere-ruby: upto needs an integer"))
     else if str_eq name "downto" then
       (match args with
@@ -13664,19 +13882,47 @@ and arr_filter_map = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn
 and arr_reverse_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   arr_each world encl theblk (val_rev xs Nil)
 
-// keep (want=true) or drop (want=false) elements by block truthiness.
-// insertion sort using a block comparator (a.sort { |x,y| ... }).
-and sort_blk = fn world -> fn theblk -> fn (xs: Val list) ->
-  match xs with Nil -> Nil | Cons (h, t) -> insert_blk world theblk h (sort_blk world theblk t)
+// (there is ONE block-comparator rule, in insert_blk_b below. The plain
+// sort_blk / insert_blk pair that used to live here held a second copy of it
+// and lost its last caller when sort / sort! / sort_by moved to the
+// break-aware form.)
 
-and insert_blk = fn world -> fn theblk -> fn (x: Val) -> fn (sorted: Val list) ->
+// sort with a comparator that may `break`: the break value becomes the whole
+// SORT call's result, so it cannot be read as a comparison. Answers
+// (sorted, broke, break_value). (flow_value alone turned `break :a` into a
+// comparison answer and the sort finished normally.)
+and sort_blk_b = fn world -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ((Nil : Val list), false, VNil)
+  | Cons (h, t) ->
+    (let (st, b1, v1) = sort_blk_b world theblk t in
+     if b1 then (st, true, v1) else insert_blk_b world theblk h st)
+
+and insert_blk_b = fn world -> fn theblk -> fn (x: Val) -> fn (sorted: Val list) ->
   match sorted with
-  | Nil -> Cons (x, Nil)
+  | Nil -> (Cons (x, Nil), false, VNil)
   | Cons (h, t) ->
     let amb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
-    let c = (match flow_value (run_block world amb theblk (Cons (x, Cons (h, Nil)))) with VInt n -> n | _ -> 0) in
-    if c <= 0 then Cons (x, sorted) else Cons (h, insert_blk world theblk x t)
+    (match run_block world amb theblk (Cons (x, Cons (h, Nil))) with
+     | FBreak bv -> (sorted, true, bv)
+     | fl ->
+       (let c = (match flow_value fl with
+                 | VInt n -> n
+                 | VBig b -> big_sign b
+                 | VFlt f -> (if f > 0.0 then 1 else if f < 0.0 then 0 - 1 else 0)
+                 | VNil -> (let _ = raise_exc world "ArgumentError"
+                                      ("comparison of " ++ class_name x ++ " with "
+                                       ++ class_name h ++ " failed") in 0)
+                 | VStr _ -> (let _ = raise_exc world "ArgumentError"
+                                        "comparison of String with 0 failed" in 0)
+                 | VSym _ -> (let _ = raise_exc world "ArgumentError"
+                                        "comparison of Symbol with 0 failed" in 0)
+                 | other -> cmp_vals_w world other (VInt 0)) in
+        if c <= 0 then (Cons (x, sorted), false, VNil)
+        else (let (rest, b2, v2) = insert_blk_b world theblk x t in
+              if b2 then (Cons (h, rest), true, v2) else (Cons (h, rest), false, VNil))))
 
+// keep (want=true) or drop (want=false) elements by block truthiness.
 and arr_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val list) -> fn (want: bool) ->
   match xs with
   | Nil -> FNext (arr_new (val_rev acc Nil))
@@ -13686,6 +13932,58 @@ and arr_filter = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (ac
      | f ->
        let keep = if want then truthy (flow_value f) else (if truthy (flow_value f) then false else true) in
        arr_filter world encl theblk t (if keep then Cons (h, acc) else acc) want)
+
+// The in-place forms of filter / map WRITE AFTER EVERY ELEMENT, because that
+// is what makes their half-done state observable: when the block raises on the
+// third element, ruby has already removed (or replaced) the first two and kept
+// the third. Building the whole result and assigning once left the array
+// untouched on a raise, which no rescue can tell from "the block never ran".
+and arr_filter_ip = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (want: bool) ->
+  let rec go = fn (kept: Val list) -> fn (rest: Val list) ->
+    (match rest with
+     | Nil -> FNext (arr_new (val_rev kept Nil))
+     | Cons (h, t) ->
+       (match run_block world encl theblk (Cons (h, Nil)) with
+        | FBreak v -> FBreak v
+        | FReturn v -> FReturn v
+        | f ->
+          (let keep = (if want then truthy (flow_value f)
+                       else (if truthy (flow_value f) then false else true)) in
+           let kept2 = (if keep then Cons (h, kept) else kept) in
+           let _ = arr_set id (list_append (val_rev kept2 Nil) t) in
+           go kept2 t))) in
+  go Nil (deref id)
+
+and arr_map_ip = fn world -> fn encl -> fn theblk -> fn (id: int) ->
+  let rec go = fn (done9: Val list) -> fn (rest: Val list) ->
+    (match rest with
+     | Nil -> FNext (arr_new (val_rev done9 Nil))
+     | Cons (h, t) ->
+       (match run_block world encl theblk (Cons (h, Nil)) with
+        | FBreak v -> FBreak v
+        | FReturn v -> FReturn v
+        | f ->
+          (let d2 = Cons (flow_value f, done9) in
+           let _ = arr_set id (list_append (val_rev d2 Nil) t) in
+           go d2 t))) in
+  go Nil (deref id)
+
+// Array#rindex with a block walks DOWN from the end and re-reads the array
+// every step, because ruby lets the block change it: an element that moved is
+// visited where it now is, and a shrink clamps the cursor (`i0` is the
+// pre-decrement cursor, exactly as CRuby's `while (i--)` reads it).
+and arr_rindex_blk = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (i0: int) ->
+  if i0 <= 0 then FNext VNil
+  else
+    (let i = i0 - 1 in
+     let xs = deref id in
+     match run_block world encl theblk (Cons (val_nth xs i, Nil)) with
+     | FBreak v -> FBreak v
+     | FReturn v -> FReturn v
+     | f ->
+       (if truthy (flow_value f) then FNext (VInt i)
+        else (let n = val_list_len (deref id) in
+              arr_rindex_blk world encl theblk id (if i > n then n else i))))
 
 and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (i: int) ->
   match xs with
@@ -13792,6 +14090,21 @@ and arr_keyed = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   | Cons (h, t) ->
     let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
     Cons (arr_new (Cons (k, Cons (h, Nil))), arr_keyed world encl theblk t)
+
+// sort_by / sort_by! with a key block that may `break`: the break value is the
+// whole call's answer, and the keys computed so far are still keys (sort_by!
+// writes back what it had, which is ruby's "makes some modification"). Answers
+// (pairs_so_far, broke, break_value).
+and arr_keyed_b = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> ((Nil : Val list), false, VNil)
+  | Cons (h, t) ->
+    (match run_block world encl theblk (Cons (h, Nil)) with
+     | FBreak bv -> ((Nil : Val list), true, bv)
+     | fl ->
+       (let k = flow_value fl in
+        let (rest, b2, v2) = arr_keyed_b world encl theblk t in
+        (Cons (arr_new (Cons (k, Cons (h, Nil))), rest), b2, v2)))
 and pair_key = fn (p: Val) -> match p with VArr id -> (match deref id with Cons (k, _) -> k | _ -> VNil) | _ -> VNil
 and pair_val = fn (p: Val) -> match p with VArr id -> (match deref id with Cons (_, Cons (v, _)) -> v | _ -> VNil) | _ -> VNil
 // the world-aware comparator: a sort_by key may be an OBJECT with its own
@@ -13944,6 +14257,20 @@ and blt_alias_lookup = fn world -> fn (anc: str list) -> fn (name: str) ->
     if map_has builtin_alias (a ++ "#" ++ name) then map_get builtin_alias (a ++ "#" ++ name)
     else blt_alias_lookup world rest name
 
+// record that `n1` on `cls` delegates to a BUILTIN. Two things have to happen
+// that a bare map_set does not do: an alias whose source is itself an alias has
+// to point at the real builtin name (`alias old <=>` then `alias <=> old` left
+// `<=>` delegating to `old`, which is not a primitive, so Integer#<=> stayed
+// broken for the rest of the file), and a user-defined method under n1 has to
+// GO, or has_meth keeps answering with the definition the alias replaces.
+and set_builtin_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
+  let (meths9, sup9, ocls9, ivars9) = world in
+  let src = (if map_has builtin_alias (cls ++ "#" ++ n2)
+             then map_get builtin_alias (cls ++ "#" ++ n2) else n2) in
+  let _ = (if map_has meths9 (cls ++ "#" ++ n1) then map_delete meths9 (cls ++ "#" ++ n1) else ()) in
+  let _ = (if map_has undefs (cls ++ "#" ++ n1) then map_delete undefs (cls ++ "#" ++ n1) else ()) in
+  map_set builtin_alias (cls ++ "#" ++ n1) src
+
 // coerce a String/Array method's arguments: a non-String object that
 // responds to #to_str (or non-Array responding to #to_ary) is converted, so
 // String/Array methods that need those arg types work with duck-typed args
@@ -14033,6 +14360,119 @@ and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
      else coerce_str_int_args env world args)
   | _ -> coerce_str_int_args env world args
 
+// Array's index arguments follow the SAME protocol String's do: for a single
+// subscript an object with #begin AND #end is a range (asked BEFORE #to_int --
+// which is how a permissive mock becomes nil..nil, the whole array), a real
+// Range converts its bounds with #to_int, and everything else converts per
+// argument. `values_at` applies it to EVERY argument.
+and coerce_arr_index_args = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // an Array subscript is an Integer or something that converts to one: a
+  // #to_int answering a non-Integer, or no #to_int at all, is ruby's refusal
+  // (a subscript that stays an object made the prim answer nil, which reads
+  // as "no element there" instead of "that is not a subscript").
+  // an index is a C long here, so one that does not fit is a RangeError and
+  // NOT a conversion problem: the value converted fine, it is just too big.
+  // (`array[bignum_value]` answered TypeError, and `array[8e19]` truncated to
+  // whatever int_of_float happened to produce.)
+  let long_flt = fn (f: float) ->
+    (if flt_is_nan f then raise_exc world "RangeError" "float NaN out of range of integer"
+     else if flt_is_inf f then
+       raise_exc world "RangeError"
+         ("float " ++ (if f > 0.0 then "Inf" else "-Inf") ++ " out of range of integer")
+     else if f >= 9223372036854775808.0 || f < 0.0 - 9223372036854775808.0 then
+       raise_exc world "RangeError" ("float " ++ str_of_float f ++ " out of range of integer")
+     else VInt (int_of_float f)) in
+  let toi = fn (v: Val) ->
+    (match v with
+     | VObj _ ->
+       (if responds world v "to_int"
+        then (match invoke_val_c env world nb v "to_int" Nil false with
+              | VInt n -> VInt n
+              | VBig b -> raise_exc world "RangeError" "bignum too big to convert into `long'"
+              | ov -> raise_exc world "TypeError"
+                        ("can't convert " ++ class_name v ++ " to Integer ("
+                         ++ class_name v ++ "#to_int gives " ++ class_name ov ++ ")"))
+        else raise_exc world "TypeError" ("no implicit conversion of " ++ class_name v ++ " into Integer"))
+     | VFlt f -> long_flt f
+     | VBig b -> raise_exc world "RangeError" "bignum too big to convert into `long'"
+     | VNil -> raise_exc world "TypeError" "no implicit conversion from nil to integer"
+     | VStr _ -> raise_exc world "TypeError" "no implicit conversion of String into Integer"
+     | VSym _ -> raise_exc world "TypeError" "no implicit conversion of Symbol into Integer"
+     | _ -> v) in
+  // a range BOUND may be nil -- that is what an endless (`1..`) or beginless
+  // (`..5`) range is -- so the bounds use a lenient conversion while a direct
+  // subscript uses the refusing one above.
+  let bound = fn (v: Val) ->
+    (match v with
+     | VNil -> VNil
+     // everything else is refused exactly as a direct subscript is:
+     // `a["a".."b"]` is a TypeError, not an empty slice.
+     | other -> toi other) in
+  let as_range = fn (v: Val) ->
+    (match v with
+     | VObj _ ->
+       // a Range SUBCLASS instance keeps its bounds in ivars (new_obj_wb), so
+       // it never reaches the #begin/#end protocol below.
+       (let (mw9, sw9, ow9, iw9) = world in
+        let oid9 = (match v with VObj o9 -> o9 | _ -> 0) in
+        if exc_is_a world (map_get ow9 (str_of_int oid9)) "Range"
+           && map_has iw9 (str_of_int oid9 ++ "@__rg_lo") then
+          (let lo9 = map_get iw9 (str_of_int oid9 ++ "@__rg_lo") in
+           let hi9 = map_get iw9 (str_of_int oid9 ++ "@__rg_hi") in
+           let ex9 = (match (if map_has iw9 (str_of_int oid9 ++ "@__rg_ex")
+                             then map_get iw9 (str_of_int oid9 ++ "@__rg_ex") else VBool false) with
+                      | VBool b9 -> b9 | _ -> false) in
+           VRange (bound lo9, bound hi9, ex9))
+        else if responds world v "begin" && responds world v "end" then
+          (let bv = invoke_val_c env world nb v "begin" Nil false in
+           let ev = invoke_val_c env world nb v "end" Nil false in
+           let ex = (if responds world v "exclude_end?"
+                     then truthy (invoke_val_c env world nb v "exclude_end?" Nil false) else false) in
+           VRange (bound bv, bound ev, ex))
+        else toi v)
+     | VRange (lo, hi, ex) -> VRange (bound lo, bound hi, ex)
+     | other -> toi other) in
+  // values_at takes any number of subscripts, each an index or a range;
+  // insert takes an index and then VALUES (which must not be converted);
+  // flatten/rotate take one count; the rest take a subscript and a length.
+  if str_eq name "values_at" then
+    (let rec go = fn (xs: Val list) ->
+       (match xs with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (as_range h, go t)) in
+     go args)
+  else if str_eq name "insert" then
+    (match args with Cons (a0, rest) -> Cons (toi a0, rest) | Nil -> Nil)
+  // `a[i] = v` / `a[i, len] = v` / `a[range] = v`: convert the SUBSCRIPTS and
+  // leave the value (which may be any object) untouched.
+  else if str_eq name "[]=" || str_eq name "store" then
+    // the MULTI-element forms (start+length, or a range) take an ARRAY on the
+    // right, so an object offering #to_ary is converted there -- but the
+    // single-index form assigns the object itself and must not convert.
+    (let rhs = fn (v: Val) ->
+       (match v with
+        | VObj _ -> (match conv_try env world v "to_ary" with VArr x -> VArr x | _ -> v)
+        | _ -> v) in
+     match args with
+     | Cons (a0, Cons (a1, Cons (v, Nil))) -> Cons (toi a0, Cons (toi a1, Cons (rhs v, Nil)))
+     | Cons (a0, Cons (v, Nil)) ->
+       (let r0 = as_range a0 in
+        match r0 with
+        | VRange (_, _, _) -> Cons (r0, Cons (rhs v, Nil))
+        | _ -> Cons (r0, Cons (v, Nil)))
+     | other -> other)
+  // `at` / `delete_at` / `fetch` take an INDEX only -- no range protocol
+  // (`[1,2,3].at(0..1)` is a TypeError in ruby, not a slice), so a permissive
+  // mock must convert through #to_int here rather than become nil..nil.
+  else if str_eq name "flatten" || str_eq name "flatten!"
+          || str_eq name "rotate" || str_eq name "rotate!"
+          || str_eq name "at" || str_eq name "delete_at" || str_eq name "fetch" then
+    (match args with Cons (a0, rest) -> Cons (toi a0, rest) | Nil -> Nil)
+  else
+    (match args with
+     | Cons (a0, Nil) -> Cons (as_range a0, Nil)
+     | Cons (a0, rest) -> Cons (toi a0, coerce_int_args env world rest)
+     | Nil -> Nil)
+
 // A count / index argument is an Integer or something that converts to one:
 // ruby truncates a Float and refuses everything else by name. `[1,2,3].first(2.5)`
 // answered 1 here -- the Float went through untouched and was taken for the
@@ -14044,6 +14484,9 @@ and coerce_count_args = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -
   | Cons (a, rest) ->
     let a2 = (match a with
               | VFlt f -> VInt (int_of_float f)
+              // a count that does not fit a C long is ruby's RangeError, not
+              // a silent truncation: `[1,2].first(2**70)` answered 1.
+              | VBig b -> raise_exc world "RangeError" "bignum too big to convert into `long'"
               | VStr _ -> raise_exc world "TypeError" "no implicit conversion of String into Integer"
               | VNil -> raise_exc world "TypeError" "no implicit conversion from nil into Integer"
               | VSym _ -> raise_exc world "TypeError" "no implicit conversion of Symbol into Integer"
@@ -14052,7 +14495,15 @@ and coerce_count_args = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -
               | VObj _ ->
                 (if responds world a "to_int"
                  then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-                       invoke_val_c env world nb a "to_int" Nil false)
+                       // a #to_int that answers a NON-Integer is the object
+                       // lying about its conversion: ruby names both classes
+                       // rather than treating the call as "no argument".
+                       (match invoke_val_c env world nb a "to_int" Nil false with
+                        | VInt n9 -> VInt n9
+                        | VBig b9 -> VBig b9
+                        | ov9 -> raise_exc world "TypeError"
+                                   ("can't convert " ++ class_name a ++ " to Integer ("
+                                    ++ class_name a ++ "#to_int gives " ++ class_name ov9 ++ ")")))
                  else raise_exc world "TypeError"
                         ("no implicit conversion of " ++ class_name a ++ " into Integer"))
               | _ -> a) in
@@ -14081,16 +14532,15 @@ and coerce_dyck_go = fn env -> fn world -> fn (conv: str) -> fn (args: Val list)
   | Nil -> Nil
   | Cons (a, rest) ->
     let a2 = (match a with
+              // adopt only a real conversion: a mock answers nil for methods it
+              // was not told about, and nil is a decline. conv_try (not
+              // `responds`) is the asker, so a method_missing-based object
+              // converts too.
               | VObj _ ->
-                (if responds world a conv
-                 then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-                       // adopt only a real conversion: a mock answers nil for
-                       // methods it was not told about, and nil is a decline.
-                       (match invoke_val_c env world nb a conv Nil false with
-                        | VStr x -> (if str_eq conv "to_str" then VStr x else a)
-                        | VArr x -> (if str_eq conv "to_ary" then VArr x else a)
-                        | _ -> a))
-                 else a)
+                (match conv_try env world a conv with
+                 | VStr x -> (if str_eq conv "to_str" then VStr x else a)
+                 | VArr x -> (if str_eq conv "to_ary" then VArr x else a)
+                 | _ -> a)
               | _ -> a) in
     Cons (a2, coerce_dyck_go env world conv rest)
 
@@ -14107,6 +14557,19 @@ and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
     if has_meth world (dispatch_cls_of world a) "=="
     then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
     else rb_eq a b
+  // a NUMERIC receiver reverses the question when the other side is an object
+  // with its own == (ruby's num_equal), so `3.0 == x` asks x.
+  | VInt _ -> rb_eq_num_w env world a b
+  | VFlt _ -> rb_eq_num_w env world a b
+  | VBig _ -> rb_eq_num_w env world a b
+  | _ -> rb_eq a b
+
+and rb_eq_num_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
+  match b with
+  | VObj _ ->
+    (if has_meth world (dispatch_cls_of world b) "=="
+     then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
+     else rb_eq a b)
   | _ -> rb_eq a b
 
 // does any element (or any element of a nested pair) define its own ==? Only
@@ -14129,6 +14592,97 @@ and shallow_has_user_eq = fn world -> fn (xs: Val list) ->
     (match h with
      | VObj _ -> if has_meth world (dispatch_cls_of world h) "==" then true else shallow_has_user_eq world t
      | _ -> shallow_has_user_eq world t)
+
+// `frozen_array.delete(x)` where x is NOT there changes nothing, and ruby's
+// FrozenError is about the change, not the call: it answers nil instead. Only
+// Array#delete has this shape, so the predicate names it.
+and delete_is_noop = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  str_eq name "delete"
+  && (match recv with
+      | VArr id -> (match args with
+                    | Cons (v, _) -> (if val_member_w env world (deref id) v then false else true)
+                    | _ -> true)
+      | _ -> false)
+
+// `eql?` semantics, which is NOT `==`: 1.0 and 1 are equal and not eql?, so
+// uniq keeps both. Two objects are compared by #hash FIRST and only then by
+// #eql? (ruby never asks eql? when the hashes differ), and an object is always
+// eql? to itself. uniq used rb_eq and collapsed [1.0, 1] to one element.
+and rb_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  match a with
+  | VInt _ -> (match b with VFlt _ -> false | _ -> rb_eq a b)
+  | VBig _ -> (match b with VFlt _ -> false | _ -> rb_eq a b)
+  | VFlt _ -> (match b with VInt _ -> false | VBig _ -> false | _ -> rb_eq a b)
+  | VObj ia ->
+    (match b with
+     | VObj ib ->
+       (let ha = invoke_val_c env world nb9 a "hash" Nil false in
+        let hb = invoke_val_c env world nb9 b "hash" Nil false in
+        if (if rb_eq ha hb then false else true) then false
+        else if ia == ib then true
+        else if has_meth world (dispatch_cls_of world a) "eql?"
+        then truthy (invoke_val_c env world nb9 a "eql?" (Cons (b, Nil)) false)
+        else ia == ib)
+     | _ -> false)
+  | _ -> rb_eq a b
+
+and arr_eq_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> true | _ -> false)
+  | Cons (h, t) ->
+    (match ys with
+     | Nil -> false
+     | Cons (h2, t2) -> if rb_eq_w env world h h2 then arr_eq_w env world t t2 else false)
+
+and uniq_seen = fn env -> fn world -> fn (seen: Val list) -> fn (k: Val) ->
+  match seen with
+  | Nil -> false
+  | Cons (h, t) -> if rb_eql_w env world h k then true else uniq_seen env world t k
+
+// Array#uniq / #uniq!: keep the FIRST element for each distinct key, where the
+// key is the element itself or what the block answers for it.
+and arr_uniq_w = fn env -> fn world -> fn (xs: Val list) -> fn (keys: Val list) -> fn (seen: Val list) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (h, t) ->
+    (let (k, krest) = (match keys with Cons (k9, kr) -> (k9, kr) | Nil -> (h, (Nil : Val list))) in
+     if uniq_seen env world seen k then arr_uniq_w env world t krest seen
+     else Cons (h, arr_uniq_w env world t krest (Cons (k, seen))))
+
+// Array#to_h's pair validation, which is three separate refusals: an element
+// that is not an array (after #to_ary) is a TypeError naming its position, one
+// of the wrong LENGTH is an ArgumentError, and a repeated key keeps the LAST
+// value (the flat list was handed to mkhash unmerged, so the hash held the
+// same key twice).
+and arr_to_h_pairs = fn env -> fn world -> fn (xs: Val list) -> fn (i: int) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (h, t) ->
+    (let hv = (match h with
+               | VArr _ -> h
+               | VObj _ -> (match conv_try env world h "to_ary" with VArr a9 -> VArr a9 | _ -> h)
+               | _ -> h) in
+     match hv with
+     | VArr aid ->
+       (let ps = deref aid in
+        if val_list_len ps == 2 then
+          list_append ps (arr_to_h_pairs env world t (i + 1))
+        else
+          (let _ = raise_exc world "ArgumentError"
+                     ("wrong array length at " ++ str_of_int i ++ " (expected 2, was "
+                      ++ str_of_int (val_list_len ps) ++ ")") in (Nil : Val list)))
+     | other ->
+       (let _ = raise_exc world "TypeError"
+                  ("wrong element type " ++ class_name other ++ " at " ++ str_of_int i
+                   ++ " (expected array)") in (Nil : Val list)))
+
+and val_remove_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (h, t) ->
+    if rb_eq_w env world h v then val_remove_w env world t v
+    else Cons (h, val_remove_w env world t v)
 
 and val_member_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) ->
   match xs with
@@ -14398,8 +14952,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               // not a count, and `[]` also takes a Range or a Regexp)
               else if (match recv with VStr _ -> true | VArr _ -> true | VRange (_, _, _) -> true | _ -> false)
                       && (str_eq name "first" || str_eq name "last"
-                          || str_eq name "take" || str_eq name "drop")
+                          || str_eq name "take" || str_eq name "drop"
+                          // pop/shift take the same kind of count (`pop(2.3)`
+                          // popped ONE element -- the Float missed the arm that
+                          // reads n and fell through to the no-argument form).
+                          || str_eq name "pop" || str_eq name "shift")
               then coerce_count_args env world recv name args0
+              // Array's subscripts: the range protocol first, then #to_int
+              // (see coerce_arr_index_args). `[]=` is here too -- its trailing
+              // VALUE argument is left alone by the "index, then length" shape.
+              else if (match recv with VArr _ -> true | _ -> false)
+                      && (str_eq name "[]" || str_eq name "slice" || str_eq name "slice!"
+                          || str_eq name "values_at" || str_eq name "at" || str_eq name "delete_at"
+                          || str_eq name "fetch" || str_eq name "insert" || str_eq name "flatten"
+                          || str_eq name "flatten!" || str_eq name "rotate" || str_eq name "rotate!"
+                          || str_eq name "[]=" || str_eq name "store")
+              then coerce_arr_index_args env world name args0
               else if (match recv with VStr _ -> true | VArr _ -> true | VRange (_, _, _) -> true | _ -> false)
                       && (str_eq name "at" || str_eq name "delete_at" || str_eq name "[]"
                           || str_eq name "rotate" || str_eq name "fetch"
@@ -14415,8 +14983,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       && (str_eq name "intersect?" || str_eq name "intersection"
                           || str_eq name "union" || str_eq name "difference"
                           || str_eq name "&" || str_eq name "|" || str_eq name "-"
+                          // product's arguments are ARRAYS, and #to_ary (or a
+                          // method_missing that answers for it) is how an
+                          // object says it is one.
+                          || str_eq name "product"
                           || str_eq name "zip")
               then coerce_dyck_args env world recv args0
+              // Array#join / Array#* take a STRING separator: #to_str decides,
+              // and `*` falls back to the Integer meaning when it is absent.
+              // An EMPTY array's join must not ask at all -- the spec pins
+              // that the separator receives no #to_str.
+              else if (match recv with
+                       | VArr id9 ->
+                         (str_eq name "*"
+                          || (str_eq name "join"
+                              && (match deref id9 with Nil -> false | _ -> true)))
+                       | _ -> false)
+              then coerce_str_int_args env world args0
               else args0) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // Kernel#raise reached by NAME (send / a matcher's method_missing
@@ -14440,7 +15023,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   else
   // a mutating method on a frozen String / Array / Hash raises FrozenError
   // before any dispatch (CRuby's message: `can't modify frozen X: <inspect>`).
-  if is_mutating_method name && val_is_frozen recv then
+  // But a yielder called WITHOUT a block mutates nothing: it hands back an
+  // Enumerator, and the FrozenError waits until that is iterated
+  // (`frozen.delete_if` is an Enumerator in ruby; it was raising here).
+  if is_mutating_method name && val_is_frozen recv
+     && (if enum_needs_block name then false else true)
+     && (if delete_is_noop env world recv name args then false else true) then
     raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
   else
   // an active refinement (`using M`, M refining this receiver's class or an
@@ -14479,24 +15067,232 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         else str_mut_do h name (coerce_dyck_args env world recv args))
      | _ -> VNil)
   else
-  // Array#join calls #to_s on each element. prim_method (the value-level
-  // fallback) has no `world`, so dispatch a user-defined to_s here where it
-  // does, then hand val_join a world-aware element stringifier.
+  // Array#flatten flattens anything that answers #to_ary, not just Arrays --
+  // ruby asks each element at each level. prim_method has no `world` to ask
+  // with, so the elements are converted here, depth by depth, and the
+  // value-level flatten then sees plain arrays.
+  if (str_eq name "flatten" || str_eq name "flatten!")
+     && (match recv with VArr _ -> true | _ -> false)
+     && (match args with Nil -> true | Cons (VInt _, Nil) -> true | _ -> false) then
+    (match recv with
+     | VArr id0 ->
+       (let seen9 = map_new () in
+        let rec conv = fn (xs: Val list) -> fn (d: int) ->
+          (match xs with
+           | Nil -> (Nil : Val list)
+           | Cons (h, t) ->
+             let h2 = (match h with
+                       | VObj oid9 ->
+                         // an element whose #to_ary answers an array holding
+                         // ITSELF would descend forever: each level builds a
+                         // fresh array, so val_flatten's own array-id guard
+                         // never sees a repeat. Guard on the OBJECT here.
+                         (if d != 0
+                             && (if map_has seen9 ("o" ++ str_of_int oid9) then false else true)
+                          then (let _ = map_set seen9 ("o" ++ str_of_int oid9) VNil in
+                                let r9 = (match conv_try env world h "to_ary" with
+                                          | VArr aid -> arr_new (conv (deref aid) (if d < 0 then d else d - 1))
+                                          // a #to_ary answering a NON-array is
+                                          // the object lying about its type.
+                                          | VNil -> h
+                                          | ov -> raise_exc world "TypeError"
+                                                    ("can't convert " ++ class_name h ++ " to Array ("
+                                                     ++ class_name h ++ "#to_ary gives " ++ class_name ov ++ ")")) in
+                                let _ = map_delete seen9 ("o" ++ str_of_int oid9) in r9)
+                          else h)
+                       | VArr aid ->
+                         // an array that contains itself (at any depth) cannot
+                         // be flattened: ruby refuses rather than stopping at
+                         // the repeat, which is what the silent guard did.
+                         (if d == 0 then h
+                          else if map_has seen9 ("a" ++ str_of_int aid) then
+                            raise_exc world "ArgumentError" "tried to flatten recursive array"
+                          else (let _ = map_set seen9 ("a" ++ str_of_int aid) VNil in
+                                let r9 = arr_new (conv (deref aid) (if d < 0 then d else d - 1)) in
+                                let _ = map_delete seen9 ("a" ++ str_of_int aid) in r9))
+                       | _ -> h) in
+             Cons (h2, conv t d)) in
+        let d0 = (match args with Cons (VInt d, _) -> d | _ -> 0 - 1) in
+        let conv_xs = conv (deref id0) d0 in
+        let out = val_flatten conv_xs d0 in
+        if str_eq name "flatten!" then
+          // nil means "nothing was nested", NOT "the length did not change":
+          // `[[1], [2]].flatten!` keeps its length and IS a change, and
+          // corpus/160 pins exactly that pair of answers.
+          (let nested = has_arr_elem conv_xs in
+           let _ = arr_set id0 out in
+           if d0 == 0 then VNil else if nested then recv else VNil)
+        else arr_new out)
+     | _ -> VNil)
+  else
+  // Array#dig recurses by CALLING #dig on what #at answered, so a singleton
+  // `dig` on a nested array has to win and an intermediate that has no #dig
+  // is a TypeError naming it. prim_method recursed into itself instead: it
+  // bypassed dispatch and answered NoMethodError.
+  // `[1,2].send(:*)` / `send(:*, 1, 2)`: the operator path never sees a wrong
+  // arity (an operator always has exactly two sides), so the METHOD form has
+  // to check it here -- it was answering NoMethodError.
+  // Array#zip: an argument that is not an Array and has no #to_ary is walked
+  // with #each instead -- and only as far as SELF is long, so an infinite
+  // enumerator (`10.upto(Float::INFINITY)`) is allowed. Anything with no #each
+  // at all is ruby's "must respond to :each" TypeError, which prim_method
+  // answered with nils.
+  if str_eq name "zip" && (match recv with VArr _ -> true | _ -> false)
+     && (let rec bad = fn (az: Val list) ->
+           (match az with
+            | Nil -> false
+            | Cons (VArr _, t) -> bad t
+            | Cons (_, _) -> true) in
+         bad args) then
+    (match recv with
+     | VArr id0 ->
+       (let n0 = val_list_len (deref id0) in
+        let rec conv = fn (az: Val list) ->
+          (match az with
+           | Nil -> (Nil : Val list)
+           | Cons (a, t) ->
+             (let a2 = (match a with
+                        | VArr _ -> a
+                        | VObj oid8 ->
+                          // an Enumerator already IS the walk, so it is asked
+                          // for its first n directly; anything else with #each
+                          // becomes an Enumerator first. `first` stops pulling
+                          // when it has enough, which is what makes an
+                          // INFINITE enumerator answerable.
+                          (let (mw8, sw8, ow8, iw8) = world in
+                           let cls8 = map_get ow8 (str_of_int oid8) in
+                           if exc_is_a world cls8 "Enumerator" then
+                             invoke_val_c env world noblk a "first" (Cons (VInt n0, Nil)) false
+                           else if responds world a "each" then
+                             (let en = invoke_val_c env world noblk a "to_enum" (Cons (VSym "each", Nil)) false in
+                              invoke_val_c env world noblk en "first" (Cons (VInt n0, Nil)) false)
+                           else raise_exc world "TypeError"
+                                  ("wrong argument type " ++ class_name a ++ " (must respond to :each)"))
+                        | other -> raise_exc world "TypeError"
+                                     ("wrong argument type " ++ class_name other ++ " (must respond to :each)")) in
+              Cons (a2, conv t))) in
+        prim_method recv "zip" (conv args))
+     | _ -> VNil)
+  else
+  // Array#transpose asks each ROW for #to_ary, which prim_method cannot do.
+  if str_eq name "transpose" && (match recv with VArr _ -> true | _ -> false) then
+    (match recv with
+     | VArr id0 ->
+       (let rec conv = fn (xs: Val list) ->
+          (match xs with
+           | Nil -> (Nil : Val list)
+           | Cons (h, t) ->
+             (let h2 = (match h with
+                        | VObj _ ->
+                          (if responds world h "to_ary"
+                           then invoke_val_c env world noblk h "to_ary" Nil false else h)
+                        | _ -> h) in
+              Cons (h2, conv t))) in
+        prim_method (arr_new (conv (deref id0))) "transpose" (Nil : Val list))
+     | _ -> VNil)
+  else
+  if str_eq name "*" && (match recv with VArr _ -> true | _ -> false)
+     && (match args with Cons (_, Nil) -> false | _ -> true) then
+    raise_exc world "ArgumentError"
+      ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
+  else
+  if str_eq name "dig" && (match recv with VArr _ -> true | _ -> false) then
+    (match coerce_arr_index_args env world "at" args with
+     | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1+)"
+     | Cons (i0, rest) ->
+       (let v = prim_method recv "at" (Cons (i0, Nil)) in
+        match rest with
+        | Nil -> v
+        | _ ->
+          (match v with
+           | VNil -> VNil
+           | VArr _ -> invoke_val_c env world noblk v "dig" rest false
+           | VHsh _ -> invoke_val_c env world noblk v "dig" rest false
+           | _ ->
+             (if responds world v "dig" then invoke_val_c env world noblk v "dig" rest false
+              else raise_exc world "TypeError" (class_name v ++ " does not have #dig method")))))
+  else
+  // Array#join asks each element #to_str, then #to_ary, then #to_s -- in that
+  // order -- and folds the ENCODING along with the text. prim_method (the
+  // value-level fallback) has no `world` to dispatch any of them with.
   if str_eq name "join" && (match recv with VArr _ -> true | _ -> false) then
-    (let es = fn (v: Val) ->
-       (match v with
-        | VObj oid ->
-          let (m2, s2, ocls2, iv2) = world in
-          let cls = map_get ocls2 (str_of_int oid) in
-          if has_meth world cls "to_s"
-          then (match invoke world noblk v cls "to_s" Nil with VStr s -> sget s | other -> to_s other)
-          else to_s v
-        | _ -> to_s v) in
-     match recv with
-     | VArr id -> let xs = deref id in
-       (match args with
-        | Cons (VStr sep, _) -> mkstr (val_join es xs (sget sep) "" true)
-        | _ -> mkstr (val_join es xs "" "" true))
+    (match recv with
+     | VArr id0 ->
+       (let xs0 = deref id0 in
+        // an EMPTY array joins to a US-ASCII "" and must not touch the
+        // separator at all (the spec pins that it receives no #to_str), so
+        // this answer comes before the separator is even looked at.
+        if (match xs0 with Nil -> true | _ -> false) then
+          (let h8 = mkstr "" in
+           let _ = (match h8 with VStr sh8 -> senc_set sh8 "US-ASCII" | _ -> ()) in h8)
+        else
+        // the separator is a String, or `$,` when it is absent OR nil (both
+        // forms take the global -- `join(nil)` was joining with nothing).
+        (let gsep = (if map_has globals "," then map_get globals "," else VNil) in
+        let _ = (match args with
+                 | Nil -> () | Cons (VNil, _) -> () | Cons (VStr _, _) -> ()
+                 // a separator that is not a String and offers no #to_str
+                 // (tried upstream) is ruby's conversion error.
+                 | Cons (other, _) ->
+                   (let _ = raise_exc world "TypeError"
+                              ("no implicit conversion of " ++ class_name other ++ " into String") in ())) in
+        let sepv = (match args with Cons (VStr sh, _) -> VStr sh | _ -> gsep) in
+        let sep = (match sepv with VStr sh -> sget sh | _ -> "") in
+        let sepe = (match sepv with VStr sh -> enc_canon_name (senc_get sh) | _ -> "US-ASCII") in
+        // the text and its ENCODING are accumulated together: each piece
+        // negotiates with what is already there, exactly as `<<` does, and an
+        // incompatible pair is ruby's EncodingError rather than a silent UTF-8.
+        let app = fn (acc: str) -> fn (ae: str) -> fn (piece: str) -> fn (pe: str) ->
+          (let ae2 = enc_compat2 ae acc pe piece in
+           if str_eq ae2 "" then
+             (let _ = raise_exc world "Encoding::CompatibilityError"
+                        ("incompatible character encodings: " ++ ae ++ " and " ++ pe) in (acc, ae))
+           else (acc ++ piece, ae2)) in
+        let seen = map_new () in
+        let _ = map_set seen ("a" ++ str_of_int id0) VNil in
+        // an element is a String, an Array (joined with the SAME separator at
+        // every depth), or an object asked #to_str, then #to_ary, then #to_s.
+        let rec ljoin = fn (ys: Val list) -> fn (acc: str) -> fn (ae: str) -> fn (first: bool) ->
+          (match ys with
+           | Nil -> (acc, ae)
+           | Cons (h, t) ->
+             (let (a0, e0) = (if first then (acc, ae) else app acc ae sep sepe) in
+              let sub = fn (aid: int) -> fn (a9: str) -> fn (e9: str) ->
+                (if map_has seen ("a" ++ str_of_int aid)
+                 then (let _ = raise_exc world "ArgumentError" "recursive array join" in (a9, e9))
+                 else (let _ = map_set seen ("a" ++ str_of_int aid) VNil in
+                       let (r9, re9) = ljoin (deref aid) a9 e9 true in
+                       let _ = map_delete seen ("a" ++ str_of_int aid) in (r9, re9))) in
+              let str_of = fn (v: Val) -> fn (a9: str) -> fn (e9: str) ->
+                (match v with
+                 | VStr sh -> app a9 e9 (sget sh) (enc_canon_name (senc_get sh))
+                 | other -> app a9 e9 (to_s other) "US-ASCII") in
+              let (a1, e1) =
+                (match h with
+                 | VStr sh -> app a0 e0 (sget sh) (enc_canon_name (senc_get sh))
+                 | VArr aid -> sub aid a0 e0
+                 | VObj oid ->
+                   (let r1 = (if responds world h "to_str"
+                              then invoke_val_c env world noblk h "to_str" Nil false else VNil) in
+                    match r1 with
+                    | VStr sh -> app a0 e0 (sget sh) (enc_canon_name (senc_get sh))
+                    | _ ->
+                      (let r2 = (if responds world h "to_ary"
+                                 then invoke_val_c env world noblk h "to_ary" Nil false else VNil) in
+                       match r2 with
+                       | VArr aid -> sub aid a0 e0
+                       | _ ->
+                         (let (m2, s2, ocls2, iv2) = world in
+                          let cls = map_get ocls2 (str_of_int oid) in
+                          if has_meth world cls "to_s"
+                          then str_of (invoke world noblk h cls "to_s" Nil) a0 e0
+                          else app a0 e0 (to_s h) "US-ASCII")))
+                 | _ -> app a0 e0 (to_s h) "US-ASCII") in
+              ljoin t a1 e1 false)) in
+        let (txt, tenc) = ljoin xs0 "" "US-ASCII" true in
+        let h9 = mkstr txt in
+        let _ = (match h9 with VStr sh9 -> senc_set sh9 tenc | _ -> ()) in
+        h9))
      | _ -> VNil)
   // A Hash built with a block calls it on a miss. prim_method's [] can only
   // see the plain default, so the block form is answered here, where a proc
@@ -14627,6 +15423,44 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // element decides the answer. rb_eq is structural and has no world to
   // dispatch with, so when an element carries its own ==, the search runs here
   // where it does. Arrays of plain values keep the existing (faster) path.
+  // Array#uniq / #uniq! / #to_h with `world`, so element #hash / #eql? / #to_ary
+  // are dispatched (the value-level versions cannot ask).
+  else if (str_eq name "uniq" || str_eq name "uniq!") && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Nil -> true | _ -> false) then
+    (match recv with
+     | VArr id ->
+       (let xs = deref id in
+        let out = arr_uniq_w env world xs (Nil : Val list) (Nil : Val list) in
+        if str_eq name "uniq" then arr_new out
+        else (let changed = (if val_list_len out == val_list_len xs then false else true) in
+              let _ = arr_set id out in
+              if changed then recv else VNil))
+     | _ -> VNil)
+  else if str_eq name "to_h" && (match recv with VArr _ -> true | _ -> false) then
+    (match args with
+     | Cons (_, _) ->
+       raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
+     | Nil ->
+       (match recv with
+        | VArr id -> mkhash (hash_merge Nil (arr_to_h_pairs env world (deref id) 0))
+        | _ -> VNil))
+  // Array#delete compares the same way (element == obj) and additionally takes
+  // a block to run when NOTHING matched -- it removed by structural equality
+  // and ignored the block. Always taken (not only for user ==), because the
+  // block and the frozen rule belong here too.
+  else if str_eq name "delete" && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Cons (_, _) -> true | _ -> false) then
+    (match recv with
+     | VArr id ->
+       (match args with
+        | Cons (v, _) ->
+          (let xs = deref id in
+           let had = val_member_w env world xs v in
+           let _ = (if had then arr_set id (val_remove_w env world xs v) else ()) in
+           if had then v else VNil)
+        | _ -> VNil)
+     | _ -> VNil)
   else if (str_eq name "include?" || str_eq name "index" || str_eq name "find_index"
            || str_eq name "rindex" || str_eq name "assoc" || str_eq name "rassoc")
           && (match recv with VArr _ -> true | _ -> false)
@@ -15071,7 +15905,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Array" && str_eq name "try_convert" then
       (match args with
        | Cons (VArr aid, _) -> VArr aid
-       | Cons (VObj oid, _) -> (if responds world (VObj oid) "to_ary" then invoke_val_c env world noblk (VObj oid) "to_ary" Nil false else VNil)
+       // a #to_ary that answers nil means "cannot convert"; one that answers a
+       // NON-array is the object lying about its type, and that is a TypeError
+       // rather than the object itself coming back.
+       | Cons (VObj oid, _) ->
+         (if responds world (VObj oid) "to_ary" then
+            (match invoke_val_c env world noblk (VObj oid) "to_ary" Nil false with
+             | VArr r -> VArr r
+             | VNil -> VNil
+             | ov -> raise_exc world "TypeError"
+                       ("can't convert " ++ class_name (VObj oid) ++ " into Array ("
+                        ++ class_name (VObj oid) ++ "#to_ary gives " ++ class_name ov ++ ")"))
+          else VNil)
        | _ -> VNil)
     else if str_eq c "String" && str_eq name "try_convert" then
       (match args with
@@ -15928,7 +16773,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // source is a builtin (no AST body) — remember it delegates to
                  // prim_method under the builtin name (e.g. String#+).
-                 else map_set builtin_alias (c ++ "#" ++ n1) n2 in
+                 else set_builtin_alias world c n1 n2 in
          // aliasing adds a method under a new name, so the hook fires (same
          // reason as the `alias` keyword above).
          let _ = run_method_added world c n1 in
@@ -16846,9 +17691,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 | VStr mh -> str_eq (sget mh) "upto"
                 | _ -> false) then VNil
        // a gsub/gsub! enumerator's size is nil (ruby cannot know it without
-       // running the matches).
+       // running the matches). bsearch / bsearch_index are the same kind of
+       // answer: how many times they yield depends on what the block says, so
+       // ruby reports UNKNOWN rather than the number materialising happens to
+       // produce (and materialising here now raises, since a collecting block
+       // does not answer the comparison bsearch demands).
        else if (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
                 | VStr mh -> str_eq (sget mh) "gsub" || str_eq (sget mh) "gsub!"
+                             || str_eq (sget mh) "bsearch" || str_eq (sget mh) "bsearch_index"
                 | _ -> false) then VNil
        // each_codepoint / codepoints know their size without running: the
        // string's character count (materialising would RAISE on a string
@@ -18337,7 +19187,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        if has_meth world pcls name then invoke world newblk recv pcls name args
        // in-place Array mutators taking a block: map!/select!/reject!/etc.
        else if (str_eq name "map!" || str_eq name "collect!") && (match recv with VArr _ -> true | _ -> false) then
-         (match recv with VArr id -> (match arr_map world blk newblk (deref id) Nil with FNext (VArr nid) -> let _ = arr_set id (deref nid) in recv | other -> flow_value other) | _ -> recv)
+         (match recv with
+          | VArr id -> (match arr_map_ip world blk newblk id with
+                        | FNext _ -> recv
+                        | other -> flow_value other)
+          | _ -> recv)
        // ⚠ select! / reject! answer nil when nothing was removed; keep_if and
        //   delete_if answer self either way. Same rule as Hash's, and it was
        //   missing on both sides.
@@ -18345,34 +19199,73 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (match recv with
           | VArr id ->
             let before = val_list_len (deref id) in
-            (match arr_filter world blk newblk (deref id) Nil true with
-             | FNext (VArr nid) ->
-               let _ = arr_set id (deref nid) in
-               if str_eq name "keep_if" then recv
-               else if val_list_len (deref id) == before then VNil else recv
+            (match arr_filter_ip world blk newblk id true with
+             | FNext _ ->
+               (if str_eq name "keep_if" then recv
+                else if val_list_len (deref id) == before then VNil else recv)
              | other -> flow_value other)
           | _ -> recv)
        else if (str_eq name "reject!" || str_eq name "delete_if") && (match recv with VArr _ -> true | _ -> false) then
          (match recv with
           | VArr id ->
             let before = val_list_len (deref id) in
-            (match arr_filter world blk newblk (deref id) Nil false with
-             | FNext (VArr nid) ->
-               let _ = arr_set id (deref nid) in
-               if str_eq name "delete_if" then recv
-               else if val_list_len (deref id) == before then VNil else recv
+            (match arr_filter_ip world blk newblk id false with
+             | FNext _ ->
+               (if str_eq name "delete_if" then recv
+                else if val_list_len (deref id) == before then VNil else recv)
              | other -> flow_value other)
           | _ -> recv)
        // sort / sort! with a comparator block.
        else if str_eq name "sort" && (match recv with VArr _ -> true | _ -> false) then
-         (match recv with VArr id -> arr_new (sort_blk world newblk (deref id)) | _ -> recv)
+         (match recv with
+          | VArr id ->
+            (let (st, broke, bv) = sort_blk_b world newblk (deref id) in
+             if broke then bv else arr_new st)
+          | _ -> recv)
        else if str_eq name "sort!" && (match recv with VArr _ -> true | _ -> false) then
-         (match recv with VArr id -> let _ = arr_set id (sort_blk world newblk (deref id)) in recv | _ -> recv)
+         (match recv with
+          // sort! writes back what it managed to order even when the block
+          // broke out (ruby's "makes some modification even if finished
+          // sorting"), and answers the break value.
+          | VArr id ->
+            (let (st, broke, bv) = sort_blk_b world newblk (deref id) in
+             let _ = arr_set id st in
+             if broke then bv else recv)
+          | _ -> recv)
+       // Array#delete with a block: the block runs when NOTHING matched (its
+       // value becomes the answer). The block form reached the plain prim,
+       // which has no block and answered nil.
+       else if str_eq name "delete" && (match recv with VArr _ -> true | _ -> false) then
+         (match recv with
+          | VArr id ->
+            (match args with
+             | Cons (v, _) ->
+               (let xs = deref id in
+                let had = val_member_w env world xs v in
+                if had then (let _ = arr_set id (val_remove_w env world xs v) in v)
+                else flow_value (run_block world blk newblk (Cons (v, Nil))))
+             | _ -> VNil)
+          | _ -> VNil)
        // fetch with a default block: run the block when the key/index is absent.
        else if str_eq name "fetch" && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
          (match recv with
           | VHsh h -> let xs = hderef h in (match args with Cons (k, _) -> (if hash_haskey xs k then hash_get xs k else flow_value (run_block world blk newblk (Cons (k, Nil)))) | _ -> VNil)
-          | VArr id -> let ys = deref id in let n = val_list_len ys in (match args with Cons (VInt i, _) -> let j = (if i < 0 then n + i else i) in (if j >= 0 && j < n then val_nth ys j else flow_value (run_block world blk newblk (Cons (VInt i, Nil)))) | _ -> VNil)
+          // the index converts through #to_int for the LOOKUP, but the block
+          // receives the ORIGINAL object (spec: `.should.equal?(o)`), and the
+          // block path does no argument conversion of its own -- a convertible
+          // object used to miss every arm and answer nil.
+          | VArr id ->
+            (let ys = deref id in
+             let n = val_list_len ys in
+             match args with
+             | Cons (a0, _) ->
+               (match coerce_arr_index_args env world "fetch" (Cons (a0, Nil)) with
+                | Cons (VInt i, _) ->
+                  (let j = (if i < 0 then n + i else i) in
+                   if j >= 0 && j < n then val_nth ys j
+                   else flow_value (run_block world blk newblk (Cons (a0, Nil))))
+                | _ -> flow_value (run_block world blk newblk (Cons (a0, Nil))))
+             | _ -> VNil)
           | _ -> recv)
        // Hash#merge/merge!/update with a conflict block.
        else if (str_eq name "merge" || str_eq name "merge!" || str_eq name "update") && (match recv with VHsh _ -> true | _ -> false) then
@@ -18696,8 +19589,20 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> VNil)
   // enumerable methods without a block return an Enumerator over recv.<name>
   // (Ruby: [1,2].map => #<Enumerator: [1, 2]:map>).
-  else if enum_needs_block name && (match recv with VArr _ -> true | VHsh _ -> true | VRange (_, _, _) -> true | _ -> false) then
+  // `rindex` / `index` / `find_index` with NEITHER an argument nor a block is
+  // an Enumerator (with an argument they are searches, so the arms above keep
+  // them -- which is why they are not in enum_needs_block).
+  else if (str_eq name "rindex" || str_eq name "index" || str_eq name "find_index")
+          && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Nil -> true | _ -> false) then
     make_enum_a world recv name args
+  else if enum_needs_block name && (match recv with VArr _ -> true | VHsh _ -> true | VRange (_, _, _) -> true | _ -> false) then
+    // most yielders take NO arguments, so `[1,2,3].map(:foo)` is a wrong-arity
+    // call, not an Enumerator over a method that ignores what it was handed.
+    (if enum_zero_arity name && (match args with Nil -> false | _ -> true) then
+       raise_exc world "ArgumentError"
+         ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
+     else make_enum_a world recv name args)
   // Enumerable extras needing === / world (blockless array forms).
   else if (str_eq name "grep" || str_eq name "grep_v") && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
@@ -18812,7 +19717,21 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   else if str_eq name "permutation" && (match recv with VArr _ -> true | _ -> false) then
     (match recv with VArr id -> (match args with Cons (VInt k, _) -> arr_new (arr_permutations (deref id) k) | _ -> arr_new (arr_permutations (deref id) (vlen (deref id)))) | _ -> recv)
   else if str_eq name "product" && (match recv with VArr _ -> true | _ -> false) then
-    (match recv with VArr id -> (match args with Cons (VArr oid, _) -> arr_new (arr_product2 (deref id) (deref oid)) | _ -> arr_new Nil) | _ -> recv)
+    (match recv with
+     | VArr id ->
+       // every argument must be an Array (or offer #to_ary, tried upstream);
+       // a non-array was silently answering [].
+       (let rec chk = fn (az: Val list) ->
+          (match az with
+           | Nil -> true
+           | Cons (VArr _, t) -> chk t
+           | Cons (other, _) ->
+             (let _ = raise_exc world "TypeError"
+                        ("no implicit conversion of " ++ class_name other ++ " into Array") in false)) in
+        let _ = chk args in
+        let _ = arr_product_guard (val_list_len (deref id)) args in
+        arr_new (arr_product_n (deref id) args))
+     | _ -> recv)
   // Comparable#clamp / #between? (any comparable receiver, incl. user <=>).
   else if str_eq name "clamp" then
     (match args with
@@ -19270,6 +20189,48 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name ">" || str_eq name ">=" || str_eq name "eql?" ||
     str_eq name "+" || str_eq name "-"
   else false
+
+// Ruby's IMPLICIT conversion attempt (rb_check_funcall), which is not the same
+// question as respond_to?: a real method wins; otherwise a user-defined
+// respond_to? / respond_to_missing?(name, TRUE -- include_private, unlike
+// respond_to?'s default) decides, and when it says yes (or says nothing) a
+// user method_missing is asked. `responds` alone answered "no" for every
+// method_missing-based object, so [obj].flatten kept the object instead of
+// flattening what its method_missing returns. Answers nil for "not
+// convertible", which is also what a #to_ary answering nil means.
+and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
+  match v with
+  | VObj id ->
+    (let (meths, sup, ocls, ivars) = world in
+     let cls = map_get ocls (str_of_int id) in
+     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+     if has_meth world cls mname then invoke_val_c env world nb v mname Nil false
+     else if is_prim_method mname || builtin_obj_has cls mname then
+       invoke_val_c env world nb v mname Nil false
+     else
+       // a user respond_to? that says no ends it; otherwise
+       // respond_to_missing?(name, true) is asked TOO (ruby asks both -- the
+       // first is not a substitute for the second), and only then
+       // method_missing. A missing answer is a decline, never an error.
+       (let rt_ok =
+          (if has_meth world cls "respond_to?" then
+             (let extra = (match lookup_meth world cls "respond_to?" with
+                           | Meth (ps, ds, _) ->
+                             (if mandatory_pos_count ps ds >= 2 then Cons (VBool true, Nil) else Nil)) in
+              truthy (invoke world nb v cls "respond_to?" (Cons (VSym mname, extra))))
+           else true) in
+        if (if rt_ok then false else true) then VNil
+        else
+          (let rtm_ok =
+             (if has_meth world cls "respond_to_missing?" then
+                truthy (invoke world nb v cls "respond_to_missing?"
+                          (Cons (VSym mname, Cons (VBool true, Nil))))
+              else true) in
+           if (if rtm_ok then false else true) then VNil
+           else if has_meth world cls "method_missing" then
+             invoke world nb v cls "method_missing" (Cons (VSym mname, Nil))
+           else VNil)))
+  | _ -> VNil
 
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
@@ -21051,10 +22012,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // an argument that is not an index and cannot become one is a
         // TypeError, not nil: `[1,2,3][Object.new]` answered nil, which reads
         // as "no element there" rather than "that is not a subscript"
-        | Cons (VObj _, _) | Cons (VNil, _) | Cons (VSym _, _) ->
+        // ruby words the nil case differently from every other type
+        // ("from nil to integer", lower case), so it cannot share the sentence.
+        | Cons (VNil, _) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
+        | Cons (VObj _, _) | Cons (VSym _, _) ->
           prim_raise "TypeError"
             ("no implicit conversion of "
-             ++ (match args with Cons (VNil, _) -> "nil" | Cons (a0, _) -> class_name a0 | _ -> "Object")
+             ++ (match args with Cons (a0, _) -> class_name a0 | _ -> "Object")
              ++ " into Integer")
         | Cons (VRange (lov, hiv, excl), _) ->
           // a[m..n]: nil if start is past the end; [] if start == size or the
@@ -22021,7 +22985,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "flatten" then
     // Hash#flatten is one level: [k1, v1, k2, v2, ...].
     (match recv with
-     | VArr id -> (match args with Cons (VInt d, _) -> arr_new (val_flatten (deref id) d) | _ -> arr_new (val_flatten (deref id) (0 - 1)))
+     | VArr id ->
+       (match args with
+        | Cons (VInt d, Nil) -> arr_new (val_flatten (deref id) d)
+        | Nil -> arr_new (val_flatten (deref id) (0 - 1))
+        | Cons (VNil, Nil) -> arr_new (val_flatten (deref id) (0 - 1))
+        | Cons (other, Nil) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
+        | _ -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)"))
      | VHsh h -> arr_new (hderef h)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "flatten") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten'")) in fail "mere-ruby: undefined method 'flatten'")))
   else if str_eq name "compact" then (match recv with VArr id -> arr_new (val_compact (deref id)) | _ -> (let _ = map_set prim_missing "n" (mkstr "compact") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact'")) in fail "mere-ruby: undefined method 'compact'")))
@@ -22090,15 +23060,47 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "transpose" then
     (match recv with
      | VArr id -> let rows = deref id in
-       (match rows with Nil -> arr_new Nil | Cons (VArr r0, _) -> arr_new (val_transpose rows 0 (val_list_len (deref r0))) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "transpose: not an array of arrays")) in fail "transpose: not an array of arrays"))
+       (match rows with
+        | Nil -> arr_new Nil
+        | Cons (VArr r0, _) ->
+          // every row must be an array of the SAME width: a short row is
+          // ruby's IndexError naming both widths (it was silently producing
+          // nils), and a non-array row anywhere -- not just first -- refuses.
+          (let w = val_list_len (deref r0) in
+           let rec chk = fn (rs: Val list) ->
+             (match rs with
+              | Nil -> true
+              | Cons (VArr r, t) ->
+                (let k = val_list_len (deref r) in
+                 if k == w then chk t
+                 else (let _ = prim_raise "IndexError"
+                                 ("element size differs (" ++ str_of_int k
+                                  ++ " should be " ++ str_of_int w ++ ")") in false))
+              | Cons (other, _) ->
+                (let _ = prim_raise "TypeError"
+                           ("no implicit conversion of " ++ class_name other ++ " into Array") in false)) in
+           let _ = chk rows in
+           arr_new (val_transpose rows 0 w))
+        // a row that is not an array (and offers no #to_ary, tried upstream)
+        // is ruby's conversion error, not an internal failure.
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Array"))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "transpose") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'transpose'")) in fail "mere-ruby: undefined method 'transpose'")))
-  else if str_eq name "rotate" then
+  else if str_eq name "rotate" || str_eq name "rotate!" then
+    // rotate!(n) is rotate(n) written back; both refuse a non-Integer count
+    // (a String argument was silently rotating by the default 1).
     (match recv with
-     | VArr id -> let xs = deref id in let len = val_list_len xs in
-       if len == 0 then arr_new Nil
-       else let n0 = (match args with Cons (VInt n, _) -> n | _ -> 1) in
-            let k = floor_mod n0 len in arr_new (list_append (vdrop xs k) (vtake xs k))
-     | _ -> (let _ = map_set prim_missing "n" (mkstr "rotate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rotate'")) in fail "mere-ruby: undefined method 'rotate'")))
+     | VArr id ->
+       (let xs = deref id in
+        let len = val_list_len xs in
+        let n0 = (match args with
+                  | Cons (VInt n, _) -> n
+                  | Nil -> 1
+                  | Cons (VNil, _) -> (match prim_raise "TypeError" "no implicit conversion from nil to integer" with _ -> 1)
+                  | Cons (other, _) -> (match prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer") with _ -> 1)) in
+        let out = (if len == 0 then (Nil : Val list)
+                   else (let k = floor_mod n0 len in list_append (vdrop xs k) (vtake xs k))) in
+        if str_eq name "rotate!" then (let _ = arr_set id out in recv) else arr_new out)
+     | _ -> (let _ = map_set prim_missing "n" (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
   else if str_eq name "min" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_sort (deref id)) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_min t h)) | _ -> (let _ = map_set prim_missing "n" (mkstr "min") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'min'")) in fail "mere-ruby: undefined method 'min'")))
   else if str_eq name "max" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_rev (val_sort (deref id)) Nil) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_max t h)) | _ -> (let _ = map_set prim_missing "n" (mkstr "max") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'max'")) in fail "mere-ruby: undefined method 'max'")))
   else if str_eq name "sum" then (match recv with VArr id -> val_sum (deref id) (match args with Cons (init, _) -> init | _ -> VInt 0) | VRange (lo, hi, excl) -> val_sum (range_vals_raw lo hi excl) (match args with Cons (init, _) -> init | _ -> VInt 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
@@ -22263,9 +23265,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "pop" then
     (match recv with
      | VArr id -> let xs = deref id in let len = val_list_len xs in
+       // one optional count, and a NEGATIVE count is not "pop nothing" -- both
+       // spellings were being accepted silently.
        (match args with
-        | Cons (VInt n, _) -> let k = if n < 0 then 0 else if n > len then len else n in
-          let _ = arr_set id (vtake xs (len - k)) in arr_new (vdrop xs (len - k))
+        | Cons (_, Cons (_, _)) ->
+          prim_raise "ArgumentError"
+            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+        | Cons (VInt n, _) ->
+          (if n < 0 then prim_raise "ArgumentError" "negative array size"
+           else let k = if n > len then len else n in
+             let _ = arr_set id (vtake xs (len - k)) in arr_new (vdrop xs (len - k)))
         | _ -> (match xs with Nil -> VNil | _ -> let _ = arr_set id (val_init xs) in val_last xs))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "pop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pop'")) in fail "mere-ruby: undefined method 'pop'")))
   // Array#at(i): index without the slice forms (negative counts from the end).
@@ -22275,9 +23284,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        let xs = deref id in
        let len = val_list_len xs in
        (match args with
-        | Cons (VInt i0, _) -> let i = if i0 < 0 then i0 + len else i0 in
-          if i < 0 || i >= len then VNil else val_nth xs i
-        | _ -> VNil)
+        | Cons (VInt i0, Nil) -> let i = if i0 < 0 then i0 + len else i0 in
+          (if i < 0 || i >= len then VNil else val_nth xs i)
+        | Cons (VNil, Nil) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
+        | Cons (other, Nil) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
+        | _ -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'at'")) in fail "mere-ruby: undefined method 'at'")))
   // Array#delete_at(i): remove and return that element (nil if out of range).
   else if str_eq name "delete_at" then
@@ -22332,9 +23343,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                   | Cons (k, Cons (v, t)) -> let _ = hset h t in arr_new (Cons (k, Cons (v, Nil)))
                   | _ -> VNil)
      | VArr id -> let xs = deref id in let len = val_list_len xs in
+       // see pop: one optional count, no negative counts.
        (match args with
-        | Cons (VInt n, _) -> let k = if n < 0 then 0 else if n > len then len else n in
-          let _ = arr_set id (vdrop xs k) in arr_new (vtake xs k)
+        | Cons (_, Cons (_, _)) ->
+          prim_raise "ArgumentError"
+            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+        | Cons (VInt n, _) ->
+          (if n < 0 then prim_raise "ArgumentError" "negative array size"
+           else let k = if n > len then len else n in
+             let _ = arr_set id (vdrop xs k) in arr_new (vtake xs k))
         | _ -> (match xs with Nil -> VNil | Cons (h, t) -> let _ = arr_set id t in h))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "shift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shift'")) in fail "mere-ruby: undefined method 'shift'")))
   // Array#replace: swap in the other array's contents (aliases see it).
@@ -22369,18 +23386,40 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VArr id ->
        (match args with
+        // `a[start, len] = v`: a start below -size has no position to write to
+        // and a negative LENGTH is not a span -- both were silently splicing
+        // at the front (`[1,2,3,4][-5, -1] = ""` gave ["", 1, 2, 3, 4]).
         | Cons (VInt i, Cons (VInt len, Cons (v, Nil))) ->
-          let _ = arr_set id (arr_splice (deref id) i len v) in v
+          (let xs = deref id in
+           let n = val_list_len xs in
+           let j = (if i < 0 then n + i else i) in
+           if j < 0 then
+             prim_raise "IndexError"
+               ("index " ++ str_of_int i ++ " too small for array; minimum: -" ++ str_of_int n)
+           else if len < 0 then
+             prim_raise "IndexError" ("negative length (" ++ str_of_int len ++ ")")
+           else let _ = arr_set id (arr_splice xs j len v) in v)
         | Cons (VRange (lov, hiv, excl), Cons (v, Nil)) ->
           (let xs = deref id in
            let n = val_list_len xs in
-           let (st, enx) = rng_slice_bounds lov hiv excl n in
-           let _ = arr_set id (arr_splice xs st (if enx - st < 0 then 0 else enx - st) v) in v)
+           // the same out-of-reach begin is a RANGE error when it arrives as a
+           // range (ruby distinguishes the two spellings).
+           let st0 = (match lov with VInt a -> a | _ -> 0) in
+           let st9 = (if st0 < 0 then n + st0 else st0) in
+           if st9 < 0 then
+             prim_raise "RangeError" (inspect (VRange (lov, hiv, excl)) ++ " out of range")
+           else
+             (let (st, enx) = rng_slice_bounds lov hiv excl n in
+              let _ = arr_set id (arr_splice xs st (if enx - st < 0 then 0 else enx - st) v) in v))
         | Cons (VInt i, Cons (v, _)) ->
           let xs = deref id in
           let n = val_list_len xs in
           let j = if i < 0 then n + i else i in
-          let _ = arr_set id (val_set_at xs j v) in v
+          // a negative index below -size has no position to write to: ruby's
+          // IndexError names the minimum, where this quietly appended.
+          (if j < 0 then prim_raise "IndexError"
+                           ("index " ++ str_of_int i ++ " too small for array; minimum: -" ++ str_of_int n)
+           else let _ = arr_set id (val_set_at xs j v) in v)
         | _ -> VNil)
      // a Hash write reached through the primitive dispatcher rather than the
      // index-assignment statement (a bare `store` in a Hash subclass).
@@ -22447,7 +23486,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "dig" then
     (match recv with
      | VHsh xs -> let xs = hderef xs in (match args with Cons (k, rest) -> let v = hash_get xs k in (match rest with Nil -> v | _ -> if (match v with VNil -> true | _ -> false) then VNil else prim_method v "dig" rest) | _ -> VNil)
-     | VArr id -> (match args with Cons (VInt i, rest) -> let v = val_nth (deref id) (if i < 0 then val_list_len (deref id) + i else i) in (match rest with Nil -> v | _ -> if (match v with VNil -> true | _ -> false) then VNil else prim_method v "dig" rest) | _ -> VNil)
+     | VArr id ->
+       (match args with
+        | Cons (VInt i, rest) -> let v = val_nth (deref id) (if i < 0 then val_list_len (deref id) + i else i) in (match rest with Nil -> v | _ -> if (match v with VNil -> true | _ -> false) then VNil else prim_method v "dig" rest)
+        // an Array subscript must be an Integer: dig answered nil for a
+        // Symbol, which reads as "no element there" instead of "not an index".
+        | Cons (VNil, _) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
+        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "dig") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'dig'")) in fail "mere-ruby: undefined method 'dig'")))
   // `super` from a builtin subclass's own #initialize (`class Uncountables <
   // Array`). The instance already IS the builtin value -- storage was created
@@ -22763,7 +23809,25 @@ and sort_w = fn world -> fn (xs: Val list) ->
 and insert_w = fn world -> fn (x: Val) -> fn (sorted: Val list) ->
   match sorted with
   | Nil -> Cons (x, Nil)
-  | Cons (h, t) -> if cmp_vals_w world x h <= 0 then Cons (x, sorted) else Cons (h, insert_w world x t)
+  | Cons (h, t) ->
+    // a user <=> answering NIL means "these do not compare", and sorting them
+    // is ruby's ArgumentError -- cmp_vals_w has to answer with an int, so the
+    // nil case is asked about separately here (it read as 0 = equal, and two
+    // uncomparable objects sorted "fine").
+    let _ = (match x with
+             | VObj oid9 ->
+               (let (m9, s9, o9, i9) = world in
+                let c9 = map_get o9 (str_of_int oid9) in
+                if has_meth world c9 "<=>" then
+                  (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+                   match invoke world nb9 x c9 "<=>" (Cons (h, Nil)) with
+                   | VNil -> (let _ = raise_exc world "ArgumentError"
+                                        ("comparison of " ++ class_name x ++ " with "
+                                         ++ class_name h ++ " failed") in ())
+                   | _ -> ())
+                else ())
+             | _ -> ()) in
+    if cmp_vals_w world x h <= 0 then Cons (x, sorted) else Cons (h, insert_w world x t)
 
 // apply a binary operator (named by a symbol like :+) to two runtime values
 // by evaluating a real EBin over a scratch env — reuses all operator logic.
@@ -23632,6 +24696,101 @@ and pair_with = fn (h: Val) -> fn (ys: Val list) ->
 
 and arr_product2 = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with Nil -> Nil | Cons (h, t) -> list_append (pair_with h ys) (arr_product2 t ys)
+
+// Array#product with ANY number of arguments: fold each argument array over
+// the tuples built so far. Only the two-argument case existed, so
+// `[1,2].product([3,4],[5])` answered pairs (or []).
+// The arguments must already be arrays (#to_ary is asked at dispatch).
+and arr_product_n = fn (xs: Val list) -> fn (az: Val list) ->
+  let rec seed = fn (ys: Val list) ->
+    (match ys with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (arr_new (Cons (h, Nil)), seed t)) in
+  let rec build = fn (acc: Val list) -> fn (rest: Val list) ->
+    (match rest with
+     | Nil -> acc
+     | Cons (a, t) ->
+       (let axs = (match a with VArr aid -> deref aid | _ -> (Nil : Val list)) in
+        let rec outer = fn (rs: Val list) ->
+          (match rs with
+           | Nil -> (Nil : Val list)
+           | Cons (r, rt) ->
+             (let rxs = (match r with VArr rid -> deref rid | _ -> (Nil : Val list)) in
+              let rec inner = fn (bs: Val list) ->
+                (match bs with
+                 | Nil -> outer rt
+                 | Cons (b, bt) -> Cons (arr_new (list_append rxs (Cons (b, Nil))), inner bt)) in
+              inner axs)) in
+        build (outer acc) t)) in
+  build (seed xs) az
+
+// Array#repeated_combination(k): every NON-DECREASING index sequence of length
+// k (so [10,10] is included and [11,10] is not), and Array#repeated_permutation
+// (k): every index sequence. Both are generated from the array as it is when
+// the walk starts -- ruby works from a defensive copy, so a block that mutates
+// the receiver does not change what is yielded. Neither existed at all.
+and arr_rep_combos = fn (xs: Val list) -> fn (k: int) ->
+  if k < 0 then (Nil : Val list)
+  else if k == 0 then Cons (arr_new (Nil : Val list), Nil)
+  else
+    (let n = val_list_len xs in
+     if n == 0 then (Nil : Val list)
+     else
+       (let rec go = fn (start: int) -> fn (k2: int) ->
+          (if k2 == 0 then Cons (arr_new (Nil : Val list), Nil)
+           else
+             (let rec loop = fn (i: int) ->
+                (if i >= n then (Nil : Val list)
+                 else
+                   (let tails = go i (k2 - 1) in
+                    let rec pre = fn (ts: Val list) ->
+                      (match ts with
+                       | Nil -> loop (i + 1)
+                       | Cons (t, tt) ->
+                         Cons (arr_new (Cons (val_nth xs i,
+                                              (match t with VArr tid -> deref tid | _ -> (Nil : Val list)))),
+                               pre tt)) in
+                    pre tails)) in
+              loop start)) in
+        go 0 k))
+
+and arr_rep_perms = fn (xs: Val list) -> fn (k: int) ->
+  if k < 0 then (Nil : Val list)
+  else if k == 0 then Cons (arr_new (Nil : Val list), Nil)
+  else
+    (let n = val_list_len xs in
+     if n == 0 then (Nil : Val list)
+     else
+       (let rec go = fn (k2: int) ->
+          (if k2 == 0 then Cons (arr_new (Nil : Val list), Nil)
+           else
+             (let tails = go (k2 - 1) in
+              let rec loop = fn (i: int) ->
+                (if i >= n then (Nil : Val list)
+                 else
+                   (let rec pre = fn (ts: Val list) ->
+                      (match ts with
+                       | Nil -> loop (i + 1)
+                       | Cons (t, tt) ->
+                         Cons (arr_new (Cons (val_nth xs i,
+                                              (match t with VArr tid -> deref tid | _ -> (Nil : Val list)))),
+                               pre tt)) in
+                    pre tails)) in
+              loop 0)) in
+        go k))
+
+// the number of tuples must stay under 2**62 -- ruby's own check is "does the
+// multiplication overflow a long", and this is that check with a bound that
+// fits in the literal syntax here. `(0..100).to_a.product(a, a, ..., a)` is a
+// RangeError rather than an attempt; nothing between 2**62 and 2**63 is
+// reachable in practice (the array would not fit in memory).
+and arr_product_guard = fn (n0: int) -> fn (az: Val list) ->
+  match az with
+  | Nil -> true
+  | Cons (a, t) ->
+    (let l = (match a with VArr aid -> val_list_len (deref aid) | _ -> 0) in
+     if l == 0 then true
+     else if n0 > 4611686018427387903 / l then
+       (let _ = prim_raise "RangeError" "too big to product" in false)
+     else arr_product_guard (n0 * l) t)
 
 and char_range = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (mkstr (chr i), char_range (i + 1) last)
@@ -30102,7 +31261,7 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
           // delegates to prim_method under the old one, exactly as alias_method
           // does. `alias _pack pack` in a reopened Array is how a wrapper keeps
           // hold of the original.
-          else map_set builtin_alias (cls ++ "#" ++ n1) n2 in
+          else set_builtin_alias world cls n1 n2 in
   // an alias ADDS a method, so `method_added` fires for the new name --
   // rubocop-ast registers its visitors from that hook and writes
   // `alias visit_number visit_symbol`, so an alias that stays quiet leaves the
@@ -30617,6 +31776,9 @@ and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   | Cons (n, rest) ->
     if has_meth world cls n || is_prim_method n || builtin_anc_has world cls n
        || is_private_object_method n
+       // a name that exists only as an alias to a builtin is still a method
+       // (`alias old <=>` then `undef old` said NameError).
+       || map_has builtin_alias (cls ++ "#" ++ n)
     then undef_check world cls rest
     else (let _ = raise_exc world "NameError" ("undefined method '" ++ n ++ "' for class '" ++ cls ++ "'") in ())
 
@@ -30625,6 +31787,7 @@ and undef_all = fn meths -> fn (cls: str) -> fn (names: str list) ->
   | Nil -> ()
   | Cons (n, rest) ->
     let _ = if map_has meths (cls ++ "#" ++ n) then map_delete meths (cls ++ "#" ++ n) else () in
+    let _ = if map_has builtin_alias (cls ++ "#" ++ n) then map_delete builtin_alias (cls ++ "#" ++ n) else () in
     // a tombstone blocks the method from being reached via inheritance.
     let _ = map_set undefs (cls ++ "#" ++ n) VNil in
     undef_all meths cls rest
