@@ -11792,7 +11792,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                && (str_eq name "[]=" || str_eq name "store")
                && (if has_meth world "Hash" name then false else true) then
          (match recv with
-          | VHsh h -> (match args with Cons (k, Cons (v, _)) -> let _ = hset h (hash_put_x (hcbi_on h) (hderef h) k v) in v | _ -> VNil)
+          | VHsh h -> (match args with
+                       | Cons (k, Cons (v, _)) ->
+                         (let k9 = hash_store_key env world h k in
+                          let _ = hset h (hash_put_x (hcbi_on h) (hderef h) k9 v) in v)
+                       | _ -> VNil)
           | _ -> VNil)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
        // assigned value as its expression result, not the writer's return.
@@ -13997,9 +14001,21 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        let _ = hcbi_copy src9 r9 in
        iter_result (FNext r9) recv)
     // two old keys that transform to the SAME new key collapse to one pair,
-    // the later one (the flat list was not merged).
+    // the later one (the flat list was not merged). With a HASH argument as
+    // well, the hash decides the keys it names and the block the rest.
     else if str_eq name "transform_keys" then
-      iter_result (FNext (mkhash (hash_merge Nil (hash_tk world encl theblk xs)))) recv
+      (match args with
+       | Cons (VHsh mid9, _) ->
+         (let mp9 = hderef mid9 in
+          let rec go9 = fn (ys: Val list) ->
+            (match ys with
+             | Cons (k9, Cons (v9, t9)) ->
+               Cons ((if hash_haskey mp9 k9 then hash_get mp9 k9
+                      else flow_value (run_block world encl theblk (Cons (k9, Nil)))),
+                     Cons (v9, go9 t9))
+             | _ -> (Nil : Val list)) in
+          iter_result (FNext (mkhash (hash_merge Nil (go9 xs)))) recv)
+       | _ -> iter_result (FNext (mkhash (hash_merge Nil (hash_tk world encl theblk xs)))) recv)
     // the BANG forms write the result back and answer self (they did not exist).
     // fetch_values with a block: the block supplies the value for a key that
     // is not there (it had no block form and raised KeyError).
@@ -14036,7 +14052,29 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        arr_new (go args))
     else if str_eq name "transform_keys!" then
       (match recv with
-       | VHsh hid -> (let _ = hset hid (hash_merge Nil (hash_tk world encl theblk xs)) in recv)
+       | VHsh hid ->
+         // a `break` leaves the keys already processed TRANSFORMED and the rest
+         // as they were -- and a transformed key wins over an untouched pair of
+         // the same name (`{a: 1, b: 2, c: 3, d: 4}` broken at :c is
+         // {b: 1, c: 2, d: 4}).
+         (let rec go9 = fn (ys: Val list) -> fn (acc: Val list) ->
+            (match ys with
+             | Cons (k9, Cons (v9, t9)) ->
+               (match run_block world encl theblk (Cons (k9, Nil)) with
+                | FBreak bv9 -> (acc, Cons (k9, Cons (v9, t9)), true, bv9)
+                | FReturn rv9 -> (acc, Cons (k9, Cons (v9, t9)), true, rv9)
+                | f9 -> go9 t9 (list_append acc (Cons (flow_value f9, Cons (v9, Nil)))))
+             | _ -> (acc, (Nil : Val list), false, VNil)) in
+          let (done9, rest9, broke9, bv9) = go9 xs (Nil : Val list) in
+          let base9 = hash_merge Nil done9 in
+          let rec fill9 = fn (ys: Val list) -> fn (acc: Val list) ->
+            (match ys with
+             | Cons (k9, Cons (v9, t9)) ->
+               fill9 t9 (if hash_haskey acc k9 then acc else hash_put acc k9 v9)
+             | _ -> acc) in
+          let out9 = fill9 rest9 base9 in
+          let _ = hset hid out9 in
+          if broke9 then bv9 else recv)
        | _ -> recv)
     else if str_eq name "transform_values!" then
       (match recv with
@@ -15901,6 +15939,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     raise_exc world "ArgumentError"
       ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
   else
+  // Hash#dig is the same walk Array#dig does: it reads through `[]` (so the
+  // hash's DEFAULT answers a missing key), recurses by CALLING #dig on what it
+  // found, and names an intermediate that has none in a TypeError. The
+  // primitive recursed into itself, which bypassed both.
+  if str_eq name "dig" && (match recv with VHsh _ -> true | _ -> false)
+     && (if prim_user_has world recv "dig" then false else true) then
+    (match args with
+     | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1+)"
+     | Cons (k0, rest) ->
+       (let v = invoke_val_c env world noblk recv "[]" (Cons (k0, Nil)) false in
+        match rest with
+        | Nil -> v
+        | _ ->
+          (match v with
+           | VNil -> VNil
+           | VArr _ -> invoke_val_c env world noblk v "dig" rest false
+           | VHsh _ -> invoke_val_c env world noblk v "dig" rest false
+           | _ ->
+             (if responds world v "dig" then invoke_val_c env world noblk v "dig" rest false
+              else raise_exc world "TypeError" (class_name v ++ " does not have #dig method")))))
+  else
   if str_eq name "dig" && (match recv with VArr _ -> true | _ -> false)
      && (if prim_user_has world recv "dig" then false else true) then
     (match coerce_arr_index_args env world "at" args with
@@ -16042,6 +16101,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         let out = hash_merge Nil (go (hderef hid)) in
         if str_eq name "transform_keys!" then (let _ = hset hid out in recv) else mkhash out)
      | _ -> recv)
+  // `h[key] = v` through DISPATCH (send / a subclass) resolves the stored key
+  // the same way the fast path does.
+  else if (str_eq name "[]=" || str_eq name "store")
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv name then false else true)
+          && (match args with Cons (_, Cons (_, Nil)) -> true | _ -> false) then
+    (match recv with
+     | VHsh hid9 ->
+       (match args with
+        | Cons (k9, Cons (v9, Nil)) ->
+          (let key9 = hash_store_key env world hid9 k9 in
+           let _ = hset hid9 (hash_put_x (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
+        | _ -> VNil)
+     | _ -> VNil)
   // Hash#initialize on a FROZEN hash refuses (it replaces the default either
   // way), and the primitive has no way to know it was frozen.
   else if str_eq name "initialize" && (match recv with VHsh _ -> true | _ -> false)
@@ -21273,6 +21346,42 @@ and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
              invoke world nb v cls "method_missing" (Cons (VSym mname, Nil))
            else VNil)))
   | _ -> VNil
+
+// The key a hash actually STORES for `h[k] = v`: an existing key that is eql?
+// to k stays in place (so a second, equal key object never replaces the first),
+// and a fresh String key is stored as a FROZEN COPY -- mutating the original
+// must not change the key, and the stored key carries no singleton methods.
+// An object key's #eql? is dispatched here, which the value-level comparison
+// cannot do.
+and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
+  let ci = hcbi_on hid in
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let rec find9 = fn (ys: Val list) ->
+    (match ys with
+     | Cons (k2, Cons (_, t)) ->
+       (if (if ci then hkey_same true k2 k
+            else (match k with
+                  | VObj _ -> (if has_meth world (dispatch_cls_of world k) "eql?"
+                               then truthy (invoke_val_c env world nb9 k "eql?" (Cons (k2, Nil)) false)
+                               else hkey_eql k2 k)
+                  | _ -> hkey_eql k2 k))
+        then Cons (k2, Nil) else find9 t)
+     | _ -> (Nil : Val list)) in
+  match find9 (hderef hid) with
+  | Cons (kk, _) -> kk
+  | Nil ->
+    (match k with
+     | VStr sh9 ->
+       // ...unless it is ALREADY frozen, in which case it is stored as it is
+       // (there is nothing to protect the hash from).
+       (if ci || sfrozen_get sh9 then k
+        else (let c9 = mkstr (sget sh9) in
+              let _ = (match c9 with
+                       | VStr nid9 -> (let _ = senc_set nid9 (senc_get sh9) in
+                                       let _ = sfrozen_set nid9 in ())
+                       | _ -> ()) in
+              c9))
+     | _ -> k)
 
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with

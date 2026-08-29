@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 384 files.
+Classified: 381 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,23 +53,23 @@ Classified: 384 files.
 
 </details>
 
-## DIFF — 363 files, 99 kinds
+## DIFF — 360 files, 99 kinds
 
 | files | kind |
 |---|---|
-| 61 | `ERROR NoMethodError` |
+| 60 | `ERROR NoMethodError` |
 | 22 | `ERROR NameError` |
 | 20 | `FAILED expected truthy from #include?` |
 | 19 | `FAILED expected N, got N` |
 | 19 | `ERROR StandardError` |
 | 16 | `FAILED expected true, got false` |
-| 13 | `FAILED expected ArgumentError to be raised` |
 | 12 | `FAILED expected to be identical` |
+| 12 | `FAILED expected ArgumentError to be raised` |
 | 11 | `FAILED expected TypeError to be raised` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 8 | `FAILED expected "S", got "S"` |
 | 8 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
+| 7 | `FAILED expected "S", got "S"` |
 | 6 | `FAILED expected N, got nil` |
 | 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
@@ -107,8 +107,8 @@ Classified: 384 files.
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
+| 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
 | 1 | `FAILED expected {:SYM=>N}, got {}` |
-| 1 | `FAILED expected {:A=>N, "S"=>N, "S"=>N}, got {"S"=>N, "S"=>N, "S"=>N}` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
 | 1 | `FAILED expected {"S"=>N, "S"=>N}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
@@ -161,7 +161,7 @@ Classified: 384 files.
 
 | files | cause |
 |---|---|
-| 13 | `FAILED: expected ArgumentError to be raised` |
+| 12 | `FAILED: expected ArgumentError to be raised` |
 | 11 | `FAILED: expected TypeError to be raised` |
 | 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
@@ -217,9 +217,9 @@ class column says where the weight sits.
 | integer (10) | `ceildiv div gcd ord pred remainder round size succ try_convert` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
-| struct (7) | `deconstruct dig element_reference element_set filter keyword_init new` |
 | proc (7) | `binding case_compare curry element_reference new to_proc yield` |
 | method (7) | `case_compare clone curry element_reference source_location super_method to_proc` |
+| struct (6) | `deconstruct element_reference element_set filter keyword_init new` |
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
