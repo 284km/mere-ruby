@@ -874,6 +874,7 @@ let hcbi_copy = fn (src: int) -> fn (dst: Val) ->
   | VHsh d -> (if map_has hcbi (str_of_int src) then map_set hcbi (str_of_int d) 1 else ())
   | _ -> ();
 
+
 // nesting depth of active catch(:tag) blocks (throw without any catch
 // raises UncaughtThrowError immediately).
 let catch_depth = map_new ();
@@ -9843,6 +9844,12 @@ let rec hash_merge_all = fn (base: Val list) -> fn (args: Val list) ->
   | Cons (VHsh o, t) -> hash_merge_all (hash_merge base (hderef o)) t
   | Cons (_, t) -> hash_merge_all base t;
 // swap keys and values.
+// the pairs whose VALUE is not nil (Hash#compact).
+let rec hash_drop_nil = fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (match v with VNil -> hash_drop_nil t | _ -> Cons (k, Cons (v, hash_drop_nil t)))
+  | _ -> (Nil : Val list);
 let rec hash_invert = fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
@@ -13951,8 +13958,61 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        match hash_filter world encl theblk xs Nil (if str_eq name "reject" then false else true) with
        | FNext r9 -> (let _ = hcbi_copy src9 r9 in iter_result (FNext r9) recv)
        | other -> iter_result other recv)
-    else if str_eq name "transform_values" then iter_result (FNext (mkhash (hash_tv world encl theblk xs))) recv
-    else if str_eq name "transform_keys" then iter_result (FNext (mkhash (hash_tk world encl theblk xs))) recv
+    else if str_eq name "transform_values" then
+      // the identity flag rides along, the DEFAULT does not (ruby 3.2).
+      (let src9 = (match recv with VHsh h9 -> h9 | _ -> 0) in
+       let r9 = mkhash (hash_tv world encl theblk xs) in
+       let _ = hcbi_copy src9 r9 in
+       iter_result (FNext r9) recv)
+    // two old keys that transform to the SAME new key collapse to one pair,
+    // the later one (the flat list was not merged).
+    else if str_eq name "transform_keys" then
+      iter_result (FNext (mkhash (hash_merge Nil (hash_tk world encl theblk xs)))) recv
+    // the BANG forms write the result back and answer self (they did not exist).
+    // fetch_values with a block: the block supplies the value for a key that
+    // is not there (it had no block form and raised KeyError).
+    // Hash#sort with a block sorts the [k, v] pairs with that comparator (the
+    // block was ignored and the natural order came back).
+    else if str_eq name "sort" then
+      (let (st9, broke9, bv9) = sort_blk_b world theblk (hash_pairs xs) in
+       if broke9 then bv9 else arr_new st9)
+    // Hash#to_h with a block hands the block the key and the value as SEPARATE
+    // arguments and takes the [k, v] pair it answers.
+    else if str_eq name "to_h" then
+      (let rec go = fn (ys: Val list) ->
+         (match ys with
+          | Cons (k, Cons (v, t)) ->
+            (match flow_value (run_block world encl theblk (Cons (k, Cons (v, Nil)))) with
+             // the pair must have exactly two elements: a longer or shorter one
+             // is ruby's ArgumentError, and a non-array its TypeError.
+             | VArr aid ->
+               (if val_list_len (deref aid) == 2 then list_append (deref aid) (go t)
+                else (let _ = raise_exc world "ArgumentError"
+                                ("element has wrong array length (expected 2, was "
+                                 ++ str_of_int (val_list_len (deref aid)) ++ ")") in go t))
+             | other -> (let _ = raise_exc world "TypeError"
+                                   ("wrong element type " ++ class_name other ++ " (expected array)") in go t))
+          | _ -> (Nil : Val list)) in
+       mkhash (hash_merge Nil (go xs)))
+    else if str_eq name "fetch_values" then
+      (let rec go = fn (ks: Val list) ->
+         (match ks with
+          | Nil -> (Nil : Val list)
+          | Cons (k, t) ->
+            Cons ((if hash_haskey xs k then hash_get xs k
+                   else flow_value (run_block world encl theblk (Cons (k, Nil)))), go t)) in
+       arr_new (go args))
+    else if str_eq name "transform_keys!" then
+      (match recv with
+       | VHsh hid -> (let _ = hset hid (hash_merge Nil (hash_tk world encl theblk xs)) in recv)
+       | _ -> recv)
+    else if str_eq name "transform_values!" then
+      (match recv with
+       | VHsh hid ->
+         (let (out9, broke9, bv9) = hash_tv_b world encl theblk xs in
+          let _ = hset hid out9 in
+          if broke9 then bv9 else recv)
+       | _ -> recv)
     else if str_eq name "each_key" then iter_each_result (hash_each_one world encl theblk xs true) recv
     else if str_eq name "each_value" then iter_each_result (hash_each_one world encl theblk xs false) recv
     // delete_if / keep_if filter IN PLACE: the receiver is a handle, so the
@@ -14453,6 +14513,20 @@ and hash_tv = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
   | Cons (k, rest) -> (match rest with Cons (v, t) -> Cons (k, Cons (flow_value (run_block world encl theblk (Cons (v, Nil))), hash_tv world encl theblk t)) | Nil -> Nil)
+
+// ...and the form that STOPS at a break, leaving the pairs after it as they
+// were: `transform_values!` that breaks half way keeps the rest of the values
+// (flow_value swallowed the break and wrote nil over them).
+and hash_tv_b = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (match run_block world encl theblk (Cons (v, Nil)) with
+     | FBreak bv -> (Cons (k, Cons (v, t)), true, bv)
+     | FReturn rv -> (Cons (k, Cons (v, t)), true, rv)
+     | f ->
+       (let (rest9, broke9, bv9) = hash_tv_b world encl theblk t in
+        (Cons (k, Cons (flow_value f, rest9)), broke9, bv9)))
+  | other -> (other, false, VNil)
 and hash_tk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
@@ -15912,6 +15986,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     (match recv with VHsh hid -> hdproc_get hid | _ -> VNil)
   // `h.default_proc = proc { |hash, key| ... }`: the same default a block
   // given to Hash.new installs, set after the fact. nil removes it.
+  // transform_keys / transform_values without a block are ENUMERATORS, and
+  // transform_keys also takes a HASH that maps old keys to new ones (with the
+  // block, when both are given, deciding the keys the hash does not name).
+  else if (str_eq name "transform_keys" || str_eq name "transform_values"
+           || str_eq name "transform_keys!" || str_eq name "transform_values!")
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Nil -> true | _ -> false) then
+    make_enum_a world recv name args
+  else if (str_eq name "transform_keys" || str_eq name "transform_keys!")
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (VHsh _, _) -> true | _ -> false) then
+    (match (recv, args) with
+     | (VHsh hid, Cons (VHsh mid, _)) ->
+       (let mp = hderef mid in
+        let rec go = fn (ys: Val list) ->
+          (match ys with
+           | Cons (k, Cons (v, t)) ->
+             Cons ((if hash_haskey mp k then hash_get mp k else k), Cons (v, go t))
+           | _ -> (Nil : Val list)) in
+        let out = hash_merge Nil (go (hderef hid)) in
+        if str_eq name "transform_keys!" then (let _ = hset hid out in recv) else mkhash out)
+     | _ -> recv)
+  // Hash#fetch takes a key and at most one default; Hash#deconstruct_keys takes
+  // exactly one argument. Both accepted any number.
+  else if str_eq name "fetch" && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with
+              | Nil -> true
+              | Cons (_, Cons (_, Cons (_, _))) -> true
+              | _ -> false) then
+    raise_exc world "ArgumentError"
+      ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
+  else if str_eq name "deconstruct_keys" && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (_, Nil) -> false | _ -> true) then
+    raise_exc world "ArgumentError"
+      ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
   // Hash#default(key) with a default PROC calls it with (hash, key); with no
   // argument the proc is not called at all. The primitive has no world to call
   // it with, so it answered the (absent) plain default.
@@ -23792,6 +23901,23 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)"))
      | VHsh h -> arr_new (hderef h)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "flatten") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten'")) in fail "mere-ruby: undefined method 'flatten'")))
+  // (a HASH drops its nil-VALUED pairs; compact! answers nil when there were
+  // none, which is the rule about the NAME, not about the type.)
+  else if str_eq name "compact" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     // (ruby 3.2's compact answers a PLAIN hash: it carries neither the default
+     // nor the identity flag. The spec expects both, and ruby fails it too --
+     // the gate is what ruby does, not what the spec asks for.)
+     | VHsh hid -> mkhash (hash_drop_nil (hderef hid))
+     | _ -> recv)
+  else if str_eq name "compact!" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     | VHsh hid ->
+       (let before9 = hash_len (hderef hid) in
+        let out9 = hash_drop_nil (hderef hid) in
+        let _ = hset hid out9 in
+        if hash_len out9 == before9 then VNil else recv)
+     | _ -> recv)
   else if str_eq name "compact" then (match recv with VArr id -> arr_new (val_compact (deref id)) | _ -> (let _ = map_set prim_missing "n" (mkstr "compact") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact'")) in fail "mere-ruby: undefined method 'compact'")))
   else if str_eq name "deconstruct" then (match recv with VArr _ -> recv | _ -> (let _ = map_set prim_missing "n" (mkstr "deconstruct") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'deconstruct'")) in fail "mere-ruby: undefined method 'deconstruct'")))
   else if str_eq name "union" then
@@ -23976,7 +24102,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> recv)
   else if str_eq name "compare_by_identity?" then
     (match recv with VHsh hid -> VBool (hcbi_on hid) | _ -> VBool false)
-  else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh xs -> mkhash (hderef xs) | VNil -> mkhash Nil | _ -> (let _ = map_set prim_missing "n" (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
+  // `h.to_h` with no block answers SELF for a plain Hash (not a copy), which
+  // is why it carries the default, the default_proc and the identity flag.
+  else if str_eq name "to_h" then (match recv with VArr id -> mkhash (val_to_h (deref id)) | VHsh _ -> recv | VNil -> mkhash Nil | _ -> (let _ = map_set prim_missing "n" (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
   // Array#pack — a small but common subset: "U"/"U*" encode integer codepoints
   // as UTF-8, "C"/"c" pack the low byte of each integer. A bare directive packs
   // one element, "*" packs all. (Other directives are not implemented.)
@@ -24343,8 +24471,28 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "except" then
     (match recv with VHsh xs -> (let r9 = mkhash (hash_except (hderef xs) args) in
                                  let _ = hcbi_copy xs r9 in r9) | _ -> (let _ = map_set prim_missing "n" (mkstr "except") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'except'")) in fail "mere-ruby: undefined method 'except'")))
+  // Hash#deconstruct_keys(keys) is the pattern-matching hook: it answers self
+  // (the keys argument only tells it what will be read).
+  else if str_eq name "deconstruct_keys" then
+    (match recv with VHsh _ -> recv | _ -> recv)
+  // Hash#compact drops the nil-VALUED pairs (compact! answers nil when there
+  // were none). Neither existed.
+  else if str_eq name "compact" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     | VHsh hid -> mkhash (hash_drop_nil (hderef hid))
+     | _ -> recv)
+  else if str_eq name "compact!" && (match recv with VHsh _ -> true | _ -> false) then
+    (match recv with
+     | VHsh hid ->
+       (let before = hash_len (hderef hid) in
+        let out = hash_drop_nil (hderef hid) in
+        let _ = hset hid out in
+        if hash_len out == before then VNil else recv)
+     | _ -> recv)
   else if str_eq name "invert" then
-    (match recv with VHsh xs -> mkhash (hash_invert (hderef xs)) | _ -> (let _ = map_set prim_missing "n" (mkstr "invert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'invert'")) in fail "mere-ruby: undefined method 'invert'")))
+    // a value that appears twice becomes ONE key, taking the LATER pair
+    // (the flat list was handed to mkhash unmerged, so the hash held it twice).
+    (match recv with VHsh xs -> mkhash (hash_merge Nil (hash_invert (hderef xs))) | _ -> (let _ = map_set prim_missing "n" (mkstr "invert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'invert'")) in fail "mere-ruby: undefined method 'invert'")))
   else if str_eq name "fetch" then
     (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (k, rest) -> if hash_haskey xs k then hash_get xs k else (match rest with Cons (d, _) -> d | Nil -> VNil) | _ -> VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "fetch") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fetch'")) in fail "mere-ruby: undefined method 'fetch'")))
   else if str_eq name "key" then
