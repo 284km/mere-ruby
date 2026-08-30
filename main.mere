@@ -1202,6 +1202,31 @@ let prim_raise = fn (cls: str) -> fn (msg: str) ->
   let _ = map_set prim_missing "m" (mkstr msg) in
   let _ = note_raise_site () in
   (let __fm = ("mere-ruby: " ++ cls ++ ": " ++ msg) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
+// `Integer(x, exception: false)` / `Float(x, exception: false)` answer nil
+// where the raising form refuses. The refusal RULES must stay in one place --
+// a separate "would this parse?" validator is a second copy of them that
+// drifts -- so the parsers keep raising, and this channel turns the raise into
+// a recorded flag while a no-exception conversion is running. Saved and
+// restored around each region so a conversion reached from inside another one
+// (a user #to_i that calls Integer itself) does not inherit the flag.
+let conv_soft = map_new ();
+let conv_fail = fn (cls: str) -> fn (msg: str) ->
+  if map_has conv_soft "on" then map_set conv_soft "bad" 1
+  else (let _ = prim_raise cls msg in ());
+let conv_soft_begin = fn () ->
+  let prev = (if map_has conv_soft "on" then 1 else 0) + (if map_has conv_soft "bad" then 2 else 0) in
+  let _ = map_set conv_soft "on" 1 in
+  let _ = (if map_has conv_soft "bad" then map_delete conv_soft "bad" else ()) in
+  prev;
+// answers whether the region refused, and puts the enclosing state back.
+let conv_soft_end = fn (prev: int) ->
+  let bad = map_has conv_soft "bad" in
+  let _ = (if prev % 2 == 1 then map_set conv_soft "on" 1
+           else (if map_has conv_soft "on" then map_delete conv_soft "on" else ())) in
+  let _ = (if prev >= 2 then map_set conv_soft "bad" 1
+           else (if map_has conv_soft "bad" then map_delete conv_soft "bad" else ())) in
+  bad;
+
 let is_upper_first = fn (id: str) ->
   str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
 // Kernel#local_variables: the local names bound in `env`, as symbols in
@@ -6688,6 +6713,98 @@ let rec pow_flt = fn (b: float) -> fn (e: int) ->
   else if e == 0 then 1.0
   else b * pow_flt b (e - 1);
 
+// ---- bignum: schoolbook arithmetic on canonical decimal strings ----------
+// magnitude = bare digit string, no leading zeros ("0" for zero).
+let rec mag_strip = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s - 1 then substring s i (str_len s)
+  else if str_eq (char_at s i) "0" then mag_strip s (i + 1)
+  else substring s i (str_len s);
+let mag_cmp = fn (a: str) -> fn (b: str) ->
+  let la = str_len a in let lb = str_len b in
+  if la < lb then 0 - 1 else if la > lb then 1 else str_compare a b;
+let rec zeros = fn (n: int) -> if n <= 0 then "" else "0" ++ zeros (n - 1);
+
+let rec mag_add_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (carry: int) -> fn (acc: str) ->
+  let la = str_len a in let lb = str_len b in
+  if i >= la && i >= lb && carry == 0 then (if str_eq acc "" then "0" else acc)
+  else
+    let da = if i < la then ord (char_at a (la - 1 - i)) - 48 else 0 in
+    let db = if i < lb then ord (char_at b (lb - 1 - i)) - 48 else 0 in
+    let s = da + db + carry in
+    mag_add_go a b (i + 1) (s / 10) (chr (s - (s / 10) * 10 + 48) ++ acc);
+let mag_add = fn (a: str) -> fn (b: str) -> mag_add_go a b 0 0 "";
+
+// a - b, assuming a >= b (magnitudes).
+let rec mag_sub_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (borrow: int) -> fn (acc: str) ->
+  let la = str_len a in let lb = str_len b in
+  if i >= la then acc
+  else
+    let da = ord (char_at a (la - 1 - i)) - 48 in
+    let db = (if i < lb then ord (char_at b (lb - 1 - i)) - 48 else 0) + borrow in
+    let d = da - db in
+    let d2 = if d < 0 then d + 10 else d in
+    let nb = if d < 0 then 1 else 0 in
+    mag_sub_go a b (i + 1) nb (chr (d2 + 48) ++ acc);
+let mag_sub = fn (a: str) -> fn (b: str) -> mag_strip (mag_sub_go a b 0 0 "") 0;
+
+// magnitude a times a single digit d (0..9).
+let rec mag_mul1_go = fn (a: str) -> fn (d: int) -> fn (i: int) -> fn (carry: int) -> fn (acc: str) ->
+  let la = str_len a in
+  if i >= la then (if carry == 0 then acc else str_of_int carry ++ acc)
+  else let da = ord (char_at a (la - 1 - i)) - 48 in
+       let p = da * d + carry in
+       mag_mul1_go a d (i + 1) (p / 10) (chr (p - (p / 10) * 10 + 48) ++ acc);
+let mag_mul1 = fn (a: str) -> fn (d: int) -> if d == 0 then "0" else mag_mul1_go a d 0 0 "";
+let rec mag_mul_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len b then acc
+  else
+    let d = ord (char_at b (str_len b - 1 - i)) - 48 in
+    let partial = mag_strip (mag_mul1 a d) 0 ++ zeros i in
+    mag_mul_go a b (i + 1) (mag_add acc (mag_strip partial 0));
+let mag_mul = fn (a: str) -> fn (b: str) -> mag_strip (mag_mul_go a b 0 "0") 0;
+
+// signed decimal strings ("-" prefix). sign/magnitude accessors.
+let big_sign = fn (s: str) -> if str_len s > 0 && str_eq (char_at s 0) "-" then 0 - 1 else 1;
+let big_mag = fn (s: str) -> if str_len s > 0 && str_eq (char_at s 0) "-" then substring s 1 (str_len s) else s;
+let with_sign = fn (sgn: int) -> fn (mag: str) ->
+  if str_eq mag "0" then "0" else if sgn < 0 then "-" ++ mag else mag;
+
+let big_add_s = fn (a: str) -> fn (b: str) ->
+  let sa = big_sign a in let sb = big_sign b in
+  let ma = big_mag a in let mb = big_mag b in
+  if sa == sb then with_sign sa (mag_add ma mb)
+  else
+    let c = mag_cmp ma mb in
+    if c == 0 then "0"
+    else if c > 0 then with_sign sa (mag_sub ma mb)
+    else with_sign sb (mag_sub mb ma);
+let big_neg_s = fn (a: str) -> if str_eq a "0" then "0" else if big_sign a < 0 then big_mag a else "-" ++ a;
+let big_sub_s = fn (a: str) -> fn (b: str) -> big_add_s a (big_neg_s b);
+let big_mul_s = fn (a: str) -> fn (b: str) -> with_sign (big_sign a * big_sign b) (mag_mul (big_mag a) (big_mag b));
+
+// The exact integer value of a Float. Above 2^53 every double is already
+// whole, so halving until the mantissa fits is exact and the value is
+// mantissa * 2^shift -- Integer(2e100) used to clamp to the machine maximum.
+let rec flt_scale_down = fn (g: float) -> fn (e: int) ->
+  if g >= 9007199254740992.0 then flt_scale_down (g / 2.0) (e + 1) else (g, e);
+let rec big_pow2_s = fn (e: int) ->
+  if e <= 0 then "1" else (let h = big_pow2_s (e - 1) in big_add_s h h);
+let flt_to_big_s = fn (f: float) ->
+  let neg = f < 0.0 in
+  let a = (if neg then 0.0 - f else f) in
+  let (g, e) = flt_scale_down a 0 in
+  let mag = big_mul_s (str_of_int (int_of_float g)) (big_pow2_s e) in
+  (if neg then "-" ++ mag else mag);
+// Integer == Float compares EXACT values (ruby's rb_integer_float_eq): the
+// double 2e100 IS the integer 2000...208, so they are equal, while a float
+// with a fraction -- or one that is not finite -- equals no integer at all.
+let big_eq_flt = fn (x: str) -> fn (f: float) ->
+  if (f == f) == false then false
+  else if f > 1.7976931348623157e308 || f < (0.0 - 1.7976931348623157e308) then false
+  else if f < 9007199254740992.0 && f > (0.0 - 9007199254740992.0)
+  then float_of_int (int_of_float f) == f && str_eq x (str_of_int (int_of_float f))
+  else str_eq x (flt_to_big_s f);
+
 let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   match va with
   | VInt x ->
@@ -6700,9 +6817,10 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
     (match vb with
      | VInt y -> feq x (float_of_int y)
      | VFlt y -> feq x y
+     | VBig y -> big_eq_flt y x
      | _ -> false)
   // canonical form: a VBig never equals a VInt; two VBig equal iff same string.
-  | VBig x -> (match vb with VBig y -> str_eq x y | _ -> false)
+  | VBig x -> (match vb with VBig y -> str_eq x y | VFlt y -> big_eq_flt x y | _ -> false)
   | VRat (n, d) -> (match vb with VRat (n2, d2) -> str_eq n n2 && str_eq d d2 | VInt m -> str_eq d "1" && str_eq n (str_of_int m) | VFlt f -> feq (float_of_str n / float_of_str d) f | _ -> false)
   | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> rb_eq r r2 && rb_eq i i2 | VInt m -> rb_eq i (VInt 0) && rb_eq r (VInt m) | _ -> false)
   | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in str_eq x y | _ -> false)
@@ -6844,74 +6962,6 @@ let rec hash_put_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn 
 
 
 // numeric / string ordering: negative | zero | positive like a compare fn.
-// ---- bignum: schoolbook arithmetic on canonical decimal strings ----------
-// magnitude = bare digit string, no leading zeros ("0" for zero).
-let rec mag_strip = fn (s: str) -> fn (i: int) ->
-  if i >= str_len s - 1 then substring s i (str_len s)
-  else if str_eq (char_at s i) "0" then mag_strip s (i + 1)
-  else substring s i (str_len s);
-let mag_cmp = fn (a: str) -> fn (b: str) ->
-  let la = str_len a in let lb = str_len b in
-  if la < lb then 0 - 1 else if la > lb then 1 else str_compare a b;
-let rec zeros = fn (n: int) -> if n <= 0 then "" else "0" ++ zeros (n - 1);
-
-let rec mag_add_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (carry: int) -> fn (acc: str) ->
-  let la = str_len a in let lb = str_len b in
-  if i >= la && i >= lb && carry == 0 then (if str_eq acc "" then "0" else acc)
-  else
-    let da = if i < la then ord (char_at a (la - 1 - i)) - 48 else 0 in
-    let db = if i < lb then ord (char_at b (lb - 1 - i)) - 48 else 0 in
-    let s = da + db + carry in
-    mag_add_go a b (i + 1) (s / 10) (chr (s - (s / 10) * 10 + 48) ++ acc);
-let mag_add = fn (a: str) -> fn (b: str) -> mag_add_go a b 0 0 "";
-
-// a - b, assuming a >= b (magnitudes).
-let rec mag_sub_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (borrow: int) -> fn (acc: str) ->
-  let la = str_len a in let lb = str_len b in
-  if i >= la then acc
-  else
-    let da = ord (char_at a (la - 1 - i)) - 48 in
-    let db = (if i < lb then ord (char_at b (lb - 1 - i)) - 48 else 0) + borrow in
-    let d = da - db in
-    let d2 = if d < 0 then d + 10 else d in
-    let nb = if d < 0 then 1 else 0 in
-    mag_sub_go a b (i + 1) nb (chr (d2 + 48) ++ acc);
-let mag_sub = fn (a: str) -> fn (b: str) -> mag_strip (mag_sub_go a b 0 0 "") 0;
-
-// magnitude a times a single digit d (0..9).
-let rec mag_mul1_go = fn (a: str) -> fn (d: int) -> fn (i: int) -> fn (carry: int) -> fn (acc: str) ->
-  let la = str_len a in
-  if i >= la then (if carry == 0 then acc else str_of_int carry ++ acc)
-  else let da = ord (char_at a (la - 1 - i)) - 48 in
-       let p = da * d + carry in
-       mag_mul1_go a d (i + 1) (p / 10) (chr (p - (p / 10) * 10 + 48) ++ acc);
-let mag_mul1 = fn (a: str) -> fn (d: int) -> if d == 0 then "0" else mag_mul1_go a d 0 0 "";
-let rec mag_mul_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (acc: str) ->
-  if i >= str_len b then acc
-  else
-    let d = ord (char_at b (str_len b - 1 - i)) - 48 in
-    let partial = mag_strip (mag_mul1 a d) 0 ++ zeros i in
-    mag_mul_go a b (i + 1) (mag_add acc (mag_strip partial 0));
-let mag_mul = fn (a: str) -> fn (b: str) -> mag_strip (mag_mul_go a b 0 "0") 0;
-
-// signed decimal strings ("-" prefix). sign/magnitude accessors.
-let big_sign = fn (s: str) -> if str_len s > 0 && str_eq (char_at s 0) "-" then 0 - 1 else 1;
-let big_mag = fn (s: str) -> if str_len s > 0 && str_eq (char_at s 0) "-" then substring s 1 (str_len s) else s;
-let with_sign = fn (sgn: int) -> fn (mag: str) ->
-  if str_eq mag "0" then "0" else if sgn < 0 then "-" ++ mag else mag;
-
-let big_add_s = fn (a: str) -> fn (b: str) ->
-  let sa = big_sign a in let sb = big_sign b in
-  let ma = big_mag a in let mb = big_mag b in
-  if sa == sb then with_sign sa (mag_add ma mb)
-  else
-    let c = mag_cmp ma mb in
-    if c == 0 then "0"
-    else if c > 0 then with_sign sa (mag_sub ma mb)
-    else with_sign sb (mag_sub mb ma);
-let big_neg_s = fn (a: str) -> if str_eq a "0" then "0" else if big_sign a < 0 then big_mag a else "-" ++ a;
-let big_sub_s = fn (a: str) -> fn (b: str) -> big_add_s a (big_neg_s b);
-let big_mul_s = fn (a: str) -> fn (b: str) -> with_sign (big_sign a * big_sign b) (mag_mul (big_mag a) (big_mag b));
 let rec big_pow = fn (base: str) -> fn (e: int) -> fn (acc: str) ->
   if e <= 0 then acc else big_pow base (e - 1) (big_mul_s acc base);
 
@@ -11269,34 +11319,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
          (if map_has autoloads key then map_get autoloads key else VNil)
        | _ -> VNil)
-    else if str_eq name "Integer" then
-      (match args with
-       | Cons (VInt n, _) -> VInt n
-       | Cons (VBig s, _) -> VBig s
-       | Cons (VFlt f, _) -> VInt (int_of_float f)
-       | Cons (VRat (n, d), _) -> norm_big (big_div_s n d)
-       | Cons (VStr s, Cons (VInt base, _)) -> VInt (str_to_int_base (sget s) base)
-       | Cons (VStr s, _) -> rb_int_parse (sget s)
-       | _ -> raise_exc world "TypeError" "can't convert to Integer")
-    else if str_eq name "Float" then (match args with Cons (VStr s, _) -> VFlt (float_of_str (sget s)) | Cons (v, _) -> VFlt (to_f v) | _ -> VFlt 0.0)
-    else if str_eq name "String" then (match args with Cons (v, _) -> mkstr (to_s v) | _ -> mkstr "")
-    else if str_eq name "Rational" then
-      // Float and String arguments are exact, not zero: Rational(2.5) is 5/2
-      // and Rational(1, 2.54) is the float's exact binary value over a power
-      // of two, as in ruby. num_dec alone answered "0" for both.
-      (match args with
-       | Cons (a0, Cons (b0, _)) ->
-         let (an, ad) = rat_parts a0 in
-         let (bn, bd) = rat_parts b0 in
-         mk_rat_s (big_mul_s an bd) (big_mul_s ad bn)
-       | Cons (a0, _) -> let (an, ad) = rat_parts a0 in mk_rat_s an ad
-       | _ -> mk_rat_s "0" "1")
-    else if str_eq name "Complex" then
-      (match args with Cons (r, Cons (i, _)) -> VCpx (r, i) | Cons (r, _) -> VCpx (r, VInt 0) | _ -> VCpx (VInt 0, VInt 0))
-    else if str_eq name "Array" then
-      (match args with Cons (VArr id, _) -> VArr id | Cons (VNil, _) -> arr_new Nil | Nil -> arr_new Nil | Cons (v, _) -> arr_new (Cons (v, Nil)))
-    else if str_eq name "Hash" then
-      (match args with Cons (VHsh h, _) -> VHsh h | _ -> mkhash Nil)
+    else if is_kernel_conv name then kernel_conv_fn env world name args
     // using refinery — activate the refinery's refinements into ref_active.
     // The scope is bounded by the enclosing module/class body (register_class
     // save/restores ref_active), matching Ruby's lexical activation.
@@ -15754,6 +15777,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               then coerce_str_int_args env world args0
               else args0) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // A name killed by `undef` / `undef_method` is gone for EVERY answer, not
+  // just the user table: the call goes to method_missing if the object has
+  // one, and to NoMethodError if it does not. Without this the builtin behind
+  // the undef'd name kept answering (see undef_blocked).
+  if undef_blocked world (dispatch_cls_of world recv) name then
+    (let c9u = dispatch_cls_of world recv in
+     if has_meth world c9u "method_missing"
+     then invoke world noblk recv c9u "method_missing" (Cons (VSym name, args))
+     else raise_exc world "NoMethodError"
+            ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world (class_name recv)))
+  else
+  // The Kernel conversion functions are PRIVATE instance methods of Object, so
+  // `obj.send(:Integer, "1")` reaches them on any receiver -- only on the send
+  // path (vischeck off), and only when nothing in the chain claims the name.
+  if is_kernel_conv name
+     && (if vischeck then false else true)
+     && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+     && (if has_meth world (dispatch_cls_of world recv) "method_missing" then false else true) then
+    kernel_conv_fn env world name args
+  else
   // Kernel#raise reached by NAME (send / a matcher's method_missing
   // forwarding) works on EVERY receiver -- checked before the per-type
   // arms, whose unknown-name fallbacks would say NoMethodError first. The
@@ -18029,9 +18072,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // this class (used e.g. on a singleton class to undo a class method).
     else if str_eq name "remove_method" || str_eq name "undef_method" then
       (let (meths0, _, _, _) = world in
-       let _ = (match args with
-                | Cons (v, _) -> let key = c ++ "#" ++ to_s v in if map_has meths0 key then map_delete meths0 key else ()
-                | _ -> ()) in
+       // undef_method makes the name UNREACHABLE (a tombstone that also blocks
+       // what the ancestors -- and the builtins -- would answer); remove_method
+       // only drops this class's own definition and lets the chain answer.
+       let tomb = str_eq name "undef_method" in
+       let rec go9 = fn (as9: Val list) ->
+         (match as9 with
+          | Nil -> ()
+          | Cons (v, rest9) ->
+            let n9 = (match v with VSym sy -> sy | VStr h -> sget h | other -> to_s other) in
+            let key = c ++ "#" ++ n9 in
+            let _ = if map_has meths0 key then map_delete meths0 key else () in
+            let _ = if map_has builtin_alias key then map_delete builtin_alias key else () in
+            let _ = if tomb then map_set undefs key VNil else () in
+            go9 rest9) in
+       let _ = go9 args in
        recv)
     // private_constant / public_constant as METHODS on the class. Only the
     // statement form inside a class body existed, so `C.private_constant :A`
@@ -21403,8 +21458,12 @@ and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
     (let (meths, sup, ocls, ivars) = world in
      let cls = map_get ocls (str_of_int id) in
      let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-     if has_meth world cls mname then invoke_val_c env world nb v mname Nil false
-     else if is_prim_method mname || builtin_obj_has cls mname then
+     // an undef'd name is not there to be called, no matter that the builtin
+     // (or a superclass) would have answered it -- fall through to the
+     // respond_to? / method_missing half, which is where ruby ends up too.
+     let live = (if undef_blocked world cls mname then false else true) in
+     if live && has_meth world cls mname then invoke_val_c env world nb v mname Nil false
+     else if live && (is_prim_method mname || builtin_obj_has cls mname) then
        invoke_val_c env world nb v mname Nil false
      else
        // a user respond_to? that says no ends it; otherwise
@@ -21476,7 +21535,10 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
     // a user-defined #respond_to? overrides the internal logic (CRuby asks
     // the object; a spec mock answers true here). Only consult it when the
     // class defines its own (not the builtin), to avoid recursion.
-    if has_meth world cls "respond_to?" then
+    // an undef'd name does not answer respond_to? -- but a REDEFINED
+    // respond_to? still gets to say whatever it likes about it.
+    if undef_blocked world cls name && (if has_meth world cls "respond_to?" then false else true) then false
+    else if has_meth world cls "respond_to?" then
       // ruby passes the include_all flag only to a respond_to? that TAKES it
       // (it looks at the arity), so a one-parameter override still works and
       // a two-parameter one does not get an ArgumentError.
@@ -21513,7 +21575,8 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   // optparse's CompletingHash < Hash defines #match, and `respond_to?(:match)`
   // is what decides whether optparse accepts it. Calling the method already
   // worked; only the question was answered wrong.
-  | VStr _ -> prim_user_has world recv name || is_prim_method name || is_str_method name || str_eq name "to_str"
+  | VStr _ -> (if undef_blocked world (dispatch_cls_of world recv) name then false
+               else prim_user_has world recv name || is_prim_method name || is_str_method name || str_eq name "to_str")
   | VProc _ -> is_prim_method name || is_proc_method name
   // the implicit-conversion protocol is per type, so a duck-type check
   // (`x.respond_to? :to_str`) tells strings from everything else.
@@ -25480,26 +25543,269 @@ and rb_fmt_int = fn env -> fn world -> fn (v: Val) ->
 // sign, an optional base prefix (0x 0b 0o 0d, or a bare leading 0 meaning
 // octal), then digits of that base with single underscores strictly BETWEEN
 // digits. Anything else is an ArgumentError, never a zero.
-and rb_int_parse = fn (s0: str) ->
+// Kernel#Integer / Kernel#Float. Both take a trailing `exception:` keyword and
+// both walk a conversion protocol before they parse anything; the value arms
+// used to be a five-line match that truncated bignums, ignored #to_int and
+// #to_str, and read a based string with the lax str_to_int_base.
+and kern_exc_kw = fn (v: Val) ->
+  (match v with
+   | VHsh h -> (match hash_lookup (hderef h) (VSym "exception") with
+                | (true, x) -> (true, truthy x)
+                | _ -> (false, true))
+   | _ -> (false, true))
+
+// the trailing hash is the keyword hash only when it actually carries
+// `exception:` -- `Integer(h)` must stay a (refused) positional argument.
+and kern_conv_kw = fn (args: Val list) ->
+  match args with
+  | Cons (a, Cons (b, Cons (c, Nil))) ->
+    (match kern_exc_kw c with (true, r) -> (Cons (a, Cons (b, Nil)), r) | _ -> (args, true))
+  | Cons (a, Cons (b, Nil)) ->
+    (match kern_exc_kw b with (true, r) -> (Cons (a, Nil), r) | _ -> (args, true))
+  | Cons (a, Nil) ->
+    (match kern_exc_kw a with (true, r) -> ((Nil : Val list), r) | _ -> (args, true))
+  | _ -> (args, true)
+
+// how ruby names a value inside "... gives X": the three singletons by their
+// literal, everything else by its class.
+and conv_gives_name = fn (v: Val) ->
+  match v with
+  | VNil -> "nil"
+  | VBool b -> (if b then "true" else "false")
+  | other -> class_name other
+
+// The seven Kernel conversion functions, in ONE place: they are reached both
+// as implicit-self calls (`Integer("1")`) and, being private instance methods
+// of Object, through send (`obj.send(:Float, "20e_")`, which ruby/spec uses).
+// A second copy for the send path would be a second set of answers.
+and is_kernel_conv = fn (name: str) ->
+  str_eq name "Integer" || str_eq name "Float" || str_eq name "String" ||
+  str_eq name "Array" || str_eq name "Hash" || str_eq name "Rational" ||
+  str_eq name "Complex"
+
+and kernel_conv_fn = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
+    if str_eq name "Integer" then kernel_integer env world args
+    else if str_eq name "Float" then kernel_float env world args
+    // Kernel#String(obj): #to_str first, then #to_s -- and an object that
+    // answers NEITHER with a String is a TypeError, not its inspect text.
+    // (`to_s v` printed `#<object>` for every object with a user to_s.)
+    else if str_eq name "String" then
+      (match args with
+       | Cons (VStr h9, _) -> VStr h9
+       | Cons (v, _) ->
+         (match conv_try env world v "to_str" with
+          | VStr r9 -> VStr r9
+          | _ ->
+            (let r8 = conv_try env world v "to_s" in
+             match r8 with
+             | VStr r9 -> VStr r9
+             | VNil -> (match v with
+                        | VObj _ -> raise_exc world "TypeError"
+                                      ("can't convert " ++ class_name v ++ " into String")
+                        | _ -> mkstr (to_s v))
+             | other -> raise_exc world "TypeError"
+                          ("can't convert " ++ class_name v ++ " to String ("
+                           ++ class_name v ++ "#to_s gives " ++ class_name other ++ ")")))
+       | _ -> mkstr "")
+    else if str_eq name "Rational" then
+      // Float and String arguments are exact, not zero: Rational(2.5) is 5/2
+      // and Rational(1, 2.54) is the float's exact binary value over a power
+      // of two, as in ruby. num_dec alone answered "0" for both.
+      (match args with
+       | Cons (a0, Cons (b0, _)) ->
+         let (an, ad) = rat_parts a0 in
+         let (bn, bd) = rat_parts b0 in
+         mk_rat_s (big_mul_s an bd) (big_mul_s ad bn)
+       | Cons (a0, _) -> let (an, ad) = rat_parts a0 in mk_rat_s an ad
+       | _ -> mk_rat_s "0" "1")
+    else if str_eq name "Complex" then
+      (match args with Cons (r, Cons (i, _)) -> VCpx (r, i) | Cons (r, _) -> VCpx (r, VInt 0) | _ -> VCpx (VInt 0, VInt 0))
+    // Kernel#Array(obj): #to_ary, then #to_a, then a one-element array. Both
+    // conversions are asked even when PRIVATE (ruby's rb_check_funcall does),
+    // and a nil answer from either is a decline rather than the result.
+    else if str_eq name "Array" then
+      (match args with
+       | Cons (VArr id, _) -> VArr id
+       | Cons (VNil, _) -> arr_new (Nil : Val list)
+       | Nil -> arr_new (Nil : Val list)
+       | Cons (v, _) ->
+         (let r9 = conv_try env world v "to_ary" in
+          match r9 with
+          | VArr a9 -> VArr a9
+          // a conversion that answers a NON-array (and not nil, which declines)
+          // is the object lying about its type.
+          | VNil ->
+            (let r8 = conv_try env world v "to_a" in
+             match r8 with
+             | VArr a9 -> VArr a9
+             | VNil -> arr_new (Cons (v, Nil))
+             | other -> raise_exc world "TypeError"
+                          ("can't convert " ++ class_name v ++ " to Array ("
+                           ++ class_name v ++ "#to_a gives " ++ class_name other ++ ")"))
+          | other -> raise_exc world "TypeError"
+                       ("can't convert " ++ class_name v ++ " to Array ("
+                        ++ class_name v ++ "#to_ary gives " ++ class_name other ++ ")")))
+    // Kernel#Hash(obj): #to_hash; nil and [] are the empty hash; anything else
+    // is a TypeError (it answered {} for everything).
+    else if str_eq name "Hash" then
+      (match args with
+       | Cons (VHsh h, _) -> VHsh h
+       | Cons (VNil, _) -> mkhash (Nil : Val list)
+       | Cons (VArr a9, _) ->
+         (match deref a9 with
+          | Nil -> mkhash (Nil : Val list)
+          | _ -> raise_exc world "TypeError" "can't convert Array into Hash")
+       | Cons (v, _) ->
+         (match conv_try env world v "to_hash" with
+          | VHsh h9 -> VHsh h9
+          | _ -> raise_exc world "TypeError"
+                   ("can't convert " ++ class_name v ++ " into Hash"))
+       | Nil -> mkhash (Nil : Val list))
+    else VNil
+
+and kernel_integer = fn env -> fn world -> fn (args0: Val list) ->
+  let (pos, raising) = kern_conv_kw args0 in
+  if raising then kernel_integer_go env world pos
+  else
+    (let prev = conv_soft_begin () in
+     let r = kernel_integer_go env world pos in
+     if conv_soft_end prev then VNil else r)
+
+and kernel_integer_go = fn env -> fn world -> fn (pos: Val list) ->
+  let v0 = (match pos with Cons (a, _) -> a | Nil -> VNil) in
+  let (has_base, base) = (match pos with
+                          | Cons (_, Cons (b, _)) -> kern_base_int env world b
+                          | _ -> (false, 0)) in
+  // with a base, only a String (or something with #to_str) is convertible --
+  // `Integer(98, 15)` is an ArgumentError about the BASE, not about 98.
+  let v = (if has_base then
+             (match v0 with
+              | VStr h9 -> VStr h9
+              | _ -> (match conv_try env world v0 "to_str" with
+                      | VStr h9 -> VStr h9
+                      | _ -> (let _ = conv_fail "ArgumentError" "base specified for non string value" in VNil)))
+           else v0) in
+  match v with
+  | VStr h -> rb_int_parse_b (sget h) base
+  | VInt n -> VInt n
+  | VBig b -> VBig b
+  | VFlt f -> kern_flt_to_int f
+  | VRat (n, d) -> norm_big (big_div_s n d)
+  | VNil -> (let _ = conv_fail "TypeError" "can't convert nil into Integer" in VNil)
+  | other ->
+    // #to_int, then #to_str (parsed), then #to_i. A #to_int that answers a
+    // non-Integer is not an error by itself: ruby falls through to #to_i and
+    // lets THAT one explain the refusal.
+    (match conv_try env world other "to_int" with
+     | VInt n -> VInt n
+     | VBig b -> VBig b
+     | _ ->
+       (match conv_try env world other "to_str" with
+        | VStr h -> rb_int_parse_b (sget h) base
+        | _ ->
+          (if responds world other "to_i" then
+             (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+              match invoke_val_c env world nb other "to_i" Nil false with
+              | VInt n -> VInt n
+              | VBig b -> VBig b
+              | bad -> (let _ = conv_fail "TypeError"
+                          ("can't convert " ++ class_name other ++ " into Integer ("
+                           ++ class_name other ++ "#to_i gives " ++ conv_gives_name bad ++ ")") in VNil))
+           else (let _ = conv_fail "TypeError"
+                   ("can't convert " ++ class_name other ++ " into Integer") in VNil))))
+
+// ruby asks the base for #to_int and, when it has none, IGNORES the argument
+// (rb_check_to_int, then the slot is re-read as the keyword hash) -- so
+// `Integer("777", "8")` is 777, not a TypeError about the base.
+and kern_base_int = fn env -> fn world -> fn (b: Val) ->
+  match b with
+  | VInt n -> (true, n)
+  | VFlt f -> (true, int_of_float f)
+  | other -> (match conv_try env world other "to_int" with
+              | VInt n -> (true, n)
+              | _ -> (false, 0))
+
+// A Float that no machine integer can hold is a BIGNUM, not the clamped
+// maximum: Integer(2e100) answered 9223372036854775807. Above 2^53 the value
+// is already whole, so halving until it fits is exact and the bignum is
+// mantissa * 2^shift.
+and kern_flt_to_int = fn (f: float) ->
+  let sp = float_special f in
+  if str_eq sp "NaN" then (let _ = conv_fail "FloatDomainError" "NaN" in VNil)
+  else if str_eq sp "Inf" then
+    (let _ = conv_fail "FloatDomainError" (if f < 0.0 then "-Infinity" else "Infinity") in VNil)
+  else if f < 9007199254740992.0 && f > (0.0 - 9007199254740992.0) then VInt (int_of_float f)
+  else norm_big (flt_to_big_s f)
+
+and kernel_float = fn env -> fn world -> fn (args0: Val list) ->
+  let (pos, raising) = kern_conv_kw args0 in
+  if raising then kernel_float_go env world pos
+  else
+    (let prev = conv_soft_begin () in
+     let r = kernel_float_go env world pos in
+     if conv_soft_end prev then VNil else r)
+
+and kernel_float_go = fn env -> fn world -> fn (pos: Val list) ->
+  let v = (match pos with Cons (a, _) -> a | Nil -> VNil) in
+  match v with
+  | VFlt f -> VFlt f
+  | VInt n -> VFlt (float_of_int n)
+  | VBig _ -> VFlt (to_f v)
+  | VRat (_, _) -> VFlt (to_f v)
+  // Kernel#Float's reading of a String is the strict one: no leading ".",
+  // no trailing junk, single underscores only between digits.
+  | VStr h -> VFlt (rb_flt_parse (sget h))
+  | VNil -> (let _ = conv_fail "TypeError" "can't convert nil into Float" in VNil)
+  // a Complex converts only when it has no imaginary part.
+  | VCpx (re, im) ->
+    (if (match im with VInt 0 -> true | VFlt fz -> fz == 0.0 | _ -> false)
+     then VFlt (to_f re)
+     else (let _ = conv_fail "RangeError" ("can't convert " ++ to_s v ++ " into Float") in VNil))
+  | other ->
+    (if responds world other "to_f" then
+       (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+        match invoke_val_c env world nb other "to_f" Nil false with
+        | VFlt f -> VFlt f
+        | bad -> (let _ = conv_fail "TypeError"
+                    ("can't convert " ++ class_name other ++ " into Float ("
+                     ++ class_name other ++ "#to_f gives " ++ conv_gives_name bad ++ ")") in VNil))
+     else (let _ = conv_fail "TypeError"
+             ("can't convert " ++ conv_gives_name other ++ " into Float") in VNil))
+
+and rb_int_parse = fn (s0: str) -> rb_int_parse_b s0 0
+
+// Kernel#Integer's string reading with an EXPLICIT base. The base form used to
+// go through str_to_int_base, which reads what it can and answers 0 for junk,
+// so Integer("0x1", 2) was 0 where ruby refuses. A base PREFIX is stripped only
+// when it agrees with the base -- `Integer("0b10", 16)` is 0xb10, not 2, and
+// every prefix letter that is not a digit in the given base is simply an
+// invalid digit, which is the refusal ruby gives.
+and rb_int_parse_b = fn (s0: str) -> fn (base0: int) ->
+  if base0 == 1 || base0 < 0 || base0 > 36 then
+    (let _ = conv_fail "ArgumentError" ("invalid radix " ++ str_of_int base0) in VNil)
+  else
   let n0 = str_len s0 in
   let lo = rb_int_ltrim s0 0 in
   let hi = rb_int_rtrim s0 n0 in
-  if lo >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+  if lo >= hi then (let _ = conv_fail "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
   else
     let (neg, i1) = (let c = char_at s0 lo in
                      if str_eq c "-" then (true, lo + 1)
                      else if str_eq c "+" then (false, lo + 1) else (false, lo)) in
-    if i1 >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+    if i1 >= hi then (let _ = conv_fail "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
     else
       let (base, i2) =
         (if str_eq (char_at s0 i1) "0" && i1 + 1 < hi then
            (let c2 = char_at s0 (i1 + 1) in
-            if str_eq c2 "x" || str_eq c2 "X" then (16, i1 + 2)
-            else if str_eq c2 "b" || str_eq c2 "B" then (2, i1 + 2)
-            else if str_eq c2 "o" || str_eq c2 "O" then (8, i1 + 2)
-            else if str_eq c2 "d" || str_eq c2 "D" then (10, i1 + 2)
-            else (8, i1 + 1))
-         else (10, i1)) in
+            let pb = (if str_eq c2 "x" || str_eq c2 "X" then 16
+                      else if str_eq c2 "b" || str_eq c2 "B" then 2
+                      else if str_eq c2 "o" || str_eq c2 "O" then 8
+                      else if str_eq c2 "d" || str_eq c2 "D" then 10
+                      else 0) in
+            if base0 == 0 then (if pb == 0 then (8, i1 + 1) else (pb, i1 + 2))
+            else if pb == base0 then (base0, i1 + 2)
+            else (base0, i1))
+         else (if base0 == 0 then (10, i1) else (base0, i1))) in
       let v = rb_int_digits s0 i2 hi base false false (VInt 0) in
       (match v with
        | VInt x -> VInt (if neg then 0 - x else x)
@@ -25517,17 +25823,17 @@ and rb_int_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (base: int
   fn (prev_us: bool) -> fn (seen: bool) -> fn (acc: Val) ->
   if i >= hi then
     (if seen && prev_us == false then acc
-     else (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil))
+     else (let _ = conv_fail "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil))
   else
     let c = char_at s0 i in
     if str_eq c "_" then
       (if seen == false || prev_us
-       then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+       then (let _ = conv_fail "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
        else rb_int_digits s0 (i + 1) hi base true seen acc)
     else
       let dv = rb_digit_val_x c in
       (if dv < 0 || dv >= base
-       then (let _ = prim_raise "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
+       then (let _ = conv_fail "ArgumentError" ("invalid value for Integer(): \"" ++ s0 ++ "\"") in VNil)
        else rb_int_digits s0 (i + 1) hi base false true (rb_int_acc acc base dv))
 
 // grows the parse accumulator, escaping to a bignum before machine overflow.
@@ -25558,32 +25864,36 @@ and rb_powf = fn (b: float) -> fn (e: int) ->
 and rb_flt_parse = fn (s0: str) ->
   let hi = rb_int_rtrim s0 (str_len s0) in
   let lo = rb_int_ltrim s0 0 in
-  if lo >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+  if lo >= hi then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
   else
     let (neg, i1) = (let c = char_at s0 lo in
                      if str_eq c "-" then (true, lo + 1)
                      else if str_eq c "+" then (false, lo + 1) else (false, lo)) in
     let sgn = (if neg then 0.0 - 1.0 else 1.0) in
-    if i1 >= hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+    if i1 >= hi then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
     else if str_eq (char_at s0 i1) "0" && i1 + 1 < hi
             && (str_eq (char_at s0 (i1 + 1)) "x" || str_eq (char_at s0 (i1 + 1)) "X") then
       // hex: digits [. digits] [p exp]
-      let (ds, i2) = rb_flt_digits s0 (i1 + 2) hi true false "" in
-      let (fs, i3) = (if i2 < hi && str_eq (char_at s0 i2) "."
-                      then rb_flt_digits s0 (i2 + 1) hi true false ""
-                      else ("", i2)) in
-      if str_len ds == 0 && str_len fs == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      let (ds, i2) = rb_flt_digits s0 (i1 + 2) hi true false false "" in
+      let (fs, i3, hdot) = (if i2 < hi && str_eq (char_at s0 i2) "."
+                            then (match rb_flt_digits s0 (i2 + 1) hi true false false "" with (a, b) -> (a, b, true))
+                            else ("", i2, false)) in
+      if str_len ds == 0 && str_len fs == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      // ruby's strtod reads a hex FRACTION only together with a p exponent:
+      // "0x0.8" refuses where "0x0.8p1" is 1.0.
+      else if hdot && (if i3 < hi && (str_eq (char_at s0 i3) "p" || str_eq (char_at s0 i3) "P") then false else true)
+      then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
       else
         let (pexp, i4) =
           (if i3 < hi && (str_eq (char_at s0 i3) "p" || str_eq (char_at s0 i3) "P") then
              (let (pneg, ip) = (if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "-" then (true, i3 + 2)
                                 else if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "+" then (false, i3 + 2)
                                 else (false, i3 + 1)) in
-              let (es, i5) = rb_flt_digits s0 ip hi false false "" in
-              if str_len es == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (0, i5))
+              let (es, i5) = rb_flt_digits s0 ip hi false false false "" in
+              if str_len es == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (0, i5))
               else ((if pneg then 0 - int_of_str es else int_of_str es), i5))
            else (0, i3)) in
-        if i4 < hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+        if i4 < hi then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
         else
           let iv = rb_hexf ds 0 0.0 in
           let fv = (if str_len fs == 0 then 0.0 else rb_hexf fs 0 0.0 / rb_powf 16.0 (str_len fs)) in
@@ -25591,23 +25901,23 @@ and rb_flt_parse = fn (s0: str) ->
     else
       // decimal: digits [. digits] [e [sign] digits], each digit run allowing
       // single underscores between digits.
-      let (ds, i2) = rb_flt_digits s0 i1 hi false false "" in
+      let (ds, i2) = rb_flt_digits s0 i1 hi false false false "" in
       let (fs, i3, dotted) = (if i2 < hi && str_eq (char_at s0 i2) "."
-                              then (match rb_flt_digits s0 (i2 + 1) hi false false "" with (a, b) -> (a, b, true))
+                              then (match rb_flt_digits s0 (i2 + 1) hi false false false "" with (a, b) -> (a, b, true))
                               else ("", i2, false)) in
-      if str_len ds == 0 && str_len fs == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
-      else if dotted && str_len fs == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      if str_len ds == 0 && str_len fs == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      else if dotted && str_len fs == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
       else
         let (es, i4) =
           (if i3 < hi && (str_eq (char_at s0 i3) "e" || str_eq (char_at s0 i3) "E") then
              (let (eneg, ip) = (if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "-" then (true, i3 + 2)
                                 else if i3 + 1 < hi && str_eq (char_at s0 (i3 + 1)) "+" then (false, i3 + 2)
                                 else (false, i3 + 1)) in
-              let (e1, i5) = rb_flt_digits s0 ip hi false false "" in
-              if str_len e1 == 0 then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in ("", i5))
+              let (e1, i5) = rb_flt_digits s0 ip hi false false false "" in
+              if str_len e1 == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in ("", i5))
               else ((if eneg then "-" ++ e1 else e1), i5))
            else ("", i3)) in
-        if i4 < hi then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+        if i4 < hi then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
         else
           float_of_str ((if neg then "-" else "")
                         ++ (if str_len ds == 0 then "0" else ds)
@@ -25616,20 +25926,26 @@ and rb_flt_parse = fn (s0: str) ->
 
 // one run of digits with single underscores strictly between digits; stops
 // at the first non-digit and hands back the cleaned digits and that index.
-and rb_flt_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (hex: bool) -> fn (prev_us: bool) -> fn (acc: str) ->
+and rb_flt_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (hex: bool) ->
+  fn (prev_us: bool) -> fn (seen_us: bool) -> fn (acc: str) ->
   if i >= hi then
-    (if prev_us then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
+    (if prev_us then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
   else
     let c = char_at s0 i in
     if str_eq c "_" then
       (if str_len acc == 0 || prev_us
-       then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i))
-       else rb_flt_digits s0 (i + 1) hi hex true acc)
+       then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i))
+       else rb_flt_digits s0 (i + 1) hi hex true true acc)
     else
       let dv = rb_digit_val_x c in
       (if dv < 0 || dv >= (if hex then 16 else 10)
-       then (if prev_us then (let _ = prim_raise "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
-       else rb_flt_digits s0 (i + 1) hi hex false (acc ++ c))
+       then (if prev_us then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
+       // ruby's reader stops its own strtod at the first underscore and then
+       // requires every remaining mantissa character to be a DECIMAL digit --
+       // so "0xa1_0" is 0xa10 but "0x1_0a" refuses.
+       else if hex && seen_us && dv >= 10
+       then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i))
+       else rb_flt_digits s0 (i + 1) hi hex false seen_us (acc ++ c))
 
 // %f/%e/%g argument: Float() semantics (a String parses; nil refuses).
 and rb_fmt_flt = fn env -> fn world -> fn (v: Val) ->
@@ -26778,6 +27094,26 @@ and has_own_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   (if str_eq cls "" then false
    else if map_has undefs (cls ++ "#" ++ name) then false
    else map_has meths (cls ++ "#" ++ name))
+
+// Is `name` UNREACHABLE on cls because someone undef'd it? The tombstone the
+// `undef` statement writes only kept the method out of the user table, so
+// `undef :to_s` still reached the BUILTIN to_s and printed #<A:0x..>. Walk the
+// ancestors and stop at whichever comes first: a definition (still reachable)
+// or a tombstone (gone, builtin included). Nothing is walked at all until the
+// program undefs something, so the usual dispatch pays one map_len.
+and undef_blocked = fn world -> fn (cls: str) -> fn (name: str) ->
+  if map_len undefs == 0 then false
+  else if str_eq cls "" then false
+  else undef_blocked_anc world (ancestors_of world cls) name
+
+and undef_blocked_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
+  let (meths, _, _, _) = world in
+  match anc with
+  | Nil -> false
+  | Cons (a, rest) ->
+    if map_has undefs (a ++ "#" ++ name) then true
+    else if map_has meths (a ++ "#" ++ name) then false
+    else undef_blocked_anc world rest name
 
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in

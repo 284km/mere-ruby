@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 371 files.
+Classified: 365 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,15 +53,15 @@ Classified: 371 files.
 
 </details>
 
-## DIFF — 350 files, 103 kinds
+## DIFF — 344 files, 101 kinds
 
 | files | kind |
 |---|---|
 | 60 | `ERROR NoMethodError` |
 | 23 | `ERROR NameError` |
-| 19 | `FAILED expected N, got N` |
-| 19 | `ERROR StandardError` |
-| 14 | `FAILED expected true, got false` |
+| 18 | `FAILED expected N, got N` |
+| 18 | `ERROR StandardError` |
+| 13 | `FAILED expected true, got false` |
 | 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 11 | `FAILED expected TypeError to be raised` |
@@ -69,9 +69,9 @@ Classified: 371 files.
 | 8 | `ERROR ArgumentError` |
 | 7 | `FAILED expected truthy from #include?` |
 | 7 | `FAILED expected false, got true` |
-| 7 | `FAILED expected "S", got "S"` |
 | 6 | `pass=N fail=N err=N` |
 | 6 | `FAILED expected N, got nil` |
+| 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
@@ -109,7 +109,6 @@ Classified: 371 files.
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
-| 1 | `FAILED expected {:SYM=>N}, got {}` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
 | 1 | `FAILED expected {"S"=>N, "S"=>N}, got {}` |
 | 1 | `FAILED expected {"S"=>"S", "S"=>"S"}, got {"S"=>"S", "S"=>nil}` |
@@ -134,7 +133,6 @@ Classified: 371 files.
 | 1 | `FAILED expected [N, N], got []` |
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
-| 1 | `FAILED expected [N, N, N], got [#<OBJ>]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
 | 1 | `FAILED expected ["S", "S"], got nil` |
