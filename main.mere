@@ -1120,6 +1120,7 @@ let modules = map_new ();
 let privates = map_new ();
 let protecteds = map_new ();  // protected methods (callable only same-class)
 let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
+let num_names_memo = map_new ();  // numeric kind -> its method-name set
 // prim_method has no `world` to build an exception, so its terminal
 // "undefined method" failure parks the method name here; the begin/rescue
 // catch site turns it into a proper NoMethodError (Ruby's class for it).
@@ -14218,6 +14219,48 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
         else if str_eq name "map" || str_eq name "collect" then iter_result (range_map world encl theblk (rng_int lo) last Nil) recv
         else builtin_iter world encl theblk (arr_new (range_to_a (rng_int lo) last)) name args)
      else builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args)
+  // Float#step(limit[, by]) had no arm at all. ruby computes each value as
+  // beg + i*by rather than accumulating, so neither the count nor the last
+  // value drifts; the same shape answers Integer#step when either argument is
+  // a Float (`1.step(2, 0.5)` yields Floats).
+  | VFlt fb ->
+    if str_eq name "step" then
+      (match args with
+       | Cons (lim9, rest9) ->
+         (let lf9 = to_f lim9 in
+          let sf9 = (match rest9 with Cons (sv9, _) -> to_f sv9 | _ -> 1.0) in
+          iter_each_result (flt_step world encl theblk fb lf9 sf9) recv)
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: step needs a limit")) in fail "mere-ruby: step needs a limit"))
+    else prim_method recv name args
+  // an Integer walk whose endpoints a machine int cannot hold. `times` is
+  // deliberately absent: a bignum count does not terminate, and a gate that
+  // hangs is worse than one that fails.
+  // Rational#step walks EXACTLY: 1/2, 3/2, 5/2 rather than a float sequence.
+  | VRat (rn9, rd9) ->
+    if str_eq name "step" then
+      (match args with
+       | Cons (lim9, rest9) ->
+         iter_each_result (num_step world encl theblk recv lim9
+                             (match rest9 with Cons (b9, _) -> b9 | _ -> VInt 1)) recv
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: step needs a limit")) in fail "mere-ruby: step needs a limit"))
+    else prim_method recv name args
+  | VBig bs ->
+    // a bignum count does not terminate in practice -- but neither does ruby's,
+    // and leaving it out would be the one name an Integer claims and cannot do.
+    if str_eq name "times" then
+      iter_each_result (big_upto world encl theblk "0" (big_sub_s bs "1") 1) recv
+    else if str_eq name "step" then
+      (match args with
+       | Cons (lim9, rest9) ->
+         iter_each_result (num_step world encl theblk recv lim9
+                             (match rest9 with Cons (b9, _) -> b9 | _ -> VInt 1)) recv
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: step needs a limit")) in fail "mere-ruby: step needs a limit"))
+    else if str_eq name "upto" || str_eq name "downto" then
+      (match args with
+       | Cons (VInt m9, _) -> iter_each_result (big_upto world encl theblk bs (str_of_int m9) (if str_eq name "upto" then 1 else 0 - 1)) recv
+       | Cons (VBig m9, _) -> iter_each_result (big_upto world encl theblk bs m9 (if str_eq name "upto" then 1 else 0 - 1)) recv
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: upto needs an integer")) in fail "mere-ruby: upto needs an integer"))
+    else prim_method recv name args
   | VInt n ->
     if str_eq name "times" then iter_each_result (range_each world encl theblk 0 (n - 1)) recv
     else if str_eq name "upto" then
@@ -14240,7 +14283,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "step" then
       (match args with
        | Cons (VInt limit, Cons (VInt by, _)) -> iter_each_result (range_step world encl theblk n limit by) recv
-       | Cons (VInt limit, _) -> iter_each_result (range_step world encl theblk n limit 1) recv
+       | Cons (VInt limit, Nil) -> iter_each_result (range_step world encl theblk n limit 1) recv
+       // a Float anywhere makes the whole walk a Float walk, as in ruby.
+       | Cons (lim9, rest9) ->
+         (let lf9 = to_f lim9 in
+          let sf9 = (match rest9 with Cons (sv9, _) -> to_f sv9 | _ -> 1.0) in
+          iter_each_result (flt_step world encl theblk (float_of_int n) lf9 sf9) recv)
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: step needs an integer")) in fail "mere-ruby: step needs an integer"))
     else prim_method recv name args
   | _ -> prim_method recv name args
@@ -14254,6 +14302,50 @@ and iter_result = fn (f: Flow) -> fn (dflt: Val) ->
 // flows return FNext VNil); break still yields the break value.
 and iter_each_result = fn (f: Flow) -> fn (recv: Val) ->
   match f with FBreak v -> v | _ -> recv
+
+// beg, beg+by, beg+2*by, ... while the value has not passed `lim`. The count
+// is computed once (ruby's n = floor((lim-beg)/by + err)) and each value is
+// beg + i*by, so a Float walk neither drifts nor overshoots its end.
+// cur, cur+by, cur+2*by, ... while the value has not passed `lim`, in the
+// receiver's OWN arithmetic -- a bignum stays exact and a rational stays a
+// rational, where a float walk would lose both.
+and num_step = fn world -> fn encl -> fn theblk -> fn (cur: Val) -> fn (lim: Val) -> fn (by: Val) ->
+  let up = cmp_vals by (VInt 0) > 0 in
+  let c = cmp_vals cur lim in
+  if up && c > 0 then FNext VNil
+  else if (if up then false else true) && c < 0 then FNext VNil
+  else
+    (match run_block world encl theblk (Cons (cur, Nil)) with
+     | FBreak v -> FBreak v
+     | FReturn v -> FReturn v
+     | FRaise v -> FRaise v
+     | _ -> num_step world encl theblk (arith_bin "+" cur by) lim by)
+
+and big_upto = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (lim: str) -> fn (dir: int) ->
+  let c = big_cmp_s cur lim in
+  if dir > 0 && c > 0 then FNext VNil
+  else if dir < 0 && c < 0 then FNext VNil
+  else
+    (match run_block world encl theblk (Cons (norm_big cur, Nil)) with
+     | FBreak v -> FBreak v
+     | FReturn v -> FReturn v
+     | FRaise v -> FRaise v
+     | _ -> big_upto world encl theblk (if dir > 0 then big_add_s cur "1" else big_sub_s cur "1") lim dir)
+
+and flt_step = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: float) -> fn (st: float) ->
+  if st == 0.0 then (let _ = prim_raise "ArgumentError" "step can't be 0" in FNext VNil)
+  else
+    let n = flt_floor ((lim - b) / st + 0.000000000001) in
+    flt_step_go world encl theblk b st 0 n
+
+and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: float) -> fn (i: int) -> fn (n: int) ->
+  if i > n then FNext VNil
+  else
+    (match run_block world encl theblk (Cons (VFlt (b + float_of_int i * st), Nil)) with
+     | FBreak v -> FBreak v
+     | FReturn v -> FReturn v
+     | FRaise v -> FRaise v
+     | _ -> flt_step_go world encl theblk b st (i + 1) n)
 
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
@@ -20835,13 +20927,32 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   if is_vis_list_name name then
     (if str_eq name "methods" && (match args with Cons (VBool false, _) -> true | Cons (VNil, _) -> true | _ -> false)
      then arr_new (Nil : Val list)
-     // Only what ruby code added to this primitive's class. The names the
-     // DISPATCHER answers for are NOT added: the one list that could supply
-     // them, is_num_method, is shared by the whole numeric tower and claims
-     // for a Complex three dozen names it refuses to call (`negative?`,
-     // `divmod`, `even?`, ...). Enumerating it would publish that lie -- the
-     // list has to be split per type before this can list anything.
-     else vis_method_list world (dispatch_cls_of world recv) name args)
+     else
+       // a primitive's own methods are not entries in the method table, so the
+       // walk finds only what ruby code added to its class. The names the
+       // DISPATCHER answers for come from the per-type lists respond_to? reads,
+       // each admitted only if `responds` says so -- the two answers are the
+       // same answer. (While one shared numeric list claimed `negative?` for a
+       // Complex, listing it here published that lie; the lists are split now.)
+       (let want9 = (if str_eq name "public_methods" then 1
+                     else if str_eq name "private_methods" then 2
+                     else if str_eq name "protected_methods" then 3 else 0) in
+        let recur9 = (match args with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+        let names9 = map_new () in
+        let blocked9 = map_new () in
+        let _ = collect_vis world (dispatch_cls_of world recv) names9 blocked9 want9 recur9 in
+        let _ = (if want9 == 2 then () else if want9 == 3 then () else
+                   (let add9 = fn (nm9: str) ->
+                      (if map_has names9 nm9 then ()
+                       else if responds world recv nm9 then map_set names9 nm9 (VSym nm9)
+                       else ()) in
+                    let rec go9 = fn (xs9: str list) ->
+                      (match xs9 with Nil -> () | Cons (h9, t9) -> (let _ = add9 h9 in go9 t9)) in
+                    let _ = (if is_num recv || is_cpx recv then go9 (num_names_for recv) else ()) in
+                    go9 (kernel_public_instance_names ()))) in
+        let out9 = map_new () in
+        let _ = map_iter names9 (fn (k9: str) -> fn (v9: Val) -> let i9 = map_len out9 in map_set out9 (str_of_int i9) v9) in
+        arr_new (idx_to_list out9 0 (map_len out9))))
   else if str_eq name "singleton_methods" then arr_new Nil
   // singleton_class: true/false/nil answer their class; immediates raise
   // TypeError; an object gets its own (hidden) singleton class.
@@ -21183,6 +21294,10 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
         arr_new (arr_product_n (deref id) args))
      | _ -> recv)
   // Comparable#clamp / #between? (any comparable receiver, incl. user <=>).
+  // #clamp / #between? are Comparable's, and a Complex has no order: it does
+  // not include Comparable at all.
+  else if (str_eq name "clamp" || str_eq name "between?") && is_cpx recv then
+    (let _ = map_set prim_missing "n" (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail ("mere-ruby: undefined method '" ++ name ++ "'")))
   else if str_eq name "clamp" then
     (match args with
      | Cons (VRange (lo, hi, _), _) ->
@@ -21784,14 +21899,14 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   | VHsh _ -> prim_user_has world recv name || is_prim_method name || is_hash_method name
   // the numeric primitives, so `5.method(:abs)` and respond_to? agree with
   // what the dispatcher actually implements.
-  | VInt _ -> prim_user_has world recv name || is_prim_method name || is_num_method name
-  | VFlt _ -> prim_user_has world recv name || is_prim_method name || is_num_method name
+  | VInt _ -> prim_user_has world recv name || is_prim_method name || num_has recv name
+  | VFlt _ -> prim_user_has world recv name || is_prim_method name || num_has recv name
   // Bignum, Rational and Complex had no entry at all and fell to the default
   // "no", so Complex#to_r was reachable but respond_to?(:to_r) denied it --
   // and ruby's Rational() decides which protocol to use by asking exactly that.
-  | VBig _ -> prim_user_has world recv name || is_prim_method name || is_num_method name
-  | VRat (_, _) -> prim_user_has world recv name || is_prim_method name || is_num_method name
-  | VCpx (_, _) -> prim_user_has world recv name || is_prim_method name || is_num_method name
+  | VBig _ -> prim_user_has world recv name || is_prim_method name || num_has recv name
+  | VRat (_, _) -> prim_user_has world recv name || is_prim_method name || num_has recv name
+  | VCpx (_, _) -> prim_user_has world recv name || is_prim_method name || num_has recv name
   | VRange (_, _, _) ->
     is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
   // a Regexp had no entry at all, so it denied `match` -- and optparse asks
@@ -22239,47 +22354,99 @@ and is_module_method = fn (name: str) ->
 
 // a curated set of universally-available primitive method names.
 // Integer / Float methods the primitive dispatcher answers.
-// The names EVERY Numeric answers to. A PREDICATE and not a list on purpose:
-// nothing enumerates it, and it could not honestly be enumerated anyway -- it
-// is shared by Integer, Float, Rational and Complex, and claims for a Complex
-// three dozen names (`negative?`, `divmod`, `even?`, ...) that the dispatcher
-// refuses to call. respond_to? has answered true for all of them all along;
-// splitting this per type is what would fix that AND let `10.public_methods`
-// list what 10 actually has.
+// What each kind of Numeric answers to, ONE LIST PER TYPE. There used to be a
+// single shared list, and a shared list is as wide as its widest member: it
+// claimed `negative?`, `divmod`, `even?` and three dozen more for a Complex,
+// which refuses to call every one of them, so respond_to? answered true and
+// the call answered NoMethodError. The lists were derived by ASKING both sides
+// -- every name x every numeric type, called under ruby and under mere-ruby --
+// rather than by remembering which name belongs where.
 //
 // `rationalize` is claimed because the simplest-fraction search it needs (the
 // continued-fraction descent) was implemented; the claim went away while it
 // was absent and came back with the implementation, which is the only order in
-// which a name list stays true.
-//
-// The complex protocol is claimed too -- 1.imaginary is 0, 1.conj is 1,
-// (-1).arg is pi. All fourteen were IMPLEMENTED and none was claimed, so
-// calling them worked and asking about them did not:
-// `Complex.instance_method(:angle)` raised NameError, which is what fifteen
-// ruby/spec files check.
+// which a name list stays true. The complex protocol (imaginary, conj, arg,
+// polar, ...) is claimed by all four because every one of them is implemented
+// for every Numeric.
+and int_method_names = fn (u: unit) ->
+  Cons ("to_int", Cons ("to_i", Cons ("to_f", Cons ("to_r", Cons ("to_c", Cons ("abs", Cons
+  ("magnitude", Cons ("ceil", Cons ("floor", Cons ("round", Cons ("truncate", Cons ("succ",
+  Cons ("next", Cons ("pred", Cons ("chr", Cons ("ord", Cons ("times", Cons ("upto", Cons
+  ("downto", Cons ("step", Cons ("divmod", Cons ("fdiv", Cons ("div", Cons ("modulo", Cons
+  ("remainder", Cons ("pow", Cons ("gcd", Cons ("lcm", Cons ("digits", Cons ("bit_length",
+  Cons ("size", Cons ("even?", Cons ("odd?", Cons ("zero?", Cons ("positive?", Cons
+  ("negative?", Cons ("nonzero?", Cons ("integer?", Cons ("finite?", Cons ("infinite?", Cons
+  ("between?", Cons ("clamp", Cons ("coerce", Cons ("numerator", Cons ("denominator", Cons
+  ("rationalize", Cons ("i", Cons ("real", Cons ("real?", Cons ("imaginary", Cons ("imag",
+  Cons ("conjugate", Cons ("conj", Cons ("abs2", Cons ("arg", Cons ("angle", Cons ("phase",
+  Cons ("polar", Cons ("rect", Cons ("rectangular", Cons ("quo", Cons ("<=>", Cons ("<",
+  Cons ("<=", Cons (">", Cons (">=",
+  Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+and flt_method_names = fn (u: unit) ->
+  Cons ("to_int", Cons ("to_i", Cons ("to_f", Cons ("to_r", Cons ("to_c", Cons ("abs", Cons
+  ("magnitude", Cons ("ceil", Cons ("floor", Cons ("round", Cons ("truncate", Cons ("step",
+  Cons ("divmod", Cons ("fdiv", Cons ("div", Cons ("modulo", Cons ("remainder", Cons
+  ("zero?", Cons ("positive?", Cons ("negative?", Cons ("nonzero?", Cons ("integer?", Cons
+  ("finite?", Cons ("infinite?", Cons ("nan?", Cons ("next_float", Cons ("prev_float", Cons
+  ("between?", Cons ("clamp", Cons ("coerce", Cons ("numerator", Cons ("denominator", Cons
+  ("rationalize", Cons ("i", Cons ("real", Cons ("real?", Cons ("imaginary", Cons ("imag",
+  Cons ("conjugate", Cons ("conj", Cons ("abs2", Cons ("arg", Cons ("angle", Cons ("phase",
+  Cons ("polar", Cons ("rect", Cons ("rectangular", Cons ("quo", Cons ("<=>", Cons ("<",
+  Cons ("<=", Cons (">", Cons (">=",
+  Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))
+
+and rat_method_names = fn (u: unit) ->
+  Cons ("to_int", Cons ("to_i", Cons ("to_f", Cons ("to_r", Cons ("to_c", Cons ("abs", Cons
+  ("magnitude", Cons ("ceil", Cons ("floor", Cons ("round", Cons ("truncate", Cons ("step",
+  Cons ("divmod", Cons ("fdiv", Cons ("div", Cons ("modulo", Cons ("remainder", Cons
+  ("zero?", Cons ("positive?", Cons ("negative?", Cons ("nonzero?", Cons ("integer?", Cons
+  ("finite?", Cons ("infinite?", Cons ("between?", Cons ("clamp", Cons ("coerce", Cons
+  ("numerator", Cons ("denominator", Cons ("rationalize", Cons ("i", Cons ("real", Cons
+  ("real?", Cons ("imaginary", Cons ("imag", Cons ("conjugate", Cons ("conj", Cons ("abs2",
+  Cons ("arg", Cons ("angle", Cons ("phase", Cons ("polar", Cons ("rect", Cons
+  ("rectangular", Cons ("quo", Cons ("<=>", Cons ("<", Cons ("<=", Cons (">", Cons (">=",
+  Nil))))))))))))))))))))))))))))))))))))))))))))))))))
+
+and cpx_method_names = fn (u: unit) ->
+  Cons ("to_int", Cons ("to_i", Cons ("to_f", Cons ("to_r", Cons ("to_c", Cons ("abs", Cons
+  ("magnitude", Cons ("fdiv", Cons ("zero?", Cons ("nonzero?", Cons ("integer?", Cons
+  ("finite?", Cons ("infinite?", Cons ("coerce", Cons ("numerator", Cons ("denominator",
+  Cons ("rationalize", Cons ("real", Cons ("real?", Cons ("imaginary", Cons ("imag", Cons
+  ("conjugate", Cons ("conj", Cons ("abs2", Cons ("arg", Cons ("angle", Cons ("phase", Cons
+  ("polar", Cons ("rect", Cons ("rectangular", Cons ("quo", Cons ("<=>",
+  Nil))))))))))))))))))))))))))))))))
+
+and num_names_for = fn (v: Val) ->
+  match v with
+  | VFlt _ -> flt_method_names ()
+  | VRat (_, _) -> rat_method_names ()
+  | VCpx (_, _) -> cpx_method_names ()
+  | _ -> int_method_names ()
+
+and num_kind_key = fn (v: Val) ->
+  match v with VFlt _ -> "f" | VRat (_, _) -> "r" | VCpx (_, _) -> "c" | _ -> "i"
+
+// the four as SETS, built once each: `responds` asks this on every primitive
+// dispatch, and a linear walk there costs a measurable slice of a spec sweep.
+and num_name_set = fn (v: Val) ->
+  let k9 = num_kind_key v in
+  if map_has num_names_memo k9 then map_get num_names_memo k9
+  else
+    (let m9 = map_new () in
+     let rec go9 = fn (xs: str list) ->
+       (match xs with Nil -> () | Cons (h9, t9) -> (let _ = map_set m9 h9 VNil in go9 t9)) in
+     let _ = go9 (num_names_for v) in
+     let _ = map_set num_names_memo k9 m9 in
+     m9)
+
+and num_has = fn (v: Val) -> fn (name: str) -> map_has (num_name_set v) name
+
+// the old shared question, for the callers that have no receiver to ask about:
+// true when ANY Numeric answers the name.
 and is_num_method = fn (name: str) ->
-  str_eq name "to_int" || str_eq name "to_i" || str_eq name "to_f" || str_eq name "to_r" ||
-  str_eq name "to_c" || str_eq name "abs" || str_eq name "magnitude" ||
-  str_eq name "ceil" || str_eq name "floor" || str_eq name "round" ||
-  str_eq name "truncate" || str_eq name "succ" || str_eq name "next" ||
-  str_eq name "pred" || str_eq name "chr" || str_eq name "ord" || str_eq name "times" ||
-  str_eq name "upto" || str_eq name "downto" || str_eq name "step" ||
-  str_eq name "divmod" || str_eq name "fdiv" || str_eq name "div" ||
-  str_eq name "modulo" || str_eq name "remainder" || str_eq name "pow" ||
-  str_eq name "gcd" || str_eq name "lcm" || str_eq name "digits" ||
-  str_eq name "bit_length" || str_eq name "size" || str_eq name "even?" ||
-  str_eq name "odd?" || str_eq name "zero?" || str_eq name "positive?" ||
-  str_eq name "negative?" || str_eq name "nonzero?" || str_eq name "integer?" ||
-  str_eq name "finite?" || str_eq name "infinite?" || str_eq name "nan?" ||
-  str_eq name "next_float" || str_eq name "prev_float" || str_eq name "between?" ||
-  str_eq name "clamp" || str_eq name "coerce" || str_eq name "numerator" ||
-  str_eq name "denominator" || str_eq name "rationalize" || str_eq name "i" ||
-  str_eq name "real" || str_eq name "real?" || str_eq name "imaginary" ||
-  str_eq name "imag" || str_eq name "conjugate" || str_eq name "conj" ||
-  str_eq name "abs2" || str_eq name "arg" || str_eq name "angle" || str_eq name "phase" ||
-  str_eq name "polar" || str_eq name "rect" || str_eq name "rectangular" ||
-  str_eq name "quo" || str_eq name "<=>" || str_eq name "<" || str_eq name "<=" ||
-  str_eq name ">" || str_eq name ">="
+  num_has (VInt 0) name || num_has (VFlt 0.0) name
+  || num_has (VRat ("0", "1")) name || num_has (VCpx (VInt 0, VInt 0)) name
 and is_prim_method = fn (name: str) ->
   str_eq name "to_s" || str_eq name "inspect" || str_eq name "class" ||
   // to_enum / enum_for answer for EVERY receiver here (they build an
@@ -23311,7 +23478,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            if b0 < 128 then VInt b0 else prim_raise "ArgumentError" "invalid byte sequence in US-ASCII")
         else VInt (match utf8_cp sv 0 with (c, l) -> c))
      | VInt n -> VInt n
+     | VBig b -> VBig b
      | _ -> (let _ = map_set prim_missing "n" (mkstr "ord") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ord'")) in fail "mere-ruby: undefined method 'ord'")))
+  // a bignum is never a character: ruby's RangeError, not a NoMethodError.
+  else if str_eq name "chr" && (match recv with VBig _ -> true | _ -> false) then
+    prim_raise "RangeError" ("bignum out of char range")
   else if str_eq name "chr" then
     // `n.chr` carries an ENCODING, and it is not the default: US-ASCII for a
     // byte under 128, ASCII-8BIT for one at or above it (ruby refuses beyond
@@ -23386,7 +23557,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "to_ary" then
     (match recv with VArr _ -> recv | _ -> (let _ = map_set prim_missing "n" (mkstr "to_ary") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_ary'")) in fail "mere-ruby: undefined method 'to_ary'")))
   else if str_eq name "to_int" then
-    (match recv with VInt _ -> recv | VBig _ -> recv | _ -> (let _ = map_set prim_missing "n" (mkstr "to_int") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_int'")) in fail "mere-ruby: undefined method 'to_int'")))
+    // Numeric#to_int is Integer#to_i for every Numeric, not Integer's alone --
+    // Float, Rational and Complex all answer it (a Complex with an imaginary
+    // part by refusing, which is still an answer and not a missing method).
+    (match recv with VInt _ -> recv | VBig _ -> recv
+     | VFlt f -> VInt (int_of_float f)
+     | VRat (rn, rd) -> norm_big (rat_int_mode "truncate" rn rd)
+     | VCpx (cre, cim) ->
+       (if exact_zero_val cim then prim_method cre "to_i" (Nil : Val list)
+        else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Integer"))
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "to_int") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_int'")) in fail "mere-ruby: undefined method 'to_int'")))
   else if str_eq name "to_hash" then
     (match recv with VHsh _ -> recv | _ -> (let _ = map_set prim_missing "n" (mkstr "to_hash") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_hash'")) in fail "mere-ruby: undefined method 'to_hash'")))
   // eql? is == without any numeric conversion, so it also demands one class.
@@ -23457,9 +23637,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                                     | _ -> rb_str_to_i_base s 10)
      // NilClass#to_i is 0 (and #to_f 0.0, #to_a []): nil answers all three.
      | VNil -> VInt 0
+     // a Complex converts only when it has no imaginary part -- the refusal is
+     // a RangeError, which is an ANSWER; it had no arm and said the method did
+     // not exist.
+     | VCpx (cre, cim) ->
+       (if exact_zero_val cim then prim_method cre "to_i" (Nil : Val list)
+        else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Integer"))
      | _ -> prim_raise "NoMethodError" ("undefined method 'to_i' for an instance of " ++ class_name recv))
   else if str_eq name "to_f" then
-    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (float_of_str n / float_of_str d) | VStr s -> VFlt (str_to_f_lenient (sget s)) | VNil -> VFlt 0.0 | _ -> prim_raise "NoMethodError" ("undefined method 'to_f' for an instance of " ++ class_name recv))
+    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (float_of_str n / float_of_str d) | VStr s -> VFlt (str_to_f_lenient (sget s)) | VNil -> VFlt 0.0
+     | VCpx (cre, cim) ->
+       (if exact_zero_val cim then VFlt (to_f cre)
+        else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Float"))
+     | _ -> prim_raise "NoMethodError" ("undefined method 'to_f' for an instance of " ++ class_name recv))
   // to_a returns self for a plain Array, but a plain Array (not the subclass)
   // for a subclass instance.
   // Enumerable#entries is to_a under another name.
@@ -23491,6 +23681,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // ruby has no Integer#length. concurrent-ruby derives FIXNUM_BIT_SIZE
   // from `0.size * 8`.
   else if str_eq name "size" && (match recv with VInt _ -> true | _ -> false) then VInt 8
+  // a bignum's size is the bytes its magnitude needs, not the machine word.
+  else if str_eq name "size" && (match recv with VBig _ -> true | _ -> false) then
+    (match recv with
+     | VBig b -> (let bits = big_bit_length (big_mag b) in VInt (floor_div (bits + 7) 8))
+     | _ -> VInt 8)
   // Range#min / #max with no argument: the endpoints, not the elements. An
   // empty range answers nil, as ruby's do.
   else if (str_eq name "min" || str_eq name "max")
@@ -23702,9 +23897,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> VNil)
      | _ -> prim_raise "NoMethodError" ("undefined method '[]' for an instance of " ++ class_name recv))
   // Integer
-  else if str_eq name "gcd" then (match recv with VInt a -> (match args with Cons (VInt b, _) -> VInt (int_gcd a b) | _ -> VInt a) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcd") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcd'")) in fail "mere-ruby: undefined method 'gcd'")))
+  else if str_eq name "gcd" then (match recv with VInt a -> (match args with Cons (VInt b, _) -> VInt (int_gcd a b) | Cons (VBig b, _) -> norm_big (big_gcd_s (big_mag (str_of_int a)) (big_mag b)) | _ -> VInt a)
+     | VBig a -> (match args with Cons (b, _) -> norm_big (big_gcd_s (big_mag a) (big_mag (num_dec b))) | _ -> norm_big (big_mag a)) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcd") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcd'")) in fail "mere-ruby: undefined method 'gcd'")))
   else if str_eq name "lcm" then
-    (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in VInt (if l < 0 then 0 - l else l)) | _ -> VInt a) | _ -> (let _ = map_set prim_missing "n" (mkstr "lcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lcm'")) in fail "mere-ruby: undefined method 'lcm'")))
+    (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in VInt (if l < 0 then 0 - l else l)) | Cons (VBig b, _) -> (let g = big_gcd_s (big_mag (str_of_int a)) (big_mag b) in norm_big (big_mul_s (big_div_s (big_mag (str_of_int a)) g) (big_mag b))) | _ -> VInt a)
+     | VBig a -> (match args with Cons (b, _) -> (let bm = big_mag (num_dec b) in let g = big_gcd_s (big_mag a) bm in norm_big (big_mul_s (big_div_s (big_mag a) g) bm)) | _ -> norm_big (big_mag a)) | _ -> (let _ = map_set prim_missing "n" (mkstr "lcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lcm'")) in fail "mere-ruby: undefined method 'lcm'")))
   else if str_eq name "gcdlcm" then
     (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
   else if str_eq name "digits" then
@@ -23744,7 +23941,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBig _ -> (match args with Cons (b, _) -> VFlt (to_f recv / to_f b) | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "fdiv") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fdiv'")) in fail "mere-ruby: undefined method 'fdiv'")))
   else if str_eq name "pow" then
-    (match recv with VInt b -> (match args with Cons (VInt e, Cons (VInt m, _)) -> VInt (int_pow_mod b e m) | Cons (VInt e, _) -> VInt (int_pow b e) | _ -> VInt b) | _ -> (let _ = map_set prim_missing "n" (mkstr "pow") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pow'")) in fail "mere-ruby: undefined method 'pow'")))
+    (match recv with VInt b -> (match args with Cons (VInt e, Cons (VInt m, _)) -> VInt (int_pow_mod b e m) | Cons (VInt e, _) -> arith_bin "**" recv (VInt e) | _ -> VInt b)
+     // a bignum base: the exact power, and the modular form through the same
+     // big arithmetic rather than a machine int that would overflow.
+     | VBig b -> (match args with
+                  | Cons (VInt e, Cons (m, _)) -> norm_big (big_mod_s (big_pow b e "1") (num_dec m))
+                  | Cons (VInt e, _) -> norm_big (big_pow b e "1")
+                  | _ -> VBig b) | _ -> (let _ = map_set prim_missing "n" (mkstr "pow") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pow'")) in fail "mere-ruby: undefined method 'pow'")))
   else if str_eq name "even?" then (match recv with VInt n -> VBool (floor_mod n 2 == 0) | VBig b -> VBool (big_even b) | _ -> (let _ = map_set prim_missing "n" (mkstr "even?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'even?'")) in fail "mere-ruby: undefined method 'even?'")))
   else if str_eq name "odd?" then (match recv with VInt n -> VBool (floor_mod n 2 != 0) | VBig b -> VBool (if big_even b then false else true) | _ -> (let _ = map_set prim_missing "n" (mkstr "odd?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'odd?'")) in fail "mere-ruby: undefined method 'odd?'")))
   // Integer#allbits?/anybits?/nobits?(mask): bit-mask predicates.
@@ -23775,6 +23978,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
      | VRat (rn, rd) -> VBool (str_eq rn "0")
+     // a Complex is zero when BOTH parts are
+     | VCpx (cre, cim) -> VBool (rb_eq cre (VInt 0) && rb_eq cim (VInt 0))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
   // Numeric#integer?. `is_num_method` has claimed this name all along with no
   // branch behind it, so `respond_to?(:integer?)` said true and the call
@@ -23810,11 +24015,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VFlt f -> (if f == 0.0 then VNil else recv)
      | VBig s2 -> (if str_eq s2 "0" then VNil else recv)
      | VRat (n, d) -> (if big_sign n == 0 then VNil else recv)
+     | VCpx (cre, cim) -> (if rb_eq cre (VInt 0) && rb_eq cim (VInt 0) then VNil else recv)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "nonzero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nonzero?'")) in fail "mere-ruby: undefined method 'nonzero?'")))
   else if str_eq name "positive?" then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
   else if str_eq name "negative?" then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
-  else if str_eq name "succ" || str_eq name "next" then (match recv with VInt n -> VInt (n + 1) | VStr s -> mkstr (str_succ (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
-  else if str_eq name "pred" then (match recv with VInt n -> VInt (n - 1) | _ -> (let _ = map_set prim_missing "n" (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
+  else if str_eq name "succ" || str_eq name "next" then (match recv with VInt n -> VInt (n + 1) | VBig b -> norm_big (big_add_s b "1") | VStr s -> mkstr (str_succ (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
+  else if str_eq name "pred" then (match recv with VInt n -> VInt (n - 1) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = map_set prim_missing "n" (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
   else if str_eq name "abs" || str_eq name "magnitude" then
     (match recv with
      | VInt n -> VInt (if n < 0 then 0 - n else n)
@@ -23829,9 +24035,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else VFlt (sqrt (to_f (cpx_comp "+" (cpx_comp "*" r r) (cpx_comp "*" i i)))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "abs") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'abs'")) in fail "mere-ruby: undefined method 'abs'")))
   else if str_eq name "next_float" then
-    (match recv with VFlt f -> VFlt (flt_next f) | VInt n -> VFlt (flt_next (float_of_int n)) | _ -> VNil)
+    (match recv with VFlt f -> VFlt (flt_next f)
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "next_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'next_float'")) in fail "mere-ruby: undefined method 'next_float'")))
   else if str_eq name "prev_float" then
-    (match recv with VFlt f -> VFlt (flt_prev f) | VInt n -> VFlt (flt_prev (float_of_int n)) | _ -> VNil)
+    (match recv with VFlt f -> VFlt (flt_prev f)
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "prev_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'prev_float'")) in fail "mere-ruby: undefined method 'prev_float'")))
   else if str_eq name "object_id" || str_eq name "__id__" then
     (match recv with
      | VInt n -> VInt (2 * n + 1)
@@ -23845,7 +24053,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VProc id -> VInt (5000000 + id * 8)
      | VFlt f -> VInt (7000000 + int_of_float (f * 1000.0))
      | _ -> VInt 0)
-  else if str_eq name "nan?" then (match recv with VFlt f -> VBool (if f == f then false else true) | _ -> VBool false)
+  // #nan? / #next_float / #prev_float belong to Float alone: an Integer
+  // answering false (or a Float) for them is a name Integer does not have.
+  else if str_eq name "nan?" then
+    (match recv with VFlt f -> VBool (if f == f then false else true)
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "nan?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nan?'")) in fail "mere-ruby: undefined method 'nan?'")))
   else if str_eq name "infinite?" then
     (match recv with VFlt f -> (if (if f == f then false else true) then VNil else if (if f == 0.0 then false else true) && f * 0.5 == f then VInt (if f > 0.0 then 1 else 0 - 1) else VNil) | _ -> VNil)
   else if str_eq name "finite?" then
@@ -23857,6 +24069,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "floor" rn rd p | _ -> norm_big (rat_int_mode "floor" rn rd))
+     // an Integer rounds to ITSELF at precision >= 0; a negative precision
+     // rounds to that power of ten, exactly (the machine-int arm above cannot
+     // hold a bignum's).
+     | VBig b -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VBig b
+                     else (let m9 = big_pow "10" (0 - d) "1" in
+                           norm_big (big_mul_s (rat_int_mode "floor" b m9) m9)))
+                  | _ -> VBig b)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "floor") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'floor'")) in fail "mere-ruby: undefined method 'floor'")))
   else if str_eq name "ceil" then
     (match recv with
@@ -23865,6 +24086,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "ceil" rn rd p | _ -> norm_big (rat_int_mode "ceil" rn rd))
+     // an Integer rounds to ITSELF at precision >= 0; a negative precision
+     // rounds to that power of ten, exactly (the machine-int arm above cannot
+     // hold a bignum's).
+     | VBig b -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VBig b
+                     else (let m9 = big_pow "10" (0 - d) "1" in
+                           norm_big (big_mul_s (rat_int_mode "ceil" b m9) m9)))
+                  | _ -> VBig b)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "ceil") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ceil'")) in fail "mere-ruby: undefined method 'ceil'")))
   else if str_eq name "round" then
     (match recv with
@@ -23873,9 +24103,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "round" rn rd p | _ -> norm_big (rat_int_mode "round" rn rd))
+     // an Integer rounds to ITSELF at precision >= 0; a negative precision
+     // rounds to that power of ten, exactly (the machine-int arm above cannot
+     // hold a bignum's).
+     | VBig b -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VBig b
+                     else (let m9 = big_pow "10" (0 - d) "1" in
+                           norm_big (big_mul_s (rat_int_mode "round" b m9) m9)))
+                  | _ -> VBig b)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "round") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'round'")) in fail "mere-ruby: undefined method 'round'")))
   else if str_eq name "truncate" then
     (match recv with VInt n -> VInt n | VFlt f -> VInt (int_of_float f)
+     | VBig b -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VBig b
+                     else (let m9 = big_pow "10" (0 - d) "1" in
+                           norm_big (big_mul_s (rat_int_mode "truncate" b m9) m9)))
+                  | _ -> VBig b)
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "truncate" rn rd p | _ -> norm_big (rat_int_mode "truncate" rn rd))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "truncate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'truncate'")) in fail "mere-ruby: undefined method 'truncate'")))
   // ⚠ numerator/denominator are the whole numeric tower's, not Rational's alone.
@@ -23955,6 +24200,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | Cons (_, Cons (_, _)) ->
        prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
      | _ -> mk_rat_s "0" "1")
+  // Complex#rationalize is Complex#to_r's question: only a real Complex has one.
+  else if str_eq name "rationalize" && is_cpx recv then
+    (match recv with
+     | VCpx (cre, cim) ->
+       (if exact_zero_val cim then prim_method cre "rationalize" args
+        else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Rational"))
+     | _ -> VNil)
   else if str_eq name "rationalize" then
     (let bounds =
        (match args with

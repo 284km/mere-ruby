@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 342 files.
+Classified: 335 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,31 +53,31 @@ Classified: 342 files.
 
 </details>
 
-## DIFF — 321 files, 97 kinds
+## DIFF — 314 files, 96 kinds
 
 | files | kind |
 |---|---|
-| 54 | `ERROR NoMethodError` |
+| 48 | `ERROR NoMethodError` |
 | 21 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
 | 18 | `ERROR StandardError` |
+| 15 | `FAILED expected ArgumentError to be raised` |
 | 12 | `FAILED expected to be identical` |
-| 12 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected true, got false` |
 | 10 | `FAILED expected TypeError to be raised` |
-| 8 | `FAILED expected truthy from #include?` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 7 | `pass=N fail=N err=N` |
+| 7 | `FAILED expected truthy from #include?` |
 | 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected N, got nil` |
 | 5 | `ERROR ArgumentError` |
-| 4 | `FAILED raised NoMethodError, expected RangeError` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected not N` |
 | 3 | `FAILED expected ZeroDivisionError to be raised` |
 | 3 | `FAILED expected SyntaxError to be raised` |
+| 3 | `FAILED expected RangeError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
 | 3 | `FAILED expected "S" to match` |
@@ -88,14 +88,13 @@ Classified: 342 files.
 | 2 | `FAILED expected nil, got N` |
 | 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
-| 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
-| 2 | `FAILED expected N ...[clipped]` |
 | 2 | `FAILED expected :SYM, got :SYM` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
+| 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 1 | `FAILED raised StandardError, expected TypeError` |
@@ -124,11 +123,11 @@ Classified: 342 files.
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
 | 1 | `FAILED expected [[N], {:SYM=>N}, #<OBJ>], got [[N], {:SYM=>N}, #<OBJ>]` |
-| 1 | `FAILED expected [N, N], got nil` |
 | 1 | `FAILED expected [N, N], got []` |
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
+| 1 | `FAILED expected [N, N ...[clipped]` |
 | 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
@@ -138,6 +137,7 @@ Classified: 342 files.
 | 1 | `FAILED expected N, got true` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
+| 1 | `FAILED expected N ...[clipped]` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected Kernel, got Module` |
@@ -152,19 +152,18 @@ Classified: 342 files.
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
 | 1 | `ERROR ZeroDivisionError` |
 | 1 | `ERROR SyntaxError` |
-| 1 | `ERROR RangeError` |
 | 1 | `ERROR Errno::ENOENT` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 12 | `FAILED: expected ArgumentError to be raised` |
+| 15 | `FAILED: expected ArgumentError to be raised` |
 | 10 | `FAILED: expected TypeError to be raised` |
-| 4 | `FAILED: raised NoMethodError, expected RangeError` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
+| 3 | `FAILED: expected RangeError to be raised` |
 | 3 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `ERROR: bignum dispatches the correct operator after coercion: ArgumentError` |
 | 2 | `pass=55 fail=0 err=0` |
@@ -180,7 +179,6 @@ Classified: 342 files.
 | 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
 | 2 | `FAILED: expected ThreadError to be raised` |
-| 2 | `FAILED: expected RangeError to be raised` |
 | 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
@@ -199,6 +197,7 @@ Classified: 342 files.
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 | 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
+| 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 
 </details>
 
@@ -213,7 +212,6 @@ class column says where the weight sits.
 |---|---|
 | kernel (12) | `__method__ binding fail format lambda loop method public_send respond_to_missing select test warn` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
-| integer (9) | `ceildiv div gcd ord pred round size succ try_convert` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | proc (7) | `binding case_compare curry element_reference new to_proc yield` |
 | method (7) | `case_compare clone curry element_reference source_location super_method to_proc` |
@@ -221,6 +219,7 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
+| integer (3) | `ceildiv div try_convert` |
 | numeric (2) | `integer real` |
 | language (2) | `alias module` |
 | threadgroup (1) | `list` |
