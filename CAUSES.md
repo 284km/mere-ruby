@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 379 files.
+Classified: 371 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,33 +53,33 @@ Classified: 379 files.
 
 </details>
 
-## DIFF — 358 files, 99 kinds
+## DIFF — 350 files, 103 kinds
 
 | files | kind |
 |---|---|
-| 59 | `ERROR NoMethodError` |
-| 22 | `ERROR NameError` |
-| 20 | `FAILED expected truthy from #include?` |
+| 60 | `ERROR NoMethodError` |
+| 23 | `ERROR NameError` |
 | 19 | `FAILED expected N, got N` |
 | 19 | `ERROR StandardError` |
-| 16 | `FAILED expected true, got false` |
+| 14 | `FAILED expected true, got false` |
 | 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 11 | `FAILED expected TypeError to be raised` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 8 | `ERROR ArgumentError` |
+| 7 | `FAILED expected truthy from #include?` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `FAILED expected "S", got "S"` |
+| 6 | `pass=N fail=N err=N` |
 | 6 | `FAILED expected N, got nil` |
-| 5 | `pass=N fail=N err=N` |
 | 5 | `FAILED raised NoMethodError, expected RangeError` |
 | 4 | `FAILED expected nil, got "S"` |
-| 4 | `FAILED expected LocalJumpError to be raised` |
 | 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED expected not N` |
+| 3 | `FAILED expected falsy from #include?` |
 | 3 | `FAILED expected SyntaxError to be raised` |
-| 3 | `FAILED expected NoMethodError to be raised` |
+| 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
 | 3 | `FAILED expected "S" to match` |
 | 3 | `ERROR TypeError` |
@@ -91,6 +91,7 @@ Classified: 379 files.
 | 2 | `FAILED expected ZeroDivisionError to be raised` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
+| 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected NameError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected N ...[clipped]` |
@@ -104,6 +105,7 @@ Classified: 379 files.
 | 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised RuntimeError, expected NoMethodError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
+| 1 | `FAILED raised NoMethodError, expected TypeError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
@@ -119,7 +121,7 @@ Classified: 379 files.
 | 1 | `FAILED expected truthy from #<=` |
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
-| 1 | `FAILED expected falsy from #include?` |
+| 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
 | 1 | `FAILED expected a #<OBJ>>, got #<OBJ>` |
@@ -139,11 +141,13 @@ Classified: 379 files.
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected N, got true` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
+| 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
 | 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
@@ -163,14 +167,11 @@ Classified: 379 files.
 |---|---|
 | 12 | `FAILED: expected ArgumentError to be raised` |
 | 11 | `FAILED: expected TypeError to be raised` |
-| 9 | `FAILED: is a private method: expected truthy from #include?` |
 | 5 | `FAILED: raised NoMethodError, expected RangeError` |
-| 4 | `FAILED: is a public method: expected truthy from #include?` |
-| 4 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `FAILED: raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
-| 3 | `FAILED: expected NoMethodError to be raised` |
+| 3 | `FAILED: expected LocalJumpError to be raised` |
 | 2 | `pass=55 fail=0 err=0` |
 | 2 | `pass=52 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
@@ -181,17 +182,20 @@ Classified: 379 files.
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED: raised NameError, expected TypeError` |
-| 2 | `FAILED: is a private instance method: expected truthy from #include?` |
+| 2 | `FAILED: is a private method: expected truthy from #include?` |
+| 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
 | 2 | `FAILED: expected ZeroDivisionError to be raised` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: expected RangeError to be raised` |
+| 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: expected NameError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 2 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=157 fail=0 err=0` |
+| 1 | `pass=110 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
@@ -213,7 +217,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (16) | `__method__ binding chomp chop fail format initialize_copy instance_variable_get lambda loop method private_methods protected_methods public_send test warn` |
+| kernel (18) | `__method__ binding fail format initialize_clone initialize_copy initialize_dup instance_variable_get lambda loop method private_methods protected_methods public_send respond_to_missing select test warn` |
 | integer (10) | `ceildiv div gcd ord pred remainder round size succ try_convert` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |

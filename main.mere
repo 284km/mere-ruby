@@ -12090,6 +12090,16 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | VSym sv -> (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | VSym sv -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       // `!~` is `=~` negated, and Object has no #=~ since ruby 3.2: a receiver
+       // that does not answer it raises rather than saying "no match". A class
+       // that defines either one keeps its answer.
+       | VObj _ ->
+         (if has_meth world (dispatch_cls_of world va0) "!~" then
+            invoke_val_c env world blk va0 "!~" (Cons (vb, Nil)) false
+          else if has_meth world (dispatch_cls_of world va0) "=~" then
+            VBool (if truthy (invoke_val_c env world blk va0 "=~" (Cons (vb, Nil)) false) then false else true)
+          else raise_exc world "NoMethodError"
+                 ("undefined method '=~' for an instance of " ++ display_cls_msg world (dispatch_cls_of world va0)))
        | _ -> VBool true)
     // For a class/module these five are the SUBCLASS partial order, not a
     // value comparison, so they have to reach the class dispatcher rather
@@ -17643,6 +17653,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "private_instance_methods" || str_eq name "public_instance_methods" then
       (let (meths0, _, _, _) = world in
        let want_priv = str_eq name "private_instance_methods" in
+       // Kernel's own methods live in the primitive dispatcher, so the method
+       // table cannot see them: the module functions are its PRIVATE instance
+       // methods and Object's are its PUBLIC ones. Read from the same lists
+       // `public_methods` uses, so the two answers cannot disagree.
+       let kern9 = str_eq c "Kernel" in
        let pfx = c ++ "#" in
        let plen = str_len pfx in
        let tmp = map_new () in
@@ -17657,6 +17672,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // already decided that case above).
        let _ = (if want_priv && (if map_has meths0 (pfx ++ "initialize") then false else true)
                 then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym "initialize")) else ()) in
+       let _ = (if kern9 then
+                  (let rec add9 = fn (xs: str list) ->
+                     (match xs with
+                      | Nil -> ()
+                      | Cons (h9, t9) ->
+                        (let m9 = map_len tmp in
+                         let _ = map_set tmp (str_of_int m9) (VSym h9) in add9 t9)) in
+                   add9 (if want_priv then kernel_builtin_names () else kernel_public_instance_names ()))
+                else ()) in
        // KERNEL'S MODULE FUNCTIONS ARE PRIVATE INSTANCE METHODS. That is not a
        // detail: `puts` and `format` are callable with no receiver from
        // anywhere precisely because Kernel makes them private instance methods
@@ -22677,7 +22701,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | Cons (b, _) -> (if rb_eq recv b then VInt 0 else VNil)
      | _ -> VNil)
   else if str_eq name "hash" then VInt (val_hash recv)
-  else if str_eq name "tap" then recv
+  // `x.tap` with NO block is a LocalJumpError (the block is not optional); it
+  // answered the receiver.
+  else if str_eq name "tap" then
+    prim_raise "LocalJumpError" "no block given (yield)"
   else if str_eq name "__regex" then
     (match recv with VStr sp -> let sp = sget sp in rx_build_once sp (match args with Cons (VStr f, _) -> sget f | _ -> "") args | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
   // Regexp#options: the same bits Regexp::IGNORECASE and friends name.
@@ -26675,8 +26702,41 @@ and is_kernel_modfunc = fn (name: str) ->
 // them" and `Kernel.private_instance_methods` has to ENUMERATE them. A
 // predicate cannot be enumerated, and a second hand-written list would drift
 // from this one, so the predicate is defined in terms of the list.
+// Kernel's PUBLIC instance methods (Object's, in other words): every object
+// answers them, and `Kernel.public_instance_methods(false)` lists them.
+and kernel_public_instance_names = fn (u: unit) ->
+  Cons ("eql?", Cons ("respond_to?", Cons ("remove_instance_variable", Cons ("=~",
+  Cons ("!~", Cons ("===", Cons ("<=>", Cons ("class", Cons ("singleton_class",
+  Cons ("clone", Cons ("dup", Cons ("itself", Cons ("yield_self", Cons ("then",
+  Cons ("tap", Cons ("freeze", Cons ("frozen?", Cons ("inspect", Cons ("methods",
+  Cons ("singleton_methods", Cons ("protected_methods", Cons ("private_methods",
+  Cons ("public_methods", Cons ("instance_variables", Cons ("instance_variable_get",
+  Cons ("instance_variable_set", Cons ("instance_variable_defined?", Cons ("instance_of?",
+  Cons ("kind_of?", Cons ("is_a?", Cons ("display", Cons ("method", Cons ("public_method",
+  Cons ("singleton_method", Cons ("define_singleton_method", Cons ("object_id",
+  Cons ("send", Cons ("public_send", Cons ("extend", Cons ("hash", Cons ("to_s",
+  Cons ("nil?", Nil))))))))))))))))))))))))))))))))))))))))))
+
+// ...and Kernel's PRIVATE instance methods: the module functions, which every
+// object can call without a receiver. A name missing from this list is missing
+// from FOUR answers at once (private_instance_methods, public_methods,
+// Kernel's own respond_to?, and the enumeration behind `methods`), which is
+// why there is one list rather than a check per door.
 and kernel_builtin_names = fn (u: unit) ->
-  Cons ("puts", Cons ("p", Cons ("pp", Cons ("print", Cons ("printf", Cons ("format", Cons ("sprintf", Cons ("raise", Cons ("fail", Cons ("loop", Cons ("catch", Cons ("throw", Cons ("proc", Cons ("lambda", Cons ("eval", Cons ("require", Cons ("require_relative", Cons ("block_given?", Cons ("Integer", Cons ("Float", Cons ("String", Cons ("Array", Cons ("Hash", Cons ("Rational", Cons ("Complex", Cons ("warn", Cons ("rand", Cons ("srand", Cons ("sleep", Cons ("gets", Cons ("exit", Cons ("exit!", Cons ("abort", Cons ("at_exit", Cons ("binding", Cons ("set_trace_func", Cons ("caller", Cons ("caller_locations", Cons ("__method__", Cons ("__callee__", Cons ("load", Cons ("system", Cons ("readline", Cons ("readlines", Cons ("trace_var", Cons ("untrace_var", Cons ("fork", Cons ("global_variables", Cons ("local_variables", Cons ("test", Cons ("__dir__", Nil)))))))))))))))))))))))))))))))))))))))))))))))))))
+  Cons ("select", Cons ("spawn", Cons ("syscall", Cons ("trap", Cons ("putc",
+  Cons ("respond_to_missing?", Cons ("initialize_clone", Cons ("initialize_dup",
+  Cons ("initialize_copy", Cons ("chomp", Cons ("chop", Cons ("open", Cons ("exec",
+  Cons ("sub", Cons ("gsub", Cons ("puts", Cons ("p", Cons ("pp", Cons ("print",
+  Cons ("printf", Cons ("format", Cons ("sprintf", Cons ("raise", Cons ("fail",
+  Cons ("loop", Cons ("catch", Cons ("throw", Cons ("proc", Cons ("lambda", Cons ("eval",
+  Cons ("require", Cons ("require_relative", Cons ("block_given?", Cons ("Integer",
+  Cons ("Float", Cons ("String", Cons ("Array", Cons ("Hash", Cons ("Rational",
+  Cons ("Complex", Cons ("warn", Cons ("rand", Cons ("srand", Cons ("sleep", Cons ("gets",
+  Cons ("exit", Cons ("exit!", Cons ("abort", Cons ("at_exit", Cons ("binding",
+  Cons ("set_trace_func", Cons ("caller", Cons ("caller_locations", Cons ("__method__",
+  Cons ("__callee__", Cons ("load", Cons ("system", Cons ("readline", Cons ("readlines",
+  Cons ("trace_var", Cons ("untrace_var", Cons ("fork", Cons ("global_variables",
+  Cons ("local_variables", Cons ("test", Cons ("__dir__", Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 
 and list_iter_kernel_names = fn (f: str -> unit) ->
   let rec go = fn (xs: str list) ->
@@ -34568,6 +34628,15 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
       let frame0 = map_new () in
       let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
       truthy (invoke world noblk0 cand ocl "===" (Cons (v, Nil)))
+    // ...but the SAME OBJECT is always ===, whatever == says: rb_equal checks
+    // identity before it calls anything.
+    else if (match v with VObj oid2 -> oid == oid2 | _ -> false) then true
+    // Object#=== IS `==`, so a class that redefines only == is followed here
+    // too (rb_eq is structural and never asks).
+    else if has_meth world ocl "==" then
+      (let frame0 = map_new () in
+       let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
+       truthy (invoke world noblk0 cand ocl "==" (Cons (v, Nil))))
     else rb_eq cand v
   | VRegex (p, pf) ->
     (match v with
