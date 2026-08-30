@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 359 files.
+Classified: 349 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,25 +53,25 @@ Classified: 359 files.
 
 </details>
 
-## DIFF — 338 files, 101 kinds
+## DIFF — 328 files, 98 kinds
 
 | files | kind |
 |---|---|
-| 60 | `ERROR NoMethodError` |
-| 23 | `ERROR NameError` |
+| 57 | `ERROR NoMethodError` |
+| 21 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
-| 12 | `FAILED expected to be identical` |
+| 13 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
-| 11 | `FAILED expected true, got false` |
-| 11 | `FAILED expected TypeError to be raised` |
+| 10 | `FAILED expected true, got false` |
+| 10 | `FAILED expected TypeError to be raised` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 8 | `ERROR ArgumentError` |
+| 7 | `pass=N fail=N err=N` |
 | 7 | `FAILED expected truthy from #include?` |
 | 7 | `FAILED expected false, got true` |
-| 6 | `pass=N fail=N err=N` |
-| 6 | `FAILED expected N, got nil` |
 | 6 | `FAILED expected "S", got "S"` |
+| 5 | `FAILED expected N, got nil` |
 | 4 | `FAILED raised NoMethodError, expected RangeError` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
@@ -85,7 +85,6 @@ Classified: 359 files.
 | 3 | `ERROR TypeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
-| 2 | `FAILED raised NameError, expected TypeError` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected nil, got N` |
 | 2 | `FAILED expected ThreadError to be raised` |
@@ -104,7 +103,6 @@ Classified: 359 files.
 | 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised RuntimeError, expected NoMethodError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
-| 1 | `FAILED raised NoMethodError, expected TypeError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
@@ -133,7 +131,6 @@ Classified: 359 files.
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
-| 1 | `FAILED expected [#<OBJ>, {:SYM=>true}], got nil` |
 | 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
@@ -147,7 +144,7 @@ Classified: 359 files.
 | 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
-| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "VSCODE_CRASH_R ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
@@ -164,7 +161,7 @@ Classified: 359 files.
 | files | cause |
 |---|---|
 | 12 | `FAILED: expected ArgumentError to be raised` |
-| 11 | `FAILED: expected TypeError to be raised` |
+| 10 | `FAILED: expected TypeError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected RangeError` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
@@ -179,7 +176,6 @@ Classified: 359 files.
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: raised NoMethodError, expected ArgumentError` |
-| 2 | `FAILED: raised NameError, expected TypeError` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
@@ -191,6 +187,7 @@ Classified: 359 files.
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 2 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
 | 1 | `sh: feature_14386: command not found` |
+| 1 | `pass=5 fail=0 err=0` |
 | 1 | `pass=157 fail=0 err=0` |
 | 1 | `pass=110 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
@@ -215,7 +212,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (18) | `__method__ binding fail format initialize_clone initialize_copy initialize_dup instance_variable_get lambda loop method private_methods protected_methods public_send respond_to_missing select test warn` |
+| kernel (14) | `__method__ binding fail format lambda loop method private_methods protected_methods public_send respond_to_missing select test warn` |
 | integer (10) | `ceildiv div gcd ord pred remainder round size succ try_convert` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
@@ -225,8 +222,8 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
-| language (3) | `alias metaclass module` |
 | numeric (2) | `integer real` |
+| language (2) | `alias module` |
 | threadgroup (1) | `list` |
 | range (1) | `step` |
 

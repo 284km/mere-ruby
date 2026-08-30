@@ -27,12 +27,12 @@ Loaded straight from a rubygems checkout, no shims:
 | `Gem::Dependency` (`requirement` / `type` / `match?` / `=~`) | byte-identical |
 | `lib/**/*.rb` that mere-ruby's parser accepts | **330 / 428** |
 
-## The test suite (2026-08-29)
+## The test suite (2026-08-30)
 
 | file | ruby | mere-ruby |
 |---|---|---|
 | `test_gem_version.rb` | pass=32 fail=0 err=0 | pass=29 fail=0 err=3 |
-| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=26 fail=7 err=2 |
+| `test_gem_requirement.rb` | pass=34 fail=0 err=1 | pass=27 fail=6 err=2 |
 | `test_gem_dependency.rb` | pass=22 fail=0 err=10 | **byte-identical** |
 
 `test_gem_dependency.rb` was `pass=21 fail=1 err=10` and became byte-identical
@@ -47,7 +47,9 @@ its lexical scope: rubygems' own rescues began working, so those examples now RU
 and compare instead of aborting. More reach, not a regression -- and what they
 compare is worth naming. `test_parse` reads
 `expected ["=", #<Gem::Version "1">], got ["=", #<Gem::Version "1">]`: the same
-text, not equal. `test_initialize_copy` wants a different object from `dup` and
+text, not equal. `test_initialize_copy` wanted a different object from `dup` and now gets one
+(2026-08-30: dup/clone run #initialize_dup / #initialize_clone, and through them
+a user #initialize_copy, which they did not before), and
 `test_parse_deduplication` wants the same object from a cache. Equality and
 identity on Gem::Version, in other words, which is where this suite goes next.
 

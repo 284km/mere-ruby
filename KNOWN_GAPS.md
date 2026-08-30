@@ -5,6 +5,35 @@ not fixed yet — as opposed to the things nobody has looked at. Each entry
 says what it costs and what fixing it would take, so the decision can be
 revisited rather than rediscovered.
 
+## `Proc` subclass clone/dup runs the copy hooks; ruby 3.2.2 runs none
+
+```ruby
+class MyProc < Proc
+  attr_reader :initializer
+  def initialize_clone(other) = (@initializer = :clone)
+end
+MyProc.new { }.clone.initializer   # mere-ruby: :clone
+                                   # ruby 3.2.2: nil
+```
+
+Every other object runs `#initialize_clone` / `#initialize_dup` (and through
+them `#initialize_copy`) when it is cloned or duplicated; `Kernel#clone`'s own
+spec is built on that. A `Proc` subclass is the one kind where the reference
+ruby calls nothing at all, so `core/proc/clone_spec.rb` is a file mere-ruby
+PASSES and ruby 3.2.2 FAILS -- which the gate records as a DIFF, because the
+gate compares the two rather than grading either.
+
+**Why it is still here.** The divergence is in the oracle. Reproducing it
+would mean a `Proc`-shaped exception inside the copy path -- "run no hook when
+the receiver is a Proc" -- with no rule behind it, written to be deleted again
+the moment the reference ruby moves. ruby/spec flags the neighbouring example
+in the same file with `ruby_bug "cloning a frozen proc is broken on Ruby 3.3"`,
+so this corner is known-broken upstream through 3.3.
+
+**What fixing it would take.** A newer reference ruby. Nothing in mere-ruby.
+The row is expected to go back to MATCH when the gate's ruby is upgraded; if
+it does not, this entry is wrong and the hook suppression is real.
+
 ## A bare `mere-ruby` prints usage; ruby reads stdin
 
 ```sh
