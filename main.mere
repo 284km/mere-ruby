@@ -11308,6 +11308,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       arr_new (caller_frames 1)
     else if str_eq name "caller_locations" && (if map_has meths name then false else true) then
       arr_new (caller_locs world 1 (0 - 1))
+    // `at_exit` with no block is an ArgumentError, not an unknown name: the
+    // block is the whole method, and the blockless form reached the
+    // undefined-local-variable path.
+    else if str_eq name "at_exit" && (if map_has meths "at_exit" then false else true) then
+      raise_exc world "ArgumentError" "called without a block"
+    // ...and `catch` with no block: the block IS the method, so there is
+    // nothing to run and nothing to catch. ruby reports a LocalJumpError.
+    else if str_eq name "catch" && (if map_has meths "catch" then false else true) then
+      raise_exc world "LocalJumpError" "no block given"
     else if str_eq name "print" && (if kernel_overridden env world "print" then false else true) then VNil
     else if str_eq name "rand" && (if map_has meths "rand" then false else true) then rand_val world Nil
     else if str_eq name "srand" && (if map_has meths "srand" then false else true) then VInt 0
@@ -11416,8 +11425,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_eq name "local_variables" && (if map_has meths name then false else true) then local_vars_of env
     else if str_eq name "global_variables" && (if map_has meths name then false else true) then global_vars_of ()
     else if map_has meths name then call_method env world noblk name args
+    // `catch :tag` with no block: the block IS the method, so there is nothing
+    // to run and nothing to catch. ruby reports a LocalJumpError; this reached
+    // the unknown-method path instead.
+    else if str_eq name "catch" && (if map_has meths "catch" then false else true) then
+      raise_exc world "LocalJumpError" "no block given"
     else if str_eq name "throw" && (if map_has meths "throw" then false else true) then
       (match args with
+       | Cons (_, Cons (_, Cons (_, _))) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1..2)")
        | Cons (t, rest) ->
          let v = (match rest with Cons (v2, _) -> v2 | Nil -> VNil) in
          let d = (if map_has catch_depth "n" then (match map_get catch_depth "n" with VInt dn -> dn | _ -> 0) else 0) in
@@ -11546,11 +11563,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> VNil)
     // catch(:tag) { ... throw :tag, v ... } via the flow-signal unwind.
     else if str_eq name "catch" && (if map_has meths "catch" then false else true) then
-      (let tag = (match args with Cons (t, _) -> t | _ -> VNil) in
+      (match args with
+       | Cons (_, Cons (_, _)) ->
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+       | _ ->
+       // with no tag ruby MAKES one (a fresh Object) and, either way, PASSES
+       // it to the block -- `catch(:k) { |y| y }` is :k, and it was nil.
+       let tag = (match args with Cons (t, _) -> t | _ -> new_obj world "Object" Nil) in
        let d0 = (if map_has catch_depth "n" then (match map_get catch_depth "n" with VInt dn -> dn | _ -> 0) else 0) in
        let _ = map_set catch_depth "n" (VInt (d0 + 1)) in
        let _ = map_set catch_depth ("t" ++ str_of_int (d0 + 1)) tag in
-       let f = try_or (fn (u: unit) -> run_block world blk (true, bp, bb, env) Nil) (FRaise VNil) in
+       let f = try_or (fn (u: unit) -> run_block world blk (true, bp, bb, env) (Cons (tag, Nil))) (FRaise VNil) in
        let _ = map_set catch_depth "n" (VInt d0) in
        (match f with
         | FRaise _ ->
@@ -11567,7 +11591,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
            let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
 
-            if str_eq k "throw" && rb_eq tg tag then v
+            if str_eq k "throw" && rb_identical tg tag then v
             else flow_rethrow_tagged k tg v
           else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
         | other -> flow_value other))
@@ -27471,8 +27495,24 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      exit 1)
   // Kernel#sleep: inside a synchronous thread it parks the thread; on the
   // main thread it is a scheduling no-op (there is nobody to switch to).
-  else if str_eq name "sleep" && (match args with Nil -> true | Cons (VInt _, _) -> true | Cons (VFlt _, _) -> true | _ -> false) then
-    (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+  else if str_eq name "sleep" then
+    // a NEGATIVE interval and a non-numeric one are both refusals; every
+    // argument used to be accepted and slept for none of it.
+    (match args with
+     | Cons (VInt n9, _) ->
+       (if n9 < 0 then raise_exc world "ArgumentError" "time interval must not be negative"
+        else if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+     | Cons (VFlt f9, _) ->
+       (if f9 < 0.0 then raise_exc world "ArgumentError" "time interval must not be negative"
+        else if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+     | Cons (VNil, _) -> raise_exc world "TypeError" "can't convert nil into time interval"
+     | Cons (other9, _) ->
+       (match other9 with
+        | VBig _ -> (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+        | VRat (_, _) -> (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+        | _ -> raise_exc world "TypeError"
+                 ("can't convert " ++ class_name other9 ++ " into time interval"))
+     | Nil -> (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0))
   // Kernel#caller / caller_locations: mere-ruby keeps no call stack, so the
   // honest answer is an empty backtrace rather than a NoMethodError. Callers
   // that log it print nothing; callers that index it get nil.
@@ -27489,7 +27529,11 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   else if str_eq name "caller_locations" && (if map_has meths name then false else true) then
     (let skip = (match args with Cons (VInt n, _) -> n | _ -> 1) in
      let want = (match args with Cons (_, Cons (VInt m, _)) -> m | _ -> 0 - 1) in
-     arr_new (caller_locs world skip want))
+     // a negative level or length is a refusal, not a shorter list
+     if skip < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int skip ++ ")")
+     else if (match args with Cons (_, Cons (VInt m, _)) -> m < 0 | _ -> false)
+     then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int want ++ ")")
+     else arr_new (caller_locs world skip want))
   // Kernel#rand: a Float in [0, 1) with no argument, an Integer in [0, n)
   // with a positive one, and a member of a Range.
   else if (str_eq name "rand" || str_eq name "srand") && (if map_has meths name then false else true) then
@@ -35674,9 +35718,13 @@ and flow_rethrow_tagged = fn (kind: str) -> fn (tag: Val) -> fn (v: Val) ->
   (let m = "mere-ruby: (unhandled " ++ kind ++ ", tagged)" in
    let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
 
+// ruby matches a throw tag to a catch tag by IDENTITY (rb_obj_id), not by
+// value: `catch("exit") { throw :exit }` and `catch("exit".dup) { throw
+// "exit".dup }` are both uncaught, and an uncaught throw is the error the
+// spec is checking for. rb_eq made two equal-looking Strings the same tag.
 and catch_tag_active = fn (t: Val) -> fn (d: int) ->
   if d <= 0 then false
-  else if map_has catch_depth ("t" ++ str_of_int d) && rb_eq (map_get catch_depth ("t" ++ str_of_int d)) t then true
+  else if map_has catch_depth ("t" ++ str_of_int d) && rb_identical (map_get catch_depth ("t" ++ str_of_int d)) t then true
   else catch_tag_active t (d - 1)
 
 and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->

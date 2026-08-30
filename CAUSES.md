@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 335 files.
+Classified: 332 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,7 +53,7 @@ Classified: 335 files.
 
 </details>
 
-## DIFF — 314 files, 96 kinds
+## DIFF — 311 files, 96 kinds
 
 | files | kind |
 |---|---|
@@ -61,8 +61,8 @@ Classified: 335 files.
 | 21 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
 | 18 | `ERROR StandardError` |
-| 15 | `FAILED expected ArgumentError to be raised` |
 | 12 | `FAILED expected to be identical` |
+| 12 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected true, got false` |
 | 10 | `FAILED expected TypeError to be raised` |
 | 8 | `FAILED expected false, got true` |
@@ -74,14 +74,13 @@ Classified: 335 files.
 | 5 | `ERROR ArgumentError` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
+| 4 | `ERROR TypeError` |
 | 3 | `FAILED expected not N` |
 | 3 | `FAILED expected ZeroDivisionError to be raised` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected RangeError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
-| 3 | `FAILED expected :SYM, got nil` |
 | 3 | `FAILED expected "S" to match` |
-| 3 | `ERROR TypeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED expected not to be identical` |
@@ -90,6 +89,7 @@ Classified: 335 files.
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
+| 2 | `FAILED expected :SYM, got nil` |
 | 2 | `FAILED expected :SYM, got :SYM` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR SystemStackError` |
@@ -101,7 +101,6 @@ Classified: 335 files.
 | 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised RuntimeError, expected NoMethodError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
-| 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
@@ -130,6 +129,7 @@ Classified: 335 files.
 | 1 | `FAILED expected [N, N ...[clipped]` |
 | 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
@@ -158,7 +158,7 @@ Classified: 335 files.
 
 | files | cause |
 |---|---|
-| 15 | `FAILED: expected ArgumentError to be raised` |
+| 12 | `FAILED: expected ArgumentError to be raised` |
 | 10 | `FAILED: expected TypeError to be raised` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
