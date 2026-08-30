@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 332 files.
+Classified: 331 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,21 +53,21 @@ Classified: 332 files.
 
 </details>
 
-## DIFF — 311 files, 96 kinds
+## DIFF — 310 files, 95 kinds
 
 | files | kind |
 |---|---|
 | 48 | `ERROR NoMethodError` |
-| 21 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
 | 18 | `ERROR StandardError` |
+| 17 | `ERROR NameError` |
 | 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
+| 11 | `FAILED expected TypeError to be raised` |
 | 10 | `FAILED expected true, got false` |
-| 10 | `FAILED expected TypeError to be raised` |
+| 10 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 8 | `pass=N fail=N err=N` |
 | 8 | `FAILED expected false, got true` |
-| 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 7 | `pass=N fail=N err=N` |
 | 7 | `FAILED expected truthy from #include?` |
 | 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected N, got nil` |
@@ -140,7 +140,6 @@ Classified: 332 files.
 | 1 | `FAILED expected N ...[clipped]` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
-| 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
@@ -159,7 +158,7 @@ Classified: 332 files.
 | files | cause |
 |---|---|
 | 12 | `FAILED: expected ArgumentError to be raised` |
-| 10 | `FAILED: expected TypeError to be raised` |
+| 11 | `FAILED: expected TypeError to be raised` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
@@ -185,6 +184,7 @@ Classified: 332 files.
 | 2 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=5 fail=0 err=0` |
+| 1 | `pass=4 fail=2 err=7` |
 | 1 | `pass=157 fail=0 err=0` |
 | 1 | `pass=110 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
@@ -197,7 +197,6 @@ Classified: 332 files.
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 | 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
-| 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 
 </details>
 
@@ -210,8 +209,8 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (12) | `__method__ binding fail format lambda loop method public_send respond_to_missing select test warn` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
+| kernel (8) | `__method__ binding lambda loop method public_send select test` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | proc (7) | `binding case_compare curry element_reference new to_proc yield` |
 | method (7) | `case_compare clone curry element_reference source_location super_method to_proc` |

@@ -11818,22 +11818,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | Cons (VSym m, rest) -> if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis
           | Cons (VStr m, rest) -> let m = sget m in (if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis)
           | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: send expects a method name")) in fail "mere-ruby: send expects a method name"))
-       else if str_eq name "respond_to?" then
-         // respond_to?(name, include_all): the second argument was ignored here
-         // too -- this arm is the one a plain value reaches.
-         (let all = (match args with
-                     | Cons (_, Cons (VBool b, _)) -> b
-                     | Cons (_, Cons (VNil, _)) -> false
-                     | Cons (_, Cons (_, _)) -> true
-                     | _ -> false) in
-          let ask = (fn (m: str) ->
-            if responds world recv m then true
-            else if all then has_meth world (class_name recv) m
-            else false) in
-          match args with
-          | Cons (VSym m, _) -> VBool (ask m)
-          | Cons (VStr m, _) -> let m = sget m in VBool (ask m)
-          | _ -> VBool false)
+       else if str_eq name "respond_to?" then respond_to_answer env world recv args
        // in-place string mutation: rewrite the receiver's store entry, so
        // every alias sees it (unless the class redefines the method).
        else if (match recv with VStr _ -> true | _ -> false)
@@ -17002,6 +16987,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let id = alloc_oid ocls0 in
        let _ = map_set ocls0 (str_of_int id) c in
        VObj id)
+    // `private_class_method :new` (or `private :new` inside `class << self`)
+    // makes .new private: the constructor is hidden and the class hands out
+    // instances through a factory. The mark was recorded and nothing read it,
+    // so the constructor stayed public.
+    else if str_eq name "new" && vischeck && meth_private world ("(sng:" ++ c ++ ")") "new" then
+      raise_exc world "NoMethodError"
+        ("private method 'new' called for class " ++ display_cls_msg world c)
     // A user-defined `def self.new` (an interning cache, a factory) is an
     // ordinary class method and outranks the built-in allocation, which its
     // `super` still reaches (see the singleton branch of ESuper).
@@ -18007,28 +17999,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // attributes on one.
     else if str_eq name "singleton_class?" then VBool (is_sng_cls c)
     // respond_to? on a class/module (also reachable via send).
-    else if str_eq name "respond_to?" then
-      // respond_to?(name, include_all) -- the second argument was ignored, so a
-      // private method stayed hidden even when the caller asked to see it. The
-      // conversion protocol does not go through here (it ignores visibility on
-      // its own), but a program that asks this question deserves the answer.
-      (let all = (match args with
-                  | Cons (_, Cons (VBool b, _)) -> b
-                  | Cons (_, Cons (VNil, _)) -> false
-                  | Cons (_, Cons (_, _)) -> true
-                  | _ -> false) in
-       let ask = (fn (m: str) ->
-         if responds world recv m then true
-         else if all then
-           (let c0 = class_name recv in
-            (match recv with
-             | VObj oid -> (let (_, _, ocls0, _) = world in has_meth world (map_get ocls0 (str_of_int oid)) m)
-             | _ -> has_meth world c0 m))
-         else false) in
-       match args with
-       | Cons (VSym m, _) -> VBool (ask m)
-       | Cons (VStr m, _) -> let m = sget m in VBool (ask m)
-       | _ -> VBool false)
+    else if str_eq name "respond_to?" then respond_to_answer env world recv args
     // Module#ancestors: the lookup chain (self, included modules, supers);
     // for a singleton class this is the metaclass chain down to Class.
     else if str_eq name "ancestors" then
@@ -21689,7 +21660,14 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
   | VClass c2 ->
     (let sng = "(sng:" ++ c2 ++ ")" in
      let a = lookup_anc world (ancestors_of world sng) nm in
-     if str_eq a "" && map_has meths (sng ++ "#" ++ nm) then sng else a)
+     if str_eq a "" && map_has meths (sng ++ "#" ++ nm) then sng
+     // Kernel's module functions are ITS singleton's; its instance methods are
+     // Kernel's, whatever module object was asked. Without these the owner
+     // fell through to the Module surface the name was found on.
+     else if str_eq a "" && str_eq c2 "Kernel" && is_kernel_builtin nm
+             && (if is_kernel_priv_only nm then false else true) then sng
+     else if str_eq a "" && (is_kernel_pub_instance nm || is_kernel_builtin nm) then "Kernel"
+     else a)
   | other ->
     (let cn = class_name other in
      let a = lookup_anc world (ancestors_of world cn) nm in
@@ -21865,6 +21843,44 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
               c9))
      | _ -> k)
 
+// Kernel#respond_to?(name, include_all = false), for every receiver. PUBLIC
+// methods only unless include_all is asked for: a PROTECTED method does not
+// answer it either, which the include_all half of the old arms knew and the
+// default half did not. The name argument reads the same way it does
+// everywhere else -- Symbol, String, or #to_str -- and anything that is none
+// of those is a TypeError, not a false. There were two copies of this arm (one
+// for a plain value, one for an object) and they had drifted apart.
+and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list) ->
+  let all = (match args with
+             | Cons (_, Cons (VBool b, _)) -> b
+             | Cons (_, Cons (VNil, _)) -> false
+             | Cons (_, Cons (_, _)) -> true
+             | _ -> false) in
+  let nm = (match args with
+            | Cons (VSym m, _) -> m
+            | Cons (VStr m, _) -> sget m
+            | Cons (other, _) ->
+              (match conv_try env world other "to_str" with
+               | VStr h9 -> sget h9
+               | _ -> (let _ = raise_exc world "TypeError"
+                         (inspect other ++ " is not a symbol nor a string") in ""))
+            | Nil -> (let _ = raise_exc world "ArgumentError"
+                        "wrong number of arguments (given 0, expected 1..2)" in "")) in
+  let c9 = dispatch_cls_of world recv in
+  if responds world recv nm then
+    (if all then VBool true
+     else VBool (if meth_protected world c9 nm then false else true))
+  else if all then
+    // include_all: the private ones too. A class receiver answers through its
+    // METACLASS chain, and `.new` is a builtin with no table entry -- when
+    // private_class_method hid it, the mark is the only record that it is there.
+    VBool (match recv with
+           | VClass c8 ->
+             (let sng8 = "(sng:" ++ c8 ++ ")" in
+              has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
+           | _ -> has_meth world c9 nm)
+  else VBool false
+
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VObj id ->
@@ -21905,7 +21921,15 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   // Instance methods of C itself do NOT make C respond (Ruby semantics).
   // ...plus the Module/Class instance methods, which every module really
   // does respond to (zeitwerk asks for `method(:autoload?)` on a module).
-  | VClass c -> str_eq name "new" || has_meth world ("(sng:" ++ c ++ ")") name
+  // A module object is an Object: it answers Kernel's public instance methods.
+  // And Kernel's MODULE FUNCTIONS are its own public singleton methods, which
+  // is what `Kernel.respond_to?(:fail)` asks about -- it answered false, so
+  // `Kernel.method(:fail)` was a NameError.
+  | VClass c -> (str_eq name "new" && (if meth_private world ("(sng:" ++ c ++ ")") "new" then false else true))
+                || has_meth world ("(sng:" ++ c ++ ")") name
+                || is_kernel_pub_instance name
+                || (str_eq c "Kernel" && is_kernel_builtin name
+                    && (if is_kernel_priv_only name then false else true))
                 || is_prim_method name || is_module_method name
                 || builtin_class_method c name || str_eq name "autoload"
                 || str_eq name "autoload?" || str_eq name "define_method"
@@ -27909,6 +27933,22 @@ and list_iter_kernel_names = fn (f: str -> unit) ->
   let rec go = fn (xs: str list) ->
     (match xs with Nil -> () | Cons (h, t) -> (let _ = f h in go t)) in
   go (kernel_builtin_names ())
+
+// ...and the public half, as a membership test. Kernel's PUBLIC instance
+// methods are answered by every object, module objects included, which is what
+// makes `Kernel.method(:respond_to?)` a Method owned by Kernel.
+// Kernel's private instance methods that are NOT module functions. The one
+// list holds both (module_function makes a name both at once), but these four
+// are only the instance half: every object answers them, and `Kernel.foo` is
+// not one of them.
+and is_kernel_priv_only = fn (name: str) ->
+  str_eq name "respond_to_missing?" || str_eq name "initialize_copy"
+  || str_eq name "initialize_dup" || str_eq name "initialize_clone"
+
+and is_kernel_pub_instance = fn (name: str) ->
+  let rec go = fn (xs: str list) ->
+    (match xs with Nil -> false | Cons (h, t) -> if str_eq h name then true else go t) in
+  go (kernel_public_instance_names ())
 
 and is_kernel_builtin = fn (name: str) ->
   let rec go = fn (xs: str list) ->
