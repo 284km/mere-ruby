@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 345 files.
+Classified: 342 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,25 +53,25 @@ Classified: 345 files.
 
 </details>
 
-## DIFF — 324 files, 97 kinds
+## DIFF — 321 files, 97 kinds
 
 | files | kind |
 |---|---|
-| 55 | `ERROR NoMethodError` |
+| 54 | `ERROR NoMethodError` |
 | 21 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
-| 17 | `ERROR StandardError` |
-| 13 | `FAILED expected to be identical` |
+| 18 | `ERROR StandardError` |
+| 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected true, got false` |
 | 10 | `FAILED expected TypeError to be raised` |
 | 8 | `FAILED expected truthy from #include?` |
+| 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 8 | `ERROR ArgumentError` |
 | 7 | `pass=N fail=N err=N` |
-| 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected N, got nil` |
+| 5 | `ERROR ArgumentError` |
 | 4 | `FAILED raised NoMethodError, expected RangeError` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
@@ -166,6 +166,7 @@ Classified: 345 files.
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected LocalJumpError to be raised` |
+| 3 | `ERROR: bignum dispatches the correct operator after coercion: ArgumentError` |
 | 2 | `pass=55 fail=0 err=0` |
 | 2 | `pass=52 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
@@ -198,7 +199,6 @@ Classified: 345 files.
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 | 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
-| 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 
 </details>
 
@@ -212,8 +212,8 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | kernel (12) | `__method__ binding fail format lambda loop method public_send respond_to_missing select test warn` |
-| integer (10) | `ceildiv div gcd ord pred remainder round size succ try_convert` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
+| integer (9) | `ceildiv div gcd ord pred round size succ try_convert` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | proc (7) | `binding case_compare curry element_reference new to_proc yield` |
 | method (7) | `case_compare clone curry element_reference source_location super_method to_proc` |

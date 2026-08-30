@@ -6671,8 +6671,16 @@ let to_f = fn (v: Val) ->
   | VRat (n, d) -> float_of_str n / float_of_str d
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: not a number")) in fail "mere-ruby: not a number");
 
+// A Numeric the float-based paths can take. VBig and VRat were missing, and
+// this predicate is what the operator path and `send(:+, x)` both ask, so
+// `(2**70) < 1` raised "comparison of Integer with 1 failed" and
+// `Rational(1,2).send(:+, 1)` was a NoMethodError. A Complex is a Numeric but
+// is NOT here: every caller converts through to_f, which a Complex has no
+// answer for -- it is admitted separately where arith_bin can take it.
 let is_num = fn (v: Val) ->
-  match v with VInt _ -> true | VFlt _ -> true | _ -> false;
+  match v with VInt _ -> true | VFlt _ -> true | VBig _ -> true
+             | VRat (_, _) -> true | _ -> false;
+let is_cpx = fn (v: Val) -> match v with VCpx (_, _) -> true | _ -> false;
 
 let feq = fn (x: float) -> fn (y: float) -> x <= y && y <= x;
 
@@ -7397,7 +7405,11 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
     | _ -> cmp_fail va vb
 // would cmp_vals fail on this pair? (the < family raises ArgumentError)
 and cmp_incompatible = fn (va: Val) -> fn (vb: Val) ->
-  if is_num va && is_num vb then false
+  // a Complex is a Numeric with no ORDER: it is not comparable with anything,
+  // including another Complex.
+  if (match va with VCpx (_, _) -> true | _ -> false)
+     || (match vb with VCpx (_, _) -> true | _ -> false) then true
+  else if is_num va && is_num vb then false
   else
     (match va with
      | VStr _ -> (match vb with VStr _ -> false | _ -> true)
@@ -12241,7 +12253,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       // incomparable operands raise ArgumentError with Ruby's message
       // ("comparison of String with 7 failed": numbers by value, others by class).
       (let vb = vb in
-       if cmp_incompatible va0 vb then
+       // Complex does not include Comparable at all, so the four ordering
+       // operators are not methods it has -- a NoMethodError, not a failed
+       // comparison.
+       if (match va0 with VCpx (_, _) -> true | _ -> false) then
+         raise_exc world "NoMethodError"
+           ("undefined method '" ++ op ++ "' for an instance of Complex")
+       else if cmp_incompatible va0 vb then
          raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else class_name vb) ++ " failed")
        else
          let c = cmp_vals va0 vb in
@@ -22773,6 +22791,28 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | VFlt qf -> VInt (flt_floor qf)
         | v -> v)
      | _ -> VNil)
+  // `div` and `remainder` between INTEGERS are exact. Both went through to_f,
+  // so (2**70).div(3) answered the machine maximum and (2**70).remainder(3)
+  // answered a Float where ruby answers an Integer.
+  else if (str_eq name "div" || str_eq name "remainder")
+     && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+     && (match args with Cons (VInt _, Nil) -> true | Cons (VBig _, Nil) -> true | _ -> false) then
+    (match args with
+     | Cons (a1, _) ->
+       (if str_eq name "div" then arith_bin "/" recv a1
+        else
+          // remainder keeps the DIVIDEND's sign where % keeps the divisor's,
+          // so it differs from % by one |divisor| when the two disagree.
+          (let m = arith_bin "%" recv a1 in
+           let zero9 = cmp_vals m (VInt 0) == 0 in
+           let negr = cmp_vals recv (VInt 0) < 0 in
+           let negm = cmp_vals m (VInt 0) < 0 in
+           let absb = (if cmp_vals a1 (VInt 0) < 0 then arith_bin "-" (VInt 0) a1 else a1) in
+           if zero9 then m
+           else if negr && (if negm then false else true) then arith_bin "-" m absb
+           else if (if negr then false else true) && negm then arith_bin "+" m absb
+           else m))
+     | _ -> VNil)
   else if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder")
      && is_num recv && (match args with Cons (a1, Nil) -> is_num a1 | _ -> false) then
     (match args with
@@ -22794,18 +22834,28 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            | VInt _ -> (match a1 with VInt _ -> VInt (int_of_float adj) | _ -> VFlt adj)
            | _ -> VFlt adj))
      | _ -> VNil)
-  else if is_binary_op_name name && is_num recv
-     && (match args with Cons (a1, Nil) -> is_num a1 | _ -> false) then
+  else if is_binary_op_name name && (is_num recv || is_cpx recv)
+     && (match args with Cons (a1, Nil) -> is_num a1 || is_cpx a1 | _ -> false)
+     // the four ORDERING operators are not Complex methods (it does not
+     // include Comparable); arith_bin would compare it as a number.
+     && (if (is_cpx recv || (match args with Cons (a1, Nil) -> is_cpx a1 | _ -> false))
+            && (str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">=")
+         then false else true) then
     (match args with
      | Cons (a1, _) ->
-       // the comparisons answer a bool (and <=> an int); the rest are arithmetic
-       (let d = (let x = to_f recv in let y = to_f a1 in
-                 if x < y then 0 - 1 else if y < x then 1 else 0) in
-        if str_eq name "<=>" then VInt d
-        else if str_eq name "<" then VBool (d < 0)
-        else if str_eq name ">" then VBool (d > 0)
-        else if str_eq name "<=" then VBool (d <= 0)
-        else if str_eq name ">=" then VBool (d >= 0)
+       // the comparisons answer a bool (and <=> an int); the rest are
+       // arithmetic. The comparison is only COMPUTED for a comparison: it went
+       // through to_f up front, which a Complex has no answer for, so
+       // `Complex(1,2).send(:+, 1)` refused before reaching arith_bin. And
+       // cmp_vals rather than to_f, so a bignum compares exactly.
+       (if str_eq name "<=>" || str_eq name "<" || str_eq name ">"
+           || str_eq name "<=" || str_eq name ">=" then
+          (let d = cmp_vals recv a1 in
+           if str_eq name "<=>" then VInt (if d < 0 then 0 - 1 else if d > 0 then 1 else 0)
+           else if str_eq name "<" then VBool (d < 0)
+           else if str_eq name ">" then VBool (d > 0)
+           else if str_eq name "<=" then VBool (d <= 0)
+           else VBool (d >= 0))
         else arith_bin name recv a1)
      | _ -> VNil)
   else
