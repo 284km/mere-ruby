@@ -19,13 +19,13 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 | core/hash | 66 | 3 | 0 | 0 | 0 | 69 |
 | core/range | 19 | 14 | 1 | 0 | 1 | 35 |
 | core/comparable | 6 | 1 | 0 | 0 | 0 | 7 |
-| core/complex | 26 | 17 | 0 | 0 | 0 | 43 |
+| core/complex | 28 | 15 | 0 | 0 | 0 | 43 |
 | core/env | 24 | 21 | 0 | 0 | 0 | 45 |
 | core/exception | 14 | 22 | 3 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 34 | 15 | 1 | 0 | 0 | 50 |
 | core/integer | 26 | 39 | 5 | 0 | 0 | 70 |
-| core/kernel | 57 | 56 | 3 | 2 | 0 | 118 |
+| core/kernel | 61 | 52 | 3 | 2 | 0 | 118 |
 | core/matchdata | 9 | 21 | 0 | 0 | 0 | 30 |
 | core/method | 10 | 16 | 0 | 0 | 0 | 26 |
 | core/mutex | 3 | 4 | 0 | 0 | 0 | 7 |

@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 365 files.
+Classified: 359 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,17 +53,17 @@ Classified: 365 files.
 
 </details>
 
-## DIFF — 344 files, 101 kinds
+## DIFF — 338 files, 101 kinds
 
 | files | kind |
 |---|---|
 | 60 | `ERROR NoMethodError` |
 | 23 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
-| 18 | `ERROR StandardError` |
-| 13 | `FAILED expected true, got false` |
+| 17 | `ERROR StandardError` |
 | 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
+| 11 | `FAILED expected true, got false` |
 | 11 | `FAILED expected TypeError to be raised` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 8 | `ERROR ArgumentError` |
@@ -72,12 +72,12 @@ Classified: 365 files.
 | 6 | `pass=N fail=N err=N` |
 | 6 | `FAILED expected N, got nil` |
 | 6 | `FAILED expected "S", got "S"` |
-| 5 | `FAILED raised NoMethodError, expected RangeError` |
+| 4 | `FAILED raised NoMethodError, expected RangeError` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
-| 3 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 3 | `FAILED expected not N` |
 | 3 | `FAILED expected falsy from #include?` |
+| 3 | `FAILED expected ZeroDivisionError to be raised` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
@@ -88,7 +88,6 @@ Classified: 365 files.
 | 2 | `FAILED raised NameError, expected TypeError` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected nil, got N` |
-| 2 | `FAILED expected ZeroDivisionError to be raised` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
@@ -96,11 +95,11 @@ Classified: 365 files.
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected N ...[clipped]` |
 | 2 | `FAILED expected :SYM, got :SYM` |
-| 2 | `FAILED expected (N/N), got (N/N)` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
+| 1 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 1 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised RuntimeError, expected NoMethodError` |
@@ -147,7 +146,7 @@ Classified: 365 files.
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected IndexError to be raised` |
-| 1 | `FAILED expected (N+Ni), got (N+Ni+N+Nii)` |
+| 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
@@ -155,6 +154,7 @@ Classified: 365 files.
 | 1 | `FAILED expected "S"MethodSpecs::MyMod\"S"bar\"S" to match` |
 | 1 | `FAILED expected "S", got #<OBJ>` |
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
+| 1 | `ERROR ZeroDivisionError` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR RangeError` |
 | 1 | `ERROR Errno::ENOENT` |
@@ -165,9 +165,9 @@ Classified: 365 files.
 |---|---|
 | 12 | `FAILED: expected ArgumentError to be raised` |
 | 11 | `FAILED: expected TypeError to be raised` |
-| 5 | `FAILED: raised NoMethodError, expected RangeError` |
-| 3 | `FAILED: raised StandardError, expected ZeroDivisionError` |
+| 4 | `FAILED: raised NoMethodError, expected RangeError` |
 | 3 | `FAILED: expected not 0` |
+| 3 | `FAILED: expected ZeroDivisionError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected LocalJumpError to be raised` |
 | 2 | `pass=55 fail=0 err=0` |
@@ -183,7 +183,6 @@ Classified: 365 files.
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
-| 2 | `FAILED: expected ZeroDivisionError to be raised` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: expected RangeError to be raised` |
 | 2 | `FAILED: expected NoMethodError to be raised` |
@@ -202,7 +201,8 @@ Classified: 365 files.
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
-| 1 | `FAILED: returns true: expected true, got false` |
+| 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
+| 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
 
 </details>
 
