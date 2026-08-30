@@ -16724,14 +16724,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | _ -> VNil)
   // Kernel#method(:name): a bound Method object (NameError when undefined).
   // A user-defined `method` method on the receiver's class wins.
-  else if str_eq name "method"
+  // Kernel#public_method is Kernel#method with one extra refusal, and it was
+  // in the name list with nothing behind it: every call was a NoMethodError.
+  else if (str_eq name "method" || str_eq name "public_method")
           && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false)
           && (match recv with
               | VObj oid2 -> (let (m9, s9, o9, i9) = world in
-                              if has_meth world (map_get o9 (str_of_int oid2)) "method" then false else true)
+                              if has_meth world (map_get o9 (str_of_int oid2)) name then false else true)
               | _ -> true) then
     (let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr h2, _) -> sget h2 | _ -> "") in
      let owner = bm_owner_of world recv nm in
+     let dcls2 = dispatch_cls_of world recv in
+     // #public_method refuses what is not public HERE -- a private or
+     // protected method is a NameError, not a Method object.
+     let _ = (if str_eq name "public_method" && meth_private world dcls2 nm
+              then (let _ = raise_exc world "NameError"
+                      ("method '" ++ nm ++ "' for class '" ++ display_cls_msg world dcls2 ++ "' is private") in ())
+              else if str_eq name "public_method" && meth_protected world dcls2 nm
+              then (let _ = raise_exc world "NameError"
+                      ("method '" ++ nm ++ "' for class '" ++ display_cls_msg world dcls2 ++ "' is protected") in ())
+              else ()) in
      // a binary operator on a primitive is dispatched by arith_bin rather than
      // being an entry anywhere, so respond_to? does not know it; `1.method(:+)`
      // is still a Method (and #call routes it back to arith_bin).
@@ -17698,9 +17710,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Module#methods: the class-method names reachable from this class — its
     // own singleton methods plus the ones it inherits. Like Object#methods,
     // the builtins that live in the primitive table are not enumerated.
-    else if str_eq name "methods" || str_eq name "public_methods" then
-      (let names = map_new () in
-       let _ = collect_cls_methods world c names in
+    else if is_vis_list_name name then
+      (if str_eq name "methods" && (match args with Cons (VBool false, _) -> true | Cons (VNil, _) -> true | _ -> false)
+       then invoke_val_c env world blk recv "singleton_methods" (Cons (VBool false, Nil)) false
+       else
+       let names = map_new () in
+       let blocked = map_new () in
+       let want9 = (if str_eq name "public_methods" then 1
+                    else if str_eq name "private_methods" then 2
+                    else if str_eq name "protected_methods" then 3 else 0) in
+       let recur9 = (match args with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+       // a class answers through its METACLASS chain: its class methods.
+       let _ = collect_vis world ("(sng:" ++ c ++ ")") names blocked want9 recur9 in
        // A MODULE FUNCTION IS ALSO A PUBLIC SINGLETON METHOD. That is what
        // `module_function` means, and Kernel's are all of them: ruby answers
        // `Kernel.public_methods(false).include?(:abort)` with true, and a
@@ -17708,7 +17729,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // the primitive dispatcher, so collect_cls_methods cannot see them --
        // enumerated from kernel_builtin_names, the same list the private
        // INSTANCE method side uses, so the two answers cannot disagree.
-       let _ = (if str_eq c "Kernel"
+       let _ = (if str_eq c "Kernel" && (if want9 == 2 then false else (if want9 == 3 then false else true))
                 then list_iter_kernel_names (fn (nm: str) -> map_set names nm (VSym nm))
                 else ()) in
        let out = map_new () in
@@ -17723,7 +17744,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let plen = str_len pfx in
           let tmp = map_new () in
           let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
+            // #singleton_methods lists the public and protected ones; a
+            // `private` inside `class << self` keeps its method OUT of both
+            // this and `methods(false)`, which routes here.
             if str_len k > plen && str_eq (substring k 0 plen) pfx
+               && (if map_has privates k then false else true)
             then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
             else ()) in
           arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -18272,12 +18297,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // object (its class and ancestors, plus any singleton methods), as
     // symbols, excluding privates. `include(:sym)`-style membership only, so
     // order is unspecified.
-    else if str_eq name "methods" || str_eq name "public_methods" then
-      (let names = map_new () in
-       let _ = collect_methods world cls names in
-       let out = map_new () in
-       let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
-       arr_new (idx_to_list out 0 (map_len out)))
+    else if is_vis_list_name name then
+      // `methods(false)` is `singleton_methods(false)`, not "this class's own
+      // methods": ruby routes it there before the walk even starts.
+      (if str_eq name "methods" && (match args with Cons (VBool false, _) -> true | Cons (VNil, _) -> true | _ -> false)
+       then invoke_val_c env world blk recv "singleton_methods" (Cons (VBool false, Nil)) false
+       // the object's REAL class (singleton included), not the dispatch class:
+       // dispatch strips the singleton off for a name the singleton does not
+       // define, and none of these four is ever defined there.
+       else vis_method_list world (map_get ocls (str_of_int id)) name args)
     // Object#singleton_methods: methods defined on this object's singleton.
     else if str_eq name "singleton_methods" then
       (let (meths9, _, _, _) = world in
@@ -18285,7 +18313,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let plen = str_len pfx in
        let tmp = map_new () in
        let _ = map_iter meths9 (fn (k: str) -> fn (v: Meth) ->
+         // the public and protected ones: a `private` in `class << obj` keeps
+         // its method out of this list and out of `methods(false)`, which
+         // routes here.
          if str_len k > plen && str_eq (substring k 0 plen) pfx
+            && (if map_has privates k then false else true)
          then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -20782,12 +20814,16 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // in ruby on its class chain. The builtins are not entries in a table, so
   // they cannot be listed -- see KNOWN_GAPS.md. rubocop computes
   // `nil.methods - Object.new.methods` and only needs the call to answer.
-  if str_eq name "methods" || str_eq name "public_methods" then
-    (let names = map_new () in
-     let _ = collect_methods world cls names in
-     let out = map_new () in
-     let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
-     arr_new (idx_to_list out 0 (map_len out)))
+  if is_vis_list_name name then
+    (if str_eq name "methods" && (match args with Cons (VBool false, _) -> true | Cons (VNil, _) -> true | _ -> false)
+     then arr_new (Nil : Val list)
+     // Only what ruby code added to this primitive's class. The names the
+     // DISPATCHER answers for are NOT added: the one list that could supply
+     // them, is_num_method, is shared by the whole numeric tower and claims
+     // for a Complex three dozen names it refuses to call (`negative?`,
+     // `divmod`, `even?`, ...). Enumerating it would publish that lie -- the
+     // list has to be split per type before this can list anything.
+     else vis_method_list world (dispatch_cls_of world recv) name args)
   else if str_eq name "singleton_methods" then arr_new Nil
   // singleton_class: true/false/nil answer their class; immediates raise
   // TypeError; an object gets its own (hidden) singleton class.
@@ -22185,41 +22221,47 @@ and is_module_method = fn (name: str) ->
 
 // a curated set of universally-available primitive method names.
 // Integer / Float methods the primitive dispatcher answers.
+// The names EVERY Numeric answers to. A PREDICATE and not a list on purpose:
+// nothing enumerates it, and it could not honestly be enumerated anyway -- it
+// is shared by Integer, Float, Rational and Complex, and claims for a Complex
+// three dozen names (`negative?`, `divmod`, `even?`, ...) that the dispatcher
+// refuses to call. respond_to? has answered true for all of them all along;
+// splitting this per type is what would fix that AND let `10.public_methods`
+// list what 10 actually has.
+//
+// `rationalize` is claimed because the simplest-fraction search it needs (the
+// continued-fraction descent) was implemented; the claim went away while it
+// was absent and came back with the implementation, which is the only order in
+// which a name list stays true.
+//
+// The complex protocol is claimed too -- 1.imaginary is 0, 1.conj is 1,
+// (-1).arg is pi. All fourteen were IMPLEMENTED and none was claimed, so
+// calling them worked and asking about them did not:
+// `Complex.instance_method(:angle)` raised NameError, which is what fifteen
+// ruby/spec files check.
 and is_num_method = fn (name: str) ->
   str_eq name "to_int" || str_eq name "to_i" || str_eq name "to_f" || str_eq name "to_r" ||
   str_eq name "to_c" || str_eq name "abs" || str_eq name "magnitude" ||
-  str_eq name "ceil" || str_eq name "floor" || str_eq name "round" || str_eq name "truncate" ||
-  str_eq name "succ" || str_eq name "next" || str_eq name "pred" || str_eq name "chr" ||
-  str_eq name "ord" || str_eq name "times" || str_eq name "upto" || str_eq name "downto" ||
-  str_eq name "step" || str_eq name "divmod" || str_eq name "fdiv" || str_eq name "div" ||
-  str_eq name "modulo" || str_eq name "remainder" || str_eq name "pow" || str_eq name "gcd" ||
-  str_eq name "lcm" || str_eq name "digits" || str_eq name "bit_length" || str_eq name "size" ||
-  str_eq name "even?" || str_eq name "odd?" || str_eq name "zero?" || str_eq name "positive?" ||
+  str_eq name "ceil" || str_eq name "floor" || str_eq name "round" ||
+  str_eq name "truncate" || str_eq name "succ" || str_eq name "next" ||
+  str_eq name "pred" || str_eq name "chr" || str_eq name "ord" || str_eq name "times" ||
+  str_eq name "upto" || str_eq name "downto" || str_eq name "step" ||
+  str_eq name "divmod" || str_eq name "fdiv" || str_eq name "div" ||
+  str_eq name "modulo" || str_eq name "remainder" || str_eq name "pow" ||
+  str_eq name "gcd" || str_eq name "lcm" || str_eq name "digits" ||
+  str_eq name "bit_length" || str_eq name "size" || str_eq name "even?" ||
+  str_eq name "odd?" || str_eq name "zero?" || str_eq name "positive?" ||
   str_eq name "negative?" || str_eq name "nonzero?" || str_eq name "integer?" ||
   str_eq name "finite?" || str_eq name "infinite?" || str_eq name "nan?" ||
-  str_eq name "next_float" || str_eq name "prev_float" ||
-  str_eq name "between?" || str_eq name "clamp" || str_eq name "coerce" ||
-  str_eq name "numerator" || str_eq name "denominator" ||
-  // `rationalize` is claimed again: the simplest-fraction search it needs is a
-  // defined algorithm (the continued-fraction descent), so it could be
-  // implemented rather than approximated. The claim went away while it was
-  // absent and came back with the implementation -- which is the only order in
-  // which a name list stays true.
-  str_eq name "rationalize" || str_eq name "i" ||
-  // The complex protocol, which every Numeric answers -- 1.imaginary is 0,
-  // 1.conj is 1, (-1).arg is pi. All fourteen were IMPLEMENTED (the arms are
-  // written `"imaginary" || "imag"`, and each has a non-Complex case) and none
-  // was claimed here, so calling them worked and asking about them did not:
-  // `Complex.instance_method(:angle)` raised NameError, which is what fifteen
-  // ruby/spec files check. Enumerated by diffing the names the numeric arm
-  // answers against the names this list claims, rather than by remembering.
+  str_eq name "next_float" || str_eq name "prev_float" || str_eq name "between?" ||
+  str_eq name "clamp" || str_eq name "coerce" || str_eq name "numerator" ||
+  str_eq name "denominator" || str_eq name "rationalize" || str_eq name "i" ||
   str_eq name "real" || str_eq name "real?" || str_eq name "imaginary" ||
   str_eq name "imag" || str_eq name "conjugate" || str_eq name "conj" ||
-  str_eq name "abs2" || str_eq name "arg" || str_eq name "angle" ||
-  str_eq name "phase" || str_eq name "polar" || str_eq name "rect" ||
-  str_eq name "rectangular" || str_eq name "quo" ||
-  str_eq name "<=>" || str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">="
-
+  str_eq name "abs2" || str_eq name "arg" || str_eq name "angle" || str_eq name "phase" ||
+  str_eq name "polar" || str_eq name "rect" || str_eq name "rectangular" ||
+  str_eq name "quo" || str_eq name "<=>" || str_eq name "<" || str_eq name "<=" ||
+  str_eq name ">" || str_eq name ">="
 and is_prim_method = fn (name: str) ->
   str_eq name "to_s" || str_eq name "inspect" || str_eq name "class" ||
   // to_enum / enum_for answer for EVERY receiver here (they build an
@@ -33191,6 +33233,73 @@ and sng_inner = fn (c: str) -> substring c 5 (str_len c - 1)
 // collect public+protected method names (excluding privates) along a class's
 // ancestor chain into `names` (keyed by name, VSym value, for dedup).
 // the class methods of `cls` and of every class it inherits from, as symbols.
+// ONE walk for #methods / #public_methods / #private_methods /
+// #protected_methods. They were four answers to one question asked four ways
+// -- which names does this receiver answer to, at which visibility -- and two
+// of them did not exist at all while the other two shared a walk that ignored
+// visibility entirely, so #public_methods listed the protected ones.
+// want: 0 = public+protected (#methods), 1 = public, 2 = private, 3 = protected.
+and collect_vis = fn world -> fn (cls: str) -> fn names -> fn blocked -> fn (want: int) -> fn (recur: bool) ->
+  collect_vis_go world (ancestors_of world cls) names blocked want recur true
+
+and collect_vis_go = fn world -> fn (anc: str list) -> fn names -> fn blocked ->
+  fn (want: int) -> fn (recur: bool) -> fn (first: bool) ->
+  match anc with
+  | Nil -> ()
+  | Cons (c9, rest) ->
+    let (meths0, _, _, _) = world in
+    let pfx = c9 ++ "#" in
+    let plen = str_len pfx in
+    // an undef'd name is gone from HERE UP, so it is marked before this level's
+    // table is read and a superclass definition cannot put it back.
+    let _ = map_iter undefs (fn (k: str) -> fn (v: Val) ->
+      if str_len k > plen && str_eq (substring k 0 plen) pfx
+      then map_set blocked (substring k plen (str_len k)) VNil
+      else ()) in
+    let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
+      if str_len k > plen && str_eq (substring k 0 plen) pfx
+         && (if str_contains (substring k plen (str_len k)) "#" then false else true)
+      then
+        (let nm = substring k plen (str_len k) in
+         if map_has names nm || map_has blocked nm then ()
+         else
+           (let priv = map_has privates k in
+            let prot = map_has protecteds k in
+            let ok = (if want == 1 then (if priv || prot then false else true)
+                      else if want == 2 then priv
+                      else if want == 3 then prot
+                      else (if priv then false else true)) in
+            // the FIRST class that defines a name decides its visibility: a
+            // public override of an inherited private method is public, and
+            // the inherited entry must not be reconsidered further up.
+            if ok then map_set names nm (VSym nm) else map_set blocked nm VNil))
+      else ()) in
+    // recur = false stops after this level -- unless it is a singleton class,
+    // which ruby steps past to reach the object's real class.
+    if recur then collect_vis_go world rest names blocked want recur false
+    else if first && is_sng_cls c9 then collect_vis_go world rest names blocked want recur false
+    else ()
+
+// the four names, as an array, for a receiver whose class chain is `cls`.
+and vis_method_list = fn world -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
+  let want = (if str_eq name "public_methods" then 1
+              else if str_eq name "private_methods" then 2
+              else if str_eq name "protected_methods" then 3 else 0) in
+  let recur = (match args with
+               | Cons (VBool false, _) -> false
+               | Cons (VNil, _) -> false
+               | _ -> true) in
+  let names = map_new () in
+  let blocked = map_new () in
+  let _ = collect_vis world cls names blocked want recur in
+  let out = map_new () in
+  let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
+  arr_new (idx_to_list out 0 (map_len out))
+
+and is_vis_list_name = fn (name: str) ->
+  str_eq name "methods" || str_eq name "public_methods"
+  || str_eq name "private_methods" || str_eq name "protected_methods"
+
 and collect_cls_methods = fn world -> fn (cls: str) -> fn names ->
   let (meths0, sup0, _, _) = world in
   let pfx = "(sng:" ++ cls ++ ")#" in

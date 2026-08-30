@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 349 files.
+Classified: 345 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,11 +53,11 @@ Classified: 349 files.
 
 </details>
 
-## DIFF — 328 files, 98 kinds
+## DIFF — 324 files, 97 kinds
 
 | files | kind |
 |---|---|
-| 57 | `ERROR NoMethodError` |
+| 55 | `ERROR NoMethodError` |
 | 21 | `ERROR NameError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
@@ -65,10 +65,10 @@ Classified: 349 files.
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected true, got false` |
 | 10 | `FAILED expected TypeError to be raised` |
+| 8 | `FAILED expected truthy from #include?` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 8 | `ERROR ArgumentError` |
 | 7 | `pass=N fail=N err=N` |
-| 7 | `FAILED expected truthy from #include?` |
 | 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected N, got nil` |
@@ -76,7 +76,6 @@ Classified: 349 files.
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected not N` |
-| 3 | `FAILED expected falsy from #include?` |
 | 3 | `FAILED expected ZeroDivisionError to be raised` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
@@ -87,10 +86,10 @@ Classified: 349 files.
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected nil, got N` |
+| 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
-| 2 | `FAILED expected NameError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected N ...[clipped]` |
 | 2 | `FAILED expected :SYM, got :SYM` |
@@ -123,7 +122,6 @@ Classified: 349 files.
 | 1 | `FAILED expected a #<OBJ>>, got #<OBJ>` |
 | 1 | `FAILED expected [], got nil` |
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
-| 1 | `FAILED expected [], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
 | 1 | `FAILED expected [[N], {:SYM=>N}, #<OBJ>], got [[N], {:SYM=>N}, #<OBJ>]` |
 | 1 | `FAILED expected [N, N], got nil` |
@@ -136,6 +134,7 @@ Classified: 349 files.
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
+| 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got true` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
@@ -144,7 +143,7 @@ Classified: 349 files.
 | 1 | `FAILED expected Kernel, got Module` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
-| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "VSCODE_CRASH_R ...[clipped]` |
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
@@ -182,7 +181,6 @@ Classified: 349 files.
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: expected RangeError to be raised` |
 | 2 | `FAILED: expected NoMethodError to be raised` |
-| 2 | `FAILED: expected NameError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 2 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
@@ -200,6 +198,7 @@ Classified: 349 files.
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 | 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
+| 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 
 </details>
 
@@ -212,7 +211,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (14) | `__method__ binding fail format lambda loop method private_methods protected_methods public_send respond_to_missing select test warn` |
+| kernel (12) | `__method__ binding fail format lambda loop method public_send respond_to_missing select test warn` |
 | integer (10) | `ceildiv div gcd ord pred remainder round size succ try_convert` |
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
