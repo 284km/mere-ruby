@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 325 files.
+Classified: 324 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,17 +53,17 @@ Classified: 325 files.
 
 </details>
 
-## DIFF — 304 files, 93 kinds
+## DIFF — 303 files, 92 kinds
 
 | files | kind |
 |---|---|
 | 48 | `ERROR NoMethodError` |
+| 19 | `ERROR StandardError` |
 | 18 | `FAILED expected N, got N` |
-| 18 | `ERROR StandardError` |
 | 17 | `ERROR NameError` |
 | 12 | `FAILED expected ArgumentError to be raised` |
-| 11 | `FAILED expected to be identical` |
 | 11 | `FAILED expected TypeError to be raised` |
+| 10 | `FAILED expected to be identical` |
 | 9 | `FAILED expected true, got false` |
 | 8 | `pass=N fail=N err=N` |
 | 8 | `FAILED expected false, got true` |
@@ -119,7 +119,6 @@ Classified: 325 files.
 | 1 | `FAILED expected [], got nil` |
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
-| 1 | `FAILED expected [[N], {:SYM=>N}, #<OBJ>], got [[N], {:SYM=>N}, #<OBJ>]` |
 | 1 | `FAILED expected [N, N], got []` |
 | 1 | `FAILED expected [N, N], got [N, N]` |
 | 1 | `FAILED expected [N, N, [N], {:SYM=>N}, N, {}], got [[N, N, N, {:SYM=>N}], N, [], nil, N, {}]` |
