@@ -507,6 +507,8 @@ let lambda_blk_marker = "__lambda_blk__";
 // carry-the-origin slot pattern `pending_home` already uses, written by
 // coerce_to_block and cleared by every other block path so it is never stale.
 let pending_srcproc = map_new ();
+let comp_inner = map_new ();     // composed proc id -> the callable run FIRST
+let comp_outer = map_new ();     // composed proc id -> the callable run on its result
 let curry_target = map_new ();   // curried proc id -> the proc it will call
 let curry_args = map_new ();     // curried proc id -> the arguments so far
 let curry_arity = map_new ();    // curried proc id -> how many it waits for
@@ -12401,6 +12403,12 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
         raise_exc world "TypeError"
           ("no implicit conversion of " ++ (match vb with VNil -> "nil" | _ -> class_name vb)
            ++ (match vb with VNil -> " into Integer" | _ -> " into Integer"))
+      // Proc#>> / Proc#<< are METHODS, so the operator hands them to the
+      // dispatcher rather than answering here -- `pr.send(:<<, x)` has to
+      // reach the same body, and arith_bin would read them as integer shifts.
+      else if (str_eq op ">>" || str_eq op "<<")
+              && (match va0 with VProc _ -> true | _ -> false) then
+        invoke_val_c env world blk va0 op (Cons (vb, Nil)) false
       else arith_bin op va0 vb
 
 // CRuby coerce_failed display: an immediate (nil/true/false/Integer/Float/
@@ -13255,6 +13263,14 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // a proc/lambda that captured its defining method's block carries a yblk
   // marker: strip it and use that captured block as `encl` so `yield` inside
   // the proc body resolves to the defining method's block, not the caller's.
+  // The block a `&param` BINDS to and the block `yield` RESOLVES to are two
+  // different questions, and `encl` was answering both. The yblk marker means
+  // "yield goes to the block captured where this proc was made" -- it says
+  // nothing about &param, which is always the block given at the CALL SITE.
+  // Binding &param from the stripped encl made `pr.call { }` hand the proc its
+  // own defining block: inside a spec example that is the example's own block,
+  // so `(one << two).call { }` ran the example again, forever.
+  let encl_call = encl in
   let (encl, params0) = strip_yblk_markers encl params00 in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
@@ -13275,7 +13291,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // block (a hidden "__f..." param) runs directly in the enclosing env and
   // leaves its loop variable and body locals behind, exactly as Ruby does.
   let benv = if is_for_params params then cenv else lv_child cenv in
-  let _ = bind_block_params benv world encl (block_defaults body) params argvals is_lam in
+  let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam in
   // A raising body used to need explicit cleanup here (restoring saved params
   // and dropping created locals) or the bindings leaked into the shared env
   // and were visible to later sibling blocks; with a per-invocation frame the
@@ -19664,15 +19680,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // at, and only then runs the proc it was made from. It is a proc like any
     // other from the outside -- #lambda? answers what the source answers --
     // so the state lives beside it rather than in a different kind of value.
-    if map_has curry_target (str_of_int pid)
+    if (map_has comp_inner (str_of_int pid) || map_has curry_target (str_of_int pid))
        && (str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===") then
-      (let tgt9 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
-       let want9 = (match map_get curry_arity (str_of_int pid) with VInt n -> n | _ -> 0) in
-       let got9 = (match map_get curry_args (str_of_int pid) with VArr a -> deref a | _ -> Nil) in
-       let all9 = rev_app (rev_app got9 Nil) args in
-       if vlen all9 >= want9
-       then invoke_val_c env world blk (VProc tgt9) "call" all9 false
-       else mk_curried world tgt9 all9 want9 pid)
+      proc_derived_call env world blk pid args
+    else if map_has comp_inner (str_of_int pid) && str_eq name "arity" then VInt (0 - 1)
+    // Proc#>> / Proc#<< compose. `f >> g` runs f then g; `f << g` runs g then
+    // f. Both reduce to "outer(inner(*args))", and the argument may be ANY
+    // callable (a Method, or an object with #call), so what is stored is the
+    // value rather than a proc id. #to_proc is NOT tried: ruby refuses an
+    // object that only has one.
+    else if str_eq name ">>" || str_eq name "<<" then
+      (match args with
+       | Cons (other9, _) ->
+         (let _ = (if responds world other9 "call" then ()
+                   else (let _ = raise_exc world "TypeError" "callable object is expected" in ())) in
+          if str_eq name ">>" then mk_composed world recv other9 else mk_composed world other9 recv)
+       | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
     // Proc#curry([arity]): the curried form of this proc.
     // a curried proc reports itself the way ruby's does: arity -1, one rest
     // parameter, and no source location (it is not written anywhere).
@@ -19722,7 +19745,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let _ = map_set live_frames (str_of_int lfid) (VBool true) in
           let (h3, ps3, b3, e3) = proc_as_block pid in
           let _ = e3 in
-          let f = try_or (fn (u: unit) -> run_block world noblk (h3, ps3, b3, e2c) args) (FRaise VNil) in
+          // a block given at THIS call site is the block the proc body's &param
+          // binds to (`pr.call(1) { }` reaching `proc { |x, &b| b }`). `yield`
+          // inside the body still resolves to the block captured where the proc
+          // was made -- that comes from the yblk marker, which overrides this.
+          let f = try_or (fn (u: unit) -> run_block world blk (h3, ps3, b3, e2c) args) (FRaise VNil) in
           let _ = map_delete live_frames (str_of_int lfid) in
           (match f with
            | FRaise _ ->
@@ -19764,7 +19791,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
  flow_throw k v)
              else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
            | other -> flow_value other))
-      else flow_value (run_block world noblk (proc_as_block pid) args)
+      else flow_value (run_block world blk (proc_as_block pid) args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
     // Proc#to_proc is the proc ITSELF -- the name was claimed with nothing
@@ -20148,6 +20175,41 @@ and run_at_exit_procs = fn world -> fn (xs: Val list) ->
 // a fresh proc that stands for "this target, these arguments so far, this
 // arity". `like` is the proc whose lambda-ness it inherits (curry preserves
 // it, and so does each partial application).
+// a proc that runs `inner` and then `outer` on its result. The composition is
+// a lambda exactly when the FIRST-CALLED one is: that is the one whose arity is
+// checked, which is why `l >> f` is a lambda and `f >> l` is not.
+// calling a proc that has no body of its own -- a composition or a curried
+// collector. Both dispatch paths (with a block and without) reach this, so
+// neither has to know how the other one works and neither can hand the call
+// back to the other.
+and proc_derived_call = fn env -> fn world -> fn blk -> fn (pid: int) -> fn (args: Val list) ->
+  if map_has comp_inner (str_of_int pid) then
+    // a block given to the composition goes to the FIRST-CALLED one only:
+    // `(one >> two).call { }` runs one with the block and two without it.
+    (let inner9 = map_get comp_inner (str_of_int pid) in
+     let outer9 = map_get comp_outer (str_of_int pid) in
+     let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let mid9 = invoke_val_c env world blk inner9 "call" args false in
+     invoke_val_c env world noblk9 outer9 "call" (Cons (mid9, Nil)) false)
+  else
+    (let tgt9 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
+     let want9 = (match map_get curry_arity (str_of_int pid) with VInt n -> n | _ -> 0) in
+     let got9 = (match map_get curry_args (str_of_int pid) with VArr a -> deref a | _ -> Nil) in
+     let all9 = rev_app (rev_app got9 Nil) args in
+     if vlen all9 >= want9
+     then invoke_val_c env world blk (VProc tgt9) "call" all9 false
+     else mk_curried world tgt9 all9 want9 pid)
+
+and mk_composed = fn world -> fn (inner: Val) -> fn (outer: Val) ->
+  let cid = map_len proc_store in
+  let _ = store_proc (str_of_int cid) (true, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  let _ = map_set comp_inner (str_of_int cid) inner in
+  let _ = map_set comp_outer (str_of_int cid) outer in
+  let _ = (match inner with
+           | VProc ip -> (if map_has lambda_ids (str_of_int ip) then map_set lambda_ids (str_of_int cid) VNil else ())
+           | _ -> ()) in
+  VProc cid
+
 and mk_curried = fn world -> fn (tgt: int) -> fn (got: Val list) -> fn (want: int) -> fn (like: int) ->
   let cid = map_len proc_store in
   let _ = store_proc (str_of_int cid) (true, (Nil : str list), (Nil : Stmt list), map_new ()) in
@@ -20289,7 +20351,13 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     else if (str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield")
             && (match recv with VProc _ -> true | _ -> false) then
       (match recv with
-       | VProc pid -> flow_value (run_block world newblk (map_get proc_store (str_of_int pid)) args)
+       // a COMPOSED or CURRIED proc has no body of its own to run: what it
+       // does lives in the dispatcher, so send it back there carrying this
+       // block. Running its (empty) stored block answered nil.
+       | VProc pid ->
+         (if map_has comp_inner (str_of_int pid) || map_has curry_target (str_of_int pid)
+          then proc_derived_call env world newblk pid args
+          else flow_value (run_block world newblk (map_get proc_store (str_of_int pid)) args))
        | _ -> VNil)
     // recv.define_method(:name) { block } with an explicit class receiver:
     // register the block as an instance method of that class (used on singleton
@@ -21915,6 +21983,19 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name "<=>" || str_eq name "<" || str_eq name "<=" ||
     str_eq name ">" || str_eq name ">=" || str_eq name "eql?" ||
     str_eq name "+" || str_eq name "-"
+  // Method and UnboundMethod: their whole surface is in the dispatcher too, so
+  // nothing knew a Method had any methods -- `m.respond_to?(:call)` was false
+  // while `m.call` worked, and `f >> m` refused the Method as not callable.
+  else if str_eq cls "Method" then
+    str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "===" ||
+    str_eq name "arity" || str_eq name "name" || str_eq name "owner" ||
+    str_eq name "receiver" || str_eq name "parameters" || str_eq name "source_location" ||
+    str_eq name "unbind" || str_eq name "to_proc" || str_eq name "original_name" ||
+    str_eq name "super_method" || str_eq name "curry" || str_eq name ">>" || str_eq name "<<"
+  else if str_eq cls "UnboundMethod" then
+    str_eq name "bind" || str_eq name "bind_call" || str_eq name "arity" ||
+    str_eq name "name" || str_eq name "owner" || str_eq name "parameters" ||
+    str_eq name "source_location" || str_eq name "original_name" || str_eq name "super_method"
   else false
 
 // Ruby's IMPLICIT conversion attempt (rb_check_funcall), which is not the same

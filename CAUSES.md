@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 319 files.
+Classified: 318 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,19 +53,19 @@ Classified: 319 files.
 
 </details>
 
-## DIFF — 298 files, 92 kinds
+## DIFF — 297 files, 92 kinds
 
 | files | kind |
 |---|---|
-| 46 | `ERROR NoMethodError` |
-| 19 | `FAILED expected N, got N` |
-| 19 | `ERROR StandardError` |
+| 47 | `ERROR NoMethodError` |
+| 18 | `FAILED expected N, got N` |
+| 17 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 11 | `FAILED expected TypeError to be raised` |
 | 10 | `FAILED expected to be identical` |
+| 9 | `FAILED expected true, got false` |
 | 8 | `pass=N fail=N err=N` |
-| 8 | `FAILED expected true, got false` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 7 | `FAILED expected truthy from #include?` |
@@ -139,7 +139,7 @@ Classified: 319 files.
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
-| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"S", "VSCODE_CRASH_R ...[clipped]` |
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
@@ -207,8 +207,8 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
+| method (8) | `case_compare clone compose curry element_reference source_location super_method to_proc` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
-| method (7) | `case_compare clone curry element_reference source_location super_method to_proc` |
 | kernel (7) | `__method__ binding lambda loop method select test` |
 | struct (6) | `deconstruct element_reference element_set filter keyword_init new` |
 | symbol (5) | `all_symbols intern match name slice` |
