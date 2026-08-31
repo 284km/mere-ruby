@@ -12,7 +12,7 @@ Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
 Classified: 318 files.
 
-## CRASH — 21 files, 13 kinds
+## CRASH — 18 files, 11 kinds
 
 | files | kind |
 |---|---|
@@ -20,9 +20,7 @@ Classified: 318 files.
 | 3 | `stack overflow (recursion too deep)` |
 | 2 | `ERROR StandardError` |
 | 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
-| 2 | `*.rb:N: mere-ruby: expected block in TMPDIR near line N` |
 | 1 | `ERROR NoMethodError` |
-| 1 | `*.rb:N: wrong number of arguments (given N, expected N) (ArgumentError)` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
 | 1 | `*.rb:N: undefined method 'S' for an instance of Object (NoMethodError)` |
@@ -39,7 +37,6 @@ Classified: 318 files.
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
 | 1 | `ERROR: when m is a bignum or larger than int returns 0 when m < 0 and n >= 0: StandardError` |
 | 1 | `ERROR: rescuing SignalException raises a SignalException when sent a signal: NoMethodError` |
-| 1 | `*.rb:N: wrong number of arguments (given 1, expected 0) (ArgumentError)` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
 | 1 | `*.rb:N: undefined method 'each' for an instance of Object (NoMethodError)` |
@@ -48,16 +45,14 @@ Classified: 318 files.
 | 1 | `*.rb:N: mere-ruby: undefined method '__callee__' for class KernelSpecs::CalleeTest` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 66` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 334` |
-| 1 | `*.rb:N: mere-ruby: expected block in TMPDIR near line 51` |
-| 1 | `*.rb:N: mere-ruby: expected block in TMPDIR near line 35` |
 
 </details>
 
-## DIFF — 297 files, 92 kinds
+## DIFF — 300 files, 93 kinds
 
 | files | kind |
 |---|---|
-| 47 | `ERROR NoMethodError` |
+| 48 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
@@ -80,6 +75,7 @@ Classified: 318 files.
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected RangeError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
+| 3 | `FAILED expected :SYM, got :SYM` |
 | 3 | `FAILED expected "S" to match` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
@@ -90,7 +86,6 @@ Classified: 318 files.
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected :SYM, got nil` |
-| 2 | `FAILED expected :SYM, got :SYM` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
@@ -114,6 +109,7 @@ Classified: 318 files.
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected true, got "S"` |
+| 1 | `FAILED expected nil, got #<OBJ>` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
 | 1 | `FAILED expected [], got nil` |
@@ -189,11 +185,11 @@ Classified: 318 files.
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: the String shows the method name, Module defined in and Module extracted from: expected "#<UnboundMethod:0xADDR>" to match` |
+| 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
-| 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
 
 </details>
 
@@ -214,8 +210,8 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
+| proc (3) | `binding new ruby2_keywords` |
 | integer (3) | `ceildiv div try_convert` |
-| proc (2) | `binding new` |
 | numeric (2) | `integer real` |
 | language (2) | `alias module` |
 | threadgroup (1) | `list` |

@@ -2875,6 +2875,19 @@ and psplat_any = fn (ps: str list) ->
   | Cons (p, r) -> (str_len p > 0 && str_eq (char_at p 0) "*") || psplat_any r
 
 // the defaults for plain (non-keyword) names; kw defaults are keyed "k:".
+// the KEYWORD defaults of a parameter list, keyed by the local name the body
+// binds (`x:` binds `x`). A lambda literal built its nil-check prologue from
+// plain_defaults only, so `->(x: 3){ x }.call` raised "missing keyword: :x" --
+// the default was parsed and then thrown away, and #parameters reported the
+// keyword as :keyreq.
+and kw_defaults_bare = fn (ds: (str * Expr) list) ->
+  match ds with
+  | Nil -> Nil
+  | Cons ((n, d), r) ->
+    if str_len n > 0 && str_eq (char_at n (str_len n - 1)) ":"
+    then Cons ((substring n 0 (str_len n - 1), d), kw_defaults_bare r)
+    else kw_defaults_bare r
+
 and plain_defaults = fn (ds: (str * Expr) list) ->
   match ds with
   | Nil -> Nil
@@ -2894,6 +2907,22 @@ and lambda_bare_params = fn toks -> fn (acc: str list) -> fn (ds: (str * Expr) l
          let (d, r3) = parse_bin r2 6 in
          let _ = map_delete parser_flags "nobrace" in
          lambda_bare_after n r3 acc (Cons ((n, d), ds))
+       // `-> x: 3 { }` -- a bare KEYWORD parameter, with or without a default.
+       // The parenthesised form has read these all along; this one refused the
+       // whole file with "expected block".
+       else if str_eq eq ":" then
+         (let kn = n ++ ":" in
+          match r2 with
+          | Cons (TP q, _) -> (if str_eq q "," then lambda_bare_after kn r2 acc ds
+                               else if starts_block r2 then lambda_bare_after kn r2 acc ds
+                               else (let _ = map_set parser_flags "nobrace" VNil in
+                                     let (d, r3) = parse_bin r2 6 in
+                                     let _ = map_delete parser_flags "nobrace" in
+                                     lambda_bare_after kn r3 acc (Cons ((kn, d), ds))))
+          | _ -> (let _ = map_set parser_flags "nobrace" VNil in
+                  let (d, r3) = parse_bin r2 6 in
+                  let _ = map_delete parser_flags "nobrace" in
+                  lambda_bare_after kn r3 acc (Cons ((kn, d), ds))))
        else lambda_bare_after n r acc ds
      | _ -> lambda_bare_after n r acc ds)
   // `-> *args, **kwargs { ... }` — splat / kw-splat / block-pass params.
@@ -3496,6 +3525,9 @@ and drop_defaults_prologue = fn (body: Stmt list) ->
      | _ -> body)
   | _ -> body
 
+and app_ds = fn (a: (str * Expr) list) -> fn (b: (str * Expr) list) ->
+  match a with Nil -> b | Cons (h, t) -> Cons (h, app_ds t b)
+
 and defaults_prologue = fn (ds: (str * Expr) list) -> fn (body: Stmt list) ->
   match ds with
   | Nil -> body
@@ -4073,7 +4105,7 @@ and parse_primary = fn toks ->
                    // named, so it can be told apart from a splat the source
                    // actually wrote: `->(a, b=1){}.parameters` must not report it.
                    | _ -> if psplat_any allp then allp else list_append_str allp (Cons ("*__opt", Nil))) in
-      (ELambda (allp2, defaults_prologue pds bb), r4)
+      (ELambda (allp2, defaults_prologue (app_ds pds (kw_defaults_bare lds)) bb), r4)
     else (let __fm = ("mere-ruby: unexpected token: " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let __fm = ("mere-ruby: unexpected end of input" ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
 
@@ -13279,7 +13311,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // an explicit-empty param list (`{ || .. }` / `-> () { .. }`) runs with zero
   // params; the sentinel only served to reject numbered params at parse time.
   let params = (match params with Cons (m, Nil) -> if str_eq m empty_bp_marker then (Nil : str list) else params | _ -> params) in
-  let _ = if is_lam then lambda_arity_check world params body (vlen argvals) else () in
+  let _ = if is_lam then lambda_arity_check_args world params body argvals else () in
   // The block's params and the locals it first assigns are block-local, so
   // the body runs in a FRESH frame chained to the block's defining scope.
   // Names bound further out resolve through the chain and stay one shared
@@ -19723,7 +19755,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       // a lambda checks arity strictly (procs stay lenient).
       let _ =
         if map_has lambda_ids (str_of_int pid) then
-          (match theblk with (h2, ps, b2, e2) -> lambda_arity_check world ps b2 (vlen args))
+          (match theblk with (h2, ps, b2, e2) -> lambda_arity_check_args world (strip_marker_params ps) b2 args)
         else () in
       if map_has lambda_ids (str_of_int pid) then
         // a lambda is method-like: it establishes a return-boundary frame, so a
@@ -20081,6 +20113,18 @@ and numbered_misuse_expr = fn (e: Expr) ->
   | _ -> false
 and numbered_misuse_exprs = fn (es: Expr list) ->
   match es with Nil -> false | Cons (e, r) -> numbered_misuse_expr e || numbered_misuse_exprs r
+
+// a lambda's strict arity counts POSITIONAL arguments: a trailing keyword hash
+// belongs to the keyword parameters, and counting it as positional made
+// `->(x: 3){ }.call(x: 9)` "wrong number of arguments (given 1, expected 0)".
+// Both places that check a lambda's arity go through this.
+and lambda_arity_check_args = fn world -> fn (ps: str list) -> fn (body: Stmt list) -> fn (args: Val list) ->
+  let wants_kw9 = (match kw_params ps with
+                   | Nil -> (if str_eq (dsplat_name ps) "" then false else true)
+                   | _ -> true) in
+  let n9 = (if wants_kw9 then (match peel_kw_hash args with (pos9, _) -> vlen pos9)
+            else vlen args) in
+  lambda_arity_check world ps body n9
 
 and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) -> fn (nargs: int) ->
   // an explicit-empty param list (`{ || }`) behaves like zero params.
