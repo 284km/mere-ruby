@@ -507,6 +507,9 @@ let lambda_blk_marker = "__lambda_blk__";
 // carry-the-origin slot pattern `pending_home` already uses, written by
 // coerce_to_block and cleared by every other block path so it is never stale.
 let pending_srcproc = map_new ();
+let curry_target = map_new ();   // curried proc id -> the proc it will call
+let curry_args = map_new ();     // curried proc id -> the arguments so far
+let curry_arity = map_new ();    // curried proc id -> how many it waits for
 // display name for an anonymous class/module once it is assigned to a
 // constant (internal "AnonClass_N"/"AnonModule_N" -> the constant's name).
 let anon_name = map_new ();
@@ -19657,8 +19660,42 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     if map_has meths name then call_method env world noblk name args
     else dispatch_prim env world blk recv name args vischeck
   | VProc pid ->
+    // a CURRIED proc collects arguments until it has the arity it was curried
+    // at, and only then runs the proc it was made from. It is a proc like any
+    // other from the outside -- #lambda? answers what the source answers --
+    // so the state lives beside it rather than in a different kind of value.
+    if map_has curry_target (str_of_int pid)
+       && (str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===") then
+      (let tgt9 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
+       let want9 = (match map_get curry_arity (str_of_int pid) with VInt n -> n | _ -> 0) in
+       let got9 = (match map_get curry_args (str_of_int pid) with VArr a -> deref a | _ -> Nil) in
+       let all9 = rev_app (rev_app got9 Nil) args in
+       if vlen all9 >= want9
+       then invoke_val_c env world blk (VProc tgt9) "call" all9 false
+       else mk_curried world tgt9 all9 want9 pid)
+    // Proc#curry([arity]): the curried form of this proc.
+    // a curried proc reports itself the way ruby's does: arity -1, one rest
+    // parameter, and no source location (it is not written anywhere).
+    else if map_has curry_target (str_of_int pid) && str_eq name "arity" then VInt (0 - 1)
+    else if map_has curry_target (str_of_int pid) && str_eq name "parameters" then
+      arr_new (Cons (arr_new (Cons (VSym "rest", Nil)), Nil))
+    else if map_has curry_target (str_of_int pid) && str_eq name "source_location" then VNil
+    // currying a curried proc curries the proc BEHIND it, not the collector.
+    else if map_has curry_target (str_of_int pid) && str_eq name "curry" then
+      (let tgt8 = (match map_get curry_target (str_of_int pid) with VInt t -> t | _ -> 0) in
+       let ar8 = (match args with
+                  | Cons (VInt n, _) -> n
+                  | _ -> (match map_get curry_arity (str_of_int pid) with VInt n -> n | _ -> 0)) in
+       mk_curried world tgt8 (Nil : Val list) ar8 pid)
+    else if str_eq name "curry" then
+      (let ar9 = (match args with
+                  | Cons (VInt n, _) -> n
+                  | _ -> (match invoke_val_c env world blk recv "arity" Nil false with
+                          | VInt a -> (if a < 0 then 0 - a - 1 else a)
+                          | _ -> 0)) in
+       mk_curried world pid (Nil : Val list) ar9 pid)
     // call/./[]/yield run the stored block; class reports Proc.
-    if str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===" then
+    else if str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===" then
       let theblk = map_get proc_store (str_of_int pid) in
       // a lambda checks arity strictly (procs stay lenient).
       let _ =
@@ -19730,6 +19767,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       else flow_value (run_block world noblk (proc_as_block pid) args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
+    // Proc#to_proc is the proc ITSELF -- the name was claimed with nothing
+    // behind it, so `pr.to_proc` was a NoMethodError on a Proc.
+    else if str_eq name "to_proc" then recv
     else if str_eq name "parameters" then
       (match map_get proc_store (str_of_int pid) with
        (h, ps, body, e) ->
@@ -20105,6 +20145,18 @@ and run_at_exit_procs = fn world -> fn (xs: Val list) ->
     run_at_exit_procs world rest
   | Cons (_, rest) -> run_at_exit_procs world rest
 
+// a fresh proc that stands for "this target, these arguments so far, this
+// arity". `like` is the proc whose lambda-ness it inherits (curry preserves
+// it, and so does each partial application).
+and mk_curried = fn world -> fn (tgt: int) -> fn (got: Val list) -> fn (want: int) -> fn (like: int) ->
+  let cid = map_len proc_store in
+  let _ = store_proc (str_of_int cid) (true, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  let _ = map_set curry_target (str_of_int cid) (VInt tgt) in
+  let _ = map_set curry_args (str_of_int cid) (arr_new got) in
+  let _ = map_set curry_arity (str_of_int cid) (VInt want) in
+  let _ = (if map_has lambda_ids (str_of_int like) then map_set lambda_ids (str_of_int cid) VNil else ()) in
+  VProc cid
+
 and proc_as_block = fn (pid: int) ->
   let t = map_get proc_store (str_of_int pid) in
   // a lambda enforces strict arity; a proc that captured a defining-method
@@ -20132,7 +20184,13 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   | _ ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     (match invoke_val_c env world noblk bv "to_proc" Nil false with
-     | VProc pid -> proc_as_block pid
+     // the proc #to_proc answered IS the proc this block was made from -- a
+     // Method's is a lambda, and `&m` lost that by not recording it here the
+     // way the VProc arm above does.
+     | VProc pid ->
+       (let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
+        let _ = map_set pending_srcproc "v" pid in
+        proc_as_block pid)
      | _ -> noblk)
 
 and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
@@ -22341,8 +22399,13 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
   // object identity, so `m.method(:x).eql?(m.method(:x))` was false where `==`
   // was true -- one relation, answered twice, disagreeing with itself.
   else if str_eq cls "Proc" then
+    // #yield, #===, #[] and #() are four more names for #call
     (if str_eq n "eql?" then "=="
      else if str_eq n "inspect" then "to_s"
+     else if str_eq n "yield" then "call"
+     else if str_eq n "===" then "call"
+     else if str_eq n "[]" then "call"
+     else if str_eq n "()" then "call"
      else n)
   else if str_eq cls "Method" || str_eq cls "UnboundMethod" then
     (if str_eq n "eql?" then "=="
@@ -22451,6 +22514,10 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
     is_num_method name || is_prim_method name
   else if str_eq cls "Module" || str_eq cls "Class" then
     is_module_method name || is_prim_method name
+  // Proc had no row at all, so `Proc.instance_method(:call)` -- and every
+  // comparison the alias specs make with it -- raised NameError for methods
+  // that answer when called.
+  else if str_eq cls "Proc" then is_proc_method name || is_prim_method name
   // zeitwerk branches on UnboundMethod.method_defined?(:bind_call)
   // Queue and SizedQueue: their methods live in the primitive dispatcher, so
   // without a row here `Queue.instance_method(:deq)` raised NameError for a
