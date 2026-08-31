@@ -16949,14 +16949,48 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // dispatch actually runs through it); for a class it is the metaclass; a
     // mutable primitive has one too (`ARGV.extend(OptionParser::Arguable)` is
     // how optparse installs itself, and ARGV is an Array).
-    (let sc = (match recv with
+    // ...and it REFUSES: no argument at all, something that is not a Module
+    // (a Class is not one either), and a frozen receiver. All four answered
+    // the receiver's singleton class instead.
+    (let _ = (match args with
+              | Nil -> (let _ = raise_exc world "ArgumentError"
+                          "wrong number of arguments (given 0, expected 1+)" in ())
+              | _ -> ()) in
+     let _ = extend_arg_check world args in
+     let _ = (if val_frozen_mut recv
+              then (let _ = raise_exc world "FrozenError"
+                      ("can't modify frozen object: " ++ inspect recv) in ()) else ()) in
+     let sc = (match recv with
                | VClass c -> "(sng:" ++ c ++ ")"
                | VObj id -> singleton_cls_of world id
                | VStr _ -> prim_sng_cls world recv "String"
                | VArr _ -> prim_sng_cls world recv "Array"
                | VHsh _ -> prim_sng_cls world recv "Hash"
                | _ -> "") in
-     let _ = extend_all sc args in
+     // a module with its own `self.extend_object` REPLACES the mixin: ruby
+     // calls it instead, and the documented override ends with `super`, which
+     // is where the mixin actually happens.
+     let hooked = (let rec anyh = fn (xs: Val list) ->
+                     (match xs with
+                      | Nil -> false
+                      | Cons (VClass m9, t9) ->
+                        (if has_meth world ("(sng:" ++ m9 ++ ")") "extend_object" then true else anyh t9)
+                      | Cons (_, t9) -> anyh t9) in
+                   anyh args) in
+     let _ = (if hooked then
+                (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                 let rec callh = fn (xs: Val list) ->
+                   (match xs with
+                    | Nil -> ()
+                    | Cons (VClass m9, t9) ->
+                      (let _ = (if has_meth world ("(sng:" ++ m9 ++ ")") "extend_object"
+                                then (let _ = invoke world nb9 (VClass m9) ("(sng:" ++ m9 ++ ")")
+                                                "extend_object" (Cons (recv, Nil)) in ())
+                                else (let _ = do_extend_one world m9 recv in ())) in
+                       callh t9)
+                    | Cons (_, t9) -> callh t9) in
+                 callh args)
+              else extend_all sc args) in
      // ...and dispatch for a primitive goes through its tagged class, so the
      // singleton has to become that tag or the mixed-in methods are invisible
      // (its superclass is the class the value had, so nothing else moves).
@@ -18047,7 +18081,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match args with
        | Cons (VClass t, _) ->
          let rc = metaclass_class c in
-         if str_eq name "instance_of?" then VBool (str_eq rc t) else VBool (obj_is_a world rc t)
+         // a class EXTENDED with a module is a kind_of? it, and the module
+         // lives in the class's metaclass includes -- metaclass_class alone
+         // answers only "Class" or "Module" and never sees it.
+         if str_eq name "instance_of?" then VBool (str_eq rc t)
+         else VBool (obj_is_a world rc t || obj_is_a world ("(sng:" ++ c ++ ")") t)
        // asking about something that is not a class or module is not a
        // question with a false answer -- ruby refuses it.
        | Cons (_, _) -> raise_exc world "TypeError" "class or module required"
@@ -18486,7 +18524,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "is_a?" || str_eq name "kind_of?" || str_eq name "instance_of?" then
       (match args with
        | Cons (VClass c9, _) ->
-         (if str_eq name "instance_of?" then VBool (str_eq cls c9) else VBool (obj_is_a world cls c9))
+         // `cls` above is the DISPATCH class, which strips the singleton off
+         // for a name the singleton does not define -- and neither of these is
+         // ever defined there. #extend puts the module in the SINGLETON's
+         // includes, so a walk that started from the stripped class could not
+         // see it: `o.extend(M); o.kind_of?(M)` was false while
+         // `o.singleton_class.include?(M)` was true.
+         (let ocls0 = map_get ocls (str_of_int id) in
+          let real0 = (if is_sng_cls ocls0 then (if map_has sup ocls0 then map_get sup ocls0 else "Object") else ocls0) in
+          if str_eq name "instance_of?" then VBool (str_eq real0 c9)
+          else VBool (obj_is_a world ocls0 c9))
        | Cons (_, _) -> raise_exc world "TypeError" "class or module required"
        | _ -> VBool false)
     // an object's singleton class (created on first use).
@@ -28456,6 +28503,41 @@ and run_extended_hooks = fn world -> fn (args: Val list) -> fn (base: Val) ->
     run_extended_hooks world rest base
   | Cons (_, rest) -> run_extended_hooks world rest base
 
+// every argument of #extend has to be a MODULE. A Class is not one (ruby's
+// "wrong argument type Class (expected Module)"), and neither is anything
+// else -- all of them were mixed in without complaint.
+// mix ONE module into a receiver's singleton. `#extend` does this, and so
+// does `super` from an `extend_object` override -- the documented way to write
+// one ends with `super` precisely to get it, so both have to reach the same
+// body rather than each having its own.
+and do_extend_one = fn world -> fn (m9: str) -> fn (target: Val) ->
+  let sc9 = (match target with
+             | VClass c9 -> "(sng:" ++ c9 ++ ")"
+             | VObj id9 -> singleton_cls_of world id9
+             | VStr _ -> prim_sng_cls world target "String"
+             | VArr _ -> prim_sng_cls world target "Array"
+             | VHsh _ -> prim_sng_cls world target "Hash"
+             | _ -> "") in
+  let _ = extend_all sc9 (Cons (VClass m9, Nil)) in
+  // dispatch for a primitive goes through its tagged class, so the singleton
+  // has to become that tag or the mixed-in methods are invisible.
+  let _ = (match target with
+           | VStr _ -> map_set hng_store (hng_key target) sc9
+           | VArr _ -> map_set hng_store (hng_key target) sc9
+           | VHsh _ -> map_set hng_store (hng_key target) sc9
+           | _ -> ()) in
+  target
+
+and extend_arg_check = fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> ()
+  | Cons (VClass c9, rest) ->
+    (if map_has modules c9 then extend_arg_check world rest
+     else (let _ = raise_exc world "TypeError" "wrong argument type Class (expected Module)" in ()))
+  | Cons (other, _) ->
+    (let _ = raise_exc world "TypeError"
+       ("wrong argument type " ++ class_name other ++ " (expected Module)") in ())
+
 and extend_all = fn (sc: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
@@ -28549,6 +28631,11 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // so an override that ends with `super` (the documented way to write one)
   // must not blow up when nothing else in the chain defines them.
   else if is_definition_hook meth then VNil
+  // `super` from an `extend_object` override IS the default extend.
+  else if str_eq meth "extend_object" && (match recv with VClass _ -> true | _ -> false) then
+    (match recv with
+     | VClass m9 -> (match args with Cons (target, _) -> do_extend_one world m9 target | _ -> VNil)
+     | _ -> VNil)
   // `super` from an `append_features` / `prepend_features` override IS the
   // default include: adding the module to the base's ancestors is what
   // Module#append_features does, and ActiveSupport::Concern's override ends

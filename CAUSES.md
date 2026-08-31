@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 328 files.
+Classified: 326 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,7 +53,7 @@ Classified: 328 files.
 
 </details>
 
-## DIFF — 307 files, 94 kinds
+## DIFF — 305 files, 93 kinds
 
 | files | kind |
 |---|---|
@@ -64,7 +64,7 @@ Classified: 328 files.
 | 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 11 | `FAILED expected TypeError to be raised` |
-| 10 | `FAILED expected true, got false` |
+| 9 | `FAILED expected true, got false` |
 | 8 | `pass=N fail=N err=N` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
@@ -116,7 +116,6 @@ Classified: 328 files.
 | 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
-| 1 | `FAILED expected a #<OBJ>>, got #<OBJ>` |
 | 1 | `FAILED expected [], got nil` |
 | 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
