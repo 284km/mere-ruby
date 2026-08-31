@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 329 files.
+Classified: 328 files.
 
 ## CRASH — 21 files, 13 kinds
 
@@ -53,7 +53,7 @@ Classified: 329 files.
 
 </details>
 
-## DIFF — 308 files, 95 kinds
+## DIFF — 307 files, 94 kinds
 
 | files | kind |
 |---|---|
@@ -99,7 +99,6 @@ Classified: 329 files.
 | 1 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 1 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `FAILED raised StandardError, expected ArgumentError` |
-| 1 | `FAILED raised RuntimeError, expected NoMethodError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
@@ -210,10 +209,10 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
-| kernel (8) | `__method__ binding lambda loop method public_send select test` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | proc (7) | `binding case_compare curry element_reference new to_proc yield` |
 | method (7) | `case_compare clone curry element_reference source_location super_method to_proc` |
+| kernel (7) | `__method__ binding lambda loop method select test` |
 | struct (6) | `deconstruct element_reference element_set filter keyword_init new` |
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |

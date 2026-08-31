@@ -11516,10 +11516,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (if map_has meths name then false else true) then
       (let recv = if lv_has env "self" then lv_get env "self" else VMain in
        let vis = str_eq name "public_send" in
-       match args with
-       | Cons (VSym m, rest) -> if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis
-       | Cons (VStr m, rest) -> let m = sget m in (if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis)
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: send expects a method name")) in fail "mere-ruby: send expects a method name"))
+       let m = send_name_arg env world args in
+       let rest = (match args with Cons (_, r) -> r | Nil -> Nil) in
+       let _ = (if vis then public_send_guard world recv m else ()) in
+       if str_eq m "eval" then do_eval env world blk rest
+       else invoke_val_c env world blk recv m rest vis)
     // enum_for(:m) / to_enum(:m): an Enumerator that drives self.m on #each.
     else if (str_eq name "enum_for" || str_eq name "to_enum") && (if map_has meths name then false else true) then
       // `to_enum(:m, a, b)` records a and b: they are the arguments the
@@ -11814,10 +11815,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        if str_eq name "send" || str_eq name "__send__" || str_eq name "public_send" then
          // public_send respects visibility; send/__send__ bypass it.
          let vis = str_eq name "public_send" in
-         (match args with
-          | Cons (VSym m, rest) -> if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis
-          | Cons (VStr m, rest) -> let m = sget m in (if str_eq m "eval" then do_eval env world blk rest else invoke_val_c env world blk recv m rest vis)
-          | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: send expects a method name")) in fail "mere-ruby: send expects a method name"))
+         let m = send_name_arg env world args in
+         let rest = (match args with Cons (_, r) -> r | Nil -> Nil) in
+         let _ = (if vis then public_send_guard world recv m else ()) in
+         (if str_eq m "eval" then do_eval env world blk rest
+          else invoke_val_c env world blk recv m rest vis)
        else if str_eq name "respond_to?" then respond_to_answer env world recv args
        // in-place string mutation: rewrite the receiver's store entry, so
        // every alias sees it (unless the class redefines the method).
@@ -20080,10 +20082,10 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
         // an unwrapped send BYPASSES visibility (public_send keeps it),
         // exactly as the blockless send arm does.
         then (let vis2 = str_eq name "public_send" in
-              match args with
-              | Cons (VSym m, rest) -> invoke_val_c env world blk recv m rest vis2
-              | Cons (VStr m, rest) -> invoke_val_c env world blk recv (sget m) rest vis2
-              | _ -> VNil)
+              let m2 = send_name_arg env world args in
+              let rest2 = (match args with Cons (_, r) -> r | Nil -> Nil) in
+              let _ = (if vis2 then public_send_guard world recv m2 else ()) in
+              invoke_val_c env world blk recv m2 rest2 vis2)
         // vischeck TRUE: this path is reached with an explicit receiver (a
         // bare call's own methods were dispatched by the caller), and a
         // forwarded private call must refuse -- `def foo(...) = @o.foo(...)`
@@ -20109,11 +20111,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        | FBreak bv -> bv
        | other -> (let _ = flow_value other in recv))
     // recv.send(:m, args) { block } — forward the block to the sent method.
-    else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
-      (match args with
-       | Cons (VSym m, rest) -> invoke_with_block env world blk recv m rest newblk
-       | Cons (VStr m, rest) -> invoke_with_block env world blk recv (sget m) rest newblk
-       | _ -> VNil)
+    else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (match args with Cons (_, _) -> true | _ -> false) then
+      (let m3 = send_name_arg env world args in
+       let rest3 = (match args with Cons (_, r) -> r | Nil -> Nil) in
+       let _ = (if str_eq name "public_send" then public_send_guard world recv m3 else ()) in
+       invoke_with_block env world blk recv m3 rest3 newblk)
     // `Method#call` with a BLOCK. tsort builds `method(:tsort_each_node)` and
     // calls it with the block that visits each node, so the block has to reach
     // the method the object names. The plain dispatcher hands a method no block
@@ -21873,6 +21875,32 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
 // everywhere else -- Symbol, String, or #to_str -- and anything that is none
 // of those is a TypeError, not a false. There were two copies of this arm (one
 // for a plain value, one for an object) and they had drifted apart.
+// #public_send is PUBLIC-only, which is a STRONGER question than "may I call
+// this from here": a protected method is callable from a sibling instance and
+// still refuses public_send. vischeck answers the first question, so the
+// second has to be asked separately -- `public_send :protected_method` from
+// inside the object's own method ran the method.
+and public_send_guard = fn world -> fn (recv: Val) -> fn (m: str) ->
+  let c9 = dispatch_cls_of world recv in
+  if meth_protected world c9 m
+  then (let _ = raise_exc world "NoMethodError"
+          ("protected method '" ++ m ++ "' called for an instance of " ++ display_cls_msg world c9) in ())
+  else ()
+
+// the method-name argument of send / __send__ / public_send, read the way
+// every other name argument is: Symbol, String, #to_str, and a TypeError for
+// what is none of those. No argument at all is ruby's "no method name given".
+and send_name_arg = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Cons (VSym m, _) -> m
+  | Cons (VStr m, _) -> sget m
+  | Cons (other, _) ->
+    (match conv_try env world other "to_str" with
+     | VStr h9 -> sget h9
+     | _ -> (let _ = raise_exc world "TypeError"
+               (inspect other ++ " is not a symbol nor a string") in ""))
+  | Nil -> (let _ = raise_exc world "ArgumentError" "no method name given" in "")
+
 and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list) ->
   let all = (match args with
              | Cons (_, Cons (VBool b, _)) -> b
@@ -34056,6 +34084,16 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
           // does. `alias _pack pack` in a reopened Array is how a wrapper keeps
           // hold of the original.
           else set_builtin_alias world cls n1 n2 in
+  // ...and it keeps the ORIGINAL'S VISIBILITY. `alias :aka :bar` under a
+  // `private` copies a private method, and the copy is private too: it was
+  // public, so `public_send(:aka)` reached a method public_send must refuse.
+  let _ = (let k1 = cls ++ "#" ++ n1 in
+           let k2 = cls ++ "#" ++ n2 in
+           let _ = (if map_has privates k1 then map_delete privates k1 else ()) in
+           let _ = (if map_has protecteds k1 then map_delete protecteds k1 else ()) in
+           if map_has privates k2 then (let _ = map_set privates k1 VNil in ())
+           else if map_has protecteds k2 then (let _ = map_set protecteds k1 VNil in ())
+           else ()) in
   // an alias ADDS a method, so `method_added` fires for the new name --
   // rubocop-ast registers its visitors from that hook and writes
   // `alias visit_number visit_symbol`, so an alias that stays quiet leaves the
