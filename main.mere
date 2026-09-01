@@ -709,6 +709,19 @@ let rec mark_captured = fn env ->
 // costs its ENTRIES only, in an arena that is handed back at return.
 let frame_pool = vec_new ();
 let frame_pool_n = map_new ();
+// Can this target measure an arena at all? `map_bytes` / `vec_bytes` report the
+// arena BYTES behind a store, and on RV32I -- where a program is the machine --
+// a Vec is a plain heap block with no arena behind it, so there is no number to
+// give and the call stops.
+//
+// Asked ONCE, here, and not per call. `frame_pool_put` runs on every frame
+// release and `gc_store_bytes` on every pressure check, so a `try_or` inside
+// either would install a fail handler in the hottest path in the interpreter.
+//
+// The false branch does not substitute 0. A byte count of 0 reads as "nothing
+// was held", which is a measurement, and this is the absence of one -- so the
+// counters are simply not kept, and the diagnostic rows that print them say so.
+let arena_measurable = try_or (fn (u: unit) -> let _ = map_bytes frame_pool_n in true) false;
 let pool_ctr = fn (k: str) ->
   map_set frame_pool_n k ((if map_has frame_pool_n k then map_get frame_pool_n k else 0) + 1);
 let frame_pool_get = fn (u: unit) ->
@@ -726,8 +739,11 @@ let frame_pool_put = fn f ->
   // count the bytes this frame's arena held BEFORE the wind-back: that sum is
   // the deterministic answer to "was anything reclaimed" that peak RSS is not
   // (peak RSS above a few GB varies 2x between identical runs, recorded below).
-  let _ = map_set frame_pool_n "bytes"
-    ((if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) + map_bytes f) in
+  let _ =
+    if arena_measurable then
+      map_set frame_pool_n "bytes"
+        ((if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) + map_bytes f)
+    else () in
   let _ = map_recycle f in
   let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
   // cap the pool at the deepest call stack seen; past that, drop the frame
@@ -10558,8 +10574,13 @@ let rec gc_args_simple = fn (es: Expr list) ->
   | Nil -> true
   | Cons (e, rest) -> gc_arg_simple e && gc_args_simple rest;
 
+// 0 when the target cannot measure an arena. Here that IS the right answer
+// rather than a lie: this feeds a pressure threshold, and a target with no arena
+// has no arena bytes to be under pressure from. The entry-count axis still
+// works, so collection still happens -- see gc_should_run, which ORs the two.
 let gc_store_bytes = fn (u: unit) ->
-  vec_bytes str_store + map_bytes arr_store + vec_bytes hash_store;
+  if arena_measurable then vec_bytes str_store + map_bytes arr_store + vec_bytes hash_store
+  else 0;
 
 // Pressure is INCREMENTAL on both axes. Entries: the amortized threshold in
 // the driver. Bytes (mere v0.1.299): growth over the post-collection baseline
@@ -13333,7 +13354,14 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
            let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
            let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
 
-  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (built-in exception raised)")) in fail "mere-ruby: (built-in exception raised)")
+  // The message names the class and text it was given. It used to say only
+  // "(built-in exception raised)", which is what reaches the terminal whenever a
+  // raise escapes before the top level's formatter is in place -- and it named
+  // neither what was raised nor why, so the only way to find out was to add a
+  // print here. `raise_exc` is holding both arguments; discarding them cost
+  // nothing to keep.
+  let __what = "mere-ruby: " ++ cls ++ (if str_len msg == 0 then "" else ": " ++ msg) ++ " (raised before the top level could format it)" in
+  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __what)) in fail __what)
 
 // run `theblk` and return the resulting Flow, so break/next inside the
 // block reach the iterating method. Its params bind into a fresh frame
@@ -29658,7 +29686,26 @@ and env_key_of = fn env -> fn world -> fn (v: Val) ->
   | _ -> let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ class_name v ++ " into String") in ""
 // the full environment as (key, value) pairs — there is no environ extern,
 // so dump env(1) to a temp file and parse it (multiline values are a cap).
+//
+// Wrapped, because on a target with no host there is nothing to ask. `mere -rv`
+// builds a program that IS the machine: `random_int`, `run`, `file_exists` and
+// `read_file` all stop with a message there, and this is the first thing the
+// interpreter does — $LOAD_PATH needs RUBYLIB, RUBYLIB needs the environment, and
+// the environment needs a shell. So `ruby -e 'puts 1 + 1'` could not start.
+//
+// An environment that cannot be read is EMPTY, not an error. That is not an
+// approximation: ruby started with no RUBYLIB and no RUBYOPT behaves exactly the
+// way this does, so the degraded answer is one of the real ones. The decision
+// lives here rather than in the four services because this is the level that
+// knows what their absence MEANS — a `read_file` that quietly returned "" would
+// be wrong everywhere else.
+//
+// The `try_or` also catches a ruby-level raise from inside, since raise unwinds
+// through Mere's `fail` too. Nothing in the body raises: it is host I/O and
+// string parsing.
 and env_all_pairs = fn () ->
+  try_or (fn (u: unit) -> env_all_pairs_host ()) (Nil : (str * str) list)
+and env_all_pairs_host = fn () ->
   let tmpf = "/tmp/.mrb_env_" ++ str_of_int (random_int 100000000) in
   let _ = run ("env > " ++ shq tmpf ++ " 2> /dev/null") in
   let content = (if file_exists tmpf then read_file tmpf else "") in
@@ -39684,8 +39731,17 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set ocls (str_of_int argfid) "ARGF" in
   let _ = map_set consts "ARGF" (VObj argfid) in
   let _ = map_set globals "0" (mkstr name) in
-  // `$$` is the process id, like Process.pid
-  let _ = map_set globals "$" (VInt (getpid ())) in
+  // `$$` is the process id, like Process.pid -- set only if there IS one. On a
+  // target with no host (`mere -rv`, where the program is the machine) `getpid`
+  // is an extern with no C library behind it, and this line runs at startup, so
+  // it stopped every program before it began.
+  //
+  // Left UNSET rather than set to 0. The comment on the extern above says why:
+  // a made-up number is a stable lie, and nil is detectable where a lie is not.
+  // `Process.pid` still asks, and still stops, for a program that actually wants
+  // the pid -- which is the honest answer to "what is my process id" on a machine
+  // that has no processes.
+  let _ = try_or (fn (u: unit) -> map_set globals "$" (VInt (getpid ()))) () in
   let _ = map_set globals "PROGRAM_NAME" (mkstr name) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // A small core prelude, written in ruby and run before the program: classes
