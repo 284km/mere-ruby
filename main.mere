@@ -751,6 +751,10 @@ let cur_file = fn () ->
 // created as the call that takes it is evaluated.
 let proc_src = map_new ();
 let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
+let meth_src = map_new ();       // "cls#name" -> line, "f" ++ key -> file
+let stamp_meth_src = fn (key: str) ->
+  let _ = map_set meth_src key (VInt (cur_line ())) in
+  map_set meth_src ("f" ++ key) (mkstr (cur_file ()));
 let store_proc = fn (k: str) -> fn entry ->
   let (_, _, _, penv) = entry in
   let _ = mark_captured penv in
@@ -18712,6 +18716,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
           VInt (val_hash (mkstr (ocl ++ "#" ++ mnm))))
        else if str_eq name "arity" then VInt (bm_arity world mown mnm)
+       // Method#source_location: [file, line] of the `def`, or nil for a
+       // builtin (there is no ruby source behind one).
+       else if str_eq name "source_location" then meth_source_location world mown mnm mrecv
        else if str_eq name "parameters" then
          bm_params world (if str_eq mown "" then class_name mrecv else mown) mnm
        else if str_eq name "unbind" then
@@ -19337,6 +19344,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else raise_exc world "TypeError" ("bind argument must be an instance of " ++ ucls))
        else if str_eq name "name" then VSym unm
        else if str_eq name "owner" then VClass ucls
+       else if str_eq name "source_location" then meth_source_location world ucls unm VNil
        else if str_eq name "arity" then VInt (bm_arity world ucls unm)
        else if str_eq name "parameters" then bm_params world ucls unm
        // original_name: the name this method was DEFINED as, which differs from
@@ -22468,6 +22476,23 @@ and is_hash_method = fn (name: str) ->
 // equality and #original_name both ask this one question, and asking only half
 // of it made `m.method(:foo) == m.method(:bar)` false for a ruby-level alias
 // while it was true for a builtin one.
+// where a `def` was written. A builtin has no ruby source and answers nil,
+// which is also what ruby does for one.
+and meth_source_location = fn world -> fn (own: str) -> fn (nm: str) -> fn (recv: Val) ->
+  let k9 = (if str_eq own "" then
+              (match recv with
+               | VClass c9 -> "(sng:" ++ c9 ++ ")#" ++ nm
+               | VMain -> nm
+               | other9 -> class_name other9 ++ "#" ++ nm)
+            else own ++ "#" ++ nm) in
+  let k9 = (if map_has meth_src k9 then k9 else nm) in
+  if map_has meth_src k9 && map_has meth_src ("f" ++ k9)
+  then (match map_get meth_src ("f" ++ k9) with
+        | VStr h9 -> (if str_eq (sget h9) "" then VNil
+                      else arr_new (Cons (mkstr (sget h9), Cons (map_get meth_src k9, Nil))))
+        | _ -> VNil)
+  else VNil
+
 and defined_as_name = fn world -> fn (cls: str) -> fn (n: str) ->
   if map_has alias_srcname (cls ++ "#" ++ n)
   then (match map_get alias_srcname (cls ++ "#" ++ n) with s2 -> s2)
@@ -34618,12 +34643,27 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // `def C.m` (a receiver-qualified "C#m") is a class method of C, so it
          // lives in C's singleton namespace; `def self.m` likewise on the
          // enclosing class; a plain name is an instance method.
-         let key = if str_contains mname "#" then "(sng:" ++ recv_base mname ++ ")#" ++ meth_base mname
+         // `def recv.m` inside a class body: recv may be a LOCAL of the class
+         // body holding an object, not a class name. Only the class-name
+         // reading was here, so `iter = Object.new; def iter.each; end` in a
+         // class body registered under a class called "iter" that nothing
+         // could reach -- while the same two lines at the top level worked.
+         let rv8 = (if str_contains mname "#" && lv_has cenv (recv_base mname)
+                    then lv_get cenv (recv_base mname) else VNil) in
+         let key = if str_contains mname "#" then
+                     (match rv8 with
+                      | VObj id8 -> singleton_cls_of world id8 ++ "#" ++ meth_base mname
+                      | VStr h8 -> hng_cls_of world (VStr h8) "String" ++ "#" ++ meth_base mname
+                      | VArr h8 -> hng_cls_of world (VArr h8) "Array" ++ "#" ++ meth_base mname
+                      | VHsh h8 -> hng_cls_of world (VHsh h8) "Hash" ++ "#" ++ meth_base mname
+                      | VClass c8 -> "(sng:" ++ c8 ++ ")#" ++ meth_base mname
+                      | _ -> "(sng:" ++ recv_base mname ++ ")#" ++ meth_base mname)
                    else if is_selfdef then "(sng:" ++ cls ++ ")#" ++ mname
                    else cls ++ "#" ++ mname in
          let _ = map_set meths key (Meth (params, defs, mbody)) in
          let _ = (if str_eq (meth_base mname) "method_added" then map_set hook_flags "ma" VNil else ()) in
          let _ = map_set meth_cref key (cur_lex ()) in
+         let _ = stamp_meth_src key in
          // `module_function` mode: the instance method is ALSO a module method,
          // so register it in the module's singleton namespace too.
          let _ = if str_eq vis2 "module_function" && (if is_selfdef then false else true) && (if str_contains mname "#" then false else true)
@@ -35496,6 +35536,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else name) in
     let _ = map_set meths key (Meth (params, defs, body)) in
     let _ = map_set meth_cref key (cur_lex ()) in
+    let _ = stamp_meth_src key in
     let _ = (if str_eq (meth_base name) "method_added" then map_set hook_flags "ma" VNil else ()) in
     // `method_added` belongs where the method is INSTALLED, not where the `def`
     // is written. The class-body walker fired it and this path -- every `def`

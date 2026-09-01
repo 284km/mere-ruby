@@ -12,7 +12,7 @@ Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
 Classified: 315 files.
 
-## CRASH — 18 files, 11 kinds
+## CRASH — 17 files, 10 kinds
 
 | files | kind |
 |---|---|
@@ -23,7 +23,6 @@ Classified: 315 files.
 | 1 | `ERROR NoMethodError` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
-| 1 | `*.rb:N: undefined method 'S' for an instance of Object (NoMethodError)` |
 | 1 | `*.rb:N: mere-ruby: unterminated string in TMPDIR near line N` |
 | 1 | `*.rb:N: mere-ruby: undefined method 'S' for class KernelSpecs::CalleeTest` |
 | 1 | `*.rb:N: mere-ruby: undefined method 'S' for class DefineSingletonMethodSpecClass` |
@@ -39,7 +38,6 @@ Classified: 315 files.
 | 1 | `ERROR: rescuing SignalException raises a SignalException when sent a signal: NoMethodError` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
-| 1 | `*.rb:N: undefined method 'each' for an instance of Object (NoMethodError)` |
 | 1 | `*.rb:N: mere-ruby: unterminated string in TMPDIR near line 645` |
 | 1 | `*.rb:N: mere-ruby: undefined method 'define_singleton_method' for class DefineSingletonMethodSpecClass` |
 | 1 | `*.rb:N: mere-ruby: undefined method '__callee__' for class KernelSpecs::CalleeTest` |
@@ -48,11 +46,11 @@ Classified: 315 files.
 
 </details>
 
-## DIFF — 297 files, 94 kinds
+## DIFF — 298 files, 94 kinds
 
 | files | kind |
 |---|---|
-| 47 | `ERROR NoMethodError` |
+| 48 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
@@ -211,8 +209,8 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
+| proc (3) | `binding new source_location` |
 | integer (3) | `ceildiv div try_convert` |
-| proc (2) | `binding new` |
 | numeric (2) | `integer real` |
 | language (2) | `alias module` |
 | threadgroup (1) | `list` |
