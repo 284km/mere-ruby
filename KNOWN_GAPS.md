@@ -1663,3 +1663,37 @@ measures the process it runs in, so its MATCH count moves between sessions with
 no change to the interpreter — 43 in one session and 25 in another, from the same
 binary. A gate whose subject includes its own execution environment cannot be
 compared across runs, and that one is still open.
+
+## A spec that accepts both answers is still a DIFF, because the harness counts assertions
+
+`core/method/source_location_spec.rb`'s "works for core methods" example is
+written to accept two answers:
+
+```ruby
+loc = method(:tap).source_location
+if loc == nil
+  loc.should == nil
+else
+  loc[0].should.start_with?('<internal:')
+  loc[1].should.is_a?(Integer)
+end
+```
+
+ruby 3.2 answers `["<internal:kernel>", 89]` — `Kernel#tap` is genuinely written
+in Ruby, in a file CRuby carries inside its own binary. mere-ruby's `tap` is a
+primitive with no source file, so it answers `nil`, which is the branch the spec
+puts first and the truthful answer for a method that was never written in Ruby.
+
+Both branches pass. But they run a **different number of assertions** — one in
+the nil branch, two in the other — and the gate compares mere-ruby's
+`pass=/fail=/err=` line against ruby's byte for byte. So the row reads `pass=16`
+against `pass=17` and stays DIFF while every example passes on both sides.
+
+The only way to close it is to invent an `<internal:kernel>` line number for a
+method that has no source, which is a worse answer than `nil`: it would name a
+file that does not exist and a line inside it. The row is left DIFF.
+
+This inverts the usual reading of the counts. A lower `pass=` here means
+mere-ruby **asserted less**, not that it failed more; `fail=0 err=0` on both
+sides is the part that says the behaviour agrees. Any row whose two sides differ
+only in `pass=` is worth reading this way before it is treated as a gap.

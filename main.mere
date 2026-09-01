@@ -755,6 +755,24 @@ let meth_src = map_new ();       // "cls#name" -> line, "f" ++ key -> file
 let stamp_meth_src = fn (key: str) ->
   let _ = map_set meth_src key (VInt (cur_line ())) in
   map_set meth_src ("f" ++ key) (mkstr (cur_file ()));
+// the definition site of one method is the definition site of another when
+// the second was made FROM the first (an alias, or a define_method given a
+// Method). The three lines that move it were written out at each `alias` site
+// separately; a rule written once per site is a rule with one answer per site.
+let copy_meth_src = fn (dst: str) -> fn (src: str) ->
+  if map_has meth_src src && map_has meth_src ("f" ++ src)
+  then (let _ = map_set meth_src dst (map_get meth_src src) in
+        map_set meth_src ("f" ++ dst) (map_get meth_src ("f" ++ src)))
+  else ();
+// a BLOCK's definition site is the call that takes it, so `stamp_meth_src` is
+// right for `define_method(:m) { }`. A PROC handed to define_method was
+// written somewhere else entirely and carries its own site -- the call that
+// installs it is not where it was defined.
+let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
+  if map_has proc_src pk && map_has proc_src ("f" ++ pk)
+  then (let _ = map_set meth_src key (map_get proc_src pk) in
+        map_set meth_src ("f" ++ key) (map_get proc_src ("f" ++ pk)))
+  else ();
 let store_proc = fn (k: str) -> fn entry ->
   let (_, _, _, penv) = entry in
   let _ = mark_captured penv in
@@ -2810,7 +2828,16 @@ let rec number_nls_go = fn (s: str) -> fn toks -> fn (off: int) -> fn (line: int
     let ln = line + nl_count_to s off o 0 in
     Cons (TNL ln, number_nls_go s r (if o > off then o else off) ln)
   | Cons (t, r) -> Cons (t, number_nls_go s r off line);
-let number_nls = fn (s: str) -> fn toks -> number_nls_go s toks 0 1;
+// `eval(code, binding, file, line)` says the code's FIRST line is `line`, so
+// every line in it is `line + k - 1` -- an OFFSET, not a constant. Numbering the
+// tokens from that base is the one place the offset belongs: SLine markers are
+// emitted by the generic statement-list parser at EVERY nesting depth, so
+// shifting them afterwards would mean walking the whole Stmt tree, and shifting
+// `cur_pos` at execution time would also shift the lines of code that the eval
+// merely CALLS. Numbering at the source makes `__LINE__`, a nested `def`'s
+// #source_location, and an error's reported line all absolute for free.
+let number_nls_at = fn (s: str) -> fn toks -> fn (base: int) -> number_nls_go s toks 0 base;
+let number_nls = fn (s: str) -> fn toks -> number_nls_at s toks 1;
 // the line a token sits on: the next newline mark in the stream ends its line
 let rec tok_line = fn toks ->
   match toks with
@@ -11720,6 +11747,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let _ = map_set meths key (Meth (drop_yblk_params ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
          let _ = map_set dm_methods key VNil in
          let _ = dm_store_closure key newblk in
+         let _ = stamp_meth_src key in
          // capture the block active here so a `yield` in the defined method
          // reaches it (Ruby's define_method closure semantics).
          let _ = (match blk with
@@ -17925,18 +17953,58 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let src = (match args with Cons (_, Cons (s, _)) -> s | _ -> VNil) in
        (match src with
         | VObj uid ->
-          if str_eq (map_get ocls0 (str_of_int uid)) "UnboundMethod" then
-            (let ucls = (match map_get ivars0 (str_of_int uid ++ "@__um_cls") with VStr h -> sget h | _ -> "") in
-             let unm = (match map_get ivars0 (str_of_int uid ++ "@__um_name") with VStr h -> sget h | _ -> "") in
-             let _ = if map_has meths0 (ucls ++ "#" ++ unm) then map_set meths0 (c ++ "#" ++ nm) (map_get meths0 (ucls ++ "#" ++ unm)) else () in
-             VSym nm)
-          else VSym nm
+          // an UnboundMethod and a bound Method name the same thing here -- a
+          // method that already exists somewhere else -- and only the pair of
+          // ivars they store it in differs. Handling one and not the other
+          // made `define_method :g, obj.method(:f)` silently define nothing.
+          (let ocl9 = map_get ocls0 (str_of_int uid) in
+           let (scls, snm) =
+             (if str_eq ocl9 "UnboundMethod" then
+                ((match map_get ivars0 (str_of_int uid ++ "@__um_cls") with VStr h -> sget h | _ -> ""),
+                 (match map_get ivars0 (str_of_int uid ++ "@__um_name") with VStr h -> sget h | _ -> ""))
+              else if str_eq ocl9 "Method" then
+                (let mo = (match map_get ivars0 (str_of_int uid ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
+                 let mn = (match map_get ivars0 (str_of_int uid ++ "@__m_name") with VStr h -> sget h | _ -> "") in
+                 // #owner is "" for a builtin; the receiver's class is then the
+                 // only place the definition could have come from.
+                 let mo = (if str_eq mo "" then (match map_get ivars0 (str_of_int uid ++ "@__m_recv") with r9 -> class_name r9) else mo) in
+                 (mo, mn))
+              else ("", "")) in
+           if str_eq snm "" then VSym nm
+           // ruby REFUSES a method that does not belong here: the class being
+           // defined on must be the owner or a subclass of it, or the body's
+           // `self` would be an object the method was never written for. Making
+           // the Method form work without this check would have widened a
+           // silent no-op into a silently WRONG method -- being wrong in the
+           // permissive direction is the worse of the two.
+           // ...and it is only a question when the owner is a CLASS. A MODULE's
+           // UnboundMethod binds to anything -- ruby has allowed that since 3.0,
+           // and `class BasicA < BasicObject; define_method(:respond_to?,
+           // ::Kernel.instance_method(:respond_to?)); end` (ruby/spec's own
+           // fixture) depends on it: BasicObject's chain has no Kernel in it.
+           // Asking "is the target below the owner" of a module refused 86 files
+           // in one group -- a new check taking out input that used to work.
+           else if (if str_eq scls "" then false
+                    else if map_has modules scls then false
+                    else if str_eq scls c then false
+                    else (if str_list_has (ancestors_of world c) scls then false else true))
+           then raise_exc world "TypeError" ("bind argument must be a subclass of " ++ scls)
+           else
+             (let sk = scls ++ "#" ++ snm in
+              let _ = if map_has meths0 sk then map_set meths0 (c ++ "#" ++ nm) (map_get meths0 sk) else () in
+              // the copy also carries WHERE the method was written and the
+              // scope it was written in -- both are properties of the original
+              // definition, not of the define_method call that re-installs it.
+              let _ = copy_meth_src (c ++ "#" ++ nm) sk in
+              let _ = if map_has meth_cref sk then map_set meth_cref (c ++ "#" ++ nm) (map_get meth_cref sk) else () in
+              VSym nm))
         | VProc pid ->
           (match proc_as_block pid with (h2, ps2, bb2, e2) ->
              let ps2 = (match ps2 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps2 | _ -> ps2) in
              let _ = map_set meths0 (c ++ "#" ++ nm) (Meth (ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
              let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
              let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
+             let _ = stamp_meth_src_proc (c ++ "#" ++ nm) (str_of_int pid) in
              VSym nm)
         | _ -> VSym nm))
     // instance_methods(false): the method names defined directly on this
@@ -18239,10 +18307,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     // ...and the original's DEFINITION SITE: #source_location
                     // answers where the method was written, which for an alias
                     // is where the method it names was written.
-                    let _ = if map_has meth_src (origin ++ "#" ++ n2)
-                            then (let _ = map_set meth_src (c ++ "#" ++ n1) (map_get meth_src (origin ++ "#" ++ n2)) in
-                                  map_set meth_src ("f" ++ c ++ "#" ++ n1) (map_get meth_src ("f" ++ origin ++ "#" ++ n2)))
-                            else () in
+                    let _ = copy_meth_src (c ++ "#" ++ n1) (origin ++ "#" ++ n2) in
                     let _ = if str_eq origin c then () else map_set alias_origin (c ++ "#" ++ n1) origin in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // A TOP-LEVEL method is stored under its bare name, with no
@@ -18253,10 +18318,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                  else if map_has methsA n2 then
                    (let _ = map_set methsA (c ++ "#" ++ n1) (map_get methsA n2) in
                     let _ = if map_has meth_cref n2 then map_set meth_cref (c ++ "#" ++ n1) (map_get meth_cref n2) else () in
-                    let _ = if map_has meth_src n2
-                            then (let _ = map_set meth_src (c ++ "#" ++ n1) (map_get meth_src n2) in
-                                  map_set meth_src ("f" ++ c ++ "#" ++ n1) (map_get meth_src ("f" ++ n2)))
-                            else () in
+                    let _ = copy_meth_src (c ++ "#" ++ n1) n2 in
                     let _ = map_set privates (c ++ "#" ++ n1) VNil in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // source is a builtin (no AST body) — remember it delegates to
@@ -20519,6 +20581,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                     (Meth (drop_yblk_params ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
           let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
           let _ = dm_store_closure (target ++ "#" ++ nm) (h2, ps2, bb2, e2) in
+          let _ = stamp_meth_src (target ++ "#" ++ nm) in
           VSym nm))
     else if str_eq name "define_method" && (match recv with VClass _ -> true | _ -> false) then
       (match recv with
@@ -20534,6 +20597,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                    (Meth (drop_yblk_params ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
+         let _ = stamp_meth_src (c ++ "#" ++ nm) in
          VSym nm
        | _ -> VNil)
     // ENV.fetch / ENV.delete with a block: the block supplies the value for
@@ -22943,7 +23007,13 @@ and is_prim_method = fn (name: str) ->
   str_eq name "tap" || str_eq name "is_a?" || str_eq name "kind_of?" ||
   str_eq name "instance_of?" || str_eq name "respond_to?" || str_eq name "send" ||
   str_eq name "__send__" || str_eq name "public_send" || str_eq name "hash" ||
-  str_eq name "object_id" || str_eq name "==" || str_eq name "!=" || str_eq name "equal?" ||
+  // BasicObject's two underscore names are the SAME methods as object_id and
+  // send, and the primitive already answered both -- but only `__send__` was
+  // claimed here, so the working `__id__` arm was unreachable: the dispatcher
+  // refused the name before the primitive ever saw it. A list that governs
+  // whether a name exists hides an implementation it forgot to mention.
+  str_eq name "object_id" || str_eq name "__id__" ||
+  str_eq name "==" || str_eq name "!=" || str_eq name "equal?" ||
   // Object#!~ is defined for every object; Object#=~ was REMOVED in ruby 3.2,
   // so it stays per-type (String, Symbol, Regexp define their own).
   str_eq name "eql?" || str_eq name "!~" ||
@@ -34512,10 +34582,7 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   let _ = if map_has meths (cls ++ "#" ++ n2) then
             (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
              // an alias keeps the original's lexical scope (see alias_method)
-             let _ = (if map_has meth_src (cls ++ "#" ++ n2)
-                      then (let _ = map_set meth_src (cls ++ "#" ++ n1) (map_get meth_src (cls ++ "#" ++ n2)) in
-                            map_set meth_src ("f" ++ cls ++ "#" ++ n1) (map_get meth_src ("f" ++ cls ++ "#" ++ n2)))
-                      else ()) in
+             let _ = copy_meth_src (cls ++ "#" ++ n1) (cls ++ "#" ++ n2) in
              if map_has meth_cref (cls ++ "#" ++ n2)
              then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (cls ++ "#" ++ n2)) else ())
           // the source is a BUILTIN (no AST body): record that the new name
@@ -34831,6 +34898,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                     | Cons (ESym nm, _) ->
                       (let _ = map_set meths (cls ++ "#" ++ nm) (Meth (bp, block_defaults bb, drop_defaults_prologue bb)) in
                        let _ = map_set dm_methods (cls ++ "#" ++ nm) VNil in
+                       let _ = stamp_meth_src (cls ++ "#" ++ nm) in
                        // the block is a CLOSURE: the class body it was written
                        // in may itself be inside a method (`Class.new do
                        // define_method(:n) { n } end`), and those locals are
@@ -36216,8 +36284,9 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let cod = src_coding code in
     let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then str_upcase codelbl else cod)) in
     let _ = set_parsing_eval code in
+    let ebase9 = (if eline9 > 0 then eline9 else 1) in
     let prog2 = try_or (fn (u: unit) ->
-      let toks = number_nls code (lex_go code 0) in
+      let toks = number_nls_at code (lex_go code 0) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
       let (p2, _) = parse_stmts toks Nil in
       let _ = rx_check_pending () in p2) sentinel in
