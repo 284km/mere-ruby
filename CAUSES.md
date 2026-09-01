@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 315 files.
+Classified: 314 files.
 
 ## CRASH — 17 files, 10 kinds
 
@@ -46,11 +46,11 @@ Classified: 315 files.
 
 </details>
 
-## DIFF — 298 files, 94 kinds
+## DIFF — 297 files, 94 kinds
 
 | files | kind |
 |---|---|
-| 48 | `ERROR NoMethodError` |
+| 47 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
@@ -209,8 +209,8 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
-| proc (3) | `binding new source_location` |
 | integer (3) | `ceildiv div try_convert` |
+| proc (2) | `binding new` |
 | numeric (2) | `integer real` |
 | language (2) | `alias module` |
 | threadgroup (1) | `list` |

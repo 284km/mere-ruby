@@ -17641,7 +17641,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with
           | Cons (VStr ph, rest) ->
             (let p1 = sget ph in
-             let base = (match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") in
+             let base0 = (match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") in
+             // ...and a RELATIVE base is expanded first: `File.realpath(p, ".")`
+             // answered a relative path, and realpath's answer is absolute.
+             let base = (if str_len base0 > 0 && str_eq (char_at base0 0) "/" then base0
+                         else env_get "PWD" ++ "/" ++ base0) in
              let abs = (if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else base ++ "/" ++ p1) in
              let full = path_norm abs in
              if file_exists full then mkstr full
@@ -18232,6 +18236,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     let _ = if map_has meth_cref (origin ++ "#" ++ n2)
                             then map_set meth_cref (c ++ "#" ++ n1) (map_get meth_cref (origin ++ "#" ++ n2))
                             else () in
+                    // ...and the original's DEFINITION SITE: #source_location
+                    // answers where the method was written, which for an alias
+                    // is where the method it names was written.
+                    let _ = if map_has meth_src (origin ++ "#" ++ n2)
+                            then (let _ = map_set meth_src (c ++ "#" ++ n1) (map_get meth_src (origin ++ "#" ++ n2)) in
+                                  map_set meth_src ("f" ++ c ++ "#" ++ n1) (map_get meth_src ("f" ++ origin ++ "#" ++ n2)))
+                            else () in
                     let _ = if str_eq origin c then () else map_set alias_origin (c ++ "#" ++ n1) origin in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // A TOP-LEVEL method is stored under its bare name, with no
@@ -18242,6 +18253,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                  else if map_has methsA n2 then
                    (let _ = map_set methsA (c ++ "#" ++ n1) (map_get methsA n2) in
                     let _ = if map_has meth_cref n2 then map_set meth_cref (c ++ "#" ++ n1) (map_get meth_cref n2) else () in
+                    let _ = if map_has meth_src n2
+                            then (let _ = map_set meth_src (c ++ "#" ++ n1) (map_get meth_src n2) in
+                                  map_set meth_src ("f" ++ c ++ "#" ++ n1) (map_get meth_src ("f" ++ n2)))
+                            else () in
                     let _ = map_set privates (c ++ "#" ++ n1) VNil in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // source is a builtin (no AST body) — remember it delegates to
@@ -18750,10 +18765,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // the forwarder's own `*__a` would say -1 and "not a lambda".
           let _ = map_set proc_arity (str_of_int pid) (VInt (bm_arity world mown mnm)) in
           let _ = map_set lambda_ids (str_of_int pid) VNil in
-          // the forwarder is not where the METHOD was written, and answering
-          // the forwarder's own line would be a wrong location rather than a
-          // missing one.
-          let _ = map_set proc_src ("f" ++ str_of_int pid) (mkstr "") in
+          // the forwarder is not where the method was written, so the proc
+          // reports the METHOD's own location -- ruby's Method#to_proc answers
+          // exactly what the Method answers, and the forwarder's line would be
+          // a wrong location rather than a missing one.
+          let _ = (match meth_source_location world mown mnm mrecv with
+                   | VArr a8 -> (match deref a8 with
+                                 | Cons (f8, Cons (l8, _)) ->
+                                   (let _ = map_set proc_src ("f" ++ str_of_int pid) f8 in
+                                    map_set proc_src (str_of_int pid) l8)
+                                 | _ -> map_set proc_src ("f" ++ str_of_int pid) (mkstr ""))
+                   | _ -> map_set proc_src ("f" ++ str_of_int pid) (mkstr "")) in
           VProc pid)
        else if str_eq name "inspect" || str_eq name "to_s" then
          mkstr ("#<Method: " ++ (if str_eq mown "" then class_name mrecv else mown) ++ "#" ++ mnm ++ ">")
@@ -34490,6 +34512,10 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   let _ = if map_has meths (cls ++ "#" ++ n2) then
             (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
              // an alias keeps the original's lexical scope (see alias_method)
+             let _ = (if map_has meth_src (cls ++ "#" ++ n2)
+                      then (let _ = map_set meth_src (cls ++ "#" ++ n1) (map_get meth_src (cls ++ "#" ++ n2)) in
+                            map_set meth_src ("f" ++ cls ++ "#" ++ n1) (map_get meth_src ("f" ++ cls ++ "#" ++ n2)))
+                      else ()) in
              if map_has meth_cref (cls ++ "#" ++ n2)
              then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (cls ++ "#" ++ n2)) else ())
           // the source is a BUILTIN (no AST body): record that the new name
@@ -36167,7 +36193,17 @@ and direct_invalid_flow = fn (body: Stmt list) ->
 // parse-time SyntaxError equivalent.
 // Kernel#eval("code"[, binding]): parse and run, mapping parse failures to a
 // catchable SyntaxError. Shared by the `eval(...)` call and `send(:eval,...)`.
+// `eval(code, binding, file, line)`: the third and fourth arguments SAY where
+// the code is to be considered written, and everything that reports a position
+// -- __FILE__, __LINE__, a proc's #source_location -- has to answer with them.
+// They were ignored, so an eval'd proc reported the first sixty characters of
+// its own source as the file name.
 and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
+  let (efile9, eline9) =
+    (match args with
+     | Cons (_, Cons (_, Cons (VStr f9, r9))) ->
+       (sget f9, (match r9 with Cons (VInt l9, _) -> l9 | _ -> 1))
+     | _ -> ("", 0)) in
   match args with
   | Cons (VStr code, rest) ->
     let codelbl = senc_get code in
@@ -36202,14 +36238,37 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           raise_exc world "SyntaxError" msg)
        else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
-       else eval_run eenv world blk prog2
+       else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
        if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
        else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
        else if numbered_misuse_stmts prog2 then raise_exc world "SyntaxError" "invalid numbered parameter"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
-       else eval_run eenv world blk prog2)
+       else eval_run_at eenv world blk prog2 efile9 eline9)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: eval expects a string")) in fail "mere-ruby: eval expects a string")
+
+// run an eval'd program with the position it was TOLD it has, restoring the
+// caller's afterwards (an eval inside an eval must not keep the inner one's).
+and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (efile: str) -> fn (eline: int) ->
+  if str_eq efile "" then eval_run env world blk prog2
+  else
+    // the parsed program carries an SFile naming the eval'd SOURCE, which
+    // would overwrite the file the caller named the moment it runs.
+    (let prog2 = drop_file_marks prog2 in
+     let of9 = (if map_has cur_pos_s "f" then map_get cur_pos_s "f" else "") in
+     let ol9 = (if map_has cur_pos "l" then map_get cur_pos "l" else VInt 0) in
+     let _ = map_set cur_pos_s "f" efile in
+     let _ = map_set cur_pos "l" (VInt eline) in
+     let r9 = eval_run env world blk prog2 in
+     let _ = map_set cur_pos_s "f" of9 in
+     let _ = map_set cur_pos "l" ol9 in
+     r9)
+
+and drop_file_marks = fn (xs: Stmt list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (SFile _, t) -> drop_file_marks t
+  | Cons (h, t) -> Cons (h, drop_file_marks t)
 
 and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   // Ruby hoists an eval'd string's local-variable assignments at parse time,
