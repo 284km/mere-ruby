@@ -37,7 +37,14 @@ rc=0
 # `/Users/` and `/home/` catch a home path even when $HOME is spelled some other
 # way (a different user, a symlink, a sudo run): the masking cannot rely on the
 # variable it happened to run with.
-for pat in '/Users/' '/home/' 'SSH_AUTH_SOCK' 'SECURITYSESSIONID' 'XPC_SERVICE_NAME' \
+# `/var/folders/` is macOS's per-user tmpdir. It is on this list for two
+# reasons at once: it names the machine, and the name inside it changes on every
+# run, so a record carrying one differs from itself and can no longer show that
+# something REAL moved. It sat unmasked in bootstraptest/ERRORS.txt while this
+# check read that very file and reported it clean -- the detector only ever
+# catches the leaks someone thought of.
+for pat in '/Users/' '/home/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SOCK' \
+           'SECURITYSESSIONID' 'XPC_SERVICE_NAME' \
            'CLAUDE_CODE_SESSION_ID' 'LaunchInstanceID' '__CF_USER_TEXT_ENCODING' \
            'VSCODE_IPC_HOOK' 'GVM_PATH_BACKUP' 'LD_LIBRARY_PATH' 'SSH_AGENT_PID'; do
   hits=$(grep -al -- "$pat" $files 2>/dev/null)

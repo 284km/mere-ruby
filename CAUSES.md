@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 314 files.
+Classified: 313 files.
 
 ## CRASH — 17 files, 10 kinds
 
@@ -46,19 +46,19 @@ Classified: 314 files.
 
 </details>
 
-## DIFF — 297 files, 94 kinds
+## DIFF — 296 files, 94 kinds
 
 | files | kind |
 |---|---|
-| 47 | `ERROR NoMethodError` |
+| 45 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
 | 12 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected to be identical` |
 | 10 | `FAILED expected TypeError to be raised` |
+| 9 | `pass=N fail=N err=N` |
 | 9 | `FAILED expected true, got false` |
-| 8 | `pass=N fail=N err=N` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 7 | `FAILED expected truthy from #include?` |
@@ -177,6 +177,7 @@ Classified: 314 files.
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=5 fail=0 err=0` |
 | 1 | `pass=4 fail=2 err=7` |
+| 1 | `pass=16 fail=0 err=0` |
 | 1 | `pass=157 fail=0 err=0` |
 | 1 | `pass=110 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
@@ -188,7 +189,6 @@ Classified: 314 files.
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
-| 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 
 </details>
 
@@ -202,13 +202,13 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
-| method (8) | `case_compare clone compose curry element_reference source_location super_method to_proc` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
+| method (7) | `case_compare clone compose curry element_reference super_method to_proc` |
 | kernel (7) | `__method__ binding lambda loop method select test` |
 | struct (6) | `deconstruct element_reference element_set filter keyword_init new` |
 | symbol (5) | `all_symbols intern match name slice` |
-| unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
+| unboundmethod (3) | `bind_call clone super_method` |
 | integer (3) | `ceildiv div try_convert` |
 | proc (2) | `binding new` |
 | numeric (2) | `integer real` |

@@ -65,8 +65,16 @@ for rb in "$dir"/*/p*.rb; do
   # last line of stderr, minus the parts that differ between two reports of
   # the same cause -- the path and the line number. The NAME inside the quotes
   # is kept: "undefined method" is not a cause, "undefined method 'itself'" is.
+  # ...and the process-specific temp name, which is neither. The reference
+  # ruby's own scratch file is `ruby-btest-<pid>-<random>`, so two of these
+  # lines were a DIFFERENT string on every regeneration -- a checked-in record
+  # that cannot be compared with itself, and therefore cannot detect a real
+  # change either. mspec/scoreboard.sh's strip_noise masks the same path for the
+  # same reason; this harness writes records too and did not.
   norm=$(printf '%s' "$msg" | tail -1 \
     | sed "s#$dir/[^ :]*##g" \
+    | sed 's#/var/folders/[^ ]*#TMPDIR#g' \
+    | sed 's#/tmp/ruby-btest-[^ ]*#TMPDIR#g' \
     | sed 's/near line [0-9]*//' \
     | sed 's/  */ /g')
   [ -z "$norm" ] && norm="(no message, exit $code)"
