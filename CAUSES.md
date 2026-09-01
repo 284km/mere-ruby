@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 316 files.
+Classified: 315 files.
 
 ## CRASH — 18 files, 11 kinds
 
@@ -48,7 +48,7 @@ Classified: 316 files.
 
 </details>
 
-## DIFF — 298 files, 93 kinds
+## DIFF — 297 files, 94 kinds
 
 | files | kind |
 |---|---|
@@ -76,7 +76,6 @@ Classified: 316 files.
 | 3 | `FAILED expected RangeError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected :SYM, got :SYM` |
-| 3 | `FAILED expected "S" to match` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED expected not to be identical` |
@@ -86,7 +85,7 @@ Classified: 316 files.
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected :SYM, got nil` |
-| 2 | `FAILED expected #<OBJ>, got nil` |
+| 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
@@ -109,7 +108,7 @@ Classified: 316 files.
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected true, got "S"` |
-| 1 | `FAILED expected nil, got #<OBJ>` |
+| 1 | `FAILED expected nil, got #<Proc:NxADDR TMPDIR` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
 | 1 | `FAILED expected [], got nil` |
@@ -135,6 +134,8 @@ Classified: 316 files.
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
+| 1 | `FAILED expected #<Proc:NxADDR TMPDIR got nil` |
+| 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
