@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 318 files.
+Classified: 316 files.
 
 ## CRASH — 18 files, 11 kinds
 
@@ -48,17 +48,17 @@ Classified: 318 files.
 
 </details>
 
-## DIFF — 300 files, 93 kinds
+## DIFF — 298 files, 93 kinds
 
 | files | kind |
 |---|---|
-| 48 | `ERROR NoMethodError` |
+| 47 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 17 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
 | 12 | `FAILED expected ArgumentError to be raised` |
-| 11 | `FAILED expected TypeError to be raised` |
 | 10 | `FAILED expected to be identical` |
+| 10 | `FAILED expected TypeError to be raised` |
 | 9 | `FAILED expected true, got false` |
 | 8 | `pass=N fail=N err=N` |
 | 8 | `FAILED expected false, got true` |
@@ -151,7 +151,7 @@ Classified: 318 files.
 | files | cause |
 |---|---|
 | 12 | `FAILED: expected ArgumentError to be raised` |
-| 11 | `FAILED: expected TypeError to be raised` |
+| 10 | `FAILED: expected TypeError to be raised` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
@@ -210,8 +210,8 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | unboundmethod (4) | `bind_call clone source_location super_method` |
 | rational (4) | `divide minus multiply plus` |
-| proc (3) | `binding new ruby2_keywords` |
 | integer (3) | `ceildiv div try_convert` |
+| proc (2) | `binding new` |
 | numeric (2) | `integer real` |
 | language (2) | `alias module` |
 | threadgroup (1) | `list` |
