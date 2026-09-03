@@ -21,6 +21,10 @@ case "$errno_out" in
              echo "an Errno class has no strerror text -- see errno_desc in main.mere"
              exit 1;;
 esac
+# A second self-check: every global map that holds object handles is a GC root
+# (or is named, with its reason, in tools/gc_roots_allow.txt). The table that
+# was missing from the roots on 2026-09-03 cost `require "bundler"` two weeks.
+./tools/gc_roots_check.sh > /dev/null || { ./tools/gc_roots_check.sh | grep -v " root$"; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a

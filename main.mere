@@ -466,17 +466,38 @@ let enc_is_dummy = fn (nm: str) ->
 // the canonical frozen string for this content + encoding: the FIRST frozen
 // holder registers itself (a dynamic string that interns becomes canonical),
 // later callers get that same object back.
+// MERE_RUBY_INTERN_LOG=1: one stderr line per intern-table hit and
+// registration, with the id and the CURRENT length of the canonical's
+// content -- a hit whose content length differs from the key's is a
+// canonical whose text was overwritten under it (the bundler `Illformed
+// requirement [""]` of 2026-09-03 was found through this line).
+let intern_log = map_new () in        // "on" -> 1, set by the driver from MERE_RUBY_INTERN_LOG
+let intern_log_on = fn (u: unit) -> map_has intern_log "on" in
 let str_fstring = fn (v: Val) ->
   match v with
   | VStr h ->
     (let k = senc_get h ++ chr 1 ++ sget h in
-     if map_has str_intern_tbl k then map_get str_intern_tbl k
+     if map_has str_intern_tbl k then
+       (let hit = map_get str_intern_tbl k in
+        let _ = (if intern_log_on () then
+                   (match hit with
+                    | VStr hid -> print_err ("intern: hit \"" ++ sget h ++ "\" -> id " ++ str_of_int hid
+                                             ++ " content now \"" ++ sget hid ++ "\"")
+                    | _ -> ())
+                 else ()) in
+        hit)
      else
        let cv = (if sfrozen_get h then v
                  else (let c = mkstr (sget h) in
                        (match c with
                         | VStr id -> (let _ = senc_set id (senc_get h) in let _ = sfrozen_set id in c)
                         | _ -> c))) in
+       let _ = (if intern_log_on () then
+                  (match cv with
+                   | VStr cid -> print_err ("intern: new \"" ++ sget h ++ "\" -> id " ++ str_of_int cid
+                                            ++ (if sfrozen_get h then " (holder id " ++ str_of_int h ++ " was frozen)" else " (copy)"))
+                   | _ -> ())
+                else ()) in
        let _ = map_set str_intern_tbl k cv in cv)
   | _ -> v;
 let enc_ascii_compat = fn (nm: str) ->
@@ -755,10 +776,53 @@ let frame_pool_put = fn f ->
               else vec_push frame_pool f) in
      map_set frame_pool_n "n" (n + 1));
 
+// A BLOCK's env comes from the same pool. It used to be `lv_child cenv`: a
+// fresh Map in the default region plus a permanent lv_up entry, per
+// invocation, never given back -- so `n.times { }` cost ~450-870 B more per
+// iteration than the same loop written as `while`, for the life of the
+// process, while a method call had been taking its frame from the pool since
+// v0.1.300. Measured before/after in bench/block_env.sh. The lv_up entry
+// leaves with the env: the pool IS the on-stack registry that pruning lv_up
+// was waiting for (a frame is put back only once it is off the stack).
+//
+// An env a proc/lambda/Thread body captured is left alone, lv_up entry
+// included -- mark_captured painted it and every parent on its chain at the
+// choke point (store_proc / store_yblk), and the closure reads and writes
+// through that chain later. `for` blocks never come here: they run in the
+// enclosing env directly.
+let blk_env_get = fn parent ->
+  let e = frame_pool_get () in
+  let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
+  let _ = map_set lv_ctr "n" (n + 1) in
+  let _ = map_set e "__eid" (VInt n) in
+  let _ = map_set lv_up (str_of_int n) parent in
+  e;
+let blk_env_put = fn e ->
+  if map_has e "__captured" then pool_ctr "blk_kept"
+  else
+    (let _ = (if map_has e "__eid" then
+                (match map_get e "__eid" with
+                 | VInt n -> map_delete lv_up (str_of_int n)
+                 | _ -> ())
+              else ()) in
+     let _ = pool_ctr "blk_puts" in
+     frame_pool_put e);
+
+// Per-statement / per-call bookkeeping. These used to be str -> Val maps, and
+// every write of an existing key copies the new value into the map's arena --
+// a fresh VInt box per statement executed, per call made, orphaning the last
+// one -- into the default region, which nothing gives back: 260 MB of a 400k-
+// iteration loop's 302 MB default growth was eleven such maps (attributed by
+// bench/def_maps.sh, 2026-09-03). An int value is stored by value: the
+// overwrite allocates nothing. The str -> str ones (cur_pos_s, call_*_s) go
+// through map_set_s below, which writes only when the text changes -- in a
+// loop it is the same method at the same depth in the same file every time.
 let cur_pos = map_new ();
 let cur_pos_s = map_new ();
+let map_set_s = fn m -> fn (k: str) -> fn (v: str) ->
+  if map_has m k && str_eq (map_get m k) v then () else map_set m k v;
 let cur_line = fn () ->
-  if map_has cur_pos "l" then (match map_get cur_pos "l" with VInt n -> n | _ -> 0) else 0;
+  if map_has cur_pos "l" then map_get cur_pos "l" else 0;
 let cur_file = fn () ->
   if map_has cur_pos_s "f" then map_get cur_pos_s "f" else "";
 // where the proc was WRITTEN, for #source_location and #to_s. Stamped here
@@ -839,20 +903,20 @@ let struct_ctr = map_new ();
 // kept, which the generated #members method cannot be asked for cheaply.
 let struct_mem = map_new ();
 let fresh_anon = fn (prefix: str) ->
-  let n = (if map_has struct_ctr "n" then (match map_get struct_ctr "n" with VInt k -> k | _ -> 0) else 0) in
-  let _ = map_set struct_ctr "n" (VInt (n + 1)) in
+  let n = (if map_has struct_ctr "n" then map_get struct_ctr "n" else 0) in
+  let _ = map_set struct_ctr "n" (n + 1) in
   prefix ++ str_of_int n;
 // break-through-yield home tracking: each method invocation gets a unique
 // frame id; a block captured by a `&blk` param remembers the frame it was
 // passed to (its "home"), so a `break` inside it — even after the block has
 // been delegated down through other methods — unwinds to that home method.
 let next_fid = fn () ->
-  let n = (if map_has struct_ctr "f" then (match map_get struct_ctr "f" with VInt k -> k | _ -> 0) else 0) in
-  let _ = map_set struct_ctr "f" (VInt (n + 1)) in
+  let n = (if map_has struct_ctr "f" then map_get struct_ctr "f" else 0) in
+  let _ = map_set struct_ctr "f" (n + 1) in
   n + 1;
 let proc_home = map_new ();     // str(proc id) -> VInt home-frame-id
 let pending_home = map_new ();  // single slot: home fid of a &proc being passed as a block
-let live_frames = map_new ();   // str(fid) -> VBool true while that method frame is on the stack
+let live_frames = map_new ();   // str(fid) -> 1 while that method frame is on the stack
 // the counter in an internal anonymous name ("AnonClass_7" -> 7), used as the
 // address Ruby shows. Stable for the life of the program, like an object id.
 let is_anon_cls = fn (c: str) ->
@@ -953,6 +1017,12 @@ let dfl_tg = map_new ();
 // unwinds via fail with the kind and value parked here; loop/method/block
 // runners catch and convert back into a Flow.
 let flow_sig = map_new ();
+// run_block's "did the body finish without raising" flag. It lived in flow_sig
+// as a VBool, written twice per block invocation -- two orphaned boxes in the
+// default region each time (34 MB of a 400k-iteration loop). An int, saved and
+// restored around the body instead of deleted, so nesting still works and no
+// key is ever re-inserted: the outer's 0 survives an inner block's 1.
+let blk_ok = map_new ();
 
 // Blocks registered with Kernel#at_exit, keyed by the order they were given:
 // they run in the REVERSE of it, after the program (and after an uncaught
@@ -1830,6 +1900,17 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
            else Cons (TStrL (chr d1), lex_go s (i + 4)))
         else if str_eq e "u" && i + 6 < str_len s then
           (let cp = hex4 s (i + 3) in Cons (TStrL (utf8_of cp), lex_go s (i + 7)))
+        // `?\C-z` / `?\cz` (control: low five bits, `?` -> DEL), `?\M-z` (meta:
+        // high bit set), and `?\M-\C-z` (both).
+        else if str_eq e "M" && i + 4 < str_len s && str_eq (char_at s (i + 3)) "-" then
+          (if str_eq (char_at s (i + 4)) "\\" && i + 7 < str_len s
+              && str_eq (char_at s (i + 5)) "C" && str_eq (char_at s (i + 6)) "-" then
+             Cons (TStrL (chr (ctrl_code (char_at s (i + 7)) + 128)), lex_go s (i + 8))
+           else Cons (TStrL (chr ((ord (char_at s (i + 4)) - (ord (char_at s (i + 4)) / 128) * 128) + 128)), lex_go s (i + 5)))
+        else if str_eq e "C" && i + 4 < str_len s && str_eq (char_at s (i + 3)) "-" then
+          Cons (TStrL (chr (ctrl_code (char_at s (i + 4)))), lex_go s (i + 5))
+        else if str_eq e "c" && i + 3 < str_len s then
+          Cons (TStrL (chr (ctrl_code (char_at s (i + 3)))), lex_go s (i + 4))
         else
         let ch = if str_eq e "n" then "\n" else if str_eq e "t" then "\t"
                  else if str_eq e "r" then chr 13 else if str_eq e "s" then " "
@@ -1849,6 +1930,13 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       Cons (TStrL lit, lex_go s j)
     // `cmd` — a command literal: a call to the ` method with the interpolated
     // string (Kernel#` is a stub; specs override it via define_method(:`)).
+    // `Kernel.`(cmd)` and `def `(cmd)`: after a dot or `def` the backtick is
+    // the METHOD NAME, not the opening of a command literal. The spec that
+    // uses the first form also carries a backtick in a trailing comment to
+    // rebalance an editor's highlighting -- which this lexer read as a second
+    // command string running to the end of the file.
+    else if str_eq c "`" && (prev_nonspace_is s i "." || prev_word_is s i "def") then
+      Cons (TId "`", lex_go s (i + 1))
     else if str_eq c "`" then
       let (segs, j) = lex_dstr_t "`" s (i + 1) "" in
       Cons (TId "`", Cons (TP "(",
@@ -2164,6 +2252,20 @@ and lex_dstr_t = fn (term: str) -> fn (s: str) -> fn (i: int) -> fn (lit: str) -
                   else if str_eq e "0" then chr 0 else if str_eq e "s" then " "
                   else e in
       lex_dstr_t term s (i + 2) (lit ++ piece)
+    // `"#@ivar"` / `"#@@cvar"` / `"#$gvar"`: interpolation without the braces.
+    // Only when a variable name follows -- `"#@"` and `"# $"` stay literal.
+    else if str_eq c "#" && i + 2 < str_len s
+            && (str_eq (char_at s (i + 1)) "@" || str_eq (char_at s (i + 1)) "$")
+            && (let k = (if str_eq (char_at s (i + 1)) "@" && str_eq (char_at s (i + 2)) "@" then i + 3 else i + 2) in
+                k < str_len s && (is_alpha (char_at s k) || str_eq (char_at s k) "_")) then
+      let k = (if str_eq (char_at s (i + 1)) "@" && str_eq (char_at s (i + 2)) "@" then i + 3 else i + 2) in
+      let close = scan_ident s k in
+      let exprtoks = drop_eof (lex_go (substring s (i + 1) close) 0) in
+      let interp =
+        Cons (TP "+", Cons (TP "(",
+          tapp exprtoks (Cons (TP ")", Cons (TP ".", Cons (TId "__interp_str", Nil)))))) in
+      let (rest, j) = lex_dstr_t term s close "" in
+      (Cons (TP "+", Cons (TStrL lit, tapp interp rest)), j)
     else if str_eq c "#" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\{" then
       let close = find_close_brace s (i + 2) 0 in
       let exprtoks = drop_eof (lex_go (substring s (i + 2) close) 0) in
@@ -2208,6 +2310,32 @@ and percent_body = fn (s: str) -> fn (i: int) ->
              str_eq c1 "W" || str_eq c1 "I" || str_eq c1 "r" || str_eq c1 "x")
             && i + 2 < str_len s && is_pct_delim (char_at s (i + 2)) then i + 3
     else 0 - 1
+
+// the control-character code for `\C-x`: the low five bits, except that
+// `\C-?` is DEL.
+and ctrl_code = fn (x: str) ->
+  if str_eq x "?" then 127 else (let o = ord x in o - (o / 32) * 32)
+
+// the last non-blank character before position i is `ch`
+and prev_nonspace_is = fn (s: str) -> fn (i: int) -> fn (ch: str) ->
+  let rec back = fn (j: int) ->
+    if j < 0 then false
+    else let c = char_at s j in
+         if str_eq c " " || str_eq c "\t" then back (j - 1)
+         else str_eq c ch in
+  back (i - 1)
+// the word ending just before position i (blanks allowed between) is `w`,
+// and is not the tail of a longer identifier
+and prev_word_is = fn (s: str) -> fn (i: int) -> fn (w: str) ->
+  let rec back = fn (j: int) ->
+    if j < 0 then false
+    else let c = char_at s j in
+         if str_eq c " " || str_eq c "\t" then back (j - 1)
+         else
+           let n = str_len w in
+           j + 1 >= n && str_eq (substring s (j + 1 - n) (j + 1)) w
+           && (j + 1 - n == 0 || (if is_alnum (char_at s (j - n)) || str_eq (char_at s (j - n)) "_" then false else true)) in
+  back (i - 1)
 
 // a percent-literal delimiter: any non-alphanumeric, non-space char.
 and is_pct_delim = fn (c: str) ->
@@ -2265,7 +2393,21 @@ and scan_balanced2 = fn (s: str) -> fn (i: int) -> fn (depth: int) -> fn (acc: s
       scan_balanced2 s (i + 1) (depth + 1) (acc ++ c) op clo
     else if str_eq c clo then
       (if depth == 1 then (acc, i + 1) else scan_balanced2 s (i + 1) (depth - 1) (acc ++ c) op clo)
+    // an interpolation is copied through whole: its text may contain the
+    // delimiter (`%@hey #{@ip}@` -- the `@` of the ivar is not the closer).
+    else if str_eq c "#" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "\{" then
+      let j = skip_interp_body s (i + 2) 1 in
+      scan_balanced2 s j depth (acc ++ substring s i j) op clo
     else scan_balanced2 s (i + 1) depth (acc ++ c) op clo
+
+// index just past the `}` that closes an interpolation whose `#{` has been
+// consumed; braces inside nest.
+and skip_interp_body = fn (s: str) -> fn (i: int) -> fn (depth: int) ->
+  if i >= str_len s then i
+  else let c = char_at s i in
+       if str_eq c "\{" then skip_interp_body s (i + 1) (depth + 1)
+       else if str_eq c "}" then (if depth == 1 then i + 1 else skip_interp_body s (i + 1) (depth - 1))
+       else skip_interp_body s (i + 1) depth
 
 // %w body -> `"w1", "w2", ... ]` token run (the caller emits the `[`).
 // A backslash escapes the next character into the word (b\ c, b\<nl>c).
@@ -2616,7 +2758,8 @@ and regex_position = fn (s: str) -> fn (i: int) ->
     let c = char_at s p in
     if str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
        str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n" || str_eq c ";" ||
-       str_eq c "<" || str_eq c "[" || str_eq c "\{" ||
+       // `=> /re/` in a hash literal, `x > /re/`: ruby reads a regex after `>` too
+       str_eq c "<" || str_eq c ">" || str_eq c "[" || str_eq c "\{" ||
        // ternary branches: `c ? /re/ : /re/` — a `/` after `?` or `:` starts a regex.
        str_eq c "?" || str_eq c ":" ||
        // a range bound: `(//..//)` is a Range of two empty regexes, which is
@@ -7865,6 +8008,17 @@ let flt_floor_mod = fn (x: float) -> fn (y: float) ->
   let fq = (let t = int_of_float q in if float_of_int t > q then float_of_int (t - 1) else float_of_int t) in
   x - y * fq;
 
+// A shift whose COUNT is a bignum. Shifting away by that much leaves nothing
+// of the receiver but its sign (0, or -1 for a negative one); shifting toward
+// it cannot be represented and is a RangeError, as in ruby. `left` says which
+// operator asked, so that `x << -big` and `x >> big` are the same question.
+let shift_by_big = fn (va: Val) -> fn (y: str) -> fn (left: bool) ->
+  let neg_count = str_eq (char_at y 0) "-" in
+  let away = (if left then neg_count else (if neg_count then false else true)) in
+  let recv_neg = (match va with VInt x -> x < 0 | VBig bs -> str_eq (char_at bs 0) "-" | _ -> false) in
+  if away then (if recv_neg then VInt (0 - 1) else VInt 0)
+  else prim_raise "RangeError" "shift width too big";
+
 let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   // Rational operand: +,-,*,/ produce a Rational (or Float if a Float is
   // involved). Checked first so int/rat mixing works uniformly.
@@ -8006,10 +8160,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
           if y < 0 then shr_big va (0 - y)
           else if shl_int_fits x y then VInt (shl_int x y)
           else shl_big va y
+        | VBig y -> shift_by_big va y true
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
      | VBig _ ->
        (match vb with
         | VInt y -> if y < 0 then shr_big va (0 - y) else shl_big va y
+        | VBig y -> shift_by_big va y true
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
   else if str_eq op ">>" then
@@ -8017,10 +8173,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | VInt x ->
        (match vb with
         | VInt y -> if y < 0 then shl_big va (0 - y) else VInt (shr_int x y)
+        | VBig y -> shift_by_big va y false
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
      | VBig _ ->
        (match vb with
         | VInt y -> if y < 0 then shl_big va (0 - y) else shr_big va y
+        | VBig y -> shift_by_big va y false
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
   else (let __fm = ("mere-ruby: unknown operator: " ++ op) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
@@ -10698,9 +10856,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter all_thr mk in
   let _ = map_iter at_exits mk in
   let _ = map_iter autoloads mk in
-  let _ = map_iter call_lines mk in
   let _ = map_iter catch_depth mk in
-  let _ = map_iter cur_pos mk in
   let _ = map_iter cur_thr mk in
   let _ = map_iter cvars mk in
   let _ = map_iter deco_memo mk in
@@ -10720,7 +10876,26 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter kwarg_marks mk in
   let _ = map_iter lambda_ids mk in
   let _ = map_iter le_path mk in
-  let _ = map_iter live_frames mk in
+  // The interned frozen strings (`"lit".freeze`, `-str`): canonical by
+  // content, handed out again and again, and referenced from nowhere else
+  // between two uses. Unrooted, a collection during a `require` blanked them
+  // (blank_s below empties every id not marked live) and rebuilt str_frozen
+  // without them -- so the NEXT `">= 3.0.1".freeze` returned an empty,
+  // unfrozen string, which is how `require "bundler"` came to raise
+  // `Illformed requirement [""]` (2026-09-03; it depended on whether store
+  // pressure happened to trigger a collection during the rubygems preload,
+  // which is why it came and went with the environment).
+  let _ = map_iter str_intern_tbl mk in
+  // Found by listing every global map whose writes store a handle and
+  // asking which of them appear above: a proc's / method's source file
+  // (`source_location`), a proc's symbol source, and a curried proc's
+  // collected arguments are all reached from nowhere but these tables.
+  let _ = map_iter proc_src mk in
+  let _ = map_iter proc_symsrc mk in
+  let _ = map_iter meth_src mk in
+  let _ = map_iter curry_args mk in
+  let _ = map_iter comp_inner mk in
+  let _ = map_iter comp_outer mk in
   let _ = map_iter loaded_files mk in
   let _ = map_iter modules mk in
   let _ = map_iter mrsh_dsyms mk in
@@ -10740,7 +10915,6 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter rx_bad mk in
   let _ = map_iter rx_gnums mk in
   let _ = map_iter rx_lenient mk in
-  let _ = map_iter struct_ctr mk in
   let _ = map_iter struct_mem mk in
   let _ = map_iter tcp_buf mk in
   let _ = map_iter thread_flag mk in
@@ -11343,9 +11517,23 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let v = mkstr f in (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
     // Kernel#__method__: the name of the method being run, as a Symbol (nil at
     // the top level). The frame already carries it for `super`.
-    else if str_eq name "__method__" then
+    else if str_eq name "__method__" || str_eq name "__callee__" then
       (if lv_has env "__meth"
-       then (match lv_get env "__meth" with VStr h -> VSym (sget h) | _ -> VNil)
+       then (match lv_get env "__meth" with
+             | VStr h ->
+               // __callee__ is the name the method was CALLED by; __method__ is
+               // the name it was defined under, so through an alias it is the
+               // alias's source (alias_srcname, keyed "Cls#alias" -> source).
+               let called = sget h in
+               if str_eq name "__callee__" then
+                 VSym (if lv_has env "__callee"
+                       then (match lv_get env "__callee" with VStr ch -> sget ch | _ -> called)
+                       else called)
+               else
+                 let dc = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c -> c | _ -> "") else "") in
+                 let k = dc ++ "#" ++ called in
+                 VSym (if map_has alias_srcname k then map_get alias_srcname k else called)
+             | _ -> VNil)
        else VNil)
     // Kernel#__dir__: the directory of the current file, absolute (like Ruby's
     // File.dirname(File.realpath(__FILE__))). A relative script dir is joined
@@ -11595,13 +11783,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    | _ -> true)
                 else true) then
       (match args with
-       | Cons (VStr cs, _) ->
-         (let cmd = sget cs in
-          let tmp = "/tmp/mrb_cmd_" ++ str_of_int (getpid ()) ++ ".out" in
-          let _ = run (cmd ++ " > " ++ shq tmp) in
-          let out = (if file_exists tmp then read_file tmp else "") in
-          let _ = run ("rm -f " ++ shq tmp) in
-          mkstr out)
+       | Cons (VStr cs, _) -> run_backtick (sget cs)
        | _ -> mkstr "")
     // Kernel#system: the same command, reporting only whether it succeeded.
     // Ruby answers nil when the command could not be executed at all and false
@@ -11769,6 +11951,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // there, and at the TOP LEVEL it defines on Object -- which is where ruby
     // puts a method defined at the top level, and what makes the defined
     // method callable from the next line.
+    // define_singleton_method(:name, method_or_proc) with an implicit class
+    // self (inside a class body): the explicit-receiver arm does the work.
+    else if str_eq name "define_singleton_method"
+            && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
+            && (match (if lv_has env "self" then lv_get env "self" else VMain) with VClass _ -> true | _ -> false) then
+      invoke_val_c env world blk (if lv_has env "self" then lv_get env "self" else VMain) name args false
     else if str_eq name "define_method"
             && (match (if lv_has env "self" then lv_get env "self" else VMain) with
                 | VClass _ -> true | VMain -> true | _ -> false) then
@@ -12187,7 +12375,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if (str_eq ocl "File" || str_eq ocl "IO" || str_eq ocl "Queue" || str_eq ocl "SizedQueue") && str_eq op "<<" then
          invoke_val_c env world blk va0 "<<" (Cons (eval_e env world blk b, Nil)) false
        // enumerator chaining: e1 + e2.
-       else if (str_eq ocl "Enumerator" || str_eq ocl "Enumerator::Chain") && str_eq op "+" then
+       else if (is_enum_cls ocl || str_eq ocl "Enumerator::Chain") && str_eq op "+" then
          invoke_val_c env world blk va0 "+" (Cons (eval_e env world blk b, Nil)) false
        // Comparable: derive < > <= >= from a user-defined <=> when the
        // operator itself is not defined.
@@ -12205,7 +12393,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // (not the meths table), so route the operator there rather than
        // falling through to rb_eq (which is object identity).
        else if (str_eq op "==" || str_eq op "eql?")
-               && (str_eq ocl "Method" || str_eq ocl "UnboundMethod" || str_eq ocl "Time"
+               && (str_eq ocl "Enumerator::ArithmeticSequence" || str_eq ocl "Method" || str_eq ocl "UnboundMethod" || str_eq ocl "Time"
                    || exc_is_a world ocl "Exception")
                && (if has_meth world ocl op then false else true) then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
@@ -13326,6 +13514,23 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
       run_stmts env world blk handler
     else run_rescues env world blk exc rest
 
+// Kernel#exit / Kernel#abort raise a SystemExit: rescuable, `ensure` runs,
+// and if nothing rescues it the top level exits with the carried status and
+// prints nothing. They used to call the native exit right here, so
+// `begin; exit 42; rescue SystemExit; end` ended the process -- which is what
+// core/exception's status_spec and success_spec recorded as "no output
+// before aborting".
+and raise_system_exit = fn world -> fn (status: int) -> fn (msg: str) ->
+  let (meths, sup, ocls, ivars) = world in
+  let id = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int id) "SystemExit" in
+  let _ = map_set ivars (str_of_int id ++ "@__status") (VInt status) in
+  let _ = map_set ivars (str_of_int id ++ "@message") (mkstr msg) in
+  // re_raise never returns (it fails); the VNil gives this a Val type for the
+  // primitive dispatchers that call it in value position.
+  let _ = re_raise world (VObj id) in
+  VNil
+
 and re_raise = fn world -> fn (exc: Val) ->
   let (meths, sup, ocls, ivars) = world in
   let _ = map_set ivars "$exc" exc in
@@ -13408,6 +13613,28 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // own defining block: inside a spec example that is the example's own block,
   // so `(one << two).call { }` ran the example again, forever.
   let encl_call = encl in
+  // The env is born OUTSIDE the invocation's region (it comes from the pool and
+  // may be captured; see blk_env_get), and whether it is pooled is read off the
+  // raw param list: a `for` block's hidden "__f" param is first and carries no
+  // marker (the markers start "__y", "__l" and "~").
+  let pooled = (if is_for_params params00 then false else true) in
+  let benv = if pooled then blk_env_get cenv else cenv in
+  let prev_ok = (if map_has blk_ok "n" then map_get blk_ok "n" else 0) in
+  let _ = map_set blk_ok "n" 0 in
+  // ONE REGION PER BLOCK INVOCATION, from parameter stripping through the body
+  // -- the same shape as region MCALL around a method body, for the same
+  // reason. Everything an invocation builds and does not store (the stripped
+  // and re-split param lists, the binding's scratch, dispatch strings, the
+  // copies of each statement's value) used to land in the region current at
+  // the ITERATOR's call site -- the enclosing statement's -- and be held until
+  // the whole `each`/`times` returned: 267 MB for one 400k-iteration statement,
+  // measured as that region's peak_cap. Wrapping the body alone moved nothing;
+  // the binding was most of it. What matters leaves safely: locals are copied
+  // into the env on store, the Flow value is copied out. A raise inside
+  // unwinds through the region and is caught by the try_or, as a raise in the
+  // body always was.
+  let f = region BLK {
+   try_or (fn (u: unit) ->
   let (encl, params0) = strip_yblk_markers encl params00 in
   // a lambda installed as a block carries a marker: strip it and enforce
   // strict arity (a plain block stays lenient).
@@ -13427,21 +13654,24 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // `for` is the exception: it is not a scope in Ruby, so its desugared
   // block (a hidden "__f..." param) runs directly in the enclosing env and
   // leaves its loop variable and body locals behind, exactly as Ruby does.
-  let benv = if is_for_params params then cenv else lv_child cenv in
   let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam in
   // A raising body used to need explicit cleanup here (restoring saved params
   // and dropping created locals) or the bindings leaked into the shared env
   // and were visible to later sibling blocks; with a per-invocation frame the
   // raise path cannot leak. The flag still distinguishes a raise from a
   // normal return so the exception is re-raised (details live in ivars "$exc").
-  let _ = map_set flow_sig "__blk_ok" (VBool false) in
-  let f = try_or (fn (u: unit) ->
-                    let r = block_body_flow benv world encl body in
-                    let _ = map_set flow_sig "__blk_ok" (VBool true) in
-                    r)
-                 (FRaise VNil) in
-  let ok = (if map_has flow_sig "__blk_ok" then (match map_get flow_sig "__blk_ok" with VBool b -> b | _ -> false) else false) in
-  let _ = if map_has flow_sig "__blk_ok" then map_delete flow_sig "__blk_ok" else () in
+  let r = block_body_flow benv world encl body in
+   let _ = map_set blk_ok "n" 1 in
+   r)
+   (FRaise VNil) } in
+  let ok = (if map_has blk_ok "n" then map_get blk_ok "n" else 0) == 1 in
+  let _ = map_set blk_ok "n" prev_ok in
+  // the env dies here unless a closure captured it (see blk_env_put). On every
+  // exit path: try_or has already turned a raise into FRaise, so this runs
+  // before the re-raise below. The Flow value `f` does not point into the
+  // env's arena -- run_stmts copies each statement's value out of its own
+  // region STMT block, into the region current here.
+  let _ = if pooled then blk_env_put benv else () in
   if ok then f else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
 
 // `for` desugars to `each` with a hidden "__for" / "__forv" / "__f<n>" param
@@ -14386,6 +14616,8 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     (if rng_is_int lo && rng_hi_open hi then
        (let a = rng_int lo in
         if str_eq name "each" then iter_each_result (range_each world encl theblk a int_max) recv
+        else if str_eq name "step" then
+          iter_each_result (range_step world encl theblk a int_max (match args with Cons (VInt n, _) -> n | _ -> 1)) recv
         else if (str_eq name "first" || str_eq name "take")
                 && (match args with Cons (VInt _, _) -> true | _ -> false) then
           (match args with
@@ -14397,6 +14629,10 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
      else if rng_is_int lo && rng_is_int hi then
        (let last = (if excl then rng_int hi - 1 else rng_int hi) in
         if str_eq name "each" then iter_each_result (range_each world encl theblk (rng_int lo) last) recv
+        // (a..b).step(n) { } walks the range by n; without a block it is an
+        // ArithmeticSequence (invoke_val_c), so this arm only ever has one.
+        else if str_eq name "step" then
+          iter_each_result (range_step world encl theblk (rng_int lo) last (match args with Cons (VInt n, _) -> n | _ -> 1)) recv
         else if str_eq name "map" || str_eq name "collect" then iter_result (range_map world encl theblk (rng_int lo) last Nil) recv
         else builtin_iter world encl theblk (arr_new (range_to_a (rng_int lo) last)) name args)
      else builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args)
@@ -14420,6 +14656,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   | VRat (rn9, rd9) ->
     if str_eq name "step" then
       (match args with
+       // step(by: n, to: m) { }: keywords; a missing `to:` walks on without end
+       | Cons (VHsh hid9, Nil) ->
+         (let by9 = aseq_kw (hderef hid9) "by" in
+          let to9 = aseq_kw (hderef hid9) "to" in
+          iter_each_result (num_step world encl theblk recv (match to9 with VNil -> VInt int_max | v -> v)
+                              (match by9 with VNil -> VInt 1 | v -> v)) recv)
        | Cons (lim9, rest9) ->
          iter_each_result (num_step world encl theblk recv lim9
                              (match rest9 with Cons (b9, _) -> b9 | _ -> VInt 1)) recv
@@ -14465,6 +14707,18 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
       (match args with
        | Cons (VInt limit, Cons (VInt by, _)) -> iter_each_result (range_step world encl theblk n limit by) recv
        | Cons (VInt limit, Nil) -> iter_each_result (range_step world encl theblk n limit 1) recv
+       // step(by: b, to: t) { }: keywords; no `to:` walks on without end, and a
+       // Float in either makes it a Float walk
+       | Cons (VHsh hid9, Nil) ->
+         (let by9 = aseq_kw (hderef hid9) "by" in
+          let to9 = aseq_kw (hderef hid9) "to" in
+          (match (by9, to9) with
+           | (VInt b9, VInt t9) -> iter_each_result (range_step world encl theblk n t9 b9) recv
+           | (VNil, VInt t9) -> iter_each_result (range_step world encl theblk n t9 1) recv
+           | (VInt b9, VNil) -> iter_each_result (range_step world encl theblk n int_max b9) recv
+           | (VNil, VNil) -> iter_each_result (range_step world encl theblk n int_max 1) recv
+           | (b9, t9) -> iter_each_result (flt_step world encl theblk (float_of_int n) (match t9 with VNil -> 1.0 / 0.0 | v -> to_f v) (match b9 with VNil -> 1.0 | v -> to_f v)) recv))
+       | Cons (VInt limit, _) -> iter_each_result (range_step world encl theblk n limit 1) recv
        // a Float anywhere makes the whole walk a Float walk, as in ruby.
        | Cons (lim9, rest9) ->
          (let lf9 = to_f lim9 in
@@ -15878,6 +16132,10 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        let lno = (match gv "lineno" with VInt n -> n | _ -> 0) in
        let lbl = (match gv "label" with VStr h -> sget h | _ -> "") in
        inspect (mkstr (pth ++ ":" ++ str_of_int lno ++ ":in `" ++ lbl ++ "'")))
+    // an ArithmeticSequence prints as the call that made it, `(1.step(10))`:
+    // its own #inspect arm knows the receiver and arguments
+    else if str_eq cls "Enumerator::ArithmeticSequence" then
+      aseq_inspect_str env world oid
     else
       (let ivs = obj_ivar_dump env world oid cls in
        // the class names ITSELF here too: an instance of an anonymous class is
@@ -15971,6 +16229,32 @@ and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
      | Nil -> acc)
 
 and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0: str) -> fn (args0: Val list) -> fn (vischeck: bool) ->
+  // Integer#step / Range#step called WITHOUT a block (a call with one goes
+  // through invoke_with_block): an Enumerator::ArithmeticSequence, not an
+  // Array. The leaf dispatcher (prim_method_raw) has no world to build it in.
+  if str_eq name0 "step"
+     && (match recv0 with
+         | VInt _ -> true
+         | VRange (lo, hi, _) -> rng_is_int lo && (rng_is_int hi || rng_hi_open hi)
+         | _ -> false)
+     && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
+  then aseq_of world recv0 args0
+  // `send(:__method__)` / `send(:__callee__)`: the same answer the bare call
+  // gives (the frame is the caller's, which is `env` here); an explicit
+  // receiver used to make both a NoMethodError.
+  else if (str_eq name0 "__method__" || str_eq name0 "__callee__") && (match args0 with Nil -> true | _ -> false)
+          && lv_has env "__meth" then
+    (match lv_get env "__meth" with
+     | VStr h ->
+       let called = sget h in
+       if str_eq name0 "__callee__" then
+         VSym (if lv_has env "__callee" then (match lv_get env "__callee" with VStr ch -> sget ch | _ -> called) else called)
+       else
+         let dc = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c -> c | _ -> "") else "") in
+         let k = dc ++ "#" ++ called in
+         VSym (if map_has alias_srcname k then map_get alias_srcname k else called)
+     | _ -> VNil)
+  else
   let recv = recv0 in
   let name = name0 in
   // File.read(pathname), Dir.glob(pathname), IO.write(pathname, s): a path
@@ -17744,6 +18028,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with
           | Cons (VStr ph, _) -> VBool (run ("test -d " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
           | _ -> VBool false)
+       // File.symlink?: the shell's test, as directory? above (bundler asks it
+       // of every load path entry while resolving a Gemfile).
+       else if str_eq name "symlink?" then
+         (match args with
+          | Cons (VStr ph, _) -> VBool (run ("test -L " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
+          | _ -> VBool false)
        // File.writable? / readable? / executable?: the shell's own tests, as
        // directory? above. There is no stat here, so these three are the whole
        // of it -- world_writable?, which answers with permission bits, is
@@ -17921,6 +18211,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if is_sng_cls c then VClass (sng_supername world c)
        else if map_has sup0 c then VClass (map_get sup0 c)
        else if str_eq c "Object" then VClass "BasicObject"
+       // Enumerator's builtin subclasses
+       else if str_eq c "Enumerator::ArithmeticSequence" || str_eq c "Enumerator::Lazy" || str_eq c "Enumerator::Chain" then VClass "Enumerator"
        else VClass "Object")
     // Hash.ruby2_keywords_hash?(h): whether h carries the ruby2_keywords flag.
     // mere does not expose that flag on a hash value, so it is never true here
@@ -17990,6 +18282,45 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                        else mark_vis_mode meths0 c names name) in
        // Ruby returns the argument, or the list of them when given several.
        match args with Nil -> VNil | Cons (a, Nil) -> a | _ -> arr_new args)
+    // define_singleton_method(:name, method_or_unbound_method) on a class: the
+    // same copy as define_method's two-argument form below, landing in the
+    // class's singleton namespace. (The block form is in the with-block
+    // dispatcher; without this arm the two-argument form was NoMethodError.)
+    else if str_eq name "define_singleton_method" && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
+      (let (meths0, sup0, ocls0, ivars0) = world in
+       let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
+       let src = (match args with Cons (_, Cons (s, _)) -> s | _ -> VNil) in
+       let target = "(sng:" ++ c ++ ")" in
+       (match src with
+        | VObj uid ->
+          (let ocl9 = map_get ocls0 (str_of_int uid) in
+           let (scls, snm) =
+             (if str_eq ocl9 "UnboundMethod" then
+                ((match map_get ivars0 (str_of_int uid ++ "@__um_cls") with VStr h -> sget h | _ -> ""),
+                 (match map_get ivars0 (str_of_int uid ++ "@__um_name") with VStr h -> sget h | _ -> ""))
+              else if str_eq ocl9 "Method" then
+                (let mo = (match map_get ivars0 (str_of_int uid ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
+                 let mn = (match map_get ivars0 (str_of_int uid ++ "@__m_name") with VStr h -> sget h | _ -> "") in
+                 let mo = (if str_eq mo "" then (match map_get ivars0 (str_of_int uid ++ "@__m_recv") with r9 -> class_name r9) else mo) in
+                 (mo, mn))
+              else ("", "")) in
+           if str_eq snm "" then raise_exc world "TypeError" ("wrong argument type " ++ ocl9 ++ " (expected Proc/Method/UnboundMethod)")
+           else
+             (let sk = scls ++ "#" ++ snm in
+              // a builtin source (`method(:constants)`) has no Meth body: it is
+              // installed as an alias the dispatcher resolves to the builtin
+              let _ = if map_has meths0 sk then map_set meths0 (target ++ "#" ++ nm) (map_get meths0 sk)
+                      else map_set builtin_alias (target ++ "#" ++ nm) snm in
+              let _ = copy_meth_src (target ++ "#" ++ nm) sk in
+              let _ = if map_has meth_cref sk then map_set meth_cref (target ++ "#" ++ nm) (map_get meth_cref sk) else () in
+              VSym nm))
+        | VProc pid -> (let _ = dm_store_closure (target ++ "#" ++ nm) (proc_as_block pid) in
+                       let (h2, ps2, bb2, e2) = proc_as_block pid in
+                       let _ = map_set meths0 (target ++ "#" ++ nm)
+                                 (Meth (drop_yblk_params ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
+                       let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
+                       VSym nm)
+        | other -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Proc/Method/UnboundMethod)")))
     else if str_eq name "define_method" && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
@@ -18650,6 +18981,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
           (let m = "mere-ruby: (ruby exception raised)" in
            let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
+       // `Kernel.`(cmd)`: the command literal's method, called by name.
+       else if str_eq name "`" then
+         (match args with Cons (VStr cs, _) -> run_backtick (sget cs) | _ -> mkstr "")
        else try_self_call_x env world recv name args true)
     // a class that does `extend Enumerable` and defines `self.each` gets the
     // Enumerable surface on the class object itself (Gem::Specification is
@@ -19324,7 +19658,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          invoke_val_c env world blk (lz_run env world blk id (0 - 1) VNil) name args vischeck
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Enumerator::Lazy"))
     // Enumerator#+ / Chain#+: a chain of self and the given enumerators.
-    else if (str_eq cls "Enumerator" || str_eq cls "Enumerator::Chain") && str_eq name "+" then
+    else if (is_enum_cls cls || str_eq cls "Enumerator::Chain") && str_eq name "+" then
       (let base = (if str_eq cls "Enumerator::Chain" then chain_srcs world id else Cons (recv, Nil)) in
        mk_chain world (list_append base args))
     // Enumerator::Chain surface: each is handled by the block dispatcher;
@@ -19334,7 +19668,52 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let av = chain_to_arr env world blk id in
        invoke_val_c env world blk av name args vischeck)
     // Enumerator#inspect: "#<Enumerator: <recv>:<meth>(args)>".
-    else if str_eq cls "Enumerator" && (str_eq name "inspect" || str_eq name "to_s") then
+    // Enumerator::ArithmeticSequence: what it knows beyond an Enumerator.
+    else if str_eq cls "Enumerator::ArithmeticSequence"
+            && (str_eq name "begin" || str_eq name "end" || str_eq name "step" || str_eq name "exclude_end?"
+                || str_eq name "inspect" || str_eq name "to_s" || str_eq name "==" || str_eq name "eql?" || str_eq name "==="
+                || str_eq name "hash" || str_eq name "size" || str_eq name "last") then
+      // (no closure over `id` here: a lifted inner fn capturing a name that is
+      // also a prelude function -- `id` -- resolved to the function)
+      (let key = str_of_int id in
+       let iv = fn (k: str) -> (if map_has ivars k then map_get ivars k else VNil) in
+       let b = iv (key ++ "@__as_begin") in let e = iv (key ++ "@__as_end") in let st = iv (key ++ "@__as_step") in
+       let excl = (match iv (key ++ "@__as_excl") with VBool x -> x | _ -> false) in
+       if str_eq name "begin" then b
+       else if str_eq name "end" then e
+       else if str_eq name "step" then st
+       else if str_eq name "exclude_end?" then VBool excl
+       else if str_eq name "inspect" || str_eq name "to_s" then mkstr (aseq_inspect_str env world id)
+       else if str_eq name "==" || str_eq name "eql?" || str_eq name "===" then
+         (match args with
+          | Cons (VObj oid, _) ->
+            (if str_eq (map_get ocls (str_of_int oid)) "Enumerator::ArithmeticSequence" then
+               (let okey = str_of_int oid in
+                VBool (rb_eq b (iv (okey ++ "@__as_begin")) && rb_eq e (iv (okey ++ "@__as_end")) && rb_eq st (iv (okey ++ "@__as_step"))
+                       && (match iv (okey ++ "@__as_excl") with VBool x -> x == excl | _ -> false)))
+             else VBool false)
+          | _ -> VBool false)
+       else if str_eq name "hash" then
+         VInt (aseq_hi b * 31 + aseq_hi e * 17 + aseq_hi st * 7 + (if excl then 1 else 0))
+       else
+         // size / last: integer sequences count exactly; anything else walks
+         (match (b, e, st) with
+          | (VInt bi, VInt ei, VInt si) ->
+            (let n = aseq_size bi ei si excl in
+             if str_eq name "size" then VInt n
+             else (match args with
+                   | Cons (VInt k, _) -> arr_new (aseq_terms (bi + (if n - k > 0 then n - k else 0) * si) si (if k < n then k else n))
+                   | _ -> if n == 0 then VNil else VInt (bi + (n - 1) * si)))
+          | (_, VNil, _) -> (if str_eq name "size" then VFlt (1.0 / 0.0) else raise_exc world "RangeError" "cannot get the last element of endless arithmetic sequence")
+          | _ ->
+            (let av = enum_to_arr env world blk id in
+             (match av with
+              | VArr aid -> (if str_eq name "size" then VInt (val_list_len (deref aid))
+                             else (match args with
+                                   | Cons (VInt k, _) -> arr_new (vtake (val_rev (deref aid) Nil) k) 
+                                   | _ -> (match val_rev (deref aid) Nil with Cons (x, _) -> x | Nil -> VNil)))
+              | _ -> VNil))))
+    else if is_enum_cls cls && (str_eq name "inspect" || str_eq name "to_s") then
       (if map_has ivars (str_of_int id ++ "@recv") then
          (let recv2 = map_get ivars (str_of_int id ++ "@recv") in
           let meth2 = to_s (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else mkstr "each") in
@@ -19345,7 +19724,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else mkstr "#<Enumerator: generator>")
     // Enumerator#size: the size given to Enumerator.new (a proc is called),
     // nil for an unsized generator, else the materialized length.
-    else if str_eq cls "Enumerator" && str_eq name "size" then
+    else if is_enum_cls cls && str_eq name "size" then
       (if map_has ivars (str_of_int id ++ "@__e_size") then
          (match map_get ivars (str_of_int id ++ "@__e_size") with
           | VProc spid -> invoke_val_c env world blk (VProc spid) "call" Nil false
@@ -19403,7 +19782,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | _ -> VNil))
     // Enumerator without a block: enum methods materialize the elements and
     // delegate to the array implementation.
-    else if str_eq cls "Enumerator"
+    else if is_enum_cls cls
             && (if str_eq name "first" || str_eq name "take" then false else true)
             && (is_enum_method name || str_eq name "each_with_index" ||
                 str_eq name "drop" || str_eq name "each_slice" || str_eq name "each_cons") then
@@ -19412,7 +19791,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // external iteration (re-drive style: the enumerator is re-run, bounded
     // to pos+1 elements, and indexed by @__e_pos — O(n^2) overall but correct
     // for pure sources, and safe for infinite generators).
-    else if str_eq cls "Enumerator" && (str_eq name "next" || str_eq name "peek" || str_eq name "rewind") then
+    else if is_enum_cls cls && (str_eq name "next" || str_eq name "peek" || str_eq name "rewind") then
       (if str_eq name "rewind" then
          (let _ = map_set ivars (str_of_int id ++ "@__e_pos") (VInt 0) in recv)
        else
@@ -19426,14 +19805,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            v)
     // with_index(offset = 0) without a block: an Enumerator of [elem, i+offset]
     // pairs; with_object handled by the with-block dispatcher.
-    else if str_eq cls "Enumerator" && (str_eq name "with_index" || str_eq name "each_with_index") && (let (h9, _, _, _) = blk in (if h9 then false else true)) then
+    else if is_enum_cls cls && (str_eq name "with_index" || str_eq name "each_with_index") && (let (h9, _, _, _) = blk in (if h9 then false else true)) then
       (let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
        let av = enum_to_arr env world blk id in
        (match av with
         | VArr aid2 -> (let _ = () in make_enum world (arr_new (with_index_pairs_off (deref aid2) off)) "each")
         | _ -> VNil))
     // next_values / peek_values: like next/peek but every yield is an array.
-    else if str_eq cls "Enumerator" && (str_eq name "next_values" || str_eq name "peek_values") then
+    else if is_enum_cls cls && (str_eq name "next_values" || str_eq name "peek_values") then
       (let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
        let av = enum_take_m env world blk id (pos + 1) true in
        let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
@@ -19443,7 +19822,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          let _ = (if str_eq name "next_values" then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
          v)
     // first / take are bounded (usable on infinite generators).
-    else if str_eq cls "Enumerator" && (str_eq name "first" || str_eq name "take") then
+    else if is_enum_cls cls && (str_eq name "first" || str_eq name "take") then
       (let n = (match args with Cons (VInt k, _) -> k | _ -> 1) in
        let av = enum_take env world blk id n in
        if str_eq name "take" then av
@@ -19973,9 +20352,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         // has to return from `m`.
         (match theblk with (h2, ps2, b2, e2) ->
           let lfid = next_fid () in
-          let e2c = lv_child e2 in
+          let e2c = blk_env_get e2 in
           let _ = map_set e2c "__fid" (VInt lfid) in
-          let _ = map_set live_frames (str_of_int lfid) (VBool true) in
+          let _ = map_set live_frames (str_of_int lfid) 1 in
           let (h3, ps3, b3, e3) = proc_as_block pid in
           let _ = e3 in
           // a block given at THIS call site is the block the proc body's &param
@@ -19984,6 +20363,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // was made -- that comes from the yblk marker, which overrides this.
           let f = try_or (fn (u: unit) -> run_block world blk (h3, ps3, b3, e2c) args) (FRaise VNil) in
           let _ = map_delete live_frames (str_of_int lfid) in
+          // the lambda's return-boundary frame is pooled like the block env
+          // under it (run_block made that one a child of e2c and has already
+          // put it back); a proc made inside painted both captured.
+          let _ = blk_env_put e2c in
           (match f with
            | FRaise _ ->
              if map_has flow_sig "k" then
@@ -20720,7 +21103,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     // block. `for x in enum_for(:m)` desugars to `enum.each { |__for| ... }`,
     // and #each just forwards to the underlying method (whose `yield` runs the
     // block); the method's return value becomes #each's (and the loop's) value.
-    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator") | _ -> false)
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in is_enum_cls (map_get ocls (str_of_int id))) | _ -> false)
             && str_eq name "each" then
       (match recv with
        | VObj id ->
@@ -20745,7 +21128,9 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           // whatever was handed to `each`.
           let eargs = (match (if map_has ivars0 (str_of_int id ++ "@eargs") then map_get ivars0 (str_of_int id ++ "@eargs") else VNil) with VArr aid3 -> deref aid3 | _ -> Nil) in
           let cargs = (match eargs with Nil -> args | _ -> eargs) in
-          drive_enum env world blk recv2 meth2 cargs newblk)
+          let r9 = drive_enum env world blk recv2 meth2 cargs newblk in
+          // an ArithmeticSequence's each { } answers the sequence itself
+          if str_eq (map_get ocls0 (str_of_int id)) "Enumerator::ArithmeticSequence" then recv else r9)
        | _ -> VNil)
     // Enumerator::Lazy with a block: pipeline ops are appended lazily; #each
     // drives the pipeline with the block as the final consumer.
@@ -20776,7 +21161,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        | _ -> VNil)
     // other Enumerator methods (map/select/... with a block): materialize the
     // elements, then run the array operation with the same block.
-    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Enumerator") | _ -> false)
+    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in is_enum_cls (map_get ocls (str_of_int id))) | _ -> false)
             && (is_enum_method name || str_eq name "each_with_index" || str_eq name "with_index" || str_eq name "with_object" || str_eq name "each_slice" || str_eq name "each_cons") then
       (match recv with
        | VObj id ->
@@ -22443,6 +22828,7 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
                 || is_prim_method name || is_module_method name
                 || builtin_class_method c name || str_eq name "autoload"
                 || str_eq name "autoload?" || str_eq name "define_method"
+                || str_eq name "define_singleton_method"
                 || str_eq name "instance_variable_set" || str_eq name "private_method_defined?"
   // A primitive may be an instance of a SUBCLASS with methods of its own --
   // optparse's CompletingHash < Hash defines #match, and `respond_to?(:match)`
@@ -27967,7 +28353,12 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
     (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
   else if str_eq name "fork" then
     raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
-  else if str_eq name "exit" then exit 0
+  else if str_eq name "exit" then
+    raise_system_exit world
+      (match args with
+       | Cons (VInt n, _) -> n
+       | Cons (VBool b, _) -> (if b then 0 else 1)
+       | _ -> 0) "exit"
   else
   match args with
   | Nil -> if explicit then raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame)
@@ -28011,6 +28402,16 @@ and self_defines = fn env -> fn world -> fn (name: str) ->
    | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name || has_meth world c name
    | VObj oid -> let (_, _, ocls0, _) = world in has_meth world (map_get ocls0 (str_of_int oid)) name
    | _ -> false)
+
+// Kernel#`: run the command, answer its standard output. The output travels
+// through a file (mere's `run` gives back only the exit status). Shared by
+// the literal form and the explicit `Kernel.`(cmd)` call.
+and run_backtick = fn (cmd: str) ->
+  let tmp = "/tmp/mrb_cmd_" ++ str_of_int (getpid ()) ++ ".out" in
+  let _ = run (cmd ++ " > " ++ shq tmp) in
+  let out = (if file_exists tmp then read_file tmp else "") in
+  let _ = run ("rm -f " ++ shq tmp) in
+  mkstr out
 
 and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   let (meths, sup, ocls, ivars) = world in
@@ -28062,15 +28463,15 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // Kernel#exit / Kernel#abort — terminate through the native exit, running
   // the at_exit handlers first (which is the only chance they get).
   else if str_eq name "exit" then
-    (let _ = run_at_exits world in
-     match args with
-     | Cons (VInt n, _) -> exit n
-     | Cons (VBool b, _) -> exit (if b then 0 else 1)
-     | _ -> exit 0)
+    raise_system_exit world
+      (match args with
+       | Cons (VInt n, _) -> n
+       | Cons (VBool b, _) -> (if b then 0 else 1)
+       | _ -> 0) "exit"
   else if str_eq name "abort" then
-    (let _ = (match args with Cons (VStr mh, _) -> print_err (sget mh) | _ -> ()) in
-     let _ = run_at_exits world in
-     exit 1)
+    (let m = (match args with Cons (VStr mh, _) -> sget mh | _ -> "exit") in
+     let _ = (match args with Cons (VStr mh, _) -> print_err (sget mh) | _ -> ()) in
+     raise_system_exit world 1 m)
   // Kernel#sleep: inside a synchronous thread it parks the thread; on the
   // main thread it is a scheduling no-op (there is nobody to switch to).
   else if str_eq name "sleep" then
@@ -28477,11 +28878,14 @@ and kernel_builtin_names = fn (u: unit) ->
   Cons ("require", Cons ("require_relative", Cons ("block_given?", Cons ("Integer",
   Cons ("Float", Cons ("String", Cons ("Array", Cons ("Hash", Cons ("Rational",
   Cons ("Complex", Cons ("warn", Cons ("rand", Cons ("srand", Cons ("sleep", Cons ("gets",
+  // the backtick is a Kernel method like any other once the lexer lets
+  // `Kernel.`(cmd)` name it (core/kernel/backtick_spec does exactly that)
+  Cons ("`",
   Cons ("exit", Cons ("exit!", Cons ("abort", Cons ("at_exit", Cons ("binding",
-  Cons ("set_trace_func", Cons ("caller", Cons ("caller_locations", Cons ("__method__",
+  Cons ("set_trace_func", Cons ("caller", Cons ("caller_locations", Cons ("__method__", Cons ("__callee__",
   Cons ("__callee__", Cons ("load", Cons ("system", Cons ("readline", Cons ("readlines",
   Cons ("trace_var", Cons ("untrace_var", Cons ("fork", Cons ("global_variables",
-  Cons ("local_variables", Cons ("test", Cons ("__dir__", Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+  Cons ("local_variables", Cons ("test", Cons ("__dir__", Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 
 and list_iter_kernel_names = fn (f: str -> unit) ->
   let rec go = fn (xs: str list) ->
@@ -28707,6 +29111,9 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
               else name in
     let _ = map_set frame "__defcls" (VClass dc) in
     let _ = map_set frame "__meth" (mkstr mnm) in
+    // __callee__ answers the name the method was CALLED by; only an alias
+    // makes it differ from __meth (the name it was defined under).
+    let _ = (if str_eq mnm name then () else map_set frame "__callee" (mkstr name)) in
     // Whether THIS call was given a block. `block_given?` asks about the
     // enclosing METHOD frame, and Ruby's rule reaches it through any number
     // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
@@ -28797,6 +29204,9 @@ and ancestors_of_raw = fn world -> fn (cls: str) ->
              else if is_sng_cls cls then ancestors_of world (sng_supername world cls)
              else if str_eq cls "BasicObject" then Nil
              else if str_eq cls "Object" then Cons ("BasicObject", Nil)
+             // Enumerator's builtin subclasses sit under Enumerator, not Object
+             else if str_eq cls "Enumerator::ArithmeticSequence" || str_eq cls "Enumerator::Lazy" || str_eq cls "Enumerator::Chain"
+             then ancestors_of world "Enumerator"
              else ancestors_of world "Object" in
   // A module already in the chain is NOT re-inserted: ruby keeps the position it
   // already had, so `class B < A; include M; end` where A includes M answers
@@ -29235,8 +29645,8 @@ and struct_members_of_args = fn (args: Val list) ->
 and struct_build = fn world -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let members = struct_members_of_args args in
-  let n = (if map_has struct_ctr "n" then (match map_get struct_ctr "n" with VInt k -> k | _ -> 0) else 0) in
-  let _ = map_set struct_ctr "n" (VInt (n + 1)) in
+  let n = (if map_has struct_ctr "n" then map_get struct_ctr "n" else 0) in
+  let _ = map_set struct_ctr "n" (n + 1) in
   let anon = "Struct_" ++ str_of_int n in
   let _ = set_sup sup anon "Struct" in
   let _ = add_attrs world anon "rw" members in
@@ -29317,7 +29727,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // existing per-body try_or below, so it is decremented on EVERY exit path
   // (normal return, propagating exception, or break/next/return flow signal)
   // and never leaks, without adding a new try_or to the hot path.
-  let cd = (if map_has struct_ctr "cd" then (match map_get struct_ctr "cd" with VInt k -> k | _ -> 0) else 0) in
+  let cd = (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0) in
   // 15000 is measured, not guessed. With the required -stack_size (512MB) a
   // heavy frame (block, hash, string, begin/rescue) reaches 100000 native
   // frames before the stack fails, so this is well inside what the stack
@@ -29333,7 +29743,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
      // REPORTER adds when nothing rescues it, so having it here printed it twice
      raise_exc world "SystemStackError" "stack level too deep" in FRaise VNil)
   else
-  let _ = map_set struct_ctr "cd" (VInt (cd + 1)) in
+  let _ = map_set struct_ctr "cd" (cd + 1) in
   // A method body may run with UNROOTED values in flight above it (the
   // caller's half-evaluated expression); a safepoint may not collect while
   // any such context is on the stack. Two exceptions stay collectable:
@@ -29342,7 +29752,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // `require "x"` under it).
   let gcbare = map_has gc_bare "y" in
   let _ = (if gcbare then map_delete gc_bare "y" else gc_unsafe_push ()) in
-  let _ = map_set call_names_s (str_of_int cd)
+  let _ = map_set_s call_names_s (str_of_int cd)
             ((match (if map_has frame "__defcls" then map_get frame "__defcls" else VNil) with
               | VClass c -> c ++ "#"
               | _ -> "")
@@ -29354,14 +29764,14 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // `caller` is. It is also what has to be restored when the body is done,
   // because the line is one global: without this, the current line after a call
   // returns would be the last line the CALLEE ran.
-  let _ = map_set call_lines (str_of_int cd) (VInt (cur_line ())) in
-  let _ = map_set call_files_s (str_of_int cd) (cur_file ()) in
-  let _ = map_set call_meths_s (str_of_int cd) (cur_meth ()) in
-  let _ = map_set cur_pos_s "m" (if map_has call_names_s (str_of_int cd) then map_get call_names_s (str_of_int cd) else "") in
+  let _ = map_set call_lines (str_of_int cd) (cur_line ()) in
+  let _ = map_set_s call_files_s (str_of_int cd) (cur_file ()) in
+  let _ = map_set_s call_meths_s (str_of_int cd) (cur_meth ()) in
+  let _ = map_set_s cur_pos_s "m" (if map_has call_names_s (str_of_int cd) then map_get call_names_s (str_of_int cd) else "") in
   // mark this frame live so a break targeting it (via a block's home) can find
   // it; once the body has unwound to here (any outcome) the frame is done.
   let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> str_of_int t | _ -> "") else "") in
-  let _ = if str_eq fidk "" then () else map_set live_frames fidk (VBool true) in
+  let _ = if str_eq fidk "" then () else map_set live_frames fidk 1 in
   // a method call is a `return` boundary: a return inside the body returns from
   // this method, even when the call happens inside a Thread.new block.
   // The BOOL, not the Val (see the Thread.new site): thread_flag is compacted
@@ -29386,12 +29796,12 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let f = try_or (fn (u: unit) -> region MCALL { run_stmts frame world blk body }) (FRaise VNil) in
   // restore depth: runs whether the body returned normally, re-raised, or
   // emitted a flow signal (try_or has already caught any fail by this point).
-  let _ = map_set struct_ctr "cd" (VInt cd) in
+  let _ = map_set struct_ctr "cd" cd in
   let _ = (if gcbare then () else gc_unsafe_pop ()) in
   // ... and with it the caller's line and file, for the same reason
-  let _ = map_set cur_pos "l" (VInt (match map_get call_lines (str_of_int cd) with VInt n -> n | _ -> 0)) in
-  let _ = map_set cur_pos_s "f" (if map_has call_files_s (str_of_int cd) then map_get call_files_s (str_of_int cd) else "") in
-  let _ = map_set cur_pos_s "m" (if map_has call_meths_s (str_of_int cd) then map_get call_meths_s (str_of_int cd) else "") in
+  let _ = map_set cur_pos "l" (if map_has call_lines (str_of_int cd) then map_get call_lines (str_of_int cd) else 0) in
+  let _ = map_set_s cur_pos_s "f" (if map_has call_files_s (str_of_int cd) then map_get call_files_s (str_of_int cd) else "") in
+  let _ = map_set_s cur_pos_s "m" (if map_has call_meths_s (str_of_int cd) then map_get call_meths_s (str_of_int cd) else "") in
   // read, compare, write only if it differs -- the body may have left the flag
   // set (a nested Thread.new), so "skip the restore because we skipped the
   // entry write" would be wrong.
@@ -33230,6 +33640,85 @@ and drive_enum = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (meth: str
      else invoke_with_block env world blk recv meth args newblk)
   | _ -> invoke_with_block env world blk recv meth args newblk
 
+// The Enumerator surface (next / peek / first / size / with_index / ...) is
+// keyed on the object's class name; an ArithmeticSequence IS an Enumerator, so
+// every such arm asks this instead of the literal name. Lazy and Chain keep
+// their own arms (they answer differently).
+and is_enum_cls = fn (cls: str) ->
+  str_eq cls "Enumerator" || str_eq cls "Enumerator::ArithmeticSequence"
+
+// Numeric#step / Range#step without a block: an Enumerator::ArithmeticSequence
+// -- an Enumerator (make_enum_a drives `recv.step(args)` when it is walked)
+// that also knows its begin, end, step and whether the end is excluded.
+and make_aseq = fn world -> fn (recv: Val) -> fn (eargs: Val list) -> fn (b: Val) -> fn (e: Val) -> fn (st: Val) -> fn (excl: bool) ->
+  let (meths, sup, ocls, ivars) = world in
+  (match make_enum_a world recv "step" eargs with
+   | VObj id ->
+     let _ = map_set ocls (str_of_int id) "Enumerator::ArithmeticSequence" in
+     let _ = map_set ivars (str_of_int id ++ "@__as_begin") b in
+     let _ = map_set ivars (str_of_int id ++ "@__as_end") e in
+     let _ = map_set ivars (str_of_int id ++ "@__as_step") st in
+     let _ = map_set ivars (str_of_int id ++ "@__as_excl") (VBool excl) in
+     VObj id
+   | other -> other)
+
+// the number of terms an integer arithmetic sequence has (ruby's count rule)
+and aseq_size = fn (b: int) -> fn (e: int) -> fn (st: int) -> fn (excl: bool) ->
+  if st == 0 then 0
+  else
+    let n = (if st > 0 then (if e < b then 0 else (e - b) / st + 1)
+             else (if e > b then 0 else (b - e) / (0 - st) + 1)) in
+    if excl && n > 0 && (e - b) - ((e - b) / st) * st == 0 then n - 1 else n
+
+// keyword lookup in a hash's flat [k, v, k, v ...] pair list
+and aseq_kw = fn (pairs: Val list) -> fn (k: str) ->
+  (let (f, v) = hash_lookup pairs (VSym k) in if f then v else VNil)
+// `by: 2, to: 10` -- keyword pairs printed the way they were written
+and aseq_kw_str = fn (pairs: Val list) -> fn (acc: str) ->
+  match pairs with
+  | Cons (VSym k, Cons (v, rest)) -> aseq_kw_str rest (acc ++ (if str_eq acc "" then "" else ", ") ++ k ++ ": " ++ inspect v)
+  | Cons (k, Cons (v, rest)) -> aseq_kw_str rest (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect k ++ "=>" ++ inspect v)
+  | _ -> acc
+// n terms from b, stepping st
+and aseq_terms = fn (b: int) -> fn (st: int) -> fn (n: int) ->
+  if n <= 0 then (Nil : Val list) else Cons (VInt b, aseq_terms (b + st) st (n - 1))
+and aseq_hi = fn (v: Val) -> (match v with VInt n -> n | _ -> 0)
+
+// the sequence for `recv.step(args)` with no block: Integer with (limit[, by])
+// or (by:, to:) keywords or nothing (endless), and an integer Range with an
+// optional step.
+and aseq_of = fn world -> fn (recv: Val) -> fn (args: Val list) ->
+  match recv with
+  | VRange (lo, hi, excl) ->
+    let st = (match args with Cons (VInt n, _) -> VInt n | _ -> VInt 1) in
+    make_aseq world recv args (VInt (rng_int lo)) (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl
+  | VInt lo ->
+    (match args with
+     | Cons (VInt limit, Cons (VInt n, _)) -> make_aseq world recv args (VInt lo) (VInt limit) (VInt n) false
+     | Cons (VInt limit, Nil) -> make_aseq world recv args (VInt lo) (VInt limit) (VInt 1) false
+     | Cons (VHsh hid, Nil) ->
+       (let by9 = aseq_kw (hderef hid) "by" in
+        let to9 = aseq_kw (hderef hid) "to" in
+        make_aseq world recv args (VInt lo) to9 (match by9 with VNil -> VInt 1 | v -> v) false)
+     | _ -> make_aseq world recv args (VInt lo) VNil (VInt 1) false)
+  | _ -> VNil
+
+// `(1.step(10, 2))` / `((1..10).step(3))` / `(1.step(by: 2, to: 10))`: the call
+// that made the sequence, from its @recv / @eargs. Called by the object
+// inspector directly (dispatching #inspect from there would come back here).
+and aseq_inspect_str = fn env -> fn world -> fn (oid: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  let key = str_of_int oid in
+  let rv = (if map_has ivars (key ++ "@recv") then map_get ivars (key ++ "@recv") else VNil) in
+  let ea = (match (if map_has ivars (key ++ "@eargs") then map_get ivars (key ++ "@eargs") else VNil) with VArr aid -> deref aid | _ -> Nil) in
+  let rec join9 = fn (xs: Val list) -> fn (acc: str) ->
+    (match xs with
+     | Nil -> acc
+     | Cons (VHsh hh, t) -> join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ aseq_kw_str (hderef hh) "")
+     | Cons (x, t) -> join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect x)) in
+  let rs = (match rv with VRange _ -> "(" ++ inspect rv ++ ")" | _ -> inspect rv) in
+  "(" ++ rs ++ ".step(" ++ join9 ea "" ++ "))"
+
 and make_enum = fn world -> fn (recv: Val) -> fn (meth: str) ->
   make_enum_a world recv meth Nil
 and make_enum_a = fn world -> fn (recv: Val) -> fn (meth: str) -> fn (eargs: Val list) ->
@@ -33614,7 +34103,7 @@ and mrsh_load = fn world -> fn (s: str) ->
 // come from different indices. Depth 0 was called from the top level, which ruby
 // labels <main>.
 and frame_line = fn (i: int) ->
-  (match map_get call_lines (str_of_int i) with VInt n -> n | _ -> 0)
+  (if map_has call_lines (str_of_int i) then map_get call_lines (str_of_int i) else 0)
 and frame_file = fn (i: int) ->
   (if map_has call_files_s (str_of_int i) then map_get call_files_s (str_of_int i) else "")
 and frame_label_at = fn (i: int) ->
@@ -33627,7 +34116,7 @@ and caller_list = fn (i: int) ->
 // caller(n) drops n frames, counting the current one as 0; the default is 1,
 // which is why `caller` starts at the frame that called us.
 and caller_depth = fn (u: unit) ->
-  if map_has struct_ctr "cd" then (match map_get struct_ctr "cd" with VInt k -> k | _ -> 0) else 0
+  if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0
 and caller_frames = fn (skip: int) ->
   let cd = caller_depth () in
   // the current frame is a frame: at the top level it is <main>, which is what
@@ -35521,8 +36010,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // A line marker: remember where we are, and answer VNil. The parser puts it
   // BEFORE its statement, so it is never the last statement of a body -- which
   // matters, because the last statement is the body's value.
-  | SLine n -> let _ = map_set cur_pos "l" (VInt n) in FNext VNil
-  | SFile f -> let _ = map_set cur_pos_s "f" f in FNext VNil
+  | SLine n -> let _ = map_set cur_pos "l" n in FNext VNil
+  | SFile f -> let _ = map_set_s cur_pos_s "f" f in FNext VNil
   | SPuts es ->
     // `puts` is a statement in this parser, so a user-defined one was not merely
     // outranked -- it was never consulted. Hand the statement to it when one is
@@ -36382,11 +36871,11 @@ and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (e
     // would overwrite the file the caller named the moment it runs.
     (let prog2 = drop_file_marks prog2 in
      let of9 = (if map_has cur_pos_s "f" then map_get cur_pos_s "f" else "") in
-     let ol9 = (if map_has cur_pos "l" then map_get cur_pos "l" else VInt 0) in
-     let _ = map_set cur_pos_s "f" efile in
-     let _ = map_set cur_pos "l" (VInt eline) in
+     let ol9 = (if map_has cur_pos "l" then map_get cur_pos "l" else 0) in
+     let _ = map_set_s cur_pos_s "f" efile in
+     let _ = map_set cur_pos "l" eline in
      let r9 = eval_run env world blk prog2 in
-     let _ = map_set cur_pos_s "f" of9 in
+     let _ = map_set_s cur_pos_s "f" of9 in
      let _ = map_set cur_pos "l" ol9 in
      r9)
 
@@ -39163,6 +39652,10 @@ let store_stats = fn world ->
   let _ = row "pool_hits" (if map_has frame_pool_n "hits" then map_get frame_pool_n "hits" else 0) in
   let _ = row "pool_news" (if map_has frame_pool_n "news" then map_get frame_pool_n "news" else 0) in
   let _ = row "pool_puts" (if map_has frame_pool_n "puts" then map_get frame_pool_n "puts" else 0) in
+  // block envs through the same pool (blk_env_get/put): puts that were block
+  // envs, and envs a closure captured that therefore stayed out of the pool.
+  let _ = row "blk_puts" (if map_has frame_pool_n "blk_puts" then map_get frame_pool_n "blk_puts" else 0) in
+  let _ = row "blk_kept" (if map_has frame_pool_n "blk_kept" then map_get frame_pool_n "blk_kept" else 0) in
   let _ = row "pool_drops" (if map_has frame_pool_n "drops" then map_get frame_pool_n "drops" else 0) in
   let _ = row "pool_bytes_wound_back" (if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) in
   // arena BYTES per store (v0.1.299 map_bytes/vec_bytes): where the resident
@@ -39215,6 +39708,11 @@ let store_stats = fn world ->
   row "insp_seen" (map_len insp_seen);
 
 let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
+  // diagnostics that must see the rubygems PRELOAD switch on here, first:
+  // collections during the preload's requires are real collections, and
+  // for a day they were invisible because the GC log was armed after them.
+  let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
+  let _ = map_set gc_state "log" (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then 0 else 1) in
   let _ = map_set load_ctx "dir" (mkstr (dirname_of name)) in
   let _ = map_set load_ctx "file" (mkstr name) in
   let _ = map_set loaded_files name VNil in
@@ -39345,6 +39843,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set consts "Encoding::Converter" (VClass "Encoding::Converter") in
   let _ = map_set consts "Enumerator::Chain" (VClass "Enumerator::Chain") in
   let _ = map_set consts "Enumerator::Yielder" (VClass "Enumerator::Yielder") in
+  let _ = map_set consts "Enumerator::ArithmeticSequence" (VClass "Enumerator::ArithmeticSequence") in
   let _ = map_set consts "Enumerator::Lazy" (VClass "Enumerator::Lazy") in
   let _ = map_set consts "Regexp::IGNORECASE" (VInt 1) in
   let _ = map_set consts "Regexp::EXTENDED" (VInt 2) in
@@ -39776,6 +40275,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   //     pressure" stopped being a guess.
   let _ = map_set gc_state "nolvup" (if str_eq (env_get "MERE_RUBY_GC_NO_LVUP_ROOT") "" then 0 else 1) in
   let _ = map_set gc_state "tight" (if str_eq (env_get "MERE_RUBY_GC_TIGHT") "" then 0 else 1) in
+  let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
   let _ = run_pre env world noblk prog in
   // The driver: plain recursion, no carry -- the collection is a function
   // now (gc_collect) and every store rebuilds in place through stable
@@ -39811,6 +40311,15 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
          | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in let _ = run_at_exits world in exit 1
          | VObj eid ->
            (let ec = map_get ocls (str_of_int eid) in
+            // an unrescued SystemExit (Kernel#exit / #abort) ends the program
+            // with the status it carries and says nothing: that is what exit
+            // means. Everything else is reported.
+            if str_eq ec "SystemExit" then
+              (let st = (if map_has ivars (str_of_int eid ++ "@__status")
+                         then (match map_get ivars (str_of_int eid ++ "@__status") with VInt n -> n | _ -> 0)
+                         else 0) in
+               let _ = run_at_exits world in exit st)
+            else
             let em = (if map_has ivars (str_of_int eid ++ "@message")
                       then (match map_get ivars (str_of_int eid ++ "@message") with VStr h -> sget h | other -> to_s other)
                       else ec) in

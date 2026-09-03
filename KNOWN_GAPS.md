@@ -294,6 +294,18 @@ recorded divergence left: reading the Gemfile, resolving it, building the
 definition and setting up the load paths all agree, with the same rubygems and
 bundler on both sides.
 
+**2026-09-03 update.** For two weeks the whole harness read FAIL with
+`Illformed requirement [""]`: a collection during the rubygems preload blanked
+the interned frozen strings (`"lit".freeze`) because their table was not a GC
+root, and bundler's gemspec is exactly a file of `"...".freeze` literals that
+gets loaded twice. Fixed by rooting the table (and the four others
+`tools/gc_roots_check.sh` found the same way); the gate now runs that check.
+What remains is one declared divergence, `versions`: ruby activates the
+bundler that ships with it (2.4.10) even though a newer bundler gem (2.6.7) is
+installed, because rubygems prefers the default gem for bundler; mere-ruby's
+activation takes the newest installed. Reading the Gemfile, resolving it and
+`Bundler.setup` agree.
+
 `Exception#backtrace` is the same gap seen from the other side: it answers
 `nil` rather than the frames the exception was raised through. It has to
 answer *something*, because a library reads a backtrace while it is
@@ -505,6 +517,31 @@ escape analysis a per-call region would have needed.
 So the honest statement is: allocation per call is now within ~2× of what a
 tree-walking interpreter of this shape costs, and the remaining factor is that
 **nothing is ever collected**, not that temporaries are held too long.
+
+**2026-09-03 update.** The numbers above are from before the frame pool, the
+statement/iteration regions and the store collector (Aug 2026); the section is
+kept because the reasoning in it is still how this is measured. Where it stands
+now, from `bench/block_env.sh` (400k iterations, region allocator's own
+counters -- peak RSS at this scale is not reproducible run to run):
+
+| program | default-region bytes | held by the loop statement | RSS slope |
+|---|---|---|---|
+| `while` + method call | 40 MB | 1 MB | 300 B/iter |
+| `n.times { f(x) }` | 69 MB | 66 MB | 317 B/iter |
+| CRuby, either | -- | -- | flat at 34 MB |
+
+Still linear, but the slope of the block loop came down from 1121 B/iter in
+one day of named changes: block envs now come from the frame pool and give
+their `lv_up` entry back (`blk_env_get` / `blk_env_put`), parameter binding
+and the body run in their own regions, and the per-call / per-statement
+bookkeeping (`cur_pos`, `struct_ctr`, `call_lines`, `live_frames`, the
+`call_*_s` names, run_block's ok-flag) stopped boxing scalars into the default
+region -- `bench/def_maps.sh` had charged 260 of 302 MB to those eleven maps.
+What remains is named in `bench/README.md`: ~165 B per block invocation held by
+the iterator's enclosing statement until the loop returns (a `while` gets a
+region per iteration, a block loop does not), and the collector's trigger,
+which watches the object stores and so never fires for a loop that allocates
+only frames.
 
 ### What the language allows (measured, `bench/reclaim.sh`)
 
