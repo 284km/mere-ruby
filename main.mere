@@ -4136,11 +4136,15 @@ and parse_primary = fn toks ->
        | Cons (TP p, r2) ->
          if is_lparen p then
            // defined?(x = 2) and friends answer "assignment" unevaluated.
-           if defined_assignish r2 then
-             let (_, r3) = parse_stmt r2 in (EStrL "assignment", expect r3 ")")
+           // `defined?((a, b = 1, 2))` wraps the assignment in ITS OWN parens,
+           // so the scan for a top-level `=` found it one level down and the
+           // whole thing read as an expression.
+           if defined_assignish r2
+              || (match r2 with Cons (TP lp2, r6) -> is_lparen lp2 && defined_assignish r6 | _ -> false) then
+             let (_, r3) = parse_stmt r2 in (EDefined (EVar ("__defined__" ++ defined_assign_kind r2)), expect r3 ")")
            // defined?(if.../while.../case... end) answers "expression".
            else if defined_compound r2 then
-             let (_, r3) = parse_stmt r2 in (EStrL "expression", expect r3 ")")
+             let (_, r3) = parse_stmt r2 in (EDefined (EVar "__defined__expression"), expect r3 ")")
            else
            // defined?(puts) — a keyword-named method probes as a plain call.
            // parse the inner expression at the lowest precedence so the word
@@ -4152,12 +4156,12 @@ and parse_primary = fn toks ->
             | _ -> let (e, r3) = parse_andor r2 in (EDefined e, expect r3 ")"))
          // `defined? a = 10` (no parens) — an assignment is unevaluated.
          else if defined_assignish r then
-           let (_, r3) = parse_stmt r in (EStrL "assignment", r3)
+           let (_, r3) = parse_stmt r in (EDefined (EVar ("__defined__" ++ defined_assign_kind r)), r3)
          else let (e, r3) = parse_unary r in (EDefined e, r3)
        // `defined? a = 10` at statement start (no leading paren token).
        | _ ->
          if defined_assignish r then
-           let (_, r3) = parse_stmt r in (EStrL "assignment", r3)
+           let (_, r3) = parse_stmt r in (EDefined (EVar ("__defined__" ++ defined_assign_kind r)), r3)
          else let (e, r3) = parse_unary r in (EDefined e, r3))
     else if str_eq id "break" || str_eq id "next" || str_eq id "return" || str_eq id "redo" || str_eq id "retry" then
       // flow keywords in expression position (ternary branches, call args).
@@ -6012,6 +6016,28 @@ and defined_compound = fn toks ->
   | _ -> false
 
 and defined_assignish = fn toks -> defined_assign_go toks 0
+
+// `defined?(a[0] = 1)` is "method" -- the []= CALL -- while `defined?(x = 1)`
+// is "assignment". CRuby splits them on the TARGET, and only for a plain `=`:
+// an op-assign writes through the same setter and is still "assignment".
+// The two tokens before the `=` say which: `] =` is an index write, and
+// `. name =` an attribute write.
+and defined_assign_kind = fn toks -> defined_assign_kind_go toks 0 TEOF TEOF
+and defined_assign_kind_go = fn toks -> fn (depth: int) -> fn (p1: Tok) -> fn (p2: Tok) ->
+  match toks with
+  | Nil -> "assignment"
+  | Cons (TP p, r) ->
+    if is_lparen p || str_eq p "[" || str_eq p " [" || str_eq p "\{" || str_eq p "(s" then
+      defined_assign_kind_go r (depth + 1) (TP p) p1
+    else if str_eq p ")" || str_eq p "]" || str_eq p "}" then
+      defined_assign_kind_go r (depth - 1) (TP p) p1
+    else if depth == 0 && str_eq p "=" then
+      (match p1 with
+       | TP c -> (if str_eq c "]" then "method" else "assignment")
+       | TId _ -> (match p2 with TP d -> (if str_eq d "." then "method" else "assignment") | _ -> "assignment")
+       | _ -> "assignment")
+    else defined_assign_kind_go r depth (TP p) p1
+  | Cons (t, r) -> defined_assign_kind_go r depth t p1
 
 and defined_assign_go = fn toks -> fn (depth: int) ->
   match toks with
@@ -11533,33 +11559,84 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else eval_e env world blk else_e
   | ECaseNone -> VNil   // only meaningful as an SCase subject marker
   | EDefined e ->
+    // A desugared string or regexp LITERAL answers "expression", not the `+`
+    // chain (nor the `.__regex` call) it is built from. The lexer opens both
+    // with an empty TStrL, so the leftmost leaf of the chain marks it -- and
+    // ruby answers "expression" for a literal however many interpolations it
+    // has, INCLUDING ones that would raise, because defined? never evaluates
+    // it. `"" + x` written by hand is indistinguishable and gets the same
+    // answer, where ruby says "method"; that is the price of the marker.
+    // ...and the answer is a FROZEN string, which the spec checks. mkstr
+    // allocates a fresh id per call, so this freezes only this one object.
+    (let ans9 =
+      (if interp_literal e then mkstr "expression"
+    else
     (match e with
      | ENil -> mkstr "nil"
      | EBool b -> if b then mkstr "true" else mkstr "false"
-     | EBin (_, _, _) -> mkstr "method"   // operators are method calls
-     | EUn (_, _) -> mkstr "method"
+     // `&&`, `||`, `and` and `or` are CONTROL FLOW, not method calls: ruby
+     // answers "expression" for them however undefined their operands are,
+     // and evaluates nothing. That is most of what defined? is asked in
+     // ruby/spec, and answering "method" was wrong for all of it.
+     //
+     // Every other operator IS a method call, and there ruby EVALUATES the
+     // operands -- side effects and all -- and answers nil if that raises.
+     // `defined?(1 == nope)` is nil, `defined?(not DS.raises)` is nil, and
+     // `defined?(DS.side_effects == 1)` really does run side_effects.
+     | EBin (op, l, r) ->
+       (if str_eq op "&&" || str_eq op "||" then mkstr "expression"
+        else if defined_operand_failed env world blk l then VNil
+        else if defined_operand_failed env world blk r then VNil
+        // ...and the operator has to exist ON THE VALUE the left operand
+        // produced: `defined?(DS.side_effects / 2)` is nil when what
+        // side_effects returns has no #/ , even though both operands are
+        // themselves perfectly defined.
+        else
+          (let lv9 = defined_eval_recv env world blk l in
+           match lv9 with
+           | VSym m9 -> (if str_eq m9 "__mere_defined_fail__" then VNil else mkstr "method")
+           | _ -> (if responds world lv9 op then mkstr "method" else VNil)))
+     | EUn (_, x) ->
+       (if defined_operand_failed env world blk x then VNil else mkstr "method")
      | ESelf -> mkstr "self"
      | EVar name ->
+       // The parser answers some forms WITHOUT evaluating them -- an
+       // assignment, a setter call, a compound statement -- and routes them
+       // here under a marker name so the answer is frozen like every other
+       // one (the spec checks `defined?(x = 1).frozen?`).
+       if str_eq name "__defined__assignment" then mkstr "assignment"
+       else if str_eq name "__defined__method" then mkstr "method"
+       else if str_eq name "__defined__expression" then mkstr "expression"
        // keyword literals reach here as bare names inside defined?(...).
-       if str_eq name "nil" then mkstr "nil"
+       else if str_eq name "nil" then mkstr "nil"
        else if str_eq name "true" then mkstr "true"
        else if str_eq name "false" then mkstr "false"
        else if str_eq name "self" then mkstr "self"
        // `defined?(yield)` / `defined?(super)` reach here as bare words (the
        // word precedes the closing paren). yield is defined iff a block was
        // given; super iff the current method has an ancestor definition.
+       // A bare word inside defined?(...) is taken as a NAME by the parser, so
+       // these never reach the nodes they would normally parse to:
+       // `defined?(__LINE__)` would be an EInt and `defined?(break)` an EFlow,
+       // and both answer "expression" in ruby. Read as names they were neither
+       // a local nor a method, so every one of them was nil.
+       else if str_eq name "__FILE__" || str_eq name "__LINE__" || str_eq name "__ENCODING__"
+               || str_eq name "break" || str_eq name "next" || str_eq name "redo"
+               || str_eq name "retry" || str_eq name "return" then mkstr "expression"
        else if str_eq name "yield" then (let (has, _, _, _) = blk in if has then mkstr "yield" else VNil)
-       else if str_eq name "super" then
-         (let (m2, s2, o2, i2) = world in
-          let defcls = (match (if lv_has env "__defcls" then lv_get env "__defcls" else VNil) with VClass c -> c | _ -> "") in
-          let meth = (match (if lv_has env "__meth" then lv_get env "__meth" else VNil) with VStr s -> sget s | _ -> "") in
-          if str_eq defcls "" || str_eq meth "" then VNil
-          else if (let sc = (if map_has s2 defcls then map_get s2 defcls else "Object") in has_meth world sc meth) then mkstr "super"
-          else VNil)
+       else if str_eq name "super" then defined_super_str env world
        // $globals and @/@@-prefixed names have their own categories.
        else if str_len name > 0 && str_eq (char_at name 0) "$" then
          (let k = gvar_slot (substring name 1 (str_len name)) in
-          if str_len k == 1 && k >= "1" && k <= "9" then
+          // MRI special-cases $! and $~: they are "global-variable" even when
+          // nothing has been raised or matched. The comment in
+          // language/defined_spec says so, and the spec asserts it.
+          if str_eq k "!" || str_eq k "~" then mkstr "global-variable"
+          // $& / $` / $' are READ OUT of $~, so they are defined exactly when
+          // the last match succeeded -- not when a slot of their own exists.
+          else if str_eq k "&" || str_eq k "`" || str_eq k "'" || str_eq k "+" then
+            (if map_has globals "~" && truthy (map_get globals "~") then mkstr "global-variable" else VNil)
+          else if str_len k == 1 && k >= "1" && k <= "9" then
             (if map_has globals k && truthy (map_get globals k) then mkstr "global-variable" else VNil)
           else if map_has globals k then mkstr "global-variable" else VNil)
        else if str_len name >= 2 && str_eq (substring name 0 2) "@@" then
@@ -11573,8 +11650,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | VMain -> if map_has ivars2 ("main@" ++ iv) then mkstr "instance-variable" else VNil
           | VClass c -> if map_has ivars2 ("cls:" ++ c ++ "@" ++ iv) then mkstr "instance-variable" else VNil
           | _ -> VNil)
-       else if is_upper_first name then
-         (if map_has consts name then mkstr "constant" else VNil)
+       // a CONSTANT read walks the lexical nesting and then the ancestors, so
+       // `defined?(MixinConstant)` inside a class that includes Mixin is
+       // "constant". Only the bare name was tried here.
+       else if is_upper_first name then eval_e env world blk (EDefined (EConst name))
        else if lv_has env name then mkstr "local-variable"
        else if is_method_defined env world name || is_kernel_builtin name then mkstr "method"
        else VNil
@@ -11591,6 +11670,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (if str_len name > 2 && str_eq (substring name 0 2) "::" then
           (if map_has consts (substring name 2 (str_len name)) then mkstr "constant" else VNil)
         else if map_has consts name then mkstr "constant"
+        else if (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s9 -> sget s9 | _ -> "") else cur_lex ()) in
+                 (if str_eq (lex_const_key cref9 name) "" then false else true)
+                 || (if str_eq (anc_const_key world cref9 name) "" then false else true)) then mkstr "constant"
         else if str_contains name "::" then
           (let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else cur_lex ()) in
            let hk = lex_const_key cref0 (const_head name) in
@@ -11622,7 +11704,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            // respond_to_missing? -- which is why ruby ends up asking it.
            else if responds world rv name then mkstr "method" else VNil)
         | VClass c -> if str_eq name "new" || has_meth world c name || has_meth world ("(sng:" ++ c ++ ")") name then mkstr "method" else VNil
-        | _ -> mkstr "method")
+        // ...and a PRIMITIVE receiver is asked too. This answered "method"
+        // for anything at all, so `defined?(1.foo)` and `defined?("s".nope)`
+        // both claimed a method that does not exist.
+        | _ ->
+          (let cls9 = dispatch_cls_of world rv in
+           if has_meth world cls9 name then
+             (if meth_private world cls9 name then VNil else mkstr "method")
+           else if responds world rv name then mkstr "method"
+           else VNil))
      | EScopedRead (recv, cn) ->
        // defined?(recv::Const): the receiver may raise or be a non-class
        // (e.g. `a::B` where a() returns nil) — then the const is undefined.
@@ -11632,7 +11722,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              | VClass c -> if map_has consts (c ++ "::" ++ cn) then mkstr "constant" else VNil
              | _ -> VNil)
      | EYield _ -> let (has, _, _, _) = blk in if has then mkstr "yield" else VNil
-     | _ -> mkstr "expression")   // literals, operators, ranges, ternary, etc.
+     // An array LITERAL is defined only if every element is: ruby answers nil
+     // for `defined?([Object, Undefined])`. It was "expression" whatever it
+     // held, because the literal fell into the catch-all.
+     | EArr es9 -> (if defined_all_elems env world blk es9 then mkstr "expression" else VNil)
+     // `defined? super` WITHOUT parens parses as a real super node (the
+     // parenthesised spelling reaches EVar "super" instead), so this arm was
+     // missing and every one of them answered "expression".
+     | ESuper (_, _) -> defined_super_str env world
+     | _ -> mkstr "expression")) in   // literals, operators, ranges, ternary
+     (match ans9 with VStr h9 -> (let _ = sfrozen_set h9 in ans9) | _ -> ans9))
   | ESuper (zsuper, arges) ->
     let (meths, sup, ocls, ivars) = world in
     let defcls = (match lv_get env "__defcls" with VClass c -> c | _ -> "") in
@@ -13089,6 +13188,59 @@ and shift_width_v = fn env -> fn world -> fn (v: Val) ->
 
 // CRuby coerce_failed display: an immediate (nil/true/false/Integer/Float/
 // Symbol) shows its inspect; a heap object shows its class name.
+// Is this expression a desugared string / regexp LITERAL? Both are built as
+// `("" + seg + ...)` -- a regexp with `.__regex(flags)` on top -- and the
+// lexer always starts the chain with an empty TStrL, so the leftmost leaf
+// says so. Used only by defined?, which must not evaluate what it looks at.
+and interp_literal = fn (e: Expr) ->
+  match e with
+  | EBin (op, l, _) -> str_eq op "+" && interp_literal l
+  | EMethod (inner, m, _) -> str_eq m "__regex" && interp_literal inner
+  | EStrL x -> str_eq x ""
+  | _ -> false
+
+// every element of an array literal, asked the defined? question
+and defined_all_elems = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
+  match es with
+  | Nil -> true
+  | Cons (h, t) ->
+    (match eval_e env world blk (EDefined h) with
+     | VNil -> false
+     | _ -> defined_all_elems env world blk t)
+
+// Is this operand a reason for the whole `defined?` to be nil? Two ways, and
+// only one of them is a raise:
+//   - the operand is not itself defined -- `defined?(!@unset_iv)` is nil, and
+//     READING an unset instance variable raises nothing at all
+//   - evaluating it raises -- `defined?(not DS.raises)` is nil
+// The defined? question is asked FIRST, because it evaluates receivers only;
+// running the operand afterwards keeps ruby's side effects happening once.
+and defined_operand_failed = fn env -> fn world -> fn blk -> fn (e: Expr) ->
+  if (match eval_e env world blk (EDefined e) with VNil -> true | _ -> false) then true
+  else
+    (match defined_eval_recv env world blk e with
+     | VSym m -> str_eq m "__mere_defined_fail__"
+     | _ -> false)
+
+// `defined?(super)` -- shared by the bare-word spelling (which reaches
+// EVar "super") and the real super node (`defined? super` without parens).
+and defined_super_str = fn env -> fn world ->
+  let (m2, s2, o2, i2) = world in
+  let defcls = (match (if lv_has env "__defcls" then lv_get env "__defcls" else VNil) with VClass c -> c | _ -> "") in
+  let meth = (match (if lv_has env "__meth" then lv_get env "__meth" else VNil) with VStr s -> sget s | _ -> "") in
+  let recv9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+  if str_eq defcls "" || str_eq meth "" then VNil
+  // The SAME walk a real super does -- strictly after the class or module the
+  // current method is defined in, along the receiver's ancestors. Reading only
+  // the direct superclass missed every super that lands in an included module,
+  // which is the shape ruby/spec uses to test super at all.
+  else if is_sng_cls defcls then
+    (let sc9 = sng_supername world defcls in
+     if has_meth world sc9 meth then mkstr "super" else VNil)
+  else
+    (let a9 = lookup_anc world (anc_after (ancestors_of world (super_base world recv9)) defcls) meth in
+     if str_eq a9 "" then VNil else mkstr "super")
+
 and coerce_operand_display = fn world -> fn (v: Val) ->
   match v with
   | VNil -> "nil" | VBool b -> (if b then "true" else "false")
@@ -16646,7 +16798,13 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // printer, which knows them by their side tables; only an object with no
     // other answer gets the default one.
     else if map_has enc_name (str_of_int oid) then inspect v
-    else if map_has md_whole (str_of_int oid) then inspect v
+    // ...and the MATCH is built here, not delegated: the leaf `inspect` has no
+    // ivars, so it can only answer `#<object>` for a MatchData, which is what
+    // `p $~` and `p [$~]` printed while `$~.inspect` was already right. Two
+    // printers, and only one of them could see the groups.
+    else if map_has md_whole (str_of_int oid) then
+      "#<MatchData " ++ inspect (mkstr (map_get md_whole (str_of_int oid)))
+      ++ md_insp_groups iv2 oid 1 ++ ">"
     // A backtrace Location reads as the frame it names, and it has to be
     // answered HERE as well as in the dispatcher: an element inside an array is
     // formatted by this printer, not by a to_s call, so `p caller_locations`
@@ -23507,32 +23665,87 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   // is what decides whether optparse accepts it. Calling the method already
   // worked; only the question was answered wrong.
   | VStr _ -> (if undef_blocked world (dispatch_cls_of world recv) name then false
-               else prim_user_has world recv name || is_prim_method name || is_str_method name || str_eq name "to_str")
-  | VProc _ -> is_prim_method name || is_proc_method name
+               else prim_user_has world recv name || is_prim_method name || is_str_method name || str_eq name "to_str"
+                    || op_responds recv name)
+  | VProc _ -> is_prim_method name || is_proc_method name || op_responds recv name
   // the implicit-conversion protocol is per type, so a duck-type check
   // (`x.respond_to? :to_str`) tells strings from everything else.
-  | VArr _ -> prim_user_has world recv name || is_prim_method name || is_arr_method name
-  | VHsh _ -> prim_user_has world recv name || is_prim_method name || is_hash_method name
+  | VArr _ -> prim_user_has world recv name || is_prim_method name || is_arr_method name || op_responds recv name
+  | VHsh _ -> prim_user_has world recv name || is_prim_method name || is_hash_method name || op_responds recv name
   // the numeric primitives, so `5.method(:abs)` and respond_to? agree with
   // what the dispatcher actually implements.
-  | VInt _ -> prim_user_has world recv name || is_prim_method name || num_has recv name
-  | VFlt _ -> prim_user_has world recv name || is_prim_method name || num_has recv name
+  | VInt _ -> prim_user_has world recv name || is_prim_method name || num_has recv name || op_responds recv name
+  | VFlt _ -> prim_user_has world recv name || is_prim_method name || num_has recv name || op_responds recv name
   // Bignum, Rational and Complex had no entry at all and fell to the default
   // "no", so Complex#to_r was reachable but respond_to?(:to_r) denied it --
   // and ruby's Rational() decides which protocol to use by asking exactly that.
-  | VBig _ -> prim_user_has world recv name || is_prim_method name || num_has recv name
-  | VRat (_, _) -> prim_user_has world recv name || is_prim_method name || num_has recv name
-  | VCpx (_, _) -> prim_user_has world recv name || is_prim_method name || num_has recv name
+  | VBig _ -> prim_user_has world recv name || is_prim_method name || num_has recv name || op_responds recv name
+  | VRat (_, _) -> prim_user_has world recv name || is_prim_method name || num_has recv name || op_responds recv name
+  | VCpx (_, _) -> prim_user_has world recv name || is_prim_method name || num_has recv name || op_responds recv name
   | VRange (_, _, _) ->
     is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
+    || op_responds recv name
   // a Regexp had no entry at all, so it denied `match` -- and optparse asks
   // exactly that before accepting a pattern (`pat.respond_to?(:match) or
   // raise`), which is where its load stopped.
-  | VRegex (_, _) -> prim_user_has world recv name || is_regex_method name || is_prim_method name
+  | VRegex (_, _) -> prim_user_has world recv name || is_regex_method name || is_prim_method name || op_responds recv name
   // every other primitive -- Symbol, nil, true/false -- can have methods too,
   // through its own class or through a reopened Kernel: `module Kernel; def m`
   // makes `:sym.respond_to?(:m)` true, and asking the table is what says so.
-  | _ -> prim_user_has world recv name || is_prim_method name
+  // Symbol had no arm of its own, so `:s.respond_to?(:to_proc)` was false
+  // for a method that works -- and `defined?(:s.to_proc)` with it.
+  | VSym _ -> prim_user_has world recv name || is_prim_method name || is_sym_method name || op_responds recv name
+  | _ -> prim_user_has world recv name || is_prim_method name || op_responds recv name
+
+// The OPERATORS a primitive answers. respond_to? has to agree with the call:
+// the dispatcher answers `1.send(:+, 2)` and `1.+(2)` through one allowlist,
+// so `1.respond_to?(:+)` saying false was the same fact spelled two ways --
+// and it is what made `defined?(42 / 2)` nil and every arithmetic operator
+// invisible to a duck-type check.
+//
+// The sets are ruby's, asked per receiver kind: a Float has no `<<` or `~`, a
+// Complex has no ordering, a Hash orders but does not add. `!` and `===` come
+// from Object and belong to everything.
+and op_responds = fn (v: Val) -> fn (name: str) ->
+  if str_eq name "!" || str_eq name "===" then true
+  else
+    (let arith = str_eq name "+" || str_eq name "-" || str_eq name "*" || str_eq name "/" || str_eq name "**" in
+     let ord = str_eq name "<" || str_eq name "<=" || str_eq name ">" || str_eq name ">=" in
+     let bits = str_eq name "&" || str_eq name "|" || str_eq name "^" in
+     let shift = str_eq name "<<" || str_eq name ">>" in
+     match v with
+     | VInt _ -> arith || ord || bits || shift || str_eq name "%" || str_eq name "~" || str_eq name "[]"
+     | VBig _ -> arith || ord || bits || shift || str_eq name "%" || str_eq name "~" || str_eq name "[]"
+     | VFlt _ -> arith || ord || str_eq name "%"
+     | VRat (_, _) -> arith || ord || str_eq name "%"
+     | VCpx (_, _) -> arith
+     | VStr _ -> ord || str_eq name "+" || str_eq name "*" || str_eq name "%" || str_eq name "<<"
+     // an Array has & and | but NOT ^ (Ruby gives it no symmetric difference)
+     | VArr _ -> str_eq name "+" || str_eq name "-" || str_eq name "*" || str_eq name "<<"
+                 || str_eq name "&" || str_eq name "|"
+     | VHsh _ -> ord
+     | VSym _ -> ord || str_eq name "=~" || str_eq name "[]"
+     | VNil -> bits || str_eq name "=~"
+     | VBool _ -> bits
+     | VRange (_, _, _) -> str_eq name "%"
+     | VRegex (_, _) -> str_eq name "~"
+     | VProc _ -> shift
+     | _ -> false)
+
+// Symbol method names the dispatcher implements, for respond_to?. Taken by
+// asking mere-ruby to CALL each of ruby's Symbol instance methods, so the
+// claim cannot be wider than the implementation. `id2name` and `name` are the
+// two ruby has that this does not (MISSING_NAMES.md).
+and is_sym_method = fn (name: str) ->
+  str_eq name "[]" || str_eq name "<=>" || str_eq name "=~" ||
+  str_eq name "capitalize" || str_eq name "casecmp" || str_eq name "casecmp?" ||
+  str_eq name "downcase" || str_eq name "empty?" || str_eq name "encoding" ||
+  str_eq name "end_with?" || str_eq name "inspect" || str_eq name "intern" ||
+  str_eq name "length" || str_eq name "match" || str_eq name "match?" ||
+  str_eq name "next" || str_eq name "size" || str_eq name "slice" ||
+  str_eq name "start_with?" || str_eq name "succ" || str_eq name "swapcase" ||
+  str_eq name "to_proc" || str_eq name "to_s" || str_eq name "to_sym" ||
+  str_eq name "upcase" || str_eq name "id2name" || str_eq name "name"
 
 // Regexp method names the dispatcher implements, for respond_to?.
 and is_regex_method = fn (name: str) ->
@@ -25187,6 +25400,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else if n < 0 || n > 1114111 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
         else prim_raise "NotImplementedError" ("Integer#chr in " ++ given ++ " is not implemented here"))
      | VStr sv -> let sv = sget sv in mkstr (utf8_char sv 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "chr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chr'")) in fail "mere-ruby: undefined method 'chr'")))
+  // Symbol#id2name is #to_s, and Symbol#name is the same string FROZEN. Both
+  // were absent, which also made `:s.respond_to?(:id2name)` false for a name
+  // ruby has.
+  else if (str_eq name "id2name" || str_eq name "name")
+          && (match recv with VSym _ -> true | _ -> false) then
+    (match recv with
+     | VSym sy ->
+       (let h9 = mkstr sy in
+        let _ = (if str_eq name "name" then (match h9 with VStr i9 -> sfrozen_set i9 | _ -> ()) else ()) in
+        h9)
+     | _ -> VNil)
   else if str_eq name "to_sym" || str_eq name "intern" then
     // the symbol KEEPS the string's encoding (recorded aside -- VSym is just
     // the name): ascii-only content is US-ASCII, invalid content refuses.

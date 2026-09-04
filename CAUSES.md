@@ -10,41 +10,17 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 324 files.
+Classified: 317 files.
 
-## CRASH — 11 files, 6 kinds
-
-| files | kind |
-|---|---|
-| 4 | `stack overflow (recursion too deep)` |
-| 2 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
-| 2 | `FAILED raised StandardError, expected TypeError` |
-| 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
-| 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
-| 1 | `*.rb:N: mere-ruby: expected a variable after for in TMPDIR near line N` |
-
-<details><summary>the same rows by exact cause (top 40)</summary>
-
-| files | cause |
-|---|---|
-| 4 | `stack overflow (recursion too deep)` |
-| 2 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
-| 2 | `FAILED: raised StandardError, expected TypeError` |
-| 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
-| 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 334` |
-| 1 | `*.rb:N: mere-ruby: expected a variable after for in TMPDIR near line 20` |
-
-</details>
-
-## DIFF — 313 files, 101 kinds
+## DIFF — 317 files, 102 kinds
 
 | files | kind |
 |---|---|
 | 45 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 16 | `ERROR StandardError` |
-| 14 | `FAILED expected ArgumentError to be raised` |
-| 14 | `ERROR NameError` |
+| 15 | `FAILED expected ArgumentError to be raised` |
+| 15 | `ERROR NameError` |
 | 12 | `FAILED expected to be identical` |
 | 11 | `FAILED expected TypeError to be raised` |
 | 10 | `FAILED expected true, got false` |
@@ -65,6 +41,7 @@ Classified: 324 files.
 | 3 | `FAILED expected RangeError to be raised` |
 | 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected :SYM, got :SYM` |
+| 3 | `ERROR RangeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED raised NoMethodError, expected ArgumentError` |
 | 2 | `FAILED expected not to be identical` |
@@ -76,7 +53,6 @@ Classified: 324 files.
 | 2 | `FAILED expected :SYM, got nil` |
 | 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR RuntimeError` |
-| 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 1 | `FAILED raised StandardError, expected TypeError` |
@@ -124,6 +100,7 @@ Classified: 324 files.
 | 1 | `FAILED expected N ...[clipped]` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
+| 1 | `FAILED expected Infinity, got nil` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
@@ -146,7 +123,7 @@ Classified: 324 files.
 
 | files | cause |
 |---|---|
-| 14 | `FAILED: expected ArgumentError to be raised` |
+| 15 | `FAILED: expected ArgumentError to be raised` |
 | 11 | `FAILED: expected TypeError to be raised` |
 | 4 | `FAILED: expected NameError to be raised` |
 | 3 | `FAILED: returns self: expected to be identical` |
@@ -179,13 +156,13 @@ Classified: 324 files.
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
+| 1 | `FAILED: works with infinity bounds: expected Infinity, got nil` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: the String shows the method name, Module defined in and Module extracted from: expected "#<UnboundMethod:0xADDR>" to match` |
 | 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
-| 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 
 </details>
 
@@ -206,10 +183,10 @@ class column says where the weight sits.
 | symbol (5) | `all_symbols intern match name slice` |
 | rational (4) | `divide minus multiply plus` |
 | unboundmethod (3) | `bind_call clone super_method` |
+| language (3) | `alias constants module` |
 | integer (3) | `ceildiv div try_convert` |
 | proc (2) | `binding new` |
 | numeric (2) | `integer real` |
-| language (2) | `alias module` |
 | threadgroup (1) | `list` |
 | range (1) | `overlap` |
 

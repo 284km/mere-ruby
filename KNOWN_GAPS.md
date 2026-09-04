@@ -1913,3 +1913,105 @@ as answers. mere-ruby bisects the doubles themselves, which cannot reach
 so the bracket is first narrowed by probing outward). Closing it needs a
 double↔int64 bit mapping, which this language has no direct way to write —
 `ldexp` is the only libm route in, and there is no `frexp` with an out-parameter.
+
+## `defined?` was answering a different question, 116 times in one file
+
+`language/defined_spec.rb` failed 116 of its assertions — the largest single
+concentration of failures in the record, and all of one keyword. Working it
+down took eleven separate rules, and the shape of the mistake was the same in
+most of them: **mere-ruby was answering "is there a method with this name",
+where ruby asks something narrower.**
+
+The rules, in the order the oracle gave them up:
+
+1. **`&&`, `||`, `and`, `or` are control flow, not method calls.** They answer
+   `"expression"` however undefined their operands are, and nothing is
+   evaluated. `EBin (_, _, _) -> "method"` covered them along with `+` and
+   `==`, and that one line was most of the 116.
+2. **Every other operator IS a method call, and ruby EVALUATES its operands.**
+   `defined?(1 == nope)` is nil because evaluating `nope` raises;
+   `defined?(DS.side_effects == 1)` really does run `side_effects`. Then it
+   asks whether the value the left operand produced *has* the operator, which
+   is why `defined?(DS.side_effects / 2)` is nil while
+   `defined?(DS.fixnum_method / 2)` is `"method"`.
+3. **A desugared string or regexp literal is `"expression"`**, not the `+`
+   chain it is built from — including one whose interpolation would raise,
+   because `defined?` never evaluates it. The lexer opens both with an empty
+   `TStrL`, so the leftmost leaf of the chain is the marker.
+4. **`a[0] = 1` is the `[]=` CALL** (`"method"`); `x = 1` is an
+   `"assignment"`. Only a plain `=` splits that way — an op-assign is
+   `"assignment"` whatever it writes through — and the two tokens before the
+   `=` say which.
+5. **`$!` and `$~` are `"global-variable"` even when nothing was raised or
+   matched** (MRI special-cases them, and the spec says so in a comment).
+   `$&`, `` $` ``, `$'` and `$+` are read out of `$~`, so they follow the last
+   match rather than having slots of their own.
+6. **A bare word inside `defined?(...)` is taken as a NAME by the parser**, so
+   `__LINE__` never becomes an `EInt` and `break` never becomes an `EFlow`.
+   Read as names they were neither a local nor a method, and every one of them
+   was nil where ruby says `"expression"`.
+7. **An array literal is defined only if every element is.**
+8. **The answer is a frozen string**, which the spec checks. The parser answers
+   some forms without evaluating them, and those went out unfrozen until they
+   were routed through the same wrapper as everything else.
+9. **`defined? super` without parens is a real super node** — the
+   parenthesised spelling reaches `EVar "super"` instead — so that arm was
+   missing and all of them answered `"expression"`.
+10. **`super` walks the ancestors, modules included**, exactly as a real super
+    does. Reading only the direct superclass missed every super that lands in
+    an included module, which is the shape ruby/spec uses to test it.
+11. **A constant read walks the lexical nesting and then the ancestors.** Only
+    the bare name was tried, so `defined?(MixinConstant)` inside a class that
+    includes `Mixin` was nil.
+
+116 failures became 8. Five of the remaining eight are `defined?` asked about a
+receiver's method in ways this dispatcher cannot yet answer; two are
+`const_missing` suppression; one is the `$~`-in-a-block gap below. ruby's own
+side of that file fails one assertion and errors on five, all of them this
+shim's missing mocks rather than the interpreter's.
+
+### ...and `respond_to?` did not know the operators
+
+Rule 2 needs `1.respond_to?(:/)`, and it was **false** — as were `+ - * % **`,
+the bit operators, the shifts and the orderings, on every primitive. The
+dispatcher answers `1.send(:+, 2)` and `1.+(2)` through one allowlist, so the
+question and the call were the same fact spelled two ways and only one of them
+was right. Every arithmetic operator was invisible to a duck-type check.
+
+The operator sets are now asked **per receiver kind**, from ruby: a Float has
+no `<<` or `~`, a Complex has no ordering, a Hash orders but does not add, an
+Array has `&` and `|` but no `^`. `!` and `===` come from Object and belong to
+everything. Symbol had no arm in `respond_to?` at all, so `:s.respond_to?(:to_proc)`
+was false for a method that works; its list was built by asking mere-ruby to
+CALL each of ruby's Symbol instance methods, so the claim cannot be wider than
+the implementation.
+
+## `$~` is scoped to the frame that matched, and a block is not a frame
+
+```ruby
+def yielder; yield; end
+"abc" =~ /a(b)c/
+yielder { $~ }     # ruby: #<MatchData "abc" 1:"b">   here: nil
+```
+
+`$~` (and with it `$1`..`$9`, `$&`, `` $` ``, `$'`) is frame-scoped: a method's
+match is invisible to its caller and the caller's invisible to the method.
+mere-ruby implements that by saving and clearing one global slot around each
+method frame, and **the comment on that code asserts the wrong rule** — that a
+block is not a frame and shares the method's. It does share a frame, but the
+frame it shares is the one it was DEFINED in, not the one it is yielded into.
+So a block passed to a user-defined method sees that method's (empty) match
+instead of its own scope's.
+
+A block passed to a BUILTIN is fine (`[1].each { $& }` works — no frame is
+made), and `proc.call` and `lambda.call` are fine, so the gap is narrow: a
+block that reads its caller's match while yielded from a user-defined method.
+
+Closing it properly means `$~` living in the frame rather than in a global,
+with the read walking the env chain — and the eighteen places that publish a
+match are leaf regexp helpers with no env to write into. The single global slot
+is what makes them possible, so this is a design change, not a patch.
+
+The visible cost meanwhile: a helper like `def show(l); puts yield; end` cannot
+be used to test the match globals, because it tests this instead. corpus 176
+reads them at top level for that reason.

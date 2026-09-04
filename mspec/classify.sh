@@ -45,20 +45,41 @@ files=0
 for g in $groups; do
   tag="$here/tags/$(printf '%s' "$g" | tr '/' '_').txt"
   [ -f "$tag" ] || continue
-  for f in $(awk '$1 == "DIFF" || $1 == "CRASH" { print $2 }' "$tag"); do
+# The bucket has to be a DIFFERENCE, not a failure. This shim is not real
+# mspec: it has no IOStub, no #should_receive, no mock_int, so plenty of
+# examples raise NoMethodError on BOTH sides -- identically, so they are not
+# what makes the file a DIFF. Recording only mere-ruby's side counted 399
+# NoMethodErrors, and core/kernel/warn_spec's 24 of them were every one a
+# missing facility in this file rather than a missing method in mere-ruby.
+# Working that bucket would have changed no verdict at all.
+#
+# So each side's lines are collected and the RUBY side is subtracted. What is
+# left is what mere-ruby fails and ruby does not.
+raw_m="$(mktemp)"; raw_r="$(mktemp)"
+trap 'rm -f "$raw_m" "$raw_r"' EXIT INT TERM
+normalise() {
+  grep -a '^FAILED:\|^ERROR:' \
+    | sed -e "s|${HOME}[^ \"]*|HOME|g" \
+          -e 's|/var/folders/[^ ]*|TMPDIR|g' \
+          -e 's|0x[0-9a-f]*|0xADDR|g' \
+    | awk -v n=300 '{ if (length($0) > n) print substr($0,1,n) " ...[clipped]"; else print $0 }'
+}
+bucket() {
+  sed -e 's/^ERROR: .*: \([A-Za-z:]*Error\)$/ERROR\t\1/' \
+      -e 's/^FAILED: raised \([A-Za-z:]*\), expected \([A-Za-z:]*\)$/RAISED\traised \1, expected \2/' \
+      -e 's/^FAILED: .*: \(expected .*\)$/FAILED\t\1/' \
+      -e 's/^FAILED: \(.*\)$/FAILED\t\1/' \
+      -e 's/^ERROR: \(.*\)$/ERROR\t\1/'
+}
+for f in $(awk '$1 == "DIFF" || $1 == "CRASH" { print $2 }' "$tag"); do
     files=$((files+1))
-    out="$("$here/run_spec.sh" "$specroot/$f" 2>&1 | sed -n '/^--- mere-ruby:/,/^--- ruby:/p')"
-    printf '%s\n' "$out" \
-      | grep -a '^FAILED:\|^ERROR:' \
-      | sed -e 's/^ERROR: .*: \([A-Za-z:]*Error\)$/ERROR\t\1/' \
-            -e 's/^FAILED: raised \([A-Za-z:]*\), expected \([A-Za-z:]*\)$/RAISED\traised \1, expected \2/' \
-            -e 's/^FAILED: .*: \(expected .*\)$/FAILED\t\1/' \
-            -e 's/^FAILED: \(.*\)$/FAILED\t\1/' \
-            -e 's/^ERROR: \(.*\)$/ERROR\t\1/' \
-      | sed -e "s|${HOME}[^ \"]*|HOME|g" \
-            -e 's|/var/folders/[^ ]*|TMPDIR|g' \
-            -e 's|0x[0-9a-f]*|0xADDR|g' \
-      | awk -v n=300 '{ if (length($0) > n) print substr($0,1,n) " ...[clipped]"; else print $0 }' \
+    out="$("$here/run_spec.sh" "$specroot/$f" 2>&1)"
+    printf '%s\n' "$out" | sed -n '/^--- mere-ruby:/,/^--- ruby:/p' | normalise | sort > "$raw_m"
+    printf '%s\n' "$out" | sed -n '/^--- ruby:/,$p'                 | normalise | sort > "$raw_r"
+    # -23: the lines only mere-ruby has. A line both sides print is the shim
+    # failing the same way twice, which is not a finding about mere-ruby.
+    comm -23 "$raw_m" "$raw_r" \
+      | bucket \
       | while IFS= read -r rec; do printf '%s\t%s\t%s\n' "$g" "$f" "$rec" >> "$lines"; done
   done
 done
@@ -68,7 +89,8 @@ done
 # hide exactly what this script is for.
 causes="$here/DIFF_CAUSES.txt"
 {
-  echo "# ranked causes of the DIFF/CRASH files, from mere-ruby's own failure lines"
+  echo "# ranked causes of the DIFF/CRASH files: lines mere-ruby fails and ruby does NOT"
+  echo "# (a line both sides print is this shim failing twice, and is subtracted)"
   echo "# $(awk 'END {print NR}' "$lines") failing examples across $files files"
   echo
   cut -f3,4 "$lines" | sort | uniq -c | sort -rn | head -60
