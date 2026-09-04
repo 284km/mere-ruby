@@ -9,6 +9,7 @@
 # With no test files it runs the pure-Ruby core: version, requirement,
 # dependency — the classes that drive gem activation.
 set -u
+. "$(cd "$(dirname "$0")" && pwd)"/../tools/ref_ruby.sh
 # The reference ruby's own output depends on its default external encoding:
 # with the locale unset (or not UTF-8) `p "にち"` escapes to "\u306B\u3061",
 # while mere-ruby has one behaviour and prints the bytes. That made corpus/118

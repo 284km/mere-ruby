@@ -1,0 +1,32 @@
+# Math, through libm -- the same functions CRuby calls. Deriving them from the
+# builtins Mere has (sqrt / sin / cos / tan / exp / log / atan2) is exact in
+# real arithmetic and wrong in the last bit: `exp(log x / 3)` answers
+# 9.999999999999998 for cbrt(1000), and `(e^x - e^-x)/(e^x + e^-x)` is NaN for
+# tanh(1000) where the answer is 1.0. This file is the spread that said so.
+xs  = [0.5, 1.0, 1.5, 2.0, 2.718281828459045, 3.0, 8.0, 10.0, 100.0, 1000.0, 0.1, 7.5]
+neg = [-0.5, -1.0, -2.0, -8.0]
+uni = [-0.9, -0.5, 0.0, 0.25, 0.5, 0.9]
+p ["exp", xs.map { |x| Math.exp(x) }]
+p ["log", xs.map { |x| Math.log(x) }]
+p ["log b", [[8.0,2.0],[1000.0,10.0],[100.0,10.0]].map { |a,b| Math.log(a,b) }]
+p ["log2", xs.map { |x| Math.log2(x) }]
+p ["log10", xs.map { |x| Math.log10(x) }]
+p ["atan", (xs + neg).map { |x| Math.atan(x) }]
+p ["asin", uni.map { |x| Math.asin(x) }]
+p ["acos", uni.map { |x| Math.acos(x) }]
+p ["sinh", (xs + neg).map { |x| Math.sinh(x) }]
+p ["cosh", (xs + neg).map { |x| Math.cosh(x) }]
+p ["tanh", (xs + neg).map { |x| Math.tanh(x) }]
+p ["asinh", (xs + neg).map { |x| Math.asinh(x) }]
+p ["acosh", [1.0, 1.5, 2.0, 10.0].map { |x| Math.acosh(x) }]
+p ["atanh", [-0.9, -0.5, 0.0, 0.5, 0.9].map { |x| Math.atanh(x) }]
+p ["cbrt", (xs + neg + [0.0]).map { |x| Math.cbrt(x) }]
+p ["frexp", (xs + neg + [0.0]).map { |x| Math.frexp(x) }]
+p ["ldexp", [[0.5,3],[1.0,0],[0.75,-2],[-0.5,4]].map { |f,e| Math.ldexp(f,e) }]
+p ["hypot", [[3.0,4.0],[1.0,1.0],[0.5,2.5]].map { |a,b| Math.hypot(a,b) }]
+p ["erf", uni.map { |x| Math.erf(x) }]
+p ["erfc", uni.map { |x| Math.erfc(x) }]
+p ["gamma", [1.0, 2.0, 5.0, 0.5, 7.5].map { |x| Math.gamma(x) }]
+p ["lgamma", [1.0, 5.0, 0.5, -2.5].map { |x| Math.lgamma(x) }]
+p ["tanh big", [100.0, 1000.0, -1000.0].map { |x| Math.tanh(x) }]
+p ["sqrt sin cos tan atan2", [Math.sqrt(2), Math.sin(1), Math.cos(1), Math.tan(1), Math.atan2(1,2)]]

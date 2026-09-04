@@ -2,6 +2,7 @@
 # Run every corpus program under the reference ruby and under ./mere-ruby,
 # and diff the outputs. Exits non-zero on the first mismatch.
 set -e
+. "$(cd "$(dirname "$0")" && pwd)"/tools/ref_ruby.sh
 # The reference ruby's own output depends on its default external encoding:
 # with the locale unset (or not UTF-8) `p "にち"` escapes to "\u306B\u3061",
 # while mere-ruby has one behaviour and prints the bytes. That made corpus/118

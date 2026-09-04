@@ -19,6 +19,7 @@
 # because this gate fails when a recorded divergence starts agreeing. Set
 # DIVERGING to a step name again when the next boundary appears.
 set -u
+. "$(cd "$(dirname "$0")" && pwd)"/../tools/ref_ruby.sh
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 stdlib="${1:?usage: run.sh <stdlib-dir> <gem-home>}"

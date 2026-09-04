@@ -11,6 +11,7 @@
 # No `set -e`: a test whose interpreter exits non-zero is a RESULT (err), not
 # a reason to stop counting -- that is the whole point of the tally.
 here="$(cd "$(dirname "$0")" && pwd)"
+. "$(cd "$(dirname "$0")" && pwd)"/../tools/ref_ruby.sh
 # The reference ruby's own output depends on its default external encoding:
 # with the locale unset (or not UTF-8) `p "にち"` escapes to "\u306B\u3061",
 # while mere-ruby has one behaviour and prints the bytes. That made corpus/118
