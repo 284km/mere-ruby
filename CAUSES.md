@@ -12,13 +12,13 @@ Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
 Classified: 324 files.
 
-## CRASH — 13 files, 6 kinds
+## CRASH — 11 files, 6 kinds
 
 | files | kind |
 |---|---|
-| 5 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
 | 4 | `stack overflow (recursion too deep)` |
-| 1 | `FAILED raised StandardError, expected TypeError` |
+| 2 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 2 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 1 | `*.rb:N: mere-ruby: expected a variable after for in TMPDIR near line N` |
@@ -27,16 +27,16 @@ Classified: 324 files.
 
 | files | cause |
 |---|---|
-| 5 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
 | 4 | `stack overflow (recursion too deep)` |
-| 1 | `FAILED: raised StandardError, expected TypeError` |
+| 2 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 2 | `FAILED: raised StandardError, expected TypeError` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 334` |
 | 1 | `*.rb:N: mere-ruby: expected a variable after for in TMPDIR near line 20` |
 
 </details>
 
-## DIFF — 311 files, 100 kinds
+## DIFF — 313 files, 101 kinds
 
 | files | kind |
 |---|---|
@@ -47,7 +47,7 @@ Classified: 324 files.
 | 14 | `ERROR NameError` |
 | 12 | `FAILED expected to be identical` |
 | 11 | `FAILED expected TypeError to be raised` |
-| 9 | `FAILED expected true, got false` |
+| 10 | `FAILED expected true, got false` |
 | 9 | `FAILED expected "S", got "S"` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
@@ -111,6 +111,7 @@ Classified: 324 files.
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [N, N ...[clipped]` |
+| 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
