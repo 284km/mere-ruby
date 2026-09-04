@@ -63,9 +63,9 @@ Classified: 317 files.
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {b: [N, N, N]}, got nil` |
 | 1 | `FAILED expected {#<OBJ> => "S", #<OBJ> => "S"}, got {}` |
-| 1 | `FAILED expected {"S" => N, "S" => N}, got {}` |
-| 1 | `FAILED expected {"S" => "S", "S" => "S"}, got {"S" => "S", "S" => nil}` |
-| 1 | `FAILED expected {"S" => "S", "S" => "S", "S" => "S"}, got {make: "S", model: "S", year: nil}` |
+| 1 | `FAILED expected {...}, got {}` |
+| 1 | `FAILED expected {...}, got {...}` |
+| 1 | `FAILED expected {...}, got {make: "S", model: "S", year: nil}` |
 | 1 | `FAILED expected truthy from #lambda?` |
 | 1 | `FAILED expected truthy from #finite?` |
 | 1 | `FAILED expected truthy from #>=` |

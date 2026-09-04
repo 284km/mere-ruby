@@ -67,11 +67,15 @@ done
 # whatever the name inside it happens to be.
 # Four characters minimum: the KIND column masks a string to "S", and `"S" => "S"`
 # is a masked row, not a dump.
-# The spacing is optional: ruby 3.2 inspects `"K"=>"V"` and 3.4 `"K" => "V"`,
-# and the records span that upgrade. Knowing only one spelling is how three
-# commits kept the token after the first pass of the scrub.
-envdump=$(grep -aln -E -- '"[^"]{4,}" *=> *"' $files 2>/dev/null)
-[ -n "$envdump" ] && { echo "LEAK  an environment/hash dump (\"NAME\" => \"value\"):"; echo "$envdump" | sed "s|$root/|        |"; rc=1; }
+# The generators COLLAPSE a string-keyed hash literal to `{...}`, so a record
+# must never contain `{"` at all. Checking for the COLLAPSED-AWAY shape rather
+# than for particular contents is the point: two earlier versions of the mask
+# tried to keep the keys and rewrite the values, and each failed differently --
+# one knew only ruby 3.4's spacing (the records span the 3.2 upgrade), the
+# other ran off its quote boundaries and left half the text behind. There is
+# no boundary to get wrong now, and nothing to enumerate.
+envdump=$(grep -aln -F -- '{"' $files 2>/dev/null)
+[ -n "$envdump" ] && { echo "LEAK  a string-keyed hash literal (an environment or object dump):"; echo "$envdump" | sed "s|$root/|        |"; rc=1; }
 # A cause field long enough to hold an object dump is the mechanism, so bound it
 # directly too: the longest line in a record should be a sentence, not a heap.
 # The bound has to sit AT the generator's clip, not above it. classify.sh clips

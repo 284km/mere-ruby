@@ -59,9 +59,48 @@ EOF
 # The exit status travels beside the output rather than through it: with
 # `head -c` in the way, `$?` would be head's.
 out_cap=2000000
-out_m="$({ perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"
+
+# BOTH SIDES RUN IN AN ALLOWLISTED ENVIRONMENT, and that is a SAFETY control
+# before it is a comparability one.
+#
+# core/env's specs measure the process environment, and a failure message then
+# carries it: ruby's own `ENV.method(:filter).inspect` is 6143 characters of
+# environment, and mere-ruby's is 4845. The harness records the first line the
+# two sides disagree on, verbatim, into files that are CHECKED IN -- so on
+# 2026-09-04 a session token went into a public commit, first key in ENV's
+# order, kept by the very clip that was supposed to bound the record.
+#
+# Masking the record is a mitigation and it is a list of shapes someone thought
+# of. This is the elimination: the subprocesses cannot record what they were
+# never given. Anything not named below is simply not in their environment, so
+# a variable added to this machine tomorrow -- with any name, holding anything
+# -- cannot reach a record.
+#
+# It also closes the drift KNOWN_GAPS has open on this group: core/env's MATCH
+# count moved between sessions with no change to the interpreter, because its
+# SUBJECT was the session. Now the subject is this list.
+#
+# Both sides get the SAME environment, so the comparison stays fair. The list
+# is what the two interpreters need to start and find their stdlib, plus a
+# fixed locale (the record must not depend on the operator's).
+spec_env() {
+  env -i \
+    PATH="$PATH" \
+    HOME="$HOME" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    ${RBENV_VERSION:+RBENV_VERSION="$RBENV_VERSION"} \
+    ${RBENV_ROOT:+RBENV_ROOT="$RBENV_ROOT"} \
+    ${GEM_HOME:+GEM_HOME="$GEM_HOME"} \
+    ${GEM_PATH:+GEM_PATH="$GEM_PATH"} \
+    ${RUBYOPT:+RUBYOPT="$RUBYOPT"} \
+    ${RUBYLIB:+RUBYLIB="$RUBYLIB"} \
+    "$@"
+}
+out_m="$({ spec_env perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"
 rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
-out_r="$({ perl -e 'alarm 25; exec @ARGV' ruby -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
+out_r="$({ spec_env perl -e 'alarm 25; exec @ARGV' ruby -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
 
 # Say WHICH failure it was, in the section it belongs to, and let scoreboard.sh
 # classify as it always has: with no `pass=` line in mere-ruby's section it

@@ -2079,3 +2079,75 @@ suite that describes the behaviour.
 the matched string (7 — `$&` has to carry the source string's encoding, and the
 spec compares `Encoding` objects by identity), the `$~`-in-a-block gap above
 (5), `$@` as a rescued exception's backtrace (2), and singles.
+
+## Four layers so a secret cannot reach a record again
+
+The leak above was masked and the history rewritten, but "we added the missing
+name to the list" is what was said in August too. What follows is what changed
+so that the *class* of accident is closed, and every layer was poison-tested --
+run against a record that really does hold a secret-shaped value -- before
+being trusted.
+
+### 1. Elimination: the spec subprocesses get an ALLOWLISTED environment
+
+`mspec/run_spec.sh` now starts both interpreters under `env -i` with an
+explicit list: `PATH`, `HOME`, `TMPDIR`, a fixed `LANG`/`LC_ALL`, and the
+`RBENV_*` / `GEM_*` / `RUBYOPT` / `RUBYLIB` values they need to find a stdlib.
+Anything else on the machine is simply not in their environment.
+
+This is the layer that matters, because the other three are all "notice it
+afterwards". A variable added to this machine tomorrow -- any name, any
+contents -- cannot reach a record, because the process that would have printed
+it was never given it.
+
+It was worth checking whether the dump could be removed at the source instead,
+and it cannot: **ruby does this too.** `ENV.method(:filter).inspect` is 6143
+characters of environment under ruby 3.4.9 and 4845 under mere-ruby. The
+receiver is part of `Method#inspect` on both sides, so agreeing with ruby means
+carrying it.
+
+The same change closes the drift this file has had open on `core/env`: its
+MATCH count moved between sessions with no change to the interpreter, because
+its subject WAS the session. The subject is now that list.
+
+### 2. The mask collapses a hash literal WHOLE
+
+`{"` up to its `}` (or to the end of a clipped line) becomes `{...}`. Two
+earlier versions tried to keep the keys and rewrite only the values, and each
+failed differently:
+
+- the first knew only ruby 3.4's `"K" => "V"` spacing. The records span the
+  reference-ruby upgrade and 3.2 writes `"K"=>"V"`, so **three older commits
+  kept the token through the first pass of the scrub** -- the same question
+  asked in one spelling.
+- the second matched pair by pair and ran off its quote boundaries on a line
+  the other masks had already rewritten, producing
+  `{"K" => "V"LC_ALL" => "en_US.UTF-8"`: a mask that leaves half of what it was
+  meant to remove.
+
+Collapsing costs a little readability -- an ordinary `{"a" => 1}` in a cause
+goes too -- and removes a whole class of accident, because there is no boundary
+left to get wrong.
+
+### 3. The check is STRUCTURAL, not a list of names
+
+`record_hygiene.sh` refuses any record containing `{"` at all. It still carries
+the named patterns for home paths and the tmpdir, but the environment is no
+longer enumerated: the list is what failed, and `CLAUDE_CODE_SESSION_ID` being
+on it while the token beside it was not is the whole argument.
+
+### 4. It is REQUIRED, in three places
+
+- `a/gates.sh` runs it first and exits 3 if it fails, before anything that
+  takes time.
+- `.github/workflows/ci.yml` runs it as its first step, so it is enforced for
+  anyone, not only for whoever remembers.
+- `.githooks/pre-push` refuses the push. Install it with
+  `git config core.hooksPath .githooks` -- git does not share hooks, so this
+  one is a local guard rather than a repository guarantee, which is why the CI
+  job exists as well.
+
+The reason for the third layer is not that the second was wrong. It is that on
+2026-09-04 the push-time check was run **by hand**, looked for the previous
+incident's shapes, and reported clean -- and a check nobody is required to run
+is a check that gets skipped on the day it matters.

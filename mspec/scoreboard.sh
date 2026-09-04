@@ -136,23 +136,28 @@ strip_noise() {  # stdin -> stdout, a line usable as a bucket key
   # not on it (the session id beside it was); naming variables one at a time
   # cannot keep up with an environment.
   #
-  # So the KEY AND THE VALUE of any pair with a 4-character-or-longer string key
-  # both go, whatever they are called -- a variable NAME identifies the machine
-  # too. Short keys survive, so an ordinary `{"a" => 1}` in a cause stays
-  # readable. The second rule catches the pair the cause clip cut in half, and
-  # the third the KEY it cut in half.
+  # So a STRING-KEYED HASH LITERAL is collapsed whole: `{"..."` up to its `}`
+  # (or to the end of a clipped line) becomes `{...}`. Two earlier versions of
+  # this mask tried to keep the keys and rewrite only the values, and both were
+  # worse than useless:
   #
-  # The spacing is OPTIONAL because the record spans the reference-ruby
-  # upgrade: 3.2 inspects a hash as `"K"=>"V"` and 3.4 as `"K" => "V"`. The
-  # first version of this mask knew only the 3.4 spelling and left three older
-  # commits holding the token -- the same question asked in one spelling.
+  #   - the first knew only ruby 3.4's `"K" => "V"` spacing. The records span
+  #     the reference-ruby upgrade and 3.2 writes `"K"=>"V"`, so three older
+  #     commits kept the token -- the same question asked in one spelling.
+  #   - the second matched pair by pair and ran off its quote boundaries on a
+  #     line the other masks had already rewritten, producing
+  #     `{"K" => "V"LC_ALL" => "en_US.UTF-8"` -- a mask that leaves half the
+  #     text it was meant to remove.
+  #
+  # A cause is a SUMMARY. Losing the contents of a hash costs a little
+  # readability (`{"a" => 1}` collapses too) and removes a whole class of
+  # accident: there is no boundary left to get wrong.
   sed -e 's|^[^ ]*\.rb:[0-9]*: |*.rb:N: |' \
       -e 's|/[^ ]*/mrb_[A-Za-z0-9]*|TMPDIR|g' \
       -e 's|/var/folders/[^ ]*|TMPDIR|g' \
       -e "s|${HOME}[^ \"]*|HOME|g" \
-      -e 's|"[^"]\{4,\}" *=> *"[^"]*"|"K" => "V"|g' \
-      -e 's|"[^"]\{4,\}" *=> *"[^"]*$|"K" => "V"|' \
-      -e 's|"[A-Za-z][A-Za-z0-9_]\{3,\} \.\.\.|"K" ...|' \
+      -e 's|{"[^}]*}|{...}|g' \
+      -e 's|{"[^}]*$|{...|' \
       -e 's|0x[0-9a-f]*|0xADDR|g'
 }
 
