@@ -10,43 +10,41 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 325 files.
+Classified: 324 files.
 
-## CRASH — 16 files, 7 kinds
+## CRASH — 13 files, 6 kinds
 
 | files | kind |
 |---|---|
-| 7 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 5 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
 | 4 | `stack overflow (recursion too deep)` |
 | 1 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
 | 1 | `*.rb:N: mere-ruby: expected a variable after for in TMPDIR near line N` |
-| 1 | `(no output before aborting)` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 7 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 5 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
 | 4 | `stack overflow (recursion too deep)` |
 | 1 | `FAILED: raised StandardError, expected TypeError` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 334` |
 | 1 | `*.rb:N: mere-ruby: expected a variable after for in TMPDIR near line 20` |
-| 1 | `(no output before aborting)` |
 
 </details>
 
-## DIFF — 309 files, 100 kinds
+## DIFF — 311 files, 100 kinds
 
 | files | kind |
 |---|---|
 | 45 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
 | 16 | `ERROR StandardError` |
+| 14 | `FAILED expected ArgumentError to be raised` |
 | 14 | `ERROR NameError` |
-| 13 | `FAILED expected ArgumentError to be raised` |
 | 12 | `FAILED expected to be identical` |
 | 11 | `FAILED expected TypeError to be raised` |
 | 9 | `FAILED expected true, got false` |
@@ -74,6 +72,7 @@ Classified: 325 files.
 | 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
+| 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected :SYM, got nil` |
 | 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR RuntimeError` |
@@ -119,7 +118,6 @@ Classified: 325 files.
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected N, got true` |
-| 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected N ...[clipped]` |
@@ -147,7 +145,7 @@ Classified: 325 files.
 
 | files | cause |
 |---|---|
-| 13 | `FAILED: expected ArgumentError to be raised` |
+| 14 | `FAILED: expected ArgumentError to be raised` |
 | 11 | `FAILED: expected TypeError to be raised` |
 | 4 | `FAILED: expected NameError to be raised` |
 | 3 | `FAILED: returns self: expected to be identical` |
