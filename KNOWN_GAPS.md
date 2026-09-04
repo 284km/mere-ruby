@@ -1602,6 +1602,50 @@ What the numbers are NOT is a claim about which construct is at fault. A 15GB
 `even?` spec says a bignum path is running away; it does not say which one. That
 is the next measurement, not a conclusion from this one.
 
+### The measurement, 2026-09-04: a digit was costing the whole number
+
+Asked of the interpreter directly rather than through a spec file, and beside
+the reference:
+
+| | before | after | ruby 3.4.9 |
+|---|---|---|---|
+| `99999**621` | 8.72 GB | **287 MB** | 18 MB |
+| `2**10000` (3011 digits) | 12.0 GB | **268 MB** | 18 MB |
+| `(2**10000).to_s.size` | 15.7 GB | **286 MB** | 18 MB |
+| `(1..300).reduce(:*)` (615 digits) | 0.10 GB | — | 18 MB |
+
+The fourth row is what pointed at the answer: 615 digits cost 0.1GB and 3011
+digits cost 12GB, so the cost was not in the size of the number.
+
+`mag_add`, `mag_sub` and `mag_mul1` each built their result by prepending one
+character per digit — `chr d ++ acc`. A string here is immutable, so that
+allocates a fresh one of the current length every time round the loop: an
+n-digit operation allocates **n²/2 bytes to produce n of them**, and none of it
+returns before a safepoint. At 3011 digits one addition is 4.5 MB, and
+`2**10000` did ten thousand of them, because `big_pow` multiplied `e` times
+where fourteen squarings will do.
+
+Both are fixed: the magnitude routines push into a `StrBuf`, which grows in
+place, and reverse once at the end; `big_pow` reads the exponent's bits. The
+loops are the same loops. (Probe first, so the claim was not a hope: 200,000
+pushes into a StrBuf is 2 MB, where the same by concatenation is 20 GB.)
+
+Ruby is 18 MB for all three, so this is not finished. What is left is a
+different order of problem, and worth naming separately: a digit still costs a
+byte here where CRuby packs nineteen into a 64-bit limb, the multiply is still
+schoolbook where CRuby switches to Karatsuba above a threshold, and
+intermediates are still not reclaimed until a safepoint. Those are three
+choices, each with a known shape; the quadratic was not a choice, it was an
+idiom that reads as O(n) and is not.
+
+Five of the seven spec files the guard was shooting now run to an answer. The
+two that still do not are not the same finding as each other:
+`core/integer/bit_length_spec` peaks at 7.1 GB running many bignum examples in
+one process that never reclaims, while `core/method/call_spec` reaches 15 GB
+**with no bignum in it at all** — that one is the interpreter's own per-call
+growth (see "A method call costs ~9 KB that is never given back"), and it is
+the arc this one is not.
+
 ## The record was measured a slice at a time, and the untouched groups drifted
 
 A full 28-group re-sweep against the same binary the previous slices were built
