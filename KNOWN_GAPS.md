@@ -300,11 +300,19 @@ the interned frozen strings (`"lit".freeze`) because their table was not a GC
 root, and bundler's gemspec is exactly a file of `"...".freeze` literals that
 gets loaded twice. Fixed by rooting the table (and the four others
 `tools/gc_roots_check.sh` found the same way); the gate now runs that check.
-What remains is one declared divergence, `versions`: ruby activates the
-bundler that ships with it (2.4.10) even though a newer bundler gem (2.6.7) is
-installed, because rubygems prefers the default gem for bundler; mere-ruby's
-activation takes the newest installed. Reading the Gemfile, resolving it and
-`Bundler.setup` agree.
+**2026-09-04, second update.** With the reference at ruby 3.4.9 the `versions`
+divergence retired itself -- both sides answer the same bundler now -- and a
+new one took its place, one step further in. Bundler 2.6.9 does
+`require "bundled_gems"` inside `rescue LoadError`, a Ruby 3.3+ path 2.4.10
+never took; mere-ruby cannot load that file and raises NoMethodError, which
+the rescue does not catch, so `Bundler.setup` raises where ruby answers `:ok`.
+Reading the Gemfile and building the definition still agree.
+
+Two different things would each unblock it: raising LoadError for a file it
+cannot load, which is what bundler is written to expect and would let it carry
+on; or loading the file, which is the real answer. The first is not a fix for
+the second -- a LoadError there means `Gem::BUNDLED_GEMS` does not exist and
+bundler simply skips the warning it wanted to give.
 
 `Exception#backtrace` is the same gap seen from the other side: it answers
 `nil` rather than the frames the exception was raised through. It has to

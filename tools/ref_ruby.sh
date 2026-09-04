@@ -10,10 +10,18 @@
 # version changed to 3.4.9 under a running session and the corpus dropped to
 # 6 of 168 -- on Hash#inspect, which 3.4 prints as `{"x" => 1}`.
 #
+# 2026-09-04: the reference moved from 3.2.2 to 3.4.9. The suites this repo
+# measures against (ruby/spec, bootstraptest) come from a 4.1-dev checkout, so
+# a newer reference reproduces more of them: bootstraptest's DRIFT -- the pairs
+# the reference cannot reproduce, and which are therefore excluded from the
+# denominator -- went 58 to 37 on the same mere-ruby binary. Nineteen of those
+# twenty-one newly measurable pairs fail, which is the point: they were failing
+# before and could not be seen.
+#
 # So: name the version, select it if rbenv has it, and refuse to run otherwise.
 # Refusing is the point. A gate that runs against whatever ruby is on PATH
 # reports a regression that did not happen, and the reader cannot tell.
-REF_RUBY_VERSION="${REF_RUBY_VERSION:-3.2.2}"
+REF_RUBY_VERSION="${REF_RUBY_VERSION:-3.4.9}"
 if [ "$(ruby -e 'print RUBY_VERSION' 2>/dev/null)" != "$REF_RUBY_VERSION" ]; then
   if [ -x "$HOME/.rbenv/versions/$REF_RUBY_VERSION/bin/ruby" ]; then
     RBENV_VERSION="$REF_RUBY_VERSION"; export RBENV_VERSION

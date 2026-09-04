@@ -220,6 +220,9 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo "- **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable)"
   echo "- **SLOW** ran past this harness's per-file limit — working, not aborting"
   echo
+  echo "Measured against **ruby $REF_RUBY_VERSION** (tools/ref_ruby.sh). The reference is part"
+  echo "of the subject: a row measured against another release is not comparable with the"
+  echo "ones around it, and the difference reads as movement in mere-ruby."
   echo "| group | MATCH | DIFF | CRASH | SKIP | SLOW | total |"
   echo "|---|---|---|---|---|---|---|"
 } > "$status"

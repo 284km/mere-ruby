@@ -27,13 +27,19 @@ gem_home="${2:?usage: run.sh <stdlib-dir> <gem-home>}"
 [ -f "$stdlib/rubygems.rb" ] || { echo "no rubygems.rb under $stdlib"; exit 2; }
 RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
 export RUBYOPT
-# versions: ruby answers the bundler that ships with it (2.4.10) even with a
-# newer bundler gem installed, because rubygems prefers the default gem for
-# bundler; mere-ruby's activation picks the newest installed one (2.6.7). The
-# other three steps agree, so the load path and resolution are right and only
-# which bundler gets activated differs. Recorded in KNOWN_GAPS.md; the fix is
-# in gem activation, not here.
-DIVERGING="versions"
+# setup: bundler 2.6.9 (the one ruby 3.4 ships) takes a path 2.4.10 did not --
+# `require "bundled_gems"`, guarded by `rescue LoadError`, for the Ruby 3.3+
+# warning about gems leaving the stdlib. mere-ruby cannot load that file and
+# fails with NoMethodError instead, which the rescue does not catch, so setup
+# raises where ruby answers :ok. Two things would each unblock it and they are
+# not the same fix: raising LoadError for a file it cannot load (bundler would
+# then carry on, as it does on any older ruby), or loading the file. Recorded
+# in KNOWN_GAPS.md.
+#
+# `versions` RETIRED here on 2026-09-04: with 3.4.9 as the reference both sides
+# answer ["3.6.9", "2.6.9"], because the newest installed bundler is also the
+# one ruby activates. The gate said so itself rather than being asked.
+DIVERGING="setup"
 
 run() {  # $1 = interpreter command line
   GEM_HOME="$gem_home" GEM_PATH="$gem_home" \

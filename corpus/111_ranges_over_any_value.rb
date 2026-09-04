@@ -25,7 +25,16 @@ p r
 p [(1..).first(3), (1..).take(3), (1..).first, ("a"..).first(3)]
 p [(1..Float::INFINITY).first(3), (1..Float::INFINITY).max]
 p (1..Float::INFINITY).lazy.map { |x| x * 2 }.first(3)
-p [(1..).size, (..5).size, (1..Float::INFINITY).size, (1...9).size]
+p [(1..).size, (1..Float::INFINITY).size, (1...9).size]
+# ...and a BEGINLESS one has no size at all: #size counts from the beginning,
+# and ruby 3.4 says so rather than answering Infinity the way 3.2 did. Asked
+# through the helper below so the rest of this file still runs.
+def size_err(r)
+  r.size
+rescue => e
+  [e.class, e.message]
+end
+p size_err(..5)
 
 # ...and what would need every element says so, rather than answering [].
 def err

@@ -434,7 +434,13 @@ let senc_set = fn (id: int) -> fn (nm: str) ->
 let senc_get = fn (id: int) -> if map_has str_enc (str_of_int id) then map_get str_enc (str_of_int id) else "UTF-8";
 // frozen-string tracking + CLI frozen-string-literal mode + __FILE__ path.
 let str_frozen = map_new () in
+let str_chilled = map_new () in
 let sfrozen_set = fn (id: int) -> let _ = map_set str_frozen (str_of_int id) "1" in ();
+// CHILLED (ruby 3.4): a literal from a file with no frozen_string_literal
+// comment. Not frozen -- #frozen? is false and it can be mutated -- but `+str`
+// answers a copy, which is the whole observable difference.
+let schilled_set = fn (id: int) -> let _ = map_set str_chilled (str_of_int id) "1" in ();
+let schilled_get = fn (id: int) -> map_has str_chilled (str_of_int id);
 let sfrozen_get = fn (id: int) -> map_has str_frozen (str_of_int id);
 // frozen state of ordinary objects (keyed by object id string), consulted by
 // #frozen? on the object and on its singleton class.
@@ -448,9 +454,17 @@ let obj_frozen = map_new () in
 let ofrozen_set = fn (id: int) -> let _ = map_set obj_frozen (str_of_int id) "1" in ();
 let ofrozen_get = fn (id: int) -> map_has obj_frozen (str_of_int id);
 let ofrozen_key = fn (k: str) -> map_has obj_frozen k;
-let cli_fsl = map_new () in   // key "on" present => --enable-frozen-string-literal
+let cli_fsl = map_new () in
+let fsl_ctx = map_new () in   // "v" -> the current file's magic-comment answer   // key "on" present => --enable-frozen-string-literal
 let cli_file = map_new () in  // key "p" -> the running script's path (__FILE__)
 let fsl_on = fn () -> map_has cli_fsl "on";
+// "on" / "off" / "" (absent). The command-line flags decide for every file;
+// otherwise the file's own magic comment does, which the loader records in
+// load_ctx "fsl" beside the encoding.
+let fsl_state = fn () ->
+  if map_has cli_fsl "on" then "on"
+  else if map_has cli_fsl "off" then "off"
+  else if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "";
 let script_file = fn () -> if map_has cli_file "p" then map_get cli_file "p" else "-";
 // lexical constant scope (cref): the class whose body is currently being run
 // ("" = top level). Captured per method at `def` time (meth_cref) and consulted
@@ -484,6 +498,11 @@ let md_whole = map_new () in
 let time_inst = map_new () in
 // dummy encodings (stateful/wide converters, CRuby's list); a dummy is never
 // ASCII-compatible, and neither is any UTF-16/UTF-32 variant.
+// ASCII-8BIT is spelled BINARY from ruby 3.4 on, with the old name kept
+// beside it -- `#<Encoding:BINARY (ASCII-8BIT)>`. #name and #to_s still answer
+// "ASCII-8BIT"; only the inspect shows both.
+let enc_display_name = fn (nm: str) ->
+  if str_eq nm "ASCII-8BIT" then "BINARY (ASCII-8BIT)" else nm in
 let enc_is_dummy = fn (nm: str) ->
   str_eq nm "UTF-16" || str_eq nm "UTF-32" || str_eq nm "IBM037" ||
   str_eq nm "ISO-2022-JP" || str_eq nm "ISO-2022-JP-2" || str_eq nm "ISO-2022-JP-KDDI" ||
@@ -1106,10 +1125,27 @@ let call_meths_s = map_new ();
 // the method the innermost frame is running ("" at the top level)
 let cur_meth = fn () ->
   if map_has cur_pos_s "m" then map_get cur_pos_s "m" else "";
-// "Cls#meth" -> "meth": the reference ruby names the method alone in a frame
+// The label ruby writes in a frame. Through 3.3 it was the method alone, so
+// this stripped the owner off the "Cls#meth" the call stack records; 3.4 names
+// the owner -- `Object#top` for a top-level def, `K#inst` for an instance
+// method, `K.cm` for a singleton one -- so the owner is what has to be put
+// back, and supplied when the recorded name has none.
+// `<main>` and `block in ...` are not methods and keep their own shape.
 let meth_label = fn (n: str) ->
-  let i = str_index_of n "#" in
-  if i < 0 then n else substring n (i + 1) (str_len n);
+  if str_len n == 0 then n
+  else if str_eq (substring n 0 1) "<" then n
+  else if str_len n >= 9 && str_eq (substring n 0 9) "block in " then n
+  else
+    let i = str_index_of n "#" in
+    if i < 0 then "Object#" ++ n
+    else
+      let cls = substring n 0 i in
+      let m = substring n (i + 1) (str_len n) in
+      // a singleton class prints as the class with a dot: (sng:K)#cm -> K.cm
+      if str_len cls >= 5 && str_eq (substring cls 0 5) "(sng:"
+      then substring cls 5 (str_len cls - 1) ++ "." ++ m
+      else if str_eq cls "" then "Object#" ++ m
+      else cls ++ "#" ++ m;
 // the line each call was made on, and the file it was made in, per call depth.
 // call_names (further down) already holds the method name per depth, so these
 // two complete the stack.
@@ -1348,6 +1384,12 @@ let note_raise_site = fn (u: unit) ->
 let prim_raise = fn (cls: str) -> fn (msg: str) ->
   let _ = map_set prim_missing "c" (mkstr cls) in
   let _ = map_set prim_missing "m" (mkstr msg) in
+  // A NEW raise must not inherit the last one's internal message. raise_exc
+  // clears it for exactly this reason; this did not, so an earlier consumed
+  // StopIteration was still in the slot and the top level reported THAT for a
+  // TypeError raised afterwards -- the right exception, announced under the
+  // wrong name.
+  let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
   let _ = note_raise_site () in
   (let __fm = ("mere-ruby: " ++ cls ++ ": " ++ msg) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
 // `Integer(x, exception: false)` / `Float(x, exception: false)` answer nil
@@ -1949,7 +1991,16 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       // double-quoted strings support #{expr} interpolation, desugared to a
       // parenthesized concat: `("" + "a" + (expr).to_s + "c")`.
       let (segs, j) = lex_dstr s (i + 1) "" in
-      tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")", lex_go s j))
+      // ...but a string with NO interpolation is a literal, and desugaring it
+      // to `("" + "a")` made it a computed value: `--enable-frozen-string-literal`
+      // never froze anything, because the freeze is applied to EStrL and a
+      // double-quoted string never was one. lex_dstr_t returns exactly two
+      // tokens when it read no `#{}`, which is the shape folded here.
+      (match segs with
+       | Cons (TP plus, Cons (TStrL lit, Nil)) ->
+         if str_eq plus "+" then Cons (TStrL lit, lex_go s j)
+         else tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")", lex_go s j))
+       | _ -> tapp (Cons (TP "(s", Cons (TStrL "", segs))) (Cons (TP ")", lex_go s j)))
     else if str_eq c "'" then
       let (lit, j) = lex_sq s (i + 1) "" in
       Cons (TStrL lit, lex_go s j)
@@ -5877,6 +5928,14 @@ and parse_sym_list = fn toks -> fn (acc: str list) ->
   // ...and a name may be written as a STRING: `attr_accessor :a, "b"`. A
   // double-quoted string lexes as an interpolation GROUP, so it is parsed as
   // an expression and folded, the way alias names are.
+  // A bare string literal, now that a double-quoted string with no
+  // interpolation lexes as one token rather than a concat: `attr_reader "c"`.
+  | Cons (TStrL lit, r0) ->
+    (match r0 with
+     | Cons (TP p, r2) ->
+       if str_eq p "," then parse_sym_list (skip_nls r2) (Cons (lit, acc))
+       else (rev_app (Cons (lit, acc)) Nil, r0)
+     | _ -> (rev_app (Cons (lit, acc)) Nil, r0))
   | Cons (TP grp, _) when str_eq grp "(s" ->
     (let (e, r) = parse_primary toks in
      let nm = const_fold_str e in
@@ -9973,6 +10032,32 @@ let rec scan_coding_line = fn (s: str) -> fn (i: int) ->
   else scan_coding_line s (i + 1);
 let rec line_end = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then i else if str_eq (char_at s i) "\n" then i else line_end s (i + 1);
+// `# frozen_string_literal: true|false` in the leading comment lines. THREE
+// answers, not two: "on", "off", and ABSENT -- and from ruby 3.4 absent is not
+// the same as off. A literal in a file that says nothing is CHILLED: not
+// frozen, but `+str` hands back a copy rather than the literal itself, which
+// is how 3.4 lets a program take a mutable string without the file having to
+// declare anything. Scans the first few comment/blank lines and stops at the
+// first line of code, as ruby does.
+let src_fsl = fn (src: str) ->
+  let n = str_len src in
+  let rec scan = fn (i: int) -> fn (seen: int) ->
+    if i >= n || seen > 4 then ""
+    else
+      let e = line_end src i in
+      let ln = substring src i e in
+      if str_len ln > 0 && str_eq (substring ln 0 1) "#" then
+        (let k = str_index_of ln "frozen_string_literal" in
+         if k < 0 then scan (e + 1) (seen + 1)
+         else
+           let rest = substring ln (k + 21) (str_len ln) in
+           if str_index_of rest "true" >= 0 then "on"
+           else if str_index_of rest "false" >= 0 then "off"
+           else scan (e + 1) (seen + 1))
+      else if str_len ln == 0 then scan (e + 1) (seen + 1)
+      else "" in
+  scan 0 0;
+
 let src_coding = fn (src: str) ->
   let start = (if str_len src >= 2 && str_eq (substring src 0 2) "#!" then line_end src 0 + 1 else 0) in
   if start < str_len src && str_eq (char_at src start) "#" then str_upcase (scan_coding_line src start)
@@ -10577,7 +10662,7 @@ and inspect = fn (v: Val) ->
     // a symbol that isn't a plain identifier / valid operator name inspects
     // quoted and escaped (:"foo bar", :"9", :"a\nb").
     if sym_plain sy then ":" ++ sy else ":\"" ++ esc_str sy 0 "" ++ "\""
-  | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ map_get enc_name (str_of_int id) ++ ">" else "#<object>"
+  | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ enc_display_name (map_get enc_name (str_of_int id)) ++ ">" else "#<object>"
   // #<Proc:0xADDR file:line> -- and " (lambda)" for a lambda, which is how
   // ruby tells the two apart in one line of output.
   | VProc pid9 -> proc_to_s pid9
@@ -10663,13 +10748,42 @@ and join_inspect = fn (xs: Val list) -> fn (acc: str) ->
     let piece = if str_eq acc "" then inspect h else acc ++ ", " ++ inspect h in
     join_inspect t piece
 
+// A Symbol prints bare on the left of a Hash pair when its name is a plain
+// identifier -- letters, digits and underscores, not starting with a digit,
+// optionally ending in `?` or `!`. `:foo=`, `:+` and `:""` are not, and ruby
+// prints those as a quoted string with the same colon: `{"foo=": 1}`.
+and sym_prints_bare = fn (s: str) ->
+  let n = str_len s in
+  if n == 0 then false
+  else
+    let c0 = char_at s 0 in
+    if (if is_alpha c0 || str_eq c0 "_" then false else true) then false
+    else
+      let rec go = fn (i: int) ->
+        if i >= n then true
+        else
+          let c = char_at s i in
+          if is_alnum c || str_eq c "_" then go (i + 1)
+          else (i == n - 1 && (str_eq c "?" || str_eq c "!")) in
+      go 1
+
+// The left-hand side of one Hash pair, separator included. Ruby 3.4 writes a
+// Symbol key as `name: `, any other key as `<inspect> => ` -- with spaces,
+// where 3.2 wrote `<inspect>=>` for every key. `kins` is the key already
+// inspected, which only the non-Symbol branch needs (a Symbol is built from
+// its name here, so this works with or without a world).
+and hash_key_prefix = fn (k: Val) -> fn (kins: str) ->
+  match k with
+  | VSym sy -> (if sym_prints_bare sy then sy else inspect (mkstr sy)) ++ ": "
+  | _ -> kins ++ " => "
+
 and join_pairs = fn (xs: Val list) -> fn (acc: str) ->
   match xs with
   | Nil -> acc
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
-       let pair = inspect k ++ "=>" ++ inspect v in
+       let pair = hash_key_prefix k (inspect k) ++ inspect v in
        let acc2 = if str_eq acc "" then pair else acc ++ ", " ++ pair in
        join_pairs t acc2
      | Nil -> acc);
@@ -11106,7 +11220,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                 // __lit_enc marker, like __ENCODING__) -- reading the loader's
                 // CURRENT coding here tagged a method's literals with whatever
                 // file happened to be loading when it ran.
-                (if fsl_on () then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v) else v))
+                (let st = fsl_state () in
+                 if str_eq st "on" then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v)
+                 else if str_eq st "off" then v
+                 else (match v with VStr id -> let _ = schilled_set id in v | _ -> v)))
   | EBool b -> VBool b
   | ENil -> VNil
   | ESym s -> VSym s
@@ -11599,7 +11716,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // which a program can override (a test suite that turns warnings into
        // failures does exactly that). No warning was emitted at all here, so the
        // override never ran and the read was silent.
-       let _ = (if str_eq k "="
+       // ...until ruby 3.4, which removed `$=` altogether: reading it is silent
+       // there, so the warning that used to be the point is now the gap.
+       let _ = (if false && str_eq k "="
                    // Ruby's rule is "$VERBOSE is not nil": false still warns
                    // (it only turns off the VERBOSE-only ones), and nil is
                    // silence. Reading it as truthy made `$VERBOSE = false`
@@ -11619,6 +11738,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                             then (let _ = invoke world nb (VClass "Warning") "Warning" "warn" (Cons (msg, Nil)) in ())
                             else (let _ = print_err (match msg with VStr h -> sget h | _ -> "") in ())) in ())
                 else ()) in
+       // `$=` was removed in ruby 3.4 -- it reads as false there, where 3.2
+       // warned and answered nil. Nothing sets it, so there is nothing else
+       // for it to be.
+       if str_eq k "=" && (if map_has globals "=" then false else true) then VBool false
+       else
        // $& / $` / $' are views on the last match, which is what $~ holds.
        if (str_eq k "&" || str_eq k "`" || str_eq k "'") && map_has globals "~" then
          (match map_get globals "~" with
@@ -15442,13 +15566,13 @@ and coerce_arr_index_args = fn env -> fn world -> fn (name: str) -> fn (args: Va
        (if responds world v "to_int"
         then (match invoke_val_c env world nb v "to_int" Nil false with
               | VInt n -> VInt n
-              | VBig b -> raise_exc world "RangeError" "bignum too big to convert into `long'"
+              | VBig b -> raise_exc world "RangeError" "bignum too big to convert into 'long'"
               | ov -> raise_exc world "TypeError"
                         ("can't convert " ++ class_name v ++ " to Integer ("
                          ++ class_name v ++ "#to_int gives " ++ class_name ov ++ ")"))
         else raise_exc world "TypeError" ("no implicit conversion of " ++ class_name v ++ " into Integer"))
      | VFlt f -> long_flt f
-     | VBig b -> raise_exc world "RangeError" "bignum too big to convert into `long'"
+     | VBig b -> raise_exc world "RangeError" "bignum too big to convert into 'long'"
      | VNil -> raise_exc world "TypeError" "no implicit conversion from nil to integer"
      | VStr _ -> raise_exc world "TypeError" "no implicit conversion of String into Integer"
      | VSym _ -> raise_exc world "TypeError" "no implicit conversion of Symbol into Integer"
@@ -15539,7 +15663,7 @@ and coerce_count_args = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -
               | VFlt f -> VInt (int_of_float f)
               // a count that does not fit a C long is ruby's RangeError, not
               // a silent truncation: `[1,2].first(2**70)` answered 1.
-              | VBig b -> raise_exc world "RangeError" "bignum too big to convert into `long'"
+              | VBig b -> raise_exc world "RangeError" "bignum too big to convert into 'long'"
               | VStr _ -> raise_exc world "TypeError" "no implicit conversion of String into Integer"
               | VNil -> raise_exc world "TypeError" "no implicit conversion from nil into Integer"
               | VSym _ -> raise_exc world "TypeError" "no implicit conversion of Symbol into Integer"
@@ -15693,7 +15817,7 @@ and arr_fill_span = fn env -> fn world -> fn (n: int) -> fn (idxargs: Val list) 
     (match v with
      | VInt k -> k
      | VFlt f -> int_of_float f
-     | VBig _ -> (let _ = raise_exc world "RangeError" "bignum too big to convert into `long'" in 0)
+     | VBig _ -> (let _ = raise_exc world "RangeError" "bignum too big to convert into 'long'" in 0)
      | VObj _ ->
        (match conv_try env world v "to_int" with
         | VInt k -> k
@@ -16165,7 +16289,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        let pth = (match gv "path" with VStr h -> sget h | _ -> "") in
        let lno = (match gv "lineno" with VInt n -> n | _ -> 0) in
        let lbl = (match gv "label" with VStr h -> sget h | _ -> "") in
-       inspect (mkstr (pth ++ ":" ++ str_of_int lno ++ ":in `" ++ lbl ++ "'")))
+       inspect (mkstr (pth ++ ":" ++ str_of_int lno ++ ":in '" ++ lbl ++ "'")))
     // an ArithmeticSequence prints as the call that made it, `(1.step(10))`:
     // its own #inspect arm knows the receiver and arguments
     else if str_eq cls "Enumerator::ArithmeticSequence" then
@@ -16257,7 +16381,7 @@ and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
   | Cons (k, rest) ->
     (match rest with
      | Cons (v, t) ->
-       let pair = inspect_w env world k ++ "=>" ++ inspect_w env world v in
+       let pair = hash_key_prefix k (inspect_w env world k) ++ inspect_w env world v in
        let acc2 = if str_eq acc "" then pair else acc ++ ", " ++ pair in
        join_pairs_w env world t acc2
      | Nil -> acc)
@@ -17328,7 +17452,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         let pth = (match gv "path" with VStr h -> sget h | _ -> "") in
         let lno = (match gv "lineno" with VInt n -> n | _ -> 0) in
         let lbl = (match gv "label" with VStr h -> sget h | _ -> "") in
-        let fs = pth ++ ":" ++ str_of_int lno ++ ":in `" ++ lbl ++ "'" in
+        let fs = pth ++ ":" ++ str_of_int lno ++ ":in '" ++ lbl ++ "'" in
         if str_eq name "to_s" then mkstr fs else mkstr (inspect (mkstr fs)))
      | _ -> VNil)
   else
@@ -18286,7 +18410,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // Math.log(x) / Math.log(x, base) -- ruby divides for the second form too
        else if str_eq name "log" then
          (match args with
-          | Cons (v, Cons (b, _)) -> VFlt (log (to_f v) / log (to_f b))
+          // base 10 and base 2 go through log10 / log2: `log x / log 10`
+          // answers 2.9999999999999996 for an exact power and ruby 3.4 does
+          // not. (3.2 did -- one of the changes the newer reference brought.)
+          | Cons (v, Cons (b, _)) ->
+            (let bf = to_f b in
+             if bf == 10.0 then VFlt (log10 (to_f v))
+             else if bf == 2.0 then VFlt (log2 (to_f v))
+             else VFlt (log (to_f v) / log bf))
           | Cons (v, _) -> VFlt (log (to_f v))
           | _ -> VFlt 0.0)
        // x = fraction * 2**exponent with 0.5 <= |fraction| < 1, and its inverse.
@@ -20186,7 +20317,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (if map_has ivars (str_of_int id ++ "@name") then map_get ivars (str_of_int id ++ "@name") else mkstr "")
     else if str_eq cls "Encoding" && str_eq name "inspect" then
       (let nm = (if map_has ivars (str_of_int id ++ "@name") then to_s (map_get ivars (str_of_int id ++ "@name")) else "") in
-       mkstr ("#<Encoding:" ++ nm ++ (if enc_is_dummy nm then " (dummy)" else "") ++ ">"))
+       mkstr ("#<Encoding:" ++ enc_display_name nm ++ (if enc_is_dummy nm then " (dummy)" else "") ++ ">"))
     else if str_eq cls "Encoding" && str_eq name "dummy?" then
       VBool (enc_is_dummy (if map_has ivars (str_of_int id ++ "@name") then to_s (map_get ivars (str_of_int id ++ "@name")) else ""))
     else if str_eq cls "Encoding" && str_eq name "ascii_compatible?" then
@@ -24267,7 +24398,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> recv)
   else if str_eq name "+@" then
     (match recv with
-     | VStr id -> if sfrozen_get id then (let s2 = mkstr (sget id) in (match s2 with VStr h2 -> (let _ = senc_set h2 (senc_get id) in s2) | _ -> s2)) else recv
+     | VStr id -> if sfrozen_get id || schilled_get id then (let s2 = mkstr (sget id) in (match s2 with VStr h2 -> (let _ = senc_set h2 (senc_get id) in s2) | _ -> s2)) else recv
      | _ -> recv)
   else if str_eq name "dup" || str_eq name "clone" then
     // strings are handles now: dup MUST copy, else mutating the dup would
@@ -24854,10 +24985,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
               | VFlt _ -> rng_flt_size (float_of_int a) hi excl
               | _ -> VNil)
            | VFlt f -> (if rng_hi_open hi then VFlt (1.0 / 0.0) else rng_flt_size f hi excl)
-           // beginless: as many elements as the end is numeric -- and none
-           // to speak of when it is not. (.."a").size is nil, (..5).size is
-           // Infinity.
-           | VNil -> (match hi with VInt _ -> VFlt (1.0 / 0.0) | VFlt _ -> VFlt (1.0 / 0.0) | _ -> VNil)
+           // beginless: ruby 3.4 refuses, where 3.2 answered Infinity for a
+           // numeric end. #size counts from the beginning and there is none,
+           // so the TypeError names the class of the bound it cannot start at.
+           | VNil -> prim_raise "TypeError" "can't iterate from NilClass"
            | _ -> VNil)
         else
           // count: what an enumeration would yield, so an open range is
@@ -24982,7 +25113,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // A number too big for an index is an Integer, so it is not a
         // conversion problem: Ruby calls it a RangeError.
         | Cons (VBig _, _) ->
-          prim_raise "RangeError" "bignum too big to convert into `long'"
+          prim_raise "RangeError" "bignum too big to convert into 'long'"
         | Cons (other, _) ->
           prim_raise "TypeError"
             (match other with
@@ -25812,10 +25943,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         let lim = (match args with
                    | Cons (_, Cons (VInt l, _)) ->
                      (if l > 2147483647 then
-                        prim_raise "RangeError" ("integer " ++ str_of_int l ++ " too big to convert to `int'")
+                        prim_raise "RangeError" ("integer " ++ str_of_int l ++ " too big to convert to 'int'")
                       else VInt l)
                    | Cons (_, Cons (VBig b, _)) ->
-                     prim_raise "RangeError" ("integer " ++ b ++ " too big to convert to `int'")
+                     prim_raise "RangeError" ("integer " ++ b ++ " too big to convert to 'int'")
                    | Cons (_, Cons (VNil, _)) ->
                      prim_raise "TypeError" "no implicit conversion from nil into Integer"
                    | Cons (_, Cons (other, _)) ->
@@ -33802,7 +33933,7 @@ and aseq_kw = fn (pairs: Val list) -> fn (k: str) ->
 and aseq_kw_str = fn (pairs: Val list) -> fn (acc: str) ->
   match pairs with
   | Cons (VSym k, Cons (v, rest)) -> aseq_kw_str rest (acc ++ (if str_eq acc "" then "" else ", ") ++ k ++ ": " ++ inspect v)
-  | Cons (k, Cons (v, rest)) -> aseq_kw_str rest (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect k ++ "=>" ++ inspect v)
+  | Cons (k, Cons (v, rest)) -> aseq_kw_str rest (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect k ++ " => " ++ inspect v)
   | _ -> acc
 // n terms from b, stepping st
 and aseq_terms = fn (b: int) -> fn (st: int) -> fn (n: int) ->
@@ -34235,7 +34366,7 @@ and frame_label_at = fn (i: int) ->
   if i <= 0 then "<main>"
   else (if map_has call_names_s (str_of_int (i - 1)) then meth_label (map_get call_names_s (str_of_int (i - 1))) else "?")
 and frame_str = fn (i: int) ->
-  frame_file i ++ ":" ++ str_of_int (frame_line i) ++ ":in `" ++ frame_label_at i ++ "'"
+  frame_file i ++ ":" ++ str_of_int (frame_line i) ++ ":in '" ++ frame_label_at i ++ "'"
 and caller_list = fn (i: int) ->
   if i < 0 then (Nil : Val list) else Cons (mkstr (frame_str i), caller_list (i - 1))
 // caller(n) drops n frames, counting the current one as 0; the default is 1,
@@ -34246,7 +34377,7 @@ and caller_frames = fn (skip: int) ->
   let cd = caller_depth () in
   // the current frame is a frame: at the top level it is <main>, which is what
   // `caller(0)` answers with there (and `caller` -- skipping it -- is empty)
-  let here = mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in `"
+  let here = mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in '"
                     ++ (if cd <= 0 then "<main>" else meth_label (cur_meth ())) ++ "'") in
   let all = (if cd <= 0 then Cons (here, (Nil : Val list))
              else Cons (here, caller_list (cd - 1))) in
@@ -36066,6 +36197,8 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let savedc = (if map_has load_ctx "coding" then map_get load_ctx "coding" else mkstr "UTF-8") in
        let cod = src_coding src in
        let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then "UTF-8" else cod)) in
+       let savedfsl = (if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "") in
+       let _ = map_set fsl_ctx "v" (src_fsl src) in
        // a lex/parse failure is a `fail`, not a raise, so it never reaches
        // raise_exc's bookkeeping -- record the file here so the report names
        // it rather than the entry script.
@@ -36105,6 +36238,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = map_set load_ctx "dir" saved in
        let _ = map_set load_ctx "file" savedf in
        let _ = map_set load_ctx "coding" savedc in
+       let _ = map_set fsl_ctx "v" savedfsl in
        (match f with
         // A require that raised did NOT load the feature. Ruby takes it back
         // out of $LOADED_FEATURES so a later require retries; leaving it
@@ -39552,7 +39686,7 @@ let err_where = fn (name: str) ->
   let ln = (if map_has prim_missing "rl" then (match map_get prim_missing "rl" with VInt n -> n | _ -> cur_line ()) else cur_line ()) in
   let m = (if map_has prim_missing "rm" then (match map_get prim_missing "rm" with VStr h -> sget h | _ -> cur_meth ()) else cur_meth ()) in
   let where = (if ln > 0 then file ++ ":" ++ str_of_int ln else file) in
-  if str_eq m "" then where else where ++ ":in `" ++ meth_label m ++ "'";
+  if str_eq m "" then where else where ++ ":in '" ++ meth_label m ++ "'";
 
 // ObjectSpace::WeakMap: a Hash that does not keep its keys alive. mere-ruby
 // frees nothing, so the weakness has no observable effect here -- what matters
@@ -39843,6 +39977,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set loaded_files name VNil in
   let cod0 = src_coding src in
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
+  let _ = map_set fsl_ctx "v" (src_fsl src) in
   let toks = number_nls src (lex_go src 0) in
   let _ = parse_line_reset (count_nls toks) in
   let (prog, rest) = parse_stmts toks Nil in
