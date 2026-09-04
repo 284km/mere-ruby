@@ -7968,6 +7968,12 @@ let rec val_hash = fn (v: Val) ->
   // wraps differently at 32 bits than at 64, so an object's #hash differs
   // between backends; Ruby does not promise that value is stable anywhere.
   | VObj oid -> floor_mod (oid * bit_or (bit_shl 0x9E37 16) 0x79B1 + 11) 1000000007
+  // A Range had no arm and fell to 0, so every range hashed the same and
+  // core/range/hash_spec's "is not 0" was the whole finding. Equal ranges have
+  // to hash equal, so it comes from the bounds and the exclusion -- and the
+  // exclusion has to be IN it: (1..2) and (1...2) are different ranges.
+  | VRange (lo, hi, excl) ->
+    floor_mod (val_hash lo * 31 + val_hash hi * 7 + (if excl then 1 else 2) + 4001) 1000000007
   | _ -> 0
 and str_hash_go = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
   if i >= str_len s then acc
@@ -12871,7 +12877,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     // ruby spells it both ways. Answered here rather than in the dispatcher so
     // that the operator and the method form cannot drift apart.
     else if str_eq op "%" && (match va0 with VRange (lo9, hi9, _) -> rng_is_int lo9 && (rng_is_int hi9 || rng_hi_open hi9) | _ -> false) then
-      aseq_of world va0 (Cons (vb, Nil))
+      aseq_pct world va0 (Cons (vb, Nil))
     else if str_eq op "===" then
       // TWO QUESTIONS, ONE NAME. `when` needs a truth value, and that is what
       // case_eqq answers. The OPERATOR returns whatever the receiver's #===
@@ -15301,7 +15307,13 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
           iter_each_result (range_step world encl theblk (rng_int lo) last (match args with Cons (VInt n, _) -> n | _ -> 1)) recv
         else if str_eq name "map" || str_eq name "collect" then iter_result (range_map world encl theblk (rng_int lo) last Nil) recv
         else builtin_iter world encl theblk (arr_new (range_to_a (rng_int lo) last)) name args)
-     else builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args)
+     else
+       // `each` answers the RANGE, not the materialized list it walked --
+       // `(:a..:c).each { }` returned an Array here. builtin_iter answers
+       // about the array it was handed, so the receiver is put back.
+       (let r9 = builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args in
+        if str_eq name "each" && (match theblk with (true, _, _, _) -> true | _ -> false)
+        then recv else r9))
   // Float#step(limit[, by]) had no arm at all. ruby computes each value as
   // beg + i*by rather than accumulating, so neither the count nor the last
   // value drifts; the same shape answers Integer#step when either argument is
@@ -16927,6 +16939,40 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          | _ -> false)
      && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
   then aseq_of world recv0 args0
+  // Range#include? / #member? ITERATE, and #cover? / #=== compare. ruby draws
+  // the line there: `(WS.new(0)..WS.new(10)).cover?(WS.new(2))` is true while
+  // `.include?` on the same range is a TypeError, because there is nothing to
+  // walk from. Answering the comparison for both made include? claim
+  // membership in a range it cannot enumerate.
+  else if (str_eq name0 "include?" || str_eq name0 "member?")
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (match recv0 with
+              | VRange (lo9, _, _) -> (match lo9 with VObj _ -> true | _ -> false)
+              | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, _, _) ->
+       raise_exc world "TypeError" ("can't iterate from " ++ display_cls_msg world (dispatch_cls_of world lo9))
+     | _ -> VBool false)
+  // Range#cover? / #member? / #=== where an OBJECT is involved.
+  // The leaf dispatcher answers these for primitives, but it has no world to
+  // dispatch <=> through, so a Comparable object -- which is how ruby/spec
+  // writes every one of its "not comparable" cases -- came back as an
+  // ArgumentError instead of false.
+  else if (str_eq name0 "cover?" || str_eq name0 "include?" || str_eq name0 "member?" || str_eq name0 "===")
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          // (an object BEGIN is handled by the arm above -- this one is for a
+          // primitive range asked about an object, and the reverse)
+          && (match recv0 with
+              | VRange (lo9, hi9, _) ->
+                (match lo9 with VObj _ -> true | _ -> (match hi9 with VObj _ -> true | _ -> false))
+                || (match args0 with Cons (VObj _, Nil) -> true | _ -> false)
+              | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       (match args0 with
+        | Cons (v9, _) -> VBool (rng_covers_w world lo9 hi9 ex9 v9)
+        | _ -> VBool false)
+     | _ -> VBool false)
   // Range#bsearch with no block is an Enumerator -- but a range whose bounds
   // cannot be bisected is a TypeError FIRST, exactly as it is with a block.
   // The blockless path never reached the search, so it handed back an
@@ -25544,7 +25590,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VRange (lo, hi, excl) ->
        if rng_hi_open hi then prim_raise "RangeError" "cannot convert endless range to an array"
        else if (match lo with VNil -> true | _ -> false) then prim_raise "TypeError" "can't iterate from NilClass"
-       else arr_new (range_vals_raw lo hi excl)
+       else (let rf9 = rng_iter_refusal lo hi in
+             if str_eq rf9 "" then arr_new (range_vals_raw lo hi excl)
+             else prim_raise "TypeError" ("can't iterate from " ++ rf9))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "entries") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'entries'")) in fail "mere-ruby: undefined method 'entries'")))
   else if str_eq name "to_a" && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
@@ -25558,7 +25606,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VRange (lo, hi, excl) ->
        if rng_hi_open hi then prim_raise "RangeError" "cannot convert endless range to an array"
        else if (match lo with VNil -> true | _ -> false) then prim_raise "TypeError" "can't iterate from NilClass"
-       else arr_new (range_vals_raw lo hi excl)
+       else (let rf9 = rng_iter_refusal lo hi in
+             if str_eq rf9 "" then arr_new (range_vals_raw lo hi excl)
+             else prim_raise "TypeError" ("can't iterate from " ++ rf9))
      | VNil -> arr_new Nil
      | _ -> prim_raise "NoMethodError" ("undefined method 'to_a' for an instance of " ++ class_name recv))
   // Integer#size is the machine word width in bytes -- and only `size`:
@@ -25604,6 +25654,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (v, _) -> VBool (rng_covers lo hi excl v)
         | _ -> VBool false)
+     | _ -> VBool false)
+  // Range#overlap? had no implementation at all.
+  else if str_eq name "overlap?" && (match recv with VRange _ -> true | _ -> false) then
+    (match recv with
+     | VRange (lo, hi, excl) ->
+       (match args with
+        | Cons (o, _) -> rng_overlap lo hi excl o
+        | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | _ -> VBool false)
   // Range#size and Range#count are DIFFERENT questions, and ruby answers them
   // differently: `size` is arithmetic on numeric bounds (and nil for bounds
@@ -27550,11 +27608,101 @@ and rng_bad_bounds = fn world -> fn (lo: Val) -> fn (hi: Val) ->
              | VCpx (_, _) -> true
              | _ -> true))
 
+// Which values can be compared at all? ruby asks `<=>` and reads nil as
+// "no", and Range#cover? / #include? / #=== answer FALSE for that. cmp_vals
+// RAISES an ArgumentError instead, so `(1..3).include?("x")` was an error
+// where ruby says false -- fifteen assertions in core/range/include_spec, and
+// #=== and #cover? want the same answer.
+and cmp_kind = fn (v: Val) ->
+  match v with
+  | VInt _ -> "n" | VBig _ -> "n" | VFlt _ -> "n" | VRat (_, _) -> "n"
+  | VStr _ -> "s"
+  | VSym _ -> "y"
+  | VArr _ -> "a"
+  | VObj _ -> "o"
+  | VClass _ -> "c"
+  | _ -> "?"
+// This has no world -- cover?/include? are answered in the leaf dispatcher --
+// so an OBJECT on either side is left to cmp_vals as before; the kinds this
+// can see are the ones the spec asks about.
+and cmp_possible = fn (a: Val) -> fn (b: Val) ->
+  let ka = cmp_kind a in
+  let kb = cmp_kind b in
+  if str_eq ka "o" || str_eq kb "o" then true
+  else (if str_eq ka "?" then false else true) && str_eq ka kb
+
+// ...and WITH a world, so an OBJECT decides for itself. A nil from its own
+// <=> means "not comparable", which is the answer Range#cover? wants -- and
+// the leaf version above cannot ask, so an object on either side used to
+// reach cmp_vals and come back as an ArgumentError.
+and cmp_possible_w = fn world -> fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VObj oid ->
+    (let (m9, s9, o9, i9) = world in
+     let ocl = map_get o9 (str_of_int oid) in
+     if has_meth world ocl "<=>" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match invoke world nb9 a ocl "<=>" (Cons (b, Nil)) with VInt _ -> true | _ -> false)
+     else cmp_possible a b)
+  | _ -> (match b with
+          | VObj _ -> cmp_possible_w world b a
+          | _ -> cmp_possible a b)
+
+and rng_covers_w = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
+  if (match lo with VNil -> false | _ -> (if cmp_possible_w world v lo then false else true)) then false
+  else if (match hi with VNil -> false | _ -> (if cmp_possible_w world v hi then false else true)) then false
+  else
+    (match lo with VNil -> true | _ -> cmp_vals_w world v lo >= 0)
+    && (match hi with
+        | VNil -> true
+        | _ -> if excl then cmp_vals_w world v hi < 0 else cmp_vals_w world v hi <= 0)
+
+// Range#overlap? (ruby 3.3): true when the two ranges share at least one
+// element. An empty range overlaps nothing, and a non-Range argument is a
+// TypeError rather than a comparison failure.
+and rng_overlap = fn (lo1: Val) -> fn (hi1: Val) -> fn (ex1: bool) -> fn (o: Val) ->
+  match o with
+  | VRange (lo2, hi2, ex2) ->
+    (if rng_empty lo1 hi1 ex1 || rng_empty lo2 hi2 ex2 then VBool false
+     // boundaries that cannot be compared do not overlap -- ruby answers false
+     // for `("a".."c").overlap?(1..3)` rather than raising.
+     else if (match (hi1, lo2) with
+              | (VNil, _) -> false
+              | (_, VNil) -> false
+              | _ -> (if cmp_possible hi1 lo2 then false else true)) then VBool false
+     else
+       // they overlap unless one ends before the other begins
+       (let ends_before = fn (hx: Val) -> fn (ly: Val) -> fn (ex: bool) ->
+          (match hx with
+           | VNil -> false
+           | _ -> (match ly with
+                   | VNil -> false
+                   | _ -> (let c = cmp_vals hx ly in if ex then c <= 0 else c < 0))) in
+        VBool ((if ends_before hi1 lo2 ex1 then false else true)
+               && (if ends_before hi2 lo1 ex2 then false else true))))
+  | _ -> prim_raise "TypeError" ("wrong argument type " ++ class_name o ++ " (expected Range)")
+
+// Which range BEGINS can be WALKED? ruby's Range#each asks the begin for
+// #succ: an Integer, a String and a Symbol have one; a Float does not
+// ("can't iterate from Float"). The raw walker answered an EMPTY list for
+// every begin it could not do, so `(1.0..3.0).to_a` was [] and not a refusal.
+// "" = it can be walked; anything else is the class name for the message.
+and rng_iter_refusal = fn (lo: Val) -> fn (hi: Val) ->
+  match lo with
+  | VInt _ -> (match hi with VInt _ -> "" | VFlt _ -> "" | VNil -> "" | VBig _ -> "" | _ -> "Integer")
+  | VStr _ -> (match hi with VStr _ -> "" | VNil -> "" | _ -> "String")
+  | VSym _ -> (match hi with VSym _ -> "" | VNil -> "" | _ -> "Symbol")
+  | VNil -> "NilClass"
+  | _ -> class_name lo
+
 and rng_covers = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
-  (match lo with VNil -> true | _ -> cmp_vals v lo >= 0)
-  && (match hi with
-      | VNil -> true
-      | _ -> if excl then cmp_vals v hi < 0 else cmp_vals v hi <= 0)
+  if (match lo with VNil -> false | _ -> (if cmp_possible v lo then false else true)) then false
+  else if (match hi with VNil -> false | _ -> (if cmp_possible v hi then false else true)) then false
+  else
+    (match lo with VNil -> true | _ -> cmp_vals v lo >= 0)
+    && (match hi with
+        | VNil -> true
+        | _ -> if excl then cmp_vals v hi < 0 else cmp_vals v hi <= 0)
 
 and rng_empty = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
   match lo with
@@ -27589,7 +27737,19 @@ and range_vals_raw = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
     (match hi with
      | VStr shi -> rng_str_walk (sget slo) (sget shi) excl 0 Nil
      | _ -> Nil)
+  // a SYMBOL range walks its succ the way a String range does -- `(:a..:c)`
+  // is [:a, :b, :c] and answered [] here.
+  | VSym slo ->
+    (match hi with
+     | VSym shi -> rng_sym_of (rng_str_walk slo shi excl 0 Nil)
+     | _ -> Nil)
   | _ -> Nil
+
+and rng_sym_of = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VStr h, t) -> Cons (VSym (sget h), rng_sym_of t)
+  | Cons (x, t) -> Cons (x, rng_sym_of t)
 
 and range_vals = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
   match hi with
@@ -27604,6 +27764,9 @@ and range_vals = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
      | VStr _ -> (match hi with
                   | VStr _ -> range_vals_raw lo hi excl
                   | _ -> raise_exc_list world "TypeError" "can't iterate from String")
+     | VSym _ -> (match hi with
+                  | VSym _ -> range_vals_raw lo hi excl
+                  | _ -> raise_exc_list world "TypeError" "can't iterate from Symbol")
      | _ -> raise_exc_list world "TypeError" ("can't iterate from " ++ class_name lo))
 
 // ("a"..) has no end to walk toward, so the COUNT is the bound.
@@ -27613,12 +27776,29 @@ and rng_str_take = fn (cur: str) -> fn (n: int) -> fn (acc: Val list) ->
 
 // `("a".."e")` walks succ; the guard bounds a range whose end is unreachable
 // ("a".."A"), which ruby answers with an empty list rather than looping.
+// TWO SINGLE-CHARACTER endpoints walk CODEPOINTS, not #succ. ruby's
+// String#upto says so, and it is why `('X'..'z').to_a` runs through the
+// punctuation between Z and a: `'Z'.succ` is "AA", which is longer than the
+// end, so the succ walk stopped at Z and answered 3 elements where ruby
+// answers 35. `(:A..:z).to_a.size` is 58 for the same reason.
+and rng_cp_walk = fn (cp: int) -> fn (last: int) -> fn (excl: bool) -> fn (acc: Val list) ->
+  if cp > last then rev_app acc Nil
+  else if cp == last then (if excl then rev_app acc Nil else rev_app (Cons (mkstr (utf8_enc cp), acc)) Nil)
+  else rng_cp_walk (cp + 1) last excl (Cons (mkstr (utf8_enc cp), acc))
+
 and rng_str_walk = fn (cur: str) -> fn (last: str) -> fn (excl: bool) -> fn (n: int) -> fn (acc: Val list) ->
+  if utf8_len cur == 1 && utf8_len last == 1 then
+    (let (c1, _) = utf8_cp cur 0 in
+     let (c2, _) = utf8_cp last 0 in
+     rng_cp_walk c1 c2 excl acc)
+  else rng_str_walk_succ cur last excl n acc
+
+and rng_str_walk_succ = fn (cur: str) -> fn (last: str) -> fn (excl: bool) -> fn (n: int) -> fn (acc: Val list) ->
   if n > 100000 then rev_app acc Nil
   else if str_len cur > str_len last then rev_app acc Nil
   else if str_len cur == str_len last && cur > last then rev_app acc Nil
   else if str_eq cur last then (if excl then rev_app acc Nil else rev_app (Cons (mkstr cur, acc)) Nil)
-  else rng_str_walk (str_succ cur) last excl (n + 1) (Cons (mkstr cur, acc))
+  else rng_str_walk_succ (str_succ cur) last excl (n + 1) (Cons (mkstr cur, acc))
 
 and raise_exc_list = fn world -> fn (cls: str) -> fn (msg: str) ->
   let _ = raise_exc world cls msg in Nil
@@ -31871,9 +32051,17 @@ and stdlib_src = fn (name: str) ->
     "    new(items)\n" ++
     "  end\n" ++
     "\n" ++
-    "  def initialize(enum = nil)\n" ++
+    // Set.new(enum) { |x| ... } MAPS each element through the block, which is
+    // what Enumerable#to_set forwards to.
+    "  def initialize(enum = nil, &block)\n" ++
     "    @hash = \{}\n" ++
-    "    enum.each \{ |x| @hash[x] = true } if enum\n" ++
+    "    if enum\n" ++
+    "      if block\n" ++
+    "        enum.each \{ |x| @hash[block.call(x)] = true }\n" ++
+    "      else\n" ++
+    "        enum.each \{ |x| @hash[x] = true }\n" ++
+    "      end\n" ++
+    "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def initialize_copy(orig)\n" ++
@@ -32023,8 +32211,11 @@ and stdlib_src = fn (name: str) ->
     "end\n" ++
     "\n" ++
     "module Enumerable\n" ++
-    "  def to_set\n" ++
-    "    Set.new(self)\n" ++
+    // `to_set { |x| ... }` MAPS on the way in -- ruby's Enumerable#to_set
+    // forwards its block (and any Set.new arguments) rather than ignoring it,
+    // so `(1..3).to_set { |x| x * x }` is {1, 4, 9} and not {1, 2, 3}.
+    "  def to_set(&block)\n" ++
+    "    Set.new(self, &block)\n" ++
     "  end\n" ++
     "end\n"
   // Forwardable / SingleForwardable: delegation built on define_method,
@@ -34582,10 +34773,21 @@ and is_enum_cls = fn (cls: str) ->
 // -- an Enumerator (make_enum_a drives `recv.step(args)` when it is walked)
 // that also knows its begin, end, step and whether the end is excluded.
 and make_aseq = fn world -> fn (recv: Val) -> fn (eargs: Val list) -> fn (b: Val) -> fn (e: Val) -> fn (st: Val) -> fn (excl: bool) ->
+  make_aseq_m world recv "step" eargs b e st excl
+// ...and the same thing under a NAMED method: `(1..10) % 2` is an
+// ArithmeticSequence too, and it inspects as `((1..10).%(2))`. The name was
+// hardcoded to "step" in both the builder and the printer, so `%` printed as
+// a step and core/range/percent_spec was the whole finding.
+and make_aseq_m = fn world -> fn (recv: Val) -> fn (meth: str) -> fn (eargs: Val list) -> fn (b: Val) -> fn (e: Val) -> fn (st: Val) -> fn (excl: bool) ->
   let (meths, sup, ocls, ivars) = world in
+  // The DRIVING method stays `step` -- @meth is what make_enum_a re-dispatches
+  // when the sequence is walked, and `(1..10).%(2)` is not a walk. The name
+  // written in the inspect is a separate question, so it gets a slot of its
+  // own; using one field for both made `(r % 2).to_a` dispatch `%` again.
   (match make_enum_a world recv "step" eargs with
    | VObj id ->
      let _ = map_set ocls (str_of_int id) "Enumerator::ArithmeticSequence" in
+     let _ = (if str_eq meth "step" then () else map_set ivars (str_of_int id ++ "@__as_meth") (mkstr meth)) in
      let _ = map_set ivars (str_of_int id ++ "@__as_begin") b in
      let _ = map_set ivars (str_of_int id ++ "@__as_end") e in
      let _ = map_set ivars (str_of_int id ++ "@__as_step") st in
@@ -34657,6 +34859,15 @@ and aseq_terms = fn (b: int) -> fn (st: int) -> fn (n: int) ->
   if n <= 0 then (Nil : Val list) else Cons (VInt b, aseq_terms (b + st) st (n - 1))
 and aseq_hi = fn (v: Val) -> (match v with VInt n -> n | _ -> 0)
 
+// `(1..10) % 2` -- the same sequence `step` makes, remembering that it was
+// written as `%`.
+and aseq_pct = fn world -> fn (recv: Val) -> fn (args: Val list) ->
+  match recv with
+  | VRange (lo, hi, excl) ->
+    (let st = (match args with Cons (VInt n, _) -> VInt n | _ -> VInt 1) in
+     make_aseq_m world recv "%" args (VInt (rng_int lo)) (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl)
+  | _ -> aseq_of world recv args
+
 // the sequence for `recv.step(args)` with no block: Integer with (limit[, by])
 // or (by:, to:) keywords or nothing (endless), and an integer Range with an
 // optional step.
@@ -34699,7 +34910,11 @@ and aseq_inspect_str = fn env -> fn world -> fn (oid: int) ->
      | Cons (VHsh hh, t) -> join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ aseq_kw_str (hderef hh) "")
      | Cons (x, t) -> join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect x)) in
   let rs = (match rv with VRange _ -> "(" ++ inspect rv ++ ")" | _ -> inspect rv) in
-  "(" ++ rs ++ ".step(" ++ join9 ea "" ++ "))"
+  let mn = (match (if map_has ivars (key ++ "@__as_meth") then map_get ivars (key ++ "@__as_meth") else VNil) with
+            | VStr h -> sget h
+            | VSym sy -> sy
+            | _ -> "step") in
+  "(" ++ rs ++ "." ++ mn ++ "(" ++ join9 ea "" ++ "))"
 
 and make_enum = fn world -> fn (recv: Val) -> fn (meth: str) ->
   make_enum_a world recv meth Nil
@@ -38131,7 +38346,7 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
      | _ -> false)
   // `(1..5) === x` / `("a".."z") === s` / `(t1..t2) === t`: one comparison,
   // whatever the bounds are, with an absent bound not constraining that side.
-  | VRange (lo, hi, excl) -> rng_covers lo hi excl v
+  | VRange (lo, hi, excl) -> rng_covers_w world lo hi excl v
   | VClass c -> (match v with VObj id -> let (m, s, ocls, iv) = world in obj_is_a world (map_get ocls (str_of_int id)) c | _ -> obj_is_a world (class_name v) c)
   // a builtin's === can be redefined too (`class Symbol; def ===(a); true; end`
   // makes every `when :b` match), so ask the method table before falling back
