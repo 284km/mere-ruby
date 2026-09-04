@@ -15155,6 +15155,18 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     // it was ignored entirely and the plain maximum came back. A one-parameter
     // block still gets two arguments and reads the first, which is what makes
     // `[1,2,3,4,5].max { |x| ... }` yield 2, 3, 4, 5.
+    // ...and max(n) / min(n) WITH a block: the block is still the comparator,
+    // so the n extremes are the ends of the SORTED list. The fold below can
+    // carry only one accumulator, so it answered the single extreme and
+    // dropped the n -- `(1..10).max(2) { |a, b| b <=> a }` was 1, not [1, 2].
+    else if (str_eq name "max" || str_eq name "min")
+            && (match args with Cons (_, Nil) -> true | _ -> false) then
+      (let k9 = (match args with
+                 | Cons (a9, _) -> rng_take_count world a9 (str_eq name "max")
+                 | _ -> 0) in
+       let (st9, broke9, bv9) = sort_blk_b world theblk xs in
+       if broke9 then bv9
+       else arr_new (val_take (if str_eq name "max" then rev_vals st9 else st9) k9))
     else if str_eq name "max" || str_eq name "min" then
       (let want = str_eq name "max" in
        let rec go = fn (ys: Val list) -> fn (acc: Val) ->
@@ -15171,6 +15183,17 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                          | VNil -> (let _ = raise_exc world "ArgumentError"
                                               ("comparison of " ++ class_name h ++ " with "
                                                ++ class_name acc ++ " failed") in 0)
+                         // ruby does not COERCE the block's answer -- it ASKS
+                         // it, sending #> and then #< against 0. An object
+                         // that answers both (ruby/spec has exactly one) went
+                         // to cmp_vals_w instead and came back as "comparison
+                         // of Object with Integer failed".
+                         | VObj _ ->
+                           (let nb8 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+                            let bv8 = flow_value fl in
+                            if truthy (invoke_val_c gc_cenv0 world nb8 bv8 ">" (Cons (VInt 0, Nil)) false) then 1
+                            else if truthy (invoke_val_c gc_cenv0 world nb8 bv8 "<" (Cons (VInt 0, Nil)) false) then 0 - 1
+                            else 0)
                          | other -> cmp_vals_w world other (VInt 0)) in
                 go t (if want then (if c > 0 then h else acc) else (if c < 0 then h else acc))))) in
        match xs with
@@ -15401,6 +15424,26 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     (if str_eq name "bsearch" then
        (let (v9, broke9, bv9) = rng_bsearch world encl theblk lo hi excl in
         if broke9 then bv9 else v9)
+     // #min / #max with a COMPARATOR block still cannot walk an endless range
+     // to the end, and ruby says so by naming the method: "cannot get the
+     // minimum of endless range with custom comparison method". mere-ruby
+     // reached the materialisation and reported that instead -- "cannot
+     // convert endless range to an array", which describes what it tried to
+     // do rather than what was asked.
+     else if (str_eq name "min" || str_eq name "max" || str_eq name "minmax")
+             && (match hi with VNil -> true | _ -> false) then
+       (if str_eq name "min"
+        then raise_exc world "RangeError" "cannot get the minimum of endless range with custom comparison method"
+        else raise_exc world "RangeError" "cannot get the maximum of endless range")
+     // ...and the same for a BEGINLESS range, where #min and #max are the ones
+     // with nothing to start from. #minmax is NOT among them: ruby reaches the
+     // walk there and reports its TypeError, so it is left to do that.
+     else if (str_eq name "min" || str_eq name "max")
+             && (match lo with VNil -> true | _ -> false) then
+       (if str_eq name "min"
+        then raise_exc world "RangeError" "cannot get the minimum of beginless range"
+        else raise_exc world "RangeError"
+               "cannot get the maximum of beginless range with custom comparison method")
      else if rng_is_int lo && rng_hi_open hi then
        (let a = rng_int lo in
         if str_eq name "each" then iter_each_result (range_each world encl theblk a int_max) recv
@@ -15427,7 +15470,14 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        // `each` answers the RANGE, not the materialized list it walked --
        // `(:a..:c).each { }` returned an Array here. builtin_iter answers
        // about the array it was handed, so the receiver is put back.
-       (let r9 = builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args in
+       //
+       // An OBJECT begin with #succ walks through rng_succ_vals; range_vals
+       // refuses it, because there is nothing generic it can do without a
+       // world to dispatch #succ through.
+       (let els9 = (if rng_is_succ_obj world lo hi
+                    then rng_succ_vals world lo hi excl 0 Nil
+                    else range_vals world lo hi excl) in
+        let r9 = builtin_iter world encl theblk (arr_new els9) name args in
         if str_eq name "each" && (match theblk with (true, _, _, _) -> true | _ -> false)
         then recv else r9))
   // Float#step(limit[, by]) had no arm at all. ruby computes each value as
@@ -16971,6 +17021,19 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
   // world to name the object's class -- the world-free printer leaves it as the
   // bookkeeping name, and this is the only place that can do better.
   | VClass c -> (if is_sng_cls c then cls_display world c else to_s v)
+  // a Range's bounds are inspected the way any other container's elements
+  // are -- through the WORLD, so an object bound shows its own #inspect.
+  // Falling through to the world-free printer rendered a range of Comparables
+  // as `#<object>..#<object>`, while an ARRAY holding the same two objects
+  // printed them correctly: the tell that one question had two answers.
+  | VRange (lo, hi, excl) ->
+    (match lo with
+     | VNil -> (match hi with VNil -> "nil" | _ -> "")
+     | _ -> inspect_w env world lo)
+    ++ (if excl then "..." else "..")
+    ++ (match hi with
+        | VNil -> (match lo with VNil -> "nil" | _ -> "")
+        | _ -> inspect_w env world hi)
   | _ -> inspect v
 
 // the object id as Ruby shows it: 0x + 16 hex digits
@@ -17055,19 +17118,231 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          | _ -> false)
      && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
   then aseq_of world recv0 args0
-  // Range#include? / #member? ITERATE, and #cover? / #=== compare. ruby draws
-  // the line there: `(WS.new(0)..WS.new(10)).cover?(WS.new(2))` is true while
-  // `.include?` on the same range is a TypeError, because there is nothing to
-  // walk from. Answering the comparison for both made include? claim
-  // membership in a range it cannot enumerate.
-  else if (str_eq name0 "include?" || str_eq name0 "member?")
+  // Range#min(n) / #max(n): arithmetic on integer endpoints, and a refusal on
+  // anything else. Enumerating was both wrong (a bignum end answered []) and
+  // unbounded (an endless range never returned).
+  else if (str_eq name0 "min" || str_eq name0 "max")
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          // NOT gated on "was a block given": a real comparator block reaches
+          // the iterating path before this arm ever runs, and asking here
+          // instead read a LEAKED block as a real one. A proc invoked through
+          // an `&b` parameter (`def w(&b); b.call; end`) hands its frame's
+          // block to the calls inside its body, so inside `w { (0...2**64)
+          // .min(2) }` this arm saw "a block was given", stood aside, and the
+          // iterating path answered [] -- and every ruby/spec example runs in
+          // exactly that shape, which is why the spec disagreed with the same
+          // expression typed at the top level. See KNOWN_GAPS.md.
+          && (match recv0 with
+              | VRange (lo9, hi9, _) ->
+                (match lo9 with VInt _ -> true | VBig _ -> true | VNil -> true | _ -> false)
+                && (match hi9 with
+                    | VInt _ -> true | VBig _ -> true | VNil -> true
+                    | VFlt _ -> true
+                    | _ -> false)
+                && (match (lo9, hi9) with (VNil, VNil) -> false | _ -> true)
+              | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       (let k9 = (match args0 with
+                  | Cons (a9, _) -> rng_take_count world a9 (str_eq name0 "max")
+                  | _ -> 0) in
+        let lo_s = rng_int_side lo9 in
+        // the last ELEMENT: one back when the end is excluded, and derived
+        // from a Float end as well as an integer one. An INFINITE end is
+        // endless, like a missing one.
+        let top = (if rng_hi_open hi9 then "" else rng_int_top hi9 ex9) in
+        let hi_s = top in
+        if str_eq name0 "min" then
+          (if str_eq lo_s "" then raise_exc world "RangeError" "cannot get the minimum of beginless range"
+           // an endless range counts up with no stop to reach
+           else if str_eq hi_s "" then
+             arr_new (rng_n_from lo_s (big_add_s lo_s (str_of_int (k9 + 1))) 1 k9 Nil)
+           else arr_new (rng_n_from lo_s top 1 k9 Nil))
+        else
+          (if str_eq hi_s "" then raise_exc world "RangeError" "cannot get the maximum of endless range"
+           // a BEGINLESS #max(n) would have to count down forever. ruby names
+           // that a RangeError, not the walk's TypeError -- and says so even
+           // for an Integer end, where ruby 4.0 will answer [1, 0] instead.
+           else if str_eq lo_s "" then
+             raise_exc world "RangeError"
+               "cannot get the maximum of beginless range with custom comparison method"
+           else arr_new (rng_n_from top lo_s (0 - 1) k9 Nil)))
+     | _ -> VNil)
+  // ...and an ENDLESS range refuses #max(n) for BEING endless, whatever its
+  // begin: `(1.0..).max(2)` is a RangeError, not the walk's "can't iterate
+  // from Float". #min(n) is the other way round -- it counts UP from the
+  // begin, so there an unwalkable begin is what stops it, and ruby's answer
+  // for `(1.0..).min(2)` is the TypeError.
+  else if str_eq name0 "max"
           && (match args0 with Cons (_, Nil) -> true | _ -> false)
           && (match recv0 with
-              | VRange (lo9, _, _) -> (match lo9 with VObj _ -> true | _ -> false)
+              | VRange (lo9, hi9, _) ->
+                (match hi9 with VNil -> true | _ -> rng_hi_open hi9)
+                && not (str_eq (rng_walk_from lo9) "")
+              | _ -> false) then
+    raise_exc world "RangeError" "cannot get the maximum of endless range"
+  // ...and #min(n) / #max(n) on endpoints that are not integers at all cannot
+  // be counted OR walked: ruby refuses by type rather than enumerating.
+  else if (str_eq name0 "min" || str_eq name0 "max")
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (match recv0 with
+              | VRange (lo9, _, _) -> not (str_eq (rng_walk_from lo9) "")
               | _ -> false) then
     (match recv0 with
      | VRange (lo9, _, _) ->
-       raise_exc world "TypeError" ("can't iterate from " ++ display_cls_msg world (dispatch_cls_of world lo9))
+       // ...and a BEGINLESS range is a RangeError whatever its end: #min has
+       // no first element to count up from and #max no last to count down
+       // from. Only the ends the arithmetic branch above understands reached
+       // that answer; a String or Array end fell through to here and reported
+       // the walk's "can't iterate from NilClass".
+       (match lo9 with
+        | VNil ->
+          (if str_eq name0 "max"
+           then raise_exc world "RangeError"
+                  "cannot get the maximum of beginless range with custom comparison method"
+           else raise_exc world "RangeError" "cannot get the minimum of beginless range")
+        | _ -> raise_exc world "TypeError" ("can't iterate from " ++ rng_walk_from lo9))
+     | _ -> VNil)
+  // #min, #max, #first, #last and #minmax NEVER iterate -- for ANY range.
+  // ruby/spec pins that with a mock whose #succ raises and asserts
+  // `(x..x).minmax == [x, x]`, and mere-ruby walked it: an object begin with
+  // #succ went straight to the enumeration arm below, so the mock raised. The
+  // endpoints answer all five, and an EXCLUSIVE #max / #minmax is the one
+  // exception -- naming the element before the end does need the walk, which
+  // is why those two fall through to the arm below.
+  else if (match recv0 with
+           | VRange (lo9, hi9, _) ->
+             (match lo9 with VObj _ -> true | _ -> false)
+             && (match hi9 with VNil -> false | _ -> true)
+           | _ -> false)
+          && (match args0 with Nil -> true | _ -> false)
+          && (match recv0 with
+              | VRange (_, _, ex9) ->
+                str_eq name0 "min" || str_eq name0 "first"
+                || ((if ex9 then false else true)
+                    && (str_eq name0 "max" || str_eq name0 "last" || str_eq name0 "minmax"))
+              | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       // "is this range empty" is a COMPARISON, and the world-free one cannot
+       // compare objects: it raised "comparison of Object with Object failed"
+       // where the object's own <=> answers.
+       (let mt9 = rng_empty_w world lo9 hi9 ex9 in
+        if str_eq name0 "minmax" then
+          arr_new (Cons ((if mt9 then VNil else lo9), Cons ((if mt9 then VNil else hi9), Nil)))
+        else if mt9 then VNil
+        else if str_eq name0 "min" || str_eq name0 "first" then lo9
+        else hi9)
+     | _ -> VNil)
+  // A range of OBJECTS with #succ ENUMERATES, and every Enumerable name
+  // follows from having the elements -- so the walk happens once, here, and
+  // the method is then asked of the ARRAY. Teaching `to_a`, `max`, `min`,
+  // `minmax`, `first`, `count` and the rest about object ranges one at a time
+  // is the same rule written a dozen times.
+  else if (match recv0 with
+           | VRange (lo9, hi9, _) -> rng_is_succ_obj world lo9 hi9
+           | _ -> false)
+          // ...but NOT #include? / #member?: those compare with the ELEMENT's
+          // own `==` (Comparable's, here), and Array#include? is structural.
+          // Routing them through the array answered false for a member.
+          && (if str_eq name0 "include?" || str_eq name0 "member?" then false else true)
+          && (is_enum_method name0 || str_eq name0 "minmax" || str_eq name0 "each"
+              || str_eq name0 "size" || str_eq name0 "last" || str_eq name0 "reverse_each") then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       // ...except #size, which is not "how many elements" but "how many
+       // WITHOUT walking": ruby answers nil for every non-numeric range, the
+       // way it does for ("a".."f"). Answering it from the walked array made
+       // it 3 where ruby says nil.
+       (if str_eq name0 "size" then VNil
+        else invoke_val_c env world blk (arr_new (rng_succ_vals world lo9 hi9 ex9 0 Nil)) name0 args0 vischeck)
+     | _ -> VNil)
+  // An object begin with NO #succ has no walk at all -- and that is the
+  // ordinary case, not an exotic one: Time is such a class, and so is any
+  // Comparable that does not name a successor. Its ENDPOINTS still answer
+  // (ruby's `(t1..t2).min` is t1 and `#minmax` is the pair), while every name
+  // that would walk names the class it cannot start from. The leaf dispatcher
+  // answered these from an EMPTY list -- #sum was 0, #first was nil, #first(n)
+  // was [], #size was nil -- and it cannot name the class either: class_name
+  // reads any VObj as "Object", so `(t1..t2).to_a` said "can't iterate from
+  // Object" where ruby says "from Time". Both halves need the world, so both
+  // are answered here.
+  else if (match recv0 with
+           | VRange (lo9, hi9, _) ->
+             (match lo9 with VObj _ -> true | _ -> false)
+             && (match hi9 with VNil -> false | _ -> true)
+             && (if rng_is_succ_obj world lo9 hi9 then false else true)
+           | _ -> false)
+          // ...and NOT the names that COMPARE rather than walk. is_enum_method
+          // counts #include? among the enumeration names, and Time and every
+          // Numeric subclass answer membership by comparison -- so taking the
+          // enumeration names wholesale turned `(t1..t2).include?(t)` into
+          // "can't iterate from Time". The succ arm above excludes them for
+          // the same reason; this is that exclusion, not a new rule.
+          && (if str_eq name0 "include?" || str_eq name0 "member?"
+                 || str_eq name0 "cover?" || str_eq name0 "===" then false else true)
+          && (is_enum_method name0 || str_eq name0 "minmax" || str_eq name0 "each"
+              || str_eq name0 "size" || str_eq name0 "last" || str_eq name0 "first"
+              || str_eq name0 "min" || str_eq name0 "max" || str_eq name0 "reverse_each") then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       (let cn9 = display_cls_msg world (dispatch_cls_of world lo9) in
+        let no_args9 = (match args0 with Nil -> true | _ -> false) in
+        if (str_eq name0 "min" || str_eq name0 "first") && no_args9 then lo9
+        // an exclusive end has to be NAMED, and naming it needs the walk
+        else if (str_eq name0 "max" || str_eq name0 "last") && no_args9 then
+          (if ex9 then raise_exc world "TypeError" ("can't iterate from " ++ cn9) else hi9)
+        else if str_eq name0 "minmax" && no_args9 then
+          (if ex9 then raise_exc world "TypeError" ("can't iterate from " ++ cn9)
+           else arr_new (Cons (lo9, Cons (hi9, Nil))))
+        else raise_exc world "TypeError" ("can't iterate from " ++ cn9))
+     | _ -> VNil)
+  // ...and an EXCLUSIVE end that is not an Integer has no predecessor to name,
+  // so #max / #minmax have to walk: `("a"..."f").max` is "e".
+  else if (str_eq name0 "max" || str_eq name0 "minmax")
+          && (match args0 with Nil -> true | _ -> false)
+          && (match recv0 with
+              | VRange (lo9, hi9, ex9) ->
+                ex9 && (match lo9 with VStr _ -> true | VSym _ -> true | _ -> false)
+                    && (match hi9 with VNil -> false | _ -> true)
+              | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       invoke_val_c env world blk (arr_new (range_vals world lo9 hi9 ex9)) name0 args0 vischeck
+     | _ -> VNil)
+  // A Comparable operator asked BY NAME. `a == b` derives from a user <=> in
+  // the EBin arm; `a.send(:==, b)` never reached it and was a NoMethodError --
+  // the same protocol under two spellings, which is the shape that keeps
+  // recurring here (respond_to? and the operators were the last one). Routing
+  // the named form through EBin keeps ONE rule rather than a second copy.
+  else if (str_eq name0 "==" || str_eq name0 "<" || str_eq name0 ">"
+           || str_eq name0 "<=" || str_eq name0 ">=")
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (match recv0 with VObj _ -> true | _ -> false)
+          && (let c9 = dispatch_cls_of world recv0 in
+              has_meth world c9 "<=>" && (if has_meth world c9 name0 then false else true)) then
+    (match args0 with Cons (b9, _) -> apply_bin_vals world blk name0 recv0 b9 | _ -> VNil)
+  // Range#include? / #member? ITERATE, and #cover? / #=== compare -- except
+  // where ruby short-circuits the walk. The whole rule, asked of the oracle:
+  //
+  //   numeric endpoints (and Time ones)   -> COMPARE, so an endless range works
+  //   String / Symbol / an object with #succ -> WALK #succ, comparing with ==
+  //   no #succ at all                     -> TypeError, in every shape
+  //   a walk needs BOTH ends              -> beginningless or endless is a TypeError
+  //
+  // Answering the comparison for all of them made `("a".."e").include?("bc")`
+  // true, where ruby says false: "bc" is covered by the range and is not on
+  // the succ walk from "a" to "e". Raising for every object begin was the
+  // other half of the same mistake -- it took Time and #succ-bearing objects
+  // with it.
+  else if (str_eq name0 "include?" || str_eq name0 "member?")
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (match recv0 with VRange (_, _, _) -> true | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, hi9, ex9) ->
+       (match args0 with
+        | Cons (v9, _) -> rng_include env world lo9 hi9 ex9 v9
+        | _ -> VBool false)
      | _ -> VBool false)
   // Range#cover? / #member? / #=== where an OBJECT is involved.
   // The leaf dispatcher answers these for primitives, but it has no world to
@@ -18111,6 +18386,40 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      h9)
   // a struct's own inspect/to_s is `#<struct S a=1>`, which needs the world to
   // read the members out -- `p s` reaches it, and so must `s.inspect`.
+  // Range#inspect and Range#to_s asked as METHODS need the world exactly as
+  // the printer does. `p (a..b)` reaches inspect_w and inspects the bounds,
+  // while `(a..b).inspect` fell through to the world-free printer and said
+  // `#<object>..#<object>`: the same question with two answers, decided by
+  // how it was asked. #to_s asks each bound's #to_s, which is a third way of
+  // asking it and was wrong for the same reason.
+  else if (str_eq name "inspect" || str_eq name "to_s")
+          && (match recv with VRange (_, _, _) -> true | _ -> false) then
+    (match recv with
+     | VRange (lo9, hi9, ex9) ->
+       (let side9 = fn (v9: Val) ->
+          (if str_eq name "inspect" then inspect_w env world v9
+           else
+             (match v9 with
+              | VObj oid9 ->
+                (let (_, _, ocls9, _) = world in
+                 let c9 = map_get ocls9 (str_of_int oid9) in
+                 if has_meth world c9 "to_s" then
+                   (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                    match invoke world nb9 v9 c9 "to_s" Nil with
+                    | VStr s9 -> sget s9
+                    | o9 -> to_s o9)
+                 else to_s v9)
+              | _ -> to_s v9)) in
+        // a missing bound shows as nothing (`1..`, `..5`), and a range with
+        // NEITHER shows `nil..nil`
+        mkstr ((match lo9 with
+                | VNil -> (match hi9 with VNil -> "nil" | _ -> "")
+                | _ -> side9 lo9)
+               ++ (if ex9 then "..." else "..")
+               ++ (match hi9 with
+                   | VNil -> (match lo9 with VNil -> "nil" | _ -> "")
+                   | _ -> side9 hi9)))
+     | _ -> VNil)
   else if (str_eq name "inspect" || str_eq name "to_s")
           && (match recv with
               | VObj oid -> (let (_, _, ocls9, _) = world in map_has struct_mem (map_get ocls9 (str_of_int oid)))
@@ -25135,11 +25444,48 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else if str_eq name "min" && (match args with Nil -> true | _ -> false) then VInt a
         else prim_raise "RangeError" "cannot convert endless range to an array")
      | _ -> VNil)
+  // #minmax is #min and #max, so it is ASKED of them rather than computed a
+  // second way. Materialising the range and taking the ends of the list made
+  // it disagree with the very methods it is defined as: `(1...10.0).minmax`
+  // was [1, 9] where #max refuses ("cannot exclude non Integer end value"),
+  // and `(1.5...3).minmax` was [nil, nil] where #max refuses too. An empty
+  // range still answers [nil, nil], because that is what #min and #max say.
+  else if str_eq name "minmax" && (match recv with VRange _ -> true | _ -> false)
+          && (match args with Nil -> true | _ -> false) then
+    arr_new (Cons (prim_method recv "min" Nil, Cons (prim_method recv "max" Nil, Nil)))
+  // first(n) / take(n) from an integer begin are COUNTED, not materialised:
+  // `(1..2**64).first(2)` is [1, 2]. Slicing the front off a materialised
+  // range answered [] instead, because the walk gives up on a bignum end.
+  else if (match recv with
+           | VRange (lo, hi, _) ->
+             (match lo with VInt _ -> true | VBig _ -> true | _ -> false)
+             && (match hi with VInt _ -> true | VBig _ -> true | _ -> false)
+           | _ -> false)
+          && (str_eq name "first" || str_eq name "take")
+          && (match args with Cons (VInt _, _) -> true | _ -> false) then
+    (match recv with
+     | VRange (lo, hi, ex) ->
+       (match args with
+        | Cons (VInt k, _) ->
+          arr_new (rng_n_from (rng_int_side lo) (rng_int_top hi ex) 1 (if k < 0 then 0 else k) Nil)
+        | _ -> VNil)
+     | _ -> VNil)
   // a Range delegates array-only enumeration methods to its materialised form.
   else if (match recv with VRange _ -> true | _ -> false) && range_delegate_name name
      && (if str_eq name "last" || str_eq name "min" || str_eq name "max"
          then (match args with Nil -> false | _ -> true) else true) then
-    (match recv with VRange (lo, hi, excl) -> prim_method (arr_new (range_vals_raw lo hi excl)) name args | _ -> VNil)
+    (match recv with
+     | VRange (lo, hi, excl) ->
+       // ...unless the begin cannot be WALKED, in which case there is no
+       // materialised form. Its ENDPOINTS still answer -- ruby's
+       // `(["a"]..["f"]).first` is ["a"] -- and everything else refuses.
+       // range_vals_raw gives up silently on such a begin, and an empty list
+       // reads as "no elements" rather than "cannot iterate": #first was nil.
+       (let w9 = rng_walk_from lo in
+        if str_eq w9 "" then prim_method (arr_new (range_vals_raw lo hi excl)) name args
+        else if str_eq name "first" && (match args with Nil -> true | _ -> false) then lo
+        else prim_raise "TypeError" ("can't iterate from " ++ w9))
+     | _ -> VNil)
   // Hash#store is Hash#[]= under another name, and a bare `store` inside a
   // Hash subclass reaches the primitive dispatcher directly (i18n's
   // `class Fallbacks < Hash` computes into itself that way).
@@ -25800,9 +26146,34 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else
           (match hi with
            | VNil -> prim_raise "RangeError" "cannot get the maximum of endless range"
-           | VInt b -> (let top = (if excl then b - 1 else b) in
-                        if rng_empty lo hi excl then VNil else VInt top)
-           | _ -> if rng_empty lo hi excl then VNil else hi))
+           // An exclusive range needs an Integer at BOTH ends to name its last
+           // element, and ruby reports the END first: `(1.0...10).max` is
+           // refused for its begin, `(1...10.0)` for its end. Only the end was
+           // checked here, so a Float BEGIN quietly answered 9.
+           | VInt b ->
+             (if excl && (match lo with VInt _ -> false | VBig _ -> false | VNil -> false | _ -> true)
+              then prim_raise "TypeError" "cannot exclude end value with non Integer begin value"
+              else
+                (let top = (if excl then b - 1 else b) in
+                 if rng_empty lo hi excl then VNil else VInt top))
+           // a BIGNUM end steps back the same way -- `(1...2**64).max` was
+           // answering the end itself, which is not an element of the range.
+           | VBig b -> (if rng_empty lo hi excl then VNil
+                        else if excl then norm_big (big_sub_s b "1") else hi)
+           // An exclusive FLOAT end has no predecessor, and ruby says so
+           // rather than answering the end: there is no last element.
+           | VFlt _ ->
+             (if excl then prim_raise "TypeError" "cannot exclude non Integer end value"
+              else if rng_empty lo hi excl then VNil else hi)
+           // An end that is not a NUMBER is not covered by the rules above:
+           // ruby hands the whole thing to the WALK, and an exclusive range
+           // needs the walk to name the element before the end. So
+           // `(["a"]..["f"]).max` is ["f"] while `(["a"]...["f"]).max` is
+           // "can't iterate from Array" -- it was answering ["f"] for both.
+           | _ ->
+             (if excl && (match lo with VNil -> false | _ -> not (str_eq (rng_walk_from lo) ""))
+              then prim_raise "TypeError" ("can't iterate from " ++ rng_walk_from lo)
+              else if rng_empty lo hi excl then VNil else hi)))
      | _ -> VNil)
   // Range#cover? / #include? / #member?: the endpoints answer directly.
   else if (str_eq name "cover?" || str_eq name "include?" || str_eq name "member?")
@@ -25833,30 +26204,41 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VRange (lo, hi, excl) ->
        (if str_eq name "size" then
-          // size: numeric bounds only. floor(hi - lo) + 1, one less when an
-          // exclusive range ends exactly on an element.
+          // size: ARITHMETIC on an integer begin -- and the begin is what
+          // decides. A Float begin cannot be walked at all in ruby 3.4, so
+          // (1.5..3.5).size raises where mere answered 3; a String or Symbol
+          // begin walks but is not counted, so ("a".."f").size is nil; and a
+          // begin that cannot walk names itself, so (["a"]..["f"]).size is a
+          // TypeError where mere answered nil. Only the integer arm is
+          // arithmetic, and it is arithmetic on DECIMALS, so a bignum end
+          // answers instead of falling off int.
           (match lo with
-           | VInt a ->
-             (if rng_hi_open hi then VFlt (1.0 / 0.0) else
-              match hi with
-              | VInt b -> (let n = (if excl then b - 1 else b) - a + 1 in VInt (if n < 0 then 0 else n))
-              | VFlt _ -> rng_flt_size (float_of_int a) hi excl
-              | _ -> VNil)
-           | VFlt f -> (if rng_hi_open hi then VFlt (1.0 / 0.0) else rng_flt_size f hi excl)
+           | VInt _ ->
+             (if rng_hi_open hi || (match hi with VNil -> true | _ -> false) then VFlt (1.0 / 0.0)
+              else rng_int_span (rng_int_side lo) (rng_int_top hi excl))
+           | VBig _ ->
+             (if rng_hi_open hi || (match hi with VNil -> true | _ -> false) then VFlt (1.0 / 0.0)
+              else rng_int_span (rng_int_side lo) (rng_int_top hi excl))
+           | VFlt _ -> prim_raise "TypeError" "can't iterate from Float"
+           | VStr _ -> VNil
+           | VSym _ -> VNil
            // beginless: ruby 3.4 refuses, where 3.2 answered Infinity for a
            // numeric end. #size counts from the beginning and there is none,
            // so the TypeError names the class of the bound it cannot start at.
            | VNil -> prim_raise "TypeError" "can't iterate from NilClass"
-           | _ -> VNil)
+           // an object range is walked by the object arm above, which has the
+           // world to ask #succ; anything still arriving here cannot walk.
+           | VObj _ -> VNil
+           | _ -> prim_raise "TypeError" ("can't iterate from " ++ class_name lo))
         else
           // count: what an enumeration would yield, so an open range is
-          // Infinity and a bound that cannot be walked raises.
+          // Infinity and a bound that cannot be walked raises. For integer
+          // bounds ruby does NOT enumerate -- (1..2**64).count answers at
+          // once -- and neither does this.
           (if rng_hi_open hi || (match lo with VNil -> true | _ -> false) then VFlt (1.0 / 0.0)
            else match lo with
-           | VInt a -> (match hi with
-                        | VInt b -> (let n = (if excl then b - 1 else b) - a + 1 in VInt (if n < 0 then 0 else n))
-                        | VFlt _ -> VInt (val_list_len (range_vals_raw lo hi excl))
-                        | _ -> prim_raise "TypeError" "can't iterate from Integer")
+           | VInt _ -> rng_int_span (rng_int_side lo) (rng_int_top hi excl)
+           | VBig _ -> rng_int_span (rng_int_side lo) (rng_int_top hi excl)
            | VStr _ -> (match hi with
                         | VStr _ -> VInt (val_list_len (range_vals_raw lo hi excl))
                         | _ -> prim_raise "TypeError" "can't iterate from String")
@@ -27100,7 +27482,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
   else if str_eq name "min" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_sort (deref id)) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_min t h)) | _ -> (let _ = map_set prim_missing "n" (mkstr "min") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'min'")) in fail "mere-ruby: undefined method 'min'")))
   else if str_eq name "max" then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_rev (val_sort (deref id)) Nil) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_max t h)) | _ -> (let _ = map_set prim_missing "n" (mkstr "max") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'max'")) in fail "mere-ruby: undefined method 'max'")))
-  else if str_eq name "sum" then (match recv with VArr id -> val_sum (deref id) (match args with Cons (init, _) -> init | _ -> VInt 0) | VRange (lo, hi, excl) -> val_sum (range_vals_raw lo hi excl) (match args with Cons (init, _) -> init | _ -> VInt 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
+  else if str_eq name "sum" then (match recv with VArr id -> val_sum (deref id) (match args with Cons (init, _) -> init | _ -> VInt 0) | VRange (lo, hi, excl) -> rng_sum lo hi excl (match args with Cons (init, _) -> init | _ -> VInt 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
   // Range#step(n) without a block: materialise the stepped values (the usual
   // consumer is `.step(n).to_a`/`.each`/`.map` on the result).
   else if str_eq name "step" then
@@ -27746,27 +28128,20 @@ and rng_bad_bounds = fn world -> fn (lo: Val) -> fn (hi: Val) ->
                && (match hi with VStr _ -> true | _ -> false) then false
        else if (match lo with VSym _ -> true | _ -> false)
                && (match hi with VSym _ -> true | _ -> false) then false
-       else (match lo with
-             // an object is comparable if its class defines `<=>` -- in ruby
-             // OR as a builtin. Time and Rational carry theirs in the
-             // dispatcher, not the method table, and (Time.now..Time.now) is
-             // a range sidekiq-pro builds.
-             | VObj _ ->
-               (let c = rng_obj_cls world lo in
-                // "does the class define <=>" is NOT the question ruby asks --
-                // ruby asks whether `lo <=> hi` ANSWERS. The two came apart the
-                // moment Object#<=> existed: every class inherits it, so the
-                // definition test became true for everything and
-                // `Range.new(Object.new, Object.new)` stopped raising. The
-                // universal one answers only for a pair that is ==, and that
-                // case is already decided above, so what counts here is a <=>
-                // the class brings ITSELF: from ruby (has_meth) or from the
-                // dispatcher (builtin_obj_has -- Time and friends).
-                if has_meth world c "<=>" || builtin_obj_has c "<=>"
-                then false else true)
-             | VRat (_, _) -> false
-             | VCpx (_, _) -> true
-             | _ -> true))
+       // ...and for everything else, ASK. This used to enumerate the kinds
+       // that compare -- numeric, String, Symbol, an object whose class
+       // brings a `<=>` -- and answer "bad" for every kind not on the list.
+       // Array was not on the list, so ruby's `(["a"]..["f"])` (a perfectly
+       // ordinary range: Array#<=> is element-wise) was an ArgumentError at
+       // CONSTRUCTION, which hid every later question about it: #min, #max,
+       // #cover? never ran, and #each / #to_a / #min(2) reported the
+       // constructor's ArgumentError where ruby reports TypeError from the
+       // walk. A list of comparable kinds cannot keep up with the classes
+       // that have a `<=>`; asking `lo <=> hi` and reading nil as "no" is
+       // ruby's actual rule, and cmp_possible_w is that question -- including
+       // for an object, whose own `<=>` it invokes rather than merely
+       // checking that one is defined.
+       else not (cmp_possible_w world lo hi))
 
 // Which values can be compared at all? ruby asks `<=>` and reads nil as
 // "no", and Range#cover? / #include? / #=== answer FALSE for that. cmp_vals
@@ -27795,6 +28170,19 @@ and cmp_possible = fn (a: Val) -> fn (b: Val) ->
 // <=> means "not comparable", which is the answer Range#cover? wants -- and
 // the leaf version above cannot ask, so an object on either side used to
 // reach cmp_vals and come back as an ArgumentError.
+// Do two ARRAYS compare? Array#<=> walks the pairs and stops at the first
+// that is not ==: that pair decides, and if its `<=>` answers nil the whole
+// comparison is nil. So `[1] <=> [2]` is -1 but `[1] <=> ["a"]` is nil, and
+// ruby refuses to build a range from the second, while accepting the first.
+// Reading "both sides are Arrays, so they compare" accepted both.
+//
+// The rule is not restated here: arr_spaceship_w IS Array#<=>, cycle guard
+// and nested pairs included, so this asks it and reads a non-Integer as "no".
+and cmp_arr_possible_w = fn world -> fn (xa: int) -> fn (xb: int) ->
+  match try_or (fn (u: unit) -> arr_spaceship_w gc_cenv0 world (deref xa) (deref xb)) VNil with
+  | VInt _ -> true
+  | _ -> false
+
 and cmp_possible_w = fn world -> fn (a: Val) -> fn (b: Val) ->
   match a with
   | VObj oid ->
@@ -27803,10 +28191,246 @@ and cmp_possible_w = fn world -> fn (a: Val) -> fn (b: Val) ->
      if has_meth world ocl "<=>" then
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
         match invoke world nb9 a ocl "<=>" (Cons (b, Nil)) with VInt _ -> true | _ -> false)
-     else cmp_possible a b)
+     // ...and a BUILTIN <=> answers too. Time's lives in the dispatcher, not
+     // in the method table, so asking only for a user definition read Time as
+     // "comparable with anything" and `(t1..t2).include?(1)` came back as an
+     // ArgumentError from cmp_vals instead of false. The dispatch is guarded:
+     // an operator that refuses is a refusal to compare, not an error here.
+     else if builtin_obj_has ocl "<=>" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world nb9 a "<=>" (Cons (b, Nil)) false) VNil with
+        | VInt _ -> true
+        | _ -> false)
+     // An object with NO <=> at all orders only against ITSELF: ruby's
+     // Object#<=> is 0 for the same object and nil for anything else. Reading
+     // "either side is an object, so they compare" sent a bare Object.new to
+     // cmp_vals, which raised an ArgumentError where ruby answers false.
+     else (match b with VObj bid -> oid == bid | _ -> false))
+  | VArr xa ->
+    (match b with
+     | VArr xb -> cmp_arr_possible_w world xa xb
+     | VObj _ -> cmp_possible_w world b a
+     | _ -> false)
   | _ -> (match b with
           | VObj _ -> cmp_possible_w world b a
           | _ -> cmp_possible a b)
+
+// Do these endpoints COMPARE rather than walk? ruby's Range#include? is
+// cover? for numeric endpoints -- which is what lets `(1..).include?(5)` work
+// with nothing to enumerate -- and for Time, which it treats the same way. A
+// Numeric SUBCLASS counts: the spec tests exactly that.
+and rng_cmp_endpoints = fn world -> fn (lo: Val) -> fn (hi: Val) ->
+  let kind = fn (x: Val) ->
+    (match x with
+     | VInt _ -> "n" | VBig _ -> "n" | VFlt _ -> "n" | VRat (_, _) -> "n"
+     | VNil -> "?"
+     | VObj oid ->
+       (let (m9, s9, o9, i9) = world in
+        let c9 = map_get o9 (str_of_int oid) in
+        if obj_is_a world c9 "Numeric" then "n"
+        else if str_eq (display_cls world c9) "Time" then "t"
+        else "x")
+     | _ -> "x") in
+  let a = kind lo in
+  let b = kind hi in
+  (str_eq a "?" && (str_eq b "n" || str_eq b "t"))
+  || ((str_eq a "n" || str_eq a "t") && (str_eq b "?" || str_eq a b))
+
+// Walk #succ from `cur` toward `hi`, answering whether `v` is on the walk.
+// Membership is `==` on the ELEMENT (ruby asks the element, not the argument),
+// and an argument that compares with nothing simply never matches -- which is
+// how `include?(Object.new)` is false rather than an error. The step count is
+// bounded for the same reason every walk here is.
+and rng_succ_member = fn env -> fn world -> fn (cur: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) -> fn (n: int) ->
+  if n > 100000 then false
+  else if (if cmp_possible_w world cur hi then false else true) then false
+  else
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let d9 = cmp_vals_w world cur hi in
+     if d9 > 0 then false
+     else if excl && d9 == 0 then false
+     else if truthy (invoke_val_c env world nb9 cur "==" (Cons (v, Nil)) false) then true
+     else rng_succ_member env world (invoke_val_c env world nb9 cur "succ" Nil false) hi excl v (n + 1))
+
+// A String range converts its argument with #to_str, and the three outcomes
+// are all different: a String (or something that yields one) is looked for on
+// the walk, something that yields a NON-String is a TypeError, and something
+// with no #to_str at all is simply not a member.
+and rng_str_arg = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VStr _ -> v
+  | VObj _ ->
+    (if responds world v "to_str" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        match invoke_val_c env world nb9 v "to_str" Nil false with
+        | VStr h9 -> VStr h9
+        | other -> (let _ = raise_exc world "TypeError"
+                      ("can't convert " ++ display_cls_msg world (dispatch_cls_of world v)
+                       ++ " to String (" ++ display_cls_msg world (dispatch_cls_of world v)
+                       ++ "#to_str gives " ++ display_cls_msg world (dispatch_cls_of world other) ++ ")") in VNil))
+     else VNil)
+  | _ -> VNil
+
+// Is this a value ruby could have ORDERED -- something on a line? A Numeric
+// (subclasses and Complex included) or a Time. `(nil..nil)` has no endpoint to
+// compare against, so ruby answers true for exactly these and refuses the rest
+// by name rather than guessing.
+and rng_linear_val = fn world -> fn (v: Val) ->
+  match v with
+  | VInt _ -> true | VBig _ -> true | VFlt _ -> true
+  | VRat (_, _) -> true | VCpx (_, _) -> true
+  | VObj oid ->
+    (let (m9, s9, o9, i9) = world in
+     let c9 = map_get o9 (str_of_int oid) in
+     obj_is_a world c9 "Numeric" || str_eq (display_cls world c9) "Time")
+  | _ -> false
+
+// Range#min(n) / #max(n) on INTEGER endpoints are ARITHMETIC, not enumeration.
+// `(0...2**64).min(2)` is [0, 1]; materializing to find them answered [] for a
+// bignum end and did not finish at all for an endless range. n is small by
+// construction -- it is how many values the caller asked for.
+and rng_n_from = fn (cur: str) -> fn (stop: str) -> fn (step: int) -> fn (k: int) -> fn (acc: Val list) ->
+  if k <= 0 then rev_app acc Nil
+  else if (if step > 0 then big_cmp_s cur stop > 0 else big_cmp_s cur stop < 0) then rev_app acc Nil
+  else rng_n_from (if step > 0 then big_add_s cur "1" else big_sub_s cur "1") stop step (k - 1)
+         (Cons (norm_big cur, acc))
+// The n of #min(n) / #max(n). It is not required to BE an Integer -- ruby
+// converts anything with #to_int, and the spec pins that with a mock -- and it
+// must not be negative. The two methods report a negative n differently:
+// #max says "negative size (-1)" and #min says "negative array size (or size
+// too big)". That is not a distinction worth inventing, so it is copied.
+// Accepting only a literal Integer meant `max(Object.new)` was answered (with
+// the plain maximum) where ruby refuses, and a negative n was clamped to 0 and
+// answered [].
+and rng_take_count = fn world -> fn (v: Val) -> fn (is_max: bool) ->
+  let n9 =
+    (match v with
+     | VInt n -> n
+     // a Float n truncates, the way every other integer conversion does
+     | VFlt f -> int_of_float f
+     | VBig _ -> (let _ = raise_exc world "RangeError" "bignum too big to convert into `long'" in 0)
+     | VObj _ ->
+       (if responds world v "to_int" then
+          (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+           match invoke_val_c gc_cenv0 world nb9 v "to_int" Nil false with
+           | VInt n2 -> n2
+           | other ->
+             (let _ = raise_exc world "TypeError"
+                        ("can't convert " ++ display_cls_msg world (dispatch_cls_of world v)
+                         ++ " to Integer (" ++ display_cls_msg world (dispatch_cls_of world v)
+                         ++ "#to_int gives " ++ class_name other ++ ")") in 0))
+        else (let _ = raise_exc world "TypeError"
+                        ("no implicit conversion of "
+                         ++ display_cls_msg world (dispatch_cls_of world v) ++ " into Integer") in 0))
+     | _ -> (let _ = raise_exc world "TypeError"
+                       ("no implicit conversion of " ++ class_name v ++ " into Integer") in 0)) in
+  if n9 < 0 then
+    (let _ = raise_exc world "ArgumentError"
+               (if is_max then "negative size (" ++ str_of_int n9 ++ ")"
+                else "negative array size (or size too big)") in 0)
+  else n9
+
+and rng_int_side = fn (v: Val) ->
+  match v with VInt n -> str_of_int n | VBig b -> b | _ -> ""
+
+// The last integer ELEMENT of a range counted from an integer begin. The end
+// need not BE an integer: ruby walks integers from the begin and only
+// COMPARES against the end, so `(1..10.0).max(2)` is [10, 9] and
+// `(1...10.0).max(2)` is [9, 8]. Requiring an integer end refused all three.
+// An exclusive end that is not exactly an integer excludes nothing --
+// (1...2.5) still ends at 2 -- which is the same rule #size already had.
+and rng_int_top = fn (hi: Val) -> fn (excl: bool) ->
+  match hi with
+  | VInt _ -> (let s = rng_int_side hi in if excl then big_sub_s s "1" else s)
+  | VBig _ -> (let s = rng_int_side hi in if excl then big_sub_s s "1" else s)
+  | VFlt f ->
+    (let t = flt_floor f in
+     let s = str_of_int t in
+     if excl && float_of_int t == f then big_sub_s s "1" else s)
+  | _ -> ""
+
+// How many integers a range holds -- ARITHMETIC, which is what ruby's #size
+// and #count both are for integer bounds. Walking them answered [] for a
+// bignum end (the walk gave up) and never returned for a wide one.
+and rng_int_span = fn (lo_s: str) -> fn (top: str) ->
+  if str_eq lo_s "" || str_eq top "" then VNil
+  else if big_cmp_s top lo_s < 0 then VInt 0
+  else norm_big (big_add_s (big_sub_s top lo_s) "1")
+
+// ...and their SUM, by Gauss rather than by adding them up: `(1..2**64).sum`
+// is an answer ruby produces instantly and a walk cannot produce at all.
+and rng_int_gauss = fn (lo_s: str) -> fn (top: str) ->
+  if str_eq lo_s "" || str_eq top "" then VNil
+  else if big_cmp_s top lo_s < 0 then VInt 0
+  else norm_big (big_div_s (big_mul_s (big_add_s lo_s top)
+                                      (big_add_s (big_sub_s top lo_s) "1")) "2")
+
+// Which class does "can't iterate from X" name? The BEGIN's -- and it is the
+// begin ALONE that decides whether a range can be walked at all. Deciding it
+// from either endpoint made `(1..10.0)` unwalkable, and hard-coding the name
+// as "Float" reported `(["a"]..["f"]).max(2)` as "can't iterate from Float".
+// An empty answer means "not for this branch to refuse": an integer, String
+// or Symbol begin walks, and an OBJECT begin may walk too (its own #succ
+// decides, which needs the world -- the object arm below asks it).
+and rng_walk_from = fn (lo: Val) ->
+  match lo with
+  | VInt _ -> "" | VBig _ -> "" | VStr _ -> "" | VSym _ -> "" | VObj _ -> ""
+  | VNil -> "NilClass"
+  | _ -> class_name lo
+
+// The ELEMENTS of a range whose begin answers #succ. A String or Symbol range
+// has its own walker; this is the general one, for any Comparable object that
+// can name its successor -- `(Sc(1)..Sc(3)).to_a` is [Sc(1), Sc(2), Sc(3)] and
+// every Enumerable name follows from having the list. Bounded like every other
+// walk here: an object whose #succ never reaches the end would not stop.
+and rng_succ_vals = fn world -> fn (cur: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (n: int) -> fn (acc: Val list) ->
+  if n > 100000 then rev_app acc Nil
+  else if (if cmp_possible_w world cur hi then false else true) then rev_app acc Nil
+  else
+    (let d9 = cmp_vals_w world cur hi in
+     if d9 > 0 then rev_app acc Nil
+     else if excl && d9 == 0 then rev_app acc Nil
+     else
+       // gc_cenv0 is the shared placeholder cenv the other world-level
+       // helpers use: dispatching #succ needs an env only to build a blk.
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        rng_succ_vals world (invoke_val_c gc_cenv0 world nb9 cur "succ" Nil false) hi excl (n + 1) (Cons (cur, acc))))
+
+// Does this range enumerate through #succ on an OBJECT begin? (A String or
+// Symbol one does not come here -- range_vals already walks those.)
+and rng_is_succ_obj = fn world -> fn (lo: Val) -> fn (hi: Val) ->
+  (match lo with VObj _ -> true | _ -> false)
+  && (match hi with VNil -> false | _ -> true)
+  && responds world lo "succ"
+
+and rng_include = fn env -> fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
+  if (match lo with VNil -> true | _ -> false) && (match hi with VNil -> true | _ -> false) then
+    (if rng_linear_val world v then VBool true
+     else raise_exc world "TypeError" "cannot determine inclusion in beginless/endless ranges")
+  else if rng_cmp_endpoints world lo hi then VBool (rng_covers_w world lo hi excl v)
+  else
+    // A walk needs BOTH ends, and ruby says so in its own words: membership
+    // in a half-open range it cannot compare is "cannot determine inclusion
+    // in beginless/endless ranges", not the walk's "can't iterate from X".
+    // One message, whichever end is missing -- the two spellings here named
+    // the missing end instead, for `("aa"..).include?("a")` and for every
+    // object range with one end open.
+    (match hi with
+     | VNil -> raise_exc world "TypeError" "cannot determine inclusion in beginless/endless ranges"
+     | _ ->
+       (match lo with
+        | VNil -> raise_exc world "TypeError" "cannot determine inclusion in beginless/endless ranges"
+        | VStr _ ->
+          (match rng_str_arg env world v with
+           | VStr h9 -> VBool (val_member_w env world (range_vals_raw lo hi excl) (VStr h9))
+           | _ -> VBool false)
+        | VSym _ -> VBool (val_member_w env world (range_vals_raw lo hi excl) v)
+        | VObj _ ->
+          (if responds world lo "succ" then VBool (rng_succ_member env world lo hi excl v 0)
+           else raise_exc world "TypeError"
+                  ("can't iterate from " ++ display_cls_msg world (dispatch_cls_of world lo)))
+        | _ -> raise_exc world "TypeError"
+                 ("can't iterate from " ++ display_cls_msg world (dispatch_cls_of world lo))))
 
 and rng_covers_w = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
   if (match lo with VNil -> false | _ -> (if cmp_possible_w world v lo then false else true)) then false
@@ -27847,13 +28471,23 @@ and rng_overlap = fn (lo1: Val) -> fn (hi1: Val) -> fn (ex1: bool) -> fn (o: Val
 // ("can't iterate from Float"). The raw walker answered an EMPTY list for
 // every begin it could not do, so `(1.0..3.0).to_a` was [] and not a refusal.
 // "" = it can be walked; anything else is the class name for the message.
+// Which class does a REFUSAL to walk this range name, or "" for none? The
+// begin decides that, and asking it a second way here let the two answers
+// disagree: this spelling had an arm for an integer begin with a BIGNUM end
+// but none for a bignum BEGIN, so `(2**64..2**64+2).to_a` was "can't iterate
+// from Integer" while #each, #map, #count and #include? all walked it. The
+// begin is now asked once, in rng_walk_from; what remains here is the END,
+// which only has to be of a kind the walk can compare against.
 and rng_iter_refusal = fn (lo: Val) -> fn (hi: Val) ->
-  match lo with
-  | VInt _ -> (match hi with VInt _ -> "" | VFlt _ -> "" | VNil -> "" | VBig _ -> "" | _ -> "Integer")
-  | VStr _ -> (match hi with VStr _ -> "" | VNil -> "" | _ -> "String")
-  | VSym _ -> (match hi with VSym _ -> "" | VNil -> "" | _ -> "Symbol")
-  | VNil -> "NilClass"
-  | _ -> class_name lo
+  let w = rng_walk_from lo in
+  if not (str_eq w "") then w
+  else (match lo with
+        | VStr _ -> (match hi with VStr _ -> "" | VNil -> "" | _ -> "String")
+        | VSym _ -> (match hi with VSym _ -> "" | VNil -> "" | _ -> "Symbol")
+        // an object range is walked by the arm that has the world to ask
+        // #succ; one arriving at the leaf has no walk.
+        | VObj _ -> class_name lo
+        | _ -> (match hi with VInt _ -> "" | VBig _ -> "" | VFlt _ -> "" | VNil -> "" | _ -> "Integer"))
 
 and rng_covers = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
   if (match lo with VNil -> false | _ -> (if cmp_possible v lo then false else true)) then false
@@ -27863,6 +28497,18 @@ and rng_covers = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) 
     && (match hi with
         | VNil -> true
         | _ -> if excl then cmp_vals v hi < 0 else cmp_vals v hi <= 0)
+
+// ...and with a world, so an OBJECT range can be asked. The world-free
+// version reaches cmp_vals, which raises for a pair it cannot compare.
+and rng_empty_w = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
+  match lo with
+  | VNil -> false
+  | _ -> (match hi with
+          | VNil -> false
+          | _ ->
+            (if cmp_possible_w world lo hi
+             then (let c = cmp_vals_w world lo hi in if excl then c >= 0 else c > 0)
+             else false))
 
 and rng_empty = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
   match lo with
@@ -27881,6 +28527,36 @@ and rng_slice_bounds = fn (lov: Val) -> fn (hiv: Val) -> fn (ex: bool) -> fn (n:
 
 // the elements, with no world to raise through: an un-enumerable range is
 // empty here, and the raising version below is used where there IS a world.
+// Range#sum over integers is GAUSS, not an addition per element: ruby answers
+// `(1..2**64).sum` at once, and adding up a materialised range answered 0 --
+// the walk gave up on the bignum end and val_sum summed nothing. A begin that
+// cannot be walked has no sum at all, which is a TypeError rather than 0.
+and rng_sum = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (init: Val) ->
+  let w = rng_walk_from lo in
+  if not (str_eq w "") then prim_raise "TypeError" ("can't iterate from " ++ w)
+  else
+    (match lo with
+     | VInt _ ->
+       (match rng_int_gauss (rng_int_side lo) (rng_int_top hi excl) with
+        | VNil -> val_sum (range_vals_raw lo hi excl) init
+        | g -> val_sum (Cons (g, Nil)) init)
+     | VBig _ ->
+       (match rng_int_gauss (rng_int_side lo) (rng_int_top hi excl) with
+        | VNil -> val_sum (range_vals_raw lo hi excl) init
+        | g -> val_sum (Cons (g, Nil)) init)
+     | _ -> val_sum (range_vals_raw lo hi excl) init)
+
+// The elements of a range with a bignum bound. A bignum end is not an
+// UNWALKABLE end -- (2**64..2**64+2) has three elements -- it is just one
+// that native ints cannot count to. Past a million elements the walk is not
+// attempted: that is where ruby exhausts memory rather than answering.
+and rng_big_vals = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
+  let a = rng_int_side lo in
+  let top = rng_int_top hi excl in
+  (match rng_int_span a top with
+   | VInt n -> (if n > 1000000 then (Nil : Val list) else rng_n_from a top 1 n Nil)
+   | _ -> (Nil : Val list))
+
 and range_vals_raw = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
   match lo with
   | VInt a ->
@@ -27892,6 +28568,15 @@ and range_vals_raw = fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
        (let t = int_of_float f in
         let fl = (if float_of_int t > f then t - 1 else t) in
         range_to_a a (if excl && feq f (float_of_int fl) then fl - 1 else fl))
+     | VBig _ -> rng_big_vals lo hi excl
+     | _ -> Nil)
+  // a BIGNUM begin walks the same way -- `(2**64..2**64+2).to_a` answered
+  // "can't iterate from Integer", which is what an unwalkable begin says.
+  | VBig _ ->
+    (match hi with
+     | VInt _ -> rng_big_vals lo hi excl
+     | VBig _ -> rng_big_vals lo hi excl
+     | VFlt _ -> rng_big_vals lo hi excl
      | _ -> Nil)
   | VStr slo ->
     (match hi with
@@ -27920,6 +28605,12 @@ and range_vals = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
      | VInt _ -> (match hi with
                   | VInt _ -> range_vals_raw lo hi excl
                   | VFlt _ -> range_vals_raw lo hi excl
+                  | VBig _ -> range_vals_raw lo hi excl
+                  | _ -> raise_exc_list world "TypeError" "can't iterate from Integer")
+     | VBig _ -> (match hi with
+                  | VInt _ -> range_vals_raw lo hi excl
+                  | VBig _ -> range_vals_raw lo hi excl
+                  | VFlt _ -> range_vals_raw lo hi excl
                   | _ -> raise_exc_list world "TypeError" "can't iterate from Integer")
      | VStr _ -> (match hi with
                   | VStr _ -> range_vals_raw lo hi excl
@@ -27947,7 +28638,15 @@ and rng_cp_walk = fn (cp: int) -> fn (last: int) -> fn (excl: bool) -> fn (acc: 
   else rng_cp_walk (cp + 1) last excl (Cons (mkstr (utf8_enc cp), acc))
 
 and rng_str_walk = fn (cur: str) -> fn (last: str) -> fn (excl: bool) -> fn (n: int) -> fn (acc: Val list) ->
-  if utf8_len cur == 1 && utf8_len last == 1 then
+  // SINGLE-BYTE endpoints, not single-character ones. ruby's String#upto takes
+  // the codepoint path only for a single byte; a multi-byte character walks
+  // #succ with a comparison bound, and the two disagree once the range spans
+  // more than one script: `("\u{999}".."\u{9999}").to_a` is 31 entries in ruby
+  // (it stops inside the Bengali block) and 36865 by codepoint.
+  //
+  // `('Σ'..'Ω')` agreed either way -- succ on Greek IS codepoint+1 -- which is
+  // why nothing showed the difference until a range crossed scripts.
+  if str_len cur == 1 && str_len last == 1 then
     (let (c1, _) = utf8_cp cur 0 in
      let (c2, _) = utf8_cp last 0 in
      rng_cp_walk c1 c2 excl acc)
@@ -27990,7 +28689,16 @@ and cmp_vals_w = fn world -> fn (a: Val) -> fn (b: Val) ->
     if has_meth world ocl "<=>" then
       let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in  // shared placeholder cenv (see gc_cenv0)
       (match invoke world noblk a ocl "<=>" (Cons (b, Nil)) with VInt n -> n | _ -> 0)
-    else cmp_vals a b
+    // Object#<=> answers 0 for the SAME object, and cmp_possible_w says so --
+    // it reads a bare object as comparable with itself and with nothing else.
+    // This half did not: it handed the pair to the world-free cmp_vals, which
+    // raised "comparison of Object with Object failed". Two functions
+    // answering "can these compare" and "what IS the comparison" have to
+    // agree, or the first one's yes leads straight into the second one's
+    // raise -- which is how `(x..x).minmax` became an ArgumentError.
+    else (match b with
+          | VObj bid -> (if oid == bid then 0 else cmp_vals a b)
+          | _ -> cmp_vals a b)
   // classes/modules order by the subclass relation (Module#<=>), so a list of
   // them sorts; unrelated ones answer nil, which sorts as equal here.
   | VClass ca ->

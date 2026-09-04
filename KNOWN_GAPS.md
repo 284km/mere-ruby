@@ -2151,3 +2151,226 @@ The reason for the third layer is not that the second was wrong. It is that on
 2026-09-04 the push-time check was run **by hand**, looked for the previous
 incident's shapes, and reported clean -- and a check nobody is required to run
 is a check that gets skipped on the day it matters.
+
+## A range is valid when `<=>` answers, not when its class is on a list
+
+`(["a"]..["f"])` is an ordinary ruby range. `Array#<=>` is element-wise, so the
+endpoints compare, so `Range.new` accepts them. mere-ruby raised
+`ArgumentError: bad value for range` at CONSTRUCTION, because it decided
+validity by enumerating the kinds it knew compared: numeric, String, Symbol,
+and an object whose class defines `<=>`. Array was not on that list.
+
+The comment above the check already stated ruby's actual rule -- *"does the
+class define `<=>` is NOT the question ruby asks; ruby asks whether `lo <=> hi`
+ANSWERS"* -- and the code below it still enumerated kinds. Asking is now what
+it does: `cmp_possible_w`, which for an object invokes its own `<=>` and reads
+a nil as "no", and for two Arrays asks `arr_spaceship_w` (Array#<=> itself,
+cycle guard and nested pairs included) rather than restating the rule a second
+time. `([1]..[2])` is valid, `([1]..["a"])` is not, and `([1,[2]]..[1,["a"]])`
+is refused by the pair that decides.
+
+Refusing at construction hid every later question about such a range. Once it
+was built, seven more answers were wrong -- and they were wrong for a second,
+separate reason.
+
+## The BEGIN alone decides whether a range can be walked
+
+ruby walks a range from its begin, comparing against its end. So the begin
+alone decides whether a walk is possible, and the end only has to be something
+the walk can compare against:
+
+    (1..10.0).max(2)          # => [10, 9]     -- integer begin, Float end
+    (1.0..10).max(2)          # => TypeError: can't iterate from Float
+    (["a"]..["f"]).max(2)     # => TypeError: can't iterate from Array
+    (["a"]..["f"]).min        # => ["a"]       -- no walk needed
+    (["a"]..["f"]).minmax     # => [["a"], ["f"]]
+    (["a"]...["f"]).minmax    # => TypeError -- an exclusive end must be NAMED
+
+mere-ruby decided walkability from EITHER endpoint, so all three `(1..10.0)`
+forms were refused, and it hard-coded the class in the message, so
+`(["a"]..["f"]).max(2)` reported *"can't iterate from Float"*. The question is
+now asked in one place (`rng_walk_from`) and the message names what it was
+asked about.
+
+That question turned out to be written in THREE spellings. `rng_iter_refusal`
+-- the one `#to_a` consults -- had an arm for an integer begin with a bignum
+end but none for a bignum BEGIN, so `(2**64..2**64+2).to_a` said "can't iterate
+from Integer" while `#each`, `#map`, `#count` and `#include?` all walked the
+same range happily. The third spelling now derives from the first.
+
+## An empty list reads as "no elements", never as "cannot iterate"
+
+`range_vals_raw` answers `Nil` for a range it cannot walk. Every caller read
+that as *no elements*, so a whole family of methods answered instead of
+refusing:
+
+| | ruby | mere-ruby was |
+|---|---|---|
+| `(["a"]..["f"]).sum` | TypeError | `0` |
+| `(["a"]..["f"]).first` | `["a"]` | `nil` |
+| `(["a"]..["f"]).first(2)` | TypeError | `[]` |
+| `(["a"]..["f"]).minmax` | `[["a"], ["f"]]` | `[nil, nil]` |
+| `(..5).sum` | TypeError | `0` |
+| `(1.0..3.0).sum` | TypeError | `0` |
+| `(t1..t2).to_a` | `can't iterate from Time` | `can't iterate from Object` |
+
+Two shapes of bug in one table. The refusals are missing because an empty list
+is indistinguishable from an empty range; the endpoint answers are missing
+because `#first`, `#min` and `#minmax` never needed the walk in the first
+place. And `class_name` reads any object as `Object`, so even the refusals
+mere-ruby did produce could not name the class -- naming it needs the world,
+which is why the object cases are now answered at the world level, where
+`display_cls_msg` can.
+
+## A bignum bound is not an unwalkable bound
+
+`(2**64..2**64+2)` has three elements. `(1..2**64)` has a size, a count, a sum
+and a first two -- ruby answers all four instantly, because none of them is a
+walk:
+
+    (1..2**64).size      # => 18446744073709551616
+    (1..2**64).count     # => 18446744073709551616
+    (1..2**64).sum       # => 170141183460469231740910675752738881536
+    (1..2**64).first(2)  # => [1, 2]
+
+`#size` and `#count` are arithmetic on the bounds; `#sum` is Gauss; `#first(n)`
+counts n times from the begin. mere-ruby materialised the range for all of
+them, and materialising gave up on a bignum end, so the answers were `nil`,
+a TypeError, `0` and `[]` respectively. They are arithmetic now, on decimal
+strings, so the width of the bound does not matter.
+
+`#to_a` and `#each` DO walk, and now walk bignum bounds -- up to a million
+elements, past which the walk is not attempted (that is where ruby exhausts
+memory rather than answering).
+
+## `#minmax` is `#min` and `#max`, and has to agree with them
+
+mere-ruby computed `#minmax` a second way -- materialise the range, take the
+ends of the list -- and it disagreed with the very methods it is defined as:
+
+    (1...10.0).minmax   # ruby: TypeError (cannot exclude non Integer end value)
+                        # mere: [1, 9]
+    (1.5...3).minmax    # ruby: TypeError (cannot exclude end value with non
+                        #                  Integer begin value)
+                        # mere: [nil, nil]
+
+Both of those are `#max`'s refusals, and `#max` was already producing them
+correctly when asked directly. `#minmax` now asks `#min` and `#max`, so there
+is one rule rather than two. An empty range still answers `[nil, nil]`,
+because that is what `#min` and `#max` say.
+
+## `#size` is not "how many elements" but "how many WITHOUT walking"
+
+    (1..10).size        # => 10
+    ("a".."f").size     # => nil     -- walkable, but not counted
+    (["a"]..["f"]).size # => TypeError
+    (1.5..3.5).size     # => TypeError  (ruby 3.4; 3.2 answered 3)
+    (Succ(1)..Succ(3)).size  # => nil  -- an object range with #succ
+
+Three different answers for three different begins, and mere-ruby had one:
+count the elements. `("a".."f").size` was already nil, but an object range with
+`#succ` answered 3 (it had the walked array to hand), a Float begin answered 3,
+and an Array begin answered nil.
+
+## Membership in a half-open range says so in ruby's words
+
+    ("aa"..).include?("a")   # => TypeError: cannot determine inclusion in
+                             #    beginless/endless ranges
+    (["a"]..).include?(["b"]) # => the same message
+
+A walk needs both ends. mere-ruby raised the WALK's error there instead --
+`can't iterate from String` -- naming the missing end for a question that never
+got as far as iterating. Numeric and Time endpoints still compare, so
+`(1..).include?(5)`, `(1.5..).include?(2)` and `(t1..).include?(t)` are all
+true.
+
+## One question, four places to answer it: Range#inspect
+
+`p (a..b)` inspected the bounds through the world and printed `Cmp(1)..Cmp(2)`.
+`(a..b).inspect` fell through to the world-free printer and said
+`#<object>..#<object>`. `(a..b).to_s` said the same. An ARRAY holding those two
+objects printed them correctly -- which is the tell: a container that knew how,
+next to one that did not.
+
+The world-free printer cannot dispatch a user's `#inspect`, so a Range asked
+for its own rendering has to be answered where the world is. It is, now, in
+both spellings -- and this is the same shape as the note two sections up about
+`respond_to?` and the operators, and the one about `rng_iter_refusal`: **when a
+question has more than one spelling, the spellings drift.**
+
+## What ruby cannot answer, a corpus program cannot ask
+
+`(0...2**64).max(2)` is arithmetic for mere-ruby and an infinite enumeration
+for ruby: `Range#max(n)` hands off to `Enumerable#max(n)`, which walks. The
+reference never returns, so the line cannot go in a corpus program -- not
+because mere-ruby is wrong, but because the oracle has no answer to compare
+against. Corpus 179 says so where the line would have been.
+
+The same asymmetry, the other way around, is why the reference is run with
+`$stdout.sync = true` when locating a hang: a block-buffered pipe loses
+everything the process printed before it was killed, so "ruby produced no
+output" read as "ruby failed immediately" when ruby had in fact printed 90
+lines and then hung on line 91.
+
+## Time is a stub
+
+`Time#strftime`, `#zone`, `#utc_offset` are undefined, and `Time#to_s` /
+`#inspect` render `#<Time:0x...>` where ruby renders `1970-01-01 09:00:00
++0900`. What Time DOES have is `<=>` (in the dispatcher, not the method table),
+which is why Time ranges compare, cover and refuse to walk exactly as ruby's
+do. The formatting is untouched.
+
+## A block leaks into the calls made inside it
+
+    def w(&b); b.call; end
+
+    (0...2**64).min(2)        # => [0, 1]
+    w { (0...2**64).min(2) }  # => []      <- mere-ruby
+
+A proc invoked through an `&b` parameter hands its frame's block to the calls
+inside its body, so a builtin that asks "was a block given?" sees one that was
+never passed. `yield` does not do this; `pr.call` at the top level does not
+either. It is `&b` + `#call` -- and every ruby/spec example runs in exactly
+that shape, which is why min_spec disagreed with the same expression typed at
+a prompt.
+
+The `encl` a block body runs under answers three questions at once: what
+`&param` binds to, what `yield` resolves to, and -- accidentally -- what block
+the body's own calls receive. The first two are already documented as distinct
+in `run_block`; the third is the one still shared.
+
+Nothing else visibly depends on it today: twenty-nine builtin forms that
+change behaviour with a block (`sort`, `max`, `min`, `sum`, `first`, `count`,
+`minmax`, `group_by`, ...) were checked inside that shape and all answer
+correctly, because the iterating path is chosen before the question is asked.
+`Range#min(n)` / `#max(n)` were the exception only because a guard was added
+that asked it directly. That guard is gone; the leak is not.
+
+## `(0...Float::INFINITY).max` answers Infinity
+
+ruby raises `TypeError: cannot exclude non Integer end value` -- an excluded
+end has to be NAMED, and Infinity is not an Integer. mere-ruby reads an
+infinite end as merely "endless" and answers the end itself, which is not even
+in the range.
+
+The fix is one branch in the endless-range arm, and it is not applied: adding
+it (binding the exclusive flag and one nested `if` inside a match arm of an
+already very long `if`/`else if` chain) took mere's type inference from 73
+seconds to over 10 minutes on this file. The inference is quadratic, and this
+chain is where it shows. It is worth doing behind a helper function, out of
+the chain, rather than in it.
+
+## The mspec shim's mock ignores `.with`
+
+    @x.should_receive(:<=>).with(@y).and_return(-1)
+    @x.should_receive(:<=>).with(@x).and_return(0)
+
+`MockObject#method_missing` answers from the FIRST registration for that
+symbol, so both send -1. Six of `core/range/minmax_spec`'s nine examples error
+under BOTH mere-ruby and ruby because of it -- the shim is the limit there,
+not either implementation. Two more errored under mere-ruby alone, and those
+were real: `cmp_possible_w` reads a bare object as comparable with ITSELF
+(Object#<=> is 0 for the same object) while `cmp_vals_w` sent that same pair
+to the world-free comparison, which raises. Two functions answering "can these
+compare?" and "what IS the comparison?" have to agree, or the first one's yes
+walks straight into the second one's raise.
