@@ -10,59 +10,49 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 313 files.
+Classified: 312 files.
 
-## CRASH — 17 files, 10 kinds
+## CRASH — 16 files, 6 kinds
 
 | files | kind |
 |---|---|
-| 4 | `(no output before aborting)` |
-| 3 | `stack overflow (recursion too deep)` |
-| 2 | `ERROR StandardError` |
-| 2 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
-| 1 | `ERROR NoMethodError` |
-| 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
+| 7 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 5 | `stack overflow (recursion too deep)` |
+| 1 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETONN_CLASSES (NameError)` |
-| 1 | `*.rb:N: mere-ruby: unterminated string in TMPDIR near line N` |
-| 1 | `*.rb:N: mere-ruby: undefined method 'S' for class KernelSpecs::CalleeTest` |
-| 1 | `*.rb:N: mere-ruby: undefined method 'S' for class DefineSingletonMethodSpecClass` |
+| 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line N` |
+| 1 | `(no output before aborting)` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 4 | `(no output before aborting)` |
-| 3 | `stack overflow (recursion too deep)` |
-| 1 | `ERROR: when m is a bignum or larger than int returns 0 when m > 0 and n >= 0: StandardError` |
-| 1 | `ERROR: when m is a bignum or larger than int returns 0 when m < 0 and n >= 0: StandardError` |
-| 1 | `ERROR: rescuing SignalException raises a SignalException when sent a signal: NoMethodError` |
-| 1 | `*.rb:N: uninitialized constant Enumerator::ArithmeticSequence (NameError)` |
+| 7 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 5 | `stack overflow (recursion too deep)` |
+| 1 | `FAILED: raised StandardError, expected TypeError` |
 | 1 | `*.rb:N: uninitialized constant CS_SINGLETON4_CLASSES (NameError)` |
-| 1 | `*.rb:N: mere-ruby: unterminated string in TMPDIR near line 645` |
-| 1 | `*.rb:N: mere-ruby: undefined method 'define_singleton_method' for class DefineSingletonMethodSpecClass` |
-| 1 | `*.rb:N: mere-ruby: undefined method '__callee__' for class KernelSpecs::CalleeTest` |
-| 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 66` |
 | 1 | `*.rb:N: mere-ruby: expected end of statement in TMPDIR near line 334` |
+| 1 | `(no output before aborting)` |
 
 </details>
 
-## DIFF — 296 files, 94 kinds
+## DIFF — 296 files, 96 kinds
 
 | files | kind |
 |---|---|
-| 45 | `ERROR NoMethodError` |
+| 44 | `ERROR NoMethodError` |
 | 18 | `FAILED expected N, got N` |
-| 17 | `ERROR StandardError` |
+| 16 | `ERROR StandardError` |
 | 14 | `ERROR NameError` |
-| 12 | `FAILED expected ArgumentError to be raised` |
-| 10 | `FAILED expected to be identical` |
+| 13 | `FAILED expected ArgumentError to be raised` |
+| 11 | `FAILED expected to be identical` |
 | 10 | `FAILED expected TypeError to be raised` |
 | 9 | `pass=N fail=N err=N` |
-| 9 | `FAILED expected true, got false` |
+| 8 | `FAILED expected true, got false` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 7 | `FAILED expected truthy from #include?` |
-| 6 | `FAILED expected "S", got "S"` |
+| 7 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected N, got nil` |
 | 5 | `ERROR ArgumentError` |
 | 4 | `FAILED expected nil, got "S"` |
@@ -81,10 +71,8 @@ Classified: 313 files.
 | 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
-| 2 | `FAILED expected N, got NaN` |
 | 2 | `FAILED expected :SYM, got nil` |
 | 2 | `FAILED expected "S" to match` |
-| 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -92,6 +80,7 @@ Classified: 313 files.
 | 1 | `FAILED raised StandardError, expected TypeError` |
 | 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
+| 1 | `FAILED raised NoMethodError, expected TypeError` |
 | 1 | `FAILED matcher did not match N` |
 | 1 | `FAILED expected {:SYM=>[N, N, N]}, got nil` |
 | 1 | `FAILED expected {#<OBJ>=>"S", #<OBJ>=>"S"}, got {}` |
@@ -125,6 +114,7 @@ Classified: 313 files.
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got true` |
+| 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected N ...[clipped]` |
@@ -134,14 +124,16 @@ Classified: 313 files.
 | 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected #<Proc:NxADDR TMPDIR got nil` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
-| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>"cl ...[clipped]` |
+| 1 | `FAILED expected #<OBJ>"S", "S"=>"S", "S"=>" ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
 | 1 | `FAILED expected "S"MethodSpecs::MyMod\"S"bar\"S" to match` |
 | 1 | `FAILED expected "S", got #<OBJ>` |
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
+| 1 | `FAILED expected "` |
 | 1 | `ERROR ZeroDivisionError` |
+| 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR Errno::ENOENT` |
 
@@ -149,7 +141,7 @@ Classified: 313 files.
 
 | files | cause |
 |---|---|
-| 12 | `FAILED: expected ArgumentError to be raised` |
+| 13 | `FAILED: expected ArgumentError to be raised` |
 | 10 | `FAILED: expected TypeError to be raised` |
 | 3 | `FAILED: expected not 0` |
 | 3 | `FAILED: expected ZeroDivisionError to be raised` |
@@ -157,8 +149,8 @@ Classified: 313 files.
 | 3 | `FAILED: expected RangeError to be raised` |
 | 3 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `ERROR: bignum dispatches the correct operator after coercion: ArgumentError` |
-| 2 | `pass=55 fail=0 err=0` |
-| 2 | `pass=52 fail=0 err=0` |
+| 2 | `pass=74 fail=0 err=0` |
+| 2 | `pass=71 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns the original name even when aliased twice: expected :foo, got :bar` |
@@ -177,8 +169,8 @@ Classified: 313 files.
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=5 fail=0 err=0` |
 | 1 | `pass=4 fail=2 err=7` |
+| 1 | `pass=214 fail=0 err=0` |
 | 1 | `pass=16 fail=0 err=0` |
-| 1 | `pass=157 fail=0 err=0` |
 | 1 | `pass=110 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: writer method be a synonym for []=: expected "F150", got nil` |
@@ -204,8 +196,8 @@ class column says where the weight sits.
 | matchdata (9) | `byteoffset deconstruct_keys deconstruct dup equal_value length match_length match regexp` |
 | exception (8) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception system_call_error` |
 | method (7) | `case_compare clone compose curry element_reference super_method to_proc` |
-| kernel (7) | `__method__ binding lambda loop method select test` |
 | struct (6) | `deconstruct element_reference element_set filter keyword_init new` |
+| kernel (6) | `binding lambda loop method select test` |
 | symbol (5) | `all_symbols intern match name slice` |
 | rational (4) | `divide minus multiply plus` |
 | unboundmethod (3) | `bind_call clone super_method` |
@@ -214,6 +206,5 @@ class column says where the weight sits.
 | numeric (2) | `integer real` |
 | language (2) | `alias module` |
 | threadgroup (1) | `list` |
-| range (1) | `step` |
 
 _Generated by `mspec/causes.sh`._

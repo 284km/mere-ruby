@@ -44,8 +44,40 @@ EOF
 # kills this script, but the child would keep spinning (a runaway spec used to
 # leave one behind per sweep, and they pile up until the machine is out of
 # memory). SIGKILL after the deadline so nothing survives.
-out_m="$(perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1)"
-out_r="$(ruby -W0 "$tmp/driver.rb" 2>&1)"
+# ...and bound the BYTES, on both sides. A command substitution buffers the
+# whole output in THIS shell, so a spec that prints without end grows the
+# harness rather than the interpreter -- which is why rss_guard.sh, watching
+# only processes whose args say mere-ruby, logged no kill on the two occasions
+# a sweep took the machine down (2026-09-04). `head -c` stays in the pipe
+# because closing it is what stops the producer (SIGPIPE); capturing to a file
+# first would trade a bounded run for an unbounded one.
+#
+# The reference side had no bound at all -- no alarm, no cap. It is one ruby
+# loop away from the same crash, and "the reference cannot run away" is an
+# assumption, not a property.
+#
+# The exit status travels beside the output rather than through it: with
+# `head -c` in the way, `$?` would be head's.
+out_cap=2000000
+out_m="$({ perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"
+rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
+out_r="$({ perl -e 'alarm 25; exec @ARGV' ruby -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
+
+# Say WHICH failure it was, in the section it belongs to, and let scoreboard.sh
+# classify as it always has: with no `pass=` line in mere-ruby's section it
+# records CRASH and takes the last line as the cause. A run the guard SIGKILLs
+# and a run that aborts on its own both arrive here as no output, and the
+# record then says "mere-ruby aborted" about a file that works and wants 15 GB.
+# (Replacing the REFERENCE section instead makes it SKIP -- a claim about ruby.)
+if [ "$rc_m" = "137" ] || [ "$rc_m" = "9" ]; then
+  out_m="KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own"
+fi
+if [ "${#out_m}" -ge "$out_cap" ]; then
+  out_m="RUNAWAY OUTPUT: passed $out_cap bytes and was cut off"
+fi
+if [ "${#out_r}" -ge "$out_cap" ]; then
+  out_r="RUNAWAY OUTPUT on the reference side: passed $out_cap bytes and was cut off"
+fi
 echo "--- mere-ruby:"; echo "$out_m"
 echo "--- ruby:";      echo "$out_r"
 if [ "$out_m" = "$out_r" ]; then echo "MATCH"; else echo "DIFF"; fi

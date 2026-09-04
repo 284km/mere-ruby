@@ -43,6 +43,23 @@ export LC_ALL
 # WITHOUT this, so pinning it and re-sweeping have to happen together.
 RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
 export RUBYOPT
+
+# THE REFERENCE RUBY IS PART OF THE SUBJECT. Every verdict here is "does
+# mere-ruby print what ruby prints", so a different ruby is a different
+# question -- and the answer looks like mere-ruby moved. On 2026-09-04 a reboot
+# dropped rbenv's shims from PATH, `ruby` resolved to macOS's own 2.6.10, and a
+# full sweep recorded MATCH 762 -> 694 with SKIP 5 -> 59: fifty-four files that
+# 2.6 cannot parse, read as "ruby does not run it here", and core/false fell
+# from 9/9 because 2.6's `false.to_s` is not frozen. Nothing in mere-ruby had
+# changed. The record is only comparable across runs if this line holds.
+REF_RUBY_VERSION="${REF_RUBY_VERSION:-3.2.2}"
+have="$(ruby -e 'print RUBY_VERSION' 2>/dev/null)"
+if [ "$have" != "$REF_RUBY_VERSION" ]; then
+  echo "reference ruby is $have, expected $REF_RUBY_VERSION (which ruby: $(command -v ruby))" >&2
+  echo "the recorded numbers are against $REF_RUBY_VERSION; sweeping with another one is not a" >&2
+  echo "regression, it is a different question. Fix PATH (rbenv shims) or set REF_RUBY_VERSION." >&2
+  exit 2
+fi
 here="$(cd "$(dirname "$0")" && pwd)"
 root="${1:?usage: scoreboard.sh <spec-root> [dir ...]}"
 shift
