@@ -56,10 +56,11 @@ for pat in '/Users/' '/home/' 'HOME/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SO
   [ -n "$hits" ] && { echo "LEAK  $pat"; echo "$hits" | sed "s|$root/|        |"; rc=1; }
 done
 # ...and a STRUCTURAL check, because the list above is a list of leaks someone
-# thought of. `CLAUDE_CODE_MESSAGING_TOKEN` was not on it, and four lines of
-# mspec/DIFF_LINES.txt carried it WITH ITS VALUE into a public commit
-# (2026-09-05). CLAUDE_CODE_SESSION_ID was on the list; the token beside it was
-# not, and naming variables one at a time cannot keep up with an environment.
+# thought of. On 2026-09-05 a SESSION TOKEN went into a public commit WITH ITS
+# VALUE, on four lines of mspec/DIFF_LINES.txt and one of mspec/tags/. Its
+# variable sat in the same environment as CLAUDE_CODE_SESSION_ID, which IS on
+# the list above -- and that is the whole point: naming variables one at a time
+# cannot keep up with an environment.
 #
 # The signature of an environment dump is ruby's hash inspect with a SHOUTING
 # key: `"SOME_NAME" => "value"`. That shape is never a legitimate cause here,
