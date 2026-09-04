@@ -55,7 +55,7 @@ for g in $groups; do
             -e 's/^FAILED: .*: \(expected .*\)$/FAILED\t\1/' \
             -e 's/^FAILED: \(.*\)$/FAILED\t\1/' \
             -e 's/^ERROR: \(.*\)$/ERROR\t\1/' \
-      | sed -e "s|${HOME}|HOME|g" \
+      | sed -e "s|${HOME}[^ \"]*|HOME|g" \
             -e 's|/var/folders/[^ ]*|TMPDIR|g' \
             -e 's|0x[0-9a-f]*|0xADDR|g' \
       | awk -v n=300 '{ if (length($0) > n) print substr($0,1,n) " ...[clipped]"; else print $0 }' \

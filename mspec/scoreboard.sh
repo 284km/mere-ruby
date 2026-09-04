@@ -131,7 +131,7 @@ strip_noise() {  # stdin -> stdout, a line usable as a bucket key
   sed -e 's|^[^ ]*\.rb:[0-9]*: |*.rb:N: |' \
       -e 's|/[^ ]*/mrb_[A-Za-z0-9]*|TMPDIR|g' \
       -e 's|/var/folders/[^ ]*|TMPDIR|g' \
-      -e "s|${HOME}|HOME|g" \
+      -e "s|${HOME}[^ \"]*|HOME|g" \
       -e 's|0x[0-9a-f]*|0xADDR|g'
 }
 

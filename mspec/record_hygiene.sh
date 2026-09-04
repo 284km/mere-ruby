@@ -43,7 +43,12 @@ rc=0
 # something REAL moved. It sat unmasked in bootstraptest/ERRORS.txt while this
 # check read that very file and reported it clean -- the detector only ever
 # catches the leaks someone thought of.
-for pat in '/Users/' '/home/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SOCK' \
+# 'HOME/' catches a path the masker only half-took: replacing $HOME with the
+# word HOME leaves `HOME/src/github.com/<user>/<repo>` behind, which is still
+# this machine's layout and still in a public record -- and every pattern below
+# it looks for the SPELLING BEFORE the mask, so it read as clean. Found on
+# 2026-09-04, already pushed.
+for pat in '/Users/' '/home/' 'HOME/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SOCK' \
            'SECURITYSESSIONID' 'XPC_SERVICE_NAME' \
            'CLAUDE_CODE_SESSION_ID' 'LaunchInstanceID' '__CF_USER_TEXT_ENCODING' \
            'VSCODE_IPC_HOOK' 'GVM_PATH_BACKUP' 'LD_LIBRARY_PATH' 'SSH_AGENT_PID'; do
