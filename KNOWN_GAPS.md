@@ -2015,3 +2015,67 @@ is what makes them possible, so this is a design change, not a patch.
 The visible cost meanwhile: a helper like `def show(l); puts yield; end` cannot
 be used to test the match globals, because it tests this instead. corpus 176
 reads them at top level for that reason.
+
+## The predefined globals accepted everything, and one refusal found a wrong default
+
+`language/predefined_spec.rb` failed 75 of its assertions, and almost all of it
+was one shape: **mere-ruby accepted every assignment and answered nil for every
+switch**, where ruby refuses, coerces, or has a default.
+
+| | ruby | was |
+|---|---|---|
+| `$& = ""` written literally | SyntaxError `Can't set variable $&` | silent write |
+| `alias $x $&` then `$x = ""` | NameError `$x is a read-only variable` | silent write |
+| `$! = []`, `$: = []`, `$" = []`, `$< = []`, `$? = []` | NameError, every spelling | silent write |
+| `$/ = 1` | TypeError `value of $/ must be String` | silent write |
+| `$-0 = 1` | TypeError `value of $-0 must be String` | silent write |
+| `$; = 1` | TypeError `value of $; must be String or Regexp` | silent write |
+| `$~ = 1` | TypeError `wrong argument type Integer (expected MatchData)` | silent write |
+| `$. = "x"` | TypeError, and `#to_int` converts | silent write |
+| `$0 = nil` | TypeError, and `#to_str` converts | silent write |
+| `$stdout = obj` with no `#write` | TypeError `$stdout must have write method, Object given` | silent write |
+| `$VERBOSE = 1` | `true` — only nil/false/true are kept | `1` |
+| `$-d`, `$-v`, `$-w` | aliases of `$DEBUG` / `$VERBOSE` | separate slots reading nil |
+| `$-a`, `$-l`, `$-p` | `false` | `nil` |
+| `$+` | the last NON-NIL capture | `nil` |
+| `$_` after `gets` | the line read, `nil` at EOF | `nil` always |
+| `STDOUT.external_encoding` | `nil` (STDIN has one) | NoMethodError |
+| `STDOUT.set_encoding(a, b)` | records both, answers self | NoMethodError |
+
+**The long spellings are now real aliases**, not separate slots. `$LOAD_PATH`,
+`$-I`, `$LOADED_FEATURES`, `$FILENAME`, `$PROGRAM_NAME` and `$-0` had slots of
+their own that happened to hold the same array as `$:` / `$"` / ... — which made
+`.equal?` accidentally true while `object_id` disagreed, and left `$-I` with
+nothing keeping it in step. Three readers had to be moved onto `gvar_slot` with
+them: the one that searches the load path and the two that record a loaded
+feature read the long spelling directly, and aliasing it emptied that slot.
+`require` stopped working entirely until they were found — the same rule written
+in four places, and only one of them changed.
+
+### ...and `$.` was nil where ruby starts it at 0
+
+The `$.` refusal above broke **bundlertest completely**, and the trace pointed
+at rubygems:
+
+```ruby
+saved_lineno = $.           # rubygems/stub_specification.rb
+...
+ensure
+  $. = saved_lineno         # TypeError: no implicit conversion from nil to integer
+end
+```
+
+rubygems saves and restores `$.` around every gemspec stub it reads. In ruby
+`$.` starts at **0**, so restoring it is harmless; here it started at **nil**.
+The check was right and the value it refused was this interpreter's own default,
+which nothing had ever read strictly enough to notice.
+
+Worth keeping: **that failure could not come from the spec.** The spec reads
+`$.`; only real third-party code writes it back. A refusal is worth running
+against the gates that execute someone else's library, not only against the
+suite that describes the behaviour.
+
+`predefined_spec` went from 75 failures to 25. What is left is the encoding of
+the matched string (7 — `$&` has to carry the source string's encoding, and the
+spec compares `Encoding` objects by identity), the `$~`-in-a-block gap above
+(5), `$@` as a rescued exception's backtrace (2), and singles.

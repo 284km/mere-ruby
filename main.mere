@@ -11818,7 +11818,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EAssign (name, e) ->
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
-            then gvar_write world (gvar_slot (substring name 1 (str_len name))) v
+            then gvar_assign_checked env world name v
             else if str_len name > 0 && str_eq (char_at name 0) "@"
             then assign_one env world name v
             else if is_upper_first name then
@@ -11986,8 +11986,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                        then (match map_get globals "VERBOSE" with VNil -> false | _ -> true)
                        else false) then
                   (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-                   let nm = (if map_has globals "PROGRAM_NAME"
-                             then (match map_get globals "PROGRAM_NAME" with VStr h -> sget h | _ -> "-e") else "-e") in
+                   let nm = (if map_has globals (gvar_slot "PROGRAM_NAME")
+                             then (match map_get globals (gvar_slot "PROGRAM_NAME") with VStr h -> sget h | _ -> "-e") else "-e") in
                    let msg = mkstr (nm ++ ": warning: variable $= is no longer effective\n") in
                    // `module Warning; def warn(m); end; end` defines an INSTANCE
                    // method, and Ruby reaches it as Warning.warn because the
@@ -12010,6 +12010,21 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              if str_eq k "&" then invoke_val_c env world nb (VObj mid) "[]" (Cons (VInt 0, Nil)) false
              else if str_eq k "`" then invoke_val_c env world nb (VObj mid) "pre_match" Nil false
              else invoke_val_c env world nb (VObj mid) "post_match" Nil false)
+          | _ -> VNil)
+       // $+ is the LAST NON-NIL capture -- not the last group, which may not
+       // have participated: `"xy" =~ /(x)(a)?(y)/` leaves $+ as "y" while
+       // group 2 is nil. It answered nil for every match.
+       else if str_eq k "+" then
+         (match (if map_has globals "~" then map_get globals "~" else VNil) with
+          | VObj mid ->
+            (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+             let n9 = (match invoke_val_c env world nb (VObj mid) "size" Nil false with VInt n -> n | _ -> 1) in
+             let rec last9 = fn (i: int) ->
+               if i < 1 then VNil
+               else (match invoke_val_c env world nb (VObj mid) "[]" (Cons (VInt i, Nil)) false with
+                     | VNil -> last9 (i - 1)
+                     | got -> got) in
+             last9 (n9 - 1))
           | _ -> VNil)
        // $1..$9 are views on the same MatchData, so they follow `$~` rather
        // than living in slots of their own -- which is what lets a call save
@@ -13398,10 +13413,111 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
      | _ -> ())
   else ()
 
+// The match globals are READ-ONLY. A literal `$& = ""` is refused by the
+// parser (ruby: SyntaxError "Can't set variable $&"); reached through an
+// ALIAS it is a NameError at run time, naming the alias -- `alias $x $&;
+// $x = ""` says "$x is a read-only variable". Both were silent writes here.
+and gvar_readonly = fn (slot: str) ->
+  str_eq slot "&" || str_eq slot "`" || str_eq slot "'" || str_eq slot "+"
+  || (str_len slot == 1 && slot >= "1" && slot <= "9")
+
+// The other read-only ones. ruby refuses these by NAME (a NameError, not a
+// parse error): the exception in flight, the load path, the loaded-features
+// list, ARGF and the child status. A program READS them; the interpreter
+// writes them. Both the written spelling and the resolved slot are checked,
+// because `$LOAD_PATH` and `$:` are separate slots here that happen to share
+// one array.
+and gvar_readonly_named = fn (n: str) ->
+  str_eq n "!" || str_eq n ":" || str_eq n "\"" || str_eq n "<" || str_eq n "?"
+  || str_eq n "LOAD_PATH" || str_eq n "-I" || str_eq n "LOADED_FEATURES"
+  || str_eq n "FILENAME"
+
+// ...and the ones that must be a String, named in their own message: ruby says
+// "value of $/ must be String" using the SPELLING that was written, so `$-0`
+// and `$/` -- the same setting -- say different things.
+and gvar_must_be_string = fn (n: str) ->
+  str_eq n "/" || str_eq n "-0" || str_eq n "\\" || str_eq n ","
+
+// Some predefined globals COERCE what is assigned to them, and refuse what
+// cannot convert: `$. = "x"` and `$0 = nil` are TypeErrors, and $stdout must
+// have a #write. All three were accepted as-is.
+and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
+  let body = substring name 1 (str_len name) in
+  let slot = gvar_slot body in
+  if gvar_readonly slot then
+    // The DIRECT spelling and the ALIASED one are different refusals, and the
+    // alias table tells them apart: `$& = ""` is written as its own slot, so
+    // ruby's parser refuses it ("Can't set variable $&"), while `$x = ""`
+    // resolves THROUGH an alias and is a NameError naming $x.
+    (if str_eq body slot then
+       (let _ = raise_exc world "SyntaxError" ("Can't set variable $" ++ slot) in ())
+     else (let _ = raise_exc world "NameError" (name ++ " is a read-only variable") in ()))
+  else if gvar_readonly_named body || gvar_readonly_named slot then
+    (let _ = raise_exc world "NameError" (name ++ " is a read-only variable") in ())
+  // `$~` holds a MatchData or nil, and nothing else.
+  else if str_eq slot "~" then
+    (match v with
+     | VNil -> (let _ = gvar_write world slot v in ())
+     | VObj oid9 -> (if map_has md_whole (str_of_int oid9) then (let _ = gvar_write world slot v in ())
+                     else (let _ = raise_exc world "TypeError"
+                             ("wrong argument type " ++ display_cls_msg world (dispatch_cls_of world v)
+                              ++ " (expected MatchData)") in ()))
+     | _ -> (let _ = raise_exc world "TypeError"
+               ("wrong argument type " ++ display_cls_msg world (dispatch_cls_of world v)
+                ++ " (expected MatchData)") in ()))
+  else if gvar_must_be_string body || gvar_must_be_string slot then
+    (match v with
+     | VStr _ -> (let _ = gvar_write world slot v in ())
+     | VNil -> (let _ = gvar_write world slot v in ())
+     | _ -> (let _ = raise_exc world "TypeError" ("value of " ++ name ++ " must be String") in ()))
+  // `$;` takes a String OR a Regexp (it is String#split's default pattern).
+  else if str_eq slot ";" || str_eq body ";" then
+    (match v with
+     | VStr _ -> (let _ = gvar_write world slot v in ())
+     | VRegex (_, _) -> (let _ = gvar_write world slot v in ())
+     | VNil -> (let _ = gvar_write world slot v in ())
+     | _ -> (let _ = raise_exc world "TypeError" ("value of " ++ name ++ " must be String or Regexp") in ()))
+  else if str_eq slot "." then
+    (match v with
+     | VInt _ -> (let _ = gvar_write world slot v in ())
+     | _ ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let ti9 = (if responds world v "to_int" then invoke_val_c env world nb9 v "to_int" Nil false else VNil) in
+        match ti9 with
+        | VInt _ -> (let _ = gvar_write world slot ti9 in ())
+        // nil has its own wording in ruby: "from nil to integer", not
+        // "of NilClass into Integer".
+        | _ -> (let _ = raise_exc world "TypeError"
+                  (match v with
+                   | VNil -> "no implicit conversion from nil to integer"
+                   | _ -> "no implicit conversion of " ++ display_cls_msg world (dispatch_cls_of world v) ++ " into Integer") in ())))
+  else if str_eq slot "0" || str_eq slot "PROGRAM_NAME" then
+    (match v with
+     | VStr _ -> (let _ = gvar_write world slot v in ())
+     | _ ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let ts9 = (if responds world v "to_str" then invoke_val_c env world nb9 v "to_str" Nil false else VNil) in
+        match ts9 with
+        | VStr _ -> (let _ = gvar_write world slot ts9 in ())
+        | _ -> (let _ = raise_exc world "TypeError"
+                  ("no implicit conversion of " ++ (match v with VNil -> "nil" | _ -> display_cls_msg world (dispatch_cls_of world v))
+                   ++ " into String") in ())))
+  // `$VERBOSE = 1` stores TRUE: ruby keeps only the three states nil / false
+  // / true, and anything else truthy becomes true.
+  else if str_eq slot "VERBOSE" then
+    (let v9 = (match v with VNil -> VNil | VBool b -> VBool b | _ -> VBool true) in
+     let _ = gvar_write world slot v9 in ())
+  else if str_eq slot "stdout" || str_eq slot "stderr" then
+    (if responds world v "write" then (let _ = gvar_write world slot v in ())
+     else (let _ = raise_exc world "TypeError"
+             ("$" ++ slot ++ " must have write method, "
+              ++ display_cls_msg world (dispatch_cls_of world v) ++ " given") in ()))
+  else (let _ = gvar_write world slot v in ())
+
 and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   let (meths, sup, ocls, ivars) = world in
   if str_len tgt > 0 && str_eq (char_at tgt 0) "$" then
-    let _ = gvar_write world (gvar_slot (substring tgt 1 (str_len tgt))) v in ()
+    let _ = gvar_assign_checked env world tgt v in ()
   // "@@x" is a class variable, not an ivar named "@x" — same split SIVarAssign
   // makes, needed here so `@@a, @@b = ...` writes class variables.
   else if str_len tgt > 1 && str_eq (substring tgt 0 2) "@@" then
@@ -20368,6 +20484,42 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "flush" || str_eq name "sync=" then recv
        else if str_eq name "sync" then VBool false
        else if str_eq name "fileno" then VInt fd
+       // A standard stream's encodings. STDOUT and STDERR answer nil for both
+       // in ruby (they take whatever they are given), STDIN has an external
+       // one, and #set_encoding records the pair and answers self. All three
+       // were NoMethodError, which also made respond_to? deny them.
+       // Object's own methods, before the arm's catch-all refusal: this arm
+       // captures every name for an IO, so `STDOUT.equal?(x)` and
+       // `STDOUT.object_id` were NoMethodError.
+       else if str_eq name "equal?" then
+         VBool (match args with Cons (VObj o9, _) -> o9 == id | _ -> false)
+       else if str_eq name "object_id" || str_eq name "__id__" then VInt id
+       else if str_eq name "frozen?" then VBool false
+       else if str_eq name "hash" then VInt (val_hash recv)
+       else if str_eq name "dup" || str_eq name "clone" then recv
+       else if str_eq name "external_encoding" then
+         (if map_has ivars (str_of_int id ++ "@__io_ext") then map_get ivars (str_of_int id ++ "@__io_ext")
+          else if fd == 0 then
+            (if map_has def_ext_enc "v" then map_get def_ext_enc "v"
+             else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else VNil)
+          else VNil)
+       else if str_eq name "internal_encoding" then
+         (if map_has ivars (str_of_int id ++ "@__io_int") then map_get ivars (str_of_int id ++ "@__io_int")
+          else VNil)
+       else if str_eq name "set_encoding" then
+         (let one9 = fn (a: Val) ->
+            (match a with
+             | VStr h9 -> (let nm9 = enc_canon (sget h9) in
+                           if map_has enc_objs nm9 then map_get enc_objs nm9 else a)
+             | _ -> a) in
+          let _ = (match args with
+                   | Cons (e1, rest9) ->
+                     (let _ = map_set ivars (str_of_int id ++ "@__io_ext") (one9 e1) in
+                      match rest9 with
+                      | Cons (e2, _) -> map_set ivars (str_of_int id ++ "@__io_int") (one9 e2)
+                      | Nil -> ())
+                   | Nil -> ()) in
+          recv)
        // Mere has no isatty capability, and the browser build has no terminal
        // at all, so an IO here is never a tty. That matches the redirected /
        // piped case exactly (which is how CRuby answers under the harnesses),
@@ -23481,7 +23633,15 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name "readlines" || str_eq name "to_a" || str_eq name "close" || str_eq name "closed?" ||
     str_eq name "path" || str_eq name "to_path" || str_eq name "rewind" || str_eq name "eof?" ||
     str_eq name "eof" || str_eq name "flush" || str_eq name "sync" || str_eq name "sync=" ||
-    str_eq name "fileno" || str_eq name "tty?" || str_eq name "isatty"
+    str_eq name "fileno" || str_eq name "tty?" || str_eq name "isatty" ||
+    // ...and the encodings, which the dispatcher now answers. respond_to?
+    // denying a name the call implements is the same fact spelled two ways.
+    str_eq name "external_encoding" || str_eq name "internal_encoding" ||
+    str_eq name "set_encoding" ||
+    // every object answers these; the IO arm captures the name before the
+    // generic path can, so `STDOUT.set_encoding(...).equal?(STDOUT)` raised.
+    str_eq name "equal?" || str_eq name "object_id" || str_eq name "frozen?" ||
+    str_eq name "hash" || str_eq name "dup" || str_eq name "clone"
   else if str_eq cls "Time" then
     str_eq name "to_i" || str_eq name "utc" || str_eq name "getutc" || str_eq name "utc?" ||
     str_eq name "year" || str_eq name "month" || str_eq name "mon" || str_eq name "day" ||
@@ -31046,7 +31206,9 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
 
 // search the $LOAD_PATH directories for a feature file ("" = not found).
 and load_path_find = fn world -> fn (p1: str) ->
-  (match (if map_has globals "LOAD_PATH" then map_get globals "LOAD_PATH" else VNil) with
+  // through gvar_slot: `$LOAD_PATH` is an ALIAS of `$:` now, so the long
+  // spelling has no slot of its own to read.
+  (match (if map_has globals (gvar_slot "LOAD_PATH") then map_get globals (gvar_slot "LOAD_PATH") else VNil) with
    | VArr aid -> load_path_go (deref aid) p1
    | _ -> "")
 and load_path_go = fn (dirs: Val list) -> fn (p1: str) ->
@@ -32361,7 +32523,9 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "\n" ++
     "  def gets(sep = \"\\n\")\n" ++
-    "    return nil if eof?\n" ++
+    // at EOF $_ becomes nil too -- it reports the LAST READ, and there was
+    // none. Returning early without touching it left the previous line there.
+    "    return ($_ = nil) if eof?\n" ++
     "    idx = @string.index(sep, @pos)\n" ++
     "    if idx.nil?\n" ++
     "      line = @string[@pos, @string.length - @pos]\n" ++
@@ -32370,7 +32534,9 @@ and stdlib_src = fn (name: str) ->
     "      line = @string[@pos, idx + sep.length - @pos]\n" ++
     "      @pos = idx + sep.length\n" ++
     "    end\n" ++
-    "    line\n" ++
+    // `gets` sets $_ to the line it read, wherever it is read from -- the
+    // spec checks it through StringIO. It was left nil.
+    "    $_ = line\n" ++
     "  end\n" ++
     "\n" ++
     "  def readlines(sep = \"\\n\")\n" ++
@@ -34295,11 +34461,16 @@ and rb_gets = fn (u: unit) ->
              let _ = map_set stdin_src_pos "p" 0 in ()) in
   let s = map_get stdin_src "s" in
   let pos = (if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0) in
-  if pos >= str_len s then VNil
+  if pos >= str_len s then (let _ = map_set globals "_" VNil in VNil)
   else
     let e = line_end_from s pos in
     let _ = map_set stdin_src_pos "p" e in
-    mkstr (substring s pos e)
+    // ...and Kernel#gets sets $_ as well, which is what `while gets` and the
+    // `-n` idiom read.
+    let line9 = mkstr (substring s pos e) in
+    let _ = map_set globals "_" line9 in
+    let _ = map_set globals "." (VInt ((match (if map_has globals "." then map_get globals "." else VInt 0) with VInt n -> n | _ -> 0) + 1)) in
+    line9
 and rb_readlines = fn (u: unit) ->
   match rb_gets () with
   | VNil -> Nil
@@ -37142,7 +37313,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
         FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0)))
      else
        let _ = map_set loaded_files full VNil in
-       let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
+       let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
                 | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
                 | _ -> ()) in
        // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
@@ -37206,7 +37377,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
         // then fog-aws reports a missing Process.clock_gettime).
         | FRaise v ->
           let _ = map_delete loaded_files full in
-          let _ = (match (if map_has globals "LOADED_FEATURES" then map_get globals "LOADED_FEATURES" else VNil) with
+          let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
                    | VArr lfid -> arr_set lfid (vals_without (deref lfid) full)
                    | _ -> ()) in
           // ...then let the unwind continue: `require` is reached through a
@@ -37267,7 +37438,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              else lv_set env name VNil) in
     let v = eval_e env world blk e in
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
-            then gvar_write world (gvar_slot (substring name 1 (str_len name))) v
+            then gvar_assign_checked env world name v
             else if str_len name >= 2 && str_eq (substring name 0 2) "::" then (let cn = substring name 2 (str_len name) in let _ = map_set consts cn v in name_anon cn v)
             else if is_upper_first name then
               (let key = const_assign_key env name in
@@ -41314,10 +41485,39 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // knows to look, and rubygems cannot help: default gems have no lib dir.
   let lp0 = arr_new (strs_to_vals (lp_seed ())) in
   let _ = map_set globals ":" lp0 in
-  let _ = map_set globals "LOAD_PATH" lp0 in
   let lf0 = arr_new Nil in
   let _ = map_set globals "\"" lf0 in
-  let _ = map_set globals "LOADED_FEATURES" lf0 in
+  // The long spellings and the command-line switches are ALIASES, not copies:
+  // `$LOAD_PATH.equal?($:)` and `$-I.equal?($:)` are both true in ruby, and
+  // `$-d = true` sets $DEBUG. Two slots holding the same array made
+  // `.equal?` accidentally true while `object_id` disagreed, and `$-I` was a
+  // slot of its own that nothing kept in step.
+  let galias = fn (a: str) -> fn (b: str) -> map_set gvar_alias a (mkstr b) in
+  let _ = galias "LOAD_PATH" ":" in
+  let _ = galias "-I" ":" in
+  let _ = galias "LOADED_FEATURES" "\"" in
+  let _ = galias "FILENAME" "<" in
+  let _ = galias "PROGRAM_NAME" "0" in
+  let _ = galias "-0" "/" in
+  let _ = galias "-d" "DEBUG" in
+  let _ = galias "-v" "VERBOSE" in
+  let _ = galias "-w" "VERBOSE" in
+  // ...and the switches READ as false when they were not given, not nil.
+  let _ = map_set globals "DEBUG" (VBool false) in
+  // `$.` is the line number of the last read, and it starts at ZERO, not nil.
+  // Nothing here read it strictly, so nil went unnoticed for a long time --
+  // until the refusal below made `$. = saved_lineno` a TypeError, and
+  // rubygems SAVES AND RESTORES $. around every gemspec stub it reads. The
+  // check was right; the default it refused was this interpreter's own.
+  let _ = map_set globals "." (VInt 0) in
+  // ($VERBOSE is deliberately NOT defaulted here. ruby's own default is
+  // false, but every gate runs the reference as `ruby -W0`, which makes it
+  // nil -- and mere-ruby is invoked without that switch because it has no
+  // warnings to silence. Setting false would be right standalone and a DIFF
+  // against the harness, for one assertion; the asymmetry is the harness's.)
+  let _ = map_set globals "-a" (VBool false) in
+  let _ = map_set globals "-l" (VBool false) in
+  let _ = map_set globals "-p" (VBool false) in
   // STDOUT / STDERR / STDIN: IO objects keyed by @__io_fd; $stdout/$stderr
   // are globals holding the same objects.
   let outid = alloc_oid ocls in
@@ -41472,7 +41672,7 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // the pid -- which is the honest answer to "what is my process id" on a machine
   // that has no processes.
   let _ = try_or (fn (u: unit) -> map_set globals "$" (VInt (getpid ()))) () in
-  let _ = map_set globals "PROGRAM_NAME" (mkstr name) in
+  let _ = map_set globals (gvar_slot "PROGRAM_NAME") (mkstr name) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // A small core prelude, written in ruby and run before the program: classes
   // that are core (no `require` names them) but are ordinary objects, so
