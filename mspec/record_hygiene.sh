@@ -55,9 +55,29 @@ for pat in '/Users/' '/home/' 'HOME/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SO
   hits=$(grep -al -- "$pat" $files 2>/dev/null)
   [ -n "$hits" ] && { echo "LEAK  $pat"; echo "$hits" | sed "s|$root/|        |"; rc=1; }
 done
+# ...and a STRUCTURAL check, because the list above is a list of leaks someone
+# thought of. `CLAUDE_CODE_MESSAGING_TOKEN` was not on it, and four lines of
+# mspec/DIFF_LINES.txt carried it WITH ITS VALUE into a public commit
+# (2026-09-05). CLAUDE_CODE_SESSION_ID was on the list; the token beside it was
+# not, and naming variables one at a time cannot keep up with an environment.
+#
+# The signature of an environment dump is ruby's hash inspect with a SHOUTING
+# key: `"SOME_NAME" => "value"`. That shape is never a legitimate cause here,
+# whatever the name inside it happens to be.
+# Four characters minimum: the KIND column masks a string to "S", and `"S" => "S"`
+# is a masked row, not a dump.
+# The spacing is optional: ruby 3.2 inspects `"K"=>"V"` and 3.4 `"K" => "V"`,
+# and the records span that upgrade. Knowing only one spelling is how three
+# commits kept the token after the first pass of the scrub.
+envdump=$(grep -aln -E -- '"[^"]{4,}" *=> *"' $files 2>/dev/null)
+[ -n "$envdump" ] && { echo "LEAK  an environment/hash dump (\"NAME\" => \"value\"):"; echo "$envdump" | sed "s|$root/|        |"; rc=1; }
 # A cause field long enough to hold an object dump is the mechanism, so bound it
 # directly too: the longest line in a record should be a sentence, not a heap.
-long=$(awk 'length($0) > 400 { print FILENAME": "length($0)" chars" }' $files 2>/dev/null | head -5)
-[ -n "$long" ] && { echo "LONG  a recorded line is over 400 chars (an object dump, not a cause):"; echo "$long" | sed "s|$root/|        |"; rc=1; }
+# The bound has to sit AT the generator's clip, not above it. classify.sh clips
+# a cause at 300 characters, so a 400-char threshold could never fire on a
+# clipped line -- and clipping is what let the token through while making the
+# line small enough to look innocent. The clip made the leak quieter, not safer.
+long=$(awk 'length($0) > 340 { print FILENAME": "length($0)" chars" }' $files 2>/dev/null | head -5)
+[ -n "$long" ] && { echo "LONG  a recorded line is over 340 chars (an object dump, not a cause):"; echo "$long" | sed "s|$root/|        |"; rc=1; }
 [ "$rc" = 0 ] && echo "records clean ($(echo $files | wc -w | tr -d ' ') files)"
 exit $rc

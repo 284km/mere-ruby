@@ -128,10 +128,31 @@ strip_noise() {  # stdin -> stdout, a line usable as a bucket key
   # into a PUBLIC repo, and the operator's home path is neither a property of the
   # interpreter nor something to publish. This is the same masking rule the other
   # two already are, applied to the third thing that identifies the machine.
+  #
+  # An ENVIRONMENT DUMP is masked by SHAPE, not by variable name. core/env's
+  # specs print ENV, so a failure message carries `"NAME" => "value"` pairs --
+  # which is how a session token reached a public commit WITH ITS VALUE on
+  # 2026-09-05. record_hygiene.sh had a LIST of variable names and the token was
+  # not on it (the session id beside it was); naming variables one at a time
+  # cannot keep up with an environment.
+  #
+  # So the KEY AND THE VALUE of any pair with a 4-character-or-longer string key
+  # both go, whatever they are called -- a variable NAME identifies the machine
+  # too. Short keys survive, so an ordinary `{"a" => 1}` in a cause stays
+  # readable. The second rule catches the pair the cause clip cut in half, and
+  # the third the KEY it cut in half.
+  #
+  # The spacing is OPTIONAL because the record spans the reference-ruby
+  # upgrade: 3.2 inspects a hash as `"K"=>"V"` and 3.4 as `"K" => "V"`. The
+  # first version of this mask knew only the 3.4 spelling and left three older
+  # commits holding the token -- the same question asked in one spelling.
   sed -e 's|^[^ ]*\.rb:[0-9]*: |*.rb:N: |' \
       -e 's|/[^ ]*/mrb_[A-Za-z0-9]*|TMPDIR|g' \
       -e 's|/var/folders/[^ ]*|TMPDIR|g' \
       -e "s|${HOME}[^ \"]*|HOME|g" \
+      -e 's|"[^"]\{4,\}" *=> *"[^"]*"|"K" => "V"|g' \
+      -e 's|"[^"]\{4,\}" *=> *"[^"]*$|"K" => "V"|' \
+      -e 's|"[A-Za-z][A-Za-z0-9_]\{3,\} \.\.\.|"K" ...|' \
       -e 's|0x[0-9a-f]*|0xADDR|g'
 }
 

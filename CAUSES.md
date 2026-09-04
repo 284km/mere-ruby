@@ -105,7 +105,7 @@ Classified: 317 files.
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
-| 1 | `FAILED expected #<OBJ> "S", "S" => "S", "NODENV_SHELL ...[clipped]` |
+| 1 | `FAILED expected #<OBJ> "S", "S" => "S", "K" ...[clipped]` |
 | 1 | `FAILED expected "S"abc def ghi\"S"abc\"S"def\"S", got "S"abc def ghi\"S"abc\"S"def\"S"ghi\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |

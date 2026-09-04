@@ -61,6 +61,9 @@ normalise() {
   grep -a '^FAILED:\|^ERROR:' \
     | sed -e "s|${HOME}[^ \"]*|HOME|g" \
           -e 's|/var/folders/[^ ]*|TMPDIR|g' \
+          -e 's|"[^"]\{4,\}" *=> *"[^"]*"|"K" => "V"|g' \
+          -e 's|"[^"]\{4,\}" *=> *"[^"]*$|"K" => "V"|' \
+          -e 's|"[A-Za-z][A-Za-z0-9_]\{3,\} \.\.\.|"K" ...|' \
           -e 's|0x[0-9a-f]*|0xADDR|g' \
     | awk -v n=300 '{ if (length($0) > n) print substr($0,1,n) " ...[clipped]"; else print $0 }'
 }
