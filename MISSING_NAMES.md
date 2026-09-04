@@ -27,13 +27,12 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 298 of 1389 names
+ABSENT: 278 of 1389 names
   IO (47): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? external_encoding fcntl fdatasync for_fd foreach fsync internal_encoding ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
   File (39): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime empty? executable_real? flock ftype grpowned? identical? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readable_real? readlink rename setgid? setuid? socket? stat sticky? symlink truncate umask utime world_readable? world_writable? writable_real? zero?
   Kernel (32): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? caller caller_locations define_singleton_method format gem gem_original_require global_variables iterator? lambda load local_variables open printf proc rand respond_to_missing? set_trace_func singleton_method sprintf test then trace_var untrace_var yield_self
   Time (29): asctime ceil ctime deconstruct_keys dst? floor friday? getgm gmt? gmt_offset gmtime gmtoff isdst monday? nsec saturday? strftime subsec sunday? thursday? to_a to_r tuesday? tv_nsec tv_sec tv_usec utc_offset wednesday? zone
   Process (24): _fork argv0 clock_getres egid euid getpgid getpgrp getpriority getrlimit getsid gid groups initgroups last_status maxgroups setpgid setpgrp setpriority setproctitle setrlimit setsid uid waitall waitpid2
-  Math (20): acos acosh asin asinh atan atanh cbrt cosh erf erfc exp frexp gamma ldexp lgamma log log10 log2 sinh tanh
   Dir (17): chdir chroot close delete each_child empty? fileno foreach inspect path pos rewind rmdir seek tell to_path unlink
   GC (14): auto_compact compact count garbage_collect latest_compact_info latest_gc_info measure_total_time stat stat_heap total_time using_rvargc? verify_compaction_references verify_internal_consistency verify_transient_heap_internal_consistency
   Module (13): class_exec const_source_location define_method included_modules module_exec nesting protected_instance_methods public_class_method public_instance_method refinements undefined_instance_methods used_modules used_refinements
@@ -65,6 +64,10 @@ SEND-ONLY: 21 of 1389 names
   Thread (1): ignore_deadlock=
 
 ```
+
+2026-09-04: 298 -> 278 ABSENT. Math is libm's now, through `extern fn` -- the
+identities that derive it from the builtins are exact in real arithmetic and
+wrong in the last bit, which this repository's standard counts as wrong.
 
 2026-09-03: 339 ABSENT. Operators called in method form (`"s".==("t")`,
 `[1].+([2])`, `5.~`) were every one a NoMethodError -- they live in eval_e's
