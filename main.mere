@@ -5095,9 +5095,39 @@ and parse_x_target1 = fn toks ->
     else if is_cap nm then parse_x_chain (EConst nm) r
     else parse_x_chain (EVar nm) r
   // a parenthesized group destructures one value: ((a, b), c) = ...
+  // `is_lparen`, not `str_eq lp "("`: a paren after a comma carries the space
+  // in its token (`y, (a, b) = ...`), and only the statement-initial one is
+  // spelled bare.
   | Cons (TP lp, r) ->
-    if str_eq lp "(" then let (ts, r2) = parse_x_group r Nil in (EArr ts, r2)
+    if is_lparen lp then
+      // ...but the SAME token opens a parenthesized RECEIVER:
+      //   (list << :a; obj).attr, (list << :b; obj).attr = c, d
+      // is how ruby/spec pins the evaluation order of a multiple assignment.
+      // Which one it is shows up AFTER the matching close paren -- a group is
+      // followed by `,` or `=`, a receiver by a call -- and reading every `(`
+      // as a group made the whole file a parse error, so language/
+      // assignments_spec never ran a single example.
+      (match after_x_lparen r 1 with
+       | Cons (TP nxt, _) ->
+         if str_eq nxt "." || str_eq nxt "&." || str_eq nxt "::"
+            || str_eq nxt "[" || str_eq nxt " [" then
+           (let (e0, r1) = parse_primary toks in parse_x_chain e0 r1)
+         else (let (ts, r2) = parse_x_group r Nil in (EArr ts, r2))
+       | _ -> (let (ts, r2) = parse_x_group r Nil in (EArr ts, r2)))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: bad assignment target")) in fail "mere-ruby: bad assignment target")
+
+// the tokens AFTER the paren group whose open has already been consumed --
+// a balanced scan, so a nested call or literal inside does not end it early.
+and after_x_lparen = fn toks -> fn (depth: int) ->
+  match toks with
+  | Nil -> Nil
+  | Cons (TP p, r) ->
+    if is_lparen p || str_eq p "[" || str_eq p " [" || str_eq p "\{" || str_eq p "(s" || str_eq p " (s" then
+      after_x_lparen r (depth + 1)
+    else if str_eq p ")" || str_eq p "]" || str_eq p "}" then
+      (if depth <= 1 then r else after_x_lparen r (depth - 1))
+    else after_x_lparen r depth
+  | Cons (_, r) -> after_x_lparen r depth
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: bad assignment target")) in fail "mere-ruby: bad assignment target")
 
 and parse_x_group = fn toks -> fn (acc: Expr list) ->
@@ -5115,12 +5145,17 @@ and parse_x_group = fn toks -> fn (acc: Expr list) ->
   match r with
   | Cons (TP p, r2) ->
     if str_eq p "," then
-      (match r2 with
+      // a grouped target list may WRAP after its comma, the same way the outer
+      // list may: ruby/spec writes one nested group across five lines. Leaving
+      // the newline in place made the next target a TNL, which is not an
+      // assignment target -- "bad assignment target" for a perfectly ordinary
+      // continuation line.
+      (match skip_nls r2 with
        // `(e,)` — a trailing comma inside the group
        | Cons (TP rp, r3) ->
          if str_eq rp ")" then (rev_app (Cons (t, acc)) Nil, r3)
-         else parse_x_group r2 (Cons (t, acc))
-       | _ -> parse_x_group r2 (Cons (t, acc)))
+         else parse_x_group (skip_nls r2) (Cons (t, acc))
+       | _ -> parse_x_group (skip_nls r2) (Cons (t, acc)))
     else if str_eq p ")" then (rev_app (Cons (t, acc)) Nil, r2)
     else (let __fm = ("mere-ruby: expected , or ) in grouped target, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated grouped target" ++ parsing_file ()))) in fail ("mere-ruby: unterminated grouped target" ++ parsing_file ()))
@@ -5207,7 +5242,16 @@ and looks_like_multix = fn toks ->
   // `self.a, self.b = ...` — self is a keyword, but here it is the receiver of
   // an attribute writer, which is a perfectly ordinary assignment target.
   | Cons (TId nm, r0) ->
-    if str_eq nm "self" then (match r0 with Cons (TP d, _) -> str_eq d "." && scan_mx toks 0 false false | _ -> false)
+    // ...and `self[k1], self[k2] = ...` / `self::A, self::B = ...`, which are
+    // the same thing through []= and a constant write. Only `.` was allowed,
+    // so a `def assign` that writes two subscripts of self -- which is how
+    // ruby/spec checks that form at all -- was not read as an assignment.
+    if str_eq nm "self" then
+      (match r0 with
+       | Cons (TP d, _) ->
+         (str_eq d "." || str_eq d "[" || str_eq d " [" || str_eq d "::")
+         && scan_mx toks 0 false false
+       | _ -> false)
     else if is_keyword nm then false else scan_mx toks 0 false false
   // a leading group: a comma or splat at depth 1 marks targets too ((*a) = ...)
   | Cons (TP lp, r) ->
@@ -5220,7 +5264,11 @@ and looks_like_multix = fn toks ->
 and scan_mx = fn toks -> fn (depth: int) -> fn (seen: bool) -> fn (grp: bool) ->
   match toks with
   | Nil -> false
-  | Cons (TNL _, _) -> false
+  // A newline (or a `;`, which lexes as one) INSIDE parens does not end the
+  // statement -- `(list << :a; obj).attr, ... = ...` is one assignment, and
+  // stopping here said it was not a multiple assignment at all. The whole of
+  // language/assignments_spec then failed to parse on that one line.
+  | Cons (TNL _, r) -> if depth > 0 then scan_mx r depth seen grp else false
   | Cons (TEOF, _) -> false
   | Cons (TId w, r) ->
     if str_eq w "do" || str_eq w "then" || str_eq w "if" || str_eq w "unless" ||
@@ -6048,9 +6096,20 @@ and parse_for = fn toks ->
   let (e, body, r4) = parse_for_iter e0 r3 in
   (match vars with
    | Cons (v, Nil) ->
+     // A single SPLAT target collects rather than binds: `for *r in [[1,2]]`
+     // is the assignment `*r = [1,2]`, so r is [1,2]. for_assign would have
+     // made a local literally NAMED "*r" and left r undefined -- and a real
+     // `|*r|` block param would have wrapped the element one layer too deep.
+     (if str_len v > 1 && str_eq (char_at v 0) "*" then
+        (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil),
+                          Cons (SMultiAssign (Cons (v, Nil), Cons (EVar "__for", Nil)), body))), r4)
+      else if str_eq v "*" then
+        // `for * in xs` binds nothing at all; the loop still runs.
+        (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), body)), r4)
+      else
      // the hidden __for param keeps v assigned in the SHARED scope, so
      // v survives the loop (block params themselves are block-local).
-     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (for_assign v (EVar "__for"), body))), r4)
+     (SExpr (EMethodB (e, "each", Nil, Cons ("__for", Nil), Cons (for_assign v (EVar "__for"), body))), r4))
    | _ ->
      // multiple targets: real (auto-splatting) block params __f0.., then a
      // prologue assigns them into the SHARED scope names.
@@ -6154,6 +6213,16 @@ and parse_for_vars = fn toks -> fn (acc: str list) ->
          if str_eq kw "in" then (rev_app (rev_app vs acc) Nil, r2)
          else parse_for_vars r1 (rev_app vs acc)
        | _ -> parse_for_vars r1 (rev_app vs acc))
+    // `*` / `*rest` as a for target. This arm and the `Cons (TP star, r)` one
+    // further down BOTH match TP, and the first match wins -- so that one was
+    // dead code and every `for *r in` / `for a, *r in` failed here with
+    // "expected a variable after for".
+    else if str_eq lp "*" then
+      (match r0 with
+       | Cons (TId n, r2) ->
+         if str_eq n "in" then (rev_app (Cons ("*", acc)) Nil, r2)
+         else parse_for_vars2 ("*" ++ n) r2 acc
+       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected in after for" ++ parsing_file ()))) in fail ("mere-ruby: expected in after for" ++ parsing_file ())))
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a variable after for" ++ parsing_file ()))) in fail ("mere-ruby: expected a variable after for" ++ parsing_file ()))
   | Cons (TId v, r) ->
     if str_eq v "in" then (rev_app acc Nil, r)
@@ -7041,10 +7110,12 @@ let rec pow_int = fn (b: int) -> fn (e: int) ->
   else if e == 0 then 1
   else b * pow_int b (e - 1);
 
-let rec pow_flt = fn (b: float) -> fn (e: int) ->
-  if e < 0 then 1.0 / pow_flt b (0 - e)
-  else if e == 0 then 1.0
-  else b * pow_flt b (e - 1);
+// (no pow_flt here any more: `b * pow_flt b (e - 1)` is a LINEAR recursion, so
+// `9.5 ** 0xffffffff` asked for 4294967295 nested frames and overflowed the
+// stack on an expression whose answer is Infinity. Every caller now goes
+// through pow_val, which is libm's pow -- and which also rounds the way ruby
+// does: the walk gave 2.3 ** 3 as 12.166999999999996 against ruby's
+// 12.166999999999998.)
 
 // ---- bignum: schoolbook arithmetic on canonical decimal strings ----------
 // magnitude = bare digit string, no leading zeros ("0" for zero).
@@ -7566,6 +7637,23 @@ let rq_answer = fn (bounds: ((str * str) * (str * str))) ->
 let two_pow_s = fn (n: int) -> big_pow "2" n "1";
 let shl_big = fn (va: Val) -> fn (n: int) -> norm_big (big_mul_s (num_dec va) (two_pow_s n));
 let shr_big = fn (va: Val) -> fn (n: int) -> norm_big (big_div_s (num_dec va) (two_pow_s n));
+// A shift WIDER THAN THE NUMBER needs no power of two at all: everything is
+// shifted out. ruby's >> floors, so a negative value lands on -1 rather than 0.
+// Building 2^(2**40) in order to divide by it is not an answer -- and it is
+// exactly what core/integer/{left,right}_shift_spec were killed at the memory
+// cap for: every one of those examples shifts by 2**40 and expects 0 or -1.
+// The bound is the DIGIT COUNT: a d-digit magnitude is under 10^d, so it has
+// fewer than 4d + 8 bits, and no exact bit_length is needed to decide this.
+let shift_swallows_all = fn (mag: str) -> fn (n: int) -> n >= 4 * str_len mag + 8;
+let shr_val = fn (va: Val) -> fn (n: int) ->
+  let d = num_dec va in
+  let mag = big_mag d in
+  if str_eq mag "0" then VInt 0
+  else if shift_swallows_all mag n then (if big_sign d < 0 then VInt (0 - 1) else VInt 0)
+  else shr_big va n;
+// ...and shifting ZERO left by any width is zero, whatever the width costs.
+let shl_val = fn (va: Val) -> fn (n: int) ->
+  if str_eq (big_mag (num_dec va)) "0" then VInt 0 else shl_big va n;
 
 // The native fast path, guarded by a ROUND TRIP rather than by a bit count:
 // shifting back has to give the operand again. `int_bit_length` is defined
@@ -8272,8 +8360,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
     (match va with
      // a Float exponent makes the whole thing a Float, whatever the base is
      | VInt x -> (match vb with VInt y -> if y < 0 then mk_rat_s "1" (big_pow (str_of_int x) (0 - y) "1") else norm_big (big_pow (str_of_int x) y "1") | VFlt y -> pow_val (float_of_int x) y | VBig y -> pow_val (float_of_int x) (float_of_str y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
-     | VBig x -> (match vb with VInt y -> if y < 0 then VFlt (pow_flt (float_of_str x) y) else norm_big (big_pow x y "1") | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
-     | VFlt x -> (match vb with VInt y -> VFlt (pow_flt x y) | VFlt y -> pow_val x y | VBig y -> pow_val x (float_of_str y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
+     // a bignum to a NEGATIVE power is a Rational, as it is for a machine
+     // integer one line up -- it was answering a Float.
+     | VBig x -> (match vb with VInt y -> if y < 0 then mk_rat_s "1" (big_pow x (0 - y) "1") else norm_big (big_pow x y "1") | VFlt y -> pow_val (float_of_str x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
+     // a Rational exponent is its float value (and a negative base with a
+     // fractional one is the principal COMPLEX root, which pow_val knows).
+     | VFlt x -> (match vb with VInt y -> pow_val x (float_of_int y) | VFlt y -> pow_val x y | VBig y -> pow_val x (float_of_str y) | VRat (rn, rd) -> pow_val x (float_of_str rn / float_of_str rd) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
   else if str_eq op "<<" then
     // array append (mutating, returns the same array); string concat;
@@ -8284,14 +8376,14 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | VInt x ->
        (match vb with
         | VInt y ->
-          if y < 0 then shr_big va (0 - y)
+          if y < 0 then shr_val va (0 - y)
           else if shl_int_fits x y then VInt (shl_int x y)
-          else shl_big va y
+          else shl_val va y
         | VBig y -> shift_by_big va y true
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
      | VBig _ ->
        (match vb with
-        | VInt y -> if y < 0 then shr_big va (0 - y) else shl_big va y
+        | VInt y -> if y < 0 then shr_val va (0 - y) else shl_val va y
         | VBig y -> shift_by_big va y true
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
@@ -8299,12 +8391,18 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
     (match va with
      | VInt x ->
        (match vb with
-        | VInt y -> if y < 0 then shl_big va (0 - y) else VInt (shr_int x y)
+        // shr_int HALVES ONE STEP AT A TIME, so `1 >> (2**40)` was a loop of
+        // 1099511627776 iterations rather than an answer of 0. The native path
+        // stays for the widths it can actually hold -- routing every shift
+        // through the bignum divide would have made `x >> 3` pay for it.
+        | VInt y -> if y < 0 then shl_val va (0 - y)
+                    else if y < 62 then VInt (shr_int x y)
+                    else shr_val va y
         | VBig y -> shift_by_big va y false
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
      | VBig _ ->
        (match vb with
-        | VInt y -> if y < 0 then shl_big va (0 - y) else shr_big va y
+        | VInt y -> if y < 0 then shl_val va (0 - y) else shr_val va y
         | VBig y -> shift_by_big va y false
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
@@ -9199,11 +9297,28 @@ let rec int_bit_length = fn (n: int) ->
 //
 // Counting by repeated division is O(bits) bignum divisions. That is fine at
 // spec sizes and it is exact; a decimal-length estimate would be neither.
-let rec big_bit_length_go = fn (m: str) -> fn (acc: int) ->
-  if str_eq m "0" then acc else big_bit_length_go (big_div_s m "2") (acc + 1);
 // ruby's bit_length for a negative n is the length of ~n, i.e. of -n-1.
+//
+// By DIGIT COUNT, not by halving. 10^(d-1) <= m < 10^d bounds log2(m) inside
+// one decimal digit, so an estimate taken from the digit count sits within
+// about four bits of the answer -- and every candidate below it is then
+// checked against a real power of two, so the estimate decides nothing.
+// The previous form divided by 2 until it reached zero: 33220 divisions, each
+// producing a fresh 3011-digit string, for (2**10000).bit_length. It
+// allocated past 6 GB and core/integer/bit_length_spec was killed at the
+// memory cap -- while BUILDING 2**10000 costs a quarter of a gigabyte.
 let big_bit_length = fn (b: str) ->
-  big_bit_length_go (big_mag (if big_sign b < 0 then big_sub_s (big_neg_s b) "1" else b)) 0;
+  let m = big_mag (if big_sign b < 0 then big_sub_s (big_neg_s b) "1" else b) in
+  if str_eq m "0" || str_eq m "" then 0
+  else
+    // floor(d * log2 10) + 2 is strictly above the answer for every d, and
+    // 3.3219281 is log2 10 rounded UP so the bound never falls short.
+    let k_hi = (str_len m * 33219281) / 10000000 + 2 in
+    let rec down = fn (k: int) -> fn (pw: str) ->
+      if k <= 1 then 1
+      else if mag_cmp pw m <= 0 then k
+      else down (k - 1) (big_div_s pw "2") in
+    down k_hi (two_pow_s (k_hi - 1));
 
 // digits: least significant first, like Integer#digits. Negative receivers
 // raise Math::DomainError in ruby, which the caller checks for.
@@ -12924,7 +13039,53 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       else if (str_eq op ">>" || str_eq op "<<")
               && (match va0 with VProc _ -> true | _ -> false) then
         invoke_val_c env world blk va0 op (Cons (vb, Nil)) false
+      // Integer#<< and #>> take an INTEGER shift width. A Float, Rational or
+      // Complex converts to one; nil, a String, a Symbol and an object with no
+      // #to_int do not, and CRuby refuses those by TypeError. arith_bin is a
+      // leaf helper with no world to raise from, so every one of them came out
+      // as a bare StandardError and core/integer/left_shift_spec and
+      // right_shift_spec read the right refusal under the wrong class.
+      else if (str_eq op "<<" || str_eq op ">>")
+              && (match va0 with VInt _ -> true | VBig _ -> true | _ -> false)
+              && (match vb with VInt _ -> false | VBig _ -> false | _ -> true) then
+        arith_bin op va0 (shift_width_v env world vb)
       else arith_bin op va0 vb
+
+// The shift width for Integer#<< / #>>, refused the way CRuby refuses it.
+// Not Kernel#Integer coercion: this one does NOT fall back to #to_i, and its
+// message names the failure as a missing implicit conversion. A user object
+// whose #to_int answers something other than an Integer gets the longer form,
+// which names what it gave instead.
+and shift_width_v = fn env -> fn world -> fn (v: Val) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let no_conv = fn (u: unit) ->
+    (let nm = (match v with
+               | VNil -> "nil"
+               | _ -> display_cls_msg world (dispatch_cls_of world v)) in
+     let _ = prim_raise "TypeError" ("no implicit conversion of " ++ nm ++ " into Integer") in VNil) in
+  match v with
+  | VInt _ -> v
+  | VBig _ -> v
+  | VFlt f ->
+    (if str_len (float_special f) > 0
+     then (let _ = prim_raise "FloatDomainError" (float_special f) in VNil)
+     else VInt (int_of_float f))
+  | VNil -> no_conv ()
+  | VStr _ -> no_conv ()
+  | VSym _ -> no_conv ()
+  | VBool _ -> no_conv ()
+  | _ ->
+    if responds world v "to_int" then
+      (let ti = invoke_val_c env world nb9 v "to_int" Nil false in
+       match ti with
+       | VInt _ -> ti
+       | VBig _ -> ti
+       | _ ->
+         let cn = display_cls_msg world (dispatch_cls_of world v) in
+         let _ = prim_raise "TypeError"
+           ("can't convert " ++ cn ++ " to Integer (" ++ cn ++ "#to_int gives "
+            ++ display_cls_msg world (dispatch_cls_of world ti) ++ ")") in VNil)
+    else no_conv ()
 
 // CRuby coerce_failed display: an immediate (nil/true/false/Integer/Float/
 // Symbol) shows its inspect; a heap object shows its class name.
@@ -13283,6 +13444,14 @@ and prep_x_target = fn env -> fn world -> fn blk -> fn (t: Expr) ->
     let rnm = fresh_anon "__mlr" in
     let _ = lv_set env rnm rv in
     EMethod (EVar rnm, m, prep_x_args env world blk args)
+  // `(expr; m)::A, (expr; m)::B = ...` -- a constant WRITE has a receiver too,
+  // and it was the one target kind left out of the pre-evaluation, so its
+  // receiver ran after the RHS and the recorded order came out reversed.
+  | EScopedRead (recv, cn) ->
+    let rv = eval_e env world blk recv in
+    let rnm = fresh_anon "__mlr" in
+    let _ = lv_set env rnm rv in
+    EScopedRead (EVar rnm, cn)
   | ESplat inner -> ESplat (prep_x_target env world blk inner)
   | EArr ts -> EArr (prep_x_targets env world blk ts)
   | _ -> t
@@ -14252,6 +14421,151 @@ and arr_bsearch_check = fn world -> fn encl -> fn theblk -> fn (vec: Val list) -
         (let _ = raise_exc world "TypeError"
                    ("wrong argument type " ++ class_name other
                     ++ " (must be numeric, true, false or nil)") in (0 - 1, false, VNil))))
+// ---- Range#bsearch over the BOUNDS, never over a materialized range ------
+// The array path built the whole range first, so `(0...Float::INFINITY)
+// .bsearch` recursed until the stack went, an endless range refused with
+// "cannot convert endless range to an array", and a Float range refused with
+// "can't iterate from Float". None of those is a search: they are all the
+// answer to a question about building a list.
+//
+// how a bound can be searched: 0 = integer, 1 = double, 2 = not at all
+and rng_bs_kind = fn (v: Val) ->
+  match v with VInt _ -> 0 | VBig _ -> 0 | VNil -> 0 | VFlt _ -> 1 | _ -> 2
+// the block's verdict, normalised. 0 = search left AND this one satisfies,
+// 1 = search right, 2 = an exact hit, 3 = the block broke, 4 = the block
+// answered something that is not numeric, true, false or nil, 5 = search left
+// but this one is NOT an answer.
+//
+// 0 and 5 are the two modes, and collapsing them was wrong. `true` from the
+// block means "this element satisfies, look for a smaller one" -- find-minimum
+// keeps it as the running answer. A NEGATIVE NUMBER means only "the target is
+// to the left"; find-any answers nothing but an exact zero, which is why ruby
+// gives nil for `(0..3).bsearch { |x| x <=> 3 }` even though 3 is in the range.
+and rng_bs_ask = fn world -> fn encl -> fn theblk -> fn (v: Val) ->
+  match run_block world encl theblk (Cons (v, Nil)) with
+  | FBreak bv -> (3, bv)
+  | fl ->
+    (match flow_value fl with
+     | VBool true -> (0, VNil)
+     | VBool false -> (1, VNil)
+     | VNil -> (1, VNil)
+     | VInt 0 -> (2, VNil)
+     | VInt k -> (if k < 0 then (5, VNil) else (1, VNil))
+     | VFlt f -> (if f == 0.0 then (2, VNil) else if f < 0.0 then (5, VNil) else (1, VNil))
+     | VBig b -> (if big_sign b < 0 then (5, VNil) else (1, VNil))
+     | other -> (4, other))
+and rng_bs_type_err = fn world -> fn (other: Val) ->
+  let _ = raise_exc world "TypeError"
+    ("wrong argument type " ++ display_cls_msg world (dispatch_cls_of world other)
+     ++ " (must be numeric, true, false or nil)") in (VNil, false, VNil)
+// inclusive [lo, hi] on integers; best/found carry the smallest satisfying one
+and rng_bs_int = fn world -> fn encl -> fn theblk -> fn (lo: int) -> fn (hi: int) -> fn (best: int) -> fn (found: bool) ->
+  if lo > hi then (if found then (VInt best, false, VNil) else (VNil, false, VNil))
+  else
+    let mid = lo + (hi - lo) / 2 in
+    let (verd, extra) = rng_bs_ask world encl theblk (VInt mid) in
+    if verd == 3 then (VNil, true, extra)
+    else if verd == 4 then rng_bs_type_err world extra
+    else if verd == 2 then (VInt mid, false, VNil)
+    else if verd == 0 then rng_bs_int world encl theblk lo (mid - 1) mid true
+    else if verd == 5 then rng_bs_int world encl theblk lo (mid - 1) best found
+    else rng_bs_int world encl theblk (mid + 1) hi best found
+// an endless integer end has no bound to halve, so one is PROBED outward --
+// beg+1, beg+2, beg+4 ... -- until the block stops sending the search right.
+and rng_bs_int_probe = fn world -> fn encl -> fn theblk -> fn (beg: int) -> fn (w: int) -> fn (n: int) ->
+  if n <= 0 || w <= 0 then beg + 1073741824
+  else
+    let (verd, _) = rng_bs_ask world encl theblk (VInt (beg + w)) in
+    if verd == 1 then rng_bs_int_probe world encl theblk beg (w * 2) (n - 1) else beg + w
+// the same search on doubles. Halving an interval never lands on either of its
+// own endpoints, and ruby's float search bisects the double ENCODINGS of an
+// inclusive range -- so both ends are asked explicitly at convergence.
+// `hi_ok` says whether the top of the bracket is a legal answer: the end of an
+// exclusive range is not, but a bracket end that the probe FOUND is an
+// interior point and always is. The end probe accepts only a boolean true --
+// find-any mode does not answer at an endpoint ruby never tested, which is why
+// `(0.0..1.0).bsearch { |x| x <=> 1.0 }` is nil while `{ |x| x >= 1.0 }` is 1.0.
+and rng_bs_flt = fn world -> fn encl -> fn theblk -> fn (lo: float) -> fn (hi: float) -> fn (best: float) -> fn (found: bool) -> fn (hi_ok: bool) -> fn (n: int) ->
+  // halved BEFORE adding: lo + (hi - lo) / 2 overflows to Infinity when the
+  // bracket spans most of the double range, and the search then never moves.
+  let mid = lo / 2.0 + hi / 2.0 in
+  if n <= 0 || mid == lo || mid == hi then
+    (let (v2, e2) = rng_bs_ask world encl theblk (VFlt lo) in
+     if v2 == 3 then (VNil, true, e2)
+     else if v2 == 4 then rng_bs_type_err world e2
+     else if v2 == 2 || v2 == 0 then (VFlt lo, false, VNil)
+     else if found then (VFlt best, false, VNil)
+     else if hi_ok then
+       (let (v3, e3) = rng_bs_ask world encl theblk (VFlt hi) in
+        if v3 == 3 then (VNil, true, e3)
+        else if v3 == 4 then rng_bs_type_err world e3
+        else if v3 == 0 then (VFlt hi, false, VNil)
+        else (VNil, false, VNil))
+     else (VNil, false, VNil))
+  else
+    let (verd, extra) = rng_bs_ask world encl theblk (VFlt mid) in
+    if verd == 3 then (VNil, true, extra)
+    else if verd == 4 then rng_bs_type_err world extra
+    else if verd == 2 then (VFlt mid, false, VNil)
+    else if verd == 0 then rng_bs_flt world encl theblk lo mid mid true hi_ok (n - 1)
+    else if verd == 5 then rng_bs_flt world encl theblk lo mid best found hi_ok (n - 1)
+    else rng_bs_flt world encl theblk mid hi best found hi_ok (n - 1)
+and rng_bs_flt_probe = fn world -> fn encl -> fn theblk -> fn (beg: float) -> fn (w: float) -> fn (n: int) ->
+  if n <= 0 then beg + w
+  else
+    let (verd, _) = rng_bs_ask world encl theblk (VFlt (beg + w)) in
+    if verd == 1 then rng_bs_flt_probe world encl theblk beg (w * 2.0) (n - 1) else beg + w
+// ...and outward the other way, for a start of -Infinity (or a beginless
+// range). A bracket end of -Infinity is not a number the midpoint can use:
+// (-inf + (inf - -inf) / 2) is NaN, and a NaN answer is worse than nil.
+and rng_bs_flt_probe_down = fn world -> fn encl -> fn theblk -> fn (top: float) -> fn (w: float) -> fn (n: int) ->
+  if n <= 0 then top - w
+  else
+    let (verd, _) = rng_bs_ask world encl theblk (VFlt (top - w)) in
+    if verd == 1 then top - w else rng_bs_flt_probe_down world encl theblk top (w * 2.0) (n - 1)
+and rng_bsearch = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) ->
+  let kl = rng_bs_kind lo in
+  let kh = rng_bs_kind hi in
+  let inf = 1.0 / 0.0 in
+  let hi_endless = (match hi with VNil -> true | VFlt f -> f == inf | _ -> false) in
+  if kl == 2 || kh == 2 then
+    (let bad = (if kl == 2 then lo else hi) in
+     let _ = raise_exc world "TypeError"
+       ("can't do binary search for " ++ display_cls_msg world (dispatch_cls_of world bad)) in
+     (VNil, false, VNil))
+  // a Float at either end makes the whole search a double search, which is
+  // what makes ruby answer 2.0 rather than 2 for (0...Float::INFINITY).
+  else if kl == 1 || kh == 1 then
+    (let lof0 = (match lo with VNil -> 0.0 - inf | v -> to_f v) in
+     let hif0 = (match hi with VNil -> inf | v -> to_f v) in
+     let lo_endless = lof0 == (0.0 - inf) in
+     // An EMPTY range has nothing to search, and its bounds are not a bracket:
+     // (inf..-inf) halves to NaN, the block is then asked about NaN, and a NaN
+     // came back as the answer -- worse than nil, which is what ruby says.
+     if (lof0 == lof0) == false || (hif0 == hif0) == false then (VNil, false, VNil)
+     else if lof0 > hif0 then (VNil, false, VNil)
+     else if lof0 == hif0 then
+       // one element (or none, if the end is excluded): ask it directly rather
+       // than probing outward from a point that is its own bracket.
+       (if excl then (VNil, false, VNil)
+        else
+          (let (v1, e1) = rng_bs_ask world encl theblk (VFlt lof0) in
+           if v1 == 3 then (VNil, true, e1)
+           else if v1 == 4 then rng_bs_type_err world e1
+           else if v1 == 0 || v1 == 2 then (VFlt lof0, false, VNil)
+           else (VNil, false, VNil)))
+     else
+       (let hif = (if hi_endless
+                   then rng_bs_flt_probe world encl theblk (if lo_endless then 0.0 else lof0) 1.0 64
+                   else hif0) in
+        let lof = (if lo_endless then rng_bs_flt_probe_down world encl theblk hif 1.0 64 else lof0) in
+        rng_bs_flt world encl theblk lof hif 0.0 false (hi_endless || (if excl then false else true)) 400))
+  else
+    (let loi = (match lo with VNil -> 0 - int_max | VInt n -> n | VBig b -> int_of_str b | _ -> 0) in
+     let hii = (if hi_endless then rng_bs_int_probe world encl theblk loi 1 62
+                else (match hi with VInt n -> (if excl then n - 1 else n) | VBig b -> int_of_str b | _ -> int_max)) in
+     rng_bs_int world encl theblk loi hii 0 false)
+
 and arr_detect = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> VNil
@@ -14810,7 +15124,10 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     // An ENDLESS integer range iterates: ruby's `(1..).each` runs until the
     // block breaks, and so does this -- the bound is the largest integer, and
     // nothing materialises. `first(n)` / `take(n)` stop after n.
-    (if rng_is_int lo && rng_hi_open hi then
+    (if str_eq name "bsearch" then
+       (let (v9, broke9, bv9) = rng_bsearch world encl theblk lo hi excl in
+        if broke9 then bv9 else v9)
+     else if rng_is_int lo && rng_hi_open hi then
        (let a = rng_int lo in
         if str_eq name "each" then iter_each_result (range_each world encl theblk a int_max) recv
         else if str_eq name "step" then
@@ -14840,6 +15157,16 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   | VFlt fb ->
     if str_eq name "step" then
       (match args with
+       // step(to: t, by: b) { }: the KEYWORD form, which this arm did not
+       // have -- the hash went to to_f and came back as "not a number", so
+       // 1.0.step(to: 10.0, by: 2.0) failed while the positional spelling of
+       // the same walk worked.
+       | Cons (VHsh hid9, Nil) ->
+         (let by9 = aseq_kw (hderef hid9) "by" in
+          let to9 = aseq_kw (hderef hid9) "to" in
+          iter_each_result (flt_step world encl theblk fb
+                              (match to9 with VNil -> 1.0 / 0.0 | v -> to_f v)
+                              (match by9 with VNil -> 1.0 | v -> to_f v)) recv)
        | Cons (lim9, rest9) ->
          (let lf9 = to_f lim9 in
           let sf9 = (match rest9 with Cons (sv9, _) -> to_f sv9 | _ -> 1.0) in
@@ -14915,7 +15242,9 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
            | (VInt b9, VNil) -> iter_each_result (range_step world encl theblk n int_max b9) recv
            | (VNil, VNil) -> iter_each_result (range_step world encl theblk n int_max 1) recv
            | (b9, t9) -> iter_each_result (flt_step world encl theblk (float_of_int n) (match t9 with VNil -> 1.0 / 0.0 | v -> to_f v) (match b9 with VNil -> 1.0 | v -> to_f v)) recv))
-       | Cons (VInt limit, _) -> iter_each_result (range_step world encl theblk n limit 1) recv
+       // (no `Cons (VInt limit, _)` arm here: it matched `1.step(10, 2.5)` and
+       // walked with a step of 1, silently dropping the Float. An integer
+       // limit with a non-integer step belongs to the Float walk below.)
        // a Float anywhere makes the whole walk a Float walk, as in ruby.
        | Cons (lim9, rest9) ->
          (let lf9 = to_f lim9 in
@@ -16432,10 +16761,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   if str_eq name0 "step"
      && (match recv0 with
          | VInt _ -> true
+         // a Float receiver too: 1.0.step(to: 10.0, by: 2.0) with no block is
+         // an ArithmeticSequence like the Integer form, and its size is
+         // COUNTED (aseq_size_flt) rather than walked.
+         | VFlt _ -> true
          | VRange (lo, hi, _) -> rng_is_int lo && (rng_is_int hi || rng_hi_open hi)
          | _ -> false)
      && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
   then aseq_of world recv0 args0
+  // Range#bsearch with no block is an Enumerator -- but a range whose bounds
+  // cannot be bisected is a TypeError FIRST, exactly as it is with a block.
+  // The blockless path never reached the search, so it handed back an
+  // Enumerator over ("a".."e") and the refusal only appeared much later.
+  else if str_eq name0 "bsearch" && (match args0 with Nil -> true | _ -> false)
+          && (match recv0 with
+              | VRange (lo9, hi9, _) -> rng_bs_kind lo9 == 2 || rng_bs_kind hi9 == 2
+              | _ -> false) then
+    (match recv0 with
+     | VRange (lo9, hi9, _) ->
+       (let bad9 = (if rng_bs_kind lo9 == 2 then lo9 else hi9) in
+        raise_exc world "TypeError"
+          ("can't do binary search for " ++ display_cls_msg world (dispatch_cls_of world bad9)))
+     | _ -> VNil)
   // `send(:__method__)` / `send(:__callee__)`: the same answer the bare call
   // gives (the frame is the caller's, which is `env` here); an explicit
   // receiver used to make both a NoMethodError.
@@ -16464,7 +16811,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // Enumerator#+, the synthetic classes' ==), and those would come straight
   // back here.
   else if is_op_method_name name0
-          && (match recv0 with VObj _ -> false | _ -> true)
+          // AN ALLOWLIST, not an exclusion. The first version excluded VObj
+          // because the EBin arm hands those back to this dispatcher, then had
+          // to exclude a class's ordering operators for the same reason, and
+          // still missed VProc: `f >> g` is composition, EBin asks the
+          // dispatcher for it, and the loop cost core/proc/compose_spec its
+          // MATCH. The receivers below are the ones whose operators EBin
+          // answers as plain value arithmetic, which is the whole set that was
+          // missing a method form; anything with behaviour behind its
+          // operators keeps its own path.
+          && (match recv0 with
+              | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat _ -> true
+              | VCpx _ -> true | VStr _ -> true | VArr _ -> true | VHsh _ -> true
+              | VSym _ -> true | VNil -> true | VBool _ -> true
+              | VRange _ -> true | VRegex _ -> true | VClass _ -> true
+              | _ -> false)
           // ...and not the SUBCLASS ORDER on a class or module. `B < A` is
           // answered further down this same function (Module#< / <= / > / >= /
           // <=>), and the EBin arm sends a VClass ordering operator back here
@@ -16481,7 +16842,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // the unary pair, same rule. `~x` is `-1 - x` in every integer width this
   // has, so it needs no arm of its own.
   else if (str_eq name0 "~" || str_eq name0 "!")
-          && (match recv0 with VObj _ -> false | _ -> true)
+          && (match recv0 with
+              | VInt _ -> true | VBig _ -> true | VNil -> true | VBool _ -> true
+              | VStr _ -> true | VArr _ -> true | VHsh _ -> true | VSym _ -> true
+              | _ -> false)
           && (match args0 with Nil -> true | _ -> false)
           && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
     (if str_eq name0 "!" then VBool (if truthy recv0 then false else true)
@@ -20001,13 +20365,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | _ -> if n == 0 then VNil else VInt (bi + (n - 1) * si)))
           | (_, VNil, _) -> (if str_eq name "size" then VFlt (1.0 / 0.0) else raise_exc world "RangeError" "cannot get the last element of endless arithmetic sequence")
           | _ ->
-            (let av = enum_to_arr env world blk id in
-             (match av with
-              | VArr aid -> (if str_eq name "size" then VInt (val_list_len (deref aid))
-                             else (match args with
-                                   | Cons (VInt k, _) -> arr_new (vtake (val_rev (deref aid) Nil) k) 
-                                   | _ -> (match val_rev (deref aid) Nil with Cons (x, _) -> x | Nil -> VNil)))
-              | _ -> VNil))))
+            // A numeric triple with a Float in it is COUNTED, never walked.
+            // Mere has no match guards, so the test lives in the arm body.
+            (let inf9 = 1.0 / 0.0 in
+             let numeric9 = aseq_is_num b && aseq_is_num e && aseq_is_num st in
+             let ef9 = (if numeric9 then aseq_to_flt e else 0.0) in
+             let sf9 = (if numeric9 then aseq_to_flt st else 0.0) in
+             let endless9 = numeric9 && (ef9 == inf9 || ef9 == (0.0 - inf9)) in
+             if numeric9 && str_eq name "size" then aseq_size_flt (aseq_to_flt b) ef9 sf9 excl
+             else if endless9 then
+               // last of a sequence running to infinity: CRuby names the end
+               // it would have reached, signed by the direction of travel.
+               raise_exc world "FloatDomainError" (if sf9 > 0.0 then "Infinity" else "-Infinity")
+             else
+               (let av = enum_to_arr env world blk id in
+                (match av with
+                 | VArr aid -> (if str_eq name "size" then VInt (val_list_len (deref aid))
+                                else (match args with
+                                      | Cons (VInt k, _) -> arr_new (vtake (val_rev (deref aid) Nil) k)
+                                      | _ -> (match val_rev (deref aid) Nil with Cons (x, _) -> x | Nil -> VNil)))
+                 | _ -> VNil)))))
     else if is_enum_cls cls && (str_eq name "inspect" || str_eq name "to_s") then
       (if map_has ivars (str_of_int id ++ "@recv") then
          (let recv2 = map_get ivars (str_of_int id ++ "@recv") in
@@ -25188,9 +25565,27 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "gcdlcm" then
     (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
   else if str_eq name "digits" then
-    (match recv with
-     | VInt n -> (match args with Cons (VInt base, _) -> arr_new (int_digits n base) | _ -> arr_new (int_digits n 10))
-     | VBig b -> (match args with Cons (bs, _) -> arr_new (big_digits_go (big_mag b) (num_dec bs)) | _ -> arr_new (big_digits_go (big_mag b) "10"))
+    // The RADIX and the sign are checked first. Dividing by 1 never reaches
+    // zero, so `12345.digits(1)` recursed until the stack went -- and a
+    // negative radix or a negative receiver quietly produced a list of
+    // negative digits instead of refusing.
+    (let radix_guard = fn (b: Val) ->
+       (match b with
+        | VInt bi -> (if bi < 0 then (let _ = prim_raise "ArgumentError" "negative radix" in ())
+                      else if bi < 2 then (let _ = prim_raise "ArgumentError" ("invalid radix " ++ str_of_int bi) in ())
+                      else ())
+        | VBig _ -> ()
+        | VNil -> (let _ = prim_raise "TypeError" "no implicit conversion of nil into Integer" in ())
+        | _ -> ()) in
+     let neg_guard = fn (isneg: bool) ->
+       (if isneg then (let _ = prim_raise "Math::DomainError" "out of domain" in ()) else ()) in
+     match recv with
+     | VInt n ->
+       (let _ = neg_guard (n < 0) in
+        match args with Cons (b, _) -> (let _ = radix_guard b in (match b with VInt base -> arr_new (int_digits n base) | VBig bs -> arr_new (big_digits_go (str_of_int n) bs) | _ -> arr_new (int_digits n 10))) | _ -> arr_new (int_digits n 10))
+     | VBig b ->
+       (let _ = neg_guard (big_sign b < 0) in
+        match args with Cons (bs, _) -> (let _ = radix_guard bs in arr_new (big_digits_go (big_mag b) (num_dec bs))) | _ -> arr_new (big_digits_go (big_mag b) "10"))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "digits") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'digits'")) in fail "mere-ruby: undefined method 'digits'")))
   else if str_eq name "bit_length" then (match recv with VInt n -> VInt (int_bit_length (if n < 0 then 0 - n - 1 else n)) | VBig b -> VInt (big_bit_length b) | _ -> (let _ = map_set prim_missing "n" (mkstr "bit_length") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit_length'")) in fail "mere-ruby: undefined method 'bit_length'")))
   else if str_eq name "divmod" then
@@ -33982,6 +34377,48 @@ and aseq_size = fn (b: int) -> fn (e: int) -> fn (st: int) -> fn (excl: bool) ->
              else (if e > b then 0 else (b - e) / (0 - st) + 1)) in
     if excl && n > 0 && (e - b) - ((e - b) / st) * st == 0 then n - 1 else n
 
+// is this bound a plain number, so the count can be COMPUTED?
+and aseq_is_num = fn (v: Val) ->
+  match v with VInt _ -> true | VFlt _ -> true | VBig _ -> true | _ -> false
+and aseq_to_flt = fn (v: Val) ->
+  match v with
+  | VInt n -> float_of_int n
+  | VFlt f -> f
+  | VBig b -> float_of_str b
+  | _ -> 0.0
+// the number of terms when any of begin/end/step is a Float, which is CRuby's
+// ruby_float_step_size (error term and all) plus the infinite ends it decides
+// before dividing. Without it, size and last MATERIALIZED the sequence:
+// 1.step(to: Float::INFINITY, by: 42).size allocated until the memory cap
+// killed the process -- the worst possible answer to a question whose answer
+// is the single word Infinity.
+and aseq_size_flt = fn (bf: float) -> fn (ef: float) -> fn (sf: float) -> fn (excl: bool) ->
+  let inf = 1.0 / 0.0 in
+  let ninf = 0.0 - inf in
+  let eps = 2.220446049250313e-16 in
+  let fabs = fn (x: float) -> if x < 0.0 then 0.0 - x else x in
+  // an infinite step takes the first term, or none if it points away
+  if sf == inf then (if bf <= ef then VInt 1 else VInt 0)
+  else if sf == ninf then (if bf >= ef then VInt 1 else VInt 0)
+  else if sf == 0.0 then VFlt inf
+  // an end at infinity never arrives in the step's own direction, and is
+  // already behind the start in the other
+  else if ef == inf then (if sf > 0.0 then VFlt inf else VInt 0)
+  else if ef == ninf then (if sf < 0.0 then VFlt inf else VInt 0)
+  else
+    let n = (ef - bf) / sf in
+    let err0 = (fabs bf + fabs ef + fabs (ef - bf)) / fabs sf * eps in
+    let err = (if err0 > 0.5 then 0.5 else err0) in
+    if excl then
+      (if n <= 0.0 then VInt 0
+       else if n < 1.0 then VInt 1
+       else (let k = n - err in
+             if k >= 9.0e18 then VFlt (k + 1.0) else VInt (flt_floor k + 1)))
+    else
+      (if n < 0.0 then VInt 0
+       else (let k = n + err in
+             if k >= 9.0e18 then VFlt (k + 1.0) else VInt (flt_floor k + 1)))
+
 // keyword lookup in a hash's flat [k, v, k, v ...] pair list
 and aseq_kw = fn (pairs: Val list) -> fn (k: str) ->
   (let (f, v) = hash_lookup pairs (VSym k) in if f then v else VNil)
@@ -34004,16 +34441,25 @@ and aseq_of = fn world -> fn (recv: Val) -> fn (args: Val list) ->
   | VRange (lo, hi, excl) ->
     let st = (match args with Cons (VInt n, _) -> VInt n | _ -> VInt 1) in
     make_aseq world recv args (VInt (rng_int lo)) (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl
-  | VInt lo ->
-    (match args with
-     | Cons (VInt limit, Cons (VInt n, _)) -> make_aseq world recv args (VInt lo) (VInt limit) (VInt n) false
-     | Cons (VInt limit, Nil) -> make_aseq world recv args (VInt lo) (VInt limit) (VInt 1) false
-     | Cons (VHsh hid, Nil) ->
-       (let by9 = aseq_kw (hderef hid) "by" in
-        let to9 = aseq_kw (hderef hid) "to" in
-        make_aseq world recv args (VInt lo) to9 (match by9 with VNil -> VInt 1 | v -> v) false)
-     | _ -> make_aseq world recv args (VInt lo) VNil (VInt 1) false)
+  | VInt _ -> aseq_of_num world recv args recv
+  | VFlt _ -> aseq_of_num world recv args recv
   | _ -> VNil
+
+// the sequence for a NUMERIC receiver: (limit[, by]), (to:, by:) keywords, or
+// nothing at all. The bounds are kept AS WRITTEN -- a Float limit or step
+// stays a Float, so the walk yields Floats and the count goes through
+// aseq_size_flt. Matching only the (VInt, VInt) shapes sent 1.step(10, 2.5)
+// to the endless-integer fallback, which walked 1, 2, 3, ... instead, and
+// left a Float receiver answering nil.
+and aseq_of_num = fn world -> fn (recv: Val) -> fn (args: Val list) -> fn (b: Val) ->
+  match args with
+  | Cons (VHsh hid, Nil) ->
+    (let by9 = aseq_kw (hderef hid) "by" in
+     let to9 = aseq_kw (hderef hid) "to" in
+     make_aseq world recv args b to9 (match by9 with VNil -> VInt 1 | v -> v) false)
+  | Cons (lim9, Cons (st9, _)) -> make_aseq world recv args b lim9 st9 false
+  | Cons (lim9, Nil) -> make_aseq world recv args b lim9 (VInt 1) false
+  | _ -> make_aseq world recv args b VNil (VInt 1) false
 
 // `(1.step(10, 2))` / `((1..10).step(3))` / `(1.step(by: 2, to: 10))`: the call
 // that made the sequence, from its @recv / @eargs. Called by the object
@@ -35363,7 +35809,7 @@ and register_builtin_consts = fn (u: unit) ->
     Cons ("ThreadError", Cons ("FiberError", Cons ("ClosedQueueError",
     Cons ("NoMemoryError", Cons ("SecurityError", Cons ("SystemStackError",
     Cons ("SignalException", Cons ("Interrupt", Cons ("SystemExit",
-    Cons ("FloatDomainError", Cons ("StopIteration",
+    Cons ("FloatDomainError", Cons ("Math::DomainError", Cons ("StopIteration",
     // the errno classes a socket raises
     Cons ("Errno::ENOENT", Cons ("Errno::ECONNREFUSED", Cons ("Errno::ECONNRESET",
     Cons ("Errno::EADDRINUSE", Cons ("Errno::EPIPE", Cons ("Errno::EAGAIN",
@@ -35391,7 +35837,7 @@ and register_builtin_consts = fn (u: unit) ->
     // below -- a class registered without its parent is an Errno that is not a
     // SystemCallError, which `rescue SystemCallError` then walks straight past.
     Cons ("Errno::EPROTO", Cons ("Errno::ENOTSUP",
-    Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+    Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
   // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
   // distinct names for it rather than distinct sources.
   // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
@@ -35493,13 +35939,31 @@ and call_inherited = fn world -> fn env -> fn (super_name: str) -> fn (sub_name:
 
 // like register_class, but the body's lexical scope (for constant lookup and
 // for nested definitions) stays whatever encloses it -- `class << self`.
+// `class << target`, run with the enclosing LEXICAL scope handed in. Reading
+// it from cur_lex () was wrong for a singleton opened inside a class body or a
+// method body -- it was "" there, so a bare constant inside the body was
+// looked up at top level. `class << self` hid it: that singleton's ANCESTORS
+// include the enclosing module, so its constants were found by the second
+// route and only a singleton of some other object showed the missing cref.
 and register_class_sng = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  register_class_sng_in world cls body (cur_lex ())
+and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (lex: str) ->
   let saved = map_copy ref_active in
-  let lex = cur_lex () in
+  // The scope KEEPS the singleton as its innermost segment. Two things have to
+  // be true at once, and using the enclosing scope alone gave up the first:
+  //   - a class defined in the body belongs to THIS singleton, so `class << a`
+  //     and `class << b` each get their own X. Naming the enclosing module
+  //     made both bodies reopen one shared class, and the second one's CONST
+  //     overwrote the first's.
+  //   - a constant READ in the body continues up the enclosing chain.
+  // lex_const_key already walks a qualified name segment by segment, so
+  // splicing the singleton in as a segment gives both: definitions land under
+  // N::(sng:111), and a lookup strips back to N.
+  let scope = (if str_eq lex "" then cls else lex ++ "::" ++ cls) in
   let cenv = map_new () in
   let _ = map_set cenv "self" (VClass cls) in
-  let _ = map_set cenv "__cscope" (mkstr lex) in
-  let _ = map_set cenv "__cref" (mkstr lex) in
+  let _ = map_set cenv "__cscope" (mkstr scope) in
+  let _ = map_set cenv "__cref" (mkstr scope) in
   let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
   let _ = restore_ref_active saved in
   (match r with
@@ -35653,7 +36117,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
            // Its body's constant lookup continues the ENCLOSING lexical scope
            // (ruby walks the cref chain), so a bare constant inside it still
            // resolves against the module that encloses it.
-           register_class_sng world (sng_target_cls world cenv csuper cls) cbody
+           register_class_sng_in world (sng_target_cls world cenv csuper cls) cbody cscope
          else
          // `class ::C` inside a class body is a TOP-LEVEL constant (not nested
          // under the enclosing class): strip the `::` and don't qualify.
@@ -36523,7 +36987,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      | VSym _ -> (let _ = raise_exc world "TypeError" "can't define singleton" in FNext VNil)
      | VBool b -> register_class_lex world (if b then "TrueClass" else "FalseClass") body
      | VNil -> register_class_lex world "NilClass" body
-     | _ -> register_class_lex world (sng_cls_of_val world recv "Object") body)
+     // `class << obj` for any other receiver. register_class_lex set the
+     // lexical scope to the SINGLETON's own name, so a bare constant in the
+     // body was looked up under "(sng:111)" and then along that singleton's
+     // ancestors -- which stop at Object. `class << self` never showed it:
+     // that singleton's ancestors DO include the enclosing module, so the
+     // constants were found by the second route. The body's cref is the scope
+     // that encloses it, exactly as for `class << self`.
+     | _ -> register_class_sng_in world (sng_cls_of_val world recv "Object") body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))
   | SClass (name0, super0, body) ->
     let (meths, sup, ocls, ivars) = world in
     // a leading `::` (class ::C) is a top-level constant; at the top level the
@@ -36545,7 +37017,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // lexical scope -- ruby walks the cref chain, so `Internal` inside
        // `module Zeitwerk; module X; class << self` finds Zeitwerk::Internal.
        // Only the def target is the singleton class.
-       else register_class_sng world (sng_target_cls world env super0 "Object") body)
+       // the enclosing scope is the CALLER's cref (a method body carries the
+       // scope its `def` was written in), falling back to the lexical stack.
+       else register_class_sng_in world (sng_target_cls world env super0 "Object") body
+              (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))
     // `class Base::Name` where Base is nil/true/false or a non-class value
     // is a TypeError (nil is not a class/module).
     else if str_contains name "::" &&
@@ -40331,6 +40806,12 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set sup "SignalException" "Exception" in
   let _ = map_set sup "Interrupt" "SignalException" in
   let _ = map_set sup "FloatDomainError" "RangeError" in
+  // Math::DomainError is a StandardError in ruby, so `rescue => e` catches it.
+  // Raising the name without registering it left `-12345.digits(7)` aborting
+  // the program: a class nothing knows is not a StandardError, so nothing
+  // rescued it.
+  let _ = map_set sup "Math::DomainError" "StandardError" in
+  let _ = map_set consts "Math::DomainError" (VClass "Math::DomainError") in
   // built-in value classes, so reopened methods resolve up the real chain
   // (class Integer / class Object monkey-patching reaches every value).
   let _ = map_set sup "Class" "Module" in

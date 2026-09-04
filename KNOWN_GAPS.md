@@ -1786,3 +1786,130 @@ This inverts the usual reading of the counts. A lower `pass=` here means
 mere-ruby **asserted less**, not that it failed more; `fail=0 err=0` on both
 sides is the part that says the behaviour agrees. Any row whose two sides differ
 only in `pass=` is worth reading this way before it is treated as a gap.
+
+## Ten CRASH rows, and what each one actually was
+
+The 2026-09-04 sweep left ten spec files classified CRASH — mere-ruby aborting
+where ruby does not. Read as a list of missing features it would have suggested
+ten feature gaps. It was nothing of the kind: **four of the ten were one
+algorithm each doing linear work where the answer is logarithmic**, one was a
+regression I had introduced two commits earlier, and only three were genuinely
+absent behaviour — and one of those three was four constructs wearing one
+error message. The classification names the symptom, not the cause, and the
+symptoms collapsed into far fewer causes than there were rows.
+
+| spec file | reported as | what it was |
+|---|---|---|
+| `core/proc/compose_spec` | stack overflow | **my own regression**: `f >> g` is composition, the `EBin` arm hands `>>` to the dispatcher, and my new operator-in-method-form arm handed it back |
+| `core/float/exponent_spec` | stack overflow | `9.5 ** 0xffffffff` walked `b * pow_flt b (e - 1)` — 4294967295 frames for an answer of `Infinity` |
+| `core/integer/digits_spec` | stack overflow | `12345.digits(1)` divided by 1, which never reaches zero |
+| `core/range/bsearch_spec` | stack overflow | `(0...Float::INFINITY).bsearch` MATERIALIZED the range first |
+| `core/integer/bit_length_spec` | killed at the memory cap | `(2**10000).bit_length` halved a 3011-digit string 33220 times; building the number itself costs 0.27 GB, the halving 6.56 GB |
+| `core/numeric/step_spec` | killed at the memory cap | `1.step(to: Float::INFINITY, by: 42).size` materialized the sequence to count it |
+| `core/integer/left_shift_spec` | killed at the memory cap | `0 << (2**40)` built 2^(2**40) in order to multiply by it |
+| `core/integer/right_shift_spec` | `raised StandardError, expected TypeError` | two of them: `arith_bin` is a leaf helper with no world to raise from, so every shift refusal came out as a bare `StandardError`; and `1 >> (2**40)` halved one step at a time |
+| `language/constants_spec` | `uninitialized constant CS_SINGLETON4_CLASSES` | `class << obj` ran with the singleton's own name as its lexical scope |
+| `language/assignments_spec` | `expected end of statement` | **four separate parse gaps in one file**; see below |
+| `language/for_spec` | `expected a variable after for` | two `match` arms for the same token kind; the first won, so the splat arm was dead code |
+
+Six notes worth keeping.
+
+**A quadratic-or-worse inner loop reports as four different failures.** The
+memory cap kills one process, the stack limit aborts another, and a third
+merely takes long enough to look like a hang — but `bit_length`, `pow_flt`,
+`digits(1)` and the materializing `bsearch`/`step` are all the same mistake:
+walking a structure one step at a time when the answer follows from its size.
+`(2**10000).bit_length` now comes from the DIGIT COUNT (`10^(d-1) <= m < 10^d`
+bounds `log2 m` inside one decimal digit) with each candidate checked against a
+real power of two, so the estimate decides nothing and the walk is four
+divisions instead of 33220.
+
+**A shift wider than the number is not a shift.** Every one of the shift specs'
+huge-width examples — `0 << (2**40)`, `1 << -(2**40)`, `-1 << -(2**40)` — has a
+trivial answer: everything is shifted out, and ruby's `>>` floors, so a
+negative value lands on `-1` rather than `0`. Nothing in the spec ever needs
+2^(2**40) to exist. The width is now compared against the DIGIT COUNT (a
+d-digit magnitude has fewer than 4d + 8 bits, so no exact `bit_length` is
+needed to decide it), and the native `shr_int` keeps the widths it can hold —
+routing every shift through the bignum divide would have made `x >> 3` pay for
+the fix. A decimal-string bignum still makes a genuine `1 << 100000` slow;
+that is the representation, and it is a different question from these rows.
+
+**A refusal that has no world to raise from becomes the wrong class.** The
+shift specs were not asking for a feature; the behaviour was right and only its
+name was wrong. Any refusal reached from a leaf helper is worth checking for
+this — the helper has `fail`, and `fail` is a `StandardError`.
+
+**`class << self` hid a missing cref for a long time.** That singleton's
+ancestors include the enclosing module, so a bare constant in its body was
+found by the ancestor route and the lexical one was never exercised. Only
+`class << some_other_object` — whose singleton inherits from Object — showed
+that the scope was wrong. The fix has to satisfy two things at once: a class
+DEFINED in the body belongs to that singleton (so `class << a` and `class << b`
+each get their own `X`), and a constant READ in the body continues up the
+enclosing chain. Naming the enclosing module alone gave up the first, and the
+second body's `CONST` overwrote the first's. The scope now keeps the singleton
+as its innermost segment — `N::(sng:111)` — because `lex_const_key` already
+walks a qualified name one segment at a time.
+
+**One parse error hides every construct behind it.** `language/assignments_spec`
+was a single `expected end of statement`, and the line it named was not even the
+line that failed — the reported number moved every time the file was truncated.
+Behind it were **four** separate gaps, each of which had to be fixed before the
+next became visible:
+
+1. `(list << :a; obj).attr, ... = ...` — a parenthesized RECEIVER as a masgn
+   target. The same `(` opens a destructuring group; which one it is shows up
+   only AFTER the matching close paren (a group is followed by `,` or `=`, a
+   receiver by a call), and every `(` was read as a group.
+2. A `;` lexes as a newline, and the scan that decides "is this a multiple
+   assignment" stopped at one — so the statement above was not read as an
+   assignment at all.
+3. A grouped target list may WRAP after its comma (ruby/spec writes one nested
+   group across five lines). Leaving the newline in place made the next target
+   a `TNL`, which is not an assignment target.
+4. `self[k1], self[k2] = ...` and `self::A, self::B = ...`. Only `self.attr`
+   was recognised as a self-receiver target.
+
+...and behind those, one behaviour gap: a constant write (`m::A`) was the only
+target kind whose receiver was not pre-evaluated, so it ran AFTER the RHS and
+the recorded evaluation order came out reversed. The file now MATCHes.
+
+Fixing #2 alone turned a clean parse error into a SIGABRT with no output at all
+— worse than the failure it replaced, because a multi-line grouped target then
+drove the parser somewhere it could not report from. A change that widens what
+a scanner accepts has to be paired with the parser actually handling the wider
+input.
+
+**Two `match` arms for one constructor make the second dead.** `parse_for_vars`
+had `Cons (TP lp, r0)` for the paren form and, further down, `Cons (TP star, r)`
+for the splat. The compiler said nothing; every `for *r in` reached the first
+arm, failed `is_lparen`, and raised "expected a variable after for" — the error
+of the arm that did not want it.
+
+### The result
+
+| | before | after |
+|---|---|---|
+| ruby/spec CRASH | 10 | **0** |
+| ruby/spec MATCH | 750 | **756** |
+| runs killed at the memory cap | 3 | 0 |
+| corpus | 170 | 175 |
+| bootstraptest | `pass=1586 fail=19 err=54 drift=37` | unchanged |
+| rgtest / bundlertest | baseline | unchanged |
+
+Five of the ten files now MATCH outright (`bit_length`, `exponent`, `digits`,
+`for`, `assignments`); the other five report an ordinary DIFF. The sweep was
+measured with one pinned binary from end to end, and `mspec/rss_kills.log` is
+empty.
+
+### What is left in `core/range/bsearch_spec`
+
+The row is DIFF, not CRASH, and the 18 remaining assertions are all the same
+thing: ruby's float `bsearch` bisects the **integer encodings** of doubles, so
+`±Float::MAX` and `±Infinity` are ordinary elements of the search and come back
+as answers. mere-ruby bisects the doubles themselves, which cannot reach
+`-Float::MAX` from an `-Infinity` bound (an infinite bracket end halves to NaN,
+so the bracket is first narrowed by probing outward). Closing it needs a
+double↔int64 bit mapping, which this language has no direct way to write —
+`ldexp` is the only libm route in, and there is no `frexp` with an out-parameter.
