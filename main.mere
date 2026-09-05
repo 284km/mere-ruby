@@ -12646,7 +12646,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // before the in-place fast paths below (which bypass invoke_val_c) --
        // except for a yielder called with NO block, which mutates nothing and
        // hands back an Enumerator (the error waits for its #each).
-       let _ = (if is_mutating_method name && val_frozen_mut recv
+       let _ = (if builtin_mut_on_frozen world recv name
                    && (if enum_needs_block name then false else true)
                    && (if delete_is_noop env world recv name args then false else true)
                 then let _ = raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) in ()
@@ -12827,7 +12827,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // an object whose class defines the operator dispatches to it.
     let va0 = eval_e env world blk a in
     // `<<` mutates a String/Array receiver in place — FrozenError first.
-    let _ = (if str_eq op "<<" && val_frozen_mut va0
+    let _ = (if str_eq op "<<" && builtin_mut_on_frozen world va0 "<<"
              then let _ = raise_exc world "FrozenError" ("can't modify frozen " ++ class_name va0 ++ ": " ++ inspect va0) in ()
              else ()) in
     // `s << x` on a string appends in place (store rewrite: aliases see it).
@@ -14998,6 +14998,20 @@ and arr_detect = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   | Nil -> VNil
   | Cons (h, t) -> if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then h else arr_detect world encl theblk t
 
+// #find with the found/not-found answer kept apart from the value
+and arr_detect_f = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> (false, VNil)
+  | Cons (h, t) ->
+    if truthy (flow_value (run_block world encl theblk (Cons (h, Nil)))) then (true, h)
+    else arr_detect_f world encl theblk t
+
+// the ifnone argument, called with no arguments; absent means nil
+and arr_ifnone = fn world -> fn encl -> fn (args: Val list) ->
+  match args with
+  | Cons (VProc pid, _) -> flow_value (run_block world encl (proc_as_block pid) Nil)
+  | _ -> VNil
+
 and arr_any = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> VBool false
@@ -15117,7 +15131,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   // The frozen check in invoke_val_c only guards the non-block dispatch, so a
   // block-form mutator (delete_if / keep_if / map! / sort! ...) reached this
   // far without one.
-  if is_mutating_method name && val_frozen_mut recv then
+  if builtin_mut_on_frozen world recv name then
     raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
   else
   // each iterator returns a Flow: FBreak v (a `break v` fired — that value
@@ -15284,9 +15298,19 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | Cons (init, _) -> iter_result (arr_reduce world encl theblk xs init) recv
        | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> iter_result (arr_reduce world encl theblk t h) recv))
     else if str_eq name "count" then iter_result (arr_count_blk world encl theblk xs 0) recv
-    else if str_eq name "detect" || str_eq name "find" then arr_detect world encl theblk xs
+    // ...and the optional IFNONE argument is CALLED when nothing matched (it is
+    // not a default value): `[1].find(-> { :none }) { false }` is :none. The
+    // found/not-found answer is a pair, so an element that IS nil does not look
+    // like a miss.
+    else if str_eq name "detect" || str_eq name "find" then
+      (match arr_detect_f world encl theblk xs with
+       | (true, v) -> v
+       | (_, _) -> arr_ifnone world encl args)
     // ruby 4.0: Array#rfind is #find walked from the other end
-    else if str_eq name "rfind" then arr_detect world encl theblk (val_rev xs Nil)
+    else if str_eq name "rfind" then
+      (match arr_detect_f world encl theblk (val_rev xs Nil) with
+       | (true, v) -> v
+       | (_, _) -> arr_ifnone world encl args)
     else if str_eq name "any?" then arr_any world encl theblk xs
     else if str_eq name "all?" then arr_all world encl theblk xs
     else if str_eq name "none?" then arr_none world encl theblk xs
@@ -15356,7 +15380,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | Cons (h0, t0) -> go t0 h0)
     else if str_eq name "min_by" then arr_min_by world encl theblk xs false
     else if str_eq name "max_by" then arr_min_by world encl theblk xs true
-    else if str_eq name "minmax_by" then arr_new (Cons (arr_min_by world encl theblk xs false, Cons (arr_min_by world encl theblk xs true, Nil)))
+    else if str_eq name "minmax_by" then arr_minmax_by world encl theblk xs
     else if str_eq name "chunk" then arr_new (arr_chunk world encl theblk xs)
     else if str_eq name "slice_when" then arr_new (arr_slice_when world encl theblk xs)
     else if str_eq name "chunk_while" then arr_new (arr_chunk_while world encl theblk xs)
@@ -15661,24 +15685,33 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
           (let b9 = to_f lo in
            let lim9 = (match hi with VNil -> 1.0 / 0.0 | _ -> to_f hi) in
            iter_each_result (flt_step_x world encl theblk b9 lim9 st9 excl) recv))
-     else if str_eq name "step" && (match args with Cons (VInt 0, _) -> true | _ -> false) then
+     // ...for a NUMERIC range. A String range answers its first element for a
+     // zero (or negative) step instead of raising, so this arm must not reach it.
+     else if str_eq name "step" && (match args with Cons (VInt 0, _) -> true | _ -> false)
+             && (match lo with VStr _ -> false | _ -> true) then
        raise_exc world "ArgumentError" "step can't be 0"
-     // Range#step over STRINGS: every k-th element of the #succ walk, and the
-     // step has to be an Integer -- a Float is "no implicit conversion of
-     // Float into String". An endless String range walks until the block
-     // breaks. There was no arm at all: NoMethodError.
+     // Range#step over STRINGS. Ruby 3.4 settled what the step may be: an
+     // INTEGER takes every k-th element of the #succ walk, a STRING is ADDED to
+     // each element (`("A".."AAA").step("A")` is A, AA, AAA), and anything else
+     // is refused as a String conversion -- an Array, nil or an object, which
+     // this walked past with step 1, and one of them (an endless range) is why
+     // core/range/step_spec ran for minutes. A non-positive Integer yields the
+     // first element and stops; it does NOT raise, as it does for numbers.
      else if str_eq name "step" && (match lo with VStr _ -> true | _ -> false) then
        (match args with
-        | Cons (VFlt _, _) -> raise_exc world "TypeError" "no implicit conversion of Float into String"
-        | _ ->
-          (let k9 = (match args with Cons (VInt k, _) -> k | Nil -> 1 | _ -> 1) in
-           if k9 <= 0 then raise_exc world "ArgumentError" ("step can't be " ++ (if k9 == 0 then "0" else "negative"))
-           else
-             (match hi with
-              | VNil -> (match lo with
-                         | VStr slo -> iter_each_result (rng_str_step_endless world encl theblk (sget slo) k9) recv
-                         | _ -> recv)
-              | _ -> iter_each_result (arr_each world encl theblk (every_kth (range_vals world lo hi excl) k9 0 Nil)) recv)))
+        | Cons (VStr sadd, _) ->
+          (match lo with
+           | VStr slo ->
+             iter_each_result
+               (rng_str_step_add world encl theblk (sget slo) (sget sadd)
+                  (match hi with VStr sh -> sget sh | _ -> "") (match hi with VStr _ -> true | _ -> false) excl) recv
+           | _ -> recv)
+        | Cons (VInt k9, _) ->
+          (if k9 <= 0 then iter_each_result (arr_each world encl theblk (Cons (lo, Nil))) recv
+           else rng_str_step_int world encl theblk recv lo hi excl k9)
+        | Nil -> rng_str_step_int world encl theblk recv lo hi excl 1
+        | Cons (v9, _) ->
+          raise_exc world "TypeError" ("no implicit conversion of " ++ conv_name v9 ++ " into String"))
      // a BEGINLESS range has nothing to step from. With a block ruby says so in
      // one sentence for every kind of end ("#step iteration for beginless
      // ranges is meaningless"); without one, a numeric end still MAKES the
@@ -16092,6 +16125,23 @@ and rng_step_int = fn world -> fn (args: Val list) ->
                (display_cls_msg world (dispatch_cls_of world v) ++ " can't be coerced into Integer") in 1)
 
 // ("A"..).step(k) { }: every k-th #succ, forever, until the block breaks.
+// the Integer-step walk, bounded or not (see the caller for what a step may be)
+and rng_str_step_int = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (k: int) ->
+  match hi with
+  | VNil -> (match lo with
+             | VStr slo -> iter_each_result (rng_str_step_endless world encl theblk (sget slo) k) recv
+             | _ -> recv)
+  | _ -> iter_each_result (arr_each world encl theblk (every_kth (range_vals world lo hi excl) k 0 Nil)) recv
+
+// ...and the String-step walk: each element is the previous one PLUS the step,
+// which ends when it passes the end (never, for an endless range).
+and rng_str_step_add = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (add: str) -> fn (hi: str) -> fn (has_hi: bool) -> fn (excl: bool) ->
+  if has_hi && (let c = str_compare cur hi in if excl then c >= 0 else c > 0) then FNext VNil
+  else
+    (match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | _ -> rng_str_step_add world encl theblk (cur ++ add) add hi has_hi excl)
+
 and rng_str_step_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (k: int) ->
   match run_block world encl theblk (Cons (mkstr cur, Nil)) with
   | FBreak v -> FBreak v | FReturn v -> FReturn v
@@ -16152,6 +16202,25 @@ and arr_min_by_go = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn 
     let better = if want_max then c > 0 else c < 0 in
     if better then arr_min_by_go world encl theblk t h k want_max
     else arr_min_by_go world encl theblk t best bestk want_max
+
+// minmax_by in ONE walk. Asking arr_min_by twice calls the block twice per
+// element, which a block with a side effect can see -- and it made the
+// enumerator yield everything twice, so `[3,1,2].minmax_by.to_a` had six
+// elements where ruby has three (the materialising walk IS that block).
+and arr_minmax_by = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> arr_new (Cons (VNil, Cons (VNil, Nil)))
+  | Cons (h, t) ->
+    (let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+     arr_minmax_by_go world encl theblk t h k h k)
+and arr_minmax_by_go = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (mn: Val) -> fn (mnk: Val) -> fn (mx: Val) -> fn (mxk: Val) ->
+  match xs with
+  | Nil -> arr_new (Cons (mn, Cons (mx, Nil)))
+  | Cons (h, t) ->
+    (let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
+     let (mn2, mnk2) = (if cmp_vals k mnk < 0 then (h, k) else (mn, mnk)) in
+     let (mx2, mxk2) = (if cmp_vals k mxk > 0 then (h, k) else (mx, mxk)) in
+     arr_minmax_by_go world encl theblk t mn2 mnk2 mx2 mxk2)
 
 // chunk: group CONSECUTIVE elements sharing a block value -> [key, [elems]].
 and arr_chunk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
@@ -18010,7 +18079,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // But a yielder called WITHOUT a block mutates nothing: it hands back an
   // Enumerator, and the FrozenError waits until that is iterated
   // (`frozen.delete_if` is an Enumerator in ruby; it was raising here).
-  if is_mutating_method name && val_frozen_mut recv
+  // ...and only for a BUILTIN mutator. The name is a stand-in for "this one
+  // writes", which it is not for a method someone wrote: ruby raises at the
+  // write, so `def zap!; :ok; end` answers on a frozen receiver and an ivar
+  // assignment inside it is what refuses. The Set shipped here has a private
+  // `__modify!` that raises with ruby's message, and this guard was answering
+  // first, about `Object` (`can't modify frozen Object: #<object>`).
+  if builtin_mut_on_frozen world recv name
      && (if enum_needs_block name then false else true)
      && (if delete_is_noop env world recv name args then false else true) then
     raise_exc world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
@@ -21473,6 +21548,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
                 | VStr mh -> str_eq (sget mh) "upto"
                 | _ -> false) then VNil
+       // ...and so does a STRING range, whose length ruby will not compute:
+       // `("A".."E").step(2).size` is nil, and `("A".."E").step("A")` -- legal
+       // since 3.4 -- never ends, so materialising to count is not an option
+       // either (it took the process out with it).
+       else if (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                | VRange (VStr _, _, _) -> true
+                | _ -> false) then VNil
        // a gsub/gsub! enumerator's size is nil (ruby cannot know it without
        // running the matches). bsearch / bsearch_index are the same kind of
        // answer: how many times they yield depends on what the block says, so
@@ -22093,6 +22175,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                           | VInt a -> (if a < 0 then 0 - a - 1 else a)
                           | _ -> 0)) in
        mk_curried world pid (Nil : Val list) ar9 pid)
+    // Internal, for wi_index_block: run the block and say whether it BROKE, as
+    // [broke?, value], so the wrapper can break its OWN iteration instead of
+    // swallowing it. `#call` cannot be used for that: a break inside a proc
+    // called with #call is that call's value here, so
+    // `map.with_index { |x, i| break :b if i == 1; x }` answered [1, :b, 3]
+    // where ruby answers :b. The pair is per call rather than a flag somewhere,
+    // because with_index nests (a block can drive another enumerator).
+    else if str_eq name "__wi_call" then
+      (match run_block world blk (map_get proc_store (str_of_int pid)) args with
+       | FBreak v -> arr_new (Cons (VBool true, Cons (v, Nil)))
+       | fl -> arr_new (Cons (VBool false, Cons (flow_value fl, Nil))))
     // call/./[]/yield run the stored block; class reports Proc.
     else if str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "yield" || str_eq name "===" then
       // a ruby2_keywords proc keeps its trailing `key:` hash MARKED as
@@ -25456,6 +25549,17 @@ and is_mutating_method = fn (name: str) ->
   // ruby lets it through -- the frozen check happens at the write instead.
   || (let n = str_len name in
       n > 1 && str_eq (char_at name (n - 1)) "!" && (if str_eq name "scrub!" then false else true))
+// ONE rule, one place: a frozen receiver refuses a BUILTIN mutator. Four sites
+// were deciding this separately (the two dispatchers, the `<<` operator and the
+// block-form iterators), and all four read the NAME -- which is a stand-in for
+// "this one writes" and is not true of a method the program defined. Ruby
+// raises at the write, so `def zap!; :ok; end` answers on a frozen receiver;
+// the Set shipped here has a private `__modify!` that raises with ruby's own
+// message, and the guard was answering first, about `Object`.
+and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
+  is_mutating_method name && val_frozen_mut recv
+  && (if has_meth world (dispatch_cls_of world recv) name then false else true)
+
 and is_str_mut = fn (name: str) ->
   str_eq name "concat" || str_eq name "replace" || str_eq name "clear" ||
   str_eq name "prepend"
@@ -33452,16 +33556,30 @@ and stdlib_src = fn (name: str) ->
     "    new(items)\n" ++
     "  end\n" ++
     "\n" ++
-    // Set.new(enum) { |x| ... } MAPS each element through the block, which is
-    // what Enumerable#to_set forwards to.
+    "  # ruby refuses a non-enumerable argument everywhere a Set takes a collection,\n" ++
+    "  # and names the two refusals differently: a set operation wants \"a set\", the\n" ++
+    "  # rest want \"enumerable\". Answering NoMethodError instead moved the blame to\n" ++
+    "  # whichever method was tried first.\n" ++
+    "  def self.__enum!(x)\n" ++
+    "    unless x.respond_to?(:each_entry) || x.respond_to?(:each)\n" ++
+    "      raise ArgumentError, \"value must be enumerable\"\n" ++
+    "    end\n" ++
+    "    x\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.__set!(x)\n" ++
+    "    raise ArgumentError, \"value must be a set\" unless x.is_a?(Set)\n" ++
+    "    x\n" ++
+    "  end\n" ++
+    "\n" ++
     "  def initialize(enum = nil, &block)\n" ++
     "    @hash = \{}\n" ++
-    "    if enum\n" ++
-    "      if block\n" ++
-    "        enum.each \{ |x| @hash[block.call(x)] = true }\n" ++
-    "      else\n" ++
-    "        enum.each \{ |x| @hash[x] = true }\n" ++
-    "      end\n" ++
+    "    return if enum.nil?\n" ++
+    "    Set.__enum!(enum)\n" ++
+    "    if block\n" ++
+    "      enum.each \{ |x| @hash[block.call(x)] = true }\n" ++
+    "    else\n" ++
+    "      enum.each \{ |x| @hash[x] = true }\n" ++
     "    end\n" ++
     "  end\n" ++
     "\n" ++
@@ -33474,9 +33592,48 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "  protected :to_h_internal\n" ++
     "\n" ++
+    "  # A set being walked refuses the mutations ruby refuses, and ruby is precise\n" ++
+    "  # about which: adding a NEW item, merging anything, and replacing all raise;\n" ++
+    "  # deleting, subtracting and clearing do not, and re-adding an item that is\n" ++
+    "  # already there does not either. Like the inspect guard, the marker is a table\n" ++
+    "  # on the class keyed by object_id -- an ivar could not be written on a frozen\n" ++
+    "  # set, and a frozen set is still walkable.\n" ++
+    "  def self.__iter_ids\n" ++
+    "    @__iter_ids ||= \{}\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def __iterating?\n" ++
+    "    Set.__iter_ids.key?(object_id)\n" ++
+    "  end\n" ++
+    "  private :__iterating?\n" ++
+    "\n" ++
+    "  # every mutation goes through here, so a frozen Set refuses with ruby's own\n" ++
+    "  # message rather than with whatever the inner Hash would have said\n" ++
+    "  def __modify!(kind = nil)\n" ++
+    "    raise FrozenError, \"can't modify frozen Set: \" + inspect if frozen?\n" ++
+    "    if __iterating?\n" ++
+    "      raise RuntimeError, \"cannot replace set during iteration\" if kind == :replace\n" ++
+    "      raise RuntimeError, \"cannot add to set during iteration\" if kind == :merge\n" ++
+    "    end\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  private :__modify!\n" ++
+    "\n" ++
     "  def each(&block)\n" ++
     "    return to_enum(:each) unless block\n" ++
-    "    @hash.each_key(&block)\n" ++
+    "    ids = Set.__iter_ids\n" ++
+    "    id = object_id\n" ++
+    "    ids[id] = (ids[id] || 0) + 1\n" ++
+    "    begin\n" ++
+    "      @hash.each_key(&block)\n" ++
+    "    ensure\n" ++
+    "      n = ids[id] - 1\n" ++
+    "      if n > 0\n" ++
+    "        ids[id] = n\n" ++
+    "      else\n" ++
+    "        ids.delete(id)\n" ++
+    "      end\n" ++
+    "    end\n" ++
     "    self\n" ++
     "  end\n" ++
     "\n" ++
@@ -33497,6 +33654,10 @@ and stdlib_src = fn (name: str) ->
     "  alias_method :===, :include?\n" ++
     "\n" ++
     "  def add(o)\n" ++
+    "    __modify!\n" ++
+    "    if __iterating? && !include?(o)\n" ++
+    "      raise RuntimeError, \"can't add a new item into set during iteration\"\n" ++
+    "    end\n" ++
     "    @hash[o] = true\n" ++
     "    self\n" ++
     "  end\n" ++
@@ -33508,6 +33669,7 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "\n" ++
     "  def delete(o)\n" ++
+    "    __modify!\n" ++
     "    @hash.delete(o)\n" ++
     "    self\n" ++
     "  end\n" ++
@@ -33518,7 +33680,27 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "\n" ++
     "  def merge(*enums)\n" ++
-    "    enums.each \{ |e| e.each \{ |x| @hash[x] = true } }\n" ++
+    "    __modify!(:merge)\n" ++
+    "    enums.each do |e|\n" ++
+    "      Set.__enum!(e)\n" ++
+    "      e.each \{ |x| @hash[x] = true }\n" ++
+    "    end\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def replace(enum)\n" ++
+    "    __modify!(:replace)\n" ++
+    "    Set.__enum!(enum)\n" ++
+    "    h = \{}\n" ++
+    "    enum.each \{ |x| h[x] = true }\n" ++
+    "    @hash = h\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def subtract(enum)\n" ++
+    "    __modify!\n" ++
+    "    Set.__enum!(enum)\n" ++
+    "    enum.each \{ |x| @hash.delete(x) }\n" ++
     "    self\n" ++
     "  end\n" ++
     "\n" ++
@@ -33526,64 +33708,94 @@ and stdlib_src = fn (name: str) ->
     "    @hash.keys\n" ++
     "  end\n" ++
     "\n" ++
-    // to_set(klass = Set, *args) -- answers self for the plain call, builds a
-    // klass otherwise. (Arguments are deprecated in 4.0 but still taken.)
+    "  # to_set(klass = Set, *args) answers self for the plain call and builds a\n" ++
+    "  # klass otherwise (the arguments are deprecated in 4.0 but still taken).\n" ++
     "  def to_set(klass = Set, *args, &block)\n" ++
     "    return self if klass == Set && args.empty? && block.nil?\n" ++
     "    klass.new(self, *args, &block)\n" ++
     "  end\n" ++
     "\n" ++
+    "  # a copy keeps the comparison MODE: a set that compares by identity dups into\n" ++
+    "  # one that still does (ruby carries it through initialize_copy)\n" ++
     "  def dup\n" ++
-    "    Set.new(to_a)\n" ++
+    "    s = self.class.new\n" ++
+    "    s.compare_by_identity if compare_by_identity?\n" ++
+    "    s.merge(to_a)\n" ++
+    "    s\n" ++
     "  end\n" ++
     "\n" ++
     "  def clear\n" ++
+    "    __modify!\n" ++
     "    @hash = \{}\n" ++
     "    self\n" ++
     "  end\n" ++
     "\n" ++
+    "  def __as_set(other)\n" ++
+    "    return other if other.is_a?(Set)\n" ++
+    "    s = Set.new\n" ++
+    "    other.each \{ |x| s.add(x) }\n" ++
+    "    s\n" ++
+    "  end\n" ++
+    "  private :__as_set\n" ++
+    "\n" ++
     "  def |(other)\n" ++
-    "    Set.new(to_a + other.to_a)\n" ++
+    "    Set.__enum!(other)\n" ++
+    "    s = Set.new(to_a)\n" ++
+    "    other.each \{ |x| s.add(x) }\n" ++
+    "    s\n" ++
     "  end\n" ++
     "  alias_method :union, :|\n" ++
     "  alias_method :+, :|\n" ++
     "\n" ++
     "  def &(other)\n" ++
-    "    Set.new(to_a.select \{ |x| other.include?(x) })\n" ++
+    "    Set.__enum!(other)\n" ++
+    "    os = __as_set(other)\n" ++
+    "    Set.new(to_a.select \{ |x| os.include?(x) })\n" ++
     "  end\n" ++
     "  alias_method :intersection, :&\n" ++
     "\n" ++
     "  def -(other)\n" ++
-    "    Set.new(to_a.reject \{ |x| other.include?(x) })\n" ++
+    "    Set.__enum!(other)\n" ++
+    "    os = __as_set(other)\n" ++
+    "    Set.new(to_a.reject \{ |x| os.include?(x) })\n" ++
     "  end\n" ++
     "  alias_method :difference, :-\n" ++
     "\n" ++
     "  def ^(other)\n" ++
-    "    (self | other) - (self & other)\n" ++
+    "    Set.__enum!(other)\n" ++
+    "    os = __as_set(other)\n" ++
+    "    (self | os) - (self & os)\n" ++
     "  end\n" ++
     "\n" ++
     "  def subset?(other)\n" ++
+    "    Set.__set!(other)\n" ++
     "    to_a.all? \{ |x| other.include?(x) }\n" ++
     "  end\n" ++
     "  alias_method :<=, :subset?\n" ++
     "\n" ++
     "  def superset?(other)\n" ++
+    "    Set.__set!(other)\n" ++
     "    other.to_a.all? \{ |x| include?(x) }\n" ++
     "  end\n" ++
     "  alias_method :>=, :superset?\n" ++
     "\n" ++
     "  def proper_subset?(other)\n" ++
+    "    Set.__set!(other)\n" ++
     "    size < other.size && subset?(other)\n" ++
     "  end\n" ++
     "  alias_method :<, :proper_subset?\n" ++
     "\n" ++
     "  def proper_superset?(other)\n" ++
+    "    Set.__set!(other)\n" ++
     "    size > other.size && superset?(other)\n" ++
     "  end\n" ++
     "  alias_method :>, :proper_superset?\n" ++
     "\n" ++
+    "  # disjoint? takes any enumerable, and says so with the other message\n" ++
     "  def disjoint?(other)\n" ++
-    "    (self & other).empty?\n" ++
+    "    Set.__enum!(other)\n" ++
+    "    os = __as_set(other)\n" ++
+    "    (self & os).empty?\n" ++
     "  end\n" ++
     "\n" ++
     "  def intersect?(other)\n" ++
@@ -33591,12 +33803,27 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "\n" ++
     "  def ==(other)\n" ++
+    "    return true if equal?(other)\n" ++
     "    return false unless other.is_a?(Set)\n" ++
-    "    size == other.size && subset?(other)\n" ++
+    "    # a set that compares by identity is not equal to one that does not, even\n" ++
+    "    # when the members would compare equal either way\n" ++
+    "    return false unless compare_by_identity? == other.compare_by_identity?\n" ++
+    "    size == other.size && to_a.all? \{ |x| other.include?(x) }\n" ++
     "  end\n" ++
+    "  alias_method :eql?, :==\n" ++
     "\n" ++
-    "  def eql?(other)\n" ++
-    "    self == other\n" ++
+    "  # nil unless one contains the other: 0 equal, -1 proper subset, +1 proper\n" ++
+    "  # superset. Anything that is not a Set is not comparable at all.\n" ++
+    "  def <=>(other)\n" ++
+    "    return nil unless other.is_a?(Set)\n" ++
+    "    c = size <=> other.size\n" ++
+    "    if c == 0\n" ++
+    "      self == other ? 0 : nil\n" ++
+    "    elsif c < 0\n" ++
+    "      subset?(other) ? -1 : nil\n" ++
+    "    else\n" ++
+    "      superset?(other) ? 1 : nil\n" ++
+    "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def hash\n" ++
@@ -33608,13 +33835,161 @@ and stdlib_src = fn (name: str) ->
     "    super\n" ++
     "  end\n" ++
     "\n" ++
-    // ruby 4.0 made Set core and its inspect `Set[1, 2]` (a set that contains
-    // itself shows `Set[...]`); a SUBCLASS keeps the older `#<MySet: {1, 2}>`,
-    // which is what 4.0.6 prints for one. The recursion guard is a table on the
-    // class rather than an ivar on the instance, because a frozen set inspects.
+    "  def compare_by_identity\n" ++
+    "    __modify!\n" ++
+    "    @hash.compare_by_identity\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def compare_by_identity?\n" ++
+    "    @hash.compare_by_identity?\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def classify(&block)\n" ++
+    "    return to_enum(:classify) unless block\n" ++
+    "    h = \{}\n" ++
+    "    each do |x|\n" ++
+    "      k = block.call(x)\n" ++
+    "      h[k] = Set.new unless h.key?(k)\n" ++
+    "      h[k].add(x)\n" ++
+    "    end\n" ++
+    "    h\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # A one-argument block groups by its value. A TWO-argument one is a relation,\n" ++
+    "  # and the subsets are the strongly connected components of the graph it\n" ++
+    "  # describes -- not merely the connected ones, which would join a pair that is\n" ++
+    "  # related in one direction only. The block is never asked about (x, x).\n" ++
+    "  def divide(&func)\n" ++
+    "    return to_enum(:divide) unless func\n" ++
+    "    return Set.new(classify(&func).values) unless func.arity == 2\n" ++
+    "    els = to_a\n" ++
+    "    adj = \{}\n" ++
+    "    i = 0\n" ++
+    "    while i < els.size\n" ++
+    "      row = []\n" ++
+    "      j = 0\n" ++
+    "      while j < els.size\n" ++
+    "        row << j if i != j && func.call(els[i], els[j])\n" ++
+    "        j += 1\n" ++
+    "      end\n" ++
+    "      adj[i] = row\n" ++
+    "      i += 1\n" ++
+    "    end\n" ++
+    "    index = \{}\n" ++
+    "    low = \{}\n" ++
+    "    onstack = \{}\n" ++
+    "    stack = []\n" ++
+    "    comps = []\n" ++
+    "    counter = [0]\n" ++
+    "    visit = nil\n" ++
+    "    visit = lambda do |v|\n" ++
+    "      index[v] = counter[0]\n" ++
+    "      low[v] = counter[0]\n" ++
+    "      counter[0] = counter[0] + 1\n" ++
+    "      stack.push(v)\n" ++
+    "      onstack[v] = true\n" ++
+    "      adj[v].each do |w|\n" ++
+    "        if !index.key?(w)\n" ++
+    "          visit.call(w)\n" ++
+    "          low[v] = low[w] if low[w] < low[v]\n" ++
+    "        elsif onstack[w]\n" ++
+    "          low[v] = index[w] if index[w] < low[v]\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      if low[v] == index[v]\n" ++
+    "        comp = []\n" ++
+    "        loop do\n" ++
+    "          w = stack.pop\n" ++
+    "          onstack[w] = false\n" ++
+    "          comp << els[w]\n" ++
+    "          break if w == v\n" ++
+    "        end\n" ++
+    "        comps << comp\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    k = 0\n" ++
+    "    while k < els.size\n" ++
+    "      visit.call(k) unless index.key?(k)\n" ++
+    "      k += 1\n" ++
+    "    end\n" ++
+    "    Set.new(comps.map \{ |c| Set.new(c) })\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def __flatten_into(acc, set, seen)\n" ++
+    "    raise ArgumentError, \"tried to flatten recursive Set\" if seen.key?(set.object_id)\n" ++
+    "    seen[set.object_id] = true\n" ++
+    "    set.each do |x|\n" ++
+    "      if x.is_a?(Set)\n" ++
+    "        __flatten_into(acc, x, seen)\n" ++
+    "      else\n" ++
+    "        acc << x\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    seen.delete(set.object_id)\n" ++
+    "    acc\n" ++
+    "  end\n" ++
+    "  private :__flatten_into\n" ++
+    "\n" ++
+    "  def flatten\n" ++
+    "    Set.new(__flatten_into([], self, \{}))\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def flatten!\n" ++
+    "    return nil unless to_a.any? \{ |x| x.is_a?(Set) }\n" ++
+    "    replace(__flatten_into([], self, \{}))\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def join(sep = nil)\n" ++
+    "    to_a.join(sep)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def delete_if(&block)\n" ++
+    "    return to_enum(:delete_if) unless block\n" ++
+    "    __modify!\n" ++
+    "    to_a.each \{ |x| @hash.delete(x) if block.call(x) }\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def keep_if(&block)\n" ++
+    "    return to_enum(:keep_if) unless block\n" ++
+    "    __modify!\n" ++
+    "    to_a.each \{ |x| @hash.delete(x) unless block.call(x) }\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # the bang filters answer nil when nothing was removed, as ruby's do\n" ++
+    "  def select!(&block)\n" ++
+    "    return to_enum(:select!) unless block\n" ++
+    "    n = size\n" ++
+    "    keep_if(&block)\n" ++
+    "    size == n ? nil : self\n" ++
+    "  end\n" ++
+    "  alias_method :filter!, :select!\n" ++
+    "\n" ++
+    "  def reject!(&block)\n" ++
+    "    return to_enum(:reject!) unless block\n" ++
+    "    n = size\n" ++
+    "    delete_if(&block)\n" ++
+    "    size == n ? nil : self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def map!(&block)\n" ++
+    "    return to_enum(:map!) unless block\n" ++
+    "    replace(to_a.map \{ |x| block.call(x) })\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  alias_method :collect!, :map!\n" ++
+    "\n" ++
+    "  # ruby 4.0 made Set core and its inspect `Set[1, 2]` (a set that contains\n" ++
+    "  # itself shows `Set[...]`); a SUBCLASS keeps the older shape, which is what\n" ++
+    "  # 4.0.6 prints for one. The recursion guard is a table on the class rather\n" ++
+    "  # than an ivar on the instance, because a frozen set still inspects.\n" ++
     "  def self.__insp_ids\n" ++
     "    @__insp_ids ||= \{}\n" ++
     "  end\n" ++
+    "\n" ++
     "  def inspect\n" ++
     "    exact = self.class == Set\n" ++
     "    open = exact ? \"Set[\" : \"#<\" + self.class.to_s + \": \{\"\n" ++
@@ -33632,16 +34007,14 @@ and stdlib_src = fn (name: str) ->
     "end\n" ++
     "\n" ++
     "module Enumerable\n" ++
-    // `to_set { |x| ... }` MAPS on the way in -- ruby's Enumerable#to_set
-    // forwards its block (and any Set.new arguments) rather than ignoring it,
-    // so `(1..3).to_set { |x| x * x }` is {1, 4, 9} and not {1, 2, 3}.
+    "  # to_set forwards its block, so `(1..3).to_set \{ |x| x * x }` is \{1, 4, 9}\n" ++
     "  def to_set(klass = Set, *args, &block)\n" ++
     "    klass.new(self, *args, &block)\n" ++
     "  end\n" ++
     "end\n" ++
     "\n" ++
-    // ruby 4.0: Range#to_set refuses an endless range before walking it.
     "class Range\n" ++
+    "  # ruby 4.0: Range#to_set refuses an endless range before walking it\n" ++
     "  def to_set(klass = Set, *args, &block)\n" ++
     "    raise RangeError, \"cannot convert endless range to a set\" if self.end.nil?\n" ++
     "    klass.new(self, *args, &block)\n" ++
@@ -36186,9 +36559,14 @@ and wi_index_block = fn newblk -> fn (off: int) ->
   let elem = ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
                     EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
                     EVar "__e") in
-  let body = Cons (SAssign ("__wi_v", EMethod (EVar "__wi_blk", "call", Cons (elem, Cons (idx, Nil)))),
+  // [broke?, value]: a break inside the caller's block has to end the WALK, so
+  // the wrapper re-issues it as its own break rather than answering the value.
+  let rv = EVar "__wi_r" in
+  let got = EMethod (rv, "[]", Cons (EInt 1, Nil)) in
+  let body = Cons (SAssign ("__wi_r", EMethod (EVar "__wi_blk", "__wi_call", Cons (elem, Cons (idx, Nil)))),
               Cons (SExpr (EMethod (EVar "__wi_c", "[]=", Cons (EInt 0, Cons (EBin ("+", idx, EInt 1), Nil)))),
-              Cons (SExpr (EVar "__wi_v"), Nil))) in
+              Cons (SIf (Cons ((EMethod (rv, "[]", Cons (EInt 0, Nil)), Cons (SBreak got, Nil)), Nil), Nil),
+              Cons (SExpr got, Nil)))) in
   (true, Cons ("*__e", Nil), body, cenv)
 
 // with_index runs the SOURCE method over (element, index) pairs, so a source

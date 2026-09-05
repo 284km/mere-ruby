@@ -339,34 +339,51 @@ in this interpreter rather than a boundary:
    `nil + "/"`. `rubylibdir`, `rubyarchdir` and `DLEXT` are derived from the
    same prefix now.
 
-## `minmax_by`'s enumerator walks its source twice, and `break` does not leave a `with_index`
+## An Enumerable method on an object materialises before it runs the block
 
-Two small edges of the same machinery, both measured against ruby 4.0.6:
+`map`, `select` and the rest, called on an object that defines `#each`, collect
+that object's elements first and then walk the collected array. Ruby runs the
+block DURING the walk, and the difference shows wherever the walk itself is
+observable: a Set refuses `add` while it is being iterated, so
 
-`[3,1,2].minmax_by.to_a` answers `[3, 1, 2, 3, 1, 2]` where ruby answers
-`[3, 1, 2]` -- materialising that enumerator drives `minmax_by`, which walks
-its receiver once for the minimum and once for the maximum. Every other source
-in `corpus/183` materialises in one pass. `minmax_by.with_index` is not
-affected: with_index calls the source once with a wrapped block and never
-materialises.
+```ruby
+s = Set[:a]
+s.map { s.add(:c) }    # ruby: RuntimeError (can't add during iteration)
+                       # here: the marker is already closed, so it succeeds
+```
 
-`break` inside a `with_index` block ends that block, not the walk:
-`[1,2,3].map.with_index { |x, i| break :b if i == 1; x }` answers
-`[1, :b, 3]` where ruby answers `:b`. The wrapper reaches the caller's block
-through a Proc, and a break inside a proc called with `#call` is that call's
-value here. Propagating it would need the flow to travel back out through the
-call, which is the same missing piece as `proc { break }.call` (ruby raises
-LocalJumpError there; this answers the value).
+`s.each { s.add(:c) }` does raise -- that one goes through `Set#each` -- and so
+does everything the Set library itself iterates with. It is the same shape the
+enumerator's `with_index` had until it stopped materialising: two phases where
+ruby has one.
 
-`Exception#backtrace` is the same gap seen from the other side: it answers
-`nil` rather than the frames the exception was raised through. It has to
-answer *something*, because a library reads a backtrace while it is
-**reporting** an error — bundler's `eval_gemfile` builds its `DSLError` out of
-`e.backtrace` — so raising NoMethodError there replaces the error being
-reported with one about the reporting. `set_backtrace` stores and returns a
-value on an exception object; on the built-in representation (a class and a
-message, no identity) there is nowhere to store one, so it is absent rather
-than a setter whose value cannot be read back.
+## A Hash compares object keys by identity, not by `#hash` and `#eql?`
+
+Ruby looks a key up by asking it: `#hash` puts it in a bucket, `#eql?` settles
+the bucket. This Hash compares with its own structural equality, which for an
+object means IDENTITY -- so a class that defines both is not honoured:
+
+```ruby
+class K
+  def initialize(v) = @v = v
+  def hash = @v.hash
+  def eql?(o) = o.is_a?(K) && o.instance_variable_get(:@v) == @v
+end
+h = { K.new(1) => :x }
+h[K.new(1)]   # ruby: :x   here: nil
+```
+
+The same gap is why a Set of Sets does not behave: `Set[Set[1, 2]].include?(Set[2, 1])`
+is false here, and four of the five remaining `core/set` differences are this one
+gap wearing different clothes (`divide`, `equal_value`, `include`, and `classify`,
+whose Hash VALUES are Sets compared the same way).
+
+Fixing it means the key comparison has to be able to CALL a method, and the
+functions that compare keys (`hkey_eql`, `hash_get_x` and the rest) are deliberate
+world-free primitives -- they are reached from thirteen sites, several of them in
+`prim_method_raw`, which has no interpreter to call back into. The shape of the
+fix is a world-aware lookup that runs only when the plain one MISSES and the key
+is an object, so the fast path stays where it is.
 
 ## A Range walks integers and strings, and nothing else
 

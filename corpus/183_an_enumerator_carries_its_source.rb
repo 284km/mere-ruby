@@ -41,9 +41,12 @@ p [1, 2, 3].each_slice(2).with_index { |s, i| [s, i] }
 p({ a: 1, b: 2 }.map.with_index { |(k, v), i| [k, v, i] })
 p [[1, 2], [3, 4]].each.with_index { |(a, b), i| [a, b, i] }
 
-# `each` answers its receiver. (A `break` inside a with_index block does NOT
-# leave the walk here -- the wrapper reaches the caller's block through a Proc,
-# and a break there becomes that call's value. Recorded in KNOWN_GAPS.md.)
+# a break leaves the WALK, not just the block, and `next` only ends the block;
+# `each` answers its receiver
+p src.map.with_index { |x, i| break :stopped if i == 1; x }
+p src.select.with_index { |x, i| break :stopped if i == 2; true }
+p src.each.with_index { |x, i| break [x, i] if i == 1 }
+p src.map.with_index { |x, i| next :skipped if i == 1; x }
 p src.each.with_index { |x, i| x }
 
 # materialising an enumerator drives its source with a block that answers nil,
@@ -51,6 +54,14 @@ p src.each.with_index { |x, i| x }
 p src.find.to_a, src.detect.to_a, src.sort_by.to_a, src.group_by.to_a
 p src.take_while.to_a, src.drop_while.to_a, src.select.to_a
 p src.each_slice(2).to_a, src.each_cons(2).to_a, src.each_with_object([]).to_a
+p src.minmax_by.to_a, src.min_by.to_a, src.max_by.to_a
+
+# ...and every source walks its receiver ONCE, which a block with a side effect
+# is the only witness to
+calls = 0
+p src.minmax_by { |x| calls += 1; x }, calls
+calls = 0
+p src.group_by { |x| calls += 1; x.even? }, calls
 
 # ...which is legal only because a nil key compares with a nil key
 p(nil <=> nil, [nil, nil].sort, [3, 1, 2].sort_by { nil })

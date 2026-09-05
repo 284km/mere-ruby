@@ -111,6 +111,17 @@ out_r="$({ spec_env perl -e 'alarm 25; exec @ARGV' ruby -W0 "$tmp/driver.rb" 2>&
 if [ "$rc_m" = "137" ] || [ "$rc_m" = "9" ]; then
   out_m="KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own"
 fi
+# A run that passed the alarm is SLOW, which is not what CRASH says. With no
+# `pass=` line on the mere-ruby side the scoreboard reads CRASH and takes the
+# last thing said as the cause, so a file that WORKS and is merely slow was
+# recorded as aborting -- core/range/step_spec was, for one walk that never
+# ended. The verdict is its own word here, and scoreboard.sh turns it into the
+# SLOW column it already has.
+timed_out=0
+if [ "$rc_m" = "142" ] || [ "$rc_m" = "14" ]; then
+  timed_out=1
+  out_m="TIMED OUT: ran past this harness's per-file limit (SIGALRM) -- it did not abort on its own"
+fi
 if [ "${#out_m}" -ge "$out_cap" ]; then
   out_m="RUNAWAY OUTPUT: passed $out_cap bytes and was cut off"
 fi
@@ -119,5 +130,6 @@ if [ "${#out_r}" -ge "$out_cap" ]; then
 fi
 echo "--- mere-ruby:"; echo "$out_m"
 echo "--- ruby:";      echo "$out_r"
-if [ "$out_m" = "$out_r" ]; then echo "MATCH"; else echo "DIFF"; fi
+if [ "$timed_out" = 1 ]; then echo "SLOW"
+elif [ "$out_m" = "$out_r" ]; then echo "MATCH"; else echo "DIFF"; fi
 [ "$2" = "--keep" ] || rm -rf "$tmp"

@@ -198,6 +198,10 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   case $rc in 142|14) printf 'TIMEOUT\t-\n'; return;; esac
   verdict="$(printf '%s' "$out" | tail -1)"
   if [ "$verdict" = "MATCH" ]; then printf 'MATCH\t-\n'; return; fi
+  # run_spec.sh says SLOW when ITS alarm fired: the file works and ran past the
+  # limit, which is not the same finding as aborting (the TIMEOUT above is this
+  # script's own alarm, one level out).
+  if [ "$verdict" = "SLOW" ]; then printf 'TIMEOUT\t-\n'; return; fi
   # ruby side empty tally => unmeasurable (ruby itself didn't run the examples)
   rb="$(printf '%s' "$out" | sed -n '/--- ruby:/,$p' | grep -a 'pass=' | tail -1)"
   mr="$(printf '%s' "$out" | sed -n '/--- mere-ruby:/,/--- ruby:/p' | grep -a 'pass=' | tail -1)"

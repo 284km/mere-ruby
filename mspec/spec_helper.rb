@@ -249,7 +249,42 @@ def ruby_bug(*args); end
 def bignum_value(plus = 0); 2**64 + plus; end
 def fixnum_max; 2**62 - 1; end
 def fixnum_min; -(2**62); end
-def ruby_version_is(*args); end
+# mspec's version guard, decided by the RUBY_VERSION each side reports. It was a
+# no-op -- the block never ran, on either side -- which kept the two runs
+# comparable and made the record BLIND: 67 of the files in the swept groups
+# carry one, and the blocks behind "3.5" and "4.0" are exactly the behaviour
+# this interpreter now claims. A reference move could not show up in the record
+# at all while this returned without yielding. Both sides still run the same
+# shim and the same RUBY_VERSION, so it remains one question asked twice.
+def __mspec_ver_cmp(a, b)
+  y = b.to_s.split(".")
+  # mspec compares RUBY_VERSION truncated to the BOUND's precision, so that
+  # `ruby_version_is "4.0".."4.0"` means "any 4.0.x" rather than "4.0.0 exactly".
+  x = a.to_s.split(".")[0, y.size]
+  n = x.size > y.size ? x.size : y.size
+  i = 0
+  while i < n
+    xa = (x[i] || "0").to_i
+    yb = (y[i] || "0").to_i
+    return -1 if xa < yb
+    return 1 if xa > yb
+    i += 1
+  end
+  0
+end
+
+def ruby_version_is(range)
+  ok =
+    if range.is_a?(Range)
+      b = range.begin.to_s
+      e = range.end.to_s
+      (b.empty? || __mspec_ver_cmp(RUBY_VERSION, b) >= 0) &&
+        (e.empty? || (range.exclude_end? ? __mspec_ver_cmp(RUBY_VERSION, e) < 0 : __mspec_ver_cmp(RUBY_VERSION, e) <= 0))
+    else
+      __mspec_ver_cmp(RUBY_VERSION, range.to_s) >= 0
+    end
+  yield if ok && block_given?
+end
 def platform_is(*args); end
 def platform_is_not(*args); end
 def suppress_warning
