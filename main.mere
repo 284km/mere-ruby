@@ -17350,6 +17350,16 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // ivars, so it can only answer `#<object>` for a MatchData, which is what
     // `p $~` and `p [$~]` printed while `$~.inspect` was already right. Two
     // printers, and only one of them could see the groups.
+    // a Method / UnboundMethod prints as ruby writes it, not as the object it
+    // is made of: `p method(:foo)` showed @__m_name and the rest.
+    else if str_eq cls "Method" || str_eq cls "UnboundMethod" then
+      (let gv9 = fn (k: str) -> (if map_has iv2 (str_of_int oid ++ k) then (match map_get iv2 (str_of_int oid ++ k) with VStr h -> sget h | _ -> "") else "") in
+       let own9 = (if str_eq cls "Method" then gv9 "@__m_owner" else gv9 "@__um_cls") in
+       let nm9 = (if str_eq cls "Method" then gv9 "@__m_name" else gv9 "@__um_name") in
+       let rcv9 = (if map_has iv2 (str_of_int oid ++ "@__m_recv") then map_get iv2 (str_of_int oid ++ "@__m_recv") else VMain) in
+       let own9 = (if str_eq own9 "" then class_name rcv9 else own9) in
+       meth_inspect_str world cls own9 nm9 (bm_params world own9 nm9)
+         (meth_source_location world own9 nm9 rcv9))
     else if map_has md_whole (str_of_int oid) then
       "#<MatchData " ++ inspect (mkstr (map_get md_whole (str_of_int oid)))
       ++ md_insp_groups iv2 oid 1 ++ ">"
@@ -18907,6 +18917,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                  (if map_has enc_name (str_of_int oid) then false
                   else if map_has md_whole (str_of_int oid) then false
                   else if map_has struct_mem c9 then false
+                  // a Method / UnboundMethod writes itself the way ruby writes
+                  // it, further down; this arm was answering #to_s (not
+                  // #inspect) with the default `#<UnboundMethod:0x..>`
+                  else if str_eq c9 "Method" || str_eq c9 "UnboundMethod" then false
                   // the object's OWN class, not `class_name recv` -- that
                   // answers "Object" here, so a class with its own #to_s had it
                   // bypassed by this arm
@@ -20885,6 +20899,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               (match args with
                | Cons (a1, _) -> arith_bin mnm mrecv a1
                | Nil -> invoke_val_c env world blk mrecv mnm args false)
+            // A Method holds the definition it was taken FROM: calling it by
+            // name again re-dispatches, so `obj.method(:m).super_method.call`
+            // ran the subclass's m forever. Invoke the owner's directly when
+            // there is one (a builtin has no entry and keeps the old path).
+            else if (if str_eq mown "" then false else true) && has_meth world mown mnm then
+              invoke world blk mrecv mown mnm args
             else invoke_val_c env world blk mrecv mnm args false)
        else if str_eq name "name" then VSym mnm
        else if str_eq name "receiver" then mrecv
@@ -20900,9 +20920,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
           VSym (original_name_of world ocl mnm))
        else if str_eq name "super_method" then
+         // ...a bound Method, on the SAME receiver: ruby answers something
+         // callable, and this answered an UnboundMethod that #call refused
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
           let above = lookup_anc_above world (ancestors_of world ocl) ocl mnm in
-          if str_eq above "" then VNil else make_unbound_method world above mnm)
+          if str_eq above "" then VNil
+          else
+            (let nid = alloc_oid ocls in
+             let _ = map_set ocls (str_of_int nid) "Method" in
+             let _ = map_set ivars (str_of_int nid ++ "@__m_name") (mkstr mnm) in
+             let _ = map_set ivars (str_of_int nid ++ "@__m_owner") (mkstr above) in
+             let _ = map_set ivars (str_of_int nid ++ "@__m_recv") mrecv in
+             VObj nid))
        // Method#==: the same receiver, the same owner, and the same definition --
        // two ALIASES of one method are equal (ruby: `m.method(:each) ==
        // m.method(:each_pair)`), which is what canon_alias decides. There was
@@ -20935,10 +20964,40 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                        && rb_identical rc2 mrecv))
              else VBool false)
           | _ -> VBool false)
-       else if str_eq name "clone" || str_eq name "dup" then recv
+       // #dup and #clone answer a NEW Method: they used to answer the receiver
+       // itself, so freezing one froze its copies too. clone carries the frozen
+       // status over, dup drops it -- which is the whole of the two specs.
+       else if str_eq name "clone" || str_eq name "dup" then
+         (let nid = alloc_oid ocls in
+          let _ = map_set ocls (str_of_int nid) "Method" in
+          let _ = map_set ivars (str_of_int nid ++ "@__m_name") (mkstr mnm) in
+          let _ = map_set ivars (str_of_int nid ++ "@__m_owner") (mkstr mown) in
+          let _ = map_set ivars (str_of_int nid ++ "@__m_recv") mrecv in
+          let _ = (if str_eq name "clone" && ofrozen_get id then ofrozen_set nid else ()) in
+          VObj nid)
+       else if str_eq name "freeze" then (let _ = ofrozen_set id in recv)
+       else if str_eq name "frozen?" then VBool (ofrozen_get id)
+       // ...and the identity questions every object answers: #dup makes a NEW
+       // one, and `dup.equal?(m)` is how a spec says so
+       else if str_eq name "equal?" then
+         (match args with Cons (VObj o2, _) -> VBool (o2 == id) | _ -> VBool false)
+       else if str_eq name "object_id" || str_eq name "__id__" then VInt (1000000 + id * 8)
+       // #curry and the two compositions are the Proc's, reached through
+       // #to_proc: a Method is callable, and ruby gives it the same surface.
+       else if str_eq name "curry" || str_eq name ">>" || str_eq name "<<" then
+         (let pr = invoke_val_c env world blk recv "to_proc" Nil false in
+          invoke_val_c env world blk pr name args false)
        else if str_eq name "hash" then
+         // ...by the name the method was DEFINED as (two aliases of one method
+         // are eql? and must hash alike), and with the RECEIVER: two Methods of
+         // different objects are different methods
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
-          VInt (val_hash (mkstr (ocl ++ "#" ++ mnm))))
+          VInt (val_hash (mkstr (ocl ++ "#" ++ defined_as_name world ocl mnm))
+                + (match mrecv with
+                   | VObj oid9 -> oid9 * 8
+                   | VStr sid9 -> sid9 * 8 + 1
+                   | VInt n9 -> n9
+                   | _ -> 0)))
        else if str_eq name "arity" then VInt (bm_arity world mown mnm)
        // Method#source_location: [file, line] of the `def`, or nil for a
        // builtin (there is no ruby source behind one).
@@ -20987,7 +21046,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | _ -> map_set proc_src ("f" ++ str_of_int pid) (mkstr "")) in
           VProc pid)
        else if str_eq name "inspect" || str_eq name "to_s" then
-         mkstr ("#<Method: " ++ (if str_eq mown "" then class_name mrecv else mown) ++ "#" ++ mnm ++ ">")
+         // `#<Method: A#foo(a, b=..., *r, k:, &blk) file:line>` -- the owner, the
+         // name, the parameter SHAPE and where it was written. It used to be
+         // the class and the name alone, and for an object with ivars the
+         // default printer showed the internal ones instead.
+         (let ocl9 = (if str_eq mown "" then class_name mrecv else mown) in
+          mkstr (meth_inspect_str world "Method" ocl9 mnm
+                   (bm_params world ocl9 mnm) (meth_source_location world mown mnm mrecv)))
        else if str_eq name "==" || str_eq name "eql?" then
          // two names for ONE implementation are one method, which is the
          // question this asks -- UnboundMethod#== has compared through
@@ -21732,10 +21797,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // onto the same (class, name) pair -- which is what ruby's clone gives
        // for one (== is by owner and name, and the specs compare that way).
        else if str_eq name "clone" || str_eq name "dup" then
-         make_unbound_method world ucls unm
-       else if str_eq name "hash" then VInt (val_hash (mkstr (ucls ++ "#" ++ unm)))
+         // a NEW UnboundMethod, carrying the frozen status only for #clone
+         (let nid = alloc_oid ocls in
+          let _ = map_set ocls (str_of_int nid) "UnboundMethod" in
+          let _ = map_set ivars (str_of_int nid ++ "@__um_cls") (mkstr ucls) in
+          let _ = map_set ivars (str_of_int nid ++ "@__um_name") (mkstr unm) in
+          let _ = (if str_eq name "clone" && ofrozen_get id then ofrozen_set nid else ()) in
+          VObj nid)
+       else if str_eq name "freeze" then (let _ = ofrozen_set id in recv)
+       else if str_eq name "hash" then VInt (val_hash (mkstr (ucls ++ "#" ++ defined_as_name world ucls unm)))
+       else if str_eq name "frozen?" then VBool (ofrozen_get id)
+       // ...and the identity questions every object answers: #dup makes a NEW
+       // one, and `dup.equal?(m)` is how a spec says so
+       else if str_eq name "equal?" then
+         (match args with Cons (VObj o2, _) -> VBool (o2 == id) | _ -> VBool false)
+       else if str_eq name "object_id" || str_eq name "__id__" then VInt (1000000 + id * 8)
        else if str_eq name "inspect" || str_eq name "to_s" then
-         mkstr ("#<UnboundMethod: " ++ ucls ++ "#" ++ unm ++ ">")
+         // the OWNER, not the class it was extracted from: a method reached
+         // through a class but defined in a module reads as the module's
+         (let own9 = (let a9 = lookup_anc world (ancestors_of world ucls) unm in
+                      if str_eq a9 "" then ucls else a9) in
+          mkstr (meth_inspect_str world "UnboundMethod" own9 unm
+                   (bm_params world ucls unm) (meth_source_location world ucls unm VMain)))
        else if str_eq name "==" || str_eq name "eql?" then
          // two names for one builtin implementation are one method, so compare
          // through canon_alias (String#size == String#length).
@@ -25198,8 +25281,15 @@ and builtin_original_name = fn (cls: str) -> fn (n: str) ->
 // resolves through alias_srcname (that table records the pair at the moment the
 // name is made), and a builtin through the table above.
 and original_name_of = fn world -> fn (cls: str) -> fn (n: str) ->
-  if map_has alias_srcname (cls ++ "#" ++ n)
-  then (match map_get alias_srcname (cls ++ "#" ++ n) with s2 -> s2)
+  // an alias OF an alias names the first definition: the chain is walked, not
+  // stepped once (`alias bar foo; alias baz bar` -> baz's original is foo).
+  // Bounded by the chain length, and a cycle cannot be built with `alias`.
+  original_name_walk world cls n 32
+and original_name_walk = fn world -> fn (cls: str) -> fn (n: str) -> fn (fuel: int) ->
+  if fuel <= 0 then n
+  else if map_has alias_srcname (cls ++ "#" ++ n)
+  then (match map_get alias_srcname (cls ++ "#" ++ n) with
+        | s2 -> (if str_eq s2 n then n else original_name_walk world cls s2 (fuel - 1)))
   else builtin_original_name cls n
 
 and canon_alias = fn (cls: str) -> fn (n: str) ->
@@ -25272,6 +25362,9 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
   else if str_eq cls "Method" || str_eq cls "UnboundMethod" then
     (if str_eq n "eql?" then "=="
      else if str_eq n "to_s" then "inspect"
+     // #===, #[] and #() are #call under other names, and the specs compare
+     // exactly those UnboundMethods
+     else if str_eq n "===" || str_eq n "[]" || str_eq n "()" then "call"
      else n)
   else if str_eq cls "MatchData" || str_eq cls "Regexp" then
     (if str_eq n "eql?" then "=="
@@ -25398,9 +25491,13 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
     (str_eq cls "SizedQueue" && (str_eq name "max" || str_eq name "max=")) ||
     is_prim_method name
   else if str_eq cls "UnboundMethod" || str_eq cls "Method" then
-    str_eq name "bind" || str_eq name "bind_call" || str_eq name "call" ||
-    str_eq name "unbind" || str_eq name "owner" || str_eq name "arity" ||
-    str_eq name "name" || is_prim_method name
+    // ...every name the dispatcher answers, so `Method.instance_method(:===)`
+    // finds the one a spec compares with #call
+    builtin_obj_has cls name || is_prim_method name
+  // Comparable's own instance methods: `Comparable.instance_method(:clamp)`
+  // is how a spec reaches one, and bind_call runs it against a number.
+  else if str_eq cls "Comparable" then
+    str_eq name "clamp" || str_eq name "between?" || is_binary_op_name name || is_prim_method name
   // Symbol's own methods (the same set the zero-arity table lists for a
   // Symbol receiver), so `Symbol.instance_method(:size)` finds the method
   // whose pair with :length a spec compares.
@@ -41462,6 +41559,41 @@ and rx_named_pairs = fn (tbl: str) -> fn (nms: str list) ->
           Cons (arr_new (md_int_to_vals (md_nums_for (str_split tbl "|") nm)), rx_named_pairs tbl rest))
 and md_int_to_vals = fn (xs: int list) ->
   match xs with Nil -> Nil | Cons (h, t) -> Cons (VInt h, md_int_to_vals t)
+// `#<Method: A#foo(a, b=...) file:line>` / `#<UnboundMethod: ...>`: a class
+// method is written with a DOT, everything else with a hash, and a builtin has
+// no source to name.
+and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm: str) -> fn (params: Val) -> fn (loc: Val) ->
+  let base = (if is_sng_cls owner then cls_display world (sng_inner owner) ++ "." else cls_display world owner ++ "#") in
+  "#<" ++ kind ++ ": " ++ base ++ nm ++ "("
+  ++ (match params with VArr aid -> meth_params_str (deref aid) | _ -> "") ++ ")"
+  ++ (match loc with
+      | VArr aid2 -> (match deref aid2 with
+                      | Cons (VStr f9, Cons (VInt l9, _)) -> " " ++ sget f9 ++ ":" ++ str_of_int l9
+                      | _ -> "")
+      | _ -> "")
+  ++ ">"
+and meth_params_str = fn (ps: Val list) ->
+  match ps with
+  | Nil -> ""
+  | Cons (h, t) ->
+    (let one = (match h with
+                | VArr pid ->
+                  (match deref pid with
+                   | Cons (VSym k, Cons (VSym n, _)) ->
+                     (if str_eq k "req" then n
+                      else if str_eq k "opt" then n ++ "=..."
+                      else if str_eq k "rest" then "*" ++ n
+                      else if str_eq k "keyreq" then n ++ ":"
+                      else if str_eq k "key" then n ++ ": ..."
+                      else if str_eq k "keyrest" then "**" ++ n
+                      else if str_eq k "block" then "&" ++ n
+                      else n)
+                   | Cons (VSym k, _) ->
+                     (if str_eq k "rest" then "*" else if str_eq k "keyrest" then "**" else "_")
+                   | _ -> "_")
+                | _ -> "_") in
+     one ++ (match t with Nil -> "" | _ -> ", ") ++ meth_params_str t)
+
 and md_strs_len = fn (xs: str list) ->
   match xs with Nil -> 0 | Cons (_, t) -> 1 + md_strs_len t
 and md_first_non_sym = fn (xs: Val list) ->
