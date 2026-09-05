@@ -2320,47 +2320,41 @@ lines and then hung on line 91.
 which is why Time ranges compare, cover and refuse to walk exactly as ruby's
 do. The formatting is untouched.
 
-## A block leaks into the calls made inside it
+## A block used to leak into the calls made inside a proc (fixed)
 
     def w(&b); b.call; end
 
     (0...2**64).min(2)        # => [0, 1]
-    w { (0...2**64).min(2) }  # => []      <- mere-ruby
+    w { (0...2**64).min(2) }  # => []      <- mere-ruby, before
 
-A proc invoked through an `&b` parameter hands its frame's block to the calls
-inside its body, so a builtin that asks "was a block given?" sees one that was
-never passed. `yield` does not do this; `pr.call` at the top level does not
-either. It is `&b` + `#call` -- and every ruby/spec example runs in exactly
-that shape, which is why min_spec disagreed with the same expression typed at
-a prompt.
+A plain call -- no block literal, no `&` -- passed the FRAME's block on, so
+inside a proc invoked through an `&b` parameter every builtin that asks "was a
+block given?" saw one that was never passed. `yield` never had the problem
+(it runs the body under no block); `&b` + `#call` did, and every ruby/spec
+example runs in exactly that shape, which is why min_spec disagreed with the
+same expression typed at a prompt.
 
-The `encl` a block body runs under answers three questions at once: what
-`&param` binds to, what `yield` resolves to, and -- accidentally -- what block
-the body's own calls receive. The first two are already documented as distinct
-in `run_block`; the third is the one still shared.
+The fix is two lines: the receiver call's final dispatch hands `invoke_val_c`
+an empty block instead of `blk`. The frame block is still what `yield` reads.
+Twenty-nine block-sensitive builtins were checked in that shape before and
+after (they were already right, because the iterating path is chosen before
+the question is asked); corpus, rgtest, bundlertest, bootstraptest and a
+twelve-file spec sample did not move by one assertion. Corpus 181 pins the
+shape.
 
-Nothing else visibly depends on it today: twenty-nine builtin forms that
-change behaviour with a block (`sort`, `max`, `min`, `sum`, `first`, `count`,
-`minmax`, `group_by`, ...) were checked inside that shape and all answer
-correctly, because the iterating path is chosen before the question is asked.
-`Range#min(n)` / `#max(n)` were the exception only because a guard was added
-that asked it directly. That guard is gone; the leak is not.
+## `(0...Float::INFINITY).max` -- fixed, and a retraction
 
-## `(0...Float::INFINITY).max` answers Infinity
+This file said the one-branch fix took mere's type inference "from 73 seconds
+to over 10 minutes" and blamed a quadratic cliff. That was wrong. Re-timed in
+isolation the next morning, the same branch compiled in 77 seconds, in all
+three shapes tried (bind the flag only; a helper outside the chain; the inline
+form itself). The slow compiles had another cause -- most likely a compile
+orphaned by a timed-out command and still running while the next attempts
+were timed -- and "reverting made it fast again" coincided with that orphan
+finishing. The branch is in: an excluded infinite end is "cannot exclude non
+Integer end value", as ruby says.
 
-ruby raises `TypeError: cannot exclude non Integer end value` -- an excluded
-end has to be NAMED, and Infinity is not an Integer. mere-ruby reads an
-infinite end as merely "endless" and answers the end itself, which is not even
-in the range.
-
-The fix is one branch in the endless-range arm, and it is not applied: adding
-it (binding the exclusive flag and one nested `if` inside a match arm of an
-already very long `if`/`else if` chain) took mere's type inference from 73
-seconds to over 10 minutes on this file. The inference is quadratic, and this
-chain is where it shows. It is worth doing behind a helper function, out of
-the chain, rather than in it.
-
-## The mspec shim's mock ignores `.with`
+## The mspec shim's mock used to ignore `.with` (fixed)
 
     @x.should_receive(:<=>).with(@y).and_return(-1)
     @x.should_receive(:<=>).with(@x).and_return(0)
@@ -2374,3 +2368,102 @@ were real: `cmp_possible_w` reads a bare object as comparable with ITSELF
 to the world-free comparison, which raises. Two functions answering "can these
 compare?" and "what IS the comparison?" have to agree, or the first one's yes
 walks straight into the second one's raise.
+
+`.with(args)` is recorded now and `method_missing` answers from the first
+registration whose arguments match (one without `.with` matches any call).
+core/range/minmax_spec went from six shared errors to MATCH.
+
+## A singleton class is a second name for the same class
+
+    t = Time.utc(1970)
+    def t.succ; self + 1; end
+    t + 1                  # => "Integer can't be coerced into Object"  <- before
+    t == Time.utc(1970)    # => false                                    <- before
+
+`def t.succ` gives the object a singleton class, and from then on the
+bookkeeping name of its class is "(sng:111)" rather than "Time". Every place
+that compared the class name to the literal "Time" -- the operator table, the
+arithmetic arm, the primitive-equality list, the routing into the Time
+methods, the builtin `<=>` lookup -- stopped matching, and the object fell
+through to Object's answers. `display_cls` resolves a singleton to the class
+it stands for; those comparisons go through it now. ruby/spec's Range#each
+Time example is exactly this shape, and it is why the example was a TypeError.
+
+The same family: `[t1] == [t2]` and `[t1].include?(t2)` compared identity
+while `t1 == t2` alone was true, because the element search asked only the
+method table for a `==` and Time's is a primitive. `has_own_eq` answers both
+questions in one place now.
+
+## The `#succ` walk stepped past the end
+
+ruby's walk yields the END object itself when the walk reaches it and asks
+`#succ` no further. mere-ruby asked `#succ` of a value that merely EQUALLED
+the end and reached an object the end never was -- a Time one second on,
+without the singleton `#succ` the spec had defined on the end -- and raised
+NoMethodError where ruby was already done. At the end, the end is the last
+element.
+
+## `Range#bsearch` over doubles bisects the ORDINAL
+
+A double's sign, exponent and fraction read as one integer order exactly like
+the values do, so bisecting ordinals visits every double once and can land on
+Infinity (ordinal 2047 * 2^52) and Float::MAX (one below). Doubling outward
+from a finite point never got there: `(-inf..0.0).bsearch { true }` answered
+-1.8e19 after 64 doublings where ruby answers -Infinity, and an excluded
+infinite end was approached rather than refused.
+
+Two ordinals of opposite sign do not subtract: the difference between the
+ordinals of -Infinity and +Infinity does not fit an int, and `lo + (hi - lo)
+/ 2` produced a garbage midpoint, so `(-inf..inf).bsearch { |x| x >= 3 }`
+answered Infinity. The midpoint is `lo/2 + hi/2` (the float bisection had the
+same note for the same reason). When the bracket closes, the lowest candidate
+is asked directly, so a boundary that satisfies is the answer --
+`(1.0..3.0).bsearch { |x| 3.0 - x }` is 3.0, which a midpoint walk never
+lands on.
+
+## `Range#step` over Floats and Strings, and a zero step
+
+Float bounds on either side make an ArithmeticSequence, exactly as
+`1.0.step(2.0, 0.5)` does, and the block form walks `begin + i*step` for a
+count computed once. The exclusive count follows ruby_float_step_size: after
+flooring with the error allowance, one more term still counts if it lands
+strictly before the excluded end, so `(1.0...55.6).step(18.2)` has four terms
+(bugs.ruby-lang.org/issues/16612); the floor alone said three.
+
+A String range steps by `#succ` k times per yield, a Float step there is "no
+implicit conversion of Float into String", and without a block the result is
+a plain Enumerator (nothing is added). A zero step is refused when the
+sequence is MADE, block or not. A beginless numeric range makes the sequence
+(ruby/spec asks its class) and walking it is the TypeError; with a block ruby
+says "#step iteration for beginless ranges is meaningless" for every kind of
+end. A stray object as the step makes a plain Enumerator and is refused when
+walked.
+
+`(1..).step(Object.new).first(1)` is [1] in ruby (the begin is yielded before
+the step is ever added) and a TypeError here. Not in ruby/spec's unguarded
+set; left.
+
+## `ruby_version_is` is a no-op in the shim
+
+The shim skips every `ruby_version_is` block, on both sides. mere-ruby
+reports RUBY_VERSION 3.2.2 and the reference is 3.4.9, so honouring the
+guards would run DIFFERENT subsets on the two sides and the record would
+compare different examples. Skipping them is the cheaper asymmetry -- but it
+means the guarded examples (String `#step` with a String step, beginless
+`#step` refusals, `#to_int` conversions of a step) are unmeasured, not
+passing.
+
+## Ranges are values, so `dup` is the same object
+
+    r = (1..2)
+    r.dup.equal?(r)   # ruby false, mere-ruby true
+
+A Range is an immediate value here; `dup`, `clone` and `equal?` see one
+value. Giving ranges heap identity is a representation change, not a Range
+fix, and core/range/clone_spec and dup_spec are the two files it costs.
+
+## Time as a Hash key
+
+`{Time.utc(1970) => 1}[Time.utc(1970)]` is nil: Hash lookup uses `eql?` and
+`hash`, and Time's are still identity. Same family as `Time#inspect` and
+`#strftime`: the Time stub, not Range.

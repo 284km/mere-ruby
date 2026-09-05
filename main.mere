@@ -12649,10 +12649,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | _ -> VNil)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
        // assigned value as its expression result, not the writer's return.
+       // A call with no block literal and no `&` passes NO block. `blk` here
+       // is the FRAME's block -- the one this method or block body was itself
+       // given, which is what `yield` reads -- and handing it on made every
+       // builtin that asks "was a block given?" see one that was never passed.
+       // The frame block is present exactly when a proc is invoked through an
+       // `&b` parameter (`def w(&b); b.call; end`): inside `w { (0...2**64)
+       // .min(2) }` the arithmetic arm stood aside for a "given" block and the
+       // iterating path answered [], while the same expression at the prompt
+       // answered [0, 1]. Every ruby/spec example runs in that shape.
        else if is_setter_name name then
-         let _ = invoke_val_c env world blk recv name args vis in
+         let _ = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis in
          (match rev_app args Nil with Cons (v, _) -> v | Nil -> VNil)
-       else invoke_val_c env world blk recv name args vis)
+       else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv name args vis)
   | EMethodB (recv_e, name, arges, bp, bb) ->
     let recv = eval_e env world blk recv_e in
     let args = eval_args env world blk arges in
@@ -12792,8 +12801,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          invoke world noblk va0 ocl op (Cons (eval_e env world blk b, Nil))
        // a builtin-backed class may answer the operator without a method-table
        // entry: Time compares by its instant, and `t1 < t2` has to reach that
-       // rather than fall through to "no method".
-       else if builtin_obj_has ocl op then
+       // rather than fall through to "no method". Through a SINGLETON class as
+       // well: after `def t.succ` the object's class is "(sng:111)", and asking
+       // the builtin table under that name sent `t + 1` to the coercion path
+       // ("Integer can't be coerced into Object").
+       else if builtin_obj_has (display_cls world ocl) op then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // a yielder in a generator block: y << value.
        else if str_eq ocl "Enumerator::Yielder" && str_eq op "<<" then
@@ -12820,17 +12832,20 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // (not the meths table), so route the operator there rather than
        // falling through to rb_eq (which is object identity).
        else if (str_eq op "==" || str_eq op "eql?")
-               && (str_eq ocl "Enumerator::ArithmeticSequence" || str_eq ocl "Method" || str_eq ocl "UnboundMethod" || str_eq ocl "Time"
+               && (str_eq ocl "Enumerator::ArithmeticSequence" || str_eq ocl "Method" || str_eq ocl "UnboundMethod"
+                   // (a Time keeps being one behind a singleton class: `def t.x`
+                   // made `t == Time.utc(1970)` fall through to identity)
+                   || str_eq (display_cls world ocl) "Time"
                    || exc_is_a world ocl "Exception")
                && (if has_meth world ocl op then false else true) then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // Time's arithmetic is a primitive, not an entry in the method table.
-       else if str_eq ocl "Time" && (str_eq op "+" || str_eq op "-") then
+       else if str_eq (display_cls world ocl) "Time" && (str_eq op "+" || str_eq op "-") then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // an object with no operator of its own but a method_missing: ruby
        // dispatches the operator like any other message (a matcher's =~).
        else if (if str_eq op "==" || str_eq op "!=" || str_eq op "===" then false else true)
-               && has_meth world ocl "method_missing" && (if builtin_obj_has ocl op then false else true) then
+               && has_meth world ocl "method_missing" && (if builtin_obj_has (display_cls world ocl) op then false else true) then
          invoke world noblk va0 ocl "method_missing" (Cons (VSym op, Cons (eval_e env world blk b, Nil)))
        else eval_bin_prim env world blk op va0 (eval_e env world blk b)
      // a class-level operator (def self.<<) dispatches too.
@@ -14784,6 +14799,59 @@ and rng_bs_flt = fn world -> fn encl -> fn theblk -> fn (lo: float) -> fn (hi: f
     else if verd == 0 then rng_bs_flt world encl theblk lo mid mid true hi_ok (n - 1)
     else if verd == 5 then rng_bs_flt world encl theblk lo mid best found hi_ok (n - 1)
     else rng_bs_flt world encl theblk mid hi best found hi_ok (n - 1)
+// A double's ORDINAL: (biased exponent * 2^52 + fraction), negated for a
+// negative value, with -0.0 and 0.0 both at 0. Adjacent doubles are adjacent
+// ordinals, so a bisection over ordinals visits every double once and can
+// land on Infinity (ordinal 2047 * 2^52) and Float::MAX (one below it).
+and flt_ord = fn (x: float) ->
+  let (sg, e, fr) = flt_bits64 x in
+  let m = e * 4503599627370496 + fr in
+  if sg == 1 then 0 - m else m
+// ...and back: the exponent and fraction fields recovered by division, the
+// value rebuilt with ldexp (subnormals scale the fraction alone).
+and flt_of_ord = fn (o: int) ->
+  let neg = o < 0 in
+  let m = (if neg then 0 - o else o) in
+  let e = floor_div m 4503599627370496 in
+  let fr = floor_mod m 4503599627370496 in
+  let a = (if e >= 2047 then 1.0 / 0.0
+           else if e == 0 then ldexp (float_of_int fr) (0 - 1074)
+           else ldexp (1.0 + float_of_int fr / 4503599627370496.0) (e - 1023)) in
+  if neg then 0.0 - a else a
+// the search itself, over ordinals. Verdicts as in rng_bs_ask: 0 satisfies
+// (find-minimum keeps it and looks left), 1 looks right, 2 is an exact hit,
+// 3 the block broke, 4 a non-comparable answer, 5 looks left without an
+// answer. When the bracket closes, the lowest candidate is asked directly, so
+// a boundary that satisfies is the answer (`(1.0..3.0).bsearch { |x| 3.0 - x }`
+// is 3.0, which the midpoint walk never lands on).
+and rng_bs_ord = fn world -> fn encl -> fn theblk -> fn (lo: int) -> fn (hi: int) -> fn (best: int) -> fn (found: bool) -> fn (n: int) ->
+  if lo > hi then (if found then (VFlt (flt_of_ord best), false, VNil) else (VNil, false, VNil))
+  else if n <= 0 || lo == hi then
+    (let (v2, e2) = rng_bs_ask world encl theblk (VFlt (flt_of_ord lo)) in
+     if v2 == 3 then (VNil, true, e2)
+     else if v2 == 4 then rng_bs_type_err world e2
+     else if v2 == 2 || v2 == 0 then (VFlt (flt_of_ord lo), false, VNil)
+     else if found then (VFlt (flt_of_ord best), false, VNil)
+     else if lo < hi then
+       (let (v3, e3) = rng_bs_ask world encl theblk (VFlt (flt_of_ord hi)) in
+        if v3 == 3 then (VNil, true, e3)
+        else if v3 == 4 then rng_bs_type_err world e3
+        else if v3 == 2 || v3 == 0 then (VFlt (flt_of_ord hi), false, VNil)
+        else (VNil, false, VNil))
+     else (VNil, false, VNil))
+  else
+    // halves ADDED, not the difference halved: the ordinals of -Infinity and
+    // +Infinity are ±2047 * 2^52, and their difference does not fit an int --
+    // `(-inf..inf).bsearch { |x| x >= 3 }` answered Infinity off a garbage
+    // midpoint. (The float bisection had the same note for the same reason.)
+    let mid = floor_div lo 2 + floor_div hi 2 in
+    let (verd, extra) = rng_bs_ask world encl theblk (VFlt (flt_of_ord mid)) in
+    if verd == 3 then (VNil, true, extra)
+    else if verd == 4 then rng_bs_type_err world extra
+    else if verd == 2 then (VFlt (flt_of_ord mid), false, VNil)
+    else if verd == 0 then rng_bs_ord world encl theblk lo (mid - 1) mid true (n - 1)
+    else if verd == 5 then rng_bs_ord world encl theblk lo (mid - 1) best found (n - 1)
+    else rng_bs_ord world encl theblk (mid + 1) hi best found (n - 1)
 and rng_bs_flt_probe = fn world -> fn encl -> fn theblk -> fn (beg: float) -> fn (w: float) -> fn (n: int) ->
   if n <= 0 then beg + w
   else
@@ -14829,11 +14897,17 @@ and rng_bsearch = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (hi: Va
            else if v1 == 0 || v1 == 2 then (VFlt lof0, false, VNil)
            else (VNil, false, VNil)))
      else
-       (let hif = (if hi_endless
-                   then rng_bs_flt_probe world encl theblk (if lo_endless then 0.0 else lof0) 1.0 64
-                   else hif0) in
-        let lof = (if lo_endless then rng_bs_flt_probe_down world encl theblk hif 1.0 64 else lof0) in
-        rng_bs_flt world encl theblk lof hif 0.0 false (hi_endless || (if excl then false else true)) 400))
+       // Bisect the doubles by their ORDINAL -- sign, exponent and fraction
+       // read as one integer, which orders exactly like the values do -- so
+       // every double between the bounds, ±Infinity and ±Float::MAX included,
+       // is a probe point. Doubling outward from a finite point never reached
+       // them: `(-inf..0.0).bsearch { true }` answered -1.8e19 (64 doublings)
+       // where ruby answers -Infinity, and an excluded infinite end has to be
+       // recognised as the end and refused rather than approached.
+       (let lo_ord = flt_ord lof0 in
+        let hi_ord = (if excl then flt_ord hif0 - 1 else flt_ord hif0) in
+        if lo_ord > hi_ord then (VNil, false, VNil)
+        else rng_bs_ord world encl theblk lo_ord hi_ord 0 false 80))
   else
     (let loi = (match lo with VNil -> 0 - int_max | VInt n -> n | VBig b -> int_of_str b | _ -> 0) in
      let hii = (if hi_endless then rng_bs_int_probe world encl theblk loi 1 62
@@ -15424,6 +15498,49 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     (if str_eq name "bsearch" then
        (let (v9, broke9, bv9) = rng_bsearch world encl theblk lo hi excl in
         if broke9 then bv9 else v9)
+     // Range#reverse_each walks from the END, so it is the end that has to be
+     // there and the end whose class a refusal names. It answers the RANGE;
+     // going through the materialised array answered the array. An endless
+     // range has nothing to start from (a TypeError, not the RangeError of
+     // "cannot convert endless range to an array" -- nothing is converted); a
+     // BEGINLESS integer range counts down without end, so `(..5).reverse_each
+     // .take(3)` is [5, 4, 3]; and a begin that cannot be walked names its
+     // own class, with the world to name it (`class_name` reads any object as
+     // "Object", so Time was refused as "can't iterate from Object").
+     else if str_eq name "reverse_each" then
+       (match hi with
+        | VNil -> raise_exc world "TypeError" "can't iterate from NilClass"
+        | _ ->
+          (match lo with
+           | VNil ->
+             (match hi with
+              | VInt b -> iter_each_result (range_down world encl theblk (if excl then b - 1 else b) (0 - int_max)) recv
+              | _ -> raise_exc world "TypeError" "can't iterate from NilClass")
+           | _ ->
+             (if rng_is_int lo && rng_is_int hi then
+                iter_each_result (range_down world encl theblk (if excl then rng_int hi - 1 else rng_int hi) (rng_int lo)) recv
+              // a non-integer begin with an integer end is ruby's odd one out:
+              // the message names the END ("can't iterate from Integer")
+              else if rng_is_int hi && (match lo with VFlt _ -> true | _ -> false) then
+                raise_exc world "TypeError" "can't iterate from Integer"
+              else if (match lo with VFlt _ -> true | _ -> false) then
+                raise_exc world "TypeError" "can't iterate from Float"
+              else if (match lo with VObj _ -> true | _ -> false) && (if rng_is_succ_obj world lo hi then false else true) then
+                raise_exc world "TypeError" ("can't iterate from " ++ display_cls_msg world (dispatch_cls_of world lo))
+              else
+                (let els9 = (if rng_is_succ_obj world lo hi
+                             then rng_succ_vals world lo hi excl 0 Nil
+                             else range_vals world lo hi excl) in
+                 iter_each_result (arr_each world encl theblk (rev_vals els9)) recv))))
+     // `("A"..).each` walks #succ until the block breaks -- the end is missing,
+     // not unreachable. It went to the materialiser, which refused to convert
+     // an endless range to an array; nothing has to be converted to walk it.
+     else if str_eq name "each"
+             && (match lo with VStr _ -> true | _ -> false)
+             && (match hi with VNil -> true | _ -> false) then
+       (match lo with
+        | VStr slo -> iter_each_result (rng_str_each_endless world encl theblk (sget slo)) recv
+        | _ -> recv)
      // #min / #max with a COMPARATOR block still cannot walk an endless range
      // to the end, and ruby says so by naming the method: "cannot get the
      // minimum of endless range with custom comparison method". mere-ruby
@@ -15444,11 +15561,54 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
         then raise_exc world "RangeError" "cannot get the minimum of beginless range"
         else raise_exc world "RangeError"
                "cannot get the maximum of beginless range with custom comparison method")
+     // Range#step with a block over FLOAT bounds (either side, or a Float
+     // step) yields Floats: begin + i*step for i in 0..n, n counted once the
+     // way ruby counts it, so the walk neither drifts nor overshoots. An
+     // exclusive end drops the last value when it lands exactly on the end.
+     // This went to the integer walker, which refused a Float begin, and a
+     // zero step was walked as "no step" instead of refused.
+     else if str_eq name "step"
+             && ((match lo with VFlt _ -> true | _ -> false)
+                 || (match hi with VFlt _ -> true | _ -> false)
+                 || (match args with Cons (VFlt _, _) -> true | _ -> false))
+             && (match lo with VNil -> false | VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false)
+             && (match hi with VNil -> true | VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false) then
+       (let st9 = (match args with Cons (v9, _) -> to_f v9 | _ -> 1.0) in
+        if st9 == 0.0 then raise_exc world "ArgumentError" "step can't be 0"
+        else if st9 < 0.0 then recv
+        else
+          (let b9 = to_f lo in
+           let lim9 = (match hi with VNil -> 1.0 / 0.0 | _ -> to_f hi) in
+           iter_each_result (flt_step_x world encl theblk b9 lim9 st9 excl) recv))
+     else if str_eq name "step" && (match args with Cons (VInt 0, _) -> true | _ -> false) then
+       raise_exc world "ArgumentError" "step can't be 0"
+     // Range#step over STRINGS: every k-th element of the #succ walk, and the
+     // step has to be an Integer -- a Float is "no implicit conversion of
+     // Float into String". An endless String range walks until the block
+     // breaks. There was no arm at all: NoMethodError.
+     else if str_eq name "step" && (match lo with VStr _ -> true | _ -> false) then
+       (match args with
+        | Cons (VFlt _, _) -> raise_exc world "TypeError" "no implicit conversion of Float into String"
+        | _ ->
+          (let k9 = (match args with Cons (VInt k, _) -> k | Nil -> 1 | _ -> 1) in
+           if k9 <= 0 then raise_exc world "ArgumentError" ("step can't be " ++ (if k9 == 0 then "0" else "negative"))
+           else
+             (match hi with
+              | VNil -> (match lo with
+                         | VStr slo -> iter_each_result (rng_str_step_endless world encl theblk (sget slo) k9) recv
+                         | _ -> recv)
+              | _ -> iter_each_result (arr_each world encl theblk (every_kth (range_vals world lo hi excl) k9 0 Nil)) recv)))
+     // a BEGINLESS range has nothing to step from. With a block ruby says so in
+     // one sentence for every kind of end ("#step iteration for beginless
+     // ranges is meaningless"); without one, a numeric end still MAKES the
+     // sequence and only walking it raises -- that arm is in invoke_val_c.
+     else if str_eq name "step" && (match lo with VNil -> true | _ -> false) then
+       raise_exc world "ArgumentError" "#step iteration for beginless ranges is meaningless"
      else if rng_is_int lo && rng_hi_open hi then
        (let a = rng_int lo in
         if str_eq name "each" then iter_each_result (range_each world encl theblk a int_max) recv
         else if str_eq name "step" then
-          iter_each_result (range_step world encl theblk a int_max (match args with Cons (VInt n, _) -> n | _ -> 1)) recv
+          iter_each_result (range_step world encl theblk a int_max (rng_step_int world args)) recv
         else if (str_eq name "first" || str_eq name "take")
                 && (match args with Cons (VInt _, _) -> true | _ -> false) then
           (match args with
@@ -15463,7 +15623,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
         // (a..b).step(n) { } walks the range by n; without a block it is an
         // ArithmeticSequence (invoke_val_c), so this arm only ever has one.
         else if str_eq name "step" then
-          iter_each_result (range_step world encl theblk (rng_int lo) last (match args with Cons (VInt n, _) -> n | _ -> 1)) recv
+          iter_each_result (range_step world encl theblk (rng_int lo) last (rng_step_int world args)) recv
         else if str_eq name "map" || str_eq name "collect" then iter_result (range_map world encl theblk (rng_int lo) last Nil) recv
         else builtin_iter world encl theblk (arr_new (range_to_a (rng_int lo) last)) name args)
      else
@@ -15627,6 +15787,16 @@ and flt_step = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: flo
   if st == 0.0 then (let _ = prim_raise "ArgumentError" "step can't be 0" in FNext VNil)
   else
     let n = flt_floor ((lim - b) / st + 0.000000000001) in
+    flt_step_go world encl theblk b st 0 n
+
+// ...and the same walk for a RANGE, which may exclude its end: the last value
+// is dropped when it lands on the end exactly. An infinite end walks until the
+// block breaks.
+and flt_step_x = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: float) -> fn (st: float) -> fn (excl: bool) ->
+  if flt_is_inf lim then flt_step_go world encl theblk b st 0 int_max
+  else
+    let n0 = flt_floor ((lim - b) / st + 0.000000000001) in
+    let n = (if excl && b + float_of_int n0 * st >= lim then n0 - 1 else n0) in
     flt_step_go world encl theblk b st 0 n
 
 and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: float) -> fn (i: int) -> fn (n: int) ->
@@ -15827,6 +15997,37 @@ and range_each = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: in
   else (match run_block world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         | _ -> range_each world encl theblk (i + 1) last)
+
+// The step of an integer walk: an Integer, 1 when absent, and a TypeError for
+// anything else -- which is when ruby complains about `(1..2).step(Object.new)`:
+// the Enumerator is made without a word, and the walk says "Object can't be
+// coerced into Integer". Reading a stray object as 1 walked it silently.
+and rng_step_int = fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> 1
+  | Cons (VInt n, _) -> n
+  | Cons (v, _) ->
+    (let _ = raise_exc world "TypeError"
+               (display_cls_msg world (dispatch_cls_of world v) ++ " can't be coerced into Integer") in 1)
+
+// ("A"..).step(k) { }: every k-th #succ, forever, until the block breaks.
+and rng_str_step_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (k: int) ->
+  match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+  | FBreak v -> FBreak v | FReturn v -> FReturn v
+  | _ -> rng_str_step_endless world encl theblk (str_succ_n cur k) k
+and str_succ_n = fn (cur: str) -> fn (k: int) ->
+  if k <= 0 then cur else str_succ_n (str_succ cur) (k - 1)
+// every k-th element of a list, starting with the first
+and every_kth = fn (xs: Val list) -> fn (k: int) -> fn (i: int) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> rev_app acc Nil
+  | Cons (h, t) -> every_kth t k (i + 1) (if floor_mod i k == 0 then Cons (h, acc) else acc)
+
+// ("A"..).each { }: #succ forever, until the block breaks (or returns).
+and rng_str_each_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
+  match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+  | FBreak v -> FBreak v | FReturn v -> FReturn v
+  | _ -> rng_str_each_endless world encl theblk (str_succ cur)
 
 // n.downto(m) { |i| }: descending.
 and range_down = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
@@ -16426,10 +16627,22 @@ and coerce_dyck_go = fn env -> fn world -> fn (conv: str) -> fn (args: Val list)
 // no #inspect fall back to the default rendering. (Lives in this rec group so
 // it can reach has_meth / invoke.)
 // `a == b` with a dispatched to its own == when it defines one.
+// Does this object answer == for ITSELF -- a method-table entry, or a class
+// whose == is a primitive (Time compares by its instant)? Both have to be
+// dispatched rather than read as identity: `[t1] == [t2]` and `[t1].include?
+// (t2)` compared identity and said false while `t1 == t2` alone was true,
+// because the element search only asked the method table.
+and has_own_eq = fn world -> fn (v: Val) ->
+  match v with
+  | VObj _ ->
+    (let c = dispatch_cls_of world v in
+     has_meth world c "==" || str_eq (display_cls world c) "Time")
+  | _ -> false
+
 and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
   match a with
   | VObj _ ->
-    if has_meth world (dispatch_cls_of world a) "=="
+    if has_own_eq world a
     then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
     else rb_eq a b
   // a NUMERIC receiver reverses the question when the other side is an object
@@ -16454,7 +16667,7 @@ and elem_has_user_eq = fn world -> fn (xs: Val list) ->
   | Nil -> false
   | Cons (h, t) ->
     (match h with
-     | VObj _ -> if has_meth world (dispatch_cls_of world h) "==" then true else elem_has_user_eq world t
+     | VObj _ -> if has_own_eq world h then true else elem_has_user_eq world t
      // one level in, for the pairs assoc/rassoc look at — and no deeper, or a
      // self-referential array (a = []; a << a) would never bottom out.
      | VArr aid -> if shallow_has_user_eq world (deref aid) then true else elem_has_user_eq world t
@@ -16465,7 +16678,7 @@ and shallow_has_user_eq = fn world -> fn (xs: Val list) ->
   | Nil -> false
   | Cons (h, t) ->
     (match h with
-     | VObj _ -> if has_meth world (dispatch_cls_of world h) "==" then true else shallow_has_user_eq world t
+     | VObj _ -> if has_own_eq world h then true else shallow_has_user_eq world t
      | _ -> shallow_has_user_eq world t)
 
 // `frozen_array.delete(x)` where x is NOT there changes nothing, and ruby's
@@ -17114,10 +17327,72 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // an ArithmeticSequence like the Integer form, and its size is
          // COUNTED (aseq_size_flt) rather than walked.
          | VFlt _ -> true
-         | VRange (lo, hi, _) -> rng_is_int lo && (rng_is_int hi || rng_hi_open hi)
+         // ...and a Range with a FLOAT bound on either side: `(1.0..2.0).step(0.5)`
+         // is an ArithmeticSequence too, and it went to the leaf, which
+         // answered an empty Array.
+         | VRange (lo, hi, _) ->
+           (rng_is_int lo || (match lo with VFlt _ -> true | _ -> false)
+            // a BEGINLESS numeric range makes the sequence too (its class is
+            // the answer ruby/spec asks for); walking it is the TypeError.
+            || ((match lo with VNil -> true | _ -> false) && (rng_is_int hi || (match hi with VFlt _ -> true | _ -> false))))
+           && (rng_is_int hi || rng_hi_open hi || (match hi with VFlt _ -> true | _ -> false))
+         | _ -> false)
+     // ...and the step itself has to be a NUMBER (or the keyword hash): with
+     // anything else ruby hands back a plain Enumerator and complains only when
+     // it is walked, so `(1..2).step(Object.new).class` is Enumerator.
+     && (match args0 with
+         | Nil -> true
+         | Cons (VInt _, _) -> true | Cons (VFlt _, _) -> true | Cons (VBig _, _) -> true
+         | Cons (VHsh _, _) -> true
          | _ -> false)
      && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
   then aseq_of world recv0 args0
+  else if str_eq name0 "step"
+          && (match recv0 with VRange (_, _, _) -> true | VInt _ -> true | VFlt _ -> true | _ -> false)
+          && (match args0 with Cons (VObj _, _) -> true | _ -> false)
+          && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true)) then
+    make_enum_a world recv0 "step" args0
+  // ...and a beginless range with a NON-numeric end has no sequence to make.
+  else if str_eq name0 "step"
+          && (match recv0 with
+              | VRange (VNil, hi9, _) -> (match hi9 with VNil -> false | VInt _ -> false | VBig _ -> false | VFlt _ -> false | _ -> true)
+              | _ -> false) then
+    (match args0 with
+     | Nil -> raise_exc world "ArgumentError" "step is required for non-numeric ranges"
+     | _ -> raise_exc world "ArgumentError" "#step for non-numeric beginless ranges is meaningless")
+  // Range#step over STRINGS with no block is a plain Enumerator (not an
+  // arithmetic sequence -- nothing is added), driven by the block form below.
+  // It reached the leaf, which answered an Array of one Integer.
+  else if str_eq name0 "step"
+          && (match recv0 with VRange (VStr _, _, _) -> true | _ -> false)
+          && (let (mm9, _, _, _) = world in (if map_has mm9 "Range#step" then false else true)) then
+    (match args0 with
+     | Cons (VFlt _, _) -> raise_exc world "TypeError" "no implicit conversion of Float into String"
+     | _ -> make_enum_a world recv0 "step" args0)
+  // Range#initialize asked BY NAME (`Range.allocate.send(:initialize, 0, 1)`,
+  // which ruby/spec does). A built range is frozen, so re-initialising it is a
+  // FrozenError; an allocated-but-empty one takes 2 or 3 arguments whose
+  // endpoints compare, exactly as the literal does. There was no method to
+  // reach, so every form was a NoMethodError.
+  else if str_eq name0 "initialize"
+          && (match recv0 with
+              | VRange (_, _, _) -> true
+              | VObj _ -> str_eq (dispatch_cls_of world recv0) "Range"
+              | _ -> false) then
+    (match recv0 with
+     | VRange (_, _, _) ->
+       raise_exc world "FrozenError" ("can't modify frozen Range: " ++ inspect_w env world recv0)
+     | _ ->
+       (let n9 = val_list_len args0 in
+        if n9 < 2 || n9 > 3 then
+          raise_exc world "ArgumentError"
+            ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected 2..3)")
+        else
+          (match args0 with
+           | Cons (lo9, Cons (hi9, _)) ->
+             (if rng_bad_bounds world lo9 hi9 then raise_exc world "ArgumentError" "bad value for range"
+              else VNil)
+           | _ -> VNil)))
   // Range#min(n) / #max(n): arithmetic on integer endpoints, and a refusal on
   // anything else. Enumerating was both wrong (a bignum end answered []) and
   // unbounded (an endless range never returned).
@@ -18085,8 +18360,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | _ -> VNil)
   // Time instance methods. The object carries a single ordinal, so the zone
   // conversions are identity and #to_i hands the ordinal back.
+  // ...and it stays a Time after `def t.succ`: that gives the object a
+  // SINGLETON class, "(sng:111)", and comparing the bookkeeping name to "Time"
+  // then failed, so `t + 1` fell through to Object and reported "Integer can't
+  // be coerced into Object". display_cls resolves the singleton to the class
+  // it stands for; ruby/spec's Range#each Time example is exactly this shape.
   else if (match recv with
-           | VObj oid -> (let (_, _, ocls9, _) = world in str_eq (map_get ocls9 (str_of_int oid)) "Time")
+           | VObj oid -> (let (_, _, ocls9, _) = world in str_eq (display_cls world (map_get ocls9 (str_of_int oid))) "Time")
            | _ -> false)
           && (str_eq name "utc" || str_eq name "getutc" || str_eq name "localtime"
               || str_eq name "getlocal" || str_eq name "round" || str_eq name "to_i"
@@ -18113,7 +18393,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           match args with
           | Cons (VObj oid2, _) ->
             (let (_, _, ocls2, _) = world in
-             if str_eq (map_get ocls2 (str_of_int oid2)) "Time" then
+             if str_eq (display_cls world (map_get ocls2 (str_of_int oid2))) "Time" then
                (let y = (match prim_time_epoch world (VObj oid2) with VInt n -> n | _ -> 0) in
                 let d = (if x < y then 0 - 1 else if y < x then 1 else 0) in
                 if str_eq name "==" || str_eq name "eql?" then VBool (d == 0)
@@ -21028,6 +21308,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              else (match args with
                    | Cons (VInt k, _) -> arr_new (aseq_terms (bi + (if n - k > 0 then n - k else 0) * si) si (if k < n then k else n))
                    | _ -> if n == 0 then VNil else VInt (bi + (n - 1) * si)))
+          | (VNil, _, _) -> raise_exc world "TypeError" "nil can't be coerced into Integer"
           | (_, VNil, _) -> (if str_eq name "size" then VFlt (1.0 / 0.0) else raise_exc world "RangeError" "cannot get the last element of endless arithmetic sequence")
           | _ ->
             // A numeric triple with a Float in it is COUNTED, never walked.
@@ -21112,6 +21393,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | VHsh _ -> true | _ -> false) then
          (match map_get ivars (str_of_int id ++ "@recv") with
           | VHsh rh9 -> VInt (hash_len (hderef rh9))
+          | _ -> VNil)
+       // an enumerator over a RANGE knows its size the way the range does:
+       // arithmetic for integer bounds (Infinity when endless), nil for a
+       // non-numeric range -- `("a".."c").each.size` is nil, not 3, and so is
+       // `("a".."z").reverse_each.size`. Materialising answered the count of
+       // what a walk happened to produce.
+       else if (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                | VRange (_, _, _) -> true | _ -> false)
+               && (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
+                   | VStr mh -> str_eq (sget mh) "each" || str_eq (sget mh) "reverse_each"
+                   | _ -> false) then
+         (match map_get ivars (str_of_int id ++ "@recv") with
+          | VRange (lo9, hi9, ex9) ->
+            // #each starts at the begin and #reverse_each at the end, so the
+            // missing bound that makes each of them impossible is the other
+            // one: `(..3).each.size` is a TypeError and `(..5).reverse_each
+            // .size` is Infinity, and vice versa for `(1..)`.
+            (let rev9 = (match map_get ivars (str_of_int id ++ "@meth") with VStr mh -> str_eq (sget mh) "reverse_each" | _ -> false) in
+             let lo_open9 = (match lo9 with VNil -> true | _ -> false) in
+             let hi_open9 = rng_hi_open hi9 || (match hi9 with VNil -> true | _ -> false) in
+             if rev9 && hi_open9 then raise_exc world "TypeError" "can't iterate from NilClass"
+             else if (if rev9 then false else true) && lo_open9 then raise_exc world "TypeError" "can't iterate from NilClass"
+             else
+               (match lo9 with
+                | VInt _ -> (if hi_open9 then VFlt (1.0 / 0.0) else rng_int_span (rng_int_side lo9) (rng_int_top hi9 ex9))
+                | VBig _ -> (if hi_open9 then VFlt (1.0 / 0.0) else rng_int_span (rng_int_side lo9) (rng_int_top hi9 ex9))
+                // beginless, asked from the END (reverse_each): an Integer end
+                // counts down forever; anything else names the end's class
+                | VNil -> (match hi9 with
+                           | VInt _ -> VFlt (1.0 / 0.0)
+                           | VBig _ -> VFlt (1.0 / 0.0)
+                           | _ -> raise_exc world "TypeError" ("can't iterate from " ++ class_name hi9))
+                | VFlt _ -> raise_exc world "TypeError"
+                              ("can't iterate from " ++ (if rng_is_int hi9 then "Integer" else "Float"))
+                | _ -> VNil))
           | _ -> VNil)
        else
          (match enum_to_arr env world blk id with
@@ -25426,14 +25742,22 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (match recv with VRange (lo, hi, _) -> rng_is_int lo && rng_hi_open hi | _ -> false)
      && range_delegate_name name then
     (match recv with
-     | VRange (lo, hi, _) ->
+     | VRange (lo, hi, ex0) ->
        (let a = rng_int lo in
         // `1..Float::INFINITY` has a maximum and `1..` does not; neither has
         // a last element, and neither may be materialised.
         if str_eq name "max" || str_eq name "minmax" then
           (match hi with
            | VNil -> prim_raise "RangeError" "cannot get the maximum of endless range"
-           | _ -> if str_eq name "max" then hi else arr_new (Cons (VInt a, Cons (hi, Nil))))
+           // ...but an EXCLUDED end still has to be named, and Infinity is not
+           // an Integer: `(0...Float::INFINITY).max` is ruby's "cannot exclude
+           // non Integer end value". Reading an infinite end as merely
+           // "endless" skipped that rule and answered Infinity, which is not
+           // even in the range.
+           | _ ->
+             (if ex0 then prim_raise "TypeError" "cannot exclude non Integer end value"
+              else if str_eq name "max" then hi
+              else arr_new (Cons (VInt a, Cons (hi, Nil)))))
         else if str_eq name "last" && (match args with Nil -> true | _ -> false) then
           prim_raise "RangeError" "cannot get the last element of endless range"
         else if (str_eq name "first" || str_eq name "take") && (match args with Cons (VInt _, _) -> true | _ -> false) then
@@ -28196,7 +28520,9 @@ and cmp_possible_w = fn world -> fn (a: Val) -> fn (b: Val) ->
      // "comparable with anything" and `(t1..t2).include?(1)` came back as an
      // ArgumentError from cmp_vals instead of false. The dispatch is guarded:
      // an operator that refuses is a refusal to compare, not an error here.
-     else if builtin_obj_has ocl "<=>" then
+     // (through a SINGLETON class too: `def t.succ` renames the object's class
+     // to "(sng:...)", and the builtin table is keyed by the real name)
+     else if builtin_obj_has (display_cls world ocl) "<=>" then
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
         match try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world nb9 a "<=>" (Cons (b, Nil)) false) VNil with
         | VInt _ -> true
@@ -28390,6 +28716,12 @@ and rng_succ_vals = fn world -> fn (cur: Val) -> fn (hi: Val) -> fn (excl: bool)
     (let d9 = cmp_vals_w world cur hi in
      if d9 > 0 then rev_app acc Nil
      else if excl && d9 == 0 then rev_app acc Nil
+     // at the end, the END is the last element and #succ is NOT asked again:
+     // ruby yields the end object itself. Asking succ of a value that merely
+     // EQUALS the end reached an object the end never was -- a Time one second
+     // on, without the singleton #succ the spec had defined on the end -- and
+     // raised NoMethodError where ruby was already done.
+     else if d9 == 0 then rev_app (Cons (cur, acc)) Nil
      else
        // gc_cenv0 is the shared placeholder cenv the other world-level
        // helpers use: dispatching #succ needs an env only to build a blk.
@@ -30655,7 +30987,7 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // a synthetic class's methods live in the primitive dispatcher, not the
        // method table, so an implicit-self call inside a reopened Time (or
        // MatchData, ...) has to be routed there too.
-       else if str_eq cls "Time" || str_eq cls "MatchData" then invoke_val_c env world noblk (VObj id) name args false
+       else if str_eq (display_cls world cls) "Time" || str_eq cls "MatchData" then invoke_val_c env world noblk (VObj id) name args false
        else undef_call_exc world (blamed (VObj id)) name args
      | VMain ->
        if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false)
@@ -35718,7 +36050,17 @@ and aseq_size_flt = fn (bf: float) -> fn (ef: float) -> fn (sf: float) -> fn (ex
       (if n <= 0.0 then VInt 0
        else if n < 1.0 then VInt 1
        else (let k = n - err in
-             if k >= 9.0e18 then VFlt (k + 1.0) else VInt (flt_floor k + 1)))
+             if k >= 9.0e18 then VFlt (k + 1.0)
+             else
+               // ruby's ruby_float_step_size: after flooring with the error
+               // allowance, one more term still counts if it lands strictly
+               // before the excluded end -- `(1.0...55.6).step(18.2)` has FOUR
+               // terms, the last 55.599999999999994, and the floor alone said
+               // three (bugs.ruby-lang.org/issues/16612).
+               (let n0 = flt_floor k in
+                let d = float_of_int (n0 + 1) * sf + bf in
+                let n1 = (if (bf < ef && d < ef) || (bf > ef && d > ef) then n0 + 1 else n0) in
+                VInt (n1 + 1))))
     else
       (if n < 0.0 then VInt 0
        else (let k = n + err in
@@ -35753,8 +36095,24 @@ and aseq_pct = fn world -> fn (recv: Val) -> fn (args: Val list) ->
 and aseq_of = fn world -> fn (recv: Val) -> fn (args: Val list) ->
   match recv with
   | VRange (lo, hi, excl) ->
-    let st = (match args with Cons (VInt n, _) -> VInt n | _ -> VInt 1) in
-    make_aseq world recv args (VInt (rng_int lo)) (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl
+    let st = (match args with Cons (VInt n, _) -> VInt n | Cons (VFlt f, _) -> VFlt f | _ -> VInt 1) in
+    // a zero step is refused when the sequence is MADE, not when it is walked:
+    // `(1..5).step(0)` is an ArgumentError with or without a block.
+    let _ = (match st with
+             | VInt 0 -> raise_exc world "ArgumentError" "step can't be 0"
+             | VFlt f -> (if f == 0.0 then raise_exc world "ArgumentError" "step can't be 0" else VNil)
+             | _ -> VNil) in
+    // Float bounds (either side) make a Float sequence, exactly as
+    // `1.0.step(2.0, 0.5)` does: make_aseq takes the values as they are.
+    (match lo with
+     | VFlt _ -> make_aseq world recv args lo (if rng_hi_open hi then VNil else hi) st excl
+     | _ ->
+       (match hi with
+        | VFlt _ -> (if rng_hi_open hi then make_aseq world recv args (match lo with VNil -> VNil | _ -> VInt (rng_int lo)) VNil st excl
+                     else make_aseq world recv args (match lo with VNil -> VNil | _ -> VInt (rng_int lo)) hi st excl)
+        // (a beginless range keeps its nil begin: the sequence exists, and
+        // walking it is what raises)
+        | _ -> make_aseq world recv args (match lo with VNil -> VNil | _ -> VInt (rng_int lo)) (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl))
   | VInt _ -> aseq_of_num world recv args recv
   | VFlt _ -> aseq_of_num world recv args recv
   | _ -> VNil

@@ -431,10 +431,17 @@ def include(*members); IncludeMatcher.new(members); end
 # A minimal mock: records should_receive expectations (parallel arrays —
 # the host may lack mutable hashes) and answers via method_missing.
 class MockExpectation
-  def initialize(sym); @sym = sym; @value = nil; end
+  def initialize(sym); @sym = sym; @value = nil; @with = nil; end
   def and_return(v); @value = v; self; end
   def and_raise(*a); self; end
-  def with(*a); self; end
+  # `.with(args)` narrows the expectation to those arguments. Ignoring it made
+  # every registration for a symbol answer from the FIRST one: a mock with
+  # `should_receive(:<=>).with(@y).and_return(-1)` and
+  # `.with(@x).and_return(0)` compared equal to nothing, and six of
+  # core/range/minmax_spec's nine examples errored -- under ruby too, since
+  # the shim is the same file on both sides.
+  def with(*a); @with = a; self; end
+  def matches?(args); @with.nil? || @with == args; end
   def twice; self; end
   def once; self; end
   def at_least(*a); self; end
@@ -461,9 +468,11 @@ class MockObject
     MockExpectation.new(sym)
   end
   def method_missing(sym, *args)
+    # the first registration for this symbol whose `.with` (if any) matches
+    # the arguments; a registration without `.with` matches any call.
     i = 0
     while i < @syms.length
-      return @exps[i].value if @syms[i] == sym
+      return @exps[i].value if @syms[i] == sym && @exps[i].matches?(args)
       i += 1
     end
     nil
