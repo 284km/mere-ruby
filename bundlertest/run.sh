@@ -8,7 +8,7 @@
 #
 #   ./bundlertest/run.sh <stdlib-dir> <gem-home>
 #
-# e.g. .../lib/ruby/3.2.0 and .../lib/ruby/gems/3.2.0
+# e.g. .../lib/ruby/4.0.0 and .../lib/ruby/gems/4.0.0
 #
 # Every step agrees now, `setup` included -- it is the last one to have. It went
 # thor's caller[1], then comparison through a user <=>, then module_function's
@@ -27,19 +27,26 @@ gem_home="${2:?usage: run.sh <stdlib-dir> <gem-home>}"
 [ -f "$stdlib/rubygems.rb" ] || { echo "no rubygems.rb under $stdlib"; exit 2; }
 RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
 export RUBYOPT
-# setup: bundler 2.6.9 (the one ruby 3.4 ships) takes a path 2.4.10 did not --
-# `require "bundled_gems"`, guarded by `rescue LoadError`, for the Ruby 3.3+
-# warning about gems leaving the stdlib. mere-ruby cannot load that file and
-# fails with NoMethodError instead, which the rescue does not catch, so setup
-# raises where ruby answers :ok. Two things would each unblock it and they are
-# not the same fix: raising LoadError for a file it cannot load (bundler would
-# then carry on, as it does on any older ruby), or loading the file. Recorded
-# in KNOWN_GAPS.md.
+# NOTHING is expected to diverge here as of 2026-09-05: every step -- reading
+# the Gemfile, resolving it, building the definition, and setting up the load
+# paths -- answers what ruby answers, with the reference's own rubygems 4.0.16
+# and bundler 4.0.16 on both sides. Set DIVERGING to a step name when the next
+# boundary appears; the gate fails either way (a recorded divergence that
+# starts agreeing is reported as RETIRE, so the record cannot go stale).
 #
-# `versions` RETIRED here on 2026-09-04: with 3.4.9 as the reference both sides
-# answer ["3.6.9", "2.6.9"], because the newest installed bundler is also the
-# one ruby activates. The gate said so itself rather than being asked.
-DIVERGING="setup"
+# `setup` was the last to go, and the move to ruby 4.0.6 cost it three
+# separate causes in one day: rubygems 4's vendored uri defines a constant in
+# a `class << self` body and reads it from a method defined there (the def
+# recorded the enclosing class as its scope); bundler's materialization sorts
+# candidates with `sort_by.with_index`, which answered [spec, index] pairs
+# because with_index materialised and re-ran instead of wrapping the block;
+# and bundled_gems.rb reads `RbConfig::CONFIG["rubylibdir"]`, a key this
+# interpreter's stand-in RbConfig did not have, and adds "/" to nil.
+#
+# `versions` RETIRED on 2026-09-04: with the reference's own rubygems and
+# bundler on both sides they answer the same pair. The gate said so itself
+# rather than being asked.
+DIVERGING=""
 
 run() {  # $1 = interpreter command line
   GEM_HOME="$gem_home" GEM_PATH="$gem_home" \

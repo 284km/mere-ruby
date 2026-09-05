@@ -24,12 +24,13 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 # real and is not a defect: two platforms' constants, correctly reported by
 # each. Comparing like with like means running where the identity it claims is
 # true -- and, for the same reason, beside the ruby VERSION it claims to be.
-# main.mere reports `ruby 3.2.2`; ruby 3.4 changed Hash#inspect to put spaces
-# around `=>`, so a newer oracle reports `{"k" => nil}` where this reports
-# `{"k"=>nil}`. And 3.2.11 stopped warning on a `$=` read where 3.2.2 still
-# warns -- a difference inside one minor version. Every axis of the string this
-# reports has to match, so CI pins the oracle to exactly 3.2.2 on darwin. None
-# of those three differences was a defect on either side.
+# main.mere reports `ruby 4.0.6` (tools/ref_ruby.sh names the same version,
+# and every gate sources it). The oracle has to be that release: 3.4 changed
+# Hash#inspect to put spaces around `=>`, 4.0 prints a Set as `Set[1, 2]`, and
+# 3.2.11 stopped warning on a `$=` read where 3.2.2 still warned -- a
+# difference inside one minor version. Every axis of the string this reports
+# has to match, so CI pins the oracle to exactly 4.0.6 on darwin. None of those
+# differences was a defect on either side.
 ./mere-ruby script.rb
 ./run_corpus.sh     # diff every corpus/*.rb against the real ruby
 ./clitest/run.sh    # diff the driver's argv handling against the real ruby

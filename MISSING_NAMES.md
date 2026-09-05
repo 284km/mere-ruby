@@ -30,8 +30,8 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 288 of 1403 names
-  IO (47): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? external_encoding fcntl fdatasync for_fd foreach fsync internal_encoding ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
+ABSENT: 282 of 1413 names
+  IO (44): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd foreach fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
   File (39): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime empty? executable_real? flock ftype grpowned? identical? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readable_real? readlink rename setgid? setuid? socket? stat sticky? symlink truncate umask utime world_readable? world_writable? writable_real? zero?
   Kernel (32): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? caller caller_locations define_singleton_method format gem gem_original_require global_variables iterator? lambda load local_variables open printf proc rand respond_to_missing? set_trace_func singleton_method sprintf test then trace_var untrace_var yield_self
   Time (31): asctime ceil ctime deconstruct_keys dst? floor friday? getgm gmt? gmt_offset gmtime gmtoff isdst iso8601 monday? nsec saturday? strftime subsec sunday? thursday? to_a to_r tuesday? tv_nsec tv_sec tv_usec utc_offset wednesday? xmlschema zone
@@ -46,7 +46,6 @@ ABSENT: 288 of 1403 names
   ObjectSpace (6): _id2ref count_objects define_finalizer each_object garbage_collect undefine_finalizer
   Enumerator (4): feed produce product with_object
   Enumerable (4): inject reduce slice_after slice_before
-  Symbol (3): all_symbols id2name name
   Method (3): << >> curry
   Random (3): new_seed seed urandom
   Integer (2): ceildiv try_convert
@@ -55,11 +54,11 @@ ABSENT: 288 of 1403 names
   String (1): append_as_bytes
   Array (1): fetch_values
   Hash (1): rehash
-  Range (1): overlap?
+  Symbol (1): all_symbols
   Proc (1): ==
   Numeric (1): singleton_method_added
 
-SEND-ONLY: 21 of 1403 names
+SEND-ONLY: 21 of 1413 names
   Process (6): egid= euid= gid= groups= maxgroups= uid=
   IO (5): autoclose= close_on_exec= lineno= pos= timeout=
   Kernel (3): public_send respond_to? send
@@ -71,11 +70,21 @@ SEND-ONLY: 21 of 1403 names
   Thread (1): ignore_deadlock=
 ```
 
+2026-09-05: 282 ABSENT of 1413, against ruby **4.0.6** (the reference moved; see
+tools/ref_ruby.sh). The denominator grew by the ten names 4.0 added -- Array#find,
+#detect and #rfind as Array's own, Kernel#Pathname and Kernel.Pathname,
+Kernel#instance_variables_to_inspect, Math.log1p and .expm1, Method#box,
+Range#to_set -- and none of the ten is absent. The numerator fell by six that
+this file had not been re-measured for since 232c169 (IO#external_encoding,
+#internal_encoding, #set_encoding, Range#overlap?, Symbol#id2name, #name):
+the row before this one was measured on an older binary. Pinned to 4.0.6 from
+here on.
+
 2026-09-04 (later): 288 ABSENT of 1403. The count went UP by ten and nothing
 regressed: the earlier run's list had 1389 names because it was taken from a
 different ruby. This file's numerator and denominator are both measured, and
 only the denominator is ruby's -- so a row is comparable with the one above it
-only when the reference is the same. Pinned to 3.4.9 from here on.
+only when the reference is the same. Pinned to 3.4.9 from here on (4.0.6 above).
 
 2026-09-04: 298 -> 278 ABSENT. Math is libm's now, through `extern fn` -- the
 identities that derive it from the builtins are exact in real arithmetic and

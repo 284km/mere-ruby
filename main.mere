@@ -333,6 +333,9 @@ extern fn atanh: float -> float;
 extern fn cbrt: float -> float;
 extern fn log2: float -> float;
 extern fn log10: float -> float;
+// ruby 4.0 added Math.log1p / Math.expm1; libm has had them all along.
+extern fn log1p: float -> float;
+extern fn expm1: float -> float;
 extern fn erf: float -> float;
 extern fn erfc: float -> float;
 extern fn tgamma: float -> float;
@@ -1242,7 +1245,7 @@ let cli_opt = map_new ();
 // from it. Two copies would be free to drift, and a library that parses
 // `ruby -v` and one that reads RUBY_DESCRIPTION have to agree -- they are the
 // same claim asked twice.
-let ruby_desc = "ruby 3.2.2 (2023-03-30 revision e51014f9c0) [arm64-darwin22]";
+let ruby_desc = "ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]";
 // ONE place for the usage line: -h prints it and so does a bare invocation.
 // The invalid-option message points at -h, so -h has to exist -- a diagnostic
 // that names a flag the binary does not have is worse than no diagnostic.
@@ -3320,6 +3323,12 @@ and parse_andor = fn toks ->
 
 and parse_andor_more = fn (lhs: Expr) -> fn toks ->
   match toks with
+  // ruby 4.0: `and` / `or` at the start of the next line continues this one
+  | Cons (TNL _, _) ->
+    (let t2 = skip_nls toks in
+     match t2 with
+     | Cons (TId w, _) -> if str_eq w "and" || str_eq w "or" then parse_andor_more lhs t2 else (lhs, toks)
+     | _ -> (lhs, toks))
   | Cons (TId w, r) ->
     // the right-hand side may continue on the next line (trailing `and` / `or`)
     if str_eq w "and" then let (rhs, r2) = parse_expr (skip_nls r) in parse_andor_more (EBin ("&&", lhs, rhs)) r2
@@ -3375,6 +3384,16 @@ and parse_more = fn (lhs: Expr) -> fn toks -> fn (minp: int) ->
                | _ -> ()) in
       parse_more (EBin (op, lhs, rhs)) r2 minp
     else (lhs, toks)
+  // ruby 4.0: `&&` / `||` at the start of the next line continues this
+  // expression. The precedence is checked BEFORE the newlines are consumed, so
+  // a tighter level hands the newline back and the level that owns the
+  // operator reads it -- `a + b` newline `|| c` is `(a + b) || c`.
+  | Cons (TNL _, _) ->
+    (let t2 = skip_nls toks in
+     match t2 with
+     | Cons (TP op, _) ->
+       if (str_eq op "&&" || str_eq op "||") && prec_of op >= minp then parse_more lhs t2 minp else (lhs, toks)
+     | _ -> (lhs, toks))
   | _ -> (lhs, toks)
 
 and parse_unary = fn toks ->
@@ -4011,10 +4030,13 @@ and parse_primary = fn toks ->
           else (EMethod (e9, "__lit_enc~" ++ cd, Nil), r9)))
   | Cons (TSym s, r) -> (ESym s, r)
   | Cons (TId id, r) ->
-    // `and` / `or` cannot START an expression; ruby rejects a line beginning
-    // with one. Saying so here (instead of reading it as a call to a method
-    // named `and`) turns a confusing NoMethodError at run time into a parse
-    // error that names the file.
+    // `and` / `or` cannot START an expression. (Since ruby 4.0 a line that
+    // begins with one CONTINUES the statement before it -- apply_modifier and
+    // parse_andor_more read that case first -- so what reaches here is an
+    // `and` with nothing in front of it: after a `;`, or at the top of a body.)
+    // Saying so (instead of reading it as a call to a method named `and`)
+    // turns a confusing NoMethodError at run time into a parse error that
+    // names the file.
     if str_eq id "and" || str_eq id "or" then
       (let __fm = ("mere-ruby: unexpected keyword: " ++ id) in
        let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
@@ -4826,6 +4848,14 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
 // single statement.
 and apply_modifier = fn (s: Stmt) -> fn toks ->
   match toks with
+  // ruby 4.0: a line that BEGINS with `and` / `or` continues the statement
+  // before it, the way a leading `.method` continues a chain. Only those two
+  // words -- a modifier keyword at line start opens a new statement.
+  | Cons (TNL _, _) ->
+    (let t2 = skip_nls toks in
+     match t2 with
+     | Cons (TId w, _) -> if str_eq w "and" || str_eq w "or" then apply_modifier s t2 else (s, toks)
+     | _ -> (s, toks))
   // one-line pattern matching at statement level: `expr => pat` (bind-or-raise)
   // and `expr in pat` (boolean). Only a plain expression statement qualifies.
   | Cons (TP arrow, r) ->
@@ -7833,8 +7863,22 @@ let cmp_type_name = fn (v: Val) ->
 // a bare StandardError with no idea what was compared -- the `<` family already
 // raised the right thing, so only the paths that call this one (sort, min, max)
 // were affected, and they are exactly the ones where knowing the types matters.
+// ...and the OTHER side is named by VALUE when ruby can write it as one: nil,
+// true, false, a Symbol and a machine-word integer are what CRuby's rb_cmperr
+// inspects, everything else by its class ("comparison of Integer with String
+// failed"). Nothing was, so `[nil, 1].sort` read "with Integer" where every ruby
+// reads "with 1". A Float is inspected by ruby too and is named by class here:
+// there is no float formatter this early in the file, and the `<` family (which
+// has one) already answers the value.
+let cmp_other_name = fn (v: Val) ->
+  (match v with
+   | VNil -> "nil"
+   | VBool b -> (if b then "true" else "false")
+   | VInt n -> str_of_int n
+   | VSym sy -> ":" ++ sy
+   | _ -> cmp_type_name v);
 let cmp_fail = fn (va: Val) -> fn (vb: Val) ->
-  prim_raise "ArgumentError" ("comparison of " ++ cmp_type_name va ++ " with " ++ cmp_type_name vb ++ " failed");
+  prim_raise "ArgumentError" ("comparison of " ++ cmp_type_name va ++ " with " ++ cmp_other_name vb ++ " failed");
 let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
   // bignum (or bignum vs int): compare exact decimal values, not floats.
   if (match va with VBig _ -> true | _ -> false) && (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
@@ -7862,6 +7906,15 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
        if fx < fy then 0 - 1 else if fy < fx then 1 else 0)
   else
     match va with
+    // `nil <=> nil` is 0 in ruby, and `true <=> true` likewise, so a sort whose
+    // keys are all nil is a stable no-op rather than an error -- which is what
+    // `enum.sort_by.to_a` is, since materialising an enumerator drives the source
+    // with a block that answers nil. Mixed pairs still fail, as they do in ruby.
+    | VNil -> (match vb with VNil -> 0 | _ -> cmp_fail va vb)
+    | VBool x ->
+      (match vb with
+       | VBool y -> (if x then (if y then 0 else cmp_fail va vb) else (if y then cmp_fail va vb else 0))
+       | _ -> cmp_fail va vb)
     | VStr x -> let x = sget x in
       (match vb with
        | VStr y -> let y = sget y in str_compare x y
@@ -9672,6 +9725,28 @@ let str_set_has = fn (set0: str) -> fn (c: str) ->
 // a char passes when it is in EVERY set (Ruby intersects multiple set args).
 let rec all_sets_has = fn (sets: str list) -> fn (c: str) ->
   match sets with Nil -> true | Cons (h, t) -> if str_set_has h c then all_sets_has t c else false;
+
+// ruby 4.0: strip / lstrip / rstrip take tr-style SELECTORS (`strip("x")`,
+// `strip("a-c")`, `strip("^a")`), intersected the way #count's are; with a
+// selector given, whitespace is no longer stripped unless it is selected. A
+// selector that is not a String is a TypeError, as for #count.
+let strip_selectors = fn (args: Val list) ->
+  let rec go = fn (xs: Val list) ->
+    (match xs with
+     | Nil -> (Nil : str list)
+     | Cons (VStr h, t) -> Cons (sget h, go t)
+     | Cons (v, _) -> (let _ = conv_err v "String" in (Nil : str list))) in
+  go args;
+// strip the CHARACTERS (UTF-8 codepoints) every selector admits, from the
+// left (`l`) and/or the right (`r`).
+let str_strip_sel = fn (s: str) -> fn (sels: str list) -> fn (l: bool) -> fn (r: bool) ->
+  let cps = decode_cps s "UTF-8" 0 in
+  let hit = fn (cp: int) -> all_sets_has sels (utf8_enc cp) in
+  let rec dropl = fn (xs: int list) -> (match xs with Cons (c, t) -> if hit c then dropl t else xs | Nil -> Nil) in
+  let rec rev = fn (a: int list) -> fn (b: int list) -> (match a with Nil -> b | Cons (h, t) -> rev t (Cons (h, b))) in
+  let a = (if l then dropl cps else cps) in
+  let b = (if r then rev (dropl (rev a Nil)) Nil else a) in
+  (match encode_cps b "UTF-8" "" with (bytes, _) -> bytes);
 
 let str_tr = fn (s: str) -> fn (from0: str) -> fn (to0: str) ->
   let neg = str_len from0 >= 2 && str_eq (char_at from0 0) "^" in
@@ -11675,7 +11750,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // `::Name` carries its prefix and is top level only.
        (if str_len name > 2 && str_eq (substring name 0 2) "::" then
           (if map_has consts (substring name 2 (str_len name)) then mkstr "constant" else VNil)
-        else if map_has consts name then mkstr "constant"
+        // an autoload (Set, Pathname) is a constant that exists before it loads
+        else if map_has consts name || map_has autoloads name then mkstr "constant"
         else if (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s9 -> sget s9 | _ -> "") else cur_lex ()) in
                  (if str_eq (lex_const_key cref9 name) "" then false else true)
                  || (if str_eq (anc_const_key world cref9 name) "" then false else true)) then mkstr "constant"
@@ -12043,6 +12119,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if map_has meths name then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if str_eq name "local_variables" then local_vars_of env
+    // Kernel#instance_variables_to_inspect (ruby 4.0): nil means "all of them";
+    // a class overrides it to choose what #inspect shows (see inspect_w).
+    else if str_eq name "instance_variables_to_inspect" then VNil
     else if str_eq name "global_variables" && (if map_has meths name then false else true) then global_vars_of ()
     // Kernel#binding: capture the current locals env (which holds "self") --
     // unless the receiver has its own `binding` (rubocop-ast's compiler holds
@@ -12963,7 +13042,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
           else if has_meth world (dispatch_cls_of world va0) "=~" then
             VBool (if truthy (invoke_val_c env world blk va0 "=~" (Cons (vb, Nil)) false) then false else true)
           else raise_exc world "NoMethodError"
-                 ("undefined method '=~' for an instance of " ++ display_cls_msg world (dispatch_cls_of world va0)))
+                 ("undefined method '=~' for " ++ for_recv_cls world (dispatch_cls_of world va0)))
        | _ -> VBool true)
     // For a class/module these five are the SUBCLASS partial order, not a
     // value comparison, so they have to reach the class dispatcher rather
@@ -13293,7 +13372,7 @@ and coerced_apply = fn env -> fn world -> fn (op: str) -> fn (x: Val) -> fn (y: 
      if has_meth world xcl op then
        (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
         invoke world noblk x xcl op (Cons (y, Nil)))
-     else raise_exc world "NoMethodError" ("undefined method '" ++ op ++ "' for an instance of " ++ display_cls_msg world xcl))
+     else raise_exc world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world xcl))
   | _ -> arith_bin op x y
 
 // hash-literal pairs; a doubled EKwSplat marker splices another hash.
@@ -14987,7 +15066,7 @@ and enum_zero_arity = fn (name: str) ->
 // enumerable methods that, called WITHOUT a block, return an Enumerator.
 and enum_needs_block = fn (name: str) ->
   str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
-  str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_all" ||
+  str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_all" || str_eq name "rfind" ||
   str_eq name "flat_map" || str_eq name "collect_concat" || str_eq name "partition" ||
   str_eq name "group_by" || str_eq name "sort_by" || str_eq name "sort_by!" || str_eq name "min_by" || str_eq name "max_by" ||
   str_eq name "minmax_by" || str_eq name "each_with_index" || str_eq name "each_with_object" ||
@@ -15015,7 +15094,7 @@ and enum_needs_block = fn (name: str) ->
 
 and is_enum_method = fn (name: str) ->
   str_eq name "map" || str_eq name "collect" || str_eq name "select" || str_eq name "filter" ||
-  str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_index" ||
+  str_eq name "reject" || str_eq name "detect" || str_eq name "find" || str_eq name "find_index" || str_eq name "rfind" ||
   str_eq name "index" || str_eq name "any?" || str_eq name "all?" || str_eq name "none?" ||
   str_eq name "count" || str_eq name "reduce" || str_eq name "inject" || str_eq name "each_with_index" ||
   str_eq name "to_a" || str_eq name "entries" || str_eq name "first" || str_eq name "include?" ||
@@ -15206,6 +15285,8 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | Nil -> (match xs with Nil -> VNil | Cons (h, t) -> iter_result (arr_reduce world encl theblk t h) recv))
     else if str_eq name "count" then iter_result (arr_count_blk world encl theblk xs 0) recv
     else if str_eq name "detect" || str_eq name "find" then arr_detect world encl theblk xs
+    // ruby 4.0: Array#rfind is #find walked from the other end
+    else if str_eq name "rfind" then arr_detect world encl theblk (val_rev xs Nil)
     else if str_eq name "any?" then arr_any world encl theblk xs
     else if str_eq name "all?" then arr_all world encl theblk xs
     else if str_eq name "none?" then arr_none world encl theblk xs
@@ -17212,7 +17293,15 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     else if str_eq cls "Enumerator::ArithmeticSequence" then
       aseq_inspect_str env world oid
     else
-      (let ivs = obj_ivar_dump env world oid cls in
+      // ruby 4.0: Kernel#inspect asks #instance_variables_to_inspect first. An
+      // array names the ivars to show (in the object's own order, unset names
+      // skipped); nil -- the Kernel default -- means all of them.
+      (let ivs = (if has_meth world cls "instance_variables_to_inspect" then
+                    (let nb0 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                     match invoke world nb0 v cls "instance_variables_to_inspect" Nil with
+                     | VArr aid -> obj_ivar_dump_sel env world oid cls (deref aid)
+                     | _ -> obj_ivar_dump env world oid cls)
+                  else obj_ivar_dump env world oid cls) in
        // the class names ITSELF here too: an instance of an anonymous class is
        // `#<#<Class:0x..>:0x..>` in ruby, not `#<AnonClass_0:0x..>`.
        "#<" ++ cls_display world cls ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
@@ -17261,6 +17350,23 @@ and obj_ivar_dump = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
   let (_, _, _, iv) = world in
   let names = ivar_names_of iv oid in
   ivar_dump_go env world iv oid names ""
+
+// the same dump, keeping only the ivars an #instance_variables_to_inspect
+// answer names (as :@a symbols or "@a" strings, with or without the @)
+and obj_ivar_dump_sel = fn env -> fn world -> fn (oid: int) -> fn (cls: str) -> fn (want: Val list) ->
+  let (_, _, _, iv) = world in
+  let names = ivar_names_of iv oid in
+  let keep = fn (n: str) ->
+    (let rec go = fn (xs: Val list) ->
+       (match xs with
+        | Nil -> false
+        | Cons (VSym s, t) -> if str_eq s ("@" ++ n) || str_eq s n then true else go t
+        | Cons (VStr h, t) -> if str_eq (sget h) ("@" ++ n) || str_eq (sget h) n then true else go t
+        | Cons (_, t) -> go t) in
+     go want) in
+  let rec filt = fn (xs: str list) ->
+    (match xs with Nil -> Nil | Cons (h, t) -> if keep h then Cons (h, filt t) else filt t) in
+  ivar_dump_go env world iv oid (filt names) ""
 
 // the object's own @ivar names, in the order the map holds them (which is the
 // order they were first set -- the order Ruby shows them in)
@@ -17860,7 +17966,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      if has_meth world c9u "method_missing"
      then invoke world noblk recv c9u "method_missing" (Cons (VSym name, args))
      else raise_exc world "NoMethodError"
-            ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world (class_name recv)))
+            ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world (class_name recv)))
   else
   // The Kernel conversion functions are PRIVATE instance methods of Object, so
   // `obj.send(:Integer, "1")` reaches them on any receiver -- only on the send
@@ -18846,7 +18952,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       | _ -> responds world recv nm || is_binary_op_name nm)
                    else true) in
      if exists then mk_bound_method world recv owner nm
-     else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for an instance of " ++ display_cls_msg world (dispatch_cls_of world recv)))
+     else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for " ++ for_recv_cls world (dispatch_cls_of world recv)))
   // Object#singleton_method(name): the method only if it is defined on the
   // receiver's OWN singleton (for true/false/nil, `def (false).foo` puts it on
   // FalseClass -- they have no singleton class to put it on), else ruby's
@@ -19709,6 +19815,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "cbrt" then (match args with Cons (v, _) -> VFlt (cbrt (to_f v)) | _ -> VFlt 0.0)
        else if str_eq name "log2" then (match args with Cons (v, _) -> VFlt (log2 (to_f v)) | _ -> VFlt 0.0)
        else if str_eq name "log10" then (match args with Cons (v, _) -> VFlt (log10 (to_f v)) | _ -> VFlt 0.0)
+       else if str_eq name "log1p" then (match args with Cons (v, _) -> VFlt (log1p (to_f v)) | _ -> VFlt 0.0)
+       else if str_eq name "expm1" then (match args with Cons (v, _) -> VFlt (expm1 (to_f v)) | _ -> VFlt 0.0)
        else if str_eq name "erf" then (match args with Cons (v, _) -> VFlt (erf (to_f v)) | _ -> VFlt 0.0)
        else if str_eq name "erfc" then (match args with Cons (v, _) -> VFlt (erfc (to_f v)) | _ -> VFlt 0.0)
        else if str_eq name "gamma" then (match args with Cons (v, _) -> VFlt (tgamma (to_f v)) | _ -> VFlt 0.0)
@@ -19792,7 +19900,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match args with
        | Cons (nv, _) ->
          let n = (match nv with VSym s -> s | VStr s -> sget s | _ -> "") in
-         VBool (map_has consts (c ++ "::" ++ n) || (str_eq c "Object" && map_has consts n))
+         // (an autoload -- Set, Pathname -- is defined before it is loaded)
+         VBool (map_has consts (c ++ "::" ++ n) || (str_eq c "Object" && (map_has consts n || map_has autoloads n)))
        | _ -> VBool false)
     // instance_method(:name): an UnboundMethod, represented as an
     // UnboundMethod-classed object carrying the origin class (where the method
@@ -20576,9 +20685,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                then sng_supername world c0 else c0) in
     if has_meth world cls name then
       (if vischeck && meth_private world cls name
-       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls_msg world cls)
+       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
        else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true)
-       then raise_exc world "NoMethodError" ("protected method '" ++ name ++ "' called for an instance of " ++ display_cls_msg world cls)
+       then raise_exc world "NoMethodError" ("protected method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
        else invoke world noblk recv cls name args)
     else if str_eq name "class" then VClass (display_cls world cls)
     // Object#methods: public + protected method names reachable from this
@@ -20641,6 +20750,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | _ -> VNil)
     else if str_eq name "instance_variable_defined?" then
       (match args with Cons (v, _) -> VBool (map_has ivars (str_of_int id ++ "@" ++ ivar_name_val env world v)) | _ -> VBool false)
+    // Kernel#instance_variables_to_inspect (ruby 4.0): the default answers nil,
+    // and Kernel#inspect reads an override to pick the ivars it shows.
+    else if str_eq name "instance_variables_to_inspect" then VNil
     // Object#instance_variables: this object's own @ivars, as :@name symbols.
     else if str_eq name "instance_variables" then
       (let pfx = str_of_int id ++ "@" in
@@ -20689,6 +20801,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             else invoke_val_c env world blk mrecv mnm args false)
        else if str_eq name "name" then VSym mnm
        else if str_eq name "receiver" then mrecv
+       // Method#box (ruby 4.0): the Ruby::Box a method was defined in; nil while
+       // boxes are not enabled, which is the only state this interpreter has.
+       else if str_eq name "box" then VNil
        else if str_eq name "owner" then (if str_eq mown "" then VClass (class_name mrecv) else VClass mown)
        // The same four as UnboundMethod (see there): the defined-as name, the
        // definition further up, a copy, and a hash. A bound Method's owner may
@@ -21902,7 +22017,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (if str_eq name "between?" then (match args with Cons (lo, Cons (hi, _)) -> VBool (cmp_vals_w world recv lo >= 0 && cmp_vals_w world recv hi <= 0) | _ -> VBool false)
        else (match args with Cons (lo, Cons (hi, _)) -> (if cmp_vals_w world recv lo < 0 then lo else if cmp_vals_w world recv hi > 0 then hi else recv) | _ -> recv))
     // an object has no such method — raise a catchable NoMethodError.
-    else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world cls)
+    else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world cls)
   | VSym s ->
     if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
     then flow_value (run_block world noblk blk args)
@@ -22215,7 +22330,10 @@ and param_meta_of = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Exp
          (let n = substring p 0 (str_len p - 1) in
           arr_new (Cons (VSym (if bm_has_default ds p || bm_has_default ds n then "key" else "keyreq"), Cons (VSym n, Nil))))
        else if bm_has_default ds p then arr_new (Cons (VSym "opt", Cons (VSym p, Nil)))
-       // a block's positional parameters are all optional; a lambda's are not
+       // a block's positional parameters are all optional; a lambda's are not.
+       // A destructuring parameter `(a, b)` has no name of its own: ruby 4.0
+       // answers `[:opt]` / `[:req]` alone (3.4 said `[:opt, nil]`).
+       else if str_len p > 0 && str_eq (char_at p 0) "(" then arr_new (Cons (VSym (if is_lam then "req" else "opt"), Nil))
        else arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym p, Nil)))) in
     Cons (pair, param_meta_of is_lam rest ds)
 and max_numbered_stmts = fn (body: Stmt list) ->
@@ -22826,15 +22944,74 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             (let (_, _, _, iv9) = world in
              let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
              let src = (match (if map_has iv9 (str_of_int id ++ "@meth") then map_get iv9 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
+             // ruby's with_index does NOT materialise and re-run: it calls the
+             // source method ONCE with the block wrapped in an index counter, so a
+             // source that decides how far to walk from the block's VALUE -- find,
+             // take_while, drop_while, sort_by, the whole *_by family -- sees the
+             // caller's real values. Two phases cannot answer that: the walk that
+             // materialises has to return something to the source, and whatever it
+             // returns is a different walk from the caller's.
+             if map_has iv9 (str_of_int id ++ "@recv") then
+               (let recv2 = map_get iv9 (str_of_int id ++ "@recv") in
+                let eargs = (match (if map_has iv9 (str_of_int id ++ "@eargs") then map_get iv9 (str_of_int id ++ "@eargs") else VNil) with
+                             | VArr aid3 -> deref aid3
+                             | _ -> Nil) in
+                invoke_with_block env world blk recv2 src eargs (wi_index_block newblk off))
+             else if map_has iv9 (str_of_int id ++ "@__e_blk") then
+               // A generator has no source method to call again, but it has the
+               // block that yields: run THAT with the same wrapper, through a
+               // Yielder, exactly as materialising it does. Its own value is the
+               // answer, as in ruby.
+               (match map_get iv9 (str_of_int id ++ "@__e_blk") with
+                | VProc gpid ->
+                  (let (_, _, ocls9, _) = world in
+                   // the wrapper is built FIRST: it stores the caller's block at
+                   // `map_len proc_store` itself, so taking the id before building
+                   // it hands out the same slot twice -- the wrapper overwrote the
+                   // block it wraps and then called itself, forever.
+                   let wrapped = wi_index_block newblk off in
+                   let bpid = map_len proc_store in
+                   let _ = store_proc (str_of_int bpid) wrapped in
+                   let yid = alloc_oid ocls9 in
+                   let _ = map_set ocls9 (str_of_int yid) "Enumerator::Yielder" in
+                   let _ = map_set iv9 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
+                   flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil))))
+                | _ -> VNil)
+             else
+             // Anything else (a produce form) is materialised and walked as pairs.
              let av = enum_to_arr env world blk id in
              (match av with
               | VArr aid2 ->
                 (let pairs = arr_new (with_index_pairs_off (deref aid2) off) in
+                 // each_with_object's memo is the enumerator's own argument and is
+                 // also its answer; running the source again over the pairs would
+                 // build a SECOND memo and nest it inside the block's first
+                 // parameter, so walk the pairs and answer the memo that exists.
+                 if str_eq src "each_with_object" then
+                   (let memo = (match (if map_has iv9 (str_of_int id ++ "@eargs") then map_get iv9 (str_of_int id ++ "@eargs") else VNil) with
+                                | VArr eid9 -> (match deref eid9 with Cons (m, _) -> m | _ -> VNil)
+                                | _ -> VNil) in
+                    let _ = invoke_with_block env world blk pairs "each" Nil newblk in
+                    memo)
+                 else
                  let r = invoke_with_block env world blk pairs (if str_eq src "each" then "each" else src) Nil newblk in
-                 // a filtering source answers with elements, not with pairs
-                 if str_eq src "select" || str_eq src "filter" || str_eq src "find_all"
-                    || str_eq src "reject" || str_eq src "take_while" || str_eq src "drop_while" then
+                 // What the source ANSWERS decides how much of the pairing has to
+                 // be undone: one that answers ELEMENTS (a filter, a sort, a search)
+                 // answers PAIRS here, while one that answers the BLOCK's values
+                 // (map, flat_map, sum) is already right. Only the filters were
+                 // listed, so `matching.sort_by.with_index { |spec, i| ... }` -- how
+                 // rubygems 4 orders platform matches -- answered [spec, index]
+                 // pairs, and bundler then called LazySpecification's methods on an
+                 // Array. The *_by family, the searches, partition and group_by are
+                 // the same question in five shapes.
+                 if wi_answers_elems src then
                    (match r with VArr rid -> arr_new (pair_firsts (deref rid)) | _ -> r)
+                 else if wi_answers_one_elem src then
+                   (match r with VArr rid -> (match deref rid with Cons (a, _) -> a | _ -> r) | _ -> r)
+                 else if str_eq src "partition" then
+                   (match r with VArr rid -> arr_new (wi_unwrap_each (deref rid)) | _ -> r)
+                 else if str_eq src "group_by" then
+                   (match r with VHsh hid -> mkhash (wi_unwrap_vals (hderef hid)) | _ -> r)
                  else if str_eq src "each" then
                    (if map_has iv9 (str_of_int id ++ "@recv") then map_get iv9 (str_of_int id ++ "@recv") else r)
                  else r)
@@ -23114,7 +23291,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             let _ = arr_each world blk newblk (val_list_of_strs (str_lines_go inp 0 0 (str_len inp))) in recv)
        else if has_meth world cls name then
          (if meth_private world cls name
-          then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls_msg world cls)
+          then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
           else invoke world newblk recv cls name args)
        // Enumerable: synthesize block iterators from the user's `each`.
        else if has_meth world cls "each" && is_enum_method name then
@@ -23125,7 +23302,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if builtin_obj_has cls name then invoke_val_c env world blk recv name args false
        else if is_sng_cls cls && builtin_obj_has (sng_supername world cls) name then invoke_val_c env world blk recv name args false
        else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
-       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world cls)
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world cls)
      // `blk` (the enclosing method's block) is threaded so a yield inside
      // the iterated block reaches it (e.g. `@xs.each { |n| yield(n) }`).
      | _ ->
@@ -23623,7 +23800,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> VBool false)
   else if has_meth world cls name then
     (if vischeck && meth_private world cls name
-     then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for an instance of " ++ display_cls_msg world cls)
+     then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
      else invoke world noblk recv cls name args)
   // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
   else if str_eq name "=~" then
@@ -24282,7 +24459,7 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
   else if str_eq cls "Method" then
     str_eq name "call" || str_eq name "()" || str_eq name "[]" || str_eq name "===" ||
     str_eq name "arity" || str_eq name "name" || str_eq name "owner" ||
-    str_eq name "receiver" || str_eq name "parameters" || str_eq name "source_location" ||
+    str_eq name "receiver" || str_eq name "parameters" || str_eq name "source_location" || str_eq name "box" ||
     str_eq name "unbind" || str_eq name "to_proc" || str_eq name "original_name" ||
     str_eq name "super_method" || str_eq name "curry" || str_eq name ">>" || str_eq name "<<"
   else if str_eq cls "UnboundMethod" then
@@ -24389,7 +24566,7 @@ and public_send_guard = fn world -> fn (recv: Val) -> fn (m: str) ->
   let c9 = dispatch_cls_of world recv in
   if meth_protected world c9 m
   then (let _ = raise_exc world "NoMethodError"
-          ("protected method '" ++ m ++ "' called for an instance of " ++ display_cls_msg world c9) in ())
+          ("protected method '" ++ m ++ "' called for " ++ for_recv_cls world c9) in ())
   else ()
 
 // the method-name argument of send / __send__ / public_send, read the way
@@ -24654,7 +24831,7 @@ and is_arr_method = fn (name: str) ->
   str_eq name "pop" || str_eq name "shift" || str_eq name "unshift" || str_eq name "prepend" ||
   str_eq name "map" || str_eq name "collect" || str_eq name "map!" || str_eq name "collect!" ||
   str_eq name "select" || str_eq name "filter" || str_eq name "select!" || str_eq name "filter!" ||
-  str_eq name "reject" || str_eq name "reject!" || str_eq name "find" || str_eq name "detect" ||
+  str_eq name "reject" || str_eq name "reject!" || str_eq name "find" || str_eq name "detect" || str_eq name "rfind" ||
   str_eq name "find_index" || str_eq name "index" || str_eq name "rindex" || str_eq name "include?" ||
   str_eq name "first" || str_eq name "last" || str_eq name "each" || str_eq name "each_index" ||
   str_eq name "each_with_index" || str_eq name "each_with_object" || str_eq name "reverse" ||
@@ -25572,8 +25749,10 @@ and prim_zero_arity = fn (recv: Val) -> fn (name: str) ->
     let str_n = str_eq name "length" || str_eq name "size" || str_eq name "empty?"
                 || str_eq name "reverse" || str_eq name "chars" || str_eq name "bytes"
                 || str_eq name "codepoints" || str_eq name "to_sym" || str_eq name "to_s"
-                || str_eq name "to_f" || str_eq name "strip" || str_eq name "lstrip"
-                || str_eq name "rstrip" || str_eq name "chop" || str_eq name "succ"
+                // (strip / lstrip / rstrip left this list with ruby 4.0: they
+                // take selector arguments now, and check them themselves)
+                || str_eq name "to_f"
+                || str_eq name "chop" || str_eq name "succ"
                 || str_eq name "next" || str_eq name "inspect" || str_eq name "to_str"
                 || str_eq name "ord" || str_eq name "chr" in
     let int_n = str_eq name "size" || str_eq name "to_f" || str_eq name "to_i"
@@ -26403,13 +26582,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VCpx (cre, cim) ->
        (if exact_zero_val cim then prim_method cre "to_i" (Nil : Val list)
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Integer"))
-     | _ -> prim_raise "NoMethodError" ("undefined method 'to_i' for an instance of " ++ class_name recv))
+     | _ -> prim_raise "NoMethodError" ("undefined method 'to_i' for " ++ for_recv_name recv))
   else if str_eq name "to_f" then
     (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (float_of_str n / float_of_str d) | VStr s -> VFlt (str_to_f_lenient (sget s)) | VNil -> VFlt 0.0
      | VCpx (cre, cim) ->
        (if exact_zero_val cim then VFlt (to_f cre)
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Float"))
-     | _ -> prim_raise "NoMethodError" ("undefined method 'to_f' for an instance of " ++ class_name recv))
+     | _ -> prim_raise "NoMethodError" ("undefined method 'to_f' for " ++ for_recv_name recv))
   // to_a returns self for a plain Array, but a plain Array (not the subclass)
   // for a subclass instance.
   // Enumerable#entries is to_a under another name.
@@ -26440,7 +26619,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              if str_eq rf9 "" then arr_new (range_vals_raw lo hi excl)
              else prim_raise "TypeError" ("can't iterate from " ++ rf9))
      | VNil -> arr_new Nil
-     | _ -> prim_raise "NoMethodError" ("undefined method 'to_a' for an instance of " ++ class_name recv))
+     | _ -> prim_raise "NoMethodError" ("undefined method 'to_a' for " ++ for_recv_name recv))
   // Integer#size is the machine word width in bytes -- and only `size`:
   // ruby has no Integer#length. concurrent-ruby derives FIXNUM_BIT_SIZE
   // from `0.size * 8`.
@@ -26573,11 +26752,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VArr id -> VInt (val_list_len (deref id))
      | VStr sh0 -> VInt (str_rblen sh0)
      | VSym s -> VInt (utf8_len s)
-     | VHsh xs -> let xs = hderef xs in VInt (hash_len xs) | _ -> prim_raise "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ class_name recv))
+     | VHsh xs -> let xs = hderef xs in VInt (hash_len xs) | _ -> prim_raise "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_name recv))
   else if str_eq name "empty?" then
     (match recv with
      | VArr id -> VBool (val_list_len (deref id) == 0) | VStr s -> let s = sget s in VBool (str_len s == 0)
-     | VHsh xs -> let xs = hderef xs in VBool (hash_len xs == 0) | _ -> prim_raise "NoMethodError" ("undefined method 'empty?' for an instance of " ++ class_name recv))
+     | VHsh xs -> let xs = hderef xs in VBool (hash_len xs == 0) | _ -> prim_raise "NoMethodError" ("undefined method 'empty?' for " ++ for_recv_name recv))
   else if str_eq name "[]" then
     (match recv with
      | VArr id ->
@@ -26703,7 +26882,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                  | _ -> VInt (n / int_pow 2 i)))
         | Cons (VInt i, _) -> (if i < 0 then VInt 0 else VInt (int_bitop "&" (n / int_pow 2 i) 1))
         | _ -> VNil)
-     | _ -> prim_raise "NoMethodError" ("undefined method '[]' for an instance of " ++ class_name recv))
+     | _ -> prim_raise "NoMethodError" ("undefined method '[]' for " ++ for_recv_name recv))
   // Integer
   else if str_eq name "gcd" then (match recv with VInt a -> (match args with Cons (VInt b, _) -> VInt (int_gcd a b) | Cons (VBig b, _) -> norm_big (big_gcd_s (big_mag (str_of_int a)) (big_mag b)) | _ -> VInt a)
      | VBig a -> (match args with Cons (b, _) -> norm_big (big_gcd_s (big_mag a) (big_mag (num_dec b))) | _ -> norm_big (big_mag a)) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcd") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcd'")) in fail "mere-ruby: undefined method 'gcd'")))
@@ -27150,7 +27329,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            match encode_cps (rv (decode_cps (sget sh0) e 0) Nil) e "" with
            | (bytes, _) -> (let v = mkstr bytes in (match v with VStr id -> (let _ = senc_set id e in v) | _ -> v))))
      | VArr id -> arr_new (val_rev (deref id) Nil) | _ -> (let _ = map_set prim_missing "n" (mkstr "reverse") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse'")) in fail "mere-ruby: undefined method 'reverse'")))
-  else if str_eq name "strip" then (match recv with VStr s -> let s = sget s in mkstr (str_lstrip (str_rstrip s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "strip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'strip'")) in fail "mere-ruby: undefined method 'strip'")))
+  else if str_eq name "strip" then (match recv with VStr s -> (match args with Nil -> (let s = sget s in mkstr (str_lstrip (str_rstrip s))) | _ -> mkstr (str_strip_sel (sget s) (strip_selectors args) true true)) | _ -> (let _ = map_set prim_missing "n" (mkstr "strip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'strip'")) in fail "mere-ruby: undefined method 'strip'")))
   else if str_eq name "swapcase" then (match recv with VStr h -> rb_case_apply h "s" (rb_case_opt args false) | _ -> (let _ = map_set prim_missing "n" (mkstr "swapcase") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'swapcase'")) in fail "mere-ruby: undefined method 'swapcase'")))
   else if str_eq name "lstrip" then
     (match recv with
@@ -27158,6 +27337,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        // ruby refuses when the FIRST NON-SPACE character is broken (bytes
        // after it may be anything); the bang form inherits this by
        // delegating here.
+       (match args with
+        | Cons (_, _) -> mkstr (str_strip_sel (sget sh) (strip_selectors args) true false)
+        | Nil ->
        (let sv = sget sh in
         let n = str_len sv in
         let rec sk = fn (i: int) -> if i < n && is_strip_ch (char_at sv i) then sk (i + 1) else i in
@@ -27166,13 +27348,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    (match utf8_cp_strict sv st with
                     | (c, l, ok) -> if ok then () else (let _ = prim_raise "ArgumentError" "invalid byte sequence in UTF-8" in ()))
                  else ()) in
-        mkstr (substring sv st n))
+        mkstr (substring sv st n)))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "lstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lstrip'")) in fail "mere-ruby: undefined method 'lstrip'")))
   else if str_eq name "rstrip" then
     (match recv with
      | VStr sh ->
        // ruby refuses when the LAST NON-SPACE character is broken -- with a
        // CompatibilityError, its own quirk (lstrip's is ArgumentError).
+       (match args with
+        | Cons (_, _) -> mkstr (str_strip_sel (sget sh) (strip_selectors args) false true)
+        | Nil ->
        (let sv = sget sh in
         let rec bk = fn (i: int) -> if i >= 0 && is_strip_ch (char_at sv i) then bk (i - 1) else i in
         let en = bk (str_len sv - 1) in
@@ -27188,7 +27373,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                       else (let _ = prim_raise "Encoding::CompatibilityError"
                                       ("incompatible character encodings: UTF-8 and ASCII-8BIT") in ()))
                  else ()) in
-        mkstr (substring sv 0 (en + 1)))
+        mkstr (substring sv 0 (en + 1))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "rstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rstrip'")) in fail "mere-ruby: undefined method 'rstrip'")))
   else if str_eq name "chomp" then
     // the default separator is $/ (nil there means "remove nothing"). A
@@ -28352,7 +28537,7 @@ and prim_blame = fn (recv: Val) ->
    | VClass c -> " for " ++ (if map_has modules c then "module " else "class ") ++ cls_display_nw c
    | VMain -> " for main"
    | VObj _ -> ""
-   | other -> " for an instance of " ++ class_name other)
+   | other -> " for " ++ for_recv_name other)
 
 // tr/count/delete/squeeze SET arguments: every one must already be a String
 // (the dispatch layer has tried #to_str), and its bytes must be valid in its
@@ -29091,7 +29276,7 @@ and insert_w = fn world -> fn (x: Val) -> fn (sorted: Val list) ->
                 // Comparable class raise (corpus/148).
                 if str_eq c9 "BasicObject" || exc_is_a world c9 "BasicObject" then
                   (let _ = raise_exc world "NoMethodError"
-                             ("undefined method '<=>' for an instance of " ++ display_cls_msg world c9) in ())
+                             ("undefined method '<=>' for " ++ for_recv_cls world c9) in ())
                 else if has_meth world c9 "<=>" then
                   (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
                    match invoke world nb9 x c9 "<=>" (Cons (h, Nil)) with
@@ -30635,8 +30820,8 @@ and undef_blame = fn world -> fn (blame: Val) ->
    | VNil -> ""
    | VMain -> " for main"
    | VClass c -> " for " ++ (if map_has modules c then "module " else "class ") ++ cls_display world c
-   | VObj _ -> " for an instance of " ++ cls_display world (dispatch_cls_of world blame)
-   | other -> " for an instance of " ++ class_name other)
+   | VObj _ -> " for " ++ for_recv_disp world (dispatch_cls_of world blame)
+   | other -> " for " ++ for_recv_name other)
 
 // `explicit` = the call had parentheses (foo()) so it is unambiguously a
 // method call -> NoMethodError even with no arguments.
@@ -31179,7 +31364,7 @@ and kernel_builtin_names = fn (u: unit) ->
   Cons ("set_trace_func", Cons ("caller", Cons ("caller_locations", Cons ("__method__", Cons ("__callee__",
   Cons ("__callee__", Cons ("load", Cons ("system", Cons ("readline", Cons ("readlines",
   Cons ("trace_var", Cons ("untrace_var", Cons ("fork", Cons ("global_variables",
-  Cons ("local_variables", Cons ("test", Cons ("__dir__", Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+  Cons ("local_variables", Cons ("test", Cons ("__dir__", Cons ("instance_variables_to_inspect", Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 
 and list_iter_kernel_names = fn (f: str -> unit) ->
   let rec go = fn (xs: str list) ->
@@ -31795,8 +31980,8 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | Cons (nm, _) ->
        raise_exc world "NoMethodError"
          ("undefined method '" ++ (match nm with VSym sy -> sy | VStr h -> sget h | other -> to_s other)
-          ++ "' for an instance of " ++ display_cls_msg world dcls)
-     | Nil -> raise_exc world "NoMethodError" ("undefined method for an instance of " ++ display_cls_msg world dcls))
+          ++ "' for " ++ for_recv_cls world dcls)
+     | Nil -> raise_exc world "NoMethodError" ("undefined method for " ++ for_recv_cls world dcls))
   else if has_meth world dcls "method_missing"
   then invoke world superblk recv dcls "method_missing" (Cons (VSym meth, args))
   // Ruby defines the definition hooks as no-ops on Class/Module/BasicObject,
@@ -32171,7 +32356,13 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
                 Cons (ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
                              EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
                              EVar "__e"), Nil)))) in
-  let body = (if n < 0 then Cons (pushst, Nil)
+  // The collector's VALUE decides how far a short-circuiting source walks, and
+  // ruby's yielder answers nil. This answered `__acc.push(...)` -- an Array,
+  // which is truthy -- so materialising a `find` enumerator stopped at the first
+  // element (`[3,1,2].find.to_a` was `[3]`), and `find.with_index` then searched
+  // a one-element list and answered nil. The BOUNDED form below already ended in
+  // an `if`, whose value is nil when it does not break, so only this one lied.
+  let body = (if n < 0 then Cons (pushst, Cons (SExpr ENil, Nil))
               else Cons (pushst,
                    Cons (SIf (Cons ((EBin (">=", EMethod (EVar "__acc", "length", Nil), EInt n),
                                      Cons (SBreak ENil, Nil)), Nil), Nil), Nil))) in
@@ -32600,6 +32791,13 @@ and stdlib_src = fn (name: str) ->
     "      __impl_for(name).hexdigest(data)\n" ++
     "    end\n" ++
     "    def initialize(name = nil, data = nil)\n" ++
+    "      # openssl 4.0 wants a String name (the subclasses pass their own)\n" ++
+    "      if name.nil? && !self.class.respond_to?(:__algo)\n" ++
+    "        raise TypeError, \"no implicit conversion of nil into String\"\n" ++
+    "      end\n" ++
+    "      if !name.nil? && !name.is_a?(String)\n" ++
+    "        raise TypeError, \"no implicit conversion of \" + name.class.to_s + \" into String\"\n" ++
+    "      end\n" ++
     "      @name = (name || self.class.__algo).to_s.upcase.gsub(\"-\", \"\")\n" ++
     "      @impl = Digest.__impl_for(@name).new\n" ++
     "      update(data) if data\n" ++
@@ -32672,7 +32870,8 @@ and stdlib_src = fn (name: str) ->
     "    BLOCK = 64\n" ++
     "    def self.__impl(dig)\n" ++
     "      # a CLASS is refused, as in ruby: HMAC wants an instance or a name\n" ++
-    "      raise TypeError, \"wrong argument type Class (expected OpenSSL/Digest)\" if dig.is_a?(Class)\n" ++
+    "      # (openssl 4.0's wording; 3.x said `wrong argument type Class`)\n" ++
+    "      raise TypeError, \"no implicit conversion of Class into String\" if dig.is_a?(Class)\n" ++
     "      return OpenSSL::Digest.__impl_for(dig) if dig.is_a?(String) || dig.is_a?(Symbol)\n" ++
     "      return OpenSSL::Digest.__impl_for(dig.name) if dig.is_a?(OpenSSL::Digest)\n" ++
     "      dig.class\n" ++
@@ -33327,8 +33526,11 @@ and stdlib_src = fn (name: str) ->
     "    @hash.keys\n" ++
     "  end\n" ++
     "\n" ++
-    "  def to_set\n" ++
-    "    self\n" ++
+    // to_set(klass = Set, *args) -- answers self for the plain call, builds a
+    // klass otherwise. (Arguments are deprecated in 4.0 but still taken.)
+    "  def to_set(klass = Set, *args, &block)\n" ++
+    "    return self if klass == Set && args.empty? && block.nil?\n" ++
+    "    klass.new(self, *args, &block)\n" ++
     "  end\n" ++
     "\n" ++
     "  def dup\n" ++
@@ -33406,8 +33608,25 @@ and stdlib_src = fn (name: str) ->
     "    super\n" ++
     "  end\n" ++
     "\n" ++
+    // ruby 4.0 made Set core and its inspect `Set[1, 2]` (a set that contains
+    // itself shows `Set[...]`); a SUBCLASS keeps the older `#<MySet: {1, 2}>`,
+    // which is what 4.0.6 prints for one. The recursion guard is a table on the
+    // class rather than an ivar on the instance, because a frozen set inspects.
+    "  def self.__insp_ids\n" ++
+    "    @__insp_ids ||= \{}\n" ++
+    "  end\n" ++
     "  def inspect\n" ++
-    "    \"#<Set: \{\" + to_a.map \{ |x| x.inspect }.join(\", \") + \"}>\"\n" ++
+    "    exact = self.class == Set\n" ++
+    "    open = exact ? \"Set[\" : \"#<\" + self.class.to_s + \": \{\"\n" ++
+    "    close = exact ? \"]\" : \"}>\"\n" ++
+    "    ids = Set.__insp_ids\n" ++
+    "    return open + \"...\" + close if ids[object_id]\n" ++
+    "    ids[object_id] = true\n" ++
+    "    begin\n" ++
+    "      open + to_a.map \{ |x| x.inspect }.join(\", \") + close\n" ++
+    "    ensure\n" ++
+    "      ids.delete(object_id)\n" ++
+    "    end\n" ++
     "  end\n" ++
     "  alias_method :to_s, :inspect\n" ++
     "end\n" ++
@@ -33416,8 +33635,16 @@ and stdlib_src = fn (name: str) ->
     // `to_set { |x| ... }` MAPS on the way in -- ruby's Enumerable#to_set
     // forwards its block (and any Set.new arguments) rather than ignoring it,
     // so `(1..3).to_set { |x| x * x }` is {1, 4, 9} and not {1, 2, 3}.
-    "  def to_set(&block)\n" ++
-    "    Set.new(self, &block)\n" ++
+    "  def to_set(klass = Set, *args, &block)\n" ++
+    "    klass.new(self, *args, &block)\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    // ruby 4.0: Range#to_set refuses an endless range before walking it.
+    "class Range\n" ++
+    "  def to_set(klass = Set, *args, &block)\n" ++
+    "    raise RangeError, \"cannot convert endless range to a set\" if self.end.nil?\n" ++
+    "    klass.new(self, *args, &block)\n" ++
     "  end\n" ++
     "end\n"
   // Forwardable / SingleForwardable: delegation built on define_method,
@@ -35943,6 +36170,49 @@ and pair_firsts = fn (xs: Val list) ->
   | Nil -> Nil
   | Cons (h, t) -> Cons ((match h with VArr aid -> (match deref aid with Cons (a, _) -> a | _ -> h) | _ -> h), pair_firsts t)
 
+// The caller's block, wrapped so a source method calls it with (element,
+// index) -- which is what with_index means. The counter lives in a
+// one-element ARRAY rather than a local, because a block-local assignment
+// would be a fresh binding on every call and the index would never move.
+and wi_index_block = fn newblk -> fn (off: int) ->
+  let bpid = map_len proc_store in
+  let _ = store_proc (str_of_int bpid) newblk in
+  let cenv = map_new () in
+  let _ = map_set cenv "__wi_blk" (VProc bpid) in
+  let _ = map_set cenv "__wi_c" (arr_new (Cons (VInt off, Nil))) in
+  let idx = EMethod (EVar "__wi_c", "[]", Cons (EInt 0, Nil)) in
+  // a multi-value yield arrives as the whole list, a single one as itself --
+  // the same shape the materialising collector uses.
+  let elem = ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
+                    EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
+                    EVar "__e") in
+  let body = Cons (SAssign ("__wi_v", EMethod (EVar "__wi_blk", "call", Cons (elem, Cons (idx, Nil)))),
+              Cons (SExpr (EMethod (EVar "__wi_c", "[]=", Cons (EInt 0, Cons (EBin ("+", idx, EInt 1), Nil)))),
+              Cons (SExpr (EVar "__wi_v"), Nil))) in
+  (true, Cons ("*__e", Nil), body, cenv)
+
+// with_index runs the SOURCE method over (element, index) pairs, so a source
+// that answers elements answers pairs and has to be unwrapped again. These name
+// the two shapes that answer elements: a list of them, and a single one.
+and wi_answers_elems = fn (src: str) ->
+  str_eq src "select" || str_eq src "filter" || str_eq src "find_all" ||
+  str_eq src "reject" || str_eq src "take_while" || str_eq src "drop_while" ||
+  str_eq src "sort_by" || str_eq src "minmax_by" || str_eq src "each_entry"
+and wi_answers_one_elem = fn (src: str) ->
+  str_eq src "find" || str_eq src "detect" || str_eq src "min_by" || str_eq src "max_by"
+// partition answers two lists of pairs; group_by a hash whose VALUES are lists
+// of pairs (a hash is a flat key, value, key, value list here).
+and wi_unwrap_each = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VArr aid, t) -> Cons (arr_new (pair_firsts (deref aid)), wi_unwrap_each t)
+  | Cons (h, t) -> Cons (h, wi_unwrap_each t)
+and wi_unwrap_vals = fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (VArr aid, t)) -> Cons (k, Cons (arr_new (pair_firsts (deref aid)), wi_unwrap_vals t))
+  | Cons (k, Cons (v, t)) -> Cons (k, Cons (v, wi_unwrap_vals t))
+  | _ -> xs
+
 and with_index_pairs_off = fn (xs: Val list) -> fn (i: int) ->
   match xs with
   | Nil -> Nil
@@ -37362,6 +37632,22 @@ and display_cls = fn world -> fn (c: str) ->
 // questions.
 and display_cls_msg = fn world -> fn (c: str) -> cls_display world (display_cls world c)
 
+// How ruby names the RECEIVER of an undefined / private / protected method: the
+// three singletons by their VALUE ("for nil", "for true", "for false"), and
+// everything else by its class ("for an instance of Foo"). Ruby 3.4 introduced
+// the second wording and this followed it -- for all five, so `nil.foo` read
+// "for an instance of NilClass" where every ruby says "for nil". One rule, three
+// spellings of the argument the call sites already had, so that no site has to
+// decide it a fourth way.
+and for_recv_msg = fn (d: str) ->
+  if str_eq d "NilClass" then "nil"
+  else if str_eq d "TrueClass" then "true"
+  else if str_eq d "FalseClass" then "false"
+  else "an instance of " ++ d
+and for_recv_cls = fn world -> fn (c: str) -> for_recv_msg (display_cls_msg world c)
+and for_recv_disp = fn world -> fn (c: str) -> for_recv_msg (cls_display world c)
+and for_recv_name = fn (v: Val) -> for_recv_msg (class_name v)
+
 and cls_display = fn world -> fn (c: str) ->
   let (meths, sup, ocls, ivars) = world in
   if is_sng_cls c then
@@ -37474,7 +37760,9 @@ and register_builtin_consts = fn (u: unit) ->
     Cons ("Enumerator", Cons ("Thread", Cons ("Complex", Cons ("Rational", Cons ("Encoding", Cons ("IO",
     Cons ("UnboundMethod",
     Cons ("File", Cons ("Dir", Cons ("Data", Cons ("GC", Cons ("ObjectSpace", Cons ("Process", Cons ("Marshal",
-    Cons ("Mutex", Cons ("Fiber", Cons ("Random", Cons ("Signal", Cons ("Set", Cons ("Regexp",
+    // (Set is NOT registered here: it is the shipped library behind an autoload,
+    // and a registered name would answer the constant before the autoload could)
+    Cons ("Mutex", Cons ("Fiber", Cons ("Random", Cons ("Signal", Cons ("Regexp",
     Cons ("Exception", Cons ("StandardError", Cons ("RuntimeError", Cons ("ArgumentError", Cons ("TypeError",
     Cons ("RangeError", Cons ("IndexError", Cons ("KeyError", Cons ("ZeroDivisionError",
     Cons ("NotImplementedError", Cons ("EncodingError", Cons ("RegexpError", Cons ("NameError", Cons ("NoMethodError",
@@ -37513,7 +37801,7 @@ and register_builtin_consts = fn (u: unit) ->
     // below -- a class registered without its parent is an Errno that is not a
     // SystemCallError, which `rescue SystemCallError` then walks straight past.
     Cons ("Errno::EPROTO", Cons ("Errno::ENOTSUP",
-    Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+    Nil))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
   // Process.clock_gettime's clock ids. mere-ruby has one clock, so these are
   // distinct names for it rather than distinct sources.
   // Zlib's compression levels. mgz picks dynamic Huffman or a stored block
@@ -37640,7 +37928,17 @@ and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let _ = map_set cenv "self" (VClass cls) in
   let _ = map_set cenv "__cscope" (mkstr scope) in
   let _ = map_set cenv "__cref" (mkstr scope) in
+  // A `def` in the body records cur_lex () as its cref (register_class_v), and
+  // nothing here had set it: the methods kept the ENCLOSING class's scope and
+  // could not see a constant the body itself defined, though the body could.
+  // rubygems 4's vendored uri is exactly that shape -- `class << self;
+  // EscapedChars = ...; def escape(name) ... EscapedChars` -- and bundler 4
+  // loads it, so every bundlertest step died on `require "bundler"`.
+  // register_class_blk sets the scope the same way for a class_eval block.
+  let saved_lex = cur_lex () in
+  let _ = set_lex scope in
   let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
+  let _ = set_lex saved_lex in
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
@@ -38449,7 +38747,11 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
           // ...then let the unwind continue: `require` is reached through a
           // method call, which propagates a `fail`, not a Flow.
           fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
-        | _ -> FNext (VBool true))
+        // ruby 4.0: Set is core and `set.rb` is in $LOADED_FEATURES before any
+        // program runs, so `require "set"` answers false. The library still has
+        // to LOAD here (mere-ruby ships it as source behind an autoload); only
+        // the answer changes.
+        | _ -> FNext (VBool (if str_eq p0 "set" || str_eq p0 "set.rb" then false else true)))
 
 // a Val list with every string equal to `s` removed.
 and vals_without = fn (xs: Val list) -> fn (s: str) ->
@@ -41900,6 +42202,34 @@ let err_where = fn (name: str) ->
 // is that the class EXISTS, because activesupport's DescendantsTracker builds
 // one at load time and railties stops there otherwise.
 let core_prelude =
+  // ruby 4.0's toplevel `Ruby` module: the identity constants again, and
+  // Ruby::Box, which is never enabled here (RUBY_BOX is a CRuby build switch).
+  "module Ruby\n" ++
+  "  VERSION = RUBY_VERSION\n" ++
+  "  PATCHLEVEL = RUBY_PATCHLEVEL\n" ++
+  "  RELEASE_DATE = RUBY_RELEASE_DATE\n" ++
+  "  REVISION = RUBY_REVISION\n" ++
+  "  ENGINE = RUBY_ENGINE\n" ++
+  "  ENGINE_VERSION = RUBY_ENGINE_VERSION\n" ++
+  "  PLATFORM = RUBY_PLATFORM\n" ++
+  "  DESCRIPTION = RUBY_DESCRIPTION\n" ++
+  "  COPYRIGHT = RUBY_COPYRIGHT\n" ++
+  "  class Box\n" ++
+  "    def self.enabled?; false; end\n" ++
+  "    def self.current; nil; end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // ruby 4.0: Pathname is core, so `Pathname(x)` -- and `Kernel.Pathname(x)`,
+  // and `obj.send(:Pathname, x)` -- work before anything has required it. The
+  // library is shipped behind an autoload (see autoloads "Pathname") and its
+  // `module Kernel; def Pathname` REPLACES this stub when it loads, so the
+  // stub only has to get it loaded and ask again.
+  "module Kernel\n" ++
+  "  def Pathname(path)\n" ++
+  "    require \"pathname\"\n" ++
+  "    Pathname(path)\n" ++
+  "  end\n" ++
+  "end\n" ++
   "module ObjectSpace\n" ++
   "  class WeakMap\n" ++
   "    include Enumerable\n" ++
@@ -42523,6 +42853,9 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // ruby 3.1+ has Set without a require: the constant is an autoload of the
   // library mere-ruby ships. (`to_set` triggers the same load, in invoke_val_c.)
   let _ = map_set autoloads "Set" (mkstr "set") in
+  // ruby 4.0 made Pathname core as well: the constant is there before any
+  // require (the file still exists, so `require "pathname"` stays true).
+  let _ = map_set autoloads "Pathname" (mkstr "pathname") in
   let _ = map_set includes "Array" "Enumerable" in
   let _ = map_set includes "Hash" "Enumerable" in
   let _ = map_set includes "Range" "Enumerable" in
@@ -42616,8 +42949,14 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let ghver = (if gi > 0 then substring gh0 (gi + 6) (str_len gh0) else "") in
   let ok = gi > 0 && str_len ghver > 0 && (if str_contains ghver "/" then false else true) in
   let rlp = (if ok then substring gh0 0 gi else "/usr/lib/ruby") in
-  let rver = (if ok then ghver else "3.2.0") in
-  let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr "arm64-darwin22", Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr rlp, Cons (mkstr "rubylibprefix", Cons (mkstr rlp, Nil))))))))))))))))))) in
+  let rver = (if ok then ghver else "4.0.0") in
+  // ...and the three paths a library builds out of that prefix. bundled_gems.rb
+  // (which bundler 4 requires from Bundler.setup) reads `rubylibdir` and adds a
+  // "/" to it, so a missing key is not a missing feature there but `nil + "/"`.
+  let rarch = "arm64-darwin25" in
+  let rld = rlp ++ "/" ++ rver in
+  let rad = rld ++ "/" ++ rarch in
+  let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr rarch, Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr rlp, Cons (mkstr "rubylibprefix", Cons (mkstr rlp, Cons (mkstr "rubylibdir", Cons (mkstr rld, Cons (mkstr "rubyarchdir", Cons (mkstr rad, Cons (mkstr "DLEXT", Cons (mkstr "bundle", Nil))))))))))))))))))))))))) in
   let _ = map_set consts "RbConfig::CONFIG" rbc in
   let _ = map_set consts "RbConfig::TOPDIR" (mkstr "/usr") in
   // rbconfig.rb also defines a TOP-LEVEL `CROSS_COMPILING` (nil for a native
@@ -42669,20 +43008,24 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set consts "File::Constants::LOCK_EX" (VInt 2) in
   let _ = map_set consts "File::Constants::LOCK_UN" (VInt 8) in
   let _ = map_set consts "File::Constants::LOCK_NB" (VInt 4) in
-  let _ = map_set consts "RUBY_VERSION" (mkstr "3.2.2") in
+  // The identity is the REFERENCE ruby's (tools/ref_ruby.sh): mere-ruby has no
+  // version of its own to report, and every gate compares its output against
+  // that ruby's, so RUBY_VERSION has to be the one whose rubygems, bundler and
+  // bundled_gems.rb branch on it. 3.2.2 until 2026-09-05, then 4.0.6.
+  let _ = map_set consts "RUBY_VERSION" (mkstr "4.0.6") in
   let _ = map_set consts "RUBY_ENGINE" (mkstr "ruby") in
-  let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "3.2.2") in
-  let _ = map_set consts "RUBY_PATCHLEVEL" (VInt 53) in
-  let _ = map_set consts "RUBY_RELEASE_DATE" (mkstr "2023-03-30") in
+  let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "4.0.6") in
+  let _ = map_set consts "RUBY_PATCHLEVEL" (VInt 0) in
+  let _ = map_set consts "RUBY_RELEASE_DATE" (mkstr "2026-07-14") in
   // The reference ruby's own revision. Like the RbConfig paths this is a
   // borrowed fact rather than a description of this interpreter -- there is no
   // git revision of mere-ruby to report here -- and it is what a program that
   // prints its ruby's identity expects to find. bundler's version command reads
   // it, so its absence was a NameError in the middle of `bundle --version`.
-  let _ = map_set consts "RUBY_REVISION" (mkstr "e51014f9c05aa65cbf203442d37fef7c12390015") in
-  let _ = map_set consts "RUBY_PLATFORM" (mkstr "arm64-darwin22") in
+  let _ = map_set consts "RUBY_REVISION" (mkstr "03b6d3f8898a28604fe6cb00eae3226b821168f4") in
+  let _ = map_set consts "RUBY_PLATFORM" (mkstr "arm64-darwin25") in
   let _ = map_set consts "RUBY_DESCRIPTION" (mkstr ruby_desc) in
-  let _ = map_set consts "RUBY_COPYRIGHT" (mkstr "ruby - Copyright (C) 1993-2023 Yukihiro Matsumoto") in
+  let _ = map_set consts "RUBY_COPYRIGHT" (mkstr "ruby - Copyright (C) 1993-2026 Yukihiro Matsumoto") in
   let _ = map_set consts "STDOUT" (VObj outid) in
   let _ = map_set globals "stdout" (VObj outid) in
   let errid = alloc_oid ocls in

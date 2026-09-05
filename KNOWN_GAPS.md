@@ -314,6 +314,50 @@ on; or loading the file, which is the real answer. The first is not a fix for
 the second -- a LoadError there means `Gem::BUNDLED_GEMS` does not exist and
 bundler simply skips the warning it wanted to give.
 
+**2026-09-05, third update: the last step agrees, and `bundlertest/run.sh` has
+no recorded divergence left again.** Moving the reference to ruby 4.0.6 (whose
+bundler is 4.0.16) broke `setup` three times over, each one a different fault
+in this interpreter rather than a boundary:
+
+1. Every step, `dsl` included, failed on `require "bundler"`. RubyGems 4's
+   vendored uri writes `class << self; EscapedChars = "..."; def escape(name)
+   ... EscapedChars`, and a method defined in a `class << self` body could not
+   see a constant that body defined -- the body could. `register_class_sng_in`
+   never set the lexical scope that `register_class_v` records for a `def`, so
+   the methods carried the ENCLOSING class's scope.
+2. `Bundler.setup` then raised `undefined method 'missing?' for an instance of
+   Array` from bundler's materialization. Bundler sorts platform candidates
+   through rubygems' `matching.sort_by.with_index {|spec, i| ... }`, and
+   `with_index` answered `[spec, index]` PAIRS: it materialised the elements
+   and re-ran the source method over pairs, where ruby calls the source once
+   with the block wrapped in a counter. The same two phases truncated every
+   short-circuiting source (`[3,1,2].find.to_a` was `[3]`, because the walk
+   that materialises has to answer something and an Array is truthy).
+3. `bundled_gems.rb` reads `RbConfig::CONFIG["rubylibdir"]` and appends "/" to
+   it. This interpreter's RbConfig is a stand-in with the handful of keys
+   libraries actually read, and that was not one of them, so the answer was
+   `nil + "/"`. `rubylibdir`, `rubyarchdir` and `DLEXT` are derived from the
+   same prefix now.
+
+## `minmax_by`'s enumerator walks its source twice, and `break` does not leave a `with_index`
+
+Two small edges of the same machinery, both measured against ruby 4.0.6:
+
+`[3,1,2].minmax_by.to_a` answers `[3, 1, 2, 3, 1, 2]` where ruby answers
+`[3, 1, 2]` -- materialising that enumerator drives `minmax_by`, which walks
+its receiver once for the minimum and once for the maximum. Every other source
+in `corpus/183` materialises in one pass. `minmax_by.with_index` is not
+affected: with_index calls the source once with a wrapped block and never
+materialises.
+
+`break` inside a `with_index` block ends that block, not the walk:
+`[1,2,3].map.with_index { |x, i| break :b if i == 1; x }` answers
+`[1, :b, 3]` where ruby answers `:b`. The wrapper reaches the caller's block
+through a Proc, and a break inside a proc called with `#call` is that call's
+value here. Propagating it would need the flow to travel back out through the
+call, which is the same missing piece as `proc { break }.call` (ruby raises
+LocalJumpError there; this answers the value).
+
 `Exception#backtrace` is the same gap seen from the other side: it answers
 `nil` rather than the frames the exception was raised through. It has to
 answer *something*, because a library reads a backtrace while it is

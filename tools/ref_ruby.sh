@@ -18,10 +18,20 @@
 # twenty-one newly measurable pairs fail, which is the point: they were failing
 # before and could not be seen.
 #
+# 2026-09-05: 3.4.9 to 4.0.6, measured the same way before the move -- the two
+# rubies diffed against each other, not against mere-ruby. 175 of 180 corpus
+# programs print the same under both (Set#inspect, `require "set"`, strip's
+# arity and an openssl message are the five). bootstraptest's DRIFT goes 37 to
+# 6 with no pair lost; the thirty-one newly measurable pairs are all Ractor.
+# ruby/spec's 1081 files in the recorded groups print the same in 1078, and the
+# other three differ by an object address: the mspec shim's ruby_version_is
+# never yields, so version-guarded blocks are skipped on BOTH sides whatever
+# the reference is, and that record cannot see a reference move at all.
+#
 # So: name the version, select it if rbenv has it, and refuse to run otherwise.
 # Refusing is the point. A gate that runs against whatever ruby is on PATH
 # reports a regression that did not happen, and the reader cannot tell.
-REF_RUBY_VERSION="${REF_RUBY_VERSION:-3.4.9}"
+REF_RUBY_VERSION="${REF_RUBY_VERSION:-4.0.6}"
 if [ "$(ruby -e 'print RUBY_VERSION' 2>/dev/null)" != "$REF_RUBY_VERSION" ]; then
   if [ -x "$HOME/.rbenv/versions/$REF_RUBY_VERSION/bin/ruby" ]; then
     RBENV_VERSION="$REF_RUBY_VERSION"; export RBENV_VERSION

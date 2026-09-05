@@ -11,7 +11,7 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 - **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable)
 - **SLOW** ran past this harness's per-file limit — working, not aborting
 
-Measured against **ruby 3.4.9** (tools/ref_ruby.sh). The reference is part
+Measured against **ruby 4.0.6** (tools/ref_ruby.sh). The reference is part
 of the subject: a row measured against another release is not comparable with the
 ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
