@@ -32463,12 +32463,50 @@ and struct_to_h_pairs = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, Cons (EIVar m, struct_to_h_pairs r))
 
 // #[] body: return the ivar whose member symbol or 0-based index matches __k.
+// `s[0]`, `s[:a]`, `s["a"]` and `s[-1]` all name one member, and an index past
+// the end is an IndexError rather than nil (`s[:nope]` is a NameError).
 and struct_index_body = fn (ms: str list) -> fn (i: int) ->
+  struct_index_go ms 0 (struct_len ms)
+and struct_len = fn (ms: str list) ->
+  match ms with Nil -> 0 | Cons (_, r) -> 1 + struct_len r
+and struct_index_go = fn (ms: str list) -> fn (i: int) -> fn (n: int) ->
   match ms with
-  | Nil -> ENil
+  | Nil -> struct_index_refuse ()
   | Cons (m, r) ->
-    ETern (EBin ("||", EBin ("==", EVar "__k", ESym m), EBin ("==", EVar "__k", EInt i)),
-           EIVar m, struct_index_body r (i + 1))
+    ETern (struct_key_test m i n, EIVar m, struct_index_go r (i + 1) n)
+and struct_key_test = fn (m: str) -> fn (i: int) -> fn (n: int) ->
+  EBin ("||",
+        EBin ("||", EBin ("==", EVar "__k", ESym m), EBin ("==", EVar "__k", EStrL m)),
+        EBin ("||", EBin ("==", EVar "__k", EInt i), EBin ("==", EVar "__k", EInt (i - n))))
+// no member matched: an Integer key is an IndexError, anything else a NameError
+// (`raise` is its own node, not a call, and the message is built with #to_s so
+// an Integer key concatenates)
+and struct_index_refuse = fn (u: unit) ->
+  EStmt (SIf (Cons ((EMethod (EVar "__k", "is_a?", Cons (EConst "Integer", Nil)),
+                     Cons (SExpr (ERaise (Cons (EConst "IndexError",
+                            Cons (EBin ("+",
+                                        EBin ("+", EStrL "offset ", EMethod (EVar "__k", "to_s", (Nil : Expr list))),
+                                        EBin ("+", EStrL " too large for struct(size:",
+                                              EBin ("+", EMethod (EMethod (EMethod (ESelf, "to_a", (Nil : Expr list)), "size", (Nil : Expr list)), "to_s", (Nil : Expr list)),
+                                                    EStrL ")"))), Nil)))), Nil)), Nil),
+              Cons (SExpr (ERaise (Cons (EConst "NameError",
+                     Cons (EBin ("+", EBin ("+", EStrL "no member '", EMethod (EVar "__k", "to_s", (Nil : Expr list))),
+                                 EStrL "' in struct"), Nil)))), Nil)))
+
+// was keyword_init: mentioned at all? (`nil` and `false` are different answers
+// from #keyword_init?)
+// `keyword_init: nil` is mentioned AND answers nil
+and struct_kw_nil = fn (args: Val list) ->
+  match args with
+  | Nil -> false
+  | Cons (VHsh h, _) -> (match hash_lookup (hderef h) (VSym "keyword_init") with (true, VNil) -> true | _ -> false)
+  | Cons (_, r) -> struct_kw_nil r
+
+and struct_kw_mentioned = fn (args: Val list) ->
+  match args with
+  | Nil -> false
+  | Cons (VHsh h, _) -> (match hash_lookup (hderef h) (VSym "keyword_init") with (true, _) -> true | _ -> false)
+  | Cons (_, r) -> struct_kw_mentioned r
 
 // keyword_init: true among the Struct.new arguments?
 and struct_kw_init = fn (args: Val list) ->
@@ -32500,6 +32538,107 @@ and struct_each_yields = fn (ms: str list) ->
 
 and struct_init_body = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (SIVarAssign (m, EVar m), struct_init_body r)
+
+// The part of a Struct's surface that does not depend on the member NAMES:
+// written once, in ruby, and registered into every struct class. Reading the
+// members at run time means a struct of any length gets all of it, and there is
+// one place each answer comes from -- the alternative was an Expr tree per
+// method per member list.
+and struct_common_src = fn (u: unit) ->
+    "  def __member_index(k)\n" ++
+    "    ms = members\n" ++
+    "    unless k.is_a?(Integer) || k.is_a?(Symbol) || k.is_a?(String)\n" ++
+    "      raise TypeError, \"no implicit conversion of \" + k.class.to_s + \" into Integer\"\n" ++
+    "    end\n" ++
+    "    i = k.is_a?(Integer) ? (k < 0 ? ms.size + k : k) : ms.index(k.to_sym)\n" ++
+    "    if i.nil?\n" ++
+    "      raise NameError, \"no member '\" + k.to_s + \"' in struct\"\n" ++
+    "    end\n" ++
+    "    if i < 0\n" ++
+    "      raise IndexError, \"offset \" + k.to_s + \" too small for struct(size:\" + ms.size.to_s + \")\"\n" ++
+    "    end\n" ++
+    "    if i >= ms.size\n" ++
+    "      raise IndexError, \"offset \" + k.to_s + \" too large for struct(size:\" + ms.size.to_s + \")\"\n" ++
+    "    end\n" ++
+    "    i\n" ++
+    "  end\n" ++
+    "  private :__member_index\n" ++
+    "\n" ++
+    "  def [](k)\n" ++
+    "    instance_variable_get(\"@\" + members[__member_index(k)].to_s)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def []=(k, v)\n" ++
+    "    instance_variable_set(\"@\" + members[__member_index(k)].to_s, v)\n" ++
+    "    v\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def dig(*ks)\n" ++
+    "    k = ks[0]\n" ++
+    "    ms = members\n" ++
+    "    unless k.is_a?(Integer) || k.is_a?(Symbol) || k.is_a?(String)\n" ++
+    "      raise TypeError, \"no implicit conversion of \" + k.class.to_s + \" into Integer\"\n" ++
+    "    end\n" ++
+    "    i = k.is_a?(Integer) ? (k < 0 ? ms.size + k : k) : ms.index(k.to_sym)\n" ++
+    "    return nil if i.nil? || i < 0 || i >= ms.size\n" ++
+    "    v = instance_variable_get(\"@\" + ms[i].to_s)\n" ++
+    "    return v if ks.size <= 1\n" ++
+    "    return nil if v.nil?\n" ++
+    "    v.dig(*ks.drop(1))\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def values_at(*ix)\n" ++
+    "    ms = members\n" ++
+    "    ix.map do |k|\n" ++
+    "      i = k < 0 ? ms.size + k : k\n" ++
+    "      if i < 0\n" ++
+    "        raise IndexError, \"offset \" + k.to_s + \" too small for struct(size:\" + ms.size.to_s + \")\"\n" ++
+    "      end\n" ++
+    "      if i >= ms.size\n" ++
+    "        raise IndexError, \"offset \" + k.to_s + \" too large for struct(size:\" + ms.size.to_s + \")\"\n" ++
+    "      end\n" ++
+    "      instance_variable_get(\"@\" + ms[i].to_s)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def to_h(&b)\n" ++
+    "    h = \{}\n" ++
+    "    members.each do |m|\n" ++
+    "      h[m] = instance_variable_get(\"@\" + m.to_s)\n" ++
+    "    end\n" ++
+    "    return h unless b\n" ++
+    "    h.to_h(&b)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def each_pair(&b)\n" ++
+    "    return to_h.each_pair unless b\n" ++
+    "    to_h.each_pair(&b)\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def hash\n" ++
+    "    to_a.hash\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def eql?(o)\n" ++
+    "    o.class == self.class && to_a == o.to_a\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def deconstruct_keys(ks)\n" ++
+    "    return to_h if ks.nil?\n" ++
+    "    ms = members\n" ++
+    "    return \{} if ks.size > ms.size\n" ++
+    "    out = \{}\n" ++
+    "    ks.each do |k|\n" ++
+    "      if k.is_a?(Integer)\n" ++
+    "        break if k < 0 || k >= ms.size\n" ++
+    "      else\n" ++
+    "        break unless ms.include?(k.to_sym)\n" ++
+    "      end\n" ++
+    "      out[k] = self[k]\n" ++
+    "    end\n" ++
+    "    out\n" ++
+    "  end\n"
 
 and struct_members_of_args = fn (args: Val list) ->
   match args with
@@ -32572,6 +32711,28 @@ and struct_build = fn world -> fn (args: Val list) ->
               name_anon cn (VClass anon))
            | _ -> ()) in
   let _ = map_set struct_mem anon (arr_new (struct_sym_vals members)) in
+  // ...and the member-independent half, parsed from ruby and registered into
+  // this class. It comes last, so it wins over the generated #[] / #to_h.
+  let _ = (let (sprog, _) = parse_stmts (number_nls (struct_common_src ()) (lex_go (struct_common_src ()) 0)) Nil in
+           let cenv9 = map_new () in
+           let _ = map_set cenv9 "self" (VClass anon) in
+           let _ = map_set cenv9 "__cscope" (mkstr anon) in
+           let _ = map_set cenv9 "__cref" (mkstr anon) in
+           register_class_v world anon sprog "public" cenv9) in
+  // Struct[] is a synonym for new, and #keyword_init? answers what the class
+  // was built with (nil when it was not mentioned at all, as ruby reports).
+  let _ = map_set meths ("(sng:" ++ anon ++ ")#[]")
+            (Meth (Cons ("*__a", Nil), Nil, Cons (SReturn (EMethod (ESelf, "new", Cons (ESplat (EVar "__a"), Nil))), Nil))) in
+  // ...and the pairs that are one method under two names: reflection compares
+  // the UnboundMethods, and alias_srcname is what says they are the same one.
+  let _ = map_set alias_srcname (anon ++ "#deconstruct") "to_a" in
+  let _ = map_set alias_srcname (anon ++ "#values") "to_a" in
+  let _ = map_set alias_srcname (anon ++ "#to_ary") "to_a" in
+  let _ = map_set alias_srcname (anon ++ "#length") "size" in
+  // Struct#initialize is private, as ruby's is (a spec asks the class for it)
+  let _ = mark_vis_mode meths anon (Cons ("initialize", Nil)) "private" in
+  let _ = map_set meths ("(sng:" ++ anon ++ ")#keyword_init?")
+            (Meth (Nil, Nil, Cons (SReturn (if struct_kw_nil args then ENil else if struct_kw_mentioned args then EBool kw else ENil), Nil))) in
   VClass anon
 
 // the innermost `n` recorded call names, outermost of that window first.
