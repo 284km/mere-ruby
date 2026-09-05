@@ -357,34 +357,6 @@ does everything the Set library itself iterates with. It is the same shape the
 enumerator's `with_index` had until it stopped materialising: two phases where
 ruby has one.
 
-## A Hash compares object keys by identity, not by `#hash` and `#eql?`
-
-Ruby looks a key up by asking it: `#hash` puts it in a bucket, `#eql?` settles
-the bucket. This Hash compares with its own structural equality, which for an
-object means IDENTITY -- so a class that defines both is not honoured:
-
-```ruby
-class K
-  def initialize(v) = @v = v
-  def hash = @v.hash
-  def eql?(o) = o.is_a?(K) && o.instance_variable_get(:@v) == @v
-end
-h = { K.new(1) => :x }
-h[K.new(1)]   # ruby: :x   here: nil
-```
-
-The same gap is why a Set of Sets does not behave: `Set[Set[1, 2]].include?(Set[2, 1])`
-is false here, and four of the five remaining `core/set` differences are this one
-gap wearing different clothes (`divide`, `equal_value`, `include`, and `classify`,
-whose Hash VALUES are Sets compared the same way).
-
-Fixing it means the key comparison has to be able to CALL a method, and the
-functions that compare keys (`hkey_eql`, `hash_get_x` and the rest) are deliberate
-world-free primitives -- they are reached from thirteen sites, several of them in
-`prim_method_raw`, which has no interpreter to call back into. The shape of the
-fix is a world-aware lookup that runs only when the plain one MISSES and the key
-is an object, so the fast path stays where it is.
-
 ## A Range walks integers and strings, and nothing else
 
 A Range holds its bounds as values, so `("a".."e")`, `(1.0..2.0)`, `(1..)`

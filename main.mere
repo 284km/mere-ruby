@@ -12855,7 +12855,26 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // comparison is REVERSED (`obj == 3.0`) rather than answered false,
     // because a numeric cannot know about the object and the object can.
     // `[2, 3.0, 3, x].find_index(x)` is 1 in ruby for exactly this reason.
+    // Two HASHES (or two Arrays) that the structural comparison calls unequal,
+    // holding objects: their members' own #== decides, and the value-level
+    // comparison cannot ask it. Routed to the dispatcher, which has the arm.
     if (str_eq op "==" || str_eq op "!=")
+       && (match va0 with VHsh _ -> true | VArr _ -> true | _ -> false)
+       && (let bv8 = eval_e env world blk b in
+           (match (va0, bv8) with
+            | (VHsh h8, VHsh _) -> (if rb_eq va0 bv8 then false else hash_has_obj world (hderef h8))
+            | (VArr a8, VArr _) -> (if rb_eq va0 bv8 then false else arr_has_obj world (deref a8))
+            | (_, _) -> false)) then
+      // ...compared HERE rather than through the dispatcher: a binary operator
+      // on a primitive routes back to this path, and the two would call each
+      // other forever.
+      (let bv8 = eval_e env world blk b in
+       let r8 = (match (va0, bv8) with
+                 | (VHsh h8, VHsh h9) -> hash_eq_w env world h8 h9
+                 | (VArr a8, VArr a9) -> arr_eq_w env world (deref a8) (deref a9)
+                 | (_, _) -> false) in
+       VBool (if str_eq op "==" then r8 else (if r8 then false else true)))
+    else if (str_eq op "==" || str_eq op "!=")
        && (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | _ -> false)
        // ...unless the receiver's own class redefined == (corpus/134 pins that
        // `1 == 2` follows a redefined Integer#==), which the arms below reach.
@@ -18483,6 +18502,66 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // overrides #default answers it (the primitive read the stored default and
   // never asked). The plain default is what Hash#default itself answers, so
   // this only needs to fire when the class has its own.
+  // Two hashes the structural comparison called unequal, at least one of them
+  // holding objects: ask the values (and the keys) themselves. Guarded to the
+  // case where the plain answer was already false, so an ordinary comparison
+  // never reaches it.
+  else if (str_eq name "==" || str_eq name "eql?")
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (VHsh _, _) -> true | _ -> false)
+          && (match recv with
+              | VHsh h1 -> (match args with
+                            | Cons (VHsh h2, _) -> (if rb_eq recv (VHsh h2) then false else hash_has_obj world (hderef h1))
+                            | _ -> false)
+              | _ -> false) then
+    (match recv with
+     | VHsh h1 -> (match args with
+                   | Cons (VHsh h2, _) -> VBool (hash_eq_w env world h1 h2)
+                   | _ -> VBool false)
+     | _ -> VBool false)
+  // ...and two Arrays the same way: element by element, asking an object its own
+  else if (str_eq name "==" || str_eq name "eql?")
+          && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Cons (VArr _, _) -> true | _ -> false)
+          && (match recv with
+              | VArr a1 -> (match args with
+                            | Cons (VArr a2, _) -> (if rb_eq recv (VArr a2) then false else arr_has_obj world (deref a1))
+                            | _ -> false)
+              | _ -> false) then
+    (match recv with
+     | VArr a1 -> (match args with
+                   | Cons (VArr a2, _) -> VBool (arr_eq_w env world (deref a1) (deref a2))
+                   | _ -> VBool false)
+     | _ -> VBool false)
+  // A Hash READ whose key is an object with its own #hash and #eql?: the fast
+  // lookup compares identity and misses, so ask the key which stored key it is
+  // equal to and re-ask with THAT one. Guarded so that an ordinary hash never
+  // reaches it: the receiver is a Hash, the key is such an object, and the
+  // plain lookup has already missed.
+  else if (match recv with VHsh _ -> true | _ -> false)
+          && (str_eq name "[]" || str_eq name "key?" || str_eq name "has_key?" || str_eq name "include?"
+              || str_eq name "member?" || str_eq name "fetch" || str_eq name "delete" || str_eq name "assoc")
+          && (match args with Cons (k9, _) -> key_has_own_eql world k9 | _ -> false)
+          && (match recv with
+              | VHsh hid9 -> (match args with
+                              | Cons (k9, _) -> (if hash_haskey_x (hcbi_on hid9) (hderef hid9) k9 then false else true)
+                              | _ -> false)
+              | _ -> false)
+          && (match recv with
+              | VHsh hid9 -> (match args with
+                              | Cons (k9, _) -> (let (f9, _) = hash_find_key_w env world hid9 k9 in f9)
+                              | _ -> false)
+              | _ -> false) then
+    (match recv with
+     | VHsh hid9 ->
+       (match args with
+        | Cons (k9, rest9) ->
+          (let (_, kk9) = hash_find_key_w env world hid9 k9 in
+           if str_eq name "key?" || str_eq name "has_key?" || str_eq name "include?" || str_eq name "member?"
+           then VBool true
+           else invoke_val_c env world blk recv name (Cons (kk9, rest9)) false)
+        | _ -> VNil)
+     | _ -> VNil)
   else if str_eq name "[]" && (match recv with VHsh _ -> true | _ -> false)
           && (match args with Cons (_, Nil) -> true | _ -> false)
           && has_meth world (dispatch_cls_of world recv) "default"
@@ -23324,6 +23403,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
               | _ -> VNil))
           else if str_eq name "with_object" then
             invoke_with_block env world blk (enum_to_arr env world blk id) "each_with_object" args newblk
+          // Enumerator#each with a block IS the source method with that block --
+          // `set.classify.each { |x| x.length }` is `set.classify { ... }`, and
+          // materialising instead answered the elements. A generator (no source
+          // to call) still materialises, below.
+          else if str_eq name "each" && (let (_, _, _, ivb) = world in map_has ivb (str_of_int id ++ "@recv")) then
+            (let (_, _, _, ivb) = world in
+             let recv2 = map_get ivb (str_of_int id ++ "@recv") in
+             let src2 = (match (if map_has ivb (str_of_int id ++ "@meth") then map_get ivb (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
+             let eargs2 = (match (if map_has ivb (str_of_int id ++ "@eargs") then map_get ivb (str_of_int id ++ "@eargs") else VNil) with
+                           | VArr aid3 -> deref aid3
+                           | _ -> Nil) in
+             invoke_with_block env world blk recv2 src2 eargs2 newblk)
           else
             invoke_with_block env world blk (enum_to_arr env world blk id) (if str_eq name "with_index" then "each_with_index" else name) args newblk)
        | _ -> VNil)
@@ -24755,9 +24846,11 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name "year" || str_eq name "month" || str_eq name "mon" || str_eq name "day" ||
     str_eq name "mday" || str_eq name "hour" || str_eq name "min" || str_eq name "sec" ||
     str_eq name "wday" || str_eq name "yday" || str_eq name "usec" ||
-    // Time compares, which is what makes (t1..t2) a range
+    // Time compares, which is what makes (t1..t2) a range -- and #== belongs in
+    // the list beside #eql?: without it nothing knew a Time answers equality,
+    // so an Array of Times compared its elements by identity.
     str_eq name "<=>" || str_eq name "<" || str_eq name "<=" ||
-    str_eq name ">" || str_eq name ">=" || str_eq name "eql?" ||
+    str_eq name ">" || str_eq name ">=" || str_eq name "eql?" || str_eq name "==" ||
     str_eq name "+" || str_eq name "-"
   // Method and UnboundMethod: their whole surface is in the dispatcher too, so
   // nothing knew a Method had any methods -- `m.respond_to?(:call)` was false
@@ -24841,6 +24934,102 @@ and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
 // must not change the key, and the stored key carries no singleton methods.
 // An object key's #eql? is dispatched here, which the value-level comparison
 // cannot do.
+// The key this hash STORES that is eql? to k, asking the KEY -- the plain
+// comparison is identity for an object, so a class that defines #hash and
+// #eql? was not honoured on the way OUT (it already was on the way in, which
+// is why `h[K.new(1)] = v; h[K.new(1)]` stored one pair and found none).
+// Answers (found, the stored key), so the caller can re-ask with a key the
+// fast path will find. Only reached when the fast lookup MISSED, so an
+// ordinary hash pays one map lookup for it.
+// Two hashes are equal when they hold the same pairs -- and "the same" is the
+// VALUE's own #==, which the structural comparison cannot ask: a Hash of
+// objects (a Set#classify answer, whose values are Sets) compared by identity
+// and said false. Only reached when the structural comparison already said no.
+and arr_eq_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match (xs, ys) with
+  | (Nil, Nil) -> true
+  | (Cons (x, xt), Cons (y, yt)) ->
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let same = (if obj_answers_eq world x
+                 then truthy (invoke_val_c env world nb9 x "==" (Cons (y, Nil)) false)
+                 else cmp_member_w env world x y) in
+     if same then arr_eq_w env world xt yt else false)
+  | (_, _) -> false
+
+and hash_eq_w = fn env -> fn world -> fn (h1: int) -> fn (h2: int) ->
+  let xs = hderef h1 in
+  let ys = hderef h2 in
+  if hash_len xs == hash_len ys then hash_eq_w_go env world h2 xs else false
+and hash_eq_w_go = fn env -> fn world -> fn (h2: int) -> fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (let ci2 = hcbi_on h2 in
+     let found = (if hash_haskey_x ci2 (hderef h2) k then (true, hash_get_x ci2 (hderef h2) k)
+                  else (let (f9, kk9) = hash_find_key_w env world h2 k in
+                        if f9 then (true, hash_get_x ci2 (hderef h2) kk9) else (false, VNil))) in
+     match found with
+     | (false, _) -> false
+     | (_, v2) ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let same = (if obj_answers_eq world v
+                    then truthy (invoke_val_c env world nb9 v "==" (Cons (v2, Nil)) false)
+                    else cmp_member_w env world v v2) in
+        if same then hash_eq_w_go env world h2 t else false))
+  | _ -> true
+
+and hash_find_key_w = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
+  if hcbi_on hid then (false, VNil)
+  else
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let rec go = fn (ys: Val list) ->
+       (match ys with
+        | Cons (k2, Cons (_, t)) ->
+          (if truthy (invoke_val_c env world nb9 k "eql?" (Cons (k2, Nil)) false) then (true, k2) else go t)
+        | _ -> (false, VNil)) in
+     go (hderef hid))
+
+// does this key bring its own #eql? and #hash? (both, as ruby requires)
+// does this hash hold an object anywhere? (only such a hash can disagree with
+// the structural comparison)
+// does this container hold an object whose class defines #== ? Only such a
+// member can disagree with the structural comparison, and asking one that does
+// NOT define it is a NoMethodError rather than an answer.
+and arr_has_obj = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (VObj o9, t) -> (if obj_answers_eq world (VObj o9) then true else arr_has_obj world t)
+  | Cons (_, t) -> arr_has_obj world t
+
+// can the dispatcher answer #== for this object? A user method, or a builtin
+// arm (a Time compares by its instant, a Method by its definition). Asking one
+// that can answer NEITHER is a NoMethodError, not a false.
+// a member that is itself a container is compared the same way, all the way
+// down: `[[Version.new(1)]] == [[Version.new(1)]]` is one nesting deeper than
+// the structural answer can see
+and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
+  if rb_eq x y then true
+  else
+    (match (x, y) with
+     | (VArr a3, VArr b3) -> arr_eq_w env world (deref a3) (deref b3)
+     | (VHsh h3, VHsh g3) -> hash_eq_w env world h3 g3
+     | (_, _) -> false)
+
+and obj_answers_eq = fn world -> fn (v: Val) ->
+  match v with
+  // through the DISPLAY class: an object with a singleton (a Time with a
+  // `def t.succ` on it) dispatches through "(sng:N)", which no builtin list
+  // mentions, and the array of them then compared by identity
+  | VObj _ -> (let c9 = dispatch_cls_of world v in
+               has_meth world c9 "==" || builtin_obj_has (display_cls world c9) "==")
+  | _ -> false
+
+and hash_has_obj = fn world -> fn (xs: Val list) -> arr_has_obj world xs
+
+and key_has_own_eql = fn world -> fn (k: Val) ->
+  match k with
+  | VObj _ -> (let c9 = dispatch_cls_of world k in has_meth world c9 "eql?" && has_meth world c9 "hash")
+  | _ -> false
+
 and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
   let ci = hcbi_on hid in
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
