@@ -2385,6 +2385,14 @@ and percent_body = fn (s: str) -> fn (i: int) ->
   // `x.%(3)` — a `%` right after a dot is the METHOD, never a literal. The
   // same holds for a backtick: `Kernel.`(cmd)` calls the method.
   else if i > 0 && str_eq (char_at s (i - 1)) "." then 0 - 1
+  // ...and `def %(other)` defines the METHOD: after `def` a % is a name, not a
+  // literal opener. `class C; def %(o); end; end` did not parse at all, which
+  // is every spec that defines modulo on its own class.
+  // (guarded: with nothing before the %, prev_nonspace answers -1 and
+  // word_ending_at would take a substring at a negative index -- which is how
+  // a file whose FIRST token is `%w[...]` died with an interpreter error)
+  else if (let pv = prev_nonspace s (i - 1) in
+           pv >= 0 && str_eq (word_ending_at s pv) "def") then 0 - 1
   else
     let c1 = char_at s (i + 1) in
     // Bracket delimiters ( { [ < are unambiguous openers. Other clean
@@ -8114,8 +8122,25 @@ let big_bitop = fn (op: str) -> fn (a: str) -> fn (b: str) ->
   big_from_bits (big_bits_zip op (big_to_bits a) (big_to_bits b)) "1";
 // as a Val, guarding against negative operands (out of scope): fall back to
 // a plain fail so the coerce layer / caller surfaces it.
+// ...and NEGATIVE operands, which ruby reads in two's complement: each side is
+// taken modulo 2**N for a width N wide enough for both, the bits are combined
+// there, and a result whose top bit is set comes back as a negative. `-1 & x`
+// used to be "unsupported" -- a bare fail that reached the program as a
+// StandardError with no idea what was asked.
+let big_two_pow = fn (n: int) -> big_pow "2" n "1";
+let big_tc_width = fn (a: str) -> fn (b: str) ->
+  let w = fn (x: str) -> str_len (if big_sign x < 0 then big_neg_s x else x) * 4 + 8 in
+  let wa = w a in let wb = w b in
+  (if wa > wb then wa else wb);
+let big_tc_in = fn (x: str) -> fn (m: str) ->
+  if big_sign x < 0 then big_add_s m x else x;
 let big_bitop_v = fn (op: str) -> fn (a: str) -> fn (b: str) ->
-  if big_sign a < 0 || big_sign b < 0 then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: bignum bitwise on negative operand unsupported")) in fail "mere-ruby: bignum bitwise on negative operand unsupported")
+  if big_sign a < 0 || big_sign b < 0 then
+    (let n = big_tc_width a b in
+     let m = big_two_pow n in
+     let half = big_two_pow (n - 1) in
+     let r = big_bitop op (big_tc_in a m) (big_tc_in b m) in
+     norm_big (if big_cmp_s r half >= 0 then big_sub_s r m else r))
   else norm_big (big_bitop op a b);
 
 // a list concatenated with itself n times (Array * Integer).
@@ -8315,6 +8340,29 @@ let flt_floor_mod = fn (x: float) -> fn (y: float) ->
   let fq = (let t = int_of_float q in if float_of_int t > q then float_of_int (t - 1) else float_of_int t) in
   x - y * fq;
 
+// a % b for rationals: a - b * (a/b).floor, in exact arithmetic (a Float on
+// either side makes it a Float modulo, as every rational operation does).
+let rat_mod = fn (va: Val) -> fn (vb: Val) ->
+  if (match va with VFlt _ -> true | _ -> false) || (match vb with VFlt _ -> true | _ -> false)
+  then
+    // ...and 0.0 is a zero divisor here as much as 0 is: a Rational modulo
+    // refuses it rather than answering a Float NaN (`Rational(3,5) % 0.0`)
+    (let _ = (if to_f vb == 0.0 then (let _ = prim_raise "ZeroDivisionError" "divided by 0" in ()) else ()) in
+     VFlt (flt_floor_mod (to_f va) (to_f vb)))
+  else
+    (let an = (match va with VRat (n, d) -> n | VInt n -> str_of_int n | VBig b -> b | _ -> "0") in
+     let ad = (match va with VRat (n, d) -> d | _ -> "1") in
+     let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | VBig b -> b | _ -> "0") in
+     let bd = (match vb with VRat (n, d) -> d | _ -> "1") in
+     // dividing by zero is a refusal, not an answer: the exact arithmetic below
+     // would happily divide by it
+     let _ = (if str_eq bn "0" then (let _ = prim_raise "ZeroDivisionError" "divided by 0" in ()) else ()) in
+     // q = floor((an*bd) / (ad*bn)) -- big_divmod_s already floors
+     let num = big_mul_s an bd in
+     let den = big_mul_s ad bn in
+     let q = big_div_s num den in
+     match rat_sub_s an ad (big_mul_s bn q) bd with r -> r);
+
 // A shift whose COUNT is a bignum. Shifting away by that much leaves nothing
 // of the receiver but its sign (0, or -1 for a negative one); shifting toward
 // it cannot be represented and is a RangeError, as in ruby. `left` says which
@@ -8335,9 +8383,29 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   else if ((match va with VCpx _ -> true | _ -> false) || (match vb with VCpx _ -> true | _ -> false))
      && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/")
   then cpx_arith op va vb
+  // Rational ** Rational: a whole exponent stays exact, a fractional one is a
+  // Float (`Rational(4,1) ** Rational(1,2)` is 2.0, not (2/1))
+  else if str_eq op "**" && (match va with VRat _ -> true | _ -> false)
+          && (match vb with VRat (_, bd9) -> str_eq bd9 "1" | VInt _ -> true | _ -> false) then
+    (match va with
+     | VRat (an9, ad9) ->
+       (let bn9 = (match vb with VRat (n9, _) -> n9 | VInt n9 -> str_of_int n9 | _ -> "0") in
+        let e9 = int_of_str bn9 in
+        if e9 >= 0 then mk_rat_s (big_pow an9 e9 "1") (big_pow ad9 e9 "1")
+        else mk_rat_s (big_pow ad9 (0 - e9) "1") (big_pow an9 (0 - e9) "1"))
+     | _ -> VNil)
+  else if str_eq op "**" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false)) then
+    pow_val (to_f va) (to_f vb)
   else if (match va with VCpx _ -> true | _ -> false) && str_eq op "**" then
     (match vb with
      | VInt n -> cpx_pow va n
+     // a Complex to a WHOLE float power is that many multiplications, which is
+     // exact enough for what ruby answers ((1+0i)**0.0 is (1.0+0.0i))
+     | VFlt fy -> (if feq fy (float_of_int (int_of_float fy)) && int_of_float fy >= 0
+                   then (match cpx_pow va (int_of_float fy) with
+                         | VCpx (re9, im9) -> VCpx (VFlt (to_f re9), VFlt (to_f im9))
+                         | other9 -> other9)
+                   else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** complex exponent unsupported")) in fail "mere-ruby: ** complex exponent unsupported"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** complex exponent unsupported")) in fail "mere-ruby: ** complex exponent unsupported"))
   else if str_eq op "|" then
     (match va with
@@ -8426,6 +8494,11 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
         | VFlt y -> VFlt (x / y)
         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: / type error")) in fail "mere-ruby: / type error"))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: / type error")) in fail "mere-ruby: / type error"))
+  // a Rational on either side is exact (a Float on either side makes it a
+  // Float), and it has to be decided BEFORE the arm below, whose match ends in
+  // a bare fail for anything that is not Int/Float/Big.
+  else if str_eq op "%" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false)) then
+    rat_mod va vb
   else if str_eq op "%" then
     (match va with
      | VInt x ->
@@ -13143,7 +13216,18 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        // has to come BEFORE the incomparable test, which would call them both
        // unorderable and answer nil. (`<=>` is an operator, so it never reaches
        // the dispatcher arm that carries the rest of Object's protocol.)
-       if cmp_incompatible va0 vb && rb_eq va0 vb then VInt 0
+       //
+       // ...and a NUMBER against an object that coerces asks it first: ruby
+       // answers `1 <=> obj` from the coerced pair, and this said nil.
+       if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
+          && (match vb with VObj _ -> true | _ -> false) && responds world vb "coerce" then
+         (let nb8 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          match invoke_val_c env world nb8 vb "coerce" (Cons (va0, Nil)) false with
+          | VArr aid8 -> (match deref aid8 with
+                          | Cons (x8, Cons (y8, Nil)) -> coerced_apply env world "<=>" x8 y8
+                          | _ -> VNil)
+          | _ -> VNil)
+       else if cmp_incompatible va0 vb && rb_eq va0 vb then VInt 0
        else if cmp_incompatible va0 vb then VNil
        // world-aware, so `[obj] <=> [obj]` reaches the elements' own <=>: the
        // value-level comparator cannot call one, and this is an OPERATOR, so it
@@ -13197,7 +13281,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       // class name for a heap object — CRuby's coerce_failed).
       else if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | VCpx _ -> true | _ -> false)
               && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/"
-                  || str_eq op "%" || str_eq op "**" || str_eq op "&" || str_eq op "|" || str_eq op "^")
+                  || str_eq op "%" || str_eq op "**" || str_eq op "&" || str_eq op "|" || str_eq op "^"
+                  // `1 <=> obj` coerces too -- and answers NIL when it cannot,
+                  // where the arithmetic operators raise
+                  || str_eq op "<=>")
               && (let bitwise = str_eq op "&" || str_eq op "|" || str_eq op "^" in
                   let ok = (if bitwise then (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
                             else (match vb with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | VCpx _ -> true | _ -> false)) in
@@ -13215,8 +13302,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                   | Cons (x, Cons (y, Nil)) -> coerced_apply env world op x y
                   | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
                | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+            else if str_eq op "<=>" then VNil
             else raise_exc world "TypeError" (coerce_operand_display world vb ++ " can't be coerced into " ++ class_name va0))
-         | _ -> raise_exc world "TypeError" (coerce_operand_display world vb ++ " can't be coerced into " ++ class_name va0))
+         | _ -> (if str_eq op "<=>" then VNil
+                 else raise_exc world "TypeError" (coerce_operand_display world vb ++ " can't be coerced into " ++ class_name va0)))
       // a String/Array receiver + a to_str/to_ary-responding object arg:
       // coerce the arg (implicit conversion) before the primitive op.
       else if str_eq op "+"
@@ -13391,6 +13480,14 @@ and coerce_operand_display = fn world -> fn (v: Val) ->
 // apply an operator to a coerced pair: a user object dispatches to its own
 // operator method, plain numerics go straight to arithmetic.
 and coerced_apply = fn env -> fn world -> fn (op: str) -> fn (x: Val) -> fn (y: Val) ->
+  // `<=>` and the method forms are not arith_bin's operators, so a coerced pair
+  // of NUMBERS is compared (or divided) through the dispatcher instead.
+  if (match x with VObj _ -> false | _ -> true)
+     && (str_eq op "<=>" || str_eq op "div" || str_eq op "modulo" || str_eq op "quo"
+         || str_eq op "fdiv" || str_eq op "remainder" || str_eq op "divmod") then
+    (let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     invoke_val_c env world nb7 x op (Cons (y, Nil)) false)
+  else
   match x with
   | VObj xid ->
     (let (m0, s0, ocls0, _) = world in
@@ -15856,6 +15953,14 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if str_eq name "downto" then
       (match args with
        | Cons (VInt m, _) -> iter_each_result (range_down world encl theblk n m) recv
+       // ...and a FLOAT limit, which ruby walks down to (3.downto(1.5) yields
+       // 3 and 2). It used to be "needs an integer" -- a bare fail.
+       | Cons (VFlt f9, _) -> iter_each_result (range_down world encl theblk n
+                       (if flt_is_nan f9 then n + 1
+                        else if flt_is_inf f9 then (if f9 > 0.0 then n + 1 else 0 - int_max)
+                        // walking DOWN stops at the first value below the limit,
+                        // so the last integer yielded is ceil(limit)
+                        else (let t9 = int_of_float f9 in if float_of_int t9 < f9 then t9 + 1 else t9))) recv
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: downto needs an integer")) in fail "mere-ruby: downto needs an integer"))
     else if str_eq name "step" then
       (match args with
@@ -18533,6 +18638,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | Cons (VArr a2, _) -> VBool (arr_eq_w env world (deref a1) (deref a2))
                    | _ -> VBool false)
      | _ -> VBool false)
+  // The METHOD forms of the arithmetic take the coerce protocol too: `1.div(o)`
+  // and `1.modulo(o)` are the operators under other names, and they were
+  // answering NoMethodError for an object that coerces.
+  else if (match recv with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
+          && (str_eq name "div" || str_eq name "modulo" || str_eq name "quo" || str_eq name "fdiv"
+              || str_eq name "remainder" || str_eq name "divmod" || str_eq name "<=>")
+          && (match args with Cons (VObj _, _) -> true | _ -> false)
+          && (match args with Cons (a9, _) -> responds world a9 "coerce" | _ -> false) then
+    (match args with
+     | Cons (a9, _) ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        match invoke_val_c env world nb9 a9 "coerce" (Cons (recv, Nil)) false with
+        | VArr aid9 ->
+          (match deref aid9 with
+           | Cons (x9, Cons (y9, Nil)) -> coerced_apply env world name x9 y9
+           | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+        | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+     | _ -> VNil)
   // A Hash READ whose key is an object with its own #hash and #eql?: the fast
   // lookup compares identity and misses, so ask the key which stored key it is
   // equal to and re-ask with THAT one. Guarded so that an ordinary hash never
@@ -20041,6 +20164,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with Cons (a, Cons (b, _)) -> VFlt (ldexp (to_f a) (int_of_float (to_f b))) | _ -> VFlt 0.0)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Math"))
     // Integer.sqrt(n): the integer square root (floor of the real sqrt).
+    // Integer.try_convert(obj): the object when it IS an Integer, its #to_int
+    // when it has one, and nil otherwise -- never a raise, which is the whole
+    // difference from Integer().
+    else if str_eq c "Integer" && str_eq name "try_convert" then
+      (match args with
+       | Cons (VInt n9, _) -> VInt n9
+       | Cons (VBig b9, _) -> VBig b9
+       | Cons (o9, _) -> (if responds world o9 "to_int"
+                          then invoke_val_c env world blk o9 "to_int" Nil false
+                          else VNil)
+       | _ -> VNil)
     else if str_eq c "Integer" && str_eq name "sqrt" then
       (match args with Cons (v, _) -> VInt (int_of_float (sqrt (to_f v))) | _ -> VInt 0)
     // Random: a source of numbers, not state — `Random.new` answers the module
@@ -27533,11 +27667,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | VInt _ -> (if (match o with VFlt _ -> true | _ -> false)
                      then arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
                      else if is_num o then arr_new (Cons (o, Cons (recv, Nil)))
-                     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: coerce non-numeric")) in fail "mere-ruby: coerce non-numeric"))
+                     // ruby coerces through Float(), so a String that is not a
+                     // number is an ArgumentError and anything else a TypeError
+                     else coerce_refuse o)
         // Float#coerce answers two Floats: `2.5.coerce(1)` is [1.0, 2.5], not
         // [1, 2.5] -- the point of coercing is that both sides end up alike.
         | VFlt _ -> (if is_num o then arr_new (Cons (VFlt (to_f o), Cons (recv, Nil)))
-                     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: coerce non-numeric")) in fail "mere-ruby: coerce non-numeric"))
+                     // ruby coerces through Float(), so a String that is not a
+                     // number is an ArgumentError and anything else a TypeError
+                     else coerce_refuse o)
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
@@ -27584,6 +27722,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "positive?" then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
   else if str_eq name "negative?" then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
   else if str_eq name "succ" || str_eq name "next" then (match recv with VInt n -> VInt (n + 1) | VBig b -> norm_big (big_add_s b "1") | VStr s -> mkstr (str_succ (sget s)) | _ -> (let _ = map_set prim_missing "n" (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
+  // Integer#ceildiv(other): the division rounded UP, which is the floor of the
+  // negated numerator negated back (7.ceildiv(2) is 4, -7.ceildiv(2) is -3).
+  else if str_eq name "ceildiv" then
+    (match args with
+     | Cons (b9, _) ->
+       (match recv with
+        | VInt a9 -> (match b9 with
+                      | VInt c9 -> VInt (0 - floor_div (0 - a9) c9)
+                      | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
+        | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "ceildiv") in VNil))
   else if str_eq name "pred" then (match recv with VInt n -> VInt (n - 1) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = map_set prim_missing "n" (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
   else if str_eq name "abs" || str_eq name "magnitude" then
     (match recv with
@@ -41943,6 +42092,13 @@ and meth_params_str = fn (ps: Val list) ->
                    | _ -> "_")
                 | _ -> "_") in
      one ++ (match t with Nil -> "" | _ -> ", ") ++ meth_params_str t)
+
+// what #coerce says about an argument it cannot take: Float()'s own refusals
+and coerce_refuse = fn (o: Val) ->
+  match o with
+  | VStr h9 -> prim_raise "ArgumentError" ("invalid value for Float(): " ++ inspect (VStr h9))
+  | VNil -> prim_raise "TypeError" "can't convert nil into Float"
+  | _ -> prim_raise "TypeError" ("can't convert " ++ conv_name o ++ " into Float")
 
 and md_strs_len = fn (xs: str list) ->
   match xs with Nil -> 0 | Cons (_, t) -> 1 + md_strs_len t
