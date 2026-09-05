@@ -1005,6 +1005,13 @@ let rx_lenient = map_new ();
 // `\k<name>`) and the body (for `\g<name>`, which re-matches the group's
 // pattern at the call site). Cleared at the start of every parse.
 let rx_gnums = map_new ();
+// ...and EVERY number a name was given, comma-joined: `(?<a>x)(?<b>y)(?<a>z)`
+// is legal, and ruby answers the LAST group of that name that participated
+// (#[], #named_captures) while listing the name once, where it first appears.
+// rx_gnums keeps the first, which is what a backreference means. The value is
+// a plain string, not a Val: the collector never sees this table, and a map of
+// handles would have to be a GC root (tools/gc_roots_check.sh says so).
+let rx_gnall = map_new ();
 let rx_gbodies = map_new ();
 // Per compiled pattern (same key as rx_progs): its named groups, as
 // "name=number|name=number|...". A MatchData answers `m[:name]` from this.
@@ -19159,6 +19166,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Proc" && str_eq name "allocate"
             && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       raise_exc world "TypeError" "allocator undefined for Proc"
+    // MatchData is made by matching, never by the program: ruby gives it
+    // neither, and both refusals are NoMethodError.
+    else if str_eq c "MatchData" && (str_eq name "new" || str_eq name "allocate")
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for class MatchData")
     else if (str_eq c "TrueClass" || str_eq c "FalseClass" || str_eq c "NilClass")
             && (str_eq name "new" || str_eq name "allocate")
             && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
@@ -21848,25 +21860,76 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq cls "MatchData" &&
             (str_eq name "pre_match" || str_eq name "post_match" ||
              str_eq name "begin" || str_eq name "end" || str_eq name "string" ||
-             str_eq name "offset") then
+             str_eq name "offset" || str_eq name "byteoffset" ||
+             str_eq name "bytebegin" || str_eq name "byteend" ||
+             str_eq name "match" || str_eq name "match_length") then
       (let src = (if map_has ivars (str_of_int id ++ "@__src") then (match map_get ivars (str_of_int id ++ "@__src") with VStr h -> sget h | _ -> "") else "") in
        let st = (if map_has ivars (str_of_int id ++ "@__st") then (match map_get ivars (str_of_int id ++ "@__st") with VInt n -> n | _ -> 0) else 0) in
        let en = (if map_has ivars (str_of_int id ++ "@__en") then (match map_get ivars (str_of_int id ++ "@__en") with VInt n -> n | _ -> 0) else 0) in
        if str_eq name "pre_match" then mkstr (substring src 0 st)
        else if str_eq name "post_match" then mkstr (substring src en (str_len src))
-       else if str_eq name "string" then mkstr src
-       // only group 0's span is recorded, which is what these are asked for
+       // #string is the SAME frozen String every time, as ruby's is: the
+       // subject is not copied per call, so `m.string.equal?(m.string)` holds
+       else if str_eq name "string" then
+         (if map_has ivars (str_of_int id ++ "@__strobj") then map_get ivars (str_of_int id ++ "@__strobj")
+          else (let v9 = mkstr src in
+                let _ = (match v9 with VStr h9 -> sfrozen_set h9 | _ -> ()) in
+                let _ = map_set ivars (str_of_int id ++ "@__strobj") v9 in v9))
        else
-         // #begin(n) / #end(n): group n's span when it has one, else group 0's
-         (let gk = (match args with Cons (VInt g, _) -> g | _ -> 0) in
-          let kst = str_of_int id ++ "@__st" ++ str_of_int gk in
-          let ken = str_of_int id ++ "@__en" ++ str_of_int gk in
-          let gst = (if gk > 0 && map_has ivars kst then (match map_get ivars kst with VInt n -> n | _ -> st) else st) in
-          let gen = (if gk > 0 && map_has ivars ken then (match map_get ivars ken with VInt n -> n | _ -> en) else en) in
-          if str_eq name "begin" then VInt (utf8_cidx src gst)
-          else if str_eq name "end" then VInt (utf8_cidx src gen)
-          // #offset(n): [begin(n), end(n)] as one pair.
-          else arr_new (Cons (VInt (utf8_cidx src gst), Cons (VInt (utf8_cidx src gen), Nil)))))
+         // The argument is an EXPOSED index (0 = the whole match) or a group
+         // NAME. Out of range is an IndexError rather than an answer, and a
+         // group that did not participate answers nil -- this used to fall back
+         // to group 0's span, so `(x)?(o)` reported the whole match's offsets
+         // for the group that matched nothing.
+         (let ns = md_num_list ivars id in
+          let cnt = md_num_count ns in
+          // an index may be anything that answers #to_int, as everywhere an
+          // index is taken
+          // A NAME addresses the FARTHEST participating group of that name --
+          // the same rule #[] follows -- and anything that is not an index or a
+          // name is asked for #to_int (a Rational answers 1).
+          let idx = (match args with
+                     | Cons (VInt g, _) -> g
+                     | Cons (VSym nm, _) -> md_span_num ivars id nm
+                     | Cons (VStr nh, _) -> md_span_num ivars id (sget nh)
+                     | Cons (v9, _) ->
+                       (match conv_try env world v9 "to_int" with
+                        | VInt g -> g
+                        | _ -> (match v9 with
+                                | VFlt f9 -> int_of_float f9
+                                | VRat (n9, d9) -> int_of_str n9 / int_of_str d9
+                                // ...and something that converts to nothing is
+                                // a TypeError rather than group 0
+                                | _ -> (let _ = conv_err v9 "Integer" in 0)))
+                     | _ -> 0) in
+          let by_name = (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) in
+          if idx == (0 - 2) then
+            raise_exc world "IndexError"
+              ("undefined group name reference: " ++ (match args with Cons (VSym nm, _) -> nm | Cons (VStr nh, _) -> sget nh | _ -> ""))
+          else if (if by_name then false else true) && (idx < 0 || idx > cnt) then
+            raise_exc world "IndexError" ("index " ++ str_of_int idx ++ " out of matches")
+          else
+            (let g = (if idx == 0 then 0 else if by_name then idx else md_num_at ns idx) in
+             let kst = str_of_int id ++ "@__st" ++ str_of_int g in
+             let ken = str_of_int id ++ "@__en" ++ str_of_int g in
+             let has = g == 0 || (map_has ivars kst && map_has ivars ken) in
+             let gst = (if g == 0 then st else (if map_has ivars kst then (match map_get ivars kst with VInt n -> n | _ -> st) else st)) in
+             let gen = (if g == 0 then en else (if map_has ivars ken then (match map_get ivars ken with VInt n -> n | _ -> en) else en)) in
+             let txt = (if g == 0 then (if map_has ivars (str_of_int id ++ "@0") then map_get ivars (str_of_int id ++ "@0") else VNil)
+                        else (if map_has ivars (str_of_int id ++ "@" ++ str_of_int g) then map_get ivars (str_of_int id ++ "@" ++ str_of_int g) else VNil)) in
+             if str_eq name "match" then txt
+             else if str_eq name "match_length" then
+               (match txt with VStr h -> VInt (utf8_len (sget h)) | _ -> VNil)
+             else if (if has then false else true) then
+               (if str_eq name "offset" || str_eq name "byteoffset" then arr_new (Cons (VNil, Cons (VNil, Nil))) else VNil)
+             // #begin / #end / #offset count CHARACTERS; the byte* family
+             // answers the byte positions the engine actually recorded.
+             else if str_eq name "begin" then VInt (utf8_cidx src gst)
+             else if str_eq name "end" then VInt (utf8_cidx src gen)
+             else if str_eq name "bytebegin" then VInt gst
+             else if str_eq name "byteend" then VInt gen
+             else if str_eq name "byteoffset" then arr_new (Cons (VInt gst, Cons (VInt gen, Nil)))
+             else arr_new (Cons (VInt (utf8_cidx src gst), Cons (VInt (utf8_cidx src gen), Nil))))))
     // MatchData#to_s is the WHOLE match, and #inspect shows it with its
     // groups. bootstraptest prints its results (`print(...)`, so to_s), and a
     // MatchData printed as "#<object>" is how this was noticed.
@@ -21876,14 +21939,79 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     else "") in
        if str_eq name "to_s" then mkstr whole
        else mkstr ("#<MatchData " ++ inspect (mkstr whole) ++ md_insp_groups ivars id 1 ++ ">"))
+    // MatchData#regexp: the pattern it came from, rebuilt from the key the
+    // match recorded (flags, \x01, source -- the same key rx_progs is under).
+    else if str_eq cls "MatchData" && str_eq name "regexp" then
+      (let key = (if map_has ivars (str_of_int id ++ "@__key")
+                  then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+       let i = str_find_from key (chr 1) 0 in
+       if i < 0 then VNil else VRegex (substring key (i + 1) (str_len key), substring key 0 i))
+    // #deconstruct is #captures, and #deconstruct_keys answers the named ones
+    // as SYMBOL keys (nil = all of them; a name it does not have is simply not
+    // in the answer, so a pattern match falls through rather than raising).
+    else if str_eq cls "MatchData" && (str_eq name "deconstruct" || str_eq name "deconstruct_keys") then
+      (if str_eq name "deconstruct" then arr_new (matchdata_arr ivars id 1)
+       else
+         (match args with
+          | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)"
+          | Cons (VNil, _) -> mkhash (md_dk_pairs world ivars id (md_names ivars id) (md_names ivars id))
+          | Cons (VArr aid, _) ->
+            // the keys must be Symbols: a String among them is a TypeError,
+            // not a name that happens not to be there
+            (let nms = md_names ivars id in
+             let bad = md_first_non_sym (deref aid) in
+             if (if str_eq bad "" then false else true) then
+               raise_exc world "TypeError" ("wrong argument type " ++ bad ++ " (expected Symbol)")
+             // more keys than the match HAS is an empty answer, before any of
+             // them is looked at
+             else if val_list_len (deref aid) > md_strs_len nms then mkhash Nil
+             else mkhash (md_dk_pairs world ivars id nms (md_sym_names (deref aid))))
+          | Cons (v9, _) ->
+            raise_exc world "TypeError" ("wrong argument type " ++ class_name v9 ++ " (expected Array)")))
+    // Two MatchData are equal when they are the same match: same pattern, same
+    // subject, same spans. They were plain objects here, so `==` was identity.
+    else if str_eq cls "MatchData" && (str_eq name "==" || str_eq name "eql?" || str_eq name "hash") then
+      (if str_eq name "hash" then VInt (str_hash_go (md_sig ivars id) 0 7)
+       else
+         (match args with
+          | Cons (VObj oid2, _) ->
+            (let (_, _, ocls2, _) = world in
+             VBool (str_eq (map_get ocls2 (str_of_int oid2)) "MatchData"
+                    && str_eq (md_sig ivars id) (md_sig ivars oid2)))
+          | _ -> VBool false))
+    // a copy is a new object carrying the same tables (the match is immutable,
+    // so the copy is only ever read)
+    else if str_eq cls "MatchData" && (str_eq name "dup" || str_eq name "clone") then
+      (let nid = alloc_oid ocls in
+       let (_, _, ocls3, iv3) = world in
+       let _ = map_set ocls3 (str_of_int nid) "MatchData" in
+       let _ = (if map_has md_whole (str_of_int id) then map_set md_whole (str_of_int nid) (map_get md_whole (str_of_int id)) else ()) in
+       let pfx = str_of_int id ++ "@" in
+       let tmp = map_new () in
+       let _ = map_iter iv3 (fn (k: str) -> fn (v: Val) ->
+                 if str_len k > str_len pfx && str_eq (substring k 0 (str_len pfx)) pfx
+                 then map_set tmp (str_of_int nid ++ "@" ++ substring k (str_len pfx) (str_len k)) v
+                 else ()) in
+       let _ = map_iter tmp (fn (k: str) -> fn (v: Val) -> map_set iv3 k v) in
+       VObj nid)
     // MatchData#names / #named_captures: the pattern's named groups.
     else if str_eq cls "MatchData" && (str_eq name "names" || str_eq name "named_captures") then
       (let nms = md_names ivars id in
        if str_eq name "names" then arr_new (strs_to_vals nms)
-       else mkhash (md_named_pairs world ivars id nms))
+       else
+         // named_captures(symbolize_names: true) keys the hash with Symbols;
+         // any truthy value asks for it, as ruby reads the option
+         (let symz = (match args with
+                      | Cons (VHsh h9, _) -> (match hash_lookup (hderef h9) (VSym "symbolize_names") with (true, v9) -> truthy v9 | _ -> false)
+                      | _ -> false) in
+          mkhash (md_named_pairs_k world ivars id nms symz)))
     else if str_eq cls "MatchData" && (str_eq name "[]" || str_eq name "to_a" || str_eq name "captures" || str_eq name "size" || str_eq name "length" || str_eq name "values_at") then
       (if str_eq name "values_at" then
-         arr_new (md_values_at world ivars id args)
+         // a Range asks for a span of the exposed list, nil-filling past its end
+         // every argument contributes: an index, a name, or a whole Range of
+         // indices -- and they mix
+         (let all = matchdata_arr ivars id 0 in
+          arr_new (md_values_go world ivars id (md_expand_idxs env world all args) all))
        else if str_eq name "[]" then
          // like Array#[]: an index, a (start, length) pair, a Range, and a
          // negative index counting from the end of the group list
@@ -21897,8 +22025,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (let (st, en) = rng_slice_bounds lov hiv ex n0 in
              if st < 0 || st > n0 then VNil else arr_new (val_slice all st en))
           | Cons (VInt n, _) ->
+            // through the exposed list, not the raw group numbers: a pattern
+            // with named groups has fewer entries than the engine numbered
             (let i2 = (if n < 0 then n0 + n else n) in
-             if map_has ivars (str_of_int id ++ "@" ++ str_of_int i2) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i2) else VNil)
+             if i2 < 0 || i2 >= n0 then VNil else val_nth all i2)
           // by NAME: `m[:scheme]` / `m["scheme"]`, resolved through the group
           // names recorded when the pattern was compiled.
           | Cons (VSym nm, _) -> md_by_name world ivars id nm
@@ -24559,6 +24689,21 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
     str_eq name "bind" || str_eq name "bind_call" || str_eq name "arity" ||
     str_eq name "name" || str_eq name "owner" || str_eq name "parameters" ||
     str_eq name "source_location" || str_eq name "original_name" || str_eq name "super_method"
+  // MatchData: what its arms answer, so `md == md2` routes to the dispatcher
+  // instead of comparing identity in the operator path, and respond_to? agrees
+  // with the call.
+  else if str_eq cls "MatchData" then
+    str_eq name "[]" || str_eq name "to_a" || str_eq name "captures" ||
+    str_eq name "named_captures" || str_eq name "names" || str_eq name "values_at" ||
+    str_eq name "size" || str_eq name "length" || str_eq name "to_s" ||
+    str_eq name "inspect" || str_eq name "string" || str_eq name "regexp" ||
+    str_eq name "pre_match" || str_eq name "post_match" ||
+    str_eq name "begin" || str_eq name "end" || str_eq name "offset" ||
+    str_eq name "byteoffset" || str_eq name "bytebegin" || str_eq name "byteend" ||
+    str_eq name "match" || str_eq name "match_length" ||
+    str_eq name "deconstruct" || str_eq name "deconstruct_keys" ||
+    str_eq name "==" || str_eq name "eql?" || str_eq name "hash" ||
+    str_eq name "dup" || str_eq name "clone"
   else false
 
 // Ruby's IMPLICIT conversion attempt (rb_check_funcall), which is not the same
@@ -25130,6 +25275,9 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      else n)
   else if str_eq cls "MatchData" || str_eq cls "Regexp" then
     (if str_eq n "eql?" then "=="
+     // two names for one implementation: the specs compare the UnboundMethods
+     else if str_eq n "deconstruct" then "captures"
+     else if str_eq n "length" then "size"
      else n)
   else if str_eq cls "TrueClass" then
     (if str_eq n "inspect" then "to_s" else n)
@@ -25272,6 +25420,10 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   // even build the pair.
   else if str_eq cls "Kernel" then
     is_kernel_builtin name || is_prim_method name
+  // MatchData's methods live in the dispatcher, so reflection could not see
+  // them: `MatchData.instance_method(:captures)` was a NameError, and the
+  // alias specs compare exactly those UnboundMethods.
+  else if str_eq cls "MatchData" then builtin_obj_has "MatchData" name || is_prim_method name
   else is_prim_method name
 
 // is this one of the classes whose instances the primitive layer implements?
@@ -26236,6 +26388,23 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              + (if str_contains fl "x" then 2 else 0)
              + (if str_contains fl "m" then 4 else 0))
      | _ -> VInt 0)
+  // Regexp#names / #named_captures: the pattern's own group names, read from
+  // the same table a MatchData reads. MatchData#names is specified against
+  // these, and there was no arm at all.
+  else if (str_eq name "names" || str_eq name "named_captures")
+          && (match recv with VRegex (_, _) -> true | _ -> false) then
+    (match recv with
+     | VRegex (pt, pf) ->
+       // the names table is filled when the pattern is COMPILED, and a Regexp
+       // that has never matched anything has not been: compile it first (the
+       // result is cached, so this is the same work the first match would do).
+       (let key = pf ++ chr 1 ++ pt in
+        let _ = try_or (fn (u: unit) -> let _ = rxc_get pt pf in true) false in
+        let tbl = (if map_has rx_prog_names key then (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") else "") in
+        let nms = (if str_eq tbl "" then Nil else md_names_sorted (str_split tbl "|") 1 Nil) in
+        if str_eq name "names" then arr_new (strs_to_vals nms)
+        else mkhash (rx_named_pairs tbl nms))
+     | _ -> VNil)
   else if str_eq name "source" then
     (match recv with VRegex (p, _) -> mkstr p | _ -> (let _ = map_set prim_missing "n" (mkstr "source") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'source'")) in fail "mere-ruby: undefined method 'source'")))
   // casecmp is the three-way form of casecmp? (nil when the other side is
@@ -40596,6 +40765,7 @@ and clausesin_targets = fn clauses ->
 
 and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   let _ = map_clear rx_gnums in
+  let _ = map_clear rx_gnall in
   let _ = map_clear rx_gbodies in
   let (n, p, g) = rxp_alt pat 0 fl 1 in
   if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )") else n
@@ -40808,6 +40978,17 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
        p + 1, g)
     // \G: anchor to where this match attempt starts (the scan/gsub cursor).
     else if str_eq c "G" then (NGANCHOR, p + 1, g)
+    // \uXXXX / \u{cp cp ...}: the codepoint's UTF-8 BYTES, matched in order.
+    // The subject is bytes here, so a codepoint escape is a byte sequence --
+    // and without it `/\A\u3042/` was "unsupported escape" and every multi-byte
+    // spec that writes its pattern that way could not run at all.
+    else if str_eq c "u" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) "\{" then
+      (let close = str_find_from pat "}" (p + 2) in
+       if close < 0 then
+         (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unterminated \\u brace")) in fail "mere-ruby: regexp parse: unterminated \\u brace")
+       else (NSeq (rxp_u_cps (str_split (substring pat (p + 2) close) " ")), close + 1, g))
+    else if str_eq c "u" && p + 4 < str_len pat && rxp_hexv (char_at pat (p + 1)) >= 0 then
+      (NSeq (rxp_u_bytes (utf8_enc (rxp_hex4 pat (p + 1))) 0), p + 5, g)
     else if str_eq c "k" || str_eq c "g" || str_eq c "p" ||
             str_eq c "K" || str_eq c "X" || str_eq c "u" then
       (if map_has rx_lenient "n" then (NEmpty, p + 1, g) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unsupported escape")) in fail "mere-ruby: regexp: unsupported escape"))
@@ -40823,6 +41004,21 @@ and rxp_oct = fn (pat: str) -> fn (p: int) -> fn (g: int) -> fn (acc: int) -> fn
   if k > 0 && p < str_len pat && char_at pat p >= "0" && char_at pat p <= "7" then
     rxp_oct pat (p + 1) g (acc * 8 + int_of_str (char_at pat p)) (k - 1)
   else (NChar (chr acc), p, g)
+
+// the four hex digits of \uXXXX, and the byte nodes of one codepoint
+and rxp_hex4 = fn (pat: str) -> fn (p: int) ->
+  rxp_hexv (char_at pat p) * 4096 + rxp_hexv (char_at pat (p + 1)) * 256
+  + rxp_hexv (char_at pat (p + 2)) * 16 + rxp_hexv (char_at pat (p + 3))
+and rxp_u_bytes = fn (bs: str) -> fn (i: int) ->
+  if i >= str_len bs then Nil else Cons (NChar (char_at bs i), rxp_u_bytes bs (i + 1))
+and rxp_u_cps = fn (xs: str list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) ->
+    (if str_eq h "" then rxp_u_cps t
+     else list_append_node (rxp_u_bytes (utf8_enc (str_to_int_base h 16)) 0) (rxp_u_cps t))
+and list_append_node = fn (a: RNode list) -> fn (b: RNode list) ->
+  match a with Nil -> b | Cons (h, t) -> Cons (h, list_append_node t b)
 
 and rxp_hexv = fn (c: str) ->
   if (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F") then str_to_int_base c 16
@@ -40861,14 +41057,16 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
           (let (nm, p2) = rxp_name pat (p + 2) ">" "" in
            let _ = rxp_name_check nm in
            let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
-           let _ = map_set rx_gnums nm (VInt g) in
+           let _ = (if map_has rx_gnums nm then () else map_set rx_gnums nm (VInt g)) in
+           let _ = map_set rx_gnall nm ((if map_has rx_gnall nm then map_get rx_gnall nm ++ "," else "") ++ str_of_int g) in
            let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
            (NGroup (n, g, nm), rxp_close pat p3, g2)))
      else if str_eq c2 "'" then
        (let (nm, p2) = rxp_name pat (p + 2) "'" "" in
         let _ = rxp_name_check nm in
         let (n, p3, g2) = rxp_alt pat p2 fl (g + 1) in
-        let _ = map_set rx_gnums nm (VInt g) in
+        let _ = (if map_has rx_gnums nm then () else map_set rx_gnums nm (VInt g)) in
+        let _ = map_set rx_gnall nm ((if map_has rx_gnall nm then map_get rx_gnall nm ++ "," else "") ++ str_of_int g) in
         let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
         (NGroup (n, g, nm), rxp_close pat p3, g2))
      // (?>...) atomic (possessive) group — non-capturing; once its body
@@ -41253,6 +41451,57 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
 // the parse's named groups, flattened to "name=number|..." (insertion order is
 // not preserved by the map, so the list is sorted by number when it is read).
 // the group number a name was compiled to, or -1.
+// the names a #deconstruct_keys argument asks for
+// the class name of the first element that is not a Symbol ("" = all are)
+// Regexp#named_captures: name => the group numbers it was given
+and rx_named_pairs = fn (tbl: str) -> fn (nms: str list) ->
+  match nms with
+  | Nil -> Nil
+  | Cons (nm, rest) ->
+    Cons (mkstr nm,
+          Cons (arr_new (md_int_to_vals (md_nums_for (str_split tbl "|") nm)), rx_named_pairs tbl rest))
+and md_int_to_vals = fn (xs: int list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> Cons (VInt h, md_int_to_vals t)
+and md_strs_len = fn (xs: str list) ->
+  match xs with Nil -> 0 | Cons (_, t) -> 1 + md_strs_len t
+and md_first_non_sym = fn (xs: Val list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (VSym _, t) -> md_first_non_sym t
+  | Cons (v, _) -> class_name v
+and md_sym_names = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VSym s, t) -> Cons (s, md_sym_names t)
+  | Cons (VStr h, t) -> Cons (sget h, md_sym_names t)
+  | Cons (_, t) -> md_sym_names t
+// name => capture for the names the pattern HAS and the caller asked for
+and md_dk_pairs = fn world -> fn ivars -> fn (id: int) -> fn (nms: str list) -> fn (want: str list) ->
+  match want with
+  | Nil -> Nil
+  | Cons (nm, rest) ->
+    // ruby stops at the FIRST name the match does not have, so a pattern match
+    // fails on the whole clause rather than binding a shorter hash
+    (if str_list_has nms nm
+     then Cons (VSym nm, Cons (md_by_name world ivars id nm, md_dk_pairs world ivars id nms rest))
+     else Nil)
+// what makes two matches the same one: the pattern, the subject, and every span
+and md_sig = fn ivars -> fn (id: int) ->
+  let g = fn (k: str) -> (if map_has ivars (str_of_int id ++ k)
+                          then (match map_get ivars (str_of_int id ++ k) with VStr h -> sget h | VInt n -> str_of_int n | _ -> "")
+                          else "") in
+  g "@__key" ++ chr 1 ++ g "@__src" ++ chr 1 ++ g "@__st" ++ chr 1 ++ g "@__en" ++ chr 1
+  ++ md_sig_groups ivars id (md_num_list ivars id)
+and md_sig_groups = fn ivars -> fn (id: int) -> fn (ns: int list) ->
+  match ns with
+  | Nil -> ""
+  | Cons (n, t) ->
+    (let k1 = str_of_int id ++ "@__st" ++ str_of_int n in
+     let k2 = str_of_int id ++ "@__en" ++ str_of_int n in
+     (if map_has ivars k1 then (match map_get ivars k1 with VInt a -> str_of_int a | _ -> "") else "-") ++ ":"
+     ++ (if map_has ivars k2 then (match map_get ivars k2 with VInt b -> str_of_int b | _ -> "") else "-") ++ ","
+     ++ md_sig_groups ivars id t)
+
 and md_name_num = fn ivars -> fn (id: int) -> fn (nm: str) ->
   let key = (if map_has ivars (str_of_int id ++ "@__key")
              then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
@@ -41275,15 +41524,55 @@ and md_find_name_go = fn (items: str list) -> fn (nm: str) ->
      else md_find_name_go rest nm)
 
 and md_by_name = fn world -> fn ivars -> fn (id: int) -> fn (nm: str) ->
-  let k = md_name_num ivars id nm in
-  if k < 0 then raise_exc world "IndexError" ("undefined group name reference: " ++ nm)
-  else if map_has ivars (str_of_int id ++ "@" ++ str_of_int k)
-  then map_get ivars (str_of_int id ++ "@" ++ str_of_int k) else VNil
+  let key = (if map_has ivars (str_of_int id ++ "@__key")
+             then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+  let tbl = (if str_eq key "" then "" else (if map_has rx_prog_names key then (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") else "")) in
+  let nums = (if str_eq tbl "" then Nil else md_nums_for (str_split tbl "|") nm) in
+  match nums with
+  | Nil -> raise_exc world "IndexError" ("undefined group name reference: " ++ nm)
+  // the LAST one that participated: `(?<a>x)|(?<a>y)` answers whichever matched
+  | _ -> md_last_participating ivars id nums VNil
+// the group NUMBER a name addresses for a span: the farthest one that
+// participated, or -2 when the pattern has no such name
+and md_span_num = fn ivars -> fn (id: int) -> fn (nm: str) ->
+  let key = (if map_has ivars (str_of_int id ++ "@__key")
+             then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+  let tbl = (if str_eq key "" then "" else (if map_has rx_prog_names key then (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") else "")) in
+  let nums = (if str_eq tbl "" then Nil else md_nums_for (str_split tbl "|") nm) in
+  match nums with
+  | Nil -> (0 - 2)
+  | Cons (first, _) -> md_last_span ivars id nums first
+and md_last_span = fn ivars -> fn (id: int) -> fn (ns: int list) -> fn (best: int) ->
+  match ns with
+  | Nil -> best
+  | Cons (k, t) ->
+    md_last_span ivars id t (if map_has ivars (str_of_int id ++ "@__st" ++ str_of_int k) then k else best)
+
+and md_last_participating = fn ivars -> fn (id: int) -> fn (ns: int list) -> fn (best: Val) ->
+  match ns with
+  | Nil -> best
+  | Cons (k, t) ->
+    md_last_participating ivars id t
+      (if map_has ivars (str_of_int id ++ "@" ++ str_of_int k)
+       then map_get ivars (str_of_int id ++ "@" ++ str_of_int k) else best)
 
 // the pattern's group names, in group-number order.
 // the ` 1:"x" 2:"y"` tail of MatchData#inspect, named where the group has a
 // name (`#<MatchData "true" 1:"r">`).
 and md_insp_groups = fn ivars -> fn (id: int) -> fn (i: int) ->
+  md_insp_go ivars id (md_num_list ivars id)
+and md_insp_go = fn ivars -> fn (id: int) -> fn (ns: int list) ->
+  match ns with
+  | Nil -> ""
+  | Cons (i, rest) ->
+    (let v = (if map_has ivars (str_of_int id ++ "@" ++ str_of_int i) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i) else VNil) in
+     let key = (if map_has ivars (str_of_int id ++ "@__key")
+                then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+     let nm = (if str_eq key "" || (if map_has rx_prog_names key then false else true) then ""
+               else md_name_at (str_split (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") "|") i) in
+     " " ++ (if str_eq nm "" then str_of_int i else nm) ++ ":" ++ inspect v
+     ++ md_insp_go ivars id rest)
+and md_insp_groups_unused = fn ivars -> fn (id: int) -> fn (i: int) ->
   if i > 63 then ""
   else if map_has ivars (str_of_int id ++ "@" ++ str_of_int i) then
     (let v = map_get ivars (str_of_int id ++ "@" ++ str_of_int i) in
@@ -41308,29 +41597,54 @@ and md_names = fn ivars -> fn (id: int) ->
 and md_names_sorted = fn (items: str list) -> fn (k: int) -> fn (acc: str list) ->
   if k > 99 then rev_strs acc Nil
   else
-    (let hit = md_name_at items k in
+    (let hit = md_name_first_at items k in
      if str_eq hit "" then md_names_sorted items (k + 1) acc
      else md_names_sorted items (k + 1) (Cons (hit, acc)))
 
 // name => capture, interleaved for mkhash.
 and md_named_pairs = fn world -> fn ivars -> fn (id: int) -> fn (nms: str list) ->
+  md_named_pairs_k world ivars id nms false
+and md_named_pairs_k = fn world -> fn ivars -> fn (id: int) -> fn (nms: str list) -> fn (symz: bool) ->
   match nms with
   | Nil -> Nil
   | Cons (nm, rest) ->
-    Cons (mkstr nm, Cons (md_by_name world ivars id nm, md_named_pairs world ivars id rest))
+    Cons ((if symz then VSym nm else mkstr nm),
+          Cons (md_by_name world ivars id nm, md_named_pairs_k world ivars id rest symz))
 
 and md_name_at = fn (items: str list) -> fn (k: int) ->
   match items with
   | Nil -> ""
   | Cons (it, rest) ->
     (let i = str_find_from it "=" 0 in
-     if i >= 0 && str_eq (substring it (i + 1) (str_len it)) (str_of_int k)
+     if i >= 0 && str_list_has (str_split (substring it (i + 1) (str_len it)) ",") (str_of_int k)
      then substring it 0 i else md_name_at rest k)
+// the name is LISTED at its first number, so `names` reports it once, where it
+// first appears
+and md_name_first_at = fn (items: str list) -> fn (k: int) ->
+  match items with
+  | Nil -> ""
+  | Cons (it, rest) ->
+    (let i = str_find_from it "=" 0 in
+     if i >= 0 && str_eq (md_first_num (substring it (i + 1) (str_len it))) (str_of_int k)
+     then substring it 0 i else md_name_first_at rest k)
+and md_first_num = fn (lst: str) ->
+  (let i = str_find_from lst "," 0 in if i < 0 then lst else substring lst 0 i)
+// every number a name was given, as ints
+and md_nums_for = fn (items: str list) -> fn (nm: str) ->
+  match items with
+  | Nil -> Nil
+  | Cons (it, rest) ->
+    (let i = str_find_from it "=" 0 in
+     if i >= 0 && str_eq (substring it 0 i) nm
+     then md_ints_of (str_split (substring it (i + 1) (str_len it)) ",")
+     else md_nums_for rest nm)
+and md_ints_of = fn (xs: str list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> Cons (int_of_str h, md_ints_of t)
 
 and rx_names_join = fn (u: unit) ->
   let acc = map_new () in
-  let _ = map_iter rx_gnums (fn (k: str) -> fn (v: Val) ->
-            map_set acc k (match v with VInt i -> str_of_int i | _ -> "0")) in
+  // every number, not just the first: `name=1,3`
+  let _ = map_iter rx_gnall (fn (k: str) -> fn (v: str) -> map_set acc k v) in
   rx_names_fold acc
 
 and rx_names_fold = fn m ->
@@ -42004,29 +42318,88 @@ and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
     rx_store_groups ivars id sv (g + 1)
 
 // MatchData#to_a (start=0, incl. whole match) / #captures (start=1).
+// WHICH groups a MatchData exposes. A pattern with named groups exposes ONLY
+// those: `(?<a>w)(o)` has one capture in ruby, because a plain paren beside a
+// named one does not capture at all. This engine numbers both, so the surface
+// masks the unnamed ones -- otherwise #to_a, #captures, #size, #[] and #inspect
+// all count one too many.
+and md_num_list = fn ivars -> fn (id: int) ->
+  let key = (if map_has ivars (str_of_int id ++ "@__key")
+             then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
+  // ...and a pattern with NO named groups keeps its numbered ones: the names
+  // table exists for every pattern and is EMPTY for those, which read as
+  // "expose nothing" and emptied every #captures in the suite.
+  let tbl0 = (if str_eq key "" then "" else (if map_has rx_prog_names key then (match map_get rx_prog_names key with VStr h -> sget h | _ -> "") else "")) in
+  if str_eq tbl0 "" then
+    md_num_range 1 (if map_has ivars (str_of_int id ++ "@__ng")
+                    then (match map_get ivars (str_of_int id ++ "@__ng") with VInt n -> n | _ -> md_max_group ivars id 9)
+                    else md_max_group ivars id 9)
+  else (let items = str_split tbl0 "|" in md_named_nums items 1 Nil)
+and md_num_range = fn (i: int) -> fn (hi: int) ->
+  if i > hi then Nil else Cons (i, md_num_range (i + 1) hi)
+and md_named_nums = fn (items: str list) -> fn (k: int) -> fn (acc: int list) ->
+  if k > 99 then rev_ints acc Nil
+  else md_named_nums items (k + 1) (if str_eq (md_name_at items k) "" then acc else Cons (k, acc))
+and rev_ints = fn (xs: int list) -> fn (acc: int list) ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_ints t (Cons (h, acc))
+// the internal group number behind exposed index i (1-based); 0 = out of range
+and md_num_at = fn (ns: int list) -> fn (i: int) ->
+  match ns with
+  | Nil -> 0
+  | Cons (h, t) -> if i <= 1 then h else md_num_at t (i - 1)
+and md_num_count = fn (ns: int list) ->
+  match ns with Nil -> 0 | Cons (_, t) -> 1 + md_num_count t
+
 and md_max_group = fn ivars -> fn (id: int) -> fn (g: int) ->
   if g < 1 then 0 else if map_has ivars (str_of_int id ++ "@" ++ str_of_int g) then g else md_max_group ivars id (g - 1)
 and md_collect = fn ivars -> fn (id: int) -> fn (i: int) -> fn (hi: int) ->
   if i > hi then Nil
   else Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int i) then map_get ivars (str_of_int id ++ "@" ++ str_of_int i) else VNil), md_collect ivars id (i + 1) hi)
 // MatchData#values_at(*indices)
+// a values_at argument list with every Range replaced by the indices it names
+and md_expand_idxs = fn env -> fn world -> fn (all: Val list) -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VRange (lov, hiv, ex), t) ->
+    (let n0 = val_list_len all in
+     let lo9 = (match lov with VInt a -> a | _ -> 0) in
+     if lo9 < 0 && n0 + lo9 < 0 then
+       (let _ = raise_exc world "RangeError" (inspect_w env world (VRange (lov, hiv, ex)) ++ " out of range") in Nil)
+     else
+       (let (rs, re) = rng_slice_bounds lov hiv ex n0 in
+        list_append (md_int_vals rs re) (md_expand_idxs env world all t)))
+  | Cons (h, t) -> Cons (h, md_expand_idxs env world all t)
+and md_int_vals = fn (i: int) -> fn (hi: int) ->
+  if i >= hi then Nil else Cons (VInt i, md_int_vals (i + 1) hi)
 and md_values_at = fn world -> fn ivars -> fn (id: int) -> fn (idxs: Val list) ->
+  md_values_go world ivars id idxs (matchdata_arr ivars id 0)
+and md_values_go = fn world -> fn ivars -> fn (id: int) -> fn (idxs: Val list) -> fn (all: Val list) ->
   match idxs with
   | Nil -> Nil
   | Cons (VInt n, t) ->
-    Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int n) then map_get ivars (str_of_int id ++ "@" ++ str_of_int n) else VNil),
-          md_values_at world ivars id t)
+    // an index addresses the EXPOSED list (see md_num_list), and one past its
+    // end is nil rather than a group the pattern does not expose
+    (let n0 = val_list_len all in
+     let i2 = (if n < 0 then n0 + n else n) in
+     Cons ((if i2 < 0 || i2 >= n0 then VNil else val_nth all i2), md_values_go world ivars id t all))
   // a name is as good as a number here, as in ruby
-  | Cons (VSym nm, t) -> Cons (md_by_name world ivars id nm, md_values_at world ivars id t)
-  | Cons (VStr nh, t) -> Cons (md_by_name world ivars id (sget nh), md_values_at world ivars id t)
-  | Cons (_, t) -> Cons (VNil, md_values_at world ivars id t)
+  | Cons (VSym nm, t) -> Cons (md_by_name world ivars id nm, md_values_go world ivars id t all)
+  | Cons (VStr nh, t) -> Cons (md_by_name world ivars id (sget nh), md_values_go world ivars id t all)
+  | Cons (_, t) -> Cons (VNil, md_values_go world ivars id t all)
 
 and matchdata_arr = fn ivars -> fn (id: int) -> fn (start: int) ->
-  // with a recorded group count, nil-fill unparticipated trailing groups.
-  let hi = (if map_has ivars (str_of_int id ++ "@__ng")
-            then (match map_get ivars (str_of_int id ++ "@__ng") with VInt n -> n | _ -> md_max_group ivars id 9)
-            else md_max_group ivars id 9) in
-  md_collect ivars id start hi
+  // the EXPOSED groups (see md_num_list), nil-filling the ones that did not
+  // participate; `start` is 0 for #to_a (which leads with the whole match) and
+  // 1 for #captures.
+  let groups = md_collect_nums ivars id (md_num_list ivars id) in
+  if start > 0 then groups
+  else Cons ((if map_has ivars (str_of_int id ++ "@0") then map_get ivars (str_of_int id ++ "@0") else VNil), groups)
+and md_collect_nums = fn ivars -> fn (id: int) -> fn (ns: int list) ->
+  match ns with
+  | Nil -> Nil
+  | Cons (g, t) ->
+    Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int g) then map_get ivars (str_of_int id ++ "@" ++ str_of_int g) else VNil),
+          md_collect_nums ivars id t)
 
 and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
   if i > 9 then ()
