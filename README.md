@@ -370,8 +370,8 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **192 programs,
-192 identical**. The corpus covers the semantic corners above. A deliberate negative control (lossy float
+and under `./mere-ruby` and diffs the output byte-for-byte: **193 programs,
+193 identical**. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
 ## Conformance (ruby/spec)
@@ -396,7 +396,7 @@ same idea as the tags/filter files every other implementation keeps. Passing
 target is the `language` and `core` groups, with `command_line` low-priority
 and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
 
-The record covers **1221 spec files** across 31 groups: **917 MATCH, 300 DIFF,
+The record covers **1221 spec files** across 31 groups: **929 MATCH, 288 DIFF,
 0 CRASH**, 4 SKIP, 0 SLOW, against ruby 4.0.6. Run with no directories, the
 sweep refreshes exactly the groups the table already has, so the numbers above
 are reproducible rather than a snapshot -- and every row of one table is

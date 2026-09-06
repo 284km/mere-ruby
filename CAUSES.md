@@ -10,30 +10,29 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 300 files.
+Classified: 288 files.
 
-## DIFF — 300 files, 100 kinds
+## DIFF — 288 files, 93 kinds
 
 | files | kind |
 |---|---|
 | 33 | `ERROR NoMethodError` |
-| 15 | `FAILED expected TypeError to be raised` |
 | 15 | `FAILED expected N, got N` |
-| 15 | `ERROR NameError` |
-| 12 | `FAILED expected true, got false` |
+| 14 | `ERROR NameError` |
+| 13 | `FAILED expected TypeError to be raised` |
+| 13 | `ERROR TypeError` |
 | 12 | `FAILED expected to be identical` |
 | 12 | `FAILED expected ArgumentError to be raised` |
+| 11 | `FAILED expected true, got false` |
 | 10 | `FAILED expected "S", got "S"` |
-| 9 | `ERROR TypeError` |
-| 8 | `FAILED expected false, got true` |
-| 8 | `ERROR StandardError` |
+| 9 | `FAILED expected false, got true` |
 | 7 | `pass=N fail=N err=N` |
 | 7 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 7 | `ERROR ArgumentError` |
 | 6 | `FAILED expected truthy from #include?` |
+| 6 | `FAILED expected ZeroDivisionError to be raised` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED expected nil, got "S"` |
-| 4 | `FAILED expected ZeroDivisionError to be raised` |
 | 4 | `FAILED expected N, got nil` |
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `ERROR RangeError` |
@@ -43,22 +42,19 @@ Classified: 300 files.
 | 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected "S" to match` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
-| 2 | `FAILED raised NoMethodError, expected FrozenError` |
 | 2 | `FAILED matcher did not match #<OBJ>` |
 | 2 | `FAILED expected not to be identical` |
-| 2 | `FAILED expected not N` |
 | 2 | `FAILED expected nil, got #<OBJ>` |
 | 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
+| 2 | `ERROR StandardError` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
-| 1 | `FAILED raised ZeroDivisionError, expected TypeError` |
-| 1 | `FAILED raised StandardError, expected ZeroDivisionError` |
-| 1 | `FAILED raised StandardError, expected TypeError` |
-| 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
+| 1 | `FAILED raised NoMethodError, expected FrozenError` |
+| 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
 | 1 | `FAILED raised ArgumentError, expected IndexError` |
 | 1 | `FAILED matcher did not match N` |
@@ -83,7 +79,6 @@ Classified: 300 files.
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
-| 1 | `FAILED expected [N, N ...[clipped]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected ["S", "S"], got nil` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
@@ -101,7 +96,6 @@ Classified: 300 files.
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected /(p(a)t[e]rn)/, got nil` |
 | 1 | `FAILED expected (N/N), got N` |
-| 1 | `FAILED expected (N/N), got (N/N)` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected "S"localhost\"S"root\"S", got "S"localhost\"S"root\"S"` |
 | 1 | `FAILED expected "S"\xN\"S", got "S"N\"S"` |
@@ -112,7 +106,6 @@ Classified: 300 files.
 | 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
 | 1 | `FAILED expected "` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
-| 1 | `ERROR ZeroDivisionError` |
 | 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR Errno::ENOENT` |
@@ -121,36 +114,34 @@ Classified: 300 files.
 
 | files | cause |
 |---|---|
-| 15 | `FAILED: expected TypeError to be raised` |
+| 13 | `FAILED: expected TypeError to be raised` |
 | 12 | `FAILED: expected ArgumentError to be raised` |
+| 6 | `FAILED: expected ZeroDivisionError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
-| 4 | `FAILED: expected ZeroDivisionError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
 | 3 | `FAILED: expected NameError to be raised` |
 | 3 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `ERROR: bignum dispatches the correct operator after coercion: ArgumentError` |
-| 2 | `pass=14 fail=0 err=0` |
-| 2 | `pass=11 fail=0 err=0` |
+| 3 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
+| 2 | `pass=13 fail=0 err=0` |
+| 2 | `pass=10 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns self: expected to be identical` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
-| 2 | `FAILED: raised NoMethodError, expected FrozenError` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
-| 2 | `FAILED: expected not 0` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: expected RangeError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 2 | `ERROR: when given an argument and no block doesn't yield an empty array if the filter matches the first entry or the last entry: NoMethodError` |
-| 2 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=4 fail=2 err=7` |
-| 1 | `pass=34 fail=0 err=0` |
+| 1 | `pass=31 fail=0 err=0` |
 | 1 | `pass=16 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: yields elements to the provided block: expected [6, 5, 4, 3, 2, 1], got [1, 2, 3, 4, 5, 6]` |
@@ -161,6 +152,8 @@ Classified: 300 files.
 | 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
 | 1 | `FAILED: sets the encoding of the result to BINARY if any non-US-ASCII characters are present in an input String with invalid encoding: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
+| 1 | `FAILED: sets $~ in the block: expected nil, got #<MatchData "e">` |
+| 1 | `FAILED: sets $~ in the block: expected "b", got nil` |
 
 </details>
 
@@ -173,8 +166,8 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| exception (7) | `backtrace_locations backtrace errno exception interrupt io_error signal_exception` |
 | kernel (6) | `binding lambda loop method select test` |
+| exception (6) | `backtrace_locations backtrace exception interrupt io_error signal_exception` |
 | enumerable (6) | `inject one slice_after slice_before to_h zip` |
 | rational (5) | `comparison divide minus multiply plus` |
 | symbol (4) | `all_symbols intern match slice` |

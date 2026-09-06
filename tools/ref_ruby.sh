@@ -39,6 +39,19 @@ if [ "$(ruby -e 'print RUBY_VERSION' 2>/dev/null)" != "$REF_RUBY_VERSION" ]; the
   fi
 fi
 ref_have="$(ruby -e 'print RUBY_VERSION' 2>/dev/null)"
+# ...and the REAL binary, not the shim. rbenv's shim exports RBENV_DIR,
+# RBENV_HOOK_PATH, RBENV_ORIG_PATH and RUBYLIB into the process it execs, so a
+# spec that counts one expectation per ENV key sees a different ENV on the two
+# sides and can never match however right the interpreter is (core/env's
+# keys / values / to_a / each_key / each_value: 15 expectations against 9).
+# Gates that compare ENV should invoke this; the rest may keep saying `ruby`.
+if [ -x "$HOME/.rbenv/versions/$REF_RUBY_VERSION/bin/ruby" ]; then
+  REF_RUBY_BIN="$HOME/.rbenv/versions/$REF_RUBY_VERSION/bin/ruby"
+else
+  REF_RUBY_BIN="$(command -v ruby)"
+fi
+export REF_RUBY_BIN
+
 if [ "$ref_have" != "$REF_RUBY_VERSION" ]; then
   echo "reference ruby is ${ref_have:-none}, expected $REF_RUBY_VERSION (which ruby: $(command -v ruby))" >&2
   echo "the recorded numbers are against $REF_RUBY_VERSION; another one is a different question," >&2

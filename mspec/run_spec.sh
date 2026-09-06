@@ -100,7 +100,10 @@ spec_env() {
 }
 out_m="$({ spec_env perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"
 rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
-out_r="$({ spec_env perl -e 'alarm 25; exec @ARGV' ruby -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
+# the REAL ruby binary, not rbenv's shim: the shim exports RBENV_* and RUBYLIB
+# into the process it execs, and a spec that walks ENV then sees a different
+# environment from the one mere-ruby was given (see tools/ref_ruby.sh).
+out_r="$({ spec_env perl -e 'alarm 25; exec @ARGV' "${REF_RUBY_BIN:-ruby}" -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
 
 # Say WHICH failure it was, in the section it belongs to, and let scoreboard.sh
 # classify as it always has: with no `pass=` line in mere-ruby's section it

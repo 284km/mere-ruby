@@ -7189,7 +7189,10 @@ let feq = fn (x: float) -> fn (y: float) -> x <= y && y <= x;
 // and modulo takes the sign of the divisor (-7 % 3 == 2). Mere's native
 // / and % truncate toward zero (C semantics), so correct after the fact.
 let floor_div = fn (a: int) -> fn (b: int) ->
-  if b == 0 then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: divided by 0")) in fail "mere-ruby: divided by 0")
+  // ...as a real ZeroDivisionError, which is what a program rescues. This was
+  // an internal failure, so it reached the program as a bare StandardError
+  // reading "mere-ruby: divided by 0".
+  if b == 0 then (let _ = prim_raise "ZeroDivisionError" "divided by 0" in 0)
   else
     let q = a / b in
     let r = a - q * b in
@@ -7350,6 +7353,17 @@ let big_eq_flt = fn (x: str) -> fn (f: float) ->
   then float_of_int (int_of_float f) == f && str_eq x (str_of_int (int_of_float f))
   else str_eq x (flt_to_big_s f);
 
+// the flags that decide whether two patterns are the same match: i, x and m.
+// `n` only says how to read the source's bytes, which changes nothing when
+// the source is ASCII-only -- and that is the case ruby's #== spec asks about.
+let rec rx_src_all7 = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then true else if ord (char_at s i) >= 128 then false else rx_src_all7 s (i + 1);
+let rx_cmp_flags = fn (src: str) -> fn (fl: str) ->
+  (if str_contains fl "i" then "i" else "") ++
+  (if str_contains fl "x" then "x" else "") ++
+  (if str_contains fl "m" then "m" else "") ++
+  (if str_contains fl "n" && (if rx_src_all7 src 0 then false else true) then "n" else "");
+
 let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   match va with
   | VInt x ->
@@ -7365,8 +7379,10 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
      | VBig y -> big_eq_flt y x
      | _ -> false)
   // canonical form: a VBig never equals a VInt; two VBig equal iff same string.
-  | VBig x -> (match vb with VBig y -> str_eq x y | VFlt y -> big_eq_flt x y | _ -> false)
-  | VRat (n, d) -> (match vb with VRat (n2, d2) -> str_eq n n2 && str_eq d d2 | VInt m -> str_eq d "1" && str_eq n (str_of_int m) | VFlt f -> feq (float_of_str n / float_of_str d) f | _ -> false)
+  // ...and a whole RATIONAL: `10**20 == Rational(10**20, 1)` is true in ruby,
+  // and each of these arms knew about VInt and not about the other's bignum.
+  | VBig x -> (match vb with VBig y -> str_eq x y | VFlt y -> big_eq_flt x y | VRat (n2, d2) -> str_eq d2 "1" && str_eq n2 x | _ -> false)
+  | VRat (n, d) -> (match vb with VRat (n2, d2) -> str_eq n n2 && str_eq d d2 | VInt m -> str_eq d "1" && str_eq n (str_of_int m) | VBig y -> str_eq d "1" && str_eq n y | VFlt f -> feq (float_of_str n / float_of_str d) f | _ -> false)
   | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> rb_eq r r2 && rb_eq i i2 | VInt m -> rb_eq i (VInt 0) && rb_eq r (VInt m) | _ -> false)
   | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in str_eq x y | _ -> false)
   | VBool x ->
@@ -7404,7 +7420,11 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   // regexes / procs / bindings compare by pattern text / handle identity (and
   // never equal a different kind) — without these arms rb_eq is non-exhaustive
   // and aborts when a regex/proc reaches it (e.g. a `^regex` pin).
-  | VRegex (p, pf) -> (match vb with VRegex (q, qf) -> str_eq p q && str_eq pf qf | _ -> false)
+  // ...comparing the flags that CHANGE the match. `n` (NOENCODING) is not one
+  // of them for an ASCII-only pattern -- it says how to read the bytes, and
+  // there is nothing to read differently -- so ruby answers true for
+  // `/x/ == Regexp.new("x", Regexp::NOENCODING)`.
+  | VRegex (p, pf) -> (match vb with VRegex (q, qf) -> str_eq p q && str_eq (rx_cmp_flags p pf) (rx_cmp_flags q qf) | _ -> false)
   | VProc x -> (match vb with VProc y -> x == y | _ -> false)
   | VBind x -> (match vb with VBind y -> x == y | _ -> false)
 
@@ -7585,9 +7605,13 @@ let rat_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      if str_eq op "+" then VFlt (x + y) else if str_eq op "-" then VFlt (x - y)
      else if str_eq op "*" then VFlt (x * y) else VFlt (x / y))
   else
-    let an = (match va with VRat (n, d) -> n | VInt n -> str_of_int n | _ -> "0") in
+    // ...and a BIGNUM is its decimal string. Without this arm it fell to the
+    // catch-all zero, and every mixed operation answered as if the bignum were
+    // 0: `(10**20) * Rational(1,2)` was (0/1), `+` dropped it entirely. A
+    // wrong ANSWER, silently -- the worst shape a gap can take.
+    let an = (match va with VRat (n, d) -> n | VInt n -> str_of_int n | VBig s -> s | _ -> "0") in
     let ad = (match va with VRat (n, d) -> d | _ -> "1") in
-    let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | _ -> "0") in
+    let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | VBig s -> s | _ -> "0") in
     let bd = (match vb with VRat (n, d) -> d | _ -> "1") in
     if str_eq op "+" then rat_add_s an ad bn bd
     else if str_eq op "-" then rat_sub_s an ad bn bd
@@ -7818,6 +7842,20 @@ let num_isneg = fn (v: Val) -> match v with
 let num_abs = fn (v: Val) -> if num_isneg v then num_neg v else v;
 // +,-,* on two boxed numerics: exact int when both are VInt, else via float.
 let num_bin = fn (o: str) -> fn (x: Val) -> fn (y: Val) ->
+  // a BIGNUM keeps its digits: this fell through to `to_f` on both sides, so
+  // a Complex with a bignum component came out in floats (and lost the low
+  // twenty digits). Integers are exact in ruby however big they are.
+  if (match x with VBig _ -> true | _ -> false) || (match y with VBig _ -> true | _ -> false) then
+    (if (match x with VFlt _ -> true | _ -> false) || (match y with VFlt _ -> true | _ -> false)
+     then (let fa = to_f x in let fb = to_f y in
+           if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb))
+     else
+       let a9 = num_dec x in
+       let b9 = num_dec y in
+       if str_eq o "+" then norm_big (big_add_s a9 b9)
+       else if str_eq o "-" then norm_big (big_sub_s a9 b9)
+       else norm_big (big_mul_s a9 b9))
+  else
   match x with
   | VInt a -> (match y with
      | VInt b -> if str_eq o "+" then VInt (a + b) else if str_eq o "-" then VInt (a - b) else VInt (a * b)
@@ -7862,6 +7900,20 @@ let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
        VCpx (cpx_quo (cpx_comp "+" (cpx_comp "*" ar br) (cpx_comp "*" ai bi)) den,
              cpx_quo (cpx_comp "-" (cpx_comp "*" ai br) (cpx_comp "*" ar bi)) den))
   else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: complex operator unsupported")) in fail "mere-ruby: complex operator unsupported");
+// x ** y for a Complex in general: exp(y * ln x), with ln(a+bi) =
+// ln|x| + i*arg(x). Both operands become Complex first, and the answer is a
+// Complex of floats -- the same shape ruby gives.
+let cpx_pow_gen = fn (x: Val) -> fn (y: Val) ->
+  let (xr, xi) = (match x with VCpx (r, i) -> (to_f r, to_f i) | v -> (to_f v, 0.0)) in
+  let (yr, yi) = (match y with VCpx (r, i) -> (to_f r, to_f i) | v -> (to_f v, 0.0)) in
+  let lnr = log (hypot xr xi) in
+  let arg = atan2 xi xr in
+  // (yr + yi i) * (lnr + arg i)
+  let er = yr * lnr - yi * arg in
+  let ei = yr * arg + yi * lnr in
+  let m = exp er in
+  VCpx (VFlt (m * cos ei), VFlt (m * sin ei));
+
 // integer powers of a Complex (negative exponents via the reciprocal).
 let rec cpx_pow = fn (base: Val) -> fn (n: int) ->
   if n == 0 then VCpx (VInt 1, VInt 0)
@@ -7901,10 +7953,22 @@ let mul_int_ov = fn (a: int) -> fn (b: int) ->
 // much later in the file and this is needed here; an object cannot be named
 // precisely without `world`, which a value-level comparison does not have, so it
 // is "Object" -- one side named exactly is enough to see what was compared.
+// Regexp#inspect wraps the source in slashes, so a slash INSIDE it has to be
+// escaped: `/\/foo/.inspect` is "/\\/foo/" and read back as the same pattern.
+// One already escaped is left alone.
+let rec rx_esc_slashes = fn (p: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len p then acc
+  else
+    let c = char_at p i in
+    if str_eq c "\\" && i + 1 < str_len p
+    then rx_esc_slashes p (i + 2) (acc ++ c ++ char_at p (i + 1))
+    else if str_eq c "/" then rx_esc_slashes p (i + 1) (acc ++ "\\/")
+    else rx_esc_slashes p (i + 1) (acc ++ c);
+
 let cmp_type_name = fn (v: Val) ->
   (match v with
    | VInt _ -> "Integer" | VBig _ -> "Integer" | VFlt _ -> "Float"
-   | VRat (_, _) -> "Rational"
+   | VRat (_, _) -> "Rational" | VCpx (_, _) -> "Complex"
    | VStr _ -> "String" | VSym _ -> "Symbol" | VArr _ -> "Array" | VHsh _ -> "Hash"
    | VNil -> "NilClass" | VBool b -> (if b then "TrueClass" else "FalseClass")
    | VProc _ -> "Proc" | VClass _ -> "Class" | VExc (c, _) -> c | VMain -> "Object"
@@ -8078,6 +8142,10 @@ let rec val_hash = fn (v: Val) ->
   // exclusion has to be IN it: (1..2) and (1...2) are different ranges.
   | VRange (lo, hi, excl) ->
     floor_mod (val_hash lo * 31 + val_hash hi * 7 + (if excl then 1 else 2) + 4001) 1000000007
+  // A Rational hashes from its two halves: it had no arm and fell to 0, so
+  // every Rational was the same hash key.
+  | VRat (rn, rd) -> floor_mod (str_hash_go rn 0 7 * 31 + str_hash_go rd 0 11 + 5003) 1000000007
+  | VCpx (cre, cim) -> floor_mod (val_hash cre * 31 + val_hash cim * 7 + 6007) 1000000007
   // A Regexp is its SOURCE AND ITS OPTIONS: /x/ and /x/i are different
   // patterns, and hashing only the source made them one key.
   | VRegex (sp, fl) ->
@@ -8417,6 +8485,17 @@ let shift_by_big = fn (va: Val) -> fn (y: str) -> fn (left: bool) ->
   if away then (if recv_neg then VInt (0 - 1) else VInt 0)
   else prim_raise "RangeError" "shift width too big";
 
+// `x % y` where y is not something to divide by: ruby coerces, and the
+// coerced pair is then asked for `%`. A Complex has none, so the answer is
+// its NoMethodError; anything non-numeric is the coercion's TypeError. This
+// was one internal failure ("mere-ruby: % type error") for both.
+let cmp_mod_refuse = fn (vb: Val) ->
+  if (match vb with VCpx (_, _) -> true | _ -> false)
+  then prim_raise "NoMethodError" "undefined method '%' for an instance of Complex"
+  else if (match vb with VRat (_, _) -> true | _ -> false)
+  then prim_raise "TypeError" "Rational can't be coerced into Float"
+  else prim_raise "TypeError" (cmp_type_name vb ++ " can't be coerced into Integer");
+
 let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   // Rational operand: +,-,*,/ produce a Rational (or Float if a Float is
   // involved). Checked first so int/rat mixing works uniformly.
@@ -8448,8 +8527,11 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
                    then (match cpx_pow va (int_of_float fy) with
                          | VCpx (re9, im9) -> VCpx (VFlt (to_f re9), VFlt (to_f im9))
                          | other9 -> other9)
-                   else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** complex exponent unsupported")) in fail "mere-ruby: ** complex exponent unsupported"))
-     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** complex exponent unsupported")) in fail "mere-ruby: ** complex exponent unsupported"))
+                   else cpx_pow_gen va (VFlt fy))
+     // a COMPLEX (or fractional) exponent is exp(y * ln x), which is what
+     // ruby computes too -- this used to be an internal failure, so it
+     // reached the program as a bare StandardError.
+     | _ -> cpx_pow_gen va vb)
   else if str_eq op "|" then
     (match va with
      | VArr x -> (match vb with VArr y -> arr_new (val_dedup_into (deref y) (val_dedup_into (deref x) Nil)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
@@ -8552,18 +8634,18 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
         // to be "supports integers only", which a spec noticed by asking for
         // `6543.21.%(137)`.
         | VFlt y -> VFlt (flt_floor_mod (float_of_int x) y)
-        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: % type error")) in fail "mere-ruby: % type error"))
+        | _ -> (cmp_mod_refuse vb))
      | VFlt x ->
        (match vb with
         | VFlt y -> VFlt (flt_floor_mod x y)
         | VInt y -> VFlt (flt_floor_mod x (float_of_int y))
-        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: % type error")) in fail "mere-ruby: % type error"))
+        | _ -> (cmp_mod_refuse vb))
      | VBig x ->
        (match vb with
         | VInt y -> norm_big (big_mod_s x (str_of_int y))
         | VBig y -> norm_big (big_mod_s x y)
-        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: % type error")) in fail "mere-ruby: % type error"))
-     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: % type error")) in fail "mere-ruby: % type error"))
+        | _ -> (cmp_mod_refuse vb))
+     | _ -> (cmp_mod_refuse vb))
   else if str_eq op "**" then
     (match va with
      // a Float exponent makes the whole thing a Float, whatever the base is
@@ -11134,7 +11216,7 @@ and inspect = fn (v: Val) ->
     // ruby prints the flags in the order "mixn", and `n` is one of them: it
     // was dropped here, so `/x/n.inspect` read `/x/` -- a literal that means
     // something else.
-    "/" ++ p ++ "/" ++ (if str_contains fl "m" then "m" else "") ++ (if str_contains fl "i" then "i" else "") ++ (if str_contains fl "x" then "x" else "") ++ (if str_contains fl "n" then "n" else "")
+    "/" ++ rx_esc_slashes p 0 "" ++ "/" ++ (if str_contains fl "m" then "m" else "") ++ (if str_contains fl "i" then "i" else "") ++ (if str_contains fl "x" then "x" else "") ++ (if str_contains fl "n" then "n" else "")
   | VSym sy ->
     // a symbol that isn't a plain identifier / valid operator name inspects
     // quoted and escaped (:"foo bar", :"9", :"a\nb").
@@ -16151,7 +16233,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
       (match args with
        | Cons (VInt m9, _) -> iter_each_result (big_upto world encl theblk bs (str_of_int m9) (if str_eq name "upto" then 1 else 0 - 1)) recv
        | Cons (VBig m9, _) -> iter_each_result (big_upto world encl theblk bs m9 (if str_eq name "upto" then 1 else 0 - 1)) recv
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: upto needs an integer")) in fail "mere-ruby: upto needs an integer"))
+       | _ -> (prim_raise "ArgumentError" ("comparison of Integer with " ++ class_name (match args with Cons (a9, _) -> a9 | Nil -> VNil) ++ " failed")))
     else prim_method recv name args
   | VInt n ->
     if str_eq name "times" then iter_each_result (range_each world encl theblk 0 (n - 1)) recv
@@ -16167,7 +16249,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
               (if flt_is_inf f && f > 0.0 then int_max
                else if flt_is_nan f || flt_is_inf f then n - 1
                else int_of_float f)) recv
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: upto needs an integer")) in fail "mere-ruby: upto needs an integer"))
+       | _ -> (prim_raise "ArgumentError" ("comparison of Integer with " ++ class_name (match args with Cons (a9, _) -> a9 | Nil -> VNil) ++ " failed")))
     else if str_eq name "downto" then
       (match args with
        | Cons (VInt m, _) -> iter_each_result (range_down world encl theblk n m) recv
@@ -16179,7 +16261,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                         // walking DOWN stops at the first value below the limit,
                         // so the last integer yielded is ceil(limit)
                         else (let t9 = int_of_float f9 in if float_of_int t9 < f9 then t9 + 1 else t9))) recv
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: downto needs an integer")) in fail "mere-ruby: downto needs an integer"))
+       | _ -> (prim_raise "ArgumentError" ("comparison of Integer with " ++ class_name (match args with Cons (a9, _) -> a9 | Nil -> VNil) ++ " failed")))
     else if str_eq name "step" then
       (match args with
        | Cons (VInt limit, Cons (VInt by, _)) -> iter_each_result (range_step world encl theblk n limit by) recv
@@ -19172,6 +19254,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // Array#initialize (reached through `send`, since it is private): the same
   // conversions and refusals Array.new gets. The primitive had neither, so a
   // size of 2**62 recursed until the stack died and #to_ary was never asked.
+  // a frozen REGEXP refuses #initialize the same way (it would replace the
+  // pattern). It had no arm at all, so a spec asking for the FrozenError got
+  // "undefined method 'initialize'".
+  // #initialize on a Regexp that already has a pattern: ruby refuses it, as
+  // TypeError when the object merely exists and as FrozenError when it is
+  // frozen. Every Regexp here is an immutable value (val_is_frozen says so),
+  // so the frozen answer is the only one this model can give -- and it is the
+  // one a program sees, since a literal is frozen in ruby too.
+  else if str_eq name "initialize" && (match recv with VRegex (_, _) -> true | _ -> false)
+          && (if prim_user_has world recv "initialize" then false else true) then
+    raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   else if str_eq name "initialize" && (match recv with VArr _ -> true | _ -> false)
           && (if prim_user_has world recv "initialize" then false else true) then
     // an ARRAY refuses #initialize when frozen even with no arguments (it
@@ -20365,19 +20458,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     | Cons (VInt opt, _) ->
                       (if opt - (opt / 2) * 2 == 1 then "i" else "") ++
                       (if (opt / 2) - (opt / 4) * 2 == 1 then "x" else "") ++
-                      (if (opt / 4) - (opt / 8) * 2 == 1 then "m" else "")
+                      (if (opt / 4) - (opt / 8) * 2 == 1 then "m" else "") ++
+                      // ...and NOENCODING (32), the `n` flag: it was dropped,
+                      // so `Regexp.new(s, Regexp::NOENCODING)` answered a
+                      // pattern with no flags and #options said 0.
+                      (if (opt / 32) - (opt / 64) * 2 == 1 then "n" else "")
                     | Cons (VStr fs, _) -> sget fs
                     | _ -> "") in
           if rx_validate body fl then rx_build_once body fl args
           else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
        | Cons (VRegex (b2, f2), _) -> VRegex (b2, f2)
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: Regexp.new expects a string")) in fail "mere-ruby: Regexp.new expects a string"))
+       | Cons (other9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name other9 ++ " into String")
+       | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
     // Regexp.last_match / .last_match(n): the same MatchData `$~` holds, which
     // is how a `method =~ /re/` test reads its capture afterwards.
     else if str_eq c "Regexp" && str_eq name "last_match" then
       (let md = (if map_has globals "~" then map_get globals "~" else VNil) in
        match args with
-       | Cons (ix, _) -> (match md with VNil -> VNil | _ -> invoke_val_c env world blk md "[]" (Cons (ix, Nil)) false)
+       | Cons (ix, rest9) ->
+         (match rest9 with
+          | Cons (_, _) -> raise_exc world "ArgumentError"
+                             ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0..1)")
+          | Nil -> (match md with VNil -> VNil | _ -> invoke_val_c env world blk md "[]" (Cons (ix, Nil)) false))
        | Nil -> md)
     else if str_eq c "Regexp" && (str_eq name "escape" || str_eq name "quote") then
       (match args with Cons (VStr s, _) -> (let e9 = rx_escape (sget s) in
@@ -24483,6 +24585,40 @@ and cvar_name_checked = fn world -> fn (nm: str) ->
 
 and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // #backtrace_locations: the same frames #backtrace answers, as objects. The
+  // leaf has the frames and no world to build a Location in, so it answered
+  // nil for an exception whose backtrace it could already print.
+  if str_eq name "backtrace_locations"
+     && (match recv with VExc (_, _) -> true | _ -> false)
+     && map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") recv then
+    (match map_get raise_bt "v" with
+     | VArr aid9 -> arr_new (bt_locs_of world (deref aid9))
+     | _ -> VNil)
+  else
+  // The names whose argument ruby converts (or refuses) BEFORE the arithmetic:
+  // the leaf below has no world and cannot call #to_int, so its refusal came
+  // out as an internal failure -- a bare StandardError reading
+  // "mere-ruby: & type error" where ruby says what it wanted and why.
+  let args = (if (str_eq name "allbits?" || str_eq name "anybits?" || str_eq name "nobits?")
+                 && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+              then (let cv9 = coerce_int_args env world args in
+                    match cv9 with
+                    | Cons (a9, _) ->
+                      (match a9 with
+                       | VInt _ -> cv9 | VBig _ -> cv9
+                       | _ -> (let _ = raise_exc world "TypeError"
+                                 ("no implicit conversion of " ++ class_name a9 ++ " into Integer") in cv9))
+                    | Nil -> cv9)
+              else args) in
+  let _ = (if (str_eq name "gcd" || str_eq name "lcm" || str_eq name "gcdlcm")
+              && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+           then (match args with
+                 | Cons (a9, _) ->
+                   (match a9 with
+                    | VInt _ -> () | VBig _ -> ()
+                    | _ -> (let _ = raise_exc world "TypeError" "not an integer" in ()))
+                 | Nil -> ())
+           else ()) in
   let cls = class_name recv in
   // The @ivar reflection primitives on a receiver that is not a plain object:
   // main and the mutable primitives get storage keyed the same way their
@@ -25710,7 +25846,7 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
     // pair of answers a library checks before calling)
     || (exc_is_a world cls "Exception"
         && (str_eq name "message" || str_eq name "backtrace" || str_eq name "set_backtrace" || str_eq name "cause"
-            || str_eq name "backtrace_locations" || str_eq name "full_message"))
+            || str_eq name "backtrace_locations" || str_eq name "full_message" || str_eq name "exception"))
     // respond_to_missing?(name, include_private=false): a method_missing-based
     // object can claim to respond to names it has no real method for.
     || (has_meth world cls "respond_to_missing?"
@@ -26984,6 +27120,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   if str_eq name "div" && (match recv with VRat _ -> true | _ -> false)
      && (match args with Cons (_, Nil) -> true | _ -> false) then
     (match args with
+     // ...but a non-number is refused first, in the receiver's own words: it
+     // went into rat_arith, whose zero denominator answered ZeroDivisionError
+     // for an argument that is not a number at all.
+     | Cons (b9, Nil) when (if is_num b9 then false else true) ->
+       prim_raise "TypeError" (cmp_type_name b9 ++ " can't be coerced into Rational")
      | Cons (b, _) ->
        (match rat_arith "/" recv b with
         | VRat (qn, qd) -> norm_big (rat_int_mode "floor" qn qd)
@@ -27014,6 +27155,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else if (if negr then false else true) && negm then arith_bin "+" m absb
            else m))
      | _ -> VNil)
+  // a NON-numeric argument to one of these is ruby's TypeError, naming the
+  // class it could not coerce INTO -- the arithmetic below took it as an
+  // internal failure ("mere-ruby: not a number").
+  else if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder" || str_eq name "quo")
+     && is_num recv && (match args with Cons (a1, Nil) -> (if is_num a1 then false else true) | _ -> false) then
+    (match args with
+     | Cons (a1, _) -> prim_raise "TypeError"
+                         (class_name a1 ++ " can't be coerced into " ++ class_name recv)
+     | Nil -> VNil)
   else if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder")
      && is_num recv && (match args with Cons (a1, Nil) -> is_num a1 | _ -> false) then
     (match args with
@@ -27298,7 +27448,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VRegex (_, fl) ->
        VInt ((if str_contains fl "i" then 1 else 0)
              + (if str_contains fl "x" then 2 else 0)
-             + (if str_contains fl "m" then 4 else 0))
+             + (if str_contains fl "m" then 4 else 0)
+             + (if str_contains fl "n" then 32 else 0))
      | _ -> VInt 0)
   // Regexp#names / #named_captures: the pattern's own group names, read from
   // the same table a MatchData reads. MatchData#names is specified against
@@ -27748,6 +27899,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in
              (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in
               fail ("mere-ruby: undefined method '" ++ name ++ "'"))))
+  // Exception#exception on the PAIR representation: self with no argument, a
+  // copy carrying the new message with one. The object form has had this all
+  // along; the pair form answered NoMethodError, and `raise "x"` makes a pair.
+  else if str_eq name "exception" && (match recv with VExc (_, _) -> true | _ -> false) then
+    (match recv with
+     | VExc (ec9, em9) ->
+       (match args with
+        | Nil -> recv
+        | Cons (VNil, _) -> recv
+        | Cons (VStr mh9, _) -> VExc (ec9, sget mh9)
+        | Cons (other9, _) -> VExc (ec9, to_s other9))
+     | _ -> recv)
   // LoadError#path: the file that could not be loaded (nil for a LoadError
   // raised with any other message).
   else if str_eq name "path" then
@@ -28081,7 +28244,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in VInt (if l < 0 then 0 - l else l)) | Cons (VBig b, _) -> (let g = big_gcd_s (big_mag (str_of_int a)) (big_mag b) in norm_big (big_mul_s (big_div_s (big_mag (str_of_int a)) g) (big_mag b))) | _ -> VInt a)
      | VBig a -> (match args with Cons (b, _) -> (let bm = big_mag (num_dec b) in let g = big_gcd_s (big_mag a) bm in norm_big (big_mul_s (big_div_s (big_mag a) g) bm)) | _ -> norm_big (big_mag a)) | _ -> (let _ = map_set prim_missing "n" (mkstr "lcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lcm'")) in fail "mere-ruby: undefined method 'lcm'")))
   else if str_eq name "gcdlcm" then
-    (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
+    // ...for a BIGNUM on either side too: this arm took two machine ints and
+    // reported the method undefined for anything else, so `(10**20).gcdlcm(35)`
+    // was a NoMethodError for a method #gcd and #lcm both answer.
+    (if (match recv with VBig _ -> true | _ -> false)
+        || (match args with Cons (VBig _, _) -> true | _ -> false) then
+       (let a9 = big_mag (num_dec recv) in
+        let b9 = big_mag (num_dec (match args with Cons (b, _) -> b | Nil -> VInt 0)) in
+        let g9 = big_gcd_s a9 b9 in
+        arr_new (Cons (norm_big g9, Cons (norm_big (big_mul_s (big_div_s a9 g9) b9), Nil))))
+     else
+     match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
   else if str_eq name "digits" then
     // The RADIX and the sign are checked first. Dividing by 1 never reaches
     // zero, so `12345.digits(1)` recursed until the stack went -- and a
@@ -28128,7 +28301,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "divmod") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'divmod'")) in fail "mere-ruby: undefined method 'divmod'")))
   else if str_eq name "fdiv" then
-    (match recv with
+    // ...and an argument that is not a number is refused in the receiver's
+    // own words: `to_f` on it was an internal failure ("not a number").
+    (if (match args with Cons (a9, _) -> (if is_num a9 then false else true) | Nil -> false)
+     then prim_raise "TypeError" (cmp_type_name (match args with Cons (a9, _) -> a9 | Nil -> VNil)
+                                  ++ " can't be coerced into " ++ cmp_type_name recv)
+     else
+     match recv with
      | VCpx (r, i) -> (match args with Cons (b, _) -> VCpx (VFlt (to_f r / to_f b), VFlt (to_f i / to_f b)) | _ -> VNil)
      | VInt a -> (match args with Cons (b, _) -> VFlt (to_f (VInt a) / to_f b) | _ -> VNil)
      | VFlt a -> (match args with Cons (b, _) -> VFlt (a / to_f b) | _ -> VNil)
@@ -34080,7 +34259,19 @@ and env_all_pairs_host = fn () ->
   let _ = run ("env > " ++ shq tmpf ++ " 2> /dev/null") in
   let content = (if file_exists tmpf then read_file tmpf else "") in
   let _ = run ("rm -f " ++ shq tmpf) in
-  env_pairs_go content 0
+  // `_` is the dump's own doing -- the shell sets it to the command it is
+  // about to run, so it names /usr/bin/env and nothing else. It is the one
+  // key we can be sure this program does not have (see KNOWN_GAPS for the
+  // two we cannot: the shell's PWD and SHLVL).
+  env_drop_underscore (env_pairs_go content 0)
+
+and env_drop_underscore = fn (ps: (str * str) list) ->
+  match ps with
+  | Nil -> Nil
+  | Cons ((k, v), t) ->
+    if str_eq k "_" && str_len v >= 4 && str_eq (substring v (str_len v - 4) (str_len v)) "/env"
+    then env_drop_underscore t
+    else Cons ((k, v), env_drop_underscore t)
 and env_pairs_go = fn (content: str) -> fn (i: int) ->
   if i >= str_len content then (Nil : (str * str) list)
   else
@@ -38583,6 +38774,40 @@ and vtake = fn (xs: Val list) -> fn (n: int) ->
   if n <= 0 then (Nil : Val list)
   else (match xs with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (h, vtake t (n - 1)))
 
+// The recorded backtrace is a list of "path:line:in 'label'" strings (that is
+// what ruby's #backtrace answers too), and #backtrace_locations wants the same
+// frames as objects. Reading them back is the only way to answer both from one
+// record.
+and bt_locs_of = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (VStr h9, t9) ->
+    (let s9 = sget h9 in
+     let c1 = bt_last_colon s9 (str_len s9) 0 in
+     let c0 = bt_last_colon s9 c1 0 in
+     let pth = (if c0 > 0 then substring s9 0 c0 else s9) in
+     let lno = (if c0 > 0 && c1 > c0 then bt_digits s9 (c0 + 1) c1 0 else 0) in
+     let lbl = (let i9 = bt_quote_at s9 0 in
+                if i9 < 0 then "" else substring s9 (i9 + 1) (bt_quote_end s9 (i9 + 1))) in
+     Cons (loc_obj world pth lno lbl, bt_locs_of world t9))
+  | Cons (_, t9) -> bt_locs_of world t9
+
+and bt_last_colon = fn (s: str) -> fn (upto: int) -> fn (best: int) ->
+  bt_last_colon_go s 0 upto (0 - 1)
+and bt_last_colon_go = fn (s: str) -> fn (i: int) -> fn (upto: int) -> fn (best: int) ->
+  if i >= upto then best
+  else bt_last_colon_go s (i + 1) upto (if str_eq (char_at s i) ":" then i else best)
+and bt_digits = fn (s: str) -> fn (i: int) -> fn (stop: int) -> fn (acc: int) ->
+  if i >= stop then acc
+  else (let c = char_at s i in
+        if ord c >= 48 && ord c <= 57 then bt_digits s (i + 1) stop (acc * 10 + (ord c - 48)) else acc)
+and bt_quote_at = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then (0 - 1)
+  else if str_eq (char_at s i) "'" then i else bt_quote_at s (i + 1)
+and bt_quote_end = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i
+  else if str_eq (char_at s i) "'" then i else bt_quote_end s (i + 1)
+
 and loc_obj = fn world -> fn (path: str) -> fn (line: int) -> fn (label: str) ->
   let (meths, sup, ocls, ivars) = world in
   let cls = "Thread::Backtrace::Location" in
@@ -41425,7 +41650,9 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if numbered_misuse_stmts prog2 then raise_exc world "SyntaxError" "invalid numbered parameter"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9)
-  | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: eval expects a string")) in fail "mere-ruby: eval expects a string")
+  // ...and anything else is ruby's TypeError, not an internal failure: `eval`
+  // says which conversion it wanted.
+  | other9 -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name (match other9 with Cons (v9, _) -> v9 | Nil -> VNil) ++ " into String")
 
 // run an eval'd program with the position it was TOLD it has, restoring the
 // caller's afterwards (an eval inside an eval must not keep the inner one's).
@@ -45570,6 +45797,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = errno_build () in
   let _ = map_iter errno_num_tbl (fn (nm9: str) -> fn (num9: int) ->
             let _ = map_set sup ("Errno::" ++ nm9) "SystemCallError" in
+            // ...and the CLASS constant itself, so `Errno::EOPNOTSUPP` names
+            // something: registering only the superclass left every name
+            // outside the hand-written list an uninitialized constant.
+            let _ = (if map_has consts ("Errno::" ++ nm9) then ()
+                     else map_set consts ("Errno::" ++ nm9) (VClass ("Errno::" ++ nm9))) in
             map_set consts ("Errno::" ++ nm9 ++ "::Errno") (VInt num9)) in
   let _ = map_set sup "EOFError" "IOError" in
   let _ = map_set sup "ThreadError" "StandardError" in

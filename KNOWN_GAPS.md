@@ -67,6 +67,36 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
+## ENV is read through a subprocess, so it carries the shell's own variables
+
+```sh
+env -i PATH=... HOME=... ruby       -e 'p ENV.keys.sort'
+#   [..., "PATH", "TMPDIR", "__CF_USER_TEXT_ENCODING"]
+env -i PATH=... HOME=... mere-ruby  -e 'p ENV.keys.sort'
+#   [..., "PATH", "PWD", "SHLVL", "TMPDIR"]
+```
+
+The environment is read once, by running `env` and parsing it. That subprocess
+is a SHELL, which sets `PWD` and increments `SHLVL` in its own environment
+before `env` prints it -- so both appear in `ENV` here whether or not this
+process has them, and `SHLVL`'s value is one too high when it does. The reverse
+also happens: macOS adds `__CF_USER_TEXT_ENCODING` to a process's real environ,
+which a subprocess dump does not show.
+
+`_` is dropped (its value is always the dump command itself); the other two
+cannot be told from a variable the parent really passed.
+
+**What it costs.** Five `core/env` spec files (`keys`, `values`, `to_a`,
+`each_key`, `each_value`) count one expectation per ENV key, so the two sides
+disagree on the COUNT while every example passes. They are recorded as DIFF
+with `pass=N fail=0 err=0`, which is what that shape looks like.
+
+**What fixing it would take.** Reading the process's own `environ` instead of a
+subprocess's -- which needs a runtime binding this interpreter does not have:
+an `extern fn` that answers a `str` hands back a raw C pointer, and there is no
+byte reader to walk it with. One new primitive in the Mere runtime (`environ`
+as a length-prefixed dump) closes it.
+
 ## A bare `mere-ruby` prints usage; ruby reads stdin
 
 ```sh
