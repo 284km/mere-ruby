@@ -12333,6 +12333,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
     if lv_has env name then lv_get env name
+    // `it` (ruby 3.4): inside a block with no parameters it names the first
+    // argument -- the same value `_1` names. It is NOT a local variable (it
+    // does not appear in #local_variables), so it is resolved here rather
+    // than bound: a real local or method called `it` is found above and wins.
+    else if str_eq name "it" && lv_has env "_1" then lv_get env "_1"
     else if map_has meths name then call_method env world noblk name Nil
     // Kernel#local_variables: the locals visible in the current scope.
     else if str_eq name "local_variables" then local_vars_of env
@@ -15672,9 +15677,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                          | VInt n -> n
                          | VBig b -> big_sign b
                          | VFlt f -> (if f > 0.0 then 1 else if f < 0.0 then 0 - 1 else 0)
+                         // ...naming the right operand by VALUE, which is
+                         // what rb_cmperr does for a comparable one (and what
+                         // the blockless path here already did).
                          | VNil -> (let _ = raise_exc world "ArgumentError"
                                               ("comparison of " ++ class_name h ++ " with "
-                                               ++ class_name acc ++ " failed") in 0)
+                                               ++ cmp_other_name acc ++ " failed") in 0)
                          // ruby does not COERCE the block's answer -- it ASKS
                          // it, sending #> and then #< against 0. An object
                          // that answers both (ruby/spec has exactly one) went
@@ -15785,6 +15793,23 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                | _ -> VNil))
     // a size below 1 is refused BEFORE the walk: val_slices never shortens on
     // a zero step, so `each_slice(0) { }` ran until the stack gave out.
+    // Array#fetch_values with a block: the block supplies the value for an
+    // index outside the array (the blockless implementation raises there).
+    else if str_eq name "fetch_values" && (match recv with VArr _ -> true | _ -> false) then
+      (match recv with
+       | VArr id9 ->
+         (let ys = deref id9 in
+          let n9 = val_list_len ys in
+          let rec go9 = fn (ks: Val list) ->
+            (match ks with
+             | Nil -> (Nil : Val list)
+             | Cons (VInt i, t) ->
+               (let j = (if i < 0 then n9 + i else i) in
+                Cons ((if j >= 0 && j < n9 then val_nth ys j
+                       else flow_value (run_block world encl theblk (Cons (VInt i, Nil)))), go9 t))
+             | Cons (_, t) -> go9 t) in
+          arr_new (go9 args))
+       | _ -> VNil)
     else if str_eq name "each_slice" then (match args with Cons (VInt n, _) -> (if n < 1 then raise_exc world "ArgumentError" "invalid slice size" else iter_each_result (arr_each world encl theblk (val_slices xs n)) recv) | _ -> recv)
     else if str_eq name "each_cons" then (match args with Cons (VInt n, _) -> (if n < 1 then raise_exc world "ArgumentError" "invalid size" else iter_each_result (arr_each world encl theblk (val_cons_windows xs n)) recv) | _ -> recv)
     else prim_method recv name args
@@ -15853,6 +15878,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
             Cons ((if hash_haskey xs k then hash_get xs k
                    else flow_value (run_block world encl theblk (Cons (k, Nil)))), go t)) in
        arr_new (go args))
+
     else if str_eq name "transform_keys!" then
       (match recv with
        | VHsh hid ->
@@ -16348,7 +16374,7 @@ and insert_blk_b = fn world -> fn theblk -> fn (x: Val) -> fn (sorted: Val list)
                  | VFlt f -> (if f > 0.0 then 1 else if f < 0.0 then 0 - 1 else 0)
                  | VNil -> (let _ = raise_exc world "ArgumentError"
                                       ("comparison of " ++ class_name x ++ " with "
-                                       ++ class_name h ++ " failed") in 0)
+                                       ++ cmp_other_name h ++ " failed") in 0)
                  | VStr _ -> (let _ = raise_exc world "ArgumentError"
                                         "comparison of String with 0 failed" in 0)
                  | VSym _ -> (let _ = raise_exc world "ArgumentError"
@@ -16521,7 +16547,10 @@ and arr_min_by_go = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn 
   | Nil -> best
   | Cons (h, t) ->
     let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
-    let c = cmp_vals k bestk in
+    // ...through the world: the block's answers may be objects with a `<=>`
+    // of their own, and the world-free comparison raised "comparison of
+    // Object with Object failed" for a class that defines one.
+    let c = cmp_vals_w world k bestk in
     let better = if want_max then c > 0 else c < 0 in
     if better then arr_min_by_go world encl theblk t h k want_max
     else arr_min_by_go world encl theblk t best bestk want_max
@@ -16541,8 +16570,8 @@ and arr_minmax_by_go = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> 
   | Nil -> arr_new (Cons (mn, Cons (mx, Nil)))
   | Cons (h, t) ->
     (let k = flow_value (run_block world encl theblk (Cons (h, Nil))) in
-     let (mn2, mnk2) = (if cmp_vals k mnk < 0 then (h, k) else (mn, mnk)) in
-     let (mx2, mxk2) = (if cmp_vals k mxk > 0 then (h, k) else (mx, mxk)) in
+     let (mn2, mnk2) = (if cmp_vals_w world k mnk < 0 then (h, k) else (mn, mnk)) in
+     let (mx2, mxk2) = (if cmp_vals_w world k mxk > 0 then (h, k) else (mx, mxk)) in
      arr_minmax_by_go world encl theblk t mn2 mnk2 mx2 mxk2)
 
 // chunk: group CONSECUTIVE elements sharing a block value -> [key, [elems]].
@@ -21448,7 +21477,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // ...a bound Method, on the SAME receiver: ruby answers something
          // callable, and this answered an UnboundMethod that #call refused
          (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
-          let above = lookup_anc_above world (ancestors_of world ocl) ocl mnm in
+          let anc9 = ancestors_of world ocl in
+          let above0 = lookup_anc_above world anc9 ocl mnm in
+          // ...or the universal name's home, Kernel (see the UnboundMethod arm)
+          let above = (if str_eq above0 "" && is_prim_method mnm
+                          && (if str_eq ocl "Kernel" then false else true) && anc_has anc9 "Kernel"
+                       then "Kernel" else above0) in
           if str_eq above "" then VNil
           else
             (let nid = alloc_oid ocls in
@@ -22316,7 +22350,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "super_method" then
          (let anc = ancestors_of world ucls in
           let above = lookup_anc_above world anc ucls unm in
-          if str_eq above "" then VNil
+          if str_eq above "" then
+            // ...and the BUILTIN above it: `String.instance_method(:to_s)`
+            // answers Kernel#to_s in ruby, because #to_s is Kernel's and
+            // String merely overrides it. The method table holds no builtin,
+            // so the only ones to look for are the universal names, whose home
+            // is Kernel.
+            (if is_prim_method unm && (if str_eq ucls "Kernel" then false else true)
+                && anc_has anc "Kernel"
+             then make_unbound_method world "Kernel" unm
+             else VNil)
           else make_unbound_method world above unm)
        // clone: a Method object is immutable here, so a copy is a fresh handle
        // onto the same (class, name) pair -- which is what ruby's clone gives
@@ -23030,6 +23073,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       else flow_value (run_block world blk (proc_as_block pid) args)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
+    // Proc#binding: the environment the proc CAPTURED, which is the same
+    // thing Kernel#binding hands back for the frame it was called in.
+    else if str_eq name "binding" then
+      (let (h9, ps9, b9, cenv9) = proc_as_block pid in
+       let bid = map_len bind_store in
+       let _ = map_set bind_store (str_of_int bid) (lv_flat cenv9) in
+       VBind bid)
     // Proc#to_proc is the proc ITSELF -- the name was claimed with nothing
     // behind it, so `pr.to_proc` was a NoMethodError on a Proc.
     else if str_eq name "to_proc" then recv
@@ -24713,6 +24763,10 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
           && (match recv with VArr _ -> true | _ -> false)
           && (match args with Nil -> true | _ -> false) then
     make_enum_a world recv name args
+  // chunk_while / slice_when have nothing to enumerate without their
+  // predicate, and ruby says so in the words of the Proc it could not make.
+  else if (str_eq name "chunk_while" || str_eq name "slice_when") then
+    raise_exc world "ArgumentError" "tried to create Proc object without a block"
   else if enum_needs_block name && (match recv with VArr _ -> true | VHsh _ -> true | VRange (_, _, _) -> true | _ -> false) then
     // most yielders take NO arguments, so `[1,2,3].map(:foo)` is a wrong-arity
     // call, not an Enumerator over a method that ignores what it was handed.
@@ -25795,7 +25849,7 @@ and hng_sng_has = fn world -> fn (recv: Val) -> fn (name: str) ->
 // Proc/lambda method names, for respond_to?.
 and is_proc_method = fn (name: str) ->
   str_eq name "call" || str_eq name "()" || str_eq name "[]" ||
-  str_eq name "yield" || str_eq name "===" || str_eq name "lambda?" ||
+  str_eq name "yield" || str_eq name "===" || str_eq name "lambda?" || str_eq name "binding" ||
   str_eq name "arity" || str_eq name "parameters" || str_eq name "to_proc" ||
   str_eq name "curry"
 
@@ -25840,6 +25894,7 @@ and val_eql_list = fn (xs: Val list) -> fn (ys: Val list) ->
      | Cons (y, yt) -> if rb_eql x y then val_eql_list xt yt else false)
 
 and is_arr_method = fn (name: str) ->
+  str_eq name "fetch_values" ||
   str_eq name "length" || str_eq name "size" || str_eq name "push" || str_eq name "append" ||
   str_eq name "pop" || str_eq name "shift" || str_eq name "unshift" || str_eq name "prepend" ||
   str_eq name "map" || str_eq name "collect" || str_eq name "map!" || str_eq name "collect!" ||
@@ -28110,12 +28165,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | VInt _ -> (if (match o with VFlt _ -> true | _ -> false)
                      then arr_new (Cons (o, Cons (VFlt (to_f recv), Nil)))
                      else if is_num o then arr_new (Cons (o, Cons (recv, Nil)))
+                     else if (match o with VStr _ -> true | _ -> false)
+                     then (match o with VStr h9 -> coerce_str recv h9 | _ -> VNil)
                      // ruby coerces through Float(), so a String that is not a
                      // number is an ArgumentError and anything else a TypeError
                      else coerce_refuse o)
         // Float#coerce answers two Floats: `2.5.coerce(1)` is [1.0, 2.5], not
         // [1, 2.5] -- the point of coercing is that both sides end up alike.
         | VFlt _ -> (if is_num o then arr_new (Cons (VFlt (to_f o), Cons (recv, Nil)))
+                     else if (match o with VStr _ -> true | _ -> false)
+                     then (match o with VStr h9 -> coerce_str recv h9 | _ -> VNil)
                      // ruby coerces through Float(), so a String that is not a
                      // number is an ArgumentError and anything else a TypeError
                      else coerce_refuse o)
@@ -29592,6 +29651,25 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Hash")
         | _ -> recv)
      | _ -> recv)
+  else if str_eq name "fetch_values" && (match recv with VArr _ -> true | _ -> false) then
+    (match recv with
+     | VArr id ->
+       (let ys = deref id in
+        let n = val_list_len ys in
+        let rec go = fn (ks: Val list) ->
+          (match ks with
+           | Nil -> (Nil : Val list)
+           | Cons (VInt i, t) ->
+             (let j = (if i < 0 then n + i else i) in
+              if j >= 0 && j < n then Cons (val_nth ys j, go t)
+              else Cons (prim_raise "IndexError"
+                           ("index " ++ str_of_int i ++ " outside of array bounds: "
+                            ++ str_of_int (0 - n) ++ "..." ++ str_of_int n), go t))
+           | Cons (other, t) ->
+             Cons (prim_raise "TypeError"
+                     ("no implicit conversion of " ++ class_name other ++ " into Integer"), go t)) in
+        arr_new (go args))
+     | _ -> VNil)
   else if str_eq name "fetch_values" then
     (match recv with
      | VHsh xs -> let xs = hderef xs in arr_new (hash_fetch_values xs args)
@@ -30446,7 +30524,7 @@ and insert_w = fn world -> fn (x: Val) -> fn (sorted: Val list) ->
                    match invoke world nb9 x c9 "<=>" (Cons (h, Nil)) with
                    | VNil -> (let _ = raise_exc world "ArgumentError"
                                         ("comparison of " ++ class_name x ++ " with "
-                                         ++ class_name h ++ " failed") in ())
+                                         ++ cmp_other_name h ++ " failed") in ())
                    | _ -> ())
                 else ())
              | _ -> ()) in
@@ -31344,7 +31422,9 @@ and rb_flt_parse = fn (s0: str) ->
                               then (match rb_flt_digits s0 (i2 + 1) hi false false false "" with (a, b) -> (a, b, true))
                               else ("", i2, false)) in
       if str_len ds == 0 && str_len fs == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
-      else if dotted && str_len fs == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      // a trailing dot is allowed: ruby 4.0 reads "1." as 1.0 and "1.e3" as
+      // 1000.0 (a bare "." is still refused, by the test above).
+      else if dotted && str_len fs == 0 && str_len ds == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
       else
         let (es, i4) =
           (if i3 < hi && (str_eq (char_at s0 i3) "e" || str_eq (char_at s0 i3) "E") then
@@ -33263,6 +33343,10 @@ and lookup_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
 // The ancestor that defines `name` ABOVE `from` -- what Method#super_method
 // answers about. Walks past `from` first, so a class that defines the method
 // itself does not find itself.
+// is this class name in the ancestor list?
+and anc_has = fn (anc: str list) -> fn (want: str) ->
+  match anc with Nil -> false | Cons (a, rest) -> if str_eq a want then true else anc_has rest want
+
 and lookup_anc_above = fn world -> fn (anc: str list) -> fn (from: str) -> fn (name: str) ->
   match anc with
   | Nil -> ""
@@ -33791,7 +33875,16 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
                  | _ -> ())
               | _ -> ())
            else
-             (let recv2 = (if map_has ivars0 (str_of_int eid ++ "@recv") then map_get ivars0 (str_of_int eid ++ "@recv") else VNil) in
+             // ...unless the ENUMERATOR itself has been given an `each`:
+             // `e = Object.new.to_enum; class << e; def each; ...` is how four
+             // spec files build one, and walking the SOURCE then asked an
+             // Object for a method the singleton had.
+             (let own_each = (let c0 = map_get ocls0 (str_of_int eid) in
+                              if is_sng_cls c0 && has_meth world c0 "each" then c0 else "") in
+              if (if str_eq own_each "" then false else true)
+              then (let _ = invoke world collector (VObj eid) own_each "each" Nil in ())
+              else
+              let recv2 = (if map_has ivars0 (str_of_int eid ++ "@recv") then map_get ivars0 (str_of_int eid ++ "@recv") else VNil) in
               let meth2 = (match (if map_has ivars0 (str_of_int eid ++ "@meth") then map_get ivars0 (str_of_int eid ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
               let eargs = (match (if map_has ivars0 (str_of_int eid ++ "@eargs") then map_get ivars0 (str_of_int eid ++ "@eargs") else VNil) with VArr aid2 -> deref aid2 | _ -> Nil) in
               let _ = drive_enum env world blk recv2 meth2 eargs collector in
@@ -39929,6 +40022,18 @@ and do_include = fn world -> fn (base: str) -> fn (mq: str) ->
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "append_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
            else set_inc base (if map_has includes base then (map_get includes base) ++ "|" ++ mq else mq)) in
+  // `include Enumerable` brings Enumerable__Impl with it -- the streaming
+  // implementations, in FRONT of the list so they are searched LAST: the
+  // class's own methods win, a program's `module Enumerable` reopening wins,
+  // and what is left reaches these. Array / Hash / Range have their includes
+  // written at bootstrap and never come through here, so their primitives
+  // keep answering.
+  let _ = (if str_eq mq "Enumerable"
+              && (if str_eq base "Enumerable__Impl" then false else true)
+              && (if map_has includes base then (if str_contains (map_get includes base) "Enumerable__Impl" then false else true) else true)
+              && has_meth world "Enumerable__Impl" "map"
+           then set_inc base ("Enumerable__Impl|" ++ (if map_has includes base then map_get includes base else ""))
+           else ()) in
   run_included_hook world mq base
 
 and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
@@ -41143,6 +41248,7 @@ and bare_yield_stmt = fn (s: Stmt) ->
   | SAssign (_, e) -> bare_yield_expr e
   | SIVarAssign (_, e) -> bare_yield_expr e
   | SReturn e -> bare_yield_expr e
+  | SPuts es -> bare_yield_exprs es
   | SClass (_, _, b) -> bare_yield_stmts b
   | SClassE (_, _, b) -> bare_yield_stmts b
   | SSingletonE (e, b) -> bare_yield_expr e || bare_yield_stmts b
@@ -41164,6 +41270,40 @@ and bare_yield_expr = fn (e: Expr) ->
   | EMethod (r, _, args) -> bare_yield_expr r || bare_yield_exprs args
   | ECall (_, args) -> bare_yield_exprs args
   | EBin (_, a, b) -> bare_yield_expr a || bare_yield_expr b
+  // ...and every other form that HOLDS an expression. A partial walk is safe
+  // for the SyntaxError this was written for (an unflagged form is simply not
+  // rejected), and is NOT safe for its second reader: blk_capture asks the
+  // same question to decide whether a literal block must carry its method's
+  // block, and a `yield` it does not see is a LocalJumpError at run time.
+  // `t.each { |x| r = [yield(x)] }` raised "no block given" for want of an
+  // arm here, while `r = yield(x)` on its own worked.
+  | EArr es -> bare_yield_exprs es
+  | EHsh es -> bare_yield_exprs es
+  | EKwHash es -> bare_yield_exprs es
+  | ETern (c, a, b) -> bare_yield_expr c || bare_yield_expr a || bare_yield_expr b
+  | EUn (_, a) -> bare_yield_expr a
+  | ESplat a -> bare_yield_expr a
+  | EKwSplat a -> bare_yield_expr a
+  | EBlockPass a -> bare_yield_expr a
+  | EDefined a -> bare_yield_expr a
+  | EAssign (_, a) -> bare_yield_expr a
+  | EFlow (_, a) -> bare_yield_expr a
+  | ERange (a, b, _) -> bare_yield_expr a || bare_yield_expr b
+  | EIdxOp (r, idx, _, v) -> bare_yield_expr r || bare_yield_exprs idx || bare_yield_expr v
+  | EAttrOp (r, _, _, v) -> bare_yield_expr r || bare_yield_expr v
+  | EAmbigIdx (_, es) -> bare_yield_exprs es
+  | ESafe (r, _, args) -> bare_yield_expr r || bare_yield_exprs args
+  | ESafeB (r, _, args, _, bb) -> bare_yield_expr r || bare_yield_exprs args || bare_yield_stmts bb
+  | ESuper (_, args) -> bare_yield_exprs args
+  | ESuperB (_, args, _, bb) -> bare_yield_exprs args || bare_yield_stmts bb
+  | EScopedAssign (r, _, v) -> bare_yield_expr r || bare_yield_expr v
+  | EScopedRead (r, _) -> bare_yield_expr r
+  | EScopedReadOrNil (r, _) -> bare_yield_expr r
+  | EMatchTest (a, _) -> bare_yield_expr a
+  | EMatchBind (a, _) -> bare_yield_expr a
+  | ERaise es -> bare_yield_exprs es
+  | EStmt st -> bare_yield_stmt st
+  | ELambda (_, bb) -> bare_yield_stmts bb
   | _ -> false
 
 and bare_yield_exprs = fn (es: Expr list) ->
@@ -42617,6 +42757,12 @@ and meth_params_str = fn (ps: Val list) ->
      one ++ (match t with Nil -> "" | _ -> ", ") ++ meth_params_str t)
 
 // what #coerce says about an argument it cannot take: Float()'s own refusals
+// ruby coerces THROUGH Float(), so a numeric string coerces (`1.coerce("2")`
+// is [2.0, 1.0]) and only a non-numeric one is the ArgumentError. Refusing
+// every string made the conversion stricter than the thing it models.
+and coerce_str = fn (recv: Val) -> fn (h9: int) ->
+  arr_new (Cons (VFlt (rb_flt_parse (sget h9)), Cons (VFlt (to_f recv), Nil)))
+
 and coerce_refuse = fn (o: Val) ->
   match o with
   | VStr h9 -> prim_raise "ArgumentError" ("invalid value for Float(): " ++ inspect (VStr h9))
@@ -44148,6 +44294,468 @@ let core_prelude =
   // mailbox by the time the body asks for it, which is the shape the tests
   // use; what this cannot model is two bodies running at once, and the pairs
   // that need that are recorded in KNOWN_GAPS.
+  // Enumerable, driven by the receiver's own #each rather than by a
+  // materialised copy of it. Two things only this shape can do: a multi-value
+  // yield reaches the block as SEVERAL arguments (so a one-parameter block
+  // takes the first, as ruby's does), and a walk stops when the answer is
+  // known -- `take_while` on a five-element receiver walks three.
+  //
+  // It is a module of its own rather than a reopening of Enumerable because
+  // Array, Hash and Range include Enumerable too, and their own methods are
+  // primitives that must keep answering. do_include puts this one BEHIND
+  // Enumerable for a class that includes it, so a program that redefines
+  // Enumerable#map still wins.
+  // Enumerable, driven by the receiver's own #each rather than by a materialised
+  // copy of it. Two things only this shape can do: a multi-value yield reaches
+  // the block as SEVERAL arguments (so a one-parameter block takes the first),
+  // and a walk stops when the answer is known.
+  // Enumerable, driven by the receiver's own #each rather than by a materialised
+  // copy of it. Two things only this shape can do: a multi-value yield reaches
+  // the block as SEVERAL arguments (so a one-parameter block takes the first),
+  // and a walk stops when the answer is known.
+  // Enumerable, driven by the receiver's own #each rather than by a materialised
+  // copy of it. Two things only this shape can do: a multi-value yield reaches
+  // the block as SEVERAL arguments (so a one-parameter block takes the first),
+  // and a walk stops when the answer is known.
+  "module Enumerable__Impl\n" ++
+  "  def __gather(args)\n" ++
+  "    args.size <= 1 ? args[0] : args\n" ++
+  "  end\n" ++
+  "\n" ++
+  // ruby converts a count with #to_int and refuses in its own words -- a
+  // NoMethodError from a bare `n.to_int` names the wrong thing.
+  "  def __int!(n)\n" ++
+  "    return n if n.is_a?(Integer)\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + n.class.to_s + \" into Integer\" unless n.respond_to?(:to_int)\n" ++
+  "    v = n.to_int\n" ++
+  "    raise TypeError, \"can't convert \" + n.class.to_s + \" to Integer (\" + n.class.to_s + \"#to_int gives \" + v.class.to_s + \")\" unless v.is_a?(Integer)\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "\n" ++
+  // the bounds ruby's own C signatures carry: a *-parameter here would accept
+  // what ruby refuses, and ten spec files ask for exactly that refusal.
+  "  def __arity!(given, lo, hi)\n" ++
+  "    return if given >= lo && given <= hi\n" ++
+  "    range = lo == hi ? lo.to_s : lo.to_s + \"..\" + hi.to_s\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + given.to_s + \", expected \" + range + \")\"\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def to_a(*outer)\n" ++
+  "    acc = []\n" ++
+  "    each(*outer) \{ |*args| acc.push(__gather(args)) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def entries(*outer); to_a(*outer); end\n" ++
+  "\n" ++
+  "  def map\n" ++
+  "    return to_enum(:map) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| acc.push(yield(*args)) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def collect(&b); map(&b); end\n" ++
+  "\n" ++
+  "  def flat_map\n" ++
+  "    return to_enum(:flat_map) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each do |*args|\n" ++
+  "      v = yield(*args)\n" ++
+  "      if v.respond_to?(:to_ary)\n" ++
+  "        a = v.to_ary\n" ++
+  "        raise TypeError, \"can't convert \" + v.class.to_s + \" to Array (\" + v.class.to_s + \"#to_ary gives \" + a.class.to_s + \")\" unless a.is_a?(Array)\n" ++
+  "        a.each \{ |x| acc.push(x) }\n" ++
+  "      else\n" ++
+  "        acc.push(v)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def collect_concat(&b); flat_map(&b); end\n" ++
+  "\n" ++
+  "  def select\n" ++
+  "    return to_enum(:select) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| v = __gather(args); acc.push(v) if yield(v) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def filter(&b); select(&b); end\n" ++
+  "  def find_all(&b); select(&b); end\n" ++
+  "\n" ++
+  "  def reject\n" ++
+  "    return to_enum(:reject) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| v = __gather(args); acc.push(v) unless yield(v) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def filter_map\n" ++
+  "    return to_enum(:filter_map) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| v = yield(*args); acc.push(v) if v }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def find(ifnone = nil)\n" ++
+  "    return to_enum(:find, ifnone) unless block_given?\n" ++
+  "    each \{ |*args| v = __gather(args); return v if yield(v) }\n" ++
+  "    ifnone ? ifnone.call : nil\n" ++
+  "  end\n" ++
+  "  def detect(ifnone = nil, &b); find(ifnone, &b); end\n" ++
+  "\n" ++
+  "  def find_index(*target)\n" ++
+  "    __arity!(target.size, 0, 1)\n" ++
+  "    i = 0\n" ++
+  "    if target.size > 0\n" ++
+  "      each \{ |*args| return i if __gather(args) == target[0]; i += 1 }\n" ++
+  "    else\n" ++
+  "      return to_enum(:find_index) unless block_given?\n" ++
+  "      each \{ |*args| return i if yield(*args); i += 1 }\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def all?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| return false unless pattern[0] === __gather(args) }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| return false unless yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| return false unless __gather(args) }\n" ++
+  "    end\n" ++
+  "    true\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def any?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| return true if pattern[0] === __gather(args) }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| return true if yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| return true if __gather(args) }\n" ++
+  "    end\n" ++
+  "    false\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def none?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| return false if pattern[0] === __gather(args) }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| return false if yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| return false if __gather(args) }\n" ++
+  "    end\n" ++
+  "    true\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def one?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    n = 0\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| n += 1 if pattern[0] === __gather(args); return false if n > 1 }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| n += 1 if yield(*args); return false if n > 1 }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| n += 1 if __gather(args); return false if n > 1 }\n" ++
+  "    end\n" ++
+  "    n == 1\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def count(*item)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + item.size.to_s + \", expected 1)\" if item.size > 1\n" ++
+  "    n = 0\n" ++
+  "    if item.size > 0\n" ++
+  "      each \{ |*args| n += 1 if __gather(args) == item[0] }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| n += 1 if yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| n += 1 }\n" ++
+  "    end\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_with_index(*outer)\n" ++
+  "    return to_enum(:each_with_index, *outer) unless block_given?\n" ++
+  "    i = 0\n" ++
+  "    each(*outer) \{ |*args| yield(__gather(args), i); i += 1 }\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_with_object(memo)\n" ++
+  "    return to_enum(:each_with_object, memo) unless block_given?\n" ++
+  "    each \{ |*args| yield(__gather(args), memo) }\n" ++
+  "    memo\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_entry(*outer)\n" ++
+  "    return to_enum(:each_entry, *outer) unless block_given?\n" ++
+  "    each(*outer) \{ |*args| yield(__gather(args)) }\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def take(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise RangeError, \"bignum too big to convert into 'long'\" if n > 4611686018427387903\n" ++
+  "    raise ArgumentError, \"attempt to take negative size\" if n < 0\n" ++
+  "    acc = []\n" ++
+  "    return acc if n == 0\n" ++
+  "    each \{ |*args| acc.push(__gather(args)); break if acc.size >= n }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def take_while\n" ++
+  "    return to_enum(:take_while) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| break unless yield(*args); acc.push(__gather(args)) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def drop(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise RangeError, \"bignum too big to convert into 'long'\" if n > 4611686018427387903\n" ++
+  "    raise ArgumentError, \"attempt to drop negative size\" if n < 0\n" ++
+  "    acc = []\n" ++
+  "    i = 0\n" ++
+  "    each \{ |*args| acc.push(__gather(args)) if i >= n; i += 1 }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def drop_while\n" ++
+  "    return to_enum(:drop_while) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    dropping = true\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      dropping = false if dropping && !yield(v)\n" ++
+  "      acc.push(v) unless dropping\n" ++
+  "    end\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def first(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    if n.size == 0\n" ++
+  "      each \{ |*args| return __gather(args) }\n" ++
+  "      nil\n" ++
+  "    else\n" ++
+  "      take(n[0])\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // min_by / max_by / sort_by / group_by / partition PACK the yielded values
+  // into one before the block sees them (MRI's rb_enum_values_pack); map,
+  // select and all? pass them through as arguments. The two rules look the
+  // same until #each yields more than one value.
+  "  def min_by(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    return to_enum(:min_by, *n) unless block_given?\n" ++
+  "    return sort_by \{ |x| yield(x) }.first(__int!(n[0])) if n.size > 0 && !n[0].nil?\n" ++
+  "    best = nil\n" ++
+  "    best_key = nil\n" ++
+  "    seen = false\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      k = yield(v)\n" ++
+  "      if !seen || (k <=> best_key) < 0\n" ++
+  "        best = v\n" ++
+  "        best_key = k\n" ++
+  "        seen = true\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    best\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def max_by(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    return to_enum(:max_by, *n) unless block_given?\n" ++
+  "    return sort_by \{ |x| yield(x) }.reverse.first(__int!(n[0])) if n.size > 0 && !n[0].nil?\n" ++
+  "    best = nil\n" ++
+  "    best_key = nil\n" ++
+  "    seen = false\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      k = yield(v)\n" ++
+  "      if !seen || (k <=> best_key) > 0\n" ++
+  "        best = v\n" ++
+  "        best_key = k\n" ++
+  "        seen = true\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    best\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def minmax_by(&b)\n" ++
+  "    return to_enum(:minmax_by) unless block_given?\n" ++
+  "    [min_by(&b), max_by(&b)]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def sort_by\n" ++
+  "    return to_enum(:sort_by) unless block_given?\n" ++
+  "    pairs = []\n" ++
+  "    each \{ |*args| v = __gather(args); pairs.push([yield(v), v]) }\n" ++
+  "    pairs.sort \{ |a, b| a[0] <=> b[0] }.map \{ |p| p[1] }\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def group_by\n" ++
+  "    return to_enum(:group_by) unless block_given?\n" ++
+  "    h = \{}\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      (h[yield(v)] ||= []).push(v)\n" ++
+  "    end\n" ++
+  "    h\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def partition\n" ++
+  "    return to_enum(:partition) unless block_given?\n" ++
+  "    yes = []\n" ++
+  "    no = []\n" ++
+  "    each \{ |*args| v = __gather(args); (yield(v) ? yes : no).push(v) }\n" ++
+  "    [yes, no]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def inject(*init, &blk)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + init.size.to_s + \", expected 1..2)\" if init.size > 2\n" ++
+  "    op = nil\n" ++
+  "    memo = nil\n" ++
+  "    have = false\n" ++
+  "    if init.size == 2\n" ++
+  "      memo = init[0]\n" ++
+  "      have = true\n" ++
+  "      op = init[1]\n" ++
+  "    elsif init.size == 1 && !block_given?\n" ++
+  "      op = init[0]\n" ++
+  "    elsif init.size == 1\n" ++
+  "      memo = init[0]\n" ++
+  "      have = true\n" ++
+  "    end\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      if !have\n" ++
+  "        memo = v\n" ++
+  "        have = true\n" ++
+  "      elsif op\n" ++
+  "        memo = memo.__send__(op, v)\n" ++
+  "      else\n" ++
+  "        memo = blk.call(memo, v)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    memo\n" ++
+  "  end\n" ++
+  "  def reduce(*init, &blk); inject(*init, &blk); end\n" ++
+  "\n" ++
+  "  def sum(*init)\n" ++
+  "    __arity!(init.size, 0, 1)\n" ++
+  "    memo = init.size > 0 ? init[0] : 0\n" ++
+  "    if block_given?\n" ++
+  "      each \{ |*args| memo = memo + yield(__gather(args)) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| memo = memo + __gather(args) }\n" ++
+  "    end\n" ++
+  "    memo\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def tally(*into)\n" ++
+  "    __arity!(into.size, 0, 1)\n" ++
+  "    h = into.size > 0 ? into[0] : \{}\n" ++
+  "    h = h.to_hash if into.size > 0 && !h.is_a?(Hash) && h.respond_to?(:to_hash)\n" ++
+  "    each \{ |*args| v = __gather(args); h[v] = (h[v] || 0) + 1 }\n" ++
+  "    h\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def to_h(*outer)\n" ++
+  "    h = \{}\n" ++
+  "    each(*outer) do |*args|\n" ++
+  "      pair = block_given? ? yield(*args) : __gather(args)\n" ++
+  "      pair = pair.to_ary if !pair.is_a?(Array) && pair.respond_to?(:to_ary)\n" ++
+  "      raise TypeError, \"wrong element type \" + pair.class.to_s + \" (expected array)\" unless pair.is_a?(Array)\n" ++
+  "      raise ArgumentError, \"element has wrong array length (expected 2, was \" + pair.size.to_s + \")\" unless pair.size == 2\n" ++
+  "      h[pair[0]] = pair[1]\n" ++
+  "    end\n" ++
+  "    h\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def include?(target)\n" ++
+  "    each \{ |*args| return true if __gather(args) == target }\n" ++
+  "    false\n" ++
+  "  end\n" ++
+  "  def member?(target); include?(target); end\n" ++
+  "\n" ++
+  "  def cycle(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    return to_enum(:cycle, *n) unless block_given?\n" ++
+  "    if n.size > 0 && !n[0].nil?\n" ++
+  "      times = __int!(n[0])\n" ++
+  "      return nil if times <= 0\n" ++
+  "      buf = []\n" ++
+  "      each \{ |*args| v = __gather(args); buf.push(v); yield v }\n" ++
+  "      return nil if buf.empty?\n" ++
+  "      (times - 1).times \{ buf.each \{ |v| yield v } }\n" ++
+  "      nil\n" ++
+  "    else\n" ++
+  "      buf = []\n" ++
+  "      each \{ |*args| v = __gather(args); buf.push(v); yield v }\n" ++
+  "      return nil if buf.empty?\n" ++
+  "      loop \{ buf.each \{ |v| yield v } }\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_slice(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise ArgumentError, \"invalid slice size\" if n < 1\n" ++
+  "    return to_enum(:each_slice, n) unless block_given?\n" ++
+  "    buf = []\n" ++
+  "    each do |*args|\n" ++
+  "      buf.push(__gather(args))\n" ++
+  "      if buf.size == n\n" ++
+  "        yield buf\n" ++
+  "        buf = []\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    yield buf unless buf.empty?\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_cons(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise ArgumentError, \"invalid size\" if n < 1\n" ++
+  "    return to_enum(:each_cons, n) unless block_given?\n" ++
+  "    buf = []\n" ++
+  "    each do |*args|\n" ++
+  "      buf.push(__gather(args))\n" ++
+  "      buf.shift if buf.size > n\n" ++
+  "      yield buf.dup if buf.size == n\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def zip(*others)\n" ++
+  "    lists = others.map do |o|\n" ++
+  "      if o.is_a?(Array)\n" ++
+  "        o\n" ++
+  "      elsif o.respond_to?(:to_ary)\n" ++
+  "        a = o.to_ary\n" ++
+  "        raise TypeError, \"wrong argument type \" + o.class.to_s + \" (must respond to :each)\" unless a.is_a?(Array)\n" ++
+  "        a\n" ++
+  "      elsif o.respond_to?(:each)\n" ++
+  "        o.to_a\n" ++
+  "      else\n" ++
+  "        raise TypeError, \"wrong argument type \" + o.class.to_s + \" (must respond to :each)\"\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    acc = []\n" ++
+  "    i = 0\n" ++
+  "    each do |*args|\n" ++
+  "      row = [__gather(args)]\n" ++
+  "      lists.each \{ |l| row.push(l[i]) }\n" ++
+  "      i += 1\n" ++
+  "      block_given? ? yield(row) : acc.push(row)\n" ++
+  "    end\n" ++
+  "    block_given? ? nil : acc\n" ++
+  "  end\n" ++
+  "end\n" ++
   "class Ractor\n" ++
   "  class Error < StandardError; end\n" ++
   "  class RemoteError < Error\n" ++

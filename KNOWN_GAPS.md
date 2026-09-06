@@ -67,37 +67,6 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
-## An Enumerable's multi-value yield is gathered before the block sees it
-
-```ruby
-class Multi
-  include Enumerable
-  def each; yield 1, 2; yield 3, 4; end
-end
-Multi.new.map { |x| x }        # mere-ruby: [[1, 2], [3, 4]]
-                               # ruby:      [1, 3]
-```
-
-An Enumerable method on an object runs the object's `each` into an array first
-(`enum_collect`) and then hands each element to the block. A yield of SEVERAL
-values gathers into an array on the way in -- which is right for `#to_a`, and
-wrong for every block with ONE parameter: ruby re-yields the values, so `|x|`
-takes the first and `|x, y|` takes both, while a gathered array gives `|x|` the
-whole pair.
-
-**Why it is still here.** The two cases are indistinguishable once gathered:
-`yield 1, 2` and `yield [1, 2]` both become the element `[1, 2]`, and ruby
-treats them differently. Telling them apart needs either a mark that travels
-with the element (which leaks: `#to_a` hands the same arrays to the program,
-where they are ordinary) or a streaming driver that never materialises.
-
-**What fixing it would take.** The streaming driver: run `each` with a
-collector that calls the caller's block per yield, carrying the yielded values
-as arguments, and implement the Enumerable surface as folds over that. It is
-the same change that would make `take_while` and `drop_while` stop walking the
-whole receiver -- three more spec files say "will only go through what's
-needed" -- so the two are one piece of work, not two.
-
 ## A bare `mere-ruby` prints usage; ruby reads stdin
 
 ```sh
@@ -402,24 +371,6 @@ in this interpreter rather than a boundary:
    libraries actually read, and that was not one of them, so the answer was
    `nil + "/"`. `rubylibdir`, `rubyarchdir` and `DLEXT` are derived from the
    same prefix now.
-
-## An Enumerable method on an object materialises before it runs the block
-
-`map`, `select` and the rest, called on an object that defines `#each`, collect
-that object's elements first and then walk the collected array. Ruby runs the
-block DURING the walk, and the difference shows wherever the walk itself is
-observable: a Set refuses `add` while it is being iterated, so
-
-```ruby
-s = Set[:a]
-s.map { s.add(:c) }    # ruby: RuntimeError (can't add during iteration)
-                       # here: the marker is already closed, so it succeeds
-```
-
-`s.each { s.add(:c) }` does raise -- that one goes through `Set#each` -- and so
-does everything the Set library itself iterates with. It is the same shape the
-enumerator's `with_index` had until it stopped materialising: two phases where
-ruby has one.
 
 ## A Range walks integers and strings, and nothing else
 
