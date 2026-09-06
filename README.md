@@ -367,8 +367,8 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte. The corpus covers
-the semantic corners above. A deliberate negative control (lossy float
+and under `./mere-ruby` and diffs the output byte-for-byte: **191 programs,
+191 identical**. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
 ## Conformance (ruby/spec)
@@ -393,29 +393,28 @@ same idea as the tags/filter files every other implementation keeps. Passing
 target is the `language` and `core` groups, with `command_line` low-priority
 and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
 
-The record covers **1054 spec files** across 26 groups: **439 MATCH, 587 DIFF,
-22 CRASH**, 5 SKIP, 1 SLOW. Run with no directories, the sweep refreshes exactly
-the groups the table already has, so the numbers above are reproducible rather
-than a snapshot.
+The record covers **1221 spec files** across 31 groups: **896 MATCH, 321 DIFF,
+0 CRASH**, 4 SKIP, 0 SLOW, against ruby 4.0.6. Run with no directories, the
+sweep refreshes exactly the groups the table already has, so the numbers above
+are reproducible rather than a snapshot -- and every row of one table is
+measured by ONE build (`a/sweep_resume.sh` pins it and says so at the end).
 
-**97% of the files run on both sides** (MATCH + DIFF); 22 abort. So the gap is
-mostly not "cannot", and a group score reads low for a reason worth naming
-rather than for breakage -- real programs (the corpus) match exactly while a
-value class scores low on an error message or a frozen-object check.
+**Every file runs on both sides** (MATCH + DIFF): nothing aborts. So the gap is
+not "cannot", and a group score reads low for a reason worth naming rather than
+for breakage -- real programs (the corpus) match exactly while a value class
+scores low on an error message or a frozen-object check.
 
-Naming it is what `CAUSES.md` is for. Grouped by cause, the 605 DIFFs come down
-to a bounded number of **kinds**, and the two largest are `NoMethodError` and
-`NameError`: a third of the gap is a name that is not there, which is
-missing surface rather than wrong behaviour. Because ruby/spec is laid out as
+Naming it is what `CAUSES.md` is for. Grouped by cause, the DIFFs come down to
+a bounded number of **kinds**, and the largest are `NoMethodError` and
+`NameError`: a third of the gap is a name that is not there, which is missing
+surface rather than wrong behaviour. Because ruby/spec is laid out as
 `core/<class>/<method>_spec.rb`, those files name the absent methods
 themselves -- `CAUSES.md` ends with that list, per class.
 
-⚠ Re-sweeping also showed the previous table had drifted 3 files from the
-committed interpreter: two `language` files and one `core/queue` file were
-recorded as MATCH and fail under the binary they were supposed to describe (and
-under the one before it). A record refreshed only when someone remembers is a
-claim about the past, so the invitation to re-run at the bottom of the table is
-the load-bearing part of it.
+⚠ A record refreshed only when someone remembers is a claim about the past. One
+re-sweep found the table had drifted 3 files from the committed interpreter, so
+the invitation to re-run at the bottom of the table is the load-bearing part of
+it.
 
 ## Why it exists
 

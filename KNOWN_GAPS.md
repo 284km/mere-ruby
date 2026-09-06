@@ -67,6 +67,37 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
+## An Enumerable's multi-value yield is gathered before the block sees it
+
+```ruby
+class Multi
+  include Enumerable
+  def each; yield 1, 2; yield 3, 4; end
+end
+Multi.new.map { |x| x }        # mere-ruby: [[1, 2], [3, 4]]
+                               # ruby:      [1, 3]
+```
+
+An Enumerable method on an object runs the object's `each` into an array first
+(`enum_collect`) and then hands each element to the block. A yield of SEVERAL
+values gathers into an array on the way in -- which is right for `#to_a`, and
+wrong for every block with ONE parameter: ruby re-yields the values, so `|x|`
+takes the first and `|x, y|` takes both, while a gathered array gives `|x|` the
+whole pair.
+
+**Why it is still here.** The two cases are indistinguishable once gathered:
+`yield 1, 2` and `yield [1, 2]` both become the element `[1, 2]`, and ruby
+treats them differently. Telling them apart needs either a mark that travels
+with the element (which leaks: `#to_a` hands the same arrays to the program,
+where they are ordinary) or a streaming driver that never materialises.
+
+**What fixing it would take.** The streaming driver: run `each` with a
+collector that calls the caller's block per yield, carrying the yielded values
+as arguments, and implement the Enumerable surface as folds over that. It is
+the same change that would make `take_while` and `drop_while` stop walking the
+whole receiver -- three more spec files say "will only go through what's
+needed" -- so the two are one piece of work, not two.
+
 ## A bare `mere-ruby` prints usage; ruby reads stdin
 
 ```sh
