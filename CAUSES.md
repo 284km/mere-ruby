@@ -10,37 +10,36 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 288 files.
+Classified: 281 files.
 
-## DIFF — 288 files, 93 kinds
+## DIFF — 281 files, 94 kinds
 
 | files | kind |
 |---|---|
-| 33 | `ERROR NoMethodError` |
-| 15 | `FAILED expected N, got N` |
-| 14 | `ERROR NameError` |
+| 32 | `ERROR NoMethodError` |
+| 16 | `FAILED expected N, got N` |
+| 15 | `ERROR NameError` |
 | 13 | `FAILED expected TypeError to be raised` |
-| 13 | `ERROR TypeError` |
 | 12 | `FAILED expected to be identical` |
-| 12 | `FAILED expected ArgumentError to be raised` |
 | 11 | `FAILED expected true, got false` |
+| 11 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected "S", got "S"` |
 | 9 | `FAILED expected false, got true` |
+| 8 | `ERROR ArgumentError` |
 | 7 | `pass=N fail=N err=N` |
 | 7 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 7 | `ERROR ArgumentError` |
 | 6 | `FAILED expected truthy from #include?` |
 | 6 | `FAILED expected ZeroDivisionError to be raised` |
+| 5 | `FAILED expected N, got nil` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED expected nil, got "S"` |
-| 4 | `FAILED expected N, got nil` |
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `ERROR RangeError` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
 | 3 | `FAILED expected NameError to be raised` |
-| 3 | `FAILED expected LocalJumpError to be raised` |
 | 3 | `FAILED expected "S" to match` |
+| 3 | `ERROR TypeError` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED matcher did not match #<OBJ>` |
 | 2 | `FAILED expected not to be identical` |
@@ -49,6 +48,8 @@ Classified: 288 files.
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected RangeError to be raised` |
 | 2 | `FAILED expected N, got NaN` |
+| 2 | `FAILED expected N, got "S"` |
+| 2 | `FAILED expected LocalJumpError to be raised` |
 | 2 | `ERROR StandardError` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -69,6 +70,7 @@ Classified: 288 files.
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected true, got "S"` |
+| 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected falsy from #start_with?` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
@@ -84,9 +86,7 @@ Classified: 288 files.
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
-| 1 | `FAILED expected N, got true` |
 | 1 | `FAILED expected N, got (N+Ni)` |
-| 1 | `FAILED expected N, got "S"` |
 | 1 | `FAILED expected N ...[clipped]` |
 | 1 | `FAILED expected MethodSpecs::Methods, got Object` |
 | 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
@@ -103,11 +103,12 @@ Classified: 288 files.
 | 1 | `FAILED expected "S"\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "S", got #<OBJ>` |
-| 1 | `FAILED expected "S"$ruby!\"S", got "S"` |
+| 1 | `FAILED expected "S", got "S"$N\"S"` |
 | 1 | `FAILED expected "` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
 | 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SyntaxError` |
+| 1 | `ERROR LocalJumpError` |
 | 1 | `ERROR Errno::ENOENT` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
@@ -115,15 +116,13 @@ Classified: 288 files.
 | files | cause |
 |---|---|
 | 13 | `FAILED: expected TypeError to be raised` |
-| 12 | `FAILED: expected ArgumentError to be raised` |
+| 11 | `FAILED: expected ArgumentError to be raised` |
 | 6 | `FAILED: expected ZeroDivisionError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
 | 3 | `FAILED: expected NameError to be raised` |
-| 3 | `FAILED: expected LocalJumpError to be raised` |
 | 3 | `ERROR: bignum dispatches the correct operator after coercion: ArgumentError` |
-| 3 | `ERROR: bignum coerces the RHS and calls #coerce even if it's private: TypeError` |
 | 2 | `pass=13 fail=0 err=0` |
 | 2 | `pass=10 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
@@ -136,6 +135,7 @@ Classified: 288 files.
 | 2 | `FAILED: includes Comparable: expected true, got false` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: expected RangeError to be raised` |
+| 2 | `FAILED: expected LocalJumpError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 2 | `ERROR: when given an argument and no block doesn't yield an empty array if the filter matches the first entry or the last entry: NoMethodError` |
@@ -154,6 +154,7 @@ Classified: 288 files.
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: sets $~ in the block: expected nil, got #<MatchData "e">` |
 | 1 | `FAILED: sets $~ in the block: expected "b", got nil` |
+| 1 | `FAILED: sends #to_int to the argument and raises TypeError if it's not a kind of Integer: matcher did not match #<Proc>` |
 
 </details>
 
@@ -166,14 +167,14 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (6) | `binding lambda loop method select test` |
-| exception (6) | `backtrace_locations backtrace exception interrupt io_error signal_exception` |
+| kernel (7) | `binding eval lambda loop method select test` |
 | enumerable (6) | `inject one slice_after slice_before to_h zip` |
 | rational (5) | `comparison divide minus multiply plus` |
+| unboundmethod (4) | `bind_call bind original_name super_method` |
 | symbol (4) | `all_symbols intern match slice` |
 | struct (4) | `deconstruct filter initialize new` |
 | language (4) | `alias constants module numbered_parameters` |
-| unboundmethod (3) | `bind_call original_name super_method` |
+| exception (4) | `backtrace_locations backtrace exception io_error` |
 | method (3) | `original_name super_method to_proc` |
 | numeric (2) | `integer real` |
 | threadgroup (1) | `list` |

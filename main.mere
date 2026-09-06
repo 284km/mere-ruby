@@ -9794,6 +9794,11 @@ let rec signal_name_go = fn (xs: Val list) -> fn (n: int) ->
   | Cons (VStr h, Cons (VInt v, rest)) -> if v == n then sget h else signal_name_go rest n
   | _ -> "";
 let signal_name_of = fn (n: int) -> signal_name_go (signal_list_pairs ()) n;
+let rec signal_num_go = fn (xs: Val list) -> fn (nm: str) ->
+  match xs with
+  | Cons (VStr h, Cons (VInt v, rest)) -> if str_eq (sget h) nm then v else signal_num_go rest nm
+  | _ -> 0;
+let signal_num_of = fn (nm: str) -> signal_num_go (signal_list_pairs ()) nm;
 
 
 // float floor/ceil/round built on int_of_float (which truncates toward 0).
@@ -11246,8 +11251,17 @@ and sym_plain = fn (sy: str) ->
     // ...and `:$-w`: the dash globals print unquoted too.
     else if st == 1 && str_eq (char_at sy 0) "$" && str_len sy == 3
             && str_eq (char_at sy 1) "-" then true
-    else if is_alpha (char_at sy st) || str_eq (char_at sy st) "_" then sym_ident_rest sy (st + 1)
+    // ...and a SIGILLED name takes no `?`/`!`/`=` ending: `:"$ruby!"` is not a
+    // global's name, so ruby quotes it. Only a bare method name may end that
+    // way, which is why the two walks differ.
+    else if is_alpha (char_at sy st) || str_eq (char_at sy st) "_" then
+      (if st == 0 then sym_ident_rest sy (st + 1) else sym_ident_plain sy (st + 1))
     else false
+
+and sym_ident_plain = fn (sy: str) -> fn (i: int) ->
+  if i >= str_len sy then true
+  else (let c = char_at sy i in
+        if is_alnum c || str_eq c "_" then sym_ident_plain sy (i + 1) else false)
 
 and sym_ident_rest = fn (sy: str) -> fn (i: int) ->
   if i >= str_len sy then true
@@ -13451,7 +13465,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        // ...and a NUMBER against an object that coerces asks it first: ruby
        // answers `1 <=> obj` from the coerced pair, and this said nil.
        if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
-          && (match vb with VObj _ -> true | _ -> false) && responds world vb "coerce" then
+          && (match vb with VObj _ -> true | _ -> false) && (responds world vb "coerce" || has_coerce world vb) then
          (let nb8 = (false, (Nil : str list), (Nil : Stmt list), env) in
           match invoke_val_c env world nb8 vb "coerce" (Cons (va0, Nil)) false with
           | VArr aid8 -> (match deref aid8 with
@@ -13525,7 +13539,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          | VObj oid ->
            (let (m0, s0, ocls0, _) = world in
             let ocl = map_get ocls0 (str_of_int oid) in
-            if responds world vb "coerce" then
+            if (responds world vb "coerce" || has_coerce world vb) then
               (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
                match invoke_val_c env world noblk vb "coerce" (Cons (va0, Nil)) false with
                | VArr aid ->
@@ -14435,6 +14449,14 @@ and make_exc_w = fn world -> fn (args: Val list) ->
 // `errno_desc_missing` is what a gate asks to find out that they do not, since a
 // name with a class and no text would silently lose its prefix instead of
 // failing.
+// the nearest Errno:: class above this one ("" if none): an anonymous subclass
+// of Errno::ENOENT is still a "No such file or directory".
+and errno_ancestor_of = fn world -> fn (cls: str) ->
+  let (meths9, sup9, _, _) = world in
+  if str_len cls > 7 && str_eq (substring cls 0 7) "Errno::" then cls
+  else if map_has sup9 cls then errno_ancestor_of world (map_get sup9 cls)
+  else ""
+
 and errno_desc = fn (n: str) ->
   // the oracle's own text first; the hand-written rows below stay as the
   // fallback for a name the table does not carry.
@@ -16551,9 +16573,20 @@ and rng_step_int = fn world -> fn (args: Val list) ->
   match args with
   | Nil -> 1
   | Cons (VInt n, _) -> n
+  // ...and an object that COERCES gives the step it coerces to: ruby asks
+  // #coerce here (`(1..5).step(obj)` walks by 2 when obj coerces to 2), and
+  // this refused before asking.
   | Cons (v, _) ->
-    (let _ = raise_exc world "TypeError"
-               (display_cls_msg world (dispatch_cls_of world v) ++ " can't be coerced into Integer") in 1)
+    (let cv9 = (if has_coerce world v || responds world v "coerce"
+                then (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+                      match invoke_val_c gc_cenv0 world nb9 v "coerce" (Cons (VInt 1, Nil)) false with
+                      | VArr aid9 -> (match deref aid9 with Cons (_, Cons (y9, Nil)) -> y9 | _ -> VNil)
+                      | _ -> VNil)
+                else VNil) in
+     match cv9 with
+     | VInt n9 -> n9
+     | _ -> (let _ = raise_exc world "TypeError"
+                       (display_cls_msg world (dispatch_cls_of world v) ++ " can't be coerced into Integer") in 1))
 
 // ("A"..).step(k) { }: every k-th #succ, forever, until the block breaks.
 // the Integer-step walk, bounded or not (see the caller for what a step may be)
@@ -17402,6 +17435,19 @@ and arr_fill_go = fn world -> fn encl -> fn theblk -> fn (useblk: bool) -> fn (i
 
 and arr_sum_w = fn env -> fn world -> fn (xs: Val list) -> fn (init: Val) ->
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // A non-numeric init is the ACCUMULATOR and its own `+` runs first:
+  // `[1, 2].sum(obj)` is `obj + 1 + 2` in ruby. The numeric runs below sum the
+  // elements and then add the init, which is the same rule when the init is a
+  // number and the wrong one when it is not -- an object with a `+` was
+  // refused for want of a #coerce it never needed.
+  if (match init with VInt _ -> false | VFlt _ -> false | VBig _ -> false
+                    | VRat (_, _) -> false | VCpx (_, _) -> false | _ -> true) then
+    (let rec fold9 = fn (zs: Val list) -> fn (acc: Val) ->
+       (match zs with
+        | Nil -> acc
+        | Cons (h9, t9) -> fold9 t9 (apply_bin_vals world noblk9 "+" acc h9)) in
+     fold9 xs init)
+  else
   let exact = fn (v: Val) -> (match v with VInt _ -> true | VBig _ -> true | _ -> false) in
   let numv = fn (v: Val) -> (match v with VInt _ -> true | VFlt _ -> true | VBig _ -> true | _ -> false) in
   let tof = fn (v: Val) -> (match v with
@@ -19016,7 +19062,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           && (str_eq name "div" || str_eq name "modulo" || str_eq name "quo" || str_eq name "fdiv"
               || str_eq name "remainder" || str_eq name "divmod" || str_eq name "<=>")
           && (match args with Cons (VObj _, _) -> true | _ -> false)
-          && (match args with Cons (a9, _) -> responds world a9 "coerce" | _ -> false) then
+          && (match args with Cons (a9, _) -> (responds world a9 "coerce" || has_coerce world a9) | _ -> false) then
     (match args with
      | Cons (a9, _) ->
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -22426,7 +22472,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let tcls = dispatch_cls_of world target in
           // a method owned by a Module (not a Class) binds to ANY object;
           // a class method requires the target to be kind_of that class.
+          // ...and a method taken from a class's SINGLETON binds to that
+          // class's subclasses: `Parent.singleton_class.instance_method(:m)`
+          // binds to Child, because Child's singleton inherits from Parent's.
+          // The check compared "(sng:Parent)" against Child's own class name
+          // and refused a binding ruby allows.
           let ok = (if map_has modules ucls then true
+                    else if is_sng_cls ucls then
+                      (match target with
+                       | VClass tc9 -> obj_is_a world ("(sng:" ++ tc9 ++ ")") ucls || str_eq ("(sng:" ++ tc9 ++ ")") ucls
+                       | _ -> obj_is_a world tcls ucls)
                     else (match target with
                           | VObj tid -> obj_is_a world (map_get ocls (str_of_int tid)) ucls
                           | _ -> obj_is_a world (class_name target) ucls || str_eq (class_name target) ucls)) in
@@ -23172,7 +23227,29 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
  flow_throw k v)
              else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
            | other -> flow_value other))
-      else flow_value (run_block world blk (proc_as_block pid) args)
+      // A `break` out of a PROC called with #call breaks the method the block
+      // was PASSED to -- `define_method(:m) { |&b| b.call }` with `m { break }`
+      // answers the break's value -- and is a LocalJumpError only when that
+      // frame is gone, which is the case for `Proc.new { break 1 }.call`.
+      // Answering the value in both cases was the earlier behaviour and made
+      // the second one a value; refusing in both broke the first.
+      else (match run_block world blk (proc_as_block pid) args with
+            | FBreak bv9 ->
+              // ...the frame the BLOCK was passed to, and only that: a method
+              // that merely happens to be running (`def m; Proc.new { break }
+              // .call; end`) is not the break's target, and reading its own
+              // frame id made that answer the break's value where ruby
+              // refuses. __blk_home exists exactly when a block was handed in.
+              // ...which the PROC carries (proc_home, recorded when a block
+              // became one), not the frame that happens to be running: a
+              // method that merely calls a proc is not the break's target.
+              (let tgt9 = (if map_has proc_home (str_of_int pid) then map_get proc_home (str_of_int pid)
+                           else if lv_has env "__blk_home" then lv_get env "__blk_home" else VInt 0) in
+               let tk9 = (match tgt9 with VInt t9 -> str_of_int t9 | _ -> "") in
+               if str_eq tk9 "" || (if map_has live_frames tk9 then false else true)
+               then raise_exc world "LocalJumpError" "break from proc-closure"
+               else flow_throw_breakret (match tgt9 with VInt t9 -> t9 | _ -> 0) bv9)
+            | other9 -> flow_value other9)
     else if str_eq name "class" then VClass "Proc"
     else if str_eq name "lambda?" then VBool (map_has lambda_ids (str_of_int pid))
     // Proc#binding: the environment the proc CAPTURED, which is the same
@@ -24585,6 +24662,24 @@ and cvar_name_checked = fn world -> fn (nm: str) ->
 
 and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // Array#fetch_values converts each index with #to_int before the leaf reads
+  // it (the leaf has no world to ask an object with).
+  let args = (if str_eq name "fetch_values" && (match recv with VArr _ -> true | _ -> false)
+              then coerce_int_args env world args else args) in
+  // Integer#coerce / Float#coerce go through Float(), which asks an OBJECT for
+  // #to_f. The leaf below has no world to ask with, so it refused every object
+  // that was not already a number.
+  if str_eq name "coerce" && is_num recv
+     && (match args with Cons (VObj _, Nil) -> true | _ -> false)
+     && (match args with Cons (o9, _) -> prim_user_has world o9 "to_f" | _ -> false) then
+    (match args with
+     | Cons (o9, _) ->
+       (match conv_try env world o9 "to_f" with
+        | VFlt f9 -> arr_new (Cons (VFlt f9, Cons (VFlt (to_f recv), Nil)))
+        | VInt n9 -> arr_new (Cons (VFlt (float_of_int n9), Cons (VFlt (to_f recv), Nil)))
+        | _ -> raise_exc world "TypeError" ("can't convert " ++ class_name o9 ++ " into Float"))
+     | Nil -> VNil)
+  else
   // #backtrace_locations: the same frames #backtrace answers, as objects. The
   // leaf has the frames and no world to build a Location in, so it answered
   // nil for an exception whose backtrace it could already print.
@@ -25816,6 +25911,15 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
               has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
            | _ -> has_meth world c9 nm)
   else VBool false
+
+// ruby's coerce protocol does NOT go through respond_to?: it looks the method
+// up and calls it, so a PRIVATE #coerce is used like any other (`(10**20) + obj`
+// with a private coerce answers the sum in ruby and refused here). This asks
+// the method table, which sees private methods too.
+and has_coerce = fn world -> fn (v: Val) ->
+  match v with
+  | VObj _ -> (let c9 = dispatch_cls_of world v in has_meth world c9 "coerce")
+  | _ -> false
 
 and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
@@ -27159,10 +27263,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // class it could not coerce INTO -- the arithmetic below took it as an
   // internal failure ("mere-ruby: not a number").
   else if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder" || str_eq name "quo")
-     && is_num recv && (match args with Cons (a1, Nil) -> (if is_num a1 then false else true) | _ -> false) then
+     && is_num recv
+     // ...a Complex IS a number here (`1.0.fdiv(Complex(1,2))` divides), and
+     // an object is refused only after the conversion below has failed.
+     // ...and an OBJECT is left to the paths below, which ask it to convert:
+     // only a value that is no number and no object is refused here.
+     && (match args with
+         | Cons (a1, Nil) -> (match a1 with
+                              | VObj _ -> false
+                              | _ -> (if is_num a1 || is_cpx a1 then false else true))
+         | _ -> false) then
     (match args with
      | Cons (a1, _) -> prim_raise "TypeError"
-                         (class_name a1 ++ " can't be coerced into " ++ class_name recv)
+                         (cmp_type_name a1 ++ " can't be coerced into " ++ cmp_type_name recv)
      | Nil -> VNil)
   else if (str_eq name "modulo" || str_eq name "div" || str_eq name "fdiv" || str_eq name "remainder")
      && is_num recv && (match args with Cons (a1, Nil) -> is_num a1 | _ -> false) then
@@ -27320,7 +27433,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (match recv with VSym _ -> true | _ -> false) && sym_str_method name then
     (match recv with
      | VSym sy ->
-       (let r = prim_method (mkstr sy) name args in
+       // ...with SYMBOL arguments turned into strings: `:abc.casecmp(:ABC)`
+       // compares two symbols in ruby. A STRING argument stays refused for the
+       // comparison names -- `:abc.casecmp("ABC")` is nil, because a Symbol
+       // only compares with a Symbol -- so only the symbol form converts.
+       (let args = (match args with
+                    | Cons (VSym a9, r9) -> Cons (mkstr a9, r9)
+                    | Cons (VStr _, _) ->
+                      (if str_eq name "casecmp" || str_eq name "casecmp?" then Cons (VNil, Nil) else args)
+                    | other9 -> other9) in
+        let r = prim_method (mkstr sy) name args in
         if sym_str_resym name then (match r with VStr h -> VSym (sget h) | _ -> r) else r)
      | _ -> VNil)
   // universal
@@ -28303,9 +28425,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "fdiv" then
     // ...and an argument that is not a number is refused in the receiver's
     // own words: `to_f` on it was an internal failure ("not a number").
-    (if (match args with Cons (a9, _) -> (if is_num a9 then false else true) | Nil -> false)
+    (if (match args with
+         | Cons (a9, _) -> (match a9 with VObj _ -> true | _ -> (if is_num a9 || is_cpx a9 then false else true))
+         | Nil -> false)
      then prim_raise "TypeError" (cmp_type_name (match args with Cons (a9, _) -> a9 | Nil -> VNil)
                                   ++ " can't be coerced into " ++ cmp_type_name recv)
+     // a COMPLEX divisor divides a real too: `1.0.fdiv(Complex(1, 2))` is a
+     // Complex in ruby, and refusing it read the value's kind as its fitness.
+     else if (match args with Cons (a9, _) -> is_cpx a9 | Nil -> false)
+     then (match args with
+           | Cons (b9, _) -> cpx_arith "/" (VCpx (recv, VInt 0)) b9
+           | Nil -> VNil)
      else
      match recv with
      | VCpx (r, i) -> (match args with Cons (b, _) -> VCpx (VFlt (to_f r / to_f b), VFlt (to_f i / to_f b)) | _ -> VNil)
@@ -32391,6 +32521,14 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        (match other9 with
         | VBig _ -> (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
         | VRat (_, _) -> (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+        // ...and ANY object that answers #divmod is a time interval to ruby:
+        // that is the protocol Kernel#sleep uses to split seconds from the
+        // fraction, and it was refused without being asked.
+        | VObj _ ->
+          (if prim_user_has world other9 "divmod"
+           then (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+           else raise_exc world "TypeError"
+                  ("can't convert " ++ class_name other9 ++ " into time interval"))
         | _ -> raise_exc world "TypeError"
                  ("can't convert " ++ class_name other9 ++ " into time interval"))
      | Nil -> (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0))
@@ -32455,6 +32593,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
         // ("Invalid argument @ location - custom message"); an integer one is
         // the errno, which picked the class before this ran.
         let loc = (match rest9 with Cons (VStr lh, _) -> sget lh | _ -> "") in
+        // ...and a SUBCLASS of an Errno class inherits its text: the class
+        // name is the anonymous subclass's, so walk up to the Errno ancestor.
+        let c = (if str_len c > 7 && str_eq (substring c 0 7) "Errno::" then c
+                 else errno_ancestor_of world c) in
         if str_len c > 7 && str_eq (substring c 0 7) "Errno::"
         then mkstr (if str_eq loc "" then errno_message c given has
                     else errno_desc (substring c 7 (str_len c)) ++ " @ " ++ loc
@@ -32465,6 +32607,39 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
         else (if has then mkstr given else VNil))
      | _ -> VNil)
   // Errno::X#errno -- the platform's number for the class this exception is.
+  // SignalException.new(2) / .new("INT"): the exception carries the signal's
+  // number and its "SIG"-prefixed name, and #signo / #signm read them back.
+  // The class existed with no constructor of its own, so both were undefined.
+  // the default for SystemCallError#initialize's first parameter: reaching it
+  // means no argument was given, which ruby refuses.
+  else if str_eq name "__sce_no_arg" then
+    // ...only for SystemCallError ITSELF: `Errno::ENOENT.new` needs no
+    // argument (its class already names the error), and the default fires for
+    // every subclass too.
+    (match args with
+     | Cons (slf9, _) ->
+       (let (_, _, ocls9, _) = world in
+        let c9 = (match slf9 with VObj oid9 -> map_get ocls9 (str_of_int oid9) | other9 -> class_name other9) in
+        if str_eq c9 "SystemCallError"
+        then raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)"
+        else VNil)
+     | Nil -> VNil)
+  else if str_eq name "__signal_pair" then
+    (match args with
+     | Cons (v9, _) ->
+       (let (num9, nm9) =
+          (match v9 with
+           | VInt k9 -> (k9, signal_name_of k9)
+           | VStr h9 -> (let raw9 = sget h9 in
+                         let short9 = (if str_len raw9 > 3 && str_eq (substring raw9 0 3) "SIG"
+                                       then substring raw9 3 (str_len raw9) else raw9) in
+                         (signal_num_of short9, short9))
+           | VSym sy9 -> (let short9 = (if str_len sy9 > 3 && str_eq (substring sy9 0 3) "SIG"
+                                        then substring sy9 3 (str_len sy9) else sy9) in
+                          (signal_num_of short9, short9))
+           | _ -> (0, "")) in
+        arr_new (Cons (VInt num9, Cons (mkstr ("SIG" ++ nm9), Nil))))
+     | Nil -> arr_new (Cons (VInt 0, Cons (mkstr "", Nil))))
   else if str_eq name "__errno_number" then
     (match args with
      // an integer the constructor was given wins; anything else (a location
@@ -41652,7 +41827,13 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else eval_run_at eenv world blk prog2 efile9 eline9)
   // ...and anything else is ruby's TypeError, not an internal failure: `eval`
   // says which conversion it wanted.
-  | other9 -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name (match other9 with Cons (v9, _) -> v9 | Nil -> VNil) ++ " into String")
+  // ...asking the object for a string first: ruby converts with #to_str and
+  // only refuses what cannot.
+  | other9 ->
+    (let v9 = (match other9 with Cons (a9, _) -> a9 | Nil -> VNil) in
+     match conv_try env world v9 "to_str" with
+     | VStr sh9 -> do_eval env world blk (Cons (VStr sh9, (match other9 with Cons (_, r9) -> r9 | Nil -> Nil)))
+     | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name v9 ++ " into String"))
 
 // run an eval'd program with the position it was TOLD it has, restoring the
 // caller's afterwards (an eval inside an eval must not keep the inner one's).
@@ -45663,8 +45844,10 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // ...and it takes an ERRNO as its second argument, which is what decides the
   // class: `SystemCallError.new("m", 2)` is an Errno::ENOENT. The number is
   // kept so #errno answers it even for the base class.
+  // ...and it REQUIRES an argument: `SystemCallError.new` is an ArgumentError
+  // in ruby (there is no errno to name), and answered an empty exception here.
   let _ = map_set meths "SystemCallError#initialize"
-    (Meth (Cons ("msg", Cons ("extra", Nil)), Cons (("msg", ENil), Cons (("extra", ENil), Nil)),
+    (Meth (Cons ("msg", Cons ("extra", Nil)), Cons (("msg", ECall ("__sce_no_arg", Cons (ESelf, Nil))), Cons (("extra", ENil), Nil)),
            Cons (SIVarAssign ("__errno", EVar "extra"),
              Cons (SIVarAssign ("message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Cons (EVar "extra", Nil))))), Nil)))) in
   // #errno: the number it was given, or the platform's number for its class.
@@ -45686,14 +45869,22 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // named __-prefixed to stay out of the way of a subclass's own.
   let _ = map_set meths "NameError#initialize"
     (Meth (Cons ("msg", Cons ("name", Cons ("receiver:", Nil))),
-           Cons (("msg", ENil), Cons (("name", ENil), Cons (("receiver:", ENil), Nil))),
+           // the default is a SENTINEL, not nil: `nil.foo` really has nil as
+           // its receiver, and #receiver must tell that from never being told.
+           Cons (("msg", ENil), Cons (("name", ENil), Cons (("receiver:", ESym "__no_receiver__"), Nil))),
            Cons (SIVarAssign ("message", EVar "msg"),
              Cons (SIVarAssign ("__name", EVar "name"),
                Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))) in
-  let _ = map_set meths "NameError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
+  // #receiver RAISES when nothing set one: ruby's "no receiver is available",
+  // which is what a spec asks for. nil is a real receiver (`nil.foo`), so the
+  // question is whether the ivar exists, not whether it is nil.
+  let _ = map_set meths "NameError#receiver"
+    (Meth (Nil, Nil, Cons (SIf (Cons ((EBin ("==", EIVar "__recv", ESym "__no_receiver__"),
+                                       Cons (SExpr (ERaise (Cons (EConst "ArgumentError", Cons (EStrL "no receiver is available", Nil)))), Nil)), Nil), Nil),
+                       Cons (SExpr (EIVar "__recv"), Nil)))) in
   let _ = map_set meths "NoMethodError#initialize"
     (Meth (Cons ("msg", Cons ("name", Cons ("args", Cons ("priv", Cons ("receiver:", Nil))))),
-           Cons (("msg", ENil), Cons (("name", ENil), Cons (("args", ENil), Cons (("priv", EBool false), Cons (("receiver:", ENil), Nil))))),
+           Cons (("msg", ENil), Cons (("name", ENil), Cons (("args", ENil), Cons (("priv", EBool false), Cons (("receiver:", ESym "__no_receiver__"), Nil))))),
            Cons (SIVarAssign ("message", EVar "msg"),
              Cons (SIVarAssign ("__name", EVar "name"),
                Cons (SIVarAssign ("__args", EVar "args"),
@@ -45701,6 +45892,17 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
                    Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))))) in
   let _ = map_set meths "NoMethodError#args" (Meth (Nil, Nil, Cons (SExpr (EIVar "__args"), Nil))) in
   let _ = map_set meths "NoMethodError#private_call?" (Meth (Nil, Nil, Cons (SExpr (EIVar "__priv"), Nil))) in
+  // SignalException(sig): #signo and #signm answer the pair the primitive
+  // resolves, and the message is the signal's name (ruby's).
+  let _ = map_set meths "SignalException#initialize"
+    (Meth (Cons ("sig", Cons ("msg", Nil)), Cons (("sig", ENil), Cons (("msg", ENil), Nil)),
+           Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (EVar "sig", Nil))),
+             Cons (SIVarAssign ("message",
+                     EBin ("||", EVar "msg", EMethod (EIVar "__sigpair", "[]", Cons (EInt 1, Nil)))), Nil)))) in
+  let _ = map_set meths "SignalException#signo"
+    (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 0, Nil))), Nil))) in
+  let _ = map_set meths "SignalException#signm"
+    (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 1, Nil))), Nil))) in
   // LocalJumpError#reason: :noreason unless the raiser said which jump it was.
   let _ = map_set meths "LocalJumpError#reason"
     (Meth (Nil, Nil, Cons (SExpr (EBin ("||", EIVar "__reason", ESym "noreason")), Nil))) in
@@ -45720,10 +45922,15 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
              Cons (SIVarAssign ("__recv", EVar "receiver"), Nil)))) in
   let _ = map_set meths "FrozenError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
   // SystemExit carries the exit status, positionally, before the message.
+  // `SystemExit.new(true)` exits with status 0 and `.new(false)` with 1: ruby
+  // takes a boolean as the SUCCESS, not as the number. This stored it as the
+  // status, so #status answered `true` and #success? compared it with 0.
   let _ = map_set meths "SystemExit#initialize"
     (Meth (Cons ("status", Cons ("msg", Nil)),
            Cons (("status", EInt 0), Cons (("msg", ENil), Nil)),
-           Cons (SIVarAssign ("__status", EVar "status"),
+           Cons (SIVarAssign ("__status",
+                   ETern (EBin ("==", EVar "status", EBool true), EInt 0,
+                     ETern (EBin ("==", EVar "status", EBool false), EInt 1, EVar "status"))),
              Cons (SIVarAssign ("message", EVar "msg"), Nil)))) in
   let _ = map_set meths "SystemExit#status" (Meth (Nil, Nil, Cons (SExpr (EIVar "__status"), Nil))) in
   let _ = map_set meths "SystemExit#success?"

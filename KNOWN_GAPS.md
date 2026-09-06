@@ -97,6 +97,30 @@ an `extern fn` that answers a `str` hands back a raw C pointer, and there is no
 byte reader to walk it with. One new primitive in the Mere runtime (`environ`
 as a length-prefixed dump) closes it.
 
+## A Struct keeps its members as instance variables, and reflection sees them
+
+```ruby
+S = Struct.new(:a, :b)
+S.new(1, 2).instance_variables            # mere-ruby: [:@a, :@b]   ruby: []
+S.new(1, 2).instance_variable_get(:@a)    # mere-ruby: 1            ruby: nil
+```
+
+Ruby stores a Struct's members outside the instance-variable table, so a struct
+has no ivars unless the program adds some. Here each member IS an ivar, which
+is what makes `S.new(1, 2).a` work at all -- and it means the two reflection
+methods above answer about storage rather than about the object.
+
+**Why it is still here.** Hiding the member names from those two methods was
+tried and reverted: the struct's own readers (`#to_h`, `#[]`,
+`deconstruct_keys`, and with them pattern matching) go through the same ivar
+path, so the hiding made `S.new(1, 2).to_h` answer `{a: nil, b: nil}`. Half a
+representation cannot be hidden from one caller and not the other.
+
+**What fixing it would take.** A side table for members, keyed by object id,
+the way `md_whole` holds a MatchData's captures -- then the ivar table is empty
+for a struct and every reader goes through the side table. Two spec files
+(`instance_variables`, `instance_variable_get`) turn on it.
+
 ## A bare `mere-ruby` prints usage; ruby reads stdin
 
 ```sh
