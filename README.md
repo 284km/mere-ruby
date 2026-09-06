@@ -11,9 +11,12 @@ output to the reference `ruby`.
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
 # That line is macOS's. On Linux all three pieces differ, and none of them was
 # written down until CI ran it somewhere else:
-#   clang -O2 -fbracket-depth=1024 mr.c -lm -o mere-ruby && ulimit -s 524288
+#   clang -O2 -fbracket-depth=4096 mr.c -lm -o mere-ruby && ulimit -s 524288
 #   -Wl,-stack_size  Mach-O only; the main thread's stack there is `ulimit -s`
-#   -fbracket-depth  mainline clang caps nesting at 256, Apple's allows more
+#   -fbracket-depth  mainline clang caps nesting at 256, Apple's allows more.
+#                    The Ruby prelude is one `"..." ++ "..."` chain and each ++
+#                    is a bracket there, so it is split into four `let`s as
+#                    well -- the flag alone kept needing a bigger number.
 #   -lm              libm is separate there and part of libSystem here
 #
 # The CORPUS is a macOS gate on purpose. run_corpus.sh diffs this interpreter
