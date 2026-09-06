@@ -684,6 +684,15 @@ let deco_memo = map_new ();
 // and it must be ONE map: a fresh map_new at each of the five sites sat on
 // the object-creation path and cost ~200 bytes per `new`. Never read.
 let gc_cenv0 = map_new ();
+// The DRIVER's carried value: the result of the last top-level statement,
+// which the `--eval-print` harness mode prints when the program ends. It
+// lives in a Mere local between two chunks, so the collection that runs at
+// the chunk boundary could not see it: a program that made enough garbage to
+// trigger one collection printed `map_get: key not found in Map` instead of
+// its value (bootstraptest's test_ractor/p22, 30 rounds of ractors). Every
+// other in-flight value is either in `env` or below a safepoint that refuses
+// to collect; this one is above them all.
+let gc_hold = map_new ();
 let bind_store = map_new ();
 // snapshot a locals env by value: `binding` must capture the scope AS IT IS
 // at capture time, isolated from same-named variables assigned in an
@@ -11425,6 +11434,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter rx_pending mk in
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
+  let _ = map_iter gc_hold mk in
   // arr_store and hash_store are NOT roots since the collector took them on:
   // a reachable array or hash is marked through the VArr / VHsh arms, and an
   // unreachable one is exactly what gets dropped and compacted away.
@@ -12420,7 +12430,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (let m = "mere-ruby: (ruby exception raised)" in
         let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
     // implicit-self send/__send__/public_send: dispatch the named method on self.
-    else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (if map_has meths name then false else true) then
+    // A class that defines its own #send (Ractor) keeps it here too -- the
+    // `meths` probe only sees a toplevel definition, so `send(v)` inside
+    // `Ractor#<<` was reaching the universal one and dispatching the message.
+    else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send")
+            && (if map_has meths name then false else true)
+            && (if user_defines_send world (if lv_has env "self" then lv_get env "self" else VMain) name then false else true) then
       (let recv = if lv_has env "self" then lv_get env "self" else VMain in
        let vis = str_eq name "public_send" in
        let m = send_name_arg env world args in
@@ -12735,7 +12750,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // setter, and generally in modern Ruby).
        let vis = (match recv_e with ESelf -> false | _ -> true) in
        // send / __send__ dispatch a runtime method name; respond_to? probes.
-       if str_eq name "send" || str_eq name "__send__" || str_eq name "public_send" then
+       if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send")
+          && (if user_defines_send world recv name then false else true) then
          // public_send respects visibility; send/__send__ bypass it.
          let vis = str_eq name "public_send" in
          let m = send_name_arg env world args in
@@ -19396,7 +19412,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Class#allocate: an instance with no ivars and NO initialize call. This
     // is how a class that builds its instances some other way (Date, from a
     // Julian day) gets an object to fill in.
-    else if str_eq name "allocate" then
+    // Ractor REFUSES its allocator (`Ractor.allocate` is a NoMethodError), so
+    // the prelude defines that refusal in Ruby and builds its instances
+    // through this private door instead. An alias cannot stand in for it: an
+    // alias of a builtin resolves by NAME at call time, so it would find the
+    // refusal too.
+    else if str_eq c "Ractor" && str_eq name "__alloc" then
+      (let (meths0, sup0, ocls0, ivars0) = world in
+       let id = alloc_oid ocls0 in
+       let _ = map_set ocls0 (str_of_int id) c in
+       VObj id)
+    // A class may define its OWN `self.allocate` (Ractor does), and the
+    // builtin arm answered first, so the definition was unreachable: the same
+    // shape as `new` below.
+    else if str_eq name "allocate" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       // the store-backed builtins allocate their own empty value; anything
       // else is a plain object of that class. allocate takes no arguments.
       (if (match args with Nil -> false | _ -> true) then
@@ -23181,6 +23210,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     (match newblk with
      | (false, _, _, _) ->
        (if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send")
+           && (if user_defines_send world recv name then false else true)
            && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false)
         // an unwrapped send BYPASSES visibility (public_send keeps it),
         // exactly as the blockless send arm does.
@@ -23214,7 +23244,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        | FBreak bv -> bv
        | other -> (let _ = flow_value other in recv))
     // recv.send(:m, args) { block } — forward the block to the sent method.
-    else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (match args with Cons (_, _) -> true | _ -> false) then
+    else if (str_eq name "send" || str_eq name "__send__" || str_eq name "public_send") && (if user_defines_send world recv name then false else true) && (match args with Cons (_, _) -> true | _ -> false) then
       (let m3 = send_name_arg env world args in
        let rest3 = (match args with Cons (_, r) -> r | Nil -> Nil) in
        let _ = (if str_eq name "public_send" then public_send_guard world recv m3 else ()) in
@@ -23573,7 +23603,12 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
      | VClass c ->
        // Proc.new { } captures the block; Class.new { } makes an anonymous
        // class whose body is the block; class_eval reopens the class.
-       if str_eq c "Proc" && str_eq name "new" then
+       // A class with its OWN `self.new` gets it, block or no block: this path
+       // went straight to the builtin allocator, so `Klass.new { }` ignored the
+       // definition while `Klass.new` used it -- one method, two answers.
+       if str_eq name "new" && has_meth world ("(sng:" ++ c ++ ")") name then
+         invoke world newblk recv ("(sng:" ++ c ++ ")") name args
+       else if str_eq c "Proc" && str_eq name "new" then
          // `Proc.new(&pr)` answers pr ITSELF, exactly as `proc(&pr)` does --
          // pending_srcproc is the proc the block was made from, and rebuilding
          // one out of the block lost both the identity and the lambda-ness.
@@ -32467,6 +32502,13 @@ and strip_last_ns_go = fn (s: str) -> fn (i: int) ->
   if i <= 0 then ""
   else if str_eq (char_at s i) ":" && str_eq (char_at s (i - 1)) ":" then substring s 0 (i - 1)
   else strip_last_ns_go s (i - 1)
+// `send` is the one universal name a class is allowed to TAKE BACK: Ractor
+// defines its own #send, and Ruby dispatches that one. The primitive arms
+// below answered first, so `r.send(:msg)` reported `msg` undefined on Ractor
+// -- the name was read as "dispatch this method", never as a method itself.
+// `__send__` and `public_send` stay universal, which is why they exist.
+and user_defines_send = fn world -> fn (recv: Val) -> fn (name: str) ->
+  if str_eq name "send" then has_meth world (dispatch_cls_of world recv) "send" else false
 and dispatch_cls_of = fn world -> fn (recv: Val) ->
   let (meths, sup, ocls, ivars) = world in
   match recv with
@@ -43619,6 +43661,247 @@ let core_prelude =
   "    Pathname(path)\n" ++
   "  end\n" ++
   "end\n" ++
+  // Ractor, sequentially: this interpreter has one thread of control (Thread
+  // runs its block where it is created), so a Ractor keeps its block and runs
+  // it when someone asks for the VALUE. A message sent before that is in the
+  // mailbox by the time the body asks for it, which is the shape the tests
+  // use; what this cannot model is two bodies running at once, and the pairs
+  // that need that are recorded in KNOWN_GAPS.
+  "class Ractor\n" ++
+  "  class Error < StandardError; end\n" ++
+  "  class RemoteError < Error\n" ++
+  "    attr_reader :ractor\n" ++
+  "    def initialize(msg = nil, ractor = nil, cause = nil)\n" ++
+  "      @ractor = ractor\n" ++
+  "      @__cause = cause\n" ++
+  "      super(msg || \"thrown by remote Ractor.\")\n" ++
+  "    end\n" ++
+  "    def cause; @__cause; end\n" ++
+  "  end\n" ++
+  "  class ClosedError < Error; end\n" ++
+  "  class IsolationError < Error; end\n" ++
+  "  class MovedError < Error; end\n" ++
+  "  class UnsafeError < Error; end\n" ++
+  "\n" ++
+  // A port is a queue with a closed flag. Reading an EMPTY one is what "wait
+  // for the other side" means here, and the other side is a ractor nobody has
+  // asked anything of yet -- so the read is the demand that runs it.
+  "  class Port\n" ++
+  "    def initialize; @q = []; @closed = false; end\n" ++
+  "    def <<(v)\n" ++
+  "      raise Ractor::ClosedError, \"The port was already closed\" if @closed\n" ++
+  "      @q.push(v)\n" ++
+  "      self\n" ++
+  "    end\n" ++
+  "    def send(v); self << v; end\n" ++
+  "    def receive\n" ++
+  "      Ractor.__run_pending if @q.empty?\n" ++
+  "      if @q.empty?\n" ++
+  "        raise Ractor::ClosedError, \"The port was already closed\" if @closed\n" ++
+  "        raise Ractor::Error, \"No other ractor can write to this port: this interpreter runs ractors sequentially\"\n" ++
+  "      end\n" ++
+  "      @q.shift\n" ++
+  "    end\n" ++
+  "    def close; @closed = true; self; end\n" ++
+  "    def closed?; @closed; end\n" ++
+  "    def inspect; \"#<Ractor::Port>\"; end\n" ++
+  "    def __empty?; @q.empty?; end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // `Ractor.allocate` is a refusal in ruby -- a Ractor is its block, and there
+  // is nothing to allocate without one -- so the public name raises and the
+  // class builds its instances through `__alloc`, a private door the
+  // interpreter opens for this class alone.
+  "  class << self\n" ++
+  "    def allocate; raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__seq\n" ++
+  "    @__seq = (@__seq || 0) + 1\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.main\n" ++
+  "    @__main ||= (m = __alloc; m.__init_main; m)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.current\n" ++
+  "    @__cur || main\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.main?\n" ++
+  "    current.equal?(main)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__with_current(r)\n" ++
+  "    prev = @__cur\n" ++
+  "    @__cur = r\n" ++
+  "    begin\n" ++
+  "      yield\n" ++
+  "    ensure\n" ++
+  "      @__cur = prev\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // Every ractor made and not yet run waits here. Anything that would BLOCK in
+  // a parallel ruby -- reading an empty port, selecting -- runs them instead:
+  // that is the whole scheduler.
+  "  def self.__pending; @__pending ||= []; end\n" ++
+  "  def self.__run_pending\n" ++
+  "    until __pending.empty?\n" ++
+  "      r = __pending.shift\n" ++
+  "      r.__run\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.count; 1; end\n" ++
+  "  def self.receive; current.__take; end\n" ++
+  "  def self.recv; current.__take; end\n" ++
+  "  def self.receive_if(&b); current.__take; end\n" ++
+  "  def self.shareable?(o); o.frozen?; end\n" ++
+  "  def self.make_shareable(o); o.freeze; end\n" ++
+  "  def self.shareable_proc(&b); b.freeze; end\n" ++
+  "  def self.shareable_lambda(&b); b.freeze; end\n" ++
+  "  def self.[](k); current[k]; end\n" ++
+  "  def self.[]=(k, v); current[k] = v; end\n" ++
+  "  def self.store_if_absent(k)\n" ++
+  "    c = current\n" ++
+  "    c.key?(k) ? c[k] : (c[k] = yield)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.new(*args, name: nil, &block)\n" ++
+  "    raise ArgumentError, \"must be called with a block\" unless block\n" ++
+  "    unless name.nil? || name.is_a?(String) || name.is_a?(Symbol)\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + name.class.to_s + \" into String\"\n" ++
+  "    end\n" ++
+  "    r = __alloc\n" ++
+  "    r.__init(args, name.nil? ? nil : name.to_s, block)\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "\n" ++
+  // Every ractor here runs SEQUENTIALLY, in the thread that asks for what it
+  // produced: the block is kept and run on the first #value / #join / port
+  // read, so a message sent before then is already in the mailbox when the
+  // body asks for it. There is no parallelism and no interleaving.
+  "  def __init(args, name, block)\n" ++
+  "    @args = args\n" ++
+  "    @name = name\n" ++
+  "    @block = block\n" ++
+  "    @port = Ractor::Port.new\n" ++
+  "    @locals = \{}\n" ++
+  "    @monitors = []\n" ++
+  "    @done = false\n" ++
+  "    @error = nil\n" ++
+  "    @value = nil\n" ++
+  "    @main = false\n" ++
+  "    @id = Ractor.__seq\n" ++
+  "    Ractor.__pending.push(self)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __init_main\n" ++
+  "    @args = []\n" ++
+  "    @name = nil\n" ++
+  "    @block = nil\n" ++
+  "    @port = Ractor::Port.new\n" ++
+  "    @locals = \{}\n" ++
+  "    @monitors = []\n" ++
+  "    @done = true\n" ++
+  "    @error = nil\n" ++
+  "    @value = nil\n" ++
+  "    @main = true\n" ++
+  "    @id = 0\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def name; @name; end\n" ++
+  "  def default_port; @port; end\n" ++
+  "  def inspect\n" ++
+  "    \"#<Ractor:#\" + (@id + 1).to_s + (@name.nil? ? \"\" : \" \" + @name) +\n" ++
+  "      ((@done && !@main) ? \" terminated\" : \" running\") + \">\"\n" ++
+  "  end\n" ++
+  "  def to_s; inspect; end\n" ++
+  // a ractor cannot be copied: it IS its block, and both routes reach the
+  // refused allocator.
+  "  def dup; raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
+  "  def clone(freeze: nil); raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
+  "\n" ++
+  // ractor-local storage.
+  "  def [](k); @locals[k]; end\n" ++
+  "  def []=(k, v); @locals[k] = v; end\n" ++
+  "  def key?(k); @locals.key?(k); end\n" ++
+  "\n" ++
+  "  def send(v, move: false)\n" ++
+  "    @port << v\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def <<(v); send(v); end\n" ++
+  "\n" ++
+  "  def close; @port.close; self; end\n" ++
+  "\n" ++
+  // a monitoring port is told `:exited` when the body finishes -- at once if it
+  // already has.
+  "  def monitor(port)\n" ++
+  "    if @done\n" ++
+  "      port << :exited\n" ++
+  "    else\n" ++
+  "      @monitors.push(port)\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def unmonitor(port)\n" ++
+  "    @monitors.delete(port)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __take\n" ++
+  "    @port.receive\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __run\n" ++
+  "    return if @done || @block.nil?\n" ++
+  "    Ractor.__pending.delete(self)\n" ++
+  "    @done = true\n" ++
+  "    begin\n" ++
+  "      @value = Ractor.__with_current(self) \{ @block.call(*@args) }\n" ++
+  "    rescue Exception => e\n" ++
+  "      @error = e\n" ++
+  "    end\n" ++
+  // a terminated ractor takes no more messages, which is how a program sees
+  // that it finished.
+  "    @port.close\n" ++
+  "    @monitors.each \{ |p| p << :exited }\n" ++
+  "    @monitors = []\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def value\n" ++
+  "    __run\n" ++
+  "    if @error\n" ++
+  "      raise Ractor::RemoteError.new(nil, self, @error)\n" ++
+  "    end\n" ++
+  "    @value\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def join\n" ++
+  "    value\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  // select answers the FIRST argument that has something: a port with a value
+  // in it, or a ractor that has finished. Pending bodies run first, since in a
+  // parallel ruby they would have been running all along.
+  "  def self.select(*ractors)\n" ++
+  "    raise ArgumentError, \"specify at least one ractor or `yield_value`\" if ractors.empty?\n" ++
+  "    ractors.each do |r|\n" ++
+  "      return [r, r.receive] if r.is_a?(Ractor::Port) && !r.__empty?\n" ++
+  "    end\n" ++
+  "    __run_pending\n" ++
+  "    ractors.each do |r|\n" ++
+  "      return [r, r.receive] if r.is_a?(Ractor::Port) && !r.__empty?\n" ++
+  "    end\n" ++
+  "    ractors.each do |r|\n" ++
+  "      return [r, r.value] if r.is_a?(Ractor)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "end\n" ++
   "module ObjectSpace\n" ++
   "  class WeakMap\n" ++
   "    include Enumerable\n" ++
@@ -44519,6 +44802,8 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // instead.
   let rec gc_drive = fn (cursor: int) -> fn (lastv: Val) ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    // pin the carried value for the collection below (see gc_hold).
+    let _ = map_set gc_hold "lastv" lastv in
     // the stack is trivially clean here; a raise anywhere below may have
     // skipped gc_unsafe pops, so the counter self-heals at each chunk.
     let _ = map_set gc_unsafe "n" 0 in
@@ -44530,7 +44815,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
                ((0, 3, VNil)) in
       let (consumed, flag, v2) = r3 in
       (if flag == 0 then
-        (let _ = gc_collect env world in
+        // v2 -- the value the chunk just produced -- is the one this
+        // collection can see least: it was born inside the region above and
+        // is held by nothing but this local until the next chunk pins it.
+        (let _ = map_set gc_hold "lastv" v2 in
+         let _ = gc_collect env world in
          gc_drive (cursor + consumed) v2)
       else if flag == 1 then gc_drive gc_total v2
       else if flag == 2 then gc_drive (gc_total + 1) lastv

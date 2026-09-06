@@ -30,7 +30,7 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 282 of 1413 names
+ABSENT: 266 of 1413 names
   IO (44): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd foreach fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
   File (39): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime empty? executable_real? flock ftype grpowned? identical? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readable_real? readlink rename setgid? setuid? socket? stat sticky? symlink truncate umask utime world_readable? world_writable? writable_real? zero?
   Kernel (32): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? caller caller_locations define_singleton_method format gem gem_original_require global_variables iterator? lambda load local_variables open printf proc rand respond_to_missing? set_trace_func singleton_method sprintf test then trace_var untrace_var yield_self
@@ -40,15 +40,12 @@ ABSENT: 282 of 1413 names
   Module (14): class_exec const_source_location define_method included_modules module_exec nesting protected_instance_methods public_class_method public_instance_method refinements set_temporary_name undefined_instance_methods used_modules used_refinements
   GC (13): auto_compact compact config count garbage_collect latest_compact_info latest_gc_info measure_total_time stat stat_heap total_time verify_compaction_references verify_internal_consistency
   Thread (11): add_trace_func backtrace backtrace_locations each_caller_location handle_interrupt ignore_deadlock keys native_thread_id pending_interrupt? set_trace_func thread_variables
-  MatchData (9): == bytebegin byteend byteoffset deconstruct deconstruct_keys match match_length regexp
-  Regexp (7): casefold? fixed_encoding? linear_time? named_captures names timeout try_convert
   Encoding (6): _dump _load aliases compatible? name_list names
   ObjectSpace (6): _id2ref count_objects define_finalizer each_object garbage_collect undefine_finalizer
+  Regexp (5): casefold? fixed_encoding? linear_time? timeout try_convert
   Enumerator (4): feed produce product with_object
   Enumerable (4): inject reduce slice_after slice_before
-  Method (3): << >> curry
   Random (3): new_seed seed urandom
-  Integer (2): ceildiv try_convert
   Exception (2): exception to_tty?
   Class (2): attached_object subclasses
   String (1): append_as_bytes
@@ -58,17 +55,24 @@ ABSENT: 282 of 1413 names
   Proc (1): ==
   Numeric (1): singleton_method_added
 
-SEND-ONLY: 21 of 1413 names
+SEND-ONLY: 20 of 1413 names
   Process (6): egid= euid= gid= groups= maxgroups= uid=
   IO (5): autoclose= close_on_exec= lineno= pos= timeout=
   Kernel (3): public_send respond_to? send
   GC (2): auto_compact= measure_total_time=
   Regexp (1): timeout=
-  Struct (1): []=
   Exception (1): respond_to?
   Dir (1): pos=
   Thread (1): ignore_deadlock=
 ```
+
+2026-09-06: **266 ABSENT of 1413**, same reference (4.0.6), same binary as the
+day's other rows. The sixteen that went are the MatchData, Method, Regexp and
+Integer names the last two days added (`MatchData#==`, `#byteoffset`,
+`#deconstruct`, `#match`; `Method#<<`, `#>>`, `#curry`; `Regexp#named_captures`,
+`#names`; `Integer#ceildiv`, `.try_convert`, and their neighbours), plus
+`Struct#[]=` leaving SEND-ONLY: this file had not been re-measured since they
+landed. Nothing was removed from mere-ruby to make the number fall.
 
 2026-09-05: 282 ABSENT of 1413, against ruby **4.0.6** (the reference moved; see
 tools/ref_ruby.sh). The denominator grew by the ten names 4.0 added -- Array#find,

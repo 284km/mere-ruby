@@ -34,6 +34,39 @@ so this corner is known-broken upstream through 3.3.
 The row is expected to go back to MATCH when the gate's ruby is upgraded; if
 it does not, this entry is wrong and the hook suppression is real.
 
+## Ractor runs sequentially: one thread of control, no isolation
+
+```ruby
+r = Ractor.new { Ractor.receive * 2 }
+r.send(21)
+r.value                            # mere-ruby: 42, ruby: 42
+                                   # -- but the body ran inside #value here,
+                                   # and in ruby it ran in parallel from #new.
+```
+
+A `Ractor` in this interpreter keeps its block and runs it in the thread that
+first asks for what it produced: `#value`, `#join`, a read of a port it writes
+to, or `Ractor.select`. That is the same choice `Thread` makes here (the block
+runs where it is created), and it reproduces 28 of the 34 pairs in CRuby's
+`bootstraptest/test_ractor.rb`.
+
+**What it cannot model.** Two bodies running at once, and the isolation that
+parallelism forces:
+
+- `Ractor.shareable_proc` / `Ractor.make_shareable(proc)` freeze the proc and
+  hand it back. In ruby they ISOLATE it: `self` becomes nil, the outer locals
+  it read stop being readable (`eval("a")` raises SyntaxError, `#binding`
+  raises), and making one whose captured local is assigned afterward raises
+  `Ractor::IsolationError`. Four pairs (p16-p19) turn on that.
+- `Thread#raise` / `Thread#kill` aimed at the thread running a ractor body
+  (p24, p25): there is one thread here, so the kill lands on the program.
+
+**What fixing it would take.** Isolation is not scheduling: `shareable_proc`
+could be given real teeth without any parallelism, by rebinding the proc's
+self to nil and refusing its captured environment -- the same machinery
+`instance_exec` already has, pointed the other way. Parallelism is a different
+project, and nothing in the corpus needs it.
+
 ## A bare `mere-ruby` prints usage; ruby reads stdin
 
 ```sh
