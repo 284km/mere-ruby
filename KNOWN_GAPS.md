@@ -2734,3 +2734,23 @@ attention.
 `loop` is a special form in the evaluator rather than a method, so `loop` with no
 block reports "undefined local variable or method 'loop'" instead of answering
 the infinite Enumerator ruby gives (`loop.first(3)` is `[nil, nil, nil]`).
+
+## A singleton class prints its object by id, not by inspect
+
+`"y".dup.freeze.singleton_class.inspect` is `#<Class:str:526>` where ruby writes
+`#<Class:#<String:0x...>>`. Both halves are unstable (an address on one side, an
+internal handle on the other), so no spec compares them -- but the shape differs:
+ruby nests the object's own inspect and this prints a kind and a handle. The
+same printer answers `#<Class:#<Object:0x..>>` correctly for a user object, so
+it is the primitive branch of `prim_sng_cls` that names itself differently.
+
+## A top-level `return` inside a block is an internal failure
+
+`[1].each { return }` at the top level of a script stops the script in ruby (a
+top-level return is allowed, and a block inherits it). Here the return unwinds
+past every live frame -- there is no method frame to consume it -- and the
+driver reports `mere-ruby: (unhandled return)` with exit status 1. The
+LocalJumpError path added for a DEAD home frame deliberately does not cover
+this: `home == 0` means "no defining method", which is the top level, and ruby
+does not raise there either. What is missing is the top level's own frame as a
+return target.

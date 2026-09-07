@@ -10,40 +10,37 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 209 files.
+Classified: 199 files.
 
-## DIFF — 209 files, 90 kinds
+## DIFF — 199 files, 86 kinds
 
 | files | kind |
 |---|---|
-| 24 | `ERROR NoMethodError` |
-| 12 | `FAILED expected TypeError to be raised` |
+| 25 | `ERROR NoMethodError` |
+| 11 | `FAILED expected TypeError to be raised` |
 | 11 | `ERROR NameError` |
 | 9 | `FAILED expected to be identical` |
 | 9 | `FAILED expected N, got N` |
 | 7 | `FAILED expected true, got false` |
 | 7 | `FAILED expected false, got true` |
-| 6 | `FAILED expected ArgumentError to be raised` |
 | 6 | `ERROR TypeError` |
 | 5 | `FAILED expected "S", got "S"` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
+| 4 | `FAILED expected ArgumentError to be raised` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 4 | `ERROR ArgumentError` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
-| 3 | `FAILED expected NameError to be raised` |
 | 3 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected "S" to match` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected falsy from #include?` |
-| 2 | `FAILED expected [N], got [N, N, N, N, N, N]` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
 | 2 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
-| 2 | `FAILED expected LocalJumpError to be raised` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -64,7 +61,6 @@ Classified: 209 files.
 | 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
-| 1 | `FAILED expected falsy from #start_with?` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected [[[N, N]], [[N, N, N], [N, N, N, N]]], got [[N, N, N]]` |
 | 1 | `FAILED expected [[[N, N], [N, N, N]], [[N, N, N, N]]], got [[N, N, N]]` |
@@ -80,7 +76,6 @@ Classified: 209 files.
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
-| 1 | `FAILED expected ZeroDivisionError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
@@ -91,6 +86,7 @@ Classified: 209 files.
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
+| 1 | `FAILED expected (N+Ni), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
 | 1 | `FAILED expected "S"localhost\"S"root\"S", got "S"localhost\"S"root\"S"` |
@@ -111,11 +107,10 @@ Classified: 209 files.
 
 | files | cause |
 |---|---|
-| 12 | `FAILED: expected TypeError to be raised` |
-| 6 | `FAILED: expected ArgumentError to be raised` |
+| 11 | `FAILED: expected TypeError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
+| 4 | `FAILED: expected ArgumentError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
-| 3 | `FAILED: expected NameError to be raised` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns the class on which public was called for a private method in ancestor: expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
@@ -125,7 +120,6 @@ Classified: 209 files.
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: expected ThreadError to be raised` |
-| 2 | `FAILED: expected LocalJumpError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 1 | `sh: feature_14386: command not found` |
@@ -151,6 +145,8 @@ Classified: 209 files.
 | 1 | `FAILED: returns the nearest Integer for Float near the limit: expected 0, got 1` |
 | 1 | `FAILED: returns self divided by other: expected 4611686018427387926, got 4611686018427387904` |
 | 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
+| 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
+| 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 
 </details>
 
@@ -163,7 +159,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (7) | `binding eval lambda loop method select test` |
+| kernel (8) | `binding eval lambda loop method select singleton_class test` |
 | unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
 | exception (4) | `backtrace_locations backtrace exception interrupt` |
