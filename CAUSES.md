@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 199 files.
+Classified: 197 files.
 
-## DIFF — 199 files, 86 kinds
+## DIFF — 197 files, 83 kinds
 
 | files | kind |
 |---|---|
@@ -23,24 +23,23 @@ Classified: 199 files.
 | 9 | `FAILED expected N, got N` |
 | 7 | `FAILED expected true, got false` |
 | 7 | `FAILED expected false, got true` |
+| 6 | `FAILED expected "S", got "S"` |
 | 6 | `ERROR TypeError` |
-| 5 | `FAILED expected "S", got "S"` |
+| 5 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
-| 4 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED expected ArgumentError to be raised` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 4 | `ERROR ArgumentError` |
+| 4 | `FAILED expected "S" to match` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected "S", got nil` |
-| 3 | `FAILED expected "S" to match` |
+| 3 | `ERROR ArgumentError` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
-| 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
-| 2 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
+| 2 | `FAILED expected :SYM, got nil` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -61,11 +60,10 @@ Classified: 199 files.
 | 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
-| 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected [[[N, N]], [[N, N, N], [N, N, N, N]]], got [[N, N, N]]` |
 | 1 | `FAILED expected [[[N, N], [N, N, N]], [[N, N, N, N]]], got [[N, N, N]]` |
 | 1 | `FAILED expected [[N, [N]], [N, [N, N]], [N, [N]]], got [[N, [N]], [:SYM, [N]], [N, [N, N]], [:SYM, [N]], [N, [N]]]` |
-| 1 | `FAILED expected [[:SYM]], got []` |
+| 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [N], got [N]` |
 | 1 | `FAILED expected [N, N], got [(N+Ni), (N+Ni)]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
@@ -83,7 +81,6 @@ Classified: 199 files.
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
-| 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected (N+Ni), got N` |
@@ -113,12 +110,10 @@ Classified: 199 files.
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
-| 2 | `FAILED: returns the class on which public was called for a private method in ancestor: expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 2 | `FAILED: returns self: expected to be identical` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
-| 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
@@ -147,6 +142,8 @@ Classified: 199 files.
 | 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
+| 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
+| 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 
 </details>
 
@@ -159,15 +156,15 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (8) | `binding eval lambda loop method select singleton_class test` |
+| kernel (10) | `binding chomp chop eval lambda loop method select singleton_class test` |
 | unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
-| exception (4) | `backtrace_locations backtrace exception interrupt` |
 | enumerable (4) | `inject one to_h zip` |
 | method (3) | `original_name super_method to_proc` |
 | symbol (2) | `all_symbols to_proc` |
 | struct (2) | `deconstruct initialize` |
 | numeric (2) | `integer real` |
+| exception (2) | `backtrace interrupt` |
 | threadgroup (1) | `list` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |

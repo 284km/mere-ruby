@@ -1321,6 +1321,12 @@ let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
 // dispatch (implicit-self calls and send bypass, as in Ruby).
 let privates = map_new ();
+// ⚠ `public :m` / `private :m` on a class that INHERITS m is a method entry of
+//   its own in ruby (a zsuper entry), which is why #owner then answers that
+//   class and not the ancestor. The visibility marks cannot say so: "public"
+//   is the absence of a mark. This records the CLASS where a visibility
+//   statement named a method, so the owner walk can stop there.
+let vis_marks = map_new ();   // "cls#name" -> VNil, where a visibility statement named it
 let protecteds = map_new ();  // protected methods (callable only same-class)
 let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
 let num_names_memo = map_new ();  // numeric kind -> its method-name set
@@ -12626,7 +12632,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // begin/rescue (which reads it back from "$exc").
     let _ = map_set ivars "$exc" exc in
     let _ = note_raise_site () in
-  let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
+  let _ = note_raise_bt world exc in
     (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
   | EVar name ->
     // `__FILE__` / `__dir__` with the parsed file attached (see enc_pseudo_var).
@@ -12758,6 +12764,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
             (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
              invoke_val_c env world nb (VObj mid) "[]" (Cons (VInt (int_of_str k), Nil)) false)
           | _ -> VNil)
+       // `$@` is `$!.backtrace` -- a VIEW on the current exception, not a slot
+       // of its own (ruby's `$@ = x` is `$!.set_backtrace(x)`), and it answered
+       // nil because nothing ever wrote that slot.
+       else if str_eq k "@" then
+         (match (if map_has globals "!" then map_get globals "!" else VNil) with
+          | VNil -> VNil
+          | exc9 -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                     invoke_val_c env world nb9 exc9 "backtrace" Nil false))
        else if map_has globals k then map_get globals k else VNil)
     else
     let (meths, sup, ocls, ivars) = world in
@@ -21381,6 +21395,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let id = alloc_oid ocls0 in
           let _ = map_set ocls0 (str_of_int id) "UnboundMethod" in
           let _ = map_set ivars0 (str_of_int id ++ "@__um_cls") (mkstr origin) in
+          // ...and the OWNER separately, because they are not the same class
+          // when a subclass only published the method: @__um_cls is where the
+          // body is (what #arity and #bind need) and this is what #owner
+          // answers. See owner_anc / body_cls_of.
+          let own9 = (let a9 = owner_anc world (ancestors_of world c) mname in
+                      if str_eq a9 "" then origin else a9) in
+          let _ = map_set ivars0 (str_of_int id ++ "@__um_owner") (mkstr own9) in
           let _ = map_set ivars0 (str_of_int id ++ "@__um_name") (mkstr mname) in
           VObj id))
     // define_method(:name, unbound_or_proc): the non-block form. An
@@ -21625,24 +21646,38 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let pfx = c ++ "#" in
        let plen = str_len pfx in
        let tmp = map_new () in
+       // ⚠ THREE doors add to this list (the method table, the module-function
+       //   list, and the call path's own list), and two of them add the same
+       //   names -- so `Kernel.private_instance_methods(false)` answered 137
+       //   entries of which 69 were distinct. ruby's list has no duplicates,
+       //   and a name is one name however many doors know it: push through one
+       //   gate that remembers what it has seen.
+       let seen9 = map_new () in
+       let push9 = fn (nm9: str) ->
+         (if map_has seen9 nm9 then ()
+          else (let _ = map_set seen9 nm9 1 in
+                let m9 = map_len tmp in
+                map_set tmp (str_of_int m9) (VSym nm9))) in
        let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
          if str_len k > plen && str_eq (substring k 0 plen) pfx
             && (if str_contains (substring k plen (str_len k)) "#" then false else true)
             && (if map_has privates k then want_priv else (if want_priv then false else true))
-         then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
+         then push9 (substring k plen (str_len k))
          else ()) in
        // :initialize is private on every class (inherited from Object) —
        // include it unless this class defines its own entry (the table
        // already decided that case above).
        let _ = (if want_priv && (if map_has meths0 (pfx ++ "initialize") then false else true)
-                then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym "initialize")) else ()) in
+                          // ...and Kernel is not where :initialize lives: it is
+                          // Object's (BasicObject's, in ruby), so Kernel's own
+                          // list claimed a name ruby does not put there.
+                          && (if kern9 then false else true)
+                then push9 "initialize" else ()) in
        let _ = (if kern9 then
                   (let rec add9 = fn (xs: str list) ->
                      (match xs with
                       | Nil -> ()
-                      | Cons (h9, t9) ->
-                        (let m9 = map_len tmp in
-                         let _ = map_set tmp (str_of_int m9) (VSym h9) in add9 t9)) in
+                      | Cons (h9, t9) -> (let _ = push9 h9 in add9 t9)) in
                    add9 (if want_priv then kernel_builtin_names () else kernel_public_instance_names ()))
                 else ()) in
        // KERNEL'S MODULE FUNCTIONS ARE PRIVATE INSTANCE METHODS. That is not a
@@ -21656,8 +21691,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // call path uses, so the two cannot disagree about what Kernel has.
        let _ = (if want_priv && str_eq c "Kernel"
                 then list_iter_kernel_names (fn (nm: str) ->
-                       (if map_has meths0 (pfx ++ nm) then ()
-                        else (let m = map_len tmp in map_set tmp (str_of_int m) (VSym nm))))
+                       (if map_has meths0 (pfx ++ nm) then () else push9 nm))
                 else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     // class variables (@@x) declared directly on this class, as :@@sym.
@@ -22275,12 +22309,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // be empty (a method reached on a primitive receiver), in which case the
        // receiver's class is the owner -- the same fallback #owner uses.
        else if str_eq name "original_name" then
-         (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
+         // ⚠ the fallback class is the DISPATCH class, not class_name's: that
+         //   one is world-free and answers "Object" for every object, so a
+         //   Method with no recorded owner (one reached through
+         //   method_missing) asked about Object -- and #owner right above
+         //   already used the dispatch class, so the two disagreed.
+         (let ocl = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
           VSym (original_name_of world ocl mnm))
        else if str_eq name "super_method" then
          // ...a bound Method, on the SAME receiver: ruby answers something
          // callable, and this answered an UnboundMethod that #call refused
-         (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
+         (let ocl = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
           let anc9 = ancestors_of world ocl in
           let above0 = lookup_anc_above world anc9 ocl mnm in
           // ...or the universal name's home, Kernel (see the UnboundMethod arm)
@@ -22354,7 +22393,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // ...by the name the method was DEFINED as (two aliases of one method
          // are eql? and must hash alike), and with the RECEIVER: two Methods of
          // different objects are different methods
-         (let ocl = (if str_eq mown "" then class_name mrecv else mown) in
+         (let ocl = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
           VInt (val_hash (mkstr (ocl ++ "#" ++ defined_as_name world ocl mnm))
                 + (match mrecv with
                    | VObj oid9 -> oid9 * 8
@@ -22366,11 +22405,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // builtin (there is no ruby source behind one).
        else if str_eq name "source_location" then meth_source_location world mown mnm mrecv
        else if str_eq name "parameters" then
-         bm_params world (if str_eq mown "" then class_name mrecv else mown) mnm
+         bm_params world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm
        else if str_eq name "unbind" then
          (let uid = alloc_oid ocls in
           let _ = map_set ocls (str_of_int uid) "UnboundMethod" in
-          let _ = map_set ivars (str_of_int uid ++ "@__um_cls") (mkstr (if str_eq mown "" then class_name mrecv else mown)) in
+          let _ = map_set ivars (str_of_int uid ++ "@__um_cls") (mkstr (if str_eq mown "" then dispatch_cls_of world mrecv else mown)) in
           let _ = map_set ivars (str_of_int uid ++ "@__um_name") (mkstr mnm) in
           VObj uid)
        else if str_eq name "to_proc" then
@@ -22413,7 +22452,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // name, the parameter SHAPE and where it was written. It used to be
          // the class and the name alone, and for an object with ivars the
          // default printer showed the internal ones instead.
-         (let ocl9 = (if str_eq mown "" then class_name mrecv else mown) in
+         (let ocl9 = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
           mkstr (meth_inspect_str world "Method" ocl9 mnm
                    (bm_params world ocl9 mnm) (meth_source_location world mown mnm mrecv)))
        else if str_eq name "==" || str_eq name "eql?" then
@@ -23199,7 +23238,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | _ -> VNil))
           else raise_exc world "TypeError" ("bind argument must be an instance of " ++ ucls))
        else if str_eq name "name" then VSym unm
-       else if str_eq name "owner" then VClass ucls
+       else if str_eq name "owner" then
+         VClass (if map_has ivars (str_of_int id ++ "@__um_owner")
+                 then (match map_get ivars (str_of_int id ++ "@__um_owner") with
+                       | VStr h9 -> sget h9
+                       | _ -> ucls)
+                 else ucls)
        else if str_eq name "source_location" then meth_source_location world ucls unm VNil
        else if str_eq name "arity" then VInt (bm_arity world ucls unm)
        else if str_eq name "parameters" then bm_params world ucls unm
@@ -24615,6 +24659,13 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        let target = (match recv with
                      | VClass c -> "(sng:" ++ c ++ ")"
                      | VObj id -> singleton_cls_of world id
+                     // nil / true / false have no singleton class of their own
+                     // -- theirs IS the class -- and ruby lets you define one
+                     // there anyway: `nil.define_singleton_method(:x)` defines
+                     // a NilClass method, the way `def (nil).x` does. Refusing
+                     // was the only answer here.
+                     | VNil -> "NilClass"
+                     | VBool b2 -> (if b2 then "TrueClass" else "FalseClass")
                      | _ -> "") in
        let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr s2, _) -> sget s2 | _ -> "") in
        if str_eq target "" then raise_exc world "TypeError" "can't define singleton"
@@ -25465,8 +25516,10 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // nil for an exception whose backtrace it could already print.
   if str_eq name "backtrace_locations"
      && (match recv with VExc (_, _) -> true | _ -> false)
-     && map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") recv then
-    (match map_get raise_bt "v" with
+     && ((map_has raise_bt "e" && rb_eq (map_get raise_bt "e") recv)
+         || (map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") recv)) then
+    (match (if map_has raise_bt "e" && rb_eq (map_get raise_bt "e") recv
+            then map_get raise_bt "eb" else map_get raise_bt "v") with
      | VArr aid9 -> arr_new (bt_locs_of world (deref aid9))
      | _ -> VNil)
   else
@@ -26468,7 +26521,7 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
   | VMain -> ""
   | VObj oid ->
     (let ocl = map_get ocls (str_of_int oid) in
-     let a = lookup_anc world (ancestors_of world ocl) nm in
+     let a = owner_anc world (ancestors_of world ocl) nm in
      if str_eq a "" && map_has meths (ocl ++ "#" ++ nm) then ocl
      // a method the object has as a BUILTIN is owned by its class too. Leaving
      // this empty made #owner fall back to a generic class name, and it also
@@ -26478,7 +26531,7 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
      else a)
   | VClass c2 ->
     (let sng = "(sng:" ++ c2 ++ ")" in
-     let a = lookup_anc world (ancestors_of world sng) nm in
+     let a = owner_anc world (ancestors_of world sng) nm in
      if str_eq a "" && map_has meths (sng ++ "#" ++ nm) then sng
      // Kernel's module functions are ITS singleton's; its instance methods are
      // Kernel's, whatever module object was asked. Without these the owner
@@ -26489,12 +26542,15 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
      else a)
   | other ->
     (let cn = class_name other in
-     let a = lookup_anc world (ancestors_of world cn) nm in
+     let a = owner_anc world (ancestors_of world cn) nm in
      if str_eq a "" && map_has meths (cn ++ "#" ++ nm) then cn else a)
 
 // Method#arity from a user method's params/defaults (-1 for builtins).
-and bm_arity = fn world -> fn (owner: str) -> fn (nm: str) ->
+and bm_arity = fn world -> fn (owner0: str) -> fn (nm: str) ->
   let (meths, sup, ocls, ivars) = world in
+  // ...and the arity is the BODY's, whatever class owns the method (see
+  // body_cls_of: `public :m` in a subclass owns it without defining it).
+  let owner = body_cls_of world owner0 nm in
   // the explicit-but-empty `||` sentinel is not a parameter, here either: a
   // `define_method(:m) { || }` counted it and answered arity 1 for a method
   // that takes nothing. #parameters and #arity read the same list and have to
@@ -26551,14 +26607,52 @@ and bm_arity_go = fn (params: str list) -> fn (defaults: (str * Expr) list) -> f
 
 // Method#parameters: the declaration in order. Whether a name is required or
 // optional is the presence of a DEFAULT, which is kept in its own list.
-and bm_params = fn world -> fn (owner: str) -> fn (nm: str) ->
+and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
   let (meths, sup, ocls, ivars) = world in
+  // the owner may be a class that only PUBLISHED the method; the parameters
+  // are the body's.
+  let owner = body_cls_of world owner0 nm in
   let key = owner ++ "#" ++ nm in
   if map_has meths key then
     (match map_get meths key with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
   else if map_has meths nm then
     (match map_get meths nm with Meth (ps, ds, _) -> arr_new (param_meta_of true ps ds))
-  else arr_new Nil
+  // ⚠ a BUILTIN method is not in the method table, and neither is one backed
+  //   by respond_to_missing? -- this answered an EMPTY parameter list for both,
+  //   which claims a method that takes nothing. ruby derives a C method's
+  //   parameters from its ARITY, with no names (there are none to give):
+  //   `1.method(:+)` is [[:req]], `[].method(:push)` is [[:rest]], and
+  //   `[].method(:size)` really is []. Read from arity_num_tbl for the same
+  //   reason #arity does -- the bounds beside it say what a CALL may pass, and
+  //   they disagree with the declaration wherever a C function is variadic.
+  else
+    (let a9 = builtin_arity_of world owner nm in
+     let k9 = owner ++ "#" ++ nm in
+     let has9 = (if map_has arity_num_tbl k9 then true
+                 else if obj_is_a world owner "Enumerable"
+                         && map_has arity_num_tbl ("Enumerable#" ++ nm) then true
+                 else if obj_is_a world owner "Comparable"
+                         && map_has arity_num_tbl ("Comparable#" ++ nm) then true
+                 else false) in
+     if has9 then
+       (if a9 >= 0 then arr_new (bm_kind_meta "req" a9)
+        else arr_new (list_append (bm_kind_meta "req" (0 - a9 - 1))
+                        (Cons (arr_new (Cons (VSym "rest", Nil)), Nil))))
+     // ...and a name with NO row is one of two things: a builtin the table
+     // does not cover (`Array#each`, whose parameters really are []), or a
+     // method the object only CLAIMS through respond_to_missing?, which ruby
+     // reports as [[:rest]]. Asking whether the class defines
+     // respond_to_missing? is what tells them apart -- a default of [[:rest]]
+     // for both would claim arguments for every uncovered builtin.
+     else if has_meth world owner "respond_to_missing?" then
+       arr_new (Cons (arr_new (Cons (VSym "rest", Nil)), Nil))
+     else arr_new Nil)
+
+// n copies of a one-element parameter description ([[:req], [:req]] ...): a C
+// method's parameters have no names, and ruby prints them without.
+and bm_kind_meta = fn (kind: str) -> fn (n: int) ->
+  if n <= 0 then (Nil : Val list)
+  else Cons (arr_new (Cons (VSym kind, Nil)), bm_kind_meta kind (n - 1))
 and bm_has_default = fn (defaults: (str * Expr) list) -> fn (pp: str) ->
   match defaults with
   | Nil -> false
@@ -27183,7 +27277,9 @@ and is_hash_method = fn (name: str) ->
 // while it was true for a builtin one.
 // where a `def` was written. A builtin has no ruby source and answers nil,
 // which is also what ruby does for one.
-and meth_source_location = fn world -> fn (own: str) -> fn (nm: str) -> fn (recv: Val) ->
+and meth_source_location = fn world -> fn (own0: str) -> fn (nm: str) -> fn (recv: Val) ->
+  // the source is the BODY's, whatever class owns the method (body_cls_of).
+  let own = body_cls_of world own0 nm in
   let k9 = (if str_eq own "" then
               (match recv with
                | VClass c9 -> "(sng:" ++ c9 ++ ")#" ++ nm
@@ -29103,8 +29199,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "backtrace" || str_eq name "backtrace_locations" then
     (match recv with
      | VExc (_, _) ->
-       (if str_eq name "backtrace" && map_has raise_bt "v"
-           && map_has globals "!" && rb_eq (map_get globals "!") recv
+       (if str_eq name "backtrace"
+           && map_has raise_bt "eb" && map_has raise_bt "e"
+           && rb_eq (map_get raise_bt "e") recv
+        then map_get raise_bt "eb"
+        else if str_eq name "backtrace" && map_has raise_bt "v"
+                && map_has globals "!" && rb_eq (map_get globals "!") recv
         then map_get raise_bt "v" else VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in
              (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in
@@ -33068,11 +33168,13 @@ and rb_flt_digits = fn (s0: str) -> fn (i: int) -> fn (hi: int) -> fn (hex: bool
       let dv = rb_digit_val_x c in
       (if dv < 0 || dv >= (if hex then 16 else 10)
        then (if prev_us then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i)) else (acc, i))
-       // ruby's reader stops its own strtod at the first underscore and then
-       // requires every remaining mantissa character to be a DECIMAL digit --
-       // so "0xa1_0" is 0xa10 but "0x1_0a" refuses.
-       else if hex && seen_us && dv >= 10
-       then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in (acc, i))
+       // ⚠ ruby 3.2's reader stopped its own strtod at the first underscore and
+       //   then required every remaining mantissa character to be a DECIMAL
+       //   digit ("0xa1_0" was 0xa10 but "0x1_0a" refused), and this was
+       //   written against that reference. ruby 4 reads hex digits on both
+       //   sides of an underscore: Float("0x1_f") is 31.0. The rules that did
+       //   NOT move are the ones about the underscore's POSITION -- doubled,
+       //   leading and trailing are still refused.
        else rb_flt_digits s0 (i + 1) hi hex false seen_us (acc ++ c))
 
 // %f/%e/%g argument: Float() semantics (a String parses; nil refuses).
@@ -33893,18 +33995,39 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
         // a STRING second argument is the LOCATION ruby names in the message
         // ("Invalid argument @ location - custom message"); an integer one is
         // the errno, which picked the class before this ran.
-        let loc = (match rest9 with Cons (VStr lh, _) -> sget lh | _ -> "") in
+        // the location may arrive as the second argument (an Errno class's
+        // `new(msg, loc)`) or the third (`SystemCallError.new(msg, errno,
+        // loc)`) -- it is the first String among them either way.
+        let loc = (match rest9 with
+                   | Cons (VStr lh, _) -> sget lh
+                   | Cons (_, Cons (VStr lh, _)) -> sget lh
+                   | _ -> "") in
         // ...and a SUBCLASS of an Errno class inherits its text: the class
         // name is the anonymous subclass's, so walk up to the Errno ancestor.
+        // ⚠ keep the ORIGINAL name: errno_ancestor_of answers "" for
+        //   SystemCallError itself, and the branch below that writes its
+        //   message tested the REWRITTEN name -- so an unknown errno fell all
+        //   the way through to "the message as given".
+        let c0 = c in
         let c = (if str_len c > 7 && str_eq (substring c 0 7) "Errno::" then c
                  else errno_ancestor_of world c) in
         if str_len c > 7 && str_eq (substring c 0 7) "Errno::"
         then mkstr (if str_eq loc "" then errno_message c given has
                     else errno_desc (substring c 7 (str_len c)) ++ " @ " ++ loc
                          ++ (if has then " - " ++ given else ""))
-        // the base class is not an errno: ruby still prefixes it, with the text
-        // it uses when it has no number to look up.
-        else if str_eq c "SystemCallError" then (if has then mkstr ("unknown error - " ++ given) else VNil)
+        // the base class is not an errno: ruby still prefixes it, with the
+        // text it uses when it has no number to look up -- "unknown error"
+        // when no number was given at all, and "Unknown error: N" (capital,
+        // with the number) when the number names no errno. The location goes
+        // in the same place either way.
+        else if str_eq c "SystemCallError" || str_eq c0 "SystemCallError" then
+          (let n9 = (match rest9 with
+                     | Cons (VInt k9, _) -> "Unknown error: " ++ str_of_int k9
+                     | _ -> "unknown error") in
+           let head9 = n9 ++ (if str_eq loc "" then "" else " @ " ++ loc) in
+           if has then mkstr (head9 ++ " - " ++ given)
+           else if (match rest9 with Cons (VInt _, _) -> true | _ -> false) then mkstr head9
+           else VNil)
         else (if has then mkstr given else VNil))
      | _ -> VNil)
   // Errno::X#errno -- the platform's number for the class this exception is.
@@ -34076,8 +34199,15 @@ and rand_val = fn world -> fn (args: Val list) ->
   match args with
   | Cons (VInt n, _) -> (if n <= 0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
                          else VInt (random_int n))
-  | Cons (VFlt f, _) -> (if f <= 0.0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
-                         else VFlt (float_of_int (random_int 1000000000) / 1000000000.0 * f))
+  // ⚠ a FLOAT max is TRUNCATED first, and the answer is an INTEGER whenever
+  //   that leaves at least one: `rand(1.5)` is 0 (an Integer) and `rand(2.5)`
+  //   is 0, 1 or 2 -- only a max that truncates to zero (`rand(0.5)`) answers a
+  //   Float. Scaling the float directly answered a Float for every one of them.
+  | Cons (VFlt f, _) ->
+    (if f <= 0.0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
+     else (let n9 = int_of_float f in
+           if n9 >= 1 then VInt (random_int n9)
+           else VFlt (float_of_int (random_int 1000000000) / 1000000000.0 * f)))
   // rand(1..6): only an integer range picks an integer
   | Cons (VRange (av, bv, excl), _) ->
     (match av with
@@ -34295,8 +34425,13 @@ and kernel_public_instance_names = fn (u: unit) ->
 and kernel_builtin_names = fn (u: unit) ->
   Cons ("select", Cons ("spawn", Cons ("syscall", Cons ("trap", Cons ("putc",
   Cons ("respond_to_missing?", Cons ("initialize_clone", Cons ("initialize_dup",
-  Cons ("initialize_copy", Cons ("chomp", Cons ("chop", Cons ("open", Cons ("exec",
-  Cons ("sub", Cons ("gsub", Cons ("puts", Cons ("p", Cons ("pp", Cons ("print",
+  // ⚠ chomp / chop / sub / gsub are NOT here: ruby defines them only under -n
+  //   or -p (they read and write $_), and `Kernel.private_instance_methods`
+  //   does not list them otherwise -- which is what core/kernel/chomp_spec and
+  //   chop_spec check. This interpreter has no -n, so the names are absent
+  //   rather than conditional.
+  Cons ("initialize_copy", Cons ("open", Cons ("exec",
+  Cons ("puts", Cons ("p", Cons ("pp", Cons ("print",
   Cons ("printf", Cons ("format", Cons ("sprintf", Cons ("raise", Cons ("fail",
   Cons ("loop", Cons ("catch", Cons ("throw", Cons ("proc", Cons ("lambda", Cons ("eval",
   Cons ("require", Cons ("require_relative", Cons ("block_given?", Cons ("Integer",
@@ -34309,7 +34444,7 @@ and kernel_builtin_names = fn (u: unit) ->
   Cons ("set_trace_func", Cons ("caller", Cons ("caller_locations", Cons ("__method__", Cons ("__callee__",
   Cons ("__callee__", Cons ("load", Cons ("system", Cons ("readline", Cons ("readlines",
   Cons ("trace_var", Cons ("untrace_var", Cons ("fork", Cons ("global_variables",
-  Cons ("local_variables", Cons ("test", Cons ("__dir__", Cons ("instance_variables_to_inspect", Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+  Cons ("local_variables", Cons ("test", Cons ("__dir__", Cons ("instance_variables_to_inspect", Nil)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 
 and list_iter_kernel_names = fn (f: str -> unit) ->
   let rec go = fn (xs: str list) ->
@@ -35004,11 +35139,54 @@ and is_definition_hook = fn (name: str) ->
   str_eq name "method_undefined" || str_eq name "singleton_method_removed" ||
   str_eq name "singleton_method_undefined"
 // the first ancestor in `anc` that defines `name`, or "" if none.
+// Record the frames a raise happened at, ON the exception where there is
+// somewhere to put them: #backtrace is asked long after `$!` has moved on
+// (`e = begin; raise; rescue RuntimeError; $!; end` then `e.backtrace`), and
+// keying the answer on "is this still $!" answered nil for every one of those.
+// An OBJECT exception keeps it in @__bt, which #backtrace already reads -- and
+// keeps the FIRST one, because a re-raise does not re-capture. The pair
+// representation has no ivars, so the last raise is remembered beside it.
+and note_raise_bt = fn world -> fn (exc: Val) ->
+  let (m9, s9, o9, ivars9) = world in
+  let bt9 = arr_new (caller_frames 0) in
+  let _ = map_set raise_bt "v" bt9 in
+  let _ = map_set raise_bt "e" exc in
+  let _ = map_set raise_bt "eb" bt9 in
+  (match exc with
+   | VObj oid9 ->
+     (if map_has ivars9 (str_of_int oid9 ++ "@__bt") then ()
+      else map_set ivars9 (str_of_int oid9 ++ "@__bt") bt9)
+   | _ -> ())
+
 and lookup_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
   let (meths, _, _, _) = world in
   match anc with
   | Nil -> ""
   | Cons (a, rest) -> if map_has meths (a ++ "#" ++ name) then a else lookup_anc world rest name
+
+// ⚠ "which class OWNS this method" is not "where is its BODY": `public :m` in
+//   a subclass is a method entry in ruby, so #owner answers that subclass --
+//   while the body is still the ancestor's, and the dispatcher needs the
+//   ancestor. Answering the owner from the body walk sent the caller to a
+//   class with no body and the call failed internally; these are two questions
+//   and they need two walks.
+// ...and the reverse trip: given the OWNER (which may be a class that only
+// changed the visibility), where is the body? Everything that reads the
+// definition -- #arity, #parameters, #source_location -- asks this.
+and body_cls_of = fn world -> fn (owner: str) -> fn (nm: str) ->
+  let (meths, _, _, _) = world in
+  if str_eq owner "" then ""
+  else if map_has meths (owner ++ "#" ++ nm) then owner
+  else (let a9 = lookup_anc world (ancestors_of world owner) nm in
+        if str_eq a9 "" then owner else a9)
+
+and owner_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
+  let (meths, _, _, _) = world in
+  match anc with
+  | Nil -> ""
+  | Cons (a, rest) ->
+    if map_has meths (a ++ "#" ++ name) || map_has vis_marks (a ++ "#" ++ name) then a
+    else owner_anc world rest name
 
 // The ancestor that defines `name` ABOVE `from` -- what Method#super_method
 // answers about. Walks past `from` first, so a class that defines the method
@@ -42149,6 +42327,7 @@ and mark_vis_mode = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (mod
     // calls them on a sibling instance).
     let _ = (let _ = if map_has privates key then map_delete privates key else () in
              let _ = if map_has protecteds key then map_delete protecteds key else () in
+             let _ = map_set vis_marks key VNil in
              if str_eq mode "private" then let _ = map_set privates key VNil in ()
              else if str_eq mode "protected" then let _ = map_set protecteds key VNil in ()
              else ()) in
@@ -42170,6 +42349,10 @@ and meth_protected = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if str_eq cls "" then false
   else if map_has protecteds (cls ++ "#" ++ name) then true
+  // ...same for protected: the class that named it in a visibility statement
+  // decides, so `public :m` (or `private :m`) below a `protected :m` is not
+  // still protected.
+  else if map_has vis_marks (cls ++ "#" ++ name) then false
   else if map_has meths (cls ++ "#" ++ name) then false
   else if map_has sup cls then meth_protected world (map_get sup cls) name
   else if str_eq cls "BasicObject" then false
@@ -42192,6 +42375,12 @@ and meth_private = fn world -> fn (cls: str) -> fn (name: str) ->
   let (meths, sup, ocls, ivars) = world in
   if str_eq cls "" then false
   else if map_has privates (cls ++ "#" ++ name) then true
+  // ...and a class that named the method in a visibility statement DECIDES,
+  // even with no body of its own: `public :m` in a subclass leaves no positive
+  // mark (public is the absence of one), so the walk went past it and found
+  // the ancestor's `private` -- and the method stayed private in a class that
+  // had just published it.
+  else if map_has vis_marks (cls ++ "#" ++ name) then false
   else if map_has meths (cls ++ "#" ++ name) then false   // public definition here
   else if map_has sup cls then meth_private world (map_get sup cls) name
   else if str_eq cls "BasicObject" then false
@@ -47618,10 +47807,16 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // kept so #errno answers it even for the base class.
   // ...and it REQUIRES an argument: `SystemCallError.new` is an ArgumentError
   // in ruby (there is no errno to name), and answered an empty exception here.
+  // ...and a THIRD argument is the LOCATION: `SystemCallError.new("m", 2,
+  // "loc")` is "No such file or directory @ loc - m". The message builder knew
+  // about a location all along (an Errno class's two-argument form passes one
+  // there), but the constructor took two parameters, so the three-argument
+  // form was a wrong-arity call.
   let _ = map_set meths "SystemCallError#initialize"
-    (Meth (Cons ("msg", Cons ("extra", Nil)), Cons (("msg", ECall ("__sce_no_arg", Cons (ESelf, Nil))), Cons (("extra", ENil), Nil)),
+    (Meth (Cons ("msg", Cons ("extra", Cons ("loc", Nil))),
+           Cons (("msg", ECall ("__sce_no_arg", Cons (ESelf, Nil))), Cons (("extra", ENil), Cons (("loc", ENil), Nil))),
            Cons (SIVarAssign ("__errno", EVar "extra"),
-             Cons (SIVarAssign ("message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Cons (EVar "extra", Nil))))), Nil)))) in
+             Cons (SIVarAssign ("message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Cons (EVar "extra", Cons (EVar "loc", Nil)))))), Nil)))) in
   // #errno: the number it was given, or the platform's number for its class.
   let _ = map_set meths "SystemCallError#errno"
     (Meth (Nil, Nil, Cons (SExpr (ECall ("__errno_number", Cons (ESelf, Cons (EIVar "__errno", Nil)))), Nil))) in
