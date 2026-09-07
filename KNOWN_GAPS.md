@@ -2695,3 +2695,42 @@ has to be noticed by running the interpreter once after touching the prelude.
 The fix is the one PAIN.md already names -- a tail-recursive (or explicitly
 stacked) statement walk -- and until then a prelude change is measured by
 whether `mere-ruby -e 'p 1'` still prints.
+
+## `Enumerator::Lazy` has six operations, and `with_index` is not one of them
+
+The lazy pipeline is a list of ops replayed by a driver object, and the driver
+knows `map` / `select` / `reject` / `filter_map` / `take_while` / `drop_while`
+(block ops) plus `take` / `drop` (integer ops). `with_index` needs the driver to
+carry a counter of its own, which is a change to the pipeline rather than a new
+entry in a table -- so `[1, 2].lazy.with_index` is a NoMethodError and the
+enumerator printer's lazy branch has an untested shape (`#<Enumerator::Lazy:
+#<Enumerator::Lazy: [1, 2]>:with_index(3)>`).
+
+## A custom RNG is accepted and ignored
+
+`[1, 2].shuffle(random: obj)` and `#sample(random: obj)` do not call `obj.rand`:
+the keyword is parsed and dropped, so an object that cannot answer `rand` is
+shuffled without complaint where ruby raises NoMethodError, and a mock that
+counts its calls sees none. Honouring it means routing the Fisher-Yates draws
+through the object (a Float answer scales by the range, an Integer is used as
+is), which is a change to the shuffling itself; core/array/shuffle_spec and
+sample_spec are the two files it costs.
+
+## Reflection still cannot enumerate a builtin's own methods
+
+`Comparable.instance_methods` is `[]`, `Complex.private_instance_methods(false)`
+is `[:initialize]` where ruby answers `[:marshal_dump]`, and
+`Integer.respond_to?(:sqrt)`, `Hash.respond_to?(:[])`, `Process.respond_to?(:pid)`
+and `Signal.respond_to?(:list)` are all false while the calls themselves work.
+The class-method side of respond_to? reads a curated list
+(`builtin_class_method`), and `.new` is claimed for every class -- including
+Integer and Float, which have none. The general answer is the one the arity
+table gave the instance side: a generated table, asked from the oracle. A hand
+kept list is what is there now, and it is as incomplete as the last person's
+attention.
+
+## `loop` without a block is a NameError
+
+`loop` is a special form in the evaluator rather than a method, so `loop` with no
+block reports "undefined local variable or method 'loop'" instead of answering
+the infinite Enumerator ruby gives (`loop.first(3)` is `[nil, nil, nil]`).

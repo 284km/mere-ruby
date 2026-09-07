@@ -59,7 +59,7 @@ SAMPLES = {
 # iteration names whose zero-argument form runs a body.
 SKIP = %w[exit exit! abort sleep gets readline readlines fork exec system spawn loop raise fail
           throw catch binding trap kill wait wait2 waitpid detach at_exit warn puts print p pp
-          display putc syscall select instance_eval instance_exec class_eval module_eval eval
+          display putc syscall instance_eval instance_exec class_eval module_eval eval
           freeze srand read sysread readpartial readchar readbyte getc getbyte
           each each_line each_byte each_char each_codepoint each_grapheme_cluster each_entry
           each_with_index each_with_object each_pair each_key each_value
