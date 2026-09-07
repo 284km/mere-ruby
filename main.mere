@@ -7988,6 +7988,7 @@ let num_neg = fn (v: Val) -> match v with
 let num_isneg = fn (v: Val) -> match v with
   | VInt n -> n < 0 | VFlt f -> f < 0.0 | VBig s -> big_sign s < 0 | VRat (n, d) -> big_sign n < 0 | _ -> false;
 let num_abs = fn (v: Val) -> if num_isneg v then num_neg v else v;
+
 // +,-,* on two boxed numerics: exact int when both are VInt, else via float.
 let num_bin = fn (o: str) -> fn (x: Val) -> fn (y: Val) ->
   // a BIGNUM keeps its digits: this fell through to `to_f` on both sides, so
@@ -8517,6 +8518,39 @@ let num_is_zero = fn (v: Val) ->
 let num_is_nan = fn (v: Val) -> match v with VFlt f -> flt_is_nan f | _ -> false;
 // infinity is the only non-zero value that is its own half
 let flt_is_inf = fn (x: float) -> (if x == 0.0 then false else true) && x * 0.5 == x;
+// ---- the parts of a Complex, for the questions asked ABOUT the parts -------
+// "is this part finite / infinite": only a Float can be either, and every
+// exact shape is finite.
+let num_part_inf = fn (v: Val) -> match v with VFlt f -> flt_is_inf f | _ -> false;
+let num_part_finite = fn (v: Val) ->
+  match v with VFlt f -> (if flt_is_nan f then false else if flt_is_inf f then false else true) | _ -> true;
+// ⚠ The sign of a part FOR PRINTING is the sign BIT, not `< 0`: for -0.0 the
+// comparison is false, so `Complex(1, -0.0)` printed "1+-0.0i" -- a sign in
+// the separator's place and not a Ruby literal at all. ruby writes "1-0.0i".
+let num_isneg_signed = fn (v: Val) ->
+  match v with
+  | VFlt f -> (if f < 0.0 then true else if f == 0.0 then 1.0 / f < 0.0 else false)
+  | other -> num_isneg other;
+let num_mag_signed = fn (v: Val) -> if num_isneg_signed v then num_neg v else v;
+// ...and a part that is not a FINITE number takes an explicit `*`: ruby writes
+// `0+Infinity*i` and `0+NaN*i`, never `0+Infinityi`.
+//
+// ⚠ A RATIONAL part is the case where to_s and inspect disagree ON PURPOSE:
+// `Complex(0, 1r).to_s` is "0+1/1i" and its inspect is "(0+(1/1)*i)" -- the
+// star belongs to the PARENTHESES, not to the Rational. Putting it in this
+// shared helper broke two bootstraptest pairs that print a rational-imaginary
+// literal, which is how the difference got noticed.
+let cpx_im_tail = fn (v: Val) ->
+  match v with
+  | VFlt f -> (if flt_is_nan f || flt_is_inf f then "*i" else "i")
+  | _ -> "i";
+// a Complex has an ordering only when BOTH imaginary parts are zero -- then it
+// is the reals that are compared. 2 means "no answer" (ruby's nil).
+let cpx_re_of = fn (v: Val) -> match v with VCpx (r, _) -> r | other -> other;
+let cpx_im_of = fn (v: Val) -> match v with VCpx (_, i) -> i | _ -> VInt 0;
+let cpx_zero_im = fn (v: Val) ->
+  match v with VInt 0 -> true | VBig b -> str_eq (big_mag b) "0"
+             | VRat (n, _) -> str_eq (big_mag n) "0" | VFlt f -> f == 0.0 | _ -> false;
 let rec flt_inf_go = fn (x: float) -> if x * 2.0 == x then x else flt_inf_go (x * 2.0);
 let flt_inf = fn () -> flt_inf_go 1.0;
 let flt_nan = fn () -> let i = flt_inf () in i - i;
@@ -8690,7 +8724,13 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
         if e9 >= 0 then mk_rat_s (big_pow an9 e9 "1") (big_pow ad9 e9 "1")
         else mk_rat_s (big_pow ad9 (0 - e9) "1") (big_pow an9 (0 - e9) "1"))
      | _ -> VNil)
-  else if str_eq op "**" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false)) then
+  // ...but NOT when either side is a Complex: to_f cannot take one, so
+  // `Complex(2,0) ** Rational(1,2)` failed inside this branch ("not a number")
+  // instead of reaching the complex power below it. A branch keyed on ONE
+  // operand's type has to say what it assumes about the other.
+  else if str_eq op "**" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false))
+          && (match va with VCpx _ -> false | _ -> true)
+          && (match vb with VCpx _ -> false | _ -> true) then
     pow_val (to_f va) (to_f vb)
   else if (match va with VCpx _ -> true | _ -> false) && str_eq op "**" then
     (match vb with
@@ -8701,11 +8741,22 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
                    then (match cpx_pow va (int_of_float fy) with
                          | VCpx (re9, im9) -> VCpx (VFlt (to_f re9), VFlt (to_f im9))
                          | other9 -> other9)
+                   else if cpx_zero_im (cpx_im_of va) && to_f (cpx_re_of va) >= 0.0
+                   then VCpx (VFlt (to_f (pow_val (to_f (cpx_re_of va)) fy)), VFlt 0.0)
                    else cpx_pow_gen va (VFlt fy))
-     // a COMPLEX (or fractional) exponent is exp(y * ln x), which is what
-     // ruby computes too -- this used to be an internal failure, so it
-     // reached the program as a bare StandardError.
-     | _ -> cpx_pow_gen va vb)
+     // ...and a NON-NEGATIVE REAL base with a real exponent is a real power:
+     // ruby computes it that way and gets the exactly-rounded double, while
+     // exp(y * ln x) is a bit short (2**0.5 came out 1.414213562373095 where
+     // ruby says 1.4142135623730951). Only the genuinely complex cases need
+     // the general formula.
+     | _ ->
+       (if cpx_zero_im (cpx_im_of va) && (match vb with VCpx (_, _) -> false | _ -> true)
+           && to_f (cpx_re_of va) >= 0.0
+        then VCpx (VFlt (to_f (pow_val (to_f (cpx_re_of va)) (to_f vb))), VFlt 0.0)
+        // a COMPLEX (or fractional-with-negative-base) exponent is
+        // exp(y * ln x), which is what ruby computes too -- this used to be an
+        // internal failure, so it reached the program as a bare StandardError.
+        else cpx_pow_gen va vb))
   else if str_eq op "|" then
     (match va with
      | VArr x -> (match vb with VArr y -> arr_new (val_dedup_into (deref y) (val_dedup_into (deref x) Nil)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
@@ -11302,7 +11353,8 @@ and to_s = fn (v: Val) ->
   | VInt n -> str_of_int n
   | VBig s -> s
   | VRat (n, d) -> n ++ "/" ++ d
-  | VCpx (r, i) -> to_s r ++ (if num_isneg i then "-" else "+") ++ to_s (num_abs i) ++ "i"
+  | VCpx (r, i) -> to_s r ++ (if num_isneg_signed i then "-" else "+")
+                   ++ to_s (num_mag_signed i) ++ cpx_im_tail i
   | VFlt f -> rb_float_str f
   | VStr s -> let s = sget s in s
   | VBool b -> if b then "true" else "false"
@@ -11434,10 +11486,10 @@ and inspect = fn (v: Val) ->
   | VCpx (r, i) ->
     // Rational components are parenthesized in inspect, and a parenthesized
     // imaginary part takes an explicit *: ((11/25)+(2/25)*i).
-    let ia = num_abs i in
+    let ia = num_mag_signed i in
     "(" ++ (match r with VRat _ -> "(" ++ to_s r ++ ")" | _ -> to_s r)
-        ++ (if num_isneg i then "-" else "+")
-        ++ (match ia with VRat _ -> "(" ++ to_s ia ++ ")*i" | _ -> to_s ia ++ "i") ++ ")"
+        ++ (if num_isneg_signed i then "-" else "+")
+        ++ (match ia with VRat _ -> "(" ++ to_s ia ++ ")*i" | _ -> to_s ia ++ cpx_im_tail ia) ++ ")"
   | VRegex (p, fl) ->
     // Regexp#inspect shows the m,i,x flags in canonical order.
     // ruby prints the flags in the order "mixn", and `n` is one of them: it
@@ -13718,6 +13770,19 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        | _ -> VNil)
     else if str_eq op "<=>" then
       (let vb = vb in
+       // A COMPLEX has an ordering exactly when both imaginary parts are zero:
+       // then it is the reals that are compared, and `Complex(2,0) <=> 1` is 1.
+       // Otherwise there is no answer (nil) -- which is what this gave for
+       // every pair, including the ones ruby orders.
+       if (match va0 with VCpx (_, _) -> true | _ -> false) || (match vb with VCpx (_, _) -> true | _ -> false) then
+         // ⚠ `is_num` does NOT include Complex (is_cpx is the separate
+         // question), so asking it alone sent every Complex-vs-Complex pair
+         // straight to nil -- the one case this arm exists for.
+         (if (if is_num vb || is_cpx vb then false else true) then VNil
+          else if cpx_zero_im (cpx_im_of va0) && cpx_zero_im (cpx_im_of vb) then
+            (let c9 = cmp_vals (cpx_re_of va0) (cpx_re_of vb) in
+             VInt (if c9 < 0 then 0 - 1 else if c9 > 0 then 1 else 0))
+          else VNil)
        // Object#<=> answers 0 for two values that are ==, even when neither has
        // an ordering: `o <=> o` is 0 and `o <=> other` is nil. The identity case
        // has to come BEFORE the incomparable test, which would call them both
@@ -13726,7 +13791,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        //
        // ...and a NUMBER against an object that coerces asks it first: ruby
        // answers `1 <=> obj` from the coerced pair, and this said nil.
-       if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
+       else if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
           && (match vb with VObj _ -> true | _ -> false) && (responds world vb "coerce" || has_coerce world vb) then
          (let nb8 = (false, (Nil : str list), (Nil : Stmt list), env) in
           match invoke_val_c env world nb8 vb "coerce" (Cons (va0, Nil)) false with
@@ -16205,9 +16270,14 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | _ -> VBool false)
     else if str_eq name "grep" || str_eq name "grep_v" then
       (match args with
+       // ⚠ `$~` inside the block is THAT ELEMENT's match. Selecting every hit
+       // first and mapping afterwards left behind the LAST attempt's result
+       // for all of them: `grep(/e/) { $~ }` saw the failed match of the
+       // element after the last hit, and `grep_v(/e/) { $~ }` saw a MatchData
+       // for a string it was never given. Matching immediately before each
+       // yield is the only order that makes the global mean what it says.
        | Cons (pat, _) ->
-         let hits = arr_grep world xs pat (str_eq name "grep_v") in
-         iter_result (arr_map world encl theblk hits Nil) recv
+         iter_result (arr_grep_map world encl theblk xs pat (str_eq name "grep_v") Nil) recv
        | _ -> arr_new Nil)
     else if str_eq name "each_entry" then iter_each_result (arr_each world encl theblk xs) recv
     else if str_eq name "cycle" then
@@ -25554,11 +25624,21 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
          ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
      else make_enum_a world recv name args)
   // Enumerable extras needing === / world (blockless array forms).
+  // ⚠ WITHOUT a block, grep leaves `$~` exactly as it was: there is no block
+  // for it to be visible to, and ruby does not publish the walk's own matches.
+  // arr_grep runs `===` on every element, so the last one overwrote whatever
+  // the program had matched before the call -- a global changed by a method
+  // that answers an Array.
   else if (str_eq name "grep" || str_eq name "grep_v") && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
      | VArr aid ->
        (match args with
-        | Cons (pat, _) -> arr_new (arr_grep world (deref aid) pat (str_eq name "grep_v"))
+        | Cons (pat, _) ->
+          (let had9 = map_has globals "~" in
+           let prev9 = (if had9 then map_get globals "~" else VNil) in
+           let r9 = arr_new (arr_grep world (deref aid) pat (str_eq name "grep_v")) in
+           let _ = (if had9 then map_set globals "~" prev9 else ()) in
+           r9)
         | _ -> arr_new Nil)
      | _ -> VNil)
   else if str_eq name "one?" && (match recv with VArr _ -> true | _ -> false) then
@@ -26705,6 +26785,12 @@ and rb_eql = fn (a: Val) -> fn (b: Val) ->
   if str_eq (class_name a) (class_name b) then
     (match a with
      | VArr ia -> (match b with VArr ib -> val_eql_list (deref ia) (deref ib) | _ -> false)
+     // ⚠ Two Complexes are eql? when each PART is eql?, which is stricter than
+     // ==: `Complex(1,2).eql?(Complex(1.0,2.0))` is false in ruby. Both are
+     // class Complex, so the outer check passed and rb_eq compared them
+     // numerically -- true, for two objects ruby says are not interchangeable
+     // (they hash differently, which is what eql? is for).
+     | VCpx (ar, ai) -> (match b with VCpx (br, bi) -> rb_eql ar br && rb_eql ai bi | _ -> false)
      | _ -> rb_eq a b)
   else false
 
@@ -27832,6 +27918,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
       || str_eq name "%" || str_eq name "remainder")
      && (is_num recv || is_cpx recv)
      && (match args with Cons (a0, Nil) -> num_is_zero a0 | _ -> false) then
+    prim_raise "ZeroDivisionError" "divided by 0"
+  // ...and pow's SECOND argument is a divisor as well: `2.pow(3, 0)` reached a
+  // machine division by zero inside int_pow_mod, so it refused -- but as a
+  // bare internal failure rather than by name.
+  else if str_eq name "pow" && is_num recv
+          && (match args with Cons (_, Cons (m0, _)) -> num_is_zero m0 | _ -> false) then
     prim_raise "ZeroDivisionError" "divided by 0"
   else if (str_eq name "div" || str_eq name "divmod")
           && is_num recv
@@ -29125,6 +29217,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
               | Cons (_, Cons (m9, _)) -> (match m9 with VInt _ -> false | VBig _ -> false | _ -> true)
               | _ -> false) then
     prim_raise "TypeError" "Integer#pow() 2nd argument not allowed unless all arguments are integers"
+  // ...and the modular form has no answer for a negative exponent: there is no
+  // integer reciprocal to reduce. `2.pow(-5)` is the exact Rational 1/32, so
+  // the refusal is about the PAIR of arguments, not about the exponent alone.
+  else if str_eq name "pow" && is_num recv
+          && (match args with
+              | Cons (e9, Cons (_, _)) -> num_isneg e9
+              | _ -> false) then
+    prim_raise "RangeError" "Integer#pow() 1st argument cannot be negative when 2nd argument specified"
   else if str_eq name "pow" then
     (match recv with VInt b -> (match args with Cons (VInt e, Cons (VInt m, _)) -> VInt (int_pow_mod b e m) | Cons (VInt e, _) -> arith_bin "**" recv (VInt e) | _ -> VInt b)
      // a bignum base: the exact power, and the modular form through the same
@@ -29167,6 +29267,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      // ruby coerces through Float(), so a String that is not a
                      // number is an ArgumentError and anything else a TypeError
                      else coerce_refuse o)
+        // Complex#coerce answers two COMPLEXES: the point of coercing is that
+        // both sides end up alike, and handing back a bare Integer breaks the
+        // contract every caller of the protocol relies on (`[3, (1+2i)]` where
+        // ruby says `[(3+0i), (1+2i)]`). The other side keeps its own class
+        // inside the complex: 3 becomes (3+0i) and 3.5 becomes (3.5+0i).
+        | VCpx (_, _) ->
+          (if is_num o || is_cpx o
+           then arr_new (Cons ((match o with VCpx (_, _) -> o | _ -> VCpx (o, VInt 0)), Cons (recv, Nil)))
+           // ...and it refuses in the RECEIVER's terms: a Complex does not
+           // coerce through Float(), so the message names Complex and not the
+           // unparsable string Float() was handed.
+           else prim_raise "TypeError" (cmp_type_name o ++ " can't be coerced into Complex"))
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if str_eq name "zero?" then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
@@ -29262,10 +29374,25 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "nan?" then
     (match recv with VFlt f -> VBool (if f == f then false else true)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "nan?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nan?'")) in fail "mere-ruby: undefined method 'nan?'")))
+  // ⚠ Every numeric shape answers these, and the catch-all said `false` --
+  // which for #finite? is not "unknown", it is "this number is infinite".
+  // `(2**70).finite?`, `Rational(1,2).finite?` and `Complex(1,2).finite?` were
+  // all false: a plain wrong answer about the most ordinary input each has.
+  // A COMPLEX is finite when both parts are, and infinite when either is (with
+  // no sign: ruby answers 1 for `Complex(-Float::INFINITY, 0).infinite?`).
   else if str_eq name "infinite?" then
-    (match recv with VFlt f -> (if (if f == f then false else true) then VNil else if (if f == 0.0 then false else true) && f * 0.5 == f then VInt (if f > 0.0 then 1 else 0 - 1) else VNil) | _ -> VNil)
+    (match recv with
+     | VFlt f -> (if flt_is_nan f then VNil else if flt_is_inf f then VInt (if f > 0.0 then 1 else 0 - 1) else VNil)
+     | VCpx (cr, ci) -> (if num_part_inf cr || num_part_inf ci then VInt 1 else VNil)
+     | _ -> VNil)
   else if str_eq name "finite?" then
-    (match recv with VFlt f -> VBool (if (if f == f then false else true) then false else if (if f == 0.0 then false else true) && f * 0.5 == f then false else true) | VInt _ -> VBool true | _ -> VBool false)
+    (match recv with
+     | VFlt f -> VBool (if flt_is_nan f then false else if flt_is_inf f then false else true)
+     | VInt _ -> VBool true
+     | VBig _ -> VBool true
+     | VRat (_, _) -> VBool true
+     | VCpx (cr, ci) -> VBool (num_part_finite cr && num_part_finite ci)
+     | _ -> VBool false)
   else if str_eq name "floor" then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (floor_div n m * m)) | _ -> VInt n)
@@ -29385,7 +29512,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // Complex#to_r: only a complex with an exact zero imaginary part has one.
     // It had none at all, so Rational(Complex(1,2)) could not refuse.
     | VCpx (cre, cim) ->
-      (if exact_zero_val cim
+      // ...and a Float zero counts: `Complex(1, 0.0).to_r` is (1/1) in ruby.
+      // exact_zero_val says no to 0.0, and Complex#to_f right beside this one
+      // says yes -- one question, two answers, so the pair disagreed about the
+      // same number.
+      (if cpx_zero_im cim
        then (match cre with
              | VRat (n9, d9) -> VRat (n9, d9) | VInt n9 -> mk_rat n9 1 | VBig b9 -> mk_rat_s b9 "1"
              | VFlt f9 -> (match flt_rat_parts f9 0 with (n9, d9) -> mk_rat_s n9 d9)
@@ -39112,6 +39243,20 @@ and arr_grep = fn world -> fn (xs: Val list) -> fn (pat: Val) -> fn (inv: bool) 
     if (if inv then (if hit then false else true) else hit)
     then Cons (h, arr_grep world t pat inv)
     else arr_grep world t pat inv
+// grep / grep_v WITH a block: the test and the yield for one element happen
+// together, so `$~` is that element's own match when the block runs.
+and arr_grep_map = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (pat: Val) -> fn (inv: bool) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> FNext (arr_new (val_rev acc Nil))
+  | Cons (h, t) ->
+    (let hit = case_eqq world pat h in
+     if (if inv then (if hit then false else true) else hit) then
+       (match run_block world encl theblk (Cons (h, Nil)) with
+        | FBreak v -> FBreak v
+        | FReturn v -> FReturn v
+        | FRaise v -> FRaise v
+        | fl -> arr_grep_map world encl theblk t pat inv (Cons (flow_value fl, acc)))
+     else arr_grep_map world encl theblk t pat inv acc)
 and arr_count_eqq = fn world -> fn (xs: Val list) -> fn (pat: Val) -> fn (acc: int) ->
   match xs with
   | Nil -> acc
@@ -46584,6 +46729,65 @@ let core_prelude_d =
   "    EWOULDBLOCKWaitWritable = Class.new(Errno::EWOULDBLOCK) do\n" ++
   "      include WaitWritable\n" ++
   "    end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // ⚠ slice_before / slice_after were in the LIST this interpreter uses to
+  // decide whether a name exists, with nothing behind them -- so the name was
+  // claimed and every call, block form included, was a NoMethodError. Written
+  // here over #each, which is the only thing they need, so Array, Hash, Range
+  // and every `include Enumerable` class get one implementation between them.
+  //
+  // The two refuse DIFFERENTLY when given both a pattern and a block, which is
+  // ruby's wording and not a slip: slice_before reports the argument count and
+  // slice_after says "both pattern and block are given".
+  "module Enumerable\n" ++
+  "  def slice_before(*args, &blk)\n" ++
+  "    if args.size > 1\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1)\"\n" ++
+  "    elsif args.size > 0 && blk\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 0)\"\n" ++
+  "    elsif args.size == 0 && blk.nil?\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given 0, expected 1)\"\n" ++
+  "    end\n" ++
+  "    pat = args[0]\n" ++
+  "    out = []\n" ++
+  "    cur = nil\n" ++
+  "    each do |x|\n" ++
+  "      hit = blk ? blk.call(x) : (pat === x)\n" ++
+  "      if cur.nil?\n" ++
+  "        cur = [x]\n" ++
+  "      elsif hit\n" ++
+  "        out << cur\n" ++
+  "        cur = [x]\n" ++
+  "      else\n" ++
+  "        cur << x\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    out << cur unless cur.nil?\n" ++
+  "    out.each\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def slice_after(*args, &blk)\n" ++
+  "    if args.size > 1\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1)\"\n" ++
+  "    elsif args.size > 0 && blk\n" ++
+  "      raise ArgumentError, \"both pattern and block are given\"\n" ++
+  "    elsif args.size == 0 && blk.nil?\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given 0, expected 1)\"\n" ++
+  "    end\n" ++
+  "    pat = args[0]\n" ++
+  "    out = []\n" ++
+  "    cur = []\n" ++
+  "    each do |x|\n" ++
+  "      cur << x\n" ++
+  "      hit = blk ? blk.call(x) : (pat === x)\n" ++
+  "      if hit\n" ++
+  "        out << cur\n" ++
+  "        cur = []\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    out << cur unless cur.empty?\n" ++
+  "    out.each\n" ++
   "  end\n" ++
   "end\n";
 

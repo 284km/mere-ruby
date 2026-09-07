@@ -126,6 +126,25 @@ Everything else about the report matches: `detailed_message`, both `highlight:`
 forms, `order: :top` and `order: :bottom`, and the numbering the bottom order
 uses. One example in `core/exception/full_message_spec`.
 
+## `Enumerable#chunk` ignores the reserved `:_separator` / `:_alone` keys
+
+```ruby
+[1,2,3].chunk { |x| x == 2 ? :_separator : x }
+#   ruby:      [[1, [1]], [3, [3]]]                    -- the element is DROPPED
+#   mere-ruby: [[1, [1]], [:_separator, [2]], [3, [3]]]
+[1,2].chunk { |x| x == 1 ? nil : x }
+#   ruby: [[2, [2]]]   mere-ruby: [[nil, [1]], [2, [2]]]
+[1].chunk { |x| :_zzz }
+#   ruby: RuntimeError "symbols beginning with an underscore are reserved"
+```
+
+`chunk` groups adjacent elements by the block's key, and ruby gives three keys
+a special meaning: `nil` and `:_separator` drop the element, `:_alone` puts it
+in a chunk of its own, and any other symbol starting with `_` is refused.
+mere-ruby treats all of them as ordinary keys, so the dropped elements come
+back. `chunk_go` accumulates in one pass and would need restructuring to flush
+a chunk without emitting the element; one spec file turns on it.
+
 ## `Symbol.all_symbols` is not implemented
 
 ```ruby
@@ -138,19 +157,6 @@ referenced in source code but not yet executed"* -- so the LEXER would have to
 record every symbol literal it reads, not just the ones `to_sym` builds. A
 partial answer (the symbols this run has created) would still fail that
 example, so there is nothing to gain by half-implementing it.
-
-## `x.pow(e, 0)` fails without naming ZeroDivisionError
-
-```ruby
-2.pow(3, 0)   # ruby: ZeroDivisionError   mere-ruby: StandardError "(ruby exception raised)"
-```
-
-The zero-divisor refusal covers `div` / `divmod` / `modulo` / `%` /
-`remainder`, and pow's MODULUS is a divisor too -- `int_pow_mod` reaches a
-machine division by zero instead. It refuses, so nothing computes with a made-up
-number, but it refuses in the wrong words. One guard beside the others closes
-it; it is recorded here rather than fixed because the measurement above was
-taken with the binary as it stands.
 
 ## `Regexp#to_s` does not fold an inline-option group into the outer one
 
@@ -2671,3 +2677,21 @@ fix, and core/range/clone_spec and dup_spec are the two files it costs.
 `{Time.utc(1970) => 1}[Time.utc(1970)]` is nil: Hash lookup uses `eql?` and
 `hash`, and Time's are still identity. Same family as `Time#inspect` and
 `#strftime`: the Time stub, not Range.
+
+## Adding a statement to a prelude method can OOM the interpreter at startup
+
+The prelude is parsed and evaluated at every startup, and the parser walks a
+statement list by NON-TAIL recursion (see PAIN.md §M9). Adding one `if` to each
+of two prelude methods -- six lines of Ruby -- was enough to turn `p 1` into a
+SIGKILL: the walk commits the whole 512 MB stack the build asks for and the
+kernel takes the process before any `SystemStackError` can be raised. Folding
+the same three refusals into ONE `if/elsif/elsif` (same behaviour, one
+statement instead of three) fits again.
+
+That means the prelude is sitting AT a cliff, not near one, and the next two
+lines added to it may not fit either. There is no gate for this: the symptom is
+"every program produces no output", which no scoreboard row expresses, so it
+has to be noticed by running the interpreter once after touching the prelude.
+The fix is the one PAIN.md already names -- a tail-recursive (or explicitly
+stacked) statement walk -- and until then a prelude change is measured by
+whether `mere-ruby -e 'p 1'` still prints.

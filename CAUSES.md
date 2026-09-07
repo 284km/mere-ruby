@@ -10,46 +10,43 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 234 files.
+Classified: 224 files.
 
-## DIFF — 234 files, 89 kinds
+## DIFF — 224 files, 89 kinds
 
 | files | kind |
 |---|---|
-| 25 | `ERROR NoMethodError` |
+| 23 | `ERROR NoMethodError` |
 | 12 | `FAILED expected N, got N` |
 | 11 | `FAILED expected TypeError to be raised` |
-| 10 | `FAILED expected false, got true` |
 | 10 | `FAILED expected ArgumentError to be raised` |
 | 10 | `ERROR NameError` |
 | 9 | `FAILED expected true, got false` |
 | 9 | `FAILED expected to be identical` |
-| 9 | `FAILED expected "S", got "S"` |
-| 6 | `FAILED expected N, got nil` |
+| 9 | `FAILED expected false, got true` |
+| 8 | `FAILED expected "S", got "S"` |
 | 6 | `ERROR TypeError` |
 | 5 | `ERROR ArgumentError` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED expected NameError to be raised` |
+| 4 | `FAILED expected N, got nil` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
+| 3 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected "S" to match` |
-| 3 | `ERROR RangeError` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
-| 2 | `FAILED expected nil, got #<OBJ>` |
 | 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 2 | `FAILED expected LocalJumpError to be raised` |
-| 2 | `ERROR StandardError` |
 | 2 | `ERROR RuntimeError` |
+| 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
-| 1 | `FAILED raised StandardError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NoMethodError, expected FrozenError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
@@ -59,20 +56,22 @@ Classified: 234 files.
 | 1 | `FAILED expected {N => N}, got {}` |
 | 1 | `FAILED expected {...}, got {...}` |
 | 1 | `FAILED expected truthy from #start_with?` |
-| 1 | `FAILED expected truthy from #finite?` |
 | 1 | `FAILED expected truthy from #>` |
 | 1 | `FAILED expected truthy from #<=` |
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected nil, got false` |
+| 1 | `FAILED expected nil, got #<OBJ>` |
 | 1 | `FAILED expected falsy from #start_with?` |
 | 1 | `FAILED expected a Integer, got N` |
-| 1 | `FAILED expected a Complex, got N` |
+| 1 | `FAILED expected [[[N, N]], [[N, N, N], [N, N, N, N]]], got [[N, N, N]]` |
+| 1 | `FAILED expected [[[N, N], [N, N, N]], [[N, N, N, N]]], got [[N, N, N]]` |
 | 1 | `FAILED expected [[N, [N]], [N, [N, N]], [N, [N]]], got [[N, [N]], [:SYM, [N]], [N, [N, N]], [:SYM, [N]], [N, [N]]]` |
 | 1 | `FAILED expected [[:SYM]], got []` |
 | 1 | `FAILED expected [[:SYM], [:SYM]], got [[:SYM, :SYM], [:SYM, :SYM]]` |
 | 1 | `FAILED expected [N], got [N]` |
+| 1 | `FAILED expected [N, N], got [(N+Ni), (N+Ni)]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
@@ -104,6 +103,7 @@ Classified: 234 files.
 | 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
+| 1 | `ERROR StandardError` |
 | 1 | `ERROR Errno::ENOENT` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
@@ -128,7 +128,6 @@ Classified: 234 files.
 | 2 | `FAILED: expected LocalJumpError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
-| 2 | `ERROR: when given an argument and no block doesn't yield an empty array if the filter matches the first entry or the last entry: NoMethodError` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=4 fail=2 err=7` |
 | 1 | `pass=16 fail=0 err=0` |
@@ -142,14 +141,15 @@ Classified: 234 files.
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
-| 1 | `FAILED: sets $~ in the block: expected nil, got #<MatchData "e">` |
-| 1 | `FAILED: sets $~ in the block: expected "b", got nil` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 | 1 | `FAILED: returns true if the Regexp was created with the Regexp::FIXEDENCODING option: expected true, got false` |
-| 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
 | 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
+| 1 | `FAILED: returns true for any truthy value, not just for true: expected true, got false` |
+| 1 | `FAILED: returns the status of the lock: expected false, got true` |
+| 1 | `FAILED: returns the remainder of dividing self by other: expected (2/1), got 0.0` |
+| 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
 
 </details>
 
@@ -163,9 +163,9 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | kernel (7) | `binding eval lambda loop method select test` |
-| enumerable (6) | `inject one slice_after slice_before to_h zip` |
 | unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
+| enumerable (4) | `inject one to_h zip` |
 | method (3) | `original_name super_method to_proc` |
 | exception (3) | `backtrace_locations backtrace exception` |
 | struct (2) | `deconstruct initialize` |
