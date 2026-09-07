@@ -10,44 +10,42 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 258 files.
+Classified: 245 files.
 
-## DIFF — 258 files, 93 kinds
+## DIFF — 245 files, 89 kinds
 
 | files | kind |
 |---|---|
 | 26 | `ERROR NoMethodError` |
-| 16 | `FAILED expected N, got N` |
-| 11 | `FAILED expected to be identical` |
-| 11 | `FAILED expected TypeError to be raised` |
+| 13 | `FAILED expected TypeError to be raised` |
+| 12 | `FAILED expected N, got N` |
 | 10 | `FAILED expected true, got false` |
+| 10 | `FAILED expected to be identical` |
 | 10 | `FAILED expected ArgumentError to be raised` |
 | 10 | `FAILED expected "S", got "S"` |
 | 10 | `ERROR NameError` |
 | 9 | `FAILED expected false, got true` |
-| 8 | `ERROR ArgumentError` |
 | 7 | `FAILED expected ZeroDivisionError to be raised` |
-| 7 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 5 | `FAILED expected N, got nil` |
+| 6 | `FAILED expected N, got nil` |
+| 6 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 5 | `ERROR ArgumentError` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED expected nil, got "S"` |
 | 4 | `FAILED expected NameError to be raised` |
 | 4 | `FAILED expected "S", got nil` |
-| 4 | `ERROR RangeError` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected NoMethodError to be raised` |
 | 3 | `FAILED expected "S" to match` |
 | 3 | `ERROR TypeError` |
+| 3 | `ERROR RangeError` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
-| 2 | `FAILED matcher did not match #<OBJ>` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected nil, got #<OBJ>` |
 | 2 | `FAILED expected falsy from #include?` |
 | 2 | `FAILED expected ThreadError to be raised` |
-| 2 | `FAILED expected RangeError to be raised` |
-| 2 | `FAILED expected N, got NaN` |
+| 2 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 2 | `FAILED expected LocalJumpError to be raised` |
 | 2 | `ERROR StandardError` |
 | 2 | `ERROR RuntimeError` |
@@ -57,7 +55,7 @@ Classified: 258 files.
 | 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
 | 1 | `FAILED raised ArgumentError, expected IndexError` |
-| 1 | `FAILED matcher did not match N` |
+| 1 | `FAILED matcher did not match #<OBJ>` |
 | 1 | `FAILED expected {N => N}, got {}` |
 | 1 | `FAILED expected {...}, got {...}` |
 | 1 | `FAILED expected truthy from #start_with?` |
@@ -72,9 +70,9 @@ Classified: 258 files.
 | 1 | `FAILED expected falsy from #start_with?` |
 | 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Complex, got N` |
-| 1 | `FAILED expected [], got [[:SYM, :"S"]]` |
 | 1 | `FAILED expected [], got [:@make, :@model, :@year]` |
 | 1 | `FAILED expected [[N, [N]], [N, [N, N]], [N, [N]]], got [[N, [N]], [:SYM, [N]], [N, [N, N]], [:SYM, [N]], [N, [N]]]` |
+| 1 | `FAILED expected [[:SYM]], got []` |
 | 1 | `FAILED expected [N], got [N]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N, N, N]` |
@@ -84,16 +82,14 @@ Classified: 258 files.
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
+| 1 | `FAILED expected RangeError to be raised` |
+| 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
-| 1 | `FAILED expected N ...[clipped]` |
-| 1 | `FAILED expected MethodSpecs::Methods, got Object` |
-| 1 | `FAILED expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
-| 1 | `FAILED expected /(p(a)t[e]rn)/, got nil` |
 | 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
@@ -114,16 +110,16 @@ Classified: 258 files.
 
 | files | cause |
 |---|---|
-| 11 | `FAILED: expected TypeError to be raised` |
+| 13 | `FAILED: expected TypeError to be raised` |
 | 10 | `FAILED: expected ArgumentError to be raised` |
 | 7 | `FAILED: expected ZeroDivisionError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
 | 4 | `FAILED: expected NameError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected NoMethodError to be raised` |
-| 3 | `ERROR: bignum dispatches the correct operator after coercion: ArgumentError` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
+| 2 | `FAILED: returns the class on which public was called for a private method in ancestor: expected MethodSpecs::InheritedMethods::C, got MethodSpecs::InheritedMethods::B` |
 | 2 | `FAILED: returns self: expected to be identical` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
@@ -131,7 +127,6 @@ Classified: 258 files.
 | 2 | `FAILED: is a private method only when -n is passed: expected falsy from #include?` |
 | 2 | `FAILED: includes Comparable: expected true, got false` |
 | 2 | `FAILED: expected ThreadError to be raised` |
-| 2 | `FAILED: expected RangeError to be raised` |
 | 2 | `FAILED: expected LocalJumpError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
@@ -144,16 +139,17 @@ Classified: 258 files.
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: uses class name when receiver has a singleton class: expected "undefined method 'bar' for an instance of NoMethodErrorSpecs::NoMethodErrorA" to match` |
-| 1 | `FAILED: tries to coerce the argument by calling #to_regexp: expected /(p(a)t[e]rn)/, got nil` |
+| 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
-| 1 | `FAILED: sets the encoding of the result to BINARY if any non-US-ASCII characters are present in an input String with invalid encoding: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: sets $~ in the block: expected nil, got #<MatchData "e">` |
 | 1 | `FAILED: sets $~ in the block: expected "b", got nil` |
-| 1 | `FAILED: sends #to_int to the argument and raises TypeError if it's not a kind of Integer: matcher did not match #<Proc>` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
+| 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
+| 1 | `FAILED: returns true if the Regexp was created with the Regexp::FIXEDENCODING option: expected true, got false` |
+| 1 | `FAILED: returns true if magnitude is finite: expected truthy from #finite?` |
 
 </details>
 

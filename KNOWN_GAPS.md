@@ -126,6 +126,20 @@ Everything else about the report matches: `detailed_message`, both `highlight:`
 forms, `order: :top` and `order: :bottom`, and the numbering the bottom order
 uses. One example in `core/exception/full_message_spec`.
 
+## `Regexp#to_s` does not fold an inline-option group into the outer one
+
+```ruby
+/(?i:a)/.to_s   # ruby: "(?i-mx:a)"   mere-ruby: "(?-mix:(?i:a))"
+/(?i)a/.to_s    # ruby: "(?i-mx:a)"   mere-ruby: "(?-mix:(?i)a)"
+```
+
+`Regexp#to_s` writes the pattern wrapped in a group that states its options.
+When the whole pattern is ITSELF an option group with the same options, ruby
+prints one group rather than two nested ones -- it reads the inline `(?i)` /
+`(?i:...)` and lifts it into the wrapper. mere-ruby keeps the source as written
+and wraps it, so the result matches on the same strings but is not the same
+text. One example in `core/regexp/to_s_spec`.
+
 ## Anonymous arguments can be DECLARED but not FORWARDED
 
 ```ruby
