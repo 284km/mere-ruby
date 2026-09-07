@@ -126,6 +126,14 @@ end
 
 rows = []
 brows = []
+# ⚠ A third table, because #arity is a DIFFERENT QUESTION from the bounds. The
+# bounds say what a call may pass; #arity reports what the method DECLARED, and
+# for a C function declared variadic that is -1 however narrow the bounds are:
+# `String#sub` accepts exactly two arguments without a block and answers -1,
+# while `String#size` accepts none and answers 0. Deriving one from the other
+# gets the fixed-arity names right and every variadic one wrong -- so this asks
+# ruby the question it is being asked, and nothing is inferred.
+arows = []
 SAMPLES.each do |cn, factory|
   begin
     klass = Object.const_get(cn)
@@ -149,10 +157,17 @@ SAMPLES.each do |cn, factory|
     # one refuses a call ruby runs.
     blk = bounds(factory, name, true)
     brows << "#{cn}##{s}:#{blk[0]}:#{blk[1]}" if blk
+    # #arity is READ, not probed: the method object knows it, and no call runs.
+    begin
+      arows << "#{cn}##{s}:#{klass.instance_method(name).arity}"
+    rescue NameError, TypeError
+    end
   end
 end
 rows.uniq!
 brows.uniq!
-warn "#{rows.size} plain rows, #{brows.size} block rows from #{SAMPLES.size} classes"
+arows.uniq!
+warn "#{rows.size} plain rows, #{brows.size} block rows, #{arows.size} arity rows from #{SAMPLES.size} classes"
 puts "let arity_raw = \"#{rows.join(",")}\";"
 puts "let arity_blk_raw = \"#{brows.join(",")}\";"
+puts "let arity_num_raw = \"#{arows.join(",")}\";"

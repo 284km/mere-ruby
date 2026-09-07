@@ -86,16 +86,78 @@ which a subprocess dump does not show.
 `_` is dropped (its value is always the dump command itself); the other two
 cannot be told from a variable the parent really passed.
 
+The dump itself is now NUL-framed (`env -0`), so a VALUE containing a newline
+survives it. It did not before: `env` alone separates records with a newline,
+which is a legal byte inside a value, and `MULTI=$'a\nB=evil'` came back both
+truncated to `"a"` AND as a second variable `B` that nothing had set. Where
+`env` has no `-0` the old line split still runs, ambiguity and all.
+
 **What it costs.** Five `core/env` spec files (`keys`, `values`, `to_a`,
 `each_key`, `each_value`) count one expectation per ENV key, so the two sides
-disagree on the COUNT while every example passes. They are recorded as DIFF
-with `pass=N fail=0 err=0`, which is what that shape looks like.
+disagree on the COUNT while every example passes -- the DIFF shape
+`pass=N fail=0 err=0`. Worse, WHICH five depended on the machine's own
+environment. `mspec/run_spec.sh` now names all three of these (`PWD`, `SHLVL`,
+`__CF_USER_TEXT_ENCODING`) in the environment it builds for both sides, so the
+key SETS agree and the gate stops measuring the platform. Their values still
+differ -- mere-ruby's shell overwrites PWD and SHLVL with its own -- and no
+spec reads them. This equalises the noise; it does not close the gap below.
 
 **What fixing it would take.** Reading the process's own `environ` instead of a
 subprocess's -- which needs a runtime binding this interpreter does not have:
 an `extern fn` that answers a `str` hands back a raw C pointer, and there is no
 byte reader to walk it with. One new primitive in the Mere runtime (`environ`
 as a length-prefixed dump) closes it.
+
+## `Exception#full_message` shows no frame when the exception was never raised
+
+```ruby
+e = RuntimeError.new("boom")
+e.backtrace                     # nil, on both
+e.full_message(highlight: false)
+#   ruby:      "prog.rb:3:in '<main>': boom (RuntimeError)\n"
+#   mere-ruby: "boom (RuntimeError)\n"
+```
+
+Ruby falls back to the CALLER when an exception carries no backtrace of its
+own, so the report still names a frame. mere-ruby captures a call stack only at
+a raise (`raise_bt`), and an exception that was merely constructed has none to
+fall back to -- the message and class are right, the frame line is absent.
+Everything else about the report matches: `detailed_message`, both `highlight:`
+forms, `order: :top` and `order: :bottom`, and the numbering the bottom order
+uses. One example in `core/exception/full_message_spec`.
+
+## Anonymous arguments can be DECLARED but not FORWARDED
+
+```ruby
+def m(*); end          # parses and binds
+def m(**); end         # parses and binds
+def m(&); end          # parses and binds
+def outer(*); inner(*); end     # mere-ruby: parse error at `)`
+def outer(**); inner(**); end   # mere-ruby: parse error at `)`
+```
+
+The parameter side of ruby 3.2's anonymous arguments works: a bare `*`, `**`
+or `&` gets a hidden name and binds like a named one (`__anonkw` for `**`, the
+way `__anonblk` already worked for `&`). The CALL side does not: `inner(*)`
+needs the argument parser to read a `*` followed by `)` or `,` as "splat the
+anonymous rest", and it reads it as a splat with a missing operand. A parse
+error takes the whole FILE, so this shows up as `language/delegation_spec`
+failing entirely rather than as one example. `def m(...)` -- the older, more
+common delegation form -- forwards correctly.
+
+## Reflection cannot ENUMERATE a builtin class's methods
+
+```ruby
+String.instance_method(:size)              # works
+String.public_instance_methods(false).size # mere-ruby: small   ruby: ~180
+```
+
+Asking whether a builtin class has a NAME is answered (`builtin_has_meth`, and
+now from the same predicates the dispatcher uses). Asking it to LIST them is
+not: the per-class surfaces are written as predicates (`is_str_method` and
+friends), and a predicate cannot be enumerated. The ARITY_TABLE is not a
+substitute -- by construction it has no row for a method that accepts nine
+arguments, so it is a lower bound on the names, not the set.
 
 ## A Struct keeps its members as instance variables, and reflection sees them
 

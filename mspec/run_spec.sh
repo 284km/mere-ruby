@@ -83,8 +83,22 @@ out_cap=2000000
 # Both sides get the SAME environment, so the comparison stays fair. The list
 # is what the two interpreters need to start and find their stdlib, plus a
 # fixed locale (the record must not depend on the operator's).
+# ⚠ The three names at the end are PLATFORM NOISE, not environment: each side
+# gets one or two variables it did not ask for, and ENV's specs count keys.
+#   - mere-ruby reads the environment by running env(1) through a shell, and
+#     the shell exports its own PWD and SHLVL to it (see KNOWN_GAPS).
+#   - ruby links CoreFoundation, which puts __CF_USER_TEXT_ENCODING into its
+#     process's environ before main runs.
+# Neither is about the subject under test, and `env -i` was handing the two
+# sides different key SETS -- five core/env files were DIFF for that alone, and
+# which five depended on the machine. Naming all three here gives both sides
+# the same keys. Their VALUES still differ (mere-ruby's shell overwrites PWD
+# and SHLVL with its own), which no spec reads.
 spec_env() {
   env -i \
+    PWD="${PWD}" \
+    SHLVL="${SHLVL:-1}" \
+    __CF_USER_TEXT_ENCODING="${__CF_USER_TEXT_ENCODING:-0x0:0x0:0x0}" \
     PATH="$PATH" \
     HOME="$HOME" \
     TMPDIR="${TMPDIR:-/tmp}" \
