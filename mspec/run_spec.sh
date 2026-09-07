@@ -110,6 +110,7 @@ spec_env() {
     ${GEM_PATH:+GEM_PATH="$GEM_PATH"} \
     ${RUBYOPT:+RUBYOPT="$RUBYOPT"} \
     ${RUBYLIB:+RUBYLIB="$RUBYLIB"} \
+    ${MERE_SPEC_VERBOSE:+MERE_SPEC_VERBOSE="$MERE_SPEC_VERBOSE"} \
     "$@"
 }
 out_m="$({ spec_env perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"

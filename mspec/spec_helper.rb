@@ -224,7 +224,13 @@ def it(desc, *opts, &blk)
     # already tallied
   rescue Exception => e
     $mspec_err += 1
-    puts "ERROR: #{$mspec_desc} #{desc}: #{e.class}"
+    # The CLASS only: the message would make this record compare two error
+    # texts rather than two behaviours, and they differ for reasons the record
+    # already names elsewhere. MERE_SPEC_VERBOSE prints it for debugging, and
+    # is off in every gate -- an ERROR line is the start of an investigation
+    # and "which NoMethodError" is the first thing it needs.
+    puts "ERROR: #{$mspec_desc} #{desc}: #{e.class}" +
+         (ENV["MERE_SPEC_VERBOSE"] ? " -- #{e.message}" : "")
   end
 end
 

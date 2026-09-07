@@ -10,38 +10,37 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 197 files.
+Classified: 192 files.
 
-## DIFF — 197 files, 83 kinds
+## DIFF — 192 files, 86 kinds
 
 | files | kind |
 |---|---|
-| 25 | `ERROR NoMethodError` |
+| 20 | `ERROR NoMethodError` |
 | 11 | `FAILED expected TypeError to be raised` |
-| 11 | `ERROR NameError` |
+| 10 | `FAILED expected N, got N` |
+| 10 | `ERROR NameError` |
 | 9 | `FAILED expected to be identical` |
-| 9 | `FAILED expected N, got N` |
 | 7 | `FAILED expected true, got false` |
 | 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected "S", got "S"` |
-| 6 | `ERROR TypeError` |
-| 5 | `FAILED expected truthy from #include?` |
+| 5 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 5 | `ERROR TypeError` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
+| 4 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED expected ArgumentError to be raised` |
-| 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 4 | `FAILED expected "S" to match` |
+| 3 | `pass=N fail=N err=N` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected "S", got nil` |
-| 3 | `ERROR ArgumentError` |
-| 2 | `pass=N fail=N err=N` |
+| 3 | `FAILED expected "S" to match` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
-| 2 | `FAILED expected :SYM, got nil` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
+| 2 | `ERROR ArgumentError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NoMethodError, expected FrozenError` |
@@ -60,6 +59,7 @@ Classified: 197 files.
 | 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
+| 1 | `FAILED expected a Float, got nil` |
 | 1 | `FAILED expected [[[N, N]], [[N, N, N], [N, N, N, N]]], got [[N, N, N]]` |
 | 1 | `FAILED expected [[[N, N], [N, N, N]], [[N, N, N, N]]], got [[N, N, N]]` |
 | 1 | `FAILED expected [[N, [N]], [N, [N, N]], [N, [N]]], got [[N, [N]], [:SYM, [N]], [N, [N, N]], [:SYM, [N]], [N, [N]]]` |
@@ -67,8 +67,8 @@ Classified: 197 files.
 | 1 | `FAILED expected [N], got [N]` |
 | 1 | `FAILED expected [N, N], got [(N+Ni), (N+Ni)]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
-| 1 | `FAILED expected [N, N, N, N, N, N], got [N, N, N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
+| 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
@@ -76,15 +76,18 @@ Classified: 197 files.
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
+| 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
+| 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected (N+Ni), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
+| 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
 | 1 | `FAILED expected "S"localhost\"S"root\"S", got "S"localhost\"S"root\"S"` |
 | 1 | `FAILED expected "S"foo\xAN\"S", got "S"` |
@@ -108,6 +111,7 @@ Classified: 197 files.
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
 | 4 | `FAILED: expected ArgumentError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
+| 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns self: expected to be identical` |
@@ -119,13 +123,14 @@ Classified: 197 files.
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=4 fail=2 err=7` |
-| 1 | `pass=16 fail=0 err=0` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
-| 1 | `FAILED: yields elements to the provided block: expected [6, 5, 4, 3, 2, 1], got [1, 2, 3, 4, 5, 6]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
+| 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: uses class name when receiver has a singleton class: expected "undefined method 'bar' for an instance of NoMethodErrorSpecs::NoMethodErrorA" to match` |
 | 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
+| 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
+| 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
@@ -142,8 +147,6 @@ Classified: 197 files.
 | 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
-| 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
-| 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 
 </details>
 
@@ -156,17 +159,17 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (10) | `binding chomp chop eval lambda loop method select singleton_class test` |
+| kernel (8) | `binding chomp chop eval loop select singleton_class test` |
 | unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
-| enumerable (4) | `inject one to_h zip` |
 | method (3) | `original_name super_method to_proc` |
 | symbol (2) | `all_symbols to_proc` |
 | struct (2) | `deconstruct initialize` |
 | numeric (2) | `integer real` |
-| exception (2) | `backtrace interrupt` |
 | threadgroup (1) | `list` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |
+| exception (1) | `interrupt` |
+| enumerable (1) | `to_h` |
 
 _Generated by `mspec/causes.sh`._

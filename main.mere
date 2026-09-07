@@ -15917,21 +15917,33 @@ and flatten1_w = fn world -> fn (xs: Val list) ->
   | Nil -> Nil
   | Cons (VArr id, t) -> list_append (deref id) (flatten1_w world t)
   | Cons (h, t) ->
-    (match h with
-     | VObj _ ->
-       (if responds world h "to_ary" then
-          (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
-           match invoke_val_c gc_cenv0 world nb9 h "to_ary" Nil false with
-           | VArr aid -> list_append (deref aid) (flatten1_w world t)
-           | VNil -> Cons (h, flatten1_w world t)
-           | other ->
-             (let cn9 = display_cls_msg world (dispatch_cls_of world h) in
-              let _ = raise_exc world "TypeError"
-                        ("can't convert " ++ cn9 ++ " to Array (" ++ cn9 ++ "#to_ary gives "
-                         ++ class_name other ++ ")") in
-              Cons (h, flatten1_w world t)))
-        else Cons (h, flatten1_w world t))
+    (let a9 = flatten1_ary world h in
+     match a9 with
+     | VArr aid -> list_append (deref aid) (flatten1_w world t)
      | _ -> Cons (h, flatten1_w world t))
+
+// #to_ary on an element that is not already an Array: the Array it converts to,
+// or nil, which means "append it as it is" (ruby's rb_check_array_type).
+// Anything ELSE is ruby's TypeError, named after what the conversion gave back.
+// ⚠ Written as its own function on purpose: as a match nested inside the
+//   caller's match, the nil arm was never reached -- the arms after the first
+//   bound to the OUTER match, so every non-Array conversion took the refusal.
+and flatten1_ary = fn world -> fn (h: Val) ->
+  match h with
+  | VObj _ ->
+    (if responds world h "to_ary" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        let r9 = invoke_val_c gc_cenv0 world nb9 h "to_ary" Nil false in
+        if (match r9 with VArr _ -> true | _ -> false) then r9
+        else if rb_eq r9 VNil then VNil
+        else
+          (let cn9 = display_cls_msg world (dispatch_cls_of world h) in
+           let _ = raise_exc world "TypeError"
+                     ("can't convert " ++ cn9 ++ " to Array (" ++ cn9 ++ "#to_ary gives "
+                      ++ class_name r9 ++ ")") in
+           VNil))
+     else VNil)
+  | _ -> VNil
 
 and arr_ifnone = fn world -> fn encl -> fn (args: Val list) ->
   match args with
@@ -15971,6 +15983,20 @@ and arr_find_index = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn
 // is_enum_method, which doubles as "names a bare call may enumerate".
 and enum_arg_iter = fn (name: str) ->
   str_eq name "each_slice" || str_eq name "each_cons" || str_eq name "cycle"
+
+// ⚠ A Hash answers Enumerable over its [k, v] PAIRS, and only the
+//   BLOCK-taking path converted it: `h.min { }` worked and `h.min` was a
+//   NoMethodError, `h.one? { }` worked and `h.one?(pattern)` was not there at
+//   all. These are the names whose blockless (or argument) form was missing --
+//   measured by asking a Hash for every Enumerable name, not guessed. `index`
+//   is NOT among them: ruby has no Hash#index either.
+and hash_enum_delegate = fn (name: str) ->
+  str_eq name "one?" || str_eq name "first" || str_eq name "min" || str_eq name "max" ||
+  str_eq name "minmax" || str_eq name "sum" || str_eq name "tally" || str_eq name "zip" ||
+  str_eq name "uniq" || str_eq name "cycle" || str_eq name "grep" || str_eq name "grep_v" ||
+  str_eq name "take" || str_eq name "drop" || str_eq name "each_slice" ||
+  str_eq name "each_cons" || str_eq name "inject" || str_eq name "reduce" ||
+  str_eq name "find_index"
 
 and enum_collect = fn world -> fn (recv: Val) -> fn (cls: str) ->
   enum_collect_a world recv cls Nil
@@ -16337,6 +16363,13 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        match xs with
        | Nil -> VNil
        | Cons (h0, t0) -> go t0 h0)
+    // ...and #sort with a comparator block, which the Array receiver answers
+    // earlier (in the block section of dispatch_prim) but an ENUMERABLE that
+    // was collected into an array reaches HERE -- so `enum.sort { |a, b| b <=>
+    // a }` dropped its block and answered the natural order.
+    else if str_eq name "sort" then
+      (let (st9, broke9, bv9) = sort_blk_b world theblk xs in
+       if broke9 then bv9 else arr_new st9)
     // minmax with a COMPARATOR block: the ENDS of the list the block sorts.
     // The block was dropped here and the plain minimum and maximum came back,
     // so `[1, 2, 3].minmax { |a, b| b <=> a }` answered [1, 3] -- the answer
@@ -20242,10 +20275,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      let exists = (if str_eq owner "" then
                      (match recv with
                       | VMain -> (let (m9, _, _, _) = world in map_has m9 nm)
-                      | _ -> responds world recv nm || is_binary_op_name nm)
+                      | _ -> responds world recv nm || is_binary_op_name nm
+                             // ⚠ Kernel#method includes the PRIVATE ones, so
+                             //   respond_to_missing? is asked with the flag
+                             //   TRUE: a name the object claims only for a
+                             //   private call (`priv` in the fixture's case
+                             //   statement) is still a Method. `responds` asks
+                             //   with false, which is right for respond_to?
+                             //   and wrong here.
+                             || (let cls9 = dispatch_cls_of world recv in
+                                 has_meth world cls9 "respond_to_missing?"
+                                 && truthy (invoke_val_c gc_cenv0 world
+                                              (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
+                                              recv "respond_to_missing?"
+                                              (Cons (VSym nm, Cons (VBool true, Nil))) false)))
                    else true) in
      if exists then mk_bound_method world recv owner nm
-     else raise_exc world "NameError" ("undefined method '" ++ nm ++ "' for " ++ for_recv_cls world (dispatch_cls_of world recv)))
+     // ...and the refusal names the CLASS ("for class 'C'"), which is the
+     // shape ruby uses for #method -- not the "for an instance of" shape a
+     // failed CALL reports.
+     else raise_exc world "NameError"
+            ("undefined method '" ++ nm ++ "' for class '"
+             ++ display_cls_msg world (dispatch_cls_of world recv) ++ "'"))
   // Object#singleton_method(name): the method only if it is defined on the
   // receiver's OWN singleton (for true/false/nil, `def (false).foo` puts it on
   // FalseClass -- they have no singleton class to put it on), else ruby's
@@ -23335,11 +23386,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Nil -> recv
        | Cons (VNil, _) -> recv
        | Cons (m, _) ->
+         // ⚠ this is a COPY of the receiver with a new message, "without
+         //   reinitializing" (ruby's own words in the spec): every ivar rides
+         //   along. Building a fresh instance and setting only the message and
+         //   the backtrace dropped the state the exception's own initialize had
+         //   put there -- a CustomArgumentError lost its @val.
          (let nid = alloc_oid ocls in
           let _ = map_set ocls (str_of_int nid) cls in
+          let oldp9 = str_of_int id ++ "@" in
+          let newp9 = str_of_int nid ++ "@" in
+          let tmp9 = map_new () in
+          let _ = map_iter ivars (fn (k9: str) -> fn (v9: Val) ->
+                    if str_len k9 > str_len oldp9 && str_eq (substring k9 0 (str_len oldp9)) oldp9
+                    then map_set tmp9 (newp9 ++ substring k9 (str_len oldp9) (str_len k9)) v9
+                    else ()) in
+          let _ = map_iter tmp9 (fn (k9: str) -> fn (v9: Val) -> map_set ivars k9 v9) in
           let _ = map_set ivars (str_of_int nid ++ "@message") m in
-          let _ = (if map_has ivars (str_of_int id ++ "@__bt")
-                   then map_set ivars (str_of_int nid ++ "@__bt") (map_get ivars (str_of_int id ++ "@__bt")) else ()) in
           VObj nid))
     // Numeric#+@ and #-@ are real methods of Numeric, so a SUBCLASS of it
     // inherits them: `+obj` is obj, and `-obj` is `0 - obj`, which goes through
@@ -24574,8 +24636,24 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                        || str_eq name "gsub!" || str_eq name "sub!")
                 then coerce_str_int_args env world args
                 else args) in
+    // ⚠ Kernel#lambda / #proc / #loop reached with a RECEIVER: `send(:lambda)
+    //   { }` inside a method has the enclosing object as its receiver, and this
+    //   path answered "undefined method 'lambda'" -- they were only reachable
+    //   as a bare call with a literal block. Kernel's methods belong to every
+    //   object, however the call is spelled.
+    if (str_eq name "proc" || str_eq name "lambda")
+       && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
+       && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+      (let id9 = map_len proc_store in
+       let _ = store_proc (str_of_int id9) newblk in
+       let _ = (if str_eq name "lambda" then map_set lambda_ids (str_of_int id9) VNil else ()) in
+       VProc id9)
+    else if str_eq name "loop"
+            && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
+            && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+      run_loop_builtin env world blk newblk
     // Object#then / yield_self: run the block with the receiver.
-    if str_eq name "then" || str_eq name "yield_self" then
+    else if str_eq name "then" || str_eq name "yield_self" then
       flow_value (run_block world blk newblk (Cons (recv, Nil)))
     // Object#tap: run the block with the receiver, then return the receiver.
     else if str_eq name "tap" then
@@ -25427,6 +25505,22 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                let _ = rb_scan_lastpub world (rx_escape (sget p)) "" s in recv
              | _ -> builtin_iter world blk newblk recv name args)
           | _ -> recv)
+       // ⚠ `send(:lambda) { }` / `send(:proc) { }` / `send(:loop) { }`: these
+       //   are Kernel methods like any other, and here they were only reachable
+       //   as a BARE call with a literal block (the ECallB path) -- so
+       //   dispatching them by name answered "undefined method 'lambda'". A
+       //   name a program can send is a name this path has to know.
+       else if (str_eq name "proc" || str_eq name "lambda")
+               && (let (m9, _, _, _) = world in
+                   if map_has m9 name then false else true) then
+         (let id9 = map_len proc_store in
+          let _ = store_proc (str_of_int id9) newblk in
+          let _ = (if str_eq name "lambda" then map_set lambda_ids (str_of_int id9) VNil else ()) in
+          VProc id9)
+       else if str_eq name "loop"
+               && (let (m9, _, _, _) = world in
+                   if map_has m9 name then false else true) then
+         run_loop_builtin env world blk newblk
        else builtin_iter world blk newblk recv name args))
 
 // dispatch on a primitive receiver: reopened built-in classes win (class
@@ -26363,6 +26457,18 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
           && (match args with Cons (VObj _, Nil) -> true | _ -> false) then
     invoke_val_c env world blk recv "**" args false
 
+  // Hash's Enumerable surface in the forms that take no block (see
+  // hash_enum_delegate): answered over the pairs, which is what ruby answers.
+  else if (match recv with VHsh _ -> true | _ -> false) && hash_enum_delegate name then
+    (match recv with
+     | VHsh h9 ->
+       // ...and the names whose blockless form is an ENUMERATOR keep the HASH
+       // as its receiver: that is what ruby prints, and asking that enumerator
+       // again WITH a block lands on the hash's own iterator.
+       (if enum_arg_iter name || str_eq name "find_index"
+        then make_enum_a world recv name args
+        else invoke_val_c env world blk (arr_new (hash_to_a (hderef h9))) name args false)
+     | _ -> recv)
   // String#start_with? / #end_with? take SEVERAL patterns and answer true on
   // the first that matches -- and start_with? takes a REGEXP, anchored at the
   // beginning. Only the first argument was read, and only when it was already
@@ -26494,8 +26600,19 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ -> VNil)
   // reduce/inject symbol form (no block): `[1,2,3].reduce(:+)` /
   // `.inject(init, :*)`. The block form is handled in invoke_with_block.
+  // ⚠ the operator may be a STRING: `[1, 2].inject(10, "-")` is ruby's, and
+  //   ruby converts it (to_str, then to_sym). Only a Symbol was matched, so
+  //   the String form fell through to the leaf and came back "undefined method
+  //   'inject' for an instance of Array" -- the method reported missing was
+  //   the one being called.
   else if (str_eq name "reduce" || str_eq name "inject") &&
-          (match args with Cons (VSym _, _) -> true | Cons (_, Cons (VSym _, _)) -> true | _ -> false) then
+          (match args with
+           | Cons (VSym _, _) -> true | Cons (_, Cons (VSym _, _)) -> true
+           | Cons (VStr _, _) -> true | Cons (_, Cons (VStr _, _)) -> true
+           // ...and an OBJECT operator converts through #to_str, which is the
+           // conversion ruby asks for (a to_str-only object names the method).
+           | Cons (VObj _, Nil) -> true | Cons (_, Cons (VObj _, Nil)) -> true
+           | _ -> false) then
     (match recv with
      | VArr id -> reduce_sym env world blk (deref id) args
      | VRange (lo, hi, excl) -> reduce_sym env world blk (range_vals world lo hi excl) args
@@ -29196,10 +29313,22 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // builds its DSLError out of `e.backtrace`). set_backtrace is not here: there
   // is nowhere to store it on this representation, and answering nil afterwards
   // would be a lie rather than a gap.
-  else if str_eq name "backtrace" || str_eq name "backtrace_locations" then
+  else if str_eq name "backtrace" || str_eq name "backtrace_locations"
+          || (str_eq name "set_backtrace" && (match recv with VExc (_, _) -> true | _ -> false)) then
     (match recv with
      | VExc (_, _) ->
-       (if str_eq name "backtrace"
+       (if str_eq name "set_backtrace" then
+          // the pair has no ivars, so its backtrace lives in the slot beside
+          // the last raise -- which is the exception being handled, and the
+          // only one #set_backtrace is ever called on. Answering NoMethodError
+          // meant `raise` (bare) produced an exception that could not be given
+          // one, while `raise SomeError.new` could.
+          (match args with
+           | Cons (v9, _) ->
+             (let _ = map_set raise_bt "e" recv in
+              let _ = map_set raise_bt "eb" v9 in v9)
+           | Nil -> VNil)
+        else if str_eq name "backtrace"
            && map_has raise_bt "eb" && map_has raise_bt "e"
            && rb_eq (map_get raise_bt "e") recv
         then map_get raise_bt "eb"
@@ -32100,6 +32229,26 @@ and reduce_sym = fn env -> fn world -> fn blk -> fn (xs: Val list) -> fn (args: 
   match args with
   | Cons (VSym sym, _) -> (match xs with Nil -> VNil | Cons (h, t) -> reduce_sym_go env world blk t h sym)
   | Cons (init, Cons (VSym sym, _)) -> reduce_sym_go env world blk xs init sym
+  // ...and the same two shapes with the operator written as a String.
+  | Cons (VStr sh, Nil) ->
+    (match xs with Nil -> VNil | Cons (h, t) -> reduce_sym_go env world blk t h (sget sh))
+  | Cons (init, Cons (VStr sh, _)) -> reduce_sym_go env world blk xs init (sget sh)
+  // ...and an object that converts with #to_str names the method too; one that
+  // does not is ruby's TypeError, naming what it could not convert.
+  | Cons (VObj _, Nil) ->
+    (match coerce_str_int_args env world args with
+     | Cons (VStr sh, _) ->
+       (match xs with Nil -> VNil | Cons (h, t) -> reduce_sym_go env world blk t h (sget sh))
+     // ruby names the VALUE here (its inspect), not its class.
+     | _ -> (let _ = raise_exc world "TypeError"
+                       (inspect_w gc_cenv0 world (match args with Cons (a9, _) -> a9 | Nil -> VNil)
+                        ++ " is not a symbol nor a string") in VNil))
+  | Cons (init, Cons (VObj _, Nil)) ->
+    (match coerce_str_int_args env world (Cons (init, Cons ((match args with Cons (_, Cons (o9, _)) -> o9 | _ -> VNil), Nil))) with
+     | Cons (_, Cons (VStr sh, _)) -> reduce_sym_go env world blk xs init (sget sh)
+     | _ -> (let _ = raise_exc world "TypeError"
+                       (inspect_w gc_cenv0 world (match args with Cons (_, Cons (a9, _)) -> a9 | _ -> VNil)
+                        ++ " is not a symbol nor a string") in VNil))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: reduce expects a symbol or block")) in fail "mere-ruby: reduce expects a symbol or block")
 
 and reduce_sym_go = fn env -> fn world -> fn blk -> fn (xs: Val list) -> fn (acc: Val) -> fn (sym: str) ->
@@ -33104,11 +33253,16 @@ and rb_flt_parse = fn (s0: str) ->
       let (fs, i3, hdot) = (if i2 < hi && str_eq (char_at s0 i2) "."
                             then (match rb_flt_digits s0 (i2 + 1) hi true false false "" with (a, b) -> (a, b, true))
                             else ("", i2, false)) in
-      if str_len ds == 0 && str_len fs == 0 then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
-      // ruby's strtod reads a hex FRACTION only together with a p exponent:
-      // "0x0.8" refuses where "0x0.8p1" is 1.0.
-      else if hdot && (if i3 < hi && (str_eq (char_at s0 i3) "p" || str_eq (char_at s0 i3) "P") then false else true)
+      // ⚠ ...unless a DOT was there: ruby answers 0.0 for "0x." (and "0X."),
+      //   with no digits on either side of it. "0x" alone is still refused, so
+      //   the dot is what makes the difference -- strtod's own corner, and this
+      //   record compares against strtod.
+      if str_len ds == 0 && str_len fs == 0 && (if hdot then false else true)
       then (let _ = conv_fail "ArgumentError" ("invalid value for Float(): \"" ++ s0 ++ "\"") in 0.0)
+      // ⚠ ruby 3.2's strtod read a hex FRACTION only together with a p
+      //   exponent ("0x0.8" refused where "0x0.8p1" is 1.0) and this was
+      //   written against that reference; ruby 4 reads it either way, so
+      //   Float("0x0.8") is 0.5.
       else
         let (pexp, i4) =
           (if i3 < hi && (str_eq (char_at s0 i3) "p" || str_eq (char_at s0 i3) "P") then
@@ -33998,9 +34152,16 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
         // the location may arrive as the second argument (an Errno class's
         // `new(msg, loc)`) or the third (`SystemCallError.new(msg, errno,
         // loc)`) -- it is the first String among them either way.
+        // ...and a location that is not a String is PRINTED (ruby to_s's it:
+        // `SystemCallError.new("foo", 1, :sym)` reads "@ sym"), which is why
+        // only a String was recognised and every other kind was dropped.
         let loc = (match rest9 with
                    | Cons (VStr lh, _) -> sget lh
                    | Cons (_, Cons (VStr lh, _)) -> sget lh
+                   | Cons (VInt _, Cons (v9, _)) -> (match v9 with VNil -> "" | _ -> to_s v9)
+                   | Cons (VBig _, Cons (v9, _)) -> (match v9 with VNil -> "" | _ -> to_s v9)
+                   | Cons (VFlt _, Cons (v9, _)) -> (match v9 with VNil -> "" | _ -> to_s v9)
+                   | Cons (VNil, Cons (v9, _)) -> (match v9 with VNil -> "" | _ -> to_s v9)
                    | _ -> "") in
         // ...and a SUBCLASS of an Errno class inherits its text: the class
         // name is the anonymous subclass's, so walk up to the Errno ancestor.
@@ -34197,14 +34358,20 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
 // positive Integer n is an Integer in [0, n); a Range picks one of its values.
 and rand_val = fn world -> fn (args: Val list) ->
   match args with
-  | Cons (VInt n, _) -> (if n <= 0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
-                         else VInt (random_int n))
+  // the SIGN is ignored here too: `rand(-3)` is `rand(3)`. Only ZERO means
+  // "no maximum", which is the Float in [0, 1).
+  | Cons (VInt n0, _) -> (let n = (if n0 < 0 then 0 - n0 else n0) in
+                          if n == 0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
+                          else VInt (random_int n))
   // ⚠ a FLOAT max is TRUNCATED first, and the answer is an INTEGER whenever
   //   that leaves at least one: `rand(1.5)` is 0 (an Integer) and `rand(2.5)`
   //   is 0, 1 or 2 -- only a max that truncates to zero (`rand(0.5)`) answers a
   //   Float. Scaling the float directly answered a Float for every one of them.
-  | Cons (VFlt f, _) ->
-    (if f <= 0.0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
+  | Cons (VFlt f0, _) ->
+    // ...and the SIGN is ignored: `rand(-1.5)` is `rand(1.5)`. A negative max
+    // took the "no argument" path and answered a Float in [0, 1).
+    (let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
+     if f == 0.0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
      else (let n9 = int_of_float f in
            if n9 >= 1 then VInt (random_int n9)
            else VFlt (float_of_int (random_int 1000000000) / 1000000000.0 * f)))
@@ -41811,17 +41978,31 @@ and register_builtin_consts = fn (u: unit) ->
 // alias the whole of `require` hangs off was the one that did not happen.
 and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
   let (meths, sup, ocls, ivars) = world in
+  // ⚠ the source may be INHERITED: `class B < A; alias aka pub; end` aliases
+  //   A's method. Only this class's table was read, so an inherited source
+  //   looked like a BUILTIN and the alias delegated to prim_method under that
+  //   name -- which no primitive has, so the alias was a NameError. (The
+  //   alias_method form walks the ancestors and always did.)
+  let src = (if map_has meths (cls ++ "#" ++ n2) then cls
+             else (let a9 = lookup_anc world (ancestors_of world cls) n2 in
+                   if str_eq a9 "" then cls else a9)) in
   // the name this alias was made FROM, which is what Method#original_name
   // answers. alias_method recorded it and the `alias` keyword did not, so the
   // same alias written two ways gave two different original_names -- one
   // fact, two writers, and only one of them wrote.
   let _ = (if str_eq n1 n2 then () else map_set alias_srcname (cls ++ "#" ++ n1) n2) in
-  let _ = if map_has meths (cls ++ "#" ++ n2) then
-            (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (cls ++ "#" ++ n2)) in
+  // ...and when it CAME from an ancestor, `super` inside the copy has to
+  // resume above THAT class, not above the aliasing one: alias_method records
+  // the same thing in alias_origin, and without it the copy's super found the
+  // module it was copied from again (bootstraptest's `include Forward; alias
+  // bar foo` answered [:Forward, [:Forward, :SecondTerminus]]).
+  let _ = (if str_eq src cls then () else map_set alias_origin (cls ++ "#" ++ n1) src) in
+  let _ = if map_has meths (src ++ "#" ++ n2) then
+            (let _ = map_set meths (cls ++ "#" ++ n1) (map_get meths (src ++ "#" ++ n2)) in
              // an alias keeps the original's lexical scope (see alias_method)
-             let _ = copy_meth_src (cls ++ "#" ++ n1) (cls ++ "#" ++ n2) in
-             if map_has meth_cref (cls ++ "#" ++ n2)
-             then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (cls ++ "#" ++ n2)) else ())
+             let _ = copy_meth_src (cls ++ "#" ++ n1) (src ++ "#" ++ n2) in
+             if map_has meth_cref (src ++ "#" ++ n2)
+             then map_set meth_cref (cls ++ "#" ++ n1) (map_get meth_cref (src ++ "#" ++ n2)) else ())
           // the source is a BUILTIN (no AST body): record that the new name
           // delegates to prim_method under the old one, exactly as alias_method
           // does. `alias _pack pack` in a reopened Array is how a wrapper keeps
@@ -41831,7 +42012,7 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   // `private` copies a private method, and the copy is private too: it was
   // public, so `public_send(:aka)` reached a method public_send must refuse.
   let _ = (let k1 = cls ++ "#" ++ n1 in
-           let k2 = cls ++ "#" ++ n2 in
+           let k2 = src ++ "#" ++ n2 in
            let _ = (if map_has privates k1 then map_delete privates k1 else ()) in
            let _ = (if map_has protecteds k1 then map_delete protecteds k1 else ()) in
            if map_has privates k2 then (let _ = map_set privates k1 VNil in ())
@@ -46623,8 +46804,14 @@ let core_prelude_b =
   "      v = yield(*args)\n" ++
   "      if v.respond_to?(:to_ary)\n" ++
   "        a = v.to_ary\n" ++
-  "        raise TypeError, \"can't convert \" + v.class.to_s + \" to Array (\" + v.class.to_s + \"#to_ary gives \" + a.class.to_s + \")\" unless a.is_a?(Array)\n" ++
-  "        a.each \{ |x| acc.push(x) }\n" ++
+  // ⚠ a NIL conversion means "append it as it is" (ruby's
+  //   rb_check_array_type), not a refusal -- only a non-Array, non-nil answer
+  //   is the TypeError. Refusing nil here is what made `enum.flat_map { obj }`
+  //   raise for an object whose #to_ary answers nil, while the same element in
+  //   an ARRAY receiver went through the interpreter's own walk and was
+  //   appended. One rule, two implementations, and this was the second one.
+  "        raise TypeError, \"can't convert \" + v.class.to_s + \" to Array (\" + v.class.to_s + \"#to_ary gives \" + a.class.to_s + \")\" unless a.is_a?(Array) || a.nil?\n" ++
+  "        if a.nil? then acc.push(v) else a.each \{ |x| acc.push(x) } end\n" ++
   "      else\n" ++
   "        acc.push(v)\n" ++
   "      end\n" ++
@@ -47000,8 +47187,13 @@ let core_prelude_b =
   "        a = o.to_ary\n" ++
   "        raise TypeError, \"wrong argument type \" + o.class.to_s + \" (must respond to :each)\" unless a.is_a?(Array)\n" ++
   "        a\n" ++
+  // ⚠ ruby converts through #to_enum(:each), not #to_a: an object that only
+  //   CLAIMS #each (through respond_to_missing?) and answers to_enum was sent
+  //   to_a and came back "undefined method 'to_a'". The `each` test stays --
+  //   every object has Kernel#to_enum, so testing THAT would accept an object
+  //   with nothing to walk (`zip(Object.new)` must stay a TypeError).
   "      elsif o.respond_to?(:each)\n" ++
-  "        o.to_a\n" ++
+  "        o.to_enum(:each).to_a\n" ++
   "      else\n" ++
   "        raise TypeError, \"wrong argument type \" + o.class.to_s + \" (must respond to :each)\"\n" ++
   "      end\n" ++
