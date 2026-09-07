@@ -126,6 +126,32 @@ Everything else about the report matches: `detailed_message`, both `highlight:`
 forms, `order: :top` and `order: :bottom`, and the numbering the bottom order
 uses. One example in `core/exception/full_message_spec`.
 
+## `Symbol.all_symbols` is not implemented
+
+```ruby
+Symbol.all_symbols   # ruby: [:a, :b, ...]   mere-ruby: NoMethodError
+```
+
+It needs a registry of every symbol that exists, and one of its spec examples
+asks for more than a runtime registry can give: *"includes symbols that are
+referenced in source code but not yet executed"* -- so the LEXER would have to
+record every symbol literal it reads, not just the ones `to_sym` builds. A
+partial answer (the symbols this run has created) would still fail that
+example, so there is nothing to gain by half-implementing it.
+
+## `x.pow(e, 0)` fails without naming ZeroDivisionError
+
+```ruby
+2.pow(3, 0)   # ruby: ZeroDivisionError   mere-ruby: StandardError "(ruby exception raised)"
+```
+
+The zero-divisor refusal covers `div` / `divmod` / `modulo` / `%` /
+`remainder`, and pow's MODULUS is a divisor too -- `int_pow_mod` reaches a
+machine division by zero instead. It refuses, so nothing computes with a made-up
+number, but it refuses in the wrong words. One guard beside the others closes
+it; it is recorded here rather than fixed because the measurement above was
+taken with the binary as it stands.
+
 ## `Regexp#to_s` does not fold an inline-option group into the outer one
 
 ```ruby

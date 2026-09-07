@@ -341,6 +341,7 @@ extern fn erfc: float -> float;
 extern fn tgamma: float -> float;
 extern fn lgamma: float -> float;
 extern fn hypot: float -> float -> float;
+extern fn fmod: float -> float -> float;
 extern fn ldexp: float -> int -> float;
 extern fn getpid: unit -> int;
 // one arena block, reused: 64 KiB is the read size and the write chunk.
@@ -1419,6 +1420,12 @@ let prim_raise = fn (cls: str) -> fn (msg: str) ->
 // restored around each region so a conversion reached from inside another one
 // (a user #to_i that calls Integer itself) does not inherit the flag.
 let conv_soft = map_new ();
+// `exception:` takes true or false and nothing else -- and ruby checks THAT
+// before it looks at the value, so `Float("x", exception: 1)` reports the
+// keyword rather than the unparsable string. Reading the flag as "truthy"
+// silently accepted a caller's mistake and then answered a different error.
+let conv_exc_kw_bad = fn (v: Val) ->
+  match v with VBool _ -> false | _ -> true;
 let conv_fail = fn (cls: str) -> fn (msg: str) ->
   if map_has conv_soft "on" then map_set conv_soft "bad" 1
   else (let _ = prim_raise cls msg in ());
@@ -2113,7 +2120,16 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if str_eq c ":" && i + 3 < str_len s && str_eq (char_at s (i + 1)) "$"
             && str_eq (char_at s (i + 2)) "-" then
       Cons (TSym (substring s (i + 1) (i + 4)), lex_go s (i + 4))
-    // `:$&` / `:$'` / `:$1` -- a symbol naming one of the punctuation globals.
+    // ⚠ `:$12` is ONE global, not `:$1` followed by 2. The numbered backref
+    // globals run to as many digits as are written, and this branch took a
+    // fixed three characters -- so `:$1234` lexed as `:$1` and left `234` as a
+    // separate expression, which then parsed as something else entirely
+    // (`p :$1234` was a syntax error and `:$1234.inspect` answered "234").
+    else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "$"
+            && is_digit (char_at s (i + 2)) then
+      (let j = scan_digits s (i + 2) in
+       Cons (TSym (substring s (i + 1) j), lex_go s j))
+    // `:$&` / `:$'` -- a symbol naming one of the punctuation globals.
     // rubocop's Style/PerlBackrefs matches on exactly these.
     else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "$"
             && is_gvar_punct (char_at s (i + 2)) then
@@ -8488,6 +8504,17 @@ let rec f_le_bytes = fn (n: int) -> fn (w: int) ->
 let rec f_be_bytes = fn (n: int) -> fn (w: int) ->
   if w <= 0 then "" else f_be_bytes (floor_div n 256) (w - 1) ++ chr (floor_mod n 256);
 let flt_is_nan = fn (x: float) -> if x == x then false else true;
+// "is this a numeric ZERO" and "is this NaN", asked of any numeric shape --
+// the two degenerate divisors, which every arithmetic path has to refuse in
+// the same place rather than each discovering its own answer for them.
+let num_is_zero = fn (v: Val) ->
+  match v with
+  | VInt n -> n == 0
+  | VBig b -> str_eq (big_mag b) "0"
+  | VFlt f -> f == 0.0
+  | VRat (n, _) -> str_eq (big_mag n) "0"
+  | _ -> false;
+let num_is_nan = fn (v: Val) -> match v with VFlt f -> flt_is_nan f | _ -> false;
 // infinity is the only non-zero value that is its own half
 let flt_is_inf = fn (x: float) -> (if x == 0.0 then false else true) && x * 0.5 == x;
 let rec flt_inf_go = fn (x: float) -> if x * 2.0 == x then x else flt_inf_go (x * 2.0);
@@ -8578,10 +8605,20 @@ let sym_id_of = fn (nm: str) ->
   else (let n = 6000000 + map_len sym_ids * 8 in let _ = map_set sym_ids nm n in n);
 
 // floored modulo on floats: the sign follows the DIVISOR, as ruby's does.
+// Ruby's floored divmod for floats, as one pair. It is NOT `x - y*floor(x/y)`:
+// that product is 0*Inf = NaN for an infinite divisor, so `5.0 % Float::INFINITY`
+// came out NaN where ruby answers 5.0, and `(-5.0).divmod(Inf)` was [0, NaN]
+// where ruby says [-1, Infinity]. The remainder comes from fmod and is then
+// pulled into the DIVISOR's sign; the quotient is derived from the remainder,
+// which is what keeps the two consistent.
+let flt_divmod_pair = fn (x: float) -> fn (y: float) ->
+  let m0 = (if flt_is_inf x && (if flt_is_inf y then false else true)
+            then 0.0 / 0.0 else fmod x y) in
+  let d0 = (if flt_is_inf y && (if flt_is_inf x then false else true)
+            then x / y else (x - m0) / y) in
+  if y * m0 < 0.0 then (d0 - 1.0, m0 + y) else (d0, m0);
 let flt_floor_mod = fn (x: float) -> fn (y: float) ->
-  let q = x / y in
-  let fq = (let t = int_of_float q in if float_of_int t > q then float_of_int (t - 1) else float_of_int t) in
-  x - y * fq;
+  match flt_divmod_pair x y with (d, m) -> m;
 
 // a % b for rationals: a - b * (a/b).floor, in exact arithmetic (a Float on
 // either side makes it a Float modulo, as every rational operation does).
@@ -8761,6 +8798,12 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   // a bare fail for anything that is not Int/Float/Big.
   else if str_eq op "%" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false)) then
     rat_mod va vb
+  // the same one refusal as the method form (see prim_method_raw): a zero
+  // divisor, whatever the types. The integer/integer and Rational paths raised
+  // it already; the float ones answered the dividend, so `5.0 % 0` was 5.0.
+  else if str_eq op "%" && num_is_zero vb
+          && (match va with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat _ -> true | _ -> false) then
+    (let _ = prim_raise "ZeroDivisionError" "divided by 0" in VInt 0)
   else if str_eq op "%" then
     (match va with
      | VInt x ->
@@ -11414,6 +11457,10 @@ and inspect = fn (v: Val) ->
   | VExc (c, m) -> "#<" ++ c ++ ": " ++ m ++ ">"
   | _ -> to_s v
 
+and sym_all_digits = fn (sy: str) -> fn (i: int) ->
+  if i >= str_len sy then true
+  else if is_digit (char_at sy i) then sym_all_digits sy (i + 1)
+  else false
 and sym_plain = fn (sy: str) ->
   if str_len sy == 0 then false
   else if is_valid_op_sym sy then true
@@ -11430,6 +11477,11 @@ and sym_plain = fn (sy: str) ->
     // ...and `:$-w`: the dash globals print unquoted too.
     else if st == 1 && str_eq (char_at sy 0) "$" && str_len sy == 3
             && str_eq (char_at sy 1) "-" then true
+    // ...and the NUMBERED backref globals, to any number of digits: `:$1234`
+    // prints unquoted. The one-punctuation-character case above covers `:$1`
+    // and stopped there, so a longer number came out quoted.
+    else if st == 1 && str_eq (char_at sy 0) "$" && is_digit (char_at sy 1)
+            && sym_all_digits sy 1 then true
     // ...and a SIGILLED name takes no `?`/`!`/`=` ending: `:"$ruby!"` is not a
     // global's name, so ruby quotes it. Only a bare method name may end that
     // way, which is why the two walks differ.
@@ -12806,7 +12858,28 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let _ = print_each world args in VNil
     // Kernel#warn: writes to stderr, which stdout byte-comparison never sees,
     // so a no-op is output-equivalent (and avoids a NoMethodError crash).
-    else if str_eq name "warn" && (if kernel_overridden env world "warn" then false else true) then VNil
+    // ...but the ARGUMENTS are still checked: `uplevel:` is a number of frames
+    // and ruby refuses anything else. A no-op that accepts everything is a
+    // no-op that hides a caller's mistake, and `category:` has a fixed set of
+    // names too.
+    else if str_eq name "warn" && (if kernel_overridden env world "warn" then false else true) then
+      (let _ = (match args with
+                | Cons (_, _) ->
+                  (let (pos9, kw9) = peel_kw_hash args in
+                   let _ = (if hash_haskey kw9 (VSym "uplevel") then
+                              (match hash_get kw9 (VSym "uplevel") with
+                               | VNil -> ()
+                               | VInt _ -> ()
+                               | VBig _ -> ()
+                               | bad9 ->
+                                 (let _ = raise_exc world "TypeError"
+                                            ("no implicit conversion of "
+                                             ++ display_cls_msg world (dispatch_cls_of world bad9)
+                                             ++ " into Integer") in ()))
+                            else ()) in
+                   ())
+                | Nil -> ()) in
+       VNil)
     // Kernel#printf: format, then write it (no newline).
     else if str_eq name "printf" && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
@@ -18219,7 +18292,11 @@ and ivar_names_of = fn iv -> fn (oid: int) ->
   let plen = str_len pfx in
   let tmp = map_new () in
   let _ = map_iter iv (fn (k: str) -> fn (v: Val) ->
+    // a Struct member's SLOT is not an instance variable, in any listing
+    // (struct_slot): it is where the member lives, not something the object
+    // was told to remember.
     if str_len k > plen && str_eq (substring k 0 plen) pfx
+       && (if struct_is_slot k then false else true)
     then (let m = map_len tmp in map_set tmp (str_of_int m) (mkstr (substring k plen (str_len k))))
     else ()) in
   ivar_names_go tmp 0 (map_len tmp) Nil
@@ -18242,7 +18319,8 @@ and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> 
   | Nil -> acc
   | Cons (VSym m, t) ->
     (let (_, _, _, iv) = world in
-     let k = str_of_int oid ++ "@" ++ m in
+     // the member lives in its SLOT, not in `@<member>` (struct_slot)
+     let k = str_of_int oid ++ "@" ++ struct_slot m in
      let v = (if map_has iv k then map_get iv k else VNil) in
      let piece = m ++ "=" ++ inspect_w env world v in
      struct_fields env world oid t (if str_eq acc "" then piece else acc ++ ", " ++ piece))
@@ -21914,7 +21992,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let plen = str_len pfx in
        let tmp = map_new () in
        let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+         // a Struct's member SLOTS are not instance variables (struct_slot):
+         // ruby keeps members outside this table entirely, so a struct with
+         // nothing else set answers [].
          if str_len k > plen && str_eq (substring k 0 plen) pfx
+            && (if struct_is_slot k then false else true)
          then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@" ++ substring k plen (str_len k))))
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -23765,10 +23847,17 @@ and params_wo_defaults = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
   | Cons (p, rest) -> if bm_has_default ds p then params_wo_defaults rest ds else Cons (p, params_wo_defaults rest ds)
 
 // `&blk` is a parameter (ruby reports it); the empty-params sentinel is not.
+// the two PARSE-TIME markers a parameter list can carry, neither of which is a
+// parameter: the explicit-but-empty `||` sentinel and the lambda-as-block flag.
+// Only the first was stripped here, so a lambda whose params still carried the
+// second was told it needed one argument more than it does -- which is how
+// `:upcase.to_proc.call("ok")` came to report "given 1, expected 2+".
 and strip_marker_params = fn (params: str list) ->
   match params with
   | Nil -> Nil
-  | Cons (p, r) -> if str_eq p empty_bp_marker then strip_marker_params r else Cons (p, strip_marker_params r)
+  | Cons (p, r) ->
+    if str_eq p empty_bp_marker || str_eq p lambda_blk_marker
+    then strip_marker_params r else Cons (p, strip_marker_params r)
 
 // A proc and a lambda count the same mandatory arguments; they differ in
 // whether an OPTIONAL one makes the count a lower bound (a lambda checks its
@@ -23996,6 +24085,7 @@ and lambda_arity_check_args = fn world -> fn (ps: str list) -> fn (body: Stmt li
 
 and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) -> fn (nargs: int) ->
   // an explicit-empty param list (`{ || }`) behaves like zero params.
+  let ps0 = (match ps0 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps0 | _ -> ps0) in
   let ps = (match ps0 with Cons (m, Nil) -> if str_eq m empty_bp_marker then (Nil : str list) else ps0 | _ -> ps0) in
   let nps = list_str_len (strip_block_params ps) in
   (match ps with
@@ -25022,7 +25112,10 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           | _ -> recv)
        // String#match with a block yields the MatchData and answers the
        // BLOCK's result (nil, unyielded, when there is no match).
-       else if str_eq name "match" && (match recv with VStr _ -> true | _ -> false) then
+       // ...for a SYMBOL too: it has the same #match, and this arm named only
+       // String, so `:abc.match(/b/) { }` dropped the block and answered the
+       // MatchData instead of the block's value.
+       else if str_eq name "match" && (match recv with VStr _ -> true | VSym _ -> true | _ -> false) then
          (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
           match invoke_val_c env world nb recv "match" args false with
           | VNil -> VNil
@@ -25120,6 +25213,16 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      && map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") recv then
     (match map_get raise_bt "v" with
      | VArr aid9 -> arr_new (bt_locs_of world (deref aid9))
+     | _ -> VNil)
+  else
+  // A Symbol delegates to its text for `[]` / `slice`, and the delegation has
+  // to happen HERE rather than in the leaf: the length argument is asked for
+  // #to_int by the string layer above, which the leaf skipped -- so
+  // `:"mbc"[0, obj]` answered one character where ruby answers two.
+  if (str_eq name "[]" || str_eq name "slice")
+     && (match recv with VSym _ -> true | _ -> false) then
+    (match recv with
+     | VSym sy9 -> invoke_val_c env world blk (mkstr sy9) name args false
      | _ -> VNil)
   else
   // #full_message / #detailed_message on the lightweight class-and-message
@@ -26842,6 +26945,10 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      else if str_eq n "intern" then "to_sym"
      else if str_eq n "slice" then "[]"
      else if str_eq n "size" then "length"
+     // Symbol#=== IS Symbol#== (a symbol is only ever equal to itself, so the
+     // case-equality has nothing else to be). The spec compares the pair as
+     // UnboundMethods, which is what this table decides.
+     else if str_eq n "===" then "=="
      else n)
   // Proc, Method and UnboundMethod each carry `eql?` as a second name for `==`,
   // and a to_s/inspect pair. The pair that matters is `eql?`: comparing two
@@ -27697,15 +27804,44 @@ and sym_str_method = fn (name: str) ->
   sym_str_resym name || str_eq name "start_with?" || str_eq name "end_with?" ||
   str_eq name "casecmp" || str_eq name "casecmp?" || str_eq name "empty?" ||
   str_eq name "[]" || str_eq name "slice"
+// One rule for a symbol's encoding, so #encoding, #to_s and #name cannot
+// disagree: what to_sym recorded, else US-ASCII when the name is 7-bit and the
+// script's encoding otherwise. #to_s only applied the recorded case, so
+// `:abc.to_s.encoding` was UTF-8 where #encoding said US-ASCII -- the same
+// symbol answering two different encodings depending on which door was used.
+and sym_enc_name = fn (sy: str) ->
+  if map_has sym_enc sy then map_get sym_enc sy
+  else if enc_all7 sy then "US-ASCII" else "UTF-8"
 and sym_str_resym = fn (name: str) ->
   str_eq name "downcase" || str_eq name "upcase" || str_eq name "capitalize" ||
   str_eq name "swapcase" || str_eq name "succ" || str_eq name "next"
 
 and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  // ⚠ ONE refusal, before any of the arithmetic below can compute with it: a
+  // zero divisor. `div` / `divmod` / `modulo` / `%` / `remainder` all refuse it
+  // whatever the operand TYPES -- including 0.0, which is the case that looked
+  // like an exception to the rule and is not. Only `/` and `fdiv` answer
+  // Infinity. Each of these arms reached the zero its own way and every one of
+  // them came back with a number: `5.0.div(0)` was 9223372036854775807 (the
+  // saturating conversion of Infinity) and `5.0 % 0` was 5.0. A fabricated
+  // number with no error is the result a caller has no reason to doubt.
+  //
+  // NaN is the same shape one step further out: it is not zero, so it divides,
+  // and floor(x/NaN) saturated to 0 -- ruby refuses it as a FloatDomainError.
+  if (str_eq name "div" || str_eq name "divmod" || str_eq name "modulo"
+      || str_eq name "%" || str_eq name "remainder")
+     && (is_num recv || is_cpx recv)
+     && (match args with Cons (a0, Nil) -> num_is_zero a0 | _ -> false) then
+    prim_raise "ZeroDivisionError" "divided by 0"
+  else if (str_eq name "div" || str_eq name "divmod")
+          && is_num recv
+          && (match args with Cons (a0, Nil) -> num_is_nan a0 | _ -> false) then
+    prim_raise "FloatDomainError" "NaN"
   // An operator written as a METHOD is the operator: `10.%(3)` and `s.<<(x)`
   // mean what `10 % 3` and `s << x` mean. Some of these had their own branch
   // below and some did not, so `1.+(2)` worked and `10.%(3)` was an undefined
   // method.
+  else
   // `modulo` / `div` / `fdiv` / `remainder` are the named forms of the same
   // arithmetic; they were in the numeric method LIST but had no branch.
   // Rational#div is EXACT: the floor of the fraction, not of a float that
@@ -27923,6 +28059,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // it was not written at a source line; it names its symbol instead.
         let _ = map_set proc_symsrc (str_of_int pid) (mkstr sy) in
         let _ = map_set proc_src ("f" ++ str_of_int pid) (mkstr "") in
+        // ...and it is a LAMBDA: `:x.to_proc.lambda?` is true in ruby, which is
+        // not decoration -- it says the proc is strict about its arguments and
+        // that a `return` inside it returns from IT. The marker in the params
+        // makes it behave as one; lambda_ids is what #lambda? reads.
+        let _ = map_set lambda_ids (str_of_int pid) VNil in
         VProc pid)
      | _ -> VNil)
   else if str_eq name "store" && (match recv with VHsh _ -> true | _ -> false) then
@@ -27965,11 +28106,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // mkstr per call cannot. The intern table `-str` uses answers it.
      | VBool _ -> str_fstring (mkstr (to_s recv))
      | VNil -> str_fstring (mkstr "")
-     // a Symbol's text carries the encoding to_sym recorded for it.
+     // a Symbol's text carries the symbol's encoding (see sym_enc_name).
      | VSym sy ->
        (let c = mkstr sy in
         (match c with
-         | VStr cid -> (let _ = (if map_has sym_enc sy then senc_set cid (map_get sym_enc sy) else ()) in c)
+         | VStr cid -> (let _ = senc_set cid (sym_enc_name sy) in c)
          | _ -> c))
      | _ -> mkstr (to_s recv))
   // true / false / nil inspect to their ONE frozen string too (for the two
@@ -28437,9 +28578,21 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           && (match recv with VSym _ -> true | _ -> false) then
     (match recv with
      | VSym sy ->
-       (let h9 = mkstr sy in
-        let _ = (if str_eq name "name" then (match h9 with VStr i9 -> sfrozen_set i9 | _ -> ()) else ()) in
-        h9)
+       // #name answers the SAME frozen string every call (`:a.name.equal?(:a.name)`
+       // is true in ruby) -- a fresh mkstr per call cannot, however frozen it
+       // is. str_fstring is the intern table the `-str` operator already uses,
+       // so the identity comes from the one place that owns it. #id2name is the
+       // older spelling and answers an ordinary mutable copy.
+       (if str_eq name "name" then
+          (let c9 = mkstr sy in
+           let _ = (match c9 with VStr i9 -> senc_set i9 (sym_enc_name sy) | _ -> ()) in
+           let f9 = str_fstring c9 in
+           let _ = (match f9 with VStr i9 -> sfrozen_set i9 | _ -> ()) in
+           f9)
+        else
+          (let h9 = mkstr sy in
+           let _ = (match h9 with VStr i9 -> senc_set i9 (sym_enc_name sy) | _ -> ()) in
+           h9))
      | _ -> VNil)
   else if str_eq name "to_sym" || str_eq name "intern" then
     // the symbol KEEPS the string's encoding (recorded aside -- VSym is just
@@ -28920,10 +29073,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "bit_length" then (match recv with VInt n -> VInt (int_bit_length (if n < 0 then 0 - n - 1 else n)) | VBig b -> VInt (big_bit_length b) | _ -> (let _ = map_set prim_missing "n" (mkstr "bit_length") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit_length'")) in fail "mere-ruby: undefined method 'bit_length'")))
   else if str_eq name "divmod" then
     (match recv with
-     | VInt a -> (match args with Cons (VInt b, _) -> arr_new (Cons (VInt (floor_div a b), Cons (VInt (floor_mod a b), Nil))) | Cons (VBig b, _) -> arr_new (Cons (norm_big (big_div_s (str_of_int a) b), Cons (norm_big (big_mod_s (str_of_int a) b), Nil))) | Cons (VFlt b, _) -> let q = flt_floor (float_of_int a / b) in arr_new (Cons (VInt q, Cons (VFlt (float_of_int a - float_of_int q * b), Nil))) | _ -> VNil)
+     | VInt a -> (match args with Cons (VInt b, _) -> arr_new (Cons (VInt (floor_div a b), Cons (VInt (floor_mod a b), Nil))) | Cons (VBig b, _) -> arr_new (Cons (norm_big (big_div_s (str_of_int a) b), Cons (norm_big (big_mod_s (str_of_int a) b), Nil))) | Cons (VFlt b, _) -> (match flt_divmod_pair (float_of_int a) b with (d9, m9) -> arr_new (Cons (VInt (flt_floor d9), Cons (VFlt m9, Nil)))) | _ -> VNil)
      | VBig a -> (match args with Cons (b, _) -> let bd = num_dec b in arr_new (Cons (norm_big (big_div_s a bd), Cons (norm_big (big_mod_s a bd), Nil))) | _ -> VNil)
      // Float#divmod: quotient floored to an Integer, remainder a Float.
-     | VFlt a -> (match args with Cons (b, _) -> let bf = to_f b in let q = flt_floor (a / bf) in arr_new (Cons (VInt q, Cons (VFlt (a - float_of_int q * bf), Nil))) | _ -> VNil)
+     | VFlt a -> (match args with Cons (b, _) -> (match flt_divmod_pair a (to_f b) with (d9, m9) -> arr_new (Cons (VInt (flt_floor d9), Cons (VFlt m9, Nil)))) | _ -> VNil)
      // Rational#divmod: the quotient is the FLOOR of the exact division (an
      // Integer) and the remainder is what is left over, so it is computed from
      // the quotient rather than by a second division.
@@ -28962,6 +29115,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VRat (_, _) -> (match args with Cons (b, _) -> VFlt (to_f recv / to_f b) | _ -> VNil)
      | VBig _ -> (match args with Cons (b, _) -> VFlt (to_f recv / to_f b) | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "fdiv") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fdiv'")) in fail "mere-ruby: undefined method 'fdiv'")))
+  // ⚠ pow's second argument is a MODULUS and has to be an integer. A
+  // non-integer did not refuse: it fell past the `Cons (VInt e, Cons (VInt m, _))`
+  // pattern into the one-argument arm, so `2.pow(3, "x")` answered 8 -- the
+  // power with the modulus silently dropped. Refusing is the whole difference
+  // between "cannot do that" and "did something else".
+  else if str_eq name "pow" && is_num recv
+          && (match args with
+              | Cons (_, Cons (m9, _)) -> (match m9 with VInt _ -> false | VBig _ -> false | _ -> true)
+              | _ -> false) then
+    prim_raise "TypeError" "Integer#pow() 2nd argument not allowed unless all arguments are integers"
   else if str_eq name "pow" then
     (match recv with VInt b -> (match args with Cons (VInt e, Cons (VInt m, _)) -> VInt (int_pow_mod b e m) | Cons (VInt e, _) -> arith_bin "**" recv (VInt e) | _ -> VInt b)
      // a bignum base: the exact power, and the modular form through the same
@@ -29147,6 +29310,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
               | Cons (VBig _, _) -> true
               | Cons (VFlt f9, _) -> flt_is_nan f9 || flt_is_inf f9
               | Cons (VInt d9, _) -> d9 > 2147483647 || d9 < 0 - 2147483648
+              // ...and a precision that is not a NUMBER at all is refused the
+              // way every other converted argument is. It used to fall past the
+              // `Cons (VInt d, _)` pattern into the no-argument arm, so
+              // `2.round("x")` answered 2 -- the receiver, rounded to a
+              // precision ruby will not read.
+              | Cons (a9, _) -> (if is_num a9 then false else true)
               | _ -> false) then
     (match args with
      | Cons (VBig _, _) -> prim_raise "RangeError" "bignum too big to convert into 'long'"
@@ -29156,6 +29325,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                ("float " ++ (if f9 > 0.0 then "Inf" else "-Inf") ++ " out of range of integer"))
      | Cons (VInt d9, _) ->
        prim_raise "RangeError" ("integer " ++ str_of_int d9 ++ " too big to convert to 'int'")
+     | Cons (a9, _) ->
+       prim_raise "TypeError" ("no implicit conversion of " ++ class_name a9 ++ " into Integer")
      | _ -> VNil)
   else if str_eq name "round" then
     (match recv with
@@ -29174,6 +29345,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                            norm_big (big_mul_s (rat_int_mode "round" b m9) m9)))
                   | _ -> VBig b)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "round") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'round'")) in fail "mere-ruby: undefined method 'round'")))
+  // ...and truncate's precision is an Integer too. `Rational(1,2).truncate("x")`
+  // fell through to the no-argument form and answered 0 -- the truncation of a
+  // precision ruby refuses to read.
+  else if str_eq name "truncate" && is_num recv
+          && (match args with
+              | Cons (p9, _) -> (match p9 with VInt _ -> false | VBig _ -> false | _ -> true)
+              | _ -> false) then
+    prim_raise "TypeError" "not an integer"
   else if str_eq name "truncate" then
     (match recv with VInt n -> VInt n | VFlt f -> VInt (int_of_float f)
      | VBig b -> (match args with
@@ -29306,8 +29485,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // a Symbol's encoding is US-ASCII when its name is, UTF-8 otherwise --
      // unless to_sym recorded the source string's own encoding.
      | VSym sy ->
-       (let nm = (if map_has sym_enc sy then map_get sym_enc sy
-                  else if enc_all7 sy then "US-ASCII" else "UTF-8") in
+       (let nm = sym_enc_name sy in
         if map_has enc_objs nm then map_get enc_objs nm else mkstr nm)
      // the `n` flag pins the pattern to BYTES, whatever its source looks like:
      // `/x/n.encoding` is ASCII-8BIT in ruby and was US-ASCII here.
@@ -31625,7 +31803,16 @@ and rb_fmt_int = fn env -> fn world -> fn (v: Val) ->
 and kern_exc_kw = fn (v: Val) ->
   (match v with
    | VHsh h -> (match hash_lookup (hderef h) (VSym "exception") with
-                | (true, x) -> (true, truthy x)
+                // ⚠ `exception:` takes true or false and NOTHING else, and ruby
+                // checks the keyword before it looks at the value -- so
+                // `Float("x", exception: 1)` reports the keyword, not the
+                // unparsable string. Reading it as "truthy" accepted the
+                // caller's mistake and then answered a different error.
+                | (true, x) ->
+                  (if conv_exc_kw_bad x
+                   then (let _ = prim_raise "ArgumentError"
+                                   ("expected true or false as exception: " ++ inspect x) in (true, true))
+                   else (true, truthy x))
                 | _ -> (false, true))
    | _ -> (false, true))
 
@@ -34256,8 +34443,34 @@ and make_unbound_method = fn world -> fn (cls: str) -> fn (nm: str) ->
 // ---- Struct.new(:a, :b) --------------------------------------------------
 // synthesize an anonymous class with rw accessors, a positional initialize,
 // and to_a / values / members / == built from the member list.
+// ⚠ Where a Struct keeps its members. NOT in `@<member>`: ruby stores them
+// outside the instance-variable table entirely, so `S.new(1).instance_variables`
+// is [] and `s.instance_variable_set(:@a, 99)` makes an ORDINARY ivar that
+// leaves the member alone. Storing them as `@a` made all three wrong, and the
+// third silently -- setting an ivar that happened to share a member's name
+// overwrote the member.
+//
+// The slot name ends in a byte no Ruby identifier can contain, so a program
+// cannot name it by accident and instance_variables can recognise and drop it.
+// Hiding `@a` instead was tried and reverted: the struct's own readers (#to_h,
+// #[], deconstruct_keys) go through the same table, so half of it cannot be
+// hidden from one caller and not the other.
+and struct_slot = fn (m: str) -> m ++ chr 1
+and struct_is_slot = fn (nm: str) -> str_contains nm (chr 1)
+and struct_add_attrs = fn world -> fn (cls: str) -> fn (syms: str list) ->
+  let (meths, sup, ocls, ivars) = world in
+  match syms with
+  | Nil -> ()
+  | Cons (name, rest) ->
+    let _ = map_set meths (cls ++ "#" ++ name)
+              (Meth (Nil, Nil, Cons (SReturn (EIVar (struct_slot name)), Nil))) in
+    let _ = map_set meths (cls ++ "#" ++ name ++ "=")
+              (Meth (Cons ("__attr_v", Nil), Nil,
+                     Cons (SIVarAssign (struct_slot name, EVar "__attr_v"),
+                           Cons (SReturn (EVar "__attr_v"), Nil)))) in
+    struct_add_attrs world cls rest
 and struct_ivar_reads = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons (EIVar m, struct_ivar_reads r)
+  match ms with Nil -> Nil | Cons (m, r) -> Cons (EIVar (struct_slot m), struct_ivar_reads r)
 
 and struct_sym_lits = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, struct_sym_lits r)
@@ -34266,7 +34479,7 @@ and struct_sym_vals = fn (ms: str list) ->
 
 // interleaved [:m1, @m1, :m2, @m2, ...] for a #to_h returning EHsh.
 and struct_to_h_pairs = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, Cons (EIVar m, struct_to_h_pairs r))
+  match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, Cons (EIVar (struct_slot m), struct_to_h_pairs r))
 
 // #[] body: return the ivar whose member symbol or 0-based index matches __k.
 // `s[0]`, `s[:a]`, `s["a"]` and `s[-1]` all name one member, and an index past
@@ -34279,7 +34492,7 @@ and struct_index_go = fn (ms: str list) -> fn (i: int) -> fn (n: int) ->
   match ms with
   | Nil -> struct_index_refuse ()
   | Cons (m, r) ->
-    ETern (struct_key_test m i n, EIVar m, struct_index_go r (i + 1) n)
+    ETern (struct_key_test m i n, EIVar (struct_slot m), struct_index_go r (i + 1) n)
 and struct_key_test = fn (m: str) -> fn (i: int) -> fn (n: int) ->
   EBin ("||",
         EBin ("||", EBin ("==", EVar "__k", ESym m), EBin ("==", EVar "__k", EStrL m)),
@@ -34340,10 +34553,10 @@ and struct_each_body = fn (ms: str list) ->
 and struct_each_yields = fn (ms: str list) ->
   match ms with
   | Nil -> Cons (SReturn ESelf, Nil)
-  | Cons (m, r) -> Cons (SExpr (EYield (Cons (EIVar m, Nil))), struct_each_yields r)
+  | Cons (m, r) -> Cons (SExpr (EYield (Cons (EIVar (struct_slot m), Nil))), struct_each_yields r)
 
 and struct_init_body = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons (SIVarAssign (m, EVar m), struct_init_body r)
+  match ms with Nil -> Nil | Cons (m, r) -> Cons (SIVarAssign (struct_slot m, EVar m), struct_init_body r)
 
 // The part of a Struct's surface that does not depend on the member NAMES:
 // written once, in ruby, and registered into every struct class. Reading the
@@ -34371,11 +34584,11 @@ and struct_common_src = fn (u: unit) ->
     "  private :__member_index\n" ++
     "\n" ++
     "  def [](k)\n" ++
-    "    instance_variable_get(\"@\" + members[__member_index(k)].to_s)\n" ++
+    "    instance_variable_get(\"@\" + members[__member_index(k)].to_s + 1.chr)\n" ++
     "  end\n" ++
     "\n" ++
     "  def []=(k, v)\n" ++
-    "    instance_variable_set(\"@\" + members[__member_index(k)].to_s, v)\n" ++
+    "    instance_variable_set(\"@\" + members[__member_index(k)].to_s + 1.chr, v)\n" ++
     "    v\n" ++
     "  end\n" ++
     "\n" ++
@@ -34387,7 +34600,7 @@ and struct_common_src = fn (u: unit) ->
     "    end\n" ++
     "    i = k.is_a?(Integer) ? (k < 0 ? ms.size + k : k) : ms.index(k.to_sym)\n" ++
     "    return nil if i.nil? || i < 0 || i >= ms.size\n" ++
-    "    v = instance_variable_get(\"@\" + ms[i].to_s)\n" ++
+    "    v = instance_variable_get(\"@\" + ms[i].to_s + 1.chr)\n" ++
     "    return v if ks.size <= 1\n" ++
     "    return nil if v.nil?\n" ++
     "    v.dig(*ks.drop(1))\n" ++
@@ -34403,14 +34616,14 @@ and struct_common_src = fn (u: unit) ->
     "      if i >= ms.size\n" ++
     "        raise IndexError, \"offset \" + k.to_s + \" too large for struct(size:\" + ms.size.to_s + \")\"\n" ++
     "      end\n" ++
-    "      instance_variable_get(\"@\" + ms[i].to_s)\n" ++
+    "      instance_variable_get(\"@\" + ms[i].to_s + 1.chr)\n" ++
     "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def to_h(&b)\n" ++
     "    h = \{}\n" ++
     "    members.each do |m|\n" ++
-    "      h[m] = instance_variable_get(\"@\" + m.to_s)\n" ++
+    "      h[m] = instance_variable_get(\"@\" + m.to_s + 1.chr)\n" ++
     "    end\n" ++
     "    return h unless b\n" ++
     "    h.to_h(&b)\n" ++
@@ -34476,7 +34689,7 @@ and struct_build = fn world -> fn (args: Val list) ->
   let _ = map_set struct_ctr "n" (n + 1) in
   let anon = "Struct_" ++ str_of_int n in
   let _ = set_sup sup anon "Struct" in
-  let _ = add_attrs world anon "rw" members in
+  let _ = struct_add_attrs world anon members in
   // keyword_init structs take their members as (nil-defaulted) keyword params;
   // positional structs take them positionally.
   let kw = struct_kw_init args in
@@ -39790,10 +40003,16 @@ and block_param_name = fn (params: str list) ->
   | Nil -> ""
   | Cons (p, r) -> if is_block_param p then substring p 1 (str_len p) else block_param_name r
 
+// ...and the same two markers here. This walk counts a lambda's parameters for
+// the strict arity check, and it did not know about the lambda-as-block flag --
+// so a lambda whose list still carried it wanted one argument more than its own
+// #arity reported. Two walks over one list, disagreeing by a marker.
 and strip_block_params = fn (params: str list) ->
   match params with
   | Nil -> Nil
-  | Cons (p, r) -> if is_block_param p || str_eq p empty_bp_marker then strip_block_params r else Cons (p, strip_block_params r)
+  | Cons (p, r) ->
+    if is_block_param p || str_eq p empty_bp_marker || str_eq p lambda_blk_marker
+    then strip_block_params r else Cons (p, strip_block_params r)
 
 // explicit block-local names (encoded ";name"): bind each to a fresh nil.
 and bind_block_locals = fn cenv -> fn (params: str list) ->
@@ -44833,7 +45052,19 @@ and md_expand_idxs = fn env -> fn world -> fn (all: Val list) -> fn (xs: Val lis
      else
        (let (rs, re) = rng_slice_bounds lov hiv ex n0 in
         list_append (md_int_vals rs re) (md_expand_idxs env world all t)))
-  | Cons (h, t) -> Cons (h, md_expand_idxs env world all t)
+  // an index, a group NAME, or a Range -- and nothing else. An object that is
+  // none of those used to be carried through and matched no group, so
+  // `md.values_at(Object.new)` answered [nil]: "no group there" rather than
+  // "that is not a subscript".
+  | Cons (VInt i9, t) -> Cons (VInt i9, md_expand_idxs env world all t)
+  | Cons (VStr h9, t) -> Cons (VStr h9, md_expand_idxs env world all t)
+  | Cons (VSym s9, t) -> Cons (VSym s9, md_expand_idxs env world all t)
+  | Cons (h, t) ->
+    (if prim_user_has world h "to_int"
+     then Cons (conv_try env world h "to_int", md_expand_idxs env world all t)
+     else (let _ = raise_exc world "TypeError"
+                     ("no implicit conversion of " ++ display_cls_msg world (dispatch_cls_of world h)
+                      ++ " into Integer") in Nil))
 and md_int_vals = fn (i: int) -> fn (hi: int) ->
   if i >= hi then Nil else Cons (VInt i, md_int_vals (i + 1) hi)
 and md_values_at = fn world -> fn ivars -> fn (id: int) -> fn (idxs: Val list) ->
@@ -46859,6 +47090,10 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // with CRuby ([Integer, Numeric, Comparable, Object, Kernel, BasicObject]).
   let _ = map_set includes "Numeric" "Comparable" in
   let _ = map_set includes "String" "Comparable" in
+  // ...and Symbol is Comparable too: it answers <=> and the four ordering
+  // operators, so `Symbol.include?(Comparable)` is true in ruby and the module
+  // belongs in the ancestry that says so.
+  let _ = map_set includes "Symbol" "Comparable" in
   // the collections include Enumerable, which is what `Array.include?
   // Enumerable` and `[].is_a? Enumerable` ask about.
   // ruby 3.1+ has Set without a require: the constant is an autoload of the
