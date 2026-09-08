@@ -10,19 +10,19 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 179 files.
+Classified: 177 files.
 
-## DIFF — 179 files, 83 kinds
+## DIFF — 177 files, 83 kinds
 
 | files | kind |
 |---|---|
 | 20 | `ERROR NoMethodError` |
 | 10 | `FAILED expected N, got N` |
-| 10 | `ERROR NameError` |
-| 7 | `FAILED expected true, got false` |
+| 9 | `ERROR NameError` |
 | 7 | `FAILED expected to be identical` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `FAILED expected "S", got "S"` |
+| 6 | `FAILED expected true, got false` |
 | 5 | `FAILED expected TypeError to be raised` |
 | 5 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected #<OBJ>, got #<OBJ>` |
@@ -131,7 +131,6 @@ Classified: 179 files.
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true if the Regexp was created with the Regexp::FIXEDENCODING option: expected true, got false` |
-| 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
 | 1 | `FAILED: returns the remainder of dividing self by other: expected (2/1), got 0.0` |
 | 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
@@ -144,6 +143,7 @@ Classified: 179 files.
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 | 1 | `FAILED: returns false if compares with near float: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
+| 1 | `FAILED: returns an Enumerator if called without a block: expected to be identical` |
 
 </details>
 
@@ -157,10 +157,10 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | kernel (9) | `binding chomp chop eval loop open select singleton_class test` |
-| unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
+| unboundmethod (3) | `bind_call bind super_method` |
 | struct (3) | `deconstruct initialize new` |
-| method (3) | `original_name super_method to_proc` |
+| method (3) | `equal_value super_method to_proc` |
 | symbol (2) | `all_symbols to_proc` |
 | threadgroup (1) | `list` |
 | regexp (1) | `timeout` |
