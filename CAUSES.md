@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 170 files.
+Classified: 168 files.
 
-## DIFF — 170 files, 79 kinds
+## DIFF — 168 files, 79 kinds
 
 | files | kind |
 |---|---|
@@ -29,7 +29,6 @@ Classified: 170 files.
 | 4 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 3 | `FAILED expected nil, got "S"` |
-| 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
@@ -71,6 +70,7 @@ Classified: 170 files.
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
+| 1 | `FAILED expected SyntaxError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
@@ -102,7 +102,6 @@ Classified: 170 files.
 |---|---|
 | 6 | `FAILED: expected TypeError to be raised` |
 | 5 | `FAILED: expected ArgumentError to be raised` |
-| 3 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
@@ -140,6 +139,7 @@ Classified: 170 files.
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Enumerator if called without a block: expected to be identical` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
+| 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
 
 </details>
 

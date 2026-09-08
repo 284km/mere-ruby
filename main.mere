@@ -1184,6 +1184,13 @@ let loaded_files = map_new ();
 // bundler's settings.rb hands a block containing `require_relative` to
 // SharedHelpers.filesystem_access, which yields it from another file entirely.
 let parse_time_file = fn (u: unit) ->
+  // ⚠ the ruby-visible NAME of what is being parsed is not the diagnostic
+  // label. `load_ctx "parsing"` holds "(eval) <the first 60 characters>" so a
+  // parse error can quote the string it failed in -- and `__FILE__` inside that
+  // string then answered the quote. Two questions about one parse, and only one
+  // slot for both: "pfile" is the name, "parsing" is the label.
+  let pf9 = (if map_has load_ctx "pfile" then (match map_get load_ctx "pfile" with VStr h -> sget h | _ -> "") else "") in
+  if (if str_eq pf9 "" then false else true) then pf9 else
   let p = (if map_has load_ctx "parsing" then (match map_get load_ctx "parsing" with VStr h -> sget h | _ -> "") else "") in
   if str_eq p "" then
     (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h -> sget h | _ -> "") else "")
@@ -44349,6 +44356,55 @@ and bare_yield_exprs = fn (es: Expr list) ->
 
 // does any def/class body contain a directly-invalid retry/redo?
 // (Ruby rejects them at parse time; blocks and loops are legal homes.)
+// ruby refuses an assignment to a PSEUDO-VARIABLE at parse time: `__FILE__`,
+// `__LINE__` and `__ENCODING__` are not locals. `self = 1` and `nil = 1` are
+// already refused by the parser itself; these three were not, so
+// `eval("__FILE__ = 1")` assigned and answered 1.
+// The lexer attaches the parsed file to `__FILE__` (and the line to
+// `__LINE__`), so the name is matched by PREFIX.
+and is_pseudo_var_name = fn (n: str) ->
+  (str_len n >= 8 && str_eq (substring n 0 8) "__FILE__")
+  || (str_len n >= 8 && str_eq (substring n 0 8) "__LINE__")
+  || (str_len n >= 12 && str_eq (substring n 0 12) "__ENCODING__")
+and pseudo_var_assign = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, rest) ->
+    (match st with
+     | SAssign (n, _) -> is_pseudo_var_name n || pseudo_var_assign rest
+     | SDef (_, _, _, b) -> pseudo_var_assign b || pseudo_var_assign rest
+     | SClass (_, _, b) -> pseudo_var_assign b || pseudo_var_assign rest
+     | SClassE (_, _, b) -> pseudo_var_assign b || pseudo_var_assign rest
+     | _ -> pseudo_var_assign rest)
+
+// A constant assignment inside a METHOD body is ruby's "dynamic constant
+// assignment": a def runs many times and a constant is written once. A class
+// or module body is not a method, and neither is the top level or a block.
+// ⚠ This walks the def body's own statements, not the inside of an `if` or a
+// `while` in it -- it refuses less than ruby does, never more, so no program
+// ruby accepts is turned away by it.
+and dyn_const_in_defs = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, rest) ->
+    (match st with
+     | SDef (_, _, _, b) -> const_assign_here b || dyn_const_in_defs rest
+     | SClass (_, _, b) -> dyn_const_in_defs b || dyn_const_in_defs rest
+     | SClassE (_, _, b) -> dyn_const_in_defs b || dyn_const_in_defs rest
+     | _ -> dyn_const_in_defs rest)
+and const_assign_here = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (st, rest) ->
+    (match st with
+     | SAssign (n, _) -> is_upper_first n || const_assign_here rest
+     // a nested class or module body inside the def is its own scope, and a
+     // nested def is another method: neither is this method's body.
+     | SClass (_, _, _) -> const_assign_here rest
+     | SClassE (_, _, _) -> const_assign_here rest
+     | SDef (_, _, _, _) -> const_assign_here rest
+     | _ -> const_assign_here rest)
+
 and invalid_flow_in_defs = fn (body: Stmt list) ->
   match body with
   | Nil -> false
@@ -44418,7 +44474,13 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     (match args with
      | Cons (_, Cons (_, Cons (VStr f9, r9))) ->
        (sget f9, (match r9 with Cons (VInt l9, _) -> l9 | _ -> 1))
-     | _ -> ("", 0)) in
+     // ...and with no file argument ruby still names the eval: `__FILE__`
+     // inside it is "(eval at <the file that called eval>:<line>)", and the
+     // line numbering starts at 1. Leaving it empty meant the eval'd code
+     // inherited whatever file was current -- so `__FILE__` answered the
+     // caller's path, and a `def` inside the eval reported the caller's file
+     // as where it was written.
+     | _ -> ("(eval at " ++ cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ")", 1)) in
   match args with
   | Cons (VStr code, rest) ->
     let codelbl = senc_get code in
@@ -44432,12 +44494,17 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     let _ = map_set load_ctx "coding" (mkstr (if str_eq cod "" then str_upcase codelbl else cod)) in
     let _ = set_parsing_eval code in
     let ebase9 = (if eline9 > 0 then eline9 else 1) in
+    // ...and the name `__FILE__` answers inside it (restored below beside the
+    // encoding, which is saved for the same reason).
+    let savedpf9 = (if map_has load_ctx "pfile" then map_get load_ctx "pfile" else mkstr "") in
+    let _ = map_set load_ctx "pfile" (mkstr efile9) in
     let prog2 = try_or (fn (u: unit) ->
       let toks = number_nls_at code (lex_go code 0) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
       let (p2, _) = parse_stmts toks Nil in
       let _ = rx_check_pending () in p2) sentinel in
     let _ = map_set load_ctx "parsing" (mkstr "") in
+    let _ = map_set load_ctx "pfile" savedpf9 in
     let _ = map_set load_ctx "coding" savedc in
     (match prog2 with
      | Cons (SDeclare (Cons (m, Nil)), Nil) ->
@@ -44453,10 +44520,14 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
              | _ -> "syntax error")) "syntax error" in
           raise_exc world "SyntaxError" msg)
        else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+       else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
+       else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
        if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+       else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
+       else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
        else if numbered_misuse_stmts prog2 then raise_exc world "SyntaxError" "invalid numbered parameter"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
