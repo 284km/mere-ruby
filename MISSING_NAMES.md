@@ -30,10 +30,10 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 223 of 1413 names
+ABSENT: 222 of 1413 names
   IO (44): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd foreach fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
   File (39): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime empty? executable_real? flock ftype grpowned? identical? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readable_real? readlink rename setgid? setuid? socket? stat sticky? symlink truncate umask utime world_readable? world_writable? writable_real? zero?
-  Kernel (32): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? caller caller_locations define_singleton_method format gem gem_original_require global_variables iterator? lambda load local_variables open printf proc rand respond_to_missing? set_trace_func singleton_method sprintf test then trace_var untrace_var yield_self
+  Kernel (31): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? caller caller_locations define_singleton_method format gem gem_original_require global_variables iterator? lambda load local_variables open printf proc rand set_trace_func singleton_method sprintf test then trace_var untrace_var yield_self
   Process (25): _fork argv0 clock_getres egid euid getpgid getpgrp getpriority getrlimit getsid gid groups initgroups last_status maxgroups setpgid setpgrp setpriority setproctitle setrlimit setsid uid waitall waitpid2 warmup
   Dir (19): chdir chroot close delete each_child empty? fchdir fileno for_fd foreach inspect path pos rewind rmdir seek tell to_path unlink
   Module (14): class_exec const_source_location define_method included_modules module_exec nesting protected_instance_methods public_class_method public_instance_method refinements set_temporary_name undefined_instance_methods used_modules used_refinements
@@ -58,6 +58,12 @@ SEND-ONLY: 19 of 1413 names
   Dir (1): pos=
   Thread (1): ignore_deadlock=
 ```
+
+2026-09-08: **222 ABSENT of 1413**, same reference (4.0.6) and the same binary
+as that day's spec rows. The one that went is `Kernel#respond_to_missing?`: it was
+consulted by the conversion protocol all along and had no definition of its own, so
+an override had nowhere to `super` to and a plain call reported the method missing
+where ruby says it is private.
 
 2026-09-06 (third): **223 ABSENT of 1413**. `Array#fetch_values`, `Proc#binding`
 and `Method#super_method` landed with the streaming Enumerable; the number

@@ -13414,7 +13414,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let _ = (if vis then public_send_guard world recv m else ()) in
          (if str_eq m "eval" then do_eval env world blk rest
           else invoke_val_c env world blk recv m rest vis)
-       else if str_eq name "respond_to?" then respond_to_answer env world recv args
+       // ⚠ a class that DEFINES #respond_to? answers with it, and with whatever
+       // it returns: this arm used to answer for every receiver, so an override
+       // was reached only through the internal probe (which reads it for
+       // truthiness) and `def respond_to?(s, a=false); :MINE; end` answered
+       // `true`. Falling through dispatches it like any other method.
+       else if str_eq name "respond_to?"
+               && (if has_meth world (dispatch_cls_of world recv) "respond_to?" then false else true) then
+         respond_to_answer env world recv args
        // in-place string mutation: rewrite the receiver's store entry, so
        // every alias sees it (unless the class redefines the method).
        else if (match recv with VStr _ -> true | _ -> false)
@@ -13883,10 +13890,29 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                (match invoke_val_c env world blk vb "to_str" Nil false with
                 | VStr bh3 -> (let c = str_compare (sget ah) (sget bh3) in VInt (if c < 0 then 0 - 1 else if c > 0 then 1 else 0))
                 | _ -> VNil)
+             // ⚠ the INVERSE comparison, and ruby guards it against finding
+             // itself (rb_invcmp / rb_exec_recursive_outer): two objects that
+             // each defer to the other answer nil, where this ran the stack
+             // out. The guard is keyed on the PAIR, so an unrelated comparison
+             // inside the callee still works -- and it is removed whether the
+             // callee returns OR raises, because a key left behind would make
+             // the next comparison of that same pair answer nil.
              else if responds world vb "<=>" then
-               (match invoke_val_c env world blk vb "<=>" (Cons (va0, Nil)) false with
-                | VInt cc -> VInt (0 - cc)
-                | _ -> VNil)
+               (let k9 = "invcmp:" ++ invcmp_id va0 ++ "|" ++ invcmp_id vb in
+                if map_has insp_seen k9 then VNil
+                else
+                  let _ = map_set insp_seen k9 1 in
+                  let _ = (if map_has insp_seen (k9 ++ "!ok") then map_delete insp_seen (k9 ++ "!ok") else ()) in
+                  let r9 = try_or (fn (u: unit) ->
+                             let v9 = invoke_val_c env world blk vb "<=>" (Cons (va0, Nil)) false in
+                             let _ = map_set insp_seen (k9 ++ "!ok") 1 in v9) VNil in
+                  let ok9 = map_has insp_seen (k9 ++ "!ok") in
+                  let _ = (if ok9 then map_delete insp_seen (k9 ++ "!ok") else ()) in
+                  let _ = map_delete insp_seen k9 in
+                  if ok9 then (match r9 with VInt cc -> VInt (0 - cc) | _ -> VNil)
+                  else (let (_, _, _, iv9) = world in
+                        flow_value (re_raise world
+                          (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil))))
              else VNil)
           | _ -> VNil)
        | _ -> VNil)
@@ -15499,6 +15525,19 @@ and rescues_targets = fn rescues ->
   | Nil -> Nil
   | Cons (rc, rest) ->
     let (cs, v, b) = rc in list_append_str (deep_targets b) (rescues_targets rest)
+
+// A value's identity, for a guard that has to tell one PAIR from another. The
+// reference types carry a handle; everything else is compared by what it prints,
+// which is enough for a recursion guard (two equal immediates cannot defer to
+// each other forever).
+and invcmp_id = fn (v: Val) ->
+  match v with
+  | VStr h -> "s" ++ str_of_int h
+  | VObj i -> "o" ++ str_of_int i
+  | VArr i -> "a" ++ str_of_int i
+  | VHsh i -> "h" ++ str_of_int i
+  | VProc i -> "p" ++ str_of_int i
+  | _ -> "v" ++ to_s v
 
 and flow_value = fn (f: Flow) ->
   match f with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v
@@ -17700,7 +17739,16 @@ and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
         let ex = (if responds world (VObj o0) "exclude_end?"
                   then truthy (invoke_val_c env world nb (VObj o0) "exclude_end?" Nil false) else false) in
         Cons (VRange (toi bv, toi ev, ex), Nil))
-     else coerce_str_int_args env world args)
+     // ...and an object that is neither a range nor an index is REFUSED, not
+     // answered with nil. `"hello"[obj]` already refused and `"hello".slice!(obj)`
+     // returned nil: one protocol, two implementations, and only one of them
+     // had this half. #to_str is not part of it ("doesn't call to_str on its
+     // argument" is a spec of its own), which is why the refusal is decided
+     // here rather than left to coerce_str_int_args, which does ask.
+     else if responds world (VObj o0) "to_int" then coerce_str_int_args env world args
+     else (let _ = raise_exc world "TypeError"
+             ("no implicit conversion of "
+              ++ display_cls_msg world (dispatch_cls_of world (VObj o0)) ++ " into Integer") in args))
   | _ -> coerce_str_int_args env world args
 
 // Array's index arguments follow the SAME protocol String's do: for a single
@@ -19275,8 +19323,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // are real methods on EVERY object -- `1.send(:initialize_copy, x)` is a
   // FrozenError, not a NoMethodError -- and dup/clone are defined in terms of
   // them. A user override wins, which is what the has_meth guard is for.
+  // ...and they are PRIVATE, so a plain `obj.initialize_copy(x)` is refused
+  // rather than run (the refusal is the is_kernel_priv_only arm further in).
+  // `send` and an override's `super` both arrive with vischeck off.
   if (str_eq name "initialize_copy" || str_eq name "initialize_dup"
       || str_eq name "initialize_clone")
+     && (if vischeck then false else true)
      && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
     kernel_copy_hook env world recv name args
   else
@@ -21885,8 +21937,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Module#singleton_class?: activesupport refuses to define module
     // attributes on one.
     else if str_eq name "singleton_class?" then VBool (is_sng_cls c)
-    // respond_to? on a class/module (also reachable via send).
-    else if str_eq name "respond_to?" then respond_to_answer env world recv args
+    // respond_to? on a class/module (also reachable via send) -- unless the
+    // class defines its own singleton #respond_to?, which then answers.
+    else if str_eq name "respond_to?"
+            && (if has_meth world ("(sng:" ++ c ++ ")") "respond_to?" then false else true) then
+      respond_to_answer env world recv args
     // Module#ancestors: the lookup chain (self, included modules, supers);
     // for a singleton class this is the metaclass chain down to Class.
     else if str_eq name "ancestors" then
@@ -22296,6 +22351,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true)
        then raise_exc world "NoMethodError" ("protected method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
        else invoke world noblk recv cls name args)
+    // The four Kernel names ruby keeps PRIVATE whatever a class does with them
+    // (is_kernel_priv_only). Their builtin arms are further down, and a plain
+    // call has to be refused before reaching one -- `obj.initialize_copy(x)`
+    // ran the copy hook, and `obj.respond_to_missing?(:x)` reported the method
+    // missing, where ruby says "private method '...' called".
+    else if vischeck && is_kernel_priv_only name then
+      raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
     else if str_eq name "class" then VClass (display_cls world cls)
     // Object#methods: public + protected method names reachable from this
     // object (its class and ancestors, plus any singleton methods), as
@@ -22360,6 +22422,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Kernel#instance_variables_to_inspect (ruby 4.0): the default answers nil,
     // and Kernel#inspect reads an override to pick the ivars it shows.
     else if str_eq name "instance_variables_to_inspect" then VNil
+    // Kernel#respond_to_missing?(name, include_all): the default answers false.
+    // It has to EXIST -- an override's `super` needs somewhere to land, and
+    // `send(:respond_to_missing?, :x, false)` is a question every object can be
+    // asked -- while a plain call is refused, because it is private (the name is
+    // already in is_kernel_priv_only, which is what the visibility check reads).
+    else if str_eq name "respond_to_missing?"
+            && (if vischeck && is_kernel_priv_only name then false else true) then VBool false
     // Object#instance_variables: this object's own @ivars, as :@name symbols.
     else if str_eq name "instance_variables" then
       (let pfx = str_of_int id ++ "@" in
@@ -24360,6 +24429,26 @@ and kw_any = fn (ps: str list) -> fn (ds: (str * Expr) list) -> fn (want_req: bo
      else kw_any rest ds want_req)
 
 // how many positional parameters MUST be given a value.
+// Does an override of #respond_to? TAKE the include_all flag? ruby looks at the
+// arity: it passes two arguments unless the method takes exactly one. Asking
+// for two MANDATORY parameters instead answered no for the ordinary
+// `def respond_to?(sym, include_all = false)` -- so every override written that
+// way was asked a different question from the one ruby asks, and a spec that
+// mocks `.with(:to_int, true)` never matched.
+and takes_include_all = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
+  positional_slots ps > 1
+
+// how many positional slots a parameter list has (required + optional + a
+// splat, which can absorb any number)
+and positional_slots = fn (ps: str list) ->
+  match ps with
+  | Nil -> 0
+  | Cons (p, rest) ->
+    if str_len p > 0 && str_eq (char_at p 0) "&" then positional_slots rest
+    else if str_len p > 0 && str_eq (char_at p 0) "*" then 2 + positional_slots rest
+    else if str_len p > 0 && str_eq (char_at p (str_len p - 1)) ":" then positional_slots rest
+    else 1 + positional_slots rest
+
 and mandatory_pos_count = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
   match ps with
   | Nil -> 0
@@ -27055,7 +27144,7 @@ and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
        (if has_meth world cls "respond_to?" then
           (let extra = (match lookup_meth world cls "respond_to?" with
                         | Meth (ps, ds, _) ->
-                          (if mandatory_pos_count ps ds >= 2 then Cons (VBool true, Nil) else Nil)) in
+                          (if takes_include_all ps ds then Cons (VBool true, Nil) else Nil)) in
            truthy (invoke world nb v cls "respond_to?" (Cons (VSym mname, extra))))
         else true) in
      if (if rt_ok then false else true) then VNil
@@ -27260,7 +27349,9 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
             | Nil -> (let _ = raise_exc world "ArgumentError"
                         "wrong number of arguments (given 0, expected 1..2)" in "")) in
   let c9 = dispatch_cls_of world recv in
-  if responds world recv nm then
+  // the TABLE form: this function is the builtin #respond_to?, so asking the
+  // object's own override from here is asking itself.
+  if responds_tbl world recv nm then
     (if all then VBool true
      else VBool (if meth_protected world c9 nm then false else true))
   else if all then
@@ -27283,7 +27374,16 @@ and has_coerce = fn world -> fn (v: Val) ->
   | VObj _ -> (let c9 = dispatch_cls_of world v in has_meth world c9 "coerce")
   | _ -> false
 
-and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
+and responds = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name true
+
+// ...and the same question WITHOUT asking a user-defined #respond_to?. This is
+// what the builtin #respond_to? itself computes, and it is where a `super` from
+// an override has to land: routing that back through the asking form made the
+// override ask itself, and `MockObject.new('x').respond_to?(:each_entry)` came
+// back out of the loop as true while `:each` came back false.
+and responds_tbl = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name false
+
+and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: bool) ->
   match recv with
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
@@ -27294,13 +27394,18 @@ and responds = fn world -> fn (recv: Val) -> fn (name: str) ->
     // class defines its own (not the builtin), to avoid recursion.
     // an undef'd name does not answer respond_to? -- but a REDEFINED
     // respond_to? still gets to say whatever it likes about it.
-    if undef_blocked world cls name && (if has_meth world cls "respond_to?" then false else true) then false
-    else if has_meth world cls "respond_to?" then
+    if undef_blocked world cls name && (if ask_user && has_meth world cls "respond_to?" then false else true) then false
+    else if ask_user && has_meth world cls "respond_to?" then
       // ruby passes the include_all flag only to a respond_to? that TAKES it
       // (it looks at the arity), so a one-parameter override still works and
       // a two-parameter one does not get an ArgumentError.
+      // ...and the flag is TRUE: every caller left here is an internal protocol
+      // probe (#to_str, #to_int, #coerce, #each), and ruby asks those through
+      // rb_check_funcall, which passes priv=TRUE. The public question is
+      // answered by responds_tbl now, so passing false here was asking a
+      // different question from the one ruby asks.
       (let extra = (match lookup_meth world cls "respond_to?" with
-                    | Meth (ps, ds, _) -> (if mandatory_pos_count ps ds >= 2 then Cons (VBool false, Nil) else Nil)) in
+                    | Meth (ps, ds, _) -> (if takes_include_all ps ds then Cons (VBool true, Nil) else Nil)) in
        truthy (invoke world nb (VObj id) cls "respond_to?" (Cons (VSym name, extra))))
     else
     // a private method does not answer respond_to? (ruby needs the

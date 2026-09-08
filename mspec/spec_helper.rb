@@ -526,6 +526,11 @@ class MockObject
     [false, nil]
   end
   def method_missing(sym, *args)
+    # a spec may mock #method_missing ITSELF, naming the message it expects to
+    # be forwarded (string/slice_spec drives the #to_int protocol that way).
+    # Looking only for the missing NAME never found that registration.
+    ok, e = __mock_find(:method_missing, [sym] + args)
+    return (e.raise!; e.value) if ok
     ok, e = __mock_find(sym, args)
     return nil unless ok
     # `.and_raise` was a no-op that answered nil, so a spec that says "this

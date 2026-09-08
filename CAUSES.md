@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 181 files.
+Classified: 179 files.
 
-## DIFF — 181 files, 83 kinds
+## DIFF — 179 files, 83 kinds
 
 | files | kind |
 |---|---|
@@ -28,16 +28,15 @@ Classified: 181 files.
 | 5 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
-| 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
+| 3 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected "S" to match` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
-| 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 2 | `ERROR ArgumentError` |
@@ -96,6 +95,7 @@ Classified: 181 files.
 | 1 | `FAILED expected "` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
 | 1 | `ERROR ZeroDivisionError` |
+| 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR StandardError` |
