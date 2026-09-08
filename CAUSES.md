@@ -12,36 +12,37 @@ Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
 Classified: 181 files.
 
-## DIFF — 181 files, 82 kinds
+## DIFF — 181 files, 83 kinds
 
 | files | kind |
 |---|---|
-| 19 | `ERROR NoMethodError` |
+| 20 | `ERROR NoMethodError` |
 | 10 | `FAILED expected N, got N` |
 | 10 | `ERROR NameError` |
 | 7 | `FAILED expected true, got false` |
 | 7 | `FAILED expected to be identical` |
 | 7 | `FAILED expected false, got true` |
-| 7 | `FAILED expected TypeError to be raised` |
-| 6 | `FAILED expected "S", got "S"` |
+| 7 | `FAILED expected "S", got "S"` |
+| 5 | `FAILED expected TypeError to be raised` |
 | 5 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
-| 3 | `pass=N fail=N err=N` |
-| 3 | `FAILED raised NoMethodError, expected TypeError` |
+| 4 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
-| 3 | `FAILED expected "S", got nil` |
 | 3 | `FAILED expected "S" to match` |
+| 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
+| 2 | `ERROR SystemStackError` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 2 | `ERROR ArgumentError` |
 | 1 | `sh: feature_N: command not found` |
+| 1 | `FAILED raised NoMethodError, expected TypeError` |
 | 1 | `FAILED raised NoMethodError, expected FrozenError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
@@ -55,6 +56,7 @@ Classified: 181 files.
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected true, got "S"` |
+| 1 | `FAILED expected not N` |
 | 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
 | 1 | `FAILED expected a Float, got nil` |
@@ -68,6 +70,7 @@ Classified: 181 files.
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
+| 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
@@ -93,19 +96,16 @@ Classified: 181 files.
 | 1 | `FAILED expected "` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
 | 1 | `ERROR ZeroDivisionError` |
-| 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR StandardError` |
-| 1 | `ERROR Errno::ENOENT` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 7 | `FAILED: expected TypeError to be raised` |
+| 5 | `FAILED: expected TypeError to be raised` |
 | 5 | `FAILED: expected ArgumentError to be raised` |
-| 3 | `FAILED: raised NoMethodError, expected TypeError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
@@ -117,7 +117,6 @@ Classified: 181 files.
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 1 | `sh: feature_14386: command not found` |
-| 1 | `pass=4 fail=2 err=7` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
@@ -143,6 +142,8 @@ Classified: 181 files.
 | 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
+| 1 | `FAILED: returns false if compares with near float: expected false, got true` |
+| 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 
 </details>
 
@@ -155,7 +156,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (8) | `binding chomp chop eval loop select singleton_class test` |
+| kernel (9) | `binding chomp chop eval loop open select singleton_class test` |
 | unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
 | struct (3) | `deconstruct initialize new` |

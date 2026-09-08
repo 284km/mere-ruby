@@ -472,9 +472,15 @@ def include(*members); IncludeMatcher.new(members); end
 # A minimal mock: records should_receive expectations (parallel arrays —
 # the host may lack mutable hashes) and answers via method_missing.
 class MockExpectation
-  def initialize(sym); @sym = sym; @value = nil; @with = nil; end
+  def initialize(sym); @sym = sym; @value = nil; @with = nil; @raise = nil; @raise_msg = nil; end
   def and_return(v); @value = v; self; end
-  def and_raise(*a); self; end
+  def and_raise(e = RuntimeError, msg = nil); @raise = e; @raise_msg = msg; self; end
+  # raise what `.and_raise` named, if anything. Called at the moment the mocked
+  # method is invoked.
+  def raise!
+    return if @raise.nil?
+    @raise_msg.nil? ? (raise @raise) : (raise @raise, @raise_msg)
+  end
   # `.with(args)` narrows the expectation to those arguments. Ignoring it made
   # every registration for a symbol answer from the FIRST one: a mock with
   # `should_receive(:<=>).with(@y).and_return(-1)` and
@@ -498,6 +504,7 @@ class MockObject
     @name = name
     @syms = []
     @exps = []
+    @sings = []
   end
   def should_receive(sym)
     e = MockExpectation.new(sym)
@@ -508,17 +515,57 @@ class MockObject
   def should_not_receive(sym)
     MockExpectation.new(sym)
   end
-  def method_missing(sym, *args)
-    # the first registration for this symbol whose `.with` (if any) matches
-    # the arguments; a registration without `.with` matches any call.
+  # the first registration for this symbol whose `.with` (if any) matches the
+  # arguments; a registration without `.with` matches any call.
+  def __mock_find(sym, args)
     i = 0
     while i < @syms.length
-      return @exps[i].value if @syms[i] == sym && @exps[i].matches?(args)
+      return [true, @exps[i]] if @syms[i] == sym && @exps[i].matches?(args)
       i += 1
     end
-    nil
+    [false, nil]
   end
-  def respond_to?(sym); true; end
+  def method_missing(sym, *args)
+    ok, e = __mock_find(sym, args)
+    return nil unless ok
+    # `.and_raise` was a no-op that answered nil, so a spec that says "this
+    # object's #coerce raises" got an object whose #coerce returned nil -- and
+    # the interpreter was then measured against the wrong question.
+    e.raise!
+    e.value
+  end
+  # A mock answers what it was TOLD to answer, plus whatever it really has (a
+  # `def obj.to_int` a spec adds by hand is a real singleton method, and `super`
+  # finds it). Claiming EVERY name made the interpreter look wrong wherever a
+  # spec's own object is supposed to decline: `5 > mock('x')` raises
+  # ArgumentError in ruby because the mock has no #coerce, and this one said it
+  # had one -- so the four ordering operators refused with the wrong error for a
+  # reason that was in the harness.
+  def respond_to?(sym, include_all = false)
+    # a spec may MOCK #respond_to? itself (string/slice_spec does, to drive the
+    # #to_int protocol through #method_missing); the registration wins, as it
+    # already does for #to_s and #inspect.
+    ok, e = __mock_find(:respond_to?, [sym, include_all])
+    return e.value if ok
+    return true if @syms.include?(sym)
+    # what this object REALLY has, asked without `super`: a super from a
+    # redefined #respond_to? lands back in the builtin probe, which consults
+    # this very method again -- `MockObject.new('x').respond_to?(:each_entry)`
+    # came back true out of that loop while `:each` came back false.
+    # ...and NOT through #methods, #singleton_methods or
+    # #singleton_class.instance_methods: all three ask this method again on the
+    # way, so the probe recursed until the stack ran out. A singleton a spec
+    # adds by hand (`def obj.to_int`) is recorded by the hook below instead.
+    return true if @sings.include?(sym)
+    self.class.instance_methods.include?(sym)
+  end
+  # `def obj.to_int` on a mock is a method it really has, and the probe above
+  # cannot ask for the list without re-entering itself. Ruby announces each one
+  # here as it is installed, so the mock keeps its own list.
+  def singleton_method_added(name)
+    @sings = [] if @sings.nil?
+    @sings << name
+  end
   # to_s / inspect are real Object methods (not method_missing), so route them
   # through the expectation list when mocked; otherwise a stable name (never a
   # heap address, which would make failure output nondeterministic).
@@ -530,6 +577,7 @@ class MockObject
     end
     [false, nil]
   end
+  def __mock_syms; @syms; end
   def to_s
     ok, v = __mock_answer(:to_s); ok ? v : "#<MockObject #{@name}>"
   end
