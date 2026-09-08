@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 172 files.
+Classified: 170 files.
 
-## DIFF — 172 files, 81 kinds
+## DIFF — 170 files, 79 kinds
 
 | files | kind |
 |---|---|
@@ -56,11 +56,9 @@ Classified: 172 files.
 | 1 | `FAILED expected true, got "S"` |
 | 1 | `FAILED expected not N` |
 | 1 | `FAILED expected nil, got false` |
+| 1 | `FAILED expected nil, got N` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
 | 1 | `FAILED expected a Float, got nil` |
-| 1 | `FAILED expected [[[N, N]], [[N, N, N], [N, N, N, N]]], got [[N, N, N]]` |
-| 1 | `FAILED expected [[[N, N], [N, N, N]], [[N, N, N, N]]], got [[N, N, N]]` |
-| 1 | `FAILED expected [[N, [N]], [N, [N, N]], [N, [N]]], got [[N, [N]], [:SYM, [N]], [N, [N, N]], [:SYM, [N]], [N, [N]]]` |
 | 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [N], got [N]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
