@@ -18,9 +18,9 @@ Classified: 165 files.
 |---|---|
 | 19 | `ERROR NoMethodError` |
 | 10 | `FAILED expected N, got N` |
+| 8 | `FAILED expected false, got true` |
 | 8 | `ERROR NameError` |
 | 7 | `FAILED expected to be identical` |
-| 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected true, got false` |
@@ -33,7 +33,6 @@ Classified: 165 files.
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
-| 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
 | 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR RangeError` |
@@ -71,6 +70,7 @@ Classified: 165 files.
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
+| 1 | `FAILED expected ThreadError to be raised` |
 | 1 | `FAILED expected SyntaxError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
@@ -108,7 +108,6 @@ Classified: 165 files.
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
-| 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 1 | `sh: feature_14386: command not found` |
@@ -117,6 +116,7 @@ Classified: 165 files.
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
+| 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
 | 1 | `FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {}` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
 | 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
