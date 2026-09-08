@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 165 files.
+Classified: 160 files.
 
-## DIFF — 165 files, 79 kinds
+## DIFF — 160 files, 77 kinds
 
 | files | kind |
 |---|---|
@@ -20,7 +20,7 @@ Classified: 165 files.
 | 10 | `FAILED expected N, got N` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `ERROR NameError` |
-| 7 | `FAILED expected to be identical` |
+| 6 | `FAILED expected to be identical` |
 | 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected true, got false` |
@@ -28,7 +28,6 @@ Classified: 165 files.
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
@@ -77,7 +76,6 @@ Classified: 165 files.
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
-| 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected (N/N), got N` |
@@ -109,7 +107,6 @@ Classified: 165 files.
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
-| 2 | `FAILED: deletes pairs through enumerator: expected nil, got "0"` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
@@ -122,7 +119,6 @@ Classified: 165 files.
 | 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
-| 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns true if the Regexp was created with the Regexp::FIXEDENCODING option: expected true, got false` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
@@ -137,9 +133,11 @@ Classified: 165 files.
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 | 1 | `FAILED: returns false if compares with near float: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
-| 1 | `FAILED: returns an Enumerator if called without a block: expected to be identical` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
 | 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
+| 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
+| 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
+| 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
 
 </details>
 
