@@ -10,15 +10,15 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 168 files.
+Classified: 166 files.
 
-## DIFF — 168 files, 79 kinds
+## DIFF — 166 files, 79 kinds
 
 | files | kind |
 |---|---|
-| 20 | `ERROR NoMethodError` |
+| 19 | `ERROR NoMethodError` |
 | 10 | `FAILED expected N, got N` |
-| 9 | `ERROR NameError` |
+| 8 | `ERROR NameError` |
 | 7 | `FAILED expected to be identical` |
 | 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected true, got false` |
@@ -45,8 +45,8 @@ Classified: 168 files.
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
 | 1 | `FAILED raised ArgumentError, expected IndexError` |
 | 1 | `FAILED matcher did not match #<OBJ>` |
-| 1 | `FAILED expected {N => N}, got {}` |
 | 1 | `FAILED expected {...}, got {...}` |
+| 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
 | 1 | `FAILED expected truthy from #>` |
 | 1 | `FAILED expected truthy from #<=` |
@@ -78,6 +78,7 @@ Classified: 168 files.
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
+| 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
@@ -85,7 +86,6 @@ Classified: 168 files.
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
 | 1 | `FAILED expected "S"foo\xAN\"S", got "S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
-| 1 | `FAILED expected "S"\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
@@ -117,6 +117,7 @@ Classified: 168 files.
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
+| 1 | `FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {}` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
 | 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
@@ -139,7 +140,6 @@ Classified: 168 files.
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Enumerator if called without a block: expected to be identical` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
-| 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
 
 </details>
 
@@ -155,10 +155,10 @@ class column says where the weight sits.
 | kernel (9) | `binding chomp chop eval loop open select singleton_class test` |
 | language (4) | `alias constants module numbered_parameters` |
 | unboundmethod (3) | `bind_call bind super_method` |
-| struct (3) | `deconstruct initialize new` |
 | method (3) | `equal_value super_method to_proc` |
 | symbol (2) | `all_symbols to_proc` |
 | threadgroup (1) | `list` |
+| struct (1) | `new` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |
 | exception (1) | `interrupt` |
