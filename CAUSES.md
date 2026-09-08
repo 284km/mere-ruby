@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 177 files.
+Classified: 172 files.
 
-## DIFF — 177 files, 83 kinds
+## DIFF — 172 files, 81 kinds
 
 | files | kind |
 |---|---|
@@ -21,23 +21,22 @@ Classified: 177 files.
 | 9 | `ERROR NameError` |
 | 7 | `FAILED expected to be identical` |
 | 7 | `FAILED expected false, got true` |
-| 7 | `FAILED expected "S", got "S"` |
 | 6 | `FAILED expected true, got false` |
-| 5 | `FAILED expected TypeError to be raised` |
+| 6 | `FAILED expected TypeError to be raised` |
+| 6 | `FAILED expected "S", got "S"` |
 | 5 | `FAILED expected ArgumentError to be raised` |
-| 5 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
+| 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected "S", got nil` |
-| 3 | `FAILED expected "S" to match` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected N, got nil` |
-| 2 | `ERROR RuntimeError` |
+| 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR RangeError` |
 | 2 | `ERROR ArgumentError` |
 | 1 | `sh: feature_N: command not found` |
@@ -81,13 +80,11 @@ Classified: 177 files.
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
-| 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
-| 1 | `FAILED expected "S"localhost\"S"root\"S", got "S"localhost\"S"root\"S"` |
 | 1 | `FAILED expected "S"foo\xAN\"S", got "S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S"\"S", got "S"` |
@@ -99,12 +96,13 @@ Classified: 177 files.
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR StandardError` |
+| 1 | `ERROR RuntimeError` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 5 | `FAILED: expected TypeError to be raised` |
+| 6 | `FAILED: expected TypeError to be raised` |
 | 5 | `FAILED: expected ArgumentError to be raised` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
@@ -121,7 +119,6 @@ Classified: 177 files.
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
-| 1 | `FAILED: uses class name when receiver has a singleton class: expected "undefined method 'bar' for an instance of NoMethodErrorSpecs::NoMethodErrorA" to match` |
 | 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
 | 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
@@ -144,6 +141,7 @@ Classified: 177 files.
 | 1 | `FAILED: returns false if compares with near float: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Enumerator if called without a block: expected to be identical` |
+| 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
 
 </details>
 

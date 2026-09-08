@@ -14908,7 +14908,18 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
   match args with
   | Cons (VClass c, rest) ->
     let (meths, sup, ocls, ivars) = world in
-    if map_has meths (c ++ "#initialize") then
+    // ⚠ INHERITED, not just its own. `raise Cls, "msg"` is `Cls.exception(msg)`
+    // in ruby, so a class that inherits SystemCallError's or NameError's
+    // #initialize has to run it -- `Class.new(Errno::ENOENT)` raised with a
+    // message lost the "No such file or directory - " its own `.new` adds,
+    // because the anonymous class has no #initialize of its OWN.
+    // Exception's own is excluded on purpose: every exception class inherits
+    // that one, and it does nothing the pair representation does not already
+    // do. Including it would allocate an object for every raise in the program.
+    let ini9 = (let a9 = lookup_anc world (ancestors_of world c) "initialize" in
+                if str_eq a9 "" && map_has meths (c ++ "#initialize") then c else a9) in
+    if map_has meths (c ++ "#initialize")
+       || (if str_eq ini9 "" then false else (if str_eq ini9 "Exception" then false else true)) then
       // keep it as a live object so custom ivars/methods (e.g. #code) survive;
       // ensure @message is set (defaults to the class name) for #message.
       let id = alloc_oid ocls in
@@ -17645,6 +17656,25 @@ and blt_alias_lookup = fn world -> fn (anc: str list) -> fn (name: str) ->
 // `<=>` delegating to `old`, which is not a primitive, so Integer#<=> stayed
 // broken for the rest of the file), and a user-defined method under n1 has to
 // GO, or has_meth keeps answering with the definition the alias replaces.
+// The errno argument of SystemCallError.new, read as ruby reads it: through
+// #to_int for anything that is not already an Integer. coerce_int_args only
+// asks an OBJECT, and the numeric kinds that answer #to_int (Float, Rational,
+// a Complex with no imaginary part) reach here as values, not objects.
+and errno_arg_int = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Cons (VInt k, rest) -> Cons (VInt k, rest)
+  | Cons (VFlt f, rest) -> Cons (VInt (int_of_float f), rest)
+  | Cons (v, rest) ->
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     match v with
+     | VRat (_, _) -> (match invoke_val_c env world nb9 v "to_int" Nil false with
+                       | VInt k -> Cons (VInt k, rest) | _ -> args)
+     | VCpx (_, _) -> (match invoke_val_c env world nb9 v "to_int" Nil false with
+                       | VInt k -> Cons (VInt k, rest) | _ -> args)
+     | VObj _ -> coerce_int_args env world args
+     | _ -> args)
+  | Nil -> Nil
+
 and set_builtin_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
   let (meths9, sup9, ocls9, ivars9) = world in
   let src = (if map_has builtin_alias (cls ++ "#" ++ n2)
@@ -18497,8 +18527,8 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
                 if has_meth world cls8 "to_s" then
                   (match invoke world nb8 other cls8 "to_s" Nil with
                    | VStr s2 -> sget s2
-                   | _ -> "#<" ++ cls_display world cls8 ++ ":0x" ++ hex_pad16 oid8 ++ ">")
-                else "#<" ++ cls_display world cls8 ++ ":0x" ++ hex_pad16 oid8 ++ ">")
+                   | _ -> "#<" ++ cls_display world (obj_print_cls world cls8) ++ ":0x" ++ hex_pad16 oid8 ++ ">")
+                else "#<" ++ cls_display world (obj_print_cls world cls8) ++ ":0x" ++ hex_pad16 oid8 ++ ">")
              | _ -> to_s other))
     // An EXCEPTION inspects as `#<Class: message>`: Exception#inspect is a real
     // override of Kernel#inspect and `p e` has to use it. The value-level
@@ -18573,7 +18603,13 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
                   else obj_ivar_dump env world oid cls) in
        // the class names ITSELF here too: an instance of an anonymous class is
        // `#<#<Class:0x..>:0x..>` in ruby, not `#<AnonClass_0:0x..>`.
-       "#<" ++ cls_display world cls ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
+       // ⚠ ...but an object's own SINGLETON class is not what it prints. `def
+       // o.x` records `#<Class:#<C:0x..>>` as o's class -- that is how dispatch
+       // finds the method -- and ruby still prints `#<C:0x..>`. Every object
+       // that had ever been given a singleton method printed its singleton,
+       // through `p`, #inspect, #to_s and the "undefined method for ..."
+       // message alike.
+       "#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
   | VArr id ->
     if map_has insp_seen ("a" ++ str_of_int id) then "[...]"
     else
@@ -20292,7 +20328,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | VObj oid ->
        let (_, _, ocls9, _) = world in
        let c9 = map_get ocls9 (str_of_int oid) in
-       if str_eq name "to_s" then mkstr ("#<" ++ cls_display world c9 ++ ":0x" ++ hex_pad16 oid ++ ">")
+       if str_eq name "to_s" then mkstr ("#<" ++ cls_display world (obj_print_cls world c9) ++ ":0x" ++ hex_pad16 oid ++ ">")
        else mkstr (inspect_w env world recv)
      | _ -> mkstr (inspect_w env world recv))
   // `o.singleton_class.to_s` -- an explicit call, so it arrives here rather than
@@ -21500,6 +21536,46 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let c9 = (if map_has errno_by_num (str_of_int n9)
                  then "Errno::" ++ map_get errno_by_num (str_of_int n9) else "SystemCallError") in
        new_obj world c9 (Cons (VNil, Cons (VInt n9, Nil))))
+    // ...and an errno that converts to nothing is refused BY NAME. Only nil is
+    // allowed to be "no number given"; a String in that position is not the
+    // location (that is the THIRD argument for this class), and it used to be
+    // read as one -- "unknown error @ bar - foo" for a call ruby refuses.
+    else if str_eq name "new" && str_eq c "SystemCallError"
+            && (match args with
+                | Cons (_, Cons (VNil, _)) -> false
+                | Cons (_, Cons (_, _)) -> true
+                | _ -> false)
+            && (match errno_arg_int env world (match args with Cons (_, r9) -> r9 | Nil -> Nil) with
+                | Cons (VInt _, _) -> false
+                | _ -> true) then
+      (let bad9 = (match args with Cons (_, Cons (v9, _)) -> v9 | _ -> VNil) in
+       raise_exc world "TypeError"
+         ("no implicit conversion of " ++ display_cls_msg world (dispatch_cls_of world bad9) ++ " into Integer"))
+    // ...and the errno converts: ruby reads it through #to_int, so a Float (or
+    // anything with #to_int) picks the Errno class the same way an Integer does.
+    // Only a literal VInt was recognised, so `SystemCallError.new("foo", 2.0)`
+    // stayed a bare SystemCallError with "unknown error".
+    else if str_eq name "new" && str_eq c "SystemCallError"
+            && (match args with
+                | Cons (_, Cons (VFlt _, _)) -> true
+                | Cons (_, Cons (VObj _, _)) -> true
+                // ...and the numbers that are not Integers but convert: ruby
+                // reads the errno through #to_int, and Rational(2,1) and
+                // Complex(2,0) both answer it.
+                | Cons (_, Cons (VRat (_, _), _)) -> true
+                | Cons (_, Cons (VCpx (_, _), _)) -> true
+                | _ -> false)
+            && (match errno_arg_int env world (match args with Cons (_, r9) -> r9 | Nil -> Nil) with
+                | Cons (VInt _, _) -> true
+                | _ -> false) then
+      (let rest9 = (match args with Cons (_, r9) -> r9 | Nil -> Nil) in
+       let n9 = (match errno_arg_int env world rest9 with
+                 | Cons (VInt k, _) -> k
+                 | _ -> 0) in
+       let args9 = (match args with Cons (a9, Cons (_, t9)) -> Cons (a9, Cons (VInt n9, t9)) | _ -> args) in
+       let _ = errno_build () in
+       let c9 = (if map_has errno_by_num (str_of_int n9) then "Errno::" ++ map_get errno_by_num (str_of_int n9) else "SystemCallError") in
+       new_obj world c9 args9)
     else if str_eq name "new" && str_eq c "SystemCallError"
             && (match args with Cons (_, Cons (VInt _, _)) -> true | _ -> false) then
       (let n9 = (match args with Cons (_, Cons (VInt k, _)) -> k | _ -> 0) in
@@ -22423,9 +22499,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match args with
        | Cons (v, Cons (value, _)) ->
          (let nm9 = ivar_name_val env world v in
+          // ...naming the RECEIVER, which #receiver answers. Every other
+          // FrozenError raise records it; these two did not, so the object a
+          // program was refused permission to change could not be asked for.
           let _ = (if val_frozen_mut recv
-                   then (let _ = raise_exc world "FrozenError"
-                                   ("can't modify frozen " ++ cls ++ ": " ++ inspect recv) in ())
+                   then (let _ = raise_exc_iv world "FrozenError"
+                                   ("can't modify frozen " ++ cls ++ ": " ++ inspect_w env world recv)
+                                   (Cons (("__recv", recv), Nil)) in ())
                    else ()) in
           let _ = map_set ivars (str_of_int id ++ "@" ++ nm9) value in value)
        | _ -> VNil)
@@ -22437,8 +22517,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (v, _) ->
          (let nm9 = ivar_name_val env world v in
           let _ = (if val_frozen_mut recv
-                   then (let _ = raise_exc world "FrozenError"
-                                   ("can't modify frozen " ++ cls ++ ": " ++ inspect recv) in ())
+                   then (let _ = raise_exc_iv world "FrozenError"
+                                   ("can't modify frozen " ++ cls ++ ": " ++ inspect_w env world recv)
+                                   (Cons (("__recv", recv), Nil)) in ())
                    else ()) in
           let k9 = str_of_int id ++ "@" ++ nm9 in
           if map_has ivars k9
@@ -24106,7 +24187,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // form answered the RECEIVER for every object that includes Comparable.
        else clamp_val world recv args)
     // an object has no such method — raise a catchable NoMethodError.
-    else raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world cls)
+    else raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_obj env world recv cls)
            (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
   | VSym s ->
     if str_eq s "&blk" && (str_eq name "call" || str_eq name "()" || str_eq name "[]")
@@ -25546,7 +25627,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if builtin_obj_has cls name then invoke_val_c env world blk recv name args false
        else if is_sng_cls cls && builtin_obj_has (sng_supername world cls) name then invoke_val_c env world blk recv name args false
        else if has_meth world cls "method_missing" then invoke world newblk recv cls "method_missing" (Cons (VSym name, args))
-       else raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world cls)
+       else raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_obj env world recv cls)
            (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
      // `blk` (the enclosing method's block) is threaded so a yield inside
      // the iterated block reaches it (e.g. `@xs.each { |n| yield(n) }`).
@@ -34279,10 +34360,20 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
        | Cons (VBool b, _) -> (if b then 0 else 1)
        | _ -> 0) "exit"
   else
+  // ...recording WHAT was not found and WHERE it was looked for: #name and
+  // #receiver are the two questions a NameError exists to answer, and every
+  // other raise site fills them in. This one -- the bare name, which is where
+  // most NameErrors come from -- answered nil for both.
+  // A blame of VNil is "no receiver known", which is not nil BEING the
+  // receiver, so the field is left off entirely (the prelude has a sentinel
+  // for exactly that difference).
+  let flds9 = (match blame with
+               | VNil -> Cons (("__name", VSym name), Nil)
+               | _ -> Cons (("__name", VSym name), Cons (("__recv", blame), Nil))) in
   match args with
-  | Nil -> if explicit then raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame)
-           else raise_exc world "NameError" ("undefined local variable or method '" ++ name ++ "'" ++ undef_blame world blame)
-  | _ -> raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame)
+  | Nil -> if explicit then raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) flds9
+           else raise_exc_iv world "NameError" ("undefined local variable or method '" ++ name ++ "'" ++ undef_blame world blame) flds9
+  | _ -> raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "'" ++ undef_blame world blame) flds9
 
 // implicit-self send when self is a primitive: honour a subclass tag (its own
 // method, then an alias-to-builtin) before the base primitive class + prims.
@@ -34474,6 +34565,21 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      | Cons (slf, Cons (m, rest9)) ->
        (let (m9, s9, ocls9, i9) = world in
         let c = (match slf with VObj oid -> map_get ocls9 (str_of_int oid) | other -> class_name other) in
+        // ⚠ the MESSAGE is a String, nil, or something with #to_str -- and
+        // anything else is a TypeError, not its #to_s. `Errno::ENOENT.new(:foo)`
+        // read "foo" as the message and `SystemCallError.new(5, 1)` read "5",
+        // where ruby refuses both by name. This is the one place both the
+        // SystemCallError and the Errno::X constructors pass through.
+        let m = (match m with
+                 | VStr h9 -> VStr h9
+                 | VNil -> VNil
+                 | other9 ->
+                   (match conv_try env world other9 "to_str" with
+                    | VStr h9 -> VStr h9
+                    | _ -> (let _ = raise_exc world "TypeError"
+                              ("no implicit conversion of "
+                               ++ display_cls_msg world (dispatch_cls_of world other9)
+                               ++ " into String") in VNil))) in
         let has = (match m with VNil -> false | _ -> true) in
         let given = (match m with VStr h -> sget h | VNil -> "" | other -> to_s other) in
         // a STRING second argument is the LOCATION ruby names in the message
@@ -42190,8 +42296,28 @@ and for_recv_msg = fn (d: str) ->
   else if str_eq d "TrueClass" then "true"
   else if str_eq d "FalseClass" then "false"
   else "an instance of " ++ d
+// The class an OBJECT prints as. Its recorded class may be its own SINGLETON
+// (that is how dispatch finds `def o.x`), and ruby prints the class the object
+// is an instance of. Written once: it was needed in four places and was in none
+// of them, so every object that had ever been given a singleton method printed
+// `#<#<Class:#<C:0x..>>:0x..>` through #inspect, #to_s, `p` and the
+// "undefined method ... for" message alike.
+and obj_print_cls = fn world -> fn (c: str) ->
+  let (_, sup9, _, _) = world in
+  if is_sng_cls c then (if map_has sup9 c then map_get sup9 c else "Object") else c
 and for_recv_cls = fn world -> fn (c: str) -> for_recv_msg (display_cls_msg world c)
 and for_recv_disp = fn world -> fn (c: str) -> for_recv_msg (cls_display world c)
+// ...and an object that HAS a singleton class is named by its own inspect:
+// "an instance of C" is a claim about a class the object no longer shares with
+// anything, so ruby prints the object instead.
+and for_recv_obj = fn env -> fn world -> fn (recv: Val) -> fn (c: str) ->
+  (match recv with
+   | VObj oid9 ->
+     (let (_, _, ocls9, _) = world in
+      if is_sng_cls (map_get ocls9 (str_of_int oid9))
+      then inspect_w env world recv
+      else for_recv_cls world c)
+   | _ -> for_recv_cls world c)
 and for_recv_name = fn (v: Val) -> for_recv_msg (class_name v)
 
 and cls_display = fn world -> fn (c: str) ->
@@ -43491,8 +43617,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             else VNil) in
          if (match rv9 with VNil -> false | _ -> true) then
            (match rv9 with
-            | VObj id -> (let _ = run_singleton_method_added world rv9 m in
-                          singleton_cls_of world id ++ "#" ++ m)
+            | VObj id ->
+              // a FROZEN object cannot gain one: ruby refuses the write before
+              // the hook, and names the receiver in the FrozenError.
+              (let _ = (if ofrozen_get id
+                        then (let _ = raise_exc_iv world "FrozenError"
+                                ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world rv9)
+                                 ++ ": " ++ inspect_w env world rv9)
+                                (Cons (("__recv", rv9), Nil)) in ())
+                        else ()) in
+               let _ = run_singleton_method_added world rv9 m in
+               singleton_cls_of world id ++ "#" ++ m)
             | VClass c -> "(sng:" ++ c ++ ")#" ++ m
             | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
             | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ m
