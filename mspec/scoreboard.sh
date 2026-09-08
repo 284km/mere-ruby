@@ -83,6 +83,28 @@ status_final="$here/../SPEC_STATUS.md"
 # SPEC_TOTALS_OK=1 sweeps anyway. That is the honest override for a deliberate
 # suite UPGRADE, where the counts are supposed to move and the whole table has to
 # be re-measured together.
+# ...and the same question about the subject's NAME. spec_subject above reads
+# the root's git checkout, and a root that is not one -- an unpacked tarball, a
+# `git archive` of the pinned revision, a copy -- makes it "unknown@unknown".
+# That string then REPLACES the revision the table was measured against, so the
+# record stops naming its subject and the next reader cannot tell whether a
+# moved number is the interpreter or the suite. Losing the name is the same
+# failure the count check above exists to prevent, so it is refused the same
+# way and for two seconds rather than after the sweep.
+#
+# SPEC_SUBJECT_OK=1 sweeps anyway, for a root that genuinely has no revision to
+# name.
+sb_rec_subject="$(sed -n 's/^_Measured against ruby\/spec `\(.*\)`\._$/\1/p' "$status_final" 2>/dev/null | tail -1)"
+if [ "$spec_subject" = "unknown@unknown" ] && [ -n "$sb_rec_subject" ] \
+   && [ "$sb_rec_subject" != "unknown@unknown" ] && [ "${SPEC_SUBJECT_OK:-0}" != 1 ]; then
+  echo "scoreboard.sh: REFUSING to sweep -- '$root' is not a git checkout, so this run" >&2
+  echo "cannot name the suite it measured, and would replace '$sb_rec_subject' with" >&2
+  echo "'unknown@unknown'. Point it at a checkout of that revision (git worktree add" >&2
+  echo "--no-checkout --detach <dir> <rev> && git -C <dir> sparse-checkout set spec)," >&2
+  echo "or set SPEC_SUBJECT_OK=1 if the root really has no revision to name." >&2
+  exit 2
+fi
+
 sb_mismatch=""
 for sb_d in $dirs; do
   sb_n="$(ls "$root/$sb_d"/*_spec.rb 2>/dev/null | wc -l | tr -d ' ')"

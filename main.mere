@@ -7453,6 +7453,20 @@ let rx_cmp_flags = fn (src: str) -> fn (fl: str) ->
   (if str_contains fl "n" && (if rx_src_all7 src 0 then false else true) then "n" else "");
 
 let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
+  // A Complex whose imaginary part is zero IS the real it wraps, and `==` says
+  // so from BOTH sides. The arms below are keyed on the LEFT value and each
+  // only knew the kinds it was written for, so `Complex(0,0) == 0` was true
+  // while `0 == Complex(0,0)` was false -- one protocol asked from the other
+  // side, answered differently. Numeric#div is the caller that made it visible:
+  // it refuses a divisor that `== 0`, and Complex(0,0) walked past the refusal.
+  match vb with
+  | VCpx (r2, i2) ->
+    (match va with
+     | VCpx (_, _) -> rb_eq_go va vb
+     | _ -> rb_eq_go i2 (VInt 0) && rb_eq va r2)
+  | _ -> rb_eq_go va vb
+
+and rb_eq_go = fn (va: Val) -> fn (vb: Val) ->
   match va with
   | VInt x ->
     (match vb with
@@ -7465,13 +7479,20 @@ let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
      | VInt y -> feq x (float_of_int y)
      | VFlt y -> feq x y
      | VBig y -> big_eq_flt y x
+     // ...and a Rational, which the VRat arm below already knew about from its
+     // own side: `Rational(0,1) == 0.0` was true and `0.0 == Rational(0,1)` was
+     // false, one question with two answers depending on which side asked.
+     | VRat (n, d) -> feq x (float_of_str n / float_of_str d)
      | _ -> false)
   // canonical form: a VBig never equals a VInt; two VBig equal iff same string.
   // ...and a whole RATIONAL: `10**20 == Rational(10**20, 1)` is true in ruby,
   // and each of these arms knew about VInt and not about the other's bignum.
   | VBig x -> (match vb with VBig y -> str_eq x y | VFlt y -> big_eq_flt x y | VRat (n2, d2) -> str_eq d2 "1" && str_eq n2 x | _ -> false)
   | VRat (n, d) -> (match vb with VRat (n2, d2) -> str_eq n n2 && str_eq d d2 | VInt m -> str_eq d "1" && str_eq n (str_of_int m) | VBig y -> str_eq d "1" && str_eq n y | VFlt f -> feq (float_of_str n / float_of_str d) f | _ -> false)
-  | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> rb_eq r r2 && rb_eq i i2 | VInt m -> rb_eq i (VInt 0) && rb_eq r (VInt m) | _ -> false)
+  // ...and this side is the same rule: a zero imaginary part makes the answer
+  // the real part's, whatever KIND of real the other side is (it used to name
+  // VInt alone, so `Complex(3.5,0) == 3.5` was false).
+  | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> rb_eq r r2 && rb_eq i i2 | _ -> rb_eq i (VInt 0) && rb_eq r vb)
   | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in str_eq x y | _ -> false)
   | VBool x ->
     (match vb with
@@ -7579,13 +7600,33 @@ and hash_eq_unordered_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val l
 // equal and not eql?, so `{4 => 0}.include?(4.0)` is false and a hash can hold
 // both. Ruby's rule is "same #hash and #eql?"; across the numeric classes that
 // comes down to the class having to match, which is what this checks.
-let hkey_eql = fn (a: Val) -> fn (b: Val) ->
-  match a with
-  | VInt _ -> (match b with VFlt _ -> false | VRat (_, _) -> false | _ -> rb_eq a b)
-  | VBig _ -> (match b with VFlt _ -> false | VRat (_, _) -> false | _ -> rb_eq a b)
-  | VFlt _ -> (match b with VInt _ -> false | VBig _ -> false | VRat (_, _) -> false | _ -> rb_eq a b)
-  | VRat (_, _) -> (match b with VInt _ -> false | VBig _ -> false | VFlt _ -> false | _ -> rb_eq a b)
-  | _ -> rb_eq a b;
+// Which CLASS of number a value is, or "" for a value that is not one. VInt
+// and VBig are one class (Integer): which of the two holds a value is this
+// interpreter's representation choice, not something ruby can see.
+let num_kind_tag = fn (v: Val) ->
+  match v with
+  | VInt _ -> "i" | VBig _ -> "i" | VFlt _ -> "f"
+  | VRat (_, _) -> "r" | VCpx (_, _) -> "c"
+  | _ -> "";
+// A hash key matches by `eql?`, which is `==` AND "the same class of number":
+// `{0 => 1}[0.0]` is nil though `0 == 0.0`. This used to be a list of the
+// cross-kind PAIRS that must not match -- a list someone has to keep complete,
+// and Complex was in none of its arms, so `{0 => 1}[Complex(0,0)]` found the
+// key that `0.eql?(Complex(0,0))` denies. Asking for the same kind FIRST cannot
+// be incomplete: a kind that is added later is excluded by default rather than
+// by being remembered.
+let rec hkey_eql = fn (a: Val) -> fn (b: Val) ->
+  let ka = num_kind_tag a in
+  let kb = num_kind_tag b in
+  if str_eq ka "" && str_eq kb "" then rb_eq a b
+  // ...and a Complex is made of two numbers, each of which has to be eql? in
+  // the same sense: `Complex(1,0)` and `Complex(1.0,0)` are == and are not the
+  // same hash key.
+  else if str_eq ka "c" && str_eq kb "c" then
+    (match (a, b) with
+     | (VCpx (r1, i1), VCpx (r2, i2)) -> hkey_eql r1 r2 && hkey_eql i1 i2
+     | _ -> false)
+  else str_eq ka kb && rb_eq a b;
 let hkey_same = fn (ident: bool) -> fn (a: Val) -> fn (b: Val) ->
   if ident then
     (match a with
@@ -12993,6 +13034,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                             ("no implicit conversion of "
                                              ++ display_cls_msg world (dispatch_cls_of world bad9)
                                              ++ " into Integer") in ()))
+                            else ()) in
+                   // `category:` is nil or a name: a Symbol, a String, or an
+                   // object with #to_sym. Anything else is refused BY NAME --
+                   // it used to be accepted and dropped.
+                   let _ = (if hash_haskey kw9 (VSym "category") then
+                              (match hash_get kw9 (VSym "category") with
+                               | VNil -> ()
+                               | VSym _ -> ()
+                               | VStr _ -> ()
+                               | bad9 ->
+                                 (if responds world bad9 "to_sym" then ()
+                                  else
+                                    (let _ = raise_exc world "TypeError"
+                                               ("no implicit conversion of "
+                                                ++ display_cls_msg world (dispatch_cls_of world bad9)
+                                                ++ " into Symbol") in ())))
                             else ()) in
                    ())
                 | Nil -> ()) in
@@ -20913,7 +20970,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       else VCpx (VFlt (to_f m * cos arg), VFlt (to_f m * sin arg)))
                    | _ -> VCpx (VFlt (to_f m * cos (to_f th)), VFlt (to_f m * sin (to_f th)))))
              else raise_exc world "TypeError" "not a real")
-          else VCpx (m, th))
+          // rectangular's two components are reals as well -- it had no check at
+          // all, so `Complex.rectangular(Object.new, 1)` built a Complex with an
+          // object in it, which then printed as `(#<object>+1i)`.
+          else if is_num m && is_num th
+                  && (match m with VCpx _ -> false | _ -> true)
+                  && (match th with VCpx _ -> false | _ -> true)
+          then VCpx (m, th)
+          else raise_exc world "TypeError" "not a real")
        | Cons (m, Nil) ->
          (if is_num m && (match m with VCpx _ -> false | _ -> true)
           then (if str_eq name "polar" then VCpx (num_abs m, VInt 0) else VCpx (m, VInt 0))
@@ -23411,6 +23475,46 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_eq name "+@" || str_eq name "-@") && obj_is_a world cls "Numeric"
             && (if has_meth world cls name then false else true) then
       (if str_eq name "+@" then recv else eval_bin_prim env world blk "-" (VInt 0) recv)
+    // The rest of Numeric's own instance methods, on the same terms: a SUBCLASS
+    // of Numeric that defines none of them inherits these. They are here and not
+    // in the ruby prelude because a prelude `class Numeric` would sit AHEAD of
+    // Integer's and Float's builtins in the walk -- `1.integer?` would answer
+    // Numeric's `false`.
+    //   #integer? is false and #real? is true for a Numeric that is not an
+    //   Integer; #real is the receiver.
+    //   A Numeric is immutable, so #clone and #dup are the receiver itself, and
+    //   `clone(freeze: false)` is the refusal every always-frozen value gives.
+    //   #div refuses a zero divisor BEFORE asking self#/ (ruby's num_div), which
+    //   is what makes div(0), div(0.0) and div(Complex(0,0)) all ZeroDivisionError
+    //   rather than whatever the subclass's own #/ would answer.
+    else if obj_is_a world cls "Numeric" && (if has_meth world cls name then false else true)
+            && (str_eq name "integer?" || str_eq name "real?" || str_eq name "real"
+                || str_eq name "div" || str_eq name "clone" || str_eq name "dup") then
+      (if str_eq name "integer?" then VBool false
+       else if str_eq name "real?" then VBool true
+       else if str_eq name "real" then recv
+       else if str_eq name "div" then
+         (match args with
+          | Cons (o9, _) ->
+            (if rb_eq_w env world (VInt 0) o9 then raise_exc world "ZeroDivisionError" "divided by 0"
+             else
+               let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+               let q9 = invoke_val_c env world nb9 recv "/" (Cons (o9, Nil)) false in
+               invoke_val_c env world nb9 q9 "floor" Nil false)
+          | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
+       else
+         // clone / dup
+         (let unfreeze9 = str_eq name "clone" &&
+            (match args with
+             | Cons (VHsh h9, _) ->
+               (match hash_lookup (hderef h9) (VSym "freeze") with
+                | (true, VBool false) -> true
+                | _ -> false)
+             | _ -> false) in
+          if unfreeze9
+          then raise_exc world "ArgumentError" ("can't unfreeze " ++ (let oc9 = map_get ocls (str_of_int id) in
+                                                                      if is_sng_cls oc9 then cls else oc9))
+          else recv))
     // Exception#== : same class, equal message, and equal backtrace.
     else if (str_eq name "==" || str_eq name "eql?") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (match args with
@@ -28795,6 +28899,26 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr id -> if sfrozen_get id || schilled_get id then (let s2 = mkstr (sget id) in (match s2 with VStr h2 -> (let _ = senc_set h2 (senc_get id) in s2) | _ -> s2)) else recv
      | _ -> recv)
   else if str_eq name "dup" || str_eq name "clone" then
+    // `clone(freeze: false)` asks for an UNFROZEN copy, and the always-frozen
+    // values -- every Numeric, Symbol, nil and the booleans -- have none to
+    // give. Ruby refuses by name ("can't unfreeze Integer"); this used to hand
+    // back the receiver, which is a frozen object answering a request for an
+    // unfrozen one. A frozen STRING is not in this list: it can be cloned
+    // unfrozen, and is.
+    (let _ = (if str_eq name "clone"
+                 && (match args with
+                     | Cons (VHsh h9, _) ->
+                       (match hash_lookup (hderef h9) (VSym "freeze") with
+                        | (true, VBool false) -> true
+                        | _ -> false)
+                     | _ -> false)
+                 && (match recv with
+                     | VInt _ -> true | VBig _ -> true | VFlt _ -> true
+                     | VRat (_, _) -> true | VCpx (_, _) -> true
+                     | VSym _ -> true | VNil -> true | VBool _ -> true
+                     | _ -> false)
+              then (let _ = prim_raise "ArgumentError" ("can't unfreeze " ++ cmp_type_name recv) in ())
+              else ()) in
     // strings are handles now: dup MUST copy, else mutating the dup would
     // write through to the original. The copy carries the ENCODING (clear on
     // a dup of a Shift_JIS string used to answer UTF-8).
@@ -28811,7 +28935,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VHsh h, Nil) -> (match hash_get (hderef h) (VSym "freeze") with VBool b -> b | _ -> true)
         | _ -> true) in
      let _ = if keep then (match cp with VStr id -> let _ = sfrozen_set id in () | VArr id -> let _ = cfrozen_set "a" id in () | VHsh id -> let _ = cfrozen_set "h" id in () | _ -> ()) else () in
-     cp)
+     cp))
   // string interpolation: a String is used as it is (Ruby does not call to_s on
   // one, not even on a subclass instance), everything else converts.
   else if str_eq name "__interp_str" then
@@ -35033,6 +35157,38 @@ and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
   then (let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") "method_added" (Cons (VSym nm, Nil)) in ())
   else ()
 
+// Ruby fires #singleton_method_added on the RECEIVER every time a method is
+// installed in its singleton class. Every default is an empty method except
+// Numeric's, which refuses -- so this is the mechanism by which `def n.foo` on
+// a Numeric is a TypeError, and why a subclass that overrides the hook (as
+// ruby/spec's own NumericSpecs::Subclass does, to let its methods be mocked)
+// gets to allow it again. Hardcoding "the receiver is a Numeric" here would
+// answer the same in the default case and the WRONG thing for both of those.
+//
+// It fires just BEFORE the table write rather than just after: the only hook
+// that does anything raises, and this keeps the caller one expression.
+and run_singleton_method_added = fn world -> fn (recv: Val) -> fn (nm: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  let c9 = dispatch_cls_of world recv in
+  if has_meth world c9 "singleton_method_added"
+  then (let _ = invoke world noblk recv c9 "singleton_method_added" (Cons (VSym nm, Nil)) in ())
+  else ()
+
+// ...and the values that have no singleton class to install into at all. Ruby
+// answers with two different refusals: the immediates cannot have one
+// (TypeError), and Rational/Complex are frozen objects (FrozenError, naming
+// the value).
+and no_singleton_here = fn world -> fn (recv: Val) -> fn (fallback: str) ->
+  let _ = (match recv with
+           | VRat (_, _) -> raise_exc_iv world "FrozenError"
+               ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+               (Cons (("__recv", recv), Nil))
+           | VCpx (_, _) -> raise_exc_iv world "FrozenError"
+               ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv)
+               (Cons (("__recv", recv), Nil))
+           | _ -> raise_exc world "TypeError" "can't define singleton") in
+  fallback
+
 // fire a module's `self.included(base)` hook, if defined, after `base`
 // includes it (the ActiveSupport::Concern entry point).
 and run_included_hook = fn world -> fn (mq: str) -> fn (base: str) ->
@@ -35544,6 +35700,12 @@ and struct_common_src = fn (u: unit) ->
     "  end\n" ++
     "\n" ++
     "  def dig(*ks)\n" ++
+    // `s.dig` with nothing to dig for is an ArgumentError, not a refusal of the
+    // nil that `ks[0]` returns -- Hash#dig and Array#dig both say so and this
+    // one answered "no implicit conversion from nil to integer".
+    "    if ks.empty?\n" ++
+    "      raise ArgumentError, \"wrong number of arguments (given 0, expected 1+)\"\n" ++
+    "    end\n" ++
     "    k = ks[0]\n" ++
     "    ms = members\n" ++
     // a key that is not a NAME is an INDEX, through #to_int: `s[1.5]` and
@@ -35559,6 +35721,13 @@ and struct_common_src = fn (u: unit) ->
     "    v = instance_variable_get(\"@\" + ms[i].to_s + 1.chr)\n" ++
     "    return v if ks.size <= 1\n" ++
     "    return nil if v.nil?\n" ++
+    // ...and an intermediate that cannot be dug into is named in a TypeError,
+    // which is what Hash#dig and Array#dig answer. Calling #dig blind reported
+    // the NoMethodError of the value instead, so the same walk had two answers
+    // depending on which container it started from.
+    "    unless v.respond_to?(:dig)\n" ++
+    "      raise TypeError, v.class.to_s + \" does not have #dig method\"\n" ++
+    "    end\n" ++
     "    v.dig(*ks.drop(1))\n" ++
     "  end\n" ++
     "\n" ++
@@ -35570,6 +35739,16 @@ and struct_common_src = fn (u: unit) ->
     // were an index is what raised "comparison of Range with 0 failed".
     "    ix.flat_map do |k|\n" ++
     "      next to_a.values_at(k) if k.is_a?(Range)\n" ++
+    // Every other subscript is an INDEX and is read as one through #to_int --
+    // a member NAME is not accepted here, as it is by #[] and #dig. Comparing
+    // the raw subscript with 0 made `s.values_at(:a)` an ArgumentError about a
+    // failed comparison where ruby refuses the conversion.
+    "      unless k.is_a?(Integer)\n" ++
+    "        unless k.respond_to?(:to_int)\n" ++
+    "          raise TypeError, k.nil? ? \"no implicit conversion from nil to integer\" : \"no implicit conversion of \" + k.class.to_s + \" into Integer\"\n" ++
+    "        end\n" ++
+    "        k = k.to_int\n" ++
+    "      end\n" ++
     "      i = k < 0 ? ms.size + k : k\n" ++
     "      if i < 0\n" ++
     "        raise IndexError, \"offset \" + k.to_s + \" too small for struct(size:\" + ms.size.to_s + \")\"\n" ++
@@ -35624,12 +35803,46 @@ and struct_common_src = fn (u: unit) ->
     "    out\n" ++
     "  end\n"
 
+// The FIRST argument may be a String naming the constant to define; every
+// argument after it is a member. Dropping strings wherever they appeared meant
+// `Struct.new(:a, "b").members` was [:a] where ruby answers [:a, :b].
 and struct_members_of_args = fn (args: Val list) ->
   match args with
+  | Cons (VStr _, r) -> struct_members_of_args_go r
+  // `Struct.new(nil, :foo)` is the explicit "no name" form and its members are
+  // [:foo]; nil ANYWHERE ELSE is refused like any other non-name. Only the
+  // first position is this door -- reading nil as "skip" everywhere would let
+  // `Struct.new(:a, nil)` through, which ruby names in a TypeError.
+  | Cons (VNil, r) -> struct_members_of_args_go r
+  | _ -> struct_members_of_args_go args
+
+// ...and a member has to BE a symbol or a string. Everything else was silently
+// ignored, so `Struct.new(:animal, 1.0)` built a one-member struct instead of
+// refusing -- and the refusal is the whole of what ruby/spec's new_spec checks
+// on that line.
+and struct_members_of_args_go = fn (args: Val list) ->
+  match args with
   | Nil -> Nil
-  | Cons (VSym s, r) -> Cons (s, struct_members_of_args r)
-  | Cons (VStr _, r) -> struct_members_of_args r   // a leading "Name" string: ignored
-  | Cons (_, r) -> struct_members_of_args r          // keyword_init: hash etc.: ignored
+  | Cons (VSym s, r) -> Cons (s, struct_members_of_args_go r)
+  | Cons (VStr h, r) -> Cons (sget h, struct_members_of_args_go r)
+  // A trailing hash is the `keyword_init:` KEYWORD argument, and it is one only
+  // if it says so: `Struct.new(:animal, {name: "chris"})` is a positional Hash
+  // and ruby refuses it by name. Accepting every trailing hash meant this
+  // interpreter could not tell a keyword from an argument that looks like one.
+  | Cons (VHsh h9, Nil) ->
+    (if (match hash_lookup (hderef h9) (VSym "keyword_init") with (true, _) -> true | _ -> false)
+     then Nil
+     else (let _ = prim_raise "TypeError" (inspect (VHsh h9) ++ " is not a symbol nor a string") in Nil))
+  | Cons (bad, _) -> (let _ = prim_raise "TypeError" (inspect bad ++ " is not a symbol nor a string") in Nil)
+
+// ...and the same member cannot be named twice.
+and struct_dup_check = fn (ms: str list) ->
+  match ms with
+  | Nil -> ()
+  | Cons (m, r) ->
+    (if str_list_has r m
+     then (let _ = prim_raise "ArgumentError" ("duplicate member: " ++ m) in ())
+     else struct_dup_check r)
 
 and struct_build = fn world -> fn (args: Val list) ->
   let (meths, sup, ocls, ivars) = world in
@@ -35650,6 +35863,7 @@ and struct_build = fn world -> fn (args: Val list) ->
                  | Nil -> args)
               | _ -> args) in
   let members = struct_members_of_args args in
+  let _ = struct_dup_check members in
   let n = (if map_has struct_ctr "n" then map_get struct_ctr "n" else 0) in
   let _ = map_set struct_ctr "n" (n + 1) in
   let anon = "Struct_" ++ str_of_int n in
@@ -43049,7 +43263,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          let m = substring name 5 (str_len name) in
          (if lv_has env "self" then
             (match lv_get env "self" with
-             | VObj id -> singleton_cls_of world id ++ "#" ++ m
+             | VObj id -> (let _ = run_singleton_method_added world (VObj id) m in
+                           singleton_cls_of world id ++ "#" ++ m)
              | VClass c -> "(sng:" ++ c ++ ")#" ++ m
              | _ -> m)
           else m)
@@ -43069,11 +43284,23 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             else VNil) in
          if (match rv9 with VNil -> false | _ -> true) then
            (match rv9 with
-            | VObj id -> singleton_cls_of world id ++ "#" ++ m
+            | VObj id -> (let _ = run_singleton_method_added world rv9 m in
+                          singleton_cls_of world id ++ "#" ++ m)
             | VClass c -> "(sng:" ++ c ++ ")#" ++ m
             | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
             | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ m
             | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m
+            // An immediate has no per-object class to put the method in, and
+            // ruby refuses at that step -- before any hook. It used to register
+            // the BARE name here, which defines a top-level method and lets
+            // `def a.test` succeed for `a = 1`. Rational and Complex are not
+            // immediates but are frozen, and ruby refuses those as a write.
+            | VInt _ -> no_singleton_here world rv9 name
+            | VBig _ -> no_singleton_here world rv9 name
+            | VFlt _ -> no_singleton_here world rv9 name
+            | VSym _ -> no_singleton_here world rv9 name
+            | VRat (_, _) -> no_singleton_here world rv9 name
+            | VCpx (_, _) -> no_singleton_here world rv9 name
             | _ -> name)
          // `def C.m` where C is a constant class (not an env local): class
          // method in C's singleton namespace.
@@ -43084,10 +43311,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          else if is_upper_first recv && map_has consts recv
                  && (match map_get consts recv with VClass _ -> false | _ -> true) then
            (match map_get consts recv with
-            | VObj id -> singleton_cls_of world id ++ "#" ++ m
+            | VObj id -> (let _ = run_singleton_method_added world (VObj id) m in
+                          singleton_cls_of world id ++ "#" ++ m)
             | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
             | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ m
             | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m
+            | VInt _ -> no_singleton_here world (map_get consts recv) name
+            | VBig _ -> no_singleton_here world (map_get consts recv) name
+            | VFlt _ -> no_singleton_here world (map_get consts recv) name
+            | VSym _ -> no_singleton_here world (map_get consts recv) name
+            | VRat (_, _) -> no_singleton_here world (map_get consts recv) name
+            | VCpx (_, _) -> no_singleton_here world (map_get consts recv) name
             | _ -> name)
          else if is_upper_first recv && map_has consts recv && (match map_get consts recv with VClass _ -> true | _ -> false) then "(sng:" ++ recv ++ ")#" ++ m
          else name
@@ -46744,6 +46978,23 @@ let core_prelude_a =
   "  def Pathname(path)\n" ++
   "    require \"pathname\"\n" ++
   "    Pathname(path)\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // A Numeric refuses to gain a singleton method, and it refuses BY DEFINING
+  // THE HOOK -- which is why `class Sub < Numeric; def singleton_method_added(n); end; end`
+  // (ruby/spec's own fixture, so that its methods can be mocked) makes it
+  // allowed again, and `remove_method :singleton_method_added` makes it refuse
+  // again. A rule written in the interpreter could not be removed by ruby code.
+  // It is written in ruby, and not in the dispatcher, for the same reason; the
+  // rest of Numeric's methods are the other way round (see invoke_val_c),
+  // because those names have Integer and Float builtins that must keep winning
+  // and this one has none.
+  // The message quotes the method name, and the quote is built rather than
+  // escaped: a `\"` here would have to survive both this string and ruby's lexer.
+  "class Numeric\n" ++
+  "  def singleton_method_added(name)\n" ++
+  "    q = '\"'\n" ++
+  "    raise TypeError, \"can't define singleton method \" + q + name.to_s + q + \" for \" + self.class.to_s\n" ++
   "  end\n" ++
   "end\n";
 

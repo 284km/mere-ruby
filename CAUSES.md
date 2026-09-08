@@ -10,26 +10,26 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 192 files.
+Classified: 181 files.
 
-## DIFF — 192 files, 86 kinds
+## DIFF — 181 files, 82 kinds
 
 | files | kind |
 |---|---|
-| 20 | `ERROR NoMethodError` |
-| 11 | `FAILED expected TypeError to be raised` |
+| 19 | `ERROR NoMethodError` |
 | 10 | `FAILED expected N, got N` |
 | 10 | `ERROR NameError` |
-| 9 | `FAILED expected to be identical` |
 | 7 | `FAILED expected true, got false` |
+| 7 | `FAILED expected to be identical` |
 | 7 | `FAILED expected false, got true` |
+| 7 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected "S", got "S"` |
+| 5 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 5 | `ERROR TypeError` |
-| 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
-| 4 | `FAILED expected ArgumentError to be raised` |
 | 3 | `pass=N fail=N err=N` |
+| 3 | `FAILED raised NoMethodError, expected TypeError` |
 | 3 | `FAILED expected nil, got "S"` |
 | 3 | `FAILED expected SyntaxError to be raised` |
 | 3 | `FAILED expected "S", got nil` |
@@ -42,10 +42,8 @@ Classified: 192 files.
 | 2 | `ERROR RangeError` |
 | 2 | `ERROR ArgumentError` |
 | 1 | `sh: feature_N: command not found` |
-| 1 | `FAILED raised NoMethodError, expected ZeroDivisionError` |
 | 1 | `FAILED raised NoMethodError, expected FrozenError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
-| 1 | `FAILED raised ArgumentError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
 | 1 | `FAILED raised ArgumentError, expected IndexError` |
 | 1 | `FAILED matcher did not match #<OBJ>` |
@@ -65,7 +63,6 @@ Classified: 192 files.
 | 1 | `FAILED expected [[N, [N]], [N, [N, N]], [N, [N]]], got [[N, [N]], [:SYM, [N]], [N, [N, N]], [:SYM, [N]], [N, [N]]]` |
 | 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [N], got [N]` |
-| 1 | `FAILED expected [N, N], got [(N+Ni), (N+Ni)]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
@@ -74,18 +71,17 @@ Classified: 192 files.
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
+| 1 | `FAILED expected ZeroDivisionError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
-| 1 | `FAILED expected N, got (N+Ni)` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
-| 1 | `FAILED expected (N+Ni), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
@@ -107,14 +103,13 @@ Classified: 192 files.
 
 | files | cause |
 |---|---|
-| 11 | `FAILED: expected TypeError to be raised` |
-| 4 | `FAILED: raised NoMethodError, expected TypeError` |
-| 4 | `FAILED: expected ArgumentError to be raised` |
+| 7 | `FAILED: expected TypeError to be raised` |
+| 5 | `FAILED: expected ArgumentError to be raised` |
+| 3 | `FAILED: raised NoMethodError, expected TypeError` |
 | 3 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
-| 2 | `FAILED: returns self: expected to be identical` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
@@ -136,7 +131,6 @@ Classified: 192 files.
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
-| 1 | `FAILED: returns true when self's imaginary part is 0 and the real part and other have numerical equality: expected 3.5, got (3.5+0i)` |
 | 1 | `FAILED: returns true if the Regexp was created with the Regexp::FIXEDENCODING option: expected true, got false` |
 | 1 | `FAILED: returns true if a method was defined using the other one: expected true, got false` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
@@ -147,6 +141,8 @@ Classified: 192 files.
 | 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
+| 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
+| 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 
 </details>
 
@@ -162,10 +158,9 @@ class column says where the weight sits.
 | kernel (8) | `binding chomp chop eval loop select singleton_class test` |
 | unboundmethod (4) | `bind_call bind original_name super_method` |
 | language (4) | `alias constants module numbered_parameters` |
+| struct (3) | `deconstruct initialize new` |
 | method (3) | `original_name super_method to_proc` |
 | symbol (2) | `all_symbols to_proc` |
-| struct (2) | `deconstruct initialize` |
-| numeric (2) | `integer real` |
 | threadgroup (1) | `list` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |
