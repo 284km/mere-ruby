@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 166 files.
+Classified: 165 files.
 
-## DIFF — 166 files, 79 kinds
+## DIFF — 165 files, 79 kinds
 
 | files | kind |
 |---|---|
@@ -21,9 +21,9 @@ Classified: 166 files.
 | 8 | `ERROR NameError` |
 | 7 | `FAILED expected to be identical` |
 | 7 | `FAILED expected false, got true` |
-| 6 | `FAILED expected true, got false` |
 | 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected "S", got "S"` |
+| 5 | `FAILED expected true, got false` |
 | 5 | `FAILED expected ArgumentError to be raised` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
@@ -58,6 +58,7 @@ Classified: 166 files.
 | 1 | `FAILED expected nil, got N` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
 | 1 | `FAILED expected a Float, got nil` |
+| 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
 | 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [N], got [N]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
@@ -79,7 +80,6 @@ Classified: 166 files.
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
-| 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
@@ -121,7 +121,6 @@ Classified: 166 files.
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
 | 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
-| 1 | `FAILED: sets the first element of each sub-Array to :req for required argument if lambda keyword used: expected :req, got :opt` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: selects via the enumerator: expected nil, got "bar"` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
@@ -140,6 +139,7 @@ Classified: 166 files.
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Enumerator if called without a block: expected to be identical` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
+| 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
 
 </details>
 

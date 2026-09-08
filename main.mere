@@ -663,6 +663,12 @@ let is_kw_hash = fn (v: Val) -> match v with VHsh id -> map_has kwarg_marks (str
 // re-splat forwards it as keywords. Cleared when the method is redefined.
 let r2k_methods = map_new ();
 let r2k_procs = map_new ();      // proc ids flagged by Proc#ruby2_keywords
+// ⚠ that flag is shared between a proc and its COPIES, in both directions:
+// ruby marks the underlying method, so `f2 = f1.dup; f1.ruby2_keywords` marks
+// f2 as well -- and the spec asks it in that order too. This maps a copy to the
+// proc it came from, and the mark is read and written at the ROOT of that
+// chain, which is the only key both objects agree on.
+let proc_origin = map_new ();
 // refinements. `refine Target do ... end` (inside a Module.new body) records,
 // per refinery module, the target class and a fresh impl_cls class holding the
 // refined methods. `using refinery` activates them into ref_active (target
@@ -17711,6 +17717,37 @@ and errno_arg_int = fn env -> fn world -> fn (args: Val list) ->
      | _ -> args)
   | Nil -> Nil
 
+// A COPY of a proc. `pr.dup` answers a different object in ruby (and drops the
+// frozen state, which is only observable once there is a second object), and
+// this returned the receiver -- so a dup of a frozen proc was frozen. What a
+// proc IS lives in tables keyed by its id, so a copy is those entries under a
+// fresh one; the id itself is what `equal?` compares.
+// the proc a mark is kept under: itself, or the one it was copied from.
+// Bounded by the chain length (a copy of a copy points at the same root).
+and r2k_root = fn (k: str) ->
+  if map_has proc_origin k
+  then (match map_get proc_origin k with VInt n9 -> str_of_int n9 | _ -> k)
+  else k
+
+and proc_copy = fn (pid: int) ->
+  let np = map_len proc_store in
+  let nk = str_of_int np in
+  let ok = str_of_int pid in
+  let _ = map_set proc_store nk (map_get proc_store ok) in
+  let _ = (if map_has lambda_ids ok then (let _ = map_set lambda_ids nk (map_get lambda_ids ok) in ()) else ()) in
+  let _ = (if map_has proc_arity ok then (let _ = map_set proc_arity nk (map_get proc_arity ok) in ()) else ()) in
+  let _ = (if map_has proc_yblk ok then (let _ = map_set proc_yblk nk (map_get proc_yblk ok) in ()) else ()) in
+  let _ = (if map_has proc_symsrc ok then (let _ = map_set proc_symsrc nk (map_get proc_symsrc ok) in ()) else ()) in
+  let _ = (if map_has proc_home ok then (let _ = map_set proc_home nk (map_get proc_home ok) in ()) else ()) in
+  let _ = (if map_has curry_target ok then (let _ = map_set curry_target nk (map_get curry_target ok) in ()) else ()) in
+  // the ROOT id, as a VInt: a string here would be a handle into the string
+  // store, and this table is not a GC root.
+  let _ = map_set proc_origin nk (VInt (int_of_str (r2k_root ok))) in
+  // the definition site is two entries: the line under the id, the file under "f" ++ id
+  let _ = (if map_has proc_src ok then (let _ = map_set proc_src nk (map_get proc_src ok) in ()) else ()) in
+  let _ = (if map_has proc_src ("f" ++ ok) then (let _ = map_set proc_src ("f" ++ nk) (map_get proc_src ("f" ++ ok)) in ()) else ()) in
+  np
+
 and set_builtin_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
   let (meths9, sup9, ocls9, ivars9) = world in
   let src = (if map_has builtin_alias (cls ++ "#" ++ n2)
@@ -24271,7 +24308,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // one with keyword parameters, or with no bare splat to collect into.
        let ok9 = (match kw_params ps9 with Nil -> str_eq (dsplat_name ps9) "" | _ -> false)
                  && psplat_any ps9 in
-       let _ = (if ok9 then map_set r2k_procs (str_of_int pid) VNil else ()) in
+       let _ = (if ok9 then map_set r2k_procs (r2k_root (str_of_int pid)) VNil else ()) in
        recv)
     // Proc#>> / Proc#<< compose. `f >> g` runs f then g; `f << g` runs g then
     // f. Both reduce to "outer(inner(*args))", and the argument may be ANY
@@ -24348,7 +24385,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       // a ruby2_keywords proc keeps its trailing `key:` hash MARKED as
       // keywords -- that is the whole point of the flag: the hash it collects
       // into *rest can be re-splatted and still arrive as keywords.
-      let _ = (if map_has r2k_procs (str_of_int pid) then mark_r2k_tail args else ()) in
+      let _ = (if map_has r2k_procs (r2k_root (str_of_int pid)) then mark_r2k_tail args else ()) in
       let theblk = map_get proc_store (str_of_int pid) in
       // a lambda checks arity strictly (procs stay lenient).
       let _ =
@@ -24466,7 +24503,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq name "parameters" then
       (match map_get proc_store (str_of_int pid) with
        (h, ps, body, e) ->
-         let is_lam = map_has lambda_ids (str_of_int pid) in
+         // `parameters(lambda: true)` asks for the answer a LAMBDA would give
+         // (leading positionals :req) and `lambda: false` for a proc's (:opt),
+         // whatever the receiver is. The keyword was ignored, so the two specs
+         // that ask a proc to describe itself as a lambda read :opt.
+         let is_lam = (let (_, kw9) = peel_kw_hash args in
+                       match hash_lookup kw9 (VSym "lambda") with
+                       | (true, VNil) -> map_has lambda_ids (str_of_int pid)
+                       | (true, v9) -> truthy v9
+                       | _ -> map_has lambda_ids (str_of_int pid)) in
          (match strip_marker_params ps with
           // no explicit params: the numbered parameters _1.._N, required for a
           // lambda and optional for a proc.
@@ -24574,6 +24619,10 @@ and blk_arity = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Expr) l
 and pos_splat_any = fn (ps: str list) ->
   match ps with
   | Nil -> false
+  // ⚠ the trailing comma's implicit rest is not a splat for ARITY either:
+  // `proc { |x,| }.arity` is 1 in ruby and was -2 here, because the marker
+  // this interpreter writes as `*,` looked like `*rest` to the count.
+  | Cons ("*,", r) -> pos_splat_any r
   | Cons (p, r) ->
     (str_len p > 0 && str_eq (char_at p 0) "*" && (if str_len p >= 2 && str_eq (substring p 0 2) "**" then false else true))
     || pos_splat_any r
@@ -24636,6 +24685,11 @@ and param_meta_of = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Exp
   | Cons ("~emptyparams~", rest) -> param_meta_of is_lam rest ds
   // an attr_writer's argument has no name to report
   | Cons ("__attr_v", rest) -> Cons (arr_new (Cons (VSym "req", Nil)), param_meta_of is_lam rest ds)
+  // ...nor is the implicit rest of a TRAILING COMMA (`|x,|`), which this
+  // interpreter carries as a splat named ",". It is what makes the block
+  // destructure its argument, and ruby does not show it: `proc { |x,| }`
+  // answers [[:opt, :x]] and reported [[:opt, :x], [:rest, :","]] here.
+  | Cons ("*,", rest) -> param_meta_of is_lam rest ds
   | Cons (p, rest) ->
     let pair =
       (if str_len p >= 2 && str_eq (substring p 0 2) "**" then
@@ -28478,7 +28532,10 @@ and val_is_frozen = fn (recv: Val) ->
   | VHsh id -> cfrozen_get "h" id
   | VObj id -> ofrozen_get id
   | VClass c -> is_sng_cls c && ofrozen_key (sng_inner c)
-  | VProc _ -> false
+  // a Proc CAN be frozen (`proc {}.freeze.frozen?` is true), and #clone carries
+  // that over while #dup drops it -- the same pair of rules the containers
+  // follow. This answered false however often it had been frozen.
+  | VProc id -> cfrozen_get "p" id
   | VMain -> false
   | _ -> true
 
@@ -29224,7 +29281,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // it was created under --enable-frozen-string-literal or explicitly frozen.
     // an object's singleton class is frozen exactly when the object is.
     VBool (val_is_frozen recv)
-  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set "a" id in recv | VHsh id -> let _ = cfrozen_set "h" id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
+  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set "a" id in recv | VHsh id -> let _ = cfrozen_set "h" id in recv | VProc id -> let _ = cfrozen_set "p" id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
   // String#-@ interns: a frozen string is returned as is, otherwise a frozen
   // copy. (CRuby also deduplicates; that is unobservable apart from identity,
   // and mere-ruby strings are handles, so a fresh frozen copy behaves the
@@ -29274,18 +29331,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // write through to the original. The copy carries the ENCODING (clear on
     // a dup of a Shift_JIS string used to answer UTF-8).
     (let cp = (match recv with
+               | VProc pid9 -> VProc (proc_copy pid9)
                | VArr id -> arr_new (deref id)
                | VStr h -> (let c2 = mkstr (sget h) in (match c2 with VStr nid -> (let _ = senc_set nid (senc_get h) in c2) | _ -> c2))
                // a copy of a compare_by_identity hash compares that way too.
                | VHsh h -> (let c3 = mkhash (hderef h) in let _ = hcbi_copy h c3 in c3)
                | _ -> recv) in
      // #clone carries the frozen state over, #dup drops it. `clone(freeze: false)` opts out.
-     let was_frozen = (match recv with VStr id -> sfrozen_get id | VArr id -> cfrozen_get "a" id | VHsh id -> cfrozen_get "h" id | _ -> false) in
+     let was_frozen = (match recv with VStr id -> sfrozen_get id | VArr id -> cfrozen_get "a" id | VHsh id -> cfrozen_get "h" id | VProc id -> cfrozen_get "p" id | _ -> false) in
      let keep = str_eq name "clone" && was_frozen &&
        (match args with
         | Cons (VHsh h, Nil) -> (match hash_get (hderef h) (VSym "freeze") with VBool b -> b | _ -> true)
         | _ -> true) in
-     let _ = if keep then (match cp with VStr id -> let _ = sfrozen_set id in () | VArr id -> let _ = cfrozen_set "a" id in () | VHsh id -> let _ = cfrozen_set "h" id in () | _ -> ()) else () in
+     let _ = if keep then (match cp with VStr id -> let _ = sfrozen_set id in () | VArr id -> let _ = cfrozen_set "a" id in () | VHsh id -> let _ = cfrozen_set "h" id in () | VProc id -> let _ = cfrozen_set "p" id in () | _ -> ()) else () in
      cp))
   // string interpolation: a String is used as it is (Ruby does not call to_s on
   // one, not even on a subclass instance), everything else converts.
