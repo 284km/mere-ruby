@@ -12,7 +12,7 @@ Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
 Classified: 155 files.
 
-## DIFF — 155 files, 77 kinds
+## DIFF — 155 files, 76 kinds
 
 | files | kind |
 |---|---|
@@ -32,6 +32,7 @@ Classified: 155 files.
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
+| 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected N, got nil` |
 | 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR RangeError` |
@@ -69,13 +70,11 @@ Classified: 155 files.
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
 | 1 | `FAILED expected ThreadError to be raised` |
-| 1 | `FAILED expected SyntaxError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
-| 1 | `FAILED expected FrozenError to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected (N/N), got N` |
@@ -106,6 +105,7 @@ Classified: 155 files.
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: is a private method: expected truthy from #include?` |
+| 2 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
@@ -137,7 +137,6 @@ Classified: 155 files.
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
-| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
 
 </details>
 

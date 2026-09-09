@@ -458,6 +458,13 @@ let obj_frozen = map_new () in
 let ofrozen_set = fn (id: int) -> let _ = map_set obj_frozen (str_of_int id) "1" in ();
 let ofrozen_get = fn (id: int) -> map_has obj_frozen (str_of_int id);
 let ofrozen_key = fn (k: str) -> map_has obj_frozen k;
+// A CLASS or MODULE can be frozen too, and then it refuses every change to
+// itself: `K.freeze` was a no-op that even left `K.frozen?` answering false,
+// so a frozen class kept accepting defs, includes, constants and attrs.
+// Keyed by class NAME (a class is named, not identified by an object id).
+let cls_frozen = map_new () in
+let clsfrozen_set = fn (c: str) -> let _ = map_set cls_frozen c "1" in ();
+let clsfrozen_get = fn (c: str) -> map_has cls_frozen c;
 let cli_fsl = map_new () in
 let fsl_ctx = map_new () in   // "v" -> the current file's magic-comment answer   // key "on" present => --enable-frozen-string-literal
 let cli_file = map_new () in  // key "p" -> the running script's path (__FILE__)
@@ -20708,9 +20715,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                           "wrong number of arguments (given 0, expected 1+)" in ())
               | _ -> ()) in
      let _ = extend_arg_check world args in
+     // ...and the refusal NAMES what it refused, the way ruby's does: the
+     // receiver's class and its inspect ("can't modify frozen Object:
+     // #<Object:0x...>"), not the word "object" and a placeholder. A frozen
+     // CLASS refuses this too, and reports itself as a Class or a Module.
+     let _ = (match recv with
+              | VClass c9 -> frz_cls_check world c9
+              | _ -> ()) in
      let _ = (if val_frozen_mut recv
               then (let _ = raise_exc world "FrozenError"
-                      ("can't modify frozen object: " ++ inspect recv) in ()) else ()) in
+                      ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world recv)
+                       ++ ": " ++ inspect_w env world recv) in ()) else ()) in
      let sc = (match recv with
                | VClass c -> "(sng:" ++ c ++ ")"
                | VObj id -> singleton_cls_of world id
@@ -20758,6 +20773,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   else
   match recv with
   | VClass c ->
+    // every writer named in cls_frozen_refuses goes through this ONE check.
+    // The empty-store test comes first: this arm is every class-method call in
+    // the program, and a program that never freezes a class should pay one map
+    // length for it, not a walk down twenty names.
+    let _ = (if map_len cls_frozen > 0 && cls_frozen_refuses name args
+             then frz_cls_check world c else ()) in
     // a singleton class cannot be instantiated: new / allocate raise TypeError.
     if is_sng_cls c && (str_eq name "new" || str_eq name "allocate") then
       raise_exc world "TypeError" "can't create instance of singleton class"
@@ -25396,6 +25417,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                      | VBool b2 -> (if b2 then "TrueClass" else "FalseClass")
                      | _ -> "") in
        let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr s2, _) -> sget s2 | _ -> "") in
+       let _ = frz_recv_check env world recv in
        if str_eq target "" then raise_exc world "TypeError" "can't define singleton"
        else
          (let (h2, ps2, bb2, e2) = newblk in
@@ -25408,6 +25430,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     else if str_eq name "define_method" && (match recv with VClass _ -> true | _ -> false) then
       (match recv with
        | VClass c ->
+         let _ = frz_cls_check world c in
          let (meths, sup, ocls, ivars) = world in
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | _ -> "") in
          let (h2, ps2, bb2, e2) = newblk in
@@ -28866,7 +28889,7 @@ and val_is_frozen = fn (recv: Val) ->
   | VArr id -> cfrozen_get "a" id
   | VHsh id -> cfrozen_get "h" id
   | VObj id -> ofrozen_get id
-  | VClass c -> is_sng_cls c && ofrozen_key (sng_inner c)
+  | VClass c -> clsfrozen_get c || (is_sng_cls c && ofrozen_key (sng_inner c))
   // a Proc CAN be frozen (`proc {}.freeze.frozen?` is true), and #clone carries
   // that over while #dup drops it -- the same pair of rules the containers
   // follow. This answered false however often it had been frozen.
@@ -29616,7 +29639,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // it was created under --enable-frozen-string-literal or explicitly frozen.
     // an object's singleton class is frozen exactly when the object is.
     VBool (val_is_frozen recv)
-  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set "a" id in recv | VHsh id -> let _ = cfrozen_set "h" id in recv | VProc id -> let _ = cfrozen_set "p" id in recv | VObj id -> let _ = ofrozen_set id in recv | _ -> recv)
+  else if str_eq name "freeze" then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set "a" id in recv | VHsh id -> let _ = cfrozen_set "h" id in recv | VProc id -> let _ = cfrozen_set "p" id in recv | VObj id -> let _ = ofrozen_set id in recv | VClass c -> let _ = clsfrozen_set c in recv | _ -> recv)
   // String#-@ interns: a frozen string is returned as is, otherwise a frozen
   // copy. (CRuby also deduplicates; that is unobservable apart from identity,
   // and mere-ruby strings are handles, so a fresh frozen copy behaves the
@@ -42747,6 +42770,68 @@ and display_cls = fn world -> fn (c: str) ->
 // questions.
 and display_cls_msg = fn world -> fn (c: str) -> cls_display world (display_cls world c)
 
+// One fact -- "this class is frozen" -- with a door for every writer, so the
+// names are ENUMERATED FROM RUBY rather than remembered: each candidate was
+// called on a frozen Class and the ones that raised FrozenError are here.
+// Three do NOT: a bare `private` (the visibility MODE, which changes nothing
+// yet), `new`/`allocate`, and `dup`/`clone`/subclassing -- a frozen class is
+// still a perfectly good class to make things from.
+// which statements in a class body actually CHANGE the class?
+// The receiver side of the same fact: a frozen OBJECT refuses a singleton
+// method, and a frozen CLASS reports itself as a Class or a Module. Every
+// route that installs a singleton asks this -- `def o.m`, instance_eval's
+// definee, define_singleton_method -- so the three cannot drift apart.
+and frz_recv_check = fn env -> fn world -> fn (recv: Val) ->
+  match recv with
+  | VClass c -> frz_cls_check world c
+  | VObj id ->
+    (if ofrozen_get id
+     then (let _ = raise_exc_iv world "FrozenError"
+             ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world recv)
+              ++ ": " ++ inspect_w env world recv) (Cons (("__recv", recv), Nil)) in ())
+     else ())
+  | _ -> ()
+
+and cls_body_writes = fn (s: Stmt) ->
+  match s with
+  | SDef (_, _, _, _) -> true
+  | SAttr (_, _) -> true
+  | SAlias (_, _) -> true
+  | SUndef _ -> true
+  | SInclude (_, _) -> true
+  | SClass (_, _, _) -> true
+  | SClassE (_, _, _) -> true
+  | SVis (_, names) -> (match names with Nil -> false | _ -> true)
+  | SAssign (n, _) -> is_upper_first n
+  | _ -> false
+
+and cls_frozen_refuses = fn (name: str) -> fn (args: Val list) ->
+  str_eq name "define_method" || str_eq name "define_singleton_method" ||
+  str_eq name "alias_method" || str_eq name "remove_method" || str_eq name "undef_method" ||
+  str_eq name "attr_accessor" || str_eq name "attr_reader" || str_eq name "attr_writer" ||
+  str_eq name "attr" || str_eq name "const_set" || str_eq name "remove_const" ||
+  str_eq name "include" || str_eq name "prepend" || str_eq name "extend" ||
+  str_eq name "instance_variable_set" || str_eq name "remove_instance_variable" ||
+  str_eq name "private_class_method" || str_eq name "public_class_method" ||
+  str_eq name "private_constant" || str_eq name "public_constant" ||
+  str_eq name "ruby2_keywords" ||
+  // ...with NAMES. `K.send(:private)` on a frozen class is allowed: it only
+  // sets the mode for defs that would follow, and none can.
+  ((str_eq name "private" || str_eq name "public" || str_eq name "protected")
+   && (match args with Nil -> false | _ -> true))
+
+and frz_cls_check = fn world -> fn (c0: str) ->
+  // `K.instance_eval { def m; end }` writes to K's SINGLETON namespace, and
+  // ruby still calls it modifying K ("can't modify frozen Class: K"). An
+  // object's singleton -- "(sng:<id>)" -- is not a class name and is answered
+  // by the object check instead.
+  let c = if is_sng_cls c0 then sng_inner c0 else c0 in
+  if clsfrozen_get c
+  then (let _ = raise_exc world "FrozenError"
+          ("can't modify frozen " ++ (if map_has modules c then "Module" else "Class")
+           ++ ": " ++ display_cls_msg world c) in ())
+  else ()
+
 // ---- Exception#detailed_message / #full_message ---------------------------
 // The first line of a report, without the frame: "msg (Class)". Two cases are
 // not that, and both are about an EMPTY message -- an exception with nothing
@@ -43283,6 +43368,10 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
   | Cons (SBegin (bbody, Nil, Nil, Nil), rest) ->
     register_class_v world cls (list_append_stmt bbody rest) vis cenv
   | Cons (s, rest) ->
+    // a frozen class refuses each WRITE in the body -- but not the body: ruby
+    // lets `class K; end` reopen a frozen K and raises on the first statement
+    // that would change it, so this is per statement, not at the entry.
+    let _ = (if map_len cls_frozen > 0 && cls_body_writes s then frz_cls_check world cls else ()) in
     let vis2 = (match s with SVis (m, Nil) -> m | _ -> vis) in
     let f =
       (match s with
@@ -44174,7 +44263,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             (match lv_get env "self" with
              | VObj id -> (let _ = run_singleton_method_added world (VObj id) m in
                            singleton_cls_of world id ++ "#" ++ m)
-             | VClass c -> "(sng:" ++ c ++ ")#" ++ m
+             | VClass c -> (let _ = frz_cls_check world c in "(sng:" ++ c ++ ")#" ++ m)
              | _ -> m)
           else m)
        else if str_contains name "#" then
@@ -44204,7 +44293,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                         else ()) in
                let _ = run_singleton_method_added world rv9 m in
                singleton_cls_of world id ++ "#" ++ m)
-            | VClass c -> "(sng:" ++ c ++ ")#" ++ m
+            | VClass c -> (let _ = frz_cls_check world c in "(sng:" ++ c ++ ")#" ++ m)
             | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ m
             | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ m
             | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ m
@@ -44241,7 +44330,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             | VRat (_, _) -> no_singleton_here world (map_get consts recv) name
             | VCpx (_, _) -> no_singleton_here world (map_get consts recv) name
             | _ -> name)
-         else if is_upper_first recv && map_has consts recv && (match map_get consts recv with VClass _ -> true | _ -> false) then "(sng:" ++ recv ++ ")#" ++ m
+         else if is_upper_first recv && map_has consts recv && (match map_get consts recv with VClass _ -> true | _ -> false) then
+           (let _ = (match map_get consts recv with VClass c8 -> frz_cls_check world c8 | _ -> ()) in
+            "(sng:" ++ recv ++ ")#" ++ m)
          else name
        // The DEFAULT DEFINEE, when one is in force. `instance_eval` /
        // `instance_exec` on an object move it to that object's SINGLETON class
@@ -44256,7 +44347,8 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          (match lv_get env "__definee_cls" with VStr h -> sget h ++ "#" ++ name | _ -> name)
        else if lv_has env "__definee_recv"
                && (match lv_get env "__definee_recv" with VNil -> false | _ -> true) then
-         (match lv_get env "__definee_recv" with
+         (let _ = frz_recv_check env world (lv_get env "__definee_recv") in
+          match lv_get env "__definee_recv" with
           | VObj id -> (let _ = run_singleton_method_added world (VObj id) name in
                         singleton_cls_of world id ++ "#" ++ name)
           | VClass c -> "(sng:" ++ c ++ ")#" ++ name
@@ -44268,7 +44360,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else if lv_has env "self" then
          (match lv_get env "self" with
           | VObj id -> map_get ocls (str_of_int id) ++ "#" ++ name
-          | VClass c -> c ++ "#" ++ name
+          // `Module.new { self.freeze; def foo; end }` runs its body as a
+          // BLOCK with self rebound, not through the class-body walker, so the
+          // walker's per-statement check never saw this def.
+          | VClass c -> (let _ = frz_cls_check world c in c ++ "#" ++ name)
           // nil/true/false are singletons: def in their instance_eval defines
           // on NilClass/TrueClass/FalseClass so nil.<method> can reach it.
           | VNil -> "NilClass#" ++ name
