@@ -12,11 +12,15 @@ set -e
 # this option does not).
 RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"
 export RUBYOPT
+# The interpreter under test. A candidate build has to be gated BEFORE it is
+# moved onto ./mere-ruby, because a sweep in flight owns that path -- writing
+# it mid-measurement tests a half-written binary and invents a regression.
+MR_BIN="${MR_BIN:-./mere-ruby}"
 # One interpreter self-check first: an Errno class registered with no strerror
 # text loses its message prefix SILENTLY (`raise Errno::EXYZ, "m"` would read "m"
 # where ruby reads "<text> - m"), so the class list and the text table are asked
 # about each other rather than trusted to stay in step.
-errno_out="$(MERE_RUBY_ERRNO_CHECK=1 ./mere-ruby corpus/01_arith.rb 2>&1 >/dev/null || true)"
+errno_out="$(MERE_RUBY_ERRNO_CHECK=1 "$MR_BIN" corpus/01_arith.rb 2>&1 >/dev/null || true)"
 case "$errno_out" in
   *MISSING*) echo "$errno_out"
              echo "an Errno class has no strerror text -- see errno_desc in main.mere"
@@ -38,7 +42,7 @@ exp="$tmpd/exp.txt"; got="$tmpd/got.txt"; dif="$tmpd/diff.txt"
 pass=0
 for f in corpus/*.rb; do
   ruby "$f" > "$exp" 2>/dev/null
-  ./mere-ruby "$f" > "$got"
+  "$MR_BIN" "$f" > "$got"
   if ! diff -u "$exp" "$got" > "$dif"; then
     echo "FAIL $f"
     cat "$dif"

@@ -10,24 +10,24 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 158 files.
+Classified: 155 files.
 
-## DIFF — 158 files, 76 kinds
+## DIFF — 155 files, 77 kinds
 
 | files | kind |
 |---|---|
-| 19 | `ERROR NoMethodError` |
+| 18 | `ERROR NoMethodError` |
 | 10 | `FAILED expected N, got N` |
 | 8 | `FAILED expected false, got true` |
 | 8 | `ERROR NameError` |
 | 6 | `FAILED expected to be identical` |
-| 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected ArgumentError to be raised` |
+| 5 | `FAILED expected TypeError to be raised` |
 | 5 | `FAILED expected "S", got "S"` |
 | 5 | `ERROR TypeError` |
-| 4 | `FAILED expected truthy from #include?` |
-| 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 3 | `FAILED expected truthy from #include?` |
+| 3 | `FAILED expected true, got false` |
 | 3 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
@@ -75,6 +75,7 @@ Classified: 158 files.
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
+| 1 | `FAILED expected FrozenError to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected (N/N), got N` |
@@ -97,8 +98,8 @@ Classified: 158 files.
 
 | files | cause |
 |---|---|
-| 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
+| 5 | `FAILED: expected TypeError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
@@ -150,9 +151,9 @@ class column says where the weight sits.
 | class | absent names (from the spec filenames) |
 |---|---|
 | kernel (9) | `binding chomp chop eval loop open select singleton_class test` |
-| language (4) | `alias constants module numbered_parameters` |
 | unboundmethod (3) | `bind_call bind super_method` |
 | method (3) | `equal_value super_method to_proc` |
+| language (3) | `constants module numbered_parameters` |
 | symbol (2) | `all_symbols to_proc` |
 | threadgroup (1) | `list` |
 | struct (1) | `new` |

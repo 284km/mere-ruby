@@ -26,7 +26,8 @@
 #     starts blocking this fails instead of never returning.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
-mr="$here/../mere-ruby"
+# see run_corpus.sh: a candidate build is gated before it takes over the path.
+mr="${MR_BIN:-$here/../mere-ruby}"
 ref="${1:-ruby}"
 [ -x "$mr" ] || { echo "clitest: no $mr"; exit 2; }
 command -v "$ref" > /dev/null || { echo "clitest: no reference ruby ($ref)"; exit 2; }

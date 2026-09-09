@@ -597,6 +597,12 @@ let anon_name = map_new ();
 // check is a single map lookup in the overwhelmingly common case (nobody
 // defines one) rather than an ancestor walk.
 let hook_flags = map_new ();
+// The DEFAULT VISIBILITY for top-level `def`s. A bare `public` / `private` at
+// the top level is a MODE, not a call on names -- language/fixtures/def.rb
+// switches it with a bare `public` and the spec then asks Object for the
+// method by visibility. Only the `public :name` form was handled, so the mode
+// silently did nothing.
+let tl_vis = map_new ();
 
 // Kernel#set_trace_func: the proc ruby hands every event to. Kept behind a
 // flag in hook_flags, so a program that never installs one pays a single map
@@ -20769,6 +20775,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "MatchData" && (str_eq name "new" || str_eq name "allocate")
             && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for class MatchData")
+    // Rational and Complex are BUILT, never allocated: ruby removes both names,
+    // and both refusals are NoMethodError. `Rational.new(1)` answered a plain
+    // object of a class whose every method expects a numerator and a
+    // denominator -- and core/rational/rational_spec asks for exactly this.
+    else if (str_eq c "Rational" || str_eq c "Complex")
+            && (str_eq name "new" || str_eq name "allocate")
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for class " ++ c)
+    // ...and the classes whose values are IMMEDIATE (or opaque) have no
+    // allocator at all: `new` is gone (NoMethodError) and `allocate` refuses
+    // with a TypeError, the same two-step the true/false/nil specs check.
+    else if (str_eq c "Symbol" || str_eq c "Integer" || str_eq c "Float"
+             || str_eq c "Method" || str_eq c "UnboundMethod" || str_eq c "Binding")
+            && (str_eq name "new" || str_eq name "allocate")
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      (if str_eq name "allocate"
+       then raise_exc world "TypeError" ("allocator undefined for " ++ c)
+       else raise_exc world "NoMethodError" ("undefined method 'new' for class " ++ c))
     else if (str_eq c "TrueClass" || str_eq c "FalseClass" || str_eq c "NilClass")
             && (str_eq name "new" || str_eq name "allocate")
             && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
@@ -22314,6 +22338,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     // answers where the method was written, which for an alias
                     // is where the method it names was written.
                     let _ = copy_meth_src (c ++ "#" ++ n1) (origin ++ "#" ++ n2) in
+                    // an alias inherits the SOURCE's visibility. Only the
+                    // top-level branch below said so, because a top-level def
+                    // used to live under a bare key; once it became the private
+                    // Object#ret1 it is found HERE, and the alias came out
+                    // public -- `k2.new.bar` answered where ruby refuses.
+                    let _ = if map_has privates (origin ++ "#" ++ n2) then map_set privates (c ++ "#" ++ n1) VNil else () in
+                    let _ = if map_has protecteds (origin ++ "#" ++ n2) then map_set protecteds (c ++ "#" ++ n1) VNil else () in
                     let _ = if str_eq origin c then () else map_set alias_origin (c ++ "#" ++ n1) origin in
                     if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
                  // A TOP-LEVEL method is stored under its bare name, with no
@@ -25084,11 +25115,20 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
 // bodies that actually yield pay for this.
 // `public def m` at the top level: copy the top-level method into Object's
 // table, where every receiver's lookup ends up.
+and mark_toplevel_private = fn meths -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let _ = (if map_has meths ("Object#" ++ n) then map_set privates ("Object#" ++ n) VNil else ()) in
+    mark_toplevel_private meths rest
+
 and publish_toplevel = fn meths -> fn (names: str list) ->
   match names with
   | Nil -> ()
   | Cons (n, rest) ->
     let _ = (if map_has meths n then map_set meths ("Object#" ++ n) (map_get meths n) else ()) in
+    // the def already installed a PRIVATE Object entry; `public` lifts the mark.
+    let _ = (if map_has privates ("Object#" ++ n) then map_delete privates ("Object#" ++ n) else ()) in
     publish_toplevel meths rest
 
 and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
@@ -25630,8 +25670,21 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // rebind self in a COPY of the block's captured env, not the shared
        // env itself: a nested call of the same proc (`pr.call` inside the
        // instance_eval'd pr) must still see the proc's own lexical self.
+       // the BLOCK form of instance_eval takes no arguments (only instance_exec
+       // forwards them), and ruby counts them before running anything. This
+       // silently ignored the extras and ran the block.
+       if str_eq name "instance_eval" && (match args with Nil -> false | _ -> true) then
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
+       else
        let e3c = lv_flat e3 in
        let _ = map_set e3c "self" recv in
+       // ...and the DEFAULT DEFINEE moves with it: a bare `def` in this block
+       // belongs to the receiver's singleton class. Stored as the receiver
+       // (not the class name) so the hidden singleton class is only created if
+       // a def actually happens -- giving one to every instance_eval'd object
+       // would change what `class`, `clone` and `singleton_class?` answer.
+       let _ = map_set e3c "__definee_recv" recv in
        let blkargs = if str_eq name "instance_exec" then args else Cons (recv, Nil) in
        flow_value (run_block world blk (h3, ps3, bb3, e3c) blkargs))
     else
@@ -25799,6 +25852,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let (h3, ps3, bb3, e3) = newblk in
           let saved_self = if lv_has e3 "self" then lv_get e3 "self" else VNil in
           let _ = lv_set e3 "self" (VClass anon) in
+          // ...and the DEFINEE with it. This block runs in the SHARED env, so
+          // an enclosing instance_eval's definee was still in force and every
+          // `def hello` in a `Module.new do .. end` written inside a spec
+          // example became a singleton method of the example object.
+          let saved_dr = if lv_has e3 "__definee_recv" then lv_get e3 "__definee_recv" else VNil in
+          let saved_dc = if lv_has e3 "__definee_cls" then lv_get e3 "__definee_cls" else VNil in
+          let _ = lv_set e3 "__definee_recv" VNil in
+          let _ = lv_set e3 "__definee_cls" VNil in
           let saved_cref = cur_lex () in
           let _ = set_lex anon in
           // a `using` inside the block is scoped to it (like register_class):
@@ -25807,11 +25868,30 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = flow_value (run_block world blk newblk (Cons (VClass anon, Nil))) in
           let _ = restore_ref_active saved_ref in
           let _ = set_lex saved_cref in
+          let _ = lv_set e3 "__definee_recv" saved_dr in
+          let _ = lv_set e3 "__definee_cls" saved_dc in
           let _ = lv_set e3 "self" saved_self in
           VClass anon)
        // class_exec / module_exec differ from _eval only in taking arguments
        // (and never a string); with a block body the class-body treatment is
        // the same, and mere-ruby's blocks already ignore extra arguments.
+       // `C.class_exec(5) { |x| ... }` -- the _exec forms pass their arguments to
+       // the block, and a class BODY has no parameters to bind them to, so
+       // every argument-taking form answered NoMethodError. Run it as a block
+       // with self rebound to the class and the definee NAMED (the class for
+       // class_exec/module_exec, its singleton for instance_exec), which is
+       // what makes a `def` inside land in the right table.
+       else if (str_eq name "class_exec" || str_eq name "module_exec" || str_eq name "instance_exec")
+               && (match args with Nil -> false | _ -> true) then
+         (let (h3, ps3, bb3, e3) = newblk in
+          let e3c = lv_flat e3 in
+          let _ = map_set e3c "self" (VClass c) in
+          let _ = map_set e3c "__definee_cls" (mkstr (if str_eq name "instance_exec" then "(sng:" ++ c ++ ")" else c)) in
+          flow_value (run_block world blk (h3, ps3, bb3, e3c) args))
+       else if (str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "instance_eval")
+               && (match args with Nil -> false | _ -> true) then
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
        else if str_eq name "class_eval" || str_eq name "module_eval"
                || str_eq name "class_exec" || str_eq name "module_exec" then
          // run the body as class-body statements (defs go to the class), but a
@@ -25820,8 +25900,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (let (h3, ps3, bb3, e3) = newblk in
           let cscope = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
           flow_value (register_class_blk world c bb3 cscope e3))
-       else if str_eq name "instance_eval" then
-         (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class world c bb3))
+       else if str_eq name "instance_eval" || str_eq name "instance_exec" then
+         (let (h3, ps3, bb3, e3) = newblk in flow_value (register_class_ieval world c bb3))
        else if str_eq c "Array" && str_eq name "new" then
          // Array.new(n) { |i| ... }: the block's value per index, with the same
          // size refusal the value form gets (and a break answers its value).
@@ -28365,18 +28445,30 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
      else n)
   else n
 
-// does builtin class `cls` provide method `name`? (reflection only)
-and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
-  if str_eq cls "String" then is_str_method name || is_prim_method name
-  else if str_eq cls "Array" then is_arr_method name || is_prim_method name
-  else if str_eq cls "Hash" then is_hash_method name || is_prim_method name
+
+// Does builtin class `cls` provide `name` ITSELF -- not counting the shared
+// Kernel-ish list every class answers? Two readers need two different
+// questions, and one list answering both is what let a reopened Object break
+// every builtin: `class Object; def size; end; end` made `[1,2].size` answer
+// 99, because has_meth walked past Array (whose #size is a builtin, invisible
+// to the walk) and found the user entry on Object. Dispatch asks THIS one --
+// a builtin the receiver's own class owns answers before any ancestor's
+// user-defined method. Reflection asks builtin_has_meth below, which adds the
+// shared list back.
+// ⚠ the Range / struct rows name their INCLUDED Enumerable methods too, so a
+//   module included into one of those classes does not outrank them here the
+//   way ruby's chain would. The reopened-Object case is the one that happens.
+and builtin_owns_here = fn (cls: str) -> fn (name: str) ->
+  if str_eq cls "String" then is_str_method name
+  else if str_eq cls "Array" then is_arr_method name
+  else if str_eq cls "Hash" then is_hash_method name
   // Module and Class carry the reflection methods as builtins, so
   // `Module.instance_method(:name)` has to see them -- zeitwerk takes exactly
   // that unbound method and bind_calls it to read a module's real name.
   // rubocop-ast asks `::Range.instance_method(:minmax).owner` to decide
   // whether it has to patch around an old ruby's Range#minmax.
   else if str_eq cls "Range" then
-    is_range_method name || range_delegate_name name || is_enum_method name || is_prim_method name
+    is_range_method name || range_delegate_name name || is_enum_method name
   // Complex and Rational were missing from this row while their methods were
   // implemented, so `Complex.instance_method(:arg)` raised NameError for a
   // method that answers when called. They are Numerics: same list.
@@ -28390,17 +28482,17 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   // ⚠ Numeric's OWN list is not unioned in: Complex and Rational undefine most
   // of it (`Complex.instance_method(:divmod)` is a NameError in ruby), so the
   // one name all four really inherit is named on its own.
-  else if str_eq cls "Integer" then num_has (VInt 0) name || num_inherited_name name || is_prim_method name
-  else if str_eq cls "Float" then num_has (VFlt 0.0) name || num_inherited_name name || is_prim_method name
-  else if str_eq cls "Rational" then num_has (VRat ("0", "1")) name || num_inherited_name name || is_prim_method name
-  else if str_eq cls "Complex" then num_has (VCpx (VInt 0, VInt 0)) name || num_inherited_name name || is_prim_method name
-  else if str_eq cls "Numeric" then is_numeric_own_method name || is_prim_method name
+  else if str_eq cls "Integer" then num_has (VInt 0) name || num_inherited_name name
+  else if str_eq cls "Float" then num_has (VFlt 0.0) name || num_inherited_name name
+  else if str_eq cls "Rational" then num_has (VRat ("0", "1")) name || num_inherited_name name
+  else if str_eq cls "Complex" then num_has (VCpx (VInt 0, VInt 0)) name || num_inherited_name name
+  else if str_eq cls "Numeric" then is_numeric_own_method name
   else if str_eq cls "Module" || str_eq cls "Class" then
-    is_module_method name || is_prim_method name
+    is_module_method name
   // Proc had no row at all, so `Proc.instance_method(:call)` -- and every
   // comparison the alias specs make with it -- raised NameError for methods
   // that answer when called.
-  else if str_eq cls "Proc" then is_proc_method name || is_prim_method name
+  else if str_eq cls "Proc" then is_proc_method name
   // zeitwerk branches on UnboundMethod.method_defined?(:bind_call)
   // Queue and SizedQueue: their methods live in the primitive dispatcher, so
   // without a row here `Queue.instance_method(:deq)` raised NameError for a
@@ -28418,11 +28510,11 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   else if str_eq cls "UnboundMethod" || str_eq cls "Method" then
     // ...every name the dispatcher answers, so `Method.instance_method(:===)`
     // finds the one a spec compares with #call
-    builtin_obj_has cls name || is_prim_method name
+    builtin_obj_has cls name
   // Comparable's own instance methods: `Comparable.instance_method(:clamp)`
   // is how a spec reaches one, and bind_call runs it against a number.
   else if str_eq cls "Comparable" then
-    str_eq name "clamp" || str_eq name "between?" || is_binary_op_name name || is_prim_method name
+    str_eq name "clamp" || str_eq name "between?" || is_binary_op_name name
   // Symbol's own methods (the same set the zero-arity table lists for a
   // Symbol receiver), so `Symbol.instance_method(:size)` finds the method
   // whose pair with :length a spec compares.
@@ -28431,7 +28523,7 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
   // true and `:a.method(:intern)` builds -- but the copy did not mention them,
   // so `Symbol.instance_method(:intern)` was a NameError for a method that
   // works. Two spec files do nothing but compare that pair.
-  else if str_eq cls "Symbol" then is_sym_method name || is_prim_method name
+  else if str_eq cls "Symbol" then is_sym_method name
   // KERNEL's own methods are the module-function list -- the same one
   // private_instance_methods and public_methods enumerate. Without this row
   // `Kernel.instance_method(:raise)` raised NameError for a method every
@@ -28443,22 +28535,26 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
     // Asking only the private list made `Kernel.instance_method(:then)` a
     // NameError for a method `1.then { }` runs, which is the same fact
     // answered two ways.
-    is_kernel_builtin name || is_kernel_pub_instance name || is_prim_method name
+    is_kernel_builtin name || is_kernel_pub_instance name
   // MatchData's methods live in the dispatcher, so reflection could not see
   // them: `MatchData.instance_method(:captures)` was a NameError, and the
   // alias specs compare exactly those UnboundMethods.
-  else if str_eq cls "MatchData" then builtin_obj_has "MatchData" name || is_prim_method name
+  else if str_eq cls "MatchData" then builtin_obj_has "MatchData" name
   // Enumerable had no row, so `Enumerable.instance_method(:map)` raised
   // NameError for a method every Array answers -- and eight of its spec files
   // open by comparing two of these as UnboundMethods.
-  else if str_eq cls "Enumerable" then is_enum_method name || is_prim_method name
+  else if str_eq cls "Enumerable" then is_enum_method name
   // A Struct class INCLUDES Enumerable, and its own methods are in the user
   // table where reflection already finds them -- but the included half had no
   // row, so `S.instance_method(:map)` was a NameError for a method that
   // `S.new(1).map { }` runs.
   else if str_eq cls "Struct" || map_has struct_mem cls then
-    is_enum_method name || is_prim_method name || is_struct_gen_method name
-  else is_prim_method name
+    is_enum_method name || is_struct_gen_method name
+  else false
+
+// does builtin class `cls` provide method `name`? (reflection only)
+and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
+  builtin_owns_here cls name || is_prim_method name
 
 // is this one of the classes whose instances the primitive layer implements?
 // (the operator fallback above asks it: a user class's `:+` really is absent
@@ -35492,14 +35588,30 @@ and undef_blocked_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
     else undef_blocked_anc world rest name
 
 and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
+  has_meth_b world cls name false
+
+// `blocked` = the walk has already passed a class that owns this name as a
+// BUILTIN. Builtins have no `meths` entry, so the ancestor walk cannot see
+// them, and a user method installed on the ROOT used to win over the
+// subclass's own primitive: `class Object; def size; 99; end; end` made
+// [1,2].size, {a: 1}.size, "ab".size and 5.size all answer 99.
+// ⚠ only a ROOT entry loses. The per-class lists are REFLECTION lists -- they
+//   name methods the prelude implements on an included module too (Array's
+//   names include Enumerable#slice_before, which no primitive answers), so
+//   refusing every blocked name made those undefined. A module found on the
+//   way (includes_has, below) is checked before the block is even set.
+and has_meth_b = fn world -> fn (cls: str) -> fn (name: str) -> fn (blocked: bool) ->
   let (meths, sup, ocls, ivars) = world in
+  let root = str_eq cls "Object" || str_eq cls "BasicObject" || str_eq cls "Kernel" in
   if str_eq cls "" then false
   else if map_has undefs (cls ++ "#" ++ name) then false   // undef'd here: blocked
   else if prepends_has world cls name then true
-  else if map_has meths (cls ++ "#" ++ name) then true
-  else if includes_has world cls name then true
-  else if map_has sup cls then has_meth world (map_get sup cls) name
-  else if is_sng_cls cls then has_meth world (sng_supername world cls) name
+  else if map_has meths (cls ++ "#" ++ name) then (if blocked && root then false else true)
+  else if includes_has world cls name then (if blocked && root then false else true)
+  else
+  let blocked = blocked || builtin_owns_here cls name in
+  if map_has sup cls then has_meth_b world (map_get sup cls) name blocked
+  else if is_sng_cls cls then has_meth_b world (sng_supername world cls) name blocked
   // every class without a declared superclass inherits from Object; the ROOT
   // is BasicObject (Object -> BasicObject by default), so a reopen of the
   // form `class Object < BasicObject` (pp.rb does exactly this) writes a sup
@@ -35508,8 +35620,8 @@ and has_meth = fn world -> fn (cls: str) -> fn (name: str) ->
   // lookup walk Object -> BasicObject -> Object forever -- 64 GB of arena in
   // one method call.
   else if str_eq cls "BasicObject" then false
-  else if str_eq cls "Object" then has_meth world "BasicObject" name
-  else has_meth world "Object" name
+  else if str_eq cls "Object" then has_meth_b world "BasicObject" name blocked
+  else has_meth_b world "Object" name blocked
 
 // does any module `include`d into `cls` define `name` as an instance method?
 // A module can `include` another module (concurrent-ruby's Concern::Obligation
@@ -35628,6 +35740,11 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
                      then map_get dm_had_blk (defcls ++ "#" ++ name) else VBool false)
              else ()) in
     let _ = map_set frame "self" recv in
+    // a method body has no instance_eval definee in force: its `def` goes to
+    // self's class. A define_method frame is a scope-chain CHILD, so without
+    // this it would read the defining block's definee through the chain.
+    let _ = map_set frame "__definee_recv" VNil in
+    let _ = map_set frame "__definee_cls" VNil in
     // hidden bindings so `super` can resume lookup above the defining class.
     // an aliased method resumes above its ORIGIN, not above the aliasing class.
     let dc = if map_has alias_origin (defcls ++ "#" ++ name)
@@ -42396,6 +42513,25 @@ and singleton_cls_of = fn world -> fn (id: int) ->
     let _ = map_set ocls (str_of_int id) sname in
     sname
 
+// The class a bare `def` / `alias` / `undef` writes to when a DEFAULT DEFINEE
+// is in force -- `instance_eval`/`instance_exec` records the receiver and this
+// resolves it to the singleton class. "" means no definee is in force, and the
+// caller keeps its self-based reading.
+and definee_cls_of = fn env -> fn world ->
+  // an explicitly NAMED definee wins: class_exec/module_exec run a block whose
+  // definee is the class itself, which the receiver form cannot say (it would
+  // resolve to the singleton).
+  if lv_has env "__definee_cls" then (match lv_get env "__definee_cls" with VStr h -> sget h | _ -> "")
+  else if lv_has env "__definee_recv" then
+    (match lv_get env "__definee_recv" with
+     | VObj id -> singleton_cls_of world id
+     | VClass c -> "(sng:" ++ c ++ ")"
+     | VStr h -> hng_cls_of world (VStr h) "String"
+     | VArr h -> hng_cls_of world (VArr h) "Array"
+     | VHsh h -> hng_cls_of world (VHsh h) "Hash"
+     | _ -> "")
+  else ""
+
 and is_sng_cls = fn (c: str) ->
   str_len c >= 5 && str_eq (substring c 0 5) "(sng:"
 
@@ -43055,6 +43191,23 @@ and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
    | _ -> r)
 
+// `K.instance_eval { def m; end }` is the class-body runner with the DEFINEE
+// moved to K's singleton namespace: self stays K (and so do the lexical scope
+// and cref, which is what bare constants inside resolve against), but the
+// methods it defines are class methods. Routing it through register_class made
+// them INSTANCE methods -- `K.new.d3` answered and `K.d3` did not.
+and register_class_ieval = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
+  let saved = map_copy ref_active in
+  let cenv = map_new () in
+  let _ = map_set cenv "self" (VClass cls) in
+  let _ = map_set cenv "__cscope" (mkstr cls) in
+  let _ = map_set cenv "__cref" (mkstr cls) in
+  let r = try_or (fn (u: unit) -> register_class_v world ("(sng:" ++ cls ++ ")") body "public" cenv) (FRaise VNil) in
+  let _ = restore_ref_active saved in
+  (match r with
+   | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
+   | _ -> r)
+
 and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // ruby's TracePoint(:class) fires when a class or module body is ENTERED --
   // zeitwerk watches for exactly that to notice an explicit namespace. The
@@ -43093,6 +43246,15 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   let saved = map_copy ref_active in
   let cenv = lv_child denv in
   let _ = map_set cenv "self" (VClass cls) in
+  // A CLASS BODY establishes its own definee (the class), and this env is a
+  // CHILD of the block's -- so an enclosing instance_eval's definee reached
+  // into it and every `def` the body could not handle itself went to the wrong
+  // table. Only the forms that fall through to the statement evaluator showed
+  // it: `Module.new do def hello; end end` and `ruby2_keywords def m` inside a
+  // `Class.new { }` written in an instance_exec block (which is every spec
+  // example) both became singleton methods of the example object.
+  let _ = map_set cenv "__definee_recv" VNil in
+  let _ = map_set cenv "__definee_cls" VNil in
   let _ = map_set cenv "__cscope" (mkstr cscope) in
   let _ = map_set cenv "__cref" (mkstr cscope) in
   // methods defined in the block get the block's lexical scope as their cref
@@ -44081,6 +44243,27 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
             | _ -> name)
          else if is_upper_first recv && map_has consts recv && (match map_get consts recv with VClass _ -> true | _ -> false) then "(sng:" ++ recv ++ ")#" ++ m
          else name
+       // The DEFAULT DEFINEE, when one is in force. `instance_eval` /
+       // `instance_exec` on an object move it to that object's SINGLETON class
+       // -- self alone cannot say so, and reading only self put every such def
+       // on the object's CLASS: a spec's `def m` inside an `it` block landed on
+       // Object, where `obj.method(:m)` then found it (core/method/arity_spec
+       // asked for a respond_to_missing? method and got the -4 one the file had
+       // defined four examples earlier). VNil means "no definee in force";
+       // nil/true/false keep the self reading below, which is already right.
+       else if lv_has env "__definee_cls"
+               && (match lv_get env "__definee_cls" with VStr _ -> true | _ -> false) then
+         (match lv_get env "__definee_cls" with VStr h -> sget h ++ "#" ++ name | _ -> name)
+       else if lv_has env "__definee_recv"
+               && (match lv_get env "__definee_recv" with VNil -> false | _ -> true) then
+         (match lv_get env "__definee_recv" with
+          | VObj id -> (let _ = run_singleton_method_added world (VObj id) name in
+                        singleton_cls_of world id ++ "#" ++ name)
+          | VClass c -> "(sng:" ++ c ++ ")#" ++ name
+          | VStr h -> hng_cls_of world (VStr h) "String" ++ "#" ++ name
+          | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ name
+          | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ name
+          | _ -> name)
        // a nested `def` inside a method body defines on self's class.
        else if lv_has env "self" then
          (match lv_get env "self" with
@@ -44097,6 +44280,25 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = map_set meths key (Meth (params, defs, body)) in
     let _ = map_set meth_cref key (cur_lex ()) in
     let _ = stamp_meth_src key in
+    // A TOP-LEVEL `def` is a PRIVATE instance method of Object -- that is the
+    // whole reason a bare call works from inside any class. The bare key alone
+    // made it reachable by the receiverless call path and by nothing else:
+    // `Object.private_instance_methods.include?(:top)` was false,
+    // `obj.send(:top)` a NoMethodError and `obj.respond_to?(:top, true)` false,
+    // for a method that answers. `public :top` (publish_toplevel) lifts the
+    // mark. A builtin the receiver's own class owns still wins -- see
+    // has_meth_b, without which this would break every `[].size` in a program
+    // that has a top-level `def size`.
+    let _ = (if str_eq key name && (if str_contains name "#" then false else true)
+                && (if str_len name > 5 && str_eq (substring name 0 5) "self." then false else true)
+             then (let ok = "Object#" ++ name in
+                   let _ = map_set meths ok (Meth (params, defs, body)) in
+                   let _ = map_set meth_cref ok (cur_lex ()) in
+                   let _ = stamp_meth_src ok in
+                   if map_has tl_vis "v" && (match map_get tl_vis "v" with VBool b -> b | _ -> false)
+                   then (if map_has privates ok then map_delete privates ok else ())
+                   else map_set privates ok VNil)
+             else ()) in
     let _ = (if str_eq (meth_base name) "method_added" then map_set hook_flags "ma" VNil else ()) in
     // `method_added` belongs where the method is INSTALLED, not where the `def`
     // is written. The class-body walker fired it and this path -- every `def`
@@ -44293,11 +44495,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // self is a class inside a class/module body (and inside class_eval), so the
     // alias belongs to that class -- the bare-name form is for a top-level
     // `alias`, where the methods really are bare.
+    // `alias` reads the same DEFAULT DEFINEE `def` does: inside an
+    // instance_eval it aliases into the receiver's singleton class, so the
+    // alias is the object's alone (`AliasObject.new.__value` stays a
+    // NoMethodError). Reading only self put it on the object's class.
+    let dcls = definee_cls_of env world in
+    if str_eq dcls "" then
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c -> let _ = do_class_alias world c n1 n2 in FNext VNil
      | _ ->
        let _ = if map_has meths n2 then map_set meths n1 (map_get meths n2) else () in
        FNext VNil)
+    else (let _ = do_class_alias world dcls n1 n2 in FNext VNil)
   | SInclude (m, pre) ->
     // a runtime `include Mod` (e.g. inside a class method, self = the class)
     // adds the module to that class's ancestor chain; at the top level with no
@@ -44312,9 +44521,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let (meths, sup, ocls, ivars) = world in
     // when self is a class (class_eval / a block run as a class body), undef
     // targets that class and raises NameError for a missing name.
+    let dcls = definee_cls_of env world in
+    if str_eq dcls "" then
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
      | VClass c -> let _ = undef_check world c names in let _ = undef_all meths c names in FNext VNil
      | _ -> let _ = undef_top meths names in FNext VNil)
+    // ...and so does `undef`: inside an instance_eval it hides the name on
+    // THIS object only, leaving every other instance of the class answering.
+    else (let _ = undef_check world dcls names in let _ = undef_all meths dcls names in FNext VNil)
   // Top-level visibility is a no-op except for one case that is observable:
   // a top-level `def` is a PRIVATE method of Object, and `public def m` (or
   // `public :m`) makes it public -- so `"str".m` and `:sym.m` work. Copying it
@@ -44323,6 +44537,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SVis (mode, names) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = (if str_eq mode "public" then publish_toplevel meths names else ()) in
+    // a BARE `public` / `private` outside any class body sets the mode for the
+    // top-level defs that follow.
+    let _ = (match names with
+             | Nil -> (match (if lv_has env "self" then lv_get env "self" else VMain) with
+                       | VClass _ -> ()
+                       // a BOOL, not the mode string: a VStr is a handle into
+                       // the string store, and a root that holds one has to be
+                       // marked. Nothing here needs the word.
+                       | _ -> map_set tl_vis "v" (VBool (str_eq mode "public")))
+             | _ -> ()) in
+    // `private :name` at the top level marks the Object entry the def made.
+    let _ = (if str_eq mode "private" then mark_toplevel_private meths names else ()) in
     FNext VNil
   | SDoWhile (s2, cond) -> run_dowhile env world blk s2 cond
   | SAndThen (s1, s2) ->
@@ -49323,6 +49549,12 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // Kernel. This makes Integer.ancestors / String.ancestors and is_a? agree
   // with CRuby ([Integer, Numeric, Comparable, Object, Kernel, BasicObject]).
   let _ = map_set includes "Numeric" "Comparable" in
+  // ⚠ Rational and Complex are Numerics too, and had NO superclass at all --
+  // their ancestries read [Rational, Object, ...] where ruby says
+  // [Rational, Numeric, Comparable, Object, ...]. `Rational(1,2).is_a?(Numeric)`
+  // and `.is_a?(Comparable)` both answered false.
+  let _ = set_sup sup "Rational" "Numeric" in
+  let _ = set_sup sup "Complex" "Numeric" in
   let _ = map_set includes "String" "Comparable" in
   // ...and Symbol is Comparable too: it answers <=> and the four ordering
   // operators, so `Symbol.include?(Comparable)` is true in ruby and the module
