@@ -26,7 +26,6 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MERE="${MERE:-mere}"
 BUDGET="${BUDGET:-256}"
-command -v "$MERE" >/dev/null 2>&1 || { echo "bracket_depth: no mere — set MERE=..." >&2; exit 1; }
 CC="${CC:-clang}"; command -v "$CC" >/dev/null 2>&1 || CC=cc
 command -v "$CC" >/dev/null 2>&1 || { echo "bracket_depth: SKIP — no C compiler"; exit 0; }
 
@@ -36,9 +35,14 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 if [ -n "${MR_C:-}" ] && [ -s "${MR_C:-}" ]; then
   SRC="$MR_C"
 else
+  # Only HERE is a compiler needed. Requiring one up front made the CI step fail with
+  # `no mere` on a runner that had just written the very file it was told to read --
+  # a precondition checked for a branch that was not going to be taken.
+  command -v "$MERE" >/dev/null 2>&1 || {
+    echo "bracket_depth: no mere and no MR_C — set one of them" >&2; exit 1; }
   "$MERE" -c "$ROOT/main.mere" > "$TMP/mr.c" 2>"$TMP/err" || {
     echo "bracket_depth: FAIL — the emit did not run"; head -3 "$TMP/err"; exit 1; }
-  SRC="$SRC"
+  SRC="$TMP/mr.c"
 fi
 
 # ASK THE TOOL THAT WILL REFUSE YOU. Counting brackets here would be a second
