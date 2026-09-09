@@ -9,7 +9,17 @@
 spec="$1"
 [ -f "$spec" ] || { echo "usage: run_spec.sh <spec.rb>"; exit 2; }
 here="$(cd "$(dirname "$0")" && pwd)"
-mr="$here/../mere-ruby"
+# ⚠ PIN THE REFERENCE HERE, not in the caller. scoreboard.sh sources this, so
+# every recorded number is against the pinned ruby -- but a hand-run of ONE
+# file did not, and `ruby` on PATH is 3.4.9 while the records are 4.0.6. Every
+# per-file check in a working session was then asking a different question from
+# the sweep: core/array/detect_spec is `ruby_version_is "4.0"`, so under 3.4.9
+# the reference ran ZERO examples and the file read DIFF against a mere-ruby
+# that had done nothing wrong. "The reference is part of the subject" only
+# holds if the harness pins it itself.
+. "$here"/../tools/ref_ruby.sh
+# see run_corpus.sh: a candidate build is gated before it takes over the path.
+mr="${MR_BIN:-$here/../mere-ruby}"
 tmp="$(mktemp -d)"
 specdir="$(cd "$(dirname "$spec")" && pwd)"
 # subpath under spec/ruby (e.g. "language", "core/enumerator"); the spec root.

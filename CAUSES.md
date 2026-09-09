@@ -10,31 +10,32 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 147 files.
+Classified: 151 files.
 
-## DIFF — 147 files, 74 kinds
+## DIFF — 151 files, 76 kinds
 
 | files | kind |
 |---|---|
 | 18 | `ERROR NoMethodError` |
-| 8 | `ERROR NameError` |
 | 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected to be identical` |
+| 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected N, got N` |
 | 6 | `FAILED expected ArgumentError to be raised` |
-| 5 | `FAILED expected TypeError to be raised` |
+| 6 | `ERROR NameError` |
 | 5 | `FAILED expected "S", got "S"` |
+| 5 | `ERROR TypeError` |
+| 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 4 | `ERROR TypeError` |
-| 3 | `FAILED expected truthy from #include?` |
-| 3 | `FAILED expected true, got false` |
-| 3 | `FAILED expected "S", got nil` |
+| 4 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected SyntaxError to be raised` |
+| 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got nil` |
 | 2 | `FAILED expected "S" to match` |
+| 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 2 | `ERROR ArgumentError` |
 | 1 | `sh: feature_N: command not found` |
@@ -47,16 +48,18 @@ Classified: 147 files.
 | 1 | `FAILED expected {...}, got {...}` |
 | 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
+| 1 | `FAILED expected truthy from #include?` |
 | 1 | `FAILED expected truthy from #>` |
 | 1 | `FAILED expected truthy from #<=` |
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected true, got "S"` |
+| 1 | `FAILED expected to receive #respond_to_missing?` |
+| 1 | `FAILED expected to receive #hash` |
 | 1 | `FAILED expected not N` |
 | 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected nil, got N` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
-| 1 | `FAILED expected a Float, got nil` |
 | 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
 | 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [N], got [N]` |
@@ -71,7 +74,6 @@ Classified: 147 files.
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
 | 1 | `FAILED expected ThreadError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
-| 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
@@ -84,26 +86,26 @@ Classified: 147 files.
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "` |
+| 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
 | 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR StandardError` |
-| 1 | `ERROR RuntimeError` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
+| 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
-| 5 | `FAILED: expected TypeError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
-| 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
+| 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
@@ -116,6 +118,7 @@ Classified: 147 files.
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
 | 1 | `FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45, ...[clipped]` |
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
+| 1 | `FAILED: stores unequal keys that hash to the same value: expected to receive #hash` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
@@ -132,7 +135,6 @@ Classified: 147 files.
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
 | 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
-| 1 | `FAILED: returns a Float between the given Integer and Float: expected a Float, got nil` |
 | 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
 | 1 | `FAILED: returns File.dirname(filename): expected ".", got "HOME"` |
 
@@ -149,10 +151,10 @@ class column says where the weight sits.
 |---|---|
 | kernel (9) | `binding chomp chop eval loop open select singleton_class test` |
 | unboundmethod (3) | `bind_call bind super_method` |
-| method (3) | `equal_value super_method to_proc` |
 | language (3) | `constants module numbered_parameters` |
-| symbol (2) | `all_symbols to_proc` |
+| method (2) | `super_method to_proc` |
 | threadgroup (1) | `list` |
+| symbol (1) | `all_symbols` |
 | struct (1) | `new` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |

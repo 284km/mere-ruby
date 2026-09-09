@@ -5803,7 +5803,13 @@ and parse_stmt_id = fn toks ->
             // `extend`, and reading it as the statement form left the parser
             // looking at a `.` it had no rule for. `private` already had this
             // guard; the other statement-leading names did not.
-            (match r with Cons (TP dt, _) -> (if str_eq dt "." || str_eq dt "&." then false else true) | _ -> true) then
+            (match r with Cons (TP dt, _) -> (if str_eq dt "." || str_eq dt "&." then false else true) | _ -> true)
+            // ...and an OPENING PAREN makes it an ordinary call whose result
+            // can be chained: `extend(Comparable).equal?(self)` is
+            // `(extend(Comparable)).equal?(self)`, but the paren-less argument
+            // form below read the whole tail as the ARGUMENT and passed
+            // `Comparable.equal?(self)` -- false -- to extend.
+            && (match r with Cons (TP op, _) -> (if str_eq op "(" then false else true) | _ -> true) then
       // `extend M` mixes a module's instance methods into the receiver's
       // singleton class (self, in a class/module body). Parse as a real call
       // so the eval-time handler records the singleton include.
@@ -13648,7 +13654,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | VHsh h -> (match args with
                        | Cons (k, Cons (v, _)) ->
                          (let k9 = hash_store_key env world h k in
-                          let _ = hset h (hash_put_x (hcbi_on h) (hderef h) k9 v) in v)
+                          let _ = hset h (hash_put_wx env world (hcbi_on h) (hderef h) k9 v) in v)
                        | _ -> VNil)
           | _ -> VNil)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
@@ -13793,8 +13799,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                  | (VArr a8, VArr a9) -> arr_eq_w env world (deref a8) (deref a9)
                  | (_, _) -> false) in
        VBool (if str_eq op "==" then r8 else (if r8 then false else true)))
+    // ⚠ `"abc" == obj` asks the OBJECT when it answers #to_str: ruby's
+    //   rb_str_equal returns `obj == self` rather than comparing bytes with
+    //   something that is not a String, so a String-like object was never
+    //   equal to any string.
     else if (str_eq op "==" || str_eq op "!=")
-       && (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | _ -> false)
+       && (match va0 with VStr _ -> true | _ -> false)
+       && (if has_meth world "String" "==" then false else true)
+       && (let bv8 = eval_e env world blk b in
+           (match bv8 with VObj _ -> responds world bv8 "to_str" | _ -> false)) then
+      (let bv8 = eval_e env world blk b in
+       let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+       let r8 = truthy (invoke_val_c env world noblk bv8 "==" (Cons (va0, Nil)) false) in
+       VBool (if str_eq op "==" then r8 else (if r8 then false else true)))
+    else if (str_eq op "==" || str_eq op "!=")
+       && (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true
+                        | VRat (_, _) -> true | VCpx (_, _) -> true | _ -> false)
        // ...unless the receiver's own class redefined == (corpus/134 pins that
        // `1 == 2` follows a redefined Integer#==), which the arms below reach.
        && (if has_meth world (dispatch_cls_of world va0) "==" then false else true) then
@@ -13842,16 +13862,39 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          invoke_val_c env world blk va0 "+" (Cons (eval_e env world blk b, Nil)) false
        // Comparable: derive < > <= >= from a user-defined <=> when the
        // operator itself is not defined.
-       else if (str_eq op "<" || str_eq op ">" || str_eq op "<=" || str_eq op ">=") && has_meth world ocl "<=>" then
-         (let c = invoke world noblk va0 ocl "<=>" (Cons (eval_e env world blk b, Nil)) in
-          match c with
-          | VInt n -> VBool (if str_eq op "<" then n < 0 else if str_eq op ">" then n > 0 else if str_eq op "<=" then n <= 0 else n >= 0)
-          | _ -> raise_exc world "ArgumentError" "comparison failed")
+       // ⚠ ...only for a class that actually INCLUDES Comparable. Defining
+       //   `<=>` alone does not give an object the four operators (ruby answers
+       //   NoMethodError), and `==` stays identity.
+       else if (str_eq op "<" || str_eq op ">" || str_eq op "<=" || str_eq op ">=")
+               && has_meth world ocl "<=>" && obj_is_a world ocl "Comparable" then
+         (let bv9 = eval_e env world blk b in
+          let c = invoke world noblk va0 ocl "<=>" (Cons (bv9, Nil)) in
+          // ⚠ ANY number the comparison answers is compared with zero -- ruby
+          //   accepts 0.0, 0.1, -0.1 and Rational(1,2) here, and only an
+          //   Integer was read, so three of core/comparable's four files
+          //   raised "comparison failed" for a comparison that succeeded.
+          //   ...and the refusal NAMES the two sides, as ruby's does.
+          if is_num c then
+            (let n = cmp_vals c (VInt 0) in
+             VBool (if str_eq op "<" then n < 0 else if str_eq op ">" then n > 0
+                    else if str_eq op "<=" then n <= 0 else n >= 0))
+          else raise_exc world "ArgumentError"
+                 ("comparison of " ++ display_cls_msg world (dispatch_cls_of world va0) ++ " with "
+                  ++ (if is_num bv9 then to_s bv9 else display_cls_msg world (dispatch_cls_of world bv9)) ++ " failed"))
        // Comparable#==: derive from a user <=> (0 = equal, nil/other = not).
-       else if str_eq op "==" && has_meth world ocl "<=>" && (if has_meth world ocl "==" then false else true) then
-         (match invoke world noblk va0 ocl "<=>" (Cons (eval_e env world blk b, Nil)) with
-          | VInt n -> VBool (n == 0)
-          | _ -> VBool false)
+       else if str_eq op "==" && has_meth world ocl "<=>" && obj_is_a world ocl "Comparable"
+               && (if has_meth world ocl "==" then false else true) then
+         (let bv9 = eval_e env world blk b in
+          match invoke world noblk va0 ocl "<=>" (Cons (bv9, Nil)) with
+          // nil means "not comparable", which for #== is simply false; ANY
+          // OTHER non-number is a broken comparison and ruby says so rather
+          // than answering false.
+          | VNil -> VBool false
+          | c ->
+            (if is_num c then VBool (cmp_vals c (VInt 0) == 0)
+             else raise_exc world "ArgumentError"
+                    ("comparison of " ++ display_cls_msg world (dispatch_cls_of world va0) ++ " with "
+                     ++ (if is_num bv9 then to_s bv9 else display_cls_msg world (dispatch_cls_of world bv9)) ++ " failed")))
        // synthetic classes carry their own == / eql? via primitive dispatch
        // (not the meths table), so route the operator there rather than
        // falling through to rb_eq (which is object identity).
@@ -14038,6 +14081,17 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       (match (va0, vb) with
        | (VArr xa, VArr xb) -> arr_spaceship_w env world (deref xa) (deref xb)
        | _ -> VNil)
+    // ...and an argument that is not an Array is asked for #to_ary first, the
+    // way every other Array method asks. Only the Array/Array pair was handled,
+    // so `[4, 5] <=> obj` answered nil for an object that IS array-like.
+    else if str_eq op "<=>"
+            && (match va0 with VArr _ -> true | _ -> false)
+            && (match vb with VObj _ -> true | _ -> false)
+            && responds world vb "to_ary" then
+      (let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+       match invoke_val_c env world nb7 vb "to_ary" Nil false with
+       | VArr xb -> (match va0 with VArr xa -> arr_spaceship_w env world (deref xa) (deref xb) | _ -> VNil)
+       | _ -> VNil)
     // String <=> : bytes decide; identical bytes in incompatible encodings
     // order by the encodings' registration index. A non-String argument is
     // asked for #to_str (compared as a String) or #<=> (inverted).
@@ -14125,7 +14179,11 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                     | VInt n7 -> n7
                     | _ -> 0) in
           VInt (if sgn < oi then 0 - 1 else if sgn > oi then 1 else 0))
-       else if cmp_incompatible va0 vb && rb_eq va0 vb then VInt 0
+       // ⚠ Object#<=> answers 0 for two values that are ==, and the question
+       //   is the OBJECT's #== -- the value-level rb_eq cannot reach a user
+       //   definition, so `E.new <=> E.new` was nil for a class whose #== says
+       //   they are equal.
+       else if cmp_incompatible va0 vb && rb_eq_w env world va0 vb then VInt 0
        // ⚠ NaN is UNORDERED: `1.0 <=> nan` is nil, not 0. cmp_vals has to
        //   answer an int and gave 0. The examples that say so never ran until
        //   mspec's nan_value existed in the shim, and both sides failing the
@@ -16869,8 +16927,24 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                 else (let _ = raise_exc world "ArgumentError"
                                 ("element has wrong array length (expected 2, was "
                                  ++ str_of_int (val_list_len (deref aid)) ++ ")") in go t))
-             | other -> (let _ = raise_exc world "TypeError"
-                                   ("wrong element type " ++ class_name other ++ " (expected array)") in go t))
+             // ...and a non-Array is asked for #to_ary before it is refused:
+             // ruby coerces the pair the block returned.
+             | other ->
+               // (builtin_iter has no env; the enclosing block's is the one
+               // any dispatch here should run in.)
+               (let benv = (match encl with (_, _, _, e7) -> e7) in
+                let conv = (if responds world other "to_ary"
+                            then invoke_val_c benv world (false, (Nil : str list), (Nil : Stmt list), benv)
+                                   other "to_ary" Nil false
+                            else VNil) in
+                match conv with
+                | VArr aid2 ->
+                  (if val_list_len (deref aid2) == 2 then list_append (deref aid2) (go t)
+                   else (let _ = raise_exc world "ArgumentError"
+                                   ("element has wrong array length (expected 2, was "
+                                    ++ str_of_int (val_list_len (deref aid2)) ++ ")") in go t))
+                | _ -> (let _ = raise_exc world "TypeError"
+                                  ("wrong element type " ++ class_name other ++ " (expected array)") in go t)))
           | _ -> (Nil : Val list)) in
        mkhash (hash_merge Nil (go xs)))
     else if str_eq name "fetch_values" then
@@ -18274,6 +18348,21 @@ and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
   | VInt _ -> rb_eq_num_w env world a b
   | VFlt _ -> rb_eq_num_w env world a b
   | VBig _ -> rb_eq_num_w env world a b
+  // ...and a Rational or Complex reverses the question the same way: ruby's
+  //   nurat_eqeq_p and nucomp_eqeq_p end in `other == self`.
+  | VRat (_, _) -> rb_eq_num_w env world a b
+  | VCpx (_, _) -> rb_eq_num_w env world a b
+  // ⚠ `"abc" == obj` asks the OBJECT when it answers #to_str: ruby's
+  //   rb_str_equal returns `obj == self` rather than comparing bytes with
+  //   something that is not a String. Only the byte comparison was here, so a
+  //   String-like object was never equal to any string.
+  | VStr _ ->
+    (match b with
+     | VObj _ ->
+       (if responds world b "to_str"
+        then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
+        else rb_eq a b)
+     | _ -> rb_eq a b)
   | _ -> rb_eq a b
 
 and rb_eq_num_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
@@ -18555,10 +18644,13 @@ and arr_spaceship_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val lis
                             | _ -> (if rb_eq h h2 then VInt 0
                                     else if cmp_comparable h h2 then VInt (cmp_vals h h2)
                                     else VNil))) in
+           // ⚠ ruby answers the element comparison's value RAW when it is not
+           //   zero -- `[a] <=> [b]` is "foobar" if a's #<=> says so. Keeping
+           //   only an Integer turned every other answer into nil.
            match c with
            | VInt 0 -> go t t2
-           | VInt n -> VInt n
-           | _ -> VNil))) in
+           | VNil -> VNil
+           | v -> v))) in
   go xs ys
 
 // can these two values be ordered at all? (Ruby refuses across kinds: an
@@ -18689,11 +18781,127 @@ and val_rindex_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) -> fn 
   | Cons (h, t) -> val_rindex_w env world t v (i + 1) (if rb_eq_w env world h v then VInt i else best)
 
 // assoc/rassoc: the element is a pair; pos picks which half is compared.
+// Hash#key compares with the STORED value's own #== -- `{1 => obj}.key(x)`
+// asks `obj == x`, which a structural comparison never does. The value-level
+// rb_eq cannot reach a user method, so this walk is world-aware.
+// the VALUES of a pair list (every second entry)
+and hash_values_of = fn (xs: Val list) ->
+  match xs with
+  | Cons (_, Cons (v, t)) -> Cons (v, hash_values_of t)
+  | _ -> (Nil : Val list)
+
+and hash_key_of_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (k, rest) ->
+    (match rest with
+     | Cons (v2, t) -> (if rb_eq_w env world v2 v then k else hash_key_of_w env world t v)
+     | Nil -> VNil)
+
+// THE HASH KEY PROTOCOL, written once. Ruby buckets a key by #hash and
+// compares within a bucket by #eql?; mere-ruby compares STRUCTURE, which
+// happens to agree for ordinary keys and asks the object nothing -- so a key
+// with its own #hash never heard from Hash at all, and two keys whose hashes
+// differ were merged when their structure matched.
+// ⚠ every door has to use it or two spellings of one operation disagree:
+//   `h[k]=`, `store`, `send(:[]=)`, `[]`, `fetch`, `delete`, `key?`. The three
+//   store doors go through hash_put_wx below; the read doors through the arm
+//   in the dispatcher.
+and key_has_user_hash = fn world -> fn (k: Val) ->
+  match k with
+  | VObj _ -> has_meth world (dispatch_cls_of world k) "hash"
+  | VArr _ -> has_meth world (dispatch_cls_of world k) "hash"
+  | VStr _ -> has_meth world (dispatch_cls_of world k) "hash"
+  | VHsh _ -> has_meth world (dispatch_cls_of world k) "hash"
+  | _ -> false
+
+and hkey_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
+  // ⚠ the SAME object is the same key whatever #eql? says: ruby compares the
+  //   references first (st_lookup's ptr check), so a key whose #eql? answers
+  //   false still finds its own entry. Asking #eql? first lost every value in
+  //   a hash keyed by such an object.
+  if rb_identical a b then true
+  else if key_has_user_hash world a || key_has_user_hash world b then
+    (let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let ha = invoke_val_c env world nb7 a "hash" Nil false in
+     let hb = invoke_val_c env world nb7 b "hash" Nil false in
+     if rb_eq ha hb then
+       // ⚠ EITHER side's #eql? answers: ruby asks the SEARCH key
+       //   (rb_any_cmp's `rb_eql(a, b)`), and this walk is called with the
+       //   STORED key first -- asking only that one left the question
+       //   unasked whenever the search key was the one carrying #eql?, and
+       //   core/set/include_spec's lookup then failed.
+       (if has_meth world (dispatch_cls_of world b) "eql?"
+        then truthy (invoke_val_c env world nb7 b "eql?" (Cons (a, Nil)) false)
+        else if has_meth world (dispatch_cls_of world a) "eql?"
+        then truthy (invoke_val_c env world nb7 a "eql?" (Cons (b, Nil)) false)
+        else hkey_eql a b)
+     else false)
+  else hkey_eql a b
+
+and hash_get_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Cons (k2, Cons (v, t)) -> (if hkey_eql_w env world k2 k then v else hash_get_w env world t k)
+  | _ -> VNil
+
+and hash_haskey_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Cons (k2, Cons (_, t)) -> hkey_eql_w env world k2 k || hash_haskey_w env world t k
+  | _ -> false
+
+and hash_put_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+  match xs with
+  | Cons (k2, Cons (v2, t)) ->
+    (if hkey_eql_w env world k2 k then Cons (k2, Cons (v, t))
+     else Cons (k2, Cons (v2, hash_put_w env world t k v)))
+  | _ -> Cons (k, Cons (v, (Nil : Val list)))
+
+and hash_del_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Cons (k2, Cons (v2, t)) ->
+    (if hkey_eql_w env world k2 k then t else Cons (k2, Cons (v2, hash_del_w env world t k)))
+  | _ -> (Nil : Val list)
+
+// the ONE store entry every `[]=` / `store` door calls: the protocol when the
+// key carries it, the structural put otherwise.
+and hash_put_wx = fn env -> fn world -> fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+  if key_has_user_hash world k then (let _ = hash_touch env world k in hash_put_w env world xs k v)
+  else hash_put_x ident xs k v
+
+// ⚠ ruby asks a key for its #hash on EVERY store and lookup -- that is how it
+//   finds the bucket, before any comparison. The walk below only asks when a
+//   comparison actually happens, so the first store into an empty hash (and a
+//   lookup that hits on identity) never asked, and two spec files watch for
+//   the call itself.
+and hash_touch = fn env -> fn world -> fn (k: Val) ->
+  if key_has_user_hash world k
+  then (let _ = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) k "hash" Nil false in ())
+  else ()
+
+// is any element a plain object? (#assoc asks each one for #to_ary)
+and elem_has_vobj = fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (h, t) -> (match h with VObj _ -> true | _ -> elem_has_vobj t)
+
 and arr_assoc_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (pos: int) ->
   match xs with
   | Nil -> VNil
   | Cons (h, t) ->
-    (match h with
+    // ⚠ a NON-Array element is asked for #to_ary, and the element ANSWERED is
+    //   what gets returned -- ruby's rb_ary_assoc calls rb_check_array_type on
+    //   each element. Skipping them made `[obj].assoc(2)` nil for an
+    //   array-like obj.
+    (let h = (match h with
+              | VObj _ ->
+                (if responds world h "to_ary"
+                 then (let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                       match invoke_val_c env world nb7 h "to_ary" Nil false with
+                       | VArr aid7 -> VArr aid7
+                       | _ -> h)
+                 else h)
+              | _ -> h) in
+     match h with
      | VArr aid ->
        let inner = deref aid in
        let cand = (if pos == 0 then (match inner with Cons (a, _) -> a | Nil -> VNil)
@@ -19093,6 +19301,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // looks at what they are.
   let __am = builtin_arity_msg world recv0 name0 args0 in
   if (if str_eq __am "" then false else true) then raise_exc world "ArgumentError" __am
+  // ⚠ `respond_to?` lived ONLY in the syntactic method-call arm, so
+  //   `x.respond_to?(:y)` answered and `send(:respond_to?, :y)` -- and every
+  //   bare `respond_to?(:y)` inside a method, which is the same dispatcher --
+  //   raised NoMethodError for a method the object has. One fact, two
+  //   spellings, one of them implemented. A class that defines its own still
+  //   wins, exactly as it does on the other path.
+  else if str_eq name0 "respond_to?"
+          && (if has_meth world (dispatch_cls_of world recv0) "respond_to?" then false else true) then
+    respond_to_answer env world recv0 args0
+  // ⚠ Object#<=> answers 0 when the two are ==, and the question is the
+  //   OBJECT's own #== -- the leaf dispatcher has no world and used the
+  //   value-level comparison, so `obj.<=>(other)` was nil for a class whose
+  //   #== says they are equal (and never asked it).
+  // ⚠ ...and NOT when the class has a BUILTIN <=> (Time's lives in the
+  //   dispatcher, not the method table): this arm shadowed it and every Time
+  //   range stopped constructing -- corpus/179 caught it.
+  else if str_eq name0 "<=>" && (match recv0 with VObj _ -> true | _ -> false)
+          && (if has_meth world (dispatch_cls_of world recv0) "<=>" then false else true)
+          && (if builtin_obj_has (display_cls world (dispatch_cls_of world recv0)) "<=>" then false else true) then
+    (match args0 with
+     | Cons (b9, _) -> (if rb_eq_w env world recv0 b9 then VInt 0 else VNil)
+     | _ -> VNil)
   else
   // Integer#step / Range#step called WITHOUT a block (a call with one goes
   // through invoke_with_block): an Enumerator::ArithmeticSequence, not an
@@ -20034,6 +20264,32 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | _ -> recv)
   // `h[key] = v` through DISPATCH (send / a subclass) resolves the stored key
   // the same way the fast path does.
+  // ⚠ ...and the READ doors, through the same rule (see hkey_eql_w).
+  else if (str_eq name "[]" || str_eq name "key?" || str_eq name "has_key?"
+           || str_eq name "member?" || str_eq name "include?"
+           || str_eq name "fetch" || str_eq name "delete")
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (k7, _) -> key_has_user_hash world k7 | _ -> false) then
+    (match recv with
+     | VHsh h ->
+       (let xs = hderef h in
+        match args with
+        | Cons (k7, rest7) ->
+          (let _ = hash_touch env world k7 in
+           if str_eq name "[]" then hash_get_w env world xs k7
+           else if str_eq name "delete" then
+             (let had = hash_haskey_w env world xs k7 in
+              let v7 = hash_get_w env world xs k7 in
+              let _ = (if had then hset h (hash_del_w env world xs k7) else ()) in
+              if had then v7 else VNil)
+           else if str_eq name "fetch" then
+             (if hash_haskey_w env world xs k7 then hash_get_w env world xs k7
+              else (match rest7 with
+                    | Cons (d7, _) -> d7
+                    | Nil -> raise_exc world "KeyError" ("key not found: " ++ inspect_w env world k7)))
+           else VBool (hash_haskey_w env world xs k7))
+        | _ -> VNil)
+     | _ -> VNil)
   else if (str_eq name "[]=" || str_eq name "store")
           && (match recv with VHsh _ -> true | _ -> false)
           && (if prim_user_has world recv name then false else true)
@@ -20043,7 +20299,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        (match args with
         | Cons (k9, Cons (v9, Nil)) ->
           (let key9 = hash_store_key env world hid9 k9 in
-           let _ = hset hid9 (hash_put_x (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
+           let _ = hset hid9 (hash_put_wx env world (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
         | _ -> VNil)
      | _ -> VNil)
   // Hash#initialize on a FROZEN hash refuses (it replaces the default either
@@ -20435,11 +20691,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            if had then v else VNil)
         | _ -> VNil)
      | _ -> VNil)
+  // Hash#key / #has_value? compare the STORED value with the argument using
+  // the stored value's own #== -- `{1 => obj}.key(x)` asks `obj == x`. The
+  // leaf dispatcher has no world, so a user #== was never reached and the
+  // answer was nil for a pair ruby finds.
+  else if (str_eq name "key" || str_eq name "has_value?" || str_eq name "value?")
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (_, _) -> true | _ -> false)
+          && (match recv with VHsh h -> elem_has_user_eq world (hash_values_of (hderef h)) | _ -> false) then
+    (match recv with
+     | VHsh h ->
+       (let xs = hderef h in
+        match args with
+        | Cons (v, _) ->
+          (if str_eq name "key" then hash_key_of_w env world xs v
+           else VBool (match hash_key_of_w env world xs v with VNil -> false | _ -> true))
+        | _ -> VNil)
+     | _ -> VNil)
   else if (str_eq name "include?" || str_eq name "index" || str_eq name "find_index"
            || str_eq name "rindex" || str_eq name "assoc" || str_eq name "rassoc")
           && (match recv with VArr _ -> true | _ -> false)
           && (match args with Cons (_, _) -> true | _ -> false)
-          && (match recv with VArr id -> elem_has_user_eq world (deref id) | _ -> false) then
+          // ⚠ ...and #assoc / #rassoc also need this path when an element is
+          //   merely an OBJECT: they ask it for #to_ary, and the guard only
+          //   fired for a user-defined #==, so an array-like element was
+          //   skipped and the answer was nil.
+          && (match recv with
+              | VArr id -> elem_has_user_eq world (deref id)
+                           || ((str_eq name "assoc" || str_eq name "rassoc")
+                               && elem_has_vobj (deref id))
+              | _ -> false) then
     (match recv with
      | VArr id ->
        let xs = deref id in
@@ -21854,7 +22135,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Random: a source of numbers, not state — `Random.new` answers the module
     // itself so `Random.new.rand(n)` reads the same generator.
     else if str_eq c "Random" && (str_eq name "rand" || str_eq name "new" || str_eq name "srand" || str_eq name "bytes") then
-      (if str_eq name "new" then recv else if str_eq name "srand" then VInt 0 else rand_val world args)
+      (if str_eq name "new" then recv else if str_eq name "srand" then VInt 0
+       else rand_val world (coerce_int_args env world args))
     // `SystemCallError.new(msg, errno)` is an instance of THAT errno's class:
     // the number picks it, and a number nothing claims stays a SystemCallError.
     // ⚠ A SINGLE Integer argument is the ERRNO, not a message: ruby answers
@@ -22292,6 +22574,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // :initialize is private on every class (inherited from Object) —
        // include it unless this class defines its own entry (the table
        // already decided that case above).
+       // ⚠ Complex and Rational have #marshal_dump as a PRIVATE instance
+       //   method (not #marshal_load, which ruby does not list): it lives in
+       //   the primitive dispatcher, so the loop above cannot see it, and both
+       //   classes' marshal_dump_spec asks for it by name.
+       let _ = (if want_priv && (str_eq c "Complex" || str_eq c "Rational")
+                then push9 "marshal_dump" else ()) in
        let _ = (if want_priv && (if map_has meths0 (pfx ++ "initialize") then false else true)
                           // ...and Kernel is not where :initialize lives: it is
                           // Object's (BasicObject's, in ruby), so Kernel's own
@@ -24103,6 +24391,141 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     //   #div refuses a zero divisor BEFORE asking self#/ (ruby's num_div), which
     //   is what makes div(0), div(0.0) and div(Complex(0,0)) all ZeroDivisionError
     //   rather than whatever the subclass's own #/ would answer.
+    // ...and the rest of them, on the same terms and for the same reason: they
+    // are DERIVED from the subclass's own operators, which is how ruby's
+    // Numeric answers. A user subclass of Numeric got NoMethodError for
+    // twenty-five names it inherits -- eight of ruby/spec's core/numeric files
+    // ask for exactly these, and they could not even be seen until the shim
+    // could install a mock on an ordinary object.
+    else if obj_is_a world cls "Numeric" && (if has_meth world cls name then false else true)
+            && (str_eq name "abs" || str_eq name "magnitude" || str_eq name "abs2"
+                || str_eq name "arg" || str_eq name "angle" || str_eq name "phase"
+                || str_eq name "conj" || str_eq name "conjugate"
+                || str_eq name "negative?" || str_eq name "positive?"
+                || str_eq name "zero?" || str_eq name "nonzero?"
+                || str_eq name "to_int" || str_eq name "finite?" || str_eq name "infinite?"
+                || str_eq name "imag" || str_eq name "imaginary"
+                || str_eq name "rect" || str_eq name "rectangular" || str_eq name "polar"
+                || str_eq name "i" || str_eq name "to_c"
+                || str_eq name "ceil" || str_eq name "floor" || str_eq name "round"
+                || str_eq name "truncate" || str_eq name "fdiv"
+                || str_eq name "modulo" || str_eq name "divmod" || str_eq name "remainder"
+                || str_eq name "quo" || str_eq name "coerce") then
+      (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+       let call1 = fn (nm: str) -> fn (a: Val) -> invoke_val_c env world nb9 recv nm (Cons (a, Nil)) false in
+       let call0 = fn (nm: str) -> invoke_val_c env world nb9 recv nm Nil false in
+       // `self < 0` is the one question most of these are built on, and it goes
+       // through the receiver's own #<=> (or #<) exactly as ruby's does.
+       let isneg = fn (u: unit) -> truthy (call1 "<" (VInt 0)) in
+       let arg1 = (match args with Cons (a9, _) -> a9 | Nil -> VNil) in
+       let need1 = fn (u: unit) ->
+         (match args with
+          | Nil -> (let _ = raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)" in VNil)
+          | _ -> VNil) in
+       if str_eq name "abs" || str_eq name "magnitude" then
+         (if isneg () then call0 "-@" else recv)
+       else if str_eq name "abs2" then call1 "*" recv
+       else if str_eq name "arg" || str_eq name "angle" || str_eq name "phase" then
+         (if isneg () then VFlt 3.141592653589793 else VInt 0)
+       else if str_eq name "conj" || str_eq name "conjugate" then recv
+       else if str_eq name "negative?" then VBool (isneg ())
+       else if str_eq name "positive?" then VBool (truthy (call1 ">" (VInt 0)))
+       // ⚠ `self == 0` through rb_eq_w, not through a DISPATCH of `==`: a
+       //   subclass that defines none gets Object#== (false), and dispatching
+       //   the name raised "undefined method '=='" for `zero?` on ruby/spec's
+       //   own fixture, which defines nothing but singleton_method_added.
+       //   rb_eq_w still reaches a subclass's own #== when it has one.
+       else if str_eq name "zero?" then VBool (rb_eq_w env world recv (VInt 0))
+       // ⚠ #nonzero? asks self's own #zero? -- ruby's num_nonzero calls it, and
+       //   the spec mocks it. Computing the equality inline here never called
+       //   the method the example was watching for.
+       else if str_eq name "nonzero?" then
+         (if truthy (call0 "zero?") then VNil else recv)
+       else if str_eq name "to_int" then call0 "to_i"
+       else if str_eq name "finite?" then VBool true
+       else if str_eq name "infinite?" then VNil
+       else if str_eq name "imag" || str_eq name "imaginary" then VInt 0
+       else if str_eq name "rect" || str_eq name "rectangular" then
+         arr_new (Cons (recv, Cons (VInt 0, Nil)))
+       else if str_eq name "polar" then
+         arr_new (Cons ((if isneg () then call0 "-@" else recv),
+                        Cons ((if isneg () then VFlt 3.141592653589793 else VInt 0), Nil)))
+       else if str_eq name "i" then VCpx (VInt 0, recv)
+       else if str_eq name "to_c" then VCpx (recv, VInt 0)
+       // the rounding family is the FLOAT's, which is what ruby's Numeric does
+       // (num_ceil and friends are `to_f.ceil`).
+       else if str_eq name "ceil" || str_eq name "floor" || str_eq name "round" || str_eq name "truncate" then
+         (let f9 = call0 "to_f" in invoke_val_c env world nb9 f9 name args false)
+       else if str_eq name "fdiv" then
+         (let _ = need1 () in
+          let a9 = invoke_val_c env world nb9 arg1 "to_f" Nil false in
+          let s9 = call0 "to_f" in
+          invoke_val_c env world nb9 s9 "/" (Cons (a9, Nil)) false)
+       else if str_eq name "modulo" then (let _ = need1 () in call1 "%" arg1)
+       else if str_eq name "divmod" then
+         (let _ = need1 () in
+          arr_new (Cons (call1 "div" arg1, Cons (call1 "%" arg1, Nil))))
+       // #quo is the EXACT division: `to_r / other`, and the conversion has to
+       // answer a Rational or ruby refuses.
+       else if str_eq name "quo" then
+         (let _ = need1 () in
+          let r9 = call0 "to_r" in
+          // ...a RATIONAL and nothing else: `to_r` answering the Integer 1 is a
+          // TypeError in ruby, which is what the spec asks for.
+          match r9 with
+          | VRat (_, _) -> invoke_val_c env world nb9 r9 "/" (Cons (arg1, Nil)) false
+          | _ -> raise_exc world "TypeError"
+                   ("can't convert " ++ display_cls_msg world (dispatch_cls_of world recv) ++ " into Rational"))
+       // #coerce pairs them: the SAME class answers [other, self] untouched,
+       // anything else is both sides through #to_f.
+       else if str_eq name "coerce" then
+         (let _ = need1 () in
+          if str_eq (dispatch_cls_of world arg1) cls
+          then arr_new (Cons (arg1, Cons (recv, Nil)))
+          else
+            // ...through the Float() CONVERSION, not a bare #to_f dispatch:
+            // that is what refuses nil, false and a Symbol with a TypeError
+            // and a non-numeric String with an ArgumentError, which is five of
+            // this spec's ten examples. It still reaches a mock's #to_f.
+            (let of9 = kernel_float env world (Cons (arg1, Nil)) in
+             let sf9 = kernel_float env world (Cons (recv, Nil)) in
+             arr_new (Cons (of9, Cons (sf9, Nil)))))
+       // #remainder keeps the DIVIDEND's sign where #% keeps the divisor's, so
+       // it differs from the modulo by one |divisor| when the two disagree.
+       // ⚠ the two signs are asked of the RECEIVER and the argument with #< and
+       //   #>, which is what ruby's num_remainder does and what the spec mocks.
+       else
+         (let _ = need1 () in
+          // ⚠ a NON-Numeric argument is coerced first -- ruby asks
+          //   `other.coerce(self)` and works with the pair it answers, which
+          //   is what this spec's `before` block sets up. Skipping it left the
+          //   mock's #coerce unreceived.
+          let (recv, arg1) =
+            (if obj_is_a world (dispatch_cls_of world arg1) "Numeric" || is_num arg1 || is_cpx arg1
+             then (recv, arg1)
+             else
+               (match invoke_val_c env world nb9 arg1 "coerce" (Cons (recv, Nil)) false with
+                | VArr aid7 ->
+                  (match deref aid7 with
+                   | Cons (a7, Cons (b7, _)) -> (a7, b7)
+                   | _ -> (recv, arg1))
+                | _ -> (recv, arg1))) in
+          let call1 = fn (nm: str) -> fn (a: Val) -> invoke_val_c env world nb9 recv nm (Cons (a, Nil)) false in
+          let m9 = call1 "%" arg1 in
+          // ⚠ the zero test is `z == 0`, and the four sign questions are asked
+          //   LAZILY, in ruby's order: (x<0 && y>0) || (x>0 && y<0). Computing
+          //   all four up front asked #> on a receiver whose example never
+          //   mocked it -- the spec is written around exactly which questions
+          //   get asked, so the short circuits are part of the behaviour.
+          let other_gt0 = fn (u: unit) ->
+            truthy (invoke_val_c env world nb9 arg1 ">" (Cons (VInt 0, Nil)) false) in
+          let other_lt0 = fn (u: unit) ->
+            truthy (invoke_val_c env world nb9 arg1 "<" (Cons (VInt 0, Nil)) false) in
+          if truthy (invoke_val_c env world nb9 m9 "==" (Cons (VInt 0, Nil)) false) then m9
+          else if (if truthy (call1 "<" (VInt 0)) then other_gt0 () else false)
+                  || (if truthy (call1 ">" (VInt 0)) then other_lt0 () else false)
+          then invoke_val_c env world nb9 m9 "-" (Cons (arg1, Nil)) false
+          else m9))
     else if obj_is_a world cls "Numeric" && (if has_meth world cls name then false else true)
             && (str_eq name "integer?" || str_eq name "real?" || str_eq name "real"
                 || str_eq name "div" || str_eq name "clone" || str_eq name "dup") then
@@ -24987,6 +25410,45 @@ and kw_any = fn (ps: str list) -> fn (ds: (str * Expr) list) -> fn (want_req: bo
 and takes_include_all = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
   positional_slots ps > 1
 
+// ⚠ ...and the question ruby asks of a PUBLIC respond_to? is narrower, which
+//   is not the same rule. Measured against ruby for four signatures:
+//     def respond_to?(s)              -> called with 1
+//     def respond_to?(s, p = false)   -> called with 2, and p is FALSE
+//     def respond_to?(s, p)           -> called with 1 (so: ArgumentError)
+//     def respond_to?(*a)             -> called with 1
+//   so the flag goes only to a method whose SECOND positional parameter is
+//   OPTIONAL -- not to a splat, and not to a mandatory pair. takes_include_all
+//   says yes to all three of those, which is right for the internal protocol
+//   probes it was written for and wrong here.
+and takes_optional_second = fn (ps: str list) -> fn (ds: (str * Expr) list) ->
+  match ps with
+  | Cons (_, Cons (p2, _)) ->
+    (if str_len p2 > 0 && (str_eq (char_at p2 0) "*" || str_eq (char_at p2 0) "&") then false
+     else if str_len p2 > 0 && str_eq (char_at p2 (str_len p2 - 1)) ":" then false
+     else defaults_has ds p2)
+  | _ -> false
+
+and defaults_has = fn (ds: (str * Expr) list) -> fn (n: str) ->
+  match ds with
+  | Nil -> false
+  | Cons ((dn, _), t) -> str_eq dn n || defaults_has t n
+
+// "does this object say it responds to <name>?", asked the way a PATTERN
+// MATCH asks it: the object's own #respond_to? when it has one (with ruby's
+// argument count), the method table otherwise.
+and responds_pm = fn env -> fn world -> fn (recv: Val) -> fn (name: str) ->
+  match recv with
+  | VObj id ->
+    (let (meths, sup, ocls, ivars) = world in
+     let cls = map_get ocls (str_of_int id) in
+     if has_meth world cls "respond_to?" then
+       (let extra = (match lookup_meth world cls "respond_to?" with
+                     | Meth (ps, ds, _) -> (if takes_optional_second ps ds then Cons (VBool false, Nil) else Nil)) in
+        let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        truthy (invoke_val_c env world nb7 recv "respond_to?" (Cons (VSym name, extra)) false))
+     else has_meth world cls name)
+  | _ -> responds world recv name
+
 // how many positional slots a parameter list has (required + optional + a
 // splat, which can absorb any number)
 and positional_slots = fn (ps: str list) ->
@@ -25810,7 +26272,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          raise_exc world "ArgumentError"
            ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
        else
-       let e3c = lv_flat e3 in
+       // ⚠ a CHILD scope, not a flat COPY. The copy kept a nested call of the
+       //   same proc seeing its own lexical self -- which a child does too,
+       //   since that call builds its frame from the proc's captured env --
+       //   but it also threw away every ASSIGNMENT to an outer local:
+       //   `x = nil; o.instance_exec { x = 5 }` left x nil, where a plain
+       //   block sets it. mspec's `before :each` assigns describe-level locals
+       //   exactly that way, so a whole spec file ran against nil.
+       let e3c = lv_child e3 in
        let _ = map_set e3c "self" recv in
        // ...and the DEFAULT DEFINEE moves with it: a bare `def` in this block
        // belongs to the receiver's singleton class. Stored as the receiver
@@ -27891,12 +28360,11 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
   let rec find9 = fn (ys: Val list) ->
     (match ys with
      | Cons (k2, Cons (_, t)) ->
-       (if (if ci then hkey_same true k2 k
-            else (match k with
-                  | VObj _ -> (if has_meth world (dispatch_cls_of world k) "eql?"
-                               then truthy (invoke_val_c env world nb9 k "eql?" (Cons (k2, Nil)) false)
-                               else hkey_eql k2 k)
-                  | _ -> hkey_eql k2 k))
+       // ⚠ through hkey_eql_w, the ONE rule: this was a partial copy of it --
+       //   it asked #eql? without asking #hash first, so two keys whose hashes
+       //   DIFFER were treated as the same key whenever eql? said yes, and the
+       //   second store replaced the first instead of adding a pair.
+       (if (if ci then hkey_same true k2 k else hkey_eql_w env world k2 k)
         then Cons (k2, Nil) else find9 t)
      | _ -> (Nil : Val list)) in
   match find9 (hderef hid) with
@@ -28036,7 +28504,14 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
     // ...and to a name `alias_method` pointed at a builtin: the delegation is
     // real, so `method(:my_inspect)` and respond_to? have to see it.
     || (if str_eq (blt_alias_lookup world (ancestors_of world cls) name) "" then false else true)
-    || ((str_eq name "+@" || str_eq name "-@") && obj_is_a world cls "Numeric")
+    // ⚠ ...and to the rest of Numeric's DERIVED methods, which the dispatcher
+    //   answers for a subclass (see invoke_val_c) but nothing claimed: so
+    //   `sub.respond_to?(:zero?)` was false and `sub.method(:abs)` raised for
+    //   methods that work -- and Complex()'s own #real? probe goes through
+    //   `responds`, so a Numeric subclass component was refused as "not a
+    //   real". The answer and the claim have to come from one list.
+    || ((str_eq name "+@" || str_eq name "-@" || is_numeric_own_method name)
+        && obj_is_a world cls "Numeric")
     || (exc_is_a world cls "Exception"
         && (str_eq name "message" || str_eq name "backtrace" || str_eq name "set_backtrace" || str_eq name "cause"
             || str_eq name "backtrace_locations" || str_eq name "full_message"
@@ -28916,6 +29391,10 @@ and is_prim_method = fn (name: str) ->
   // reflection primitives, so respond_to? and implicit-self dispatch reach them
   str_eq name "instance_variable_get" || str_eq name "instance_variable_set" ||
   str_eq name "instance_variable_defined?" || str_eq name "instance_variables" ||
+  // ...and #singleton_class, which was implemented and claimed by nobody: a
+  // bare `singleton_class` inside a method was "undefined local variable or
+  // method", while `self.singleton_class` answered.
+  str_eq name "singleton_class" ||
   str_eq name "methods" || str_eq name "public_methods" || str_eq name "singleton_methods" ||
   str_eq name "method" || str_eq name "extend" || str_eq name "define_singleton_method" ||
   // Object#<=>, which every object has in ruby: `obj.<=>(obj)` is 0 and
@@ -33496,6 +33975,22 @@ and arr_cmp_w = fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
 // RECEIVER's comparison failure for `5.clamp("a", 1)` -- two wrong answers out
 // of the same missing order. Both the primitive receivers and the user-object
 // path answer through here, so the order is written once.
+// does this pair COMPARE at all? cmp_vals_w has to answer an int, so a `<=>`
+// that says nil comes back as 0 -- indistinguishable from "equal". #clamp has
+// to tell them apart: ruby refuses a min and max that do not compare.
+and cmp_defined_w = fn world -> fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VObj oid ->
+    (let (meths, sup, ocls, ivars) = world in
+     let cls = map_get ocls (str_of_int oid) in
+     if has_meth world cls "<=>" then
+       (let nb7 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match invoke world nb7 a cls "<=>" (Cons (b, Nil)) with
+        | VNil -> false
+        | c -> is_num c)
+     else true)
+  | _ -> true
+
 and clamp_val = fn world -> fn (recv: Val) -> fn (args: Val list) ->
   let nn = fn (v: Val) -> (match v with VNil -> false | _ -> true) in
   let (lo, hi, bad) =
@@ -33513,6 +34008,12 @@ and clamp_val = fn world -> fn (recv: Val) -> fn (args: Val list) ->
                   ("wrong argument type " ++ class_name a1 ++ " (expected Range)") in (VNil, VNil, true))
      | Cons (l, Cons (h, _)) -> (l, h, false)) in
   if bad then recv
+  // ⚠ min and max must COMPARE, and "does not compare" is not "equal": a
+  //   `<=>` that answers nil came back as 0 here and the refusal never fired.
+  else if nn lo && nn hi && (if cmp_defined_w world lo hi then false else true) then
+    (let _ = raise_exc world "ArgumentError"
+               ("comparison of " ++ display_cls_msg world (dispatch_cls_of world lo) ++ " with "
+                ++ display_cls_msg world (dispatch_cls_of world hi) ++ " failed") in recv)
   else if nn lo && nn hi && cmp_vals_w world lo hi > 0 then
     (let _ = raise_exc world "ArgumentError"
                "min argument must be less than or equal to max argument" in recv)
@@ -35311,7 +35812,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // Kernel#rand: a Float in [0, 1) with no argument, an Integer in [0, n)
   // with a positive one, and a member of a Range.
   else if (str_eq name "rand" || str_eq name "srand") && (if map_has meths name then false else true) then
-    (if str_eq name "srand" then VInt 0 else rand_val world args)
+    // ⚠ rand's argument goes through #to_int: `rand(obj)` is `rand(obj.to_int)`
+    //   and an object one made rand answer a Float (the no-argument form),
+    //   which is what core/kernel/rand_spec asks about.
+    (if str_eq name "srand" then VInt 0 else rand_val world (coerce_int_args env world args))
   // Kernel#fork is not implemented (no process extern) — Ruby's own
   // NotImplementedError contract for platforms without fork.
   else if str_eq name "fork" then
@@ -35546,6 +36050,9 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // (`Kernel#Pathname`, `Kernel#Rainbow`).
        else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
        else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
+       // the top-level self answers respond_to? like any other object; this
+       // branch went to dispatch_prim, which has no arm for it.
+       else if str_eq name "respond_to?" then respond_to_answer env world VMain args
        // a universal primitive (instance_variable_get, frozen?, send, ...)
        // with an implicit self at the top level, exactly as `self.name` would
        else if is_prim_method name then dispatch_prim env world noblk VMain name args false
@@ -35588,6 +36095,18 @@ and rand_val = fn world -> fn (args: Val list) ->
      else (let n9 = int_of_float f in
            if n9 >= 1 then VInt (random_int n9)
            else VFlt (float_of_int (random_int 1000000000) / 1000000000.0 * f)))
+  // ⚠ a range with a FLOAT on either end picks a FLOAT in it, and only the
+  //   Integer/Integer pair picks an Integer: `rand(1..2.0)` answered nil
+  //   because the arm below reads two VInts and nothing else.
+  | Cons (VRange (av, bv, excl), _) when
+      (match (av, bv) with
+       | (VFlt _, VFlt _) -> true | (VFlt _, VInt _) -> true | (VInt _, VFlt _) -> true
+       | _ -> false) ->
+    (let lo9 = to_f av in
+     let hi9 = to_f bv in
+     let span9 = hi9 - lo9 in
+     if span9 < 0.0 then VNil
+     else VFlt (lo9 + float_of_int (random_int 1000000000) / 1000000000.0 * span9))
   // rand(1..6): only an integer range picks an integer
   | Cons (VRange (av, bv, excl), _) ->
     (match av with
@@ -35623,7 +36142,13 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // object responds to (method_missing) with implicit self routes through
        // the receiver dispatcher, exactly as `self.name` would; a genuinely
        // undefined bare name still raises NameError.
-       else if is_enum_method name || responds world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
+       // ⚠ a PRIMITIVE is reached whatever the object's own #respond_to? says.
+       //   This asked `responds`, which CALLS a user-defined respond_to? -- so
+       //   a class that redefines it (every mock does) turned a bare
+       //   `singleton_class` into "undefined local variable or method" for a
+       //   method it has. The with-arguments path next door asks
+       //   is_prim_method; two paths, two rules, and only one of them right.
+       else if is_enum_method name || is_prim_method name || responds world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
        // a synthetic class's methods live in the primitive dispatcher, not the
        // method table, so an implicit-self call inside a reopened Time (or
        // MatchData, ...) has to be routed there too.
@@ -45917,8 +46442,17 @@ and deconstruct_of = fn env -> fn world -> fn blk -> fn (v: Val) ->
   | VObj oid ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int oid) in
-    if has_meth world cls "deconstruct" then call_deco env world blk v cls
-    else (false, (Nil : Val list))
+    // ⚠ ruby ASKS the object -- `respond_to?(:deconstruct)` -- before it uses
+    //   one. Reading only the method table never asked, so an object that says
+    //   no still matched, and language/pattern_matching_spec watches for the
+    //   question itself. A yes with no table entry is dispatched (the answer
+    //   may come from method_missing).
+    if (if responds_pm env world v "deconstruct" then false else true) then (false, (Nil : Val list))
+    else if has_meth world cls "deconstruct" then call_deco env world blk v cls
+    else (let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          match invoke_val_c env world nb7 v "deconstruct" Nil false with
+          | VArr id2 -> (true, deref id2)
+          | _ -> (false, (Nil : Val list)))
   | _ -> (false, (Nil : Val list))
 
 // invoke recv.deconstruct on class `cls`, memoised per case; the result must be
@@ -46043,7 +46577,9 @@ and deconstruct_keys_of = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (ite
   | VObj oid ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int oid) in
-    if has_meth world cls "deconstruct_keys" then
+    // ...and the same question for #deconstruct_keys.
+    if (if responds_pm env world v "deconstruct_keys" then false else true) then (false, (Nil : Val list))
+    else if has_meth world cls "deconstruct_keys" || responds_pm env world v "deconstruct_keys" then
       // Ruby passes the list of requested keys, or nil when a **rest binding is
       // present (the method may then need every key).
       let named_rest = if str_eq rest "" || str_eq rest "nil" || str_eq rest "*" then false else true in
@@ -49948,6 +50484,11 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   // operators, so `Symbol.include?(Comparable)` is true in ruby and the module
   // belongs in the ancestry that says so.
   let _ = map_set includes "Symbol" "Comparable" in
+  // ...and Time, which orders by its instant: ruby's `Time.include?(Comparable)`
+  // is true, and mere-ruby's derived < > <= >= now REQUIRE the module to be in
+  // the ancestry (defining #<=> alone does not give an object the operators),
+  // so a missing include stopped `(t1..t2).include?(t)` -- corpus/179 caught it.
+  let _ = map_set includes "Time" "Comparable" in
   // the collections include Enumerable, which is what `Array.include?
   // Enumerable` and `[].is_a? Enumerable` ask about.
   // ruby 3.1+ has Set without a require: the constant is an autoload of the

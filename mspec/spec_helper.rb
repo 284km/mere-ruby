@@ -220,6 +220,7 @@ def it(desc, *opts, &blk)
     env.instance_exec(&$mspec_before) if $mspec_before
     env.instance_exec(&blk) if blk
     env.instance_exec(&$mspec_after) if $mspec_after
+    __mspec_verify_stubs
   rescue SpecFailure
     # already tallied
   rescue Exception => e
@@ -232,6 +233,9 @@ def it(desc, *opts, &blk)
     puts "ERROR: #{$mspec_desc} #{desc}: #{e.class}" +
          (ENV["MERE_SPEC_VERBOSE"] ? " -- #{e.message}" : "")
   end
+  # ...and on the failure paths too: a stub left installed would change the
+  # NEXT example (one put on a class outlives the object it was put on).
+  __mspec_drop_stubs
 end
 
 # mspec: `specify` is an alias of `it` (a describe-less example).
@@ -251,6 +255,11 @@ def guard(*args); end
 def not_supported_on(*args); yield if block_given?; end
 # known-MRI-bug guard: skipped (like ruby_version_is), same on both sides.
 def ruby_bug(*args); end
+# mspec's `quarantine! do ... end` marks examples as not-to-be-run; the block is
+# skipped entirely. It was missing, so the block ran at DESCRIBE time and the
+# file died on `undefined method 'quarantine!'` -- under ruby too, which is why
+# the pair only showed as a path difference in the two error reports.
+def quarantine!(*args); end
 # mspec numeric boundary helpers (mspec/helpers/numeric.rb).
 # mspec/helpers/numeric.rb: the exceptional Float values a spec names rather
 # than writes. Without them core/float/round_spec's three FloatDomainError
@@ -496,12 +505,115 @@ class MockExpectation
   def matches?(args); @with.nil? || @with == args; end
   def twice; self; end
   def once; self; end
-  def at_least(*a); self; end
-  def any_number_of_times; self; end
+  def at_least(*a); @optional = true; self; end
+  # ⚠ "any number of times" INCLUDES zero, so this expectation must not be
+  #  verified. core/numeric/coerce_spec sets one in `before :each` that its
+  #  first example never uses.
+  def any_number_of_times; @optional = true; self; end
+  def optional?; @optional ? true : false; end
   def exactly(*a); self; end
   def times; self; end
   def value; @value; end
   def sym; @sym; end
+  # whether the mocked method was actually invoked -- what `should_receive`
+  # verifies at the end of the example, and what `should_not_receive` forbids.
+  def called!; @called = true; end
+  def called?; @called ? true : false; end
+end
+
+# `should_receive` / `should_not_receive` on an ORDINARY object, which is how a
+# spec says "this protocol must (not) be used": `[].should_not_receive(:to_ary)`
+# and `obj.should_receive(:to_str).and_return("x")`. Only MockObject had them,
+# so every such example raised NoMethodError -- and the reference ruby runs the
+# same shim, so both sides raised and the pair read as MATCH. The stub is
+# installed as a real singleton method and REMOVED when the example ends, or a
+# stub on a class (`Array.should_receive(:new)`) would outlive it.
+# ⚠ a symbol may carry SEVERAL expectations, narrowed by `.with`:
+#   `a.should_receive(:<=>).with(x).and_return(0)` followed by
+#   `.with(y).and_return(-1)` is two registrations, and the stub has to pick
+#   the FIRST whose arguments match. Redefining the singleton method per
+#   registration kept only the LAST one -- the same "one name, several
+#   answers" mistake MockExpectation#with already exists to avoid, made again
+#   one level out. Each entry is [obj, sym, [[expectation, forbidden?], ...]]
+#   and the installed method closes over that list, so a later registration
+#   for the same pair is seen by the method already defined.
+$mspec_stubs = []
+module Kernel
+  def should_receive(sym)
+    __mspec_install_stub(sym, MockExpectation.new(sym), false)
+  end
+  def should_not_receive(sym)
+    __mspec_install_stub(sym, MockExpectation.new(sym), true)
+  end
+  # mspec's `stub!` is a should_receive that does not have to be received: it
+  # only says what the method ANSWERS. Without it `obj.stub!(:to_ary)` was nil
+  # and the `.and_return` on the end raised NoMethodError.
+  def stub!(sym)
+    e = MockExpectation.new(sym)
+    e.any_number_of_times
+    __mspec_install_stub(sym, e, false)
+  end
+  def stub(sym); stub!(sym); end
+  def __mspec_install_stub(sym, e, forbidden)
+    found = nil
+    $mspec_stubs.each { |x| found = x if found.nil? && x[0].equal?(self) && x[1] == sym }
+    if found
+      found[2] << [e, forbidden]
+      return e
+    end
+    exps = [[e, forbidden]]
+    begin
+      singleton_class.send(:define_method, sym) do |*args, &blk|
+        hit = nil
+        exps.each { |pair| hit = pair if hit.nil? && pair[0].matches?(args) }
+        if hit.nil?
+          $mspec_fail += 1
+          puts "FAILED: #{$mspec_it}: ##{sym} received with unexpected arguments"
+          nil
+        else
+          hit[0].called!
+          if hit[1]
+            $mspec_fail += 1
+            puts "FAILED: #{$mspec_it}: expected not to receive ##{sym}"
+            nil
+          else
+            hit[0].raise!
+            hit[0].value
+          end
+        end
+      end
+      $mspec_stubs << [self, sym, exps]
+    rescue Exception
+      # a frozen object or an immediate has nowhere to put one; the example
+      # will surface that on its own terms.
+    end
+    e
+  end
+end
+
+# ...verified and undone when the example ends: an expectation that was never
+# received is a failure, and the stub must not outlive the example (one put on
+# a CLASS would change every example after it).
+def __mspec_verify_stubs
+  $mspec_stubs.each do |obj, sym, exps|
+    exps.each do |e, forbidden|
+      if !forbidden && !e.called? && !e.optional?
+        $mspec_fail += 1
+        puts "FAILED: #{$mspec_it}: expected to receive ##{sym}"
+      end
+    end
+  end
+  __mspec_drop_stubs
+end
+
+def __mspec_drop_stubs
+  $mspec_stubs.each do |obj, sym, _exps|
+    begin
+      obj.singleton_class.send(:remove_method, sym)
+    rescue Exception
+    end
+  end
+  $mspec_stubs = []
 end
 
 class MockObject
@@ -515,11 +627,36 @@ class MockObject
     e = MockExpectation.new(sym)
     @syms << sym
     @exps << e
+    # ⚠ ...and a REAL singleton method too: a name Object already answers
+    # (==, <, >, <=>, coerce, to_s) never reaches #method_missing, so a
+    # registration for it was invisible. core/numeric/remainder_spec mocks
+    # `@result.==(0)` and got Object#== instead.
+    #
+    # ⚠ ...but NOT for the four this class answers carefully itself. Its
+    # #respond_to? consults the registration list AND the object's real
+    # methods without re-entering itself; a raw stub for that name answers nil
+    # whenever the arity does not match the `.with` (ruby calls it with TWO
+    # arguments), and core/array/equal_value_spec then recursed forever on its
+    # self-referencing arrays. The instrument has to keep the part of itself
+    # that was already right.
+    __mspec_install_stub(sym, e, false) unless
+      sym == :respond_to? || sym == :to_s || sym == :inspect || sym == :method_missing
     e
   end
   def should_not_receive(sym)
     MockExpectation.new(sym)
   end
+  # see Kernel#stub!: a registration that answers but is never required.
+  def stub!(sym)
+    e = MockExpectation.new(sym)
+    e.any_number_of_times
+    @syms << sym
+    @exps << e
+    __mspec_install_stub(sym, e, false) unless
+      sym == :respond_to? || sym == :to_s || sym == :inspect || sym == :method_missing
+    e
+  end
+  def stub(sym); stub!(sym); end
   # the first registration for this symbol whose `.with` (if any) matches the
   # arguments; a registration without `.with` matches any call.
   def __mock_find(sym, args)
