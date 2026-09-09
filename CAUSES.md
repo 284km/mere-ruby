@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 160 files.
+Classified: 158 files.
 
-## DIFF — 160 files, 77 kinds
+## DIFF — 158 files, 76 kinds
 
 | files | kind |
 |---|---|
@@ -22,11 +22,11 @@ Classified: 160 files.
 | 8 | `ERROR NameError` |
 | 6 | `FAILED expected to be identical` |
 | 6 | `FAILED expected TypeError to be raised` |
-| 6 | `FAILED expected "S", got "S"` |
-| 5 | `FAILED expected true, got false` |
-| 5 | `FAILED expected ArgumentError to be raised` |
+| 6 | `FAILED expected ArgumentError to be raised` |
+| 5 | `FAILED expected "S", got "S"` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected truthy from #include?` |
+| 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 3 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
@@ -64,7 +64,6 @@ Classified: 160 files.
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
-| 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
@@ -99,7 +98,7 @@ Classified: 160 files.
 | files | cause |
 |---|---|
 | 6 | `FAILED: expected TypeError to be raised` |
-| 5 | `FAILED: expected ArgumentError to be raised` |
+| 6 | `FAILED: expected ArgumentError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
@@ -120,7 +119,6 @@ Classified: 160 files.
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
-| 1 | `FAILED: returns true if the Regexp was created with the Regexp::FIXEDENCODING option: expected true, got false` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
 | 1 | `FAILED: returns the remainder of dividing self by other: expected (2/1), got 0.0` |
 | 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
@@ -138,6 +136,7 @@ Classified: 160 files.
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
+| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
 
 </details>
 

@@ -11450,6 +11450,58 @@ and proc_to_s = fn (pid9: int) ->
 and anon_addr_of = fn (c: str) ->
   let i = str_index_of c "_" in
   if i < 0 then 0 else (try_or (fn () -> int_of_str (substring c (i + 1) (str_len c))) 0)
+// Where the group that opens at index 0 closes, or -1 if it does not close at
+// all. Escapes and character classes are skipped, so `(?i:\))` and `(?i:[)])`
+// do not end the group early.
+and rx_group_end = fn (p: str) -> fn (i: int) -> fn (depth: int) -> fn (incls: bool) ->
+  if i >= str_len p then 0 - 1
+  else
+    let c9 = char_at p i in
+    if str_eq c9 "\\" then rx_group_end p (i + 2) depth incls
+    else if incls then (if str_eq c9 "]" then rx_group_end p (i + 1) depth false
+                        else rx_group_end p (i + 1) depth true)
+    else if str_eq c9 "[" then rx_group_end p (i + 1) depth true
+    else if str_eq c9 "(" then rx_group_end p (i + 1) (depth + 1) false
+    else if str_eq c9 ")" then (if depth == 1 then i else rx_group_end p (i + 1) (depth - 1) false)
+    else rx_group_end p (i + 1) depth false
+
+// Read a `(?...:` header as flags. Only m, i and x and at most one `-` -- a
+// header holding anything else (`(?=5)`, `(?<name>`) is not an option group.
+// Repeats are allowed and the LAST mention of a flag wins, which is what
+// `(?mmmmix-miiiix:)` prints as all-off.
+and rx_hdr_flags = fn (h: str) -> fn (i: int) -> fn (on: str) -> fn (off: str) -> fn (neg: bool) ->
+  if i >= str_len h then (true, on, off)
+  else
+    let c9 = char_at h i in
+    if str_eq c9 "-" then (if neg then (false, "", "") else rx_hdr_flags h (i + 1) on off true)
+    else if str_eq c9 "m" || str_eq c9 "i" || str_eq c9 "x" then
+      (if neg then rx_hdr_flags h (i + 1) on (off ++ c9) neg
+       else rx_hdr_flags h (i + 1) (on ++ c9) off neg)
+    else (false, "", "")
+
+// The `:` that ends a `(?...` header, searched only as far as the group's own
+// close (str_index_of has no "from here" form).
+and rx_hdr_colon = fn (p: str) -> fn (i: int) -> fn (stop: int) ->
+  if i >= stop then 0 - 1
+  else if str_eq (char_at p i) ":" then i
+  else rx_hdr_colon p (i + 1) stop
+
+// Is the WHOLE pattern one option group? ruby's #to_s lifts its flags into the
+// wrapper then -- `/(?i:x)/` prints `(?i-mx:x)` and not `(?-mix:(?i:x))`.
+and rx_collapse_opt_group = fn (p: str) ->
+  if str_len p < 4 then (false, "", "", p)
+  else if (if str_eq (substring p 0 2) "(?" then false else true) then (false, "", "", p)
+  else
+    let e9 = rx_group_end p 2 1 false in
+    if e9 != str_len p - 1 then (false, "", "", p)
+    else
+      let ci9 = rx_hdr_colon p 2 e9 in
+      if ci9 < 0 then (false, "", "", p)
+      else
+        (match rx_hdr_flags (substring p 2 ci9) 0 "" "" false with
+         | (ok9, on9, off9) ->
+           if ok9 then (true, on9, off9, substring p (ci9 + 1) e9) else (false, "", "", p))
+
 and to_s = fn (v: Val) ->
   match v with
   | VInt n -> str_of_int n
@@ -11489,9 +11541,20 @@ and to_s = fn (v: Val) ->
     else c
   | VRegex (p, fl) ->
     // Regexp#to_s: "(?<on>-<off>:body)" with the m,i,x flags split by state.
-    let on = (if str_contains fl "m" then "m" else "") ++ (if str_contains fl "i" then "i" else "") ++ (if str_contains fl "x" then "x" else "") in
-    let off = (if str_contains fl "m" then "" else "m") ++ (if str_contains fl "i" then "" else "i") ++ (if str_contains fl "x" then "" else "x") in
-    "(?" ++ on ++ (if str_eq off "" then "" else "-" ++ off) ++ ":" ++ p ++ ")"
+    (match rx_collapse_opt_group p with
+     | (coll9, gon9, goff9, body9) ->
+       let has9 = fn (ch9: str) ->
+         // ⚠ the OFF half is read first: it comes after the `-` in the header,
+         // and the last mention of a flag wins. `(?mmmmix-miiiix:)` turns all
+         // three off, which is what ruby prints.
+         (if coll9 then
+            (if str_contains goff9 ch9 then false
+             else if str_contains gon9 ch9 then true
+             else str_contains fl ch9)
+          else str_contains fl ch9) in
+       let on = (if has9 "m" then "m" else "") ++ (if has9 "i" then "i" else "") ++ (if has9 "x" then "x" else "") in
+       let off = (if has9 "m" then "" else "m") ++ (if has9 "i" then "" else "i") ++ (if has9 "x" then "" else "x") in
+       "(?" ++ on ++ (if str_eq off "" then "" else "-" ++ off) ++ ":" ++ (if coll9 then body9 else p) ++ ")")
   | VObj id ->
     // Encoding#to_s is its name, MatchData#to_s is the whole match; disp
     // (world-aware) overrides other objects
@@ -21411,7 +21474,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       // ...and NOENCODING (32), the `n` flag: it was dropped,
                       // so `Regexp.new(s, Regexp::NOENCODING)` answered a
                       // pattern with no flags and #options said 0.
-                      (if (opt / 32) - (opt / 64) * 2 == 1 then "n" else "")
+                      (if (opt / 32) - (opt / 64) * 2 == 1 then "n" else "") ++
+                      // ...and FIXEDENCODING (16), the `u` flag, dropped the
+                      // same way: `Regexp.new(s, Regexp::FIXEDENCODING)`
+                      // answered #fixed_encoding? false for the option that
+                      // exists to make it true.
+                      (if (opt / 16) - (opt / 32) * 2 == 1 then "u" else "")
                     | Cons (VStr fs, _) -> sget fs
                     | _ -> "") in
           if rx_validate body fl then rx_build_once body fl args
@@ -26996,6 +27064,17 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
      | VRegex (p, pf) ->
        (match args with
+        // ⚠ `re.match(str, pos)` starts AT pos, in characters, and a negative
+        // one counts from the end -- `String#match` has honoured its second
+        // argument all along and this one dropped it, so every match started at
+        // 0 whatever it was told. A position past the end matches nothing
+        // rather than being clamped.
+        | Cons (VStr sv, Cons (VInt off9, _)) ->
+          (let s9 = sget sv in
+           let cn9 = utf8_len s9 in
+           let cst9 = (if off9 < 0 then cn9 + off9 else off9) in
+           if cst9 < 0 || cst9 > cn9 then VNil
+           else hit p pf (substring s9 (utf8_boff s9 cst9 0) (str_len s9)))
         | Cons (VStr sv, _) -> hit p pf (sget sv)
         | Cons (VSym sv, _) -> hit p pf sv
         // nil matches nothing (and does NOT refuse); anything else has to be
@@ -29544,7 +29623,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        VInt ((if str_contains fl "i" then 1 else 0)
              + (if str_contains fl "x" then 2 else 0)
              + (if str_contains fl "m" then 4 else 0)
-             + (if str_contains fl "n" then 32 else 0))
+             + (if str_contains fl "n" then 32 else 0)
+             // FIXEDENCODING (16) is the `u` flag here -- `/a/u.options` read 0
+             // while #fixed_encoding? answered true for the same regexp, which
+             // is the same fact through two doors with two answers.
+             + (if str_contains fl "u" then 16 else 0))
      | _ -> VInt 0)
   // Regexp#names / #named_captures: the pattern's own group names, read from
   // the same table a MatchData reads. MatchData#names is specified against
@@ -41866,7 +41949,7 @@ and seed_builtin_subclass_ivars = fn world -> fn (cls: str) -> fn (id: int) -> f
               | Cons (VStr ph, rest) ->
                 (let _ = map_set ivars (str_of_int id ++ "@__rx_src") (mkstr (sget ph)) in
                  let fl = (match rest with
-                           | Cons (VInt f, _) -> (if floor_mod f 2 == 1 then "i" else "") ++ (if floor_mod (floor_div f 4) 2 == 1 then "m" else "") ++ (if floor_mod (floor_div f 2) 2 == 1 then "x" else "")
+                           | Cons (VInt f, _) -> (if floor_mod f 2 == 1 then "i" else "") ++ (if floor_mod (floor_div f 4) 2 == 1 then "m" else "") ++ (if floor_mod (floor_div f 2) 2 == 1 then "x" else "") ++ (if floor_mod (floor_div f 16) 2 == 1 then "u" else "")
                            | Cons (VBool true, _) -> "i"
                            | _ -> "") in
                  map_set ivars (str_of_int id ++ "@__rx_flags") (mkstr fl))
