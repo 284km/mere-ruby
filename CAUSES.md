@@ -10,22 +10,22 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 155 files.
+Classified: 147 files.
 
-## DIFF — 155 files, 76 kinds
+## DIFF — 147 files, 74 kinds
 
 | files | kind |
 |---|---|
 | 18 | `ERROR NoMethodError` |
-| 10 | `FAILED expected N, got N` |
-| 8 | `FAILED expected false, got true` |
 | 8 | `ERROR NameError` |
+| 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected to be identical` |
+| 6 | `FAILED expected N, got N` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected TypeError to be raised` |
 | 5 | `FAILED expected "S", got "S"` |
-| 5 | `ERROR TypeError` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 4 | `ERROR TypeError` |
 | 3 | `FAILED expected truthy from #include?` |
 | 3 | `FAILED expected true, got false` |
 | 3 | `FAILED expected "S", got nil` |
@@ -77,7 +77,6 @@ Classified: 155 files.
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
-| 1 | `FAILED expected (N/N), got N` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
@@ -86,7 +85,6 @@ Classified: 155 files.
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
-| 1 | `ERROR ZeroDivisionError` |
 | 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
@@ -121,22 +119,22 @@ Classified: 155 files.
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
-| 1 | `FAILED: returns the remainder of dividing self by other: expected (2/1), got 0.0` |
 | 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
-| 1 | `FAILED: returns the nearest Integer for Float near the limit: expected 0, got 1` |
-| 1 | `FAILED: returns self divided by other: expected 4611686018427387926, got 4611686018427387904` |
 | 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
-| 1 | `FAILED: returns false if compares with near float: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
 | 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
+| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
+| 1 | `FAILED: returns a Float between the given Integer and Float: expected a Float, got nil` |
+| 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
+| 1 | `FAILED: returns File.dirname(filename): expected ".", got "HOME"` |
 
 </details>
 

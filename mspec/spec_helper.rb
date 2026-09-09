@@ -252,6 +252,11 @@ def not_supported_on(*args); yield if block_given?; end
 # known-MRI-bug guard: skipped (like ruby_version_is), same on both sides.
 def ruby_bug(*args); end
 # mspec numeric boundary helpers (mspec/helpers/numeric.rb).
+# mspec/helpers/numeric.rb: the exceptional Float values a spec names rather
+# than writes. Without them core/float/round_spec's three FloatDomainError
+# examples raised NameError -- the harness missing, not the interpreter.
+def nan_value; 0 / 0.0; end
+def infinity_value; 1 / 0.0; end
 def bignum_value(plus = 0); 2**64 + plus; end
 def fixnum_max; 2**62 - 1; end
 def fixnum_min; -(2**62); end

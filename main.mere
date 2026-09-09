@@ -7466,6 +7466,16 @@ let big_eq_flt = fn (x: str) -> fn (f: float) ->
   else if f < 9007199254740992.0 && f > (0.0 - 9007199254740992.0)
   then float_of_int (int_of_float f) == f && str_eq x (str_of_int (int_of_float f))
   else str_eq x (flt_to_big_s f);
+// Does comparing an Integer with this Float need the EXACT path? A float of
+// magnitude 2**53 or more is a whole number that an Int64 -> double conversion
+// can no longer represent, so the comparison has to be done on exact values.
+// Below that the double comparison is already exact: either both sides fit, or
+// the integer is the larger by magnitude and rounding cannot cross the gap.
+// (`(f - f) == 0.0` is the finiteness test: it is false for NaN and for both
+// infinities, which order by sign and never need a bignum.)
+let flt_is_infinite = fn (f: float) -> (f == f) && (if (f - f) == 0.0 then false else true);
+let flt_cmp_exact_needed = fn (f: float) ->
+  (f - f) == 0.0 && (f >= 9007199254740992.0 || f <= (0.0 - 9007199254740992.0));
 
 // the flags that decide whether two patterns are the same match: i, x and m.
 // `n` only says how to read the source's bytes, which changes nothing when
@@ -7497,12 +7507,15 @@ and rb_eq_go = fn (va: Val) -> fn (vb: Val) ->
   | VInt x ->
     (match vb with
      | VInt y -> x == y
-     | VFlt y -> feq (float_of_int x) y
+     // ...and against a float too big for a double to hold the integer: the
+     // conversion rounds, and 4611686018427387903 == 4611686018427387903.0
+     // came out true where ruby says false (the float is really 2**62).
+     | VFlt y -> (if flt_cmp_exact_needed y then big_eq_flt (str_of_int x) y else feq (float_of_int x) y)
      | VRat (n, d) -> str_eq d "1" && str_eq n (str_of_int x)
      | _ -> false)
   | VFlt x ->
     (match vb with
-     | VInt y -> feq x (float_of_int y)
+     | VInt y -> (if flt_cmp_exact_needed x then big_eq_flt (str_of_int y) x else feq x (float_of_int y))
      | VFlt y -> feq x y
      | VBig y -> big_eq_flt y x
      // ...and a Rational, which the VRat arm below already knew about from its
@@ -7795,6 +7808,9 @@ let big_cmp_s = fn (a: str) -> fn (b: str) ->
   let sa = big_sign a in let sb = big_sign b in
   if sa < sb then 0 - 1 else if sa > sb then 1
   else (let c = mag_cmp (big_mag a) (big_mag b) in if sa < 0 then 0 - c else c);
+// an Integer (as a decimal string) against a Float that is a whole number:
+// exact, both sides as integers. See flt_cmp_exact_needed above.
+let int_flt_cmp_s = fn (x: str) -> fn (f: float) -> big_cmp_s x (flt_to_big_s f);
 
 // ---- Rational (num/den as canonical decimal strings, den > 0, reduced) ----
 // bignum gcd of the magnitudes of a, b (Euclid), as a positive canonical string.
@@ -7847,14 +7863,23 @@ let rat_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
     else rat_div_s an ad bn bd;
 
 // does a magnitude fit in a signed 64-bit int?
-let big_fits = fn (mag: str) ->
-  str_len mag < 19 || (str_len mag == 19 && str_compare mag "9223372036854775807" <= 0);
+// ⚠ the machine-int range is NOT symmetric: -9223372036854775808 fits and
+//   +9223372036854775808 does not. Testing the MAGNITUDE alone left Int64 MIN
+//   as a bignum whenever it was reached by arithmetic, while the same value
+//   written as a literal (or reached another way) was a VInt -- and a VBig
+//   never equals a VInt here, so `(-2**62) >> -1` and `-2**62 * 2` printed the
+//   same digits and answered false to ==, eql? and equal hashes. One value,
+//   two representations, three symptoms.
+let big_fits = fn (mag: str) -> fn (neg: bool) ->
+  str_len mag < 19
+  || (str_len mag == 19
+      && str_compare mag (if neg then "9223372036854775808" else "9223372036854775807") <= 0);
 // canonicalise a signed decimal string to VInt (if it fits) or VBig.
 let norm_big = fn (sval: str) ->
   let m = mag_strip (big_mag sval) 0 in
   let sgn = if str_eq m "0" then 1 else big_sign sval in
   let canon = with_sign sgn m in
-  if big_fits m then VInt (int_of_str canon) else VBig canon;
+  if big_fits m (sgn < 0) then VInt (int_of_str canon) else VBig canon;
 // signed decimal of a numeric value.
 let num_dec = fn (v: Val) -> match v with VInt n -> str_of_int n | VBig s -> s | _ -> "0";
 
@@ -8025,7 +8050,16 @@ let shl_int_fits = fn (x: int) -> fn (n: int) ->
 // 2.54*2^k over 2^k. Beyond 62 doublings the numerator would leave int64,
 // so those (subnormals) fall back to truncation.
 let rec flt_rat_parts = fn (f: float) -> fn (k: int) ->
-  if k >= 62 || f == float_of_int (int_of_float f) then (str_of_int (int_of_float f), big_pow "2" k "1")
+  // A float of magnitude 2**53 or more is ALREADY a whole number, so its exact
+  // pair is (itself, 1). The loop below asks `int_of_float` whether the value
+  // is whole, and that SATURATES above 2**63: for 1.0e30 the test never
+  // succeeded, the doubling ran to its fuel limit, and `1.0e30.to_r` answered
+  // (9223372036854775807/4611686018427387904) -- Int64 max over 2**62.
+  // ...FINITE ones. Infinity passes the magnitude test, and flt_to_big_s
+  // halves its argument until it fits a machine int, which never happens:
+  // core/float/numerator_spec and denominator_spec hung.
+  if (f - f) == 0.0 && (f >= 9007199254740992.0 || f <= (0.0 - 9007199254740992.0)) then (flt_to_big_s f, "1")
+  else if k >= 62 || f == float_of_int (int_of_float f) then (str_of_int (int_of_float f), big_pow "2" k "1")
   else flt_rat_parts (f * 2.0) (k + 1);
 // a value as an exact (numerator, denominator) pair
 let rat_pair_of = fn (v: Val) -> match v with
@@ -8061,9 +8095,17 @@ let rat_parts = fn (v: Val) ->
 let big_even = fn (s: str) ->
   let c = char_at s (str_len s - 1) in
   str_eq c "0" || str_eq c "2" || str_eq c "4" || str_eq c "6" || str_eq c "8";
+// The one machine int whose negation overflows: the range is not symmetric.
+// ⚠ written as a comparison with the minimum, NOT as `a < 0 && 0 - a < 0`:
+//   signed overflow is undefined in C, and the optimiser is entitled to fold
+//   that test to false -- the guard would compile away and never fire.
+let rec __signbit = fn (v: int) -> if v < 0 then v else __signbit (bit_shl v 1);
+let int_min_v = __signbit 1;
+let int_neg_overflows = fn (a: int) -> a == int_min_v;
 // negate / sign / abs on a boxed numeric value (used by Complex components).
 let num_neg = fn (v: Val) -> match v with
-  | VInt n -> VInt (0 - n) | VFlt f -> VFlt (f * (0.0 - 1.0))
+  | VInt n -> (if int_neg_overflows n then norm_big (big_neg_s (str_of_int n)) else VInt (0 - n))
+  | VFlt f -> VFlt (f * (0.0 - 1.0))
   | VBig s -> norm_big (big_neg_s s) | VRat (n, d) -> VRat (big_neg_s n, d) | _ -> v;
 let num_isneg = fn (v: Val) -> match v with
   | VInt n -> n < 0 | VFlt f -> f < 0.0 | VBig s -> big_sign s < 0 | VRat (n, d) -> big_sign n < 0 | _ -> false;
@@ -8162,8 +8204,7 @@ let rec cpx_pow = fn (base: Val) -> fn (n: int) ->
 // width; complementing it gives the largest value. The boundary is not
 // observable from Ruby -- Integer is arbitrary precision and 2.4 merged Fixnum
 // into it -- so this only moves where the promotion to a bignum happens.
-let rec __signbit = fn (v: int) -> if v < 0 then v else __signbit (bit_shl v 1);
-let int_min = __signbit 1;
+let int_min = int_min_v;
 let int_max = bit_not int_min;
 let add_int_ov = fn (a: int) -> fn (b: int) ->
   if (b > 0 && a > int_max - b) || (b < 0 && a < int_min - b)
@@ -8237,6 +8278,25 @@ let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
      let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | _ -> "0") in
      let bd = (match vb with VRat (n, d) -> d | _ -> "1") in
      rat_cmp_s an ad bn bd)
+  // Integer vs Float orders on EXACT values (ruby's rb_integer_float_cmp).
+  // Both sides went through to_f, which rounds the integer:
+  // `4611686018427387903 <=> 4611686018427387903.0` answered 0 where ruby says
+  // -1, and with it `<`, `<=`, `>` and `>=` all read the wrong way round.
+  // ⚠ an INFINITE float is above (or below) every integer, however big --
+  //   and converting a 309-digit integer to a double OVERFLOWS to the same
+  //   infinity, so `Float::INFINITY <=> Float::MAX.to_i * 2` answered 0.
+  else if (match va with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match vb with VFlt f9 -> flt_is_infinite f9 | _ -> false) then
+    (match vb with VFlt f9 -> (if f9 > 0.0 then 0 - 1 else 1) | _ -> 0)
+  else if (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match va with VFlt f9 -> flt_is_infinite f9 | _ -> false) then
+    (match va with VFlt f9 -> (if f9 > 0.0 then 1 else 0 - 1) | _ -> 0)
+  else if (match va with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match vb with VFlt f9 -> flt_cmp_exact_needed f9 | _ -> false) then
+    (match vb with VFlt f9 -> int_flt_cmp_s (num_dec va) f9 | _ -> 0)
+  else if (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match va with VFlt f9 -> flt_cmp_exact_needed f9 | _ -> false) then
+    (match va with VFlt f9 -> 0 - int_flt_cmp_s (num_dec vb) f9 | _ -> 0)
   else if is_num va && is_num vb then
     (match va with
      | VInt x ->
@@ -8983,11 +9043,17 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
        (match vb with
         | VFlt y -> VFlt (flt_floor_mod x y)
         | VInt y -> VFlt (flt_floor_mod x (float_of_int y))
+        // ⚠ a BIGNUM operand had no arm on either side, so `(2**64) % 3.5` and
+        //   `3.5 % (2**64)` both refused with "Float can't be coerced into
+        //   Integer" for arithmetic ruby answers (2.0 and 3.5). A Float
+        //   operand makes the whole operation a Float one, big or not.
+        | VBig y -> VFlt (flt_floor_mod x (big_fdiv_s y "1"))
         | _ -> (cmp_mod_refuse vb))
      | VBig x ->
        (match vb with
         | VInt y -> norm_big (big_mod_s x (str_of_int y))
         | VBig y -> norm_big (big_mod_s x y)
+        | VFlt y -> VFlt (flt_floor_mod (big_fdiv_s x "1") y)
         | _ -> (cmp_mod_refuse vb))
      | _ -> (cmp_mod_refuse vb))
   else if str_eq op "**" then
@@ -10190,7 +10256,13 @@ let signal_num_of = fn (nm: str) -> signal_num_go (signal_list_pairs ()) nm;
 // float floor/ceil/round built on int_of_float (which truncates toward 0).
 let flt_floor = fn (x: float) -> let t = int_of_float x in if float_of_int t > x then t - 1 else t;
 let flt_ceil = fn (x: float) -> let t = int_of_float x in if float_of_int t < x then t + 1 else t;
-let flt_round = fn (x: float) -> if x < 0.0 then flt_ceil (x - 0.5) else flt_floor (x + 0.5);
+// ⚠ ruby rounds half AWAY FROM ZERO, and `floor (x + 0.5)` is not that: for
+//   0.49999999999999994 the addition itself rounds up to exactly 1.0, so the
+//   answer was 1 where ruby says 0. Compare the FRACTION with a half instead,
+//   which never adds two values of different magnitude.
+let flt_round = fn (x: float) ->
+  if x < 0.0 then (let t = flt_ceil x in if float_of_int t - x >= 0.5 then t - 1 else t)
+  else (let t = flt_floor x in if x - float_of_int t >= 0.5 then t + 1 else t);
 // integer round/floor/ceil to a power-of-ten place (n negative in Ruby).
 let int_round_place = fn (x: int) -> fn (m: int) ->
   if x >= 0 then ((x + m / 2) / m) * m else 0 - (((0 - x) + m / 2) / m) * m;
@@ -12253,7 +12325,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   match e with
   | ESplat inner -> eval_e env world blk inner   // bare splat: evaluate inner
   | EInt n -> VInt n
-  | EBig b -> VBig b
+  // ⚠ canonicalised, not taken as written: the parser folds a leading minus
+  //   into the literal ("-" ++ b), and -9223372036854775808 DOES fit a machine
+  //   int while +9223372036854775808 does not. Left as a VBig, that literal
+  //   never equalled the same value reached by arithmetic -- and a VBig never
+  //   equals a VInt here, so `9223372036854775808.send(:-@) == -92233...808`
+  //   was false.
+  | EBig b -> norm_big b
   | ERat (n, d) -> mk_rat_s n d
   | EImag n -> VCpx (VInt 0, VInt n)
   | EImagF f -> VCpx (VInt 0, VFlt f)
@@ -13637,7 +13715,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unary ~ on non-integer")) in fail "mere-ruby: unary ~ on non-integer"))
     else
       (match eval_e env world blk a with
-       | VInt n -> if str_eq op "-" then VInt (0 - n) else VInt n
+       // -(machine minimum) does not fit a machine int: it promotes.
+       | VInt n -> if str_eq op "-" then num_neg (VInt n) else VInt n
        | VBig s -> if str_eq op "-" then norm_big (big_neg_s s) else VBig s
        | VFlt f -> if str_eq op "-" then VFlt (f * (0.0 - 1.0)) else VFlt f
        | VRat (n, d) -> if str_eq op "-" then VRat (big_neg_s n, d) else VRat (n, d)
@@ -14032,7 +14111,27 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
           && (match vb with VObj _ -> true | _ -> false) && (responds world vb "coerce" || has_coerce world vb) then
          (let (ok8, x8, y8) = coerced_pair env world vb va0 in
           if ok8 then coerced_apply env world "<=>" x8 y8 else VNil)
+       // ⚠ an INFINITE float asks a non-numeric other for its own #infinite?
+       //   and orders by the two signs: ruby's flo_cmp does exactly this, so
+       //   `Float::INFINITY <=> obj` is 0 when the object calls itself +1,
+       //   1 when it calls itself -1 or nil (finite), and the mirror for
+       //   -Infinity. Without it every one of those answered nil.
+       else if (match va0 with VFlt f7 -> flt_is_infinite f7 | _ -> false)
+               && (match vb with VObj _ -> true | _ -> false)
+               && responds world vb "infinite?" then
+         (let sgn = (match va0 with VFlt f7 -> (if f7 > 0.0 then 1 else 0 - 1) | _ -> 0) in
+          let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          let oi = (match invoke_val_c env world nb7 vb "infinite?" Nil false with
+                    | VInt n7 -> n7
+                    | _ -> 0) in
+          VInt (if sgn < oi then 0 - 1 else if sgn > oi then 1 else 0))
        else if cmp_incompatible va0 vb && rb_eq va0 vb then VInt 0
+       // ⚠ NaN is UNORDERED: `1.0 <=> nan` is nil, not 0. cmp_vals has to
+       //   answer an int and gave 0. The examples that say so never ran until
+       //   mspec's nan_value existed in the shim, and both sides failing the
+       //   same way read as MATCH.
+       else if (match va0 with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false)
+               || (match vb with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false) then VNil
        else if cmp_incompatible va0 vb then VNil
        // world-aware, so `[obj] <=> [obj]` reaches the elements' own <=>: the
        // value-level comparator cannot call one, and this is an OPERATOR, so it
@@ -14062,6 +14161,11 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
           else raise_exc world "ArgumentError"
                  ("comparison of " ++ class_name va0 ++ " with "
                   ++ display_cls_msg world (dispatch_cls_of world vb) ++ " failed"))
+       // ...and the four relations are all false against a NaN, for the same
+       //   reason: it is unordered, not equal-to.
+       else if (match va0 with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false)
+               || (match vb with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false) then
+         VBool false
        else if cmp_incompatible va0 vb then
          raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else class_name vb) ++ " failed")
        else
@@ -14367,6 +14471,12 @@ and rb_identical = fn (a: Val) -> fn (b: Val) ->
   // strings are handles: equal? is object identity, not content equality.
   | VStr ia -> (match b with VStr ib -> ia == ib | _ -> false)
   | VHsh ia -> (match b with VHsh ib -> ia == ib | _ -> false)
+  // ⚠ NaN is the one value that is not `==` to ITSELF, and equal? asks about
+  //   identity, not equality. A Float here has no separate identity -- two
+  //   equal floats ARE the same object in this model -- so the same bits are
+  //   the same object, NaN included. `nan.arg.should equal(nan)` and three
+  //   other spec rows say exactly that.
+  | VFlt x -> (match b with VFlt y -> feq x y || ((if x == x then false else true) && (if y == y then false else true)) | _ -> false)
   | _ -> rb_eq a b
 
 // bind index values to hidden temp vars (__opi0..) in e2 for op-assign, and
@@ -29358,6 +29468,28 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | VFlt qf -> VInt (flt_floor qf)
         | v -> v)
      | _ -> VNil)
+  // ...and with a RATIONAL argument they are exact as well: this went to the
+  // float path, so `(2**64 + 1024).div(Rational(4,1))` came back rounded to a
+  // double (4611686018427387904 for a value ruby answers exactly) and
+  // `10.remainder(Rational(4,1))` answered the Float 0.0 where ruby answers
+  // the exact (2/1).
+  else if (str_eq name "div" || str_eq name "remainder")
+     && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+     && (match args with Cons (VRat _, Nil) -> true | _ -> false) then
+    (match args with
+     | Cons (b9, _) ->
+       (if str_eq name "div" then
+          (match rat_arith "/" recv b9 with
+           | VRat (qn, qd) -> norm_big (rat_int_mode "floor" qn qd)
+           | v -> v)
+        else
+          // remainder keeps the DIVIDEND's sign: self - other * (self/other)
+          // truncated toward zero.
+          (let q9 = (match rat_arith "/" recv b9 with
+                     | VRat (qn, qd) -> norm_big (rat_int_mode "truncate" qn qd)
+                     | v -> v) in
+           rat_arith "-" recv (rat_arith "*" b9 q9)))
+     | _ -> VNil)
   // `div` and `remainder` between INTEGERS are exact. Both went through to_f,
   // so (2**70).div(3) answered the machine maximum and (2**70).remainder(3)
   // answered a Float where ruby answers an Integer.
@@ -29420,8 +29552,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            then VFlt (big_fdiv_s (num_dec recv) (num_dec a1))
            else VFlt (to_f recv / to_f a1))
         else if str_eq name "div" then
-          (let q = to_f recv / to_f a1 in
-           let t = int_of_float q in VInt (if float_of_int t > q then t - 1 else t))
+          // the floor of the quotient, EXACTLY: int_of_float saturates, so
+          // `9223372036854775808.div(1.0)` answered Int64 max.
+          (let q = to_f recv / to_f a1 in flt_floor_v q)
         // remainder keeps the DIVIDEND's sign, where % keeps the divisor's
         else
           (let r = (match arith_bin "%" recv a1 with VInt n -> float_of_int n | VFlt f -> f | _ -> 0.0) in
@@ -29654,7 +29787,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // operator form is handled by the evaluator and never comes here -- and
      // the catch-all below answered the RECEIVER, so `2.send(:-@)` was 2. Two
      // spellings of one method, and only one of them negated.
-     | VInt n -> VInt (0 - n)
+     // ...through num_neg, which promotes the machine minimum: writing the
+     // negation out again here left `(-2**63).send(:-@)` answering itself.
+     | VInt n -> num_neg (VInt n)
      | VBig b -> norm_big (big_neg_s b)
      | VFlt f -> VFlt (0.0 - f)
      | VRat (n, d) -> VRat (big_neg_s n, d)
@@ -30267,9 +30402,70 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // the message is the VALUE as printed -- "NaN", "Infinity", "-Infinity"
      // (float_special answers "Inf", which is the printf spelling, not ruby's).
      else prim_raise "FloatDomainError" (to_s recv))
+  // ⚠ the PRECISION argument is converted with to_int, so a Float one is
+  //   truncated: `12.345678.round(3.999)` is round(3) and answers 12.346.
+  //   Only an Integer argument was matched, so a Float one fell through to the
+  //   no-argument arm and answered 12.
+  // ...but NOT for a Rational receiver: `Rational(1,2).round(1.5)` is a
+  // TypeError in ruby, where `12.3.round(1.5)` and `12345.round(1.5)` are not.
+  else if (str_eq name "round" || str_eq name "floor" || str_eq name "ceil" || str_eq name "truncate")
+          && (match recv with VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false)
+          && (match args with Cons (VFlt _, _) -> true | Cons (VRat (_, _), _) -> true | _ -> false) then
+    (match args with
+     | Cons (VRat (pn, pd), rest) ->
+       // ...a Rational one too: `12.3.round(Rational(3,2))` is round(1). It is
+       // truncated toward zero, exactly as #to_int does.
+       prim_method recv name (Cons (norm_big (rat_int_mode "truncate" pn pd), rest))
+     | Cons (VFlt pf, rest) ->
+       // ⚠ this is the ARGUMENT being converted to an Integer, not the
+       //   receiver: an infinite or NaN precision is a RangeError about the
+       //   conversion ("float Inf out of range of integer"), never the
+       //   FloatDomainError a receiver gets. corpus/196 caught the mix-up.
+       (if flt_is_nan pf then prim_raise "RangeError" "float NaN out of range of integer"
+        else if flt_is_inf pf
+        then prim_raise "RangeError"
+               ("float " ++ (if pf > 0.0 then "Inf" else "-Inf") ++ " out of range of integer")
+        else prim_method recv name (Cons (flt_trunc_v pf, rest)))
+     | _ -> VNil)
+  // ...and a precision beyond what a Float can hold changes nothing: ruby
+  // answers the receiver for a large positive one and zero for a large
+  // negative one. `int_pow 10 d` below would overflow long before either --
+  // `0.42.round(2.0**23)` asked for 10**8388608.
+  else if (str_eq name "round" || str_eq name "floor" || str_eq name "ceil" || str_eq name "truncate")
+          && (match recv with VFlt f9 -> (if flt_is_big_whole f9 then false else true) | _ -> false)
+          && (match args with Cons (VInt d9, _) -> d9 > 17 || d9 < (0 - 17) | _ -> false) then
+    (match args with Cons (VInt d9, _) -> (if d9 > 17 then recv else VInt 0) | _ -> recv)
+  // ⚠ ...and anything that is NOT a precision is refused BEFORE the rounding
+  //   arms answer, in ruby's two wordings: "no implicit conversion of String
+  //   into Integer", and for nil "no implicit conversion FROM nil TO integer"
+  //   (rb_num2long's own phrasing, lower case and reversed). Only #truncate
+  //   had a check, it sat after the other three arms, and it used Rational's
+  //   message -- so `12345.floor("x")` cheerfully answered 12345.
+  else if (str_eq name "truncate" || str_eq name "round" || str_eq name "floor" || str_eq name "ceil")
+          && (match recv with VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false)
+          && (match args with
+              | Cons (p9, _) -> (match p9 with VInt _ -> false | VBig _ -> false | _ -> true)
+              | _ -> false) then
+    (match args with
+     | Cons (VNil, _) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
+     | Cons (p9, _) -> conv_err p9 "Integer"
+     | _ -> VNil)
+  // ⚠ a RATIONAL takes an Integer precision and nothing else, and says so in
+  //   its own words: "not an integer" for a Float, a String, nil, a Symbol or
+  //   another Rational -- where an Integer or Float receiver reports the
+  //   CONVERSION ("no implicit conversion of String into Integer"). Asked of
+  //   ruby for all three receivers against five argument kinds, because the
+  //   message is not one rule. The check existed for #truncate alone and sat
+  //   AFTER the round / floor / ceil arms, which answered first.
+  else if (str_eq name "truncate" || str_eq name "round" || str_eq name "floor" || str_eq name "ceil")
+          && (match recv with VRat (_, _) -> true | _ -> false)
+          && (match args with
+              | Cons (p9, _) -> (match p9 with VInt _ -> false | VBig _ -> false | _ -> true)
+              | _ -> false) then
+    prim_raise "TypeError" "not an integer"
   else if str_eq name "to_i" then
     (match recv with
-     | VInt n -> VInt n | VFlt f -> VInt (int_of_float f)
+     | VInt n -> VInt n | VFlt f -> flt_trunc_v f
      | VBig s -> recv
      | VRat (n, d) -> norm_big (big_div_s n d)
      | VStr s -> let s = sget s in (match args with
@@ -30594,6 +30790,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> VNil)
      | _ -> prim_raise "NoMethodError" ("undefined method '[]' for " ++ for_recv_name recv))
   // Integer
+  // ⚠ the gcd is a MAGNITUDE, and the magnitude of the machine minimum does
+  //   not fit a machine int: `(-9223372036854775808).gcd(-9223372036854775808)`
+  //   negated in place and answered the minimum again, with the wrong sign.
+  else if (str_eq name "gcd" || str_eq name "lcm" || str_eq name "gcdlcm")
+          && ((match recv with VInt a7 -> int_neg_overflows a7 | _ -> false)
+              || (match args with Cons (VInt b7, _) -> int_neg_overflows b7 | _ -> false)) then
+    (let a9 = big_mag (num_dec recv) in
+     let b9 = big_mag (num_dec (match args with Cons (b, _) -> b | Nil -> VInt 0)) in
+     let g9 = big_gcd_s a9 b9 in
+     if str_eq name "gcd" then norm_big g9
+     else if str_eq name "lcm" then norm_big (big_mul_s (big_div_s a9 g9) b9)
+     else arr_new (Cons (norm_big g9, Cons (norm_big (big_mul_s (big_div_s a9 g9) b9), Nil))))
   else if str_eq name "gcd" then (match recv with VInt a -> (match args with Cons (VInt b, _) -> VInt (int_gcd a b) | Cons (VBig b, _) -> norm_big (big_gcd_s (big_mag (str_of_int a)) (big_mag b)) | _ -> VInt a)
      | VBig a -> (match args with Cons (b, _) -> norm_big (big_gcd_s (big_mag a) (big_mag (num_dec b))) | _ -> norm_big (big_mag a)) | _ -> (let _ = map_set prim_missing "n" (mkstr "gcd") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcd'")) in fail "mere-ruby: undefined method 'gcd'")))
   else if str_eq name "lcm" then
@@ -30638,9 +30846,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "divmod" then
     (match recv with
      | VInt a -> (match args with Cons (VInt b, _) -> arr_new (Cons (VInt (floor_div a b), Cons (VInt (floor_mod a b), Nil))) | Cons (VBig b, _) -> arr_new (Cons (norm_big (big_div_s (str_of_int a) b), Cons (norm_big (big_mod_s (str_of_int a) b), Nil))) | Cons (VFlt b, _) -> (match flt_divmod_pair (float_of_int a) b with (d9, m9) -> arr_new (Cons (VInt (flt_floor d9), Cons (VFlt m9, Nil)))) | Cons (VRat (_, _), _) -> rat_divmod_pair recv (match args with Cons (b9, _) -> b9 | Nil -> VInt 1) | _ -> VNil)
-     | VBig a -> (match args with Cons (b, _) -> let bd = num_dec b in arr_new (Cons (norm_big (big_div_s a bd), Cons (norm_big (big_mod_s a bd), Nil))) | _ -> VNil)
+     // ⚠ only an INTEGER divisor was read here: num_dec answers "0" for every
+     //   other kind, so `(2**64).divmod(3.5)` divided by zero. A Float divisor
+     //   makes it float arithmetic; a Rational one stays exact.
+     | VBig a ->
+       (match args with
+        | Cons (VFlt y9, _) ->
+          (match flt_divmod_pair (big_fdiv_s a "1") y9 with
+           (d9, m9) -> arr_new (Cons (flt_floor_v d9, Cons (VFlt m9, Nil))))
+        | Cons (VRat (_, _), _) -> (match args with Cons (b9, _) -> rat_divmod_pair recv b9 | _ -> VNil)
+        | Cons (b, _) -> let bd = num_dec b in arr_new (Cons (norm_big (big_div_s a bd), Cons (norm_big (big_mod_s a bd), Nil)))
+        | _ -> VNil)
      // Float#divmod: quotient floored to an Integer, remainder a Float.
-     | VFlt a -> (match args with Cons (b, _) -> (match flt_divmod_pair a (to_f b) with (d9, m9) -> arr_new (Cons (VInt (flt_floor d9), Cons (VFlt m9, Nil)))) | _ -> VNil)
+     | VFlt a -> (match args with Cons (b, _) -> (match flt_divmod_pair a (to_f b) with (d9, m9) -> arr_new (Cons (flt_floor_v d9, Cons (VFlt m9, Nil)))) | _ -> VNil)
      // Rational#divmod: the quotient is the FLOOR of the exact division and
      // the remainder is what the quotient leaves. An INTEGER receiver with a
      // Rational divisor is the same arithmetic -- it had no arm at all and
@@ -30809,7 +31027,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "pred" then (match recv with VInt n -> VInt (n - 1) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = map_set prim_missing "n" (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
   else if str_eq name "abs" || str_eq name "magnitude" then
     (match recv with
-     | VInt n -> VInt (if n < 0 then 0 - n else n)
+     // ...and the magnitude of the machine minimum does not fit a machine int.
+     | VInt n -> (if n < 0 then num_neg (VInt n) else VInt n)
      // -0.0 is negative BY ITS SIGN BIT, and `f < 0.0` is false for it, so
      // `(-0.0).abs` answered -0.0 -- a magnitude that prints with a minus.
      | VFlt f -> VFlt (if f < 0.0 || (if f == 0.0 then 1.0 / f < 0.0 else false) then 0.0 - f else f)
@@ -30868,7 +31087,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "floor" then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (floor_div n m * m)) | _ -> VInt n)
-     | VFlt f -> (match args with Cons (VInt d, _) -> if d <= 0 then VInt (flt_floor f) else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_floor (f * m)) / m)) | _ -> VInt (flt_floor f))
+     // ⚠ a NEGATIVE precision rounds to that power of ten, and `d <= 0`
+     //   dropped it: 12345.678.floor(-2) answered 12345, not 12300. floor of
+     //   the integer part, then floor to the place, is the same as flooring
+     //   the quotient -- so the Integer arm above can finish the job.
+     | VFlt f -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d < 0 then prim_method (flt_floor_v f) "floor" args
+                     else if d == 0 then flt_floor_v f
+                     else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_floor (f * m)) / m)))
+                  | _ -> flt_floor_v f)
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "floor" rn rd p | _ -> norm_big (rat_int_mode "floor" rn rd))
@@ -30885,7 +31113,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "ceil" then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (0 - (floor_div (0 - n) m) * m)) | _ -> VInt n)
-     | VFlt f -> (match args with Cons (VInt d, _) -> if d <= 0 then VInt (flt_ceil f) else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_ceil (f * m)) / m)) | _ -> VInt (flt_ceil f))
+     | VFlt f -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d < 0 then prim_method (flt_ceil_v f) "ceil" args
+                     else if d == 0 then flt_ceil_v f
+                     else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_ceil (f * m)) / m)))
+                  | _ -> flt_ceil_v f)
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "ceil" rn rd p | _ -> norm_big (rat_int_mode "ceil" rn rd))
@@ -30930,7 +31163,20 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "round" then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else VInt (int_round_place n (int_pow 10 (0 - d))) | _ -> VInt n)
-     | VFlt f -> (match args with Cons (VInt d, _) -> if d <= 0 then VInt (flt_round f) else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_round (f * m)) / m)) | _ -> VInt (flt_round f))
+     // ⚠ round does NOT decompose the way floor and ceil do: rounding to an
+     //   integer first and then to the place DOUBLE-ROUNDS (12349.6 would go
+     //   12350 -> 12400 where ruby answers 12300), so a negative precision
+     //   scales the float itself. A float that is already whole has no
+     //   fraction to round twice, and takes the exact integer path.
+     | VFlt f -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d < 0 then
+                       (if flt_is_big_whole f then prim_method (flt_round_v f) "round" args
+                        else (let mi = int_pow 10 (0 - d) in
+                              VInt (flt_round (f / float_of_int mi) * mi)))
+                     else if d == 0 then flt_round_v f
+                     else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_round (f * m)) / m)))
+                  | _ -> flt_round_v f)
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "round" rn rd p | _ -> norm_big (rat_int_mode "round" rn rd))
@@ -30947,13 +31193,23 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // ...and truncate's precision is an Integer too. `Rational(1,2).truncate("x")`
   // fell through to the no-argument form and answered 0 -- the truncation of a
   // precision ruby refuses to read.
-  else if str_eq name "truncate" && is_num recv
-          && (match args with
-              | Cons (p9, _) -> (match p9 with VInt _ -> false | VBig _ -> false | _ -> true)
-              | _ -> false) then
-    prim_raise "TypeError" "not an integer"
   else if str_eq name "truncate" then
-    (match recv with VInt n -> VInt n | VFlt f -> VInt (int_of_float f)
+    // ⚠ a NEGATIVE precision truncates to that power of ten, TOWARD ZERO --
+    //   and this arm answered the receiver unchanged, so `12345.truncate(-2)`
+    //   was 12345. The Bignum arm below always did it; the machine-int one did
+    //   not, which is the same rule written twice and only one of them right.
+    (match recv with
+     | VInt n -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (n / m * m)))
+                  | _ -> VInt n)
+     | VFlt f -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d < 0 then prim_method (flt_trunc_v f) "truncate" args
+                     else if d == 0 then flt_trunc_v f
+                     else (let m = float_of_int (int_pow 10 d) in
+                           VFlt (float_of_int (int_of_float (f * m)) / m)))
+                  | _ -> flt_trunc_v f)
      | VBig b -> (match args with
                   | Cons (VInt d, _) ->
                     (if d >= 0 then VBig b
@@ -30967,6 +31223,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   //   A Float's pair is its EXACT value (0.1 -> 3602879701896397/36028797018963968),
   //   which flt_rat_parts already computes for to_r.
   //   A Complex's is its parts over their common denominator.
+  // ⚠ a NON-FINITE float has no exact pair, and ruby answers the float itself
+  //   for #numerator (Infinity, -Infinity, NaN) and 1 for #denominator. Asking
+  //   flt_rat_parts answered Int64 max over 2**62 instead -- the saturation
+  //   again, wearing a different name.
+  else if (str_eq name "numerator" || str_eq name "denominator")
+          && (match recv with VFlt f7 -> (if (f7 - f7) == 0.0 then false else true) | _ -> false) then
+    (if str_eq name "numerator" then recv else VInt 1)
+  // ...and NaN has no phase either: #arg / #angle / #phase answer NaN.
+  else if (str_eq name "arg" || str_eq name "angle" || str_eq name "phase")
+          && (match recv with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false) then
+    recv
   else if str_eq name "numerator" then (match recv with VRat (n, d) -> norm_big n | VInt n -> VInt n | VBig b -> norm_big b | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big n2 | v -> v) | VCpx (r, i) -> (let dn = cpx_common_den r i in VCpx (num_scale_to r dn, num_scale_to i dn)) | _ -> (let _ = map_set prim_missing "n" (mkstr "numerator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'numerator'")) in fail "mere-ruby: undefined method 'numerator'")))
   // marshal_dump: the pair a Marshal round-trip needs. Ruby has these as
   // private methods on both classes, so a direct call is a NoMethodError in
@@ -31033,6 +31300,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      //   through atan2 gave 0.0 and printed a Float where ruby prints an
      //   Integer, which is a diff on every spec that inspects the pair.
      // ...and -0.0's polar is [0.0, pi] -- both halves read the sign bit.
+     // ...and NaN has no magnitude and no angle: ruby answers [NaN, NaN]. The
+     // sign-bit reading below took the "not negative" branch and paired NaN
+     // with the Integer 0.
+     | VFlt f7 when (if f7 == f7 then false else true) -> arr_new (Cons (recv, Cons (recv, Nil)))
      | v -> arr_new (Cons (num_mag_signed v,
                            Cons ((if num_isneg_signed v then VFlt (atan2 0.0 (to_f v)) else VInt 0), Nil))))
   // Numeric#rationalize: the SIMPLEST fraction within the receiver's precision,
@@ -31054,6 +31325,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (if exact_zero_val cim then prim_method cre "rationalize" args
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Rational"))
      | _ -> VNil)
+  // A Float that is already WHOLE rationalizes to ITSELF over 1: ruby short
+  // circuits there (float_rationalize returns the exact integer once the
+  // exponent says there is no fraction) and never runs the simplest-rational
+  // search. Running it anyway answered 999999999999999949515880660992 for
+  // 1.0e30, whose exact value is 1000000000000000019884624838656 -- a simpler
+  // rational inside an interval ruby does not consider.
+  else if str_eq name "rationalize" && (match args with Nil -> true | _ -> false)
+          && (match recv with VFlt f9 -> flt_is_big_whole f9 | _ -> false) then
+    (match recv with VFlt f9 -> mk_rat_s (flt_to_big_s f9) "1" | _ -> VNil)
   else if str_eq name "rationalize" then
     (let bounds =
        (match args with
@@ -33999,6 +34279,19 @@ and kern_base_int = fn env -> fn world -> fn (b: Val) ->
 // maximum: Integer(2e100) answered 9223372036854775807. Above 2^53 the value
 // is already whole, so halving until it fits is exact and the bignum is
 // mantissa * 2^shift.
+// floor / ceil / round / truncate of a Float as an EXACT Integer. Each site
+// used to build one with `VInt (flt_floor f)`, and every one of those goes
+// through int_of_float, which SATURATES: 1.0e30.to_i / .floor / .round /
+// .truncate all answered Int64 max, and .ceil wrapped to Int64 MIN -- the
+// wrong sign for a positive number. Above 2**53 a float is already whole, so
+// all four are the same exact integer and kern_flt_to_int builds it.
+and flt_is_big_whole = fn (f: float) ->
+  f >= 9007199254740992.0 || f <= (0.0 - 9007199254740992.0)
+and flt_floor_v = fn (f: float) -> if flt_is_big_whole f then kern_flt_to_int f else VInt (flt_floor f)
+and flt_ceil_v  = fn (f: float) -> if flt_is_big_whole f then kern_flt_to_int f else VInt (flt_ceil f)
+and flt_round_v = fn (f: float) -> if flt_is_big_whole f then kern_flt_to_int f else VInt (flt_round f)
+and flt_trunc_v = fn (f: float) -> if flt_is_big_whole f then kern_flt_to_int f else VInt (int_of_float f)
+
 and kern_flt_to_int = fn (f: float) ->
   let sp = float_special f in
   if str_eq sp "NaN" then (let _ = conv_fail "FloatDomainError" "NaN" in VNil)
