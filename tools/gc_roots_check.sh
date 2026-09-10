@@ -26,9 +26,23 @@ trap 'rm -rf "$tmp"' EXIT
 LC_ALL=C grep -a -o 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
   | sed 's/static mere_map_str_//; s/\* mu_/ /; s/;//' \
   | awk '$1 ~ /Val/ && $1 !~ /^Map___heap_str_Val$/ {print $2, $1}' | sort -u > "$tmp/valmaps"
+# ...and the names this excluded, so an allowlist entry for one of them is not
+# reported as stale (see the note above).
+LC_ALL=C grep -a -o 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
+  | sed 's/static mere_map_str_//; s/\* mu_/ /; s/;//' \
+  | awk '$1 == "Map___heap_str_Val" {print $2}' | sort -u > "$tmp/excluded"
 # (Map___heap_str_Val values are env maps -- containers of Vals -- and lv_up,
 #  which holds them, is a root; the rest are frame-shaped scratch handled by
 #  the pool. They are checked by hand, not here.)
+# ⚠ a map of MAPS lands in that excluded class too, and not every one of them
+#   is an env map: num_names_memo (numeric kind -> a set of method names) has
+#   been on BOTH sides of this line -- `Map_str_Val` in one build (so the gate
+#   said UNACCOUNTED and it was allowlisted) and `Map___heap_str_Val` in
+#   another (so the same entry read STALE and the gate went red again). Which
+#   one it gets is a monomorphisation coincidence, not a change in the map.
+#   Two sessions then "fixed" the gate in OPPOSITE directions on the same day.
+#   So an allowlist entry naming a map that is currently in the excluded class
+#   is not stale -- it is an entry waiting for the type to swing back.
 
 # 2. the roots: every `map_iter X mk` inside gc_mark_roots
 a=$(LC_ALL=C grep -n '^let gc_mark_roots = fn' "$root/main.mere" | head -1 | cut -d: -f1)
@@ -51,7 +65,8 @@ done < "$tmp/valmaps"
 # an allowlist entry that has become a root (or vanished) is stale
 while read -r nm; do
   grep -qx "$nm" "$tmp/roots" && { echo "STALE allowlist entry $nm: it is a root now"; fail=1; }
-  grep -q "^$nm " "$tmp/valmaps" || { echo "STALE allowlist entry $nm: no such Val-valued map"; fail=1; }
+  grep -q "^$nm " "$tmp/valmaps" || grep -qx "$nm" "$tmp/excluded" \
+    || { echo "STALE allowlist entry $nm: no such Val-valued map"; fail=1; }
 done < "$tmp/allow"
 [ $fail = 0 ] && echo "gc roots: every Val-valued global map is accounted for" || echo "gc roots: UNACCOUNTED maps above"
 exit $fail

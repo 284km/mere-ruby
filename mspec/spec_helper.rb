@@ -506,6 +506,7 @@ class MockExpectation
   def twice; self; end
   def once; self; end
   def at_least(*a); @optional = true; self; end
+  def at_most(*a); @optional = true; self; end
   # ⚠ "any number of times" INCLUDES zero, so this expectation must not be
   #  verified. core/numeric/coerce_spec sets one in `before :each` that its
   #  first example never uses.

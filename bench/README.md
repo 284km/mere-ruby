@@ -1,6 +1,6 @@
 # bench — where the time and the memory actually go
 
-Two harnesses, both meant to be run against CRuby as well, because a number
+Every harness here is meant to be run against CRuby as well, because a number
 without the reference number is not a measurement.
 
 ## `alloc_per_call.sh`
@@ -143,3 +143,53 @@ literals, including bytes that are not valid UTF-8, and its longest line is
 compiling *at a line nowhere near the edit*. LC_ALL=C does not save it. The
 splice here is done with `grep -b` and `head -c` / `tail -c` for that reason,
 and anything else that edits generated C should be too.
+
+## `csv.sh`
+
+```
+./bench/csv.sh [path/to/mere-ruby]        # ROWS (400), REPS (3, best-of)
+```
+
+Can this interpreter run a real gem, and what does it cost? ruby/csv is a good
+subject: pure Ruby, no C extension, and it leans on StringScanner, Enumerator,
+StringIO and ARGF -- four things an interpreter is easy to get *almost* right.
+Six bugs stood between `require "csv"` and this table, and none of them was
+about CSV; see the commit that added this file.
+
+The gem is not vendored. The script asks the reference ruby where it loaded
+`csv.rb` from and puts that directory on both sides' load path, so the two
+sides run byte-identical library code and the interpreter is the only variable.
+
+2026-09-10, csv 3.3.5, ruby 4.0.6, ROWS=400, best of 3:
+
+| | ruby | mere-ruby | |
+|---|---|---|---|
+| `CSV.parse` plain 401 rows | 0.001 s | 0.212 s | ~200x |
+| `CSV.parse` quoted 401 rows | 0.002 s | 5.978 s | ~3000x |
+| `CSV.parse headers:` 400 rows | 0.001 s | 0.256 s | ~250x |
+| `CSV.parse_line` x400 | 0.009 s | 0.909 s | ~100x |
+| `CSV.generate_line` x400 | 0.005 s | 0.888 s | ~180x |
+
+**Read the count column, not just the seconds.** Every line prints the rows,
+fields or bytes it produced. Two sides that produced different numbers did
+different amounts of work -- and the bug that started this arc was `CSV.parse`
+quietly returning every other row, which without the counts reads as a 2x
+speedup.
+
+The interesting number is not the 200x, it is the difference between the two
+parse rows. Doubling ROWS:
+
+| rows | plain | quoted |
+|---|---|---|
+| 100 | 0.050 s | 0.628 s |
+| 200 | 0.105 s | 1.845 s |
+| 400 | 0.209 s | 6.049 s |
+| 800 | 0.431 s | 22.002 s |
+
+Plain is **linear** (2.1x, 2.0x, 2.1x). Quoted is **n^1.7 and climbing**
+(2.9x, 3.3x, 3.6x), so the gap widens with the file: 12x at 100 rows, 51x at
+800. One quoted field switches csv to `parse_quotable_robust`, a different
+parser built on regexes and StringScanner rather than String#split -- so the
+quoted row is not measuring csv, it is measuring what this interpreter charges
+for a regex match and a scanner step. That is where to look before optimising
+anything the plain row touches.
