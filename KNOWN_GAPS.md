@@ -255,6 +255,43 @@ Until then the gate records this as a DELIBERATE divergence with a bounded
 wait, so a regression to blocking fails rather than hangs
 (`clitest/run.sh`).
 
+## `puts(**{})` prints an empty hash; ruby prints a newline
+
+```ruby
+h = {a: 1}
+puts **h        # both: {a: 1}
+puts(**{})      # mere-ruby: {}      ruby: (a blank line)
+```
+
+An empty double-splat passes no keyword arguments **at all** (Ruby 3.0),
+so it does not merely contribute nothing to the output — it disappears
+from the argument list, and `puts(**{})` is `puts()`, which prints a
+newline. `eval_args` already says this for a call ("omit it rather than
+leaking an empty positional hash"). The statement form of `puts` does not
+go through `eval_args`.
+
+**Why it is still here.** `puts` is a statement in this parser, so
+`SPuts` has two argument paths: a user-overridden `puts` goes through
+`eval_args`, which is correct, and the builtin goes through `puts_args`,
+which evaluates each element with `eval_e` directly. Dropping the empty
+splat *inside* `puts_args` drops the newline with it, because `SPuts`
+decides between `out_print ""` and `puts_args` by looking at the argument
+list before anything is evaluated. Deciding emptiness earlier means
+evaluating the inner expression to look at it and then evaluating it
+again to print it — one `**side_effecting_call` and that is two calls.
+
+**What fixing it takes.** Routing the builtin path through `eval_args`
+too, so both halves of `SPuts` share one argument evaluator instead of
+disagreeing about `**`. That is the right shape — the duplication is the
+actual defect here — but the blast radius is the whole `puts` family and
+it wants the full spec sweep rather than the corpus.
+
+**What it costs today.** Nothing measured. No file in `ruby/spec` writes
+`puts **h` in any form, the corpus does not either, and it surfaced only
+while giving `eval_e` its missing `EKwSplat` arm — before which
+`puts **h` printed *nothing at all*, so both halves of this were wrong
+and the reachable half is now right.
+
 ## `p -1` parses as `p - 1`
 
 ```ruby
