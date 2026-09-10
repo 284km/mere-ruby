@@ -10,13 +10,13 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 151 files.
+Classified: 149 files.
 
-## DIFF — 151 files, 76 kinds
+## DIFF — 149 files, 75 kinds
 
 | files | kind |
 |---|---|
-| 18 | `ERROR NoMethodError` |
+| 17 | `ERROR NoMethodError` |
 | 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected to be identical` |
 | 6 | `FAILED expected TypeError to be raised` |
@@ -70,7 +70,7 @@ Classified: 151 files.
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
 | 1 | `FAILED expected ThreadError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
@@ -88,7 +88,6 @@ Classified: 151 files.
 | 1 | `FAILED expected "` |
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `Exception 'S' at /privateTMPDIR - uninitialized constant IOStub` |
-| 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR SyntaxError` |
 | 1 | `ERROR StandardError` |
@@ -153,7 +152,6 @@ class column says where the weight sits.
 | unboundmethod (3) | `bind_call bind super_method` |
 | language (3) | `constants module numbered_parameters` |
 | method (2) | `super_method to_proc` |
-| threadgroup (1) | `list` |
 | symbol (1) | `all_symbols` |
 | struct (1) | `new` |
 | regexp (1) | `timeout` |

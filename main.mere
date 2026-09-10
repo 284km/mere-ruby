@@ -11991,7 +11991,10 @@ let rec val_join = fn (es: Val -> str) -> fn (xs: Val list) -> fn (sep: str) -> 
 //   ivars : Map[str, Val]   — "id@name" -> instance variable value
 // (Maps cannot be put in a record/variant field without wrestling the
 // region annotations, but a tuple of Maps threads cleanly — so a tuple
-// is the bundle. A fresh object's id is `map_len ocls`.)
+// is the bundle. A fresh object's id comes from `alloc_oid ocls`, which
+// carries its counter in the map as "$next" -- it was `map_len ocls` once,
+// and a site left behind on that rule issued an id alloc_oid had already
+// given out.)
 //
 // Ruby method scope is FLAT: a method body sees only its parameters and
 // self, never the caller's locals. Each call runs in a fresh env.
@@ -21671,6 +21674,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with Cons (v, _) -> v | _ -> VNil)
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Thread"))
     // Queue / SizedQueue / ConditionVariable constructors.
+    // ⚠ these three fresh ids come from alloc_oid, NOT from `map_len ocls`.
+    //   They were the last three sites left on the old scheme, and one id
+    //   space with two allocators issues the same id twice: alloc_oid carries
+    //   its counter in the map as "$next", which map_len then COUNTS, so the
+    //   two disagree from the first allocation onward. A Queue and a plain
+    //   object got the same id, which means the same ivar slots -- `M.new(q)`
+    //   read its own `@a` out of the queue's row and answered ITSELF, and the
+    //   mspec matcher built that way recursed until the stack ran out. It
+    //   needs no collection to happen; see alloc_oid for the reason it exists.
     else if (str_eq c "Queue" || str_eq c "SizedQueue") && str_eq name "new" then
       (let (mth0, sup0, ocl0, iv0) = world in
        // Queue.new(enumerable) seeds from the argument: an Array directly,
@@ -21701,7 +21713,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                  ("can't convert " ++ class_name v ++ " into Array") in
                Nil)
           else Nil) in
-       let id2 = map_len ocl0 in
+       let id2 = alloc_oid ocl0 in
        let _ = map_set ocl0 (str_of_int id2) c in
        let _ = map_set iv0 (str_of_int id2 ++ "@__q") (arr_new seed) in
        let _ = (if str_eq c "SizedQueue" then
@@ -21714,13 +21726,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        VObj id2)
     else if str_eq c "ConditionVariable" && str_eq name "new" then
       (let (mth0, sup0, ocl0, iv0) = world in
-       let id2 = map_len ocl0 in
+       let id2 = alloc_oid ocl0 in
        let _ = map_set ocl0 (str_of_int id2) "ConditionVariable" in
        VObj id2)
     // ThreadGroup: groups are markers on thread objects (@__tgrp).
     else if str_eq c "ThreadGroup" && str_eq name "new" then
       (let (mth0, sup0, ocl0, iv0) = world in
-       let id2 = map_len ocl0 in
+       let id2 = alloc_oid ocl0 in
        let _ = map_set ocl0 (str_of_int id2) "ThreadGroup" in
        VObj id2)
     // Complex class methods: polar / rectangular constructors. A Complex
@@ -23562,6 +23574,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 if alive2 && rb_eq grp recv then (let i2 = map_len out in map_set out (str_of_int i2) t) else ())
              | _ -> ())) in
           arr_new (idx_to_list out 0 (map_len out)))
+       // ⚠ ...and then the UNIVERSAL names, or this arm refuses them all.
+       //   `equal?`, `__send__`, `object_id`, `nil?`, `hash`, `==`, `freeze`,
+       //   `itself` and six more answered NoMethodError here -- fourteen of
+       //   them, the same hole ARGF had: an arm keyed on the class captures
+       //   the whole namespace, so every name it does not spell is refused
+       //   rather than passed on. The class's own names are all tried above,
+       //   so this cannot shadow one.
+       else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ThreadGroup"))
     // Queue / SizedQueue (synchronous model): a plain FIFO. A pop that
     // would block forever (empty, not closed, nobody left to push) is the
@@ -23611,6 +23631,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil)
        else if str_eq name "max=" then
          (match args with Cons (VInt mx, _) -> let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in VInt mx | _ -> VNil)
+       // ⚠ ...but NOT dup/clone. A Queue has no #initialize_copy in ruby, so
+       //   copying one is a NoMethodError naming THAT -- and handing the two
+       //   names to the generic handler answered a COPY instead, which is
+       //   wrong in the permissive direction: a program that must not copy a
+       //   queue got a second queue and no complaint. Mutex and ThreadGroup
+       //   do copy, so this is per-class, not a rule about the group.
+       else if str_eq name "dup" || str_eq name "clone" then
+         raise_exc world "NoMethodError"
+           ("undefined method 'initialize_copy' for an instance of Thread::" ++ cls)
+       // the universal names, same reason as the ThreadGroup arm above.
+       else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ cls))
     // ConditionVariable (synchronous model): wait returns immediately (there
     // is nobody to signal us later); signal/broadcast are no-ops.
@@ -23621,6 +23652,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (if in_thread () then raise_exc world "__ThreadPark" "sleep"
           else raise_exc world "fatal" "No live threads left. Deadlock?")
        else if str_eq name "signal" || str_eq name "broadcast" then recv
+       // the universal names, same reason as the ThreadGroup arm above.
+       else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of ConditionVariable"))
     // Mutex (synchronous model): the owner is a thread object; a lock held
     // by a dead thread is reacquirable, a re-lock by the owner (or a lock
@@ -23688,6 +23721,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                   | VNil -> raise_exc world "fatal" "No live threads left. Deadlock?"
                   | _ -> VNil)
           else raise_exc world "ThreadError" "Attempt to unlock a mutex which is not locked")
+       // the universal names, same reason as the ThreadGroup arm above.
+       else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Mutex"))
     // File handles from File.open/File.new: buffered writes, read-through
     // reads, #gets tracked by @__f_pos.
@@ -25122,6 +25157,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else if str_eq name "priority=" then (match args with Cons (v, _) -> v | _ -> VNil)
           else if str_eq name "inspect" || str_eq name "to_s" then
             mkstr ("#<Thread " ++ (match tst with VStr h -> sget h | VBool _ -> "dead" | _ -> "dead") ++ ">")
+          // the universal names, same reason as the ThreadGroup arm above --
+          // this one refused four of them.
+          else if is_prim_method name then dispatch_prim env world blk recv name args false
           else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Thread"))
        | _ -> recv)
     // Comparable#clamp / #between? on a user object with <=>.
@@ -44975,6 +45013,25 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                   env_get "PWD" ++ "/" ++ p1
                 else (let hit = load_path_find world p1 in
                       if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
+     // ...and then CANONICALISED, because this one string is the whole
+     // identity of a feature: it keys loaded_files, it is the entry pushed
+     // onto $LOADED_FEATURES, and it is what is opened and read. Built by
+     // concatenation it is not canonical -- `require_relative "spec_helper"`
+     // from a driver and `require_relative "../../spec_helper"` from a file
+     // two directories down name the SAME file as
+     // `/d/spec_helper` and `/d/core/queue/../../spec_helper`, so the guard
+     // above saw two features and ran the file TWICE. Ruby resolves both to
+     // one realpath and loads once.
+     //
+     // ⚠ the second load is not merely wasted work. Re-running a file that
+     //   redefines a method in terms of the one it is replacing makes the new
+     //   definition call ITSELF: the mspec shim loaded twice turned
+     //   `q.should.empty?` into `stack level too deep`, and that error was
+     //   recorded against Queue in three spec rows -- the instrument's bug
+     //   wearing the subject's name.
+     let full = (let n0 = path_norm full in
+                 if str_len n0 > 0 && str_eq (char_at n0 0) "/" then n0
+                 else path_norm (env_get "PWD" ++ "/" ++ n0)) in
      let _ = (if gc_log_on () then print_err ("gc: require " ++ full) else ()) in
      if map_has loaded_files full then FNext (VBool false)
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
