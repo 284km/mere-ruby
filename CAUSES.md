@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 169 files.
+Classified: 165 files.
 
-## DIFF — 169 files, 75 kinds
+## DIFF — 165 files, 75 kinds
 
 | files | kind |
 |---|---|
-| 17 | `FAILED matcher did not match #<OBJ>` |
 | 15 | `ERROR NoMethodError` |
+| 13 | `FAILED matcher did not match #<OBJ>` |
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `ERROR NameError` |
@@ -99,7 +99,6 @@ Classified: 169 files.
 | 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
 | 2 | `pass=16 fail=0 err=0` |
-| 2 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
@@ -113,9 +112,9 @@ Classified: 169 files.
 | 1 | `FAILED: with &&= assignments: matcher did not match #<Proc>` |
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
-| 1 | `FAILED: warns on block and default parameter given: matcher did not match #<Proc>` |
 | 1 | `FAILED: warns if there are identical when clauses: matcher did not match #<Proc>` |
 | 1 | `FAILED: warns about flags being ignored for regexp arguments: matcher did not match #<Proc>` |
+| 1 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
@@ -136,6 +135,7 @@ Classified: 169 files.
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
 | 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
+| 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 
 </details>
 

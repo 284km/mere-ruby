@@ -8,23 +8,18 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **169** of **169** recorded DIFF files.
+Visited **165** of **165** recorded DIFF files.
 
 | file | what fails |
 |---|---|
 | core/array/element_reference_spec.rb | ERROR: with a subclass of Array raises a RangeError when the start index is out of range of Fixnum: NameError -- undefined local variable or method 'max_long' for an instance of Object |
 | core/array/element_reference_spec.rb | FAILED: expected RangeError to be raised |
 | core/array/element_reference_spec.rb | FAILED: expected TypeError to be raised |
-| core/array/fetch_spec.rb | FAILED: gives precedence to the default block over the default argument: matcher did not match #<Proc> |
-| core/array/fetch_spec.rb | pass=16 fail=1 err=0 |
 | core/array/initialize_spec.rb | ERROR: Array#initialize with no arguments does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | ERROR: Array#initialize with (array) does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
 | core/array/intersect_spec.rb | FAILED: determines equivalence between elements in the sense of eql?: expected true, got false |
 | core/array/intersect_spec.rb | pass=12 fail=1 err=0 |
-| core/array/new_spec.rb | ERROR: Array.new with no arguments does not use the given block: RuntimeError -- |
-| core/array/new_spec.rb | ERROR: Array.new with (array) does not use the given block: RuntimeError -- |
-| core/array/new_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
@@ -54,8 +49,6 @@ Visited **169** of **169** recorded DIFF files.
 | core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
 | core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
 | core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
-| core/env/fetch_spec.rb | FAILED: warns on block and default parameter given: matcher did not match #<Proc> |
-| core/env/fetch_spec.rb | pass=10 fail=1 err=0 |
 | core/env/merge_spec.rb | FAILED: adds the multiple parameter hashes to ENV, returning ENV: expected "multi2", got nil |
 | core/env/merge_spec.rb | ERROR: ENV.merge! yields key, the old value and the new value when replacing an entry: NotImplementedError -- mere-ruby: ENV.merge! is not implemented (it would change the environment) |
 | core/env/merge_spec.rb | ERROR: ENV.merge! yields key, the old value and the new value when replacing an entry: NotImplementedError -- mere-ruby: ENV.merge! is not implemented (it would change the environment) |
@@ -107,8 +100,6 @@ Visited **169** of **169** recorded DIFF files.
 | core/hash/element_set_spec.rb | FAILED: stores unequal keys that hash to the same value: expected to receive #hash |
 | core/hash/element_set_spec.rb | FAILED: stores unequal keys that hash to the same value: expected to receive #hash |
 | core/hash/element_set_spec.rb | FAILED: does not dispatch to hash for Boolean, Integer, Float, String, or Symbol: expected "OK |
-| core/hash/fetch_spec.rb | FAILED: gives precedence to the default block over the default argument when passed both: matcher did not match #<Proc> |
-| core/hash/fetch_spec.rb | pass=9 fail=1 err=0 |
 | core/hash/inspect_spec.rb | FAILED: returns a string representation with same order as each(): expected "{:a=>[1, 2], :b=>-2, :d=>-6, nil=>nil}", got "{a: [1, 2], b: -2, d: -6, nil => nil}" |
 | core/hash/inspect_spec.rb | FAILED: calls #inspect on keys and values: expected "{key=>val}", got "{key => val}" |
 | core/hash/inspect_spec.rb | FAILED: does not call #to_s on a String returned from #inspect: expected "{:a=>\"abc\"}", got "{a: \"abc\"}" |
@@ -213,7 +204,7 @@ Visited **169** of **169** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.109106379, got 0.816685748 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.317057097, got 0.741206217 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
