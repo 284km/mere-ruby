@@ -742,6 +742,174 @@ def flunk(msg = nil)
   nil
 end
 
+# ---- mspec's own helpers, ported from its source --------------------------
+# Nineteen recorded rows stop at one of these, and they are mspec's files, not
+# ruby's: `fixture`, `tmp`, `IOStub`, `complain`, `output`, the fs helpers.
+# They are transcribed from spec/mspec/lib/mspec rather than reconstructed from
+# the call sites, because a helper invented from how it is CALLED answers a
+# different question from the one the spec is asking -- and the spec is the
+# thing being trusted here.
+
+# helpers/io.rb
+class IOStub
+  def initialize; @buffer = []; @output = +""; end
+  def write(*str); self << str.join(''); end
+  def <<(str); @buffer << str; self; end
+  def print(*str); write(str.join('') + $\.to_s); end
+  def printf(format, *args); self << sprintf(format, *args); end
+  def puts(*str)
+    if str.empty?
+      write "\n"
+    else
+      write(str.collect { |s| s.to_s.chomp }.concat([nil]).join("\n"))
+    end
+  end
+  def flush; @output += @buffer.join(''); @buffer.clear; self; end
+  def to_s; flush; @output; end
+  def to_str; to_s; end
+  def ==(other); to_s == other; end
+  def =~(other); to_s =~ other; end
+  def method_missing(name, *args, &block); to_s.send(name, *args, &block); end
+  def respond_to_missing?(name, include_private = false); to_s.respond_to?(name, include_private); end
+end
+
+# helpers/fixture.rb
+def fixture(file, *args)
+  path = File.dirname(file)
+  path = path[0..-7] if path[-7..-1] == "/shared"
+  fixtures = path[-9..-1] == "/fixtures" ? "" : "fixtures"
+  path = (File.realpath(path) rescue File.expand_path(path))
+  File.join(path, fixtures, *args)
+end
+
+# helpers/tmp.rb. ⚠ mspec also refuses a world-writable SPEC_TEMP_DIR, asking
+# File.umask -- which mere-ruby does not have. The check is dropped rather than
+# faked: it guards against a SHARED temp directory, and this one is created
+# under the working directory per process. Said here so the omission is a
+# decision and not a gap someone later mistakes for a port that is complete.
+SPEC_TEMP_DIR = "#{Dir.pwd}/rubyspec_temp/#{Process.pid}" unless defined?(SPEC_TEMP_DIR)
+SPEC_TEMP_UNIQUIFIER = +"0" unless defined?(SPEC_TEMP_UNIQUIFIER)
+
+def tmp(name, uniquify = true)
+  mkdir_p SPEC_TEMP_DIR unless File.directory?(SPEC_TEMP_DIR)
+  if uniquify and !name.empty?
+    slash = name.rindex "/"
+    index = slash ? slash + 1 : 0
+    name = +name
+    name.insert index, "#{SPEC_TEMP_UNIQUIFIER.succ!}-"
+  end
+  File.join SPEC_TEMP_DIR, name
+end
+
+# helpers/fs.rb
+def mkdir_p(path)
+  parts = File.expand_path(path).split("/")
+  name = parts.shift
+  parts.each do |part|
+    name = File.join name, part
+    raise ArgumentError, "path component of #{path} is a file" if File.file? name
+    Dir.mkdir(name) unless File.directory? name
+  end
+end
+
+def rm_r(*paths)
+  paths.each do |path|
+    path = File.expand_path path
+    prefix = SPEC_TEMP_DIR
+    unless path[0, prefix.size] == prefix
+      raise ArgumentError, "#{path} is not prefixed by #{prefix}"
+    end
+    if File.symlink? path
+      File.delete path
+    elsif File.directory? path
+      Dir.entries(path).each { |x| rm_r "#{path}/#{x}" unless x =~ /\A\.\.?\z/ }
+      Dir.rmdir path
+    elsif File.exist? path
+      File.delete path
+    end
+  end
+end
+
+def touch(name, mode = "w")
+  mkdir_p File.dirname(name)
+  File.open(name, mode) { |f| yield f if block_given? }
+end
+
+def cp(source, dest)
+  File.write(dest, File.read(source))
+end
+
+# helpers/warning.rb
+def suppress_keyword_warning(&block); suppress_warning(&block); end
+
+# matchers/complain.rb
+class ComplainMatcher
+  def initialize(complaint = nil, options = nil)
+    if complaint.is_a?(Hash)
+      @complaint = nil
+      @options = complaint
+    else
+      @complaint = complaint
+      @options = options || {}
+    end
+  end
+  def match?(proc)
+    saved_err = $stderr
+    verbose = $VERBOSE
+    err = IOStub.new
+    $stderr = err
+    $VERBOSE = @options.key?(:verbose) ? @options[:verbose] : false
+    begin
+      proc.call
+    ensure
+      $VERBOSE = verbose
+      $stderr = saved_err
+    end
+    @warning = err.to_s
+    unless @complaint.nil?
+      case @complaint
+      when Regexp then return false unless @warning =~ @complaint
+      else return false unless @warning == @complaint
+      end
+    end
+    !@warning.empty?
+  end
+end
+def complain(complaint = nil, options = nil); ComplainMatcher.new(complaint, options); end
+
+# matchers/output.rb
+class OutputMatcher
+  def initialize(stdout, stderr); @out = stdout; @err = stderr; end
+  def match?(proc)
+    saved_out = $stdout
+    saved_err = $stderr
+    o = IOStub.new
+    e = IOStub.new
+    $stdout = o
+    $stderr = e
+    begin
+      proc.call
+    ensure
+      $stdout = saved_out
+      $stderr = saved_err
+    end
+    unless @out.nil?
+      case @out
+      when Regexp then return false unless o.to_s =~ @out
+      else return false unless o.to_s == @out
+      end
+    end
+    unless @err.nil?
+      case @err
+      when Regexp then return false unless e.to_s =~ @err
+      else return false unless e.to_s == @err
+      end
+    end
+    true
+  end
+end
+def output(stdout = nil, stderr = nil); OutputMatcher.new(stdout, stderr); end
+
 def mspec_report
   puts "pass=#{$mspec_pass} fail=#{$mspec_fail} err=#{$mspec_err}"
 end

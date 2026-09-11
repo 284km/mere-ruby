@@ -8,15 +8,44 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **146** of **146** recorded DIFF files.
+Visited **182** of **182** recorded DIFF files.
 
 | file | what fails |
 |---|---|
+| core/array/all_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
+| core/array/all_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/all_spec.rb | pass=0 fail=2 err=0 |
+| core/array/any_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
+| core/array/any_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/any_spec.rb | pass=6 fail=2 err=0 |
+| core/array/count_spec.rb | FAILED: ignores the block if there is an argument: expected 2, got 0 |
+| core/array/count_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/count_spec.rb | pass=3 fail=2 err=0 |
 | core/array/element_reference_spec.rb | ERROR: with a subclass of Array raises a RangeError when the start index is out of range of Fixnum: NameError -- undefined local variable or method 'max_long' for an instance of Object |
 | core/array/element_reference_spec.rb | FAILED: expected RangeError to be raised |
 | core/array/element_reference_spec.rb | FAILED: expected TypeError to be raised |
+| core/array/fetch_spec.rb | FAILED: gives precedence to the default block over the default argument: matcher did not match #<Proc> |
+| core/array/fetch_spec.rb | pass=16 fail=1 err=0 |
+| core/array/find_index_spec.rb | FAILED: ignores the block if there is an argument: expected 3, got 2 |
+| core/array/find_index_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/find_index_spec.rb | pass=6 fail=2 err=0 |
+| core/array/initialize_spec.rb | ERROR: Array#initialize with no arguments does not use the given block: RuntimeError -- |
+| core/array/initialize_spec.rb | ERROR: Array#initialize with (array) does not use the given block: RuntimeError -- |
+| core/array/initialize_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
 | core/array/intersect_spec.rb | FAILED: determines equivalence between elements in the sense of eql?: expected true, got false |
 | core/array/intersect_spec.rb | pass=12 fail=1 err=0 |
+| core/array/new_spec.rb | ERROR: Array.new with no arguments does not use the given block: RuntimeError -- |
+| core/array/new_spec.rb | ERROR: Array.new with (array) does not use the given block: RuntimeError -- |
+| core/array/new_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
+| core/array/none_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
+| core/array/none_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/none_spec.rb | pass=0 fail=2 err=0 |
+| core/array/one_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
+| core/array/one_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/one_spec.rb | pass=0 fail=2 err=0 |
+| core/array/rindex_spec.rb | FAILED: ignores the block if there is an argument: expected 3, got 4 |
+| core/array/rindex_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/array/rindex_spec.rb | pass=13 fail=2 err=0 |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
@@ -28,22 +57,41 @@ Visited **146** of **146** recorded DIFF files.
 | core/complex/inspect_spec.rb | pass=7 fail=0 err=2 |
 | core/complex/to_s_spec.rb | ERROR: when self's real component is 0 treats real and imaginary parts as strings: TypeError -- not a real |
 | core/complex/to_s_spec.rb | pass=13 fail=0 err=1 |
+| core/enumerable/all_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/enumerable/all_spec.rb | pass=60 fail=1 err=0 |
+| core/enumerable/any_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/enumerable/any_spec.rb | pass=70 fail=1 err=0 |
 | core/enumerable/chunk_spec.rb | FAILED: returned Enumerator size returns nil: expected nil, got 1 |
 | core/enumerable/chunk_spec.rb | pass=10 fail=1 err=0 |
-| core/enumerable/inject_spec.rb | ERROR: Enumerable#inject ignores the block if two arguments: NoMethodError -- undefined method 'complain' for an instance of Object |
-| core/enumerable/inject_spec.rb | ERROR: Enumerable#inject does not warn when given a Symbol with $VERBOSE true: NoMethodError -- undefined method 'complain' for an instance of Object |
+| core/enumerable/count_spec.rb | ERROR: with a custom size method ignores the custom size method: NoMethodError -- undefined method 'count' |
+| core/enumerable/count_spec.rb | FAILED: ignores the block when given an argument: matcher did not match #<Proc> |
+| core/enumerable/count_spec.rb | pass=7 fail=1 err=1 |
+| core/enumerable/find_index_spec.rb | FAILED: ignores the block if an argument is given: matcher did not match #<Proc> |
+| core/enumerable/find_index_spec.rb | ERROR: given a single yield parameter passes first element to the parameter: NoMethodError -- undefined method 'find_index' for nil |
+| core/enumerable/find_index_spec.rb | ERROR: given a greedy yield parameter passes a gathered array to the parameter: NoMethodError -- undefined method 'find_index' for nil |
+| core/enumerable/inject_spec.rb | FAILED: ignores the block if two arguments: matcher did not match #<Proc> |
+| core/enumerable/inject_spec.rb | ERROR: Enumerable#inject ignores the block if two arguments: RuntimeError -- we never get here |
 | core/enumerable/inject_spec.rb | FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45,  ...[clipped] |
 | core/enumerable/map_spec.rb | FAILED: reports the same arity as the given block: expected [2], got [-2] |
 | core/enumerable/map_spec.rb | FAILED: reports the same arity as the given block: expected [1], got [-2] |
 | core/enumerable/map_spec.rb | ERROR: Enumerable#map yields 2 arguments for a Hash when block arity is 2: ArgumentError -- wrong number of arguments (given 1, expected 2) |
+| core/enumerable/none_spec.rb | FAILED: raised NoMethodError, expected RuntimeError |
+| core/enumerable/none_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/enumerable/none_spec.rb | pass=34 fail=2 err=0 |
+| core/enumerable/one_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
+| core/enumerable/one_spec.rb | pass=41 fail=1 err=0 |
 | core/enumerable/tally_spec.rb | FAILED: ignores the default value: expected {...}, got {...} |
 | core/enumerable/tally_spec.rb | FAILED: ignores the default proc: expected {...}, got {...} |
 | core/enumerable/tally_spec.rb | pass=14 fail=2 err=0 |
 | core/enumerable/to_h_spec.rb | ERROR: Enumerable#to_h forwards arguments to #each: NoMethodError -- undefined method 'to_h' for #<Object:0xADDR> |
 | core/enumerable/to_h_spec.rb | pass=13 fail=0 err=1 |
+| core/enumerable/to_set_spec.rb | FAILED: instantiates an object of provided as the first argument set class: matcher did not match #<Proc> |
+| core/enumerable/to_set_spec.rb | pass=5 fail=1 err=0 |
 | core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
 | core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
 | core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
+| core/env/fetch_spec.rb | FAILED: warns on block and default parameter given: matcher did not match #<Proc> |
+| core/env/fetch_spec.rb | pass=10 fail=1 err=0 |
 | core/env/merge_spec.rb | FAILED: adds the multiple parameter hashes to ENV, returning ENV: expected "multi2", got nil |
 | core/env/merge_spec.rb | ERROR: ENV.merge! yields key, the old value and the new value when replacing an entry: NotImplementedError -- mere-ruby: ENV.merge! is not implemented (it would change the environment) |
 | core/env/merge_spec.rb | ERROR: ENV.merge! yields key, the old value and the new value when replacing an entry: NotImplementedError -- mere-ruby: ENV.merge! is not implemented (it would change the environment) |
@@ -68,6 +116,8 @@ Visited **146** of **146** recorded DIFF files.
 | core/exception/signm_spec.rb | pass=0 fail=1 err=0 |
 | core/exception/signo_spec.rb | FAILED: raised NoMethodError, expected SignalException |
 | core/exception/signo_spec.rb | pass=0 fail=1 err=0 |
+| core/exception/syntax_error_spec.rb | FAILED: raised StandardError, expected SyntaxError |
+| core/exception/syntax_error_spec.rb | pass=2 fail=1 err=0 |
 | core/exception/system_exit_spec.rb | ERROR: #initialize sets the exit status and exits silently when raised: SystemExit -- SystemExit |
 | core/exception/system_exit_spec.rb | ERROR: #initialize sets the exit status and exits silently when raised when subclassed: CustomExit -- CustomExit |
 | core/exception/system_exit_spec.rb | pass=18 fail=0 err=2 |
@@ -88,9 +138,13 @@ Visited **146** of **146** recorded DIFF files.
 | core/float/to_s_spec.rb | FAILED: uses non-e format for a positive value with whole part having 16 significant figures: expected "100000000000000.0", got "1.0e+14" |
 | core/hash/compare_by_identity_spec.rb | ERROR: Hash#compare_by_identity does not call #hash on keys: RuntimeError -- #hash should not be called on compare_by_identity Hash |
 | core/hash/compare_by_identity_spec.rb | pass=32 fail=0 err=1 |
+| core/hash/element_reference_spec.rb | FAILED: does not dispatch to hash for Boolean, Integer, Float, String, or Symbol: expected "Ok. |
+| core/hash/element_reference_spec.rb | pass=30 fail=1 err=0 |
 | core/hash/element_set_spec.rb | FAILED: stores unequal keys that hash to the same value: expected to receive #hash |
 | core/hash/element_set_spec.rb | FAILED: stores unequal keys that hash to the same value: expected to receive #hash |
-| core/hash/element_set_spec.rb | ERROR: Hash#[]= does not dispatch to hash for Boolean, Integer, Float, String, or Symbol: NoMethodError -- undefined method 'fixture' for an instance of Object |
+| core/hash/element_set_spec.rb | FAILED: does not dispatch to hash for Boolean, Integer, Float, String, or Symbol: expected "OK |
+| core/hash/fetch_spec.rb | FAILED: gives precedence to the default block over the default argument when passed both: matcher did not match #<Proc> |
+| core/hash/fetch_spec.rb | pass=9 fail=1 err=0 |
 | core/hash/inspect_spec.rb | FAILED: returns a string representation with same order as each(): expected "{:a=>[1, 2], :b=>-2, :d=>-6, nil=>nil}", got "{a: [1, 2], b: -2, d: -6, nil => nil}" |
 | core/hash/inspect_spec.rb | FAILED: calls #inspect on keys and values: expected "{key=>val}", got "{key => val}" |
 | core/hash/inspect_spec.rb | FAILED: does not call #to_s on a String returned from #inspect: expected "{:a=>\"abc\"}", got "{a: \"abc\"}" |
@@ -114,9 +168,12 @@ Visited **146** of **146** recorded DIFF files.
 | core/integer/upto_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/kernel/Integer_spec.rb | FAILED: expected TypeError to be raised |
 | core/kernel/Integer_spec.rb | pass=327 fail=1 err=0 |
-| core/kernel/__dir___spec.rb | ERROR: Kernel#__dir__ returns the expanded path of the directory when used in the main script: NoMethodError -- undefined method 'fixture' for an instance of Object |
+| core/kernel/__dir___spec.rb | FAILED: returns the expanded path of the directory when used in the main script: expected "__dir__.rb |
 | core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected ".", got "HOME" |
 | core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected "foo", got "HOME" |
+| core/kernel/autoload_spec.rb | FAILED: is a private method: expected truthy from #include? |
+| core/kernel/autoload_spec.rb | FAILED: raised LoadError, expected NameError |
+| core/kernel/autoload_spec.rb | FAILED: should define on the new anonymous class: expected "bogus", got nil |
 | core/kernel/backtick_spec.rb | ERROR: Kernel#` lets the standard error stream pass through to the inherited stderr: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
 | core/kernel/backtick_spec.rb | FAILED: produces a String in the default external encoding: expected to be identical |
 | core/kernel/backtick_spec.rb | FAILED: expected Errno::ENOENT to be raised |
@@ -142,7 +199,7 @@ Visited **146** of **146** recorded DIFF files.
 | core/kernel/define_singleton_method_spec.rb | FAILED: raised NoMethodError, expected ArgumentError |
 | core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates within the scope of the eval: NameError -- uninitialized constant EvalSpecs::A::B |
 | core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates such that constants are scoped to the class of the eval: NameError -- uninitialized constant EvalSpecs::A::C |
-| core/kernel/eval_spec.rb | ERROR: Kernel#eval does not share locals across eval scopes: NoMethodError -- undefined method 'fixture' for an instance of Object |
+| core/kernel/eval_spec.rb | FAILED: does not share locals across eval scopes: expected "NameError", got "" |
 | core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected "spec", got nil |
 | core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected to receive #gets |
 | core/kernel/gets_spec.rb | pass=2 fail=2 err=0 |
@@ -156,11 +213,25 @@ Visited **146** of **146** recorded DIFF files.
 | core/kernel/loop_spec.rb | FAILED: returns StopIteration#result, the result value of a finished iterator: expected :stopped, got nil |
 | core/kernel/method_spec.rb | FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR |
 | core/kernel/method_spec.rb | pass=11 fail=1 err=0 |
-| core/kernel/open_spec.rb | ERROR: Kernel#open is a private method: NoMethodError -- undefined method 'tmp' for an instance of Object |
-| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when given a valid filename: NoMethodError -- undefined method 'tmp' for an instance of Object |
-| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when called with a block: NoMethodError -- undefined method 'tmp' for an instance of Object |
+| core/kernel/open_spec.rb | ERROR: Kernel#open is a private method: ArgumentError -- path component of HOME is a file |
+| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when given a valid filename: ArgumentError -- path component of HOME is a file |
+| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when called with a block: ArgumentError -- path component of HOME is a file |
+| core/kernel/p_spec.rb | ERROR: Kernel#p flushes output if receiver is a File: ArgumentError -- path component of HOME is a file |
+| core/kernel/p_spec.rb | ERROR: Kernel#p is not affected by setting $\, $/ or $,: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
+| core/kernel/p_spec.rb | ERROR: Kernel#p prints nothing if no argument is given: NameError -- undefined local variable or method 'p' for an instance of Object |
+| core/kernel/print_spec.rb | FAILED: prints $_ when no arguments are given: matcher did not match #<Proc> |
+| core/kernel/print_spec.rb | pass=3 fail=1 err=0 |
+| core/kernel/printf_spec.rb | ERROR: Kernel#printf is a private method: ArgumentError -- path component of HOME is a file |
+| core/kernel/printf_spec.rb | ERROR: Kernel#printf writes to stdout when a string is the first argument: ArgumentError -- path component of HOME is a file |
+| core/kernel/printf_spec.rb | ERROR: Kernel#printf calls write on the first argument when it is not a string: ArgumentError -- path component of HOME is a file |
 | core/kernel/public_method_spec.rb | FAILED: expected NameError to be raised |
 | core/kernel/public_method_spec.rb | pass=4 fail=1 err=0 |
+| core/kernel/putc_spec.rb | ERROR: Kernel#putc is a private method: ArgumentError -- path component of HOME is a file |
+| core/kernel/putc_spec.rb | pass=1 fail=0 err=1 |
+| core/kernel/putc_spec.rb | ERROR: Kernel#putc is a private method: NoMethodError -- undefined method 'new_io' for an instance of Object |
+| core/kernel/puts_spec.rb | ERROR: Kernel#puts is a private method: ArgumentError -- path component of HOME is a file |
+| core/kernel/puts_spec.rb | ERROR: Kernel#puts delegates to $stdout.puts: ArgumentError -- path component of HOME is a file |
+| core/kernel/puts_spec.rb | pass=1 fail=0 err=2 |
 | core/kernel/raise_spec.rb | FAILED: re-raises a previously rescued exception without overwriting the cause when it's explicitly specified with :cause option and has nil value: expected #<RuntimeError: Error 1>, got nil |
 | core/kernel/raise_spec.rb | FAILED: re-raises a previously rescued exception that doesn't have a cause and is a cause of other exception without setting a cause implicitly: expected #<RuntimeError: Error 1>, got #<RuntimeError: Error 1> |
 | core/kernel/raise_spec.rb | FAILED: re-raises a previously rescued exception that doesn't have a cause and is a cause of other exception without setting a cause implicitly: expected nil, got #<RuntimeError: Error 2> |
@@ -178,7 +249,7 @@ Visited **146** of **146** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.600358202, got 0.089427938 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.075481898, got 0.774849364 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -192,9 +263,9 @@ Visited **146** of **146** recorded DIFF files.
 | core/kernel/trace_var_spec.rb | FAILED: accepts a String argument instead of a Proc or block: expected true, got nil |
 | core/kernel/trace_var_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/kernel/trace_var_spec.rb | pass=4 fail=2 err=0 |
-| core/kernel/warn_spec.rb | ERROR: Kernel#warn does not append line-end if last character is line-end: NoMethodError -- undefined method 'output' for an instance of Object |
-| core/kernel/warn_spec.rb | ERROR: Kernel#warn calls #write on $stderr if $VERBOSE is true: NoMethodError -- undefined method 'output' for an instance of Object |
-| core/kernel/warn_spec.rb | ERROR: Kernel#warn calls #write on $stderr if $VERBOSE is false: NoMethodError -- undefined method 'output' for an instance of Object |
+| core/kernel/warn_spec.rb | ERROR: Kernel#warn does not write strings when passed no arguments: NameError -- undefined local variable or method 'warn' for an instance of Object |
+| core/kernel/warn_spec.rb | FAILED: prepends a message with specified line from the backtrace: matcher did not match #<Proc> |
+| core/kernel/warn_spec.rb | FAILED: prepends a message with specified line from the backtrace: matcher did not match #<Proc> |
 | core/matchdata/element_reference_spec.rb | FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8> |
 | core/matchdata/element_reference_spec.rb | pass=39 fail=1 err=0 |
 | core/matchdata/post_match_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |
@@ -253,6 +324,9 @@ Visited **146** of **146** recorded DIFF files.
 | core/proc/parameters_spec.rb | FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped] |
 | core/proc/parameters_spec.rb | FAILED: returns all parameters defined with the name _ as _: expected [[:req, :_], [:req, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped] |
 | core/proc/parameters_spec.rb | FAILED: handles the usage of `it` as a parameter: expected [[:opt]], got [] |
+| core/proc/ruby2_keywords_spec.rb | FAILED: prints warning when a proc does not accept argument splat: matcher did not match #<Proc> |
+| core/proc/ruby2_keywords_spec.rb | FAILED: prints warning when a proc accepts keywords: matcher did not match #<Proc> |
+| core/proc/ruby2_keywords_spec.rb | FAILED: prints warning when a proc accepts keyword splat: matcher did not match #<Proc> |
 | core/range/clone_spec.rb | FAILED: duplicates the range: expected not to be identical |
 | core/range/clone_spec.rb | FAILED: duplicates the range: expected not to be identical |
 | core/range/clone_spec.rb | pass=10 fail=2 err=0 |
@@ -264,6 +338,8 @@ Visited **146** of **146** recorded DIFF files.
 | core/range/step_spec.rb | ERROR: Range#step does not iterate if step is 0 for bounded non-numeric ranges: ArgumentError -- step can't be 0 |
 | core/range/step_spec.rb | ERROR: and String values calls #+ on begin and each element returned by #+: TypeError -- can't iterate from Object |
 | core/range/step_spec.rb | ERROR: and String values iterates backward if the step is decreasing values, and the range is backward: TypeError -- can't iterate from Object |
+| core/range/to_set_spec.rb | FAILED: instantiates an object of provided as the first argument set class and warns: matcher did not match #<Proc> |
+| core/range/to_set_spec.rb | pass=8 fail=1 err=0 |
 | core/rational/exponent_spec.rb | FAILED: expected ZeroDivisionError to be raised |
 | core/rational/exponent_spec.rb | pass=38 fail=1 err=0 |
 | core/rational/round_spec.rb | ERROR: with half option returns an Integer when precision is not passed: TypeError -- not an integer |
@@ -283,6 +359,8 @@ Visited **146** of **146** recorded DIFF files.
 | core/regexp/last_match_spec.rb | FAILED: expected IndexError to be raised |
 | core/regexp/last_match_spec.rb | FAILED: coerces argument to an index using #to_int: expected "TEST123", got nil |
 | core/regexp/last_match_spec.rb | FAILED: coerces argument to an index using #to_int: expected to receive #to_int |
+| core/regexp/linear_time_spec.rb | FAILED: warns about flags being ignored for regexp arguments: matcher did not match #<Proc> |
+| core/regexp/linear_time_spec.rb | pass=9 fail=1 err=0 |
 | core/regexp/match_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/regexp/match_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/regexp/match_spec.rb | ERROR: when passed a block yields the MatchData: NoMethodError -- undefined method 'match' for an instance of Regexp |
@@ -303,14 +381,11 @@ Visited **146** of **146** recorded DIFF files.
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/index_spec.rb | FAILED: always clear $~: expected nil, got #<MatchData "a"> |
 | core/string/index_spec.rb | pass=741 fail=1 err=0 |
-| core/string/modulo_spec.rb | ERROR: output's encoding raises an ArgumentError for unused arguments when $DEBUG is true: NameError -- uninitialized constant IOStub |
-| core/string/modulo_spec.rb | ERROR: output's encoding behaves as if calling Kernel#Integer for %b argument, if it does not respond to #to_ary: ArgumentError -- ArgumentError |
-| core/string/modulo_spec.rb | ERROR: output's encoding behaves as if calling Kernel#Integer for %d argument, if it does not respond to #to_ary: ArgumentError -- ArgumentError |
 | core/string/to_f_spec.rb | FAILED: expected Encoding::CompatibilityError to be raised |
 | core/string/to_f_spec.rb | pass=82 fail=1 err=0 |
-| core/string/uplus_spec.rb | ERROR: if file has "frozen_string_literal: true" magic comment returns mutable copy of a literal: NoMethodError -- undefined method 'fixture' for an instance of Object |
+| core/string/uplus_spec.rb | FAILED: returns mutable copy of a literal: expected "mutable", got "" |
 | core/string/uplus_spec.rb | FAILED: returns mutable copy of a literal: expected false, got true |
-| core/string/uplus_spec.rb | pass=5 fail=1 err=1 |
+| core/string/uplus_spec.rb | pass=5 fail=2 err=0 |
 | core/struct/deconstruct_keys_spec.rb | FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {} |
 | core/struct/deconstruct_keys_spec.rb | FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected to receive #to_int |
 | core/struct/deconstruct_keys_spec.rb | FAILED: raises a TypeError if the conversion with #to_int does not return an Integer: matcher did not match #<Proc> |
@@ -320,7 +395,7 @@ Visited **146** of **146** recorded DIFF files.
 | core/struct/initialize_spec.rb | FAILED: can be overridden: expected :value, got nil |
 | core/struct/initialize_spec.rb | FAILED: can be initialized with keyword arguments: expected {version: "3.2", platform: "OS"}, got "3.2" |
 | core/struct/initialize_spec.rb | FAILED: can be initialized with keyword arguments: expected nil, got "OS" |
-| core/struct/new_spec.rb | ERROR: Struct.new overwrites previously defined constants with string as first argument: NoMethodError -- undefined method 'complain' for an instance of Object |
+| core/struct/new_spec.rb | FAILED: overwrites previously defined constants with string as first argument: matcher did not match #<Proc> |
 | core/struct/new_spec.rb | ERROR: with a block passes same struct class to the block: NoMethodError -- undefined method 'block_parameter' for class #<Class:0xADDR> |
 | core/struct/new_spec.rb | FAILED: accepts keyword arguments to initialize: expected #<struct args=42>, got #<struct args={args: 42}> |
 | core/symbol/all_symbols_spec.rb | ERROR: Symbol.all_symbols returns an array of Symbols: NoMethodError -- undefined method 'all_symbols' for class Symbol |
@@ -355,11 +430,13 @@ Visited **146** of **146** recorded DIFF files.
 | language/assignments_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/assignments_spec.rb | FAILED: raised ArgumentError, expected SyntaxError |
 | language/block_spec.rb | FAILED: assigns elements to mixed argument types: expected [1, 2, [3], {x: 9}, 2, {}], got [[1, 2, 3, {x: 9}], 5, [], nil, 2, {}] |
-| language/block_spec.rb | ERROR: Array does not call #to_hash on final argument to get keyword arguments and does not autosplat: NoMethodError -- undefined method 'suppress_keyword_warning' for #<Object:0xADDR> |
-| language/block_spec.rb | ERROR: when non-symbol keys are in a keyword arguments Hash does not separate non-symbol keys and symbol keys and does not autosplat: NoMethodError -- undefined method 'suppress_keyword_warning' for #<Object:0xADDR> |
+| language/block_spec.rb | FAILED: assigns the first variable named: expected 1, got 2 |
+| language/block_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/break_spec.rb | FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e] |
-| language/break_spec.rb | ERROR: created at the toplevel returns a value when invoking from the toplevel: NoMethodError -- undefined method 'fixture' for an instance of Object |
-| language/break_spec.rb | ERROR: created at the toplevel returns a value when invoking from a method: NoMethodError -- undefined method 'fixture' for an instance of Object |
+| language/break_spec.rb | FAILED: returns a value when invoking from the toplevel: expected "a,b,break,d", got "" |
+| language/break_spec.rb | FAILED: returns a value when invoking from a method: expected "a,d,b,break,e,f", got "" |
+| language/case_spec.rb | FAILED: warns if there are identical when clauses: matcher did not match #<Proc> |
+| language/case_spec.rb | pass=65 fail=1 err=0 |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches the superclass chain: NameError -- uninitialized constant ConstantSpecs::ContainerA::ChildA::CS_CONST13 |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches Object if no class or module qualifier is given: NameError -- uninitialized constant CS_CONST10 |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches Object after searching other scopes: NameError -- uninitialized constant CS_CONST10 |
@@ -376,38 +453,55 @@ Visited **146** of **146** recorded DIFF files.
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
 | language/execution_spec.rb | pass=16 fail=2 err=0 |
+| language/for_spec.rb | FAILED: allows a constant as an iterator name: matcher did not match #<Proc> |
+| language/for_spec.rb | pass=71 fail=1 err=0 |
 | language/hash_spec.rb | FAILED: freezes string keys on initialization: expected "bar", got nil |
 | language/hash_spec.rb | FAILED: freezes string keys on initialization: expected "foo", got "oof" |
-| language/hash_spec.rb | ERROR: Hash literal checks duplicated keys on initialization: NoMethodError -- undefined method 'complain' for an instance of Object |
+| language/hash_spec.rb | FAILED: checks duplicated keys on initialization: matcher did not match #<Proc> |
+| language/if_spec.rb | FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc> |
+| language/if_spec.rb | FAILED: warns when Integer literals are used instead of predicates: expected [], got [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] |
+| language/if_spec.rb | pass=59 fail=2 err=0 |
 | language/it_parameter_spec.rb | ERROR: The `it` parameter provides it in a block: ArgumentError -- wrong number of arguments (given 1, expected 0) |
 | language/it_parameter_spec.rb | ERROR: The `it` parameter can be used in both outer and nested blocks at the same time: ArgumentError -- wrong number of arguments (given 1, expected 0) |
 | language/it_parameter_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/lambda_spec.rb | FAILED: has its own scope for local variables: expected to be identical |
 | language/lambda_spec.rb | FAILED: has its own scope for local variables: expected [9, 8, [7], [], 6, 5, 4, 3, {}, #<Proc:0xADDR TMPDIR (lambda)>], got [9, 8, [7], [], 6, 5, 4, 3, {}, #<Proc:0xADDR TMPDIR |
 | language/lambda_spec.rb | FAILED: has its own scope for local variables: expected [1, 1, [], 2, 3, 2, 4, {h: 5, i: 6}, #<Proc:0xADDR TMPDIR (lambda)>], got [1, 1, [], 2, 3, 2, 4, {h: 5, i: 6}, #<Proc:0xADDR TMPDIR |
+| language/method_spec.rb | FAILED: expected ArgumentError to be raised |
+| language/method_spec.rb | FAILED: expected ArgumentError to be raised |
+| language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/module_spec.rb | ERROR: Assigning an anonymous module to a constant sets the name of a module scoped by an anonymous module: NoMethodError -- undefined method 'end_with?' |
 | language/module_spec.rb | pass=15 fail=0 err=1 |
 | language/numbered_parameters_spec.rb | ERROR: assigning to a numbered parameter does not affect binding local variables: NoMethodError -- undefined method 'local_variables' for an instance of Binding |
 | language/numbered_parameters_spec.rb | FAILED: expected NameError to be raised |
 | language/numbered_parameters_spec.rb | FAILED: expected NameError to be raised |
+| language/optional_assignments_spec.rb | FAILED: with &&= assignments: matcher did not match #<Proc> |
+| language/optional_assignments_spec.rb | FAILED: with operator assignments: matcher did not match #<Proc> |
+| language/optional_assignments_spec.rb | pass=112 fail=2 err=0 |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |
 | language/predefined_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
-| language/regexp_spec.rb | ERROR: Literal Regexps matches against $_ (last input) in a conditional if no explicit matchee provided: NoMethodError -- undefined method 'complain' for an instance of Object |
+| language/regexp_spec.rb | FAILED: expected not true |
+| language/regexp_spec.rb | FAILED: matches against $_ (last input) in a conditional if no explicit matchee provided: matcher did not match #<Proc> |
 | language/regexp_spec.rb | ERROR: Literal Regexps supports paired delimiters with %r: SyntaxError -- syntax error |
-| language/regexp_spec.rb | ERROR: Literal Regexps supports grouping constructs that are also paired delimiters: SyntaxError -- syntax error |
 | language/rescue_spec.rb | FAILED: in a global variable: expected "some text", got "" |
 | language/rescue_spec.rb | FAILED: converts the splatted list of exceptions using #to_a: expected to receive #to_a |
 | language/rescue_spec.rb | FAILED: expected SyntaxError to be raised |
+| language/return_spec.rb | ERROR: at top level stops file execution: ArgumentError -- path component of HOME is a file |
+| language/return_spec.rb | ERROR: within if is allowed: ArgumentError -- path component of HOME is a file |
+| language/return_spec.rb | ERROR: within while loop is allowed: ArgumentError -- path component of HOME is a file |
 | language/send_spec.rb | FAILED: raises TypeError if 'to_proc' doesn't return a Proc: matcher did not match #<Proc> |
 | language/send_spec.rb | FAILED: raised NoMethodError, expected TypeError |
 | language/send_spec.rb | FAILED: calls #to_a to convert a final splatted Hash object to an Array: expected [1, 2, 3, :a, 1], got [1, 2, 3, [:a, 1]] |
+| language/source_encoding_spec.rb | FAILED: can be parsed: expected "hello |
+| language/source_encoding_spec.rb | FAILED: can be parsed: expected "hello |
+| language/source_encoding_spec.rb | ERROR: encoded in UTF-16 LE with a BOM are invalid because they contain an invalid UTF-8 sequence before the encoding comment: ArgumentError -- path component of HOME is a file |
 | language/string_spec.rb | FAILED: backslashes follow the same rules as interpolation: expected " |
 | language/string_spec.rb | FAILED: expected NoMethodError to be raised |
 | language/string_spec.rb | ERROR: Ruby character strings allows a dynamic string to parse a nested do...end block as an argument to a call without parens, interpolated: SyntaxError -- syntax error |
-| language/variables_spec.rb | ERROR: Local variable shadowing does not warn in verbose mode: NoMethodError -- undefined method 'complain' for an instance of Object |
 | language/variables_spec.rb | FAILED: expected SyntaxError to be raised |
-| language/variables_spec.rb | ERROR: when instance variable is uninitialized doesn't warn about accessing uninitialized instance variable: NoMethodError -- undefined method 'complain' for an instance of Object |
+| language/variables_spec.rb | FAILED: warns about accessing uninitialized global variable in verbose mode: matcher did not match #<Proc> |
+| language/variables_spec.rb | pass=170 fail=2 err=0 |

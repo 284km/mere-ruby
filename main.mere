@@ -4889,8 +4889,23 @@ and parse_call_go = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
     if str_eq star "*" then
       let (inner, r1) = parse_expr r0 in parse_call_sep r1 (Cons (ESplat inner, pos)) hp
     else if str_eq star "**" then
-      // **hash spreads as the call's keyword hash.
-      let (inner, r1) = parse_expr r0 in parse_call_sep r1 (Cons (EKwSplat inner, pos)) hp
+      // **hash spreads as the call's keyword hash -- so it goes on the KEYWORD
+      // list, beside the explicit `k: v` pairs, and not on the positional one.
+      // ⚠ it used to go on the positional list and be lifted across afterwards,
+      //   which broke twice:
+      //     f(**h1, **h2)   the lift only ran when there was at least one
+      //                     explicit pair, so with none the splats stayed
+      //                     POSITIONAL and the callee got "wrong number of
+      //                     arguments (given 1, expected 0)" where ruby merges
+      //                     them into {a: 4, b: 2, c: 7}
+      //     f(**h, d: 9)    the lift appended the splats AFTER the pairs, so
+      //                     the keys came out {d: 9, a: 1, b: 2} where ruby
+      //                     keeps source order, {a: 1, b: 2, d: 9} -- and the
+      //                     same reordering decides which duplicate key wins
+      //   Both are the same fact: the two lists lost the order they were
+      //   written in. Doubled, which is the marker hsh_eval_items reads.
+      let (inner, r1) = parse_expr r0 in
+      parse_call_sep r1 pos (Cons (EKwSplat inner, Cons (EKwSplat inner, hp)))
     else if str_eq star "..." then
       // `foo(...)` (immediately closed) forwards the collected positional
       // args; `foo(...expr)` is a beginless exclusive range argument.
@@ -5034,7 +5049,20 @@ and parse_bare_rockets = fn toks -> fn (pos: Expr list) -> fn (hp: Expr list) ->
   | _ -> (rev_app (Cons (EKwHash (rev_app hp Nil), pos)) Nil, toks)
 
 and parse_bare_kw_pairs = fn toks -> fn (kname: str) -> fn (acc: Expr list) ->
-  let (v, r) = parse_expr toks in
+  // ⚠ the value may be OMITTED here too. `m(a:, b:)` was handled in the
+  //   parenthesised parser and `m a:, b:` was not -- this one always parsed a
+  //   value, so it met the comma and died with "unexpected token: ,". ruby/spec
+  //   writes `call bar:, val:` and the abort took the whole file with it.
+  //   ⚠ and unlike the parenthesised form, a NEWLINE ends the call rather than
+  //     continuing it, so a line break after `a:` is an omission and not the
+  //     start of a value on the next line.
+  let omitted9 = (match toks with
+                  | Cons (TP p9, _) -> str_eq p9 "," || str_eq p9 ")" || str_eq p9 "]" || str_eq p9 "}"
+                  | Cons (TNL _, _) -> true
+                  | Cons (TEOF, _) -> true
+                  | Nil -> true
+                  | _ -> false) in
+  let (v, r) = (if omitted9 then (EVar kname, toks) else parse_expr toks) in
   let acc2 = Cons (v, Cons (ESym kname, acc)) in
   match r with
   | Cons (TP p, r2) ->
@@ -7245,7 +7273,13 @@ and parse_def_tail = fn (name: str) -> fn (params: str list) -> fn (defs: (str *
   (match r2 with
    | Cons (TP eq, r3) ->
      if str_eq eq "=" || str_eq eq " =" then
-       let (e, r4) = parse_expr r3 in (SDef (name, params, defs, Cons (SExpr e, Nil)), r4)
+       // ⚠ the body may start on the NEXT line -- `def m(n) =` with the
+       //   expression below it is how ruby/spec writes a multi-line endless
+       //   method, and stopping at the newline made it "unexpected end of
+       //   input" and aborted the whole file. The `=` has already committed
+       //   this to being a body, so there is nothing else the next expression
+       //   could be.
+       let (e, r4) = parse_expr (skip_nls r3) in (SDef (name, params, defs, Cons (SExpr e, Nil)), r4)
      else parse_def_body name params defs r2
    | _ -> parse_def_body name params defs r2)
 
@@ -13413,8 +13447,21 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                | VInt _ -> cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: "
                                | VBig _ -> cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: "
                                | _ -> "") in
+                   // ⚠ $VERBOSE = nil silences warn entirely -- and FALSE, the
+                   //   default, does not. Measured, because the intuition here
+                   //   is the wrong way round:
+                   //     $VERBOSE = nil   -> nothing
+                   //     $VERBOSE = false -> "x\n"
+                   //     $VERBOSE = true  -> "x\n"
+                   let vnil9 = (if map_has globals (gvar_slot "VERBOSE")
+                                then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
+                                else false) in
+                   // ...and `warn("")` writes a newline while `warn` with NO
+                   // arguments writes nothing: the empty case is the ARGUMENT
+                   // LIST, never the joined text.
                    let body9 = warn_join world pos9 "" in
-                   (if on9 && (if str_eq body9 "" then false else true)
+                   (if on9 && (if vnil9 then false else true)
+                       && (match pos9 with Nil -> false | _ -> true)
                     then err_emit world (pre9 ++ body9) else ()))
                 | Nil -> ()) in
        VNil)
@@ -14782,6 +14829,17 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                     | VHsh nid -> let _ = mark_kw nid in Cons (VHsh nid, eval_args env world blk t)
                     | v -> Cons (v, eval_args env world blk t)))
      | other -> Cons (other, eval_args env world blk t))
+  // ⚠ an EMPTY keyword hash is not an argument. `f(**{})`, and `f(**h)` with
+  //   an empty h, pass NOTHING in ruby -- `def m() end; m(**{})` answers nil,
+  //   where handing the callee an empty hash makes it "wrong number of
+  //   arguments (given 1, expected 0)" and aborted a whole spec file.
+  | Cons (EKwHash items9, t) ->
+    (match eval_e env world blk (EKwHash items9) with
+     | VHsh id9 ->
+       (match hderef id9 with
+        | Nil -> eval_args env world blk t
+        | _ -> Cons (VHsh id9, eval_args env world blk t))
+     | v9 -> Cons (v9, eval_args env world blk t))
   | Cons (h, t) -> Cons (eval_e env world blk h, eval_args env world blk t)
 
 // ---- multiple assignment ------------------------------------------------
@@ -42190,7 +42248,18 @@ and warn_join = fn world -> fn (xs: Val list) -> fn (acc: str) ->
   | Nil -> acc
   | Cons (VArr aid, t) -> warn_join world t (warn_join world (deref aid) acc)
   | Cons (h, t) ->
-    (let s9 = (match h with VStr sh -> sget sh | other -> to_s other) in
+    // ⚠ an object is asked for ITS #to_s, not the value-level one: ruby's
+    //   `warn(obj)` calls the method, and a spec mock counts the call.
+    (let s9 = (match h with
+               | VStr sh -> sget sh
+               | VObj oid9 ->
+                 (let (m9, s99, ocls9, iv9) = world in
+                  let cls9 = map_get ocls9 (str_of_int oid9) in
+                  let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+                  if has_meth world cls9 "to_s"
+                  then (match invoke world nb9 h cls9 "to_s" Nil with VStr h9 -> sget h9 | o9 -> to_s o9)
+                  else to_s h)
+               | other -> to_s other) in
      let s9 = (if str_len s9 > 0 && str_eq (char_at s9 (str_len s9 - 1)) "\n"
                then substring s9 0 (str_len s9 - 1) else s9) in
      warn_join world t (if str_eq acc "" then s9 else acc ++ "\n" ++ s9))
