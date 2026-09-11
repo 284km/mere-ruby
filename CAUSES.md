@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 148 files.
+Classified: 146 files.
 
-## DIFF — 148 files, 74 kinds
+## DIFF — 146 files, 74 kinds
 
 | files | kind |
 |---|---|
@@ -20,12 +20,12 @@ Classified: 148 files.
 | 7 | `FAILED expected false, got true` |
 | 6 | `FAILED expected to be identical` |
 | 6 | `FAILED expected TypeError to be raised` |
-| 6 | `FAILED expected N, got N` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 6 | `ERROR NameError` |
 | 5 | `FAILED expected "S", got "S"` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected true, got false` |
+| 4 | `FAILED expected N, got N` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 4 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
@@ -100,7 +100,6 @@ Classified: 148 files.
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
-| 2 | `FAILED: returns -1: expected -1, got -4` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: expected NoMethodError to be raised` |
@@ -135,6 +134,7 @@ Classified: 148 files.
 | 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
 | 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
 | 1 | `FAILED: returns File.dirname(filename): expected ".", got "HOME"` |
+| 1 | `FAILED: returns 'method' if the method is defined: expected "method", got nil` |
 
 </details>
 
