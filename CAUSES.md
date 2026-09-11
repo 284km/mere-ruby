@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 165 files.
+Classified: 162 files.
 
-## DIFF — 165 files, 75 kinds
+## DIFF — 162 files, 75 kinds
 
 | files | kind |
 |---|---|
 | 15 | `ERROR NoMethodError` |
-| 13 | `FAILED matcher did not match #<OBJ>` |
+| 11 | `FAILED matcher did not match #<OBJ>` |
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `ERROR NameError` |
@@ -28,8 +28,8 @@ Classified: 165 files.
 | 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected N, got N` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
+| 3 | `FAILED expected "S", got nil` |
 | 2 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
@@ -109,7 +109,6 @@ Classified: 165 files.
 | 1 | `TMPDIR` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
-| 1 | `FAILED: with &&= assignments: matcher did not match #<Proc>` |
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
 | 1 | `FAILED: warns if there are identical when clauses: matcher did not match #<Proc>` |
@@ -136,6 +135,7 @@ Classified: 165 files.
 | 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
+| 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
 
 </details>
 

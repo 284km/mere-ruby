@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **165** of **165** recorded DIFF files.
+Visited **162** of **162** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -155,9 +155,6 @@ Visited **165** of **165** recorded DIFF files.
 | core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates within the scope of the eval: NameError -- uninitialized constant EvalSpecs::A::B |
 | core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates such that constants are scoped to the class of the eval: NameError -- uninitialized constant EvalSpecs::A::C |
 | core/kernel/eval_spec.rb | FAILED: does not share locals across eval scopes: expected "NameError", got "" |
-| core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected "spec", got nil |
-| core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected to receive #gets |
-| core/kernel/gets_spec.rb | pass=2 fail=2 err=0 |
 | core/kernel/inspect_spec.rb | FAILED: expected TypeError to be raised |
 | core/kernel/inspect_spec.rb | pass=7 fail=1 err=0 |
 | core/kernel/lambda_spec.rb | ERROR: Kernel#lambda strictly checks the arity when 0 or 2..inf args are specified: ArgumentError -- ArgumentError |
@@ -204,7 +201,7 @@ Visited **165** of **165** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.317057097, got 0.741206217 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.284581405, got 0.500870392 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -408,8 +405,6 @@ Visited **165** of **165** recorded DIFF files.
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
 | language/execution_spec.rb | pass=16 fail=2 err=0 |
-| language/for_spec.rb | FAILED: allows a constant as an iterator name: matcher did not match #<Proc> |
-| language/for_spec.rb | pass=71 fail=1 err=0 |
 | language/hash_spec.rb | FAILED: freezes string keys on initialization: expected "bar", got nil |
 | language/hash_spec.rb | FAILED: freezes string keys on initialization: expected "foo", got "oof" |
 | language/hash_spec.rb | FAILED: checks duplicated keys on initialization: matcher did not match #<Proc> |
@@ -430,9 +425,6 @@ Visited **165** of **165** recorded DIFF files.
 | language/numbered_parameters_spec.rb | ERROR: assigning to a numbered parameter does not affect binding local variables: NoMethodError -- undefined method 'local_variables' for an instance of Binding |
 | language/numbered_parameters_spec.rb | FAILED: expected NameError to be raised |
 | language/numbered_parameters_spec.rb | FAILED: expected NameError to be raised |
-| language/optional_assignments_spec.rb | FAILED: with &&= assignments: matcher did not match #<Proc> |
-| language/optional_assignments_spec.rb | FAILED: with operator assignments: matcher did not match #<Proc> |
-| language/optional_assignments_spec.rb | pass=112 fail=2 err=0 |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |
 | language/predefined_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |

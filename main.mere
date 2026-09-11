@@ -12649,7 +12649,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let rv = eval_e env world blk recv_e in
     let v = eval_e env world blk val_e in
     (match rv with
-     | VClass c -> let _ = map_set consts (c ++ "::" ++ cn) v in v
+     | VClass c -> let _ = const_store world (c ++ "::" ++ cn) v in v
      | _ -> raise_exc world "TypeError" (inspect rv ++ " is not a class/module"))
   | EIVar name ->
     let (meths, sup, ocls, ivars) = world in
@@ -12950,14 +12950,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else run_meth world (sbh, sbp, sbb, sbe) recv a2 meth (map_get meths (a2 ++ "#" ++ meth)) args)
   | EBlockPass e -> eval_e env world blk e   // non-&:sym block-pass: best effort
   | EAssign (name, e) ->
-    let v = eval_e env world blk e in
+    let (skip9, v) = const_opassign env world blk name e in
+    if skip9 then v else
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
             then gvar_assign_checked env world name v
             else if str_len name > 0 && str_eq (char_at name 0) "@"
             then assign_one env world name v
             else if is_upper_first name then
               (let key = const_assign_key env name in
-               let _ = map_set consts key v in name_anon key v)
+               let _ = const_store world key v in name_anon key v)
             else lv_set env name v in
     v
   | ELambda (ps, body) ->
@@ -15013,13 +15014,50 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
   // the enclosing class/module — the class-body walker namespaces the
   // assignments it can see, but one nested in an if/unless only reaches here.
   else if is_upper_first tgt && (if str_contains tgt "::" then false else true) then
-    (let _ = map_set consts (const_assign_key env tgt) v in ())
+    (let _ = const_store world (const_assign_key env tgt) v in ())
   else let _ = lv_set env tgt v in ()
 
 // where a constant assignment lands: the enclosing class/module, else the top
 // level. The class-body walker namespaces the assignments it can see directly;
 // one nested in an if/unless only reaches the ordinary statement path, so the
 // lexical scope has to be consulted here too.
+// A constant that already has a value is being REPLACED, and ruby says so.
+// ⚠ only the RUBY-LEVEL assignment sites route through here. `consts` is also
+//   the table this interpreter SEEDS at startup -- Regexp::IGNORECASE and a
+//   hundred others, and every class name -- and warning there would put a page
+//   of noise in front of any program run with -w. Of the 159 writes to the
+//   table, seven are a program assigning a constant; these are those.
+// `C ||= v` / `C &&= v`: read-then-MAYBE-write. When the short circuit already
+// decides the answer there is no write at all -- the same rule SIVarAssign has
+// for `@x ||= v`. It matters now that a replacement WARNS: desugared to
+// `C = (C || v)` this stored the same value back and announced "already
+// initialized constant C" where ruby says nothing.
+// ⚠ an assignment has TWO nodes here, the statement and the expression form,
+//   so the rule lives in one place and both ask it.
+and const_opassign = fn env -> fn world -> fn blk -> fn (name: str) -> fn (e: Expr) ->
+  // ⚠ the two spellings read the constant through DIFFERENT nodes: `||=`
+  //   desugars with EConstOrNil (an undefined constant is nil there, which is
+  //   what makes `C ||= v` define it) and `&&=` with EConst (an undefined one
+  //   raises, which is what makes `C &&= v` a NameError). Reading through the
+  //   wrong one would turn `UND ||= 5` into a NameError.
+  (match e with
+   | EBin (o9, EConstOrNil n9, rhs9) ->
+     (if str_eq o9 "||" && str_eq n9 name && is_upper_first name then
+        (let cur9 = eval_e env world blk (EConstOrNil name) in
+         if truthy cur9 then (true, cur9) else (false, eval_e env world blk rhs9))
+      else (false, eval_e env world blk e))
+   | EBin (o9, EConst n9, rhs9) ->
+     (if str_eq o9 "&&" && str_eq n9 name && is_upper_first name then
+        (let cur9 = eval_e env world blk (EConst name) in
+         if truthy cur9 then (false, eval_e env world blk rhs9) else (true, cur9))
+      else (false, eval_e env world blk e))
+   | _ -> (false, eval_e env world blk e))
+
+and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
+  let _ = (if map_has consts key
+           then rb_warn world ("already initialized constant " ++ key) else ()) in
+  map_set consts key v
+
 and const_assign_key = fn env -> fn (name: str) ->
   let lex0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else "") in
   let lex = (if str_eq lex0 "" then cur_lex () else lex0) in
@@ -15167,7 +15205,7 @@ and assign_x_one = fn env -> fn world -> fn blk -> fn (t: Expr) -> fn (v: Val) -
   // `recv::CONST = v` — assign a constant in the receiver module's namespace.
   | EScopedRead (recv, cn) ->
     (match eval_e env world blk recv with
-     | VClass c -> let _ = map_set consts (c ++ "::" ++ cn) v in ()
+     | VClass c -> let _ = const_store world (c ++ "::" ++ cn) v in ()
      | other -> let _ = raise_exc world "TypeError" (inspect other ++ " is not a class/module") in ())
   // `recv&.attr = v` — assign only when the receiver is non-nil.
   | ESafe (recv, m, args) ->
@@ -15176,7 +15214,7 @@ and assign_x_one = fn env -> fn world -> fn blk -> fn (t: Expr) -> fn (v: Val) -
      | rv -> let argvals = eval_args env world blk args in
              let _ = invoke_val_c env world blk rv (m ++ "=") (vappend argvals (Cons (v, Nil))) false in ())
   // a bare CONSTANT target (`A, b = 1, 2`).
-  | EConst n -> let _ = map_set consts n v in ()
+  | EConst n -> let _ = const_store world n v in ()
   | _ -> ()
 
 // Pre-evaluate a complex masgn target's receiver (and index/method args) into
@@ -23316,7 +23354,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (match args with
        | Cons (v, Cons (value, _)) ->
          let key = (if str_eq c "Object" then to_s v else c ++ "::" ++ to_s v) in
-         let _ = map_set consts key value in value
+         // ruby warns here too: const_set over an existing constant is the
+         // same replacement as writing `C = v`.
+         let _ = const_store world key value in value
        | _ -> VNil)
     else if has_meth world ("(sng:" ++ c ++ ")") name then
       (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
@@ -44917,7 +44957,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          if is_upper_first aname && (if str_contains aname "::" then false else true) then
            let v = eval_e cenv world noblk e in
            let key = if str_eq cscope "" then aname else cscope ++ "::" ++ aname in
-           let _ = map_set consts key v in
+           let _ = const_store world key v in
            // an anonymous class/module assigned to a constant takes that
            // constant name as its display name.
            let _ = name_anon key v in
@@ -45633,13 +45673,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              else if str_contains name "::" then ()
              else if lv_has env name then ()
              else lv_set env name VNil) in
-    let v = eval_e env world blk e in
+    let (skip9, v) = const_opassign env world blk name e in
+    if skip9 then FNext v else
     let _ = if str_len name > 0 && str_eq (char_at name 0) "$"
             then gvar_assign_checked env world name v
             else if str_len name >= 2 && str_eq (substring name 0 2) "::" then (let cn = substring name 2 (str_len name) in let _ = map_set consts cn v in name_anon cn v)
             else if is_upper_first name then
               (let key = const_assign_key env name in
-               let _ = map_set consts key v in name_anon key v)
+               let _ = const_store world key v in name_anon key v)
             else lv_set env name v in
     FNext v
   | SIVarAssign (name, e) ->
