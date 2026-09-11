@@ -29,7 +29,7 @@ root="$(cd "$here/.." && pwd)"
 if [ "$#" -gt 0 ]; then
   files="$*"
 else
-  files=$(cd "$root" && git ls-files 'mspec/*.txt' 'CAUSES.md' 'SPEC_STATUS.md' 'bootstraptest/*.txt' 2>/dev/null | sed "s|^|$root/|")
+  files=$(cd "$root" && git ls-files 'mspec/*.txt' 'CAUSES.md' 'EXAMPLES.md' 'SPEC_STATUS.md' 'bootstraptest/*.txt' 2>/dev/null | sed "s|^|$root/|")
 fi
 [ -n "$files" ] || { echo "no records to check" >&2; exit 2; }
 rc=0
@@ -84,5 +84,16 @@ envdump=$(grep -aln -F -- '{"' $files 2>/dev/null)
 # line small enough to look innocent. The clip made the leak quieter, not safer.
 long=$(awk 'length($0) > 340 { print FILENAME": "length($0)" chars" }' $files 2>/dev/null | head -5)
 [ -n "$long" ] && { echo "LONG  a recorded line is over 340 chars (an object dump, not a cause):"; echo "$long" | sed "s|$root/|        |"; rc=1; }
+# ⚠ A record has to be TEXT. core/symbol/inspect's `quotes BINARY symbols`
+# prints a raw 0xA4; it reached mspec/tags/core_symbol.txt and was pushed, and
+# from that moment `grep` called that file binary and answered NOTHING without
+# -a. A check that goes quiet is worse than one that fails, and this one went
+# quiet about the record it was pointed at. mask.sh escapes such bytes now;
+# this refuses them if they ever arrive by another route.
+badenc=$(for f in $files; do
+           perl -e 'local $/; my $b = <>; exit(utf8::decode($b) ? 0 : 1)' "$f" 2>/dev/null || echo "$f"
+         done)
+[ -n "$badenc" ] && { echo "BINARY  a record is not valid UTF-8 (grep goes silent on it):"; echo "$badenc" | sed "s|$root/|        |"; rc=1; }
+
 [ "$rc" = 0 ] && echo "records clean ($(echo $files | wc -w | tr -d ' ') files)"
 exit $rc
