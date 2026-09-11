@@ -13263,7 +13263,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // not shadow a real method).
     else if str_eq name "binding" && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = map_len bind_store in
-      let _ = map_set bind_store (str_of_int id) (lv_flat env) in
+      let _ = map_set bind_store (str_of_int id) (bnd_snapshot env) in
       VBind id
     // paren-less Kernel#rand / gets / readline / readlines (`line = gets`).
     else if str_eq name "caller" && (if map_has meths name then false else true) then
@@ -13354,7 +13354,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // as a first-class Binding, unless the user redefined `binding`.
     else if str_eq name "binding" && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = map_len bind_store in
-      let _ = map_set bind_store (str_of_int id) (lv_flat env) in
+      let _ = map_set bind_store (str_of_int id) (bnd_snapshot env) in
       VBind id
     // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
     // against that captured env; otherwise it uses the CURRENT env. A parse
@@ -13942,6 +13942,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                         // slice! shares slice's index conversions (range
                         // protocol, per-bound #to_int, Float truncation).
                         else if str_eq name "slice!" then coerce_slice_args env world args
+                        // append_as_bytes refuses #to_str -- the same exception
+                        // the explicit-receiver path makes, and the same reason
+                        // (see there). Two callers of is_str_mut, two places.
+                        else if str_eq name "append_as_bytes" then args
                         else coerce_dyck_args env world recv args) in
             (if str_eq name "slice!" && (match args with Cons (VRegex (_, _), _) -> true | _ -> false)
              then str_slice_bang_rx env world h args
@@ -20311,6 +20315,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        (if str_eq name "slice!" && (match args with Cons (VRegex (_, _), _) -> true | _ -> false)
         then str_slice_bang_rx env world h args
         else if str_eq name "slice!" then str_mut_do h name (coerce_slice_args env world args)
+        // ⚠ ...but NOT for append_as_bytes. This list decides three things at
+        //   once -- that the call takes the in-place mutation path, that the
+        //   receiver's store entry is rewritten, and that object arguments are
+        //   asked for #to_str -- and append_as_bytes wants the first two and
+        //   refuses the third: ruby answers "wrong argument type Object
+        //   (expected String or Integer)" for an object that HAS #to_str.
+        //   Joining the list bought the coercion silently along with the rest.
+        else if str_eq name "append_as_bytes" then str_mut_do h name args
         else str_mut_do h name (coerce_dyck_args env world recv args))
      | _ -> VNil)
   else
@@ -20651,6 +20663,30 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
            let _ = hset hid9 (hash_put_wx env world (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
         | _ -> VNil)
      | _ -> VNil)
+  // Hash#rehash: rebuild the table now that the keys may hash differently.
+  // Measured against ruby: entries that have BECOME equal collapse, and the
+  // survivor keeps the FIRST one's position and the LAST one's value -- which
+  // is what re-inserting every pair in order does.
+  // ⚠ through hash_put_wx, not the value-level hash_put. The two compare keys
+  //   differently: hash_put asks `==` and the hash protocol asks #hash and then
+  //   #eql?. The spec's four keys share a hash and answer eql? true while `==`
+  //   says no, so a rebuild through the value-level put collapsed nothing --
+  //   the rule is only right if the rebuild asks the same question a store
+  //   does.
+  else if str_eq name "rehash" && (match recv with VHsh _ -> true | _ -> false)
+          && (if prim_user_has world recv name then false else true) then
+    (match recv with
+     | VHsh hid9 ->
+       // ⚠ ci9 travels as a PARAMETER, not a capture: the lambda lifter drops a
+       //   capture chosen by name (PAIN.md M10) and the emitted C came out with
+       //   "use of undeclared identifier mu_ci9". Mere accepted the source; the
+       //   C compiler is what caught it.
+       (let rec re9 = fn (ci9: bool) -> fn (xs: Val list) -> fn (acc: Val list) ->
+          (match xs with
+           | Cons (k9, Cons (v9, t9)) -> re9 ci9 t9 (hash_put_wx env world ci9 acc k9 v9)
+           | _ -> acc) in
+        let _ = hset hid9 (re9 (hcbi_on hid9) (hderef hid9) Nil) in recv)
+     | _ -> recv)
   // Hash#initialize on a FROZEN hash refuses (it replaces the default either
   // way), and the primitive has no way to know it was frozen.
   else if str_eq name "initialize" && (match recv with VHsh _ -> true | _ -> false)
@@ -25773,12 +25809,42 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          let _ = map_set load_ctx "parsing" (mkstr "") in
          eval_run benv world blk p2
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: Binding#eval expects a string")) in fail "mere-ruby: Binding#eval expects a string"))
+    // Binding#local_variables: the names the binding can see, as symbols.
+    // ⚠ NOT the interpreter's own entries -- `self` and the `__`-prefixed
+    //   bookkeeping (__cref, __definee_recv, ...) live in the same map and are
+    //   not locals -- and NOT a numbered parameter: since ruby 4.0 `_1` is not
+    //   a binding local, which is what the spec here asserts.
+    else if str_eq name "local_variables" then
+      (let out9 = arr_new Nil in
+       let _ = (match out9 with
+                | VArr aid9 ->
+                  map_iter benv (fn (k9: str) -> fn (v9: Val) ->
+                    if bnd_is_local k9
+                    then arr_set aid9 (list_append (deref aid9) (Cons (VSym k9, Nil)))
+                    else ())
+                | _ -> ()) in
+       out9)
     else if str_eq name "local_variable_get" then
-      (match args with Cons (VSym n, _) -> (if map_has benv n then map_get benv n else VNil) | _ -> VNil)
+      (match args with
+       | Cons (VSym n, _) ->
+         (if numbered_digit n > 0
+          then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
+          else if map_has benv n then map_get benv n else VNil)
+       | _ -> VNil)
     else if str_eq name "local_variable_set" then
-      (match args with Cons (VSym n, Cons (v, _)) -> let _ = map_set benv n v in v | _ -> VNil)
+      (match args with
+       | Cons (VSym n, Cons (v, _)) ->
+         (if numbered_digit n > 0
+          then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
+          else (let _ = map_set benv n v in v))
+       | _ -> VNil)
     else if str_eq name "local_variable_defined?" then
-      (match args with Cons (VSym n, _) -> VBool (map_has benv n) | _ -> VBool false)
+      (match args with
+       | Cons (VSym n, _) ->
+         (if numbered_digit n > 0
+          then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
+          else VBool (map_has benv n))
+       | _ -> VBool false)
     else if str_eq name "receiver" || str_eq name "self" then
       (if map_has benv "self" then map_get benv "self" else VMain)
     else if str_eq name "class" then VClass "Binding"
@@ -25795,6 +25861,29 @@ and numbered_digit = fn (s: str) ->
   if str_len s == 2 && str_eq (char_at s 0) "_" && (let d = char_at s 1 in is_digit d && (if str_eq d "0" then false else true))
   then ord (char_at s 1) - 48 else 0
 and imax = fn (a: int) -> fn (b: int) -> if a > b then a else b
+
+// Is this key of a binding's env a RUBY local? `self` and the `__`-prefixed
+// slots are the interpreter's own, and a numbered parameter stopped being a
+// binding local in ruby 4.0.
+// A binding's snapshot WITHOUT the numbered parameters. `_1` is reserved by
+// ruby -- `_1 = 5` is a SyntaxError anywhere, so nothing else can be hiding
+// under that name -- and since 4.0 it is not a binding local: `binding.eval
+// "_1"` raises NameError where the value is plainly in scope for the block.
+// Filtering at CAPTURE makes every reader agree (eval, local_variables,
+// local_variable_get) instead of each excluding it separately.
+and bnd_snapshot = fn env ->
+  let src9 = lv_flat env in
+  let dst9 = map_new () in
+  let _ = map_iter src9 (fn (k9: str) -> fn (v9: Val) ->
+            if numbered_digit k9 > 0 then () else (let _ = map_set dst9 k9 v9 in ())) in
+  dst9
+
+and bnd_is_local = fn (k: str) ->
+  (if str_eq k "self" then false
+   else if str_len k >= 2 && str_eq (substring k 0 2) "__" then false
+   else if numbered_digit k > 0 then false
+   else if str_eq k "it" then false
+   else true)
 
 // the highest numbered parameter (_1..) referenced in a block body, else 0.
 // Over-detection is safe (it only relaxes the arity-0 check / grows arity),
@@ -30087,6 +30176,7 @@ and is_mutating_method = fn (name: str) ->
   str_eq name "<<" || str_eq name "push" || str_eq name "append" ||
   str_eq name "pop" || str_eq name "shift" || str_eq name "unshift" ||
   str_eq name "prepend" || str_eq name "insert" || str_eq name "concat" ||
+  str_eq name "append_as_bytes" || str_eq name "rehash" ||
   str_eq name "[]=" || str_eq name "store" || str_eq name "delete" ||
   str_eq name "delete_at" || str_eq name "delete_if" || str_eq name "fill" ||
   str_eq name "clear" || str_eq name "replace" || str_eq name "keep_if" ||
@@ -30112,7 +30202,7 @@ and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
 
 and is_str_mut = fn (name: str) ->
   str_eq name "concat" || str_eq name "replace" || str_eq name "clear" ||
-  str_eq name "prepend"
+  str_eq name "prepend" || str_eq name "append_as_bytes"
   || (let n = str_len name in
       n > 1 && str_eq (char_at name (n - 1)) "!" && str_bang_base_ok (substring name 0 (n - 1)))
 
@@ -30197,6 +30287,36 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
      | Cons (v, _) -> let _ = sset h (match v with VStr a -> sget a | _ -> to_s v) in VStr h
      | Nil -> VStr h)
   else if str_eq name "concat" then let _ = sset h (s ++ str_concat_vals args) in VStr h
+  // String#append_as_bytes(*args): appends BYTES. A String contributes its
+  // bytes as they are and an Integer one byte, its least significant -- so it
+  // can build a string that is not valid in its own encoding, which is the
+  // point of it. The receiver's encoding never changes.
+  // ⚠ no conversion: an object with #to_str is refused, unlike every other
+  //   String method that takes one. Measured, not assumed.
+  else if str_eq name "append_as_bytes" then
+    (let rec go9 = fn (xs: Val list) -> fn (acc: str) ->
+       (match xs with
+        | Nil -> acc
+        | Cons (VStr a9, t9) -> go9 t9 (acc ++ sget a9)
+        | Cons (VInt n9, t9) ->
+          // the least significant byte, wrapping for a negative (-1 is 255)
+          (let b9 = n9 - (n9 / 256) * 256 in
+           go9 t9 (acc ++ chr (if b9 < 0 then b9 + 256 else b9)))
+        // ⚠ an Integer is TWO representations here, and the spec reaches for
+        //   the other one: `append_as_bytes(bignum_value)`. A VBig fell to the
+        //   refusal arm and was rejected as "wrong argument type Integer
+        //   (expected String or Integer)" -- refusing a value for being the
+        //   type it is. big_divmod_s floors toward -infinity, which is ruby's
+        //   modulo, so a negative bignum wraps the same way -1 does.
+        | Cons (VBig g9, t9) ->
+          (let r9 = (match big_divmod_s g9 "256" with (q9, rr9) -> rr9) in
+           let b9 = int_of_str r9 in
+           go9 t9 (acc ++ chr (if b9 < 0 then b9 + 256 else b9)))
+        | Cons (bad9, _) ->
+          // prim_raise, not raise_exc: this arm has no world (see prim_method).
+          prim_raise "TypeError"
+            ("wrong argument type " ++ class_name bad9 ++ " (expected String or Integer)")) in
+     let _ = sset h (s ++ go9 args "") in VStr h)
   else if str_eq name "prepend" then
     // every argument must already be a String (#to_str was tried upstream).
     (let rec ck = fn (xs: Val list) ->

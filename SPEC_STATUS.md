@@ -16,8 +16,8 @@ of the subject: a row measured against another release is not comparable with th
 ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 41 | 26 | 0 | 0 | 0 | 67 |
-| core/string | 109 | 5 | 0 | 0 | 0 | 114 |
+| language | 42 | 25 | 0 | 0 | 0 | 67 |
+| core/string | 110 | 4 | 0 | 0 | 0 | 114 |
 | core/array | 99 | 5 | 0 | 0 | 1 | 105 |
 | core/hash | 64 | 5 | 0 | 0 | 0 | 69 |
 | core/range | 30 | 5 | 0 | 0 | 0 | 35 |

@@ -10,13 +10,13 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 162 files.
+Classified: 160 files.
 
-## DIFF — 162 files, 75 kinds
+## DIFF — 160 files, 74 kinds
 
 | files | kind |
 |---|---|
-| 15 | `ERROR NoMethodError` |
+| 14 | `ERROR NoMethodError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
@@ -44,7 +44,6 @@ Classified: 162 files.
 | 1 | `TMPDIR` |
 | 1 | `FAILED raised StandardError, expected SyntaxError` |
 | 1 | `FAILED raised NoMethodError, expected TypeError` |
-| 1 | `FAILED raised NoMethodError, expected FrozenError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
 | 1 | `FAILED raised ArgumentError, expected IndexError` |
@@ -150,8 +149,8 @@ class column says where the weight sits.
 |---|---|
 | kernel (9) | `binding chomp chop eval loop select singleton_class test warn` |
 | unboundmethod (3) | `bind_call bind super_method` |
-| language (3) | `constants module numbered_parameters` |
 | method (2) | `super_method to_proc` |
+| language (2) | `constants module` |
 | symbol (1) | `all_symbols` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |

@@ -151,12 +151,19 @@ a chunk without emitting the element; one spec file turns on it.
 Symbol.all_symbols   # ruby: [:a, :b, ...]   mere-ruby: NoMethodError
 ```
 
-It needs a registry of every symbol that exists, and one of its spec examples
-asks for more than a runtime registry can give: *"includes symbols that are
-referenced in source code but not yet executed"* -- so the LEXER would have to
-record every symbol literal it reads, not just the ones `to_sym` builds. A
-partial answer (the symbols this run has created) would still fail that
-example, so there is nothing to gain by half-implementing it.
+It needs a registry of every symbol that exists. One spec example asks for more
+than a RUNTIME registry can give -- *"includes symbols that are referenced in
+source code but not yet executed"* -- so the LEXER would have to record every
+symbol literal it reads, not just the ones `to_sym` builds.
+
+⚠ The reason first written here was that a partial answer would still fail
+that example. That is wrong, and the correction matters more than the original
+claim: a registry of the lexer's literals PLUS `to_sym` passes all three
+examples, while still under-reporting every other way a symbol comes into
+existence -- and `VSym` is built in more than two dozen places, so covering
+them is the real work. The spec is not a witness for this one: it can be
+satisfied by an implementation that is not true. That is the reason to leave it
+alone, not the one given before.
 
 ## `Regexp#to_s` does not fold an inline-option group into the outer one
 

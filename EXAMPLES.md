@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **162** of **162** recorded DIFF files.
+Visited **160** of **160** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -104,8 +104,7 @@ Visited **162** of **162** recorded DIFF files.
 | core/hash/inspect_spec.rb | FAILED: calls #inspect on keys and values: expected "{key=>val}", got "{key => val}" |
 | core/hash/inspect_spec.rb | FAILED: does not call #to_s on a String returned from #inspect: expected "{:a=>\"abc\"}", got "{a: \"abc\"}" |
 | core/hash/rehash_spec.rb | FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true |
-| core/hash/rehash_spec.rb | ERROR: Hash#rehash reorganizes the Hash by recomputing all key hash codes: NoMethodError -- undefined method 'rehash' for an instance of Hash |
-| core/hash/rehash_spec.rb | ERROR: Hash#rehash calls #hash for each key: NoMethodError -- undefined method 'rehash' for an instance of Hash |
+| core/hash/rehash_spec.rb | pass=22 fail=1 err=0 |
 | core/integer/chr_spec.rb | ERROR: and self is greater than 255 returns a String with the default internal encoding: RangeError -- 256 out of char range |
 | core/integer/chr_spec.rb | ERROR: and self is greater than 255 returns a String encoding self interpreted as a codepoint in the default internal encoding: RangeError -- 256 out of char range |
 | core/integer/chr_spec.rb | ERROR: Integer#chr with an encoding argument accepts a String as an argument: RuntimeError -- |
@@ -204,7 +203,7 @@ Visited **162** of **162** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.767969648, got 0.081245259 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.902291979, got 0.95460655 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -328,9 +327,6 @@ Visited **162** of **162** recorded DIFF files.
 | core/regexp/union_spec.rb | FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII> |
 | core/regexp/union_spec.rb | FAILED: returns a Regexp with the encoding of a String containing non-ASCII-compatible characters: expected #<Encoding:ISO-8859-1>, got #<Encoding:UTF-8> |
 | core/regexp/union_spec.rb | FAILED: returns a Regexp with the encoding of multiple non-conflicting ASCII-incompatible String arguments: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII> |
-| core/string/append_as_bytes_spec.rb | FAILED: raised NoMethodError, expected FrozenError |
-| core/string/append_as_bytes_spec.rb | ERROR: String#append_bytes allows creating broken strings in UTF8: NoMethodError -- undefined method 'append_as_bytes' for an instance of String |
-| core/string/append_as_bytes_spec.rb | ERROR: String#append_bytes allows creating broken strings in UTF_32: NoMethodError -- undefined method 'append_as_bytes' for an instance of String |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
@@ -423,9 +419,6 @@ Visited **162** of **162** recorded DIFF files.
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/module_spec.rb | ERROR: Assigning an anonymous module to a constant sets the name of a module scoped by an anonymous module: NoMethodError -- undefined method 'end_with?' |
 | language/module_spec.rb | pass=15 fail=0 err=1 |
-| language/numbered_parameters_spec.rb | ERROR: assigning to a numbered parameter does not affect binding local variables: NoMethodError -- undefined method 'local_variables' for an instance of Binding |
-| language/numbered_parameters_spec.rb | FAILED: expected NameError to be raised |
-| language/numbered_parameters_spec.rb | FAILED: expected NameError to be raised |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |
 | language/predefined_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |
