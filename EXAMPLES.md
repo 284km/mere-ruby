@@ -8,27 +8,15 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **182** of **182** recorded DIFF files.
+Visited **169** of **169** recorded DIFF files.
 
 | file | what fails |
 |---|---|
-| core/array/all_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
-| core/array/all_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/all_spec.rb | pass=0 fail=2 err=0 |
-| core/array/any_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
-| core/array/any_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/any_spec.rb | pass=6 fail=2 err=0 |
-| core/array/count_spec.rb | FAILED: ignores the block if there is an argument: expected 2, got 0 |
-| core/array/count_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/count_spec.rb | pass=3 fail=2 err=0 |
 | core/array/element_reference_spec.rb | ERROR: with a subclass of Array raises a RangeError when the start index is out of range of Fixnum: NameError -- undefined local variable or method 'max_long' for an instance of Object |
 | core/array/element_reference_spec.rb | FAILED: expected RangeError to be raised |
 | core/array/element_reference_spec.rb | FAILED: expected TypeError to be raised |
 | core/array/fetch_spec.rb | FAILED: gives precedence to the default block over the default argument: matcher did not match #<Proc> |
 | core/array/fetch_spec.rb | pass=16 fail=1 err=0 |
-| core/array/find_index_spec.rb | FAILED: ignores the block if there is an argument: expected 3, got 2 |
-| core/array/find_index_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/find_index_spec.rb | pass=6 fail=2 err=0 |
 | core/array/initialize_spec.rb | ERROR: Array#initialize with no arguments does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | ERROR: Array#initialize with (array) does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
@@ -37,15 +25,6 @@ Visited **182** of **182** recorded DIFF files.
 | core/array/new_spec.rb | ERROR: Array.new with no arguments does not use the given block: RuntimeError -- |
 | core/array/new_spec.rb | ERROR: Array.new with (array) does not use the given block: RuntimeError -- |
 | core/array/new_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
-| core/array/none_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
-| core/array/none_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/none_spec.rb | pass=0 fail=2 err=0 |
-| core/array/one_spec.rb | FAILED: ignores the block if there is an argument: expected true, got false |
-| core/array/one_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/one_spec.rb | pass=0 fail=2 err=0 |
-| core/array/rindex_spec.rb | FAILED: ignores the block if there is an argument: expected 3, got 4 |
-| core/array/rindex_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/array/rindex_spec.rb | pass=13 fail=2 err=0 |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
 | core/array/sample_spec.rb | FAILED: samples evenly: expected truthy from #<= |
@@ -57,29 +36,14 @@ Visited **182** of **182** recorded DIFF files.
 | core/complex/inspect_spec.rb | pass=7 fail=0 err=2 |
 | core/complex/to_s_spec.rb | ERROR: when self's real component is 0 treats real and imaginary parts as strings: TypeError -- not a real |
 | core/complex/to_s_spec.rb | pass=13 fail=0 err=1 |
-| core/enumerable/all_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/enumerable/all_spec.rb | pass=60 fail=1 err=0 |
-| core/enumerable/any_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/enumerable/any_spec.rb | pass=70 fail=1 err=0 |
 | core/enumerable/chunk_spec.rb | FAILED: returned Enumerator size returns nil: expected nil, got 1 |
 | core/enumerable/chunk_spec.rb | pass=10 fail=1 err=0 |
-| core/enumerable/count_spec.rb | ERROR: with a custom size method ignores the custom size method: NoMethodError -- undefined method 'count' |
-| core/enumerable/count_spec.rb | FAILED: ignores the block when given an argument: matcher did not match #<Proc> |
-| core/enumerable/count_spec.rb | pass=7 fail=1 err=1 |
-| core/enumerable/find_index_spec.rb | FAILED: ignores the block if an argument is given: matcher did not match #<Proc> |
-| core/enumerable/find_index_spec.rb | ERROR: given a single yield parameter passes first element to the parameter: NoMethodError -- undefined method 'find_index' for nil |
-| core/enumerable/find_index_spec.rb | ERROR: given a greedy yield parameter passes a gathered array to the parameter: NoMethodError -- undefined method 'find_index' for nil |
 | core/enumerable/inject_spec.rb | FAILED: ignores the block if two arguments: matcher did not match #<Proc> |
 | core/enumerable/inject_spec.rb | ERROR: Enumerable#inject ignores the block if two arguments: RuntimeError -- we never get here |
 | core/enumerable/inject_spec.rb | FAILED: tolerates increasing a collection size during iterating Array: expected [0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 4, 40, 41, 42, 43, 44, 45,  ...[clipped] |
 | core/enumerable/map_spec.rb | FAILED: reports the same arity as the given block: expected [2], got [-2] |
 | core/enumerable/map_spec.rb | FAILED: reports the same arity as the given block: expected [1], got [-2] |
 | core/enumerable/map_spec.rb | ERROR: Enumerable#map yields 2 arguments for a Hash when block arity is 2: ArgumentError -- wrong number of arguments (given 1, expected 2) |
-| core/enumerable/none_spec.rb | FAILED: raised NoMethodError, expected RuntimeError |
-| core/enumerable/none_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/enumerable/none_spec.rb | pass=34 fail=2 err=0 |
-| core/enumerable/one_spec.rb | FAILED: ignores the block if there is an argument: matcher did not match #<Proc> |
-| core/enumerable/one_spec.rb | pass=41 fail=1 err=0 |
 | core/enumerable/tally_spec.rb | FAILED: ignores the default value: expected {...}, got {...} |
 | core/enumerable/tally_spec.rb | FAILED: ignores the default proc: expected {...}, got {...} |
 | core/enumerable/tally_spec.rb | pass=14 fail=2 err=0 |
@@ -249,7 +213,7 @@ Visited **182** of **182** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.075481898, got 0.774849364 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.109106379, got 0.816685748 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |

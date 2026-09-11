@@ -10,23 +10,23 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 182 files.
+Classified: 169 files.
 
-## DIFF — 182 files, 75 kinds
+## DIFF — 169 files, 75 kinds
 
 | files | kind |
 |---|---|
-| 23 | `FAILED matcher did not match #<OBJ>` |
+| 17 | `FAILED matcher did not match #<OBJ>` |
 | 15 | `ERROR NoMethodError` |
 | 9 | `ERROR ArgumentError` |
-| 8 | `FAILED expected true, got false` |
 | 7 | `FAILED expected false, got true` |
-| 7 | `FAILED expected N, got N` |
 | 7 | `ERROR NameError` |
 | 6 | `FAILED expected to be identical` |
 | 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `ERROR TypeError` |
+| 4 | `FAILED expected true, got false` |
+| 4 | `FAILED expected N, got N` |
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
@@ -98,8 +98,6 @@ Classified: 182 files.
 |---|---|
 | 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
-| 4 | `FAILED: ignores the block if there is an argument: matcher did not match #<Proc>` |
-| 4 | `FAILED: ignores the block if there is an argument: expected true, got false` |
 | 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
@@ -136,6 +134,8 @@ Classified: 182 files.
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
+| 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
+| 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 
 </details>
 
