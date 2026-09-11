@@ -13381,13 +13381,47 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                                                 ++ display_cls_msg world (dispatch_cls_of world bad9)
                                                 ++ " into Symbol") in ())))
                             else ()) in
-                   ())
+                   // ⚠ ...AND THEN IT WRITES. This arm validated the keywords
+                   //   and returned nil: `warn "x"` produced no output at all,
+                   //   anywhere. mspec's `complain` matcher is built on it and
+                   //   so are seven recorded rows.
+                   //   Asked of ruby rather than assumed:
+                   //     warn "a"                       -> "a\n"
+                   //     warn "a", "b"                  -> "a\nb\n" (ONE write)
+                   //     warn "a\n"                     -> "a\n" (not two)
+                   //     warn 42                        -> "42\n"
+                   //     warn ["x", "y"]                -> "x\ny\n"
+                   //     warn "u", uplevel: 0           -> "FILE:LINE: warning: u\n"
+                   //     warn "c", category: :deprecated-> nothing, unless
+                   //                                       Warning[:deprecated]
+                   //     warn "e", category: :experimental -> "e\n" (on by default)
+                   //     warn "b", category: :nope      -> ArgumentError
+                   //     warn                           -> nothing
+                   let cat9 = (if hash_haskey kw9 (VSym "category")
+                               then hash_get kw9 (VSym "category") else VNil) in
+                   let on9 = (match cat9 with
+                              | VNil -> true
+                              | VSym cn ->
+                                (if str_eq cn "deprecated" then
+                                   (if map_has warn_cats cn then truthy (map_get warn_cats cn) else false)
+                                 else if str_eq cn "experimental" || str_eq cn "performance" then
+                                   (if map_has warn_cats cn then truthy (map_get warn_cats cn) else true)
+                                 else (let _ = raise_exc world "ArgumentError" ("unknown category: " ++ cn) in false))
+                              | _ -> true) in
+                   let pre9 = (match (if hash_haskey kw9 (VSym "uplevel")
+                                      then hash_get kw9 (VSym "uplevel") else VNil) with
+                               | VInt _ -> cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: "
+                               | VBig _ -> cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: "
+                               | _ -> "") in
+                   let body9 = warn_join world pos9 "" in
+                   (if on9 && (if str_eq body9 "" then false else true)
+                    then err_emit world (pre9 ++ body9) else ()))
                 | Nil -> ()) in
        VNil)
     // Kernel#printf: format, then write it (no newline).
     else if str_eq name "printf" && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
-                | Cons (VStr h, rest) -> out_print_no_nl (rb_format env world (sget h) rest)
+                | Cons (VStr h, rest) -> out_emit world (rb_format env world (sget h) rest)
                 | _ -> ()) in VNil)
     // Kernel#format / #sprintf: sprintf-style formatting.
     else if (str_eq name "format" || str_eq name "sprintf") && (if kernel_overridden env world name then false else true) then
@@ -42147,16 +42181,30 @@ and line_end_from = fn (s: str) -> fn (i: int) ->
   else line_end_from s (i + 1)
 // puts semantics onto stderr: arrays flatten, one trailing newline per item
 // (print_err itself appends the newline).
+// The text Kernel#warn writes, WITHOUT its final newline (err_emit adds that,
+// and print_err on the unhooked path adds it too). An Array argument spreads
+// over lines, and a message that already ends in a newline does not get a
+// second one -- both measured against ruby rather than assumed.
+and warn_join = fn world -> fn (xs: Val list) -> fn (acc: str) ->
+  match xs with
+  | Nil -> acc
+  | Cons (VArr aid, t) -> warn_join world t (warn_join world (deref aid) acc)
+  | Cons (h, t) ->
+    (let s9 = (match h with VStr sh -> sget sh | other -> to_s other) in
+     let s9 = (if str_len s9 > 0 && str_eq (char_at s9 (str_len s9 - 1)) "\n"
+               then substring s9 0 (str_len s9 - 1) else s9) in
+     warn_join world t (if str_eq acc "" then s9 else acc ++ "\n" ++ s9))
+
 and err_puts_each = fn world -> fn (xs: Val list) ->
   match xs with
   | Nil -> ()
   | Cons (VArr aid, t) -> let _ = err_puts_each world (deref aid) in err_puts_each world t
   | Cons (VStr sh, t) ->
     let s2 = sget sh in
-    let _ = print_err (if str_len s2 > 0 && str_eq (char_at s2 (str_len s2 - 1)) "\n"
+    let _ = err_emit world (if str_len s2 > 0 && str_eq (char_at s2 (str_len s2 - 1)) "\n"
                        then substring s2 0 (str_len s2 - 1) else s2) in
     err_puts_each world t
-  | Cons (h, t) -> let _ = print_err (to_s h) in err_puts_each world t
+  | Cons (h, t) -> let _ = err_emit world (to_s h) in err_puts_each world t
 and io_join_go = fn (args: Val list) -> fn (acc: str) ->
   match args with
   | Nil -> acc
@@ -49269,6 +49317,40 @@ and any_truthy = fn env -> fn world -> fn blk -> fn (vs: Expr list) ->
 and any_val_truthy = fn (xs: Val list) ->
   match xs with Nil -> false | Cons (h, t) -> truthy h || any_val_truthy t
 
+// ⚠ Kernel#puts / #print / #p / #warn write THROUGH $stdout and $stderr.
+// A program may replace either -- mspec's `output` and `complain` matchers do
+// exactly that, and so does anything that captures its own output -- and these
+// wrote straight to the descriptor, so the replacement saw NOTHING while the
+// text still appeared on the terminal. Measured against ruby:
+//
+//     $stdout = stub; puts "y"    ruby: stub holds "y\n"   here: "" (and "y"
+//                                 went to the real stdout)
+//     $stderr = stub; warn "x"    ruby: stub holds "x\n"   here: ""
+//
+// The built-in STDOUT / STDERR objects carry @__io_fd; while the global still
+// names one of those there is nothing to dispatch to, and the raw sink is both
+// right and faster. Anything else is asked for #write, which is the only
+// method $stdout= accepts in the first place (see the assignment guard).
+and stdio_hook = fn world -> fn (slot: str) ->
+  (if map_has globals slot then
+     (match map_get globals slot with
+      | VObj id9 ->
+        (let (m9, s9, o9, iv9) = world in
+         if map_has iv9 (str_of_int id9 ++ "@__io_fd") then VNil else VObj id9)
+      | _ -> VNil)
+   else VNil)
+and stdio_emit = fn world -> fn (slot: str) -> fn (s: str) ->
+  (match stdio_hook world slot with
+   | VNil -> false
+   | t9 ->
+     (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+      let _ = invoke_val_c gc_cenv0 world nb9 t9 "write" (Cons (mkstr s, Nil)) false in
+      true))
+and out_emit = fn world -> fn (s: str) ->
+  if stdio_emit world "stdout" s then () else out_print_no_nl s
+and err_emit = fn world -> fn (s: str) ->
+  if stdio_emit world "stderr" (s ++ "\n") then () else print_err s
+
 and print_each = fn world -> fn (args: Val list) ->
   match args with
   | Nil -> ()
@@ -49277,22 +49359,22 @@ and print_each = fn world -> fn (args: Val list) ->
 // like puts_one but without the trailing newline (for Kernel#print).
 and puts_one_nonl = fn world -> fn (v: Val) ->
   match v with
-  | VStr s -> let s = sget s in out_print_no_nl s
+  | VStr s -> let s = sget s in out_emit world s
   // ⚠ An Array's (or Hash's) #to_s IS its #inspect, and inspecting a
   // COLLECTION means inspecting each element -- which needs the world, because
   // an element may be an object whose class defines #inspect. The value-level
   // to_s has no world and prints "#<object>" for every one of them, so
   // `print [exc]` named nothing. inspect_w is the same printer `p` uses.
-  | VArr _ -> out_print_no_nl (inspect_w gc_cenv0 world v)
-  | VHsh _ -> out_print_no_nl (inspect_w gc_cenv0 world v)
+  | VArr _ -> out_emit world (inspect_w gc_cenv0 world v)
+  | VHsh _ -> out_emit world (inspect_w gc_cenv0 world v)
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
     let cls = map_get ocls (str_of_int id) in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in  // shared placeholder cenv (see gc_cenv0)
     if has_meth world cls "to_s" then
-      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in out_print_no_nl s | other -> out_print_no_nl (to_s other))
-    else out_print_no_nl (to_s v)
-  | _ -> out_print_no_nl (to_s v)
+      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in out_emit world s | other -> out_emit world (to_s other))
+    else out_emit world (to_s v)
+  | _ -> out_emit world (to_s v)
 
 and p_print = fn (args: Val list) ->
   match args with
@@ -49304,7 +49386,7 @@ and p_print = fn (args: Val list) ->
 and p_print_w = fn env -> fn world -> fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (v, t) -> let _ = out_print (inspect_w env world v) in p_print_w env world t
+  | Cons (v, t) -> let _ = out_emit world (inspect_w env world v ++ "\n") in p_print_w env world t
 
 // puts of one value: arrays flatten recursively; an object uses its
 // user-defined to_s if present (Ruby would otherwise print an address,
@@ -49317,15 +49399,15 @@ and puts_one = fn world -> fn (v: Val) ->
     let cls = map_get ocls (str_of_int id) in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in  // shared placeholder cenv (see gc_cenv0)
     if has_meth world cls "to_s" then
-      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in out_print s | other -> out_print (to_s other))
-    else if map_has enc_name (str_of_int id) then out_print (map_get enc_name (str_of_int id))
-    else out_print ("#<" ++ display_cls world cls ++ ">")
+      (match invoke world noblk v cls "to_s" Nil with VStr s -> let s = sget s in out_emit world (s ++ "\n") | other -> out_emit world (to_s other ++ "\n"))
+    else if map_has enc_name (str_of_int id) then out_emit world (map_get enc_name (str_of_int id) ++ "\n")
+    else out_emit world ("#<" ++ display_cls world cls ++ ">" ++ "\n")
   // a string already ending in a newline doesn't get another (Ruby puts).
   | VStr s -> let s = sget s in
     if str_len s > 0 && str_eq (char_at s (str_len s - 1)) "\n"
-    then out_print (substring s 0 (str_len s - 1))
-    else out_print s
-  | _ -> out_print (to_s v)
+    then out_emit world s
+    else out_emit world (s ++ "\n")
+  | _ -> out_emit world (to_s v ++ "\n")
 
 and puts_each = fn world -> fn (xs: Val list) ->
   match xs with
