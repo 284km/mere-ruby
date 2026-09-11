@@ -10,14 +10,14 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 163 files.
+Classified: 162 files.
 
-## DIFF — 163 files, 75 kinds
+## DIFF — 162 files, 75 kinds
 
 | files | kind |
 |---|---|
 | 15 | `ERROR NoMethodError` |
-| 11 | `FAILED matcher did not match #<OBJ>` |
+| 10 | `FAILED matcher did not match #<OBJ>` |
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `ERROR NameError` |
@@ -111,7 +111,6 @@ Classified: 163 files.
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
-| 1 | `FAILED: warns if there are identical when clauses: matcher did not match #<Proc>` |
 | 1 | `FAILED: warns about flags being ignored for regexp arguments: matcher did not match #<Proc>` |
 | 1 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
@@ -136,6 +135,7 @@ Classified: 163 files.
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
+| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
 
 </details>
 

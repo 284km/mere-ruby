@@ -155,6 +155,9 @@ Visited **162** of **162** recorded DIFF files.
 | core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates within the scope of the eval: NameError -- uninitialized constant EvalSpecs::A::B |
 | core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates such that constants are scoped to the class of the eval: NameError -- uninitialized constant EvalSpecs::A::C |
 | core/kernel/eval_spec.rb | FAILED: does not share locals across eval scopes: expected "NameError", got "" |
+| core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected "spec", got nil |
+| core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected to receive #gets |
+| core/kernel/gets_spec.rb | pass=2 fail=2 err=0 |
 | core/kernel/inspect_spec.rb | FAILED: expected TypeError to be raised |
 | core/kernel/inspect_spec.rb | pass=7 fail=1 err=0 |
 | core/kernel/lambda_spec.rb | ERROR: Kernel#lambda strictly checks the arity when 0 or 2..inf args are specified: ArgumentError -- ArgumentError |
@@ -201,7 +204,7 @@ Visited **162** of **162** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.284581405, got 0.500870392 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.767969648, got 0.081245259 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -387,8 +390,6 @@ Visited **162** of **162** recorded DIFF files.
 | language/break_spec.rb | FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e] |
 | language/break_spec.rb | FAILED: returns a value when invoking from the toplevel: expected "a,b,break,d", got "" |
 | language/break_spec.rb | FAILED: returns a value when invoking from a method: expected "a,d,b,break,e,f", got "" |
-| language/case_spec.rb | FAILED: warns if there are identical when clauses: matcher did not match #<Proc> |
-| language/case_spec.rb | pass=65 fail=1 err=0 |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches the superclass chain: NameError -- uninitialized constant ConstantSpecs::ContainerA::ChildA::CS_CONST13 |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches Object if no class or module qualifier is given: NameError -- uninitialized constant CS_CONST10 |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches Object after searching other scopes: NameError -- uninitialized constant CS_CONST10 |

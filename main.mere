@@ -1059,6 +1059,17 @@ let rx_cur = map_new ();
 // require / main), so an invalid literal is a parse-time SyntaxError while
 // engine-unsupported ones pass (legacy fallback).
 let rx_pending = map_new ();
+// Warnings the PARSER found. It has no `world`, so it cannot ask $stderr (which
+// a program may have replaced -- mspec's `complain` does exactly that) nor read
+// $VERBOSE; both need the interpreter. So the parser NOTES them, with the
+// location already in the text because by flush time the current position is
+// the driver's, and whoever drove the parse flushes them. Same shape as
+// rx_pending above, which validates regexp literals the same way.
+let warn_pending = map_new ();
+let warn_note = fn (s: str) ->
+  let n = (if map_has warn_pending "n" then (match map_get warn_pending "n" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set warn_pending ("w" ++ str_of_int n) (mkstr s) in
+  map_set warn_pending "n" (VInt (n + 1));
 // container handles currently being inspected — breaks self-referential
 // structures (Ruby prints such a cycle as "[...]" / "{...}") instead of
 // recursing forever.
@@ -6662,10 +6673,10 @@ and parse_case = fn toks ->
   // `case` immediately followed by a newline is subjectless: the when
   // conditions are truthiness tests rather than === against a subject.
   match toks with
-  | Cons (TNL _, _) -> parse_whens ECaseNone toks Nil
+  | Cons (TNL _, _) -> parse_whens ECaseNone toks Nil Nil
   // ... and so is `case when c then v end` on one line: `when` cannot start a
   // subject expression, so its presence here means there is no subject.
-  | Cons (TId kw0, _) -> if str_eq kw0 "when" then parse_whens ECaseNone toks Nil else parse_case_subj toks
+  | Cons (TId kw0, _) -> if str_eq kw0 "when" then parse_whens ECaseNone toks Nil Nil else parse_case_subj toks
   | _ -> parse_case_subj toks
 and parse_case_subj = fn toks ->
   (match toks with
@@ -6673,8 +6684,8 @@ and parse_case_subj = fn toks ->
     let (subj, r) = parse_expr toks in
     // `in` after the subject selects pattern matching; `when` the classic form.
     (match skip_nls r with
-     | Cons (TId kw, _) -> if str_eq kw "in" then parse_case_in subj r Nil else parse_whens subj r Nil
-     | _ -> parse_whens subj r Nil))
+     | Cons (TId kw, _) -> if str_eq kw "in" then parse_case_in subj r Nil else parse_whens subj r Nil Nil
+     | _ -> parse_whens subj r Nil Nil))
 
 // pattern-matching case: parse `in <pattern> [if|unless <cond>] [then] body`
 // clauses, an optional `else`, and the closing `end`.
@@ -7071,14 +7082,50 @@ and hash_pat_sep = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) ->
     else (rev_app acc Nil, rest, toks)
   | _ -> (rev_app acc Nil, rest, toks)
 
-and parse_whens = fn (subj: Expr) -> fn toks -> fn acc ->
+// A `when` value the parser can compare with another: a literal, and only a
+// literal. Anything computed is "" and never counts as a duplicate -- two
+// clauses saying `when foo` are not the same clause as far as the parser can
+// tell, and ruby does not claim they are either.
+and when_lit_key = fn (e: Expr) ->
+  (match e with
+   | EInt n9 -> "i" ++ str_of_int n9
+   | EStrL s9 -> "s" ++ s9
+   | ESym y9 -> "y" ++ y9
+   | EBool b9 -> (if b9 then "b1" else "b0")
+   | EFlt f9 -> "f" ++ str_of_float f9
+   | ENil -> "n"
+   | _ -> "")
+and when_seen_line = fn (seen: (str * int) list) -> fn (k: str) ->
+  (match seen with
+   | Nil -> 0
+   | Cons ((k9, l9), t9) -> if str_eq k9 k then l9 else when_seen_line t9 k)
+// note every literal of THIS clause, warning for the first one already seen
+and when_note_dups = fn (vs: Expr list) -> fn (seen: (str * int) list) -> fn (ln: int) ->
+  (match vs with
+   | Nil -> seen
+   | Cons (v9, t9) ->
+     (let k9 = when_lit_key v9 in
+      if str_eq k9 "" then when_note_dups t9 seen ln
+      else
+        (let prev = when_seen_line seen k9 in
+         if prev > 0 then
+           (let _ = warn_note (parse_time_file () ++ ":" ++ str_of_int ln
+                               ++ ": warning: 'when' clause on line " ++ str_of_int ln
+                               ++ " duplicates 'when' clause on line " ++ str_of_int prev
+                               ++ " and is ignored") in
+            when_note_dups t9 seen ln)
+         else when_note_dups t9 (Cons ((k9, ln), seen)) ln)))
+
+and parse_whens = fn (subj: Expr) -> fn toks -> fn acc -> fn (seen: (str * int) list) ->
   let t = skip_nls toks in
   match t with
   | Cons (TId id, r) ->
     if str_eq id "when" then
+      let ln9 = tok_line t in
       let (vs, r2) = parse_when_vals r Nil in
+      let seen2 = when_note_dups vs seen ln9 in
       let (b, r3) = parse_stmts (skip_then r2) Nil in
-      parse_whens subj r3 (Cons ((vs, b), acc))
+      parse_whens subj r3 (Cons ((vs, b), acc)) seen2
     else if str_eq id "else" then
       let _ = (match acc with
                | Nil -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: case with else but no when")) in fail "mere-ruby: case with else but no when")
@@ -12391,6 +12438,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter rx_cur mk in
   let _ = map_iter rx_gbodies mk in
   let _ = map_iter rx_pending mk in
+  let _ = map_iter warn_pending mk in
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
   let _ = map_iter gc_hold mk in
@@ -38464,6 +38512,7 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
      let (prog2, rest2) = parse_stmts toks Nil in
      let _ = map_set load_ctx "parsing" (mkstr "") in
      let _ = rx_check_pending () in
+     let _ = warn_flush world in
      let _ = (match rest2 with
               | Cons (TEOF, _) -> ()
               | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)) in
@@ -45575,6 +45624,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                  (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
                   let _ = fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: parse failed") else "mere-ruby: parse failed") in ()) in
        let _ = rx_check_pending () in
+     let _ = warn_flush world in
        let _ = (match rest2 with
                 | Cons (TEOF, _) -> ()
                 | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)) in
@@ -46706,7 +46756,8 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
       let toks = number_nls_at code (lex_go code 0) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
       let (p2, _) = parse_stmts toks Nil in
-      let _ = rx_check_pending () in p2) sentinel in
+      let _ = rx_check_pending () in
+     let _ = warn_flush world in p2) sentinel in
     let _ = map_set load_ctx "parsing" (mkstr "") in
     let _ = map_set load_ctx "pfile" savedpf9 in
     let _ = map_set load_ctx "coding" savedc in
@@ -47745,6 +47796,24 @@ and rx_validate = fn (body: str) -> fn (fl: str) ->
 
 // validate the regex literals recorded since the last check; the first
 // invalid one fails (a SyntaxError at the enclosing parse boundary).
+// Emit what the parser noted, now that there is a world to emit it through.
+// Silent when $VERBOSE is nil, like every other warning here; the text already
+// carries its own "FILE:LINE: warning: " because the parse is over.
+and warn_flush = fn world ->
+  let n = (if map_has warn_pending "n" then (match map_get warn_pending "n" with VInt k -> k | _ -> 0) else 0) in
+  let d = (if map_has warn_pending "done" then (match map_get warn_pending "done" with VInt k -> k | _ -> 0) else 0) in
+  let _ = warn_flush_go world d n in
+  map_set warn_pending "done" (VInt n)
+and warn_flush_go = fn world -> fn (i: int) -> fn (n: int) ->
+  if i >= n then ()
+  else
+    (let s9 = (match map_get warn_pending ("w" ++ str_of_int i) with VStr h -> sget h | _ -> "") in
+     let _ = (if (if map_has globals (gvar_slot "VERBOSE")
+                  then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
+                  else false)
+              then () else err_emit world s9) in
+     warn_flush_go world (i + 1) n)
+
 and rx_check_pending = fn (u: unit) ->
   let n = (if map_has rx_pending "n" then (match map_get rx_pending "n" with VInt k -> k | _ -> 0) else 0) in
   let d = (if map_has rx_pending "done" then (match map_get rx_pending "done" with VInt k -> k | _ -> 0) else 0) in
@@ -51228,6 +51297,10 @@ let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set sup "TrueClass" "Object" in
   let _ = map_set sup "FalseClass" "Object" in
   let world = (meths, sup, ocls, ivars) in
+  // ⚠ the entry program's parse happened BEFORE the world existed, so its
+  //   noted warnings are flushed here instead -- still before a line of the
+  //   program runs, which is where ruby prints them.
+  let _ = warn_flush world in
   let _ = register_builtin_consts () in
   let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
   let _ = lv_set env "self" VMain in   // top-level self is `main`
