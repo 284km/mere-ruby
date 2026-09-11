@@ -344,6 +344,12 @@ extern fn hypot: float -> float -> float;
 extern fn fmod: float -> float -> float;
 extern fn ldexp: float -> int -> float;
 extern fn getpid: unit -> int;
+// chdir(2) / symlink(2): plain libc, and both answer an int -- an extern that
+// returned `char*` would hand back a raw pointer rather than a Mere string
+// (see the note at the top of this file), which is why realpath(3) is not
+// here and File.realpath stays textual.
+extern fn chdir: str -> int;
+extern fn symlink: str -> str -> int;
 // one arena block, reused: 64 KiB is the read size and the write chunk.
 
 // Object ids come from a counter carried IN the ocls map itself (special key
@@ -1408,6 +1414,31 @@ let parse_line_now = fn () ->
 let set_parsing_eval = fn (code: str) ->
   map_set load_ctx "parsing"
     (mkstr ("(eval) " ++ substring code 0 (if str_len code > 60 then 60 else str_len code)));
+
+// ---- the (file, line) a STRING eval runs under ---------------------------
+// `eval` takes them as its 3rd and 4th arguments and already honoured them;
+// instance_eval / class_eval / module_eval (and the _exec spellings) take them
+// as their 2nd and 3rd and did NOT -- so `__FILE__` inside one answered the
+// diagnostic label, which is the first sixty characters of the code:
+//
+//   Object.new.instance_eval("__FILE__", "foo.rb")
+//     ruby       "foo.rb"
+//     mere-ruby  "(eval) __FILE__"
+//
+// and `require_relative` written inside such a string then resolved against
+// that quote, building paths like `<cwd>/(eval) require_relative("../..`.
+// One rule, two argument positions: the caller pulls the two values out of
+// its own arg list, and these decide the DEFAULT and do the save/restore.
+let eval_file_arg = fn (fv: Val) ->
+  (match fv with
+   | VStr h -> sget h
+   | _ -> "(eval at " ++ cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ")");
+let eval_line_arg = fn (lv: Val) -> (match lv with VInt n -> (if n > 0 then n else 1) | _ -> 1);
+let eval_pfile_push = fn (f: str) ->
+  let saved = (if map_has load_ctx "pfile" then map_get load_ctx "pfile" else mkstr "") in
+  let _ = map_set load_ctx "pfile" (mkstr f) in
+  saved;
+let eval_pfile_pop = fn (saved: Val) -> map_set load_ctx "pfile" saved;
 
 let parsing_file = fn () ->
   let ln = parse_line_now () in
@@ -3069,6 +3100,34 @@ and prev_nonspace = fn (s: str) -> fn (i: int) ->
   else i
 
 and is_lparen = fn (p: str) -> str_eq p "(" || str_eq p " ("
+// the tokens AFTER a leading parenthesised group, for a statement-leading name
+// that has to know whether its call is being CHAINED. `require_relative(p)` is
+// the statement form; `require_relative(p).should == true` is an ordinary
+// expression whose value is chained, and reading the second as the first made
+// the whole chain the require's argument -- so the file it tried to load was
+// named after the method called on the result. Depth-counted, so a nested call
+// in the arguments does not end the scan early.
+and after_parens = fn toks ->
+  match toks with
+  | Cons (TP lp, r) -> (if is_lparen lp then after_parens_go r 1 else toks)
+  | _ -> toks
+and after_parens_go = fn toks -> fn (d: int) ->
+  match toks with
+  | Nil -> (Nil : Tok list)
+  | Cons (TEOF, _) -> toks
+  | Cons (TP p9, r) ->
+    // ⚠ "(s" opens too -- it is the token an interpolating string becomes, and
+    //   it is closed by the same ")". Counting only "(" made
+    //   `require_relative("#{dir}/f.rb").should` end its scan at the string's
+    //   own closer, so the chain after it was never seen.
+    (if is_lparen p9 || str_eq p9 "(s" then after_parens_go r (d + 1)
+     else if str_eq p9 ")" then (if d <= 1 then r else after_parens_go r (d - 1))
+     else after_parens_go r d)
+  | Cons (_, r) -> after_parens_go r d
+and tok_chains = fn toks ->
+  match toks with
+  | Cons (TP p9, _) -> str_eq p9 "." || str_eq p9 "&." || str_eq p9 "::" || str_eq p9 "["
+  | _ -> false
 
 // scan the regex body to the closing unescaped /, returning the trailing
 // flags ("im"...) alongside the body and the resume position.
@@ -3251,7 +3310,23 @@ let rec number_nls_go = fn (s: str) -> fn toks -> fn (off: int) -> fn (line: int
 // `cur_pos` at execution time would also shift the lines of code that the eval
 // merely CALLS. Numbering at the source makes `__LINE__`, a nested `def`'s
 // #source_location, and an error's reported line all absolute for free.
-let number_nls_at = fn (s: str) -> fn toks -> fn (base: int) -> number_nls_go s toks 0 base;
+// ⚠ ...and a source that does not END with a newline has no final mark, so
+//   every token on its last line reads as line 0 -- `tok_line` walks FORWARD
+//   to the next TNL and answers 0 when it reaches the end instead. A FILE
+//   almost always ends with a newline and so never showed it; an eval string
+//   usually does not, which is why `eval("__LINE__", nil, "f.rb", 7)` was 0
+//   and not 7. The mark the source is missing is added here, once, where the
+//   base is known -- rather than teaching tok_line's two callers a fallback
+//   they have no way to compute.
+let rec tnl_before_eof = fn toks -> fn (ln: int) ->
+  match toks with
+  | Nil -> (Nil : Tok list)
+  | Cons (TEOF, r) -> Cons (TNL ln, Cons (TEOF, r))
+  | Cons (t, r) -> Cons (t, tnl_before_eof r ln);
+let number_nls_at = fn (s: str) -> fn toks -> fn (base: int) ->
+  let numbered = number_nls_go s toks 0 base in
+  if str_len s == 0 || str_eq (char_at s (str_len s - 1)) "\n" then numbered
+  else tnl_before_eof numbered (base + nl_count_to s 0 (str_len s) 0);
 let number_nls = fn (s: str) -> fn toks -> number_nls_at s toks 1;
 // the line a token sits on: the next newline mark in the stream ends its line
 let rec tok_line = fn toks ->
@@ -5803,7 +5878,18 @@ and parse_stmt_id = fn toks ->
             // `extend`, and reading it as the statement form left the parser
             // looking at a `.` it had no rule for. `private` already had this
             // guard; the other statement-leading names did not.
-            (match r with Cons (TP dt, _) -> (if str_eq dt "." || str_eq dt "&." then false else true) | _ -> true) then
+            (match r with Cons (TP dt, _) -> (if str_eq dt "." || str_eq dt "&." then false else true) | _ -> true) &&
+            // ⚠ ...and the same question has to be asked AFTER a parenthesised
+            //   argument list, not only right after the word: `.should` there
+            //   chains onto the call's RESULT, and ruby/spec writes exactly
+            //   that (`require_relative(@path).should == true`). Falling
+            //   through to the ordinary expression statement is the fix, and
+            //   the expression form (__builtin_require_relative) already
+            //   exists -- it joins against the loader's current directory at
+            //   RUN time rather than the written-in file at parse time, which
+            //   is the same answer except for a call inside a block that runs
+            //   after its own file finished loading.
+            (if tok_chains (after_parens r) then false else true) then
       // load a file into the same world (each file gets a fresh top-level).
       let (e, r2) = parse_expr r in
       // A `require_relative` means "next to the file I am written in", which is
@@ -21581,14 +21667,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // code as class-body statements (def defines methods of the class).
     else if (str_eq name "class_eval" || str_eq name "module_eval" || str_eq name "class_exec" || str_eq name "module_exec") && (match args with Cons (VStr _, _) -> true | _ -> false) then
       (match args with
-       | Cons (VStr code, _) ->
+       | Cons (VStr code, frest) ->
+         // the 2nd and 3rd arguments name the file and line (see eval_file_arg)
+         let ef = eval_file_arg (match frest with Cons (fv, _) -> fv | _ -> VNil) in
+         let el = eval_line_arg (match frest with Cons (_, Cons (lv, _)) -> lv | _ -> VNil) in
+         let savedpf = eval_pfile_push ef in
          let _ = set_parsing_eval (sget code) in
-         let (p2, _) = parse_stmts (lex_go (sget code) 0) Nil in
+         let toks = number_nls_at (sget code) (lex_go (sget code) 0) el in
+         let (p2, _) = parse_stmts toks Nil in
          let _ = map_set load_ctx "parsing" (mkstr "") in
          // string-form *_eval sets the lexical scope (cref) to the receiver.
          let saved = cur_lex () in let _ = set_lex c in
          let r = flow_value (register_class world c p2) in
-         let _ = set_lex saved in r
+         let _ = set_lex saved in
+         let _ = eval_pfile_pop savedpf in r
        | _ -> VClass c)
     // string-form instance_eval on a class/module runs in the receiver's
     // SINGLETON scope: a constant assigned there lands in the singleton
@@ -21865,6 +21957,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with
           | Cons (VStr ph, _) -> VBool (run ("test -d " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
           | _ -> VBool false)
+       // File.symlink(old, new): symlink(2), which answers 0 or -1.
+       // ⚠ there is no errno reader here, so the failure is classified by
+       //   asking the filesystem the one question that distinguishes the
+       //   common two: a link path that already exists is EEXIST, anything
+       //   else is reported as ENOENT. A third cause (EACCES, say) is
+       //   therefore named wrongly -- said here rather than left to be
+       //   discovered.
+       else if str_eq name "symlink" then
+         (match args with
+          | Cons (VStr a9, Cons (VStr b9, _)) ->
+            (let src = sget a9 in let dst = sget b9 in
+             if symlink src dst == 0 then VInt 0
+             else if file_exists dst then
+               raise_exc world "Errno::EEXIST" ("File exists @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")")
+             else
+               raise_exc world "Errno::ENOENT" ("No such file or directory @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")"))
+          | _ -> VInt 0)
        // File.symlink?: the shell's test, as directory? above (bundler asks it
        // of every load path entry while resolving a Gemfile).
        else if str_eq name "symlink?" then
@@ -21942,6 +22051,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | _ -> VBool false)
     else if str_eq c "Dir" then
       (if str_eq name "pwd" || str_eq name "getwd" then mkstr (env_get "PWD")
+       // Dir.chdir(path) with no block: move and stay. The block form is in
+       // invoke_with_block, and both go through dir_chdir_to.
+       else if str_eq name "chdir" then
+         (let tgt = (match args with Cons (VStr ph, _) -> sget ph | _ -> env_get "HOME") in
+          if dir_chdir_to tgt == 0 then VInt 0
+          else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir - " ++ tgt))
        else if str_eq name "mkdir" then
          (match args with
           | Cons (VStr ph, _) -> (let _ = run ("mkdir -p " ++ shq (sget ph)) in VInt 0)
@@ -26467,6 +26582,19 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           VProc id)
        // File.open(path, mode) { |f| ... }: open, run the block with the
        // handle, flush/close on exit, return the block's value.
+       // Dir.chdir(path) { }: move, run the block, and move BACK -- including
+       // when the block raises, which is what the ensure is for. Answers the
+       // block's value, as ruby does. The move itself is dir_chdir_to, shared
+       // with the blockless form.
+       else if str_eq c "Dir" && str_eq name "chdir" then
+         (let tgt = (match args with Cons (VStr ph, _) -> sget ph | _ -> env_get "HOME") in
+          let back = env_get "PWD" in
+          if (if dir_chdir_to tgt == 0 then false else true) then
+            raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir - " ++ tgt)
+          else
+            let r = try_or (fn (u: unit) -> flow_value (run_block world blk newblk (Cons (mkstr tgt, Nil)))) VNil in
+            let _ = dir_chdir_to back in
+            r)
        else if str_eq c "File" && (str_eq name "open" || str_eq name "new") then
          (let fobj = file_open_obj world (path_args (false, (Nil : str list), (Nil : Stmt list), env) world "open" args) in
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
@@ -27369,13 +27497,20 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // with self rebound to the receiver (a fresh scope, like Ruby).
   else if (str_eq name "instance_eval" || str_eq name "instance_exec") && (match args with Cons (VStr _, _) -> true | _ -> false) then
     (match args with
-     | Cons (VStr code, _) ->
+     | Cons (VStr code, frest) ->
        let code = sget code in
+       // the 2nd and 3rd arguments name the file and line (see eval_file_arg)
+       let ef = eval_file_arg (match frest with Cons (fv, _) -> fv | _ -> VNil) in
+       let el = eval_line_arg (match frest with Cons (_, Cons (lv, _)) -> lv | _ -> VNil) in
+       let savedpf = eval_pfile_push ef in
        let _ = set_parsing_eval code in
-       let toks = number_nls code (lex_go code 0) in
+       let toks = number_nls_at code (lex_go code 0) el in
        let _ = parse_line_reset (count_nls toks) in
        let (p2, _) = parse_stmts toks Nil in
        let _ = map_set load_ctx "parsing" (mkstr "") in
+       // pfile is a PARSE-time slot (see parse_time_file), so it comes back
+       // down as soon as the parse is over -- the body runs without it.
+       let _ = eval_pfile_pop savedpf in
        if imm_no_singleton recv && body_defines p2 then raise_exc world "TypeError" "can't define singleton"
        else
        let env2 = map_new () in
@@ -36149,7 +36284,11 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   else if str_eq name "__builtin_relpath" && (match args with Cons (VStr _, Cons (_, _)) -> true | _ -> false) then
     (match args with
      | Cons (VStr fh, Cons (pv, _)) ->
-       (let p = (match pv with VStr ph -> sget ph | other -> to_s other) in
+       // ⚠ the fourth door. `to_s` on a non-String turned `require_relative(42)`
+       //   into the path "42" and a LoadError; ruby refuses with TypeError
+       //   before it ever looks at the filesystem.
+       (let p = require_path_of env world pv in
+        if str_eq p "" then VNil else
         if str_len p > 0 && str_eq (char_at p 0) "/" then mkstr p
         else (let d0 = dirname_of (sget fh) in
               let d = (if str_len d0 > 0 && str_eq (char_at d0 0) "/" then d0
@@ -36158,19 +36297,23 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
               mkstr (d ++ "/" ++ p)))
      | _ -> VNil)
   else if (str_eq name "__builtin_require" || str_eq name "__builtin_require_relative") &&
-          (match args with Cons (VStr _, _) -> true | _ -> false) then
+          (match args with Cons (_, _) -> true | _ -> false) then
     (match args with
-     | Cons (VStr ph, _) ->
-       (match do_require env world noblk (str_eq name "__builtin_require_relative") (sget ph) with
+     | Cons (a9, _) ->
+       (let ph9 = require_path_of env world a9 in
+        if str_eq ph9 "" then VNil
+        else match do_require env world noblk (str_eq name "__builtin_require_relative") ph9 with
         | FNext v -> v
         | _ -> VNil)
      | _ -> VNil)
   // expression-position require("x") / require_relative("x") (the statement
   // forms parse as SRequire; parenthesized calls arrive here).
-  else if (str_eq name "require" || str_eq name "require_relative") && (match args with Cons (VStr _, _) -> true | _ -> false) then
+  else if (str_eq name "require" || str_eq name "require_relative") && (match args with Cons (_, _) -> true | _ -> false) then
     (match args with
-     | Cons (VStr ph, _) ->
-       (match exec_stmt env world noblk (SRequire (str_eq name "require_relative", EStrL (sget ph))) with
+     | Cons (a8, _) ->
+       (let ph = require_path_of env world a8 in
+        if str_eq ph "" then VNil else
+        match exec_stmt env world noblk (SRequire (str_eq name "require_relative", EStrL ph)) with
         | FNext v -> v
         | FRaise _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
         | _ -> VNil)
@@ -38138,6 +38281,18 @@ and env_cache_fill = fn (ps: (str * str) list) ->
   match ps with
   | Nil -> ()
   | Cons ((k, v), t) -> let _ = map_set env_cache k (mkstr v) in env_cache_fill t
+// Dir.chdir: the process's cwd and the PWD this interpreter reads are ONE
+// fact, so they move together. File.expand_path, Dir.pwd, __dir__ and
+// require_relative all resolve through PWD, so changing only the process cwd
+// would leave every one of them pointing at the directory we just left.
+// ⚠ the new PWD is computed TEXTUALLY (path_norm), so a path through a
+//   symlink keeps the name it was given -- `Dir.pwd` says /tmp where ruby,
+//   which asks getcwd(3), says /private/tmp. Same limit File.realpath has.
+and dir_chdir_to = fn (p: str) ->
+  let abs = (if str_len p > 0 && str_eq (char_at p 0) "/" then p else env_get "PWD" ++ "/" ++ p) in
+  let rc = chdir p in
+  let _ = (if rc == 0 then (let _ = map_set env_cache "PWD" (mkstr (path_norm abs)) in ()) else ()) in
+  rc
 and env_is_set = fn (k2: str) ->
   let _ = env_load () in map_has env_cache k2
 and env_get = fn (k2: str) ->
@@ -41629,6 +41784,33 @@ and cpx_realize_args = fn world -> fn (args: Val list) ->
 //
 // The no-block value comes from the caller: this runs at the dispatch head,
 // before the local one is built.
+// What `require` accepts as a path, in ruby's words: a String is itself, and
+// anything else is asked for #to_path and then #to_str -- refusing with
+// TypeError when neither answers a String. ⚠ THREE doors led to do_require and
+// each treated a non-String differently: the statement form answered nil in
+// silence, and the two builtin arms matched only `Cons (VStr _, _)` so a
+// MockObject fell past them and was reported as an undefined method named
+// __builtin_require_relative. One rule, one place.
+and require_path_of = fn env -> fn world -> fn (v: Val) ->
+  (match v with
+   | VStr h9 -> sget h9
+   | _ ->
+     (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+      let cls9 = dispatch_cls_of world v in
+      // ⚠ the two conversions CHAIN, they are not alternatives: #to_path is
+      //   asked first, and whatever it answers is then asked for #to_str if it
+      //   is not already a String. An object whose #to_path returns another
+      //   object is converted twice, and ruby/spec has that exact case.
+      let via = (if has_meth world cls9 "to_path" then invoke world nb9 v cls9 "to_path" Nil else v) in
+      let via = (match via with
+                 | VStr _ -> via
+                 | _ -> (let c8 = dispatch_cls_of world via in
+                         if has_meth world c8 "to_str" then invoke world nb9 via c8 "to_str" Nil else via)) in
+      match via with
+      | VStr h9 -> sget h9
+      | _ -> (let _ = raise_exc world "TypeError"
+                ("no implicit conversion of " ++ conv_name v ++ " into String") in "")))
+
 and to_path_str = fn nb -> fn world -> fn (v: Val) ->
   (match v with
    | VObj _ ->
@@ -45001,6 +45183,24 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
 // The loader behind `require` / `require_relative`: resolve the path, run the
 // file once, and record it. Reached through Kernel#require (see SRequire), so
 // a replaced `require` can still get here by calling the original.
+// Is this feature already loaded? ⚠ the answer is $LOADED_FEATURES and only
+// $LOADED_FEATURES, because that array is RUBY-VISIBLE and ruby code edits it:
+// ruby/spec's code_loading fixture saves it in a before block and does
+// `$LOADED_FEATURES.replace @saved` in the after block, which is how a spec
+// requires the same fixture in ten examples in a row. Answering from a private
+// map instead made the second example onward return false with nothing loaded
+// -- one fact, two representations, and only one of them was reachable from
+// the program. `loaded_files` is kept as bookkeeping (a GC root walk and a
+// diagnostic row read it); it is NOT the answer to this question.
+and feature_loaded = fn (full: str) ->
+  (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
+   | VArr lfid -> val_strs_have (deref lfid) full
+   | _ -> false)
+and val_strs_have = fn (xs: Val list) -> fn (t: str) ->
+  match xs with
+  | Nil -> false
+  | Cons (VStr h9, r9) -> (if str_eq (sget h9) t then true else val_strs_have r9 t)
+  | Cons (_, r9) -> val_strs_have r9 t
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
      let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
      let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
@@ -45033,7 +45233,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                  if str_len n0 > 0 && str_eq (char_at n0 0) "/" then n0
                  else path_norm (env_get "PWD" ++ "/" ++ n0)) in
      let _ = (if gc_log_on () then print_err ("gc: require " ++ full) else ()) in
-     if map_has loaded_files full then FNext (VBool false)
+     if feature_loaded full then FNext (VBool false)
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
      // mere-ruby has no build to describe, so RbConfig::CONFIG is seeded at
      // startup and the require is satisfied here rather than searched for.
@@ -45700,7 +45900,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
         else if map_has meths0 ("Object#" ++ mname) then FNext (invoke world blk self0 "Object" mname (Cons (VStr p0, Nil)))
         else if map_has meths0 ("Kernel#" ++ mname) then FNext (invoke world blk self0 "Kernel" mname (Cons (VStr p0, Nil)))
         else do_require env world blk rel (sget p0))
-     | _ -> FNext VNil)
+     // ...and a non-String argument is NOT nothing: require_path_of asks it
+     // for #to_path / #to_str and refuses with TypeError. Answering nil here
+     // in silence was the quietest of the three doors.
+     | other9 ->
+       (let ph9 = require_path_of env world other9 in
+        if str_eq ph9 "" then FNext VNil
+        else do_require env world blk rel ph9))
   | SReturn e ->
     let v = eval_e env world blk e in
     // a bare `return` directly inside a Thread.new block cannot return across
