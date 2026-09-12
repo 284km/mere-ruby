@@ -69,8 +69,15 @@ while read -r f; do
   #   137 files that way and reported the other 49 as if they were all of them.
   #   A tally that does not match `total` is the only thing that catches it,
   #   which is why the count is printed at the end.
-  lines=$(env MERE_SPEC_VERBOSE=1 MR_BIN="$mr" sh "$here"/run_spec.sh "$spec/$f" 2>&1 < /dev/null \
-          | sed -n '2,8p' | grep -aE '^(FAILED|ERROR|pass=)' | head -4)
+  env MERE_SPEC_VERBOSE=1 MR_BIN="$mr" sh "$here"/run_spec.sh "$spec/$f" 2>&1 < /dev/null > "$tmp/run"
+  # ⚠ THE TALLY GOES IN FIRST, ALWAYS. The causes below are a SAMPLE -- at most
+  #   four, off the top of the diff -- and a file showing three of them can have
+  #   sixty. Reading the sample as the whole list is how core/array/sample came
+  #   to look like a statistics problem when Array#sample was ignoring its
+  #   count argument outright. The two tallies are mere-ruby's and ruby's.
+  tally=$(grep -aE '^pass=' "$tmp/run" | head -2 | tr '\n' ' ' | sed 's/  *$//')
+  [ -n "$tally" ] && printf '%s\t%s\n' "$f" "$(printf '%s' "$tally" | strip_noise)" >> "$tmp/out"
+  lines=$(sed -n '2,8p' "$tmp/run" | grep -aE '^(FAILED|ERROR)' | head -4)
   if [ -z "$lines" ]; then
     printf '%s\t(nothing failed -- the record may be stale)\n' "$f" >> "$tmp/out"
   else

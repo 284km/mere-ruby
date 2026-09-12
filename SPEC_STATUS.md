@@ -18,7 +18,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 |---|---|---|---|---|---|---|
 | language | 43 | 24 | 0 | 0 | 0 | 67 |
 | core/string | 111 | 3 | 0 | 0 | 0 | 114 |
-| core/array | 99 | 5 | 0 | 0 | 1 | 105 |
+| core/array | 100 | 4 | 0 | 0 | 1 | 105 |
 | core/hash | 64 | 5 | 0 | 0 | 0 | 69 |
 | core/range | 30 | 5 | 0 | 0 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |

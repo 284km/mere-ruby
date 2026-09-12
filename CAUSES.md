@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 150 files.
+Classified: 149 files.
 
-## DIFF — 150 files, 70 kinds
+## DIFF — 149 files, 70 kinds
 
 | files | kind |
 |---|---|
@@ -34,7 +34,6 @@ Classified: 150 files.
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected SyntaxError to be raised` |
-| 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got nil` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -48,7 +47,6 @@ Classified: 150 files.
 | 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
 | 1 | `FAILED expected truthy from #>` |
-| 1 | `FAILED expected truthy from #<=` |
 | 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected to receive #respond_to_missing?` |
@@ -64,11 +62,13 @@ Classified: 150 files.
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
+| 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
 | 1 | `FAILED expected ThreadError to be raised` |
 | 1 | `FAILED expected RangeError to be raised` |
+| 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
@@ -96,7 +96,6 @@ Classified: 150 files.
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
-| 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=24 fail=1 err=0` |
@@ -116,7 +115,6 @@ Classified: 150 files.
 | 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: stores unequal keys that hash to the same value: expected to receive #hash` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
-| 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
 | 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
@@ -131,6 +129,8 @@ Classified: 150 files.
 | 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
 | 1 | `FAILED: returns 'method' if the method is defined: expected "method", got nil` |
 | 1 | `FAILED: returned Enumerator size returns nil: expected nil, got 1` |
+| 1 | `FAILED: reports the same arity as the given block: expected [2], got [-2]` |
+| 1 | `FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true` |
 
 </details>
 
