@@ -224,7 +224,13 @@ type Val = VInt of int | VFlt of float | VStr of int | VBool of bool
          | VExc of str * str    // exception: class name, message
          | VProc of int         // a proc/lambda: a handle into proc_store
          | VBind of int         // a Binding: a handle into bind_store (captured env)
-         | VRegex of str * str  // /pattern/flags (minimal matcher)
+         // /pattern/flags, plus the ENCODING the value carries ("" = derive it
+         // from the source and flags). A Regexp built from a String keeps that
+         // string's encoding, and (source, flags) cannot hold it: every
+         // `Regexp.new(s, Regexp::FIXEDENCODING)` over an ASCII-only source has
+         // the SAME source and flags whatever s was encoded in, so a side table
+         // keyed by the two answered whichever was built last.
+         | VRegex of str * str * str
          | VMain;               // the top-level `self` (main), class Object
 
 // A user method: parameter names, defaults ((name, default-expr) for
@@ -1058,12 +1064,6 @@ let rx_gbodies = map_new ();
 // Per compiled pattern (same key as rx_progs): its named groups, as
 // "name=number|name=number|...". A MatchData answers `m[:name]` from this.
 let rx_prog_names = map_new ();
-// Per compiled pattern (same key again): the encoding a STRING contributed to
-// it. A Regexp's encoding is otherwise derived from its source bytes, which
-// can only ever guess UTF-8 -- `/#{s}/` where s is EUC-JP is an EUC-JP Regexp,
-// and nothing in (source, flags) says so. Only set when the source is not
-// 7-bit: ruby IGNORES the argument's encoding for an all-ASCII pattern.
-let rx_src_enc = map_new ();
 // the cache key of the pattern currently being matched, so the MatchData it
 // publishes can name its groups.
 let rx_cur = map_new ();
@@ -2917,17 +2917,61 @@ and rx_src_nonascii = fn (p: str) -> fn (i: int) ->
 // an explicit modifier names the encoding outright, `/n` means BYTES, and
 // otherwise a pattern that names a non-ASCII character is in the script's
 // encoding. `fixed_encoding?` is exactly "the answer is not US-ASCII".
-// is any of these union arguments a BINARY (ASCII-8BIT) string?
-and rx_alts_enc = fn (xs: Val list) ->
+// What Regexp.union's arguments say about the union's encoding, and whether
+// they contradict each other. THREE accumulators, not one, and they are
+// re-checked after EVERY argument rather than at the end:
+//
+//   asciionly  some argument yields -- ASCII-only text in an ascii-compatible
+//              encoding, or a Regexp that does not fix one
+//   inc        an argument in an ASCII-INCOMPATIBLE encoding (UTF-16/32)
+//   fix        an argument that FIXES an ascii-compatible encoding: a
+//              fixed_encoding? Regexp, or a String carrying a non-ASCII byte
+//
+// Two arguments landing in the same accumulator with different encodings is
+// "incompatible encodings: A and B", naming the one already accumulated first.
+// An ASCII-incompatible argument beside anything else is a refusal too, and
+// WHICH refusal depends on what the other side was: "ASCII incompatible
+// encoding: X" against a yielding argument, "incompatible encodings: X and Y"
+// against one that fixes. Answers ("", "", "") when nothing is contradicted;
+// the third element is the message, "" for none.
+and rx_union_scan = fn (xs: Val list) -> fn (asciionly: bool) -> fn (inc: str) -> fn (fix: str) ->
   match xs with
-  | Nil -> ""
-  | Cons (VStr h9, t9) ->
-    (let e9 = enc_canon_name (senc_get h9) in
-     // ...either because the encoding itself cannot be read as ASCII, or
-     // because this argument actually carries a byte that is not.
-     if (if enc_ascii_compat e9 then false else true) || (if enc_all7 (sget h9) then false else true)
-     then e9 else rx_alts_enc t9)
-  | Cons (_, t9) -> rx_alts_enc t9
+  | Nil -> (inc, fix, "")
+  | Cons (h9, t9) ->
+    (let (e9, fixes9) =
+       (match h9 with
+        // a Regexp fixes its encoding exactly when that encoding is not
+        // US-ASCII -- which is what #fixed_encoding? answers (see rx_enc_name).
+        | VRegex (p9, f9, ev9) ->
+          (let n9 = rx_enc_name p9 f9 ev9 in
+           (n9, str_contains f9 "u" || (if str_eq n9 "US-ASCII" then false else true)))
+        | VStr s9 -> (let n9 = enc_canon_name (senc_get s9) in (n9, (if enc_all7 (sget s9) then false else true)))
+        | VSym s9 -> (let n9 = enc_canon_name (sym_enc_name s9) in (n9, (if enc_all7 s9 then false else true)))
+        | _ -> ("US-ASCII", false)) in
+     let incompat9 = (if enc_ascii_compat e9 then false else true) in
+     let (ao2, inc2, fix2, err2) =
+       (if incompat9 then
+          (if str_eq inc "" then (asciionly, e9, fix, "")
+           else if str_eq inc e9 then (asciionly, inc, fix, "")
+           else (asciionly, inc, fix, "incompatible encodings: " ++ inc ++ " and " ++ e9))
+        else if fixes9 then
+          (if str_eq fix "" then (asciionly, inc, e9, "")
+           else if str_eq fix e9 then (asciionly, inc, fix, "")
+           else (asciionly, inc, fix, "incompatible encodings: " ++ fix ++ " and " ++ e9))
+        else (true, inc, fix, "")) in
+     if (if str_eq err2 "" then false else true) then (inc2, fix2, err2)
+     else if (if str_eq inc2 "" then false else true) && ao2 then
+       (inc2, fix2, "ASCII incompatible encoding: " ++ inc2)
+     else if (if str_eq inc2 "" then false else true) && (if str_eq fix2 "" then false else true) then
+       (inc2, fix2, "incompatible encodings: " ++ inc2 ++ " and " ++ fix2)
+     else rx_union_scan t9 ao2 inc2 fix2)
+// What ONE value contributes, read off the same scan: the ASCII-incompatible
+// encoding if it is in one, else the ascii-compatible encoding it fixes, else
+// "" for an argument that yields. Regexp.new and the `/#{...}/` desugaring ask
+// this about their single source string, so they cannot drift from union.
+and rx_one_enc = fn (v: Val) ->
+  (match rx_union_scan (Cons (v, Nil)) false "" "" with
+   | (inc9, fix9, _) -> (if str_eq inc9 "" then fix9 else inc9))
 and rx_alts_binary = fn (xs: Val list) ->
   match xs with
   | Nil -> false
@@ -2937,15 +2981,21 @@ and rx_alts_binary = fn (xs: Val list) ->
   // patterns rather than strings only looked at the strings, so a union with
   // `/[\x80-\xBF]/n` in it -- a BINARY pattern -- came out UTF-8 whatever
   // order the arguments were written in.
-  | Cons (VRegex (p9, f9), t9) ->
-    (if str_eq (rx_enc_name p9 f9) "ASCII-8BIT" then true else rx_alts_binary t9)
+  | Cons (VRegex (p9, f9, ev9), t9) ->
+    (if str_eq (rx_enc_name p9 f9 ev9) "ASCII-8BIT" then true else rx_alts_binary t9)
   | Cons (_, t9) -> rx_alts_binary t9
-and rx_enc_name = fn (p: str) -> fn (fl: str) ->
-  if str_contains fl "u" then "UTF-8"
+and rx_enc_name = fn (p: str) -> fn (fl: str) -> fn (e: str) ->
+  // ⚠ The encoding the VALUE carries wins over anything derivable. `u` alone
+  // carries two different claims -- as a literal modifier (`/x/u`) it names
+  // UTF-8, as Regexp::FIXEDENCODING it says "keep the SOURCE STRING's
+  // encoding", which is whatever that string had. Only the builder that read
+  // that string knows which, so it says so in the value rather than in a table
+  // keyed by (source, flags), which cannot tell two such patterns apart.
+  if (if str_eq e "" then false else true) then e
+  else if str_contains fl "u" then "UTF-8"
   else if str_contains fl "e" then "EUC-JP"
   else if str_contains fl "s" then "Windows-31J"
   else if str_contains fl "n" then (if rx_src_nonascii p 0 then "ASCII-8BIT" else "US-ASCII")
-  else if map_has rx_src_enc (fl ++ chr 1 ++ p) then map_get rx_src_enc (fl ++ chr 1 ++ p)
   else if rx_src_nonascii p 0 then "UTF-8"
   else "US-ASCII"
 
@@ -7958,7 +8008,7 @@ and rb_eq_go = fn (va: Val) -> fn (vb: Val) ->
   // of them for an ASCII-only pattern -- it says how to read the bytes, and
   // there is nothing to read differently -- so ruby answers true for
   // `/x/ == Regexp.new("x", Regexp::NOENCODING)`.
-  | VRegex (p, pf) -> (match vb with VRegex (q, qf) -> str_eq p q && str_eq (rx_cmp_flags p pf) (rx_cmp_flags q qf) | _ -> false)
+  | VRegex (p, pf, _) -> (match vb with VRegex (q, qf, _) -> str_eq p q && str_eq (rx_cmp_flags p pf) (rx_cmp_flags q qf) | _ -> false)
   | VProc x -> (match vb with VProc y -> x == y | _ -> false)
   | VBind x -> (match vb with VBind y -> x == y | _ -> false)
 
@@ -8823,7 +8873,7 @@ let rec val_hash = fn (v: Val) ->
   | VCpx (cre, cim) -> floor_mod (val_hash cre * 31 + val_hash cim * 7 + 6007) 1000000007
   // A Regexp is its SOURCE AND ITS OPTIONS: /x/ and /x/i are different
   // patterns, and hashing only the source made them one key.
-  | VRegex (sp, fl) ->
+  | VRegex (sp, fl, _) ->
     floor_mod (str_hash_go sp 0 7 * 31
                + (if str_contains fl "i" then 1 else 0)
                + (if str_contains fl "x" then 2 else 0)
@@ -8943,7 +8993,7 @@ let conv_name = fn (v: Val) ->
   | VStr _ -> "String" | VSym _ -> "Symbol"
   | VArr _ -> "Array" | VHsh _ -> "Hash"
   | VRat (_, _) -> "Rational" | VCpx (_, _) -> "Complex"
-  | VRegex (_, _) -> "Regexp" | VProc _ -> "Proc"
+  | VRegex (_, _, _) -> "Regexp" | VProc _ -> "Proc"
   | VRange (_, _, _) -> "Range" | VClass _ -> "Class"
   | _ -> "Object";
 // The two shapes CRuby uses: a container/string wants a conversion of its
@@ -12018,7 +12068,7 @@ and to_s = fn (v: Val) ->
                    else "Class") in
        "#<" ++ kind ++ ":0x" ++ hex16_of (anon_addr_of c) ++ ">")
     else c
-  | VRegex (p, fl) ->
+  | VRegex (p, fl, _) ->
     // Regexp#to_s: "(?<on>-<off>:body)" with the m,i,x flags split by state.
     (match rx_collapse_opt_group p with
      | (coll9, gon9, goff9, body9) ->
@@ -12147,7 +12197,7 @@ and inspect = fn (v: Val) ->
     "(" ++ (match r with VRat _ -> "(" ++ to_s r ++ ")" | _ -> to_s r)
         ++ (if num_isneg_signed i then "-" else "+")
         ++ (match ia with VRat _ -> "(" ++ to_s ia ++ ")*i" | _ -> to_s ia ++ cpx_im_tail ia) ++ ")"
-  | VRegex (p, fl) ->
+  | VRegex (p, fl, _) ->
     // Regexp#inspect shows the m,i,x flags in canonical order.
     // ruby prints the flags in the order "mixn", and `n` is one of them: it
     // was dropped here, so `/x/n.inspect` read `/x/` -- a literal that means
@@ -12271,7 +12321,7 @@ and rx_union_go = fn (xs: Val list) -> fn (acc: str) -> fn (first: bool) ->
   | Nil -> acc
   | Cons (h, t) ->
     let piece = (match h with
-                 | VRegex (_, _) -> to_s h
+                 | VRegex (_, _, _) -> to_s h
                  | VStr s -> rx_escape (sget s)
                  | VSym s -> rx_escape s
                  | other -> rx_escape (to_s other)) in
@@ -13246,7 +13296,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let r = invoke_val_c env world blk recv name args true in
        // an attribute-writer (`recv&.foo = v`) yields the assigned value.
        if is_setter_name name then (match rev_app args Nil with Cons (v, _) -> v | _ -> r) else r)
-  | ERegex p -> VRegex p
+  // a LITERAL carries no encoding of its own: it is derived from the source
+  // text and the modifiers, which is what rx_enc_name does for "".
+  | ERegex (p9, f9) -> VRegex (p9, f9, "")
   | EYield arges ->
     let args = eval_args env world blk arges in
     let (has, bparams, bbody, cenv) = blk in
@@ -14111,7 +14163,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                               // a capture index whose #to_int answered a
                               // non-Integer is ruby's own conversion error.
                               match cv with
-                              | Cons (VRegex (_, _), Cons (VObj o2, Cons (_, Nil))) ->
+                              | Cons (VRegex (_, _, _), Cons (VObj o2, Cons (_, Nil))) ->
                                 (if responds world (VObj o2) "to_int" then
                                    (let nb2 = (false, (Nil : str list), (Nil : Stmt list), env) in
                                     match invoke_val_c env world nb2 (VObj o2) "to_int" Nil false with
@@ -14130,7 +14182,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                         // (see there). Two callers of is_str_mut, two places.
                         else if str_eq name "append_as_bytes" then args
                         else coerce_dyck_args env world recv args) in
-            (if str_eq name "slice!" && (match args with Cons (VRegex (_, _), _) -> true | _ -> false)
+            (if str_eq name "slice!" && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
              then str_slice_bang_rx env world h args
              else str_mut_do h name args)
           | _ -> VNil)
@@ -14492,7 +14544,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        | VStr sv0 ->
          (let sv = sget sv0 in
           match vb with
-          | VRegex (p, pf) -> rx_do_match world p pf sv (senc_get sv0)
+          | VRegex (p, pf, _) -> rx_do_match world p pf sv (senc_get sv0)
           // string =~ string is ruby's own type mismatch; any OTHER object
           // is asked for ITS #=~ with self (a mock's stubbed =~ answers).
           | VStr _ -> raise_exc world "TypeError" "type mismatch: String given"
@@ -14506,15 +14558,15 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              then invoke world nb (VObj oq) oclq "method_missing" (Cons (VSym "=~", Cons (va0, Nil)))
              else VNil)
           | _ -> VNil)
-       | VSym sv -> (match vb with VRegex (p, pf) -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
-       | VRegex (p, pf) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
+       | VSym sv -> (match vb with VRegex (p, pf, _) -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
+       | VRegex (p, pf, _) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = vb in
        match va0 with
-       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
-       | VSym sv -> (match vb with VRegex (p, pf) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
-       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | VSym sv -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf, _) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       | VSym sv -> (match vb with VRegex (p, pf, _) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       | VRegex (p, pf, _) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | VSym sv -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
        // `!~` is `=~` negated, and Object has no #=~ since ruby 3.2: a receiver
        // that does not answer it raises rather than saying "no match". A class
        // that defines either one keeps its answer.
@@ -15107,16 +15159,16 @@ and gvar_slot = fn (k: str) ->
 // `/#{expr}/o` interpolates ONCE: the first value built at that source site
 // is the regex from then on. The site is named by the literal's offset, which
 // the lexer passes along; without the o flag nothing is remembered.
-and rx_build_once = fn (body: str) -> fn (fl: str) -> fn (args: Val list) ->
+and rx_build_once = fn (body: str) -> fn (fl: str) -> fn (enc: str) -> fn (args: Val list) ->
   if str_contains fl "o" then
     (let site = (match args with Cons (_, Cons (VInt n, _)) -> n | _ -> 0 - 1) in
-     if site < 0 then VRegex (body, fl)
+     if site < 0 then VRegex (body, fl, enc)
      else
        (let f = (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h -> sget h | _ -> "") else "") in
         let k = f ++ ":" ++ str_of_int site in
         if map_has rx_once k then map_get rx_once k
-        else (let v = VRegex (body, fl) in let _ = map_set rx_once k v in v)))
-  else VRegex (body, fl)
+        else (let v = VRegex (body, fl, enc) in let _ = map_set rx_once k v in v)))
+  else VRegex (body, fl, enc)
 
 and gvar_trace_name = fn (n: str) ->
   gvar_slot (if str_len n > 0 && str_eq (char_at n 0) "$" then substring n 1 (str_len n) else n)
@@ -15199,7 +15251,7 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
   else if str_eq slot ";" || str_eq body ";" then
     (match v with
      | VStr _ -> (let _ = gvar_write world slot v in ())
-     | VRegex (_, _) -> (let _ = gvar_write world slot v in ())
+     | VRegex (_, _, _) -> (let _ = gvar_write world slot v in ())
      | VNil -> (let _ = gvar_write world slot v in ())
      | _ -> (let _ = raise_exc world "TypeError" ("value of " ++ name ++ " must be String or Regexp") in ()))
   else if str_eq slot "." then
@@ -18513,7 +18565,7 @@ and builtin_rep_val = fn (c: str) ->
   else if str_eq c "NilClass" then VNil
   else if str_eq c "Range" then VRange (VInt 0, VInt 0, false)
   else if str_eq c "Proc" then VProc 0
-  else if str_eq c "Regexp" then VRegex ("", "")
+  else if str_eq c "Regexp" then VRegex ("", "", "")
   else VMain
 
 and is_binary_op_name = fn (s: str) ->
@@ -20521,7 +20573,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      && (if has_meth world "String" name then false else true) then
     (match recv with
      | VStr h ->
-       (if str_eq name "slice!" && (match args with Cons (VRegex (_, _), _) -> true | _ -> false)
+       (if str_eq name "slice!" && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
         then str_slice_bang_rx env world h args
         else if str_eq name "slice!" then str_mut_do h name (coerce_slice_args env world args)
         // ⚠ ...but NOT for append_as_bytes. This list decides three things at
@@ -21209,7 +21261,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // frozen. Every Regexp here is an immutable value (val_is_frozen says so),
   // so the frozen answer is the only one this model can give -- and it is the
   // one a program sees, since a literal is frozen in ruby too.
-  else if str_eq name "initialize" && (match recv with VRegex (_, _) -> true | _ -> false)
+  else if str_eq name "initialize" && (match recv with VRegex (_, _, _) -> true | _ -> false)
           && (if prim_user_has world recv "initialize" then false else true) then
     raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   else if str_eq name "initialize" && (match recv with VArr _ -> true | _ -> false)
@@ -21557,9 +21609,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         let fl = (match args with Cons (VStr f, _) -> sget f | _ -> "") in
         // the interpolated pieces already merged into ONE string with ONE
         // encoding; hand it to the pattern so #encoding can answer with it.
-        let _ = (let e9 = rx_alts_enc (Cons (recv, Nil)) in
-                 if str_eq e9 "" then () else (let _ = map_set rx_src_enc (fl ++ chr 1 ++ body) e9 in ())) in
-        if rx_validate body fl then rx_build_once body fl args
+        if rx_validate body fl then rx_build_once body fl (rx_one_enc recv) args
         // name the pattern: a runtime-built regex is usually assembled from
         // pieces, and the text is the only way to see which piece is bad.
         else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
@@ -22554,11 +22604,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       (if (opt / 16) - (opt / 32) * 2 == 1 then "u" else "")
                     | Cons (VStr fs, _) -> sget fs
                     | _ -> "") in
-          let _ = (let e9 = rx_alts_enc (Cons (VStr src, Nil)) in
-                   if str_eq e9 "" then () else (let _ = map_set rx_src_enc (fl ++ chr 1 ++ body) e9 in ())) in
-          if rx_validate body fl then rx_build_once body fl args
+          // FIXEDENCODING means "this source string's encoding", so it is kept
+          // whether or not the text would contribute one on its own:
+          // `Regexp.new("a".encode("ISO-8859-1"), Regexp::FIXEDENCODING)` is an
+          // ISO-8859-1 pattern even though every byte in it is ASCII.
+          let renc9 = (if str_contains fl "u" then enc_canon_name (senc_get src) else rx_one_enc (VStr src)) in
+          if rx_validate body fl then rx_build_once body fl renc9 args
           else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
-       | Cons (VRegex (b2, f2), _) -> VRegex (b2, f2)
+       | Cons (VRegex (b2, f2, e2), _) -> VRegex (b2, f2, e2)
        | Cons (other9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name other9 ++ " into String")
        | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
     // Regexp.last_match / .last_match(n): the same MatchData `$~` holds, which
@@ -22594,13 +22647,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // for a program's own classes, and it was nailed shut.
     else if str_eq c "Regexp" && str_eq name "try_convert" then
       (match args with
-       | Cons (VRegex (a9, b9), _) -> VRegex (a9, b9)
+       | Cons (VRegex (a9, b9, e9), _) -> VRegex (a9, b9, e9)
        | Cons (VObj _, _) ->
          (match args with
           | Cons (o9, _) ->
             (if responds world o9 "to_regexp"
              then (match invoke_val_c env world blk o9 "to_regexp" Nil false with
-                   | VRegex (a9, b9) -> VRegex (a9, b9)
+                   | VRegex (a9, b9, e9) -> VRegex (a9, b9, e9)
                    | VNil -> VNil
                    | bad9 ->
                      (let cn9 = display_cls_msg world (dispatch_cls_of world o9) in
@@ -22624,7 +22677,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // PATTERN: a backreference or a lookaround is what makes one non-linear.
     else if str_eq c "Regexp" && str_eq name "linear_time?" then
       (let src9 = (match args with
-                   | Cons (VRegex (sp9, _), _) -> sp9
+                   | Cons (VRegex (sp9, _, _), _) -> sp9
                    | Cons (VStr sh9, _) -> sget sh9
                    | _ -> "") in
        // a lookaround IS linear (ruby answers true for one); a backreference
@@ -22635,9 +22688,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Regexp" && str_eq name "union" then
       // one array argument or a varargs list; no alternatives at all is the
       // never-matching pattern.
-      (let alts = (match args with Cons (VArr id, Nil) -> deref id | _ -> args) in
+      (let alts0 = (match args with Cons (VArr id, Nil) -> deref id | _ -> args) in
+       let alts = rx_union_conv env world (match alts0 with Cons (_, Nil) -> true | _ -> false) alts0 in
        match alts with
-       | Nil -> VRegex ("(?!)", "")
+       | Nil -> VRegex ("(?!)", "", "")
        // ⚠ ONE alternative is not a union of one: ruby hands the pattern back
        // as it stands, keeping its flags -- `Regexp.union(/x/i).inspect` is
        // "/x/i" -- rather than wrapping it. Wrapping gave "(?-mix:x)" as the
@@ -22646,18 +22700,31 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // (only a REGEXP argument: a single STRING already comes out unwrapped
        // from rx_union_go, and it still has to go through the general path so
        // the encoding it contributes is recorded.)
-       | Cons (VRegex (p9, f9), Nil) -> VRegex (p9, f9)
+       | Cons (VRegex (p9, f9, e9), Nil) -> VRegex (p9, f9, e9)
        // a BINARY argument makes the union a byte pattern: ruby answers
        // ASCII-8BIT for `Regexp.union("\xff".b)`, and this answered UTF-8 --
        // the union of bytes claiming to be characters. `n` is how a pattern
        // says "bytes" here, so the flag carries the fact.
        | _ ->
-         (let usrc = rx_union_go alts "" true in
-          let ufl = (if rx_alts_binary alts then "n" else "") in
-          let ue = rx_alts_enc alts in
-          let _ = (if str_eq ue "" then ()
-                   else (let _ = map_set rx_src_enc (ufl ++ chr 1 ++ usrc) ue in ())) in
-          VRegex (usrc, ufl)))
+         (match rx_union_scan alts false "" "" with
+          | (inc9, fix9, err9) ->
+            if (if str_eq err9 "" then false else true) then raise_exc world "ArgumentError" err9
+            else
+              (let usrc = rx_union_go alts "" true in
+               // ...and with nothing contradicted, the encoding the union
+               // CARRIES: the ASCII-incompatible one if there was one, else the
+               // fixed one, else none at all. The joined SOURCE decides the last
+               // step, the way rb_enc_associate + Regexp.new do: an all-ASCII
+               // source in an ascii-compatible encoding comes back US-ASCII.
+               let renc9 = (if str_eq inc9 "" then (if str_eq fix9 "" then "ASCII-8BIT" else fix9) else inc9) in
+               // ⚠ "does the SOURCE have non-ASCII" is the regexp question, not the
+               // byte question: `[\x80-\xBF]` is ASCII bytes spelling a
+               // non-ASCII character, and reading its bytes said US-ASCII for a
+               // union that ruby answers ASCII-8BIT for.
+               let final9 = (if enc_ascii_compat renc9 && (if rx_src_nonascii usrc 0 then false else true)
+                             then "US-ASCII" else renc9) in
+               let ufl = (if str_eq final9 "ASCII-8BIT" then "n" else "") in
+               VRegex (usrc, ufl, final9))))
     // Math module functions (only sqrt-derived ones; no trig/log builtin).
     // ...only for the functions Math actually has; anything else (Module's own
     // methods, `class`, `name`, ...) falls through to the general dispatcher.
@@ -25429,7 +25496,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let key = (if map_has ivars (str_of_int id ++ "@__key")
                   then (match map_get ivars (str_of_int id ++ "@__key") with VStr h -> sget h | _ -> "") else "") in
        let i = str_find_from key (chr 1) 0 in
-       if i < 0 then VNil else VRegex (substring key (i + 1) (str_len key), substring key 0 i))
+       if i < 0 then VNil else VRegex (substring key (i + 1) (str_len key), substring key 0 i, ""))
     // #deconstruct is #captures, and #deconstruct_keys answers the named ones
     // as SYMBOL keys (nil = all of them; a name it does not have is simply not
     // in the answer, so a pattern match falls through rather than raising).
@@ -27639,7 +27706,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              let _ = (if str_eq e9 "UTF-8" && (if enc_valid_utf8 s0 then false else true)
                       then (let _ = prim_raise "ArgumentError" "invalid byte sequence in UTF-8" in ()) else ()) in
              let (pat9, pf9, okp) = (match args with
-                                     | Cons (VRegex (p9, f9), _) -> (p9, f9, true)
+                                     | Cons (VRegex (p9, f9, _), _) -> (p9, f9, true)
                                      | Cons (VStr p9, _) -> (rx_escape (sget p9), "", true)
                                      | _ -> ("", "", false)) in
              if okp == false then recv
@@ -27676,7 +27743,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          (match recv with
           | VStr s -> let se9 = senc_get s in let s = sget s in
             (match args with
-             | Cons (VRegex (pat, pf), _) ->
+             | Cons (VRegex (pat, pf, _), _) ->
                let _ = rx_scan_blk world newblk pat pf s 0 se9 in
                let _ = rb_scan_lastpub world pat pf s se9 in recv
              | Cons (VStr p, _) ->
@@ -27768,7 +27835,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                     // coerce_int_args leaves it as it found it, which the arm
                     // below then read as "no length given".
                     | Cons (a8, Cons (VObj _, Nil)) ->
-                      (if (match a8 with VRegex (_, _) -> true | _ -> false) then args
+                      (if (match a8 with VRegex (_, _, _) -> true | _ -> false) then args
                        else
                          let cv8 = coerce_int_args env world args in
                          (match cv8 with
@@ -27791,7 +27858,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                     // `s[re, "name"]` take a capture number or a capture NAME
                     // there, and a String is the right kind of second argument.
                     | Cons (a9, Cons (len9, Nil)) ->
-                      (if (match a9 with VRegex (_, _) -> true | _ -> false) then args
+                      (if (match a9 with VRegex (_, _, _) -> true | _ -> false) then args
                        else
                          match len9 with
                          | VInt _ -> args
@@ -28179,11 +28246,11 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
   else if str_eq name "=~" then
     (match recv with
-     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> rx_do_match world p pf (sget sv) (senc_get sv) | _ -> VNil)
+     | VRegex (p, pf, _) -> (match args with Cons (VStr sv, _) -> rx_do_match world p pf (sget sv) (senc_get sv) | _ -> VNil)
      | VStr sv ->
        (let se9 = senc_get sv in let sv = sget sv in
         match args with
-        | Cons (VRegex (p, pf), _) -> rx_do_match world p pf sv se9
+        | Cons (VRegex (p, pf, _), _) -> rx_do_match world p pf sv se9
         // string =~ string is ruby's own type mismatch; any OTHER object is
         // asked for ITS #=~ with self (a mock's stubbed =~ answers).
         | Cons (VStr _, _) -> raise_exc world "TypeError" "type mismatch: String given"
@@ -28404,13 +28471,13 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
            let cst = (if off < 0 then cn + off else off) in
            if cst < 0 || cst > cn then VBool false
            else (match args with
-                 | Cons (VRegex (p, pf), _) -> VBool (rx_match p pf sv)
+                 | Cons (VRegex (p, pf, _), _) -> VBool (rx_match p pf sv)
                  | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv)
                  | _ -> VBool false))
-        | Cons (VRegex (p, pf), _) -> VBool (rx_match p pf sv)
+        | Cons (VRegex (p, pf, _), _) -> VBool (rx_match p pf sv)
         | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv)
         | _ -> VBool false)
-     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | Cons (VSym sv, _) -> VBool (rx_match p pf sv) | _ -> VBool false)
+     | VRegex (p, pf, _) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | Cons (VSym sv, _) -> VBool (rx_match p pf sv) | _ -> VBool false)
      | _ -> VBool false)
   // gsub/sub with a String or Hash replacement, handled where `world` is:
   // $~ ends up holding the last (gsub) / first (sub) match, hash values go
@@ -28451,7 +28518,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   else if (str_eq name "gsub" || str_eq name "sub" || str_eq name "gsub!" || str_eq name "sub!")
           && (match recv with VStr _ -> true | _ -> false)
           && (match args with
-              | Cons (p9, Cons (_, Nil)) -> (match p9 with VStr _ -> false | VRegex (_, _) -> false | _ -> true)
+              | Cons (p9, Cons (_, Nil)) -> (match p9 with VStr _ -> false | VRegex (_, _, _) -> false | _ -> true)
               | _ -> false) then
     (match args with
      | Cons (p9, _) -> raise_exc world "TypeError" ("wrong argument type " ++ class_name p9 ++ " (expected Regexp)")
@@ -28459,9 +28526,9 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   else if (str_eq name "gsub" || str_eq name "sub" || str_eq name "gsub!" || str_eq name "sub!")
           && (match recv with VStr _ -> true | _ -> false)
           && (match args with
-              | Cons (VRegex (_, _), Cons (VStr _, Nil)) -> true
+              | Cons (VRegex (_, _, _), Cons (VStr _, Nil)) -> true
               | Cons (VStr _, Cons (VStr _, Nil)) -> true
-              | Cons (VRegex (_, _), Cons (VHsh _, Nil)) -> true
+              | Cons (VRegex (_, _, _), Cons (VHsh _, Nil)) -> true
               | Cons (VStr _, Cons (VHsh _, Nil)) -> true
               | _ -> false) then
     (match recv with
@@ -28472,7 +28539,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
         let _ = (if str_eq e0 "UTF-8" && (if enc_valid_utf8 s0 then false else true)
                  then (let _ = prim_raise "ArgumentError" "invalid byte sequence in UTF-8" in ()) else ()) in
         let (pat, pf) = (match args with
-                         | Cons (VRegex (p9, f9), _) -> (p9, f9)
+                         | Cons (VRegex (p9, f9, _), _) -> (p9, f9)
                          | Cons (VStr p9, _) -> (rx_escape (sget p9), "")
                          | _ -> ("", "")) in
         let repv = (match args with Cons (_, Cons (rv, _)) -> rv | _ -> VNil) in
@@ -28530,13 +28597,13 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // and every piece carries the receiver's encoding; the prim below has no
   // world for either, so wrap it here.
   else if str_eq name "scan" && (match recv with VStr _ -> true | _ -> false)
-          && (match args with Cons (VRegex (_, _), _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+          && (match args with Cons (VRegex (_, _, _), _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     (match recv with
      | VStr h ->
        (let e = enc_canon_name (senc_get h) in
         let sv = sget h in
         let (pat, pf) = (match args with
-                         | Cons (VRegex (p9, f9), _) -> (p9, f9)
+                         | Cons (VRegex (p9, f9, _), _) -> (p9, f9)
                          | Cons (VStr p9, _) -> (rx_escape (sget p9), "")
                          | _ -> ("", "")) in
         let items = rx_scan_all2 pat pf sv 0 in
@@ -28551,12 +28618,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // published (or cleared) around it -- 'hello'[/.(.)/, 1] leaves $~ set.
   else if (str_eq name "[]" || str_eq name "slice")
           && (match recv with VStr _ -> true | _ -> false)
-          && (match args with Cons (VRegex (_, _), _) -> true | _ -> false) then
+          && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false) then
     (match recv with
      | VStr h ->
        (let s = sget h in
         let _ = (match args with
-                 | Cons (VRegex (p, pf), _) ->
+                 | Cons (VRegex (p, pf, _), _) ->
                    (match rxv_search p pf s 0 with
                     | RHit (st, en, saves) ->
                       (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
@@ -28572,12 +28639,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   else if (str_eq name "index" || str_eq name "rindex" || str_eq name "byteindex" || str_eq name "byterindex"
            || str_eq name "partition" || str_eq name "rpartition")
           && (match recv with VStr _ -> true | _ -> false)
-          && (match args with Cons (VRegex (_, _), _) -> true | _ -> false) then
+          && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false) then
     (match recv with
      | VStr h ->
        let sv = sget h in
        (match args with
-        | Cons (VRegex (p, pf), rest) ->
+        | Cons (VRegex (p, pf, _), rest) ->
           // a regexp whose SOURCE bytes are not valid UTF-8 was compiled in
           // another encoding: matching it against a UTF-8 string is ruby's
           // CompatibilityError (the exact foreign encoding is not tracked).
@@ -28644,12 +28711,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | VStr h ->
        let sv = sget h in
        (match args with
-        | Cons (VRegex (p, pf), Cons (VInt off, _)) ->
+        | Cons (VRegex (p, pf, _), Cons (VInt off, _)) ->
           let cn = utf8_len sv in
           let cst = (if off < 0 then cn + off else off) in
           if cst < 0 || cst > cn then VNil
           else hit p pf (substring sv (utf8_boff sv cst 0) (str_len sv)) (senc_get h)
-        | Cons (VRegex (p, pf), _) -> hit p pf sv (senc_get h)
+        | Cons (VRegex (p, pf, _), _) -> hit p pf sv (senc_get h)
         | Cons (VStr p, _) -> hit (sget p) "" sv (senc_get h)
         // a Regexp SUBCLASS instance (an object with its own #match) decides
         // itself: ruby calls pattern.match(self).
@@ -28663,7 +28730,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
         // upstream) refuses in the pattern's words.
         | Cons (other, _) -> prim_raise "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Regexp)")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
-     | VRegex (p, pf) ->
+     | VRegex (p, pf, _) ->
        (match args with
         // ⚠ `re.match(str, pos)` starts AT pos, in characters, and a negative
         // one counts from the end -- `String#match` has honoured its second
@@ -28764,7 +28831,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
           (match ps with
            | Nil -> VBool false
            | Cons (VStr ph, t9) -> (if hit1 (sget ph) then VBool true else go t9)
-           | Cons (VRegex (pat, pf), t9) ->
+           | Cons (VRegex (pat, pf, _), t9) ->
              (if starts then
                 // a match must begin AT 0, and a miss leaves $~ nil -- which
                 // is what ruby leaves behind for a pattern that matched later
@@ -29128,6 +29195,44 @@ and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
 // method_missing-based object, so [obj].flatten kept the object instead of
 // flattening what its method_missing returns. Answers nil for "not
 // convertible", which is also what a #to_ary answering nil means.
+// An argument that is neither a Regexp nor a String is CONVERTED, not printed:
+// #to_regexp first, then #to_str, and a TypeError naming the class when it
+// offers neither. Quoting its #to_s instead made `Regexp.union(obj, "bar")`
+// the pattern /\#<object>|bar/ -- and accepted a Symbol and an Integer, which
+// ruby refuses because neither answers #to_str.
+// ...named the way ruby names it: nil / true / false spell themselves, and
+// everything else answers with its CLASS -- read through the world, because
+// class_name has none and stops at "Object" for every user-defined class.
+and rx_union_refuse = fn world -> fn (v9: Val) ->
+  raise_exc world "TypeError"
+    ("no implicit conversion of "
+     ++ (match v9 with
+         | VNil -> "nil"
+         | VBool b9 -> (if b9 then "true" else "false")
+         | _ -> dispatch_cls_of world v9)
+     ++ " into String")
+and rx_union_conv = fn env -> fn world -> fn (sym_ok: bool) -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (h9, t9) ->
+    (let v9 = (match h9 with
+               | VRegex (_, _, _) -> h9
+               | VStr _ -> h9
+               // ⚠ ...and a Symbol, but ONLY as the single argument: that path
+               // quotes through Regexp.quote, which takes a Symbol, while two
+               // or more go through the String conversion, which does not.
+               | VSym _ -> (if sym_ok then h9 else rx_union_refuse world h9)
+               | other9 ->
+                 (match conv_try env world other9 "to_regexp" with
+                  | VRegex (a9, b9, c9) -> VRegex (a9, b9, c9)
+                  | _ ->
+                    (match conv_try env world other9 "to_str" with
+                     | VStr s9 -> VStr s9
+                     // ...named the way ruby names it: nil / true / false
+                     // spell themselves, everything else answers with its
+                     // CLASS (conv_name stops at "Object" for a user class).
+                     | _ -> rx_union_refuse world other9))) in
+     Cons (v9, rx_union_conv env world sym_ok t9))
 and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
   match v with
   | VObj id ->
@@ -29487,7 +29592,7 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
   // a Regexp had no entry at all, so it denied `match` -- and optparse asks
   // exactly that before accepting a pattern (`pat.respond_to?(:match) or
   // raise`), which is where its load stopped.
-  | VRegex (_, _) -> prim_user_has world recv name || is_regex_method name || is_prim_method name || op_responds recv name
+  | VRegex (_, _, _) -> prim_user_has world recv name || is_regex_method name || is_prim_method name || op_responds recv name
   // every other primitive -- Symbol, nil, true/false -- can have methods too,
   // through its own class or through a reopened Kernel: `module Kernel; def m`
   // makes `:sym.respond_to?(:m)` true, and asking the table is what says so.
@@ -29529,7 +29634,7 @@ and op_responds = fn (v: Val) -> fn (name: str) ->
      | VRange (_, _, _) -> str_eq name "%"
      // `=~` as well as `~`: respond_to? already answered true for it through
      // the regexp name list, and reflection asks THIS one.
-     | VRegex (_, _) -> str_eq name "~" || str_eq name "=~"
+     | VRegex (_, _, _) -> str_eq name "~" || str_eq name "=~"
      | VProc _ -> shift
      | _ -> false)
 
@@ -30457,7 +30562,7 @@ and is_str_mut = fn (name: str) ->
 and str_slice_bang_rx = fn env -> fn world -> fn (h: int) -> fn (args: Val list) ->
   let s = sget h in
   (match args with
-   | Cons (VRegex (p, pf), rest) ->
+   | Cons (VRegex (p, pf, _), rest) ->
      (match rxv_search p pf s 0 with
       | RHit (st, en, saves) ->
         (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
@@ -30514,7 +30619,7 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
        | Cons (VStr sub, Nil) ->
          (let i = str_find_from s (sget sub) 0 in
           if i < 0 then (0 - 1, 0 - 1) else (i, i + str_len (sget sub)))
-       | Cons (VRegex (p, pf), Nil) ->
+       | Cons (VRegex (p, pf, _), Nil) ->
          (match rxv_search p pf s 0 with RHit (st9, en9, _) -> (st9, en9) | _ -> (0 - 1, 0 - 1))
        | _ -> (0 - 1, 0 - 1)) in
      match span with (b0, b1) ->
@@ -30626,7 +30731,7 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
           let _ = sset h (substring s 0 i ++ sget r ++ substring s (i + str_len sub) n) in
           let _ = senc_set h renc in VStr r)
      // s[/re/] = r : replace the first match, which must exist.
-     | Cons (VRegex (p, pf), Cons (VStr r, Nil)) ->
+     | Cons (VRegex (p, pf, _), Cons (VStr r, Nil)) ->
        let _ = enc_pair_guard h r in
        let renc = enc_pair_or h r in
        (match rxv_search p pf s 0 with
@@ -30635,7 +30740,7 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
            let _ = senc_set h renc in VStr r)
         | _ -> prim_raise "IndexError" "regexp not matched")
      // s[/re/, g] = r : replace capture group g of the first match.
-     | Cons (VRegex (p, pf), Cons (VInt g, Cons (VStr r, Nil))) ->
+     | Cons (VRegex (p, pf, _), Cons (VInt g, Cons (VStr r, Nil))) ->
        let _ = enc_pair_guard h r in
        let renc = enc_pair_or h r in
        (match rxv_search p pf s 0 with
@@ -30657,7 +30762,7 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
      | Cons (VStr _, Cons (other, _)) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
      // an UNCONVERTED replacement still comes AFTER the match / index checks:
      // ruby raises the IndexError before ever asking the replacement for #to_str.
-     | Cons (VRegex (p, pf), Cons (VInt g, Cons (other, Nil))) ->
+     | Cons (VRegex (p, pf, _), Cons (VInt g, Cons (other, Nil))) ->
        (match rxv_search p pf s 0 with
         | RHit (st, en, saves) ->
           (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
@@ -30665,11 +30770,11 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
            if g2 < 0 || g2 > ng || (g < 0 && g2 == 0) then prim_raise "IndexError" ("index " ++ str_of_int g ++ " out of regexp")
            else prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String"))
         | _ -> prim_raise "IndexError" "regexp not matched")
-     | Cons (VRegex (p, pf), Cons (other, Nil)) ->
+     | Cons (VRegex (p, pf, _), Cons (other, Nil)) ->
        (match rxv_search p pf s 0 with
         | RHit (_, _, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
         | _ -> prim_raise "IndexError" "regexp not matched")
-     | Cons (VRegex (_, _), Cons (other, _)) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
+     | Cons (VRegex (_, _, _), Cons (other, _)) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
      | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into Integer")
      | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2..3)")
   else
@@ -31285,21 +31390,26 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "tap" then
     prim_raise "LocalJumpError" "no block given (yield)"
   else if str_eq name "__regex" then
-    (match recv with VStr sp -> let sp = sget sp in rx_build_once sp (match args with Cons (VStr f, _) -> sget f | _ -> "") args | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
+    (match recv with VStr sp0 -> (let sp = sget sp0 in rx_build_once sp (match args with Cons (VStr f, _) -> sget f | _ -> "") (rx_one_enc recv) args) | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
   // Regexp#casefold?: the `i` flag, which #options already carries as bit 0.
   else if str_eq name "casefold?" && (match recv with VRegex _ -> true | _ -> false) then
-    (match recv with VRegex (_, fl) -> VBool (str_contains fl "i") | _ -> VBool false)
+    (match recv with VRegex (_, fl, _) -> VBool (str_contains fl "i") | _ -> VBool false)
   // Regexp#fixed_encoding?: true for a pattern PINNED to one encoding, which
   // is what a non-ASCII source does. `/n` is the opposite -- it says "bytes,
   // no encoding" -- so it answers false.
   else if str_eq name "fixed_encoding?" && (match recv with VRegex _ -> true | _ -> false) then
     (match recv with
-     | VRegex (p9, fl) -> VBool (if str_eq (rx_enc_name p9 fl) "US-ASCII" then false else true)
+     // ⚠ ...or the FIXEDENCODING flag, which fixes US-ASCII just as firmly as
+     // any other encoding: `Regexp.new("a".encode("US-ASCII"),
+     // Regexp::FIXEDENCODING).fixed_encoding?` is true, and reading the answer
+     // off the encoding alone said false for exactly that case.
+     | VRegex (p9, fl, ev9) ->
+       VBool (str_contains fl "u" || (if str_eq (rx_enc_name p9 fl ev9) "US-ASCII" then false else true))
      | _ -> VBool false)
   // Regexp#options: the same bits Regexp::IGNORECASE and friends name.
   else if str_eq name "options" && (match recv with VRegex _ -> true | _ -> false) then
     (match recv with
-     | VRegex (_, fl) ->
+     | VRegex (_, fl, _) ->
        VInt ((if str_contains fl "i" then 1 else 0)
              + (if str_contains fl "x" then 2 else 0)
              + (if str_contains fl "m" then 4 else 0)
@@ -31313,9 +31423,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // the same table a MatchData reads. MatchData#names is specified against
   // these, and there was no arm at all.
   else if (str_eq name "names" || str_eq name "named_captures")
-          && (match recv with VRegex (_, _) -> true | _ -> false) then
+          && (match recv with VRegex (_, _, _) -> true | _ -> false) then
     (match recv with
-     | VRegex (pt, pf) ->
+     | VRegex (pt, pf, _) ->
        // the names table is filled when the pattern is COMPILED, and a Regexp
        // that has never matched anything has not been: compile it first (the
        // result is cached, so this is the same work the first match would do).
@@ -31333,10 +31443,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // identical in kind. Testing the bytes here answered US-ASCII for the
     // second, so #source and #encoding disagreed about the same regexp.
     (match recv with
-     | VRegex (p, fl) ->
+     | VRegex (p, fl, ev9) ->
        (let v9 = mkstr p in
         (match v9 with
-         | VStr id9 -> (let _ = senc_set id9 (rx_enc_name p fl) in v9)
+         | VStr id9 -> (let _ = senc_set id9 (rx_enc_name p fl ev9) in v9)
          | _ -> v9))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "source") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'source'")) in fail "mere-ruby: undefined method 'source'")))
   // casecmp is the three-way form of casecmp? (nil when the other side is
@@ -32190,7 +32300,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              if st < 0 || st > n || len < 0 then VNil
              else let en = if st + len > n then n else st + len in mkstr (utf8_substr s st (en - st)))
         // s[/re/] -> whole match; s[/re/, g] -> capture group g (nil if none).
-        | Cons (VRegex (pat, pf), rest) ->
+        | Cons (VRegex (pat, pf, _), rest) ->
           (match rxv_search pat pf s 0 with
            | RBadPat ->
              (let _ = rx_clear_caps 1 in
@@ -32860,8 +32970,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         if map_has enc_objs nm then map_get enc_objs nm else mkstr nm)
      // the `n` flag pins the pattern to BYTES, whatever its source looks like:
      // `/x/n.encoding` is ASCII-8BIT in ruby and was US-ASCII here.
-     | VRegex (p, fl) ->
-       (let nm = rx_enc_name p fl in
+     | VRegex (p, fl, ev9) ->
+       (let nm = rx_enc_name p fl ev9 in
         if map_has enc_objs nm then map_get enc_objs nm else mkstr nm)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "encoding") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'encoding'")) in fail "mere-ruby: undefined method 'encoding'")))
   else if str_eq name "force_encoding" then
@@ -33235,10 +33345,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr pat, Cons (VStr rep, _)) ->
           let pat = sget pat in let rep = sget rep in
           mkstr (if str_eq name "gsub" then str_gsub_lit s pat rep else str_sub_lit s pat rep)
-        | Cons (VRegex (pat, pf), Cons (VStr rep, _)) ->
+        | Cons (VRegex (pat, pf, _), Cons (VStr rep, _)) ->
           let rep = sget rep in
           mkstr (rx_gsub_go2 pat pf s rep 0 (str_eq name "gsub") "")
-        | Cons (VRegex (pat, pf), Cons (VHsh h, _)) ->
+        | Cons (VRegex (pat, pf, _), Cons (VHsh h, _)) ->
           mkstr (rx_gsub_hash (hderef h) pat pf s (str_eq name "gsub") 0 "")
         | _ -> mkstr s)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "sub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sub'")) in fail "mere-ruby: undefined method 'sub'")))
@@ -33266,7 +33376,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr sh0 -> let s = sget sh0 in
        (match args with
-        | Cons (VRegex (pat, pf), _) -> arr_new (rx_scan_all2 pat pf s 0)
+        | Cons (VRegex (pat, pf, _), _) -> arr_new (rx_scan_all2 pat pf s 0)
         | Cons (VStr pat, _) -> arr_new (rx_scan_all2 (rx_escape (sget pat)) "" s 0)
         | Cons (other, _) -> prim_raise "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Regexp)")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
@@ -33338,7 +33448,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    (let pe = enc_canon_name (senc_get seph) in
                     if enc_valid (sget seph) pe then ()
                     else (let _ = prim_raise "ArgumentError" ("invalid byte sequence in " ++ pe) in ()))
-                 | VRegex (_, _) -> ()
+                 | VRegex (_, _, _) -> ()
                  | VNil -> ()
                  | other -> (let _ = prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String") in ())) in
         // an awk-mode split with a NEGATIVE limit keeps one final empty field
@@ -33353,7 +33463,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else if lim == 1 then arr_new (Cons (tag1 (mkstr s), Nil))
         else
         match pat0 with
-        | VRegex (pat, pf) -> arr_new (tag_all (rx_split_lim pat pf s lim))
+        | VRegex (pat, pf, _) -> arr_new (tag_all (rx_split_lim pat pf s lim))
         | VStr seph ->
           (let sep = sget seph in
            if str_eq sep " " then
@@ -33643,7 +33753,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let _ = enc_pair_guard sh0 sub in
           let i = str_find_from s (sget sub) 0 in
           (if i < 0 then VNil else VInt (utf8_cidx s i))
-        | Cons (VRegex (pat, pf), rest) ->
+        | Cons (VRegex (pat, pf, _), rest) ->
           let bst = (match rest with
                      | Cons (VInt off, _) ->
                        let cn = utf8_len s in
@@ -38111,7 +38221,7 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
        (let (m9x, s9x, o9x, i9x) = world in
         let src = (if map_has i9x (str_of_int oid ++ "@__rx_src") then to_s (map_get i9x (str_of_int oid ++ "@__rx_src")) else "") in
         let fl = (if map_has i9x (str_of_int oid ++ "@__rx_flags") then to_s (map_get i9x (str_of_int oid ++ "@__rx_flags")) else "") in
-        invoke_val_c (map_new ()) world superblk (VRegex (src, fl)) meth args false)
+        invoke_val_c (map_new ()) world superblk (VRegex (src, fl, "")) meth args false)
      | _ -> raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'"))
   else raise_exc world "NoMethodError" ("super: no superclass method '" ++ meth ++ "'")
 
@@ -44114,7 +44224,7 @@ and seed_builtin_subclass_ivars = fn world -> fn (cls: str) -> fn (id: int) -> f
                            | Cons (VBool true, _) -> "i"
                            | _ -> "") in
                  map_set ivars (str_of_int id ++ "@__rx_flags") (mkstr fl))
-              | Cons (VRegex (p9, f9), _) ->
+              | Cons (VRegex (p9, f9, _), _) ->
                 (let _ = map_set ivars (str_of_int id ++ "@__rx_src") (mkstr p9) in
                  map_set ivars (str_of_int id ++ "@__rx_flags") (mkstr f9))
               | _ -> ())
@@ -47577,7 +47687,7 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
        let noblk0 = (false, (Nil : str list), (Nil : Stmt list), frame0) in
        truthy (invoke world noblk0 cand ocl "==" (Cons (v, Nil))))
     else rb_eq cand v
-  | VRegex (p, pf) ->
+  | VRegex (p, pf, _) ->
     (match v with
      | VStr sv -> (match rx_do_match world p pf (sget sv) (senc_get sv) with VNil -> false | _ -> true)
      // ...and a SYMBOL: `/x/ === :x` is true in ruby, which is how a `case`

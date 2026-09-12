@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 151 files.
+Classified: 150 files.
 
-## DIFF — 151 files, 70 kinds
+## DIFF — 150 files, 70 kinds
 
 | files | kind |
 |---|---|
@@ -20,9 +20,9 @@ Classified: 151 files.
 | 10 | `FAILED matcher did not match #<OBJ>` |
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
-| 7 | `FAILED expected ArgumentError to be raised` |
 | 7 | `ERROR NameError` |
 | 6 | `FAILED expected TypeError to be raised` |
+| 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected to be identical` |
@@ -91,8 +91,8 @@ Classified: 151 files.
 
 | files | cause |
 |---|---|
-| 7 | `FAILED: expected ArgumentError to be raised` |
 | 6 | `FAILED: expected TypeError to be raised` |
+| 6 | `FAILED: expected ArgumentError to be raised` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |

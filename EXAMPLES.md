@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **151** of **151** recorded DIFF files.
+Visited **150** of **150** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -200,7 +200,7 @@ Visited **151** of **151** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.419148537, got 0.267011711 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.712948233, got 0.505604652 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -311,9 +311,6 @@ Visited **151** of **151** recorded DIFF files.
 | core/regexp/timeout_spec.rb | ERROR: Regexp.timeout raises Regexp::TimeoutError after global timeout elapsed: NameError -- uninitialized constant Regexp::TimeoutError |
 | core/regexp/timeout_spec.rb | ERROR: Regexp.timeout raises Regexp::TimeoutError after timeout keyword value elapsed: NameError -- uninitialized constant Regexp::TimeoutError |
 | core/regexp/timeout_spec.rb | pass=3 fail=0 err=2 |
-| core/regexp/union_spec.rb | FAILED: expected ArgumentError to be raised |
-| core/regexp/union_spec.rb | FAILED: expected ArgumentError to be raised |
-| core/regexp/union_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
