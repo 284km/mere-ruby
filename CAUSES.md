@@ -12,7 +12,7 @@ Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
 Classified: 160 files.
 
-## DIFF — 160 files, 74 kinds
+## DIFF — 160 files, 73 kinds
 
 | files | kind |
 |---|---|
@@ -30,7 +30,7 @@ Classified: 160 files.
 | 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
-| 2 | `pass=N fail=N err=N` |
+| 3 | `pass=N fail=N err=N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected not to be identical` |
@@ -68,7 +68,6 @@ Classified: 160 files.
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
-| 1 | `FAILED expected ["S", "S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
@@ -105,6 +104,7 @@ Classified: 160 files.
 | 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 1 | `sh: feature_14386: command not found` |
+| 1 | `pass=22 fail=1 err=0` |
 | 1 | `TMPDIR` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
@@ -134,7 +134,6 @@ Classified: 160 files.
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
-| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
 
 </details>
 

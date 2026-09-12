@@ -137,11 +137,11 @@ Visited **160** of **160** recorded DIFF files.
 | core/kernel/block_given_spec.rb | FAILED: returns false outside of a method: expected false, got true |
 | core/kernel/block_given_spec.rb | pass=11 fail=2 err=0 |
 | core/kernel/caller_locations_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected truthy from #end_with? |
-| core/kernel/caller_locations_spec.rb | FAILED: can be called with a range: expected ["TMPDIR 'Object#describe'", "TMPDIR 'Kernel#require'", "TMPDIR '<main>'"], got ["TMPDIR 'Kernel#require'", "TMPDIR '<main>'"] |
-| core/kernel/caller_locations_spec.rb | FAILED: works with endless ranges: expected ["TMPDIR 'Kernel#require'", "TMPDIR '<main>'"], got ["TMPDIR 'Object#describe'", "TMPDIR 'Kernel#require'", "TMPDIR '<main>'"] |
+| core/kernel/caller_locations_spec.rb | pass=22 fail=1 err=0 |
+| core/kernel/caller_locations_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected truthy from #end_with? |
 | core/kernel/caller_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match |
-| core/kernel/caller_spec.rb | FAILED: returns an Array of caller locations using a custom limit: expected 1, got 4 |
-| core/kernel/caller_spec.rb | FAILED: returns an Array of caller locations using a range: expected 1, got 4 |
+| core/kernel/caller_spec.rb | FAILED: returns an Array with the block given to #at_exit at the base of the stack: expected 2, got 0 |
+| core/kernel/caller_spec.rb | FAILED: returns an Array with the block given to #at_exit at the base of the stack: expected nil to match |
 | core/kernel/chomp_spec.rb | ERROR: Kernel#chomp is a private method only when -n is passed: NoMethodError -- undefined method 'popen' for class IO |
 | core/kernel/chomp_spec.rb | ERROR: Kernel#chomp removes the final newline of $_: NoMethodError -- undefined method 'popen' for class IO |
 | core/kernel/chomp_spec.rb | ERROR: Kernel#chomp removes the final carriage return of $_: NoMethodError -- undefined method 'popen' for class IO |
@@ -203,7 +203,7 @@ Visited **160** of **160** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.902291979, got 0.95460655 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.574094992, got 0.80410596 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |

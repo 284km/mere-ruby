@@ -36499,7 +36499,10 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // honest answer is an empty backtrace rather than a NoMethodError. Callers
   // that log it print nothing; callers that index it get nil.
   else if str_eq name "caller" && (if map_has meths name then false else true) then
-    arr_new (caller_frames (match args with Cons (VInt n, _) -> n | _ -> 1))
+    (match caller_args env world args with
+     | Nil -> arr_new (caller_frames 1)
+     | Cons (a9, Cons (b9, _)) -> caller_pick2 (caller_frames 0) a9 b9
+     | Cons (a9, _) -> caller_pick (caller_frames 0) a9)
   // caller_locations answers with the ONE frame mere-ruby can name honestly:
   // the file currently being executed, which for a method called from a
   // library's body IS the caller's file (there is no separate call stack).
@@ -36515,7 +36518,18 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      if skip < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int skip ++ ")")
      else if (match args with Cons (_, Cons (VInt m, _)) -> m < 0 | _ -> false)
      then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int want ++ ")")
-     else arr_new (caller_locs world skip want))
+     // ...and then the SAME selection #caller uses, on the same full list, so
+     // the two cannot disagree about what `(2..4)` or `(skip, length)` means.
+     // ⚠ caller_pick2 is the two-argument one. Routing the integer form
+     //   through the one-argument caller_pick dropped the length in silence
+     //   and corpus/153 went from [false] to [false, false]; reverting the
+     //   whole integer path then lost the nil-past-the-end rule with it. Both
+     //   belong to the same selection, which is why there is one function for
+     //   it and not a special case per argument shape.
+     else (match caller_args env world args with
+           | Cons (a9, Cons (b9, _)) -> caller_pick2 (caller_locs world 0 (0 - 1)) a9 b9
+           | Cons (a9, _) -> caller_pick (caller_locs world 0 (0 - 1)) a9
+           | Nil -> arr_new (caller_locs world 1 (0 - 1))))
   // Kernel#rand: a Float in [0, 1) with no argument, an Integer in [0, n)
   // with a positive one, and a member of a Range.
   else if (str_eq name "rand" || str_eq name "srand") && (if map_has meths name then false else true) then
@@ -43510,6 +43524,105 @@ and caller_list = fn (i: int) ->
 // which is why `caller` starts at the frame that called us.
 and caller_depth = fn (u: unit) ->
   if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0
+// `caller(arg)` / `caller_locations(arg)`: the argument SELECTS from the full
+// frame list, and ruby's own rule is the shortest statement of it --
+// `caller(x)` is `caller(0)[x]` for a Range and `caller(0)[x..]` for an
+// Integer. Ranges were ignored here, so `caller(2..4)` answered the whole
+// stack.
+// ⚠ the boundary decides between two DIFFERENT answers, and both occur:
+//     caller(depth)      []     an empty Array
+//     caller(depth + 1)  nil    no Array at all
+//   Measured at exactly the depth, because that is the only input that tells
+//   those two apart.
+and caller_pick = fn (all: Val list) -> fn (a: Val) ->
+  (let n9 = val_list_len all in
+   match a with
+   | VRange (lo9, hi9, ex9) ->
+     (let s9 = (match lo9 with VInt i9 -> (if i9 < 0 then n9 + i9 else i9) | _ -> 0) in
+      let e0 = (match hi9 with VInt i9 -> (if i9 < 0 then n9 + i9 else i9) | _ -> n9 - 1) in
+      let e9 = (if ex9 && (match hi9 with VInt _ -> true | _ -> false) then e0 - 1 else e0) in
+      if s9 < 0 || s9 > n9 then VNil
+      else arr_new (vtake (vdrop all s9) (e9 - s9 + 1)))
+   | VInt k9 -> (if k9 < 0 || k9 > n9 then VNil else arr_new (vdrop all k9))
+   | _ -> arr_new (vdrop all 1))
+// ...and the two-argument form, `caller(skip, length)`. caller_locations kept
+// its length and #caller dropped it -- one pair of arguments, two readers, and
+// only one of them read both.
+// caller / caller_locations coerce their arguments to Integer -- #to_int for an
+// object, truncation for a Float, TypeError for anything else -- but a RANGE is
+// the argument, not a number, and must reach caller_pick untouched.
+and caller_args = fn env -> fn world -> fn (args: Val list) ->
+  (match args with
+   // ⚠ a RANGE's bounds are coerced too: `caller_locations(1.1..1.1)` is
+   //   `caller(1..1)`. Passing the range through untouched left Float bounds
+   //   unmatched by caller_pick, which then read them as "no bound" and
+   //   answered the whole stack.
+   | Cons (VRange (VFlt lo9, VFlt hi9, ex9), r9) ->
+     Cons (VRange (VInt (int_of_float lo9), VInt (int_of_float hi9), ex9), r9)
+   | Cons (VRange (VFlt lo9, hi9, ex9), r9) -> Cons (VRange (VInt (int_of_float lo9), hi9, ex9), r9)
+   | Cons (VRange (lo9, VFlt hi9, ex9), r9) -> Cons (VRange (lo9, VInt (int_of_float hi9), ex9), r9)
+   | Cons (VRange (_, _, _), _) -> args
+   | Nil -> args
+   | _ ->
+     // ⚠ the refusal is written HERE rather than in a helper. Three shapes of
+     //   a `caller_int_ck world v` helper -- recursive over the list,
+     //   list-returning, and a single non-recursive value check -- each made
+     //   the Mere compiler stop returning from `-c`: 35 seconds became minutes.
+     //   Bisected to the CALL, not the definition: with the function defined
+     //   and never called, the emit finished normally. PAIN.md's
+     //   type-inference cliff, and inlining is the way around it.
+     // caller takes at most two, so both positions are spelled out flat.
+     // ⚠ a Float TRUNCATES here; it is not a refusal. `caller(1.1, 1.1)` is
+     //   `caller(1, 1)`, and coerce_int_args leaves Floats alone (it converts
+     //   objects through #to_int), so the refusal below was catching them.
+     (match (match coerce_int_args env world args with
+             | Cons (VFlt f9, Cons (VFlt g9, r9)) -> Cons (VInt (int_of_float f9), Cons (VInt (int_of_float g9), r9))
+             | Cons (VFlt f9, r9) -> Cons (VInt (int_of_float f9), r9)
+             | Cons (a9, Cons (VFlt g9, r9)) -> Cons (a9, Cons (VInt (int_of_float g9), r9))
+             | other9 -> other9) with
+      | Cons (VInt a9, Cons (VInt b9, r9)) -> Cons (VInt a9, Cons (VInt b9, r9))
+      | Cons (VInt a9, Cons (VBig b9, r9)) -> Cons (VInt a9, Cons (VBig b9, r9))
+      // ⚠ the two positions are NOT symmetric: a nil FIRST argument is refused
+      //   ("no implicit conversion from nil to integer") and a nil LENGTH means
+      //   "no limit" and is fine. I had applied the first position's rule to
+      //   the second by symmetry, without asking -- `caller(1, nil)` then
+      //   raised where ruby answers the whole stack.
+      | Cons (VInt a9, Cons (VNil, r9)) -> Cons (VInt a9, (Nil : Val list))
+      | Cons (VInt a9, Cons (bad9, r9)) ->
+        (let _ = raise_exc world "TypeError"
+                   ("no implicit conversion of " ++ class_name bad9 ++ " into Integer") in
+         Cons (VInt a9, Cons (bad9, r9)))
+      | Cons (VInt a9, Nil) -> Cons (VInt a9, (Nil : Val list))
+      | Cons (VBig a9, r9) -> Cons (VBig a9, r9)
+      | Cons (VNil, r9) ->
+        (let _ = raise_exc world "TypeError" "no implicit conversion from nil to integer" in
+         Cons (VNil, r9))
+      | Cons (bad9, r9) ->
+        (let _ = raise_exc world "TypeError"
+                   ("no implicit conversion of " ++ class_name bad9 ++ " into Integer") in
+         Cons (bad9, r9))
+      | Nil -> (Nil : Val list)))
+// ...and whatever #to_int did not turn into an Integer is refused, in ruby's
+// words -- nil has its own wording, which is why it is not the general one.
+// ⚠ this ANSWERS THE LIST rather than unit. Written as `fn ... -> unit` and
+//   called through `let _ = ... in cs9`, the Mere compiler stopped returning
+//   from `-c` at all (35s became minutes; bisected by removing this one call).
+//   Same family as PAIN.md's type-inference cliff.
+// ...and whatever #to_int did not turn into an Integer is refused, in ruby's
+// words -- nil has its own wording, which is why it is not the general one.
+// ⚠ NOT recursive, and checks one value. A recursive version over the list --
+//   in both the unit-returning and the list-returning shape -- made the Mere
+//   compiler stop returning from `-c` at all: 35 seconds became minutes, twice,
+//   bisected each time by removing the single call. Same family as PAIN.md's
+//   type-inference cliff. Two arguments is the whole surface here, so the two
+//   are checked by name at the call site.
+and caller_pick2 = fn (all: Val list) -> fn (a: Val) -> fn (b: Val) ->
+  (match caller_pick all a with
+   | VArr id9 -> (match b with
+                  | VInt m9 -> arr_new (vtake (deref id9) m9)
+                  | _ -> VArr id9)
+   | other9 -> other9)
+
 and caller_frames = fn (skip: int) ->
   let cd = caller_depth () in
   // the current frame is a frame: at the top level it is <main>, which is what
