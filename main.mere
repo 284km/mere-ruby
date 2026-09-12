@@ -1625,11 +1625,12 @@ let enc_canon_name = fn (nm: str) ->
   else if str_len u >= 4 && str_eq (substring u 0 4) "EUC-" then u
   else if str_eq u "GB18030" || str_eq u "GBK" || str_eq u "GB2312" then u
   else nm;
-let enc_ascii_compat = fn (e: str) ->
-  if str_len e >= 6 && str_eq (substring e 0 6) "UTF-16" then false
-  else if str_len e >= 6 && str_eq (substring e 0 6) "UTF-32" then false
-  else if str_eq e "UTF-7" then false
-  else true;
+// (enc_ascii_compat is defined once, beside enc_is_dummy. A SECOND copy used
+// to live here that knew only UTF-16/32/7, and being the later definition it
+// won: every DUMMY encoding -- IBM037, CP50220/1, the ISO-2022-JP family --
+// claimed to be ascii-compatible, so `"a".force_encoding("IBM037") + "b"`
+// concatenated instead of raising, `== "a"` was true, and `.to_sym` dropped
+// the encoding as if the name were plain US-ASCII.)
 // the lookup key for enc_alias_canon: ruby's Encoding.find is case-blind and
 // the constant spelling of an alias replaces '-' with '_' (ISO8859_1 is the
 // constant for the alias "ISO8859-1"), so both collapse to one key here.
@@ -1803,8 +1804,6 @@ let enc_find_canon = fn (nm: str) ->
 // compatible encodings) an ASCII-only side yielding to the other.
 // dummy encodings (stateful ISO-2022-*, UTF-7) are compatible with nothing
 // but themselves and the empty string, even for ASCII-only content.
-let enc_dummy = fn (e: str) ->
-  str_eq e "UTF-7" || (str_len e >= 9 && str_eq (substring e 0 9) "ISO-2022-");
 // ---- what Integer#chr needs to know about an encoding -------------------
 // A character in a byte-oriented encoding IS its bytes, so Integer#chr needs
 // two structural facts and no character table: how wide the widest character
@@ -1853,7 +1852,12 @@ let enc_max_clen = fn (e: str) ->
           || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" || str_eq e "CP949"
           || str_eq e "GBK" || str_eq e "CP936"
           || str_eq e "stateless-ISO-2022-JP" || str_eq e "stateless-ISO-2022-JP-KDDI" then 0 - 1
-  else if enc_dummy e then 0 - 1
+  // ⚠ NOT a dummy check. A dummy encoding is never DECODED, but Integer#chr
+  // does not decode: ruby hands back the single byte for 0..255 in every one
+  // of them (IBM037, the ISO-2022-JP family, UTF-16, UTF-32, UTF-7) and calls
+  // 256 out of char range. Refusing them here -- which a narrower dummy list
+  // had been doing by accident for two of the nine -- answered
+  // NotImplementedError where the answer is a one-byte String.
   else 1;
 // The byte length of the character STARTING at 0 in s, 0 when those bytes are
 // not one. Only the families enc_max_clen gives a width for are answered.
@@ -1900,7 +1904,7 @@ let enc_compat2 = fn (ae0: str) -> fn (as_: str) -> fn (be0: str) -> fn (bs: str
   if str_eq ae be then ae
   else if str_len bs == 0 then ae
   else if str_len as_ == 0 then be
-  else if enc_dummy ae || enc_dummy be then ""
+  else if enc_is_dummy ae || enc_is_dummy be then ""
   else if enc_ascii_compat ae && enc_ascii_compat be then
     (let a7 = enc_all7 as_ in
      let b7 = enc_all7 bs in
@@ -2929,6 +2933,12 @@ and rx_alts_binary = fn (xs: Val list) ->
   | Nil -> false
   | Cons (VStr h9, t9) ->
     (if str_eq (enc_canon_name (senc_get h9)) "ASCII-8BIT" then true else rx_alts_binary t9)
+  // ⚠ ...and a REGEXP argument carries an encoding too. `Regexp.union` over
+  // patterns rather than strings only looked at the strings, so a union with
+  // `/[\x80-\xBF]/n` in it -- a BINARY pattern -- came out UTF-8 whatever
+  // order the arguments were written in.
+  | Cons (VRegex (p9, f9), t9) ->
+    (if str_eq (rx_enc_name p9 f9) "ASCII-8BIT" then true else rx_alts_binary t9)
   | Cons (_, t9) -> rx_alts_binary t9
 and rx_enc_name = fn (p: str) -> fn (fl: str) ->
   if str_contains fl "u" then "UTF-8"
@@ -12045,6 +12055,19 @@ and inspect = fn (v: Val) ->
     (let e0 = senc_get s in
      let e = enc_canon_name e0 in
      let sv = sget s in
+     // ⚠ A DUMMY encoding is not decoded at ALL, so nothing in it is a
+     // character to print: ruby escapes every byte, the printable ASCII ones
+     // included -- `"abcd".force_encoding("ISO-2022-JP").inspect` is
+     // "\x61\x62\x63\x64", not "abcd". This is the one case where an
+     // ascii-compatible encoding still shows its ASCII as \xNN, which is why
+     // it has to be asked BEFORE the compatibility question below.
+     if enc_is_dummy e then
+       (let n9 = str_len sv in
+        let rec go9 = fn (i9: int) -> fn (acc9: str) ->
+          (if i9 >= n9 then acc9
+           else go9 (i9 + 1) (acc9 ++ "\\x" ++ hex2 (ord (char_at sv i9)))) in
+        "\"" ++ go9 0 "" ++ "\"")
+     else
      // a NON-ASCII-COMPATIBLE string (UTF-16/32) inspects through its
      // codepoints: printable ASCII raw, everything else \uXXXX; a MULTIBYTE
      // ascii-compatible one (EUC-JP, Shift_JIS...) shows each multibyte
@@ -12146,9 +12169,12 @@ and inspect = fn (v: Val) ->
     // holds both rules, so the name is inspected AS a String wearing the
     // symbol's encoding rather than through a second copy of them.
     (let e9 = enc_canon_name (sym_enc_name sy) in
-     if (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else enc_ascii_compat e9) && sym_plain sy
+     let dummy9 = enc_is_dummy e9 in
+     if (if dummy9 then false else true)
+        && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else enc_ascii_compat e9) && sym_plain sy
      then ":" ++ sy
-     else if enc_ascii_compat e9 && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else true)
+     else if (if dummy9 then false else true)
+             && enc_ascii_compat e9 && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else true)
      then ":\"" ++ esc_str_b sy 0 "" (rx_src_all7 sy 0) ++ "\""
      else ":" ++ inspect (mkstr_e sy e9))
   | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ enc_display_name (map_get enc_name (str_of_int id)) ++ ">" else "#<object>"
@@ -22612,6 +22638,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let alts = (match args with Cons (VArr id, Nil) -> deref id | _ -> args) in
        match alts with
        | Nil -> VRegex ("(?!)", "")
+       // ⚠ ONE alternative is not a union of one: ruby hands the pattern back
+       // as it stands, keeping its flags -- `Regexp.union(/x/i).inspect` is
+       // "/x/i" -- rather than wrapping it. Wrapping gave "(?-mix:x)" as the
+       // source and dropped `i` into the group header, so #source, #options
+       // and #== all read differently from the pattern that went in.
+       // (only a REGEXP argument: a single STRING already comes out unwrapped
+       // from rx_union_go, and it still has to go through the general path so
+       // the encoding it contributes is recorded.)
+       | Cons (VRegex (p9, f9), Nil) -> VRegex (p9, f9)
        // a BINARY argument makes the union a byte pattern: ruby answers
        // ASCII-8BIT for `Regexp.union("\xff".b)`, and this answered UTF-8 --
        // the union of bytes claiming to be characters. `n` is how a pattern
@@ -28025,7 +28060,20 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                 (match xs with Nil -> (Nil : int list) | Cons (10, t9) -> Cons (13, Cons (10, crlf t9)) | Cons (c9, t9) -> Cons (c9, crlf t9)) in
               crlf cps0)
            else cps0) in
-        let rep_bytes = (match encode_cps rep_cps to "" with (b9, _) -> b9) in
+        // ⚠ THE BYTE-ORDER MARK BELONGS TO THE STRING, NOT TO EACH CHARACTER.
+        // encode_cps writes a BOM for the byte-order-free names UTF-16 and
+        // UTF-32, and the loop below hands it ONE codepoint at a time -- so
+        // `"foo".encode("UTF-16")` came out FE FF 00 66 FE FF 00 6F FE FF 00 6F.
+        // The loop encodes through the BE form instead, and the mark is written
+        // once, in front, and only for a string that has any characters at all
+        // (ruby gives "" no BOM). The RESULT still wears the name it was asked
+        // for: `to` is what gets stamped, `to_enc9` is only how it is written.
+        let to_enc9 = (if str_eq (enc_up to) "UTF-16" then "UTF-16BE"
+                       else if str_eq (enc_up to) "UTF-32" then "UTF-32BE" else to) in
+        let bom9 = (if str_eq (enc_up to) "UTF-16" then chr 254 ++ chr 255
+                    else if str_eq (enc_up to) "UTF-32" then chr 0 ++ chr 0 ++ chr 254 ++ chr 255
+                    else "") in
+        let rep_bytes = (match encode_cps rep_cps to_enc9 "" with (b9, _) -> b9) in
         let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
         let rec emit = fn (xs: int list) -> fn (acc: str) ->
           (match xs with
@@ -28033,7 +28081,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
            | Cons (c9, t9) ->
              if c9 < 0 then emit t9 (acc ++ rep_bytes)
              else
-               (match encode_cps (Cons (c9, Nil)) to "" with
+               (match encode_cps (Cons (c9, Nil)) to_enc9 "" with
                 | (b9, ok9) ->
                   if ok9 then emit t9 (acc ++ b9)
                   else
@@ -28052,14 +28100,14 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                                | _ -> VNil) in
                      match fb with
                      | VStr fh2 ->
-                       (match encode_cps (decode_cps (sget fh2) (enc_canon_name (senc_get fh2)) 0) to "" with
+                       (match encode_cps (decode_cps (sget fh2) (enc_canon_name (senc_get fh2)) 0) to_enc9 "" with
                         | (fb9, _) -> emit t9 (acc ++ fb9))
                      | _ ->
                        if und_rep then emit t9 (acc ++ rep_bytes)
                        else (match raise_exc world "Encoding::UndefinedConversionError"
                                      ("conversion undefined from " ++ from ++ " to " ++ to) with
                              | _ -> acc)))) in
-        let bytes = emit cps1 "" in
+        let bytes = (let b0 = emit cps1 "" in if str_eq b0 "" then b0 else bom9 ++ b0) in
         if str_eq name "encode!" then (let _ = sset h bytes in let _ = senc_set h to in recv)
         else (let c = mkstr bytes in (match c with VStr id -> let _ = senc_set id to in c | _ -> c)))
      | _ -> VNil)

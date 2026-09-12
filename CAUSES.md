@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 152 files.
+Classified: 151 files.
 
-## DIFF — 152 files, 71 kinds
+## DIFF — 151 files, 70 kinds
 
 | files | kind |
 |---|---|
@@ -20,9 +20,9 @@ Classified: 152 files.
 | 10 | `FAILED matcher did not match #<OBJ>` |
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
+| 7 | `FAILED expected ArgumentError to be raised` |
 | 7 | `ERROR NameError` |
 | 6 | `FAILED expected TypeError to be raised` |
-| 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected to be identical` |
@@ -36,7 +36,6 @@ Classified: 152 files.
 | 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got nil` |
-| 2 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
@@ -75,9 +74,9 @@ Classified: 152 files.
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
+| 1 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
-| 1 | `FAILED expected "S"\xN\xN\xN\xN\"S", got "S"\uN\uN\"S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "S" to match` |
@@ -92,8 +91,8 @@ Classified: 152 files.
 
 | files | cause |
 |---|---|
+| 7 | `FAILED: expected ArgumentError to be raised` |
 | 6 | `FAILED: expected TypeError to be raised` |
-| 6 | `FAILED: expected ArgumentError to be raised` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
@@ -130,8 +129,8 @@ Classified: 152 files.
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
 | 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
-| 1 | `FAILED: returns ASCII-8BIT if the regexp encodings are ASCII-8BIT and at least one has non-ASCII characters: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: returns 'method' if the method is defined: expected "method", got nil` |
+| 1 | `FAILED: returned Enumerator size returns nil: expected nil, got 1` |
 
 </details>
 
