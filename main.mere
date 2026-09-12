@@ -8923,6 +8923,145 @@ let rec val_intersect = fn (xs: Val list) -> fn (ys: Val list) ->
 
 // native 64-bit bitwise (two's-complement, so negatives are correct) — the
 // mere builtins map straight to C & | ^.
+// ---- MT19937 --------------------------------------------------------------
+// Transcribed from CRuby's missing/mt19937.c. ruby/spec asks for the exact
+// SEQUENCE a seed produces -- core/kernel/srand wants 0.640674151 out of
+// srand(10), core/array/shuffle wants a named permutation -- so "some
+// reproducible generator" is not enough; it has to be this one.
+//
+// State lives in a map keyed "<gid>:<i>" so several generators can exist at
+// once: gid 0 is the one Kernel#rand and srand share, and every Random
+// instance gets its own.
+let mt_state = map_new ();
+let mt_pos = map_new ();      // gid -> how many words of the block are used
+let mt_seeded = map_new ();   // gid -> "1" once initialised
+let mt_seed_of = map_new ();  // gid -> the seed it was given, as DECIMAL TEXT so a
+                              // bignum survives without a second Val-valued global
+let mt_next_gid = map_new (); // one counter, so each Random instance gets its own stream
+let mt_n = 624;
+let mt_m = 397;
+let mt_mask32 = 4294967295;
+let mt_get = fn (g: int) -> fn (i: int) ->
+  (let k = str_of_int g ++ ":" ++ str_of_int i in if map_has mt_state k then map_get mt_state k else 0);
+let mt_set = fn (g: int) -> fn (i: int) -> fn (v: int) ->
+  (let _ = map_set mt_state (str_of_int g ++ ":" ++ str_of_int i) v in ());
+// init_genrand: state[0] = s, then a Knuth LCG down the array.
+let mt_init_genrand = fn (g: int) -> fn (s: int) ->
+  (let _ = mt_set g 0 (bit_and s mt_mask32) in
+   let rec go = fn (j: int) ->
+     (if j >= mt_n then ()
+      else
+        (let prev = mt_get g (j - 1) in
+         let v = 1812433253 * (bit_xor prev (bit_shr prev 30)) + j in
+         let _ = mt_set g j (bit_and v mt_mask32) in
+         go (j + 1))) in
+   let _ = go 1 in
+   // CRuby leaves left=1 / next=state+N, which makes the FIRST draw run
+   // next_state before reading. pos = mt_n says the same thing.
+   let _ = map_set mt_pos (str_of_int g) mt_n in
+   let _ = map_set mt_seeded (str_of_int g) 1 in ());
+// init_by_array: the multi-word seeding, for a seed wider than 32 bits.
+let mt_init_by_array = fn (g: int) -> fn (key: int list) -> fn (klen: int) ->
+  (let _ = mt_init_genrand g 19650218 in
+   let kget = fn (j: int) ->
+     (let rec nth = fn (xs: int list) -> fn (k: int) ->
+        (match xs with Nil -> 0 | Cons (h, t) -> (if k <= 0 then h else nth t (k - 1))) in
+      nth key j) in
+   let rec go1 = fn (k: int) -> fn (i: int) -> fn (j: int) ->
+     (if k <= 0 then (i, j)
+      else
+        (let prev = mt_get g (i - 1) in
+         let v = bit_xor (mt_get g i) ((bit_xor prev (bit_shr prev 30)) * 1664525) + kget j + j in
+         let _ = mt_set g i (bit_and v mt_mask32) in
+         let i2 = i + 1 in let j2 = j + 1 in
+         let i3 = (if i2 >= mt_n then (let _ = mt_set g 0 (mt_get g (mt_n - 1)) in 1) else i2) in
+         let j3 = (if j2 >= klen then 0 else j2) in
+         go1 (k - 1) i3 j3)) in
+   let (i4, _) = go1 (if mt_n > klen then mt_n else klen) 1 0 in
+   let rec go2 = fn (k: int) -> fn (i: int) ->
+     (if k <= 0 then ()
+      else
+        (let prev = mt_get g (i - 1) in
+         let v = bit_xor (mt_get g i) ((bit_xor prev (bit_shr prev 30)) * 1566083941) - i in
+         let _ = mt_set g i (bit_and v mt_mask32) in
+         let i2 = i + 1 in
+         let i3 = (if i2 >= mt_n then (let _ = mt_set g 0 (mt_get g (mt_n - 1)) in 1) else i2) in
+         go2 (k - 1) i3)) in
+   let _ = go2 (mt_n - 1) i4 in
+   let _ = mt_set g 0 2147483648 in ());
+// next_state: the twist. MATRIX_A = 0x9908b0df.
+let mt_next_state = fn (g: int) ->
+  (let twist = fn (u: int) -> fn (v: int) ->
+     bit_xor (bit_shr (bit_or (bit_and u 2147483648) (bit_and v 2147483647)) 1)
+             (if bit_and v 1 == 1 then 2567483615 else 0) in
+   let rec go = fn (i: int) ->
+     (if i >= mt_n then ()
+      else
+        (let j = (if i + mt_m < mt_n then i + mt_m else i + mt_m - mt_n) in
+         let nx = (if i + 1 < mt_n then i + 1 else 0) in
+         let _ = mt_set g i (bit_xor (mt_get g j) (twist (mt_get g i) (mt_get g nx))) in
+         go (i + 1))) in
+   // ⚠ the twist reads state[i+1] which the NEXT iteration overwrites, so this
+   // has to run front to back exactly as the C does -- CRuby's three loops are
+   // one wrapped walk, and the last element mixes with state[0] again.
+   let _ = go 0 in
+   let _ = map_set mt_pos (str_of_int g) 0 in ());
+let mt_genrand_int32 = fn (g: int) ->
+  (let _ = (if map_has mt_seeded (str_of_int g) then () else mt_init_genrand g 5489) in
+   let pos = (if map_has mt_pos (str_of_int g) then map_get mt_pos (str_of_int g) else mt_n) in
+   let _ = (if pos >= mt_n then mt_next_state g else ()) in
+   let pos2 = map_get mt_pos (str_of_int g) in
+   let y0 = mt_get g pos2 in
+   let _ = map_set mt_pos (str_of_int g) (pos2 + 1) in
+   // tempering
+   let y1 = bit_xor y0 (bit_shr y0 11) in
+   let y2 = bit_xor y1 (bit_and (bit_and (y1 * 128) mt_mask32) 2636928640) in
+   let y3 = bit_xor y2 (bit_and (bit_and (y2 * 32768) mt_mask32) 4022730752) in
+   bit_xor y3 (bit_shr y3 18));
+// The seed as CRuby packs it: 32-bit words, least significant first. One word
+// means init_genrand; more means init_by_array -- the two seedings give
+// different streams, so which one runs is part of reproducing the sequence.
+let rec mt_seed_words = fn (mag: str) ->
+  (match big_divmod_s mag "4294967296" with
+   | (q, r) ->
+     (let lo = int_of_str r in
+      if str_eq q "0" then Cons (lo, Nil) else Cons (lo, mt_seed_words q)));
+let mt_seed_from = fn (g: int) -> fn (mag: str) ->
+  (let ws = mt_seed_words mag in
+   match ws with
+   | Cons (w0, Nil) -> mt_init_genrand g w0
+   | _ -> (let rec len9 = fn (xs: int list) -> (match xs with Nil -> 0 | Cons (_, t) -> 1 + len9 t) in
+           mt_init_by_array g ws (len9 ws)));
+let mt_alloc_gid = fn (u: unit) ->
+  (let g = (if map_has mt_next_gid "n" then map_get mt_next_gid "n" else 1) in
+   let _ = map_set mt_next_gid "n" (g + 1) in g);
+// limited_rand: a MASK of the low bits, drawn again until it lands in range.
+// ⚠ not `% n`. Modulo would bias the low values and, more to the point, give a
+// different sequence from ruby's for the same seed -- which is the whole thing
+// being reproduced here.
+let mt_make_mask = fn (x0: int) ->
+  (let x1 = bit_or x0 (bit_shr x0 1) in
+   let x2 = bit_or x1 (bit_shr x1 2) in
+   let x3 = bit_or x2 (bit_shr x2 4) in
+   let x4 = bit_or x3 (bit_shr x3 8) in
+   let x5 = bit_or x4 (bit_shr x4 16) in
+   bit_or x5 (bit_shr x5 32));
+let mt_limited = fn (g: int) -> fn (limit: int) ->
+  (if limit <= 0 then 0
+   else
+     (let mask = mt_make_mask limit in
+      let rec go = fn (guard: int) ->
+        (let v = bit_and (mt_genrand_int32 g) mask in
+         if v <= limit then v else (if guard <= 0 then 0 else go (guard - 1))) in
+      go 10000));
+// rand(n) for a positive n: an index in [0, n).
+let mt_rand_int = fn (g: int) -> fn (n: int) -> (if n <= 1 then 0 else mt_limited g (n - 1));
+// rand() with no argument: 53 bits of resolution, built from TWO draws exactly
+// as int_pair_to_real_exclusive does (a >> 5) * 2**26 + (b >> 6), over 2**53.
+let mt_rand_real = fn (g: int) ->
+  (let a = bit_shr (mt_genrand_int32 g) 5 in
+   let b = bit_shr (mt_genrand_int32 g) 6 in
+   (float_of_int a * 67108864.0 + float_of_int b) / 9007199254740992.0);
 let int_bitop = fn (op: str) -> fn (x: int) -> fn (y: int) ->
   if str_eq op "&" then bit_and x y
   else if str_eq op "|" then bit_or x y
@@ -11536,7 +11675,7 @@ let rec val_without_nth = fn (xs: Val list) -> fn (i: int) ->
 let rec val_shuffle = fn (xs: Val list) -> fn (n: int) ->
   if n <= 0 then (Nil : Val list)
   else
-    let i = random_int n in
+    let i = mt_rand_int 0 n in
     Cons (val_nth xs i, val_shuffle (val_without_nth xs i) (n - 1));
 
 let rec val_len_i = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + val_len_i t;
@@ -13521,7 +13660,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       raise_exc world "LocalJumpError" "no block given"
     else if str_eq name "print" && (if kernel_overridden env world "print" then false else true) then VNil
     else if str_eq name "rand" && (if map_has meths "rand" then false else true) then rand_val world Nil
-    else if str_eq name "srand" && (if map_has meths "srand" then false else true) then VInt 0
+    else if str_eq name "srand" && (if map_has meths "srand" then false else true) then srand_val env world Nil
     else if str_eq name "gets" && (if kernel_overridden env world "gets" then false else true) then rb_gets ()
     else if str_eq name "readline" && (if kernel_overridden env world "readline" then false else true) then
       (match rb_gets () with VNil -> raise_exc world "EOFError" "end of file reached" | v -> v)
@@ -20763,7 +20902,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               // ...and never more elements than there are.
               else arr_new (val_shuffle_r env world rng xs n (if k9 > n then n else k9))))
         else
-          (let sh9 = val_shuffle_r env world rng xs n n in
+          (let sh9 = val_shuffle_fy env world rng xs n in
            if str_eq name "shuffle!" then (let _ = arr_set aid sh9 in recv) else arr_new sh9))
      | _ -> VNil)
   else if str_eq name "zip" && (match recv with VArr _ -> true | _ -> false)
@@ -22962,8 +23101,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | _ -> VInt 0)
     // Random: a source of numbers, not state — `Random.new` answers the module
     // itself so `Random.new.rand(n)` reads the same generator.
-    else if str_eq c "Random" && (str_eq name "rand" || str_eq name "new" || str_eq name "srand" || str_eq name "bytes") then
-      (if str_eq name "new" then recv else if str_eq name "srand" then VInt 0
+    // ⚠ Random.new must build an INSTANCE with its own generator. It used to
+    // answer the class itself, so `Random.new(42)` shared Kernel#rand's stream
+    // and the seed went nowhere: three runs, three sequences.
+    else if str_eq c "Random" && str_eq name "new" then
+      (let sd9 = (match args with
+                  | Cons (VInt k9, _) -> k9
+                  | Cons (VFlt f9, _) -> int_of_float f9
+                  | Cons (VBig b9, _) -> bit_and (int_of_str (big_mag b9)) mt_mask32
+                  | _ -> random_int 1000000000) in
+       let g9 = mt_alloc_gid () in
+       let _ = mt_init_genrand g9 sd9 in
+       let _ = map_set mt_seed_of (str_of_int g9) (str_of_int sd9) in
+       let ob9 = new_obj world "Random" Nil in
+       (match ob9 with
+        | VObj oid9 ->
+          (let (_, _, _, iv9) = world in
+           let _ = map_set iv9 (str_of_int oid9 ++ "@__gid") (VInt g9) in
+           let _ = map_set iv9 (str_of_int oid9 ++ "@__seed") (VInt sd9) in ob9)
+        | _ -> ob9))
+    else if str_eq c "Random" && str_eq name "new_seed" then VInt (random_int 1000000000)
+    else if str_eq c "Random" && (str_eq name "rand" || str_eq name "srand" || str_eq name "bytes") then
+      (if str_eq name "srand" then srand_val env world args
        else rand_val world (coerce_int_args env world args))
     // `SystemCallError.new(msg, errno)` is an instance of THAT errno's class:
     // the number picks it, and a number nothing claims stays a SystemCallError.
@@ -25702,6 +25861,59 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq cls "Encoding" && str_eq name "inspect" then
       (let nm = (if map_has ivars (str_of_int id ++ "@name") then to_s (map_get ivars (str_of_int id ++ "@name")) else "") in
        mkstr ("#<Encoding:" ++ enc_display_name nm ++ (if enc_is_dummy nm then " (dummy)" else "") ++ ">"))
+    // ---- Random instances -----------------------------------------------
+    // Each carries its own generator id, so two of them seeded the same way
+    // walk the same sequence and neither disturbs Kernel#rand.
+    else if str_eq cls "Random" && (str_eq name "rand" || str_eq name "seed"
+                                    || str_eq name "bytes" || str_eq name "==") then
+      (let g9 = (if map_has ivars (str_of_int id ++ "@__gid")
+                 then (match map_get ivars (str_of_int id ++ "@__gid") with VInt k9 -> k9 | _ -> 0) else 0) in
+       let sd9 = (if map_has ivars (str_of_int id ++ "@__seed")
+                  then map_get ivars (str_of_int id ++ "@__seed") else VInt 0) in
+       if str_eq name "seed" then sd9
+       // two Randoms are equal when they were seeded alike.
+       else if str_eq name "==" then
+         (match args with
+          | Cons (VObj o2, _) ->
+            (let c2 = map_get ocls (str_of_int o2) in
+             if str_eq c2 "Random" && map_has ivars (str_of_int o2 ++ "@__seed")
+             then VBool (match (sd9, map_get ivars (str_of_int o2 ++ "@__seed")) with
+                          | (VInt x9, VInt y9) -> x9 == y9
+                          | _ -> false)
+             else VBool false)
+          | _ -> VBool false)
+       else if str_eq name "bytes" then
+         (let n9 = (match args with Cons (VInt k9, _) -> k9 | _ -> 0) in
+          // ⚠ FOUR bytes per draw, little-endian, which is how ruby fills a
+          // buffer: taking one draw per byte would consume the stream four
+          // times as fast and answer different bytes for the same seed.
+          let rec go9 = fn (k: int) -> fn (acc: str) ->
+            (if k <= 0 then acc
+             else
+               (let w9 = mt_genrand_int32 g9 in
+                let take = (if k > 4 then 4 else k) in
+                let rec emit9 = fn (b: int) -> fn (v: int) -> fn (a2: str) ->
+                  (if b <= 0 then a2 else emit9 (b - 1) (bit_shr v 8) (a2 ++ chr (bit_and v 255))) in
+                go9 (k - take) (emit9 take w9 acc))) in
+          let r9 = mkstr (go9 n9 "") in
+          (match r9 with VStr h9 -> (let _ = senc_set h9 "ASCII-8BIT" in r9) | _ -> r9))
+       else
+         // #rand: the same shapes Kernel#rand takes, on THIS generator.
+         (match coerce_int_args env world args with
+          | Cons (VInt n9, _) ->
+            (if n9 <= 0 then raise_exc world "ArgumentError" ("invalid argument - " ++ str_of_int n9)
+             else VInt (mt_rand_int g9 n9))
+          | Cons (VFlt f9, _) ->
+            (if f9 <= 0.0 then raise_exc world "ArgumentError" ("invalid argument - " ++ to_s (VFlt f9))
+             else VFlt (mt_rand_real g9 * f9))
+          | Cons (VRange (av9, bv9, ex9), _) ->
+            (match (av9, bv9) with
+             | (VInt a9, VInt b9) ->
+               (let span9 = (if ex9 then b9 - a9 else b9 - a9 + 1) in
+                if span9 <= 0 then VNil else VInt (a9 + mt_rand_int g9 span9))
+             | _ -> (let lo9 = to_f av9 in let hi9 = to_f bv9 in
+                     if hi9 <= lo9 then VNil else VFlt (lo9 + mt_rand_real g9 * (hi9 - lo9))))
+          | _ -> VFlt (mt_rand_real g9)))
     else if str_eq cls "Encoding" && str_eq name "dummy?" then
       VBool (enc_is_dummy (if map_has ivars (str_of_int id ++ "@name") then to_s (map_get ivars (str_of_int id ++ "@name")) else ""))
     else if str_eq cls "Encoding" && str_eq name "ascii_compatible?" then
@@ -29778,7 +29990,7 @@ and is_regex_method = fn (name: str) ->
 // 0, not the middle of the array), and anything else is asked for #to_int.
 and rnd_index = fn env -> fn world -> fn (rng: Val) -> fn (k: int) ->
   match rng with
-  | VNil -> random_int k
+  | VNil -> mt_rand_int 0 k
   | _ ->
     (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
      let r9 = invoke_val_c env world nb9 rng "rand" (Cons (VInt k, Nil)) false in
@@ -29797,6 +30009,28 @@ and rnd_index = fn env -> fn world -> fn (rng: Val) -> fn (k: int) ->
 // -- so EVERY POSITION of the result is uniform, which is what the fairness
 // spec measures position by position. Taking the first k of a full shuffle
 // would do as well; stopping early just avoids the rest of the work.
+// ⚠ #shuffle is a BACKWARD Fisher-Yates, and ruby/spec pins the permutation a
+// seed produces -- so the order the draws are made in is part of the answer,
+// not an implementation detail. CRuby walks i down from len, drawing j in
+// [0, i) and swapping element i-1 with j. Picking-and-removing from the front
+// (which val_shuffle_r does, and which is just as uniform) consumes the same
+// numbers in a different order and lands on a different permutation.
+and val_shuffle_fy = fn env -> fn world -> fn (rng: Val) -> fn (xs: Val list) -> fn (n: int) ->
+  (let perm = map_new () in
+   let pg = fn (i: int) -> (if map_has perm (str_of_int i) then map_get perm (str_of_int i) else i) in
+   let rec go = fn (i: int) ->
+     (if i <= 1 then ()
+      else
+        (let j = rnd_index env world rng i in
+         let i2 = i - 1 in
+         let a = pg i2 in let b = pg j in
+         let _ = map_set perm (str_of_int i2) b in
+         let _ = map_set perm (str_of_int j) a in
+         go i2)) in
+   let _ = go n in
+   let rec build = fn (k: int) ->
+     (if k >= n then (Nil : Val list) else Cons (val_nth xs (pg k), build (k + 1))) in
+   build 0)
 and val_shuffle_r = fn env -> fn world -> fn (rng: Val) -> fn (xs: Val list) -> fn (n: int) -> fn (k: int) ->
   if k <= 0 || n <= 0 then (Nil : Val list)
   else
@@ -34321,7 +34555,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if str_eq name "sample" then
     (match recv with
      | VArr id -> let xs = deref id in let n = val_list_len xs in
-       (if n == 0 then VNil else val_nth xs (random_int n))
+       (if n == 0 then VNil else val_nth xs (mt_rand_int 0 n))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "sample") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sample'")) in fail "mere-ruby: undefined method 'sample'")))
   else if str_eq name "shuffle" then
     (match recv with
@@ -37137,7 +37371,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     // ⚠ rand's argument goes through #to_int: `rand(obj)` is `rand(obj.to_int)`
     //   and an object one made rand answer a Float (the no-argument form),
     //   which is what core/kernel/rand_spec asks about.
-    (if str_eq name "srand" then VInt 0 else rand_val world (coerce_int_args env world args))
+    (if str_eq name "srand" then srand_val env world args else rand_val world (coerce_int_args env world args))
   // Kernel#fork is not implemented (no process extern) — Ruby's own
   // NotImplementedError contract for platforms without fork.
   else if str_eq name "fork" then
@@ -37406,13 +37640,33 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
 // a StringIO defines all three.
 // Kernel#rand / Random.rand. No argument (or 0) is a Float in [0, 1); a
 // positive Integer n is an Integer in [0, n); a Range picks one of its values.
+// srand(n): seed generator 0 and answer the seed it had BEFORE -- which is what
+// makes `srand(srand)` restore a run. Without an argument ruby picks its own.
+and srand_val = fn env -> fn world -> fn (args: Val list) ->
+  // ⚠ the seed is answered back EXACTLY as it was given -- a bignum, a
+  // negative, the #to_int of a Float -- while only its MAGNITUDE seeds the
+  // generator. Storing the 32 bits that seeded it and answering those made
+  // `srand(0x12345678901234567890)` report 4294967295.
+  (let _ = (if map_has mt_seed_of "0" then ()
+            else (let _ = map_set mt_seed_of "0" (str_of_int (random_int 1000000000 + 1)) in ())) in
+   let prev = norm_big (map_get mt_seed_of "0") in
+   let sv = (match args with
+             | Nil -> VInt (random_int 1000000000 + 1)
+             | Cons (v9, _) -> shift_width_v env world v9) in
+   let mag = (match sv with
+              | VInt k9 -> str_of_int (if k9 < 0 then 0 - k9 else k9)
+              | VBig b9 -> big_mag b9
+              | _ -> "0") in
+   let _ = mt_seed_from 0 mag in
+   let _ = map_set mt_seed_of "0" (to_s sv) in
+   prev)
 and rand_val = fn world -> fn (args: Val list) ->
   match args with
   // the SIGN is ignored here too: `rand(-3)` is `rand(3)`. Only ZERO means
   // "no maximum", which is the Float in [0, 1).
   | Cons (VInt n0, _) -> (let n = (if n0 < 0 then 0 - n0 else n0) in
-                          if n == 0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
-                          else VInt (random_int n))
+                          if n == 0 then VFlt (mt_rand_real 0)
+                          else VInt (mt_rand_int 0 n))
   // ⚠ a FLOAT max is TRUNCATED first, and the answer is an INTEGER whenever
   //   that leaves at least one: `rand(1.5)` is 0 (an Integer) and `rand(2.5)`
   //   is 0, 1 or 2 -- only a max that truncates to zero (`rand(0.5)`) answers a
@@ -37421,10 +37675,10 @@ and rand_val = fn world -> fn (args: Val list) ->
     // ...and the SIGN is ignored: `rand(-1.5)` is `rand(1.5)`. A negative max
     // took the "no argument" path and answered a Float in [0, 1).
     (let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
-     if f == 0.0 then VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
+     if f == 0.0 then VFlt (mt_rand_real 0)
      else (let n9 = int_of_float f in
-           if n9 >= 1 then VInt (random_int n9)
-           else VFlt (float_of_int (random_int 1000000000) / 1000000000.0 * f)))
+           if n9 >= 1 then VInt (mt_rand_int 0 n9)
+           else VFlt (mt_rand_real 0 * f)))
   // ⚠ a range with a FLOAT on either end picks a FLOAT in it, and only the
   //   Integer/Integer pair picks an Integer: `rand(1..2.0)` answered nil
   //   because the arm below reads two VInts and nothing else.
@@ -37436,17 +37690,17 @@ and rand_val = fn world -> fn (args: Val list) ->
      let hi9 = to_f bv in
      let span9 = hi9 - lo9 in
      if span9 < 0.0 then VNil
-     else VFlt (lo9 + float_of_int (random_int 1000000000) / 1000000000.0 * span9))
+     else VFlt (lo9 + mt_rand_real 0 * span9))
   // rand(1..6): only an integer range picks an integer
   | Cons (VRange (av, bv, excl), _) ->
     (match av with
      | VInt a ->
        (match bv with
         | VInt b -> (let span = (if excl then b - a else b - a + 1) in
-                     if span <= 0 then VNil else VInt (a + random_int span))
+                     if span <= 0 then VNil else VInt (a + mt_rand_int 0 span))
         | _ -> VNil)
      | _ -> VNil)
-  | _ -> VFlt (float_of_int (random_int 1000000000) / 1000000000.0)
+  | _ -> VFlt (mt_rand_real 0)
 
 and self_defines = fn env -> fn world -> fn (name: str) ->
   if lv_has env "self" then

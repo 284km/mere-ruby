@@ -18,7 +18,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 |---|---|---|---|---|---|---|
 | language | 43 | 24 | 0 | 0 | 0 | 67 |
 | core/string | 111 | 3 | 0 | 0 | 0 | 114 |
-| core/array | 100 | 4 | 0 | 0 | 1 | 105 |
+| core/array | 101 | 3 | 0 | 0 | 1 | 105 |
 | core/hash | 64 | 5 | 0 | 0 | 0 | 69 |
 | core/range | 30 | 5 | 0 | 0 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
@@ -28,7 +28,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 46 | 4 | 0 | 0 | 0 | 50 |
 | core/integer | 67 | 3 | 0 | 0 | 0 | 70 |
-| core/kernel | 81 | 36 | 0 | 1 | 0 | 118 |
+| core/kernel | 82 | 35 | 0 | 1 | 0 | 118 |
 | core/matchdata | 30 | 0 | 0 | 0 | 0 | 30 |
 | core/method | 18 | 8 | 0 | 0 | 0 | 26 |
 | core/mutex | 3 | 4 | 0 | 0 | 0 | 7 |

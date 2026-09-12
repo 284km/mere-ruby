@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 148 files.
+Classified: 146 files.
 
-## DIFF — 148 files, 70 kinds
+## DIFF — 146 files, 69 kinds
 
 | files | kind |
 |---|---|
@@ -26,10 +26,10 @@ Classified: 148 files.
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected true, got false` |
 | 4 | `FAILED expected to be identical` |
-| 4 | `FAILED expected N, got N` |
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
 | 3 | `pass=N fail=N err=N` |
+| 3 | `FAILED expected N, got N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected not to be identical` |
@@ -61,7 +61,6 @@ Classified: 148 files.
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
-| 1 | `FAILED expected ["S", "S", "S"], got ["S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ZeroDivisionError to be raised` |
@@ -116,7 +115,6 @@ Classified: 148 files.
 | 1 | `FAILED: stores unequal keys that hash to the same value: expected to receive #hash` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
-| 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
@@ -131,6 +129,7 @@ Classified: 148 files.
 | 1 | `FAILED: returned Enumerator size returns nil: expected nil, got 1` |
 | 1 | `FAILED: reports the same arity as the given block: expected [2], got [-2]` |
 | 1 | `FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true` |
+| 1 | `FAILED: re-raises a previously rescued exception without overwriting the cause when it's explicitly specified with :cause option and has nil value: expected #<RuntimeError: Error 1>, got nil` |
 
 </details>
 
