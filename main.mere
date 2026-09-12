@@ -1712,14 +1712,21 @@ let enc_valid_eucjp = fn (s: str) ->
     else
       let b0 = bv i in
       if b0 < 128 then go (i + 1)
-      else if b0 == 142 then (if (let v = bv (i + 1) in v >= 161 && v <= 223) then go (i + 2) else false)
+      // 0x8E is the single shift to half-width katakana. ruby validates the
+      // TRAIL structurally -- 0xA1..0xFE -- not by the assigned subrange
+      // 0xA1..0xDF, so `"\x8E\xE0"` is a valid EUC-JP string to it.
+      else if b0 == 142 then (if (let v = bv (i + 1) in v >= 161 && v <= 254) then go (i + 2) else false)
       else if b0 == 143 then
         (if (let v = bv (i + 1) in v >= 161 && v <= 254) && (let v = bv (i + 2) in v >= 161 && v <= 254)
          then go (i + 3) else false)
       else if b0 >= 161 && b0 <= 254 then (if (let v = bv (i + 1) in v >= 161 && v <= 254) then go (i + 2) else false)
       else false in
   go 0;
-let enc_valid_sjis = fn (s: str) -> fn (w31j: bool) ->
+// Shift_JIS and its vendor variants. They differ in which codepoints are
+// ASSIGNED, not in which byte sequences are well formed, and #valid_encoding?
+// asks the second question: ruby answers true for lead bytes 0xF0..0xFC under
+// plain Shift_JIS too, so there is no variant flag to carry here.
+let enc_valid_sjis = fn (s: str) ->
   let n = str_len s in
   let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
   let rec go = fn (i: int) ->
@@ -1728,7 +1735,7 @@ let enc_valid_sjis = fn (s: str) -> fn (w31j: bool) ->
       let b0 = bv i in
       if b0 < 128 then go (i + 1)
       else if b0 >= 161 && b0 <= 223 then go (i + 1)
-      else if (b0 >= 129 && b0 <= 159) || (b0 >= 224 && b0 <= (if w31j then 252 else 239)) then
+      else if (b0 >= 129 && b0 <= 159) || (b0 >= 224 && b0 <= 252) then
         (if (let v = bv (i + 1) in (v >= 64 && v <= 126) || (v >= 128 && v <= 252)) then go (i + 2) else false)
       else false in
   go 0;
@@ -1777,7 +1784,7 @@ let enc_valid = fn (s: str) -> fn (e: str) ->
   else if str_eq e "EUC-KR" || str_eq e "GB2312" || str_eq e "EUC-TW" || str_eq e "GB12345" then enc_valid_db s 161 254 161 254 (0 - 1) (0 - 1)
   else if str_eq e "Shift_JIS" || str_eq e "Windows-31J" || str_eq e "MacJapanese"
           || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank" then
-    enc_valid_sjis s (if str_eq e "Shift_JIS" then false else true)
+    enc_valid_sjis s
   else if str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
           || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then enc_valid_db s 129 254 64 126 161 254
   else if str_eq e "CP949" then enc_valid_db s 129 254 65 90 97 254
@@ -1798,6 +1805,95 @@ let enc_find_canon = fn (nm: str) ->
 // but themselves and the empty string, even for ASCII-only content.
 let enc_dummy = fn (e: str) ->
   str_eq e "UTF-7" || (str_len e >= 9 && str_eq (substring e 0 9) "ISO-2022-");
+// ---- what Integer#chr needs to know about an encoding -------------------
+// A character in a byte-oriented encoding IS its bytes, so Integer#chr needs
+// two structural facts and no character table: how wide the widest character
+// can be, and whether a given byte string is exactly one character.
+//
+// The WIDTH picks the two refusals apart. A number too big to be a character
+// in e at all is "N out of char range"; one that fits the width but is not
+// well formed is "invalid codepoint 0xN in E". ruby was asked which message it
+// gives, encoding by encoding, and the widths below are its answers.
+//
+// ⚠ -1 means "no structural model here", and chr refuses rather than guessing.
+// EUC-TW and GB18030 really take FOUR bytes while the validator above models
+// them as two; the dummy encodings are never scanned at all.
+let enc_utf8_family = fn (e: str) ->
+  str_eq e "UTF-8" || str_eq e "UTF8-MAC" || str_eq e "UTF8-DoCoMo"
+  || str_eq e "UTF8-KDDI" || str_eq e "UTF8-SoftBank";
+let enc_eucjp_family = fn (e: str) ->
+  str_eq e "EUC-JP" || str_eq e "eucJP-ms" || str_eq e "CP51932" || str_eq e "EUC-JIS-2004";
+let enc_sjis_family = fn (e: str) ->
+  str_eq e "Shift_JIS" || str_eq e "Windows-31J" || str_eq e "MacJapanese"
+  || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank";
+// the double-byte families the validator above models, as (lead, trail, trail2)
+// ranges -- the same numbers enc_valid_db is called with, read back here.
+// ⚠ ONLY the ranges that were checked against ruby for EVERY number in the
+// one- and two-byte space. The validator above also models Big5, CP949 and
+// GBK with (129, 254, ...), and ruby disagrees with all three -- it refuses
+// 0x8140 in Big5 and ACCEPTS a bare 0x80 in CP949 and GBK -- so chr leaves
+// them to the refusal below instead of answering from ranges that are wrong
+// in the permissive direction.
+let enc_db_ranges = fn (e: str) ->
+  if str_eq e "EUC-KR" || str_eq e "GB2312" || str_eq e "GB12345" then (161, 254, 161, 254, 0 - 1, 0 - 1)
+  else (0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+let enc_max_clen = fn (e: str) ->
+  if str_eq e "US-ASCII" then 1
+  else if enc_utf8_family e then 4
+  else if enc_eucjp_family e then 3
+  else if enc_sjis_family e then 2
+  else if (match enc_db_ranges e with (l, _, _, _, _, _) -> l) > 0 then 2
+  // ⚠ modelled by the validator above but NOT verified for chr: Big5 and its
+  // variants, CP949, GBK/CP936, and the stateless ISO-2022-JP pair, which
+  // accepts ASCII and the EUC-JP katakana shift but not the trail pairs.
+  else if str_eq e "EUC-TW" || str_eq e "GB18030"
+          || str_eq e "Emacs-Mule" || str_eq e "UTF-16BE" || str_eq e "UTF-16LE"
+          || str_eq e "UTF-32BE" || str_eq e "UTF-32LE"
+          || str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" || str_eq e "CP949"
+          || str_eq e "GBK" || str_eq e "CP936"
+          || str_eq e "stateless-ISO-2022-JP" || str_eq e "stateless-ISO-2022-JP-KDDI" then 0 - 1
+  else if enc_dummy e then 0 - 1
+  else 1;
+// The byte length of the character STARTING at 0 in s, 0 when those bytes are
+// not one. Only the families enc_max_clen gives a width for are answered.
+let enc_clen1 = fn (e: str) -> fn (s: str) ->
+  let n = str_len s in
+  let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let b0 = bv 0 in
+  if b0 < 0 then 0
+  else if str_eq e "US-ASCII" then (if b0 < 128 then 1 else 0)
+  else if enc_eucjp_family e then
+    // ASCII, 0x8E + one trail, 0x8F + two trails, or a trail pair.
+    (if b0 < 128 then 1
+     else if b0 == 142 then (if (let v = bv 1 in v >= 161 && v <= 254) then 2 else 0)
+     else if b0 == 143 then
+       (if (let v = bv 1 in v >= 161 && v <= 254) && (let v = bv 2 in v >= 161 && v <= 254) then 3 else 0)
+     else if b0 >= 161 && b0 <= 254 then (if (let v = bv 1 in v >= 161 && v <= 254) then 2 else 0)
+     else 0)
+  else if enc_sjis_family e then
+    // ASCII, half-width katakana alone, or a lead/trail pair.
+    (if b0 < 128 then 1
+     else if b0 >= 161 && b0 <= 223 then 1
+     else if (b0 >= 129 && b0 <= 159) || (b0 >= 224 && b0 <= 252) then
+       (if (let v = bv 1 in (v >= 64 && v <= 126) || (v >= 128 && v <= 252)) then 2 else 0)
+     else 0)
+  else
+    (match enc_db_ranges e with
+     | (l_lo, l_hi, t1_lo, t1_hi, t2_lo, t2_hi) ->
+       if l_lo > 0 then
+         (if b0 < 128 then 1
+          else if b0 >= l_lo && b0 <= l_hi then
+            (let v = bv 1 in
+             if (v >= t1_lo && v <= t1_hi) || (t2_lo > 0 && v >= t2_lo && v <= t2_hi) then 2 else 0)
+          else 0)
+       else if enc_max_clen e == 1 then 1
+       else 0 - 1);
+// n as its shortest big-endian byte string ("" for a negative number).
+let rec be_bytes = fn (n: int) ->
+  if n < 0 then ""
+  else if n < 256 then chr n
+  else be_bytes (n / 256) ++ chr (n - (n / 256) * 256);
 let enc_compat2 = fn (ae0: str) -> fn (as_: str) -> fn (be0: str) -> fn (bs: str) ->
   let ae = enc_canon_name ae0 in
   let be = enc_canon_name be0 in
@@ -31481,38 +31577,94 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // scoreboard, and one method.
     (match recv with
      | VInt n ->
-       (let given = (match args with
-                     | Cons (VStr e, _) -> str_upcase (sget e)
-                     | Cons (VObj _, _) -> (match args with Cons (ev, _) -> str_upcase (to_s ev) | _ -> "")
-                     | _ -> "") in
+       // ⚠ The name is resolved the way Encoding.find resolves it, not by
+       // upcasing: 'euc-jp' and 'Utf-8' name encodings, and the canonical
+       // spelling ("EUC-JP", "Shift_JIS", "eucJP-ms") is what every rule below
+       // is written against. Upcasing answered "EUC-JP" for one spelling and
+       // "SHIFT_JIS" for another, so only the all-caps names were reachable.
+       (let given0 = (match args with
+                      | Cons (VStr e, _) -> sget e
+                      | Cons (VObj _, _) -> (match args with Cons (ev, _) -> to_s ev | _ -> "")
+                      | _ -> "") in
+        let given = (if str_eq given0 "" then "" else enc_find_canon given0) in
+        if (if str_eq given0 "" then false else str_eq given "") then
+          prim_raise "ArgumentError" ("unknown encoding name - " ++ given0)
+        else
         // `n.chr` with no encoding is a BYTE: 0..255, US-ASCII under 128 and
         // ASCII-8BIT at or above it, and RangeError outside. With an encoding it
         // is a CODEPOINT in that encoding, so UTF-8 reaches 0x10FFFF and
         // US-ASCII stops at 0x7F -- and out of range is a RangeError naming the
         // number, not an interpreter failure with no class (which is what every
         // one of these answered before).
+        //
+        // ⚠ ...except that a number ABOVE 255 is not out of range when
+        // Encoding.default_internal is set: it is a character in THAT encoding,
+        // and `n.chr` means `n.chr(Encoding.default_internal)`. Below 256 the
+        // default_internal is ignored entirely -- 0..127 stays US-ASCII and
+        // 128..255 stays binary whatever it is set to.
         if str_eq given "" then
-          (if n < 0 || n > 255 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
-           else (let r = mkstr (chr n) in
-                 (match r with VStr rid -> (let _ = senc_set rid (if n < 128 then "US-ASCII" else "ASCII-8BIT") in r) | _ -> r)))
-        else if str_eq given "UTF-8" then
+          (let di9 = (if map_has def_int_enc "v"
+                      then (match map_get def_int_enc "v" with
+                            | VObj oi9 -> (if map_has enc_name (str_of_int oi9) then map_get enc_name (str_of_int oi9) else "")
+                            | _ -> "")
+                      else "") in
+           if n >= 0 && n <= 255 then
+             (let r = mkstr (chr n) in
+              (match r with VStr rid -> (let _ = senc_set rid (if n < 128 then "US-ASCII" else "ASCII-8BIT") in r) | _ -> r))
+           else if str_eq di9 "" then prim_raise "RangeError" (str_of_int n ++ " out of char range")
+           else prim_method recv name (Cons (mkstr di9, Nil)))
+        // the UTF-8 vendor variants encode a single codepoint exactly as UTF-8
+        // does; they differ in NORMALISATION on conversion, which chr does not do.
+        else if enc_utf8_family given || str_eq given "CESU-8" then
           (if n < 0 || n > 1114111 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
-           else mkstr (utf8_enc n))
-        else if str_eq given "US-ASCII" then
-          (if n < 0 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
-           else if n > 127 then prim_raise "RangeError" ("invalid codepoint 0x" ++ str_upcase (int_to_base n 16) ++ " in US-ASCII")
-           else (let r = mkstr (chr n) in
-                 (match r with VStr rid -> (let _ = senc_set rid "US-ASCII" in r) | _ -> r)))
-        else if str_eq given "ASCII-8BIT" || str_eq given "BINARY" || str_eq given "ISO-8859-1" then
-          (if n < 0 || n > 255 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
-           else (let r = mkstr (chr n) in
-                 (match r with VStr rid -> (let _ = senc_set rid (if str_eq given "ISO-8859-1" then "ISO-8859-1" else "ASCII-8BIT") in r) | _ -> r)))
-        // An encoding whose character table this interpreter does not have. Two
-        // things can still be said without one, because they hold in EVERY
-        // encoding: a negative number is out of char range, and so is one past
-        // the largest codepoint Unicode defines. ruby/spec asks exactly that of
-        // EUC-JP, and it is a rule rather than a guess. Producing the BYTES for
-        // a valid codepoint does need the table, so that is refused.
+           // ⚠ the SURROGATE half is a number in range that is not a character:
+           // D800..DFFF exist only to pair up inside UTF-16, and ruby refuses
+           // them by name. utf8_enc encoded them happily, so `0xD800.chr(...)`
+           // produced three bytes no UTF-8 reader will accept.
+           else if n >= 55296 && n <= 57343 then
+             prim_raise "RangeError" ("invalid codepoint 0x" ++ str_upcase (int_to_base n 16) ++ " in " ++ given)
+           else
+             // ⚠ CESU-8 agrees with UTF-8 up to U+FFFF and then DISAGREES: an
+             // astral codepoint is written as the UTF-16 surrogate PAIR, each
+             // half encoded as its own three UTF-8 bytes. So U+10400 is six
+             // bytes here and four in UTF-8 -- which is the whole reason the
+             // encoding exists, and the only thing that separates the two.
+             (let bs9 = (if str_eq given "CESU-8" && n >= 65536
+                         then (let v9 = n - 65536 in
+                               utf8_enc (55296 + v9 / 1024) ++ utf8_enc (56320 + (v9 - (v9 / 1024) * 1024)))
+                         else utf8_enc n) in
+              let r = mkstr bs9 in
+              (match r with VStr rid -> (let _ = senc_set rid given in r) | _ -> r)))
+        // ⚠ EVERY OTHER ENCODING IS BYTE-ORIENTED, NOT CODEPOINT-ORIENTED.
+        //
+        //   0x8140.chr(Encoding::SHIFT_JIS)  ->  "\x81\x40"
+        //   0xA4A2.chr(Encoding::EUC_JP)     ->  "\xA4\xA2"
+        //
+        // The number is not a Unicode codepoint to be converted; it IS the
+        // character's bytes, big-endian. So no character table is needed --
+        // only the structural question "are these bytes one character in e",
+        // which enc_clen1 answers. Which of the two refusals applies is decided
+        // by the encoding's WIDTH: a number that cannot fit in a character of e
+        // is out of char range, one that fits but is malformed is an invalid
+        // codepoint. (ruby: 0x818181 in Shift_JIS is "out of char range" --
+        // three bytes, and Shift_JIS characters are at most two -- while
+        // 0xFFFFFF in EUC-JP, which IS three bytes wide, is "invalid
+        // codepoint".)
+        else if enc_max_clen given > 0 then
+          (let w9 = enc_max_clen given in
+           let lim9 = (let rec pow9 = fn (k: int) -> (if k <= 0 then 1 else 256 * pow9 (k - 1)) in pow9 w9) in
+           if n < 0 || n >= lim9 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
+           else
+             (let bs9 = be_bytes n in
+              if enc_clen1 given bs9 == str_len bs9
+              then (let r = mkstr bs9 in
+                    (match r with VStr rid -> (let _ = senc_set rid given in r) | _ -> r))
+              else prim_raise "RangeError"
+                     ("invalid codepoint 0x" ++ str_upcase (int_to_base n 16) ++ " in " ++ given)))
+        // An encoding this interpreter has no structural model for. One thing
+        // can still be said without one, because it holds in EVERY encoding: a
+        // negative number is out of char range, and so is one past the largest
+        // codepoint Unicode defines.
         else if n < 0 || n > 1114111 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
         else prim_raise "NotImplementedError" ("Integer#chr in " ++ given ++ " is not implemented here"))
      | VStr sv -> let sv = sget sv in mkstr (utf8_char sv 0) | _ -> (let _ = map_set prim_missing "n" (mkstr "chr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chr'")) in fail "mere-ruby: undefined method 'chr'")))

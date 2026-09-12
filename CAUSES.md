@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 153 files.
+Classified: 152 files.
 
-## DIFF — 153 files, 71 kinds
+## DIFF — 152 files, 71 kinds
 
 | files | kind |
 |---|---|
@@ -38,7 +38,6 @@ Classified: 153 files.
 | 2 | `FAILED expected N, got nil` |
 | 2 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 2 | `ERROR RuntimeError` |
-| 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
 | 1 | `FAILED raised StandardError, expected SyntaxError` |
@@ -87,6 +86,7 @@ Classified: 153 files.
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `ERROR SystemExit` |
 | 1 | `ERROR StandardError` |
+| 1 | `ERROR RangeError` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 

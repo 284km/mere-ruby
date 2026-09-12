@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **153** of **153** recorded DIFF files.
+Visited **152** of **152** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -105,9 +105,6 @@ Visited **153** of **153** recorded DIFF files.
 | core/hash/inspect_spec.rb | FAILED: does not call #to_s on a String returned from #inspect: expected "{:a=>\"abc\"}", got "{a: \"abc\"}" |
 | core/hash/rehash_spec.rb | FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true |
 | core/hash/rehash_spec.rb | pass=22 fail=1 err=0 |
-| core/integer/chr_spec.rb | ERROR: and self is greater than 255 returns a String with the default internal encoding: RangeError -- 256 out of char range |
-| core/integer/chr_spec.rb | ERROR: and self is greater than 255 returns a String encoding self interpreted as a codepoint in the default internal encoding: RangeError -- 256 out of char range |
-| core/integer/chr_spec.rb | ERROR: Integer#chr with an encoding argument accepts a String as an argument: RuntimeError -- |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
@@ -203,7 +200,7 @@ Visited **153** of **153** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.505334659, got 0.780025904 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.376444399, got 0.457755003 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
