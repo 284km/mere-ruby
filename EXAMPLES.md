@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **159** of **159** recorded DIFF files.
+Visited **156** of **156** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -203,7 +203,7 @@ Visited **159** of **159** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.174929328, got 0.690608893 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.389719723, got 0.67664494 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -220,14 +220,6 @@ Visited **159** of **159** recorded DIFF files.
 | core/kernel/warn_spec.rb | ERROR: Kernel#warn does not write strings when passed no arguments: NameError -- undefined local variable or method 'warn' for an instance of Object |
 | core/kernel/warn_spec.rb | FAILED: prepends a message with specified line from the backtrace: matcher did not match #<Proc> |
 | core/kernel/warn_spec.rb | FAILED: prepends a message with specified line from the backtrace: matcher did not match #<Proc> |
-| core/matchdata/element_reference_spec.rb | FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8> |
-| core/matchdata/element_reference_spec.rb | pass=39 fail=1 err=0 |
-| core/matchdata/post_match_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |
-| core/matchdata/post_match_spec.rb | FAILED: sets an empty result to the encoding of the source String: expected to be identical |
-| core/matchdata/post_match_spec.rb | pass=2 fail=2 err=0 |
-| core/matchdata/pre_match_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |
-| core/matchdata/pre_match_spec.rb | FAILED: sets an empty result to the encoding of the source String: expected to be identical |
-| core/matchdata/pre_match_spec.rb | pass=2 fail=2 err=0 |
 | core/method/call_spec.rb | FAILED: does not call the original method name even if it now exists: expected [:argument], got :not_called |
 | core/method/call_spec.rb | pass=7 fail=1 err=0 |
 | core/method/curry_spec.rb | FAILED: expected ArgumentError to be raised |
@@ -418,7 +410,7 @@ Visited **159** of **159** recorded DIFF files.
 | language/module_spec.rb | pass=15 fail=0 err=1 |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |
-| language/predefined_spec.rb | FAILED: sets the encoding to the encoding of the source String: expected to be identical |
+| language/predefined_spec.rb | ERROR: Predefined global $! is Fiber-local: NoMethodError -- undefined method 'yield' for class Fiber |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |

@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 159 files.
+Classified: 156 files.
 
-## DIFF — 159 files, 73 kinds
+## DIFF — 156 files, 73 kinds
 
 | files | kind |
 |---|---|
@@ -21,16 +21,16 @@ Classified: 159 files.
 | 9 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `ERROR NameError` |
-| 6 | `FAILED expected to be identical` |
 | 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected true, got false` |
+| 4 | `FAILED expected to be identical` |
 | 4 | `FAILED expected N, got N` |
-| 4 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
 | 3 | `pass=N fail=N err=N` |
+| 3 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected not to be identical` |
@@ -97,7 +97,6 @@ Classified: 159 files.
 | 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
-| 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: expected NoMethodError to be raised` |
@@ -126,7 +125,6 @@ Classified: 159 files.
 | 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
 | 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
-| 1 | `FAILED: returns matches in the String's encoding: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
@@ -134,6 +132,8 @@ Classified: 159 files.
 | 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#it'" to match` |
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
+| 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
+| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
 
 </details>
 

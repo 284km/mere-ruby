@@ -442,6 +442,13 @@ let senc_set = fn (id: int) -> fn (nm: str) ->
         else ())
   else (let _ = map_set str_enc (str_of_int id) nm in ());
 let senc_get = fn (id: int) -> if map_has str_enc (str_of_int id) then map_get str_enc (str_of_int id) else "UTF-8";
+// A new String that carries a GIVEN encoding. Every string derived from a
+// subject must wear the subject's encoding, not the default: a MatchData over
+// an EUC-JP string answered UTF-8 for #[0] / #pre_match / $& / $1, because the
+// substring was built with a bare mkstr and encoding is per-handle.
+let mkstr_e = fn (s: str) -> fn (enc: str) ->
+  (let v = mkstr s in
+   let _ = (match v with VStr h -> senc_set h enc | _ -> ()) in v);
 // frozen-string tracking + CLI frozen-string-literal mode + __FILE__ path.
 let str_frozen = map_new () in
 let str_chilled = map_new () in
@@ -11461,6 +11468,14 @@ let rec arr_values_at = fn (xs: Val list) -> fn (idxs: Val list) ->
 
 let rec val_list_of_strs = fn (ss: str list) ->
   match ss with Nil -> Nil | Cons (h, t) -> Cons (mkstr h, val_list_of_strs t);
+// Stamp a freshly built list of Strings with an encoding. #lines / #each_line
+// cut their pieces out of the receiver, so each piece wears the RECEIVER's
+// encoding -- val_list_of_strs alone left them all UTF-8.
+let rec val_strs_tag = fn (xs: Val list) -> fn (e: str) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (VStr h2, t) -> (let _ = senc_set h2 e in Cons (VStr h2, val_strs_tag t e))
+  | Cons (h2, t) -> Cons (h2, val_strs_tag t e);
 // `lines(chomp: true)`: the same lines with their terminator taken off.
 let rec val_map_chomp = fn (xs: Val list) ->
   match xs with
@@ -14062,12 +14077,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | ERegex (pat, pfl) ->
          let vb = eval_e env world blk b in
          (match vb with
-          | VStr sv -> let sv = sget sv in
-            let r = rx_do_match world pat pfl sv in
+          | VStr sv -> let se9 = senc_get sv in let sv = sget sv in
+            let r = rx_do_match world pat pfl sv se9 in
             let _ = set_named_caps env pat 0 0 in r
           // a Symbol matches like its name
           | VSym sv ->
-            let r = rx_do_match world pat pfl sv in
+            let r = rx_do_match world pat pfl sv (sym_enc_name sv) in
             let _ = set_named_caps env pat 0 0 in r
           | _ -> VNil)
        | _ -> VNil)
@@ -14320,7 +14335,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        | VStr sv0 ->
          (let sv = sget sv0 in
           match vb with
-          | VRegex (p, pf) -> rx_do_match world p pf sv
+          | VRegex (p, pf) -> rx_do_match world p pf sv (senc_get sv0)
           // string =~ string is ruby's own type mismatch; any OTHER object
           // is asked for ITS #=~ with self (a mock's stubbed =~ answers).
           | VStr _ -> raise_exc world "TypeError" "type mismatch: String given"
@@ -14334,8 +14349,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              then invoke world nb (VObj oq) oclq "method_missing" (Cons (VSym "=~", Cons (va0, Nil)))
              else VNil)
           | _ -> VNil)
-       | VSym sv -> (match vb with VRegex (p, pf) -> rx_do_match world p pf sv | _ -> VNil)
-       | VRegex (p, pf) -> (match vb with VStr sv -> let sv = sget sv in rx_do_match world p pf sv | VSym sv -> rx_do_match world p pf sv | _ -> VNil)
+       | VSym sv -> (match vb with VRegex (p, pf) -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
+       | VRegex (p, pf) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
       (let vb = vb in
@@ -16961,7 +16976,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                     (if str_eq sep "\n" then val_list_of_strs (str_lines_go sv 0 0 (str_len sv))
                      else val_list_of_strs (str_lines_sep sv sep))
                   | _ -> val_list_of_strs (str_lines_go sv 0 0 (str_len sv))) in
-        iter_each_result (arr_each world encl theblk ls) recv)
+        iter_each_result (arr_each world encl theblk (val_strs_tag ls (senc_get h))) recv)
      else if str_eq name "each_with_index" then iter_each_result (arr_each world encl theblk (with_index_pairs (utf8_chars_val sv 0) 0)) recv
      else prim_method recv name args)
   | VArr id -> let xs = deref id in
@@ -25157,13 +25172,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (let src = (if map_has ivars (str_of_int id ++ "@__src") then (match map_get ivars (str_of_int id ++ "@__src") with VStr h -> sget h | _ -> "") else "") in
        let st = (if map_has ivars (str_of_int id ++ "@__st") then (match map_get ivars (str_of_int id ++ "@__st") with VInt n -> n | _ -> 0) else 0) in
        let en = (if map_has ivars (str_of_int id ++ "@__en") then (match map_get ivars (str_of_int id ++ "@__en") with VInt n -> n | _ -> 0) else 0) in
-       if str_eq name "pre_match" then mkstr (substring src 0 st)
-       else if str_eq name "post_match" then mkstr (substring src en (str_len src))
+       let menc = (if map_has ivars (str_of_int id ++ "@__enc") then (match map_get ivars (str_of_int id ++ "@__enc") with VStr h9 -> sget h9 | _ -> "UTF-8") else "UTF-8") in
+       if str_eq name "pre_match" then mkstr_e (substring src 0 st) menc
+       else if str_eq name "post_match" then mkstr_e (substring src en (str_len src)) menc
        // #string is the SAME frozen String every time, as ruby's is: the
        // subject is not copied per call, so `m.string.equal?(m.string)` holds
        else if str_eq name "string" then
          (if map_has ivars (str_of_int id ++ "@__strobj") then map_get ivars (str_of_int id ++ "@__strobj")
-          else (let v9 = mkstr src in
+          else (let v9 = mkstr_e src menc in
                 let _ = (match v9 with VStr h9 -> sfrozen_set h9 | _ -> ()) in
                 let _ = map_set ivars (str_of_int id ++ "@__strobj") v9 in v9))
        else
@@ -27457,8 +27473,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              | (r, re) ->
                // the block may have run its own matches: $~ afterwards is THIS
                // method's last (gsub) / first (sub) match again.
-               let _ = (if all9 then (let _ = rb_scan_lastpub world pat9 pf9 s0 in ())
-                        else (let _ = rb_sub_firstpub world pat9 pf9 s0 in ())) in
+               let _ = (if all9 then (let _ = rb_scan_lastpub world pat9 pf9 s0 (senc_get sid) in ())
+                        else (let _ = rb_sub_firstpub world pat9 pf9 s0 (senc_get sid) in ())) in
                if bang9 then
                  (if str_eq r s0 then VNil
                   else (let _ = sset sid r in let _ = senc_set sid re in recv))
@@ -27481,14 +27497,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // and silently dropped the block.
        else if str_eq name "scan" && (match recv with VStr _ -> true | _ -> false) then
          (match recv with
-          | VStr s -> let s = sget s in
+          | VStr s -> let se9 = senc_get s in let s = sget s in
             (match args with
              | Cons (VRegex (pat, pf), _) ->
-               let _ = rx_scan_blk world newblk pat pf s 0 in
-               let _ = rb_scan_lastpub world pat pf s in recv
+               let _ = rx_scan_blk world newblk pat pf s 0 se9 in
+               let _ = rb_scan_lastpub world pat pf s se9 in recv
              | Cons (VStr p, _) ->
-               let _ = rx_scan_blk world newblk (rx_escape (sget p)) "" s 0 in
-               let _ = rb_scan_lastpub world (rx_escape (sget p)) "" s in recv
+               let _ = rx_scan_blk world newblk (rx_escape (sget p)) "" s 0 se9 in
+               let _ = rb_scan_lastpub world (rx_escape (sget p)) "" s se9 in recv
              | _ -> builtin_iter world blk newblk recv name args)
           | _ -> recv)
        // ⚠ `send(:lambda) { }` / `send(:proc) { }` / `send(:loop) { }`: these
@@ -27973,11 +27989,11 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
   else if str_eq name "=~" then
     (match recv with
-     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> let sv = sget sv in rx_do_match world p pf sv | _ -> VNil)
+     | VRegex (p, pf) -> (match args with Cons (VStr sv, _) -> rx_do_match world p pf (sget sv) (senc_get sv) | _ -> VNil)
      | VStr sv ->
-       (let sv = sget sv in
+       (let se9 = senc_get sv in let sv = sget sv in
         match args with
-        | Cons (VRegex (p, pf), _) -> rx_do_match world p pf sv
+        | Cons (VRegex (p, pf), _) -> rx_do_match world p pf sv se9
         // string =~ string is ruby's own type mismatch; any OTHER object is
         // asked for ITS #=~ with self (a mock's stubbed =~ answers).
         | Cons (VStr _, _) -> raise_exc world "TypeError" "type mismatch: String given"
@@ -28286,13 +28302,13 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
              (let _ = (if found then () else
                          (let _ = rx_clear_caps 1 in
                           let _ = map_set globals "~" VNil in
-                          let _ = rx_pub_groups s0 1 false in ())) in
+                          let _ = rx_pub_groups s0 1 false "UTF-8" in ())) in
               app acc ae (substring s0 i n) e0)
            | RBadPat -> (acc ++ substring s0 i n, ae)
            | RHit (st, en, saves) ->
              let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
              let _ = rxv_export_caps saves ng in
-             let _ = rx_publish_at world s0 st en ng in
+             let _ = rx_publish_at world s0 st en ng (senc_get h) in
              let (rep, re9) = (match repv with
                                | VStr rh -> (rx_expand_rep (sget rh) s0 st en 0 "", enc_canon_name (senc_get rh))
                                | VHsh _ ->
@@ -28334,7 +28350,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                          | Cons (VStr p9, _) -> (rx_escape (sget p9), "")
                          | _ -> ("", "")) in
         let items = rx_scan_all2 pat pf sv 0 in
-        let _ = rb_scan_lastpub world pat pf sv in
+        let _ = rb_scan_lastpub world pat pf sv (senc_get h) in
         arr_new (rb_scan_tag items e))
      | _ -> VNil)
   // String#index/rindex/byteindex/byterindex/partition/rpartition with a
@@ -28355,11 +28371,11 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                     | RHit (st, en, saves) ->
                       (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
                        let _ = rxv_export_caps saves ng in
-                       let _ = rx_publish_at world s st en ng in ())
+                       let _ = rx_publish_at world s st en ng (senc_get h) in ())
                     | _ ->
                       (let _ = rx_clear_caps 1 in
                        let _ = map_set globals "~" VNil in
-                       let _ = rx_pub_groups s 1 false in ()))
+                       let _ = rx_pub_groups s 1 false "UTF-8" in ()))
                  | _ -> ()) in
         prim_method recv name args)
      | _ -> VNil)
@@ -28391,7 +28407,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
              if off < 0 || off > lim then VNil
              else
                let bst = (if str_eq name "index" then utf8_boff sv off 0 else off) in
-               (match rx_idx_pub world p pf sv bst with
+               (match rx_idx_pub world p pf sv bst (senc_get h) with
                 | VInt ci -> (if str_eq name "index" then VInt ci else VInt (utf8_boff sv ci 0))
                 | other -> other))
           else if str_eq name "rindex" || str_eq name "byterindex" then
@@ -28406,7 +28422,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
              else
                let blim = (if str_eq name "rindex" then utf8_boff sv (if off > cn then cn else off) 0
                            else (if off > n then n else off)) in
-               (match rx_last_pub world p pf sv blim with
+               (match rx_last_pub world p pf sv blim (senc_get h) with
                 | VInt ci -> (if str_eq name "rindex" then VInt ci else VInt (utf8_boff sv ci 0))
                 | other -> other))
           else if str_eq name "partition" then
@@ -28414,8 +28430,8 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
              | RHit (st, en, saves) ->
                (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
                 let _ = rxv_export_caps saves ng in
-                let _ = rx_publish_at world sv st en ng in
-                arr_new (Cons (mkstr (substring sv 0 st), Cons (mkstr (substring sv st en), Cons (mkstr (substring sv en n), Nil)))))
+                let _ = rx_publish_at world sv st en ng (senc_get h) in
+                arr_new (Cons (mkstr_e (substring sv 0 st) (senc_get h), Cons (mkstr_e (substring sv st en) (senc_get h), Cons (mkstr_e (substring sv en n) (senc_get h), Nil)))))
              | _ -> (let _ = map_set globals "~" VNil in
                      arr_new (Cons (mkstr sv, Cons (mkstr "", Cons (mkstr "", Nil))))))
           else
@@ -28423,13 +28439,13 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
              if st < 0 then (let _ = map_set globals "~" VNil in
                              arr_new (Cons (mkstr "", Cons (mkstr "", Cons (mkstr sv, Nil)))))
              else
-               (let _ = rx_last_pub world p pf sv n in
-                arr_new (Cons (mkstr (substring sv 0 st), Cons (mkstr (substring sv st en), Cons (mkstr (substring sv en n), Nil))))))
+               (let _ = rx_last_pub world p pf sv n (senc_get h) in
+                arr_new (Cons (mkstr_e (substring sv 0 st) (senc_get h), Cons (mkstr_e (substring sv st en) (senc_get h), Cons (mkstr_e (substring sv en n) (senc_get h), Nil))))))
         | _ -> VNil)
      | _ -> VNil)
   else if str_eq name "match" && (match recv with VStr _ -> true | VRegex _ -> true | VSym _ -> true | _ -> false) then
-    (let hit = (fn (p: str) -> fn (pf: str) -> fn (sv: str) ->
-                  let _ = rx_do_match world p pf sv in
+    (let hit = (fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (enc: str) ->
+                  let _ = rx_do_match world p pf sv enc in
                   if map_has globals "~" then map_get globals "~" else VNil) in
      match recv with
      // ...and #match, for the same reason.
@@ -28442,9 +28458,9 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
           let cn = utf8_len sv in
           let cst = (if off < 0 then cn + off else off) in
           if cst < 0 || cst > cn then VNil
-          else hit p pf (substring sv (utf8_boff sv cst 0) (str_len sv))
-        | Cons (VRegex (p, pf), _) -> hit p pf sv
-        | Cons (VStr p, _) -> hit (sget p) "" sv
+          else hit p pf (substring sv (utf8_boff sv cst 0) (str_len sv)) (senc_get h)
+        | Cons (VRegex (p, pf), _) -> hit p pf sv (senc_get h)
+        | Cons (VStr p, _) -> hit (sget p) "" sv (senc_get h)
         // a Regexp SUBCLASS instance (an object with its own #match) decides
         // itself: ruby calls pattern.match(self).
         | Cons (VObj oq, _) ->
@@ -28469,15 +28485,15 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
            let cn9 = utf8_len s9 in
            let cst9 = (if off9 < 0 then cn9 + off9 else off9) in
            if cst9 < 0 || cst9 > cn9 then VNil
-           else hit p pf (substring s9 (utf8_boff s9 cst9 0) (str_len s9)))
-        | Cons (VStr sv, _) -> hit p pf (sget sv)
-        | Cons (VSym sv, _) -> hit p pf sv
+           else hit p pf (substring s9 (utf8_boff s9 cst9 0) (str_len s9)) (senc_get sv))
+        | Cons (VStr sv, _) -> hit p pf (sget sv) (senc_get sv)
+        | Cons (VSym sv, _) -> hit p pf sv (sym_enc_name sv)
         // nil matches nothing (and does NOT refuse); anything else has to be
         // string-like, and ruby names what it could not convert.
         | Cons (VNil, _) -> VNil
         | Cons (other, _) ->
           (match conv_try env world other "to_str" with
-           | VStr sv2 -> hit p pf (sget sv2)
+           | VStr sv2 -> hit p pf (sget sv2) (senc_get sv2)
            | _ -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String"))
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
      | _ -> VNil)
@@ -28567,10 +28583,10 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                              | RHit (st9, _, _) -> st9 == 0
                              | RBadPat -> rx_find_start pat sv 0 == 0
                              | RNoHit -> false) in
-                 if anch then (let _ = rx_do_match world pat pf sv in VBool true)
+                 if anch then (let _ = rx_do_match world pat pf sv (senc_get h) in VBool true)
                  else (let _ = rx_clear_caps 1 in
                        let _ = map_set globals "~" VNil in
-                       let _ = rx_pub_groups sv 1 false in
+                       let _ = rx_pub_groups sv 1 false "UTF-8" in
                        go t9))
               // end_with? takes no Regexp at all: it is refused as something
               // that cannot convert to a String, which is what ruby says.
@@ -30256,7 +30272,7 @@ and str_slice_bang_rx = fn env -> fn world -> fn (h: int) -> fn (args: Val list)
       | RHit (st, en, saves) ->
         (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
          let _ = rxv_export_caps saves ng in
-         let _ = rx_publish_at world s st en ng in
+         let _ = rx_publish_at world s st en ng (senc_get h) in
          let gk0 = (match rest with
                     | Cons (VInt g, _) -> g
                     | Cons (VFlt f, _) -> int_of_float f
@@ -30276,7 +30292,7 @@ and str_slice_bang_rx = fn env -> fn world -> fn (h: int) -> fn (args: Val list)
       | _ ->
         (let _ = rx_clear_caps 1 in
          let _ = map_set globals "~" VNil in
-         let _ = rx_pub_groups s 1 false in VNil))
+         let _ = rx_pub_groups s 1 false "UTF-8" in VNil))
    | _ -> VNil)
 
 // mutate the string behind handle h in place; returns the method's value
@@ -33012,7 +33028,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = map_set prim_missing "n" (mkstr "scan") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scan'")) in fail "mere-ruby: undefined method 'scan'")))
   // `lines(chomp: true)` drops each terminator, which is what a caller
   // splitting input almost always wants.
-  else if str_eq name "lines" then (match recv with VStr s -> let s = sget s in
+  else if str_eq name "lines" then (match recv with VStr s -> let se9 = senc_get s in let s = sget s in
       // lines(sep = $/, chomp: false): a custom separator stays attached to
       // each piece, "" is paragraph mode, and $/ = nil means one piece.
       (let copt = (let rec last_hash = fn (xs: Val list) -> fn (acc: bool) ->
@@ -33035,7 +33051,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    (if str_eq sep "\n" then val_list_of_strs (str_lines_go s 0 0 (str_len s))
                     else val_list_of_strs (str_lines_sep s sep))
                  | _ -> val_list_of_strs (str_lines_go s 0 0 (str_len s))) in
-       if copt then arr_new (val_map_chomp ls) else arr_new ls) | _ -> (let _ = map_set prim_missing "n" (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
+       if copt then arr_new (val_strs_tag (val_map_chomp ls) se9) else arr_new (val_strs_tag ls se9)) | _ -> (let _ = map_set prim_missing "n" (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
   else if str_eq name "split" then
     (match recv with
      | VStr sh0 ->
@@ -42489,11 +42505,11 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
         let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
         let nb = floor_div (nib + 1) 2 in
         let last = (if si + nb < slen then si + nb else slen) in
-        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr (rb_hex_of s si last ""), acc))
+        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (rb_hex_of s si last "") "US-ASCII", acc))
       else if str_eq d "a" || str_eq d "A" then
         let take = (if cnt < 0 then slen - si else cnt) in
         let last = (if si + take < slen then si + take else slen) in
-        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr (rb_str_of_bytes s si last ""), acc))
+        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (rb_str_of_bytes s si last "") "ASCII-8BIT", acc))
       else if str_eq d "B" || str_eq d "b" then
         // bit string: "B" walks each byte's bits MSB-first, "b" LSB-first;
         // the count is in BITS ('*' = all of them).
@@ -42512,7 +42528,7 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
                         else floor_mod (floor_div by (pw2 pos)) 2) in
              bits9 (k + 1) (out ++ str_of_int bit) in
          let consumed = floor_div (take + 7) 8 in
-         rb_unpack_go s slen (si + consumed) fmt fl fi2 (Cons (mkstr (bits9 0 ""), acc)))
+         rb_unpack_go s slen (si + consumed) fmt fl fi2 (Cons (mkstr_e (bits9 0 "") "US-ASCII", acc)))
       else if str_eq d "m" then
         // base64: decode the rest of the input, skipping '=' padding and
         // anything outside the alphabet (newlines), as ruby's loose "m" does.
@@ -42541,7 +42557,7 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
                   let dv = (if sh == 0 then 1 else if sh == 2 then 4 else 16) in
                   go9 (i + 1) (floor_mod bits2 dv) sh (out ++ chr (floor_div bits2 dv)))
                else go9 (i + 1) bits2 nb2 out in
-         rb_unpack_go s slen slen fmt fl fi2 (Cons (mkstr (go9 si 0 0 ""), acc)))
+         rb_unpack_go s slen slen fmt fl fi2 (Cons (mkstr_e (go9 si 0 0 "") "ASCII-8BIT", acc)))
       else rb_unpack_go s slen si fmt fl fi2 acc  // unknown directive: skip
 // pack helpers: an integer's low w bytes, big- or little-endian.
 and rb_be_bytes = fn (n: int) -> fn (w: int) ->
@@ -47318,15 +47334,15 @@ and case_eqq = fn world -> fn (cand: Val) -> fn (v: Val) ->
     else rb_eq cand v
   | VRegex (p, pf) ->
     (match v with
-     | VStr sv -> let sv = sget sv in (match rx_do_match world p pf sv with VNil -> false | _ -> true)
+     | VStr sv -> (match rx_do_match world p pf (sget sv) (senc_get sv) with VNil -> false | _ -> true)
      // ...and a SYMBOL: `/x/ === :x` is true in ruby, which is how a `case`
      // over symbols with a pattern arm works at all.
-     | VSym sy -> (match rx_do_match world p pf sy with VNil -> false | _ -> true)
+     | VSym sy -> (match rx_do_match world p pf sy (sym_enc_name sy) with VNil -> false | _ -> true)
      // ...and anything that can BECOME a string says so with #to_str, which is
      // the protocol `case s when /x/` follows for a string-like object.
      | VObj _ ->
        (match conv_try gc_cenv0 world v "to_str" with
-        | VStr sv2 -> (match rx_do_match world p pf (sget sv2) with VNil -> false | _ -> true)
+        | VStr sv2 -> (match rx_do_match world p pf (sget sv2) (senc_get sv2) with VNil -> false | _ -> true)
         | _ -> false)
      | _ -> false)
   // `(1..5) === x` / `("a".."z") === s` / `(t1..t2) === t`: one comparison,
@@ -49073,38 +49089,38 @@ and rxv_export_go = fn (saves: (int * int) list) -> fn (ng: int) -> fn (g: int) 
 
 // =~ / .match / ===: run the match and publish $~ / $1..$9. New engine with
 // legacy fallback for uncompilable patterns.
-and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) ->
+and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) -> fn (enc: str) ->
   match rxv_search pat fl sv 0 with
   | RBadPat ->
     (let _ = rx_clear_caps 1 in
      let r = rx_index pat sv in
-     let _ = rx_publish world pat sv r in
+     let _ = rx_publish world pat sv r enc in
      r)
   | RNoHit ->
     (let _ = rx_clear_caps 1 in
      let _ = map_set globals "~" VNil in
-     let _ = rx_pub_groups sv 1 false in
+     let _ = rx_pub_groups sv 1 false "UTF-8" in
      VNil)
   | RHit (st, en, saves) ->
     (let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
      let _ = rxv_export_caps saves ng in
-     let _ = rx_publish_at world sv st en ng in
+     let _ = rx_publish_at world sv st en ng enc in
      // the position Ruby reports is in characters, not bytes
      VInt (utf8_cidx sv st))
 
 // String#index(regexp, offset): search from a byte offset, publish $~ and
 // the groups exactly as =~ does, and answer the hit in CHARACTERS (or nil).
-and rx_idx_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (bst: int) ->
+and rx_idx_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (bst: int) -> fn (enc: str) ->
   match rxv_search p pf sv bst with
   | RHit (st, en, saves) ->
     (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
      let _ = rxv_export_caps saves ng in
-     let _ = rx_publish_at world sv st en ng in
+     let _ = rx_publish_at world sv st en ng enc in
      VInt (utf8_cidx sv st))
   | _ ->
     (let _ = rx_clear_caps 1 in
      let _ = map_set globals "~" VNil in
-     let _ = rx_pub_groups sv 1 false in
+     let _ = rx_pub_groups sv 1 false "UTF-8" in
      VNil)
 
 // byte span of the LAST match whose start is at or before `limit` bytes
@@ -49124,13 +49140,13 @@ and rx_last_hit = fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (from: int) 
 // answers the first position where one begins -- \G stays pinned to pos (the
 // override slot), which is how /YOU\G/ can match five characters earlier.
 // Published like =~, answered in characters (or nil).
-and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (limit: int) ->
+and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (limit: int) -> fn (enc: str) ->
   let _ = map_set rx_ganchor "o" limit in
   let rec down = fn (q: int) ->
     if q < 0 then
       (let _ = rx_clear_caps 1 in
        let _ = map_set globals "~" VNil in
-       let _ = rx_pub_groups sv 1 false in
+       let _ = rx_pub_groups sv 1 false "UTF-8" in
        VNil)
     else
       (match rxv_search p pf sv q with
@@ -49138,7 +49154,7 @@ and rx_last_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn 
          (if st == q then
             (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
              let _ = rxv_export_caps saves ng in
-             let _ = rx_publish_at world sv st en ng in
+             let _ = rx_publish_at world sv st en ng enc in
              VInt (utf8_cidx sv st))
           else down (q - 1))
        | _ -> down (q - 1)) in
@@ -49168,7 +49184,7 @@ and rb_scan_tag = fn (xs: Val list) -> fn (e: str) ->
   | Cons (h2, t) -> Cons (h2, rb_scan_tag t e)
 // after scan, $~ is the LAST match's MatchData (nil when none): find the
 // last start, re-run there, publish as =~ would.
-and rb_scan_lastpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) ->
+and rb_scan_lastpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) -> fn (enc: str) ->
   let rec go = fn (i: int) -> fn (found: bool) -> fn (lst: int) ->
     (match rxv_search pat pf sv i with
      | RHit (st, en, _) -> go (if en > st then en else st + (if st < str_len sv then utf8_clen sv st else 1)) true st
@@ -49179,24 +49195,24 @@ and rb_scan_lastpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) 
       | RHit (st2, en2, saves) ->
         (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
          let _ = rxv_export_caps saves ng in
-         let _ = rx_publish_at world sv st2 en2 ng in ())
+         let _ = rx_publish_at world sv st2 en2 ng enc in ())
       | _ -> ())
    | _ ->
      (let _ = rx_clear_caps 1 in
       let _ = map_set globals "~" VNil in
-      let _ = rx_pub_groups sv 1 false in ()))
+      let _ = rx_pub_groups sv 1 false "UTF-8" in ()))
 
 // after sub, $~ is the FIRST match's MatchData (nil when none).
-and rb_sub_firstpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) ->
+and rb_sub_firstpub = fn world -> fn (pat: str) -> fn (pf: str) -> fn (sv: str) -> fn (enc: str) ->
   match rxv_search pat pf sv 0 with
   | RHit (st, en, saves) ->
     (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
      let _ = rxv_export_caps saves ng in
-     let _ = rx_publish_at world sv st en ng in ())
+     let _ = rx_publish_at world sv st en ng enc in ())
   | _ ->
     (let _ = rx_clear_caps 1 in
      let _ = map_set globals "~" VNil in
-     let _ = rx_pub_groups sv 1 false in ())
+     let _ = rx_pub_groups sv 1 false "UTF-8" in ())
 
 // index of the next `>` at or after p (for a (?<name> header).
 and rx_name_end = fn (pat: str) -> fn (p: int) ->
@@ -49244,39 +49260,42 @@ and rx_clear_caps = fn (i: int) ->
     let _ = if map_has rx_caps ("e" ++ str_of_int i) then map_delete rx_caps ("e" ++ str_of_int i) else () in
     rx_clear_caps (i + 1)
 
-and rx_publish = fn world -> fn (pat: str) -> fn (sv: str) -> fn (r: Val) ->
+and rx_publish = fn world -> fn (pat: str) -> fn (sv: str) -> fn (r: Val) -> fn (enc: str) ->
   (match r with
    | VNil ->
-     let _ = map_set globals "~" VNil in rx_pub_groups sv 1 false
+     let _ = map_set globals "~" VNil in rx_pub_groups sv 1 false "UTF-8"
    | _ ->
      let st = (match r with VInt p -> p | _ -> 0) in
      let en = (let e = rxe_alts pat (rxe_start pat) sv st in if e < 0 then st else e) in
-     rx_publish_at world sv st en (0 - 1))
+     rx_publish_at world sv st en (0 - 1) enc)
 
 // publish a match at (st, en): a MatchData in $~ (group 0 = the whole match,
 // groups 1..9 read from rx_caps) and the $1..$9 globals. ng >= 0 records the
 // pattern's group count on the object (so #to_a nil-fills unparticipated
 // groups); -1 = unknown (legacy engine).
-and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> fn (ng: int) ->
+and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> fn (ng: int) -> fn (enc: str) ->
   let (meths, sup, ocls, ivars) = world in
   let id = alloc_oid ocls in
   let _ = map_set ocls (str_of_int id) "MatchData" in
   let _ = map_set globals "~" (VObj id) in
-  let _ = map_set ivars (str_of_int id ++ "@0") (mkstr (substring sv st en)) in
+  let _ = map_set ivars (str_of_int id ++ "@0") (mkstr_e (substring sv st en) enc) in
   let _ = map_set md_whole (str_of_int id) (substring sv st en) in
   // keep the subject and the span, so #pre_match / #post_match / #begin / #end
   // (and $` / $' / $&, which are derived from them) can be answered.
-  let _ = map_set ivars (str_of_int id ++ "@__src") (mkstr sv) in
+  let _ = map_set ivars (str_of_int id ++ "@__src") (mkstr_e sv enc) in
+  // the subject's encoding, so the LAZY accessors (#pre_match / #post_match /
+  // #string) can wear it too -- they build their String on demand.
+  let _ = map_set ivars (str_of_int id ++ "@__enc") (mkstr enc) in
   let _ = map_set ivars (str_of_int id ++ "@__st") (VInt st) in
   let _ = map_set ivars (str_of_int id ++ "@__en") (VInt en) in
   let _ = (if ng >= 0 then map_set ivars (str_of_int id ++ "@__ng") (VInt ng) else ()) in
   // the pattern this match came from, so #[](:name) / #names / #named_captures
   // can look its group names up (rx_prog_names, keyed the same way).
   let _ = (if map_has rx_cur "k" then map_set ivars (str_of_int id ++ "@__key") (map_get rx_cur "k") else ()) in
-  let _ = rx_store_groups ivars id sv 1 in
-  rx_pub_groups sv 1 true
+  let _ = rx_store_groups ivars id sv 1 enc in
+  rx_pub_groups sv 1 true enc
 
-and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
+and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) -> fn (enc: str) ->
   if g > 64 then ()
   else
     let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
@@ -49288,10 +49307,10 @@ and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) ->
                   // reported where the whole match started
                   (let _ = map_set ivars (str_of_int id ++ "@__st" ++ str_of_int g) (VInt a) in
                    let _ = map_set ivars (str_of_int id ++ "@__en" ++ str_of_int g) (VInt b) in
-                   map_set ivars (str_of_int id ++ "@" ++ str_of_int g) (mkstr (substring sv a b)))
+                   map_set ivars (str_of_int id ++ "@" ++ str_of_int g) (mkstr_e (substring sv a b) enc))
                 else ())
              else ()) in
-    rx_store_groups ivars id sv (g + 1)
+    rx_store_groups ivars id sv (g + 1) enc
 
 // MatchData#to_a (start=0, incl. whole match) / #captures (start=1).
 // WHICH groups a MatchData exposes. A pattern with named groups exposes ONLY
@@ -49389,7 +49408,7 @@ and md_collect_nums = fn ivars -> fn (id: int) -> fn (ns: int list) ->
     Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int g) then map_get ivars (str_of_int id ++ "@" ++ str_of_int g) else VNil),
           md_collect_nums ivars id t)
 
-and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
+and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) -> fn (enc: str) ->
   if i > 9 then ()
   else
     let k_s = "s" ++ str_of_int i in
@@ -49397,10 +49416,10 @@ and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) ->
     let v = if ok && map_has rx_caps k_s && map_has rx_caps k_e then
               (let a = map_get rx_caps k_s in
                let b = map_get rx_caps k_e in
-               if b >= a then mkstr (substring sv a b) else VNil)
+               if b >= a then mkstr_e (substring sv a b) enc else VNil)
             else VNil in
     let _ = map_set globals (str_of_int i) v in
-    rx_pub_groups sv (i + 1) ok
+    rx_pub_groups sv (i + 1) ok enc
 
 // zero-or-more of the element at p, then the rest (greedy with backtrack).
 and rx_many = fn (pat: str) -> fn (p: int) -> fn (elen: int) -> fn (s: str) -> fn (i: int) ->
@@ -49586,7 +49605,7 @@ and rx_expand_rep = fn (rep: str) -> fn (s: str) -> fn (mst: int) -> fn (men: in
 // gsub/sub with a BLOCK: for each match, publish $~/$1..$9, call the block
 // with the whole match string, and use its (to_s'd) result as the
 // replacement. all=true replaces every match, all=false only the first.
-and rx_gsub_blk = fn world -> fn newblk -> fn (pat: str) -> fn (s: str) -> fn (all: bool) -> fn (i: int) -> fn (acc: str) ->
+and rx_gsub_blk = fn world -> fn newblk -> fn (pat: str) -> fn (s: str) -> fn (all: bool) -> fn (i: int) -> fn (enc: str) -> fn (acc: str) ->
   let n = str_len s in
   let ps = rxe_start pat in
   let st = rx_find_start pat s i in
@@ -49597,17 +49616,17 @@ and rx_gsub_blk = fn world -> fn newblk -> fn (pat: str) -> fn (s: str) -> fn (a
     let en0 = rxe_alts pat ps s st in
     let en = if en0 < 0 then st else en0 in
     let m = substring s st en in
-    let _ = rx_publish world pat s (VInt st) in
-    let rv9 = flow_value (run_block world nb newblk (Cons (mkstr m, Nil))) in
+    let _ = rx_publish world pat s (VInt st) enc in
+    let rv9 = flow_value (run_block world nb newblk (Cons (mkstr_e m enc, Nil))) in
     let rep = w_to_s world rv9 in
     if en <= st then
       // zero-width match: insert the replacement, copy one char, advance.
       let acc2 = acc ++ substring s i st ++ rep in
-      if all then (if st >= n then acc2 else rx_gsub_blk world newblk pat s all (st + 1) (acc2 ++ substring s st (st + 1)))
+      if all then (if st >= n then acc2 else rx_gsub_blk world newblk pat s all (st + 1) enc (acc2 ++ substring s st (st + 1)))
       else acc2 ++ substring s st n
     else
       let acc2 = acc ++ substring s i st ++ rep in
-      if all then rx_gsub_blk world newblk pat s all en acc2
+      if all then rx_gsub_blk world newblk pat s all en enc acc2
       else acc2 ++ substring s en n
 
 // gsub/sub against a regex pattern, expanding \& / \0 / \1..\9 in the
@@ -49718,15 +49737,15 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
      else (acc ++ piece, ae2)) in
   let rec go = fn (i: int) -> fn (acc: str) -> fn (ae: str) ->
     (match rxv_search pat fl s i with
-     | RBadPat -> (rx_gsub_blk world newblk pat s all i acc, ae)
+     | RBadPat -> (rx_gsub_blk world newblk pat s all i (senc_get sid) acc, ae)
      | RNoHit -> app acc ae (substring s i n) e0
      | RHit (st, en, saves) ->
        let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
        let ng2 = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
        let _ = rxv_export_caps saves ng2 in
        let m = substring s st en in
-       let _ = rx_publish_at world s st en ng2 in
-       let bv = flow_value (run_block world nb newblk (Cons (mkstr m, Nil))) in
+       let _ = rx_publish_at world s st en ng2 (senc_get sid) in
+       let bv = flow_value (run_block world nb newblk (Cons (mkstr_e m (senc_get sid), Nil))) in
        let _ = (if bang && (if str_eq (sget sid) s then false else true)
                 then (let _ = prim_raise "RuntimeError" "string modified" in ()) else ()) in
        let (rep, re9) = (match bv with
@@ -49749,19 +49768,25 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
 // the block (the capture array when the pattern has groups, else the matched
 // string), publishing $~/$1.. per match so the block can read them. Mirrors
 // rx_scan_all2's cursor advance (zero-width matches step one char).
-and rx_scan_blk = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) ->
+and rx_scan_blk = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) -> fn (enc: str) ->
   match rxv_search pat fl s i with
   | RBadPat -> ()
   | RNoHit -> ()
   | RHit (st, en, saves) ->
     let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
     let _ = rxv_export_caps saves ng in
-    let _ = rx_publish_at world s st en ng in
-    let item = (if ng == 0 then mkstr (substring s st en) else arr_new (rx_scan_groups s 1 ng)) in
+    let _ = rx_publish_at world s st en ng enc in
+    // the block's argument is a piece of the SUBJECT: it wears the subject's
+    // encoding, the way the blockless #scan's items already did via rb_scan_tag.
+    let item = (if ng == 0 then mkstr_e (substring s st en) enc
+                else (let a9 = arr_new (rx_scan_groups s 1 ng) in
+                      (match a9 with
+                       | VArr id9 -> (let _ = arr_set id9 (rb_scan_tag (deref id9) enc) in a9)
+                       | _ -> a9))) in
     let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
     let _ = flow_value (run_block world nb newblk (Cons (item, Nil))) in
     let nexti = (if en > st then en else st + 1) in
-    rx_scan_blk world newblk pat fl s nexti
+    rx_scan_blk world newblk pat fl s nexti enc
 
 // gsub/sub with a Hash replacement: each match is looked up in the hash and
 // replaced by the (to_s of the) value, or by "" when the key is absent.
