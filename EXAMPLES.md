@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **156** of **156** recorded DIFF files.
+Visited **153** of **153** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -203,7 +203,7 @@ Visited **156** of **156** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.389719723, got 0.67664494 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.505334659, got 0.780025904 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -295,8 +295,6 @@ Visited **156** of **156** recorded DIFF files.
 | core/rational/to_f_spec.rb | pass=0 fail=1 err=0 |
 | core/rational/to_r_spec.rb | FAILED: expected TypeError to be raised |
 | core/rational/to_r_spec.rb | pass=4 fail=1 err=0 |
-| core/regexp/encoding_spec.rb | FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8> |
-| core/regexp/encoding_spec.rb | pass=12 fail=1 err=0 |
 | core/regexp/equal_value_spec.rb | FAILED: is true if self and other have the same character set code: expected false, got true |
 | core/regexp/equal_value_spec.rb | pass=10 fail=1 err=0 |
 | core/regexp/initialize_spec.rb | FAILED: raised FrozenError, expected TypeError |
@@ -316,16 +314,14 @@ Visited **156** of **156** recorded DIFF files.
 | core/regexp/timeout_spec.rb | ERROR: Regexp.timeout raises Regexp::TimeoutError after global timeout elapsed: NameError -- uninitialized constant Regexp::TimeoutError |
 | core/regexp/timeout_spec.rb | ERROR: Regexp.timeout raises Regexp::TimeoutError after timeout keyword value elapsed: NameError -- uninitialized constant Regexp::TimeoutError |
 | core/regexp/timeout_spec.rb | pass=3 fail=0 err=2 |
-| core/regexp/union_spec.rb | FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII> |
-| core/regexp/union_spec.rb | FAILED: returns a Regexp with the encoding of a String containing non-ASCII-compatible characters: expected #<Encoding:ISO-8859-1>, got #<Encoding:UTF-8> |
-| core/regexp/union_spec.rb | FAILED: returns a Regexp with the encoding of multiple non-conflicting ASCII-incompatible String arguments: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII> |
+| core/regexp/union_spec.rb | FAILED: returns ASCII-8BIT if the regexp encodings are ASCII-8BIT and at least one has non-ASCII characters: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8> |
+| core/regexp/union_spec.rb | FAILED: returns ASCII-8BIT if the regexp encodings are ASCII-8BIT and at least one has non-ASCII characters: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8> |
+| core/regexp/union_spec.rb | FAILED: returns ASCII-8BIT if the regexp encodings are ASCII-8BIT and at least one has non-ASCII characters: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8> |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/index_spec.rb | FAILED: always clear $~: expected nil, got #<MatchData "a"> |
 | core/string/index_spec.rb | pass=741 fail=1 err=0 |
-| core/string/to_f_spec.rb | FAILED: expected Encoding::CompatibilityError to be raised |
-| core/string/to_f_spec.rb | pass=82 fail=1 err=0 |
 | core/string/uplus_spec.rb | FAILED: returns mutable copy of a literal: expected "mutable", got "" |
 | core/string/uplus_spec.rb | FAILED: returns mutable copy of a literal: expected false, got true |
 | core/string/uplus_spec.rb | pass=5 fail=2 err=0 |
@@ -344,15 +340,12 @@ Visited **156** of **156** recorded DIFF files.
 | core/symbol/all_symbols_spec.rb | ERROR: Symbol.all_symbols returns an array of Symbols: NoMethodError -- undefined method 'all_symbols' for class Symbol |
 | core/symbol/all_symbols_spec.rb | ERROR: Symbol.all_symbols includes symbols that are strongly referenced: NoMethodError -- undefined method 'all_symbols' for class Symbol |
 | core/symbol/all_symbols_spec.rb | ERROR: Symbol.all_symbols includes symbols that are referenced in source code but not yet executed: NoMethodError -- undefined method 'all_symbols' for class Symbol |
-| core/symbol/casecmp_spec.rb | FAILED: returns nil when comparing characters with different encodings: expected nil, got false |
-| core/symbol/casecmp_spec.rb | FAILED: returns nil when comparing characters with different encodings: expected nil, got false |
-| core/symbol/casecmp_spec.rb | pass=45 fail=2 err=0 |
 | core/symbol/element_reference_spec.rb | FAILED: converts the last value to an Integer: expected "sym", got "symbol" |
 | core/symbol/element_reference_spec.rb | ERROR: with a Range subclass slice returns a slice: TypeError -- no implicit conversion of Object into Integer |
 | core/symbol/element_reference_spec.rb | FAILED: returns a string for the matched capture at the given index: expected "ol", got nil |
-| core/symbol/inspect_spec.rb | FAILED: quotes BINARY symbols: expected ":\"foo\xA4\"", got ":foo\xA4" |
-| core/symbol/inspect_spec.rb | FAILED: quotes symbols in non-ASCII-compatible encodings: expected ":\"foo\"", got ":\"f\x00o\x00o\x00\"" |
-| core/symbol/inspect_spec.rb | FAILED: quotes symbols in non-ASCII-compatible encodings: expected ":\"foo\"", got ":\"\x00f\x00o\x00o\"" |
+| core/symbol/inspect_spec.rb | FAILED: quotes and escapes symbols in dummy encodings: expected ":\"\x61\x62\x63\x64\"", got ":\"\u6162\u6364\"" |
+| core/symbol/inspect_spec.rb | FAILED: quotes and escapes symbols in dummy encodings: expected ":\"\x61\x62\x63\x64\"", got ":\"\u{61626364}\"" |
+| core/symbol/inspect_spec.rb | FAILED: quotes and escapes symbols in dummy encodings: expected ":\"\x61\x62\x63\x64\"", got ":abcd" |
 | core/symbol/to_proc_spec.rb | FAILED: expected NoMethodError to be raised |
 | core/symbol/to_proc_spec.rb | FAILED: only calls public methods: expected [:pub], got [:pub, :pro] |
 | core/symbol/to_proc_spec.rb | FAILED: expected NoMethodError to be raised |

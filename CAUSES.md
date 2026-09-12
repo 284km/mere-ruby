@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 156 files.
+Classified: 153 files.
 
-## DIFF — 156 files, 73 kinds
+## DIFF — 153 files, 71 kinds
 
 | files | kind |
 |---|---|
@@ -30,13 +30,13 @@ Classified: 156 files.
 | 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
 | 3 | `pass=N fail=N err=N` |
-| 3 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got nil` |
+| 2 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -57,7 +57,6 @@ Classified: 156 files.
 | 1 | `FAILED expected to receive #hash` |
 | 1 | `FAILED expected not true` |
 | 1 | `FAILED expected not N` |
-| 1 | `FAILED expected nil, got false` |
 | 1 | `FAILED expected nil, got N` |
 | 1 | `FAILED expected nil, got #<OBJ>` |
 | 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
@@ -75,12 +74,11 @@ Classified: 156 files.
 | 1 | `FAILED expected NameError to be raised` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
-| 1 | `FAILED expected Encoding::CompatibilityError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
-| 1 | `FAILED expected "S"foo\xAN\"S", got "S"` |
+| 1 | `FAILED expected "S"\xN\xN\xN\xN\"S", got "S"\uN\uN\"S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "S" to match` |
@@ -113,7 +111,6 @@ Classified: 156 files.
 | 1 | `FAILED: warns about flags being ignored for regexp arguments: matcher did not match #<Proc>` |
 | 1 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
 | 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
-| 1 | `FAILED: upgrades the encoding to that of an embedded String: expected #<Encoding:EUC-JP>, got #<Encoding:UTF-8>` |
 | 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
 | 1 | `FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {}` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
@@ -123,7 +120,6 @@ Classified: 156 files.
 | 1 | `FAILED: samples evenly: expected truthy from #<=` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
 | 1 | `FAILED: returns the previous seed value: expected 10, got 0` |
-| 1 | `FAILED: returns nil when comparing characters with different encodings: expected nil, got false` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
@@ -133,7 +129,9 @@ Classified: 156 files.
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
 | 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
-| 1 | `FAILED: returns a Regexp with the encoding of an ASCII-incompatible String argument: expected #<Encoding:UTF-16LE>, got #<Encoding:US-ASCII>` |
+| 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
+| 1 | `FAILED: returns ASCII-8BIT if the regexp encodings are ASCII-8BIT and at least one has non-ASCII characters: expected #<Encoding:BINARY (ASCII-8BIT)>, got #<Encoding:UTF-8>` |
+| 1 | `FAILED: returns 'method' if the method is defined: expected "method", got nil` |
 
 </details>
 

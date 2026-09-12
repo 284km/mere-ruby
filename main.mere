@@ -1058,6 +1058,12 @@ let rx_gbodies = map_new ();
 // Per compiled pattern (same key as rx_progs): its named groups, as
 // "name=number|name=number|...". A MatchData answers `m[:name]` from this.
 let rx_prog_names = map_new ();
+// Per compiled pattern (same key again): the encoding a STRING contributed to
+// it. A Regexp's encoding is otherwise derived from its source bytes, which
+// can only ever guess UTF-8 -- `/#{s}/` where s is EUC-JP is an EUC-JP Regexp,
+// and nothing in (source, flags) says so. Only set when the source is not
+// 7-bit: ruby IGNORES the argument's encoding for an all-ASCII pattern.
+let rx_src_enc = map_new ();
 // the cache key of the pattern currently being matched, so the MatchData it
 // publishes can name its groups.
 let rx_cur = map_new ();
@@ -1638,6 +1644,13 @@ let enc_all7 = fn (s: str) ->
   let n = str_len s in
   let rec go = fn (i: int) -> if i >= n then true else if ord (char_at s i) >= 128 then false else go (i + 1) in
   go 0;
+// A symbol's encoding: recorded when it came from a String that had one, else
+// derived -- 7-bit names are US-ASCII, the rest UTF-8. Defined HERE, ahead of
+// `inspect`, because both the inspect rules and the Symbol->String delegation
+// need it and a second copy would drift.
+let sym_enc_name = fn (sy: str) ->
+  if map_has sym_enc sy then map_get sym_enc sy
+  else if enc_all7 sy then "US-ASCII" else "UTF-8";
 // strict UTF-8: continuation shapes, no overlongs, no surrogates, <= U+10FFFF.
 let enc_valid_utf8 = fn (s: str) ->
   let n = str_len s in
@@ -2805,6 +2818,16 @@ and rx_src_nonascii = fn (p: str) -> fn (i: int) ->
 // otherwise a pattern that names a non-ASCII character is in the script's
 // encoding. `fixed_encoding?` is exactly "the answer is not US-ASCII".
 // is any of these union arguments a BINARY (ASCII-8BIT) string?
+and rx_alts_enc = fn (xs: Val list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (VStr h9, t9) ->
+    (let e9 = enc_canon_name (senc_get h9) in
+     // ...either because the encoding itself cannot be read as ASCII, or
+     // because this argument actually carries a byte that is not.
+     if (if enc_ascii_compat e9 then false else true) || (if enc_all7 (sget h9) then false else true)
+     then e9 else rx_alts_enc t9)
+  | Cons (_, t9) -> rx_alts_enc t9
 and rx_alts_binary = fn (xs: Val list) ->
   match xs with
   | Nil -> false
@@ -2816,6 +2839,7 @@ and rx_enc_name = fn (p: str) -> fn (fl: str) ->
   else if str_contains fl "e" then "EUC-JP"
   else if str_contains fl "s" then "Windows-31J"
   else if str_contains fl "n" then (if rx_src_nonascii p 0 then "ASCII-8BIT" else "US-ASCII")
+  else if map_has rx_src_enc (fl ++ chr 1 ++ p) then map_get rx_src_enc (fl ++ chr 1 ++ p)
   else if rx_src_nonascii p 0 then "UTF-8"
   else "US-ASCII"
 
@@ -12018,8 +12042,19 @@ and inspect = fn (v: Val) ->
     // as \xNN in a US-ASCII string and as \uXXXX in a UTF-8 one. Inspecting
     // through the UTF-8 spelling printed `:"\u0000"` where ruby writes
     // `:"\x00"`, while a symbol with real UTF-8 in it still prints as itself.
-    if sym_plain sy then ":" ++ sy
-    else ":\"" ++ esc_str_b sy 0 "" (rx_src_all7 sy 0) ++ "\""
+    // ...and the ENCODING decides whether the name can be plain at all. A
+    // BINARY symbol carrying a high byte is not an identifier (`:"foo\xA4"`),
+    // and a symbol in a non-ASCII-compatible encoding (UTF-16/32) is always
+    // quoted AND shown through its codepoints -- printing its raw bytes gave
+    // `:"f\x00o\x00o\x00"` where ruby writes `:"foo"`. String#inspect already
+    // holds both rules, so the name is inspected AS a String wearing the
+    // symbol's encoding rather than through a second copy of them.
+    (let e9 = enc_canon_name (sym_enc_name sy) in
+     if (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else enc_ascii_compat e9) && sym_plain sy
+     then ":" ++ sy
+     else if enc_ascii_compat e9 && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else true)
+     then ":\"" ++ esc_str_b sy 0 "" (rx_src_all7 sy 0) ++ "\""
+     else ":" ++ inspect (mkstr_e sy e9))
   | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ enc_display_name (map_get enc_name (str_of_int id)) ++ ">" else "#<object>"
   // #<Proc:0xADDR file:line> -- and " (lambda)" for a lambda, which is how
   // ruby tells the two apart in one line of output.
@@ -21398,6 +21433,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | VStr sp ->
        (let body = sget sp in
         let fl = (match args with Cons (VStr f, _) -> sget f | _ -> "") in
+        // the interpolated pieces already merged into ONE string with ONE
+        // encoding; hand it to the pattern so #encoding can answer with it.
+        let _ = (let e9 = rx_alts_enc (Cons (recv, Nil)) in
+                 if str_eq e9 "" then () else (let _ = map_set rx_src_enc (fl ++ chr 1 ++ body) e9 in ())) in
         if rx_validate body fl then rx_build_once body fl args
         // name the pattern: a runtime-built regex is usually assembled from
         // pieces, and the text is the only way to see which piece is bad.
@@ -22393,6 +22432,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       (if (opt / 16) - (opt / 32) * 2 == 1 then "u" else "")
                     | Cons (VStr fs, _) -> sget fs
                     | _ -> "") in
+          let _ = (let e9 = rx_alts_enc (Cons (VStr src, Nil)) in
+                   if str_eq e9 "" then () else (let _ = map_set rx_src_enc (fl ++ chr 1 ++ body) e9 in ())) in
           if rx_validate body fl then rx_build_once body fl args
           else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
        | Cons (VRegex (b2, f2), _) -> VRegex (b2, f2)
@@ -22479,8 +22520,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // ASCII-8BIT for `Regexp.union("\xff".b)`, and this answered UTF-8 --
        // the union of bytes claiming to be characters. `n` is how a pattern
        // says "bytes" here, so the flag carries the fact.
-       | _ -> VRegex (rx_union_go alts "" true,
-                      (if rx_alts_binary alts then "n" else "")))
+       | _ ->
+         (let usrc = rx_union_go alts "" true in
+          let ufl = (if rx_alts_binary alts then "n" else "") in
+          let ue = rx_alts_enc alts in
+          let _ = (if str_eq ue "" then ()
+                   else (let _ = map_set rx_src_enc (ufl ++ chr 1 ++ usrc) ue in ())) in
+          VRegex (usrc, ufl)))
     // Math module functions (only sqrt-derived ones; no trig/log builtin).
     // ...only for the functions Math actually has; anything else (Module's own
     // methods, `class`, `name`, ...) falls through to the general dispatcher.
@@ -30647,9 +30693,6 @@ and sym_str_method = fn (name: str) ->
 // script's encoding otherwise. #to_s only applied the recorded case, so
 // `:abc.to_s.encoding` was UTF-8 where #encoding said US-ASCII -- the same
 // symbol answering two different encodings depending on which door was used.
-and sym_enc_name = fn (sy: str) ->
-  if map_has sym_enc sy then map_get sym_enc sy
-  else if enc_all7 sy then "US-ASCII" else "UTF-8"
 and sym_str_resym = fn (name: str) ->
   str_eq name "downcase" || str_eq name "upcase" || str_eq name "capitalize" ||
   str_eq name "swapcase" || str_eq name "succ" || str_eq name "next"
@@ -30951,11 +30994,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        // comparison names -- `:abc.casecmp("ABC")` is nil, because a Symbol
        // only compares with a Symbol -- so only the symbol form converts.
        (let args = (match args with
-                    | Cons (VSym a9, r9) -> Cons (mkstr a9, r9)
+                    | Cons (VSym a9, r9) -> Cons (mkstr_e a9 (sym_enc_name a9), r9)
                     | Cons (VStr _, _) ->
                       (if str_eq name "casecmp" || str_eq name "casecmp?" then Cons (VNil, Nil) else args)
                     | other9 -> other9) in
-        let r = prim_method (mkstr sy) name args in
+        let r = prim_method (mkstr_e sy (sym_enc_name sy)) name args in
         if sym_str_resym name then (match r with VStr h -> VSym (sget h) | _ -> r) else r)
      | _ -> VNil)
   // universal
@@ -31723,7 +31766,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Integer"))
      | _ -> prim_raise "NoMethodError" ("undefined method 'to_i' for " ++ for_recv_name recv))
   else if str_eq name "to_f" then
-    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (float_of_str n / float_of_str d) | VStr s -> VFlt (str_to_f_lenient (sget s)) | VNil -> VFlt 0.0
+    (match recv with VInt n -> VFlt (float_of_int n) | VFlt f -> VFlt f | VBig s -> VFlt (float_of_str s) | VRat (n, d) -> VFlt (float_of_str n / float_of_str d) | VStr s -> (let e9 = enc_canon_name (senc_get s) in
+                 if enc_ascii_compat e9 then VFlt (str_to_f_lenient (sget s))
+                 else prim_raise "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ e9)) | VNil -> VFlt 0.0
      | VCpx (cre, cim) ->
        (if exact_zero_val cim then VFlt (to_f cre)
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Float"))
