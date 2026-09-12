@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 160 files.
+Classified: 159 files.
 
-## DIFF — 160 files, 73 kinds
+## DIFF — 159 files, 73 kinds
 
 | files | kind |
 |---|---|
@@ -37,7 +37,6 @@ Classified: 160 files.
 | 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected NoMethodError to be raised` |
 | 2 | `FAILED expected N, got nil` |
-| 2 | `FAILED expected "S" to match` |
 | 2 | `ERROR RuntimeError` |
 | 2 | `ERROR RangeError` |
 | 1 | `sh: feature_N: command not found` |
@@ -84,6 +83,7 @@ Classified: 160 files.
 | 1 | `FAILED expected "S"foo\xAN\"S", got "S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
+| 1 | `FAILED expected "S" to match` |
 | 1 | `FAILED expected "Ok.` |
 | 1 | `FAILED expected "` |
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
@@ -96,7 +96,6 @@ Classified: 160 files.
 |---|---|
 | 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
-| 2 | `pass=16 fail=0 err=0` |
 | 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
 | 2 | `FAILED: sets the encoding to the encoding of the source String: expected to be identical` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
@@ -104,7 +103,9 @@ Classified: 160 files.
 | 2 | `FAILED: expected NoMethodError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 1 | `sh: feature_14386: command not found` |
-| 1 | `pass=22 fail=1 err=0` |
+| 1 | `pass=24 fail=1 err=0` |
+| 1 | `pass=19 fail=0 err=0` |
+| 1 | `pass=16 fail=0 err=0` |
 | 1 | `TMPDIR` |
 | 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
@@ -130,10 +131,9 @@ Classified: 160 files.
 | 1 | `FAILED: returns false when a method defined by define_method is called with a block: expected false, got true` |
 | 1 | `FAILED: returns false if both have same Module, same name, identical body but not the same: expected false, got true` |
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
-| 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match` |
+| 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#it'" to match` |
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
 | 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
-| 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
 
 </details>
 

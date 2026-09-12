@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **160** of **160** recorded DIFF files.
+Visited **159** of **159** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -60,7 +60,7 @@ Visited **160** of **160** recorded DIFF files.
 | core/env/shift_spec.rb | pass=6 fail=2 err=0 |
 | core/exception/backtrace_locations_spec.rb | FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'" |
 | core/exception/backtrace_locations_spec.rb | pass=2 fail=1 err=0 |
-| core/exception/backtrace_spec.rb | pass=16 fail=0 err=0 |
+| core/exception/backtrace_spec.rb | pass=19 fail=0 err=0 |
 | core/exception/full_message_spec.rb | FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last): |
 | core/exception/full_message_spec.rb | FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "Traceback (most recent call last): |
 | core/exception/interrupt_spec.rb | ERROR: rescuing Interrupt raises an Interrupt when sent a signal SIGINT: NoMethodError -- undefined method 'kill' for module Process |
@@ -137,9 +137,9 @@ Visited **160** of **160** recorded DIFF files.
 | core/kernel/block_given_spec.rb | FAILED: returns false outside of a method: expected false, got true |
 | core/kernel/block_given_spec.rb | pass=11 fail=2 err=0 |
 | core/kernel/caller_locations_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected truthy from #end_with? |
-| core/kernel/caller_locations_spec.rb | pass=22 fail=1 err=0 |
+| core/kernel/caller_locations_spec.rb | pass=24 fail=1 err=0 |
 | core/kernel/caller_locations_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected truthy from #end_with? |
-| core/kernel/caller_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#describe'" to match |
+| core/kernel/caller_spec.rb | FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#it'" to match |
 | core/kernel/caller_spec.rb | FAILED: returns an Array with the block given to #at_exit at the base of the stack: expected 2, got 0 |
 | core/kernel/caller_spec.rb | FAILED: returns an Array with the block given to #at_exit at the base of the stack: expected nil to match |
 | core/kernel/chomp_spec.rb | ERROR: Kernel#chomp is a private method only when -n is passed: NoMethodError -- undefined method 'popen' for class IO |
@@ -203,7 +203,7 @@ Visited **160** of **160** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.574094992, got 0.80410596 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.174929328, got 0.690608893 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
@@ -396,9 +396,6 @@ Visited **160** of **160** recorded DIFF files.
 | language/defined_spec.rb | FAILED: calls #respond_to_missing?: expected "method", got nil |
 | language/defined_spec.rb | FAILED: calls #respond_to_missing?: expected to receive #respond_to_missing? |
 | language/delegation_spec.rb | ERROR: delegation with def(*) delegates rest: StandardError -- mere-ruby: unexpected token: ) in (eval)     def delegate(*) |
-| language/ensure_spec.rb | FAILED: does not introduce extra backtrace entries: expected "TMPDIR '190.foo'" to match |
-| language/ensure_spec.rb | FAILED: does not introduce extra backtrace entries: expected "TMPDIR 'Object#it'" to match |
-| language/ensure_spec.rb | pass=34 fail=2 err=0 |
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
 | language/execution_spec.rb | pass=16 fail=2 err=0 |
