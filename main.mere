@@ -14913,7 +14913,7 @@ and shift_width_v = fn env -> fn world -> fn (v: Val) ->
   | VBig _ -> v
   | VFlt f ->
     (if str_len (float_special f) > 0
-     then (let _ = prim_raise "FloatDomainError" (float_special f) in VNil)
+     then (let _ = prim_raise "FloatDomainError" (float_domain_msg f) in VNil)
      else VInt (int_of_float f))
   | VNil -> no_conv ()
   | VStr _ -> no_conv ()
@@ -20657,6 +20657,65 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // enumerator (`10.upto(Float::INFINITY)`) is allowed. Anything with no #each
   // at all is ruby's "must respond to :each" TypeError, which prim_method
   // answered with nils.
+  // ---- Integer#[] --------------------------------------------------------
+  // Here rather than beside the other Integer primitives for the same reason
+  // sample is: the index goes through #to_int, and that has to be CALLED.
+  if str_eq name "[]" && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+     && (if prim_user_has world recv "[]" then false else true) then
+    (let arity9 = val_list_len args in
+     if arity9 < 1 || arity9 > 2 then
+       prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int arity9 ++ ", expected 1..2)")
+     else
+       (match args with
+        // n[beg, len]
+        | Cons (bv9, Cons (lv9, _)) ->
+          (match (shift_width_v env world bv9, shift_width_v env world lv9) with
+           | (VInt b9, VInt l9) ->
+             (match recv with
+              | VInt n9 -> VInt (int_aref2_v n9 b9 l9)
+              // a Bignum slice would need the whole shift-and-mask in big
+              // arithmetic; ruby/spec asks only for single bits of one, so
+              // this answers the bit rather than pretending to slice.
+              | _ -> int_aref_bit recv (VInt b9))
+             | _ -> VInt 0)
+        | Cons (VRange (lov9, hiv9, excl9), Nil) ->
+          (match recv with
+           | VInt n9 ->
+             (match lov9 with
+              // ⚠ a BEGINLESS range asks for every bit below the end, and
+              // "below" has no floor: ruby answers 0 when those bits are all
+              // clear and REFUSES otherwise, because the answer would be
+              // infinitely wide.
+              | VNil ->
+                (match shift_width_v env world hiv9 with
+                 | VInt e9 ->
+                   (if e9 < 0 then VInt 0
+                    else (let e2 = (if excl9 then e9 else e9 + 1) in
+                          if int_aref_mask n9 e2 == 0 then VInt 0
+                          else prim_raise "ArgumentError"
+                                 "The beginless range for Integer#[] results in infinity"))
+                 | _ -> VInt 0)
+              | _ ->
+                (match shift_width_v env world lov9 with
+                 | VInt b9 ->
+                   (match hiv9 with
+                    // endless: everything from beg up
+                    | VNil -> VInt (int_aref_shift n9 b9)
+                    | _ ->
+                      (match shift_width_v env world hiv9 with
+                       | VInt e9 ->
+                         (if b9 < e9 then VInt (int_aref2_v n9 b9 ((e9 - b9) + (if excl9 then 0 else 1)))
+                          else if b9 == e9 then (if excl9 then VInt 0 else int_aref_bit recv (VInt b9))
+                          // ⚠ upper below lower is not an empty slice: ruby
+                          // ignores the upper bound and takes everything from
+                          // beg up, which answering 0 got wrong.
+                          else VInt (int_aref_shift n9 b9))
+                       | _ -> VInt 0))
+                 | _ -> VInt 0))
+           | _ -> VInt 0)
+        | Cons (iv9, Nil) -> int_aref_bit recv (shift_width_v env world iv9)
+        | _ -> VInt 0))
+  else
   // ---- Array#sample / #shuffle -------------------------------------------
   // These live up HERE rather than beside the other Array primitives because
   // both take a `random:` object whose #rand has to be CALLED, and the prim
@@ -29743,6 +29802,53 @@ and val_shuffle_r = fn env -> fn world -> fn (rng: Val) -> fn (xs: Val list) -> 
   else
     (let i9 = rnd_index env world rng n in
      Cons (val_nth xs i9, val_shuffle_r env world rng (val_without_nth xs i9) (n - 1) (k - 1)))
+// ---- Integer#[] : a slice of BITS -------------------------------------
+// Transcribed from CRuby's int_aref / int_aref2 rather than approximated. The
+// whole method is two operations:
+//
+//     n[beg, len]  ==  (n >> beg) & ((1 << len) - 1)
+//
+// and every "special case" falls out of them instead of needing an arm:
+//
+//   len < 0   1 << -1 is 0, so the mask is -1 and nothing is masked off --
+//             which is what "ignores negative length" means.
+//   beg < 0   >> by a negative shifts LEFT, moving the window up into the
+//             more significant bits.
+//
+// Writing those as `if beg < 0 || len <= 0 then 0` (which is what stood here)
+// answers zero for both, and for the reversed and endless ranges too.
+and int_aref_shift = fn (n: int) -> fn (k: int) ->
+  if k >= 0 then int_shr_arith n k
+  // ⚠ a left shift past the word is not representable here; ruby promotes to
+  // a Bignum. Everything the caller can still mask off is zero by then, so
+  // this answers 0 rather than an overflowed number.
+  else if 0 - k >= 62 then 0
+  else n * int_pow 2 (0 - k)
+and int_aref_mask = fn (v: int) -> fn (len: int) ->
+  if len < 0 then v                       // mask of -1: every bit survives
+  // ⚠ 2^63 does not fit. Above that width ruby promotes to a Bignum and this
+  // cannot follow: a NEGATIVE value masked to 63 bits or more is a number
+  // wider than the machine word, and what comes back here is the unmasked
+  // (still negative) value rather than that number.
+  else if len >= 63 then v
+  else int_bitop "&" v (int_pow 2 len - 1)
+and int_aref2_v = fn (n: int) -> fn (beg: int) -> fn (len: int) ->
+  int_aref_mask (int_aref_shift n beg) len
+// ...and ONE bit, which is where the index conversions land.
+and int_aref_bit = fn (recv: Val) -> fn (iv: Val) ->
+  (match iv with
+   // an index too big to be a machine word: every bit up there is the sign.
+   | VBig ib -> (if str_len ib > 0 && str_eq (substring ib 0 1) "-" then VInt 0
+                 else (match recv with
+                       | VInt n -> VInt (if n < 0 then 1 else 0)
+                       | _ -> VInt 0))
+   | VInt i ->
+     (if i < 0 then VInt 0
+      else (match recv with
+            | VInt n -> VInt (int_bitop "&" (int_shr_arith n i) 1)
+            | VBig b -> VInt (big_bit_at b i)
+            | _ -> VInt 0))
+   | _ -> VInt 0)
 and prim_user_has = fn world -> fn (recv: Val) -> fn (name: str) ->
   let c = dispatch_cls_of world recv in
   ((if str_eq c "" then false else has_meth world c name)
@@ -35469,7 +35575,7 @@ and rb_fmt_int_v = fn env -> fn world -> fn (v: Val) ->
   | VInt x -> VInt x
   | VBig s -> VBig s
   | VFlt f ->
-    (if str_len (float_special f) > 0 then (let _ = prim_raise "FloatDomainError" (float_special f) in VNil) else VInt (int_of_float f))
+    (if str_len (float_special f) > 0 then (let _ = prim_raise "FloatDomainError" (float_domain_msg f) in VNil) else VInt (int_of_float f))
   | VNil -> (let _ = prim_raise "TypeError" "can't convert nil into Integer" in VNil)
   | VStr h -> rb_int_parse (sget h)
   | _ ->
@@ -36251,6 +36357,12 @@ and rb_pad_num = fn (sign: str) -> fn (ds: str) -> fn (flags: str) -> fn (width:
 // "Inf"/"NaN" for a non-finite float, "" for a finite one. NaN is the value
 // that is not equal to itself; the sign of -NaN is never shown, and -Inf's
 // sign comes from the caller's f < 0.0 (false for NaN, so it needs no case).
+// ⚠ The word a FloatDomainError carries is NOT float_special's. That one is
+// printf's ("Inf", which is what %f writes); the exception says "Infinity" and
+// signs it. Two questions, one function, and the refusal was answering the
+// formatter's: `1[Float::INFINITY]` raised FloatDomainError "Inf".
+and float_domain_msg = fn (f: float) ->
+  if f == f then (if f > 0.0 then "Infinity" else "-Infinity") else "NaN"
 and float_special = fn (f: float) ->
   if f == f then
     (if f > 1.7976931348623157e308 || f < (0.0 - 1.7976931348623157e308) then "Inf" else "")

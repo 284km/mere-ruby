@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **149** of **149** recorded DIFF files.
+Visited **148** of **148** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -21,9 +21,8 @@ Visited **149** of **149** recorded DIFF files.
 | core/array/initialize_spec.rb | ERROR: Array#initialize with (array) does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
 | core/array/intersect_spec.rb | pass=12 fail=1 err=0 pass=13 fail=0 err=0 |
-| core/array/shuffle_spec.rb | pass=41 fail=3 err=0 pass=44 fail=0 err=0 |
-| core/array/shuffle_spec.rb | FAILED: matches CRuby with random:: expected ["a", "c", "b"], got ["c", "b", "a"] |
-| core/array/shuffle_spec.rb | FAILED: matches CRuby with random:: expected [2, 6, 8, 5, 7, 10, 3, 1, 0, 4, 9], got [3, 0, 6, 10, 5, 9, 2, 4, 7, 8, 1] |
+| core/array/shuffle_spec.rb | pass=42 fail=2 err=0 pass=44 fail=0 err=0 |
+| core/array/shuffle_spec.rb | FAILED: matches CRuby with random:: expected [2, 6, 8, 5, 7, 10, 3, 1, 0, 4, 9], got [1, 8, 5, 9, 7, 3, 0, 4, 10, 2, 6] |
 | core/complex/inspect_spec.rb | pass=7 fail=0 err=2 pass=9 fail=0 err=0 |
 | core/complex/inspect_spec.rb | ERROR: Complex#inspect calls #inspect on real and imaginary: TypeError -- not a real |
 | core/complex/to_s_spec.rb | pass=13 fail=0 err=1 pass=14 fail=0 err=0 |
@@ -101,10 +100,6 @@ Visited **149** of **149** recorded DIFF files.
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
-| core/integer/element_reference_spec.rb | pass=26 fail=36 err=0 pass=57 fail=0 err=0 |
-| core/integer/element_reference_spec.rb | FAILED: calls #to_int to convert the argument to an Integer and returns 1 if the nth bit is set: expected 1, got nil |
-| core/integer/element_reference_spec.rb | FAILED: calls #to_int to convert the argument to an Integer and returns 1 if the nth bit is set: expected to receive #to_int |
-| core/integer/element_reference_spec.rb | FAILED: calls #to_int to convert the argument to an Integer and returns 0 if the nth bit is set: expected 0, got nil |
 | core/integer/round_spec.rb | pass=5 fail=3 err=1 pass=7 fail=1 err=0 |
 | core/integer/round_spec.rb | FAILED: raised NameError, expected RangeError |
 | core/integer/round_spec.rb | ERROR: Integer#round calls #to_int on the argument to convert it to an Integer: TypeError -- no implicit conversion of Object into Integer |
@@ -202,7 +197,7 @@ Visited **149** of **149** recorded DIFF files.
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
 | core/kernel/srand_spec.rb | pass=4 fail=8 err=1 pass=11 fail=0 err=1 |
 | core/kernel/srand_spec.rb | FAILED: returns the previous seed value: expected 10, got 0 |
-| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.054703273, got 0.93244642 |
+| core/kernel/srand_spec.rb | FAILED: seeds the RNG correctly and repeatably: expected 0.640674151, got 0.882110366 |
 | core/kernel/srand_spec.rb | ERROR: Kernel#srand defaults number to a random value: RuntimeError -- |
 | core/kernel/system_spec.rb | pass=2 fail=3 err=6 pass=6 fail=1 err=5 |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |

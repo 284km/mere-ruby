@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 149 files.
+Classified: 148 files.
 
-## DIFF — 149 files, 70 kinds
+## DIFF — 148 files, 70 kinds
 
 | files | kind |
 |---|---|
@@ -34,7 +34,6 @@ Classified: 149 files.
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected SyntaxError to be raised` |
-| 2 | `FAILED expected N, got nil` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
@@ -70,6 +69,7 @@ Classified: 149 files.
 | 1 | `FAILED expected RangeError to be raised` |
 | 1 | `FAILED expected NoMethodError to be raised` |
 | 1 | `FAILED expected NameError to be raised` |
+| 1 | `FAILED expected N, got nil` |
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
