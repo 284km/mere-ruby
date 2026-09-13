@@ -10,17 +10,17 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 140 files.
+Classified: 138 files.
 
-## DIFF — 140 files, 68 kinds
+## DIFF — 138 files, 67 kinds
 
 | files | kind |
 |---|---|
 | 15 | `ERROR NoMethodError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
-| 8 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `ERROR NameError` |
+| 7 | `ERROR ArgumentError` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected TypeError to be raised` |
 | 5 | `ERROR TypeError` |
@@ -57,7 +57,6 @@ Classified: 140 files.
 | 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [N], got [N]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
-| 1 | `FAILED expected [N, N, N, N, N, N, N, N, N], got [N, N, N, N, N, N, N, N, N, N]` |
 | 1 | `FAILED expected [:SYM], got :SYM` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
@@ -99,7 +98,6 @@ Classified: 140 files.
 | 1 | `pass=19 fail=0 err=0` |
 | 1 | `pass=16 fail=0 err=0` |
 | 1 | `TMPDIR` |
-| 1 | `FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1]` |
 | 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
 | 1 | `FAILED: will see an alias of the original method as == when in a derived class: expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
 | 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
@@ -129,6 +127,7 @@ Classified: 140 files.
 | 1 | `FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true` |
 | 1 | `FAILED: re-raises a previously rescued exception without overwriting the cause when it's explicitly specified with :cause option and has nil value: expected #<RuntimeError: Error 1>, got nil` |
 | 1 | `FAILED: raises TypeError if 'to_proc' doesn't return a Proc: matcher did not match #<Proc>` |
+| 1 | `FAILED: raised StandardError, expected SyntaxError` |
 
 </details>
 

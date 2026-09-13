@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **140** of **140** recorded DIFF files.
+Visited **138** of **138** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -88,10 +88,6 @@ Visited **140** of **140** recorded DIFF files.
 | core/integer/round_spec.rb | FAILED: raised NameError, expected RangeError |
 | core/integer/round_spec.rb | ERROR: Integer#round calls #to_int on the argument to convert it to an Integer: TypeError -- no implicit conversion of Object into Integer |
 | core/integer/round_spec.rb | FAILED: expected ArgumentError to be raised |
-| core/integer/upto_spec.rb | pass=6 fail=11 err=0 pass=17 fail=0 err=0 |
-| core/integer/upto_spec.rb | FAILED: yields while increasing self until it is greater than floor of a Float endpoint: expected [9, 10, 11, 12, 13, -5, -4, -3, -2], got [9, 10, 11, 12, 13, -5, -4, -3, -2, -1] |
-| core/integer/upto_spec.rb | FAILED: expected ArgumentError to be raised |
-| core/integer/upto_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/kernel/Integer_spec.rb | pass=327 fail=1 err=0 pass=328 fail=0 err=0 |
 | core/kernel/__dir___spec.rb | pass=3 fail=4 err=0 pass=6 fail=1 err=0 |
 | core/kernel/__dir___spec.rb | FAILED: returns the expanded path of the directory when used in the main script: expected "__dir__.rb |
@@ -151,10 +147,6 @@ Visited **140** of **140** recorded DIFF files.
 | core/kernel/p_spec.rb | ERROR: Kernel#p is not affected by setting $\, $/ or $,: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/p_spec.rb | ERROR: Kernel#p prints nothing if no argument is given: NameError -- undefined local variable or method 'p' for an instance of Object |
 | core/kernel/print_spec.rb | pass=3 fail=1 err=0 pass=4 fail=0 err=0 |
-| core/kernel/printf_spec.rb | pass=1 fail=0 err=4 pass=1 fail=0 err=4 |
-| core/kernel/printf_spec.rb | ERROR: Kernel#printf is a private method: ArgumentError -- path component of HOME is a file |
-| core/kernel/printf_spec.rb | ERROR: Kernel#printf writes to stdout when a string is the first argument: ArgumentError -- path component of HOME is a file |
-| core/kernel/printf_spec.rb | ERROR: Kernel#printf calls write on the first argument when it is not a string: ArgumentError -- path component of HOME is a file |
 | core/kernel/public_method_spec.rb | pass=4 fail=1 err=0 pass=5 fail=0 err=0 |
 | core/kernel/putc_spec.rb | pass=1 fail=0 err=1 pass=1 fail=0 err=1 |
 | core/kernel/putc_spec.rb | ERROR: Kernel#putc is a private method: ArgumentError -- path component of HOME is a file |
