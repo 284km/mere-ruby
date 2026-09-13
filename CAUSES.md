@@ -16,11 +16,11 @@ Classified: 140 files.
 
 | files | kind |
 |---|---|
-| 14 | `ERROR NoMethodError` |
+| 15 | `ERROR NoMethodError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
-| 8 | `ERROR NameError` |
 | 8 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
+| 7 | `ERROR NameError` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected TypeError to be raised` |
 | 5 | `ERROR TypeError` |

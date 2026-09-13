@@ -13052,6 +13052,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     if str_len name > 2 && str_eq (substring name 0 2) "::" then
       (let n = substring name 2 (str_len name) in
        if map_has consts n then map_get consts n
+       // ⚠ ...and Object's OWN namespace is top level too. A constant assigned
+       // inside `class Object` is stored under "Object::X", so `::X` -- which
+       // reads exactly that namespace -- could not find what `Object::X` could.
+       else if map_has consts ("Object::" ++ n) then map_get consts ("Object::" ++ n)
+       // ⚠ ...and along Object's ANCESTORS, which is where `include M` at top
+       // level puts M. `::X` names Object's namespace, and that namespace is
+       // the whole chain -- the bare `X` already searched it.
+       else if (if str_eq (anc_const_key world "Object" n) "" then false else true)
+       then map_get consts (anc_const_key world "Object" n)
        else if autoload_fire env world blk n then eval_e env world blk (EConst ("::" ++ n))
        else raise_exc world "NameError" ("uninitialized constant " ++ n))
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
@@ -13092,10 +13101,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                     let k = (if str_eq k "" && map_has consts rc then rc else k) in
                     if str_eq k "" then rc
                     else (match map_get consts k with VClass real -> real | _ -> rc)) in
-         let akey = anc_const_key world rcq cn in
+         let akey = anc_const_key_q world rcq cn in
          // top-level constants live in Object's namespace, so Object::X reads
          // the bare top-level X.
          if str_eq rc "Object" && map_has consts cn then map_get consts cn
+         // ⚠ reaching a constant THROUGH an included module does not make it
+         // public: `Inc::X` finds PM2::X along the chain, and private_constant
+         // closed that name off wherever it is reached from.
+         else if (if str_eq akey "" then false else true) && map_has private_consts akey then
+           raise_exc world "NameError" ("private constant " ++ akey ++ " referenced")
          else if (if str_eq akey "" then false else true) then map_get consts akey
          else if has_meth world ("(sng:" ++ rc ++ ")") "const_missing" || has_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
@@ -13118,7 +13132,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       else if (let k = lex_autoload_key cref name in
                if str_eq k "" then false else autoload_fire env world blk k)
       then eval_e env world blk (EConst name)
-      else raise_exc world "NameError" ("uninitialized constant " ++ name)
+      // ⚠ the name ruby reports is QUALIFIED BY THE LEXICAL SCOPE it was
+      // looked for in: inside `module A; class B`, a missing MISSING is
+      // "uninitialized constant A::B::MISSING". Reporting the bare name lost
+      // the one piece of the message that says where the search happened.
+      else raise_exc world "NameError"
+             ("uninitialized constant " ++ (if str_eq cref "" then name else cref ++ "::" ++ name))
   | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
   | EScopedRead (recv_e, cn) ->
     (match eval_e env world blk recv_e with
@@ -13126,8 +13145,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let key = c ++ "::" ++ cn in
        // `Logger::WARN` where WARN comes from an INCLUDED module (or a
        // superclass): ruby looks along the ancestors, not just the class.
-       let akey = (if map_has consts key then "" else anc_const_key world c cn) in
-       if map_has consts key then map_get consts key
+       let akey = (if map_has consts key then "" else anc_const_key_q world c cn) in
+       // ⚠ private_constant closes the SCOPE OPERATOR off, and this is the
+       // scope operator too -- `c::Foo` where c is a value rather than a
+       // constant path. Only the name-path form checked, so anything reached
+       // through a variable holding the module read straight past it.
+       if map_has private_consts key then
+         raise_exc world "NameError" ("private constant " ++ key ++ " referenced")
+       else if (if str_eq akey "" then false else true) && map_has private_consts akey then
+         raise_exc world "NameError" ("private constant " ++ akey ++ " referenced")
+       else if map_has consts key then map_get consts key
        else if (if str_eq akey "" then false else true) then map_get consts akey
        else if map_has consts cn then map_get consts cn
        else if autoload_fire env world blk key || autoload_fire env world blk cn then
@@ -13140,7 +13167,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EScopedReadOrNil (recv_e, cn) ->
     (match eval_e env world blk recv_e with
      | VClass c -> let key = c ++ "::" ++ cn in
-       (let akey = (if map_has consts key then "" else anc_const_key world c cn) in
+       (let akey = (if map_has consts key then "" else anc_const_key_q world c cn) in
         if map_has consts key then map_get consts key
         else if (if str_eq akey "" then false else true) then map_get consts akey
         else if map_has consts cn then map_get consts cn else VNil)
@@ -13306,18 +13333,30 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // a qualified name's head can be lexically scoped: inside `module M`,
        // `I::K` is `M::I::K` (the same walk EConst's evaluation does).
        // `::Name` carries its prefix and is top level only.
-       (if str_len name > 2 && str_eq (substring name 0 2) "::" then
-          (if map_has consts (substring name 2 (str_len name)) then mkstr "constant" else VNil)
+       // ⚠ THE PRIVACY CHECK COMES FIRST. A private constant is in `consts`
+       // under its qualified name, so the plain membership test below answered
+       // "constant" for a name that raises when read -- defined? has to agree
+       // with the read.
+       (if str_contains name "::" && map_has private_consts name then VNil
+        else if str_len name > 2 && str_eq (substring name 0 2) "::" then
+          (let n9 = substring name 2 (str_len name) in
+           if map_has consts n9 || map_has consts ("Object::" ++ n9) then mkstr "constant" else VNil)
         // an autoload (Set, Pathname) is a constant that exists before it loads
         else if map_has consts name || map_has autoloads name then mkstr "constant"
         else if (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s9 -> sget s9 | _ -> "") else cur_lex ()) in
                  (if str_eq (lex_const_key cref9 name) "" then false else true)
                  || (if str_eq (anc_const_key world cref9 name) "" then false else true)) then mkstr "constant"
         else if str_contains name "::" then
-          (let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else cur_lex ()) in
+          // ⚠ a PRIVATE constant is not defined? through the scope operator --
+          // the whole point of private_constant is that `M::X` cannot see it,
+          // and defined? has to agree with the read rather than answer
+          // "constant" for a name that would raise.
+          (if map_has private_consts name then VNil
+           else
+           let cref0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else cur_lex ()) in
            let hk = lex_const_key cref0 (const_head name) in
            // ... and, as when reading it, along the receiver's ancestors.
-           let anc = (if str_eq (anc_const_key world (recv_of_scoped name) (const_of_scoped name)) "" then false else true) in
+           let anc = (if str_eq (anc_const_key_q world (recv_of_scoped name) (const_of_scoped name)) "" then false else true) in
            if ((if str_eq hk "" then false else true) && map_has consts (hk ++ "::" ++ const_tail name)) || anc
            then mkstr "constant" else VNil)
         else VNil)
@@ -38876,6 +38915,24 @@ and lex_const_key = fn (cref: str) -> fn (name: str) ->
 // After the lexical scope, Ruby looks along the ancestors of the enclosing
 // class/module: an included module's constants are visible in the including
 // class, and a subclass sees its superclass's.
+// ⚠ A QUALIFIED lookup (`A::X`) does NOT fall through to Object, even though
+// Object is on every class's ancestor chain: `class Object; OC = 1; end` then
+// `OE2::OC` is a NameError in ruby, while the bare `OC` finds it. So the walk
+// for `A::X` skips Object (and its modules) unless A IS Object -- sharing one
+// walk with the bare-name case answered every top-level constant for every
+// qualifier.
+and anc_const_key_q = fn world -> fn (cref: str) -> fn (name: str) ->
+  if str_eq cref "Object" then anc_const_key world cref name
+  else anc_const_go (anc_drop_object (ancestors_of world cref)) name
+// ⚠ ...drops OBJECT ITSELF, not everything from Object down. A module included
+// into Object (`include M` at top level) is further along that same chain and
+// IS visible to a qualified lookup: `Z2::KT` finds M's constant while
+// `Z2::OC` -- assigned in `class Object` -- does not. Cutting the chain at
+// Object took both away.
+and anc_drop_object = fn (ancs: str list) ->
+  match ancs with
+  | Nil -> Nil
+  | Cons (a, t) -> if str_eq a "Object" then anc_drop_object t else Cons (a, anc_drop_object t)
 and anc_const_key = fn world -> fn (cref: str) -> fn (name: str) ->
   // ⚠ NO lexical scope still has ancestors: at top level the cref is Object,
   // and `include M` there puts M among Object's. Treating an empty cref as
@@ -47519,7 +47576,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // flow such as a begin/if block) is lexically nested: qualify with the
     // current cref so it reopens the right constant (Base::Name), and resolve a
     // sibling superclass in the same scope. A `::`-prefixed name stays top-level.
-    let lex = cur_lex () in
+    // ⚠ OBJECT IS NOT A NAMESPACE PREFIX. Reopening it (`class ::Object`) and
+    // defining a class inside names that class at TOP LEVEL -- ruby calls it
+    // `QA`, not `Object::QA` -- because top-level constants live in Object's
+    // namespace to begin with. Qualifying by the lexical scope made a second,
+    // separate constant beside any `QA` already defined, and methods added
+    // there were invisible from the first.
+    let lex = (let l9 = cur_lex () in if str_eq l9 "Object" then "" else l9) in
     let name = if toplevel || str_contains name "::" || str_eq lex "" then name
                else if map_has consts (lex ++ "::" ++ name) then lex ++ "::" ++ name else name in
     let super0 = if str_eq super0 "" || str_eq super0 "(module)" || str_eq lex "" || str_contains super0 "::" then super0
@@ -47606,7 +47669,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // a break/raise escaping the class body propagates (a body is code).
     // set the lexical scope (cref) to this class while its body runs.
     let saved_lex = cur_lex () in
-    let _ = set_lex name in
+    // ⚠ ...and the body of Object itself runs at TOP LEVEL, not in a scope
+    // called "Object": everything defined there is named as if written at the
+    // top. Setting the cref to "Object" made the whole nest below it
+    // Object::QQ::O::I, a separate structure from the QQ already there.
+    let _ = set_lex (if str_eq name "Object" then "" else name) in
     // restored even when the body raises (see register_class_lex)
     let r = try_or (fn (u: unit) -> register_class world name body) (FRaise VNil) in
     let _ = set_lex saved_lex in

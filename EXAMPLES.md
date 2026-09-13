@@ -341,10 +341,10 @@ Visited **140** of **140** recorded DIFF files.
 | language/break_spec.rb | FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e] |
 | language/break_spec.rb | FAILED: returns a value when invoking from the toplevel: expected "a,b,break,d", got "" |
 | language/break_spec.rb | FAILED: returns a value when invoking from a method: expected "a,d,b,break,e,f", got "" |
-| language/constants_spec.rb | pass=122 fail=16 err=7 pass=148 fail=0 err=0 |
-| language/constants_spec.rb | ERROR: with statically assigned constants searches Object if a toplevel qualifier (::X) is given: NameError -- uninitialized constant CS_CONST10 |
+| language/constants_spec.rb | pass=129 fail=10 err=6 pass=148 fail=0 err=0 |
 | language/constants_spec.rb | ERROR: with dynamically assigned constants evaluates the qualifier: NoMethodError -- undefined method 'get_const' for module Object::ConstantSpecs |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches Object as a lexical scope only if Object is explicitly opened: NoMethodError -- undefined method 'const20' for class ConstantSpecs::ContainerA::ChildA |
+| language/constants_spec.rb | FAILED: expected NameError to be raised |
 | language/def_spec.rb | pass=111 fail=6 err=7 pass=135 fail=0 err=0 |
 | language/def_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/def_spec.rb | ERROR: A singleton method definition can be declared for a global variable: NoMethodError -- undefined method 'foo' for an instance of String |
