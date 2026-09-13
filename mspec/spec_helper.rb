@@ -375,6 +375,18 @@ def ruby_exe(code = nil, *rest, **opts)
   __ruby_exe(code.to_s)
 end
 
+# mspec's RUBY_EXE / ruby_cmd: the command line that runs the interpreter under
+# test. run_spec.sh names it per side, because neither interpreter can answer
+# "my own path". A spec that shells out (`\`#{ruby_cmd(...)}\``, system(...))
+# needs this; without it every such example died with NoMethodError on both
+# sides and the file read DIFF on the difference between two failures.
+RUBY_EXE = ENV["MSPEC_RUBY_EXE"] || "ruby" unless defined?(RUBY_EXE)
+def ruby_cmd(code, opts = {})
+  body = code
+  body = "-e #{code.inspect}" if code and !File.exist?(code)
+  [RUBY_EXE, opts[:options], body, opts[:args]].compact.join(" ")
+end
+
 # mspec's `evaluate <<-ruby do ... end`: run the code (which defines methods
 # or sets ivars) and then the block, on the same fresh object so state set by
 # the code is visible to the block's assertions.

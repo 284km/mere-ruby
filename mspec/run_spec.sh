@@ -121,14 +121,19 @@ spec_env() {
     ${RUBYOPT:+RUBYOPT="$RUBYOPT"} \
     ${RUBYLIB:+RUBYLIB="$RUBYLIB"} \
     ${MERE_SPEC_VERBOSE:+MERE_SPEC_VERBOSE="$MERE_SPEC_VERBOSE"} \
+    ${MSPEC_RUBY_EXE:+MSPEC_RUBY_EXE="$MSPEC_RUBY_EXE"} \
     "$@"
 }
-out_m="$({ spec_env perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"
+# ⚠ each side must name ITSELF here. mspec's `ruby_cmd` builds a shell command
+# out of RUBY_EXE, and a spec that shells out has to reach the interpreter it
+# is testing -- not whatever `ruby` the PATH happens to hold. The shim reads
+# this; there is nothing in either interpreter that can answer "my own path".
+out_m="$({ MSPEC_RUBY_EXE="$mr" spec_env perl -e 'alarm 25; exec @ARGV' "$mr" "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_m"; } | head -c "$out_cap")"
 rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
 # the REAL ruby binary, not rbenv's shim: the shim exports RBENV_* and RUBYLIB
 # into the process it execs, and a spec that walks ENV then sees a different
 # environment from the one mere-ruby was given (see tools/ref_ruby.sh).
-out_r="$({ spec_env perl -e 'alarm 25; exec @ARGV' "${REF_RUBY_BIN:-ruby}" -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
+out_r="$({ MSPEC_RUBY_EXE="${REF_RUBY_BIN:-ruby}" spec_env perl -e 'alarm 25; exec @ARGV' "${REF_RUBY_BIN:-ruby}" -W0 "$tmp/driver.rb" 2>&1; echo "$?" > "$tmp/rc_r"; } | head -c "$out_cap")"
 
 # Say WHICH failure it was, in the section it belongs to, and let scoreboard.sh
 # classify as it always has: with no `pass=` line in mere-ruby's section it
