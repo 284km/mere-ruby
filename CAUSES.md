@@ -10,23 +10,23 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 136 files.
+Classified: 126 files.
 
-## DIFF — 136 files, 68 kinds
+## DIFF — 126 files, 65 kinds
 
 | files | kind |
 |---|---|
-| 15 | `ERROR NoMethodError` |
+| 13 | `ERROR NoMethodError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
-| 7 | `FAILED expected false, got true` |
-| 7 | `ERROR NameError` |
+| 6 | `FAILED expected false, got true` |
+| 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected ArgumentError to be raised` |
-| 5 | `FAILED expected TypeError to be raised` |
 | 5 | `ERROR TypeError` |
-| 4 | `FAILED expected true, got false` |
-| 4 | `FAILED expected "S", got "S"` |
+| 5 | `ERROR NameError` |
 | 3 | `pass=N fail=N err=N` |
+| 3 | `FAILED expected true, got false` |
 | 3 | `FAILED expected N, got N` |
+| 3 | `FAILED expected "S", got "S"` |
 | 3 | `ERROR Errno::ENOENT` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
@@ -35,7 +35,6 @@ Classified: 136 files.
 | 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected "S", got nil` |
 | 2 | `ERROR StandardError` |
-| 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
 | 1 | `FAILED raised StandardError, expected SyntaxError` |
@@ -45,11 +44,8 @@ Classified: 136 files.
 | 1 | `FAILED expected {...}, got {...}` |
 | 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
-| 1 | `FAILED expected truthy from #>` |
-| 1 | `FAILED expected truthy from #<` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected to receive #respond_to_missing?` |
-| 1 | `FAILED expected to receive #hash` |
 | 1 | `FAILED expected not true` |
 | 1 | `FAILED expected not N` |
 | 1 | `FAILED expected nil, got N` |
@@ -71,6 +67,7 @@ Classified: 136 files.
 | 1 | `FAILED expected N, got NaN` |
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected :SYM, got nil` |
+| 1 | `FAILED expected :SYM, got :SYM` |
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
@@ -78,10 +75,10 @@ Classified: 136 files.
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "S" to match` |
-| 1 | `FAILED expected "Ok.` |
 | 1 | `FAILED expected "` |
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `ERROR SystemExit` |
+| 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
 | 1 | `ERROR ArgumentError` |
 
@@ -89,8 +86,8 @@ Classified: 136 files.
 
 | files | cause |
 |---|---|
+| 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
-| 5 | `FAILED: expected TypeError to be raised` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
@@ -104,13 +101,12 @@ Classified: 136 files.
 | 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
 | 1 | `FAILED: warns about flags being ignored for regexp arguments: matcher did not match #<Proc>` |
 | 1 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
-| 1 | `FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13"` |
 | 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
 | 1 | `FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {}` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
-| 1 | `FAILED: stores unequal keys that hash to the same value: expected to receive #hash` |
 | 1 | `FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError)` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
+| 1 | `FAILED: searches Object as a lexical scope only if Object is explicitly opened: expected :const20_1, got :const20_2` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
 | 1 | `FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e]` |
@@ -119,16 +115,17 @@ Classified: 136 files.
 | 1 | `FAILED: returns an Array that can be updated: expected "backtrace first", got "TMPDIR 'Object#it'"` |
 | 1 | `FAILED: returns an Array of caller locations using a custom offset: expected "TMPDIR 'Object#it'" to match` |
 | 1 | `FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped]` |
-| 1 | `FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #>` |
-| 1 | `FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #<` |
 | 1 | `FAILED: returns [:rest, :*], [:keyrest, :**], [:block, :&] for forward parameters operator: expected [[:rest, :*], [:keyrest, :**], [:block, :&]], got [[:rest, :__fwd], [:block, :&]]` |
 | 1 | `FAILED: returns 'method' if the method is defined: expected "method", got nil` |
 | 1 | `FAILED: returned Enumerator size returns nil: expected nil, got 1` |
 | 1 | `FAILED: reports the same arity as the given block: expected [2], got [-2]` |
-| 1 | `FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true` |
 | 1 | `FAILED: re-raises a previously rescued exception without overwriting the cause when it's explicitly specified with :cause option and has nil value: expected #<RuntimeError: Error 1>, got nil` |
 | 1 | `FAILED: raises TypeError if 'to_proc' doesn't return a Proc: matcher did not match #<Proc>` |
 | 1 | `FAILED: raised StandardError, expected SyntaxError` |
+| 1 | `FAILED: raised NoMethodError, expected TypeError` |
+| 1 | `FAILED: raised FrozenError, expected TypeError` |
+| 1 | `FAILED: raised ArgumentError, expected SyntaxError` |
+| 1 | `FAILED: provided features are already required: expected ["complex", "enumerator", "fiber", "pathname", "rational", "ruby2_keywords", "set", "thread"], got ["code_loading", "require", "require_spec", "spec_helper"]` |
 
 </details>
 
@@ -141,13 +138,12 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (9) | `binding chomp chop eval loop select singleton_class test warn` |
+| kernel (8) | `binding chomp chop loop select singleton_class test warn` |
 | unboundmethod (3) | `bind_call bind super_method` |
-| language (3) | `constants module optional_assignments` |
 | method (2) | `super_method to_proc` |
-| symbol (1) | `all_symbols` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |
+| language (1) | `module` |
 | exception (1) | `interrupt` |
 | enumerable (1) | `to_h` |
 

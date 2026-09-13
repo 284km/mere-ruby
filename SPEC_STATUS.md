@@ -16,17 +16,17 @@ of the subject: a row measured against another release is not comparable with th
 ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 44 | 23 | 0 | 0 | 0 | 67 |
+| language | 45 | 22 | 0 | 0 | 0 | 67 |
 | core/string | 112 | 2 | 0 | 0 | 0 | 114 |
-| core/array | 101 | 3 | 0 | 0 | 1 | 105 |
-| core/hash | 64 | 5 | 0 | 0 | 0 | 69 |
+| core/array | 102 | 2 | 0 | 0 | 1 | 105 |
+| core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
 | core/range | 30 | 5 | 0 | 0 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 41 | 2 | 0 | 0 | 0 | 43 |
 | core/env | 45 | 0 | 0 | 0 | 0 | 45 |
 | core/exception | 29 | 10 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
-| core/float | 46 | 4 | 0 | 0 | 0 | 50 |
+| core/float | 49 | 1 | 0 | 0 | 0 | 50 |
 | core/integer | 68 | 2 | 0 | 0 | 0 | 70 |
 | core/kernel | 85 | 32 | 0 | 1 | 0 | 118 |
 | core/matchdata | 30 | 0 | 0 | 0 | 0 | 30 |
@@ -38,7 +38,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/rational | 28 | 4 | 0 | 0 | 0 | 32 |
 | core/sizedqueue | 16 | 0 | 0 | 0 | 0 | 16 |
 | core/struct | 26 | 4 | 0 | 0 | 0 | 30 |
-| core/symbol | 26 | 3 | 0 | 0 | 0 | 29 |
+| core/symbol | 27 | 2 | 0 | 0 | 0 | 29 |
 | core/threadgroup | 5 | 0 | 0 | 0 | 0 | 5 |
 | core/true | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/unboundmethod | 16 | 4 | 0 | 0 | 0 | 20 |

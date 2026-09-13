@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **136** of **136** recorded DIFF files.
+Visited **126** of **126** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -20,7 +20,6 @@ Visited **136** of **136** recorded DIFF files.
 | core/array/initialize_spec.rb | ERROR: Array#initialize with no arguments does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | ERROR: Array#initialize with (array) does not use the given block: RuntimeError -- |
 | core/array/initialize_spec.rb | FAILED: uses the block value instead of using the default value: matcher did not match #<Proc> |
-| core/array/intersect_spec.rb | pass=12 fail=1 err=0 pass=13 fail=0 err=0 |
 | core/complex/inspect_spec.rb | pass=7 fail=0 err=2 pass=9 fail=0 err=0 |
 | core/complex/inspect_spec.rb | ERROR: Complex#inspect calls #inspect on real and imaginary: TypeError -- not a real |
 | core/complex/to_s_spec.rb | pass=13 fail=0 err=1 pass=14 fail=0 err=0 |
@@ -60,28 +59,14 @@ Visited **136** of **136** recorded DIFF files.
 | core/exception/top_level_spec.rb | FAILED: is printed on STDERR: expected "" to match |
 | core/exception/top_level_spec.rb | FAILED: the Exception#cause is printed to STDERR with backtraces: expected nil to match |
 | core/exception/top_level_spec.rb | ERROR: An Exception reaching the top level the Exception#cause is printed to STDERR with backtraces: RuntimeError -- wrapped |
-| core/float/next_float_spec.rb | pass=11 fail=2 err=0 pass=13 fail=0 err=0 |
-| core/float/next_float_spec.rb | FAILED: returns a float the smallest possible step greater than the receiver: expected truthy from #< |
-| core/float/prev_float_spec.rb | pass=11 fail=2 err=0 pass=13 fail=0 err=0 |
-| core/float/prev_float_spec.rb | FAILED: returns a float the smallest possible step smaller than the receiver: expected truthy from #> |
 | core/float/round_spec.rb | pass=37 fail=2 err=2 pass=40 fail=0 err=0 |
 | core/float/round_spec.rb | ERROR: Float#round returns different rounded values depending on the half option: TypeError -- no implicit conversion of Hash into Integer |
 | core/float/round_spec.rb | FAILED: raised TypeError, expected ArgumentError |
 | core/float/round_spec.rb | FAILED: returns self for positive ndigits: expected "-0.0", got "0.0" |
-| core/float/to_s_spec.rb | pass=169 fail=6 err=0 pass=175 fail=0 err=0 |
-| core/float/to_s_spec.rb | FAILED: uses non-e format for a positive value with whole part having 15 significant figures: expected "10000000000000.0", got "1.0e+13" |
-| core/float/to_s_spec.rb | FAILED: uses non-e format for a negative value with whole part having 15 significant figures: expected "-10000000000000.0", got "-1.0e+13" |
-| core/float/to_s_spec.rb | FAILED: uses non-e format for a positive value with whole part having 16 significant figures: expected "100000000000000.0", got "1.0e+14" |
-| core/hash/compare_by_identity_spec.rb | pass=32 fail=0 err=1 pass=33 fail=0 err=0 |
-| core/hash/element_reference_spec.rb | pass=30 fail=1 err=0 pass=31 fail=0 err=0 |
-| core/hash/element_set_spec.rb | pass=17 fail=3 err=0 pass=18 fail=0 err=0 |
-| core/hash/element_set_spec.rb | FAILED: stores unequal keys that hash to the same value: expected to receive #hash |
-| core/hash/element_set_spec.rb | FAILED: stores unequal keys that hash to the same value: expected to receive #hash |
 | core/hash/inspect_spec.rb | pass=7 fail=13 err=1 pass=9 fail=12 err=0 |
 | core/hash/inspect_spec.rb | FAILED: returns a string representation with same order as each(): expected "{:a=>[1, 2], :b=>-2, :d=>-6, nil=>nil}", got "{a: [1, 2], b: -2, d: -6, nil => nil}" |
 | core/hash/inspect_spec.rb | FAILED: calls #inspect on keys and values: expected "{key=>val}", got "{key => val}" |
 | core/hash/inspect_spec.rb | FAILED: does not call #to_s on a String returned from #inspect: expected "{:a=>\"abc\"}", got "{a: \"abc\"}" |
-| core/hash/rehash_spec.rb | pass=22 fail=1 err=0 pass=23 fail=0 err=0 |
 | core/integer/coerce_spec.rb | pass=19 fail=5 err=0 pass=24 fail=0 err=0 |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
 | core/integer/coerce_spec.rb | FAILED: expected TypeError to be raised |
@@ -124,10 +109,10 @@ Visited **136** of **136** recorded DIFF files.
 | core/kernel/define_singleton_method_spec.rb | FAILED: raised NoMethodError, expected TypeError |
 | core/kernel/define_singleton_method_spec.rb | FAILED: raised NoMethodError, expected ArgumentError |
 | core/kernel/define_singleton_method_spec.rb | FAILED: raised NoMethodError, expected ArgumentError |
-| core/kernel/eval_spec.rb | pass=81 fail=11 err=10 pass=99 fail=3 err=0 |
-| core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates within the scope of the eval: NameError -- uninitialized constant EvalSpecs::A::B |
-| core/kernel/eval_spec.rb | ERROR: Kernel#eval evaluates such that constants are scoped to the class of the eval: NameError -- uninitialized constant EvalSpecs::A::C |
+| core/kernel/eval_spec.rb | pass=83 fail=11 err=8 pass=99 fail=3 err=0 |
 | core/kernel/eval_spec.rb | FAILED: does not share locals across eval scopes: expected "NameError", got "" |
+| core/kernel/eval_spec.rb | FAILED: expected TypeError to be raised |
+| core/kernel/eval_spec.rb | ERROR: parameter forwarding allows anonymous rest parameter forwarding: SyntaxError -- syntax error |
 | core/kernel/gets_spec.rb | pass=2 fail=2 err=0 pass=3 fail=0 err=0 |
 | core/kernel/gets_spec.rb | FAILED: calls ARGF.gets: expected "spec", got nil |
 | core/kernel/inspect_spec.rb | pass=7 fail=1 err=0 pass=8 fail=0 err=0 |
@@ -294,9 +279,6 @@ Visited **136** of **136** recorded DIFF files.
 | core/struct/new_spec.rb | FAILED: overwrites previously defined constants with string as first argument: matcher did not match #<Proc> |
 | core/struct/new_spec.rb | ERROR: with a block passes same struct class to the block: NoMethodError -- undefined method 'block_parameter' for class #<Class:0xADDR> |
 | core/struct/new_spec.rb | FAILED: accepts keyword arguments to initialize: expected #<struct args=42>, got #<struct args={args: 42}> |
-| core/symbol/all_symbols_spec.rb | pass=0 fail=0 err=3 pass=2 fail=0 err=0 |
-| core/symbol/all_symbols_spec.rb | ERROR: Symbol.all_symbols returns an array of Symbols: NoMethodError -- undefined method 'all_symbols' for class Symbol |
-| core/symbol/all_symbols_spec.rb | ERROR: Symbol.all_symbols includes symbols that are strongly referenced: NoMethodError -- undefined method 'all_symbols' for class Symbol |
 | core/symbol/element_reference_spec.rb | pass=51 fail=6 err=1 pass=58 fail=0 err=0 |
 | core/symbol/element_reference_spec.rb | FAILED: converts the last value to an Integer: expected "sym", got "symbol" |
 | core/symbol/element_reference_spec.rb | ERROR: with a Range subclass slice returns a slice: TypeError -- no implicit conversion of Object into Integer |
@@ -329,10 +311,10 @@ Visited **136** of **136** recorded DIFF files.
 | language/break_spec.rb | FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e] |
 | language/break_spec.rb | FAILED: returns a value when invoking from the toplevel: expected "a,b,break,d", got "" |
 | language/break_spec.rb | FAILED: returns a value when invoking from a method: expected "a,d,b,break,e,f", got "" |
-| language/constants_spec.rb | pass=129 fail=10 err=6 pass=148 fail=0 err=0 |
-| language/constants_spec.rb | ERROR: with dynamically assigned constants evaluates the qualifier: NoMethodError -- undefined method 'get_const' for module Object::ConstantSpecs |
-| language/constants_spec.rb | ERROR: with statically assigned constants searches Object as a lexical scope only if Object is explicitly opened: NoMethodError -- undefined method 'const20' for class ConstantSpecs::ContainerA::ChildA |
+| language/constants_spec.rb | pass=130 fail=12 err=5 pass=148 fail=0 err=0 |
+| language/constants_spec.rb | FAILED: searches Object as a lexical scope only if Object is explicitly opened: expected :const20_1, got :const20_2 |
 | language/constants_spec.rb | FAILED: expected NameError to be raised |
+| language/constants_spec.rb | FAILED: searches Object as a lexical scope only if Object is explicitly opened: expected :const211_1, got :const211_2 |
 | language/def_spec.rb | pass=129 fail=4 err=1 pass=135 fail=0 err=0 |
 | language/def_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/def_spec.rb | FAILED: expected FrozenError to be raised |
@@ -356,7 +338,6 @@ Visited **136** of **136** recorded DIFF files.
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/module_spec.rb | pass=15 fail=0 err=1 pass=16 fail=0 err=0 |
-| language/optional_assignments_spec.rb | pass=112 fail=0 err=1 pass=114 fail=0 err=0 |
 | language/predefined_spec.rb | pass=206 fail=25 err=6 pass=221 fail=14 err=2 |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |
