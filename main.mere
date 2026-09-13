@@ -1107,6 +1107,8 @@ let cyc_flag = map_new ();
 // different keys.
 let hcbi = map_new ();
 let hcbi_on = fn (id: int) -> map_has hcbi (str_of_int id);
+// the hash code each stored key had when it was stored: "<hash handle>|<key>".
+let hstored = map_new ();
 // a hash DERIVED from one that compares by identity keeps the flag: select,
 // reject, except, slice, dup and clone all answer a compare_by_identity? hash
 // in ruby. Every derived hash was built with a plain mkhash, which loses it.
@@ -12859,6 +12861,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter trace_fn mk in
   let _ = map_iter undefs mk in
   let _ = map_iter warn_cats mk in
+  let _ = map_iter hstored mk in
   let _ = map_iter rx_once mk in
   // The second sweep of missed roots -- found by classifier v2, which reads
   // the GENERATED C's map value types instead of guessing from setter sites
@@ -14438,7 +14441,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | VHsh h -> (match args with
                        | Cons (k, Cons (v, _)) ->
                          (let k9 = hash_store_key env world h k in
-                          let _ = hset h (hash_put_wx env world (hcbi_on h) (hderef h) k9 v) in v)
+                          let _ = hset h (hash_put_wx env world h (hcbi_on h) (hderef h) k9 v) in v)
                        | _ -> VNil)
           | _ -> VNil)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
@@ -14467,11 +14470,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // fold the evaluated pairs through hash_put so duplicate keys (from an
   // explicit repeat or a **splat then override) collapse last-value-wins,
   // keeping the key's first position — Ruby hash-literal semantics.
-  | EHsh items -> mkhash (hash_merge Nil (hsh_eval_items env world blk items))
+  | EHsh items -> hstored_seed env world (mkhash (hash_merge Nil (hsh_eval_items env world blk items)))
   // a keyword-argument hash: same value as EHsh, but its handle is marked so
   // method binding knows it came from `key: value` syntax (not a positional {}).
   | EKwHash items ->
-    (match mkhash (hash_merge Nil (hsh_eval_items env world blk items)) with
+    (match hstored_seed env world (mkhash (hash_merge Nil (hsh_eval_items env world blk items))) with
      | VHsh id -> let _ = mark_kw id in VHsh id
      | v -> v)
   | EUn (op, a) ->
@@ -14763,6 +14766,24 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     // `(1..10) % 3` is `(1..10).step(3)`: the same arithmetic sequence, and
     // ruby spells it both ways. Answered here rather than in the dispatcher so
     // that the operator and the method form cannot drift apart.
+    // ⚠ `a & b` and `a - b` are SET operations: they ask #hash and #eql?,
+    // not `==`, so an element that answers eql? true while `==` says no is
+    // still the same element. The value-level arms below cannot ask an object
+    // anything (they are defined in an earlier chain), so the protocol answer
+    // is given here -- and only when an element actually carries one, so an
+    // ordinary array keeps the fast path. Answered beside the operator rather
+    // than only in #intersection / #difference, or the two spellings of one
+    // operation would disagree.
+    else if (str_eq op "&" || str_eq op "-")
+            && (match (va0, vb) with
+                | (VArr xa, VArr xb) -> elem_has_user_eql world (deref xa) || elem_has_user_eql world (deref xb)
+                | _ -> false) then
+      (match (va0, vb) with
+       | (VArr xa, VArr xb) ->
+         (if str_eq op "&"
+          then arr_new (val_intersect_w env world (val_dedup_into (deref xa) Nil) (deref xb))
+          else arr_new (val_subtract_w env world (deref xa) (deref xb)))
+       | _ -> VNil)
     // A BEGINLESS range is a sequence too -- `(..5) % 2` starts at nil and
     // slices an array from its front. Requiring an Integer begin sent it to
     // the numeric `%` instead, which refused with "Integer can't be coerced
@@ -19654,6 +19675,66 @@ and arr_eq_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
      | Nil -> false
      | Cons (h2, t2) -> if rb_eq_w env world h h2 then arr_eq_w env world t t2 else false)
 
+// ⚠ THE SET OPERATIONS ASK #eql?, NOT `==`. `&`, `-`, `intersect?` and
+// #intersection / #difference are all "is this element already in that list"
+// under HASH semantics, which is a different question from #include?'s `==`:
+// `[e].intersect?([e2])` is true for keys that are eql? while `e == e2` is
+// false. The value-level helpers cannot ask an object anything, so the rule
+// lives here once and every door uses it.
+// does any element carry its own #hash or #eql?? (the set operations only
+// need the protocol then, and asking is much cheaper than running it)
+and elem_has_user_eql = fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (h9, t9) ->
+    (match h9 with
+     | VObj _ -> has_meth world (dispatch_cls_of world h9) "eql?"
+                 || has_meth world (dispatch_cls_of world h9) "hash"
+     | _ -> false)
+    || elem_has_user_eql world t9
+
+// ⚠ NOT `val_member_w` -- that name is already taken, by the `==` version.
+// Defining a second one under it silently resolved every call to the OTHER
+// function, and the set operations went on comparing with `==` while the
+// build stayed green.
+and val_member_eqlw = fn env -> fn world -> fn (ys: Val list) -> fn (x: Val) ->
+  match ys with
+  | Nil -> false
+  | Cons (h9, t9) -> if rb_eql_w env world h9 x then true else val_member_eqlw env world t9 x
+
+and val_intersect_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (h9, t9) ->
+    (if val_member_eqlw env world ys h9
+     then Cons (h9, val_intersect_w env world t9 ys)
+     else val_intersect_w env world t9 ys)
+
+and val_subtract_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (Nil : Val list)
+  | Cons (h9, t9) ->
+    (if val_member_eqlw env world ys h9
+     then val_subtract_w env world t9 ys
+     else Cons (h9, val_subtract_w env world t9 ys))
+
+and val_any_in_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (h9, t9) -> if val_member_eqlw env world ys h9 then true else val_any_in_w env world t9 ys
+
+and arr_intersect_args_w = fn env -> fn world -> fn (args: Val list) -> fn (acc: Val list) ->
+  match args with
+  | Nil -> acc
+  | Cons (VArr o9, rest9) -> arr_intersect_args_w env world rest9 (val_intersect_w env world acc (deref o9))
+  | Cons (_, rest9) -> arr_intersect_args_w env world rest9 acc
+
+and arr_difference_args_w = fn env -> fn world -> fn (args: Val list) -> fn (acc: Val list) ->
+  match args with
+  | Nil -> acc
+  | Cons (VArr o9, rest9) -> arr_difference_args_w env world rest9 (val_subtract_w env world acc (deref o9))
+  | Cons (_, rest9) -> arr_difference_args_w env world rest9 acc
+
 and uniq_seen = fn env -> fn world -> fn (seen: Val list) -> fn (k: Val) ->
   match seen with
   | Nil -> false
@@ -19748,22 +19829,87 @@ and hash_key_of_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) ->
 and key_has_user_hash = fn world -> fn (k: Val) ->
   match k with
   | VObj _ -> has_meth world (dispatch_cls_of world k) "hash"
-  | VArr _ -> has_meth world (dispatch_cls_of world k) "hash"
-  | VStr _ -> has_meth world (dispatch_cls_of world k) "hash"
-  | VHsh _ -> has_meth world (dispatch_cls_of world k) "hash"
+  | VArr _ -> key_hash_here world k
+  | VHsh _ -> key_hash_here world k
+  // ⚠ A STRING KEY IS HASHED BY ITS CONTENT, ALWAYS. Ruby's rb_any_hash
+  // branches on the type tag for String (and for true/false/Integer/Float/
+  // Symbol, which are already excluded here), so a redefined String#hash --
+  // or even a singleton one -- is never consulted for a Hash key. Asking it
+  // made `{"hello" => 42}["hello"]` run the program's own #hash, which is
+  // what core/hash/element_reference's fixture raises on.
   | _ -> false
 
-and hkey_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
+// ⚠ dispatch_cls_of DELIBERATELY looks past a hanging SINGLETON class (it
+// answers the class a `super` should resume above), so `def k.hash` on an
+// Array key was invisible here and Hash never asked that key for its hash --
+// which is exactly what core/hash/element_set watches for. The singleton is
+// the first place to look for a key's own #hash.
+and key_hash_here = fn world -> fn (k: Val) ->
+  let hk9 = hng_key k in
+  (if str_eq hk9 "" then false
+   else if map_has hng_store hk9 then has_meth world (map_get hng_store hk9) "hash"
+   else false)
+  || has_meth world (dispatch_cls_of world k) "hash"
+
+// ⚠ THE HASH CODE IS RECORDED AT STORE TIME, not recomputed on every look.
+// Ruby keeps each entry's hash in the table, which is the whole reason
+// Hash#rehash exists: mutate a key so its #hash changes and the entry can no
+// longer be found until the table is rebuilt. Asking the STORED key for its
+// hash again at comparison time made every key permanently findable and left
+// rehash with nothing to reorganise. Keyed by (hash handle, key identity) so
+// the same object used in two hashes keeps a record per hash, as ruby does.
+and hstored_key = fn (hid: int) -> fn (k: Val) ->
+  let ki9 = (match k with
+             | VObj i9 -> "o" ++ str_of_int i9
+             | VArr i9 -> "a" ++ str_of_int i9
+             | VHsh i9 -> "h" ++ str_of_int i9
+             | _ -> "") in
+  if str_eq ki9 "" then "" else str_of_int hid ++ "|" ++ ki9
+
+// a hash LITERAL does not go through the store door, so its keys' codes are
+// recorded here instead -- otherwise `{k => v}` left nothing for #rehash to
+// reorganise while `h[k] = v` did.
+and hstored_seed = fn env -> fn world -> fn (h9: Val) ->
+  match h9 with
+  | VHsh hid9 -> (let _ = hstored_seed_go env world hid9 (hderef hid9) in h9)
+  | _ -> h9
+and hstored_seed_go = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) ->
+  match xs with
+  | Cons (k9, Cons (_, t9)) ->
+    (let _ = (if key_has_user_hash world k9 then hstored_put env world hid k9 else ()) in
+     hstored_seed_go env world hid t9)
+  | _ -> ()
+
+and hstored_put = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
+  let kk9 = hstored_key hid k in
+  if str_eq kk9 "" || hid < 0 then ()
+  else (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let _ = map_set hstored kk9 (invoke_val_c env world nb9 k "hash" Nil false) in ())
+
+// the code recorded for this stored key, or its live #hash when none is.
+and hstored_code = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
+  let kk9 = hstored_key hid k in
+  if (if str_eq kk9 "" then false else true) && hid >= 0 && map_has hstored kk9
+  then map_get hstored kk9
+  else invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) k "hash" Nil false
+
+and hkey_eql_w = fn env -> fn world -> fn (hid: int) -> fn (a: Val) -> fn (b: Val) ->
   // ⚠ the SAME object is the same key whatever #eql? says: ruby compares the
   //   references first (st_lookup's ptr check), so a key whose #eql? answers
   //   false still finds its own entry. Asking #eql? first lost every value in
   //   a hash keyed by such an object.
-  if rb_identical a b then true
-  else if key_has_user_hash world a || key_has_user_hash world b then
+  // ⚠ ...but that shortcut lives INSIDE THE BUCKET. ruby finds the bucket by
+  //   hash first and only then compares references, so a key whose #hash has
+  //   changed since it was stored does not find its own entry -- `h.key?(k)`
+  //   is false until #rehash. Taking the identity answer first made every key
+  //   permanently findable and left rehash with nothing to do.
+  if key_has_user_hash world a || key_has_user_hash world b then
     (let nb7 = (false, (Nil : str list), (Nil : Stmt list), env) in
-     let ha = invoke_val_c env world nb7 a "hash" Nil false in
+     // `a` is the key ALREADY IN the table, so its code is the recorded one.
+     let ha = hstored_code env world hid a in
      let hb = invoke_val_c env world nb7 b "hash" Nil false in
      if rb_eq ha hb then
+       if rb_identical a b then true else
        // ⚠ EITHER side's #eql? answers: ruby asks the SEARCH key
        //   (rb_any_cmp's `rb_eql(a, b)`), and this walk is called with the
        //   STORED key first -- asking only that one left the question
@@ -19777,33 +19923,41 @@ and hkey_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
      else false)
   else hkey_eql a b
 
-and hash_get_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) ->
+and hash_get_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn (k: Val) ->
   match xs with
-  | Cons (k2, Cons (v, t)) -> (if hkey_eql_w env world k2 k then v else hash_get_w env world t k)
+  | Cons (k2, Cons (v, t)) -> (if hkey_eql_w env world hid k2 k then v else hash_get_w env world hid t k)
   | _ -> VNil
 
-and hash_haskey_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) ->
+and hash_haskey_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn (k: Val) ->
   match xs with
-  | Cons (k2, Cons (_, t)) -> hkey_eql_w env world k2 k || hash_haskey_w env world t k
+  | Cons (k2, Cons (_, t)) -> hkey_eql_w env world hid k2 k || hash_haskey_w env world hid t k
   | _ -> false
 
-and hash_put_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+and hash_put_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
   match xs with
   | Cons (k2, Cons (v2, t)) ->
-    (if hkey_eql_w env world k2 k then Cons (k2, Cons (v, t))
-     else Cons (k2, Cons (v2, hash_put_w env world t k v)))
+    (if hkey_eql_w env world hid k2 k then Cons (k2, Cons (v, t))
+     else Cons (k2, Cons (v2, hash_put_w env world hid t k v)))
   | _ -> Cons (k, Cons (v, (Nil : Val list)))
 
-and hash_del_w = fn env -> fn world -> fn (xs: Val list) -> fn (k: Val) ->
+and hash_del_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn (k: Val) ->
   match xs with
   | Cons (k2, Cons (v2, t)) ->
-    (if hkey_eql_w env world k2 k then t else Cons (k2, Cons (v2, hash_del_w env world t k)))
+    (if hkey_eql_w env world hid k2 k then t else Cons (k2, Cons (v2, hash_del_w env world hid t k)))
   | _ -> (Nil : Val list)
 
 // the ONE store entry every `[]=` / `store` door calls: the protocol when the
 // key carries it, the structural put otherwise.
-and hash_put_wx = fn env -> fn world -> fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
-  if key_has_user_hash world k then (let _ = hash_touch env world k in hash_put_w env world xs k v)
+and hash_put_wx = fn env -> fn world -> fn (hid: int) -> fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+  // ⚠ compare_by_identity ANSWERS FIRST. A hash comparing by identity asks
+  // its keys nothing -- not #hash, not #eql? -- so two distinct objects that
+  // claim to be equal are still two entries. Testing for a user #hash before
+  // the flag sent exactly those keys down the protocol path, where they
+  // merged into one.
+  if ident then hash_put_x ident xs k v
+  else if key_has_user_hash world k then
+    // record BEFORE the walk: the comparison below reads the recorded code.
+    (let _ = hstored_put env world hid k in hash_put_w env world hid xs k v)
   else hash_put_x ident xs k v
 
 // ⚠ ruby asks a key for its #hash on EVERY store and lookup -- that is how it
@@ -21012,7 +21166,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // ⚠ A step wider than 1 is STRICT about range: beg or len past the array is
   // a RangeError naming the sequence, where a plain Range slice would answer
   // nil. `a[(11..12) % 2]` refuses while `a[(10..12) % 2]` is [].
-  if str_eq name "[]" && (match recv with VArr _ -> true | _ -> false)
+  // ...and the NAMED spellings of the same set operations, for the same
+  // reason: the primitive layer they live in has no env to call #eql? with.
+  if (str_eq name "intersect?" || str_eq name "intersection" || str_eq name "difference")
+     && (match recv with VArr xa9 -> elem_has_user_eql world (deref xa9) | _ -> false) then
+    (match recv with
+     | VArr xa9 ->
+       (if str_eq name "intersect?" then
+          (match args with
+           | Cons (VArr xb9, _) -> VBool (val_any_in_w env world (deref xa9) (deref xb9))
+           | _ -> VBool false)
+        else if str_eq name "intersection" then
+          arr_new (arr_intersect_args_w env world args (val_dedup_into (deref xa9) Nil))
+        else arr_new (arr_difference_args_w env world args (deref xa9)))
+     | _ -> VNil)
+  else if str_eq name "[]" && (match recv with VArr _ -> true | _ -> false)
      && (match args with
          | Cons (VObj oid9, Nil) ->
            (let (_, _, ocls9, iv9) = world in
@@ -21409,7 +21577,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   else if (str_eq name "[]" || str_eq name "key?" || str_eq name "has_key?"
            || str_eq name "member?" || str_eq name "include?"
            || str_eq name "fetch" || str_eq name "delete")
-          && (match recv with VHsh _ -> true | _ -> false)
+          // ...and the READ doors skip the protocol for a compare_by_identity
+          // hash for the same reason the store door does.
+          && (match recv with VHsh h8 -> (if hcbi_on h8 then false else true) | _ -> false)
           && (match args with Cons (k7, _) -> key_has_user_hash world k7 | _ -> false) then
     (match recv with
      | VHsh h ->
@@ -21417,18 +21587,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
         match args with
         | Cons (k7, rest7) ->
           (let _ = hash_touch env world k7 in
-           if str_eq name "[]" then hash_get_w env world xs k7
+           if str_eq name "[]" then hash_get_w env world h xs k7
            else if str_eq name "delete" then
-             (let had = hash_haskey_w env world xs k7 in
-              let v7 = hash_get_w env world xs k7 in
-              let _ = (if had then hset h (hash_del_w env world xs k7) else ()) in
+             (let had = hash_haskey_w env world h xs k7 in
+              let v7 = hash_get_w env world h xs k7 in
+              let _ = (if had then hset h (hash_del_w env world h xs k7) else ()) in
               if had then v7 else VNil)
            else if str_eq name "fetch" then
-             (if hash_haskey_w env world xs k7 then hash_get_w env world xs k7
+             (if hash_haskey_w env world h xs k7 then hash_get_w env world h xs k7
               else (match rest7 with
                     | Cons (d7, _) -> d7
                     | Nil -> raise_exc world "KeyError" ("key not found: " ++ inspect_w env world k7)))
-           else VBool (hash_haskey_w env world xs k7))
+           else VBool (hash_haskey_w env world h xs k7))
         | _ -> VNil)
      | _ -> VNil)
   else if (str_eq name "[]=" || str_eq name "store")
@@ -21440,7 +21610,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        (match args with
         | Cons (k9, Cons (v9, Nil)) ->
           (let key9 = hash_store_key env world hid9 k9 in
-           let _ = hset hid9 (hash_put_wx env world (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
+           let _ = hset hid9 (hash_put_wx env world hid9 (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
         | _ -> VNil)
      | _ -> VNil)
   // Hash#rehash: rebuild the table now that the keys may hash differently.
@@ -21457,15 +21627,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           && (if prim_user_has world recv name then false else true) then
     (match recv with
      | VHsh hid9 ->
-       // ⚠ ci9 travels as a PARAMETER, not a capture: the lambda lifter drops a
-       //   capture chosen by name (PAIN.md M10) and the emitted C came out with
-       //   "use of undeclared identifier mu_ci9". Mere accepted the source; the
-       //   C compiler is what caught it.
-       (let rec re9 = fn (ci9: bool) -> fn (xs: Val list) -> fn (acc: Val list) ->
+       // ⚠ ci9 AND hd9 travel as PARAMETERS, not captures: the lambda lifter
+       //   drops a capture chosen by name (PAIN.md M10) and the emitted C came
+       //   out with "use of undeclared identifier mu_ci9". Mere accepted the
+       //   source; the C compiler is what caught it -- once per name.
+       (let rec re9 = fn (hd9: int) -> fn (ci9: bool) -> fn (xs: Val list) -> fn (acc: Val list) ->
           (match xs with
-           | Cons (k9, Cons (v9, t9)) -> re9 ci9 t9 (hash_put_wx env world ci9 acc k9 v9)
+           | Cons (k9, Cons (v9, t9)) -> re9 hd9 ci9 t9 (hash_put_wx env world hd9 ci9 acc k9 v9)
            | _ -> acc) in
-        let _ = hset hid9 (re9 (hcbi_on hid9) (hderef hid9) Nil) in recv)
+        let _ = hset hid9 (re9 hid9 (hcbi_on hid9) (hderef hid9) Nil) in recv)
      | _ -> recv)
   // Hash#initialize on a FROZEN hash refuses (it replaces the default either
   // way), and the primitive has no way to know it was frozen.
@@ -30228,7 +30398,7 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
        //   it asked #eql? without asking #hash first, so two keys whose hashes
        //   DIFFER were treated as the same key whenever eql? said yes, and the
        //   second store replaced the first instead of adding a pair.
-       (if (if ci then hkey_same true k2 k else hkey_eql_w env world k2 k)
+       (if (if ci then hkey_same true k2 k else hkey_eql_w env world hid k2 k)
         then Cons (k2, Nil) else find9 t)
      | _ -> (Nil : Val list)) in
   match find9 (hderef hid) with
