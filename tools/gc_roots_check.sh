@@ -44,11 +44,20 @@ LC_ALL=C grep -a -o 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
 #   So an allowlist entry naming a map that is currently in the excluded class
 #   is not stale -- it is an entry waiting for the type to swing back.
 
-# 2. the roots: every `map_iter X mk` inside gc_mark_roots
-a=$(LC_ALL=C grep -n '^let gc_mark_roots = fn' "$root/main.mere" | head -1 | cut -d: -f1)
-b=$(LC_ALL=C awk -v s="$a" 'NR>s && /^(let|and) [a-z_]+ = /{print NR; exit}' "$root/main.mere")
-[ -n "$a" ] && [ -n "$b" ] || { echo "cannot find gc_mark_roots in main.mere"; exit 2; }
-sed -n "${a},${b}p" "$root/main.mere" | LC_ALL=C grep -o 'map_iter [a-z_0-9]*' | awk '{print $2}' | sort -u > "$tmp/roots"
+# 2. the roots: every `map_iter X mk` inside gc_mark_roots.
+# ⚠ The definition may live in ANY of the program's .mere files -- main.mere
+# is one module among several, and looking only there would find nothing and
+# report every map as unrooted (or, worse, find a stale copy). The source
+# files are asked in turn for the one that defines it.
+srcfile=""
+for f in "$root"/*.mere; do
+  LC_ALL=C grep -q '^let gc_mark_roots = fn' "$f" && { srcfile="$f"; break; }
+done
+[ -n "$srcfile" ] || { echo "cannot find gc_mark_roots in any .mere under $root"; exit 2; }
+a=$(LC_ALL=C grep -n '^let gc_mark_roots = fn' "$srcfile" | head -1 | cut -d: -f1)
+b=$(LC_ALL=C awk -v s="$a" 'NR>s && /^(let|and) [a-z_]+ = /{print NR; exit}' "$srcfile")
+[ -n "$a" ] && [ -n "$b" ] || { echo "cannot delimit gc_mark_roots in $srcfile"; exit 2; }
+sed -n "${a},${b}p" "$srcfile" | LC_ALL=C grep -o 'map_iter [a-z_0-9]*' | awk '{print $2}' | sort -u > "$tmp/roots"
 
 # 3. the allowlist: "name  reason"
 sed -n 's/^\([a-z_][a-z_0-9]*\)[[:space:]].*/\1/p' "$here/gc_roots_allow.txt" 2>/dev/null | sort -u > "$tmp/allow"

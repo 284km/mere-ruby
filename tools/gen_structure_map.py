@@ -19,14 +19,28 @@ inside the big cycle could not, whatever the module system looked like.
 """
 import io, re, sys, collections
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "main.mere"
-L = io.open(SRC, encoding="utf-8", errors="replace").read().split("\n")
+# Every .mere of the program, in import order where that matters. `import` is
+# a SPLICE, so a chain cannot cross a file: each file is its own sequence of
+# chains, and the map has to say which file a definition is in as well as which
+# chain. With no argument, every .mere in the project root is read.
+import glob, os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRCS = sys.argv[1:] or sorted(glob.glob(os.path.join(ROOT, "*.mere")))
+L, FILE = [], []
+for f in SRCS:
+    ls = io.open(f, encoding="utf-8", errors="replace").read().split("\n")
+    base = os.path.basename(f)
+    L += ls; FILE += [(base, k + 1) for k in range(len(ls))]
+SRC = ", ".join(os.path.basename(f) for f in SRCS)
 DEF = re.compile(r"^(and|let rec|let) ([a-z_][a-z_0-9]*) = fn")
 WORD = re.compile(r"[a-z_][a-z_0-9]*")
 
 chains, owner, defline = [], [None] * len(L), {}
 cur_chain = -1
+prev_file = None
 for i, l in enumerate(L):
+    if FILE[i][0] != prev_file:
+        prev_file = FILE[i][0]; cur_chain = len(chains) - 1   # a file boundary ends a chain
     m = DEF.match(l)
     if m:
         name = m.group(2)
@@ -104,7 +118,7 @@ w("|---|---|---|---|")
 small = 0
 for c in chains:
     if c["lines"] < 20: small += 1; continue
-    w(f"| {c['lines']} | {c['start']} | `{c['head']}` | {len(c['names'])} |")
+    w(f"| {c['lines']} | {FILE[c['start']-1][0]}:{FILE[c['start']-1][1]} | `{c['head']}` | {len(c['names'])} |")
 w(f"\n...and {small} chains shorter than 20 lines.\n")
 
 w("## Cycles — what could be split, and what could not\n")
@@ -123,10 +137,11 @@ w("between the halves, and Mere has no way to write that.\n")
 
 w("## The chain each function is in\n")
 w("Sorted by name. `scc` is the size of its cycle (1 = not in one).\n")
-w("| function | line | chain | scc |")
+w("| function | at | chain | scc |")
 w("|---|---|---|---|")
 for n in sorted(names):
     ln = defline[n]
     ci = next((k for k, c in enumerate(chains) if c["start"] <= ln <= c["end"]), -1)
-    w(f"| `{n}` | {ln} | {chains[ci]['head'] if ci >= 0 else '—'} | {len(comps[scc_of[n]])} |")
+    fb, fl = FILE[ln - 1]
+    w(f"| `{n}` | {fb}:{fl} | {chains[ci]['head'] if ci >= 0 else '—'} | {len(comps[scc_of[n]])} |")
 print("\n".join(out))
