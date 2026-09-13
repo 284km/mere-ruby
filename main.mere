@@ -14763,7 +14763,17 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     // `(1..10) % 3` is `(1..10).step(3)`: the same arithmetic sequence, and
     // ruby spells it both ways. Answered here rather than in the dispatcher so
     // that the operator and the method form cannot drift apart.
-    else if str_eq op "%" && (match va0 with VRange (lo9, hi9, _) -> rng_is_int lo9 && (rng_is_int hi9 || rng_hi_open hi9) | _ -> false) then
+    // A BEGINLESS range is a sequence too -- `(..5) % 2` starts at nil and
+    // slices an array from its front. Requiring an Integer begin sent it to
+    // the numeric `%` instead, which refused with "Integer can't be coerced
+    // into Integer". For a beginless one it is the END that decides, so the
+    // whole family comes here and aseq_pct names the refusal.
+    else if str_eq op "%" && (match va0 with
+                              | VRange (lo9, hi9, _) ->
+                                (match lo9 with
+                                 | VNil -> true
+                                 | _ -> rng_is_int lo9 && (rng_is_int hi9 || rng_hi_open hi9))
+                              | _ -> false) then
       aseq_pct world va0 (Cons (vb, Nil))
     else if str_eq op "===" then
       // TWO QUESTIONS, ONE NAME. `when` needs a truth value, and that is what
@@ -20702,6 +20712,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               // Array's subscripts: the range protocol first, then #to_int
               // (see coerce_arr_index_args). `[]=` is here too -- its trailing
               // VALUE argument is left alone by the "index, then length" shape.
+              // ⚠ an ArithmeticSequence subscript is NOT an index to convert:
+              // `a[(1..5) % 2]` is a slice with a step, and sending it through
+              // the #to_int protocol refused it as "no implicit conversion of
+              // Object into Integer" before the slicing arm could see it.
+              else if (match recv with VArr _ -> true | _ -> false)
+                      && (str_eq name "[]" || str_eq name "slice")
+                      && (match args0 with
+                          | Cons (VObj oid8, Nil) ->
+                            (let (_, _, ocls8, _) = world in
+                             str_eq (map_get ocls8 (str_of_int oid8)) "Enumerator::ArithmeticSequence")
+                          | _ -> false)
+              then args0
               else if (match recv with VArr _ -> true | _ -> false)
                       && (str_eq name "[]" || str_eq name "slice" || str_eq name "slice!"
                           || str_eq name "values_at" || str_eq name "at" || str_eq name "delete_at"
@@ -20954,6 +20976,70 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      && (match args with Cons (VClass _, _) -> true | _ -> false) then
     (let _ = (if str_eq name "include" then incl_each world "Object" args
               else prep_each world "Object" args) in recv)
+  else
+  // ---- Array#[aseq] : slicing with a step --------------------------------
+  // `a[(1..5) % 2]` is [a[1], a[3], a[5]]. Transcribed from CRuby's
+  // rb_arithmetic_sequence_beg_len_step: a NEGATIVE step reverses the range
+  // (moving the exclusion to the other end first, so `(5..1) % -2` keeps 5),
+  // then the pair is read as an ordinary range slice and walked with the step.
+  //
+  // ⚠ A step wider than 1 is STRICT about range: beg or len past the array is
+  // a RangeError naming the sequence, where a plain Range slice would answer
+  // nil. `a[(11..12) % 2]` refuses while `a[(10..12) % 2]` is [].
+  if str_eq name "[]" && (match recv with VArr _ -> true | _ -> false)
+     && (match args with
+         | Cons (VObj oid9, Nil) ->
+           (let (_, _, ocls9, iv9) = world in
+            str_eq (map_get ocls9 (str_of_int oid9)) "Enumerator::ArithmeticSequence"
+            && map_has iv9 (str_of_int oid9 ++ "@__as_begin"))
+         | _ -> false) then
+    (match (recv, args) with
+     | (VArr aid9, Cons (VObj oid9, Nil)) ->
+       (let (_, _, _, iv9) = world in
+        let gv = fn (nm: str) -> (if map_has iv9 (str_of_int oid9 ++ nm) then map_get iv9 (str_of_int oid9 ++ nm) else VNil) in
+        let xs9 = deref aid9 in
+        let n9 = val_list_len xs9 in
+        let st9 = (match gv "@__as_step" with VInt k -> k | _ -> 1) in
+        let ex0 = (match gv "@__as_excl" with VBool b -> b | _ -> false) in
+        if st9 == 0 then raise_exc world "ArgumentError" "slice step cannot be zero"
+        else
+          (let b0 = gv "@__as_begin" in
+           let e0 = gv "@__as_end" in
+           // a negative step swaps the ends, and the exclusion moves with them
+           let (b1, e1, ex1) =
+             (if st9 < 0 then
+                (match e0 with
+                 | VNil -> (e0, b0, ex0)
+                 | VInt ev -> (if ex0 then (VInt (ev + 1), b0, false) else (e0, b0, ex0))
+                 | _ -> (e0, b0, ex0))
+              else (b0, e0, ex0)) in
+           let bi = (match b1 with VInt k -> (if k < 0 then k + n9 else k) | _ -> 0) in
+           let ei = (match e1 with VInt k -> (if k < 0 then k + n9 else k) | _ -> n9 - 1) in
+           // an ENDLESS range excludes nothing: `a[(3...nil) % 1]` runs to the
+           // last element. Honouring the `...` against the substituted end
+           // dropped one.
+           let ex2 = (match e1 with VNil -> false | _ -> ex1) in
+           let len0 = (if ex2 then ei - bi else ei - bi + 1) in
+           let len1 = (if len0 < 0 then 0 else len0) in
+           // ⚠ a NEGATIVE step walks DOWN from the high end of the window, not
+           // up from the low one: `a[(9..1) % -3]` is [9, 6, 3], taken from 9.
+           // Picking upward and reversing gave [7, 4, 1] -- the same count of
+           // elements, off by the remainder.
+           let start9 = (if st9 < 0 then bi + ((if bi + len1 > n9 then n9 - bi else len1) - 1) else bi) in
+           // ⚠ the strict check, and only for |step| > 1
+           if (st9 > 1 || st9 < 0 - 1) && (bi > n9 || bi < 0 || len1 > n9) then
+             raise_exc world "RangeError" (to_s (invoke_val_c env world blk (VObj oid9) "inspect" Nil false) ++ " out of range")
+           else if bi > n9 || bi < 0 then VNil
+           else
+             (let avail = (if bi + len1 > n9 then n9 - bi else len1) in
+              let avail = (if avail < 0 then 0 else avail) in
+              let rec pick9 = fn (i: int) -> fn (k: int) ->
+                (if k <= 0 then (Nil : Val list)
+                 else if i < 0 || i >= n9 then (Nil : Val list)
+                 else Cons (val_nth xs9 i, pick9 (i + st9) (k - 1))) in
+              let cnt = (let d9 = (if st9 < 0 then 0 - st9 else st9) in (avail + d9 - 1) / d9) in
+              arr_new (pick9 start9 cnt))))
+     | _ -> VNil)
   else
   // ---- Integer#[] --------------------------------------------------------
   // Here rather than beside the other Integer primitives for the same reason
@@ -44379,7 +44465,18 @@ and aseq_pct = fn world -> fn (recv: Val) -> fn (args: Val list) ->
   match recv with
   | VRange (lo, hi, excl) ->
     (let st = (match args with Cons (VInt n, _) -> VInt n | _ -> VInt 1) in
-     make_aseq_m world recv "%" args (VInt (rng_int lo)) (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl)
+     // a BEGINLESS range still makes a sequence -- `(..5) % 2` begins at nil
+     // and slices an array from its front. Reading the begin as an Integer
+     // refused it as "Integer can't be coerced into Integer" before it was
+     // ever built. With NO end either there is nothing numeric to step over,
+     // and ruby says so by name.
+     let _ = (if (match lo with VNil -> true | _ -> false)
+                 && (rng_hi_open hi || (if rng_is_int hi then false else true))
+              then prim_raise "ArgumentError"
+                     "#step for non-numeric beginless ranges is meaningless"
+              else ()) in
+     make_aseq_m world recv "%" args (match lo with VNil -> VNil | _ -> VInt (rng_int lo))
+       (if rng_hi_open hi then VNil else VInt (rng_int hi)) st excl)
   | _ -> aseq_of world recv args
 
 // the sequence for `recv.step(args)` with no block: Integer with (limit[, by])
@@ -45545,7 +45642,14 @@ and bind_defaulted = fn frame -> fn world -> fn blk -> fn (params: str list) -> 
   | Nil -> ()
   | Cons (p, ps) ->
     (match args with
-     | Cons (a, rest) -> let _ = bind_seq_one frame world p a in bind_defaulted frame world blk ps defaults rest
+     | Cons (a, rest) ->
+       // ⚠ A default that does NOT run still DECLARES what it assigns.
+       // `def m(a = b = 1, d = 2)` called as `m(9)` leaves b as nil in ruby;
+       // skipping the expression entirely left b undefined, so the body
+       // raised NameError instead of reading nil.
+       let _ = (if has_default defaults p
+                then decl_default_names frame (get_default defaults p) else ()) in
+       let _ = bind_seq_one frame world p a in bind_defaulted frame world blk ps defaults rest
      | Nil ->
        // Ruby declares the parameter (as nil) before its default runs, so a
        // self-referential default like `a = a` sees nil.
@@ -45553,6 +45657,17 @@ and bind_defaulted = fn frame -> fn world -> fn blk -> fn (params: str list) -> 
                 then (let _ = map_set frame p VNil in eval_e frame world blk (get_default defaults p))
                 else VNil) in
        let _ = bind_seq_one frame world p v in bind_defaulted frame world blk ps defaults Nil)
+
+// the locals a parameter default ASSIGNS, declared as nil when it is skipped.
+// Only the assignment chain matters here (`a = b = c = {}` is the shape ruby's
+// own spec uses); a name already bound keeps its value.
+and decl_default_names = fn frame -> fn (e: Expr) ->
+  match e with
+  | EAssign (n, inner) ->
+    let _ = (if str_len n > 0 && (str_eq (char_at n 0) "$" || is_upper_first n) then ()
+             else if map_has frame n then () else (let _ = map_set frame n VNil in ())) in
+    decl_default_names frame inner
+  | _ -> ()
 
 and has_default = fn (defaults: (str * Expr) list) -> fn (p: str) ->
   match defaults with Nil -> false | Cons (d, r) -> let (n, _) = d in if str_eq n p then true else has_default r p
@@ -46518,10 +46633,21 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // plain `def m` must not inherit an earlier `ruby2_keywords def m`).
          let _ = if map_has r2k_methods (meth_base mname) then map_delete r2k_methods (meth_base mname) else () in
          // receiver-qualified / singleton defs are always public.
+         // ⚠ A REDEFINITION TAKES THE BODY'S CURRENT VISIBILITY, it does not
+         // inherit the old one. Reopening a class and writing `def foo` again
+         // makes foo public even if the first one was private -- the entry
+         // was only ever added, never removed, so the method stayed private
+         // and `method_defined?` kept answering false.
          let _ = if (if is_selfdef then false else true) && (if str_contains mname "#" then false else true) then
-                   (if str_eq vis2 "private" || always_private_meth (meth_base mname) then map_set privates key VNil
-                    else if str_eq vis2 "protected" then map_set protecteds key VNil
-                    else ())
+                   (if str_eq vis2 "private" || always_private_meth (meth_base mname) then
+                      (let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
+                       map_set privates key VNil)
+                    else if str_eq vis2 "protected" then
+                      (let _ = (if map_has privates key then map_delete privates key else ()) in
+                       map_set protecteds key VNil)
+                    else
+                      (let _ = (if map_has privates key then map_delete privates key else ()) in
+                       (if map_has protecteds key then map_delete protecteds key else ())))
                  else () in
          // ...and it fires AFTER the visibility is recorded, because ruby's hook
          // sees the method as it finally is. thor asks
@@ -47423,7 +47549,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
          // `def @obj.m` -- the receiver is an ivar of the current self: the
          // singleton goes on the OBJECT the ivar holds, like a local's would.
          let rv9 =
-           (if str_len recv > 1 && str_eq (char_at recv 0) "@" && lv_has env "self" then
+           // `def $g.foo` -- the receiver is a GLOBAL, and the singleton goes
+           // on whatever object it holds. Only locals, ivars and constants
+           // were read, so this registered a bare name nothing could reach
+           // and `$g.foo` raised NoMethodError.
+           (if str_len recv > 1 && str_eq (char_at recv 0) "$" then
+              (if map_has globals (substring recv 1 (str_len recv))
+               then map_get globals (substring recv 1 (str_len recv)) else VNil)
+            else if str_len recv > 1 && str_eq (char_at recv 0) "@" && lv_has env "self" then
               (match lv_get env "self" with
                | VObj oid9 ->
                  (let k9 = str_of_int oid9 ++ recv in
@@ -47507,7 +47640,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ name
           | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ name
           | _ -> name)
-       // a nested `def` inside a method body defines on self's class.
+       // ⚠ A nested `def` goes where it was WRITTEN, not to self's class.
+       // `class B; class << self; def make; def cm; end; end` puts cm on B's
+       // SINGLETON (B.cm), and a top-level `def C.mk; def dm; end` puts dm on
+       // Object -- reading self gave B and C instead, so B.cm raised
+       // NoMethodError and C.dm was invisible. The innermost segment of the
+       // method's recorded cref IS that lexical class ("B::(sng:B)" for the
+       // singleton body, "" for the top level = Object); only a METHOD frame
+       // has one, which is what `__meth` distinguishes from a class body.
+       else if lv_has env "__meth" && lv_has env "__cref" then
+         (let lx9 = (match lv_get env "__cref" with VStr h -> sget h | _ -> "") in
+          let seg9 = lex_innermost lx9 in
+          (if str_eq seg9 "" then "Object" else seg9) ++ "#" ++ name)
        else if lv_has env "self" then
          (match lv_get env "self" with
           | VObj id -> map_get ocls (str_of_int id) ++ "#" ++ name
@@ -48395,6 +48539,11 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
             (match skip_nls rest1 with
              | Cons (TId _, _) -> ": syntax error, unexpected local variable or method, expecting end-of-input"
              | _ -> "syntax error")) "syntax error" in
+          // ⚠ that re-lex was only to WORD the error, but lexing queues every
+          // regexp literal it sees -- so the bad one went back on the queue
+          // and the NEXT eval raised its SyntaxError instead of its own.
+          // A diagnostic pass must leave no work behind.
+          let _ = rx_pending_sync () in
           raise_exc world "SyntaxError" msg)
        else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
@@ -49441,11 +49590,26 @@ and warn_flush_go = fn world -> fn (i: int) -> fn (n: int) ->
               then () else err_emit world s9) in
      warn_flush_go world (i + 1) n)
 
+// mark everything queued so far as already looked at -- for a lex done only
+// to produce a message, whose literals nobody is going to run.
+// the innermost segment of a lexical scope string ("A::B::(sng:C)" -> "(sng:C)"),
+// which is the class a `def` written at that point lands in.
+and lex_innermost = fn (lx: str) ->
+  let i = str_rindex_go lx "::" (str_len lx - 2) in
+  if i < 0 then lx else substring lx (i + 2) (str_len lx)
+and rx_pending_sync = fn (u: unit) ->
+  map_set rx_pending "done"
+    (if map_has rx_pending "n" then map_get rx_pending "n" else VInt 0)
 and rx_check_pending = fn (u: unit) ->
   let n = (if map_has rx_pending "n" then (match map_get rx_pending "n" with VInt k -> k | _ -> 0) else 0) in
   let d = (if map_has rx_pending "done" then (match map_get rx_pending "done" with VInt k -> k | _ -> 0) else 0) in
-  let _ = rx_check_go d n in
-  map_set rx_pending "done" (VInt n)
+  // ⚠ CONSUME THE QUEUE FIRST. rx_check_go RAISES on a bad literal, so the
+  // cursor below never advanced past it -- and every later `eval` re-checked
+  // the same dead entry and raised the same SyntaxError. One
+  // `eval('/(/')` in a spec file turned every subsequent eval in the process
+  // into a SyntaxError. A literal is validated once, whatever the verdict.
+  let _ = map_set rx_pending "done" (VInt n) in
+  rx_check_go d n
 and rx_check_go = fn (i: int) -> fn (n: int) ->
   if i >= n then ()
   else
