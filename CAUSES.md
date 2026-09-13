@@ -10,30 +10,30 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 146 files.
+Classified: 140 files.
 
-## DIFF — 146 files, 69 kinds
+## DIFF — 140 files, 68 kinds
 
 | files | kind |
 |---|---|
 | 14 | `ERROR NoMethodError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
-| 9 | `ERROR ArgumentError` |
+| 8 | `ERROR NameError` |
+| 8 | `ERROR ArgumentError` |
 | 7 | `FAILED expected false, got true` |
-| 7 | `ERROR NameError` |
-| 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected ArgumentError to be raised` |
+| 5 | `FAILED expected TypeError to be raised` |
 | 5 | `ERROR TypeError` |
 | 4 | `FAILED expected true, got false` |
-| 4 | `FAILED expected to be identical` |
-| 4 | `FAILED expected "S", got nil` |
 | 4 | `FAILED expected "S", got "S"` |
 | 3 | `pass=N fail=N err=N` |
 | 3 | `FAILED expected N, got N` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
+| 2 | `FAILED expected to be identical` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected SyntaxError to be raised` |
+| 2 | `FAILED expected "S", got nil` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
@@ -41,7 +41,6 @@ Classified: 146 files.
 | 1 | `FAILED raised NoMethodError, expected TypeError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
-| 1 | `FAILED raised ArgumentError, expected IndexError` |
 | 1 | `FAILED expected {...}, got {...}` |
 | 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
@@ -90,9 +89,8 @@ Classified: 146 files.
 
 | files | cause |
 |---|---|
-| 6 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected ArgumentError to be raised` |
-| 2 | `FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical` |
+| 5 | `FAILED: expected TypeError to be raised` |
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
@@ -130,6 +128,7 @@ Classified: 146 files.
 | 1 | `FAILED: reports the same arity as the given block: expected [2], got [-2]` |
 | 1 | `FAILED: reorganizes the Hash by recomputing all key hash codes: expected false, got true` |
 | 1 | `FAILED: re-raises a previously rescued exception without overwriting the cause when it's explicitly specified with :cause option and has nil value: expected #<RuntimeError: Error 1>, got nil` |
+| 1 | `FAILED: raises TypeError if 'to_proc' doesn't return a Proc: matcher did not match #<Proc>` |
 
 </details>
 
@@ -144,8 +143,8 @@ class column says where the weight sits.
 |---|---|
 | kernel (9) | `binding chomp chop eval loop select singleton_class test warn` |
 | unboundmethod (3) | `bind_call bind super_method` |
+| language (3) | `constants module optional_assignments` |
 | method (2) | `super_method to_proc` |
-| language (2) | `constants module` |
 | symbol (1) | `all_symbols` |
 | regexp (1) | `timeout` |
 | proc (1) | `new` |

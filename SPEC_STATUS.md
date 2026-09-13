@@ -16,14 +16,14 @@ of the subject: a row measured against another release is not comparable with th
 ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 43 | 24 | 0 | 0 | 0 | 67 |
-| core/string | 111 | 3 | 0 | 0 | 0 | 114 |
+| language | 44 | 23 | 0 | 0 | 0 | 67 |
+| core/string | 112 | 2 | 0 | 0 | 0 | 114 |
 | core/array | 101 | 3 | 0 | 0 | 1 | 105 |
 | core/hash | 64 | 5 | 0 | 0 | 0 | 69 |
 | core/range | 30 | 5 | 0 | 0 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 41 | 2 | 0 | 0 | 0 | 43 |
-| core/env | 41 | 4 | 0 | 0 | 0 | 45 |
+| core/env | 45 | 0 | 0 | 0 | 0 | 45 |
 | core/exception | 29 | 10 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 46 | 4 | 0 | 0 | 0 | 50 |

@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **146** of **146** recorded DIFF files.
+Visited **140** of **140** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -35,20 +35,6 @@ Visited **146** of **146** recorded DIFF files.
 | core/enumerable/tally_spec.rb | FAILED: ignores the default value: expected {...}, got {...} |
 | core/enumerable/to_h_spec.rb | pass=13 fail=0 err=1 pass=14 fail=0 err=0 |
 | core/enumerable/to_set_spec.rb | pass=5 fail=1 err=0 pass=6 fail=0 err=0 |
-| core/env/each_pair_spec.rb | pass=33 fail=20 err=0 pass=53 fail=0 err=0 |
-| core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
-| core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
-| core/env/each_pair_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
-| core/env/merge_spec.rb | pass=7 fail=6 err=5 pass=21 fail=0 err=0 |
-| core/env/merge_spec.rb | FAILED: adds the multiple parameter hashes to ENV, returning ENV: expected "multi2", got nil |
-| core/env/merge_spec.rb | ERROR: ENV.merge! yields key, the old value and the new value when replacing an entry: NotImplementedError -- mere-ruby: ENV.merge! is not implemented (it would change the environment) |
-| core/env/merge_spec.rb | ERROR: ENV.merge! yields key, the old value and the new value when replacing an entry: NotImplementedError -- mere-ruby: ENV.merge! is not implemented (it would change the environment) |
-| core/env/replace_spec.rb | pass=6 fail=9 err=0 pass=15 fail=0 err=0 |
-| core/env/replace_spec.rb | FAILED: expected TypeError to be raised |
-| core/env/replace_spec.rb | FAILED: raises TypeError if a key is not a String: expected {...}, got {...} |
-| core/env/replace_spec.rb | FAILED: expected TypeError to be raised |
-| core/env/shift_spec.rb | pass=6 fail=2 err=0 pass=8 fail=0 err=0 |
-| core/env/shift_spec.rb | FAILED: transcodes from the locale encoding to Encoding.default_internal if set: expected to be identical |
 | core/exception/backtrace_locations_spec.rb | pass=2 fail=1 err=0 pass=3 fail=0 err=0 |
 | core/exception/backtrace_spec.rb | pass=19 fail=0 err=0 pass=21 fail=0 err=0 |
 | core/exception/backtrace_spec.rb | (nothing failed -- the record may be stale) |
@@ -261,10 +247,8 @@ Visited **146** of **146** recorded DIFF files.
 | core/proc/new_spec.rb | ERROR: called on a subclass of Proc returns an instance of the subclass: NoMethodError -- undefined method 'call' for an instance of #<Class:0xADDR> |
 | core/proc/new_spec.rb | ERROR: using a reified block parameter returns an instance of the subclass: NoMethodError -- undefined method 'call' for an instance of #<Class:0xADDR> |
 | core/proc/new_spec.rb | ERROR: called on a subclass of Proc that does not 'super' in 'initialize' still constructs a functional proc: NoMethodError -- undefined method 'call' for an instance of #<Class:0xADDR> |
-| core/proc/parameters_spec.rb | pass=52 fail=4 err=0 pass=56 fail=0 err=0 |
+| core/proc/parameters_spec.rb | pass=54 fail=2 err=0 pass=56 fail=0 err=0 |
 | core/proc/parameters_spec.rb | FAILED: returns all parameters defined with the name _ as _: expected [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped] |
-| core/proc/parameters_spec.rb | FAILED: returns all parameters defined with the name _ as _: expected [[:req, :_], [:req, :_], [:opt, :_], [:rest, :_], [:keyreq, :_], [:key, :_], [:keyrest, :_], [:block, :_]], got [[:opt, :_], [:opt, :_], [:opt, :_], [:rest, :_], [:key, : ...[clipped] |
-| core/proc/parameters_spec.rb | FAILED: handles the usage of `it` as a parameter: expected [[:opt]], got [] |
 | core/proc/ruby2_keywords_spec.rb | pass=6 fail=4 err=0 pass=10 fail=0 err=0 |
 | core/proc/ruby2_keywords_spec.rb | FAILED: prints warning when a proc does not accept argument splat: matcher did not match #<Proc> |
 | core/proc/ruby2_keywords_spec.rb | FAILED: prints warning when a proc accepts keywords: matcher did not match #<Proc> |
@@ -304,10 +288,6 @@ Visited **146** of **146** recorded DIFF files.
 | core/regexp/options_spec.rb | FAILED: expected not 0 |
 | core/regexp/timeout_spec.rb | pass=3 fail=0 err=2 pass=5 fail=0 err=0 |
 | core/regexp/timeout_spec.rb | ERROR: Regexp.timeout raises Regexp::TimeoutError after global timeout elapsed: NameError -- uninitialized constant Regexp::TimeoutError |
-| core/string/bytesplice_spec.rb | pass=57 fail=16 err=11 pass=118 fail=0 err=0 |
-| core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
-| core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
-| core/string/bytesplice_spec.rb | FAILED: raised ArgumentError, expected IndexError |
 | core/string/index_spec.rb | pass=741 fail=1 err=0 pass=742 fail=0 err=0 |
 | core/string/uplus_spec.rb | pass=5 fail=2 err=0 pass=6 fail=1 err=0 |
 | core/string/uplus_spec.rb | FAILED: returns mutable copy of a literal: expected "mutable", got "" |
@@ -361,10 +341,10 @@ Visited **146** of **146** recorded DIFF files.
 | language/break_spec.rb | FAILED: returns from the lambda: expected [:a, :d, :aaa, :b, :bbb, :e], got [:a, :d, :aaa, :b, :e] |
 | language/break_spec.rb | FAILED: returns a value when invoking from the toplevel: expected "a,b,break,d", got "" |
 | language/break_spec.rb | FAILED: returns a value when invoking from a method: expected "a,d,b,break,e,f", got "" |
-| language/constants_spec.rb | pass=113 fail=17 err=13 pass=148 fail=0 err=0 |
-| language/constants_spec.rb | ERROR: with statically assigned constants searches the superclass chain: NameError -- uninitialized constant ConstantSpecs::ContainerA::ChildA::CS_CONST13 |
-| language/constants_spec.rb | ERROR: with statically assigned constants searches Object if no class or module qualifier is given: NameError -- uninitialized constant CS_CONST10 |
-| language/constants_spec.rb | ERROR: with statically assigned constants searches Object after searching other scopes: NameError -- uninitialized constant CS_CONST10 |
+| language/constants_spec.rb | pass=122 fail=16 err=7 pass=148 fail=0 err=0 |
+| language/constants_spec.rb | ERROR: with statically assigned constants searches Object if a toplevel qualifier (::X) is given: NameError -- uninitialized constant CS_CONST10 |
+| language/constants_spec.rb | ERROR: with dynamically assigned constants evaluates the qualifier: NoMethodError -- undefined method 'get_const' for module Object::ConstantSpecs |
+| language/constants_spec.rb | ERROR: with statically assigned constants searches Object as a lexical scope only if Object is explicitly opened: NoMethodError -- undefined method 'const20' for class ConstantSpecs::ContainerA::ChildA |
 | language/def_spec.rb | pass=111 fail=6 err=7 pass=135 fail=0 err=0 |
 | language/def_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/def_spec.rb | ERROR: A singleton method definition can be declared for a global variable: NoMethodError -- undefined method 'foo' for an instance of String |
@@ -377,16 +357,8 @@ Visited **146** of **146** recorded DIFF files.
 | language/delegation_spec.rb | ERROR: delegation with def(*) delegates rest: StandardError -- mere-ruby: unexpected token: ) in (eval)     def delegate(*) |
 | language/execution_spec.rb | pass=16 fail=2 err=0 pass=18 fail=0 err=0 |
 | language/execution_spec.rb | FAILED: can be redefined and receive a frozen string as argument: expected true, got false |
-| language/hash_spec.rb | pass=74 fail=21 err=0 pass=93 fail=0 err=0 |
-| language/hash_spec.rb | FAILED: freezes string keys on initialization: expected "bar", got nil |
-| language/hash_spec.rb | FAILED: freezes string keys on initialization: expected "foo", got "oof" |
-| language/hash_spec.rb | FAILED: checks duplicated keys on initialization: matcher did not match #<Proc> |
 | language/if_spec.rb | pass=59 fail=2 err=0 pass=61 fail=0 err=0 |
 | language/if_spec.rb | FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc> |
-| language/it_parameter_spec.rb | pass=11 fail=14 err=4 pass=32 fail=0 err=0 |
-| language/it_parameter_spec.rb | ERROR: The `it` parameter provides it in a block: ArgumentError -- wrong number of arguments (given 1, expected 0) |
-| language/it_parameter_spec.rb | ERROR: The `it` parameter can be used in both outer and nested blocks at the same time: ArgumentError -- wrong number of arguments (given 1, expected 0) |
-| language/it_parameter_spec.rb | FAILED: expected SyntaxError to be raised |
 | language/lambda_spec.rb | pass=116 fail=14 err=0 pass=129 fail=0 err=0 |
 | language/lambda_spec.rb | FAILED: has its own scope for local variables: expected to be identical |
 | language/lambda_spec.rb | FAILED: has its own scope for local variables: expected [9, 8, [7], [], 6, 5, 4, 3, {}, #<Proc:0xADDR TMPDIR (lambda)>], got [9, 8, [7], [], 6, 5, 4, 3, {}, #<Proc:0xADDR TMPDIR |
@@ -396,6 +368,7 @@ Visited **146** of **146** recorded DIFF files.
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/module_spec.rb | pass=15 fail=0 err=1 pass=16 fail=0 err=0 |
+| language/optional_assignments_spec.rb | pass=112 fail=0 err=1 pass=114 fail=0 err=0 |
 | language/predefined_spec.rb | pass=206 fail=25 err=6 pass=221 fail=14 err=2 |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |

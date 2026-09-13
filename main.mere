@@ -1038,6 +1038,7 @@ let cvars = map_new ();
 let rx_caps = map_new ();
 // compiled-regex program cache: "flags<SOH>pattern" -> prog map; rx_bad marks
 // patterns the new engine cannot compile (the legacy matcher handles them).
+let num_misuse_note = map_new ();
 let rx_progs = map_new ();
 let rx_bad = map_new ();
 // \G anchor position: the start offset of the current search (scan/gsub pass
@@ -2298,7 +2299,10 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
         if j0 < str_len s then
           let cj = char_at s j0 in
           let nj = if j0 + 1 < str_len s then char_at s (j0 + 1) else "" in
-          if str_eq cj "?" then j0 + 1
+          // ⚠ `?` takes the same guard `!` has: it joins the symbol UNLESS an
+          // `=` follows, because `:a?=> 1` is ruby's syntax error rather than
+          // `:a?` and `=>`. Taking it unconditionally made that a valid hash.
+          if str_eq cj "?" && (if str_eq nj "=" then false else true) then j0 + 1
           else if str_eq cj "!" && (if str_eq nj "=" then false else true) then j0 + 1
           else if str_eq cj "=" && (if str_eq nj "=" || str_eq nj ">" || str_eq nj "~" then false else true) then j0 + 1
           // `:a==>1` — the = joins the symbol when what follows is `=>`.
@@ -5009,7 +5013,14 @@ and hash_key_expr = fn toks ->
   let (ke, r) = parse_expr toks in
   match r with
   | Cons (TP c, r2) ->
-    if str_eq c ":" then (EMethod (ke, "to_sym", Nil), r2)
+    // ⚠ `{"a": 1}` becomes `"a".to_sym`, so the invalid-symbol check further
+    // down (which looks for ESym) cannot see it. A LITERAL string here is
+    // known at parse time, so it is turned into the symbol now -- and an
+    // invalid one is the same parse error `:"\xC3"` is.
+    if str_eq c ":" then
+      (match ke with
+       | EStrL lit9 -> (ESym lit9, r2)
+       | _ -> (EMethod (ke, "to_sym", Nil), r2))
     else (ke, expect r "=>")
   | _ -> (ke, expect r "=>")
 
@@ -5023,16 +5034,25 @@ and parse_hash_items = fn toks -> fn (acc: Expr list) ->
     else parse_hash_items_kv toks acc
   | _ -> parse_hash_items_kv toks acc
 
+// ⚠ FOUR places closed a hash literal, and the duplicate-key check has to run
+// at every one of them or it runs at none that matter: adding it to two left
+// `x = {a: 1, a: 2}` silent, because the `name:` shorthand closes elsewhere.
+// They all go through here now.
+and hsh_done = fn (acc: Expr list) -> fn (ln: int) -> fn rest9 ->
+  (let its = rev_app acc Nil in
+   let _ = hsh_note_dups its (Nil : (str * int) list) ln in
+   (EHsh its, rest9))
 and hash_items_sep = fn r3 -> fn (acc: Expr list) ->
+  let done9 = hsh_done acc (tok_line r3) in
   match skip_nls r3 with
   | Cons (TP p, r4) ->
     if str_eq p "," then
       (match skip_nls r4 with
        | Cons (TP rb, r5) ->
-         if str_eq rb "}" then (EHsh (rev_app acc Nil), r5)
+         if str_eq rb "}" then done9 r5
          else parse_hash_items (skip_nls r4) acc
        | _ -> parse_hash_items (skip_nls r4) acc)
-    else if str_eq p "}" then (EHsh (rev_app acc Nil), r4)
+    else if str_eq p "}" then done9 r4
     else (let __fm = ("mere-ruby: expected , or } in hash, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated hash literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated hash literal" ++ parsing_file ()))
 
@@ -5056,6 +5076,16 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
      | _ -> false) in
   if omitted then
     (match k with
+     // ⚠ the omitted-value form reads a VARIABLE of the same name, and `a!` or
+     // `a?` is not one -- ruby refuses `{a!:}` at parse time rather than
+     // looking for it. Building the EVar made it a NameError at RUN time, so
+     // anything before it in the same eval had already happened.
+     | ESym nm when (let n9 = str_len nm in
+                     n9 > 0 && (let lc = char_at nm (n9 - 1) in str_eq lc "!" || str_eq lc "?")) ->
+       (let _ = (if map_has prim_missing "i" then ()
+                 else map_set prim_missing "i"
+                        (mkstr ("mere-ruby: identifier " ++ nm ++ " is not valid to get"))) in
+        fail ("mere-ruby: identifier " ++ nm ++ " is not valid to get" ++ parsing_file ()))
      | ESym nm -> hash_items_sep (skip_nls r2) (Cons (EVar nm, Cons (k, acc)))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: bad hash key")) in fail "mere-ruby: bad hash key"))
   else
@@ -5067,10 +5097,10 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
       // `{a: 1, b: 2,}` — a hanging comma before the closing brace.
       (match skip_nls r4 with
        | Cons (TP rb, r5) ->
-         if str_eq rb "}" then (EHsh (rev_app (Cons (v, Cons (k, acc))) Nil), r5)
+         if str_eq rb "}" then hsh_done (Cons (v, Cons (k, acc))) (tok_line r3) r5
          else parse_hash_items (skip_nls r4) (Cons (v, Cons (k, acc)))
        | _ -> parse_hash_items (skip_nls r4) (Cons (v, Cons (k, acc))))
-    else if str_eq p "}" then (EHsh (rev_app (Cons (v, Cons (k, acc))) Nil), r4)
+    else if str_eq p "}" then hsh_done (Cons (v, Cons (k, acc))) (tok_line r3) r4
     else (let __fm = ("mere-ruby: expected , or } in hash, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated hash literal" ++ parsing_file ()))) in fail ("mere-ruby: unterminated hash literal" ++ parsing_file ()))
 
@@ -7293,6 +7323,42 @@ and when_lit_key = fn (e: Expr) ->
    | EFlt f9 -> "f" ++ str_of_float f9
    | ENil -> "n"
    | _ -> "")
+// A hash LITERAL warns about a duplicated key, the way a case/when warns about
+// a duplicated clause -- same literal-key rule, same warn_note. The key that
+// wins is the LAST one, so the warning is about the earlier one being dropped.
+// ⚠ Only literal keys: `{x => 1, y => 1}` may or may not collide at run time,
+// and ruby says nothing about those either.
+and hsh_note_dups = fn (items: Expr list) -> fn (seen: (str * int) list) -> fn (ln: int) ->
+  (match items with
+   // ⚠ `**{a: 1}` contributes KEYS too, and they collide with the literal ones
+   // around them: `{**{a: 1}, a: 2}` warns. Only a literal hash can be read
+   // this way -- `**h` names a variable, and what is in it is a run-time
+   // question this walk cannot answer, so it contributes nothing.
+   | Cons (EKwSplat inner9, Cons (_, t9)) ->
+     (match inner9 with
+      | EHsh its9 -> hsh_note_dups t9 (hsh_note_dups its9 seen ln) ln
+      | _ -> hsh_note_dups t9 seen ln)
+   // interleaved [k1, v1, k2, v2, ...]: step two at a time.
+   | Cons (k9, Cons (_, t9)) ->
+     (let key = when_lit_key k9 in
+      if str_eq key "" then hsh_note_dups t9 seen ln
+      else if when_seen_line seen key > 0 then
+        (let _ = warn_note (parse_time_file () ++ ":" ++ str_of_int ln
+                            ++ ": warning: key " ++ hsh_key_disp k9
+                            ++ " is duplicated and overwritten on line " ++ str_of_int ln) in
+         hsh_note_dups t9 seen ln)
+      else hsh_note_dups t9 (Cons ((key, ln), seen)) ln)
+   | _ -> seen)
+// the key as the warning prints it: ruby inspects it.
+and hsh_key_disp = fn (e: Expr) ->
+  (match e with
+   | EInt n9 -> str_of_int n9
+   | EStrL s9 -> "\"" ++ s9 ++ "\""
+   | ESym y9 -> ":" ++ y9
+   | EBool b9 -> (if b9 then "true" else "false")
+   | EFlt f9 -> str_of_float f9
+   | ENil -> "nil"
+   | _ -> "?")
 and when_seen_line = fn (seen: (str * int) list) -> fn (k: str) ->
   (match seen with
    | Nil -> 0
@@ -15189,15 +15255,42 @@ and hsh_eval_items = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
      | EKwSplat e ->
        (match rest0 with
         | Cons (_, rest) ->
-          let pairs = (match eval_e env world blk e with VHsh xs -> let xs = hderef xs in xs | _ -> Nil) in
+          // ⚠ `**obj` asks obj for #to_hash and REFUSES what it gets back if
+          // that is not a Hash. Answering an empty list for everything else
+          // made `{ **obj }` silently empty instead of naming the conversion.
+          let pairs = (match eval_e env world blk e with
+                       | VHsh xs -> hderef xs
+                       | VNil -> (Nil : Val list)
+                       | other9 ->
+                         (match conv_try env world other9 "to_hash" with
+                          | VHsh xs -> hderef xs
+                          | _ ->
+                            (let cn9 = display_cls_msg world (dispatch_cls_of world other9) in
+                             match raise_exc world "TypeError"
+                               ("can't convert " ++ cn9 ++ " to Hash (" ++ cn9 ++ "#to_hash gives "
+                                ++ display_cls_msg world (dispatch_cls_of world (conv_try env world other9 "to_hash")) ++ ")")
+                             with _ -> (Nil : Val list)))) in
           list_append pairs (hsh_eval_items env world blk rest)
         | Nil -> Nil)
      | _ ->
        (match rest0 with
         | Cons (v, rest) ->
-          Cons (eval_e env world blk k,
+          // ⚠ A STRING KEY IS COPIED AND FROZEN. `k = "foo"; h = { k => 1 }`
+          // stores a frozen duplicate, so `k << "bar"` afterwards leaves the
+          // hash's key alone -- storing k itself let the caller mutate a key
+          // in place, and `h["foo"]` then found nothing.
+          Cons (hsh_key_of (eval_e env world blk k),
                 Cons (eval_e env world blk v, hsh_eval_items env world blk rest))
-        | Nil -> Cons (eval_e env world blk k, Nil)))
+        | Nil -> Cons (hsh_key_of (eval_e env world blk k), Nil)))
+and hsh_key_of = fn (kv: Val) ->
+  (match kv with
+   | VStr h9 ->
+     // ...unless it is ALREADY frozen, in which case ruby stores that very
+     // object rather than making another copy of it.
+     (if sfrozen_get h9 then kv
+      else (let c9 = mkstr_e (sget h9) (senc_get h9) in
+            (match c9 with VStr i9 -> (let _ = sfrozen_set i9 in c9) | _ -> c9)))
+   | _ -> kv)
 
 // object identity (equal?): reference types are identical only when they
 // are the same handle; immediates compare by value.
@@ -20796,6 +20889,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // enumerator (`10.upto(Float::INFINITY)`) is allowed. Anything with no #each
   // at all is ruby's "must respond to :each" TypeError, which prim_method
   // answered with nils.
+  // ⚠ `include M` AT TOP LEVEL includes into Object -- that is what makes its
+  // methods and its CONSTANTS visible everywhere afterwards. The only arm for
+  // it wanted a Class receiver, and top-level self is main, so the call did
+  // nothing at all: neither `hi` nor `KT` from the module could be found.
+  if (str_eq name "include" || str_eq name "prepend")
+     && (match recv with VMain -> true | _ -> false)
+     && (match args with Cons (VClass _, _) -> true | _ -> false) then
+    (let _ = (if str_eq name "include" then incl_each world "Object" args
+              else prep_each world "Object" args) in recv)
+  else
   // ---- Integer#[] --------------------------------------------------------
   // Here rather than beside the other Integer primitives for the same reason
   // sample is: the index goes through #to_int, and that has to be CALLED.
@@ -23973,7 +24076,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (v, _) ->
          (let n = to_s v in
           let key = (if str_eq c "Object" then n else c ++ "::" ++ n) in
+          // ⚠ ...and the ANCESTORS, which is where `::` already looks: a
+          // constant on a superclass or an included module answers
+          // `Child.const_get(:X)` in ruby, and this stopped at the class
+          // itself and the top level.
+          let akey = anc_const_key world c n in
           if map_has consts key then map_get consts key
+          else if (if str_eq akey "" then false else true) then map_get consts akey
           else if map_has consts n then map_get consts n
           // the constant may only be registered as an autoload so far
           else if autoload_fire env world blk key || autoload_fire env world blk n then
@@ -24918,17 +25027,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if str_eq name "replace" then
          (match args with
           | Cons (VHsh h, _) ->
+            let _ = env_check_pairs env world (hderef h) in
             let _ = env_del_keys (env_hl_keys (env_hash_list ())) in
-            let _ = env_set_pairs (hderef h) in recv
+            let _ = env_set_pairs env world (hderef h) in recv
           | Cons (o9, _) -> raise_exc world "TypeError"
                               ("no implicit conversion of " ++ class_name o9 ++ " into Hash")
           | Nil -> recv)
+       // ⚠ merge!/update take ANY NUMBER of hashes, applied left to right --
+       // `ENV.merge!(a, b)` is both. Reading only the first silently dropped
+       // the rest.
        else if str_eq name "update" || str_eq name "merge!" then
-         (match args with
-          | Cons (VHsh h, _) -> let _ = env_set_pairs (hderef h) in recv
-          | Cons (o9, _) -> raise_exc world "TypeError"
-                              ("no implicit conversion of " ++ class_name o9 ++ " into Hash")
-          | Nil -> recv)
+         (let rec go9 = fn (az: Val list) ->
+            (match az with
+             | Nil -> recv
+             | Cons (VHsh h, t9) -> (let _ = env_set_pairs env world (hderef h) in go9 t9)
+             | Cons (o9, _) -> raise_exc world "TypeError"
+                                 ("no implicit conversion of " ++ class_name o9 ++ " into Hash")) in
+          go9 args)
        // ENV is not an object you get a second of: ruby refuses both, and names
        // the thing to do instead. Answering a COPY (which is what the delegation
        // did) hands back something that looks like ENV and changes nothing when
@@ -24993,8 +25108,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 || str_eq name "select" || str_eq name "filter" || str_eq name "reject")
                && (match blk with (true, _, _, _) -> false | _ -> true) then
          invoke_val_c env world blk recv "to_enum" (Cons (VSym name, Nil)) false
+       // ⚠ merge!/update belong with the names the delegation CAN carry out: it
+       // runs them on a copy and writes the copy back, which is exactly what
+       // they need. Refusing them by their spelling meant `ENV.merge!(h) { }`
+       // raised NotImplementedError while `ENV.merge!(h)` worked -- the same
+       // method, refused for having a block.
        else if (str_ends_with name "!" || str_ends_with name "=")
-               && not (str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!") then
+               && not (str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!"
+                       || str_eq name "merge!") then
          raise_exc world "NotImplementedError"
            ("mere-ruby: ENV." ++ name ++ " is not implemented (it would change the environment)")
        // Everything else ENV answers, it answers AS a hash -- which is what it
@@ -26387,7 +26508,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match strip_marker_params ps with
           // no explicit params: the numbered parameters _1.._N, required for a
           // lambda and optional for a proc.
-          | Nil -> arr_new (numbered_params_meta is_lam 1 (max_numbered_stmts body))
+          | Nil ->
+            (let nn9 = max_numbered_stmts body in
+             if nn9 > 0 then arr_new (numbered_params_meta is_lam 1 nn9)
+             // ...and `it`'s parameter has no name to report.
+             else if uses_it_stmts body && (if lv_has e "it" then false else true)
+             then arr_new (Cons (arr_new (Cons (VSym (if is_lam then "req" else "opt"), Nil)), Nil))
+             else arr_new (Nil : Val list))
           // ...and Symbol#to_proc's proc has NO parameter NAMES in ruby (it is
           // a C function): it answers [[:req], [:rest]]. Its stand-in here is
           // written with real parameters, so the two internal names leaked
@@ -26407,7 +26534,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          let ps = (match ps0 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps0 | _ -> ps0) in
          (match strip_block_params ps with
           // no explicit params: arity is the highest numbered parameter used.
-          | Nil -> VInt (max_numbered_stmts body)
+          // ⚠ a LOCAL named `it` wins over the parameter -- `it = 5; ->{ it }`
+          // takes no arguments and reads the local -- so the captured scope
+          // decides whether the body's `it` is a parameter at all.
+          | Nil -> VInt (if lv_has e "it" then max_numbered_stmts body else implicit_params_of body)
           // explicit params: the MANDATORY positional ones, negative when a
           // splat or a default makes the count a lower bound. The defaults
           // live in the body prologue, not in the parameter list.
@@ -26447,7 +26577,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (VSym n, _) ->
          (if numbered_digit n > 0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
-          else if map_has benv n then map_get benv n else VNil)
+          // ⚠ a name the binding does not hold is a NameError, not nil. Answering
+          // nil made `binding.local_variable_get(:it)` look like a local holding
+          // nothing -- and the same for every misspelt name.
+          else if map_has benv n then map_get benv n
+          else raise_exc world "NameError"
+                 ("local variable '" ++ n ++ "' is not defined for " ++ inspect recv))
        | _ -> VNil)
     else if str_eq name "local_variable_set" then
       (match args with
@@ -26679,6 +26814,56 @@ and param_meta_of = fn (is_lam: bool) -> fn (ps: str list) -> fn (ds: (str * Exp
        else if str_len p > 0 && str_eq (char_at p 0) "(" then arr_new (Cons (VSym (if is_lam then "req" else "opt"), Nil))
        else arr_new (Cons (VSym (if is_lam then "req" else "opt"), Cons (VSym p, Nil)))) in
     Cons (pair, param_meta_of is_lam rest ds)
+// Does this block's OWN body name `it`? Same walk as the numbered parameters
+// and the same rule about nesting -- `it` belongs to the innermost block that
+// mentions it. A block that uses it has one parameter, which is why
+// `-> { it }.call("a")` works and `-> {}.call("a")` does not.
+//
+// ⚠ It is NOT the same answer as _1, only the same arity: the parameter has no
+// NAME (`[[:req]]`, not `[[:req, :_1]]`), because `it` is a keyword rather
+// than a variable the caller can see.
+and uses_it_stmts = fn (body: Stmt list) ->
+  match body with
+  | Nil -> false
+  | Cons (s, rest) -> uses_it_stmt s || uses_it_stmts rest
+and uses_it_stmt = fn (s: Stmt) ->
+  match s with
+  | SExpr e -> uses_it_expr e
+  | SAssign (_, e) -> uses_it_expr e
+  | SIVarAssign (_, e) -> uses_it_expr e
+  | SReturn e -> uses_it_expr e
+  | SPuts es -> uses_it_exprs es
+  | SWhile (c, b) -> uses_it_expr c || uses_it_stmts b
+  | SIf (clauses, els) -> uses_it_clauses clauses || uses_it_stmts els
+  | _ -> false
+and uses_it_clauses = fn (clauses: (Expr * Stmt list) list) ->
+  match clauses with
+  | Nil -> false
+  | Cons ((c, b), rest) -> uses_it_expr c || uses_it_stmts b || uses_it_clauses rest
+and uses_it_expr = fn (e: Expr) ->
+  match e with
+  // `it` parses as a bare name, and a bare name with no arguments is the only
+  // shape it can take: `it(1)` and `it { }` are ordinary method calls.
+  | EVar n -> str_eq n "it"
+  | ECall (n, args) -> (match args with Nil -> str_eq n "it" | _ -> uses_it_exprs args)
+  | EBin (_, a, b) -> uses_it_expr a || uses_it_expr b
+  | EUn (_, a) -> uses_it_expr a
+  | EMethod (r, _, args) -> uses_it_expr r || uses_it_exprs args
+  | EMethodB (r, _, args, _, _) -> uses_it_expr r || uses_it_exprs args
+  | ECallB (_, args, _, _) -> uses_it_exprs args
+  | EArr es -> uses_it_exprs es
+  | EHsh es -> uses_it_exprs es
+  | ETern (a, b, c) -> uses_it_expr a || uses_it_expr b || uses_it_expr c
+  | EYield es -> uses_it_exprs es
+  | _ -> false
+and uses_it_exprs = fn (es: Expr list) ->
+  match es with
+  | Nil -> false
+  | Cons (e, rest) -> uses_it_expr e || uses_it_exprs rest
+// the block's implicit parameter count: the numbered ones, or one for `it`.
+and implicit_params_of = fn (body: Stmt list) ->
+  (let n9 = max_numbered_stmts body in
+   if n9 > 0 then n9 else (if uses_it_stmts body then 1 else 0))
 and max_numbered_stmts = fn (body: Stmt list) ->
   match body with
   | Nil -> 0
@@ -26704,8 +26889,12 @@ and max_numbered_expr = fn (e: Expr) ->
   | EUn (_, a) -> max_numbered_expr a
   | ECall (_, args) -> max_numbered_exprs args
   | EMethod (r, _, args) -> imax (max_numbered_expr r) (max_numbered_exprs args)
-  | EMethodB (r, _, args, _, bb) -> imax (imax (max_numbered_expr r) (max_numbered_exprs args)) (max_numbered_stmts bb)
-  | ECallB (_, args, _, bb) -> imax (max_numbered_exprs args) (max_numbered_stmts bb)
+  // ⚠ NOT into the block's own body. A numbered parameter belongs to the
+  // INNERMOST block that mentions it, so `->{ [1].map { _1 } }` takes no
+  // arguments -- the _1 is the map block's. Descending gave the outer one
+  // arity 1 and, once `it` joined this walk, would have done the same to it.
+  | EMethodB (r, _, args, _, _) -> imax (max_numbered_expr r) (max_numbered_exprs args)
+  | ECallB (_, args, _, _) -> max_numbered_exprs args
   | EArr es -> max_numbered_exprs es
   | EHsh es -> max_numbered_exprs es
   | ETern (a, b, c) -> imax (imax (max_numbered_expr a) (max_numbered_expr b)) (max_numbered_expr c)
@@ -26719,6 +26908,42 @@ and max_numbered_exprs = fn (es: Expr list) ->
 // invalid use of a numbered parameter (Ruby rejects at parse time): a block
 // with explicit params whose body uses _1.. ("ordinary parameter is
 // defined"), or assigning to _1.. ("reserved for numbered parameter").
+// A symbol LITERAL whose bytes are not valid in the source encoding is a parse
+// error, not a symbol: `:"\xC3"` never becomes a value, so nothing in the same
+// eval runs. Accepting it built a Symbol whose name could not be printed.
+and bad_sym_stmts = fn (b: Stmt list) ->
+  match b with Nil -> false | Cons (s9, r9) -> bad_sym_stmt s9 || bad_sym_stmts r9
+and bad_sym_stmt = fn (s: Stmt) ->
+  match s with
+  | SExpr e -> bad_sym_expr e
+  | SAssign (_, e) -> bad_sym_expr e
+  | SIVarAssign (_, e) -> bad_sym_expr e
+  | SReturn e -> bad_sym_expr e
+  | SPuts es -> bad_sym_exprs es
+  | SWhile (c, bd) -> bad_sym_expr c || bad_sym_stmts bd
+  | SIf (cls, els) -> bad_sym_clauses cls || bad_sym_stmts els
+  | _ -> false
+and bad_sym_clauses = fn (cls: (Expr * Stmt list) list) ->
+  match cls with
+  | Nil -> false
+  | Cons ((c, b), r) -> bad_sym_expr c || bad_sym_stmts b || bad_sym_clauses r
+and bad_sym_expr = fn (e: Expr) ->
+  match e with
+  | ESym y -> (if enc_all7 y then false else (if enc_valid_utf8 y then false else true))
+  | EBin (_, a, b) -> bad_sym_expr a || bad_sym_expr b
+  | EUn (_, a) -> bad_sym_expr a
+  | ECall (_, args) -> bad_sym_exprs args
+  | EMethod (r, _, args) -> bad_sym_expr r || bad_sym_exprs args
+  | EMethodB (r, _, args, _, bb) -> bad_sym_expr r || bad_sym_exprs args || bad_sym_stmts bb
+  | ECallB (_, args, _, bb) -> bad_sym_exprs args || bad_sym_stmts bb
+  | EArr es -> bad_sym_exprs es
+  | EHsh es -> bad_sym_exprs es
+  | ETern (a, b, c) -> bad_sym_expr a || bad_sym_expr b || bad_sym_expr c
+  | EYield es -> bad_sym_exprs es
+  | ELambda (_, b) -> bad_sym_stmts b
+  | _ -> false
+and bad_sym_exprs = fn (es: Expr list) ->
+  match es with Nil -> false | Cons (e, r) -> bad_sym_expr e || bad_sym_exprs r
 and numbered_misuse_stmts = fn (body: Stmt list) ->
   match body with Nil -> false | Cons (s, r) -> numbered_misuse_stmt s || numbered_misuse_stmts r
 and numbered_misuse_stmt = fn (s: Stmt) ->
@@ -26733,9 +26958,74 @@ and numbered_misuse_stmt = fn (s: Stmt) ->
   | _ -> false
 and numbered_misuse_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with Nil -> false | Cons ((c, b), r) -> numbered_misuse_expr c || numbered_misuse_stmts b || numbered_misuse_clauses r
+// WHICH misuse it is. ruby words the three differently, and the spec matches
+// on the wording: an ordinary parameter beside `it`, numbered parameters after
+// `it`, or `it` after a numbered parameter. One sentence for all three said
+// "invalid numbered parameter" even when no numbered parameter was involved.
+and numbered_misuse_why = fn (bp: str list) -> fn (bb: Stmt list) ->
+  (let hasnum = max_numbered_stmts bb > 0 in
+   let hasit = uses_it_stmts bb in
+   match bp with
+   | Cons (_, _) -> (if hasit then "'it' is not allowed when an ordinary parameter is defined"
+                     else "numbered parameters are not allowed when an ordinary parameter is defined")
+   | Nil ->
+     // ⚠ WHICH ONE CAME FIRST decides the sentence: `it` then `_1` blames the
+     // numbered parameter, `_1` then `it` blames `it`. Nothing but the order
+     // separates them, so the body is walked for whichever appears earlier.
+     (if hasnum && hasit then
+        (if str_eq (first_implicit_stmts bb) "it"
+         then "numbered parameters are not allowed when 'it' is already used"
+         else "'it' is not allowed when a numbered parameter is already used")
+      else "invalid numbered parameter"))
+// "it" or "num" -- whichever this body names first, "" for neither.
+and first_implicit_stmts = fn (b: Stmt list) ->
+  match b with
+  | Nil -> ""
+  | Cons (s, r) -> (let f = first_implicit_stmt s in if str_eq f "" then first_implicit_stmts r else f)
+and first_implicit_stmt = fn (s: Stmt) ->
+  match s with
+  | SExpr e -> first_implicit_expr e
+  | SAssign (_, e) -> first_implicit_expr e
+  | SIVarAssign (_, e) -> first_implicit_expr e
+  | SReturn e -> first_implicit_expr e
+  | SPuts es -> first_implicit_exprs es
+  | SWhile (c, bd) -> (let f = first_implicit_expr c in if str_eq f "" then first_implicit_stmts bd else f)
+  | _ -> ""
+and first_implicit_expr = fn (e: Expr) ->
+  match e with
+  | EVar n -> (if str_eq n "it" then "it" else if numbered_digit n > 0 then "num" else "")
+  | ECall (n, args) -> (match args with
+                        | Nil -> (if str_eq n "it" then "it" else if numbered_digit n > 0 then "num" else "")
+                        | _ -> first_implicit_exprs args)
+  | EBin (_, a, b) -> (let f = first_implicit_expr a in if str_eq f "" then first_implicit_expr b else f)
+  | EUn (_, a) -> first_implicit_expr a
+  | EMethod (r, _, args) -> (let f = first_implicit_expr r in if str_eq f "" then first_implicit_exprs args else f)
+  | EArr es -> first_implicit_exprs es
+  | EHsh es -> first_implicit_exprs es
+  | ETern (a, b, c) -> (let f = first_implicit_expr a in
+                        if str_eq f "" then (let g = first_implicit_expr b in
+                                             if str_eq g "" then first_implicit_expr c else g) else f)
+  | EYield es -> first_implicit_exprs es
+  | _ -> ""
+and first_implicit_exprs = fn (es: Expr list) ->
+  match es with
+  | Nil -> ""
+  | Cons (e, r) -> (let f = first_implicit_expr e in if str_eq f "" then first_implicit_exprs r else f)
 and blk_num_bad = fn (bp: str list) -> fn (bb: Stmt list) ->
   // a block with explicit params AND a numbered param in its body is invalid.
-  (match bp with Nil -> false | _ -> max_numbered_stmts bb > 0)
+  // ⚠ `it` is one of them: `proc { |x| it }` is refused just as
+  // `proc { |x| _1 }` is, and so is mixing the two (`proc { it + _1 }`) --
+  // one block cannot take its argument two ways.
+  //
+  // The WHY is noted here rather than re-derived at the refusal: this walk is
+  // the only thing that has seen the offending block, and ruby words the three
+  // cases differently (the spec matches on the wording).
+  (let bad9 = (match bp with
+               | Nil -> max_numbered_stmts bb > 0 && uses_it_stmts bb
+               | _ -> max_numbered_stmts bb > 0 || uses_it_stmts bb) in
+   let _ = (if bad9 && (if map_has num_misuse_note "why" then false else true)
+            then (let _ = map_set num_misuse_note "why" (numbered_misuse_why bp bb) in ()) else ()) in
+   bad9)
 // a numbered param referenced in THIS block's scope (does not descend into a
 // nested block/lambda body, which starts its own numbered-param scope).
 and own_num_stmts = fn (b: Stmt list) -> match b with Nil -> 0 | Cons (s, r) -> imax (own_num_stmt s) (own_num_stmts r)
@@ -26798,7 +27088,13 @@ and num_nested_bad = fn (bb: Stmt list) -> own_num_stmts bb > 0 && nested_num_st
 
 and numbered_misuse_expr = fn (e: Expr) ->
   match e with
-  | ELambda (ps, b) -> (match ps with Nil -> num_nested_bad b || numbered_misuse_stmts b | _ -> if max_numbered_stmts b > 0 then true else numbered_misuse_stmts b)
+  // ⚠ `-> (x) { it }` too. This arm asked only about numbered parameters, so
+  // the `->` literal was the one block form that accepted `it` beside an
+  // explicit parameter list -- `proc { |x| it }` was already refused.
+  | ELambda (ps, b) ->
+    (match ps with
+     | Nil -> num_nested_bad b || numbered_misuse_stmts b
+     | _ -> if blk_num_bad ps b then true else numbered_misuse_stmts b)
   | ECallB (_, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_exprs args || numbered_misuse_stmts bb
   | EMethodB (r, _, args, bp, bb) -> blk_num_bad bp bb || (match bp with Nil -> num_nested_bad bb | _ -> false) || numbered_misuse_expr r || numbered_misuse_exprs args || numbered_misuse_stmts bb
   | EBin (_, a, b) -> numbered_misuse_expr a || numbered_misuse_expr b
@@ -26833,10 +27129,15 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
    // no explicit params: arity 0 (strict) unless the body uses numbered
    // params (_1..), in which case it absorbs args (kept lenient).
    | Nil ->
-     if max_numbered_stmts body > 0 then ()
-     else if nargs == 0 then ()
-     else let _ = raise_exc world "ArgumentError"
-            ("wrong number of arguments (given " ++ str_of_int nargs ++ ", expected 0)") in ()
+     // ⚠ a LAMBDA is strict about its implicit parameters too: `-> { _1 }`
+     // wants exactly one argument and `-> { _2 }` exactly two, the same way
+     // `-> { }` wants none. This arm used to wave through any count once the
+     // body named one, so `-> { it }.call("a", "b")` answered "a".
+     (let want9 = implicit_params_of body in
+      if nargs == want9 then ()
+      else let _ = raise_exc world "ArgumentError"
+             ("wrong number of arguments (given " ++ str_of_int nargs
+              ++ ", expected " ++ str_of_int want9 ++ ")") in ())
    | _ ->
      // positional-only params (drop &blk / **kw / key: keyword params); the
      // required count (no default) is the minimum, and without a splat the
@@ -27300,14 +27601,19 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "EnvHash") | _ -> false) then
       (// ⚠ a mutator this does not know about must not run on the copy and
        //   report success while the environment stands still. Ends in ! or = is
-       //   a rule; the three that end in neither are named.
+       //   a rule; the ones that end in neither are named.
+       //   ...and the SAME list has to appear in both places the refusal is
+       //   written, which is why `ENV.merge!(h) { }` stayed refused after the
+       //   block-free path was fixed: one rule, two copies.
        if (str_ends_with name "!" || str_ends_with name "=")
-          && not (str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!") then
+          && not (str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!"
+                  || str_eq name "merge!") then
          raise_exc world "NotImplementedError"
            ("mere-ruby: ENV." ++ name ++ " is not implemented (it would change the environment)")
        else
          let mutates = str_eq name "delete_if" || str_eq name "keep_if"
-                       || str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!" in
+                       || str_eq name "reject!" || str_eq name "select!" || str_eq name "filter!"
+                       || str_eq name "merge!" || str_eq name "update" in
          // the names whose answer is ENV itself rather than a new collection
          let self_ret = mutates || str_eq name "each" || str_eq name "each_pair"
                         || str_eq name "each_key" || str_eq name "each_value" in
@@ -27315,13 +27621,19 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
          let r = invoke_with_block env world blk h name args newblk in
          let _ = (if mutates
                   then (let _ = env_del_keys (env_hl_keys (env_hash_list ())) in
-                        (match h with VHsh hid -> env_set_pairs (hderef hid) | _ -> ()))
+                        (match h with VHsh hid -> env_set_pairs env world (hderef hid) | _ -> ()))
                   else ()) in
          // reject!/select!/filter! answer nil when nothing changed; the rest of
          // the self-returning names answer ENV.
-         (match r with
+         //
+         // ⚠ ...unless the block BROKE. `ENV.each_pair { break x }` is x, not
+         // ENV, and the delegate hash says which happened: it answers ITSELF
+         // when the walk finished and the break's value when it did not.
+         // Answering `recv` either way swallowed every break value.
+         (let finished9 = (match (r, h) with (VHsh a9, VHsh b9) -> a9 == b9 | _ -> false) in
+          match r with
           | VNil -> if mutates then VNil else (if self_ret then recv else r)
-          | other -> if self_ret then recv else other))
+          | other -> if self_ret && finished9 then recv else other))
     // Mutex#synchronize { }: lock, run, unlock — the unlock behaves like an
     // ensure (a raising block still releases before the raise continues).
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls (str_of_int id)) "Mutex") | _ -> false)
@@ -32001,36 +32313,63 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            let _ = sset h (substring s 0 st ++ piece ++ substring s (st + ln) bs) in
            let _ = senc_set h renc in
            VStr h) in
-        // ruby 3.2.2 (the reference) has only the 2- and 3-argument forms:
-        // more args is its arity error BEFORE the frozen check, and a 3-arg
-        // call with a Range first is its (idx, len, str) conversion error.
+        // ⚠ FOUR SHAPES, not two. Since ruby 3.3 the replacement can be sliced
+        // too -- `bytesplice(idx, len, str, sidx, slen)` and
+        // `bytesplice(range, str, srange)` -- and the reference here is 4.0.6.
+        // This arm was written against 3.2.2, where those did not exist, and
+        // refused them as arity errors; the note saying so outlived its reason.
+        // The source slice is checked against the SOURCE's length with the same
+        // rules, which is where "index 99 out of string" comes from.
+        // ⚠ TWO, THREE or FIVE -- never four. The (idx, len, str) form takes a
+        // (sidx, slen) pair or nothing, and the (range, str) form takes a
+        // range or nothing, so four arguments is never a shape.
         let na = val_list_len args in
-        if na > 3 then prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int na ++ ", expected 2..3)")
-        // the 3-arg form's TYPE resolution comes before the frozen check
-        // (ruby 3.2.2 refuses (range, str, range) with TypeError even frozen).
-        else if (match args with Cons (VRange (_, _, _), Cons (_, Cons (_, _))) -> true | _ -> false)
-        then prim_raise "TypeError" "no implicit conversion of Range into Integer"
+        if na < 2 || na == 4 || na > 5 then
+          prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int na ++ ", expected 2, 3, or 5)")
         else if val_frozen_mut recv then prim_raise "FrozenError" ("can't modify frozen String: " ++ inspect recv)
         else
         match args with
-        | Cons (VInt i0, Cons (VInt l0, Cons (VStr rh, _))) ->
-          (match ridl i0 l0 bs with
+        // (idx, len, str) and (idx, len, str, sidx, slen)
+        | Cons (VInt i0, Cons (VInt l0, Cons (VStr rh, srest))) ->
+          (let sb = str_len (sget rh) in
+           let (sst, sln) =
+             (match srest with
+              | Nil -> (0, sb)
+              | Cons (VInt si, Cons (VInt sl, _)) -> ridl si sl sb
+              | _ -> (match prim_raise "TypeError" "no implicit conversion into Integer" with _ -> (0, 0))) in
+           match ridl i0 l0 bs with
            | (st, ln) ->
              let _ = ck s e st in
              let _ = ck s e (st + ln) in
-             splice st ln rh 0 (str_len (sget rh)))
-        | Cons (VRange (lo, hi, ex), Cons (VStr rh, Nil)) ->
-          (match rrng lo hi ex bs with
+             let se9 = enc_canon_name (senc_get rh) in
+             let _ = ck (sget rh) se9 sst in
+             let _ = ck (sget rh) se9 (sst + sln) in
+             splice st ln rh sst sln)
+        // (range, str) and (range, str, srange) / (range, str, sidx, slen)
+        | Cons (VRange (lo, hi, ex), Cons (VStr rh, srest)) ->
+          (let sb = str_len (sget rh) in
+           let (sst, sln) =
+             (match srest with
+              | Nil -> (0, sb)
+              | Cons (VRange (slo, shi, sex), _) -> rrng slo shi sex sb
+              | _ -> (match prim_raise "TypeError" "no implicit conversion into Integer" with _ -> (0, 0))) in
+           match rrng lo hi ex bs with
            | (st, ln) ->
              let _ = ck s e st in
              let _ = ck s e (st + ln) in
-             splice st ln rh 0 (str_len (sget rh)))
-        | Cons (VRange (_, _, _), Cons (_, Cons (_, _))) ->
-          prim_raise "TypeError" "no implicit conversion of Range into Integer"
+             let se9 = enc_canon_name (senc_get rh) in
+             let _ = ck (sget rh) se9 sst in
+             let _ = ck (sget rh) se9 (sst + sln) in
+             splice st ln rh sst sln)
         | Cons (VInt _, Cons (VStr _, _)) ->
           prim_raise "TypeError" "wrong argument type Integer (expected Range)"
-        | Cons (_, Nil) -> prim_raise "ArgumentError" "wrong number of arguments (given 1, expected 2..3)"
-        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2..3)"
+        | Cons (_, Nil) -> prim_raise "ArgumentError" "wrong number of arguments (given 1, expected 2, 3, or 5)"
+        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2, 3, or 5)"
+        // the replacement must be a String: ruby names the class it was given.
+        | Cons (VInt _, Cons (VInt _, Cons (other9, _))) ->
+          prim_raise "TypeError" ("no implicit conversion of " ++ conv_name other9 ++ " into String")
+        | Cons (VRange (_, _, _), Cons (other9, _)) ->
+          prim_raise "TypeError" ("no implicit conversion of " ++ conv_name other9 ++ " into String")
         | _ -> prim_raise "TypeError" "no implicit conversion into Integer")
      | _ -> (let _ = map_set prim_missing "n" (mkstr "bytesplice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesplice'")) in fail "mere-ruby: undefined method 'bytesplice'")))
   else if str_eq name "byteslice" then
@@ -38538,7 +38877,11 @@ and lex_const_key = fn (cref: str) -> fn (name: str) ->
 // class/module: an included module's constants are visible in the including
 // class, and a subclass sees its superclass's.
 and anc_const_key = fn world -> fn (cref: str) -> fn (name: str) ->
-  if str_eq cref "" then "" else anc_const_go (ancestors_of world cref) name
+  // ⚠ NO lexical scope still has ancestors: at top level the cref is Object,
+  // and `include M` there puts M among Object's. Treating an empty cref as
+  // "nothing to walk" meant a bare constant from such a module was never
+  // found, though `Object::NAME` was.
+  anc_const_go (ancestors_of world (if str_eq cref "" then "Object" else cref)) name
 and anc_const_go = fn (ancs: str list) -> fn (name: str) ->
   match ancs with
   | Nil -> ""
@@ -39613,15 +39956,19 @@ and env_lookup_v = fn (k2: str) ->
            else VNil) in
   // reads carry Encoding.default_internal when set, else the locale (UTF-8).
   (match v with
-   | VStr h ->
-     let _ = senc_set h
-       (if map_has def_int_enc "v" then
-          (match map_get def_int_enc "v" with
-           | VObj eid -> (if map_has enc_name (str_of_int eid) then map_get enc_name (str_of_int eid) else "UTF-8")
-           | _ -> "UTF-8")
-        else "UTF-8") in
-     v
+   | VStr h -> (let _ = senc_set h (env_read_enc ()) in v)
    | _ -> v)
+// ⚠ ONE rule for what an ENV string is tagged with, because there are two
+// readers: ENV[k] goes through env_lookup_v, and everything ELSE (each_pair,
+// keys, to_h, shift, ...) is answered from a Hash built by env_hash_list. Only
+// the first stamped, so `ENV["X"].encoding` honoured default_internal and
+// `ENV.keys.first.encoding` did not.
+and env_read_enc = fn (u: unit) ->
+  (if map_has def_int_enc "v" then
+     (match map_get def_int_enc "v" with
+      | VObj eid -> (if map_has enc_name (str_of_int eid) then map_get enc_name (str_of_int eid) else "UTF-8")
+      | _ -> "UTF-8")
+   else "UTF-8")
 // coerce an ENV key (or value) to str: String, or anything with #to_str;
 // otherwise TypeError.
 // ENV's arguments are strings, and ruby asks an object for #to_str to get one.
@@ -39807,16 +40154,23 @@ and env_pairs_hl = fn (ps: (str * str) list) ->
     if map_has env_ovr k then
       (match map_get env_ovr k with
        | VNil -> env_pairs_hl t
-       | ov -> Cons (mkstr k, Cons (ov, env_pairs_hl t)))
-    else Cons (mkstr k, Cons (mkstr v, env_pairs_hl t))
+       // ⚠ a value stored through ENV[]= is the user's own String, and it
+       // leaves with the encoding ENV reads in -- not the one it was written
+       // with. Passing it through unchanged left it UTF-8 under a
+       // default_internal of IBM437, for the keys' sake but not the values'.
+       | ov -> Cons (mkstr_e k (env_read_enc ()),
+                     Cons ((match ov with VStr h9 -> mkstr_e (sget h9) (env_read_enc ()) | _ -> ov),
+                           env_pairs_hl t)))
+    else Cons (mkstr_e k (env_read_enc ()), Cons (mkstr_e v (env_read_enc ()), env_pairs_hl t))
 and env_ovr_only = fn (ps: (str * str) list) ->
   let out = map_new () in
   let _ = map_iter env_ovr (fn (k: str) -> fn (v: Val) ->
     match v with
     | VNil -> ()
     | _ -> if spairs_has ps k then () else (let i = map_len out in
-             let _ = map_set out (str_of_int i) (mkstr k) in
-             map_set out (str_of_int (i + 1)) v)) in
+             let _ = map_set out (str_of_int i) (mkstr_e k (env_read_enc ())) in
+             map_set out (str_of_int (i + 1))
+               (match v with VStr h9 -> mkstr_e (sget h9) (env_read_enc ()) | _ -> v))) in
   idx_to_list out 0 (map_len out)
 and spairs_has = fn (ps: (str * str) list) -> fn (k: str) ->
   match ps with Nil -> false | Cons ((k2, _), t) -> if str_eq k2 k then true else spairs_has t k
@@ -39834,11 +40188,67 @@ and env_del_keys = fn (ks: Val list) ->
   | Nil -> ()
   | Cons (VStr h, t) -> let _ = map_set env_ovr (sget h) VNil in env_del_keys t
   | Cons (_, t) -> env_del_keys t
-and env_set_pairs = fn (xs: Val list) ->
+// ⚠ A WRITE-BACK IS A WRITE. Every pair that lands here is going into the
+// environment, so it faces the same refusals `ENV[k] = v` does: a key or value
+// that is not a String is a TypeError, and a key holding `=` (or empty) is the
+// Errno::EINVAL setenv(3) would give. Writing them straight into the overlay
+// let `ENV.merge!({1 => "x"})` and `ENV.replace({"A=B" => "1"})` through --
+// entries the real environment could never hold.
+// ⚠ CHECK THE WHOLE LIST FIRST. ENV.replace deletes before it writes, so a
+// bad pair halfway down used to leave the environment emptied and half filled;
+// ruby refuses with ENV untouched. The refusals are the ones env_set_pairs
+// makes -- run over the list with nothing written.
+and env_check_pairs = fn env -> fn world -> fn (xs: Val list) ->
   match xs with
   | Cons (k, Cons (v, t)) ->
-    let _ = map_set env_ovr (match k with VStr h -> sget h | VSym s2 -> s2 | other -> to_s other) v in
-    env_set_pairs t
+    (let _ = env_pair_ok env world k v in env_check_pairs env world t)
+  | _ -> ()
+// the (key, value) a pair is written as, or the refusal it earns.
+and env_pair_ok = fn env -> fn world -> fn (k: Val) -> fn (v: Val) ->
+  (let k2 = (match k with
+             | VStr h -> sget h
+             | other -> (match conv_try env world other "to_str" with
+                         | VStr h2 -> sget h2
+                         | _ -> (match raise_exc world "TypeError"
+                                   ("no implicit conversion of " ++ dispatch_cls_of world other
+                                    ++ " into String") with _ -> ""))) in
+   let v2 = (match v with
+             | VStr _ -> v
+             | VNil -> v
+             | other -> (match conv_try env world other "to_str" with
+                         | VStr h2 -> VStr h2
+                         | _ -> raise_exc world "TypeError"
+                                  ("no implicit conversion of " ++ dispatch_cls_of world other
+                                   ++ " into String"))) in
+   let _ = (if (str_eq k2 "" || str_contains k2 "=") && (match v2 with VNil -> false | _ -> true)
+            then (let _ = raise_exc_iv world "Errno::EINVAL"
+                    ("Invalid argument - setenv(" ++ k2 ++ ")") (Cons (("__recv", k), Nil)) in ())
+            else ()) in
+   (k2, v2))
+and env_set_pairs = fn env -> fn world -> fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (let k2 = (match k with
+               | VStr h -> sget h
+               | other -> (match conv_try env world other "to_str" with
+                           | VStr h2 -> sget h2
+                           | _ -> (match raise_exc world "TypeError"
+                                     ("no implicit conversion of " ++ dispatch_cls_of world other
+                                      ++ " into String") with _ -> ""))) in
+     let v2 = (match v with
+               | VStr _ -> v
+               | VNil -> v
+               | other -> (match conv_try env world other "to_str" with
+                           | VStr h2 -> VStr h2
+                           | _ -> raise_exc world "TypeError"
+                                    ("no implicit conversion of " ++ dispatch_cls_of world other
+                                     ++ " into String"))) in
+     let _ = (if (str_eq k2 "" || str_contains k2 "=") && (match v2 with VNil -> false | _ -> true)
+              then (let _ = raise_exc_iv world "Errno::EINVAL"
+                      ("Invalid argument - setenv(" ++ k2 ++ ")") (Cons (("__recv", k), Nil)) in ())
+              else ()) in
+     let _ = map_set env_ovr k2 v2 in
+     env_set_pairs env world t)
   | _ -> ()
 
 // reverse lookup for ENV.key: first key whose value matches (skipping keys
@@ -47241,10 +47651,20 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     else (let _ = do_class_alias world dcls n1 n2 in FNext VNil)
   | SInclude (m, pre) ->
     // a runtime `include Mod` (e.g. inside a class method, self = the class)
-    // adds the module to that class's ancestor chain; at the top level with no
-    // class self it is a no-op. `m` may name a local variable holding a module
-    // (e.g. an anonymous `Module.new`), not just a constant.
+    // adds the module to that class's ancestor chain. `m` may name a local
+    // variable holding a module (e.g. an anonymous `Module.new`), not just a
+    // constant.
+    //
+    // ⚠ AT TOP LEVEL IT INCLUDES INTO Object, which is not a no-op: that is
+    // how `include M` makes M's methods callable everywhere and M's CONSTANTS
+    // resolvable by their bare names afterwards. Treating it as nothing left
+    // ruby/spec's constants fixture -- which ends in `include
+    // ConstantSpecs::ModuleA` -- unable to see a dozen of its own constants.
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
+     | VMain ->
+       (let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> m) else m) in
+        let _ = (if pre then do_prepend world "Object" mq else do_include world "Object" mq) in
+        FNext VNil)
      | VClass c ->
        let mq = (if lv_has env m then (match lv_get env m with VClass mc -> mc | _ -> named_class_of_al env world blk c (resolve_scope_name c m)) else named_class_of_al env world blk c (resolve_scope_name c m)) in
        (let _ = (if pre then do_prepend world c mq else do_include world c mq) in FNext VNil)
@@ -47865,6 +48285,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
+       else if bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
@@ -47872,7 +48293,11 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
-       else if numbered_misuse_stmts prog2 then raise_exc world "SyntaxError" "invalid numbered parameter"
+       else if (let _ = (if map_has num_misuse_note "why" then (let _ = map_delete num_misuse_note "why" in ()) else ()) in
+                numbered_misuse_stmts prog2) then
+         raise_exc world "SyntaxError"
+           (if map_has num_misuse_note "why" then map_get num_misuse_note "why" else "invalid numbered parameter")
+       else if bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9)
   // ...and anything else is ruby's TypeError, not an internal failure: `eval`
