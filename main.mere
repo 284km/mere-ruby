@@ -16056,7 +16056,7 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
       // whatever was in flight when this was raised becomes its cause, as ruby does
       let _ = (if map_has globals "!" then (match map_get globals "!" with
                                             | VNil -> ()
-                                            | prev -> (if rb_identical prev (VObj id) then () else map_set ivars (str_of_int id ++ "@__cause") prev))
+                                            | prev -> (if rb_identical prev (VObj id) then () else map_set ivars (str_of_int id ++ "@__cause") (cause_keepalive world prev)))
                else ()) in
       VObj id
     else exc_with_cause world (make_exc args)
@@ -16120,7 +16120,7 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
                  else (if map_has globals "!"
                        then (match map_get globals "!" with
                              | VNil -> ()
-                             | prev -> (if rb_identical prev base then () else map_set ivars2 (str_of_int bid ++ "@__cause") prev))
+                             | prev -> (if rb_identical prev base then () else map_set ivars2 (str_of_int bid ++ "@__cause") (cause_keepalive world prev)))
                        else ())) in
         base))
   | _ -> exc_with_cause world (make_exc args)
@@ -16134,6 +16134,25 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
 // nothing in flight -- almost every raise a program makes -- keeps the cheap
 // representation, so this costs an object only where ruby has something to
 // record.
+// ⚠ A CAUSE MUST KEEP ITS BACKTRACE. The cheap VExc representation has no
+// ivars, so its backtrace lives in the slot beside the LAST raise -- and the
+// raise that makes it a cause overwrites that slot. Stored as-is, the
+// innermost exception in a chain reported no frames at all, so
+// #full_message named the line that asked instead of the line that raised.
+// Promoting it here gives it somewhere of its own to keep them.
+and cause_keepalive = fn world -> fn (v: Val) ->
+  match v with
+  | VExc (c9, m9) ->
+    (if map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") v
+     then (let (_, _, ocls9, ivars9) = world in
+           let id9 = alloc_oid ocls9 in
+           let _ = map_set ocls9 (str_of_int id9) c9 in
+           let _ = map_set ivars9 (str_of_int id9 ++ "@message") (mkstr m9) in
+           let _ = map_set ivars9 (str_of_int id9 ++ "@__bt") (map_get raise_bt "v") in
+           VObj id9)
+     else v)
+  | _ -> v
+
 and exc_with_cause = fn world -> fn (v: Val) ->
   match v with
   | VExc (c, m) ->
@@ -16149,7 +16168,7 @@ and exc_with_cause = fn world -> fn (v: Val) ->
               let id9 = alloc_oid ocls9 in
               let _ = map_set ocls9 (str_of_int id9) c in
               let _ = map_set ivars9 (str_of_int id9 ++ "@message") (mkstr m) in
-              let _ = map_set ivars9 (str_of_int id9 ++ "@__cause") prev in
+              let _ = map_set ivars9 (str_of_int id9 ++ "@__cause") (cause_keepalive world prev) in
               VObj id9)))
      else v)
   | _ -> v
@@ -31030,6 +31049,14 @@ and builtin_owns_here = fn (cls: str) -> fn (name: str) ->
   // comparison the alias specs make with it -- raised NameError for methods
   // that answer when called.
   else if str_eq cls "Proc" then is_proc_method name
+  // Exception had no row at all, so every one of its builtin methods was
+  // invisible to reflection AND to `undef`: `class << e; undef
+  // :detailed_message; end` raised NameError for a method that answers when
+  // called, which is exactly what core/exception/full_message asks for.
+  // Enumerated from ruby (`Exception.instance_methods(false)`) and then
+  // confirmed one by one by asking THIS interpreter for each as a Method --
+  // all twelve answer, so the claim is no wider than the implementation.
+  else if str_eq cls "Exception" then is_exception_method name
   // zeitwerk branches on UnboundMethod.method_defined?(:bind_call)
   // Queue and SizedQueue: their methods live in the primitive dispatcher, so
   // without a row here `Queue.instance_method(:deq)` raised NameError for a
@@ -31101,6 +31128,13 @@ and builtin_has_meth = fn (cls: str) -> fn (name: str) ->
 // `Struct.instance_method(:deconstruct)` is a real UnboundMethod in ruby.
 // (`to_a` was found here only because Enumerable happens to list it, which is
 // why one of the pair answered and the other did not.)
+// Exception's OWN instance methods (ruby: Exception.instance_methods(false)).
+and is_exception_method = fn (name: str) ->
+  str_eq name "==" || str_eq name "backtrace" || str_eq name "backtrace_locations" ||
+  str_eq name "cause" || str_eq name "detailed_message" || str_eq name "exception" ||
+  str_eq name "full_message" || str_eq name "inspect" || str_eq name "message" ||
+  str_eq name "respond_to?" || str_eq name "set_backtrace" || str_eq name "to_s"
+
 and is_struct_gen_method = fn (name: str) ->
   str_eq name "to_a" || str_eq name "to_ary" || str_eq name "values" ||
   str_eq name "deconstruct" || str_eq name "members" || str_eq name "size" ||
@@ -46061,9 +46095,39 @@ and exc_detailed_msg = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) ->
   if str_eq msg9 "" then
     (let t9 = (if str_eq raw9 "RuntimeError" then "unhandled exception" else shown9) in
      if hl then e9 ++ "[1;4m" ++ t9 ++ e9 ++ "[m" else t9)
-  else if is_anon_cls raw9 then (if hl then e9 ++ "[1m" ++ msg9 ++ e9 ++ "[m" else msg9)
-  else if hl then e9 ++ "[1m" ++ msg9 ++ " (" ++ e9 ++ "[1;4m" ++ shown9 ++ e9 ++ "[m" ++ e9 ++ "[1m)" ++ e9 ++ "[m"
-  else msg9 ++ " (" ++ shown9 ++ ")"
+  // ⚠ THE CLASS GOES AT THE END OF THE FIRST LINE, not after the whole
+  // message. A multi-line message reads "line1 (RuntimeError)\nline2" in
+  // ruby; appending to the end put the class after the LAST line, where the
+  // reader looking at the head of a report cannot see it. With highlight
+  // each line is emboldened on its own.
+  else
+    (let nl9 = exc_msg_nl msg9 0 in
+     let head9 = (if nl9 < 0 then msg9 else substring msg9 0 nl9) in
+     let tail9 = (if nl9 < 0 then "" else substring msg9 nl9 (str_len msg9)) in
+     let rest9 = (if hl then exc_hl_lines tail9 else tail9) in
+     if is_anon_cls raw9 then (if hl then e9 ++ "[1m" ++ head9 ++ e9 ++ "[m" ++ rest9 else msg9)
+     else if hl then e9 ++ "[1m" ++ head9 ++ " (" ++ e9 ++ "[1;4m" ++ shown9 ++ e9 ++ "[m" ++ e9 ++ "[1m)" ++ e9 ++ "[m" ++ rest9
+     else head9 ++ " (" ++ shown9 ++ ")" ++ tail9)
+
+// index of the first newline, or -1.
+and exc_msg_nl = fn (s9: str) -> fn (i9: int) ->
+  if i9 >= str_len s9 then 0 - 1
+  else if str_eq (char_at s9 i9) "\n" then i9
+  else exc_msg_nl s9 (i9 + 1)
+
+// the continuation lines of a highlighted message: ruby bolds each one on its
+// own, so "\nline2\nline3" becomes "\n<b>line2</b>\n<b>line3</b>".
+and exc_hl_lines = fn (s9: str) ->
+  let e9 = chr 27 in
+  // the empty tail (a SINGLE-line message) must be answered before the
+  // substring below runs -- `let` is eager, so computing it first made
+  // `full_message(highlight: true)` on a one-line message fail outright.
+  if str_len s9 == 0 then ""
+  else
+  let nl9 = exc_msg_nl (substring s9 1 (str_len s9)) 0 in
+  (if nl9 < 0 then "\n" ++ e9 ++ "[1m" ++ substring s9 1 (str_len s9) ++ e9 ++ "[m"
+  else "\n" ++ e9 ++ "[1m" ++ substring s9 1 (nl9 + 1) ++ e9 ++ "[m"
+         ++ exc_hl_lines (substring s9 (nl9 + 1) (str_len s9)))
 
 // The whole report, the way an uncaught exception is printed to stderr. The
 // first line is the innermost frame and the detailed message; `order: :bottom`
@@ -46072,6 +46136,47 @@ and exc_detailed_msg = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) ->
 // a program may override it -- that is the method's entire purpose, and
 // computing the text here directly would make the override unreachable.
 and exc_full_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> fn (bottom: bool) ->
+  // ⚠ THE CAUSES ARE PART OF THE REPORT. `raise` inside a rescue records the
+  // exception being handled as the new one's #cause, and ruby prints the
+  // whole chain -- outermost first for `order: :top`, deepest first under a
+  // single "Traceback" header for `order: :bottom`. Printing only the
+  // exception itself lost every "inner" a nested raise had wrapped.
+  let chain9 = exc_cause_chain env world recv 8 in
+  let e9 = chr 27 in
+  if bottom then
+    (if hl then e9 ++ "[1mTraceback" ++ e9 ++ "[m (most recent call last):\n"
+     else "Traceback (most recent call last):\n")
+    ++ exc_blocks_rev env world (rev_app_str chain9 Nil) hl
+  else exc_blocks env world chain9 hl
+
+// the exception and its causes, outermost first. Bounded so a cause cycle
+// (ruby allows `raise x, cause: y` to build one) cannot spin here.
+and exc_cause_chain = fn env -> fn world -> fn (recv: Val) -> fn (fuel9: int) ->
+  if fuel9 <= 0 then Cons (recv, Nil)
+  else
+    let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+    (match invoke_val_c env world noblk9 recv "cause" Nil false with
+     | VNil -> Cons (recv, Nil)
+     | c9 -> (if rb_eq c9 recv then Cons (recv, Nil)
+              else Cons (recv, exc_cause_chain env world c9 (fuel9 - 1))))
+
+and rev_app_str = fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with Nil -> acc | Cons (h9, t9) -> rev_app_str t9 (Cons (h9, acc))
+
+// `order: :top`: each exception's head line then its frames, outermost first.
+and exc_blocks = fn env -> fn world -> fn (xs: Val list) -> fn (hl: bool) ->
+  match xs with
+  | Nil -> ""
+  | Cons (h9, t9) -> exc_one_message env world h9 hl false ++ exc_blocks env world t9 hl
+
+// `order: :bottom`: frames upside down then the head line, deepest cause first.
+and exc_blocks_rev = fn env -> fn world -> fn (xs: Val list) -> fn (hl: bool) ->
+  match xs with
+  | Nil -> ""
+  | Cons (h9, t9) -> exc_one_message env world h9 hl true ++ exc_blocks_rev env world t9 hl
+
+and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> fn (bottom: bool) ->
+  let e9 = chr 27 in
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   // `highlight:` is a KEYWORD argument, and an override written `def
   // exception.detailed_message(**)` only accepts it as one -- an unmarked hash
@@ -46080,21 +46185,39 @@ and exc_full_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> 
   let kwh9 = (match mkhash (Cons (VSym "highlight", Cons (VBool hl, Nil))) with
               | VHsh hid9 -> (let _ = mark_kw hid9 in VHsh hid9)
               | other9 -> other9) in
-  let dm9 = (match invoke_val_c env world noblk9 recv "detailed_message"
-                     (Cons (kwh9, Nil)) false with
+  // ⚠ WHAT detailed_message RETURNS IS NOT ALWAYS THE MESSAGE. Ruby converts
+  // it with #to_str -- not #to_s -- and where that is not available (nil, an
+  // Integer, anything else) it falls back to the exception's CLASS NAME,
+  // underlined like the class always is. Printing to_s of it put "" in the
+  // report for an override that answered nil.
+  // ...and an exception whose #detailed_message has been UNDEF'd takes the
+  // same fallback rather than a NoMethodError. Asked as `responds`, this was
+  // false for the cheap VExc representation too, and every real raise lost
+  // its message -- the undef question has to be asked as an undef question.
+  let dmv9 = (if undef_blocked world (exc_cls_of world recv) "detailed_message"
+              then VNil
+              else invoke_val_c env world noblk9 recv "detailed_message" (Cons (kwh9, Nil)) false) in
+  let dm9 = (match dmv9 with
              | VStr h9 -> sget h9
-             | o9 -> to_s o9) in
+             | o9 ->
+               (if responds world o9 "to_str"
+                then (match invoke_val_c env world noblk9 o9 "to_str" Nil false with
+                      | VStr h8 -> sget h8
+                      | other8 -> to_s other8)
+                else (let shown8 = cls_display world (display_cls world (exc_cls_of world recv)) in
+                      if hl then e9 ++ "[1;4m" ++ shown8 ++ e9 ++ "[m" else shown8))) in
   let bt9 = (match invoke_val_c env world noblk9 recv "backtrace" Nil false with
              | VArr aid9 -> bt_strs_of (deref aid9)
              | _ -> (Nil : str list)) in
   let e9 = chr 27 in
   match bt9 with
-  | Nil -> dm9 ++ "\n"
+  // ⚠ NO BACKTRACE STILL HAS A HEAD LINE. An exception that was built but
+  // never raised has none, and ruby names the place full_message was CALLED
+  // ("file:line:in 'full_message'") rather than printing the message bare.
+  | Nil ->
+    (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in 'full_message': " ++ dm9 ++ "\n")
   | Cons (top9, rest9) ->
-    (if bottom then
-       (let hdr9 = (if hl then e9 ++ "[1mTraceback" ++ e9 ++ "[m (most recent call last):\n"
-                    else "Traceback (most recent call last):\n") in
-        hdr9 ++ bt_from_lines_rev rest9 1 ++ top9 ++ ": " ++ dm9 ++ "\n")
+    (if bottom then bt_from_lines_rev rest9 1 ++ top9 ++ ": " ++ dm9 ++ "\n"
      else top9 ++ ": " ++ dm9 ++ "\n" ++ bt_from_lines rest9)
 // a keyword read off the trailing options hash: `highlight: true` and
 // `order: :bottom`. Absent means the default, and so does a hash that is not
