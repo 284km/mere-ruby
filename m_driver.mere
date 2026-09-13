@@ -1,0 +1,2062 @@
+// The driver: where an error is reported from (err_where), how a script is
+// read and run (run_src), and the command line that chooses between them.
+//
+// A MODULE, spliced by `import` where these chains used to sit. `import`
+// is an AST splice, not a separate scope: this file sees everything
+// declared above the import point and nothing below it -- which is what
+// these chains already had, since they are the last thing in the program.
+// The main expression itself stays in main.mere, because that is what
+// makes main.mere the program.
+let err_where = fn (name: str) ->
+  let f = (if map_has prim_missing "f" then (match map_get prim_missing "f" with VStr h -> sget h | _ -> "") else "") in
+  let rf = (if map_has prim_missing "rf" then (match map_get prim_missing "rf" with VStr h -> sget h | _ -> "") else "") in
+  let file = (if (if str_eq rf "" then false else true) then rf
+              else if str_eq f "" || str_eq f name then name else f) in
+  // ruby writes `file:line:in `meth\': message`, at the RAISE site
+  let ln = (if map_has prim_missing "rl" then (match map_get prim_missing "rl" with VInt n -> n | _ -> cur_line ()) else cur_line ()) in
+  let m = (if map_has prim_missing "rm" then (match map_get prim_missing "rm" with VStr h -> sget h | _ -> cur_meth ()) else cur_meth ()) in
+  let where = (if ln > 0 then file ++ ":" ++ str_of_int ln else file) in
+  if str_eq m "" then where else where ++ ":in '" ++ meth_label m ++ "'";
+
+// ObjectSpace::WeakMap: a Hash that does not keep its keys alive. mere-ruby
+// frees nothing, so the weakness has no observable effect here -- what matters
+// is that the class EXISTS, because activesupport's DescendantsTracker builds
+// one at load time and railties stops there otherwise.
+let core_prelude_a =
+  // ruby 4.0's toplevel `Ruby` module: the identity constants again, and
+  // Ruby::Box, which is never enabled here (RUBY_BOX is a CRuby build switch).
+  "module Ruby\n" ++
+  "  VERSION = RUBY_VERSION\n" ++
+  "  PATCHLEVEL = RUBY_PATCHLEVEL\n" ++
+  "  RELEASE_DATE = RUBY_RELEASE_DATE\n" ++
+  "  REVISION = RUBY_REVISION\n" ++
+  "  ENGINE = RUBY_ENGINE\n" ++
+  "  ENGINE_VERSION = RUBY_ENGINE_VERSION\n" ++
+  "  PLATFORM = RUBY_PLATFORM\n" ++
+  "  DESCRIPTION = RUBY_DESCRIPTION\n" ++
+  "  COPYRIGHT = RUBY_COPYRIGHT\n" ++
+  "  class Box\n" ++
+  "    def self.enabled?; false; end\n" ++
+  "    def self.current; nil; end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // ruby 4.0: Pathname is core, so `Pathname(x)` -- and `Kernel.Pathname(x)`,
+  // and `obj.send(:Pathname, x)` -- work before anything has required it. The
+  // library is shipped behind an autoload (see autoloads "Pathname") and its
+  // `module Kernel; def Pathname` REPLACES this stub when it loads, so the
+  // stub only has to get it loaded and ask again.
+  "module Kernel\n" ++
+  "  def Pathname(path)\n" ++
+  "    require \"pathname\"\n" ++
+  "    Pathname(path)\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // A Numeric refuses to gain a singleton method, and it refuses BY DEFINING
+  // THE HOOK -- which is why `class Sub < Numeric; def singleton_method_added(n); end; end`
+  // (ruby/spec's own fixture, so that its methods can be mocked) makes it
+  // allowed again, and `remove_method :singleton_method_added` makes it refuse
+  // again. A rule written in the interpreter could not be removed by ruby code.
+  // It is written in ruby, and not in the dispatcher, for the same reason; the
+  // rest of Numeric's methods are the other way round (see invoke_val_c),
+  // because those names have Integer and Float builtins that must keep winning
+  // and this one has none.
+  // The message quotes the method name, and the quote is built rather than
+  // escaped: a `\"` here would have to survive both this string and ruby's lexer.
+  "class Numeric\n" ++
+  "  def singleton_method_added(name)\n" ++
+  "    q = '\"'\n" ++
+  "    raise TypeError, \"can't define singleton method \" + q + name.to_s + q + \" for \" + self.class.to_s\n" ++
+  "  end\n" ++
+  "end\n";
+
+let core_prelude_b =
+  // Enumerable, driven by the receiver's own #each rather than by a
+  // materialised copy of it. Two things only this shape can do: a multi-value
+  // yield reaches the block as SEVERAL arguments (so a one-parameter block
+  // takes the first, as ruby's does), and a walk stops when the answer is
+  // known -- `take_while` on a five-element receiver walks three.
+  //
+  // It is a module of its own rather than a reopening of Enumerable because
+  // Array, Hash and Range include Enumerable too, and their own methods are
+  // primitives that must keep answering. do_include puts this one BEHIND
+  // Enumerable for a class that includes it, so a program that redefines
+  // Enumerable#map still wins.
+  "module Enumerable__Impl\n" ++
+  "  def __gather(args)\n" ++
+  "    args.size <= 1 ? args[0] : args\n" ++
+  "  end\n" ++
+  "\n" ++
+  // ruby converts a count with #to_int and refuses in its own words -- a
+  // NoMethodError from a bare `n.to_int` names the wrong thing.
+  "  def __int!(n)\n" ++
+  "    return n if n.is_a?(Integer)\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + n.class.to_s + \" into Integer\" unless n.respond_to?(:to_int)\n" ++
+  "    v = n.to_int\n" ++
+  "    raise TypeError, \"can't convert \" + n.class.to_s + \" to Integer (\" + n.class.to_s + \"#to_int gives \" + v.class.to_s + \")\" unless v.is_a?(Integer)\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "\n" ++
+  // the bounds ruby's own C signatures carry: a *-parameter here would accept
+  // what ruby refuses, and ten spec files ask for exactly that refusal.
+  "  def __arity!(given, lo, hi)\n" ++
+  "    return if given >= lo && given <= hi\n" ++
+  "    range = lo == hi ? lo.to_s : lo.to_s + \"..\" + hi.to_s\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + given.to_s + \", expected \" + range + \")\"\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def to_a(*outer)\n" ++
+  "    acc = []\n" ++
+  "    each(*outer) \{ |*args| acc.push(__gather(args)) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def entries(*outer); to_a(*outer); end\n" ++
+  "\n" ++
+  "  def map\n" ++
+  "    return to_enum(:map) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| acc.push(yield(*args)) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def collect(&b); map(&b); end\n" ++
+  "\n" ++
+  "  def flat_map\n" ++
+  "    return to_enum(:flat_map) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each do |*args|\n" ++
+  "      v = yield(*args)\n" ++
+  "      if v.respond_to?(:to_ary)\n" ++
+  "        a = v.to_ary\n" ++
+  // ⚠ a NIL conversion means "append it as it is" (ruby's
+  //   rb_check_array_type), not a refusal -- only a non-Array, non-nil answer
+  //   is the TypeError. Refusing nil here is what made `enum.flat_map { obj }`
+  //   raise for an object whose #to_ary answers nil, while the same element in
+  //   an ARRAY receiver went through the interpreter's own walk and was
+  //   appended. One rule, two implementations, and this was the second one.
+  "        raise TypeError, \"can't convert \" + v.class.to_s + \" to Array (\" + v.class.to_s + \"#to_ary gives \" + a.class.to_s + \")\" unless a.is_a?(Array) || a.nil?\n" ++
+  "        if a.nil? then acc.push(v) else a.each \{ |x| acc.push(x) } end\n" ++
+  "      else\n" ++
+  "        acc.push(v)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def collect_concat(&b); flat_map(&b); end\n" ++
+  "\n" ++
+  "  def select\n" ++
+  "    return to_enum(:select) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| v = __gather(args); acc.push(v) if yield(v) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "  def filter(&b); select(&b); end\n" ++
+  "  def find_all(&b); select(&b); end\n" ++
+  "\n" ++
+  "  def reject\n" ++
+  "    return to_enum(:reject) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| v = __gather(args); acc.push(v) unless yield(v) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def filter_map\n" ++
+  "    return to_enum(:filter_map) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| v = yield(*args); acc.push(v) if v }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def find(ifnone = nil)\n" ++
+  "    return to_enum(:find, ifnone) unless block_given?\n" ++
+  "    each \{ |*args| v = __gather(args); return v if yield(v) }\n" ++
+  "    ifnone ? ifnone.call : nil\n" ++
+  "  end\n" ++
+  "  def detect(ifnone = nil, &b); find(ifnone, &b); end\n" ++
+  "\n" ++
+  "  def find_index(*target)\n" ++
+  "    __arity!(target.size, 0, 1)\n" ++
+  "    i = 0\n" ++
+  "    if target.size > 0\n" ++
+  "      each \{ |*args| return i if __gather(args) == target[0]; i += 1 }\n" ++
+  "    else\n" ++
+  "      return to_enum(:find_index) unless block_given?\n" ++
+  "      each \{ |*args| return i if yield(*args); i += 1 }\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def all?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| return false unless pattern[0] === __gather(args) }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| return false unless yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| return false unless __gather(args) }\n" ++
+  "    end\n" ++
+  "    true\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def any?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| return true if pattern[0] === __gather(args) }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| return true if yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| return true if __gather(args) }\n" ++
+  "    end\n" ++
+  "    false\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def none?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| return false if pattern[0] === __gather(args) }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| return false if yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| return false if __gather(args) }\n" ++
+  "    end\n" ++
+  "    true\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def one?(*pattern)\n" ++
+  "    __arity!(pattern.size, 0, 1)\n" ++
+  "    n = 0\n" ++
+  "    if pattern.size > 0\n" ++
+  "      each \{ |*args| n += 1 if pattern[0] === __gather(args); return false if n > 1 }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| n += 1 if yield(*args); return false if n > 1 }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| n += 1 if __gather(args); return false if n > 1 }\n" ++
+  "    end\n" ++
+  "    n == 1\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def count(*item)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + item.size.to_s + \", expected 1)\" if item.size > 1\n" ++
+  "    n = 0\n" ++
+  "    if item.size > 0\n" ++
+  "      each \{ |*args| n += 1 if __gather(args) == item[0] }\n" ++
+  "    elsif block_given?\n" ++
+  "      each \{ |*args| n += 1 if yield(*args) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| n += 1 }\n" ++
+  "    end\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_with_index(*outer)\n" ++
+  "    return to_enum(:each_with_index, *outer) unless block_given?\n" ++
+  "    i = 0\n" ++
+  "    each(*outer) \{ |*args| yield(__gather(args), i); i += 1 }\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_with_object(memo)\n" ++
+  "    return to_enum(:each_with_object, memo) unless block_given?\n" ++
+  "    each \{ |*args| yield(__gather(args), memo) }\n" ++
+  "    memo\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_entry(*outer)\n" ++
+  "    return to_enum(:each_entry, *outer) unless block_given?\n" ++
+  "    each(*outer) \{ |*args| yield(__gather(args)) }\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def take(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise RangeError, \"bignum too big to convert into 'long'\" if n > 4611686018427387903\n" ++
+  "    raise ArgumentError, \"attempt to take negative size\" if n < 0\n" ++
+  "    acc = []\n" ++
+  "    return acc if n == 0\n" ++
+  "    each \{ |*args| acc.push(__gather(args)); break if acc.size >= n }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def take_while\n" ++
+  "    return to_enum(:take_while) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    each \{ |*args| break unless yield(*args); acc.push(__gather(args)) }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def drop(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise RangeError, \"bignum too big to convert into 'long'\" if n > 4611686018427387903\n" ++
+  "    raise ArgumentError, \"attempt to drop negative size\" if n < 0\n" ++
+  "    acc = []\n" ++
+  "    i = 0\n" ++
+  "    each \{ |*args| acc.push(__gather(args)) if i >= n; i += 1 }\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def drop_while\n" ++
+  "    return to_enum(:drop_while) unless block_given?\n" ++
+  "    acc = []\n" ++
+  "    dropping = true\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      dropping = false if dropping && !yield(v)\n" ++
+  "      acc.push(v) unless dropping\n" ++
+  "    end\n" ++
+  "    acc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def first(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    if n.size == 0\n" ++
+  "      each \{ |*args| return __gather(args) }\n" ++
+  "      nil\n" ++
+  "    else\n" ++
+  "      take(n[0])\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // min_by / max_by / sort_by / group_by / partition PACK the yielded values
+  // into one before the block sees them (MRI's rb_enum_values_pack); map,
+  // select and all? pass them through as arguments. The two rules look the
+  // same until #each yields more than one value.
+  "  def min_by(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    return to_enum(:min_by, *n) unless block_given?\n" ++
+  "    return sort_by \{ |x| yield(x) }.first(__int!(n[0])) if n.size > 0 && !n[0].nil?\n" ++
+  "    best = nil\n" ++
+  "    best_key = nil\n" ++
+  "    seen = false\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      k = yield(v)\n" ++
+  "      if !seen || (k <=> best_key) < 0\n" ++
+  "        best = v\n" ++
+  "        best_key = k\n" ++
+  "        seen = true\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    best\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def max_by(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    return to_enum(:max_by, *n) unless block_given?\n" ++
+  "    return sort_by \{ |x| yield(x) }.reverse.first(__int!(n[0])) if n.size > 0 && !n[0].nil?\n" ++
+  "    best = nil\n" ++
+  "    best_key = nil\n" ++
+  "    seen = false\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      k = yield(v)\n" ++
+  "      if !seen || (k <=> best_key) > 0\n" ++
+  "        best = v\n" ++
+  "        best_key = k\n" ++
+  "        seen = true\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    best\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def minmax_by(&b)\n" ++
+  "    return to_enum(:minmax_by) unless block_given?\n" ++
+  "    [min_by(&b), max_by(&b)]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def sort_by\n" ++
+  "    return to_enum(:sort_by) unless block_given?\n" ++
+  "    pairs = []\n" ++
+  "    each \{ |*args| v = __gather(args); pairs.push([yield(v), v]) }\n" ++
+  "    pairs.sort \{ |a, b| a[0] <=> b[0] }.map \{ |p| p[1] }\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def group_by\n" ++
+  "    return to_enum(:group_by) unless block_given?\n" ++
+  "    h = \{}\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      (h[yield(v)] ||= []).push(v)\n" ++
+  "    end\n" ++
+  "    h\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def partition\n" ++
+  "    return to_enum(:partition) unless block_given?\n" ++
+  "    yes = []\n" ++
+  "    no = []\n" ++
+  "    each \{ |*args| v = __gather(args); (yield(v) ? yes : no).push(v) }\n" ++
+  "    [yes, no]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def inject(*init, &blk)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + init.size.to_s + \", expected 1..2)\" if init.size > 2\n" ++
+  "    op = nil\n" ++
+  "    memo = nil\n" ++
+  "    have = false\n" ++
+  "    if init.size == 2\n" ++
+  "      memo = init[0]\n" ++
+  "      have = true\n" ++
+  "      op = init[1]\n" ++
+  "    elsif init.size == 1 && !block_given?\n" ++
+  "      op = init[0]\n" ++
+  "    elsif init.size == 1\n" ++
+  "      memo = init[0]\n" ++
+  "      have = true\n" ++
+  "    end\n" ++
+  "    each do |*args|\n" ++
+  "      v = __gather(args)\n" ++
+  "      if !have\n" ++
+  "        memo = v\n" ++
+  "        have = true\n" ++
+  "      elsif op\n" ++
+  "        memo = memo.__send__(op, v)\n" ++
+  "      else\n" ++
+  "        memo = blk.call(memo, v)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    memo\n" ++
+  "  end\n" ++
+  "  def reduce(*init, &blk); inject(*init, &blk); end\n" ++
+  "\n" ++
+  "  def sum(*init)\n" ++
+  "    __arity!(init.size, 0, 1)\n" ++
+  "    memo = init.size > 0 ? init[0] : 0\n" ++
+  "    if block_given?\n" ++
+  "      each \{ |*args| memo = memo + yield(__gather(args)) }\n" ++
+  "    else\n" ++
+  "      each \{ |*args| memo = memo + __gather(args) }\n" ++
+  "    end\n" ++
+  "    memo\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def tally(*into)\n" ++
+  "    __arity!(into.size, 0, 1)\n" ++
+  "    h = into.size > 0 ? into[0] : \{}\n" ++
+  "    h = h.to_hash if into.size > 0 && !h.is_a?(Hash) && h.respond_to?(:to_hash)\n" ++
+  "    each \{ |*args| v = __gather(args); h[v] = (h[v] || 0) + 1 }\n" ++
+  "    h\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def to_h(*outer)\n" ++
+  "    h = \{}\n" ++
+  "    each(*outer) do |*args|\n" ++
+  "      pair = block_given? ? yield(*args) : __gather(args)\n" ++
+  "      pair = pair.to_ary if !pair.is_a?(Array) && pair.respond_to?(:to_ary)\n" ++
+  "      raise TypeError, \"wrong element type \" + pair.class.to_s + \" (expected array)\" unless pair.is_a?(Array)\n" ++
+  "      raise ArgumentError, \"element has wrong array length (expected 2, was \" + pair.size.to_s + \")\" unless pair.size == 2\n" ++
+  "      h[pair[0]] = pair[1]\n" ++
+  "    end\n" ++
+  "    h\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def include?(target)\n" ++
+  "    each \{ |*args| return true if __gather(args) == target }\n" ++
+  "    false\n" ++
+  "  end\n" ++
+  "  def member?(target); include?(target); end\n" ++
+  "\n" ++
+  "  def cycle(*n)\n" ++
+  "    __arity!(n.size, 0, 1)\n" ++
+  "    return to_enum(:cycle, *n) unless block_given?\n" ++
+  "    if n.size > 0 && !n[0].nil?\n" ++
+  "      times = __int!(n[0])\n" ++
+  "      return nil if times <= 0\n" ++
+  "      buf = []\n" ++
+  "      each \{ |*args| v = __gather(args); buf.push(v); yield v }\n" ++
+  "      return nil if buf.empty?\n" ++
+  "      (times - 1).times \{ buf.each \{ |v| yield v } }\n" ++
+  "      nil\n" ++
+  "    else\n" ++
+  "      buf = []\n" ++
+  "      each \{ |*args| v = __gather(args); buf.push(v); yield v }\n" ++
+  "      return nil if buf.empty?\n" ++
+  "      loop \{ buf.each \{ |v| yield v } }\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_slice(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise ArgumentError, \"invalid slice size\" if n < 1\n" ++
+  "    return to_enum(:each_slice, n) unless block_given?\n" ++
+  "    buf = []\n" ++
+  "    each do |*args|\n" ++
+  "      buf.push(__gather(args))\n" ++
+  "      if buf.size == n\n" ++
+  "        yield buf\n" ++
+  "        buf = []\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    yield buf unless buf.empty?\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def each_cons(n)\n" ++
+  "    n = __int!(n)\n" ++
+  "    raise ArgumentError, \"invalid size\" if n < 1\n" ++
+  "    return to_enum(:each_cons, n) unless block_given?\n" ++
+  "    buf = []\n" ++
+  "    each do |*args|\n" ++
+  "      buf.push(__gather(args))\n" ++
+  "      buf.shift if buf.size > n\n" ++
+  "      yield buf.dup if buf.size == n\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def zip(*others)\n" ++
+  "    lists = others.map do |o|\n" ++
+  "      if o.is_a?(Array)\n" ++
+  "        o\n" ++
+  "      elsif o.respond_to?(:to_ary)\n" ++
+  "        a = o.to_ary\n" ++
+  "        raise TypeError, \"wrong argument type \" + o.class.to_s + \" (must respond to :each)\" unless a.is_a?(Array)\n" ++
+  "        a\n" ++
+  // ⚠ ruby converts through #to_enum(:each), not #to_a: an object that only
+  //   CLAIMS #each (through respond_to_missing?) and answers to_enum was sent
+  //   to_a and came back "undefined method 'to_a'". The `each` test stays --
+  //   every object has Kernel#to_enum, so testing THAT would accept an object
+  //   with nothing to walk (`zip(Object.new)` must stay a TypeError).
+  "      elsif o.respond_to?(:each)\n" ++
+  "        o.to_enum(:each).to_a\n" ++
+  "      else\n" ++
+  "        raise TypeError, \"wrong argument type \" + o.class.to_s + \" (must respond to :each)\"\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    acc = []\n" ++
+  "    i = 0\n" ++
+  "    each do |*args|\n" ++
+  "      row = [__gather(args)]\n" ++
+  "      lists.each \{ |l| row.push(l[i]) }\n" ++
+  "      i += 1\n" ++
+  "      block_given? ? yield(row) : acc.push(row)\n" ++
+  "    end\n" ++
+  "    block_given? ? nil : acc\n" ++
+  "  end\n" ++
+  "end\n";
+
+let core_prelude_c =
+  // Ractor, sequentially: this interpreter has one thread of control (Thread
+  // runs its block where it is created), so a Ractor keeps its block and runs
+  // it when someone asks for the VALUE. A message sent before that is in the
+  // mailbox by the time the body asks for it, which is the shape the tests
+  // use; what this cannot model is two bodies running at once, and the pairs
+  // that need that are recorded in KNOWN_GAPS.
+  "class Ractor\n" ++
+  "  class Error < StandardError; end\n" ++
+  "  class RemoteError < Error\n" ++
+  "    attr_reader :ractor\n" ++
+  "    def initialize(msg = nil, ractor = nil, cause = nil)\n" ++
+  "      @ractor = ractor\n" ++
+  "      @__cause = cause\n" ++
+  "      super(msg || \"thrown by remote Ractor.\")\n" ++
+  "    end\n" ++
+  "    def cause; @__cause; end\n" ++
+  "  end\n" ++
+  "  class ClosedError < Error; end\n" ++
+  "  class IsolationError < Error; end\n" ++
+  "  class MovedError < Error; end\n" ++
+  "  class UnsafeError < Error; end\n" ++
+  "\n" ++
+  // A port is a queue with a closed flag. Reading an EMPTY one is what "wait
+  // for the other side" means here, and the other side is a ractor nobody has
+  // asked anything of yet -- so the read is the demand that runs it.
+  "  class Port\n" ++
+  "    def initialize; @q = []; @closed = false; end\n" ++
+  "    def <<(v)\n" ++
+  "      raise Ractor::ClosedError, \"The port was already closed\" if @closed\n" ++
+  "      @q.push(v)\n" ++
+  "      self\n" ++
+  "    end\n" ++
+  "    def send(v); self << v; end\n" ++
+  "    def receive\n" ++
+  "      Ractor.__run_pending if @q.empty?\n" ++
+  "      if @q.empty?\n" ++
+  "        raise Ractor::ClosedError, \"The port was already closed\" if @closed\n" ++
+  "        raise Ractor::Error, \"No other ractor can write to this port: this interpreter runs ractors sequentially\"\n" ++
+  "      end\n" ++
+  "      @q.shift\n" ++
+  "    end\n" ++
+  "    def close; @closed = true; self; end\n" ++
+  "    def closed?; @closed; end\n" ++
+  "    def inspect; \"#<Ractor::Port>\"; end\n" ++
+  "    def __empty?; @q.empty?; end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // `Ractor.allocate` is a refusal in ruby -- a Ractor is its block, and there
+  // is nothing to allocate without one -- so the public name raises and the
+  // class builds its instances through `__alloc`, a private door the
+  // interpreter opens for this class alone.
+  "  class << self\n" ++
+  "    def allocate; raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__seq\n" ++
+  "    @__seq = (@__seq || 0) + 1\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.main\n" ++
+  "    @__main ||= (m = __alloc; m.__init_main; m)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.current\n" ++
+  "    @__cur || main\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.main?\n" ++
+  "    current.equal?(main)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__with_current(r)\n" ++
+  "    prev = @__cur\n" ++
+  "    @__cur = r\n" ++
+  "    begin\n" ++
+  "      yield\n" ++
+  "    ensure\n" ++
+  "      @__cur = prev\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  // Every ractor made and not yet run waits here. Anything that would BLOCK in
+  // a parallel ruby -- reading an empty port, selecting -- runs them instead:
+  // that is the whole scheduler.
+  "  def self.__pending; @__pending ||= []; end\n" ++
+  "  def self.__run_pending\n" ++
+  "    until __pending.empty?\n" ++
+  "      r = __pending.shift\n" ++
+  "      r.__run\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.count; 1; end\n" ++
+  "  def self.receive; current.__take; end\n" ++
+  "  def self.recv; current.__take; end\n" ++
+  "  def self.receive_if(&b); current.__take; end\n" ++
+  "  def self.shareable?(o); o.frozen?; end\n" ++
+  "  def self.make_shareable(o); o.freeze; end\n" ++
+  "  def self.shareable_proc(&b); b.freeze; end\n" ++
+  "  def self.shareable_lambda(&b); b.freeze; end\n" ++
+  "  def self.[](k); current[k]; end\n" ++
+  "  def self.[]=(k, v); current[k] = v; end\n" ++
+  "  def self.store_if_absent(k)\n" ++
+  "    c = current\n" ++
+  "    c.key?(k) ? c[k] : (c[k] = yield)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.new(*args, name: nil, &block)\n" ++
+  "    raise ArgumentError, \"must be called with a block\" unless block\n" ++
+  "    unless name.nil? || name.is_a?(String) || name.is_a?(Symbol)\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + name.class.to_s + \" into String\"\n" ++
+  "    end\n" ++
+  "    r = __alloc\n" ++
+  "    r.__init(args, name.nil? ? nil : name.to_s, block)\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "\n" ++
+  // Every ractor here runs SEQUENTIALLY, in the thread that asks for what it
+  // produced: the block is kept and run on the first #value / #join / port
+  // read, so a message sent before then is already in the mailbox when the
+  // body asks for it. There is no parallelism and no interleaving.
+  "  def __init(args, name, block)\n" ++
+  "    @args = args\n" ++
+  "    @name = name\n" ++
+  "    @block = block\n" ++
+  "    @port = Ractor::Port.new\n" ++
+  "    @locals = \{}\n" ++
+  "    @monitors = []\n" ++
+  "    @done = false\n" ++
+  "    @error = nil\n" ++
+  "    @value = nil\n" ++
+  "    @main = false\n" ++
+  "    @id = Ractor.__seq\n" ++
+  "    Ractor.__pending.push(self)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __init_main\n" ++
+  "    @args = []\n" ++
+  "    @name = nil\n" ++
+  "    @block = nil\n" ++
+  "    @port = Ractor::Port.new\n" ++
+  "    @locals = \{}\n" ++
+  "    @monitors = []\n" ++
+  "    @done = true\n" ++
+  "    @error = nil\n" ++
+  "    @value = nil\n" ++
+  "    @main = true\n" ++
+  "    @id = 0\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def name; @name; end\n" ++
+  "  def default_port; @port; end\n" ++
+  "  def inspect\n" ++
+  "    \"#<Ractor:#\" + (@id + 1).to_s + (@name.nil? ? \"\" : \" \" + @name) +\n" ++
+  "      ((@done && !@main) ? \" terminated\" : \" running\") + \">\"\n" ++
+  "  end\n" ++
+  "  def to_s; inspect; end\n" ++
+  // a ractor cannot be copied: it IS its block, and both routes reach the
+  // refused allocator.
+  "  def dup; raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
+  "  def clone(freeze: nil); raise TypeError, \"allocator undefined for Ractor\"; end\n" ++
+  "\n" ++
+  // ractor-local storage.
+  "  def [](k); @locals[k]; end\n" ++
+  "  def []=(k, v); @locals[k] = v; end\n" ++
+  "  def key?(k); @locals.key?(k); end\n" ++
+  "\n" ++
+  "  def send(v, move: false)\n" ++
+  "    @port << v\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def <<(v); send(v); end\n" ++
+  "\n" ++
+  "  def close; @port.close; self; end\n" ++
+  "\n" ++
+  // a monitoring port is told `:exited` when the body finishes -- at once if it
+  // already has.
+  "  def monitor(port)\n" ++
+  "    if @done\n" ++
+  "      port << :exited\n" ++
+  "    else\n" ++
+  "      @monitors.push(port)\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def unmonitor(port)\n" ++
+  "    @monitors.delete(port)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __take\n" ++
+  "    @port.receive\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __run\n" ++
+  "    return if @done || @block.nil?\n" ++
+  "    Ractor.__pending.delete(self)\n" ++
+  "    @done = true\n" ++
+  "    begin\n" ++
+  "      @value = Ractor.__with_current(self) \{ @block.call(*@args) }\n" ++
+  "    rescue Exception => e\n" ++
+  "      @error = e\n" ++
+  "    end\n" ++
+  // a terminated ractor takes no more messages, which is how a program sees
+  // that it finished.
+  "    @port.close\n" ++
+  "    @monitors.each \{ |p| p << :exited }\n" ++
+  "    @monitors = []\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def value\n" ++
+  "    __run\n" ++
+  "    if @error\n" ++
+  "      raise Ractor::RemoteError.new(nil, self, @error)\n" ++
+  "    end\n" ++
+  "    @value\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def join\n" ++
+  "    value\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  // select answers the FIRST argument that has something: a port with a value
+  // in it, or a ractor that has finished. Pending bodies run first, since in a
+  // parallel ruby they would have been running all along.
+  "  def self.select(*ractors)\n" ++
+  "    raise ArgumentError, \"specify at least one ractor or `yield_value`\" if ractors.empty?\n" ++
+  "    ractors.each do |r|\n" ++
+  "      return [r, r.receive] if r.is_a?(Ractor::Port) && !r.__empty?\n" ++
+  "    end\n" ++
+  "    __run_pending\n" ++
+  "    ractors.each do |r|\n" ++
+  "      return [r, r.receive] if r.is_a?(Ractor::Port) && !r.__empty?\n" ++
+  "    end\n" ++
+  "    ractors.each do |r|\n" ++
+  "      return [r, r.value] if r.is_a?(Ractor)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "end\n";
+
+let core_prelude_d =
+  "module ObjectSpace\n" ++
+  "  class WeakMap\n" ++
+  "    include Enumerable\n" ++
+  // (no braces in this source: a `{` in a Mere string starts an interpolation)
+  "    def initialize; @h = Hash.new; end\n" ++
+  "    def [](k); @h[k]; end\n" ++
+  "    def []=(k, v); @h[k] = v; v; end\n" ++
+  "    def key?(k); @h.key?(k); end\n" ++
+  "    def include?(k); @h.key?(k); end\n" ++
+  "    def member?(k); @h.key?(k); end\n" ++
+  "    def delete(k); @h.delete(k); end\n" ++
+  "    def size; @h.size; end\n" ++
+  "    def length; @h.size; end\n" ++
+  "    def keys; @h.keys; end\n" ++
+  "    def values; @h.values; end\n" ++
+  "    def each(&b); @h.each(&b); self; end\n" ++
+  "    def each_pair(&b); @h.each(&b); self; end\n" ++
+  "    def each_key(&b); @h.each_key(&b); self; end\n" ++
+  "    def each_value(&b); @h.each_value(&b); self; end\n" ++
+  // (no #{} in this source: Mere interpolates its own strings the same way)
+  "    def inspect; '#<ObjectSpace::WeakMap:size=' + @h.size.to_s + '>'; end\n" ++
+  "  end\n" ++
+  "  class WeakKeyMap < WeakMap\n" ++
+  "    def getkey(k); @h.key?(k) ? k : nil; end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // Dir.open answers a Dir OBJECT (the class methods above are the rest of
+  // Dir). Only the instance side needs Ruby: the listing itself comes from
+  // the class methods, which are primitives.
+  "class Dir\n" ++
+  "  def initialize(path)\n" ++
+  "    @path = path\n" ++
+  "    @pos = 0\n" ++
+  "  end\n" ++
+  "  def path\n" ++
+  "    @path\n" ++
+  "  end\n" ++
+  "  def to_path\n" ++
+  "    @path\n" ++
+  "  end\n" ++
+  "  def entries\n" ++
+  "    Dir.entries(@path)\n" ++
+  "  end\n" ++
+  "  def children\n" ++
+  "    Dir.children(@path)\n" ++
+  "  end\n" ++
+  "  def each(&b)\n" ++
+  "    entries.each(&b)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def read\n" ++
+  "    e = entries\n" ++
+  "    return nil if @pos >= e.size\n" ++
+  "    v = e[@pos]\n" ++
+  "    @pos = @pos + 1\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "  def rewind\n" ++
+  "    @pos = 0\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def close\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // TracePoint, enough of it for zeitwerk: the :class event, which fires when
+  // a class or module body is entered. `#self` cannot be written with `def`
+  // (it is a keyword), so it is defined the way ruby's C code effectively
+  // does -- through define_method.
+  "class TracePoint\n" ++
+  "  def self.__points\n" ++
+  "    @points = Array.new if @points.nil?\n" ++
+  "    @points\n" ++
+  "  end\n" ++
+  "  def self.__fire(mod)\n" ++
+  "    __points.each do |tp|\n" ++
+  "      tp.__call(mod)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  def self.__fire_ev(ev, mid, cls, path)\n" ++
+  "    __points.each do |tp|\n" ++
+  "      tp.__call_ev(ev, mid, cls, path)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  def initialize(*events, &blk)\n" ++
+  "    @events = events\n" ++
+  "    @blk = blk\n" ++
+  "    @enabled = false\n" ++
+  "    @tp_self = nil\n" ++
+  "  end\n" ++
+  "  def enabled?\n" ++
+  "    @enabled\n" ++
+  "  end\n" ++
+  "  def event\n" ++
+  "    @event\n" ++
+  "  end\n" ++
+  "  define_method(:self) do\n" ++
+  "    @tp_self\n" ++
+  "  end\n" ++
+  // enable(target:) narrows a tracepoint to one method -- `tp.enable(target:
+  // method(:foo))` fires only for foo. Without the keyword, `enable` took no
+  // arguments at all and four bootstraptest pairs died on the ArgumentError
+  // rather than on anything to do with tracing. The block form enables for the
+  // duration of the block, which is how Ruby scopes it.
+  "  def enable(target: nil, target_line: nil, target_thread: nil)\n" ++
+  "    @target = target\n" ++
+  "    if block_given?\n" ++
+  "      was = @enabled\n" ++
+  "      __on\n" ++
+  "      begin\n" ++
+  "        yield\n" ++
+  "      ensure\n" ++
+  "        disable unless was\n" ++
+  "      end\n" ++
+  "    else\n" ++
+  "      __on\n" ++
+  "      false\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  def __on\n" ++
+  "    unless @enabled\n" ++
+  "      @enabled = true\n" ++
+  "      TracePoint.__points.push(self)\n" ++
+  "      TracePoint.__active(true)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  def disable\n" ++
+  "    was = @enabled\n" ++
+  "    @enabled = false\n" ++
+  "    TracePoint.__points.delete(self)\n" ++
+  "    TracePoint.__active(TracePoint.__points.size > 0)\n" ++
+  "    was\n" ++
+  "  end\n" ++
+  "  def __call(mod)\n" ++
+  "    return nil unless @enabled\n" ++
+  "    return nil unless @events.empty? || @events.include?(:class)\n" ++
+  "    @tp_self = mod\n" ++
+  "    @event = :class\n" ++
+  "    r = @blk.call(self)\n" ++
+  "    @tp_self = nil\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "  def __call_ev(ev, mid, cls, path)\n" ++
+  "    return nil unless @enabled\n" ++
+  "    return nil unless @events.empty? || @events.include?(ev)\n" ++
+  "    return nil if @target && @target.name != mid\n" ++
+  "    @event = ev\n" ++
+  "    @method_id = mid\n" ++
+  "    @defined_class = cls\n" ++
+  "    @path = path\n" ++
+  "    @tp_self = nil\n" ++
+  "    @blk.call(self)\n" ++
+  "  end\n" ++
+  "  def method_id\n" ++
+  "    @method_id\n" ++
+  "  end\n" ++
+  "  def callee_id\n" ++
+  "    @method_id\n" ++
+  "  end\n" ++
+  "  def defined_class\n" ++
+  "    @defined_class\n" ++
+  "  end\n" ++
+  "  def path\n" ++
+  "    @path\n" ++
+  "  end\n" ++
+  "  def lineno\n" ++
+  "    0\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // The non-blocking read/write exceptions. Each is an Errno class WITH a
+  // marker module mixed in, so `rescue IO::WaitReadable` catches whichever
+  // errno the platform actually raised. EAGAIN and EWOULDBLOCK are the same
+  // number on darwin and on linux, and where they are the same class ruby
+  // makes the two Wait classes the same OBJECT too -- so the pair is decided
+  // by asking, not by assuming, and a platform that separates them gets two.
+  "class IO\n" ++
+  "  module WaitReadable; end\n" ++
+  "  module WaitWritable; end\n" ++
+  "  class EAGAINWaitReadable < Errno::EAGAIN\n" ++
+  "    include WaitReadable\n" ++
+  "  end\n" ++
+  "  class EAGAINWaitWritable < Errno::EAGAIN\n" ++
+  "    include WaitWritable\n" ++
+  "  end\n" ++
+  "  class EINPROGRESSWaitReadable < Errno::EINPROGRESS\n" ++
+  "    include WaitReadable\n" ++
+  "  end\n" ++
+  "  class EINPROGRESSWaitWritable < Errno::EINPROGRESS\n" ++
+  "    include WaitWritable\n" ++
+  "  end\n" ++
+  "  if Errno::EAGAIN.equal?(Errno::EWOULDBLOCK)\n" ++
+  "    EWOULDBLOCKWaitReadable = EAGAINWaitReadable\n" ++
+  "    EWOULDBLOCKWaitWritable = EAGAINWaitWritable\n" ++
+  "  else\n" ++
+  "    EWOULDBLOCKWaitReadable = Class.new(Errno::EWOULDBLOCK) do\n" ++
+  "      include WaitReadable\n" ++
+  "    end\n" ++
+  "    EWOULDBLOCKWaitWritable = Class.new(Errno::EWOULDBLOCK) do\n" ++
+  "      include WaitWritable\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  // ⚠ slice_before / slice_after were in the LIST this interpreter uses to
+  // decide whether a name exists, with nothing behind them -- so the name was
+  // claimed and every call, block form included, was a NoMethodError. Written
+  // here over #each, which is the only thing they need, so Array, Hash, Range
+  // and every `include Enumerable` class get one implementation between them.
+  //
+  // The two refuse DIFFERENTLY when given both a pattern and a block, which is
+  // ruby's wording and not a slip: slice_before reports the argument count and
+  // slice_after says "both pattern and block are given".
+  "module Enumerable\n" ++
+  "  def slice_before(*args, &blk)\n" ++
+  "    if args.size > 1\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1)\"\n" ++
+  "    elsif args.size > 0 && blk\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 0)\"\n" ++
+  "    elsif args.size == 0 && blk.nil?\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given 0, expected 1)\"\n" ++
+  "    end\n" ++
+  "    pat = args[0]\n" ++
+  "    out = []\n" ++
+  "    cur = nil\n" ++
+  // a receiver whose #each yields SEVERAL values per element hands them to the
+  // block as several arguments, so `|x|` took the first and threw the rest
+  // away: `yield 1, 2` is the element `[1, 2]` here, as it is in ruby.
+  "    each do |*a9|\n" ++
+  "      x = a9.size == 1 ? a9[0] : a9\n" ++
+  "      hit = blk ? blk.call(x) : (pat === x)\n" ++
+  "      if cur.nil?\n" ++
+  "        cur = [x]\n" ++
+  "      elsif hit\n" ++
+  "        out << cur\n" ++
+  "        cur = [x]\n" ++
+  "      else\n" ++
+  "        cur << x\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    out << cur unless cur.nil?\n" ++
+  "    out.each\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def slice_after(*args, &blk)\n" ++
+  "    if args.size > 1\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1)\"\n" ++
+  "    elsif args.size > 0 && blk\n" ++
+  "      raise ArgumentError, \"both pattern and block are given\"\n" ++
+  "    elsif args.size == 0 && blk.nil?\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given 0, expected 1)\"\n" ++
+  "    end\n" ++
+  "    pat = args[0]\n" ++
+  "    out = []\n" ++
+  "    cur = []\n" ++
+  "    each do |*a9|\n" ++
+  "      x = a9.size == 1 ? a9[0] : a9\n" ++
+  "      cur << x\n" ++
+  "      hit = blk ? blk.call(x) : (pat === x)\n" ++
+  "      if hit\n" ++
+  "        out << cur\n" ++
+  "        cur = []\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    out << cur unless cur.empty?\n" ++
+  "    out.each\n" ++
+  "  end\n" ++
+  "end\n";
+
+let core_prelude = core_prelude_a ++ core_prelude_b ++ core_prelude_c ++ core_prelude_d;
+
+
+// define each CONST=encoding-name pair of the table above, `|`-separated.
+let rec enc_define_all = fn mk -> fn (t: str) -> fn (i: int) ->
+  if i >= str_len t then ()
+  else
+    let e = (let j = str_find_from t "|" i in if j < 0 then str_len t else j) in
+    let item = substring t i e in
+    let eq = str_find_from item "=" 0 in
+    let _ = (if eq < 0 then () else
+               (let cname = substring item 0 eq in
+                let ename = substring item (eq + 1) (str_len item) in
+                let _ = map_set consts ("Encoding::" ++ cname) (mk ename) in
+                // the constant's spelling doubles as the alias name ruby's
+                // Encoding.find accepts (underscores are the '-'s).
+                map_set enc_alias_canon (enc_norm_name cname) ename)) in
+    enc_define_all mk t (e + 1);
+
+// MERE_RUBY_STORE_STATS=1 prints, at exit, how many entries each store holds.
+// Nothing here is ever reclaimed -- Mere has no way to give a container's memory
+// back (map_delete does not, overwriting a key does not, and a region block does
+// not: measured) -- so these counts ARE the growth, and they say which store a
+// collector would have to trace first rather than leaving it to be guessed.
+let store_stats = fn world ->
+  let (meths, sup, ocls, ivars) = world in
+  let row = fn (nm: str) -> fn (n: int) ->
+    print_err (nm ++ "\t" ++ str_of_int n ++ "\n") in
+  let _ = print_err "store\tentries\n" in
+  let _ = row "arr_store" (map_len arr_store) in
+  let _ = row "ivars" (map_len ivars) in
+  let _ = row "ocls" (map_len ocls) in
+  let _ = row "meths" (map_len meths) in
+  let _ = row "sup" (map_len sup) in
+  let _ = row "globals" (map_len globals) in
+  let _ = row "consts" (map_len consts) in
+  let _ = row "sym_ids" (map_len sym_ids) in
+  let _ = row "str_enc" (map_len str_enc) in
+  let _ = row "str_frozen" (map_len str_frozen) in
+  let _ = row "hash_dflt" (map_len hash_dflt) in
+  let _ = row "proc_store" (map_len proc_store) in
+  let _ = row "proc_home" (map_len proc_home) in
+  let _ = row "bind_store" (map_len bind_store) in
+  let _ = row "lv_up" (map_len lv_up) in
+  let _ = row "live_frames" (map_len live_frames) in
+  let _ = row "pool_hits" (if map_has frame_pool_n "hits" then map_get frame_pool_n "hits" else 0) in
+  let _ = row "pool_news" (if map_has frame_pool_n "news" then map_get frame_pool_n "news" else 0) in
+  let _ = row "pool_puts" (if map_has frame_pool_n "puts" then map_get frame_pool_n "puts" else 0) in
+  // block envs through the same pool (blk_env_get/put): puts that were block
+  // envs, and envs a closure captured that therefore stayed out of the pool.
+  let _ = row "blk_puts" (if map_has frame_pool_n "blk_puts" then map_get frame_pool_n "blk_puts" else 0) in
+  let _ = row "blk_kept" (if map_has frame_pool_n "blk_kept" then map_get frame_pool_n "blk_kept" else 0) in
+  let _ = row "pool_drops" (if map_has frame_pool_n "drops" then map_get frame_pool_n "drops" else 0) in
+  let _ = row "pool_bytes_wound_back" (if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) in
+  // arena BYTES per store (v0.1.299 map_bytes/vec_bytes): where the resident
+  // memory actually lives, which entry counts cannot say (a store of a few
+  // entries can hold a giant arena and vice versa). Backend-dependent values,
+  // for diagnosis only -- never for output.
+  let _ = row "bytes_str_store" (vec_bytes str_store) in
+  let _ = row "bytes_arr_store" (map_bytes arr_store) in
+  let _ = row "bytes_hash_store" (vec_bytes hash_store) in
+  let _ = row "bytes_ivars" (map_bytes ivars) in
+  let _ = row "bytes_ocls" (map_bytes ocls) in
+  let _ = row "bytes_meths" (map_bytes meths) in
+  let _ = row "bytes_consts" (map_bytes consts) in
+  let _ = row "bytes_globals" (map_bytes globals) in
+  let _ = row "bytes_str_enc" (map_bytes str_enc) in
+  let _ = row "bytes_str_frozen" (map_bytes str_frozen) in
+  let _ = row "bytes_sym_ids" (map_bytes sym_ids) in
+  let _ = row "bytes_proc_store" (map_bytes proc_store) in
+  let _ = row "bytes_proc_yblk" (map_bytes proc_yblk) in
+  let _ = row "bytes_bind_store" (map_bytes bind_store) in
+  let _ = row "bytes_lv_up" (map_bytes lv_up) in
+  let _ = row "bytes_mro_anc" (map_bytes mro_anc) in
+  let _ = row "bytes_dm_methods" (map_bytes dm_methods) in
+  let _ = row "call_names" (map_len call_names_s) in
+  let _ = row "call_lines" (map_len call_lines) in
+  let _ = row "rx_progs" (map_len rx_progs) in
+  let _ = row "rx_caps" (map_len rx_caps) in
+  let _ = row "md_whole" (map_len md_whole) in
+  let _ = row "time_inst" (map_len time_inst) in
+  let _ = row "mro_anc" (map_len mro_anc) in
+  let _ = row "lex_cref" (map_len lex_cref) in
+  let _ = row "meth_cref" (map_len meth_cref) in
+  let _ = row "dm_methods" (map_len dm_methods) in
+  let _ = row "loaded_files" (map_len loaded_files) in
+  // The call-bookkeeping maps' ARENAS. gc_collect compacts these, which moves
+  // their write churn out of the default region and into a private arena --
+  // and a private arena is invisible to MERE_REGION_STATS. Without these rows
+  // the compaction would look like the memory vanished when it only left the
+  // frame the other meter can see.
+  let _ = row "bytes_call_names" (map_bytes call_names_s) in
+  let _ = row "bytes_call_files" (map_bytes call_files_s) in
+  let _ = row "bytes_call_meths" (map_bytes call_meths_s) in
+  let _ = row "bytes_cur_pos" (map_bytes cur_pos_s) in
+  let _ = row "bytes_call_lines" (map_bytes call_lines) in
+  let _ = row "bytes_live_frames" (map_bytes live_frames) in
+  let _ = row "bytes_struct_ctr" (map_bytes struct_ctr) in
+  let _ = row "bytes_thread_flag" (map_bytes thread_flag) in
+  let _ = row "bytes_gc_bare" (map_bytes gc_bare) in
+  let _ = row "gc_blocked" (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+  row "insp_seen" (map_len insp_seen);
+
+let run_src = fn (src: str) -> fn (print_result: bool) -> fn (name: str) ->
+  // diagnostics that must see the rubygems PRELOAD switch on here, first:
+  // collections during the preload's requires are real collections, and
+  // for a day they were invisible because the GC log was armed after them.
+  let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
+  let _ = map_set gc_state "log" (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then 0 else 1) in
+  let _ = map_set load_ctx "dir" (mkstr (dirname_of name)) in
+  let _ = map_set load_ctx "file" (mkstr name) in
+  let _ = map_set loaded_files name VNil in
+  let cod0 = src_coding src in
+  let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
+  let _ = map_set fsl_ctx "v" (src_fsl src) in
+  let toks = number_nls src (lex_go src 0) in
+  let _ = parse_line_reset (count_nls toks) in
+  let (prog, rest) = parse_stmts toks Nil in
+  let _ = rx_check_pending () in
+  let _ =
+    (match rest with
+     | Cons (TEOF, _) -> ()
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in fail ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in
+  let env = map_new () in
+  // The program's middle (non-BEGIN/END) statements, computed once, OUTSIDE
+  // the loop: the carried cursor is an INDEX into this default-region list,
+  // so no AST ever crosses arenas.
+  let gc_mids = filter_mid prog in
+  let gc_total = list_len gc_mids in
+  // TOPLEVEL_BINDING's env: created OUT here (env maps are __heap; a map born
+  // inside the loop would be typed GCW and the typer refuses to store it into
+  // bind_store -- correctly, it would die with the arena).
+  let __tenv0 = map_new () in
+  // THE WORLD is four maps created here and threaded as `world` -- and since
+  // mere v0.1.297 every store (these four included) reclaims by rebuilding IN
+  // PLACE through its stable handle (survivors out, map_clear, survivors
+  // back, map_compact). The region loop that used to carry them across
+  // arenas is gone: compaction made the swap redundant, and a collection is
+  // a plain function (gc_collect) callable from any depth whose in-flight
+  // values are rooted.
+  let meths = map_new () in
+  let sup = map_new () in
+  let ocls = map_new () in
+  let ivars = map_new () in
+  // Encoding objects (VObj of class Encoding, name in @name). Shared instances
+  // stored in enc_objs; the constants point at them. String#encoding returns
+  // the matching one, so `x.encoding == Encoding::UTF_8` holds by identity.
+  // one object per encoding NAME: ruby's aliases are the same object
+  // (Encoding::BIG5.equal?(Encoding::Big5)), and String#encoding compares by
+  // identity.
+  let mk_enc = fn (nm: str) ->
+    if map_has enc_objs nm then map_get enc_objs nm else
+    let id = alloc_oid ocls in
+    let _ = map_set ocls (str_of_int id) "Encoding" in
+    let _ = map_set ivars (str_of_int id ++ "@name") (mkstr nm) in
+    let o = VObj id in
+    let _ = map_set enc_objs nm o in
+    let _ = map_set enc_alias_canon (enc_norm_name nm) nm in
+    let _ = map_set enc_name (str_of_int id) nm in o in
+  let _ = map_set consts "Encoding::UTF_8" (mk_enc "UTF-8") in
+  let _ = map_set consts "Encoding::US_ASCII" (mk_enc "US-ASCII") in
+  let _ = map_set consts "Encoding::ASCII_8BIT" (mk_enc "ASCII-8BIT") in
+  let _ = map_set consts "Encoding::BINARY" (if map_has enc_objs "ASCII-8BIT" then map_get enc_objs "ASCII-8BIT" else mkstr "ASCII-8BIT") in
+  let _ = map_set consts "Encoding::ISO_8859_1" (mk_enc "ISO-8859-1") in
+  let _ = map_set consts "Encoding::ASCII" (if map_has enc_objs "US-ASCII" then map_get enc_objs "US-ASCII" else mkstr "US-ASCII") in
+  let _ = map_set consts "Encoding::UTF_16LE" (mk_enc "UTF-16LE") in
+  let _ = map_set consts "Encoding::UTF_16BE" (mk_enc "UTF-16BE") in
+  let _ = map_set consts "Encoding::UTF_32LE" (mk_enc "UTF-32LE") in
+  let _ = map_set consts "Encoding::UTF_32BE" (mk_enc "UTF-32BE") in
+  // dummy encodings (see enc_is_dummy).
+  let _ = map_set consts "Encoding::UTF_16" (mk_enc "UTF-16") in
+  let _ = map_set consts "Encoding::UTF_32" (mk_enc "UTF-32") in
+  let _ = map_set consts "Encoding::ISO_2022_JP" (mk_enc "ISO-2022-JP") in
+  let _ = map_set consts "Encoding::ISO_2022_JP_2" (mk_enc "ISO-2022-JP-2") in
+  let _ = map_set consts "Encoding::ISO_2022_JP_KDDI" (mk_enc "ISO-2022-JP-KDDI") in
+  let _ = map_set consts "Encoding::IBM037" (mk_enc "IBM037") in
+  let _ = map_set consts "Encoding::IBM437" (mk_enc "IBM437") in
+  let _ = map_set consts "Encoding::CP50220" (mk_enc "CP50220") in
+  let _ = map_set consts "Encoding::CP50221" (mk_enc "CP50221") in
+  let _ = map_set consts "Encoding::UTF_7" (mk_enc "UTF-7") in
+  let _ = map_set consts "Encoding::SHIFT_JIS" (mk_enc "Shift_JIS") in
+  let _ = map_set consts "Encoding::Shift_JIS" (if map_has enc_objs "Shift_JIS" then map_get enc_objs "Shift_JIS" else mkstr "Shift_JIS") in
+  let _ = map_set consts "Encoding::EUC_JP" (mk_enc "EUC-JP") in
+  // ...and every other Encoding constant ruby defines, as CONST=name pairs.
+  // mere-ruby transcodes only a handful of these; a constant EXISTING is not a
+  // claim that it does. activesupport indexes a table by these objects, so a
+  // missing one stopped railties at Encoding::GB18030.
+  let enc_table =
+    "UTF_8_HFS=UTF8-MAC|UTF_8_MAC=UTF8-MAC|UCS_2BE=UTF-16BE|UCS_4BE=UTF-32BE|CP932=Windows-31" ++
+    "J|CsWindows31J=Windows-31J|UCS_4LE=UTF-32LE|SJIS=Windows-31J|PCK=Windows-31J|CSWINDOWS31" ++
+    "J=Windows-31J|CP1251=Windows-1251|CP1252=Windows-1252|CP1250=Windows-1250|CP1254=Windows" ++
+    "-1254|CP1257=Windows-1257|CP1253=Windows-1253|UTF8_DOCOMO=UTF8-DoCoMo|SJIS_DoCoMo=SJIS-D" ++
+    "oCoMo|UTF8_DoCoMo=UTF8-DoCoMo|UTF8_KDDI=UTF8-KDDI|SJIS_KDDI=SJIS-KDDI|SJIS_DOCOMO=SJIS-D" ++
+    "oCoMo|Stateless_ISO_2022_JP_KDDI=stateless-ISO-2022-JP-KDDI|STATELESS_ISO_2022_JP_KDDI=s" ++
+    "tateless-ISO-2022-JP-KDDI|UTF8_SOFTBANK=UTF8-SoftBank|SJIS_SoftBank=SJIS-SoftBank|UTF8_S" ++
+    "oftBank=UTF8-SoftBank|SJIS_SOFTBANK=SJIS-SoftBank|Big5=Big5|BIG5=Big5|Big5_HKSCS=Big5-HK" ++
+    "SCS|BIG5_HKSCS=Big5-HKSCS|Big5_UAO=Big5-UAO|BIG5_UAO=Big5-UAO|CESU_8=CESU-8|CP949=CP949|" ++
+    "Emacs_Mule=Emacs-Mule|EMACS_MULE=Emacs-Mule|EUC_KR=EUC-KR|EUC_TW=EUC-TW|GB18030=GB18030|" ++
+    "GBK=GBK|ISO_8859_2=ISO-8859-2|ISO_8859_3=ISO-8859-3|ISO_8859_4=ISO-8859-4|ISO_8859_5=ISO" ++
+    "-8859-5|ISO_8859_6=ISO-8859-6|ISO_8859_7=ISO-8859-7|ISO_8859_8=ISO-8859-8|ISO_8859_9=ISO" ++
+    "-8859-9|ISO_8859_10=ISO-8859-10|ISO_8859_11=ISO-8859-11|ISO_8859_13=ISO-8859-13|ISO_8859" ++
+    "_14=ISO-8859-14|ISO_8859_15=ISO-8859-15|ISO_8859_16=ISO-8859-16|KOI8_R=KOI8-R|KOI8_U=KOI" ++
+    "8-U|Windows_31J=Windows-31J|WINDOWS_31J=Windows-31J|Windows_1250=Windows-1250|WINDOWS_12" ++
+    "50=Windows-1250|Windows_1251=Windows-1251|WINDOWS_1251=Windows-1251|Windows_1252=Windows" ++
+    "-1252|WINDOWS_1252=Windows-1252|Windows_1253=Windows-1253|WINDOWS_1253=Windows-1253|Wind" ++
+    "ows_1254=Windows-1254|WINDOWS_1254=Windows-1254|Windows_1257=Windows-1257|WINDOWS_1257=W" ++
+    "indows-1257|CP437=IBM437|IBM720=IBM720|CP720=IBM720|IBM737=IBM737|CP737=IBM737|IBM775=IB" ++
+    "M775|CP775=IBM775|CP850=CP850|IBM850=CP850|IBM852=IBM852|CP852=CP852|IBM855=IBM855|CP855" ++
+    "=CP855|IBM857=IBM857|CP857=IBM857|IBM860=IBM860|CP860=IBM860|IBM861=IBM861|CP861=IBM861|" ++
+    "IBM862=IBM862|CP862=IBM862|IBM863=IBM863|CP863=IBM863|IBM864=IBM864|CP864=IBM864|IBM865=" ++
+    "IBM865|CP865=IBM865|IBM866=IBM866|CP866=IBM866|IBM869=IBM869|CP869=IBM869|Windows_1258=W" ++
+    "indows-1258|WINDOWS_1258=Windows-1258|CP1258=Windows-1258|GB1988=GB1988|MacCentEuro=macC" ++
+    "entEuro|MACCENTEURO=macCentEuro|MacCroatian=macCroatian|MACCROATIAN=macCroatian|MacCyril" ++
+    "lic=macCyrillic|MACCYRILLIC=macCyrillic|MacGreek=macGreek|MACGREEK=macGreek|MacIceland=m" ++
+    "acIceland|MACICELAND=macIceland|MacRoman=macRoman|MACROMAN=macRoman|MacRomania=macRomani" ++
+    "a|MACROMANIA=macRomania|MacThai=macThai|MACTHAI=macThai|MacTurkish=macTurkish|MACTURKISH" ++
+    "=macTurkish|MacUkraine=macUkraine|MACUKRAINE=macUkraine|CP950=CP950|Big5_HKSCS_2008=Big5" ++
+    "-HKSCS|BIG5_HKSCS_2008=Big5-HKSCS|CP951=CP951|EBCDIC_CP_US=IBM037|Stateless_ISO_2022_JP=" ++
+    "stateless-ISO-2022-JP|STATELESS_ISO_2022_JP=stateless-ISO-2022-JP|EucJP=EUC-JP|EUCJP=EUC" ++
+    "-JP|EucJP_ms=eucJP-ms|EUCJP_MS=eucJP-ms|EUC_JP_MS=eucJP-ms|CP51932=CP51932|EUC_JIS_2004=" ++
+    "EUC-JIS-2004|EUC_JISX0213=EUC-JIS-2004|EucKR=EUC-KR|EUCKR=EUC-KR|EucTW=EUC-TW|EUCTW=EUC-" ++
+    "TW|GB2312=GB2312|EUC_CN=GB2312|EucCN=GB2312|EUCCN=GB2312|GB12345=GB12345|CP936=GBK|ISO20" ++
+    "22_JP=ISO-2022-JP|ISO2022_JP2=ISO-2022-JP-2|ISO8859_1=ISO-8859-1|ISO8859_2=ISO-8859-2|IS" ++
+    "O8859_3=ISO-8859-3|ISO8859_5=ISO-8859-5|ISO8859_6=ISO-8859-6|ISO8859_4=ISO-8859-4|WINDOW" ++
+    "S_1256=Windows-1256|CP1256=Windows-1256|Windows_1256=Windows-1256|ISO8859_8=ISO-8859-8|W" ++
+    "indows_1255=Windows-1255|ISO8859_7=ISO-8859-7|CP1255=Windows-1255|ISO8859_9=ISO-8859-9|W" ++
+    "INDOWS_1255=Windows-1255|ISO8859_11=ISO-8859-11|TIS_620=TIS-620|ISO8859_10=ISO-8859-10|W" ++
+    "INDOWS_874=Windows-874|CP874=Windows-874|Windows_874=Windows-874|ISO8859_14=ISO-8859-14|" ++
+    "ISO8859_15=ISO-8859-15|ISO8859_13=ISO-8859-13|CP878=KOI8-R|MacJapanese=MacJapanese|ISO88" ++
+    "59_16=ISO-8859-16|MacJapan=MacJapanese|MACJAPAN=MacJapanese|MACJAPANESE=MacJapanese|ANSI" ++
+    "_X3_4_1968=US-ASCII|CP65001=UTF-8|UTF8_MAC=UTF8-MAC|CP65000=UTF-7" in
+  let _ = enc_define_all mk_enc enc_table 0 in
+  // the exception classes and the converter live in the same namespace
+  let _ = map_set consts "Encoding::CompatibilityError" (VClass "Encoding::CompatibilityError") in
+  let _ = map_set consts "Encoding::UndefinedConversionError" (VClass "Encoding::UndefinedConversionError") in
+  let _ = map_set consts "Encoding::InvalidByteSequenceError" (VClass "Encoding::InvalidByteSequenceError") in
+  let _ = map_set consts "Encoding::ConverterNotFoundError" (VClass "Encoding::ConverterNotFoundError") in
+  let _ = map_set consts "Encoding::Converter" (VClass "Encoding::Converter") in
+  let _ = map_set consts "Enumerator::Chain" (VClass "Enumerator::Chain") in
+  let _ = map_set consts "Enumerator::Yielder" (VClass "Enumerator::Yielder") in
+  let _ = map_set consts "Enumerator::ArithmeticSequence" (VClass "Enumerator::ArithmeticSequence") in
+  let _ = map_set consts "Enumerator::Lazy" (VClass "Enumerator::Lazy") in
+  let _ = map_set consts "Regexp::IGNORECASE" (VInt 1) in
+  let _ = map_set consts "Regexp::EXTENDED" (VInt 2) in
+  let _ = map_set consts "Regexp::MULTILINE" (VInt 4) in
+  let _ = map_set consts "Math::PI" (VFlt 3.141592653589793) in
+  let _ = map_set consts "Math::E" (VFlt 2.718281828459045) in
+  // TOPLEVEL_BINDING: a binding whose lexical scope is the top level, so
+  // eval("Const", TOPLEVEL_BINDING) resolves constants at the top level.
+  let _ = (let _ = map_set __tenv0 "__cref" (mkstr "") in
+           let _ = map_set __tenv0 "self" VMain in
+           let bid = map_len bind_store in
+           let _ = map_set bind_store (str_of_int bid) __tenv0 in
+           map_set consts "TOPLEVEL_BINDING" (VBind bid)) in
+  // Exception#initialize(msg = nil) sets @message, so a user exception's
+  // `super(msg)` records the message (read back by make_exc_w).
+  // `require` and `require_relative` are ordinary Kernel methods whose bodies
+  // call the loader, so a library can replace them (RubyGems does) and alias
+  // the original away first. SRequire dispatches to whatever they resolve to.
+  // Module#const_missing as a real method, so a library hook that handles
+  // some names and calls `super` for the rest has somewhere to land.
+  let _ = map_set meths "Module#const_missing"
+    (Meth (Cons ("name", Nil), Nil,
+           Cons (SExpr (ECall ("__const_missing_raise", Cons (ESelf, Cons (EVar "name", Nil)))), Nil))) in
+  let _ = map_set meths "Kernel#require"
+    (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require", Cons (EVar "path", Nil))), Nil))) in
+  let _ = map_set meths "Kernel#require_relative"
+    (Meth (Cons ("path", Nil), Nil, Cons (SExpr (ECall ("__builtin_require_relative", Cons (EVar "path", Nil))), Nil))) in
+  let _ = map_set meths "Exception#initialize" (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil), Cons (SIVarAssign ("message", EVar "msg"), Nil))) in
+  // An Errno class's message is the SYSTEM's text, and `.new` has to say the
+  // same thing `raise` does: `Errno::EINVAL.new.message` is "Invalid argument",
+  // not the class name, and with an argument it reads "<text> - <arg>". raise
+  // went through errno_message and `.new` did not, so the two disagreed about
+  // the same exception -- one primitive, called from the constructor, is what
+  // keeps them from drifting again.
+  // ...and it takes an ERRNO as its second argument, which is what decides the
+  // class: `SystemCallError.new("m", 2)` is an Errno::ENOENT. The number is
+  // kept so #errno answers it even for the base class.
+  // ...and it REQUIRES an argument: `SystemCallError.new` is an ArgumentError
+  // in ruby (there is no errno to name), and answered an empty exception here.
+  // ...and a THIRD argument is the LOCATION: `SystemCallError.new("m", 2,
+  // "loc")` is "No such file or directory @ loc - m". The message builder knew
+  // about a location all along (an Errno class's two-argument form passes one
+  // there), but the constructor took two parameters, so the three-argument
+  // form was a wrong-arity call.
+  let _ = map_set meths "SystemCallError#initialize"
+    (Meth (Cons ("msg", Cons ("extra", Cons ("loc", Nil))),
+           Cons (("msg", ECall ("__sce_no_arg", Cons (ESelf, Nil))), Cons (("extra", ENil), Cons (("loc", ENil), Nil))),
+           Cons (SIVarAssign ("__errno", EVar "extra"),
+             Cons (SIVarAssign ("message", ECall ("__errno_message", Cons (ESelf, Cons (EVar "msg", Cons (EVar "extra", Cons (EVar "loc", Nil)))))), Nil)))) in
+  // #errno: the number it was given, or the platform's number for its class.
+  let _ = map_set meths "SystemCallError#errno"
+    (Meth (Nil, Nil, Cons (SExpr (ECall ("__errno_number", Cons (ESelf, Cons (EIVar "__errno", Nil)))), Nil))) in
+  // NameError#initialize(msg = nil, name = nil): also records the offending
+  // name (NoMethodError inherits this). #name reads it back.
+  let _ = map_set meths "NameError#initialize" (Meth (Cons ("msg", Cons ("name", Nil)), Cons (("msg", ENil), Cons (("name", ENil), Nil)), Cons (SIVarAssign ("message", EVar "msg"), Cons (SIVarAssign ("__name", EVar "name"), Nil)))) in
+  let _ = map_set meths "NameError#name" (Meth (Nil, Nil, Cons (SExpr (EIVar "__name"), Nil))) in
+  // The exception classes whose constructor takes MORE than a message. Ruby
+  // gives each of them a reader for what it recorded, and ruby/spec asks for
+  // exactly that pairing -- a constructor that accepts the argument and a
+  // reader that gives it back. All of them are synthesized the same way as
+  // Exception#initialize above: params, defaults, body. A keyword parameter is
+  // a param name ending in ":", which is how the binder recognizes one.
+  //
+  // NameError also takes `receiver:`, and NoMethodError adds the arguments of
+  // the failed call. `super` in a user subclass reaches these, so the ivars are
+  // named __-prefixed to stay out of the way of a subclass's own.
+  let _ = map_set meths "NameError#initialize"
+    (Meth (Cons ("msg", Cons ("name", Cons ("receiver:", Nil))),
+           // the default is a SENTINEL, not nil: `nil.foo` really has nil as
+           // its receiver, and #receiver must tell that from never being told.
+           Cons (("msg", ENil), Cons (("name", ENil), Cons (("receiver:", ESym "__no_receiver__"), Nil))),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__name", EVar "name"),
+               Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))) in
+  // #receiver RAISES when nothing set one: ruby's "no receiver is available",
+  // which is what a spec asks for. nil is a real receiver (`nil.foo`), so the
+  // question is whether the ivar exists, not whether it is nil.
+  let _ = map_set meths "NameError#receiver"
+    (Meth (Nil, Nil, Cons (SIf (Cons ((EBin ("==", EIVar "__recv", ESym "__no_receiver__"),
+                                       Cons (SExpr (ERaise (Cons (EConst "ArgumentError", Cons (EStrL "no receiver is available", Nil)))), Nil)), Nil), Nil),
+                       Cons (SExpr (EIVar "__recv"), Nil)))) in
+  let _ = map_set meths "NoMethodError#initialize"
+    (Meth (Cons ("msg", Cons ("name", Cons ("args", Cons ("priv", Cons ("receiver:", Nil))))),
+           Cons (("msg", ENil), Cons (("name", ENil), Cons (("args", ENil), Cons (("priv", EBool false), Cons (("receiver:", ESym "__no_receiver__"), Nil))))),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__name", EVar "name"),
+               Cons (SIVarAssign ("__args", EVar "args"),
+                 Cons (SIVarAssign ("__priv", EVar "priv"),
+                   Cons (SIVarAssign ("__recv", EVar "receiver"), Nil))))))) in
+  let _ = map_set meths "NoMethodError#args" (Meth (Nil, Nil, Cons (SExpr (EIVar "__args"), Nil))) in
+  let _ = map_set meths "NoMethodError#private_call?" (Meth (Nil, Nil, Cons (SExpr (EIVar "__priv"), Nil))) in
+  // SignalException(sig): #signo answers the pair the primitive resolves, and
+  // the message is the signal's name (ruby's) unless the caller gave one.
+  let _ = map_set meths "SignalException#initialize"
+    (Meth (Cons ("sig", Cons ("msg", Nil)), Cons (("sig", ENil), Cons (("msg", ENil), Nil)),
+           Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (EVar "sig", Nil))),
+             Cons (SIVarAssign ("message",
+                     EBin ("||", EVar "msg", EMethod (EIVar "__sigpair", "[]", Cons (EInt 1, Nil)))), Nil)))) in
+  // Interrupt is SIGINT with a message of its own: `Interrupt.new` is signo 2
+  // and message "Interrupt", and `Interrupt.new("m")` is just "m". Inheriting
+  // SignalException's initialize made the first argument a SIGNAL, so
+  // `Interrupt.new` resolved signal "" (signo 0, message "SIG") and
+  // `Interrupt.new("message")` reported "SIGmessage" -- a signal name built
+  // out of the caller's text.
+  let _ = map_set meths "Interrupt#initialize"
+    (Meth (Cons ("msg", Nil), Cons (("msg", ENil), Nil),
+           Cons (SIVarAssign ("__sigpair", ECall ("__signal_pair", Cons (ESym "INT", Nil))),
+             Cons (SIVarAssign ("message",
+                     EBin ("||", EVar "msg", EStrL "Interrupt")), Nil)))) in
+  let _ = map_set meths "SignalException#signo"
+    (Meth (Nil, Nil, Cons (SExpr (EMethod (EIVar "__sigpair", "[]", Cons (EInt 0, Nil))), Nil))) in
+  // #signm is the MESSAGE, not the resolved name: `SignalException.new(2)`
+  // answers "SIGINT" because that is the message it built, but
+  // `SignalException.new(2, "name")` answers "name" and `Interrupt.new`
+  // answers "Interrupt". Reading the pair answered the signal's own name for
+  // every one of them.
+  let _ = map_set meths "SignalException#signm"
+    (Meth (Nil, Nil, Cons (SExpr (EIVar "message"), Nil))) in
+  // LocalJumpError#reason: :noreason unless the raiser said which jump it was.
+  let _ = map_set meths "LocalJumpError#reason"
+    (Meth (Nil, Nil, Cons (SExpr (EBin ("||", EIVar "__reason", ESym "noreason")), Nil))) in
+  // ...and #exit_value is the value the jump was carrying (nil for a jump with
+  // no value, and for a yield with no block). It had no entry at all.
+  let _ = map_set meths "LocalJumpError#exit_value"
+    (Meth (Nil, Nil, Cons (SExpr (EIVar "__exit_value"), Nil))) in
+  // KeyError and FrozenError take their extra state as keywords only.
+  let _ = map_set meths "KeyError#initialize"
+    (Meth (Cons ("msg", Cons ("receiver:", Cons ("key:", Nil))),
+           Cons (("msg", ENil), Cons (("receiver:", ENil), Cons (("key:", ENil), Nil))),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__recv", EVar "receiver"),
+               Cons (SIVarAssign ("__key", EVar "key"), Nil))))) in
+  let _ = map_set meths "KeyError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
+  let _ = map_set meths "KeyError#key" (Meth (Nil, Nil, Cons (SExpr (EIVar "__key"), Nil))) in
+  let _ = map_set meths "FrozenError#initialize"
+    (Meth (Cons ("msg", Cons ("receiver:", Nil)),
+           Cons (("msg", ENil), Cons (("receiver:", ENil), Nil)),
+           Cons (SIVarAssign ("message", EVar "msg"),
+             Cons (SIVarAssign ("__recv", EVar "receiver"), Nil)))) in
+  let _ = map_set meths "FrozenError#receiver" (Meth (Nil, Nil, Cons (SExpr (EIVar "__recv"), Nil))) in
+  // SystemExit carries the exit status, positionally, before the message.
+  // `SystemExit.new(true)` exits with status 0 and `.new(false)` with 1: ruby
+  // takes a boolean as the SUCCESS, not as the number. This stored it as the
+  // status, so #status answered `true` and #success? compared it with 0.
+  // ...and a STRING in the status position is the message, with the status
+  // left at 0: `SystemExit.new("message")` is not an exit with status
+  // "message". Reading the first argument positionally made #status answer a
+  // string and #message answer the class name -- both wrong, from one call.
+  let _ = map_set meths "SystemExit#initialize"
+    (Meth (Cons ("status", Cons ("msg", Nil)),
+           Cons (("status", EInt 0), Cons (("msg", ENil), Nil)),
+           Cons (SIVarAssign ("__status",
+                   ETern (EMethod (EVar "status", "is_a?", Cons (EConst "String", Nil)), EInt 0,
+                     ETern (EBin ("==", EVar "status", EBool true), EInt 0,
+                       ETern (EBin ("==", EVar "status", EBool false), EInt 1, EVar "status")))),
+             Cons (SIVarAssign ("message",
+                     ETern (EMethod (EVar "status", "is_a?", Cons (EConst "String", Nil)),
+                            EVar "status", EVar "msg")), Nil)))) in
+  let _ = map_set meths "SystemExit#status" (Meth (Nil, Nil, Cons (SExpr (EIVar "__status"), Nil))) in
+  let _ = map_set meths "SystemExit#success?"
+    (Meth (Nil, Nil, Cons (SExpr (EBin ("==", EIVar "__status", EInt 0)), Nil))) in
+  // LoadError#path and SyntaxError#path get NO method-table entry: `path` is
+  // already answered for the PAIR representation (the VExc the loader raises)
+  // by looking the path up from the message, and a method-table entry SHADOWS
+  // that -- corpus 55 caught exactly that, reading nil for a file the loader
+  // had just named. The object representation is answered in the exception arms
+  // instead, where it cannot shadow anything.
+  // UncaughtThrowError#tag / #value: what `throw` was called with.
+  let _ = map_set meths "UncaughtThrowError#tag" (Meth (Nil, Nil, Cons (SExpr (EIVar "__tag"), Nil))) in
+  let _ = map_set meths "UncaughtThrowError#value" (Meth (Nil, Nil, Cons (SExpr (EIVar "__value"), Nil))) in
+  let _ = map_set sup "StandardError" "Exception" in
+  let _ = map_set sup "RuntimeError" "StandardError" in
+  let _ = map_set sup "ArgumentError" "StandardError" in
+  let _ = map_set sup "TypeError" "StandardError" in
+  let _ = map_set sup "RangeError" "StandardError" in
+  let _ = map_set sup "IndexError" "StandardError" in
+  let _ = map_set sup "KeyError" "IndexError" in
+  let _ = map_set sup "ZeroDivisionError" "StandardError" in
+  let _ = map_set sup "NotImplementedError" "ScriptError" in
+  let _ = map_set sup "EncodingError" "StandardError" in
+  let _ = map_set sup "RegexpError" "StandardError" in
+  let _ = map_set sup "Encoding::UndefinedConversionError" "EncodingError" in
+  let _ = map_set sup "Encoding::CompatibilityError" "EncodingError" in
+  let _ = map_set sup "NameError" "StandardError" in
+  let _ = map_set sup "NoMethodError" "NameError" in
+  let _ = map_set sup "StopIteration" "IndexError" in
+  let _ = map_set sup "FrozenError" "RuntimeError" in
+  let _ = map_set sup "ScriptError" "Exception" in
+  let _ = map_set sup "SyntaxError" "ScriptError" in
+  let _ = map_set sup "LoadError" "ScriptError" in
+  let _ = map_set sup "IOError" "StandardError" in
+  let _ = map_set sup "SystemCallError" "StandardError" in
+  // File IS an IO in ruby, and rexml reopens `class File < IO`: without the
+  // relation registered that reopening is a superclass mismatch.
+  let _ = map_set sup "File" "IO" in
+  let _ = map_set sup "Errno::ENOENT" "SystemCallError" in
+  let _ = map_set sup "Errno::ECONNREFUSED" "SystemCallError" in
+  let _ = map_set sup "Errno::ECONNRESET" "SystemCallError" in
+  let _ = map_set sup "Errno::EADDRINUSE" "SystemCallError" in
+  let _ = map_set sup "Errno::EPIPE" "SystemCallError" in
+  let _ = map_set sup "Errno::EAGAIN" "SystemCallError" in
+  // EWOULDBLOCK IS EAGAIN here, and ruby gives them one class, not two
+  let _ = map_set consts "Errno::EWOULDBLOCK" (VClass "Errno::EAGAIN") in
+  let _ = map_set sup "Errno::EINPROGRESS" "SystemCallError" in
+  let _ = map_set sup "Errno::EALREADY" "SystemCallError" in
+  let _ = map_set sup "Errno::EISCONN" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOTCONN" "SystemCallError" in
+  let _ = map_set sup "Errno::ETIMEDOUT" "SystemCallError" in
+  let _ = map_set sup "Errno::EHOSTUNREACH" "SystemCallError" in
+  let _ = map_set sup "Errno::ENETUNREACH" "SystemCallError" in
+  let _ = map_set sup "Errno::ECONNABORTED" "SystemCallError" in
+  let _ = map_set sup "Errno::EBADF" "SystemCallError" in
+  let _ = map_set sup "Errno::EINTR" "SystemCallError" in
+  let _ = map_set sup "Errno::EINVAL" "SystemCallError" in
+  let _ = map_set sup "Errno::EMFILE" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOTDIR" "SystemCallError" in
+  let _ = map_set sup "Errno::EEXIST" "SystemCallError" in
+  let _ = map_set sup "Errno::EACCES" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOSPC" "SystemCallError" in
+  let _ = map_set sup "Errno::ESPIPE" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOMEM" "SystemCallError" in
+  let _ = map_set sup "Errno::EIO" "SystemCallError" in
+  let _ = map_set sup "Errno::EPROTO" "SystemCallError" in
+  let _ = map_set sup "Errno::ENOTSUP" "SystemCallError" in
+  // ...and every OTHER name the platform has, with its `::Errno` constant:
+  // `Errno::EINVAL::Errno` is what a program compares an exception's #errno
+  // with, and the hand-written rows above are a fraction of the table.
+  let _ = errno_build () in
+  let _ = map_iter errno_num_tbl (fn (nm9: str) -> fn (num9: int) ->
+            let _ = map_set sup ("Errno::" ++ nm9) "SystemCallError" in
+            // ...and the CLASS constant itself, so `Errno::EOPNOTSUPP` names
+            // something: registering only the superclass left every name
+            // outside the hand-written list an uninitialized constant.
+            let _ = (if map_has consts ("Errno::" ++ nm9) then ()
+                     else map_set consts ("Errno::" ++ nm9) (VClass ("Errno::" ++ nm9))) in
+            map_set consts ("Errno::" ++ nm9 ++ "::Errno") (VInt num9)) in
+  let _ = map_set sup "EOFError" "IOError" in
+  let _ = map_set sup "ThreadError" "StandardError" in
+  let _ = map_set sup "fatal" "Exception" in
+  let _ = map_set sup "ClosedQueueError" "StopIteration" in
+  let _ = map_set sup "FiberError" "StandardError" in
+  let _ = map_set sup "LocalJumpError" "StandardError" in
+  let _ = map_set sup "UncaughtThrowError" "ArgumentError" in
+  let _ = map_set sup "NoMatchingPatternError" "StandardError" in
+  let _ = map_set sup "NoMatchingPatternKeyError" "NoMatchingPatternError" in
+  let _ = map_set sup "NoMemoryError" "Exception" in
+  let _ = map_set sup "SecurityError" "Exception" in
+  let _ = map_set sup "SystemStackError" "Exception" in
+  let _ = map_set sup "SystemExit" "Exception" in
+  let _ = map_set sup "SignalException" "Exception" in
+  let _ = map_set sup "Interrupt" "SignalException" in
+  let _ = map_set sup "FloatDomainError" "RangeError" in
+  // Math::DomainError is a StandardError in ruby, so `rescue => e` catches it.
+  // Raising the name without registering it left `-12345.digits(7)` aborting
+  // the program: a class nothing knows is not a StandardError, so nothing
+  // rescued it.
+  let _ = map_set sup "Math::DomainError" "StandardError" in
+  let _ = map_set consts "Math::DomainError" (VClass "Math::DomainError") in
+  // built-in value classes, so reopened methods resolve up the real chain
+  // (class Integer / class Object monkey-patching reaches every value).
+  let _ = map_set sup "Class" "Module" in
+  let _ = map_set sup "Module" "Object" in
+  let _ = map_set sup "Integer" "Numeric" in
+  let _ = map_set sup "Float" "Numeric" in
+  // Float constants (INFINITY/NAN built from float division; the bounds are
+  // IEEE-754 double literals).
+  let _ = map_set consts "Float::INFINITY" (VFlt (1.0 / 0.0)) in
+  let _ = map_set consts "Float::NAN" (VFlt (0.0 / 0.0)) in
+  // the ends of the range, written the way ruby writes them (Mere gained
+  // exponent notation in v0.1.260 -- these three were the probe that wanted
+  // it, and they used to be built out of powers of two).
+  let _ = map_set consts "Float::MIN" (VFlt 2.2250738585072014e-308) in
+  let _ = map_set consts "Float::MAX" (VFlt 1.7976931348623157e308) in
+  let _ = map_set consts "Float::EPSILON" (VFlt 2.220446049250313e-16) in
+  let _ = map_set consts "Float::DIG" (VInt 15) in
+  let _ = map_set consts "Float::MANT_DIG" (VInt 53) in
+  let _ = map_set consts "Float::MIN_EXP" (VInt (0 - 1021)) in
+  let _ = map_set consts "Float::MAX_EXP" (VInt 1024) in
+  let _ = map_set consts "Float::MIN_10_EXP" (VInt (0 - 307)) in
+  let _ = map_set consts "Float::MAX_10_EXP" (VInt 308) in
+  let _ = map_set consts "Float::RADIX" (VInt 2) in
+  // Complex::I -- the imaginary unit, the one constant the complex class has.
+  let _ = map_set consts "Complex::I" (VCpx (VInt 0, VInt 1)) in
+  // module ancestry: Numeric and String are Comparable; every Object is a
+  // Kernel. This makes Integer.ancestors / String.ancestors and is_a? agree
+  // with CRuby ([Integer, Numeric, Comparable, Object, Kernel, BasicObject]).
+  let _ = map_set includes "Numeric" "Comparable" in
+  // ⚠ Rational and Complex are Numerics too, and had NO superclass at all --
+  // their ancestries read [Rational, Object, ...] where ruby says
+  // [Rational, Numeric, Comparable, Object, ...]. `Rational(1,2).is_a?(Numeric)`
+  // and `.is_a?(Comparable)` both answered false.
+  let _ = set_sup sup "Rational" "Numeric" in
+  let _ = set_sup sup "Complex" "Numeric" in
+  let _ = map_set includes "String" "Comparable" in
+  // ...and Symbol is Comparable too: it answers <=> and the four ordering
+  // operators, so `Symbol.include?(Comparable)` is true in ruby and the module
+  // belongs in the ancestry that says so.
+  let _ = map_set includes "Symbol" "Comparable" in
+  // ...and Time, which orders by its instant: ruby's `Time.include?(Comparable)`
+  // is true, and mere-ruby's derived < > <= >= now REQUIRE the module to be in
+  // the ancestry (defining #<=> alone does not give an object the operators),
+  // so a missing include stopped `(t1..t2).include?(t)` -- corpus/179 caught it.
+  let _ = map_set includes "Time" "Comparable" in
+  // the collections include Enumerable, which is what `Array.include?
+  // Enumerable` and `[].is_a? Enumerable` ask about.
+  // ruby 3.1+ has Set without a require: the constant is an autoload of the
+  // library mere-ruby ships. (`to_set` triggers the same load, in invoke_val_c.)
+  let _ = map_set autoloads "Set" (mkstr "set") in
+  // ruby 4.0 made Pathname core as well: the constant is there before any
+  // require (the file still exists, so `require "pathname"` stays true).
+  let _ = map_set autoloads "Pathname" (mkstr "pathname") in
+  let _ = map_set includes "Array" "Enumerable" in
+  let _ = map_set includes "Hash" "Enumerable" in
+  let _ = map_set includes "Range" "Enumerable" in
+  let _ = map_set includes "Struct" "Enumerable" in
+  let _ = map_set includes "Enumerator" "Enumerable" in
+  let _ = map_set includes "Object" "Kernel" in
+  let _ = map_set sup "Numeric" "Object" in
+  let _ = map_set sup "String" "Object" in
+  let _ = map_set sup "Array" "Object" in
+  let _ = map_set sup "Hash" "Object" in
+  let _ = map_set sup "Symbol" "Object" in
+  let _ = map_set sup "Range" "Object" in
+  let _ = map_set sup "Proc" "Object" in
+  let _ = map_set sup "NilClass" "Object" in
+  let _ = map_set sup "TrueClass" "Object" in
+  let _ = map_set sup "FalseClass" "Object" in
+  let world = (meths, sup, ocls, ivars) in
+  // ⚠ the entry program's parse happened BEFORE the world existed, so its
+  //   noted warnings are flushed here instead -- still before a line of the
+  //   program runs, which is where ruby prints them.
+  let _ = warn_flush world in
+  let _ = register_builtin_consts () in
+  let _ = map_set step_budget "n" 50000000 in   // loop-iteration cap (infinite-loop guard)
+  let _ = lv_set env "self" VMain in   // top-level self is `main`
+  // $: / $LOAD_PATH are the SAME array (aliased by handle); likewise $" /
+  // $LOADED_FEATURES. require searches the load path and records features.
+  // -I comes first, then RUBYLIB -- the order ruby itself builds them in.
+  // mere-ruby has no compiled-in stdlib directory, so without one of these
+  // a default gem (shellwords, fileutils) is simply not on disk anywhere it
+  // knows to look, and rubygems cannot help: default gems have no lib dir.
+  let lp0 = arr_new (strs_to_vals (lp_seed ())) in
+  let _ = map_set globals ":" lp0 in
+  let lf0 = arr_new Nil in
+  let _ = map_set globals "\"" lf0 in
+  // The long spellings and the command-line switches are ALIASES, not copies:
+  // `$LOAD_PATH.equal?($:)` and `$-I.equal?($:)` are both true in ruby, and
+  // `$-d = true` sets $DEBUG. Two slots holding the same array made
+  // `.equal?` accidentally true while `object_id` disagreed, and `$-I` was a
+  // slot of its own that nothing kept in step.
+  let galias = fn (a: str) -> fn (b: str) -> map_set gvar_alias a (mkstr b) in
+  let _ = galias "LOAD_PATH" ":" in
+  let _ = galias "-I" ":" in
+  let _ = galias "LOADED_FEATURES" "\"" in
+  let _ = galias "FILENAME" "<" in
+  let _ = galias "PROGRAM_NAME" "0" in
+  let _ = galias "-0" "/" in
+  let _ = galias "-d" "DEBUG" in
+  let _ = galias "-v" "VERBOSE" in
+  let _ = galias "-w" "VERBOSE" in
+  // ...and the switches READ as false when they were not given, not nil.
+  let _ = map_set globals "DEBUG" (VBool false) in
+  // `$.` is the line number of the last read, and it starts at ZERO, not nil.
+  // Nothing here read it strictly, so nil went unnoticed for a long time --
+  // until the refusal below made `$. = saved_lineno` a TypeError, and
+  // rubygems SAVES AND RESTORES $. around every gemspec stub it reads. The
+  // check was right; the default it refused was this interpreter's own.
+  let _ = map_set globals "." (VInt 0) in
+  // ($VERBOSE is deliberately NOT defaulted here. ruby's own default is
+  // false, but every gate runs the reference as `ruby -W0`, which makes it
+  // nil -- and mere-ruby is invoked without that switch because it has no
+  // warnings to silence. Setting false would be right standalone and a DIFF
+  // against the harness, for one assertion; the asymmetry is the harness's.)
+  let _ = map_set globals "-a" (VBool false) in
+  let _ = map_set globals "-l" (VBool false) in
+  let _ = map_set globals "-p" (VBool false) in
+  // STDOUT / STDERR / STDIN: IO objects keyed by @__io_fd; $stdout/$stderr
+  // are globals holding the same objects.
+  let outid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int outid) "IO" in
+  let _ = map_set ivars (str_of_int outid ++ "@__io_fd") (VInt 1) in
+  // The RUBY_* description constants. RUBY_ENGINE says "ruby" rather than
+  // "mere-ruby" on purpose: every gate here is a byte comparison against
+  // MRI, so MRI's is the behaviour being emulated, and a library that
+  // branches on the engine should take the same branch CRuby would. The
+  // version tracks the ruby the corpus and specs are compared against.
+  // Marshal's format version. The module itself is not implemented; these
+  // are the two constants libraries read to stamp a serialised format.
+  let mid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int mid) "Module" in
+  let _ = map_set consts "Marshal" (VClass "Marshal") in
+  let _ = map_set consts "Marshal::MAJOR_VERSION" (VInt 4) in
+  let _ = map_set consts "Marshal::MINOR_VERSION" (VInt 8) in
+  // RbConfig::CONFIG — the handful of keys libraries actually read. mere-ruby
+  // reports the ruby it is compared against; there is no separate build to
+  // describe.
+  let _ = map_set consts "RbConfig" (VClass "RbConfig") in
+  // These paths are a fiction -- there is no ruby installation to describe --
+  // but rubygems computes `Gem.default_dir` from rubylibprefix and
+  // ruby_version, and DEFAULT gem specs live under it
+  // (`specifications/default`, 71 of them in a 3.2 tree). Deriving the prefix
+  // from GEM_HOME makes the fiction agree with the tree mere-ruby was pointed
+  // at, so `net-protocol` and the rest are found rather than missing.
+  let gh0 = env_get "GEM_HOME" in
+  let gi = (if str_len gh0 > 0 then str_rfind gh0 "/gems/" 0 (0 - 1) else (0 - 1)) in
+  let ghver = (if gi > 0 then substring gh0 (gi + 6) (str_len gh0) else "") in
+  let ok = gi > 0 && str_len ghver > 0 && (if str_contains ghver "/" then false else true) in
+  let rlp = (if ok then substring gh0 0 gi else "/usr/lib/ruby") in
+  let rver = (if ok then ghver else "4.0.0") in
+  // ...and the three paths a library builds out of that prefix. bundled_gems.rb
+  // (which bundler 4 requires from Bundler.setup) reads `rubylibdir` and adds a
+  // "/" to it, so a missing key is not a missing feature there but `nil + "/"`.
+  let rarch = "arm64-darwin25" in
+  let rld = rlp ++ "/" ++ rver in
+  let rad = rld ++ "/" ++ rarch in
+  let rbc = mkhash (Cons (mkstr "host_os", Cons (mkstr "darwin", Cons (mkstr "arch", Cons (mkstr rarch, Cons (mkstr "ruby_version", Cons (mkstr rver, Cons (mkstr "ruby_install_name", Cons (mkstr "ruby", Cons (mkstr "EXEEXT", Cons (mkstr "", Cons (mkstr "bindir", Cons (mkstr "/usr/bin", Cons (mkstr "libdir", Cons (mkstr "/usr/lib", Cons (mkstr "sitelibdir", Cons (mkstr rlp, Cons (mkstr "rubylibprefix", Cons (mkstr rlp, Cons (mkstr "rubylibdir", Cons (mkstr rld, Cons (mkstr "rubyarchdir", Cons (mkstr rad, Cons (mkstr "DLEXT", Cons (mkstr "bundle", Nil))))))))))))))))))))))))) in
+  let _ = map_set consts "RbConfig::CONFIG" rbc in
+  let _ = map_set consts "RbConfig::TOPDIR" (mkstr "/usr") in
+  // rbconfig.rb also defines a TOP-LEVEL `CROSS_COMPILING` (nil for a native
+  // build), and standing in for that file means standing in for what it
+  // defines: bundler's rubygems_ext.rb reads `CROSS_COMPILING || RUBY_PLATFORM`
+  // and a missing constant is a NameError there, not a nil.
+  let _ = map_set consts "CROSS_COMPILING" VNil in
+  // File::FNM_* — the flag bits File.fnmatch? and Dir.glob take.
+  let _ = map_set consts "File::FNM_NOESCAPE" (VInt 1) in
+  let _ = map_set consts "File::FNM_PATHNAME" (VInt 2) in
+  let _ = map_set consts "File::FNM_DOTMATCH" (VInt 4) in
+  let _ = map_set consts "File::FNM_CASEFOLD" (VInt 8) in
+  let _ = map_set consts "File::FNM_EXTGLOB" (VInt 16) in
+  let _ = map_set consts "File::FNM_SYSCASE" (VInt 0) in
+  // File open-mode / lock bits. mere-ruby's File does not honour them (there
+  // is no open(2) here), but libraries name them when building a mode.
+  let _ = map_set consts "File::RDONLY" (VInt 0) in
+  let _ = map_set consts "File::WRONLY" (VInt 1) in
+  let _ = map_set consts "File::RDWR" (VInt 2) in
+  let _ = map_set consts "File::CREAT" (VInt 512) in
+  let _ = map_set consts "File::EXCL" (VInt 2048) in
+  let _ = map_set consts "File::TRUNC" (VInt 1024) in
+  let _ = map_set consts "File::APPEND" (VInt 8) in
+  let _ = map_set consts "File::NONBLOCK" (VInt 4) in
+  let _ = map_set consts "File::BINARY" (VInt 0) in
+  let _ = map_set consts "File::LOCK_SH" (VInt 1) in
+  let _ = map_set consts "File::LOCK_EX" (VInt 2) in
+  let _ = map_set consts "File::LOCK_UN" (VInt 8) in
+  let _ = map_set consts "File::LOCK_NB" (VInt 4) in
+  let _ = map_set consts "File::SEPARATOR" (mkstr "/") in
+  let _ = map_set consts "File::ALT_SEPARATOR" VNil in
+  let _ = map_set consts "File::PATH_SEPARATOR" (mkstr ":") in
+  // the bit bucket: aws-sdk-core opens it to throw output away.
+  let _ = map_set consts "File::NULL" (mkstr "/dev/null") in
+  // File::Constants is where ruby actually defines the flags above; File
+  // includes it, so both names reach the same values.
+  let _ = map_set modules "File::Constants" VNil in
+  let _ = map_set consts "File::Constants" (VClass "File::Constants") in
+  let _ = map_set consts "File::Constants::RDONLY" (VInt 0) in
+  let _ = map_set consts "File::Constants::WRONLY" (VInt 1) in
+  let _ = map_set consts "File::Constants::RDWR" (VInt 2) in
+  let _ = map_set consts "File::Constants::CREAT" (VInt 512) in
+  let _ = map_set consts "File::Constants::EXCL" (VInt 2048) in
+  let _ = map_set consts "File::Constants::TRUNC" (VInt 1024) in
+  let _ = map_set consts "File::Constants::APPEND" (VInt 8) in
+  let _ = map_set consts "File::Constants::NONBLOCK" (VInt 4) in
+  let _ = map_set consts "File::Constants::BINARY" (VInt 0) in
+  let _ = map_set consts "File::Constants::LOCK_SH" (VInt 1) in
+  let _ = map_set consts "File::Constants::LOCK_EX" (VInt 2) in
+  let _ = map_set consts "File::Constants::LOCK_UN" (VInt 8) in
+  let _ = map_set consts "File::Constants::LOCK_NB" (VInt 4) in
+  // The identity is the REFERENCE ruby's (tools/ref_ruby.sh): mere-ruby has no
+  // version of its own to report, and every gate compares its output against
+  // that ruby's, so RUBY_VERSION has to be the one whose rubygems, bundler and
+  // bundled_gems.rb branch on it. 3.2.2 until 2026-09-05, then 4.0.6.
+  let _ = map_set consts "RUBY_VERSION" (mkstr "4.0.6") in
+  let _ = map_set consts "RUBY_ENGINE" (mkstr "ruby") in
+  let _ = map_set consts "RUBY_ENGINE_VERSION" (mkstr "4.0.6") in
+  let _ = map_set consts "RUBY_PATCHLEVEL" (VInt 0) in
+  let _ = map_set consts "RUBY_RELEASE_DATE" (mkstr "2026-07-14") in
+  // The reference ruby's own revision. Like the RbConfig paths this is a
+  // borrowed fact rather than a description of this interpreter -- there is no
+  // git revision of mere-ruby to report here -- and it is what a program that
+  // prints its ruby's identity expects to find. bundler's version command reads
+  // it, so its absence was a NameError in the middle of `bundle --version`.
+  let _ = map_set consts "RUBY_REVISION" (mkstr "03b6d3f8898a28604fe6cb00eae3226b821168f4") in
+  let _ = map_set consts "RUBY_PLATFORM" (mkstr "arm64-darwin25") in
+  let _ = map_set consts "RUBY_DESCRIPTION" (mkstr ruby_desc) in
+  let _ = map_set consts "RUBY_COPYRIGHT" (mkstr "ruby - Copyright (C) 1993-2026 Yukihiro Matsumoto") in
+  let _ = map_set consts "STDOUT" (VObj outid) in
+  let _ = map_set globals "stdout" (VObj outid) in
+  let errid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int errid) "IO" in
+  let _ = map_set ivars (str_of_int errid ++ "@__io_fd") (VInt 2) in
+  let _ = map_set consts "STDERR" (VObj errid) in
+  let _ = map_set globals "stderr" (VObj errid) in
+  let inid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int inid) "IO" in
+  let _ = map_set ivars (str_of_int inid ++ "@__io_fd") (VInt 0) in
+  let _ = map_set consts "STDIN" (VObj inid) in
+  let _ = map_set globals "stdin" (VObj inid) in
+  // the main Thread object (always index 0 of the registry), the default
+  // ThreadGroup, and the thread-related constants.
+  let mainid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int mainid) "Thread" in
+  let _ = map_set ivars (str_of_int mainid ++ "@__tst") (mkstr "run") in
+  let _ = map_set cur_thr "v" (VObj mainid) in
+  let _ = map_set all_thr "0" (VObj mainid) in
+  let tgid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int tgid) "ThreadGroup" in
+  let _ = map_set dfl_tg "v" (VObj tgid) in
+  let _ = map_set consts "ThreadGroup" (VClass "ThreadGroup") in
+  let _ = map_set consts "ThreadGroup::Default" (VObj tgid) in
+  let _ = map_set consts "ThreadError" (VClass "ThreadError") in
+  let _ = map_set consts "Thread::Mutex" (VClass "Mutex") in
+  let _ = map_set consts "Queue" (VClass "Queue") in
+  let _ = map_set consts "SizedQueue" (VClass "SizedQueue") in
+  let _ = map_set consts "ConditionVariable" (VClass "ConditionVariable") in
+  let _ = map_set consts "Thread::Queue" (VClass "Queue") in
+  let _ = map_set consts "Thread::SizedQueue" (VClass "SizedQueue") in
+  let _ = map_set consts "Thread::ConditionVariable" (VClass "ConditionVariable") in
+  let _ = map_set consts "ClosedQueueError" (VClass "ClosedQueueError") in
+  // ENV (reads go through getenv, writes overlay), ARGV, $0/$PROGRAM_NAME.
+  let envid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int envid) "EnvHash" in
+  let _ = map_set consts "ENV" (VObj envid) in
+  let _ = map_set consts "ARGV" (if map_has cli_argv "v" then map_get cli_argv "v" else arr_new Nil) in
+  // ARGF: the pseudo-file over the ARGV filenames (or stdin). Its methods
+  // (read / each / each(nil)) are dispatched specially on class "ARGF".
+  let argfid = alloc_oid ocls in
+  let _ = map_set ocls (str_of_int argfid) "ARGF" in
+  let _ = map_set consts "ARGF" (VObj argfid) in
+  let _ = map_set globals "0" (mkstr name) in
+  // `$$` is the process id, like Process.pid -- set only if there IS one. On a
+  // target with no host (`mere -rv`, where the program is the machine) `getpid`
+  // is an extern with no C library behind it, and this line runs at startup, so
+  // it stopped every program before it began.
+  //
+  // Left UNSET rather than set to 0. The comment on the extern above says why:
+  // a made-up number is a stable lie, and nil is detectable where a lie is not.
+  // `Process.pid` still asks, and still stops, for a program that actually wants
+  // the pid -- which is the honest answer to "what is my process id" on a machine
+  // that has no processes.
+  let _ = try_or (fn (u: unit) -> map_set globals "$" (VInt (getpid ()))) () in
+  let _ = map_set globals (gvar_slot "PROGRAM_NAME") (mkstr name) in
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // A small core prelude, written in ruby and run before the program: classes
+  // that are core (no `require` names them) but are ordinary objects, so
+  // writing them in ruby is shorter and clearer than a builtin. It runs as its
+  // own program, so it does not shift the script's line numbers.
+  let _ = (let (pprog, _) = parse_stmts (number_nls core_prelude (lex_go core_prelude 0)) Nil in
+           hoist_run env world noblk pprog) in
+  // An exception nobody rescued: report it the way Ruby does and exit 1,
+  // instead of letting the interpreter's own `fail` message be the last word.
+  // (Until this, every uncaught Ruby exception read as "(ruby exception
+  // raised)", which named neither the class nor the message.)
+  // ruby LOADS RUBYGEMS BEFORE the program (that is what `--disable=gems` turns
+  // off), and mere-ruby did not: `bundle --version` reached line 15 and stopped
+  // at `uninitialized constant Gem::Requirement`, because bundler expects the
+  // gem library to be there already. So when rubygems can be FOUND on the load
+  // path, it is required first, exactly as ruby does; when it cannot (no -I, no
+  // RUBYLIB -- the corpus, the playground) nothing happens and nothing slows
+  // down. MERE_RUBY_NO_GEMS=1 is the `--disable=gems` of this interpreter.
+  let _ = (if str_eq (env_get "MERE_RUBY_NO_GEMS") ""
+              && (if str_eq (load_path_find world "rubygems.rb") "" then false else true)
+           then (let _ = try_or (fn (u: unit) -> (match do_require env world noblk false "rubygems" with _ -> ())) () in ())
+           else ()) in
+  let _ = map_set gc_state "log" (if str_eq (env_get "MERE_RUBY_GC_LOG") "" then 0 else 1) in
+  // Two diagnostics for the collector, both off unless asked for. They exist
+  // because the questions they answer came up and could not be answered by
+  // reading the code:
+  //   MERE_RUBY_GC_NO_LVUP_ROOT=1 stops rooting lv_up. UNSOUND -- a closure
+  //     can lose its outer scope -- and for measurement only: it answers "how
+  //     much is the scope-chain table PINNING?". Answer, on a rubocop load:
+  //     nothing (str_store moved by 24 bytes), which killed a plan to prune it.
+  //   MERE_RUBY_GC_TIGHT=1 makes the byte trigger fire at baseline + 8 MB
+  //     instead of 2x + 32 MB, and counts the safepoints that pressure wanted
+  //     and could not have (the gc_blocked row of MERE_RUBY_STORE_STATS).
+  //     Answer, on the same load: 2 collections against 18.8M blocked checks,
+  //     which is how "the collector is starved of safe points, not of
+  //     pressure" stopped being a guess.
+  let _ = map_set gc_state "nolvup" (if str_eq (env_get "MERE_RUBY_GC_NO_LVUP_ROOT") "" then 0 else 1) in
+  let _ = map_set gc_state "tight" (if str_eq (env_get "MERE_RUBY_GC_TIGHT") "" then 0 else 1) in
+  let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
+  let _ = run_pre env world noblk prog in
+  // The driver: plain recursion, no carry -- the collection is a function
+  // now (gc_collect) and every store rebuilds in place through stable
+  // handles, so nothing needs an arena swap. Each chunk runs inside its own
+  // region DRV block: the per-iteration flow copies and driver temporaries
+  // that used to land in the carried loop's arena die at the chunk boundary
+  // instead.
+  let rec gc_drive = fn (cursor: int) -> fn (lastv: Val) ->
+    let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    // pin the carried value for the collection below (see gc_hold).
+    let _ = map_set gc_hold "lastv" lastv in
+    // the stack is trivially clean here; a raise anywhere below may have
+    // skipped gc_unsafe pops, so the counter self-heals at each chunk.
+    let _ = map_set gc_unsafe "n" 0 in
+    if cursor < gc_total then
+      let r3 = try_or (fn (u: unit) ->
+                 region DRV {
+                   run_until_gc env world noblk (gc_suffix gc_mids cursor) lastv
+                 })
+               ((0, 3, VNil)) in
+      let (consumed, flag, v2) = r3 in
+      (if flag == 0 then
+        // v2 -- the value the chunk just produced -- is the one this
+        // collection can see least: it was born inside the region above and
+        // is held by nothing but this local until the next chunk pins it.
+        (let _ = map_set gc_hold "lastv" v2 in
+         let _ = gc_collect env world in
+         gc_drive (cursor + consumed) v2)
+      else if flag == 1 then gc_drive gc_total v2
+      else if flag == 2 then gc_drive (gc_total + 1) lastv
+      else gc_drive (gc_total + 2) lastv)
+    else
+      // ---- finish: reporting, at_exit, optional print ----
+      let (meths, sup, ocls, ivars) = world in
+      let _ = (if str_eq (env_get "MERE_RUBY_STORE_STATS") "" then () else store_stats world) in
+      let _ = if cursor <= gc_total + 1 then run_at_exits world else
+        (let exc = (if map_has ivars "$exc" then map_get ivars "$exc" else VNil) in
+         match exc with
+         | VExc (ec, em) -> let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in let _ = run_at_exits world in exit 1
+         | VObj eid ->
+           (let ec = map_get ocls (str_of_int eid) in
+            // an unrescued SystemExit (Kernel#exit / #abort) ends the program
+            // with the status it carries and says nothing: that is what exit
+            // means. Everything else is reported.
+            if str_eq ec "SystemExit" then
+              (let st = (if map_has ivars (str_of_int eid ++ "@__status")
+                         then (match map_get ivars (str_of_int eid ++ "@__status") with VInt n -> n | _ -> 0)
+                         else 0) in
+               let _ = run_at_exits world in exit st)
+            else
+            let em = (if map_has ivars (str_of_int eid ++ "@message")
+                      then (match map_get ivars (str_of_int eid ++ "@message") with VStr h -> sget h | other -> to_s other)
+                      else ec) in
+            let _ = print_err (err_where name ++ ": " ++ em ++ " (" ++ ec ++ ")") in
+            let _ = run_at_exits world in exit 1)
+         | _ ->
+           (let m = (if map_has prim_missing "i"
+                     then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: failed")
+                     else "mere-ruby: failed") in
+            let _ = print_err (if str_eq (err_where name) name then m else err_where name ++ ": " ++ m) in exit 1)) in
+      (if print_result && cursor == gc_total then
+        (match lastv with
+         | VObj id ->
+           let cls = map_get ocls (str_of_int id) in
+           if has_meth world cls "to_s" then
+             (match invoke world noblk (VObj id) cls "to_s" Nil with VStr sh -> let s2 = sget sh in print_no_nl s2 | other -> print_no_nl (to_s other))
+           else print_no_nl (to_s (VObj id))
+         // a collection is printed by INSPECTING it, elements and all, which
+         // needs the world (see puts_one_nonl): the world-free to_s named every
+         // object in it "#<object>".
+         | VArr _ -> print_no_nl (inspect_w gc_cenv0 world lastv)
+         | VHsh _ -> print_no_nl (inspect_w gc_cenv0 world lastv)
+         | v -> print_no_nl (to_s v))
+      else ()) in
+  gc_drive 0 VNil;
+
+
+let run_prog = fn (path: str) -> fn (print_result: bool) ->
+  run_src (read_file path) print_result path;
+
+// consume CLI flags (--enable/--disable-frozen-string-literal), returning the
+// remaining args with those flags removed (mutating cli_fsl as a side effect).
+let rec take_flags = fn (argl: str list) ->
+  match argl with
+  | Nil -> Nil
+  | Cons (a, rest) ->
+    if str_eq a "--enable-frozen-string-literal" then let _ = map_set cli_fsl "on" "1" in take_flags rest
+    else if str_eq a "--disable-frozen-string-literal" then let _ = (if map_has cli_fsl "on" then map_delete cli_fsl "on" else ()) in take_flags rest
+    // -I<dir> / -I <dir>: prepend to $LOAD_PATH, in the order given.
+    else if str_len a > 2 && str_eq (substring a 0 2) "-I" then
+      let _ = add_inc (substring a 2 (str_len a)) in take_flags rest
+    else if str_eq a "-I" then
+      (match rest with
+       | Cons (d, rest2) -> let _ = add_inc d in take_flags rest2
+       | Nil -> Nil)
+    // -v / --version: print the version. ruby's -v also sets $VERBOSE and
+    // carries on to the script, so this does not stop parsing: `-v FILE` runs
+    // FILE, and a bare `-v` exits 0 because no script follows it.
+    else if str_eq a "-v" || str_eq a "--version" then
+      let _ = map_set cli_opt "ver" "1" in take_flags rest
+    else if str_eq a "-h" || str_eq a "--help" then
+      let _ = map_set cli_opt "help" "1" in take_flags rest
+    // -e CODE / -eCODE: run CODE instead of a script file. Repeated -e join
+    // with "\n" -- they are LINES OF ONE PROGRAM, not separate programs, which
+    // is why `-e 'a = 1' -e 'puts a'` has to see one scope.
+    else if str_eq a "-e" then
+      (match rest with
+       | Cons (code, rest2) ->
+         let pre = (if map_has cli_opt "eval" then map_get cli_opt "eval" ++ "\n" else "") in
+         let _ = map_set cli_opt "eval" (pre ++ code) in take_flags rest2
+       | Nil -> let _ = map_set cli_opt "bad" "-e" in Nil)
+    else if str_len a > 2 && str_eq (substring a 0 2) "-e" then
+      let pre = (if map_has cli_opt "eval" then map_get cli_opt "eval" ++ "\n" else "") in
+      let _ = map_set cli_opt "eval" (pre ++ substring a 2 (str_len a)) in take_flags rest
+    // The two long flags run_cli owns: hand them back untouched rather than
+    // letting the unrecognised-option arm below claim them.
+    else if str_eq a "--parse-only" || str_eq a "--eval-print" then Cons (a, rest)
+    // `--` ends option parsing; everything after is the script and its ARGV.
+    else if str_eq a "--" then rest
+    // An unrecognised -option is an ERROR, not a filename. Before this it fell
+    // through to read_file, which reported `-v` as a missing file: that names
+    // the symptom and hides the cause.
+    else if str_len a > 1 && str_eq (substring a 0 1) "-" then
+      let _ = map_set cli_opt "bad" a in Nil
+    // ★ Any other argument ENDS option parsing, as it does for ruby. Scanning
+    // the whole list (what this did before) meant `mere-ruby foo.rb -Ilib` ate
+    // -Ilib as an interpreter flag instead of passing it to foo.rb in ARGV.
+    else Cons (a, rest);
+
+// `mere-ruby --parse-only FILE`: read and parse, run nothing. A parse error is
+// the one failure that takes a WHOLE file with it, so it is worth being able
+// to ask about it in isolation -- over a few thousand files, without executing
+// any of them. Exit 0 = parsed, 1 = did not.
+let parse_only = fn (path: str) ->
+  let src = read_file path in
+  let _ = map_set load_ctx "parsing" (mkstr path) in
+  let toks = number_nls src (lex_go src 0) in
+  let _ = parse_line_reset (count_nls toks) in
+  let (prog, rest) = parse_stmts toks Nil in
+  let _ = rx_check_pending () in
+  match rest with
+  | Cons (TEOF, _) -> 0
+  | _ ->
+    let _ = print_err ("mere-ruby: unexpected token at top level" ++ parsing_file ()) in 1;
+
+let run_cli = fn () ->
+  let argl = take_flags (args ()) in
+  // An unrecognised option is reported and nothing runs: continuing would run
+  // a DIFFERENT program than the one that was asked for.
+  if map_has cli_opt "bad" then
+    let _ = print_err ("mere-ruby: invalid option " ++ map_get cli_opt "bad" ++ "  (-h will show valid options)") in 1
+  else if map_has cli_opt "help" then let _ = print usage_line in 0
+  else
+  // -v prints before the program runs, like ruby's does.
+  let _ = (if map_has cli_opt "ver" then print ruby_desc else ()) in
+  if map_has cli_opt "eval" then
+    // -e wins over a script path, and the remaining args are ARGV. __FILE__ is
+    // "-e", which is what ruby reports.
+    let _ = map_set cli_file "p" "-e" in
+    let _ = map_set cli_argv "v" (arr_new (strs_to_vals argl)) in
+    let _ = run_src (map_get cli_opt "eval") false "-e" in 0
+  else
+  match argl with
+  | Nil ->
+    // Browser playground entry (mere v0.1.127 Wasm target): the wasm host
+    // makes `read_file` of this sentinel return the editor's Ruby source, so
+    // the page can drive mere-ruby without argv (args () is always [] on the
+    // Wasm backend). On native the file does not exist, read_file fails, and
+    // try_or falls back to "" -- so a bare `mere-ruby` still prints usage.
+    let src = try_or (fn () -> read_file "@mere-ruby-playground@") "" in
+    if str_eq src "" then
+      // A bare `mere-ruby` deliberately does NOT read stdin, though ruby does.
+      // read_stdin blocks until EOF, so a gate (or a person) that runs the
+      // binary with no arguments and no input would HANG rather than fail, and
+      // a hanging gate is worse than a failing one. `-` asks for stdin
+      // explicitly and is the form a pipeline writes anyway.
+      (if map_has cli_opt "ver" then 0 else let _ = print usage_line in 2)
+    else let _ = run_src src false "(playground)" in 0
+  | Cons (a0, rest) ->
+    if str_eq a0 "--parse-only" then
+      (match rest with
+       | Cons (path, _) -> parse_only path
+       | Nil -> let _ = print "usage: mere-ruby --parse-only <script.rb>" in 2)
+    else if str_eq a0 "--eval-print" then
+      (match rest with
+       | Cons (path, rest2) -> let _ = map_set cli_file "p" path in let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest2)) in let _ = run_prog path true in 0
+       | Nil -> let _ = print "usage: mere-ruby --eval-print <script.rb>" in 2)
+    // `-` reads the program from stdin, as it does for ruby.
+    else if str_eq a0 "-" then
+      let _ = map_set cli_file "p" "-" in
+      let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest)) in
+      let _ = run_src (read_stdin ()) false "-" in 0
+    else let _ = map_set cli_file "p" a0 in let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest)) in let _ = run_prog a0 false in 0;

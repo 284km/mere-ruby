@@ -19,19 +19,30 @@ inside the big cycle could not, whatever the module system looked like.
 """
 import io, re, sys, collections
 
-# Every .mere of the program, in import order where that matters. `import` is
-# a SPLICE, so a chain cannot cross a file: each file is its own sequence of
-# chains, and the map has to say which file a definition is in as well as which
-# chain. With no argument, every .mere in the project root is read.
-import glob, os
+# The program as the COMPILER sees it: main.mere with every `import` expanded
+# in place. `import` is a splice, so that order -- not alphabetical, and not
+# the order the files happen to be listed in -- is the one that decides what a
+# chain is and what each name can see. Reading the files in any other order
+# gives a different call graph for the handful of names defined in two chains.
+import os, re as _re
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRCS = sys.argv[1:] or sorted(glob.glob(os.path.join(ROOT, "*.mere")))
-L, FILE = [], []
-for f in SRCS:
-    ls = io.open(f, encoding="utf-8", errors="replace").read().split("\n")
-    base = os.path.basename(f)
-    L += ls; FILE += [(base, k + 1) for k in range(len(ls))]
-SRC = ", ".join(os.path.basename(f) for f in SRCS)
+ENTRY = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "main.mere")
+IMP = _re.compile(r'^import\s+"([^"]+)"\s*;')
+L, FILE, SEEN = [], [], set()
+def splice(path):
+    rp = os.path.realpath(path)
+    if rp in SEEN: return          # the compiler reads each file once
+    SEEN.add(rp)
+    base = os.path.basename(path)
+    for k, line in enumerate(io.open(path, encoding="utf-8", errors="replace").read().split("\n")):
+        m = IMP.match(line)
+        if m:
+            sub = os.path.join(os.path.dirname(path), m.group(1))
+            if os.path.exists(sub): splice(sub); continue
+        L.append(line); FILE.append((base, k + 1))
+splice(ENTRY)
+SRCS = [ENTRY]
+SRC = " + ".join(sorted({f for f, _ in FILE}))
 DEF = re.compile(r"^(and|let rec|let) ([a-z_][a-z_0-9]*) = fn")
 WORD = re.compile(r"[a-z_][a-z_0-9]*")
 
