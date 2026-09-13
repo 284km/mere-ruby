@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 126 files.
+Classified: 125 files.
 
-## DIFF — 126 files, 65 kinds
+## DIFF — 125 files, 63 kinds
 
 | files | kind |
 |---|---|
@@ -21,8 +21,8 @@ Classified: 126 files.
 | 6 | `FAILED expected false, got true` |
 | 6 | `FAILED expected TypeError to be raised` |
 | 6 | `FAILED expected ArgumentError to be raised` |
+| 6 | `ERROR NameError` |
 | 5 | `ERROR TypeError` |
-| 5 | `ERROR NameError` |
 | 3 | `pass=N fail=N err=N` |
 | 3 | `FAILED expected true, got false` |
 | 3 | `FAILED expected N, got N` |
@@ -35,7 +35,6 @@ Classified: 126 files.
 | 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected "S", got nil` |
 | 2 | `ERROR StandardError` |
-| 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
 | 1 | `FAILED raised StandardError, expected SyntaxError` |
 | 1 | `FAILED raised NoMethodError, expected TypeError` |
@@ -71,7 +70,6 @@ Classified: 126 files.
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
-| 1 | `FAILED expected "TMPDIR 'S': non-empty (RuntimeError)` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "S" to match` |
@@ -91,7 +89,6 @@ Classified: 126 files.
 | 2 | `FAILED: raised NoMethodError, expected SignalException` |
 | 2 | `FAILED: expected SyntaxError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
-| 1 | `sh: feature_14386: command not found` |
 | 1 | `pass=24 fail=1 err=0` |
 | 1 | `pass=19 fail=0 err=0` |
 | 1 | `pass=16 fail=0 err=0` |
@@ -104,7 +101,6 @@ Classified: 126 files.
 | 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
 | 1 | `FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {}` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
-| 1 | `FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError)` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: searches Object as a lexical scope only if Object is explicitly opened: expected :const20_1, got :const20_2` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
@@ -126,6 +122,8 @@ Classified: 126 files.
 | 1 | `FAILED: raised FrozenError, expected TypeError` |
 | 1 | `FAILED: raised ArgumentError, expected SyntaxError` |
 | 1 | `FAILED: provided features are already required: expected ["complex", "enumerator", "fiber", "pathname", "rational", "ruby2_keywords", "set", "thread"], got ["code_loading", "require", "require_spec", "spec_helper"]` |
+| 1 | `FAILED: produces a String in the default external encoding: expected to be identical` |
+| 1 | `FAILED: prints warning when a proc does not accept argument splat: matcher did not match #<Proc>` |
 
 </details>
 
@@ -138,7 +136,7 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| kernel (8) | `binding chomp chop loop select singleton_class test warn` |
+| kernel (9) | `binding chomp chop loop select singleton_class system test warn` |
 | unboundmethod (3) | `bind_call bind super_method` |
 | method (2) | `super_method to_proc` |
 | regexp (1) | `timeout` |

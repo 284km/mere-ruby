@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **126** of **126** recorded DIFF files.
+Visited **125** of **125** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -37,10 +37,6 @@ Visited **126** of **126** recorded DIFF files.
 | core/exception/backtrace_locations_spec.rb | pass=2 fail=1 err=0 pass=3 fail=0 err=0 |
 | core/exception/backtrace_spec.rb | pass=19 fail=0 err=0 pass=21 fail=0 err=0 |
 | core/exception/backtrace_spec.rb | (nothing failed -- the record may be stale) |
-| core/exception/full_message_spec.rb | pass=45 fail=11 err=1 pass=46 fail=11 err=0 |
-| core/exception/full_message_spec.rb | FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError) |
-| core/exception/full_message_spec.rb | FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': \e[1mnon-empty (\e[1;4mRuntimeError\e[m\e[1m)\e[m |
-| core/exception/full_message_spec.rb | FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError) |
 | core/exception/interrupt_spec.rb | pass=4 fail=1 err=1 pass=6 fail=1 err=0 |
 | core/exception/interrupt_spec.rb | ERROR: rescuing Interrupt raises an Interrupt when sent a signal SIGINT: NoMethodError -- undefined method 'kill' for module Process |
 | core/exception/interrupt_spec.rb | FAILED: is raised on the main Thread by the default SIGINT handler: expected "Interrupt: 2 |
@@ -85,7 +81,7 @@ Visited **126** of **126** recorded DIFF files.
 | core/kernel/autoload_spec.rb | FAILED: raised LoadError, expected NameError |
 | core/kernel/autoload_spec.rb | FAILED: should define on the new anonymous class: expected "bogus", got nil |
 | core/kernel/backtick_spec.rb | pass=2 fail=4 err=1 pass=5 fail=0 err=1 |
-| core/kernel/backtick_spec.rb | ERROR: Kernel#` lets the standard error stream pass through to the inherited stderr: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
+| core/kernel/backtick_spec.rb | ERROR: Kernel#` lets the standard error stream pass through to the inherited stderr: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/backtick_spec.rb | FAILED: produces a String in the default external encoding: expected to be identical |
 | core/kernel/backtick_spec.rb | FAILED: expected Errno::ENOENT to be raised |
 | core/kernel/binding_spec.rb | pass=9 fail=0 err=1 pass=14 fail=0 err=0 |
@@ -152,10 +148,10 @@ Visited **126** of **126** recorded DIFF files.
 | core/kernel/sleep_spec.rb | FAILED: pauses execution indefinitely if not given a duration: expected 5, got nil |
 | core/kernel/sleep_spec.rb | FAILED: sleeps with nanosecond precision: expected truthy from #> |
 | core/kernel/sleep_spec.rb | ERROR: Kernel#sleep accepts a nil duration: TypeError -- can't convert nil into time interval |
-| core/kernel/system_spec.rb | pass=2 fail=3 err=6 pass=6 fail=1 err=5 |
+| core/kernel/system_spec.rb | pass=4 fail=3 err=6 pass=13 fail=0 err=3 |
 | core/kernel/system_spec.rb | ERROR: Kernel#system executes the specified command in a subprocess: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
-| core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
-| core/kernel/system_spec.rb | ERROR: Kernel#system returns false when the command exits with a non-zero exit status: NoMethodError -- undefined method 'ruby_cmd' for an instance of Object |
+| core/kernel/system_spec.rb | ERROR: Kernel#system returns true when the command exits with a zero exit status: NameError -- uninitialized constant Process::Status |
+| core/kernel/system_spec.rb | ERROR: Kernel#system returns false when the command exits with a non-zero exit status: NameError -- uninitialized constant Process::Status |
 | core/kernel/test_spec.rb | pass=2 fail=0 err=13 pass=12 fail=0 err=0 |
 | core/kernel/test_spec.rb | ERROR: Kernel#test returns true when passed ?f if the argument is a regular file: NoMethodError -- undefined method 'test' for an instance of Object |
 | core/kernel/test_spec.rb | ERROR: Kernel#test returns true when passed ?e if the argument is a file: NoMethodError -- undefined method 'test' for an instance of Object |
@@ -186,19 +182,16 @@ Visited **126** of **126** recorded DIFF files.
 | core/method/super_method_spec.rb | FAILED: returns the expected super_method: expected MethodSpecs::InheritedMethods::A, got MethodSpecs::InheritedMethods::B |
 | core/method/to_proc_spec.rb | pass=36 fail=0 err=1 pass=37 fail=0 err=0 |
 | core/method/unbind_spec.rb | pass=7 fail=1 err=0 pass=8 fail=0 err=0 |
-| core/mutex/lock_spec.rb | pass=2 fail=1 err=4 pass=4 fail=0 err=3 |
-| core/mutex/lock_spec.rb | ERROR: Mutex#lock blocks the caller if already locked: NameError -- undefined local variable or method 'block_caller' for an instance of Object |
-| core/mutex/lock_spec.rb | ERROR: Mutex#lock does not block the caller if not locked: NameError -- undefined local variable or method 'block_caller' for an instance of Object |
+| core/mutex/lock_spec.rb | pass=4 fail=1 err=2 pass=6 fail=0 err=1 |
 | core/mutex/lock_spec.rb | FAILED: expected ThreadError to be raised |
+| core/mutex/lock_spec.rb | ERROR: Mutex#lock raises a deadlock ThreadError when multiple fibers from the same thread try to lock: ThreadError -- Attempt to unlock a mutex which is not locked |
 | core/mutex/locked_spec.rb | pass=3 fail=1 err=0 pass=4 fail=0 err=0 |
-| core/mutex/sleep_spec.rb | pass=7 fail=2 err=4 pass=10 fail=0 err=3 |
+| core/mutex/sleep_spec.rb | pass=8 fail=2 err=3 pass=11 fail=0 err=2 |
 | core/mutex/sleep_spec.rb | ERROR: when not locked by the current thread pauses execution for approximately the duration requested: NameError -- uninitialized constant TIME_TOLERANCE |
 | core/mutex/sleep_spec.rb | FAILED: unlocks the mutex while sleeping: expected false, got true |
 | core/mutex/sleep_spec.rb | ERROR: when not locked by the current thread relocks the mutex when woken by an exception being raised: Exception -- Exception |
-| core/mutex/synchronize_spec.rb | pass=4 fail=1 err=3 pass=5 fail=0 err=3 |
+| core/mutex/synchronize_spec.rb | pass=6 fail=2 err=0 pass=8 fail=0 err=0 |
 | core/mutex/synchronize_spec.rb | FAILED: wraps the lock/unlock pair in an ensure: expected true, got false |
-| core/mutex/synchronize_spec.rb | ERROR: Mutex#synchronize blocks the caller if already locked: NameError -- undefined local variable or method 'block_caller' for an instance of Object |
-| core/mutex/synchronize_spec.rb | ERROR: Mutex#synchronize does not block the caller if not locked: NameError -- undefined local variable or method 'block_caller' for an instance of Object |
 | core/numeric/step_spec.rb | pass=8 fail=5 err=0 pass=13 fail=0 err=0 |
 | core/numeric/step_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/numeric/step_spec.rb | FAILED: raised StandardError, expected ArgumentError |
@@ -338,7 +331,7 @@ Visited **126** of **126** recorded DIFF files.
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/method_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/module_spec.rb | pass=15 fail=0 err=1 pass=16 fail=0 err=0 |
-| language/predefined_spec.rb | pass=206 fail=25 err=6 pass=221 fail=14 err=2 |
+| language/predefined_spec.rb | pass=207 fail=25 err=5 pass=222 fail=14 err=1 |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "bar">, got #<MatchData "foo"> |
 | language/predefined_spec.rb | FAILED: is set at the method-scoped level rather than block-scoped: expected #<MatchData "qux">, got #<MatchData "baz"> |
 | language/predefined_spec.rb | ERROR: Predefined global $! is Fiber-local: NoMethodError -- undefined method 'yield' for class Fiber |
