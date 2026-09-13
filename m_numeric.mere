@@ -1,0 +1,1935 @@
+// The numeric tower below the dispatcher: bignum arithmetic on canonical
+// decimal strings, Rational (and the simplest rational in an interval),
+// integer shifts that stay total across the int64 boundary, MT19937, and the
+// parts of a Complex.
+//
+// A MODULE, spliced by `import` where these chains used to sit. Nothing here
+// is in the evaluator's mutual-recursion group -- see STRUCTURE.md.
+// ---- bignum: schoolbook arithmetic on canonical decimal strings ----------
+// magnitude = bare digit string, no leading zeros ("0" for zero).
+let rec mag_strip = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s - 1 then substring s i (str_len s)
+  else if str_eq (char_at s i) "0" then mag_strip s (i + 1)
+  else substring s i (str_len s);
+let mag_cmp = fn (a: str) -> fn (b: str) ->
+  let la = str_len a in let lb = str_len b in
+  if la < lb then 0 - 1 else if la > lb then 1 else str_compare a b;
+// THE DIGITS GO INTO A BUFFER, NOT ONTO A STRING. Each of these used to build
+// its result by prepending one character at a time -- `chr d ++ acc` -- and a
+// string is immutable here, so an n-digit operation allocated 1 + 2 + ... + n
+// = n squared over two BYTES to produce n of them. It is the whole reason a
+// bignum cost gigabytes: `2 ** 10000` is 3011 digits and took 8.5 GB, where
+// the reference ruby takes 18 MB for the same number. A StrBuf grows in place,
+// so the same loop is linear; the digits arrive least-significant first and
+// the buffer is reversed once at the end.
+let rev_str = fn (s: str) ->
+  let b = strbuf_new () in
+  let rec go = fn (i: int) -> if i < 0 then () else (let _ = strbuf_push b (char_at s i) in go (i - 1)) in
+  let _ = go (str_len s - 1) in
+  strbuf_to_str b;
+
+let zeros = fn (n: int) ->
+  let b = strbuf_new () in
+  let rec go = fn (k: int) -> if k <= 0 then () else (let _ = strbuf_push b "0" in go (k - 1)) in
+  let _ = go n in
+  strbuf_to_str b;
+
+let mag_add = fn (a: str) -> fn (b: str) ->
+  let la = str_len a in let lb = str_len b in
+  let out = strbuf_new () in
+  let rec go = fn (i: int) -> fn (carry: int) ->
+    if i >= la && i >= lb && carry == 0 then ()
+    else
+      let da = if i < la then ord (char_at a (la - 1 - i)) - 48 else 0 in
+      let db = if i < lb then ord (char_at b (lb - 1 - i)) - 48 else 0 in
+      let s = da + db + carry in
+      let _ = strbuf_push out (chr (s - (s / 10) * 10 + 48)) in
+      go (i + 1) (s / 10) in
+  let _ = go 0 0 in
+  let r = strbuf_to_str out in
+  if str_eq r "" then "0" else rev_str r;
+
+// a - b, assuming a >= b (magnitudes).
+let mag_sub = fn (a: str) -> fn (b: str) ->
+  let la = str_len a in let lb = str_len b in
+  let out = strbuf_new () in
+  let rec go = fn (i: int) -> fn (borrow: int) ->
+    if i >= la then ()
+    else
+      let da = ord (char_at a (la - 1 - i)) - 48 in
+      let db = (if i < lb then ord (char_at b (lb - 1 - i)) - 48 else 0) + borrow in
+      let d = da - db in
+      let d2 = if d < 0 then d + 10 else d in
+      let _ = strbuf_push out (chr (d2 + 48)) in
+      go (i + 1) (if d < 0 then 1 else 0) in
+  let _ = go 0 0 in
+  mag_strip (rev_str (strbuf_to_str out)) 0;
+
+// magnitude a times a single digit d (0..9).
+let mag_mul1 = fn (a: str) -> fn (d: int) ->
+  if d == 0 then "0"
+  else
+    let la = str_len a in
+    let out = strbuf_new () in
+    let rec go = fn (i: int) -> fn (carry: int) ->
+      if i >= la then (if carry == 0 then () else (let _ = strbuf_push out (rev_str (str_of_int carry)) in ()))
+      else
+        let da = ord (char_at a (la - 1 - i)) - 48 in
+        let p = da * d + carry in
+        let _ = strbuf_push out (chr (p - (p / 10) * 10 + 48)) in
+        go (i + 1) (p / 10) in
+    let _ = go 0 0 in
+    rev_str (strbuf_to_str out);
+
+let rec mag_mul_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len b then acc
+  else
+    let d = ord (char_at b (str_len b - 1 - i)) - 48 in
+    let partial = mag_strip (mag_mul1 a d) 0 ++ zeros i in
+    mag_mul_go a b (i + 1) (mag_add acc (mag_strip partial 0));
+let mag_mul = fn (a: str) -> fn (b: str) -> mag_strip (mag_mul_go a b 0 "0") 0;
+
+// signed decimal strings ("-" prefix). sign/magnitude accessors.
+let big_sign = fn (s: str) -> if str_len s > 0 && str_eq (char_at s 0) "-" then 0 - 1 else 1;
+let big_mag = fn (s: str) -> if str_len s > 0 && str_eq (char_at s 0) "-" then substring s 1 (str_len s) else s;
+let with_sign = fn (sgn: int) -> fn (mag: str) ->
+  if str_eq mag "0" then "0" else if sgn < 0 then "-" ++ mag else mag;
+
+let big_add_s = fn (a: str) -> fn (b: str) ->
+  let sa = big_sign a in let sb = big_sign b in
+  let ma = big_mag a in let mb = big_mag b in
+  if sa == sb then with_sign sa (mag_add ma mb)
+  else
+    let c = mag_cmp ma mb in
+    if c == 0 then "0"
+    else if c > 0 then with_sign sa (mag_sub ma mb)
+    else with_sign sb (mag_sub mb ma);
+let big_neg_s = fn (a: str) -> if str_eq a "0" then "0" else if big_sign a < 0 then big_mag a else "-" ++ a;
+let big_sub_s = fn (a: str) -> fn (b: str) -> big_add_s a (big_neg_s b);
+let big_mul_s = fn (a: str) -> fn (b: str) -> with_sign (big_sign a * big_sign b) (mag_mul (big_mag a) (big_mag b));
+
+// The exact integer value of a Float. Above 2^53 every double is already
+// whole, so halving until the mantissa fits is exact and the value is
+// mantissa * 2^shift -- Integer(2e100) used to clamp to the machine maximum.
+let rec flt_scale_down = fn (g: float) -> fn (e: int) ->
+  if g >= 9007199254740992.0 then flt_scale_down (g / 2.0) (e + 1) else (g, e);
+let rec big_pow2_s = fn (e: int) ->
+  if e <= 0 then "1" else (let h = big_pow2_s (e - 1) in big_add_s h h);
+let flt_to_big_s = fn (f: float) ->
+  let neg = f < 0.0 in
+  let a = (if neg then 0.0 - f else f) in
+  let (g, e) = flt_scale_down a 0 in
+  let mag = big_mul_s (str_of_int (int_of_float g)) (big_pow2_s e) in
+  (if neg then "-" ++ mag else mag);
+// Integer == Float compares EXACT values (ruby's rb_integer_float_eq): the
+// double 2e100 IS the integer 2000...208, so they are equal, while a float
+// with a fraction -- or one that is not finite -- equals no integer at all.
+let big_eq_flt = fn (x: str) -> fn (f: float) ->
+  if (f == f) == false then false
+  else if f > 1.7976931348623157e308 || f < (0.0 - 1.7976931348623157e308) then false
+  else if f < 9007199254740992.0 && f > (0.0 - 9007199254740992.0)
+  then float_of_int (int_of_float f) == f && str_eq x (str_of_int (int_of_float f))
+  else str_eq x (flt_to_big_s f);
+// Does comparing an Integer with this Float need the EXACT path? A float of
+// magnitude 2**53 or more is a whole number that an Int64 -> double conversion
+// can no longer represent, so the comparison has to be done on exact values.
+// Below that the double comparison is already exact: either both sides fit, or
+// the integer is the larger by magnitude and rounding cannot cross the gap.
+// (`(f - f) == 0.0` is the finiteness test: it is false for NaN and for both
+// infinities, which order by sign and never need a bignum.)
+let flt_is_infinite = fn (f: float) -> (f == f) && (if (f - f) == 0.0 then false else true);
+let flt_cmp_exact_needed = fn (f: float) ->
+  (f - f) == 0.0 && (f >= 9007199254740992.0 || f <= (0.0 - 9007199254740992.0));
+
+// the flags that decide whether two patterns are the same match: i, x and m.
+// `n` only says how to read the source's bytes, which changes nothing when
+// the source is ASCII-only -- and that is the case ruby's #== spec asks about.
+let rec rx_src_all7 = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then true else if ord (char_at s i) >= 128 then false else rx_src_all7 s (i + 1);
+let rx_cmp_flags = fn (src: str) -> fn (fl: str) ->
+  (if str_contains fl "i" then "i" else "") ++
+  (if str_contains fl "x" then "x" else "") ++
+  (if str_contains fl "m" then "m" else "") ++
+  (if str_contains fl "n" && (if rx_src_all7 src 0 then false else true) then "n" else "");
+
+let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
+  // A Complex whose imaginary part is zero IS the real it wraps, and `==` says
+  // so from BOTH sides. The arms below are keyed on the LEFT value and each
+  // only knew the kinds it was written for, so `Complex(0,0) == 0` was true
+  // while `0 == Complex(0,0)` was false -- one protocol asked from the other
+  // side, answered differently. Numeric#div is the caller that made it visible:
+  // it refuses a divisor that `== 0`, and Complex(0,0) walked past the refusal.
+  match vb with
+  | VCpx (r2, i2) ->
+    (match va with
+     | VCpx (_, _) -> rb_eq_go va vb
+     | _ -> rb_eq_go i2 (VInt 0) && rb_eq va r2)
+  | _ -> rb_eq_go va vb
+
+and rb_eq_go = fn (va: Val) -> fn (vb: Val) ->
+  match va with
+  | VInt x ->
+    (match vb with
+     | VInt y -> x == y
+     // ...and against a float too big for a double to hold the integer: the
+     // conversion rounds, and 4611686018427387903 == 4611686018427387903.0
+     // came out true where ruby says false (the float is really 2**62).
+     | VFlt y -> (if flt_cmp_exact_needed y then big_eq_flt (str_of_int x) y else feq (float_of_int x) y)
+     | VRat (n, d) -> str_eq d "1" && str_eq n (str_of_int x)
+     | _ -> false)
+  | VFlt x ->
+    (match vb with
+     | VInt y -> (if flt_cmp_exact_needed x then big_eq_flt (str_of_int y) x else feq x (float_of_int y))
+     | VFlt y -> feq x y
+     | VBig y -> big_eq_flt y x
+     // ...and a Rational, which the VRat arm below already knew about from its
+     // own side: `Rational(0,1) == 0.0` was true and `0.0 == Rational(0,1)` was
+     // false, one question with two answers depending on which side asked.
+     | VRat (n, d) -> feq x (float_of_str n / float_of_str d)
+     | _ -> false)
+  // canonical form: a VBig never equals a VInt; two VBig equal iff same string.
+  // ...and a whole RATIONAL: `10**20 == Rational(10**20, 1)` is true in ruby,
+  // and each of these arms knew about VInt and not about the other's bignum.
+  | VBig x -> (match vb with VBig y -> str_eq x y | VFlt y -> big_eq_flt x y | VRat (n2, d2) -> str_eq d2 "1" && str_eq n2 x | _ -> false)
+  | VRat (n, d) -> (match vb with VRat (n2, d2) -> str_eq n n2 && str_eq d d2 | VInt m -> str_eq d "1" && str_eq n (str_of_int m) | VBig y -> str_eq d "1" && str_eq n y | VFlt f -> feq (float_of_str n / float_of_str d) f | _ -> false)
+  // ...and this side is the same rule: a zero imaginary part makes the answer
+  // the real part's, whatever KIND of real the other side is (it used to name
+  // VInt alone, so `Complex(3.5,0) == 3.5` was false).
+  | VCpx (r, i) -> (match vb with VCpx (r2, i2) -> rb_eq r r2 && rb_eq i i2 | _ -> rb_eq i (VInt 0) && rb_eq r vb)
+  | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in str_eq x y | _ -> false)
+  | VBool x ->
+    (match vb with
+     | VBool y -> if x then y else (if y then false else true)
+     | _ -> false)
+  | VNil -> (match vb with VNil -> true | _ -> false)
+  | VArr x -> (match vb with VArr y -> if x == y then true else eq_list (deref x) (deref y) | _ -> false)
+  // two hashes are == only if they compare keys the SAME WAY: a
+  // compare_by_identity hash is never == a plain one, and two identity hashes
+  // are compared BY IDENTITY (which is how a dup of one, holding two distinct
+  // but equal-looking keys, comes out equal to it).
+  | VHsh xs0 ->
+    (match vb with
+     | VHsh ys0 ->
+       // ...and the flags are compared only when BOTH have pairs: two empty
+       // hashes are equal however they look keys up (ruby's rule exactly).
+       (let e9 = (match hderef xs0 with Nil -> true | _ -> false) in
+        let f9 = (match hderef ys0 with Nil -> true | _ -> false) in
+        if e9 || f9 then hash_eq_unordered (hderef xs0) (hderef ys0)
+        else if (if hcbi_on xs0 then true else false) == (if hcbi_on ys0 then true else false)
+        then hash_eq_unordered_x (hcbi_on xs0) (hderef xs0) (hderef ys0)
+        else false)
+     | _ -> false)
+  // object identity (same handle); classes and symbols by value.
+  | VObj x -> (match vb with VObj y -> x == y | _ -> false)
+  | VClass x -> (match vb with VClass y -> str_eq x y | _ -> false)
+  | VSym x -> (match vb with VSym y -> str_eq x y | _ -> false)
+  | VRange (a, b, c) ->
+    (match vb with
+     | VRange (d, e, f) -> rb_eq a d && rb_eq b e && (if c then f else (if f then false else true))
+     | _ -> false)
+  | VExc (c, m) -> (match vb with VExc (d, n) -> str_eq c d && str_eq m n | _ -> false)
+  | VMain -> (match vb with VMain -> true | _ -> false)
+  // regexes / procs / bindings compare by pattern text / handle identity (and
+  // never equal a different kind) — without these arms rb_eq is non-exhaustive
+  // and aborts when a regex/proc reaches it (e.g. a `^regex` pin).
+  // ...comparing the flags that CHANGE the match. `n` (NOENCODING) is not one
+  // of them for an ASCII-only pattern -- it says how to read the bytes, and
+  // there is nothing to read differently -- so ruby answers true for
+  // `/x/ == Regexp.new("x", Regexp::NOENCODING)`.
+  | VRegex (p, pf, _) -> (match vb with VRegex (q, qf, _) -> str_eq p q && str_eq (rx_cmp_flags p pf) (rx_cmp_flags q qf) | _ -> false)
+  | VProc x -> (match vb with VProc y -> x == y | _ -> false)
+  | VBind x -> (match vb with VBind y -> x == y | _ -> false)
+
+and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> true | _ -> false)
+  | Cons (h, t) ->
+    (match ys with
+     | Nil -> false
+     // Array#== compares each pair with rb_equal, which checks IDENTITY before
+     // ==: `[nan] == [nan]` is true for the same Float object even though
+     // `nan == nan` is false. A Float here has no identity to check, so two
+     // NaNs in the same position are taken as that case -- the other one (two
+     // separately produced NaNs, false in ruby) is not expressible.
+     | Cons (h2, t2) ->
+       ((match (h, h2) with
+         // (NaN is the value that is not equal to itself; flt_is_nan is
+         // defined further down the file than this.)
+         | (VFlt f1, VFlt f2) ->
+           (if f1 == f1 then rb_eq h h2 else (if f2 == f2 then false else true))
+         | _ -> rb_eq h h2)
+        && eq_list t t2))
+// Hash#== is order-insensitive: same size and every key maps to an equal
+// value (both are flat [k,v,k,v,...] lists; keys are unique in a hash).
+and hlookup_eq = fn (ys: Val list) -> fn (k: Val) ->
+  match ys with
+  | Cons (yk, Cons (yv, rest)) -> if rb_eq k yk then Cons (yv, Nil) else hlookup_eq rest k
+  | _ -> Nil
+// ...and the identity form, which is the same walk with `equal?` for the key.
+and hlookup_eq_x = fn (ident: bool) -> fn (ys: Val list) -> fn (k: Val) ->
+  match ys with
+  | Cons (yk, Cons (yv, rest)) ->
+    // (hkey_same's rule, written out: it is defined after this rec group.)
+    (let same9 = (if ident then
+                    (match (k, yk) with
+                     | (VStr x9, VStr y9) -> x9 == y9
+                     | (VArr x9, VArr y9) -> x9 == y9
+                     | (VHsh x9, VHsh y9) -> x9 == y9
+                     | (VObj x9, VObj y9) -> x9 == y9
+                     | (VProc x9, VProc y9) -> x9 == y9
+                     | _ -> rb_eq k yk)
+                  else rb_eq k yk) in
+     if same9 then Cons (yv, Nil) else hlookup_eq_x ident rest k)
+  | _ -> Nil
+and hash_eq_go = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, rest)) ->
+    (match hlookup_eq ys k with Cons (yv, _) -> if rb_eq v yv then hash_eq_go rest ys else false | _ -> false)
+  | _ -> true
+and hash_eq_go_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, rest)) ->
+    (match hlookup_eq_x ident ys k with
+     | Cons (yv, _) -> (if rb_eq v yv then hash_eq_go_x ident rest ys else false)
+     | _ -> false)
+  | _ -> true
+and vllen = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + vllen t
+and hash_eq_unordered = fn (xs: Val list) -> fn (ys: Val list) ->
+  if vllen xs == vllen ys then hash_eq_go xs ys else false
+and hash_eq_unordered_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val list) ->
+  if vllen xs == vllen ys then hash_eq_go_x ident xs ys else false;
+
+// Two keys are the same key when they are EQL?, which is not ==: 1 and 1.0 are
+// equal and not eql?, so `{4 => 0}.include?(4.0)` is false and a hash can hold
+// both. Ruby's rule is "same #hash and #eql?"; across the numeric classes that
+// comes down to the class having to match, which is what this checks.
+// Which CLASS of number a value is, or "" for a value that is not one. VInt
+// and VBig are one class (Integer): which of the two holds a value is this
+// interpreter's representation choice, not something ruby can see.
+let num_kind_tag = fn (v: Val) ->
+  match v with
+  | VInt _ -> "i" | VBig _ -> "i" | VFlt _ -> "f"
+  | VRat (_, _) -> "r" | VCpx (_, _) -> "c"
+  | _ -> "";
+// A hash key matches by `eql?`, which is `==` AND "the same class of number":
+// `{0 => 1}[0.0]` is nil though `0 == 0.0`. This used to be a list of the
+// cross-kind PAIRS that must not match -- a list someone has to keep complete,
+// and Complex was in none of its arms, so `{0 => 1}[Complex(0,0)]` found the
+// key that `0.eql?(Complex(0,0))` denies. Asking for the same kind FIRST cannot
+// be incomplete: a kind that is added later is excluded by default rather than
+// by being remembered.
+let rec hkey_eql = fn (a: Val) -> fn (b: Val) ->
+  let ka = num_kind_tag a in
+  let kb = num_kind_tag b in
+  if str_eq ka "" && str_eq kb "" then rb_eq a b
+  // ...and a Complex is made of two numbers, each of which has to be eql? in
+  // the same sense: `Complex(1,0)` and `Complex(1.0,0)` are == and are not the
+  // same hash key.
+  else if str_eq ka "c" && str_eq kb "c" then
+    (match (a, b) with
+     | (VCpx (r1, i1), VCpx (r2, i2)) -> hkey_eql r1 r2 && hkey_eql i1 i2
+     | _ -> false)
+  else str_eq ka kb && rb_eq a b;
+let hkey_same = fn (ident: bool) -> fn (a: Val) -> fn (b: Val) ->
+  if ident then
+    (match a with
+     | VStr x -> (match b with VStr y -> x == y | _ -> false)
+     | VArr x -> (match b with VArr y -> x == y | _ -> false)
+     | VHsh x -> (match b with VHsh y -> x == y | _ -> false)
+     | VObj x -> (match b with VObj y -> x == y | _ -> false)
+     | VProc x -> (match b with VProc y -> x == y | _ -> false)
+     // Integers, Symbols, nil and the booleans are their own identity
+     | _ -> hkey_eql a b)
+  else hkey_eql a b;
+let rec hash_get_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (k2, rest) -> (match rest with Cons (v, t) -> if hkey_same ident k2 k then v else hash_get_x ident t k | Nil -> VNil);
+let rec hash_haskey_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> false
+  | Cons (k2, rest) -> (match rest with Cons (_, t) -> if hkey_same ident k2 k then true else hash_haskey_x ident t k | Nil -> false);
+let rec hash_put_x = fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
+  match xs with
+  | Nil -> Cons (k, Cons (v, Nil))
+  | Cons (k2, rest) ->
+    (match rest with
+     | Cons (v2, t) -> if hkey_same ident k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put_x ident t k v))
+     | Nil -> Cons (k, Cons (v, Nil)));
+
+
+// numeric / string ordering: negative | zero | positive like a compare fn.
+// acc * base**e by SQUARING, not by multiplying e times. `2 ** 10000` was ten
+// thousand multiplications against a growing accumulator; it is fourteen
+// squarings and a few products now, and the exponent's bits decide which.
+let rec big_pow = fn (base: str) -> fn (e: int) -> fn (acc: str) ->
+  if e <= 0 then acc
+  else if e - (e / 2) * 2 == 1 then big_pow (big_mul_s base base) (e / 2) (big_mul_s acc base)
+  else big_pow (big_mul_s base base) (e / 2) acc;
+
+// schoolbook long division of magnitudes: returns (quotient, remainder).
+let rec mag_find_k = fn (b: str) -> fn (cur: str) -> fn (k: int) ->
+  if k <= 0 then 0
+  else if mag_cmp (mag_mul1 b k) cur <= 0 then k
+  else mag_find_k b cur (k - 1);
+let rec mag_dm_go = fn (a: str) -> fn (b: str) -> fn (i: int) -> fn (cur: str) -> fn (q: str) ->
+  if i >= str_len a then (mag_strip q 0, mag_strip cur 0)
+  else
+    let cur2 = mag_strip (cur ++ char_at a i) 0 in
+    let k = mag_find_k b cur2 9 in
+    let cur3 = mag_sub cur2 (mag_strip (mag_mul1 b k) 0) in
+    mag_dm_go a b (i + 1) cur3 (q ++ chr (k + 48));
+let mag_divmod = fn (a: str) -> fn (b: str) -> mag_dm_go a b 0 "" "";
+
+// signed divmod with Ruby semantics (quotient floors toward -inf; remainder
+// takes the divisor's sign). Returns (quotient, remainder) as decimal strings.
+//
+// ⚠ The zero check is not decoration. mag_find_k answers "how many times does
+// b go into this prefix", and for b = 0 the answer is 9 at EVERY digit -- so a
+// zero divisor did not fail, it FABRICATED a quotient of all nines
+// (`(2**70).div(0)` was 9999999999999999999999) and a remainder to match. A
+// wrong number with no error is the one result a caller cannot notice.
+let big_divmod_s = fn (a: str) -> fn (b: str) ->
+  if str_eq (big_mag b) "0" then
+    (let _ = prim_raise "ZeroDivisionError" "divided by 0" in ("0", "0"))
+  else
+  let dm = mag_divmod (big_mag a) (big_mag b) in
+  let mq = (match dm with (q, r) -> q) in
+  let mr = (match dm with (q, r) -> r) in
+  let sa = big_sign a in let sb = big_sign b in
+  let qt = with_sign (sa * sb) mq in
+  let rt = with_sign sa mr in
+  if str_eq mr "0" then (qt, "0")
+  else if sa == sb then (qt, rt)
+  else (big_sub_s qt "1", big_add_s rt b);
+let big_div_s = fn (a: str) -> fn (b: str) -> (match big_divmod_s a b with (q, r) -> q);
+// `a.fdiv(b)` where either side is too big for a double. `to_f a / to_f b` is
+// Inf/Inf = NaN once BOTH overflow, which is how `(10**400).fdiv(10**397)` --
+// a quotient of exactly 1000.0 -- came out NaN. Divide in DECIMAL instead:
+// shift the numerator so the integer quotient carries 18 significant digits
+// (more than a double holds), then put the single fixed scale back. 1e18 is
+// exactly representable, so the last step adds no error of its own.
+let rec dec_zeros = fn (n: int) -> if n <= 0 then "" else "0" ++ dec_zeros (n - 1);
+// bit i of a bignum, in two's complement. A negative -m is ~(m-1), so its bit
+// i is the complement of (m-1)'s -- which is how an arbitrary-precision
+// negative gets bits without a word width to borrow them from.
+let rec big_bit_mag = fn (s: str) -> fn (i: int) ->
+  if str_eq s "0" then 0
+  else if i <= 0 then (match big_divmod_s s "2" with (q, r) -> (if str_eq r "0" then 0 else 1))
+  else big_bit_mag (match big_divmod_s s "2" with (q, r) -> q) (i - 1);
+// integer square root of a non-negative magnitude, by Newton on decimal
+// strings. `sqrt(to_f n)` cannot answer for a bignum: the double it starts
+// from has already lost the digits the answer is made of.
+let rec big_isqrt_go = fn (n: str) -> fn (x: str) -> fn (fuel: int) ->
+  if fuel <= 0 then x
+  else
+    // x' = (x + n/x) / 2, which decreases until it stops
+    let nx = big_div_s (big_add_s x (big_div_s n x)) "2" in
+    // magnitudes only, so mag_cmp is the comparison (big_cmp_s is defined
+    // further down and this block runs before it)
+    if mag_cmp nx x >= 0 then x else big_isqrt_go n nx (fuel - 1);
+let big_isqrt_s = fn (n: str) -> fn (u: unit) ->
+  if str_eq n "0" then "0"
+  else
+    // start above the answer: 10^ceil(digits/2) has at least as many digits
+    let x0 = "1" ++ dec_zeros ((str_len n + 1) / 2) in
+    let r = big_isqrt_go n x0 (str_len n * 4 + 40) in
+    // Newton lands on floor(sqrt) or one above it; step down while it is above
+    if mag_cmp (big_mul_s r r) n > 0 then big_sub_s r "1" else r;
+let big_bit_at = fn (b: str) -> fn (i: int) ->
+  if big_sign b < 0 then 1 - big_bit_mag (big_sub_s (big_mag b) "1") i
+  else big_bit_mag (big_mag b) i;
+let big_fdiv_s = fn (a: str) -> fn (b: str) ->
+  let ma = big_mag a in
+  let mb = big_mag b in
+  let sg = big_sign a * big_sign b in
+  let neg = sg < 0 in
+  if str_eq mb "0" then
+    (if str_eq ma "0" then 0.0 / 0.0 else (if neg then 0.0 - 1.0 else 1.0) / 0.0)
+  else if str_eq ma "0" then (if neg then 0.0 - 0.0 else 0.0)
+  else
+    let d = str_len ma - str_len mb in
+    // beyond a double's decimal range the answer IS an infinity or a zero
+    if d > 320 then (if neg then 0.0 - 1.0 else 1.0) / 0.0
+    else if d < 0 - 340 then (if neg then 0.0 - 0.0 else 0.0)
+    else
+      // k is chosen so the integer quotient carries ~25 significant digits --
+      // more than a double holds, whatever the two magnitudes were.
+      let k = 25 - d in
+      let q = (if k >= 0 then big_div_s (ma ++ dec_zeros k) mb
+               else big_div_s ma (mb ++ dec_zeros (0 - k))) in
+      // ...and the scale goes back by WRITING the decimal out and letting
+      // float_of_str round it. Dividing by a float power of ten would add that
+      // power's own rounding on top; the string has no such step.
+      let txt = (if k <= 0 then q ++ dec_zeros (0 - k)
+                 else (let n = str_len q in
+                       if n > k then substring q 0 (n - k) ++ "." ++ substring q (n - k) n
+                       else "0." ++ dec_zeros (k - n) ++ q)) in
+      let f = float_of_str txt in
+      if neg then 0.0 - f else f;
+let big_mod_s = fn (a: str) -> fn (b: str) -> (match big_divmod_s a b with (q, r) -> r);
+let big_cmp_s = fn (a: str) -> fn (b: str) ->
+  let sa = big_sign a in let sb = big_sign b in
+  if sa < sb then 0 - 1 else if sa > sb then 1
+  else (let c = mag_cmp (big_mag a) (big_mag b) in if sa < 0 then 0 - c else c);
+// an Integer (as a decimal string) against a Float that is a whole number:
+// exact, both sides as integers. See flt_cmp_exact_needed above.
+let int_flt_cmp_s = fn (x: str) -> fn (f: float) -> big_cmp_s x (flt_to_big_s f);
+
+// ---- Rational (num/den as canonical decimal strings, den > 0, reduced) ----
+// bignum gcd of the magnitudes of a, b (Euclid), as a positive canonical string.
+let rec big_gcd_s = fn (a: str) -> fn (b: str) ->
+  let a = big_mag a in let b = big_mag b in
+  if str_eq b "0" then (if str_eq a "" then "0" else a)
+  else big_gcd_s b (big_mod_s a b);
+// build a reduced Rational from num/den strings (den != 0).
+let mk_rat_s = fn (n: str) -> fn (d: str) ->
+  let nm = mag_strip (big_mag n) 0 in let dm = mag_strip (big_mag d) 0 in
+  if str_eq dm "0" then (let _ = prim_raise "ZeroDivisionError" "divided by 0" in VRat ("0", "1"))
+  else
+    let sgn = big_sign n * big_sign d in
+    let g = big_gcd_s nm dm in
+    let g = if str_eq g "0" then "1" else g in
+    let nr = big_div_s nm g in let dr = big_div_s dm g in
+    VRat (with_sign sgn nr, dr);
+let mk_rat = fn (n: int) -> fn (d: int) -> mk_rat_s (str_of_int n) (str_of_int d);
+// ruby's k_exact_zero_p: zero AND exact -- 0.0 is zero but not exact, which is
+// why Complex(1, 0.0) is not the real 1.
+let exact_zero_val = fn (v: Val) ->
+  match v with VInt 0 -> true | VRat (n, _) -> str_eq n "0" | _ -> false;
+let rat_to_f = fn (n: str) -> fn (d: str) -> float_of_str n / float_of_str d;
+let rat_add_s = fn (an: str) -> fn (ad: str) -> fn (bn: str) -> fn (bd: str) -> mk_rat_s (big_add_s (big_mul_s an bd) (big_mul_s bn ad)) (big_mul_s ad bd);
+let rat_sub_s = fn (an: str) -> fn (ad: str) -> fn (bn: str) -> fn (bd: str) -> mk_rat_s (big_sub_s (big_mul_s an bd) (big_mul_s bn ad)) (big_mul_s ad bd);
+let rat_mul_s = fn (an: str) -> fn (ad: str) -> fn (bn: str) -> fn (bd: str) -> mk_rat_s (big_mul_s an bn) (big_mul_s ad bd);
+let rat_div_s = fn (an: str) -> fn (ad: str) -> fn (bn: str) -> fn (bd: str) -> mk_rat_s (big_mul_s an bd) (big_mul_s ad bn);
+// compare an/ad vs bn/bd (dens > 0): sign of an*bd - bn*ad.
+let rat_cmp_s = fn (an: str) -> fn (ad: str) -> fn (bn: str) -> fn (bd: str) -> big_cmp_s (big_mul_s an bd) (big_mul_s bn ad);
+// +,-,*,/ when at least one operand is Rational (others Int/Rat/Float).
+let rat_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
+  let vaf = (match va with VFlt _ -> true | _ -> false) in
+  let vbf = (match vb with VFlt _ -> true | _ -> false) in
+  if vaf || vbf then
+    (let x = to_f va in let y = to_f vb in
+     if str_eq op "+" then VFlt (x + y) else if str_eq op "-" then VFlt (x - y)
+     else if str_eq op "*" then VFlt (x * y) else VFlt (x / y))
+  else
+    // ...and a BIGNUM is its decimal string. Without this arm it fell to the
+    // catch-all zero, and every mixed operation answered as if the bignum were
+    // 0: `(10**20) * Rational(1,2)` was (0/1), `+` dropped it entirely. A
+    // wrong ANSWER, silently -- the worst shape a gap can take.
+    let an = (match va with VRat (n, d) -> n | VInt n -> str_of_int n | VBig s -> s | _ -> "0") in
+    let ad = (match va with VRat (n, d) -> d | _ -> "1") in
+    let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | VBig s -> s | _ -> "0") in
+    let bd = (match vb with VRat (n, d) -> d | _ -> "1") in
+    if str_eq op "+" then rat_add_s an ad bn bd
+    else if str_eq op "-" then rat_sub_s an ad bn bd
+    else if str_eq op "*" then rat_mul_s an ad bn bd
+    else rat_div_s an ad bn bd;
+
+// does a magnitude fit in a signed 64-bit int?
+// ⚠ the machine-int range is NOT symmetric: -9223372036854775808 fits and
+//   +9223372036854775808 does not. Testing the MAGNITUDE alone left Int64 MIN
+//   as a bignum whenever it was reached by arithmetic, while the same value
+//   written as a literal (or reached another way) was a VInt -- and a VBig
+//   never equals a VInt here, so `(-2**62) >> -1` and `-2**62 * 2` printed the
+//   same digits and answered false to ==, eql? and equal hashes. One value,
+//   two representations, three symptoms.
+let big_fits = fn (mag: str) -> fn (neg: bool) ->
+  str_len mag < 19
+  || (str_len mag == 19
+      && str_compare mag (if neg then "9223372036854775808" else "9223372036854775807") <= 0);
+// canonicalise a signed decimal string to VInt (if it fits) or VBig.
+let norm_big = fn (sval: str) ->
+  let m = mag_strip (big_mag sval) 0 in
+  let sgn = if str_eq m "0" then 1 else big_sign sval in
+  let canon = with_sign sgn m in
+  if big_fits m (sgn < 0) then VInt (int_of_str canon) else VBig canon;
+// signed decimal of a numeric value.
+let num_dec = fn (v: Val) -> match v with VInt n -> str_of_int n | VBig s -> s | _ -> "0";
+
+// The denominator a Complex's two parts share, and either part scaled onto it.
+// `Complex(1/2r, 1/3r).numerator` is `(3+2i)` over a denominator of 6: the parts
+// are put over their lcm, which is what makes the pair reconstruct the value.
+let rat_den_of = fn (v: Val) -> match v with VRat (n, d) -> d | _ -> "1";
+let rat_num_of = fn (v: Val) -> match v with VRat (n, d) -> n | VInt n -> str_of_int n | VBig b -> b | _ -> "0";
+let cpx_common_den = fn (a: Val) -> fn (b: Val) ->
+  let da = rat_den_of a in let db = rat_den_of b in
+  // lcm(da, db) = da * db / gcd
+  big_div_s (big_mul_s da db) (big_gcd_s da db);
+let num_scale_to = fn (v: Val) -> fn (den: str) ->
+  norm_big (big_mul_s (rat_num_of v) (big_div_s den (rat_den_of v)));
+
+// Rational's rounding family, as ONE function over the four modes. The
+// denominator is positive and the sign lives in the numerator (mk_rat_s
+// normalizes both), and big_divmod_s already floors toward -infinity with the
+// remainder taking the divisor's sign -- which is Ruby's integer division --
+// so `floor` is the division itself and the other three are one step from it.
+// `round` is half AWAY FROM ZERO (ruby: (1/2r).round == 1, (-1/2r).round == -1),
+// which is why it is computed on the magnitude and given the sign back rather
+// than by adding a half and flooring.
+let rat_int_mode = fn (mode: str) -> fn (n: str) -> fn (d: str) ->
+  if str_eq mode "round" then
+    (let sg = big_sign n in
+     let m = big_mag n in
+     let q = big_div_s (big_add_s (big_mul_s m "2") d) (big_mul_s d "2") in
+     with_sign sg q)
+  else
+    (let dm = big_divmod_s n d in
+     let q = (match dm with (q, r) -> q) in
+     let r = (match dm with (q, r) -> r) in
+     if str_eq mode "floor" then q
+     else if str_eq mode "ceil" then (if str_eq r "0" then q else big_add_s q "1")
+     // truncate: toward zero, so a negative with a remainder is one above floor
+     else (if str_eq r "0" then q
+           else if big_sign n < 0 then big_add_s q "1" else q));
+// The precision form. ruby answers an INTEGER for precision <= 0 and a
+// RATIONAL for precision > 0 -- `Rational(1,3).ceil(2)` is `(17/50)`, not 0.34 --
+// so the two cases return different classes on purpose.
+// How many decimal places make n/d EXACT, or -1 when it never terminates:
+// strip the 2s and 5s from the denominator and see whether anything is left.
+// (1/2 needs 1 place, 1/8 needs 3, 1/3 never terminates.) Rounding a rational
+// to more places than it needs cannot change it, which is the only reason
+// `Rational(3,2).round(2_097_171)` can answer at all -- ruby/spec asks for
+// exactly that (issue #6605), and computing 10**2097171 to find out is not an
+// answer, it is a hang.
+let rec rat_strip_25 = fn (d: str) -> fn (c2: int) -> fn (c5: int) ->
+  (match big_divmod_s d "2" with
+   | (q, r) -> if str_eq r "0" then rat_strip_25 q (c2 + 1) c5
+               else (match big_divmod_s d "5" with
+                     | (q5, r5) -> if str_eq r5 "0" then rat_strip_25 q5 c2 (c5 + 1)
+                                   else (d, c2, c5)));
+let rat_exact_digits = fn (d: str) ->
+  match rat_strip_25 d 0 0 with
+  | (rest, c2, c5) -> if str_eq rest "1" then (if c2 > c5 then c2 else c5) else 0 - 1;
+let rat_round_prec = fn (mode: str) -> fn (n: str) -> fn (d: str) -> fn (p: int) ->
+  if p == 0 then norm_big (rat_int_mode mode n d)
+  else if p > 0 then
+    (let need = rat_exact_digits d in
+     if need >= 0 && p >= need then VRat (n, d)
+     else
+       let m = big_pow "10" p "1" in
+       mk_rat_s (rat_int_mode mode (big_mul_s n m) d) m)
+  else
+    (let m = big_pow "10" (0 - p) "1" in
+     norm_big (big_mul_s (rat_int_mode mode n (big_mul_s d m)) m));
+
+// ---- the simplest rational in an interval --------------------------------
+// `rationalize` is NOT to_r: ruby answers the SIMPLEST fraction within the
+// value's precision, so 0.3.rationalize is (3/10) where 0.3.to_r is
+// (5404319552844595/18014398509481984). That is a defined algorithm -- the
+// continued-fraction descent through the Stern-Brocot tree -- not an
+// approximation, which is why it can be implemented exactly instead of guessed.
+//
+// Rationals here are (numerator, denominator) pairs of decimal strings with a
+// positive denominator, so each step is big-integer arithmetic.
+let rq_norm = fn (n: str) -> fn (d: str) ->
+  let g = big_gcd_s (big_mag n) (big_mag d) in
+  let g = (if str_eq g "0" then "1" else g) in
+  let sgn = big_sign n * big_sign d in
+  (with_sign sgn (big_mag (big_div_s n g)), big_mag (big_div_s d g));
+// a/b - c/d, and 1/(a/b)
+let rq_sub = fn (a: (str * str)) -> fn (b: (str * str)) ->
+  (match a with (an, ad) -> (match b with (bn, bd) ->
+    rq_norm (big_sub_s (big_mul_s an bd) (big_mul_s bn ad)) (big_mul_s ad bd)));
+let rq_recip = fn (a: (str * str)) ->
+  (match a with (an, ad) -> rq_norm ad an);
+// ceil(a/b) for a positive denominator: floor plus one unless it divides evenly
+let rq_ceil = fn (a: (str * str)) ->
+  (match a with (an, ad) ->
+    let q = big_div_s an ad in
+    if str_eq (big_mod_s an ad) "0" then q else big_add_s q "1");
+let rq_lt_int = fn (c: str) -> fn (b: (str * str)) ->
+  (match b with (bn, bd) -> big_cmp_s (big_mul_s c bd) bn < 0);
+
+// The interval [a, b] with 0 < a <= b; answers the simplest p/q inside it.
+// This is ruby's nurat_rationalize_internal, term for term.
+let rec rq_simplest = fn (a: (str * str)) -> fn (b: (str * str)) ->
+             fn (p0: str) -> fn (q0: str) -> fn (p1: str) -> fn (q1: str) -> fn (fuel: int) ->
+  let c = rq_ceil a in
+  if fuel <= 0 || rq_lt_int c b then
+    (big_add_s (big_mul_s c p1) p0, big_add_s (big_mul_s c q1) q0)
+  else
+    let k = big_sub_s c "1" in
+    let p2 = big_add_s (big_mul_s k p1) p0 in
+    let q2 = big_add_s (big_mul_s k q1) q0 in
+    let a2 = rq_recip (rq_sub b (k, "1")) in
+    let b2 = rq_recip (rq_sub a (k, "1")) in
+    rq_simplest a2 b2 p1 q1 p2 q2 (fuel - 1);
+
+// Drive rq_simplest over a signed interval: the descent needs 0 < a <= b, so
+// a wholly negative interval is searched mirrored and the sign put back.
+let rq_answer = fn (bounds: ((str * str) * (str * str))) ->
+  (match bounds with (lo, hi) ->
+    let neg = (match lo with (n, d) -> big_sign n < 0) in
+    let hineg = (match hi with (n, d) -> big_sign n < 0) in
+    // an interval that spans zero contains 0, and 0 is the simplest thing in it
+    if neg && (if hineg then false else true) then mk_rat_s "0" "1"
+    else if neg then
+      (let lo2 = (match hi with (n, d) -> (big_neg_s n, d)) in
+       let hi2 = (match lo with (n, d) -> (big_neg_s n, d)) in
+       match rq_simplest lo2 hi2 "0" "1" "1" "0" 4096 with
+       | (pn, qd) -> mk_rat_s (big_neg_s pn) qd)
+    else (match rq_simplest lo hi "0" "1" "1" "0" 4096 with
+          | (pn, qd) -> mk_rat_s pn qd));
+
+// ---- integer shifts, total over the int64 boundary ----------------------
+// A shift is arithmetic: `x << n` is x * 2**n, `x >> n` is x floor-divided by
+// 2**n. big_divmod_s already floors, which is what makes the negative cases
+// (`-1 >> 1 == -1`) agree with ruby for free.
+//
+// Going through the bignum path is what makes them TOTAL. Before this,
+// `(2**64) >> 3` raised "type error" -- and `1 << 64` returned **0**, and
+// `1 << 63` returned a negative number, because shl_int wraps at 64 bits.
+// The silent wrong answer is the worse of the two: nothing in a program that
+// stays under 2**63 can ever show it.
+let two_pow_s = fn (n: int) -> big_pow "2" n "1";
+let shl_big = fn (va: Val) -> fn (n: int) -> norm_big (big_mul_s (num_dec va) (two_pow_s n));
+let shr_big = fn (va: Val) -> fn (n: int) -> norm_big (big_div_s (num_dec va) (two_pow_s n));
+// A shift WIDER THAN THE NUMBER needs no power of two at all: everything is
+// shifted out. ruby's >> floors, so a negative value lands on -1 rather than 0.
+// Building 2^(2**40) in order to divide by it is not an answer -- and it is
+// exactly what core/integer/{left,right}_shift_spec were killed at the memory
+// cap for: every one of those examples shifts by 2**40 and expects 0 or -1.
+// The bound is the DIGIT COUNT: a d-digit magnitude is under 10^d, so it has
+// fewer than 4d + 8 bits, and no exact bit_length is needed to decide this.
+let shift_swallows_all = fn (mag: str) -> fn (n: int) -> n >= 4 * str_len mag + 8;
+let shr_val = fn (va: Val) -> fn (n: int) ->
+  let d = num_dec va in
+  let mag = big_mag d in
+  if str_eq mag "0" then VInt 0
+  else if shift_swallows_all mag n then (if big_sign d < 0 then VInt (0 - 1) else VInt 0)
+  else shr_big va n;
+// ...and shifting ZERO left by any width is zero, whatever the width costs.
+let shl_val = fn (va: Val) -> fn (n: int) ->
+  if str_eq (big_mag (num_dec va)) "0" then VInt 0 else shl_big va n;
+
+// The native fast path, guarded by a ROUND TRIP rather than by a bit count:
+// shifting back has to give the operand again. `int_bit_length` is defined
+// further down the file, and a hand-written bound would be a claim about
+// shl_int's overflow rather than a check of it.
+let shl_int_fits = fn (x: int) -> fn (n: int) ->
+  n >= 0 && n < 62 && shr_int (shl_int x n) n == x;
+// the exact numerator/denominator of a value, as decimal strings. A float is
+// doubled until it is integral, which is exact: 2.54 becomes
+// 2.54*2^k over 2^k. Beyond 62 doublings the numerator would leave int64,
+// so those (subnormals) fall back to truncation.
+let rec flt_rat_parts = fn (f: float) -> fn (k: int) ->
+  // A float of magnitude 2**53 or more is ALREADY a whole number, so its exact
+  // pair is (itself, 1). The loop below asks `int_of_float` whether the value
+  // is whole, and that SATURATES above 2**63: for 1.0e30 the test never
+  // succeeded, the doubling ran to its fuel limit, and `1.0e30.to_r` answered
+  // (9223372036854775807/4611686018427387904) -- Int64 max over 2**62.
+  // ...FINITE ones. Infinity passes the magnitude test, and flt_to_big_s
+  // halves its argument until it fits a machine int, which never happens:
+  // core/float/numerator_spec and denominator_spec hung.
+  if (f - f) == 0.0 && (f >= 9007199254740992.0 || f <= (0.0 - 9007199254740992.0)) then (flt_to_big_s f, "1")
+  else if k >= 62 || f == float_of_int (int_of_float f) then (str_of_int (int_of_float f), big_pow "2" k "1")
+  else flt_rat_parts (f * 2.0) (k + 1);
+// a value as an exact (numerator, denominator) pair
+let rat_pair_of = fn (v: Val) -> match v with
+  | VRat (n, d) -> (n, d)
+  | VInt n -> (str_of_int n, "1")
+  | VBig b -> (b, "1")
+  | VFlt f -> flt_rat_parts f 0
+  | _ -> ("0", "1");
+let flt_pair = fn (f: float) -> flt_rat_parts f 0;
+// the midpoint of two exact rationals, exactly
+let rat_mid = fn (a: (str * str)) -> fn (b: (str * str)) ->
+  (match a with (an, ad) -> (match b with (bn, bd) ->
+    rq_norm (big_add_s (big_mul_s an bd) (big_mul_s bn ad)) (big_mul_s (big_mul_s ad bd) "2")));
+
+// "3/4" / "2.5" / "7" — the forms Rational() accepts as a string.
+let str_rat_parts = fn (s: str) ->
+  let i = str_index_of s "/" in
+  if i >= 0 then (str_trim (substring s 0 i), str_trim (substring s (i + 1) (str_len s)))
+  else (let j = str_index_of s "." in
+        if j < 0 then (str_trim s, "1")
+        else let ip = substring s 0 j in
+             let fp = substring s (j + 1) (str_len s) in
+             (ip ++ fp, big_pow "10" (str_len fp) "1"));
+let rat_parts = fn (v: Val) ->
+  match v with
+  | VInt n -> (str_of_int n, "1")
+  | VBig s -> (s, "1")
+  | VRat (n, d) -> (n, d)
+  | VFlt f -> flt_rat_parts f 0
+  | VStr h -> str_rat_parts (sget h)
+  | _ -> ("0", "1");
+// parity of a bignum from its last decimal digit.
+let big_even = fn (s: str) ->
+  let c = char_at s (str_len s - 1) in
+  str_eq c "0" || str_eq c "2" || str_eq c "4" || str_eq c "6" || str_eq c "8";
+// The one machine int whose negation overflows: the range is not symmetric.
+// ⚠ written as a comparison with the minimum, NOT as `a < 0 && 0 - a < 0`:
+//   signed overflow is undefined in C, and the optimiser is entitled to fold
+//   that test to false -- the guard would compile away and never fire.
+let rec __signbit = fn (v: int) -> if v < 0 then v else __signbit (bit_shl v 1);
+let int_min_v = __signbit 1;
+let int_neg_overflows = fn (a: int) -> a == int_min_v;
+// negate / sign / abs on a boxed numeric value (used by Complex components).
+let num_neg = fn (v: Val) -> match v with
+  | VInt n -> (if int_neg_overflows n then norm_big (big_neg_s (str_of_int n)) else VInt (0 - n))
+  | VFlt f -> VFlt (f * (0.0 - 1.0))
+  | VBig s -> norm_big (big_neg_s s) | VRat (n, d) -> VRat (big_neg_s n, d) | _ -> v;
+let num_isneg = fn (v: Val) -> match v with
+  | VInt n -> n < 0 | VFlt f -> f < 0.0 | VBig s -> big_sign s < 0 | VRat (n, d) -> big_sign n < 0 | _ -> false;
+let num_abs = fn (v: Val) -> if num_isneg v then num_neg v else v;
+
+// +,-,* on two boxed numerics: exact int when both are VInt, else via float.
+let num_bin = fn (o: str) -> fn (x: Val) -> fn (y: Val) ->
+  // a BIGNUM keeps its digits: this fell through to `to_f` on both sides, so
+  // a Complex with a bignum component came out in floats (and lost the low
+  // twenty digits). Integers are exact in ruby however big they are.
+  if (match x with VBig _ -> true | _ -> false) || (match y with VBig _ -> true | _ -> false) then
+    (if (match x with VFlt _ -> true | _ -> false) || (match y with VFlt _ -> true | _ -> false)
+     then (let fa = to_f x in let fb = to_f y in
+           if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb))
+     else
+       let a9 = num_dec x in
+       let b9 = num_dec y in
+       if str_eq o "+" then norm_big (big_add_s a9 b9)
+       else if str_eq o "-" then norm_big (big_sub_s a9 b9)
+       else norm_big (big_mul_s a9 b9))
+  else
+  match x with
+  | VInt a -> (match y with
+     | VInt b -> if str_eq o "+" then VInt (a + b) else if str_eq o "-" then VInt (a - b) else VInt (a * b)
+     | _ -> let fa = float_of_int a in let fb = to_f y in
+            if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb))
+  | _ -> let fa = to_f x in let fb = to_f y in
+         if str_eq o "+" then VFlt (fa + fb) else if str_eq o "-" then VFlt (fa - fb) else VFlt (fa * fb);
+// component arithmetic inside a Complex: Rational components stay exact
+// (num_bin would fall back to float).
+let cpx_comp = fn (op: str) -> fn (x: Val) -> fn (y: Val) ->
+  if (match x with VRat _ -> true | _ -> false) || (match y with VRat _ -> true | _ -> false)
+  then rat_arith op x y
+  else num_bin op x y;
+// component quo for Complex division: exact (Rational) for non-floats, and
+// a den-1 Rational canonicalizes back to an integer (CRuby's f_divide does
+// this — bare 2.quo(2) stays (1/1), but Complex(4,2)/2 is (2+1i)).
+let cpx_quo = fn (x: Val) -> fn (y: Val) ->
+  if (match x with VFlt _ -> true | _ -> false) || (match y with VFlt _ -> true | _ -> false)
+  then VFlt (to_f x / to_f y)
+  else
+    let xr = (match x with VRat _ -> x | VInt n -> mk_rat n 1 | VBig b -> mk_rat_s b "1" | v -> v) in
+    (match rat_arith "/" xr y with
+     | VRat (n, d) -> if str_eq d "1" then norm_big n else VRat (n, d)
+     | v -> v);
+// +,-,*,/ when at least one operand is Complex (components are boxed numerics).
+let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
+  let ar = (match va with VCpx (r, i) -> r | v -> v) in
+  let ai = (match va with VCpx (r, i) -> i | _ -> VInt 0) in
+  let br = (match vb with VCpx (r, i) -> r | v -> v) in
+  let bi = (match vb with VCpx (r, i) -> i | _ -> VInt 0) in
+  if str_eq op "+" then VCpx (cpx_comp "+" ar br, cpx_comp "+" ai bi)
+  else if str_eq op "-" then VCpx (cpx_comp "-" ar br, cpx_comp "-" ai bi)
+  else if str_eq op "*" then VCpx (cpx_comp "-" (cpx_comp "*" ar br) (cpx_comp "*" ai bi), cpx_comp "+" (cpx_comp "*" ar bi) (cpx_comp "*" ai br))
+  else if str_eq op "/" then
+    (match bi with
+     // a real divisor divides each component independently (CRuby does the
+     // same, so an integer component stays exact next to a float one).
+     | VInt 0 -> VCpx (cpx_quo ar br, cpx_quo ai br)
+     | _ ->
+       // (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c^2+d^2), per-component quo.
+       let den = cpx_comp "+" (cpx_comp "*" br br) (cpx_comp "*" bi bi) in
+       VCpx (cpx_quo (cpx_comp "+" (cpx_comp "*" ar br) (cpx_comp "*" ai bi)) den,
+             cpx_quo (cpx_comp "-" (cpx_comp "*" ai br) (cpx_comp "*" ar bi)) den))
+  else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: complex operator unsupported")) in fail "mere-ruby: complex operator unsupported");
+// x ** y for a Complex in general: exp(y * ln x), with ln(a+bi) =
+// ln|x| + i*arg(x). Both operands become Complex first, and the answer is a
+// Complex of floats -- the same shape ruby gives.
+let cpx_pow_gen = fn (x: Val) -> fn (y: Val) ->
+  let (xr, xi) = (match x with VCpx (r, i) -> (to_f r, to_f i) | v -> (to_f v, 0.0)) in
+  let (yr, yi) = (match y with VCpx (r, i) -> (to_f r, to_f i) | v -> (to_f v, 0.0)) in
+  let lnr = log (hypot xr xi) in
+  let arg = atan2 xi xr in
+  // (yr + yi i) * (lnr + arg i)
+  let er = yr * lnr - yi * arg in
+  let ei = yr * arg + yi * lnr in
+  let m = exp er in
+  VCpx (VFlt (m * cos ei), VFlt (m * sin ei));
+
+// integer powers of a Complex (negative exponents via the reciprocal).
+let rec cpx_pow = fn (base: Val) -> fn (n: int) ->
+  if n == 0 then VCpx (VInt 1, VInt 0)
+  else if n < 0 then cpx_arith "/" (VCpx (VInt 1, VInt 0)) (cpx_pow base (0 - n))
+  else cpx_arith "*" base (cpx_pow base (n - 1));
+// int add/sub/mul that promote to bignum exactly on overflow. The checks
+// are done BEFORE the operation (signed overflow is UB in C and clang -O2
+// would optimise away any after-the-fact `r < 0` test).
+// Derived from the backend's own int rather than written down. The literal for
+// 2^63-1 cannot appear in source anyway (the compiler's int is 63 bits), and
+// hardcoding it was wrong on two of the four backends: on the interpreter, whose
+// int IS 63 bits, `a > int_max - b` could not fire for values it cannot hold, so
+// overflow above 2^62 went undetected and stayed a machine int instead of
+// promoting. And on a 32-bit target the literal does not compile at all.
+//
+// Shifting a 1 left until it goes negative finds the sign bit, whatever the
+// width; complementing it gives the largest value. The boundary is not
+// observable from Ruby -- Integer is arbitrary precision and 2.4 merged Fixnum
+// into it -- so this only moves where the promotion to a bignum happens.
+let int_min = int_min_v;
+let int_max = bit_not int_min;
+let add_int_ov = fn (a: int) -> fn (b: int) ->
+  if (b > 0 && a > int_max - b) || (b < 0 && a < int_min - b)
+  then norm_big (big_add_s (str_of_int a) (str_of_int b)) else VInt (a + b);
+let sub_int_ov = fn (a: int) -> fn (b: int) ->
+  if (b < 0 && a > int_max + b) || (b > 0 && a < int_min + b)
+  then norm_big (big_sub_s (str_of_int a) (str_of_int b)) else VInt (a - b);
+let mul_int_ov = fn (a: int) -> fn (b: int) ->
+  if a == 0 || b == 0 then VInt 0
+  else
+    let ovf = if a > 0 then (if b > 0 then a > int_max / b else b < int_min / a)
+              else (if b > 0 then a < int_min / b else b < int_max / a) in
+    if ovf then norm_big (big_mul_s (str_of_int a) (str_of_int b)) else VInt (a * b);
+
+// The class name for a comparison failure's message. `class_name` is defined
+// much later in the file and this is needed here; an object cannot be named
+// precisely without `world`, which a value-level comparison does not have, so it
+// is "Object" -- one side named exactly is enough to see what was compared.
+// Regexp#inspect wraps the source in slashes, so a slash INSIDE it has to be
+// escaped: `/\/foo/.inspect` is "/\\/foo/" and read back as the same pattern.
+// One already escaped is left alone.
+let rec rx_esc_slashes = fn (p: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len p then acc
+  else
+    let c = char_at p i in
+    if str_eq c "\\" && i + 1 < str_len p
+    then rx_esc_slashes p (i + 2) (acc ++ c ++ char_at p (i + 1))
+    else if str_eq c "/" then rx_esc_slashes p (i + 1) (acc ++ "\\/")
+    else rx_esc_slashes p (i + 1) (acc ++ c);
+
+let cmp_type_name = fn (v: Val) ->
+  (match v with
+   | VInt _ -> "Integer" | VBig _ -> "Integer" | VFlt _ -> "Float"
+   | VRat (_, _) -> "Rational" | VCpx (_, _) -> "Complex"
+   | VStr _ -> "String" | VSym _ -> "Symbol" | VArr _ -> "Array" | VHsh _ -> "Hash"
+   | VNil -> "NilClass" | VBool b -> (if b then "TrueClass" else "FalseClass")
+   | VProc _ -> "Proc" | VClass _ -> "Class" | VExc (c, _) -> c | VMain -> "Object"
+   | _ -> "Object");
+// ruby raises ArgumentError here, naming both sides. This used to leak an
+// interpreter-internal `fail` ("comparison of incompatible types"), which became
+// a bare StandardError with no idea what was compared -- the `<` family already
+// raised the right thing, so only the paths that call this one (sort, min, max)
+// were affected, and they are exactly the ones where knowing the types matters.
+// ...and the OTHER side is named by VALUE when ruby can write it as one: nil,
+// true, false, a Symbol and a machine-word integer are what CRuby's rb_cmperr
+// inspects, everything else by its class ("comparison of Integer with String
+// failed"). Nothing was, so `[nil, 1].sort` read "with Integer" where every ruby
+// reads "with 1". A Float is inspected by ruby too and is named by class here:
+// there is no float formatter this early in the file, and the `<` family (which
+// has one) already answers the value.
+let cmp_other_name = fn (v: Val) ->
+  (match v with
+   | VNil -> "nil"
+   | VBool b -> (if b then "true" else "false")
+   | VInt n -> str_of_int n
+   | VSym sy -> ":" ++ sy
+   | _ -> cmp_type_name v);
+let cmp_fail = fn (va: Val) -> fn (vb: Val) ->
+  prim_raise "ArgumentError" ("comparison of " ++ cmp_type_name va ++ " with " ++ cmp_other_name vb ++ " failed");
+let rec cmp_vals = fn (va: Val) -> fn (vb: Val) ->
+  // bignum (or bignum vs int): compare exact decimal values, not floats.
+  if (match va with VBig _ -> true | _ -> false) && (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
+     || (match vb with VBig _ -> true | _ -> false) && (match va with VInt _ -> true | _ -> false)
+  then big_cmp_s (num_dec va) (num_dec vb)
+  // Rational vs Rational/Int: exact cross-multiply compare.
+  else if ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false))
+          && (match va with VRat _ -> true | VInt _ -> true | _ -> false)
+          && (match vb with VRat _ -> true | VInt _ -> true | _ -> false) then
+    (let an = (match va with VRat (n, d) -> n | VInt n -> str_of_int n | _ -> "0") in
+     let ad = (match va with VRat (n, d) -> d | _ -> "1") in
+     let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | _ -> "0") in
+     let bd = (match vb with VRat (n, d) -> d | _ -> "1") in
+     rat_cmp_s an ad bn bd)
+  // Integer vs Float orders on EXACT values (ruby's rb_integer_float_cmp).
+  // Both sides went through to_f, which rounds the integer:
+  // `4611686018427387903 <=> 4611686018427387903.0` answered 0 where ruby says
+  // -1, and with it `<`, `<=`, `>` and `>=` all read the wrong way round.
+  // ⚠ an INFINITE float is above (or below) every integer, however big --
+  //   and converting a 309-digit integer to a double OVERFLOWS to the same
+  //   infinity, so `Float::INFINITY <=> Float::MAX.to_i * 2` answered 0.
+  else if (match va with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match vb with VFlt f9 -> flt_is_infinite f9 | _ -> false) then
+    (match vb with VFlt f9 -> (if f9 > 0.0 then 0 - 1 else 1) | _ -> 0)
+  else if (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match va with VFlt f9 -> flt_is_infinite f9 | _ -> false) then
+    (match va with VFlt f9 -> (if f9 > 0.0 then 1 else 0 - 1) | _ -> 0)
+  else if (match va with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match vb with VFlt f9 -> flt_cmp_exact_needed f9 | _ -> false) then
+    (match vb with VFlt f9 -> int_flt_cmp_s (num_dec va) f9 | _ -> 0)
+  else if (match vb with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match va with VFlt f9 -> flt_cmp_exact_needed f9 | _ -> false) then
+    (match va with VFlt f9 -> 0 - int_flt_cmp_s (num_dec vb) f9 | _ -> 0)
+  else if is_num va && is_num vb then
+    (match va with
+     | VInt x ->
+       (match vb with
+        | VInt y -> if x < y then 0 - 1 else if x > y then 1 else 0
+        | _ ->
+          let fx = to_f va in let fy = to_f vb in
+          if fx < fy then 0 - 1 else if fy < fx then 1 else 0)
+     | _ ->
+       let fx = to_f va in let fy = to_f vb in
+       if fx < fy then 0 - 1 else if fy < fx then 1 else 0)
+  else
+    match va with
+    // `nil <=> nil` is 0 in ruby, and `true <=> true` likewise, so a sort whose
+    // keys are all nil is a stable no-op rather than an error -- which is what
+    // `enum.sort_by.to_a` is, since materialising an enumerator drives the source
+    // with a block that answers nil. Mixed pairs still fail, as they do in ruby.
+    | VNil -> (match vb with VNil -> 0 | _ -> cmp_fail va vb)
+    | VBool x ->
+      (match vb with
+       | VBool y -> (if x then (if y then 0 else cmp_fail va vb) else (if y then cmp_fail va vb else 0))
+       | _ -> cmp_fail va vb)
+    | VStr x -> let x = sget x in
+      (match vb with
+       | VStr y -> let y = sget y in str_compare x y
+       | _ -> cmp_fail va vb)
+    // two Times order by their instant (recorded in time_ord when built)
+    | VObj x ->
+      (match vb with
+       | VObj y when map_has time_inst (str_of_int x) && map_has time_inst (str_of_int y) ->
+         (let a1 = map_get time_inst (str_of_int x) in
+          let b1 = map_get time_inst (str_of_int y) in
+          if a1 < b1 then 0 - 1 else if b1 < a1 then 1 else 0)
+       | _ -> cmp_fail va vb)
+    | VSym x -> (match vb with VSym y -> str_compare x y | _ -> cmp_fail va vb)
+    // Array <=> Array: element-wise, then by length (Ruby semantics).
+    // Two self-referential arrays compared element-wise recursed forever. When
+    // the SAME pair comes round again the walk has proved them equal so far, so
+    // the cycle compares equal -- which is the answer ruby gives.
+    | VArr x ->
+      (match vb with
+       | VArr y ->
+         let k = "c" ++ str_of_int x ++ ":" ++ str_of_int y in
+         if map_has cyc_seen k then 0
+         else
+           let _ = map_set cyc_seen k 1 in
+           let r = arr_cmp (deref x) (deref y) in
+           let _ = map_delete cyc_seen k in
+           r
+       | _ -> cmp_fail va vb)
+    | _ -> cmp_fail va vb
+// would cmp_vals fail on this pair? (the < family raises ArgumentError)
+and cmp_incompatible = fn (va: Val) -> fn (vb: Val) ->
+  // a Complex is a Numeric with no ORDER: it is not comparable with anything,
+  // including another Complex.
+  if (match va with VCpx (_, _) -> true | _ -> false)
+     || (match vb with VCpx (_, _) -> true | _ -> false) then true
+  else if is_num va && is_num vb then false
+  else
+    (match va with
+     | VStr _ -> (match vb with VStr _ -> false | _ -> true)
+     | VSym _ -> (match vb with VSym _ -> false | _ -> true)
+     | VArr _ -> (match vb with VArr _ -> false | _ -> true)
+     | VRat (_, _) -> (if is_num vb then false else true)
+     | _ -> true)
+
+and arr_cmp = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> (match ys with Nil -> 0 | _ -> 0 - 1)
+  | Cons (h, t) ->
+    (match ys with
+     | Nil -> 1
+     | Cons (h2, t2) -> let c = cmp_vals h h2 in if c == 0 then arr_cmp t t2 else c);
+
+let rec list_append = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with Nil -> ys | Cons (h, t) -> Cons (h, list_append t ys);
+
+// a deterministic per-value hash (equal values -> equal hash). Ruby's own
+// hash is process-randomised, so only intra-run consistency is required.
+let rec val_hash = fn (v: Val) ->
+  match v with
+  | VInt n -> n
+  | VBig s -> str_hash_go s 0 7
+  | VStr h -> str_hash_go (sget h) 0 7
+  | VSym s -> str_hash_go s 0 5381
+  | VBool b -> if b then 1 else 0
+  | VNil -> 0
+  | VFlt f -> int_of_float f
+  // A self-referential array used to recurse until the stack died. The cycle
+  // contributes a constant: ruby only requires that equal values hash equal,
+  // and two arrays that cycle at the same position agree on it.
+  | VArr id ->
+    // the same collapse-to-a-constant rule the hash arm uses: a cycle detected
+    // at the ARRAY level has to raise the flag too, or a hash that cycles
+    // THROUGH an array (`h[:x] = [h]`) answers a different number per wrapping.
+    if map_has cyc_seen ("a" ++ str_of_int id) then (let _ = map_set cyc_flag "f" 1 in 4919)
+    else
+      let _ = map_set cyc_seen ("a" ++ str_of_int id) 1 in
+      let r = arr_hash_go (deref id) 17 in
+      let _ = map_delete cyc_seen ("a" ++ str_of_int id) in
+      r
+  // an object with no #hash of its own hashes by IDENTITY, so two distinct
+  // objects land in different buckets. Every object answered 0, which made
+  // uniq compare unrelated objects with #eql? and dedup them.
+  // (A PROC deliberately does NOT hash by id: `proc(&body)` hands back a fresh
+  // proc here where ruby hands back `body` itself, so an id-based hash would
+  // make Proc#hash unstable -- a distinction this runtime does not keep.)
+  // a Hash hashes ORDER-INSENSITIVELY: each pair contributes, and the pairs
+  // are combined with a commutative operation so `{a: 1, b: 2}` and
+  // `{b: 2, a: 1}` agree. Every hash answered 0.
+  | VHsh hid ->
+    (if map_has cyc_seen ("h" ++ str_of_int hid) then (let _ = map_set cyc_flag "f" 1 in 5077)
+     else
+       (let _ = map_set cyc_seen ("h" ++ str_of_int hid) 1 in
+        let rec go = fn (ys: Val list) -> fn (acc: int) ->
+          (match ys with
+           | Cons (k, Cons (v, t)) ->
+             go t (floor_mod (acc + floor_mod ((val_hash k * 31 + val_hash v) * 7919 + 13) 1000000007) 1000000007)
+           | _ -> acc) in
+        let r = go (hderef hid) 271 in
+        let _ = map_delete cyc_seen ("h" ++ str_of_int hid) in
+        r))
+  // 0x9E3779B1 -- the golden-ratio multiplier -- has its top bit set, so as one
+  // literal it does not fit a signed 32-bit int and one backend has one.
+  // Assembled from halves it is the same 32 bits on every width. The product
+  // wraps differently at 32 bits than at 64, so an object's #hash differs
+  // between backends; Ruby does not promise that value is stable anywhere.
+  | VObj oid -> floor_mod (oid * bit_or (bit_shl 0x9E37 16) 0x79B1 + 11) 1000000007
+  // A Range had no arm and fell to 0, so every range hashed the same and
+  // core/range/hash_spec's "is not 0" was the whole finding. Equal ranges have
+  // to hash equal, so it comes from the bounds and the exclusion -- and the
+  // exclusion has to be IN it: (1..2) and (1...2) are different ranges.
+  | VRange (lo, hi, excl) ->
+    floor_mod (val_hash lo * 31 + val_hash hi * 7 + (if excl then 1 else 2) + 4001) 1000000007
+  // A Rational hashes from its two halves: it had no arm and fell to 0, so
+  // every Rational was the same hash key.
+  | VRat (rn, rd) -> floor_mod (str_hash_go rn 0 7 * 31 + str_hash_go rd 0 11 + 5003) 1000000007
+  | VCpx (cre, cim) -> floor_mod (val_hash cre * 31 + val_hash cim * 7 + 6007) 1000000007
+  // A Regexp is its SOURCE AND ITS OPTIONS: /x/ and /x/i are different
+  // patterns, and hashing only the source made them one key.
+  | VRegex (sp, fl, _) ->
+    floor_mod (str_hash_go sp 0 7 * 31
+               + (if str_contains fl "i" then 1 else 0)
+               + (if str_contains fl "x" then 2 else 0)
+               + (if str_contains fl "m" then 4 else 0) + 9001) 1000000007
+  | _ -> 0
+and str_hash_go = fn (s: str) -> fn (i: int) -> fn (acc: int) ->
+  if i >= str_len s then acc
+  else str_hash_go s (i + 1) (floor_mod (acc * 31 + ord (char_at s i)) 1000000007)
+and arr_hash_go = fn (xs: Val list) -> fn (acc: int) ->
+  match xs with Nil -> acc | Cons (h, t) -> arr_hash_go t (floor_mod (acc * 31 + val_hash h) 1000000007);
+
+// Does this list have an array element? flatten! answers nil when there was
+// nothing nested to flatten -- and LENGTH cannot tell: [[1],[2]] flattens to
+// [1,2], same length, different value.
+let rec has_arr_elem = fn (xs: Val list) ->
+  match xs with
+  | Nil -> false
+  | Cons (VArr _, _) -> true
+  | Cons (_, t) -> has_arr_elem t;
+
+// flatten one level: array elements are spliced, others kept (for flat_map).
+let rec flatten1 = fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> (match h with VArr id -> list_append (deref id) (flatten1 t) | _ -> Cons (h, flatten1 t));
+
+let rec val_member = fn (xs: Val list) -> fn (v: Val) ->
+  match xs with Nil -> false | Cons (h, t) -> rb_eq h v || val_member t v;
+let rec val_remove = fn (xs: Val list) -> fn (v: Val) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if rb_eq h v then val_remove t v else Cons (h, val_remove t v);
+// append ys to acc keeping first occurrences only (Array#| semantics).
+let rec val_dedup_into = fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h, t) -> if val_member acc h then val_dedup_into t acc else val_dedup_into t (list_append acc (Cons (h, Nil)));
+// Array#- : keep the elements the other side does not have.
+let rec val_difference = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if val_member ys h then val_difference t ys else Cons (h, val_difference t ys);
+let rec val_intersect = fn (xs: Val list) -> fn (ys: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) -> if val_member ys h then Cons (h, val_intersect t ys) else val_intersect t ys;
+
+// native 64-bit bitwise (two's-complement, so negatives are correct) — the
+// mere builtins map straight to C & | ^.
+// ---- MT19937 --------------------------------------------------------------
+// Transcribed from CRuby's missing/mt19937.c. ruby/spec asks for the exact
+// SEQUENCE a seed produces -- core/kernel/srand wants 0.640674151 out of
+// srand(10), core/array/shuffle wants a named permutation -- so "some
+// reproducible generator" is not enough; it has to be this one.
+//
+// State lives in a map keyed "<gid>:<i>" so several generators can exist at
+// once: gid 0 is the one Kernel#rand and srand share, and every Random
+// instance gets its own.
+let mt_state = map_new ();
+let mt_pos = map_new ();      // gid -> how many words of the block are used
+let mt_seeded = map_new ();   // gid -> "1" once initialised
+let mt_seed_of = map_new ();  // gid -> the seed it was given, as DECIMAL TEXT so a
+                              // bignum survives without a second Val-valued global
+let mt_next_gid = map_new (); // one counter, so each Random instance gets its own stream
+let mt_n = 624;
+let mt_m = 397;
+let mt_mask32 = 4294967295;
+let mt_get = fn (g: int) -> fn (i: int) ->
+  (let k = str_of_int g ++ ":" ++ str_of_int i in if map_has mt_state k then map_get mt_state k else 0);
+let mt_set = fn (g: int) -> fn (i: int) -> fn (v: int) ->
+  (let _ = map_set mt_state (str_of_int g ++ ":" ++ str_of_int i) v in ());
+// init_genrand: state[0] = s, then a Knuth LCG down the array.
+let mt_init_genrand = fn (g: int) -> fn (s: int) ->
+  (let _ = mt_set g 0 (bit_and s mt_mask32) in
+   let rec go = fn (j: int) ->
+     (if j >= mt_n then ()
+      else
+        (let prev = mt_get g (j - 1) in
+         let v = 1812433253 * (bit_xor prev (bit_shr prev 30)) + j in
+         let _ = mt_set g j (bit_and v mt_mask32) in
+         go (j + 1))) in
+   let _ = go 1 in
+   // CRuby leaves left=1 / next=state+N, which makes the FIRST draw run
+   // next_state before reading. pos = mt_n says the same thing.
+   let _ = map_set mt_pos (str_of_int g) mt_n in
+   let _ = map_set mt_seeded (str_of_int g) 1 in ());
+// init_by_array: the multi-word seeding, for a seed wider than 32 bits.
+let mt_init_by_array = fn (g: int) -> fn (key: int list) -> fn (klen: int) ->
+  (let _ = mt_init_genrand g 19650218 in
+   let kget = fn (j: int) ->
+     (let rec nth = fn (xs: int list) -> fn (k: int) ->
+        (match xs with Nil -> 0 | Cons (h, t) -> (if k <= 0 then h else nth t (k - 1))) in
+      nth key j) in
+   let rec go1 = fn (k: int) -> fn (i: int) -> fn (j: int) ->
+     (if k <= 0 then (i, j)
+      else
+        (let prev = mt_get g (i - 1) in
+         let v = bit_xor (mt_get g i) ((bit_xor prev (bit_shr prev 30)) * 1664525) + kget j + j in
+         let _ = mt_set g i (bit_and v mt_mask32) in
+         let i2 = i + 1 in let j2 = j + 1 in
+         let i3 = (if i2 >= mt_n then (let _ = mt_set g 0 (mt_get g (mt_n - 1)) in 1) else i2) in
+         let j3 = (if j2 >= klen then 0 else j2) in
+         go1 (k - 1) i3 j3)) in
+   let (i4, _) = go1 (if mt_n > klen then mt_n else klen) 1 0 in
+   let rec go2 = fn (k: int) -> fn (i: int) ->
+     (if k <= 0 then ()
+      else
+        (let prev = mt_get g (i - 1) in
+         let v = bit_xor (mt_get g i) ((bit_xor prev (bit_shr prev 30)) * 1566083941) - i in
+         let _ = mt_set g i (bit_and v mt_mask32) in
+         let i2 = i + 1 in
+         let i3 = (if i2 >= mt_n then (let _ = mt_set g 0 (mt_get g (mt_n - 1)) in 1) else i2) in
+         go2 (k - 1) i3)) in
+   let _ = go2 (mt_n - 1) i4 in
+   let _ = mt_set g 0 2147483648 in ());
+// next_state: the twist. MATRIX_A = 0x9908b0df.
+let mt_next_state = fn (g: int) ->
+  (let twist = fn (u: int) -> fn (v: int) ->
+     bit_xor (bit_shr (bit_or (bit_and u 2147483648) (bit_and v 2147483647)) 1)
+             (if bit_and v 1 == 1 then 2567483615 else 0) in
+   let rec go = fn (i: int) ->
+     (if i >= mt_n then ()
+      else
+        (let j = (if i + mt_m < mt_n then i + mt_m else i + mt_m - mt_n) in
+         let nx = (if i + 1 < mt_n then i + 1 else 0) in
+         let _ = mt_set g i (bit_xor (mt_get g j) (twist (mt_get g i) (mt_get g nx))) in
+         go (i + 1))) in
+   // ⚠ the twist reads state[i+1] which the NEXT iteration overwrites, so this
+   // has to run front to back exactly as the C does -- CRuby's three loops are
+   // one wrapped walk, and the last element mixes with state[0] again.
+   let _ = go 0 in
+   let _ = map_set mt_pos (str_of_int g) 0 in ());
+let mt_genrand_int32 = fn (g: int) ->
+  (let _ = (if map_has mt_seeded (str_of_int g) then () else mt_init_genrand g 5489) in
+   let pos = (if map_has mt_pos (str_of_int g) then map_get mt_pos (str_of_int g) else mt_n) in
+   let _ = (if pos >= mt_n then mt_next_state g else ()) in
+   let pos2 = map_get mt_pos (str_of_int g) in
+   let y0 = mt_get g pos2 in
+   let _ = map_set mt_pos (str_of_int g) (pos2 + 1) in
+   // tempering
+   let y1 = bit_xor y0 (bit_shr y0 11) in
+   let y2 = bit_xor y1 (bit_and (bit_and (y1 * 128) mt_mask32) 2636928640) in
+   let y3 = bit_xor y2 (bit_and (bit_and (y2 * 32768) mt_mask32) 4022730752) in
+   bit_xor y3 (bit_shr y3 18));
+// The seed as CRuby packs it: 32-bit words, least significant first. One word
+// means init_genrand; more means init_by_array -- the two seedings give
+// different streams, so which one runs is part of reproducing the sequence.
+let rec mt_seed_words = fn (mag: str) ->
+  (match big_divmod_s mag "4294967296" with
+   | (q, r) ->
+     (let lo = int_of_str r in
+      if str_eq q "0" then Cons (lo, Nil) else Cons (lo, mt_seed_words q)));
+let mt_seed_from = fn (g: int) -> fn (mag: str) ->
+  (let ws = mt_seed_words mag in
+   match ws with
+   | Cons (w0, Nil) -> mt_init_genrand g w0
+   | _ -> (let rec len9 = fn (xs: int list) -> (match xs with Nil -> 0 | Cons (_, t) -> 1 + len9 t) in
+           mt_init_by_array g ws (len9 ws)));
+let mt_alloc_gid = fn (u: unit) ->
+  (let g = (if map_has mt_next_gid "n" then map_get mt_next_gid "n" else 1) in
+   let _ = map_set mt_next_gid "n" (g + 1) in g);
+// limited_rand: a MASK of the low bits, drawn again until it lands in range.
+// ⚠ not `% n`. Modulo would bias the low values and, more to the point, give a
+// different sequence from ruby's for the same seed -- which is the whole thing
+// being reproduced here.
+let mt_make_mask = fn (x0: int) ->
+  (let x1 = bit_or x0 (bit_shr x0 1) in
+   let x2 = bit_or x1 (bit_shr x1 2) in
+   let x3 = bit_or x2 (bit_shr x2 4) in
+   let x4 = bit_or x3 (bit_shr x3 8) in
+   let x5 = bit_or x4 (bit_shr x4 16) in
+   bit_or x5 (bit_shr x5 32));
+let mt_limited = fn (g: int) -> fn (limit: int) ->
+  (if limit <= 0 then 0
+   else
+     (let mask = mt_make_mask limit in
+      let rec go = fn (guard: int) ->
+        (let v = bit_and (mt_genrand_int32 g) mask in
+         if v <= limit then v else (if guard <= 0 then 0 else go (guard - 1))) in
+      go 10000));
+// rand(n) for a positive n: an index in [0, n).
+let mt_rand_int = fn (g: int) -> fn (n: int) -> (if n <= 1 then 0 else mt_limited g (n - 1));
+// rand() with no argument: 53 bits of resolution, built from TWO draws exactly
+// as int_pair_to_real_exclusive does (a >> 5) * 2**26 + (b >> 6), over 2**53.
+let mt_rand_real = fn (g: int) ->
+  (let a = bit_shr (mt_genrand_int32 g) 5 in
+   let b = bit_shr (mt_genrand_int32 g) 6 in
+   (float_of_int a * 67108864.0 + float_of_int b) / 9007199254740992.0);
+let int_bitop = fn (op: str) -> fn (x: int) -> fn (y: int) ->
+  if str_eq op "&" then bit_and x y
+  else if str_eq op "|" then bit_or x y
+  else bit_xor x y;
+// bignum bitwise (non-negative operands only): a decimal-string magnitude to
+// an LSB-first bit list and back, so & | ^ work past 64 bits. Negative
+// bignums (arbitrary-precision two's complement) are out of scope.
+let rec big_to_bits = fn (s: str) ->
+  if str_eq s "0" then (Nil : int list)
+  else (match big_divmod_s s "2" with (q, r) -> Cons ((if str_eq r "0" then 0 else 1), big_to_bits q));
+let rec big_from_bits = fn (bs: int list) -> fn (place: str) ->
+  match bs with
+  | Nil -> "0"
+  | Cons (b, t) ->
+    let rest = big_from_bits t (big_mul_s place "2") in
+    if b == 1 then big_add_s place rest else rest;
+let rec big_bits_zip = fn (op: str) -> fn (xs: int list) -> fn (ys: int list) ->
+  match xs with
+  | Nil -> (match op with _ -> ys_tail_for op ys)
+  | Cons (x, xt) ->
+    (match ys with
+     | Nil -> ys_tail_for op (Cons (x, xt))
+     | Cons (y, yt) ->
+       let b = if str_eq op "&" then (if x == 1 && y == 1 then 1 else 0)
+               else if str_eq op "|" then (if x == 1 || y == 1 then 1 else 0)
+               else (if x != y then 1 else 0) in
+       Cons (b, big_bits_zip op xt yt))
+// the tail beyond the shorter operand: & drops it (0), | / ^ keep it.
+and ys_tail_for = fn (op: str) -> fn (rest: int list) ->
+  if str_eq op "&" then (Nil : int list) else rest;
+// big bitwise on two non-negative decimal magnitudes.
+let big_bitop = fn (op: str) -> fn (a: str) -> fn (b: str) ->
+  big_from_bits (big_bits_zip op (big_to_bits a) (big_to_bits b)) "1";
+// as a Val, guarding against negative operands (out of scope): fall back to
+// a plain fail so the coerce layer / caller surfaces it.
+// ...and NEGATIVE operands, which ruby reads in two's complement: each side is
+// taken modulo 2**N for a width N wide enough for both, the bits are combined
+// there, and a result whose top bit is set comes back as a negative. `-1 & x`
+// used to be "unsupported" -- a bare fail that reached the program as a
+// StandardError with no idea what was asked.
+let big_two_pow = fn (n: int) -> big_pow "2" n "1";
+let big_tc_width = fn (a: str) -> fn (b: str) ->
+  let w = fn (x: str) -> str_len (if big_sign x < 0 then big_neg_s x else x) * 4 + 8 in
+  let wa = w a in let wb = w b in
+  (if wa > wb then wa else wb);
+let big_tc_in = fn (x: str) -> fn (m: str) ->
+  if big_sign x < 0 then big_add_s m x else x;
+let big_bitop_v = fn (op: str) -> fn (a: str) -> fn (b: str) ->
+  if big_sign a < 0 || big_sign b < 0 then
+    (let n = big_tc_width a b in
+     let m = big_two_pow n in
+     let half = big_two_pow (n - 1) in
+     let r = big_bitop op (big_tc_in a m) (big_tc_in b m) in
+     norm_big (if big_cmp_s r half >= 0 then big_sub_s r m else r))
+  else norm_big (big_bitop op a b);
+
+// a list concatenated with itself n times (Array * Integer).
+let rec list_rep = fn (xs: Val list) -> fn (n: int) ->
+  if n <= 0 then (Nil : Val list) else list_append xs (list_rep xs (n - 1));
+// The name Ruby puts in a conversion error: nil / true / false print as the
+// value, everything else as its class. (class_name proper needs the object
+// table, which is defined much further down.)
+let conv_name = fn (v: Val) ->
+  match v with
+  | VNil -> "nil"
+  | VBool b -> (if b then "true" else "false")
+  | VInt _ -> "Integer" | VBig _ -> "Integer" | VFlt _ -> "Float"
+  | VStr _ -> "String" | VSym _ -> "Symbol"
+  | VArr _ -> "Array" | VHsh _ -> "Hash"
+  | VRat (_, _) -> "Rational" | VCpx (_, _) -> "Complex"
+  | VRegex (_, _, _) -> "Regexp" | VProc _ -> "Proc"
+  | VRange (_, _, _) -> "Range" | VClass _ -> "Class"
+  | _ -> "Object";
+// The two shapes CRuby uses: a container/string wants a conversion of its
+// argument, a number wants its argument coerced.
+let conv_err = fn (v: Val) -> fn (target: str) ->
+  prim_raise "TypeError" ("no implicit conversion of " ++ conv_name v ++ " into " ++ target);
+let coerce_err = fn (v: Val) -> fn (target: str) ->
+  prim_raise "TypeError" (conv_name v ++ " can't be coerced into " ++ target);
+// A negative base raised to a non-integer power has no real root, and ruby
+// answers the principal COMPLEX one rather than NaN: r * (cos pi*y + i sin
+// pi*y). A half-integer exponent is a quarter turn, where the real part is
+// exactly zero and the sign of the imaginary part alternates -- computing
+// those through cos/sin would leave 1e-16 where ruby prints 0.0.
+let pow_val = fn (x: float) -> fn (y: float) ->
+  if x >= 0.0 then VFlt (f_pow x y)
+  else if y == float_of_int (int_of_float y) then VFlt (f_pow x y)
+  else
+    let r = f_pow (0.0 - x) y in
+    let half = y - 0.5 in
+    if half == float_of_int (int_of_float half) then
+      (let k = int_of_float half in
+       VCpx (VFlt 0.0, VFlt (if k - (k / 2) * 2 == 0 then r else 0.0 - r)))
+    else
+      (let pi = 3.141592653589793 in
+       VCpx (VFlt (r * cos (pi * y)), VFlt (r * sin (pi * y))));
+
+// The next representable double above x, found by search rather than by bit
+// twiddling (this language has no way to look at a float's bits): start near
+// one ulp, double until the sum is actually greater, then halve while it
+// still is. The result is exactly nextafter(x, +inf).
+let rec flt_grow = fn (x: float) -> fn (d: float) -> fn (n: int) ->
+  if n > 4000 then d
+  else if x + d > x then d else flt_grow x (d * 2.0) (n + 1);
+let rec flt_shrink = fn (x: float) -> fn (d: float) -> fn (n: int) ->
+  if n > 4000 then d
+  else if x + d * 0.5 > x then flt_shrink x (d * 0.5) (n + 1) else d;
+// the smallest positive subnormal, halved down until the next halving is 0
+let rec flt_tiny_go = fn (d: float) ->
+  if d * 0.5 == 0.0 then d else flt_tiny_go (d * 0.5);
+let flt_tiny = fn () -> flt_tiny_go 1.0;
+// ~2^-52, the relative step of a double
+let rec flt_eps_go = fn (e: float) -> fn (n: int) ->
+  if n == 0 then e else flt_eps_go (e * 0.5) (n - 1);
+let flt_eps = fn () -> flt_eps_go 1.0 52;
+
+// the largest finite double, written out rather than derived: doubling from
+// 1.0 reaches 2^1023, not this.
+let flt_max = fn () -> float_of_str "1.7976931348623157e308";
+let flt_next = fn (x: float) ->
+  if (if x == x then false else true) then x           // NaN
+  // ⚠ INFINITY IS A FIXED POINT ONLY OUTWARD. `(-Float::INFINITY).next_float`
+  // steps INTO the finite range and answers -Float::MAX; only +infinity has
+  // nowhere further up to go. Treating both ends as fixed left the step out
+  // of -infinity at -infinity.
+  else if (if x == 0.0 then false else true) && x * 0.5 == x then
+    (if x < 0.0 then 0.0 - flt_max () else x)
+  else if x == 0.0 then flt_tiny ()
+  else
+    // ⚠ IN THE SUBNORMAL RANGE THE RELATIVE STEP UNDERFLOWS TO ZERO, and
+    // `x + 0.0` is x -- so next_float on the smallest subnormal answered
+    // itself and the spec's `barely_positive < barely_positive.next_float`
+    // was false. Subnormals are evenly spaced by the smallest one, so that is
+    // the step whenever the relative one has vanished.
+    (let mag = (if x > 0.0 then x else 0.0 - x) in
+     let d0 = mag * flt_eps () in
+     let r0 = (if d0 == 0.0 then x + flt_tiny () else x + flt_shrink x (flt_grow x d0 0) 0) in
+     let r = (if r0 == x then x + flt_tiny () else r0) in
+     // ⚠ AND THE SIGN OF THE ZERO SURVIVES. Stepping up from the smallest
+     // NEGATIVE subnormal lands on -0.0, but IEEE addition of two opposite
+     // values gives +0.0 -- so `1 / (-0.0).prev_float.next_float` came out
+     // +Infinity where ruby says -Infinity.
+     if r == 0.0 && x < 0.0 then float_of_str "-0.0" else r);
+let rec flt_grow_dn = fn (x: float) -> fn (d: float) -> fn (n: int) ->
+  if n > 4000 then d
+  else if x - d < x then d else flt_grow_dn x (d * 2.0) (n + 1);
+let rec flt_shrink_dn = fn (x: float) -> fn (d: float) -> fn (n: int) ->
+  if n > 4000 then d
+  else if x - d * 0.5 < x then flt_shrink_dn x (d * 0.5) (n + 1) else d;
+let flt_prev = fn (x: float) ->
+  if (if x == x then false else true) then x
+  // ...and the mirror: `Float::INFINITY.prev_float` is Float::MAX.
+  else if (if x == 0.0 then false else true) && x * 0.5 == x then
+    (if x > 0.0 then flt_max () else x)
+  else if x == 0.0 then 0.0 - flt_tiny ()
+  else
+    // ...and the same vanishing step downward.
+    (let mag = (if x > 0.0 then x else 0.0 - x) in
+     let d0 = mag * flt_eps () in
+     let r = (if d0 == 0.0 then x - flt_tiny () else x - flt_shrink_dn x (flt_grow_dn x d0 0) 0) in
+     if r == x then x - flt_tiny () else r);
+
+// IEEE-754, by arithmetic. `pack("E")` has to hand out the BYTES of a double,
+// and Mere has no bit view of a float, so the three fields are recovered by
+// scaling: divide or multiply by two until the value sits in [1,2) -- that
+// count IS the exponent -- and the remaining fraction is then an exact
+// integer, because 52 bits fits in an int. Every step is a power of two, so
+// nothing rounds on the way.
+let rec f_p2 = fn (k: int) -> if k <= 0 then 1.0 else 2.0 * f_p2 (k - 1);
+let rec f_p2n = fn (k: int) -> if k <= 0 then 1.0 else 0.5 * f_p2n (k - 1);
+let rec f_norm = fn (x: float) -> fn (e: int) ->
+  if x >= 2.0 then f_norm (x * 0.5) (e + 1)
+  else if x < 1.0 then f_norm (x * 2.0) (e - 1)
+  else (x, e);
+let rec f_le_bytes = fn (n: int) -> fn (w: int) ->
+  if w <= 0 then "" else chr (floor_mod n 256) ++ f_le_bytes (floor_div n 256) (w - 1);
+let rec f_be_bytes = fn (n: int) -> fn (w: int) ->
+  if w <= 0 then "" else f_be_bytes (floor_div n 256) (w - 1) ++ chr (floor_mod n 256);
+let flt_is_nan = fn (x: float) -> if x == x then false else true;
+// "is this a numeric ZERO" and "is this NaN", asked of any numeric shape --
+// the two degenerate divisors, which every arithmetic path has to refuse in
+// the same place rather than each discovering its own answer for them.
+let num_is_zero = fn (v: Val) ->
+  match v with
+  | VInt n -> n == 0
+  | VBig b -> str_eq (big_mag b) "0"
+  | VFlt f -> f == 0.0
+  | VRat (n, _) -> str_eq (big_mag n) "0"
+  | _ -> false;
+let num_is_nan = fn (v: Val) -> match v with VFlt f -> flt_is_nan f | _ -> false;
+// infinity is the only non-zero value that is its own half
+let flt_is_inf = fn (x: float) -> (if x == 0.0 then false else true) && x * 0.5 == x;
+// ---- the parts of a Complex, for the questions asked ABOUT the parts -------
+// "is this part finite / infinite": only a Float can be either, and every
+// exact shape is finite.
+let num_part_inf = fn (v: Val) -> match v with VFlt f -> flt_is_inf f | _ -> false;
+let num_part_finite = fn (v: Val) ->
+  match v with VFlt f -> (if flt_is_nan f then false else if flt_is_inf f then false else true) | _ -> true;
+// ⚠ The sign of a part FOR PRINTING is the sign BIT, not `< 0`: for -0.0 the
+// comparison is false, so `Complex(1, -0.0)` printed "1+-0.0i" -- a sign in
+// the separator's place and not a Ruby literal at all. ruby writes "1-0.0i".
+let num_isneg_signed = fn (v: Val) ->
+  match v with
+  | VFlt f -> (if f < 0.0 then true else if f == 0.0 then 1.0 / f < 0.0 else false)
+  | other -> num_isneg other;
+let num_mag_signed = fn (v: Val) -> if num_isneg_signed v then num_neg v else v;
+// ...and a part that is not a FINITE number takes an explicit `*`: ruby writes
+// `0+Infinity*i` and `0+NaN*i`, never `0+Infinityi`.
+//
+// ⚠ A RATIONAL part is the case where to_s and inspect disagree ON PURPOSE:
+// `Complex(0, 1r).to_s` is "0+1/1i" and its inspect is "(0+(1/1)*i)" -- the
+// star belongs to the PARENTHESES, not to the Rational. Putting it in this
+// shared helper broke two bootstraptest pairs that print a rational-imaginary
+// literal, which is how the difference got noticed.
+let cpx_im_tail = fn (v: Val) ->
+  match v with
+  | VFlt f -> (if flt_is_nan f || flt_is_inf f then "*i" else "i")
+  | _ -> "i";
+// a Complex has an ordering only when BOTH imaginary parts are zero -- then it
+// is the reals that are compared. 2 means "no answer" (ruby's nil).
+let cpx_re_of = fn (v: Val) -> match v with VCpx (r, _) -> r | other -> other;
+let cpx_im_of = fn (v: Val) -> match v with VCpx (_, i) -> i | _ -> VInt 0;
+let cpx_zero_im = fn (v: Val) ->
+  match v with VInt 0 -> true | VBig b -> str_eq (big_mag b) "0"
+             | VRat (n, _) -> str_eq (big_mag n) "0" | VFlt f -> f == 0.0 | _ -> false;
+let rec flt_inf_go = fn (x: float) -> if x * 2.0 == x then x else flt_inf_go (x * 2.0);
+let flt_inf = fn () -> flt_inf_go 1.0;
+let flt_nan = fn () -> let i = flt_inf () in i - i;
+// round-to-nearest-even, the mode the hardware uses when it narrows a double
+// to a single -- so that pack("e") answers what the C library would
+let f_round_even = fn (r: float) ->
+  let fl = int_of_float r in
+  let d = r - float_of_int fl in
+  if d > 0.5 then fl + 1
+  else if d < 0.5 then fl
+  else if floor_mod fl 2 == 0 then fl else fl + 1;
+// the sign, the biased exponent and the fraction of `x` as a binary64
+let flt_bits64 = fn (x: float) ->
+  if flt_is_nan x then (0, 2047, bit_shl 1 51)
+  else
+    (let sg = (if x < 0.0 then 1 else if x == 0.0 && flt_is_inf (1.0 / x) && 1.0 / x < 0.0 then 1 else 0) in
+     let a = (if x < 0.0 then 0.0 - x else x) in
+     if a == 0.0 then (sg, 0, 0)
+     else if flt_is_inf a then (sg, 2047, 0)
+     else
+       (let (m, e) = f_norm a 0 in
+        if e < 0 - 1022 then
+          // subnormal: the exponent field bottoms out at its smallest, and
+          // what is left of the value goes into the fraction
+          (let sh = (0 - 1022) - e in
+           if sh > 52 then (sg, 0, 0) else (sg, 0, int_of_float (m * f_p2 (52 - sh))))
+        else (sg, e + 1023, int_of_float ((m - 1.0) * f_p2 52))));
+let flt_bits32 = fn (x: float) ->
+  if flt_is_nan x then (0, 255, 4194304)
+  else
+    (let sg = (if x < 0.0 then 1 else if x == 0.0 && flt_is_inf (1.0 / x) && 1.0 / x < 0.0 then 1 else 0) in
+     let a = (if x < 0.0 then 0.0 - x else x) in
+     if a == 0.0 then (sg, 0, 0)
+     else if flt_is_inf a then (sg, 255, 0)
+     else
+       (let (m, e) = f_norm a 0 in
+        if e > 127 then (sg, 255, 0)
+        else if e < 0 - 126 then
+          (let sh = (0 - 126) - e in
+           if sh > 24 then (sg, 0, 0)
+           else (let q = f_round_even (m * f_p2 (23 - sh)) in
+                 if q >= 8388608 then (sg, 1, q - 8388608) else (sg, 0, q)))
+        else
+          // rounding the fraction up can carry into the exponent
+          (let q = f_round_even ((m - 1.0) * f_p2 23) in
+           if q >= 8388608 then (if e + 1 > 127 then (sg, 255, 0) else (sg, e + 1 + 127, 0))
+           else (sg, e + 127, q))));
+let flt_pack64 = fn (x: float) -> fn (bigend: bool) ->
+  let (sg, ex, fr) = flt_bits64 x in
+  let hi = sg * 128 + floor_div ex 16 in
+  let nx = floor_mod ex 16 * 16 + floor_div fr (bit_shl 1 48) in
+  if bigend then chr hi ++ chr nx ++ f_be_bytes fr 6
+  else f_le_bytes fr 6 ++ chr nx ++ chr hi;
+let flt_pack32 = fn (x: float) -> fn (bigend: bool) ->
+  let (sg, ex, fr) = flt_bits32 x in
+  let hi = sg * 128 + floor_div ex 2 in
+  let nx = floor_mod ex 2 * 128 + floor_div fr 65536 in
+  if bigend then chr hi ++ chr nx ++ f_be_bytes fr 2
+  else f_le_bytes fr 2 ++ chr nx ++ chr hi;
+let flt_from64 = fn (sg: int) -> fn (ex: int) -> fn (fr: int) ->
+  let mag = (if ex == 2047 then (if fr == 0 then flt_inf () else flt_nan ())
+             else if ex == 0 then float_of_int fr * f_p2n 1074
+             else (1.0 + float_of_int fr * f_p2n 52)
+                  * (if ex >= 1023 then f_p2 (ex - 1023) else f_p2n (1023 - ex))) in
+  if sg == 1 then 0.0 - mag else mag;
+let flt_from32 = fn (sg: int) -> fn (ex: int) -> fn (fr: int) ->
+  let mag = (if ex == 255 then (if fr == 0 then flt_inf () else flt_nan ())
+             else if ex == 0 then float_of_int fr * f_p2n 149
+             else (1.0 + float_of_int fr * f_p2n 23)
+                  * (if ex >= 127 then f_p2 (ex - 127) else f_p2n (127 - ex))) in
+  if sg == 1 then 0.0 - mag else mag;
+// which pack/unpack directives name a float, and how wide each one is
+let flt_dir_width = fn (d: str) ->
+  if str_eq d "E" || str_eq d "G" || str_eq d "D" || str_eq d "d" then 8
+  else if str_eq d "e" || str_eq d "g" || str_eq d "F" || str_eq d "f" then 4
+  else 0;
+let flt_dir_big = fn (d: str) -> str_eq d "G" || str_eq d "g";
+
+// Object#object_id: a stable integer per object. Ruby's exact values are not
+// specified beyond nil/true/false and the small-integer encoding, but the
+// IDENTITY has to hold -- the same object answers the same number, and two
+// equal Integers or Symbols answer the same one.
+let sym_ids = map_new ();
+let sym_id_of = fn (nm: str) ->
+  if map_has sym_ids nm then map_get sym_ids nm
+  else (let n = 6000000 + map_len sym_ids * 8 in let _ = map_set sym_ids nm n in n);
+
+// floored modulo on floats: the sign follows the DIVISOR, as ruby's does.
+// Ruby's floored divmod for floats, as one pair. It is NOT `x - y*floor(x/y)`:
+// that product is 0*Inf = NaN for an infinite divisor, so `5.0 % Float::INFINITY`
+// came out NaN where ruby answers 5.0, and `(-5.0).divmod(Inf)` was [0, NaN]
+// where ruby says [-1, Infinity]. The remainder comes from fmod and is then
+// pulled into the DIVISOR's sign; the quotient is derived from the remainder,
+// which is what keeps the two consistent.
+let flt_divmod_pair = fn (x: float) -> fn (y: float) ->
+  let m0 = (if flt_is_inf x && (if flt_is_inf y then false else true)
+            then 0.0 / 0.0 else fmod x y) in
+  let d0 = (if flt_is_inf y && (if flt_is_inf x then false else true)
+            then x / y else (x - m0) / y) in
+  if y * m0 < 0.0 then (d0 - 1.0, m0 + y) else (d0, m0);
+let flt_floor_mod = fn (x: float) -> fn (y: float) ->
+  match flt_divmod_pair x y with (d, m) -> m;
+
+// a % b for rationals: a - b * (a/b).floor, in exact arithmetic (a Float on
+// either side makes it a Float modulo, as every rational operation does).
+let rat_mod = fn (va: Val) -> fn (vb: Val) ->
+  if (match va with VFlt _ -> true | _ -> false) || (match vb with VFlt _ -> true | _ -> false)
+  then
+    // ...and 0.0 is a zero divisor here as much as 0 is: a Rational modulo
+    // refuses it rather than answering a Float NaN (`Rational(3,5) % 0.0`)
+    (let _ = (if to_f vb == 0.0 then (let _ = prim_raise "ZeroDivisionError" "divided by 0" in ()) else ()) in
+     VFlt (flt_floor_mod (to_f va) (to_f vb)))
+  else
+    (let an = (match va with VRat (n, d) -> n | VInt n -> str_of_int n | VBig b -> b | _ -> "0") in
+     let ad = (match va with VRat (n, d) -> d | _ -> "1") in
+     let bn = (match vb with VRat (n, d) -> n | VInt n -> str_of_int n | VBig b -> b | _ -> "0") in
+     let bd = (match vb with VRat (n, d) -> d | _ -> "1") in
+     // dividing by zero is a refusal, not an answer: the exact arithmetic below
+     // would happily divide by it
+     let _ = (if str_eq bn "0" then (let _ = prim_raise "ZeroDivisionError" "divided by 0" in ()) else ()) in
+     // q = floor((an*bd) / (ad*bn)) -- big_divmod_s already floors
+     let num = big_mul_s an bd in
+     let den = big_mul_s ad bn in
+     let q = big_div_s num den in
+     match rat_sub_s an ad (big_mul_s bn q) bd with r -> r);
+
+// A shift whose COUNT is a bignum. Shifting away by that much leaves nothing
+// of the receiver but its sign (0, or -1 for a negative one); shifting toward
+// it cannot be represented and is a RangeError, as in ruby. `left` says which
+// operator asked, so that `x << -big` and `x >> big` are the same question.
+let shift_by_big = fn (va: Val) -> fn (y: str) -> fn (left: bool) ->
+  let neg_count = str_eq (char_at y 0) "-" in
+  let away = (if left then neg_count else (if neg_count then false else true)) in
+  let recv_neg = (match va with VInt x -> x < 0 | VBig bs -> str_eq (char_at bs 0) "-" | _ -> false) in
+  // ⚠ ZERO has nothing to shift, so no width is too big for it: `0 << (2**70)`
+  // is 0 in ruby and was a RangeError here. The refusal is about the RESULT
+  // not fitting, and zero always fits.
+  let recv_zero = (match va with VInt x -> x == 0 | VBig bs -> str_eq (big_mag bs) "0" | _ -> false) in
+  if recv_zero then VInt 0
+  else if away then (if recv_neg then VInt (0 - 1) else VInt 0)
+  else prim_raise "RangeError" "shift width too big";
+
+// `x % y` where y is not something to divide by: ruby coerces, and the
+// coerced pair is then asked for `%`. A Complex has none, so the answer is
+// its NoMethodError; anything non-numeric is the coercion's TypeError. This
+// was one internal failure ("mere-ruby: % type error") for both.
+let cmp_mod_refuse = fn (vb: Val) ->
+  if (match vb with VCpx (_, _) -> true | _ -> false)
+  then prim_raise "NoMethodError" "undefined method '%' for an instance of Complex"
+  else if (match vb with VRat (_, _) -> true | _ -> false)
+  then prim_raise "TypeError" "Rational can't be coerced into Float"
+  // the LEFT half of "X can't be coerced into Y" names nil, true and false by
+  // VALUE ("nil can't be coerced into Integer"), which is what conv_name
+  // answers -- cmp_type_name names the class and wrote "NilClass" there.
+  else prim_raise "TypeError" (conv_name vb ++ " can't be coerced into Integer");
+
+let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
+  // Rational operand: +,-,*,/ produce a Rational (or Float if a Float is
+  // involved). Checked first so int/rat mixing works uniformly.
+  if ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false))
+     && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/")
+  then rat_arith op va vb
+  else if ((match va with VCpx _ -> true | _ -> false) || (match vb with VCpx _ -> true | _ -> false))
+     && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/")
+  then cpx_arith op va vb
+  // ⚠ a BIGNUM exponent has no answer that fits: only the four bases whose
+  //   power does not grow have one -- 0, 1, -1 (and a Rational of them) -- and
+  //   ruby refuses every other with "exponent is too large" rather than
+  //   answering a Float. `2 ** (2**64)` was Infinity, `1 ** (2**64)` was 1.0
+  //   (a Float where ruby answers the Integer 1), and `(-1) ** (2**64)` came
+  //   back a COMPLEX -- the float power of a negative base takes the principal
+  //   complex root, which is the right answer to a different question.
+  else if str_eq op "**"
+          && (match va with VInt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
+          && (match vb with VBig _ -> true | _ -> false) then
+    (let rat9 = (match va with VRat (_, _) -> true | _ -> false) in
+     let ans9 = fn (n: int) -> (if rat9 then mk_rat n 1 else VInt n) in
+     let iseq9 = fn (n: int) ->
+       (match va with
+        | VInt k9 -> k9 == n
+        | VBig b9 -> str_eq b9 (str_of_int n)
+        | VRat (rn9, rd9) -> str_eq rd9 "1" && str_eq rn9 (str_of_int n)
+        | _ -> false) in
+     if iseq9 0 then
+       (if num_isneg vb then prim_raise "ZeroDivisionError" "divided by 0" else ans9 0)
+     else if iseq9 1 then ans9 1
+     else if iseq9 (0 - 1) then
+       (if (match vb with VBig b9 -> big_even b9 | _ -> true) then ans9 1 else ans9 (0 - 1))
+     else prim_raise "ArgumentError" "exponent is too large")
+  // Rational ** Rational: a whole exponent stays exact, a fractional one is a
+  // Float (`Rational(4,1) ** Rational(1,2)` is 2.0, not (2/1))
+  // ...and an INTEGER base with a whole Rational exponent is exact as well:
+  // `2 ** 2r` is (4/1) in ruby, not 4.0. Only a Rational BASE was read here,
+  // so that pair went to the float power below -- and `2.pow(2r)`, which is
+  // the same operator, with it.
+  else if str_eq op "**"
+          && (((match va with VRat _ -> true | _ -> false)
+               && (match vb with VRat (_, bd9) -> str_eq bd9 "1" | VInt _ -> true | _ -> false))
+              || ((match va with VInt _ -> true | VBig _ -> true | _ -> false)
+                  && (match vb with VRat (_, bd9) -> str_eq bd9 "1" | _ -> false))) then
+    (let an9 = (match va with VRat (n9, _) -> n9 | VInt n9 -> str_of_int n9 | VBig b9 -> b9 | _ -> "0") in
+     let ad9 = (match va with VRat (_, d9) -> d9 | _ -> "1") in
+     let bn9 = (match vb with VRat (n9, _) -> n9 | VInt n9 -> str_of_int n9 | _ -> "0") in
+     let e9 = int_of_str bn9 in
+     if e9 >= 0 then mk_rat_s (big_pow an9 e9 "1") (big_pow ad9 e9 "1")
+     else mk_rat_s (big_pow ad9 (0 - e9) "1") (big_pow an9 (0 - e9) "1"))
+  // ...but NOT when either side is a Complex: to_f cannot take one, so
+  // `Complex(2,0) ** Rational(1,2)` failed inside this branch ("not a number")
+  // instead of reaching the complex power below it. A branch keyed on ONE
+  // operand's type has to say what it assumes about the other.
+  else if str_eq op "**" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false))
+          && (match va with VCpx _ -> false | _ -> true)
+          && (match vb with VCpx _ -> false | _ -> true) then
+    pow_val (to_f va) (to_f vb)
+  else if (match va with VCpx _ -> true | _ -> false) && str_eq op "**" then
+    (match vb with
+     | VInt n -> cpx_pow va n
+     // a Complex to a WHOLE float power is that many multiplications, which is
+     // exact enough for what ruby answers ((1+0i)**0.0 is (1.0+0.0i))
+     | VFlt fy -> (if feq fy (float_of_int (int_of_float fy)) && int_of_float fy >= 0
+                   then (match cpx_pow va (int_of_float fy) with
+                         | VCpx (re9, im9) -> VCpx (VFlt (to_f re9), VFlt (to_f im9))
+                         | other9 -> other9)
+                   else if cpx_zero_im (cpx_im_of va) && to_f (cpx_re_of va) >= 0.0
+                   then VCpx (VFlt (to_f (pow_val (to_f (cpx_re_of va)) fy)), VFlt 0.0)
+                   else cpx_pow_gen va (VFlt fy))
+     // ...and a NON-NEGATIVE REAL base with a real exponent is a real power:
+     // ruby computes it that way and gets the exactly-rounded double, while
+     // exp(y * ln x) is a bit short (2**0.5 came out 1.414213562373095 where
+     // ruby says 1.4142135623730951). Only the genuinely complex cases need
+     // the general formula.
+     | _ ->
+       (if cpx_zero_im (cpx_im_of va) && (match vb with VCpx (_, _) -> false | _ -> true)
+           && to_f (cpx_re_of va) >= 0.0
+        then VCpx (VFlt (to_f (pow_val (to_f (cpx_re_of va)) (to_f vb))), VFlt 0.0)
+        // a COMPLEX (or fractional-with-negative-base) exponent is
+        // exp(y * ln x), which is what ruby computes too -- this used to be an
+        // internal failure, so it reached the program as a bare StandardError.
+        else cpx_pow_gen va vb))
+  else if str_eq op "|" then
+    (match va with
+     | VArr x -> (match vb with VArr y -> arr_new (val_dedup_into (deref y) (val_dedup_into (deref x) Nil)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
+     | VInt x -> (match vb with VInt y -> VInt (int_bitop "|" x y) | VBig y -> big_bitop_v "|" (str_of_int x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
+     | VBig x -> big_bitop_v "|" x (num_dec vb)
+     // TrueClass#| / FalseClass#| / NilClass#| take ANY object and ask only
+     // whether it is truthy (`false | 5` is true, `false | nil` is false).
+     // Demanding a boolean made `false & nil` -- which the specs open with --
+     // an internal type error escaping as StandardError.
+     | VBool x -> VBool (x || truthy vb)
+     | VNil -> VBool (truthy vb)
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: | type error")) in fail "mere-ruby: | type error"))
+  else if str_eq op "&" then
+    (match va with
+     | VArr x -> (match vb with VArr y -> arr_new (val_intersect (val_dedup_into (deref x) Nil) (deref y)) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
+     | VInt x -> (match vb with VInt y -> VInt (int_bitop "&" x y) | VBig y -> big_bitop_v "&" (str_of_int x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
+     | VBig x -> big_bitop_v "&" x (num_dec vb)
+     | VBool x -> VBool (x && truthy vb)
+     | VNil -> VBool false
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: & type error")) in fail "mere-ruby: & type error"))
+  else if str_eq op "^" then
+    (match va with
+     | VInt x -> (match vb with VInt y -> VInt (int_bitop "^" x y) | VBig y -> big_bitop_v "^" (str_of_int x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ^ type error")) in fail "mere-ruby: ^ type error"))
+     | VBig x -> big_bitop_v "^" x (num_dec vb)
+     | VBool x -> (let y = truthy vb in VBool (if x then (if y then false else true) else y))
+     | VNil -> VBool (truthy vb)
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ^ type error")) in fail "mere-ruby: ^ type error"))
+  else
+  if str_eq op "+" then
+    (match va with
+     | VStr x -> (match vb with
+                  | VStr y ->
+                    (let renc = enc_compat2 (senc_get x) (sget x) (senc_get y) (sget y) in
+                     if str_eq renc "" then
+                       (let _ = prim_raise "Encoding::CompatibilityError"
+                                  ("incompatible character encodings: " ++ enc_canon_name (senc_get x) ++ " and " ++ enc_canon_name (senc_get y)) in VNil)
+                     else
+                       let r = mkstr (sget x ++ sget y) in
+                       (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r))
+                  | _ -> conv_err vb "String")
+     | VArr x -> (match vb with VArr y -> arr_new (list_append (deref x) (deref y)) | _ -> conv_err vb "Array")
+     | VInt x -> (match vb with VInt y -> add_int_ov x y | VBig y -> norm_big (big_add_s (str_of_int x) y) | VFlt y -> VFlt (float_of_int x + y) | _ -> coerce_err vb (conv_name va))
+     | VBig x -> (match vb with VInt y -> norm_big (big_add_s x (str_of_int y)) | VBig y -> norm_big (big_add_s x y) | VFlt y -> VFlt (float_of_str x + y) | _ -> coerce_err vb (conv_name va))
+     | VFlt x -> (match vb with VInt y -> VFlt (x + float_of_int y) | VBig y -> VFlt (x + float_of_str y) | VFlt y -> VFlt (x + y) | _ -> coerce_err vb (conv_name va))
+     | _ -> coerce_err vb (conv_name va))
+  else if str_eq op "-" then
+    (match va with
+     // Array#- : the elements of the left side that the right side lacks.
+     | VArr x -> (match vb with VArr y -> arr_new (val_difference (deref x) (deref y)) | _ -> conv_err vb "Array")
+     | VInt x -> (match vb with VInt y -> sub_int_ov x y | VBig y -> norm_big (big_sub_s (str_of_int x) y) | VFlt y -> VFlt (float_of_int x - y) | _ -> coerce_err vb (conv_name va))
+     | VBig x -> (match vb with VInt y -> norm_big (big_sub_s x (str_of_int y)) | VBig y -> norm_big (big_sub_s x y) | VFlt y -> VFlt (float_of_str x - y) | _ -> coerce_err vb (conv_name va))
+     | VFlt x -> (match vb with VInt y -> VFlt (x - float_of_int y) | VBig y -> VFlt (x - float_of_str y) | VFlt y -> VFlt (x - y) | _ -> coerce_err vb (conv_name va))
+     | _ -> coerce_err vb (conv_name va))
+  else if str_eq op "*" then
+    (match va with
+     | VStr x -> (match vb with VInt y -> (let r = mkstr (str_repeat (sget x) y) in (match r with VStr rid -> let _ = senc_set rid (senc_get x) in r | _ -> r)) | _ -> conv_err vb "Integer")
+     // a NEGATIVE count is ruby's ArgumentError, not an empty array: `a * -1`
+     // was answering [] (list_rep stops at zero either way).
+     | VArr x -> (match vb with
+                  | VInt y -> (if y < 0 then prim_raise "ArgumentError" "negative argument"
+                               else arr_new (list_rep (deref x) y))
+                  | _ -> conv_err vb "Integer")
+     | VInt x -> (match vb with VInt y -> mul_int_ov x y | VBig y -> norm_big (big_mul_s (str_of_int x) y) | VFlt y -> VFlt (float_of_int x * y) | _ -> coerce_err vb (conv_name va))
+     | VBig x -> (match vb with VInt y -> norm_big (big_mul_s x (str_of_int y)) | VBig y -> norm_big (big_mul_s x y) | VFlt y -> VFlt (float_of_str x * y) | _ -> coerce_err vb (conv_name va))
+     | VFlt x -> (match vb with VInt y -> VFlt (x * float_of_int y) | VBig y -> VFlt (x * float_of_str y) | VFlt y -> VFlt (x * y) | _ -> coerce_err vb (conv_name va))
+     | _ -> coerce_err vb (conv_name va))
+  else if str_eq op "/" then
+    (match va with
+     | VInt x ->
+       (match vb with
+        | VInt y -> VInt (floor_div x y)
+        | VBig y -> norm_big (big_div_s (str_of_int x) y)
+        | VFlt y -> VFlt (float_of_int x / y)
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: / type error")) in fail "mere-ruby: / type error"))
+     | VBig x ->
+       (match vb with
+        | VInt y -> norm_big (big_div_s x (str_of_int y))
+        | VBig y -> norm_big (big_div_s x y)
+        | VFlt y -> VFlt (float_of_str x / y)
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: / type error")) in fail "mere-ruby: / type error"))
+     | VFlt x ->
+       (match vb with
+        | VInt y -> VFlt (x / float_of_int y)
+        | VBig y -> VFlt (x / float_of_str y)
+        | VFlt y -> VFlt (x / y)
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: / type error")) in fail "mere-ruby: / type error"))
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: / type error")) in fail "mere-ruby: / type error"))
+  // a Rational on either side is exact (a Float on either side makes it a
+  // Float), and it has to be decided BEFORE the arm below, whose match ends in
+  // a bare fail for anything that is not Int/Float/Big.
+  else if str_eq op "%" && ((match va with VRat _ -> true | _ -> false) || (match vb with VRat _ -> true | _ -> false)) then
+    rat_mod va vb
+  // the same one refusal as the method form (see prim_method_raw): a zero
+  // divisor, whatever the types. The integer/integer and Rational paths raised
+  // it already; the float ones answered the dividend, so `5.0 % 0` was 5.0.
+  else if str_eq op "%" && num_is_zero vb
+          && (match va with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat _ -> true | _ -> false) then
+    (let _ = prim_raise "ZeroDivisionError" "divided by 0" in VInt 0)
+  else if str_eq op "%" then
+    (match va with
+     | VInt x ->
+       (match vb with
+        | VInt y -> VInt (floor_mod x y)
+        | VBig y -> norm_big (big_mod_s (str_of_int x) y)
+        // Float#% is floored, like Integer#%: x - y * (x / y).floor. It used
+        // to be "supports integers only", which a spec noticed by asking for
+        // `6543.21.%(137)`.
+        | VFlt y -> VFlt (flt_floor_mod (float_of_int x) y)
+        | _ -> (cmp_mod_refuse vb))
+     | VFlt x ->
+       (match vb with
+        | VFlt y -> VFlt (flt_floor_mod x y)
+        | VInt y -> VFlt (flt_floor_mod x (float_of_int y))
+        // ⚠ a BIGNUM operand had no arm on either side, so `(2**64) % 3.5` and
+        //   `3.5 % (2**64)` both refused with "Float can't be coerced into
+        //   Integer" for arithmetic ruby answers (2.0 and 3.5). A Float
+        //   operand makes the whole operation a Float one, big or not.
+        | VBig y -> VFlt (flt_floor_mod x (big_fdiv_s y "1"))
+        | _ -> (cmp_mod_refuse vb))
+     | VBig x ->
+       (match vb with
+        | VInt y -> norm_big (big_mod_s x (str_of_int y))
+        | VBig y -> norm_big (big_mod_s x y)
+        | VFlt y -> VFlt (flt_floor_mod (big_fdiv_s x "1") y)
+        | _ -> (cmp_mod_refuse vb))
+     | _ -> (cmp_mod_refuse vb))
+  else if str_eq op "**" then
+    (match va with
+     // a Float exponent makes the whole thing a Float, whatever the base is
+     | VInt x -> (match vb with VInt y -> if y < 0 then mk_rat_s "1" (big_pow (str_of_int x) (0 - y) "1") else norm_big (big_pow (str_of_int x) y "1") | VFlt y -> pow_val (float_of_int x) y | VBig y -> pow_val (float_of_int x) (float_of_str y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
+     // a bignum to a NEGATIVE power is a Rational, as it is for a machine
+     // integer one line up -- it was answering a Float.
+     | VBig x -> (match vb with VInt y -> if y < 0 then mk_rat_s "1" (big_pow x (0 - y) "1") else norm_big (big_pow x y "1") | VFlt y -> pow_val (float_of_str x) y | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
+     // a Rational exponent is its float value (and a negative base with a
+     // fractional one is the principal COMPLEX root, which pow_val knows).
+     | VFlt x -> (match vb with VInt y -> pow_val x (float_of_int y) | VFlt y -> pow_val x y | VBig y -> pow_val x (float_of_str y) | VRat (rn, rd) -> pow_val x (float_of_str rn / float_of_str rd) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: ** type error")) in fail "mere-ruby: ** type error"))
+  else if str_eq op "<<" then
+    // array append (mutating, returns the same array); string concat;
+    // integer shift-left.
+    (match va with
+     | VArr id -> let _ = arr_set id (list_append (deref id) (Cons (vb, Nil))) in va
+     | VStr x -> let x = sget x in (match vb with VStr y -> let y = sget y in mkstr (x ++ y) | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << string needs a string")) in fail "mere-ruby: << string needs a string"))
+     | VInt x ->
+       (match vb with
+        | VInt y ->
+          if y < 0 then shr_val va (0 - y)
+          else if shl_int_fits x y then VInt (shl_int x y)
+          else shl_val va y
+        | VBig y -> shift_by_big va y true
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
+     | VBig _ ->
+       (match vb with
+        | VInt y -> if y < 0 then shr_val va (0 - y) else shl_val va y
+        | VBig y -> shift_by_big va y true
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << type error")) in fail "mere-ruby: << type error"))
+  else if str_eq op ">>" then
+    (match va with
+     | VInt x ->
+       (match vb with
+        // shr_int HALVES ONE STEP AT A TIME, so `1 >> (2**40)` was a loop of
+        // 1099511627776 iterations rather than an answer of 0. The native path
+        // stays for the widths it can actually hold -- routing every shift
+        // through the bignum divide would have made `x >> 3` pay for it.
+        | VInt y -> if y < 0 then shl_val va (0 - y)
+                    else if y < 62 then VInt (shr_int x y)
+                    else shr_val va y
+        | VBig y -> shift_by_big va y false
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
+     | VBig _ ->
+       (match vb with
+        | VInt y -> if y < 0 then shl_val va (0 - y) else shr_val va y
+        | VBig y -> shift_by_big va y false
+        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
+     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: >> type error")) in fail "mere-ruby: >> type error"))
+  else (let __fm = ("mere-ruby: unknown operator: " ++ op) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
+
+

@@ -1,0 +1,1651 @@
+// The interpreter's global state and the questions asked of it before any
+// evaluation happens: the mutable-array / string / hash stores, the TCP
+// capability, the lexical scope chain, the (file, line) a string eval runs
+// under, and the encoding tables (names, ASCII compatibility, validity,
+// negotiation, and what Integer#chr needs to know).
+//
+// A MODULE, spliced by `import` where these chains used to sit. The TYPES stay
+// in main.mere, ahead of every import, because every module needs them.
+// ---- mutable-array store (M10) ------------------------------------------
+// A single top-level Map captured by every function below (no threading):
+// id (as str) -> the array's contents (a Val list). Arrays are handles
+// (VArr id) into it, so aliases share one mutable list. A fresh id is
+// map_len arr_store (arrays are never removed — memory grows, acceptable).
+
+// ---- TCP (the `socket` capability) ---------------------------------------
+// Mere's own byte-level socket FFI: the same externs mkv uses. Reads and
+// writes cross through the shared byte arena (`mem_*`), so a payload with a
+// zero byte survives. The Wasm host has no sockets and stubs these to -1.
+extern fn tcp_connect: str -> int -> int;
+extern fn tcp_listen: int -> int;
+extern fn tcp_accept: int -> int;
+extern fn tcp_read: int -> int -> int -> int;
+extern fn tcp_write: int -> int -> int -> int;
+extern fn tcp_close: int -> unit;
+extern fn tcp_set_timeout: int -> int -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_to_str: int -> int -> str;
+extern fn mem_copy_str: int -> int -> str -> int;
+extern fn mem_set_u8: int -> int -> int -> int;
+// libc's getpid: Process.pid has to be the real one -- a made-up number would
+// be a stable lie, and sidekiq builds its identity string from it.
+// libm, for the Math functions Mere has no builtin for. DERIVING them from
+// the builtins does not work: every identity below is exact in real arithmetic
+// and wrong in the last bit -- `exp (log x / 3.0)` answers 9.999999999999998
+// for cbrt(1000), `atan2 x 1.0` differs from atan in the final digit, and
+// `(e^x - e^-x) / (e^x + e^-x)` is NaN for tanh(1000) where the answer is 1.0.
+// Byte-exactness against CRuby is the whole standard here, and CRuby calls
+// these same functions.
+extern fn atan: float -> float;
+extern fn asin: float -> float;
+extern fn acos: float -> float;
+extern fn sinh: float -> float;
+extern fn cosh: float -> float;
+extern fn tanh: float -> float;
+extern fn asinh: float -> float;
+extern fn acosh: float -> float;
+extern fn atanh: float -> float;
+extern fn cbrt: float -> float;
+extern fn log2: float -> float;
+extern fn log10: float -> float;
+// ruby 4.0 added Math.log1p / Math.expm1; libm has had them all along.
+extern fn log1p: float -> float;
+extern fn expm1: float -> float;
+extern fn erf: float -> float;
+extern fn erfc: float -> float;
+extern fn tgamma: float -> float;
+extern fn lgamma: float -> float;
+extern fn hypot: float -> float -> float;
+extern fn fmod: float -> float -> float;
+extern fn ldexp: float -> int -> float;
+extern fn getpid: unit -> int;
+// chdir(2) / symlink(2): plain libc, and both answer an int -- an extern that
+// returned `char*` would hand back a raw pointer rather than a Mere string
+// (see the note at the top of this file), which is why realpath(3) is not
+// here and File.realpath stays textual.
+extern fn chdir: str -> int;
+extern fn symlink: str -> str -> int;
+// one arena block, reused: 64 KiB is the read size and the write chunk.
+
+// Object ids come from a counter carried IN the ocls map itself (special key
+// "$next", preserved by the collector's rebuild) -- not from map_len. With a
+// collector dropping dead entries, map_len shrinks and a fresh object would
+// collide with a survivor's id. The first call seeds from map_len, so a world
+// built before any allocation behaves exactly as the old scheme did.
+let alloc_oid = fn om ->
+  let id = (if map_has om "$next" then int_of_str (map_get om "$next") else map_len om) in
+  let _ = map_set om "$next" (str_of_int (id + 1)) in
+  id;
+let arr_store = map_new ();
+// Array ids come from a counter: the collector deletes dead entries now, so
+// map_len shrinks and a length-derived id would collide with a survivor's.
+let arr_ctr = map_new ();
+let arr_new = fn (xs: Val list) ->
+  let id = (if map_has arr_ctr "n" then map_get arr_ctr "n" else 0) in
+  let _ = map_set arr_ctr "n" (id + 1) in
+  let _ = map_set arr_store (str_of_int id) xs in
+  VArr id;
+let deref = fn (id: int) -> map_get arr_store (str_of_int id);
+// Every write bumps a per-array VERSION. Ruby's Array#each indexes into the
+// live array, so a block that shifts or pops changes what comes next -- but
+// this array is a linked list, and indexing from the head at every step would
+// make each iteration O(n^2). The version lets a walker keep its tail pointer
+// while nothing writes, and re-derive it from the index only after a write.
+let arr_vers = map_new ();
+let arr_ver = fn (id: int) -> (if map_has arr_vers (str_of_int id) then map_get arr_vers (str_of_int id) else 0);
+let arr_set = fn (id: int) -> fn (xs: Val list) ->
+  let _ = map_set arr_vers (str_of_int id) (arr_ver id + 1) in
+  let _ = map_set arr_store (str_of_int id) xs in ();
+
+// strings are mutable reference types too (Ruby semantics): VStr is a HANDLE
+// into str_store, so aliases share one mutable string. Fresh id per literal
+// evaluation — entries are never removed. A vec gives O(1) alloc/get/set
+// (string allocation is far hotter than array allocation).
+let str_store = vec_new ();
+let mkstr = fn (s: str) ->
+  let id = vec_len str_store in
+  let _ = vec_push str_store s in
+  VStr id;
+let sget = fn (id: int) -> vec_get str_store id;
+let sset = fn (id: int) -> fn (s: str) ->
+  let _ = vec_set str_store id s in ();
+// Kernel#gets state: stdin is slurped once (read_stdin) into stdin_src "s",
+// then handed out one line at a time via a cursor stdin_src_pos "p". Lets
+// `while line = gets` terminate at EOF (nil) the way Ruby does.
+let stdin_src = map_new ();
+let stdin_src_pos = map_new ();
+// hashes are mutable reference types too: VHsh is a HANDLE into hash_store,
+// which holds the interleaved [k1,v1,k2,v2,...] pair list. Aliases share one
+// mutable hash (h[k]=v is seen through every reference).
+let hash_store = vec_new ();
+// The signal names a program may trap. mere-ruby never delivers one -- nothing
+// here is a source of signals -- so this is a NAME table, used by Signal.list and
+// Signal.signame, and the handlers a program registers live in signal_traps
+// unread. A CLI traps INT before doing anything else, so answering matters more
+// than refusing; the limit is in KNOWN_GAPS.
+let signal_traps = map_new ();
+let signal_names = "EXIT:0 IOT:6 EMT:7 CLD:20 HUP:1 INT:2 QUIT:3 ILL:4 TRAP:5 ABRT:6 FPE:8 KILL:9 BUS:10 SEGV:11 SYS:12 PIPE:13 ALRM:14 TERM:15 URG:16 STOP:17 TSTP:18 CONT:19 CHLD:20 TTIN:21 TTOU:22 IO:23 XCPU:24 XFSZ:25 VTALRM:26 PROF:27 WINCH:28 INFO:29 USR1:30 USR2:31";
+let mkhash = fn (xs: Val list) ->
+  let id = vec_len hash_store in
+  let _ = vec_push hash_store xs in
+  VHsh id;
+let hderef = fn (id: int) -> vec_get hash_store id;
+let hset = fn (id: int) -> fn (xs: Val list) ->
+  let _ = vec_set hash_store id xs in ();
+// per-hash default value for missing keys (Hash.new(d)); keyed by handle id.
+let hash_dflt = map_new ();
+let hdflt_set = fn (id: int) -> fn (v: Val) -> let _ = map_set hash_dflt (str_of_int id) v in ();
+let hdflt_get = fn (id: int) -> if map_has hash_dflt (str_of_int id) then map_get hash_dflt (str_of_int id) else VNil;
+// Hash.new { |h, k| ... }: the block form of the default, kept as a proc
+// handle per hash so a miss can call it with (hash, key).
+let hash_dproc = map_new ();
+let hdproc_set = fn (id: int) -> fn (v: Val) -> let _ = map_set hash_dproc (str_of_int id) v in ();
+let hdproc_get = fn (id: int) -> if map_has hash_dproc (str_of_int id) then map_get hash_dproc (str_of_int id) else VNil;
+// per-string encoding label (str handle id -> encoding name); default UTF-8.
+let str_enc = map_new ();
+// The ABSENCE of an entry means UTF-8 (senc_get, below), so writing "UTF-8" says
+// nothing the absence did not -- and it says it permanently: a container here
+// never gives its memory back, so every redundant entry is a permanent one. A
+// census of 200k interpolated strings found 1.2M entries in this map, six per
+// string, nearly all of them "UTF-8". A string that is already tagged is a
+// different matter: setting UTF-8 there is a real change, and has to remove the
+// tag rather than skip the write.
+let senc_set = fn (id: int) -> fn (nm: str) ->
+  if str_eq nm "UTF-8"
+  then (if map_has str_enc (str_of_int id)
+        then (let _ = map_delete str_enc (str_of_int id) in ())
+        else ())
+  else (let _ = map_set str_enc (str_of_int id) nm in ());
+let senc_get = fn (id: int) -> if map_has str_enc (str_of_int id) then map_get str_enc (str_of_int id) else "UTF-8";
+// A new String that carries a GIVEN encoding. Every string derived from a
+// subject must wear the subject's encoding, not the default: a MatchData over
+// an EUC-JP string answered UTF-8 for #[0] / #pre_match / $& / $1, because the
+// substring was built with a bare mkstr and encoding is per-handle.
+let mkstr_e = fn (s: str) -> fn (enc: str) ->
+  (let v = mkstr s in
+   let _ = (match v with VStr h -> senc_set h enc | _ -> ()) in v);
+// frozen-string tracking + CLI frozen-string-literal mode + __FILE__ path.
+let str_frozen = map_new ();
+let str_chilled = map_new ();
+let sfrozen_set = fn (id: int) -> let _ = map_set str_frozen (str_of_int id) "1" in ();
+// CHILLED (ruby 3.4): a literal from a file with no frozen_string_literal
+// comment. Not frozen -- #frozen? is false and it can be mutated -- but `+str`
+// answers a copy, which is the whole observable difference.
+let schilled_set = fn (id: int) -> let _ = map_set str_chilled (str_of_int id) "1" in ();
+let schilled_get = fn (id: int) -> map_has str_chilled (str_of_int id);
+let sfrozen_get = fn (id: int) -> map_has str_frozen (str_of_int id);
+// frozen state of ordinary objects (keyed by object id string), consulted by
+// #frozen? on the object and on its singleton class.
+// frozen state of arrays / hashes. Arrays and hashes live in separate stores,
+// so their handle ids overlap: the key needs the kind ("a" / "h") or freezing
+// array #7 would make hash #7 report frozen too.
+let coll_frozen = map_new ();
+let cfrozen_set = fn (k: str) -> fn (id: int) -> let _ = map_set coll_frozen (k ++ str_of_int id) "1" in ();
+let cfrozen_get = fn (k: str) -> fn (id: int) -> map_has coll_frozen (k ++ str_of_int id);
+let obj_frozen = map_new ();
+let ofrozen_set = fn (id: int) -> let _ = map_set obj_frozen (str_of_int id) "1" in ();
+let ofrozen_get = fn (id: int) -> map_has obj_frozen (str_of_int id);
+let ofrozen_key = fn (k: str) -> map_has obj_frozen k;
+// A CLASS or MODULE can be frozen too, and then it refuses every change to
+// itself: `K.freeze` was a no-op that even left `K.frozen?` answering false,
+// so a frozen class kept accepting defs, includes, constants and attrs.
+// Keyed by class NAME (a class is named, not identified by an object id).
+let cls_frozen = map_new ();
+let clsfrozen_set = fn (c: str) -> let _ = map_set cls_frozen c "1" in ();
+let clsfrozen_get = fn (c: str) -> map_has cls_frozen c;
+let cli_fsl = map_new ();
+let fsl_ctx = map_new ();  // "v" -> the current file's magic-comment answer   // key "on" present => --enable-frozen-string-literal
+let cli_file = map_new ();  // key "p" -> the running script's path (__FILE__)
+let fsl_on = fn () -> map_has cli_fsl "on";
+// "on" / "off" / "" (absent). The command-line flags decide for every file;
+// otherwise the file's own magic comment does, which the loader records in
+// load_ctx "fsl" beside the encoding.
+let fsl_state = fn () ->
+  if map_has cli_fsl "on" then "on"
+  else if map_has cli_fsl "off" then "off"
+  else if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "";
+let script_file = fn () -> if map_has cli_file "p" then map_get cli_file "p" else "-";
+// lexical constant scope (cref): the class whose body is currently being run
+// ("" = top level). Captured per method at `def` time (meth_cref) and consulted
+// when resolving a bare Constant, so `Const` means the lexically-nearest one.
+let lex_cref = map_new ();
+let cur_lex = fn () -> if map_has lex_cref "c" then map_get lex_cref "c" else "";
+let set_lex = fn (c: str) -> let _ = map_set lex_cref "c" c in ();
+let meth_cref = map_new ();
+// the shared Encoding objects, keyed by canonical name; enc_name maps an
+// Encoding object's handle id -> name so the (world-free) printer can format it.
+let enc_objs = map_new ();
+let enc_name = map_new ();
+// every name and alias an encoding is findable by, normalized (upcased,
+// '_' -> '-'), mapped to its canonical name. Filled at startup from the same
+// table that defines the Encoding constants, so force_encoding / Encoding.find
+// accept exactly the names ruby does and refuse the rest.
+let enc_alias_canon = map_new ();
+// a Symbol made from a non-Unicode / non-ASCII string keeps that encoding;
+// VSym is only the name, so the encoding lives here (name -> canonical enc).
+let sym_enc = map_new ();
+// ⚠ EVERY SYMBOL THE PROGRAM NAMES, whether or not it has run yet. Ruby's
+// Symbol.all_symbols includes one written in source that execution has not
+// reached, because the parser has already made it -- so the LEXER registers
+// them, alongside the ones #to_sym makes at run time.
+let sym_all = map_new ();
+let sym_note = fn (sy: str) -> let _ = map_set sym_all sy VNil in sy;
+// the interned (deduplicated) frozen strings, keyed by encoding + content:
+// what `-str` and the literal `.freeze` special form answer.
+let str_intern_tbl = map_new ();
+// The whole match, by MatchData object id. `to_s` has no world to reach the
+// ivars through, and bootstraptest PRINTS its results -- a MatchData that
+// printed as "#<object>" is how this was found.
+let md_whole = map_new ();
+// A Time's instant, by object id. Comparison (cmp_vals) has no world to reach
+// the ivars through, and a Range of Times has to be able to compare its
+// bounds -- `(t1..t2).cover?(t)` is the case that found this.
+let time_inst = map_new ();
+// dummy encodings (stateful/wide converters, CRuby's list); a dummy is never
+// ASCII-compatible, and neither is any UTF-16/UTF-32 variant.
+// ASCII-8BIT is spelled BINARY from ruby 3.4 on, with the old name kept
+// beside it -- `#<Encoding:BINARY (ASCII-8BIT)>`. #name and #to_s still answer
+// "ASCII-8BIT"; only the inspect shows both.
+let enc_display_name = fn (nm: str) ->
+  if str_eq nm "ASCII-8BIT" then "BINARY (ASCII-8BIT)" else nm;
+let enc_is_dummy = fn (nm: str) ->
+  str_eq nm "UTF-16" || str_eq nm "UTF-32" || str_eq nm "IBM037" ||
+  str_eq nm "ISO-2022-JP" || str_eq nm "ISO-2022-JP-2" || str_eq nm "ISO-2022-JP-KDDI" ||
+  str_eq nm "CP50220" || str_eq nm "CP50221" || str_eq nm "UTF-7";
+// the canonical frozen string for this content + encoding: the FIRST frozen
+// holder registers itself (a dynamic string that interns becomes canonical),
+// later callers get that same object back.
+// MERE_RUBY_INTERN_LOG=1: one stderr line per intern-table hit and
+// registration, with the id and the CURRENT length of the canonical's
+// content -- a hit whose content length differs from the key's is a
+// canonical whose text was overwritten under it (the bundler `Illformed
+// requirement [""]` of 2026-09-03 was found through this line).
+let intern_log = map_new ();  // "on" -> 1, set by the driver from MERE_RUBY_INTERN_LOG
+let intern_log_on = fn (u: unit) -> map_has intern_log "on";
+let str_fstring = fn (v: Val) ->
+  match v with
+  | VStr h ->
+    (let k = senc_get h ++ chr 1 ++ sget h in
+     if map_has str_intern_tbl k then
+       (let hit = map_get str_intern_tbl k in
+        let _ = (if intern_log_on () then
+                   (match hit with
+                    | VStr hid -> print_err ("intern: hit \"" ++ sget h ++ "\" -> id " ++ str_of_int hid
+                                             ++ " content now \"" ++ sget hid ++ "\"")
+                    | _ -> ())
+                 else ()) in
+        hit)
+     else
+       let cv = (if sfrozen_get h then v
+                 else (let c = mkstr (sget h) in
+                       (match c with
+                        | VStr id -> (let _ = senc_set id (senc_get h) in let _ = sfrozen_set id in c)
+                        | _ -> c))) in
+       let _ = (if intern_log_on () then
+                  (match cv with
+                   | VStr cid -> print_err ("intern: new \"" ++ sget h ++ "\" -> id " ++ str_of_int cid
+                                            ++ (if sfrozen_get h then " (holder id " ++ str_of_int h ++ " was frozen)" else " (copy)"))
+                   | _ -> ())
+                else ()) in
+       let _ = map_set str_intern_tbl k cv in cv)
+  | _ -> v;
+let enc_ascii_compat = fn (nm: str) ->
+  if enc_is_dummy nm then false
+  else if str_len nm >= 6 && (str_eq (substring nm 0 6) "UTF-16" || str_eq (substring nm 0 6) "UTF-32") then false
+  else true;
+// procs/lambdas are handles into this store, which holds their block
+// (has, params, body, captured env) — the env is a Map, so like arrays a
+// proc lives behind an int handle rather than inside the Val variant.
+let proc_store = map_new ();
+// proc id -> the block in scope where the proc/lambda was created, so that
+// `yield` inside a proc body resolves to the DEFINING method's block (Ruby
+// semantics), not the block of whatever method later runs the proc.
+let proc_yblk = map_new ();
+let yblk_marker = "__yblk__~";
+// proc ids created via `lambda` — lambdas check arity strictly on call.
+let lambda_ids = map_new ();
+// A proc built from something that already knows its arity (Method#to_proc,
+// where ruby's answer is the METHOD's arity, not the `*args` forwarder's).
+let proc_arity = map_new ();
+// a sentinel prepended to a block's params when a lambda is installed as a
+// block (via &lambda): run_block detects it, strips it, and enforces strict
+// arity (a lambda yielded to raises ArgumentError on a count mismatch, unlike
+// a plain block). This threads lambda-ness through the existing 4-tuple.
+let lambda_blk_marker = "__lambda_blk__";
+// `m(&pr)`: the PROC the block came from. `Hash.new(&pr).default_proc` has to
+// be pr itself, and a block carries no identity of its own -- the same
+// carry-the-origin slot pattern `pending_home` already uses, written by
+// coerce_to_block and cleared by every other block path so it is never stale.
+let pending_srcproc = map_new ();
+let comp_inner = map_new ();     // composed proc id -> the callable run FIRST
+let comp_outer = map_new ();     // composed proc id -> the callable run on its result
+let curry_target = map_new ();   // curried proc id -> the proc it will call
+let curry_args = map_new ();     // curried proc id -> the arguments so far
+let curry_arity = map_new ();    // curried proc id -> how many it waits for
+// display name for an anonymous class/module once it is assigned to a
+// constant (internal "AnonClass_N"/"AnonModule_N" -> the constant's name).
+let anon_name = map_new ();
+// a define_method block captures the block active where it was defined, so a
+// `yield` inside the defined method reaches that block. Keyed "Cls#name" ->
+// VProc of the captured block (installed by invoke when the call site passes
+// no block of its own).
+// The name of the method running at each call depth. One map_set per call,
+// on the same path that already counts depth, so it costs a store and no
+// bookkeeping -- and it is the only thing resembling a backtrace mere-ruby
+// has. MERE_RUBY_STACKTRACE=1 dumps the innermost frames when the recursion
+// guard trips, which is how an unbounded recursion names itself.
+// set the first time any class defines `method_added`, so the per-def hook
+// check is a single map lookup in the overwhelmingly common case (nobody
+// defines one) rather than an ancestor walk.
+let hook_flags = map_new ();
+// The DEFAULT VISIBILITY for top-level `def`s. A bare `public` / `private` at
+// the top level is a MODE, not a call on names -- language/fixtures/def.rb
+// switches it with a bare `public` and the spec then asks Object for the
+// method by visibility. Only the `public :name` form was handled, so the mode
+// silently did nothing.
+let tl_vis = map_new ();
+
+// Kernel#set_trace_func: the proc ruby hands every event to. Kept behind a
+// flag in hook_flags, so a program that never installs one pays a single map
+// lookup per method call -- the same shape TracePoint(:class) uses.
+let trace_fn = map_new ();
+// Marshal's symbol table: symbols are written once and back-referenced by
+// index afterwards, so a load has to remember them in order.
+let mrsh_syms = map_new ();
+// Marshal.dump's own symbol table: the format writes a symbol once and refers
+// to it by index afterwards, and every UTF-8 String carries the :E ivar, so
+// without the table the output is valid but never byte-identical to ruby's.
+let mrsh_dsyms = map_new ();
+// the position a lookbehind body must end at, so that its own backtracking
+// picks a branch of the right length. Saved and restored around each attempt
+// (a lookbehind may contain another one).
+let rxv_lb_end = map_new ();
+let dm_captured = map_new ();
+// whether the frame a define_method block was written in had a block of its
+// own -- the answer `block_given?` gives inside the defined method
+let dm_had_blk = map_new ();
+// methods defined via define_method, keyed "Cls#name". A bare (implicit-args)
+// `super` inside such a method raises RuntimeError in Ruby, since a block has
+// no fixed argument list to forward.
+let dm_methods = map_new ();
+// a define_method block/lambda is a closure over the scope where it was
+// defined, so the defined method's body can read those locals. Keyed
+// "Cls#name" -> VProc whose stored block carries the captured env; run_meth
+// seeds the call frame from it (see dm_store_closure).
+let dm_closenv = map_new ();
+// an aliased method remembers the class/module its source was defined in,
+// keyed "Cls#newname" -> origin class. A `super` inside the aliased method
+// resumes above the ORIGIN, not above the class the alias lives in.
+let alias_origin = map_new ();
+// the original name an alias was made from, keyed "Cls#newname" -> old name,
+// so a `super` inside the aliased method searches for the SOURCE method name.
+let alias_srcname = map_new ();
+// alias_method whose SOURCE is a builtin (e.g. `alias_method :plus, :+` on a
+// String subclass): keyed "Cls#newname" -> builtin op name. Dispatched by
+// delegating to prim_method on the receiver, since the source has no AST body.
+let builtin_alias = map_new ();
+// `Warning[:deprecated] = true` — the warning-category switches, remembered so
+// a program reads back what it set.
+let warn_cats = map_new ();
+// `trace_var(:$g) { }`: the proc to run when that global is assigned. Behind
+// the "gvt" hook flag, so an untraced program pays one map lookup per global
+// write and nothing else.
+let gvar_traces = map_new ();
+// `/.../o` results, keyed by the literal's source site (file:offset).
+let rx_once = map_new ();
+// hash handles that originate from keyword-argument syntax (`key: v` / `**h`)
+// at a call site, as opposed to a positional `{...}` literal or hash variable.
+// Ruby 3.0 keeps these separate: only a kwarg-origin trailing hash binds to a
+// method's keyword / **kwrest parameters; a positional hash stays positional.
+let kwarg_marks = map_new ();
+// hashes marked by `Hash.ruby2_keywords_hash` (and by a ruby2_keywords method
+// keeping a `key:` hash). This mark is a property of the HASH and outlives any
+// one call, unlike kwarg_marks, which says "written as key: at this call site"
+// and is cleared when a method without keyword parameters absorbs it.
+let r2k_marks = map_new ();
+let mark_kw = fn (id: int) -> let _ = map_set kwarg_marks (str_of_int id) VNil in ();
+let is_kw_hash = fn (v: Val) -> match v with VHsh id -> map_has kwarg_marks (str_of_int id) | _ -> false;
+// methods marked `ruby2_keywords` (by bare name): a trailing `key:` hash they
+// receive into *args keeps its kwarg mark instead of being demoted, so a later
+// re-splat forwards it as keywords. Cleared when the method is redefined.
+let r2k_methods = map_new ();
+let r2k_procs = map_new ();      // proc ids flagged by Proc#ruby2_keywords
+// ⚠ that flag is shared between a proc and its COPIES, in both directions:
+// ruby marks the underlying method, so `f2 = f1.dup; f1.ruby2_keywords` marks
+// f2 as well -- and the spec asks it in that order too. This maps a copy to the
+// proc it came from, and the mark is read and written at the ROOT of that
+// chain, which is the only key both objects agree on.
+let proc_origin = map_new ();
+// refinements. `refine Target do ... end` (inside a Module.new body) records,
+// per refinery module, the target class and a fresh impl_cls class holding the
+// refined methods. `using refinery` activates them into ref_active (target
+// class name -> impl_cls class name); register_class save/restores ref_active so a
+// `using` inside a module body is scoped to that body (Ruby's lexical scope).
+let refine_cnt = map_new ();   // "<refinery>"      -> VInt count
+let refine_tgt = map_new ();   // "<refinery>#<i>"  -> VStr target class
+let refine_cls = map_new ();   // "<refinery>#<i>"  -> VStr impl_cls class
+let ref_active = map_new ();   // "<target>"        -> VStr impl_cls class
+// per-case memo of #deconstruct / #deconstruct_keys results, so a case with
+// several `in` clauses calls the method once (Ruby caches). Keyed by value
+// handle; cleared at the start of each case.
+let deco_memo = map_new ();
+// Binding objects: id -> the captured local-variable env (which already
+// holds "self"). `binding` captures the current env; eval(str, b) and
+// b.eval(str) re-enter the interpreter against it.
+// The shared placeholder cenv for blk tuples built without a real captured
+// env. It must be A map of the env type -- NOT ivars (that unified the world
+// with the env region and pinned both to __heap; see the collector notes) --
+// and it must be ONE map: a fresh map_new at each of the five sites sat on
+// the object-creation path and cost ~200 bytes per `new`. Never read.
+let gc_cenv0 = map_new ();
+// The DRIVER's carried value: the result of the last top-level statement,
+// which the `--eval-print` harness mode prints when the program ends. It
+// lives in a Mere local between two chunks, so the collection that runs at
+// the chunk boundary could not see it: a program that made enough garbage to
+// trigger one collection printed `map_get: key not found in Map` instead of
+// its value (bootstraptest's test_ractor/p22, 30 rounds of ractors). Every
+// other in-flight value is either in `env` or below a safepoint that refuses
+// to collect; this one is above them all.
+let gc_hold = map_new ();
+let bind_store = map_new ();
+// snapshot a locals env by value: `binding` must capture the scope AS IT IS
+// at capture time, isolated from same-named variables assigned in an
+// enclosing scope afterward. The copy is still a persistent mutable Map, so
+// eval(str, b) can define and read locals in the binding's own scope across
+// calls. (A chained env is flattened first — see lv_flat.)
+let map_copy = fn m ->
+  let d = map_new () in
+  let _ = map_iter m (fn (k: str) -> fn (v: Val) -> map_set d k v) in
+  d;
+
+// ---- lexical scope chain ------------------------------------------------
+// A locals env is a Map, but Ruby blocks nest scopes: a block's params and
+// the locals it first assigns are block-local, while a name bound further
+// out stays the SAME cell (assigning it inside the block is visible after).
+// So a block body runs in a fresh child frame linked to its defining scope:
+// lookup walks the chain, and assignment writes to the frame that already
+// binds the name, otherwise declaring it in the innermost one. Because a
+// proc/lambda captures the frame itself, the block-locals it closes over
+// outlive the invocation — Ruby's closure semantics, which a single flat map
+// with save/restore teardown could not express (the teardown deleted the
+// very bindings the closure had captured).
+// The ancestor chain of a class is asked for on EVERY dispatch -- `i + 1`
+// asks whether Integer (then Numeric, then Object) redefines `+` -- and
+// rebuilding it means splitting the include lists and appending fresh string
+// lists each time. It changes only when someone includes, prepends, or names
+// a superclass, so it is memoized against a counter those bump.
+//
+// MERE_RUBY_NO_MRO_CACHE=1 turns the memo off and recomputes every time: the
+// old definition kept as an oracle, so the two can be compared over the whole
+// corpus rather than trusted.
+let mro_gen = map_new ();
+let mro_anc = map_new ();      // cls -> its linearized ancestors
+let mro_anc_gen = map_new ();  // cls -> the generation that list was built at
+let mro_mods = map_new ();     // cls -> the modules included into it, expanded
+let mro_mods_gen = map_new ();
+let mro_bump = fn () ->
+  let n = (if map_has mro_gen "n" then map_get mro_gen "n" else 0) in
+  map_set mro_gen "n" (n + 1);
+let mro_now = fn () -> if map_has mro_gen "n" then map_get mro_gen "n" else 0;
+
+let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
+let lv_ctr = map_new ();   // "n" -> next frame id
+let lv_child = fn parent ->
+  let e = map_new () in
+  let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
+  let _ = map_set lv_ctr "n" (n + 1) in
+  let _ = map_set e "__eid" (VInt n) in
+  let _ = map_set lv_up (str_of_int n) parent in
+  e;
+// (has_parent, parent). There is no null env, so a root echoes itself back.
+let lv_parent_of = fn env ->
+  if map_has env "__eid" then
+    (match map_get env "__eid" with
+     | VInt n ->
+       let k = str_of_int n in
+       if map_has lv_up k then (true, map_get lv_up k) else (false, env)
+     | _ -> (false, env))
+  else (false, env);
+// the frame that binds `n`, or `env` itself when no frame in the chain does
+// (so a fresh assignment declares the local in the innermost frame).
+// (found, frame) — the frame in the chain that binds `n`. When nothing binds
+// it the flag is false and the frame is meaningless: callers that declare
+// (lv_set) must fall back to the INNERMOST env they were handed, or a fresh
+// block-local would be created out in the method scope and leak.
+let rec lv_owner = fn env -> fn (n: str) ->
+  if map_has env n then (true, env)
+  else let (has, p) = lv_parent_of env in
+       if has then lv_owner p n else (false, env);
+// A frame that ESCAPES its call -- a proc/lambda body, a captured yield
+// block, a Thread body -- must never be recycled into the frame pool, and
+// neither may any parent on its scope chain (the proc reads and writes
+// through the chain). Marked at the choke points where an env leaves the
+// call's extent; run_meth recycles only unmarked frames.
+let rec mark_captured = fn env ->
+  if map_has env "__captured" then ()
+  else
+    let _ = map_set env "__captured" (VBool true) in
+    (match lv_parent_of env with
+     | (true, p) -> mark_captured p
+     | _ -> ());
+
+// The choke points: every proc-shaped store goes through these, so the
+// capture marking cannot be forgotten at one of the twenty-two write sites.
+// THE FRAME POOL. A method call's frame dies at return unless captured
+// (mark_captured above); a dead frame is recycled -- entries wiped, its
+// private arena wound back to one warm 4 KB seed (mere v0.1.300) -- and
+// parked here for the next call. Frames were the single largest unreclaimed
+// share (12 GB of a rubocop load): every call allocated ~1.8 KB of map
+// machinery into the default region, permanently. Pooled, a call's frame
+// costs its ENTRIES only, in an arena that is handed back at return.
+let frame_pool = vec_new ();
+let frame_pool_n = map_new ();
+// Can this target measure an arena at all? `map_bytes` / `vec_bytes` report the
+// arena BYTES behind a store, and on RV32I -- where a program is the machine --
+// a Vec is a plain heap block with no arena behind it, so there is no number to
+// give and the call stops.
+//
+// Asked ONCE, here, and not per call. `frame_pool_put` runs on every frame
+// release and `gc_store_bytes` on every pressure check, so a `try_or` inside
+// either would install a fail handler in the hottest path in the interpreter.
+//
+// The false branch does not substitute 0. A byte count of 0 reads as "nothing
+// was held", which is a measurement, and this is the absence of one -- so the
+// counters are simply not kept, and the diagnostic rows that print them say so.
+let arena_measurable = try_or (fn (u: unit) -> let _ = map_bytes frame_pool_n in true) false;
+let pool_ctr = fn (k: str) ->
+  map_set frame_pool_n k ((if map_has frame_pool_n k then map_get frame_pool_n k else 0) + 1);
+let frame_pool_get = fn (u: unit) ->
+  let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
+  if n > 0 then
+    (let _ = pool_ctr "hits" in
+     let _ = map_set frame_pool_n "n" (n - 1) in
+     vec_get frame_pool (n - 1))
+  else
+    (let _ = pool_ctr "news" in
+     let f = map_new () in
+     let _ = map_recycle f in   // promote: give it its own arena from birth
+     f);
+let frame_pool_put = fn f ->
+  // count the bytes this frame's arena held BEFORE the wind-back: that sum is
+  // the deterministic answer to "was anything reclaimed" that peak RSS is not
+  // (peak RSS above a few GB varies 2x between identical runs, recorded below).
+  let _ =
+    if arena_measurable then
+      map_set frame_pool_n "bytes"
+        ((if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) + map_bytes f)
+    else () in
+  let _ = map_recycle f in
+  let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
+  // cap the pool at the deepest call stack seen; past that, drop the frame
+  // (its arena was already wound back, so the residue is the struct alone).
+  if n >= 4096 then (pool_ctr "drops")
+  else
+    (let _ = pool_ctr "puts" in
+     let _ = (if n < vec_len frame_pool then vec_set frame_pool n f
+              else vec_push frame_pool f) in
+     map_set frame_pool_n "n" (n + 1));
+
+// A BLOCK's env comes from the same pool. It used to be `lv_child cenv`: a
+// fresh Map in the default region plus a permanent lv_up entry, per
+// invocation, never given back -- so `n.times { }` cost ~450-870 B more per
+// iteration than the same loop written as `while`, for the life of the
+// process, while a method call had been taking its frame from the pool since
+// v0.1.300. Measured before/after in bench/block_env.sh. The lv_up entry
+// leaves with the env: the pool IS the on-stack registry that pruning lv_up
+// was waiting for (a frame is put back only once it is off the stack).
+//
+// An env a proc/lambda/Thread body captured is left alone, lv_up entry
+// included -- mark_captured painted it and every parent on its chain at the
+// choke point (store_proc / store_yblk), and the closure reads and writes
+// through that chain later. `for` blocks never come here: they run in the
+// enclosing env directly.
+let blk_env_get = fn parent ->
+  let e = frame_pool_get () in
+  let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
+  let _ = map_set lv_ctr "n" (n + 1) in
+  let _ = map_set e "__eid" (VInt n) in
+  let _ = map_set lv_up (str_of_int n) parent in
+  e;
+let blk_env_put = fn e ->
+  if map_has e "__captured" then pool_ctr "blk_kept"
+  else
+    (let _ = (if map_has e "__eid" then
+                (match map_get e "__eid" with
+                 | VInt n -> map_delete lv_up (str_of_int n)
+                 | _ -> ())
+              else ()) in
+     let _ = pool_ctr "blk_puts" in
+     frame_pool_put e);
+
+// Per-statement / per-call bookkeeping. These used to be str -> Val maps, and
+// every write of an existing key copies the new value into the map's arena --
+// a fresh VInt box per statement executed, per call made, orphaning the last
+// one -- into the default region, which nothing gives back: 260 MB of a 400k-
+// iteration loop's 302 MB default growth was eleven such maps (attributed by
+// bench/def_maps.sh, 2026-09-03). An int value is stored by value: the
+// overwrite allocates nothing. The str -> str ones (cur_pos_s, call_*_s) go
+// through map_set_s below, which writes only when the text changes -- in a
+// loop it is the same method at the same depth in the same file every time.
+let cur_pos = map_new ();
+let cur_pos_s = map_new ();
+let map_set_s = fn m -> fn (k: str) -> fn (v: str) ->
+  if map_has m k && str_eq (map_get m k) v then () else map_set m k v;
+let cur_line = fn () ->
+  if map_has cur_pos "l" then map_get cur_pos "l" else 0;
+let cur_file = fn () ->
+  if map_has cur_pos_s "f" then map_get cur_pos_s "f" else "";
+// where the proc was WRITTEN, for #source_location and #to_s. Stamped here
+// rather than carried through the AST: every proc goes through store_proc, and
+// the executing statement's file and line are the block's own -- a block is
+// created as the call that takes it is evaluated.
+let proc_src = map_new ();
+let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
+let meth_src = map_new ();       // "cls#name" -> line, "f" ++ key -> file
+let stamp_meth_src = fn (key: str) ->
+  let _ = map_set meth_src key (VInt (cur_line ())) in
+  map_set meth_src ("f" ++ key) (mkstr (cur_file ()));
+// the definition site of one method is the definition site of another when
+// the second was made FROM the first (an alias, or a define_method given a
+// Method). The three lines that move it were written out at each `alias` site
+// separately; a rule written once per site is a rule with one answer per site.
+let copy_meth_src = fn (dst: str) -> fn (src: str) ->
+  if map_has meth_src src && map_has meth_src ("f" ++ src)
+  then (let _ = map_set meth_src dst (map_get meth_src src) in
+        map_set meth_src ("f" ++ dst) (map_get meth_src ("f" ++ src)))
+  else ();
+// a BLOCK's definition site is the call that takes it, so `stamp_meth_src` is
+// right for `define_method(:m) { }`. A PROC handed to define_method was
+// written somewhere else entirely and carries its own site -- the call that
+// installs it is not where it was defined.
+let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
+  if map_has proc_src pk && map_has proc_src ("f" ++ pk)
+  then (let _ = map_set meth_src key (map_get proc_src pk) in
+        map_set meth_src ("f" ++ key) (map_get proc_src ("f" ++ pk)))
+  else ();
+let store_proc = fn (k: str) -> fn entry ->
+  let (_, _, _, penv) = entry in
+  let _ = mark_captured penv in
+  let _ = (if map_has proc_src k then () else map_set proc_src k (VInt (cur_line ()))) in
+  let _ = (if map_has proc_src ("f" ++ k) then () else map_set proc_src ("f" ++ k) (mkstr (cur_file ()))) in
+  map_set proc_store k entry;
+let store_yblk = fn (k: str) -> fn b ->
+  let (_, _, _, cenv) = b in
+  let _ = mark_captured cenv in
+  map_set proc_yblk k b;
+
+let lv_has = fn env -> fn (n: str) -> let (found, _) = lv_owner env n in found;
+let lv_get = fn env -> fn (n: str) ->
+  let (found, f) = lv_owner env n in
+  if found then map_get f n else VNil;
+let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
+  let (found, f) = lv_owner env n in
+  map_set (if found then f else env) n v;
+let lv_del = fn env -> fn (n: str) ->
+  let (found, f) = lv_owner env n in
+  if found then map_delete f n else ();
+// flatten a chain into one detached map (inner shadows outer). `binding` and
+// the env copies that install a different self must not write back through
+// the chain, so the flattened copy carries no parent link.
+let rec lv_flat_into = fn env -> fn d ->
+  let (has, p) = lv_parent_of env in
+  let _ = if has then lv_flat_into p d else () in
+  let _ = map_iter env (fn (k: str) -> fn (v: Val) -> map_set d k v) in
+  ();
+let lv_flat = fn env ->
+  let d = map_new () in
+  let _ = lv_flat_into env d in
+  let _ = if map_has d "__eid" then map_delete d "__eid" else () in
+  d;
+// read a map whose keys are "0".."n-1" (insertion order) back into a list;
+// used to collect map_iter results (which can only side-effect) into an array.
+let rec idx_to_list = fn tmp -> fn (i: int) -> fn (n: int) ->
+  if i >= n then (Nil : Val list)
+  else Cons (map_get tmp (str_of_int i), idx_to_list tmp (i + 1) n);
+// monotonic counter for anonymous class/module/Struct names (map_len of a
+// store collides before any instance exists — e.g. Class.new(Class.new)
+// would name the subclass after its superclass, giving a sup self-loop — so
+// draw fresh names from a dedicated counter instead).
+let struct_ctr = map_new ();
+// struct class name -> its members, as a VArr of symbols. A struct's inspect
+// is the one object shape ruby prints WITHOUT an address (`#<struct S a=1>`),
+// so it can be reproduced byte for byte -- but only if the member ORDER is
+// kept, which the generated #members method cannot be asked for cheaply.
+let struct_mem = map_new ();
+let fresh_anon = fn (prefix: str) ->
+  let n = (if map_has struct_ctr "n" then map_get struct_ctr "n" else 0) in
+  let _ = map_set struct_ctr "n" (n + 1) in
+  prefix ++ str_of_int n;
+// break-through-yield home tracking: each method invocation gets a unique
+// frame id; a block captured by a `&blk` param remembers the frame it was
+// passed to (its "home"), so a `break` inside it — even after the block has
+// been delegated down through other methods — unwinds to that home method.
+let next_fid = fn () ->
+  let n = (if map_has struct_ctr "f" then map_get struct_ctr "f" else 0) in
+  let _ = map_set struct_ctr "f" (n + 1) in
+  n + 1;
+let proc_home = map_new ();     // str(proc id) -> VInt home-frame-id
+let pending_home = map_new ();  // single slot: home fid of a &proc being passed as a block
+let live_frames = map_new ();   // str(fid) -> 1 while that method frame is on the stack
+// the counter in an internal anonymous name ("AnonClass_7" -> 7), used as the
+// address Ruby shows. Stable for the life of the program, like an object id.
+let is_anon_cls = fn (c: str) ->
+  (str_len c >= 10 && str_eq (substring c 0 10) "AnonClass_") || (str_len c >= 11 && str_eq (substring c 0 11) "AnonModule_")
+  // a struct class is anonymous too until something names it: ruby answers
+  // nil for `Struct.new(:a).name`, and "Struct::Foo" once it is given one.
+  || (str_len c >= 7 && str_eq (substring c 0 7) "Struct_");
+// name_anon (records a constant name for an anonymous class/module the first
+// time it is assigned to a constant) is defined in the mutual-recursion block
+// below, since it recurses through the receiver's constants.
+// singleton methods on handle-based values (String/Array/Hash): keyed by
+// "str:<h>" / "arr:<h>" / "hsh:<h>" -> the value's singleton class name.
+// one arena block, reused: 64 KiB is the read size and the write chunk.
+let tcp_buf = map_new ();
+let tcp_arena = fn () ->
+  if map_has tcp_buf "p" then (match map_get tcp_buf "p" with VInt p -> p | _ -> 0)
+  else (let p = mem_alloc 65536 in let _ = map_set tcp_buf "p" (VInt p) in p);
+
+let hng_store = map_new ();
+// class variables (@@x): "Cls@x" -> value, resolved up the superclass chain.
+let cvars = map_new ();
+// regex capture-group spans recorded during the latest match attempt
+// ("sN"/"eN" -> string index).
+let rx_caps = map_new ();
+// compiled-regex program cache: "flags<SOH>pattern" -> prog map; rx_bad marks
+// patterns the new engine cannot compile (the legacy matcher handles them).
+let num_misuse_note = map_new ();
+let rx_progs = map_new ();
+let rx_bad = map_new ();
+// \G anchor position: the start offset of the current search (scan/gsub pass
+// it the cursor). \G (IGANCHOR) matches only when the cursor sits exactly
+// here, so scan/gsub produce contiguous, gap-free matches like Ruby.
+let rx_ganchor = map_new ();
+// lenient regex-parse mode: set while VALIDATING a regex literal at ruby-parse
+// time — constructs the engine does not support yet are accepted (they fall
+// back to the legacy matcher at runtime), while truly invalid syntax still
+// fails (a Ruby SyntaxError / RegexpError).
+let rx_lenient = map_new ();
+// Named groups seen so far in the pattern being parsed: the number (for
+// `\k<name>`) and the body (for `\g<name>`, which re-matches the group's
+// pattern at the call site). Cleared at the start of every parse.
+let rx_gnums = map_new ();
+// ...and EVERY number a name was given, comma-joined: `(?<a>x)(?<b>y)(?<a>z)`
+// is legal, and ruby answers the LAST group of that name that participated
+// (#[], #named_captures) while listing the name once, where it first appears.
+// rx_gnums keeps the first, which is what a backreference means. The value is
+// a plain string, not a Val: the collector never sees this table, and a map of
+// handles would have to be a GC root (tools/gc_roots_check.sh says so).
+let rx_gnall = map_new ();
+let rx_gbodies = map_new ();
+// Per compiled pattern (same key as rx_progs): its named groups, as
+// "name=number|name=number|...". A MatchData answers `m[:name]` from this.
+let rx_prog_names = map_new ();
+// the cache key of the pattern currently being matched, so the MatchData it
+// publishes can name its groups.
+let rx_cur = map_new ();
+// regex literals recorded by the ruby parser ("e<i>" -> "flags\nbody", "n" =
+// count, "done" = validated prefix); validated right after each parse (eval /
+// require / main), so an invalid literal is a parse-time SyntaxError while
+// engine-unsupported ones pass (legacy fallback).
+let rx_pending = map_new ();
+// Warnings the PARSER found. It has no `world`, so it cannot ask $stderr (which
+// a program may have replaced -- mspec's `complain` does exactly that) nor read
+// $VERBOSE; both need the interpreter. So the parser NOTES them, with the
+// location already in the text because by flush time the current position is
+// the driver's, and whoever drove the parse flushes them. Same shape as
+// rx_pending above, which validates regexp literals the same way.
+let warn_pending = map_new ();
+let warn_note = fn (s: str) ->
+  let n = (if map_has warn_pending "n" then (match map_get warn_pending "n" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set warn_pending ("w" ++ str_of_int n) (mkstr s) in
+  map_set warn_pending "n" (VInt (n + 1));
+// container handles currently being inspected — breaks self-referential
+// structures (Ruby prints such a cycle as "[...]" / "{...}") instead of
+// recursing forever.
+//
+// ⚠ The key carries the KIND ("a3" / "h3"). Array ids come from arr_ctr and
+// hash ids from vec_len hash_store: two independent counters, so bare integers
+// would make array 3 and hash 3 the same entry and print "[...]" for an array
+// that merely sat inside hash 3.
+let insp_seen = map_new ();
+// container handles on the current traversal for the NON-printing walks
+// (Array#hash, Array#<=>). Deliberately not insp_seen: a mark left by a printer
+// would make a hash computed inside it return the cycle constant instead of the
+// real value, and the two walks can in principle nest.
+let cyc_seen = map_new ();
+// set while an array hash walks into a cycle: once a self-reference is seen,
+// the WHOLE hash collapses to one constant, which is how ruby makes
+// `rec.hash == [rec].hash == [[rec]].hash` for `rec = []; rec << rec`.
+let cyc_flag = map_new ();
+// Hash#compare_by_identity: the marked hashes, by handle id. Their lookups
+// compare keys with `equal?` rather than `==`, so two equal Strings are two
+// different keys.
+let hcbi = map_new ();
+let hcbi_on = fn (id: int) -> map_has hcbi (str_of_int id);
+// the hash code each stored key had when it was stored: "<hash handle>|<key>".
+let hstored = map_new ();
+// the keyword hash the current #full_message was called with, for the
+// #detailed_message it delegates to.
+let fm_kw = map_new ();
+// a hash DERIVED from one that compares by identity keeps the flag: select,
+// reject, except, slice, dup and clone all answer a compare_by_identity? hash
+// in ruby. Every derived hash was built with a plain mkhash, which loses it.
+let hcbi_copy = fn (src: int) -> fn (dst: Val) ->
+  match dst with
+  | VHsh d -> (if map_has hcbi (str_of_int src) then map_set hcbi (str_of_int d) 1 else ())
+  | _ -> ();
+
+
+// nesting depth of active catch(:tag) blocks (throw without any catch
+// raises UncaughtThrowError immediately).
+let catch_depth = map_new ();
+// true while running directly inside a Thread.new block (reset on entering a
+// method, which is a return boundary): a bare `return` there is a LocalJumpError.
+let thread_flag = map_new ();
+// synchronous-thread model state: the current Thread object, and a registry
+// of every spawned thread (for Thread.list / ThreadGroup#list).
+let cur_thr = map_new ();
+let all_thr = map_new ();
+let dfl_tg = map_new ();
+// expression-position flow (break/next/redo/return inside an expression)
+// unwinds via fail with the kind and value parked here; loop/method/block
+// runners catch and convert back into a Flow.
+let flow_sig = map_new ();
+// run_block's "did the body finish without raising" flag. It lived in flow_sig
+// as a VBool, written twice per block invocation -- two orphaned boxes in the
+// default region each time (34 MB of a 400k-iteration loop). An int, saved and
+// restored around the body instead of deleted, so nesting still works and no
+// key is ever re-inserted: the outer's 0 survives an inner block's 1.
+let blk_ok = map_new ();
+
+// Blocks registered with Kernel#at_exit, keyed by the order they were given:
+// they run in the REVERSE of it, after the program (and after an uncaught
+// exception has been reported), and before an explicit `exit`.
+let at_exits = map_new ();
+
+// One END { } in the source registers once, however many times control
+// reaches it: the parser numbers the sites and this remembers which have
+// registered. (`END` inside a loop is the case ruby names explicitly.)
+let end_sites = map_new ();
+let end_ctr = map_new ();
+let end_site_next = fn () ->
+  let n = (if map_has end_ctr "n" then map_get end_ctr "n" else 0) in
+  let _ = map_set end_ctr "n" (n + 1) in n;
+// flip-flop operator state: one on/off flag per lexical site. Sites are
+// numbered at parse time (map_len allocates), so each eval gets fresh ones.
+let ff_state = map_new ();
+// parser modes: "nobrace" suppresses brace-block attachment (lambda
+// parameter defaults — the { after them is the lambda body).
+let parser_flags = map_new ();
+// parse-time gensym counter for `rescue E => <complex lvalue>`: the exception
+// binds to a fresh temp, then a synthesized assignment writes it to the target.
+// a block written with an explicit-but-empty parameter list (`{ || ... }`)
+// carries this sentinel so the parser can reject a numbered parameter in the
+// body (`proc { || _1 }` is a SyntaxError); it is stripped before the block runs.
+let empty_bp_marker = "~emptyparams~";
+// parse-time gensym for op-assign temporaries (so `(expr)::C op= v` evaluates
+// the receiver expression exactly once).
+let tmp_ctr = map_new ();
+let fresh_tmp = fn () ->
+  let n = (if map_has tmp_ctr "n" then (match map_get tmp_ctr "n" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set tmp_ctr "n" (VInt (n + 1)) in
+  "~opasgn~" ++ str_of_int n;
+let resc_ctr = map_new ();
+let fresh_resc = fn () ->
+  let n = (if map_has resc_ctr "n" then (match map_get resc_ctr "n" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set resc_ctr "n" (VInt (n + 1)) in
+  "__resc~" ++ str_of_int n;
+// a non-constant rescue class expression (`rescue rescuer`, `rescue -> {..}.call`)
+// is stashed here and referenced from the class list by a "@rexpr~N" sentinel;
+// it is evaluated at match time (so `rescue <expr>` runs only when needed).
+let resc_exprs = map_new ();
+let resc_reg = fn (e: Expr) ->
+  let n = (if map_has resc_ctr "e" then (match map_get resc_ctr "e" with VInt k -> k | _ -> 0) else 0) in
+  let _ = map_set resc_ctr "e" (VInt (n + 1)) in
+  let _ = map_set resc_exprs (str_of_int n) e in
+  "@rexpr~" ++ str_of_int n;
+// require bookkeeping: "dir" = the current file's directory (require_relative
+// resolves against it); loaded_files dedups double-loads.
+let load_ctx = map_new ();
+// where execution is: the line of the statement being run (0 = not known, e.g.
+// inside a body that was synthesised rather than parsed).
+let call_names_s = map_new ();
+let call_files_s = map_new ();
+let call_meths_s = map_new ();
+// the method the innermost frame is running ("" at the top level)
+let cur_meth = fn () ->
+  if map_has cur_pos_s "m" then map_get cur_pos_s "m" else "";
+// The label ruby writes in a frame. Through 3.3 it was the method alone, so
+// this stripped the owner off the "Cls#meth" the call stack records; 3.4 names
+// the owner -- `Object#top` for a top-level def, `K#inst` for an instance
+// method, `K.cm` for a singleton one -- so the owner is what has to be put
+// back, and supplied when the recorded name has none.
+// `<main>` and `block in ...` are not methods and keep their own shape.
+let rec all_digits_go = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then i > 0
+  else if is_digit (char_at s i) then all_digits_go s (i + 1)
+  else false;
+let all_digits = fn (s: str) -> all_digits_go s 0;
+let meth_label = fn (n: str) ->
+  if str_len n == 0 then n
+  else if str_eq (substring n 0 1) "<" then n
+  else if str_len n >= 9 && str_eq (substring n 0 9) "block in " then n
+  else
+    let i = str_index_of n "#" in
+    if i < 0 then "Object#" ++ n
+    else
+      let cls = substring n 0 i in
+      let m = substring n (i + 1) (str_len n) in
+      // a singleton class prints as the class with a dot: (sng:K)#cm -> K.cm
+      // ⚠ ...but an OBJECT's singleton has no name to print. Its singleton
+      //   class is "(sng:<id>)", and mere-ruby was putting the id in the
+      //   backtrace: `111.sing1`. ruby labels such a method with its NAME
+      //   alone -- `def o.m` and a `def` inside instance_exec both read as
+      //   'm'. An id in a backtrace is not a name; it is this run's arithmetic.
+      if str_len cls >= 5 && str_eq (substring cls 0 5) "(sng:"
+      then (let inner = substring cls 5 (str_len cls - 1) in
+            if all_digits inner then m else inner ++ "." ++ m)
+      else if str_eq cls "" then "Object#" ++ m
+      else cls ++ "#" ++ m;
+// the line each call was made on, and the file it was made in, per call depth.
+// call_names (further down) already holds the method name per depth, so these
+// two complete the stack.
+let call_lines = map_new ();
+let loaded_files = map_new ();
+// __ENCODING__ is a parse-time constant: the source encoding of the file (or
+// eval string) being parsed. The parser captures the current script encoding
+// (load_ctx "coding", set before lex/parse by run_prog/require/eval) into the
+// EVar name as "__ENCODING__~<NAME>"; eval resolves it to the Encoding object.
+// The file whose source is being parsed right now. do_require sets "parsing"
+// before it lexes; the entry script's "file" is set before parsing it. Reading
+// it at PARSE time is the point: `__FILE__`, `__dir__` and `require_relative`
+// name the file their expression is WRITTEN in, and the loader's idea of the
+// current file is whatever it is loading at the moment the code RUNS. A method
+// or a block that runs after its own file finished loading saw the wrong one --
+// bundler's settings.rb hands a block containing `require_relative` to
+// SharedHelpers.filesystem_access, which yields it from another file entirely.
+let parse_time_file = fn (u: unit) ->
+  // ⚠ the ruby-visible NAME of what is being parsed is not the diagnostic
+  // label. `load_ctx "parsing"` holds "(eval) <the first 60 characters>" so a
+  // parse error can quote the string it failed in -- and `__FILE__` inside that
+  // string then answered the quote. Two questions about one parse, and only one
+  // slot for both: "pfile" is the name, "parsing" is the label.
+  let pf9 = (if map_has load_ctx "pfile" then (match map_get load_ctx "pfile" with VStr h -> sget h | _ -> "") else "") in
+  if (if str_eq pf9 "" then false else true) then pf9 else
+  let p = (if map_has load_ctx "parsing" then (match map_get load_ctx "parsing" with VStr h -> sget h | _ -> "") else "") in
+  if str_eq p "" then
+    (if map_has load_ctx "file" then (match map_get load_ctx "file" with VStr h -> sget h | _ -> "") else "")
+  else p;
+let enc_pseudo_var = fn (id: str) ->
+  if str_eq id "__ENCODING__" then
+    (let c = (if map_has load_ctx "coding" then (match map_get load_ctx "coding" with VStr s -> sget s | _ -> "UTF-8") else "UTF-8") in
+     EVar ("__ENCODING__~" ++ (if str_eq c "" then "UTF-8" else c)))
+  // `__FILE__` / `__dir__` carry the parsed file in the EVar name, exactly as
+  // __ENCODING__ carries the encoding. Without a file to name (an eval string
+  // before anything has been loaded) the dynamic reading in eval_e is kept.
+  else if str_eq id "__FILE__" || str_eq id "__dir__" then
+    (let f = parse_time_file () in
+     if str_eq f "" then EVar id else EVar (id ++ "~" ++ f))
+  else EVar id;
+// `__LINE__` is the line it is WRITTEN on, so it is a literal from here -- the
+// same reasoning as __FILE__ above. Line 0 means the lexer had nothing to say
+// (an eval string with no newline in it at all), and eval_e's fallback answers.
+let enc_pseudo_var_at = fn (id: str) -> fn (line: int) ->
+  if str_eq id "__LINE__" && line > 0 then EInt line else enc_pseudo_var id;
+// Kernel#ruby_exe support: a redirectable output sink. While io_cap["on"] is
+// set, puts/print/p append to io_cap["buf"] instead of the real stdout, so
+// __ruby_exe can capture a snippet's output (an in-process approximation of
+// mspec's subprocess ruby_exe).
+let io_cap = map_new ();
+// A ruby String may hold a zero byte, and `print` / `print_no_nl` write with
+// the C string functions, which stop there: `print Zlib.gzip(x)` came out as
+// the two bytes before the first NUL. `print_bytes` writes a length, so the
+// I/O boundary is crossed as bytes. It is only used when the string actually
+// holds a NUL, so the ordinary path is untouched.
+let rec str_has_nul_go = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then false
+  else if ord (char_at s i) == 0 then true
+  else str_has_nul_go s (i + 1);
+let str_has_nul = fn (s: str) -> str_has_nul_go s 0;
+// Copy a string into the byte arena and write it. `mem_copy_str` walks a C
+// string and stops at a zero byte, so a payload that has one is copied byte by
+// byte instead -- the same split the output path makes.
+let rec tcp_put_bytes = fn (p: int) -> fn (s: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then () else (let _ = mem_set_u8 p i (ord (char_at s i)) in tcp_put_bytes p s (i + 1) n);
+let tcp_put = fn (fd: int) -> fn (s: str) ->
+  let p = tcp_arena () in
+  let n = str_len s in
+  let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
+  tcp_write fd p n;
+let out_write_raw = fn (s: str) ->
+  if str_has_nul s then print_bytes (bytes_of_str s) else print_no_nl s;
+let out_print = fn (s: str) ->
+  if map_has io_cap "on" then
+    (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
+     map_set io_cap "buf" (mkstr (cur ++ s ++ "\n")))
+  else out_write_raw (s ++ "\n");
+let out_print_no_nl = fn (s: str) ->
+  if map_has io_cap "on" then
+    (let cur = (match map_get io_cap "buf" with VStr h -> sget h | _ -> "") in
+     map_set io_cap "buf" (mkstr (cur ++ s)))
+  else out_write_raw s;
+// ENV writes overlay the real environment (there is no setenv extern);
+// VNil marks a deleted key. cli_argv holds the script's ARGV.
+let env_ovr = map_new ();
+// `alias $NEW $OLD`: the new name reads and writes the old one's slot.
+let gvar_alias = map_new ();
+// LoadError#path: the message determines the path, so the raise records it
+// here rather than widening VExc (which carries only a class and a message).
+let le_path = map_new ();
+// the real environment, dumped once on first read (see env_load).
+let env_cache = map_new ();
+let cli_argv = map_new ();
+// key "v" -> the -I directories, ":"-joined in the order they were given.
+let cli_inc = map_new ();
+// key "ver" -> -v/--version was given; "help" -> -h/--help; "eval" -> the -e
+// code, "\n"-joined in the order given; "bad" -> the first unrecognised
+// -option. Set by take_flags, read by run_cli.
+let cli_opt = map_new ();
+// ONE place for the version string: `-v` prints it and RUBY_DESCRIPTION is set
+// from it. Two copies would be free to drift, and a library that parses
+// `ruby -v` and one that reads RUBY_DESCRIPTION have to agree -- they are the
+// same claim asked twice.
+let ruby_desc = "ruby 4.0.6 (2026-07-14 revision 03b6d3f889) +PRISM [arm64-darwin25]";
+// ONE place for the usage line: -h prints it and so does a bare invocation.
+// The invalid-option message points at -h, so -h has to exist -- a diagnostic
+// that names a flag the binary does not have is worse than no diagnostic.
+let usage_line = "usage: mere-ruby [-v] [-h] [-e CODE] [-I DIR] [--] <script.rb | -> [args]";
+// Encoding.default_internal (nil unless assigned; ENV reads honor it) and
+// default_external (UTF-8 unless assigned).
+let def_int_enc = map_new ();
+let def_ext_enc = map_new ();
+let rec strs_to_vals = fn (xs: str list) ->
+  match xs with Nil -> (Nil : Val list) | Cons (h, t) -> Cons (mkstr h, strs_to_vals t);
+let rec last_slash = fn (s: str) -> fn (i: int) -> fn (best: int) ->
+  if i >= str_len s then best
+  else last_slash s (i + 1) (if str_eq (char_at s i) "/" then i else best);
+// Ruby strips trailing slashes first ("a/" -> "."), and a path whose only
+// slash is the leading one has "/" as its directory ("/x" -> "/").
+let rec strip_trail_slash = fn (p: str) -> fn (i: int) ->
+  if i > 0 && str_eq (char_at p i) "/" then strip_trail_slash p (i - 1) else substring p 0 (i + 1);
+let dirname_of = fn (p: str) ->
+  let q = strip_trail_slash p (str_len p - 1) in
+  let ls = last_slash q 0 (0 - 1) in
+  if ls < 0 then "." else if ls == 0 then "/" else substring q 0 ls;
+let ends_with_rb = fn (p: str) ->
+  str_len p >= 3 && str_eq (substring p (str_len p - 3) (str_len p)) ".rb";
+// global variables ($name) live in another top-level captured Map.
+let globals = map_new ();
+// $/ (the record separator) DEFAULTS to "\n"; reading it before any
+// assignment answered nil, so a spec's save-and-restore dance turned the
+// default off for every example after the first.
+let _ = map_set globals "/" (mkstr "\n");
+// constants (Capitalized names) live in another; a class name that is not
+// an assigned constant reads as VClass.
+let consts = map_new ();
+// `private_constant :NAME` — the fully qualified names that may not be read
+// through the scope operator. The constant itself stays in `consts`: it is
+// still readable by the lexical name from inside its own module, and
+// const_get still answers, exactly as in ruby.
+let private_consts = map_new ();
+// modules mixed into a class via `include`: class name -> "M1|M2|..." of the
+// included module names (searched after the class's own methods + ancestors).
+let includes = map_new ();
+
+// `prepend`ed modules, by class: unlike an included one, a prepended module
+// comes BEFORE the class in its ancestors, so its methods win and their
+// `super` reaches the class's own definition.
+let prepends = map_new ();
+
+// Writing any of these three invalidates the memoized ancestor chains, so the
+// writes go through here rather than being spread across seventeen call sites
+// that each have to remember. (`sup` lives in the world tuple, so it is passed
+// in; includes and prepends are globals.)
+let set_sup = fn m -> fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set m k v;
+let set_inc = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set includes k v;
+let set_pre = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set prepends k v;
+// names declared with `module` (vs `class`) so Module#class differs.
+let modules = map_new ();
+// private methods: "Cls#name" -> present. Checked only on explicit-receiver
+// dispatch (implicit-self calls and send bypass, as in Ruby).
+let privates = map_new ();
+// ⚠ `public :m` / `private :m` on a class that INHERITS m is a method entry of
+//   its own in ruby (a zsuper entry), which is why #owner then answers that
+//   class and not the ancestor. The visibility marks cannot say so: "public"
+//   is the absence of a mark. This records the CLASS where a visibility
+//   statement named a method, so the owner walk can stop there.
+let vis_marks = map_new ();   // "cls#name" -> VNil, where a visibility statement named it
+let protecteds = map_new ();  // protected methods (callable only same-class)
+let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
+let num_names_memo = map_new ();  // numeric kind -> its method-name set
+// prim_method has no `world` to build an exception, so its terminal
+// "undefined method" failure parks the method name here; the begin/rescue
+// catch site turns it into a proper NoMethodError (Ruby's class for it).
+// Module#autoload: a constant that names a file to load the first time the
+// constant is read. Keyed by the qualified constant ("Gem::Requirement") or
+// the bare name at top level; the entry is removed before the file runs, so a
+// file that fails to define the constant cannot loop.
+let autoloads = map_new ();
+let prim_missing = map_new ();
+
+// A parse error is raised deep in the parser, which has no idea which file it
+// is reading: a gem's syntax error arrived as a bare "unexpected token: =",
+// and finding the file cost a scan of the whole gem. `require`/`load` park the
+// Which line the parser had reached. Tokens carry no position (a Tok is a
+// bare variant), so this is derived: the statement loop remembers how many
+// newlines were still AHEAD of it, and the line is the file's total minus
+// that. Counting the newlines consumed instead would be wrong -- the parser
+// backtracks, and a global counter counts the re-scans twice. A parse error
+// that names only the file sends the reader to grep; "near line 87" sends
+// them to the line.
+let parse_line = map_new ();
+// Counted, not derived: the statement loop adds the newlines it skips and the
+// one that ends each statement. Two other shapes were tried and both were
+// worse -- counting the newlines LEFT costs O(n) per statement, and stashing
+// the token list costs a deep COPY per statement (map_set copies its value),
+// which took a 241k-line test from 10 seconds to over 75. Newlines consumed
+// inside a single expression are not counted, so this is a lower bound, which
+// is why the message says "near".
+let parse_line_add = fn (k: int) ->
+  let n = (if map_has parse_line "n" then map_get parse_line "n" else 0) in
+  map_set parse_line "n" (n + k);
+// The count is an UPPER bound: the parser backtracks, and a re-scanned block
+// body is counted twice. The file's own line count (one pass, at the start of
+// the parse -- not per statement) clamps it, so the number always names a line
+// that exists.
+let parse_line_reset = fn (lines: int) ->
+  let _ = map_set parse_line "n" 0 in
+  map_set parse_line "max" lines;
+let parse_line_now = fn () ->
+  if map_has parse_line "n" then
+    (let n = map_get parse_line "n" + 1 in
+     let mx = (if map_has parse_line "max" then map_get parse_line "max" else 0) in
+     if mx > 0 && n > mx then mx else n)
+  else 0;
+
+// path here for the duration of the parse so the message can say it.
+// A string passed to eval / class_eval has no file at all, so a parse error in
+// one has to quote the string instead: the alternative is a bare "expected
+// parameter name" with nowhere to look.
+let set_parsing_eval = fn (code: str) ->
+  map_set load_ctx "parsing"
+    (mkstr ("(eval) " ++ substring code 0 (if str_len code > 60 then 60 else str_len code)));
+
+// ---- the (file, line) a STRING eval runs under ---------------------------
+// `eval` takes them as its 3rd and 4th arguments and already honoured them;
+// instance_eval / class_eval / module_eval (and the _exec spellings) take them
+// as their 2nd and 3rd and did NOT -- so `__FILE__` inside one answered the
+// diagnostic label, which is the first sixty characters of the code:
+//
+//   Object.new.instance_eval("__FILE__", "foo.rb")
+//     ruby       "foo.rb"
+//     mere-ruby  "(eval) __FILE__"
+//
+// and `require_relative` written inside such a string then resolved against
+// that quote, building paths like `<cwd>/(eval) require_relative("../..`.
+// One rule, two argument positions: the caller pulls the two values out of
+// its own arg list, and these decide the DEFAULT and do the save/restore.
+let eval_file_arg = fn (fv: Val) ->
+  (match fv with
+   | VStr h -> sget h
+   | _ -> "(eval at " ++ cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ")");
+let eval_line_arg = fn (lv: Val) -> (match lv with VInt n -> (if n > 0 then n else 1) | _ -> 1);
+let eval_pfile_push = fn (f: str) ->
+  let saved = (if map_has load_ctx "pfile" then map_get load_ctx "pfile" else mkstr "") in
+  let _ = map_set load_ctx "pfile" (mkstr f) in
+  saved;
+let eval_pfile_pop = fn (saved: Val) -> map_set load_ctx "pfile" saved;
+
+let parsing_file = fn () ->
+  let ln = parse_line_now () in
+  let where = (if ln > 0 then " near line " ++ str_of_int (ln + 1) else "") in
+  (if map_has load_ctx "parsing" then
+     (match map_get load_ctx "parsing" with
+      | VStr d -> (let f = sget d in if str_eq f "" then where else " in " ++ f ++ where)
+      | _ -> where)
+   else where);
+// prim_method has no `world` to build an exception with, so a TYPED failure
+// parks its class and message here and fails; the begin/rescue catch site
+// turns that into the real Ruby exception. Same channel as the "n" slot above,
+// generalised from the one NoMethodError case it was built for.
+// Where a raise happened. Recorded at the raise, not read at the report: each
+// frame puts the caller's line back as it unwinds, so reading the current line
+// at the top level names the call site instead. First writer wins, which is the
+// innermost raise -- the same rule the recorded FILE already used.
+// The frames of the raise that is in flight. A built-in exception is a class and
+// a message with no identity, so there is nowhere on it to keep them; this slot
+// answers for the exception in `$!` and nothing else (see Exception#backtrace).
+let raise_bt = map_new ();
+let note_raise_site = fn (u: unit) ->
+  let _ = (if map_has prim_missing "rl" then () else map_set prim_missing "rl" (VInt (cur_line ()))) in
+  let _ = (if map_has prim_missing "rm" then () else map_set prim_missing "rm" (mkstr (cur_meth ()))) in
+  (if map_has prim_missing "rf" then () else map_set prim_missing "rf" (mkstr (cur_file ())));
+let prim_raise = fn (cls: str) -> fn (msg: str) ->
+  let _ = map_set prim_missing "c" (mkstr cls) in
+  let _ = map_set prim_missing "m" (mkstr msg) in
+  // A NEW raise must not inherit the last one's internal message. raise_exc
+  // clears it for exactly this reason; this did not, so an earlier consumed
+  // StopIteration was still in the slot and the top level reported THAT for a
+  // TypeError raised afterwards -- the right exception, announced under the
+  // wrong name.
+  let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
+  let _ = note_raise_site () in
+  (let __fm = ("mere-ruby: " ++ cls ++ ": " ++ msg) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm);
+// `Integer(x, exception: false)` / `Float(x, exception: false)` answer nil
+// where the raising form refuses. The refusal RULES must stay in one place --
+// a separate "would this parse?" validator is a second copy of them that
+// drifts -- so the parsers keep raising, and this channel turns the raise into
+// a recorded flag while a no-exception conversion is running. Saved and
+// restored around each region so a conversion reached from inside another one
+// (a user #to_i that calls Integer itself) does not inherit the flag.
+let conv_soft = map_new ();
+// `exception:` takes true or false and nothing else -- and ruby checks THAT
+// before it looks at the value, so `Float("x", exception: 1)` reports the
+// keyword rather than the unparsable string. Reading the flag as "truthy"
+// silently accepted a caller's mistake and then answered a different error.
+let conv_exc_kw_bad = fn (v: Val) ->
+  match v with VBool _ -> false | _ -> true;
+let conv_fail = fn (cls: str) -> fn (msg: str) ->
+  if map_has conv_soft "on" then map_set conv_soft "bad" 1
+  else (let _ = prim_raise cls msg in ());
+let conv_soft_begin = fn () ->
+  let prev = (if map_has conv_soft "on" then 1 else 0) + (if map_has conv_soft "bad" then 2 else 0) in
+  let _ = map_set conv_soft "on" 1 in
+  let _ = (if map_has conv_soft "bad" then map_delete conv_soft "bad" else ()) in
+  prev;
+// answers whether the region refused, and puts the enclosing state back.
+let conv_soft_end = fn (prev: int) ->
+  let bad = map_has conv_soft "bad" in
+  let _ = (if prev % 2 == 1 then map_set conv_soft "on" 1
+           else (if map_has conv_soft "on" then map_delete conv_soft "on" else ())) in
+  let _ = (if prev >= 2 then map_set conv_soft "bad" 1
+           else (if map_has conv_soft "bad" then map_delete conv_soft "bad" else ())) in
+  bad;
+
+let is_upper_first = fn (id: str) ->
+  str_len id > 0 && (let o = ord (char_at id 0) in o >= 65 && o <= 90);
+// Kernel#local_variables: the local names bound in `env`, as symbols in
+// insertion order. Internal slots (self, __cref, __for, &block, globals,
+// ivars, constants) are hidden so the result matches Ruby's.
+let local_vars_of = fn env ->
+  let tmp = map_new () in
+  // the whole chain is in scope here, outermost first (a block sees the
+  // method's locals as well as its own).
+  let _ = map_iter (lv_flat env) (fn (k: str) -> fn (v: Val) ->
+    let skip = str_len k == 0
+               || (str_len k >= 2 && str_eq (substring k 0 2) "__")
+               || str_eq k "self"
+               || str_eq (char_at k 0) "&"
+               || str_eq (char_at k 0) "$"
+               || str_eq (char_at k 0) "@"
+               // the numbered-parameter slots _1.._9 are always pre-declared in
+               // a block, so hide them (Ruby reports them only when used).
+               || (str_len k == 2 && str_eq (char_at k 0) "_" && (let o = ord (char_at k 1) in o >= 49 && o <= 57))
+               || is_upper_first k in
+    if skip then () else (let m = map_len tmp in map_set tmp (str_of_int m) (VSym k))) in
+  arr_new (idx_to_list tmp 0 (map_len tmp));
+// Kernel#global_variables: every global the program can read, as symbols. The
+// `globals` map keys are stored WITHOUT the sigil ("~" is $~), so the sigil is
+// put back here; the ones ruby always has are added whether or not this program
+// has touched them, because `global_variables.include?(:$stdout)` is true in a
+// program that never mentions $stdout.
+let global_vars_of = fn (u: unit) ->
+  let tmp = map_new () in
+  let add1 = fn (nm: str) ->
+    (if map_has tmp nm then () else (let m = map_len tmp in map_set tmp nm (VSym nm))) in
+  let _ = map_iter globals (fn (k: str) -> fn (v: Val) -> add1 ("$" ++ k)) in
+  let _ = map_iter gvar_alias (fn (k: str) -> fn (v: Val) -> add1 ("$" ++ k)) in
+  let rec addall = fn (xs: str list) ->
+    (match xs with Nil -> () | Cons (h, t) -> (let _ = add1 h in addall t)) in
+  let _ = addall (str_split "$stdout|$stderr|$stdin|$PROGRAM_NAME|$0|$!|$~|$LOAD_PATH|$LOADED_FEATURES|$,|$;|$/|$*|$$|$?|$DEBUG|$VERBOSE" "|") in
+  let ordered = map_new () in
+  let _ = map_iter tmp (fn (k: str) -> fn (v: Val) ->
+    (let m = map_len ordered in map_set ordered (str_of_int m) v)) in
+  arr_new (idx_to_list ordered 0 (map_len ordered));
+// iteration budget: a top-level counter ticked once per loop iteration so
+// an infinite loop fails fast (a catchable error) instead of hanging.
+let step_budget = map_new ();
+let tick = fn () ->
+  let n = if map_has step_budget "n" then map_get step_budget "n" else 0 in
+  if n <= 0 then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: iteration limit exceeded (possible infinite loop)")) in fail "mere-ruby: iteration limit exceeded (possible infinite loop)")
+  else let _ = map_set step_budget "n" (n - 1) in ();
+
+// ---- small helpers ------------------------------------------------------
+let rec rev_app = fn xs -> fn acc ->
+  match xs with Nil -> acc | Cons (h, t) -> rev_app t (Cons (h, acc));
+
+let is_digit = fn (c: str) -> let o = ord c in o >= 48 && o <= 57;
+// Ruby identifiers may contain any non-ASCII character, and the lexer walks
+// bytes, so every byte of a UTF-8 sequence (>= 0x80) counts as a name byte.
+// sidekiq writes `alias_method :\u{1F4A3}, :clear`.
+let is_alpha = fn (c: str) ->
+  let o = ord c in (o >= 97 && o <= 122) || (o >= 65 && o <= 90) || o == 95 || o >= 128;
+let is_alnum = fn (c: str) -> is_digit c || is_alpha c;
+
+// ---- encodings: names, ASCII compatibility, validity, negotiation ---------
+let enc_upc = fn (s: str) ->
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i >= str_len s then acc
+    else let c = char_at s i in
+         go (i + 1) (acc ++ (if c >= "a" && c <= "z" then chr (ord c - 32) else c)) in
+  go 0 "";
+// the canonical spelling for the names programs actually write; ruby's
+// encoding names are case-insensitive, its canonical spellings are not.
+let enc_canon_name = fn (nm: str) ->
+  let u = enc_upc nm in
+  if str_eq u "BINARY" || str_eq u "ASCII-8BIT" then "ASCII-8BIT"
+  else if str_eq u "US-ASCII" || str_eq u "ASCII" || str_eq u "ANSI_X3.4-1968" || str_eq u "646" then "US-ASCII"
+  else if str_eq u "SHIFT_JIS" then "Shift_JIS"
+  else if str_eq u "WINDOWS-31J" || str_eq u "CP932" || str_eq u "SJIS" then "Windows-31J"
+  else if str_eq u "EMACS-MULE" then "Emacs-Mule"
+  else if str_eq u "BIG5" then "Big5"
+  else if str_len u >= 8 && str_eq (substring u 0 8) "WINDOWS-" then "Windows-" ++ substring u 8 (str_len u)
+  else if str_len u >= 4 && str_eq (substring u 0 4) "UTF-" then u
+  else if str_len u >= 9 && str_eq (substring u 0 9) "ISO-8859-" then u
+  else if str_len u >= 5 && str_eq (substring u 0 5) "KOI8-" then u
+  else if str_len u >= 4 && str_eq (substring u 0 4) "EUC-" then u
+  else if str_eq u "GB18030" || str_eq u "GBK" || str_eq u "GB2312" then u
+  else nm;
+// (enc_ascii_compat is defined once, beside enc_is_dummy. A SECOND copy used
+// to live here that knew only UTF-16/32/7, and being the later definition it
+// won: every DUMMY encoding -- IBM037, CP50220/1, the ISO-2022-JP family --
+// claimed to be ascii-compatible, so `"a".force_encoding("IBM037") + "b"`
+// concatenated instead of raising, `== "a"` was true, and `.to_sym` dropped
+// the encoding as if the name were plain US-ASCII.)
+// the lookup key for enc_alias_canon: ruby's Encoding.find is case-blind and
+// the constant spelling of an alias replaces '-' with '_' (ISO8859_1 is the
+// constant for the alias "ISO8859-1"), so both collapse to one key here.
+let enc_norm_name = fn (nm: str) ->
+  let u = enc_upc nm in
+  let n = str_len u in
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i >= n then acc
+    else go (i + 1) (acc ++ (if str_eq (char_at u i) "_" then "-" else char_at u i)) in
+  go 0 "";
+let enc_all7 = fn (s: str) ->
+  let n = str_len s in
+  let rec go = fn (i: int) -> if i >= n then true else if ord (char_at s i) >= 128 then false else go (i + 1) in
+  go 0;
+// A symbol's encoding: recorded when it came from a String that had one, else
+// derived -- 7-bit names are US-ASCII, the rest UTF-8. Defined HERE, ahead of
+// `inspect`, because both the inspect rules and the Symbol->String delegation
+// need it and a second copy would drift.
+let sym_enc_name = fn (sy: str) ->
+  if map_has sym_enc sy then map_get sym_enc sy
+  else if enc_all7 sy then "US-ASCII" else "UTF-8";
+// strict UTF-8: continuation shapes, no overlongs, no surrogates, <= U+10FFFF.
+let enc_valid_utf8 = fn (s: str) ->
+  let n = str_len s in
+  let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let cont = fn (k: int) -> (let v = bv k in v >= 128 && v < 192) in
+  let rec go = fn (i: int) ->
+    if i >= n then true
+    else
+      let b0 = bv i in
+      if b0 < 128 then go (i + 1)
+      else if b0 < 194 then false
+      else if b0 < 224 then (if cont (i + 1) then go (i + 2) else false)
+      else if b0 < 240 then
+        (if cont (i + 1) && cont (i + 2) then
+           (let cp = (b0 - 224) * 4096 + (bv (i + 1) - 128) * 64 + (bv (i + 2) - 128) in
+            if cp < 2048 then false else if cp >= 55296 && cp <= 57343 then false else go (i + 3))
+         else false)
+      else if b0 < 245 then
+        (if cont (i + 1) && cont (i + 2) && cont (i + 3) then
+           (let cp = (b0 - 240) * 262144 + (bv (i + 1) - 128) * 4096 + (bv (i + 2) - 128) * 64 + (bv (i + 3) - 128) in
+            if cp < 65536 || cp > 1114111 then false else go (i + 4))
+         else false)
+      else false in
+  go 0;
+let enc_valid_utf16 = fn (s: str) -> fn (be: bool) ->
+  let n = str_len s in
+  if n - (n / 2) * 2 != 0 then false
+  else
+    let unit = fn (k: int) ->
+      (if be then ord (char_at s k) * 256 + ord (char_at s (k + 1))
+       else ord (char_at s (k + 1)) * 256 + ord (char_at s k)) in
+    let rec go = fn (i: int) ->
+      if i >= n then true
+      else
+        let u = unit i in
+        if u >= 55296 && u <= 56319 then
+          (if i + 3 < n && (let v = unit (i + 2) in v >= 56320 && v <= 57343) then go (i + 4) else false)
+        else if u >= 56320 && u <= 57343 then false
+        else go (i + 2) in
+    go 0;
+let enc_valid_utf32 = fn (s: str) -> fn (be: bool) ->
+  let n = str_len s in
+  if n - (n / 4) * 4 != 0 then false
+  else
+    let rec go = fn (i: int) ->
+      if i >= n then true
+      else
+        let v = (if be then ((ord (char_at s i) * 256 + ord (char_at s (i + 1))) * 256 + ord (char_at s (i + 2))) * 256 + ord (char_at s (i + 3))
+                 else ((ord (char_at s (i + 3)) * 256 + ord (char_at s (i + 2))) * 256 + ord (char_at s (i + 1))) * 256 + ord (char_at s i)) in
+        if v > 1114111 then false
+        else if v >= 55296 && v <= 57343 then false
+        else go (i + 4) in
+    go 0;
+let enc_valid_eucjp = fn (s: str) ->
+  let n = str_len s in
+  let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let rec go = fn (i: int) ->
+    if i >= n then true
+    else
+      let b0 = bv i in
+      if b0 < 128 then go (i + 1)
+      // 0x8E is the single shift to half-width katakana. ruby validates the
+      // TRAIL structurally -- 0xA1..0xFE -- not by the assigned subrange
+      // 0xA1..0xDF, so `"\x8E\xE0"` is a valid EUC-JP string to it.
+      else if b0 == 142 then (if (let v = bv (i + 1) in v >= 161 && v <= 254) then go (i + 2) else false)
+      else if b0 == 143 then
+        (if (let v = bv (i + 1) in v >= 161 && v <= 254) && (let v = bv (i + 2) in v >= 161 && v <= 254)
+         then go (i + 3) else false)
+      else if b0 >= 161 && b0 <= 254 then (if (let v = bv (i + 1) in v >= 161 && v <= 254) then go (i + 2) else false)
+      else false in
+  go 0;
+// Shift_JIS and its vendor variants. They differ in which codepoints are
+// ASSIGNED, not in which byte sequences are well formed, and #valid_encoding?
+// asks the second question: ruby answers true for lead bytes 0xF0..0xFC under
+// plain Shift_JIS too, so there is no variant flag to carry here.
+let enc_valid_sjis = fn (s: str) ->
+  let n = str_len s in
+  let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let rec go = fn (i: int) ->
+    if i >= n then true
+    else
+      let b0 = bv i in
+      if b0 < 128 then go (i + 1)
+      else if b0 >= 161 && b0 <= 223 then go (i + 1)
+      else if (b0 >= 129 && b0 <= 159) || (b0 >= 224 && b0 <= 252) then
+        (if (let v = bv (i + 1) in (v >= 64 && v <= 126) || (v >= 128 && v <= 252)) then go (i + 2) else false)
+      else false in
+  go 0;
+// generic double-byte family: ASCII, then lead in [l_lo,l_hi] with a trail in
+// [t1_lo,t1_hi] or [t2_lo,t2_hi] (-1 disables the second range).
+let enc_valid_db = fn (s: str) -> fn (l_lo: int) -> fn (l_hi: int) -> fn (t1_lo: int) -> fn (t1_hi: int) -> fn (t2_lo: int) -> fn (t2_hi: int) ->
+  let n = str_len s in
+  let rec go = fn (i: int) ->
+    if i >= n then true
+    else
+      let b0 = ord (char_at s i) in
+      if b0 < 128 then go (i + 1)
+      else if b0 >= l_lo && b0 <= l_hi then
+        (if i + 1 < n then
+           (let b1 = ord (char_at s (i + 1)) in
+            if (b1 >= t1_lo && b1 <= t1_hi) || (t2_lo >= 0 && b1 >= t2_lo && b1 <= t2_hi) then go (i + 2) else false)
+         else false)
+      else false in
+  go 0;
+// Emacs-Mule: ASCII, or a leading code 0x81-0x99 followed by one (0x81-0x8F)
+// or two (0x90-0x99) bytes in 0xA0-0xFF; a bare 0xA0+ byte never stands alone.
+let enc_valid_emacs = fn (s: str) ->
+  let n = str_len s in
+  let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let hi = fn (k: int) -> (let v = bv k in v >= 160 && v <= 255) in
+  let rec go = fn (i: int) ->
+    if i >= n then true
+    else
+      let b0 = bv i in
+      if b0 < 128 then go (i + 1)
+      else if b0 >= 129 && b0 <= 143 then (if hi (i + 1) then go (i + 2) else false)
+      else if b0 >= 144 && b0 <= 153 then (if hi (i + 1) && hi (i + 2) then go (i + 3) else false)
+      else false in
+  go 0;
+let enc_valid = fn (s: str) -> fn (e: str) ->
+  // the UTF-8 / EUC-JP / Shift_JIS / Big5 vendor variants validate like their
+  // base encoding; a DUMMY encoding (stateful ISO-2022-*, UTF-7, byte-order-
+  // free UTF-16/32) is never scanned, so any bytes are "valid" in it.
+  if str_eq e "UTF-8" || str_eq e "UTF8-MAC" || str_eq e "UTF8-DoCoMo"
+     || str_eq e "UTF8-KDDI" || str_eq e "UTF8-SoftBank" || str_eq e "CESU-8" then enc_valid_utf8 s
+  else if str_eq e "US-ASCII" then enc_all7 s
+  else if str_eq e "UTF-16BE" || str_eq e "UTF-16LE" then enc_valid_utf16 s (str_eq e "UTF-16BE")
+  else if str_eq e "UTF-32BE" || str_eq e "UTF-32LE" then enc_valid_utf32 s (str_eq e "UTF-32BE")
+  else if str_eq e "EUC-JP" || str_eq e "eucJP-ms" || str_eq e "CP51932" || str_eq e "EUC-JIS-2004"
+          || str_eq e "stateless-ISO-2022-JP" || str_eq e "stateless-ISO-2022-JP-KDDI" then enc_valid_eucjp s
+  else if str_eq e "EUC-KR" || str_eq e "GB2312" || str_eq e "EUC-TW" || str_eq e "GB12345" then enc_valid_db s 161 254 161 254 (0 - 1) (0 - 1)
+  else if str_eq e "Shift_JIS" || str_eq e "Windows-31J" || str_eq e "MacJapanese"
+          || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank" then
+    enc_valid_sjis s
+  else if str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" then enc_valid_db s 129 254 64 126 161 254
+  else if str_eq e "CP949" then enc_valid_db s 129 254 65 90 97 254
+  else if str_eq e "GBK" || str_eq e "CP936" || str_eq e "GB18030" then enc_valid_db s 129 254 64 126 128 254
+  else if str_eq e "Emacs-Mule" then enc_valid_emacs s
+  else true;
+// the canonical name behind any spelling ruby accepts, or "" for a name no
+// encoding answers to (force_encoding raises on those, exactly as ruby does).
+let enc_find_canon = fn (nm: str) ->
+  let c = enc_canon_name nm in
+  if map_has enc_objs c then c
+  else (let k = enc_norm_name nm in
+        if map_has enc_alias_canon k then map_get enc_alias_canon k else "");
+// the encoding a value combining a and b carries, or "" when they are
+// incompatible: equal encodings, an empty side, or (between two ASCII-
+// compatible encodings) an ASCII-only side yielding to the other.
+// dummy encodings (stateful ISO-2022-*, UTF-7) are compatible with nothing
+// but themselves and the empty string, even for ASCII-only content.
+// ---- what Integer#chr needs to know about an encoding -------------------
+// A character in a byte-oriented encoding IS its bytes, so Integer#chr needs
+// two structural facts and no character table: how wide the widest character
+// can be, and whether a given byte string is exactly one character.
+//
+// The WIDTH picks the two refusals apart. A number too big to be a character
+// in e at all is "N out of char range"; one that fits the width but is not
+// well formed is "invalid codepoint 0xN in E". ruby was asked which message it
+// gives, encoding by encoding, and the widths below are its answers.
+//
+// ⚠ -1 means "no structural model here", and chr refuses rather than guessing.
+// EUC-TW and GB18030 really take FOUR bytes while the validator above models
+// them as two; the dummy encodings are never scanned at all.
+let enc_utf8_family = fn (e: str) ->
+  str_eq e "UTF-8" || str_eq e "UTF8-MAC" || str_eq e "UTF8-DoCoMo"
+  || str_eq e "UTF8-KDDI" || str_eq e "UTF8-SoftBank";
+let enc_eucjp_family = fn (e: str) ->
+  str_eq e "EUC-JP" || str_eq e "eucJP-ms" || str_eq e "CP51932" || str_eq e "EUC-JIS-2004";
+let enc_sjis_family = fn (e: str) ->
+  str_eq e "Shift_JIS" || str_eq e "Windows-31J" || str_eq e "MacJapanese"
+  || str_eq e "SJIS-DoCoMo" || str_eq e "SJIS-KDDI" || str_eq e "SJIS-SoftBank";
+// the double-byte families the validator above models, as (lead, trail, trail2)
+// ranges -- the same numbers enc_valid_db is called with, read back here.
+// ⚠ ONLY the ranges that were checked against ruby for EVERY number in the
+// one- and two-byte space. The validator above also models Big5, CP949 and
+// GBK with (129, 254, ...), and ruby disagrees with all three -- it refuses
+// 0x8140 in Big5 and ACCEPTS a bare 0x80 in CP949 and GBK -- so chr leaves
+// them to the refusal below instead of answering from ranges that are wrong
+// in the permissive direction.
+let enc_db_ranges = fn (e: str) ->
+  if str_eq e "EUC-KR" || str_eq e "GB2312" || str_eq e "GB12345" then (161, 254, 161, 254, 0 - 1, 0 - 1)
+  else (0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+let enc_max_clen = fn (e: str) ->
+  if str_eq e "US-ASCII" then 1
+  else if enc_utf8_family e then 4
+  else if enc_eucjp_family e then 3
+  else if enc_sjis_family e then 2
+  else if (match enc_db_ranges e with (l, _, _, _, _, _) -> l) > 0 then 2
+  // ⚠ modelled by the validator above but NOT verified for chr: Big5 and its
+  // variants, CP949, GBK/CP936, and the stateless ISO-2022-JP pair, which
+  // accepts ASCII and the EUC-JP katakana shift but not the trail pairs.
+  else if str_eq e "EUC-TW" || str_eq e "GB18030"
+          || str_eq e "Emacs-Mule" || str_eq e "UTF-16BE" || str_eq e "UTF-16LE"
+          || str_eq e "UTF-32BE" || str_eq e "UTF-32LE"
+          || str_eq e "Big5" || str_eq e "CP950" || str_eq e "CP951"
+          || str_eq e "Big5-HKSCS" || str_eq e "Big5-UAO" || str_eq e "CP949"
+          || str_eq e "GBK" || str_eq e "CP936"
+          || str_eq e "stateless-ISO-2022-JP" || str_eq e "stateless-ISO-2022-JP-KDDI" then 0 - 1
+  // ⚠ NOT a dummy check. A dummy encoding is never DECODED, but Integer#chr
+  // does not decode: ruby hands back the single byte for 0..255 in every one
+  // of them (IBM037, the ISO-2022-JP family, UTF-16, UTF-32, UTF-7) and calls
+  // 256 out of char range. Refusing them here -- which a narrower dummy list
+  // had been doing by accident for two of the nine -- answered
+  // NotImplementedError where the answer is a one-byte String.
+  else 1;
+// The byte length of the character STARTING at 0 in s, 0 when those bytes are
+// not one. Only the families enc_max_clen gives a width for are answered.
+let enc_clen1 = fn (e: str) -> fn (s: str) ->
+  let n = str_len s in
+  let bv = fn (k: int) -> if k < n then ord (char_at s k) else 0 - 1 in
+  let b0 = bv 0 in
+  if b0 < 0 then 0
+  else if str_eq e "US-ASCII" then (if b0 < 128 then 1 else 0)
+  else if enc_eucjp_family e then
+    // ASCII, 0x8E + one trail, 0x8F + two trails, or a trail pair.
+    (if b0 < 128 then 1
+     else if b0 == 142 then (if (let v = bv 1 in v >= 161 && v <= 254) then 2 else 0)
+     else if b0 == 143 then
+       (if (let v = bv 1 in v >= 161 && v <= 254) && (let v = bv 2 in v >= 161 && v <= 254) then 3 else 0)
+     else if b0 >= 161 && b0 <= 254 then (if (let v = bv 1 in v >= 161 && v <= 254) then 2 else 0)
+     else 0)
+  else if enc_sjis_family e then
+    // ASCII, half-width katakana alone, or a lead/trail pair.
+    (if b0 < 128 then 1
+     else if b0 >= 161 && b0 <= 223 then 1
+     else if (b0 >= 129 && b0 <= 159) || (b0 >= 224 && b0 <= 252) then
+       (if (let v = bv 1 in (v >= 64 && v <= 126) || (v >= 128 && v <= 252)) then 2 else 0)
+     else 0)
+  else
+    (match enc_db_ranges e with
+     | (l_lo, l_hi, t1_lo, t1_hi, t2_lo, t2_hi) ->
+       if l_lo > 0 then
+         (if b0 < 128 then 1
+          else if b0 >= l_lo && b0 <= l_hi then
+            (let v = bv 1 in
+             if (v >= t1_lo && v <= t1_hi) || (t2_lo > 0 && v >= t2_lo && v <= t2_hi) then 2 else 0)
+          else 0)
+       else if enc_max_clen e == 1 then 1
+       else 0 - 1);
+// n as its shortest big-endian byte string ("" for a negative number).
+let rec be_bytes = fn (n: int) ->
+  if n < 0 then ""
+  else if n < 256 then chr n
+  else be_bytes (n / 256) ++ chr (n - (n / 256) * 256);
+let enc_compat2 = fn (ae0: str) -> fn (as_: str) -> fn (be0: str) -> fn (bs: str) ->
+  let ae = enc_canon_name ae0 in
+  let be = enc_canon_name be0 in
+  if str_eq ae be then ae
+  else if str_len bs == 0 then ae
+  else if str_len as_ == 0 then be
+  else if enc_is_dummy ae || enc_is_dummy be then ""
+  else if enc_ascii_compat ae && enc_ascii_compat be then
+    (let a7 = enc_all7 as_ in
+     let b7 = enc_all7 bs in
+     if a7 && b7 then ae else if a7 then be else if b7 then ae else "")
+  else "";
+// the negotiated encoding for two string HANDLES, or "" when incompatible;
+// the guard form raises the CompatibilityError ruby's searches raise.
+let enc_pair_or = fn (ah: int) -> fn (bh: int) ->
+  enc_compat2 (senc_get ah) (sget ah) (senc_get bh) (sget bh);
+let enc_pair_guard = fn (ah: int) -> fn (bh: int) ->
+  if str_eq (enc_pair_or ah bh) "" then
+    (let _ = prim_raise "Encoding::CompatibilityError"
+               ("incompatible character encodings: " ++ enc_canon_name (senc_get ah) ++ " and " ++ enc_canon_name (senc_get bh)) in false)
+  else true;
+// ruby's encoding registration order, for <=> between identical bytes whose
+// encodings are incompatible (only the relative order can matter).
+let enc_index = fn (e: str) ->
+  if str_eq e "ASCII-8BIT" then 0 else if str_eq e "UTF-8" then 1 else if str_eq e "US-ASCII" then 2
+  else if str_eq e "UTF-16BE" then 3 else if str_eq e "UTF-16LE" then 4
+  else if str_eq e "UTF-32BE" then 5 else if str_eq e "UTF-32LE" then 6
+  else if str_eq e "UTF-16" then 7 else if str_eq e "UTF-32" then 8
+  else 100;
+
