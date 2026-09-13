@@ -30,6 +30,11 @@ esac
 # (or is named, with its reason, in tools/gc_roots_allow.txt). The table that
 # was missing from the roots on 2026-09-03 cost `require "bundler"` two weeks.
 ./tools/gc_roots_check.sh > /dev/null || { ./tools/gc_roots_check.sh | grep -v " root$"; exit 1; }
+# A third: no top-level name is defined twice in one `let rec ... and ...`
+# chain. The later definition wins for every caller and the earlier one is
+# dead, silently, on a green build -- six of them had accumulated, and one was
+# added the same day the gate was written.
+./tools/dup_defs_check.sh > /dev/null || { ./tools/dup_defs_check.sh | grep -a SAME-CHAIN; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a
