@@ -16056,7 +16056,11 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
       // whatever was in flight when this was raised becomes its cause, as ruby does
       let _ = (if map_has globals "!" then (match map_get globals "!" with
                                             | VNil -> ()
-                                            | prev -> (if rb_identical prev (VObj id) then () else map_set ivars (str_of_int id ++ "@__cause") (cause_keepalive world prev)))
+                                            | prev -> (if rb_identical prev (VObj id) then ()
+                                                       else (let _ = map_set ivars (str_of_int id ++ "@__cause") prev in
+                                                             match cause_bt_now prev with
+                                                             | VNil -> ()
+                                                             | b9 -> map_set ivars (str_of_int id ++ "@__cause_bt") b9)))
                else ()) in
       VObj id
     else exc_with_cause world (make_exc args)
@@ -16120,7 +16124,11 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
                  else (if map_has globals "!"
                        then (match map_get globals "!" with
                              | VNil -> ()
-                             | prev -> (if rb_identical prev base then () else map_set ivars2 (str_of_int bid ++ "@__cause") (cause_keepalive world prev)))
+                             | prev -> (if rb_identical prev base then ()
+                                                       else (let _ = map_set ivars2 (str_of_int bid ++ "@__cause") prev in
+                                                             match cause_bt_now prev with
+                                                             | VNil -> ()
+                                                             | b9 -> map_set ivars2 (str_of_int bid ++ "@__cause_bt") b9)))
                        else ())) in
         base))
   | _ -> exc_with_cause world (make_exc args)
@@ -16134,24 +16142,20 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
 // nothing in flight -- almost every raise a program makes -- keeps the cheap
 // representation, so this costs an object only where ruby has something to
 // record.
-// ⚠ A CAUSE MUST KEEP ITS BACKTRACE. The cheap VExc representation has no
-// ivars, so its backtrace lives in the slot beside the LAST raise -- and the
-// raise that makes it a cause overwrites that slot. Stored as-is, the
-// innermost exception in a chain reported no frames at all, so
-// #full_message named the line that asked instead of the line that raised.
-// Promoting it here gives it somewhere of its own to keep them.
-and cause_keepalive = fn world -> fn (v: Val) ->
+// ⚠ A CAUSE MUST KEEP ITS BACKTRACE -- WITHOUT BECOMING A DIFFERENT OBJECT.
+// The cheap VExc representation has no ivars, so its backtrace lives in the
+// slot beside the LAST raise, and the raise that makes it a cause overwrites
+// that slot; the innermost exception in a chain then reported no frames at
+// all. Promoting it to an object gave it somewhere to keep them and BROKE
+// `e.dup.cause.should.equal?(cause)` -- the cause a program already holds has
+// to stay the very same value. So the frames are recorded beside the cause,
+// on the exception that owns the link, and the report reads them from there.
+and cause_bt_now = fn (v: Val) ->
   match v with
-  | VExc (c9, m9) ->
+  | VExc (_, _) ->
     (if map_has raise_bt "v" && map_has globals "!" && rb_eq (map_get globals "!") v
-     then (let (_, _, ocls9, ivars9) = world in
-           let id9 = alloc_oid ocls9 in
-           let _ = map_set ocls9 (str_of_int id9) c9 in
-           let _ = map_set ivars9 (str_of_int id9 ++ "@message") (mkstr m9) in
-           let _ = map_set ivars9 (str_of_int id9 ++ "@__bt") (map_get raise_bt "v") in
-           VObj id9)
-     else v)
-  | _ -> v
+     then map_get raise_bt "v" else VNil)
+  | _ -> VNil
 
 and exc_with_cause = fn world -> fn (v: Val) ->
   match v with
@@ -16168,7 +16172,10 @@ and exc_with_cause = fn world -> fn (v: Val) ->
               let id9 = alloc_oid ocls9 in
               let _ = map_set ocls9 (str_of_int id9) c in
               let _ = map_set ivars9 (str_of_int id9 ++ "@message") (mkstr m) in
-              let _ = map_set ivars9 (str_of_int id9 ++ "@__cause") (cause_keepalive world prev) in
+              let _ = map_set ivars9 (str_of_int id9 ++ "@__cause") prev in
+              let _ = (match cause_bt_now prev with
+                       | VNil -> ()
+                       | b9 -> map_set ivars9 (str_of_int id9 ++ "@__cause_bt") b9) in
               VObj id9)))
      else v)
   | _ -> v
@@ -22914,8 +22921,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | Cons (VStr ph, _) -> let ph = sget ph in
             arr_new (Cons (mkstr (dirname_of ph), Cons (mkstr (basename_of ph), Nil)))
           | _ -> raise_exc world "TypeError" "no implicit conversion into String")
-       else if str_eq name "exist?" || str_eq name "exists?" || str_eq name "file?" then
+       else if str_eq name "exist?" || str_eq name "exists?" then
          (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
+       // ⚠ `file?` IS NOT `exist?`: a directory exists and is not a file.
+       // Answering exist? for both made mspec's own mkdir_p refuse every path
+       // whose parent it had already created ("path component ... is a file"),
+       // and core/kernel/printf read DIFF against an interpreter that had done
+       // nothing wrong. `test -f` is the question being asked.
+       else if str_eq name "file?" then
+         (match args with
+          | Cons (VStr ph, _) -> VBool (run ("test -f " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
+          | _ -> VBool false)
        // File.fnmatch?(pattern, path): the same matcher Dir.glob uses.
        else if str_eq name "fnmatch" || str_eq name "fnmatch?" then
          (match args with
@@ -46141,7 +46157,7 @@ and exc_full_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> 
   // whole chain -- outermost first for `order: :top`, deepest first under a
   // single "Traceback" header for `order: :bottom`. Printing only the
   // exception itself lost every "inner" a nested raise had wrapped.
-  let chain9 = exc_cause_chain env world recv 8 in
+  let chain9 = exc_cause_chain env world recv VNil 8 in
   let e9 = chr 27 in
   if bottom then
     (if hl then e9 ++ "[1mTraceback" ++ e9 ++ "[m (most recent call last):\n"
@@ -46149,33 +46165,42 @@ and exc_full_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> 
     ++ exc_blocks_rev env world (rev_app_str chain9 Nil) hl
   else exc_blocks env world chain9 hl
 
-// the exception and its causes, outermost first. Bounded so a cause cycle
-// (ruby allows `raise x, cause: y` to build one) cannot spin here.
-and exc_cause_chain = fn env -> fn world -> fn (recv: Val) -> fn (fuel9: int) ->
-  if fuel9 <= 0 then Cons (recv, Nil)
+// the exception and its causes, outermost first, each paired with the frames
+// recorded for it beside the link (VNil = ask the exception itself). Bounded
+// so a cause cycle (ruby allows `raise x, cause: y` to build one) cannot spin.
+and exc_cause_chain = fn env -> fn world -> fn (recv: Val) -> fn (bt9: Val) -> fn (fuel9: int) ->
+  if fuel9 <= 0 then Cons ((recv, bt9), Nil)
   else
     let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
     (match invoke_val_c env world noblk9 recv "cause" Nil false with
-     | VNil -> Cons (recv, Nil)
-     | c9 -> (if rb_eq c9 recv then Cons (recv, Nil)
-              else Cons (recv, exc_cause_chain env world c9 (fuel9 - 1))))
+     | VNil -> Cons ((recv, bt9), Nil)
+     | c9 -> (if rb_eq c9 recv then Cons ((recv, bt9), Nil)
+              else Cons ((recv, bt9), exc_cause_chain env world c9 (exc_cause_bt world recv) (fuel9 - 1))))
 
-and rev_app_str = fn (xs: Val list) -> fn (acc: Val list) ->
+// the frames this exception recorded for its cause, if any.
+and exc_cause_bt = fn world -> fn (recv: Val) ->
+  match recv with
+  | VObj id9 ->
+    (let (_, _, _, iv9) = world in
+     if map_has iv9 (str_of_int id9 ++ "@__cause_bt") then map_get iv9 (str_of_int id9 ++ "@__cause_bt") else VNil)
+  | _ -> VNil
+
+and rev_app_str = fn (xs: (Val * Val) list) -> fn (acc: (Val * Val) list) ->
   match xs with Nil -> acc | Cons (h9, t9) -> rev_app_str t9 (Cons (h9, acc))
 
 // `order: :top`: each exception's head line then its frames, outermost first.
-and exc_blocks = fn env -> fn world -> fn (xs: Val list) -> fn (hl: bool) ->
+and exc_blocks = fn env -> fn world -> fn (xs: (Val * Val) list) -> fn (hl: bool) ->
   match xs with
   | Nil -> ""
-  | Cons (h9, t9) -> exc_one_message env world h9 hl false ++ exc_blocks env world t9 hl
+  | Cons ((h9, b9), t9) -> exc_one_message env world h9 b9 hl false ++ exc_blocks env world t9 hl
 
 // `order: :bottom`: frames upside down then the head line, deepest cause first.
-and exc_blocks_rev = fn env -> fn world -> fn (xs: Val list) -> fn (hl: bool) ->
+and exc_blocks_rev = fn env -> fn world -> fn (xs: (Val * Val) list) -> fn (hl: bool) ->
   match xs with
   | Nil -> ""
-  | Cons (h9, t9) -> exc_one_message env world h9 hl true ++ exc_blocks_rev env world t9 hl
+  | Cons ((h9, b9), t9) -> exc_one_message env world h9 b9 hl true ++ exc_blocks_rev env world t9 hl
 
-and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> fn (bottom: bool) ->
+and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (btov9: Val) -> fn (hl: bool) -> fn (bottom: bool) ->
   let e9 = chr 27 in
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   // `highlight:` is a KEYWORD argument, and an override written `def
@@ -46206,9 +46231,11 @@ and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) -> f
                       | other8 -> to_s other8)
                 else (let shown8 = cls_display world (display_cls world (exc_cls_of world recv)) in
                       if hl then e9 ++ "[1;4m" ++ shown8 ++ e9 ++ "[m" else shown8))) in
-  let bt9 = (match invoke_val_c env world noblk9 recv "backtrace" Nil false with
-             | VArr aid9 -> bt_strs_of (deref aid9)
-             | _ -> (Nil : str list)) in
+  let bt9 = (match btov9 with
+             | VArr aid8 -> bt_strs_of (deref aid8)
+             | _ -> (match invoke_val_c env world noblk9 recv "backtrace" Nil false with
+                     | VArr aid9 -> bt_strs_of (deref aid9)
+                     | _ -> (Nil : str list))) in
   let e9 = chr 27 in
   match bt9 with
   // ⚠ NO BACKTRACE STILL HAS A HEAD LINE. An exception that was built but
@@ -47771,15 +47798,19 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // method's recorded cref IS that lexical class ("B::(sng:B)" for the
        // singleton body, "" for the top level = Object); only a METHOD frame
        // has one, which is what `__meth` distinguishes from a class body.
-       // ⚠ AN EMPTY CREF IS THE TOP LEVEL, and the reading below already
-       // answers it (self is main, whose class is Object). Only a cref that
-       // NAMES something overrides it -- forcing "Object#name" here made a
-       // def inside a top-level method's own parameter default register a
-       // SECOND entry, so `method(:m)` found the new one while the CALL still
-       // found the old and kept demanding its old keyword.
+       // ⚠ ONLY A SINGLETON CREF OVERRIDES THE READING BELOW. Inside a method
+       // written in `class << self`, self is the CLASS while the definee is
+       // its singleton -- that one case self cannot answer, and `B.cm` raised
+       // NoMethodError for a def nested there. Everywhere else the reading
+       // below is already right, and taking the cref instead broke two of
+       // them: an empty cref is the top level (whose methods are keyed by
+       // their bare name, so a def inside a parameter default registered a
+       // SECOND entry and the call kept finding the old one), and a `def`
+       // inside a `Module.new` block belongs to that anonymous module, not to
+       // the class whose method opened it.
        else if lv_has env "__meth" && lv_has env "__cref"
                && (match lv_get env "__cref" with
-                   | VStr h9 -> (if str_eq (lex_innermost (sget h9)) "" then false else true)
+                   | VStr h9 -> is_sng_cls (lex_innermost (sget h9))
                    | _ -> false) then
          (let lx9 = (match lv_get env "__cref" with VStr h -> sget h | _ -> "") in
           lex_innermost lx9 ++ "#" ++ name)

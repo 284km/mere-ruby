@@ -830,6 +830,14 @@ def rm_r(*paths)
   end
 end
 
+# ⚠ CLEAR THIS PROCESS'S TEMP DIRECTORY BEFORE ANY SPEC USES IT. The path is
+# keyed by pid, pids recycle, and nothing removed the directory afterwards --
+# so 436 of them accumulated under the repo, and a run that inherited one
+# holding a FILE where it wanted a directory died with "path component ... is
+# a file". core/kernel/printf then read DIFF against an interpreter that had
+# done nothing wrong. A directory named by THIS pid is stale by definition.
+rm_r SPEC_TEMP_DIR if File.exist?(SPEC_TEMP_DIR)
+
 def touch(name, mode = "w")
   mkdir_p File.dirname(name)
   File.open(name, mode) { |f| yield f if block_given? }
