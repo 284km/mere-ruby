@@ -8,11 +8,11 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **138** of **138** recorded DIFF files.
+Visited **136** of **136** recorded DIFF files.
 
 | file | what fails |
 |---|---|
-| core/array/element_reference_spec.rb | pass=253 fail=2 err=10 pass=459 fail=0 err=1 |
+| core/array/element_reference_spec.rb | pass=457 fail=2 err=1 pass=459 fail=0 err=1 |
 | core/array/element_reference_spec.rb | ERROR: with a subclass of Array raises a RangeError when the start index is out of range of Fixnum: NameError -- undefined local variable or method 'max_long' for an instance of Object |
 | core/array/element_reference_spec.rb | FAILED: expected RangeError to be raised |
 | core/array/element_reference_spec.rb | FAILED: expected TypeError to be raised |
@@ -38,11 +38,13 @@ Visited **138** of **138** recorded DIFF files.
 | core/exception/backtrace_locations_spec.rb | pass=2 fail=1 err=0 pass=3 fail=0 err=0 |
 | core/exception/backtrace_spec.rb | pass=19 fail=0 err=0 pass=21 fail=0 err=0 |
 | core/exception/backtrace_spec.rb | (nothing failed -- the record may be stale) |
-| core/exception/full_message_spec.rb | pass=25 fail=29 err=2 pass=46 fail=11 err=0 |
-| core/exception/full_message_spec.rb | FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last): |
-| core/exception/full_message_spec.rb | FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "Traceback (most recent call last): |
-| core/exception/interrupt_spec.rb | pass=4 fail=1 err=1 pass=7 fail=0 err=0 |
+| core/exception/full_message_spec.rb | pass=45 fail=11 err=1 pass=46 fail=11 err=0 |
+| core/exception/full_message_spec.rb | FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError) |
+| core/exception/full_message_spec.rb | FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': \e[1mnon-empty (\e[1;4mRuntimeError\e[m\e[1m)\e[m |
+| core/exception/full_message_spec.rb | FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError) |
+| core/exception/interrupt_spec.rb | pass=4 fail=1 err=1 pass=6 fail=1 err=0 |
 | core/exception/interrupt_spec.rb | ERROR: rescuing Interrupt raises an Interrupt when sent a signal SIGINT: NoMethodError -- undefined method 'kill' for module Process |
+| core/exception/interrupt_spec.rb | FAILED: is raised on the main Thread by the default SIGINT handler: expected "Interrupt: 2 |
 | core/exception/signal_exception_spec.rb | pass=22 fail=1 err=2 pass=26 fail=0 err=1 |
 | core/exception/signal_exception_spec.rb | FAILED: expected ArgumentError to be raised |
 | core/exception/signal_exception_spec.rb | ERROR: rescuing SignalException raises a SignalException when sent a signal: NoMethodError -- undefined method 'kill' for module Process |
@@ -139,21 +141,15 @@ Visited **138** of **138** recorded DIFF files.
 | core/kernel/loop_spec.rb | FAILED: returns StopIteration#result, the result value of a finished iterator: expected :stopped, got nil |
 | core/kernel/method_spec.rb | pass=11 fail=1 err=0 pass=12 fail=0 err=0 |
 | core/kernel/open_spec.rb | pass=1 fail=0 err=15 pass=15 fail=0 err=7 |
-| core/kernel/open_spec.rb | ERROR: Kernel#open is a private method: ArgumentError -- path component of HOME is a file |
-| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when given a valid filename: ArgumentError -- path component of HOME is a file |
-| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when called with a block: ArgumentError -- path component of HOME is a file |
+| core/kernel/open_spec.rb | ERROR: Kernel#open is a private method: Errno::ENOENT -- No such file or directory @ rb_sysopen - HOME |
+| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when given a valid filename: Errno::ENOENT -- No such file or directory @ rb_sysopen - HOME |
+| core/kernel/open_spec.rb | ERROR: Kernel#open opens a file when called with a block: Errno::ENOENT -- No such file or directory @ rb_sysopen - HOME |
 | core/kernel/p_spec.rb | pass=7 fail=0 err=3 pass=9 fail=0 err=1 |
-| core/kernel/p_spec.rb | ERROR: Kernel#p flushes output if receiver is a File: ArgumentError -- path component of HOME is a file |
+| core/kernel/p_spec.rb | ERROR: Kernel#p flushes output if receiver is a File: Errno::ENOENT -- No such file or directory @ rb_sysopen - HOME |
 | core/kernel/p_spec.rb | ERROR: Kernel#p is not affected by setting $\, $/ or $,: NoMethodError -- undefined method 'output_to_fd' for an instance of Object |
 | core/kernel/p_spec.rb | ERROR: Kernel#p prints nothing if no argument is given: NameError -- undefined local variable or method 'p' for an instance of Object |
 | core/kernel/print_spec.rb | pass=3 fail=1 err=0 pass=4 fail=0 err=0 |
 | core/kernel/public_method_spec.rb | pass=4 fail=1 err=0 pass=5 fail=0 err=0 |
-| core/kernel/putc_spec.rb | pass=1 fail=0 err=1 pass=1 fail=0 err=1 |
-| core/kernel/putc_spec.rb | ERROR: Kernel#putc is a private method: ArgumentError -- path component of HOME is a file |
-| core/kernel/puts_spec.rb | pass=1 fail=0 err=2 pass=1 fail=0 err=2 |
-| core/kernel/puts_spec.rb | ERROR: Kernel#puts is a private method: ArgumentError -- path component of HOME is a file |
-| core/kernel/puts_spec.rb | ERROR: Kernel#puts delegates to $stdout.puts: ArgumentError -- path component of HOME is a file |
-| core/kernel/puts_spec.rb | ERROR: Kernel#puts is a private method: NoMethodError -- undefined method 'new_io' for an instance of Object |
 | core/kernel/raise_spec.rb | pass=22 fail=6 err=0 pass=28 fail=0 err=0 |
 | core/kernel/raise_spec.rb | FAILED: re-raises a previously rescued exception without overwriting the cause when it's explicitly specified with :cause option and has nil value: expected #<RuntimeError: Error 1>, got nil |
 | core/kernel/raise_spec.rb | FAILED: re-raises a previously rescued exception that doesn't have a cause and is a cause of other exception without setting a cause implicitly: expected #<RuntimeError: Error 1>, got #<RuntimeError: Error 1> |
@@ -337,9 +333,9 @@ Visited **138** of **138** recorded DIFF files.
 | language/constants_spec.rb | ERROR: with dynamically assigned constants evaluates the qualifier: NoMethodError -- undefined method 'get_const' for module Object::ConstantSpecs |
 | language/constants_spec.rb | ERROR: with statically assigned constants searches Object as a lexical scope only if Object is explicitly opened: NoMethodError -- undefined method 'const20' for class ConstantSpecs::ContainerA::ChildA |
 | language/constants_spec.rb | FAILED: expected NameError to be raised |
-| language/def_spec.rb | pass=111 fail=6 err=7 pass=135 fail=0 err=0 |
+| language/def_spec.rb | pass=129 fail=4 err=1 pass=135 fail=0 err=0 |
 | language/def_spec.rb | FAILED: expected SyntaxError to be raised |
-| language/def_spec.rb | ERROR: A singleton method definition can be declared for a global variable: NoMethodError -- undefined method 'foo' for an instance of String |
+| language/def_spec.rb | FAILED: expected FrozenError to be raised |
 | language/def_spec.rb | FAILED: expected FrozenError to be raised |
 | language/defined_spec.rb | pass=311 fail=11 err=0 pass=321 fail=0 err=0 |
 | language/defined_spec.rb | FAILED: returns 'method' if the method is defined: expected "method", got nil |
@@ -369,18 +365,18 @@ Visited **138** of **138** recorded DIFF files.
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
 | language/proc_spec.rb | FAILED: expected ArgumentError to be raised |
-| language/regexp_spec.rb | pass=30 fail=11 err=4 pass=74 fail=0 err=0 |
+| language/regexp_spec.rb | pass=63 fail=11 err=0 pass=74 fail=0 err=0 |
 | language/regexp_spec.rb | FAILED: expected not true |
 | language/regexp_spec.rb | FAILED: matches against $_ (last input) in a conditional if no explicit matchee provided: matcher did not match #<Proc> |
-| language/regexp_spec.rb | ERROR: Literal Regexps supports paired delimiters with %r: SyntaxError -- syntax error |
+| language/regexp_spec.rb | FAILED: supports \g (named backreference): expected ["foo1barfoo2", "foo2"], got ["foo1barfoo2", "foo1"] |
 | language/rescue_spec.rb | pass=91 fail=7 err=2 pass=100 fail=0 err=0 |
 | language/rescue_spec.rb | FAILED: in a global variable: expected "some text", got "" |
 | language/rescue_spec.rb | FAILED: converts the splatted list of exceptions using #to_a: expected to receive #to_a |
 | language/rescue_spec.rb | FAILED: expected SyntaxError to be raised |
-| language/return_spec.rb | pass=36 fail=0 err=16 pass=49 fail=2 err=2 |
-| language/return_spec.rb | ERROR: at top level stops file execution: ArgumentError -- path component of HOME is a file |
-| language/return_spec.rb | ERROR: within if is allowed: ArgumentError -- path component of HOME is a file |
-| language/return_spec.rb | ERROR: within while loop is allowed: ArgumentError -- path component of HOME is a file |
+| language/return_spec.rb | pass=38 fail=0 err=15 pass=49 fail=2 err=2 |
+| language/return_spec.rb | ERROR: at top level stops file execution: NoMethodError -- undefined method 'exitstatus' for nil |
+| language/return_spec.rb | ERROR: within if is allowed: StandardError -- mere-ruby: (ruby exception raised) |
+| language/return_spec.rb | ERROR: within while loop is allowed: StandardError -- mere-ruby: (ruby exception raised) |
 | language/send_spec.rb | pass=140 fail=4 err=0 pass=143 fail=0 err=0 |
 | language/send_spec.rb | FAILED: raises TypeError if 'to_proc' doesn't return a Proc: matcher did not match #<Proc> |
 | language/send_spec.rb | FAILED: raised NoMethodError, expected TypeError |
@@ -388,7 +384,7 @@ Visited **138** of **138** recorded DIFF files.
 | language/source_encoding_spec.rb | pass=2 fail=2 err=2 pass=2 fail=4 err=0 |
 | language/source_encoding_spec.rb | FAILED: can be parsed: expected "hello |
 | language/source_encoding_spec.rb | FAILED: can be parsed: expected "hello |
-| language/source_encoding_spec.rb | ERROR: encoded in UTF-16 LE with a BOM are invalid because they contain an invalid UTF-8 sequence before the encoding comment: ArgumentError -- path component of HOME is a file |
+| language/source_encoding_spec.rb | ERROR: encoded in UTF-16 LE with a BOM are invalid because they contain an invalid UTF-8 sequence before the encoding comment: Errno::ENOENT -- No such file or directory @ rb_sysopen - HOME |
 | language/string_spec.rb | pass=66 fail=11 err=3 pass=74 fail=4 err=2 |
 | language/string_spec.rb | FAILED: backslashes follow the same rules as interpolation: expected " |
 | language/string_spec.rb | FAILED: expected NoMethodError to be raised |

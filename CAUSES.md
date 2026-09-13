@@ -10,9 +10,9 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 138 files.
+Classified: 136 files.
 
-## DIFF — 138 files, 67 kinds
+## DIFF — 136 files, 68 kinds
 
 | files | kind |
 |---|---|
@@ -20,7 +20,6 @@ Classified: 138 files.
 | 10 | `FAILED matcher did not match #<OBJ>` |
 | 7 | `FAILED expected false, got true` |
 | 7 | `ERROR NameError` |
-| 7 | `ERROR ArgumentError` |
 | 6 | `FAILED expected ArgumentError to be raised` |
 | 5 | `FAILED expected TypeError to be raised` |
 | 5 | `ERROR TypeError` |
@@ -28,12 +27,14 @@ Classified: 138 files.
 | 4 | `FAILED expected "S", got "S"` |
 | 3 | `pass=N fail=N err=N` |
 | 3 | `FAILED expected N, got N` |
+| 3 | `ERROR Errno::ENOENT` |
 | 2 | `FAILED raised NoMethodError, expected SignalException` |
 | 2 | `FAILED expected truthy from #include?` |
 | 2 | `FAILED expected to be identical` |
 | 2 | `FAILED expected not to be identical` |
 | 2 | `FAILED expected SyntaxError to be raised` |
 | 2 | `FAILED expected "S", got nil` |
+| 2 | `ERROR StandardError` |
 | 2 | `ERROR RuntimeError` |
 | 1 | `sh: feature_N: command not found` |
 | 1 | `TMPDIR` |
@@ -73,7 +74,7 @@ Classified: 138 files.
 | 1 | `FAILED expected #<OBJ>, got nil` |
 | 1 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 1 | `FAILED expected #<Method: KernelSpecs::A#pub_method() TMPDIR got #<Method: KernelSpecs::B#aliased_pub_method() TMPDIR` |
-| 1 | `FAILED expected "\e[NmTraceback\e[m (most recent call last):` |
+| 1 | `FAILED expected "TMPDIR 'S': non-empty (RuntimeError)` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
 | 1 | `FAILED expected "S" to match` |
@@ -81,8 +82,8 @@ Classified: 138 files.
 | 1 | `FAILED expected "` |
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `ERROR SystemExit` |
-| 1 | `ERROR StandardError` |
 | 1 | `ERROR RangeError` |
+| 1 | `ERROR ArgumentError` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
@@ -107,8 +108,8 @@ Classified: 138 files.
 | 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
 | 1 | `FAILED: tries to convert a key with #to_int if index is not a String nor a Symbol, but responds to #to_int: expected {#<MockObject to_int> => 2}, got {}` |
 | 1 | `FAILED: treats the block as a Proc when lambda is re-defined: expected 1, got 2` |
-| 1 | `FAILED: supports :highlight option and adds escape sequences to highlight some strings: expected "\e[1mTraceback\e[m (most recent call last):` |
 | 1 | `FAILED: stores unequal keys that hash to the same value: expected to receive #hash` |
+| 1 | `FAILED: should not report as unhandled if the message is not empty: expected "TMPDIR 'full_message': non-empty (RuntimeError)` |
 | 1 | `FAILED: sets regexp matches in the caller: expected ["w", "a", "w", "a"], got ["a", "a", "a", "a"]` |
 | 1 | `FAILED: returns the status of the lock: expected false, got true` |
 | 1 | `FAILED: returns mutable copy of a literal: expected false, got true` |
