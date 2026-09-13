@@ -108,6 +108,19 @@ class PositiveMatcher
     end
     nil
   end
+  # ⚠ `x.should !~ /re/` needs its OWN method. Object#!~ is defined as the
+  # negation of #=~, so without this it ran the matcher above -- which counts
+  # a pass when the pattern MATCHES -- and every `should !~` was recorded
+  # backwards, on both sides. core/exception/full_message has eleven of them.
+  def !~(pattern)
+    if @actual =~ pattern
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected #{@actual.inspect} not to match"
+    else
+      $mspec_pass += 1
+    end
+    nil
+  end
 end
 
 class NegativeMatcher
@@ -369,6 +382,35 @@ def evaluate(code, &block)
   o = Object.new
   o.instance_eval(code)
   o.instance_eval(&block)
+end
+
+# mspec's `-> { ... }.should block_caller`: run the proc on its own thread and
+# watch its status. A thread parked on a lock reports "sleep"; one that ran to
+# the end reports false. ⚠ this is the shim's matcher protocol (#match?), not
+# mspec's (#matches?) -- the name and the behaviour are mspec's, the interface
+# is this file's, and the two mutex files that use it were failing on BOTH
+# sides for want of it.
+class BlockingMatcher
+  def match?(block)
+    t = Thread.new { block.call }
+    300.times do
+      case t.status
+      when "sleep"
+        t.kill
+        (t.join rescue nil)
+        return true
+      when false, nil
+        (t.join rescue nil)
+        return false
+      end
+      Thread.pass
+    end
+    (t.kill rescue nil)
+    true
+  end
+end
+def block_caller
+  BlockingMatcher.new
 end
 
 # Matcher objects for the `x.should be_nil` style.
