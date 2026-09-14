@@ -486,26 +486,33 @@ let rec gc_suffix = fn (xs: Stmt list) -> fn (n: int) ->
 // are not "<id>@..." ("$exc", "cls:Name@x") are always kept. Objects live in
 // ivars only through their owner: a second fixpoint pass marks values of
 // entries whose owner is live, until the live set stops growing.
+// ⚠ THE LIVE SET IS KEYED BY A TAGGED INT, NOT BY "<kind><decimal id>". It
+// used to build `"o" ++ str_of_int id` for EVERY VALUE MARKED and, in the
+// sweep, once per slot in every store -- an asprintf, a concatenation and a
+// string hash each time, on the one pass that walks the whole heap. `id * 8 +
+// kind` says the same thing in a register: no id is negative and there are six
+// kinds, so the mapping is injective.
+//   0 obj   1 str   2 arr   3 hash   4 proc   5 bind
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
-  | VObj id -> let k = "o" ++ str_of_int id in
+  | VObj id -> let k = id * 8 in
                (if map_has live k then () else (let _ = map_set live k VNil in ()))
-  | VStr id -> let k = "s" ++ str_of_int id in
+  | VStr id -> let k = id * 8 + 1 in
                (if map_has live k then () else (let _ = map_set live k VNil in ()))
-  | VArr id -> let k = "a" ++ str_of_int id in
+  | VArr id -> let k = id * 8 + 2 in
                (if map_has live k then ()
                 else let _ = map_set live k VNil in gc_mark_vals live (deref id))
-  | VHsh id -> let k = "h" ++ str_of_int id in
+  | VHsh id -> let k = id * 8 + 3 in
                (if map_has live k then ()
                 else let _ = map_set live k VNil in gc_mark_vals live (hderef id))
-  | VProc id -> let k = "p" ++ str_of_int id in
+  | VProc id -> let k = id * 8 + 4 in
                 (if map_has live k then ()
                  else let _ = map_set live k VNil in
                       (if map_has proc_store (str_of_int id)
                        then (let (_, _, _, penv) = map_get proc_store (str_of_int id) in
                              map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
                        else ()))
-  | VBind id -> let k = "b" ++ str_of_int id in
+  | VBind id -> let k = id * 8 + 5 in
                 (if map_has live k then ()
                  else let _ = map_set live k VNil in
                       (if map_has bind_store (str_of_int id)
@@ -520,14 +527,22 @@ and gc_mark_vals = fn live -> fn (xs: Val list) ->
   | Nil -> ()
   | Cons (v, rest) -> let _ = gc_mark_val live v in gc_mark_vals live rest;
 
-// owner id of an ivars key: "123@x" -> "123"; "" when the key has no numeric
+// owner id of an ivars key: "123@x" -> 123; -1 when the key has no numeric
 // owner (specials and class ivars -- those entries are kept unconditionally).
+// Reads the digits straight out rather than cutting a substring: this runs
+// once per ivars entry per fixpoint pass, and the substring was an allocation
+// each time whose only use was to be parsed back into a number.
+let rec gc_owner_go = fn (k: str) -> fn (i: int) -> fn (acc: int) ->
+  if i >= str_len k then 0 - 1
+  else
+    let c = char_at k i in
+    if str_eq c "@" then (if i > 0 then acc else 0 - 1)
+    else if is_digit c then gc_owner_go k (i + 1) (acc * 10 + (ord c - 48))
+    else 0 - 1;
 let gc_owner_of = fn (k: str) ->
-  if str_len k == 0 then ""
-  else if is_digit (char_at k 0) then
-    (let i = str_index_of k "@" in
-     if i > 0 then substring k 0 i else "")
-  else "";
+  if str_len k == 0 then 0 - 1
+  else if is_digit (char_at k 0) then gc_owner_go k 0 0
+  else 0 - 1;
 
 // fixpoint: values of entries whose owner is live (or ownerless) are marked;
 // repeat until the live set stops growing.
@@ -536,8 +551,8 @@ let gc_fixpoint = fn ivars -> fn live ->
     let before = map_len live in
     let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
       let owner = gc_owner_of k in
-      if str_eq owner "" then gc_mark_val live v
-      else if map_has live ("o" ++ owner) then gc_mark_val live v
+      if owner < 0 then gc_mark_val live v
+      else if map_has live (owner * 8) then gc_mark_val live v
       else ()) in
     let _ = (if gc_log_on () then print_err ("gc: fixpoint pass live=" ++ str_of_int (map_len live)) else ()) in
     if map_len live > before && guard > 0 then go (guard - 1) else () in
@@ -698,8 +713,8 @@ let gc_collect = fn env -> fn world ->
     let ivsave = map_new () in
     let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
       let owner = gc_owner_of k in
-      if str_eq owner "" then (let _ = map_set ivsave k v in ())
-      else if map_has live ("o" ++ owner) then (let _ = map_set ivsave k v in ())
+      if owner < 0 then (let _ = map_set ivsave k v in ())
+      else if map_has live (owner * 8) then (let _ = map_set ivsave k v in ())
       else ()) in
     let _ = map_clear ivars in
     let _ = map_iter ivsave (fn (k: str) -> fn (v: Val) -> map_set ivars k v) in
@@ -707,23 +722,21 @@ let gc_collect = fn env -> fn world ->
     let ocsave = map_new () in
     let _ = map_iter ocls (fn (k: str) -> fn (v: str) ->
       if str_len k > 0 && is_digit (char_at k 0)
-      then (if map_has live ("o" ++ k) then (let _ = map_set ocsave k v in ()) else ())
+      then (if map_has live (int_of_str k * 8) then (let _ = map_set ocsave k v in ()) else ())
       else (let _ = map_set ocsave k v in ())) in
     let _ = map_clear ocls in
     let _ = map_iter ocsave (fn (k: str) -> fn (v: str) -> map_set ocls k v) in
     let _ = map_compact ocls in
     let liveAK = map_new () in
-    // `live` is keyed by a PREFIXED string ("a123" / "o123") and stays so; the
-    // store itself is keyed by the id, which is what it always meant.
     let _ = map_iter arr_store (fn (k: int) -> fn (xs: Val list) ->
-      if map_has live ("a" ++ str_of_int k) then (let _ = map_set liveAK k xs in ()) else ()) in
+      if map_has live (k * 8 + 2) then (let _ = map_set liveAK k xs in ()) else ()) in
     let _ = map_clear arr_store in
     let _ = map_iter liveAK (fn (k: int) -> fn (xs: Val list) -> map_set arr_store k xs) in
     let _ = map_compact arr_store in
     let rec blank_h = fn (i: int) ->
       if i >= vec_len hash_store then ()
       else
-        let _ = (if map_has live ("h" ++ str_of_int i) then ()
+        let _ = (if map_has live (i * 8 + 3) then ()
                  else (match hderef i with
                        | Nil -> ()
                        | _ -> (let _ = hset i (Nil : Val list) in ()))) in
@@ -733,20 +746,20 @@ let gc_collect = fn env -> fn world ->
     let rec blank_s = fn (i: int) ->
       if i >= vec_len str_store then ()
       else
-        let _ = (if map_has live ("s" ++ str_of_int i) then ()
+        let _ = (if map_has live (i * 8 + 1) then ()
                  else (if str_eq (sget i) "" then () else sset i "")) in
         blank_s (i + 1) in
     let _ = blank_s 0 in
     let _ = vec_compact str_store in
     let liveE = map_new () in
     let _ = map_iter str_enc (fn (k: str) -> fn (v: str) ->
-      if map_has live ("s" ++ k) then (let _ = map_set liveE k v in ()) else ()) in
+      if map_has live (int_of_str k * 8 + 1) then (let _ = map_set liveE k v in ()) else ()) in
     let _ = map_clear str_enc in
     let _ = map_iter liveE (fn (k: str) -> fn (v: str) -> map_set str_enc k v) in
     let _ = map_compact str_enc in
     let liveF = map_new () in
     let _ = map_iter str_frozen (fn (k: str) -> fn (v: str) ->
-      if map_has live ("s" ++ k) then (let _ = map_set liveF k v in ()) else ()) in
+      if map_has live (int_of_str k * 8 + 1) then (let _ = map_set liveF k v in ()) else ()) in
     let _ = map_clear str_frozen in
     let _ = map_iter liveF (fn (k: str) -> fn (v: str) -> map_set str_frozen k v) in
     let _ = map_compact str_frozen in
