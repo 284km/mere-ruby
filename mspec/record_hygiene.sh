@@ -95,5 +95,79 @@ badenc=$(for f in $files; do
          done)
 [ -n "$badenc" ] && { echo "BINARY  a record is not valid UTF-8 (grep goes silent on it):"; echo "$badenc" | sed "s|$root/|        |"; rc=1; }
 
+# ...and finally, is each record COMPLETE? Everything above asks what a record
+# CONTAINS. Nothing asked whether it contains all of it -- and on 2026-09-14 a
+# truncated record was committed and pushed while every check here said clean.
+# A scoreboard run that is killed part-way (two sweeps racing, a superseded
+# binary) has already opened mspec/tags/<group>.txt and written the rows it got
+# to. The file left behind is a VALID record of a shorter run: no leak, no long
+# line, valid UTF-8. mspec/tags/language.txt kept 4 of its 22 DIFF rows that
+# way, and the loss was invisible because SPEC_STATUS.md -- written last, in one
+# go -- still said 22.
+#
+# That disagreement is the detector. SPEC_STATUS.md holds the COUNT per group
+# and mspec/tags/ holds the ROWS, so the two records can be asked the same
+# question and made to agree. A killed run cannot fake it: it dies before the
+# summary, so either the summary is the old one (and the rows are short) or
+# there is no summary at all.
+#
+# This is a check on the RECORDS, not on the interpreter -- it stays green while
+# DIFF moves, and goes red only when the two files stop describing one run.
+# Refused, not skipped, when the summary is absent: a check that quietly does
+# nothing when its oracle is missing is the same green as a check that passed.
+status="$root/SPEC_STATUS.md"
+if [ ! -f "$status" ]; then
+  echo "NO SUMMARY  SPEC_STATUS.md is missing, so the rows in mspec/tags/ cannot be"
+  echo "            checked for completeness against anything."
+  rc=1
+else
+  mismatch=$(awk -F'|' '
+    # | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
+    NF >= 8 {
+      g = $2; gsub(/^ +| +$/, "", g)
+      if (g == "group" || g ~ /^-+$/) next
+      d = $4 + 0; c = $5 + 0; sk = $6 + 0; sl = $7 + 0
+      f = g; gsub("/", "_", f)
+      path = tags "/" f ".txt"
+      want = d + c + sk + sl
+      have = 0; hd = 0; hc = 0; hsk = 0; hsl = 0
+      while ((getline line < path) > 0) {
+        if (line == "") continue
+        have++
+        if (line ~ /^DIFF/)  hd++
+        else if (line ~ /^CRASH/) hc++
+        else if (line ~ /^SKIP/)  hsk++
+        else if (line ~ /^SLOW/)  hsl++
+      }
+      close(path)
+      if (have == 0 && want > 0)
+        printf "        %s: SPEC_STATUS says %d rows, %s.txt is empty or missing\n", g, want, f
+      else if (hd != d || hc != c || hsk != sk || hsl != sl)
+        printf "        %s: SPEC_STATUS says %d/%d/%d/%d (diff/crash/skip/slow), %s.txt has %d/%d/%d/%d\n", \
+               g, d, c, sk, sl, f, hd, hc, hsk, hsl
+    }
+  ' tags="$root/mspec/tags" "$status")
+  if [ -n "$mismatch" ]; then
+    echo "PARTIAL  a record disagrees with SPEC_STATUS.md (a killed sweep truncates the rows"
+    echo "         it was mid-way through; the summary is written last and still reads full):"
+    echo "$mismatch"
+    rc=1
+  fi
+  # ...and the other direction: a tag file no row claims. A group renamed or
+  # dropped from the sweep leaves its old rows behind, and they then read as
+  # current findings about an interpreter that has not been asked in months.
+  orphan=$(for t in "$root"/mspec/tags/*.txt; do
+             [ -e "$t" ] || continue
+             b=$(basename "$t" .txt)
+             g=$(echo "$b" | sed 's|_|/|')
+             grep -aqE "^\| ($b|$g) \|" "$status" || echo "        $b.txt"
+           done)
+  if [ -n "$orphan" ]; then
+    echo "ORPHAN  a record in mspec/tags/ has no row in SPEC_STATUS.md:"
+    echo "$orphan"
+    rc=1
+  fi
+fi
+
 [ "$rc" = 0 ] && echo "records clean ($(echo $files | wc -w | tr -d ' ') files)"
 exit $rc

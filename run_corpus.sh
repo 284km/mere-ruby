@@ -39,6 +39,12 @@ esac
 # eight had accumulated, superseded by rewrites nobody finished; the compiler
 # does not say so, and a definition that never runs still gets maintained.
 ./tools/dead_defs_check.sh > /dev/null || { ./tools/dead_defs_check.sh | grep -a UNCALLED; exit 1; }
+# ...and a fifth, on the RECORDS rather than the interpreter: no leaked machine
+# text, and no record left half-written. This lived only in CI until 2026-09-14,
+# when a sweep killed mid-file left mspec/tags/language.txt holding 4 of its 22
+# rows and it was committed and pushed -- CI would have said so days later. The
+# check belongs on the path walked before a commit, which is this one.
+./mspec/record_hygiene.sh > /dev/null || { ./mspec/record_hygiene.sh; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a
