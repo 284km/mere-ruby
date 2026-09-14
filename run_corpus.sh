@@ -45,6 +45,12 @@ esac
 # rows and it was committed and pushed -- CI would have said so days later. The
 # check belongs on the path walked before a commit, which is this one.
 ./mspec/record_hygiene.sh > /dev/null || { ./mspec/record_hygiene.sh; exit 1; }
+# ...and a sixth: every write to the method table goes through the setter that
+# bumps the lookup generation. `has_meth` memoises the whole ancestor walk on
+# that generation, so a write that skips the setter is a method the lookup will
+# never see -- green build, green corpus, and one program that fails for no
+# visible reason.
+./tools/meth_writes_check.sh > /dev/null || { ./tools/meth_writes_check.sh; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a

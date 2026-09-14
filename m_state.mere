@@ -532,6 +532,18 @@ let mro_bump = fn () ->
   let n = (if map_has mro_gen "n" then map_get mro_gen "n" else 0) in
   map_set mro_gen "n" (n + 1);
 let mro_now = fn () -> if map_has mro_gen "n" then map_get mro_gen "n" else 0;
+// ⚠ THE ANCESTOR WALK, MEMOISED. `has_meth` asks whether a class or anything
+// above it answers a name, and answering it costs about five hash lookups PER
+// ANCESTOR LEVEL plus a 23-way class chain -- 26% of a dispatch-heavy profile,
+// cumulative, and the same handful of (class, name) pairs over and over. The
+// memo is keyed on the generation that `mro_bump ()` moves, which every write
+// to sup / includes / prepends / meths / undefs goes through (tools/
+// meth_writes_check.sh refuses one that does not). Same shape as mro_mods /
+// mro_mods_gen below, and the same MERE_RUBY_NO_MRO_CACHE switch turns it off
+// -- which is also how it is tested: the corpus and the spec sweep have to
+// give the same answers with the memo off as with it on.
+let hm_memo = map_new ();
+let hm_memo_gen = map_new ();
 
 let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
 let lv_ctr = map_new ();   // "n" -> next frame id
@@ -687,20 +699,20 @@ let name_sets = map_new ();
 let name_set = fn (tag: str) -> fn (spec: str) ->
   if map_has name_sets tag then map_get name_sets tag
   else
-    (let m = map_new () in
-     let _ = list_iter (str_split spec "|") (fn (n: str) -> map_set m n true) in
-     let _ = map_set name_sets tag m in
-     m);
-let map_set_s = fn m -> fn (k: str) -> fn (v: str) ->
-  if map_has m k && str_eq (map_get m k) v then () else map_set m k v;
+    (let tbl = map_new () in
+     let _ = list_iter (str_split spec "|") (fn (n: str) -> map_set tbl n true) in
+     let _ = map_set name_sets tag tbl in
+     tbl);
+let map_set_s = fn tbl -> fn (k: str) -> fn (v: str) ->
+  if map_has tbl k && str_eq (map_get tbl k) v then () else map_set tbl k v;
 // the same, for a table keyed by an INT. The call-stack tables (call_names_s,
 // call_files_s, call_meths_s, call_lines, live_frames) are keyed by the call
 // DEPTH or a frame id, and they were keyed by its decimal spelling: nine
 // `str_of_int` per method call, each one an asprintf. That was the single
 // largest cost in a dispatch-heavy program -- 1,207 of 4,600 samples in
 // method_body_flow alone.
-let map_set_si = fn m -> fn (k: int) -> fn (v: str) ->
-  if map_has m k && str_eq (map_get m k) v then () else map_set m k v;
+let map_set_si = fn tbl -> fn (k: int) -> fn (v: str) ->
+  if map_has tbl k && str_eq (map_get tbl k) v then () else map_set tbl k v;
 let cur_line = fn () ->
   if map_has cur_pos "l" then map_get cur_pos "l" else 0;
 let cur_file = fn () ->
@@ -1168,9 +1180,20 @@ let prepends = map_new ();
 // writes go through here rather than being spread across seventeen call sites
 // that each have to remember. (`sup` lives in the world tuple, so it is passed
 // in; includes and prepends are globals.)
-let set_sup = fn m -> fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set m k v;
+let set_sup = fn tbl -> fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set tbl k v;
 let set_inc = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set includes k v;
 let set_pre = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set prepends k v;
+// ⚠ AND THE SAME FOR THE METHOD TABLE AND ITS TOMBSTONES, for a reason the
+// three above did not have: `has_meth` MEMOISES the whole ancestor walk on
+// this generation, so a definition that does not bump it is a definition the
+// lookup will not see -- the quietest possible bug, and the one recorded in
+// feedback about a method-table entry hiding every other answer. Every write
+// goes through here and tools/meth_writes_check.sh refuses a bare
+// `map_set meths` anywhere else; that gate is the only thing making the memo
+// safe, so it is poisoned like one.
+// (`meths` lives in the world tuple, so it is passed in; `undefs` is global.)
+let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) -> let _ = mro_bump () in map_set tbl k v;
+let del_meth = fn tbl -> fn (k: str) -> let _ = mro_bump () in map_delete tbl k;
 // names declared with `module` (vs `class`) so Module#class differs.
 let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
@@ -1184,6 +1207,9 @@ let privates = map_new ();
 let vis_marks = map_new ();   // "cls#name" -> VNil, where a visibility statement named it
 let protecteds = map_new ();  // protected methods (callable only same-class)
 let undefs = map_new ();  // undef'd methods (tombstones that block inheritance)
+// a tombstone changes what the walk answers, so it bumps the generation too
+let set_undef = fn (k: str) -> let _ = mro_bump () in map_set undefs k VNil;
+let del_undef = fn (k: str) -> let _ = mro_bump () in map_delete undefs k;
 let num_names_memo = map_new ();  // numeric kind -> its method-name set
 // prim_method has no `world` to build an exception, so its terminal
 // "undefined method" failure parks the method name here; the begin/rescue
