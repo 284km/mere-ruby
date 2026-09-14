@@ -35,6 +35,10 @@ esac
 # dead, silently, on a green build -- six of them had accumulated, and one was
 # added the same day the gate was written.
 ./tools/dup_defs_check.sh > /dev/null || { ./tools/dup_defs_check.sh | grep -a SAME-CHAIN; exit 1; }
+# ...and a fourth: no top-level function is defined and never called. Twenty-
+# eight had accumulated, superseded by rewrites nobody finished; the compiler
+# does not say so, and a definition that never runs still gets maintained.
+./tools/dead_defs_check.sh > /dev/null || { ./tools/dead_defs_check.sh | grep -a UNCALLED; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a
