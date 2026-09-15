@@ -19,17 +19,35 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 src="${1:-$root/mr.c}"
 [ -f "$src" ] || { echo "no $src (generate: mere -c main.mere > mr.c)"; exit 2; }
+# ⚠ AND IT MUST DESCRIBE THIS TREE. The default subject is a file in the repo
+# and nothing regenerates it: locally it was FIVE DAYS OLD while this check
+# reported on it every run. CI writes it immediately before, which is why the
+# staleness never showed there. A gate that caches its subject is not a gate.
+newest=$(ls -t "$root"/*.mere 2>/dev/null | head -1)
+if [ -n "$newest" ] && [ "$newest" -nt "$src" ]; then
+  echo "gc roots: $src is older than $(basename "$newest") -- it does not describe this tree." >&2
+  echo "Regenerate it (mere -c main.mere > mr.c) or pass the C you just built:" >&2
+  echo "  ./tools/gc_roots_check.sh /path/to/fresh.c" >&2
+  exit 2
+fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # 1. maps whose value type carries Val (the value type is the C struct suffix)
-LC_ALL=C grep -a -o 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
-  | sed 's/static mere_map_str_//; s/\* mu_/ /; s/;//' \
+# ⚠ BOTH KEY TYPES. This read `mere_map_str_` only, and on 2026-09-15 a batch
+# of tables moved from string keys to int keys for speed -- at which point
+# arr_store, arr_pending and lv_up, all of which hold Vals, became INVISIBLE
+# here. A gate that silently stops covering something is worse than one that
+# never covered it: the green stayed green. (What said so was the allowlist's
+# own staleness check -- "no such Val-valued map" for a table that plainly
+# exists -- which is why that check earns its place.)
+LC_ALL=C grep -a -o -e 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' -e 'static mere_map_int_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
+  | sed 's/static mere_map_str_//; s/static mere_map_int_//; s/\* mu_/ /; s/;//' \
   | awk '$1 ~ /Val/ && $1 !~ /^Map___heap_str_Val$/ {print $2, $1}' | sort -u > "$tmp/valmaps"
 # ...and the names this excluded, so an allowlist entry for one of them is not
 # reported as stale (see the note above).
-LC_ALL=C grep -a -o 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
-  | sed 's/static mere_map_str_//; s/\* mu_/ /; s/;//' \
+LC_ALL=C grep -a -o -e 'static mere_map_str_[A-Za-z_]*\* mu_[a-z_0-9]*;' -e 'static mere_map_int_[A-Za-z_]*\* mu_[a-z_0-9]*;' "$src" \
+  | sed 's/static mere_map_str_//; s/static mere_map_int_//; s/\* mu_/ /; s/;//' \
   | awk '$1 == "Map___heap_str_Val" {print $2}' | sort -u > "$tmp/excluded"
 # (Map___heap_str_Val values are env maps -- containers of Vals -- and lv_up,
 #  which holds them, is a root; the rest are frame-shaped scratch handled by

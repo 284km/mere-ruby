@@ -94,16 +94,60 @@ let arr_new = fn (xs: Val list) ->
   let _ = map_set arr_ctr "n" (id + 1) in
   let _ = map_set arr_store id xs in
   VArr id;
-let deref = fn (id: int) -> map_get arr_store id;
-// Every write bumps a per-array VERSION. Ruby's Array#each indexes into the
-// live array, so a block that shifts or pops changes what comes next -- but
-// this array is a linked list, and indexing from the head at every step would
-// make each iteration O(n^2). The version lets a walker keep its tail pointer
-// while nothing writes, and re-derive it from the index only after a write.
+// ⚠ APPENDS GO INTO A Vec, NOT A LIST, AND THAT IS THE WHOLE POINT.
+// An Array here is a `Val list`, and `push` was `arr_set id (list_append
+// (deref id) args)` -- a copy of the entire array per element, so building one
+// with `<<` was O(n^2): 32,000 pushes took 19.6 seconds where ruby takes 0.001.
+//
+// The first attempt queued the appends in another `Val list` and it did not
+// help at all, which is the interesting part. A `list` is a VALUE type in
+// Mere: `map_set` copies it into the MAP'S region, by design, so that the map
+// outlives whatever region built the value (`__mcopy_list_V`). Queuing into a
+// list still stored that list per push, so the copy just moved. Measured on
+// its own: building a 32,000-element list is 0.37 ms, and storing it into a
+// map on every step is 15,889 ms.
+//
+// A `Vec` is a REFERENCE type -- `__mcopy_Vec_V(r, v)` returns `v` -- so the
+// map holds a HANDLE. Pushing through it never writes the map at all, and
+// costs what a push should: 32,000 vec_pushes through a map_get is 0.09 ms.
+// Nothing about Mere needed changing; the value/reference split IS the region
+// model, and this was the wrong container on this side of it.
+//
+// `deref` folds the queue in before anyone sees the array, so all 338 readers
+// are unchanged. The fold is one `list_append` over the SETTLED part, paid
+// once per read after a run of appends -- and for the shape that matters,
+// build-then-read (`n.times { a << i }`, and CSV.parse), the settled part is
+// empty and the whole build is linear.
+// ⚠ THE QUEUED VALUES ARE LIVE. gc_roots_check.sh is the gate that says so.
+let arr_pending = map_new ();
+let rec vec_tail_list = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
+  if i < 0 then acc else vec_tail_list v (i - 1) (Cons (vec_get v i, acc));
+let deref = fn (id: int) ->
+  // `map_len` first: nothing is queued in most programs, and then this costs
+  // one comparison rather than a hash on every array read.
+  if map_len arr_pending > 0 && map_has arr_pending id
+  then
+    (let v = map_get arr_pending id in
+     let merged = list_append (map_get arr_store id) (vec_tail_list v (vec_len v - 1) (Nil : Val list)) in
+     let _ = map_set arr_store id merged in
+     let _ = map_delete arr_pending id in
+     merged)
+  else map_get arr_store id;
 let arr_vers = map_new ();
 let arr_ver = fn (id: int) -> (if map_has arr_vers id then map_get arr_vers id else 0);
+// push without writing the map or the array: O(1) per element
+let rec vec_push_all = fn (v) -> fn (xs: Val list) ->
+  match xs with Nil -> () | Cons (h, t) -> (let _ = vec_push v h in vec_push_all v t);
+let arr_push_many = fn (id: int) -> fn (xs: Val list) ->
+  let v = (if map_has arr_pending id then map_get arr_pending id
+           else (let nv = vec_new () in let _ = map_set arr_pending id nv in nv)) in
+  let _ = map_set arr_vers id (arr_ver id + 1) in
+  vec_push_all v xs;
 let arr_set = fn (id: int) -> fn (xs: Val list) ->
   let _ = map_set arr_vers id (arr_ver id + 1) in
+  // a whole-array replacement supersedes anything queued for it
+  let _ = (if map_len arr_pending > 0 && map_has arr_pending id
+           then (let _ = map_delete arr_pending id in ()) else ()) in
   let _ = map_set arr_store id xs in ();
 
 // strings are mutable reference types too (Ruby semantics): VStr is a HANDLE

@@ -29,7 +29,11 @@ esac
 # A second self-check: every global map that holds object handles is a GC root
 # (or is named, with its reason, in tools/gc_roots_allow.txt). The table that
 # was missing from the roots on 2026-09-03 cost `require "bundler"` two weeks.
-./tools/gc_roots_check.sh > /dev/null || { ./tools/gc_roots_check.sh | grep -v " root$"; exit 1; }
+# MR_C, when the caller has just emitted one, so this reads the tree it is
+# testing rather than a checked-in mr.c that nothing regenerates (it was five
+# days stale on 2026-09-15 and the check reported on it every run).
+./tools/gc_roots_check.sh ${MR_C:+"$MR_C"} > /dev/null \
+  || { ./tools/gc_roots_check.sh ${MR_C:+"$MR_C"} | grep -v " root$"; exit 1; }
 # A third: no top-level name is defined twice in one `let rec ... and ...`
 # chain. The later definition wins for every caller and the earlier one is
 # dead, silently, on a green build -- six of them had accumulated, and one was
