@@ -8531,9 +8531,17 @@ and rx_nth_open = fn (pat: str) -> fn (g: int) -> fn (p: int) -> fn (cnt: int) -
     else if str_eq c "[" then rx_nth_open pat g (rx_class_end pat (p + 1)) cnt
     else if str_eq c "(" then (if cnt + 1 == g then p else rx_nth_open pat g (p + 1) (cnt + 1))
     else rx_nth_open pat g (p + 1) cnt
+// every write to a capture slot goes through here, so `rx_clear_caps` knows
+// how far it has to reach. Without it the clear walked 1..64 on EVERY match
+// attempt: 128 str_of_int and 128 map probes for a pattern with no groups.
+and rx_cap_set = fn (g: int) -> fn (kind: int) -> fn (v: int) ->
+  let _ = (if g > (if map_has rx_wide 0 then map_get rx_wide 0 else 0)
+           then map_set rx_wide 0 g else ()) in
+  map_set rx_caps (g * 4 + kind) v
+and rx_cap_hi = fn (u: unit) -> if map_has rx_wide 0 then map_get rx_wide 0 else 0
 and rx_unset_cap = fn (g: int) ->
-  let _ = if map_has rx_caps ("s" ++ str_of_int g) then map_delete rx_caps ("s" ++ str_of_int g) else () in
-  (if map_has rx_caps ("e" ++ str_of_int g) then map_delete rx_caps ("e" ++ str_of_int g) else ())
+  let _ = if map_has rx_caps (g * 4) then map_delete rx_caps (g * 4) else () in
+  (if map_has rx_caps (g * 4 + 1) then map_delete rx_caps (g * 4 + 1) else ())
 and backref_at = fn (s: str) -> fn (i: int) -> fn (cap: str) -> fn (clen: int) ->
   clen > 0 && i + clen <= str_len s && str_eq (substring s i (i + clen)) cap
 and rx_count = fn (pat: str) -> fn (ch: str) -> fn (p: int) ->
@@ -8565,8 +8573,7 @@ and rxv_export_go = fn (saves: (int * int) list) -> fn (ng: int) -> fn (g: int) 
     let a = rxv_slot_get saves (2 * g) in
     let b = rxv_slot_get saves (2 * g + 1) in
     let _ = (if a >= 0 && b >= 0 then
-               (let _ = map_set rx_caps ("s" ++ str_of_int g) a in
-                map_set rx_caps ("e" ++ str_of_int g) b)
+               (let _ = rx_cap_set g 0 a in rx_cap_set g 1 b)
              else ()) in
     rxv_export_go saves ng (g + 1)
 and rb_scan_tag = fn (xs: Val list) -> fn (e: str) ->
@@ -8606,17 +8613,23 @@ and rx_capture_names = fn (pat: str) -> fn (p: int) ->
       Cons (substring pat (p + 3) nend, rx_capture_names pat (nend + 1))
     else rx_capture_names pat (p + 1)
 and rx_clear_caps = fn (i: int) ->
-  if i > 64 then ()
+  let _ = rx_clear_go i (rx_cap_hi ()) in
+  map_set rx_wide 0 0
+and rx_clear_go = fn (i: int) -> fn (hi: int) ->
+  if i > hi then ()
   else
-    let _ = if map_has rx_caps ("s" ++ str_of_int i) then map_delete rx_caps ("s" ++ str_of_int i) else () in
-    let _ = if map_has rx_caps ("e" ++ str_of_int i) then map_delete rx_caps ("e" ++ str_of_int i) else () in
-    rx_clear_caps (i + 1)
+    let _ = if map_has rx_caps (i * 4) then map_delete rx_caps (i * 4) else () in
+    let _ = if map_has rx_caps (i * 4 + 1) then map_delete rx_caps (i * 4 + 1) else () in
+    rx_clear_go (i + 1) hi
 and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> fn (ng: int) -> fn (enc: str) ->
   let (meths, sup, ocls, ivars) = world in
   let id = alloc_oid ocls in
+  // one itoa for the id, not one per field: every ivar key here is
+  // `<id>@...`, and there are eight of them on every successful match.
+  let idk = str_of_int id in
   let _ = map_set ocls id "MatchData" in
   let _ = map_set globals "~" (VObj id) in
-  let _ = map_set ivars (str_of_int id ++ "@0") (mkstr_e (substring sv st en) enc) in
+  let _ = map_set ivars (idk ++ "@0") (mkstr_e (substring sv st en) enc) in
   let _ = map_set md_whole (str_of_int id) (substring sv st en) in
   // keep the subject and the span, so #pre_match / #post_match / #begin / #end
   // (and $` / $' / $&, which are derived from them) can be answered.
@@ -8630,31 +8643,32 @@ and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> 
                        let _ = map_set rx_src_last "e" enc in
                        let _ = map_set rx_src_hnd "h" nh in VStr nh)
                     | other -> other)) in
-  let _ = map_set ivars (str_of_int id ++ "@__src") srcv in
+  let _ = map_set ivars (idk ++ "@__src") srcv in
   // the subject's encoding, so the LAZY accessors (#pre_match / #post_match /
   // #string) can wear it too -- they build their String on demand.
-  let _ = map_set ivars (str_of_int id ++ "@__enc") (mkstr enc) in
-  let _ = map_set ivars (str_of_int id ++ "@__st") (VInt st) in
-  let _ = map_set ivars (str_of_int id ++ "@__en") (VInt en) in
-  let _ = (if ng >= 0 then map_set ivars (str_of_int id ++ "@__ng") (VInt ng) else ()) in
+  let _ = map_set ivars (idk ++ "@__enc") (mkstr enc) in
+  let _ = map_set ivars (idk ++ "@__st") (VInt st) in
+  let _ = map_set ivars (idk ++ "@__en") (VInt en) in
+  let _ = (if ng >= 0 then map_set ivars (idk ++ "@__ng") (VInt ng) else ()) in
   // the pattern this match came from, so #[](:name) / #names / #named_captures
   // can look its group names up (rx_prog_names, keyed the same way).
-  let _ = (if map_has rx_cur "k" then map_set ivars (str_of_int id ++ "@__key") (map_get rx_cur "k") else ()) in
+  let _ = (if map_has rx_cur "k" then map_set ivars (idk ++ "@__key") (map_get rx_cur "k") else ()) in
   let _ = rx_store_groups ivars id sv 1 enc in
   rx_pub_groups sv 1 true enc
 and rx_store_groups = fn ivars -> fn (id: int) -> fn (sv: str) -> fn (g: int) -> fn (enc: str) ->
-  if g > 64 then ()
+  if g > rx_cap_hi () then ()
   else
-    let ks = "s" ++ str_of_int g in let ke = "e" ++ str_of_int g in
+    let ks = g * 4 in let ke = g * 4 + 1 in
+    let idk = str_of_int id in let gk = str_of_int g in
     let _ = (if map_has rx_caps ks && map_has rx_caps ke then
                let a = map_get rx_caps ks in let b = map_get rx_caps ke in
                (if b >= a then
                   // the span too, not only the text: #begin(n) / #end(n) had
                   // nothing but group 0's span to answer from, so `begin(1)`
                   // reported where the whole match started
-                  (let _ = map_set ivars (str_of_int id ++ "@__st" ++ str_of_int g) (VInt a) in
-                   let _ = map_set ivars (str_of_int id ++ "@__en" ++ str_of_int g) (VInt b) in
-                   map_set ivars (str_of_int id ++ "@" ++ str_of_int g) (mkstr_e (substring sv a b) enc))
+                  (let _ = map_set ivars (idk ++ "@__st" ++ gk) (VInt a) in
+                   let _ = map_set ivars (idk ++ "@__en" ++ gk) (VInt b) in
+                   map_set ivars (idk ++ "@" ++ gk) (mkstr_e (substring sv a b) enc))
                 else ())
              else ()) in
     rx_store_groups ivars id sv (g + 1) enc
@@ -8716,18 +8730,27 @@ and md_collect_nums = fn ivars -> fn (id: int) -> fn (ns: int list) ->
   | Cons (g, t) ->
     Cons ((if map_has ivars (str_of_int id ++ "@" ++ str_of_int g) then map_get ivars (str_of_int id ++ "@" ++ str_of_int g) else VNil),
           md_collect_nums ivars id t)
+// ⚠ `$1..$9` are nine unconditional map writes per match, and a write leaves
+// the value it replaced in the map's arena. A pattern with no groups wrote
+// nine VNils over nine VNils on every match. Write as far as THIS match
+// reaches, clear as far as the LAST one did, and remember which that was.
 and rx_pub_groups = fn (sv: str) -> fn (i: int) -> fn (ok: bool) -> fn (enc: str) ->
-  if i > 9 then ()
+  let hi = (let h = (if ok then rx_cap_hi () else 0) in if h > 9 then 9 else h) in
+  let last = (if map_has rx_wide 1 then map_get rx_wide 1 else 0) in
+  let _ = rx_pub_go sv i ok enc (if hi > last then hi else last) in
+  map_set rx_wide 1 hi
+and rx_pub_go = fn (sv: str) -> fn (i: int) -> fn (ok: bool) -> fn (enc: str) -> fn (lim: int) ->
+  if i > lim then ()
   else
-    let k_s = "s" ++ str_of_int i in
-    let k_e = "e" ++ str_of_int i in
+    let k_s = i * 4 in
+    let k_e = i * 4 + 1 in
     let v = if ok && map_has rx_caps k_s && map_has rx_caps k_e then
               (let a = map_get rx_caps k_s in
                let b = map_get rx_caps k_e in
                if b >= a then mkstr_e (substring sv a b) enc else VNil)
             else VNil in
     let _ = map_set globals (str_of_int i) v in
-    rx_pub_groups sv (i + 1) ok enc
+    rx_pub_go sv (i + 1) ok enc lim
 and rx_step = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int) ->
   if str_eq (char_at pat p) "." then utf8_clen s i else 1
 and rx_elem = fn (pat: str) -> fn (p: int) -> fn (c: str) ->
@@ -8789,7 +8812,7 @@ and rx_expand_rep = fn (rep: str) -> fn (s: str) -> fn (mst: int) -> fn (men: in
         (let rec lastg = fn (g: int) -> fn (best: str) ->
            if g > 64 then best
            else
-             let gs = "s" ++ str_of_int g in let ge = "e" ++ str_of_int g in
+             let gs = g * 4 in let ge = g * 4 + 1 in
              (if map_has rx_caps gs && map_has rx_caps ge then
                 (let a = map_get rx_caps gs in let b = map_get rx_caps ge in
                  lastg (g + 1) (if b >= a then substring s a b else best))
@@ -8797,7 +8820,7 @@ and rx_expand_rep = fn (rep: str) -> fn (s: str) -> fn (mst: int) -> fn (men: in
          rx_expand_rep rep s mst men (i + 2) (acc ++ lastg 1 ""))
       else if is_digit d then
         let g = ord d - 48 in
-        let gs = "s" ++ str_of_int g in let ge = "e" ++ str_of_int g in
+        let gs = g * 4 in let ge = g * 4 + 1 in
         let piece = if map_has rx_caps gs && map_has rx_caps ge then
                       (let a = map_get rx_caps gs in let b = map_get rx_caps ge in if b >= a then substring s a b else "")
                     else "" in
@@ -8815,8 +8838,8 @@ and rx_group_count = fn (pat: str) -> fn (i: int) -> fn (n: int) ->
 and rx_scan_groups = fn (s: str) -> fn (g: int) -> fn (ng: int) ->
   if g > ng then Nil
   else
-    let ks = "s" ++ str_of_int g in
-    let ke = "e" ++ str_of_int g in
+    let ks = g * 4 in
+    let ke = g * 4 + 1 in
     let v = (if map_has rx_caps ks && map_has rx_caps ke then
                (let a = map_get rx_caps ks in let b = map_get rx_caps ke in
                 if b >= a then mkstr (substring s a b) else VNil)

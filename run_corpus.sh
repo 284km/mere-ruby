@@ -55,6 +55,15 @@ esac
 # never see -- green build, green corpus, and one program that fails for no
 # visible reason.
 ./tools/meth_writes_check.sh > /dev/null || { ./tools/meth_writes_check.sh; exit 1; }
+# ...a seventh: every `name_set "tag"` has an arm in name_spec. A tag with no
+# arm builds an EMPTY table, which is a predicate answering false about every
+# name -- a wrong answer, not a crash.
+./tools/name_spec_check.sh > /dev/null || { ./tools/name_spec_check.sh; exit 1; }
+# ...and an eighth: every write to a regex capture slot goes through
+# rx_cap_set, which keeps the high-water mark rx_clear_caps reaches to. A write
+# that goes around it leaves a capture behind, and the NEXT match answers with
+# a group belonging to the one before it.
+./tools/rx_caps_check.sh > /dev/null || { ./tools/rx_caps_check.sh; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a
