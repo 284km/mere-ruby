@@ -761,6 +761,19 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8 + 3) then (let _ = map_set liveHQ k q in ()) else ()) in
     let _ = map_clear hash_pending in
     let _ = map_iter liveHQ (fn (k: int) -> fn (q: Vec['q, Val]) -> map_set hash_pending k q) in
+    // ...and the index beside it. Its values are the hash's own values, so it
+    // holds nothing the hash does not; a DEAD hash's index is dropped here so
+    // the table does not grow with every hash ever made.
+    let liveHI = map_new () in
+    let _ = map_iter hash_index (fn (k: int) -> fn (ix: Map['i, str, Val]) ->
+      if map_has live (k * 8 + 3) then (let _ = map_set liveHI k ix in ()) else ()) in
+    let _ = map_clear hash_index in
+    let _ = map_iter liveHI (fn (k: int) -> fn (ix: Map['i, str, Val]) -> map_set hash_index k ix) in
+    let liveHM = map_new () in
+    let _ = map_iter hash_indexed (fn (k: int) -> fn (b: bool) ->
+      if map_has live (k * 8 + 3) then (let _ = map_set liveHM k b in ()) else ()) in
+    let _ = map_clear hash_indexed in
+    let _ = map_iter liveHM (fn (k: int) -> fn (b: bool) -> map_set hash_indexed k b) in
     let _ = vec_compact hash_store in
     let rec blank_s = fn (i: int) ->
       if i >= vec_len str_store then ()
@@ -7103,8 +7116,28 @@ and hpending_has = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) ->
   hpending_on hid && (let q = hpending_vec hid in hq_has q 0 (vec_len q) ident k)
 // ⚠ `hsettled`, NOT `hderef`: hderef folds the queue in, and the test that
 // decides whether to queue must not flush the thing it is deciding about.
+// MERE_RUBY_NO_HASH_INDEX=1 turns the index off at the READ doors. That is
+// not a debug switch: the corpus has to give BYTE-IDENTICAL output with it on
+// and off, which is the only check that says the index agrees with the walk
+// it replaces. (Writes keep maintaining it either way, so the two runs differ
+// only in which answer is believed.)
+and hidx_use = fn (hid: int) ->
+  (if map_has hidx_off "o" then (match map_get hidx_off "o" with 1 -> false | _ -> true)
+   else (let o = (if str_eq (env_get "MERE_RUBY_NO_HASH_INDEX") "" then 0 else 1) in
+         let _ = map_set hidx_off "o" o in (match o with 1 -> false | _ -> true)))
+  && hidx_on hid
 and hput_or_queue = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: Val) -> fn (slow: unit -> Val list) ->
-  if hash_haskey_x ident (hsettled hid) k || hpending_has hid ident k
+  // ⚠ ASK THE INDEX FIRST. Without this the write still WALKED to find out
+  // whether the key was already there, so the index made reads O(1) and left
+  // building a hash quadratic: 16,000 insertions stayed at 2.24 s with reads
+  // already flat. The index knows every key in an indexed hash, so its answer
+  // is the whole answer -- and when it says "present" the old path runs, which
+  // is what rewrites the value in place.
+  if hidx_use hid && (if str_eq (hkey_digest k) "" then false else true)
+  then (if hidx_has hid (hkey_digest k)
+        then (let _ = hset hid (slow ()) in v)
+        else (let _ = hpush_new hid k v in v))
+  else if hash_haskey_x ident (hsettled hid) k || hpending_has hid ident k
   then (let _ = hset hid (slow ()) in v)
   else (let _ = hpush_new hid k v in v)
 // ⚠ A KEY WITH ITS OWN #hash NEVER QUEUES. `hash_put_wx` sends exactly those
@@ -17256,9 +17289,17 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
        let k2 = vec_get q9 i in
        if (if ci then hkey_same true k2 k else hkey_eql_w env world hid k2 k)
        then Cons (k2, Nil) else findq9 (i + 2) n) in
-  let found9 = (match find9 (hsettled hid) with
-                | Cons (kk, _) -> Cons (kk, Nil)
-                | Nil -> (if hpending_on hid then findq9 0 (vec_len (hpending_vec hid)) else (Nil : Val list))) in
+  // ⚠ AN INDEXED HASH ANSWERS "not there" WITHOUT LOOKING. This scan runs on
+  // every store -- it is what finds the key OBJECT ruby keeps when an equal
+  // key is stored later -- and with the index in place it was the last O(n)
+  // left in a build: reads were flat and 16,000 insertions still took 1.21 s.
+  // When the index says absent there is no earlier key object to find.
+  let found9 = (if hidx_use hid && (if str_eq (hkey_digest k) "" then false else true)
+                   && (if hidx_has hid (hkey_digest k) then false else true)
+                then (Nil : Val list)
+                else (match find9 (hsettled hid) with
+                      | Cons (kk, _) -> Cons (kk, Nil)
+                      | Nil -> (if hpending_on hid then findq9 0 (vec_len (hpending_vec hid)) else (Nil : Val list)))) in
   match found9 with
   | Cons (kk, _) -> kk
   | Nil ->
@@ -19524,7 +19565,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              | VNil -> "no implicit conversion from nil to integer"
              | _ -> "no implicit conversion of " ++ class_name other ++ " into Integer")
         | _ -> VNil)
-     | VHsh hid -> let xs = hderef hid in let ci = hcbi_on hid in (match args with Cons (k, _) -> if hash_haskey_x ci xs k then hash_get_x ci xs k else hdflt_get hid | _ -> VNil)
+     // ⚠ the index answers BEFORE `hderef`, which folds the queue: consulting
+     // it afterwards would already have paid the thing it is meant to avoid.
+     // It is believed only while the hash is marked indexed, which means every
+     // key in it has a digest -- so a MISS here is a real miss.
+     | VHsh hid ->
+       (match args with
+        | Cons (k, _) when hidx_use hid && (if str_eq (hkey_digest k) "" then false else true) ->
+          (let d = hkey_digest k in if hidx_has hid d then hidx_get hid d else hdflt_get hid)
+        | _ ->
+          let xs = hderef hid in let ci = hcbi_on hid in (match args with Cons (k, _) -> if hash_haskey_x ci xs k then hash_get_x ci xs k else hdflt_get hid | _ -> VNil))
      // Integer#[i]: bit i of the number (0 for out-of-range high bits).
      // `n[i, len]` and `n[i..j]` take a RUN of bits, low bit first: the bits
      // are shifted down to zero and masked, so 255[0, 4] is 15.
@@ -20957,7 +21007,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // marking a hash changes how it looks keys up, which a frozen hash refuses.
      | VHsh hid -> (if cfrozen_get 1 hid then
                       prim_raise "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
-                    else (let _ = map_set hcbi (str_of_int hid) 1 in recv))
+                    // ⚠ compare_by_identity DROPS THE INDEX. Two equal Strings are two keys
+                          // under it, and the digest of a String is its CONTENT -- so the
+                          // index would answer one where the hash holds two. Found by the
+                          // semantics check, not by reasoning: `[2, 1, 2]` came back `[2, 2, 2]`.
+                          else (let _ = hidx_drop hid in let _ = map_set hcbi (str_of_int hid) 1 in recv))
      | _ -> recv)
   else if str_eq name "compare_by_identity?" then
     (match recv with VHsh hid -> VBool (hcbi_on hid) | _ -> VBool false)

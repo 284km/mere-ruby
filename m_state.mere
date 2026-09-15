@@ -208,9 +208,59 @@ let hash_store = vec_new ();
 // than refusing; the limit is in KNOWN_GAPS.
 let signal_traps = map_new ();
 let signal_names = "EXIT:0 IOT:6 EMT:7 CLD:20 HUP:1 INT:2 QUIT:3 ILL:4 TRAP:5 ABRT:6 FPE:8 KILL:9 BUS:10 SEGV:11 SYS:12 PIPE:13 ALRM:14 TERM:15 URG:16 STOP:17 TSTP:18 CONT:19 CHLD:20 TTIN:21 TTOU:22 IO:23 XCPU:24 XFSZ:25 VTALRM:26 PROF:27 WINCH:28 INFO:29 USR1:30 USR2:31";
+// ⚠ AN INDEX, FOR THE KEYS WHOSE EQUALITY IS A VALUE COMPARISON.
+// A Hash here is a flat assoc list, so `h[k]` walks it: measured, a read is
+// `4.1 us + position x 14 ns`, and the walk overtakes the per-call constant at
+// about position 290. For a 16,000-entry hash that is 112 us of scanning per
+// read, and building one is 82% scan.
+//
+// The index is a digest -> value map beside the list. It is consulted ONLY
+// when the hash is marked indexed, and the mark is dropped the moment anything
+// happens that the index cannot describe. The safe direction is built in:
+// `hkey_digest` answers "" for any key it does not know, and a hash holding
+// one of those is not indexed at all -- a key kind added later is slow, never
+// wrong. (Which is the opposite of a list of names that has to stay complete.)
+//
+// ⚠ Float, Rational, Complex and container keys are deliberately NOT here.
+// `0` and `0.0` are different hash keys, `Complex(1,0)` and `1` are different
+// again, and a container key is compared by its contents -- each is a rule
+// that has to be got exactly right, and getting it wrong is a wrong answer
+// rather than a slow one. They fall through to the scan.
+let hash_index = map_new ();
+let hash_indexed = map_new ();
+let hkey_digest = fn (k: Val) ->
+  match k with
+  | VInt n -> "i" ++ str_of_int n
+  | VStr h -> "s" ++ sget h
+  | VSym y -> "y" ++ y
+  | VNil -> "n"
+  | VBool b -> (if b then "t" else "f")
+  | _ -> "";
+// (the off-switch lives in main.mere, where env_get is in scope; this is the
+//  plain question "does this hash have an index", asked while maintaining it)
+let hidx_off = map_new ();
+let hidx_on = fn (id: int) -> map_has hash_indexed id;
+// anything the index cannot describe: the hash goes back to scanning
+let hidx_drop = fn (id: int) ->
+  if map_has hash_indexed id
+  then (let _ = map_delete hash_indexed id in
+        let _ = (if map_has hash_index id then (let _ = map_delete hash_index id in ()) else ()) in ())
+  else ();
+// a hash created EMPTY starts indexed; one created from pairs does not (the
+// pairs would have to be walked and classified, and a literal is small)
+let hidx_start = fn (id: int) ->
+  let _ = map_set hash_indexed id true in
+  let _ = map_set hash_index id (map_new ()) in ();
+let hidx_put = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
+  map_set (map_get hash_index id) d v;
+let hidx_has = fn (id: int) -> fn (d: str) -> map_has (map_get hash_index id) d;
+let hidx_get = fn (id: int) -> fn (d: str) -> map_get (map_get hash_index id) d;
 let mkhash = fn (xs: Val list) ->
   let id = vec_len hash_store in
   let _ = vec_push hash_store xs in
+  // an EMPTY hash starts indexed; one built from pairs does not, because the
+  // pairs would have to be walked and classified first and a literal is small
+  let _ = (match xs with Nil -> hidx_start id | _ -> ()) in
   VHsh id;
 // ⚠ NEW PAIRS QUEUE IN A Vec, for the reason arr_pending does: `hset` is
 // `vec_set hash_store id xs` and a `Val list` is a VALUE type, so storing it
@@ -246,14 +296,24 @@ let hderef = fn (id: int) ->
 // decides whether to queue must not flush the thing it is deciding about.
 let hsettled = fn (id: int) -> vec_get hash_store id;
 let hset = fn (id: int) -> fn (xs: Val list) ->
-  // a whole-hash replacement supersedes anything queued for it
+  // a whole-hash replacement supersedes anything queued for it -- and the
+  // index cannot describe an arbitrary new list, so it goes too. This is the
+  // single door for "the hash changed in a way this file did not choose",
+  // which is what makes the index safe to believe when it is still there.
   let _ = (if map_len hash_pending > 0 && map_has hash_pending id
            then (let _ = map_delete hash_pending id in ()) else ()) in
+  let _ = hidx_drop id in
   let _ = vec_set hash_store id xs in ();
 // queue a pair whose key is NOT already present (the caller has checked)
 let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
   let q = (if map_has hash_pending id then map_get hash_pending id
            else (let nq = vec_new () in let _ = map_set hash_pending id nq in nq)) in
+  // keep the index in step, or give it up: a key it cannot digest means the
+  // index no longer knows everything in this hash.
+  let _ = (if hidx_on id then
+             (let d = hkey_digest k in
+              if str_eq d "" then hidx_drop id else hidx_put id d v)
+           else ()) in
   let _ = vec_push q k in vec_push q v;
 // ⚠ THE MEMBERSHIP TEST IS NOT HERE. It needs `hkey_same`, which lives in a
 // module spliced after this one -- and the first version passed the comparison
@@ -1004,7 +1064,7 @@ let fm_kw = map_new ();
 // in ruby. Every derived hash was built with a plain mkhash, which loses it.
 let hcbi_copy = fn (src: int) -> fn (dst: Val) ->
   match dst with
-  | VHsh d -> (if map_has hcbi (str_of_int src) then map_set hcbi (str_of_int d) 1 else ())
+  | VHsh d -> (if map_has hcbi (str_of_int src) then (let _ = hidx_drop d in map_set hcbi (str_of_int d) 1) else ())
   | _ -> ();
 
 
