@@ -1419,10 +1419,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                | _ -> make_exc_w world argvals) in
     // stash the exception, then unwind via Mere's fail to the nearest
     // begin/rescue (which reads it back from "$exc").
-    let _ = map_set ivars "$exc" exc in
-    let _ = note_raise_site () in
-  let _ = note_raise_bt world exc in
-    (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
+    raise_exc_val world exc
   | EVar name ->
     // `__FILE__` / `__dir__` with the parsed file attached (see enc_pseudo_var).
     if str_len name > 9 && str_eq (substring name 0 9) "__FILE__~" then
@@ -3691,6 +3688,18 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
 // that would have been recorded from $!. `cause: nil` is a deliberate "no
 // cause", not an absent argument -- and ruby distinguishes the two: giving
 // only a cause is an ArgumentError either way.
+// throw an exception object that is already BUILT. The sequence -- stash it
+// where the nearest begin/rescue reads it, remember the site, then unwind
+// through Mere's `fail` -- was written out at the `raise` arm in eval_e and
+// nowhere else, so anything else that wanted to raise a real object (rather
+// than the VExc pair raise_exc makes) had to copy all four lines.
+and raise_exc_val = fn world -> fn (exc: Val) ->
+  let (meths, sup, ocls, ivars) = world in
+  let _ = map_set ivars "$exc" exc in
+  let _ = note_raise_site () in
+  let _ = note_raise_bt world exc in
+  (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in
+   fail "mere-ruby: (ruby exception raised)")
 and make_exc_w = fn world -> fn (args: Val list) ->
   let (pos9, kw9) = peel_kw_hash args in
   if hash_haskey kw9 (VSym "cause") then
@@ -9558,9 +9567,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      // a binary operator on a primitive is dispatched by arith_bin rather than
      // being an entry anywhere, so respond_to? does not know it; `1.method(:+)`
      // is still a Method (and #call routes it back to arith_bin).
+     // ⚠ ...and REMEMBER when that was the only reason. ruby's Method holds the
+     // definition it was made from: a Method for a name only
+     // respond_to_missing? claims calls method_missing forever, even after a
+     // real method of that name appears. This one re-dispatched by name and
+     // found the new one.
+     let via_rtm = (str_eq owner "" && (match recv with VMain -> false | _ -> true)
+                    && (if is_binary_op_name nm then false else true)
+                    && (if responds_real world recv nm then false else true)) in
      let exists = (if str_eq owner "" then
                      (match recv with
-                      | VMain -> (let (m9, _, _, _) = world in map_has m9 nm)
+                      // ⚠ ...and the UNIVERSAL names. `method(:__id__)` at
+                      // top level was a NameError: main's method table holds
+                      // what the program defined, and nothing else, so every
+                      // name every object answers was missing from it.
+                      | VMain -> (let (m9, _, _, _) = world in
+                                  map_has m9 nm || is_prim_method nm)
                       | _ -> responds world recv nm || is_binary_op_name nm
                              // ⚠ ...and #public_method does NOT: it asks the
                              //   same question #respond_to? asks, which is
@@ -9582,7 +9604,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                                               recv "respond_to_missing?"
                                               (Cons (VSym nm, Cons (VBool true, Nil))) false))))
                    else true) in
-     if exists then mk_bound_method world recv owner nm
+     if exists then
+       (let mv = mk_bound_method world recv owner nm in
+        let _ = (if via_rtm then
+                   (match mv with
+                    | VObj mid9 -> (let (_, _, _, ivars9) = world in
+                                    map_set ivars9 (str_of_int mid9 ++ "@__m_mm") (VBool true))
+                    | _ -> ())
+                 else ()) in
+        mv)
      // ...and the refusal names the CLASS ("for class 'C'"), which is the
      // shape ruby uses for #method -- not the "for an instance of" shape a
      // failed CALL reports.
@@ -10614,7 +10644,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // backtracking. This engine backtracks, so the answer is about the
     // PATTERN: a backreference or a lookaround is what makes one non-linear.
     else if str_eq c "Regexp" && (str_len name == 12 && str_eq name "linear_time?") then
-      (let src9 = (match args with
+      (// ⚠ a second argument is ACCEPTED and ignored -- and ruby says so out
+       // loud, because silently ignoring flags is how a caller comes to
+       // believe they were applied. Only for a Regexp first argument: with a
+       // String the flags are the ones the pattern is built with.
+       let _ = (match args with
+                | Cons (VRegex (_, _, _), Cons (_, _)) -> rb_warn world "flags ignored"
+                | _ -> ()) in
+       let src9 = (match args with
                    | Cons (VRegex (sp9, _, _), _) -> sp9
                    | Cons (VStr sh9, _) -> sget sh9
                    | _ -> "") in
@@ -11597,6 +11634,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // use it for; not a separate CPU-time source.
     else if str_eq c "Process" && ((str_len name == 3 && str_eq name "pid") || (str_len name == 4 && str_eq name "ppid")) then VInt (getpid ())
     else if str_eq c "Process" && (str_len name == 13 && str_eq name "clock_gettime") then VFlt (time ())
+    // ⚠ Signalling THIS process raises, it does not deliver: ruby's default
+    // handler for a signal turns it into a SignalException in the main thread,
+    // which is what `-> { Process.kill(:TERM, Process.pid) }.should.raise` is
+    // watching for. Another pid is out of reach here -- there are no
+    // subprocesses -- so it is refused by name rather than answered with a lie.
+    else if str_eq c "Process" && (str_len name == 4 && str_eq name "kill") then
+      (match args with
+       | Cons (sig9, Cons (VInt pid9, _)) ->
+         (if pid9 == getpid () || pid9 == 0 then
+            // SignalException#initialize resolves the name and number itself
+            // (see the prelude), so the signal is handed over as given.
+            raise_exc_val world (make_exc_w world (Cons (VClass "SignalException", Cons (sig9, Nil))))
+          else raise_exc world "NotImplementedError"
+                 "Process.kill can only signal this process here")
+       | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
     // remove_const(:Name) deletes the constant, returning its value.
     else if (str_len name == 12 && str_eq name "remove_const") then
       (match args with
@@ -11911,7 +11963,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let mown = (match map_get ivars (str_of_int id ++ "@__m_owner") with VStr h -> sget h | _ -> "") in
        let mrecv = (if map_has ivars (str_of_int id ++ "@__m_recv") then map_get ivars (str_of_int id ++ "@__m_recv") else VMain) in
        if (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "===") then
-         (match mrecv with
+         (if map_has ivars (str_of_int id ++ "@__m_mm")
+          then invoke_val_c env world blk mrecv "method_missing" (Cons (VSym mnm, args)) false
+          else
+         match mrecv with
           | VMain -> call_method env world blk mnm args
           // a binary operator on a primitive is not in the method table -- it
           // is arith_bin -- so `1.method(:+)` has to route there, the same way
@@ -17452,16 +17507,23 @@ and has_coerce = fn world -> fn (v: Val) ->
   | VObj _ -> (let c9 = dispatch_cls_of world v in has_meth world c9 "coerce")
   | _ -> false
 
-and responds = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name true
+and responds = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name true true
+// ...and the same question about a REAL definition only: no respond_to_missing?,
+// which is how `Kernel#method` tells "this object has such a method" from "this
+// object merely claims the name". A Method made from the claim goes through
+// method_missing for the rest of its life, ruby's rule, and it needs to know
+// which of the two it is. Asked by asking responds_x to leave one clause out,
+// rather than by writing the other clauses down a second time.
+and responds_real = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name false false
 
 // ...and the same question WITHOUT asking a user-defined #respond_to?. This is
 // what the builtin #respond_to? itself computes, and it is where a `super` from
 // an override has to land: routing that back through the asking form made the
 // override ask itself, and `MockObject.new('x').respond_to?(:each_entry)` came
 // back out of the loop as true while `:each` came back false.
-and responds_tbl = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name false
+and responds_tbl = fn world -> fn (recv: Val) -> fn (name: str) -> responds_x world recv name false true
 
-and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: bool) ->
+and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: bool) -> fn (ask_rtm: bool) ->
   match recv with
   | VObj id ->
     let (meths, sup, ocls, ivars) = world in
@@ -17512,7 +17574,7 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
             || (str_len name == 16 && str_eq name "detailed_message") || (str_len name == 9 && str_eq name "exception")))
     // respond_to_missing?(name, include_private=false): a method_missing-based
     // object can claim to respond to names it has no real method for.
-    || (has_meth world cls "respond_to_missing?"
+    || (ask_rtm && has_meth world cls "respond_to_missing?"
         && truthy (invoke world nb (VObj id) cls "respond_to_missing?" (Cons (VSym name, Cons (VBool false, Nil)))))
   // a class/module responds via its class-method (metaclass) chain — the
   // has_meth walk of (sng:C) covers inherited class methods and, through
@@ -27551,14 +27613,22 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
                    let _ = map_set pok "y" 1 in r)
                 (Nil, Nil) in
        let _ = map_set load_ctx "parsing" (mkstr "") in
+       // ⚠ ...and that failure is a RUBY exception. It was a bare `fail`, an
+       // interpreter-level abort, which the wrapper at the top translates into
+       // a StandardError -- so `require` of a file with a syntax error raised
+       // something no rescue clause for SyntaxError could catch, and #path had
+       // nothing to answer with.
        let _ = if map_has pok "y" then () else
                  (let _ = (if map_has prim_missing "f" then () else map_set prim_missing "f" (mkstr full)) in
-                  let _ = fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "mere-ruby: parse failed") else "mere-ruby: parse failed") in ()) in
+                  let _ = raise_exc_iv world "SyntaxError"
+                            (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error")
+                            (Cons (("__path", mkstr full), Nil)) in ()) in
        let _ = rx_check_pending () in
      let _ = warn_flush world in
        let _ = (match rest2 with
                 | Cons (TEOF, _) -> ()
-                | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)) in
+                | _ -> (let __fm = ("mere-ruby: unexpected token at top level in " ++ full ++ parsing_file ()) in
+                        let _ = raise_exc_iv world "SyntaxError" __fm (Cons (("__path", mkstr full), Nil)) in ())) in
        // the required file runs with its own top-level locals but the
        // same world (classes/methods/consts/globals are shared).
        let fenv = map_new () in
@@ -28679,7 +28749,11 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           // and the NEXT eval raised its SyntaxError instead of its own.
           // A diagnostic pass must leave no work behind.
           let _ = rx_pending_sync () in
-          raise_exc world "SyntaxError" msg)
+          // ⚠ ...and it carries the PATH eval was given. #path reads @__path,
+          // which only the loader ever set, so a SyntaxError from eval
+          // answered nil for the file the caller had just named.
+          raise_exc_iv world "SyntaxError" msg
+            (Cons (("__path", (if str_eq efile9 "" then VNil else mkstr efile9)), Nil)))
        else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
