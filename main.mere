@@ -1594,7 +1594,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // nothing to run and nothing to catch. ruby reports a LocalJumpError.
     else if (str_len name == 5 && str_eq name "catch") && (if map_has meths "catch" then false else true) then
       raise_exc world "LocalJumpError" "no block given"
-    else if (str_len name == 5 && str_eq name "print") && (if kernel_overridden env world "print" then false else true) then VNil
+    // ⚠ a bare `print` reaches HERE, not the argument-taking arm, and this one
+    // answered VNil: `while gets; print; end` -- ruby's -n loop written out --
+    // printed nothing at all. With no arguments it writes `$_`.
+    else if (str_len name == 5 && str_eq name "print") && (if kernel_overridden env world "print" then false else true) then
+      (let _ = (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ()) in VNil)
     else if (str_len name == 4 && str_eq name "rand") && (if map_has meths "rand" then false else true) then rand_val world Nil
     else if (str_len name == 5 && str_eq name "srand") && (if map_has meths "srand" then false else true) then srand_val env world Nil
     else if (str_len name == 4 && str_eq name "gets") && (if kernel_overridden env world "gets" then false else true) then rb_gets ()
@@ -1750,7 +1754,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match args with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new args)
     // Kernel#print: write each arg's to_s (no separators, no newline).
     else if (str_len name == 5 && str_eq name "print") && (if kernel_overridden env world "print" then false else true) then
-      let _ = print_each world args in VNil
+      // ⚠ with NO arguments it writes `$_` -- the last line `gets` read. An
+      // empty argument list is not "print nothing"; `while gets; print; end`
+      // is the whole of ruby's -n loop and it printed nothing here.
+      (match args with
+       | Nil -> (let _ = (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ()) in VNil)
+       | _ -> let _ = print_each world args in VNil)
     // Kernel#warn: writes to stderr, which stdout byte-comparison never sees,
     // so a no-op is output-equivalent (and avoids a NoMethodError crash).
     // ...but the ARGUMENTS are still checked: `uplevel:` is a number of frames
@@ -7408,7 +7417,13 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
                     (let nb0 = (false, (Nil : str list), (Nil : Stmt list), env) in
                      match invoke world nb0 v cls "instance_variables_to_inspect" Nil with
                      | VArr aid -> obj_ivar_dump_sel env world oid cls (deref aid)
-                     | _ -> obj_ivar_dump env world oid cls)
+                     | VNil -> obj_ivar_dump env world oid cls
+                     // ⚠ and ANYTHING ELSE is a TypeError. The catch-all read
+                     // every other answer as "all of them", so a hook that
+                     // returned a Hash was silently the default.
+                     | bad -> (let _ = raise_exc world "TypeError"
+                                 ("Expected #instance_variables_to_inspect to return an Array or nil, but it returned "
+                                  ++ display_cls_msg world (dispatch_cls_of world bad)) in ""))
                   else obj_ivar_dump env world oid cls) in
        // the class names ITSELF here too: an instance of an anonymous class is
        // `#<#<Class:0x..>:0x..>` in ruby, not `#<AnonClass_0:0x..>`.
@@ -9536,6 +9551,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                      (match recv with
                       | VMain -> (let (m9, _, _, _) = world in map_has m9 nm)
                       | _ -> responds world recv nm || is_binary_op_name nm
+                             // ⚠ ...and #public_method does NOT: it asks the
+                             //   same question #respond_to? asks, which is
+                             //   what `responds` already did above. Sharing
+                             //   the arm gave a Method for a name the object
+                             //   claims only privately.
+                             || ((str_len name == 6 && str_eq name "method") &&
                              // ⚠ Kernel#method includes the PRIVATE ones, so
                              //   respond_to_missing? is asked with the flag
                              //   TRUE: a name the object claims only for a
@@ -9543,12 +9564,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                              //   statement) is still a Method. `responds` asks
                              //   with false, which is right for respond_to?
                              //   and wrong here.
-                             || (let cls9 = dispatch_cls_of world recv in
+                                 (let cls9 = dispatch_cls_of world recv in
                                  has_meth world cls9 "respond_to_missing?"
                                  && truthy (invoke_val_c gc_cenv0 world
                                               (false, (Nil : str list), (Nil : Stmt list), gc_cenv0)
                                               recv "respond_to_missing?"
-                                              (Cons (VSym nm, Cons (VBool true, Nil))) false)))
+                                              (Cons (VSym nm, Cons (VBool true, Nil))) false))))
                    else true) in
      if exists then mk_bound_method world recv owner nm
      // ...and the refusal names the CLASS ("for class 'C'"), which is the
@@ -11966,11 +11987,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 // itself, not `Class`: `Complex.method(:rect)` is a method of
                 // Complex's singleton, and the alias table is keyed by
                 // Complex ("Class" has no rect/rectangular row and never will).
+                // ⚠ each side asks about ITS OWN class, and the classes are
+                // compared through the ALIAS ORIGIN, not as written. Requiring
+                // the owners to be equal made `b.method(:ali) ==
+                // b.method(:pub)` false for an alias defined in a subclass (B
+                // vs A), which is the one thing this rule exists for. The
+                // origin still has to match, or `A.instance_method(:pub).
+                // bind(d) == d.method(:pub)` would be true where D overrides
+                // pub -- two different definitions of one name.
+                // (class_name is world-free and answers "Object" for every
+                // object; the dispatch class is the one #owner uses.)
                 let ocl9 = (if str_eq mown "" then
-                              (match mrecv with VClass c9 -> c9 | _ -> class_name mrecv)
+                              (match mrecv with VClass c9 -> c9 | _ -> dispatch_cls_of world mrecv)
                             else mown) in
-                VBool (str_eq own2 mown
-                       && str_eq (defined_as_name world ocl9 nm2) (defined_as_name world ocl9 mnm)
+                let ocl8 = (if str_eq own2 "" then
+                              (match rc2 with VClass c8 -> c8 | _ -> dispatch_cls_of world rc2)
+                            else own2) in
+                VBool (str_eq (meth_origin_cls world ocl8 nm2) (meth_origin_cls world ocl9 mnm)
+                       && str_eq (defined_as_name world ocl8 nm2) (defined_as_name world ocl9 mnm)
                        && rb_identical rc2 mrecv))
              else VBool false)
           | _ -> VBool false)
@@ -12063,23 +12097,6 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let ocl9 = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
           mkstr (meth_inspect_str world "Method" ocl9 mnm
                    (bm_params world ocl9 mnm) (meth_source_location world mown mnm mrecv)))
-       else if (str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?") then
-         // two names for ONE implementation are one method, which is the
-         // question this asks -- UnboundMethod#== has compared through
-         // defined_as_name all along and the bound form compared raw names, so
-         // `Kernel.method(:fail) == Kernel.method(:raise)` was false while the
-         // unbound pair was true.
-         (match args with
-          | Cons (VObj oid2, _) ->
-            (let n2 = to_s (map_get ivars (str_of_int oid2 ++ "@__m_name")) in
-             let o2 = (if map_has ivars (str_of_int oid2 ++ "@__m_owner")
-                       then (match map_get ivars (str_of_int oid2 ++ "@__m_owner") with
-                             | VStr h9 -> sget h9 | other9 -> to_s other9)
-                       else "") in
-             VBool (str_eq (map_get ocls oid2) "Method"
-                    && str_eq (defined_as_name world o2 n2) (defined_as_name world mown mnm)
-                    && rb_identical mrecv (if map_has ivars (str_of_int oid2 ++ "@__m_recv") then map_get ivars (str_of_int oid2 ++ "@__m_recv") else VMain)))
-          | _ -> VBool false)
        // the universal names, same reason as the ThreadGroup arm above (this
        // one refused `nil?` and `itself`).
        else if is_prim_method name then dispatch_prim env world blk recv name args false
@@ -13071,10 +13088,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // through canon_alias (String#size == String#length).
          (match args with
           | Cons (VObj oid2, _) ->
-            VBool (str_eq (map_get ocls oid2) "UnboundMethod"
-                   && str_eq (to_s (map_get ivars (str_of_int oid2 ++ "@__um_cls"))) ucls
-                   && str_eq (defined_as_name world ucls (to_s (map_get ivars (str_of_int oid2 ++ "@__um_name"))))
-                             (defined_as_name world ucls unm))
+            (let uc2 = to_s (map_get ivars (str_of_int oid2 ++ "@__um_cls")) in
+             let un2 = to_s (map_get ivars (str_of_int oid2 ++ "@__um_name")) in
+             // ⚠ ...through the alias ORIGIN, and each side under its own
+             // class: `B.instance_method(:ali)` records B and
+             // `B.instance_method(:pub)` records A, so comparing the recorded
+             // classes made an alias unequal to what it aliases.
+             VBool (str_eq (map_get ocls oid2) "UnboundMethod"
+                    && str_eq (meth_origin_cls world uc2 un2) (meth_origin_cls world ucls unm)
+                    && str_eq (defined_as_name world uc2 un2) (defined_as_name world ucls unm)))
           | _ -> VBool false)
        // the universal names, same reason as the ThreadGroup arm above (this
        // one refused `nil?` and `itself`).
@@ -22710,7 +22732,17 @@ and kern_base_int = fn env -> fn world -> fn (b: Val) ->
   | VFlt f -> (true, int_of_float f)
   | other -> (match conv_try env world other "to_int" with
               | VInt n -> (true, n)
-              | _ -> (false, 0))
+              // ⚠ and a base that is neither is a TypeError -- raised even
+              // under `exception: false`, which covers the CONVERSION and not
+              // the argument. Asked of ruby 4.0.6 for every shape: Integer,
+              // Float and #to_int convert; nil, String, Symbol and a #to_s-only
+              // object all refuse, nil with its own wording.
+              | _ -> (let _ = raise_exc world "TypeError"
+                        (match other with
+                         | VNil -> "no implicit conversion from nil to integer"
+                         | _ -> "no implicit conversion of "
+                                ++ display_cls_msg world (dispatch_cls_of world other)
+                                ++ " into Integer") in (false, 0)))
 
 // A Float that no machine integer can hold is a BIGNUM, not the clamped
 // maximum: Integer(2e100) answered 9223372036854775807. Above 2^53 the value
