@@ -753,6 +753,14 @@ let gc_collect = fn env -> fn world ->
                        | _ -> (let _ = hset i (Nil : Val list) in ()))) in
         blank_h (i + 1) in
     let _ = blank_h 0 in
+    // ⚠ and the pairs queued for a hash but not yet folded in -- as reachable
+    // as the hash itself (gc_mark_val folds them in through hderef before
+    // marking), and a dead hash's queue goes with it.
+    let liveHQ = map_new () in
+    let _ = map_iter hash_pending (fn (k: int) -> fn (q: Vec['q, Val]) ->
+      if map_has live (k * 8 + 3) then (let _ = map_set liveHQ k q in ()) else ()) in
+    let _ = map_clear hash_pending in
+    let _ = map_iter liveHQ (fn (k: int) -> fn (q: Vec['q, Val]) -> map_set hash_pending k q) in
     let _ = vec_compact hash_store in
     let rec blank_s = fn (i: int) ->
       if i >= vec_len str_store then ()
@@ -2247,7 +2255,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           | VHsh h -> (match args with
                        | Cons (k, Cons (v, _)) ->
                          (let k9 = hash_store_key env world h k in
-                          let _ = hset h (hash_put_wx env world h (hcbi_on h) (hderef h) k9 v) in v)
+                          hput_or_queue h (hcbi_on h) k9 v (fn (u: unit) -> hash_put_wx env world h (hcbi_on h) (hderef h) k9 v))
                        | _ -> VNil)
           | _ -> VNil)
        // an attribute-writer call (`recv.foo = v`, `recv[i] = v`) has the
@@ -7078,6 +7086,27 @@ and hash_del_w = fn env -> fn world -> fn (hid: int) -> fn (xs: Val list) -> fn 
 
 // the ONE store entry every `[]=` / `store` door calls: the protocol when the
 // key carries it, the structural put otherwise.
+// ⚠ A NEW KEY IS QUEUED, AN EXISTING ONE TAKES THE OLD PATH. Queuing is
+// O(1) (see hash_pending in m_state.mere); rewriting a value in place still
+// rebuilds the list and copies it, which is right -- the queue can only hold
+// keys that are not there yet, or the fold would introduce a duplicate.
+// The membership test is the same `hkey_same` the put itself uses, asked of
+// the settled part and of the queue with one rule.
+// ⚠ `hkey_same ident` called DIRECTLY, not handed in as a closure: the same
+// comparison through a closure parameter costs about ten times as much, and
+// this loop runs once per key already present.
+and hq_has = fn (q) -> fn (i: int) -> fn (n: int) -> fn (ident: bool) -> fn (k: Val) ->
+  if i >= n then false
+  else if hkey_same ident (vec_get q i) k then true
+  else hq_has q (i + 2) n ident k
+and hpending_has = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) ->
+  hpending_on hid && (let q = hpending_vec hid in hq_has q 0 (vec_len q) ident k)
+// ⚠ `hsettled`, NOT `hderef`: hderef folds the queue in, and the test that
+// decides whether to queue must not flush the thing it is deciding about.
+and hput_or_queue = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: Val) -> fn (slow: unit -> Val list) ->
+  if hash_haskey_x ident (hsettled hid) k || hpending_has hid ident k
+  then (let _ = hset hid (slow ()) in v)
+  else (let _ = hpush_new hid k v in v)
 and hash_put_wx = fn env -> fn world -> fn (hid: int) -> fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
   // ⚠ compare_by_identity ANSWERS FIRST. A hash comparing by identity asks
   // its keys nothing -- not #hash, not #eql? -- so two distinct objects that
@@ -8705,7 +8734,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        (match args with
         | Cons (k9, Cons (v9, Nil)) ->
           (let key9 = hash_store_key env world hid9 k9 in
-           let _ = hset hid9 (hash_put_wx env world hid9 (hcbi_on hid9) (hderef hid9) key9 v9) in v9)
+           hput_or_queue hid9 (hcbi_on hid9) key9 v9 (fn (u: unit) -> hash_put_wx env world hid9 (hcbi_on hid9) (hderef hid9) key9 v9))
         | _ -> VNil)
      | _ -> VNil)
   // Hash#rehash: rebuild the table now that the keys may hash differently.
@@ -17205,7 +17234,21 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
        (if (if ci then hkey_same true k2 k else hkey_eql_w env world hid k2 k)
         then Cons (k2, Nil) else find9 t)
      | _ -> (Nil : Val list)) in
-  match find9 (hderef hid) with
+  // ⚠ the SETTLED part and the QUEUE, without folding: this runs inside the
+  // write path, and `hderef` would fold the queue on every store -- which is
+  // exactly what made the first version of the queue buy nothing (the copy
+  // moved into hderef and happened per put instead of per read).
+  let rec findq9 = fn (i: int) -> fn (n: int) ->
+    if i >= n then (Nil : Val list)
+    else
+      (let q9 = hpending_vec hid in
+       let k2 = vec_get q9 i in
+       if (if ci then hkey_same true k2 k else hkey_eql_w env world hid k2 k)
+       then Cons (k2, Nil) else findq9 (i + 2) n) in
+  let found9 = (match find9 (hsettled hid) with
+                | Cons (kk, _) -> Cons (kk, Nil)
+                | Nil -> (if hpending_on hid then findq9 0 (vec_len (hpending_vec hid)) else (Nil : Val list))) in
+  match found9 with
   | Cons (kk, _) -> kk
   | Nil ->
     (match k with
@@ -21196,7 +21239,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // index-assignment statement (a bare `store` in a Hash subclass).
      | VHsh h ->
        (match args with
-        | Cons (k, Cons (v, _)) -> let _ = hset h (hash_put_x (hcbi_on h) (hderef h) k v) in v
+        | Cons (k, Cons (v, _)) -> hput_or_queue h (hcbi_on h) k v (fn (u: unit) -> hash_put_x (hcbi_on h) (hderef h) k v)
         | _ -> VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr "[]=") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '[]='")) in fail "mere-ruby: undefined method '[]='")))
   else if str_eq name "keys" then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_keys xs) | _ -> (let _ = map_set prim_missing "n" (mkstr "keys") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'keys'")) in fail "mere-ruby: undefined method 'keys'")))

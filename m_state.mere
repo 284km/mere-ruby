@@ -212,9 +212,58 @@ let mkhash = fn (xs: Val list) ->
   let id = vec_len hash_store in
   let _ = vec_push hash_store xs in
   VHsh id;
-let hderef = fn (id: int) -> vec_get hash_store id;
+// ⚠ NEW PAIRS QUEUE IN A Vec, for the reason arr_pending does: `hset` is
+// `vec_set hash_store id xs` and a `Val list` is a VALUE type, so storing it
+// COPIES the whole hash into the Vec's region -- and `hash_put` rebuilt the
+// list before that. Measured, 16,000 insertions: 11.3 s, of which the key
+// SCAN is 1.07 s. The rebuild and the copy are the other 90%, and this is
+// what removes them. A Vec is a reference type, so pushing through the map
+// never writes the map.
+// The queue holds k, v, k, v ... in insertion order, which is the order Ruby
+// promises. `hderef` folds it in before anyone sees the hash, so all 145
+// readers are unchanged.
+// ⚠ What is left is the scan: finding whether the key is already there is
+// still a walk, so building a hash is still quadratic -- about ten times
+// cheaper, not linear. An index is the next change, not this one.
+let hash_pending = map_new ();
+let rec hvec_pairs = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
+  if i < 0 then acc else hvec_pairs v (i - 1) (Cons (vec_get v i, acc));
+// a plain append, no dedup: only keys the caller has already found ABSENT are
+// queued, so folding cannot introduce a duplicate. (`hash_put` and `hkey_eql`
+// live in modules spliced after this one and are not reachable here -- which
+// is also why the membership test below takes the comparison as an argument
+// rather than writing the rule a second time.)
+let hderef = fn (id: int) ->
+  if map_len hash_pending > 0 && map_has hash_pending id
+  then
+    (let q = map_get hash_pending id in
+     let merged = list_append (vec_get hash_store id) (hvec_pairs q (vec_len q - 1) (Nil : Val list)) in
+     let _ = vec_set hash_store id merged in
+     let _ = map_delete hash_pending id in
+     merged)
+  else vec_get hash_store id;
+// the settled part WITHOUT folding the queue in -- the membership test that
+// decides whether to queue must not flush the thing it is deciding about.
+let hsettled = fn (id: int) -> vec_get hash_store id;
 let hset = fn (id: int) -> fn (xs: Val list) ->
+  // a whole-hash replacement supersedes anything queued for it
+  let _ = (if map_len hash_pending > 0 && map_has hash_pending id
+           then (let _ = map_delete hash_pending id in ()) else ()) in
   let _ = vec_set hash_store id xs in ();
+// queue a pair whose key is NOT already present (the caller has checked)
+let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
+  let q = (if map_has hash_pending id then map_get hash_pending id
+           else (let nq = vec_new () in let _ = map_set hash_pending id nq in nq)) in
+  let _ = vec_push q k in vec_push q v;
+// ⚠ THE MEMBERSHIP TEST IS NOT HERE. It needs `hkey_same`, which lives in a
+// module spliced after this one -- and the first version passed the comparison
+// in as a CLOSURE to get around that. It cost ten times per comparison what a
+// direct call costs: the same 8,000,000 key comparisons are 0.081 s through
+// `hash_haskey` and were 0.744 s through a closure parameter, which is the
+// whole of what this change was supposed to save. The test lives beside its
+// comparison now (hpending_has, main.mere) and this only hands out the queue.
+let hpending_on = fn (id: int) -> map_len hash_pending > 0 && map_has hash_pending id;
+let hpending_vec = fn (id: int) -> map_get hash_pending id;
 // per-hash default value for missing keys (Hash.new(d)); keyed by handle id.
 let hash_dflt = map_new ();
 let hdflt_set = fn (id: int) -> fn (v: Val) -> let _ = map_set hash_dflt (str_of_int id) v in ();
