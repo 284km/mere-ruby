@@ -2761,3 +2761,30 @@ LocalJumpError path added for a DEAD home frame deliberately does not cover
 this: `home == 0` means "no defining method", which is the top level, and ruby
 does not raise there either. What is missing is the top level's own frame as a
 return target.
+
+## A NaN hash key is not found by the object that stored it
+
+```ruby
+n = Float::NAN
+h = {}; h[n] = :v
+h[n]        # ruby: :v    here: nil
+h.key?(n)   # ruby: true  here: false
+```
+
+Ruby's hash lookup compares the REFERENCE first, inside the bucket, so a key
+whose `eql?` answers false about itself still finds its own entry -- and NaN is
+exactly such a key (`n.eql?(n)` is false in both). A *different* NaN correctly
+finds nothing, in ruby and here.
+
+⚠ **This needs object identity for Floats, which this interpreter does not
+have.** A Float is `VFlt f`, a value: `equal?` and `object_id` compare the
+bits, so two distinct NaNs are indistinguishable here --
+`Float::NAN.equal?(0.0/0.0)` is `true` here and `false` in ruby. Implementing
+the rule means giving Floats handles the way Strings and Arrays have them,
+which touches every float operation in the interpreter.
+
+Measured cost of leaving it: **zero spec rows**. No file under core/hash tests
+a NaN key (the grep that suggested otherwise was matching "ba*nan*a"), and
+`assoc_spec` / `rassoc_spec` both MATCH. The hash index excludes NaN for the
+same reason -- a content digest cannot tell two NaNs apart -- so this gap is
+one place, not two.
