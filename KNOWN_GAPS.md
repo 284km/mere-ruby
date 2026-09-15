@@ -2817,3 +2817,35 @@ gap -- `[]` and `key?` disagreeing about the same key, which made
 now goes through the index, so they agree. What is left is only the copy.
 
 `#rehash` is the supported way to file the keys again, in ruby and here.
+
+## `# frozen_string_literal` is read where the literal RUNS, not where it is written
+
+```ruby
+# a.rb  (no magic comment)      # b.rb  # frozen_string_literal: true
+module B; def self.call; "t"; end; end
+B.call.frozen?   # ruby: true    here: false
+```
+
+The magic comment is a property of the FILE A LITERAL IS WRITTEN IN. Here it is
+read from one slot that the loader sets as each file is parsed and restores as
+that file finishes, so a method defined in a frozen-literal file and called
+from an ordinary one builds unfrozen strings -- the loader had long since put
+the outer file's answer back.
+
+⚠ **Implemented, measured, and taken out again.** Recording the answer per file
+and asking "which file is the running statement from" is correct and costs
+**10% of a literal-heavy program** (every string literal in the program asks).
+Resolving it once at each file boundary instead moves the cost to the two
+places that stamp the current file -- one of which is the method-frame restore,
+on every return -- and cost **13% of a method-call-heavy program**. Both were
+measured against the same tree, best of five.
+
+Making it free needs the answer to travel with the literal, decided at PARSE
+time. The parser already does that for a non-UTF-8 magic comment (the
+`__lit_enc~` marker), but that marker is one wrapper node per literal, which
+is affordable for the handful of literals in a file with a coding comment and
+not for every literal in a file with this one.
+
+Cost of leaving it: **one spec row** (core/proc/call). The command-line forms,
+`--enable-frozen-string-literal` and a file whose own top level runs under its
+own comment, are both correct.
