@@ -228,13 +228,35 @@ let signal_names = "EXIT:0 IOT:6 EMT:7 CLD:20 HUP:1 INT:2 QUIT:3 ILL:4 TRAP:5 AB
 // rather than a slow one. They fall through to the scan.
 let hash_index = map_new ();
 let hash_indexed = map_new ();
-let hkey_digest = fn (k: Val) ->
+let rec hkey_digest = fn (k: Val) ->
   match k with
   | VInt n -> "i" ++ str_of_int n
   | VStr h -> "s" ++ sget h
   | VSym y -> "y" ++ y
   | VNil -> "n"
   | VBool b -> (if b then "t" else "f")
+  // ⚠ TWO TRAPS IN A FLOAT KEY, both established by asking ruby:
+  //   `0.0` and `-0.0` are ONE key -- but their printed forms differ, so a
+  //   digest that spelled the number would make two. They compare equal, so
+  //   the zero case is written once.
+  //   NaN is NOT indexable. Ruby finds a NaN key by IDENTITY (`h[nan]` works
+  //   for the object that was stored, and two distinct NaNs are two keys),
+  //   and a content digest cannot tell them apart. `f == f` is false only for
+  //   NaN, which is how it is recognised here.
+  | VFlt f -> (if (if f == f then false else true) then ""
+               else if f == 0.0 then "d0" else "d" ++ str_of_float f)
+  // a Rational is stored normalised (Rational(2,4) prints "1/2"), so its two
+  // parts identify it; a Complex is a pair, and each half must be digestible.
+  | VRat (n, d) -> "r" ++ n ++ "/" ++ d
+  | VCpx (a, b) ->
+    (let da = hkey_digest a in let db = hkey_digest b in
+     if str_eq da "" || str_eq db "" then ""
+     else "c" ++ str_of_int (str_len da) ++ ":" ++ da ++ db)
+  // ⚠ AN ARRAY OR HASH KEY IS DELIBERATELY NOT INDEXED, and not because the
+  // encoding is hard. mere-ruby's own equality for them is already wrong:
+  // `{[1] => :x, [1.0] => :y}` is TWO keys in ruby (eql? distinguishes 1 from
+  // 1.0) and ONE here. An index over a rule that is already wrong would make
+  // the wrong answer faster and harder to find. Fix the rule first.
   | _ -> "";
 // (the off-switch lives in main.mere, where env_get is in scope; this is the
 //  plain question "does this hash have an index", asked while maintaining it)
@@ -255,12 +277,26 @@ let hidx_put = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
   map_set (map_get hash_index id) d v;
 let hidx_has = fn (id: int) -> fn (d: str) -> map_has (map_get hash_index id) d;
 let hidx_get = fn (id: int) -> fn (d: str) -> map_get (map_get hash_index id) d;
+// build the index for a hash made from pairs, if EVERY key has a digest.
+// One walk of the literal, and then `{a: 1}` filled in a loop is as fast as
+// `{}` filled in a loop -- which it was not: 0.574 s against 0.010 s for the
+// same 8,000 insertions, because starting from a literal left it unindexed
+// for its whole life.
+let rec hidx_seed = fn (id: int) -> fn (ys: Val list) ->
+  match ys with
+  | Nil -> true
+  | Cons (k, Cons (v, t)) ->
+    (let d = hkey_digest k in
+     if str_eq d "" then false
+     else (let _ = hidx_put id d v in hidx_seed id t))
+  | _ -> false;
 let mkhash = fn (xs: Val list) ->
   let id = vec_len hash_store in
   let _ = vec_push hash_store xs in
-  // an EMPTY hash starts indexed; one built from pairs does not, because the
-  // pairs would have to be walked and classified first and a literal is small
-  let _ = (match xs with Nil -> hidx_start id | _ -> ()) in
+  let _ = (match xs with
+           | Nil -> hidx_start id
+           | _ -> (let _ = hidx_start id in
+                   if hidx_seed id xs then () else hidx_drop id)) in
   VHsh id;
 // ⚠ NEW PAIRS QUEUE IN A Vec, for the reason arr_pending does: `hset` is
 // `vec_set hash_store id xs` and a `Val list` is a VALUE type, so storing it
@@ -303,6 +339,20 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
   let _ = (if map_len hash_pending > 0 && map_has hash_pending id
            then (let _ = map_delete hash_pending id in ()) else ()) in
   let _ = hidx_drop id in
+  let _ = vec_set hash_store id xs in ();
+// ⚠ A DELETE KEEPS THE INDEX, if the key has a digest. `hset` is the door for
+// "the list changed in a way this file did not choose" and it drops the index;
+// a delete is the one change that IS describable -- one key leaves -- so it
+// gets its own door. Without it, one `h.delete` turned every later write in
+// that hash back into a walk: 8,000 insertions after a single delete took
+// 0.583 s against 0.010 s without it.
+let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
+  let keep = hidx_on id && (if str_eq (hkey_digest k) "" then false else true) in
+  let _ = (if keep then (let _ = map_delete (map_get hash_index id) (hkey_digest k) in ()) else ()) in
+  // hset would drop the index; write the list underneath it instead
+  let _ = (if map_len hash_pending > 0 && map_has hash_pending id
+           then (let _ = map_delete hash_pending id in ()) else ()) in
+  let _ = (if keep then () else hidx_drop id) in
   let _ = vec_set hash_store id xs in ();
 // queue a pair whose key is NOT already present (the caller has checked)
 let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
