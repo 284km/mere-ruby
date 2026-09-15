@@ -2788,3 +2788,4 @@ a NaN key (the grep that suggested otherwise was matching "ba*nan*a"), and
 `assoc_spec` / `rassoc_spec` both MATCH. The hash index excludes NaN for the
 same reason -- a content digest cannot tell two NaNs apart -- so this gap is
 one place, not two.
+

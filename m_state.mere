@@ -88,10 +88,14 @@ let alloc_oid = fn om ->
 let arr_store = map_new ();
 // Array ids come from a counter: the collector deletes dead entries now, so
 // map_len shrinks and a length-derived id would collide with a survivor's.
+// Slots, not names: every key here is a literal in this tree, and a string
+// key costs a hash of the bytes plus a strcmp on each of the three probes
+// `arr_new` makes -- once per Array the program builds.
+//   0 n   1 flushes   2 hfast   3 hslow
 let arr_ctr = map_new ();
 let arr_new = fn (xs: Val list) ->
-  let id = (if map_has arr_ctr "n" then map_get arr_ctr "n" else 0) in
-  let _ = map_set arr_ctr "n" (id + 1) in
+  let id = (if map_has arr_ctr 0 then map_get arr_ctr 0 else 0) in
+  let _ = map_set arr_ctr 0 (id + 1) in
   let _ = map_set arr_store id xs in
   VArr id;
 // ⚠ APPENDS GO INTO A Vec, NOT A LIST, AND THAT IS THE WHOLE POINT.
@@ -751,15 +755,16 @@ let map_copy = fn m ->
 // MERE_RUBY_NO_MRO_CACHE=1 turns the memo off and recomputes every time: the
 // old definition kept as an oracle, so the two can be compared over the whole
 // corpus rather than trusted.
+//   0 n (the generation)   1 off (MERE_RUBY_NO_MRO_CACHE, read once)
 let mro_gen = map_new ();
 let mro_anc = map_new ();      // cls -> its linearized ancestors
 let mro_anc_gen = map_new ();  // cls -> the generation that list was built at
 let mro_mods = map_new ();     // cls -> the modules included into it, expanded
 let mro_mods_gen = map_new ();
 let mro_bump = fn () ->
-  let n = (if map_has mro_gen "n" then map_get mro_gen "n" else 0) in
-  map_set mro_gen "n" (n + 1);
-let mro_now = fn () -> if map_has mro_gen "n" then map_get mro_gen "n" else 0;
+  let n = (if map_has mro_gen 0 then map_get mro_gen 0 else 0) in
+  map_set mro_gen 0 (n + 1);
+let mro_now = fn () -> if map_has mro_gen 0 then map_get mro_gen 0 else 0;
 // ⚠ THE ANCESTOR WALK, MEMOISED. `has_meth` asks whether a class or anything
 // above it answers a name, and answering it costs about five hash lookups PER
 // ANCESTOR LEVEL plus a 23-way class chain -- 26% of a dispatch-heavy profile,
@@ -825,6 +830,9 @@ let rec mark_captured = fn env ->
 // machinery into the default region, permanently. Pooled, a call's frame
 // costs its ENTRIES only, in an arena that is handed back at return.
 let frame_pool = vec_new ();
+// `frame_pool_get` and `frame_pool_put` between them probe this table about
+// fifteen times per method call, so the keys are slots:
+//   0 n   1 hits   2 news   3 puts   4 drops   5 bytes   6 blk_kept   7 blk_puts
 let frame_pool_n = map_new ();
 // Can this target measure an arena at all? `map_bytes` / `vec_bytes` report the
 // arena BYTES behind a store, and on RV32I -- where a program is the machine --
@@ -839,16 +847,16 @@ let frame_pool_n = map_new ();
 // was held", which is a measurement, and this is the absence of one -- so the
 // counters are simply not kept, and the diagnostic rows that print them say so.
 let arena_measurable = try_or (fn (u: unit) -> let _ = map_bytes frame_pool_n in true) false;
-let pool_ctr = fn (k: str) ->
+let pool_ctr = fn (k: int) ->
   map_set frame_pool_n k ((if map_has frame_pool_n k then map_get frame_pool_n k else 0) + 1);
 let frame_pool_get = fn (u: unit) ->
-  let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
+  let n = (if map_has frame_pool_n 0 then map_get frame_pool_n 0 else 0) in
   if n > 0 then
-    (let _ = pool_ctr "hits" in
-     let _ = map_set frame_pool_n "n" (n - 1) in
+    (let _ = pool_ctr 1 in
+     let _ = map_set frame_pool_n 0 (n - 1) in
      vec_get frame_pool (n - 1))
   else
-    (let _ = pool_ctr "news" in
+    (let _ = pool_ctr 2 in
      let f = map_new () in
      let _ = map_recycle f in   // promote: give it its own arena from birth
      f);
@@ -858,19 +866,19 @@ let frame_pool_put = fn f ->
   // (peak RSS above a few GB varies 2x between identical runs, recorded below).
   let _ =
     if arena_measurable then
-      map_set frame_pool_n "bytes"
-        ((if map_has frame_pool_n "bytes" then map_get frame_pool_n "bytes" else 0) + map_bytes f)
+      map_set frame_pool_n 5
+        ((if map_has frame_pool_n 5 then map_get frame_pool_n 5 else 0) + map_bytes f)
     else () in
   let _ = map_recycle f in
-  let n = (if map_has frame_pool_n "n" then map_get frame_pool_n "n" else 0) in
+  let n = (if map_has frame_pool_n 0 then map_get frame_pool_n 0 else 0) in
   // cap the pool at the deepest call stack seen; past that, drop the frame
   // (its arena was already wound back, so the residue is the struct alone).
-  if n >= 4096 then (pool_ctr "drops")
+  if n >= 4096 then (pool_ctr 4)
   else
-    (let _ = pool_ctr "puts" in
+    (let _ = pool_ctr 3 in
      let _ = (if n < vec_len frame_pool then vec_set frame_pool n f
               else vec_push frame_pool f) in
-     map_set frame_pool_n "n" (n + 1));
+     map_set frame_pool_n 0 (n + 1));
 
 // A BLOCK's env comes from the same pool. It used to be `lv_child cenv`: a
 // fresh Map in the default region plus a permanent lv_up entry, per
@@ -894,14 +902,14 @@ let blk_env_get = fn parent ->
   let _ = map_set lv_up n parent in
   e;
 let blk_env_put = fn e ->
-  if map_has e "__captured" then pool_ctr "blk_kept"
+  if map_has e "__captured" then pool_ctr 6
   else
     (let _ = (if map_has e "__eid" then
                 (match map_get e "__eid" with
                  | VInt n -> map_delete lv_up n
                  | _ -> ())
               else ()) in
-     let _ = pool_ctr "blk_puts" in
+     let _ = pool_ctr 7 in
      frame_pool_put e);
 
 // Per-statement / per-call bookkeeping. These used to be str -> Val maps, and
@@ -924,11 +932,131 @@ let cur_pos_s = map_new ();
 // statements: the count of top-level lets is what the C backend's bracket
 // depth is made of, and a hundred more of them is a real cost elsewhere.
 let name_sets = map_new ();
-let name_set = fn (tag: str) -> fn (spec: str) ->
+let name_spec = fn (tag: str) ->
+  if str_eq tag "builtin_cls_name" then ("String|Array|Hash|Integer|Float|Numeric|Complex|Rational|Range|"
+    ++ "Symbol|TrueClass|FalseClass|NilClass|Kernel|Comparable"
+    )
+  else if str_eq tag "enc_preserving" then ("upcase|downcase|capitalize|swapcase|reverse|strip|lstrip|rstrip|"
+    ++ "chomp|chop|chr|squeeze|tr|tr_s|delete|succ|next|*|slice|[]|gsub|sub|"
+    ++ "concat|prepend|replace|delete_prefix|delete_suffix|byteslice|dup|"
+    ++ "clone|+|<<"
+    )
+  else if str_eq tag "enum_needs_block" then ("map|collect|select|filter|reject|detect|find|find_all|rfind|flat_map|"
+    ++ "collect_concat|partition|group_by|sort_by|sort_by!|min_by|max_by|"
+    ++ "minmax_by|each_with_index|each_with_object|filter_map|take_while|"
+    ++ "drop_while|each_entry|chunk|chunk_while|slice_when|reverse_each|"
+    ++ "each_char|each_byte|each_line|each_codepoint|each|each_pair|each_key|"
+    ++ "each_value|delete_if|keep_if|select!|reject!|filter!|each_index|map!|"
+    ++ "collect!|bsearch|bsearch_index|repeated_combination|"
+    ++ "repeated_permutation"
+    )
+  else if str_eq tag "enum_zero_arity" then ("map|collect|select|filter|find_all|reject|flat_map|collect_concat|"
+    ++ "partition|group_by|sort_by|sort_by!|min_by|max_by|minmax_by|"
+    ++ "filter_map|take_while|drop_while|each_with_index|delete_if|keep_if|"
+    ++ "select!|filter!|reject!|each_index|map!|collect!|bsearch|"
+    ++ "bsearch_index|reverse_each"
+    )
+  else if str_eq tag "hash_enum_delegate" then ("one?|first|min|max|minmax|sum|tally|zip|uniq|cycle|grep|grep_v|take|"
+    ++ "drop|each_slice|each_cons|inject|reduce|find_index"
+    )
+  else if str_eq tag "is_arr_method" then ("fetch_values|length|size|push|append|pop|shift|unshift|prepend|map|"
+    ++ "collect|map!|collect!|select|filter|select!|filter!|reject|reject!|"
+    ++ "find|detect|rfind|find_index|index|rindex|include?|first|last|each|"
+    ++ "each_index|each_with_index|each_with_object|reverse|reverse!|"
+    ++ "reverse_each|sort|sort!|sort_by|join|flatten|flatten!|compact|"
+    ++ "compact!|uniq|uniq!|resolve_feature_path|empty?|[]|[]=|slice|slice!|"
+    ++ "concat|reduce|inject|to_a|to_ary|count|min|max|minmax|sum|zip|take|"
+    ++ "take_while|drop|drop_while|group_by|partition|flat_map|any?|all?|"
+    ++ "none?|one?|delete|delete_at|delete_if|keep_if|clear|replace|fill|"
+    ++ "insert|rotate|sample|shuffle|at|fetch|values_at|assoc|tally|"
+    ++ "each_slice|each_cons|cycle"
+    )
+  else if str_eq tag "is_binary_op_name" then "+|-|*|/|%|**|<<|>>|&|^|<|>|<=|>=|<=>|==|===|!="
+  else if str_eq tag "is_enum_method" then ("map|collect|select|filter|reject|detect|find|find_index|rfind|index|"
+    ++ "any?|all?|none?|count|reduce|inject|each_with_index|to_a|entries|"
+    ++ "first|include?|member?|min|max|sort|sum|flat_map|collect_concat|"
+    ++ "partition|group_by|each_with_object|filter_map|take_while|drop_while|"
+    ++ "take|drop|tally|zip|uniq|compact|chunk_while|chunk|slice_before|"
+    ++ "slice_after|slice_when|sort_by|sort_by!|min_by|max_by|minmax|"
+    ++ "minmax_by|find_all|one?|grep|grep_v|reverse_each|each_entry|to_h|"
+    ++ "cycle"
+    )
+  else if str_eq tag "is_exception_method" then ("==|backtrace|backtrace_locations|cause|detailed_message|exception|"
+    ++ "full_message|inspect|message|respond_to?|set_backtrace|to_s"
+    )
+  else if str_eq tag "is_hash_method" then ("length|size|[]|[]=|store|fetch|delete|each|each_pair|each_key|"
+    ++ "each_value|keys|values|key|key?|has_key?|include?|member?|value?|"
+    ++ "has_value?|empty?|map|collect|select|filter|select!|filter!|reject|"
+    ++ "reject!|merge|merge!|update|to_a|to_h|to_hash|invert|sort|"
+    ++ "compare_by_identity|compare_by_identity?|sort_by|min_by|max_by|count|"
+    ++ "sum|find|detect|any?|all?|none?|group_by|partition|each_with_object|"
+    ++ "each_with_index|reduce|inject|dig|values_at|fetch_values|"
+    ++ "transform_values|transform_keys|delete_if|keep_if|clear|replace|"
+    ++ "default|default=|default_proc|default_proc=|compact|except|slice|"
+    ++ "flat_map|sort!|first"
+    )
+  else if str_eq tag "is_kernel_modfunc" then ("puts|p|pp|print|printf|format|sprintf|warn|rand|srand|sleep|gets|"
+    ++ "binding|caller|caller_locations|Integer|Float|String|Array|Hash|"
+    ++ "Rational|Complex"
+    )
+  else if str_eq tag "is_numeric_own_method" then ("%|+@|-@|<=>|abs|abs2|angle|arg|ceil|clone|coerce|conj|conjugate|"
+    ++ "denominator|div|divmod|dup|eql?|fdiv|finite?|floor|i|imag|imaginary|"
+    ++ "infinite?|integer?|magnitude|modulo|negative?|nonzero?|numerator|"
+    ++ "phase|polar|positive?|quo|real|real?|rect|rectangular|remainder|"
+    ++ "round|singleton_method_added|step|to_c|to_int|truncate|zero?"
+    )
+  else if str_eq tag "is_op_sym_start" then "=|<|>|+|-|*|/|%|[|!|^|&|~|`"
+  else if str_eq tag "is_prim_method" then ("to_s|inspect|class|to_enum|enum_for|nil?|frozen?|freeze|dup|clone|"
+    ++ "itself|then|yield_self|tap|is_a?|kind_of?|instance_of?|respond_to?|"
+    ++ "send|__send__|public_send|hash|object_id|__id__|==|!=|equal?|eql?|!~|"
+    ++ "instance_variable_get|instance_variable_set|"
+    ++ "instance_variable_defined?|instance_variables|singleton_class|"
+    ++ "methods|public_methods|singleton_methods|method|extend|"
+    ++ "define_singleton_method|<=>"
+    )
+  else if str_eq tag "is_range_method" then ("begin|end|exclude_end?|size|count|length|cover?|include?|member?|"
+    ++ "step|to_a|each"
+    )
+  else if str_eq tag "is_regex_method" then ("match|match?|=~|===|source|options|names|named_captures|casefold?|"
+    ++ "encoding|to_s|inspect"
+    )
+  else if str_eq tag "is_str_method" then ("=~|-@|+@|length|size|empty?|chars|lines|bytes|split|include?|index|"
+    ++ "upcase|downcase|capitalize|swapcase|reverse|strip|lstrip|rstrip|"
+    ++ "chomp|chop|start_with?|end_with?|sub|gsub|tr|replace|concat|to_i|"
+    ++ "to_f|to_sym|each_char|each_line|count|scan|match|match?|slice|succ|"
+    ++ "succ!|next|next!|intern|to_str|dedup|===|[]|[]="
+    )
+  else if str_eq tag "is_sym_method" then ("[]|<=>|=~|capitalize|casecmp|casecmp?|downcase|empty?|encoding|"
+    ++ "end_with?|inspect|intern|length|match|match?|next|size|slice|"
+    ++ "start_with?|succ|swapcase|to_proc|to_s|to_sym|upcase|id2name|name"
+    )
+  else if str_eq tag "is_valid_op_sym" then ("+|-|*|/|%|**|==|!=|<|<=|>|>=|<=>|===|=~|!~|<<|>>|[]|[]=|!|~|^|&|+@|"
+    ++ "-@|`"
+    )
+  else if str_eq tag "modmeth" then ("name|ancestors|superclass|instance_methods|instance_method|"
+    ++ "method_defined?|instance_variable_get|const_get|const_set|"
+    ++ "const_defined?|constants|include?|included_modules|"
+    ++ "singleton_class|singleton_class?|class_eval|module_eval|"
+    ++ "class_exec|module_exec|<|<=|>|>=|<=>")
+  else if str_eq tag "mut" then ("<<|push|append|pop|shift|unshift|prepend|insert|concat|"
+    ++ "append_as_bytes|rehash|[]=|store|delete|delete_at|delete_if|"
+    ++ "fill|clear|replace|keep_if|update|merge!|force_encoding|setbyte")
+  else if str_eq tag "opmeth" then ("==|!=|<=>|===|<|>|<=|>=|+|-|*|/|%|**|<<|>>|!|=~|!~|&|^|~")
+  else if str_eq tag "range_delegate_name" then ("each_slice|each_cons|zip|first|last|min|max|take|drop|values_at|"
+    ++ "rotate|combination|permutation|each_index|product|join|minmax"
+    )
+  else if str_eq tag "rb_fmt_is_type" then "d|i|u|s|p|c|b|B|o|x|X|e|E|f|g|G"
+  else if str_eq tag "rx_is_meta" then "$|^|*|+|.|?|}|)|>|]|(|[|<"
+  else if str_eq tag "str_bang_base_ok" then ("upcase|downcase|capitalize|reverse|strip|succ|next|delete|swapcase|"
+    ++ "lstrip|rstrip|chomp|chop|tr|tr_s|squeeze|slice|delete_prefix|"
+    ++ "delete_suffix|unicode_normalize|scrub"
+    )
+  else chr 0 ++ "no such name_set tag";
+let name_set = fn (tag: str) ->
   if map_has name_sets tag then map_get name_sets tag
   else
     (let tbl = map_new () in
-     let _ = list_iter (str_split spec "|") (fn (n: str) -> map_set tbl n true) in
+     let _ = list_iter (str_split (name_spec tag) "|") (fn (n: str) -> map_set tbl n true) in
      let _ = map_set name_sets tag tbl in
      tbl);
 let map_set_s = fn tbl -> fn (k: str) -> fn (v: str) ->
@@ -951,6 +1079,7 @@ let cur_file = fn () ->
 // created as the call that takes it is evaluated.
 let proc_src = map_new ();
 let proc_symsrc = map_new ();    // Symbol#to_proc's proc id -> the symbol name
+let meth_params = map_new ();   // "cls#name" -> the Array of parameter names
 let meth_src = map_new ();       // "cls#name" -> line, "f" ++ key -> file
 let stamp_meth_src = fn (key: str) ->
   let _ = map_set meth_src key (VInt (cur_line ())) in
@@ -1420,8 +1549,15 @@ let set_pre = fn (k: str) -> fn (v: str) -> let _ = mro_bump () in map_set prepe
 // `map_set meths` anywhere else; that gate is the only thing making the memo
 // safe, so it is poisoned like one.
 // (`meths` lives in the world tuple, so it is passed in; `undefs` is global.)
-let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) -> let _ = mro_bump () in map_set tbl k v;
-let del_meth = fn tbl -> fn (k: str) -> let _ = mro_bump () in map_delete tbl k;
+// ⚠ and DROP the parameter-name Array memo for that key. `run_meth` builds
+// `__params` once per method (see there); a redefinition with a different
+// parameter list would otherwise make bare `super` forward the OLD names.
+// Here rather than on a generation counter because this is the only writer --
+// tools/meth_writes_check.sh refuses a bare `map_set meths` anywhere else.
+let set_meth = fn tbl -> fn (k: str) -> fn (v: Meth) ->
+  let _ = mro_bump () in let _ = map_delete meth_params k in map_set tbl k v;
+let del_meth = fn tbl -> fn (k: str) ->
+  let _ = mro_bump () in let _ = map_delete meth_params k in map_delete tbl k;
 // names declared with `module` (vs `class`) so Module#class differs.
 let modules = map_new ();
 // private methods: "Cls#name" -> present. Checked only on explicit-receiver
