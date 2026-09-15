@@ -2789,3 +2789,31 @@ a NaN key (the grep that suggested otherwise was matching "ba*nan*a"), and
 same reason -- a content digest cannot tell two NaNs apart -- so this gap is
 one place, not two.
 
+## Copying a Hash re-hashes its keys, so a stale container key comes back
+
+A Hash entry here is found through the digest its key had when it was STORED
+(`hash_index`), which is ruby's rule: mutate a key in place and it stops
+finding its own entry.
+
+```ruby
+h = {}; res = []; res << "one"; h[res] = :v; res << "two"
+h.key?(res)        # false, in ruby and here
+h.dup.key?(res)    # ruby: false    here: TRUE
+h.merge({}).key?(res)            # same
+h.select { true }.key?(res)      # same
+```
+
+⚠ **Every operation that BUILDS a hash stores each key under the digest it has
+at that moment**, so a copy re-hashes a key that has drifted from the digest it
+was first filed under. Ruby copies the stored hashes with the table. Matching it
+means carrying the per-entry digest through `dup`, `clone`, `merge`, `select`,
+`reject`, `transform_values`, `to_h` and every other producer -- the digest
+would have to become part of what a Hash IS here, rather than a side index.
+
+Measured cost of leaving it: **zero spec rows**. The observable version of this
+gap -- `[]` and `key?` disagreeing about the same key, which made
+`Set#classify` raise `nil.add` -- is fixed: every keyed read door (`[]`,
+`key?`, `has_key?`, `member?`, `include?`, `fetch`, `fetch_values`, `delete`)
+now goes through the index, so they agree. What is left is only the copy.
+
+`#rehash` is the supported way to file the keys again, in ruby and here.
