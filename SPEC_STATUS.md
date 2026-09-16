@@ -17,7 +17,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
 | language | 45 | 22 | 0 | 0 | 0 | 67 |
-| core/string | 112 | 2 | 0 | 0 | 0 | 114 |
+| core/string | 113 | 1 | 0 | 0 | 0 | 114 |
 | core/array | 102 | 2 | 0 | 0 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
 | core/range | 31 | 4 | 0 | 0 | 0 | 35 |

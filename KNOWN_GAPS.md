@@ -2849,3 +2849,44 @@ not for every literal in a file with this one.
 Cost of leaving it: **one spec row** (core/proc/call). The command-line forms,
 `--enable-frozen-string-literal` and a file whose own top level runs under its
 own comment, are both correct.
+
+## `obj.extend Enumerable` gives the object nothing when `each` is a singleton method
+
+```ruby
+o = Object.new
+def o.each; yield 1; yield 2; end
+o.extend Enumerable
+o.to_a               # ruby: [1, 2]   here: NoMethodError
+o.respond_to?(:to_a) # ruby: true     here: false
+```
+
+⚠ **The class-defined case works**, which is why this went unnoticed:
+
+```ruby
+c = Class.new { def each; yield 1; end }
+i = c.new; i.extend Enumerable
+i.to_a               # [1] on both sides
+```
+
+Enumerable's methods are not table entries here -- they are synthesised from
+the receiver's `each` by the dispatcher, guarded by `has_meth world cls "each"`
+where `cls` is `dispatch_cls_of`. That function DELIBERATELY looks past a
+hanging singleton class (it answers the class a `super` should resume above),
+so an `each` defined with `def o.each` is invisible to the guard.
+
+**Attempted, measured, and taken out again.** Teaching the guard about the
+singleton is two lines, and it makes `to_a`, `map`, `sort` and the rest work --
+but three more answers then disagree with ruby and with each other:
+
+- `respond_to?` still says false (a different predicate, `responds_x`, asks the
+  same question its own way)
+- `to_h(:a, 1)` forwards the arguments to `each`, and the arity check refuses
+- `to_h` over elements that are not pairs answers `{}` where ruby raises
+  TypeError
+
+A guard that admits a receiver three other answers still refuse is the shape of
+bug this interpreter keeps finding, so the two lines are not in the tree. The
+fix is one arc: every place that asks "does this receiver have an each" has to
+ask it the same way.
+
+Cost of leaving it: **one spec row** (core/enumerable/to_h).
