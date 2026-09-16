@@ -8,11 +8,20 @@
 #     -fbracket-depth=239   fatal error: bracket nesting level exceeded maximum of 238
 #     -fbracket-depth=240   ok
 #
-# So the requirement is 240 and mainline clang's default is 256. The flag is NOT stale --
-# it is SIXTEEN brackets of headroom, about 7%, and removing it would leave the build one
-# prelude concatenation away from an error whose text is about C and whose cause is Ruby.
-# 4096 was simply far larger than it had to be, and a number that large hid how close the
-# real one is.
+# ⚠ THAT HEADROOM IS GONE, and this check is how it was noticed -- 25 CI runs after the
+# fact, because the run was already red for it and nobody read past the first failure.
+# Re-measured 2026-09-17:
+#
+#     last green CI (e68c5c0)  253      still under the 256 default
+#     the next commit          256      exactly at it
+#     today                    269      over by thirteen
+#
+# The flag is LOAD-BEARING now, not headroom: a build without it does not compile. What
+# grew is the count of TOP-LEVEL `let`s -- each one is a nesting level in the emitted C,
+# and m_state.mere alone went 316 -> 361 while the hash index, the array queue and the
+# memo tables were added. Merging a few of those maps buys a few levels and not thirteen,
+# so the budget moves instead, deliberately, to the number the build line actually passes.
+# What this check is FOR is unchanged: catching the growth before it reaches the flag.
 #
 # The number moves for two reasons and this reports both: mere's codegen changing how
 # deeply it nests (v0.1.449 and v0.1.450 both cut it), and this interpreter's own source
@@ -20,12 +29,12 @@
 # that is what is printed.
 #
 # Usage:  MERE=/path/to/mere.exe sh tools/bracket_depth_check.sh
-#         BUDGET=... to change the ceiling this fails at (default 256, the mainline cap)
+#         BUDGET=... to change the ceiling this fails at (default 1024, the build's flag)
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MERE="${MERE:-mere}"
-BUDGET="${BUDGET:-256}"
+BUDGET="${BUDGET:-1024}"
 CC="${CC:-clang}"; command -v "$CC" >/dev/null 2>&1 || CC=cc
 command -v "$CC" >/dev/null 2>&1 || { echo "bracket_depth: SKIP — no C compiler"; exit 0; }
 
@@ -51,10 +60,10 @@ fi
 # accepting. So: bisect on clang's own answer.
 lo=1; hi=$BUDGET
 "$CC" -O0 -w -fsyntax-only -fbracket-depth=$hi "$SRC" 2>/dev/null || {
-  echo "bracket_depth: FAIL — the emitted C needs MORE than $hi, the mainline clang default."
-  echo "  The build line's -fbracket-depth is now load-bearing rather than headroom."
-  echo "  Either split whatever grew (a long ++ chain, a long let chain) or raise the flag"
-  echo "  deliberately -- and update this budget in the same commit."
+  echo "bracket_depth: FAIL — the emitted C needs MORE than $hi, which is the -fbracket-depth"
+  echo "  the build line passes. The build does not compile: this is not a warning."
+  echo "  Split whatever grew (a long ++ chain, a long top-level let chain) or raise BOTH"
+  echo "  the flag and this budget -- in the same commit, with the new number measured."
   exit 1; }
 while [ $((hi - lo)) -gt 1 ]; do
   mid=$(( (lo + hi) / 2 ))
@@ -63,7 +72,15 @@ while [ $((hi - lo)) -gt 1 ]; do
 done
 
 margin=$(( BUDGET - hi ))
-echo "bracket_depth: needs $hi, the mainline clang default is $BUDGET — $margin to spare"
+echo "bracket_depth: needs $hi, the build passes $BUDGET — $margin to spare"
+# ...and whether the DEFAULT would still do is reported separately: it is the thing that
+# changed, and a check that only watched the flag would never have said so.
+if [ "$hi" -le 256 ]; then
+  echo "bracket_depth: the mainline default of 256 would also do — the flag is headroom"
+else
+  echo "bracket_depth: over the mainline default of 256 by $(( hi - 256 )) — the flag is LOAD-BEARING,"
+  echo "bracket_depth: a build without -fbracket-depth does not compile."
+fi
 # A margin this thin is the thing worth saying out loud; it is not a failure.
-[ "$margin" -lt 32 ] && echo "bracket_depth: that is thin. One more long chain in the prelude and the build stops."
+[ "$margin" -lt 128 ] && echo "bracket_depth: that is thin. One more long chain and the build stops."
 echo "bracket_depth: ok"
