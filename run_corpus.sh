@@ -64,6 +64,14 @@ esac
 # that goes around it leaves a capture behind, and the NEXT match answers with
 # a group belonging to the one before it.
 ./tools/rx_caps_check.sh > /dev/null || { ./tools/rx_caps_check.sh; exit 1; }
+# ...and a ninth: each single-namespace arm of the class dispatcher (File /
+# FileTest, IO, Dir, Math) is guarded by a name list, and the SAME list answers
+# respond_to?. If the arm grows a name the list does not carry, the call is
+# refused for a method that is right there; if the list carries one the arm
+# never implements, respond_to? claims a method that is not. Both doors, one
+# list -- this is what caught File.foreach, which the entry condition let in
+# and the body never answered.
+./tools/ns_names_check.sh > /dev/null || { ./tools/ns_names_check.sh; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a
