@@ -10677,7 +10677,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match rest9 with
           | Cons (_, _) -> raise_exc world "ArgumentError"
                              ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0..1)")
-          | Nil -> (match md with VNil -> VNil | _ -> invoke_val_c env world blk md "[]" (Cons (ix, Nil)) false))
+          | Nil ->
+            // ⚠ the index is a group NAME (Symbol / String) or an integer
+            // CONVERSION -- `Regexp.last_match(obj)` asks obj for #to_int, and
+            // refuses what has none. Anything was accepted here and MatchData#[]
+            // quietly answered nil for it.
+            // ⚠ ...and NO MATCH answers nil whatever the index is, before any
+            // conversion: `Regexp.last_match(Object.new)` is nil when $~ is,
+            // and the TypeError only exists for an index that would have been
+            // used. Converting first made the no-match case raise.
+            (match md with VNil -> VNil | _ ->
+             let ix = (match ix with
+                       | VSym _ -> ix
+                       | VStr _ -> ix
+                       | VInt _ -> ix
+                       | _ -> (match coerce_int_args env world (Cons (ix, Nil)) with
+                               | Cons (VInt n9, _) -> VInt n9
+                               | Cons (VBig b9, _) -> VBig b9
+                               | _ -> (let _ = raise_exc world "TypeError"
+                                         (match ix with
+                                          | VNil -> "no implicit conversion from nil to integer"
+                                          | _ -> "no implicit conversion of " ++ class_name ix ++ " into Integer") in ix))) in
+             invoke_val_c env world blk md "[]" (Cons (ix, Nil)) false))
        | Nil -> md)
     else if str_eq c "Regexp" && ((str_len name == 6 && str_eq name "escape") || (str_len name == 5 && str_eq name "quote")) then
       (match args with
@@ -12194,7 +12215,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | VStr sid9 -> sid9 * 8 + 1
                    | VInt n9 -> n9
                    | _ -> 0)))
-       else if (str_len name == 5 && str_eq name "arity") then VInt (bm_arity world mown mnm)
+       // ⚠ the same fallback #owner and #hash use. A Method taken from a
+       // PRIMITIVE has no owner recorded (a builtin is not a table entry), so
+       // the arity table was asked for "#+" instead of "Integer#+" and every
+       // builtin Method answered -1. That is also why `1.method(:+).curry(2)`
+       // built a chain ruby refuses: curry checks the arity it was given
+       // against the lambda's, and -1 means "variadic, anything goes".
+       else if (str_len name == 5 && str_eq name "arity") then
+         VInt (bm_arity world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm)
        // Method#source_location: [file, line] of the `def`, or nil for a
        // builtin (there is no ruby source behind one).
        else if (str_len name == 15 && str_eq name "source_location") then meth_source_location world mown mnm mrecv
@@ -12227,7 +12255,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let _ = store_proc (str_of_int pid) (true, Cons ("*__a", Cons ("&__b", Nil)), body, benv) in
           // ruby's Method#to_proc answers the METHOD's arity and is a lambda;
           // the forwarder's own `*__a` would say -1 and "not a lambda".
-          let _ = map_set proc_arity (str_of_int pid) (VInt (bm_arity world mown mnm)) in
+          // ...through the same owner fallback #arity uses: a Method taken from
+          // a primitive has none recorded, and the arity table is keyed by the
+          // class, so the proc reported -1 for every builtin method.
+          let _ = map_set proc_arity (str_of_int pid)
+                    (VInt (bm_arity world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm)) in
           let _ = map_set lambda_ids (str_of_int pid) VNil in
           // the forwarder is not where the method was written, so the proc
           // reports the METHOD's own location -- ruby's Method#to_proc answers
@@ -16006,6 +16038,34 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   // it (the leaf has no world to ask an object with).
   let args = (if (str_len name == 12 && str_eq name "fetch_values") && (match recv with VArr _ -> true | _ -> false)
               then coerce_int_args env world args else args) in
+  // ⚠ the POSITION of #match / #match? is an integer conversion, and the arms
+  // that read it match `Cons (_, Cons (VInt off, _))` -- so anything else
+  // looked like NO position at all and the whole subject was searched.
+  // `/a/.match("ab", "x")` answered a MatchData where ruby refuses.
+  let args = (if ((str_len name == 5 && str_eq name "match") || (str_len name == 6 && str_eq name "match?"))
+                 && (match args with
+                     | Cons (_, Cons (VInt _, _)) -> false
+                     | Cons (_, Cons (_, _)) -> true
+                     | _ -> false)
+              then (match args with
+                    | Cons (a9, rest9) ->
+                      (let c9 = coerce_int_args env world rest9 in
+                       // ...and what still is not an Integer is refused HERE:
+                       // coerce_int_args converts an object with #to_int and
+                       // hands everything else back, which is right for the
+                       // callers that have their own refusal and wrong for an
+                       // arm that reads the position by pattern-matching VInt.
+                       let _ = (match c9 with
+                                | Cons (VInt _, _) -> ()
+                                | Cons (bad9, _) ->
+                                  (let _ = raise_exc world "TypeError"
+                                     (match bad9 with
+                                      | VNil -> "no implicit conversion from nil to integer"
+                                      | _ -> "no implicit conversion of " ++ class_name bad9 ++ " into Integer") in ())
+                                | Nil -> ()) in
+                       Cons (a9, c9))
+                    | _ -> args)
+              else args) in
   // ⚠ the PRECISION of the rounding family is an integer CONVERSION too, and
   // the leaf that applies it (prim_method_raw) has no world to ask an object
   // with -- so `12345.round(obj)` was a TypeError for an obj whose #to_int
