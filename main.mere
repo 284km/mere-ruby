@@ -10409,7 +10409,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // IO.read / IO.write and friends are the same methods as File's in ruby (File
     // < IO, and these are IO's own class methods), so the branch answers for both
     // rather than a second copy drifting from this one.
-    else if (str_eq c "File"
+    // ⚠ FileTest is the SAME set of predicates under another name -- ruby's
+    // File gets them by including it. Every one already works here as a File
+    // class method; the module simply had no door, so `FileTest.exist?` was an
+    // uninitialized constant and all 25 core/filetest files died on line one.
+    else if (str_eq c "File" || str_eq c "FileTest"
              || (str_eq c "IO"
                  && ((str_len name == 4 && str_eq name "read") || (str_len name == 5 && str_eq name "write") || (str_len name == 7 && str_eq name "binread")
                      || (str_len name == 8 && str_eq name "binwrite") || (str_len name == 9 && str_eq name "readlines") || (str_len name == 7 && str_eq name "foreach"))))
@@ -10531,6 +10535,35 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | _ -> VBool false)
        else if (str_len name == 4 && str_eq name "size") then
          (match args with Cons (VStr ph, _) -> VInt (str_len (if file_exists (sget ph) then read_file (sget ph) else "")) | _ -> VInt 0)
+       // ⚠ only the predicates this interpreter can actually ANSWER. `zero?` /
+       // `empty?` are "exists and is empty", `identical?` is "the same path
+       // after expansion", and the `_real?` trio is the same question as the
+       // effective one here -- there is no setuid to tell them apart. The file
+       // KINDS (pipe? socket? blockdev? chardev?) and the permission bits
+       // (setgid? setuid? sticky? world_readable? world_writable? owned?
+       // grpowned?) are NOT added: there is no stat behind them, and a
+       // predicate that always answers false is a wrong answer, not a missing
+       // one. See KNOWN_GAPS.
+       else if (str_len name == 5 && str_eq name "zero?") || (str_len name == 6 && str_eq name "empty?") then
+         (match args with
+          | Cons (VStr ph, _) ->
+            VBool (file_exists (sget ph) && str_len (read_file (sget ph)) == 0)
+          | _ -> VBool false)
+       // ...asked of the shell, the way readable?/writable?/executable? are:
+       // `test a -ef b` is "the same file", which is what #identical? means.
+       else if (str_len name == 10 && str_eq name "identical?") then
+         (match args with
+          | Cons (VStr a9, Cons (VStr b9, _)) ->
+            VBool (run ("test " ++ shq (sget a9) ++ " -ef " ++ shq (sget b9) ++ " 2> /dev/null") == 0)
+          | _ -> VBool false)
+       else if (str_len name == 14 && str_eq name "readable_real?") || (str_len name == 14 && str_eq name "writable_real?")
+               || (str_len name == 16 && str_eq name "executable_real?") then
+         (match args with
+          | Cons (VStr ph, _) ->
+            (let flag = (if (str_len name == 14 && str_eq name "writable_real?") then "-w"
+                         else if (str_len name == 14 && str_eq name "readable_real?") then "-r" else "-x") in
+             VBool (run ("test " ++ flag ++ " " ++ shq (sget ph) ++ " 2> /dev/null") == 0))
+          | _ -> VBool false)
        else if (str_len name == 5 && str_eq name "size?") then
          (match args with
           | Cons (VStr ph, _) ->
@@ -11311,6 +11344,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          VBool ((str_len name == 23 && str_eq name "private_method_defined?"))
        else if str_eq origin "" && builtin_has_meth c nm then
          VBool ((str_len name == 15 && str_eq name "method_defined?") || (str_len name == 22 && str_eq name "public_method_defined?"))
+       // Every class inherits BasicObject's #initialize, and it is PRIVATE:
+       // `C.private_method_defined?(:initialize)` is true for a class that
+       // never wrote one, and `C.method_defined?(:initialize)` is false
+       // because of that privacy. A bare module inherits neither. The method
+       // table has no row for the inherited one, so origin is "" and the
+       // answer has to be decided here (private_instance_methods says the
+       // same thing from its own door, and the two must agree).
+       else if str_eq origin "" && (str_len nm == 10 && str_eq nm "initialize")
+               && (if map_has modules c then false else true) then
+         VBool ((str_len name == 23 && str_eq name "private_method_defined?"))
        else if str_eq origin "" then VBool false
        else
          // meth_private/meth_protected are the dispatch oracles (they also see
@@ -11412,11 +11455,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        //   classes' marshal_dump_spec asks for it by name.
        let _ = (if want_priv && (str_eq c "Complex" || str_eq c "Rational")
                 then push9 "marshal_dump" else ()) in
+       // ⚠ `initialize` is INHERITED by most classes, not owned by them, and
+       //   `(false)` asks only for the ones a class owns. The rule here was
+       //   "every class except one that defines its own", which put :initialize
+       //   on every user class and every module -- ruby puts it on neither
+       //   (`module M; def a; end; end` answers [], and so does `class C; def
+       //   b; end; end`). The classes that really own one are a fixed list,
+       //   asked of the reference over the whole registered class list; the
+       //   rest inherit BasicObject's. A class that defines its own is already
+       //   in the method table and came out of the loop above.
+       // The inherited form (no arg / true) also reports what the ancestors
+       // hold, and every CLASS inherits BasicObject's private #initialize --
+       // a bare module inherits nothing and reports none.
+       let inh9 = (match args with Cons (VBool false, _) -> false | _ -> true) in
        let _ = (if want_priv && (if map_has meths0 (pfx ++ "initialize") then false else true)
-                          // ...and Kernel is not where :initialize lives: it is
-                          // Object's (BasicObject's, in ruby), so Kernel's own
-                          // list claimed a name ruby does not put there.
-                          && (if kern9 then false else true)
+                          && (owns_initialize c
+                              || (inh9 && (if map_has modules c then false else true)))
                 then push9 "initialize" else ()) in
        let _ = (if kern9 then
                   (let rec add9 = fn (xs: str list) ->
@@ -11750,6 +11804,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Process.clock_gettime(clock_id) -- one clock behind every id, in
     // seconds as a Float. Enough for the elapsed-time measurements libraries
     // use it for; not a separate CPU-time source.
+    // Module.nesting: the lexically enclosing scopes AS WRITTEN, innermost
+    // first. Kept beside the cref by push_nest, because the cref alone cannot
+    // tell `module A; module B` from `module A::B` -- both leave "A::B".
+    else if str_eq c "Module" && (str_len name == 7 && str_eq name "nesting") then
+      // ...the frame's captured nesting when running inside a method (a `def`
+      // body keeps the scope it was WRITTEN in, exactly as its cref does),
+      // otherwise the scope being executed right now.
+      // ...the frame's captured nesting when running inside a method (a `def`
+      // body keeps the scope it was WRITTEN in, exactly as its cref does).
+      // A method frame always carries __cref, so its absence means we are in a
+      // class body or at the top level, where the live stack is the answer;
+      // __cref present with no __nest means a method written at the top level.
+      (let s9 = (if lv_has env "__nest"
+                 then (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> "")
+                 else if lv_has env "__meth" then ""
+                 else cur_nest ()) in
+       arr_new (if str_eq s9 "" then (Nil : Val list)
+                else nest_vclasses (str_split s9 (chr 10))))
     else if str_eq c "Process" && ((str_len name == 3 && str_eq name "pid") || (str_len name == 4 && str_eq name "ppid")) then VInt (getpid ())
     else if str_eq c "Process" && (str_len name == 13 && str_eq name "clock_gettime") then VFlt (time ())
     // ⚠ Signalling THIS process raises, it does not deliver: ruby's default
@@ -23898,7 +23970,13 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
      let _ = map_set frame "__has_blk" (VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
      // top-level methods run with main as self (their @ivars live there).
      let _ = map_set frame "self" (if lv_has env "self" then lv_get env "self" else VMain) in
-     let _ = map_set frame "__cref" (mkstr (if map_has meth_cref name then map_get meth_cref name else "")) in
+     // ⚠ the stored value carries BOTH (see lex_pack): the frame gets the cref
+    // in the slot its ten readers already know, and the nesting in one of its
+    // own. Unpacked here, once, rather than at each reader.
+    let crefv9 = (if map_has meth_cref name then map_get meth_cref name else "") in
+    let _ = map_set frame "__cref" (mkstr (pack_cref crefv9)) in
+    let _ = (let n9 = pack_nest crefv9 in
+             if str_eq n9 "" then () else map_set frame "__nest" (mkstr n9)) in
      let _ = bind_params frame world blk name params defaults args in
      // a top-level method is a frame too, so `$~` is scoped to it as well.
      let mstate = rx_state_save () in
@@ -24194,7 +24272,12 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // through evaluation answered about the innermost block call instead.
     let _ = map_set frame "__has_blk" (VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
     // lexical scope (cref) for bare-constant resolution in the body.
-    let _ = map_set frame "__cref" (mkstr (if map_has meth_cref dk then map_get meth_cref dk else "")) in
+    // ...the same split as the top-level path: the cref in the slot its readers
+    // know, the captured Module.nesting in one of its own (see lex_pack).
+    let crefv8 = (if map_has meth_cref dk then map_get meth_cref dk else "") in
+    let _ = map_set frame "__cref" (mkstr (pack_cref crefv8)) in
+    let _ = (let n8 = pack_nest crefv8 in
+             if str_eq n8 "" then () else map_set frame "__nest" (mkstr n8)) in
     let _ = map_set frame "__args" (arr_new args) in
     // ⚠ ONE Array per METHOD, not per call. `__params` holds the parameter
     // NAMES, which the method fixed at `def`; bare `super` (the only reader,
@@ -27026,15 +27109,20 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   // `alias visit_number visit_symbol`, so an alias that stays quiet leaves the
   // visitor unregistered and the compiler recurses forever.
   run_method_added world cls n1
+and nest_vclasses = fn (xs: str list) ->
+  match xs with Nil -> Nil | Cons (a, r) -> Cons (VClass a, nest_vclasses r)
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved_lex = cur_lex () in
+  let saved_nest = cur_nest () in
   let _ = set_lex cls in
+  let _ = push_nest cls in
   // The body can raise -- a require that fails inside a class body is
   // ordinary. The lexical scope has to be restored anyway, or every
   // top-level constant assigned afterwards is silently keyed under this
   // class: `TOP = 1` at the top level of a later file becomes Cls::TOP.
   let r = try_or (fn (u: unit) -> register_class world cls body) (FRaise VNil) in
   let _ = set_lex saved_lex in
+  let _ = set_nest saved_nest in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
    | _ -> r)
@@ -27086,9 +27174,16 @@ and register_class_sng_in = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // loads it, so every bundlertest step died on `require "bundler"`.
   // register_class_blk sets the scope the same way for a class_eval block.
   let saved_lex = cur_lex () in
+  // ⚠ `class << self` is one more entry in Module.nesting, written the way
+  // ruby writes a singleton class: `#<Class:M::N>`. The cref keeps its own
+  // spelling (see above) -- these are two different questions about the same
+  // body, and the nesting is the one a program prints.
+  let saved_nest = cur_nest () in
+  let _ = push_nest ("#<Class:" ++ (if str_eq lex "" then cls else lex) ++ ">") in
   let _ = set_lex scope in
   let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
   let _ = set_lex saved_lex in
+  let _ = set_nest saved_nest in
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
@@ -27238,12 +27333,14 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                    else cls ++ "#" ++ mname in
          let _ = set_meth meths key (Meth (params, defs, mbody)) in
          let _ = (if str_eq (meth_base mname) "method_added" then map_set hook_flags "ma" VNil else ()) in
-         let _ = map_set meth_cref key (cur_lex ()) in
+         let _ = map_set meth_cref key (lex_pack ()) in
          let _ = stamp_meth_src key in
          // `module_function` mode: the instance method is ALSO a module method,
          // so register it in the module's singleton namespace too.
          let _ = if str_eq vis2 "module_function" && (if is_selfdef then false else true) && (if str_contains mname "#" then false else true)
-                 then (let mk = "(sng:" ++ cls ++ ")#" ++ mname in let _ = set_meth meths mk (Meth (params, defs, mbody)) in map_set meth_cref mk (cur_lex ()))
+                 then (let mk = "(sng:" ++ cls ++ ")#" ++ mname in
+                       let _ = set_meth meths mk (Meth (params, defs, mbody)) in
+                       map_set meth_cref mk (lex_pack ()))
                  else () in
          let _ = if map_has undefs key then del_undef key else () in
          // a (re)definition is not ruby2_keywords until explicitly marked:
@@ -27257,7 +27354,13 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // was only ever added, never removed, so the method stayed private
          // and `method_defined?` kept answering false.
          let _ = if (if is_selfdef then false else true) && (if str_contains mname "#" then false else true) then
-                   (if str_eq vis2 "private" || always_private_meth (meth_base mname) then
+                   // `module_function` mode privatises too: the singleton copy
+                   // above is only half of what it means, and the instance
+                   // half is private. This block is where visibility is
+                   // decided, so the rule goes HERE -- setting it beside the
+                   // copy above left it standing until this `else` cleared it.
+                   (if str_eq vis2 "private" || str_eq vis2 "module_function"
+                       || always_private_meth (meth_base mname) then
                       (let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
                        map_set privates key VNil)
                     else if str_eq vis2 "protected" then
@@ -27317,9 +27420,16 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let _ = if map_has consts full then () else map_set consts full (VClass full) in
          let _ = if was_new then call_inherited world cenv qsuper full else () in
          let saved_lex = cur_lex () in
+         // ⚠ the nesting takes the QUALIFIED name (what the scope IS) but only
+         // ONE entry, because only one `class`/`module` keyword was written:
+         // `module A; module B; end; end` is [A::B, A] and `module A::B` is
+         // [A::B] -- the same cref, two different answers.
+         let saved_nest = cur_nest () in
+         let _ = push_nest full in
          let _ = set_lex full in
          let r = register_class world full cbody in
          let _ = set_lex saved_lex in
+         let _ = set_nest saved_nest in
          r
        // nested class with a runtime-expression superclass: evaluate it first.
        | SClassE (cname, se, cbody) ->
@@ -27421,7 +27531,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                        // that so a class variable and a bare constant in the
                        // body resolve against this class, and a method built
                        // from a block needs it just as much.
-                       let _ = map_set meth_cref (cls ++ "#" ++ nm) (cur_lex ()) in
+                       let _ = map_set meth_cref (cls ++ "#" ++ nm) (lex_pack ()) in
                        // define_method adds a method, so the hook fires for it too
                        run_method_added world cls nm)
                     | _ -> ()) in
@@ -28145,7 +28255,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           | _ -> name)
        else name) in
     let _ = set_meth meths key (Meth (params, defs, body)) in
-    let _ = map_set meth_cref key (cur_lex ()) in
+    let _ = map_set meth_cref key (lex_pack ()) in
     let _ = stamp_meth_src key in
     // A TOP-LEVEL `def` is a PRIVATE instance method of Object -- that is the
     // whole reason a bare call works from inside any class. The bare key alone
@@ -28160,7 +28270,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                 && (if str_len name > 5 && str_eq (substring name 0 5) "self." then false else true)
              then (let ok = "Object#" ++ name in
                    let _ = set_meth meths ok (Meth (params, defs, body)) in
-                   let _ = map_set meth_cref ok (cur_lex ()) in
+                   let _ = map_set meth_cref ok (lex_pack ()) in
                    let _ = stamp_meth_src ok in
                    if map_has tl_vis "v" && (match map_get tl_vis "v" with VBool b -> b | _ -> false)
                    then (if map_has privates ok then map_delete privates ok else ())
@@ -28352,9 +28462,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // top. Setting the cref to "Object" made the whole nest below it
     // Object::QQ::O::I, a separate structure from the QQ already there.
     let _ = set_lex (if (str_len name == 6 && str_eq name "Object") then "" else name) in
+    // ⚠ ...and the NESTING gets the name as written, Object included: `class
+    // Object` is [Object] in ruby even though its cref is the top level.
+    let saved_nest = cur_nest () in
+    let _ = push_nest name in
     // restored even when the body raises (see register_class_lex)
     let r = try_or (fn (u: unit) -> register_class world name body) (FRaise VNil) in
     let _ = set_lex saved_lex in
+    let _ = set_nest saved_nest in
     let r = (match r with
              | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
              | _ -> r) in

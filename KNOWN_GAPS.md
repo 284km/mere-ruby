@@ -2918,3 +2918,28 @@ Fixing the block form means uniquifying there too, which changes what every
 block parameter is stored under -- binding, `super`, the defaults prologue and
 the destructuring path all read those names. Cost of leaving it: **part of one
 spec row** (core/proc/parameters; its other half, the method form, is fixed).
+
+## FileTest answers the predicates it can, and refuses the ones that need stat(2)
+
+`FileTest` is the same set of predicates ruby's `File` gets by including it, and
+it had no door at all here: the constant was undefined, so all 25
+core/filetest spec files died on their first line. It answers now, through the
+File class methods that already existed.
+
+⚠ **Eleven of the twenty-six are deliberately still absent**, because there is no
+`stat(2)` behind them and a predicate that always answers `false` is a WRONG
+answer rather than a missing one:
+
+| absent | what it needs |
+|---|---|
+| `pipe?` `socket?` `blockdev?` `chardev?` | the file's type bits |
+| `setgid?` `setuid?` `sticky?` | the mode's special bits |
+| `owned?` `grpowned?` | the file's uid/gid against the process's |
+| `world_readable?` `world_writable?` | the mode as an Integer |
+
+What IS answered: `exist?` `directory?` `file?` `symlink?` `readable?`
+`writable?` `executable?` and their `_real?` spellings (the same question here
+-- there is no setuid to tell the two apart), `size` `size?` `zero?` `empty?`
+and `identical?` (`test a -ef b`, the shell route the other three already use).
+
+Closing the rest means a stat syscall the interpreter does not have a door for.
