@@ -2890,3 +2890,31 @@ fix is one arc: every place that asks "does this receiver have an each" has to
 ask it the same way.
 
 Cost of leaving it: **one spec row** (core/enumerable/to_h).
+
+## A block's repeated `_` parameters share one default, and #parameters cannot tell them apart
+
+```ruby
+proc { |_:, _: 2| }.parameters
+#   ruby: [[:keyreq, :_], [:key, :_]]
+#   here: [[:key,    :_], [:key, :_]]
+```
+
+Ruby lets the ignore-name `_` repeat in one parameter list. The `def` parser
+gives each repeat a unique internal storage key (`_~1`, `_~2`, ...) so they bind
+to distinct slots -- `uniq_param` -- and #parameters strips that key back off
+before reporting (see `param_report_name`). ⚠ **The BLOCK parser does not
+uniquify**, so both `_:` parameters are stored under the same name, the single
+default recorded for the second one answers `bm_has_default` for both, and the
+required one is reported as optional.
+
+The method form is right:
+
+```ruby
+def m(_, _, _=1, *_, _:, _: 2, **_, &_); end
+method(:m).parameters   # identical to ruby
+```
+
+Fixing the block form means uniquifying there too, which changes what every
+block parameter is stored under -- binding, `super`, the defaults prologue and
+the destructuring path all read those names. Cost of leaving it: **part of one
+spec row** (core/proc/parameters; its other half, the method form, is fixed).
