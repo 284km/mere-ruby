@@ -1654,7 +1654,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match arges with
        | Cons (EMethodB (mrecv, mm, margs, mbp, mbb), Nil) ->
          (match eval_e env world blk (EMethod (mrecv, mm, margs)) with
-          | VClass tcls -> do_refine world (match lv_get env "self" with VClass rc -> rc | _ -> "") tcls mbb
+          | VClass tcls -> do_refine world (match lv_get env "self" with VClass rc -> rc | _ -> "") tcls mbb env
           | _ -> VNil)
        | _ -> VNil)
     else
@@ -2074,7 +2074,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 6 && str_eq name "refine") && (match args with Cons (VClass _, _) -> true | _ -> false) && (match lv_get env "self" with VClass _ -> true | _ -> false) then
       (let refinery = (match lv_get env "self" with VClass rc -> rc | _ -> "") in
        let target = (match args with Cons (VClass t, _) -> t | _ -> "") in
-       do_refine world refinery target bb)
+       do_refine world refinery target bb env)
+    // ⚠ ...and the two refusals: `refine` needs a block, and its argument must
+    //   be a Class or a Module. Both were NoMethodError, which says nothing
+    //   about what the call got wrong.
+    else if (str_len name == 6 && str_eq name "refine") && (match lv_get env "self" with VClass _ -> true | _ -> false) then
+      (match args with
+       | Cons (VClass _, _) -> raise_exc world "ArgumentError" "no block given"
+       | Cons (other9, _) ->
+         raise_exc world "TypeError" ("wrong argument type " ++ class_name other9 ++ " (expected Class or Module)")
+       | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
     else if map_has meths name then call_method env world newblk name args
     // bare method(:name) — Kernel#method on the implicit self.
     else if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
@@ -11309,6 +11318,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // wrong call, and ruby says so by name rather than by NoMethodError.
     else if (str_len name == 5 && str_eq name "using") then
       raise_exc world "RuntimeError" "Module#using is not called on self"
+    // ...and `refine` reached with NO BLOCK comes here (the block form is
+    // handled by the block dispatcher): ruby asks for one by name.
+    else if (str_len name == 6 && str_eq name "refine") then
+      (match args with
+       | Cons (VClass _, _) -> raise_exc world "ArgumentError" "no block given"
+       | Cons (other9, _) ->
+         raise_exc world "TypeError" ("wrong argument type " ++ class_name other9 ++ " (expected Class or Module)")
+       | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
     // ...and the seven NOTIFICATION hooks, whose default is to do nothing and
     // answer nil. They exist so that a `super` in an override lands, and so
     // that `Module.private_instance_methods` can honestly name them.
@@ -11825,6 +11842,43 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // for a singleton class this is the metaclass chain down to Class.
     else if (str_len name == 9 && str_eq name "ancestors") then
       arr_new (anc_vclasses (ancestors_of world c))
+    // Module#refinements: the refinement modules THIS module defined, in the
+    // order it defined them. The bookkeeping was already here (refine_cls,
+    // keyed "<refinery>#<i>"); nothing read it back.
+    // Module.used_refinements: the refinement modules ACTIVE in the current
+    // scope -- what every `using` in it brought in. ref_active is the table
+    // `using` writes (target class -> impl module) and it is already
+    // save/restored per scope, so the answer is its values.
+    else if str_eq c "Module" && (str_len name == 16 && str_eq name "used_refinements") then
+      (let tmp8 = map_new () in
+       let seen8 = map_new () in
+       let _ = map_iter ref_active (fn (k8: str) -> fn (v8: Val) ->
+         (match v8 with
+          | VStr h8 -> (let im8 = sget h8 in
+                        if map_has seen8 im8 then ()
+                        else (let _ = map_set seen8 im8 1 in
+                              let m8 = map_len tmp8 in map_set tmp8 (str_of_int m8) (VClass im8)))
+          | VClass im8 -> (if map_has seen8 im8 then ()
+                           else (let _ = map_set seen8 im8 1 in
+                                 let m8 = map_len tmp8 in map_set tmp8 (str_of_int m8) (VClass im8)))
+          | _ -> ())) in
+       arr_new (idx_to_list tmp8 0 (map_len tmp8)))
+    else if (str_len name == 11 && str_eq name "refinements") then
+      (let n9 = (if map_has refine_cnt c then (match map_get refine_cnt c with VInt k -> k | _ -> 0) else 0) in
+       let tmp9 = map_new () in
+       let seen9 = map_new () in
+       let rec go9 = fn (i9: int) ->
+         (if i9 >= n9 then ()
+          else (let k9 = c ++ "#" ++ str_of_int i9 in
+                let _ = (if map_has refine_cls k9 then
+                           (let im9 = (match map_get refine_cls k9 with VStr h -> sget h | _ -> "") in
+                            if str_eq im9 "" || map_has seen9 im9 then ()
+                            else (let _ = map_set seen9 im9 1 in
+                                  let m9 = map_len tmp9 in map_set tmp9 (str_of_int m9) (VClass im9)))
+                         else ()) in
+                go9 (i9 + 1))) in
+       let _ = go9 0 in
+       arr_new (idx_to_list tmp9 0 (map_len tmp9)))
     // Module#included_modules: the same chain, modules only, without self.
     else if (str_len name == 16 && str_eq name "included_modules") then
       arr_new (mod_vclasses (ancestors_of world c) c)
@@ -27609,14 +27663,39 @@ and cls_display = fn world -> fn (c: str) ->
 // the surrounding visibility mode is — so they never show up in
 // instance_methods and cannot be called with an explicit receiver.
 
-and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: Stmt list) ->
+// the impl module an earlier `refine <target>` in this refinery already made.
+and refine_impl_for = fn world -> fn (refinery: str) -> fn (target: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then ""
+  else (let k = refinery ++ "#" ++ str_of_int i in
+        if map_has refine_tgt k
+           && str_eq (match map_get refine_tgt k with VStr h -> sget h | _ -> "") target
+        then (match map_get refine_cls k with VStr h -> sget h | _ -> "")
+        else refine_impl_for world refinery target (i + 1) n)
+
+and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: Stmt list) -> fn denv ->
   let i = (if map_has refine_cnt refinery then (match map_get refine_cnt refinery with VInt n -> n | _ -> 0) else 0) in
+  // ⚠ REFINING THE SAME CLASS TWICE REOPENS THE SAME MODULE. `refine String`
+  //   written a second time in one refinery adds to the module the first one
+  //   made -- ruby answers the identical object, and a program that refines in
+  //   two places (an `if` guarding one of them) depends on it. A fresh module
+  //   each time left the first one's methods behind in a module nothing
+  //   activated.
+  let existing = refine_impl_for world refinery target 0 i in
+  if (if str_eq existing "" then false else true) then
+    (let _ = flow_value (register_class_blk world existing bb refinery denv) in VClass existing)
+  else
   let impl_cls = "Refine_" ++ refinery ++ "_" ++ str_of_int i in
   // The body is a BLOCK, so it does not open a constant scope: `refine String
   // do Presenter … end` inside `module M` must see M's constants, not the
   // synthetic Refine_M_0 namespace. Defs still land on impl_cls; only the
   // lexical scope for constant lookup is the enclosing module.
-  let _ = flow_value (register_class_blk world impl_cls bb refinery (map_new ())) in
+  // ⚠ the block runs in the CALLER'S environment. Handed a fresh map, an
+  //   assignment inside it (`refine String do inner = self end`, ruby/spec's
+  //   own first example) wrote to a throwaway child and the outer local stayed
+  //   nil -- the block ran, and nothing it did was visible.
+  let _ = flow_value (register_class_blk world impl_cls bb refinery denv) in
+  // ...and it is a MODULE, which is what `self.is_a?(Module)` inside asks.
+  let _ = map_set modules impl_cls VNil in
   let _ = map_set refine_tgt (refinery ++ "#" ++ str_of_int i) (mkstr target) in
   let _ = map_set refine_cls (refinery ++ "#" ++ str_of_int i) (mkstr impl_cls) in
   let _ = map_set refine_cnt refinery (VInt (i + 1)) in
