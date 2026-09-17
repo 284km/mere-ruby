@@ -11272,12 +11272,26 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     //   answers the OBJECT, which is how ruby lets them be chained. None of
     //   the three fires a callback: #include fires `included` after calling
     //   append_features, and calling append_features alone must not.
+    //   ⚠ ...and all three refuse a CLASS as the receiver. They are Module's,
+    //     and a Class is not mixed into anything: ruby removes them from Class
+    //     (see name_spec's clsundef), so the only way to reach one with a
+    //     class receiver is `Module.instance_method(:append_features).bind(cls)`
+    //     -- which is exactly what ruby/spec does, and ruby answers TypeError.
+    else if ((str_len name == 15 && str_eq name "append_features") || (str_len name == 16 && str_eq name "prepend_features")
+             || (str_len name == 13 && str_eq name "extend_object"))
+            && (if map_has modules c then false else true) then
+      raise_exc world "TypeError" "wrong argument type Class (expected Module)"
     else if (str_len name == 15 && str_eq name "append_features") && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (match args with Cons (VClass b9, _) -> (let _ = append_features_raw world b9 c in recv) | _ -> recv)
     else if (str_len name == 16 && str_eq name "prepend_features") && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (match args with Cons (VClass b9, _) -> (let _ = prepend_features_raw world b9 c in recv) | _ -> recv)
     else if (str_len name == 13 && str_eq name "extend_object") && (match args with Cons (_, _) -> true | _ -> false) then
       (match args with Cons (o9, _) -> (let _ = do_extend_one world c o9 in o9) | _ -> VNil)
+    // `Module#using` is only meaningful at the top level or inside a module
+    // body, where the parser handles it. Reached as a METHOD it is always the
+    // wrong call, and ruby says so by name rather than by NoMethodError.
+    else if (str_len name == 5 && str_eq name "using") then
+      raise_exc world "RuntimeError" "Module#using is not called on self"
     // ...and the seven NOTIFICATION hooks, whose default is to do nothing and
     // answer nil. They exist so that a `super` in an override lands, and so
     // that `Module.private_instance_methods` can honestly name them.
@@ -11293,10 +11307,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (str_len name == 15 && str_eq name "module_function") || (str_len name == 20 && str_eq name "private_class_method") ||
             (str_len name == 19 && str_eq name "public_class_method") then
       (let (meths0, sup0, ocls0, ivars0) = world in
+       // ...and the BARE form refuses a class too -- `Class.new.send(:module_function)`
+       // is the same wrong call as the named one, and did nothing at all here.
+       let _ = (if (str_len name == 15 && str_eq name "module_function")
+                   && (if map_has modules c then false else true)
+                then (let _ = raise_exc world "TypeError"
+                        "module_function must be called for modules" in ()) else ()) in
        let names = vis_arg_names args in
        let _ = (match names with
                 | Nil -> ()
-                | _ -> if (str_len name == 15 && str_eq name "module_function") then modfunc_promote world c names
+                | _ -> if (str_len name == 15 && str_eq name "module_function") then
+                         (if map_has modules c then modfunc_promote world c names
+                          // ...and it is a MODULE's method: a class has no
+                          // module functions, and ruby refuses by name.
+                          else (let _ = raise_exc world "TypeError"
+                                  "module_function must be called for modules" in ()))
                        else if (str_len name == 20 && str_eq name "private_class_method") then
                          (let _ = vis_names_check world ("(sng:" ++ c ++ ")") names in
                           mark_vis_mode meths0 ("(sng:" ++ c ++ ")") names "private")
@@ -11460,7 +11485,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                             "wrong number of arguments (given 0, expected 1..2)" in ())
                 | _ -> ()) in
        let nm = (match args with Cons (a2, _) -> sym_or_str_arg env world a2 | Nil -> "") in
-       let origin = (if map_has meths0 (c ++ "#" ++ nm) then c else lookup_anc world (ancestors_of world c) nm) in
+       // ⚠ THE SECOND ARGUMENT IS "look at the ancestors too", and it was
+       //   ignored: `C.method_defined?(:from_superclass, false)` answered true
+       //   about a method C does not define. All four spellings take it, and
+       //   all four had a spec for it.
+       let inh2 = (match args with Cons (_, Cons (VBool false, _)) -> false | Cons (_, Cons (VNil, _)) -> false | _ -> true) in
+       let origin = (if map_has meths0 (c ++ "#" ++ nm) then c
+                     else if inh2 then lookup_anc world (ancestors_of world c) nm
+                     else "") in
        // a builtin-backed method is still a method of the class (see
        // instance_method above). "Never private" was true for every class but
        // one: KERNEL's are private instance methods, which is what makes
@@ -11653,14 +11685,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 then push9 "initialize" else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     // class variables (@@x) declared directly on this class, as :@@sym.
+    // ⚠ class_variables walks the ANCESTOR CHAIN (the argument `false` asks for
+    //   this class's own only). It scanned one class's keys whatever it was
+    //   given, so an inherited @@var -- and every one an included module
+    //   contributes -- was missing from a list ruby fills.
     else if (str_len name == 15 && str_eq name "class_variables") then
-      (let pfx = c ++ "@" in
-       let plen = str_len pfx in
-       let tmp = map_new () in
-       let _ = map_iter cvars (fn (k: str) -> fn (v: Val) ->
-         if str_len k > plen && str_eq (substring k 0 plen) pfx
-         then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@@" ++ substring k plen (str_len k))))
-         else ()) in
+      (let tmp = map_new () in
+       let seen = map_new () in
+       let inh = (match args with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+       let add1 = fn (cx: str) ->
+         (let pfx = cx ++ "@" in
+          let plen = str_len pfx in
+          map_iter cvars (fn (k: str) -> fn (v: Val) ->
+            if str_len k > plen && str_eq (substring k 0 plen) pfx
+            then (let nm9 = "@@" ++ substring k plen (str_len k) in
+                  if map_has seen nm9 then ()
+                  else (let _ = map_set seen nm9 1 in
+                        let m = map_len tmp in map_set tmp (str_of_int m) (VSym nm9)))
+            else ())) in
+       let _ = add1 c in
+       let _ = (if inh then list_iter (anc_after (ancestors_of world c) c) add1 else ()) in
+       // ⚠ ...and a CLASS'S SINGLETON also reports the class's, because the
+       //   two share a lexical scope (`class << self; @@meta = 1; end` writes
+       //   to the class -- see cvar_cls). The sharing is ONE WAY: the class
+       //   does not report what was set on its singleton through
+       //   `C.singleton_class.class_variable_set`, so this cannot be done by
+       //   rewriting the receiver. The metaclass chain does not contain the
+       //   class, which is why it has to be walked separately.
+       let _ = (if inh && is_sng_cls c && (let i8 = sng_inner c in
+                                           map_has consts i8 || map_has modules i8)
+                then list_iter (ancestors_of world (sng_inner c)) add1 else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if (str_len name == 18 && str_eq name "class_variable_get") then
       (match args with
@@ -11676,11 +11730,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          let owner = if str_eq owner0 "" then c else owner0 in
          let _ = map_set cvars (owner ++ "@" ++ nm) value in value
        | _ -> VNil)
+    // ...and the same chain answers `defined?`: it read one class's key, so it
+    // denied a variable class_variable_get finds one line below.
     else if (str_len name == 23 && str_eq name "class_variable_defined?") then
-      (match args with Cons (v, _) -> VBool (map_has cvars (c ++ "@" ++ cvar_name_checked world (sym_or_str_arg env world v))) | _ -> VBool false)
+      (match args with
+       | Cons (v, _) -> VBool (cvar_defined_from world c (cvar_name_checked world (sym_or_str_arg env world v)))
+       | _ -> VBool false)
     else if (str_len name == 21 && str_eq name "remove_class_variable") then
       (match args with
-       | Cons (v, _) -> let k = c ++ "@" ++ cvar_name_checked world (sym_or_str_arg env world v) in
+       | Cons (v, _) -> let nm8 = cvar_name_checked world (sym_or_str_arg env world v) in
+         let k = c ++ "@" ++ nm8 in
+         // ⚠ ...and it removes only THIS class's own. A variable that lives on
+         //   an ancestor (or an included module) is not Cv's to remove, and
+         //   ruby says so -- this answered nil and did nothing, so a program
+         //   removing the wrong one never learned.
+         let _ = (if map_has cvars k then ()
+                  else (let _ = raise_exc world "NameError"
+                          ("class variable @@" ++ nm8 ++ " not defined for " ++ cls_display world c) in ())) in
          let old = (if map_has cvars k then map_get cvars k else VNil) in
          let _ = if map_has cvars k then map_delete cvars k else () in old
        | _ -> VNil)
@@ -24677,6 +24743,59 @@ and meth_vis_walk = fn world -> fn (anc: str list) -> fn (name: str) -> fn (want
     else if map_has vis_marks k then false
     else if map_has meths k then false   // a definition here, and it is public
     else meth_vis_walk world rest name want_priv
+// ⚠ CLASS VARIABLES LIVE ON THE ANCESTOR CHAIN, not the superclass chain.
+//   A module's `@@var` is visible in every class that includes it (that is
+//   what makes the "class variable of a module" pattern work at all), and all
+//   four walkers here followed `sup` alone -- so `class C; include M; end`
+//   answered "uninitialized class variable @@mvar in C" for a variable M
+//   defines. Moved out of m_eval_leaf.mere for this: ancestors_of is declared
+//   in this file, and the rule must not be written twice.
+and cvar_get = fn env -> fn world -> fn (name: str) ->
+  let cls = cvar_cls env world in
+  // a class variable accessed at the top-level scope is a RuntimeError.
+  if str_eq cls "" then raise_exc world "RuntimeError" "class variable access from toplevel"
+  // reading an uninitialised class variable is a NameError in Ruby.
+  else if cvar_defined_from world cls name then cvar_get_from world cls name
+  else raise_exc world "NameError" ("uninitialized class variable @@" ++ name ++ " in " ++ cls)
+
+// the chain a class variable is looked up along: the receiver, then everything
+// it inherits from or includes, in the order dispatch uses.
+and cvar_chain = fn world -> fn (cls: str) -> ancestors_of world cls
+
+and cvar_first_owner = fn world -> fn (anc: str list) -> fn (name: str) ->
+  match anc with
+  | Nil -> ""
+  | Cons (a, rest) -> if map_has cvars (a ++ "@" ++ name) then a else cvar_first_owner world rest name
+
+and cvar_overtaken = fn world -> fn (cls: str) -> fn (name: str) ->
+  // "this class defines it AND so does something above it" -- ruby warns about
+  // that, and the question is asked of the same chain as the lookup.
+  if map_has cvars (cls ++ "@" ++ name)
+  then (if str_eq (cvar_first_owner world (anc_after (cvar_chain world cls) cls) name) "" then false else true)
+  else (if str_eq (cvar_first_owner world (cvar_chain world cls) name) "" then false
+        else cvar_overtaken world (cvar_first_owner world (cvar_chain world cls) name) name)
+
+and cvar_defined_from = fn world -> fn (cls: str) -> fn (name: str) ->
+  if str_eq (cvar_first_owner world (cvar_chain world cls) name) "" then false else true
+
+and cvar_get_from = fn world -> fn (cls: str) -> fn (name: str) ->
+  let o9 = cvar_first_owner world (cvar_chain world cls) name in
+  if str_eq o9 "" then VNil else map_get cvars (o9 ++ "@" ++ name)
+
+and cvar_set = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
+  let cls = cvar_cls env world in
+  if str_eq cls "" then (let _ = raise_exc world "RuntimeError" "class variable access from toplevel" in ())
+  else
+  // an assignment writes where the variable ALREADY lives, if it lives
+  // anywhere up the chain; otherwise it is created here.
+  let owner0 = cvar_first_owner world (cvar_chain world cls) name in
+  let owner = if str_eq owner0 "" then cls else owner0 in
+  map_set cvars (owner ++ "@" ++ name) v
+
+and cvar_owner = fn world -> fn (cls: str) -> fn (name: str) ->
+  let o9 = cvar_first_owner world (cvar_chain world cls) name in
+  if str_eq o9 "" then "" else o9
+
 and ancestors_of_raw = fn world -> fn (cls: str) ->
   let (meths, sup, ocls, ivars) = world in
   let pre = if map_has prepends cls then expand_mods world (rev_strs (str_split (map_get prepends cls) "|") Nil) else Nil in

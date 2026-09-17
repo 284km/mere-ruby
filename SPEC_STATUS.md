@@ -47,7 +47,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/set | 55 | 0 | 0 | 0 | 0 | 55 |
 | core/regexp | 20 | 4 | 0 | 0 | 0 | 24 |
 | core/enumerable | 57 | 4 | 0 | 0 | 0 | 61 |
-| core/module | 32 | 51 | 0 | 1 | 1 | 85 |
+| core/module | 40 | 43 | 0 | 1 | 1 | 85 |
 | core/filetest | 22 | 3 | 0 | 0 | 0 | 25 |
 | core/data | 8 | 5 | 0 | 0 | 0 | 13 |
 

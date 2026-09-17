@@ -93,17 +93,22 @@ and const_assign_key = fn env -> fn (name: str) ->
 //   singleton is the `class << self` case this rule is for.
 and const_owner_scope = fn (lex: str) ->
   let i9 = sng_seg_at lex 0 (0 - 1) in
-  let tail = (if i9 < 0 then "" else substring lex (i9 + 2) (str_len lex)) in
-  if i9 < 0 then lex
-  else if str_contains tail "::" then lex
-  else tail
+  if i9 == (0 - 1) then lex else substring lex (i9 + 2) (str_len lex)
 
 // index of the last "::" that is followed by a "(sng:" segment, or -1.
+// ⚠ Where a TRAILING singleton segment starts, as the index of the "::" before
+//   it (or 0 when the whole scope is one). A singleton segment is
+//   "(sng:<inner>)" and its INNER PART MAY ITSELF BE QUALIFIED --
+//   "ModuleSpecs::CVars::(sng:ModuleSpecs::CVars)" is one scope with one
+//   singleton at the end, and testing "does the tail contain ::" called that
+//   two segments and gave up. The test is: the last "(sng:" that begins a
+//   segment, with the rest of the string closing it.
 and sng_seg_at = fn (k: str) -> fn (i: int) -> fn (best: int) ->
-  if i + 1 >= str_len k then best
-  else if str_eq (char_at k i) ":" && str_eq (char_at k (i + 1)) ":"
-          && i + 6 < str_len k && str_eq (substring k (i + 2) (i + 7)) "(sng:"
-  then sng_seg_at k (i + 2) i
+  if i + 4 >= str_len k then best
+  else if str_eq (substring k i (i + 5)) "(sng:"
+          && (i == 0 || (i >= 2 && str_eq (substring k (i - 2) i) "::"))
+          && str_eq (char_at k (str_len k - 1)) ")"
+  then sng_seg_at k (i + 1) (if i == 0 then 0 - 2 else i - 2)
   else sng_seg_at k (i + 1) best
 and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
 and is_dsplat = fn (p: str) -> str_len p >= 2 && str_eq (substring p 0 2) "**"
@@ -2734,45 +2739,27 @@ and cvar_cls = fn env -> fn world ->
   // `extend` still reads the module's cvar. "" means the top-level scope.
   let (meths, sup, ocls, ivars) = world in
   // purely lexical: no enclosing class/module cref => top-level scope ("").
-  if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> let s = sget s in s | _ -> "")
-  else ""
-and cvar_get = fn env -> fn world -> fn (name: str) ->
-  let cls = cvar_cls env world in
-  // a class variable accessed at the top-level scope is a RuntimeError.
-  if str_eq cls "" then raise_exc world "RuntimeError" "class variable access from toplevel"
-  // reading an uninitialised class variable is a NameError in Ruby.
-  else if cvar_defined_from world cls name then cvar_get_from world cls name
-  else raise_exc world "NameError" ("uninitialized class variable @@" ++ name ++ " in " ++ cls)
-and cvar_overtaken = fn world -> fn (cls: str) -> fn (name: str) ->
-  let (meths, sup, ocls, ivars) = world in
-  if map_has cvars (cls ++ "@" ++ name)
-  then (if map_has sup cls then cvar_defined_from world (map_get sup cls) name else false)
-  else if map_has sup cls then cvar_overtaken world (map_get sup cls) name
-  else false
-and cvar_defined_from = fn world -> fn (cls: str) -> fn (name: str) ->
-  let (meths, sup, ocls, ivars) = world in
-  if map_has cvars (cls ++ "@" ++ name) then true
-  else if map_has sup cls then cvar_defined_from world (map_get sup cls) name
-  else false
-and cvar_get_from = fn world -> fn (cls: str) -> fn (name: str) ->
-  let (meths, sup, ocls, ivars) = world in
-  if map_has cvars (cls ++ "@" ++ name) then map_get cvars (cls ++ "@" ++ name)
-  else if map_has sup cls then cvar_get_from world (map_get sup cls) name
-  else VNil
-and cvar_set = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
-  let cls = cvar_cls env world in
-  if str_eq cls "" then (let _ = raise_exc world "RuntimeError" "class variable access from toplevel" in ())
-  else
-  let owner0 = cvar_owner world cls name in
-  let owner = if str_eq owner0 "" then cls else owner0 in
-  map_set cvars (owner ++ "@" ++ name) v
-and cvar_owner = fn world -> fn (cls: str) -> fn (name: str) ->
-  let (meths, sup, ocls, ivars) = world in
-  if map_has cvars (cls ++ "@" ++ name) then cls
-  else if map_has sup cls then
-    let up = cvar_owner world (map_get sup cls) name in
-    (if str_eq up "" then cls else up)
-  else ""
+  // ⚠ A SINGLETON SHARES ITS CLASS'S CLASS-VARIABLE SCOPE. `class C; class <<
+  //   self; @@meta = 1; end; end` puts @@meta on C -- `C.class_variables`
+  //   names it and a method in either body reads it. The cref there is
+  //   "C::(sng:C)", and taken whole it made a second, invisible scope: the
+  //   metaclass body wrote a variable the class could not see and vice versa.
+  //   Dropping the trailing singleton segment is also why `class << D` at the
+  //   TOP level is still an error -- its cref is just "(sng:D)", and what is
+  //   left is the empty top-level scope, which is what ruby refuses.
+  (if lv_has env "__cref"
+   then (match lv_get env "__cref" with
+         | VStr s -> cvar_scope_of (sget s)
+         | _ -> "")
+   else "")
+
+// the lexical scope a class variable written at `lex` belongs to: everything
+// but a trailing "(sng:...)" segment (see cvar_cls).
+and cvar_scope_of = fn (lex: str) ->
+  let i9 = sng_seg_at lex 0 (0 - 1) in
+  if i9 == (0 - 1) then lex
+  else if i9 < 0 then ""      // the whole scope IS the singleton: top level
+  else substring lex 0 i9
 and is_kernel_modfunc = fn (name: str) ->
   map_has (name_set "is_kernel_modfunc") name
 and kernel_public_instance_names = fn (u: unit) ->
