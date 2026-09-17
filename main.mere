@@ -10920,7 +10920,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // methods, `class`, `name`, ...) falls through to the general dispatcher.
     else if str_eq c "Math" && ns_class_method c name && (if is_module_method name then false else true)
             && (if is_prim_method name then false else true) then
-      (if (str_len name == 4 && str_eq name "sqrt") then (match args with Cons (v, _) -> VFlt (sqrt (to_f v)) | _ -> VFlt 0.0)
+      // ⚠ EVERY Math FUNCTION REFUSES A NON-NUMBER, and several refuse a number
+      //   outside their domain. Each argument went straight into `to_f`, which
+      //   answers 0.0 for anything it does not understand -- so `Math.sqrt("x")`
+      //   was 0.0 and `Math.acos(2)` was a NaN, where ruby raises TypeError and
+      //   Math::DomainError. Twenty-seven of core/math's twenty-nine files open
+      //   on one of the two.
+      (let _ = list_iter_vals args (fn (v9: Val) -> math_arg_check world name v9) in
+       // ...and a Numeric object is turned into its Float here, once, so every
+       // arm below sees a number (`to_f` on a VObj answers 0.0 by itself).
+       let args = math_conv_args env world args in
+       let _ = (match args with
+                | Cons (v9, _) -> math_domain_check world name (to_f v9)
+                | Nil -> ()) in
+       if (str_len name == 4 && str_eq name "sqrt") then (match args with Cons (v, _) -> VFlt (sqrt (to_f v)) | _ -> VFlt 0.0)
        else if (str_len name == 5 && str_eq name "hypot") then (match args with Cons (a, Cons (b, _)) -> VFlt (hypot (to_f a) (to_f b)) | _ -> VFlt 0.0)
        else if (str_len name == 3 && str_eq name "sin") then (match args with Cons (v, _) -> VFlt (sin (to_f v)) | _ -> VFlt 0.0)
        else if (str_len name == 3 && str_eq name "cos") then (match args with Cons (v, _) -> VFlt (cos (to_f v)) | _ -> VFlt 0.0)
@@ -11711,6 +11724,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                          | Nil -> ()
                          | Cons (h9, t9) -> (let _ = push9 h9 in add9 t9)) in
                       add9 (if want_priv then kernel_builtin_names () else kernel_public_instance_names ()))
+                   else ()) in
+          // ...and BASICOBJECT's, for the same reason.
+          let _ = (if str_eq cx "BasicObject" && (if want_prot then false else true) then
+                     list_iter (str_split (name_spec (if want_priv then "bopriv" else "bopub")) "|")
+                       (fn (nb9: str) -> (if map_has meths0 (pfx ++ nb9) then () else push9 nb9))
                    else ()) in
           // MODULE's own methods live in the dispatcher too -- the same fact as
           // Kernel's, one class along. The lists are name_spec's modpub /
@@ -14500,6 +14518,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // sat further down the same chain, where those classes never reached it.
     else if ((str_len name == 13 && str_eq name "instance_eval") || (str_len name == 13 && str_eq name "instance_exec")) && (match args with Cons (VStr _, _) -> true | _ -> false) then
       dispatch_prim env world blk recv name args vischeck
+    // ⚠ `include Math` gives Math's functions to the INCLUDER as private
+    //   instance methods, and they live in the Math namespace arm rather than
+    //   the method table. The implicit-self path learned this; the explicit
+    //   one (`self.sin(0)`, `obj.send(:sin, 0)`) comes through here and had
+    //   to learn it too -- one rule, two call shapes.
+    else if ns_class_method "Math" name && str_list_has (ancestors_of world cls) "Math" then
+      invoke_val_c env world blk (VClass "Math") name args false
     // a method_missing defined on the object's SINGLETON (def o.method_missing)
     // lives under the (sng:N) class, which `cls` here is not.
     else if (match recv with
@@ -24331,6 +24356,13 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // through the receiver dispatcher, exactly as self.name would, and
        // ahead of method_missing since a real method wins.
        else if is_enum_method name || is_prim_method name then invoke_val_c env world noblk (VObj id) name args false
+       // ⚠ `include Math` MAKES MATH'S FUNCTIONS PRIVATE INSTANCE METHODS.
+       //   They live in the Math namespace arm, which only ever answered for
+       //   the Math receiver -- so `class C; include Math; def t; sin(0); end;
+       //   end` was a NoMethodError, and twenty-five of core/math's files have
+       //   an example for exactly that.
+       else if ns_class_method "Math" name && str_list_has (ancestors_of world cls) "Math" then
+         invoke_val_c env world noblk (VClass "Math") name args false
        // ⚠ ...and a KERNEL method, which every object has as a private
        //   instance method. Three names (sleep, fork, exit) had been added to
        //   the refusal by hand as they were missed; seventeen more were still
@@ -24434,6 +24466,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        //   `singleton_class` into "undefined local variable or method" for a
        //   method it has. The with-arguments path next door asks
        //   is_prim_method; two paths, two rules, and only one of them right.
+       else if ns_class_method "Math" name && str_list_has (ancestors_of world cls) "Math" then
+         invoke_val_c env world noblk (VClass "Math") name args false
        else if is_enum_method name || is_prim_method name || responds world (VObj id) name then invoke_val_c env world noblk (VObj id) name args false
        // a synthetic class's methods live in the primitive dispatcher, not the
        // method table, so an implicit-self call inside a reopened Time (or
@@ -28290,6 +28324,58 @@ and sym_or_str_arg = fn env -> fn world -> fn (v: Val) ->
      // object ("#<object>") and ruby's message carries the real one.
      else (let _ = raise_exc world "TypeError"
              (inspect_w env world other ++ " is not a symbol nor a string") in ""))
+
+// Math takes NUMBERS -- Integer, Float, Rational, Complex -- and nothing else.
+// `to_f` on the way in turned a String into 0.0 and answered as if it had been
+// asked about zero. The message names the VALUE for true/false/nil and the
+// CLASS for everything else, which is ruby's wording.
+and math_arg_check = fn world -> fn (fname: str) -> fn (v: Val) ->
+  match v with
+  // ⚠ every NUMERIC representation, not just the two immediate ones: a bignum
+  //   is VBig, a Rational VRat and a Complex VCpx, and refusing those refused
+  //   `Math.sqrt(4r)` and `Math.sqrt(2**70)`, which ruby answers.
+  | VInt _ -> () | VFlt _ -> () | VBig _ -> () | VRat _ -> () | VCpx _ -> ()
+  // ...and a user-defined NUMERIC, which ruby converts with #to_f.
+  //   MathSpecs::Float is `class Float < Numeric; def to_f; end`, and every
+  //   core/math file tries one.
+  | VObj oid9 -> (let (_, _, ocls9, _) = world in
+                  let cls9 = map_get ocls9 oid9 in
+                  if obj_is_a world cls9 "Numeric" then ()
+                  else (let _ = raise_exc world "TypeError"
+                          ("can't convert " ++ cls_display world cls9 ++ " into Float") in ()))
+  | VNil -> (let _ = raise_exc world "TypeError" "can't convert nil into Float" in ())
+  | VBool b9 -> (let _ = raise_exc world "TypeError"
+                   ("can't convert " ++ (if b9 then "true" else "false") ++ " into Float") in ())
+  | other -> (let _ = raise_exc world "TypeError"
+                ("can't convert " ++ class_name other ++ " into Float") in ())
+
+// ...and the DOMAINS, which are per function: sqrt and the logarithms refuse a
+// negative (0 is -Infinity, not an error), acos/asin/atanh refuse |x| > 1, and
+// acosh refuses anything below 1.
+and math_domain_check = fn world -> fn (fname: str) -> fn (x: float) ->
+  let bad = (if (str_len fname == 4 && str_eq fname "sqrt") then x < 0.0
+             else if (str_len fname == 3 && str_eq fname "log") || (str_len fname == 4 && str_eq fname "log2")
+                     || (str_len fname == 5 && str_eq fname "log10") then x < 0.0
+             else if (str_len fname == 4 && str_eq fname "acos") || (str_len fname == 4 && str_eq fname "asin")
+                     || (str_len fname == 5 && str_eq fname "atanh") then x > 1.0 || x < (0.0 - 1.0)
+             else if (str_len fname == 5 && str_eq fname "acosh") then x < 1.0
+             else false) in
+  if bad then (let _ = raise_exc world "Math::DomainError"
+                 ("Numerical argument is out of domain - " ++ fname) in ())
+  else ()
+
+and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (h, t) ->
+    Cons ((match h with
+           | VObj _ -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                        invoke_val_c env world nb9 h "to_f" Nil false)
+           | other -> other),
+          math_conv_args env world t)
+
+and list_iter_vals = fn (xs: Val list) -> fn (f: Val -> unit) ->
+  match xs with Nil -> () | Cons (h, t) -> (let _ = f h in list_iter_vals t f)
 
 and vis_names_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   let (meths0, _, _, _) = world in
