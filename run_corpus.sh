@@ -72,6 +72,12 @@ esac
 # list -- this is what caught File.foreach, which the entry condition let in
 # and the body never answered.
 ./tools/ns_names_check.sh > /dev/null || { ./tools/ns_names_check.sh; exit 1; }
+# ...and a tenth: every dispatch arm's length test matches its own literal.
+# A guard whose N is not the literal's length makes the arm UNREACHABLE, with
+# no build error and no crash -- the method simply answers "undefined" forever.
+# Two arms were written that way (append_features as 16, prepend_features as
+# 17) and both were invisible until someone called the method.
+./tools/name_len_check.sh > /dev/null || { ./tools/name_len_check.sh; exit 1; }
 
 # Per-run temp files. These were three fixed /tmp names, so two runs of this
 # gate at once overwrote each other's expected and actual output and reported a

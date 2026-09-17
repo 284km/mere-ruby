@@ -3464,7 +3464,30 @@ and const_opassign = fn env -> fn world -> fn blk -> fn (name: str) -> fn (e: Ex
 and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
   let _ = (if map_has consts key
            then rb_warn world ("already initialized constant " ++ key) else ()) in
-  map_set consts key v
+  let _ = map_set consts key v in
+  // ⚠ ...and an ANONYMOUS class or module gains its name here. Two of the
+  //   assignment paths called name_anon and the rest did not, so
+  //   `M.const_set(:Z, Class.new)` and `m::X = Class.new` left the class
+  //   nameless -- `#name` answered nil for something that has a constant
+  //   pointing at it. This is the one door every constant comes through.
+  let _ = name_anon key v in
+  // `const_added(:NAME)` on the module the constant landed in -- Object for a
+  // bare one. This is the only door constants come through, so the hook cannot
+  // be missed; the flag keeps a program that never defines it from paying a
+  // lookup per assignment.
+  (if map_has hook_flags "ca" then
+     (let i9 = last_sep_at key 0 (0 - 1) in
+      let owner9 = (if i9 < 0 then "Object" else substring key 0 i9) in
+      let simple9 = (if i9 < 0 then key else substring key (i9 + 2) (str_len key)) in
+      run_cls_hook world owner9 "const_added" simple9)
+   else ())
+
+// index of the LAST "::" in a constant key, or -1.
+and last_sep_at = fn (k: str) -> fn (i: int) -> fn (best: int) ->
+  if i + 1 >= str_len k then best
+  else if str_eq (char_at k i) ":" && str_eq (char_at k (i + 1)) ":"
+  then last_sep_at k (i + 2) i
+  else last_sep_at k (i + 1) best
 
 
 
@@ -11126,7 +11149,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       // live in Object, so Object also consults the bare name.
       (match args with
        | Cons (nv, _) ->
-         let n = (match nv with VSym s -> s | VStr s -> sget s | _ -> "") in
+         let n = sym_or_str_arg env world nv in
          // (an autoload -- Set, Pathname -- is defined before it is loaded)
          VBool (map_has consts (c ++ "::" ++ n) || (str_eq c "Object" && (map_has consts n || map_has autoloads n)))
        | _ -> VBool false)
@@ -11141,14 +11164,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (VClass m, _) ->
          VBool ((if str_eq m c then false else true) && str_list_has (ancestors_of world c) m)
        | _ -> VBool false)
-    else if (str_len name == 15 && str_eq name "instance_method") then
+    // ...and `public_instance_method`, which is the same lookup with one extra
+    // question asked at the end: a private or protected method is NOT one of
+    // them, and ruby refuses with the same NameError shape. It shares this arm
+    // rather than getting a copy, so the two cannot find different methods.
+    else if (str_len name == 15 && str_eq name "instance_method")
+            || (str_len name == 22 && str_eq name "public_instance_method") then
       (let (meths0, sup0, ocls0, ivars0) = world in
+       let want_pub9 = (str_len name == 22 && str_eq name "public_instance_method") in
        let mname = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
        let origin = (let a = lookup_anc world (ancestors_of world c) mname in
                      if str_eq a "" && map_has meths0 (c ++ "#" ++ mname) then c else a) in
        // a builtin method has no entry in the user method table, but it is
        // still a method of the class and reflection must see it.
        let origin = if str_eq origin "" && builtin_has_meth c mname then c else origin in
+       // ...and MODULE's own methods are builtins of a different shape: they
+       // are answered by the class dispatcher, not by builtin_has_meth, so
+       // `Module.instance_method(:remove_method)` was a NameError for a method
+       // every class uses. Same two lists as private_instance_methods and
+       // method_defined? -- a name is one fact however many doors ask for it.
+       let origin = if str_eq origin "" && str_eq c "Module"
+                       && (map_has (name_set "modpriv") mname || map_has (name_set "modpub") mname)
+                    then c else origin in
        // an OPERATOR on a builtin is dispatched by eval_bin_prim rather than
        // being an entry anywhere, so the per-class name lists do not mention
        // it -- `1.method(:+)` already had this fallback and
@@ -11184,7 +11221,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let origin = if str_eq origin ""
                        && (if str_eq (blt_alias_lookup world (ancestors_of world c) mname) "" then false else true)
                     then c else origin in
-       if str_eq origin "" then raise_exc world "NameError" ("undefined method '" ++ mname ++ "' for class '" ++ c ++ "'")
+       // ⚠ and the refusal SAYS WHICH: ruby answers "method 'b' for class 'C' is
+       //   protected", not "undefined" -- the method is there, the question was
+       //   whether it is public. A caller that reads the message to decide what
+       //   to do next needs the two apart.
+       let hid9 = (if want_pub9 && (if str_eq origin "" then false else true) then
+                     // ...and MODULE's own private ones are private by the same
+                     // list the other three doors read (meth_private only sees
+                     // the visibility TABLE, which has no row for a builtin).
+                     (if str_eq c "Module" && map_has (name_set "modpriv") mname then "private"
+                      else if meth_private world c mname then "private"
+                      else if meth_protected world c mname then "protected" else "")
+                   else "") in
+       let where9 = (if map_has modules c then "module '" else "class '") ++ c ++ "'" in
+       if (if str_eq hid9 "" then false else true) then
+         raise_exc world "NameError" ("method '" ++ mname ++ "' for " ++ where9 ++ " is " ++ hid9)
+       else if str_eq origin "" then
+         raise_exc world "NameError" ("undefined method '" ++ mname ++ "' for " ++ where9)
        else
          (let id = alloc_oid ocls0 in
           let _ = map_set ocls0 id "UnboundMethod" in
@@ -11208,18 +11261,52 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Module#prepend(M): like include, but M goes in FRONT of the class.
     else if (str_len name == 7 && str_eq name "prepend") && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (let _ = prep_each world c args in recv)
+    // ⚠ THE MIXIN HOOKS' OWN DEFAULTS, which were missing entirely: a module
+    //   could be included but could not say how. `include` is documented as
+    //   "call append_features, then included", and a program (ActiveSupport's
+    //   Concern is the famous one) overrides append_features and ends with
+    //   `super` -- that super had nowhere to land. These are also the twelve
+    //   names Module reports as its own private instance methods.
+    //
+    //   append_features / prepend_features answer the MODULE and extend_object
+    //   answers the OBJECT, which is how ruby lets them be chained. None of
+    //   the three fires a callback: #include fires `included` after calling
+    //   append_features, and calling append_features alone must not.
+    else if (str_len name == 15 && str_eq name "append_features") && (match args with Cons (VClass _, _) -> true | _ -> false) then
+      (match args with Cons (VClass b9, _) -> (let _ = append_features_raw world b9 c in recv) | _ -> recv)
+    else if (str_len name == 16 && str_eq name "prepend_features") && (match args with Cons (VClass _, _) -> true | _ -> false) then
+      (match args with Cons (VClass b9, _) -> (let _ = prepend_features_raw world b9 c in recv) | _ -> recv)
+    else if (str_len name == 13 && str_eq name "extend_object") && (match args with Cons (_, _) -> true | _ -> false) then
+      (match args with Cons (o9, _) -> (let _ = do_extend_one world c o9 in o9) | _ -> VNil)
+    // ...and the seven NOTIFICATION hooks, whose default is to do nothing and
+    // answer nil. They exist so that a `super` in an override lands, and so
+    // that `Module.private_instance_methods` can honestly name them.
+    else if (str_len name == 8 && str_eq name "included") || (str_len name == 8 && str_eq name "extended")
+            || (str_len name == 9 && str_eq name "prepended") || (str_len name == 11 && str_eq name "const_added")
+            || (str_len name == 12 && str_eq name "method_added") || (str_len name == 14 && str_eq name "method_removed")
+            || (str_len name == 16 && str_eq name "method_undefined") then
+      VNil
     // `private(*names)` and friends as a genuine call. The statement parser
     // handles the bare and `:sym`-list forms; this is the parenthesised one,
     // whose argument list is only known once it has been evaluated.
     else if (str_len name == 7 && str_eq name "private") || (str_len name == 6 && str_eq name "public") || (str_len name == 9 && str_eq name "protected") ||
-            (str_len name == 15 && str_eq name "module_function") || (str_len name == 20 && str_eq name "private_class_method") then
+            (str_len name == 15 && str_eq name "module_function") || (str_len name == 20 && str_eq name "private_class_method") ||
+            (str_len name == 19 && str_eq name "public_class_method") then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let names = vis_arg_names args in
        let _ = (match names with
                 | Nil -> ()
                 | _ -> if (str_len name == 15 && str_eq name "module_function") then modfunc_promote world c names
-                       else if (str_len name == 20 && str_eq name "private_class_method") then mark_vis_mode meths0 ("(sng:" ++ c ++ ")") names "private"
-                       else mark_vis_mode meths0 c names name) in
+                       else if (str_len name == 20 && str_eq name "private_class_method") then
+                         (let _ = vis_names_check world ("(sng:" ++ c ++ ")") names in
+                          mark_vis_mode meths0 ("(sng:" ++ c ++ ")") names "private")
+                       // ...and its opposite, which was missing: a class method
+                       // hidden by private_class_method is taken back out.
+                       else if (str_len name == 19 && str_eq name "public_class_method") then
+                         (let _ = vis_names_check world ("(sng:" ++ c ++ ")") names in
+                          mark_vis_mode meths0 ("(sng:" ++ c ++ ")") names "public")
+                       else (let _ = vis_names_check world c names in
+                             mark_vis_mode meths0 c names name)) in
        // Ruby returns the argument, or the list of them when given several.
        match args with Nil -> VNil | Cons (a, Nil) -> a | _ -> arr_new args)
     // define_singleton_method(:name, method_or_unbound_method) on a class: the
@@ -11364,7 +11451,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_len name == 15 && str_eq name "method_defined?") || (str_len name == 22 && str_eq name "public_method_defined?") ||
             (str_len name == 23 && str_eq name "private_method_defined?") || (str_len name == 25 && str_eq name "protected_method_defined?") then
       (let (meths0, _, _, _) = world in
-       let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr h2, _) -> sget h2 | _ -> "") in
+       // ⚠ ...and it refuses a name that is not one. `C.method_defined?(1)` was
+       //   answered (false, silently) instead of raising -- the four spellings
+       //   each have a spec for it, and a caller that passes a number by
+       //   mistake got an answer rather than a diagnosis.
+       let _ = (match args with
+                | Nil -> (let _ = raise_exc world "ArgumentError"
+                            "wrong number of arguments (given 0, expected 1..2)" in ())
+                | _ -> ()) in
+       let nm = (match args with Cons (a2, _) -> sym_or_str_arg env world a2 | Nil -> "") in
        let origin = (if map_has meths0 (c ++ "#" ++ nm) then c else lookup_anc world (ancestors_of world c) nm) in
        // a builtin-backed method is still a method of the class (see
        // instance_method above). "Never private" was true for every class but
@@ -11374,6 +11469,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // private_instance_methods does, or a program can be told both.
        if str_eq origin "" && str_eq c "Kernel" && is_kernel_builtin nm then
          VBool ((str_len name == 23 && str_eq name "private_method_defined?"))
+       // ...and MODULE's own methods, from the same two lists that
+       // private_instance_methods / public_instance_methods answer with. Two
+       // doors onto one fact: `Module.private_method_defined?(:append_features)`
+       // said false about a name the other door had just named.
+       else if str_eq origin "" && str_eq c "Module"
+               && (map_has (name_set "modpriv") nm || map_has (name_set "modpub") nm) then
+         (let priv8 = map_has (name_set "modpriv") nm in
+          if (str_len name == 23 && str_eq name "private_method_defined?") then VBool priv8
+          else if (str_len name == 25 && str_eq name "protected_method_defined?") then VBool false
+          else VBool (if priv8 then false else true))
        else if str_eq origin "" && builtin_has_meth c nm then
          VBool ((str_len name == 15 && str_eq name "method_defined?") || (str_len name == 22 && str_eq name "public_method_defined?"))
        // Every class inherits BasicObject's #initialize, and it is PRIVATE:
@@ -11449,16 +11554,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           arr_new (idx_to_list out 0 (map_len out))))
     // private_instance_methods(false) / public_instance_methods(false): the
     // own methods split by the visibility table.
-    else if (str_len name == 24 && str_eq name "private_instance_methods") || (str_len name == 23 && str_eq name "public_instance_methods") then
+    else if (str_len name == 24 && str_eq name "private_instance_methods") || (str_len name == 23 && str_eq name "public_instance_methods")
+            || (str_len name == 26 && str_eq name "protected_instance_methods") then
       (let (meths0, _, _, _) = world in
        let want_priv = (str_len name == 24 && str_eq name "private_instance_methods") in
+       // the third visibility, which had no door at all: same own-methods walk,
+       // read against the protecteds table instead.
+       let want_prot = (str_len name == 26 && str_eq name "protected_instance_methods") in
        // Kernel's own methods live in the primitive dispatcher, so the method
        // table cannot see them: the module functions are its PRIVATE instance
        // methods and Object's are its PUBLIC ones. Read from the same lists
        // `public_methods` uses, so the two answers cannot disagree.
-       let kern9 = str_eq c "Kernel" in
-       let pfx = c ++ "#" in
-       let plen = str_len pfx in
        let tmp = map_new () in
        // ⚠ THREE doors add to this list (the method table, the module-function
        //   list, and the call path's own list), and two of them add the same
@@ -11467,63 +11573,84 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        //   and a name is one name however many doors know it: push through one
        //   gate that remembers what it has seen.
        let seen9 = map_new () in
+       // ⚠ CLASS UNDEFINES FIVE OF MODULE'S -- the mixin machinery, which a
+       //   Class is not on the receiving end of. They are seeded into the
+       //   dedupe gate so the walk up to Module cannot put them back.
+       let _ = (if str_eq c "Class" then
+                  list_iter (str_split (name_spec "clsundef") "|")
+                    (fn (nu9: str) -> map_set seen9 nu9 1)
+                else ()) in
        let push9 = fn (nm9: str) ->
          (if map_has seen9 nm9 then ()
           else (let _ = map_set seen9 nm9 1 in
                 let m9 = map_len tmp in
                 map_set tmp (str_of_int m9) (VSym nm9))) in
-       let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
-         if str_len k > plen && str_eq (substring k 0 plen) pfx
-            && (if str_contains (substring k plen (str_len k)) "#" then false else true)
-            && (if map_has privates k then want_priv else (if want_priv then false else true))
-         then push9 (substring k plen (str_len k))
-         else ()) in
-       // :initialize is private on every class (inherited from Object) —
-       // include it unless this class defines its own entry (the table
-       // already decided that case above).
-       // ⚠ Complex and Rational have #marshal_dump as a PRIVATE instance
-       //   method (not #marshal_load, which ruby does not list): it lives in
-       //   the primitive dispatcher, so the loop above cannot see it, and both
-       //   classes' marshal_dump_spec asks for it by name.
-       let _ = (if want_priv && (str_eq c "Complex" || str_eq c "Rational")
-                then push9 "marshal_dump" else ()) in
-       // ⚠ `initialize` is INHERITED by most classes, not owned by them, and
-       //   `(false)` asks only for the ones a class owns. The rule here was
-       //   "every class except one that defines its own", which put :initialize
-       //   on every user class and every module -- ruby puts it on neither
-       //   (`module M; def a; end; end` answers [], and so does `class C; def
-       //   b; end; end`). The classes that really own one are a fixed list,
-       //   asked of the reference over the whole registered class list; the
-       //   rest inherit BasicObject's. A class that defines its own is already
-       //   in the method table and came out of the loop above.
-       // The inherited form (no arg / true) also reports what the ancestors
-       // hold, and every CLASS inherits BasicObject's private #initialize --
-       // a bare module inherits nothing and reports none.
+       // ⚠ ...and the NO-ARGUMENT form asks for the ancestors too. This branch
+       //   answered own-methods whatever it was passed, so
+       //   `SomeModule.private_instance_methods` -- the form eight core/module
+       //   files use -- missed everything an included module contributed.
+       //   Everything one class contributes is collected here, once, and the
+       //   inherited form runs it down the chain.
+       let add_from9 = fn (cx: str) ->
+         (let pfx = cx ++ "#" in
+          let plen = str_len pfx in
+          let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
+            if str_len k > plen && str_eq (substring k 0 plen) pfx
+               && (if str_contains (substring k plen (str_len k)) "#" then false else true)
+               && (if want_prot then map_has protecteds k
+                   else if map_has protecteds k then false
+                   else if map_has privates k then want_priv else (if want_priv then false else true))
+            then push9 (substring k plen (str_len k))
+            else ()) in
+          // ⚠ Complex and Rational have #marshal_dump as a PRIVATE instance
+          //   method (not #marshal_load, which ruby does not list): it lives in
+          //   the primitive dispatcher, so the loop above cannot see it, and
+          //   both classes' marshal_dump_spec asks for it by name.
+          let _ = (if want_priv && (str_eq cx "Complex" || str_eq cx "Rational")
+                   then push9 "marshal_dump" else ()) in
+          // ⚠ `initialize` is INHERITED by most classes, not owned by them.
+          //   The rule here was "every class except one that defines its own",
+          //   which put :initialize on every user class and every module --
+          //   ruby puts it on neither. The classes that really own one are a
+          //   fixed list, asked of the reference over the whole registered
+          //   class list; the rest inherit BasicObject's.
+          let _ = (if want_priv && (if map_has meths0 (pfx ++ "initialize") then false else true)
+                              && owns_initialize cx
+                   then push9 "initialize" else ()) in
+          // KERNEL'S MODULE FUNCTIONS ARE PRIVATE INSTANCE METHODS. That is not
+          // a detail: `puts` and `format` are callable with no receiver from
+          // anywhere precisely because Kernel makes them private instance
+          // methods of Object, and forty-six ruby/spec files open by asserting
+          // it. They live in the primitive dispatcher rather than the method
+          // table, so the loop above cannot see them -- the list is
+          // is_kernel_builtin, the same one the call path uses.
+          let _ = (if str_eq cx "Kernel" && (if want_prot then false else true) then
+                     (let rec add9 = fn (xs: str list) ->
+                        (match xs with
+                         | Nil -> ()
+                         | Cons (h9, t9) -> (let _ = push9 h9 in add9 t9)) in
+                      add9 (if want_priv then kernel_builtin_names () else kernel_public_instance_names ()))
+                   else ()) in
+          // MODULE's own methods live in the dispatcher too -- the same fact as
+          // Kernel's, one class along. The lists are name_spec's modpub /
+          // modpriv; protected gets none, because ruby gives Module no
+          // protected instance method.
+          (if str_eq cx "Module" && (if want_prot then false else true) then
+             // iterated from the SPEC STRING, not the built set: the set is a
+             // hash and ruby's answer has a stable order.
+             list_iter (str_split (name_spec (if want_priv then "modpriv" else "modpub")) "|")
+               (fn (nm8: str) -> (if map_has meths0 (pfx ++ nm8) then () else push9 nm8))
+           else ())) in
        let inh9 = (match args with Cons (VBool false, _) -> false | _ -> true) in
-       let _ = (if want_priv && (if map_has meths0 (pfx ++ "initialize") then false else true)
-                          && (owns_initialize c
-                              || (inh9 && (if map_has modules c then false else true)))
+       let _ = add_from9 c in
+       let _ = (if inh9 then list_iter (anc_after (ancestors_of world c) c) add_from9 else ()) in
+       // ...and BasicObject's private #initialize, which every CLASS inherits
+       // and no module does. It has no method-table row to be found by the
+       // walk above, so the inherited form has to name it here.
+       let _ = (if want_priv && inh9
+                   && (if map_has modules c then false else true)
+                   && (if map_has meths0 (c ++ "#initialize") then false else true)
                 then push9 "initialize" else ()) in
-       let _ = (if kern9 then
-                  (let rec add9 = fn (xs: str list) ->
-                     (match xs with
-                      | Nil -> ()
-                      | Cons (h9, t9) -> (let _ = push9 h9 in add9 t9)) in
-                   add9 (if want_priv then kernel_builtin_names () else kernel_public_instance_names ()))
-                else ()) in
-       // KERNEL'S MODULE FUNCTIONS ARE PRIVATE INSTANCE METHODS. That is not a
-       // detail: `puts` and `format` are callable with no receiver from
-       // anywhere precisely because Kernel makes them private instance methods
-       // of Object, and forty-six ruby/spec files open by asserting it
-       // (`Kernel.should have_private_instance_method(:format)`, which is
-       // `Kernel.private_instance_methods.include?`). They live in the
-       // primitive dispatcher rather than the method table, so the loop above
-       // cannot see them -- the list is is_kernel_builtin, the same one the
-       // call path uses, so the two cannot disagree about what Kernel has.
-       let _ = (if want_priv && str_eq c "Kernel"
-                then list_iter_kernel_names (fn (nm: str) ->
-                       (if map_has meths0 (pfx ++ nm) then () else push9 nm))
-                else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     // class variables (@@x) declared directly on this class, as :@@sym.
     else if (str_len name == 15 && str_eq name "class_variables") then
@@ -11537,23 +11664,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if (str_len name == 18 && str_eq name "class_variable_get") then
       (match args with
-       | Cons (v, _) -> let nm = cvar_name_checked world (to_s v) in
+       | Cons (v, _) -> let nm = cvar_name_checked world (sym_or_str_arg env world v) in
          (if cvar_overtaken world c nm then raise_exc world "RuntimeError" ("class variable @@" ++ nm ++ " of " ++ c ++ " is overtaken by " ++ c)
           else if cvar_defined_from world c nm then cvar_get_from world c nm
           else raise_exc world "NameError" ("uninitialized class variable @@" ++ nm ++ " in " ++ c))
        | _ -> VNil)
     else if (str_len name == 18 && str_eq name "class_variable_set") then
       (match args with
-       | Cons (v, Cons (value, _)) -> let nm = cvar_name_checked world (to_s v) in
+       | Cons (v, Cons (value, _)) -> let nm = cvar_name_checked world (sym_or_str_arg env world v) in
          let owner0 = cvar_owner world c nm in
          let owner = if str_eq owner0 "" then c else owner0 in
          let _ = map_set cvars (owner ++ "@" ++ nm) value in value
        | _ -> VNil)
     else if (str_len name == 23 && str_eq name "class_variable_defined?") then
-      (match args with Cons (v, _) -> VBool (map_has cvars (c ++ "@" ++ cvar_name_checked world (to_s v))) | _ -> VBool false)
+      (match args with Cons (v, _) -> VBool (map_has cvars (c ++ "@" ++ cvar_name_checked world (sym_or_str_arg env world v))) | _ -> VBool false)
     else if (str_len name == 21 && str_eq name "remove_class_variable") then
       (match args with
-       | Cons (v, _) -> let k = c ++ "@" ++ cvar_name_checked world (to_s v) in
+       | Cons (v, _) -> let k = c ++ "@" ++ cvar_name_checked world (sym_or_str_arg env world v) in
          let old = (if map_has cvars k then map_get cvars k else VNil) in
          let _ = if map_has cvars k then map_delete cvars k else () in old
        | _ -> VNil)
@@ -11600,6 +11727,43 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // for a singleton class this is the metaclass chain down to Class.
     else if (str_len name == 9 && str_eq name "ancestors") then
       arr_new (anc_vclasses (ancestors_of world c))
+    // Module#included_modules: the same chain, modules only, without self.
+    else if (str_len name == 16 && str_eq name "included_modules") then
+      arr_new (mod_vclasses (ancestors_of world c) c)
+    // Module#undefined_instance_methods: the names `undef_method` put a
+    // tombstone on IN THIS CLASS. The tombstones are already how inheritance
+    // is blocked (the undefs table, keyed "Cls#name"); nothing read them back.
+    else if (str_len name == 26 && str_eq name "undefined_instance_methods") then
+      (let pfx8 = c ++ "#" in
+       let plen8 = str_len pfx8 in
+       let tmp8 = map_new () in
+       let _ = map_iter undefs (fn (k: str) -> fn (v: Val) ->
+         if str_len k > plen8 && str_eq (substring k 0 plen8) pfx8
+            && (if str_contains (substring k plen8 (str_len k)) "#" then false else true)
+         then (let m8 = map_len tmp8 in map_set tmp8 (str_of_int m8) (VSym (substring k plen8 (str_len k))))
+         else ()) in
+       arr_new (idx_to_list tmp8 0 (map_len tmp8)))
+    // Module#set_temporary_name(str): gives an ANONYMOUS module or class a
+    // name, for the length of the program or until it is cleared with nil. The
+    // slot is the one an anonymous class already uses when it is assigned to a
+    // constant, so #name, #to_s and #inspect answer it without further work.
+    else if (str_len name == 18 && str_eq name "set_temporary_name") then
+      (match args with
+       | Cons (VNil, _) ->
+         (if is_anon_cls c then (let _ = (if map_has anon_name c then map_delete anon_name c else ()) in recv)
+          else raise_exc world "RuntimeError" "can't change permanent name")
+       | Cons (VStr h8, _) ->
+         (let s8 = sget h8 in
+          if (if is_anon_cls c then false else true) then
+            raise_exc world "RuntimeError" "can't change permanent name"
+          else if str_len s8 == 0 then raise_exc world "ArgumentError" "empty class/module name"
+          else if is_const_path s8 then
+            raise_exc world "ArgumentError"
+              "the temporary name must not be a constant path to avoid confusion"
+          else (let _ = map_set anon_name c (mkstr s8) in recv))
+       | Cons (other8, _) ->
+         raise_exc world "TypeError" ("no implicit conversion of " ++ class_name other8 ++ " into String")
+       | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
     // Module#< / <= / > / >= / <=> : the subclass partial order. Unrelated
     // modules compare to nil, which is what makes sorting a list of classes
     // raise "comparison of Class with Class failed" until <=> exists.
@@ -11877,9 +12041,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (v, _) ->
          // the receiver's own constant is keyed qualified (C::N); a top-level
          // constant (self=Object or main) is keyed bare.
-         let n0 = to_s v in
+         let n0 = sym_or_str_arg env world v in
          let qn = c ++ "::" ++ n0 in
          let n = if map_has consts qn then qn else n0 in
+         // ⚠ ...and it refuses one that is not there: `C.remove_const(:NOPE)`
+         //   answered nil, so a program removing the wrong name never learned.
+         let _ = (if map_has consts n then ()
+                  else (let _ = raise_exc world "NameError"
+                          ("constant " ++ cls_display world c ++ "::" ++ n0 ++ " not defined") in ())) in
          let old = if map_has consts n then map_get consts n else VNil in
          let _ = if map_has consts n then map_delete consts n else () in
          old
@@ -11890,7 +12059,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (str_len name == 11 && str_eq name "attr_writer") || (str_len name == 4 && str_eq name "attr") then
       (let mode = (if (str_len name == 11 && str_eq name "attr_reader") || (str_len name == 4 && str_eq name "attr") then "r"
                    else if (str_len name == 11 && str_eq name "attr_writer") then "w" else "rw") in
-       let _ = add_attrs world c mode (vis_arg_names args) in
+       // ⚠ vis_arg_names DROPS anything that is not a Symbol or a String, so
+       //   `attr_reader obj_with_to_str` defined nothing at all. A name
+       //   argument is a name argument wherever it appears.
+       let rec names9 = fn (xs: Val list) ->
+         (match xs with
+          | Nil -> (Nil : str list)
+          | Cons (v9, t9) -> Cons (sym_or_str_arg env world v9, names9 t9)) in
+       let _ = add_attrs world c mode (names9 args) in
+       // `attr_accessor :a, :b` answers the symbols it defined (ruby 3.0+);
+       // `attr` answers them too.
        VNil)
     // remove_method(:m) / undef_method(:m): drop the instance method m from
     // this class (used e.g. on a singleton class to undo a class method).
@@ -11904,11 +12082,31 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match as9 with
           | Nil -> ()
           | Cons (v, rest9) ->
-            let n9 = (match v with VSym sy -> sy | VStr h -> sget h | other -> to_s other) in
+            let n9 = sym_or_str_arg env world v in
             let key = c ++ "#" ++ n9 in
+            // ⚠ ...and both refuse a name that is not there, with DIFFERENT
+            //   messages: remove_method wants the class's OWN definition
+            //   ("method 'x' not defined in C") while undef_method is happy
+            //   with an inherited one and reports the ordinary undefined-method
+            //   NameError. Neither refused at all -- `C.remove_method(:nope)`
+            //   quietly did nothing, which is how a typo in a metaprogramming
+            //   patch survives to be debugged somewhere else.
+            let _ = (if tomb then
+                       (if map_has meths0 key
+                           || (if str_eq (lookup_anc world (ancestors_of world c) n9) "" then false else true)
+                           || builtin_has_meth c n9
+                        then ()
+                        else (let _ = raise_exc world "NameError"
+                                ("undefined method '" ++ n9 ++ "' for "
+                                 ++ (if map_has modules c then "module '" else "class '") ++ c ++ "'") in ()))
+                     else
+                       (if map_has meths0 key then ()
+                        else (let _ = raise_exc world "NameError"
+                                ("method '" ++ n9 ++ "' not defined in " ++ cls_display world c) in ()))) in
             let _ = if map_has meths0 key then del_meth meths0 key else () in
             let _ = if map_has builtin_alias key then map_delete builtin_alias key else () in
             let _ = if tomb then set_undef key else () in
+            let _ = run_cls_hook world c (if tomb then "method_undefined" else "method_removed") n9 in
             go9 rest9) in
        let _ = go9 args in
        recv)
@@ -11935,7 +12133,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_len name == 9 && str_eq name "const_get") then
       (match args with
        | Cons (v, _) ->
-         (let n = to_s v in
+         (let n = sym_or_str_arg env world v in
           let key = (if str_eq c "Object" then n else c ++ "::" ++ n) in
           // ⚠ ...and the ANCESTORS, which is where `::` already looks: a
           // constant on a superclass or an included module answers
@@ -11985,7 +12183,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       // "HTTP", URI::HTTP` at top level, where a later `HTTP` would find it.
       (match args with
        | Cons (v, Cons (value, _)) ->
-         let key = (if str_eq c "Object" then to_s v else c ++ "::" ++ to_s v) in
+         let cn9 = sym_or_str_arg env world v in
+         let key = (if str_eq c "Object" then cn9 else c ++ "::" ++ cn9) in
          // ruby warns here too: const_set over an existing constant is the
          // same replacement as writing `C = v`.
          let _ = const_store world key value in value
@@ -24389,12 +24588,51 @@ and ancestors_of = fn world -> fn (cls: str) ->
               else ()) in
      r)
 
+and meth_protected = fn world -> fn (cls: str) -> fn (name: str) ->
+  // ...same walk, same reason, reading the protecteds table instead.
+  meth_vis_walk world (ancestors_of world cls) name false
+and meth_private = fn world -> fn (cls: str) -> fn (name: str) ->
+  // walk from the object's class up: the first ancestor that either marks
+  // the method private (`private :foo` override) or defines it decides.
+  // ⚠ ...down the ANCESTOR CHAIN, not the superclass chain. This followed
+  //   `sup` alone, so an INCLUDED MODULE's visibility was invisible:
+  //   `module Anc; private def x; end; end; module M; include Anc; end` left
+  //   `M.private_method_defined?(:x)` false about a method that is private and
+  //   is right there. ancestors_of is the order dispatch itself uses (prepends,
+  //   self, includes, then supers), so the two cannot disagree about WHICH
+  //   definition decides.
+  meth_vis_walk world (ancestors_of world cls) name true
+
+and meth_vis_walk = fn world -> fn (anc: str list) -> fn (name: str) -> fn (want_priv: bool) ->
+  let (meths, sup, ocls, ivars) = world in
+  match anc with
+  | Nil -> false
+  | Cons (a, rest) ->
+    let k = a ++ "#" ++ name in
+    if map_has (if want_priv then privates else protecteds) k then true
+    // ...and a class that named the method in a visibility statement DECIDES,
+    // even with no body of its own: `public :m` in a subclass leaves no
+    // positive mark (public is the absence of one), so the walk went past it
+    // and found the ancestor's `private` -- and the method stayed private in a
+    // class that had just published it.
+    else if map_has vis_marks k then false
+    else if map_has meths k then false   // a definition here, and it is public
+    else meth_vis_walk world rest name want_priv
 and ancestors_of_raw = fn world -> fn (cls: str) ->
   let (meths, sup, ocls, ivars) = world in
   let pre = if map_has prepends cls then expand_mods world (rev_strs (str_split (map_get prepends cls) "|") Nil) else Nil in
   let mods = if map_has includes cls then expand_mods world (rev_strs (str_split (map_get includes cls) "|") Nil) else Nil in
+  // ⚠ A MODULE HAS NO SUPERCLASS CHAIN. `module A; end; A.ancestors` is [A],
+  //   not [A, Object, Kernel, BasicObject] -- a module is not under Object,
+  //   which is why `A.instance_method(:inspect)` is a NameError in ruby and
+  //   why `included_modules` can be read off this list at all. Every module
+  //   here walked up to Object, so a module claimed ~55 methods it does not
+  //   have and its ancestors answer was wrong by four entries. A SINGLETON
+  //   class is not this case (it has a real metaclass chain), and neither is
+  //   a module someone gave an explicit `sup` entry.
   let rest = if map_has sup cls then ancestors_of world (map_get sup cls)
              else if is_sng_cls cls then ancestors_of world (sng_supername world cls)
+             else if map_has modules cls then Nil
              else if str_eq cls "BasicObject" then Nil
              else if str_eq cls "Object" then Cons ("BasicObject", Nil)
              // Enumerator's builtin subclasses sit under Enumerator, not Object
@@ -24447,6 +24685,16 @@ and user_defines_send = fn world -> fn (recv: Val) -> fn (name: str) ->
   if (str_len name == 4 && str_eq name "send") then has_meth world (dispatch_cls_of world recv) "send" else false
 // `extend`: append each module's name to the receiver singleton's includes,
 // so its instance methods become singleton methods (found via the sng chain).
+// fire one of the notification hooks on a class, if it defines it. The three
+// ⚠ that had no caller at all -- method_removed, method_undefined and
+//   const_added -- were as reachable as method_added and simply never ran, so
+//   a class watching its own shape saw only half of what happened to it.
+and run_cls_hook = fn world -> fn (cls: str) -> fn (hook: str) -> fn (nm: str) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  if has_meth world ("(sng:" ++ cls ++ ")") hook
+  then (let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") hook (Cons (VSym nm, Nil)) in ())
+  else ()
+
 // fire `method_added(:name)` on the class that just gained an instance method.
 and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
@@ -24579,7 +24827,18 @@ and anc_const_key = fn world -> fn (cref: str) -> fn (name: str) ->
   // and `include M` there puts M among Object's. Treating an empty cref as
   // "nothing to walk" meant a bare constant from such a module was never
   // found, though `Object::NAME` was.
-  anc_const_go (ancestors_of world (if str_eq cref "" then "Object" else cref)) name
+  // ⚠ ...and a MODULE falls back to OBJECT, which its ancestor chain does not
+  //   contain. A module is not under Object (that is why `M.ancestors` is
+  //   [M]), but a bare constant written inside one still reaches the top
+  //   level -- ruby searches "the lexical scopes, then the cref's ancestors,
+  //   then Object". While modules walked up to Object by accident this came
+  //   for free; once they stopped, `module M::N; TOP_CONST; end` became an
+  //   uninitialized constant.
+  (let c9 = (if str_eq cref "" then "Object" else cref) in
+   let k9 = anc_const_go (ancestors_of world c9) name in
+   if (if str_eq k9 "" then false else true) then k9
+   else if map_has modules c9 then anc_const_go (ancestors_of world "Object") name
+   else "")
 // the ancestor chain to walk for a super call: a class receiver means the
 // current method is a class method (defined on the singleton class or an
 // extended module), so resume in the singleton chain, not the instance chain.
@@ -27374,6 +27633,10 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                    else cls ++ "#" ++ mname in
          let _ = set_meth meths key (Meth (params, defs, mbody)) in
          let _ = (if str_eq (meth_base mname) "method_added" then map_set hook_flags "ma" VNil else ()) in
+         // ...and the same trick for const_added, which fires from the single
+         // constant-assignment door: a program that never defines the hook must
+         // not pay a method lookup for every constant it sets.
+         let _ = (if str_eq (meth_base mname) "const_added" then map_set hook_flags "ca" VNil else ()) in
          let _ = map_set meth_cref key (lex_pack ()) in
          let _ = stamp_meth_src key in
          // `module_function` mode: the instance method is ALSO a module method,
@@ -27516,7 +27779,10 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        | SAssign (aname, e) ->
          if is_upper_first aname && (if str_contains aname "::" then false else true) then
            let v = eval_e cenv world noblk e in
-           let key = if str_eq cscope "" then aname else cscope ++ "::" ++ aname in
+           // ...through the same rule as a constant assigned anywhere else:
+           // a trailing singleton segment owns it alone (const_owner_scope).
+           let own9 = const_owner_scope cscope in
+           let key = if str_eq own9 "" then aname else own9 ++ "::" ++ aname in
            let _ = const_store world key v in
            // an anonymous class/module assigned to a constant takes that
            // constant name as its display name.
@@ -27544,7 +27810,14 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let _ = (if pre then do_prepend world cls mq else do_include world cls mq) in
          FNext VNil
        // `undef name` removes the method from this class.
-       | SUndef names -> let _ = undef_check world cls names in let _ = undef_all meths cls names in FNext VNil
+       // ...and `method_undefined(:name)` fires here too: `undef_method :u`
+       // written in a class BODY is this statement, not the method call that
+       // already fires it, and only one of the two paths had the hook.
+       | SUndef names ->
+         (let _ = undef_check world cls names in
+          let _ = undef_all meths cls names in
+          let _ = list_iter names (fn (n8: str) -> run_cls_hook world cls "method_undefined" n8) in
+          FNext VNil)
        // `define_method(:name) { body }` registers the block as a method;
        // any other expression statement executes.
        | SExpr (ECallB (fname, fargs, bp, bb)) ->
@@ -27605,11 +27878,79 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
 // does, and that override is where a Concern's ClassMethods get extended and
 // its `included do` block runs. When the module has one, IT decides what
 // including means; its `super` lands on the default (super_missing).
+// `Module#append_features(base)` with nothing overridden: the mixin itself,
+// and ONLY that. The `included` hook is fired by #include, not by this -- ruby
+// runs append_features and then included, and a program calling
+// `m.send(:append_features, c)` directly gets no callback. Extracted so the
+// default has a name that `super` inside an override can reach.
+// ⚠ A CYCLE IS REFUSED, and it is refused HERE so that both spellings are
+//   covered: `A.include(A)` and `A.send(:append_features, A)` are the same
+//   act. Without this the ancestor walk had no bottom -- `A.include(A)` was a
+//   stack overflow, and so was `B.append_features(A)` when B already includes
+//   A. The frozen target is refused first, as ruby does, so a refused include
+//   leaves no trace in the chain.
+and mixin_refuse = fn world -> fn (base: str) -> fn (mq: str) ->
+  let _ = frz_cls_check world base in
+  if str_eq base mq || str_list_has (ancestors_of world mq) base
+  then (let _ = raise_exc world "ArgumentError" "cyclic include detected" in ())
+  else ()
+
+// `private :nope` / `private_class_method :nope` name a method that has to
+// EXIST -- in the class or anywhere up its chain, builtins included. Neither
+// refused, so a renamed method left a visibility statement pointing at nothing
+// and the method it used to hide became public without a word.
+// A METHOD-OR-CONSTANT NAME ARGUMENT, the way ruby reads one: a Symbol or a
+// String as they are, anything else through #to_str. Seven of Module's methods
+// take one (method_defined? and its three spellings, const_get, remove_const,
+// class_variable_set, attr_reader...), each has a spec for the conversion, and
+// each was reading `to_s` or refusing outright -- so an object that IS a name
+// by protocol was rejected, and one that is not was silently stringified.
+and sym_or_str_arg = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VSym s9 -> s9
+  | VStr h9 -> sget h9
+  | other ->
+    (if responds world other "to_str" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        match invoke_val_c env world nb9 other "to_str" Nil false with
+        | VStr h8 -> sget h8
+        | bad -> (let _ = raise_exc world "TypeError"
+                    ("can't convert " ++ class_name other ++ " to String ("
+                     ++ class_name other ++ "#to_str gives " ++ class_name bad ++ ")") in ""))
+     // inspect_w, not inspect: the bare `inspect` answers a placeholder for an
+     // object ("#<object>") and ruby's message carries the real one.
+     else (let _ = raise_exc world "TypeError"
+             (inspect_w env world other ++ " is not a symbol nor a string") in ""))
+
+and vis_names_check = fn world -> fn (cls: str) -> fn (names: str list) ->
+  let (meths0, _, _, _) = world in
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    let _ = (if map_has meths0 (cls ++ "#" ++ n)
+                || (if str_eq (lookup_anc world (ancestors_of world cls) n) "" then false else true)
+                || builtin_has_meth cls n
+                || (str_eq cls "Module" && (map_has (name_set "modpriv") n || map_has (name_set "modpub") n))
+             then ()
+             else (let _ = raise_exc world "NameError"
+                     ("undefined method '" ++ n ++ "' for "
+                      ++ (if map_has modules cls then "module '" else "class '")
+                      ++ cls_display world cls ++ "'") in ())) in
+    vis_names_check world cls rest
+
+and append_features_raw = fn world -> fn (base: str) -> fn (mq: str) ->
+  let _ = mixin_refuse world base mq in
+  set_inc base (if map_has includes base then (map_get includes base) ++ "|" ++ mq else mq)
+
+and prepend_features_raw = fn world -> fn (base: str) -> fn (mq: str) ->
+  let _ = mixin_refuse world base mq in
+  set_pre base (if map_has prepends base then (map_get prepends base) ++ "|" ++ mq else mq)
+
 and do_include = fn world -> fn (base: str) -> fn (mq: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "append_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
-           else set_inc base (if map_has includes base then (map_get includes base) ++ "|" ++ mq else mq)) in
+           else append_features_raw world base mq) in
   // `include Enumerable` brings Enumerable__Impl with it -- the streaming
   // implementations, in FRONT of the list so they are searched LAST: the
   // class's own methods win, a program's `module Enumerable` reopening wins,
@@ -27628,7 +27969,7 @@ and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "prepend_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepend_features" (Cons (VClass base, Nil)) in ())
-           else set_pre base (if map_has prepends base then (map_get prepends base) ++ "|" ++ mq else mq)) in
+           else prepend_features_raw world base mq) in
   run_prepended_hook world mq base
 
 // `include(M, N)` / `prepend(M, N)` put M nearest: ruby takes the list from

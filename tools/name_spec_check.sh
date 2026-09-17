@@ -4,7 +4,11 @@
 # name, which is a wrong answer and not a crash. Refuse the tree instead.
 set -u
 cd "$(dirname "$0")/.." || exit 2
-used=$(grep -ho 'name_set "[a-z_0-9]*"' ./*.mere | sed 's/.*"\(.*\)"/\1/' | sort -u)
+# ⚠ TWO SPELLINGS ASK FOR A TAG: `name_set "t"` builds the membership table and
+# `name_spec "t"` reads the raw string (which is how a list whose ORDER matters
+# is iterated -- the set is a hash). Counting only the first reported a live
+# arm as dead.
+used=$(grep -hoE '(name_set|name_spec) "[a-z_0-9]*"' ./*.mere | sed 's/.*"\(.*\)"/\1/' | sort -u)
 have=$(sed -n '/^let name_spec = /,/^let /p' m_state.mere \
        | grep -o 'str_eq tag "[a-z_0-9]*"' | sed 's/.*"\(.*\)"/\1/' | sort -u)
 [ -n "$used" ] || { echo "name_spec: found no name_set call at all -- the pattern moved"; exit 1; }

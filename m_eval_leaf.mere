@@ -73,7 +73,38 @@ and gvar_must_be_string = fn (n: str) ->
 and const_assign_key = fn env -> fn (name: str) ->
   let lex0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else "") in
   let lex = (if str_eq lex0 "" then cur_lex () else lex0) in
-  if str_eq lex "" then name else lex ++ "::" ++ name
+  // ⚠ A SINGLETON innermost segment OWNS the constant by itself. The scope of
+  //   `class << self` inside `module M` is "M::(sng:M)" -- the enclosing part
+  //   is there so a constant READ in the body continues up M's chain (see
+  //   register_class_sng_in) -- but the constant is DEFINED on the singleton,
+  //   and `M.singleton_class.constants` looks under "(sng:M)::". Keyed with
+  //   the whole scope it landed under "M::(sng:M)::" instead, where no door
+  //   could see it: the reflection answered [] and remove_const refused a
+  //   constant that was there.
+  let owner = const_owner_scope lex in
+  if str_eq owner "" then name else owner ++ "::" ++ name
+
+// The part of a lexical scope a constant DEFINED there belongs to. Everything
+// but a trailing singleton segment is read-chain only (see const_assign_key).
+// ⚠ TRAILING, not anywhere: `class << a; class X; CONST = 1; end; end` has the
+//   scope "CS::(sng:117)::X", and X is registered under that whole name -- so
+//   stripping back to "(sng:117)::X" put CONST somewhere X's own lookup could
+//   not reach. corpus/175 is the witness. Only a scope that ENDS in the
+//   singleton is the `class << self` case this rule is for.
+and const_owner_scope = fn (lex: str) ->
+  let i9 = sng_seg_at lex 0 (0 - 1) in
+  let tail = (if i9 < 0 then "" else substring lex (i9 + 2) (str_len lex)) in
+  if i9 < 0 then lex
+  else if str_contains tail "::" then lex
+  else tail
+
+// index of the last "::" that is followed by a "(sng:" segment, or -1.
+and sng_seg_at = fn (k: str) -> fn (i: int) -> fn (best: int) ->
+  if i + 1 >= str_len k then best
+  else if str_eq (char_at k i) ":" && str_eq (char_at k (i + 1)) ":"
+          && i + 6 < str_len k && str_eq (substring k (i + 2) (i + 7)) "(sng:"
+  then sng_seg_at k (i + 2) i
+  else sng_seg_at k (i + 1) best
 and tgt_is_splat = fn (t: str) -> str_len t > 0 && str_eq (char_at t 0) "*"
 and is_dsplat = fn (p: str) -> str_len p >= 2 && str_eq (substring p 0 2) "**"
 and dsplat_name = fn (ps: str list) ->
@@ -2851,6 +2882,41 @@ and anc_dedupe = fn (xs: str list) ->
   | Cons (h, t) -> if str_list_has t h then anc_dedupe t else Cons (h, anc_dedupe t)
 and anc_vclasses = fn (anc: str list) ->
   match anc with Nil -> Nil | Cons (a, rest) -> Cons (VClass a, anc_vclasses rest)
+and const_seg_ok = fn (t: str) -> fn (i: int) -> fn (n: int) ->
+  // one `::`-separated segment of a constant path: an uppercase letter and
+  // then identifier characters, and it must not be empty.
+  if i >= n then i > 0
+  else (let ch = char_at t i in
+        if (if i == 0 then is_upper ch
+            else (let o9 = ord ch in is_upper ch || (o9 >= 97 && o9 <= 122) || is_digit ch || str_eq ch "_"))
+        then const_seg_ok t (i + 1) n
+        else false)
+
+and is_const_path = fn (s9: str) ->
+  // `set_temporary_name` refuses a name that IS a constant path, "to avoid
+  // confusion" with a real constant -- so "Foo", "FOO", "F", "::Foo" and
+  // "A::B" are refused while "foo", "_Foo", "Foo Bar", "Foo-1", "Foo::" and
+  // "foo::Bar" are all accepted. The question is about the WHOLE string, not
+  // its first character.
+  (let t = (if str_len s9 >= 2 && str_eq (substring s9 0 2) "::" then substring s9 2 (str_len s9) else s9) in
+   if str_len t == 0 then false
+   else (let rec allsegs = fn (xs: str list) ->
+           (match xs with
+            | Nil -> true
+            | Cons (h9, t9) -> if const_seg_ok h9 0 (str_len h9) then allsegs t9 else false) in
+         allsegs (str_split t "::")))
+
+and mod_vclasses = fn (anc: str list) -> fn (self9: str) ->
+  // `included_modules` is the ancestor chain filtered to the MODULES, with the
+  // receiver itself dropped: `class C; include B; end` (B includes A) answers
+  // [B, A, Kernel]. Reading it off ancestors_of is only right because a module
+  // no longer walks up to Object (see ancestors_of_raw).
+  match anc with
+  | Nil -> Nil
+  | Cons (a, rest) ->
+    if (if str_eq a self9 then true else (if map_has modules a then false else true))
+    then mod_vclasses rest self9
+    else Cons (VClass a, mod_vclasses rest self9)
 and anc_after = fn (anc: str list) -> fn (x: str) ->
   match anc with Nil -> Nil | Cons (a, rest) -> if str_eq a x then rest else anc_after rest x
 // ⚠ where `super` resumes when the defining module is NOT in the receiver's
@@ -7658,17 +7724,49 @@ and sng_supername = fn world -> fn (c: str) ->
   else if map_has sup0 c then map_get sup0 c
   else if str_eq c "Object" then "BasicObject"
   else "Object"
-and name_anon = fn (cn: str) -> fn (v: Val) ->
+and first_seg = fn (k: str) ->
+  let rec at = fn (i: int) ->
+    (if i + 1 >= str_len k then 0 - 1
+     else if str_eq (char_at k i) ":" && str_eq (char_at k (i + 1)) ":" then i
+     else at (i + 1)) in
+  (let i9 = at 0 in if i9 < 0 then k else substring k 0 i9)
+
+and name_anon = fn (cn: str) -> fn (v: Val) -> name_anon_x cn v false
+
+// ⚠ RENAMING a module already named through its anonymous parent. `m = Module.new;
+//   m::B = Module.new; ModuleSpecs_CS2 = m` must leave B called
+//   "ModuleSpecs_CS2::B" -- but B was named the moment it was assigned, so the
+//   "first name wins" guard (which is also what terminates cycles) refused the
+//   better one. The RECURSION forces; a fresh naming still does not.
+and name_anon_x = fn (cn: str) -> fn (v: Val) -> fn (force: bool) ->
   match v with
   | VClass c ->
-    if is_anon_cls c && (if map_has anon_name c then false else true) then
+    let cur = (if map_has anon_name c then (match map_get anon_name c with VStr h9 -> sget h9 | _ -> "") else "") in
+    // ⚠ A NAME BUILT ON AN ANONYMOUS OWNER IS NOT A NAME. `m = Module.new;
+    //   m::Z = Module.new` would key Z as "AnonModule_2::Z", and storing that
+    //   leaks an internal name out of #name AND makes `q::W = q` rename
+    //   forever ("Q2", "Q2::W", "Q2::W::W", ... until the process is killed).
+    //   Z simply has no name yet; it gets one when the OWNER is assigned to a
+    //   constant, which is the recursion below -- and that one replaces the
+    //   name the owner's old anonymous path had given it.
+    if is_anon_cls c
+       && (if is_anon_cls (first_seg cn) then false else true)
+       && (if str_eq cur "" then true else force)
+       // ⚠ ...and never to a name that EXTENDS the one it already has. A module
+       //   that contains itself (`q::W = q`) is renamed by its own recursion:
+       //   "Q2", then "Q2::W", then "Q2::W::W", until the process is killed.
+       //   Ruby answers "Q2" for both q and q::W -- the first name it got.
+       && (if str_eq cur "" then true
+           else (if str_len cn > str_len cur && str_eq (substring cn 0 (str_len cur)) cur
+                 then false else true))
+    then
       (let _ = map_set anon_name c (mkstr cn) in
        let prefix = c ++ "::" in
        let plen = str_len prefix in
        map_iter consts (fn (k: str) -> fn (kv: Val) ->
          if str_len k > plen && str_eq (substring k 0 plen) prefix
             && (if str_contains (substring k plen (str_len k)) "::" then false else true)
-         then name_anon (cn ++ "::" ++ substring k plen (str_len k)) kv
+         then name_anon_x (cn ++ "::" ++ substring k plen (str_len k)) kv true
          else ()))
     else ()
   | _ -> ()
@@ -7736,6 +7834,10 @@ and cls_frozen_refuses = fn (name: str) -> fn (args: Val list) ->
   (str_len name == 20 && str_eq name "private_class_method") || (str_len name == 19 && str_eq name "public_class_method") ||
   (str_len name == 16 && str_eq name "private_constant") || (str_len name == 15 && str_eq name "public_constant") ||
   (str_len name == 14 && str_eq name "ruby2_keywords") ||
+  // ...and the class-variable writers, which were not in this list: a frozen
+  // class accepted `class_variable_set` and `remove_class_variable` silently.
+  (str_len name == 18 && str_eq name "class_variable_set") ||
+  (str_len name == 21 && str_eq name "remove_class_variable") ||
   // ...with NAMES. `K.send(:private)` on a frozen class is allowed: it only
   // sets the mode for defs that would follow, and none can.
   (((str_len name == 7 && str_eq name "private") || (str_len name == 6 && str_eq name "public") || (str_len name == 9 && str_eq name "protected"))
@@ -7970,36 +8072,6 @@ and mark_vis = fn meths -> fn (cls: str) -> fn (names: str list) -> fn (priv: bo
     let _ = if priv then map_set privates key VNil
             else if map_has privates key then map_delete privates key else () in
     mark_vis meths cls rest priv
-and meth_protected = fn world -> fn (cls: str) -> fn (name: str) ->
-  let (meths, sup, ocls, ivars) = world in
-  if str_eq cls "" then false
-  else if map_has protecteds (cls ++ "#" ++ name) then true
-  // ...same for protected: the class that named it in a visibility statement
-  // decides, so `public :m` (or `private :m`) below a `protected :m` is not
-  // still protected.
-  else if map_has vis_marks (cls ++ "#" ++ name) then false
-  else if map_has meths (cls ++ "#" ++ name) then false
-  else if map_has sup cls then meth_protected world (map_get sup cls) name
-  else if str_eq cls "BasicObject" then false
-  else if str_eq cls "Object" then meth_protected world "BasicObject" name
-  else meth_protected world "Object" name
-and meth_private = fn world -> fn (cls: str) -> fn (name: str) ->
-  // walk from the object's class up: the first ancestor that either marks
-  // the method private (`private :foo` override) or defines it decides.
-  let (meths, sup, ocls, ivars) = world in
-  if str_eq cls "" then false
-  else if map_has privates (cls ++ "#" ++ name) then true
-  // ...and a class that named the method in a visibility statement DECIDES,
-  // even with no body of its own: `public :m` in a subclass leaves no positive
-  // mark (public is the absence of one), so the walk went past it and found
-  // the ancestor's `private` -- and the method stayed private in a class that
-  // had just published it.
-  else if map_has vis_marks (cls ++ "#" ++ name) then false
-  else if map_has meths (cls ++ "#" ++ name) then false   // public definition here
-  else if map_has sup cls then meth_private world (map_get sup cls) name
-  else if str_eq cls "BasicObject" then false
-  else if str_eq cls "Object" then meth_private world "BasicObject" name
-  else meth_private world "Object" name
 and undef_top = fn meths -> fn (names: str list) ->
   match names with
   | Nil -> ()
