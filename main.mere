@@ -16357,6 +16357,30 @@ and ivar_name_val = fn env -> fn world -> fn (v: Val) ->
 
 and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // ⚠ KERNEL METHODS CALLED WITH NOTHING. A bare `loop` / `warn` /
+  //   `iterator?` reaches here now that try_self_call routes every Kernel name
+  //   (it used to be "undefined local variable or method"), and these three
+  //   answer with no arguments where the arms below all want some. `loop`
+  //   without a block is an endless Enumerator, `warn` with nothing writes
+  //   nothing, and `iterator?` is block_given? under its older name.
+  if (str_len name == 4 && str_eq name "loop") && (match args with Nil -> true | _ -> false)
+     && (match blk with (true, _, _, _) -> false | _ -> true)
+     && (if kernel_overridden env world "loop" then false else true) then
+    // ⚠ ...WITH ITS SIZE. `loop` is endless, and Enumerator#size falls back to
+    //   materialising the sequence -- so `loop.size` ran until the harness
+    //   killed it. ruby answers Float::INFINITY, which @__e_size carries.
+    (let e9 = make_enum world (VClass "Kernel") "loop" in
+     let _ = (match e9 with
+              | VObj eid9 -> (let (_, _, _, iv9) = world in
+                              map_set iv9 (str_of_int eid9 ++ "@__e_size") (VFlt (1.0 / 0.0)))
+              | _ -> ()) in
+     e9)
+  else if (str_len name == 4 && str_eq name "warn") && (match args with Nil -> true | _ -> false)
+          && (if kernel_overridden env world "warn" then false else true) then VNil
+  else if (str_len name == 9 && str_eq name "iterator?")
+          && (if kernel_overridden env world "iterator?" then false else true) then
+    VBool (match blk with (true, _, _, _) -> true | _ -> false)
+  else
   // Array#fetch_values converts each index with #to_int before the leaf reads
   // it (the leaf has no world to ask an object with).
   let args = (if (str_len name == 12 && str_eq name "fetch_values") && (match recv with VArr _ -> true | _ -> false)
@@ -23642,6 +23666,16 @@ and undef_blame = fn world -> fn (blame: Val) ->
 
 // `explicit` = the call had parentheses (foo()) so it is unambiguously a
 // method call -> NoMethodError even with no arguments.
+// ⚠ THREE KERNEL NAMES MUST REACH undef_call_exc_x, not the dispatcher: it is
+//   where `sleep` PARKS A THREAD (mere-ruby runs thread bodies synchronously,
+//   and a bare `sleep` raising __ThreadPark is the whole scheduler), where
+//   `fork` refuses, and where `exit` unwinds. Routing every Kernel name to
+//   dispatch_prim took `sleep` away from the parking arm and
+//   core/threadgroup/list stopped seeing its threads at all.
+and kernel_bare_special = fn (name: str) ->
+  (str_len name == 5 && str_eq name "sleep") || (str_len name == 4 && str_eq name "fork")
+  || (str_len name == 4 && str_eq name "exit")
+
 and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
   // last-resort Kernel methods that reach here as bare names (the ECall
   // path handles the argument forms in try_self_call_x).
@@ -24065,6 +24099,14 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // through the receiver dispatcher, exactly as self.name would, and
        // ahead of method_missing since a real method wins.
        else if is_enum_method name || is_prim_method name then invoke_val_c env world noblk (VObj id) name args false
+       // ⚠ ...and a KERNEL method, which every object has as a private
+       //   instance method. Three names (sleep, fork, exit) had been added to
+       //   the refusal by hand as they were missed; seventeen more were still
+       //   missing, so bare `loop`, `warn`, `format`, `eval`, `iterator?` and
+       //   the rest were "undefined local variable or method" for methods
+       //   Kernel defines. The list is is_kernel_builtin -- the same one
+       //   respond_to? and private_instance_methods answer from.
+       else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk (VObj id) name args false
        else if has_meth world cls "method_missing" then invoke world noblk (VObj id) cls "method_missing" (Cons (VSym name, args))
        else undef_call_exc_x world (blamed (VObj id)) name args explicit
      // top-level self is main (an Object); route the string form of
@@ -24084,6 +24126,8 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // a universal primitive (instance_variable_get, frozen?, send, ...)
        // with an implicit self at the top level, exactly as `self.name` would
        else if is_prim_method name then dispatch_prim env world noblk VMain name args false
+       // ...and the same for the top-level self (see the VObj arm above).
+       else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
        else undef_call_exc_x world (blamed VMain) name args explicit
      | VClass c ->
        // a `def self.new` outranks the built-in allocation here exactly as it
@@ -24096,6 +24140,9 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // apply; invoke_val_c raises NoMethodError itself if truly undefined.
        else invoke_val_c env world noblk (VClass c) name args false
      | other -> prim_self_send env world other name args)
+  // ...and with NO self bound at all, which is the ordinary top level: the
+  // same Kernel route as the two arms above (see there).
+  else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
   else undef_call_exc_x world (blamed VMain) name args explicit
 
 // implicit-self method call (a method calling a sibling method).
@@ -24160,6 +24207,14 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // method table, so an implicit-self call inside a reopened Time (or
        // MatchData, ...) has to be routed there too.
        else if str_eq (display_cls world cls) "Time" || str_eq cls "MatchData" then invoke_val_c env world noblk (VObj id) name args false
+       // ⚠ ...and a KERNEL method, which every object has as a private
+       //   instance method. try_self_call_x (the with-arguments twin of this
+       //   function) grew the same arm; seventeen names -- loop, warn, format,
+       //   sprintf, eval, iterator?, trace_var and the rest -- were
+       //   "undefined local variable or method" when written bare, because
+       //   BOTH copies of this rule had to know and only three names had been
+       //   added to either, one at a time as they were missed.
+       else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk (VObj id) name args false
        else undef_call_exc world (blamed (VObj id)) name args
      | VMain ->
        if ((str_len name == 13 && str_eq name "instance_eval") || (str_len name == 13 && str_eq name "instance_exec")) && (match args with Cons (VStr _, _) -> true | _ -> false)
@@ -24169,6 +24224,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        else if has_meth world "Object" name then invoke world noblk VMain "Object" name args
        else if has_meth world "Kernel" name then invoke world noblk VMain "Kernel" name args
        else if is_prim_method name then dispatch_prim env world noblk VMain name args false
+       // ...and Kernel's, as in the VObj arm above.
+       else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
        else undef_call_exc world (blamed VMain) name args
      | VClass c ->
        // class-level self (class << self body / class methods): route through
@@ -24184,6 +24241,8 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // primitive self (a reopened built-in class's method body): user
        // methods first, then the built-in prims (implicit-self upcase etc.).
        prim_self_send env world other name args)
+  // ...and with no self bound at all, which is the ordinary top level.
+  else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
   else undef_call_exc world (blamed VMain) name args
 
 // top-level method call: fresh frame, no self; blk is installed for yield.
@@ -29566,7 +29625,15 @@ and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
        // a StopIteration ends the loop quietly; other exceptions re-raise.
        let (meths, sup, ocls, ivars) = world in
        let ecls = (if map_has ivars "$exc" then (match map_get ivars "$exc" with VExc (c, _) -> c | _ -> "") else "") in
-       if str_eq ecls "StopIteration" then let _ = map_delete ivars "$exc" in VNil
+       // ⚠ ...and a SUBCLASS of StopIteration ends it too. Compared by name
+       //   this caught only StopIteration itself, so `loop { raise
+       //   Class.new(StopIteration) }` escaped the loop as an ordinary error.
+       //   (`loop` also answers the finished iterator's RESULT, which is what
+       //   the generator block returned. Nothing keeps that here -- an
+       //   Enumerator is materialised and the block's own value is dropped --
+       //   so this answers nil, as it did before.)
+       if (if str_eq ecls "" then false else exc_is_a world ecls "StopIteration") then
+         (let _ = map_delete ivars "$exc" in VNil)
        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
    | _ -> run_loop_builtin env world blk theblk)
 
