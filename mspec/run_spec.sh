@@ -32,7 +32,13 @@ case "$specdir" in
 esac
 if [ -n "$specroot" ]; then
   # clone the relevant trees (APFS copy-on-write when available).
-  for d in core language shared fixtures; do
+  # ⚠ LIBRARY WAS NOT IN THIS LIST, so not one of ruby/spec's 1516 library
+  # files could run: the clone did not contain them and BOTH sides died with
+  # `cannot load such file`. Measured that way the whole tree reads 0/1516,
+  # which is the instrument's answer and not the subject's -- mere-ruby ships
+  # set, pathname, digest, csv, zlib, socket, stringio and more, and
+  # library/pathname/absolute_spec is MATCH the moment the directory is there.
+  for d in core language library shared fixtures; do
     [ -d "$specroot/$d" ] || continue
     cp -Rc "$specroot/$d" "$tmp/$d" 2>/dev/null || cp -R "$specroot/$d" "$tmp/$d"
   done
