@@ -10491,9 +10491,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // whose parent it had already created ("path component ... is a file"),
        // and core/kernel/printf read DIFF against an interpreter that had done
        // nothing wrong. `test -f` is the question being asked.
+       // ...and `file?` is "exists and is not a directory", from the same two
+       // native questions rather than a third shell.
        else if (str_len name == 5 && str_eq name "file?") then
          (match args with
-          | Cons (VStr ph, _) -> VBool (run ("test -f " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
+          | Cons (VStr ph, _) ->
+            (let p9 = sget ph in
+             VBool (file_exists p9 && (if file_exists (p9 ++ "/.") then false else true)))
           | _ -> VBool false)
        // File.fnmatch?(pattern, path): the same matcher Dir.glob uses.
        else if (str_len name == 7 && str_eq name "fnmatch") || (str_len name == 8 && str_eq name "fnmatch?") then
@@ -10535,9 +10539,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // name has no dot, or begins with the only one (".bashrc").
        else if (str_len name == 7 && str_eq name "extname") then
          (match args with Cons (VStr ph, _) -> mkstr (extname_of (basename_of (sget ph))) | _ -> mkstr "")
+       // ⚠ 8.5 MILLISECONDS PER CALL, because `test -d` is a fork and an exec.
+       //   `File.exist?` is a native extern and answers instantly, and the two
+       //   sit next to each other in every path walk -- mspec's own mkdir_p
+       //   asks both for every component of every path, so core/dir's fixture
+       //   (fifty files, five components each) spent minutes in the shell and
+       //   the harness killed thirteen files on time. A directory is the one
+       //   thing for which "<path>/." also exists, which is a question the
+       //   native extern can answer: 2000 calls went 17.0s -> 0.0s.
        else if (str_len name == 10 && str_eq name "directory?") then
          (match args with
-          | Cons (VStr ph, _) -> VBool (run ("test -d " ++ shq (sget ph) ++ " 2> /dev/null") == 0)
+          // ⚠ ...and the EMPTY path is not a directory, though "/." is: the
+          //   trick appends, so "" would ask about the root.
+          | Cons (VStr ph, _) -> (let p9 = sget ph in
+                                  VBool (str_len p9 > 0 && file_exists (p9 ++ "/.")))
           | _ -> VBool false)
        // File.symlink(old, new): symlink(2), which answers 0 or -1.
        // ⚠ there is no errno reader here, so the failure is classified by
@@ -10642,7 +10657,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              if str_len p1 > 0 && str_eq (char_at p1 0) "/" then mkstr p1
              else mkstr ((match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") ++ "/" ++ p1))
           | _ -> mkstr "")
-       else if (str_len name == 4 && str_eq name "join") then mkstr (file_join_go args "")
+       // ⚠ File.join FLATTENS ARRAYS and collapses the separators at every
+       //   boundary. It did neither: an Array argument was stringified whole
+       //   (`File.join(d, ["x"])` gave `d/["x"]`, which is how thirteen
+       //   core/dir files failed -- their fixture builds its path that way),
+       //   `File.join("a/", "/b")` gave "a///b" where ruby gives "a/b", and an
+       //   empty piece left a doubled slash. A non-String is asked for
+       //   #to_path then #to_str, and refused by name if it has neither.
+       else if (str_len name == 4 && str_eq name "join") then
+         mkstr (file_join_parts (file_join_flat env world args (map_new ())) "")
        else if (str_len name == 11 && str_eq name "expand_path") then
          // File.expand_path(path[, base]): a relative path resolves against
          // base when given (that is how a library says "next to this file",
@@ -28409,6 +28432,61 @@ and math_conv_args = fn env -> fn world -> fn (xs: Val list) ->
 
 and list_iter_vals = fn (xs: Val list) -> fn (f: Val -> unit) ->
   match xs with Nil -> () | Cons (h, t) -> (let _ = f h in list_iter_vals t f)
+
+// the pieces of a File.join, flattened: an Array argument contributes its
+// elements (recursively), and anything that is not a String is asked for
+// #to_path and then #to_str. `seen` catches an array that contains itself,
+// which ruby reports rather than looping.
+and file_join_flat = fn env -> fn world -> fn (args: Val list) -> fn seen ->
+  match args with
+  | Nil -> (Nil : str list)
+  | Cons (v, rest) ->
+    let here = (match v with
+                | VStr h -> Cons (sget h, Nil)
+                | VArr aid ->
+                  (let k9 = str_of_int aid in
+                   if map_has seen k9 then
+                     (let _ = raise_exc world "ArgumentError" "recursive array" in (Nil : str list))
+                   else (let _ = map_set seen k9 1 in
+                         let inner = file_join_flat env world (deref aid) seen in
+                         let _ = map_delete seen k9 in inner))
+                | other ->
+                  (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                   if responds world other "to_path" then
+                     (match invoke_val_c env world nb9 other "to_path" Nil false with
+                      | VStr h9 -> Cons (sget h9, Nil)
+                      | _ -> Cons (to_s other, Nil))
+                   else if responds world other "to_str" then
+                     (match invoke_val_c env world nb9 other "to_str" Nil false with
+                      | VStr h9 -> Cons (sget h9, Nil)
+                      | _ -> Cons (to_s other, Nil))
+                   else (let _ = raise_exc world "TypeError"
+                           ("no implicit conversion of " ++ class_name other ++ " into String") in
+                         (Nil : str list)))) in
+    list_append_str here (file_join_flat env world rest seen)
+
+// ...and joined with exactly one separator between pieces: a trailing slash on
+// the left and a leading one on the right are the same separator, and an empty
+// piece contributes none of its own.
+// ⚠ the FIRST piece is taken as it is, and every later one is appended with
+//   exactly one separator. Testing "is the accumulator empty" instead of
+//   "is this the first piece" loses the leading slash of `File.join("", "tmp")`
+//   -- which is "/tmp" in ruby, and is exactly how mspec's own mkdir_p walks
+//   an absolute path apart and puts it back together.
+and file_join_parts = fn (ps: str list) -> fn (acc: str) ->
+  match ps with
+  | Nil -> acc
+  | Cons (p9, rest) -> file_join_parts_go rest p9
+
+and file_join_parts_go = fn (ps: str list) -> fn (acc: str) ->
+  match ps with
+  | Nil -> acc
+  | Cons (p9, rest) ->
+    let a9 = (if str_len acc > 0 && str_eq (char_at acc (str_len acc - 1)) "/"
+              then substring acc 0 (str_len acc - 1) else acc) in
+    let b9 = (if str_len p9 > 0 && str_eq (char_at p9 0) "/"
+              then substring p9 1 (str_len p9) else p9) in
+    file_join_parts_go rest (a9 ++ "/" ++ b9)
 
 and vis_names_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   let (meths0, _, _, _) = world in
