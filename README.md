@@ -10,8 +10,9 @@ reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
 to ruby 4.0.6 (`bench/csv.sh`).
 
 The milestones below (M0-M6) are how it was built. What it is measured by now
-is [ruby/spec](https://github.com/ruby/spec): **1530 of 2082 spec files**
-byte-identical to ruby 4.0.6, nothing crashing — see
+is [ruby/spec](https://github.com/ruby/spec): **1687 of 2498 spec files**
+byte-identical to ruby 4.0.6 — every `core` and `language` file the suite has,
+plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
 
 ```sh
@@ -450,51 +451,70 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2082 spec files** across 71 groups: **1530 MATCH, 526 DIFF,
-0 CRASH**, 16 SKIP, 10 SLOW, against ruby 4.0.6. Run with no directories, the
-sweep refreshes exactly the groups the table already has, so the numbers above
-are reproducible rather than a snapshot -- and every row of one table is
-measured by ONE build (`a/sweep_resume.sh` pins it and says so at the end).
+The record covers **2498 spec files** across 103 groups: **1687 MATCH, 750
+DIFF, 10 CRASH**, 32 SKIP, 19 SLOW, against ruby 4.0.6. Run with no
+directories, the sweep refreshes exactly the groups the table already has, so
+the numbers above are reproducible rather than a snapshot -- and every row of
+one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
+the end).
 
-⚠ **2082 is not all of ruby/spec** -- the suite has 3821 files, and the number
+**`core` and `language` are now measured in full**: 2133 of 2133 core files and
+80 of 80 language files, every directory the suite has, nested ones included.
+`library` is measured for the 16 libraries this ships: 285 of 1516.
+
+⚠ **2498 is not all of ruby/spec** -- the suite has 3821 files, and the number
 worth writing down is the one that says what is NOT being asked. Here are the
-other 1739, counted so that they add up:
+other 1323, counted so that they add up:
 
 | files | not measured | why |
 |---|---|---|
 | 1231 | `library/` outside the 16 groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before |
-| 293 | NESTED core dirs (`core/file/stat`, `core/enumerator/lazy`, `core/array/pack` and 23 more) | the scoreboard takes those group names; it was simply never given them |
-| 104 | `core/thread` 45, `core/process` 40, `core/tracepoint` 19 | next on the list. Nothing here says they cannot run -- they have not been swept |
 | 46 | `optional/capi` | out of scope: a C API, and this has no C extensions to answer it with |
 | 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
-| 13 | `language/regexp` 11, `language/predefined` 2 | nested, the same gap as the core dirs above |
 | 13 | `security` | CVE regressions; four of them need rubygems or optparse |
-| 6 | `core/marshal` | deferred on purpose: the CRASH the sweep recorded was the REFERENCE ruby's own message. Standalone it finishes 4 of 4, and a flaky row is not a measurement |
-| 1 | `optional/thread_safety` | one file, same reason as `core/thread` |
+| 1 | `optional/thread_safety` | one file; it needs the scheduling `core/thread` is still thin on |
 
 A percentage over a surface you chose is worth less than the list of what you
 left out, so the list is here and it adds to 3821.
 
-⚠ And the stdlib was out of scope for a reason that turned out to be the
-HARNESS: `run_spec.sh` clones core, language, shared and fixtures into the tree
-it runs in, and not library -- so all 1516 library files failed on BOTH sides
-with `cannot load such file`, and measuring them answered 0/1516. That is the
-instrument's answer, not the subject's. One word in a for-loop, and sixteen
-library groups have rows: `library/date` 60 of 98, `library/etc` 16 of 19,
-`library/pathname` 11 of 20.
+⚠ The last 416 of those were not hard to measure -- they were never ASKED.
+`run_spec.sh` clones core, language, shared and fixtures into the tree it runs
+in, and once it also cloned library, sixteen library groups had rows. The same
+kind of omission hid the rest: the scoreboard takes a nested group name like
+`core/file/stat` and turns it into a tag file, and it had simply never been
+given one. Adding 32 group names moved 416 files from "unknown" to measured,
+157 of them straight to MATCH (`core/process` was 26 of 40 the first time it
+was ever run), and it is why the headline MATCH went UP while the percentage
+went DOWN. Both are the honest direction.
 
-**Every file runs on both sides** (MATCH + DIFF): nothing aborts. So the gap is
-not "cannot", and a group score reads low for a reason worth naming rather than
-for breakage -- real programs (the corpus) match exactly while a value class
-scores low on an error message or a frozen-object check. ⚠ Three CRASH rows
-have appeared and gone since: every one was a NAMED MISSING LIBRARY (`fcntl`,
-`cgi`, `io/console`) that the file required on its fourth line, which the
-scoreboard reports as a crash because the process dies before it can report.
+⚠ **CRASH is 10, and it had been 0** -- because the surface that had never been
+measured is where the aborts were. Every one is named, and they are four roots:
+
+| files | root |
+|---|---|
+| 4 | `Enumerator::Lazy` is not lazy for `grep`, `grep_v`, `slice_before`, `uniq` and `zip`: it materialises the source, and an infinite one runs to 6-17 GB until `mspec/rss_guard.sh` kills it. Another 8 files in that group hit the time alarm for the same reason -- 29 of its 30 files fail |
+| 3 | a stack overflow (SIGSEGV in the stack region) in `core/marshal` dump/load and `core/thread` value: the recursion goes deeper than 512 MB of stack |
+| 2 | `\g<1>` (subexpression call by NUMBER) and `\k<-1>` / `\k<01>` (relative and zero-padded backrefs). The by-NAME spellings work; the numbered ones are not parsed, and a literal that the parser refuses takes the process down with it |
+| 1 | `Enumerator::Product` does not exist |
+
+⚠ These do NOT come from `run_spec.sh <one file>`, which prints DIFF for every
+one of them. That verdict answers "do the two outputs differ"; the scoreboard
+asks "did it run at all", and mere-ruby printed no tally where ruby ran eleven
+examples. When two instruments disagree, find out which question each is
+answering before believing the friendlier one.
+
+Elsewhere **every file runs on both sides** (MATCH + DIFF): the gap is not
+"cannot", and a group score reads low for a reason worth naming rather than for
+breakage -- real programs (the corpus) match exactly while a value class scores
+low on an error message or a frozen-object check. ⚠ Three earlier CRASH rows
+have appeared and gone: every one was a NAMED MISSING LIBRARY (`fcntl`, `cgi`,
+`io/console`) that the file required on its fourth line, which the scoreboard
+reports as a crash because the process dies before it can report.
 A whole group can carry a crash for a handful of integers.
 
 Naming the rest is what `CAUSES.md` is for. Grouped by cause, the DIFFs come
 down to a bounded number of **kinds**, and the largest single one is
-`NoMethodError` (186 files): a name that is not there, which is missing surface
+`NoMethodError` (265 files): a name that is not there, which is missing surface
 rather than wrong behaviour -- and it grew with the measured surface, because
 the groups added most recently (`core/io`, `core/time`, `library/stringio`) are
 the ones whose names are thinnest. The next-largest kinds are VALUE mismatches

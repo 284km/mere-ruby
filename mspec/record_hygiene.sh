@@ -156,11 +156,19 @@ else
   # ...and the other direction: a tag file no row claims. A group renamed or
   # dropped from the sweep leaves its old rows behind, and they then read as
   # current findings about an interpreter that has not been asked in months.
+  # ⚠ MAP THE ROW TO THE FILE, NOT THE FILE TO THE ROW. The tag basename is the
+  # group with "/" turned into "_", and that direction is NOT reversible: from
+  # "core_file_stat" you cannot tell whether the group was core/file/stat or
+  # core/file_stat. The first version guessed by replacing the FIRST underscore,
+  # which is right for "core_array" and wrong for every NESTED group -- so the
+  # day 26 of them were added, all 26 were reported as orphan records while
+  # their rows sat in the table. Deriving the expected basenames from the rows
+  # has one answer per row and needs no guess.
+  expected=$(sed -n 's/^| \([a-z][a-z_0-9/-]*\) |.*/\1/p' "$status" | tr '/' '_')
   orphan=$(for t in "$root"/mspec/tags/*.txt; do
              [ -e "$t" ] || continue
              b=$(basename "$t" .txt)
-             g=$(echo "$b" | sed 's|_|/|')
-             grep -aqE "^\| ($b|$g) \|" "$status" || echo "        $b.txt"
+             printf '%s\n' "$expected" | grep -qxF "$b" || echo "        $b.txt"
            done)
   if [ -n "$orphan" ]; then
     echo "ORPHAN  a record in mspec/tags/ has no row in SPEC_STATUS.md:"

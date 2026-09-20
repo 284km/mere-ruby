@@ -10,63 +10,96 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 526 files.
+Classified: 760 files.
 
-## DIFF — 526 files, 117 kinds
+## CRASH — 10 files, 5 kinds
 
 | files | kind |
 |---|---|
-| 186 | `ERROR NoMethodError` |
-| 46 | `ERROR NameError` |
-| 20 | `FAILED expected "S", got "S"` |
-| 19 | `FAILED expected N, got N` |
-| 17 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 14 | `FAILED expected true, got false` |
-| 11 | `FAILED expected ArgumentError to be raised` |
-| 10 | `FAILED expected truthy from #include?` |
-| 10 | `ERROR ArgumentError` |
-| 9 | `FAILED matcher did not match #<OBJ>` |
-| 9 | `FAILED expected TypeError to be raised` |
-| 8 | `FAILED expected false, got true` |
-| 7 | `FAILED expected to be identical` |
+| 4 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 3 | `stack overflow (recursion too deep)` |
+| 1 | `*.rb:N: uninitialized constant Enumerator::Product (NameError)` |
+| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group reference: N` |
+| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group name reference: N` |
+
+<details><summary>the same rows by exact cause (top 40)</summary>
+
+| files | cause |
+|---|---|
+| 4 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
+| 3 | `stack overflow (recursion too deep)` |
+| 1 | `*.rb:N: uninitialized constant Enumerator::Product (NameError)` |
+| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group reference: 1` |
+| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group name reference: -1` |
+
+</details>
+
+## DIFF — 750 files, 140 kinds
+
+| files | kind |
+|---|---|
+| 265 | `ERROR NoMethodError` |
+| 91 | `ERROR NameError` |
+| 34 | `FAILED expected "S", got "S"` |
+| 21 | `FAILED expected N, got N` |
+| 20 | `FAILED expected true, got false` |
+| 19 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 17 | `FAILED expected ArgumentError to be raised` |
+| 13 | `FAILED expected truthy from #include?` |
+| 12 | `FAILED expected TypeError to be raised` |
+| 11 | `FAILED expected to be identical` |
+| 11 | `ERROR ArgumentError` |
+| 10 | `FAILED matcher did not match #<OBJ>` |
+| 10 | `FAILED expected false, got true` |
+| 10 | `FAILED expected N, got nil` |
+| 7 | `pass=N fail=N err=N` |
 | 7 | `ERROR NotImplementedError` |
 | 6 | `FAILED expected falsy from #include?` |
-| 5 | `pass=N fail=N err=N` |
+| 6 | `FAILED expected NoMethodError to be raised` |
+| 6 | `ERROR SystemExit` |
+| 5 | `FAILED expected "S", got nil` |
+| 5 | `ERROR StandardError` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
 | 4 | `FAILED raised NoMethodError, expected ArgumentError` |
+| 4 | `FAILED expected SyntaxError to be raised` |
 | 4 | `FAILED expected RangeError to be raised` |
-| 4 | `FAILED expected NoMethodError to be raised` |
 | 4 | `FAILED expected NameError to be raised` |
 | 4 | `FAILED expected IOError to be raised` |
-| 4 | `FAILED expected "S", got nil` |
+| 4 | `FAILED expected "S" to match` |
 | 3 | `FAILED expected not to be identical` |
 | 3 | `FAILED expected false, got nil` |
 | 3 | `FAILED expected [:SYM, :SYM], got nil` |
-| 3 | `FAILED expected SyntaxError to be raised` |
+| 3 | `FAILED expected ["S"], got []` |
 | 3 | `FAILED expected Math::DomainError to be raised` |
 | 3 | `FAILED expected :SYM, got nil` |
-| 3 | `ERROR StandardError` |
+| 2 | `TMPDIR` |
 | 2 | `FAILED raised StandardError, expected FrozenError` |
+| 2 | `FAILED raised NoMethodError, expected FrozenError` |
+| 2 | `FAILED expected {...}, got {...}` |
 | 2 | `FAILED expected to receive #to_str` |
+| 2 | `FAILED expected nil, got "S"` |
+| 2 | `FAILED expected a Integer, got N` |
+| 2 | `FAILED expected [N, N, N, N], got [N, N, N, N]` |
 | 2 | `FAILED expected ThreadError to be raised` |
-| 2 | `FAILED expected N, got nil` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR TypeError` |
+| 2 | `ERROR Errno::ENOENT` |
 | 1 | `This is experimental warning.` |
-| 1 | `TMPDIR` |
 | 1 | `FAILED raised TypeError, expected ArgumentError` |
+| 1 | `FAILED raised ThreadError, expected ArgumentError` |
+| 1 | `FAILED raised NoMethodError, expected ThreadError` |
 | 1 | `FAILED raised NoMethodError, expected NotImplementedError` |
 | 1 | `FAILED raised NoMethodError, expected LocalJumpError` |
 | 1 | `FAILED raised NoMethodError, expected IOError` |
-| 1 | `FAILED raised NoMethodError, expected FrozenError` |
 | 1 | `FAILED raised NoMethodError, expected EOFError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED raised LoadError, expected NameError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
-| 1 | `FAILED expected {...}, got {...}` |
 | 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
+| 1 | `FAILED expected truthy from #const_defined?` |
+| 1 | `FAILED expected truthy from #>=` |
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected to receive #to_int` |
 | 1 | `FAILED expected to receive #to_a` |
@@ -74,32 +107,41 @@ Classified: 526 files.
 | 1 | `FAILED expected to receive #respond_to_missing?` |
 | 1 | `FAILED expected not true` |
 | 1 | `FAILED expected not N` |
-| 1 | `FAILED expected nil, got "S"` |
 | 1 | `FAILED expected nil to match` |
-| 1 | `FAILED expected a Integer, got N` |
 | 1 | `FAILED expected a Enumerable, got #<OBJ>` |
+| 1 | `FAILED expected [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [:SYM, :SYM], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N], [N, ...[clipped]` |
 | 1 | `FAILED expected [], got [N, N, N]` |
 | 1 | `FAILED expected [], got [:SYM]` |
+| 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got nil` |
 | 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
 | 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
 | 1 | `FAILED expected [[#<OBJ>, #<OBJ>], [#<OBJ>, #<OBJ>], [#<OBJ>, #<OBJ>]], got []` |
 | 1 | `FAILED expected [["S", "S", "S"], ["S", "S"]], got []` |
 | 1 | `FAILED expected [N], got [N]` |
+| 1 | `FAILED expected [N, nil, nil, N, nil, nil], got []` |
+| 1 | `FAILED expected [N, N], got [N, "S", N, "S", "S", nil, nil, nil]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
 | 1 | `FAILED expected [CoreClassSpecs::Inherited::D, #<OBJ>], got [#<OBJ>]` |
+| 1 | `FAILED expected [:SYM], got [:SYM, :SYM]` |
+| 1 | `FAILED expected [:SYM, N, :SYM, N, :SYM, N, :SYM, N], got []` |
 | 1 | `FAILED expected [:SYM, :SYM], got []` |
 | 1 | `FAILED expected [:SYM, :SYM], got [:SYM]` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM], got []` |
 | 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
 | 1 | `FAILED expected [#<OBJ>], got []` |
 | 1 | `FAILED expected [#<OBJ>, ModuleSpecs::Nesting, ModuleSpecs], got [#<OBJ>, ModuleSpecs::Nesting, ModuleSpecs]` |
+| 1 | `FAILED expected ["S"], got ["S"]` |
+| 1 | `FAILED expected ["S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S"], got ["S"]` |
+| 1 | `FAILED expected ["S", "S", "S", "S"], got []` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "su ...[clipped]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "sp ...[clipped]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "subdir_tw ...[clipped]` |
+| 1 | `FAILED expected [" def foo` |
 | 1 | `FAILED expected SystemCallError to be raised` |
 | 1 | `FAILED expected RuntimeError to be raised` |
 | 1 | `FAILED expected N, got Infinity` |
@@ -110,74 +152,77 @@ Classified: 526 files.
 | 1 | `FAILED expected #<UnboundMethod: StringIO#length() TMPDIR got #<UnboundMethod: StringIO#size() TMPDIR` |
 | 1 | `FAILED expected #<UnboundMethod: StringIO#each_line(sep=...) TMPDIR got #<UnboundMethod: StringIO#each(sep=..., &block) TMPDIR` |
 | 1 | `FAILED expected #<UnboundMethod: Pathname#+(other) TMPDIR got #<UnboundMethod: Pathname#/(other) TMPDIR` |
+| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#size() TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#length() TMPDIR` |
+| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#include?(k) TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#member?(k) TMPDIR` |
+| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#include?(k) TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#key?(k) TMPDIR` |
+| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#each(&b) TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#each_pair(&b) TMPDIR` |
 | 1 | `FAILED expected #<UnboundMethod: Dir#to_path() TMPDIR got #<UnboundMethod: Dir#path() TMPDIR` |
 | 1 | `FAILED expected #<OBJ>, got #<UnboundMethod: StringIO#tell() TMPDIR` |
 | 1 | `FAILED expected #<OBJ>, got "S"` |
 | 1 | `FAILED expected #<Method: Time.xmlschema(str) TMPDIR got #<Method: Time.isoN(str) TMPDIR` |
 | 1 | `FAILED expected #<Method: Time.rfcN(str) TMPDIR got #<Method: Time.rfcN(str) TMPDIR` |
 | 1 | `FAILED expected "x\xNCN\xN` |
+| 1 | `FAILED expected "TMPDIR got nil` |
 | 1 | `FAILED expected "TMPDIR` |
 | 1 | `FAILED expected "S"km\"S", got "S"km\"S"` |
 | 1 | `FAILED expected "S"abcde\"S", got "S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got N` |
-| 1 | `FAILED expected "S" to match` |
 | 1 | `FAILED expected "NMLJNI\xND$` |
 | 1 | `FAILED expected "Another Test!` |
+| 1 | `FAILED expected "(N&!ANF-DN` |
 | 1 | `FAILED expected "` |
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `ERROR fatal` |
 | 1 | `ERROR SystemStackError` |
-| 1 | `ERROR SystemExit` |
 | 1 | `ERROR SignalException` |
 | 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
-| 1 | `ERROR Errno::ENOENT` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 11 | `FAILED: expected ArgumentError to be raised` |
-| 9 | `FAILED: expected TypeError to be raised` |
+| 17 | `FAILED: expected ArgumentError to be raised` |
+| 12 | `FAILED: expected TypeError to be raised` |
+| 6 | `FAILED: expected NoMethodError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
 | 4 | `FAILED: raised NoMethodError, expected ArgumentError` |
+| 4 | `FAILED: is a private method: expected truthy from #include?` |
+| 4 | `FAILED: expected SyntaxError to be raised` |
 | 4 | `FAILED: expected RangeError to be raised` |
-| 4 | `FAILED: expected NoMethodError to be raised` |
 | 4 | `FAILED: expected NameError to be raised` |
 | 4 | `FAILED: expected IOError to be raised` |
 | 3 | `FAILED: is not defined: expected falsy from #include?` |
 | 3 | `FAILED: includes Enumerable: expected true, got false` |
-| 3 | `FAILED: expected SyntaxError to be raised` |
 | 3 | `FAILED: expected Math::DomainError to be raised` |
+| 2 | `pass=7 fail=0 err=0` |
+| 2 | `TMPDIR` |
 | 2 | `FAILED: uses the passed Object as the StringIO backend: expected to be identical` |
+| 2 | `FAILED: round-trips a string through pack and unpack: expected ["hello"], got []` |
 | 2 | `FAILED: returns the day of the reform if date falls within calendar reform: expected #<Date: 1582-10-04>, got #<Date: 1582-10-09>` |
 | 2 | `FAILED: returns a US_ASCII encoded string: expected #<Encoding:US-ASCII>, got #<Encoding:BINARY (ASCII-8BIT)>` |
 | 2 | `FAILED: raised StandardError, expected FrozenError` |
+| 2 | `FAILED: raised NoMethodError, expected FrozenError` |
 | 2 | `FAILED: is a public method: expected truthy from #include?` |
-| 2 | `FAILED: is a private method: expected truthy from #include?` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
+| 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected true, got false` |
+| 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 49, got nil` |
+| 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 1, got nil` |
+| 2 | `FAILED: calls supplied block if the key is not found: expected 5, got nil` |
+| 2 | `FAILED: calls #to_str to convert an Object to a String: expected "abcdef", got ""` |
+| 2 | `ERROR: for a child that exited normally returns true: SystemExit` |
+| 2 | `ERROR: Encoding::UndefinedConversionError#source_encoding_name returns a String: NoMethodError` |
 | 1 | `pass=3 fail=0 err=0` |
 | 1 | `pass=24 fail=1 err=0` |
 | 1 | `pass=2 fail=0 err=0` |
 | 1 | `pass=19 fail=0 err=0` |
 | 1 | `pass=16 fail=0 err=0` |
 | 1 | `This is experimental warning.` |
-| 1 | `TMPDIR` |
 | 1 | `FAILED: yields each directory entry in succession: expected [".", "..", ".dotfile", ".dotsubdir", "brace", "deeply", "dir", "dir_filename_ordering", "file_one.ext", "file_two.ext", "nested", "nondotfile", "special", "subdir_one", "subdir_tw ...[clipped]` |
 | 1 | `FAILED: writes the passed char before the current position: expected "A234", got "1234"` |
 | 1 | `FAILED: writes the passed argument onto self: expected "just testing", got "examplejust testing"` |
-| 1 | `FAILED: writes $_.to_s followed by $\ (if any) to the stream if no arguments given: expected "mockmockmock->", got ""` |
-| 1 | `FAILED: wraps the lock/unlock pair in an ensure: expected true, got false` |
-| 1 | `FAILED: works when creating subclasses concurrently: expected 16000, got 0` |
-| 1 | `FAILED: with a relative path: expected #<Pathname:/foo>, got #<Pathname:/usr/../foo>` |
-| 1 | `FAILED: will not acquire a monitor already held by another thread: expected false, got true` |
-| 1 | `FAILED: warns when passing a block argument to a method that never uses it: matcher did not match #<Proc>` |
-| 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
-| 1 | `FAILED: uses the block value instead of using the default value: matcher did not match #<Proc>` |
-| 1 | `FAILED: updates $. with each yield: expected 1, got 0` |
-| 1 | `FAILED: unlocks the mutex while sleeping: expected false, got true` |
 
 </details>
 
@@ -193,34 +238,50 @@ class column says where the weight sits.
 | date (34) | `accessor add_month add asctime boat commercial constants conversions ctime deconstruct_keys downto eql gregorian_leap gregorian hash infinity iso8601 jd julian_leap julian minus_month minus ordinal plus relationship rfc3339 step strftime upto valid_civil valid_commercial valid_date valid_jd valid_ordinal` |
 | time (29) | `_dump asctime at ceil ctime deconstruct_keys dup floor getgm gm gmt_offset gmt gmtime gmtoff isdst iso8601 mday mktime mon nsec round strftime subsec to_r tv_nsec tv_sec tv_usec xmlschema zone` |
 | stringio (24) | `binmode close_read close_write closed_read closed closed_write each_byte each_char each_codepoint eof fsync getbyte lineno pid putc read_nonblock readbyte readchar reopen rewind seek set_encoding_by_bom ungetbyte write_nonblock` |
+| buffer (21) | `and empty external for free initialize internal locked map mapped not null or private readonly resize shared string transfer valid xor` |
 | file (20) | `absolute_path atime chmod constants ctime flock grpowned initialize mtime new owned pipe rename reopen setuid socket truncate umask world_readable world_writable` |
 | io (19) | `binmode close_read close close_write copy_stream dup fsync pid popen pos pread pwrite readbyte stat sysopen sysread syswrite tell to_i` |
+| process (17) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall waitpid2 waitpid warmup` |
+| thread (15) | `backtrace_locations backtrace current each_caller_location exit fetch fork handle_interrupt ignore_deadlock inspect keys pending_interrupt raise terminate thread_variables` |
+| stat (14) | `atime comparison ctime dev ftype gid inspect mode mtime new owned pipe rdev uid` |
 | module (14) | `alias_method const_defined const_missing const_set const_source_location deprecate_constant included initialize module_exec name public_instance_method refine remove_class_variable remove_const` |
+| lazy (13) | `collect_concat collect compact drop drop_while eager filter find_all map reject select take take_while` |
+| converter (12) | `asciicompat_encoding convert convpath destination_encoding finish last_error new primitive_errinfo putback replacement search_convpath source_encoding` |
 | kernel (9) | `autoload binding chomp chop open select singleton_class system test` |
 | fiber (9) | `alive blocking current kill new resume storage transfer yield` |
+| invalid_byte_sequence_error (7) | `destination_encoding_name destination_encoding error_bytes incomplete_input readagain_bytes source_encoding_name source_encoding` |
 | gc (7) | `auto_compact config count garbage_collect measure_total_time stat total_time` |
 | enumerator (7) | `each each_with_object feed initialize new product with_object` |
 | encoding (7) | `aliases compatible find list name_list names to_s` |
 | argf (7) | `argv each eof path tell to_a to_i` |
 | dir (6) | `delete empty fileno foreach pos tell` |
 | yaml (5) | `dump load_file parse_file parse to_yaml` |
+| undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
+| profiler (5) | `disable enable enabled result total_time` |
+| product (5) | `initialize_copy initialize inspect rewind size` |
+| tms (4) | `cstime cutime stime utime` |
 | pathname (4) | `case_compare empty glob realdirpath` |
 | binding (4) | `implicit_parameter_defined implicit_parameter_get implicit_parameters source_location` |
 | securerandom (3) | `base64 hex random_bytes` |
 | objectspace (3) | `_id2ref each_object garbage_collect` |
 | warning (2) | `categories warn` |
+| regexp (2) | `timeout escapes` |
 | refinement (2) | `import_methods target` |
 | random (2) | `equal_value urandom` |
 | filetest (2) | `grpowned socket` |
 | etc (2) | `sysconfdir uname` |
 | zlib (1) | `zlib_version` |
+| weakkeymap (1) | `clear` |
 | unboundmethod (1) | `super_method` |
+| tracepoint (1) | `trace` |
 | tempfile (1) | `initialize` |
-| regexp (1) | `timeout` |
+| status (1) | `wait` |
 | proc (1) | `new` |
 | monitor (1) | `synchronize` |
 | method (1) | `super_method` |
+| marshal (1) | `restore` |
 | main (1) | `define_method` |
+| location (1) | `base_label` |
 | language (1) | `module` |
 | enumerable (1) | `to_h` |
 | class (1) | `allocate` |

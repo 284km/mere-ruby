@@ -2990,3 +2990,42 @@ which is not decoration: `BasicObject` does not include it, and
 `[1,2].sample(random: BasicObject.new)` must raise NoMethodError for `#rand`.
 Without that test the route answered for every receiver and took two recorded
 rows with it.
+
+## The four roots behind the record's ten CRASH rows
+
+Measured 2026-09-20, when `core` and `language` were swept in full for the
+first time. A CRASH row means mere-ruby printed no tally at all where ruby ran
+the file's examples -- the process died, so the other examples in that file
+were never asked either.
+
+### `Enumerator::Lazy` is not lazy (4 CRASH, 8 SLOW, 17 DIFF -- 29 of 30 files)
+
+`lazy.grep`, `grep_v`, `slice_before`, `uniq` and `zip` materialise their
+source instead of pulling from it. Against `(1..Float::INFINITY).lazy` that is
+an allocation loop: the five files reach 6-17 GB before `mspec/rss_guard.sh`
+kills them, and eight more hit the time alarm for the same reason. `map`,
+`select` and `first` are lazy, which is why exactly one file in the group
+passes. This is the single largest named gap in the record.
+
+### A stack overflow, not an exception (3 CRASH)
+
+`core/marshal` dump/load and `core/thread` value die with SIGSEGV inside the
+stack region -- reported as "stack overflow (recursion too deep)" by the Mere
+runtime's own handler, which knows the real bounds. The binary is linked with
+`-stack_size 0x20000000` (512 MB), so this is a recursion that goes deeper than
+512 MB and not a small-stack problem. ⚠ Ruby answers deep recursion with
+`SystemStackError`, which a spec can rescue; a SIGSEGV takes the file with it.
+
+### Numbered backreferences and subexpression calls (2 CRASH)
+
+The by-NAME spellings work: `\k<name>` and `\g<name>` both parse, and `\g` is
+inlined rather than called (see the comment at `rxp_esc`). The NUMBERED ones do
+not: `\g<1>`, `\k<-1>` (relative) and `\k<01>` (zero-padded) all reach the
+"undefined group reference" arm, which `fail`s. ⚠ `Regexp.new` turns that into
+a RegexpError correctly -- it is the LITERAL path that takes the process down,
+so one unsupported literal costs a whole file. ruby accepts all three.
+
+### `Enumerator::Product` does not exist (1 CRASH)
+
+`Enumerator::Product` is the class `Enumerator.product` returns (ruby 3.2).
+The constant is absent, so the file dies on line 2.
