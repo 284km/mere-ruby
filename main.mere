@@ -9839,7 +9839,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   else if ((str_len name == 8 && str_eq name "enum_for") || (str_len name == 7 && str_eq name "to_enum"))
           && (match recv with
               | VObj oid3 -> (let (m9, s9, o9, i9) = world in
-                              if has_meth world (map_get o9 oid3) name then false else true)
+                              // ⚠ Enumerator::Lazy answers `to_enum` ITSELF, with a
+                              //   new Lazy over the same pipeline. This arm is 3700
+                              //   lines above that one and was answering first, which
+                              //   made the Lazy arm UNREACHABLE and handed back a
+                              //   plain Enumerator -- so `(1..Float::INFINITY).lazy
+                              //   .to_enum.first(3)` materialised an infinite source.
+                              if str_eq (map_get o9 oid3) "Enumerator::Lazy"
+                                 && (match args with Nil -> true | _ -> false) then false
+                              else if has_meth world (map_get o9 oid3) name then false else true)
               | _ -> true) then
     (match args with
      | Cons (VSym m, rest) -> make_enum_a world recv m rest
@@ -13530,7 +13538,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else invoke_val_c env world blk (mkhash (env_hash_list ())) name args false)
     // Enumerator::Lazy surface without a block: take/drop extend the pipeline,
     // first/to_a/force run it (bounded), eager materializes.
-    else if str_eq cls "Enumerator::Lazy" then
+    // ⚠ GUARD THE ARM WITH THE NAMES IT IMPLEMENTS. Entering on the class alone
+    //   made this a wall: the chain ends in `raise NoMethodError`, so every name
+    //   Object answers -- equal?, frozen?, tap, instance_variable_get -- died
+    //   here instead of reaching the generic arms below. `lazy.to_enum.equal?(l)`
+    //   is in the spec, and a Lazy could not answer it.
+    else if str_eq cls "Enumerator::Lazy" && (if is_enum_method name then true else lz_pipe_name name) then
       (if (str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop") then
          (match args with
           | Cons (VInt n, _) -> lz_extend world id name (VInt n)
@@ -13541,9 +13554,34 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | _ -> (match lz_run env world blk id 1 VNil with
                   | VArr aid -> val_nth (deref aid) 0
                   | _ -> VNil))
+       // ⚠ these EXTEND the pipeline; without them the chain below runs the
+       //   whole source first, which never returns for an infinite one.
+       else if (str_len name == 4 && str_eq name "grep") || (str_len name == 6 && str_eq name "grep_v") then
+         (match args with
+          | Cons (pat, _) -> lz_extend world id name (arr_new (Cons (pat, Cons (VNil, Nil))))
+          | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
+       else if (str_len name == 4 && str_eq name "uniq") then lz_extend world id "uniq" VNil
+       else if (str_len name == 7 && str_eq name "compact") then lz_extend world id "compact" VNil
+       else if (str_len name == 10 && str_eq name "with_index") || (str_len name == 15 && str_eq name "each_with_index") then
+         (let off = (match args with Cons (VInt o9, _) -> o9 | _ -> 0) in
+          lz_extend world id "with_index" (arr_new (Cons (VInt off, Cons (VNil, Nil)))))
+       // ⚠ ARRAY arguments only. ruby pulls from any enumerable here, and the
+       //   order it pulls them in is observable; rather than guess at that,
+       //   anything else falls through to the materialising path it used to
+       //   take, which is wrong only in the ways it was already wrong.
+       else if (str_len name == 3 && str_eq name "zip") && lz_all_arrays args then
+         lz_extend world id "zip" (arr_new args)
        else if (str_len name == 4 && str_eq name "to_a") || (str_len name == 5 && str_eq name "force") then lz_run env world blk id (0 - 1) VNil
        else if (str_len name == 5 && str_eq name "eager") then make_enum world (lz_run env world blk id (0 - 1) VNil) "each"
        else if (str_len name == 4 && str_eq name "lazy") then recv
+       // ⚠ a NEW Lazy over the same source and the same pipeline -- the spec
+       //   asks for `instance_of?(Enumerator::Lazy)` AND `should_not.equal?`
+       //   the receiver, so returning self is the wrong answer twice over.
+       //   Only the no-argument form: `to_enum(:each_slice, 2)` names a method
+       //   this pipeline does not carry, and would materialise the source.
+       else if ((str_len name == 7 && str_eq name "to_enum") || (str_len name == 8 && str_eq name "enum_for"))
+               && (match args with Nil -> true | _ -> false) then
+         mk_lazy world (lz_src world id) (lz_ops world id)
        else if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") then mkstr "#<Enumerator::Lazy>"
        else if is_enum_method name then
          invoke_val_c env world blk (lz_run env world blk id (0 - 1) VNil) name args vischeck
@@ -15979,7 +16017,27 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "Enumerator::Lazy") | _ -> false) then
       (match recv with
        | VObj id ->
-         (if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") || (str_len name == 6 && str_eq name "select") || (str_len name == 6 && str_eq name "filter") ||
+         (if (str_len name == 4 && str_eq name "grep") || (str_len name == 6 && str_eq name "grep_v") then
+            (match args with
+             | Cons (pat, _) ->
+               (let pid = map_len proc_store in
+                let _ = store_proc (str_of_int pid) newblk in
+                lz_extend world id name (arr_new (Cons (pat, Cons (VProc pid, Nil)))))
+             | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
+          else if (str_len name == 4 && str_eq name "uniq") then
+            (let pid = map_len proc_store in
+             let _ = store_proc (str_of_int pid) newblk in
+             lz_extend world id "uniq" (VProc pid))
+          else if (str_len name == 8 && str_eq name "flat_map") || (str_len name == 14 && str_eq name "collect_concat") then
+            (let pid = map_len proc_store in
+             let _ = store_proc (str_of_int pid) newblk in
+             lz_extend world id "flat_map" (VProc pid))
+          else if (str_len name == 10 && str_eq name "with_index") || (str_len name == 15 && str_eq name "each_with_index") then
+            (let off = (match args with Cons (VInt o9, _) -> o9 | _ -> 0) in
+             let pid = map_len proc_store in
+             let _ = store_proc (str_of_int pid) newblk in
+             lz_extend world id "with_index" (arr_new (Cons (VInt off, Cons (VProc pid, Nil)))))
+          else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") || (str_len name == 6 && str_eq name "select") || (str_len name == 6 && str_eq name "filter") ||
              (str_len name == 8 && str_eq name "find_all") || (str_len name == 6 && str_eq name "reject") || (str_len name == 10 && str_eq name "filter_map") ||
              (str_len name == 10 && str_eq name "take_while") || (str_len name == 10 && str_eq name "drop_while") then
             (let pid = map_len proc_store in
@@ -26637,7 +26695,117 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
        let c = (match (if map_has ivars0 ck then map_get ivars0 ck else VNil) with VInt cn -> cn | _ -> 0) in
        if c < n then (let _ = map_set ivars0 ck (VInt (c + 1)) in VNil)
        else lz_step_ops env world blk did rest (i + 1) v)
+    // ⚠ EVERY operator missing from this chain used to fall through to the
+    //   dispatcher's `lz_run ... (0-1)`, which runs the pipeline to the END
+    //   first. Against `(1..Float::INFINITY).lazy` that is an allocation loop:
+    //   grep_v, uniq, with_index and slice_before reached 6-17 GB and were
+    //   killed, and chunk, grep, zip and four more hit the time alarm. The
+    //   semantics below were measured against ruby 4.0.6, not assumed.
+    else if str_eq kind "grep" || str_eq kind "grep_v" then
+      (let (pat, gfn) = (match payload with
+                         | VArr gaid -> (match deref gaid with
+                                         | Cons (p9, Cons (f9, _)) -> (p9, f9)
+                                         | _ -> (VNil, VNil))
+                         | _ -> (VNil, VNil)) in
+       let hit = case_eqq world pat v in
+       if (if str_eq kind "grep" then hit else (if hit then false else true)) then
+         (let out = (match gfn with
+                     | VProc gpid -> flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (v, Nil)))
+                     | _ -> v) in
+          lz_step_ops env world blk did rest (i + 1) out)
+       else VNil)
+    // ⚠ the block makes the KEY, and the ORIGINAL is what flows on:
+    //   `[3,1,3,2,nil,1].lazy.uniq { |x| x.to_s }.force` is [3,1,2,nil].
+    else if str_eq kind "uniq" then
+      (let sk = str_of_int did ++ "@__uq" ++ str_of_int i in
+       let sv = (if map_has ivars0 sk then map_get ivars0 sk
+                 else (let a9 = arr_new Nil in let _ = map_set ivars0 sk a9 in a9)) in
+       let key = (match payload with
+                  | VProc upid -> flow_value (run_block world blk (map_get proc_store (str_of_int upid)) (Cons (v, Nil)))
+                  | _ -> v) in
+       (match sv with
+        | VArr said ->
+          (if lz_seen (deref said) key then VNil
+           else (let _ = arr_set said (list_append (deref said) (Cons (key, Nil))) in
+                 lz_step_ops env world blk did rest (i + 1) v))
+        | _ -> lz_step_ops env world blk did rest (i + 1) v))
+    else if str_eq kind "compact" then
+      (match v with VNil -> VNil | _ -> lz_step_ops env world blk did rest (i + 1) v)
+    // an Array return is SPLICED, anything else passes through as one element.
+    else if str_eq kind "flat_map" then
+      (let r = callp v in
+       (match r with
+        | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
+        | _ -> lz_step_ops env world blk did rest (i + 1) r))
+    // ⚠ with a block, the block runs and the ORIGINAL element flows on:
+    //   `inf.with_index { |x, i| 99 }.first(3)` is [1,2,3], not [99,99,99].
+    else if str_eq kind "with_index" then
+      (let (off, wfn) = (match payload with
+                         | VArr waid -> (match deref waid with
+                                         | Cons (VInt o9, Cons (f9, _)) -> (o9, f9)
+                                         | _ -> (0, VNil))
+                         | _ -> (0, VNil)) in
+       let ck = str_of_int did ++ "@__wi" ++ str_of_int i in
+       let c = (match (if map_has ivars0 ck then map_get ivars0 ck else VNil) with VInt cn -> cn | _ -> 0) in
+       let _ = map_set ivars0 ck (VInt (c + 1)) in
+       (match wfn with
+        | VProc wpid ->
+          (let _ = flow_value (run_block world blk (map_get proc_store (str_of_int wpid)) (Cons (v, Cons (VInt (off + c), Nil)))) in
+           lz_step_ops env world blk did rest (i + 1) v)
+        | _ -> lz_step_ops env world blk did rest (i + 1) (arr_new (Cons (v, Cons (VInt (off + c), Nil))))))
+    // a SHORT argument pads with nil, which is why the row is built by index
+    // rather than by walking the arguments together.
+    else if str_eq kind "zip" then
+      (let others = (match payload with VArr zaid -> deref zaid | _ -> Nil) in
+       let ck = str_of_int did ++ "@__zp" ++ str_of_int i in
+       let c = (match (if map_has ivars0 ck then map_get ivars0 ck else VNil) with VInt cn -> cn | _ -> 0) in
+       let _ = map_set ivars0 ck (VInt (c + 1)) in
+       lz_step_ops env world blk did rest (i + 1) (arr_new (Cons (v, lz_zip_row others c))))
     else lz_step_ops env world blk did rest (i + 1) v
+
+// has this value already been emitted by a lazy `uniq`? ruby dedupes with
+// eql?/hash, which for these purposes is rb_eql over the keys kept so far.
+and lz_seen = fn (xs: Val list) -> fn (k: Val) ->
+  match xs with
+  | Nil -> false
+  | Cons (x, t) -> if rb_eql x k then true else lz_seen t k
+
+// push each element of a spliced array on through the REST of the pipeline.
+and lz_emit_each = fn env -> fn world -> fn blk -> fn (did: int) -> fn (rest: Val list) -> fn (i: int) -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> VNil
+  | Cons (x, t) -> (let _ = lz_step_ops env world blk did rest i x in lz_emit_each env world blk did rest i t)
+
+// the names the Enumerator::Lazy arm implements, which is also the list that
+// decides whether it answers at all (see the guard). Anything not here and not
+// an enumerable name belongs to Object, not to Lazy.
+and lz_pipe_name = fn (name: str) ->
+  (str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop") ||
+  (str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "to_a") ||
+  (str_len name == 5 && str_eq name "force") || (str_len name == 5 && str_eq name "eager") ||
+  (str_len name == 4 && str_eq name "lazy") || (str_len name == 7 && str_eq name "inspect") ||
+  (str_len name == 4 && str_eq name "to_s") || (str_len name == 4 && str_eq name "grep") ||
+  (str_len name == 6 && str_eq name "grep_v") || (str_len name == 4 && str_eq name "uniq") ||
+  (str_len name == 7 && str_eq name "compact") || (str_len name == 10 && str_eq name "with_index") ||
+  (str_len name == 15 && str_eq name "each_with_index") || (str_len name == 3 && str_eq name "zip") ||
+  (str_len name == 7 && str_eq name "to_enum") || (str_len name == 8 && str_eq name "enum_for")
+
+// every argument an Array? the lazy zip only claims the case it can answer
+// without deciding the pull order of an arbitrary enumerable.
+and lz_all_arrays = fn (xs: Val list) ->
+  match xs with
+  | Nil -> true
+  | Cons (x, t) -> (match x with VArr _ -> lz_all_arrays t | _ -> false)
+
+// one zip row's tail: the idx'th element of each argument, nil past its end.
+and lz_zip_row = fn (others: Val list) -> fn (idx: int) ->
+  match others with
+  | Nil -> Nil
+  | Cons (o, t) ->
+    (let e = (match o with
+              | VArr oaid -> (if idx < val_list_len (deref oaid) then val_nth (deref oaid) idx else VNil)
+              | _ -> VNil) in
+     Cons (e, lz_zip_row t idx))
 
 // an Enumerator::Chain over a list of sources (each must respond to #each).
 // materialize a chain: drive each source's #each into one collector.

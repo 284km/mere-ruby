@@ -2998,14 +2998,38 @@ first time. A CRASH row means mere-ruby printed no tally at all where ruby ran
 the file's examples -- the process died, so the other examples in that file
 were never asked either.
 
-### `Enumerator::Lazy` is not lazy (4 CRASH, 8 SLOW, 17 DIFF -- 29 of 30 files)
+### `Enumerator::Lazy` materialises for the buffering operators (4 CRASH, 3 SLOW)
 
-`lazy.grep`, `grep_v`, `slice_before`, `uniq` and `zip` materialise their
-source instead of pulling from it. Against `(1..Float::INFINITY).lazy` that is
-an allocation loop: the five files reach 6-17 GB before `mspec/rss_guard.sh`
-kills them, and eight more hit the time alarm for the same reason. `map`,
-`select` and `first` are lazy, which is why exactly one file in the group
-passes. This is the single largest named gap in the record.
+The pipeline keeps a list of ops and pushes ONE element through it at a time.
+Every operator missing from that list fell through to `lz_run ... (-1)`, which
+runs the source to the end first -- against `(1..Float::INFINITY).lazy` an
+allocation loop that reached 6-17 GB before `mspec/rss_guard.sh` killed it.
+`grep`, `grep_v`, `uniq`, `compact`, `flat_map`/`collect_concat`, `with_index`,
+`each_with_index`, `zip` over Arrays and the no-argument `to_enum` are lazy
+now, all measured against the reference and held by corpus/206.
+
+⚠ Two of those are counter-intuitive, and both were nearly written backwards:
+`uniq { blk }` dedupes by the BLOCK's value and emits the ORIGINAL, and
+`with_index { blk }` runs the block and emits the ORIGINAL -- so
+`inf.with_index { 99 }.first(3)` is `[1, 2, 3]`, not `[99, 99, 99]`.
+
+What still materialises, and why it is a different shape of work:
+
+| operator | why |
+|---|---|
+| `chunk`, `chunk_while`, `slice_before`, `slice_after`, `slice_when` | they emit a GROUP at a boundary, so they hold a buffer and must flush it when the source ends. `lz_run` has no hook there: it drives `each` and returns |
+| `to_enum(:m, ...)` | naming a method means running THAT method lazily. `to_enum(:each_slice, 2)` needs a lazy `each_slice`, which the pipeline has no kind for |
+| `zip` over a non-Array | ruby pulls from any enumerable, and the ORDER it pulls in is observable (the spec checks it). Claiming Arrays only is a refusal that names what it refused |
+
+⚠ And the arm is guarded by the names it implements, not by the class. Entering
+on the class alone made it a wall: the chain ends in `raise NoMethodError`, so
+`equal?`, `frozen?` and `tap` died there instead of reaching Object's own arms.
+`lazy.to_enum.equal?(l)` is in the spec, and a Lazy could not answer it.
+
+⚠ The group is still 1 of 30. Five files moved from "hangs" to "runs and
+disagrees", which is the honest half of the work; what blocks the rest is
+`Enumerator::Lazy.new(obj, size) { }` (absent) and `Lazy#size` (absent), which
+most of those files ask for in their first example.
 
 ### A stack overflow, not an exception (3 CRASH)
 

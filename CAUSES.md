@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 760 files.
+Classified: 767 files.
 
 ## CRASH — 10 files, 5 kinds
 
@@ -34,23 +34,23 @@ Classified: 760 files.
 
 </details>
 
-## DIFF — 750 files, 140 kinds
+## DIFF — 757 files, 140 kinds
 
 | files | kind |
 |---|---|
-| 265 | `ERROR NoMethodError` |
-| 91 | `ERROR NameError` |
+| 268 | `ERROR NoMethodError` |
+| 93 | `ERROR NameError` |
 | 34 | `FAILED expected "S", got "S"` |
 | 21 | `FAILED expected N, got N` |
 | 20 | `FAILED expected true, got false` |
 | 19 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 17 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected truthy from #include?` |
-| 12 | `FAILED expected TypeError to be raised` |
+| 13 | `FAILED expected TypeError to be raised` |
 | 11 | `FAILED expected to be identical` |
+| 11 | `FAILED expected false, got true` |
 | 11 | `ERROR ArgumentError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
-| 10 | `FAILED expected false, got true` |
 | 10 | `FAILED expected N, got nil` |
 | 7 | `pass=N fail=N err=N` |
 | 7 | `ERROR NotImplementedError` |
@@ -184,7 +184,7 @@ Classified: 760 files.
 | files | cause |
 |---|---|
 | 17 | `FAILED: expected ArgumentError to be raised` |
-| 12 | `FAILED: expected TypeError to be raised` |
+| 13 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected NoMethodError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
 | 4 | `FAILED: raised NoMethodError, expected ArgumentError` |
@@ -242,10 +242,10 @@ class column says where the weight sits.
 | file (20) | `absolute_path atime chmod constants ctime flock grpowned initialize mtime new owned pipe rename reopen setuid socket truncate umask world_readable world_writable` |
 | io (19) | `binmode close_read close close_write copy_stream dup fsync pid popen pos pread pwrite readbyte stat sysopen sysread syswrite tell to_i` |
 | process (17) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall waitpid2 waitpid warmup` |
+| lazy (17) | `collect_concat collect compact drop drop_while eager filter find_all flat_map grep grep_v map reject select take take_while uniq` |
 | thread (15) | `backtrace_locations backtrace current each_caller_location exit fetch fork handle_interrupt ignore_deadlock inspect keys pending_interrupt raise terminate thread_variables` |
 | stat (14) | `atime comparison ctime dev ftype gid inspect mode mtime new owned pipe rdev uid` |
 | module (14) | `alias_method const_defined const_missing const_set const_source_location deprecate_constant included initialize module_exec name public_instance_method refine remove_class_variable remove_const` |
-| lazy (13) | `collect_concat collect compact drop drop_while eager filter find_all map reject select take take_while` |
 | converter (12) | `asciicompat_encoding convert convpath destination_encoding finish last_error new primitive_errinfo putback replacement search_convpath source_encoding` |
 | kernel (9) | `autoload binding chomp chop open select singleton_class system test` |
 | fiber (9) | `alive blocking current kill new resume storage transfer yield` |
@@ -253,8 +253,8 @@ class column says where the weight sits.
 | gc (7) | `auto_compact config count garbage_collect measure_total_time stat total_time` |
 | enumerator (7) | `each each_with_object feed initialize new product with_object` |
 | encoding (7) | `aliases compatible find list name_list names to_s` |
+| dir (7) | `delete each_child empty fileno foreach pos tell` |
 | argf (7) | `argv each eof path tell to_a to_i` |
-| dir (6) | `delete empty fileno foreach pos tell` |
 | yaml (5) | `dump load_file parse_file parse to_yaml` |
 | undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
 | profiler (5) | `disable enable enabled result total_time` |

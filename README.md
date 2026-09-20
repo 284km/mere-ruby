@@ -117,7 +117,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 208 programs, byte-for-byte
+./run_corpus.sh                                  # 209 programs, byte-for-byte
                                                  # (and eight SOURCE gates, see tools/)
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
@@ -423,8 +423,8 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **208 programs,
-208 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
+and under `./mere-ruby` and diffs the output byte-for-byte: **209 programs,
+209 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
 index cannot hide behind the walk it replaced. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
@@ -451,8 +451,8 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2498 spec files** across 103 groups: **1687 MATCH, 750
-DIFF, 10 CRASH**, 32 SKIP, 19 SLOW, against ruby 4.0.6. Run with no
+The record covers **2498 spec files** across 103 groups: **1687 MATCH, 757
+DIFF, 10 CRASH**, 32 SKIP, 12 SLOW, against ruby 4.0.6. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
@@ -492,7 +492,7 @@ measured is where the aborts were. Every one is named, and they are four roots:
 
 | files | root |
 |---|---|
-| 4 | `Enumerator::Lazy` is not lazy for `grep`, `grep_v`, `slice_before`, `uniq` and `zip`: it materialises the source, and an infinite one runs to 6-17 GB until `mspec/rss_guard.sh` kills it. Another 8 files in that group hit the time alarm for the same reason -- 29 of its 30 files fail |
+| 4 | `Enumerator::Lazy` still materialises for the BUFFERING operators -- `chunk`, `chunk_while`, `slice_before`, `slice_after`, `slice_when` -- which emit a group at a boundary and so need a flush the pipeline has no hook for, plus `to_enum(:m, ...)` by method name and `zip` over a non-Array. Against an infinite source that runs to 6-17 GB until `mspec/rss_guard.sh` kills it. `grep`, `grep_v`, `uniq`, `compact`, `flat_map`, `with_index` and `zip` over Arrays are lazy now (corpus/206) |
 | 3 | a stack overflow (SIGSEGV in the stack region) in `core/marshal` dump/load and `core/thread` value: the recursion goes deeper than 512 MB of stack |
 | 2 | `\g<1>` (subexpression call by NUMBER) and `\k<-1>` / `\k<01>` (relative and zero-padded backrefs). The by-NAME spellings work; the numbered ones are not parsed, and a literal that the parser refuses takes the process down with it |
 | 1 | `Enumerator::Product` does not exist |
@@ -514,7 +514,7 @@ A whole group can carry a crash for a handful of integers.
 
 Naming the rest is what `CAUSES.md` is for. Grouped by cause, the DIFFs come
 down to a bounded number of **kinds**, and the largest single one is
-`NoMethodError` (265 files): a name that is not there, which is missing surface
+`NoMethodError` (268 files): a name that is not there, which is missing surface
 rather than wrong behaviour -- and it grew with the measured surface, because
 the groups added most recently (`core/io`, `core/time`, `library/stringio`) are
 the ones whose names are thinnest. The next-largest kinds are VALUE mismatches
