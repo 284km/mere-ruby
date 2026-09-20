@@ -10336,6 +10336,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (v, _) -> let _ = map_set def_int_enc "v" v in v
        | _ -> VNil)
     // Enumerator.new requires a block (the legacy obj/method form is gone).
+    else if str_eq c "Enumerator::Lazy" && (str_len name == 3 && str_eq name "new") then
+      raise_exc world "ArgumentError" "tried to call lazy new without a block"
     else if str_eq c "Enumerator" && (str_len name == 3 && str_eq name "new") then
       raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..)"
     // Thread class methods (synchronous model; see the Thread.new boundary).
@@ -12942,13 +12944,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // break flow so the generator's own loop stops.
     else if str_eq cls "Enumerator::Yielder" then
       (if (str_len name == 2 && str_eq name "<<") || (str_len name == 5 && str_eq name "yield") || (str_len name == 4 && str_eq name "call") then
+       (if map_has ivars (str_of_int id ++ "@__y_lzdid") then
+          // a LAZY generator's yielder: the value goes into the rest of the
+          // pipeline, not into a ruby block. The ops live on the driver, so
+          // the index it was created with says where to resume.
+          (let did9 = (match map_get ivars (str_of_int id ++ "@__y_lzdid") with VInt d9 -> d9 | _ -> 0) in
+           let i9 = (match (if map_has ivars (str_of_int id ++ "@__y_lzi") then map_get ivars (str_of_int id ++ "@__y_lzi") else VNil) with VInt k9 -> k9 | _ -> 0) in
+           let ops9 = (match (if map_has ivars (str_of_int did9 ++ "@__ops") then map_get ivars (str_of_int did9 ++ "@__ops") else VNil) with VArr a9 -> deref a9 | _ -> Nil) in
+           let _ = lz_step_ops env world blk did9 (vdrop ops9 i9) i9 (match args with Cons (a1, _) -> a1 | _ -> VNil) in
+           recv)
+        else
          (match (if map_has ivars (str_of_int id ++ "@__y_blk") then map_get ivars (str_of_int id ++ "@__y_blk") else VNil) with
           | VProc bpid ->
             (match run_block world (false, (Nil : str list), (Nil : Stmt list), env) (map_get proc_store (str_of_int bpid)) args with
              | FBreak v -> raise_exc world "StopIteration" "iteration reached an end"
              | FNext r -> (if (str_len name == 2 && str_eq name "<<") then recv else r)
              | other -> (if (str_len name == 2 && str_eq name "<<") then recv else flow_value other))
-          | _ -> VNil)
+          | _ -> VNil))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Enumerator::Yielder"))
     // the lazy-pipeline driver callback (see lz_run).
     else if str_eq cls "Enumerator::LzDrv" && (str_len name == 8 && str_eq name "__lzstep") then
@@ -13573,6 +13585,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          lz_extend world id "zip" (arr_new args)
        else if (str_len name == 4 && str_eq name "to_a") || (str_len name == 5 && str_eq name "force") then lz_run env world blk id (0 - 1) VNil
        else if (str_len name == 5 && str_eq name "eager") then make_enum world (lz_run env world blk id (0 - 1) VNil) "each"
+       else if (str_len name == 4 && str_eq name "size") then lz_size env world blk id
        else if (str_len name == 4 && str_eq name "lazy") then recv
        // ⚠ a NEW Lazy over the same source and the same pipeline -- the spec
        //   asks for `instance_of?(Enumerator::Lazy)` AND `should_not.equal?`
@@ -16334,6 +16347,22 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set iv3 (str_of_int eid ++ "@__e_step") (VProc pid) in
           let _ = map_set iv3 (str_of_int eid ++ "@__e_seed") (match args with Cons (v, _) -> v | _ -> VNil) in
           VObj eid)
+       // Enumerator::Lazy.new(src, size = nil) { |y, *vals| }: the block is a
+       // pipeline op over src, and the size (if given) is what #size answers.
+       else if str_eq c "Enumerator::Lazy" && (str_len name == 3 && str_eq name "new") then
+         (match args with
+          | Cons (lsrc, lrest) ->
+            (let pid = map_len proc_store in
+             let _ = store_proc (str_of_int pid) newblk in
+             let lzv = mk_lazy world lsrc (Cons (arr_new (Cons (VStr (mkstr_h "gen"), Cons (VProc pid, Nil))), Nil)) in
+             let _ = (match lzv with
+                      | VObj lid ->
+                        (match lrest with
+                         | Cons (lsz, _) -> (let (m8, s8, o8, iv8) = world in map_set iv8 (str_of_int lid ++ "@__lz_size") lsz)
+                         | _ -> ())
+                      | _ -> ()) in
+             lzv)
+          | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1+)")
        else if str_eq c "Enumerator" && (str_len name == 3 && str_eq name "new") then
          // Enumerator.new(size = nil) { |y| ... }: store the generator block
          // as a proc, and the optional size (#size returns / calls it).
@@ -26701,6 +26730,19 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
     //   grep_v, uniq, with_index and slice_before reached 6-17 GB and were
     //   killed, and chunk, grep, zip and four more hit the time alarm. The
     //   semantics below were measured against ruby 4.0.6, not assumed.
+    // Enumerator::Lazy.new's block: it is handed a YIELDER and one source
+    // element, and whatever it pushes goes on down the rest of the pipeline.
+    // It may push none (a filter), one, or several -- which is why it cannot
+    // be a map and needs the yielder rather than a return value.
+    else if str_eq kind "gen" then
+      (let yid = alloc_oid ocls0 in
+       let _ = map_set ocls0 yid "Enumerator::Yielder" in
+       let _ = map_set ivars0 (str_of_int yid ++ "@__y_lzdid") (VInt did) in
+       let _ = map_set ivars0 (str_of_int yid ++ "@__y_lzi") (VInt (i + 1)) in
+       (match payload with
+        | VProc gpid ->
+          (let _ = flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Cons (v, Nil)))) in VNil)
+        | _ -> VNil))
     else if str_eq kind "grep" || str_eq kind "grep_v" then
       (let (pat, gfn) = (match payload with
                          | VArr gaid -> (match deref gaid with
@@ -26776,6 +26818,56 @@ and lz_emit_each = fn env -> fn world -> fn blk -> fn (did: int) -> fn (rest: Va
   | Nil -> VNil
   | Cons (x, t) -> (let _ = lz_step_ops env world blk did rest i x in lz_emit_each env world blk did rest i t)
 
+// what a lazy pipeline answers for #size. ⚠ Measured against the reference:
+// map, with_index and zip PRESERVE it; take(k) is min, drop(k) is max(n-k,0);
+// select, grep, grep_v, uniq, compact, flat_map, take_while, drop_while,
+// reject and filter_map all give nil, because none of them can say how many
+// elements survive without running the source.
+and lz_size = fn env -> fn world -> fn blk -> fn (id: int) ->
+  let (m9, s9, o9, iv9) = world in
+  let base = (if map_has iv9 (str_of_int id ++ "@__lz_size") then map_get iv9 (str_of_int id ++ "@__lz_size")
+              else lz_src_size env world (lz_src world id)) in
+  lz_size_ops (lz_ops world id) base
+
+// the source's own #size, and nil when it has none -- asking a receiver that
+// does not answer would raise where ruby simply reports nil.
+and lz_src_size = fn env -> fn world -> fn (src: Val) ->
+  match src with
+  | VArr aid -> VInt (val_list_len (deref aid))
+  | VNil -> VNil
+  // ⚠ ask through the DISPATCHER, not the respond_to? table directly: a Range
+  //   answers `size` and `respond_to?(:size)` while `builtin_obj_has "Range"
+  //   "size"` is false, so reading the table gave nil for every range source.
+  | _ ->
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     if truthy (invoke_val_c env world nb9 src "respond_to?" (Cons (VSym "size", Nil)) false)
+     then invoke_val_c env world nb9 src "size" Nil false
+     else VNil)
+
+and lz_size_ops = fn (ops: Val list) -> fn (n: Val) ->
+  match ops with
+  | Nil -> n
+  | Cons (opv, rest) ->
+    (let (kind, pl) = (match opv with
+                       | VArr oaid -> (match deref oaid with
+                                       | Cons (VStr kh, Cons (p9, _)) -> (sget kh, p9)
+                                       | _ -> ("", VNil))
+                       | _ -> ("", VNil)) in
+     if str_eq kind "map" || str_eq kind "with_index" || str_eq kind "zip" || str_eq kind "gen" then lz_size_ops rest n
+     else if str_eq kind "take" then
+       (let k = (match pl with VInt k9 -> k9 | _ -> 0) in
+        (match n with
+         | VInt n9 -> lz_size_ops rest (VInt (if n9 < k then n9 else k))
+         | VFlt _ -> lz_size_ops rest (VInt k)
+         | _ -> lz_size_ops rest VNil))
+     else if str_eq kind "drop" then
+       (let k = (match pl with VInt k9 -> k9 | _ -> 0) in
+        (match n with
+         | VInt n9 -> lz_size_ops rest (VInt (if n9 - k > 0 then n9 - k else 0))
+         | VFlt f9 -> lz_size_ops rest (VFlt f9)
+         | _ -> lz_size_ops rest VNil))
+     else lz_size_ops rest VNil)
+
 // the names the Enumerator::Lazy arm implements, which is also the list that
 // decides whether it answers at all (see the guard). Anything not here and not
 // an enumerable name belongs to Object, not to Lazy.
@@ -26788,7 +26880,8 @@ and lz_pipe_name = fn (name: str) ->
   (str_len name == 6 && str_eq name "grep_v") || (str_len name == 4 && str_eq name "uniq") ||
   (str_len name == 7 && str_eq name "compact") || (str_len name == 10 && str_eq name "with_index") ||
   (str_len name == 15 && str_eq name "each_with_index") || (str_len name == 3 && str_eq name "zip") ||
-  (str_len name == 7 && str_eq name "to_enum") || (str_len name == 8 && str_eq name "enum_for")
+  (str_len name == 7 && str_eq name "to_enum") || (str_len name == 8 && str_eq name "enum_for") ||
+  (str_len name == 4 && str_eq name "size")
 
 // every argument an Array? the lazy zip only claims the case it can answer
 // without deciding the pull order of an arbitrary enumerable.

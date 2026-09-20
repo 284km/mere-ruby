@@ -10,13 +10,12 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 767 files.
+Classified: 742 files.
 
-## CRASH — 10 files, 5 kinds
+## CRASH — 6 files, 4 kinds
 
 | files | kind |
 |---|---|
-| 4 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
 | 3 | `stack overflow (recursion too deep)` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::Product (NameError)` |
 | 1 | `*.rb:N: mere-ruby: regexp parse: undefined group reference: N` |
@@ -26,7 +25,6 @@ Classified: 767 files.
 
 | files | cause |
 |---|---|
-| 4 | `KILLED at the memory cap (SIGKILL; see mspec/rss_kills.log) -- it did not abort on its own` |
 | 3 | `stack overflow (recursion too deep)` |
 | 1 | `*.rb:N: uninitialized constant Enumerator::Product (NameError)` |
 | 1 | `*.rb:N: mere-ruby: regexp parse: undefined group reference: 1` |
@@ -34,29 +32,30 @@ Classified: 767 files.
 
 </details>
 
-## DIFF — 757 files, 140 kinds
+## DIFF — 736 files, 141 kinds
 
 | files | kind |
 |---|---|
-| 268 | `ERROR NoMethodError` |
+| 234 | `ERROR NoMethodError` |
 | 93 | `ERROR NameError` |
 | 34 | `FAILED expected "S", got "S"` |
-| 21 | `FAILED expected N, got N` |
+| 22 | `FAILED expected N, got N` |
+| 21 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 20 | `FAILED expected true, got false` |
-| 19 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 17 | `FAILED expected ArgumentError to be raised` |
+| 19 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected truthy from #include?` |
 | 13 | `FAILED expected TypeError to be raised` |
+| 13 | `FAILED expected N, got nil` |
 | 11 | `FAILED expected to be identical` |
 | 11 | `FAILED expected false, got true` |
 | 11 | `ERROR ArgumentError` |
 | 10 | `FAILED matcher did not match #<OBJ>` |
-| 10 | `FAILED expected N, got nil` |
 | 7 | `pass=N fail=N err=N` |
 | 7 | `ERROR NotImplementedError` |
 | 6 | `FAILED expected falsy from #include?` |
 | 6 | `FAILED expected NoMethodError to be raised` |
 | 6 | `ERROR SystemExit` |
+| 5 | `FAILED expected IOError to be raised` |
 | 5 | `FAILED expected "S", got nil` |
 | 5 | `ERROR StandardError` |
 | 4 | `FAILED raised NoMethodError, expected TypeError` |
@@ -64,7 +63,6 @@ Classified: 767 files.
 | 4 | `FAILED expected SyntaxError to be raised` |
 | 4 | `FAILED expected RangeError to be raised` |
 | 4 | `FAILED expected NameError to be raised` |
-| 4 | `FAILED expected IOError to be raised` |
 | 4 | `FAILED expected "S" to match` |
 | 3 | `FAILED expected not to be identical` |
 | 3 | `FAILED expected false, got nil` |
@@ -79,23 +77,24 @@ Classified: 767 files.
 | 2 | `FAILED expected to receive #to_str` |
 | 2 | `FAILED expected nil, got "S"` |
 | 2 | `FAILED expected a Integer, got N` |
+| 2 | `FAILED expected [nil, N, N, N, N, nil, :SYM, [], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N] ...[clipped]` |
+| 2 | `FAILED expected [], got [N, N, N]` |
 | 2 | `FAILED expected [N, N, N, N], got [N, N, N, N]` |
 | 2 | `FAILED expected ThreadError to be raised` |
 | 2 | `FAILED expected #<OBJ>, got nil` |
 | 2 | `ERROR TypeError` |
+| 2 | `ERROR SystemStackError` |
 | 2 | `ERROR Errno::ENOENT` |
 | 1 | `This is experimental warning.` |
 | 1 | `FAILED raised TypeError, expected ArgumentError` |
 | 1 | `FAILED raised ThreadError, expected ArgumentError` |
 | 1 | `FAILED raised NoMethodError, expected ThreadError` |
-| 1 | `FAILED raised NoMethodError, expected NotImplementedError` |
 | 1 | `FAILED raised NoMethodError, expected LocalJumpError` |
-| 1 | `FAILED raised NoMethodError, expected IOError` |
-| 1 | `FAILED raised NoMethodError, expected EOFError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
 | 1 | `FAILED raised LoadError, expected NameError` |
 | 1 | `FAILED raised FrozenError, expected TypeError` |
 | 1 | `FAILED raised ArgumentError, expected SyntaxError` |
+| 1 | `FAILED raised ArgumentError, expected IOError` |
 | 1 | `FAILED expected {#<OBJ> => N}, got {}` |
 | 1 | `FAILED expected truthy from #start_with?` |
 | 1 | `FAILED expected truthy from #const_defined?` |
@@ -110,7 +109,6 @@ Classified: 767 files.
 | 1 | `FAILED expected nil to match` |
 | 1 | `FAILED expected a Enumerable, got #<OBJ>` |
 | 1 | `FAILED expected [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [:SYM, :SYM], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N], [N, ...[clipped]` |
-| 1 | `FAILED expected [], got [N, N, N]` |
 | 1 | `FAILED expected [], got [:SYM]` |
 | 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got nil` |
 | 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
@@ -121,6 +119,7 @@ Classified: 767 files.
 | 1 | `FAILED expected [N, nil, nil, N, nil, nil], got []` |
 | 1 | `FAILED expected [N, N], got [N, "S", N, "S", "S", nil, nil, nil]` |
 | 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
+| 1 | `FAILED expected [N, N, N], got []` |
 | 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
 | 1 | `FAILED expected [CoreClassSpecs::Inherited::D, #<OBJ>], got [#<OBJ>]` |
 | 1 | `FAILED expected [:SYM], got [:SYM, :SYM]` |
@@ -137,6 +136,7 @@ Classified: 767 files.
 | 1 | `FAILED expected ["S", "S", "S", "S"], got []` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got [#<OBJ>>, #<Enumerator::Lazy: #<Enumerator: "S":SYM ...[clipped]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "su ...[clipped]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "sp ...[clipped]` |
@@ -174,7 +174,6 @@ Classified: 767 files.
 | 1 | `FAILED expected "` |
 | 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
 | 1 | `ERROR fatal` |
-| 1 | `ERROR SystemStackError` |
 | 1 | `ERROR SignalException` |
 | 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
@@ -183,16 +182,16 @@ Classified: 767 files.
 
 | files | cause |
 |---|---|
-| 17 | `FAILED: expected ArgumentError to be raised` |
+| 19 | `FAILED: expected ArgumentError to be raised` |
 | 13 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected NoMethodError to be raised` |
+| 5 | `FAILED: expected IOError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
 | 4 | `FAILED: raised NoMethodError, expected ArgumentError` |
 | 4 | `FAILED: is a private method: expected truthy from #include?` |
 | 4 | `FAILED: expected SyntaxError to be raised` |
 | 4 | `FAILED: expected RangeError to be raised` |
 | 4 | `FAILED: expected NameError to be raised` |
-| 4 | `FAILED: expected IOError to be raised` |
 | 3 | `FAILED: is not defined: expected falsy from #include?` |
 | 3 | `FAILED: includes Enumerable: expected true, got false` |
 | 3 | `FAILED: expected Math::DomainError to be raised` |
@@ -210,6 +209,7 @@ Classified: 767 files.
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected true, got false` |
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 49, got nil` |
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 1, got nil` |
+| 2 | `FAILED: calls the block with initial values when yield with multiple arguments: expected [nil, 0, 0, 0, 0, nil, :default_arg, [], [], [0], [0, 1], [0, 1, 2]], got [nil, 0, [0, 1], [0, 1, 2], [0, 1, 2], nil, :default_arg, [], [], [0], [0, 1] ...[clipped]` |
 | 2 | `FAILED: calls supplied block if the key is not found: expected 5, got nil` |
 | 2 | `FAILED: calls #to_str to convert an Object to a String: expected "abcdef", got ""` |
 | 2 | `ERROR: for a child that exited normally returns true: SystemExit` |
@@ -221,8 +221,7 @@ Classified: 767 files.
 | 1 | `pass=16 fail=0 err=0` |
 | 1 | `This is experimental warning.` |
 | 1 | `FAILED: yields each directory entry in succession: expected [".", "..", ".dotfile", ".dotsubdir", "brace", "deeply", "dir", "dir_filename_ordering", "file_one.ext", "file_two.ext", "nested", "nondotfile", "special", "subdir_one", "subdir_tw ...[clipped]` |
-| 1 | `FAILED: writes the passed char before the current position: expected "A234", got "1234"` |
-| 1 | `FAILED: writes the passed argument onto self: expected "just testing", got "examplejust testing"` |
+| 1 | `FAILED: yields each codepoint starting from the current position: expected [238, 116, 233], got []` |
 
 </details>
 
@@ -237,12 +236,10 @@ class column says where the weight sits.
 |---|---|
 | date (34) | `accessor add_month add asctime boat commercial constants conversions ctime deconstruct_keys downto eql gregorian_leap gregorian hash infinity iso8601 jd julian_leap julian minus_month minus ordinal plus relationship rfc3339 step strftime upto valid_civil valid_commercial valid_date valid_jd valid_ordinal` |
 | time (29) | `_dump asctime at ceil ctime deconstruct_keys dup floor getgm gm gmt_offset gmt gmtime gmtoff isdst iso8601 mday mktime mon nsec round strftime subsec to_r tv_nsec tv_sec tv_usec xmlschema zone` |
-| stringio (24) | `binmode close_read close_write closed_read closed closed_write each_byte each_char each_codepoint eof fsync getbyte lineno pid putc read_nonblock readbyte readchar reopen rewind seek set_encoding_by_bom ungetbyte write_nonblock` |
 | buffer (21) | `and empty external for free initialize internal locked map mapped not null or private readonly resize shared string transfer valid xor` |
 | file (20) | `absolute_path atime chmod constants ctime flock grpowned initialize mtime new owned pipe rename reopen setuid socket truncate umask world_readable world_writable` |
 | io (19) | `binmode close_read close close_write copy_stream dup fsync pid popen pos pread pwrite readbyte stat sysopen sysread syswrite tell to_i` |
 | process (17) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall waitpid2 waitpid warmup` |
-| lazy (17) | `collect_concat collect compact drop drop_while eager filter find_all flat_map grep grep_v map reject select take take_while uniq` |
 | thread (15) | `backtrace_locations backtrace current each_caller_location exit fetch fork handle_interrupt ignore_deadlock inspect keys pending_interrupt raise terminate thread_variables` |
 | stat (14) | `atime comparison ctime dev ftype gid inspect mode mtime new owned pipe rdev uid` |
 | module (14) | `alias_method const_defined const_missing const_set const_source_location deprecate_constant included initialize module_exec name public_instance_method refine remove_class_variable remove_const` |
@@ -253,8 +250,9 @@ class column says where the weight sits.
 | gc (7) | `auto_compact config count garbage_collect measure_total_time stat total_time` |
 | enumerator (7) | `each each_with_object feed initialize new product with_object` |
 | encoding (7) | `aliases compatible find list name_list names to_s` |
-| dir (7) | `delete each_child empty fileno foreach pos tell` |
 | argf (7) | `argv each eof path tell to_a to_i` |
+| lazy (6) | `collect_concat collect filter find_all grep grep_v` |
+| dir (6) | `delete empty fileno foreach pos tell` |
 | yaml (5) | `dump load_file parse_file parse to_yaml` |
 | undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
 | profiler (5) | `disable enable enabled result total_time` |
@@ -265,6 +263,7 @@ class column says where the weight sits.
 | securerandom (3) | `base64 hex random_bytes` |
 | objectspace (3) | `_id2ref each_object garbage_collect` |
 | warning (2) | `categories warn` |
+| stringio (2) | `eof seek` |
 | regexp (2) | `timeout escapes` |
 | refinement (2) | `import_methods target` |
 | random (2) | `equal_value urandom` |

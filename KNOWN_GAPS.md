@@ -2998,7 +2998,7 @@ first time. A CRASH row means mere-ruby printed no tally at all where ruby ran
 the file's examples -- the process died, so the other examples in that file
 were never asked either.
 
-### `Enumerator::Lazy` materialises for the buffering operators (4 CRASH, 3 SLOW)
+### `Enumerator::Lazy` materialises for the buffering operators (0 CRASH, 7 SLOW)
 
 The pipeline keeps a list of ops and pushes ONE element through it at a time.
 Every operator missing from that list fell through to `lz_run ... (-1)`, which
@@ -3026,10 +3026,19 @@ on the class alone made it a wall: the chain ends in `raise NoMethodError`, so
 `equal?`, `frozen?` and `tap` died there instead of reaching Object's own arms.
 `lazy.to_enum.equal?(l)` is in the spec, and a Lazy could not answer it.
 
-⚠ The group is still 1 of 30. Five files moved from "hangs" to "runs and
-disagrees", which is the honest half of the work; what blocks the rest is
-`Enumerator::Lazy.new(obj, size) { }` (absent) and `Lazy#size` (absent), which
-most of those files ask for in their first example.
+`Enumerator::Lazy.new(obj, size) { |y, v| }` and `Lazy#size` are answered now
+-- most of the group's files ask for both in their first example. #size follows
+the reference exactly: `map`, `with_index` and `zip` preserve it, `take(k)` and
+`drop(k)` do the arithmetic, and `select`, `grep`, `uniq`, `compact`,
+`flat_map`, `take_while` and the rest give nil, because none of them can say
+how many elements survive without running the source.
+
+⚠ The group is 3 of 30. What blocks most of the rest now is REFLECTION: the
+files say `Enumerator::Lazy.instance_method(:collect)` to check that `collect`
+is an alias of `map`, and these names live in the dispatcher, which neither
+`builtin_owns_here` nor `builtin_obj_has` has a row for. `lz_pipe_name` is
+already the list of names the arm implements; giving both doors that list (and
+`canon_alias` the pairs) is the next increment.
 
 ### A stack overflow, not an exception (3 CRASH)
 
@@ -3053,3 +3062,36 @@ so one unsupported literal costs a whole file. ruby accepts all three.
 
 `Enumerator::Product` is the class `Enumerator.product` returns (ruby 3.2).
 The constant is absent, so the file dies on line 2.
+
+
+## StringIO answers the IO surface now, with one gap left on purpose
+
+Twenty-five names were missing (`binmode`, `close_read`, `close_write`,
+`closed_read?`, `closed_write?`, `each_byte`, `each_char`, `each_codepoint`,
+`fcntl`, `fsync`, `getbyte`, `lineno`, `lineno=`, `pid`, `putc`,
+`read_nonblock`, `readbyte`, `readchar`, `readline`, `reopen`,
+`set_encoding_by_bom`, `sysread`, `ungetbyte`, `write_nonblock`), and the group
+went from 11 of 64 to 29. Three behaviours were measured rather than guessed
+and all three read backwards from the name: `#putc` returns its ARGUMENT,
+`#lineno` counts calls to `#gets` (so `readline` advances it and `getc` does
+not), and `#ungetbyte` PREPENDS at position 0 while overwriting anywhere else.
+
+⚠ Three bugs in what was already there came out with them:
+
+  - `#write` APPENDED. ruby writes AT the position, so
+    `StringIO.new("ab").write("q")` is "qb"; it was "abq". A gap past the end
+    is NUL-padded.
+  - `#string` handed back a NEW string on every write, so a reference taken
+    earlier never saw later writes. ruby returns the live buffer, and #write,
+    #ungetbyte and #truncate now mutate it in place.
+  - the mode was not enforced at all. `StringIO.new("ab", "r").write("q")`
+    succeeded; it raises IOError now, which is also what makes `close_read`
+    and `close_write` mean anything.
+
+What is left, all of it PRE-EXISTING and none of it introduced here:
+
+| gap | why |
+|---|---|
+| `@pos` counts CHARACTERS, ruby counts BYTES | the whole class is written that way -- `read(len)`, `seek` and now `getbyte` all agree with ruby for ASCII and disagree for multibyte. `set_encoding_by_bom` leaves pos at 1 where ruby says 3, and that is the same one gap |
+| `StringIO.new(frozen_string).string.frozen?` is false | it dups its argument; ruby keeps the object (and refuses writes to it) |
+| `StringIO.new(nil).string` is `""` | ruby keeps the nil |
