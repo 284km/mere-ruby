@@ -30,34 +30,48 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 222 of 1413 names
-  IO (44): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd foreach fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
-  File (39): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime empty? executable_real? flock ftype grpowned? identical? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readable_real? readlink rename setgid? setuid? socket? stat sticky? symlink truncate umask utime world_readable? world_writable? writable_real? zero?
-  Kernel (31): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? caller caller_locations define_singleton_method format gem gem_original_require global_variables iterator? lambda load local_variables open printf proc rand set_trace_func singleton_method sprintf test then trace_var untrace_var yield_self
+ABSENT: 185 of 1413 names
+  IO (43): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
+  File (32): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime flock ftype grpowned? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readlink rename setgid? setuid? socket? stat sticky? truncate umask utime world_readable? world_writable?
   Process (25): _fork argv0 clock_getres egid euid getpgid getpgrp getpriority getrlimit getsid gid groups initgroups last_status maxgroups setpgid setpgrp setpriority setproctitle setrlimit setsid uid waitall waitpid2 warmup
-  Dir (19): chdir chroot close delete each_child empty? fchdir fileno for_fd foreach inspect path pos rewind rmdir seek tell to_path unlink
-  Module (14): class_exec const_source_location define_method included_modules module_exec nesting protected_instance_methods public_class_method public_instance_method refinements set_temporary_name undefined_instance_methods used_modules used_refinements
+  Kernel (24): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? define_singleton_method format gem gem_original_require global_variables lambda load local_variables open printf proc singleton_method sprintf test then yield_self
+  Dir (13): chroot close each_child empty? fchdir fileno for_fd foreach pos rewind seek tell to_path
   GC (13): auto_compact compact config count garbage_collect latest_compact_info latest_gc_info measure_total_time stat stat_heap total_time verify_compaction_references verify_internal_consistency
-  Thread (11): add_trace_func backtrace backtrace_locations each_caller_location handle_interrupt ignore_deadlock keys native_thread_id pending_interrupt? set_trace_func thread_variables
+  Thread (10): add_trace_func backtrace backtrace_locations each_caller_location handle_interrupt ignore_deadlock keys native_thread_id pending_interrupt? thread_variables
   ObjectSpace (6): _id2ref count_objects define_finalizer each_object garbage_collect undefine_finalizer
+  Module (5): class_exec const_source_location define_method module_exec used_modules
   Encoding (5): _dump _load aliases compatible? name_list
   Time (4): ceil floor iso8601 xmlschema
-  Random (3): new_seed seed urandom
-  Exception (2): exception to_tty?
   Enumerator (2): produce product
-  Class (2): attached_object subclasses
-  String (1): append_as_bytes
-  Symbol (1): all_symbols
+  Random (2): seed urandom
+  Exception (1): exception
 
-SEND-ONLY: 19 of 1413 names
+SEND-ONLY: 17 of 1413 names
   Process (6): egid= euid= gid= groups= maxgroups= uid=
   IO (5): autoclose= close_on_exec= lineno= pos= timeout=
-  Kernel (3): public_send respond_to? send
+  Kernel (2): public_send send
   GC (2): auto_compact= measure_total_time=
-  Exception (1): respond_to?
   Dir (1): pos=
   Thread (1): ignore_deadlock=
 ```
+
+2026-09-19: **185 ABSENT of 1413**, same reference (4.0.6) and the same binary
+as the record above. The drop from 222 is three arcs and one door: File and Dir
+gained the predicates and the class methods their groups asked for (empty?,
+identical?, the _real? spellings, each_child, foreach); Module gained the ones
+its own reflection lists name (included_modules, public_class_method,
+public_instance_method, protected_instance_methods, refinements,
+set_temporary_name, undefined_instance_methods, nesting); Class gained
+subclasses and attached_object; and ⚠ SEVEN Kernel names were never absent at
+all -- `obj.__send__(:rand)` could not reach Kernel's private instance methods,
+though writing `rand` bare has always worked. `send` bypasses privacy, so the
+probe is right to ask that way; the door it asked through had not been told.
+Twenty-four of Kernel's thirty-one remain, and reading the bucket says they
+are FOUR different gaps and not one: twelve are unimplemented, eight more are
+the same door (bare works, `send` does not), two are syntax rather than
+methods (`!~`, `===`), and two are counted only because the probe calls them
+without a block (`then`, `yield_self`).
+[`KNOWN_GAPS.md`](KNOWN_GAPS.md) lists them by name.
 
 2026-09-08: **222 ABSENT of 1413**, same reference (4.0.6) and the same binary
 as that day's spec rows. The one that went is `Kernel#respond_to_missing?`: it was

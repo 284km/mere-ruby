@@ -2943,3 +2943,50 @@ What IS answered: `exist?` `directory?` `file?` `symlink?` `readable?`
 and `identical?` (`test a -ef b`, the shell route the other three already use).
 
 Closing the rest means a stat syscall the interpreter does not have a door for.
+
+## Only part of a library, on purpose
+
+Some libraries are shipped as the half of themselves that can be answered
+exactly, because the other half would have to invent something:
+
+| shipped | absent, and why |
+|---|---|
+| `cgi` — escapeHTML, unescapeHTML, the URI encoders, escapeElement | the request-shaped instance methods `#params`, `#header`, `#out`, `#[]`: they need a request environment, and this process is not a CGI script. ⚠ `CGI.new` itself SUCCEEDS and hands back an object none of them answer for -- the one row here that fails somewhere other than the name you asked for |
+| `io/console` — `StringIO#getch` | `#getpass`: ruby consumes one character more than "a line without the newline", and a method that is close but not the same is a wrong answer where a missing one is an honest refusal |
+| `openssl` — `OpenSSL::Digest`, HMAC | TLS, X509, PKey: a gem should fail on the constant that names the missing capability, not load and fail somewhere else |
+| `socket` — TCPSocket, TCPServer | UDP and UNIX sockets EXIST and raise `NotImplementedError`, for the same reason |
+
+⚠ Each of these was added because something failed by NAME rather than by
+behaviour: `require "fcntl"` on line four of core/io/reopen_spec took that
+whole file down, and the record called it a CRASH because the process dies
+before it can report. A missing library is not a small gap when a file
+requires it at the top.
+
+## `send` reaches most of Kernel's private methods, not all
+
+`obj.__send__(:rand)` works now: `send` bypasses privacy, so Kernel's private
+instance methods have to be reachable that way. Seven that were not are:
+`rand`, `caller`, `caller_locations`, `iterator?`, `set_trace_func`,
+`trace_var`, `untrace_var`.
+
+⚠ Twenty-four of Kernel's thirty-one names are still counted ABSENT by
+[`MISSING_NAMES.md`](MISSING_NAMES.md), and they are not one gap but FOUR --
+which is the reason to probe both spellings instead of reporting a number:
+
+| how many | what it is | which names |
+|---|---|---|
+| 12 | not implemented, in either spelling | `autoload` `autoload?` `define_singleton_method` `format` `gem` `gem_original_require` `load` `open` `printf` `singleton_method` `sprintf` `test` |
+| 8 | a DISPATCHER gap: written bare it works, sent it does not | `__callee__` `__dir__` `__method__` `block_given?` `global_variables` `local_variables` `lambda` `proc` |
+| 2 | syntax rather than a method: `1 !~ 2` parses and runs, `o.!~(1)` and `o.===(1)` raise NoMethodError | `!~` `===` |
+| 2 | present with a block (`1.then { }`, `o.__send__(:yield_self) { }`), absent without one -- ruby returns an Enumerator there | `then` `yield_self` |
+
+Only the eight in the second row are the door: they are implemented in the
+EXPRESSION arm (eval_e's `ECall`), which `send` does not go through. Closing
+that means moving them into a function both doors can call -- the same shape
+as the Math and namespace arms, one rule that lived in two places.
+
+⚠ And the arm that routes them tests the receiver's ancestors for `Kernel`,
+which is not decoration: `BasicObject` does not include it, and
+`[1,2].sample(random: BasicObject.new)` must raise NoMethodError for `#rand`.
+Without that test the route answered for every receiver and took two recorded
+rows with it.

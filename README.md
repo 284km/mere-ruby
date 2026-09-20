@@ -1,11 +1,18 @@
 # mere-ruby
 
 A Ruby subset interpreter written in [Mere](https://merelang.org/), in
-pure Mere. Through milestone **M5** it runs literals, operators, variables,
-control flow, methods, classes and inheritance, blocks and iterators, and a
-broad set of core methods — every corpus program (FizzBuzz, class
-hierarchies, `map`/`select`/`reduce` chains, hashes) prints byte-identical
-output to the reference `ruby`.
+pure Mere. It runs literals, operators, variables, control flow, methods,
+classes and inheritance, blocks and iterators, exceptions, and a broad set of
+core methods — every corpus program (FizzBuzz, class hierarchies,
+`map`/`select`/`reduce` chains, hashes) prints byte-identical output to the
+reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
+`csv` gem is not, and pointed at it with `-I` this parses CSV byte-identically
+to ruby 4.0.6 (`bench/csv.sh`).
+
+The milestones below (M0-M6) are how it was built. What it is measured by now
+is [ruby/spec](https://github.com/ruby/spec): **1530 of 2082 spec files**
+byte-identical to ruby 4.0.6, nothing crashing — see
+[Conformance](#conformance-rubyspec) for what that covers and what it does not.
 
 ```sh
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
@@ -16,7 +23,7 @@ mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ru
 #   -fbracket-depth  mainline clang caps nesting at 256, Apple's allows more.
 #                    The Ruby prelude is one `"..." ++ "..."` chain and each ++
 #                    is a bracket there, so it is split into four `let`s as well.
-#                    MEASURED 2026-09-17: the emitted C needs 269, so the flag is
+#                    MEASURED 2026-09-19: the emitted C needs 270, so the flag is
 #                    LOAD-BEARING -- a build without it does not compile. It was
 #                    240 on 2026-09-10 and that note said the default of 256
 #                    would do by sixteen; the sixteen are gone. What grew is the
@@ -109,7 +116,8 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 204 programs, byte-for-byte
+./run_corpus.sh                                  # 208 programs, byte-for-byte
+                                                 # (and eight SOURCE gates, see tools/)
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
@@ -123,6 +131,27 @@ Every change is checked against the reference `ruby` before it lands:
 Each harness derives what it needs from the arguments; nothing is left in
 `/tmp` between runs. Two of them used to be, and a cleared `/tmp` quietly
 took the measurement with it.
+
+`run_corpus.sh` also runs eight SOURCE gates before it runs a program, because
+each of them catches a defect that is invisible at runtime -- a rule written
+twice, a table nobody reads, a guard that silently disables the arm behind it:
+
+| gate | what it refuses |
+|---|---|
+| `gc_roots_check.sh` | a `Val`-valued global the collector does not scan |
+| `dup_defs_check.sh` | one name defined twice in a chain (the second silently wins) |
+| `dead_defs_check.sh` | a top-level function nothing calls |
+| `meth_writes_check.sh` | a method-table write that skips the generation bump |
+| `name_spec_check.sh` | a `name_set` tag with no arm (an empty table answers false about every name), and an arm nobody asks for |
+| `ns_names_check.sh` | a namespace arm and its name list disagreeing -- either a name the call refuses though the arm implements it, or one respond_to? claims and the arm does not |
+| `name_len_check.sh` | a length guard that is not its literal's length, which makes the arm UNREACHABLE with no build error |
+| `rx_caps_check.sh` | a regex capture slot written around `rx_cap_set` (the next match answers with the last one's group) |
+| `bracket_depth_check.sh` | the emitted C outgrowing the nesting the build passes (CI-only: it needs the C) |
+
+`mspec/record_hygiene.sh` is the tenth: it refuses a record that names a
+machine or an operator, a tag file whose row count disagrees with its table
+row (which is what a killed sweep leaves behind), and a tag file with no table
+row at all.
 
 Run the sweep with `mspec/rss_guard.sh` alongside it, and run it ALONE. The sweep
 bounds time per file and not bytes, and five spec files drive this interpreter
@@ -158,9 +187,16 @@ system zlib writes, and the system zlib reads what mere-ruby writes.
 
 ## The load path
 
-mere-ruby ships a handful of pure-Ruby libraries compiled in (`monitor`,
+mere-ruby ships a set of pure-Ruby libraries compiled in (`monitor`,
 `stringio`, `strscan`, `set`, `pathname`, `time`, `delegate`, `English`,
-…) and those always win over a file of the same name. Everything else is
+`digest`, `securerandom`, `base64`, `shellwords`, `observer`,
+`fcntl`, `io/console`, the escape half of `cgi`, …) and those always win over
+a file of the same name. ⚠ Each is there because something asked for it and
+failed by NAME -- `require "fcntl"` on line four of a spec file took a whole
+group down with it -- and each is only as much of the library as can be
+answered exactly: `cgi`'s escapers are here and `CGI.new` is not, because a
+CGI object in a process that is not a CGI script would have to invent its
+environment. Everything else is
 searched for on `$LOAD_PATH`, which starts **empty** — mere-ruby has no
 stdlib directory of its own to seed it with. `-I` and `RUBYLIB` fill it,
 in that order, exactly as in ruby:
@@ -171,8 +207,17 @@ RUBYLIB=/path/to/ruby/lib/ruby/3.2.0 ./mere-ruby script.rb
 ```
 
 Pointed at a CRuby installation's stdlib, mere-ruby runs a good deal of
-it directly — `shellwords`, `fileutils`, `racc`, `uri` all parse and
-load.
+it directly — `fileutils` and `uri` parse and load, and `URI.parse`,
+`URI.join` and `URI.encode_www_form` answer exactly as ruby 4.0.6 does.
+⚠ MEASURED 2026-09-20, and two of the three names this sentence used to carry
+were wrong in opposite directions. `uri` did NOT load: a constant defined in a
+`class << self` body could not be read from that same body (`uri/common.rb`
+line 99 is exactly that shape), which is now fixed and is corpus/205. `racc`
+did not load either, and that one is not this interpreter's doing -- in ruby
+4.0 racc is a BUNDLED GEM and is no longer under `rubylibdir` at all, so the
+example was describing a layout rather than measuring anything. (`shellwords`
+used to be here too; it is compiled in now, so the shipped one wins and it
+demonstrates nothing about the load path.)
 
 A C extension is not automatically out of reach, but it has to be
 answered rather than found. `digest`, `date` and `etc` ship as Ruby
@@ -377,8 +422,9 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **204 programs,
-204 identical**. The corpus covers the semantic corners above. A deliberate negative control (lossy float
+and under `./mere-ruby` and diffs the output byte-for-byte: **208 programs,
+208 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
+index cannot hide behind the walk it replaced. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
 ## Conformance (ruby/spec)
@@ -400,29 +446,65 @@ many files disagree, and this says how many NAMES they come down to. It reads
 the tags files only, so the bucket key can be retuned without re-sweeping. Those tag files are the honest, checked-in record of the gap — the
 same idea as the tags/filter files every other implementation keeps. Passing
 100% is a non-goal (only MRI does, because the specs are derived from it); the
-target is the `language` and `core` groups, with `command_line` low-priority
-and the C-API (`optional/capi`) and stdlib (`library`) out of scope.
+target is the `language` and `core` groups, and the C-API (`optional/capi`) is
+out of scope. The stdlib (`library`) is IN scope for what this interpreter
+actually ships -- see below.
 
-The record covers **1221 spec files** across 31 groups: **1025 MATCH, 192 DIFF,
-0 CRASH**, 4 SKIP, 0 SLOW, against ruby 4.0.6. Run with no directories, the
+The record covers **2082 spec files** across 71 groups: **1530 MATCH, 526 DIFF,
+0 CRASH**, 16 SKIP, 10 SLOW, against ruby 4.0.6. Run with no directories, the
 sweep refreshes exactly the groups the table already has, so the numbers above
 are reproducible rather than a snapshot -- and every row of one table is
 measured by ONE build (`a/sweep_resume.sh` pins it and says so at the end).
 
+⚠ **2082 is not all of ruby/spec** -- the suite has 3821 files, and the number
+worth writing down is the one that says what is NOT being asked. Here are the
+other 1739, counted so that they add up:
+
+| files | not measured | why |
+|---|---|---|
+| 1231 | `library/` outside the 16 groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before |
+| 293 | NESTED core dirs (`core/file/stat`, `core/enumerator/lazy`, `core/array/pack` and 23 more) | the scoreboard takes those group names; it was simply never given them |
+| 104 | `core/thread` 45, `core/process` 40, `core/tracepoint` 19 | next on the list. Nothing here says they cannot run -- they have not been swept |
+| 46 | `optional/capi` | out of scope: a C API, and this has no C extensions to answer it with |
+| 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
+| 13 | `language/regexp` 11, `language/predefined` 2 | nested, the same gap as the core dirs above |
+| 13 | `security` | CVE regressions; four of them need rubygems or optparse |
+| 6 | `core/marshal` | deferred on purpose: the CRASH the sweep recorded was the REFERENCE ruby's own message. Standalone it finishes 4 of 4, and a flaky row is not a measurement |
+| 1 | `optional/thread_safety` | one file, same reason as `core/thread` |
+
+A percentage over a surface you chose is worth less than the list of what you
+left out, so the list is here and it adds to 3821.
+
+⚠ And the stdlib was out of scope for a reason that turned out to be the
+HARNESS: `run_spec.sh` clones core, language, shared and fixtures into the tree
+it runs in, and not library -- so all 1516 library files failed on BOTH sides
+with `cannot load such file`, and measuring them answered 0/1516. That is the
+instrument's answer, not the subject's. One word in a for-loop, and sixteen
+library groups have rows: `library/date` 60 of 98, `library/etc` 16 of 19,
+`library/pathname` 11 of 20.
+
 **Every file runs on both sides** (MATCH + DIFF): nothing aborts. So the gap is
 not "cannot", and a group score reads low for a reason worth naming rather than
 for breakage -- real programs (the corpus) match exactly while a value class
-scores low on an error message or a frozen-object check.
+scores low on an error message or a frozen-object check. ⚠ Three CRASH rows
+have appeared and gone since: every one was a NAMED MISSING LIBRARY (`fcntl`,
+`cgi`, `io/console`) that the file required on its fourth line, which the
+scoreboard reports as a crash because the process dies before it can report.
+A whole group can carry a crash for a handful of integers.
 
-Naming it is what `CAUSES.md` is for. Grouped by cause, the DIFFs come down to
-a bounded number of **kinds**, and the largest single one is `NoMethodError`
-(20 files): a name that is not there, which is missing surface rather than
-wrong behaviour. Its share has been shrinking as the conversion and dispatch
-protocols were filled in, and the next-largest kinds are now REFUSALS ruby
-makes and this does not (`expected TypeError to be raised`) and VALUE
-mismatches (`expected N, got N`). Because ruby/spec is laid out as
-`core/<class>/<method>_spec.rb`, those files name the absent methods
-themselves -- `CAUSES.md` ends with that list, per class.
+Naming the rest is what `CAUSES.md` is for. Grouped by cause, the DIFFs come
+down to a bounded number of **kinds**, and the largest single one is
+`NoMethodError` (186 files): a name that is not there, which is missing surface
+rather than wrong behaviour -- and it grew with the measured surface, because
+the groups added most recently (`core/io`, `core/time`, `library/stringio`) are
+the ones whose names are thinnest. The next-largest kinds are VALUE mismatches
+(`expected "S", got "S"`, `expected N, got N`) and REFUSALS ruby makes and this
+does not (`expected ArgumentError to be raised`). Because ruby/spec is laid out
+as `core/<class>/<method>_spec.rb`, those files name the absent methods
+themselves -- `CAUSES.md` ends with that list, per class, and
+[`MISSING_NAMES.md`](MISSING_NAMES.md) asks the same question from the other
+side (ruby's own method lists, probed under this interpreter: **185 absent of
+1413**).
 
 ⚠ A record refreshed only when someone remembers is a claim about the past. One
 re-sweep found the table had drifted 3 files from the committed interpreter, so
