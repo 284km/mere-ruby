@@ -46,3 +46,15 @@ p inf.drop_while { |x| x < 3 }.first(2)
 p inf.take(3).force
 p inf.drop(2).first(2)
 p inf.filter_map { |x| x * 2 if x.odd? }.first(3)
+
+# ...and zip over an ENUMERABLE that is not an Array. The arguments are pulled
+# into Arrays up front and the RECEIVER stays lazy; leaving that case to the
+# materialising path meant running an infinite source to the end, which the
+# memory cap caught as a CRASH on a fast machine and the time alarm caught as
+# SLOW on a slow one. ⚠ The conversion asks by CALLING #to_a -- an Enumerator
+# answers it and its respond_to? does not say so.
+p inf.zip([7, 8].to_enum).first(3)
+p inf.zip(10..12).first(3)
+p inf.zip([4, 5], (7..8).to_enum).first(3)
+p [1, 2].lazy.zip([3, 4].to_enum).force
+p([1, 2].lazy.zip(Object.new).force) rescue p $!.class

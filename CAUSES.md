@@ -10,27 +10,27 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 694 files.
+Classified: 693 files.
 
-## DIFF — 694 files, 135 kinds
+## DIFF — 693 files, 136 kinds
 
 | files | kind |
 |---|---|
-| 227 | `ERROR NoMethodError` |
-| 60 | `ERROR NameError` |
+| 226 | `ERROR NoMethodError` |
+| 57 | `ERROR NameError` |
 | 36 | `FAILED expected "S", got "S"` |
-| 21 | `FAILED expected N, got N` |
+| 22 | `FAILED expected N, got N` |
 | 20 | `FAILED expected true, got false` |
 | 19 | `FAILED expected ArgumentError to be raised` |
 | 15 | `FAILED expected TypeError to be raised` |
-| 15 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 14 | `FAILED expected truthy from #include?` |
-| 13 | `FAILED expected N, got nil` |
+| 14 | `FAILED expected N, got nil` |
+| 13 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 12 | `FAILED matcher did not match #<OBJ>` |
 | 12 | `FAILED expected to be identical` |
-| 11 | `FAILED expected false, got true` |
+| 12 | `FAILED expected false, got true` |
 | 11 | `ERROR ArgumentError` |
-| 7 | `pass=N fail=N err=N` |
+| 8 | `pass=N fail=N err=N` |
 | 7 | `ERROR NotImplementedError` |
 | 6 | `FAILED expected falsy from #include?` |
 | 6 | `FAILED expected NoMethodError to be raised` |
@@ -125,6 +125,7 @@ Classified: 694 files.
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "sp ...[clipped]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "subdir_tw ...[clipped]` |
 | 1 | `FAILED expected [" def foo` |
+| 1 | `FAILED expected SystemCallError to be raised` |
 | 1 | `FAILED expected RuntimeError to be raised` |
 | 1 | `FAILED expected NNN N:N:N UTC, got NNN N:N:N UTC` |
 | 1 | `FAILED expected N, got Infinity` |
@@ -178,6 +179,7 @@ Classified: 694 files.
 | 2 | `FAILED: returns a US_ASCII encoded string: expected #<Encoding:US-ASCII>, got #<Encoding:BINARY (ASCII-8BIT)>` |
 | 2 | `FAILED: raised StandardError, expected FrozenError` |
 | 2 | `FAILED: raised NoMethodError, expected FrozenError` |
+| 2 | `FAILED: keeps size: expected 100, got nil` |
 | 2 | `FAILED: expected ThreadError to be raised` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected true, got false` |
@@ -189,13 +191,12 @@ Classified: 694 files.
 | 2 | `FAILED: calls #to_str to convert an Object to a String: expected "abcdef", got ""` |
 | 2 | `ERROR: for a child that exited normally returns true: SystemExit` |
 | 2 | `ERROR: Encoding::UndefinedConversionError#source_encoding_name returns a String: NoMethodError` |
+| 1 | `pass=6 fail=0 err=0` |
 | 1 | `pass=3 fail=0 err=0` |
 | 1 | `pass=24 fail=1 err=0` |
 | 1 | `pass=2 fail=0 err=0` |
 | 1 | `pass=19 fail=0 err=0` |
 | 1 | `pass=16 fail=0 err=0` |
-| 1 | `This is experimental warning.` |
-| 1 | `FAILED: yields each directory entry in succession: expected [".", "..", ".dotfile", ".dotsubdir", "brace", "deeply", "dir", "dir_filename_ordering", "file_one.ext", "file_two.ext", "nested", "nondotfile", "special", "subdir_one", "subdir_tw ...[clipped]` |
 
 </details>
 
@@ -211,7 +212,7 @@ class column says where the weight sits.
 | date (34) | `accessor add_month add asctime boat commercial constants conversions ctime deconstruct_keys downto eql gregorian_leap gregorian hash infinity iso8601 jd julian_leap julian minus_month minus ordinal plus relationship rfc3339 step strftime upto valid_civil valid_commercial valid_date valid_jd valid_ordinal` |
 | buffer (21) | `and empty external for free initialize internal locked map mapped not null or private readonly resize shared string transfer valid xor` |
 | file (20) | `absolute_path atime chmod constants ctime flock grpowned initialize mtime new owned pipe rename reopen setuid socket truncate umask world_readable world_writable` |
-| io (19) | `binmode close_read close close_write copy_stream dup fsync pid popen pos pread pwrite readbyte stat sysopen sysread syswrite tell to_i` |
+| io (16) | `binmode close_read close close_write copy_stream dup fsync pid popen pread pwrite readbyte stat sysopen sysread syswrite` |
 | process (15) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall warmup` |
 | stat (14) | `atime comparison ctime dev ftype gid inspect mode mtime new owned pipe rdev uid` |
 | module (14) | `alias_method const_defined const_missing const_set const_source_location deprecate_constant included initialize module_exec name public_instance_method refine remove_class_variable remove_const` |
@@ -225,10 +226,10 @@ class column says where the weight sits.
 | argf (7) | `argv each eof path tell to_a to_i` |
 | enumerator (6) | `each each_with_object feed initialize new product` |
 | encoding (6) | `aliases compatible find list name_list names` |
-| dir (6) | `delete empty fileno foreach pos tell` |
 | yaml (5) | `dump load_file parse_file parse to_yaml` |
 | undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
 | profiler (5) | `disable enable enabled result total_time` |
+| dir (5) | `delete each_child empty fileno foreach` |
 | tms (4) | `cstime cutime stime utime` |
 | binding (4) | `implicit_parameter_defined implicit_parameter_get implicit_parameters source_location` |
 | securerandom (3) | `base64 hex random_bytes` |

@@ -40,3 +40,18 @@ p Time.method(:mktime) == Time.method(:local)
 p Process.method(:waitpid) == Process.method(:wait)
 p Process.method(:waitpid2) == Process.method(:wait2)
 p [Thread.respond_to?(:start), Marshal.respond_to?(:dump)]
+
+# ...and the last three shapes: a position the arm already kept but never
+# exposed, the name `fileno` also goes by, and a class's OWN class method,
+# which shadows Kernel's -- `Marshal.load` is Marshal's, not Kernel#load, and
+# only reflection ever noticed (calling it always worked).
+p Dir.instance_method(:path) == Dir.instance_method(:to_path)
+p Dir.instance_method(:tell) == Dir.instance_method(:pos)
+p IO.instance_method(:tell) == IO.instance_method(:pos)
+p IO.instance_method(:to_i) == IO.instance_method(:fileno)
+p Marshal.method(:restore) == Marshal.method(:load)
+p Thread.method(:fork) == Thread.method(:start)
+p [Marshal.method(:load).owner, Thread.method(:start).owner]
+
+d = Dir.new(".")
+p [d.pos, d.read.class, d.pos, (d.pos = 0), d.rewind.class]

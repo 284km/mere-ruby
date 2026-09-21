@@ -3150,6 +3150,22 @@ What is left of the 44:
 
 | left | why |
 |---|---|
-| ARGF's six (`each`, `eof`, `path`, `tell`, `to_a`, `to_i`) | the methods do not exist. ARGF here is "the whole input as one string" while ruby's walks a FILE LIST, so `filename`, `argv`, `pos` and `fileno` are all relative to the current file. Backing it with a StringIO (the way ENV delegates to a Hash) is the shape, but it needs the per-file state first |
-| `Dir#tell`, `IO#tell`, `IO#to_i` | the methods do not exist either |
-| `Marshal.restore`, `Thread.fork` | these resolve to `Kernel#load` and `Kernel#fork`: the class's own singleton method should shadow Kernel's, and reflection reports the wrong owner. Calling them works |
+| ARGF's six (`each`, `eof`, `path`, `tell`, `to_a`, `to_i`) | the methods do not exist. ARGF here is "the whole input as one string" while ruby's walks a FILE LIST, so `filename`, `argv`, `pos` and `fileno` are all relative to the current file. Backing it with a StringIO (the way ENV delegates to a Hash) is the shape, but it needs the per-file state first. These six are all that is left of the 44 |
+
+
+### ...and the three shapes the last of them turned out to be
+
+`Dir#tell` / `IO#tell` / `IO#to_i` were a POSITION the arm already kept and
+never exposed (`@pos`, `@__f_pos` -- `#rewind` and `#eof?` both used it) and a
+second name for `fileno`, which refuses here because a File has no descriptor;
+`to_i` gets the same refusal rather than a NoMethodError, which is also what
+makes the two one method.
+
+`Marshal.restore` and `Thread.fork` resolved to `Kernel#load` and `Kernel#fork`
+-- the class's OWN class method has to shadow Kernel's, and `bm_owner_of` fell
+through to the Kernel arm. Calling them always worked; only reflection reported
+the wrong definition.
+
+⚠ And `Dir#to_path` is the DEFINITION with `path` as its alias, which is the
+opposite of what writing it the other way round suggests. One method either
+way -- but `#original_name` then disagrees, and that is what the spec reads.

@@ -13343,6 +13343,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 7 && str_eq name "closed?") then VBool (str_eq mode "")
        else if (str_len name == 4 && str_eq name "path") || (str_len name == 7 && str_eq name "to_path") then mkstr path
        else if (str_len name == 6 && str_eq name "rewind") then (let _ = map_set ivars (k ++ "@__f_pos") (VInt 0) in VInt 0)
+       // the read position this arm already keeps in @__f_pos -- #rewind and
+       // #eof? both use it, and it simply had no reader or writer.
+       else if (str_len name == 3 && str_eq name "pos") || (str_len name == 4 && str_eq name "tell") then
+         (match map_get ivars (k ++ "@__f_pos") with VInt n -> VInt n | _ -> VInt 0)
+       else if (str_len name == 4 && str_eq name "pos=") || (str_len name == 4 && str_eq name "seek") then
+         (match args with
+          | Cons (VInt n, _) -> (let _ = map_set ivars (k ++ "@__f_pos") (VInt n) in
+                                 if (str_len name == 4 && str_eq name "seek") then VInt 0 else VInt n)
+          | _ -> VInt 0)
        else if (str_len name == 4 && str_eq name "eof?") || (str_len name == 3 && str_eq name "eof") then
          (let content = (if file_exists path then read_file path else "") in
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
@@ -13369,7 +13378,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // buffer (see file_close_obj), and the host interface reads and writes
        // whole files. Refusing says so where a made-up number would not -- the
        // same choice as the UDP and UNIX sockets.
-       else if (str_len name == 6 && str_eq name "fileno") then
+       // ...and #to_i is that same question under its other name, so it gets
+       // the same refusal rather than a NoMethodError -- which is also what
+       // makes the two one method.
+       else if (str_len name == 6 && str_eq name "fileno") || (str_len name == 4 && str_eq name "to_i") then
          raise_exc world "NotImplementedError"
            "fileno is not available: mere-ruby's File has no descriptor"
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of File"))
@@ -13711,12 +13723,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 10 && str_eq name "with_index") || (str_len name == 15 && str_eq name "each_with_index") then
          (let off = (match args with Cons (VInt o9, _) -> o9 | _ -> 0) in
           lz_extend world id "with_index" (arr_new (Cons (VInt off, Cons (VNil, Nil)))))
-       // ⚠ ARRAY arguments only. ruby pulls from any enumerable here, and the
-       //   order it pulls them in is observable; rather than guess at that,
-       //   anything else falls through to the materialising path it used to
-       //   take, which is wrong only in the ways it was already wrong.
-       else if (str_len name == 3 && str_eq name "zip") && lz_all_arrays args then
-         lz_extend world id "zip" (arr_new args)
+       // ⚠ the ARGUMENTS are materialised, the RECEIVER stays lazy. Leaving a
+       //   non-Array argument to the old path meant materialising the source,
+       //   and against an infinite one that was a runaway allocation -- one
+       //   recorded CRASH whose verdict flipped between CRASH and SLOW
+       //   depending on which bound fired first. An argument is pulled here
+       //   rather than in step with the receiver, which is a difference in
+       //   WHEN, not in the rows produced.
+       else if (str_len name == 3 && str_eq name "zip") then
+         (let zs = lz_zip_args env world args in
+          match zs with
+          | VArr _ -> lz_extend world id "zip" zs
+          | _ -> invoke_val_c env world blk (lz_run env world blk id (0 - 1) VNil) name args vischeck)
        else if (str_len name == 4 && str_eq name "to_a") || (str_len name == 5 && str_eq name "force") then lz_run env world blk id (0 - 1) VNil
        else if (str_len name == 5 && str_eq name "eager") then make_enum world (lz_run env world blk id (0 - 1) VNil) "each"
        else if (str_len name == 4 && str_eq name "size") then lz_size env world blk id
@@ -18219,6 +18237,13 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
      // fell through to the Module surface the name was found on.
      else if str_eq a "" && str_eq c2 "Kernel" && is_kernel_builtin nm
              && (if is_kernel_priv_only nm then false else true) then sng
+     // ⚠ THE CLASS'S OWN class method SHADOWS Kernel's. `Marshal.load` and
+     //   `Thread.fork` are Marshal's and Thread's, not Kernel#load and
+     //   Kernel#fork -- the Kernel arm below claimed them, so #owner said
+     //   Kernel and `Marshal.method(:restore) == Marshal.method(:load)` was
+     //   false for two names of one method. Calling them always worked; only
+     //   reflection reported the wrong definition.
+     else if str_eq a "" && builtin_cls_has c2 (canon_alias c2 nm) then sng
      else if str_eq a "" && (is_kernel_pub_instance nm || is_kernel_builtin nm) then "Kernel"
      else a)
   | other ->
@@ -27160,6 +27185,30 @@ and lz_size_ops = fn (ops: Val list) -> fn (n: Val) ->
          | VFlt f9 -> lz_size_ops rest (VFlt f9)
          | _ -> lz_size_ops rest VNil))
      else lz_size_ops rest VNil)
+
+// each zip argument as an Array, or VNil when one of them cannot answer #to_a
+// (which is the only case the lazy path cannot take).
+and lz_zip_args = fn env -> fn world -> fn (xs: Val list) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+  arr_new (lz_zip_args_go env world nb9 xs)
+and lz_zip_args_go = fn env -> fn world -> fn nb9 -> fn (xs: Val list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (x, t) ->
+    (match x with
+     | VArr _ -> Cons (x, lz_zip_args_go env world nb9 t)
+     // ⚠ ASK BY CALLING, not by respond_to?: an Enumerator answers #to_a and
+     //   its respond_to? does not say so, so every enumerator argument came
+     //   back as nils. An argument that cannot become an Array is ruby's
+     //   TypeError, not a column of nils.
+     | _ ->
+       (let r9 = try_or (fn (u: unit) -> invoke_val_c env world nb9 x "to_a" Nil false) VNil in
+        let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+        (match r9 with
+         | VArr _ -> Cons (r9, lz_zip_args_go env world nb9 t)
+         | _ -> (let _ = raise_exc world "TypeError"
+                   ("wrong argument type " ++ display_cls_msg world (dispatch_cls_of world x)
+                    ++ " (must respond to :each)") in Nil))))
 
 // every argument an Array? the lazy zip only claims the case it can answer
 // without deciding the pull order of an arbitrary enumerable.
