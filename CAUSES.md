@@ -10,21 +10,21 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 722 files.
+Classified: 694 files.
 
-## DIFF — 722 files, 146 kinds
+## DIFF — 694 files, 135 kinds
 
 | files | kind |
 |---|---|
 | 227 | `ERROR NoMethodError` |
-| 71 | `ERROR NameError` |
+| 60 | `ERROR NameError` |
 | 36 | `FAILED expected "S", got "S"` |
-| 22 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 21 | `FAILED expected N, got N` |
 | 20 | `FAILED expected true, got false` |
 | 19 | `FAILED expected ArgumentError to be raised` |
+| 15 | `FAILED expected TypeError to be raised` |
+| 15 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 14 | `FAILED expected truthy from #include?` |
-| 14 | `FAILED expected TypeError to be raised` |
 | 13 | `FAILED expected N, got nil` |
 | 12 | `FAILED matcher did not match #<OBJ>` |
 | 12 | `FAILED expected to be identical` |
@@ -131,18 +131,7 @@ Classified: 722 files.
 | 1 | `FAILED expected IndexError to be raised` |
 | 1 | `FAILED expected Errno::EINVAL to be raised` |
 | 1 | `FAILED expected :SYM, got :SYM` |
-| 1 | `FAILED expected #<UnboundMethod: StringIO#tty?() TMPDIR got #<UnboundMethod: StringIO#isatty() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: StringIO#length() TMPDIR got #<UnboundMethod: StringIO#size() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: StringIO#each_line(sep=...) TMPDIR got #<UnboundMethod: StringIO#each(sep=..., &block) TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Pathname#+(other) TMPDIR got #<UnboundMethod: Pathname#/(other) TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#size() TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#length() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#include?(k) TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#member?(k) TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#include?(k) TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#key?(k) TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: ObjectSpace::WeakMap#each(&b) TMPDIR got #<UnboundMethod: ObjectSpace::WeakMap#each_pair(&b) TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Dir#to_path() TMPDIR got #<UnboundMethod: Dir#path() TMPDIR` |
-| 1 | `FAILED expected #<OBJ>, got #<UnboundMethod: StringIO#tell() TMPDIR` |
 | 1 | `FAILED expected #<OBJ>, got "S"` |
-| 1 | `FAILED expected #<Method: Time.xmlschema(str) TMPDIR got #<Method: Time.isoN(str) TMPDIR` |
 | 1 | `FAILED expected #<Method: Time.rfcN(str) TMPDIR got #<Method: Time.rfcN(str) TMPDIR` |
 | 1 | `FAILED expected "x\xNCN\xN` |
 | 1 | `FAILED expected "TMPDIR got nil` |
@@ -168,7 +157,7 @@ Classified: 722 files.
 | files | cause |
 |---|---|
 | 19 | `FAILED: expected ArgumentError to be raised` |
-| 14 | `FAILED: expected TypeError to be raised` |
+| 15 | `FAILED: expected TypeError to be raised` |
 | 6 | `FAILED: expected NoMethodError to be raised` |
 | 5 | `FAILED: expected IOError to be raised` |
 | 4 | `FAILED: raised NoMethodError, expected TypeError` |
@@ -223,28 +212,28 @@ class column says where the weight sits.
 | buffer (21) | `and empty external for free initialize internal locked map mapped not null or private readonly resize shared string transfer valid xor` |
 | file (20) | `absolute_path atime chmod constants ctime flock grpowned initialize mtime new owned pipe rename reopen setuid socket truncate umask world_readable world_writable` |
 | io (19) | `binmode close_read close close_write copy_stream dup fsync pid popen pos pread pwrite readbyte stat sysopen sysread syswrite tell to_i` |
-| process (17) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall waitpid2 waitpid warmup` |
+| process (15) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall warmup` |
 | stat (14) | `atime comparison ctime dev ftype gid inspect mode mtime new owned pipe rdev uid` |
 | module (14) | `alias_method const_defined const_missing const_set const_source_location deprecate_constant included initialize module_exec name public_instance_method refine remove_class_variable remove_const` |
-| thread (13) | `backtrace_locations backtrace current each_caller_location exit fetch fork handle_interrupt ignore_deadlock keys pending_interrupt terminate thread_variables` |
 | converter (12) | `asciicompat_encoding convert convpath destination_encoding finish last_error new primitive_errinfo putback replacement search_convpath source_encoding` |
-| time (11) | `_dump asctime at ceil deconstruct_keys dup floor gm mktime round strftime` |
+| thread (10) | `backtrace_locations backtrace current each_caller_location fetch handle_interrupt ignore_deadlock keys pending_interrupt thread_variables` |
+| time (9) | `_dump asctime at ceil deconstruct_keys dup floor round strftime` |
 | kernel (9) | `autoload binding chomp chop open select singleton_class system test` |
 | fiber (9) | `alive blocking current kill new resume storage transfer yield` |
 | invalid_byte_sequence_error (7) | `destination_encoding_name destination_encoding error_bytes incomplete_input readagain_bytes source_encoding_name source_encoding` |
 | gc (7) | `auto_compact config count garbage_collect measure_total_time stat total_time` |
-| enumerator (7) | `each each_with_object feed initialize new product with_object` |
-| encoding (7) | `aliases compatible find list name_list names to_s` |
 | argf (7) | `argv each eof path tell to_a to_i` |
+| enumerator (6) | `each each_with_object feed initialize new product` |
+| encoding (6) | `aliases compatible find list name_list names` |
 | dir (6) | `delete empty fileno foreach pos tell` |
 | yaml (5) | `dump load_file parse_file parse to_yaml` |
 | undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
 | profiler (5) | `disable enable enabled result total_time` |
 | tms (4) | `cstime cutime stime utime` |
-| pathname (4) | `case_compare empty glob realdirpath` |
 | binding (4) | `implicit_parameter_defined implicit_parameter_get implicit_parameters source_location` |
 | securerandom (3) | `base64 hex random_bytes` |
 | regexp (3) | `timeout escapes subexpression_call` |
+| pathname (3) | `empty glob realdirpath` |
 | objectspace (3) | `_id2ref each_object garbage_collect` |
 | warning (2) | `categories warn` |
 | stringio (2) | `eof seek` |
@@ -261,7 +250,6 @@ class column says where the weight sits.
 | proc (1) | `new` |
 | monitor (1) | `synchronize` |
 | method (1) | `super_method` |
-| marshal (1) | `restore` |
 | main (1) | `define_method` |
 | location (1) | `base_label` |
 | lazy (1) | `chunk` |

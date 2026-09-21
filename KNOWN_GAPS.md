@@ -3118,3 +3118,38 @@ UnboundMethods.
 |---|---|
 | the local time zone | there is no zone database here. `#utc_offset` is 0, `#zone` is "UTC" or nil, and a Time that is not marked UTC prints `+0000`. `Time.now.iso8601` is therefore Z-relative where ruby shows the machine's offset |
 | `Time.respond_to?(:utc)` and the other CLASS methods | there is no table for class-level respond_to? at all -- not for Time and not for any other dispatcher class -- so `Time.method(:gm) == Time.method(:utc)` is still a NameError. That is one table, and it would answer for every class at once |
+
+
+## "X is an alias of Y" is one question asked of four tables
+
+Forty-four of the record's files open by comparing two names as one Method --
+`Time.instance_method(:tv_nsec) == Time.instance_method(:nsec)`. A name that
+DISPATCHES is not enough. Four things have to agree, and each was missing
+somewhere:
+
+| table | what it decides | symptom when missing |
+|---|---|---|
+| the arm's ENTRY guard | whether the implementation is reached at all | the method answers "undefined" however well it is written |
+| `builtin_obj_has` | `respond_to?` | callable, but respond_to? says false |
+| `builtin_owns_here` | `instance_method` | `X.instance_method(:m)` is a NameError |
+| `canon_alias` | which of two names is the definition | both exist, and the two Methods compare unequal |
+
+⚠ And `builtin_cls_has` is a FIFTH, for class methods: it did not exist at all,
+so `Time.respond_to?(:utc)` was false and `Time.method(:gm)` a NameError -- for
+every class in the dispatcher, not just Time.
+
+⚠ The direction is per class and cannot be guessed by symmetry: `File#path` is
+the ALIAS and `to_path` the canonical, while for `IO` it is the other way
+round. Every pair here was read out of the ruby/spec file that asserts it.
+
+⚠ For a class written in RUBY (StringIO, Pathname), the fix is `alias`, not a
+table row: two `def`s that behave the same are two methods, and reflection is
+right to say so. Four StringIO files were exactly that.
+
+What is left of the 44:
+
+| left | why |
+|---|---|
+| ARGF's six (`each`, `eof`, `path`, `tell`, `to_a`, `to_i`) | the methods do not exist. ARGF here is "the whole input as one string" while ruby's walks a FILE LIST, so `filename`, `argv`, `pos` and `fileno` are all relative to the current file. Backing it with a StringIO (the way ENV delegates to a Hash) is the shape, but it needs the per-file state first |
+| `Dir#tell`, `IO#tell`, `IO#to_i` | the methods do not exist either |
+| `Marshal.restore`, `Thread.fork` | these resolve to `Kernel#load` and `Kernel#fork`: the class's own singleton method should shadow Kernel's, and reflection reports the wrong owner. Calling them works |
