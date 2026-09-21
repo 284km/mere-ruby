@@ -2991,78 +2991,68 @@ which is not decoration: `BasicObject` does not include it, and
 Without that test the route answered for every receiver and took two recorded
 rows with it.
 
-## The four roots behind the record's ten CRASH rows
+## The ten CRASH rows are closed, and what each one really was
 
-Measured 2026-09-20, when `core` and `language` were swept in full for the
-first time. A CRASH row means mere-ruby printed no tally at all where ruby ran
-the file's examples -- the process died, so the other examples in that file
-were never asked either.
+Measuring `core` and `language` in full put ten aborts in the record. All ten
+are gone. Each was one of two shapes: a CYCLE nobody had guarded, or a REFUSAL
+that killed the process where ruby raises.
 
-### `Enumerator::Lazy` materialises for the buffering operators (0 CRASH, 7 SLOW)
+### `Enumerator::Lazy` materialised its source (was 4 CRASH, 8 SLOW)
 
-The pipeline keeps a list of ops and pushes ONE element through it at a time.
+The pipeline keeps a list of ops and pushes ONE element through at a time.
 Every operator missing from that list fell through to `lz_run ... (-1)`, which
-runs the source to the end first -- against `(1..Float::INFINITY).lazy` an
+runs the source to the end FIRST -- against `(1..Float::INFINITY).lazy` an
 allocation loop that reached 6-17 GB before `mspec/rss_guard.sh` killed it.
-`grep`, `grep_v`, `uniq`, `compact`, `flat_map`/`collect_concat`, `with_index`,
-`each_with_index`, `zip` over Arrays and the no-argument `to_enum` are lazy
-now, all measured against the reference and held by corpus/206.
 
-⚠ Two of those are counter-intuitive, and both were nearly written backwards:
-`uniq { blk }` dedupes by the BLOCK's value and emits the ORIGINAL, and
-`with_index { blk }` runs the block and emits the ORIGINAL -- so
-`inf.with_index { 99 }.first(3)` is `[1, 2, 3]`, not `[99, 99, 99]`.
+Lazy now: `grep`, `grep_v`, `uniq`, `compact`, `flat_map`/`collect_concat`,
+`with_index`, `each_with_index`, `zip` over Arrays, the no-argument `to_enum`,
+and the BUFFERING five -- `chunk`, `chunk_while`, `slice_before`,
+`slice_after`, `slice_when` -- which emit a group at a boundary and so need a
+flush when the source ends (`lz_flush`), or the last group is simply lost.
 
-What still materialises, and why it is a different shape of work:
+⚠ Three of those read backwards from the name, and all three were measured:
+`uniq { blk }` dedupes by the BLOCK's value and emits the ORIGINAL;
+`with_index { blk }` runs the block and emits the ORIGINAL, so
+`inf.with_index { 99 }.first(3)` is `[1, 2, 3]`; and `#size` is preserved by
+map/with_index/zip, arithmetic for take/drop, and nil for everything that can
+drop or multiply elements, because none of those can say how many survive
+without running the source.
 
-| operator | why |
+Still materialising, on purpose: `to_enum(:m, ...)` by method name (it needs a
+lazy version of whatever `m` is), and `zip` over a non-Array (ruby pulls from
+any enumerable and the ORDER it pulls in is observable, so claiming only the
+Array case is a refusal that names what it refused).
+
+### A cycle is a third container kind, and only two were guarded (was 3 CRASH)
+
+Arrays and hashes printed `[...]` and `{...}`; everything else walked forever.
+
+| what | was |
 |---|---|
-| `chunk`, `chunk_while`, `slice_before`, `slice_after`, `slice_when` | they emit a GROUP at a boundary, so they hold a buffer and must flush it when the source ends. `lz_run` has no hook there: it drives `each` and returns |
-| `to_enum(:m, ...)` | naming a method means running THAT method lazily. `to_enum(:each_slice, 2)` needs a lazy `each_slice`, which the pipeline has no kind for |
-| `zip` over a non-Array | ruby pulls from any enumerable, and the ORDER it pulls in is observable (the spec checks it). Claiming Arrays only is a refusal that names what it refused |
+| `#inspect` of an object holding itself | SIGSEGV. It shows the address again and then `...`, as ruby does |
+| `Marshal.dump` of a cycle | SIGSEGV. It writes ruby's OBJECT TABLE now: every non-immediate, non-Symbol value gets an index the first time it is written and a later mention is `@<index>`. Symbols have their own table and do not consume one; Floats do. That is also why `[s, s]` writes the string once, and the READ side registers containers BEFORE their contents so a cycle can resolve |
+| `==` and `eql?` between two cycles | SIGSEGV. A pair already on the comparison stack is taken as equal, which terminates the walk -- and `[1,[...]] == [2,[...]]` is still false, because the 1 and the 2 differ before the cycle closes |
+| `Thread.new { Thread.current.exit }.value` | SIGSEGV, and a good illustration: this model runs the body to completion, so the block returned the THREAD and the thread ended up holding itself. A killed thread's value is nil now |
 
-⚠ And the arm is guarded by the names it implements, not by the class. Entering
-on the class alone made it a wall: the chain ends in `raise NoMethodError`, so
-`equal?`, `frozen?` and `tap` died there instead of reaching Object's own arms.
-`lazy.to_enum.equal?(l)` is in the spec, and a Lazy could not answer it.
+### A regexp literal this engine cannot compile (was 2 CRASH)
 
-`Enumerator::Lazy.new(obj, size) { |y, v| }` and `Lazy#size` are answered now
--- most of the group's files ask for both in their first example. #size follows
-the reference exactly: `map`, `with_index` and `zip` preserve it, `take(k)` and
-`drop(k)` do the arithmetic, and `select`, `grep`, `uniq`, `compact`,
-`flat_map`, `take_while` and the rest give nil, because none of them can say
-how many elements survive without running the source.
+`\g<1>` (subexpression call by NUMBER), `\k<-1>` (relative) and `\k<01>`
+(zero-padded) are implemented -- ruby refuses all three once the pattern has a
+NAMED group, and refuses group 0 always, and so does this.
 
-⚠ The group is 3 of 30. What blocks most of the rest now is REFLECTION: the
-files say `Enumerator::Lazy.instance_method(:collect)` to check that `collect`
-is an alias of `map`, and these names live in the dispatcher, which neither
-`builtin_owns_here` nor `builtin_obj_has` has a row for. `lz_pipe_name` is
-already the list of names the arm implements; giving both doors that list (and
-`canon_alias` the pairs) is the next increment.
+⚠ The deeper defect was the REFUSAL. The load-time check validates every
+literal with `rx_lenient` set, under which an unsupported construct parses as
+empty instead of failing -- so the literal passed the check and then died in
+the REAL parse, at MATCH time, inside `rxc_get`. Two things changed: the check
+now tells "malformed" (still a SyntaxError, as in ruby) from "unsupported"
+(left alone), and `rxc_get` raises RegexpError instead of `fail`ing. A literal
+using a construct this engine lacks now costs its own example, not the file.
+`Regexp.new` had always answered RegexpError for exactly these patterns.
 
-### A stack overflow, not an exception (3 CRASH)
+### `Enumerator::Product` did not exist (was 1 CRASH)
 
-`core/marshal` dump/load and `core/thread` value die with SIGSEGV inside the
-stack region -- reported as "stack overflow (recursion too deep)" by the Mere
-runtime's own handler, which knows the real bounds. The binary is linked with
-`-stack_size 0x20000000` (512 MB), so this is a recursion that goes deeper than
-512 MB and not a small-stack problem. ⚠ Ruby answers deep recursion with
-`SystemStackError`, which a spec can rescue; a SIGSEGV takes the file with it.
-
-### Numbered backreferences and subexpression calls (2 CRASH)
-
-The by-NAME spellings work: `\k<name>` and `\g<name>` both parse, and `\g` is
-inlined rather than called (see the comment at `rxp_esc`). The NUMBERED ones do
-not: `\g<1>`, `\k<-1>` (relative) and `\k<01>` (zero-padded) all reach the
-"undefined group reference" arm, which `fail`s. ⚠ `Regexp.new` turns that into
-a RegexpError correctly -- it is the LITERAL path that takes the process down,
-so one unsupported literal costs a whole file. ruby accepts all three.
-
-### `Enumerator::Product` does not exist (1 CRASH)
-
-`Enumerator::Product` is the class `Enumerator.product` returns (ruby 3.2).
-The constant is absent, so the file dies on line 2.
-
+It is ordinary ruby -- a depth-first walk and a product of sizes -- so it is
+ruby source behind an autoload on the constant, like `Data`.
 
 ## StringIO answers the IO surface now, with one gap left on purpose
 

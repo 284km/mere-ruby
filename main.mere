@@ -653,6 +653,9 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter modules mk in
   let _ = map_iter mrsh_dsyms mk in
   let _ = map_iter mrsh_syms mk in
+  // the load-side object table DOES hold values (the objects read so far), so
+  // unlike its write-side twin it is a real root.
+  let _ = map_iter mrsh_rlinks mk in
   let _ = map_iter parser_flags mk in
   let _ = map_iter pending_home mk in
   let _ = map_iter prim_missing mk in
@@ -7511,11 +7514,20 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
       aseq_inspect_str env world oid
     else if str_eq cls "Enumerator" || str_eq cls "Enumerator::Lazy" then
       enum_inspect_str env world oid cls
+    // ⚠ A SELF-REFERENTIAL OBJECT recursed until the stack died, while the
+    //   array and the hash beside it printed "[...]" and "{...}". That is the
+    //   third container kind and it had no guard: `class C; def initialize;
+    //   @me = self; end; end; p C.new` was a SIGSEGV, and so was
+    //   `Thread.new { Thread.current.exit }.value` (the thread ends up holding
+    //   itself). ruby shows the address again and then "...".
+    else if map_has insp_seen ("o" ++ str_of_int oid) then
+      "#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 oid ++ " ...>"
     else
       // ruby 4.0: Kernel#inspect asks #instance_variables_to_inspect first. An
       // array names the ivars to show (in the object's own order, unset names
       // skipped); nil -- the Kernel default -- means all of them.
-      (let ivs = (if has_meth world cls "instance_variables_to_inspect" then
+      (let _ = map_set insp_seen ("o" ++ str_of_int oid) 1 in
+       let ivs = (if has_meth world cls "instance_variables_to_inspect" then
                     (let nb0 = (false, (Nil : str list), (Nil : Stmt list), env) in
                      match invoke world nb0 v cls "instance_variables_to_inspect" Nil with
                      | VArr aid -> obj_ivar_dump_sel env world oid cls (deref aid)
@@ -7535,7 +7547,9 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        // that had ever been given a singleton method printed its singleton,
        // through `p`, #inspect, #to_s and the "undefined method for ..."
        // message alike.
-       "#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">")
+       let r8 = "#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 oid ++ (if str_eq ivs "" then "" else " " ++ ivs) ++ ">" in
+       let _ = map_delete insp_seen ("o" ++ str_of_int oid) in
+       r8)
   | VArr id ->
     if map_has insp_seen ("a" ++ str_of_int id) then "[...]"
     else
@@ -13573,6 +13587,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | Cons (pat, _) -> lz_extend world id name (arr_new (Cons (pat, Cons (VNil, Nil))))
           | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
        else if (str_len name == 4 && str_eq name "uniq") then lz_extend world id "uniq" VNil
+       // slice_before/slice_after also take a PATTERN instead of a block
+       else if ((str_len name == 12 && str_eq name "slice_before") || (str_len name == 11 && str_eq name "slice_after"))
+               && (match args with Cons (_, _) -> true | _ -> false) then
+         (match args with
+          | Cons (pat, _) -> lz_extend world id name (arr_new (Cons (pat, Cons (VNil, Nil))))
+          | _ -> VNil)
        else if (str_len name == 7 && str_eq name "compact") then lz_extend world id "compact" VNil
        else if (str_len name == 10 && str_eq name "with_index") || (str_len name == 15 && str_eq name "each_with_index") then
          (let off = (match args with Cons (VInt o9, _) -> o9 | _ -> 0) in
@@ -14724,7 +14744,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else if (str_len name == 5 && str_eq name "stop?") then
             VBool (if alive then (match tst with VStr h -> str_eq (sget h) "sleep" | _ -> false) else true)
           else if (str_len name == 4 && str_eq name "kill") || (str_len name == 4 && str_eq name "exit") || (str_len name == 9 && str_eq name "terminate") then
-            (let _ = (if alive then map_set ivars (k ++ "@__tst") (VBool false) else ()) in recv)
+            // ⚠ a killed thread's #value is nil. This model runs the body to
+            //   completion, so `Thread.new { Thread.current.exit }` ended with
+            //   the block returning the THREAD (that is what #exit answers) and
+            //   the thread holding ITSELF -- which #inspect then recursed on
+            //   until the stack died. The mark below tells the Thread.new
+            //   boundary to keep nil instead of the block's value.
+            (let _ = (if alive then (let _ = map_set ivars (k ++ "@__tkill") (VBool true) in
+                                     map_set ivars (k ++ "@__tst") (VBool false)) else ()) in recv)
           else if (str_len name == 5 && str_eq name "raise") then
             // raising into a parked thread kills it with the exception (join
             // re-raises); raising into a dead thread is a no-op.
@@ -16041,6 +16068,12 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             (let pid = map_len proc_store in
              let _ = store_proc (str_of_int pid) newblk in
              lz_extend world id "uniq" (VProc pid))
+          else if (str_len name == 12 && str_eq name "slice_before") || (str_len name == 11 && str_eq name "slice_after")
+                  || (str_len name == 10 && str_eq name "slice_when") || (str_len name == 11 && str_eq name "chunk_while")
+                  || (str_len name == 5 && str_eq name "chunk") then
+            (let pid = map_len proc_store in
+             let _ = store_proc (str_of_int pid) newblk in
+             lz_extend world id name (arr_new (Cons (VNil, Cons (VProc pid, Nil)))))
           else if (str_len name == 8 && str_eq name "flat_map") || (str_len name == 14 && str_eq name "collect_concat") then
             (let pid = map_len proc_store in
              let _ = store_proc (str_of_int pid) newblk in
@@ -16330,7 +16363,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                   let _ = map_set iv3 (str_of_int tid ++ "@__texc") other in
                   map_set iv3 (str_of_int tid ++ "@__tst") VNil)
              | other ->
-               let _ = map_set iv3 (str_of_int tid ++ "@__tval") (flow_value other) in
+               let _ = map_set iv3 (str_of_int tid ++ "@__tval")
+                         (if map_has iv3 (str_of_int tid ++ "@__tkill") then VNil else flow_value other) in
                map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)) in
           VObj tid)
        // Thread.new { } runs the block synchronously but with a FRESH catch
@@ -18724,7 +18758,21 @@ and hng_sng_has = fn world -> fn (recv: Val) -> fn (name: str) ->
 and rb_eql = fn (a: Val) -> fn (b: Val) ->
   if str_eq (class_name a) (class_name b) then
     (match a with
-     | VArr ia -> (match b with VArr ib -> val_eql_list (deref ia) (deref ib) | _ -> false)
+     // the same cycle guard rb_eq needs, for the same reason: eql? walks the
+     // elements too, and a self-referential array walked forever.
+     | VArr ia ->
+       (match b with
+        | VArr ib ->
+          (if ia == ib then true
+           else
+             (let k7 = "q" ++ str_of_int ia ++ ":q" ++ str_of_int ib in
+              if map_has eq_seen k7 then true
+              else
+                (let _ = map_set eq_seen k7 (VInt 1) in
+                 let r7 = val_eql_list (deref ia) (deref ib) in
+                 let _ = map_delete eq_seen k7 in
+                 r7)))
+        | _ -> false)
      // ⚠ Two Complexes are eql? when each PART is eql?, which is stricter than
      // ==: `Complex(1,2).eql?(Complex(1.0,2.0))` is false in ruby. Both are
      // class Complex, so the outer check passed and rb_eq compared them
@@ -19653,7 +19701,27 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (str_len name == 3 && str_eq name "tap") then
     prim_raise "LocalJumpError" "no block given (yield)"
   else if (str_len name == 7 && str_eq name "__regex") then
-    (match recv with VStr sp0 -> (let sp = sget sp0 in rx_build_once sp (match args with Cons (VStr f, _) -> sget f | _ -> "") (rx_one_enc recv) args) | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
+    // ⚠ AN UNSUPPORTED LITERAL MUST NOT KILL THE PROCESS. The load-time check
+    //   (rx_check_go) validates with rx_lenient set, under which an unsupported
+    //   group like `(?(cond)a|b)` parses as empty instead of failing -- so the
+    //   literal passed the check and then died in the REAL parse, taking the
+    //   whole file with it. `Regexp.new` answers RegexpError for exactly these
+    //   patterns; a literal now does the same, at the point it is evaluated.
+    //   language/regexp/back-references_spec.rb was one recorded CRASH for one
+    //   construct in one example, with 30 others in the file that do run.
+    (match recv with
+     | VStr sp0 ->
+       (let sp = sget sp0 in
+        let fl9 = (match args with Cons (VStr f, _) -> sget f | _ -> "") in
+        let r9 = try_or (fn (u: unit) -> rx_build_once sp fl9 (rx_one_enc recv) args) VNil in
+        (match r9 with
+         | VNil ->
+           // a caught `fail` leaves its message behind, and the next real
+           // failure would be reported as this one.
+           (let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+            prim_raise "RegexpError" ("invalid regular expression: /" ++ sp ++ "/"))
+         | _ -> r9))
+     | _ -> (let _ = map_set prim_missing "n" (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
   // Regexp#casefold?: the `i` flag, which #options already carries as bit 0.
   else if (str_len name == 9 && str_eq name "casefold?") && (match recv with VRegex _ -> true | _ -> false) then
     (match recv with VRegex (_, fl, _) -> VBool (str_contains fl "i") | _ -> VBool false)
@@ -26663,6 +26731,14 @@ and lz_run = fn env -> fn world -> fn blk -> fn (id: int) -> fn (bound: int) -> 
                 if str_eq ecls "StopIteration" then (let _ = map_delete ivars0 "$exc" in ())
                 else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)"))
            | _ -> ()) in
+  // ⚠ the buffering operators are still holding their last group. Skip it when
+  //   the bound is already met -- `first(3)` has its three, and flushing would
+  //   hand it a fourth.
+  let _ = (let nacc = (match accv with VArr a8 -> val_list_len (deref a8) | _ -> 0) in
+           if bound >= 0 && nacc >= bound then ()
+           else (let _ = try_or (fn (u: unit) -> let _ = lz_flush env world blk did (lz_ops world id) 0 in true) false in
+                 let _ = (if map_has ivars0 "$exc" then map_delete ivars0 "$exc" else ()) in
+                 (if map_has prim_missing "i" then map_delete prim_missing "i" else ()))) in
   accv
 
 // one element through the pipeline (called from the collector via __lzstep).
@@ -26734,6 +26810,67 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
     // element, and whatever it pushes goes on down the rest of the pipeline.
     // It may push none (a filter), one, or several -- which is why it cannot
     // be a map and needs the yielder rather than a return value.
+    // the BUFFERING operators: they emit a GROUP at a boundary, so each keeps a
+    // buffer and the group goes downstream only when the boundary arrives --
+    // and whatever is left when the source ends is flushed by lz_flush. Every
+    // shape below was measured against the reference, infinite and finite.
+    else if str_eq kind "slice_before" || str_eq kind "slice_after"
+            || str_eq kind "slice_when" || str_eq kind "chunk_while" || str_eq kind "chunk" then
+      (let (pat, bfn) = (match payload with
+                         | VArr baid0 -> (match deref baid0 with
+                                          | Cons (p9, Cons (f9, _)) -> (p9, f9)
+                                          | _ -> (VNil, VNil))
+                         | _ -> (VNil, VNil)) in
+       let bk = str_of_int did ++ "@__sb" ++ str_of_int i in
+       let bufv = (if map_has ivars0 bk then map_get ivars0 bk
+                   else (let a9 = arr_new Nil in let _ = map_set ivars0 bk a9 in a9)) in
+       (match bufv with
+        | VArr baid ->
+          (let cur = deref baid in
+           let filled = (match cur with Nil -> false | _ -> true) in
+           let call1 = fn (x: Val) ->
+             (match bfn with
+              | VProc fp1 -> truthy (flow_value (run_block world blk (map_get proc_store (str_of_int fp1)) (Cons (x, Nil))))
+              | _ -> case_eqq world pat x) in
+           let key1 = fn (x: Val) ->
+             (match bfn with
+              | VProc fp2 -> flow_value (run_block world blk (map_get proc_store (str_of_int fp2)) (Cons (x, Nil)))
+              | _ -> VNil) in
+           let call2 = fn (a9: Val) -> fn (b9: Val) ->
+             (match bfn with
+              | VProc fp3 -> truthy (flow_value (run_block world blk (map_get proc_store (str_of_int fp3)) (Cons (a9, Cons (b9, Nil)))))
+              | _ -> false) in
+           let pk = str_of_int did ++ "@__sp" ++ str_of_int i in
+           let prev = (if map_has ivars0 pk then map_get ivars0 pk else VNil) in
+           let _ = map_set ivars0 pk v in
+           if str_eq kind "slice_before" then
+             (if filled && call1 v
+              then (let _ = arr_set baid (Cons (v, Nil)) in lz_step_ops env world blk did rest (i + 1) (arr_new cur))
+              else (let _ = arr_set baid (list_append cur (Cons (v, Nil))) in VNil))
+           else if str_eq kind "slice_after" then
+             (let cur2 = list_append cur (Cons (v, Nil)) in
+              if call1 v
+              then (let _ = arr_set baid Nil in lz_step_ops env world blk did rest (i + 1) (arr_new cur2))
+              else (let _ = arr_set baid cur2 in VNil))
+           else if str_eq kind "slice_when" then
+             (if filled && call2 prev v
+              then (let _ = arr_set baid (Cons (v, Nil)) in lz_step_ops env world blk did rest (i + 1) (arr_new cur))
+              else (let _ = arr_set baid (list_append cur (Cons (v, Nil))) in VNil))
+           else if str_eq kind "chunk_while" then
+             (if filled && (if call2 prev v then false else true)
+              then (let _ = arr_set baid (Cons (v, Nil)) in lz_step_ops env world blk did rest (i + 1) (arr_new cur))
+              else (let _ = arr_set baid (list_append cur (Cons (v, Nil))) in VNil))
+           else
+             // chunk: consecutive elements sharing a key, emitted as [key, [elems]]
+             (let kk = str_of_int did ++ "@__sk" ++ str_of_int i in
+              let key = key1 v in
+              let pkey = (if map_has ivars0 kk then map_get ivars0 kk else VNil) in
+              let _ = map_set ivars0 kk key in
+              if (if filled then false else true) then (let _ = arr_set baid (Cons (v, Nil)) in VNil)
+              else if rb_eq pkey key then (let _ = arr_set baid (list_append cur (Cons (v, Nil))) in VNil)
+              else (let _ = arr_set baid (Cons (v, Nil)) in
+                    lz_step_ops env world blk did rest (i + 1) (arr_new (Cons (pkey, Cons (arr_new cur, Nil)))))))
+        | _ -> lz_step_ops env world blk did rest (i + 1) v))
     else if str_eq kind "gen" then
       (let yid = alloc_oid ocls0 in
        let _ = map_set ocls0 yid "Enumerator::Yielder" in
@@ -26805,6 +26942,40 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
        lz_step_ops env world blk did rest (i + 1) (arr_new (Cons (v, lz_zip_row others c))))
     else lz_step_ops env world blk did rest (i + 1) v
 
+// what a buffering operator is still holding when the source ends. ⚠ Without
+// this the last group is simply lost: `[1,2,3,4,5].lazy.slice_before { .. }`
+// would answer [[1,2]] and drop [3,4,5]. Left to right, because flushing op i
+// pushes into ops after i -- and a buffering op downstream may then have
+// something of its own to flush.
+and lz_flush = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val list) -> fn (i: int) ->
+  let (m0, s0, ocls0, ivars0) = world in
+  match ops with
+  | Nil -> ()
+  | Cons (opv, rest) ->
+    (let kind = (match opv with
+                 | VArr oaid -> (match deref oaid with Cons (VStr kh, _) -> sget kh | _ -> "")
+                 | _ -> "") in
+     let _ = (if str_eq kind "slice_before" || str_eq kind "slice_after" || str_eq kind "slice_when"
+                 || str_eq kind "chunk_while" || str_eq kind "chunk"
+              then
+                (let bk = str_of_int did ++ "@__sb" ++ str_of_int i in
+                 (match (if map_has ivars0 bk then map_get ivars0 bk else VNil) with
+                  | VArr baid ->
+                    (match deref baid with
+                     | Nil -> ()
+                     | cur ->
+                       (let _ = arr_set baid Nil in
+                        let out = (if str_eq kind "chunk"
+                                   then (let kk = str_of_int did ++ "@__sk" ++ str_of_int i in
+                                         let pkey = (if map_has ivars0 kk then map_get ivars0 kk else VNil) in
+                                         arr_new (Cons (pkey, Cons (arr_new cur, Nil))))
+                                   else arr_new cur) in
+                        let _ = lz_step_ops env world blk did rest (i + 1) out in ()))
+                  | _ -> ())
+               )
+              else ()) in
+     lz_flush env world blk did rest (i + 1))
+
 // has this value already been emitted by a lazy `uniq`? ruby dedupes with
 // eql?/hash, which for these purposes is rb_eql over the keys kept so far.
 and lz_seen = fn (xs: Val list) -> fn (k: Val) ->
@@ -26867,21 +27038,6 @@ and lz_size_ops = fn (ops: Val list) -> fn (n: Val) ->
          | VFlt f9 -> lz_size_ops rest (VFlt f9)
          | _ -> lz_size_ops rest VNil))
      else lz_size_ops rest VNil)
-
-// the names the Enumerator::Lazy arm implements, which is also the list that
-// decides whether it answers at all (see the guard). Anything not here and not
-// an enumerable name belongs to Object, not to Lazy.
-and lz_pipe_name = fn (name: str) ->
-  (str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop") ||
-  (str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "to_a") ||
-  (str_len name == 5 && str_eq name "force") || (str_len name == 5 && str_eq name "eager") ||
-  (str_len name == 4 && str_eq name "lazy") || (str_len name == 7 && str_eq name "inspect") ||
-  (str_len name == 4 && str_eq name "to_s") || (str_len name == 4 && str_eq name "grep") ||
-  (str_len name == 6 && str_eq name "grep_v") || (str_len name == 4 && str_eq name "uniq") ||
-  (str_len name == 7 && str_eq name "compact") || (str_len name == 10 && str_eq name "with_index") ||
-  (str_len name == 15 && str_eq name "each_with_index") || (str_len name == 3 && str_eq name "zip") ||
-  (str_len name == 7 && str_eq name "to_enum") || (str_len name == 8 && str_eq name "enum_for") ||
-  (str_len name == 4 && str_eq name "size")
 
 // every argument an Array? the lazy zip only claims the case it can answer
 // without deciding the pull order of an arbitrary enumerable.
@@ -27161,22 +27317,41 @@ and mrsh_val = fn world -> fn (s: str) -> fn (i: int) ->
     (let (n, j) = mrsh_long s (i + 1) in
      let v = mkstr (substring s j (j + n)) in
      let _ = (match v with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in
+     // a String takes an object index too, in the same order the writer gave
+     // it -- the `I` wrapper around it does not take one of its own.
+     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) v in
      (v, j + n))
   else if str_eq t "f" then
     (let (n, j) = mrsh_long s (i + 1) in
      let txt = substring s j (j + n) in
-     ((if str_eq txt "inf" then VFlt (1.0 / 0.0)
-       else if str_eq txt "-inf" then VFlt (0.0 - 1.0 / 0.0)
-       else if str_eq txt "nan" then VFlt (0.0 / 0.0)
-       else VFlt (float_of_str txt)), j + n))
+     let fv = (if str_eq txt "inf" then VFlt (1.0 / 0.0)
+               else if str_eq txt "-inf" then VFlt (0.0 - 1.0 / 0.0)
+               else if str_eq txt "nan" then VFlt (0.0 / 0.0)
+               else VFlt (float_of_str txt)) in
+     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) fv in
+     (fv, j + n))
+  // ⚠ the container claims its index BEFORE its elements are read. A
+  //   self-referential array is written as `[` length `@0`, and the `@0` can
+  //   only resolve to an array that already exists -- so it is created empty,
+  //   registered, filled.
   else if str_eq t "[" then
     (let (n, j) = mrsh_long s (i + 1) in
+     let av = arr_new Nil in
+     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) av in
      let (xs, j2) = mrsh_vals world s j n Nil in
-     (arr_new xs, j2))
+     let _ = (match av with VArr aid -> arr_set aid xs | _ -> ()) in
+     (av, j2))
   else if ord t == 123 then
     (let (n, j) = mrsh_long s (i + 1) in
+     let hv = mkhash Nil in
+     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) hv in
      let (xs, j2) = mrsh_vals world s j (n * 2) Nil in
-     (mkhash (hash_merge Nil xs), j2))
+     let _ = (match hv with VHsh hid -> hset hid (hash_merge Nil xs) | _ -> ()) in
+     (hv, j2))
+  // "@<index>" -- a value already written once in this stream.
+  else if str_eq t "@" then
+    (let (k, j) = mrsh_long s (i + 1) in
+     ((if map_has mrsh_rlinks (str_of_int k) then map_get mrsh_rlinks (str_of_int k) else VNil), j))
   // `I` wraps an object in its instance variables; for a String they are the
   // encoding, which mere-ruby tracks separately, so the pairs are consumed
   // and dropped.
@@ -27220,7 +27395,35 @@ and mrsh_ivars = fn world -> fn (s: str) -> fn (i: int) -> fn (n: int) -> fn (ow
 
 // a symbol is written out once; later mentions are ";" plus its index.
 
+// ⚠ THE OBJECT TABLE. ruby gives every non-immediate, non-Symbol value an
+// index the first time it writes it, counting from 0 at the top level, and
+// writes "@<index>" for any later mention. Without it `a = []; a << a;
+// Marshal.dump(a)` recursed until the stack died -- one CRASH row for one
+// example -- and every "uses object links for objects repeatedly dumped"
+// example wrote the object twice. Symbols are NOT here: they have their own
+// table (";<index>") and do not consume an object index. Floats ARE: ruby's
+// flonums make `[1.5, 1.5]` two mentions of one object, and it links them.
+and mrsh_link_key = fn (v: Val) ->
+  match v with
+  | VStr h -> "s" ++ str_of_int h
+  | VArr id -> "a" ++ str_of_int id
+  | VHsh id -> "h" ++ str_of_int id
+  | VObj id -> "o" ++ str_of_int id
+  | VFlt f -> "f" ++ mrsh_float_text f
+  | _ -> ""
+
 and mrsh_dump_val = fn world -> fn (v: Val) ->
+  let k = mrsh_link_key v in
+  if str_eq k "" then mrsh_dump_val_raw world v
+  else if map_has mrsh_links k then
+    "@" ++ mrsh_dump_long (match map_get mrsh_links k with VInt n9 -> n9 | _ -> 0)
+  else
+    // the index is claimed BEFORE the body is written, which is what makes a
+    // cycle terminate: the inner mention finds the entry already there.
+    (let _ = map_set mrsh_links k (VInt (map_len mrsh_links)) in
+     mrsh_dump_val_raw world v)
+
+and mrsh_dump_val_raw = fn world -> fn (v: Val) ->
   match v with
   | VNil -> "0"
   | VBool b -> (if b then "T" else "F")
@@ -27264,9 +27467,11 @@ and mrsh_dump_vals = fn world -> fn (xs: Val list) ->
 
 and mrsh_dump = fn world -> fn (v: Val) ->
   let _ = map_clear mrsh_dsyms in
+  let _ = map_clear mrsh_links in
   chr 4 ++ chr 8 ++ mrsh_dump_val world v
 
 and mrsh_load = fn world -> fn (s: str) ->
+  let _ = map_clear mrsh_rlinks in
   if str_len s < 3 then raise_exc world "ArgumentError" "marshal data too short"
   else if (if mrsh_at s 0 == 4 && mrsh_at s 1 <= 8 then false else true) then
     raise_exc world "TypeError" "incompatible marshal file format"
@@ -31028,7 +31233,29 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
             && (str_eq (char_at pat (p + 1)) "<" || str_eq (char_at pat (p + 1)) "'") then
       (let close = (if str_eq (char_at pat (p + 1)) "<" then ">" else "'") in
        let (nm, p2) = rxp_name pat (p + 2) close "" in
-       if str_eq c "k" then
+       // ⚠ NUMBERED backreferences and calls. `\k<1>` is group 1, `\k<-1>` is
+       //   the group one BEFORE here (g is the next number, so g - 1), and
+       //   `\k<01>` is group 1 zero-padded. ruby refuses all of them once the
+       //   pattern has a NAMED group ("numbered backref/call is not allowed"),
+       //   and refuses group 0 always. Only the by-NAME spellings were parsed,
+       //   and a literal that fell through took the process down with it.
+       if rx_num_ref nm then
+         (let tgt = rx_num_ref_target nm g in
+          if map_len rx_gnums > 0 then
+            (let __fm = "mere-ruby: regexp parse: numbered backref/call is not allowed. (use name)" in
+             let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
+          else if tgt <= 0 then
+            (let __fm = ("mere-ruby: regexp parse: invalid backref number: " ++ nm) in
+             let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
+          else if str_eq c "k" then (NBackref (tgt, str_contains fl "i"), p2, g)
+          else
+            (let bk = "#" ++ str_of_int tgt in
+             if map_has rx_gbodies bk
+             then (let src = (match map_get rx_gbodies bk with VStr h -> sget h | _ -> "") in
+                   let (nb, _, _) = rxp_alt src 0 fl 1 in (rxp_shy nb, p2, g))
+             else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
+                   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
+       else if str_eq c "k" then
          (if map_has rx_gnums nm
           then (NBackref ((match map_get rx_gnums nm with VInt k -> k | _ -> 0), str_contains fl "i"), p2, g)
           else (let __fm = ("mere-ruby: regexp parse: undefined group name reference: " ++ nm) in
@@ -31108,6 +31335,7 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
            let _ = (if map_has rx_gnums nm then () else map_set rx_gnums nm (VInt g)) in
            let _ = map_set rx_gnall nm ((if map_has rx_gnall nm then map_get rx_gnall nm ++ "," else "") ++ str_of_int g) in
            let _ = map_set rx_gbodies nm (mkstr (substring pat p2 p3)) in
+           let _ = map_set rx_gbodies ("#" ++ str_of_int g) (mkstr (substring pat p2 p3)) in
            (NGroup (n, g, nm), rxp_close pat p3, g2)))
      else if str_eq c2 "'" then
        (let (nm, p2) = rxp_name pat (p + 2) "'" "" in
@@ -31138,6 +31366,10 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
        else (NFlagsRest fl2, p2, g))
   else
     let (n, p2, g2) = rxp_alt pat p fl (g + 1) in
+    // \g<1> calls a group by NUMBER, and only named groups recorded a body to
+    // call. "#" prefixes the numeric key because rxp_name_check refuses it as
+    // a name, so the two spaces cannot collide.
+    let _ = map_set rx_gbodies ("#" ++ str_of_int g) (mkstr (substring pat p p2)) in
     (NGroup (n, g, ""), rxp_close pat p2, g2)
 
 // read [imx]*(-[imx]*)? up to ':' (scoped) or ')' (rest). `neg` = after '-'.
@@ -31151,6 +31383,28 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
 // validate a regex literal at ruby-parse time: lenient mode accepts the
 // constructs the engine defers to the legacy matcher, so only genuinely
 // invalid syntax fails here (Ruby's SyntaxError; RegexpError via Regexp.new).
+// is this `\k<...>` / `\g<...>` name a NUMBER, optionally signed? A name with
+// a digit anywhere else (`a1`) is still a name; only an all-digit body, or a
+// sign followed by digits, is numeric.
+and rx_num_ref = fn (nm: str) ->
+  let n9 = str_len nm in
+  if n9 == 0 then false
+  else
+    (let c0 = char_at nm 0 in
+     let st = (if str_eq c0 "-" || str_eq c0 "+" then 1 else 0) in
+     if st >= n9 then false else rx_all_digits nm st)
+and rx_all_digits = fn (s9: str) -> fn (i9: int) ->
+  if i9 >= str_len s9 then true
+  else (let c9 = char_at s9 i9 in
+        if c9 >= "0" && c9 <= "9" then rx_all_digits s9 (i9 + 1) else false)
+// the group a numeric reference names: absolute, or counted back from the next
+// group number (`g`), which is where the reference itself sits.
+and rx_num_ref_target = fn (nm: str) -> fn (g: int) ->
+  let c0 = char_at nm 0 in
+  if str_eq c0 "-" then g - int_of_str (substring nm 1 (str_len nm))
+  else if str_eq c0 "+" then g + int_of_str (substring nm 1 (str_len nm)) - 1
+  else int_of_str nm
+
 and rx_validate = fn (body: str) -> fn (fl: str) ->
   let _ = map_set rx_lenient "n" VNil in
   let ok = try_or (fn (u: unit) -> let _ = rxp_parse body fl in true) false in
@@ -31198,8 +31452,23 @@ and rx_check_go = fn (i: int) -> fn (n: int) ->
     let nl = rx_key_nl k 0 in
     let fl = substring k 0 nl in
     let body = substring k (nl + 1) (str_len k) in
+    let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
     if rx_validate body fl then rx_check_go (i + 1) n
-    else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: invalid regular expression")) in fail "mere-ruby: regexp: invalid regular expression")
+    else
+      // ⚠ TELL "MALFORMED" FROM "UNSUPPORTED". ruby answers a malformed literal
+      //   with a SyntaxError at compile time and this matched that -- but a
+      //   literal this engine merely lacks a FEATURE for is valid ruby, and
+      //   killing the process for one cost whole files: the recursive
+      //   `\g<name>` idiom is one construct in one example of a file with
+      //   thirty others that run. Those are left alone here and raise
+      //   RegexpError when evaluated (rxc_get), which is what Regexp.new has
+      //   always answered for them.
+      (let why = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "") else "") in
+       let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+       if str_contains why "unsupported" || str_contains why "undefined group"
+          || str_contains why "numbered backref"
+       then rx_check_go (i + 1) n
+       else (let _ = map_set prim_missing "i" (mkstr "mere-ruby: regexp: invalid regular expression") in fail "mere-ruby: regexp: invalid regular expression"))
 
 
 // character class [...]: items, negated, resume position (after ']').
@@ -31380,6 +31649,18 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
   let key = fl ++ chr 1 ++ pat in
   if map_has rx_progs key then map_get rx_progs key
   else
+    // ⚠ THE PARSE HAPPENS HERE, at MATCH time -- not when the literal was
+    //   built, which is why wrapping the build caught nothing. An unsupported
+    //   construct `fail`ed from inside this function and killed the process:
+    //   `\g<parens>` calling a group defined LATER in the same pattern (the
+    //   recursive-parens idiom) took language/regexp/subexpression_call with
+    //   it. Regexp.new answers RegexpError for the same pattern; so does a
+    //   match now. The extra parse costs one per DISTINCT pattern -- the
+    //   program is cached immediately below.
+    let ok9 = try_or (fn (u: unit) -> let _ = rxp_parse pat fl in true) false in
+    let _ = (if ok9 then ()
+             else (let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+                   let _ = prim_raise "RegexpError" ("invalid regular expression: /" ++ pat ++ "/") in ())) in
     let n = rxp_parse pat fl in
     let prog = map_new () in
     let ng = rxp_ngroups n in

@@ -10,46 +10,26 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 742 files.
+Classified: 734 files.
 
-## CRASH — 6 files, 4 kinds
-
-| files | kind |
-|---|---|
-| 3 | `stack overflow (recursion too deep)` |
-| 1 | `*.rb:N: uninitialized constant Enumerator::Product (NameError)` |
-| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group reference: N` |
-| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group name reference: N` |
-
-<details><summary>the same rows by exact cause (top 40)</summary>
-
-| files | cause |
-|---|---|
-| 3 | `stack overflow (recursion too deep)` |
-| 1 | `*.rb:N: uninitialized constant Enumerator::Product (NameError)` |
-| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group reference: 1` |
-| 1 | `*.rb:N: mere-ruby: regexp parse: undefined group name reference: -1` |
-
-</details>
-
-## DIFF — 736 files, 141 kinds
+## DIFF — 734 files, 144 kinds
 
 | files | kind |
 |---|---|
-| 234 | `ERROR NoMethodError` |
-| 93 | `ERROR NameError` |
-| 34 | `FAILED expected "S", got "S"` |
+| 236 | `ERROR NoMethodError` |
+| 82 | `ERROR NameError` |
+| 35 | `FAILED expected "S", got "S"` |
 | 22 | `FAILED expected N, got N` |
-| 21 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 20 | `FAILED expected true, got false` |
+| 20 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 19 | `FAILED expected ArgumentError to be raised` |
 | 13 | `FAILED expected truthy from #include?` |
 | 13 | `FAILED expected TypeError to be raised` |
 | 13 | `FAILED expected N, got nil` |
-| 11 | `FAILED expected to be identical` |
+| 12 | `FAILED matcher did not match #<OBJ>` |
+| 12 | `FAILED expected to be identical` |
 | 11 | `FAILED expected false, got true` |
 | 11 | `ERROR ArgumentError` |
-| 10 | `FAILED matcher did not match #<OBJ>` |
 | 7 | `pass=N fail=N err=N` |
 | 7 | `ERROR NotImplementedError` |
 | 6 | `FAILED expected falsy from #include?` |
@@ -75,6 +55,7 @@ Classified: 742 files.
 | 2 | `FAILED raised NoMethodError, expected FrozenError` |
 | 2 | `FAILED expected {...}, got {...}` |
 | 2 | `FAILED expected to receive #to_str` |
+| 2 | `FAILED expected to receive #rewind` |
 | 2 | `FAILED expected nil, got "S"` |
 | 2 | `FAILED expected a Integer, got N` |
 | 2 | `FAILED expected [nil, N, N, N, N, nil, :SYM, [], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N] ...[clipped]` |
@@ -88,6 +69,7 @@ Classified: 742 files.
 | 1 | `This is experimental warning.` |
 | 1 | `FAILED raised TypeError, expected ArgumentError` |
 | 1 | `FAILED raised ThreadError, expected ArgumentError` |
+| 1 | `FAILED raised StandardError, expected ArgumentError` |
 | 1 | `FAILED raised NoMethodError, expected ThreadError` |
 | 1 | `FAILED raised NoMethodError, expected LocalJumpError` |
 | 1 | `FAILED raised NameError, expected ArgumentError` |
@@ -102,10 +84,10 @@ Classified: 742 files.
 | 1 | `FAILED expected true, got nil` |
 | 1 | `FAILED expected to receive #to_int` |
 | 1 | `FAILED expected to receive #to_a` |
-| 1 | `FAILED expected to receive #rewind` |
 | 1 | `FAILED expected to receive #respond_to_missing?` |
 | 1 | `FAILED expected not true` |
 | 1 | `FAILED expected not N` |
+| 1 | `FAILED expected nil, got NaN` |
 | 1 | `FAILED expected nil to match` |
 | 1 | `FAILED expected a Enumerable, got #<OBJ>` |
 | 1 | `FAILED expected [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [:SYM, :SYM], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N], [N, ...[clipped]` |
@@ -142,7 +124,6 @@ Classified: 742 files.
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "sp ...[clipped]` |
 | 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "subdir_tw ...[clipped]` |
 | 1 | `FAILED expected [" def foo` |
-| 1 | `FAILED expected SystemCallError to be raised` |
 | 1 | `FAILED expected RuntimeError to be raised` |
 | 1 | `FAILED expected N, got Infinity` |
 | 1 | `FAILED expected IndexError to be raised` |
@@ -177,6 +158,8 @@ Classified: 742 files.
 | 1 | `ERROR SignalException` |
 | 1 | `ERROR RuntimeError` |
 | 1 | `ERROR RangeError` |
+| 1 | `ERROR FrozenError` |
+| 1 | `ERROR Encoding::UndefinedConversionError` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
@@ -209,6 +192,7 @@ Classified: 742 files.
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected true, got false` |
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 49, got nil` |
 | 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 1, got nil` |
+| 2 | `FAILED: calls the enclosed object's rewind method if one exists: expected to receive #rewind` |
 | 2 | `FAILED: calls the block with initial values when yield with multiple arguments: expected [nil, 0, 0, 0, 0, nil, :default_arg, [], [], [0], [0, 1], [0, 1, 2]], got [nil, 0, [0, 1], [0, 1, 2], [0, 1, 2], nil, :default_arg, [], [], [0], [0, 1] ...[clipped]` |
 | 2 | `FAILED: calls supplied block if the key is not found: expected 5, got nil` |
 | 2 | `FAILED: calls #to_str to convert an Object to a String: expected "abcdef", got ""` |
@@ -221,7 +205,6 @@ Classified: 742 files.
 | 1 | `pass=16 fail=0 err=0` |
 | 1 | `This is experimental warning.` |
 | 1 | `FAILED: yields each directory entry in succession: expected [".", "..", ".dotfile", ".dotsubdir", "brace", "deeply", "dir", "dir_filename_ordering", "file_one.ext", "file_two.ext", "nested", "nondotfile", "special", "subdir_one", "subdir_tw ...[clipped]` |
-| 1 | `FAILED: yields each codepoint starting from the current position: expected [238, 116, 233], got []` |
 
 </details>
 
@@ -251,20 +234,18 @@ class column says where the weight sits.
 | enumerator (7) | `each each_with_object feed initialize new product with_object` |
 | encoding (7) | `aliases compatible find list name_list names to_s` |
 | argf (7) | `argv each eof path tell to_a to_i` |
-| lazy (6) | `collect_concat collect filter find_all grep grep_v` |
 | dir (6) | `delete empty fileno foreach pos tell` |
 | yaml (5) | `dump load_file parse_file parse to_yaml` |
 | undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
 | profiler (5) | `disable enable enabled result total_time` |
-| product (5) | `initialize_copy initialize inspect rewind size` |
 | tms (4) | `cstime cutime stime utime` |
 | pathname (4) | `case_compare empty glob realdirpath` |
 | binding (4) | `implicit_parameter_defined implicit_parameter_get implicit_parameters source_location` |
 | securerandom (3) | `base64 hex random_bytes` |
+| regexp (3) | `timeout escapes subexpression_call` |
 | objectspace (3) | `_id2ref each_object garbage_collect` |
 | warning (2) | `categories warn` |
 | stringio (2) | `eof seek` |
-| regexp (2) | `timeout escapes` |
 | refinement (2) | `import_methods target` |
 | random (2) | `equal_value urandom` |
 | filetest (2) | `grpowned socket` |
@@ -281,6 +262,7 @@ class column says where the weight sits.
 | marshal (1) | `restore` |
 | main (1) | `define_method` |
 | location (1) | `base_label` |
+| lazy (1) | `chunk` |
 | language (1) | `module` |
 | enumerable (1) | `to_h` |
 | class (1) | `allocate` |

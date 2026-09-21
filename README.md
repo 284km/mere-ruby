@@ -117,7 +117,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 210 programs, byte-for-byte
+./run_corpus.sh                                  # 211 programs, byte-for-byte
                                                  # (and eight SOURCE gates, see tools/)
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
@@ -423,8 +423,8 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **210 programs,
-210 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
+and under `./mere-ruby` and diffs the output byte-for-byte: **211 programs,
+211 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
 index cannot hide behind the walk it replaced. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
@@ -451,8 +451,8 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2498 spec files** across 103 groups: **1707 MATCH, 736
-DIFF, 6 CRASH**, 32 SKIP, 17 SLOW, against ruby 4.0.6. Run with no
+The record covers **2498 spec files** across 103 groups: **1719 MATCH, 734
+DIFF, 0 CRASH**, 32 SKIP, 13 SLOW, against ruby 4.0.6. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
@@ -487,19 +487,17 @@ given one. Adding 32 group names moved 416 files from "unknown" to measured,
 was ever run), and it is why the headline MATCH went UP while the percentage
 went DOWN. Both are the honest direction.
 
-⚠ **CRASH is 6, and it had been 0** -- because the surface that had never been
-measured is where the aborts were. Every one is named, and they are three
-roots. A fourth, `Enumerator::Lazy`, was four of them and is closed: the
-pipeline materialised its source for every operator it did not know, so an
-infinite one ran to 6-17 GB. Its buffering operators (`chunk`, `slice_before`
-and three more) still materialise and now hit the time alarm instead -- the
-group's remaining failures are SLOW, not CRASH.
+⚠ **CRASH went 0 -> 10 -> 0.** Measuring core and language in full put ten
+aborts in the record, because the surface nobody had measured is where they
+were. All ten are closed, and every one was a CYCLE or a REFUSAL that killed
+the process instead of raising:
 
-| files | root |
+| was | root |
 |---|---|
-| 3 | a stack overflow (SIGSEGV in the stack region) in `core/marshal` dump/load and `core/thread` value: the recursion goes deeper than 512 MB of stack |
-| 2 | `\g<1>` (subexpression call by NUMBER) and `\k<-1>` / `\k<01>` (relative and zero-padded backrefs). The by-NAME spellings work; the numbered ones are not parsed, and a literal that the parser refuses takes the process down with it |
-| 1 | `Enumerator::Product` does not exist |
+| 4 | `Enumerator::Lazy` materialised its source for every operator the pipeline did not know, so an infinite one ran to 6-17 GB. Sixteen operators are lazy now, buffering ones included |
+| 3 | a self-referential structure walked forever. Arrays and hashes were guarded in the PRINTER only: an object holding itself, `Marshal.dump` of a cycle, and `==`/`eql?` between two cycles were each a SIGSEGV. Marshal now writes ruby's object table (`@<index>`), which is also why `[s, s]` writes the string once |
+| 2 | `\g<1>`, `\k<-1>` and `\k<01>`: the by-NAME spellings parsed, the numbered ones reached the "undefined group reference" arm and `fail`ed. ⚠ The load-time check validates LENIENTLY, so an unsupported literal passed it and then died in the real parse. A literal this engine cannot compile raises RegexpError now, exactly as `Regexp.new` always did, and one construct no longer costs a whole file |
+| 1 | `Enumerator::Product` did not exist |
 
 ⚠ These do NOT come from `run_spec.sh <one file>`, which prints DIFF for every
 one of them. That verdict answers "do the two outputs differ"; the scoreboard
@@ -507,9 +505,9 @@ asks "did it run at all", and mere-ruby printed no tally where ruby ran eleven
 examples. When two instruments disagree, find out which question each is
 answering before believing the friendlier one.
 
-Elsewhere **every file runs on both sides** (MATCH + DIFF): the gap is not
-"cannot", and a group score reads low for a reason worth naming rather than for
-breakage -- real programs (the corpus) match exactly while a value class scores
+**Every file runs on both sides** (MATCH + DIFF): nothing aborts. So the gap
+is not "cannot", and a group score reads low for a reason worth naming rather
+than for breakage -- real programs (the corpus) match exactly while a value class scores
 low on an error message or a frozen-object check. ⚠ Three earlier CRASH rows
 have appeared and gone: every one was a NAMED MISSING LIBRARY (`fcntl`, `cgi`,
 `io/console`) that the file required on its fourth line, which the scoreboard
@@ -518,7 +516,7 @@ A whole group can carry a crash for a handful of integers.
 
 Naming the rest is what `CAUSES.md` is for. Grouped by cause, the DIFFs come
 down to a bounded number of **kinds**, and the largest single one is
-`NoMethodError` (234 files): a name that is not there, which is missing surface
+`NoMethodError` (236 files): a name that is not there, which is missing surface
 rather than wrong behaviour -- and it grew with the measured surface, because
 the groups added most recently (`core/io`, `core/time`, `library/stringio`) are
 the ones whose names are thinnest. The next-largest kinds are VALUE mismatches
