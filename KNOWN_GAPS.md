@@ -3085,3 +3085,36 @@ What is left, all of it PRE-EXISTING and none of it introduced here:
 | `@pos` counts CHARACTERS, ruby counts BYTES | the whole class is written that way -- `read(len)`, `seek` and now `getbyte` all agree with ruby for ASCII and disagree for multibyte. `set_encoding_by_bom` leaves pos at 1 where ruby says 3, and that is the same one gap |
 | `StringIO.new(frozen_string).string.frozen?` is false | it dups its argument; ruby keeps the object (and refuses writes to it) |
 | `StringIO.new(nil).string` is `""` | ruby keeps the nil |
+
+
+## Time keeps its subsecond now, and what it still cannot know
+
+A Time was epoch SECONDS and nothing else. `#usec` answered a hard-coded 0,
+`#nsec`, `#subsec`, `#to_r`, `#ceil` and `#floor` did not exist, `Time.at(x.5)`
+dropped the half, and two Times 300 ms apart subtracted to 0. The nanosecond
+rides beside the second now: `make_time_at_ns` is the one door that builds a
+Time and `time_nsec_of` the one that reads the fraction (0 for a Time built
+before any of this). Comparison, `+`/`-`, `#to_f` and `#inspect` all carry it.
+
+`#to_s` and `#inspect` did not exist either -- a Time printed as
+`#<Time:0x.. @__t=1577934245, @__utc=true>`, publishing the ivars this
+implementation happens to store. Added with `#asctime`/`#ctime`, `#zone`,
+`#to_a`, `#tv_sec`/`#tv_usec`/`#tv_nsec` and `#iso8601`/`#xmlschema`, so every
+Time instance method ruby has is now answered.
+
+⚠ Two of the values read backwards from the name and both were measured:
+`#subsec` is an Integer `0` when there is no fraction (not `(0/1)`), and
+`#iso8601(n)` ZERO PADS to n digits, so half a second at 3 places is `.500`.
+
+⚠ And the LIST that lets a name in is a third thing. respond_to? (and through
+it reflection) has to ask under the CANONICAL name: Time carries a dozen
+aliases inherited from C's struct tm -- `gmtime`, `gmt?`, `getgm`,
+`gmt_offset`, `gmtoff`, `isdst` -- every one of which DISPATCHES, while the
+list held only the canonical spellings. `Time.instance_method(:ctime)` was a
+NameError and eight of core/time's files open by comparing two of these as
+UnboundMethods.
+
+| still missing | why |
+|---|---|
+| the local time zone | there is no zone database here. `#utc_offset` is 0, `#zone` is "UTC" or nil, and a Time that is not marked UTC prints `+0000`. `Time.now.iso8601` is therefore Z-relative where ruby shows the machine's offset |
+| `Time.respond_to?(:utc)` and the other CLASS methods | there is no table for class-level respond_to? at all -- not for Time and not for any other dispatcher class -- so `Time.method(:gm) == Time.method(:utc)` is still a NameError. That is one table, and it would answer for every class at once |

@@ -10,7 +10,7 @@ reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
 to ruby 4.0.6 (`bench/csv.sh`).
 
 The milestones below (M0-M6) are how it was built. What it is measured by now
-is [ruby/spec](https://github.com/ruby/spec): **1687 of 2498 spec files**
+is [ruby/spec](https://github.com/ruby/spec): **1731 of 2498 spec files**
 byte-identical to ruby 4.0.6 — every `core` and `language` file the suite has,
 plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
@@ -117,7 +117,7 @@ would take — separately from what nobody has looked at yet.
 Every change is checked against the reference `ruby` before it lands:
 
 ```sh
-./run_corpus.sh                                  # 211 programs, byte-for-byte
+./run_corpus.sh                                  # 212 programs, byte-for-byte
                                                  # (and eight SOURCE gates, see tools/)
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
@@ -423,8 +423,8 @@ C backend.
 ## Verification
 
 `run_corpus.sh` runs every program in `corpus/` under the real `ruby`
-and under `./mere-ruby` and diffs the output byte-for-byte: **211 programs,
-211 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
+and under `./mere-ruby` and diffs the output byte-for-byte: **212 programs,
+212 identical** — and again with `MERE_RUBY_NO_HASH_INDEX=1`, so the hash
 index cannot hide behind the walk it replaced. The corpus covers the semantic corners above. A deliberate negative control (lossy float
 printing, see PAIN.md) confirms the harness actually detects divergence.
 
@@ -451,7 +451,7 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2498 spec files** across 103 groups: **1719 MATCH, 734
+The record covers **2498 spec files** across 103 groups: **1731 MATCH, 722
 DIFF, 0 CRASH**, 32 SKIP, 13 SLOW, against ruby 4.0.6. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
@@ -516,7 +516,7 @@ A whole group can carry a crash for a handful of integers.
 
 Naming the rest is what `CAUSES.md` is for. Grouped by cause, the DIFFs come
 down to a bounded number of **kinds**, and the largest single one is
-`NoMethodError` (236 files): a name that is not there, which is missing surface
+`NoMethodError` (227 files): a name that is not there, which is missing surface
 rather than wrong behaviour -- and it grew with the measured surface, because
 the groups added most recently (`core/io`, `core/time`, `library/stringio`) are
 the ones whose names are thinnest. The next-largest kinds are VALUE mismatches
