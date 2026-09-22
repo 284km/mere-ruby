@@ -19,6 +19,43 @@ clock read off a polling loop while other work shared the machine. Observed
 numbers are marked as such and are only ever used for "before" figures that
 were not timed at the time.
 
+## Everything that changed, and what each was worth
+
+One line per change, with the measurement that justified it. The sections below
+are chronological and carry the reasoning, the poison tests, and the wrong turns.
+
+| change | before | after | where |
+|---|---|---|---|
+| one spec tree per sweep, not per file | ~90 min | 30 min | *one tree per sweep* |
+| the bound on "does this finish" is CPU time | record moved with the load | record is load-independent | *the bound is CPU time* |
+| the wall bound is 24× the CPU bound, and SIGKILLs | misread a busy file as "stuck" | only a stuck process trips it | *the bound that was still too tight* |
+| the outer bound is derived, not chosen | two numbers, one question | one owner per question | *the shape that landed* |
+| the sweep starts its own memory guard | a README step, down half a day | a bound the harness owns | *two more limits* |
+| a SIGKILL is not CRASH | "the interpreter aborted" | SLOW, naming the bound | *three bounds, one verdict* |
+| the row carries a class, the log the numbers | 2 unstable rows → 7 | rows reproduce | *the second design* |
+| background jobs' SIGINT no longer inherited | a row moved on worker count | subjects behave identically | *a stuck reference* |
+| `SPEC_JOBS` defaults to 6 | 1829.7s | 646–662s | *the default is 6 now* |
+| `dead_defs_check.sh` in one pass | 22.99s | 0.64s | *dead_defs_check.sh, landed* |
+| `bracket_depth` seeded fast path | 75.04s | 11.97s | *a seeded fast path* |
+| `run_corpus.sh --both` | 111.65s | 70.55s | *concurrent corpus passes* |
+| `tools/build.sh --fast` (-O0) | 120.5s | 30.6s | *-O0 for the probe loop* |
+| the sweep removes its own litter | 1,605 dirs | bounded | *the litter* |
+
+**Measured and NOT adopted** — kept because the next reader will have the same
+ideas:
+
+| idea | measured | verdict |
+|---|---|---|
+| cache the reference side between sweeps | would save ~2 min of 30 | not worth it after the tree fix |
+| take the verdict from peak RSS | the two ambiguous files exceed BOTH bounds | cannot resolve what has no answer |
+| put the measured numbers in the row | 2 unstable rows became 7 | a record and a measurement want opposite things |
+| deal the biggest groups first | 719.9s vs 646–662s | slower |
+| ten workers instead of six | 736.7s, CPU +50s | slower; the bottleneck is shared and serial |
+| unique `/tmp` paths per corpus process | `138` prints `File.basename(__FILE__)` | breaks byte-equality; the two sides are two processes |
+
+**Still open, both outside this repository**: the 41s emit and the ~350s `clang`
+invocation, which needs the emitted C split into several translation units.
+
 ## The cycle, measured 2026-09-22
 
 One change to the interpreter, from edit to pushed commit:
@@ -544,38 +581,6 @@ the record was measured rather than before.
 Two other rows differ between the runs and always will: `core/process/
 clock_gettime` embeds a clock reading and `core/random/new` embeds a seed.
 
-### So: does the default flip to 6?
-
-The evidence, all of it, with the final bounds:
-
-| comparison | table | tag rows |
-|---|---|---|
-| 8 groups, seq 645.4s vs par 300.0s | identical | 2 cause lines swapped (CPU vs memory) |
-| full, seq 1829.7s vs par 657.0s (wall 120) | `core/dir` moved | + clock, seed |
-| full, seq 1829.7s vs par **879.2s** (wall 600) | **identical** | **clock and seed only** |
-
-The last row is the one that counts, and the two lines that differ in it are
-the two that differ between ANY two runs: `core/process/clock_gettime` embeds a
-clock reading and `core/random/new` embeds a seed. By that measure the parallel
-sweep is as reproducible as the sequential one.
-
-**The default stays 1 anyway**, and this is a judgement rather than a forced
-conclusion. The reason is the row above it: the two files sitting on both the
-CPU and the memory threshold DID swap once in three comparisons, and the record
-is the product here. Thirty minutes once a day is cheaper than one unexplained
-diff in a checked-in file. `SPEC_JOBS=6` is documented, measured and safe for a
-working session, which is where the 2× actually matters.
-
-⚠ Note what the third row cost: 879s, not the 657s of the run before it, and
-the difference is almost entirely one file that stalled for ten minutes. The
-parallel sweep's wall time now has a long tail that the sequential one does
-not.
-
-The section above said "when it lands the default can flip to 6". It landed and
-the default did not flip. ⚠ **The obstacle moved rather than vanishing**, and
-naming where it moved to is the whole value of having promised the flip: the
-time bounds are load-independent now, and the byte bound is not.
-
 ### ⚠ A stuck reference — three wrong explanations, then the measurement
 
 `core/exception/interrupt_spec.rb` left the REFERENCE ruby sitting at ten
@@ -615,158 +620,17 @@ foreground.
 It also removed a ten-minute tail from every parallel sweep, which is why the
 run that found it took 886s rather than the 657s of the run before.
 
-### So: does the default flip to 6?
+### The default: 1 at the time, 6 by the end of the day
 
-The evidence, all of it, with the final bounds:
+This section used to answer "no, and here is why", three times over — the file
+had accumulated three identical copies of that answer from successive edits,
+all of them saying the default stays 1. ⚠ That was true when written and wrong
+by the evening; see **The default is 6 now** below, which is the live answer.
 
-| comparison | table | tag rows |
-|---|---|---|
-| 8 groups, seq 645.4s vs par 300.0s | identical | 2 cause lines swapped (CPU vs memory) |
-| full, seq 1829.7s vs par 657.0s (wall 120) | `core/dir` moved | + clock, seed |
-| full, seq 1829.7s vs par **879.2s** (wall 600) | **identical** | **clock and seed only** |
-
-The last row is the one that counts, and the two lines that differ in it are
-the two that differ between ANY two runs: `core/process/clock_gettime` embeds a
-clock reading and `core/random/new` embeds a seed. By that measure the parallel
-sweep is as reproducible as the sequential one.
-
-**The default stays 1 anyway**, and this is a judgement rather than a forced
-conclusion. The reason is the row above it: the two files sitting on both the
-CPU and the memory threshold DID swap once in three comparisons, and the record
-is the product here. Thirty minutes once a day is cheaper than one unexplained
-diff in a checked-in file. `SPEC_JOBS=6` is documented, measured and safe for a
-working session, which is where the 2× actually matters.
-
-⚠ Note what the third row cost: 879s, not the 657s of the run before it, and
-the difference is almost entirely one file that stalled for ten minutes. The
-parallel sweep's wall time now has a long tail that the sequential one does
-not.
-
-The section above said "when it lands the default can flip to 6". It landed and
-the default did not flip. ⚠ **The obstacle moved rather than vanishing**, and
-naming where it moved to is the whole value of having promised the flip: the
-time bounds are load-independent now, and the byte bound is not.
-
-### ⚠ A stuck reference, and a causal story that did not survive being measured
-
-In the six-worker re-check, `core/exception/interrupt_spec.rb` left the
-REFERENCE ruby sitting at **9 minutes 56 seconds of wall clock and 0.07 seconds
-of CPU**. Blocked, not slow, and on the side nobody watches. The spec runs
-`IO.popen([*ruby_exe, '-e', 'Process.kill :INT, Process.pid; sleep'], &:read)`
--- it waits for a child that is supposed to die of its own SIGINT.
-
-**Two explanations were written here before either was checked, and both were
-wrong.** They are kept because the checking is the content.
-
-1. *"It will land in SKIP: the wall bound kills the reference, no `pass=` line,
-   ruby did not run it here."* It did not. The row is byte-identical to the
-   sequential one.
-2. *"`alarm` survives `exec` and ruby HANDLES SIGALRM, so the bound is a nudge
-   rather than a kill."* Measured afterwards, three ways:
-
-   | subject | rc |
-   |---|---|
-   | `mere-ruby` spinning, `alarm 2` | **142** (killed) |
-   | `ruby` spinning, `alarm 2` | **142** (killed) |
-   | `ruby` blocked in `sleep 60`, `alarm 2` | **142** (killed) |
-
-   SIGALRM kills ruby. The "it is only a nudge" story was invented to explain
-   an observation and would have gone into a document as fact.
-
-⚠ **What is actually known**: a reference process sat for ten minutes using no
-CPU, and the recorded row for that file shows no sign of it. Those two facts
-have NOT been connected, and the honest state of this is an open question, not
-a finding. The candidates worth testing are that the process belonged to a run
-whose row was already written, and that the group had been measured before the
-stall began -- both checkable by timestamping group completion, which the sweep
-does not currently do.
-
-What the episode DOES establish, and this part is measured:
-
-- A spec can leave the reference blocked for as long as the wall bound allows,
-  and at six workers this one did. The wall bound is what ends it.
-- ⚠ **Nothing in the record says a bound had to fire.** Whatever the row ended
-  up being, no artifact anywhere notes that a file took ten minutes longer than
-  it should have. A bound that fires should be recorded even when the run then
-  completes, and that is the smallest useful next change here.
-- The reference-side classification added this morning has still only ever been
-  exercised by poison (`SPEC_CPU=0`), not in the wild. ⚠ The poison used a
-  subject with no SIGALRM handler, which is the easy case.
-
-### So: does the default flip to 6?
-
-The evidence, all of it, with the final bounds:
-
-| comparison | table | tag rows |
-|---|---|---|
-| 8 groups, seq 645.4s vs par 300.0s | identical | 2 cause lines swapped (CPU vs memory) |
-| full, seq 1829.7s vs par 657.0s (wall 120) | `core/dir` moved | + clock, seed |
-| full, seq 1829.7s vs par **879.2s** (wall 600) | **identical** | **clock and seed only** |
-
-The last row is the one that counts, and the two lines that differ in it are
-the two that differ between ANY two runs: `core/process/clock_gettime` embeds a
-clock reading and `core/random/new` embeds a seed. By that measure the parallel
-sweep is as reproducible as the sequential one.
-
-**The default stays 1 anyway**, and this is a judgement rather than a forced
-conclusion. The reason is the row above it: the two files sitting on both the
-CPU and the memory threshold DID swap once in three comparisons, and the record
-is the product here. Thirty minutes once a day is cheaper than one unexplained
-diff in a checked-in file. `SPEC_JOBS=6` is documented, measured and safe for a
-working session, which is where the 2× actually matters.
-
-⚠ Note what the third row cost: 879s, not the 657s of the run before it, and
-the difference is almost entirely one file that stalled for ten minutes. The
-parallel sweep's wall time now has a long tail that the sequential one does
-not.
-
-The section above said "when it lands the default can flip to 6". It landed and
-the default did not flip. ⚠ **The obstacle moved rather than vanishing**, and
-naming where it moved to is the whole value of having promised the flip: the
-time bounds are load-independent now, and the byte bound is not.
-
-### ⚠ The wall bound is a NUDGE, not a kill — found by predicting wrong
-
-In the six-worker re-check, `core/exception/interrupt_spec.rb` -- which sends
-itself SIGINT -- left the REFERENCE ruby sitting at **9 minutes 56 seconds of
-wall clock and 0.07 seconds of CPU**. Blocked, not slow, and on the side nobody
-watches. It is intermittent: the same file completes every time sequentially
-and completed in an earlier parallel run, so it is a signal-handling spec
-racing with other processes.
-
-**The prediction written here at the time was that it would land in SKIP** --
-the wall bound kills the reference, no `pass=` line, "ruby itself does not run
-it here". That was wrong, and the record is kept wrong-then-corrected because
-the correction is the finding:
-
-⚠ `perl -e "alarm N; exec @ARGV"` leaves the timer armed across the exec, so
-the SUBJECT gets SIGALRM -- and **ruby handles it**. It raised SignalException
-inside the spec, finished normally, and exited 0. `rc_r` was never 142, so the
-reference branch never fired at all. The row came out byte-identical to the
-sequential one, and only by coincidence: the spec's own SIGINT failure and the
-harness's SIGALRM both print `SignalException`.
-
-Three things follow, and none of them was visible from the design:
-
-- **The wall bound does not guarantee termination.** It terminates a process
-  with no SIGALRM handler (a sleeping `/bin/sh` does die, which is what the
-  poison test used) and merely perturbs one that has a handler. "Bound" is the
-  wrong word for it; it is a nudge that usually works.
-- **A ten-minute stall left NO TRACE in the record.** The verdict was right and
-  the row was identical, so nothing anywhere says that one file took 600
-  seconds longer than it should have. A bound that fires should be recorded
-  even when the subject recovers.
-- **The poison test passed for the wrong reason.** `MR_BIN=<a script that
-  sleeps>` has no handler, so it died and the branch fired. A subject that
-  handles the signal was never tried, and that is the case that actually
-  occurs.
-
-Next piece of work here, and it is small: make the wall bound SIGKILL after the
-alarm rather than only raising it, and record "a bound fired" even when the run
-then completes. ⚠ It cannot change the committed record -- the sequential run
-contains no wall-bound row at all -- which is what makes it safe to do
-separately rather than in a hurry.
-
+Two superseded sections were removed with them: an earlier telling of the stuck
+reference above, and one claiming the wall bound is "a nudge, not a kill" —
+refuted by measurement (`mere-ruby`, `ruby` spinning, and `ruby` blocked all
+return 142) and fixed outright, since the bound now SIGKILLs.
 
 ## 2026-09-22 (later): the next five, each with the measurement that sized it
 

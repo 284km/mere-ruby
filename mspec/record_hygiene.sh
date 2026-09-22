@@ -177,5 +177,30 @@ else
   fi
 fi
 
+# ...and the DOCUMENTS, for one failure they share with records: saying two
+# things at once. LOOP.md is append-only by design, and three successive edits
+# left THREE copies of a section called "So: does the default flip to 6?" —
+# all answering "no, it stays 1", which had become false. A reader hitting the
+# first copy got a confident wrong answer, and 173 lines of the file were
+# superseded text contradicting the rest of it.
+#
+# A repeated heading is the signature: nobody writes the same section twice on
+# purpose, and an edit that replaces a section but misses an older copy leaves
+# exactly this. Checked across the tracked docs; measured 2026-09-22, none of
+# them has a legitimate duplicate.
+dupheads=""
+for f in $(cd "$root" && git ls-files '*.md' 2>/dev/null); do
+  d=$(grep '^#\{1,3\} ' "$root/$f" 2>/dev/null | sort | uniq -d)
+  [ -n "$d" ] && dupheads="$dupheads        $f:
+$(printf '%s' "$d" | sed 's/^/          /')
+"
+done
+if [ -n "$dupheads" ]; then
+  echo "DUPLICATE HEADING  a document has two sections with the same title, which is what"
+  echo "         an edit that replaced one copy and missed another leaves behind:"
+  printf '%s' "$dupheads"
+  rc=1
+fi
+
 [ "$rc" = 0 ] && echo "records clean ($(echo $files | wc -w | tr -d ' ') files)"
 exit $rc
