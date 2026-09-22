@@ -3317,3 +3317,45 @@ where ruby says `Zlib::ZStream`. Reopening either with `< ZStream` is a
 superclass mismatch; the shared surface is a module mixed into all three
 instead. Nothing in ruby/spec reads `Zlib::Deflate.superclass`, and every
 ZStream spec constructs a `Zlib::Deflate`.
+
+## Which libc functions an `extern` can reach, measured
+
+`mere-ruby` calls a few libc functions directly (`chdir`, `symlink`, and now
+`rename` and `link`). Which ones are POSSIBLE is not a matter of taste, and
+this is the measurement, taken 2026-09-23 with the build's own clang. Three
+walls, in the order a new extern hits them:
+
+| wall | what it refuses | examples |
+|---|---|---|
+| **header** | Mere emits `<stdio.h>` and `<unistd.h>` and no more, so anything declared elsewhere is "call to undeclared function" -- an ERROR since C99, which `-w` does not silence | `chmod`, `umask`, `mkfifo` (`<sys/stat.h>`) |
+| **types** | Mere emits `extern int f(const char*, int)` for `str -> int -> int`, so a parameter that is a TYPEDEF rather than a plain int is a conflicting declaration | `chown` (uid_t, gid_t), `truncate` (off_t) |
+| **shape** | a parameter that is a pointer OUT of the function cannot be an arena offset: clang refuses `long long` where `char *` is wanted | `readlink`, and `stat(2)` for the same reason |
+
+What survives all three is a function whose parameters are `const char*` and
+plain `int` and whose result is a plain int. That is why `File.rename` and
+`File.link` are here and `File.chmod`, `File.chown`, `File.truncate`,
+`File.readlink`, `File.umask` and `File.mkfifo` are not.
+
+**What would close all three at once** is the `file_stat`-shaped host builtin
+noted under *`File::Stat` reads through `stat(1)`*: the C side is written with
+the real headers, so it sees `<sys/stat.h>`, it converts the typedefs itself,
+and it can hand bytes back through the arena it already owns. The point of
+writing the three walls down is that they say exactly what that builtin buys,
+and it is more than one method.
+
+⚠ `File.flock` is behind a FOURTH wall and no builtin fixes it: it takes a file
+descriptor, and a File here is a path, a mode and a buffer (see *`File#fileno`
+refuses*).
+
+## `File.delete` removed one file however many it was given
+
+```ruby
+File.delete(a, b)   # removed a, left b, and answered 2
+```
+
+It matched `Cons (VStr ph, _)` -- the first path -- ran `rm -f` on it and
+returned the literal `1`, while `core/file/delete_spec.rb` reads the count. The
+count and the work had to be the same walk, so both now come from one.
+
+⚠ And `rm -f` is the wrong verb: ruby raises `Errno::ENOENT` for a path that is
+not there, and `-f` is precisely the flag that does not. The walk asks first.
