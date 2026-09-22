@@ -133,6 +133,17 @@ fi
 # mere-ruby side stops before it prints a tally, under this build and under the
 # build before it.)
 TIMEOUT=60
+# ⚠ BOTH BOUNDS ARE WALL CLOCK, which is why SPEC_JOBS defaults to 1. Measured
+# 2026-09-22 at six workers: with the bounds left at 25s/60s, four core/dir
+# files crossed them and the row moved from 18 DIFF / 1 SLOW to 14 / 5; with
+# both scaled by the worker count, those same files ran long enough to reach
+# the MEMORY cap instead and four groups moved from SLOW to CRASH. Same
+# interpreter, three different records -- the harness deciding the answer.
+# The parallel path is real and it is 3x (30 min -> 9), but it belongs behind
+# SPEC_JOBS until the bound is CPU time rather than wall clock. See LOOP.md.
+sb_jobs="${SPEC_JOBS:-1}"
+case "$sb_jobs" in ''|*[!0-9]*) sb_jobs=1 ;; esac
+[ "$sb_jobs" -ge 1 ] || sb_jobs=1
 # what a recorded line may say -- masking and the length bound, shared with
 # examples.sh so the two records cannot drift apart.
 . "$here"/mask.sh
@@ -226,23 +237,31 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
 # that changes. Validated by sweeping groups both ways and requiring the rows
 # to be identical -- if a spec ever leaves something behind, that check is
 # where it shows.
-sb_tree="$(mktemp -d)"
-for sb_d0 in core language library shared fixtures; do
-  [ -d "$root/$sb_d0" ] || continue
-  cp -Rc "$root/$sb_d0" "$sb_tree/$sb_d0" 2>/dev/null || cp -R "$root/$sb_d0" "$sb_tree/$sb_d0"
-done
-cp "$here/spec_helper.rb" "$sb_tree/spec_helper.rb"
-SPEC_TREE="$sb_tree"
-export SPEC_TREE
-trap 'rm -rf "$sb_tree"' EXIT INT TERM
+sb_mktree() {  # $1 = where to build it
+  for sb_d0 in core language library shared fixtures; do
+    [ -d "$root/$sb_d0" ] || continue
+    cp -Rc "$root/$sb_d0" "$1/$sb_d0" 2>/dev/null || cp -R "$root/$sb_d0" "$1/$sb_d0"
+  done
+  cp "$here/spec_helper.rb" "$1/spec_helper.rb"
+}
 
 # the rows measured THIS run; the table is merged rather than rewritten (below)
 rows="$(mktemp)"
+# ⚠ ...and one FILE per row, named by the group's position, because the workers
+# below finish out of order and the table's row order has to come out the same
+# as a sequential sweep's.
+rowsdir="$(mktemp -d)"
+sb_trees="$(mktemp -d)"
+trap 'rm -rf "$rowsdir" "$sb_trees"' EXIT INT TERM
 
-for d in $dirs; do
+# one group, measured by whichever worker drew it. The tag file is named by the
+# group, so two workers never write the same one; the row goes to its own file
+# in $rowsdir under the group's position.
+run_group() {  # $1 = group dir, $2 = its position in $dirs
+  d="$1"
   group="$(printf '%s' "$d" | tr '/' '_')"
   files="$(ls "$root/$d"/*_spec.rb 2>/dev/null)"
-  [ -n "$files" ] || continue
+  [ -n "$files" ] || return 0
   m=0; df=0; cr=0; sk=0; to=0; tot=0
   : > "$tagdir/$group.txt"
   for f in $files; do
@@ -261,9 +280,48 @@ for d in $dirs; do
       TIMEOUT) to=$((to+1)); printf 'SLOW  %s\n'     "$rel" >> "$tagdir/$group.txt" ;;
     esac
   done
-  echo "| $d | $m | $df | $cr | $sk | $to | $tot |" >> "$rows"
+  echo "| $d | $m | $df | $cr | $sk | $to | $tot |" > "$rowsdir/$2"
   echo "$d: $m/$tot MATCH ($df diff, $cr crash, $sk skip, $to slow)"
-done
+}
+
+# ⚠ ONE TREE PER WORKER, never one shared by all of them. A spec that writes
+# into the tree merely FOLLOWS another spec when the sweep is sequential; with
+# workers sharing a tree it would RACE one, which is a different and much worse
+# failure. Six clones instead of 2,498 keeps the win and adds the parallelism.
+# SPEC_TEMP_DIR is already per-process (see mspec/spec_helper.rb), so the specs'
+# own scratch does not collide either.
+sb_work="$(mktemp)"
+sb_i=0
+for d in $dirs; do
+  sb_i=$((sb_i + 1))
+  printf '%s %s\n' "$sb_i" "$d"
+done > "$sb_work"
+
+if [ "$sb_jobs" -le 1 ]; then
+  sb_t0="$sb_trees/0"; mkdir -p "$sb_t0"; sb_mktree "$sb_t0"
+  SPEC_TREE="$sb_t0"; export SPEC_TREE
+  while read -r sb_n sb_d; do run_group "$sb_d" "$sb_n"; done < "$sb_work"
+else
+  sb_w=0
+  while [ "$sb_w" -lt "$sb_jobs" ]; do
+    (
+      sb_t="$sb_trees/$sb_w"
+      mkdir -p "$sb_t"
+      sb_mktree "$sb_t"
+      SPEC_TREE="$sb_t"
+      export SPEC_TREE
+      while read -r sb_n sb_d; do
+        [ $(( (sb_n - 1) % sb_jobs )) -eq "$sb_w" ] || continue
+        run_group "$sb_d" "$sb_n"
+      done < "$sb_work"
+    ) &
+    sb_w=$((sb_w + 1))
+  done
+  wait
+fi
+rm -f "$sb_work"
+# the rows, back in the order a sequential sweep would have written them
+for sb_r in $(ls "$rowsdir" 2>/dev/null | sort -n); do cat "$rowsdir/$sb_r"; done > "$rows"
 
 # Merge the measured rows into the table instead of rewriting it. Rewriting meant
 # a sweep of ONE group silently dropped every row it had not measured: the

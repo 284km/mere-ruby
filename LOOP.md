@@ -98,7 +98,7 @@ show up.
 
 ## What is left, and what each is worth
 
-### 1. Parallelise the sweep — 30 min to an estimated 5-6 min
+### 1. Parallelise the sweep — built, 3x, and behind a flag until the bound is CPU time
 
 The sweep is sequential and the machine is not: 1809s of wall clock for 1051s
 of CPU (585 user + 467 sys) is **0.58 cores of ten**. Groups are independent
@@ -110,10 +110,43 @@ tree, because a spec that writes into it would then race with another worker
 rather than merely follow it. The shape is **one tree per worker** — six
 clones, not 2,498 — which keeps today's win and adds the parallelism on top.
 
-Verified the same way: every row identical to the sequential record.
+Built on 2026-09-22 and it works: `SPEC_JOBS=6` gives one tree per worker,
+groups dealt round-robin by position, rows written to one file each and
+concatenated in the original order so the table comes out identical.
 
-This is the largest remaining lever by a wide margin. Six sweeps a day goes
-from thirty minutes to five.
+| | timed |
+|---|---|
+| eight groups, `SPEC_JOBS=1` | 135.4s |
+| eight groups, `SPEC_JOBS=6` | **67.2s** (rows and tags byte-identical) |
+| the full sweep, `SPEC_JOBS=6` | **547s — 9 minutes**, from 30 |
+
+⚠ **And then the record moved, twice, without the interpreter changing.**
+This is the part worth carrying:
+
+| bounds | what the record said |
+|---|---|
+| sequential, 25s per side / 60s per file | core/dir 18 DIFF, 1 SLOW — 0 CRASH overall |
+| six workers, same bounds | core/dir **14 DIFF, 5 SLOW** — four files crossed a wall-clock bound because five other workers were on the machine |
+| six workers, both bounds ×6 | SLOW 13 → 4 and **CRASH 0 → 4** — with more time, the same files reached the MEMORY cap instead |
+
+MATCH was 1764 in all three. The gap moved between DIFF, SLOW and CRASH
+according to **which bound fired first**, and both of them are wall clock.
+⚠ There are TWO bounds and the first attempt scaled only the outer one
+(`scoreboard.sh`'s 60s), which changed nothing, because the four files were
+hitting `run_spec.sh`'s own 25s per side. A harness with two limits for one
+question will hide one of them from you.
+
+So `SPEC_JOBS` defaults to **1**. The parallel path is committed and is a
+genuine 3×, but a record has to be reproducible before it is fast, and this
+one is not yet: the same build gives three different tables.
+
+**What would make it sound**: bound CPU TIME, not wall clock. A file that
+spends 25 CPU-seconds spends 25 whether one worker runs or six, so the verdict
+stops depending on the load. ⚠ It cannot be the only bound: a spec blocked on
+stdin (several of `core/argf`) uses no CPU at all and would never be killed.
+The shape is a CPU bound at today's numbers for "this does not finish", plus a
+generous wall bound purely to catch a blocked process. That is the next piece
+of work here, and when it lands the default can flip to 6.
 
 ### 2. `-O0` for the probe loop — 82s off every build
 
@@ -177,3 +210,16 @@ Append a dated section for the change: the number BEFORE, the number AFTER,
 how each was obtained (timed or observed), and what was checked to show the
 answers did not move. A speedup whose correctness check is not written down is
 not a speedup anyone can build on.
+
+
+## 2026-09-22: the sweep leaves its own litter
+
+`mspec/spec_helper.rb` removes `SPEC_TEMP_DIR` (which is
+`rubyspec_temp/<pid>`, per process) when a run finishes normally. A run killed
+by either bound does not reach that line, so a sweep with a dozen SLOW files
+leaves a dozen directories behind — and there were **1,337** of them after a
+day of sweeps. They are what the next day's `fseventsd` is indexing.
+
+Not yet fixed; the one-line version is for the sweep to remove `rubyspec_temp/`
+when it finishes, since it is the sweep's own litter. Noted here so the number
+is on record: it is small per run and it accumulates.
