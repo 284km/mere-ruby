@@ -698,6 +698,27 @@ reclaiming *objects*, which is a garbage collector or reference counting rather
 than a tweak. A bare block iteration is 130 allocations and 3.7 KB, so the frame
 machinery is most of it either way.
 
+### What that costs the record: two spec files pass 6 GB (2026-09-22)
+
+The sweep caps a spec run at 6 GB (`mspec/rss_guard.sh`), and two files reach
+it where ruby needs megabytes:
+
+| file | what it does |
+|---|---|
+| `core/module/define_method_spec.rb` | defines methods in a loop — the 9 KB above, times the loop |
+| `core/enumerator/lazy/to_enum_spec.rb` | drives a lazy pipeline far enough to pay it per element |
+
+⚠ Both are recorded as **SLOW**, not CRASH, and the distinction is the point:
+the interpreter does not abort, the HARNESS stops it. Their rows in
+`mspec/tags/` name which bound answered. ⚠ And both sit on two thresholds at
+once — over 25 CPU-seconds AND over 6 GB — so which bound reaches them first
+varies between runs. They are the two rows that keep the parallel sweep from
+being byte-reproducible; see LOOP.md.
+
+This is not a separate defect. It is the section above, observed from the spec
+suite instead of from a benchmark, and it closes when the allocation per call
+does.
+
 One tempting shortcut was measured and does NOT work: the region doubles its
 block size and abandons the previous block, so the waste looked like it might be
 the 2x between 7.4 KB requested and ~9.5 KB resident. Capping the growth at 8 MB

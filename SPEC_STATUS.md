@@ -7,9 +7,10 @@ implementations' tags files. Per-file DIFF/CRASH lists live in `mspec/tags/`.
 
 - **MATCH** identical output under mere-ruby and ruby
 - **DIFF** runs on both, output differs (fidelity gap — often an error message or a frozen check)
-- **CRASH** mere-ruby aborts where ruby does not (missing feature)
+- **CRASH** mere-ruby aborts ON ITS OWN where ruby does not (missing feature)
 - **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable)
-- **SLOW** ran past this harness's per-file limit — working, not aborting
+- **SLOW** stopped by one of this harness's bounds — CPU seconds, wall clock or bytes —
+  and so working, not aborting. The row in `mspec/tags/` names which bound answered.
 
 Measured against **ruby 4.0.6** (tools/ref_ruby.sh). The reference is part
 of the subject: a row measured against another release is not comparable with the
@@ -67,7 +68,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/conditionvariable | 0 | 3 | 0 | 0 | 1 | 4 |
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/fiber | 1 | 12 | 0 | 0 | 0 | 13 |
-| core/dir | 15 | 18 | 0 | 0 | 1 | 34 |
+| core/dir | 15 | 19 | 0 | 0 | 0 | 34 |
 | core/file | 31 | 33 | 0 | 4 | 0 | 68 |
 | core/time | 40 | 26 | 0 | 0 | 0 | 66 |
 | core/io | 45 | 35 | 0 | 1 | 0 | 81 |

@@ -16,6 +16,12 @@ plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
 
 ```sh
+./tools/build.sh            # or, by hand, the line below
+./tools/build.sh --fast     # -O0: 30s instead of 112s, ~1.7x slower to run.
+                            # For shaping a change, NOT for the record -- the
+                            # sweep refuses an -O0 binary, because every verdict
+                            # in it is bounded in CPU seconds.
+
 mere -c main.mere > mr.c && clang -O2 -Wl,-stack_size,0x20000000 mr.c -o mere-ruby
 # That line is macOS's. On Linux all three pieces differ, and none of them was
 # written down until CI ran it somewhere else:
@@ -120,7 +126,6 @@ Every change is checked against the reference `ruby` before it lands:
 ./run_corpus.sh                                  # 213 programs, byte-for-byte
                                                  # (and eight SOURCE gates, see tools/)
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
-./mspec/rss_guard.sh &                           # bound the sweep's memory (see below)
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
 ./mspec/record_hygiene.sh                        # the records name no machine and no operator
 ./rgtest/run.sh <rubygems-checkout>              # rubygems' own test files
@@ -168,13 +173,27 @@ changes no answer, and where it would show if a spec ever dirtied it.
 [LOOP.md](LOOP.md) has the full breakdown of what a cycle costs, what each
 attempt to shorten it was worth, and what is left to try.
 
-Run the sweep with `mspec/rss_guard.sh` alongside it, and run it ALONE. The sweep
-bounds time per file and not bytes, and five spec files drive this interpreter
-past 6GB — `core/integer/even_spec.rb` reaches 15.3GB in under five seconds. The
-guard turns that into one recorded CRASH instead of a machine that stops
-responding. Starting a second harness next to the sweep is what took this machine
-down once: bootstraptest extracts a 121k-line generated program, and the two peaks
-land together.
+⚠ **The sweep's bounds are its own, and one of them is CPU time.** A spec run
+is limited three ways and [mspec/bounds.sh](mspec/bounds.sh) owns all three:
+`SPEC_CPU` (25s) is how much CPU one side may BURN and is the answer to "does
+this finish"; `SPEC_WALL` (120s) is how long one side may EXIST and exists only
+to catch a process that is blocked rather than slow; the outer bound
+`scoreboard.sh` puts on `run_spec.sh` is DERIVED from `SPEC_WALL` so it can
+never be the one that fires first. Bytes are the third, and the sweep now
+starts `mspec/rss_guard.sh` itself and takes it down on the way out, instead of
+asking the operator to remember — five spec files drive this interpreter past
+6GB, and `core/integer/even_spec.rb` reaches 15.3GB in under five seconds.
+
+Two of those were wall clock until 2026-09-22, and that is why the sweep was
+sequential: with six workers the same binary produced three different tables,
+the gap sliding between DIFF, SLOW and CRASH according to which bound fired
+first. A file that burns 25 CPU-seconds burns 25 whether one worker runs or
+six, so `SPEC_JOBS` is now safe to use; [LOOP.md](LOOP.md) has the measurements
+and the A/B that checked it.
+
+Still run the sweep ALONE. Starting a second harness next to it is what took
+this machine down once: bootstraptest extracts a 121k-line generated program,
+and the two peaks land together.
 
 `MERE_RUBY_STACKTRACE=1` makes the recursion guard dump the innermost call
 names before it raises. mere-ruby keeps no backtrace, so this is the only
@@ -465,8 +484,8 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2498 spec files** across 103 groups: **1764 MATCH, 693
-DIFF, 0 CRASH**, 32 SKIP, 9 SLOW, against ruby 4.0.6. Run with no
+The record covers **2498 spec files** across 103 groups: **1764 MATCH, 694
+DIFF, 0 CRASH**, 32 SKIP, 8 SLOW, against ruby 4.0.6. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
@@ -519,9 +538,13 @@ asks "did it run at all", and mere-ruby printed no tally where ruby ran eleven
 examples. When two instruments disagree, find out which question each is
 answering before believing the friendlier one.
 
-**Every file runs on both sides** (MATCH + DIFF): nothing aborts. So the gap
-is not "cannot", and a group score reads low for a reason worth naming rather
-than for breakage -- real programs (the corpus) match exactly while a value class scores
+**Nothing aborts on its own** — CRASH is 0, and the eight SLOW files were
+stopped by one of this harness's bounds (six by the CPU budget, one by the
+memory cap), not by the interpreter giving up. ⚠ That distinction is now the
+definition rather than a convention: a SIGKILL from `mspec/rss_guard.sh` used
+to be filed as CRASH, which is a claim about the interpreter, and its row names
+the bound instead. So the gap is not "cannot", and a group score reads low for
+a reason worth naming rather than for breakage -- real programs (the corpus) match exactly while a value class scores
 low on an error message or a frozen-object check. ⚠ Three earlier CRASH rows
 have appeared and gone: every one was a NAMED MISSING LIBRARY (`fcntl`, `cgi`,
 `io/console`) that the file required on its fourth line, which the scoreboard

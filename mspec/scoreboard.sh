@@ -8,8 +8,10 @@
 # compares byte-for-byte (see run_spec.sh). A file is one of:
 #   MATCH  - identical output on both
 #   DIFF   - runs on both, output differs (feature fidelity gap)
-#   CRASH  - mere-ruby aborts where ruby does not (missing feature / bug)
+#   CRASH  - mere-ruby aborts ON ITS OWN where ruby does not (missing feature)
 #   SKIP   - ruby itself errors/does not run (unmeasurable here)
+#   SLOW   - one of this harness's bounds stopped it (CPU seconds, wall clock or
+#            bytes). Not the interpreter aborting: the row names which bound.
 #
 # Usage:
 #   ./scoreboard.sh <spec-root> [dir ...]     # e.g. .../spec/ruby language core/array
@@ -105,6 +107,24 @@ if [ "$spec_subject" = "unknown@unknown" ] && [ -n "$sb_rec_subject" ] \
   exit 2
 fi
 
+# ...and the same question about the BINARY. tools/build.sh has a --fast mode
+# that compiles at -O0: 30s instead of 112s, and 1.7x slower to run. That is a
+# good trade while a change is being shaped and a bad one here, because every
+# verdict in this table is bounded in CPU seconds -- a file that burns 20 of
+# them under -O2 burns about 34 under -O0 and crosses a budget it has never
+# crossed, so the record would report a regression that is a compiler flag.
+# Which build made the binary is not visible in the binary; build.sh writes it
+# down, and this is what reads it. Silent when there is no stamp, because a
+# hand-built binary is still the normal case.
+sb_build_mode="$(cat "$here/../.build_mode" 2>/dev/null || echo)"
+if [ "$sb_build_mode" = "O0" ] && [ "${SPEC_BUILD_OK:-0}" != 1 ]; then
+  echo "scoreboard.sh: REFUSING to sweep -- .build_mode says this mere-ruby was built" >&2
+  echo "with tools/build.sh --fast (-O0), which runs about 1.7x slower. Every verdict" >&2
+  echo "here is bounded in CPU seconds, so the table would move for a reason that is" >&2
+  echo "not the interpreter. Rebuild with ./tools/build.sh, or set SPEC_BUILD_OK=1." >&2
+  exit 2
+fi
+
 sb_mismatch=""
 for sb_d in $dirs; do
   sb_n="$(ls "$root/$sb_d"/*_spec.rb 2>/dev/null | wc -l | tr -d ' ')"
@@ -126,21 +146,32 @@ if [ -n "$sb_mismatch" ]; then
   fi
 fi
 
-# 60s, not 30: the heaviest file here (core/string/modulo_spec.rb) spends ~26s of
-# CPU on its own, so 30 left almost no margin under the load of a sweep -- and a
-# file the alarm kills is not the same finding as a file that aborts, which is
-# what TIMEOUT below is for. (modulo_spec does abort, for its own reasons: its
-# mere-ruby side stops before it prints a tally, under this build and under the
-# build before it.)
-TIMEOUT=60
-# ⚠ BOTH BOUNDS ARE WALL CLOCK, which is why SPEC_JOBS defaults to 1. Measured
-# 2026-09-22 at six workers: with the bounds left at 25s/60s, four core/dir
-# files crossed them and the row moved from 18 DIFF / 1 SLOW to 14 / 5; with
-# both scaled by the worker count, those same files ran long enough to reach
-# the MEMORY cap instead and four groups moved from SLOW to CRASH. Same
-# interpreter, three different records -- the harness deciding the answer.
-# The parallel path is real and it is 3x (30 min -> 9), but it belongs behind
-# SPEC_JOBS until the bound is CPU time rather than wall clock. See LOOP.md.
+# ⚠ THE OUTER BOUND IS DERIVED, NOT CHOSEN. It used to be a number here (60s)
+# while run_spec.sh had a number of its own (25s per side), and the two answered
+# the same question -- "does this finish" -- in two places. When the sweep went
+# parallel and the answers moved, the first fix scaled THIS one, which changed
+# nothing, because the files were hitting the other. mspec/bounds.sh now owns
+# both, and this one is computed from the inner wall bound so that it covers
+# two sides plus the driver and can never be the one that fires first. Its job
+# is to catch run_spec.sh ITSELF wedging, not to judge a spec.
+. "$here"/bounds.sh
+TIMEOUT="$sb_outer"
+# ...and prove the CPU bound is available BEFORE measuring 2,498 files with it,
+# once for the whole sweep rather than once per file. run_spec.sh reads this and
+# skips its own probe.
+if sb_cpu_works; then
+  SPEC_CPU_OK=1
+else
+  SPEC_CPU_OK=0
+  echo "scoreboard.sh: this shell cannot set RLIMIT_CPU -- the sweep falls back to a" >&2
+  echo "${sb_cpu}s WALL bound per side, so verdicts will depend on the machine's load." >&2
+fi
+export SPEC_CPU_OK
+# The sweep can be parallel now that "does this finish" is measured in CPU
+# seconds: a file that burns 25 of them burns 25 whether one worker runs or six.
+# ⚠ It still defaults to 1, because the RECORD is the product here and a record
+# is checked by re-measuring it. The flag is how a working session buys the 3x;
+# see LOOP.md for the numbers and for what was checked.
 sb_jobs="${SPEC_JOBS:-1}"
 case "$sb_jobs" in ''|*[!0-9]*) sb_jobs=1 ;; esac
 [ "$sb_jobs" -ge 1 ] || sb_jobs=1
@@ -154,7 +185,14 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   # empty output, a killed run is indistinguishable from an abort. (`pipefail`
   # would do it too, but it is a bashism and these harnesses also run under dash.)
   raw="$(mktemp)"
-  perl -e "alarm $TIMEOUT; exec @ARGV" sh "$here/run_spec.sh" "$1" > "$raw" 2>/dev/null
+  # ⚠ `</dev/null`, because the loops below read the GROUP LIST on stdin and the
+  # child inherits it. Two things follow from leaving it: a spec that reads
+  # $stdin reads the harness's own work list -- so the record would depend on
+  # WHICH groups the sweep was asked for -- and whatever it consumed is a line
+  # the `while read` loop never sees, which loses groups in silence. Neither had
+  # bitten yet (core/argf's stdin specs redirect a fixture into a child rather
+  # than reading ours), and both are one redirection away from doing so.
+  perl -e "alarm $TIMEOUT; exec @ARGV" sh "$here/run_spec.sh" "$1" > "$raw" 2>/dev/null </dev/null
   rc=$?
   # LC_ALL=C on the `tr`: a spec whose output carries bytes that are not valid
   # UTF-8 (core/string's chars, chr, grapheme_clusters, ...) makes `tr` FAIL under
@@ -164,13 +202,18 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   # that are not there in C.
   out="$(LC_ALL=C tr -d '\0' < "$raw")"
   rm -f "$raw"
-  case $rc in 142|14) printf 'TIMEOUT\t-\n'; return;; esac
-  verdict="$(printf '%s' "$out" | tail -1)"
+  case $rc in 142|14) printf 'TIMEOUT\tthe outer %ss bound fired -- run_spec.sh itself did not return\n' "$TIMEOUT"; return;; esac
+  # The verdict line is VERDICT or VERDICT<TAB>CAUSE.
+  vline="$(printf '%s' "$out" | tail -1)"
+  verdict="${vline%%	*}"
+  if [ "$vline" = "$verdict" ]; then vcause="-"; else vcause="${vline#*	}"; fi
   if [ "$verdict" = "MATCH" ]; then printf 'MATCH\t-\n'; return; fi
-  # run_spec.sh says SLOW when ITS alarm fired: the file works and ran past the
-  # limit, which is not the same finding as aborting (the TIMEOUT above is this
-  # script's own alarm, one level out).
-  if [ "$verdict" = "SLOW" ]; then printf 'TIMEOUT\t-\n'; return; fi
+  # run_spec.sh says SLOW when one of ITS bounds fired: the file works and was
+  # stopped, which is not the same finding as aborting. Its cause says WHICH --
+  # over the CPU budget (a fact about the file) or stuck with the budget unspent
+  # (a fact about the harness or the environment) -- and the record keeps that,
+  # because a SLOW row that does not name the bound cannot be acted on.
+  if [ "$verdict" = "SLOW" ]; then printf 'TIMEOUT\t%s\n' "$(clip_cause "$vcause")"; return; fi
   # ruby side empty tally => unmeasurable (ruby itself didn't run the examples)
   rb="$(printf '%s' "$out" | sed -n '/--- ruby:/,$p' | grep -a 'pass=' | tail -1)"
   mr="$(printf '%s' "$out" | sed -n '/--- mere-ruby:/,/--- ruby:/p' | grep -a 'pass=' | tail -1)"
@@ -215,9 +258,10 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo
   echo "- **MATCH** identical output under mere-ruby and ruby"
   echo "- **DIFF** runs on both, output differs (fidelity gap — often an error message or a frozen check)"
-  echo "- **CRASH** mere-ruby aborts where ruby does not (missing feature)"
+  echo "- **CRASH** mere-ruby aborts ON ITS OWN where ruby does not (missing feature)"
   echo "- **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable)"
-  echo "- **SLOW** ran past this harness's per-file limit — working, not aborting"
+  echo "- **SLOW** stopped by one of this harness's bounds — CPU seconds, wall clock or bytes —"
+  echo "  and so working, not aborting. The row in \`mspec/tags/\` names which bound answered."
   echo
   echo "Measured against **ruby $REF_RUBY_VERSION** (tools/ref_ruby.sh). The reference is part"
   echo "of the subject: a row measured against another release is not comparable with the"
@@ -245,6 +289,56 @@ sb_mktree() {  # $1 = where to build it
   cp "$here/spec_helper.rb" "$1/spec_helper.rb"
 }
 
+# ⚠ THE SWEEP LEAVES ITS OWN LITTER, and it is the litter that makes the NEXT
+# sweep slow. mspec/spec_helper.rb gives each process a scratch directory --
+# `rubyspec_temp/<pid>`, under the cwd -- and removes it on the last line of a
+# normal exit. A run killed by either bound never reaches that line, so every
+# SLOW file leaves one behind: 1,605 of them had accumulated by 2026-09-22, and
+# they are exactly what fseventsd is indexing between sweeps (see LOOP.md).
+#
+# Removing them is the sweep's job because they are the sweep's own droppings.
+# ⚠ A directory is removed only when NO PROCESS HOLDS ITS PID: a concurrent
+# sweep's scratch must survive this one's exit, and `kill -0` is the question
+# that distinguishes them. A recycled pid keeps a dead directory one sweep
+# longer, which is the harmless direction.
+sb_sweep_litter() {
+  sb_lit="$sb_cwd/rubyspec_temp"
+  [ -d "$sb_lit" ] || return 0
+  for sb_p in "$sb_lit"/*; do
+    [ -d "$sb_p" ] || continue
+    sb_b="${sb_p##*/}"
+    case "$sb_b" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$sb_b" 2>/dev/null && continue
+    rm -rf "$sb_p"
+  done
+  rmdir "$sb_lit" 2>/dev/null
+  return 0
+}
+sb_cwd="$PWD"
+# before, so a sweep does not run on top of the last one's droppings...
+sb_sweep_litter
+
+# ⚠ THE MEMORY BOUND WAS A STEP IN THE README, WHICH IS NOT A BOUND. The
+# third limit on a spec run is bytes, and mspec/rss_guard.sh is what enforces
+# it -- by polling, because macOS has no `ulimit -v`. It was started by hand
+# ("./mspec/rss_guard.sh &" in the README) and it dies with the shell that
+# started it, so whether a runaway file is recorded as CRASH or takes the
+# machine down depended on whether someone remembered. On 2026-09-22 it was
+# down for half a day without anything saying so, and the four CRASH rows the
+# parallel experiment produced the same morning came from a run where it was
+# UP -- the same sweep, two answers, decided by a process nobody could see.
+#
+# So the sweep starts its own and takes it down on the way out. An operator's
+# guard is left alone if one is already up, because two pollers would both
+# report the same kill.
+sb_guard_pid=""
+if pgrep -f 'rss_guard\.sh' >/dev/null 2>&1; then
+  echo "scoreboard.sh: an rss_guard.sh is already running; leaving it to it" >&2
+else
+  sh "$here/rss_guard.sh" "$sb_rss_cap" "$here/rss_kills.log" 1 &
+  sb_guard_pid=$!
+fi
+
 # the rows measured THIS run; the table is merged rather than rewritten (below)
 rows="$(mktemp)"
 # ⚠ ...and one FILE per row, named by the group's position, because the workers
@@ -252,7 +346,7 @@ rows="$(mktemp)"
 # as a sequential sweep's.
 rowsdir="$(mktemp -d)"
 sb_trees="$(mktemp -d)"
-trap 'rm -rf "$rowsdir" "$sb_trees"' EXIT INT TERM
+trap '[ -n "$sb_guard_pid" ] && kill "$sb_guard_pid" 2>/dev/null; rm -rf "$rowsdir" "$sb_trees"; sb_sweep_litter' EXIT INT TERM
 
 # one group, measured by whichever worker drew it. The tag file is named by the
 # group, so two workers never write the same one; the row goes to its own file
@@ -277,7 +371,7 @@ run_group() {  # $1 = group dir, $2 = its position in $dirs
       DIFF)  df=$((df+1)); printf 'DIFF  %s\t%s\n'  "$rel" "$cause" >> "$tagdir/$group.txt" ;;
       CRASH) cr=$((cr+1)); printf 'CRASH %s\t%s\n'  "$rel" "$cause" >> "$tagdir/$group.txt" ;;
       SKIP)  sk=$((sk+1)); printf 'SKIP  %s\n'       "$rel" >> "$tagdir/$group.txt" ;;
-      TIMEOUT) to=$((to+1)); printf 'SLOW  %s\n'     "$rel" >> "$tagdir/$group.txt" ;;
+      TIMEOUT) to=$((to+1)); printf 'SLOW  %s\t%s\n' "$rel" "$cause" >> "$tagdir/$group.txt" ;;
     esac
   done
   echo "| $d | $m | $df | $cr | $sk | $to | $tot |" > "$rowsdir/$2"
@@ -303,6 +397,7 @@ if [ "$sb_jobs" -le 1 ]; then
   while read -r sb_n sb_d; do run_group "$sb_d" "$sb_n"; done < "$sb_work"
 else
   sb_w=0
+  sb_wpids=""
   while [ "$sb_w" -lt "$sb_jobs" ]; do
     (
       sb_t="$sb_trees/$sb_w"
@@ -315,9 +410,16 @@ else
         run_group "$sb_d" "$sb_n"
       done < "$sb_work"
     ) &
+    sb_wpids="$sb_wpids $!"
     sb_w=$((sb_w + 1))
   done
-  wait
+  # ⚠ WAIT FOR THE WORKERS, NOT FOR EVERY BACKGROUND CHILD. A bare `wait` also
+  # waits for the memory guard this script starts, and the guard is a `while :`
+  # poller that never exits -- so the sweep measured all eight groups, wrote
+  # every tag file, and then sat there forever with no child process running.
+  # It looked exactly like a hung sweep and it was a finished one. The
+  # sequential path has no `wait`, which is why only the parallel path wedged.
+  for sb_p in $sb_wpids; do wait "$sb_p"; done
 fi
 rm -f "$sb_work"
 # the rows, back in the order a sequential sweep would have written them
