@@ -1069,3 +1069,74 @@ Two things worth keeping from this:
 - **A kill is now a kill.** Tested with a subject that ignores SIGALRM: it is
   killed anyway. That closes the "is the wall bound only a nudge" question
   recorded earlier, and the answer changed because the mechanism changed.
+
+## 2026-09-22 (late): two scheduling ideas, both measured, both rejected
+
+The sweep at six workers uses **2.09 cores of ten** — 662s of wall for 1381s of
+CPU, of which **51% is SYSTEM time**. Each worker is therefore blocked about 65%
+of the time, on process creation and the filesystem rather than on computing.
+Two readings of that number suggested two changes. Both were implemented, both
+were measured, and **neither is in the tree**.
+
+### Longest-processing-time-first: slower
+
+Groups run from 118 files (`core/kernel`) down to three, and twenty of the 103
+have five or fewer. They were dealt round-robin BY POSITION, so one worker drew
+both 118- and 114-file groups. Dealing biggest-first is the textbook fix.
+
+| | timed |
+|---|---|
+| baseline | 646–662s (three samples) |
+| longest-first | **719.87s** |
+
+CPU was unchanged (1386s against 1381s): the same work, more wall clock.
+
+### Ten workers instead of six: slower
+
+If the workers are blocked rather than busy, more of them should overlap the
+blocking. They do not:
+
+| | timed | CPU |
+|---|---|---|
+| six workers | 646–662s | 1381s |
+| ten workers | **736.73s** | **1430s** |
+
+⚠ CPU went UP by 50 seconds for the same result. That is contention overhead,
+and it says the bottleneck is a SHARED serial resource — almost certainly the
+filesystem, given that half the CPU is system time — not a shortage of workers.
+
+### ⚠ The part that is about measuring, not about scheduling
+
+Both numbers came in worse, and both were taken while macOS's
+`StorageManagement` was eating **150%+ of CPU** — as it had been, on and off,
+all day. Three sweeps at 19:30, 19:57 and 20:12 got progressively slower, which
+is a pattern with nothing to do with what was changed, so **both results were
+retracted here as unmeasurable.**
+
+Then the control ran: the unchanged harness, default workers, under the same
+78%+64% load. **646.16s.** The baseline reproduces across seven hours (657.04,
+661.57, 646.16 — a 2.3% spread), so the load is high but STEADY. It is a
+constant, not a confound, and the two changes sit 10–14% outside that spread.
+
+**The retraction was wrong and the control is what found that out.** Both
+results stand.
+
+Two things to carry, and the second is the uncomfortable one:
+
+- **A before/after pair must be taken in the same window, or a control must be
+  run in the window you are doubting.** Three timings hours apart are not a
+  comparison. This is the fseventsd lesson from this morning in a new costume,
+  and it was walked into twice in one day.
+- ⚠ **Doubt was applied asymmetrically.** The load had been visible since 11:50
+  and was noted at the time. It was only treated as a possible confound when
+  the numbers came out AGAINST the changes. Had longest-first measured 10%
+  faster, it would have been committed without a control and this paragraph
+  would not exist.
+
+### What this leaves
+
+The sweep's remaining cost is process creation and filesystem work, shared
+across workers, and neither scheduling nor worker count moves it. The two
+remaining items in the loop are both outside this repository: the 41s emit and
+the ~350s `clang` invocation, which needs the emitted C split into several
+translation units.

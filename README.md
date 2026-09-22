@@ -190,8 +190,10 @@ arrived — two files sit above both the CPU budget and the memory cap, so
 `mspec/bound_events.log`, per run, not checked in.
 
 **`SPEC_JOBS` defaults to 6.** The full record is byte-identical at one worker
-and at six (1829.7s against 661.6s), which is the check — the speed is the
-consequence. Getting there took three fixes, and the last one is the one worth
+and at six, which is the check — the speed is the consequence. ⚠ On the ratio:
+the eight-group A/B was run back to back and is the load-independent figure
+(627.5s against 271.2s, **2.31×**); the full-sweep pair (1829.7s against
+646–662s across three samples) was taken hours apart and is the softer claim. Getting there took three fixes, and the last one is the one worth
 knowing: a shell sets SIGINT to `SIG_IGN` for a BACKGROUND job and `SIG_IGN`
 survives `fork` and `exec`, so every spec under a worker was ignoring SIGINT
 while the sequential path was not. [LOOP.md](LOOP.md) has the measurements.
