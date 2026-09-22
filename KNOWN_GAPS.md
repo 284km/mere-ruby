@@ -3275,3 +3275,45 @@ for its masks decides whether it runs here**, and nothing in the program says
 so: the 64-bit version is the more natural transcription of the standard, it is
 correct, and it is unusable. A dogfood that only checked answers would have
 shipped it.
+
+## The gzip engine runs at about 30 KB/s, and nothing had reached it before
+
+```
+Zlib.gzip("." * 2**20)   #   1 MB -> 1051 bytes,  35.3s
+Zlib.gzip("." * 2**21)   #   2 MB -> 2068 bytes,  71.2s
+Zlib.gzip("." * 2**22)   #   4 MB -> 4099 bytes, 142.6s
+```
+
+Linear, and about **34 seconds per megabyte**. `library/zlib/gzipwriter/write_spec.rb`
+writes 2\*\*23 bytes and is recorded SLOW: the harness stops it over the CPU
+budget, which is the honest verdict -- it is working, not aborting.
+
+⚠ **This cost is not new; only its visibility is.** Before `Zlib::GzipFile.wrap`
+existed the spec died on the missing name in milliseconds, so the record showed
+a NoMethodError and never the seconds. A hole with no workaround leaves no
+trace of what is behind it, and closing the hole is what put the number in the
+record. The same is true of the eight other SLOW rows this harness carries.
+
+**What fixing it would take.** Work in the deflate encoder itself, not here.
+The interesting question first is which half the time is in -- the LZ77 match
+search or the Huffman coding -- and neither has been measured.
+
+## `Zlib::Deflate` and `Zlib::Inflate` buffer, and cannot change mid-stream
+
+`Zlib.deflate` / `Zlib.inflate` are one-shot. The streaming classes are built on
+them by buffering the input and running the engine once, at `finish`, which
+gives byte-identical output because deflate is deterministic here:
+`d.deflate("hello") + d.finish == Zlib.deflate("hello")`.
+
+What that model cannot express is a change part way through a stream, so
+`Deflate#params`, `Deflate#set_dictionary`, `Inflate#set_dictionary` and
+`Inflate#add_dictionary` raise `NotImplementedError` naming the reason rather
+than accepting the call and ignoring it. `Inflate#sync` answers false and
+`#sync_point?` answers false, which is true of a stream that is never partial.
+
+⚠ `Zlib::Deflate` and `Zlib::Inflate` already existed as bare classes whose
+class methods are answered by the dispatcher, so their `superclass` is `Object`
+where ruby says `Zlib::ZStream`. Reopening either with `< ZStream` is a
+superclass mismatch; the shared surface is a module mixed into all three
+instead. Nothing in ruby/spec reads `Zlib::Deflate.superclass`, and every
+ZStream spec constructs a `Zlib::Deflate`.
