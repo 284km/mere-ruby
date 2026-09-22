@@ -3328,13 +3328,22 @@ walls, in the order a new extern hits them:
 | wall | what it refuses | examples |
 |---|---|---|
 | **header** | Mere emits `<stdio.h>` and `<unistd.h>` and no more, so anything declared elsewhere is "call to undeclared function" -- an ERROR since C99, which `-w` does not silence | `chmod`, `umask`, `mkfifo` (`<sys/stat.h>`) |
-| **types** | Mere emits `extern int f(const char*, int)` for `str -> int -> int`, so a parameter that is a TYPEDEF rather than a plain int is a conflicting declaration | `chown` (uid_t, gid_t), `truncate` (off_t) |
+| **types** | Mere emits `extern int f(const char*, int)` for `str -> int -> int`, so a parameter that is a TYPEDEF rather than a plain int is a conflicting declaration | `chown` (uid_t, gid_t), `truncate` (off_t), and `chmod` / `umask` / `mkfifo` AGAIN (mode_t) |
 | **shape** | a parameter that is a pointer OUT of the function cannot be an arena offset: clang refuses `long long` where `char *` is wanted | `readlink`, and `stat(2)` for the same reason |
 
 What survives all three is a function whose parameters are `const char*` and
 plain `int` and whose result is a plain int. That is why `File.rename` and
 `File.link` are here and `File.chmod`, `File.chown`, `File.truncate`,
 `File.readlink`, `File.umask` and `File.mkfifo` are not.
+
+⚠ **The walls are not alternatives, and the first reading of this table got that
+wrong.** "chmod is only behind the header" suggested a one-line fix -- emit
+`<sys/stat.h>` unconditionally -- and that was tried: the Mere compiler builds,
+its 2817 tests pass, and `chmod` goes from "call to undeclared function"
+straight to "conflicting types for 'chmod'", because mode_t is a typedef too.
+The header buys nothing on its own. Every function in `<sys/stat.h>` that this
+would want takes a mode_t, so wall 1 never stands alone in practice, and the
+change was reverted rather than pushed.
 
 **What would close all three at once** is the `file_stat`-shaped host builtin
 noted under *`File::Stat` reads through `stat(1)`*: the C side is written with
