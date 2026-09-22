@@ -268,6 +268,47 @@ how each was obtained (timed or observed), and what was checked to show the
 answers did not move. A speedup whose correctness check is not written down is
 not a speedup anyone can build on.
 
+The rest of these were learned by getting them wrong in this very file.
+
+**Pair the before and the after in the same window.** Two timings taken hours
+apart are not a comparison, because the machine is shared with whatever macOS
+decided to index today. If you are doubting a number, run the CONTROL — the
+unchanged thing, now, under the load you are doubting. ⚠ And decide whether to
+doubt from HOW it was measured, never from which way it came out: on
+2026-09-22 a background indexer at 150% was noticed at 11:50, ignored all day,
+and promoted to "a confound" only once the numbers came out against the change
+being tested. The control then showed the baseline was stable and the
+retraction was the error.
+
+**Write the open question, not a plausible story.** A stuck reference process
+was left in here as "two facts that have not been connected" because that was
+all that was known. Three tidier explanations had been written before it and
+all three were wrong. The honest placeholder is what made the real cause
+findable later; a confident wrong sentence would have closed the question.
+
+**Keep the wrong turns, with their corrections attached.** Six ideas in this
+file were measured and rejected, two of them proposed here a few hours before
+being disproved here. That is the most reusable content in the document: the
+next reader will have the same ideas, and the measurement that killed one is
+worth more than the reasoning that suggested it.
+
+⚠ **When a conclusion is superseded, say so AT the old one and check for other
+copies.** This file is append-only, so an edit that replaces a section leaves
+the earlier version in place unless you go and find it. Three successive edits
+left THREE copies of one section, all answering a live question the way it had
+stopped being true, and a reader hits the oldest first. Either mark the old
+section `SUPERSEDED — see <name> below` and leave the reasoning, or remove it
+and say in the replacement what was removed and why.
+
+**`mspec/record_hygiene.sh` refuses a document with two sections of the same
+title**, which is the signature of exactly that mistake. It is a check, not a
+convention, because this went wrong three times in one day without anyone
+noticing.
+
+**Keep the index at the top current.** A thousand lines of narrative has the
+detail and no way to see the list. Every change gets a row; so does every idea
+that was measured and not adopted.
+
 
 ## 2026-09-22: the sweep leaves its own litter
 
