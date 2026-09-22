@@ -124,6 +124,8 @@ Every change is checked against the reference `ruby` before it lands:
 
 ```sh
 ./run_corpus.sh                                  # 213 programs, byte-for-byte
+./run_corpus.sh --both                           # ...with the hash index ON and OFF,
+                                                 # running the reference once, not twice
                                                  # (and eight SOURCE gates, see tools/)
 ./bootstraptest/all.sh <ruby-checkout>           # CRuby's own bootstraptest
 ./mspec/scoreboard.sh <ruby>/spec/ruby           # every group the record has a row for
@@ -173,23 +175,26 @@ changes no answer, and where it would show if a spec ever dirtied it.
 [LOOP.md](LOOP.md) has the full breakdown of what a cycle costs, what each
 attempt to shorten it was worth, and what is left to try.
 
-⚠ **The sweep's bounds are its own, and one of them is CPU time.** A spec run
-is limited three ways and [mspec/bounds.sh](mspec/bounds.sh) owns all three:
-`SPEC_CPU` (25s) is how much CPU one side may BURN and is the answer to "does
-this finish"; `SPEC_WALL` (120s) is how long one side may EXIST and exists only
-to catch a process that is blocked rather than slow; the outer bound
-`scoreboard.sh` puts on `run_spec.sh` is DERIVED from `SPEC_WALL` so it can
-never be the one that fires first. Bytes are the third, and the sweep now
-starts `mspec/rss_guard.sh` itself and takes it down on the way out, instead of
-asking the operator to remember — five spec files drive this interpreter past
-6GB, and `core/integer/even_spec.rb` reaches 15.3GB in under five seconds.
+⚠ **The sweep's bounds are its own, and the one that matters is CPU time.** A
+spec run is limited three ways and [mspec/bounds.sh](mspec/bounds.sh) owns all
+three: `SPEC_CPU` (25s) is how much CPU one side may BURN and answers "does
+this finish"; `SPEC_WALL` (24× that) is how long one side may EXIST and catches
+a process that is blocked rather than slow; the outer bound `scoreboard.sh`
+puts on `run_spec.sh` is DERIVED from `SPEC_WALL` so it can never fire first.
+Bytes are the third, and the sweep starts `mspec/rss_guard.sh` itself and takes
+it down on the way out instead of asking the operator to remember.
 
-Two of those were wall clock until 2026-09-22, and that is why the sweep was
-sequential: with six workers the same binary produced three different tables,
-the gap sliding between DIFF, SLOW and CRASH according to which bound fired
-first. A file that burns 25 CPU-seconds burns 25 whether one worker runs or
-six, so `SPEC_JOBS` is now safe to use; [LOOP.md](LOOP.md) has the measurements
-and the A/B that checked it.
+A row says WHICH bound the measurements put a file over, never which signal
+arrived — two files sit above both the CPU budget and the memory cap, so
+"which bound fired" has no stable answer. The numbers behind it go to
+`mspec/bound_events.log`, per run, not checked in.
+
+**`SPEC_JOBS` defaults to 6.** The full record is byte-identical at one worker
+and at six (1829.7s against 661.6s), which is the check — the speed is the
+consequence. Getting there took three fixes, and the last one is the one worth
+knowing: a shell sets SIGINT to `SIG_IGN` for a BACKGROUND job and `SIG_IGN`
+survives `fork` and `exec`, so every spec under a worker was ignoring SIGINT
+while the sequential path was not. [LOOP.md](LOOP.md) has the measurements.
 
 Still run the sweep ALONE. Starting a second harness next to it is what took
 this machine down once: bootstraptest extracts a 121k-line generated program,

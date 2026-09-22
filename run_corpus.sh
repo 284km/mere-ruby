@@ -87,6 +87,26 @@ tmpd="$(mktemp -d "${TMPDIR:-/tmp}/mere_ruby_corpus.XXXXXX")"
 trap 'rm -rf "$tmpd"' EXIT
 exp="$tmpd/exp.txt"; got="$tmpd/got.txt"; dif="$tmpd/diff.txt"
 
+# ⚠ `--both` RUNS THE REFERENCE ONCE, NOT TWICE. Every change is swept with the
+# hash index ON and again with it OFF, which used to be two whole invocations of
+# this script -- and the second one re-ran `ruby` over all 213 programs to
+# reproduce output it had already produced.
+#
+# It is the same output: measured 2026-09-22, all 213 programs give a
+# byte-identical reference result with and without MERE_RUBY_NO_HASH_INDEX in
+# the environment (the flag is this interpreter's, and the three corpus programs
+# that enumerate ENV compare sizes against themselves rather than absolutely).
+# So the reference side of the second pass was pure repetition.
+#
+# ⚠ It is one PROCESS rather than two on purpose. 13 corpus programs write fixed
+# `/tmp` paths -- `/tmp/mere_ruby_corpus_105.bin`, `/tmp/mrb_al_source.rb` -- so
+# two passes running CONCURRENTLY would delete each other's files and the
+# failure would look exactly like an interpreter bug. That is a trap this
+# project has already been caught by once, with `diff <(a) <(b)`. Sequential in
+# one process keeps the programs' assumptions true.
+sb_both=0
+[ "${1:-}" = "--both" ] && sb_both=1
+
 pass=0
 for f in corpus/*.rb; do
   ruby "$f" > "$exp" 2>/dev/null
@@ -96,7 +116,19 @@ for f in corpus/*.rb; do
     cat "$dif"
     exit 1
   fi
+  if [ "$sb_both" = 1 ]; then
+    MERE_RUBY_NO_HASH_INDEX=1 "$MR_BIN" "$f" > "$got"
+    if ! diff -u "$exp" "$got" > "$dif"; then
+      echo "FAIL $f (with MERE_RUBY_NO_HASH_INDEX=1)"
+      cat "$dif"
+      exit 1
+    fi
+  fi
   pass=$((pass + 1))
   echo "ok   $f"
 done
-echo "$pass/$pass corpus programs match ruby"
+if [ "$sb_both" = 1 ]; then
+  echo "$pass/$pass corpus programs match ruby, with the hash index ON and OFF"
+else
+  echo "$pass/$pass corpus programs match ruby"
+fi

@@ -576,6 +576,155 @@ the default did not flip. ⚠ **The obstacle moved rather than vanishing**, and
 naming where it moved to is the whole value of having promised the flip: the
 time bounds are load-independent now, and the byte bound is not.
 
+### ⚠ A stuck reference — three wrong explanations, then the measurement
+
+`core/exception/interrupt_spec.rb` left the REFERENCE ruby sitting at ten
+minutes of wall clock and 0.07 seconds of CPU, but only under six workers. The
+spec runs `IO.popen([*ruby_exe, '-e', 'Process.kill :INT, Process.pid; sleep'],
+&:read)` — it waits for a child that is supposed to die of its own SIGINT.
+
+Three explanations were written into this file before any was checked. All
+three were wrong, and they are kept because the checking is the content:
+
+1. *"It lands in SKIP."* It did not, that time — the row was unchanged.
+2. *"`alarm` survives `exec` and ruby HANDLES SIGALRM, so the bound is a nudge."*
+   Measured: `mere-ruby` spinning, `ruby` spinning and `ruby` blocked in `sleep`
+   all come back **142**. SIGALRM kills. The story was invented to fit.
+3. *"Two facts that have not been connected."* Honest at the time, and still an
+   unexplained observation rather than a finding.
+
+**The measurement, finally.** A shell sets SIGINT and SIGQUIT to `SIG_IGN` for a
+job it starts in the BACKGROUND — and `SIG_IGN` is inherited across `fork` AND
+`exec`. The parallel path runs each worker as `( … ) &`, so every spec process
+beneath it ignored SIGINT, while at `SPEC_JOBS=1` (foreground) none of them did.
+The self-killing child therefore never died, and its parent blocked on `read`
+until the wall bound. Shown directly:
+
+| the same popen, run from | result |
+|---|---|
+| the foreground | child dies, `SIGINT (signal 2)` |
+| a background subshell | child never dies |
+
+⚠ **This is the harness changing the SUBJECT**, which is the one thing the
+parallel path must never do, and it moved a real row between DIFF and SKIP on
+worker count alone. The fix is two lines in the child before `exec`:
+`$SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"`. After it, the file completes in
+seconds from a background subshell and reports DIFF, exactly as in the
+foreground.
+
+It also removed a ten-minute tail from every parallel sweep, which is why the
+run that found it took 886s rather than the 657s of the run before.
+
+### So: does the default flip to 6?
+
+The evidence, all of it, with the final bounds:
+
+| comparison | table | tag rows |
+|---|---|---|
+| 8 groups, seq 645.4s vs par 300.0s | identical | 2 cause lines swapped (CPU vs memory) |
+| full, seq 1829.7s vs par 657.0s (wall 120) | `core/dir` moved | + clock, seed |
+| full, seq 1829.7s vs par **879.2s** (wall 600) | **identical** | **clock and seed only** |
+
+The last row is the one that counts, and the two lines that differ in it are
+the two that differ between ANY two runs: `core/process/clock_gettime` embeds a
+clock reading and `core/random/new` embeds a seed. By that measure the parallel
+sweep is as reproducible as the sequential one.
+
+**The default stays 1 anyway**, and this is a judgement rather than a forced
+conclusion. The reason is the row above it: the two files sitting on both the
+CPU and the memory threshold DID swap once in three comparisons, and the record
+is the product here. Thirty minutes once a day is cheaper than one unexplained
+diff in a checked-in file. `SPEC_JOBS=6` is documented, measured and safe for a
+working session, which is where the 2× actually matters.
+
+⚠ Note what the third row cost: 879s, not the 657s of the run before it, and
+the difference is almost entirely one file that stalled for ten minutes. The
+parallel sweep's wall time now has a long tail that the sequential one does
+not.
+
+The section above said "when it lands the default can flip to 6". It landed and
+the default did not flip. ⚠ **The obstacle moved rather than vanishing**, and
+naming where it moved to is the whole value of having promised the flip: the
+time bounds are load-independent now, and the byte bound is not.
+
+### ⚠ A stuck reference, and a causal story that did not survive being measured
+
+In the six-worker re-check, `core/exception/interrupt_spec.rb` left the
+REFERENCE ruby sitting at **9 minutes 56 seconds of wall clock and 0.07 seconds
+of CPU**. Blocked, not slow, and on the side nobody watches. The spec runs
+`IO.popen([*ruby_exe, '-e', 'Process.kill :INT, Process.pid; sleep'], &:read)`
+-- it waits for a child that is supposed to die of its own SIGINT.
+
+**Two explanations were written here before either was checked, and both were
+wrong.** They are kept because the checking is the content.
+
+1. *"It will land in SKIP: the wall bound kills the reference, no `pass=` line,
+   ruby did not run it here."* It did not. The row is byte-identical to the
+   sequential one.
+2. *"`alarm` survives `exec` and ruby HANDLES SIGALRM, so the bound is a nudge
+   rather than a kill."* Measured afterwards, three ways:
+
+   | subject | rc |
+   |---|---|
+   | `mere-ruby` spinning, `alarm 2` | **142** (killed) |
+   | `ruby` spinning, `alarm 2` | **142** (killed) |
+   | `ruby` blocked in `sleep 60`, `alarm 2` | **142** (killed) |
+
+   SIGALRM kills ruby. The "it is only a nudge" story was invented to explain
+   an observation and would have gone into a document as fact.
+
+⚠ **What is actually known**: a reference process sat for ten minutes using no
+CPU, and the recorded row for that file shows no sign of it. Those two facts
+have NOT been connected, and the honest state of this is an open question, not
+a finding. The candidates worth testing are that the process belonged to a run
+whose row was already written, and that the group had been measured before the
+stall began -- both checkable by timestamping group completion, which the sweep
+does not currently do.
+
+What the episode DOES establish, and this part is measured:
+
+- A spec can leave the reference blocked for as long as the wall bound allows,
+  and at six workers this one did. The wall bound is what ends it.
+- ⚠ **Nothing in the record says a bound had to fire.** Whatever the row ended
+  up being, no artifact anywhere notes that a file took ten minutes longer than
+  it should have. A bound that fires should be recorded even when the run then
+  completes, and that is the smallest useful next change here.
+- The reference-side classification added this morning has still only ever been
+  exercised by poison (`SPEC_CPU=0`), not in the wild. ⚠ The poison used a
+  subject with no SIGALRM handler, which is the easy case.
+
+### So: does the default flip to 6?
+
+The evidence, all of it, with the final bounds:
+
+| comparison | table | tag rows |
+|---|---|---|
+| 8 groups, seq 645.4s vs par 300.0s | identical | 2 cause lines swapped (CPU vs memory) |
+| full, seq 1829.7s vs par 657.0s (wall 120) | `core/dir` moved | + clock, seed |
+| full, seq 1829.7s vs par **879.2s** (wall 600) | **identical** | **clock and seed only** |
+
+The last row is the one that counts, and the two lines that differ in it are
+the two that differ between ANY two runs: `core/process/clock_gettime` embeds a
+clock reading and `core/random/new` embeds a seed. By that measure the parallel
+sweep is as reproducible as the sequential one.
+
+**The default stays 1 anyway**, and this is a judgement rather than a forced
+conclusion. The reason is the row above it: the two files sitting on both the
+CPU and the memory threshold DID swap once in three comparisons, and the record
+is the product here. Thirty minutes once a day is cheaper than one unexplained
+diff in a checked-in file. `SPEC_JOBS=6` is documented, measured and safe for a
+working session, which is where the 2× actually matters.
+
+⚠ Note what the third row cost: 879s, not the 657s of the run before it, and
+the difference is almost entirely one file that stalled for ten minutes. The
+parallel sweep's wall time now has a long tail that the sequential one does
+not.
+
+The section above said "when it lands the default can flip to 6". It landed and
+the default did not flip. ⚠ **The obstacle moved rather than vanishing**, and
+naming where it moved to is the whole value of having promised the flip: the
+time bounds are load-independent now, and the byte bound is not.
+
 ### ⚠ The wall bound is a NUDGE, not a kill — found by predicting wrong
 
 In the six-worker re-check, `core/exception/interrupt_spec.rb` -- which sends
@@ -618,3 +767,305 @@ then completes. ⚠ It cannot change the committed record -- the sequential run
 contains no wall-bound row at all -- which is what makes it safe to do
 separately rather than in a hurry.
 
+
+## 2026-09-22 (later): the next five, each with the measurement that sized it
+
+Investigated before planning, because the previous round's plan was built on a
+premise that turned out to be false. Two of the five below changed shape once
+they were measured, and one of them was my own proposal being refuted.
+
+### 1. Report what was MEASURED, not which alarm rang — and the peak-RSS idea is dead
+
+The plan recorded above was "take the verdict from the child's `rusage` peak
+RSS, so the poller can miss a peak without changing the answer". ⚠ **Measured,
+it does not work, for a reason that is more interesting than the proposal.**
+
+Peak RSS of the mere-ruby side under the real CPU bound, twice each, guard off:
+
+| file | run 1 | run 2 | spread |
+|---|---|---|---|
+| `core/module/define_method_spec` | 8323 MB | 7931 MB | 392 MB (4.7%) |
+| `core/enumerator/lazy/to_enum_spec` | 9030 MB | 9027 MB | 3 MB (0.03%) |
+| `core/array/equal_value_spec` | 5351 MB | 5336 MB | 15 MB (0.3%) |
+
+(And a control: a ruby allocating 500 MB reports 495 MB twice, identically, and
+the number survives being measured through the `perl … exec` chain. ⚠ It is
+also NOT quantised to a power of two, which is what this project had written
+down about peak RSS and does not hold for `rusage`'s maxrss.)
+
+The measurement is reproducible enough. **The problem is that the two ambiguous
+files exceed BOTH bounds, by a wide margin** — 8.3 GB and 9.0 GB against a 6 GB
+cap, while also burning past 25 CPU-seconds. There is no single true answer to
+"which bound", so a better way of OBSERVING which one fired cannot help: any
+rule that picks one is arbitrary.
+
+**So the change is to stop asking.** Read `rusage` after each side (CPU seconds
+AND peak RSS) and let the cause line state the facts: `CPU 25.0s, peak 8.3 GB
+— over both`. Nothing then depends on which alarm rang first, and the third
+file above shows the facts separate cleanly when they should (5.3 GB is under
+the cap, so it is CPU-only and says so).
+
+- **Worth**: the last two non-reproducible lines go away, so the full record
+  becomes byte-identical at six workers and `SPEC_JOBS` can default to 6 —
+  the sweep goes 30 minutes to 15.
+- ⚠ **Risk**: `/usr/bin/time -l` is BSD and reports bytes; GNU time is `-v` and
+  reports kbytes. The sweep is macOS-only today, but `bounds.sh` must degrade
+  to current behaviour rather than mis-parse.
+- **Check**: the eight-group A/B at 1 and 6 with byte-identical tags, plus a
+  poison per quadrant — over CPU only, over memory only, over both, over
+  neither.
+
+### 2. Record that a bound fired, even when the run completes
+
+⚠ **The motivation changed when it was measured.** This was going to be "make
+the wall bound SIGKILL, because `alarm` only perturbs a process that handles
+the signal". Measured three ways, that is false:
+
+| subject | rc |
+|---|---|
+| `mere-ruby` spinning, `alarm 2` | 142 (killed) |
+| `ruby` spinning, `alarm 2` | 142 (killed) |
+| `ruby` blocked in `sleep 60`, `alarm 2` | 142 (killed) |
+
+SIGALRM kills. What remains true is the part that has nothing to do with
+killing: **a reference process sat for ten minutes at 0.07 seconds of CPU and
+no artifact anywhere says so.** The work is a per-sweep log of bound events
+(file, side, which bound, the measured numbers), and group-completion
+timestamps so a stuck process can be attributed to the run it belongs to —
+which is also what would settle the open question recorded above.
+
+### 3. `dead_defs_check.sh`: 22.04s → 0.67s
+
+It is 25 of the 29 seconds the nine source gates take, and the reason is one
+line: the loop runs **one `awk` per definition**, each scanning the whole uses
+table.
+
+| | |
+|---|---|
+| top-level definitions (= `awk` forks) | **2,575** |
+| distinct identifiers (= lines each scans) | 7,577 |
+| line-scans | **19.5 million** |
+| current, timed | **22.04s** (user 9.96 + sys 5.75 — the sys is the forks) |
+| one-pass join, prototyped and timed | **0.67s** |
+
+⚠ **Not a pure speedup, because the allowlist has ZERO entries**, so
+`grep -qx "$name" allow` is a branch that has never fired. Rewriting around a
+guard nobody has exercised is how a guard quietly stops working. The check is
+an A/B of the output on the current tree PLUS a poison: add a function nobody
+calls (both versions must flag it), then allowlist it (both must pass).
+
+**Worth**: ~21 seconds off every cycle, and it is the most self-contained item
+here.
+
+### 4. The two corpus passes cannot simply overlap — and now the reason is known
+
+The idea is to run the hash-index-ON and hash-index-OFF passes concurrently,
+for ~79s a cycle. ⚠ **Blocked**: `grep` finds **13 corpus programs that write
+FIXED `/tmp` paths** (`/tmp/mere_ruby_corpus_105.bin`, `/tmp/mrb_al_source.rb`,
+…). Two passes at once would have them delete each other's files, and the
+failure would look exactly like an interpreter bug — which is a trap this
+project has already fallen into once with `diff <(a) <(b)`.
+
+The runner's OWN temporaries were fixed names and were moved to `mktemp -d`
+after two concurrent runs made the gate lie. The programs' were not. So the
+prerequisite is to give those 13 unique paths, without changing what they test.
+
+### 5. CI: the C compile is the critical path, and `bracket_depth` is the cheap part
+
+| job | step | timed |
+|---|---|---|
+| build-linux | Build mere-ruby on Linux | **378s** |
+| corpus | Build mere-ruby | **310s** |
+| build-linux | bracket_depth | 119s |
+| build-linux | setup-ocaml | 105s |
+| corpus | Build mere | 98s |
+| corpus | run_corpus.sh | 59s |
+
+The two jobs run in parallel, so the 11 minutes is build-linux, and 378s of it
+is one `clang` invocation on 302k lines. Cutting that needs the emit split into
+several translation units, which is a change in the Mere compiler's repository,
+not this one.
+
+The affordable piece is `bracket_depth`, at 119s: it bisects clang's own limit
+from scratch on every run. Seeding the range from the recorded value would keep
+the answer and skip most of the `-fsyntax-only` passes. ⚠ It must still be able
+to report a value ABOVE the seed, or it becomes a check that can only confirm
+what it was told.
+
+### Order, and why
+
+**3 first** — biggest ratio, smallest blast radius, and it needs no decision.
+**Then 1**, which is the only one that changes what the record says and the
+only one that halves the sweep. **Then 2**, which is visibility and also the
+tool for the open question above. **4** needs 13 corpus files touched carefully;
+**5** is mostly somebody else's repository.
+
+⚠ Not on this list: the emit step's 41 seconds, and `tools/build.sh`'s emit
+path, which is still the one thing shipped without being run — the Mere
+compiler is not on this machine.
+
+## 2026-09-22 (evening): the five, done — and the first attempt at #1 made it worse
+
+### 3. `dead_defs_check.sh`, landed (`7767794`)
+
+| | timed |
+|---|---|
+| before | **22.99s** |
+| after | **0.64s** |
+| the eight source gates together | ~29s → **4.95s** |
+
+One `awk` per definition became one `awk` over both tables. Checked by an
+output A/B on the current tree plus two poisons — an uncalled function (both
+versions flag it, same text, rc 1) and that function allowlisted (both pass).
+⚠ The second poison is the one that mattered: `dead_defs_allow.txt` has ZERO
+entries, so the allowlist branch had never once executed.
+
+### 1. Report the classification, and log the numbers — the second design
+
+The plan was "put the measured facts in the cause, so nothing depends on which
+alarm rang". Implemented, and the A/B says it **made the record worse**:
+
+| | before the change | after it |
+|---|---|---|
+| table, 1 vs 6 workers | identical | identical |
+| tag rows that differ | **2** (which bound was named) | **7** (every SLOW row) |
+
+The classification did become stable — the two rows that used to swap both read
+`over the memory cap` at one worker and at six. But writing `used 25.3s of 25s
+CPU, peaked 5.22 GB` into a CHECKED-IN row means the row differs from itself
+whenever the last digit moves, and `5.22` against `5.01 GB` is the same fact in
+two different bytes. **Two unreproducible rows became seven.**
+
+⚠ The error is worth naming precisely, because it is not a coding mistake: a
+record and a measurement want opposite things. A record must read the same
+twice; a measurement is interesting exactly where it varies. Putting them in
+one field made the field serve neither.
+
+So they are separated:
+
+- **the row** carries the class — `over the CPU budget`, `over the memory cap`,
+  `over the CPU budget AND the memory cap`, or the signal when neither bound
+  was reached (which means the wall bound fired). Derived from the
+  measurements, so it does not depend on which signal arrived.
+- **`mspec/bound_events.log`** carries the numbers, per run, truncated at the
+  start of each sweep, and gitignored. This is also item 2: a bound that fires
+  now leaves a trace, which is the thing that was missing when a reference
+  process sat for ten minutes and no artifact said so.
+
+Two measurements were needed to get there, and both were surprises:
+
+⚠ **`/usr/bin/time` loses SIGKILL.** Measured: a child killed by SIGXCPU comes
+back as 152 and by SIGALRM as 142, but SIGKILL's 137 arrives as **1**. Wrapping
+the subject in `time` to get rusage would therefore have broken the memory-cap
+classification — the guard's own kill, the one case that matters most — while
+the other two kept working. The real status is written by an inner `sh -c` now.
+
+⚠ **Peak RSS does not settle the ambiguity**, which is what killed the plan
+recorded earlier. With no guard running, `define_method_spec` peaks at 8.3 GB
+and `lazy/to_enum_spec` at 9.0 GB against a 6 GB cap, while both also burn past
+25 CPU-seconds: they are genuinely over BOTH bounds, so there is no single true
+answer for a better measurement to find. What fixed it was reporting both
+conditions instead of choosing between them.
+
+### 5. `bracket_depth`: a seeded fast path that can only confirm
+
+The check bisects `[1, BUDGET]` on clang's own answer — ten `-fsyntax-only`
+passes over 302k lines of C, 119s of every CI run. The answer is the same
+number almost every time, so it now tries to PROVE it in two probes: `SEED`
+must compile and `SEED-1` must not. Both together pin it exactly; either one
+behaving differently means the number moved, and the full bisection runs and
+reports the new value.
+
+⚠ The property to preserve is that the fast path can only CONFIRM, never
+conclude. A seeded check that could not report a larger number would be a check
+that only ever agrees with what it was told.
+
+Measured on THIS machine, both numbers from the same box — ⚠ the first version
+of this paragraph compared the new local time against CI's old one, which is
+two different machines and exactly the comparison this file exists to refuse:
+
+| | timed here |
+|---|---|
+| full bisection (`BRACKET_SEED=999`, i.e. a seed that misses) | **75.04s** |
+| seeded fast path | **11.97s** |
+
+**6.3×**, and the same answer both ways: 273, "over the mainline default of 256
+by 17". The wrong-seed run is also the proof that the fast path cannot weaken
+the check — it missed, fell back, bisected, and reported the right number.
+
+CI's copy of this step took 119s on its own hardware, so the saving there is
+its own measurement to take, not this ratio applied to that number.
+
+### The default is 6 now
+
+The eight groups that hold every bound-hitting file, same binary, same revision:
+
+| | timed | table | tag rows |
+|---|---|---|---|
+| `SPEC_JOBS=1` | 627.5s | — | — |
+| `SPEC_JOBS=6` | **271.2s (2.31×)** | **IDENTICAL** | **IDENTICAL** |
+
+Byte-identical rows AND causes. That is what `SPEC_JOBS` had been waiting for
+since the first parallel experiment, and it took three separate fixes to get
+there: the CPU bound, the wall bound expressed as a multiple of it, and the
+record carrying a classification rather than a measurement.
+
+### 4. Concurrent corpus passes: the uniquifier cannot come from the program
+
+13 corpus programs write fixed `/tmp` paths, so the two passes cannot overlap.
+⚠ And the obvious fix is wrong: `$$` in the program gives the two SIDES
+different paths, because they are different processes — and
+`138_lexical_file_and_require_relative` prints `File.basename(__FILE__)`, so
+the path reaches the output and byte-equality breaks.
+
+**So the concurrency was abandoned, and the redundancy removed instead.**
+Measured: all **213** programs give a byte-identical REFERENCE result with and
+without `MERE_RUBY_NO_HASH_INDEX` in the environment. The flag is this
+interpreter's; ruby does not read it, and the three corpus programs that
+enumerate ENV compare sizes against themselves rather than absolutely. So the
+second pass was running `ruby` over 213 programs purely to reproduce output it
+already had.
+
+`run_corpus.sh --both` runs the reference once and mere-ruby twice:
+
+| | timed |
+|---|---|
+| two separate invocations | 56.37s + 55.28s = **111.65s** |
+| `--both` | **70.55s** |
+
+**41 seconds a cycle**, no concurrency, and not one corpus program touched — so
+the 13 fixed `/tmp` paths stay safe, because it is still sequential in one
+process. ⚠ The first plan would have edited 13 witness programs to buy less.
+
+### ⚠ The record caught a regression the harness had been warned about
+
+The full sweep after all of the above read **MATCH 1758, not 1764**. Six files,
+all in `core/env`, had gone from MATCH to DIFF — `keys`, `values`, `to_a`,
+`each_key`, `each_value`, `each_pair` — and the divergence was one expectation:
+ruby ran 13 where mere-ruby ran 12.
+
+**One environment variable.** To get the wall bound into an inner shell I had
+added `SB_WALL` to `spec_env`'s `env -i` allowlist, and `core/env` COUNTS ENV
+KEYS. The two sides build their view of the environment differently (mere-ruby
+shells out to `env(1)`), so an extra key is not free even when both sides get
+it. ⚠ The comment above `spec_env` says precisely this, and names the five
+files it cost the last time. I added the variable anyway.
+
+The first fix — substituting the number into the command text instead of
+exporting it — left it off by one, which said the variable was not the only
+cause: the extra `sh -c` was a shell level too.
+
+So the shell went away entirely. `perl` was already in the chain for the alarm,
+so it now forks, merges the child's stderr into stdout, execs (with a LIST, so
+no shell), and on the alarm kills the child and records that the WALL bound
+fired rather than the child's own death. Nothing is added to the environment
+and there is no reaper printing "Killed: 9" into the captured output.
+
+Two things worth keeping from this:
+
+- ⚠ **The harness is part of the subject when the subject measures the
+  harness's environment.** There is no such thing as an invisible helper
+  variable in a suite that counts keys.
+- **A kill is now a kill.** Tested with a subject that ignores SIGALRM: it is
+  killed anyway. That closes the "is the wall bound only a nudge" question
+  recorded earlier, and the answer changed because the mechanism changed.

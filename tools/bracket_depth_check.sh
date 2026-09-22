@@ -58,6 +58,29 @@ fi
 # implementation of clang's rule, and the two would disagree eventually -- an earlier
 # hand-written counter in the mere repository reported "still over" for a file clang was
 # accepting. So: bisect on clang's own answer.
+# ⚠ SEEDED FAST PATH, AND IT CANNOT WEAKEN THE CHECK. A full bisection over
+# [1, 1024] is ten `-fsyntax-only` passes over 302k lines of C -- 119 seconds of
+# every CI run, measured 2026-09-22, and the answer is the same number almost
+# every time. So try to PROVE the recorded answer first, in two probes:
+#
+#     SEED     must compile   (the need is at most SEED)
+#     SEED-1   must NOT       (the need is at least SEED)
+#
+# Both together pin it exactly. Either one failing to behave means the number
+# MOVED, and then the full bisection runs and reports the new value -- so a
+# stale seed costs two extra probes and never a wrong answer. ⚠ This is the
+# property that matters: the fast path can only ever CONFIRM, never conclude.
+# A seed that made the check unable to report a larger value would be a check
+# that can only agree with what it was told.
+SEED="${BRACKET_SEED:-273}"
+sb_bd_fast=0
+if [ "$SEED" -gt 1 ] && [ "$SEED" -le "$BUDGET" ] \
+   && "$CC" -O0 -w -fsyntax-only -fbracket-depth="$SEED" "$SRC" 2>/dev/null \
+   && ! "$CC" -O0 -w -fsyntax-only -fbracket-depth="$(( SEED - 1 ))" "$SRC" 2>/dev/null; then
+  hi="$SEED"; sb_bd_fast=1
+fi
+
+if [ "$sb_bd_fast" = 0 ]; then
 lo=1; hi=$BUDGET
 "$CC" -O0 -w -fsyntax-only -fbracket-depth=$hi "$SRC" 2>/dev/null || {
   echo "bracket_depth: FAIL — the emitted C needs MORE than $hi, which is the -fbracket-depth"
@@ -70,6 +93,12 @@ while [ $((hi - lo)) -gt 1 ]; do
   if "$CC" -O0 -w -fsyntax-only -fbracket-depth=$mid "$SRC" 2>/dev/null
   then hi=$mid; else lo=$mid; fi
 done
+  if [ "$hi" != "$SEED" ]; then
+    echo "bracket_depth: the need is $hi, not the recorded $SEED -- update BRACKET_SEED"
+    echo "bracket_depth: in tools/bracket_depth_check.sh (this run bisected, which is 10"
+    echo "bracket_depth: compiles instead of 2; the number is right either way)."
+  fi
+fi
 
 margin=$(( BUDGET - hi ))
 echo "bracket_depth: needs $hi, the build passes $BUDGET — $margin to spare"

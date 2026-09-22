@@ -167,12 +167,24 @@ else
   echo "${sb_cpu}s WALL bound per side, so verdicts will depend on the machine's load." >&2
 fi
 export SPEC_CPU_OK
-# The sweep can be parallel now that "does this finish" is measured in CPU
-# seconds: a file that burns 25 of them burns 25 whether one worker runs or six.
-# ⚠ It still defaults to 1, because the RECORD is the product here and a record
-# is checked by re-measuring it. The flag is how a working session buys the 3x;
-# see LOOP.md for the numbers and for what was checked.
-sb_jobs="${SPEC_JOBS:-1}"
+# ⚠ WHERE A FIRED BOUND LEAVES ITS TRACE. The rows carry the classification, so
+# they read the same twice; the numbers behind it go here, per run, not checked
+# in. Truncated at the start so it describes THIS sweep and not a month of them.
+SB_BOUND_LOG="$here/bound_events.log"; export SB_BOUND_LOG
+: > "$SB_BOUND_LOG"
+# ⚠ SIX BY DEFAULT, AND THE CHECK IS THE RECORD, NOT THE CLOCK. This defaulted
+# to 1 for as long as a parallel sweep could produce a different table -- first
+# because both time bounds were wall clock, then because two rows named
+# whichever bound reached them first. Both are fixed (see mspec/bounds.sh), and
+# measured 2026-09-22 on the eight groups that hold every bound-hitting file:
+#
+#   SPEC_JOBS=1   627.5s
+#   SPEC_JOBS=6   271.2s   -- table IDENTICAL, mspec/tags/ IDENTICAL
+#
+# Byte-identical rows AND causes, which is the claim; 2.31x is the consequence.
+# SPEC_JOBS=1 is still there for a machine with fewer cores, or to re-measure a
+# record sequentially when something looks wrong.
+sb_jobs="${SPEC_JOBS:-6}"
 case "$sb_jobs" in ''|*[!0-9]*) sb_jobs=1 ;; esac
 [ "$sb_jobs" -ge 1 ] || sb_jobs=1
 # what a recorded line may say -- masking and the length bound, shared with

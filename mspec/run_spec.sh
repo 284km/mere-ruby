@@ -187,18 +187,58 @@ spec_env() {
 # "Cputime limit exceeded: 24", printed when it reaps a process the kernel
 # killed, which would otherwise land in the recorded output as if the spec had
 # said it.
-out_m="$({ ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
-             MSPEC_RUBY_EXE="$mr"; export MSPEC_RUBY_EXE
-             spec_env perl -e "alarm $sb_wall; exec @ARGV" "$mr" "$tmp/driver.rb"
-           ) 2>&1; echo "$?" > "$tmp/rc_m"; } 2>/dev/null | head -c "$out_cap")"
+# ⚠ NO EXTRA SHELL BETWEEN THE LIMIT AND THE SUBJECT. Two earlier attempts put
+# one there -- first to read the wall bound from the environment, then to record
+# the child's true exit status -- and each cost a key in `env -i`'s allowlist or
+# a shell level, which core/env COUNTS: six of its files went DIFF and MATCH
+# dropped 1764 to 1758. The record caught it; nothing else would have.
+#
+# perl already has to be in the chain for the alarm, so it does all of it and
+# adds nothing: fork, redirect the child's stderr into stdout, exec, and on the
+# alarm KILL the child and remember that it was the wall bound rather than the
+# child's own death. `system`/`exec` with a LIST never invokes a shell.
+#
+# ⚠ This also settles a question left open earlier: the wall bound is now a
+# kill, not a signal the subject may choose to handle.
+sb_runner='
+  my ($wall, $rcf, @cmd) = @ARGV;
+  my $pid = fork();
+  if (!defined $pid) { exit 127 }
+  if (!$pid) {
+    # ⚠ RESET THE SIGNALS A BACKGROUND JOB IGNORES. A shell sets SIGINT and
+    # SIGQUIT to SIG_IGN for a job it starts in the background, and SIG_IGN is
+    # inherited across fork AND exec -- so with SPEC_JOBS>1 every spec process
+    # under a worker ignored SIGINT, while at SPEC_JOBS=1 (foreground) it did
+    # not. Measured: `core/exception/interrupt_spec` spawns a child that kills
+    # itself with SIGINT; in the foreground the child dies, from a background
+    # subshell it never does and the parent blocks on read until the wall bound.
+    # That is the harness changing the SUBJECT, and it moved a row between DIFF
+    # and SKIP depending only on the worker count.
+    $SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT";
+    open(STDERR, ">&", \*STDOUT); exec(@cmd); exit 127
+  }
+  my $timedout = 0;
+  $SIG{ALRM} = sub { $timedout = 1; kill "KILL", $pid };
+  alarm $wall;
+  waitpid($pid, 0);
+  my $st = $?;
+  alarm 0;
+  my $rc = ($st & 127) ? 128 + ($st & 127) : ($st >> 8);
+  $rc = 142 if $timedout;
+  if (open(my $fh, ">", $rcf)) { print $fh "$rc\n" }
+'
+out_m="$( ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
+            MSPEC_RUBY_EXE="$mr"; export MSPEC_RUBY_EXE
+            spec_env /usr/bin/time -l -o "$tmp/ru_m" perl -e "$sb_runner" "$sb_wall" "$tmp/rc_m" "$mr" "$tmp/driver.rb"
+          ) 2>/dev/null | head -c "$out_cap")"
 rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
 # the REAL ruby binary, not rbenv's shim: the shim exports RBENV_* and RUBYLIB
 # into the process it execs, and a spec that walks ENV then sees a different
 # environment from the one mere-ruby was given (see tools/ref_ruby.sh).
-out_r="$({ ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
-             MSPEC_RUBY_EXE="${REF_RUBY_BIN:-ruby}"; export MSPEC_RUBY_EXE
-             spec_env perl -e "alarm $sb_wall; exec @ARGV" "${REF_RUBY_BIN:-ruby}" -W0 "$tmp/driver.rb"
-           ) 2>&1; echo "$?" > "$tmp/rc_r"; } 2>/dev/null | head -c "$out_cap")"
+out_r="$( ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
+            MSPEC_RUBY_EXE="${REF_RUBY_BIN:-ruby}"; export MSPEC_RUBY_EXE
+            spec_env /usr/bin/time -l -o "$tmp/ru_r" perl -e "$sb_runner" "$sb_wall" "$tmp/rc_r" "${REF_RUBY_BIN:-ruby}" -W0 "$tmp/driver.rb"
+          ) 2>/dev/null | head -c "$out_cap")"
 
 # ⚠ THREE BOUNDS, ONE VERDICT: "the harness stopped it". A run killed by the
 # CPU budget, by the wall alarm or by the memory guard did NOT abort -- and
@@ -215,10 +255,19 @@ out_r="$({ ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
 # real gap named in KNOWN_GAPS.md. What changes is which column carries it.
 # (Replacing the REFERENCE section instead would make it SKIP -- a claim about
 # ruby, which is a third wrong owner.)
+# ⚠ ONE SENTENCE FOR ALL THREE BOUNDS, AND IT REPORTS MEASUREMENTS. Which
+# signal arrived is a race when a file is above more than one threshold, and
+# two of them are: see mspec/bounds.sh. `rusage` says what the file actually
+# did, and it says the same thing at one worker and at six.
+#
+# The rusage line is only a REFINEMENT of the sentence: if it cannot be parsed
+# the row still names the signal, because a missing measurement must not become
+# a silent one.
+sb_ru_m="$(sb_rusage_read "$tmp/ru_m" 2>/dev/null || true)"
+sb_stopped=""
 timed_out=0
 if [ "$rc_m" = "137" ] || [ "$rc_m" = "9" ]; then
-  timed_out=1
-  out_m="OVER THE MEMORY CAP: SIGKILL, from mspec/rss_guard.sh unless something else on this machine sent it (see mspec/rss_kills.log) -- it did not abort on its own"
+  timed_out=1; sb_stopped="SIGKILL (the memory guard, unless something else on this machine sent it; see mspec/rss_kills.log)"
 fi
 # A run that passed the alarm is SLOW, which is not what CRASH says. With no
 # `pass=` line on the mere-ruby side the scoreboard reads CRASH and takes the
@@ -234,12 +283,27 @@ fi
 # They were one bucket with one message when both bounds were wall clock, and
 # that is exactly the distinction that was lost.
 if [ "$rc_m" = "152" ] || [ "$rc_m" = "24" ]; then
-  timed_out=1
-  out_m="OVER CPU BUDGET: burned this harness's ${sb_cpu}s of CPU per side (SIGXCPU) -- it did not abort on its own"
+  timed_out=1; sb_stopped="SIGXCPU (the CPU budget)"
 fi
 if [ "$rc_m" = "142" ] || [ "$rc_m" = "14" ]; then
-  timed_out=1
-  out_m="STUCK: ${sb_wall}s of wall clock without reaching the ${sb_cpu}s CPU budget (SIGALRM) -- it was waiting on something, not computing"
+  timed_out=1; sb_stopped="SIGALRM (the ${sb_wall}s wall bound, so it was waiting rather than computing)"
+fi
+if [ "$timed_out" = 1 ]; then
+  if [ -n "$sb_ru_m" ]; then
+    sb_cpu_used="${sb_ru_m%%	*}"; sb_peak="${sb_ru_m#*	}"
+    sb_class="$(sb_rusage_class "$sb_cpu_used" "$sb_peak")"
+    sb_bound_log "$spec" mere-ruby "$sb_stopped" "$sb_cpu_used" "$sb_peak"
+    # ⚠ THE CLASS, NOT THE NUMBERS -- see mspec/bounds.sh. And the signal is
+    # named only when the measurements do NOT account for the stop, which means
+    # it was the wall bound: a file over a bound is described identically at one
+    # worker and at six, and naming the signal there is what made rows swap.
+    case "$sb_class" in
+      "neither bound reached") out_m="STOPPED BY THIS HARNESS: $sb_stopped, with $sb_class -- it did not abort on its own" ;;
+      *)                       out_m="STOPPED BY THIS HARNESS: $sb_class -- it did not abort on its own" ;;
+    esac
+  else
+    out_m="STOPPED BY THIS HARNESS: $sb_stopped -- it did not abort on its own (rusage unavailable)"
+  fi
 fi
 if [ "${#out_m}" -ge "$out_cap" ]; then
   out_m="RUNAWAY OUTPUT: passed $out_cap bytes and was cut off"
@@ -254,9 +318,15 @@ fi
 # (ruby is the fast side here) and that is exactly why it would be believed.
 rc_r="$(cat "$tmp/rc_r" 2>/dev/null || echo 0)"
 case "$rc_r" in
-  152|24)  out_r="THE REFERENCE was stopped: it burned this harness's ${sb_cpu}s of CPU (SIGXCPU). ruby did not fail -- this file is unmeasured." ;;
-  142|14)  out_r="THE REFERENCE was stopped: ${sb_wall}s of wall clock with the CPU budget unspent (SIGALRM). ruby did not fail -- this file is unmeasured." ;;
-  137|9)   out_r="THE REFERENCE was stopped at the memory cap (SIGKILL; see mspec/rss_kills.log). ruby did not fail -- this file is unmeasured." ;;
+  152|24|142|14|137|9)
+    sb_ru_r="$(sb_rusage_read "$tmp/ru_r" 2>/dev/null || true)"
+    if [ -n "$sb_ru_r" ]; then
+      sb_bound_log "$spec" reference "signal $rc_r" "${sb_ru_r%%	*}" "${sb_ru_r#*	}"
+      out_r="THE REFERENCE was stopped by this harness: $(sb_rusage_class "${sb_ru_r%%	*}" "${sb_ru_r#*	}"). ruby did not fail -- this file is unmeasured."
+    else
+      out_r="THE REFERENCE was stopped by this harness (signal $rc_r). ruby did not fail -- this file is unmeasured."
+    fi
+    ;;
 esac
 echo "--- mere-ruby:"; echo "$out_m"
 echo "--- ruby:";      echo "$out_r"
