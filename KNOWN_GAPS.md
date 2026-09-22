@@ -2550,13 +2550,21 @@ everything the process printed before it was killed, so "ruby produced no
 output" read as "ruby failed immediately" when ruby had in fact printed 90
 lines and then hung on line 91.
 
-## Time is a stub
+## Time is a stub — SUPERSEDED, and every sentence of it is now false
 
-`Time#strftime`, `#zone`, `#utc_offset` are undefined, and `Time#to_s` /
-`#inspect` render `#<Time:0x...>` where ruby renders `1970-01-01 09:00:00
-+0900`. What Time DOES have is `<=>` (in the dispatcher, not the method table),
-which is why Time ranges compare, cover and refuse to walk exactly as ruby's
-do. The formatting is untouched.
+⚠ **Kept because a reader who greps for `strftime` lands here first.** What this
+entry said, and what is true instead:
+
+| this said | now |
+|---|---|
+| `Time#strftime` is undefined | implemented in the core prelude; matches the reference over the flag, width, `%:z`, `%^a` and `%N` forms |
+| `#zone`, `#utc_offset` are undefined | both answer |
+| `#to_s` / `#inspect` render `#<Time:0x...>` | they render `1970-01-01 09:00:00 +0900` |
+| the formatting is untouched | see also *Time keeps its subsecond now*, below |
+
+What Time DOES have is `<=>` (in the dispatcher, not the method table), which is
+why Time ranges compare, cover and refuse to walk exactly as ruby's do. That
+sentence is the only one that survived.
 
 ## A block used to leak into the calls made inside a proc (fixed)
 
@@ -2940,30 +2948,21 @@ block parameter is stored under -- binding, `super`, the defaults prologue and
 the destructuring path all read those names. Cost of leaving it: **part of one
 spec row** (core/proc/parameters; its other half, the method form, is fixed).
 
-## FileTest answers the predicates it can, and refuses the ones that need stat(2)
+## FileTest answers the predicates it can — and the eleven that needed stat(2) now answer too
 
 `FileTest` is the same set of predicates ruby's `File` gets by including it, and
 it had no door at all here: the constant was undefined, so all 25
 core/filetest spec files died on their first line. It answers now, through the
 File class methods that already existed.
 
-⚠ **Eleven of the twenty-six are deliberately still absent**, because there is no
-`stat(2)` behind them and a predicate that always answers `false` is a WRONG
-answer rather than a missing one:
-
-| absent | what it needs |
-|---|---|
-| `pipe?` `socket?` `blockdev?` `chardev?` | the file's type bits |
-| `setgid?` `setuid?` `sticky?` | the mode's special bits |
-| `owned?` `grpowned?` | the file's uid/gid against the process's |
-| `world_readable?` `world_writable?` | the mode as an Integer |
-
-What IS answered: `exist?` `directory?` `file?` `symlink?` `readable?`
-`writable?` `executable?` and their `_real?` spellings (the same question here
--- there is no setuid to tell the two apart), `size` `size?` `zero?` `empty?`
-and `identical?` (`test a -ef b`, the shell route the other three already use).
-
-Closing the rest means a stat syscall the interpreter does not have a door for.
+⚠ **This entry used to end "closing the rest means a stat syscall the
+interpreter does not have a door for", and listed eleven absent predicates.**
+They are answered as of the `File::Stat` work below: the type bits
+(`pipe?` `socket?` `blockdev?` `chardev?`), the special mode bits
+(`setgid?` `setuid?` `sticky?`), the ownership pair (`owned?` `grpowned?`)
+and the two that report the mode as an Integer (`world_readable?`
+`world_writable?`). The door is `stat(1)`, not `stat(2)`, and what that costs
+is the entry that follows.
 
 ## Only part of a library, on purpose
 
@@ -3190,3 +3189,89 @@ the wrong definition.
 ⚠ And `Dir#to_path` is the DEFINITION with `path` as its alias, which is the
 opposite of what writing it the other way round suggests. One method either
 way -- but `#original_name` then disagrees, and that is what the spec reads.
+
+## `File::Stat` reads through `stat(1)`, one subprocess per snapshot
+
+```ruby
+File.stat("x").mtime     # correct value, one `stat` process
+File.mtime("x")          # the same, and the same process count
+```
+
+Every field CRuby reads from `stat(2)` is read here by running `stat(1)` once
+and parsing its output. The values are the operating system's own, so they
+match the reference; what diverges is the cost and the dependency.
+
+**Why it is still here.** The host language's FFI carries ints, floats and
+strings, and `stat(2)` fills a `struct stat`. The two ways to bridge that from
+this repository are a hardcoded offset table -- an ABI claim nothing here can
+check, and a different one on the macOS this is developed on and the Linux CI
+runs -- or a subprocess. The subprocess is the one whose wrongness would be
+LOUD: `File::Stat.__raw` requires the exact field count and rejects a token
+that is not a number, so a wrong dialect raises instead of reporting zeros.
+The unit is the snapshot, not the field, which is what CRuby's `File::Stat`
+is too, so `st.uid` and `st.mtime` on one object cost one process between them.
+
+**What fixing it would take.** A `file_stat` host builtin in the Mere compiler,
+of the shape `file_pread` and the socket family already have: the C side does
+the `stat(2)` with the real headers and hands back fields in a layout Mere
+defines, so no offset is ever guessed. That is a change in merelang/mere across
+its backends, not a change here.
+
+## `Date` is proleptic Gregorian: the 1582 reform window is missing
+
+```ruby
+Date.civil(1583, 10, 14).prev_year   # mere-ruby: 1582-10-14
+                                     # ruby:      1582-10-04
+Date.civil(1581, 1, 1).jd            # mere-ruby: 2298509
+                                     # ruby:      2298519   -- ten days
+```
+
+`Date.civil(y, m, d)` here converts through a Julian day number with one
+formula for all of history. CRuby's `Date` takes a `start` argument naming the
+day the Gregorian calendar took effect (`Date::ITALY`, 2299161, by default) and
+uses the Julian calendar before it, so the ten days 1582-10-05..14 do not
+exist and dates before the reform differ by up to ten days.
+
+`#start` answers `2299161.0` because that is what the reference answers and
+because every date outside the window agrees with it; `#julian?` is therefore
+`false` everywhere, which is the visible edge of the same gap.
+
+**What fixing it would take.** Carrying `start` on each Date and branching both
+conversions on it -- which is the real feature, not a patch. Two spec files
+(`library/date/next_year_spec.rb`, `library/date/prev_year_spec.rb`) fail on
+exactly this and name the date 1582-10-09 when they do.
+
+## A 64-bit mask is a bignum, and a loop of them is 9.5 GB
+
+```ruby
+M32 = 0xffffffff
+x = 0x12345678
+i = 0; while i < 200_000; x = (x * 3 + 1) & M32; i += 1; end   # 0.39s,  28 MB
+
+M64 = 0xffffffffffffffff
+x = 0x123456789abcdef
+i = 0; while i < 200_000; x = (x * 3 + 1) & M64; i += 1; end   # does not
+                                                               # finish in 2 min
+```
+
+Values past the native integer become the bignum representation, every
+operation on one allocates, and a method call does not give its memory back
+(see *A method call costs ~9 KB that is never given back*). The two costs
+multiply inside a loop.
+
+**Where it was measured.** `Digest::SHA512` was first written the way the
+algorithm is specified -- one Integer per 64-bit word, masked with `M64`. It was
+correct against the reference on every input tried, and hashing **1000 bytes
+took 24 seconds and 9.5 GB of resident memory**, against 0.11s and 28 MB for
+SHA-256 on the same input. Seven spec files apiece for SHA-512 and SHA-384 were
+stopped by the sweep's memory cap and recorded SLOW.
+
+Rewriting it on 32-bit halves -- hi and lo carried separately, exactly as a C
+implementation on a 32-bit machine does, so no value ever reaches 2\*\*32 --
+gives byte-identical digests at **0.65s and 34 MB**.
+
+⚠ The lesson is not about SHA-512. It is that **the width a Ruby program picks
+for its masks decides whether it runs here**, and nothing in the program says
+so: the 64-bit version is the more natural transcription of the standard, it is
+correct, and it is unusable. A dogfood that only checked answers would have
+shipped it.

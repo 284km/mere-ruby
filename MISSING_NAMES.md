@@ -18,7 +18,9 @@ is a name the sender cannot reach though the direct call can, which is a
 dispatcher gap rather than a missing method.
 
 Asking only one of the two is how the first version of this file reported
-`Math.log` and `Time#strftime` as dispatcher gaps when they are simply absent.
+`Math.log` and `Time#strftime` as dispatcher gaps when they were simply
+absent. (Both answer now; the sentence is kept because the mistake is the
+point, and `Dir#to_path` is a name the same reading would misfile today.)
 
 Read a bucket before believing it. This is an upper bound: a method that
 rejects a wrong-typed argument with NoMethodError is counted, and the probe
@@ -30,18 +32,17 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 185 of 1413 names
+ABSENT: 159 of 1413 names
   IO (43): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
-  File (32): absolute_path? atime birthtime blockdev? chardev? chmod chown ctime flock ftype grpowned? lchmod lchown link lstat lutime mkfifo mtime owned? pipe? readlink rename setgid? setuid? socket? stat sticky? truncate umask utime world_readable? world_writable?
-  Process (25): _fork argv0 clock_getres egid euid getpgid getpgrp getpriority getrlimit getsid gid groups initgroups last_status maxgroups setpgid setpgrp setpriority setproctitle setrlimit setsid uid waitall waitpid2 warmup
   Kernel (24): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? define_singleton_method format gem gem_original_require global_variables lambda load local_variables open printf proc singleton_method sprintf test then yield_self
+  Process (21): _fork argv0 clock_getres getpgid getpgrp getpriority getrlimit getsid groups initgroups last_status maxgroups setpgid setpgrp setpriority setproctitle setrlimit setsid waitall waitpid2 warmup
+  File (14): absolute_path? chmod chown flock lchmod lchown link lutime mkfifo readlink rename truncate umask utime
   Dir (13): chroot close each_child empty? fchdir fileno for_fd foreach pos rewind seek tell to_path
   GC (13): auto_compact compact config count garbage_collect latest_compact_info latest_gc_info measure_total_time stat stat_heap total_time verify_compaction_references verify_internal_consistency
   Thread (10): add_trace_func backtrace backtrace_locations each_caller_location handle_interrupt ignore_deadlock keys native_thread_id pending_interrupt? thread_variables
   ObjectSpace (6): _id2ref count_objects define_finalizer each_object garbage_collect undefine_finalizer
   Module (5): class_exec const_source_location define_method module_exec used_modules
   Encoding (5): _dump _load aliases compatible? name_list
-  Time (4): ceil floor iso8601 xmlschema
   Enumerator (2): produce product
   Random (2): seed urandom
   Exception (1): exception
@@ -54,6 +55,30 @@ SEND-ONLY: 17 of 1413 names
   Dir (1): pos=
   Thread (1): ignore_deadlock=
 ```
+
+2026-09-22: **159 ABSENT of 1413**, same reference (4.0.6) and the same binary
+as the record above. The drop of twenty-six is three things, and only two of
+them are this day's work:
+
+- **File, eighteen names** -- `stat` and `lstat` and everything that reads a
+  snapshot: `atime` `mtime` `ctime` `birthtime` `ftype`, the KINDS
+  (`pipe?` `socket?` `blockdev?` `chardev?`), the special mode bits
+  (`setuid?` `setgid?` `sticky?`), the ownership pair (`owned?` `grpowned?`)
+  and the two that report the mode as an Integer (`world_readable?`
+  `world_writable?`). One `File::Stat` closed all eighteen, because they are
+  all the same read.
+- **Process, four names** -- `uid` `gid` `euid` `egid`, which File::Stat's
+  ownership questions need and which nothing else had asked for.
+- ⚠ **Time, four names** -- `ceil` `floor` `iso8601` `xmlschema`, and these are
+  NOT from this day. They landed in `57af09e` on 2026-09-20 and this file was
+  simply not re-probed afterwards. A count that is regenerated less often than
+  the thing it counts reports its own staleness as movement, so it is worth
+  saying which rows are which.
+
+What is left is concentrated: IO 43 and Kernel 24 are more than two fifths of
+the total, and File's remaining fourteen are all WRITES (`chmod` `chown`
+`rename` `truncate` `link` `readlink` `utime` `umask` `flock` ...) rather than
+reads -- a different door from the one the snapshot opened.
 
 2026-09-19: **185 ABSENT of 1413**, same reference (4.0.6) and the same binary
 as the record above. The drop from 222 is three arcs and one door: File and Dir

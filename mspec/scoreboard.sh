@@ -59,7 +59,15 @@ spec_subject="$( (cd "$root" 2>/dev/null && printf '%s@%s' \
 if [ -z "$dirs" ]; then
   # column 1 of the recorded table, minus the header rows
   # ... and not the header, whose first cell reads "group"
-  dirs="$(sed -n 's/^| \([a-z][a-z_/-]*\) |.*/\1/p' "$here/../SPEC_STATUS.md" 2>/dev/null | grep -v '^group$' | tr '\n' ' ')"
+  # ⚠ Same expression as mspec/record_hygiene.sh, and it has to stay that
+  # way: this one decides what gets swept and that one decides what must
+  # have a row. A character class that misses a name drops the ROW, because
+  # the whole `sed` line fails to match -- it does not merely shorten a
+  # name. Measured 2026-09-22: `[a-z][a-z_/-]*` silently dropped TWELVE of
+  # the 152 rows from the default sweep (every digest/* and win32ole/* and
+  # openssl/x509/*, plus library/base64 and library/English), so those rows
+  # kept whatever an older run had put there.
+  dirs="$(sed -n 's/^| \([a-zA-Z][a-zA-Z_0-9/-]*\) |.*/\1/p' "$here/../SPEC_STATUS.md" 2>/dev/null | grep -v '^group$' | tr '\n' ' ')"
   [ -n "$dirs" ] || dirs="language"
 fi
 tagdir="$here/tags"

@@ -164,7 +164,13 @@ else
   # day 26 of them were added, all 26 were reported as orphan records while
   # their rows sat in the table. Deriving the expected basenames from the rows
   # has one answer per row and needs no guess.
-  expected=$(sed -n 's/^| \([a-z][a-z_0-9/-]*\) |.*/\1/p' "$status" | tr '/' '_')
+  # ⚠ THE GROUP NAME IS WHATEVER ruby/spec CALLS THE DIRECTORY, and two of
+  # them are not lower-case ASCII words: `library/English` has a capital and
+  # `library/base64` has digits. A class that leaves either out does not
+  # report a smaller list -- `sed` fails the whole line and the row VANISHES,
+  # so the row reads as a tag file with no row (here) and as a group the
+  # default sweep never refreshes (scoreboard.sh, same expression).
+  expected=$(sed -n 's/^| \([a-zA-Z][a-zA-Z_0-9/-]*\) |.*/\1/p' "$status" | tr '/' '_')
   orphan=$(for t in "$root"/mspec/tags/*.txt; do
              [ -e "$t" ] || continue
              b=$(basename "$t" .txt)

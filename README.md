@@ -10,7 +10,7 @@ reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
 to ruby 4.0.6 (`bench/csv.sh`).
 
 The milestones below (M0-M6) are how it was built. What it is measured by now
-is [ruby/spec](https://github.com/ruby/spec): **1764 of 2498 spec files**
+is [ruby/spec](https://github.com/ruby/spec): **1991 of 2946 spec files**
 byte-identical to ruby 4.0.6 — every `core` and `language` file the suite has,
 plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
@@ -491,8 +491,8 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2498 spec files** across 103 groups: **1764 MATCH, 694
-DIFF, 0 CRASH**, 32 SKIP, 8 SLOW, against ruby 4.0.6. Run with no
+The record covers **2946 spec files** across 152 groups: **1991 MATCH, 815
+DIFF, 0 CRASH**, 132 SKIP, 8 SLOW, against ruby 4.0.6. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
@@ -500,15 +500,16 @@ the end).
 
 **`core` and `language` are now measured in full**: 2133 of 2133 core files and
 80 of 80 language files, every directory the suite has, nested ones included.
-`library` is measured for the 16 libraries this ships: 285 of 1516.
+`library` is measured for the libraries this ships: **733 of 1516**, across 65
+groups.
 
-⚠ **2498 is not all of ruby/spec** -- the suite has 3821 files, and the number
+⚠ **2946 is not all of ruby/spec** -- the suite has 3821 files, and the number
 worth writing down is the one that says what is NOT being asked. Here are the
-other 1323, counted so that they add up:
+other 875, counted so that they add up:
 
 | files | not measured | why |
 |---|---|---|
-| 1231 | `library/` outside the 16 groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before |
+| 783 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
 | 46 | `optional/capi` | out of scope: a C API, and this has no C extensions to answer it with |
 | 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
 | 13 | `security` | CVE regressions; four of them need rubygems or optparse |
@@ -516,6 +517,27 @@ other 1323, counted so that they add up:
 
 A percentage over a surface you chose is worth less than the list of what you
 left out, so the list is here and it adds to 3821.
+
+⚠ **The 448 files added on 2026-09-22 cost no interpreter change at all**, and
+picking them was the whole of the work. `library/` has 118 directories with no
+row; the question "which of these does this interpreter ship?" was answered by
+asking IT, not by reading a list: every non-relative `require` those 118 groups
+make -- 49 distinct names -- was run under this binary, and the 49 groups whose
+requires ALL loaded were swept. That moved **1764 MATCH to 1934** before a line
+of the interpreter changed, and four groups came back whole on the first run
+(`cgi/queryextension` 38/38, `cgi/htmlextension` 26/26, `cgi/cookie` 9/9,
+`date/infinity` 10/10).
+
+⚠ It also found that the default sweep had been **dropping twelve of its own
+rows in silence**. `scoreboard.sh` with no arguments re-sweeps "every group the
+table has a row for", and it read those names with `sed -n 's/^| \([a-z][a-z_/-]*\) |.*/\1/p'`.
+A group name with a digit or a capital does not shorten under that class -- the
+whole line fails to match and the ROW DISAPPEARS. `library/base64` had been in
+the table for weeks and had never been re-measured by a default run; so had
+every `digest/*`, `win32ole/*` and `openssl/x509/*` group, and `library/English`.
+The same expression lived a second time in `record_hygiene.sh` with a slightly
+different class, which is why that gate reported `library/English` as a tag file
+with no row. Both now use one expression, and the comment in each names the other.
 
 ⚠ The last 416 of those were not hard to measure -- they were never ASKED.
 `run_spec.sh` clones core, language, shared and fixtures into the tree it runs
