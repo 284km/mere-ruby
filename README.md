@@ -154,6 +154,18 @@ machine or an operator, a tag file whose row count disagrees with its table
 row (which is what a killed sweep leaves behind), and a tag file with no table
 row at all.
 
+⚠ **The sweep clones the spec tree ONCE, not once per file.** Measured
+2026-09-22: a spec file cost 2.71s of which 1.89s was SYS and 0.15s user --
+the two interpreters take about 0.1s between them and the rest was copying the
+4,333 files of core, language, library, shared and fixtures, which never
+change. Ten million clones per sweep, about an hour of syscalls, and enough
+filesystem churn to hold `fseventsd` at 100%+ for hours afterwards, which
+slowed every other run on the machine by up to 8x. `scoreboard.sh` builds one
+tree and hands it to `run_spec.sh` through `SPEC_TREE`; a hand-run of a single
+file still gets its own. The full sweep went from ~90 minutes to 30, with every
+row of the record byte-identical -- which is the check that the shared tree
+changes no answer, and where it would show if a spec ever dirtied it.
+
 Run the sweep with `mspec/rss_guard.sh` alongside it, and run it ALONE. The sweep
 bounds time per file and not bytes, and five spec files drive this interpreter
 past 6GB — `core/integer/even_spec.rb` reaches 15.3GB in under five seconds. The

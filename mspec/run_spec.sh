@@ -20,7 +20,23 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here"/../tools/ref_ruby.sh
 # see run_corpus.sh: a candidate build is gated before it takes over the path.
 mr="${MR_BIN:-$here/../mere-ruby}"
-tmp="$(mktemp -d)"
+# ⚠ THE CLONE IS THE SWEEP. Measured 2026-09-22: one spec file costs 2.71s
+# real of which 1.89s is SYS and only 0.15s user -- the two interpreters take
+# about 0.1s between them and the REST is copying 4,333 files (core, language,
+# library, shared, fixtures) that never change. Across 2498 files that is ten
+# million clones and roughly an hour of syscalls per sweep, and it is also what
+# drives fseventsd to 100%+ for hours, which slowed everything else by up to 8x.
+#
+# SPEC_TREE lets the caller prepare that tree ONCE and hand it over; scoreboard
+# does exactly that. Unset, this behaves as it always has -- a private tree per
+# file, which is what a hand-run of one spec still wants.
+if [ -n "${SPEC_TREE:-}" ]; then
+  tmp="$SPEC_TREE"
+  tree_is_shared=1
+else
+  tmp="$(mktemp -d)"
+  tree_is_shared=0
+fi
 specdir="$(cd "$(dirname "$spec")" && pwd)"
 # subpath under spec/ruby (e.g. "language", "core/enumerator"); the spec root.
 case "$specdir" in
@@ -30,7 +46,9 @@ case "$specdir" in
     ;;
   *) sub="language"; specroot="" ;;
 esac
-if [ -n "$specroot" ]; then
+if [ "$tree_is_shared" = 1 ]; then
+  : # the caller built it; nothing to copy
+elif [ -n "$specroot" ]; then
   # clone the relevant trees (APFS copy-on-write when available).
   # ⚠ LIBRARY WAS NOT IN THIS LIST, so not one of ruby/spec's 1516 library
   # files could run: the clone did not contain them and BOTH sides died with
@@ -48,8 +66,10 @@ else
   [ -d "$specdir/fixtures" ] && cp -R "$specdir/fixtures" "$tmp/$sub/fixtures"
   [ -d "$specdir/shared" ] && cp -R "$specdir/shared" "$tmp/$sub/shared"
 fi
-# the shim replaces the real mspec spec_helper.
-cp "$here/spec_helper.rb" "$tmp/spec_helper.rb"
+# the shim replaces the real mspec spec_helper. In a shared tree it is already
+# there (the caller put it there once); copying it again per file is one more
+# write into a directory fseventsd is watching.
+[ "$tree_is_shared" = 1 ] || cp "$here/spec_helper.rb" "$tmp/spec_helper.rb"
 base="$(basename "$spec" .rb)"
 cat > "$tmp/driver.rb" <<EOF
 require_relative "spec_helper"
@@ -171,4 +191,5 @@ echo "--- mere-ruby:"; echo "$out_m"
 echo "--- ruby:";      echo "$out_r"
 if [ "$timed_out" = 1 ]; then echo "SLOW"
 elif [ "$out_m" = "$out_r" ]; then echo "MATCH"; else echo "DIFF"; fi
-[ "$2" = "--keep" ] || rm -rf "$tmp"
+# a SHARED tree belongs to the caller, which removes it when the sweep ends.
+[ "$tree_is_shared" = 1 ] || [ "$2" = "--keep" ] || rm -rf "$tmp"

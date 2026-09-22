@@ -215,6 +215,27 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo "|---|---|---|---|---|---|---|"
 } > "$status"
 
+# ⚠ ONE TREE FOR THE WHOLE SWEEP. run_spec.sh used to clone core, language,
+# library, shared and fixtures -- 4,333 files -- for EVERY spec file, which is
+# ten million clones and about an hour of syscall time per sweep, and it is
+# what drives fseventsd to 100%+ for hours afterwards. Measured 2026-09-22: of
+# one file's 2.71s, 1.46s was the clone and 0.1s the two interpreters.
+#
+# The tree is read-only to a spec except for what the spec itself writes, which
+# it also cleans up; the driver.rb this rewrites per file is the only thing
+# that changes. Validated by sweeping groups both ways and requiring the rows
+# to be identical -- if a spec ever leaves something behind, that check is
+# where it shows.
+sb_tree="$(mktemp -d)"
+for sb_d0 in core language library shared fixtures; do
+  [ -d "$root/$sb_d0" ] || continue
+  cp -Rc "$root/$sb_d0" "$sb_tree/$sb_d0" 2>/dev/null || cp -R "$root/$sb_d0" "$sb_tree/$sb_d0"
+done
+cp "$here/spec_helper.rb" "$sb_tree/spec_helper.rb"
+SPEC_TREE="$sb_tree"
+export SPEC_TREE
+trap 'rm -rf "$sb_tree"' EXIT INT TERM
+
 # the rows measured THIS run; the table is merged rather than rewritten (below)
 rows="$(mktemp)"
 
