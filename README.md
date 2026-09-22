@@ -165,6 +165,8 @@ tree and hands it to `run_spec.sh` through `SPEC_TREE`; a hand-run of a single
 file still gets its own. The full sweep went from ~90 minutes to 30, with every
 row of the record byte-identical -- which is the check that the shared tree
 changes no answer, and where it would show if a spec ever dirtied it.
+[LOOP.md](LOOP.md) has the full breakdown of what a cycle costs, what each
+attempt to shorten it was worth, and what is left to try.
 
 Run the sweep with `mspec/rss_guard.sh` alongside it, and run it ALONE. The sweep
 bounds time per file and not bytes, and five spec files drive this interpreter
