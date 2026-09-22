@@ -34,14 +34,31 @@ LC_ALL=C sed 's://.*::' $srcs | LC_ALL=C grep -oE '[a-z_][a-z_0-9]*' | sort | un
 sed -n 's/^\([a-z_][a-z_0-9]*\)[[:space:]].*/\1/p' "$here/dead_defs_allow.txt" 2>/dev/null \
   | sort -u > "$tmp/allow"
 
-n=0
-while IFS="$(printf '\t')" read -r name where; do
-  c=$(LC_ALL=C awk -v n="$name" -F"\t" '$1==n {print $2; found=1} END{if(!found) print 0}' "$tmp/uses")
-  [ "$c" -le 1 ] || continue
-  grep -qx "$name" "$tmp/allow" && continue
-  printf 'UNCALLED  %-26s %s\n' "$name" "$where"
-  n=$((n+1))
-done < "$tmp/defs"
+# ⚠ ONE PASS, NOT ONE PROCESS PER DEFINITION. This was a shell loop that ran an
+# `awk` per definition, each scanning the whole uses table: 2,575 forks over
+# 7,577 lines is 19.5 MILLION line-scans, and it was 25 of the 29 seconds the
+# nine source gates take (22.04s, of which 5.75 was SYS -- the forks). The same
+# question answered by loading the two tables into one awk is 0.67s, a 33x
+# difference for an identical answer.
+#
+# The three files go in as three streams and are told apart by FILENAME, which
+# is what keeps this a single pass rather than three.
+LC_ALL=C awk -F'\t' '
+  FILENAME == uses_f { use[$1] = $2 + 0; next }
+  FILENAME == allow_f { allow[$1] = 1; next }
+  {
+    name = $1; where = $2
+    # a name is CALLED if it occurs anywhere in code other than its own
+    # definition line, so the threshold is "more than one occurrence"
+    if ((name in use ? use[name] : 0) > 1) next
+    if (name in allow) next
+    printf "UNCALLED  %-26s %s\n", name, where
+    n++
+  }
+  END { print n + 0 > count_f }
+' uses_f="$tmp/uses" allow_f="$tmp/allow" count_f="$tmp/n" \
+  "$tmp/uses" "$tmp/allow" "$tmp/defs"
+n="$(cat "$tmp/n")"
 
 if [ "$n" -gt 0 ]; then
   echo "dead defs: $n top-level function(s) nobody calls -- delete, or name in tools/dead_defs_allow.txt with the reason"
