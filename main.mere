@@ -27523,16 +27523,58 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
     let d = char_at fmt fi in
     if str_eq d " " then rb_unpack_go s slen si fmt fl (fi + 1) acc
     else
-      let (cnt, fi2) = rb_count fmt fl (fi + 1) in
-      // width per element for fixed-width directives (0 = string-consuming)
-      let w = (if str_eq d "N" || str_eq d "V" then 4
-               else if str_eq d "n" || str_eq d "v" then 2
+      // ⚠ ...and `<`/`>` are read here too. unpack had the same gap as pack:
+      //   the modifier was left for rb_count, which is not a count, so every
+      //   modified directive unpacked as its unmodified self.
+      let (d, fi1) = pack_mods fmt fl (fi + 1) d in
+      let (cnt, fi2) = rb_count fmt fl fi1 in
+      // width per element for fixed-width directives (0 = string-consuming).
+      // ⚠ int_dir_width is the SAME TABLE pack reads. Before this, unpack knew
+      //   only N/n/V/v/C/c, so `"\x02\x01".unpack("S*")` answered [] -- an
+      //   empty array for a directive ruby understands, which is the quietest
+      //   possible wrong answer. One table, both directions.
+      let w = (if int_dir_width d > 0 then int_dir_width d
                else if str_eq d "C" || str_eq d "c" then 1
                else flt_dir_width d) in
-      if w > 0 then
+      // ⚠ `@` and `x` MOVE THE READ INDEX and produce no value. `@n` is an
+      //   ABSOLUTE position -- `"abcde".unpack("@2C")` reads the third byte --
+      //   and past the end is an ArgumentError, which is ruby's message word
+      //   for word. `xn` skips n bytes forward.
+      if str_eq d "@" then
+        (let want = (if cnt < 0 then 1 else cnt) in
+         if want > slen then
+           (let _ = prim_raise "ArgumentError" "@ outside of string" in acc)
+         else rb_unpack_go s slen want fmt fl fi2 acc)
+      else if str_eq d "x" then
+        (let n9 = (if cnt < 0 then 1 else cnt) in
+         let nxt = si + n9 in
+         if nxt > slen then
+           (let _ = prim_raise "ArgumentError" "x outside of string" in acc)
+         else rb_unpack_go s slen nxt fmt fl fi2 acc)
+      else if w > 0 then
         // repeat the fixed-width read `cnt` times (or until end for '*').
         let reps = (if cnt < 0 then floor_div (slen - si) w else cnt) in
         rb_unpack_fixed s slen si fmt fl fi2 d w reps acc
+      // ⚠ `h` -- hex, LOW nibble first -- was not here while `H` was, so
+      //   `"\xab".unpack("h*")` answered [] where ruby gives "ba". It is the
+      //   other half of the same round trip and pack has had both for a while.
+      else if str_eq d "h" then
+        (let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
+         let nb = floor_div (nib + 1) 2 in
+         let last = (if si + nb < slen then si + nb else slen) in
+         rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (rb_hex_lo s si last "") "US-ASCII", acc)))
+      // ⚠ `Z` reads up to the first NUL and SKIPS PAST IT; it was not here at
+      //   all, so `"ab\x00cd".unpack("Z*")` answered []. `A` strips trailing
+      //   NULs and spaces, which `a` does not -- they shared one arm and both
+      //   kept the padding.
+      else if str_eq d "Z" then
+        (let take = (if cnt < 0 then slen - si else cnt) in
+         let last = (if si + take < slen then si + take else slen) in
+         let z9 = nul_at s si last in
+         let text = rb_str_of_bytes s si z9 "" in
+         // `*` consumes the NUL too; a counted Z consumes the whole field.
+         let nxt = (if cnt < 0 then (if z9 < last then z9 + 1 else last) else last) in
+         rb_unpack_go s slen nxt fmt fl fi2 (Cons (mkstr_e text "ASCII-8BIT", acc)))
       else if str_eq d "H" then
         // hex string of `cnt` NIBBLES (or all remaining bytes for '*').
         let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
@@ -27542,7 +27584,10 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
       else if str_eq d "a" || str_eq d "A" then
         let take = (if cnt < 0 then slen - si else cnt) in
         let last = (if si + take < slen then si + take else slen) in
-        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (rb_str_of_bytes s si last "") "ASCII-8BIT", acc))
+        let raw9 = rb_str_of_bytes s si last "" in
+        // A strips trailing NULs and spaces; a keeps everything.
+        let txt9 = (if str_eq d "A" then rstrip_pad raw9 (str_len raw9) else raw9) in
+        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e txt9 "ASCII-8BIT", acc))
       else if str_eq d "B" || str_eq d "b" then
         // bit string: "B" walks each byte's bits MSB-first, "b" LSB-first;
         // the count is in BITS ('*' = all of them).
@@ -27598,11 +27643,15 @@ and rb_unpack_fixed = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: 
   else if si + w > slen then rb_unpack_fixed s slen si fmt fl fi2 d w 0 (Cons (VNil, acc))  // short: nil, stop
   else
     let vv = (if flt_dir_width d > 0 then rb_unpack_flt s si d
-              else VInt (if str_eq d "N" then rb_be s si 4 0
-                         else if str_eq d "n" then rb_be s si 2 0
-                         else if str_eq d "V" then rb_le s si 4 1 0
-                         else if str_eq d "v" then rb_le s si 2 1 0
-                         else if str_eq d "C" then rb_sbyte s si
+              else if int_dir_width d > 0 then
+                // ⚠ ...and the SIGNED directives come back signed. The lowercase
+                //   letters (s, l, q, i, j) are two's complement over their own
+                //   width; the uppercase ones are not. Reading them all as
+                //   unsigned made `"\xff\xff".unpack("s")` answer 65535.
+                (let raw = (if int_dir_big d then rb_be s si (int_dir_width d) 0
+                            else rb_le s si (int_dir_width d) 1 0) in
+                 VInt (if int_dir_signed d then int_signed raw (int_dir_width d) else raw))
+              else VInt (if str_eq d "C" then rb_sbyte s si
                          else // "c": signed byte
                            let b = rb_sbyte s si in (if b >= 128 then b - 256 else b))) in
     rb_unpack_fixed s slen (si + w) fmt fl fi2 d w (reps - 1) (Cons (vv, acc))
