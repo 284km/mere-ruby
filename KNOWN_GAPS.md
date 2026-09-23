@@ -3495,3 +3495,29 @@ A Dir here is a path and a position; there is no `opendir(3)` behind it and so
 no descriptor. NotImplementedError is what ruby raises on a platform without
 `dirfd`, and it is the honest answer -- a made-up number would be accepted by
 every caller and wrong for all of them.
+
+## An IO here has no file descriptor, and that is what core/io is waiting on
+
+Measured 2026-09-23. A File in mere-ruby is a path, a mode and a buffer (see
+`file_open_obj`); reads and writes go through the whole-file `read_file` /
+`write_file` externs. There is no open(2)/read(2)/write(2)/close(2) behind it,
+so there is no descriptor to hand out, and `IO.new(fd)` cannot attach to one.
+
+That single absence is what the following core/io rows are blocked on, and no
+amount of surface work reaches them:
+
+  - `IO#fileno` on a File (NotImplementedError; STDIN/STDOUT/STDERR have fds
+    and answer correctly)
+  - `IO#path`, whose spec builds `IO.new(file.fileno, path: ...)`
+  - `IO#pid` and `IO#stat`, whose fixtures construct an IO from a descriptor
+  - `IO#inspect`'s "contains the file descriptor number" example
+  - `autoclose?`, `close_on_exec?`, `fcntl`, `ioctl`, `sysseek`, `advise`,
+    `read_nonblock`, `write_nonblock`, `IO.for_fd`, `IO.sysopen`, `IO.select`
+
+Closing it means adding the four syscalls as Mere externs -- see the three
+walls in m_state.mere -- and reworking the File model to carry a descriptor.
+It is an arc, not a row.
+
+What was reachable without it has been done: `File#inspect` and `IO#inspect`
+print what ruby prints rather than the object's ivars, `IO#pid` answers nil,
+and STDERR#sync is true.
