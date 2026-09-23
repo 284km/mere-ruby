@@ -423,6 +423,41 @@ operation, `sync = true` makes each write flush, and a file is not a terminal.
 sidekiq-pro and devise ask for `fileno` when they are loaded without a CRuby
 stdlib on `-I`, and stop there.
 
+### What a descriptor would buy, counted twice
+
+The obvious reading of this entry is that `core/io` is weak BECAUSE of it, and
+that adding real descriptors is the way out. That is a claim about how many
+rows a descriptor moves, and it is countable.
+
+**First count, before any of the work.** Of the 43 IO names this did not
+answer, 19 needed a descriptor and 24 needed only a path and a position. The
+35 diverging files split the same way: 15 a missing method, 8 the explicit
+refusal above. So a descriptor was worth about eight rows -- and it changes the
+model, since descriptors and whole-file buffering do not coexist and every read
+and write path would be rewritten to get them.
+
+So the 24 went first, and MATCH moved 45/81 to 48/81 with the missing-name rows
+falling 15 to 9 and the absent-name count 47 to 18.
+
+**Second count, after.** Of the 33 rows left, ten are reachable by a
+descriptor and seven have nothing to do with one:
+
+| rows | what they need |
+|---|---|
+| 6 | `IO.popen`, `IO.pipe`, `IO.select`, `#pid`, `#close` clearing `#pid`, and the duplex `#close_read`/`#close_write` -- these need PROCESS SPAWNING and READINESS WAITING, not a descriptor. A descriptor is necessary and nowhere near sufficient |
+| 4 | `IO.sysopen`, `#read_nonblock`, `#write_nonblock`, `#dup` setting a new descriptor -- a descriptor alone does answer these |
+| 7 | `#path`, `#pos` resetting `#eof?`, `#stat` / `#readpartial` raising IOError on a closed stream, and File.open taking a `#to_path` object -- reachable today |
+
+⚠ **So the descriptor is worth FOUR rows on its own.** The six that look like
+its neighbours are a `fork`/`exec`/`poll` project wearing a descriptor's
+clothes, and that is a larger piece of work than rewriting the File model, not
+a part of it.
+
+**The conclusion, which is the point of counting twice:** a descriptor is not
+the next task, and it is not a task at all until `popen`/`pipe`/`select` is
+something this interpreter means to have. Then it is decided together with
+them. On its own it is four rows for a rewrite.
+
 ## A block's own `&b` parameter used to bind nil, and the comment said why
 
 `proc { |x, &b| b.call(x) }.call(7) { |v| v + 1 }` is 8 in ruby and was
