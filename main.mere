@@ -1041,8 +1041,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if autoload_fire env world blk key || autoload_fire env world blk cn then
          (if map_has consts key then map_get consts key
           else if map_has consts cn then map_get consts cn
-          else raise_exc world "NameError" ("uninitialized constant " ++ cn))
-       else raise_exc world "NameError" ("uninitialized constant " ++ cn)
+          else scoped_read_missing env world blk c cn)
+       else scoped_read_missing env world blk c cn
      // `obj::CONST` where obj is not a class/module is a TypeError (Ruby).
      | other -> raise_exc world "TypeError" (inspect other ++ " is not a class/module"))
   | EScopedReadOrNil (recv_e, cn) ->
@@ -11818,7 +11818,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_len name == 16 && str_eq name "prepend_features") && (match args with Cons (VClass _, _) -> true | _ -> false) then
       (match args with Cons (VClass b9, _) -> (let _ = prepend_features_raw world b9 c in recv) | _ -> recv)
     else if (str_len name == 13 && str_eq name "extend_object") && (match args with Cons (_, _) -> true | _ -> false) then
-      (match args with Cons (o9, _) -> (let _ = do_extend_one world c o9 in o9) | _ -> VNil)
+      // ⚠ A FROZEN OBJECT CANNOT BE EXTENDED, and this extended it anyway --
+      //   `Module.new.send(:extend_object, frozen)` gave the object a new
+      //   singleton class, so the spec's follow-up (`@object.should_not
+      //   .is_a?(@receiver)`) was false about an object ruby never touched.
+      //   FrozenError is a RuntimeError, which is what the spec asks for.
+      (match args with
+       | Cons (o9, _) ->
+         (let _ = frz_recv_check env world o9 in
+          let _ = do_extend_one world c o9 in o9)
+       | _ -> VNil)
     // `Module#using` is only meaningful at the top level or inside a module
     // body, where the parser handles it. Reached as a METHOD it is always the
     // wrong call, and ruby says so by name rather than by NoMethodError.
@@ -12863,11 +12872,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          let n = if map_has consts qn then qn else n0 in
          // ⚠ ...and it refuses one that is not there: `C.remove_const(:NOPE)`
          //   answered nil, so a program removing the wrong name never learned.
-         let _ = (if map_has consts n then ()
+         // ⚠ ...and an AUTOLOAD is a constant too, for this purpose. The name is
+         //   registered but nothing has been loaded, so `consts` has no entry
+         //   and this reported it as not defined -- where ruby removes the
+         //   registration and answers nil, because there is no value yet.
+         let al9 = (if map_has autoloads qn then qn else n0) in
+         let auto9 = map_has autoloads al9 in
+         let _ = (if map_has consts n || auto9 then ()
                   else (let _ = raise_exc world "NameError"
                           ("constant " ++ cls_display world c ++ "::" ++ n0 ++ " not defined") in ())) in
          let old = if map_has consts n then map_get consts n else VNil in
          let _ = if map_has consts n then map_delete consts n else () in
+         let _ = if auto9 then map_delete autoloads al9 else () in
          old
        | _ -> VNil)
     // attr_accessor / attr_reader / attr_writer called with values (a name
@@ -27979,6 +27995,19 @@ and pack_conv_one = fn env -> fn world -> fn (v: Val) ->
      else if has_meth world c9 "to_int" then invoke world nb9 v c9 "to_int" Nil
      else v)
   | _ -> v
+
+// ⚠ A CONSTANT REACHED THROUGH A VARIABLE asks #const_missing too.
+//   `Named::Hello` (a literal path) consulted the hook and `k::Hello` -- the
+//   same scope operator with the class in a local -- did not, so every
+//   `Class.new { def self.const_missing ... }` was a bare NameError. The hook
+//   is asked whatever its VISIBILITY, which is ruby's rule and what
+//   private_class_method :const_missing in the spec is checking; has_own_meth
+//   reads the table rather than the call path, so a private one is found.
+and scoped_read_missing = fn env -> fn world -> fn blk -> fn (c: str) -> fn (cn: str) ->
+  if has_own_meth world ("(sng:" ++ c ++ ")") "const_missing"
+     || has_own_meth world c "const_missing"
+  then invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym cn, Nil)) false
+  else raise_exc world "NameError" ("uninitialized constant " ++ cn)
 
 and lz_needs_block = fn (name: str) ->
   (str_len name == 6 && str_eq name "select") || (str_len name == 6 && str_eq name "filter") ||
