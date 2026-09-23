@@ -10,7 +10,7 @@ reference `ruby`. `set`, `pathname` and `digest` are compiled in; the real
 to ruby 4.0.6 (`bench/csv.sh`).
 
 The milestones below (M0-M6) are how it was built. What it is measured by now
-is [ruby/spec](https://github.com/ruby/spec): **1991 of 2946 spec files**
+is [ruby/spec](https://github.com/ruby/spec): **2048 of 2948 spec files**
 byte-identical to ruby 4.0.6 — every `core` and `language` file the suite has,
 plus the libraries this ships — see
 [Conformance](#conformance-rubyspec) for what that covers and what it does not.
@@ -491,8 +491,8 @@ target is the `language` and `core` groups, and the C-API (`optional/capi`) is
 out of scope. The stdlib (`library`) is IN scope for what this interpreter
 actually ships -- see below.
 
-The record covers **2946 spec files** across 152 groups: **1991 MATCH, 815
-DIFF, 0 CRASH**, 132 SKIP, 8 SLOW, against ruby 4.0.6. Run with no
+The record covers **2948 spec files** across 153 groups: **2048 MATCH, 759
+DIFF, 0 CRASH**, 132 SKIP, 9 SLOW, against ruby 4.0.6. Run with no
 directories, the sweep refreshes exactly the groups the table already has, so
 the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
@@ -500,16 +500,16 @@ the end).
 
 **`core` and `language` are now measured in full**: 2133 of 2133 core files and
 80 of 80 language files, every directory the suite has, nested ones included.
-`library` is measured for the libraries this ships: **733 of 1516**, across 65
+`library` is measured for the libraries this ships: **735 of 1516**, across 66
 groups.
 
-⚠ **2946 is not all of ruby/spec** -- the suite has 3821 files, and the number
+⚠ **2948 is not all of ruby/spec** -- the suite has 3821 files, and the number
 worth writing down is the one that says what is NOT being asked. Here are the
-other 875, counted so that they add up:
+other 873, counted so that they add up:
 
 | files | not measured | why |
 |---|---|---|
-| 783 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
+| 781 | `library/` outside the groups with rows | the libraries this does not ship. A group gets a row when the library is answered, not before -- and which those are is now MEASURED rather than remembered: every `require` the 118 unrecorded groups make was asked of this interpreter, and the 49 groups whose libraries all loaded were swept |
 | 46 | `optional/capi` | out of scope: a C API, and this has no C extensions to answer it with |
 | 32 | `command_line` | the executable's flag handling, which `clitest/` measures directly instead |
 | 13 | `security` | CVE regressions; four of them need rubygems or optparse |
