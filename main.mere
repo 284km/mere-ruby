@@ -10962,13 +10962,51 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // Dir.chdir(path) with no block: move and stay. The block form is in
        // invoke_with_block, and both go through dir_chdir_to.
        else if (str_len name == 5 && str_eq name "chdir") then
-         (let tgt = (match args with Cons (VStr ph, _) -> sget ph | _ -> env_get "HOME") in
+         // ⚠ ...and an argument that is neither nil nor a String is a TypeError,
+         //   not "no argument". Falling through to $HOME meant a wrong
+         //   argument moved the process somewhere, quietly.
+         (let tgt = (match args with
+                     | Nil -> rb_env_get "HOME"
+                     | Cons (VNil, _) -> rb_env_get "HOME"
+                     | Cons (VStr ph, _) -> sget ph
+                     | Cons (other9, _) -> (let _ = raise_exc world "TypeError"
+                                              ("no implicit conversion of " ++ class_name other9 ++ " into String") in "")) in
           if dir_chdir_to tgt == 0 then VInt 0
           else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir - " ++ tgt))
+       // ⚠ This was `mkdir -p`, which is the one thing Dir.mkdir is NOT: -p
+       //   creates missing parents and succeeds on a directory that is already
+       //   there, so neither of the two errors ruby raises could happen. It
+       //   also let the shell's own message out on stderr while the call still
+       //   answered 0 -- a failure that printed and then reported success.
+       //   Dir.mkdir makes ONE directory: EEXIST if the name is taken, ENOENT
+       //   if the parent is not a directory.
        else if (str_len name == 5 && str_eq name "mkdir") then
          (match args with
-          | Cons (VStr ph, _) -> (let _ = run ("mkdir -p " ++ shq (sget ph)) in VInt 0)
-          | _ -> VInt 0)
+          | Cons (VStr ph, rest9) ->
+            (let p9 = sget ph in
+             // The permission argument is a CONVERSION, as everywhere else ruby
+             // takes a mode: anything that answers #to_int, and a TypeError for
+             // anything that does not.
+             // ⚠ `mkdir -m` sets the mode directly, so unlike ruby's mkdir(2)
+             //   the process umask is NOT subtracted from it. Said here because
+             //   there is no chmod primitive to do it the other way, and a mode
+             //   that differs by the umask is still nearer than one ignored.
+             let perm = (match rest9 with
+                         | Nil -> 0 - 1
+                         | Cons (pv, _) ->
+                           (match coerce_int_args env world (Cons (pv, Nil)) with
+                            | Cons (VInt n9, _) -> n9
+                            // a value with no #to_int is REFUSED, not quietly
+                            // treated as "no mode given" -- the same slip the
+                            // arm above made about paths.
+                            | _ -> (let _ = raise_exc world "TypeError"
+                                      ("no implicit conversion of " ++ class_name pv ++ " into Integer") in 0 - 1))) in
+             if file_exists p9 then
+               raise_exc world "Errno::EEXIST" ("File exists @ dir_s_mkdir - " ++ p9)
+             else if run ("mkdir " ++ (if perm < 0 then "" else "-m " ++ oct12 perm ++ " ") ++ shq p9 ++ " 2>/dev/null") == 0 then
+               VInt 0
+             else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_s_mkdir - " ++ p9))
+          | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
        // ⚠ Dir.rmdir was MISSING while Dir.mkdir was here, and the pair is
        // what a temp directory needs. mspec's own `rm_r` walks a tree and ends
        // at `Dir.rmdir`, so the spec harness -- which clears a per-PID temp
@@ -10989,8 +11027,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // ⚠ `exists?` is REMOVED in ruby 4.0 -- on File, on FileTest and on Dir.
        //   Answering it made three specs read DIFF for a method that should
        //   not be there, and the guard list no longer carries the name either.
+       // ⚠ ...and `exist?` asked FILE's question, not Dir's: `Dir.exist?` of a
+       //   path that is a file answered true.
        else if (str_len name == 6 && str_eq name "exist?") then
-         (match args with Cons (VStr ph, _) -> VBool (file_exists (sget ph)) | _ -> VBool false)
+         (match args with Cons (VStr ph, _) -> VBool (dir_there (sget ph)) | _ -> VBool false)
        // Dir.glob(pat[, base:]) / Dir[pat, ...]: `base:` arrives as a trailing
        // hash. Several patterns union (Dir[] takes varargs, glob an array).
        else if (str_len name == 4 && str_eq name "glob") || (str_len name == 2 && str_eq name "[]") then
@@ -11000,23 +11040,50 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 7 && str_eq name "entries") || (str_len name == 8 && str_eq name "children") then
          (match args with
           | Cons (VStr ph, _) ->
-            // glob_lines keeps find's own "." line as a glob candidate; a
-            // directory listing names only what is inside.
-            (let kids = glob_drop_dot (glob_lines (glob_find (sget ph) 1) 0) in
+            (let p9 = sget ph in
+             // Dir.foreach and Dir.each_child are these two (see the prelude),
+             // so this is where all four stop being willing to list a
+             // directory that is not there.
+             if (if dir_there p9 then false else true) then dir_open_fail world p9 else
+             // glob_lines keeps find's own "." line as a glob candidate; a
+             // directory listing names only what is inside.
+             let kids = glob_drop_dot (glob_lines (glob_find p9 1) 0) in
              let names = val_sort (glob_strs kids) in
              arr_new (if (str_len name == 7 && str_eq name "entries") then Cons (mkstr ".", Cons (mkstr "..", names)) else names))
           | _ -> arr_new Nil)
-       else if (str_len name == 4 && str_eq name "home") then mkstr (env_get "HOME")
+       // Dir.home / Dir.home(user). The no-argument form is ENV["HOME"] -- the
+       // ruby-visible one, see rb_env_get -- and nil means the same thing.
+       // ⚠ With a user name it is the USER DATABASE, which there is no extern
+       //   for. The spec's own oracle is `echo ~user`, so that is the oracle
+       //   here: the shell expands a name it knows and hands back the text
+       //   unchanged for one it does not, which is exactly the ArgumentError
+       //   case.
+       else if (str_len name == 4 && str_eq name "home") then
+         (match args with
+          | Nil -> mkstr (rb_env_get "HOME")
+          | Cons (VNil, _) -> mkstr (rb_env_get "HOME")
+          | Cons (VStr uh, _) ->
+            (let u9 = sget uh in
+             let got0 = (match run_backtick ("echo ~" ++ u9) with VStr g -> sget g | _ -> "") in
+             let got = (if str_len got0 > 0 && str_eq (char_at got0 (str_len got0 - 1)) "\n"
+                        then substring got0 0 (str_len got0 - 1) else got0) in
+             if str_len got > 0 && str_eq (char_at got 0) "/" then mkstr got
+             else raise_exc world "ArgumentError" ("user " ++ u9 ++ " doesn't exist"))
+          | Cons (other9, _) -> raise_exc world "TypeError"
+                                  ("no implicit conversion of " ++ class_name other9 ++ " into String"))
        // Dir.open(path) -> a Dir object (the instance side is Ruby, see the
        // prelude); with a block it yields the object and answers the block.
        else if (str_len name == 4 && str_eq name "open") || (str_len name == 3 && str_eq name "new") then
          (match args with
-          | Cons (VStr ph, _) -> new_obj world "Dir" (Cons (mkstr (sget ph), Nil))
+          | Cons (VStr ph, _) ->
+            (let p9 = sget ph in
+             if dir_there p9 then new_obj world "Dir" (Cons (mkstr p9, Nil))
+             else dir_open_fail world p9)
           | _ -> VNil)
        // Dir.mktmpdir / Dir.tmpdir: `tmpdir` is a stdlib file in CRuby; here
        // the one thing it adds is this directory name.
        else if (str_len name == 6 && str_eq name "tmpdir") then
-         (let t = env_get "TMPDIR" in mkstr (if str_eq t "" then "/tmp" else t))
+         (let t = rb_env_get "TMPDIR" in mkstr (if str_eq t "" then "/tmp" else t))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Dir"))
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
@@ -16046,6 +16113,26 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        let _ = store_proc (str_of_int id9) newblk in
        let _ = (if (str_len name == 6 && str_eq name "lambda") then map_set lambda_ids (str_of_int id9) VNil else ()) in
        VProc id9)
+    // to_enum(:m, *args) { size } / enum_for -- the block is not an iterator,
+    // it is the enumerator's SIZE, and #size already knows how to call one
+    // (@__e_size, which Enumerator.new's size argument also writes).
+    // ⚠ With a block in hand this call reached NO arm at all and raised
+    //   NoMethodError. to_enum is handled TWICE -- once for a bare call, once
+    //   for an explicit receiver -- and both live in the plain dispatcher, so
+    //   the block form fell past both of them and out the bottom. The same
+    //   name, two paths, and the block was the axis they split on.
+    //   Dir.foreach's own `to_enum(:foreach, path) { nil }` is what found it.
+    else if ((str_len name == 7 && str_eq name "to_enum") || (str_len name == 8 && str_eq name "enum_for"))
+            && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
+            && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+      (let e9 = invoke_val_c env world blk recv name args false in
+       let sid9 = map_len proc_store in
+       let _ = store_proc (str_of_int sid9) newblk in
+       let (m8, s8, o8, iv8) = world in
+       let _ = (match e9 with
+                | VObj eid9 -> map_set iv8 (str_of_int eid9 ++ "@__e_size") (VProc sid9)
+                | _ -> ()) in
+       e9)
     else if (str_len name == 4 && str_eq name "loop")
             && (let (m9, _, _, _) = world in if map_has m9 name then false else true)
             && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
@@ -16510,7 +16597,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // block's value, as ruby does. The move itself is dir_chdir_to, shared
        // with the blockless form.
        else if str_eq c "Dir" && (str_len name == 5 && str_eq name "chdir") then
-         (let tgt = (match args with Cons (VStr ph, _) -> sget ph | _ -> env_get "HOME") in
+         // ⚠ The block form never ran path_args -- that conversion happens in
+         //   invoke_val_c, and this is the OTHER dispatcher. So
+         //   `Dir.chdir(obj_with_to_str) { }` did not match `Cons (VStr _, _)`,
+         //   fell into the "no argument" case and SILENTLY MOVED TO $HOME.
+         //   Two arms for one method, and the block was the axis.
+         (let args = path_args (false, (Nil : str list), (Nil : Stmt list), env) world "chdir" args in
+          let tgt = (match args with
+                     | Nil -> rb_env_get "HOME"
+                     | Cons (VNil, _) -> rb_env_get "HOME"
+                     | Cons (VStr ph, _) -> sget ph
+                     | Cons (other9, _) -> (let _ = raise_exc world "TypeError"
+                                              ("no implicit conversion of " ++ class_name other9 ++ " into String") in "")) in
           let back = env_get "PWD" in
           if (if dir_chdir_to tgt == 0 then false else true) then
             raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir - " ++ tgt)
@@ -26771,6 +26869,38 @@ and require_path_of = fn env -> fn world -> fn (v: Val) ->
 //   Not converting is still not an error HERE -- a value that answers neither
 //   is handed on unchanged and refused downstream, which is where the
 //   per-method message lives.
+// "Is this path a directory?" -- the question every Dir entry point asks
+// before it can do anything, because all of them start by OPENING the
+// directory.
+//
+// ⚠ mere-ruby asked it nowhere. Dir.open of a path that is not there returned
+//   a Dir object, Dir.entries answered [".", ".."] and Dir.children answered
+//   [] -- a FABRICATED listing for a directory that does not exist. A program
+//   that read a missing directory got an empty-looking success where ruby
+//   raises, which is the permissive direction and the worse one. It also put
+//   six core/dir rows on the wrong side of the record: mere-ruby PASSED
+//   examples the reference cannot reach, so their deficit read NEGATIVE and
+//   the rows looked like reference trouble rather than a bug here.
+//
+// The test is `file_exists (p ++ "/.")` and not `test -d`: see File.directory?,
+// where the fork and exec cost 8.5ms per call. The empty path is excluded
+// because the trick APPENDS, and "" would ask about the root.
+and dir_there = fn (p9: str) ->
+  str_len p9 > 0 && file_exists (p9 ++ "/.")
+// ...and how opening one fails. ruby names dir_initialize in both messages and
+// tells the two causes apart: a path that is there but is not a directory is
+// ENOTDIR, a path that is not there at all is ENOENT.
+and dir_open_fail = fn world -> fn (p9: str) ->
+  if file_exists p9
+  then raise_exc world "Errno::ENOTDIR" ("Not a directory @ dir_initialize - " ++ p9)
+  else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_initialize - " ++ p9)
+// A mode as `mkdir -m` wants it: four octal digits of the low twelve bits.
+// There is no general base formatter here and one question does not need one.
+and oct12 = fn (n9: int) ->
+  let m9 = n9 - (n9 / 4096) * 4096 in
+  str_of_int (m9 / 512) ++ str_of_int ((m9 / 64) - (m9 / 512) * 8) ++
+  str_of_int ((m9 / 8) - (m9 / 64) * 8) ++ str_of_int (m9 - (m9 / 8) * 8)
+
 and to_path_str = fn nb -> fn world -> fn (v: Val) ->
   (match v with
    | VObj _ ->
@@ -26802,6 +26932,15 @@ and delete_paths = fn world -> fn (paths: Val list) -> fn (acc: int) ->
    | Cons (_, rest9) -> delete_paths world rest9 acc)
 
 and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  // ⚠ Dir.glob and Dir[] take MANY patterns, and an Array of them. Converting
+  //   only the LEADING one -- which is all this did -- meant `Dir[p1, p2]`
+  //   globbed p1 and silently dropped p2, and `Dir.glob([p1, p2])` dropped
+  //   both: glob_pat_args discards anything that is not already a String, so
+  //   an unconverted path object left no trace at all. The trailing options
+  //   hash passes through untouched, because to_path_str only converts objects.
+  if (str_len name == 4 && str_eq name "glob") || (str_len name == 2 && str_eq name "[]")
+  then path_args_all nb world args
+  else
   (match args with
    | Nil -> Nil
    | Cons (a, rest) ->
@@ -26809,6 +26948,12 @@ and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
            (if (str_len name == 6 && str_eq name "rename") || (str_len name == 7 && str_eq name "symlink") || (str_len name == 4 && str_eq name "link")
             then (match rest with Cons (b, r2) -> Cons (to_path_str nb world b, r2) | Nil -> Nil)
             else rest)))
+
+and path_args_all = fn nb -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> Nil
+  | Cons (VArr id9, t9) -> Cons (arr_new (path_args_all nb world (deref id9)), path_args_all nb world t9)
+  | Cons (a9, t9) -> Cons (to_path_str nb world a9, path_args_all nb world t9)
 
 // Put what has been written out to the file and keep the handle open. close does
 // the same and then marks the handle closed; a buffer that has already been

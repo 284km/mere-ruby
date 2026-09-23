@@ -3434,3 +3434,64 @@ count and the work had to be the same walk, so both now come from one.
 
 ⚠ And `rm -f` is the wrong verb: ruby raises `Errno::ENOENT` for a path that is
 not there, and `-f` is precisely the flag that does not. The walk asks first.
+
+## `ensure` does not replace the exception in flight
+
+Measured 2026-09-23. An exception raised INSIDE an `ensure` block should
+replace the one that was propagating; mere-ruby keeps the original.
+
+```ruby
+def f
+  raise ArgumentError, "inner"
+ensure
+  nil.close
+end
+f  # ruby: NoMethodError (undefined method 'close' for nil)
+   # mere-ruby: ArgumentError (inner)
+```
+
+Found from core/dir/chdir_spec, where ruby/spec writes `it ... ensure dir.close
+end`: when the fixture is missing, `Dir.new` raises, `dir` is nil, and the
+reference reports the ensure's NoMethodError while mere-ruby reports the
+original Errno::ENOENT. Both sides are failing the example for the same
+reason; only the name of the failure differs. It is not specific to Dir --
+this is `ensure` everywhere.
+
+## `break <value>` through a yielding method can lose the value
+
+Measured 2026-09-23.
+
+```ruby
+Dir.foreach(".", encoding: "ISO-8859-1") { |x| break x.encoding }
+# ruby: #<Encoding:ISO-8859-1>   mere-ruby: nil
+```
+
+The block breaks out of `names.each(&block)` inside `Dir.foreach`; the value
+does not come back out of the enclosing method.
+
+## `Dir.glob` and `**` with `File::FNM_DOTMATCH`
+
+core/dir/glob_spec is the one file left DIFF in core/dir after the 2026-09-23
+work (17 rows -> 2). `**` on its own matches the whole tree here where ruby
+matches one level, and `**/` with FNM_DOTMATCH answers nothing. This is the
+glob engine's recursion, not the Dir surface.
+
+## `Dir.pwd` does not resolve symlinks
+
+`Dir.chdir("/tmp"); Dir.pwd` is `/tmp` here and `/private/tmp` under the
+reference on macOS. mere-ruby tracks the cwd as the string it was given;
+ruby answers getcwd(3), which has resolved every symlink on the way.
+
+## `Dir.mkdir`'s permission argument is not reduced by the umask
+
+`mkdir -m` sets the mode directly. ruby's `mkdir(2)` subtracts the process
+umask from the mode it is given, so `Dir.mkdir(path, 0777)` is 0755 under a
+umask of 022 there and 0777 here. There is no chmod primitive to do it the
+other way round.
+
+## `Dir#fileno` raises NotImplementedError
+
+A Dir here is a path and a position; there is no `opendir(3)` behind it and so
+no descriptor. NotImplementedError is what ruby raises on a platform without
+`dirfd`, and it is the honest answer -- a made-up number would be accepted by
+every caller and wrong for all of them.
