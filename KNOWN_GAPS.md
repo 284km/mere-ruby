@@ -3521,3 +3521,37 @@ It is an arc, not a row.
 What was reachable without it has been done: `File#inspect` and `IO#inspect`
 print what ruby prints rather than the object's ivars, `IO#pid` answers nil,
 and STDERR#sync is true.
+
+## A wrong argument shape is reported as a missing method
+
+Measured 2026-09-23. The dispatcher's arms are guarded on the SHAPE of their
+arguments, and a call matching none of them falls out of the chain and is
+reported as `NoMethodError: undefined method`. "There is no such method" and
+"those are the wrong arguments" are different facts and a program rescues them
+differently.
+
+Fixed where measured: Module#include/#prepend/#class_eval/#module_eval/
+#class_exec/#module_exec, Object#instance_eval/#instance_exec, Class.new with
+a non-Class superclass.
+
+Still open, and each is its own contract rather than one cause -- the record
+has sixteen rows of `raised NoMethodError, expected X` and X is a different
+class in almost every one (ArgumentError, TypeError, LocalJumpError,
+FrozenError, ThreadError, Errno::ECHILD, Date::Error):
+
+  - `Object#define_singleton_method` with a bad name, with one argument and no
+    block, and the two-argument (Proc body) form for an OBJECT receiver -- the
+    class receiver has it. Refusal arms placed at the bottom of the object
+    chain never run: `is_kernel_builtin` claims the name several arms earlier
+    and try_self_call_x reports it undefined from there. Fixing it means
+    moving the check above that arm, not adding one below it.
+  - `Class#initialize` on an already-initialized class (TypeError).
+  - `ObjectSpace.define_finalizer` with no block (ArgumentError).
+  - core/basicobject, core/data, core/conditionvariable, library/date and the
+    rest of those sixteen rows.
+
+⚠ `include?` must NOT get one of these arms. A class that extends Enumerable
+answers Enumerable#include? -- membership, not ancestry -- and an arm for the
+name hijacked it: corpus/56_gem_surface's `Registry.include?(2)` came back
+"wrong number of arguments (given 1, expected 1)", a message absurd on its
+face. One name, two meanings, and only the receiver tells them apart.
