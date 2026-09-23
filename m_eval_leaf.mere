@@ -9315,12 +9315,28 @@ and pack_go = fn (fmt: str) -> fn (fl: int) -> fn (fi: int) -> fn (ys: Val list)
     let d = char_at fmt fi in
     if str_eq d " " then pack_go fmt fl (fi + 1) ys acc
     else
-      let (cnt0, fi2) = rb_count fmt fl (fi + 1) in
+      // ⚠ `<` and `>` belong to the DIRECTIVE, not to the count: `S>` is a
+      //   big-endian 16-bit word and `S` is native. They were not read at all,
+      //   so every modified directive packed as its unmodified self. Carrying
+      //   the modifier IN the directive string keeps pack_one's existing
+      //   `str_eq d "C"` comparisons correct for the unmodified ones.
+      //   ruby also accepts `!`/`_` meaning "native width", which is what
+      //   these already are, so they are consumed and ignored.
+      let (d, fi1) = pack_mods fmt fl (fi + 1) d in
+      let (cnt0, fi2) = rb_count fmt fl fi1 in
       // ⚠ `*` means "as many VALUES as are left" for the per-value directives
       //   and "the whole of this ONE string" for the string ones (H, h, m).
       //   Collapsing it to the value count before the arm could tell them
       //   apart made `["4142"].pack("H*")` read a single hex digit.
-      let cnt = (if cnt0 < 0 && (if str_eq d "H" || str_eq d "h" || str_eq d "m" then false else true)
+      // ⚠ ...and a/A/Z belong on THIS list. `*` means "as many VALUES as are
+      //   left" for the per-value directives and "the whole of this ONE
+      //   string" for the string ones -- the note below has said so since H/h
+      //   were added, and the three new string directives were not added to
+      //   it, so `["ab"].pack("a*")` collapsed to a count of 1 and answered
+      //   one character.
+      let cnt = (if cnt0 < 0 && (if str_eq d "H" || str_eq d "h" || str_eq d "m"
+                                    || str_eq d "a" || str_eq d "A" || str_eq d "Z"
+                                 then false else true)
                  then vlen ys else cnt0) in
       let (piece, rest) = pack_one d cnt ys "" in
       pack_go fmt fl fi2 rest (acc ++ piece)
@@ -9342,6 +9358,36 @@ and pack_one = fn (d: str) -> fn (k: int) -> fn (ys: Val list) -> fn (acc: str) 
   //   while unpack("H*") worked: `["4142"].pack("H*")` answered one NUL where
   //   ruby answers "AB". It is the other half of the same round trip, and
   //   CGI.unescape is written as `[hex].pack("H*")`.
+  // ⚠ a / A / Z -- a STRING, padded or truncated to the count. None of the
+  //   three existed, so `["ab"].pack("a3")` answered one NUL byte: the arm
+  //   fell through to the integer path and packed the String as the number 0.
+  //   The count is the FIELD WIDTH here, not a repeat, and the three differ
+  //   only in the pad byte and what `*` does:
+  //     a  NUL-padded, `a*` is the text as it is
+  //     A  space-padded, `A*` is the text as it is
+  //     Z  NUL-padded, and `Z*` adds a NUL even though no width was given
+  //   A bare directive with no count is width 1, which truncates.
+  if str_eq d "a" || str_eq d "A" || str_eq d "Z" then
+    (match ys with
+     // ⚠ A VALUE THAT IS NOT A STRING IS REFUSED, not packed as zero bytes.
+     //   ruby says "no implicit conversion of X into String" -- the CONVERSION
+     //   itself happens before this (see pack_conv_one, which is where the
+     //   world is), so anything still not a String here has no #to_str and is
+     //   the caller's mistake. nil is the exception: `[nil].pack("a")` is a
+     //   NUL, because nil packs as the empty string for these three.
+     | Cons (VNil, t) ->
+       (acc ++ str_repeat (if str_eq d "A" then " " else chr 0) (if k < 0 then 0 else k), t)
+     | Cons (VStr h, t) ->
+       (let src = sget h in
+        let pad = (if str_eq d "A" then " " else chr 0) in
+        let w = (if k < 0 then (if str_eq d "Z" then str_len src + 1 else str_len src) else k) in
+        let cut = (if str_len src > w then substring src 0 w else src) in
+        (acc ++ cut ++ str_repeat pad (w - str_len cut), t))
+     | Cons (other9, t) ->
+       (let _ = prim_raise "TypeError"
+                  ("no implicit conversion of " ++ class_name other9 ++ " into String") in (acc, t))
+     | Nil -> (acc, Nil))
+  else
   if str_eq d "H" || str_eq d "h" then
     (match ys with
      | Cons (VStr h, t) ->
@@ -9356,15 +9402,35 @@ and pack_one = fn (d: str) -> fn (k: int) -> fn (ys: Val list) -> fn (acc: str) 
     (match ys with
      | Nil -> (acc, Nil)
      | Cons (v, t) ->
+       // ⚠ ...and the integer directives refuse a non-Integer the same way.
+       //   `(match v with VInt m -> m | _ -> 0)` turned every wrong value into
+       //   the number 0 and packed it, so `["x"].pack("C")` answered a NUL
+       //   where ruby raises. The conversion has already been tried (see
+       //   pack_conv_one); what is left has no #to_int. Floats are exempt --
+       //   the float directives take them.
+       let _ = (if int_dir_width d > 0 || str_eq d "C" || str_eq d "c"
+                   || str_eq d "U" || str_eq d "w" then
+                  (match v with
+                   | VInt _ -> ()
+                   | VBig _ -> ()
+                   | _ -> (let _ = prim_raise "TypeError"
+                             ("no implicit conversion of "
+                              ++ (match v with VNil -> "nil" | _ -> class_name v)
+                              ++ " into Integer") in ()))
+                else ()) in
        let n = (match v with VInt m -> m | _ -> 0) in
        let piece = (if flt_dir_width d == 8 then flt_pack64 (to_f v) (flt_dir_big d)
                     else if flt_dir_width d == 4 then flt_pack32 (to_f v) (flt_dir_big d)
                     else if str_eq d "U" then utf8_enc n
                     else if str_eq d "C" || str_eq d "c" then chr (floor_mod n 256)
-                    else if str_eq d "N" then rb_be_bytes n 4
-                    else if str_eq d "n" then rb_be_bytes n 2
-                    else if str_eq d "V" then rb_le_bytes n 4
-                    else if str_eq d "v" then rb_le_bytes n 2
+                    // ⚠ ONE TABLE for every integer directive. S/s/L/l/Q/q/I/i
+                    //   and j/J were not here at all and fell through to
+                    //   utf8_enc, so `[258].pack("L")` answered two UTF-8 bytes
+                    //   instead of four little-endian ones -- and the width was
+                    //   whatever the character happened to need.
+                    else if int_dir_width d > 0 then
+                      (if int_dir_big d then rb_be_bytes n (int_dir_width d)
+                       else rb_le_bytes n (int_dir_width d))
                     else utf8_enc n) in
        pack_one d (k - 1) t (acc ++ piece))
 // ⚠ `pack("m")` -- base64 ENCODE -- was missing while `unpack("m")` (decode)
@@ -9417,6 +9483,31 @@ and b64_encode_go = fn (s: str) -> fn (i: int) -> fn (lw: int) -> fn (col: int) 
 
 and b64_encode = fn (s: str) -> fn (lw: int) -> b64_encode_go s 0 lw 0 ""
 
+and pack_mods = fn (fmt: str) -> fn (fl: int) -> fn (fi: int) -> fn (d: str) ->
+  if fi >= fl then (d, fi)
+  else (let c = char_at fmt fi in
+        if str_eq c "<" || str_eq c ">" then pack_mods fmt fl (fi + 1) (d ++ c)
+        else if str_eq c "!" || str_eq c "_" then pack_mods fmt fl (fi + 1) d
+        else (d, fi))
+// The width of an integer directive in bytes, 0 when it is not one. Asked of
+// the reference directive by directive, not guessed: S/s and v/n are 2, L/l
+// and V/N and I/i are 4, Q/q and j/J are 8.
+and int_dir_width = fn (d: str) ->
+  let b = (if str_len d > 0 then char_at d 0 else "") in
+  if str_eq b "S" || str_eq b "s" || str_eq b "v" || str_eq b "n" then 2
+  else if str_eq b "L" || str_eq b "l" || str_eq b "V" || str_eq b "N"
+          || str_eq b "I" || str_eq b "i" then 4
+  else if str_eq b "Q" || str_eq b "q" || str_eq b "j" || str_eq b "J" then 8
+  else 0
+// ...and its byte order. N and n are ALWAYS big and V and v ALWAYS little --
+// that is what those letters mean -- so a modifier cannot change them. Every
+// other integer directive is native, which is little-endian on the platforms
+// this runs on, and `>` asks for big.
+and int_dir_big = fn (d: str) ->
+  let b = (if str_len d > 0 then char_at d 0 else "") in
+  if str_eq b "N" || str_eq b "n" then true
+  else if str_eq b "V" || str_eq b "v" then false
+  else str_contains d ">"
 and rb_count = fn (fmt: str) -> fn (fl: int) -> fn (fi: int) ->
   if fi >= fl then (1, fi)
   else if str_eq (char_at fmt fi) "*" then (0 - 1, fi + 1)
@@ -9430,6 +9521,9 @@ and is_digit_ch = fn (c: str) -> str_len c == 1 && ord c >= 48 && ord c <= 57
 and rev_vals = fn (xs: Val list) -> rev_vals_go xs Nil
 and rev_vals_go = fn (xs: Val list) -> fn (acc: Val list) ->
   match xs with Nil -> acc | Cons (h, t) -> rev_vals_go t (Cons (h, acc))
+// n copies of a one-character string, for pack's field padding.
+and str_repeat = fn (c: str) -> fn (n: int) ->
+  if n <= 0 then "" else c ++ str_repeat c (n - 1)
 and rb_be_bytes = fn (n: int) -> fn (w: int) ->
   if w <= 0 then "" else rb_be_bytes (floor_div n 256) (w - 1) ++ chr (floor_mod n 256)
 and rb_le_bytes = fn (n: int) -> fn (w: int) ->
