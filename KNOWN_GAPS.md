@@ -3496,7 +3496,33 @@ no descriptor. NotImplementedError is what ruby raises on a platform without
 `dirfd`, and it is the honest answer -- a made-up number would be accepted by
 every caller and wrong for all of them.
 
-## An IO here has no file descriptor, and that is what core/io is waiting on
+## An IO here has a descriptor now, but does not READ OR WRITE through it
+
+Updated 2026-09-23. A File carries a real descriptor: `#fileno` answers the
+kernel's number, `IO.new(fd, path:)` and `IO.for_fd(fd)` attach to one, and
+`#path` answers the name the caller gave it. The descriptor is opened LAZILY,
+on the first call that needs one -- opening it eagerly costs one per File and
+nothing here closes a File the program forgot about (measured: six hundred
+opens with no close reached fd 602). ruby survives that because its GC
+finalizes them and this interpreter has no finalizer to hang a close on.
+
+What has NOT moved is the I/O itself. A File is still a path, a mode and a
+buffer, and its reads and writes go through the whole-file `read_file` /
+`write_file` externs. The descriptor is a second handle on the same file, and
+the two would desync the moment a program wrote through one and read through
+the other. So:
+
+  - `IO.pipe` is still refused. A pipe has no path, so an IO over one cannot
+    read or write until the I/O moves onto the descriptor. Answering with two
+    IOs that cannot transfer data would be worse than the refusal.
+  - `IO#stat` and `IO#pid` are still missing on a descriptor-born IO.
+  - `read_nonblock`, `write_nonblock`, `IO.select`, `advise`, `fcntl`, `ioctl`
+    and `sysseek` all need the descriptor to be the thing that moves bytes.
+  - The offsets differ from ruby: `IO.new(f.fileno)` here opens its own
+    descriptor rather than sharing the File's file description, so a seek
+    through one is invisible to the other. ruby shares it.
+
+## The old note, kept for the shape of the problem
 
 Measured 2026-09-23. A File in mere-ruby is a path, a mode and a buffer (see
 `file_open_obj`); reads and writes go through the whole-file `read_file` /

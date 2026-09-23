@@ -9054,11 +9054,55 @@ and file_flush_obj = fn world -> fn (id: int) ->
        (let _ = write_file path ((if file_exists path then read_file path else "") ++ buf) in ())
      else ()) in
   map_set ivars (k ++ "@__f_buf") (mkstr "")
+// The File's REAL DESCRIPTOR, opened the first time something asks for one.
+//
+// ⚠ LAZILY, and that is the whole design. Until now a File here was a path
+//   and a buffer with no descriptor at all, so `fileno` raised
+//   NotImplementedError and `IO.new(f.fileno)` had nothing to attach to --
+//   which is what five core/io files and eleven IO names are waiting on.
+//   Opening one EAGERLY in file_open_obj works and costs a descriptor per
+//   File: measured 2026-09-23, six hundred opens with no close reached fd 602,
+//   because nothing here closes a File the program forgot about. ruby survives
+//   that because its GC finalizes them; this interpreter has no finalizer to
+//   hang a close on. A sweep opens thousands of files and asks for a
+//   descriptor on almost none of them, so the ones that never ask never pay.
+//
+//   It is not READ or WRITTEN through yet -- two representations of one file
+//   would desync the moment a program wrote through the descriptor, and
+//   KNOWN_GAPS names that as the open arc. It is there to BE a descriptor: a
+//   number dup(2) accepts, IO.new attaches to, and the kernel refuses the same
+//   way after a close.
+and file_fd_of = fn world -> fn (id: int) ->
+  let (meths, sup, ocls, ivars) = world in
+  let k = str_of_int id in
+  if map_has ivars (k ++ "@__f_fd") then
+    (match map_get ivars (k ++ "@__f_fd") with VInt fd9 -> fd9 | _ -> 0 - 1)
+  else
+    (let path = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with
+                 | VStr h -> sget h | _ -> "") in
+     let mode = (match (if map_has ivars (k ++ "@__f_mode") then map_get ivars (k ++ "@__f_mode") else VNil) with
+                 | VStr h -> sget h | _ -> "") in
+     // the descriptor is opened with the same access the File was, but never
+     // with a truncating "w": the File's own write path owns the content, and
+     // a second O_TRUNC here would empty a file this call only meant to name.
+     let fdm9 = (if str_contains mode "a" then "a" else if str_contains mode "+" then "r+"
+                 else if str_contains mode "w" then "r+" else "r") in
+     let fd9 = fd_open path fdm9 438 in
+     let _ = map_set ivars (k ++ "@__f_fd") (VInt fd9) in
+     fd9)
+
 and file_close_obj = fn world -> fn (id: int) ->
   let (meths, sup, ocls, ivars) = world in
   let k = str_of_int id in
   // one path for getting bytes out, so a close after a flush cannot undo it
   let _ = file_flush_obj world id in
+  // ...and the descriptor goes with it. A File that is opened and never closed
+  // would otherwise hold one until the process ends, and the spec suite opens
+  // thousands.
+  let _ = (match (if map_has ivars (k ++ "@__f_fd") then map_get ivars (k ++ "@__f_fd") else VNil) with
+           | VInt fd9 -> (if fd9 >= 0 then (let _ = fd_close fd9 in ()) else ())
+           | _ -> ()) in
+  let _ = map_delete ivars (k ++ "@__f_fd") in
   map_set ivars (k ++ "@__f_mode") (mkstr "")
 and rb_gets = fn (u: unit) ->
   let _ = (if map_has stdin_src "done" then ()
