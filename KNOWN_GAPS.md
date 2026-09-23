@@ -3512,9 +3512,17 @@ buffer, and its reads and writes go through the whole-file `read_file` /
 the two would desync the moment a program wrote through one and read through
 the other. So:
 
-  - `IO.pipe` is still refused. A pipe has no path, so an IO over one cannot
-    read or write until the I/O moves onto the descriptor. Answering with two
-    IOs that cannot transfer data would be worse than the refusal.
+  - `IO.pipe` works, and its two IOs do move bytes -- but both ends are opened
+    NON-BLOCKING and a read that finds nothing raises instead of waiting. That
+    is not a performance choice. A thread body here runs to completion at
+    Thread.new, so when a read would block there is no other thread left to
+    write to it and the wait can never end: ruby/spec's core/io/copy_stream is
+    that exact shape and it cost a 600-SECOND WALL BOUND on every sweep before
+    the non-blocking ends went in. The consequences, both divergences:
+      * `io.read` with no length on a pipe answers what is THERE rather than
+        blocking until end of file, because nothing could arrive later.
+      * a read with nothing at all raises IOError naming the deadlock, where
+        ruby would block until another thread wrote.
   - `IO#stat` and `IO#pid` are still missing on a descriptor-born IO.
   - `read_nonblock`, `write_nonblock`, `IO.select`, `advise`, `fcntl`, `ioctl`
     and `sysseek` all need the descriptor to be the thing that moves bytes.

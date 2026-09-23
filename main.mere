@@ -10681,8 +10681,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (other9, _) -> raise_exc world "TypeError"
                                ("no implicit conversion of " ++ class_name other9 ++ " into Integer")
        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
+    // ⚠ IO.pipe was refused for want of a primitive. There is one now
+    //   (fd_pipe, compiler v0.1.523): pipe(2) fills the caller's int[2], which
+    //   no plain extern can name, so the family packs the two descriptors into
+    //   one integer -- read end high, write end low. The two IOs read and
+    //   write THROUGH those descriptors, which is what makes the pair actually
+    //   carry bytes rather than be two objects that look like a pipe.
     else if str_eq c "IO" && (str_len name == 4 && str_eq name "pipe") then
-      prim_raise "NotImplementedError" "IO.pipe is not implemented here (no pipe primitive)"
+      (let pk9 = fd_pipe () in
+       if pk9 < 0 then raise_exc world "Errno::EMFILE" "Too many open files - pipe"
+       else
+         (let (m9, s9, ocls9, iv9) = world in
+          let pr9 = pk9 / 4294967296 in
+          let pw9 = pk9 - pr9 * 4294967296 in
+          // ⚠ BOTH ENDS ARE NON-BLOCKING, and the reason is the thread model,
+          //   not speed. A thread body here runs to completion at Thread.new,
+          //   so a read that would block has no other thread left to write to
+          //   it and the wait can never end -- ruby/spec's core/io/copy_stream
+          //   is that exact shape and it cost a 600-SECOND WALL BOUND on every
+          //   sweep. The peer descriptor is recorded so a would-block can be
+          //   told from an end of file: peer still open means nothing can ever
+          //   arrive, which is a deadlock this model can name in microseconds
+          //   instead of hanging.
+          let mk9 = fn (fd9: int) -> fn (peer9: int) ->
+            (let oid9 = alloc_oid ocls9 in
+             let _ = map_set ocls9 oid9 "IO" in
+             let _ = io_set_nonblocking fd9 in
+             let _ = map_set iv9 (str_of_int oid9 ++ "@__io_fd") (VInt fd9) in
+             let _ = map_set iv9 (str_of_int oid9 ++ "@__io_peer") (VInt peer9) in
+             VObj oid9) in
+          arr_new (Cons (mk9 pr9 pw9, Cons (mk9 pw9 pr9, Nil)))))
     // IO.read / IO.write and friends are the same methods as File's in ruby (File
     // < IO, and these are IO's own class methods), so the branch answers for both
     // rather than a second copy drifting from this one.
@@ -13727,7 +13755,64 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // STDOUT / STDERR: IO objects keyed by @__io_fd (1 = out, 2 = err).
     else if str_eq cls "IO" && map_has ivars (str_of_int id ++ "@__io_fd") then
       (let fd = (match map_get ivars (str_of_int id ++ "@__io_fd") with VInt n -> n | _ -> 1) in
-       if (str_len name == 4 && str_eq name "puts") then
+       // ⚠ A descriptor above the three standard ones is a REAL FILE OR PIPE,
+       //   and writing to it used to print to this process's stdout. Every
+       //   IO.new(fd) and every pipe end went to the terminal. 0/1/2 keep the
+       //   buffered path they have always had, because that is where the
+       //   capture in io_cap lives and the spec suite reads it.
+       // ⚠ A descriptor-born IO had no CLOSED state: `r.close` left the object
+       //   answering closed? false and reading on happily. The three standard
+       //   streams are never closed here, so the mark only exists above 2.
+       if fd > 2 && (str_len name == 5 && str_eq name "close") then
+         (let _ = fd_close fd in
+          let _ = map_set ivars (str_of_int id ++ "@__io_closed") (VBool true) in
+          VNil)
+       else if fd > 2 && (str_len name == 7 && str_eq name "closed?") then
+         VBool (map_has ivars (str_of_int id ++ "@__io_closed"))
+       // ...and every read or write after that is an IOError, not a syscall.
+       else if fd > 2 && map_has ivars (str_of_int id ++ "@__io_closed")
+               && (if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s")
+                      || (str_len name == 4 && str_eq name "path") || (str_len name == 7 && str_eq name "to_path")
+                   then false else true) then
+         raise_exc world "IOError" "closed stream"
+       else if fd > 2 && ((str_len name == 5 && str_eq name "write")
+                          || (str_len name == 2 && str_eq name "<<")
+                          || (str_len name == 5 && str_eq name "print")
+                          || (str_len name == 4 && str_eq name "puts")) then
+         (let s2 = (if (str_len name == 4 && str_eq name "puts")
+                    then (match args with Nil -> "\n" | _ -> io_join_go args "" ++ "\n")
+                    else io_join_go args "") in
+          let n9 = fd_put fd s2 in
+          if n9 < 0 then raise_exc world "IOError" "closed stream"
+          else if (str_len name == 5 && str_eq name "write") then VInt n9
+          else if (str_len name == 2 && str_eq name "<<") then recv
+          else VNil)
+       else if fd > 2 && ((str_len name == 4 && str_eq name "read")
+                          || (str_len name == 11 && str_eq name "readpartial")
+                          || (str_len name == 7 && str_eq name "sysread")) then
+         // The READ ITSELF is the probe -- see fd_slurp. VNil back means the
+         // descriptor had nothing right now, and on a pipe whose PEER IS STILL
+         // OPEN that can never change here (a thread body runs to completion at
+         // Thread.new, so no writer is left to run). Say so rather than wait.
+         (let peer9 = (if map_has ivars (str_of_int id ++ "@__io_peer")
+                       then (match map_get ivars (str_of_int id ++ "@__io_peer") with VInt pv -> pv | _ -> 0 - 1)
+                       else 0 - 1) in
+          let got9 = (match args with
+                      | Cons (VInt n9, _) -> fd_slurp_limited fd n9
+                      | _ -> fd_slurp fd) in
+          match got9 with
+          | VNil ->
+            (if peer9 >= 0 then
+               raise_exc world "IOError"
+                 "deadlock: reading a pipe with nothing in it, and this interpreter runs thread bodies to completion, so nothing is left that could write to it"
+             else raise_exc world "IOError" "closed stream")
+          | VStr h9 ->
+            // #read with no length answers "" at end of file; with one, nil.
+            (match args with
+             | Cons (VInt _, _) -> (if str_eq (sget h9) "" then VNil else got9)
+             | _ -> got9)
+          | _ -> got9)
+       else if (str_len name == 4 && str_eq name "puts") then
          (let _ = (if fd == 2 then (match args with Nil -> print_err "" | _ -> err_puts_each world args)
                    else (match args with Nil -> out_print "" | _ -> puts_each world args)) in
           VNil)

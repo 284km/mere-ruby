@@ -94,6 +94,15 @@ extern fn fd_close: int -> int;
 extern fn fd_seek: int -> int -> int -> int;
 extern fn fd_dup: int -> int;
 extern fn fd_isatty: int -> int;
+extern fn fd_pipe: unit -> int;
+// O_NONBLOCK on a descriptor. ⚠ Both ends of a pipe get it, and the reason is
+//   this interpreter's THREAD MODEL rather than performance: a thread body
+//   here runs to completion at Thread.new, so when a read would block there is
+//   no other thread left to write and the wait can never end. ruby/spec's
+//   core/io/copy_stream is exactly that shape, and it cost a 600-second wall
+//   bound on every sweep before this. A read that would block is a deadlock
+//   HERE, and it is named as one.
+extern fn io_set_nonblocking: int -> int;
 // one arena block, reused: 64 KiB is the read size and the write chunk.
 
 // Object ids come from a counter carried IN the ocls map itself (special key
@@ -1667,6 +1676,49 @@ let tcp_put = fn (fd: int) -> fn (s: str) ->
   let n = str_len s in
   let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
   tcp_write fd p n;
+// The same two moves for an ordinary descriptor. ⚠ The arena block is SHARED
+//   with the tcp path on purpose -- one 64 KiB block, reused -- so nothing
+//   here may hold it across a call that could also use it.
+let fd_put = fn (fd: int) -> fn (s: str) ->
+  let p = tcp_arena () in
+  let n = str_len s in
+  let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
+  fd_write fd p n;
+// read up to 64 KiB; "" at end of file, and a refusal is "" too -- the caller
+// that needs to tell them apart asks fd_read itself.
+let fd_get = fn (fd: int) ->
+  let p = tcp_arena () in
+  let n = fd_read fd p 65536 in
+  if n <= 0 then "" else mem_to_str p n;
+// ⚠ A SEPARATE "would it block?" PROBE CANNOT BE WRITTEN HERE. The first
+//   version asked `fd_read fd p 0` -- a zero-length read -- and the family's
+//   own contract answers -1 for a capacity of zero, so it said "would block"
+//   for every pipe including one at end of file. Reading one byte instead
+//   would answer correctly and CONSUME the byte.
+//   So the read itself is the probe: on a non-blocking descriptor fd_read
+//   answers -1 for "nothing now" and 0 for "end of file", and those two mean
+//   opposite things. These return VNil for the first and a string otherwise,
+//   and the caller decides what -1 means from what else it knows.
+let rec fd_slurp_go = fn (fd: int) -> fn (acc: str) ->
+  let p = tcp_arena () in
+  let n = fd_read fd p 65536 in
+  if n <= 0 then acc else fd_slurp_go fd (acc ++ mem_to_str p n);
+let fd_slurp = fn (fd: int) ->
+  let p = tcp_arena () in
+  let n = fd_read fd p 65536 in
+  if n < 0 then VNil
+  else if n == 0 then mkstr ""
+  else mkstr (fd_slurp_go fd (mem_to_str p n));
+let fd_slurp_limited = fn (fd: int) -> fn (want: int) ->
+  let p = tcp_arena () in
+  let cap = (if want > 65536 then 65536 else want) in
+  let n = (if cap <= 0 then 0 else fd_read fd p cap) in
+  if n < 0 then VNil
+  else if n == 0 then mkstr ""
+  else mkstr (mem_to_str p n);
+let rec fd_get_all = fn (fd: int) -> fn (acc: str) ->
+  let chunk = fd_get fd in
+  if str_eq chunk "" then acc else fd_get_all fd (acc ++ chunk);
 let out_write_raw = fn (s: str) ->
   if str_has_nul s then print_bytes (bytes_of_str s) else print_no_nl s;
 let out_print = fn (s: str) ->
