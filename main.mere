@@ -30939,7 +30939,55 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
     let saved_rm = (if map_has prim_missing "rm" then map_get prim_missing "rm" else VNil) in
     let saved_rf = (if map_has prim_missing "rf" then map_get prim_missing "rf" else VNil) in
     let saved_i = (if map_has prim_missing "i" then map_get prim_missing "i" else VNil) in
-    let ensf = (match ens with Nil -> FNext VNil | _ -> run_stmts env world blk ens) in
+    // ⚠ AN EXCEPTION RAISED INSIDE THE ENSURE BODY REPLACES the one in flight.
+    //   ruby is explicit about that and programs lean on it -- ruby/spec's own
+    //   `it ... ensure dir.close end` reports the ensure's NoMethodError when
+    //   the body already failed. Here the pending exception STAYED in $exc
+    //   while the ensure ran, the ensure's own raise left through `fail`
+    //   without ever coming back to this function, and the handler above then
+    //   read the stale $exc: `raise ArgumentError; ensure; nil.close; end`
+    //   reported ArgumentError where ruby reports NoMethodError. Both raises
+    //   were real and the older one won.
+    //
+    //   So the slots are CLEARED before the body runs -- a new raise is then
+    //   recorded on its own, with nothing of the old one left to be preferred
+    //   -- and put back only when the body finished without raising. The
+    //   save/restore above is still needed for the other case this guards: a
+    //   rescue INSIDE the ensure body consumes the slot when it handles its
+    //   own exception, and the pending one must survive that.
+    let has_ens = (match ens with Nil -> false | _ -> true) in
+    //   ⚠ ...and CLEARED before the ensure body runs, so that a raise inside
+    //   it is recorded on its own. Without that, the pending exception stayed
+    //   in $exc while the ensure ran, the ensure's own raise left through
+    //   `fail` without coming back here, and the handler further out read the
+    //   STALE $exc: `raise ArgumentError; ensure; nil.close; end` reported
+    //   ArgumentError where ruby reports NoMethodError. Both raises were real
+    //   and the older one won.
+    //
+    //   Nothing wraps the ensure body: its `fail` propagates exactly as it
+    //   always did, and the restore below is simply never reached when it
+    //   does. A try_or around it was the first attempt and it cost
+    //   core/thread/alive_spec its verdict -- that spec spins inside an
+    //   ensure body (`Thread.pass until exit`), and catching and re-raising
+    //   each park took the file over the CPU budget: DIFF became SLOW, which
+    //   is a worse answer than the wrong one it gave before.
+    //
+    //   ...and only when there IS an ensure body. Clearing the slots for a
+    //   plain begin/rescue took the pending exception away from a reader
+    //   further out -- the thread runner decides whether a body PARKED by
+    //   looking at $exc.
+    //   ...but NOT a __ThreadPark. That is not a ruby exception at all -- it is
+    //   this interpreter's scheduler, parking a thread through the same slot
+    //   and the same unwinding path, and it is already documented as invisible
+    //   to a bare rescue. An ensure body is exactly where a parked thread
+    //   carries on (`sleep; ensure; Thread.pass until exit`), so clearing the
+    //   slot there loses the park: core/thread/alive_spec stopped finishing at
+    //   all and went DIFF -> SLOW, which is a worse answer than the wrong one
+    //   it gave before. One slot, two meanings; only the ruby one is replaced.
+    let park9 = (match saved_exc with VExc (c9, _) -> str_eq c9 "__ThreadPark" | _ -> false) in
+    let _ = (if has_ens && saved_had && (if park9 then false else true)
+             then map_delete ivars "$exc" else ()) in
+    let ensf = (if has_ens then run_stmts env world blk ens else FNext VNil) in
     let _ = (if saved_had && (if map_has ivars "$exc" then false else true)
              then (let _ = map_set ivars "$exc" saved_exc in
                    let _ = (match saved_rl with VNil -> () | v -> map_set prim_missing "rl" v) in
