@@ -55,6 +55,10 @@ type Expr = EInt of int | EBig of str | ERat of str * str | EImag of int | EImag
           // `name [items]` (space before bracket): indexing when name is a
           // live local, else a call with one array argument. Decided at eval.
           | EAmbigIdx of str * Expr list
+          // the same ambiguity with a postfix chain after the bracket: both
+          // readings are built by the parser because they have different
+          // shapes. See ambig_or_call.
+          | EAmbigIdxC of str * Expr * Expr
           // a range in condition position: the flip-flop operator. The int
           // is the site id keying its hidden on/off state.
           | EFlipFlop of int * Expr * Expr * bool
@@ -1077,6 +1081,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EAmbigIdx (name, items) ->
     if lv_has env name then eval_e env world blk (EMethod (EVar name, "[]", items))
     else eval_e env world blk (ECall (name, Cons (EArr items, Nil)))
+  | EAmbigIdxC (name, idx_form, call_form) ->
+    if lv_has env name then eval_e env world blk idx_form
+    else eval_e env world blk call_form
   | ERange (loe, hie, excl) ->
     // Both bounds are kept AS THEY ARE. An absent bound (`(1..)`, `(..9)`)
     // is nil, exactly as in ruby, and no bound is coerced: a string range
@@ -10939,6 +10946,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // so `File.delete(a, b)` left b on disk and said 2 files were gone.
        else if (str_len name == 6 && str_eq name "delete") || (str_len name == 6 && str_eq name "unlink") then
          delete_paths world args 0
+       // File.chmod(mode, *paths) -> how many it changed. Like Dir.mkdir's
+       // permission argument this is a #to_int conversion, and like
+       // File.delete a missing path is an error rather than a silent skip
+       // (ruby names apply2files in the message, which is the C function that
+       // walks the list).
+       // ⚠ Not having it stopped whole spec FILES, not examples:
+       //   ruby/spec's Dir fixture calls File.chmod on every directory it
+       //   builds, so all five of core/dir/delete_spec's examples died in
+       //   `before :each` with NoMethodError.
+       else if (str_len name == 5 && str_eq name "chmod") then
+         (match args with
+          | Cons (mv, paths9) ->
+            (let md = (match coerce_int_args env world (Cons (mv, Nil)) with
+                       | Cons (VInt n9, _) -> n9
+                       | _ -> (let _ = raise_exc world "TypeError"
+                                 ("no implicit conversion of " ++ class_name mv ++ " into Integer") in 0)) in
+             chmod_paths world (oct12 md) paths9 0)
+          | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)")
        else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then file_open_obj world args
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
     // Dir class methods (pwd via env, mkdir via the shell).
@@ -11021,6 +11046,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (let p9 = sget ph in
              if (if file_exists p9 then false else true) then
                raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_s_rmdir - " ++ p9)
+             // ⚠ THREE causes, and only two were told apart: a path that is
+             //   there but is NOT A DIRECTORY was reported as "directory not
+             //   empty", which names the wrong thing entirely.
+             else if (if dir_there p9 then false else true) then
+               raise_exc world "Errno::ENOTDIR" ("Not a directory @ dir_s_rmdir - " ++ p9)
              else if run ("rmdir " ++ shq p9 ++ " 2>/dev/null") == 0 then VInt 0
              else raise_exc world "Errno::ENOTEMPTY" ("Directory not empty @ dir_s_rmdir - " ++ p9))
           | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
@@ -11036,7 +11066,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 4 && str_eq name "glob") || (str_len name == 2 && str_eq name "[]") then
          (let base = (match glob_base_arg args with VStr h -> sget h | _ -> "") in
           let pats = glob_pat_args (glob_drop_opts args) in
-          arr_new (val_uniq (glob_all ("p" ++ glob_fnm_flags args) pats base) Nil))
+          // ⚠ ...and the results carry the PATTERN's encoding. Every name came
+          //   back UTF-8 whatever was asked for, because the strings are built
+          //   here and nothing told them where they came from.
+          let penc = (match glob_drop_opts args with
+                      | Cons (VStr ph9, _) -> senc_get ph9
+                      | Cons (VArr aid9, _) -> (match deref aid9 with
+                                                | Cons (VStr ph9, _) -> senc_get ph9
+                                                | _ -> "UTF-8")
+                      | _ -> "UTF-8") in
+          arr_new (val_strs_tag (val_uniq (glob_all ("p" ++ glob_fnm_flags args) pats base) Nil) penc))
        else if (str_len name == 7 && str_eq name "entries") || (str_len name == 8 && str_eq name "children") then
          (match args with
           | Cons (VStr ph, _) ->
@@ -11077,7 +11116,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match args with
           | Cons (VStr ph, _) ->
             (let p9 = sget ph in
-             if dir_there p9 then new_obj world "Dir" (Cons (mkstr p9, Nil))
+             if dir_there p9
+             // ⚠ #to_path answers a String with the ARGUMENT's encoding, and
+             //   mkstr makes a UTF-8 one.
+             then (let ph9 = mkstr p9 in
+                   let _ = (match ph9 with VStr h9 -> senc_set h9 (senc_get ph) | _ -> ()) in
+                   new_obj world "Dir" (Cons (ph9, Nil)))
              else dir_open_fail world p9)
           | _ -> VNil)
        // Dir.mktmpdir / Dir.tmpdir: `tmpdir` is a stdlib file in CRuby; here
@@ -16596,6 +16640,26 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // when the block raises, which is what the ensure is for. Answers the
        // block's value, as ruby does. The move itself is dir_chdir_to, shared
        // with the blockless form.
+       // Dir.open(path) { } / Dir.new is NOT this: only .open takes a block.
+       // ⚠ There was no arm here at all, so the call fell through to the
+       //   blockless one, which built the Dir and ANSWERED IT -- the block ran
+       //   (the generic iterator path saw to that) but its value was thrown
+       //   away, and the directory was never closed.
+       else if str_eq c "Dir" && (str_len name == 4 && str_eq name "open") then
+         (let dobj = invoke_val_c env world blk recv "open" args false in
+          // ⚠ try_or's fallback is an ordinary value, so a block that RAISES
+          //   comes back as VNil and the exception is gone. The directory still
+          //   has to be closed, so the raise cannot simply propagate either:
+          //   run, note whether we got to the end, clean up, and only then
+          //   re-fail. The pending exception is still in $exc, which is what
+          //   run_begin's own "propagates after ensure" fail relies on.
+          let ok9 = map_new () in
+          let r = try_or (fn (u: unit) ->
+                            let v = flow_value (run_block world blk newblk (Cons (dobj, Nil))) in
+                            let _ = map_set ok9 "y" 1 in v) VNil in
+          let _ = invoke_val_c env world blk dobj "close" Nil false in
+          if map_has ok9 "y" then r
+          else fail "mere-ruby: (exception propagates after Dir.open)")
        else if str_eq c "Dir" && (str_len name == 5 && str_eq name "chdir") then
          // ⚠ The block form never ran path_args -- that conversion happens in
          //   invoke_val_c, and this is the OTHER dispatcher. So
@@ -16613,9 +16677,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           if (if dir_chdir_to tgt == 0 then false else true) then
             raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir - " ++ tgt)
           else
-            let r = try_or (fn (u: unit) -> flow_value (run_block world blk newblk (Cons (mkstr tgt, Nil)))) VNil in
+            // ⚠ ...and the same here, which was ALREADY wrong: a block that
+            //   raised inside Dir.chdir came back as nil and the exception
+            //   vanished. The comment above says "including when the block
+            //   raises, which is what the ensure is for" -- the move back did
+            //   happen, but the raise did not survive it.
+            let ok9 = map_new () in
+            let r = try_or (fn (u: unit) ->
+                              let v = flow_value (run_block world blk newblk (Cons (mkstr tgt, Nil))) in
+                              let _ = map_set ok9 "y" 1 in v) VNil in
             let _ = dir_chdir_to back in
-            r)
+            if map_has ok9 "y" then r
+            else fail "mere-ruby: (exception propagates after Dir.chdir)")
        else if str_eq c "File" && ((str_len name == 4 && str_eq name "open") || (str_len name == 3 && str_eq name "new")) then
          (let fobj = file_open_obj world (path_args (false, (Nil : str list), (Nil : Stmt list), env) world "open" args) in
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
@@ -26940,6 +27013,12 @@ and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
   //   hash passes through untouched, because to_path_str only converts objects.
   if (str_len name == 4 && str_eq name "glob") || (str_len name == 2 && str_eq name "[]")
   then path_args_all nb world args
+  // File.chmod(mode, *paths): the LEADING argument is the mode, not a path,
+  // and every argument after it is one.
+  else if (str_len name == 5 && str_eq name "chmod") then
+    (match args with
+     | Nil -> Nil
+     | Cons (m9, rest9) -> Cons (m9, path_args_all nb world rest9))
   else
   (match args with
    | Nil -> Nil
@@ -26948,6 +27027,20 @@ and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
            (if (str_len name == 6 && str_eq name "rename") || (str_len name == 7 && str_eq name "symlink") || (str_len name == 4 && str_eq name "link")
             then (match rest with Cons (b, r2) -> Cons (to_path_str nb world b, r2) | Nil -> Nil)
             else rest)))
+
+// File.chmod(mode, *paths): one shell call per path, so a missing one can be
+// named. The mode is already four octal digits (oct12).
+and chmod_paths = fn world -> fn (md: str) -> fn (paths: Val list) -> fn (acc: int) ->
+  (match paths with
+   | Nil -> VInt acc
+   | Cons (VStr h9, rest9) ->
+     (let ph = sget h9 in
+      if (if file_exists ph then false else true) then
+        raise_exc world "Errno::ENOENT" ("No such file or directory @ apply2files - " ++ ph)
+      else (let _ = run ("chmod " ++ md ++ " " ++ shq ph ++ " 2>/dev/null") in
+            chmod_paths world md rest9 (acc + 1)))
+   | Cons (other9, _) ->
+     raise_exc world "TypeError" ("no implicit conversion of " ++ class_name other9 ++ " into String"))
 
 and path_args_all = fn nb -> fn world -> fn (args: Val list) ->
   match args with
@@ -30937,6 +31030,7 @@ and bare_yield_expr = fn (e: Expr) ->
   | EIdxOp (r, idx, _, v) -> bare_yield_expr r || bare_yield_exprs idx || bare_yield_expr v
   | EAttrOp (r, _, _, v) -> bare_yield_expr r || bare_yield_expr v
   | EAmbigIdx (_, es) -> bare_yield_exprs es
+  | EAmbigIdxC (_, a9, b9) -> bare_yield_exprs (Cons (a9, Cons (b9, Nil)))
   | ESafe (r, _, args) -> bare_yield_expr r || bare_yield_exprs args
   | ESafeB (r, _, args, _, bb) -> bare_yield_expr r || bare_yield_exprs args || bare_yield_stmts bb
   | ESuper (_, args) -> bare_yield_exprs args
