@@ -26759,15 +26759,31 @@ and require_path_of = fn env -> fn world -> fn (v: Val) ->
       | _ -> (let _ = raise_exc world "TypeError"
                 ("no implicit conversion of " ++ conv_name v ++ " into String") in "")))
 
+// ⚠ THE SAME RULE AS require_path_of, and for a long time only half of it.
+//   This one asked #to_path and stopped, so an object that answers #to_str --
+//   which ruby accepts everywhere a path is accepted -- fell through
+//   UNCONVERTED and was stringified by whatever ran next: `File.open(o)` went
+//   looking for a file literally named `#<S:0x...>` and raised Errno::ENOENT,
+//   naming a path the program never wrote. Wrong in the permissive direction,
+//   and wearing the wrong exception.
+//   The conversions CHAIN exactly as they do there: #to_path first, and its
+//   answer is asked for #to_str when it is not already a String.
+//   Not converting is still not an error HERE -- a value that answers neither
+//   is handed on unchanged and refused downstream, which is where the
+//   per-method message lives.
 and to_path_str = fn nb -> fn world -> fn (v: Val) ->
   (match v with
    | VObj _ ->
      (let cls = dispatch_cls_of world v in
-      if has_meth world cls "to_path"
-      then (match invoke world nb v cls "to_path" Nil with
-            | VStr h -> VStr h
-            | _ -> v)
-      else v)
+      let via = (if has_meth world cls "to_path" then invoke world nb v cls "to_path" Nil else v) in
+      (match via with
+       | VStr h -> VStr h
+       | _ -> (let c8 = dispatch_cls_of world via in
+               if has_meth world c8 "to_str"
+               then (match invoke world nb via c8 "to_str" Nil with
+                     | VStr h -> VStr h
+                     | _ -> v)
+               else v)))
    | _ -> v)
 
 // Only the leading argument, and the second of the two-path calls: File.write's
@@ -29595,13 +29611,45 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
      let p1 = if ends_with_rb p0 then p0 else p0 ++ ".rb" in
      let dir = (if map_has load_ctx "dir" then (match map_get load_ctx "dir" with VStr d -> let d = sget d in d | _ -> ".") else ".") in
+     // A library mere-ruby SHIPS is its implementation of that feature (see
+     // stdlib_src, and the `shipped` use below): the source that runs comes
+     // from the binary, not from any file. Compute it ONCE, here, because it
+     // now decides the NAME as well as the source -- and because building it
+     // is a long string concatenation that should not happen twice per
+     // require.
+     let shipped = stdlib_src p0 in
+     // ...and where that fiction lives. m_driver seeds it beside RbConfig's
+     // `rubylibdir`, which is the same fiction told to ruby code; one owner,
+     // one value. Absent, this falls through to the behaviour below rather
+     // than restating the rule with a second literal.
+     let sdir = (if map_has load_ctx "stdlibdir" then (match map_get load_ctx "stdlibdir" with VStr d -> sget d | _ -> "") else "") in
      // require_relative: against the requiring file's dir; require: an
      // absolute path directly, an explicit ./ or ../ against the process
      // CWD (as in Ruby), else the $LOAD_PATH dirs, else the dir.
+     //
+     // ⚠ A SHIPPED library's identity must not depend on WHO required it.
+     //   `require "digest/sha2"` has no file to find, so the last branch fell
+     //   through to `dir ++ "/" ++ p1` -- the REQUIRING FILE's directory. Two
+     //   files in two directories requiring the same shipped library therefore
+     //   named two features, and the library was evaluated TWICE. ruby/spec's
+     //   library/openssl/digest requires four `shared/constants`, one from
+     //   each of the sha1/sha256/sha384/sha512 directories; mere-ruby
+     //   re-evaluated digest/sha2 three times and printed eleven
+     //   `already initialized constant Digest::...` warnings that ruby does
+     //   not print. Nine recorded rows (library/openssl/digest 6,
+     //   library/digest 3) were that and nothing else.
+     //
+     //   `require` is not `require_relative`: the name resolves once, for the
+     //   whole process. So a shipped feature is named from the name ALONE --
+     //   including over a file of the same name on the $LOAD_PATH, which the
+     //   source already ignored. require_relative is left alone: it names a
+     //   file in the program's own tree and the requiring dir is the point.
      let full = if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
                 else if rel then dir ++ "/" ++ p1
                 else if str_len p1 >= 2 && (str_eq (substring p1 0 2) "./" || (str_len p1 >= 3 && str_eq (substring p1 0 3) "../")) then
                   env_get "PWD" ++ "/" ++ p1
+                else if (if str_eq shipped "" then false else true) && (if str_eq sdir "" then false else true) then
+                  sdir ++ "/" ++ p1
                 else (let hit = load_path_find world p1 in
                       if str_eq hit "" then dir ++ "/" ++ p1 else hit) in
      // ...and then CANONICALISED, because this one string is the whole
@@ -29651,7 +29699,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
              // tmpdir's one addition, Dir.tmpdir, is a primitive here
              str_eq p0 "tmpdir" || str_eq p0 "tmpdir.rb" then
        FNext (VBool true)
-     else if (if is_reg_file full then false else true) && str_eq (stdlib_src p0) "" then
+     else if (if is_reg_file full then false else true) && str_eq shipped "" then
        (let _ = map_set le_path ("cannot load such file -- " ++ p0) (mkstr p0) in
         FRaise (raise_exc world "LoadError" ("cannot load such file -- " ++ p0)))
      else
@@ -29659,10 +29707,19 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = (match (if map_has globals (gvar_slot "LOADED_FEATURES") then map_get globals (gvar_slot "LOADED_FEATURES") else VNil) with
                 | VArr lfid -> arr_set lfid (list_append (deref lfid) (Cons (mkstr full, Nil)))
                 | _ -> ()) in
+       // A DIFFERENT NAME for a body that has already run. The feature is new
+       // -- it was just pushed onto $LOADED_FEATURES above and this require
+       // answers true, exactly as ruby does for `require "digest"` followed by
+       // `require "digest/sha2"` -- but the SOURCE is the one that already
+       // ran, and running it again re-assigns every constant in it. See
+       // stdlib_ran for why the test is the body and not a list of names.
+       if (if str_eq shipped "" then false else true) && map_has stdlib_ran shipped then
+         FNext (VBool true)
+       else
+       let _ = (if str_eq shipped "" then () else map_set stdlib_ran shipped VNil) in
        // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
        // that feature, so it wins over a file of the same name on the load
        // path -- CRuby's monitor.rb would only `require "monitor.so"` here.
-       let shipped = stdlib_src p0 in
        let src = (if str_eq shipped "" then read_file full else shipped) in
        // the file's magic comment sets the script encoding for parse (a
        // parse-time __ENCODING__ capture) and while it runs; a file with no
