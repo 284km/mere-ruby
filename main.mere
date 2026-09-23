@@ -734,6 +734,14 @@ let gc_collect = fn env -> fn world ->
   region GCC {
     let (meths, sup, ocls, ivars) = world in
     let gclog = gc_log_on () in
+    // ⚠ The collector kept no count of itself, so `GC.count` and `GC.total_time`
+    //   had nothing to answer with and core/gc could not ask this interpreter a
+    //   single question about its own collector. These two are the whole of it:
+    //   how many times it ran and how long that took. Nothing here is CRuby's
+    //   numbers -- they are this collector's, which is the only honest thing a
+    //   different collector can report.
+    let _ = map_set gc_state "n" ((if map_has gc_state "n" then map_get gc_state "n" else 0) + 1) in
+    let t0 = int_of_float (time () * 1000000000.0) in
     let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)) else ()) in
     let live = map_new () in
     let _ = gc_mark_roots env live in
@@ -865,6 +873,10 @@ let gc_collect = fn env -> fn world ->
     let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
     let _ = map_set gc_state "t" (map_len ivars + map_len ocls + delta) in
     let _ = map_set gc_state "b" (gc_store_bytes ()) in
+    // ...and the time this run took, in nanoseconds, added to the total.
+    let _ = map_set gc_state "ns"
+              ((if map_has gc_state "ns" then map_get gc_state "ns" else 0)
+               + (int_of_float (time () * 1000000000.0) - t0)) in
     ()
   };
 
@@ -12615,7 +12627,66 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       | (true, VStr h) -> mkstr (sget h ++ "/ruby")
                       | _ -> mkstr "/usr/bin/ruby")
        | _ -> mkstr "/usr/bin/ruby")
-    else if str_eq c "GC" && ((str_len name == 5 && str_eq name "start") || (str_len name == 6 && str_eq name "enable") || (str_len name == 7 && str_eq name "disable") || (str_len name == 7 && str_eq name "stress=") || (str_len name == 6 && str_eq name "stress")) then VNil
+    // ⚠ EVERY GC METHOD ANSWERED nil. `GC.start` did not collect, `GC.enable`
+    //   and `GC.disable` did not switch anything and answered nil where ruby
+    //   answers the PREVIOUS state, and count/stat/total_time did not exist at
+    //   all -- so core/gc could not ask this interpreter one question about its
+    //   own collector and 10 of its 11 files were DIFF.
+    //
+    //   What is reported here is THIS COLLECTOR's, not CRuby's. It does not
+    //   have generations, slots or a compactor, and inventing those numbers
+    //   would be worse than not having them: a program that reads GC.stat to
+    //   decide something would decide it on fiction. The keys are the ones
+    //   this collector actually keeps.
+    else if str_eq c "GC" && (str_len name == 5 && str_eq name "start") then
+      (let _ = gc_collect env world in VNil)
+    else if str_eq c "GC" && ((str_len name == 6 && str_eq name "enable") || (str_len name == 7 && str_eq name "disable")) then
+      // ruby answers the state BEFORE the call: enable on an enabled GC is
+      // false, and disable on an enabled one is false too -- the answer is
+      // "was it already disabled", not "did this work".
+      (let was9 = (if map_has gc_state "off" then true else false) in
+       let _ = (if (str_len name == 7 && str_eq name "disable")
+                then map_set gc_state "off" 1
+                else (if map_has gc_state "off" then map_delete gc_state "off" else ())) in
+       VBool was9)
+    else if str_eq c "GC" && (str_len name == 6 && str_eq name "stress") then
+      VBool (map_has gc_state "stress")
+    else if str_eq c "GC" && (str_len name == 7 && str_eq name "stress=") then
+      (match args with
+       | Cons (v9, _) ->
+         (let _ = (if truthy v9 then map_set gc_state "stress" 1
+                   else (if map_has gc_state "stress" then map_delete gc_state "stress" else ())) in v9)
+       | Nil -> VNil)
+    else if str_eq c "GC" && (str_len name == 5 && str_eq name "count") then
+      VInt (if map_has gc_state "n" then map_get gc_state "n" else 0)
+    else if str_eq c "GC" && (str_len name == 10 && str_eq name "total_time") then
+      VInt (if map_has gc_state "ns" then map_get gc_state "ns" else 0)
+    // measure_total_time: this collector ALWAYS times itself (it is two clock
+    // reads per collection), so the switch is honoured as a flag and the
+    // measurement never stops. Reporting false while still measuring would be
+    // the lie; reporting the flag the caller set is not.
+    else if str_eq c "GC" && (str_len name == 18 && str_eq name "measure_total_time") then
+      VBool (if map_has gc_state "notime" then false else true)
+    else if str_eq c "GC" && (str_len name == 19 && str_eq name "measure_total_time=") then
+      (match args with
+       | Cons (v9, _) ->
+         (let _ = (if truthy v9 then (if map_has gc_state "notime" then map_delete gc_state "notime" else ())
+                   else map_set gc_state "notime" 1) in v9)
+       | Nil -> VNil)
+    // ⚠ COMPACTION IS REFUSED, not faked. This collector marks and sweeps; it
+    //   never MOVES an object, so there is nothing for auto_compact to switch
+    //   on and a stored flag would be a promise it cannot keep. ruby raises
+    //   NotImplementedError on a platform without compaction and the spec
+    //   skips on it, which is the shape this belongs in. It costs the row --
+    //   the reference here DOES compact -- and that is the price of not
+    //   answering a question this collector cannot answer.
+    else if str_eq c "GC" && ((str_len name == 12 && str_eq name "auto_compact")) then VBool false
+    else if str_eq c "GC" && ((str_len name == 13 && str_eq name "auto_compact=")
+                              || (str_len name == 7 && str_eq name "compact")
+                              || (str_len name == 19 && str_eq name "latest_compact_info")
+                              || (str_len name == 28 && str_eq name "verify_compaction_references")) then
+      raise_exc world "NotImplementedError"
+        "this collector marks and sweeps; it never moves an object, so there is no compaction to configure"
     // Zlib.crc32(str, seed) / Zlib.adler32(str, seed), and the two stream
     // methods, reached as Zlib::Deflate.deflate / Zlib::Inflate.inflate.
     else if (str_eq c "Zlib" || str_eq c "Zlib::Deflate" || str_eq c "Zlib::Inflate")

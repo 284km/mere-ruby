@@ -222,6 +222,11 @@ def context(desc, *opts)
   $mspec_after = prev_a
 end
 
+# mspec's `skip`: abandon this example without failing it. Real mspec raises
+# its own exception class and the runner counts the example as passed.
+class SpecSkipped < StandardError; end
+def skip(reason = nil); raise SpecSkipped, reason.to_s; end
+
 def it(desc, *opts, &blk)
   $mspec_it = desc
   # Run before/example/after on ONE fresh example object (like real mspec), so
@@ -236,6 +241,15 @@ def it(desc, *opts, &blk)
     __mspec_verify_stubs
   rescue SpecFailure
     # already tallied
+  rescue SpecSkipped
+    # ⚠ `skip` is mspec's own, and the shim did not have it -- so an example
+    #   that MEANT to skip raised NameError and was recorded as an ERROR, which
+    #   is a different verdict from the reference's. core/gc/config is the one
+    #   that found it: its example skips when the collector has no boolean
+    #   setting to toggle, which this one does not.
+    #   A skipped example is counted as PASSED here, as real mspec counts it,
+    #   so the two sides' tallies mean the same thing.
+    $mspec_pass += 1
   rescue Exception => e
     $mspec_err += 1
     # The CLASS only: the message would make this record compare two error
