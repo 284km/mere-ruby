@@ -2566,12 +2566,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                && (str_eq ocl "Enumerator::ArithmeticSequence" || str_eq ocl "Method" || str_eq ocl "UnboundMethod"
                    // (a Time keeps being one behind a singleton class: `def t.x`
                    // made `t == Time.utc(1970)` fall through to identity)
-                   || str_eq (display_cls world ocl) "Time"
+                   || obj_is_a world (display_cls world ocl) "Time"
                    || exc_is_a world ocl "Exception")
                && (if has_meth world ocl op then false else true) then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // Time's arithmetic is a primitive, not an entry in the method table.
-       else if str_eq (display_cls world ocl) "Time" && (str_eq op "+" || str_eq op "-") then
+       else if obj_is_a world (display_cls world ocl) "Time" && (str_eq op "+" || str_eq op "-") then
          invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        // an object with no operator of its own but a method_missing: ruby
        // dispatches the operator like any other message (a matcher's =~).
@@ -6592,7 +6592,7 @@ and has_own_eq = fn world -> fn (v: Val) ->
   match v with
   | VObj _ ->
     (let c = dispatch_cls_of world v in
-     has_meth world c "==" || str_eq (display_cls world c) "Time")
+     has_meth world c "==" || obj_is_a world (display_cls world c) "Time")
   | _ -> false
 
 and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
@@ -9147,7 +9147,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   // be coerced into Object". display_cls resolves the singleton to the class
   // it stands for; ruby/spec's Range#each Time example is exactly this shape.
   else if (match recv with
-           | VObj oid -> (let (_, _, ocls9, _) = world in str_eq (display_cls world (map_get ocls9 oid)) "Time")
+           // ⚠ obj_is_a, not str_eq: a subclass of Time is still a Time, and
+           // this guard is what lets a name in -- see the note below. With the
+           // exact name, `class T < Time` got its class methods (T.now) and
+           // then answered "undefined method" for every instance method.
+           | VObj oid -> (let (_, _, ocls9, _) = world in obj_is_a world (display_cls world (map_get ocls9 oid)) "Time")
            | _ -> false)
           && ((str_len name == 3 && str_eq name "utc") || (str_len name == 6 && str_eq name "getutc") || (str_len name == 9 && str_eq name "localtime")
               || (str_len name == 8 && str_eq name "getlocal") || (str_len name == 5 && str_eq name "round") || (str_len name == 4 && str_eq name "to_i")
@@ -9188,6 +9192,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               // two Times compare by their instant, not by identity:
               // `Time.at(1) + 1 == Time.at(2)` is true
               || (str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?") || (str_len name == 3 && str_eq name "<=>")
+              // ...and #hash has to agree with them. Two Times that are `eql?`
+              // must hash alike, and the generic object hash is IDENTITY, so
+              // `Time.at(1234).hash == Time.at(1234).hash` was false -- which
+              // also means a Time could not be used as a Hash key twice.
+              || (str_len name == 4 && str_eq name "hash")
               || (str_len name == 1 && str_eq name "<") || (str_len name == 2 && str_eq name "<=") || (str_len name == 1 && str_eq name ">") || (str_len name == 2 && str_eq name ">=")) then
     (match recv with
      | VObj oid ->
@@ -9202,7 +9211,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           match args with
           | Cons (VObj oid2, _) ->
             (let (_, _, ocls2, _) = world in
-             if str_eq (display_cls world (map_get ocls2 oid2)) "Time" then
+             if obj_is_a world (display_cls world (map_get ocls2 oid2)) "Time" then
                (let y = (match prim_time_epoch world (VObj oid2) with VInt n -> n | _ -> 0) in
                 // ⚠ the NANOSECOND is part of the instant. Comparing seconds
                 //   alone made 03:04:05.5 == 03:04:05, and every ordering
@@ -9232,6 +9241,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // UTC time is 0 and a local one is what the process's own zone says --
        // which is the same question `Time.now.to_i` already answers against
        // the calendar parts, so it is 0 here as well.
+       else if (str_len name == 4 && str_eq name "hash") then
+         // the instant IS the identity: seconds and the subsecond, the same
+         // two numbers `eql?` compares.
+         (let k9 = str_of_int oid ++ "@__tn" in
+          let ns9 = (if map_has iv9 k9 then (match map_get iv9 k9 with VInt n -> n | _ -> 0) else 0) in
+          VInt (val_hash (arr_new (Cons (VInt (time_ord_of world recv), Cons (VInt ns9, Nil))))))
        else if (str_len name == 10 && str_eq name "utc_offset") || (str_len name == 10 && str_eq name "gmt_offset")
                || (str_len name == 6 && str_eq name "gmtoff") then VInt 0
        else if (str_len name == 4 && str_eq name "dst?") || (str_len name == 5 && str_eq name "isdst") then VBool false
@@ -10190,19 +10205,31 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Time.now / Time.at(sec): the same minimal Time object new_obj builds,
     // seeded from the clock rather than from calendar arguments.
     // Time.utc / .gm / .local / .mktime build from calendar parts, like Time.new.
-    else if str_eq c "Time" && ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
+    // ⚠ A SUBCLASS OF Time IS STILL A Time. These arms matched the class NAME,
+    // so `class T < Time; end; T.now` was "undefined method 'now' for class T"
+    // -- and core/time's ceil, floor and round each spend an example on
+    // "returns an instance of Time, even if called on a subclass". The object
+    // is tagged with the RECEIVER's class, not with "Time", so the subclass's
+    // own methods dispatch and `super` still reaches Time.
+    else if obj_is_a world c "Time" && ((str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm")
                                 || (str_len name == 5 && str_eq name "local") || (str_len name == 6 && str_eq name "mktime")) then
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
-       let _ = map_set ocls9 id "Time" in
+       let _ = map_set ocls9 id c in
        let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord args)) in
        let _ = map_set time_inst (str_of_int id) (time_ord args) in
+       // the SEVENTH argument is microseconds, and dropping it made
+       // `Time.utc(1960,1,1,0,0,0,999_999).to_f.to_i` a whole second out.
+       let _ = (match args with
+                | Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (VInt us9, _))))))) ->
+                  (if us9 == 0 then () else map_set iv9 (str_of_int id ++ "@__tn") (VInt (us9 * 1000)))
+                | _ -> ()) in
        let _ = (if (str_len name == 3 && str_eq name "utc") || (str_len name == 2 && str_eq name "gm") then map_set iv9 (str_of_int id ++ "@__utc") (VBool true) else ()) in
        VObj id)
-    else if str_eq c "Time" && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")) then
+    else if obj_is_a world c "Time" && ((str_len name == 3 && str_eq name "now") || (str_len name == 2 && str_eq name "at")) then
       (let (m9, s9, ocls9, iv9) = world in
        let id = alloc_oid ocls9 in
-       let _ = map_set ocls9 id "Time" in
+       let _ = map_set ocls9 id c in
        // ⚠ in NANOSECONDS, because `Time.at(x.5)` used to drop the half and
        //   `Time.at(sec, usec)` ignored its second argument entirely.
        let tot = (match args with

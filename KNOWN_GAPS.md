@@ -2708,11 +2708,42 @@ A Range is an immediate value here; `dup`, `clone` and `equal?` see one
 value. Giving ranges heap identity is a representation change, not a Range
 fix, and core/range/clone_spec and dup_spec are the two files it costs.
 
-## Time as a Hash key
+## Time as a Hash key — and the reason is not the one this entry used to give
 
-`{Time.utc(1970) => 1}[Time.utc(1970)]` is nil: Hash lookup uses `eql?` and
-`hash`, and Time's are still identity. Same family as `Time#inspect` and
-`#strftime`: the Time stub, not Range.
+```ruby
+{Time.at(5) => 1}[Time.at(5)]   # nil, where ruby answers 1
+Time.at(5).hash == Time.at(5).hash   # true
+Time.at(5).eql?(Time.at(5))          # true
+```
+
+⚠ **This entry used to say "Time's `eql?` and `hash` are still identity".**
+They are not, as of the work that gave Time `#hash`: both answer from the
+INSTANT, and the two lines above prove it. The lookup still misses, so the
+cause is somewhere else, and knowing which is the difference between a
+half-hour fix and a wrong one.
+
+**Where it actually is.** Hash's key path consults `hash` and `eql?` through
+the METHOD TABLE. A user-defined class that defines both is looked up
+correctly:
+
+```ruby
+class K
+  def initialize(v) = @v = v
+  def hash = @v.hash
+  def eql?(o) = o.is_a?(K) && o.instance_variable_get(:@v) == @v
+end
+{K.new(1) => :x}[K.new(1)]   # :x, here and in ruby
+```
+
+Time's `hash` and `eql?` live in the DISPATCHER, not in a method table, so the
+key path does not find them and falls back to identity. This is the same
+shape as *Reflection cannot ENUMERATE a builtin class's methods*: a name the
+dispatcher answers is invisible to anything that looks the name up rather than
+calling it.
+
+**What fixing it would take.** The Hash key path asking the dispatcher when
+the method table has no answer — which is the general fix, and would close
+this for every builtin-dispatched class at once rather than for Time.
 
 ## Adding a statement to a prelude method can OOM the interpreter at startup
 
