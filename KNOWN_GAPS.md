@@ -3384,6 +3384,31 @@ superclass mismatch; the shared surface is a module mixed into all three
 instead. Nothing in ruby/spec reads `Zlib::Deflate.superclass`, and every
 ZStream spec constructs a `Zlib::Deflate`.
 
+## `Module#dup` answers the RECEIVER, and a real copy needs something first
+
+`M.dup` and `M.clone` hand back the module itself. That is wrong in two ways a
+program can see: writing to the copy writes to the original
+(`M.dup.send(:remove_class_variable, :@@v)` takes the variable off M), and
+`M.dup.name` is `"M"` where ruby answers nil.
+
+⚠ **A REAL COPY WAS WRITTEN AND MEASURED, AND IT LOST MORE THAN IT WON.** A
+fresh anonymous name carrying copies of the methods, singleton methods,
+constants, class variables, visibility marks, superclass and mixins is about
+forty lines, and it works for a class or module the program itself defined:
+`core/module/remove_class_variable` went green. It BREAKS every builtin-backed
+class and module, because a builtin surface here is reached BY CLASS NAME --
+`Time.dup.now`, `Struct.new(:a).dup.new(1)`, `Math.dup.sqrt(4)`,
+`Comparable.dup` used as a mixin and `Kernel.dup.format` all become
+NoMethodError the moment the copy has a different name. Measured on the full
+sweep: core/module +1, core/exception -1, core/struct -1, core/time -1.
+
+So the copy is not the missing piece; a **builtin identity separate from the
+class name** is. The same mechanism would answer the other half of this:
+`SubModule.new` where `SubModule < Module` is an ordinary object here, so
+`core/module/initialize_spec` and `module_exec_spec` cannot pass either -- a
+module object that is an INSTANCE of something is not a shape this
+interpreter has.
+
 ## Which libc functions an `extern` can reach, measured
 
 `mere-ruby` calls a few libc functions directly (`chdir`, `symlink`, and now

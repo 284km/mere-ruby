@@ -3457,8 +3457,16 @@ and assign_one = fn env -> fn world -> fn (tgt: str) -> fn (v: Val) ->
     // on a frozen receiver is a FrozenError, not a silent write.
     (let slf = lv_get env "self" in
      let _ = (if val_frozen_mut slf
-              then (let _ = raise_exc world "FrozenError"
-                              ("can't modify frozen " ++ class_name slf ++ ": " ++ inspect slf) in ())
+              // ⚠ inspect_w, not inspect, and raise_exc_iv, not raise_exc.
+              //   The bare `inspect` has no world and answers the placeholder
+              //   "#<object>" for every object, so a frozen attr writer
+              //   refused with a message no ruby ever prints -- and without
+              //   __recv, FrozenError#receiver had nothing to answer. The
+              //   ivar-assignment door two thousand lines up gets both right;
+              //   this is the same refusal written a second time.
+              then (let _ = raise_exc_iv world "FrozenError"
+                              ("can't modify frozen " ++ class_name slf ++ ": " ++ frz_inspect env world slf)
+                              (Cons (("__recv", slf), Nil)) in ())
               else ()) in
      let k = ivar_self_key slf n in
      if str_eq k "" then () else (let _ = map_set ivars k v in ()))
@@ -10776,6 +10784,31 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                (let whole = read_file path in
                 let len9 = (match rest9 with Cons (VInt n, _) -> n | _ -> 0 - 1) in
                 let off9 = (match rest9 with Cons (_, Cons (VInt n, _)) -> n | _ -> 0) in
+                // %s THE SENTINEL FOR "NO LENGTH" IS -1, AND SO IS A REAL -1.
+                //   `IO.read(p, -1)` read as "no length given" and answered
+                //   the whole file where ruby raises ArgumentError -- the two
+                //   cases are told apart by whether the argument is THERE,
+                //   not by its value. A negative OFFSET is EINVAL, and it
+                //   used to seek past nothing and answer "".
+                let _ = (match rest9 with
+                         | Cons (VInt n9, _) ->
+                           (if n9 < 0 then (let _ = raise_exc world "ArgumentError"
+                                              ("negative length " ++ str_of_int n9 ++ " given") in ())
+                            else ())
+                         | _ -> ()) in
+                // ...and the two names do NOT agree about a negative OFFSET,
+                // which is not a guess: asked of the reference, IO.read says
+                // ArgumentError and IO.binread says Errno::EINVAL, and each
+                // spec expects its own. They go through different C entry
+                // points there; here they share an arm, so the refusal has to
+                // be picked by name.
+                let _ = (if off9 < 0 then
+                           (if (str_len name == 7 && str_eq name "binread")
+                            then (let _ = raise_exc world "Errno::EINVAL"
+                                            ("Invalid argument - " ++ path) in ())
+                            else (let _ = raise_exc world "ArgumentError"
+                                            ("negative offset " ++ str_of_int off9 ++ " given") in ()))
+                         else ()) in
                 let body =
                   (if len9 < 0 then (if off9 >= str_len whole then "" else substring whole off9 (str_len whole))
                    else if off9 >= str_len whole then ""
@@ -10787,7 +10820,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                   (let r = mkstr body in
                    if (str_len name == 7 && str_eq name "binread") then (match r with VStr rid -> let _ = senc_set rid "ASCII-8BIT" in r | _ -> r) else r))
              else raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ path))
-          | _ -> path_arg_err world args 1 1)
+          | _ -> path_arg_err world args 1 3)
        // write / binwrite both write the string's bytes: a mere str carries its
        // length, so a zero byte in the content is not a terminator.
        else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "binwrite") then
@@ -27631,6 +27664,14 @@ and thread_key_of = fn env -> fn world -> fn (kv: Val) ->
      else (let _ = raise_exc world "TypeError"
                      (inspect kv ++ " is not a symbol nor a string") in ""))
 
+// The receiver, as a FrozenError message shows it -- "..." when we are already
+// inside one. See frz_busy in m_state for why that case exists at all.
+and frz_inspect = fn env -> fn world -> fn (v: Val) ->
+  if map_has frz_busy "v" then " ..."
+  else (let _ = map_set frz_busy "v" VNil in
+        let r9 = inspect_w env world v in
+        let _ = map_delete frz_busy "v" in r9)
+
 and path_arg_err = fn world -> fn (args: Val list) -> fn (lo: int) -> fn (hi: int) ->
   let n9 = vlen args in
   if n9 < lo || n9 > hi then
@@ -31017,9 +31058,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // freezing an object seals its ivars: `@x = v` on a frozen self raises,
     // which is what an attr writer on a frozen receiver has to do.
     (let slf = lv_get env "self" in
-     let _ = (if val_frozen_mut slf
-              then (let _ = raise_exc world "FrozenError"
-                              ("can't modify frozen " ++ class_name slf ++ ": " ++ inspect slf) in ())
+     // ⚠ inspect_w, not inspect, and raise_exc_iv, not raise_exc. The bare
+     //   `inspect` has no world and answers the placeholder "#<object>" for
+     //   every object, so a frozen attr writer refused with a message no ruby
+     //   ever prints; without __recv, FrozenError#receiver had nothing to
+     //   answer. The other ivar-assignment door (the `@x =` statement, 27000
+     //   lines up) had the identical two lines and the identical two faults --
+     //   fixing the one I found first changed nothing, because the writer
+     //   generated by attr_writer comes through THIS one.
+     let _ = (if val_frozen_mut slf || val_is_immediate slf
+              then (let _ = raise_exc_iv world "FrozenError"
+                              ("can't modify frozen " ++ class_name slf ++ ": " ++ frz_inspect env world slf)
+                              (Cons (("__recv", slf), Nil)) in ())
               else ()) in
      let k = ivar_self_key slf name in
      if (if str_eq k "" then false else true) then (let _ = map_set ivars k v in FNext v)
