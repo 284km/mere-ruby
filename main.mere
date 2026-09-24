@@ -10838,9 +10838,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              VBool (file_exists p9 && (if file_exists (p9 ++ "/.") then false else true)))
           | _ -> VBool false)
        // File.fnmatch?(pattern, path): the same matcher Dir.glob uses.
+       // ⚠ BRACES ARE NOT A fnmatch PATTERN unless FNM_EXTGLOB is passed.
+       //   This expanded them unconditionally, so File.fnmatch("{a,b}", "a")
+       //   answered true where ruby answers false. Dir.glob DOES expand them
+       //   always, which is why the expansion sits in glob_expand and is
+       //   reached from glob_paths without a flag -- the two callers want
+       //   different defaults from the same matcher.
        else if (str_len name == 7 && str_eq name "fnmatch") || (str_len name == 8 && str_eq name "fnmatch?") then
          (match args with
-          | Cons (VStr pp, Cons (VStr sp, _)) -> VBool (glob_any (glob_fnm_flags args) (glob_expand (sget pp)) (sget sp))
+          | Cons (VStr pp, Cons (VStr sp, _)) ->
+            VBool (glob_any (glob_fnm_flags args)
+                     (if fnm_extglob args then glob_expand (sget pp) else Cons (sget pp, Nil))
+                     (sget sp))
           | _ -> VBool false)
        // File.realpath / realdirpath: the absolute path, raising when it does
        // not exist. mere-ruby has no lstat, so symlinks are NOT resolved —
@@ -10864,19 +10873,48 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 4 && str_eq name "path") then
          (match args with
           | Cons (VStr ph, _) -> mkstr (sget ph)
-          | Cons (v, _) -> invoke_val_c env world noblk v "to_path" Nil false
-          | _ -> mkstr "")
+          // ⚠ ...and anything WITHOUT #to_path is a TypeError, not the
+          //   NoMethodError that asking it anyway produced. path_args has
+          //   already run the #to_path/#to_str conversion, so a value that
+          //   is still not a String here has neither.
+          | Cons (VObj o9, _) -> invoke_val_c env world noblk (VObj o9) "to_path" Nil false
+          | _ -> path_arg_err world args 1 1)
+       // ⚠ A NON-String PATH IS A TypeError. All three of these answered ""
+       //   for anything that was not a String -- File.basename(1) was "",
+       //   File.basename("a.rb", 1) ignored the suffix -- so a program that
+       //   handed them the wrong thing got a plausible empty path instead of
+       //   the refusal ruby gives, and the mistake surfaced somewhere else.
        else if (str_len name == 8 && str_eq name "basename") then
          (match args with
-          | Cons (VStr ph, Cons (VStr sf, _)) -> mkstr (basename_suffix (basename_of (sget ph)) (sget sf))
-          | Cons (VStr ph, _) -> mkstr (basename_of (sget ph))
-          | _ -> mkstr "")
+          // ⚠ `Nil`, NOT `_`: with `_` the two-argument arm also matched
+          //   File.basename("bar.txt", ".txt", ".txt"), swallowing the third
+          //   argument where ruby raises ArgumentError -- and the arity check
+          //   below it could never be reached to see it.
+          | Cons (VStr ph, Cons (VStr sf, Nil)) -> mkstr (basename_suffix (basename_of (sget ph)) (sget sf))
+          | Cons (VStr ph, Nil) -> mkstr (basename_of (sget ph))
+          | _ -> path_arg_err world args 1 2)
+       // File.dirname(path, level = 1): the directory part, taken `level`
+       // times. The second argument is an Integer, so this cannot hand the
+       // whole list to path_arg_err the way basename does.
        else if (str_len name == 7 && str_eq name "dirname") then
-         (match args with Cons (VStr ph, _) -> mkstr (dirname_of (sget ph)) | _ -> mkstr "")
+         // ...and a level that is not an Integer is asked for #to_int first,
+         // through the same coercion every other Integer argument goes through.
+         (match (match args with
+                 | Cons (p0, rest0) -> Cons (p0, coerce_int_args env world rest0)
+                 | Nil -> Nil) with
+          | Cons (VStr ph, Nil) -> mkstr (dirname_of (sget ph))
+          | Cons (VStr ph, Cons (VInt lv, Nil)) ->
+            (if lv < 0 then raise_exc world "ArgumentError" ("negative level: " ++ str_of_int lv)
+             else mkstr (dirname_lv (sget ph) lv))
+          | Cons (VStr _, Cons (v9, Nil)) ->
+            raise_exc world "TypeError" ("no implicit conversion of " ++ class_name v9 ++ " into Integer")
+          | _ -> path_arg_err world args 1 2)
        // File.extname: the last dot and after, in the basename — "" when the
        // name has no dot, or begins with the only one (".bashrc").
        else if (str_len name == 7 && str_eq name "extname") then
-         (match args with Cons (VStr ph, _) -> mkstr (extname_of (basename_of (sget ph))) | _ -> mkstr "")
+         (match args with
+          | Cons (VStr ph, Nil) -> mkstr (extname_of (basename_of (sget ph)))
+          | _ -> path_arg_err world args 1 1)
        // ⚠ 8.5 MILLISECONDS PER CALL, because `test -d` is a fork and an exec.
        //   `File.exist?` is a native extern and answers instantly, and the two
        //   sit next to each other in every path walk -- mspec's own mkdir_p
@@ -11053,10 +11091,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                               else env_get "PWD" ++ "/" ++ b)
                            | _ -> env_get "PWD") in
                mkstr (path_norm (base ++ "/" ++ path)))
-          | _ -> mkstr "")
+          | _ -> path_arg_err world args 1 2)
        // ⚠ `File.delete` takes ANY number of paths and answers how many it
        // removed. This took the first and answered 1 whatever it was handed,
        // so `File.delete(a, b)` left b on disk and said 2 files were gone.
+       else if (str_len name == 8 && str_eq name "truncate") then
+         (match args with
+          | Cons (VStr ph, Cons (VInt n9, Nil)) -> file_truncate world (sget ph) n9
+          | _ -> path_arg_err world args 2 2)
        else if (str_len name == 6 && str_eq name "delete") || (str_len name == 6 && str_eq name "unlink") then
          delete_paths world args 0
        // File.chmod(mode, *paths) -> how many it changed. Like Dir.mkdir's
@@ -13747,7 +13789,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // would be a second copy of this rule and would drift from it.
        if str_eq mode "" && (if map_has closed_ok name then false else true) then
          raise_exc world "IOError" "closed stream"
+       // ...and an OPEN stream still refuses the direction it was not opened
+       // for. See io_reads / io_writes in m_state for why those are two allow
+       // lists and what a name in neither of them means.
+       else if map_has io_reads name && (if mode_readable mode then false else true) then
+         raise_exc world "IOError" "not opened for reading"
+       else if map_has io_writes name && (if mode_writable mode then false else true) then
+         raise_exc world "IOError" "not opened for writing"
        else
+       // ⚠ ...AND A READ ON A READ-WRITE HANDLE FLUSHES FIRST. Writes buffer
+       //   into @__f_buf and every reader here goes to the file, so
+       //   `File.open(p, "w+") { |f| f.write("ab"); f.rewind; f.read }`
+       //   answered "" -- the bytes the program had just written were the one
+       //   thing it could not read back. Only a "+" mode reaches this: on a
+       //   one-directional handle the guard above has already refused, which
+       //   is also why this could not be seen before that guard existed.
+       let _ = (if map_has io_reads name && mode_writable mode
+                then file_flush_obj world id else ()) in
        // read CONSUMES: a second `f.read` is "" in ruby, and `eof?` after one is
        // true. This kept the position untouched, so eof? answered false with the
        // whole file already handed over.
@@ -13847,6 +13905,52 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // ...and #to_i is that same question under its other name, so it gets
        // the same refusal rather than a NoMethodError -- which is also what
        // makes the two one method.
+       // File#reopen(path, mode = "r"): the SAME File object, pointing at another
+       // file. The spec assigns the result and closes it once, so the identity
+       // has to be kept -- this resets the four ivars in place instead of
+       // making a new handle.
+       // ⚠ AND IT DROPS THE DESCRIPTOR. file_fd_of memoises @__f_fd, so a
+       //   reopened File would keep answering #read and #fileno from the fd
+       //   opened for the OLD path, with the new path sitting in @__f_path
+       //   where #path reports it. Nothing about that is visible until
+       //   something reads.
+       else if (str_len name == 6 && str_eq name "reopen") then
+         (match path_args_all noblk world args with
+          | Cons (VStr np9, rest9) ->
+            (let np = sget np9 in
+             let nm = (match rest9 with Cons (VStr h9, _) -> sget h9
+                                      | Cons (VInt n9, _) -> int_mode_str n9
+                                      | _ -> "r") in
+             let _ = file_flush_obj world id in
+             let _ = (match (if map_has ivars (k ++ "@__f_fd") then map_get ivars (k ++ "@__f_fd") else VNil) with
+                      | VInt fd9 -> (if fd9 >= 0 then (let _ = fd_close fd9 in ()) else ())
+                      | _ -> ()) in
+             let _ = map_delete ivars (k ++ "@__f_fd") in
+             if (if file_exists np then false else true)
+                && (str_contains nm "r" && (if str_contains nm "+" then false else true)) then
+               raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ np)
+             else
+               (let _ = map_set ivars (k ++ "@__f_path") (mkstr np) in
+                let _ = map_set ivars (k ++ "@__f_mode") (mkstr nm) in
+                let _ = map_set ivars (k ++ "@__f_buf") (mkstr "") in
+                let _ = map_set ivars (k ++ "@__f_pos") (VInt 0) in
+                recv))
+          | _ -> path_arg_err world args 1 2)
+       // File#chmod(mode) and File#truncate(len): the class methods of the same
+       // name, aimed at the path this handle already holds. Both answer 0.
+       // ⚠ #truncate FLUSHES FIRST. The buffer is part of the file's
+       //   contents as far as the program is concerned, and truncating the
+       //   bytes on disk while a write was still pending would have close
+       //   append them back afterwards -- the file would end up longer than
+       //   the length just asked for.
+       else if (str_len name == 5 && str_eq name "chmod") then
+         (match args with
+          | Cons (VInt m9, Nil) -> (let _ = run ("chmod " ++ oct12 m9 ++ " " ++ shq path ++ " 2>/dev/null") in VInt 0)
+          | _ -> path_arg_err world args 1 1)
+       else if (str_len name == 8 && str_eq name "truncate") then
+         (match args with
+          | Cons (VInt n9, Nil) -> (let _ = file_flush_obj world id in file_truncate world path n9)
+          | _ -> path_arg_err world args 1 1)
        else if (str_len name == 6 && str_eq name "fileno") || (str_len name == 4 && str_eq name "to_i") then
          // ⚠ This raised NotImplementedError for years because a File here was
          //   a path and a buffer. It has a real descriptor now (see
@@ -15469,25 +15573,36 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else if (str_len name == 2 && str_eq name "[]") || (str_len name == 19 && str_eq name "thread_variable_get") then
             (match args with
              | Cons (kv, _) ->
-               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+               (let kk = thread_key_of env world kv in
                 if map_has ivars (k ++ "@__tl_" ++ kk) then map_get ivars (k ++ "@__tl_" ++ kk) else VNil)
              | _ -> VNil)
           else if (str_len name == 3 && str_eq name "[]=") || (str_len name == 19 && str_eq name "thread_variable_set") then
             (match args with
              | Cons (kv, Cons (v, _)) ->
-               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+               (let kk = thread_key_of env world kv in
+                let _ = tl_note_key ivars k kk in
                 let _ = map_set ivars (k ++ "@__tl_" ++ kk) v in v)
              | _ -> VNil)
+          // ⚠ ruby's #keys are the FIBER-locals and #thread_variables are the
+          //   THREAD-locals -- two tables, which is the whole point of
+          //   core/thread/keys_spec's "is not shared across fibers". mere-ruby
+          //   has one table, so these two names answer the same list. The
+          //   conflation is older than this arm and is not hidden by it:
+          //   thread_variables_spec is satisfied, keys_spec is not.
+          else if (str_len name == 4 && str_eq name "keys") || (str_len name == 16 && str_eq name "thread_variables") then
+            (let cur = (match (if map_has ivars (k ++ "@__tlk") then map_get ivars (k ++ "@__tlk") else VNil) with
+                        | VStr h9 -> sget h9 | _ -> "") in
+             arr_new (tl_keys_split cur 0 0 Nil))
           else if (str_len name == 4 && str_eq name "key?") || (str_len name == 16 && str_eq name "thread_variable?") then
             (match args with
              | Cons (kv, _) ->
-               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+               (let kk = thread_key_of env world kv in
                 VBool (map_has ivars (k ++ "@__tl_" ++ kk)))
              | _ -> VBool false)
           else if (str_len name == 5 && str_eq name "fetch") then
             (match args with
              | Cons (kv, rest) ->
-               (let kk = (match kv with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+               (let kk = thread_key_of env world kv in
                 if map_has ivars (k ++ "@__tl_" ++ kk) then map_get ivars (k ++ "@__tl_" ++ kk)
                 else (match rest with
                       | Cons (d, _) -> d
@@ -27378,6 +27493,83 @@ and require_path_of = fn env -> fn world -> fn (v: Val) ->
 // ⚠ ...and the TypeError did not name the class either: "no implicit
 //   conversion into String" where ruby says "no implicit conversion of Integer
 //   into String". The class is the whole information in that message.
+// File.dirname(path, level): dirname applied `level` times. It stabilises at
+// the root ("/" and "." are their own directory), so a level past the depth
+// of the path is not an error -- File.dirname("/a/b/c/d", 9) is "/".
+and dirname_lv = fn (p9: str) -> fn (n9: int) ->
+  if n9 <= 0 then p9 else dirname_lv (dirname_of p9) (n9 - 1)
+
+// FNM_EXTGLOB is 0x10. The flags argument is optional and may sit behind the
+// path, so this scans for it the way glob_fnm_flags does.
+and fnm_extglob = fn (args: Val list) ->
+  match args with
+  | Nil -> false
+  | Cons (VInt n9, _) -> (n9 / 16) - (n9 / 32) * 2 == 1
+  | Cons (_, t9) -> fnm_extglob t9
+
+// File.truncate(path, len) / File#truncate(len): the file becomes EXACTLY len
+// bytes -- cut when it is longer, NUL-PADDED when it is shorter. Both
+// directions are what ftruncate(2) does and core/file/truncate_spec checks
+// each of them; growing is the one a read-modify-write is easy to get wrong,
+// because "write what I read" leaves a short file short.
+and file_truncate = fn world -> fn (path: str) -> fn (len: int) ->
+  if (if file_exists path then false else true) then
+    raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_file_s_truncate - " ++ path)
+  else if len < 0 then
+    raise_exc world "Errno::EINVAL" ("Invalid argument - " ++ path)
+  else
+    (let c9 = read_file path in
+     let _ = write_file path (if str_len c9 >= len then substring c9 0 len
+                              else c9 ++ str_repeat (chr 0) (len - str_len c9)) in
+     VInt 0)
+
+// The key of a thread-local is a Symbol, a String, or anything that answers
+// #to_str.
+// ⚠ ANYTHING ELSE IS A TypeError, and four arms each turned it into the
+//   EMPTY key instead. `Thread.current[Object.new]` did not refuse: it read
+//   and wrote a real slot -- ONE slot, shared by every non-coercible key in
+//   the program -- and answered nil. Six of core/thread's rows are the same
+//   example ("converts a key that is neither String nor Symbol with #to_str")
+//   asked of six of the seven method names those four arms carry, which is
+//   what one rule copied four times looks like from outside.
+// Thread#keys / Thread#thread_variables: the names that have been set on this
+// thread.
+// ⚠ THE NAMES ARE RECORDED AS THEY ARE WRITTEN, in a second structure, and
+//   that is a cost worth naming: the slots live in the ivar map under
+//   "<id>@__tl_<name>" and a Map here cannot be enumerated, so without this
+//   list the two methods can only answer []. The list is "|a|b|c|" -- the
+//   delimiters on BOTH sides of every name, so a containment test for
+//   "|a|" cannot be satisfied by a longer name that merely starts with it.
+and tl_note_key = fn ivars -> fn (k: str) -> fn (kk: str) ->
+  let cur = (match (if map_has ivars (k ++ "@__tlk") then map_get ivars (k ++ "@__tlk") else VNil) with
+             | VStr h9 -> sget h9 | _ -> "") in
+  if str_index_of cur ("|" ++ kk ++ "|") >= 0 then ()
+  else map_set ivars (k ++ "@__tlk")
+         (mkstr (if str_eq cur "" then "|" ++ kk ++ "|" else cur ++ kk ++ "|"))
+
+and tl_keys_split = fn (s9: str) -> fn (i: int) -> fn (st: int) -> fn (acc: Val list) ->
+  if i >= str_len s9 then rev_vals acc
+  else if str_eq (char_at s9 i) "|" then
+    (if i > st then tl_keys_split s9 (i + 1) (i + 1) (Cons (VSym (substring s9 st i), acc))
+     else tl_keys_split s9 (i + 1) (i + 1) acc)
+  else tl_keys_split s9 (i + 1) st acc
+
+and thread_key_of = fn env -> fn world -> fn (kv: Val) ->
+  match kv with
+  | VSym sy -> sy
+  | VStr h9 -> sget h9
+  | _ ->
+    (let c9 = dispatch_cls_of world kv in
+     if has_meth world c9 "to_str" then
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        match invoke_val_c env world nb9 kv "to_str" Nil false with
+        | VStr h9 -> sget h9
+        | o9 -> (let _ = raise_exc world "TypeError"
+                           ("can't convert " ++ class_name kv ++ " to String ("
+                            ++ class_name kv ++ "#to_str gives " ++ class_name o9 ++ ")") in ""))
+     else (let _ = raise_exc world "TypeError"
+                     (inspect kv ++ " is not a symbol nor a string") in ""))
+
 and path_arg_err = fn world -> fn (args: Val list) -> fn (lo: int) -> fn (hi: int) ->
   let n9 = vlen args in
   if n9 < lo || n9 > hi then
@@ -30145,15 +30337,37 @@ and file_join_parts = fn (ps: str list) -> fn (acc: str) ->
   | Nil -> acc
   | Cons (p9, rest) -> file_join_parts_go rest p9
 
+// ⚠ DROPPING ONE SLASH FROM EACH SIDE AND ADDING ONE BACK IS NOT THE RULE.
+//   File.join("usr//", "//bin") answered "usr///bin" and ruby answers
+//   "usr//bin"; File.join("//", "//") answered "///" and ruby answers "//".
+//   Ruby never inserts a separator that is already there and never lengthens
+//   a run that the caller wrote. When BOTH sides carry one, the RIGHT side's
+//   run wins and the left's whole trailing run goes -- the spec's own name for
+//   the example is "prefers the separator of the right part". When only one
+//   side carries one, the two are concatenated untouched; only when NEITHER
+//   does is a "/" put between them, which is why File.join("", "a") is "/a"
+//   and File.join("a", "") is "a/".
+//   ⚠ THE FIRST VERSION OF THIS KEPT THE LEFT AND DROPPED THE RIGHT, and a
+//   probe of ten argument pairs against the reference did not see it. The two
+//   rules give the SAME answer whenever either run is a single "/", which
+//   every pair in that probe was: "usr/" + "//bin" is "usr//bin" read either
+//   way. They part only when both runs are longer than one, and the spec has
+//   exactly that pair on the next line -- File.join("usr//", "/bin"), which
+//   is "usr/bin" and which the left-preferring rule makes "usr//bin".
 and file_join_parts_go = fn (ps: str list) -> fn (acc: str) ->
   match ps with
   | Nil -> acc
   | Cons (p9, rest) ->
-    let a9 = (if str_len acc > 0 && str_eq (char_at acc (str_len acc - 1)) "/"
-              then substring acc 0 (str_len acc - 1) else acc) in
-    let b9 = (if str_len p9 > 0 && str_eq (char_at p9 0) "/"
-              then substring p9 1 (str_len p9) else p9) in
-    file_join_parts_go rest (a9 ++ "/" ++ b9)
+    let ends = str_len acc > 0 && str_eq (char_at acc (str_len acc - 1)) "/" in
+    let starts = str_len p9 > 0 && str_eq (char_at p9 0) "/" in
+    file_join_parts_go rest
+      (if ends && starts then drop_trail_slash acc (str_len acc - 1) ++ p9
+       else if ends || starts then acc ++ p9
+       else acc ++ "/" ++ p9)
+
+and drop_trail_slash = fn (a9: str) -> fn (i: int) ->
+  if i >= 0 && str_eq (char_at a9 i) "/" then drop_trail_slash a9 (i - 1)
+  else substring a9 0 (i + 1)
 
 and vis_names_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   let (meths0, _, _, _) = world in

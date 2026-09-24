@@ -3399,8 +3399,25 @@ walls, in the order a new extern hits them:
 
 What survives all three is a function whose parameters are `const char*` and
 plain `int` and whose result is a plain int. That is why `File.rename` and
-`File.link` are here and `File.chmod`, `File.chown`, `File.truncate`,
-`File.readlink`, `File.umask` and `File.mkfifo` are not.
+`File.link` are here and `File.chown`, `File.readlink`, `File.umask` and
+`File.mkfifo` are not.
+
+⚠ **TWO OF THAT LIST ARE NOW IMPLEMENTED WITHOUT THE SYSCALL, and what they
+cost is worth naming.** The table says which *externs* are possible, not which
+*methods* are -- a distinction the earlier version of this list blurred by
+putting method names in it.
+
+* `File.chmod` / `File#chmod` shell out (`run "chmod 0644 <path>"`). One
+  subprocess per path, and `run` is a constant 127 in the Wasm build, so
+  neither works there.
+* `File.truncate` / `File#truncate` read the file and write it back at the
+  new length, NUL-padding when the length is larger. It is not atomic, it
+  needs the whole file in memory, and it only means anything for a regular
+  file -- `ftruncate` on a device or a pipe is a different operation. For the
+  files a Ruby program truncates it is the same answer.
+
+Neither is a reason not to build the `file_stat`-shaped host builtin below;
+both are reasons the builtin is worth less than the table alone suggests.
 
 ⚠ **The walls are not alternatives, and the first reading of this table got that
 wrong.** "chmod is only behind the header" suggested a one-line fix -- emit
