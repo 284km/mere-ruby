@@ -10208,26 +10208,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // `super` still reaches (see the singleton branch of ESuper).
     else if (str_len name == 3 && str_eq name "new") && has_meth world ("(sng:" ++ c ++ ")") name then
       invoke world noblk recv ("(sng:" ++ c ++ ")") name args
-    else if str_eq c "Class" && (str_len name == 3 && str_eq name "new") then
-      (let (meths2, sup2, ocls2, iv2) = world in
-       let anon = fresh_anon "AnonClass_" in
-       // ⚠ A non-Class superclass was IGNORED -- `Class.new(1)` answered a
-       //   fresh class with the argument dropped, where ruby refuses. Silently
-       //   discarding an argument is the permissive direction.
-       let _ = (match args with
-                | Nil -> ()
-                | Cons (VClass sc, _) -> set_sup sup2 anon sc
-                | Cons (v9, _) -> (let _ = raise_exc world "TypeError"
-                                     ("superclass must be an instance of Class (given "
-                                      ++ for_recv_cls world (class_name v9) ++ ")") in ())) in
-       VClass anon)
-    // Module.new — an anonymous module (registered in `modules` so #class is
-    // Module); its constants/methods live under the fresh name's namespace.
-    else if str_eq c "Module" && (str_len name == 3 && str_eq name "new") then
-      (let (meths2, sup2, ocls2, iv2) = world in
-       let anon = fresh_anon "AnonModule_" in
-       let _ = map_set modules anon VNil in
-       VClass anon)
+    // Class.new / Module.new with no block. The block form is in the block
+    // dispatcher and builds the same thing through make_anon_cls.
+    else if (str_eq c "Class" || str_eq c "Module") && (str_len name == 3 && str_eq name "new") then
+      make_anon_cls world c args
     else if str_eq c "Range" && (str_len name == 3 && str_eq name "new") then
       // Range.new(lo, hi[, excl]) -- the bounds are kept as given, nil included.
       let lo = (match args with Cons (a, _) -> a | _ -> VNil) in
@@ -11892,10 +11876,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // ...and the seven NOTIFICATION hooks, whose default is to do nothing and
     // answer nil. They exist so that a `super` in an override lands, and so
     // that `Module.private_instance_methods` can honestly name them.
-    else if (str_len name == 8 && str_eq name "included") || (str_len name == 8 && str_eq name "extended")
+    // ⚠ THE DEFAULT ONLY APPLIES WHEN THE MODULE HAS NOT OVERRIDDEN IT. A
+    //   dispatcher arm wins over a user `def self.`, so `Module.new { def
+    //   self.method_added(n); ... end; def q; end }` installed the override,
+    //   answered true to respond_to?, LISTED it in
+    //   singleton_class.instance_methods -- and ran this `VNil` instead, for
+    //   the hook fired internally AND for an explicit `M.send(:method_added,
+    //   :x)`. A class did not have the problem, which is why the symptom read
+    //   as "Module.new drops its block" rather than as a shadowed override.
+    //   The guard is the one `name` uses two hundred lines above.
+    else if ((str_len name == 8 && str_eq name "included") || (str_len name == 8 && str_eq name "extended")
             || (str_len name == 9 && str_eq name "prepended") || (str_len name == 11 && str_eq name "const_added")
             || (str_len name == 12 && str_eq name "method_added") || (str_len name == 14 && str_eq name "method_removed")
-            || (str_len name == 16 && str_eq name "method_undefined") then
+            || (str_len name == 16 && str_eq name "method_undefined"))
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       VNil
     // `private(*names)` and friends as a genuine call. The statement parser
     // handles the bare and `:sym`-list forms; this is the parenthesised one,
@@ -13826,18 +13820,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (let stop = (if pos + len > str_len content then str_len content else pos + len) in
              let _ = map_set ivars (k ++ "@__f_pos") (VInt stop) in
              mkstr (substring content pos stop)))
+       // ⚠ A WRITE MOVES THE POSITION, and this one did not touch it: #pos
+       //   after `f.write("abc")` answered 0, #eof? was false on a handle
+       //   sitting at the end, and the buffer had no idea WHERE it belonged.
+       //   file_write_at records both -- the offset the buffer starts at
+       //   (only when it leaves empty, so a run of writes keeps one offset)
+       //   and the position after it -- so flush can splice instead of
+       //   append. One function, because write/print/<</puts are four doors
+       //   into it and three of them used to get this wrong silently.
        else if (str_len name == 5 && str_eq name "write") || (str_len name == 5 && str_eq name "print") || (str_len name == 2 && str_eq name "<<") then
          (let piece = io_join_go args "" in
-          let cur = (match map_get ivars (k ++ "@__f_buf") with VStr h -> sget h | _ -> "") in
-          let _ = map_set ivars (k ++ "@__f_buf") (mkstr (cur ++ piece)) in
+          let _ = file_write_at world id piece in
           let _ = (if map_has ivars (k ++ "@__f_sync") then (let _ = file_flush_obj world id in ()) else ()) in
           if (str_len name == 2 && str_eq name "<<") then recv
           else if (str_len name == 5 && str_eq name "write") then VInt (str_len piece) else VNil)
        else if (str_len name == 4 && str_eq name "puts") then
-         (let piece = file_puts_str args "" in
-          let cur = (match map_get ivars (k ++ "@__f_buf") with VStr h -> sget h | _ -> "") in
-          let _ = map_set ivars (k ++ "@__f_buf") (mkstr (cur ++ piece)) in
-          VNil)
+         (let _ = file_write_at world id (file_puts_str args "") in VNil)
        else if (str_len name == 4 && str_eq name "gets") || (str_len name == 8 && str_eq name "readline") then
          (let content = (if file_exists path then read_file path else "") in
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
@@ -13866,15 +13864,33 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    | VStr h9 -> (match pv9 with VStr n9 -> senc_set n9 (senc_get h9) | _ -> ())
                    | _ -> ()) in
           pv9)
-       else if (str_len name == 6 && str_eq name "rewind") then (let _ = map_set ivars (k ++ "@__f_pos") (VInt 0) in VInt 0)
+       // ⚠ MOVING THE POSITION FLUSHES FIRST. The buffer is tagged with the
+       //   offset it started at, so moving the position out from under it
+       //   would write the pending bytes at the NEW place -- `f.write("ab");
+       //   f.rewind; f.read` would put "ab" at 0 twice over.
+       else if (str_len name == 6 && str_eq name "rewind") then
+         (let _ = file_flush_obj world id in
+          let _ = map_set ivars (k ++ "@__f_pos") (VInt 0) in
+          let _ = map_set ivars (k ++ "@__f_wpos") (VInt 0) in VInt 0)
        // the read position this arm already keeps in @__f_pos -- #rewind and
        // #eof? both use it, and it simply had no reader or writer.
        else if (str_len name == 3 && str_eq name "pos") || (str_len name == 4 && str_eq name "tell") then
          (match map_get ivars (k ++ "@__f_pos") with VInt n -> VInt n | _ -> VInt 0)
+       // ...and #seek's SECOND argument is the WHENCE, which this ignored:
+       // SEEK_CUR (1) and SEEK_END (2) both landed at the absolute offset, so
+       // `f.seek(-5, IO::SEEK_END)` went to a negative position and read "".
        else if (str_len name == 4 && str_eq name "pos=") || (str_len name == 4 && str_eq name "seek") then
-         (match args with
-          | Cons (VInt n, _) -> (let _ = map_set ivars (k ++ "@__f_pos") (VInt n) in
-                                 if (str_len name == 4 && str_eq name "seek") then VInt 0 else VInt n)
+         (let _ = file_flush_obj world id in
+          match args with
+          | Cons (VInt n, rest9) ->
+            (let wh9 = (match rest9 with Cons (VInt w, _) -> w | _ -> 0) in
+             let cur9 = (match (if map_has ivars (k ++ "@__f_pos") then map_get ivars (k ++ "@__f_pos") else VNil) with
+                         | VInt c -> c | _ -> 0) in
+             let sz9 = (if file_exists path then str_len (read_file path) else 0) in
+             let np9 = (if wh9 == 1 then cur9 + n else if wh9 == 2 then sz9 + n else n) in
+             let _ = map_set ivars (k ++ "@__f_pos") (VInt np9) in
+             let _ = map_set ivars (k ++ "@__f_wpos") (VInt np9) in
+             if (str_len name == 4 && str_eq name "seek") then VInt 0 else VInt np9)
           | _ -> VInt 0)
        else if (str_len name == 4 && str_eq name "eof?") || (str_len name == 3 && str_eq name "eof") then
          (let content = (if file_exists path then read_file path else "") in
@@ -17345,47 +17361,37 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
              let _ = flow_value (register_class_blk world anon bb3 bcref e3) in
              VClass anon)
           | other -> other)
-       else if str_eq c "Class" && (str_len name == 3 && str_eq name "new") then
-         (let (meths2, sup2, ocls2, iv2) = world in
-          let anon = fresh_anon "AnonClass_" in
-          let _ = (match args with Cons (VClass sc, _) -> set_sup sup2 anon sc | _ -> ()) in
-          let (h3, ps3, bb3, e3) = newblk in
-          // a block is not a constant scope: classes/constants defined in it
-          // go to the block's LEXICAL scope (its captured cref; "" = toplevel).
-          let bcref = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
-          let _ = flow_value (register_class_blk world anon bb3 bcref e3) in
-          VClass anon)
-       // Module.new { } — an anonymous module whose body is the block. Run the
-       // block as a closure (outer locals stay visible/assignable) with self
-       // rebound to the module, so top-level defs land on it (SDef keys off
-       // self's class) and refine/using inside see the module as self.
-       else if str_eq c "Module" && (str_len name == 3 && str_eq name "new") then
-         (let (meths2, sup2, ocls2, iv2) = world in
-          let anon = fresh_anon "AnonModule_" in
-          let _ = map_set modules anon VNil in
-          let (h3, ps3, bb3, e3) = newblk in
-          let saved_self = if lv_has e3 "self" then lv_get e3 "self" else VNil in
-          let _ = lv_set e3 "self" (VClass anon) in
-          // ...and the DEFINEE with it. This block runs in the SHARED env, so
-          // an enclosing instance_eval's definee was still in force and every
-          // `def hello` in a `Module.new do .. end` written inside a spec
-          // example became a singleton method of the example object.
-          let saved_dr = if lv_has e3 "__definee_recv" then lv_get e3 "__definee_recv" else VNil in
-          let saved_dc = if lv_has e3 "__definee_cls" then lv_get e3 "__definee_cls" else VNil in
-          let _ = lv_set e3 "__definee_recv" VNil in
-          let _ = lv_set e3 "__definee_cls" VNil in
-          let saved_cref = cur_lex () in
-          let _ = set_lex anon in
-          // a `using` inside the block is scoped to it (like register_class):
-          // snapshot/restore ref_active so refinements don't leak past the body.
-          let saved_ref = map_copy ref_active in
-          let _ = flow_value (run_block world blk newblk (Cons (VClass anon, Nil))) in
-          let _ = restore_ref_active saved_ref in
-          let _ = set_lex saved_cref in
-          let _ = lv_set e3 "__definee_recv" saved_dr in
-          let _ = lv_set e3 "__definee_cls" saved_dc in
-          let _ = lv_set e3 "self" saved_self in
-          VClass anon)
+       // Class.new { } / Module.new { } -- the block IS the new class's body.
+       // ⚠ THE TWO WERE NOT THE SAME CODE, and only one of them was right.
+       //   Class.new ran its block through register_class_blk (a class body:
+       //   `attr_accessor`, `private`, `module_function` and the visibility
+       //   MODE all work) and Module.new ran it through run_block with self
+       //   rebound (an ordinary block: only `def` landed, because SDef keys
+       //   off self). So `Module.new { attr_accessor :x }` defined nothing,
+       //   `Module.new { private; def z; end }` left z public, and
+       //   `Module.new { def z; end; module_function :z }` never promoted it
+       //   -- while the very same body inside `m.module_eval { }` worked,
+       //   which is what made the difference so hard to see from the record.
+       //   One arm now, and the self/definee/cref/refinement bookkeeping the
+       //   Module branch spelled out by hand is what register_class_blk does.
+       else if (str_eq c "Class" || str_eq c "Module") && (str_len name == 3 && str_eq name "new") then
+         (match make_anon_cls world c args with
+          | VClass anon9 ->
+            (let (h3, ps3, bb3, e3) = newblk in
+             // a block is not a constant scope: classes/constants defined in
+             // it go to the block's LEXICAL scope (its captured cref;
+             // "" = toplevel).
+             let bcref = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s9 -> sget s9 | _ -> "") else "") in
+             // ...and `Class.new { |c| }` is handed the new class, which
+             // neither branch used to bind. Bound in a CHILD of the block's
+             // env, as module_eval does, so the outer scope keeps its own.
+             let e3b = (match ps3 with
+                        | Nil -> e3
+                        | Cons (p3, _) -> (let ch3 = lv_child e3 in
+                                           let _ = lv_set ch3 p3 (VClass anon9) in ch3)) in
+             let _ = flow_value (register_class_blk world anon9 bb3 bcref e3b) in
+             VClass anon9)
+          | other9 -> other9)
        // class_exec / module_exec differ from _eval only in taking arguments
        // (and never a string); with a block body the class-body treatment is
        // the same, and mere-ruby's blocks already ignore extra arguments.
@@ -19039,6 +19045,25 @@ and bm_owner_of = fn world -> fn (recv: Val) -> fn (nm: str) ->
      //   false for two names of one method. Calling them always worked; only
      //   reflection reported the wrong definition.
      else if str_eq a "" && builtin_cls_has c2 (canon_alias c2 nm) then sng
+     // ⚠ MODULE'S OWN INSTANCE METHODS ARE MODULE'S, not the receiver's. Every
+     //   class and module answers `instance_method`, `const_get`, `ancestors`
+     //   and the rest because Module defines them, and this fell through to
+     //   the Kernel arm or to "" -- so `String.method(:instance_method).owner`
+     //   was String where ruby says Module, and #arity read -1 because
+     //   builtin_arity_of was handed "String#instance_method", a key no table
+     //   has. It sits AFTER the class's own class methods (which shadow) and
+     //   BEFORE Kernel (whose #puts a class also answers, and which ruby does
+     //   report as Kernel's).
+     //   ⚠ ...and the owner is MODULE even for a Class receiver, except for the
+     //   five names Class ADDS. Keying it on "is the receiver a module" made
+     //   `String.method(:instance_method).owner` answer Class, which is where
+     //   the method is REACHED and not where it is defined -- ruby says
+     //   Module for a class and a module alike.
+     else if str_eq a "" && is_module_method nm then
+       (if (str_len nm == 3 && str_eq nm "new") || (str_len nm == 8 && str_eq nm "allocate")
+           || (str_len nm == 10 && str_eq nm "superclass") || (str_len nm == 10 && str_eq nm "subclasses")
+           || (str_len nm == 15 && str_eq nm "attached_object")
+        then "Class" else "Module")
      else if str_eq a "" && (is_kernel_pub_instance nm || is_kernel_builtin nm) then "Kernel"
      else a)
   | other ->
@@ -27512,6 +27537,42 @@ and fnm_extglob = fn (args: Val list) ->
 // directions are what ftruncate(2) does and core/file/truncate_spec checks
 // each of them; growing is the one a read-modify-write is easy to get wrong,
 // because "write what I read" leaves a short file short.
+// Buffer a write and move the position by it. The buffer's own offset is
+// recorded only when the buffer leaves empty, so a run of writes with no seek
+// between them shares one offset and one splice.
+// An anonymous Class or Module. Both `Class.new` doors call this -- the value
+// form in invoke_val_c and the block form in the block dispatcher -- so the
+// superclass refusal and the `modules` registration cannot drift apart.
+// ⚠ A non-Class superclass is REFUSED. `Class.new(1)` used to answer a fresh
+//   class with the argument dropped, and silently discarding an argument is
+//   the permissive direction.
+and make_anon_cls = fn world -> fn (c: str) -> fn (args: Val list) ->
+  let (meths2, sup2, ocls2, iv2) = world in
+  if str_eq c "Module" then
+    (let anon = fresh_anon "AnonModule_" in
+     let _ = map_set modules anon VNil in
+     VClass anon)
+  else
+    (let anon = fresh_anon "AnonClass_" in
+     let _ = (match args with
+              | Nil -> ()
+              | Cons (VClass sc, _) -> set_sup sup2 anon sc
+              | Cons (v9, _) -> (let _ = raise_exc world "TypeError"
+                                   ("superclass must be an instance of Class (given "
+                                    ++ for_recv_cls world (class_name v9) ++ ")") in ())) in
+     VClass anon)
+
+and file_write_at = fn world -> fn (id: int) -> fn (piece: str) ->
+  let (_, _, _, iv9) = world in
+  let k9 = str_of_int id in
+  let cur9 = (match (if map_has iv9 (k9 ++ "@__f_buf") then map_get iv9 (k9 ++ "@__f_buf") else VNil) with
+              | VStr h9 -> sget h9 | _ -> "") in
+  let pos9 = (match (if map_has iv9 (k9 ++ "@__f_pos") then map_get iv9 (k9 ++ "@__f_pos") else VNil) with
+              | VInt n9 -> n9 | _ -> 0) in
+  let _ = (if str_eq cur9 "" then map_set iv9 (k9 ++ "@__f_wpos") (VInt pos9) else ()) in
+  let _ = map_set iv9 (k9 ++ "@__f_buf") (mkstr (cur9 ++ piece)) in
+  map_set iv9 (k9 ++ "@__f_pos") (VInt (pos9 + str_len piece))
+
 and file_truncate = fn world -> fn (path: str) -> fn (len: int) ->
   if (if file_exists path then false else true) then
     raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_file_s_truncate - " ++ path)
