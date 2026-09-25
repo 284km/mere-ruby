@@ -780,23 +780,378 @@ let core_prelude_d =
   // `Encoding::Converter.new(src, dst)` built a bare object that answered no
   // method of its own. This is the part a caller reaches first -- the two
   // encodings, #inspect, and #convert through String#encode, which already
-  // knows the conversions. The primitive stream API (primitive_convert,
-  // putback, last_error) is still absent, and says so by NoMethodError.
+  // knows the conversions. The stream API (primitive_convert, putback,
+  // last_error, primitive_errinfo, finish) and the path search are here too;
+  // a broken sequence is found by the transcoders' own rules (__bad_seq) so
+  // the errors carry ruby's bytes, stages and messages.
   "class Encoding::Converter\n" ++
-  "  def initialize(src, dst, *opts)\n" ++
-  "    begin\n" ++
-  "      @source_encoding = src.is_a?(Encoding) ? src : Encoding.find(src.to_str)\n" ++
-  "      @destination_encoding = dst.is_a?(Encoding) ? dst : Encoding.find(dst.to_str)\n" ++
-  "    rescue ArgumentError\n" ++
-  "      raise Encoding::ConverterNotFoundError, 'code converter not found (' + src.to_s + ' to ' + dst.to_s + ')'\n" ++
+  "  INVALID_MASK = 15\n" ++
+  "  INVALID_REPLACE = 2\n" ++
+  "  UNDEF_MASK = 240\n" ++
+  "  UNDEF_REPLACE = 32\n" ++
+  "  UNDEF_HEX_CHARREF = 48\n" ++
+  "  UNIVERSAL_NEWLINE_DECORATOR = 256\n" ++
+  "  CRLF_NEWLINE_DECORATOR = 4096\n" ++
+  "  CR_NEWLINE_DECORATOR = 8192\n" ++
+  "  LF_NEWLINE_DECORATOR = 16384\n" ++
+  "  XML_TEXT_DECORATOR = 32768\n" ++
+  "  XML_ATTR_CONTENT_DECORATOR = 65536\n" ++
+  "  PARTIAL_INPUT = 131072\n" ++
+  "  AFTER_OUTPUT = 262144\n" ++
+  "  XML_ATTR_QUOTE_DECORATOR = 1048576\n" ++
+  "\n" ++
+  "  # An encoding argument: an Encoding, or a name through #to_str. The name\n" ++
+  "  # as given is kept for the \"code converter not found\" message.\n" ++
+  "  def self.__enc(e)\n" ++
+  "    return [e, e.name] if Encoding === e\n" ++
+  "    s = String === e ? e : e.to_str\n" ++
+  "    [(Encoding.find(s) rescue nil), s]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # The transcoding path, as ruby builds it: one step when either side is\n" ++
+  "  # UTF-8, two through UTF-8 otherwise, three for ISO-2022-JP (it is\n" ++
+  "  # stateful, reached through EUC-JP and its stateless form). A newline\n" ++
+  "  # decorator is named at the end (universal_newline at the front).\n" ++
+  "  def self.__path(src, dst, opts)\n" ++
+  "    s, sn = __enc(src)\n" ++
+  "    d, dn = __enc(dst)\n" ++
+  "    nf = \"code converter not found (\" + (s ? s.name : sn) + \" to \" + (d ? d.name : dn) + \")\"\n" ++
+  "    raise Encoding::ConverterNotFoundError, nf if s.nil? || d.nil? || s == d\n" ++
+  "    raise Encoding::ConverterNotFoundError, nf if s.name == \"Emacs-Mule\" || d.name == \"Emacs-Mule\"\n" ++
+  "    u = Encoding::UTF_8\n" ++
+  "    pairs =\n" ++
+  "      if d.name == \"ISO-2022-JP\"\n" ++
+  "        e = Encoding::EUC_JP\n" ++
+  "        st = Encoding.find(\"stateless-ISO-2022-JP\")\n" ++
+  "        (s == u ? [] : [[s, u]]) + [[u, e], [e, st], [st, d]]\n" ++
+  "      elsif s == u || d == u || (s.name == \"EUC-JP\" && d.name == \"Shift_JIS\") || (s.name == \"Shift_JIS\" && d.name == \"EUC-JP\")\n" ++
+  "        [[s, d]]\n" ++
+  "      else\n" ++
+  "        [[s, u], [u, d]]\n" ++
+  "      end\n" ++
+  "    opts ||= \{}\n" ++
+  "    pairs.unshift(\"universal_newline\") if opts[:universal_newline]\n" ++
+  "    pairs << \"crlf_newline\" if opts[:crlf_newline]\n" ++
+  "    pairs << \"cr_newline\" if opts[:cr_newline]\n" ++
+  "    pairs\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.search_convpath(src, dst, **opts)\n" ++
+  "    __path(src, dst, opts)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.asciicompat_encoding(enc)\n" ++
+  "    e = Encoding === enc ? enc : (Encoding.find(String === enc ? enc : enc.to_str) rescue nil)\n" ++
+  "    return nil if e.nil?\n" ++
+  "    case e.name\n" ++
+  "    when \"UTF-16BE\", \"UTF-16LE\", \"UTF-32BE\", \"UTF-32LE\", \"UTF-16\", \"UTF-32\" then Encoding::UTF_8\n" ++
+  "    when \"ISO-2022-JP\" then Encoding.find(\"stateless-ISO-2022-JP\")\n" ++
+  "    else nil\n" ++
   "    end\n" ++
   "  end\n" ++
-  "  attr_reader :source_encoding, :destination_encoding\n" ++
-  "  def inspect\n" ++
-  "    '#<Encoding::Converter: ' + @source_encoding.name + ' to ' + @destination_encoding.name + '>'\n" ++
+  "\n" ++
+  "  def initialize(src, dst, opts = nil, **kw)\n" ++
+  "    opts = kw if opts.nil? || Integer === opts\n" ++
+  "    @convpath = Encoding::Converter.__path(src, dst, opts)\n" ++
+  "    steps = @convpath.select \{ |x| Array === x }\n" ++
+  "    @source_encoding = steps.first[0]\n" ++
+  "    @destination_encoding = steps.last[1]\n" ++
+  "    @invalid_replace = opts[:invalid] == :replace\n" ++
+  "    @undef_replace = opts[:undef] == :replace\n" ++
+  "    if opts.key?(:replace) && !opts[:replace].nil?\n" ++
+  "      r = opts[:replace]\n" ++
+  "      r = r.to_str unless String === r || !r.respond_to?(:to_str)\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + (r.nil? ? \"nil\" : r.class.to_s) + \" into String\" unless String === r\n" ++
+  "      @replacement = r\n" ++
+  "    else\n" ++
+  "      @replacement = __default_replacement\n" ++
+  "    end\n" ++
+  "    @__errinfo = [:source_buffer_empty, nil, nil, nil, nil]\n" ++
+  "    @__last_error = nil\n" ++
+  "    @__pending = \"\".b\n" ++
+  "    @__putback = \"\".b\n" ++
+  "    @__outbuf = \"\".b\n" ++
+  "    @__finished = false\n" ++
   "  end\n" ++
+  "  attr_reader :source_encoding, :destination_encoding, :replacement, :convpath\n" ++
+  "\n" ++
+  "  def __default_replacement\n" ++
+  "    @destination_encoding.name.start_with?(\"UTF-\") ? \"�\" : \"?\".encode(\"US-ASCII\")\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def replacement=(r)\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + (r.nil? ? \"nil\" : r.class.to_s) + \" into String\" unless String === r\n" ++
+  "    r.encode(@destination_encoding) unless r.ascii_only?\n" ++
+  "    @replacement = r\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def inspect\n" ++
+  "    \"#<Encoding::Converter: \" + @source_encoding.name + \" to \" + @destination_encoding.name + \">\"\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def last_error = @__last_error\n" ++
+  "  def primitive_errinfo = @__errinfo\n" ++
+  "\n" ++
+  "  def putback(n = nil)\n" ++
+  "    b = @__putback\n" ++
+  "    n = b.bytesize if n.nil? || n > b.bytesize\n" ++
+  "    out = b.byteslice(b.bytesize - n, n)\n" ++
+  "    @__putback = b.byteslice(0, b.bytesize - n)\n" ++
+  "    out.force_encoding(@source_encoding)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # The first broken sequence in `bytes` read as `enc`: [offset, error\n" ++
+  "  # bytes, bytes to read again, incomplete?], or nil. The rules are the\n" ++
+  "  # transcoders': a lead byte and the continuations that fit are the error,\n" ++
+  "  # the byte that did not fit is read again, and a sequence cut off by the\n" ++
+  "  # end of the input is incomplete.\n" ++
+  "  def self.__bad_seq(bytes, enc)\n" ++
+  "    a = bytes.bytes\n" ++
+  "    n = a.size\n" ++
+  "    i = 0\n" ++
+  "    name = String === enc ? enc : enc.name\n" ++
+  "    if name == \"UTF-8\"\n" ++
+  "      while i < n\n" ++
+  "        b = a[i]\n" ++
+  "        if b < 0x80 then i += 1; next end\n" ++
+  "        need, lo, hi =\n" ++
+  "          if b >= 0xC2 && b <= 0xDF then [1, 0x80, 0xBF]\n" ++
+  "          elsif b == 0xE0 then [2, 0xA0, 0xBF]\n" ++
+  "          elsif b == 0xED then [2, 0x80, 0x9F]\n" ++
+  "          elsif b >= 0xE1 && b <= 0xEF then [2, 0x80, 0xBF]\n" ++
+  "          elsif b == 0xF0 then [3, 0x90, 0xBF]\n" ++
+  "          elsif b >= 0xF1 && b <= 0xF3 then [3, 0x80, 0xBF]\n" ++
+  "          elsif b == 0xF4 then [3, 0x80, 0x8F]\n" ++
+  "          else [0, 0, 0]\n" ++
+  "          end\n" ++
+  "        return [i, bytes.byteslice(i, 1), \"\".b, false] if need == 0\n" ++
+  "        k = 1\n" ++
+  "        while k <= need\n" ++
+  "          return [i, bytes.byteslice(i, k), \"\".b, true] if i + k >= n\n" ++
+  "          c = a[i + k]\n" ++
+  "          ok = k == 1 ? (c >= lo && c <= hi) : (c >= 0x80 && c <= 0xBF)\n" ++
+  "          return [i, bytes.byteslice(i, k), bytes.byteslice(i + k, 1), false] unless ok\n" ++
+  "          k += 1\n" ++
+  "        end\n" ++
+  "        i += need + 1\n" ++
+  "      end\n" ++
+  "    elsif name == \"US-ASCII\"\n" ++
+  "      while i < n\n" ++
+  "        return [i, bytes.byteslice(i, 1), \"\".b, false] if a[i] >= 0x80\n" ++
+  "        i += 1\n" ++
+  "      end\n" ++
+  "    elsif name == \"EUC-JP\"\n" ++
+  "      while i < n\n" ++
+  "        b = a[i]\n" ++
+  "        if b < 0x80 then i += 1; next end\n" ++
+  "        rng = b == 0x8E ? [0xA1, 0xDF] : ((b >= 0xA1 && b <= 0xFE) || b == 0x8F ? [0xA1, 0xFE] : nil)\n" ++
+  "        return [i, bytes.byteslice(i, 1), \"\".b, false] if rng.nil?\n" ++
+  "        need = b == 0x8F ? 2 : 1\n" ++
+  "        k = 1\n" ++
+  "        while k <= need\n" ++
+  "          return [i, bytes.byteslice(i, k), \"\".b, true] if i + k >= n\n" ++
+  "          c = a[i + k]\n" ++
+  "          return [i, bytes.byteslice(i, k), bytes.byteslice(i + k, 1), false] unless c >= rng[0] && c <= rng[1]\n" ++
+  "          rng = [0xA1, 0xFE]\n" ++
+  "          k += 1\n" ++
+  "        end\n" ++
+  "        i += need + 1\n" ++
+  "      end\n" ++
+  "    elsif name == \"UTF-16LE\" || name == \"UTF-16BE\"\n" ++
+  "      le = name == \"UTF-16LE\"\n" ++
+  "      while i < n\n" ++
+  "        return [i, bytes.byteslice(i, n - i), \"\".b, true] if i + 1 >= n\n" ++
+  "        u = le ? a[i] | (a[i + 1] << 8) : (a[i] << 8) | a[i + 1]\n" ++
+  "        if u >= 0xD800 && u <= 0xDBFF\n" ++
+  "          return [i, bytes.byteslice(i, 2), \"\".b, true] if i + 3 >= n\n" ++
+  "          v = le ? a[i + 2] | (a[i + 3] << 8) : (a[i + 2] << 8) | a[i + 3]\n" ++
+  "          return [i, bytes.byteslice(i, 2), bytes.byteslice(i + 2, 2), false] unless v >= 0xDC00 && v <= 0xDFFF\n" ++
+  "          i += 4\n" ++
+  "        elsif u >= 0xDC00 && u <= 0xDFFF\n" ++
+  "          return [i, bytes.byteslice(i, 2), \"\".b, false]\n" ++
+  "        else\n" ++
+  "          i += 2\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__dump(b)\n" ++
+  "    s = +\"\"\n" ++
+  "    b.each_byte \{ |c| s << (c >= 0x20 && c < 0x7F && c != 0x22 && c != 0x5C ? c.chr : format(\"\\\\x%02X\", c)) }\n" ++
+  "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # The exception for a broken sequence, and what #primitive_errinfo says\n" ++
+  "  # about it. `sn` is the source; `dn` the destination of the FIRST step,\n" ++
+  "  # which is where a broken sequence is found.\n" ++
+  "  def self.__invalid_exc(bad, sn, dn)\n" ++
+  "    _, err, again, incomplete = bad\n" ++
+  "    msg = if incomplete\n" ++
+  "            \"incomplete \\\"\" + __dump(err) + \"\\\" on \" + sn\n" ++
+  "          elsif again.empty?\n" ++
+  "            \"\\\"\" + __dump(err) + \"\\\" on \" + sn\n" ++
+  "          else\n" ++
+  "            \"\\\"\" + __dump(err) + \"\\\" followed by \\\"\" + __dump(again) + \"\\\" on \" + sn\n" ++
+  "          end\n" ++
+  "    e = Encoding::InvalidByteSequenceError.new(msg)\n" ++
+  "    \{ :@source_encoding_name => sn, :@destination_encoding_name => dn, :@error_bytes => err.b,\n" ++
+  "      :@readagain_bytes => (again.empty? ? nil : again.b), :@incomplete_input => incomplete }.each \{ |k, v| e.instance_variable_set(k, v) }\n" ++
+  "    [e, [incomplete ? :incomplete_input : :invalid_byte_sequence, sn, dn, err.b, again.b]]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # String#encode's refusal of a broken sequence, raised here so it carries\n" ++
+  "  # the same bytes, stage and message as a converter's. Returns nil when the\n" ++
+  "  # sequence is broken in a way these rules do not know.\n" ++
+  "  def self.__raise_invalid(bytes, from, to)\n" ++
+  "    s = Encoding.find(from)\n" ++
+  "    d = Encoding.find(to)\n" ++
+  "    bad = __bad_seq(bytes, s)\n" ++
+  "    return nil unless bad\n" ++
+  "    steps = (__path(s, d, nil) rescue [[s, d]]).select \{ |x| Array === x }\n" ++
+  "    raise __invalid_exc(bad, s.name, steps.first[1].name)[0]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ivs(e, h)\n" ++
+  "    h.each \{ |k, v| e.instance_variable_set(k, v) }\n" ++
+  "    e\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __invalid_error(bad)\n" ++
+  "    Encoding::Converter.__invalid_exc(bad, @source_encoding.name, @convpath.find \{ |x| Array === x }[1].name)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # The error for a character the destination cannot hold. From UTF-8 it\n" ++
+  "  # names the code point; into UTF-8 it shows the bytes; between two other\n" ++
+  "  # encodings it is raised by the SECOND step, from UTF-8, and its message\n" ++
+  "  # names the whole path.\n" ++
+  "  def __undef_error(ch)\n" ++
+  "    steps = @convpath.select \{ |x| Array === x }\n" ++
+  "    u = Encoding::UTF_8\n" ++
+  "    if @source_encoding == u\n" ++
+  "      msg = format(\"U+%04X\", ch.ord) + \" from UTF-8 to \" + @destination_encoding.name\n" ++
+  "      sn, dn = \"UTF-8\", steps.first[1].name\n" ++
+  "    elsif @destination_encoding == u || steps.size == 1\n" ++
+  "      msg = \"\\\"\" + Encoding::Converter.__dump(ch.b) + \"\\\" from \" + @source_encoding.name + \" to \" + steps.first[1].name\n" ++
+  "      sn, dn = @source_encoding.name, steps.first[1].name\n" ++
+  "    elsif (cu = (ch.encode(u) rescue nil)).nil?\n" ++
+  "      msg = \"\\\"\" + Encoding::Converter.__dump(ch.b) + \"\\\" to UTF-8 in conversion from \" +\n" ++
+  "            steps.map \{ |x| x[0].name }.join(\" to \") + \" to \" + @destination_encoding.name\n" ++
+  "      sn, dn = @source_encoding.name, \"UTF-8\"\n" ++
+  "    else\n" ++
+  "      ch = cu\n" ++
+  "      msg = format(\"U+%04X\", ch.ord) + \" to \" + @destination_encoding.name + \" in conversion from \" +\n" ++
+  "            steps.map \{ |x| x[0].name }.join(\" to \") + \" to \" + @destination_encoding.name\n" ++
+  "      sn, dn = \"UTF-8\", steps[1][1].name\n" ++
+  "    end\n" ++
+  "    e = __ivs(Encoding::UndefinedConversionError.new(msg),\n" ++
+  "              :@source_encoding_name => sn, :@destination_encoding_name => dn, :@error_char => ch)\n" ++
+  "    [e, [:undefined_conversion, sn, dn, ch.b, \"\".b]]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # Converts what it can of `bytes`: [output, status, rest, error, errinfo,\n" ++
+  "  # read-again bytes].\n" ++
+  "  def __step(bytes, partial)\n" ++
+  "    bad = Encoding::Converter.__bad_seq(bytes, @source_encoding)\n" ++
+  "    bad = nil if bad && @invalid_replace && !bad[3]\n" ++
+  "    upto = bad ? bad[0] : bytes.bytesize\n" ++
+  "    good = bytes.byteslice(0, upto).force_encoding(@source_encoding)\n" ++
+  "    out = \"\".b\n" ++
+  "    off = 0\n" ++
+  "    good.each_char do |c|\n" ++
+  "      begin\n" ++
+  "        out << if @destination_encoding.name == \"UTF8-MAC\"\n" ++
+  "                 # the Mac's decomposed UTF-8\n" ++
+  "                 c.encode(Encoding::UTF_8, @source_encoding).unicode_normalize(:nfd).b\n" ++
+  "               else\n" ++
+  "                 c.encode(@destination_encoding, @source_encoding, invalid: (@invalid_replace ? :replace : nil),\n" ++
+  "                          undef: (@undef_replace ? :replace : nil), replace: @replacement).b\n" ++
+  "               end\n" ++
+  "      # a character this interpreter cannot decode (a Shift_JIS kanji: there\n" ++
+  "      # is no table) is structurally valid -- __bad_seq passed it -- so it is\n" ++
+  "      # a character the destination does not have, as ruby reports it\n" ++
+  "      rescue Encoding::UndefinedConversionError, Encoding::InvalidByteSequenceError\n" ++
+  "        e, info = __undef_error(c)\n" ++
+  "        return [out, :undefined_conversion, bytes.byteslice(off + c.bytesize, bytes.bytesize), e, info, \"\".b]\n" ++
+  "      end\n" ++
+  "      off += c.bytesize\n" ++
+  "    end\n" ++
+  "    return [out, :finished, \"\".b, nil, [:finished, nil, nil, nil, nil], \"\".b] unless bad\n" ++
+  "    if bad[3] && partial\n" ++
+  "      return [out, :source_buffer_empty, bytes.byteslice(bad[0], bytes.bytesize), nil, [:source_buffer_empty, nil, nil, nil, nil], \"\".b]\n" ++
+  "    end\n" ++
+  "    e, info = __invalid_error(bad)\n" ++
+  "    [out, info[0], bytes.byteslice(bad[0] + bad[1].bytesize + bad[2].bytesize, bytes.bytesize), e, info, bad[2].b]\n" ++
+  "  end\n" ++
+  "\n" ++
   "  def convert(str)\n" ++
-  "    str.encode(@destination_encoding, @source_encoding)\n" ++
+  "    raise ArgumentError, \"converter already finished\" if @__finished\n" ++
+  "    bytes = @__pending + str.b\n" ++
+  "    @__pending = \"\".b\n" ++
+  "    out, status, rest, err, info, _again = __step(bytes, true)\n" ++
+  "    if err\n" ++
+  "      @__last_error = err\n" ++
+  "      @__errinfo = info\n" ++
+  "      raise err\n" ++
+  "    end\n" ++
+  "    @__pending = rest || \"\".b\n" ++
+  "    @__last_error = nil\n" ++
+  "    @__errinfo = [:source_buffer_empty, nil, nil, nil, nil]\n" ++
+  "    out.force_encoding(@destination_encoding)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def finish\n" ++
+  "    @__finished = true\n" ++
+  "    unless @__pending.empty?\n" ++
+  "      bad = Encoding::Converter.__bad_seq(@__pending, @source_encoding)\n" ++
+  "      @__pending = \"\".b\n" ++
+  "      if bad\n" ++
+  "        e, info = __invalid_error(bad)\n" ++
+  "        @__last_error = e\n" ++
+  "        @__errinfo = info\n" ++
+  "        raise e\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    (+\"\").force_encoding(@destination_encoding)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # One step of the stream. What was read again after an error is read\n" ++
+  "  # first (unless #putback took it), then what a partial call held back.\n" ++
+  "  # Output beyond dst_size waits in the converter for the next call; the\n" ++
+  "  # source is consumed either way.\n" ++
+  "  def primitive_convert(src, dst, dst_start = nil, dst_size = nil, opts = nil, **kw)\n" ++
+  "    opts = kw if opts.nil?\n" ++
+  "    partial = Integer === opts ? (opts & PARTIAL_INPUT) != 0 : opts[:partial_input]\n" ++
+  "    raise FrozenError, \"can't modify frozen String: \" + src.inspect if src && src.frozen?\n" ++
+  "    raise FrozenError, \"can't modify frozen String: \" + dst.inspect if dst.frozen?\n" ++
+  "    dst_start = dst_start.to_int unless dst_start.nil? || Integer === dst_start\n" ++
+  "    dst_size = dst_size.to_int unless dst_size.nil? || Integer === dst_size\n" ++
+  "    raise ArgumentError, \"destination byte offset is greater than the destination buffer\" if dst_start && dst_start > dst.bytesize\n" ++
+  "    input = @__putback + @__pending + (src ? src.b : \"\".b)\n" ++
+  "    @__putback = \"\".b\n" ++
+  "    @__pending = \"\".b\n" ++
+  "    out, status, rest, err, info, again = __step(input, partial)\n" ++
+  "    if status == :source_buffer_empty\n" ++
+  "      @__pending = rest\n" ++
+  "      rest = \"\".b\n" ++
+  "    end\n" ++
+  "    out = @__outbuf + out\n" ++
+  "    @__outbuf = \"\".b\n" ++
+  "    if dst_size && out.bytesize > dst_size\n" ++
+  "      @__outbuf = out.byteslice(dst_size, out.bytesize)\n" ++
+  "      out = out.byteslice(0, dst_size)\n" ++
+  "      status = :destination_buffer_full\n" ++
+  "      err = nil\n" ++
+  "      info = [:destination_buffer_full, nil, nil, nil, nil]\n" ++
+  "    end\n" ++
+  "    head = dst_start ? dst.b.byteslice(0, dst_start) : dst.b\n" ++
+  "    dst.replace((head + out).force_encoding(@destination_encoding))\n" ++
+  "    src.replace(rest.force_encoding(src.encoding)) if src\n" ++
+  "    @__putback = again\n" ++
+  "    @__last_error = err\n" ++
+  "    @__errinfo = info\n" ++
+  "    status\n" ++
   "  end\n" ++
   "end\n" ++
   // The thread queues and the condition variable define #marshal_dump only to
@@ -812,6 +1167,16 @@ let core_prelude_d =
   "  def destination_encoding_name; @destination_encoding_name; end\n" ++
   "  def source_encoding; @source_encoding_name && Encoding.find(@source_encoding_name); end\n" ++
   "  def destination_encoding; @destination_encoding_name && Encoding.find(@destination_encoding_name); end\n" ++
+  "  def error_char; @error_char; end\n" ++
+  "end\n" ++
+  "class Encoding::InvalidByteSequenceError\n" ++
+  "  def source_encoding_name; @source_encoding_name; end\n" ++
+  "  def destination_encoding_name; @destination_encoding_name; end\n" ++
+  "  def source_encoding; @source_encoding_name && Encoding.find(@source_encoding_name); end\n" ++
+  "  def destination_encoding; @destination_encoding_name && Encoding.find(@destination_encoding_name); end\n" ++
+  "  def error_bytes; @error_bytes; end\n" ++
+  "  def readagain_bytes; @readagain_bytes; end\n" ++
+  "  def incomplete_input?; @incomplete_input; end\n" ++
   "end\n" ++
   "module ObjectSpace\n" ++
   "  # Finalizers. There is no hook from this collector into Ruby code, so\n" ++
