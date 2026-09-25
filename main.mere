@@ -1627,6 +1627,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 7 && str_eq name "binding") && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = map_len bind_store in
       let _ = map_set bind_store (str_of_int id) (bnd_snapshot env) in
+      // where it was made, for #source_location
+      let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
     // paren-less Kernel#rand / gets / readline / readlines (`line = gets`).
     else if (str_len name == 6 && str_eq name "caller") && (if map_has meths name then false else true) then
@@ -1722,6 +1724,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 7 && str_eq name "binding") && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = map_len bind_store in
       let _ = map_set bind_store (str_of_int id) (bnd_snapshot env) in
+      let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
     // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
     // against that captured env; otherwise it uses the CURRENT env. A parse
@@ -3369,6 +3372,12 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
         // The busy flag is cleared first, or the unwind would leave it set.
         let _ = map_delete trace_fn "gvbusy" in
         let _ = run_block world nb (proc_as_block pid) (Cons (v, Nil)) in ())
+     // a String tracer is ruby source, evaluated at the top level
+     | VStr sh ->
+       (let fenv9 = map_new () in
+        let _ = map_set fenv9 "self" VMain in
+        let nb = (false, (Nil : str list), (Nil : Stmt list), fenv9) in
+        let _ = do_eval fenv9 world nb (Cons (VStr sh, Nil)) in ())
      | _ -> ())
   else ()
 
@@ -10223,7 +10232,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // allocator at all: `new` is gone (NoMethodError) and `allocate` refuses
     // with a TypeError, the same two-step the true/false/nil specs check.
     else if (str_eq c "Symbol" || str_eq c "Integer" || str_eq c "Float"
-             || str_eq c "Method" || str_eq c "UnboundMethod" || str_eq c "Binding")
+             || str_eq c "Method" || str_eq c "UnboundMethod" || str_eq c "Binding"
+             || str_eq c "Enumerator::ArithmeticSequence")
             && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate"))
             && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       (if (str_len name == 8 && str_eq name "allocate")
@@ -13790,7 +13800,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // A break from that block (a bounded materialization) propagates as a
     // break flow so the generator's own loop stops.
     else if str_eq cls "Enumerator::Yielder" then
-      (if (str_len name == 2 && str_eq name "<<") || (str_len name == 5 && str_eq name "yield") || (str_len name == 4 && str_eq name "call") then
+      // (<< and yield: a Yielder has no #call -- its #to_proc, in the
+      // prelude, is how it is used as a block)
+      // `<<` takes exactly one value (yield takes any number)
+      (if (str_len name == 2 && str_eq name "<<") && (match args with Cons (_, Nil) -> false | _ -> true) then
+         raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 1)")
+       else if (str_len name == 2 && str_eq name "<<") || (str_len name == 5 && str_eq name "yield") then
        (if map_has ivars (str_of_int id ++ "@__y_lzdid") then
           // a LAZY generator's yielder: the value goes into the rest of the
           // pipeline, not into a ruby block. The ops live on the driver, so
@@ -16381,6 +16396,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_len name == 8 && str_eq name "receiver") || (str_len name == 4 && str_eq name "self") then
       (if map_has benv "self" then map_get benv "self" else VMain)
     else if (str_len name == 5 && str_eq name "class") then VClass "Binding"
+    // [file, line] of the `binding` call that made it
+    else if (str_len name == 15 && str_eq name "source_location") then
+      (match recv with
+       | VBind bid9 when map_has bind_loc (str_of_int bid9) ->
+         (let l9 = map_get bind_loc (str_of_int bid9) in
+          let nl9 = str_index_of l9 "\n" in
+          arr_new (Cons (mkstr (substring l9 0 nl9), Cons (VInt (int_of_str (substring l9 (nl9 + 1) (str_len l9))), Nil))))
+       | _ -> VNil)
     else dispatch_prim env world blk recv name args vischeck
   | _ -> dispatch_prim env world blk recv name args vischeck
 
@@ -18155,6 +18178,27 @@ and rnd_half_down = fn (x: float) -> fn (s: float) ->
   if x > 0.0 then (if (fv - 0.5) / s >= x then fv - 1.0 else fv)
   else (if (fv + 0.5) / s <= x then fv + 1.0 else fv)
 
+// Enumerable#tally(hash): the hash's own stored counts are the start (its
+// default is not consulted), a count that is not an Integer is refused,
+// and a frozen hash refuses before anything is counted.
+and tally_into = fn env -> fn world -> fn (recv: Val) -> fn (h0: Val) ->
+  let blk9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+  let h = (match h0 with
+           | VHsh _ -> h0
+           | _ -> (if has_meth world (dispatch_cls_of world h0) "to_hash" then invoke_val_c env world blk9 h0 "to_hash" Nil false
+                   else raise_exc world "TypeError" ("no implicit conversion of " ++ class_name h0 ++ " into Hash"))) in
+  match (h, recv) with
+  | (VHsh hid, VArr aid) ->
+    (let _ = (if val_frozen_mut h then (let _ = raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect_w env world h) in ()) else ()) in
+     let _ = list_iter_vals (deref aid) (fn (e9: Val) ->
+               (let nv9 = (match hash_lookup (hderef hid) e9 with
+                           | (true, VInt n9) -> VInt (n9 + 1)
+                           | (true, other9) -> raise_exc world "TypeError" ("wrong argument type " ++ class_name other9 ++ " (expected Integer)")
+                           | _ -> VInt 1) in
+                let _ = invoke_val_c env world blk9 h "[]=" (Cons (e9, Cons (nv9, Nil))) false in ())) in
+     h)
+  | _ -> h
+
 and pow10i = fn (k: int) -> if k <= 0 then 1 else 10 * pow10i (k - 1)
 
 and round_half_mode = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list) ->
@@ -18287,6 +18331,10 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      && (match recv with VInt _ -> true | VFlt _ -> true | VRat (_, _) -> true | _ -> false)
      && (match args with Nil -> false | _ -> (match vlast args with VHsh h9 -> (match hash_lookup (hderef h9) (VSym "half") with (true, _) -> true | _ -> false) | _ -> false))
   then round_half_mode env world recv args
+  // `tally(hash)` counts INTO the hash it is given (and answers it)
+  else if (str_len name == 5 && str_eq name "tally") && (match recv with VArr _ -> true | _ -> false)
+          && (match args with Cons (_, Nil) -> true | _ -> false)
+  then tally_into env world recv (match args with Cons (h9, _) -> h9 | Nil -> VNil)
   else
   // ⚠ the PRECISION of the rounding family is an integer CONVERSION too, and
   // the leaf that applies it (prim_method_raw) has no world to ask an object
@@ -25824,19 +25872,22 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     (match args with
      | Cons (gv, rest) ->
        (let gn = gvar_trace_name (to_s gv) in
-        let pv = (match rest with Cons (VProc pid, _) -> VProc pid | _ -> VNil) in
+        // the tracer is a Proc, or a String of ruby to evaluate
+        let pv = (match rest with Cons (VProc pid, _) -> VProc pid | Cons (VStr sh, _) -> VStr sh | _ -> VNil) in
         match pv with
-        | VProc _ -> (let _ = map_set gvar_traces gn pv in
-                      let _ = map_set hook_flags "gvt" VNil in VNil)
-        | _ -> VNil)
+        | VNil -> raise_exc world "ArgumentError" "tried to create Proc object without a block"
+        | _ -> (let _ = map_set gvar_traces gn pv in
+                let _ = map_set hook_flags "gvt" VNil in VNil))
      | _ -> VNil)
   else if (str_len name == 11 && str_eq name "untrace_var") then
     (match args with
      | Cons (gv, _) ->
+       // answers the tracers it took off
        (let gn = gvar_trace_name (to_s gv) in
+        let had9 = (if map_has gvar_traces gn then Cons (map_get gvar_traces gn, Nil) else Nil) in
         let _ = (if map_has gvar_traces gn then map_delete gvar_traces gn else ()) in
         let _ = (if map_len gvar_traces == 0 && map_has hook_flags "gvt"
-                 then map_delete hook_flags "gvt" else ()) in VNil)
+                 then map_delete hook_flags "gvt" else ()) in arr_new had9)
      | _ -> VNil)
   // Kernel#exit / Kernel#abort — terminate through the native exit, running
   // the at_exit handlers first (which is the only chance they get).
