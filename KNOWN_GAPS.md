@@ -3384,6 +3384,20 @@ superclass mismatch; the shared surface is a module mixed into all three
 instead. Nothing in ruby/spec reads `Zlib::Deflate.superclass`, and every
 ZStream spec constructs a `Zlib::Deflate`.
 
+## Two small refusals that are representation, not effort
+
+* **`Range#dup` / `#clone` answer an object `equal?` to the original.** A
+  range here is a VALUE (`VRange (lo, hi, excl)`), not an object with an
+  identity, so there is nothing a copy could be distinct FROM.
+  `core/range/dup_spec`'s "duplicates the range" asks `should_not
+  equal?`, and that one assertion cannot be satisfied without giving ranges
+  an identity -- which would be a change to every range operation.
+* **`StringScanner#fixed_anchor?` answers false whatever was asked for.**
+  Fixed-anchor mode changes what `\A` and `^` mean (the start of the whole
+  string rather than the scan pointer), and this scanner matches the rest of
+  the string from the pointer. Answering true would claim a mode it does not
+  run; two library/stringscanner rows read the flag and stay red.
+
 ## `Module#dup` answers the RECEIVER, and a real copy needs something first
 
 `M.dup` and `M.clone` hand back the module itself. That is wrong in two ways a

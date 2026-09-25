@@ -972,12 +972,26 @@ and lz_pipe_name = fn (name: str) ->
   (str_len name == 5 && str_eq name "chunk")
 
 and builtin_obj_has = fn (cls: str) -> fn (name: str) ->
+  // ⚠ ARGF: the same shape as ENV below -- one object whose methods live in
+  //   the dispatcher -- and it had no row at all, so `ARGF.respond_to?(:each)`
+  //   was false and `ARGF.method(:each)` a NameError for a method that runs.
+  //   Six core/argf files are nothing but `X is an alias of Y`. The list is
+  //   what the ARGF arm and the block dispatcher actually answer.
+  if str_eq cls "ARGF" then
+    (str_len name == 4 && str_eq name "read") || (str_len name == 9 && str_eq name "readlines") ||
+    (str_len name == 4 && str_eq name "to_a") || (str_len name == 4 && str_eq name "each") ||
+    (str_len name == 9 && str_eq name "each_line") || (str_len name == 4 && str_eq name "gets") ||
+    (str_len name == 4 && str_eq name "argv") || (str_len name == 8 && str_eq name "filename") ||
+    (str_len name == 4 && str_eq name "path") || (str_len name == 6 && str_eq name "fileno") ||
+    (str_len name == 4 && str_eq name "to_i") || (str_len name == 3 && str_eq name "pos") ||
+    (str_len name == 4 && str_eq name "tell") || (str_len name == 4 && str_eq name "eof?") ||
+    (str_len name == 3 && str_eq name "eof")
   // ENV: one object whose methods all live in the dispatcher, so nothing knew
   // it had any -- `ENV.respond_to?(:each)` was false and `ENV.method(:each)`
   // raised NameError while `ENV.each` iterated. It answers the Hash surface
   // (its arm delegates the rest to a hash copy) plus the keys-and-values
   // methods of its own.
-  if str_eq cls "EnvHash" then
+  else if str_eq cls "EnvHash" then
     is_hash_method name || is_enum_method name ||
     (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "[]=") || (str_len name == 5 && str_eq name "store") ||
     (str_len name == 5 && str_eq name "fetch") || (str_len name == 6 && str_eq name "delete") || (str_len name == 4 && str_eq name "key?") ||
@@ -1274,6 +1288,16 @@ and canon_alias = fn (cls: str) -> fn (n: str) ->
   //   "(sng:File)" and is unwrapped to File before it gets here.
   // ⚠ TIME'S ALIASES, which it has for nearly every name it inherited from C's
   //   struct tm. Eleven core/time files are a single `X is an alias of Y`.
+  // ARGF's six aliases, each a core/argf file of its own.
+  if str_eq cls "ARGF" then
+    (if str_eq n "each_line" then "each"
+     else if str_eq n "eof?" then "eof"
+     else if str_eq n "filename" then "path"
+     else if str_eq n "tell" then "pos"
+     else if str_eq n "readlines" then "to_a"
+     else if str_eq n "fileno" then "to_i"
+     else n)
+  else
   if str_eq cls "Time" then
     (if str_eq n "tv_nsec" then "nsec"
      else if str_eq n "tv_sec" then "to_i"
@@ -3297,7 +3321,7 @@ and do_extend_one = fn world -> fn (m9: str) -> fn (target: Val) ->
              | VArr _ -> prim_sng_cls world target "Array"
              | VHsh _ -> prim_sng_cls world target "Hash"
              | _ -> "") in
-  let _ = extend_all sc9 (Cons (VClass m9, Nil)) in
+  let _ = extend_all world sc9 (Cons (VClass m9, Nil)) in
   // dispatch for a primitive goes through its tagged class, so the singleton
   // has to become that tag or the mixed-in methods are invisible.
   let _ = (match target with
@@ -3315,13 +3339,30 @@ and extend_arg_check = fn world -> fn (args: Val list) ->
   | Cons (other, _) ->
     (let _ = raise_exc world "TypeError"
        ("wrong argument type " ++ class_name other ++ " (expected Module)") in ())
-and extend_all = fn (sc: str) -> fn (args: Val list) ->
+and extend_all = fn world -> fn (sc: str) -> fn (args: Val list) ->
   match args with
   | Nil -> ()
   | Cons (VClass m, rest) ->
     let _ = set_inc sc (if map_has includes sc then (map_get includes sc) ++ "|" ++ m else m) in
-    extend_all sc rest
-  | Cons (_, rest) -> extend_all sc rest
+    let _ = enum_impl_follow world sc m in
+    extend_all world sc rest
+  | Cons (_, rest) -> extend_all world sc rest
+// `Enumerable` mixed into `base` brings Enumerable__Impl with it -- the
+// streaming implementations, in FRONT of the includes list so they are
+// searched last.
+// ⚠ ONE RULE FOR BOTH DOORS. do_include applied it and extend did not, so
+//   `obj.extend Enumerable` gave an object that answered #map (which the
+//   block dispatcher reaches by calling #each) and NOT #to_h, #to_a or
+//   #first, which live in the Impl -- NoMethodError on the methods that
+//   module exists to provide. `include` and `extend` are the same mixin
+//   aimed at a class and at a singleton.
+and enum_impl_follow = fn world -> fn (base: str) -> fn (mq: str) ->
+  if str_eq mq "Enumerable"
+     && (if str_eq base "Enumerable__Impl" then false else true)
+     && (if map_has includes base then (if str_contains (map_get includes base) "Enumerable__Impl" then false else true) else true)
+     && (let (mt9, _, _, _) = world in map_has mt9 "Enumerable__Impl#map")
+  then set_inc base ("Enumerable__Impl|" ++ (if map_has includes base then map_get includes base else ""))
+  else ()
 and ivar_self_key = fn (slf: Val) -> fn (name: str) ->
   match slf with
   | VObj id -> str_of_int id ++ "@" ++ name
@@ -4095,7 +4136,12 @@ and stdlib_src = fn (name: str) ->
   if str_eq n "cgi" || str_eq n "cgi/escape" || str_eq n "cgi/util" then
     "class CGI\n" ++
     "  module Escape\n" ++
+    "    # \u26a0 ruby's escapeHTML works on BYTES (it is C), so a string that is\n" ++
+    "    # not valid in its encoding is escaped, not refused. gsub refuses such a\n" ++
+    "    # string, so the invalid case goes through a binary copy and comes back\n" ++
+    "    # tagged as it arrived. A valid string takes the path it always took.\n" ++
     "    def escapeHTML(string)\n" ++
+    "      return escapeHTML(string.b).force_encoding(string.encoding) unless string.valid_encoding?\n" ++
     "      string.gsub(/['&\\\"<>]/, \{\n" ++
     "        \"'\" => \"&#39;\",\n" ++
     "        \"&\" => \"&amp;\",\n" ++
@@ -4107,6 +4153,7 @@ and stdlib_src = fn (name: str) ->
     "\n" ++
     "    def unescapeHTML(string)\n" ++
     "      return string unless string.include? \"&\"\n" ++
+    "      return unescapeHTML(string.b).force_encoding(string.encoding) unless string.valid_encoding?\n" ++
     "      string.gsub(/&(apos|amp|quot|gt|lt|#[0-9]+|#[xX][0-9A-Fa-f]+);/) do\n" ++
     "        match = $1.dup\n" ++
     "        case match\n" ++
@@ -4208,7 +4255,11 @@ and stdlib_src = fn (name: str) ->
     "    [bin].pack(\"m0\")\n" ++
     "  end\n" ++
     "\n" ++
+    "  # ⚠ STRICT means refuse, and the only refusals were the ones unpack\n" ++
+    "  # happened to make: \"aGk\" (a length that is not a multiple of four)\n" ++
+    "  # decoded to \"hi\" where ruby raises. Checked here, before unpack.\n" ++
     "  def strict_decode64(str)\n" ++
+    "    raise ArgumentError, \"invalid base64\" if str.length % 4 != 0\n" ++
     "    str.unpack1(\"m0\")\n" ++
     "  end\n" ++
     "\n" ++
@@ -4931,12 +4982,28 @@ and stdlib_src = fn (name: str) ->
     "    super\n" ++
     "    mon_initialize\n" ++
     "  end\n" ++
-    "  def mon_initialize; @mon_count = 0; self; end\n" ++
-    "  def mon_enter; @mon_count = (@mon_count || 0) + 1; nil; end\n" ++
-    "  def mon_exit; @mon_count = (@mon_count || 1) - 1; nil; end\n" ++
-    "  def mon_owned?; (@mon_count || 0) > 0; end\n" ++
-    "  def mon_locked?; mon_owned?; end\n" ++
-    "  def mon_check_owner; nil; end\n" ++
+    "  # \u26a0 THE OWNER IS A THREAD, and leaving a monitor you do not hold is\n" ++
+    "  # an error. mon_exit decremented a counter below zero and answered nil,\n" ++
+    "  # so an unbalanced exit went unnoticed; ruby raises ThreadError\n" ++
+    "  # (\"current fiber not owner\"), as does mon_check_owner.\n" ++
+    "  def mon_initialize; @mon_count = 0; @mon_owner = nil; self; end\n" ++
+    "  def mon_enter\n" ++
+    "    @mon_owner = Thread.current if (@mon_count || 0) == 0\n" ++
+    "    @mon_count = (@mon_count || 0) + 1\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def mon_exit\n" ++
+    "    mon_check_owner\n" ++
+    "    @mon_count -= 1\n" ++
+    "    @mon_owner = nil if @mon_count == 0\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def mon_owned?; (@mon_count || 0) > 0 && @mon_owner.equal?(Thread.current); end\n" ++
+    "  def mon_locked?; (@mon_count || 0) > 0; end\n" ++
+    "  def mon_check_owner\n" ++
+    "    raise ThreadError, \"current fiber not owner\" unless mon_owned?\n" ++
+    "    nil\n" ++
+    "  end\n" ++
     "  def mon_try_enter; mon_enter; true; end\n" ++
     "  def try_mon_enter; mon_try_enter; end\n" ++
     "  def mon_synchronize\n" ++
@@ -5690,8 +5757,13 @@ and stdlib_src = fn (name: str) ->
     "      @singleton__instance__ ||= new\n" ++
     "    end\n" ++
     "  end\n" ++
+    "  # ⚠ new and allocate become PRIVATE on the including class: the one\n" ++
+    "  # instance is the only way in. They stayed public, so `S.new` made a\n" ++
+    "  # second instance of a singleton without complaint. `instance` still\n" ++
+    "  # reaches `new` because it calls it on self, receiverless.\n" ++
     "  def self.included(klass)\n" ++
     "    klass.extend(SingletonClassMethods)\n" ++
+    "    klass.private_class_method :new, :allocate\n" ++
     "  end\n" ++
     "  def clone\n" ++
     "    raise TypeError, \"can't clone instance of singleton \" + self.class.to_s\n" ++
@@ -5848,38 +5920,54 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "  end\n" ++
     "\n" ++
-    "  def gets(sep = \"\\n\")\n" ++
+    "  # ⚠ gets takes a LIMIT as well as a separator -- gets(3), gets(sep, 3) --\n" ++
+    "  # and a chomp: keyword. An Integer in the first position was used AS the\n" ++
+    "  # separator, so `readline(3)` asked String#index for 3 and raised TypeError\n" ++
+    "  # where ruby reads three characters (or raises EOFError at the end).\n" ++
+    "  def gets(sep = \"\\n\", limit = nil, chomp: false)\n" ++
     "    __sio_check_read\n" ++
+    "    if sep.is_a?(Integer)\n" ++
+    "      limit = sep\n" ++
+    "      sep = \"\\n\"\n" ++
+    "    end\n" ++
+    "    limit = nil if limit && limit < 0\n" ++
     "    return ($_ = nil) if eof?\n" ++
+    "    return ($_ = +\"\") if limit == 0\n" ++
     "    if sep.nil?\n" ++
-    "      whole = @string[@pos, @string.length - @pos]\n" ++
-    "      @pos = @string.length\n" ++
+    "      len = @string.length - @pos\n" ++
+    "      len = limit if limit && limit < len\n" ++
+    "      line = @string[@pos, len]\n" ++
+    "      @pos += len\n" ++
     "      @lineno += 1\n" ++
-    "      return ($_ = whole)\n" ++
+    "      return ($_ = line)\n" ++
     "    end\n" ++
     "    idx = @string.index(sep, @pos)\n" ++
-    "    if idx.nil?\n" ++
-    "      line = @string[@pos, @string.length - @pos]\n" ++
-    "      @pos = @string.length\n" ++
-    "    else\n" ++
-    "      line = @string[@pos, idx + sep.length - @pos]\n" ++
-    "      @pos = idx + sep.length\n" ++
-    "    end\n" ++
+    "    stop = idx.nil? ? @string.length : idx + sep.length\n" ++
+    "    stop = @pos + limit if limit && @pos + limit < stop\n" ++
+    "    line = @string[@pos, stop - @pos]\n" ++
+    "    @pos = stop\n" ++
     "    @lineno += 1\n" ++
+    "    line = __sio_chomp(line, sep) if chomp\n" ++
     "    $_ = line\n" ++
     "  end\n" ++
     "\n" ++
-    "  def readlines(sep = \"\\n\")\n" ++
+    "  def __sio_chomp(line, sep)\n" ++
+    "    return line.chomp if sep == \"\\n\"\n" ++
+    "    line.end_with?(sep) ? line[0, line.length - sep.length] : line\n" ++
+    "  end\n" ++
+    "\n" ++
+    "\n" ++
+    "  def readlines(sep = \"\\n\", limit = nil, chomp: false)\n" ++
     "    out = []\n" ++
-    "    while (line = gets(sep))\n" ++
+    "    while (line = gets(sep, limit, chomp: chomp))\n" ++
     "      out.push(line)\n" ++
     "    end\n" ++
     "    out\n" ++
     "  end\n" ++
     "\n" ++
-    "  def each_line(sep = \"\\n\")\n" ++
-    "    return to_enum(:each_line, sep) unless block_given?\n" ++
-    "    while (line = gets(sep))\n" ++
+    "  def each_line(sep = \"\\n\", limit = nil, chomp: false)\n" ++
+    "    return to_enum(:each_line, sep, limit, chomp: chomp) unless block_given?\n" ++
+    "    while (line = gets(sep, limit, chomp: chomp))\n" ++
     "      yield line\n" ++
     "    end\n" ++
     "    self\n" ++
@@ -6064,8 +6152,8 @@ and stdlib_src = fn (name: str) ->
     "    c\n" ++
     "  end\n" ++
     "\n" ++
-    "  def readline(sep = \"\\n\")\n" ++
-    "    l = gets(sep)\n" ++
+    "  def readline(sep = \"\\n\", limit = nil, chomp: false)\n" ++
+    "    l = gets(sep, limit, chomp: chomp)\n" ++
     "    raise EOFError, \"end of file reached\" if l.nil?\n" ++
     "    l\n" ++
     "  end\n" ++
@@ -6733,8 +6821,11 @@ and stdlib_src = fn (name: str) ->
     "    parse(str)\n" ++
     "  end\n" ++
     "\n" ++
-    "  def self.rfc822(str)\n" ++
-    "    parse(str)\n" ++
+    "  # \u26a0 rfc822 IS rfc2822, one method under two names: the spec compares\n" ++
+    "  # the Method objects, and a second `def` that answers the same is a\n" ++
+    "  # different method.\n" ++
+    "  class << self\n" ++
+    "    alias rfc822 rfc2822\n" ++
     "  end\n" ++
     "\n" ++
     "  def self.httpdate(str)\n" ++
@@ -6824,14 +6915,30 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "end\n" ++
     "\n" ++
+    "# \u26a0 ruby's DelegateClass DEFINES a forwarder for every public and\n" ++
+    "# protected instance method of the class it wraps, and that is how\n" ++
+    "# `DelegateClass(Foo).public_instance_methods` comes to list Foo's methods\n" ++
+    "# and the protected ones stay protected. Forwarding through method_missing\n" ++
+    "# alone made every call work and reflection say nothing. The names\n" ++
+    "# Delegator itself answers are left alone, as ruby leaves them.\n" ++
     "def DelegateClass(superclass, &block)\n" ++
     "  klass = Class.new(Delegator)\n" ++
+    "  ignores = Delegator.public_instance_methods + [:to_s, :inspect, :=~, :!~, :===]\n" ++
+    "  prot = superclass.protected_instance_methods - ignores\n" ++
+    "  pub = superclass.public_instance_methods - ignores\n" ++
     "  klass.class_eval do\n" ++
     "    def __getobj__\n" ++
     "      @delegate_dc_obj\n" ++
     "    end\n" ++
     "    def __setobj__(obj)\n" ++
     "      @delegate_dc_obj = obj\n" ++
+    "    end\n" ++
+    "    prot.each do |m|\n" ++
+    "      define_method(m) \{ |*a, &b| __getobj__.__send__(m, *a, &b) }\n" ++
+    "      protected m\n" ++
+    "    end\n" ++
+    "    pub.each do |m|\n" ++
+    "      define_method(m) \{ |*a, &b| __getobj__.__send__(m, *a, &b) }\n" ++
     "    end\n" ++
     "  end\n" ++
     "  klass.class_eval(&block) if block\n" ++
@@ -6855,8 +6962,10 @@ and stdlib_src = fn (name: str) ->
     "    __getobj__.public_methods(all) | __own_methods\n" ++
     "  end\n" ++
     "\n" ++
+    "  # ...and the protected side has the same two halves: the delegate's and\n" ++
+    "  # the delegator class's own (an included module's protected methods).\n" ++
     "  def protected_methods(all = true)\n" ++
-    "    __getobj__.protected_methods(all)\n" ++
+    "    __getobj__.protected_methods(all) | self.class.protected_instance_methods(true)\n" ++
     "  end\n" ++
     "\n" ++
     "  def hash = __getobj__.hash\n" ++
@@ -6999,6 +7108,16 @@ and stdlib_src = fn (name: str) ->
     "module Digest\n" ++
     "  M32 = 0xffffffff\n" ++
     "\n" ++
+    "  # Digest::Instance is the protocol every digest class mixes in: a class\n" ++
+    "  # that includes it and does not implement update() refuses with\n" ++
+    "  # RuntimeError, and << is the same method as update, not a copy of it.\n" ++
+    "  module Instance\n" ++
+    "    def update(str)\n" ++
+    "      raise RuntimeError, self.class.to_s + \" does not implement update()\"\n" ++
+    "    end\n" ++
+    "    alias << update\n" ++
+    "  end\n" ++
+    "\n" ++
     "  class Base\n" ++
     "    def initialize\n" ++
     "      @buf = +\"\".b\n" ++
@@ -7015,13 +7134,23 @@ and stdlib_src = fn (name: str) ->
     "      self\n" ++
     "    end\n" ++
     "\n" ++
+    "    # ⚠ WITH an argument, ruby RESETS the object: `d << \"test\";\n" ++
+    "    # d.hexdigest(str)` digests str alone and leaves d blank, so a later\n" ++
+    "    # bare `d.hexdigest` is the empty digest. This returned the class\n" ++
+    "    # method's answer and kept @buf, so the \"test\" came back afterwards.\n" ++
     "    def digest(s = nil)\n" ++
-    "      return self.class.digest(s) if s\n" ++
+    "      if s\n" ++
+    "        reset\n" ++
+    "        return self.class.digest(s)\n" ++
+    "      end\n" ++
     "      self.class.digest(@buf)\n" ++
     "    end\n" ++
     "\n" ++
     "    def hexdigest(s = nil)\n" ++
-    "      return self.class.hexdigest(s) if s\n" ++
+    "      if s\n" ++
+    "        reset\n" ++
+    "        return self.class.hexdigest(s)\n" ++
+    "      end\n" ++
     "      self.class.hexdigest(@buf)\n" ++
     "    end\n" ++
     "\n" ++
@@ -7708,9 +7837,15 @@ and stdlib_src = fn (name: str) ->
     "  #   DateTime-specific method was reached by inheritance from an object\n" ++
     "  #   that is not a DateTime. #iso8601 answered \"2020-01-02\" for that\n" ++
     "  #   reason. `super` runs the same code with self still DateTime.\n" ++
-    "  def self.new(y = -4712, m = 1, d = 1, h = 0, min = 0, s = 0, _off = 0, _start = nil)\n" ++
+    "  # \u26a0 THE SEVENTH ARGUMENT IS THE OFFSET, a fraction of a day, and it was\n" ++
+    "  # dropped: every DateTime claimed +00:00. ruby takes a Rational, an\n" ++
+    "  # Integer, a Float (rationalized -- 0.7 is 7/10, not the binary fraction)\n" ++
+    "  # or \"+HH:MM\"; the civil fields are read AS local to that offset, so only\n" ++
+    "  # #offset, #zone and the printers change.\n" ++
+    "  def self.new(y = -4712, m = 1, d = 1, h = 0, min = 0, s = 0, off = 0, _start = nil)\n" ++
     "    obj = super(y, m, d)\n" ++
     "    obj.__set_time(h, min, s)\n" ++
+    "    obj.__set_offset(Date.__offset_of(off))\n" ++
     "    obj\n" ++
     "  end\n" ++
     "\n" ++
@@ -7750,7 +7885,23 @@ and stdlib_src = fn (name: str) ->
     "  # print differently.\n" ++
     "  def sec_fraction = Rational(0, 1)\n" ++
     "  alias_method :second_fraction, :sec_fraction\n" ++
-    "  def offset = Rational(0, 1)\n" ++
+    "  def offset = @offset || Rational(0, 1)\n" ++
+    "  def __set_offset(o)\n" ++
+    "    @offset = o\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def self.__offset_of(off)\n" ++
+    "    case off\n" ++
+    "    when String\n" ++
+    "      m = /\\A([+-])(\\d\{2}):?(\\d\{2})\\z/.match(off)\n" ++
+    "      return Rational(0, 1) unless m\n" ++
+    "      r = Rational(m[2].to_i * 3600 + m[3].to_i * 60, 86400)\n" ++
+    "      m[1] == \"-\" ? -r : r\n" ++
+    "    when Float then off.rationalize(Rational(1, 864000000))\n" ++
+    "    when Integer, Rational then Rational(off)\n" ++
+    "    else Rational(0, 1)\n" ++
+    "    end\n" ++
+    "  end\n" ++
     "  def zone = __off_s\n" ++
     "  # ⚠ DateTime#iso8601 answered the DATE only -- Date#iso8601, inherited --\n" ++
     "  #   so a DateTime printed as \"2020-01-02\" where ruby gives the full\n" ++
@@ -7875,7 +8026,12 @@ and stdlib_src = fn (name: str) ->
     "\n" ++
     "  alias_method :xmlschema, :iso8601\n" ++
     "\n" ++
-    "  def __off_s = \"+00:00\"\n" ++
+    "  def __off_s\n" ++
+    "    secs = (offset * 86400).round\n" ++
+    "    sign = secs < 0 ? \"-\" : \"+\"\n" ++
+    "    secs = secs.abs\n" ++
+    "    format(\"%s%02d:%02d\", sign, secs / 3600, (secs % 3600) / 60)\n" ++
+    "  end\n" ++
     "\n" ++
     "  def rfc3339\n" ++
     "    format(\"%04d-%02d-%02dT%02d:%02d:%02d%s\", year, month, day, hour, minute, second, __off_s)\n" ++
@@ -7887,6 +8043,21 @@ and stdlib_src = fn (name: str) ->
     "           hour, minute, second)\n" ++
     "  end\n" ++
     "  alias rfc822 rfc2822\n" ++
+    "\n" ++
+    "  # Date.rfc2822 / DateTime.rfc2822: \"[Day, ]DD Mon YYYY HH:MM[:SS] zone\".\n" ++
+    "  # Anything else -- nil included -- is Date::Error \"invalid date\", which\n" ++
+    "  # is what ruby raises; the method did not exist at all.\n" ++
+    "  def self.rfc2822(str = \"Mon, 1 Jan -4712 00:00:00 +0000\", _start = nil, limit: 128)\n" ++
+    "    raise Date::Error, \"invalid date\" unless str.is_a?(String)\n" ++
+    "    m = /\\A\\s*(?:[A-Za-z]\{3},\\s*)?(\\d\{1,2})\\s+([A-Za-z]\{3})\\s+(-?\\d+)\\s+(\\d\{2}):(\\d\{2})(?::(\\d\{2}))?/.match(str)\n" ++
+    "    raise Date::Error, \"invalid date\" unless m\n" ++
+    "    mon = Date::ABBR_MONTHNAMES.index(m[2].capitalize)\n" ++
+    "    raise Date::Error, \"invalid date\" unless mon\n" ++
+    "    new(m[3].to_i, mon, m[1].to_i)\n" ++
+    "  end\n" ++
+    "  class << self\n" ++
+    "    alias rfc822 rfc2822\n" ++
+    "  end\n" ++
     "\n" ++
     "  def httpdate\n" ++
     "    format(\"%s, %02d %s %04d %02d:%02d:%02d GMT\",\n" ++
@@ -8183,21 +8354,40 @@ and stdlib_src = fn (name: str) ->
     "      end\n" ++
     "    end\n" ++
     "\n" ++
+    "    # \u26a0 A write failure is REPORTED, per phase, and the phases are\n" ++
+    "    # ruby's: a device handed an IO checks for rotation first (its #stat),\n" ++
+    "    # which is where a closed stream is noticed -- \"log shifting failed.\"\n" ++
+    "    # -- and then the write itself fails as \"log writing failed.\". A\n" ++
+    "    # device the Logger opened from a path (shift_age 0) skips the check.\n" ++
+    "    # Asked of the reference. The one message here was always \"shifting\",\n" ++
+    "    # and the write that raised it never reached a Logger's caller.\n" ++
     "    def write(message)\n" ++
     "      return if @dev.nil?\n" ++
+    "      unless @owned\n" ++
+    "        begin\n" ++
+    "          @dev.stat if @dev.respond_to?(:stat)\n" ++
+    "        rescue StandardError => e\n" ++
+    "          warn(\"log shifting failed. \" + e.message)\n" ++
+    "        end\n" ++
+    "      end\n" ++
     "      begin\n" ++
     "        @dev.write(message)\n" ++
     "        @dev.flush if @dev.respond_to?(:flush)\n" ++
     "      rescue StandardError => e\n" ++
-    "        warn(\"log shifting failed. \\#\{e.message}\")\n" ++
+    "        warn(\"log writing failed. \" + e.message)\n" ++
     "        return nil\n" ++
     "      end\n" ++
     "      message.to_s.length\n" ++
     "    end\n" ++
     "\n" ++
+    "    # ruby closes the device whoever opened it -- the LogDevice#close spec\n" ++
+    "    # hands it a File and expects that File to be closed afterwards.\n" ++
     "    def close\n" ++
     "      return if @dev.nil?\n" ++
-    "      @dev.close if @owned && !@dev.closed?\n" ++
+    "      begin\n" ++
+    "        @dev.close unless @dev.closed?\n" ++
+    "      rescue StandardError\n" ++
+    "      end\n" ++
     "      nil\n" ++
     "    end\n" ++
     "\n" ++
@@ -9481,8 +9671,11 @@ and pack_one = fn (d: str) -> fn (k: int) -> fn (ys: Val list) -> fn (acc: str) 
      //   world is), so anything still not a String here has no #to_str and is
      //   the caller's mistake. nil is the exception: `[nil].pack("a")` is a
      //   NUL, because nil packs as the empty string for these three.
+     // ...and `Z*` of nil is the empty string's `Z*`: one NUL, which the
+     //   width rule below gives any string (length + 1) and this arm did not.
      | Cons (VNil, t) ->
-       (acc ++ str_repeat (if str_eq d "A" then " " else chr 0) (if k < 0 then 0 else k), t)
+       (acc ++ str_repeat (if str_eq d "A" then " " else chr 0)
+                (if k < 0 then (if str_eq d "Z" then 1 else 0) else k), t)
      | Cons (VStr h, t) ->
        (let src = sget h in
         let pad = (if str_eq d "A" then " " else chr 0) in
@@ -10566,6 +10759,24 @@ and collect_vis_go = fn world -> fn (anc: str list) -> fn names -> fn blocked ->
             // the inherited entry must not be reconsidered further up.
             if ok then map_set names nm (VSym nm) else map_set blocked nm VNil))
       else ()) in
+    // ⚠ ...and a visibility mark with NO BODY at this level decides too.
+    //   `class B < A; private :b; end` writes privates["B#b"] and no method
+    //   row, so the walk found nothing at B, reached A's public #b and listed
+    //   it -- `B.new.methods` included a method B had made private. The mark
+    //   is read after the rows, so a level that has both is decided above.
+    let mark9 = fn (tbl: str) -> fn (isprot: bool) ->
+      map_iter (if isprot then protecteds else privates) (fn (k: str) -> fn (v: Val) ->
+        if str_len k > plen && str_eq (substring k 0 plen) pfx
+           && (if str_contains (substring k plen (str_len k)) "#" then false else true)
+        then
+          (let nm = substring k plen (str_len k) in
+           if map_has names nm || map_has blocked nm then ()
+           else if (if isprot then (want == 3 || want == 0) else want == 2)
+           then map_set names nm (VSym nm)
+           else map_set blocked nm VNil)
+        else ()) in
+    let _ = mark9 "p" false in
+    let _ = mark9 "p" true in
     // recur = false stops after this level -- unless it is a singleton class,
     // which ruby steps past to reach the object's real class.
     if recur then collect_vis_go world rest names blocked want recur false
@@ -10584,19 +10795,6 @@ and collect_cls_methods = fn world -> fn (cls: str) -> fn names ->
     then (let nm = substring k plen (str_len k) in if map_has names nm then () else map_set names nm (VSym nm))
     else ()) in
   if map_has sup0 cls then collect_cls_methods world (map_get sup0 cls) names else ()
-and collect_methods = fn world -> fn (cls: str) -> fn names ->
-  let (meths0, sup0, _, _) = world in
-  let pfx = cls ++ "#" in
-  let plen = str_len pfx in
-  let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
-    if str_len k > plen && str_eq (substring k 0 plen) pfx
-       && (if str_contains (substring k plen (str_len k)) "#" then false else true)
-       && (if map_has privates k then false else true)
-    then (let nm = substring k plen (str_len k) in if map_has names nm then () else map_set names nm (VSym nm))
-    else ()) in
-  if map_has sup0 cls then collect_methods world (map_get sup0 cls) names
-  else if str_eq cls "Object" || str_eq cls "BasicObject" then ()
-  else collect_methods world "Object" names
 and metaclass_class = fn (c: str) ->
   if is_sng_cls c then "(sng:" ++ metaclass_class (sng_inner c) ++ ")"
   else if map_has modules c then "Module"
@@ -10934,6 +11132,9 @@ and vis_arg_names = fn (args: Val list) ->
   | Nil -> (Nil : str list)
   | Cons (VSym s, t) -> Cons (s, vis_arg_names t)
   | Cons (VStr h, t) -> Cons (sget h, vis_arg_names t)
+  // ...and an ARRAY of names, which `private attr_accessor(:a, :b)` hands over
+  // (attr_* answer the symbols they defined) and ruby accepts.
+  | Cons (VArr id9, t) -> sappend (vis_arg_names (deref id9)) (vis_arg_names t)
   | Cons (_, t) -> vis_arg_names t
 and mark_private_consts = fn (cls: str) -> fn (names: str list) ->
   match names with
