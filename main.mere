@@ -12982,7 +12982,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Process" && (str_len name == 4 && str_eq name "kill") then
       (match args with
        | Cons (sig9, Cons (VInt pid9, _)) ->
-         (if pid9 == getpid () || pid9 == 0 then
+         // signal 0 delivers nothing: it asks whether the process exists and
+         // may be signalled, and our own always does.
+         (if (pid9 == getpid () || pid9 == 0) && (match sig9 with VInt 0 -> true | _ -> false) then VInt 1
+          else if pid9 == getpid () || pid9 == 0 then
             // SignalException#initialize resolves the name and number itself
             // (see the prelude), so the signal is handed over as given.
             raise_exc_val world (make_exc_w world (Cons (VClass "SignalException", Cons (sig9, Nil))))
@@ -13400,6 +13403,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // nothing else set answers [].
          if str_len k > plen && str_eq (substring k 0 plen) pfx
             && (if struct_is_slot k then false else true)
+            && (if ivar_is_internal k plen then false else true)
          then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@" ++ substring k plen (str_len k))))
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -13673,7 +13677,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 | _ -> arr_new args) in
        lz_step env world blk id v)
     // Fiber instances (synchronous): resume runs the stored block once.
-    else if str_eq cls "Fiber" then
+    // An instance of a SUBCLASS carries the same block ivar and is served here
+    // too, for every name the subclass does not define itself.
+    else if str_eq cls "Fiber"
+            || (map_has ivars (str_of_int id ++ "@__fb_blk") && (if has_meth world cls name then false else true)) then
       (let k = str_of_int id in
        if (str_len name == 6 && str_eq name "resume") then
          (if map_has ivars (k ++ "@__fb_done") then raise_exc world "FiberError" "dead fiber called"
@@ -14787,7 +14794,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // for pure sources, and safe for infinite generators).
     else if is_enum_cls cls && ((str_len name == 4 && str_eq name "next") || (str_len name == 4 && str_eq name "peek") || (str_len name == 6 && str_eq name "rewind")) then
       (if (str_len name == 6 && str_eq name "rewind") then
-         (let _ = map_set ivars (str_of_int id ++ "@__e_pos") (VInt 0) in
+         // ⚠ ...and the SOURCE is told as well: ruby calls the enclosed
+         //   object's #rewind when it has one, so an IO- or cursor-backed
+         //   enumerator really starts over.
+         (let _ = (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                   | VObj so9 -> (if has_meth world (dispatch_cls_of world (VObj so9)) "rewind"
+                                  then (let _ = invoke_val_c env world noblk (VObj so9) "rewind" Nil false in ()) else ())
+                   | _ -> ()) in
+          let _ = map_set ivars (str_of_int id ++ "@__e_pos") (VInt 0) in
           // ...and the buffer with it, so a source that can be walked again is.
           let _ = (if map_has ivars (str_of_int id ++ "@__e_buf")
                    then map_delete ivars (str_of_int id ++ "@__e_buf") else ()) in
@@ -17377,12 +17391,16 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           r)
        // Fiber.new { }: minimal synchronous fiber — #resume runs the whole
        // body once (no suspension points in this model).
-       else if str_eq c "Fiber" && (str_len name == 3 && str_eq name "new") then
+       // ⚠ ...and a SUBCLASS of Fiber builds a fiber too, of its own class:
+       //   `Class.new(Fiber).new { }` fell to the generic constructor, which
+       //   made a plain object that could not #resume.
+       else if (str_eq c "Fiber" || (obj_is_a world c "Fiber" && (if has_meth world ("(sng:" ++ c ++ ")") "new" then false else true)))
+               && (str_len name == 3 && str_eq name "new") then
          (let pid = map_len proc_store in
           let _ = store_proc (str_of_int pid) newblk in
           let (m3, s3, ocls3, iv3) = world in
           let fid = alloc_oid ocls3 in
-          let _ = map_set ocls3 fid "Fiber" in
+          let _ = map_set ocls3 fid c in
           let _ = map_set iv3 (str_of_int fid ++ "@__fb_blk") (VProc pid) in
           VObj fid)
        // Thread.new/start/fork { }: the synchronous thread model. The body
@@ -18155,6 +18173,12 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
                  | VMain -> "main"
                  | VStr _ -> hng_key recv | VArr _ -> hng_key recv | VHsh _ -> hng_key recv
                  | _ -> "") in
+     // ⚠ the interpreter's OWN bookkeeping rides in ivars named "@__..."
+     //   (a File's @__f_path and @__f_pos, an Enumerator's @__e_pos, a
+     //   Process::Status's @__st), and listing them leaked the implementation:
+     //   `File.new(p).instance_variables` answered five names where ruby
+     //   answers [], and YAML.dump wrote them out as the object's state.
+     //   A program's own `@__x` is hidden with them -- a cost, named here.
      if (str_len name == 18 && str_eq name "instance_variables") then
        (let pfx = base ++ "@" in
         let plen = str_len pfx in
@@ -18162,6 +18186,7 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
         let _ = if str_eq base "" then () else
           map_iter ivars0 (fn (k: str) -> fn (v: Val) ->
             if str_len k > plen && str_eq (substring k 0 plen) pfx
+               && (if ivar_is_internal k plen then false else true)
             then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym ("@" ++ substring k plen (str_len k))))
             else ()) in
         arr_new (idx_to_list tmp 0 (map_len tmp)))
@@ -21494,6 +21519,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         then map_get raise_bt "eb"
         else if (str_len name == 9 && str_eq name "backtrace") && map_has raise_bt "v"
                 && map_has globals "!" && rb_eq (map_get globals "!") recv
+        then map_get raise_bt "v"
+        // ⚠ ...and after the rescue has finished. `$!` is put back when the
+        //   handler ends, so `(1 / 0 rescue $!).backtrace` -- the exception
+        //   kept, the handler gone -- answered nil. raise_exc now remembers
+        //   the pair it raised beside the frames, and that is asked too.
+        else if (str_len name == 9 && str_eq name "backtrace") && map_has raise_bt "v"
+                && map_has raise_bt "vx" && rb_eq (map_get raise_bt "vx") recv
         then map_get raise_bt "v" else VNil)
      | _ -> (let _ = map_set prim_missing "n" (mkstr name) in
              (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in
@@ -27958,9 +27990,10 @@ and run_sng_hook = fn world -> fn (c: str) -> fn (hook: str) -> fn (nm: str) ->
   if is_sng_cls c then
     (let inner = sng_inner c in
      let recv9 = (if str_len inner > 0 && is_digit (char_at inner 0) then VObj (int_of_str inner) else VClass inner) in
-     let c9 = dispatch_cls_of world recv9 in
-     if has_meth world c9 hook
-     then (let _ = invoke world (false, (Nil : str list), (Nil : Stmt list), map_new ()) recv9 c9 hook (Cons (VSym nm, Nil)) in ())
+     // the hook is a singleton method of the owner, so it lives IN c -- the
+     // very singleton class the method was removed from.
+     if has_meth world c hook
+     then (let _ = invoke world (false, (Nil : str list), (Nil : Stmt list), map_new ()) recv9 c hook (Cons (VSym nm, Nil)) in ())
      else ())
   else ()
 
@@ -27978,6 +28011,12 @@ and lz_offset = fn env -> fn world -> fn (args: Val list) ->
     (match coerce_int_args env world (Cons (a9, Nil)) with
      | Cons (VInt o9, _) -> o9
      | _ -> (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ class_name a9 ++ " into Integer") in 0))
+
+// An ivar key "<id>@__..." is the interpreter's own bookkeeping, not the
+// program's state; both instance_variables doors leave it out (see the note at
+// the dispatch_prim one for what that costs).
+and ivar_is_internal = fn (k: str) -> fn (plen: int) ->
+  str_len k >= plen + 2 && str_eq (substring k plen (plen + 2)) "__"
 
 and kernel_gets = fn world ->
   let av = (if map_has consts "ARGF" then map_get consts "ARGF" else VNil) in

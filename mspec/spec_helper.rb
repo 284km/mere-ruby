@@ -460,6 +460,31 @@ class CloseMatcher
   def match?(actual); (actual - @expected).abs <= @tolerance; end
 end
 def be_close(expected, tolerance = TOLERANCE); CloseMatcher.new(expected, tolerance); end
+# mspec's match_yaml (mspec/matchers/match_yaml.rb): the expectation is YAML
+# text when it parses as YAML and is dumped otherwise, and the two sides are
+# compared after the trailing-space and document-end cleanup mspec does.
+class MatchYAMLMatcher
+  def initialize(expected)
+    @expected = valid_yaml?(expected) ? expected : expected.to_yaml
+  end
+  def match?(actual)
+    actual.is_a?(String) && clean_yaml(actual) == clean_yaml(@expected)
+  end
+  def clean_yaml(yaml)
+    yaml.gsub(/([^-]|^---)\s+\n/, "\\1\n").sub(/\n\.\.\.\n$/, "\n")
+  end
+  def valid_yaml?(obj)
+    require 'yaml'
+    begin
+      YAML.respond_to?(:unsafe_load) ? YAML.unsafe_load(obj) : YAML.load(obj)
+    rescue StandardError
+      false
+    else
+      true
+    end
+  end
+end
+def match_yaml(expected); MatchYAMLMatcher.new(expected); end
 class WithinMatcher
   def initialize(tolerance); @tolerance = tolerance; @expected = nil; end
   def of(expected); @expected = expected; self; end
