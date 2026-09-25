@@ -460,6 +460,7 @@ let gc_bare = map_new ();
 let gc_arg_simple = fn (e: Expr) ->
   match e with
   | EStrL _ -> true | EInt _ -> true | EVar _ -> true | ESym _ -> true
+  | EMethod (EStrL _, m9, Nil) -> str_len m9 > 10 && str_eq (substring m9 0 10) "__lit_fsl~"
   | EBool _ -> true | ENil -> true | EFlt _ -> true
   | _ -> false;
 let rec gc_args_simple = fn (es: Expr list) ->
@@ -920,7 +921,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                 // __lit_enc marker, like __ENCODING__) -- reading the loader's
                 // CURRENT coding here tagged a method's literals with whatever
                 // file happened to be loading when it ran.
-                (let st = fsl_state () in
+                // only the COMMAND LINE decides here: a file's magic comment
+                // was read when the file was parsed (the __lit_fsl marker)
+                (let st = (if fsl_on () then "on" else if map_has cli_fsl "off" then "off" else "") in
                  if str_eq st "on" then (match v with VStr id -> let _ = sfrozen_set id in v | _ -> v)
                  else if str_eq st "off" then v
                  else (match v with VStr id -> let _ = schilled_set id in v | _ -> v)))
@@ -1755,6 +1758,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (match args with Cons (a, _) -> a | _ -> VNil))
     else if (str_len name == 15 && str_eq name "local_variables") && (if map_has meths name then false else true) then local_vars_of env
     else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_of ()
+    // ⚠ a top-level `def include` is a private method of OBJECT, and inside a
+    //   module Module#include is found first. Top-level methods are searched
+    //   before self's here, so a program (or a spec harness) with its own
+    //   `include` swallowed `include M` written in a module's block.
+    else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
+            && map_has meths name && (match (if lv_has env "self" then lv_get env "self" else VNil) with VClass _ -> true | _ -> false) then
+      invoke_val_c env world noblk (lv_get env "self") name args false
     else if map_has meths name then call_method env world noblk name args
     // `catch :tag` with no block: the block IS the method, so there is nothing
     // to run and nothing to catch. ruby reports a LocalJumpError; this reached
@@ -2206,11 +2216,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              (match e9 with
               | EStrL _ -> true
               | EBin (op9, a9, b9) -> str_eq op9 "+" && statstr a9 && statstr b9
+              // a literal wearing its file's frozen_string_literal marker
+              | EMethod (a9, m9, Nil) -> str_len m9 > 10 && str_eq (substring m9 0 10) "__lit_fsl~" && statstr a9
               | _ -> false) in
            statstr recv_e) then
       str_fstring (eval_e env world blk recv_e)
     // a parse-time literal-encoding marker (see the TStrL parse): tag the
     // fresh literal with the file's magic-comment encoding.
+    // the file's frozen_string_literal comment, applied to the fresh literal:
+    // "on" freezes it, "off" leaves it an ordinary (not chilled) string
+    else if str_len name > 10 && str_eq (substring name 0 10) "__lit_fsl~" then
+      (let v = eval_e env world blk recv_e in
+       (match v with
+        | VStr h ->
+          (let _ = (if map_has str_chilled (str_of_int h) then map_delete str_chilled (str_of_int h) else ()) in
+           let _ = (if str_eq (substring name 10 (str_len name)) "on" then sfrozen_set h else ()) in v)
+        | _ -> v))
     else if str_len name > 10 && str_eq (substring name 0 10) "__lit_enc~" then
       (let v = eval_e env world blk recv_e in
        let cd = enc_canon_name (substring name 10 (str_len name)) in
@@ -7616,7 +7637,7 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
   // the singleton class OF AN OBJECT: `#<Class:#<Object:0x..>>`, which needs the
   // world to name the object's class -- the world-free printer leaves it as the
   // bookkeeping name, and this is the only place that can do better.
-  | VClass c -> (if is_sng_cls c then cls_display world c else to_s v)
+  | VClass c -> (if is_sng_cls c || is_refine_impl c then cls_display world c else to_s v)
   // a Range's bounds are inspected the way any other container's elements
   // are -- through the WORLD, so an object bound shows its own #inspect.
   // Falling through to the world-free printer rendered a range of Comparables
@@ -10104,6 +10125,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                           "wrong number of arguments (given 0, expected 1+)" in ())
               | _ -> ()) in
      let _ = extend_arg_check world args in
+     // a refinement is not a module an object can be extended with
+     let _ = (let rec anyref9 = fn (xs: Val list) ->
+                (match xs with Nil -> false | Cons (VClass m9, t9) -> is_refine_impl m9 || anyref9 t9 | Cons (_, t9) -> anyref9 t9) in
+              if anyref9 args then (let _ = raise_exc world "TypeError" "Cannot extend object with refinement" in ()) else ()) in
      // ...and the refusal NAMES what it refused, the way ruby's does: the
      // receiver's class and its inspect ("can't modify frozen Object:
      // #<Object:0x...>"), not the word "object" and a placeholder. A frozen
@@ -11710,7 +11735,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Random" && (str_len name == 8 && str_eq name "new_seed") then VInt (random_int 1000000000)
     else if str_eq c "Random" && ((str_len name == 4 && str_eq name "rand") || (str_len name == 5 && str_eq name "srand") || (str_len name == 5 && str_eq name "bytes")) then
       (if (str_len name == 5 && str_eq name "srand") then srand_val env world args
-       else rand_val world (coerce_int_args env world args))
+       else
+         // Random.rand refuses a limit Kernel#rand would take: zero and the
+         // negatives (Kernel#rand(0) is a Float, Kernel#rand(-3) uses 3)
+         (let ca9 = coerce_int_args env world args in
+          match ca9 with
+          | Cons (VInt n9, _) when n9 <= 0 && (str_len name == 4 && str_eq name "rand") ->
+            raise_exc world "ArgumentError" ("invalid argument - " ++ str_of_int n9)
+          | Cons (VFlt f9, _) when f9 < 0.0 && (str_len name == 4 && str_eq name "rand") ->
+            raise_exc world "ArgumentError" ("invalid argument - " ++ to_s (VFlt f9))
+          | _ -> rand_val world ca9))
     // `SystemCallError.new(msg, errno)` is an instance of THAT errno's class:
     // the number picks it, and a number nothing claims stays a SystemCallError.
     // ⚠ A SINGLE Integer argument is the ERRNO, not a message: ruby answers
@@ -12694,7 +12728,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_len name == 5 && str_eq name "is_a?") || (str_len name == 8 && str_eq name "kind_of?") || (str_len name == 12 && str_eq name "instance_of?") then
       (match args with
        | Cons (VClass t, _) ->
-         let rc = metaclass_class c in
+         // a refinement's module is a Refinement (a Module subclass)
+         let rc = (if is_refine_impl c then "Refinement" else metaclass_class c) in
          // a class EXTENDED with a module is a kind_of? it, and the module
          // lives in the class's metaclass includes -- metaclass_class alone
          // answers only "Class" or "Module" and never sees it.
@@ -14167,6 +14202,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // (or stdin). The block form of each is handled in the block dispatch.
     else if str_eq cls "ARGF" then
       (if (str_len name == 4 && str_eq name "read") then mkstr (argf_input ())
+       // ARGF names itself, and #inspect is #to_s (one method, two names)
+       else if (str_len name == 4 && str_eq name "to_s") || (str_len name == 7 && str_eq name "inspect") then mkstr "ARGF"
        else if (str_len name == 9 && str_eq name "readlines") || (str_len name == 4 && str_eq name "to_a") then
          arr_new (val_list_of_strs (str_lines_go (argf_input ()) 0 0 (str_len (argf_input ()))))
        // The stream methods, over the same slurped stdin and the same position
@@ -15566,9 +15603,21 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | Cons (VInt n9, _) ->
             (if n9 <= 0 then raise_exc world "ArgumentError" ("invalid argument - " ++ str_of_int n9)
              else VInt (mt_rand_int g9 n9))
+          // 0.0 is no limit at all (a Float in [0, 1)); only a negative refuses
           | Cons (VFlt f9, _) ->
-            (if f9 <= 0.0 then raise_exc world "ArgumentError" ("invalid argument - " ++ to_s (VFlt f9))
+            (if f9 < 0.0 then raise_exc world "ArgumentError" ("invalid argument - " ++ to_s (VFlt f9))
+             else if f9 == 0.0 then VFlt (mt_rand_real g9)
              else VFlt (mt_rand_real g9 * f9))
+          // a Bignum limit: enough 32-bit draws for its size, reduced modulo
+          // it -- the same draws for the same seed, and never above the limit.
+          // A negative one refuses like any other.
+          | Cons (VBig b9, _) ->
+            (if str_len b9 > 0 && str_eq (char_at b9 0) "-" then raise_exc world "ArgumentError" ("invalid argument - " ++ b9)
+             else
+               (let words9 = str_len b9 / 9 + 2 in
+                let rec acc9 = fn (k: int) -> fn (a: str) ->
+                  (if k <= 0 then a else acc9 (k - 1) (big_add_s (big_mul_s a "4294967296") (str_of_int (mt_genrand_int32 g9)))) in
+                norm_big (big_mod_s (acc9 words9 "0") b9)))
           | Cons (VRange (av9, bv9, ex9), _) ->
             (match (av9, bv9) with
              | (VInt a9, VInt b9) ->
@@ -30507,6 +30556,14 @@ and cls_display = fn world -> fn (c: str) ->
            let ocn = display_cls world (if map_has ocls oid then map_get ocls oid else "Object") in
            "#<Class:#<" ++ ocn ++ ":0x" ++ hex16_of oid ++ ">>")
      else "#<Class:" ++ cls_display world inner ++ ">")
+  // a refinement shows what it refines and where: #<refinement:C@M>
+  else if is_refine_impl c then
+    (let rest9 = substring c 7 (str_len c) in
+     let u9 = str_rfind rest9 "_" 0 (0 - 1) in
+     let refinery9 = (if u9 < 0 then rest9 else substring rest9 0 u9) in
+     let k9 = (if u9 < 0 then "" else refinery9 ++ "#" ++ substring rest9 (u9 + 1) (str_len rest9)) in
+     let tgt9 = (match (if map_has refine_tgt k9 then map_get refine_tgt k9 else VNil) with VStr h9 -> sget h9 | _ -> "") in
+     "#<refinement:" ++ cls_display world tgt9 ++ "@" ++ cls_display world refinery9 ++ ">")
   else if is_anon_cls c then
     (let addr9 = (let kind = (if str_len c >= 11 && str_eq (substring c 0 11) "AnonModule_" then "Module" else "Class") in
                   "#<" ++ kind ++ ":0x" ++ hex16_of (anon_addr_of c) ++ ">") in
@@ -31059,6 +31116,8 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          (let _ = undef_check world cls names in
           let _ = undef_all meths cls names in
           let _ = list_iter names (fn (n8: str) -> run_cls_hook world cls "method_undefined" n8) in
+          // ...and in a singleton class body the owner hears of it too
+          let _ = list_iter names (fn (n8: str) -> run_sng_hook world cls "singleton_method_undefined" n8) in
           FNext VNil)
        // `define_method(:name) { body }` registers the block as a method;
        // any other expression statement executes.
@@ -31329,6 +31388,9 @@ and do_include = fn world -> fn (base: str) -> fn (mq: str) ->
   //   module to the refinement's own ancestry.
   let _ = (if str_len base >= 7 && str_eq (substring base 0 7) "Refine_"
            then (let _ = raise_exc world "TypeError" "Refinement#include has been removed" in ()) else ()) in
+  // ...nor is a refinement a module anything can mix in, and the refusal
+  // comes before its #append_features could be asked
+  let _ = (if is_refine_impl mq then (let _ = raise_exc world "TypeError" "Cannot include refinement" in ()) else ()) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "append_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "append_features" (Cons (VClass base, Nil)) in ())
@@ -31348,6 +31410,7 @@ and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
   //   module to the refinement's own ancestry.
   let _ = (if str_len base >= 7 && str_eq (substring base 0 7) "Refine_"
            then (let _ = raise_exc world "TypeError" "Refinement#prepend has been removed" in ()) else ()) in
+  let _ = (if is_refine_impl mq then (let _ = raise_exc world "TypeError" "Cannot prepend refinement" in ()) else ()) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let _ = (if has_meth world ("(sng:" ++ mq ++ ")") "prepend_features"
            then (let _ = invoke world noblk (VClass mq) ("(sng:" ++ mq ++ ")") "prepend_features" (Cons (VClass base, Nil)) in ())
@@ -31356,6 +31419,10 @@ and do_prepend = fn world -> fn (base: str) -> fn (mq: str) ->
 
 // `include(M, N)` / `prepend(M, N)` put M nearest: ruby takes the list from
 // the RIGHT, so the first argument ends up in front of the others.
+// a refinement's implementation module (see do_refine)
+and is_refine_impl = fn (c: str) ->
+  str_len c >= 7 && str_eq (substring c 0 7) "Refine_" && map_has modules c
+
 and prep_each = fn world -> fn (c: str) -> fn (args: Val list) ->
   prep_each_go world c (rev_app args Nil)
 
