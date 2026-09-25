@@ -2107,6 +2107,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           let _ = map_set dm_had_blk key
                     (if lv_has env "__has_blk" then lv_get env "__has_blk"
                      else VBool (match blk with (true, _, _, _) -> true | _ -> false)) in
+          // ...and main's define_method makes a PUBLIC method of Object (a
+          // top-level `def` is private; this is not): Object.respond_to? and
+          // Object.send(:remove_method) see it
+          let _ = (if str_eq c "" then
+                     (let ok9 = "Object#" ++ nm in
+                      let _ = set_meth meths ok9 (Meth (drop_yblk_params ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
+                      let _ = map_set dm_methods ok9 VNil in
+                      let _ = dm_store_closure ok9 newblk in
+                      let _ = (if map_has dm_captured key then map_set dm_captured ok9 (map_get dm_captured key) else ()) in
+                      let _ = map_set dm_had_blk ok9 (map_get dm_had_blk key) in
+                      if map_has privates ok9 then map_delete privates ok9 else ())
+                   else ()) in
           VSym nm
        | _ -> VNil)
     // refine Target do <defs> end — inside a Module.new body (self is the
@@ -2910,10 +2922,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
        //
        // ...and a NUMBER against an object that coerces asks it first: ruby
        // answers `1 <=> obj` from the coerced pair, and this said nil.
-       else if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
-          && (match vb with VObj _ -> true | _ -> false) && (responds world vb "coerce" || has_coerce world vb) then
-         (let (ok8, x8, y8) = coerced_pair env world vb va0 in
-          if ok8 then coerced_apply env world "<=>" x8 y8 else VNil)
+       // (asked BEFORE any coerce, as flo_cmp does)
        // ⚠ an INFINITE float asks a non-numeric other for its own #infinite?
        //   and orders by the two signs: ruby's flo_cmp does exactly this, so
        //   `Float::INFINITY <=> obj` is 0 when the object calls itself +1,
@@ -2928,6 +2937,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                     | VInt n7 -> n7
                     | _ -> 0) in
           VInt (if sgn < oi then 0 - 1 else if sgn > oi then 1 else 0))
+       else if (match va0 with VInt _ -> true | VFlt _ -> true | VBig _ -> true | VRat _ -> true | _ -> false)
+          && (match vb with VObj _ -> true | _ -> false) && (responds world vb "coerce" || has_coerce world vb) then
+         (let (ok8, x8, y8) = coerced_pair env world vb va0 in
+          if ok8 then coerced_apply env world "<=>" x8 y8 else VNil)
        // ⚠ Object#<=> answers 0 for two values that are ==, and the question
        //   is the OBJECT's #== -- the value-level rb_eq cannot reach a user
        //   definition, so `E.new <=> E.new` was nil for a class whose #== says
@@ -17590,8 +17603,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
             let r = try_or (fn (u: unit) ->
                               let v = flow_value (run_block world blk newblk (Cons (mkstr tgt, Nil))) in
                               let _ = map_set ok9 "y" 1 in v) VNil in
-            let _ = dir_chdir_to back in
-            if map_has ok9 "y" then r
+            // the way back can be gone (the block removed it): ruby says so
+            let backok9 = dir_chdir_to back == 0 in
+            if map_has ok9 "y" then
+              (if backok9 then r
+               else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir0 - " ++ back))
             else fail "mere-ruby: (exception propagates after Dir.chdir)")
        else if str_eq c "File" && ((str_len name == 4 && str_eq name "open") || (str_len name == 3 && str_eq name "new")) then
          (let fobj = file_open_obj world (path_args (false, (Nil : str list), (Nil : Stmt list), env) world "open" args) in
@@ -28858,13 +28874,16 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
       //   ABSOLUTE position -- `"abcde".unpack("@2C")` reads the third byte --
       //   and past the end is an ArgumentError, which is ruby's message word
       //   for word. `xn` skips n bytes forward.
+      // (a bare `@` is `@0`, the start: fi2 == fi1 means no count was written)
       if str_eq d "@" then
-        (let want = (if cnt < 0 then 1 else cnt) in
+        // (`@*` moves to len - pos: that is what ruby does, measured)
+        (let want = (if fi2 == fi1 then 0 else if cnt < 0 then slen - si else cnt) in
          if want > slen then
            (let _ = prim_raise "ArgumentError" "@ outside of string" in acc)
          else rb_unpack_go s slen want fmt fl fi2 acc)
       else if str_eq d "x" then
-        (let n9 = (if cnt < 0 then 1 else cnt) in
+        // (`x*` skips to the end)
+        (let n9 = (if cnt < 0 && fi2 > fi1 then slen - si else if cnt < 0 then 1 else cnt) in
          let nxt = si + n9 in
          if nxt > slen then
            (let _ = prim_raise "ArgumentError" "x outside of string" in acc)
@@ -28880,11 +28899,63 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
         (let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
          let nb = floor_div (nib + 1) 2 in
          let last = (if si + nb < slen then si + nb else slen) in
-         rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (rb_hex_lo s si last "") "US-ASCII", acc)))
+         // exactly `nib` nibbles: an odd count leaves the last byte's other half
+         (let hx9 = rb_hex_lo s si last "" in
+          rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (if str_len hx9 > nib then substring hx9 0 nib else hx9) "US-ASCII", acc))))
       // ⚠ `Z` reads up to the first NUL and SKIPS PAST IT; it was not here at
       //   all, so `"ab\x00cd".unpack("Z*")` answered []. `A` strips trailing
       //   NULs and spaces, which `a` does not -- they shared one arm and both
       //   kept the padding.
+      // a NUL is no directive at all
+      else if str_eq d (chr 0) then
+        (let _ = prim_raise "ArgumentError" ("unknown unpack directive '\\0' in '" ++ fmt ++ "'") in acc)
+      // `X` backs up: count bytes (a bare one is 1), never before the start
+      else if str_eq d "X" then
+        // (`X*` backs up by as many bytes as remain after the position)
+        (let n9 = (if fi2 == fi1 then 1 else if cnt < 0 then slen - si else cnt) in
+         if n9 > si then (let _ = prim_raise "ArgumentError" "X outside of string" in acc)
+         else rb_unpack_go s slen (si - n9) fmt fl fi2 acc)
+      // `u`: uuencoded lines, each led by its length character
+      else if str_eq d "u" then
+        (let rec lines9 = fn (i: int) -> fn (out: str) ->
+           (if i >= slen then (out, i)
+            else
+              (let ln9 = floor_mod (ord (char_at s i) - 32) 64 in
+               if ln9 == 0 then (out, slen)
+               else
+                 (let rec grp9 = fn (j: int) -> fn (left: int) -> fn (o2: str) ->
+                    (if left <= 0 || j + 3 >= slen + 3 then (o2, j)
+                     else
+                       (let c9 = fn (k: int) -> (if j + k < slen then floor_mod (ord (char_at s (j + k)) - 32) 64 else 0) in
+                        let v9 = c9 0 * 262144 + c9 1 * 4096 + c9 2 * 64 + c9 3 in
+                        let b3 = chr (v9 / 65536) ++ chr (floor_mod (v9 / 256) 256) ++ chr (floor_mod v9 256) in
+                        grp9 (j + 4) (left - 3) (o2 ++ (if left >= 3 then b3 else substring b3 0 left)))) in
+                  match grp9 (i + 1) ln9 "" with
+                  | (piece9, j9) ->
+                    (let rec eol9 = fn (k: int) -> (if k < slen && (if str_eq (char_at s k) "\n" then false else true) then eol9 (k + 1) else k) in
+                     let e9 = eol9 j9 in
+                     lines9 (if e9 < slen then e9 + 1 else e9) (out ++ piece9))))) in
+         match lines9 si "" with
+         | (bytes9, i9) -> rb_unpack_go s slen i9 fmt fl fi2 (Cons (mkstr_e bytes9 "ASCII-8BIT", acc)))
+      // `#` to the end of the line is a comment
+      else if str_eq d "#" then
+        (let rec skip9 = fn (k: int) -> (if k < fl && (if str_eq (char_at fmt k) "\n" then false else true) then skip9 (k + 1) else k) in
+         rb_unpack_go s slen si fmt fl (skip9 fi1 + 1) acc)
+      // `w`: BER-compressed integers, seven bits a byte, high bit = more;
+      // the count is how many (`*` all of them), and a big one is a Bignum
+      else if str_eq d "w" then
+        (let rec one9 = fn (i: int) -> fn (v: str) ->
+           (if i >= slen then (v, i)
+            else (let b9 = ord (char_at s i) in
+                  let v2 = big_add_s (big_mul_s v "128") (str_of_int (b9 - (b9 / 128) * 128)) in
+                  if b9 >= 128 then one9 (i + 1) v2 else (v2, i + 1))) in
+         // how many: `*` all of them, bare one, else the count
+         let want9 = (if cnt < 0 && fi2 > fi1 then 0 - 1 else if fi2 == fi1 then 1 else cnt) in
+         let rec many9 = fn (i: int) -> fn (k: int) -> fn (out: Val list) ->
+           (if i >= slen || (want9 >= 0 && k >= want9) then (i, out)
+            else (match one9 i "0" with (v9, i2) -> many9 i2 (k + 1) (Cons (norm_big v9, out)))) in
+         match many9 si 0 acc with
+         | (i3, acc3) -> rb_unpack_go s slen i3 fmt fl fi2 acc3)
       else if str_eq d "Z" then
         (let take = (if cnt < 0 then slen - si else cnt) in
          let last = (if si + take < slen then si + take else slen) in
@@ -28898,7 +28969,8 @@ and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str
         let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
         let nb = floor_div (nib + 1) 2 in
         let last = (if si + nb < slen then si + nb else slen) in
-        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (rb_hex_of s si last "") "US-ASCII", acc))
+        (let hx9 = rb_hex_of s si last "" in
+         rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (if str_len hx9 > nib then substring hx9 0 nib else hx9) "US-ASCII", acc)))
       else if str_eq d "a" || str_eq d "A" then
         let take = (if cnt < 0 then slen - si else cnt) in
         let last = (if si + take < slen then si + take else slen) in
@@ -33200,12 +33272,17 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     // encoding, which is saved for the same reason).
     let savedpf9 = (if map_has load_ctx "pfile" then map_get load_ctx "pfile" else mkstr "") in
     let _ = map_set load_ctx "pfile" (mkstr efile9) in
+    // eval'd source is its own compilation unit: its literals follow ITS
+    // magic comment (usually none), not that of the file loading right now
+    let savedfsl9 = (if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "") in
+    let _ = map_set fsl_ctx "v" (src_fsl code) in
     let prog2 = try_or (fn (u: unit) ->
       let toks = number_nls_at code (lex_go code 0) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
       let (p2, _) = parse_stmts toks Nil in
       let _ = rx_check_pending () in
      let _ = warn_flush world in p2) sentinel in
+    let _ = map_set fsl_ctx "v" savedfsl9 in
     let _ = map_set load_ctx "parsing" (mkstr "") in
     let _ = map_set load_ctx "pfile" savedpf9 in
     let _ = map_set load_ctx "coding" savedc in
