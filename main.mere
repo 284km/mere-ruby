@@ -11030,13 +11030,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // File.path(obj): the string form of a path — the object itself when it
        // is already a String, else its #to_path.
        else if (str_len name == 4 && str_eq name "path") then
-         (match args with
-          | Cons (VStr ph, _) -> mkstr (sget ph)
+         // a path holds no NUL, whether it came as a String or from #to_path
+         (let nul9 = fn (p9: str) ->
+            (if str_contains p9 (chr 0) then raise_exc world "ArgumentError" "path name contains null byte"
+             else mkstr p9) in
+          match args with
+          | Cons (VStr ph, _) -> nul9 (sget ph)
           // ⚠ ...and anything WITHOUT #to_path is a TypeError, not the
           //   NoMethodError that asking it anyway produced. path_args has
           //   already run the #to_path/#to_str conversion, so a value that
-          //   is still not a String here has neither.
-          | Cons (VObj o9, _) -> invoke_val_c env world noblk (VObj o9) "to_path" Nil false
+          //   is still not a String here has neither -- or its #to_path
+          //   answered something that is not one, which is a TypeError too.
+          | Cons (VObj o9, _) ->
+            (match invoke_val_c env world noblk (VObj o9) "to_path" Nil false with
+             | VStr h9 -> nul9 (sget h9)
+             | r9 -> raise_exc world "TypeError"
+                       ("can't convert " ++ class_name (VObj o9) ++ " to String (" ++ class_name (VObj o9)
+                        ++ "#to_path gives " ++ class_name r9 ++ ")"))
           | _ -> path_arg_err world args 1 1)
        // ⚠ A NON-String PATH IS A TypeError. All three of these answered ""
        //   for anything that was not a String -- File.basename(1) was "",
@@ -11213,10 +11223,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                (let rec each9 = fn (xs: Val list) ->
                   (match xs with
                    | Nil -> VNil
-                   | Cons (l9, t9) -> (let _ = run_block world noblk blk (Cons (l9, Nil)) in each9 t9)) in
-                each9 ls)
-             // no block: ruby answers an Enumerator over the same lines.
-             | _ -> make_enum world (arr_new ls) "each")
+                   // $. counts the lines as each one is yielded, as #gets does
+                   | Cons (l9, t9) ->
+                     (let _ = map_set globals "." (VInt ((match (if map_has globals "." then map_get globals "." else VInt 0) with VInt n -> n | _ -> 0) + 1)) in
+                      let _ = run_block world noblk blk (Cons (l9, Nil)) in each9 t9)) in
+                let _ = map_set globals "." (VInt 0) in
+                let r9 = each9 ls in
+                // ...and leaves $_ unset afterwards
+                let _ = map_set globals "_" VNil in
+                r9)
+             // no block: ruby answers an Enumerator over the same lines, whose
+             // size it does not know without reading the file.
+             | _ ->
+               (let e9 = make_enum world (arr_new ls) "each" in
+                let _ = (match e9 with
+                         | VObj eo9 -> (let (_, _, _, iv9) = world in map_set iv9 (str_of_int eo9 ++ "@__e_size") VNil)
+                         | _ -> ()) in
+                e9))
           | _ -> VNil)
        else if (str_len name == 13 && str_eq name "absolute_path") then
          (match args with
@@ -11233,7 +11256,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        //   empty piece left a doubled slash. A non-String is asked for
        //   #to_path then #to_str, and refused by name if it has neither.
        else if (str_len name == 4 && str_eq name "join") then
-         mkstr (file_join_parts (file_join_flat env world args (map_new ())) "")
+         (let j9 = file_join_parts (file_join_flat env world args (map_new ())) "" in
+          // a path cannot hold NUL, and ruby refuses it here rather than later
+          if str_contains j9 (chr 0) then raise_exc world "ArgumentError" "string contains null byte"
+          else mkstr j9)
        else if (str_len name == 11 && str_eq name "expand_path") then
          // File.expand_path(path[, base]): a relative path resolves against
          // base when given (that is how a library says "next to this file",
@@ -11272,10 +11298,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 5 && str_eq name "chmod") then
          (match args with
           | Cons (mv, paths9) ->
-            (let md = (match coerce_int_args env world (Cons (mv, Nil)) with
-                       | Cons (VInt n9, _) -> n9
-                       | _ -> (let _ = raise_exc world "TypeError"
-                                 ("no implicit conversion of " ++ class_name mv ++ " into Integer") in 0)) in
+            (let md = chmod_mode env world mv in
              chmod_paths world (oct12 md) paths9 0)
           | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)")
        else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then file_open_obj world args
@@ -14295,7 +14318,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        //   the length just asked for.
        else if (str_len name == 5 && str_eq name "chmod") then
          (match args with
-          | Cons (VInt m9, Nil) -> (let _ = run ("chmod " ++ oct12 m9 ++ " " ++ shq path ++ " 2>/dev/null") in VInt 0)
+          | Cons (mv9, Nil) ->
+            (let m9 = chmod_mode env world mv9 in
+             let _ = run ("chmod " ++ oct12 m9 ++ " " ++ shq path ++ " 2>/dev/null") in VInt 0)
           | _ -> path_arg_err world args 1 1)
        else if (str_len name == 8 && str_eq name "truncate") then
          (match args with
@@ -28868,6 +28893,17 @@ and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
             then (match rest with Cons (b, r2) -> Cons (to_path_str nb world b, r2) | Nil -> Nil)
             else rest)))
 
+// A chmod MODE: an Integer, or anything #to_int makes one. One too wide for
+// the C side (an Integer beyond 64 bits here) is a RangeError, as ruby's
+// conversion to mode_t says -- not the TypeError "no implicit conversion".
+and chmod_mode = fn env -> fn world -> fn (mv: Val) ->
+  (match coerce_int_args env world (Cons (mv, Nil)) with
+   | Cons (VInt n9, _) -> n9
+   | Cons (big9, _) when str_eq (class_name big9) "Integer" ->
+     (let _ = raise_exc world "RangeError" ("integer " ++ to_s big9 ++ " too big to convert to 'long'") in 0)
+   | _ -> (let _ = raise_exc world "TypeError"
+             ("no implicit conversion of " ++ class_name mv ++ " into Integer") in 0))
+
 // File.chmod(mode, *paths): one shell call per path, so a missing one can be
 // named. The mode is already four octal digits (oct12).
 and chmod_paths = fn world -> fn (md: str) -> fn (paths: Val list) -> fn (acc: int) ->
@@ -31649,9 +31685,12 @@ and file_join_flat = fn env -> fn world -> fn (args: Val list) -> fn seen ->
                   (let k9 = str_of_int aid in
                    if map_has seen k9 then
                      (let _ = raise_exc world "ArgumentError" "recursive array" in (Nil : str list))
+                   // an array is ONE piece: itself joined, so `[]` is the empty
+                   // piece and `File.join([], [])` is "/" as `File.join("", "")` is.
                    else (let _ = map_set seen k9 1 in
                          let inner = file_join_flat env world (deref aid) seen in
-                         let _ = map_delete seen k9 in inner))
+                         let _ = map_delete seen k9 in
+                         Cons (file_join_parts inner "", Nil)))
                 | other ->
                   (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
                    if responds world other "to_path" then
