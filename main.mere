@@ -7559,6 +7559,8 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        let nm9 = (if str_eq raw9 "" then ""
                   else if str_contains raw9 "AnonClass_" then ""
                   else if str_contains raw9 "AnonModule_" then ""
+                  // a temporary name ("#<Module:0x..>::S") is not a name either
+                  else if str_len raw9 >= 2 && str_eq (substring raw9 0 2) "#<" then ""
                   else if str_len raw9 >= 7 && str_eq (substring raw9 0 7) "Struct_" then ""
                   else raw9 ++ " ") in
        let ms = (match map_get struct_mem mc9 with VArr aid -> deref aid | _ -> Nil) in
@@ -11894,7 +11896,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | VStr h9 -> VClass (sget h9)
        | _ -> VNil)
     else if (str_len name == 4 && str_eq name "name") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
-      (if map_has anon_name c then map_get anon_name c
+      (if is_sng_cls c then VNil
+       else if map_has anon_name c then map_get anon_name c
+       else if is_anon_cls c && str_find_from c "::" 0 > 0 then mkstr (to_s (VClass c))
        else if is_anon_cls c then VNil
        else mkstr c)
     // Class#superclass: the recorded superclass, else Object (BasicObject has
@@ -11959,7 +11963,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             || (str_len name == 22 && str_eq name "public_instance_method") then
       (let (meths0, sup0, ocls0, ivars0) = world in
        let want_pub9 = (str_len name == 22 && str_eq name "public_instance_method") in
-       let mname = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
+       // the name is a Symbol or a String (or converts to one) -- anything else
+       // is a TypeError, not a lookup of the empty name.
+       let _ = (match args with
+                | Cons (VSym _, _) -> ()
+                | Cons (VStr _, _) -> ()
+                | Cons (a9, _) ->
+                  (if responds world a9 "to_str" then ()
+                   else (let _ = raise_exc world "TypeError" (inspect a9 ++ " is not a symbol nor a string") in ()))
+                | Nil -> ()) in
+       let mname = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h
+                                  | Cons (a9, _) -> (match invoke_val_c env world blk a9 "to_str" Nil false with VStr h -> sget h | _ -> "")
+                                  | _ -> "") in
        let origin = (let a = lookup_anc world (ancestors_of world c) mname in
                      if str_eq a "" && map_has meths0 (c ++ "#" ++ mname) then c else a) in
        // a builtin method has no entry in the user method table, but it is
@@ -12021,10 +12036,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       else if meth_protected world c mname then "protected" else "")
                    else "") in
        let where9 = (if map_has modules c then "module '" else "class '") ++ c ++ "'" in
+       // ...and the NameError carries the name and the receiver, which is
+       // what #name and #receiver answer.
+       let nf9 = Cons (("__name", VSym mname), Cons (("__recv", recv), Nil)) in
        if (if str_eq hid9 "" then false else true) then
-         raise_exc world "NameError" ("method '" ++ mname ++ "' for " ++ where9 ++ " is " ++ hid9)
+         raise_exc_iv world "NameError" ("method '" ++ mname ++ "' for " ++ where9 ++ " is " ++ hid9) nf9
        else if str_eq origin "" then
-         raise_exc world "NameError" ("undefined method '" ++ mname ++ "' for " ++ where9)
+         raise_exc_iv world "NameError" ("undefined method '" ++ mname ++ "' for " ++ where9) nf9
        else
          (let id = alloc_oid ocls0 in
           let _ = map_set ocls0 id "UnboundMethod" in
@@ -12771,7 +12789,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_len name == 18 && str_eq name "set_temporary_name") then
       (match args with
        | Cons (VNil, _) ->
-         (if is_anon_cls c then (let _ = (if map_has anon_name c then map_delete anon_name c else ()) in recv)
+         // ⚠ a module nested in an anonymous one has a name built from its
+         //   path, and clearing the temporary name leaves NO name, not that
+         //   one -- so the slot keeps an explicit nil.
+         (if is_anon_cls c && str_find_from c "::" 0 > 0 then (let _ = map_set anon_name c VNil in recv)
+          else if is_anon_cls c then (let _ = (if map_has anon_name c then map_delete anon_name c else ()) in recv)
           else raise_exc world "RuntimeError" "can't change permanent name")
        | Cons (VStr h8, _) ->
          (let s8 = sget h8 in
@@ -15011,7 +15033,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    else (let a9 = enum_to_arr env world blk id in
                          let _ = map_set ivars bk a9 in a9)) in
          let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
-         if pos >= val_list_len xs then raise_exc world "StopIteration" "iteration reached an end"
+         if pos >= val_list_len xs then
+           raise_exc_iv world "StopIteration" "iteration reached an end"
+             (Cons (("result", (if map_has ivars (str_of_int id ++ "@__e_ret") then map_get ivars (str_of_int id ++ "@__e_ret") else VNil)), Nil))
          else
            let v = val_nth xs pos in
            let _ = (if (str_len name == 4 && str_eq name "next") then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
@@ -27674,7 +27698,12 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
                 let _ = map_set ocls0 yid "Enumerator::Yielder" in
                 let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
                 // a break escaping the generator (no loop of its own) ends here.
-                let f = try_or (fn (u: unit) -> let _ = run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil)) in FNext VNil) (FRaise VNil) in
+                // A run to the end keeps what the generator RETURNED: that is
+                // the finished iterator's StopIteration#result.
+                let f = try_or (fn (u: unit) ->
+                          let r9 = run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil)) in
+                          let _ = (if n < 0 then map_set ivars0 (str_of_int eid ++ "@__e_ret") (flow_value r9) else ()) in
+                          FNext VNil) (FRaise VNil) in
                 (match f with
                  | FRaise _ ->
                    (if map_has flow_sig "k" then
@@ -28767,6 +28796,14 @@ and oct12 = fn (n9: int) ->
 
 and to_path_str = fn nb -> fn world -> fn (v: Val) ->
   (match v with
+   // a File's #to_path is a builtin, which has_meth does not see, so a File
+   // handed to File.expand_path / File.delete / ... was refused as "no
+   // implicit conversion of File into String". Its path is recorded.
+   | VObj fo9 when (let (_, _, _, iv9) = world in map_has iv9 (str_of_int fo9 ++ "@__f_path")) ->
+     (let (_, _, _, iv9) = world in
+      match map_get iv9 (str_of_int fo9 ++ "@__f_path") with
+      | VStr h9 -> mkstr (sget h9)
+      | _ -> v)
    | VObj _ ->
      (let cls = dispatch_cls_of world v in
       let via = (if has_meth world cls "to_path" then invoke world nb v cls "to_path" Nil else v) in
@@ -30862,6 +30899,9 @@ and cls_display = fn world -> fn (c: str) ->
            // class (that is how dispatch finds it), so the name has to be walked
            // back to the real one -- display_cls is that walk.
            let ocn = display_cls world (if map_has ocls oid then map_get ocls oid else "Object") in
+           // ...and an anonymous class prints as ruby prints it, not as its
+           // bookkeeping name (`#<Class:#<#<Class:0x..>:0x..>>`)
+           let ocn = (if is_anon_cls ocn then to_s (VClass ocn) else ocn) in
            "#<Class:#<" ++ ocn ++ ":0x" ++ hex16_of oid ++ ">>")
      else "#<Class:" ++ cls_display world inner ++ ">")
   // a refinement shows what it refines and where: #<refinement:C@M>
@@ -33429,16 +33469,17 @@ and run_loop_builtin = fn env -> fn world -> fn blk -> fn theblk ->
      else
        // a StopIteration ends the loop quietly; other exceptions re-raise.
        let (meths, sup, ocls, ivars) = world in
-       let ecls = (if map_has ivars "$exc" then (match map_get ivars "$exc" with VExc (c, _) -> c | _ -> "") else "") in
+       let ecls = (if map_has ivars "$exc" then exc_cls_of world (map_get ivars "$exc") else "") in
        // ⚠ ...and a SUBCLASS of StopIteration ends it too. Compared by name
        //   this caught only StopIteration itself, so `loop { raise
        //   Class.new(StopIteration) }` escaped the loop as an ordinary error.
-       //   (`loop` also answers the finished iterator's RESULT, which is what
-       //   the generator block returned. Nothing keeps that here -- an
-       //   Enumerator is materialised and the block's own value is dropped --
-       //   so this answers nil, as it did before.)
+       //   `loop` answers the exception's #result -- what the finished
+       //   generator returned, which Enumerator#next puts on it.
        if (if str_eq ecls "" then false else exc_is_a world ecls "StopIteration") then
-         (let _ = map_delete ivars "$exc" in VNil)
+         (let r9 = (match map_get ivars "$exc" with
+                    | VObj xo9 -> (if map_has ivars (str_of_int xo9 ++ "@result") then map_get ivars (str_of_int xo9 ++ "@result") else VNil)
+                    | _ -> VNil) in
+          let _ = map_delete ivars "$exc" in r9)
        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
    | _ -> run_loop_builtin env world blk theblk)
 

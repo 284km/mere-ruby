@@ -17,7 +17,7 @@ of the subject: a row measured against another release is not comparable with th
 ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 47 | 20 | 0 | 0 | 0 | 67 |
+| language | 48 | 19 | 0 | 0 | 0 | 67 |
 | core/string | 114 | 0 | 0 | 0 | 0 | 114 |
 | core/array | 103 | 1 | 0 | 0 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
@@ -29,7 +29,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 50 | 0 | 0 | 0 | 0 | 50 |
 | core/integer | 69 | 1 | 0 | 0 | 0 | 70 |
-| core/kernel | 92 | 25 | 0 | 1 | 0 | 118 |
+| core/kernel | 94 | 23 | 0 | 1 | 0 | 118 |
 | core/matchdata | 30 | 0 | 0 | 0 | 0 | 30 |
 | core/method | 20 | 6 | 0 | 0 | 0 | 26 |
 | core/mutex | 3 | 4 | 0 | 0 | 0 | 7 |
@@ -48,7 +48,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/set | 55 | 0 | 0 | 0 | 0 | 55 |
 | core/regexp | 20 | 4 | 0 | 0 | 0 | 24 |
 | core/enumerable | 59 | 2 | 0 | 0 | 0 | 61 |
-| core/module | 53 | 30 | 0 | 1 | 1 | 85 |
+| core/module | 55 | 28 | 0 | 1 | 1 | 85 |
 | core/filetest | 25 | 0 | 0 | 0 | 0 | 25 |
 | core/data | 10 | 3 | 0 | 0 | 0 | 13 |
 | core/math | 29 | 0 | 0 | 0 | 0 | 29 |
