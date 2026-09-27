@@ -12890,6 +12890,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                      list_iter (str_split (name_spec (if want_priv then "clspriv" else "clspub")) "|")
                        (fn (nc9: str) -> (if map_has meths0 (pfx ++ nc9) then () else push9 nc9))
                    else ()) in
+          // ...and PROC's public ones
+          let _ = (if str_eq cx "Proc" && (if want_prot || want_priv then false else true) then
+                     list_iter (str_split (name_spec "procpub") "|")
+                       (fn (np9: str) -> (if map_has meths0 (pfx ++ np9) then () else push9 np9))
+                   else ()) in
           // ...and BASICOBJECT's, for the same reason.
           let _ = (if str_eq cx "BasicObject" && (if want_prot then false else true) then
                      list_iter (str_split (name_spec (if want_priv then "bopriv" else "bopub")) "|")
@@ -15383,8 +15388,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             && (if (str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take") then false else true)
             && (is_enum_method name || (str_len name == 15 && str_eq name "each_with_index") ||
                 (str_len name == 4 && str_eq name "drop") || (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons")) then
+      // ...but a method that answers an ENUMERATOR when it has no block
+      // (each_slice, map, select...) wraps THIS one, as ruby does:
+      // `(1..3).each.each_slice(2)` is
+      // `#<Enumerator: #<Enumerator: 1..3:each>:each_slice(2)>`. Materializing
+      // first made it an enumerator over an Array copy.
+      (if (let (h9, _, _, _) = blk in (if h9 then false else true))
+          // (#each_with_index takes no argument: given one, the array path refuses it)
+          && (if (str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> false | _ -> true) then false else true)
+          && (enum_needs_block name || (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons")
+              || ((str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> true | _ -> false)))
+          && (match args with
+              | Cons (VInt n9, _) -> n9 >= 1 || (if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") then false else true)
+              | Nil -> (if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") then false else true)
+              | _ -> true)
+       then make_enum_a world recv name args
+       else
       (let av = enum_to_arr env world blk id in
-       invoke_val_c env world blk av name args vischeck)
+       invoke_val_c env world blk av name args vischeck))
     // external iteration (re-drive style: the enumerator is re-run, bounded
     // to pos+1 elements, and indexed by @__e_pos — O(n^2) overall but correct
     // for pure sources, and safe for infinite generators).
@@ -15431,11 +15452,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // with_index(offset = 0) without a block: an Enumerator of [elem, i+offset]
     // pairs; with_object handled by the with-block dispatcher.
     else if is_enum_cls cls && ((str_len name == 10 && str_eq name "with_index") || (str_len name == 15 && str_eq name "each_with_index")) && (let (h9, _, _, _) = blk in (if h9 then false else true)) then
-      (let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
-       let av = enum_to_arr env world blk id in
-       (match av with
-        | VArr aid2 -> (let _ = () in make_enum world (arr_new (with_index_pairs_off (deref aid2) off)) "each")
-        | _ -> VNil))
+      // an Enumerator over THIS one (see the arm above), not over the pairs;
+      // #each_with_index takes no argument at all
+      (if (str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> false | _ -> true)
+       then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
+       else make_enum_a world recv name args)
     // next_values / peek_values: like next/peek but every yield is an array.
     else if is_enum_cls cls && ((str_len name == 11 && str_eq name "next_values") || (str_len name == 11 && str_eq name "peek_values")) then
       (let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
@@ -27913,7 +27934,22 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
   // keyword_init structs take their members as (nil-defaulted) keyword params;
   // positional structs take them positionally.
   let kw = struct_kw_init args in
-  let _ = set_meth meths (anon ++ "#initialize")
+  // ⚠ ruby's member initializer is STRUCT's #initialize, above the parent, so
+  //   a parent that defines its own (`def initialize(*); @key = :value;
+  //   super; end`) runs first and reaches it with super. Installed on the
+  //   generated class itself it shadowed the parent's, and the parent's body
+  //   never ran. When the parent chain has one, the initializer goes in as
+  //   #__struct_init and Struct#initialize forwards to it.
+  let init_owner9 = lookup_anc world (ancestors_of world (if str_eq parent "" then "Struct" else parent)) "initialize" in
+  let parent_inits9 = (if str_eq init_owner9 "" || str_eq init_owner9 "Struct" then false
+                       else obj_is_a world init_owner9 "Struct") in
+  let init_key9 = (if parent_inits9 then anon ++ "#__struct_init" else anon ++ "#initialize") in
+  let _ = (if parent_inits9 && (if map_has meths "Struct#initialize" then false else true) then
+             set_meth meths "Struct#initialize"
+               (Meth (Cons ("*__sa", Nil), Nil,
+                      Cons (SReturn (EMethod (ESelf, "__struct_init", Cons (ESplat (EVar "__sa"), Nil))), Nil)))
+           else ()) in
+  let _ = set_meth meths init_key9
             (if kw then Meth (struct_kw_params members, struct_kw_defaults members, struct_init_body members)
              // Positional members default to nil: Struct.new(:a, :b).new takes
              // 0..2 arguments in Ruby, filling what is missing.
@@ -28735,6 +28771,10 @@ and make_anon_cls = fn world -> fn (c: str) -> fn (args: Val list) ->
               | Cons (v9, _) -> (let _ = raise_exc world "TypeError"
                                    ("superclass must be an instance of Class (given "
                                     ++ for_recv_cls world (class_name v9) ++ ")") in ())) in
+     // ...and the superclass hears of it, BEFORE the block runs: `inherited`
+     // fired for `class X < D` and never for `Class.new(D)`
+     let _ = call_inherited world gc_cenv0
+               (match args with Cons (VClass sc, _) -> sc | _ -> "Object") anon in
      VClass anon)
 
 and file_write_at = fn world -> fn (id: int) -> fn (piece: str) ->
