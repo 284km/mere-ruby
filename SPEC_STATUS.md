@@ -17,7 +17,7 @@ of the subject: a row measured against another release is not comparable with th
 ones around it, and the difference reads as movement in mere-ruby.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 48 | 19 | 0 | 0 | 0 | 67 |
+| language | 49 | 18 | 0 | 0 | 0 | 67 |
 | core/string | 114 | 0 | 0 | 0 | 0 | 114 |
 | core/array | 103 | 1 | 0 | 0 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
@@ -48,7 +48,7 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/set | 55 | 0 | 0 | 0 | 0 | 55 |
 | core/regexp | 20 | 4 | 0 | 0 | 0 | 24 |
 | core/enumerable | 59 | 2 | 0 | 0 | 0 | 61 |
-| core/module | 58 | 25 | 0 | 1 | 1 | 85 |
+| core/module | 59 | 24 | 0 | 1 | 1 | 85 |
 | core/filetest | 25 | 0 | 0 | 0 | 0 | 25 |
 | core/data | 11 | 2 | 0 | 0 | 0 | 13 |
 | core/math | 29 | 0 | 0 | 0 | 0 | 29 |
@@ -69,9 +69,9 @@ ones around it, and the difference reads as movement in mere-ruby.
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/fiber | 2 | 11 | 0 | 0 | 0 | 13 |
 | core/dir | 33 | 1 | 0 | 0 | 0 | 34 |
-| core/file | 55 | 9 | 0 | 4 | 0 | 68 |
+| core/file | 56 | 8 | 0 | 4 | 0 | 68 |
 | core/time | 61 | 5 | 0 | 0 | 0 | 66 |
-| core/io | 58 | 22 | 0 | 1 | 0 | 81 |
+| core/io | 59 | 21 | 0 | 1 | 0 | 81 |
 | library/date | 98 | 0 | 0 | 0 | 0 | 98 |
 | library/etc | 17 | 2 | 0 | 0 | 0 | 19 |
 | library/pathname | 18 | 2 | 0 | 0 | 0 | 20 |

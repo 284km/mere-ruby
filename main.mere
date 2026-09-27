@@ -3862,6 +3862,11 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
 // than the VExc pair raise_exc makes) had to copy all four lines.
 // A Complex part may be any Numeric, and a Numeric OBJECT is a real when its
 // own #real? says so. The builtin reals answer without being asked.
+// an object whose class does not include Kernel (a BasicObject) has none of
+// Kernel's methods -- unless one was bound to it explicitly (bm_bypass)
+and bo_refuses = fn world -> fn (c: str) ->
+  (if map_has bm_bypass "k" then false else true)
+  && (if str_list_has (ancestors_of world c) "Kernel" then false else true)
 and cpx_is_real = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VCpx (_, _) -> false
@@ -10097,6 +10102,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 (let (_, _, ocls9, _) = world in
                  let c9 = map_get ocls9 oid in
                  (if map_has enc_name (str_of_int oid) then false
+                  // a BasicObject has neither (see the refusal further down)
+                  else if bo_refuses world c9 then false
                   else if map_has md_whole oid then false
                   else if is_struct_obj_cls world c9 then false
                   // a Method / UnboundMethod writes itself the way ruby writes
@@ -11292,11 +11299,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // is already a String, else its #to_path.
        else if (str_len name == 4 && str_eq name "path") then
          // a path holds no NUL, whether it came as a String or from #to_path
-         (let nul9 = fn (p9: str) ->
-            (if str_contains p9 (chr 0) then raise_exc world "ArgumentError" "path name contains null byte"
-             else mkstr p9) in
+         // ...and it is in an ASCII-compatible encoding (a UTF-32 path is
+         // refused before its bytes are looked at)
+         (let nul9h = fn (h9: int) ->
+            (let e9 = enc_canon_name (senc_get h9) in
+             if (if enc_ascii_compat e9 then false else true)
+             then raise_exc world "Encoding::CompatibilityError" ("path name must be ASCII-compatible (" ++ e9 ++ ")")
+             else if str_contains (sget h9) (chr 0) then raise_exc world "ArgumentError" "path name contains null byte"
+             else mkstr (sget h9)) in
           match args with
-          | Cons (VStr ph, _) -> nul9 (sget ph)
+          | Cons (VStr ph, _) -> nul9h ph
           // ⚠ ...and anything WITHOUT #to_path is a TypeError, not the
           //   NoMethodError that asking it anyway produced. path_args has
           //   already run the #to_path/#to_str conversion, so a value that
@@ -11304,7 +11316,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           //   answered something that is not one, which is a TypeError too.
           | Cons (VObj o9, _) ->
             (match invoke_val_c env world noblk (VObj o9) "to_path" Nil false with
-             | VStr h9 -> nul9 (sget h9)
+             | VStr h9 -> nul9h h9
              | r9 -> raise_exc world "TypeError"
                        ("can't convert " ++ class_name (VObj o9) ++ " to String (" ++ class_name (VObj o9)
                         ++ "#to_path gives " ++ class_name r9 ++ ")"))
@@ -12289,14 +12301,25 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                   (if responds world a9 "to_str" then ()
                    else (let _ = raise_exc world "TypeError" (inspect a9 ++ " is not a symbol nor a string") in ()))
                 | Nil -> ()) in
-       let mname = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h
-                                  | Cons (a9, _) -> (match invoke_val_c env world blk a9 "to_str" Nil false with VStr h -> sget h | _ -> "")
-                                  | _ -> "") in
+       // (a #to_str that answers a non-String is the TypeError sym_or_str_arg raises)
+       let mname = (match args with Cons (a9, _) -> sym_or_str_arg env world a9 | _ -> "") in
+       // ⚠ an UNDEF on the way up hides the method: `child.undef_method(:foo)`
+       //   leaves a tombstone at child, and the walk found the parent's #foo
+       //   behind it, so instance_method answered a method the class refuses.
+       let rec undef_first9 = fn (xs: str list) ->
+         (match xs with
+          | Nil -> false
+          | Cons (a8, t8) ->
+            (if map_has meths0 (a8 ++ "#" ++ mname) then false
+             else if map_has undefs (a8 ++ "#" ++ mname) then true
+             else undef_first9 t8)) in
+       let hidden9 = undef_first9 (ancestors_of world c) in
        let origin = (let a = lookup_anc world (ancestors_of world c) mname in
                      if str_eq a "" && map_has meths0 (c ++ "#" ++ mname) then c else a) in
+       let origin = (if hidden9 then "" else origin) in
        // a builtin method has no entry in the user method table, but it is
        // still a method of the class and reflection must see it.
-       let origin = if str_eq origin "" && builtin_has_meth c mname then c else origin in
+       let origin = if str_eq origin "" && (if hidden9 then false else true) && builtin_has_meth c mname then c else origin in
        // ...and MODULE's own methods are builtins of a different shape: they
        // are answered by the class dispatcher, not by builtin_has_meth, so
        // `Module.instance_method(:remove_method)` was a NameError for a method
@@ -14005,6 +14028,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             // there is one (a builtin has no entry and keeps the old path).
             else if (if str_eq mown "" then false else true) && has_meth world mown mnm then
               invoke world blk mrecv mown mnm args
+            // a KERNEL method bound to a BasicObject runs on it
+            // (`Kernel.instance_method(:inspect).bind(bo).call`): the object
+            // has no such method of its own, which is the refusal bo_refuses
+            // makes for an ordinary call
+            else if str_eq mown "Kernel" then
+              (let _ = map_set bm_bypass "k" VNil in
+               let r9 = try_or (fn (u: unit) -> FNext (invoke_val_c env world blk mrecv mnm args false)) (FRaise VNil) in
+               let _ = map_delete bm_bypass "k" in
+               match r9 with
+               | FNext v9 -> v9
+               | _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception"))
             else invoke_val_c env world blk mrecv mnm args false)
        else if (str_len name == 4 && str_eq name "name") then VSym mnm
        else if (str_len name == 8 && str_eq name "receiver") then mrecv
@@ -16252,6 +16286,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    && (if fz9 == 1 then true else (if fz9 == 0 then false else ofrozen_get id))
                 then (let _ = ofrozen_set nid in ()) else ()) in
        cp9)
+    // ⚠ ...but those are KERNEL's (Object's) methods, and an object whose
+    //   class does not include Kernel -- a BasicObject -- has none of them:
+    //   `BasicObject.new.to_s` is a NoMethodError, and IO#pwrite relies on
+    //   exactly that refusal. It answered with the default printer.
+    else if is_prim_method name && (match recv with VObj _ -> true | _ -> false)
+            && bo_refuses world cls
+            && (if map_has (name_set "bopub") name || map_has (name_set "bopriv") name then false else true) then
+      raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world cls)
     else if is_prim_method name then prim_method recv name args
     // Enumerable (no block): to_a returns the collected array; others delegate.
     // each_slice / each_cons / cycle take an argument, so is_enum_method leaves
