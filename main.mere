@@ -4736,7 +4736,10 @@ and rng_bs_type_err = fn world -> fn (other: Val) ->
 and rng_bs_int = fn world -> fn encl -> fn theblk -> fn (lo: int) -> fn (hi: int) -> fn (best: int) -> fn (found: bool) ->
   if lo > hi then (if found then (VInt best, false, VNil) else (VNil, false, VNil))
   else
-    let mid = lo + (hi - lo) / 2 in
+    // ⚠ halved SEPARATELY: a beginless range starts at -int_max, and
+    //   `hi - lo` then overflows into a negative span, so mid landed above
+    //   hi and the search never converged
+    let mid = lo / 2 + hi / 2 + ((lo - (lo / 2) * 2) + (hi - (hi / 2) * 2)) / 2 in
     let (verd, extra) = rng_bs_ask world encl theblk (VInt mid) in
     if verd == 3 then (VNil, true, extra)
     else if verd == 4 then rng_bs_type_err world extra
@@ -12485,11 +12488,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                    && (if map_has modules c then false else true)
                 then (let _ = raise_exc world "TypeError"
                         "module_function must be called for modules" in ()) else ()) in
-       let names = vis_arg_names args in
+       // a name that is neither a Symbol nor a String converts through #to_str
+       // (or is the TypeError) -- vis_arg_names dropped it silently
+       let rec conv9 = fn (xs: Val list) ->
+         (match xs with
+          | Nil -> Nil
+          | Cons (o9, t9) ->
+            (match o9 with
+             | VSym _ -> Cons (o9, conv9 t9)
+             | VStr _ -> Cons (o9, conv9 t9)
+             | VArr _ -> Cons (o9, conv9 t9)
+             | _ -> Cons (mkstr (sym_or_str_arg env world o9), conv9 t9))) in
+       let names = vis_arg_names (conv9 args) in
        let _ = (match names with
                 | Nil -> ()
                 | _ -> if (str_len name == 15 && str_eq name "module_function") then
-                         (if map_has modules c then modfunc_promote world c names
+                         (if map_has modules c then modfunc_promote_hooked world c names
                           // ...and it is a MODULE's method: a class has no
                           // module functions, and ruby refuses by name.
                           else (let _ = raise_exc world "TypeError"
@@ -27543,6 +27557,12 @@ and run_cls_hook = fn world -> fn (cls: str) -> fn (hook: str) -> fn (nm: str) -
   then (let _ = invoke world noblk (VClass cls) ("(sng:" ++ cls ++ ")") hook (Cons (VSym nm, Nil)) in ())
   else ()
 
+// module_function COPIES each method into the singleton, which is a
+// singleton method being added: ruby fires singleton_method_added for it
+// (and not method_added). Both doors -- the statement and the call -- use this.
+and modfunc_promote_hooked = fn world -> fn (cls: str) -> fn (names: str list) ->
+  let _ = modfunc_promote world cls names in
+  list_iter names (fn (n9: str) -> run_cls_hook world cls "singleton_method_added" n9)
 // fire `method_added(:name)` on the class that just gained an instance method.
 and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
@@ -31952,7 +31972,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        | SVis (m, names) ->
          let _ = (match names with
                   | Nil -> ()
-                  | _ -> if str_eq m "module_function" then modfunc_promote world cls names
+                  | _ -> if str_eq m "module_function" then modfunc_promote_hooked world cls names
                          // (the named class methods have to exist, as the method form checks)
                          else if str_eq m "private_class_method" then
                            (let _ = vis_names_check world ("(sng:" ++ cls ++ ")") names in
@@ -31963,7 +31983,20 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                            (let _ = vis_names_check world ("(sng:" ++ cls ++ ")") names in
                             mark_vis_mode meths ("(sng:" ++ cls ++ ")") names "public")
                          else if str_eq m "private_constant" then mark_private_consts cls names
-                         else mark_vis_mode meths cls names m) in
+                         else
+                           // ⚠ a visibility statement about an INHERITED method
+                           //   makes an entry in this class, and ruby announces
+                           //   it: method_added fires for the first one (a later
+                           //   `public :foo` finds the entry and says nothing)
+                           (let rec fresh_of9 = fn (xs: str list) ->
+                              (match xs with
+                               | Nil -> Nil
+                               | Cons (n9, t9) ->
+                                 (if map_has meths (cls ++ "#" ++ n9) || map_has vis_marks (cls ++ "#" ++ n9)
+                                  then fresh_of9 t9 else Cons (n9, fresh_of9 t9))) in
+                            let fresh9 = fresh_of9 names in
+                            let _ = mark_vis_mode meths cls names m in
+                            list_iter fresh9 (fn (n9: str) -> run_method_added world cls n9))) in
          FNext VNil
        | SDef (mname0, params, defs, mbody) ->
          // `def self.m` (marked "self.m") is a class method: register under
