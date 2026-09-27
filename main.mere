@@ -14910,7 +14910,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           match zs with
           | VArr _ -> lz_extend world id "zip" zs
           | _ -> invoke_val_c env world blk (lz_run env world blk id (0 - 1) VNil) name args vischeck)
-       else if (str_len name == 4 && str_eq name "to_a") || (str_len name == 5 && str_eq name "force") then lz_run env world blk id (0 - 1) VNil
+       // (arguments go to the source's #each, as ruby passes them)
+       else if (str_len name == 4 && str_eq name "to_a") || (str_len name == 5 && str_eq name "force") then
+         (let ek9 = str_of_int id ++ "@__lz_eargs" in
+          let _ = (match args with Nil -> () | _ -> map_set ivars ek9 (arr_new args)) in
+          let r9 = lz_run env world blk id (0 - 1) VNil in
+          let _ = (if map_has ivars ek9 then map_delete ivars ek9 else ()) in
+          r9)
        // #eager wraps the lazy one without walking it: the walk happens when the
        // returned (ordinary) Enumerator is enumerated, not here.
        else if (str_len name == 5 && str_eq name "eager") then make_enum world recv "each"
@@ -17539,7 +17545,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "Enumerator::Lazy") | _ -> false) then
       (match recv with
        | VObj id ->
-         (if (str_len name == 4 && str_eq name "grep") || (str_len name == 6 && str_eq name "grep_v") then
+         // take(n) / drop(n) ignore a block, as ruby's lazy ones do: they stay
+         // pipeline steps instead of walking the source now
+         (if ((str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop"))
+             && (match args with Cons (VInt _, Nil) -> true | _ -> false) then
+            (match args with
+             | Cons (VInt n, _) -> lz_extend world id name (VInt n)
+             | _ -> VNil)
+          else if (str_len name == 4 && str_eq name "grep") || (str_len name == 6 && str_eq name "grep_v") then
             (match args with
              | Cons (pat, _) ->
                (let pid = map_len proc_store in
@@ -29370,7 +29383,21 @@ and lz_run = fn env -> fn world -> fn blk -> fn (id: int) -> fn (bound: int) -> 
   let collector = (true, Cons ("*__e", Nil),
                    Cons (SExpr (EMethod (EVar "__lzobj", "__lzstep", Cons (ESplat (EVar "__e"), Nil))), Nil),
                    cenv2) in
-  let f = try_or (fn (u: unit) -> let _ = invoke_with_block env world blk (lz_src world id) "each" Nil collector in FNext VNil) (FRaise VNil) in
+  // a take(0) anywhere means nothing gets through: the source is not run
+  let take0 = (let rec t0 = fn (os: Val list) ->
+                 (match os with
+                  | Nil -> false
+                  | Cons (VArr oa9, t9) ->
+                    (match deref oa9 with
+                     | Cons (VStr kh9, Cons (VInt 0, _)) -> (if str_eq (sget kh9) "take" then true else t0 t9)
+                     | _ -> t0 t9)
+                  | Cons (_, t9) -> t0 t9) in
+               t0 (lz_ops world id)) in
+  let f = (if take0 then FNext VNil
+           else (let eargs9 = (match (if map_has ivars0 (str_of_int id ++ "@__lz_eargs") then map_get ivars0 (str_of_int id ++ "@__lz_eargs") else VNil) with
+                               | VArr ea9 -> deref ea9
+                               | _ -> Nil) in
+                 try_or (fn (u: unit) -> let _ = invoke_with_block env world blk (lz_src world id) "each" eargs9 collector in FNext VNil) (FRaise VNil))) in
   let _ = (match f with
            | FRaise _ ->
              (if map_has flow_sig "k" then
@@ -29460,8 +29487,12 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
       (let n = (match payload with VInt tn -> tn | _ -> 0) in
        let ck = str_of_int did ++ "@__tk" ++ str_of_int i in
        let c = (match (if map_has ivars0 ck then map_get ivars0 ck else VNil) with VInt cn -> cn | _ -> 0) in
+       // ...and it stops right AFTER the n-th element goes on, without pulling
+       // one more from the source (whose side effects ruby does not run)
        if c >= n then raise_exc world "StopIteration" "iteration reached an end"
-       else (let _ = map_set ivars0 ck (VInt (c + 1)) in lz_step_ops env world blk did rest (i + 1) v))
+       else (let _ = map_set ivars0 ck (VInt (c + 1)) in
+             let r9 = lz_step_ops env world blk did rest (i + 1) v in
+             if c + 1 >= n then raise_exc world "StopIteration" "iteration reached an end" else r9))
     else if str_eq kind "drop" then
       (let n = (match payload with VInt dn -> dn | _ -> 0) in
        let ck = str_of_int did ++ "@__dp" ++ str_of_int i in
@@ -29583,6 +29614,13 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
       (let r = callp v in
        (match r with
         | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
+        // ...and so is anything that answers both #each and #force (a lazy
+        // enumerator), as ruby's lazy flat_map flattens it
+        | VObj lo9 when (let (_, _, oc9, _) = world in str_eq (map_get oc9 lo9) "Enumerator::Lazy")
+                        || (responds world r "each" && responds world r "force") ->
+          (match invoke_val_c env world blk r "force" Nil false with
+           | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
+           | r2 -> lz_step_ops env world blk did rest (i + 1) r2)
         | _ -> lz_step_ops env world blk did rest (i + 1) r))
     // ⚠ with a block, the block runs and the ORIGINAL element flows on:
     //   `inf.with_index { |x, i| 99 }.first(3)` is [1,2,3], not [99,99,99].
