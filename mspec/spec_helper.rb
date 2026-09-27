@@ -829,6 +829,20 @@ end
 
 def mock(name); MockObject.new(name); end
 def mock_int(n); n; end
+# mspec's mock_numeric: a Numeric that answers only what a spec stubs on it
+# (Kernel#should_receive above). 20 spec files ask for one, and without it
+# every such example died on the helper's name on BOTH sides.
+class NumericMockObject < Numeric
+  def initialize(name, options = {})
+    @name = name
+    @null = options[:null_object]
+  end
+  def method_missing(sym, *args, &block)
+    @null ? self : super
+  end
+  def singleton_method_added(val); end
+end
+def mock_numeric(name, options = {}); NumericMockObject.new(name, options); end
 def flunk(msg = nil)
   $mspec_fail += 1
   puts "FAILED: #{$mspec_it}: flunked"

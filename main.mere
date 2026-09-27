@@ -2568,6 +2568,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // `1 == 2` follows a redefined Integer#==), which the arms below reach.
        && (if has_meth world (dispatch_cls_of world va0) "==" then false else true) then
       (let bv9 = eval_e env world blk b in
+       // a Complex with Numeric objects in it, or compared with one, follows
+       // Complex#=='s own rule (cpx_obj_call), not the operand's #==
+       if cpx_obj_applies world va0 "==" (Cons (bv9, Nil)) then
+         (let r9 = truthy (cpx_obj_call env world va0 "==" (Cons (bv9, Nil))) in
+          VBool (if str_eq op "==" then r9 else (if r9 then false else true)))
+       else
        match bv9 with
        | VObj _ ->
          (if has_meth world (dispatch_cls_of world bv9) "==" then
@@ -2665,6 +2671,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // from Object and method_missing never runs: `obj <=> 3` is nil, not a
        // missing message. (`=~` is not in the list: Object#=~ was REMOVED in
        // ruby 3.2, so that one really does reach method_missing.)
+       // Numeric#% is one of Numeric's own DERIVED methods (the dispatcher's
+       // Numeric arm), so a subclass that defines no #% still has one; the
+       // primitive path tried to coerce the operands into Integers instead
+       else if str_eq op "%" && obj_is_a world ocl "Numeric" then
+         invoke_val_c env world blk va0 op (Cons (eval_e env world blk b, Nil)) false
        else if (if str_eq op "==" || str_eq op "!=" || str_eq op "===" ||
                    str_eq op "<=>" || str_eq op "!~" then false else true)
                && has_meth world ocl "method_missing" && (if builtin_obj_has (display_cls world ocl) op then false else true) then
@@ -2686,7 +2697,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // singleton up before the argument ran meant it never could.
        let vb = eval_e env world blk b in
        let hk = hng_key va0 in
-       if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) op then
+       if cpx_obj_applies world va0 op (Cons (vb, Nil)) then cpx_obj_call env world va0 op (Cons (vb, Nil))
+       else if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) op then
          let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
          invoke world noblk va0 (map_get hng_store hk) op (Cons (vb, Nil))
        // a builtin value class (Integer/Float/String/Array/...) whose operator
@@ -3848,6 +3860,89 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
 // through Mere's `fail` -- was written out at the `raise` arm in eval_e and
 // nowhere else, so anything else that wanted to raise a real object (rather
 // than the VExc pair raise_exc makes) had to copy all four lines.
+// A Complex part may be any Numeric, and a Numeric OBJECT is a real when its
+// own #real? says so. The builtin reals answer without being asked.
+and cpx_is_real = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VCpx (_, _) -> false
+  | VObj _ ->
+    obj_is_a world (dispatch_cls_of world v) "Numeric"
+    && truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) v "real?" Nil false)
+  | _ -> is_num v
+and cpx_user_num = fn world -> fn (v: Val) ->
+  match v with
+  | VObj _ -> obj_is_a world (dispatch_cls_of world v) "Numeric"
+  | _ -> false
+// ruby's k_exact_zero_p: an Integer or Rational zero, or an object that says
+// it is `== 0` (a Float 0.0 is NOT exactly zero)
+and cpx_exact_zero = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VInt n -> n == 0
+  | VRat (rn, _) -> str_eq rn "0"
+  | VObj _ -> truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) v "==" (Cons (VInt 0, Nil)) false)
+  | _ -> false
+// Complex methods for a Complex whose parts are Numeric OBJECTS, or with a
+// Numeric object as the other operand. The primitive Complex arithmetic has no
+// world to dispatch with, so it could only fail on them ("can't convert
+// #<object>+#<object>i into Float"); ruby's complex.c asks the parts' own
+// methods, and asks the other operand's #real? to choose between treating it
+// as a real and coercing.
+and cpx_obj_names = fn (name: str) ->
+  (str_len name == 4 && (str_eq name "to_i" || str_eq name "to_f" || str_eq name "to_r"))
+  || (str_len name == 11 && str_eq name "rationalize") || (str_len name == 2 && (str_eq name "-@" || str_eq name "=="))
+  || (str_len name == 6 && str_eq name "coerce")
+  || (str_len name == 1 && (str_eq name "+" || str_eq name "-" || str_eq name "*" || str_eq name "/"))
+  || (str_len name == 3 && str_eq name "quo")
+and cpx_obj_applies = fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  cpx_obj_names name &&
+  (match recv with
+   | VCpx (re, im) ->
+     (match re with VObj _ -> true | _ -> false) || (match im with VObj _ -> true | _ -> false)
+     || (match args with Cons (a, _) -> cpx_user_num world a | Nil -> false)
+   | _ -> false)
+and cpx_obj_call = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let call = fn (v: Val) -> fn (nm: str) -> fn (xs: Val list) -> invoke_val_c env world nb v nm xs false in
+  match recv with
+  | VCpx (re, im) ->
+    (let arg1 = (match args with Cons (a, _) -> a | Nil -> VNil) in
+     let range = fn (tgt: str) ->
+       raise_exc world "RangeError" ("can't convert " ++ inspect_w env world recv ++ " into " ++ tgt) in
+     if str_len name == 4 && (str_eq name "to_i" || str_eq name "to_f" || str_eq name "to_r") then
+       (if cpx_exact_zero env world im then call re name Nil
+        else range (if str_eq name "to_i" then "Integer" else if str_eq name "to_f" then "Float" else "Rational"))
+     else if str_eq name "rationalize" then
+       (if vlen args > 1 then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0..1)")
+        else if cpx_exact_zero env world im then call re "rationalize" args
+        else range "Rational")
+     else if str_eq name "-@" then VCpx (call re "-@" Nil, call im "-@" Nil)
+     else if str_eq name "==" then
+       (if cpx_user_num world arg1 then
+          (if cpx_is_real env world arg1
+           then VBool (cpx_exact_zero env world im && truthy (call re "==" (Cons (arg1, Nil))))
+           else VBool (truthy (call arg1 "==" (Cons (recv, Nil)))))
+        else (match arg1 with
+              | VCpx (r2, i2) -> VBool (truthy (call re "==" (Cons (r2, Nil))) && truthy (call im "==" (Cons (i2, Nil))))
+              | _ -> VBool (cpx_exact_zero env world im && truthy (call re "==" (Cons (arg1, Nil))))))
+     else if str_eq name "coerce" then
+       (if cpx_is_real env world arg1 then arr_new (Cons (VCpx (arg1, VInt 0), Cons (recv, Nil)))
+        else raise_exc world "TypeError" (display_cls_msg world (dispatch_cls_of world arg1) ++ " can't be coerced into Complex"))
+     else
+       // + - * / quo with a Numeric object: a REAL one works part by part,
+       // anything else is `other.coerce(self)` and the operator on the pair
+       (let op = (if str_eq name "quo" then "/" else name) in
+        if cpx_is_real env world arg1 then
+          (if str_eq op "+" || str_eq op "-" then VCpx (call re op (Cons (arg1, Nil)), im)
+           else if str_eq op "*" then VCpx (call re "*" (Cons (arg1, Nil)), call im "*" (Cons (arg1, Nil)))
+           else VCpx (call re "quo" (Cons (arg1, Nil)), call im "quo" (Cons (arg1, Nil))))
+        else
+          (match call arg1 "coerce" (Cons (recv, Nil)) with
+           | VArr aid ->
+             (match deref aid with
+              | Cons (a, Cons (b, Nil)) -> (if str_eq op "/" then call a "quo" (Cons (b, Nil)) else call a op (Cons (b, Nil)))
+              | _ -> raise_exc world "TypeError" "coerce must return [x, y]")
+           | _ -> raise_exc world "TypeError" "coerce must return [x, y]")))
+  | _ -> VNil
 // a :raise tracepoint sees the exception as it is raised (the program's own
 // raises; the interpreter's internal ones are not reported)
 and tp_raise = fn world -> fn (exc: Val) ->
@@ -7889,6 +7984,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             raise_exc world "TypeError" ("bind argument must be a subclass of " ++ cls_display world own9)
           else raise_exc world "NoMethodError" ("undefined method 'define_singleton_method'"))
        | _ -> VNil)
+  // a Complex with Numeric OBJECTS in it (or one as the operand): see cpx_obj_call
+  else if cpx_obj_applies world recv0 name0 args0 then cpx_obj_call env world recv0 name0 args0
   // Class#initialize on a class that already exists (every class object here
   // is one) is ruby's TypeError, not a no-op
   else if str_eq name0 "initialize"
@@ -10979,14 +11076,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // rectangular's two components are reals as well -- it had no check at
           // all, so `Complex.rectangular(Object.new, 1)` built a Complex with an
           // object in it, which then printed as `(#<object>+1i)`.
-          else if is_num m && is_num th
-                  && (match m with VCpx _ -> false | _ -> true)
-                  && (match th with VCpx _ -> false | _ -> true)
+          // ...and a Numeric OBJECT is a real when its #real? says so
+          else if cpx_is_real env world m && cpx_is_real env world th
           then VCpx (m, th)
           else raise_exc world "TypeError" "not a real")
        | Cons (m, Nil) ->
          (if is_num m && (match m with VCpx _ -> false | _ -> true)
           then (if (str_len name == 5 && str_eq name "polar") then VCpx (num_abs m, VInt 0) else VCpx (m, VInt 0))
+          else if (if (str_len name == 5 && str_eq name "polar") then false else true) && cpx_is_real env world m
+          then VCpx (m, VInt 0)
           else raise_exc world "TypeError" "not a real")
        | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
     // File class methods over the native externs (read/write/exist?/...).
@@ -12002,6 +12100,15 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                   | Cons (VInt k9, _) -> k9
                   | Cons (VFlt f9, _) -> int_of_float f9
                   | Cons (VBig b9, _) -> bit_and (int_of_str (big_mag b9)) mt_mask32
+                  // ...and anything else is an Integer CONVERSION (a Rational
+                  // seed, an object's #to_int), not a reason to pick a random
+                  // one: `Random.new(Rational(10, 1)).seed` is 10
+                  | Cons (VNil, _) -> random_int 1000000000
+                  | Cons (a9, _) ->
+                    (match coerce_int_args env world (Cons ((match a9 with VRat (_, _) -> invoke_val_c env world blk a9 "to_i" Nil false | VCpx (_, _) -> invoke_val_c env world blk a9 "to_i" Nil false | _ -> a9), Nil)) with
+                     | Cons (VInt k9, _) -> k9
+                     | Cons (VBig b9, _) -> bit_and (int_of_str (big_mag b9)) mt_mask32
+                     | _ -> random_int 1000000000)
                   | _ -> random_int 1000000000) in
        let g9 = mt_alloc_gid () in
        let _ = mt_init_genrand g9 sd9 in
@@ -15553,7 +15660,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 || (str_len name == 4 && str_eq name "ceil") || (str_len name == 5 && str_eq name "floor") || (str_len name == 5 && str_eq name "round")
                 || (str_len name == 8 && str_eq name "truncate") || (str_len name == 4 && str_eq name "fdiv")
                 || (str_len name == 6 && str_eq name "modulo") || (str_len name == 6 && str_eq name "divmod") || (str_len name == 9 && str_eq name "remainder")
-                || (str_len name == 3 && str_eq name "quo") || (str_len name == 6 && str_eq name "coerce")) then
+                || (str_len name == 3 && str_eq name "quo") || (str_len name == 6 && str_eq name "coerce")
+                || (str_len name == 9 && str_eq name "numerator") || (str_len name == 11 && str_eq name "denominator")
+                || (str_len name == 1 && str_eq name "%")) then
       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
        let call1 = fn (nm: str) -> fn (a: Val) -> invoke_val_c env world nb9 recv nm (Cons (a, Nil)) false in
        let call0 = fn (nm: str) -> invoke_val_c env world nb9 recv nm Nil false in
@@ -15604,6 +15713,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let a9 = invoke_val_c env world nb9 arg1 "to_f" Nil false in
           let s9 = call0 "to_f" in
           invoke_val_c env world nb9 s9 "/" (Cons (a9, Nil)) false)
+       // #numerator / #denominator are the Rational's (`to_r.numerator`), and
+       // #% is `self - other * self.div(other)` -- ruby's num_modulo, asked
+       // through the receiver's own #div, #* and #-
+       else if (str_len name == 9 && str_eq name "numerator") || (str_len name == 11 && str_eq name "denominator") then
+         invoke_val_c env world nb9 (call0 "to_r") name Nil false
+       else if (str_len name == 1 && str_eq name "%") then
+         (let _ = need1 () in
+          let d9 = call1 "div" arg1 in
+          let p9 = invoke_val_c env world nb9 arg1 "*" (Cons (d9, Nil)) false in
+          call1 "-" p9)
        else if (str_len name == 6 && str_eq name "modulo") then (let _ = need1 () in call1 "%" arg1)
        else if (str_len name == 6 && str_eq name "divmod") then
          (let _ = need1 () in
@@ -29021,7 +29140,10 @@ and time_exact = fn world -> fn (v: Val) ->
   | VRat (_, _) -> v
   | VObj _ ->
     (let c9 = dispatch_cls_of world v in
-     if has_meth world c9 "to_int" && has_meth world c9 "to_r" then invoke_val_c gc_cenv0 world blk9 v "to_r" Nil false
+     // a Numeric HAS #to_int (Numeric's own, served by the dispatcher arm,
+     // which no method-table row names)
+     let hasint9 = has_meth world c9 "to_int" || obj_is_a world c9 "Numeric" in
+     if hasint9 && has_meth world c9 "to_r" then invoke_val_c gc_cenv0 world blk9 v "to_r" Nil false
      else if has_meth world c9 "to_int" then invoke_val_c gc_cenv0 world blk9 v "to_int" Nil false
      else bad9 ())
   | _ -> bad9 ()
