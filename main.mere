@@ -13008,8 +13008,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          // resolve the source through the ancestor chain (an alias can name an
          // inherited/included method), and remember the origin so a `super`
          // inside the aliased method resumes above where the source was defined.
+         // (a MODULE also finds Object's methods, as ruby's alias does: the
+         // fixtures alias a method reopened into Object from inside Kernel)
          let origin = if map_has methsA (c ++ "#" ++ n2) then c
-                      else lookup_anc world (ancestors_of world c) n2 in
+                      else (let a9 = lookup_anc world (ancestors_of world c) n2 in
+                            if str_eq a9 "" && map_has modules c && map_has methsA ("Object#" ++ n2) then "Object"
+                            else a9) in
          let _ = if map_has methsA (origin ++ "#" ++ n2) then
                    (let _ = map_set methsA (c ++ "#" ++ n1) (map_get methsA (origin ++ "#" ++ n2)) in
                     // the alias keeps the ORIGINAL's lexical scope, so constants
@@ -13048,8 +13052,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                  // ...and the source NAME, which #original_name answers. The two
                  // user-method branches above record it and this one did not, so
                  // an alias of a builtin reported its own name as the original.
-                 else (let _ = (if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2) in
-                       set_builtin_alias world c n1 n2) in
+                 // ...but only a builtin that EXISTS: a missing name is the
+                 // same NameError the `alias` keyword raises (alias_builtin_exists)
+                 else if alias_builtin_exists world c n2 then
+                   (let _ = (if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2) in
+                    set_builtin_alias world c n1 n2)
+                 else (let _ = raise_exc_iv world "NameError"
+                                 ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world c ++ "'")
+                                 (Cons (("__name", VSym n2), Nil)) in ()) in
          // aliasing adds a method under a new name, so the hook fires (same
          // reason as the `alias` keyword above).
          let _ = run_method_added world c n1 in
@@ -29950,7 +29960,12 @@ and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
      | Cons (x, t) -> join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect_w env world x)) in
   let argstr = fn (xs: Val list) ->
     (match xs with Nil -> "" | _ -> "(" ++ join9 xs "" ++ ")") in
-  if str_eq cls "Enumerator::Lazy" then
+  // an ALLOCATED enumerator (no source, no generator block) was never set up
+  if (if map_has ivars (key ++ "@recv") || map_has ivars (key ++ "@__e_blk") || map_has ivars (key ++ "@__lz_src")
+         || map_has ivars (key ++ "@__lz_ops") || map_has ivars (key ++ "@__e_step") || map_has ivars (key ++ "@meth")
+      then false else true)
+  then "#<" ++ cls ++ ": uninitialized>"
+  else if str_eq cls "Enumerator::Lazy" then
     // the source, then one wrapper per operation. An operation's stored
     // argument is its BLOCK for map/select and a value for take(2), and only
     // the value is printed -- ruby prints `:map` with no arguments at all.
@@ -31169,6 +31184,23 @@ and do_refine = fn world -> fn (refinery: str) -> fn (target: str) -> fn (bb: St
 // methods) and left the class without the method. rubygems guards its
 // `alias gem_original_require require` with `unless defined?(...)`, so the one
 // alias the whole of `require` hangs off was the one that did not happen.
+and alias_builtin_exists = fn world -> fn (cls: str) -> fn (n: str) ->
+  let rec any9 = fn (cs: str list) ->
+    (match cs with
+     | Nil -> false
+     | Cons (c9, t9) ->
+       (builtin_has_meth c9 n || builtin_obj_has c9 n || builtin_owns_here c9 n
+        // a name define_method / alias_method pointed at a builtin
+        || map_has builtin_alias (c9 ++ "#" ++ n) || any9 t9)) in
+  any9 (Cons (cls, ancestors_of world cls))
+  || is_kernel_builtin n || is_kernel_pub_instance n || is_prim_method n
+  || ((is_sng_cls cls || map_has modules cls) && is_module_method n)
+  // a SINGLETON class has what its object answers: `class << self; alias
+  // make new; end` aliases Class#new
+  || (is_sng_cls cls && (builtin_class_method (sng_inner cls) n
+                         || (if is_digit (char_at (sng_inner cls) 0) then false
+                             else responds world (VClass (sng_inner cls)) n)))
+
 and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) ->
   let (meths, sup, ocls, ivars) = world in
   // ⚠ the source may be INHERITED: `class B < A; alias aka pub; end` aliases
@@ -31178,7 +31210,17 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   //   alias_method form walks the ancestors and always did.)
   let src = (if map_has meths (cls ++ "#" ++ n2) then cls
              else (let a9 = lookup_anc world (ancestors_of world cls) n2 in
-                   if str_eq a9 "" then cls else a9)) in
+                   if str_eq a9 "" && map_has modules cls && map_has meths ("Object#" ++ n2) then "Object"
+                   else if str_eq a9 "" then cls else a9)) in
+  // ⚠ THE SOURCE MUST EXIST. `alias foo not_exist` is a NameError in ruby,
+  //   and this made `foo` a delegate to a primitive that is not there -- the
+  //   mistake surfaced only when foo was called, as a NoMethodError about a
+  //   different name. A builtin counts if any ancestor's builtin table, Kernel
+  //   or Module (for a class or module receiver) answers it.
+  let _ = (if map_has meths (src ++ "#" ++ n2) || alias_builtin_exists world cls n2 then ()
+           else (let _ = raise_exc_iv world "NameError"
+                           ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world cls ++ "'")
+                           (Cons (("__name", VSym n2), Nil)) in ())) in
   // the name this alias was made FROM, which is what Method#original_name
   // answers. alias_method recorded it and the `alias` keyword did not, so the
   // same alias written two ways gave two different original_names -- one
