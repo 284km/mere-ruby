@@ -460,6 +460,23 @@ class CloseMatcher
   def match?(actual); (actual - @expected).abs <= @tolerance; end
 end
 def be_close(expected, tolerance = TOLERANCE); CloseMatcher.new(expected, tolerance); end
+# mspec's be_computed_by (mspec/matchers/be_computed_by.rb): each row is
+# [receiver, *arguments, expected], and the method is sent with the row's
+# arguments plus the matcher's. Without it every example written as a table
+# died on the matcher's name on BOTH sides -- 23 files ask for it.
+class BeComputedByMatcher
+  def initialize(sym, *args); @method = sym; @args = args; end
+  def match?(array)
+    array.each do |line|
+      receiver = line.shift
+      value = line.pop
+      actual = receiver.send(@method, *(line + @args))
+      return false unless actual == value
+    end
+    true
+  end
+end
+def be_computed_by(sym, *args); BeComputedByMatcher.new(sym, *args); end
 # mspec's match_yaml (mspec/matchers/match_yaml.rb): the expectation is YAML
 # text when it parses as YAML and is dumped otherwise, and the two sides are
 # compared after the trailing-space and document-end cleanup mspec does.
