@@ -7879,6 +7879,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             raise_exc world "TypeError" ("bind argument must be a subclass of " ++ cls_display world own9)
           else raise_exc world "NoMethodError" ("undefined method 'define_singleton_method'"))
        | _ -> VNil)
+  // Class#initialize on a class that already exists (every class object here
+  // is one) is ruby's TypeError, not a no-op
+  else if str_eq name0 "initialize"
+          && (match recv0 with VClass rc9 -> (if has_meth world ("(sng:" ++ rc9 ++ ")") "initialize" then false else true) | _ -> false) then
+    raise_exc world "TypeError" "already initialized class"
   // ⚠ Object#== and #!= are OPERATORS in this interpreter, answered by the
   //   binary-op path, and a message naming them -- `obj.send(:!=, x)`, or a
   //   Method object for one -- found no entry and was a NoMethodError on a
@@ -10834,7 +10839,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if str_eq c "Thread" && thread_cls_name name then
       (let (mth0, sup0, ocl0, ivars) = world in
        if (str_len name == 7 && str_eq name "current") then
-         (if map_has cur_thr "v" then map_get cur_thr "v" else VNil)
+         // ...the THREAD: "v" is the ownership context, which a running fiber
+         // takes over (Mutex#owned? is per fiber), and Thread.current inside a
+         // fiber answered the Fiber
+         (if map_has cur_thr "t" then map_get cur_thr "t"
+          else if map_has cur_thr "v" then map_get cur_thr "v" else VNil)
        else if (str_len name == 4 && str_eq name "main") then
          (if map_has all_thr "0" then map_get all_thr "0" else VNil)
        // pass is a scheduling no-op: the calling thread just continues. A
@@ -12510,6 +12519,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                && (if map_has privates k then false else true)
             then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
             else ()) in
+          // Enumerator::Lazy's own methods are the dispatcher's lazy arms, which
+          // no table row names: the list is the reference's, asked once
+          let _ = (if str_eq c "Enumerator::Lazy" then
+                     list_iter (str_split "chunk chunk_while collect collect_concat compact drop drop_while eager enum_for filter filter_map find_all flat_map force grep grep_v lazy map reject select slice_after slice_before slice_when take take_while to_enum uniq with_index zip" " ")
+                       (fn (n9: str) -> (let m = map_len tmp in map_set tmp (str_of_int m) (VSym n9)))
+                   else ()) in
+          // ...plus a visibility statement that made an inherited method this
+          // module's own public/protected one (see collect_vis_go)
+          let _ = map_iter vis_marks (fn (k: str) -> fn (v: Val) ->
+            if str_len k > plen && str_eq (substring k 0 plen) pfx && (if map_has meths0 k then false else true)
+               && (if str_contains (substring k plen (str_len k)) "#" then false else true)
+               && (if map_has privates k then false else true)
+            then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
+            else ()) in
           arr_new (idx_to_list tmp 0 (map_len tmp))))
     // method_defined? family: resolve the defining ancestor, then check the
     // visibility tables. method_defined? is true for public + protected.
@@ -14124,6 +14147,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 r)
              | _ -> VNil))
        else if (str_len name == 6 && str_eq name "alive?") then VBool (if map_has ivars (k ++ "@__fb_done") then false else true)
+       // the universal names (equal?, nil?, itself, ...), as for Method: this
+       // chain ends in a refusal, and `fiber.resume.should.equal? cur` died
+       // on #equal? itself
+       else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Fiber"))
     // ThreadGroup instances: #add marks the thread, #list scans the registry.
     else if str_eq cls "ThreadGroup" then
@@ -16163,7 +16190,24 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let k = str_of_int tid in
           let tst = (if map_has ivars (k ++ "@__tst") then map_get ivars (k ++ "@__tst") else VBool false) in
           let alive = (match tst with VStr _ -> true | _ -> false) in
-          if (str_len name == 4 && str_eq name "join") || (str_len name == 5 && str_eq name "value") then
+          // join(limit): the limit is a number (or nil), and a thread still
+          // parked when it runs out answers nil -- here a parked thread never
+          // wakes on its own, so any limit runs out
+          if (str_len name == 4 && str_eq name "join")
+             && (match args with
+                 | Cons (VInt _, _) -> false | Cons (VFlt _, _) -> false | Cons (VRat _, _) -> false
+                 | Cons (VNil, _) -> false | Nil -> false | _ -> true) then
+            (match args with
+             | Cons (a9, _) -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into time interval")
+             | Nil -> VNil)
+          else if (str_len name == 4 && str_eq name "join") && alive
+                  && (match args with Cons (VNil, _) -> false | Cons (_, _) -> true | Nil -> false)
+                  && (match tst with VStr h9 -> str_eq (sget h9) "sleep" | _ -> false) then VNil
+          // ...and with no limit, a thread waiting on a parked one parks too
+          else if ((str_len name == 4 && str_eq name "join") || (str_len name == 5 && str_eq name "value"))
+                  && (match tst with VStr h9 -> str_eq (sget h9) "sleep" | _ -> false) && in_thread () then
+            raise_exc world "__ThreadPark" "sleep"
+          else if (str_len name == 4 && str_eq name "join") || (str_len name == 5 && str_eq name "value") then
             (if map_has ivars (k ++ "@__texc") then flow_value (re_raise world (map_get ivars (k ++ "@__texc")))
              else if (str_len name == 5 && str_eq name "value") then
                (if map_has ivars (k ++ "@__tval") then map_get ivars (k ++ "@__tval") else VNil)
@@ -16565,6 +16609,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                else flow_throw_breakret (match tgt9 with VInt t9 -> t9 | _ -> 0) bv9)
             | other9 -> flow_value other9)
     else if (str_len name == 5 && str_eq name "class") then VClass "Proc"
+    // a copy (dup / clone, see proc_copy) is == to its original and to other
+    // copies of it, though not equal?
+    else if (str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?") then
+      (match args with
+       | Cons (VProc p2, _) -> VBool (str_eq (r2k_root (str_of_int pid)) (r2k_root (str_of_int p2)))
+       | _ -> VBool false)
     else if (str_len name == 7 && str_eq name "lambda?") then VBool (map_has lambda_ids (str_of_int pid))
     // Proc#binding: the environment the proc CAPTURED, which is the same
     // thing Kernel#binding hands back for the frame it was called in.
@@ -17938,7 +17988,9 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
           let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
           let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+          let savedthr = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
           let _ = map_set cur_thr "v" (VObj tid) in
+          let _ = map_set cur_thr "t" (VObj tid) in
           let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
           let _ = map_set catch_depth "n" (VInt 0) in
           // the BOOL, not the Val holding it: thread_flag is compacted at a
@@ -17964,6 +18016,7 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set thread_flag "n" (VBool savedtf) in
           let _ = map_set catch_depth "n" saved in
           let _ = map_set cur_thr "v" savedcur in
+          let _ = map_set cur_thr "t" savedthr in
           let _ =
             (match result with
              | FRaise _ ->
@@ -27370,7 +27423,8 @@ and fire_tp_v = fn world -> fn (ev: str) -> fn (mname: str) -> fn (cls: str) -> 
      let file = (if map_has load_ctx "file" then map_get load_ctx "file" else mkstr "") in
      let _ = try_or (fn (u: unit) ->
                let _ = invoke world noblk0 (VClass "TracePoint") "(sng:TracePoint)" "__fire_ev"
-                         (Cons (VSym ev, Cons (VSym mname, Cons (VClass cls, Cons (file, Cons (rv, Cons (slf, Nil))))))) in VNil)
+                         (Cons (VSym ev, Cons ((if str_eq mname "" then VNil else VSym mname),
+                                Cons ((if str_eq mname "" then VNil else VClass cls), Cons (file, Cons (rv, Cons (slf, Nil))))))) in VNil)
                VNil in
      let _ = map_delete trace_fn "tpbusy" in ())
   else ()
@@ -28540,6 +28594,12 @@ and make_anon_cls = fn world -> fn (c: str) -> fn (args: Val list) ->
     (let anon = fresh_anon "AnonClass_" in
      let _ = (match args with
               | Nil -> ()
+              // ...and a MODULE is not a class, nor may a singleton class be
+              // subclassed
+              | Cons (VClass sc, _) when map_has modules sc ->
+                (let _ = raise_exc world "TypeError" ("superclass must be an instance of Class (given an instance of Module)") in ())
+              | Cons (VClass sc, _) when is_sng_cls sc ->
+                (let _ = raise_exc world "TypeError" "can't make subclass of singleton class" in ())
               | Cons (VClass sc, _) -> set_sup sup2 anon sc
               | Cons (v9, _) -> (let _ = raise_exc world "TypeError"
                                    ("superclass must be an instance of Class (given "
@@ -31467,8 +31527,18 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   // `alias visit_number visit_symbol`, so an alias that stays quiet leaves the
   // visitor unregistered and the compiler recurses forever.
   run_method_added world cls n1
+// ⚠ an entry is spelled the way ruby PRINTS it (`#<Class:M>` for a
+//   `class << self`), but the singleton class itself is `(sng:M)`: the
+//   printed spelling as a class name made a value that inspected right and
+//   was == to nothing, so `Module.nesting[0] == M.singleton_class` was false
+and nest_sng_name = fn (a: str) ->
+  if str_len a > 9 && str_eq (substring a 0 8) "#<Class:" && str_eq (substring a (str_len a - 1) (str_len a)) ">"
+  then (let inner = nest_sng_name (substring a 8 (str_len a - 1)) in
+        if str_len inner > 1 && str_eq (substring inner 0 2) "#<" then a
+        else "(sng:" ++ inner ++ ")")
+  else a
 and nest_vclasses = fn (xs: str list) ->
-  match xs with Nil -> Nil | Cons (a, r) -> Cons (VClass a, nest_vclasses r)
+  match xs with Nil -> Nil | Cons (a, r) -> Cons (VClass (nest_sng_name a), nest_vclasses r)
 and register_class_lex = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let saved_lex = cur_lex () in
   let saved_nest = cur_nest () in
@@ -31569,9 +31639,15 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   // zeitwerk watches for exactly that to notice an explicit namespace. The
   // flag is set by TracePoint#enable, so a program with no tracepoint pays one
   // map lookup per class body.
-  let _ = (if map_has hook_flags "tp" then
+  // ⚠ ...inside the same busy guard the method events use: the prelude
+  //   methods __fire runs are calls too, and a :call tracepoint reported
+  //   __fire, __points and __call before the class it was asked about.
+  let _ = (if map_has hook_flags "tp" && (if map_has trace_fn "tpbusy" then false else true) then
              (let noblk0 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
-              let _ = invoke world noblk0 (VClass "TracePoint") "(sng:TracePoint)" "__fire" (Cons (VClass cls, Nil)) in ())
+              let _ = map_set trace_fn "tpbusy" VNil in
+              let _ = try_or (fn (u: unit) ->
+                        let _ = invoke world noblk0 (VClass "TracePoint") "(sng:TracePoint)" "__fire" (Cons (VClass cls, Nil)) in VNil) VNil in
+              map_delete trace_fn "tpbusy")
            else ()) in
   let _ = fire_trace world "class" cls cls in
   // a `using` inside this body is scoped to it: snapshot/restore ref_active.
@@ -31589,7 +31665,8 @@ and register_class = fn world -> fn (cls: str) -> fn (body: Stmt list) ->
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
-   | _ -> r)
+   // ...and :end when the body is left normally, with the class as #self
+   | _ -> (let _ = fire_tp_v world "end" "" cls VNil (VClass cls) in r))
 
 // run a class_eval-style BLOCK body as class `cls`: defs go to the class, but
 // constants and nested classes go to `cscope` — the block's LEXICAL scope
@@ -34371,10 +34448,25 @@ and clausesin_targets = fn clauses ->
 // skipped. Unsupported constructs `fail`; during the migration the caller
 // falls back to the legacy matcher below.
 
+// does the pattern name a group? `(?<n>` / `(?'n'`, not the lookbehinds, and
+// not inside a character class or after a backslash.
+and rxp_has_named = fn (pat: str) -> fn (i: int) -> fn (incls: bool) ->
+  if i >= str_len pat then false
+  else (let c = char_at pat i in
+        if str_eq c "\\" then rxp_has_named pat (i + 2) incls
+        else if incls then rxp_has_named pat (i + 1) (if str_eq c "]" then false else true)
+        else if str_eq c "[" then rxp_has_named pat (i + 1) true
+        else if str_eq c "(" && i + 3 < str_len pat && str_eq (char_at pat (i + 1)) "?"
+                && (str_eq (char_at pat (i + 2)) "'"
+                    || (str_eq (char_at pat (i + 2)) "<"
+                        && (if str_eq (char_at pat (i + 3)) "=" || str_eq (char_at pat (i + 3)) "!" then false else true)))
+        then true
+        else rxp_has_named pat (i + 1) false)
 and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   let _ = map_clear rx_gnums in
   let _ = map_clear rx_gnall in
   let _ = map_clear rx_gbodies in
+  let _ = (if rxp_has_named pat 0 false then map_set rx_named_mode "on" 1 else map_delete rx_named_mode "on") in
   let (n, p, g) = rxp_alt pat 0 fl 1 in
   if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )") else n
 
@@ -34637,6 +34729,14 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
          (let (n, p3, g2) = rxp_alt pat p2 fl2 g in
           (NGroup (n, 0, ""), rxp_close pat p3, g2))
        else (NFlagsRest fl2, p2, g))
+  // ⚠ beside a NAMED group a plain paren does not capture at all (onigmo's
+  //   rule), so it takes no number: `/(y)(?<a>x)/` has one group, and it is
+  //   group 1. Numbering both made named_captures, \1 and every index after
+  //   the plain paren one too high -- the MatchData surface masked the
+  //   unnamed ones, but only the surface.
+  else if map_has rx_named_mode "on" then
+    (let (n, p2, g2) = rxp_alt pat p fl g in
+     (NGroup (n, 0, ""), rxp_close pat p2, g2))
   else
     let (n, p2, g2) = rxp_alt pat p fl (g + 1) in
     // \g<1> calls a group by NUMBER, and only named groups recorded a body to
@@ -34957,7 +35057,17 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
 // method is written with a DOT, everything else with a hash, and a builtin has
 // no source to name.
 and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm: str) -> fn (params: Val) -> fn (loc: Val) ->
-  let base = (if is_sng_cls owner then cls_display world (sng_inner owner) ++ "." else cls_display world owner ++ "#") in
+  // ⚠ ...but an UNBOUND one has no receiver to put before the dot: it names
+  //   its owner, the singleton class, with a hash (`#<Class:C>#foo`). And a
+  //   bound one on an OBJECT'S singleton names the object, which the owner
+  //   spells as a bare id -- it printed `111.foo`.
+  let sdisp = (if is_sng_cls owner then cls_display world owner else "") in
+  let base = (if is_sng_cls owner && str_eq kind "UnboundMethod" then sdisp ++ "#"
+              else if is_sng_cls owner && str_len (sng_inner owner) > 0 && is_digit (char_at (sng_inner owner) 0)
+                      && str_len sdisp > 9
+              then substring sdisp 8 (str_len sdisp - 1) ++ "."
+              else if is_sng_cls owner then cls_display world (sng_inner owner) ++ "."
+              else cls_display world owner ++ "#") in
   "#<" ++ kind ++ ": " ++ base ++ nm ++ "("
   ++ (match params with VArr aid -> meth_params_str (deref aid) | _ -> "") ++ ")"
   ++ (match loc with
