@@ -3,6 +3,13 @@
 # in plain Ruby so the same shim runs under both mere-ruby and ruby (the
 # outputs can be diffed byte-for-byte).
 
+# mspec/utils/warnings.rb, which every mspec run loads: deprecation warnings
+# on (ruby/spec tests for them), experimental ones off
+if Object.const_defined?(:Warning) && Warning.respond_to?(:[]=)
+  Warning[:deprecated] = true
+  Warning[:experimental] = false
+end
+
 $mspec_pass = 0
 $mspec_fail = 0
 $mspec_err = 0
@@ -23,20 +30,21 @@ class PositiveMatcher
   def initialize(actual)
     @actual = actual
   end
-  # x.should.raise(Klass[, pattern]) — @actual is a proc; the pattern (a
-  # regex source string here) is accepted but not matched.
-  def raise(klass = nil, pattern = nil)
-    begin
-      @actual.call
+  # x.should.raise(Klass[, message][, cause: c]) { |e| ... } -- mspec's
+  # RaiseErrorMatcher (matchers/base.rb, matchers/raise_error.rb): the class,
+  # the message (a String is compared, a Regexp matched) and the cause must
+  # all agree, and then the block gets the exception, with expectations of its
+  # own. An exception that does NOT agree propagates, as mspec re-raises it.
+  # (The shim compared the class alone and threw the block away: 1068 message
+  # checks and 111 blocks of assertions ran on neither side, and `cause:` was
+  # an ArgumentError on both.)
+  def raise(exception = Exception, message = nil, options = nil, &block)
+    m = RaiseErrorMatcher.new(exception, message, options, &block)
+    if m.match?(@actual)
+      $mspec_pass += 1
+    else
       $mspec_fail += 1
-      puts "FAILED: expected #{klass} to be raised"
-    rescue Exception => e
-      if klass.nil? || e.class.to_s == klass.to_s || e.is_a?(klass)
-        $mspec_pass += 1
-      else
-        $mspec_fail += 1
-        puts "FAILED: raised #{e.class}, expected #{klass}"
-      end
+      puts "FAILED: #{$mspec_it}: #{m.failure_line}"
     end
     nil
   end
@@ -127,6 +135,20 @@ class NegativeMatcher
   def initialize(actual)
     @actual = actual
   end
+  # x.should_not.raise(Klass[, message]): passes when nothing is raised, fails
+  # when a matching exception is, and lets any other one propagate (mspec). It
+  # had no #raise, so method_missing sent #raise to the Proc -- Kernel#raise --
+  # and all 155 of them were an ERROR on both sides.
+  def raise(exception = Exception, message = nil, options = nil, &block)
+    m = RaiseErrorMatcher.new(exception, message, options, &block)
+    if m.match?(@actual)
+      $mspec_fail += 1
+      puts "FAILED: #{$mspec_it}: expected not to raise #{m.expected_text}"
+    else
+      $mspec_pass += 1
+    end
+    nil
+  end
   def empty?
     if @actual.empty?
       $mspec_fail += 1
@@ -201,26 +223,164 @@ class Object
   end
 end
 
-def describe(desc, *opts)
-  # a shared example group (describe :name, shared: true) is only a template;
-  # real mspec registers it for it_behaves_like (a no-op here), so skip it.
-  return if opts.any? { |o| o.is_a?(Hash) && o[:shared] }
-  prev_b = $mspec_before
-  prev_a = $mspec_after
-  $mspec_desc = desc
-  yield
-  $mspec_before = prev_b
-  $mspec_after = prev_a
+# ---- the example tree, as mspec builds and runs it (runner/context.rb) ----
+#
+# mspec reads a describe body FIRST and runs its examples AFTERWARDS, and the
+# order it runs things in is part of what a spec means:
+#   * before(:all) runs once per describe, and it is every ENCLOSING
+#     describe's before(:all) as well as the describe's own; before(:each)
+#     runs per example, after all of those. So a `before :each` that sets
+#     @object wins over a shared group's `before :all` that sets it to nil.
+#   * after blocks run innermost first, and later-defined first.
+#   * a describe's own examples run before its nested describes.
+#   * it_behaves_like adds the shared group's hooks and examples to the
+#     describe it is IN (not to a group of its own), after a before(:all)
+#     that sets @method / @object.
+#   * everything runs on ONE env object (MSpec.protect is
+#     `@env.instance_exec(&block)`), so `@value_to_return = ...` written in a
+#     describe body reaches that describe's examples, and an ivar one example
+#     sets is still there in the next -- examples do not start clean.
+# The shim used to run each example the moment `it` was read, on a fresh
+# Object, with befores in one flat list: 1781 it_behaves_like lines were then
+# no-ops, and once they ran, a spec's `before :each { @object = ... }` was
+# overwritten by the shared group's nil, and every describe-level ivar was
+# lost -- on BOTH sides, so those rows compared the shim with itself.
+class MSpecContext
+  attr_reader :desc, :parent, :examples, :children
+  attr_accessor :parsed
+  def initialize(desc, parent)
+    @desc = desc
+    @parent = parent
+    @parsed = false
+    @examples = []
+    @children = []
+    @before_all = []
+    @before_each = []
+    @after_each = []
+    @after_all = []
+    parent.children << self if parent
+  end
+  def before_list(kind); kind == :all ? @before_all : @before_each; end
+  def after_list(kind); kind == :all ? @after_all : @after_each; end
+  def add_before(kind, blk); before_list(kind) << blk; end
+  def add_after(kind, blk); after_list(kind).unshift(blk); end
+  def parents
+    l = []
+    s = self
+    while s
+      l.unshift(s)
+      s = s.parent
+    end
+    l
+  end
+  # outermost first, each describe's in the order they were written
+  def pre(kind)
+    l = []
+    parents.each { |s| l.concat(s.before_list(kind)) }
+    l
+  end
+  # innermost first (and within one describe, the later ones first)
+  def post(kind)
+    l = []
+    parents.reverse.each { |s| l.concat(s.after_list(kind)) }
+    l
+  end
+  # a copy of a shared group's nested describe, placed under +parent+
+  def adopt_copy(parent)
+    c = MSpecContext.new(@desc, parent)
+    c.parsed = @parsed
+    [:all, :each].each do |k|
+      before_list(k).each { |b| c.add_before(k, b) }
+      after_list(k).reverse.each { |b| c.add_after(k, b) }
+    end
+    @examples.each { |e| c.examples << e }
+    @children.each { |ch| ch.adopt_copy(c) }
+    c
+  end
 end
 
-def context(desc, *opts)
-  prev_b = $mspec_before
-  prev_a = $mspec_after
-  $mspec_desc = desc
-  yield
-  $mspec_before = prev_b
-  $mspec_after = prev_a
+$mspec_env = Object.new
+$mspec_cur = nil
+# shared example groups, by name: `describe :name, shared: true do` parses
+# one here and runs none of it; it_behaves_like copies it in.
+$mspec_shared = {}
+
+# One step of the run -- a hook or an example -- with its failure tallied.
+# Answers whether it completed. (MSpec.protect; the shim keeps its own tally
+# and its one-line reports, and a SystemExit is swallowed as it always was.)
+def __mspec_protect(label, blk)
+  $mspec_env.instance_exec(&blk)
+  true
+rescue SpecFailure
+  # already tallied
+  false
+rescue SpecSkipped
+  # ⚠ `skip` is mspec's own, and the shim did not have it -- so an example
+  #   that MEANT to skip raised NameError and was recorded as an ERROR, which
+  #   is a different verdict from the reference's. core/gc/config is the one
+  #   that found it: its example skips when the collector has no boolean
+  #   setting to toggle, which this one does not.
+  #   A skipped example is counted as PASSED here, as real mspec counts it,
+  #   so the two sides' tallies mean the same thing.
+  $mspec_pass += 1
+  false
+rescue Exception => e
+  $mspec_err += 1
+  # The CLASS only: the message would make this record compare two error
+  # texts rather than two behaviours, and they differ for reasons the record
+  # already names elsewhere. MERE_SPEC_VERBOSE prints it for debugging, and
+  # is off in every gate -- an ERROR line is the start of an investigation
+  # and "which NoMethodError" is the first thing it needs.
+  puts "ERROR: #{label}: #{e.class}" +
+       (ENV["MERE_SPEC_VERBOSE"] ? " -- #{e.message}" : "")
+  false
 end
+
+def __mspec_run_example(ctx, desc, blk)
+  $mspec_it = desc
+  $mspec_desc = ctx.desc
+  label = "#{ctx.desc} #{desc}"
+  ok = true
+  ctx.pre(:each).each { |b| ok = __mspec_protect(label, b) if ok }
+  if ok && blk
+    ok = __mspec_protect(label, blk)
+  end
+  ctx.post(:each).each { |a| __mspec_protect(label, a) }
+  __mspec_protect(label, proc { __mspec_verify_stubs }) if ok
+  # ...and on the failure paths too: a stub left installed would change the
+  # NEXT example (one put on a class outlives the object it was put on).
+  __mspec_drop_stubs
+end
+
+def __mspec_process(ctx)
+  if ctx.parsed && !ctx.examples.empty?
+    $mspec_desc = ctx.desc
+    ok = true
+    ctx.pre(:all).each { |b| ok = __mspec_protect("#{ctx.desc} before :all", b) if ok }
+    if ok
+      ctx.examples.each { |d, b| __mspec_run_example(ctx, d, b) }
+      ctx.post(:all).each { |a| __mspec_protect("#{ctx.desc} after :all", a) }
+    end
+  end
+  ctx.children.each { |c| __mspec_process(c) }
+end
+
+def describe(desc, *opts, &blk)
+  shared = opts.any? { |o| o.is_a?(Hash) && o[:shared] }
+  prev = $mspec_cur
+  ctx = MSpecContext.new(desc.to_s, shared ? nil : prev)
+  $mspec_cur = ctx
+  ctx.parsed = __mspec_protect(desc.to_s, blk) if blk
+  $mspec_cur = prev
+  if shared
+    $mspec_shared[desc.to_s] = ctx
+  elsif prev.nil?
+    __mspec_process(ctx)
+  end
+  nil
+end
+
+def context(desc, *opts, &blk); describe(desc, *opts, &blk); end
 
 # mspec's `skip`: abandon this example without failing it. Real mspec raises
 # its own exception class and the runner counts the example as passed.
@@ -228,41 +388,16 @@ class SpecSkipped < StandardError; end
 def skip(reason = nil); raise SpecSkipped, reason.to_s; end
 
 def it(desc, *opts, &blk)
-  $mspec_it = desc
-  # Run before/example/after on ONE fresh example object (like real mspec), so
-  # @ivars set in `before` are visible to the example, each example starts
-  # clean, and matcher methods (include, equal, ...) resolve to the shim
-  # definitions instead of a self=main built-in such as Module#include.
-  env = Object.new
-  begin
-    env.instance_exec(&$mspec_before) if $mspec_before
-    env.instance_exec(&blk) if blk
-    env.instance_exec(&$mspec_after) if $mspec_after
-    __mspec_verify_stubs
-  rescue SpecFailure
-    # already tallied
-  rescue SpecSkipped
-    # ⚠ `skip` is mspec's own, and the shim did not have it -- so an example
-    #   that MEANT to skip raised NameError and was recorded as an ERROR, which
-    #   is a different verdict from the reference's. core/gc/config is the one
-    #   that found it: its example skips when the collector has no boolean
-    #   setting to toggle, which this one does not.
-    #   A skipped example is counted as PASSED here, as real mspec counts it,
-    #   so the two sides' tallies mean the same thing.
-    $mspec_pass += 1
-  rescue Exception => e
-    $mspec_err += 1
-    # The CLASS only: the message would make this record compare two error
-    # texts rather than two behaviours, and they differ for reasons the record
-    # already names elsewhere. MERE_SPEC_VERBOSE prints it for debugging, and
-    # is off in every gate -- an ERROR line is the start of an investigation
-    # and "which NoMethodError" is the first thing it needs.
-    puts "ERROR: #{$mspec_desc} #{desc}: #{e.class}" +
-         (ENV["MERE_SPEC_VERBOSE"] ? " -- #{e.message}" : "")
+  if $mspec_cur
+    $mspec_cur.examples << [desc, blk]
+  else
+    # an example outside any describe runs where it stands
+    top = MSpecContext.new("", nil)
+    top.parsed = true
+    top.examples << [desc, blk]
+    __mspec_process(top)
   end
-  # ...and on the failure paths too: a stub left installed would change the
-  # NEXT example (one put on a class outlives the object it was put on).
-  __mspec_drop_stubs
+  nil
 end
 
 # mspec: `specify` is an alias of `it` (a describe-less example).
@@ -273,15 +408,49 @@ module SpecEvaluate
   def self.desc=(x); @desc = x; end
   def self.desc; @desc; end
 end
-def it_behaves_like(*args); end
-def it_should_behave_like(*args); end
-def before(kind = nil, &blk); $mspec_before = blk; end
-def after(kind = nil, &blk); $mspec_after = blk; end
-def guard(*args); end
+# mspec's it_behaves_like (runner/shared.rb), word for word: @method and
+# @object are set in a before(:all) of the describe it is written in.
+def it_behaves_like(desc, meth = nil, obj = nil)
+  before(:all) do
+    @method = meth
+    @object = obj
+  end
+  after(:all) do
+    @method = nil
+    @object = nil
+  end
+  it_should_behave_like desc.to_s
+end
+# ContextState#it_should_behave_like: the shared group's hooks, examples and
+# nested describes join the current describe. A name that was never
+# registered is mspec's error too.
+def it_should_behave_like(desc)
+  state = $mspec_shared[desc.to_s]
+  raise Exception, "Unable to find shared 'describe' for #{desc}" unless state
+  cur = $mspec_cur
+  [:all, :each].each do |k|
+    state.before_list(k).each { |b| cur.add_before(k, b) }
+    state.after_list(k).each { |b| cur.add_after(k, b) }
+  end
+  state.examples.each { |e| cur.examples << e }
+  state.children.each { |ch| ch.adopt_copy(cur) }
+  nil
+end
+def before(kind = :each, &blk); $mspec_cur.add_before(kind, blk) if $mspec_cur; end
+def after(kind = :each, &blk); $mspec_cur.add_after(kind, blk) if $mspec_cur; end
+# mspec's guard: the block runs when the condition answers true
+def guard(cond = nil)
+  ok = cond.respond_to?(:call) ? cond.call : cond
+  yield if ok && block_given?
+  ok
+end
 # mspec platform guards: this shim runs everywhere, so the block runs.
 def not_supported_on(*args); yield if block_given?; end
-# known-MRI-bug guard: skipped (like ruby_version_is), same on both sides.
-def ruby_bug(*args); end
+# mspec's known-MRI-bug guard: the block is skipped on the versions that have
+# the bug (up to and including the one named) and runs after it
+def ruby_bug(bug = nil, version = nil)
+  yield if block_given? && version && __mspec_ver_cmp(RUBY_VERSION, version.to_s) > 0
+end
 # mspec's `quarantine! do ... end` marks examples as not-to-be-run; the block is
 # skipped entirely. It was missing, so the block ran at DESCRIBE time and the
 # file died on `undefined method 'quarantine!'` -- under ruby too, which is why
@@ -330,10 +499,295 @@ def ruby_version_is(range)
     else
       __mspec_ver_cmp(RUBY_VERSION, range.to_s) >= 0
     end
-  yield if ok && block_given?
+  # without a block it ANSWERS (mspec's run_if): `ruby_version_is("4.0") ?
+  # "Object" : "object"` picks a message by version, and nil picked the old one
+  # on both sides
+  return ok unless block_given?
+  yield if ok
 end
-def platform_is(*args); end
-def platform_is_not(*args); end
+# mspec's platform guards, decided by RUBY_PLATFORM (the same on both sides
+# here). With no block they answer the question, which some specs use inline.
+def __mspec_platform?(*args)
+  args.any? do |a|
+    case a
+    when Hash
+      a.all? do |k, v|
+        case k
+        when :c_long_size, :pointer_size, :wordsize then v == 64
+        else false
+        end
+      end
+    when :windows, :mingw, :mswin, :cygwin, :android, :aix, :solaris, :openbsd, :netbsd, :freebsd, :dragonfly, :wsl
+      RUBY_PLATFORM.include?(a.to_s)
+    when :linux then RUBY_PLATFORM.include?("linux")
+    when :darwin then RUBY_PLATFORM.include?("darwin")
+    when :bsd then RUBY_PLATFORM =~ /bsd|dragonfly/ ? true : false
+    else RUBY_PLATFORM.include?(a.to_s)
+    end
+  end
+end
+def platform_is(*args)
+  ok = __mspec_platform?(*args)
+  yield if ok && block_given?
+  ok
+end
+def platform_is_not(*args)
+  ok = !__mspec_platform?(*args)
+  yield if ok && block_given?
+  ok
+end
+# ---- the rest of mspec's guards and helpers, ported from mspec/lib ----
+# ruby/spec's own spec_helper.rb defines this (the code-loading fixtures), and
+# 45 of core/kernel/load_spec's examples name it
+CODE_LOADING_DIR = File.realpath("fixtures/code", __dir__) unless defined?(CODE_LOADING_DIR)
+# Each was missing, and a spec that used one raised NoMethodError under BOTH
+# interpreters -- the pair read as agreement about nothing. Found by listing
+# every `def` in mspec's helpers/guards/matchers against this file (2026-09-29):
+# new_io 104 uses, output_to_fd 68, with_timezone 66, with_feature 47,
+# mock_to_path 42, little_endian/big_endian 41, as_user 22, ...
+#
+# guards/platform.rb's queries that specs call directly
+module PlatformGuard
+  C_LONG_SIZE = 64
+  POINTER_SIZE = 64
+  def self.implementation?(*args)
+    args.any? { |name| (name == :ruby ? "ruby" : name.to_s) == RUBY_ENGINE }
+  end
+  def self.standard?; implementation?(:ruby); end
+  def self.windows?; false; end
+  def self.wasi?; false; end
+end
+# guards/guard.rb's guard_not
+def guard_not(condition)
+  yield unless condition.call
+end
+# guards/endian.rb: decided by the bytes [1].pack('L') lays out
+def __mspec_big_endian?; [1].pack('L')[-1] == ?\001; end
+def big_endian
+  ok = __mspec_big_endian?
+  yield if ok && block_given?
+  ok
+end
+def little_endian
+  ok = !__mspec_big_endian?
+  yield if ok && block_given?
+  ok
+end
+# guards/superuser.rb
+def as_superuser
+  ok = Process.euid == 0
+  yield if ok && block_given?
+  ok
+end
+def as_real_superuser
+  ok = Process.uid == 0
+  yield if ok && block_given?
+  ok
+end
+def as_user
+  ok = Process.euid != 0
+  yield if ok && block_given?
+  ok
+end
+# guards/feature.rb and the MSpec registry it asks. ruby/spec's own
+# spec_helpers enable the features (library/socket, library/readline).
+module MSpec
+  @features = {}
+  def self.enable_feature(f); @features[f] = true; end
+  def self.disable_feature(f); @features.delete(f); end
+  def self.feature_enabled?(f); @features.key?(f); end
+end
+def with_feature(*features)
+  ok = features.all? { |f| MSpec.feature_enabled?(f) }
+  yield if ok && block_given?
+  ok
+end
+def without_feature(*features)
+  ok = !features.all? { |f| MSpec.feature_enabled?(f) }
+  yield if ok && block_given?
+  ok
+end
+# guards/version.rb's version_is (ruby_version_is with another base) and
+# kernel_version_is (darwin's is the build-time one in RUBY_PLATFORM)
+def __mspec_version_ok?(base, req)
+  if req.is_a?(Range)
+    b = req.begin.to_s
+    e = req.end.to_s
+    (b.empty? || __mspec_ver_cmp(base, b) >= 0) &&
+      (e.empty? || (req.exclude_end? ? __mspec_ver_cmp(base, e) < 0 : __mspec_ver_cmp(base, e) <= 0))
+  else
+    __mspec_ver_cmp(base, req.to_s) >= 0
+  end
+end
+def version_is(base, req)
+  ok = __mspec_version_ok?(base.to_s, req)
+  yield if ok && block_given?
+  ok
+end
+def kernel_version_is(req)
+  v = RUBY_PLATFORM[/darwin(\d+)/, 1] || `uname -r`.chomp
+  ok = __mspec_version_ok?(v, req)
+  yield if ok && block_given?
+  ok
+end
+# guards/block_device.rb
+def with_block_device
+  found = `find /dev /devices -type b 2> /dev/null`
+  ok = !(found.nil? || found.empty?)
+  yield if ok && block_given?
+  ok
+end
+# helpers/numeric.rb (C long is 64 bits on every host this runs on)
+def max_long; 2**63 - 1; end
+def min_long; -(2**63); end
+# helpers/io.rb
+def new_fd(name, mode = "w:utf-8")
+  if mode.kind_of? Hash
+    if mode.key? :mode
+      mode = mode[:mode]
+    else
+      raise ArgumentError, "new_fd options Hash must include :mode"
+    end
+  end
+  IO.sysopen name, mode
+end
+def new_io(name, mode = "w:utf-8")
+  if Hash === mode
+    File.new(name, **mode)
+  else
+    File.new(name, mode)
+  end
+end
+# helpers/mock_to_path.rb
+def mock_to_path(path)
+  obj = MockObject.new('path')
+  obj.should_receive(:to_path).and_return(path)
+  obj
+end
+# helpers/datetime.rb
+def new_datetime(opts = {})
+  require 'date'
+  value = {
+    :year   => -4712,
+    :month  => 1,
+    :day    => 1,
+    :hour   => 0,
+    :minute => 0,
+    :second => 0,
+    :offset => 0,
+    :sg     => Date::ITALY
+  }.merge opts
+  DateTime.new value[:year], value[:month], value[:day], value[:hour],
+    value[:minute], value[:second], value[:offset], value[:sg]
+end
+def with_timezone(name, offset = nil, daylight_saving_zone = "")
+  zone = name.dup
+  if offset
+    # TZ convention is backwards
+    offset = -offset
+    zone += offset.to_s
+    zone += ":00:00"
+  end
+  zone += daylight_saving_zone
+  old = ENV["TZ"]
+  ENV["TZ"] = zone
+  begin
+    yield
+  ensure
+    ENV["TZ"] = old
+  end
+end
+# helpers/argv.rb
+def argv(args)
+  if args == :restore
+    ARGV.replace(@__mspec_saved_argv__ || [])
+  else
+    @__mspec_saved_argv__ = ARGV.dup
+    ARGV.replace args
+    if block_given?
+      begin
+        yield
+      ensure
+        argv :restore
+      end
+    end
+  end
+end
+# matchers/signed_zero.rb
+class SignedZeroMatcher
+  def initialize(sign); @sign = sign; end
+  def match?(actual); (1.0 / actual).infinite? == @sign; end
+end
+def be_positive_zero; SignedZeroMatcher.new(1); end
+def be_negative_zero; SignedZeroMatcher.new(-1); end
+# matchers/equal_element.rb
+class EqualElementMatcher
+  def initialize(element, attributes = nil, content = nil, options = {})
+    @element = element
+    @attributes = attributes
+    @content = content
+    @options = options
+  end
+  def match?(actual)
+    matched = true
+    if @options[:not_closed]
+      matched &&= actual =~ /^#{Regexp.quote("<" + @element)}.*#{Regexp.quote(">" + (@content || ''))}$/
+    else
+      matched &&= actual =~ /^#{Regexp.quote("<" + @element)}/
+      matched &&= actual =~ /#{Regexp.quote("</" + @element + ">")}$/
+      matched &&= actual =~ /#{Regexp.quote(">" + @content + "</")}/ if @content
+    end
+    if @attributes
+      if @attributes.empty?
+        matched &&= actual.scan(/\w+\=\"(.*)\"/).size == 0
+      else
+        @attributes.each do |key, value|
+          if value == true
+            matched &&= (actual.scan(/#{Regexp.quote(key)}(\s|>)/).size == 1)
+          else
+            matched &&= (actual.scan(%Q{ #{key}="#{value}"}).size == 1)
+          end
+        end
+      end
+    end
+    !!matched
+  end
+end
+def equal_element(*args); EqualElementMatcher.new(*args); end
+# matchers/output_to_fd.rb: the block's writes to that stream, by reopening it
+# on a temporary file
+class OutputToFDMatcher
+  def initialize(expected, to)
+    @to, @expected = to, expected
+    unless @to.equal?(STDOUT) || @to.equal?(STDERR) || @to.is_a?(IO)
+      raise ArgumentError, "#{@to.inspect} is not a supported output target"
+    end
+  end
+  def match?(block)
+    old_to = @to.dup
+    path = tmp("mspec_output_to_#{$$}_#{Time.now.to_i}")
+    begin
+      File.open(path, 'w+') do |out|
+        @to.reopen out
+        begin
+          block.call
+        ensure
+          @to.reopen old_to
+          old_to.close
+        end
+        out.rewind
+        @actual = out.read
+      end
+    ensure
+      File.delete path if File.exist?(path)
+    end
+    case @expected
+    when Regexp then !(@actual =~ @expected).nil?
+    else @actual == @expected
+    end
+  end
+end
+def output_to_fd(what, where = STDOUT); OutputToFDMatcher.new(what, where); end
 def suppress_warning
   yield
 end
@@ -396,6 +850,12 @@ end
 def ruby_exe(code = :__not_given, *rest, **opts)
   # with no code, mspec answers the command line itself, as words
   return RUBY_EXE.split(" ") if code == :__not_given
+  # nil code: the interpreter runs what its options and args give it (a
+  # script on stdin, `args: "< file"`), not an empty -e
+  if code.nil?
+    cmd = [RUBY_EXE, opts[:options], __mspec_shell_args(opts[:args])].compact.join(" ")
+    return `#{cmd}`
+  end
   # mspec runs a FILE in a subprocess of the interpreter under test
   # (`ruby_exe(fixture(...))`). Evaluating the path as code failed identically
   # on both sides, and evaluating the file in-process cannot give it what a
@@ -494,6 +954,12 @@ end
 # mspec numeric tolerance (mspec/helpers/numeric.rb) and the be_close /
 # be_within float matchers.
 TOLERANCE = 0.00003 unless defined?(TOLERANCE)
+# mspec defines this beside TOLERANCE (matchers/be_close.rb): the bound a
+# timed wait is allowed to overshoot by. Without it every `timeout:` example
+# in shared/queue dies in its thread with NameError while the main thread
+# spins in `Thread.pass until t.status == "sleep"` -- the REFERENCE then hits
+# the CPU budget and the row reads SLOW on both sides.
+TIME_TOLERANCE = 20.0 unless defined?(TIME_TOLERANCE)
 class CloseMatcher
   def initialize(expected, tolerance); @expected = expected; @tolerance = tolerance; end
   def match?(actual); (actual - @expected).abs <= @tolerance; end
@@ -600,21 +1066,58 @@ def be_ancestor_of(mod); AncestorOfMatcher.new(mod); end
 # exception's class. Message/pattern/block args are accepted but not matched
 # (the existing `raise` matcher does the same), so mere and ruby agree as long
 # as they raise the same class.
+# mspec's RaiseErrorMatcher, as matchers/raise_error.rb writes it. #match?
+# answers false when nothing was raised, true when the exception agrees (after
+# giving it to the block), and RE-RAISES one that does not agree -- the class
+# of what really happened is the finding, not "a matcher failed".
 class RaiseErrorMatcher
-  def initialize(klass); @klass = klass; end
-  def match?(actual)
-    begin
-      actual.call
-      false
-    rescue Exception => e
-      @klass.nil? || e.is_a?(@klass)
+  UNDEF_CAUSE = Object.new
+  def initialize(exception = Exception, message = nil, options = nil, &block)
+    if message.is_a?(Hash)
+      @message = nil
+      options = message
+    else
+      @message = message
     end
+    @cause = options ? options.fetch(:cause, UNDEF_CAUSE) : UNDEF_CAUSE
+    @exception = exception.nil? ? Exception : exception
+    @block = block
   end
+  def match?(proc)
+    proc.call
+    false
+  rescue Object => actual
+    raise actual unless matching_exception?(actual)
+    @block.call(actual) if @block
+    true
+  end
+  def matching_exception?(exc)
+    return false unless @exception === exc
+    ok = case @message
+         when String then @message == exc.message
+         when Regexp then (@message =~ exc.message) ? true : false
+         else true
+         end
+    return false unless ok
+    @cause.equal?(UNDEF_CAUSE) || @cause == exc.cause
+  end
+  def expected_text
+    t = @exception.to_s
+    t += " #{@message.inspect}" unless @message.nil?
+    t
+  end
+  def failure_line; "expected #{expected_text} to be raised"; end
 end
 
-def raise_error(klass = nil, msg = nil, pat = nil, &blk); RaiseErrorMatcher.new(klass); end
-# mspec's stricter variant (also checks the message under -W); class-only here.
-def raise_consistent_error(klass = nil, msg = nil, &blk); RaiseErrorMatcher.new(klass); end
+def raise_error(exception = Exception, message = nil, options = nil, &block)
+  RaiseErrorMatcher.new(exception, message, options, &block)
+end
+# CRuby < 4.1 has inconsistent coercion errors (bugs.ruby-lang.org #21864), so
+# mspec ignores the message there -- and the reference here is 4.0.
+def raise_consistent_error(exception = Exception, message = nil, options = nil, &block)
+  message = nil if RUBY_ENGINE == "ruby" && __mspec_version_ok?(RUBY_VERSION, ""..."4.1")
+  RaiseErrorMatcher.new(exception, message, options, &block)
+end
 
 # x.should equal(y) — object identity.
 class EqualMatcher
@@ -636,8 +1139,22 @@ def include(*members); IncludeMatcher.new(members); end
 # the host may lack mutable hashes) and answers via method_missing.
 class MockExpectation
   def initialize(sym); @sym = sym; @value = nil; @with = nil; @raise = nil; @raise_msg = nil; end
-  def and_return(v); @value = v; self; end
+  # several values are answered one per call, the last one from then on
+  # (mspec's MockProxy#returning): `and_return(-1, -1)` was an ArgumentError
+  def and_return(*vs)
+    if vs.size > 1
+      @values = vs
+    else
+      @values = nil
+      @value = vs[0]
+    end
+    self
+  end
   def and_raise(e = RuntimeError, msg = nil); @raise = e; @raise_msg = msg; self; end
+  # mspec's and_yield: each call adds one yield, made (in order) to the block
+  # the mocked method is called with, before it answers
+  def and_yield(*a); (@yields ||= []) << a; self; end
+  def yields; @yields || []; end
   # raise what `.and_raise` named, if anything. Called at the moment the mocked
   # method is invoked.
   def raise!
@@ -663,7 +1180,11 @@ class MockExpectation
   def optional?; @optional ? true : false; end
   def exactly(*a); self; end
   def times; self; end
-  def value; @value; end
+  def value
+    return @value if @values.nil?
+    return @values[0] if @values.size == 1
+    @values.shift
+  end
   def sym; @sym; end
   # whether the mocked method was actually invoked -- what `should_receive`
   # verifies at the end of the example, and what `should_not_receive` forbids.
@@ -716,18 +1237,23 @@ module Kernel
       singleton_class.send(:define_method, sym) do |*args, &blk|
         hit = nil
         exps.each { |pair| hit = pair if hit.nil? && pair[0].matches?(args) }
+        # ⚠ the report goes to STDOUT itself: a spec may stub #write on the
+        #   object that IS $stdout (core/kernel/putc), and `puts` from here
+        #   called that stub again, which reported again, until the stack ran
+        #   out
         if hit.nil?
           $mspec_fail += 1
-          puts "FAILED: #{$mspec_it}: ##{sym} received with unexpected arguments"
+          STDOUT.puts "FAILED: #{$mspec_it}: ##{sym} received with unexpected arguments"
           nil
         else
           hit[0].called!
           if hit[1]
             $mspec_fail += 1
-            puts "FAILED: #{$mspec_it}: expected not to receive ##{sym}"
+            STDOUT.puts "FAILED: #{$mspec_it}: expected not to receive ##{sym}"
             nil
           else
             hit[0].raise!
+            hit[0].yields.each { |ya| blk.call(*ya) } if blk
             hit[0].value
           end
         end

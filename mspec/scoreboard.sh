@@ -286,6 +286,13 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo "Measured against **ruby $REF_RUBY_VERSION** (tools/ref_ruby.sh). The reference is part"
   echo "of the subject: a row measured against another release is not comparable with the"
   echo "ones around it, and the difference reads as movement in mere-ruby."
+  echo
+  echo "⚠ **The shim is part of the subject too.** From 2026-09-29 it runs what mspec runs:"
+  echo "shared examples (\`it_behaves_like\`, 1781 lines that used to run nothing), the"
+  echo "platform / version / feature guards, mspec's before/after order, and its raise"
+  echo "matcher (message, \`cause:\` and the block). A row from before that date compared"
+  echo "fewer examples, so MATCH 2589 then and 2221 now are not the same question: the"
+  echo "368 files are ones whose newly compared examples differ, not behaviour that was lost."
   echo "| group | MATCH | DIFF | CRASH | SKIP | SLOW | total |"
   echo "|---|---|---|---|---|---|---|"
 } > "$status"
