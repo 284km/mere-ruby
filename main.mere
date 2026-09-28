@@ -568,6 +568,13 @@ and gc_mark_vals = fn live -> fn (xs: Val list) ->
   match xs with
   | Nil -> ()
   | Cons (v, rest) -> let _ = gc_mark_val live v in gc_mark_vals live rest;
+// an id a half-evaluated statement built (fb_stack_wm): kind 0 object, 1 array,
+// 2 string, 3 hash. An id no store holds any more is skipped, not dereferenced.
+let gc_mark_wm = fn live -> fn (k: int) -> fn (n: int) ->
+  if k == 0 then gc_mark_val live (VObj n)
+  else if k == 1 then (if map_has arr_store n then gc_mark_val live (VArr n) else ())
+  else if k == 2 then (if n < vec_len str_store then gc_mark_val live (VStr n) else ())
+  else (if n < vec_len hash_store then gc_mark_val live (VHsh n) else ());
 
 // owner id of an ivars key: "123@x" -> 123; -1 when the key has no numeric
 // owner (specials and class ivars -- those entries are kept unconditionally).
@@ -723,10 +730,20 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter gc_cenv0 mk in
   let _ = map_iter gc_hold mk in
   // the Fiber objects, the value crossing a switch, and the saved contexts of
-  // suspended stacks. (No collection runs while a stack is suspended -- see
-  // fb_live -- so the saved contexts are marked for when that changes.)
+  // suspended stacks
   let fbx = map_has gc_state "fbx" in
   let _ = (if fbx then () else map_iter fb_obj (fn (k: int) -> fn (v: Val) -> gc_mark_val live v)) in
+  // A collection may run while fibers are suspended (it does not compact then;
+  // see gc_collect): every stack other than the running one is in the middle
+  // of a statement, so its frames are roots and so is what each frame's
+  // statement has built so far. (The reclaim pass marks these itself, stack by
+  // stack, which is why it asks for "fbx".)
+  let _ = (if fbx then ()
+           else map_iter fb_state (fn (i: int) -> fn (st: int) ->
+                  if (st == 1 || st == 2) && i != fb_cur ()
+                  then (let _ = fb_stack_envs i (fn (e) -> map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
+                        fb_stack_wm i (gc_mark_wm live))
+                  else ())) in
   let _ = map_iter fb_xfer mk in
   let _ = (if fbx then () else map_iter fb_sv mk) in
   let _ = map_iter fb_storage (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
@@ -767,6 +784,15 @@ let gc_collect = fn env -> fn world ->
   region GCC {
     let (meths, sup, ocls, ivars) = world in
     let gclog = gc_log_on () in
+    // WHILE A FIBER IS SUSPENDED THIS DOES NOT COMPACT. A suspended stack holds
+    // pointers into the stores' arenas in C variables, and compaction frees an
+    // arena; clearing a store and setting its survivors back frees nothing, so
+    // everything else below is safe under it. What this gives back is entries
+    // -- ids, table slots, the side tables -- not bytes; the bytes wait for
+    // the next collection with no fiber suspended. (Measured on a loop of
+    // short-lived values under a held Enumerator: 1748 MB and three million
+    // array entries without it, 1473 MB and 300 thousand with it.)
+    let nc = fb_live () > 0 in
     // ⚠ The collector kept no count of itself, so `GC.count` and `GC.total_time`
     //   had nothing to answer with and core/gc could not ask this interpreter a
     //   single question about its own collector. These two are the whole of it:
@@ -790,7 +816,7 @@ let gc_collect = fn env -> fn world ->
       else ()) in
     let _ = map_clear ivars in
     let _ = map_iter ivsave (fn (k: str) -> fn (v: Val) -> map_set ivars k v) in
-    let _ = map_compact ivars in
+    let _ = (if nc then () else map_compact ivars) in
     let ocsave = map_new () in
     // every key here IS an object id now -- the one non-numeric entry ("$next")
     // moved to its own table -- so the "keep what is not a number" branch that
@@ -799,7 +825,7 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8) then (let _ = map_set ocsave k v in ()) else ()) in
     let _ = map_clear ocls in
     let _ = map_iter ocsave (fn (k: int) -> fn (v: str) -> map_set ocls k v) in
-    let _ = map_compact ocls in
+    let _ = (if nc then () else map_compact ocls) in
     // ⚠ md_whole had NO sweep. It is one entry per successful match -- the
     // text the match covered, keyed by the MatchData's id -- and it was kept
     // for the life of the program: a loop that matches a million times held a
@@ -810,7 +836,7 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8) then (let _ = map_set mwsave k v in ()) else ()) in
     let _ = map_clear md_whole in
     let _ = map_iter mwsave (fn (k: int) -> fn (v: str) -> map_set md_whole k v) in
-    let _ = map_compact md_whole in
+    let _ = (if nc then () else map_compact md_whole) in
     let liveAK = map_new () in
     let _ = map_iter arr_store (fn (k: int) -> fn (xs: Val list) ->
       if map_has live (k * 8 + 2) then (let _ = map_set liveAK k xs in ()) else ()) in
@@ -824,7 +850,7 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter livePK (fn (k: int) -> fn (v: Vec['p, Val]) -> map_set arr_pending k v) in
     let _ = map_clear arr_store in
     let _ = map_iter liveAK (fn (k: int) -> fn (xs: Val list) -> map_set arr_store k xs) in
-    let _ = map_compact arr_store in
+    let _ = (if nc then () else map_compact arr_store) in
     let rec blank_h = fn (i: int) ->
       if i >= vec_len hash_store then ()
       else
@@ -855,7 +881,7 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8 + 3) then (let _ = map_set liveHM k b in ()) else ()) in
     let _ = map_clear hash_indexed in
     let _ = map_iter liveHM (fn (k: int) -> fn (b: bool) -> map_set hash_indexed k b) in
-    let _ = vec_compact hash_store in
+    let _ = (if nc then () else vec_compact hash_store) in
     let rec blank_s = fn (i: int) ->
       if i >= vec_len str_store then ()
       else
@@ -863,19 +889,19 @@ let gc_collect = fn env -> fn world ->
                  else (if str_eq (sget i) "" then () else sset i "")) in
         blank_s (i + 1) in
     let _ = blank_s 0 in
-    let _ = vec_compact str_store in
+    let _ = (if nc then () else vec_compact str_store) in
     let liveE = map_new () in
     let _ = map_iter str_enc (fn (k: int) -> fn (v: str) ->
       if map_has live (k * 8 + 1) then (let _ = map_set liveE k v in ()) else ()) in
     let _ = map_clear str_enc in
     let _ = map_iter liveE (fn (k: int) -> fn (v: str) -> map_set str_enc k v) in
-    let _ = map_compact str_enc in
+    let _ = (if nc then () else map_compact str_enc) in
     let liveF = map_new () in
     let _ = map_iter str_frozen (fn (k: int) -> fn (v: str) ->
       if map_has live (k * 8 + 1) then (let _ = map_set liveF k v in ()) else ()) in
     let _ = map_clear str_frozen in
     let _ = map_iter liveF (fn (k: int) -> fn (v: str) -> map_set str_frozen k v) in
-    let _ = map_compact str_frozen in
+    let _ = (if nc then () else map_compact str_frozen) in
     // The call-bookkeeping maps: one write per name/file/meth/line PER CALL
     // and a live_frames set+delete per frame, all keyed by depth (or a fixed
     // flag), so the live population is at most the recursion guard's 15000
@@ -884,21 +910,21 @@ let gc_collect = fn env -> fn world ->
     // forever. No liveness filter here: every entry is kept (compact is not
     // collection), the point is only that the churn moves into a private
     // arena that the NEXT compact throws away as a whole.
-    let _ = map_compact call_names_s in
-    let _ = map_compact call_files_s in
-    let _ = map_compact call_meths_s in
-    let _ = map_compact cur_pos_s in
-    let _ = map_compact call_lines in
+    let _ = (if nc then () else map_compact call_names_s) in
+    let _ = (if nc then () else map_compact call_files_s) in
+    let _ = (if nc then () else map_compact call_meths_s) in
+    let _ = (if nc then () else map_compact cur_pos_s) in
+    let _ = (if nc then () else map_compact call_lines) in
     // cur_pos: two keys, one write per STATEMENT executed (the SLine marker) --
     // 14.9M writes and 456 MB of orphaned boxes in a rubocop load, the second
     // biggest emitter after `globals`. Safe to compact because its only reader
     // extracts the int (a Val read out of a compacted map must not be held:
     // see thread_flag).
-    let _ = map_compact cur_pos in
-    let _ = map_compact live_frames in
-    let _ = map_compact struct_ctr in
-    let _ = map_compact thread_flag in
-    let _ = map_compact gc_bare in
+    let _ = (if nc then () else map_compact cur_pos) in
+    let _ = (if nc then () else map_compact live_frames) in
+    let _ = (if nc then () else map_compact struct_ctr) in
+    let _ = (if nc then () else map_compact thread_flag) in
+    let _ = (if nc then () else map_compact gc_bare) in
     let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len ivars)) else ()) in
     // the next thresholds, set HERE so any caller at any depth inherits the
     // same amortization: entries = live + max(scan/2, 4000); bytes = the
@@ -915,12 +941,14 @@ let gc_collect = fn env -> fn world ->
   };
 
 // ---- giving back the fibers nobody can reach ---------------------------------
-// While a fiber is suspended nothing collects (its C stack holds values no mark
-// sees), so a fiber that is simply DROPPED -- an Enumerator stepped with #next
-// and let go, a generator abandoned half way -- would keep its thread and stop
-// collection for the rest of the run. This pass finds them. It runs only where
-// the driver collects (a top-level statement boundary: the running stack holds
-// no frame), and marks the way a collection would, except that the fiber
+// While a fiber is suspended a collection roots its stack and does not compact
+// (see gc_collect), so a fiber that is simply DROPPED -- an Enumerator stepped
+// with #next and let go, a generator abandoned half way -- would keep its stack
+// and hold the arenas' bytes for the rest of the run. This pass finds them. It
+// runs where the driver collects, and also in the middle of a statement once
+// many fibers are live (the resume path); the running stack's frames, and what
+// their statements have built so far, are roots either way. It marks the way a
+// collection would, except that the fiber
 // objects are not roots and the stacks of SUSPENDED fibers are not either: a
 // suspended fiber's frames count only once its Fiber object has been reached,
 // which may reach another's, to a fixed point. What is still unreached can
@@ -962,12 +990,17 @@ let fb_reclaim = fn env -> fn world ->
        let mark_env = fn (e) -> map_iter e (fn (k: str) -> fn (v: Val) -> gc_mark_val live v) in
        let mark_queued = fn (u: unit) ->
          let _ = map_iter inq (fn (o: int) -> fn (u2: int) ->
-           fb_stack_envs o (fn (e) ->
+           let _ = fb_stack_envs o (fn (e) ->
              let _ = mark_env e in
              // a reached block's parent link, which the roots left out
              match (if map_has e "__eid" then map_get e "__eid" else VNil) with
              | VInt n -> (if map_has fb_rc_eid n && map_has lv_up n then mark_env (map_get lv_up n) else ())
-             | _ -> ())) in
+             | _ -> ()) in
+           // ...and what its frames' statements have built so far. This pass
+           // runs in the middle of a statement on the RUNNING stack too, and
+           // that is where a `map` still filling its array holds the fibers
+           // it is collecting.
+           fb_stack_wm o (gc_mark_wm live)) in
          let _ = map_iter fb_sv (fn (k: str) -> fn (v: Val) ->
            (let bar = str_index_of k "|" in
             let o = (if bar > 0 then int_of_str (substring k 0 bar) else 0 - 2) in
@@ -990,19 +1023,6 @@ let fb_reclaim = fn env -> fn world ->
                                                 ++ str_of_int (map_len dead) ++ " unreachable and given back") else ()) in
        map_len dead)
   };
-
-// A fiber that is still reachable keeps the collector away, and the pressure
-// that asked for a collection is still there at the next statement: without
-// this the reclaim pass above would run at EVERY statement until the fiber
-// ends. So the thresholds move as though a collection had run, and the next
-// attempt waits until the stores have grown as much again.
-let fb_defer_pressure = fn world ->
-  let (_, _, ocls, ivars) = world in
-  let scan = map_len arr_store + vec_len hash_store + vec_len str_store in
-  let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
-  let _ = map_set gc_state "t" (map_len ivars + map_len ocls + delta) in
-  let _ = map_set gc_state "b" (gc_store_bytes ()) in
-  (if map_has gc_state "req" then map_delete gc_state "req" else ());
 
 import "m_eval_leaf.mere";
 
@@ -4494,6 +4514,8 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let benv = if pooled then blk_env_get cenv else cenv in
   // (the frame's env, by depth, for the fiber reclaim pass -- see fb_env_at)
   let _ = map_set fb_env_at bcd9 benv in
+  // and where the caller's statement had got to (fb_wm)
+  let _ = fb_wm_call (bcd9 - 1) in
   let prev_ok = (if map_has blk_ok "n" then map_get blk_ok "n" else 0) in
   let _ = map_set blk_ok "n" 0 in
   // ONE REGION PER BLOCK INVOCATION, from parameter stripping through the body
@@ -28627,6 +28649,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> t | _ -> 0 - 1) else 0 - 1) in
   let _ = if fidk < 0 then () else fb_frame_mark fidk in
   let _ = map_set fb_env_at cd frame in
+  let _ = fb_wm_call (cd - 1) in
   // a method call is a `return` boundary: a return inside the body returns from
   // this method, even when the call happens inside a Thread.new block.
   // The BOOL, not the Val (see the Thread.new site): thread_flag is compacted
@@ -33874,6 +33897,7 @@ and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (la
         else let (cn, f, lv) = run_until_gc env world blk rest VNil in (cn + 1, f, lv))
      | _ -> (0, 2, lastv))
   | Cons (s, rest) ->
+    let _ = fb_wm_stmt () in
     (match region STMT { exec_stmt env world blk s } with
      | FNext v ->
        (if gc_pressure world then (1, 0, v)
@@ -33898,6 +33922,8 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   match prog with
   | Nil -> FNext VNil
   | Cons (s, rest) ->
+    // where this statement's allocations begin (fb_wm in m_fiber.mere)
+    let _ = fb_wm_stmt () in
     (match rest with
      // The LAST statement of a body used to run bare, on the grounds that its
      // value is the body's result. But "bare" means "into whatever region is

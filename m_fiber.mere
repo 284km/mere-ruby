@@ -343,6 +343,37 @@ let fb_overlay_sv = fn (f: int) -> fn (t: str) -> fn tbl ->
   let _ = go 0 in
   map_delete fb_sn b;
 
+// ---- what a half-evaluated statement holds -----------------------------------
+// A suspended stack's frames are each in the middle of a statement, and what a
+// statement has built but not stored yet is held by a C variable only: the
+// array a `map` is still filling, an argument already evaluated, the left side
+// of an operator. No mark sees those. But every allocation takes its id from a
+// counter that only grows -- objects, arrays, strings, hashes -- so "built by
+// this frame's statement so far" is an interval of ids: from where the
+// statement began to where the frame last called into what is running above
+// it. Those intervals are roots: for every suspended stack, and -- in the pass
+// that runs in the middle of a statement -- for the running one, whose
+// innermost frame's interval runs to now.
+// Keyed by depth * 8 + k: 0-3 the four counters where the statement began,
+// 4-7 where the frame last called in. What this cannot see is a value that was
+// reachable when the statement began and is held only by a C variable since
+// (`[q.pop, Fiber.yield]`); seeing that takes a scan of the stack itself.
+let fb_wm = map_new ();
+let fb_wm_now = fn (k: int) ->
+  if k == 0 then (if map_has oid_next "n" then map_get oid_next "n" else 0)
+  else if k == 1 then (if map_has arr_ctr 0 then map_get arr_ctr 0 else 0)
+  else if k == 2 then vec_len str_store
+  else vec_len hash_store;
+let fb_wm_put = fn (b: int) ->
+  let _ = map_set fb_wm b (if map_has oid_next "n" then map_get oid_next "n" else 0) in
+  let _ = map_set fb_wm (b + 1) (if map_has arr_ctr 0 then map_get arr_ctr 0 else 0) in
+  let _ = map_set fb_wm (b + 2) (vec_len str_store) in
+  map_set fb_wm (b + 3) (vec_len hash_store);
+let fb_cd = fn (u: unit) -> if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0;
+// a statement begins in the innermost frame
+let fb_wm_stmt = fn (u: unit) -> fb_wm_put ((fb_cd () - 1) * 8);
+// the frame at depth d calls into a method or a block, or switches away
+let fb_wm_call = fn (d: int) -> fb_wm_put (d * 8 + 4);
 // ---- starting a fiber -------------------------------------------------------
 // The body is a closure the evaluator registers here, and the coroutine is
 // made by a top-level function that captures nothing but an index. The body
@@ -365,18 +396,42 @@ let fb_rc_pid = map_new ();
 let fb_rc_eid = map_new ();
 // call f on each live env of stack i: the running one reads the live depth,
 // a suspended one the depth it saved when it switched away
-let fb_stack_envs = fn (i: int) -> fn f ->
+// the live depths of stack i, bottom up: the running one reads the live depth,
+// a suspended one the depth it saved when it switched away; the main stack's
+// top level is depth -1
+let fb_stack_lohi = fn (i: int) ->
   let running = i == fb_cur () in
   let lo = (if running then fb_depth_base ()
             else (let k = fb_key i "sc" ++ "=base" in if map_has fb_si k then map_get fb_si k else 0)) in
   let hi = (if running then (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0)
             else (let k = fb_key i "sc" ++ "=cd" in if map_has fb_si k then map_get fb_si k else lo)) in
-  let lo2 = (if lo > 0 then lo - 1 else 0) in
-  let _ = (if i == 0 && map_has fb_env_at (0 - 1) then f (map_get fb_env_at (0 - 1)) else ()) in
+  ((if lo > 0 then lo - 1 else 0), hi);
+let fb_stack_depths = fn (i: int) -> fn f ->
+  let (lo2, hi) = fb_stack_lohi i in
+  let _ = (if i == 0 then f (0 - 1) else ()) in
   let rec go = fn (d: int) ->
-    if d >= hi then ()
-    else (let _ = (if map_has fb_env_at d then f (map_get fb_env_at d) else ()) in go (d + 1)) in
+    if d >= hi then () else (let _ = f d in go (d + 1)) in
   go lo2;
+// call f on each live env of stack i
+let fb_stack_envs = fn (i: int) -> fn f ->
+  fb_stack_depths i (fn (d: int) -> if map_has fb_env_at d then f (map_get fb_env_at d) else ());
+
+// call f kind id on every id the live frames of stack i have built mid-statement
+let fb_stack_wm = fn (i: int) -> fn f ->
+  let running = i == fb_cur () in
+  let (lo2, hi) = fb_stack_lohi i in
+  let top = (if hi - 1 >= lo2 then hi - 1 else 0 - 1) in
+  fb_stack_depths i (fn (d: int) ->
+    let rec kinds = fn (k: int) ->
+      if k >= 4 then ()
+      else (let b = d * 8 + k in
+            let lo = (if map_has fb_wm b then map_get fb_wm b else 0) in
+            let up = (if running && d == top then fb_wm_now k
+                      else if map_has fb_wm (b + 4) then map_get fb_wm (b + 4) else lo) in
+            let rec each = fn (n: int) -> if n >= up then () else (let _ = f k n in each (n + 1)) in
+            let _ = each lo in
+            kinds (k + 1)) in
+    kinds 0);
 
 // abandoning a fiber nobody can reach: it is switched to with a kind that makes
 // it unwind with nothing running on the way (fb_st "abandon" makes rescue and

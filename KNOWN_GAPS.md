@@ -67,7 +67,7 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
-## A Fiber runs on a coroutine, and while one is suspended nothing is collected
+## A Fiber runs on a coroutine, and while one is suspended nothing is compacted
 
 ```ruby
 fib = Fiber.new { a, b = 0, 1; loop { Fiber.yield a; a, b = b, a + b } }
@@ -107,29 +107,49 @@ two threads over channels. Measured against that build, same machine:
   came to 1.7 GB. There is no fixed ceiling on the number (the thread build's
   was 8192); on Linux each takes two mappings of the 65530 a process may have.
 
-**While a fiber is suspended, nothing is collected.** Its C stack holds values
-that no mark can see, and a collection compacts the arenas those values point
-into. A pass finds the suspended fibers nobody can reach any more -- marking
+**While a fiber is suspended, collections run but do not compact.** A
+suspended stack holds pointers into the stores' arenas in C variables, and
+compaction frees an arena; clearing a store and setting its survivors back
+frees nothing, so a collection under a suspended fiber gives back entries --
+ids, table slots, the side tables -- and not bytes. The bytes come back at the
+first collection with no fiber suspended. Measured on a loop of short-lived
+values under a held Enumerator (300,000 iterations): 608 MB and no collection
+at all before, 546 MB and five collections now.
+
+What a suspended stack holds is rooted in two parts. Its frames' locals (each
+frame's env is kept by call depth), and what each frame's statement has built
+so far but not stored -- the array a `map` is filling, an argument already
+evaluated, the left side of an operator. Every allocation takes its id from a
+counter that only grows, so that is an interval of ids per frame: from where
+the statement began to where the frame last called into what is running above
+it. Recording the counters costs about 4% on a statement-heavy loop.
+
+A pass also finds the suspended fibers nobody can reach any more -- marking
 without the fibers' own stacks, which count only once their Fiber object is
 reached -- and abandons them: they unwind with no `rescue` or `ensure` running
 (ruby never runs an unreachable fiber's ensure either). It runs where the
-driver would collect, and also when 1024 fibers are live, because
-`CSV.parse_line` leaves one per call and a loop of them is one statement the
-driver never interrupts. Every stack's frames are seen (each frame's env is
-kept by call depth); what the pass cannot see is a value half-way through an
-expression, and that is measured to lose fibers:
+driver collects, and also when 1024 fibers are live, in the middle of a
+statement: `CSV.parse_line` leaves one per call and a loop of them is one
+statement the driver never interrupts. There the running stack's frames and
+their intervals are roots too, which is what keeps
 
 ```ruby
 fs = 1100.times.map { f = Fiber.new { Fiber.yield 1; 2 }; f.resume; f }
-fs.map(&:resume)   # ruby: fine. mere-ruby: attempt to resume a terminated fiber
+fs.map(&:resume)
 ```
 
-The array `map` is building is held by a C variable only, so the pass at 1024
-live fibers calls those fibers unreachable. Built one statement at a time
-(`fs << f` in the block) the same 20,000 fibers all resume. A fiber that IS
-reachable holds collection off until it ends: `while row = csv.shift` keeps the
-CSV's parser fiber alive for the whole loop, and nothing the loop builds is
-collected until then.
+working: until the intervals, the array `map` was building was held by a C
+variable only, and that pass abandoned all 1100 fibers in it.
+
+**What is still not seen**: a value that was reachable when its statement
+began and is held only by a C variable since -- `q = [mk]; [q.pop,
+Fiber.yield(1)]`, where the popped string was built by an earlier statement and
+nothing reachable holds it after the pop. A collection while that fiber is
+suspended can blank it. Seeing it takes a scan of the suspended stack itself,
+which is also what compaction under a suspended fiber would need.
+
+A fiber that IS reachable keeps its stack's values alive until it ends:
+`while row = csv.shift` keeps the CSV's parser fiber for the whole loop.
 
 **`Enumerator#next` uses a fiber only when it has to.** A builtin iteration of
 a finite Array, Hash, String or Range cannot run a program's code, so it gives
@@ -148,12 +168,6 @@ switch stacks) and the RV targets (one stack) -- compile
 `m_fiber_nothreads.mere` in `m_fiber_coro.mere`'s place
 (`tools/nothreads_tree.sh`): a fiber runs to completion on its first `#resume`
 and `Fiber.yield` is `NotImplementedError`.
-
-**What fixing the collection would take.** Values half-way through an
-expression are the part no mark sees. Numbering allocations and treating
-everything a suspended frame allocated since its statement began as a root
-closes the case above without touching the language; seeing the values
-themselves needs the runtime to scan a suspended coroutine's stack.
 
 ## ENV is read through a subprocess, so it carries the shell's own variables
 
