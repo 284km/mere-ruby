@@ -393,13 +393,24 @@ def __mspec_shell_args(a)
   else a.to_s
   end
 end
-def ruby_exe(code = nil, *rest, **opts)
+def ruby_exe(code = :__not_given, *rest, **opts)
+  # with no code, mspec answers the command line itself, as words
+  return RUBY_EXE.split(" ") if code == :__not_given
   # mspec runs a FILE in a subprocess of the interpreter under test
   # (`ruby_exe(fixture(...))`). Evaluating the path as code failed identically
   # on both sides, and evaluating the file in-process cannot give it what a
   # main script has: its own DATA, TOPLEVEL_BINDING, $0 and ARGF.
   if code.is_a?(String) && !code.include?("\n") && File.file?(code)
     cmd = [RUBY_EXE, opts[:options], code, __mspec_shell_args(opts[:args])].compact.join(" ")
+    return `#{cmd}`
+  end
+  # ...and so does a snippet that asks for interpreter OPTIONS or shell text
+  # (`args: "< file"`, "2>&1"): neither means anything in-process
+  # ...and so does every snippet: a subprocess is what mspec runs, and an
+  # in-process eval shares the runner's state -- its warning settings, its
+  # globals, its at_exit/END list, its $stdout
+  if ENV["MSPEC_RUBY_EXE"]
+    cmd = [RUBY_EXE, opts[:options], "-e", __mspec_shell_args([code.to_s]), __mspec_shell_args(opts[:args])].compact.join(" ")
     return `#{cmd}`
   end
   # ...and an ARRAY of args is the snippet's ARGV for an in-process run (a

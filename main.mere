@@ -1826,7 +1826,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    | _ -> true)
                 else true) then
       (match args with
-       | Cons (VStr cs, _) -> run_backtick (sget cs)
+       | Cons (VStr cs, _) ->
+         // ...and $? is the command's status, as system already set it
+         (let out9 = run_backtick (sget cs) in
+          let _ = map_set globals "?" (make_proc_status world (if map_has bt_rc "v" then map_get bt_rc "v" else 0)) in
+          out9)
        | _ -> mkstr "")
     // Kernel#system: the same command, reporting only whether it succeeded.
     // Ruby answers nil when the command could not be executed at all and false
@@ -3871,6 +3875,55 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
 // through Mere's `fail` -- was written out at the `raise` arm in eval_e and
 // nowhere else, so anything else that wanted to raise a real object (rather
 // than the VExc pair raise_exc makes) had to copy all four lines.
+and stdin_read_name = fn (name: str) ->
+  (str_len name == 4 && (str_eq name "read" || str_eq name "gets" || str_eq name "getc" || str_eq name "eof?"))
+  || (str_len name == 3 && str_eq name "eof") || (str_len name == 7 && str_eq name "getbyte")
+  || (str_len name == 8 && (str_eq name "readline" || str_eq name "readchar" || str_eq name "readbyte"))
+  || (str_len name == 9 && (str_eq name "readlines" || str_eq name "each_line"))
+  || (str_len name == 4 && str_eq name "each") || (str_len name == 11 && str_eq name "readpartial")
+and stdin_all = fn (u: unit) ->
+  let _ = (if map_has stdin_src "done" then ()
+           else
+             let _ = map_set stdin_src "s" (read_stdin ()) in
+             let _ = map_set stdin_src "done" "1" in
+             map_set stdin_src_pos "p" 0) in
+  map_get stdin_src "s"
+and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let s = stdin_all () in
+  let pos = (if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0) in
+  let n = str_len s in
+  let eofe = fn (u: unit) -> raise_exc world "EOFError" "end of file reached" in
+  if str_eq name "read" || str_eq name "readpartial" then
+    (match args with
+     | Cons (VInt k, rest9) ->
+       (if pos >= n then (if str_eq name "readpartial" then eofe () else VNil)
+        else
+          (let e = (if pos + k > n then n else pos + k) in
+           let _ = map_set stdin_src_pos "p" e in
+           let r9 = mkstr_e (substring s pos e) "ASCII-8BIT" in
+           match rest9 with
+           | Cons (VStr bh, _) -> (let _ = sset bh (substring s pos e) in VStr bh)
+           | _ -> r9))
+     | _ ->
+       (let _ = map_set stdin_src_pos "p" n in
+        mkstr (if pos >= n then "" else substring s pos n)))
+  else if str_eq name "gets" || str_eq name "readline" then
+    (match rb_gets () with
+     | VNil -> (if str_eq name "readline" then eofe () else VNil)
+     | v -> v)
+  else if str_eq name "getc" || str_eq name "readchar" then
+    (if pos >= n then (if str_eq name "readchar" then eofe () else VNil)
+     else (let e = pos + utf8_clen s pos in
+           let _ = map_set stdin_src_pos "p" e in mkstr (substring s pos e)))
+  else if str_eq name "getbyte" || str_eq name "readbyte" then
+    (if pos >= n then (if str_eq name "readbyte" then eofe () else VNil)
+     else (let _ = map_set stdin_src_pos "p" (pos + 1) in VInt (ord (char_at s pos))))
+  else if str_eq name "eof?" || str_eq name "eof" then VBool (pos >= n)
+  else
+    // readlines / each_line / each
+    (let lines9 = rb_readlines () in
+     if str_eq name "readlines" then arr_new lines9
+     else (let _ = invoke_val_c env world blk (arr_new lines9) "each" Nil false in recv))
 and strs_to_syms = fn (xs: str list) ->
   match xs with Nil -> Nil | Cons (x, t) -> Cons (VSym x, strs_to_syms t)
 and tl_is = fn (bid: int) -> map_has tl_bid "v" && map_get tl_bid "v" == bid
@@ -14857,7 +14910,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        // ⚠ A descriptor-born IO had no CLOSED state: `r.close` left the object
        //   answering closed? false and reading on happily. The three standard
        //   streams are never closed here, so the mark only exists above 2.
-       if fd > 2 && (str_len name == 5 && str_eq name "close") then
+       // STDIN READS, over the one buffer Kernel#gets already keeps (so the
+       // two never read the same line twice): read / gets / getc / getbyte /
+       // eof? / readline(s) / each_line were all NoMethodError on $stdin,
+       // and a program piping data in could only reach it through gets.
+       if fd == 0 && stdin_read_name name then stdin_io_call env world blk recv name args
+       else if fd > 2 && (str_len name == 5 && str_eq name "close") then
          (let _ = fd_close fd in
           let _ = map_set ivars (str_of_int id ++ "@__io_closed") (VBool true) in
           VNil)
@@ -17513,6 +17571,15 @@ and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
 // cannot make them run twice.
 
 and run_at_exits = fn world ->
+  // a `trap(:EXIT, handler)` runs first, before the at_exit handlers, and once
+  let _ = (let k9 = (if map_has signal_traps "EXIT" then "EXIT" else if map_has signal_traps "SIGEXIT" then "SIGEXIT" else "") in
+           if str_eq k9 "" then ()
+           else (match map_get signal_traps k9 with
+                 | VProc pid9 ->
+                   (let _ = map_delete signal_traps k9 in
+                    let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+                    let _ = try_or (fn (u: unit) -> run_block world nb9 (proc_as_block pid9) (Cons (VInt 0, Nil))) (FNext VNil) in ())
+                 | _ -> ())) in
   let n = map_len at_exits in
   if n == 0 then ()
   else
