@@ -1617,6 +1617,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if str_eq k ">" && (if map_has globals ">" then false else true) then
          (if map_has globals "stdout" then map_get globals "stdout" else eval_e env world blk (EConst "STDOUT"))
        else if str_eq k "<" && (if map_has globals "<" then false else true) then eval_e env world blk (EConst "ARGF")
+       // ...and $FILENAME is the NAME ARGF is reading, not ARGF (it was an
+       // alias of $<, so `puts $FILENAME` printed "ARGF")
+       else if str_eq k "FILENAME" then
+         (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          invoke_val_c env world nb9 (eval_e env world blk (EConst "ARGF")) "filename" Nil false)
        else if str_eq k "*" && (if map_has globals "*" then false else true) then eval_e env world blk (EConst "ARGV")
        else if map_has globals k then map_get globals k else VNil)
     else
@@ -1763,7 +1768,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // restore it afterwards so class names resolve as top-level.
          let saved_lex = cur_lex () in
          let _ = set_lex "" in
-         let _ = try_or (fn (u: unit) -> let _ = do_eval fenv world noblk (Cons (mkstr code, Nil)) in VNil) VNil in
+         // ...under the FILE's name when the harness hands one over
+         // (`ruby_exe(fixture(...))` runs a file, and `__FILE__` is its path)
+         let eargs9 = (match args with
+                       | Cons (_, Cons (VStr fh9, _)) -> Cons (mkstr code, Cons (VNil, Cons (VStr fh9, Cons (VInt 1, Nil))))
+                       | _ -> Cons (mkstr code, Nil)) in
+         let _ = try_or (fn (u: unit) -> let _ = do_eval fenv world noblk eargs9 in VNil) VNil in
          let _ = set_lex saved_lex in
          let out = (match map_get io_cap "buf" with VStr b -> sget b | _ -> "") in
          let _ = if had_on then map_set io_cap "buf" saved_buf else map_delete io_cap "on" in
@@ -2268,6 +2278,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let cd = enc_canon_name (substring name 10 (str_len name)) in
        (match v with
         | VStr h -> (let _ = senc_set h (if str_eq (enc_find_canon cd) "" then cd else enc_find_canon cd) in v)
+        | VSym sy9 -> (let _ = map_set sym_enc sy9 (if str_eq (enc_find_canon cd) "" then cd else enc_find_canon cd) in v)
         | _ -> v))
     else
     // `Kernel.puts` / `::Kernel.format`: the Kernel module functions are
@@ -3860,6 +3871,12 @@ and assign_targets = fn env -> fn world -> fn (targets: str list) -> fn (values:
 // through Mere's `fail` -- was written out at the `raise` arm in eval_e and
 // nowhere else, so anything else that wanted to raise a real object (rather
 // than the VExc pair raise_exc makes) had to copy all four lines.
+and strs_to_syms = fn (xs: str list) ->
+  match xs with Nil -> Nil | Cons (x, t) -> Cons (VSym x, strs_to_syms t)
+and tl_is = fn (bid: int) -> map_has tl_bid "v" && map_get tl_bid "v" == bid
+and tl_declared = fn (n: str) ->
+  (let d9 = (if map_has tl_decl "v" then map_get tl_decl "v" else "") in
+   str_list_has (if str_eq d9 "" then Nil else str_split d9 (chr 10)) n)
 // A Complex part may be any Numeric, and a Numeric OBJECT is a real when its
 // own #real? says so. The builtin reals answer without being asked.
 // an object whose class does not include Kernel (a BasicObject) has none of
@@ -11478,11 +11495,30 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (let n = str_len (if file_exists (sget ph) then read_file (sget ph) else "") in
              if n > 0 then VInt n else VNil)
           | _ -> VNil)
+       // File.readlines(path, sep = $/, chomp: false): the separator and chomp
+       // were ignored, so `File.readlines(f, ".")` answered lines
        else if (str_len name == 9 && str_eq name "readlines") then
-         (match args with
+         (let chomp9 = (match vlast args with
+                        | VHsh h9 -> (match hash_lookup (hderef h9) (VSym "chomp") with (true, cv9) -> truthy cv9 | _ -> false)
+                        | _ -> false) in
+          let sep9 = (match args with Cons (_, Cons (VStr sh9, _)) -> sget sh9 | Cons (_, Cons (VNil, _)) -> "" | _ -> "\n") in
+          let whole9 = (match args with Cons (_, Cons (VNil, _)) -> true | _ -> false) in
+          match args with
           | Cons (VStr ph, _) ->
             (let c = (if file_exists (sget ph) then read_file (sget ph) else "") in
-             arr_new (val_list_of_strs (str_lines_go c 0 0 (str_len c))))
+             let rec pieces9 = fn (i: int) ->
+               (if i >= str_len c then Nil
+                else
+                  (let rest9 = substring c i (str_len c) in
+                   let ix9 = (if whole9 then 0 - 1 else str_index_of rest9 sep9) in
+                   let e9 = (if ix9 < 0 then str_len c else i + ix9 + str_len sep9) in
+                   let piece9 = substring c i e9 in
+                   let piece9 = (if chomp9 && (if whole9 then false else true) && ix9 >= 0
+                                 then substring piece9 0 (str_len piece9 - str_len sep9) else piece9) in
+                   Cons (mkstr piece9, pieces9 e9))) in
+             if str_eq sep9 "\n" && (if chomp9 then false else true)
+             then arr_new (val_list_of_strs (str_lines_go c 0 0 (str_len c)))
+             else arr_new (pieces9 0))
           | _ -> arr_new Nil)
        // ⚠ `foreach` was in this arm's ENTRY condition and nowhere in its body,
        //   so File.foreach and IO.foreach entered here and fell out of the
@@ -14583,12 +14619,52 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 4 && str_eq name "gets") || (str_len name == 8 && str_eq name "readline") then
          (let content = (if file_exists path then read_file path else "") in
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
+          // gets(sep = $/, limit = nil, chomp: false): the SEPARATOR, the
+          // LIMIT and chomp were all ignored, so `f.gets(".")` read a whole
+          // line and `f.gets(nil)` stopped at the first newline
+          let chomp9 = (match args with
+                        | Nil -> false
+                        | _ -> (match vlast args with
+                                | VHsh h9 -> (match hash_lookup (hderef h9) (VSym "chomp") with (true, cv9) -> truthy cv9 | _ -> false)
+                                | _ -> false)) in
+          let pos_args9 = (match args with
+                           | Nil -> Nil
+                           | _ -> (match vlast args with VHsh _ -> vinit args | _ -> args)) in
+          let (sep9, limit9) = (match pos_args9 with
+                                | Cons (VStr sh9, Cons (VInt l9, _)) -> (VStr sh9, l9)
+                                | Cons (VNil, Cons (VInt l9, _)) -> (VNil, l9)
+                                | Cons (VInt l9, _) -> (mkstr "\n", l9)
+                                | Cons (VStr sh9, _) -> (VStr sh9, 0 - 1)
+                                | Cons (VNil, _) -> (VNil, 0 - 1)
+                                | _ -> (mkstr "\n", 0 - 1)) in
           if pos >= str_len content then
             (if (str_len name == 8 && str_eq name "readline") then raise_exc world "EOFError" "end of file reached" else VNil)
           else
-            let e = line_end_from content pos in
+            let e0 = (match sep9 with
+                      | VStr sh9 ->
+                        (let sp9 = sget sh9 in
+                         if str_eq sp9 "\n" then line_end_from content pos
+                         else if str_eq sp9 "" then line_end_from content pos
+                         else (let rest9 = substring content pos (str_len content) in
+                               let ix9 = str_index_of rest9 sp9 in
+                               if ix9 < 0 then str_len content else pos + ix9 + str_len sp9))
+                      | _ -> str_len content) in
+            let e = (if limit9 >= 0 && e0 - pos > limit9 then pos + limit9 else e0) in
             let _ = map_set ivars (k ++ "@__f_pos") (VInt e) in
-            mkstr (substring content pos e))
+            let line9 = substring content pos e in
+            let line9 = (if chomp9 then
+                           (match sep9 with
+                            | VStr sh9 ->
+                              (let sp9 = sget sh9 in
+                               let lsp9 = str_len sp9 in
+                               if str_eq sp9 "\n" && str_len line9 >= 2 && str_eq (substring line9 (str_len line9 - 2) (str_len line9)) "\r\n"
+                               then substring line9 0 (str_len line9 - 2)
+                               else if lsp9 > 0 && str_len line9 >= lsp9 && str_eq (substring line9 (str_len line9 - lsp9) (str_len line9)) sp9
+                               then substring line9 0 (str_len line9 - lsp9)
+                               else line9)
+                            | _ -> line9)
+                         else line9) in
+            mkstr line9)
        // ⚠ ...and `each`, which IS each_line on an IO. It is the name a
        //   for-loop and every Enumerable method reaches for, and it was not
        //   here at all.
@@ -14912,6 +14988,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          mkstr (if fd == 0 then "<STDIN>" else if fd == 2 then "<STDERR>" else "<STDOUT>")
        else if (str_len name == 5 && str_eq name "close") then VNil
        else if (str_len name == 7 && str_eq name "closed?") then VBool false
+       // the universal names (nil?, equal?, itself ...), which this chain refused
+       else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of IO"))
     // ENV: reads consult the write overlay first, then the environment table
     // (so a set-but-empty variable reads as "" like Ruby).
@@ -16904,6 +16982,22 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     //   bookkeeping (__cref, __definee_recv, ...) live in the same map and are
     //   not locals -- and NOT a numbered parameter: since ruby 4.0 `_1` is not
     //   a binding local, which is what the spec here asserts.
+    // TOPLEVEL_BINDING answers the main script's DECLARED locals (known at
+    // parse time, so a later assignment already counts) and the ones set
+    // through the binding itself -- not an eval's, not a required file's
+    else if (str_len name == 15 && str_eq name "local_variables") && tl_is bid then
+      (let decl9 = (if map_has tl_decl "v" then map_get tl_decl "v" else "") in
+       let ds9 = (if str_eq decl9 "" then Nil else str_split decl9 (chr 10)) in
+       let seen9 = map_new () in
+       let _ = list_iter ds9 (fn (d9: str) -> map_set seen9 d9 1) in
+       let tmp9 = map_new () in
+       let _ = map_iter tl_dyn (fn (k9: str) -> fn (v9: int) ->
+                 if map_has seen9 k9 then () else map_set tmp9 (str_of_int v9) k9) in
+       let rec dyn_in9 = fn (i: int) ->
+         (if i >= map_len tl_dyn + 1 then Nil
+          else if map_has tmp9 (str_of_int i) then Cons (map_get tmp9 (str_of_int i), dyn_in9 (i + 1))
+          else dyn_in9 (i + 1)) in
+       arr_new (strs_to_syms (list_append_str ds9 (dyn_in9 0))))
     else if (str_len name == 15 && str_eq name "local_variables") then
       (let out9 = arr_new Nil in
        let _ = (match out9 with
@@ -16932,6 +17026,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // nil made `binding.local_variable_get(:it)` look like a local holding
           // nothing -- and the same for every misspelt name.
           else if map_has benv n then map_get benv n
+          // a declared toplevel local not assigned yet holds nil
+          else if tl_is bid && tl_declared n then VNil
           else raise_exc world "NameError"
                  ("local variable '" ++ n ++ "' is not defined for " ++ inspect recv))
        | _ -> VNil)
@@ -16940,14 +17036,16 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        | Cons (VSym n, Cons (v, _)) ->
          (if numbered_digit n > 0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
-          else (let _ = map_set benv n v in v))
+          else (let _ = map_set benv n v in
+                let _ = (if tl_is bid && (if map_has tl_dyn n then false else true)
+                         then map_set tl_dyn n (map_len tl_dyn) else ()) in v))
        | _ -> VNil)
     else if (str_len name == 23 && str_eq name "local_variable_defined?") then
       (match args with
        | Cons (VSym n, _) ->
          (if numbered_digit n > 0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
-          else VBool (map_has benv n))
+          else VBool (map_has benv n || (tl_is bid && tl_declared n)))
        | _ -> VBool false)
     else if (str_len name == 8 && str_eq name "receiver") || (str_len name == 4 && str_eq name "self") then
       (if map_has benv "self" then map_get benv "self" else VMain)
@@ -32880,7 +32978,8 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
        // that feature, so it wins over a file of the same name on the load
        // path -- CRuby's monitor.rb would only `require "monitor.so"` here.
-       let src = (if str_eq shipped "" then read_file full else shipped) in
+       // (a required file's __END__ ends it too, but DATA is the main script's)
+       let src = (if str_eq shipped "" then (match src_prepare (read_file full) with (b9, _) -> b9) else shipped) in
        // the file's magic comment sets the script encoding for parse (a
        // parse-time __ENCODING__ capture) and while it runs; a file with no
        // magic comment is UTF-8 (per file, not inherited), as in Ruby.
@@ -34111,7 +34210,14 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
              | Cons (b9, _) -> (let _ = raise_exc world "TypeError" ("wrong argument type " ++ class_name b9 ++ " (expected binding)") in ())
              | Nil -> ()) in
     let codelbl = senc_get code in
-    let code = sget code in
+    // the source ends at its first NUL byte (ruby reads nothing past one, so a
+    // UTF-16 file without a BOM parses as empty), and a leading UTF-8 BOM is
+    // not part of it
+    let code = (let c0 = sget code in
+                let n0 = str_index_of c0 (chr 0) in
+                let c1 = (if n0 >= 0 then substring c0 0 n0 else c0) in
+                if str_len c1 >= 3 && str_eq (substring c1 0 3) (chr 239 ++ chr 187 ++ chr 191)
+                then substring c1 3 (str_len c1) else c1) in
     let eenv = (match rest with Cons (VBind bid, _) -> map_get bind_store (str_of_int bid) | _ -> env) in
     let sentinel = Cons (SDeclare (Cons ("__syntax_error__", Nil)), Nil) in
     // the eval'd string's encoding (its magic comment, else its own label)

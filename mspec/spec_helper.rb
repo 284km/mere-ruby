@@ -372,12 +372,12 @@ class MSpecStdoutCapture
   end
 end
 
-def __ruby_exe(code)
+def __ruby_exe(code, file = nil)
   old = $stdout
   cap = MSpecStdoutCapture.new
   $stdout = cap
   begin
-    eval(code.to_s)
+    file ? eval(code.to_s, TOPLEVEL_BINDING, file, 1) : eval(code.to_s)
   rescue Exception
   ensure
     $stdout = old
@@ -385,8 +385,36 @@ def __ruby_exe(code)
   cap.string
 end
 
+# a shell word for each arg (an Array), or shell text as given (a String)
+def __mspec_shell_args(a)
+  case a
+  when nil then nil
+  when Array then a.map { |x| "'" + x.to_s.gsub("'", "'\\\\''") + "'" }.join(" ")
+  else a.to_s
+  end
+end
 def ruby_exe(code = nil, *rest, **opts)
-  __ruby_exe(code.to_s)
+  # mspec runs a FILE in a subprocess of the interpreter under test
+  # (`ruby_exe(fixture(...))`). Evaluating the path as code failed identically
+  # on both sides, and evaluating the file in-process cannot give it what a
+  # main script has: its own DATA, TOPLEVEL_BINDING, $0 and ARGF.
+  if code.is_a?(String) && !code.include?("\n") && File.file?(code)
+    cmd = [RUBY_EXE, opts[:options], code, __mspec_shell_args(opts[:args])].compact.join(" ")
+    return `#{cmd}`
+  end
+  # ...and an ARRAY of args is the snippet's ARGV for an in-process run (a
+  # String of args is shell text such as "2>&1", which has no in-process
+  # meaning)
+  saved_argv = nil
+  if opts[:args].is_a?(Array)
+    saved_argv = ARGV.dup
+    ARGV.replace(opts[:args].map(&:to_s))
+  end
+  begin
+    __ruby_exe(code.to_s)
+  ensure
+    ARGV.replace(saved_argv) if saved_argv
+  end
 end
 
 # mspec's RUBY_EXE / ruby_cmd: the command line that runs the interpreter under
@@ -860,6 +888,28 @@ class NumericMockObject < Numeric
   def singleton_method_added(val); end
 end
 def mock_numeric(name, options = {}); NumericMockObject.new(name, options); end
+# mspec's argf helper (mspec/helpers/argf.rb): @argf is a FRESH ARGF over the
+# given files, because ARGF itself is global. Without it every example written
+# around it died on the helper's name on both sides.
+def argf(argv)
+  if argv.empty? or argv.length > 2
+    raise "Only 1 or 2 filenames are allowed for the argf helper so files can be properly closed: #{argv.inspect}"
+  end
+  @argf ||= nil
+  raise "Cannot nest calls to the argf helper" if @argf
+  @argf = ARGF.class.new(*argv)
+  @__mspec_saved_argf_file__ = @argf.file
+  begin
+    yield
+  ensure
+    file1 = @__mspec_saved_argf_file__
+    file2 = @argf.file
+    file1.close if !file1.closed? and file1 != STDIN
+    file2.close if !file2.closed? and file2 != STDIN
+    @argf = nil
+    @__mspec_saved_argf_file__ = nil
+  end
+end
 def flunk(msg = nil)
   $mspec_fail += 1
   puts "FAILED: #{$mspec_it}: flunked"
