@@ -11243,6 +11243,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else if map_has cur_thr "v" then map_get cur_thr "v" else VNil)
        else if (str_len name == 4 && str_eq name "main") then
          (if map_has all_thr "0" then map_get all_thr "0" else VNil)
+       // (with a block it is invoke_with_block's)
+       else if (str_len name == 20 && str_eq name "each_caller_location") then
+         raise_exc world "LocalJumpError" "no block given"
        // pass is a scheduling no-op: the calling thread just continues. A
        // body that spins on it forever parks via the iteration budget.
        else if (str_len name == 4 && str_eq name "pass") then VNil
@@ -16821,6 +16824,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              else recv)
           else if (str_len name == 6 && str_eq name "status") then tst
           else if (str_len name == 6 && str_eq name "alive?") then VBool alive
+          // Thread#backtrace / #backtrace_locations: nil for a dead thread;
+          // for the current one, caller(0)'s frames under a frame for the
+          // call itself ('Thread#backtrace'), selected as caller selects;
+          // for another (parked) thread, [] -- its stack is not kept
+          else if (str_len name == 9 && str_eq name "backtrace") || (str_len name == 19 && str_eq name "backtrace_locations") then
+            (if (if alive then false else true) then VNil
+             else if (if thr_is_current recv then false else true) then arr_new Nil
+             else
+               (let lbl9 = "Thread#" ++ name in
+                let all9 = (if (str_len name == 19) then Cons (loc_obj world (cur_file ()) (cur_line ()) lbl9, caller_locs world 0 (0 - 1))
+                            else Cons (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in '" ++ lbl9 ++ "'"), caller_frames 0)) in
+                let ca9 = caller_args env world args in
+                let _ = (match ca9 with
+                         | Cons (VInt a9, _) -> (if a9 < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int a9 ++ ")") else VNil)
+                         | _ -> VNil) in
+                let _ = (match ca9 with
+                         | Cons (_, Cons (VInt b9, _)) -> (if b9 < 0 then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int b9 ++ ")") else VNil)
+                         | _ -> VNil) in
+                match ca9 with
+                | Nil -> arr_new all9
+                | Cons (a9, Cons (b9, _)) -> caller_pick2 all9 a9 b9
+                | Cons (a9, _) -> caller_pick all9 a9))
           else if (str_len name == 5 && str_eq name "stop?") then
             VBool (if alive then (match tst with VStr h -> str_eq (sget h) "sleep" | _ -> false) else true)
           else if (str_len name == 4 && str_eq name "kill") || (str_len name == 4 && str_eq name "exit") || (str_len name == 9 && str_eq name "terminate") then
@@ -18634,6 +18659,34 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if (str_eq c "Fiber" || (obj_is_a world c "Fiber" && (if has_meth world ("(sng:" ++ c ++ ")") "new" then false else true)))
                && (str_len name == 3 && str_eq name "new") then
          fb_new world c newblk args
+       // Thread.each_caller_location(start = 1, length = nil) { |loc| }: the
+       // locations caller_locations would answer, one at a time; nil, or
+       // what a `break` carries. It takes no keywords.
+       else if str_eq c "Thread" && (str_len name == 20 && str_eq name "each_caller_location") then
+         (let _ = (match rev_app args Nil with
+                   | Cons (VHsh hk9, _) ->
+                     (match hderef hk9 with
+                      | Cons (k9, _) -> raise_exc world "ArgumentError" ("unknown keyword: " ++ inspect k9)
+                      | Nil -> VNil)
+                   | _ -> VNil) in
+          let ca9 = caller_args env world args in
+          let _ = (match ca9 with
+                   | Cons (VInt a9, _) -> (if a9 < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int a9 ++ ")") else VNil)
+                   | _ -> VNil) in
+          let _ = (match ca9 with
+                   | Cons (_, Cons (VInt b9, _)) -> (if b9 < 0 then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int b9 ++ ")") else VNil)
+                   | _ -> VNil) in
+          let sel9 = (match ca9 with
+                      | Nil -> arr_new (caller_locs world 1 (0 - 1))
+                      | Cons (a9, Cons (b9, _)) -> caller_pick2 (caller_locs world 0 (0 - 1)) a9 b9
+                      | Cons (a9, _) -> caller_pick (caller_locs world 0 (0 - 1)) a9) in
+          match sel9 with
+          | VArr sid9 ->
+            // Array#each answers the array itself unless a break left it
+            (match invoke_with_block env world blk sel9 "each" Nil newblk with
+             | VArr rid9 -> (if rid9 == sid9 then VNil else VArr rid9)
+             | other9 -> other9)
+          | _ -> VNil)
        // Thread.new/start/fork { }: the synchronous thread model, whose
        // rules are written at thread_start.
        // ⚠ ...and a SUBCLASS's: `Sub.start { }` / `Sub.fork { }` make a Sub
@@ -26900,7 +26953,16 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // honest answer is an empty backtrace rather than a NoMethodError. Callers
   // that log it print nothing; callers that index it get nil.
   else if (str_len name == 6 && str_eq name "caller") && (if map_has meths name then false else true) then
-    (match caller_args env world args with
+    (let ca9 = caller_args env world args in
+     // a negative level or length is a refusal, as caller_locations' is
+     // (written out here, not shared: see caller_args on helpers there)
+     let _ = (match ca9 with
+              | Cons (VInt a9, _) -> (if a9 < 0 then raise_exc world "ArgumentError" ("negative level (" ++ str_of_int a9 ++ ")") else VNil)
+              | _ -> VNil) in
+     let _ = (match ca9 with
+              | Cons (_, Cons (VInt b9, _)) -> (if b9 < 0 then raise_exc world "ArgumentError" ("negative size (" ++ str_of_int b9 ++ ")") else VNil)
+              | _ -> VNil) in
+     match ca9 with
      | Nil -> arr_new (caller_frames 1)
      | Cons (a9, Cons (b9, _)) -> caller_pick2 (caller_frames 0) a9 b9
      | Cons (a9, _) -> caller_pick (caller_frames 0) a9)
