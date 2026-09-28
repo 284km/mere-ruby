@@ -89,6 +89,11 @@ of call depths of its own.
 
 - **A switch is about 4.6 µs** (a round trip through a pthread condition
   variable measures 4.0-4.4 µs on the same machine; CRuby's is about 0.1 µs).
+  An `Enumerator#next` on a generator is 28 µs, most of it the interpreter's
+  own calls (loop, `y <<`, the block, `Fiber.yield`). Measured on
+  `bench/csv.sh` with 2000 rows: parse, headers and generate_line within
+  noise; `parse_line x2000` 4.28 -> 4.98 s (+16%), because each call makes a CSV whose
+  `#each` steps an Enumerator.
 - **A live fiber is an OS thread**: 8192 per process on macOS
   (`kern.num_taskthreads`). Past that, starting one is
   `FiberError: can't alloc machine stack to fiber`.
@@ -99,14 +104,20 @@ of call depths of its own.
 
 **While a fiber is suspended, nothing is collected.** Its C stack holds values
 that no mark can see, and a collection compacts the arenas those values point
-into. Where the driver would collect, a pass first finds the suspended fibers
-nobody can reach any more -- marking without the fibers' own stacks, which
-count only once their Fiber object is reached -- and abandons them: they
-unwind with no `rescue` or `ensure` running (ruby never runs an unreachable
-fiber's ensure either) and give their threads back. A fiber that IS still
-reachable holds collection off until it ends: `while row = csv.shift` keeps
-the CSV's parser fiber alive for the whole loop, and nothing the loop builds is
-collected until then.
+into. A pass finds the suspended fibers nobody can reach any more -- marking
+without the fibers' own stacks, which count only once their Fiber object is
+reached -- and abandons them: they unwind with no `rescue` or `ensure` running
+(ruby never runs an unreachable fiber's ensure either) and their threads go
+back to a pool the next fiber starts on. It runs where the driver would
+collect, and also when 1024 fibers are live, because `CSV.parse_line` leaves
+one per call and a loop of them is one statement the driver never interrupts.
+Every stack's frames are seen (each frame's env is kept by call depth); what
+the pass cannot see is a value half-way through an expression, so a fiber
+reachable ONLY from such a value, and used after it, would be lost -- a shape
+this has not been measured to occur in. A fiber that IS still reachable holds
+collection off until it ends: `while row = csv.shift` keeps the CSV's parser
+fiber alive for the whole loop, and nothing the loop builds is collected until
+then.
 
 **`Enumerator#next` uses a fiber only when it has to.** A builtin iteration of
 a finite Array, Hash, String or Range cannot run a program's code, so it gives

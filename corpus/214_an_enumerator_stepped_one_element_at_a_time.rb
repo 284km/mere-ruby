@@ -38,3 +38,11 @@ while i < 3000
   i += 1
 end
 p gen
+
+# ...and inside ONE statement, where the driver never gets a collection point:
+# a stepped generator dropped per iteration (CSV.parse_line's shape) is given
+# back once enough of them are live, so this does not run out of threads
+kept = Enumerator.new { |y| y << :kept1; y << :kept2 }
+p kept.next
+p 9000.times.count { |k| Enumerator.new { |y| y << k }.next == k }
+p kept.next

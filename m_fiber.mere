@@ -162,17 +162,6 @@ let fb_restore_k = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
            else if map_has tbl k then map_delete tbl k else ()) in
   let _ = (if map_has fb_sv kk then map_delete fb_sv kk else ()) in
   map_delete fb_si (kk ++ "?");
-let fb_save_ki = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
-  let kk = fb_key f t ++ "=" ++ k in
-  if map_has tbl k then (let _ = map_set fb_si kk (map_get tbl k) in map_set fb_si (kk ++ "?") 1)
-  else map_set fb_si (kk ++ "?") 0;
-let fb_restore_ki = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
-  let kk = fb_key f t ++ "=" ++ k in
-  let had = (if map_has fb_si (kk ++ "?") then map_get fb_si (kk ++ "?") else 0) in
-  let _ = (if had == 1 then map_set tbl k (map_get fb_si kk)
-           else if map_has tbl k then map_delete tbl k else ()) in
-  let _ = (if map_has fb_si kk then map_delete fb_si kk else ()) in
-  map_delete fb_si (kk ++ "?");
 
 // the match globals: $! $~ $_ and $1..$9
 let fb_gvar_keys = Cons ("!", Cons ("~", Cons ("_", Cons ("1", Cons ("2", Cons ("3",
@@ -182,75 +171,122 @@ let rec fb_save_gvars = fn (f: int) -> fn (ks: str list) ->
 let rec fb_restore_gvars = fn (f: int) -> fn (ks: str list) ->
   match ks with Nil -> () | Cons (k, r) -> let _ = fb_restore_k f "g" globals k in fb_restore_gvars f r;
 
+// ⚠ Most of these maps are EMPTY at most switches, and the first version wrote
+// a record for every one anyway -- a key string built and a map written per
+// map, four times per round trip: 37 us per Enumerator#next against 4.6 us for
+// the thread hand-off itself. Now each stack's saved state carries a mask of
+// what was actually there (fb_mask), an empty map writes nothing, and on the
+// way back an unsaved map is only emptied if something has put entries in it.
+let fb_mask = map_new ();
+let rec fb_pow2 = fn (b: int) -> if b <= 0 then 1 else 2 * fb_pow2 (b - 1);
+let fb_bit_on = fn (m: int) -> fn (b: int) -> (m / fb_pow2 b) % 2 == 1;
+let fb_msave_sv = fn (f: int) -> fn (b: int) -> fn (t: str) -> fn tbl -> fn (m: int) ->
+  if map_len tbl == 0 then m else (let _ = fb_save_sv f t tbl in m + fb_pow2 b);
+let fb_mrestore_sv = fn (f: int) -> fn (b: int) -> fn (t: str) -> fn tbl -> fn (m: int) ->
+  if fb_bit_on m b then fb_restore_sv f t tbl
+  else if map_len tbl > 0 then map_clear tbl else ();
+let fb_msave_si = fn (f: int) -> fn (b: int) -> fn (t: str) -> fn tbl -> fn (m: int) ->
+  if map_len tbl == 0 then m else (let _ = fb_save_si f t tbl in m + fb_pow2 b);
+let fb_mrestore_si = fn (f: int) -> fn (b: int) -> fn (t: str) -> fn tbl -> fn (m: int) ->
+  if fb_bit_on m b then fb_restore_si f t tbl
+  else if map_len tbl > 0 then map_clear tbl else ();
+let fb_msave_ss = fn (f: int) -> fn (b: int) -> fn (t: str) -> fn tbl -> fn (m: int) ->
+  if map_len tbl == 0 then m else (let _ = fb_save_ss f t tbl in m + fb_pow2 b);
+let fb_mrestore_ss = fn (f: int) -> fn (b: int) -> fn (t: str) -> fn tbl -> fn (m: int) ->
+  if fb_bit_on m b then fb_restore_ss f t tbl
+  else if map_len tbl > 0 then map_clear tbl else ();
+// one key: present -> saved and its bit set; absent -> nothing written
+let fb_msave_k = fn (f: int) -> fn (b: int) -> fn tbl -> fn (k: str) -> fn (m: int) ->
+  if map_has tbl k then (let _ = map_set fb_sv (fb_key f "k" ++ "=" ++ k) (map_get tbl k) in m + fb_pow2 b) else m;
+let fb_mrestore_k = fn (f: int) -> fn (b: int) -> fn tbl -> fn (k: str) -> fn (m: int) ->
+  if fb_bit_on m b
+  then (let kk = fb_key f "k" ++ "=" ++ k in
+        let _ = map_set tbl k (map_get fb_sv kk) in
+        map_delete fb_sv kk)
+  else if map_has tbl k then map_delete tbl k else ();
+let fb_msave_ki = fn (f: int) -> fn (b: int) -> fn tbl -> fn (k: str) -> fn (m: int) ->
+  if map_has tbl k then (let _ = map_set fb_si (fb_key f "sc" ++ "=" ++ k) (map_get tbl k) in m + fb_pow2 b) else m;
+let fb_mrestore_ki = fn (f: int) -> fn (b: int) -> fn tbl -> fn (k: str) -> fn (m: int) ->
+  if fb_bit_on m b
+  then (let kk = fb_key f "sc" ++ "=" ++ k in
+        let _ = map_set tbl k (map_get fb_si kk) in
+        map_delete fb_si kk)
+  else if map_has tbl k then map_delete tbl k else ();
+
+// the whole-map slots (bits 0-20), then single keys (21-40); the order is the
+// bit, so save and restore must list them alike
+let rec fb_msave_gvars = fn (f: int) -> fn (b: int) -> fn (ks: str list) -> fn (m: int) ->
+  match ks with Nil -> m | Cons (k, r) -> fb_msave_gvars f (b + 1) r (fb_msave_k f b globals k m);
+let rec fb_mrestore_gvars = fn (f: int) -> fn (b: int) -> fn (ks: str list) -> fn (m: int) ->
+  match ks with Nil -> () | Cons (k, r) -> let _ = fb_mrestore_k f b globals k m in fb_mrestore_gvars f (b + 1) r m;
 let fb_ctx_save = fn (f: int) ->
-  let _ = fb_save_sv f "tf" thread_flag in
-  let _ = fb_save_sv f "fs" flow_sig in
-  let _ = fb_save_sv f "pm" prim_missing in
-  let _ = fb_save_sv f "bt" raise_bt in
-  let _ = fb_save_sv f "ph" pending_home in
-  let _ = fb_save_sv f "lc" load_ctx in
-  let _ = fb_save_sv f "fz" frz_busy in
-  let _ = fb_save_sv f "fk" fm_kw in
-  let _ = fb_save_sv f "bb" bm_bypass in
-  let _ = fb_save_sv f "cd" catch_depth in
-  let _ = fb_save_sv f "ra" ref_active in
-  let _ = fb_save_sv f "ct" cur_thr in
-  let _ = fb_save_si f "cp" cur_pos in
-  let _ = fb_save_si f "bo" blk_ok in
-  let _ = fb_save_si f "ps" pending_srcproc in
-  let _ = fb_save_si f "cs" conv_soft in
-  let _ = fb_save_si f "gb" gc_bare in
-  let _ = fb_save_ss f "cq" cur_pos_s in
-  let _ = fb_save_ss f "xc" lex_cref in
-  let _ = fb_save_ss f "xn" lex_nest in
-  let _ = fb_save_ss f "fl" fsl_ctx in
-  let _ = fb_save_gvars f fb_gvar_keys in
-  let _ = fb_save_k f "iv" ivars_g "$exc" in
-  let _ = fb_save_k f "tr" trace_fn "busy" in
-  let _ = fb_save_k f "tr" trace_fn "tpbusy" in
-  let _ = fb_save_k f "tr" trace_fn "gvbusy" in
-  let _ = fb_save_ki f "sc" struct_ctr "cd" in
-  let _ = fb_save_ki f "sc" struct_ctr "base" in
-  let _ = (if map_has rx_wide 1 then (let _ = map_set fb_si (fb_key f "rw") (map_get rx_wide 1) in map_set fb_si (fb_key f "rw?") 1)
-           else map_set fb_si (fb_key f "rw?") 0) in
+  let m = fb_msave_sv f 0 "tf" thread_flag 0 in
+  let m = fb_msave_sv f 1 "fs" flow_sig m in
+  let m = fb_msave_sv f 2 "pm" prim_missing m in
+  let m = fb_msave_sv f 3 "bt" raise_bt m in
+  let m = fb_msave_sv f 4 "ph" pending_home m in
+  let m = fb_msave_sv f 5 "lc" load_ctx m in
+  let m = fb_msave_sv f 6 "fz" frz_busy m in
+  let m = fb_msave_sv f 7 "fk" fm_kw m in
+  let m = fb_msave_sv f 8 "bb" bm_bypass m in
+  let m = fb_msave_sv f 9 "cd" catch_depth m in
+  let m = fb_msave_sv f 10 "ra" ref_active m in
+  let m = fb_msave_sv f 11 "ct" cur_thr m in
+  let m = fb_msave_si f 12 "cp" cur_pos m in
+  let m = fb_msave_si f 13 "bo" blk_ok m in
+  let m = fb_msave_si f 14 "ps" pending_srcproc m in
+  let m = fb_msave_si f 15 "cs" conv_soft m in
+  let m = fb_msave_si f 16 "gb" gc_bare m in
+  let m = fb_msave_ss f 17 "cq" cur_pos_s m in
+  let m = fb_msave_ss f 18 "xc" lex_cref m in
+  let m = fb_msave_ss f 19 "xn" lex_nest m in
+  let m = fb_msave_ss f 20 "fl" fsl_ctx m in
+  let m = fb_msave_gvars f 21 fb_gvar_keys m in
+  let m = fb_msave_k f 33 ivars_g "$exc" m in
+  let m = fb_msave_k f 34 trace_fn "busy" m in
+  let m = fb_msave_k f 35 trace_fn "tpbusy" m in
+  let m = fb_msave_k f 36 trace_fn "gvbusy" m in
+  let m = fb_msave_ki f 37 struct_ctr "cd" m in
+  let m = fb_msave_ki f 38 struct_ctr "base" m in
+  let m = (if map_has rx_wide 1 then (let _ = map_set fb_si (fb_key f "rw") (map_get rx_wide 1) in m + fb_pow2 39) else m) in
+  let _ = map_set fb_mask f m in
   // the gc_bare baton must not leak to another stack: a method entered there
   // would skip its unsafe push
-  map_clear gc_bare;
+  (if map_len gc_bare > 0 then map_clear gc_bare else ());
 let fb_ctx_restore = fn (f: int) ->
-  let _ = fb_restore_sv f "tf" thread_flag in
-  let _ = fb_restore_sv f "fs" flow_sig in
-  let _ = fb_restore_sv f "pm" prim_missing in
-  let _ = fb_restore_sv f "bt" raise_bt in
-  let _ = fb_restore_sv f "ph" pending_home in
-  let _ = fb_restore_sv f "lc" load_ctx in
-  let _ = fb_restore_sv f "fz" frz_busy in
-  let _ = fb_restore_sv f "fk" fm_kw in
-  let _ = fb_restore_sv f "bb" bm_bypass in
-  let _ = fb_restore_sv f "cd" catch_depth in
-  let _ = fb_restore_sv f "ra" ref_active in
-  let _ = fb_restore_sv f "ct" cur_thr in
-  let _ = fb_restore_si f "cp" cur_pos in
-  let _ = fb_restore_si f "bo" blk_ok in
-  let _ = fb_restore_si f "ps" pending_srcproc in
-  let _ = fb_restore_si f "cs" conv_soft in
-  let _ = fb_restore_si f "gb" gc_bare in
-  let _ = fb_restore_ss f "cq" cur_pos_s in
-  let _ = fb_restore_ss f "xc" lex_cref in
-  let _ = fb_restore_ss f "xn" lex_nest in
-  let _ = fb_restore_ss f "fl" fsl_ctx in
-  let _ = fb_restore_gvars f fb_gvar_keys in
-  let _ = fb_restore_k f "iv" ivars_g "$exc" in
-  let _ = fb_restore_k f "tr" trace_fn "busy" in
-  let _ = fb_restore_k f "tr" trace_fn "tpbusy" in
-  let _ = fb_restore_k f "tr" trace_fn "gvbusy" in
-  let _ = fb_restore_ki f "sc" struct_ctr "cd" in
-  let _ = fb_restore_ki f "sc" struct_ctr "base" in
+  let m = (if map_has fb_mask f then map_get fb_mask f else 0) in
+  let _ = fb_mrestore_sv f 0 "tf" thread_flag m in
+  let _ = fb_mrestore_sv f 1 "fs" flow_sig m in
+  let _ = fb_mrestore_sv f 2 "pm" prim_missing m in
+  let _ = fb_mrestore_sv f 3 "bt" raise_bt m in
+  let _ = fb_mrestore_sv f 4 "ph" pending_home m in
+  let _ = fb_mrestore_sv f 5 "lc" load_ctx m in
+  let _ = fb_mrestore_sv f 6 "fz" frz_busy m in
+  let _ = fb_mrestore_sv f 7 "fk" fm_kw m in
+  let _ = fb_mrestore_sv f 8 "bb" bm_bypass m in
+  let _ = fb_mrestore_sv f 9 "cd" catch_depth m in
+  let _ = fb_mrestore_sv f 10 "ra" ref_active m in
+  let _ = fb_mrestore_sv f 11 "ct" cur_thr m in
+  let _ = fb_mrestore_si f 12 "cp" cur_pos m in
+  let _ = fb_mrestore_si f 13 "bo" blk_ok m in
+  let _ = fb_mrestore_si f 14 "ps" pending_srcproc m in
+  let _ = fb_mrestore_si f 15 "cs" conv_soft m in
+  let _ = fb_mrestore_si f 16 "gb" gc_bare m in
+  let _ = fb_mrestore_ss f 17 "cq" cur_pos_s m in
+  let _ = fb_mrestore_ss f 18 "xc" lex_cref m in
+  let _ = fb_mrestore_ss f 19 "xn" lex_nest m in
+  let _ = fb_mrestore_ss f 20 "fl" fsl_ctx m in
+  let _ = fb_mrestore_gvars f 21 fb_gvar_keys m in
+  let _ = fb_mrestore_k f 33 ivars_g "$exc" m in
+  let _ = fb_mrestore_k f 34 trace_fn "busy" m in
+  let _ = fb_mrestore_k f 35 trace_fn "tpbusy" m in
+  let _ = fb_mrestore_k f 36 trace_fn "gvbusy" m in
+  let _ = fb_mrestore_ki f 37 struct_ctr "cd" m in
+  let _ = fb_mrestore_ki f 38 struct_ctr "base" m in
   let rk = fb_key f "rw" in
-  let _ = (if (if map_has fb_si (rk ++ "?") then map_get fb_si (rk ++ "?") else 0) == 1
-           then map_set rx_wide 1 (map_get fb_si rk)
+  let _ = (if fb_bit_on m 39 then (let _ = map_set rx_wide 1 (map_get fb_si rk) in map_delete fb_si rk)
            else if map_has rx_wide 1 then map_delete rx_wide 1 else ()) in
-  let _ = (if map_has fb_si rk then map_delete fb_si rk else ()) in
-  map_delete fb_si (rk ++ "?");
+  map_delete fb_mask f;
 
 // A fiber's first run starts from the resumer's state with the per-stack
 // parts emptied: no flow or exception in flight, no catch tags, not "directly
@@ -319,30 +355,33 @@ let fb_overlay_sv = fn (f: int) -> fn (t: str) -> fn tbl ->
 let fb_bodies = map_new ();
 import "m_fiber_threads.mere";
 
-// ---- the envs of every stack, while fibers exist ------------------------------
+// ---- the envs of every stack, by depth ------------------------------------
 // A suspended fiber's locals live in env maps that only its own C stack points
-// at, so no mark can see them -- which is why nothing collects while a fiber
-// is suspended, and why a fiber nobody can reach any more cannot be told from
-// one that is merely waiting. While any fiber is live, every method frame and
-// block env is registered here on entry (key: 2*__eid for a block, 2*__fid+1
-// for a method frame) with the stack it belongs to, and dropped on exit.
-// Before the first fiber exists nothing is registered: the only stack is the
-// running one, and the reclaim pass below runs only at a top-level safepoint,
-// where the running stack holds no frame.
-let fb_envs = map_new ();
+// at, so no mark can see them. Every method frame and block env is written
+// here at its call depth on entry -- one write, no delete: a stack's LIVE
+// frames are exactly the depths from its band's base up to its current depth,
+// and what lies above that is stale and never read. Written always, not only
+// once a fiber exists, because a frame entered before the first fiber is as
+// live as any (the reclaim pass may run in the middle of a method now).
+let fb_env_at = map_new ();
 // the reclaim pass's view of the roots: the body procs and the active blocks
 // of the suspended fibers, left out of the scan until their fiber is reached
 let fb_rc_pid = map_new ();
 let fb_rc_eid = map_new ();
-let fb_env_owner = map_new ();
-let fb_env_in = fn (key: int) -> fn env ->
-  if fb_live () > 0
-  then (let _ = map_set fb_envs key env in map_set fb_env_owner key (fb_cur ()))
-  else ();
-let fb_env_out = fn (key: int) ->
-  if map_len fb_envs > 0 && map_has fb_envs key
-  then (let _ = map_delete fb_envs key in map_delete fb_env_owner key)
-  else ();
+// call f on each live env of stack i: the running one reads the live depth,
+// a suspended one the depth it saved when it switched away
+let fb_stack_envs = fn (i: int) -> fn f ->
+  let running = i == fb_cur () in
+  let lo = (if running then fb_depth_base ()
+            else (let k = fb_key i "sc" ++ "=base" in if map_has fb_si k then map_get fb_si k else 0)) in
+  let hi = (if running then (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0)
+            else (let k = fb_key i "sc" ++ "=cd" in if map_has fb_si k then map_get fb_si k else lo)) in
+  let lo2 = (if lo > 0 then lo - 1 else 0) in
+  let _ = (if i == 0 && map_has fb_env_at (0 - 1) then f (map_get fb_env_at (0 - 1)) else ()) in
+  let rec go = fn (d: int) ->
+    if d >= hi then ()
+    else (let _ = (if map_has fb_env_at d then f (map_get fb_env_at d) else ()) in go (d + 1)) in
+  go lo2;
 
 // abandoning a fiber nobody can reach: it is handed a token that makes it
 // unwind with nothing running on the way (fb_st "abandon" makes rescue and
