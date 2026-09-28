@@ -11227,6 +11227,12 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
        else if (str_len name == 8 && str_eq name "blocking") then raise_exc world "LocalJumpError" "no block given (yield)"
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for class Fiber"))
+    // a SUBCLASS's new / start / fork without a block (with one, they are
+    // invoke_with_block's): Sub#initialize may still supply the body
+    else if (if str_eq c "Thread" then false else true)
+            && ((str_len name == 3 && str_eq name "new") || (str_len name == 5 && str_eq name "start") || (str_len name == 4 && str_eq name "fork"))
+            && obj_is_a world c "Thread" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      thread_new world blk c name args (false, (Nil : str list), (Nil : Stmt list), env)
     else if str_eq c "Thread" && thread_cls_name name then
       (let (mth0, sup0, ocl0, ivars) = world in
        if (str_len name == 7 && str_eq name "current") then
@@ -11259,8 +11265,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                 | _ -> ())
              | _ -> ())) in
           arr_new (idx_to_list out 0 (map_len out)))
+       // Thread.start / fork with no block is Proc.new's refusal; new's is
+       // Thread#initialize's
        else if (str_len name == 3 && str_eq name "new") || (str_len name == 5 && str_eq name "start") || (str_len name == 4 && str_eq name "fork") then
-         raise_exc world "ThreadError" "must be called with a block"
+         thread_new world blk c name args (false, (Nil : str list), (Nil : Stmt list), env)
        // the process-wide flags, remembered; report_on_exception starts true
        else if (str_len name == 18 && str_eq name "abort_on_exception") || (str_len name == 19 && str_eq name "report_on_exception")
                || (str_len name == 15 && str_eq name "ignore_deadlock") then
@@ -16743,12 +16751,14 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             && (if has_meth world cls name then false else true)
             // ⚠ ...but not a name THREAD answers itself: `t.raise` is
             //   Thread#raise, and Kernel's took it (raising in the caller)
-            && (if str_eq cls "Thread" && str_list_has (thread_inst_names ()) name then false else true)
+            && (if thr_obj_here world recv cls && str_list_has (thread_inst_names ()) name then false else true)
             && str_list_has (ancestors_of world cls) "Kernel" then
       try_self_call_x env world recv name args true
     // Thread instance surface (synchronous model): the body already ran to
     // completion, a park, or an exception (see the Thread.new boundary).
-    else if str_eq cls "Thread" then
+    // An instance of a subclass is served here too, for every name the
+    // subclass does not define itself (this is past the method table).
+    else if thr_obj_here world recv cls then
       (match recv with
        | VObj tid ->
          (let k = str_of_int tid in
@@ -18005,6 +18015,10 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        let _ = store_proc (str_of_int id9) newblk in
        let _ = (if (str_len name == 6 && str_eq name "lambda") then map_set lambda_ids (str_of_int id9) VNil else ()) in
        VProc id9)
+    // Thread#initialize again on a thread (`instance_eval { initialize { } }`)
+    else if (str_len name == 10 && str_eq name "initialize") && thr_is_thread world recv
+            && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+      thread_init world blk recv args newblk
     // `allocate` then `send(:initialize, ..) { }` on an Enumerator or a Lazy
     // is the send arm above; spelled as a call, it is a private method
     else if (if str_eq (enum_init_cls world recv name) "" then false else true) then
@@ -18578,96 +18592,14 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        else if (str_eq c "Fiber" || (obj_is_a world c "Fiber" && (if has_meth world ("(sng:" ++ c ++ ")") "new" then false else true)))
                && (str_len name == 3 && str_eq name "new") then
          fb_new world c newblk args
-       // Thread.new/start/fork { }: the synchronous thread model. The body
-       // runs immediately as the "thread"; scheduler points (sleep /
-       // Thread.pass / Thread.stop) park it by raising the internal
-       // __ThreadPark (which runs ensure blocks and is invisible to a bare
-       // rescue), and an exhausted iteration budget parks a spinning body
-       // ("preempted, never rescheduled"). The object records the outcome:
-       // completed (value), parked (status run/sleep), or died (exception,
-       // re-raised by join/value).
-       else if str_eq c "Thread" && ((str_len name == 3 && str_eq name "new") || (str_len name == 5 && str_eq name "start") || (str_len name == 4 && str_eq name "fork")) then
-         (let (m3, s3, ocls3, iv3) = world in
-          let tid = alloc_oid ocls3 in
-          let _ = map_set ocls3 tid "Thread" in
-          let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
-          // where it was made, which #inspect shows
-          let _ = map_set iv3 (str_of_int tid ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
-          let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
-          let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
-          let savedthr = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
-          let _ = map_set cur_thr "v" (VObj tid) in
-          let _ = map_set cur_thr "t" (VObj tid) in
-          // the thread's ROOT FIBER: Fiber.current in the body is a fiber of
-          // its own, a fiber made there belongs to this thread (resuming it
-          // from another is FiberError), and it starts with a copy of the
-          // spawner's fiber storage.
-          let _ = fb_boot () in
-          let fb_saved = fb_cur () in
-          let fb_r = fb_new_index () in
-          let _ = map_set fb_root fb_r 1 in
-          let _ = map_set fb_state fb_r 1 in
-          let _ = map_set fb_thr fb_r tid in
-          let _ = (match fb_storage_copy fb_saved with VNil -> () | h -> map_set fb_storage fb_r h) in
-          let _ = map_set fb_st "cur" fb_r in
-          let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
-          let _ = map_set catch_depth "n" (VInt 0) in
-          // the BOOL, not the Val holding it: thread_flag is compacted at a
-          // safepoint, and a Val read out of it is a pointer into the arena
-          // that compaction frees. The body below runs safepoints, so keeping
-          // the box across it would restore from freed memory -- which reads
-          // back correctly almost always, and is a use-after-free every time.
-          let savedtf = (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false) in
-          let _ = map_set thread_flag "n" (VBool true) in
-          // $~ is per-thread in Ruby: the body starts with a fresh one and
-                 // the Thread body outlives this call: its env chain is captured.
-                 let _ = (let (_, _, _, tcenv) = newblk in mark_captured tcenv) in
-          // the spawner's is restored afterwards.
-          let savedtilde = (if map_has globals "~" then map_get globals "~" else VNil) in
-          let _ = map_set globals "~" VNil in
-          let savedbud = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
-          let _ = map_set step_budget "n" 2000 in
-          let result = try_or (fn (u: unit) -> run_block world blk newblk args) (FRaise VNil) in
-          let remaining = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
-          let newbud = savedbud - (2000 - remaining) in
-          let _ = map_set step_budget "n" (if newbud < 1000 then 1000 else newbud) in
-          let _ = map_set globals "~" savedtilde in
-          let _ = map_set thread_flag "n" (VBool savedtf) in
-          let _ = map_set catch_depth "n" saved in
-          let _ = map_set cur_thr "v" savedcur in
-          let _ = map_set cur_thr "t" savedthr in
-          let _ = map_set fb_st "cur" fb_saved in
-          let _ = map_set fb_state fb_r 3 in
-          let _ =
-            (match result with
-             | FRaise _ ->
-               (let exc = (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) in
-                let _ = (if map_has iv3 "$exc" then map_delete iv3 "$exc" else ()) in
-                let _ = (if map_has prim_missing "n" then map_delete prim_missing "n" else ()) in
-                let _ = (if map_has flow_sig "k" then map_delete flow_sig "k" else ()) in
-                match exc with
-                | VExc (c2, m2) ->
-                  (if str_eq c2 "__ThreadPark" then
-                     (if str_eq m2 "kill" then map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)
-                      else map_set iv3 (str_of_int tid ++ "@__tst") (mkstr m2))
-                   else
-                     let _ = map_set iv3 (str_of_int tid ++ "@__texc") exc in
-                     map_set iv3 (str_of_int tid ++ "@__tst") VNil)
-                | VNil ->
-                  // no recorded ruby exception: budget exhaustion = a spinning
-                  // body that was "preempted" (parked running).
-                  (if remaining <= 0 then map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run")
-                   else
-                     let _ = map_set iv3 (str_of_int tid ++ "@__texc") (VExc ("StandardError", "error")) in
-                     map_set iv3 (str_of_int tid ++ "@__tst") VNil)
-                | other ->
-                  let _ = map_set iv3 (str_of_int tid ++ "@__texc") other in
-                  map_set iv3 (str_of_int tid ++ "@__tst") VNil)
-             | other ->
-               let _ = map_set iv3 (str_of_int tid ++ "@__tval")
-                         (if map_has iv3 (str_of_int tid ++ "@__tkill") then VNil else flow_value other) in
-               map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)) in
-          VObj tid)
+       // Thread.new/start/fork { }: the synchronous thread model, whose
+       // rules are written at thread_start.
+       // ⚠ ...and a SUBCLASS's: `Sub.start { }` / `Sub.fork { }` make a Sub
+       //   without calling initialize, and `Sub.new(..) { }` runs Sub's own
+       //   #initialize, whose `super { }` is what starts the body (thread_new)
+       else if (str_eq c "Thread" || (obj_is_a world c "Thread" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true)))
+               && ((str_len name == 3 && str_eq name "new") || (str_len name == 5 && str_eq name "start") || (str_len name == 4 && str_eq name "fork")) then
+         thread_new world blk c name args newblk
        // Thread.new { } runs the block synchronously but with a FRESH catch
        // stack (a throw can't cross a thread boundary), returning a thread
        // object whose join is a no-op.
@@ -28172,6 +28104,10 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // on the same path as method_missing below and failed the same way.
   else if str_eq meth "respond_to_missing?" then VBool false
   else if is_prim_method meth then prim_method recv meth args
+  // a Thread subclass's `super` from #initialize is Thread#initialize, which
+  // starts the body (with the block super was given)
+  else if str_eq meth "initialize" && thr_is_thread world recv then
+    thread_init world superblk recv args superblk
   // BasicObject#initialize is an ancestor too: it takes no arguments and does
   // nothing, so `super()` from an initialize with no user-defined superclass
   // method has somewhere to land instead of raising.
@@ -30618,6 +30554,126 @@ and fb_index_of = fn world -> fn (v: Val) ->
   | VObj id -> (match fb_iv world id "@__fb_idx" with VInt i -> i | _ -> 0 - 1)
   | _ -> 0 - 1
 and fb_is_fiber = fn world -> fn (v: Val) -> fb_index_of world v >= 0
+// Thread.new / .start / .fork for Thread or a subclass of it. start and fork
+// never call #initialize; new calls a subclass's own, and that one has to
+// reach Thread#initialize (super) or the thread was never set up -- ruby's
+// ThreadError names the method to look at.
+and thread_new = fn world -> fn blk -> fn (c: str) -> fn (name: str) -> fn (args: Val list) -> fn newblk ->
+  let (_, _, ocls3, iv3) = world in
+  let hasblk = (match newblk with (false, _, _, _) -> false | _ -> true) in
+  if (str_len name == 3 && str_eq name "new") && has_meth world c "initialize" then
+    (let tid = alloc_oid ocls3 in
+     let _ = map_set ocls3 tid c in
+     let _ = invoke world newblk (VObj tid) c "initialize" args in
+     if map_has iv3 (str_of_int tid ++ "@__tst") then VObj tid
+     else raise_exc world "ThreadError" ("uninitialized thread - check '" ++ cls_display world c ++ "#initialize'"))
+  else if hasblk then
+    (let tid = alloc_oid ocls3 in
+     let _ = map_set ocls3 tid c in
+     thread_start world blk tid args newblk)
+  else if (str_len name == 3 && str_eq name "new") then raise_exc world "ThreadError" "must be called with a block"
+  else raise_exc world "ArgumentError" "tried to create Proc object without a block"
+// Thread#initialize, reached by a subclass's `super` (or by send): starts the
+// body on this object, once
+and thread_init = fn world -> fn blk -> fn (recv: Val) -> fn (args: Val list) -> fn newblk ->
+  let (_, _, _, iv3) = world in
+  match recv with
+  | VObj tid ->
+    (if map_has iv3 (str_of_int tid ++ "@__tst") then
+       raise_exc world "ThreadError" ("already initialized thread"
+                                      ++ (match (if map_has iv3 (str_of_int tid ++ "@__tloc") then map_get iv3 (str_of_int tid ++ "@__tloc") else VNil) with
+                                          | VStr h -> " - " ++ sget h | _ -> ""))
+     else if (match newblk with (false, _, _, _) -> true | _ -> false) then
+       raise_exc world "ThreadError" "must be called with a block"
+     else thread_start world blk tid args newblk)
+  | _ -> VNil
+// The synchronous thread model: the body runs NOW, on the object `tid`.
+// Scheduler points (sleep / Thread.pass / Thread.stop) park it by raising
+// the internal __ThreadPark (which runs ensure blocks and is invisible to a
+// bare rescue), and an exhausted iteration budget parks a spinning body
+// ("preempted, never rescheduled"). The object records the outcome:
+// completed (value), parked (status run/sleep), or died (exception,
+// re-raised by join/value).
+and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) -> fn newblk ->
+         (let (m3, s3, ocls3, iv3) = world in
+          let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
+          // where it was made, which #inspect shows
+          let _ = map_set iv3 (str_of_int tid ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
+          let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
+          let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+          let savedthr = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
+          let _ = map_set cur_thr "v" (VObj tid) in
+          let _ = map_set cur_thr "t" (VObj tid) in
+          // the thread's ROOT FIBER: Fiber.current in the body is a fiber of
+          // its own, a fiber made there belongs to this thread (resuming it
+          // from another is FiberError), and it starts with a copy of the
+          // spawner's fiber storage.
+          let _ = fb_boot () in
+          let fb_saved = fb_cur () in
+          let fb_r = fb_new_index () in
+          let _ = map_set fb_root fb_r 1 in
+          let _ = map_set fb_state fb_r 1 in
+          let _ = map_set fb_thr fb_r tid in
+          let _ = (match fb_storage_copy fb_saved with VNil -> () | h -> map_set fb_storage fb_r h) in
+          let _ = map_set fb_st "cur" fb_r in
+          let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
+          let _ = map_set catch_depth "n" (VInt 0) in
+          // the BOOL, not the Val holding it: thread_flag is compacted at a
+          // safepoint, and a Val read out of it is a pointer into the arena
+          // that compaction frees. The body below runs safepoints, so keeping
+          // the box across it would restore from freed memory -- which reads
+          // back correctly almost always, and is a use-after-free every time.
+          let savedtf = (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false) in
+          let _ = map_set thread_flag "n" (VBool true) in
+          // $~ is per-thread in Ruby: the body starts with a fresh one and
+                 // the Thread body outlives this call: its env chain is captured.
+                 let _ = (let (_, _, _, tcenv) = newblk in mark_captured tcenv) in
+          // the spawner's is restored afterwards.
+          let savedtilde = (if map_has globals "~" then map_get globals "~" else VNil) in
+          let _ = map_set globals "~" VNil in
+          let savedbud = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
+          let _ = map_set step_budget "n" 2000 in
+          let result = try_or (fn (u: unit) -> run_block world blk newblk args) (FRaise VNil) in
+          let remaining = (if map_has step_budget "n" then map_get step_budget "n" else 0) in
+          let newbud = savedbud - (2000 - remaining) in
+          let _ = map_set step_budget "n" (if newbud < 1000 then 1000 else newbud) in
+          let _ = map_set globals "~" savedtilde in
+          let _ = map_set thread_flag "n" (VBool savedtf) in
+          let _ = map_set catch_depth "n" saved in
+          let _ = map_set cur_thr "v" savedcur in
+          let _ = map_set cur_thr "t" savedthr in
+          let _ = map_set fb_st "cur" fb_saved in
+          let _ = map_set fb_state fb_r 3 in
+          let _ =
+            (match result with
+             | FRaise _ ->
+               (let exc = (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) in
+                let _ = (if map_has iv3 "$exc" then map_delete iv3 "$exc" else ()) in
+                let _ = (if map_has prim_missing "n" then map_delete prim_missing "n" else ()) in
+                let _ = (if map_has flow_sig "k" then map_delete flow_sig "k" else ()) in
+                match exc with
+                | VExc (c2, m2) ->
+                  (if str_eq c2 "__ThreadPark" then
+                     (if str_eq m2 "kill" then map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)
+                      else map_set iv3 (str_of_int tid ++ "@__tst") (mkstr m2))
+                   else
+                     let _ = map_set iv3 (str_of_int tid ++ "@__texc") exc in
+                     map_set iv3 (str_of_int tid ++ "@__tst") VNil)
+                | VNil ->
+                  // no recorded ruby exception: budget exhaustion = a spinning
+                  // body that was "preempted" (parked running).
+                  (if remaining <= 0 then map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run")
+                   else
+                     let _ = map_set iv3 (str_of_int tid ++ "@__texc") (VExc ("StandardError", "error")) in
+                     map_set iv3 (str_of_int tid ++ "@__tst") VNil)
+                | other ->
+                  let _ = map_set iv3 (str_of_int tid ++ "@__texc") other in
+                  map_set iv3 (str_of_int tid ++ "@__tst") VNil)
+             | other ->
+               let _ = map_set iv3 (str_of_int tid ++ "@__tval")
+                         (if map_has iv3 (str_of_int tid ++ "@__tkill") then VNil else flow_value other) in
+               map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)) in
+          VObj tid)
 // The class of an Enumerator / Lazy / Chain OBJECT whose #initialize is the
 // builtin one, or "" -- the receivers enum_init serves
 and enum_init_cls = fn world -> fn (v: Val) -> fn (name: str) ->
@@ -30720,6 +30776,13 @@ and thr_is_thread = fn world -> fn (v: Val) ->
   | VObj id -> (let (_, _, o9, _) = world in
                 map_has o9 id && (let c9 = map_get o9 id in str_eq c9 "Thread" || str_list_has (ancestors_of world c9) "Thread"))
   | _ -> false
+// the dispatcher's cheap form of thr_is_thread: a started thread carries
+// @__tst, whatever its class
+and thr_obj_here = fn world -> fn (v: Val) -> fn (cls: str) ->
+  str_eq cls "Thread"
+  || (match v with
+      | VObj id -> (let (_, _, _, iv9) = world in map_has iv9 (str_of_int id ++ "@__tst"))
+      | _ -> false)
 and thr_is_current = fn (v: Val) ->
   let cur = (if map_has cur_thr "t" then map_get cur_thr "t" else if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
   (match (v, cur) with
