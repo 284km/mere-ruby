@@ -4199,7 +4199,34 @@ and raise_exc_val = fn world -> fn (exc: Val) ->
   let _ = tp_raise world exc in
   (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in
    fail "mere-ruby: (ruby exception raised)")
+// `raise E, msg, backtrace`: the third argument IS the backtrace (an Array of
+// Strings, or one String), and the report prints it verbatim. It was dropped,
+// so the frames came from where the raise was written. The pair
+// representation has nowhere to keep one and is promoted, as it is for a
+// cause. Every raise site builds its exception here, so all of them keep it.
 and make_exc_w = fn world -> fn (args: Val list) ->
+  let exc = make_exc_w1 world args in
+  let (_, _, ocls, ivars) = world in
+  let (pos3, _) = peel_kw_hash args in
+  match pos3 with
+  | Cons (_, Cons (_, Cons (bt3, _))) ->
+    (let bt4 = (match bt3 with VArr _ -> bt3 | VStr _ -> arr_new (Cons (bt3, Nil)) | _ -> VNil) in
+     match bt4 with
+     | VNil -> exc
+     | _ ->
+       (let obj9 = (match exc with
+                    | VExc (c9, m9) ->
+                      (let id9 = alloc_oid ocls in
+                       let _ = map_set ocls id9 c9 in
+                       let _ = map_set ivars (str_of_int id9 ++ "@message") (mkstr m9) in
+                       VObj id9)
+                    | _ -> exc) in
+        let _ = (match obj9 with
+                 | VObj oid9 -> map_set ivars (str_of_int oid9 ++ "@__bt") bt4
+                 | _ -> ()) in
+        obj9))
+  | _ -> exc
+and make_exc_w1 = fn world -> fn (args: Val list) ->
   let (pos9, kw9) = peel_kw_hash args in
   if hash_haskey kw9 (VSym "cause") then
     (let cz9 = hash_get kw9 (VSym "cause") in
@@ -4240,7 +4267,11 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
       let id = alloc_oid ocls in
       let _ = map_set ocls id c in
       let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in  // shared placeholder cenv (see gc_cenv0)
-      let _ = invoke world noblk (VObj id) c "initialize" rest in
+      // `raise Cls, msg, backtrace` is `Cls.exception(msg)` and then the
+      // backtrace: #initialize is given the MESSAGE only (the ERaise arm keeps
+      // the frames). Handing it both was an ArgumentError from a one-argument
+      // #initialize the moment a raise named a backtrace.
+      let _ = invoke world noblk (VObj id) c "initialize" (match rest with Cons (m9, _) -> Cons (m9, Nil) | Nil -> Nil) in
       let _ = if map_has ivars (str_of_int id ++ "@message") then () else map_set ivars (str_of_int id ++ "@message") (mkstr c) in
       // whatever was in flight when this was raised becomes its cause, as ruby does
       let _ = (if map_has globals "!" then (match map_get globals "!" with
@@ -35693,6 +35724,67 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        let _ = assign_x_targets env world blk pts values in
        FNext (arr_new values))
 
+// The exception a raise left behind for whoever catches it: the one it
+// stashed, or -- for a builtin's refusal that never built one -- the class and
+// message the leaf recorded (as an object when it recorded the call). Read by
+// a rescue, and by the top level when nothing rescued it.
+and pending_exc = fn world ->
+    let (meths, sup, ocls, ivars) = world in
+    (if map_has ivars "$exc" then map_get ivars "$exc"
+        else if map_has prim_missing "c" then
+          VExc ((match map_get prim_missing "c" with VStr h -> sget h | _ -> "StandardError"),
+                (match map_get prim_missing "m" with VStr h -> sget h | _ -> ""))
+        // ...as an OBJECT when the leaf recorded the call, so
+        // #name, #args and #receiver answer what failed. The
+        // message is built exactly as the pair form built it.
+        else if map_has prim_missing "n" && map_has prim_missing "rvv" then
+          (let nm9 = (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") in
+           let id9 = alloc_oid ocls in
+           let _ = map_set ocls id9 "NoMethodError" in
+           let _ = map_set ivars (str_of_int id9 ++ "@__name") (VSym nm9) in
+           let _ = map_set ivars (str_of_int id9 ++ "@__recv") (map_get prim_missing "rvv") in
+           let _ = map_set ivars (str_of_int id9 ++ "@__args")
+                     (if map_has prim_missing "av" then map_get prim_missing "av" else arr_new Nil) in
+           let _ = map_set ivars (str_of_int id9 ++ "@message")
+                     (mkstr ("undefined method '" ++ nm9 ++ "'"
+                             ++ (if map_has prim_missing "rvc"
+                                 then (let c9 = (match map_get prim_missing "rvc" with VStr h -> sget h | _ -> "") in
+                                       " for " ++ (if map_has modules c9 then "module " else "class ") ++ cls_display world c9)
+                                 else if map_has prim_missing "rv"
+                                 then (match map_get prim_missing "rv" with VStr h -> sget h | _ -> "")
+                                 else ""))) in
+           VObj id9)
+        else if map_has prim_missing "n" then VExc ("NoMethodError", "undefined method '" ++ (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") ++ "'" ++ (if map_has prim_missing "rv" && map_has prim_missing "rvn"
+                       && str_eq (match map_get prim_missing "rvn" with VStr h -> sget h | _ -> "")
+                                 (match map_get prim_missing "n" with VStr h -> sget h | _ -> "")
+                     then (if map_has prim_missing "rvc"
+                           then (let c9 = (match map_get prim_missing "rvc" with VStr h -> sget h | _ -> "") in
+                                 " for " ++ (if map_has modules c9 then "module " else "class ") ++ cls_display world c9)
+                           else (match map_get prim_missing "rv" with VStr h -> sget h | _ -> "")) else ""))
+        // an interpreter-internal failure that is not a Ruby
+        // exception: `fail` records its message on the way out
+        // (try_or discards it), so a rescue sees what actually
+        // happened instead of a bare "error".
+        else if map_has prim_missing "i" then
+          // MERE_RUBY_LOST_EXC=1 names the place where a Ruby
+          // exception arrived with no class or message of its own.
+          // That happens when something swallowed it and let the
+          // internal failure through instead, and it is otherwise
+          // invisible: the report says StandardError and points at
+          // the top of the program. Two of today's bugs were found
+          // with exactly this print.
+          (let _ = (if str_eq (env_get "MERE_RUBY_LOST_EXC") "" then ()
+                    else print_err ("[lost] internal="
+                                    ++ (match map_get prim_missing "i" with VStr h -> sget h | _ -> "?")
+                                    // where the LAST raise happened: raise_bt is not cleared when a
+                                    // rescue handles one, so it still names the exception that went
+                                    // missing -- which the frames below cannot, they are where the
+                                    // loss was noticed after everything deeper had unwound.
+                                    ++ "\n       last raise=" ++ inspect (if map_has raise_bt "v" then map_get raise_bt "v" else VNil)
+                                    ++ "\n       here=" ++ inspect (arr_new (caller_frames 0)))) in
+           VExc ("StandardError", (match map_get prim_missing "i" with VStr h -> sget h | _ -> "error")))
+        else VExc ("StandardError", "error"))
+
 and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescues -> fn (els: Stmt list) -> fn (ens: Stmt list) ->
     let (meths, sup, ocls, ivars) = world in
     // $! before this construct; restored when it completes without unwinding.
@@ -35714,60 +35806,7 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
       (match result with
        | FRaise _ ->
          if str_eq flowk "" then
-           let exc = (if map_has ivars "$exc" then map_get ivars "$exc"
-                      else if map_has prim_missing "c" then
-                        VExc ((match map_get prim_missing "c" with VStr h -> sget h | _ -> "StandardError"),
-                              (match map_get prim_missing "m" with VStr h -> sget h | _ -> ""))
-                      // ...as an OBJECT when the leaf recorded the call, so
-                      // #name, #args and #receiver answer what failed. The
-                      // message is built exactly as the pair form built it.
-                      else if map_has prim_missing "n" && map_has prim_missing "rvv" then
-                        (let nm9 = (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") in
-                         let id9 = alloc_oid ocls in
-                         let _ = map_set ocls id9 "NoMethodError" in
-                         let _ = map_set ivars (str_of_int id9 ++ "@__name") (VSym nm9) in
-                         let _ = map_set ivars (str_of_int id9 ++ "@__recv") (map_get prim_missing "rvv") in
-                         let _ = map_set ivars (str_of_int id9 ++ "@__args")
-                                   (if map_has prim_missing "av" then map_get prim_missing "av" else arr_new Nil) in
-                         let _ = map_set ivars (str_of_int id9 ++ "@message")
-                                   (mkstr ("undefined method '" ++ nm9 ++ "'"
-                                           ++ (if map_has prim_missing "rvc"
-                                               then (let c9 = (match map_get prim_missing "rvc" with VStr h -> sget h | _ -> "") in
-                                                     " for " ++ (if map_has modules c9 then "module " else "class ") ++ cls_display world c9)
-                                               else if map_has prim_missing "rv"
-                                               then (match map_get prim_missing "rv" with VStr h -> sget h | _ -> "")
-                                               else ""))) in
-                         VObj id9)
-                      else if map_has prim_missing "n" then VExc ("NoMethodError", "undefined method '" ++ (match map_get prim_missing "n" with VStr h -> sget h | _ -> "") ++ "'" ++ (if map_has prim_missing "rv" && map_has prim_missing "rvn"
-                                     && str_eq (match map_get prim_missing "rvn" with VStr h -> sget h | _ -> "")
-                                               (match map_get prim_missing "n" with VStr h -> sget h | _ -> "")
-                                   then (if map_has prim_missing "rvc"
-                                         then (let c9 = (match map_get prim_missing "rvc" with VStr h -> sget h | _ -> "") in
-                                               " for " ++ (if map_has modules c9 then "module " else "class ") ++ cls_display world c9)
-                                         else (match map_get prim_missing "rv" with VStr h -> sget h | _ -> "")) else ""))
-                      // an interpreter-internal failure that is not a Ruby
-                      // exception: `fail` records its message on the way out
-                      // (try_or discards it), so a rescue sees what actually
-                      // happened instead of a bare "error".
-                      else if map_has prim_missing "i" then
-                        // MERE_RUBY_LOST_EXC=1 names the place where a Ruby
-                        // exception arrived with no class or message of its own.
-                        // That happens when something swallowed it and let the
-                        // internal failure through instead, and it is otherwise
-                        // invisible: the report says StandardError and points at
-                        // the top of the program. Two of today's bugs were found
-                        // with exactly this print.
-                        (let _ = (if str_eq (env_get "MERE_RUBY_LOST_EXC") "" then ()
-                                  else print_err ("[lost] internal="
-                                                  ++ (match map_get prim_missing "i" with VStr h -> sget h | _ -> "?")
-                                                  // where the LAST raise happened: raise_bt is not cleared when a
-                                                  // rescue handles one, so it still names the exception that went
-                                                  // missing -- which the frames below cannot, they are where the
-                                                  // loss was noticed after everything deeper had unwound.
-                                                  ++ "\n       last raise=" ++ inspect (if map_has raise_bt "v" then map_get raise_bt "v" else VNil)
-                                                  ++ "\n       here=" ++ inspect (arr_new (caller_frames 0)))) in
-                         VExc ("StandardError", (match map_get prim_missing "i" with VStr h -> sget h | _ -> "error")))
-                      else VExc ("StandardError", "error")) in
+           let exc = pending_exc world in
            let _ = map_delete ivars "$exc" in
            let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
            let _ = if map_has prim_missing "rv" then map_delete prim_missing "rv" else () in
