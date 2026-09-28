@@ -67,7 +67,7 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
-## A Fiber runs on a thread of its own, and while one is suspended nothing is collected
+## A Fiber runs on a coroutine, and while one is suspended nothing is collected
 
 ```ruby
 fib = Fiber.new { a, b = 0, 1; loop { Fiber.yield a; a, b = b, a + b } }
@@ -77,47 +77,59 @@ e.next                            # works: the source is stepped, not drained
 ```
 
 The evaluator recurses on the C stack, so suspending a fiber means leaving its
-C stack where it is. Mere has no way to do that on one thread, so each fiber's
-body runs on an OS thread of its own (`spawn`), and control is handed between
-threads over channels so that exactly one runs interpreter code at any moment
-(`m_fiber.mere`, `m_fiber_threads.mere`). Everything the interpreter keeps
-per stack in global maps -- the depth, the flow or exception in flight, the
-catch tags, `$~` -- is saved at a switch and put back, and each fiber has a band
-of call depths of its own.
+C stack where it is. Each fiber's body runs on a coroutine -- a second stack on
+the same thread (mere's `coro_new` / `coro_switch`, v0.1.543) -- and a switch
+hands the thread to it (`m_fiber.mere`, `m_fiber_coro.mere`). Everything the
+interpreter keeps per stack in global maps -- the depth, the flow or exception
+in flight, the catch tags, `$~` -- is saved at a switch and put back, and each
+fiber has a band of call depths of its own.
+
+(Until 2026-09-28 a fiber was an OS thread and a switch a round trip between
+two threads over channels. Measured against that build, same machine:
+100,000 resume/yield pairs 2.47 -> 1.61 s, 5,000 fibers made and finished 0.19
+-> 0.11 s, 6,000 `Enumerator#next` on 3,000 enumerators 0.72 -> 0.60 s.)
 
 **What it costs.**
 
-- **A switch is about 4.6 µs** (a round trip through a pthread condition
-  variable measures 4.0-4.4 µs on the same machine; CRuby's is about 0.1 µs).
-  An `Enumerator#next` on a generator is 28 µs, most of it the interpreter's
-  own calls (loop, `y <<`, the block, `Fiber.yield`). Measured on
-  `bench/csv.sh` with 2000 rows: parse, headers and generate_line within
-  noise; `parse_line x2000` 4.28 -> 4.98 s (+16%), because each call makes a CSV whose
-  `#each` steps an Enumerator.
-- **A live fiber is an OS thread**: 8192 per process on macOS
-  (`kern.num_taskthreads`). Past that, starting one is
-  `FiberError: can't alloc machine stack to fiber`.
-- **Its stack is the interpreter's 512 MB** (address space, not memory:
-  `mere.toml` asks for it and the compiler gives it to every spawned thread,
-  mere v0.1.540), so a fiber recurses as deep as the main thread -- deeper than
-  ruby's fibers, whose smaller VM stack stops at about 1250 levels.
+- **A resume and its yield are about 16 µs** (15.7 measured with the loop
+  around them; CRuby's pair is 0.16 µs), and the two coroutine switches in
+  that are 45 ns each. The rest is the interpreter's own: saving and
+  restoring the per-stack maps (a profile shows the string keys they are filed
+  under), and the resume path.
+- `bench/csv.sh` with 2000 rows: `parse_line x2000` did NOT get faster with the
+  coroutines (4.88 -> 4.97 s, noise), so its +16% over the build before fibers
+  was never the hand-off between threads.
+- **Its stack is the interpreter's 512 MB**, reserved rather than committed,
+  below a 64 KiB guard (`mere.toml` asks for it and every coroutine gets it),
+  so a fiber recurses as deep as the main thread -- deeper than ruby's fibers,
+  whose smaller VM stack stops at about 1250 levels. What a live fiber holds
+  is the pages it has touched: 20,000 suspended ones, each one method deep,
+  came to 1.7 GB. There is no fixed ceiling on the number (the thread build's
+  was 8192); on Linux each takes two mappings of the 65530 a process may have.
 
 **While a fiber is suspended, nothing is collected.** Its C stack holds values
 that no mark can see, and a collection compacts the arenas those values point
 into. A pass finds the suspended fibers nobody can reach any more -- marking
 without the fibers' own stacks, which count only once their Fiber object is
 reached -- and abandons them: they unwind with no `rescue` or `ensure` running
-(ruby never runs an unreachable fiber's ensure either) and their threads go
-back to a pool the next fiber starts on. It runs where the driver would
-collect, and also when 1024 fibers are live, because `CSV.parse_line` leaves
-one per call and a loop of them is one statement the driver never interrupts.
-Every stack's frames are seen (each frame's env is kept by call depth); what
-the pass cannot see is a value half-way through an expression, so a fiber
-reachable ONLY from such a value, and used after it, would be lost -- a shape
-this has not been measured to occur in. A fiber that IS still reachable holds
-collection off until it ends: `while row = csv.shift` keeps the CSV's parser
-fiber alive for the whole loop, and nothing the loop builds is collected until
-then.
+(ruby never runs an unreachable fiber's ensure either). It runs where the
+driver would collect, and also when 1024 fibers are live, because
+`CSV.parse_line` leaves one per call and a loop of them is one statement the
+driver never interrupts. Every stack's frames are seen (each frame's env is
+kept by call depth); what the pass cannot see is a value half-way through an
+expression, and that is measured to lose fibers:
+
+```ruby
+fs = 1100.times.map { f = Fiber.new { Fiber.yield 1; 2 }; f.resume; f }
+fs.map(&:resume)   # ruby: fine. mere-ruby: attempt to resume a terminated fiber
+```
+
+The array `map` is building is held by a C variable only, so the pass at 1024
+live fibers calls those fibers unreachable. Built one statement at a time
+(`fs << f` in the block) the same 20,000 fibers all resume. A fiber that IS
+reachable holds collection off until it ends: `while row = csv.shift` keeps the
+CSV's parser fiber alive for the whole loop, and nothing the loop builds is
+collected until then.
 
 **`Enumerator#next` uses a fiber only when it has to.** A builtin iteration of
 a finite Array, Hash, String or Range cannot run a program's code, so it gives
@@ -131,21 +143,17 @@ fiber to the collector, which does not run it.
 once (see the synchronous model); a Thread body gets a root fiber of its own,
 so `Fiber.current`, fiber storage and `Thread#[]` inside it answer as ruby's.
 
-**The builds without threads** -- the Wasm playground (a module that spawns
-needs a shared memory the page cannot have) and the RV targets (no `spawn`) --
-compile `m_fiber_nothreads.mere` in `m_fiber_threads.mere`'s place
+**The builds without coroutines** -- the Wasm playground (core Wasm cannot
+switch stacks) and the RV targets (one stack) -- compile
+`m_fiber_nothreads.mere` in `m_fiber_coro.mere`'s place
 (`tools/nothreads_tree.sh`): a fiber runs to completion on its first `#resume`
 and `Fiber.yield` is `NotImplementedError`.
 
-**It rests on a gap in the language.** `spawn`'s capture check does not follow
-a named top-level function into the globals it touches (Q-179 in the
-language's open questions), and the fiber threads touch the interpreter's
-global maps; that is sound only because the hand-off is strict.
-
-**What fixing it would take.** A coroutine that runs on the same thread
-(a language primitive that switches C stacks), which removes the thread per
-fiber, the switch cost and the Q-179 dependence at once; and frames that are
-roots, which is what collecting under a suspended stack needs.
+**What fixing the collection would take.** Values half-way through an
+expression are the part no mark sees. Numbering allocations and treating
+everything a suspended frame allocated since its statement began as a root
+closes the case above without touching the language; seeing the values
+themselves needs the runtime to scan a suspended coroutine's stack.
 
 ## ENV is read through a subprocess, so it carries the shell's own variables
 
