@@ -103,6 +103,16 @@ extern fn fd_pipe: unit -> int;
 //   bound on every sweep before this. A read that would block is a deadlock
 //   HERE, and it is named as one.
 extern fn io_set_nonblocking: int -> int;
+// ...and readiness, which is what IO.select, IO#wait and the *_nonblock
+//   pair ask. poll(2) under a registered interest set (compiler v0.1.313):
+//   one set for the whole process, filled for one wait and emptied again,
+//   because the runtime has a fixed number of them and no way to free one.
+//   A ready event packs into one int, fd*8 + (1 read | 2 write | 4 err/hup).
+extern fn io_poll_new: int -> int;
+extern fn io_poll_add: int -> int -> int -> int;
+extern fn io_poll_del: int -> int -> int;
+extern fn io_poll_wait: int -> int -> int;
+extern fn io_poll_get: int -> int -> int;
 // one arena block, reused: 64 KiB is the read size and the write chunk.
 
 // Object ids come from a counter carried IN the ocls map itself (special key
@@ -1872,6 +1882,50 @@ let fd_slurp_limited = fn (fd: int) -> fn (want: int) ->
   if n < 0 then VNil
   else if n == 0 then mkstr ""
   else mkstr (mem_to_str p n);
+// One poll(2) over `fds`, each with the interest at the same position (1 read,
+// 2 write), for up to `ms` milliseconds (-1: no limit). Answers the ready bits
+// per position (1 read, 2 write, 4 error or hang-up; 0 when nothing happened).
+// The set is the process's one set (see io_poll_new) and is left empty.
+let io_ps = map_new ();
+let io_ps_id = fn (u: unit) ->
+  if map_has io_ps 0 then map_get io_ps 0
+  else (let s = io_poll_new 0 in let _ = map_set io_ps 0 s in s);
+let rec io_poll_fill = fn (s: int) -> fn (fds: Val list) -> fn (ints: Val list) ->
+  match fds with
+  | Cons (VInt fd, rest) ->
+    (match ints with
+     | Cons (VInt b, irest) -> (let _ = io_poll_add s fd b in io_poll_fill s rest irest)
+     | _ -> ())
+  | _ -> ();
+let rec io_poll_drain = fn (s: int) -> fn (fds: Val list) ->
+  match fds with
+  | Cons (VInt fd, rest) -> (let _ = io_poll_del s fd in io_poll_drain s rest)
+  | _ -> ();
+let rec io_poll_read = fn (s: int) -> fn (got) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then ()
+  else (let e = io_poll_get s i in
+        let _ = (if e >= 0 then map_set got (e / 8) (e - (e / 8) * 8) else ()) in
+        io_poll_read s got (i + 1) n);
+let rec io_poll_answer = fn (got) -> fn (fds: Val list) ->
+  match fds with
+  | Cons (VInt fd, rest) -> Cons (VInt (if map_has got fd then map_get got fd else 0), io_poll_answer got rest)
+  | Cons (_, rest) -> Cons (VInt 0, io_poll_answer got rest)
+  | Nil -> (Nil : Val list);
+let io_poll_bits = fn (fds: Val list) -> fn (ints: Val list) -> fn (ms: int) ->
+  let s = io_ps_id () in
+  let _ = io_poll_fill s fds ints in
+  let n = io_poll_wait s ms in
+  let got = map_new () in
+  let _ = map_set got (0 - 1) 0 in
+  let _ = (if n > 0 then io_poll_read s got 0 n else ()) in
+  let _ = io_poll_drain s fds in
+  io_poll_answer got fds;
+// the bytes a descriptor-born IO has taken off its descriptor and not yet
+// handed out (#getc reads ahead, #ungetc pushes back), "" when none
+let io_rbuf_of = fn ivars -> fn (id: int) ->
+  if map_has ivars (str_of_int id ++ "@__io_rbuf")
+  then (match map_get ivars (str_of_int id ++ "@__io_rbuf") with VStr h -> sget h | _ -> "")
+  else "";
 let rec fd_get_all = fn (fd: int) -> fn (acc: str) ->
   let chunk = fd_get fd in
   if str_eq chunk "" then acc else fd_get_all fd (acc ++ chunk);

@@ -11464,6 +11464,27 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     //   carry bytes rather than be two objects that look like a pipe.
     // (__pipe is the same primitive under a name the prelude's block form of
     // IO.pipe can call without reaching itself again)
+    // the one readiness primitive the prelude's IO.select / IO#wait are
+    // written over: descriptors, interests (1 read, 2 write) and a wait in
+    // milliseconds (-1 for none) in, the ready bits per descriptor out.
+    else if str_eq c "IO" && (str_len name == 6 && str_eq name "__poll") then
+      (match args with
+       | Cons (VArr fa9, Cons (VArr ia9, Cons (VInt ms9, _))) -> arr_new (io_poll_bits (deref fa9) (deref ia9) ms9)
+       | _ -> arr_new Nil)
+    // ...and a wait that cannot be answered now, on a thread that is not the
+    // main one: the thread PARKS, as a bare sleep in its body would. ⚠ Not
+    //   `sleep` from the prelude: in_thread() is the Thread.new BLOCK's flag
+    //   and a method call clears it, so a bare sleep inside a method a thread
+    //   calls returns at once instead of parking. Which thread is running is
+    //   what the question is about, and cur_thr answers it.
+    else if str_eq c "IO" && (str_len name == 6 && str_eq name "__park") then
+      (let t9 = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
+       let m9 = (if map_has all_thr "0" then map_get all_thr "0" else VNil) in
+       match t9 with
+       | VObj a9 -> (match m9 with
+                     | VObj b9 -> (if a9 == b9 then VNil else raise_exc world "__ThreadPark" "sleep")
+                     | _ -> VNil)
+       | _ -> VNil)
     else if str_eq c "IO" && ((str_len name == 4 && str_eq name "pipe") || (str_len name == 6 && str_eq name "__pipe")) then
       (let pk9 = fd_pipe () in
        if pk9 < 0 then raise_exc world "Errno::EMFILE" "Too many open files - pipe"
@@ -15226,7 +15247,59 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                       || (str_len name == 4 && str_eq name "path") || (str_len name == 7 && str_eq name "to_path")
                    then false else true) then
          raise_exc world "IOError" "closed stream"
+       // ONE read(2) and ONE write(2), which is what the prelude's
+       // read_nonblock and write_nonblock are written over: on these
+       // non-blocking descriptors -1 is "nothing now" (answered as :wait),
+       // and a read of 0 is the end of the file (nil). Bytes that #getc
+       // already took off the descriptor come first, as they do in ruby's
+       // buffer -- unless the stream converts newlines, when ruby refuses a
+       // byte read of a CHARACTER buffer.
+       else if fd > 2 && (str_len name == 8 && str_eq name "__nbread") then
+         (let n9 = (match args with Cons (VInt n, _) -> n | _ -> 0) in
+          let rb9 = io_rbuf_of ivars id in
+          if str_len rb9 > 0 then
+            (if map_has ivars (str_of_int id ++ "@__io_univ")
+             then raise_exc world "IOError" "byte oriented read for character buffered IO"
+             else (let k9 = (if n9 < str_len rb9 then n9 else str_len rb9) in
+                   let _ = map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (substring rb9 k9 (str_len rb9))) in
+                   mkstr (substring rb9 0 k9)))
+          else
+            (let p9 = tcp_arena () in
+             let cap9 = (if n9 > 65536 then 65536 else n9) in
+             let got9 = (if cap9 <= 0 then 0 else fd_read fd p9 cap9) in
+             if got9 < 0 then VSym "wait" else if got9 == 0 then VNil else mkstr (mem_to_str p9 got9)))
+       else if fd > 2 && (str_len name == 9 && str_eq name "__nbwrite") then
+         (match args with
+          | Cons (VStr h9, _) ->
+            (let s9 = sget h9 in
+             VInt (fd_put fd (if str_len s9 > 65536 then substring s9 0 65536 else s9)))
+          | _ -> VInt 0)
+       // #getc fills the buffer the way ruby's does -- whatever the pipe holds
+       // now, not one byte -- so a byte read after it sees what ruby's sees.
+       else if fd > 2 && (str_len name == 4 && str_eq name "getc") then
+         (let rb0 = io_rbuf_of ivars id in
+          let p9 = tcp_arena () in
+          let got9 = (if str_len rb0 > 0 then 0 else fd_read fd p9 65536) in
+          let rb9 = (if str_len rb0 > 0 then rb0 else if got9 > 0 then mem_to_str p9 got9 else "") in
+          if str_len rb0 == 0 && got9 < 0 && map_has ivars (str_of_int id ++ "@__io_peer") then
+            raise_exc world "IOError"
+              "deadlock: reading a pipe with nothing in it, and this interpreter runs thread bodies to completion, so nothing is left that could write to it"
+          else if str_len rb9 == 0 then VNil
+          else
+            (let b9 = ord (char_at rb9 0) in
+             let w0 = (if b9 >= 240 then 4 else if b9 >= 224 then 3 else if b9 >= 192 then 2 else 1) in
+             let w9 = (if w0 > str_len rb9 then str_len rb9 else w0) in
+             let _ = map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (substring rb9 w9 (str_len rb9))) in
+             mkstr (substring rb9 0 w9)))
+       else if fd > 2 && (str_len name == 6 && str_eq name "ungetc") then
+         (let back9 = (match args with
+                       | Cons (VStr h9, _) -> sget h9
+                       | Cons (VInt n9, _) -> (if n9 < 256 then chr n9 else "")
+                       | _ -> "") in
+          let _ = map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (back9 ++ io_rbuf_of ivars id)) in
+          VNil)
        else if fd > 2 && ((str_len name == 5 && str_eq name "write")
+                          || (str_len name == 8 && str_eq name "syswrite")
                           || (str_len name == 2 && str_eq name "<<")
                           || (str_len name == 5 && str_eq name "print")
                           || (str_len name == 4 && str_eq name "puts")) then
@@ -15235,7 +15308,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                     else io_join_go args "") in
           let n9 = fd_put fd s2 in
           if n9 < 0 then raise_exc world "IOError" "closed stream"
-          else if (str_len name == 5 && str_eq name "write") then VInt n9
+          else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "syswrite") then VInt n9
           else if (str_len name == 2 && str_eq name "<<") then recv
           else VNil)
        else if fd > 2 && ((str_len name == 4 && str_eq name "read")
@@ -15248,9 +15321,25 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (let peer9 = (if map_has ivars (str_of_int id ++ "@__io_peer")
                        then (match map_get ivars (str_of_int id ++ "@__io_peer") with VInt pv -> pv | _ -> 0 - 1)
                        else 0 - 1) in
-          let got9 = (match args with
-                      | Cons (VInt n9, _) -> fd_slurp_limited fd n9
+          // what #getc buffered is read first, and only what is still
+          // wanted after it goes to the descriptor
+          let rb9 = io_rbuf_of ivars id in
+          let _ = (if str_len rb9 > 0 then map_delete ivars (str_of_int id ++ "@__io_rbuf") else ()) in
+          let got0 = (match args with
+                      | Cons (VInt n9, _) ->
+                        (if str_len rb9 >= n9 && str_len rb9 > 0 then
+                           (let _ = (if str_len rb9 > n9
+                                     then map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (substring rb9 n9 (str_len rb9)))
+                                     else ()) in
+                            mkstr "")
+                         else fd_slurp_limited fd (n9 - str_len rb9))
                       | _ -> fd_slurp fd) in
+          let got9 = (if str_len rb9 == 0 then got0
+                      else (match args with
+                            | Cons (VInt n9, _) ->
+                              (if str_len rb9 >= n9 then mkstr (substring rb9 0 n9)
+                               else (match got0 with VStr g9 -> mkstr (rb9 ++ sget g9) | _ -> mkstr rb9))
+                            | _ -> (match got0 with VStr g9 -> mkstr (rb9 ++ sget g9) | _ -> mkstr rb9))) in
           match got9 with
           | VNil ->
             (if peer9 >= 0 then
@@ -15269,7 +15358,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           VNil)
        else if (str_len name == 5 && str_eq name "print") then
          (let _ = (if fd == 2 then err_raw (io_join_go args "") else print_each world args) in VNil)
-       else if (str_len name == 5 && str_eq name "write") then
+       else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "syswrite") then
          (let s2 = io_join_go args "" in
           let _ = (if fd == 2 then err_raw s2 else out_print_no_nl s2) in
           VInt (str_len s2))
@@ -15326,6 +15415,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              | VStr h9 -> (let nm9 = enc_canon (sget h9) in
                            if map_has enc_objs nm9 then map_get enc_objs nm9 else a)
              | _ -> a) in
+          // the trailing OPTIONS are options, not an encoding: the internal
+          // one used to be the Hash itself. universal_newline is kept because
+          // it makes the buffer a character one (see __nbread).
+          let n9 = list_len args in
+          let opt9 = (match val_drop args (n9 - 1) with Cons (VHsh oh9, Nil) -> oh9 | _ -> 0 - 1) in
+          let args = (if opt9 >= 0 then val_take args (n9 - 1) else args) in
+          let _ = (if opt9 >= 0 then
+                     (let (f9, v9) = hash_lookup (hderef opt9) (VSym "universal_newline") in
+                      if f9 && truthy v9 then map_set ivars (str_of_int id ++ "@__io_univ") (VBool true)
+                      else if map_has ivars (str_of_int id ++ "@__io_univ") then map_delete ivars (str_of_int id ++ "@__io_univ")
+                      else ())
+                   else ()) in
           let _ = (match args with
                    | Cons (e1, rest9) ->
                      (let _ = map_set ivars (str_of_int id ++ "@__io_ext") (one9 e1) in
@@ -26935,6 +27036,14 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   else if (str_len name == 4 && str_eq name "load") && (match args with Cons (VStr _, _) -> true | _ -> false)
           && (if self_defines env world name then false else true) then
     (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
+  // Kernel#select is IO.select. It is answered HERE, as a bare name with
+  // arguments, and not as a Kernel method in the prelude: that one sat in the
+  // ancestry of every Array and changed what `Array.instance_method(:select)`
+  // reports (see the prelude's note). A block-only `select` never has
+  // arguments, so Enumerable's is not reached from here.
+  else if (str_len name == 6 && str_eq name "select") && (match args with Cons (_, _) -> true | Nil -> false)
+          && (if self_defines env world name then false else true) then
+    invoke_val_c env world noblk (VClass "IO") "select" args false
   // `set_trace_func(proc)` installs the tracer, `set_trace_func(nil)` removes
   // it. The proc arrives as an ARGUMENT, not a block, so this is the ordinary
   // call path rather than the block-taking one.

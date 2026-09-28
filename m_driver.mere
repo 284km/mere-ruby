@@ -2128,6 +2128,222 @@ let core_prelude_d =
   "      include WaitWritable\n" ++
   "    end\n" ++
   "  end\n" ++
+  "  # --- readiness: IO.select, #wait and the non-blocking pair --------------\n" ++
+  "  # All of it is written over one primitive, IO.__poll (poll(2) on the\n" ++
+  "  # descriptors, a wait in milliseconds, -1 for none). A File here is a path\n" ++
+  "  # and a buffer rather than a descriptor, and a regular file is always ready\n" ++
+  "  # to poll(2) anyway, so a File is answered as ready without asking.\n" ++
+  "  #\n" ++
+  "  # ⚠ WAITING IS WHERE THE THREAD MODEL SHOWS. A thread body runs to\n" ++
+  "  #   completion at Thread.new, so a thread that would wait for a descriptor\n" ++
+  "  #   PARKS (IO.__park: the park a bare sleep in its body is), and its status\n" ++
+  "  #   is \"sleep\" as it is in ruby. The main thread really waits -- for as long\n" ++
+  "  #   as it was told, or without limit on a descriptor something else could\n" ++
+  "  #   still write to. A pipe both of whose ends are this process's cannot\n" ++
+  "  #   become ready while it waits, and that is named as the deadlock it is.\n" ++
+  "  READABLE = 1\n" ++
+  "  PRIORITY = 2\n" ++
+  "  WRITABLE = 4\n" ++
+  "\n" ++
+  "  def self.__sel_io(o)\n" ++
+  "    return o if o.is_a?(IO)\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + o.class.to_s + \" into IO\" unless o.respond_to?(:to_io)\n" ++
+  "    io = o.to_io\n" ++
+  "    unless io.is_a?(IO)\n" ++
+  "      raise TypeError, \"can't convert \" + o.class.to_s + \" to IO (\" + o.class.to_s + \"#to_io gives \" + io.class.to_s + \")\"\n" ++
+  "    end\n" ++
+  "    io\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__sel_ms(t)\n" ++
+  "    return -1 if t.nil?\n" ++
+  "    raise TypeError, \"can't convert \" + t.class.to_s + \" into time interval\" unless t.is_a?(Numeric)\n" ++
+  "    raise RangeError, \"NaN out of Time range\" if t.is_a?(Float) && t.nan?\n" ++
+  "    raise ArgumentError, \"time interval must not be negative\" if t < 0\n" ++
+  "    return -1 if t.is_a?(Float) && t.infinite?\n" ++
+  "    ms = (t * 1000).ceil\n" ++
+  "    ms > 2147483647 ? 2147483647 : ms\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # true when nothing outside this process could make `ios` ready: every one\n" ++
+  "  # of them is an end of a pipe this process made\n" ++
+  "  def self.__sel_stuck?(ios)\n" ++
+  "    !ios.empty? && ios.all? do |io|\n" ++
+  "      io.instance_variable_defined?(:@__io_peer)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # [[fd, interest], ...] -> the ready bits per entry; a nil fd is a File\n" ++
+  "  def self.__sel_wait(ent, ms)\n" ++
+  "    fds = []\n" ++
+  "    ints = []\n" ++
+  "    ent.each do |fd, b|\n" ++
+  "      next if fd.nil?\n" ++
+  "      i = fds.index(fd)\n" ++
+  "      if i then ints[i] |= b else fds << fd; ints << b end\n" ++
+  "    end\n" ++
+  "    now = ent.any? \{ |fd, _| fd.nil? } ? 0 : ms\n" ++
+  "    got = IO.__poll(fds, ints, 0)\n" ++
+  "    if got.all? \{ |b| b == 0 } && now != 0 && !ent.any? \{ |fd, _| fd.nil? }\n" ++
+  "      if Thread.current != Thread.main\n" ++
+  "        IO.__park\n" ++
+  "      elsif fds.empty? && now == -1\n" ++
+  "        # nothing to wait for and nobody left to wake it: the main thread's\n" ++
+  "        # bare sleep, which is a no-op here\n" ++
+  "        nil\n" ++
+  "      elsif now == -1 && __sel_stuck?(ent.map \{ |e| e[2] })\n" ++
+  "        raise IOError, \"deadlock: waiting on a pipe with nothing in it, and this interpreter runs thread bodies to completion, so nothing is left that could write to it\"\n" ++
+  "      else\n" ++
+  "        got = IO.__poll(fds, ints, now)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    ent.map do |fd, _|\n" ++
+  "      fd.nil? ? 7 : got[fds.index(fd)]\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.select(*args)\n" ++
+  "    unless args.size >= 1 && args.size <= 4\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1..4)\"\n" ++
+  "    end\n" ++
+  "    r, w, e, timeout = args\n" ++
+  "    ms = __sel_ms(timeout)\n" ++
+  "    sets = [r, w, e].map do |a|\n" ++
+  "      if a.nil?\n" ++
+  "        []\n" ++
+  "      else\n" ++
+  "        raise TypeError, \"wrong argument type \" + a.class.to_s + \" (expected Array)\" unless a.is_a?(Array)\n" ++
+  "        a.map do |o|\n" ++
+  "          io = __sel_io(o)\n" ++
+  "          raise IOError, \"closed stream\" if io.closed?\n" ++
+  "          [o, io]\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    ent = []\n" ++
+  "    sets[0].each \{ |o, io| ent << [io.__sel_fd, 1, io] }\n" ++
+  "    sets[1].each \{ |o, io| ent << [io.__sel_fd, 2, io] }\n" ++
+  "    # bytes #getc read ahead are ready now, whatever the descriptor says\n" ++
+  "    ms = 0 if sets[0].any? \{ |o, io| io.__sel_pending? }\n" ++
+  "    got = __sel_wait(ent, ms)\n" ++
+  "    nr = sets[0].size\n" ++
+  "    rd = []\n" ++
+  "    sets[0].each_with_index do |pair, i|\n" ++
+  "      rd << pair[0] if pair[1].__sel_pending? || (got[i] & 5) != 0\n" ++
+  "    end\n" ++
+  "    wr = []\n" ++
+  "    sets[1].each_with_index do |pair, i|\n" ++
+  "      wr << pair[0] if (got[nr + i] & 6) != 0\n" ++
+  "    end\n" ++
+  "    return nil if rd.empty? && wr.empty?\n" ++
+  "    [rd, wr, []]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __sel_fd = @__io_fd\n" ++
+  "  def __sel_pending? = !@__io_rbuf.nil? && !@__io_rbuf.empty?\n" ++
+  "\n" ++
+  "  # the events of `events` that are ready within `timeout`, or nil\n" ++
+  "  def __wait_for(events, timeout)\n" ++
+  "    raise IOError, \"closed stream\" if closed?\n" ++
+  "    ms = IO.__sel_ms(timeout)\n" ++
+  "    int = ((events & READABLE) != 0 ? 1 : 0) | ((events & WRITABLE) != 0 ? 2 : 0)\n" ++
+  "    b = IO.__sel_wait([[__sel_fd, int, self]], ms)[0]\n" ++
+  "    m = 0\n" ++
+  "    m |= READABLE if (events & READABLE) != 0 && (b & 5) != 0\n" ++
+  "    m |= WRITABLE if (events & WRITABLE) != 0 && (b & 6) != 0\n" ++
+  "    m == 0 ? nil : m\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__wait_mode(sym)\n" ++
+  "    case sym\n" ++
+  "    when :r, :read, :readable then READABLE\n" ++
+  "    when :w, :write, :writable then WRITABLE\n" ++
+  "    when :rw, :read_write, :readable_writable then READABLE | WRITABLE\n" ++
+  "    else raise ArgumentError, \"unsupported mode: \" + sym.to_s\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # ruby's two forms: wait(events, timeout) answers the ready events, and\n" ++
+  "  # wait(timeout, *modes) -- in any order -- answers self\n" ++
+  "  def wait(*args)\n" ++
+  "    if args.size != 2 || args[0].is_a?(Symbol) || args[1].is_a?(Symbol)\n" ++
+  "      events = 0\n" ++
+  "      given = false\n" ++
+  "      timeout = nil\n" ++
+  "      args.each do |a|\n" ++
+  "        if a.is_a?(Symbol)\n" ++
+  "          events |= IO.__wait_mode(a)\n" ++
+  "        elsif !given\n" ++
+  "          IO.__sel_ms(a)\n" ++
+  "          given = true\n" ++
+  "          timeout = a\n" ++
+  "        else\n" ++
+  "          raise ArgumentError, \"timeout given more than once\"\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      events = READABLE if events == 0\n" ++
+  "      return true if (events & READABLE) != 0 && __sel_pending?\n" ++
+  "      __wait_for(events, timeout) ? self : nil\n" ++
+  "    else\n" ++
+  "      events = args[0].to_int\n" ++
+  "      raise ArgumentError, \"Events must be positive integer!\" if events <= 0\n" ++
+  "      return READABLE if (events & READABLE) != 0 && __sel_pending?\n" ++
+  "      __wait_for(events, args[1])\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def wait_readable(timeout = nil)\n" ++
+  "    raise IOError, \"closed stream\" if closed?\n" ++
+  "    return true if __sel_pending?\n" ++
+  "    __wait_for(READABLE, timeout) ? self : nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def wait_writable(timeout = nil)\n" ++
+  "    raise IOError, \"closed stream\" if closed?\n" ++
+  "    __wait_for(WRITABLE, timeout) ? self : nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def read_nonblock(len, buf = nil, exception: true)\n" ++
+  "    raise IOError, \"closed stream\" if closed?\n" ++
+  "    len = len.to_int\n" ++
+  "    raise ArgumentError, \"negative length \" + len.to_s + \" given\" if len < 0\n" ++
+  "    if __sel_fd.nil?\n" ++
+  "      return nil if !exception && len != 0 && eof?\n" ++
+  "      return sysread(len, buf)\n" ++
+  "    end\n" ++
+  "    if len == 0\n" ++
+  "      return \"\" if buf.nil?\n" ++
+  "      buf.clear\n" ++
+  "      return buf\n" ++
+  "    end\n" ++
+  "    s = self.__nbread(len)\n" ++
+  "    if s.is_a?(String)\n" ++
+  "      s.force_encoding(Encoding::BINARY)\n" ++
+  "      return s if buf.nil?\n" ++
+  "      enc = buf.encoding\n" ++
+  "      buf.replace(s)\n" ++
+  "      buf.force_encoding(enc)\n" ++
+  "      return buf\n" ++
+  "    end\n" ++
+  "    buf.clear unless buf.nil?\n" ++
+  "    if s.nil?\n" ++
+  "      return nil unless exception\n" ++
+  "      raise EOFError, \"end of file reached\"\n" ++
+  "    end\n" ++
+  "    return :wait_readable unless exception\n" ++
+  "    raise IO::EAGAINWaitReadable, \"read would block\"\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def write_nonblock(s, exception: true)\n" ++
+  "    raise IOError, \"closed stream\" if closed?\n" ++
+  "    s = s.to_s\n" ++
+  "    return syswrite(s) if __sel_fd.nil?\n" ++
+  "    return 0 if s.empty?\n" ++
+  "    n = self.__nbwrite(s)\n" ++
+  "    return n if n >= 0\n" ++
+  "    return :wait_writable unless exception\n" ++
+  "    raise IO::EAGAINWaitWritable, \"write would block\"\n" ++
+  "  end\n" ++
   "end\n" ++
   // ⚠ slice_before / slice_after were in the LIST this interpreter uses to
   // decide whether a name exists, with nothing behind them -- so the name was
