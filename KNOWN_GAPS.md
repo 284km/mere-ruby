@@ -686,6 +686,24 @@ assigns. No installed gem does it — the tree was searched before the two were
 left out. Fixing it means letting them read as ordinary identifiers in
 expression position, which is where their statement syntax is decided.
 
+## A block sees a local that is assigned only after it, lexically
+
+```ruby
+b = proc { r = 5 }
+r = []
+b.call
+p r        # ruby: []   mere-ruby: 5
+```
+
+In ruby `r` inside the block is the block's own local: when the block was
+parsed, no `r` was in scope, and a later assignment in the enclosing scope does
+not reach back into it. mere-ruby decides a block's locals when the block runs,
+not where it was written, so by then the outer `r` exists and the block writes
+it. It is one example of core/enumerator/initialize_spec ("accepts a block").
+Fixing it means recording, at each block, which names were in scope where it
+was written -- a change to how every block binds, so it is left until it can be
+made on its own.
+
 ## The regex engine has no true subroutine calls
 
 `\g<name>` is implemented by INLINING the named group's pattern at the call
