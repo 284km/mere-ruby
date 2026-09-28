@@ -2657,8 +2657,12 @@ let core_prelude_f =
   "    def to_s = \"pid #\{pid} exit #\{@__st}\"\n" ++
   "    # Process::Status.wait with no children answers a status whose pid is -1\n" ++
   "    # (and exitstatus 0) rather than raising, which is ruby's documented\n" ++
-  "    # difference from Process.wait. There are no children in this model.\n" ++
+  "    # difference from Process.wait; with one, it is Process.wait's status.\n" ++
   "    def self.wait(pid = -1, flags = 0)\n" ++
+  "      begin\n" ++
+  "        return Process.wait(pid, flags) && $?\n" ++
+  "      rescue Errno::ECHILD\n" ++
+  "      end\n" ++
   "      s = allocate\n" ++
   "      s.instance_variable_set(:@__st, 0)\n" ++
   "      s.instance_variable_set(:@__pid, -1)\n" ++
@@ -2714,6 +2718,10 @@ let core_prelude_f =
   "    File.open(n, *rest, &blk)\n" ++
   "  end\n" ++
   "  module_function :open\n" ++
+  "\n" ++
+  "  # Kernel#spawn is Process.spawn (see there for what a child is here)\n" ++
+  "  def spawn(*args) = Process.spawn(*args)\n" ++
+  "  module_function :spawn\n" ++
   "\n" ++
   "  # ⚠ Kernel#select IS NOT DEFINED HERE, and the reason is worth the line.\n" ++
   "  #   Defining it (a zero timeout answers nil, anything else refuses) closed\n" ++
@@ -2841,27 +2849,278 @@ let core_prelude_f =
   "    true\n" ++
   "  end\n" ++
   "\n" ++
-  "  # There are no child processes in this model, so there is never anything to\n" ++
-  "  # reap. Answering [] is the truth here, not a stub.\n" ++
-  "  def self.waitall\n" ++
-  "    []\n" ++
-  "  end\n" ++
-  "  # ...and for the same reason waiting for one is ECHILD, which is what ruby\n" ++
-  "  # raises when there are none. These three answered respond_to? and then\n" ++
-  "  # NoMethodError when called.\n" ++
-  "  def self.wait(pid = -1, flags = 0)\n" ++
-  "    raise Errno::ECHILD\n" ++
-  "  end\n" ++
-  "  def self.waitpid(pid = -1, flags = 0)\n" ++
-  "    raise Errno::ECHILD\n" ++
-  "  end\n" ++
-  "  def self.wait2(pid = -1, flags = 0)\n" ++
-  "    raise Errno::ECHILD\n" ++
-  "  end\n" ++
-  "  def self.waitpid2(pid = -1, flags = 0)\n" ++
-  "    raise Errno::ECHILD\n" ++
+  "\n" ++
+  "  WNOHANG = 1\n" ++
+  "  WUNTRACED = 2\n" ++
+  "  SHELL_WORDS = %w[case do done elif else esac fi for if in then until while\n" ++
+  "                   ! . : break continue eval exec exit export readonly return set shift times trap unset]\n" ++
+  "\n" ++
+  "  # --- children: spawn, wait and detach ------------------------------------\n" ++
+  "  # ⚠ THE RUNTIME HAS ONE WAY TO START A PROCESS, and it waits for it:\n" ++
+  "  #   posix_spawn of `sh -c` and then waitpid. A child that outlives the call\n" ++
+  "  #   is therefore started BY that shell, in the background, and reported back\n" ++
+  "  #   through two files -- its pid, written as soon as it starts, and its exit\n" ++
+  "  #   status, written by the shell that waits for it when it ends. So:\n" ++
+  "  #   - the pid is the child's own, real pid (Process.kill reaches it, and it\n" ++
+  "  #     is gone -- ESRCH -- once waited for);\n" ++
+  "  #   - it is not OUR child in the kernel's sense but a grandchild, which is\n" ++
+  "  #     why waiting polls a file instead of calling wait(2). The table below\n" ++
+  "  #     is what makes it \"ours\": wait answers only pids spawn handed out, and\n" ++
+  "  #     ECHILD for everything else, as the kernel would.\n" ++
+  "  #   - a child killed by a signal reports 128+signal as an exit status,\n" ++
+  "  #     because that is all the waiting shell can see.\n" ++
+  "  @__kids = \{}\n" ++
+  "  @__kid_n = 0\n" ++
+  "\n" ++
+  "  def self.__kid_dir\n" ++
+  "    d = ENV[\"TMPDIR\"] || \"/tmp\"\n" ++
+  "    d.end_with?(\"/\") ? d[0..-2] : d\n" ++
   "  end\n" ++
   "\n" ++
+  "  def self.__str_arg(a)\n" ++
+  "    s = a.is_a?(String) ? a : (a.respond_to?(:to_str) ? a.to_str : nil)\n" ++
+  "    unless s.is_a?(String)\n" ++
+  "      n = a.nil? ? \"nil\" : a == true ? \"true\" : a == false ? \"false\" : a.class.to_s\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + n + \" into String\"\n" ++
+  "    end\n" ++
+  "    raise ArgumentError, \"string contains null byte\" if s.include?(\"\\0\")\n" ++
+  "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__q(w) = \"'\" + w.to_s.gsub(\"'\", \"'\\\\''\") + \"'\"\n" ++
+  "\n" ++
+  "  def self.__which(cmd, path)\n" ++
+  "    return (File.exist?(cmd) ? cmd : nil) if cmd.include?(\"/\")\n" ++
+  "    (path || \"\").split(\":\").each do |d|\n" ++
+  "      f = File.join(d, cmd)\n" ++
+  "      return f if File.file?(f) && File.executable?(f)\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a redirect target as the shell spells it, for descriptor `fd`\n" ++
+  "  def self.__redir(fd, v)\n" ++
+  "    v = v.to_io if !v.is_a?(IO) && v.respond_to?(:to_io)\n" ++
+  "    t = if v.is_a?(Integer) then \">&\" + v.to_s\n" ++
+  "        elsif v == :out then \">&1\"\n" ++
+  "        elsif v == :err then \">&2\"\n" ++
+  "        elsif v == :in then \"<&0\"\n" ++
+  "        elsif v == :close then \">&-\"\n" ++
+  "        elsif v.is_a?(IO) then \">&\" + v.fileno.to_s\n" ++
+  "        elsif v.is_a?(String) then (fd == 0 ? \"<\" : \">\") + __q(v)\n" ++
+  "        elsif v.is_a?(Array) && v[0] == :child then \">&\" + (v[1] == :out ? \"1\" : v[1] == :err ? \"2\" : v[1].to_s)\n" ++
+  "        elsif v.is_a?(Array)\n" ++
+  "          nm = __str_arg(v[0])\n" ++
+  "          m = v[1].to_s\n" ++
+  "          (fd == 0 ? \"<\" : (m.include?(\"a\") ? \">>\" : \">\")) + __q(nm)\n" ++
+  "        else raise ArgumentError, \"wrong exec redirect action\"\n" ++
+  "        end\n" ++
+  "    fd.to_s + t\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__fd_of(k)\n" ++
+  "    return k if k.is_a?(Integer)\n" ++
+  "    return 0 if k == :in\n" ++
+  "    return 1 if k == :out\n" ++
+  "    return 2 if k == :err\n" ++
+  "    return k.fileno if k.is_a?(IO)\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.spawn(*args)\n" ++
+  "    env = nil\n" ++
+  "    if !args.empty? && (args[0].is_a?(Hash) || (!args[0].is_a?(String) && !args[0].is_a?(Array) && args[0].respond_to?(:to_hash)))\n" ++
+  "      env = args.shift\n" ++
+  "      env = env.to_hash unless env.is_a?(Hash)\n" ++
+  "    end\n" ++
+  "    opts = args.last.is_a?(Hash) ? args.pop : \{}\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given 0, expected 1+)\" if args.empty?\n" ++
+  "    pre = []\n" ++
+  "    if env\n" ++
+  "      env.each do |k, v|\n" ++
+  "        k = __str_arg(k)\n" ++
+  "        raise ArgumentError, \"environment name contains a equal : \" + k if k.include?(\"=\")\n" ++
+  "        if v.nil?\n" ++
+  "          pre << \"unset \" + __q(k) + \";\"\n" ++
+  "        else\n" ++
+  "          pre << \"export \" + __q(k) + \"=\" + __q(__str_arg(v)) + \";\"\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    redir = []\n" ++
+  "    late = []\n" ++
+  "    pgroup = false\n" ++
+  "    path = (env && env.key?(\"PATH\")) ? env[\"PATH\"] : ENV[\"PATH\"]\n" ++
+  "    opts.each do |k, v|\n" ++
+  "      if k.is_a?(String)\n" ++
+  "        raise ArgumentError, \"wrong exec option: \" + k.inspect\n" ++
+  "      elsif k == :chdir\n" ++
+  "        d = v.respond_to?(:to_path) ? v.to_path : v\n" ++
+  "        pre << \"cd \" + __q(d) + \" || exit 127;\"\n" ++
+  "      elsif k == :umask\n" ++
+  "        pre << \"umask \" + v.to_s(8) + \";\"\n" ++
+  "      elsif k == :pgroup\n" ++
+  "        pgroup = v ? true : false\n" ++
+  "      elsif k == :unsetenv_others\n" ++
+  "        pre << \"for __v in $(env | sed 's/=.*//'); do unset $__v 2>/dev/null; done;\" if v\n" ++
+  "      elsif k == :close_others || k == :new_pgroup || k == :rlimit_core\n" ++
+  "      elsif k.is_a?(Array)\n" ++
+  "        # one open shared by every descriptor named, as ruby does it\n" ++
+  "        fs = k.map \{ |kk| __fd_of(kk) }\n" ++
+  "        redir << __redir(fs[0], v)\n" ++
+  "        fs[1..].each \{ |f| redir << f.to_s + \">&\" + fs[0].to_s }\n" ++
+  "      elsif (f = __fd_of(k))\n" ++
+  "        # [:child, fd] names the CHILD's descriptor after the others are set\n" ++
+  "        (v.is_a?(Array) && v[0] == :child ? late : redir) << __redir(f, v)\n" ++
+  "      else\n" ++
+  "        raise ArgumentError, \"wrong exec option symbol: \" + k.to_s\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    first = args[0]\n" ++
+  "    first = first.to_ary if !first.is_a?(String) && !first.is_a?(Array) && first.respond_to?(:to_ary)\n" ++
+  "    if first.is_a?(Array)\n" ++
+  "      raise ArgumentError, \"wrong first argument\" unless first.size == 2\n" ++
+  "      prog = __str_arg(first[0])\n" ++
+  "      argv0 = __str_arg(first[1])\n" ++
+  "      rest = args[1..].map \{ |a| __str_arg(a) }\n" ++
+  "    else\n" ++
+  "      prog = __str_arg(first)\n" ++
+  "      argv0 = nil\n" ++
+  "      rest = args[1..].map \{ |a| __str_arg(a) }\n" ++
+  "    end\n" ++
+  "    # a single string goes to the shell when it needs one: a metacharacter, or\n" ++
+  "    # a first word that is a reserved word or special builtin (ruby's list)\n" ++
+  "    shell = argv0.nil? && rest.empty? &&\n" ++
+  "            (prog.match?(/[*?\{}\\[\\]<>()~&|\\\\$;'`\"\\n#=%]/) || SHELL_WORDS.include?(prog.split[0]))\n" ++
+  "    if shell\n" ++
+  "      # its own shell, as ruby's is: a line that does not parse is that\n" ++
+  "      # shell's error (and exit status), never a hole in the script below\n" ++
+  "      line = \"exec sh -c \" + __q(prog)\n" ++
+  "    else\n" ++
+  "      words = argv0.nil? && rest.empty? ? prog.split : [prog] + rest\n" ++
+  "      raise Errno::ENOENT, prog if words.empty?\n" ++
+  "      exe = __which(words[0], path)\n" ++
+  "      if exe.nil?\n" ++
+  "        __set_status(127, nil)\n" ++
+  "        raise Errno::ENOENT, words[0]\n" ++
+  "      end\n" ++
+  "      if File.directory?(exe)\n" ++
+  "        __set_status(127, nil)\n" ++
+  "        raise Errno::EACCES, words[0]\n" ++
+  "      end\n" ++
+  "      line = (argv0.nil? ? \"\" : \"exec -a \" + __q(argv0) + \" \") + ([exe] + words[1..]).map \{ |w| __q(w) }.join(\" \")\n" ++
+  "      line = \"exec \" + line if argv0.nil?\n" ++
+  "    end\n" ++
+  "    @__kid_n += 1\n" ++
+  "    base = __kid_dir + \"/mere_ruby_kid.\" + Process.pid.to_s + \".\" + @__kid_n.to_s\n" ++
+  "    pidf = base + \".pid\"\n" ++
+  "    stf = base + \".st\"\n" ++
+  "    inner = pre.join(\" \") + \" \" + line + \" \" + (redir + late).join(\" \")\n" ++
+  "    STDOUT.flush\n" ++
+  "    STDERR.flush\n" ++
+  "    # the child is started by a background shell that waits for it; stdin is\n" ++
+  "    # handed down explicitly, because an asynchronous list's is /dev/null, and\n" ++
+  "    # so is stderr, because the waiting shell's own (\"Killed: 9\") is not ours.\n" ++
+  "    # They travel on 9 and 8, out of the way of the low descriptors a pipe or\n" ++
+  "    # a redirect names.\n" ++
+  "    rc = Process.__sh(\"exec 9<&0 8>&2; ( ( \" + inner + \" ) <&9 2>&8 9<&- 8>&- & echo $! > \" + __q(pidf + \".t\") + \"; mv \" + __q(pidf + \".t\") + \" \" + __q(pidf) +\n" ++
+  "                 \"; wait $!; echo $? > \" + __q(stf + \".t\") + \"; mv \" + __q(stf + \".t\") + \" \" + __q(stf) + \" ) 2>/dev/null &\")\n" ++
+  "    n = 0\n" ++
+  "    until File.exist?(pidf)\n" ++
+  "      n += 1\n" ++
+  "      raise SystemCallError.new(\"spawn: the child did not start (sh exit \" + rc.to_s + \")\", 0) if rc != 0 || n > 10000\n" ++
+  "      IO.__poll([], [], 1)\n" ++
+  "    end\n" ++
+  "    pid = File.read(pidf).to_i\n" ++
+  "    File.delete(pidf)\n" ++
+  "    @__kids[pid] = [stf, pgroup]\n" ++
+  "    pid\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__set_status(st, pid)\n" ++
+  "    s = Process::Status.allocate\n" ++
+  "    s.instance_variable_set(:@__st, st)\n" ++
+  "    s.instance_variable_set(:@__pid, pid)\n" ++
+  "    Process.__set_last(s)\n" ++
+  "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__to_pid(pid)\n" ++
+  "    return pid if pid.is_a?(Integer)\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + pid.class.to_s + \" into Integer\" unless pid.respond_to?(:to_int)\n" ++
+  "    i = pid.to_int\n" ++
+  "    raise TypeError, \"can't convert \" + pid.class.to_s + \" into Integer (\" + pid.class.to_s + \"#to_int gives \" + i.class.to_s + \")\" unless i.is_a?(Integer)\n" ++
+  "    i\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the finished child among `pids`, or nil\n" ++
+  "  def self.__reaped(pids)\n" ++
+  "    pids.each do |p|\n" ++
+  "      stf = @__kids[p][0]\n" ++
+  "      next unless File.exist?(stf)\n" ++
+  "      st = File.read(stf).to_i\n" ++
+  "      File.delete(stf)\n" ++
+  "      @__kids.delete(p)\n" ++
+  "      __set_status(st, p)\n" ++
+  "      return p\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.wait(pid = -1, flags = 0)\n" ++
+  "    pid = __to_pid(pid)\n" ++
+  "    flags = 0 if flags.nil?\n" ++
+  "    pids = if pid == -1 then @__kids.keys\n" ++
+  "           elsif pid == 0 then @__kids.keys.reject \{ |p| @__kids[p][1] }\n" ++
+  "           elsif pid > 0 then (@__kids.key?(pid) ? [pid] : [])\n" ++
+  "           else []\n" ++
+  "           end\n" ++
+  "    raise Errno::ECHILD if pids.empty?\n" ++
+  "    loop do\n" ++
+  "      got = __reaped(pids)\n" ++
+  "      return got if got\n" ++
+  "      return nil if (flags & WNOHANG) != 0\n" ++
+  "      IO.__poll([], [], 5)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  def self.waitpid(pid = -1, flags = 0) = wait(pid, flags)\n" ++
+  "  def self.wait2(pid = -1, flags = 0)\n" ++
+  "    got = wait(pid, flags)\n" ++
+  "    got.nil? ? nil : [got, $?]\n" ++
+  "  end\n" ++
+  "  def self.waitpid2(pid = -1, flags = 0) = wait2(pid, flags)\n" ++
+  "  def self.waitall\n" ++
+  "    out = []\n" ++
+  "    until @__kids.empty?\n" ++
+  "      p = wait\n" ++
+  "      out << [p, $?]\n" ++
+  "    end\n" ++
+  "    out\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.last_status(*args)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 0)\" unless args.empty?\n" ++
+  "    $?\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the thread detach answers: its value is the child's status, and it\n" ++
+  "  # knows the pid it is waiting for\n" ++
+  "  class Waiter < Thread\n" ++
+  "    def pid = self[:pid]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.detach(pid)\n" ++
+  "    pid = __to_pid(pid)\n" ++
+  "    Waiter.new(pid) do |p|\n" ++
+  "      Thread.current[:pid] = p\n" ++
+  "      begin\n" ++
+  "        Process.wait(p)\n" ++
+  "        $?\n" ++
+  "      rescue Errno::ECHILD\n" ++
+  "        nil\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "  end\n" ++
   "  Tms = Struct.new(:utime, :stime, :cutime, :cstime)\n" ++
   "\n" ++
   "  # ⚠ CPU time, and it costs a subprocess: there is no times(2) or\n" ++

@@ -3745,11 +3745,32 @@ the other. So:
       * a read with nothing at all raises IOError naming the deadlock, where
         ruby would block until another thread wrote.
   - `IO#stat` and `IO#pid` are still missing on a descriptor-born IO.
-  - `read_nonblock`, `write_nonblock`, `IO.select`, `advise`, `fcntl`, `ioctl`
-    and `sysseek` all need the descriptor to be the thing that moves bytes.
+  - `advise`, `fcntl`, `ioctl` and `sysseek` all need the descriptor to be
+    the thing that moves bytes. (`read_nonblock`, `write_nonblock`,
+    `IO.select` and `IO#wait` work on a pipe's IOs since 2026-09-28, over
+    poll(2); a File is answered as always ready, which a regular file is.)
   - The offsets differ from ruby: `IO.new(f.fileno)` here opens its own
     descriptor rather than sharing the File's file description, so a seek
     through one is invisible to the other. ruby shares it.
+
+## A spawned child is a grandchild, reported through two files
+
+Added 2026-09-28. The runtime's one way to start a process waits for it
+(posix_spawn of `sh -c`, then waitpid), so `Process.spawn` has that shell start
+the child in the BACKGROUND and write two files: the child's pid as soon as it
+starts, and its exit status from the shell that waits for it. The pid is the
+child's real one (Process.kill reaches it; ESRCH once it is reaped), and
+wait / wait2 / waitpid / waitall / detach answer only pids spawn handed out,
+ECHILD otherwise -- but they POLL a file every 5ms rather than call wait(2),
+because the process is not this one's child in the kernel's sense. Divergences:
+
+  - a child killed by a signal reports 128+signal as an EXIT status
+    (`$?.signaled?` is false), because that is all the waiting shell sees;
+  - `pgroup:` is recorded (so `Process.wait(0)` skips such a child) but no
+    group is made; `rlimit_*`, `close_others` and `new_pgroup` are accepted
+    and ignored;
+  - `IO.popen` still does not exist: its pipe ends are non-blocking here (see
+    above), and a child writing into or reading from one would see EAGAIN.
 
 ## The old note, kept for the shape of the problem
 
