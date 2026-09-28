@@ -506,6 +506,8 @@ let gc_pressure = fn world ->
 // here because it saves and restores the collector's baton (gc_bare) along
 // with the rest of a stack's state.
 import "m_fiber.mere";
+// Threads, scheduled on those coroutines: the world-free half.
+import "m_sched.mere";
 
 let rec gc_suffix = fn (xs: Stmt list) -> fn (n: int) ->
   if n <= 0 then xs
@@ -11270,10 +11272,23 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          raise_exc world "LocalJumpError" "no block given"
        // pass is a scheduling no-op: the calling thread just continues. A
        // body that spins on it forever parks via the iteration budget.
-       else if (str_len name == 4 && str_eq name "pass") then VNil
+       else if (str_len name == 4 && str_eq name "pass") then
+         (if fb_can_suspend then sch_pass world else VNil)
+       else if (str_len name == 16 && str_eq name "handle_interrupt") then
+         raise_exc world "ArgumentError" "block is needed."
+       else if (str_len name == 18 && str_eq name "pending_interrupt?") then
+         VBool (map_has ivars (str_of_int (sch_me ()) ++ "@__tpend"))
+       // under the scheduler Thread.stop waits until woken -- unless nobody
+       // else is alive to wake it
+       else if (str_len name == 4 && str_eq name "stop") && fb_can_suspend then
+         (if map_len sch_live <= 1
+          then raise_exc world "ThreadError" "stopping only thread\n\tnote: use sleep to stop forever"
+          else (let _ = sch_block world 3 0 0 in VNil))
        else if (str_len name == 4 && str_eq name "stop") then
          (if in_thread () then raise_exc world "__ThreadPark" "sleep"
           else raise_exc world "ThreadError" "stopping only thread\n\tnote: use sleep to stop forever")
+       else if (str_len name == 4 && str_eq name "exit") && fb_can_suspend then
+         thread_inst_sch env world blk (VObj (sch_me ())) (sch_me ()) "kill" Nil
        else if (str_len name == 4 && str_eq name "exit") then
          (if in_thread () then raise_exc world "__ThreadPark" "kill" else VNil)
        else if (str_len name == 4 && str_eq name "kill") then
@@ -14735,7 +14750,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let qv = (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else arr_new Nil) in
        let items = (match qv with VArr aid -> deref aid | _ -> Nil) in
        let closed = map_has ivars (k ++ "@__qclosed") in
-       if (str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq") then
+       if fb_can_suspend && queue_sch_name name then queue_sch env world recv id cls name args
+       else if (str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq") then
          (if closed then raise_exc world "ClosedQueueError" "queue closed"
           else
             let full = (match (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil) with
@@ -14790,7 +14806,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // ConditionVariable (synchronous model): wait returns immediately (there
     // is nobody to signal us later); signal/broadcast are no-ops.
     else if str_eq cls "ConditionVariable" then
-      (if (str_len name == 4 && str_eq name "wait") then
+      (if fb_can_suspend && ((str_len name == 4 && str_eq name "wait") || (str_len name == 6 && str_eq name "signal")
+                             || (str_len name == 9 && str_eq name "broadcast")) then
+         cv_sch env world blk recv id name args
+       else if (str_len name == 4 && str_eq name "wait") then
          // waiting with nobody left to signal: parks a thread, and is the
          // real deadlock on the main thread (as in Ruby).
          (if in_thread () then raise_exc world "__ThreadPark" "sleep"
@@ -14817,7 +14836,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
          (match cur with
           | VObj cid2 -> map_set ivars (str_of_int cid2 ++ "@__nlk") (VInt (cur_locks + d))
           | _ -> ()) in
-       if (str_len name == 4 && str_eq name "lock") then
+       if fb_can_suspend && ((str_len name == 4 && str_eq name "lock") || (str_len name == 8 && str_eq name "try_lock")
+                             || (str_len name == 6 && str_eq name "unlock") || (str_len name == 7 && str_eq name "locked?")
+                             || (str_len name == 6 && str_eq name "owned?") || (str_len name == 5 && str_eq name "sleep")) then
+         mutex_sch env world blk recv id name args
+       else if (str_len name == 4 && str_eq name "lock") then
          // a re-lock by the owner deadlocks. A lock held by a live other
          // thread blocks: a thread that blocks parks (it never resumes);
          // the main thread blocking on a parked owner while holding another
@@ -16816,6 +16839,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // completion, a park, or an exception (see the Thread.new boundary).
     // An instance of a subclass is served here too, for every name the
     // subclass does not define itself (this is past the method table).
+    // ...and under the scheduler, the names that wait or wake (thread_inst_sch)
+    else if fb_can_suspend && thr_obj_here world recv cls && sch_thr_name name then
+      (match recv with
+       | VObj tid -> thread_inst_sch env world blk recv tid name args
+       | _ -> VNil)
     else if thr_obj_here world recv cls then
       (match recv with
        | VObj tid ->
@@ -16852,7 +16880,10 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           // for another (parked) thread, [] -- its stack is not kept
           else if (str_len name == 9 && str_eq name "backtrace") || (str_len name == 19 && str_eq name "backtrace_locations") then
             (if (if alive then false else true) then VNil
-             else if (if thr_is_current recv then false else true) then arr_new Nil
+             // another thread: under the scheduler its stack is standing,
+             // suspended, and its frames can be read off it
+             else if (if thr_is_current recv then false else true) then
+               arr_new (if fb_can_suspend && (str_len name == 9) then sch_backtrace tid else (Nil : Val list))
              else
                (let lbl9 = "Thread#" ++ name in
                 let all9 = (if (str_len name == 19) then Cons (loc_obj world (cur_file ()) (cur_line ()) lbl9, caller_locs world 0 (0 - 1))
@@ -16968,8 +16999,17 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (match args with Cons (v, _) -> let _ = map_set ivars (k ++ "@__tabort") v in v | _ -> VNil)
           else if (str_len name == 20 && str_eq name "report_on_exception=") then
             (match args with Cons (v, _) -> let _ = map_set ivars (k ++ "@__treport") v in v | _ -> VNil)
-          else if (str_len name == 8 && str_eq name "priority") then VInt 0
-          else if (str_len name == 9 && str_eq name "priority=") then (match args with Cons (v, _) -> v | _ -> VNil)
+          // the priority is remembered, clamped to -3..3 as ruby clamps it
+          // (it does not change who runs next here)
+          else if (str_len name == 8 && str_eq name "priority") then
+            (if map_has ivars (k ++ "@__tprio") then map_get ivars (k ++ "@__tprio") else VInt 0)
+          else if (str_len name == 9 && str_eq name "priority=") then
+            (match args with
+             | Cons (VInt v, _) ->
+               (let c9 = (if v > 3 then 3 else if v < 0 - 3 then 0 - 3 else v) in
+                let _ = map_set ivars (k ++ "@__tprio") (VInt c9) in VInt v)
+             | Cons (o9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name o9 ++ " into Integer")
+             | Nil -> VNil)
           else if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") then
             thread_inspect_v world recv
           // the universal names, same reason as the ThreadGroup arm above --
@@ -18684,6 +18724,11 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
        // Thread.each_caller_location(start = 1, length = nil) { |loc| }: the
        // locations caller_locations would answer, one at a time; nil, or
        // what a `break` carries. It takes no keywords.
+       else if str_eq c "Thread" && (str_len name == 16 && str_eq name "handle_interrupt") then
+         (match args with
+          | Cons (VHsh _, _) -> thread_handle_interrupt env world blk newblk args
+          | Cons (a9, _) -> raise_exc world "ArgumentError" "unknown mask signature"
+          | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1)")
        else if str_eq c "Thread" && (str_len name == 20 && str_eq name "each_caller_location") then
          (let _ = (match rev_app args Nil with
                    | Cons (VHsh hk9, _) ->
@@ -26813,7 +26858,9 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
   // last-resort Kernel methods that reach here as bare names (the ECall
   // path handles the argument forms in try_self_call_x).
   if (str_len name == 5 && str_eq name "sleep") then
-    (if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
+    (if fb_sched_here () then fb_sched_sleep gc_cenv0 world Nil
+     else if fb_can_suspend then sch_sleep gc_cenv0 world VNil
+     else if in_thread () then raise_exc world "__ThreadPark" "sleep" else VInt 0)
   else if (str_len name == 4 && str_eq name "fork") then
     raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
   else if (str_len name == 4 && str_eq name "exit") then
@@ -26943,6 +26990,21 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     (let m = (match args with Cons (VStr mh, _) -> sget mh | _ -> "exit") in
      let _ = (match args with Cons (VStr mh, _) -> print_err (sget mh) | _ -> ()) in
      raise_system_exit world 1 m)
+  // Kernel#sleep in a non-blocking fiber of a thread that has a Fiber
+  // scheduler is the scheduler's #kernel_sleep, with the arguments as given
+  else if (str_len name == 5 && str_eq name "sleep") && fb_sched_here () then
+    fb_sched_sleep env world args
+  // Kernel#sleep under the scheduler: a real sleep, others running meanwhile
+  // (the argument checks are the synchronous arm's, below)
+  else if (str_len name == 5 && str_eq name "sleep") && fb_can_suspend
+          && (match args with
+              // (nil is "for ever" in 4.0, as no argument is)
+              | Nil -> true | Cons (VNil, _) -> true | Cons (VInt n9, _) -> n9 >= 0 | Cons (VFlt f9, _) -> f9 >= 0.0
+              | Cons (VRat (n9, _), _) -> (if str_len n9 > 0 && str_eq (char_at n9 0) "-" then false else true)
+              | Cons (VBig _, _) -> true
+              | Cons (VObj _, _) -> (match args with Cons (o9, _) -> prim_user_has world o9 "divmod" | Nil -> false)
+              | _ -> false) then
+    sch_sleep env world (match args with Cons (d9, _) -> d9 | Nil -> VNil)
   // Kernel#sleep: inside a synchronous thread it parks the thread; on the
   // main thread it is a scheduling no-op (there is nobody to switch to).
   else if (str_len name == 5 && str_eq name "sleep") then
@@ -30722,6 +30784,8 @@ and thread_init = fn world -> fn blk -> fn (recv: Val) -> fn (args: Val list) ->
 // completed (value), parked (status run/sleep), or died (exception,
 // re-raised by join/value).
 and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) -> fn newblk ->
+         if fb_can_suspend then thread_start_sch world blk tid args newblk
+         else
          (let (m3, s3, ocls3, iv3) = world in
           let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
           // where it was made, which #inspect shows
@@ -30801,6 +30865,562 @@ and thread_start = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) ->
                          (if map_has iv3 (str_of_int tid ++ "@__tkill") then VNil else flow_value other) in
                map_set iv3 (str_of_int tid ++ "@__tst") (VBool false)) in
           VObj tid)
+// ---- the scheduler, the evaluator's half --------------------------------------
+// m_sched.mere keeps the tables and says what the rules are; this half starts
+// thread bodies, switches, and delivers what was raised at a thread while it
+// waited. Only a build that can suspend comes here (fb_can_suspend); the
+// others keep the synchronous model above.
+//
+// The running thread, as its Thread object's id.
+and sch_me = fn (u: unit) ->
+  match (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) with
+  | VObj o -> o
+  | _ -> sch_main ()
+// Hand the thread to t -- to the fiber t was running when it stopped -- and
+// come back when something hands it back.
+and sch_run = fn (t: int) ->
+  let me = sch_me () in
+  let _ = map_set sch_fb me (fb_cur ()) in
+  fb_switch (fb_cur ()) (map_get sch_fb t)
+// Let the others run until something makes `me` runnable and picks it.
+and sch_dispatch = fn world -> fn (me: int) ->
+  let (_, _, _, iv) = world in
+  let t = sch_pick () in
+  if t == me then ()
+  else if t >= 0 then sch_run t
+  else if t == 0 - 1 then
+    // nobody can run and every live thread waits on another: the main thread
+    // is told, and whoever it was waiting on stays waiting
+    (let m = sch_main () in
+     let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", "No live threads left. Deadlock?")) in
+     let _ = sch_unpark m in
+     sch_dispatch world me)
+  else
+    // someone sleeps for ever in Kernel#sleep and nothing else can run: ruby
+    // just stops there, and so does this
+    (let _ = fb_os_sleep 1000 in sch_dispatch world me)
+// What was raised at `me` while it waited (Thread#raise, #kill, the deadlock
+// fatal) is raised here, on its own stack.
+and sch_deliver = fn world -> fn (me: int) -> sch_deliver_at world me true
+// ...at a point that is (or is not) a blocking call: Thread.handle_interrupt's
+// masks can defer an interrupt until the block ends (:never) or until the
+// next blocking call (:on_blocking); deferred, it stays pending
+and sch_deliver_at = fn world -> fn (me: int) -> fn (blocking: bool) ->
+  let (_, _, _, iv) = world in
+  let k = str_of_int me ++ "@__tpend" in
+  let mode = (if map_has iv k then sch_mask_mode world me (map_get iv k) else "immediate") in
+  if map_has iv k && (if str_eq mode "never" || (str_eq mode "on_blocking" && (if blocking then false else true)) then false else true) then
+    (let e = map_get iv k in
+     let _ = map_delete iv k in
+     match e with
+     | VExc (c, m) ->
+       (if str_eq c "__ThreadPark" && me == sch_main () then raise_system_exit world 0 "exit"
+        // a thread being killed is "aborting" while it unwinds
+        else if str_eq c "__ThreadPark" then
+          (let _ = map_set iv (str_of_int me ++ "@__tst") (mkstr "aborting") in raise_exc world c m)
+        else raise_exc world c m)
+     | other -> (let _ = re_raise world other in VNil))
+  else VNil
+// Wait: for kind on obj, until dl (0 = no limit). Answers true when the wait
+// ran out rather than being ended by someone.
+and sch_block = fn world -> fn (kind: int) -> fn (obj: int) -> fn (dl: int) ->
+  let out = sch_wait world kind obj dl in
+  let _ = sch_deliver world (sch_me ()) in
+  out
+// ...the wait alone, for a caller that must put something back (a mutex)
+// before what was raised at it is delivered
+and sch_wait = fn world -> fn (kind: int) -> fn (obj: int) -> fn (dl: int) ->
+  let me = sch_me () in
+  let _ = sch_park me kind obj dl in
+  let _ = sch_dispatch world me in
+  let out = map_has sch_timedout me in
+  let _ = (if out then map_delete sch_timedout me else ()) in
+  out
+// Thread.pass, and a preemption: to the back of the run queue
+and sch_pass = fn world ->
+  let me = sch_me () in
+  let _ = sch_enqueue me in
+  let _ = sch_dispatch world me in
+  sch_deliver_at world me false
+// what the innermost Thread.handle_interrupt mask says about exception e:
+// the first pair (inside out) whose class e is a kind of names the mode
+and sch_mask_mode = fn world -> fn (me: int) -> fn (e: Val) ->
+  let (_, _, ocls, iv) = world in
+  let ecls = (match e with VExc (c, _) -> c | VObj o -> (if map_has ocls o then map_get ocls o else "Object") | _ -> "Object") in
+  if str_eq ecls "__ThreadPark" then "immediate"
+  else
+    (let masks = (match (if map_has iv (str_of_int me ++ "@__tmask") then map_get iv (str_of_int me ++ "@__tmask") else VNil) with
+                  | VArr aid -> deref aid | _ -> (Nil : Val list)) in
+     let rec pairs = fn (ps: Val list) ->
+       match ps with
+       | Cons (VClass kc, Cons (VSym md, r)) -> (if exc_is_a world ecls kc then md else pairs r)
+       | Cons (_, Cons (_, r)) -> pairs r
+       | _ -> "" in
+     let rec go = fn (ms: Val list) ->
+       match ms with
+       | Nil -> "immediate"
+       | Cons (VHsh hid, r) -> (let md = pairs (hderef hid) in if str_eq md "" then go r else md)
+       | Cons (_, r) -> go r in
+     go masks)
+// Thread.handle_interrupt(Class => mode, ...) { }: the mask is in force for
+// the block. What it lets through that is already pending runs first; what
+// it held back runs when the block ends -- even when the block raised, and
+// then the interrupt is what propagates.
+and thread_handle_interrupt = fn env -> fn world -> fn blk -> fn newblk -> fn (args: Val list) ->
+  let (_, _, _, iv) = world in
+  let me = sch_me () in
+  let k = str_of_int me ++ "@__tmask" in
+  let mask = (match args with Cons (h, _) -> h | Nil -> VNil) in
+  let saved = (if map_has iv k then map_get iv k else arr_new Nil) in
+  let _ = map_set iv k (arr_new (Cons (mask, (match saved with VArr aid -> deref aid | _ -> (Nil : Val list))))) in
+  let r = try_or (fn (u: unit) ->
+            let _ = sch_deliver_at world me false in
+            run_block world blk newblk Nil) (FRaise VNil) in
+  let exc = (if map_has iv "$exc" then map_get iv "$exc" else VNil) in
+  let _ = map_set iv k saved in
+  let _ = sch_deliver_at world me false in
+  match r with
+  | FRaise _ -> (match exc with VNil -> fail "mere-ruby: (exception propagates past handle_interrupt)" | e -> flow_value (re_raise world e))
+  | other -> flow_value other
+// Every so many statements, a thread that has not waited lets the others
+// run -- when there are others, or a sleeper's time is up. (ruby switches
+// every 100 ms; a count is what keeps two runs of a program the same.)
+and sch_tick = fn world ->
+  let n = (if map_has sch_st "tk" then map_get sch_st "tk" else 0) in
+  if n > 0 then map_set sch_st "tk" (n - 1)
+  else (let _ = map_set sch_st "tk" 20000 in
+        if sch_runnable_n () > 0 || (map_len sch_dl > 0 && sch_next_deadline () <= sch_now ())
+        then (let _ = sch_pass world in ()) else ())
+// seconds (any Numeric, or an object answering #divmod) to nanoseconds
+and sch_secs_ns = fn env -> fn world -> fn (v: Val) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let num = fn (x: Val) ->
+    match x with
+    | VInt n -> n * 1000000000
+    | VFlt f -> int_of_float (f * 1000000000.0)
+    | _ -> (match invoke_val_c env world noblk x "to_f" Nil false with
+            | VFlt f -> int_of_float (f * 1000000000.0)
+            | VInt n -> n * 1000000000
+            | _ -> 0) in
+  match v with
+  // an object that is not a Numeric is a time interval through #divmod(1):
+  // whole seconds and the fraction, the protocol Kernel#sleep uses
+  | VObj _ ->
+    (match invoke_val_c env world noblk v "divmod" (Cons (VInt 1, Nil)) false with
+     | VArr aid -> (match deref aid with
+                    | Cons (a9, Cons (b9, _)) -> num a9 + num b9
+                    | _ -> 0)
+     | _ -> 0)
+  | _ -> num v
+// Kernel#sleep: nil or no argument sleeps until woken
+and sch_sleep = fn env -> fn world -> fn (dur: Val) ->
+  let t0 = sch_now () in
+  let _ = (match dur with
+           | VNil -> sch_block world 2 0 0
+           | _ -> (let ns = sch_secs_ns env world dur in
+                   if ns <= 0 then (let _ = sch_pass world in false)
+                   else sch_block world 1 0 (t0 + ns))) in
+  VInt ((sch_now () - t0 + 500000000) / 1000000000)
+// the `timeout:` keyword of a blocking call, when there is one
+and sch_kw_timeout = fn (args: Val list) ->
+  let rec last = fn (xs: Val list) -> match xs with Nil -> VNil | Cons (x, Nil) -> x | Cons (_, r) -> last r in
+  match last args with
+  | VHsh hid ->
+    (let rec find = fn (ps: Val list) ->
+       match ps with
+       | Cons (VSym k, Cons (v, r)) -> (if str_eq k "timeout" then v else find r)
+       | Cons (_, Cons (_, r)) -> find r
+       | _ -> VNil in
+     find (hderef hid))
+  | _ -> VNil
+and sch_deadline = fn env -> fn world -> fn (limit: Val) ->
+  match limit with
+  | VNil -> 0
+  | _ -> (let ns = sch_secs_ns env world limit in sch_now () + (if ns < 1 then 1 else ns))
+// Thread.new under the scheduler: the thread goes to the end of the run queue
+// and the creator keeps running. Its body is a proc in proc_store (a root)
+// and its arguments an Array in its ivars, so nothing it needs can be
+// collected before it first runs.
+and thread_start_sch = fn world -> fn blk -> fn (tid: int) -> fn (args: Val list) -> fn newblk ->
+  let (_, _, _, iv3) = world in
+  let k = str_of_int tid in
+  let _ = map_set iv3 (k ++ "@__tst") (mkstr "run") in
+  let _ = map_set iv3 (k ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
+  let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
+  let _ = (let (_, _, _, tcenv) = newblk in mark_captured tcenv) in
+  let pid = map_len proc_store in
+  let _ = store_proc (str_of_int pid) newblk in
+  let _ = map_set iv3 (k ++ "@__tblk") (VProc pid) in
+  let _ = map_set iv3 (k ++ "@__targs") (arr_new args) in
+  // a new thread takes Thread.report_on_exception as it is now
+  let _ = (if map_has thread_cfg "report_on_exception" && str_eq (map_get thread_cfg "report_on_exception") "0"
+           then map_set iv3 (k ++ "@__treport") (VBool false) else ()) in
+  let _ = fb_boot () in
+  let r = fb_new_index () in
+  let _ = map_set fb_root r 1 in
+  let _ = map_set fb_state r 1 in
+  let _ = map_set fb_thr r tid in
+  let _ = (match fb_storage_copy (fb_cur ()) with VNil -> () | h -> map_set fb_storage r h) in
+  let _ = map_set fb_bodies r (fn (u: unit) -> thread_body world blk tid r) in
+  let _ = fb_live_add 1 in
+  match try_or (fn (u: unit) -> let _ = fb_start_thread r r in Cons (1, Nil)) (Nil : int list) with
+  | Nil ->
+    (let _ = fb_live_add (0 - 1) in
+     let _ = map_delete fb_bodies r in
+     let _ = map_set fb_state r 3 in
+     let _ = map_set iv3 (k ++ "@__tst") (VBool false) in
+     raise_exc world "ThreadError" "can't create Thread: Resource temporarily unavailable")
+  | _ ->
+    (let _ = map_set sch_fb tid r in
+     let _ = map_set sch_live tid 1 in
+     let _ = sch_enqueue tid in
+     VObj tid)
+// A thread's body, on its own coroutine. Answers the fiber to hand the thread
+// to when it has ended.
+and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
+  let (_, _, _, iv3) = world in
+  let k = str_of_int tid in
+  let _ = fb_ctx_fresh r in
+  let _ = map_set cur_thr "v" (VObj tid) in
+  let _ = map_set cur_thr "t" (VObj tid) in
+  let _ = map_set catch_depth "n" (VInt 0) in
+  let _ = map_set thread_flag "n" (VBool true) in
+  let _ = map_set globals "~" VNil in
+  let args = (match (if map_has iv3 (k ++ "@__targs") then map_get iv3 (k ++ "@__targs") else VNil) with
+              | VArr aid -> deref aid | _ -> (Nil : Val list)) in
+  let result = try_or (fn (u: unit) ->
+                 // raised at it (or killed) before it ever ran
+                 let _ = sch_deliver world tid in
+                 match (if map_has iv3 (k ++ "@__tblk") then map_get iv3 (k ++ "@__tblk") else VNil) with
+                 | VProc pid -> run_block world blk (map_get proc_store (str_of_int pid)) args
+                 | _ -> FNext VNil)
+               (FRaise VNil) in
+  let _ = thread_report world tid result in
+  let _ = thread_finish world tid result in
+  // abort_on_exception (the thread's, or Thread's): the exception is raised
+  // in the main thread too, wherever it is waiting
+  let _ = (if map_has iv3 (k ++ "@__texc")
+              && ((map_has iv3 (k ++ "@__tabort") && truthy (map_get iv3 (k ++ "@__tabort")))
+                  || (map_has thread_cfg "abort_on_exception" && str_eq (map_get thread_cfg "abort_on_exception") "1"))
+           then (let m = sch_main () in
+                 let _ = map_set iv3 (str_of_int m ++ "@__tpend") (map_get iv3 (k ++ "@__texc")) in
+                 if sch_waiting m then sch_unpark m else ())
+           else ()) in
+  let _ = (if map_has iv3 (k ++ "@__targs") then map_delete iv3 (k ++ "@__targs") else ()) in
+  let _ = thread_release world tid in
+  let _ = map_delete sch_live tid in
+  let _ = map_set fb_state r 3 in
+  let _ = fb_live_add (0 - 1) in
+  let _ = sch_wake_all 8 tid in
+  thread_next world tid
+// the fiber the thread goes to when `me` has ended
+and thread_next = fn world -> fn (me: int) ->
+  let (_, _, _, iv) = world in
+  let t = sch_pick () in
+  if t >= 0 then map_get sch_fb t
+  else if t == 0 - 1 then
+    (let m = sch_main () in
+     let _ = map_set iv (str_of_int m ++ "@__tpend") (VExc ("fatal", "No live threads left. Deadlock?")) in
+     let _ = sch_unpark m in
+     thread_next world me)
+  else (let _ = fb_os_sleep 1000 in thread_next world me)
+// A thread that dies of an exception says so on stderr, unless its
+// report_on_exception is off -- while it is still alive, so the line names it
+// "run" as ruby's does. (ruby follows the message with error_highlight's
+// excerpt of the line; so does neither this nor mere-ruby's top level.)
+and thread_report = fn world -> fn (tid: int) -> fn (result: Flow) ->
+  let (_, _, _, iv3) = world in
+  let k = str_of_int tid in
+  let on = (if map_has iv3 (k ++ "@__treport") then truthy (map_get iv3 (k ++ "@__treport")) else true) in
+  let exc = (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) in
+  let killed = (match exc with VExc (c9, _) -> str_eq c9 "__ThreadPark" | VNil -> true | _ -> false) in
+  match result with
+  | FRaise _ ->
+    (if on && (if killed then false else true) then
+       (let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        let ins = (match invoke_val_c gc_cenv0 world noblk (VObj tid) "inspect" Nil false with VStr h -> sget h | _ -> "#<Thread>") in
+        let full = (match invoke_val_c gc_cenv0 world noblk exc "full_message" Nil false with VStr h -> sget h | _ -> "") in
+        let text = ins ++ " terminated with exception (report_on_exception is true):\n"
+                   ++ full ++ (if str_len full > 0 && str_eq (char_at full (str_len full - 1)) "\n" then "" else "\n") in
+        // through $stderr, the object: a program (or a spec) may have
+        // replaced it, and this is where ruby writes
+        match (if map_has globals "stderr" then map_get globals "stderr" else VNil) with
+        | VNil -> print_err (substring text 0 (str_len text - 1))
+        | se -> (let _ = invoke_val_c gc_cenv0 world noblk se "write" (Cons (mkstr text, Nil)) false in ()))
+     else ())
+  | _ -> ()
+// how the body ended, on the Thread object: its value, or the exception join
+// re-raises, and the status word (false when it ended, nil when it died)
+and thread_finish = fn world -> fn (tid: int) -> fn (result: Flow) ->
+  let (_, _, _, iv3) = world in
+  let k = str_of_int tid in
+  match result with
+  | FRaise _ ->
+    (let exc = (if map_has iv3 "$exc" then map_get iv3 "$exc" else VNil) in
+     let _ = (if map_has iv3 "$exc" then map_delete iv3 "$exc" else ()) in
+     let _ = (if map_has prim_missing "n" then map_delete prim_missing "n" else ()) in
+     let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+     let _ = (if map_has flow_sig "k" then map_delete flow_sig "k" else ()) in
+     match exc with
+     | VExc (c2, _) ->
+       (if str_eq c2 "__ThreadPark" then map_set iv3 (k ++ "@__tst") (VBool false)
+        else (let _ = map_set iv3 (k ++ "@__texc") exc in map_set iv3 (k ++ "@__tst") VNil))
+     | VNil ->
+       (let _ = map_set iv3 (k ++ "@__texc") (VExc ("StandardError", "error")) in
+        map_set iv3 (k ++ "@__tst") VNil)
+     | other -> (let _ = map_set iv3 (k ++ "@__texc") other in map_set iv3 (k ++ "@__tst") VNil))
+  | other ->
+    (let _ = map_set iv3 (k ++ "@__tval")
+               (if map_has iv3 (k ++ "@__tkill") then VNil else flow_value other) in
+     map_set iv3 (k ++ "@__tst") (VBool false))
+// a thread that ends lets go of every mutex it holds, and the first waiter
+// on each may take it
+and thread_release = fn world -> fn (tid: int) ->
+  let (_, _, _, iv3) = world in
+  let held = map_new () in
+  let _ = map_iter mtx_thr (fn (mid: int) -> fn (t: int) -> if t == tid then map_set held mid 1 else ()) in
+  map_iter held (fn (mid: int) -> fn (u: int) ->
+    let _ = map_delete mtx_thr mid in
+    let _ = map_set iv3 (str_of_int mid ++ "@__mown") VNil in
+    let _ = sch_wake_one 6 mid in ())
+// Queue / SizedQueue under the scheduler: a pop from an empty queue and a
+// push to a full one wait (kinds 4 and 5), and each side wakes the first
+// waiter of the other. close wakes every waiter: a popper then answers nil,
+// a pusher raises.
+and queue_sch_name = fn (name: str) ->
+  str_list_has (str_split "push|<<|enq|pop|shift|deq|close|num_waiting|clear|max=" "|") name
+and queue_sch = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (cls: str) -> fn (name: str) -> fn (args: Val list) ->
+  let (_, _, _, ivars) = world in
+  let k = str_of_int id in
+  let items = fn (u: unit) ->
+    match (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else VNil) with
+    | VArr aid -> deref aid | _ -> (Nil : Val list) in
+  let put = fn (xs: Val list) ->
+    match (if map_has ivars (k ++ "@__q") then map_get ivars (k ++ "@__q") else VNil) with
+    | VArr aid -> arr_set aid xs
+    | _ -> map_set ivars (k ++ "@__q") (arr_new xs) in
+  let closed = fn (u: unit) -> map_has ivars (k ++ "@__qclosed") in
+  let tmo = sch_kw_timeout args in
+  let has_tmo = (match tmo with VNil -> false | _ -> true) in
+  // the positional arguments, without a trailing keyword Hash
+  let rec pos = fn (xs: Val list) ->
+    match xs with
+    | Nil -> (Nil : Val list)
+    | Cons (VHsh _, Nil) -> (if has_tmo then (Nil : Val list) else xs)
+    | Cons (x, r) -> Cons (x, pos r) in
+  let pargs = pos args in
+  let nonblk = fn (xs: Val list) -> match xs with Cons (v9, _) -> truthy v9 | Nil -> false in
+  if (str_len name == 4 && str_eq name "push") || (str_len name == 2 && str_eq name "<<") || (str_len name == 3 && str_eq name "enq") then
+    (let v = (match pargs with Cons (v9, _) -> v9 | Nil -> VNil) in
+     let nb = (match pargs with Cons (_, r9) -> nonblk r9 | Nil -> false) in
+     if nb && has_tmo then raise_exc world "ArgumentError" "can't set a timeout if non_block is enabled"
+     else
+       (let dl = sch_deadline env world tmo in
+        let rec go = fn (u: unit) ->
+          if closed () then raise_exc world "ClosedQueueError" "queue closed"
+          else
+            (let full = (match (if map_has ivars (k ++ "@__qmax") then map_get ivars (k ++ "@__qmax") else VNil) with
+                         | VInt mx -> val_list_len (items ()) >= mx
+                         | _ -> false) in
+             if full then
+               (if nb then raise_exc world "ThreadError" "queue full"
+                else if sch_block world 5 id dl then VNil
+                else go ())
+             else (let _ = put (list_append (items ()) (Cons (v, Nil))) in
+                   let _ = sch_wake_one 4 id in
+                   recv)) in
+        go ()))
+  else if (str_len name == 3 && str_eq name "pop") || (str_len name == 5 && str_eq name "shift") || (str_len name == 3 && str_eq name "deq") then
+    (let nb = nonblk pargs in
+     if nb && has_tmo then raise_exc world "ArgumentError" "can't set a timeout if non_block is enabled"
+     else
+       (let dl = sch_deadline env world tmo in
+        let rec go = fn (u: unit) ->
+          match items () with
+          | Cons (h, t) -> (let _ = put t in let _ = sch_wake_one 5 id in h)
+          | Nil ->
+            (if closed () then VNil
+             else if nb then raise_exc world "ThreadError" "queue empty"
+             else if sch_block world 4 id dl then VNil
+             else go ()) in
+        go ()))
+  else if (str_len name == 5 && str_eq name "close") then
+    (let _ = map_set ivars (k ++ "@__qclosed") (VBool true) in
+     let _ = sch_wake_all 4 id in
+     let _ = sch_wake_all 5 id in
+     recv)
+  else if (str_len name == 11 && str_eq name "num_waiting") then
+    VInt (sch_waiters_n 4 id + sch_waiters_n 5 id)
+  else if (str_len name == 5 && str_eq name "clear") then
+    (let _ = put (Nil : Val list) in let _ = sch_wake_all 5 id in recv)
+  else
+    // max=: a larger bound lets waiting pushers try again
+    (match args with
+     | Cons (VInt mx, _) -> (let _ = map_set ivars (k ++ "@__qmax") (VInt mx) in let _ = sch_wake_all 5 id in VInt mx)
+     | _ -> VNil)
+// Mutex under the scheduler. Held = mtx_thr has it (a thread that ends lets
+// go, thread_release); the owner word is the fiber that locked it, as ruby's
+// is. A contended lock waits (kind 6); unlock wakes the first waiter, which
+// takes the lock when it runs -- or finds it taken again and waits again.
+and mutex_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -> fn (name: str) -> fn (args: Val list) ->
+  let (_, _, _, ivars) = world in
+  let k = str_of_int id in
+  let owner = fn (u: unit) -> (if map_has ivars (k ++ "@__mown") then map_get ivars (k ++ "@__mown") else VNil) in
+  let cur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+  let held = fn (u: unit) -> map_has mtx_thr id in
+  let mine = fn (u: unit) -> held () && rb_eq (owner ()) cur in
+  let take = fn (u: unit) ->
+    let _ = map_set ivars (k ++ "@__mown") cur in
+    map_set mtx_thr id (sch_me ()) in
+  let release = fn (u: unit) ->
+    let _ = map_set ivars (k ++ "@__mown") VNil in
+    let _ = map_delete mtx_thr id in
+    sch_wake_one 6 id in
+  if (str_len name == 4 && str_eq name "lock") then
+    (if mine () then raise_exc world "ThreadError" "deadlock; recursive locking"
+     // held by another fiber of THIS thread: waiting would stop the thread
+     // for ever, so it is refused (ruby's words)
+     else if held () && map_get mtx_thr id == sch_me () then
+       raise_exc world "ThreadError" "deadlock; lock already owned by another fiber belonging to the same thread"
+     else
+       (let rec go = fn (u: unit) ->
+          if held () then (let _ = sch_block world 6 id 0 in go ()) else (let _ = take () in recv) in
+        go ()))
+  else if (str_len name == 8 && str_eq name "try_lock") then
+    (if held () then VBool false else (let _ = take () in VBool true))
+  else if (str_len name == 6 && str_eq name "unlock") then
+    (if mine () then (let _ = release () in recv)
+     else raise_exc world "ThreadError" "Attempt to unlock a mutex which is not locked")
+  else if (str_len name == 7 && str_eq name "locked?") then VBool (held ())
+  else if (str_len name == 6 && str_eq name "owned?") then VBool (mine ())
+  else
+    // sleep: the checks of the synchronous arm, then unlock, wait, lock again
+    (let dur9 = (match args with Cons (v9, _) -> v9 | Nil -> VNil) in
+     let neg9 = (match dur9 with
+                 | VInt n9 -> n9 < 0
+                 | VFlt f9 -> f9 < 0.0
+                 | VRat (n9, _) -> str_len n9 > 0 && str_eq (char_at n9 0) "-"
+                 | _ -> false) in
+     let _ = (if neg9 then (let _ = raise_exc world "ArgumentError" "time interval must not be negative" in ()) else ()) in
+     let _ = (match dur9 with
+              | VNil -> () | VInt _ -> () | VFlt _ -> () | VBig _ -> () | VRat (_, _) -> ()
+              | other9 -> (let _ = raise_exc world "TypeError"
+                             ("can't convert " ++ display_cls_msg world (dispatch_cls_of world other9)
+                              ++ " into time interval") in ())) in
+     if (if mine () then false else true) then raise_exc world "ThreadError" "Attempt to unlock a mutex which is not locked"
+     else
+       (let t0 = sch_now () in
+        let _ = release () in
+        let _ = (match dur9 with VNil -> sch_wait world 3 0 0 | _ -> sch_wait world 1 0 (sch_deadline env world dur9)) in
+        let _ = sch_cv_leave (sch_me ()) in
+        // the lock is taken back BEFORE anything raised at this thread is
+        // delivered: a kill or a raise leaves it holding the mutex, so the
+        // ensure around it can unlock (ruby's rule)
+        let rec relock = fn (u: unit) ->
+          if held () then (let _ = sch_wait world 6 id 0 in relock ()) else take () in
+        let _ = relock () in
+        let _ = sch_deliver world (sch_me ()) in
+        VInt ((sch_now () - t0 + 500000000) / 1000000000)))
+// ConditionVariable under the scheduler, the way ruby's is: #wait puts the
+// thread in the variable's line and calls #sleep on the object it was given
+// (usually a Mutex, whose #sleep unlocks, waits and locks again); #signal
+// wakes the first in line from that sleep, #broadcast all of them. Thread#run
+// and #wakeup end the sleep as well, which is what ruby does too.
+and cv_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (id: int) -> fn (name: str) -> fn (args: Val list) ->
+  if (str_len name == 6 && str_eq name "signal") then (let _ = sch_cv_wake id false in recv)
+  else if (str_len name == 9 && str_eq name "broadcast") then (let _ = sch_cv_wake id true in recv)
+  else
+    (match args with
+     | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..2)"
+     | Cons (m, rest) ->
+       (let me = sch_me () in
+        let _ = sch_cv_join me id in
+        let r = invoke_val_c env world blk m "sleep" rest false in
+        let _ = sch_cv_leave me in
+        r))
+// the Thread instance names the scheduler answers
+and sch_thr_name = fn (name: str) ->
+  str_list_has (str_split "join|value|status|alive?|stop?|kill|exit|terminate|raise|wakeup|run|pending_interrupt?" "|") name
+and thread_inst_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (tid: int) -> fn (name: str) -> fn (args: Val list) ->
+  let (_, _, _, ivars) = world in
+  let k = str_of_int tid in
+  let tst = (if map_has ivars (k ++ "@__tst") then map_get ivars (k ++ "@__tst") else VBool false) in
+  let alive = (match tst with VStr _ -> true | _ -> false) in
+  let me = sch_me () in
+  let pend = fn (e: Val) ->
+    // ...except that a kill does not replace an exception already on its way:
+    // the thread dies of the exception (and reports it)
+    let kill_after_raise = (match e with VExc (c9, _) -> str_eq c9 "__ThreadPark" | _ -> false)
+                           && map_has ivars (k ++ "@__tpend") in
+    let _ = (if kill_after_raise then () else map_set ivars (k ++ "@__tpend") e) in
+    // a wait of any kind ends: the thread must see what was raised at it
+    (if sch_waiting tid then sch_unpark tid else ()) in
+  if (str_len name == 4 && str_eq name "join") || (str_len name == 5 && str_eq name "value") then
+    (let limit = (if (str_len name == 4) then (match args with Cons (l9, _) -> l9 | Nil -> VNil) else VNil) in
+     match limit with
+     | VInt _ -> thread_join_sch env world recv tid name limit alive me
+     | VFlt _ -> thread_join_sch env world recv tid name limit alive me
+     | VRat _ -> thread_join_sch env world recv tid name limit alive me
+     | VNil -> thread_join_sch env world recv tid name limit alive me
+     | a9 -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into time interval"))
+  else if (str_len name == 6 && str_eq name "status") then
+    (if alive then (if sch_status_sleeping tid then mkstr "sleep" else tst) else tst)
+  else if (str_len name == 18 && str_eq name "pending_interrupt?") then VBool (map_has ivars (k ++ "@__tpend"))
+  else if (str_len name == 6 && str_eq name "alive?") then VBool alive
+  else if (str_len name == 5 && str_eq name "stop?") then
+    VBool (if alive then sch_status_sleeping tid else true)
+  else if (str_len name == 4 && str_eq name "kill") || (str_len name == 4 && str_eq name "exit") || (str_len name == 9 && str_eq name "terminate") then
+    (if (if alive then false else true) then recv
+     else if tid == me then
+       (if me == sch_main () then raise_system_exit world 0 "exit"
+        else (let _ = map_set ivars (k ++ "@__tst") (mkstr "aborting") in
+              raise_exc world "__ThreadPark" "kill"))
+     else (let _ = pend (VExc ("__ThreadPark", "kill")) in recv))
+  else if (str_len name == 5 && str_eq name "raise") then
+    // no argument is RuntimeError "" (measured on 4.0.6, both ways round)
+    (if tid == me then kernel_raise_now world (match args with Nil -> Cons (mkstr "", Nil) | _ -> args)
+     else if (if alive then false else true) then VNil
+     else (let e = (match args with Nil -> VExc ("RuntimeError", "") | _ -> make_exc_w world args) in
+           let _ = pend e in VNil))
+  else if (str_len name == 6 && str_eq name "wakeup") || (str_len name == 3 && str_eq name "run") then
+    (if (if alive then false else true) then raise_exc world "ThreadError" "killed thread"
+     else
+       (let kind = sch_wait_kind tid in
+        let _ = (if kind == 1 || kind == 2 || kind == 3 then sch_unpark tid else ()) in
+        let _ = (if (str_len name == 3) then (let _ = sch_pass world in ()) else ()) in
+        recv))
+  else VNil
+and thread_join_sch = fn env -> fn world -> fn (recv: Val) -> fn (tid: int) -> fn (name: str) -> fn (limit: Val) -> fn (alive: bool) -> fn (me: int) ->
+  let (_, _, _, ivars) = world in
+  let k = str_of_int tid in
+  if alive && tid == me then raise_exc world "ThreadError" "Target thread must not be current thread"
+  else if alive && tid == sch_main () then raise_exc world "ThreadError" "Target thread must not be main thread"
+  else if (if map_has sch_live tid then sch_join env world tid limit else false) then VNil
+  else if map_has ivars (k ++ "@__texc") then flow_value (re_raise world (map_get ivars (k ++ "@__texc")))
+  else if (str_len name == 5) then (if map_has ivars (k ++ "@__tval") then map_get ivars (k ++ "@__tval") else VNil)
+  else recv
+// a Fiber scheduler answers for this fiber: the thread has one and the
+// fiber is not blocking
+and fb_sched_here = fn (u: unit) ->
+  map_has fb_sched (fb_thread_of (fb_cur ())) && (if fb_blocking_now () then false else true)
+and fb_sched_sleep = fn env -> fn world -> fn (args: Val list) ->
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  invoke_val_c env world noblk (map_get fb_sched (fb_thread_of (fb_cur ()))) "kernel_sleep" args false
+// the frames of a thread that is not running, innermost first, read off the
+// stack it stopped on
+and sch_backtrace = fn (t: int) ->
+  let f = (if map_has sch_fb t then map_get sch_fb t else 0 - 1) in
+  if f < 0 then (Nil : Val list)
+  else (let (lo2, hi) = fb_stack_lohi f in
+        let rec go = fn (d: int) ->
+          if d < lo2 then (Nil : Val list) else Cons (mkstr (frame_str d), go (d - 1)) in
+        go (hi - 1))
+// join: wait for t to end, or for the limit to run out (answers true then)
+and sch_join = fn env -> fn world -> fn (t: int) -> fn (limit: Val) ->
+  let dl = sch_deadline env world limit in
+  let rec go = fn (u: unit) ->
+    if map_has sch_live t then (if sch_block world 8 t dl then true else go ()) else false in
+  go ()
 // The class of an Enumerator / Lazy / Chain OBJECT whose #initialize is the
 // builtin one, or "" -- the receivers enum_init serves
 and enum_init_cls = fn world -> fn (v: Val) -> fn (name: str) ->
@@ -30876,7 +31496,12 @@ and thread_inspect = fn world -> fn (v: Val) ->
      let loc = (match (if map_has iv9 (k ++ "@__tloc") then map_get iv9 (k ++ "@__tloc") else VNil) with
                 | VStr h -> " " ++ sget h | _ -> "") in
      let st = (match (if map_has iv9 (k ++ "@__tst") then map_get iv9 (k ++ "@__tst") else VBool false) with
-               | VStr h -> sget h | _ -> "dead") in
+               // under the scheduler a waiting thread is "sleep", or
+               // "sleep_forever" when only another thread can end the wait
+               | VStr h -> (if fb_can_suspend && sch_status_sleeping oid
+                            then (if sch_sleep_forever oid then "sleep_forever" else "sleep")
+                            else sget h)
+               | _ -> "dead") in
      "#<" ++ cls_display world (obj_print_cls world (map_get o9 oid)) ++ ":0x" ++ hex_pad16 oid ++ nm ++ loc ++ " " ++ st ++ ">")
   | _ -> "#<Thread>"
 // ...as a String: BINARY, unless a name made it UTF-8 (ruby's answer)
@@ -33924,6 +34549,8 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
   | Cons (s, rest) ->
     // where this statement's allocations begin (fb_wm in m_fiber.mere)
     let _ = fb_wm_stmt () in
+    // ...and, with more than one thread alive, the preemption count (sch_tick)
+    let _ = (if map_len sch_live > 1 then sch_tick world else ()) in
     (match rest with
      // The LAST statement of a body used to run bare, on the grounds that its
      // value is the body's result. But "bare" means "into whatever region is

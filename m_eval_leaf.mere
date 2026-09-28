@@ -345,6 +345,10 @@ and any_class_matches = fn world -> fn (ecls: str) -> fn (classes: str list) ->
   | Nil -> false
   | Cons (c, rest) ->
     if exc_is_a world ecls c then true
+    // every exception is an Object, a BasicObject and a Kernel, and the
+    // builtin chain stops at Exception: `rescue Object => e` rescued nothing
+    // (only here -- exc_is_a answers class-chain questions for everything)
+    else if str_eq c "Object" || str_eq c "BasicObject" || str_eq c "Kernel" then true
     // A rescue clause names a CONSTANT, and a constant can hold a class under
     // another name: `Err = Class.new(StandardError)` is how most gems declare
     // one, and `Alias = ArgumentError` happens too. Matching the written name
@@ -1278,18 +1282,19 @@ and thread_cls_name = fn (name: str) ->
   (str_len name == 19 && str_eq name "report_on_exception") || (str_len name == 20 && str_eq name "report_on_exception=") ||
   (str_len name == 15 && str_eq name "ignore_deadlock") || (str_len name == 16 && str_eq name "ignore_deadlock=") ||
   (str_len name == 16 && str_eq name "default_internal") || (str_len name == 17 && str_eq name "default_internal=") ||
-  (str_len name == 20 && str_eq name "each_caller_location")
+  (str_len name == 20 && str_eq name "each_caller_location") ||
+  (str_len name == 16 && str_eq name "handle_interrupt") || (str_len name == 18 && str_eq name "pending_interrupt?")
 
 // Thread's public INSTANCE methods that the dispatcher's Thread arm answers:
 // builtin_owns_here reads it and public_instance_methods lists it.
 and thread_inst_names = fn (u: unit) ->
-  Cons ("value", Cons ("join", Cons ("status", Cons ("alive?", Cons ("stop?", Cons ("kill", Cons ("exit",
+  Cons ("pending_interrupt?", Cons ("value", Cons ("join", Cons ("status", Cons ("alive?", Cons ("stop?", Cons ("kill", Cons ("exit",
   Cons ("terminate", Cons ("raise", Cons ("to_s", Cons ("inspect", Cons ("[]", Cons ("[]=", Cons ("name",
   Cons ("name=", Cons ("fetch", Cons ("key?", Cons ("group", Cons ("keys", Cons ("thread_variables",
   Cons ("priority", Cons ("priority=", Cons ("abort_on_exception", Cons ("abort_on_exception=",
   Cons ("report_on_exception", Cons ("report_on_exception=", Cons ("thread_variable_get",
   Cons ("thread_variable_set", Cons ("thread_variable?", Cons ("set_trace_func",
-  Cons ("wakeup", Cons ("run", Cons ("backtrace", Cons ("backtrace_locations", Nil))))))))))))))))))))))))))))))))))
+  Cons ("wakeup", Cons ("run", Cons ("backtrace", Cons ("backtrace_locations", Nil)))))))))))))))))))))))))))))))))))
 
 // Fiber's class and instance surfaces. The dispatcher's arms are GUARDED by
 // these, and both reflection doors read them, so the three cannot drift apart.
@@ -5070,47 +5075,68 @@ and stdlib_src = fn (name: str) ->
     "class UNIXServer < UNIXSocket\n" ++
     "end\n"
   else
-  // Thread bodies run synchronously here, so a monitor never actually blocks:
-  // the counter is kept so mon_owned? and re-entry answer honestly.
+  // A monitor is a Mutex, an owner and a count, and its condition variable is
+  // a ConditionVariable on that mutex -- so under the scheduler entering a
+  // held monitor waits, and wait / signal are real.
   if str_eq n "monitor" then
     "module MonitorMixin\n" ++
     "  class ConditionVariable\n" ++
-    "    def initialize(monitor); @monitor = monitor; end\n" ++
-    "    def wait(timeout = nil); false; end\n" ++
-    "    def signal; nil; end\n" ++
-    "    def broadcast; nil; end\n" ++
+    "    def initialize(monitor); @monitor = monitor; @cond = Thread::ConditionVariable.new; end\n" ++
+    "    def wait(timeout = nil)\n" ++
+    "      @monitor.mon_check_owner\n" ++
+    "      count = @monitor.__send__(:mon_exit_for_cond)\n" ++
+    "      begin\n" ++
+    "        @cond.wait(@monitor.__send__(:mon_mutex), timeout)\n" ++
+    "      ensure\n" ++
+    "        @monitor.__send__(:mon_enter_for_cond, count)\n" ++
+    "      end\n" ++
+    "      true\n" ++
+    "    end\n" ++
+    "    def wait_while; wait while yield; end\n" ++
+    "    def wait_until; wait until yield; end\n" ++
+    "    def signal; @monitor.mon_check_owner; @cond.signal; end\n" ++
+    "    def broadcast; @monitor.mon_check_owner; @cond.broadcast; end\n" ++
     "  end\n" ++
     "  def initialize(*args)\n" ++
     "    super\n" ++
     "    mon_initialize\n" ++
     "  end\n" ++
-    "  # ⚠ THE OWNER IS A THREAD, and leaving a monitor you do not hold is\n" ++
-    "  # an error. mon_exit decremented a counter below zero and answered nil,\n" ++
-    "  # so an unbalanced exit went unnoticed; ruby raises ThreadError\n" ++
-    "  # (\"current fiber not owner\"), as does mon_check_owner.\n" ++
-    "  def mon_initialize; @mon_count = 0; @mon_owner = nil; self; end\n" ++
+    "  # the owner is a thread; leaving a monitor you do not hold is ThreadError\n" ++
+    "  # (\"current fiber not owner\"), as it is mon_check_owner's\n" ++
+    "  def mon_initialize; @mon_mutex = Thread::Mutex.new; @mon_count = 0; @mon_owner = nil; self; end\n" ++
     "  def mon_enter\n" ++
-    "    @mon_owner = Thread.current if (@mon_count || 0) == 0\n" ++
-    "    @mon_count = (@mon_count || 0) + 1\n" ++
+    "    if @mon_owner.equal?(Thread.current)\n" ++
+    "      @mon_count += 1\n" ++
+    "    else\n" ++
+    "      @mon_mutex.lock\n" ++
+    "      @mon_owner = Thread.current\n" ++
+    "      @mon_count = 1\n" ++
+    "    end\n" ++
     "    nil\n" ++
     "  end\n" ++
     "  def mon_exit\n" ++
     "    mon_check_owner\n" ++
     "    @mon_count -= 1\n" ++
-    "    @mon_owner = nil if @mon_count == 0\n" ++
+    "    if @mon_count == 0\n" ++
+    "      @mon_owner = nil\n" ++
+    "      @mon_mutex.unlock\n" ++
+    "    end\n" ++
     "    nil\n" ++
     "  end\n" ++
-    "  def mon_owned?; (@mon_count || 0) > 0 && @mon_owner.equal?(Thread.current); end\n" ++
-    "  def mon_locked?; (@mon_count || 0) > 0; end\n" ++
+    "  def mon_owned?; @mon_count > 0 && @mon_owner.equal?(Thread.current); end\n" ++
+    "  def mon_locked?; @mon_mutex.locked?; end\n" ++
     "  def mon_check_owner\n" ++
     "    raise ThreadError, \"current fiber not owner\" unless mon_owned?\n" ++
     "    nil\n" ++
     "  end\n" ++
-    "  # ...and another thread holding it is a refusal, not an entry: this\n" ++
-    "  # answered true whoever the owner was (ruby's try_enter never waits)\n" ++
     "  def mon_try_enter\n" ++
-    "    return false if (@mon_count || 0) > 0 && !@mon_owner.equal?(Thread.current)\n" ++
-    "    mon_enter\n" ++
+    "    if @mon_owner.equal?(Thread.current)\n" ++
+    "      @mon_count += 1\n" ++
+    "      return true\n" ++
+    "    end\n" ++
+    "    return false unless @mon_mutex.try_lock\n" ++
+    "    @mon_owner = Thread.current\n" ++
+    "    @mon_count = 1\n" ++
     "    true\n" ++
     "  end\n" ++
     "  def try_mon_enter; mon_try_enter; end\n" ++
@@ -5124,6 +5150,18 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "  def synchronize(&b); mon_synchronize(&b); end\n" ++
     "  def new_cond; MonitorMixin::ConditionVariable.new(self); end\n" ++
+    "  private\n" ++
+    "  def mon_mutex; @mon_mutex; end\n" ++
+    "  def mon_exit_for_cond\n" ++
+    "    count = @mon_count\n" ++
+    "    @mon_owner = nil\n" ++
+    "    @mon_count = 0\n" ++
+    "    count\n" ++
+    "  end\n" ++
+    "  def mon_enter_for_cond(count)\n" ++
+    "    @mon_owner = Thread.current\n" ++
+    "    @mon_count = count\n" ++
+    "  end\n" ++
     "end\n" ++
     "class Monitor\n" ++
     "  include MonitorMixin\n" ++

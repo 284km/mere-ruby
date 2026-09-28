@@ -46,8 +46,8 @@ r.value                            # mere-ruby: 42, ruby: 42
 
 A `Ractor` in this interpreter keeps its block and runs it in the thread that
 first asks for what it produced: `#value`, `#join`, a read of a port it writes
-to, or `Ractor.select`. That is the same choice `Thread` makes here (the block
-runs where it is created), and it reproduces 28 of the 34 pairs in CRuby's
+to, or `Ractor.select`. (That was also `Thread`'s model until threads got a
+scheduler; see the section on it.) It reproduces 28 of the 34 pairs in CRuby's
 `bootstraptest/test_ractor.rb`.
 
 **What it cannot model.** Two bodies running at once, and the isolation that
@@ -159,15 +159,60 @@ no fiber, no hold on the collector. A generator, a Lazy, an object's own
 KILLS its fiber, so the source's `ensure` runs then; ruby leaves the abandoned
 fiber to the collector, which does not run it.
 
-**Threads are not scheduled by this.** `Thread.new` still runs its body at
-once (see the synchronous model); a Thread body gets a root fiber of its own,
-so `Fiber.current`, fiber storage and `Thread#[]` inside it answer as ruby's.
+**Threads are scheduled on the same coroutines.** A Thread's body runs on a
+coroutine of its own (its root fiber), and one thread runs at a time; see
+"Threads take turns on one OS thread" below.
 
 **The builds without coroutines** -- the Wasm playground (core Wasm cannot
 switch stacks) and the RV targets (one stack) -- compile
 `m_fiber_nothreads.mere` in `m_fiber_coro.mere`'s place
 (`tools/nothreads_tree.sh`): a fiber runs to completion on its first `#resume`
 and `Fiber.yield` is `NotImplementedError`.
+
+## Threads take turns on one OS thread
+
+```ruby
+q = Queue.new
+c = Thread.new { 3.times.map { q.pop } }
+3.times { |i| q << i }
+p c.value          # [0, 1, 2], as in ruby
+```
+
+A Thread's body runs on a coroutine of its own and exactly one thread runs at
+a time (`m_sched.mere` is the scheduler, the evaluator's half is next to
+`thread_start`). The rules are ruby's, measured on 4.0.6: a new thread goes to
+the end of the run queue and its creator keeps running; waking a thread (a
+push, an unlock, a signal, `#wakeup`, `#raise`, `#kill`) makes it runnable and
+the waker keeps running; every queue is FIFO and nothing is handed over (an
+unlock leaves the mutex unlocked for whoever runs first). `join`, `value`,
+`sleep`, `Thread.stop`, `Queue#pop`, `SizedQueue#push`, `Mutex#lock` and
+`#sleep`, `ConditionVariable#wait` (which calls `#sleep` on its object, as
+ruby's does) and `Monitor` really wait. `Thread#raise` and `#kill` are
+delivered where the target waits, on its own stack; `Thread.handle_interrupt`
+masks them (`:never`, `:on_blocking`). When nothing can run and every live
+thread waits on another, the main thread gets `fatal` -- with ruby's first line
+only, not the list of threads and addresses after it.
+
+**Where it differs.**
+
+- **Preemption is by count, not by time**: a thread that never waits lets the
+  others run every 20,000 statements (ruby switches every 100 ms). A program
+  whose output depends on how far a spinning thread gets in a time slice
+  prints something else; one that waits (or calls `Thread.pass`) matches.
+- **One core**: nothing runs in parallel, so a CPU-bound program with four
+  threads takes four times as long.
+- **A blocking system call blocks every thread**: a `read` from a pipe that
+  has no data stops the process, not just the thread that asked.
+- When the main thread ends, the others are not killed and their `ensure`
+  clauses do not run; the process just exits.
+- A dying thread's report on `$stderr` has ruby's first line and
+  `full_message`, but not error_highlight's excerpt of the source line, and a
+  frame inside a block is labelled as mere-ruby labels it (see the Thread
+  backtrace notes).
+
+The builds without coroutines keep the model this replaced: the body runs at
+`Thread.new`, a wait parks the thread for good, and a wait on the main thread
+with nobody to wake it is the deadlock `fatal`.
 
 ## ENV is read through a subprocess, so it carries the shell's own variables
 

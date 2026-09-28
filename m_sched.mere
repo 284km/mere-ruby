@@ -1,0 +1,221 @@
+// ---- Threads, scheduled: the world-free half --------------------------------
+//
+// A Thread's body runs on a coroutine of its own (its root fiber, see
+// m_fiber.mere), and exactly one thread runs at a time. This file is the
+// scheduler those threads share: who may run, who is waiting on what, and
+// who runs next. The evaluator (thread_start, the Queue / Mutex /
+// ConditionVariable / sleep / join arms) asks it, and does the switching
+// through fb_switch.
+//
+// The rules are ruby's, measured on 4.0.6 (3 to 10 runs each):
+// - A new thread goes to the END of the run queue and its creator keeps
+//   running. Waking a thread (push, unlock, signal, wakeup, raise, kill)
+//   makes it runnable and the waker keeps running.
+// - Every queue is FIFO: the run queue, and the waiters on each object.
+//   Nothing is handed over: an unlock leaves the mutex unlocked, and the
+//   woken waiter takes it when it runs -- or finds it taken and waits again.
+// - Two kinds of waiting. Kernel#sleep and every wait with a time limit do
+//   not count towards a deadlock (ruby just stops). Thread.stop, a contended
+//   lock, a pop from an empty queue, a push to a full one, a condition wait
+//   and a join with no limit do; when nothing can run and every live thread
+//   is in one of those, the main thread gets `fatal`.
+//
+// A thread is named by its Thread object's id. 0 is never one: the main
+// thread's object is made by the driver and recorded here (sch_main).
+//
+// A build without coroutines keeps the synchronous model (m_fiber_nothreads
+// sets fb_can_suspend false, and the evaluator never comes here).
+
+// "main": the main thread's id. "seq": the next wait-order number.
+// "qh" / "qt": head and tail of the run queue.
+let sch_st = map_new ();
+// the run queue: position -> thread id (-1 once taken)
+let sch_q = map_new ();
+// thread id -> 1 while it is in the run queue
+let sch_queued = map_new ();
+// thread id -> the fiber it was running when it stopped (the one to switch to)
+let sch_fb = map_new ();
+// thread id -> what it waits for: 1 Kernel#sleep with a limit, 2 Kernel#sleep
+// for ever, 3 Thread.stop, 4 a queue to fill, 5 a queue to drain (sized push),
+// 6 a mutex, 7 a condition variable, 8 a thread to end. Absent: runnable.
+let sch_wait = map_new ();
+// thread id -> the object it waits on (queue, mutex, condition variable or
+// thread id); the deadline in nanoseconds when there is one; the order in
+// which it began to wait
+let sch_wobj = map_new ();
+let sch_dl = map_new ();
+let sch_wseq = map_new ();
+// thread id -> 1 once its wait timed out (the waiter asks, then it is cleared)
+let sch_timedout = map_new ();
+// thread id -> 1 while it is alive under the scheduler (started, not ended)
+let sch_live = map_new ();
+// mutex id -> the thread holding it, so a thread that ends can let go of them
+let mtx_thr = map_new ();
+
+let sch_main = fn (u: unit) -> if map_has sch_st "main" then map_get sch_st "main" else 0 - 1;
+let sch_now = fn (u: unit) -> int_of_float (time () * 1000000000.0);
+
+let sch_enqueue = fn (t: int) ->
+  if map_has sch_queued t then ()
+  else (let n = (if map_has sch_st "qt" then map_get sch_st "qt" else 0) in
+        let _ = map_set sch_q n t in
+        let _ = map_set sch_queued t 1 in
+        map_set sch_st "qt" (n + 1));
+// the next runnable thread in queue order, or -1
+let sch_dequeue = fn (u: unit) ->
+  let rec go = fn (u2: unit) ->
+    let h = (if map_has sch_st "qh" then map_get sch_st "qh" else 0) in
+    let t = (if map_has sch_st "qt" then map_get sch_st "qt" else 0) in
+    if h >= t then 0 - 1
+    else (let k = map_get sch_q h in
+          let _ = map_delete sch_q h in
+          let _ = map_set sch_st "qh" (h + 1) in
+          if map_has sch_queued k then (let _ = map_delete sch_queued k in k) else go ()) in
+  go ();
+let sch_runnable_n = fn (u: unit) -> map_len sch_queued;
+
+// a wait that counts towards a deadlock
+let sch_counts = fn (kind: int) -> kind >= 3;
+let sch_waiting = fn (t: int) -> map_has sch_wait t;
+let sch_wait_kind = fn (t: int) -> if map_has sch_wait t then map_get sch_wait t else 0;
+
+// t stops being runnable and waits: for kind on obj, until dl (0 = no limit)
+let sch_park = fn (t: int) -> fn (kind: int) -> fn (obj: int) -> fn (dl: int) ->
+  let s = (if map_has sch_st "seq" then map_get sch_st "seq" else 0) in
+  let _ = map_set sch_st "seq" (s + 1) in
+  let _ = map_set sch_wait t kind in
+  let _ = map_set sch_wobj t obj in
+  let _ = map_set sch_wseq t s in
+  let _ = (if dl > 0 then map_set sch_dl t dl else (if map_has sch_dl t then map_delete sch_dl t else ())) in
+  (if map_has sch_queued t then map_delete sch_queued t else ());
+// t is runnable again (its wait is over, whatever ended it)
+let sch_unpark = fn (t: int) ->
+  let _ = (if map_has sch_wait t then map_delete sch_wait t else ()) in
+  let _ = (if map_has sch_wobj t then map_delete sch_wobj t else ()) in
+  let _ = (if map_has sch_dl t then map_delete sch_dl t else ()) in
+  let _ = (if map_has sch_wseq t then map_delete sch_wseq t else ()) in
+  sch_enqueue t;
+
+// the waiters of kind on obj, in the order they began to wait
+let sch_waiters = fn (kind: int) -> fn (obj: int) ->
+  let found = map_new () in
+  let _ = map_iter sch_wait (fn (t: int) -> fn (k: int) ->
+    if k == kind && map_has sch_wobj t && map_get sch_wobj t == obj
+    then map_set found (map_get sch_wseq t) t else ()) in
+  let keys = map_new () in
+  let _ = map_iter found (fn (s: int) -> fn (t: int) -> map_set keys (map_len keys) s) in
+  // sort the few wait numbers (insertion sort: a handful of waiters)
+  let rec ins = fn (xs: int list) -> fn (x: int) ->
+    match xs with
+    | Nil -> Cons (x, Nil)
+    | Cons (h, r) -> if x < h then Cons (x, xs) else Cons (h, ins r x) in
+  let rec build = fn (i: int) -> fn (acc: int list) ->
+    if i >= map_len keys then acc else build (i + 1) (ins acc (map_get keys i)) in
+  let rec to_t = fn (xs: int list) ->
+    match xs with Nil -> (Nil : int list) | Cons (s, r) -> Cons (map_get found s, to_t r) in
+  to_t (build 0 Nil);
+let sch_waiters_n = fn (kind: int) -> fn (obj: int) ->
+  let n = map_new () in
+  let _ = map_iter sch_wait (fn (t: int) -> fn (k: int) ->
+    if k == kind && map_has sch_wobj t && map_get sch_wobj t == obj then map_set n t 1 else ()) in
+  map_len n;
+// wake the first waiter of kind on obj; true when there was one
+let sch_wake_one = fn (kind: int) -> fn (obj: int) ->
+  match sch_waiters kind obj with
+  | Nil -> false
+  | Cons (t, _) -> let _ = sch_unpark t in true;
+let sch_wake_all = fn (kind: int) -> fn (obj: int) ->
+  let rec go = fn (xs: int list) ->
+    match xs with Nil -> () | Cons (t, r) -> let _ = sch_unpark t in go r in
+  go (sch_waiters kind obj);
+
+// the earliest deadline among the waiting threads, or 0
+let sch_next_deadline = fn (u: unit) ->
+  let best = map_new () in
+  let _ = map_iter sch_dl (fn (t: int) -> fn (d: int) ->
+    if map_has best 0 && map_get best 0 <= d then () else map_set best 0 d) in
+  if map_has best 0 then map_get best 0 else 0;
+// wake every thread whose deadline has passed, in the order they began to wait
+let sch_expire = fn (now: int) ->
+  let due = map_new () in
+  let _ = map_iter sch_dl (fn (t: int) -> fn (d: int) ->
+    if d <= now then map_set due (if map_has sch_wseq t then map_get sch_wseq t else 0) t else ()) in
+  let order = map_new () in
+  let _ = map_iter due (fn (s: int) -> fn (t: int) -> map_set order (map_len order) s) in
+  let rec ins = fn (xs: int list) -> fn (x: int) ->
+    match xs with
+    | Nil -> Cons (x, Nil)
+    | Cons (h, r) -> if x < h then Cons (x, xs) else Cons (h, ins r x) in
+  let rec build = fn (i: int) -> fn (acc: int list) ->
+    if i >= map_len order then acc else build (i + 1) (ins acc (map_get order i)) in
+  let rec wake = fn (xs: int list) ->
+    match xs with
+    | Nil -> ()
+    | Cons (s, r) -> (let t = map_get due s in
+                      let _ = map_set sch_timedout t 1 in
+                      let _ = sch_unpark t in wake r) in
+  wake (build 0 Nil);
+
+// Who runs next. -1: nobody can, and every live thread waits in a way that
+// counts (a deadlock). -2: nobody can, and someone sleeps for ever in
+// Kernel#sleep (ruby stops there; so does this, by sleeping).
+let sch_pick = fn (u: unit) ->
+  let rec go = fn (u2: unit) ->
+    // a deadline that has passed makes its thread runnable even while others
+    // are: a sleeper must not wait for the busy ones to finish
+    let _ = (if map_len sch_dl > 0 then sch_expire (sch_now ()) else ()) in
+    let t = sch_dequeue () in
+    if t >= 0 then t
+    else (let d = sch_next_deadline () in
+          if d > 0 then
+            (let now = sch_now () in
+             let _ = (if d > now then fb_os_sleep ((d - now + 999999) / 1000000) else ()) in
+             let _ = sch_expire (sch_now ()) in
+             go ())
+          else (let uncounted = map_new () in
+                let _ = map_iter sch_wait (fn (t2: int) -> fn (k: int) ->
+                  if sch_counts k then () else map_set uncounted t2 1) in
+                if map_len uncounted > 0 then 0 - 2 else 0 - 1)) in
+  go ();
+
+// ---- condition variables: who is in whose line ------------------------------
+// thread id -> the condition variable it waits on, and its place in line
+let sch_cvw = map_new ();
+let sch_cvs = map_new ();
+let sch_cv_join = fn (t: int) -> fn (cv: int) ->
+  let s = (if map_has sch_st "seq" then map_get sch_st "seq" else 0) in
+  let _ = map_set sch_st "seq" (s + 1) in
+  let _ = map_set sch_cvw t cv in
+  map_set sch_cvs t s;
+let sch_cv_leave = fn (t: int) ->
+  let _ = (if map_has sch_cvw t then map_delete sch_cvw t else ()) in
+  (if map_has sch_cvs t then map_delete sch_cvs t else ());
+// wake the first in cv's line (or all of them): out of the line, and out of
+// the sleep it is in -- a thread that is not asleep any more just leaves
+let sch_cv_wake = fn (cv: int) -> fn (all: bool) ->
+  let line = map_new () in
+  let _ = map_iter sch_cvw (fn (t: int) -> fn (c: int) ->
+    if c == cv then map_set line (map_get sch_cvs t) t else ()) in
+  let order = map_new () in
+  let _ = map_iter line (fn (s: int) -> fn (t: int) -> map_set order (map_len order) s) in
+  let rec ins = fn (xs: int list) -> fn (x: int) ->
+    match xs with
+    | Nil -> Cons (x, Nil)
+    | Cons (h, r) -> if x < h then Cons (x, xs) else Cons (h, ins r x) in
+  let rec build = fn (i: int) -> fn (acc: int list) ->
+    if i >= map_len order then acc else build (i + 1) (ins acc (map_get order i)) in
+  let rec wake = fn (xs: int list) ->
+    match xs with
+    | Nil -> ()
+    | Cons (s, r) ->
+      (let t = map_get line s in
+       let _ = sch_cv_leave t in
+       let k = sch_wait_kind t in
+       let _ = (if k == 1 || k == 2 || k == 3 then sch_unpark t else ()) in
+       if all then wake r else ()) in
+  wake (build 0 Nil);
+
+// the status word of a live thread: "sleep" while it waits, "run" otherwise
+let sch_status_sleeping = fn (t: int) -> map_has sch_wait t;
+// ...and in #inspect, whether that sleep can only end by someone else's doing
+let sch_sleep_forever = fn (t: int) -> sch_counts (sch_wait_kind t) && (if map_has sch_dl t then false else true);
