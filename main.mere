@@ -1862,22 +1862,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Rational()/Complex()/Hash().
     // top-level `autoload :Const, "path"` (implicit self is main, so it
     // registers in Object's namespace like Ruby's Kernel#autoload).
+    // ⚠ ...and not in self's class: ruby's Kernel#autoload registers in the
+    //   CALLER'S LEXICAL CLASS (the cref), so the call inside a method of an
+    //   included module lands on that module, and one inside a Class.new
+    //   body's method on the anonymous class. Reading self answered Object
+    //   for both. (A bare autoload inside a module body is the module either
+    //   way.)
     if (str_len name == 8 && str_eq name "autoload") && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then
-      (match args with
-       | Cons (nm, Cons (pv, _)) ->
-         let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
-         // a bare autoload inside a module body registers in THAT module, not
-         // at top level: self is the module there.
-         let ns = (match lv_get env "self" with VClass c0 -> (if str_eq c0 "Object" then "" else c0) | _ -> "") in
-         let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
-         let _ = map_set autoloads key (mkstr (match pv with VStr h -> sget h | _ -> "")) in
-         VNil
-       | _ -> VNil)
+      autoload_register env world (autoload_cref env) args
     else if (str_len name == 9 && str_eq name "autoload?") && (match args with Cons (_, _) -> true | _ -> false) then
       (match args with
        | Cons (nm, _) ->
          let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
-         let ns = (match lv_get env "self" with VClass c0 -> (if str_eq c0 "Object" then "" else c0) | _ -> "") in
+         let ns = autoload_cref env in
          let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
          (if map_has autoloads key then map_get autoloads key else VNil)
        | _ -> VNil)
@@ -7883,6 +7880,40 @@ and const_walk_go = fn env -> fn world -> fn blk -> fn (sofar: str) -> fn (rest:
     then const_walk_go env world blk key (const_tail rest)
     else VNil
 
+// the namespace a bare (or Kernel.) autoload registers in: the lexical class
+// of the code calling it -- a method's cref, else the class body being run --
+// with the top level (Object) as "".
+and autoload_cref = fn env ->
+  // a method's own class first: a `def` inside Class.new { } belongs to the
+  // anonymous class, while its written (lexical) scope is the outside
+  let dc9 = (if lv_has env "__defcls" then (match lv_get env "__defcls" with VClass c9 -> c9 | _ -> "") else "") in
+  let cr0 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h9 -> sget h9 | _ -> "") else "") in
+  let cr9 = (if str_eq dc9 "" || is_sng_cls dc9 then cr0 else dc9) in
+  let ns9 = (if str_eq cr9 ""
+             then (match lv_get env "self" with VClass c0 -> c0 | _ -> cur_lex ())
+             else cr9) in
+  if str_eq ns9 "Object" then "" else ns9
+// autoload(:Const, path) into namespace `ns` ("" is Object): the path as ruby
+// takes it (a String, or an object's #to_path; nil or anything else is a
+// TypeError and "" an ArgumentError), and a frozen namespace refuses.
+and autoload_register = fn env -> fn world -> fn (ns: str) -> fn (args: Val list) ->
+  (match args with
+   | Cons (nm, Cons (pv, _)) ->
+     let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
+     let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let pv9 = (match pv with
+                | VStr _ -> pv
+                | VObj _ -> (if responds world pv "to_path" then invoke_val_c env world nb9 pv "to_path" Nil false else pv)
+                | _ -> pv) in
+     let pth = (match pv9 with
+                | VStr h -> sget h
+                | _ -> (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ conv_name pv9 ++ " into String") in "")) in
+     let _ = (if str_eq pth "" then (let _ = raise_exc world "ArgumentError" "empty feature name" in ()) else ()) in
+     let _ = frz_cls_check world (if str_eq ns "" then "Object" else ns) in
+     let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
+     let _ = map_set autoloads key (mkstr pth) in
+     VNil
+   | _ -> VNil)
 and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
   if map_has autoloads key then
     (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
@@ -14243,21 +14274,28 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     // Module#autoload(:Const, path) / #autoload?(:Const). The registration is
     // qualified with the receiver, so Gem.autoload :Requirement, "..." answers
     // a later Gem::Requirement.
+    // (Kernel.autoload is Kernel#autoload's, with the caller's cref, not
+    // Kernel's namespace)
     else if (str_len name == 8 && str_eq name "autoload") then
-      (match args with
-       | Cons (nm, Cons (pv, _)) ->
-         let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
-         let pth = (match pv with VStr h -> sget h | _ -> "") in
-         let key = (if str_eq c "Object" then cn else c ++ "::" ++ cn) in
-         let _ = map_set autoloads key (mkstr pth) in
-         VNil
-       | _ -> VNil)
+      autoload_register env world (if str_eq c "Kernel" then autoload_cref env else if str_eq c "Object" then "" else c) args
+    // ...and it asks the ANCESTORS too, unless told not to: a superclass's or
+    // an included module's registration is the class's (Object's included,
+    // for a class; a module has no Object above it)
     else if (str_len name == 9 && str_eq name "autoload?") then
       (match args with
-       | Cons (nm, _) ->
+       | Cons (nm, rest9) ->
          let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
-         let key = (if str_eq c "Object" then cn else c ++ "::" ++ cn) in
-         (if map_has autoloads key then map_get autoloads key else VNil)
+         let key_in = fn (ns9: str) -> (if str_eq ns9 "" || str_eq ns9 "Object" then cn else ns9 ++ "::" ++ cn) in
+         let own9 = (if str_eq c "Kernel" then autoload_cref env else if str_eq c "Object" then "" else c) in
+         let inherit9 = (match rest9 with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+         if map_has autoloads (key_in own9) then map_get autoloads (key_in own9)
+         else if inherit9 && (if str_eq c "Kernel" then false else true) then
+           (let rec walk9 = fn (xs: str list) ->
+              (match xs with
+               | Nil -> VNil
+               | Cons (a9, t9) -> (if map_has autoloads (key_in a9) then map_get autoloads (key_in a9) else walk9 t9)) in
+            walk9 (ancestors_of world c))
+         else VNil
        | _ -> VNil)
     // Module#deprecate_constant marks a constant as deprecated; the constant
     // keeps working and CRuby only warns on use, which mere-ruby does not do.
