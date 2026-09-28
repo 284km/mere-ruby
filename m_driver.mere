@@ -793,6 +793,23 @@ let core_prelude_d =
   // a broken sequence is found by the transcoders' own rules (__bad_seq) so
   // the errors carry ruby's bytes, stages and messages.
   "class Enumerator\n" ++
+  "  # External iteration (#next, #peek, #feed) runs #each on a Fiber of its own\n" ++
+  "  # and suspends it at every element: what a source yields is handed out one\n" ++
+  "  # at a time, and what #feed gave is what that yield returns. The source is\n" ++
+  "  # never run ahead -- an infinite one can be stepped, and a stateful one is\n" ++
+  "  # driven exactly once. The dispatcher's next/peek arm resumes this.\n" ++
+  "  def __ext_fiber\n" ++
+  "    en = self\n" ++
+  "    Fiber.new do\n" ++
+  "      r = en.each \{ |*a| Fiber.yield(a) }\n" ++
+  "      en.__ext_finish(r)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  def __ext_finish(r)\n" ++
+  "    @__x_done = true\n" ++
+  "    @__x_ret = r\n" ++
+  "    nil\n" ++
+  "  end\n" ++
   "  # Enumerator.product lives here, not beside Enumerator::Product (which is\n" ++
   "  # autoloaded): it has to answer before anything has named the constant.\n" ++
   "  # With a block it walks the product and answers nil.\n" ++
@@ -3729,12 +3746,13 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   // arenas is gone: compaction made the swap redundant, and a collection is
   // a plain function (gc_collect) callable from any depth whose in-flight
   // values are rooted.
-  let meths = map_new () in
-  // ...the world's two class tables are the globals of the same name, so a
-  // helper with no world in hand can still answer about a class (see obj_cls).
+  // ...all four are globals (see obj_cls and meths_g): a helper with no world
+  // in hand can still answer about a class, and a Fiber's thread can rebuild
+  // the world it was not handed.
+  let meths = meths_g in
   let sup = cls_sup in
   let ocls = obj_cls in
-  let ivars = map_new () in
+  let ivars = ivars_g in
   // Encoding objects (VObj of class Encoding, name in @name). Shared instances
   // stored in enc_objs; the constants point at them. String#encoding returns
   // the matching one, so `x.encoding == Encoding::UTF_8` holds by identity.
@@ -4561,7 +4579,9 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
     let _ = map_set gc_hold "lastv" lastv in
     // the stack is trivially clean here; a raise anywhere below may have
     // skipped gc_unsafe pops, so the counter self-heals at each chunk.
-    let _ = map_set gc_unsafe "n" 0 in
+    // ...except while a Fiber is suspended: its stack's pushes are real, and
+    // they are what keeps every safepoint from collecting under it.
+    let _ = (if fb_live () > 0 then () else map_set gc_unsafe "n" 0) in
     if cursor < gc_total then
       let r3 = try_or (fn (u: unit) ->
                  region DRV {
@@ -4576,7 +4596,13 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
         (let _ = map_set gc_hold "lastv" v2 in
          // a chunk also stops on its while budget, which is not pressure, so
          // GC.disable is asked here as well as in gc_pressure
-         let _ = (if gc_auto_off () then () else gc_collect env world) in
+         // ...and a suspended Fiber holds values on its own C stack that no
+         // mark can see, so a chunk boundary does not collect under it either
+         // (first giving back the fibers nobody can reach, which is what lets
+         // a program that drops a stepped Enumerator collect again)
+         let _ = (if gc_auto_off () then ()
+                  else (let _ = (if fb_live () > 0 then (let _ = fb_reclaim env world in ()) else ()) in
+                        if fb_live () > 0 then fb_defer_pressure world else gc_collect env world)) in
          gc_drive (cursor + consumed) v2)
       else if flag == 1 then gc_drive gc_total v2
       else if flag == 2 then gc_drive (gc_total + 1) lastv

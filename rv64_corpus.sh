@@ -27,7 +27,7 @@ CC="${CC:-cc}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUBYOPT="-Eutf-8${RUBYOPT:+ $RUBYOPT}"; export RUBYOPT
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/mere_ruby_rv64.XXXXXX")
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP" "${NT:-}"' EXIT
 
 echo "rv64_corpus: building the RV64 emulator"
 "$MERE" -c "$MEMU/riscv-runc/rv64i_run.mere" > "$TMP/rvrun64.c" 2>"$TMP/err" \
@@ -36,7 +36,10 @@ $CC -O2 -w -o "$TMP/rvrun64" "$TMP/rvrun64.c" 2>"$TMP/err" \
   || { echo "FAIL: cc refused the emulator"; head -5 "$TMP/err"; exit 1; }
 
 echo "rv64_corpus: compiling main.mere for RV64 (--ram $RAM)"
-if ! "$MERE" -rv64 --ram "$RAM" "$ROOT/main.mere" > "$TMP/prog.bin" 2>"$TMP/err"; then
+# (from a copy with no threads: the RISC-V backends have no `spawn`, and a
+# Fiber there runs to completion -- see tools/nothreads_tree.sh)
+NT=$(sh "$ROOT/tools/nothreads_tree.sh")
+if ! "$MERE" -rv64 --ram "$RAM" "$NT/main.mere" > "$TMP/prog.bin" 2>"$TMP/err"; then
   echo "FAIL: the RISC-V backend refused mere-ruby itself"; head -20 "$TMP/err"; exit 1
 fi
 echo "rv64_corpus: prog.bin is $(wc -c < "$TMP/prog.bin") bytes"

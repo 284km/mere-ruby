@@ -502,6 +502,11 @@ let gc_pressure = fn world ->
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
 // list this way, so the carry holds an int, never AST.
+// Fibers (one OS thread each, strict hand-off): the world-free half. It sits
+// here because it saves and restores the collector's baton (gc_bare) along
+// with the rest of a stack's state.
+import "m_fiber.mere";
+
 let rec gc_suffix = fn (xs: Stmt list) -> fn (n: int) ->
   if n <= 0 then xs
   else (match xs with Nil -> Nil | Cons (_, r) -> gc_suffix r (n - 1));
@@ -717,19 +722,39 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter rx_prog_names mk in
   let _ = map_iter gc_cenv0 mk in
   let _ = map_iter gc_hold mk in
+  // the Fiber objects, the value crossing a switch, and the saved contexts of
+  // suspended stacks. (No collection runs while a stack is suspended -- see
+  // fb_live -- so the saved contexts are marked for when that changes.)
+  let fbx = map_has gc_state "fbx" in
+  let _ = (if fbx then () else map_iter fb_obj (fn (k: int) -> fn (v: Val) -> gc_mark_val live v)) in
+  let _ = map_iter fb_xfer mk in
+  let _ = (if fbx then () else map_iter fb_sv mk) in
+  let _ = map_iter fb_storage (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
+  // the registered envs of live stacks (m_fiber.mere); the reclaim pass marks
+  // them itself, by stack
+  let _ = (if fbx then () else map_iter fb_envs mkenvi) in
+  let _ = map_iter fb_sched (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
   // arr_store and hash_store are NOT roots since the collector took them on:
   // a reachable array or hash is marked through the VArr / VHsh arms, and an
   // unreachable one is exactly what gets dropped and compacted away.
+  // (the fiber-reclaim pass leaves out the body of each SUSPENDED fiber: it
+  // belongs to that fiber, and is reached through the Fiber's own ivar when
+  // the Fiber is -- see fb_reclaim)
   let _ = map_iter proc_store (fn (k: str) -> fn pe ->
-    let (_, _, _, penv) = pe in
-    map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
+    if fbx && map_has fb_rc_pid k then ()
+    else (let (_, _, _, penv) = pe in
+          map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))) in
   // blk tuples captured for yield: their env member holds Vals
   let _ = map_iter proc_yblk (fn (k: str) -> fn b ->
     let (_, _, _, benv) = b in
     map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
   let _ = map_iter bind_store mkenv in
   // the scope-chain parents: env maps linked by id, each holding Vals
-  let _ = (if (if map_has gc_state "nolvup" then map_get gc_state "nolvup" else 0) == 1 then () else map_iter lv_up mkenvi) in
+  // (...and the parent links of a suspended fiber's active blocks, likewise)
+  let _ = (if (if map_has gc_state "nolvup" then map_get gc_state "nolvup" else 0) == 1 then ()
+           else if fbx then map_iter lv_up (fn (k: int) -> fn (benv) ->
+                              if map_has fb_rc_eid k then () else map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
+           else map_iter lv_up mkenvi) in
   ();
 
 // THE COLLECTION, as a plain function. Everything it needs reaches it
@@ -891,6 +916,91 @@ let gc_collect = fn env -> fn world ->
                + (int_of_float (time () * 1000000000.0) - t0)) in
     ()
   };
+
+// ---- giving back the fibers nobody can reach ---------------------------------
+// While a fiber is suspended nothing collects (its C stack holds values no mark
+// sees), so a fiber that is simply DROPPED -- an Enumerator stepped with #next
+// and let go, a generator abandoned half way -- would keep its thread and stop
+// collection for the rest of the run. This pass finds them. It runs only where
+// the driver collects (a top-level statement boundary: the running stack holds
+// no frame), and marks the way a collection would, except that the fiber
+// objects are not roots and the stacks of SUSPENDED fibers are not either: a
+// suspended fiber's frames count only once its Fiber object has been reached,
+// which may reach another's, to a fixed point. What is still unreached can
+// never be resumed, and is abandoned (fb_abandon). Nothing is swept here.
+let fb_reclaim = fn env -> fn world ->
+  region FBR {
+    let (_, _, _, ivars) = world in
+    let live = map_new () in
+    let cand = map_new () in
+    let _ = map_iter fb_state (fn (i: int) -> fn (st: int) -> if st == 2 then map_set cand i 0 else ()) in
+    if map_len cand == 0 then 0
+    else
+      (let _ = map_clear fb_rc_pid in
+       let _ = map_clear fb_rc_eid in
+       let _ = map_iter cand (fn (i: int) -> fn (u: int) ->
+         match (if map_has fb_obj i then map_get fb_obj i else VNil) with
+         | VObj oid -> (match (if map_has ivars (str_of_int oid ++ "@__fb_blk") then map_get ivars (str_of_int oid ++ "@__fb_blk") else VNil) with
+                        | VProc pid -> map_set fb_rc_pid (str_of_int pid) 1
+                        | _ -> ())
+         | _ -> ()) in
+       let _ = map_iter fb_env_owner (fn (key: int) -> fn (o: int) ->
+         if map_has cand o && key % 2 == 0 then map_set fb_rc_eid (key / 2) 1 else ()) in
+       let _ = map_set gc_state "fbx" 1 in
+       let _ = gc_mark_roots env live in
+       let _ = map_delete gc_state "fbx" in
+       // a stack's frames and saved slots are marked when the stack is: every
+       // non-candidate at once, a candidate once its Fiber object is reached.
+       // `inq` holds the stacks whose frames still have to be marked; each
+       // round walks the two tables ONCE (walking them per stack was the
+       // quadratic that made a few hundred dropped Enumerators take seconds).
+       let inq = map_new () in
+       let _ = map_iter fb_state (fn (i: int) -> fn (st: int) -> if map_has cand i then () else map_set inq i 1) in
+       let _ = map_set inq 0 1 in
+       let mark_queued = fn (u: unit) ->
+         let _ = map_iter fb_env_owner (fn (key: int) -> fn (o: int) ->
+           if map_has inq o
+           then (let _ = map_iter (map_get fb_envs key) (fn (k: str) -> fn (v: Val) -> gc_mark_val live v) in
+                 // a reached block's parent link, which the roots left out
+                 if key % 2 == 0 && map_has lv_up (key / 2)
+                 then map_iter (map_get lv_up (key / 2)) (fn (k: str) -> fn (v: Val) -> gc_mark_val live v)
+                 else ())
+           else ()) in
+         let _ = map_iter fb_sv (fn (k: str) -> fn (v: Val) ->
+           (let bar = str_index_of k "|" in
+            let o = (if bar > 0 then int_of_str (substring k 0 bar) else 0 - 2) in
+            if map_has inq o || o < 0 then gc_mark_val live v else ())) in
+         let _ = map_clear inq in
+         gc_fixpoint ivars live in
+       let _ = mark_queued () in
+       let rec settle = fn (guard: int) ->
+         let _ = map_iter cand (fn (i: int) -> fn (done: int) ->
+           if done == 1 then ()
+           else (match (if map_has fb_obj i then map_get fb_obj i else VNil) with
+                 | VObj oid -> (if map_has live (oid * 8) then (let _ = map_set cand i 1 in map_set inq i 1) else ())
+                 | _ -> ())) in
+         if map_len inq > 0 && guard > 0 then (let _ = mark_queued () in settle (guard - 1)) else () in
+       let _ = settle 100000 in
+       let dead = map_new () in
+       let _ = map_iter cand (fn (i: int) -> fn (done: int) -> if done == 1 then () else map_set dead i 1) in
+       let _ = map_iter dead (fn (i: int) -> fn (u: int) -> fb_abandon i) in
+       let _ = (if gc_log_on () then print_err ("gc: fiber reclaim: " ++ str_of_int (map_len cand) ++ " suspended, "
+                                                ++ str_of_int (map_len dead) ++ " unreachable and given back") else ()) in
+       map_len dead)
+  };
+
+// A fiber that is still reachable keeps the collector away, and the pressure
+// that asked for a collection is still there at the next statement: without
+// this the reclaim pass above would run at EVERY statement until the fiber
+// ends. So the thresholds move as though a collection had run, and the next
+// attempt waits until the stores have grown as much again.
+let fb_defer_pressure = fn world ->
+  let (_, _, ocls, ivars) = world in
+  let scan = map_len arr_store + vec_len hash_store + vec_len str_store in
+  let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
+  let _ = map_set gc_state "t" (map_len ivars + map_len ocls + delta) in
+  let _ = map_set gc_state "b" (gc_store_bytes ()) in
+  (if map_has gc_state "req" then map_delete gc_state "req" else ());
 
 import "m_eval_leaf.mere";
 
@@ -1456,7 +1566,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      let target = (if lv_has env "__blk_home" then lv_get env "__blk_home"
                                    else if lv_has env "__fid" then lv_get env "__fid" else VInt 0) in
                      let tk = (match target with VInt t -> t | _ -> 0 - 1) in
-                     if tk < 0 || (if map_has live_frames tk then false else true)
+                     if tk < 0 || (if fb_frame_live tk then false else true)
                      then raise_exc world "LocalJumpError" "break from proc-closure"
                      else flow_throw_breakret (match target with VInt t -> t | _ -> 0) v
                  | other -> flow_value other)
@@ -4449,7 +4559,10 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
   // A block body runs inside its ITERATOR's evaluation: unrooted values are
   // in flight above it, so its statement boundaries are not safepoints.
   let _ = gc_unsafe_push () in
+  let eidk = (if map_has cenv "__eid" then (match map_get cenv "__eid" with VInt t -> t | _ -> 0 - 1) else 0 - 1) in
+  let _ = (if eidk < 0 then () else fb_env_in (eidk * 2) cenv) in
   let f = try_or (fn (u: unit) -> run_stmts cenv world encl body) (FRaise VNil) in
+  let _ = (if eidk < 0 then () else fb_env_out (eidk * 2)) in
   let _ = gc_unsafe_pop () in
   match f with
   | FReturn v ->
@@ -4467,7 +4580,8 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
     //   internal "(unhandled return)" -- `Proc.new { return 42 }.call` after
     //   its method returned is the shape, and `break` next door has raised
     //   here all along.
-    else if (if map_has live_frames home then false else true) then
+    // (a frame on ANOTHER fiber's stack is not one this can unwind to)
+    else if (if fb_frame_live home then false else true) then
       (let _ = raise_exc_iv world "LocalJumpError" "unexpected return"
                  (Cons (("__exit_value", v), Cons (("__reason", VSym "return"), Nil))) in
        flow_rethrow "return" v)
@@ -7735,6 +7849,10 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     else if (if has_meth world cls "inspect" then false else true)
             && map_has iv2 (str_of_int oid ++ "@__t") && obj_is_a world (display_cls world cls) "Time"
     then time_str_of world v true
+    // ...and `p fiber` is Fiber#inspect, `#<Fiber:0x.. file:line (status)>`,
+    // for the same reason: the generic form printed the bookkeeping ivars
+    else if (if has_meth world cls "inspect" then false else true) && map_has iv2 (str_of_int oid ++ "@__fb_idx")
+    then fb_inspect world v
     // an #inspect that answers a NON-String is asked #to_s, and only if THAT
     // is not a String either does the default rendering stand in. #to_str is
     // never asked (the spec pins that too). `to_s other` skipped the dispatch
@@ -8769,7 +8887,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
   if ((str_len name == 5 && str_eq name "raise") || (str_len name == 4 && str_eq name "fail"))
      && (if vischeck then false else true)
      && (if has_meth world (dispatch_cls_of world recv) name then false else true)
-     && (if has_meth world (dispatch_cls_of world recv) "method_missing" then false else true) then
+     && (if has_meth world (dispatch_cls_of world recv) "method_missing" then false else true)
+     // ...except Fiber#raise, which raises in THAT fiber
+     && (if (str_len name == 5 && str_eq name "raise") && fb_is_fiber world recv then false else true) then
     (let (m9r, s9r, o9r, iv0) = world in
      let exc = (match args with
                 | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
@@ -11060,6 +11180,41 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     else if (str_eq c "Fiber" || obj_is_a world c "Fiber") && (str_len name == 3 && str_eq name "new")
             && (if has_meth world ("(sng:" ++ c ++ ")") "new" then false else true) then
       raise_exc world "ArgumentError" "tried to create Proc object without a block"
+    // Fiber's class methods (the real fibers: see fb_yield and m_fiber.mere).
+    // Guarded by the names they implement, as Thread's are.
+    else if (str_eq c "Fiber" || obj_is_a world c "Fiber") && fb_cls_name name
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      (if (str_len name == 5 && str_eq name "yield") then fb_yield world args
+       else if (str_len name == 7 && str_eq name "current") then (let _ = fb_boot () in fb_obj_for world (fb_cur ()))
+       else if (str_len name == 2 && str_eq name "[]") then
+         (match args with Cons (k, Nil) -> fb_storage_aref env world k
+                        | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
+       else if (str_len name == 3 && str_eq name "[]=") then
+         (match args with Cons (k, Cons (v, Nil)) -> fb_storage_aset env world k v
+                        | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 2)"))
+       else if (str_len name == 9 && str_eq name "blocking?") then (if fb_blocking_now () then VInt 1 else VBool false)
+       else if (str_len name == 9 && str_eq name "scheduler") || (str_len name == 17 && str_eq name "current_scheduler") then
+         (if map_has fb_sched (fb_thread_of (fb_cur ())) then map_get fb_sched (fb_thread_of (fb_cur ())) else VNil)
+       else if (str_len name == 13 && str_eq name "set_scheduler") then
+         (match args with
+          | Cons (VNil, Nil) ->
+            (let th = fb_thread_of (fb_cur ()) in
+             let _ = (if map_has fb_sched th then map_delete fb_sched th else ()) in VNil)
+          | Cons (sch, Nil) ->
+            // the hooks a scheduler must have, in the order ruby checks them
+            (let need = Cons ("block", Cons ("unblock", Cons ("kernel_sleep", Cons ("io_wait", Nil)))) in
+             let rec chk = fn (ns: str list) ->
+               match ns with
+               | Nil -> ()
+               | Cons (n, r) ->
+                 (if responds world sch n then chk r
+                  else (let _ = raise_exc world "ArgumentError" ("Scheduler must implement #" ++ n) in ())) in
+             let _ = chk need in
+             let _ = map_set fb_sched (fb_thread_of (fb_cur ())) sch in
+             sch)
+          | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
+       else if (str_len name == 8 && str_eq name "blocking") then raise_exc world "LocalJumpError" "no block given (yield)"
+       else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for class Fiber"))
     else if str_eq c "Thread" && thread_cls_name name then
       (let (mth0, sup0, ocl0, ivars) = world in
        if (str_len name == 7 && str_eq name "current") then
@@ -13049,6 +13204,13 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                          | Cons (h9, t9) -> (let _ = push9 h9 in add9 t9)) in
                       add9 (if want_priv then kernel_builtin_names () else kernel_public_instance_names ()))
                    else ()) in
+          // ...FIBER's: its surface lives in the dispatcher (fb_inst_name is
+          // the same predicate that guards the arm), all public
+          let _ = (if str_eq cx "Fiber" && (if want_prot || want_priv then false else true) then
+                     list_iter (Cons ("resume", Cons ("transfer", Cons ("alive?", Cons ("raise", Cons ("kill",
+                                Cons ("blocking?", Cons ("storage", Cons ("storage=", Cons ("inspect", Cons ("to_s", Nil)))))))))))
+                       (fn (nf9: str) -> (if fb_inst_name nf9 && (if map_has meths0 (pfx ++ nf9) then false else true) then push9 nf9 else ()))
+                   else ()) in
           // ...and CLASS's.
           let _ = (if str_eq cx "Class" && (if want_prot then false else true) then
                      list_iter (str_split (name_spec (if want_priv then "clspriv" else "clspub")) "|")
@@ -14437,28 +14599,32 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        let r9 = lz_step env world blk id v in
        let _ = (if map_has ivars mk9 then map_delete ivars mk9 else ()) in
        r9)
-    // Fiber instances (synchronous): resume runs the stored block once.
-    // An instance of a SUBCLASS carries the same block ivar and is served here
+    // Fiber instances: a real fiber (fb_resume and the rest, m_fiber.mere).
+    // An instance of a SUBCLASS carries the same index and is served here
     // too, for every name the subclass does not define itself.
     else if str_eq cls "Fiber"
-            || (map_has ivars (str_of_int id ++ "@__fb_blk") && (if has_meth world cls name then false else true)) then
-      (let k = str_of_int id in
-       if (str_len name == 6 && str_eq name "resume") then
-         (if map_has ivars (k ++ "@__fb_done") then raise_exc world "FiberError" "dead fiber called"
+            || (map_has ivars (str_of_int id ++ "@__fb_idx") && (if has_meth world cls name then false else true)) then
+      (if (str_len name == 6 && str_eq name "resume") then fb_resume world recv args false
+       else if (str_len name == 8 && str_eq name "transfer") then fb_resume world recv args true
+       else if (str_len name == 6 && str_eq name "alive?") then VBool (fb_state_of (fb_index_of world recv) != 3)
+       else if (str_len name == 5 && str_eq name "raise") then fb_raise world recv args
+       else if (str_len name == 4 && str_eq name "kill") then fb_kill world recv
+       else if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") then mkstr (fb_inspect world recv)
+       else if (str_len name == 9 && str_eq name "blocking?") then
+         (let i = fb_index_of world recv in VBool (fb_is_root i || map_has fb_blocking i))
+       // storage belongs to the fiber that is running: read it from inside
+       else if (str_len name == 7 && str_eq name "storage") || (str_len name == 8 && str_eq name "storage=") then
+         (let i = fb_index_of world recv in
+          if i != fb_cur () then raise_exc world "ArgumentError" "Fiber storage can only be accessed from the Fiber it belongs to"
+          else if (str_len name == 7 && str_eq name "storage") then
+            (match fb_storage_get i with VHsh hid -> VHsh hid | _ -> mkhash Nil)
           else
-            let _ = map_set ivars (k ++ "@__fb_done") (VBool true) in
-            (match (if map_has ivars (k ++ "@__fb_blk") then map_get ivars (k ++ "@__fb_blk") else VNil) with
-             | VProc pid ->
-               (let noblk2 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                // the fiber is its own ownership context (Mutex#owned? is
-                // per fiber): run the body with itself as the current thread.
-                let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
-                let _ = map_set cur_thr "v" recv in
-                let r = flow_value (run_block world noblk2 (map_get proc_store (str_of_int pid)) args) in
-                let _ = map_set cur_thr "v" savedcur in
-                r)
-             | _ -> VNil))
-       else if (str_len name == 6 && str_eq name "alive?") then VBool (if map_has ivars (k ++ "@__fb_done") then false else true)
+            (match args with
+             | Cons (v, _) ->
+               (let v2 = fb_storage_check world v in
+                let _ = (match v2 with VNil -> (if map_has fb_storage i then map_delete fb_storage i else ()) | _ -> map_set fb_storage i v2) in
+                v)
+             | Nil -> VNil))
        // the universal names (equal?, nil?, itself, ...), as for Method: this
        // chain ends in a refusal, and `fiber.resume.should.equal? cur` died
        // on #equal? itself
@@ -15641,49 +15807,42 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else
       (let av = enum_to_arr env world blk id in
        invoke_val_c env world blk av name args vischeck))
-    // external iteration (re-drive style: the enumerator is re-run, bounded
-    // to pos+1 elements, and indexed by @__e_pos — O(n^2) overall but correct
-    // for pure sources, and safe for infinite generators).
-    else if is_enum_cls cls && ((str_len name == 4 && str_eq name "next") || (str_len name == 4 && str_eq name "peek") || (str_len name == 6 && str_eq name "rewind")) then
-      (if (str_len name == 6 && str_eq name "rewind") then
+    // EXTERNAL ITERATION on a Fiber (Enumerator#__ext_fiber in the prelude):
+    // #next resumes it, and it runs the source's #each until the next element
+    // -- no further. It used to drive the whole source into a buffer on the
+    // first #next, which could not step an infinite source and ran a stateful
+    // one ahead of the caller (Lazy#next evaluated every stage in advance).
+    // (a Lazy too: its #each drives the whole pipeline, one element at a time)
+    else if (is_enum_cls cls || str_eq cls "Enumerator::Lazy")
+            && ((str_len name == 4 && str_eq name "next") || (str_len name == 4 && str_eq name "peek") || (str_len name == 6 && str_eq name "rewind")
+                || (str_len name == 11 && str_eq name "next_values") || (str_len name == 11 && str_eq name "peek_values")
+                || (str_len name == 4 && str_eq name "feed")) then
+      (let k = str_of_int id in
+       if (str_len name == 6 && str_eq name "rewind") then
          // ⚠ ...and the SOURCE is told as well: ruby calls the enclosed
          //   object's #rewind when it has one, so an IO- or cursor-backed
          //   enumerator really starts over.
-         (let _ = (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+         (let _ = (match (if map_has ivars (k ++ "@recv") then map_get ivars (k ++ "@recv") else VNil) with
                    | VObj so9 -> (if has_meth world (dispatch_cls_of world (VObj so9)) "rewind"
                                   then (let _ = invoke_val_c env world noblk (VObj so9) "rewind" Nil false in ()) else ())
                    | _ -> ()) in
-          let _ = map_set ivars (str_of_int id ++ "@__e_pos") (VInt 0) in
-          // ...and the buffer with it, so a source that can be walked again is.
-          let _ = (if map_has ivars (str_of_int id ++ "@__e_buf")
-                   then map_delete ivars (str_of_int id ++ "@__e_buf") else ()) in
+          let _ = en_ext_drop world id in
           recv)
+       else if (str_len name == 4 && str_eq name "feed") then
+         (if map_has ivars (k ++ "@__x_feedset") then raise_exc world "TypeError" "feed value already set"
+          else (let _ = map_set ivars (k ++ "@__x_feed") (match args with Cons (v, _) -> v | Nil -> VNil) in
+                let _ = map_set ivars (k ++ "@__x_feedset") (VBool true) in
+                VNil))
        else
-         let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
-         // ⚠ DRIVE THE SOURCE ONCE and keep what it produced. This re-ran it
-         //   from the start for every #next, taking pos+1 elements and reading
-         //   the last -- right only for a source with no state. A source that
-         //   ADVANCES (csv's parser walks a StringScanner) carries on from
-         //   where the previous run left it, so the elements between runs are
-         //   never seen: a six-element generator answered 1, 3, 6 for three
-         //   #next calls instead of 1, 2, 3, and CSV.parse returned every
-         //   other row.
-         //   ⚠ the cost is that an INFINITE enumerator cannot be stepped: it is
-         //   materialised here and never comes back. Real external iteration
-         //   needs a coroutine, and this interpreter's Fiber runs its body to
-         //   completion, so there is nothing to suspend.
-         let bk = str_of_int id ++ "@__e_buf" in
-         let av = (if map_has ivars bk then map_get ivars bk
-                   else (let a9 = enum_to_arr env world blk id in
-                         let _ = map_set ivars bk a9 in a9)) in
-         let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
-         if pos >= val_list_len xs then
-           raise_exc_iv world "StopIteration" "iteration reached an end"
-             (Cons (("result", (if map_has ivars (str_of_int id ++ "@__e_ret") then map_get ivars (str_of_int id ++ "@__e_ret") else VNil)), Nil))
-         else
-           let v = val_nth xs pos in
-           let _ = (if (str_len name == 4 && str_eq name "next") then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
-           v)
+         (let consume = (str_len name == 4 && str_eq name "next") || (str_len name == 11 && str_eq name "next_values") in
+          let vals = (if en_can_buffer world id then en_buf_step env world blk id consume
+                      else en_ext_step env world recv id consume) in
+          let xs = (match vals with VArr aid -> deref aid | _ -> Nil) in
+          // #next answers what one yield passed: nothing is nil, one is itself,
+          // more are an Array; the _values forms always answer the Array
+          if (str_len name == 11 && str_eq name "next_values") || (str_len name == 11 && str_eq name "peek_values")
+          then arr_new xs
+          else (match xs with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new xs)))
     // with_index(offset = 0) without a block: an Enumerator of [elem, i+offset]
     // pairs; with_object handled by the with-block dispatcher.
     else if is_enum_cls cls && ((str_len name == 10 && str_eq name "with_index") || (str_len name == 15 && str_eq name "each_with_index")) && (let (h9, _, _, _) = blk in (if h9 then false else true)) then
@@ -15692,16 +15851,6 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
       (if (str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> false | _ -> true)
        then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
        else make_enum_a world recv name args)
-    // next_values / peek_values: like next/peek but every yield is an array.
-    else if is_enum_cls cls && ((str_len name == 11 && str_eq name "next_values") || (str_len name == 11 && str_eq name "peek_values")) then
-      (let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
-       let av = enum_take_m env world blk id (pos + 1) true in
-       let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
-       if pos >= val_list_len xs then raise_exc world "StopIteration" "iteration reached an end"
-       else
-         let v = val_nth xs pos in
-         let _ = (if (str_len name == 11 && str_eq name "next_values") then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
-         v)
     // first / take are bounded (usable on infinite generators).
     else if is_enum_cls cls && ((str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take")) then
       (let n = (match args with Cons (VInt k, _) -> k | _ -> 1) in
@@ -16654,7 +16803,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             (match args with
              | Cons (kv, _) ->
                (let kk = thread_key_of env world kv in
-                if map_has ivars (k ++ "@__tl_" ++ kk) then map_get ivars (k ++ "@__tl_" ++ kk) else VNil)
+                if map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) then map_get ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) else VNil)
              | _ -> VNil)
           else if (str_len name == 3 && str_eq name "[]=") || (str_len name == 19 && str_eq name "thread_variable_set") then
             (match args with
@@ -16664,41 +16813,39 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
              // nil REMOVES the variable: it is no longer a key at all
              | Cons (kv, Cons (VNil, _)) ->
                (let kk = thread_key_of env world kv in
-                let _ = (if map_has ivars (k ++ "@__tl_" ++ kk) then map_delete ivars (k ++ "@__tl_" ++ kk) else ()) in
-                let cur9 = (match (if map_has ivars (k ++ "@__tlk") then map_get ivars (k ++ "@__tlk") else VNil) with
+                let _ = (if map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) then map_delete ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) else ()) in
+                let cur9 = (match (if map_has ivars (fb_tl_base world tid name ++ "@__tlk") then map_get ivars (fb_tl_base world tid name ++ "@__tlk") else VNil) with
                             | VStr h9 -> sget h9 | _ -> "") in
                 let at9 = str_index_of cur9 ("|" ++ kk ++ "|") in
                 let _ = (if at9 >= 0
-                         then map_set ivars (k ++ "@__tlk")
+                         then map_set ivars (fb_tl_base world tid name ++ "@__tlk")
                                 (mkstr (substring cur9 0 (at9 + 1) ++ substring cur9 (at9 + str_len kk + 2) (str_len cur9)))
                          else ()) in
                 VNil)
              | Cons (kv, Cons (v, _)) ->
                (let kk = thread_key_of env world kv in
-                let _ = tl_note_key ivars k kk in
-                let _ = map_set ivars (k ++ "@__tl_" ++ kk) v in v)
+                let _ = tl_note_key ivars (fb_tl_base world tid name) kk in
+                let _ = map_set ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) v in v)
              | _ -> VNil)
-          // ⚠ ruby's #keys are the FIBER-locals and #thread_variables are the
+          // ruby's #keys are the FIBER-locals and #thread_variables are the
           //   THREAD-locals -- two tables, which is the whole point of
-          //   core/thread/keys_spec's "is not shared across fibers". mere-ruby
-          //   has one table, so these two names answer the same list. The
-          //   conflation is older than this arm and is not hidden by it:
-          //   thread_variables_spec is satisfied, keys_spec is not.
+          //   core/thread/keys_spec's "is not shared across fibers". They are
+          //   two here too: fb_tl_base names whose table a name reads.
           else if (str_len name == 4 && str_eq name "keys") || (str_len name == 16 && str_eq name "thread_variables") then
-            (let cur = (match (if map_has ivars (k ++ "@__tlk") then map_get ivars (k ++ "@__tlk") else VNil) with
+            (let cur = (match (if map_has ivars (fb_tl_base world tid name ++ "@__tlk") then map_get ivars (fb_tl_base world tid name ++ "@__tlk") else VNil) with
                         | VStr h9 -> sget h9 | _ -> "") in
              arr_new (tl_keys_split cur 0 0 Nil))
           else if (str_len name == 4 && str_eq name "key?") || (str_len name == 16 && str_eq name "thread_variable?") then
             (match args with
              | Cons (kv, _) ->
                (let kk = thread_key_of env world kv in
-                VBool (map_has ivars (k ++ "@__tl_" ++ kk)))
+                VBool (map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk)))
              | _ -> VBool false)
           else if (str_len name == 5 && str_eq name "fetch") then
             (match args with
              | Cons (kv, rest) ->
                (let kk = thread_key_of env world kv in
-                if map_has ivars (k ++ "@__tl_" ++ kk) then map_get ivars (k ++ "@__tl_" ++ kk)
+                if map_has ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk) then map_get ivars (fb_tl_base world tid name ++ "@__tl_" ++ kk)
                 else (match rest with
                       | Cons (d, _) -> d
                       | Nil -> raise_exc world "KeyError" ("key not found: :" ++ kk)))
@@ -16924,7 +17071,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           let lfid = next_fid () in
           let e2c = blk_env_get e2 in
           let _ = map_set e2c "__fid" (VInt lfid) in
-          let _ = map_set live_frames lfid 1 in
+          let _ = fb_frame_mark lfid in
           let (h3, ps3, b3, e3) = proc_as_block pid in
           let _ = e3 in
           // a block given at THIS call site is the block the proc body's &param
@@ -16996,7 +17143,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
               (let tgt9 = (if map_has proc_home (str_of_int pid) then map_get proc_home (str_of_int pid)
                            else if lv_has env "__blk_home" then lv_get env "__blk_home" else VInt 0) in
                let tk9 = (match tgt9 with VInt t9 -> t9 | _ -> 0 - 1) in
-               if tk9 < 0 || (if map_has live_frames tk9 then false else true)
+               if tk9 < 0 || (if fb_frame_live tk9 then false else true)
                // ...with the reason and the value on it, the way ruby's carry
                // them: #reason is :break and #exit_value the break's value.
                then raise_exc_iv world "LocalJumpError" "break from proc-closure"
@@ -18082,8 +18229,10 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
                let yid = alloc_oid ocls0 in
                let _ = map_set ocls0 yid "Enumerator::Yielder" in
                let _ = map_set ivars0 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
-               let _ = flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil))) in
-               recv
+               // ...and #each answers what the GENERATOR block answered, as
+               // ruby's does (`Enumerator.new { |y| y << 1; :ret }.each { }` is
+               // :ret) -- which is also StopIteration#result at the end of #next
+               flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil)))
              | _ -> VNil)
           else
           let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
@@ -18383,20 +18532,23 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
           let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
           r)
-       // Fiber.new { }: minimal synchronous fiber — #resume runs the whole
-       // body once (no suspension points in this model).
+       // Fiber.blocking { |f| }: the running fiber is blocking for the block
+       else if str_eq c "Fiber" && (str_len name == 8 && str_eq name "blocking") then
+         (let _ = fb_boot () in
+          let i = fb_cur () in
+          let was = map_has fb_blocking i in
+          let _ = map_set fb_blocking i 1 in
+          let r = flow_value (run_block world blk newblk (Cons (fb_obj_for world i, Nil))) in
+          let _ = (if was then () else map_delete fb_blocking i) in
+          r)
+       // Fiber.new { }: a real fiber now (see fb_new and m_fiber.mere) -- the
+       // body runs on a thread of its own and suspends at Fiber.yield.
        // ⚠ ...and a SUBCLASS of Fiber builds a fiber too, of its own class:
        //   `Class.new(Fiber).new { }` fell to the generic constructor, which
        //   made a plain object that could not #resume.
        else if (str_eq c "Fiber" || (obj_is_a world c "Fiber" && (if has_meth world ("(sng:" ++ c ++ ")") "new" then false else true)))
                && (str_len name == 3 && str_eq name "new") then
-         (let pid = map_len proc_store in
-          let _ = store_proc (str_of_int pid) newblk in
-          let (m3, s3, ocls3, iv3) = world in
-          let fid = alloc_oid ocls3 in
-          let _ = map_set ocls3 fid c in
-          let _ = map_set iv3 (str_of_int fid ++ "@__fb_blk") (VProc pid) in
-          VObj fid)
+         fb_new world c newblk args
        // Thread.new/start/fork { }: the synchronous thread model. The body
        // runs immediately as the "thread"; scheduler points (sleep /
        // Thread.pass / Thread.stop) park it by raising the internal
@@ -18415,6 +18567,18 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let savedthr = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
           let _ = map_set cur_thr "v" (VObj tid) in
           let _ = map_set cur_thr "t" (VObj tid) in
+          // the thread's ROOT FIBER: Fiber.current in the body is a fiber of
+          // its own, a fiber made there belongs to this thread (resuming it
+          // from another is FiberError), and it starts with a copy of the
+          // spawner's fiber storage.
+          let _ = fb_boot () in
+          let fb_saved = fb_cur () in
+          let fb_r = fb_new_index () in
+          let _ = map_set fb_root fb_r 1 in
+          let _ = map_set fb_state fb_r 1 in
+          let _ = map_set fb_thr fb_r tid in
+          let _ = (match fb_storage_copy fb_saved with VNil -> () | h -> map_set fb_storage fb_r h) in
+          let _ = map_set fb_st "cur" fb_r in
           let saved = (if map_has catch_depth "n" then map_get catch_depth "n" else VInt 0) in
           let _ = map_set catch_depth "n" (VInt 0) in
           // the BOOL, not the Val holding it: thread_flag is compacted at a
@@ -18441,6 +18605,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let _ = map_set catch_depth "n" saved in
           let _ = map_set cur_thr "v" savedcur in
           let _ = map_set cur_thr "t" savedthr in
+          let _ = map_set fb_st "cur" fb_saved in
+          let _ = map_set fb_state fb_r 3 in
           let _ =
             (match result with
              | FRaise _ ->
@@ -28357,7 +28523,9 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // process has to survive that. The old 1500 predates the -stack_size flag
   // entirely and stopped rubocop-ast mid-load: it needs more than 10000,
   // because each Ruby call costs several interpreter frames.
-  if cd >= 15000 then
+  // ...counted from this stack's own base: a fiber's depths are a band of
+  // their own (fb_band), so the call tables of two stacks never collide
+  if cd - fb_depth_base () >= 15000 then
     (let _ = (if str_eq (env_get "MERE_RUBY_STACKTRACE") "" then ()
               else print_err ("[stack] innermost frames:\n" ++ stack_dump cd 40 "")) in
      let _ = // ruby's message is the four words; the class in parentheses is what the
@@ -28392,7 +28560,8 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // mark this frame live so a break targeting it (via a block's home) can find
   // it; once the body has unwound to here (any outcome) the frame is done.
   let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> t | _ -> 0 - 1) else 0 - 1) in
-  let _ = if fidk < 0 then () else map_set live_frames fidk 1 in
+  let _ = if fidk < 0 then () else fb_frame_mark fidk in
+  let _ = (if fidk < 0 then () else fb_env_in (fidk * 2 + 1) frame) in
   // a method call is a `return` boundary: a return inside the body returns from
   // this method, even when the call happens inside a Thread.new block.
   // The BOOL, not the Val (see the Thread.new site): thread_flag is compacted
@@ -28429,6 +28598,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let nowtf = (if map_has thread_flag "n" then (match map_get thread_flag "n" with VBool b -> b | _ -> false) else false) in
   let _ = if nowtf == savedtf then () else map_set thread_flag "n" (VBool savedtf) in
   let _ = if fidk < 0 then () else map_delete live_frames fidk in
+  let _ = (if fidk < 0 then () else fb_env_out (fidk * 2 + 1)) in
   match f with
   | FRaise _ ->
     if map_has flow_sig "k" then
@@ -30408,6 +30578,476 @@ and attr_mark_vis = fn (cls: str) -> fn (mode: str) -> fn (syms: str list) -> fn
 
 // A Process::Status for a command that has already finished. The class is
 // defined in the prelude; this only has to carry the exit code.
+// ---- Fibers: the half that runs Ruby code (m_fiber.mere has the rest) -----
+// The world a fiber's thread runs in: the driver's own four maps, which are
+// globals so that a thread handed nothing but an index can find them.
+and fb_world = fn (u: unit) -> (meths_g, cls_sup, obj_cls, ivars_g)
+and fb_iv = fn world -> fn (oid: int) -> fn (k: str) ->
+  let (_, _, _, iv) = world in
+  if map_has iv (str_of_int oid ++ k) then map_get iv (str_of_int oid ++ k) else VNil
+and fb_index_of = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id -> (match fb_iv world id "@__fb_idx" with VInt i -> i | _ -> 0 - 1)
+  | _ -> 0 - 1
+and fb_is_fiber = fn world -> fn (v: Val) -> fb_index_of world v >= 0
+and fb_thread_of = fn (i: int) -> if map_has fb_thr i then map_get fb_thr i else 0
+and fb_is_root = fn (i: int) -> map_has fb_root i
+// the object for an index, made on first ask (a root fiber has none until
+// Fiber.current is called on its stack)
+and fb_obj_for = fn world -> fn (i: int) ->
+  if map_has fb_obj i then map_get fb_obj i
+  else
+    (let (_, _, ocls, iv) = world in
+     let oid = alloc_oid ocls in
+     let _ = map_set ocls oid "Fiber" in
+     let _ = map_set iv (str_of_int oid ++ "@__fb_idx") (VInt i) in
+     let o = VObj oid in
+     let _ = map_set fb_obj i o in
+     o)
+// the main thread's root fiber exists from the start: index 0, resumed
+and fb_boot = fn (u: unit) ->
+  if map_has fb_state 0 then ()
+  else (let _ = map_set fb_state 0 1 in let _ = map_set fb_root 0 1 in map_set fb_thr 0 0)
+// ---- storage (Fiber[] / Fiber[]= / #storage): a Hash per fiber, or none ----
+and fb_storage_get = fn (i: int) -> if map_has fb_storage i then map_get fb_storage i else VNil
+and fb_storage_copy = fn (i: int) ->
+  match fb_storage_get i with
+  | VHsh hid -> mkhash (hderef hid)
+  | _ -> VNil
+// storage: must be a Hash, not frozen, keyed by Symbols
+and fb_storage_check = fn world -> fn (v: Val) ->
+  match v with
+  | VNil -> VNil
+  | VHsh hid ->
+    (if val_is_frozen v then raise_exc_iv world "FrozenError" ("can't modify frozen Hash: " ++ inspect v) (Cons (("__recv", v), Nil))
+     else
+       (let rec keys = fn (ps: Val list) ->
+          match ps with
+          | Cons (VSym _, Cons (_, t)) -> keys t
+          | Cons (k, Cons (_, _)) -> raise_exc world "TypeError" ("wrong argument type " ++ class_name k ++ " (expected Symbol)")
+          | _ -> v in
+        keys (hderef hid)))
+  | _ -> raise_exc world "TypeError" "storage must be a hash"
+// a storage KEY: a Symbol, or a String (4.0 converts it), or anything with to_str
+and fb_storage_key = fn env -> fn world -> fn (k: Val) ->
+  match k with
+  | VSym s -> VSym s
+  | VStr h -> VSym (sget h)
+  | _ ->
+    (if responds world k "to_str"
+     then (match invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) k "to_str" Nil false with
+           | VStr h -> VSym (sget h)
+           | _ -> raise_exc world "TypeError" (inspect k ++ " is not a symbol nor a string"))
+     else raise_exc world "TypeError" (inspect k ++ " is not a symbol nor a string"))
+and fb_storage_aref = fn env -> fn world -> fn (k: Val) ->
+  let key = fb_storage_key env world k in
+  match fb_storage_get (fb_cur ()) with
+  | VHsh hid -> (match hash_lookup (hderef hid) key with (true, v) -> v | _ -> VNil)
+  | _ -> VNil
+and fb_storage_aset = fn env -> fn world -> fn (k: Val) -> fn (v: Val) ->
+  let key = fb_storage_key env world k in
+  let i = fb_cur () in
+  let h = (match fb_storage_get i with
+           | VHsh hid -> VHsh hid
+           | _ -> (let nh = mkhash Nil in let _ = map_set fb_storage i nh in nh)) in
+  let _ = (match v with
+           | VNil -> invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) h "delete" (Cons (key, Nil)) false
+           | _ -> invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) h "[]=" (Cons (key, Cons (v, Nil))) false) in
+  v
+// a keyword argument of a builtin call: the trailing Hash, by Symbol key
+and fb_kw = fn (args: Val list) -> fn (k: str) ->
+  let rec last = fn (xs: Val list) -> match xs with Nil -> VNil | Cons (x, Nil) -> x | Cons (_, t) -> last t in
+  match last args with
+  | VHsh hid -> hash_lookup (hderef hid) (VSym k)
+  | _ -> (false, VNil)
+
+// ---- Fiber.new --------------------------------------------------------------
+and fb_new = fn world -> fn (c: str) -> fn newblk -> fn (args: Val list) ->
+  let _ = fb_boot () in
+  let (_, _, ocls, iv) = world in
+  let (hass, st0) = fb_kw args "storage" in
+  let st = (if hass then fb_storage_check world st0 else VNil) in
+  let (hasb, bl) = fb_kw args "blocking" in
+  let pid = map_len proc_store in
+  let _ = store_proc (str_of_int pid) newblk in
+  let oid = alloc_oid ocls in
+  let _ = map_set ocls oid c in
+  let i = fb_new_index () in
+  let k = str_of_int oid in
+  let _ = map_set iv (k ++ "@__fb_blk") (VProc pid) in
+  let _ = map_set iv (k ++ "@__fb_idx") (VInt i) in
+  let _ = map_set iv (k ++ "@__fb_loc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
+  let o = VObj oid in
+  let _ = map_set fb_obj i o in
+  let _ = map_set fb_state i 0 in
+  let _ = map_set fb_thr i (fb_thread_of (fb_cur ())) in
+  let _ = (if hasb && (match bl with VNil -> false | VBool false -> false | _ -> true) then map_set fb_blocking i 1 else ()) in
+  // storage: given (a Hash, or nil for "none yet"), else a COPY of the
+  // creator's -- a child's Fiber[]= must not write into its parent's
+  let _ = (if hass then (match st with VNil -> () | _ -> map_set fb_storage i st)
+           else (match fb_storage_copy (fb_cur ()) with VNil -> () | h -> map_set fb_storage i h)) in
+  o
+
+// ---- the thread a fiber's body runs on ---------------------------------------
+// Runs once its first token has arrived (fb_run_body in m_fiber.mere waits
+// for it), so the resumer is suspended and this is the only stack running.
+and fb_thread_main = fn (i: int) ->
+  let world = fb_world () in
+  let _ = fb_ctx_fresh i in
+  let me = fb_obj_for world i in
+  let _ = map_set cur_thr "v" me in
+  let (_, _, _, iv) = world in
+  let oid = (match me with VObj o -> o | _ -> 0) in
+  let args = (match (if map_has fb_xfer "v" then map_get fb_xfer "v" else VNil) with
+              | VArr aid -> deref aid
+              | VNil -> (Nil : Val list)
+              | v -> Cons (v, Nil)) in
+  let _ = (if map_has fb_xfer "v" then map_delete fb_xfer "v" else ()) in
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+  let r = (match fb_iv world oid "@__fb_blk" with
+           | VProc pid ->
+             try_or (fn (u: unit) -> run_block world noblk (map_get proc_store (str_of_int pid)) args) (FRaise VNil)
+           | _ -> FNext VNil) in
+  // what the body ended with, as a value or an exception for the other side
+  let _ = (match r with
+           | FNext v -> fb_set_value v
+           | FLoopNext v -> fb_set_value v
+           | FBreak _ -> fb_set_exc_new world "LocalJumpError" "break from proc-closure"
+           | FReturn _ -> fb_set_exc_new world "LocalJumpError" "unexpected return"
+           | FRaise _ ->
+             (let fk = (if map_has flow_sig "k" then (match map_get flow_sig "k" with VStr h -> sget h | _ -> "") else "") in
+              if str_eq fk "break" || str_eq fk "breakret" then
+                (let _ = map_clear flow_sig in fb_set_exc_new world "LocalJumpError" "break from proc-closure")
+              else if str_eq fk "return" || str_eq fk "returnret" then
+                (let _ = map_clear flow_sig in fb_set_exc_new world "LocalJumpError" "unexpected return")
+              else if str_eq fk "next" then
+                (let v = (if map_has flow_sig "v" then map_get flow_sig "v" else VNil) in
+                 let _ = map_clear flow_sig in fb_set_value v)
+              else if map_has fb_st "abandon" then
+                (let _ = map_delete iv "$exc" in let _ = map_clear prim_missing in
+                 let _ = map_clear flow_sig in
+                 let _ = map_delete fb_st "abandon" in
+                 fb_set_value VNil)
+              else if fb_exc_is_kill iv && (if map_has fb_st "kt" then map_get fb_st "kt" else i) == i then
+                (let _ = map_delete iv "$exc" in let _ = map_clear prim_missing in
+                 let _ = (if map_has fb_st "kt" then map_delete fb_st "kt" else ()) in
+                 fb_set_value VNil)
+              else fb_set_exc_carry world)
+           | _ -> fb_set_value VNil) in
+  let _ = map_set fb_state i 3 in
+  let _ = fb_live_add (0 - 1) in
+  let t = fb_return_target i in
+  let _ = map_set fb_state t 1 in
+  fb_hand_over t
+// where a fiber returns when it ends, yields, or is left: the one that resumed
+// it -- or, for one entered by transfer, the head of the resume chain
+and fb_return_target = fn (i: int) ->
+  if map_has fb_xferd i then (if map_has fb_ret i then map_get fb_ret i else 0)
+  else (if map_has fb_parent i then map_get fb_parent i else 0)
+and fb_set_value = fn (v: Val) ->
+  let _ = map_set fb_xk "k" 0 in
+  map_set fb_xfer "v" v
+and fb_exc_is_kill = fn iv ->
+  map_has iv "$exc" && (match map_get iv "$exc" with VExc (c, _) -> str_eq c "__FiberKill" | _ -> false)
+// an exception raised inside the body, carried to the other side whole: the
+// exception slot and the two maps its report is built from (index -1 is the
+// crossing's own slot in the save store)
+and fb_set_exc_carry = fn world ->
+  let (_, _, _, iv) = world in
+  let _ = map_set fb_xk "k" 1 in
+  let _ = fb_save_k (0 - 1) "iv" iv "$exc" in
+  let _ = fb_save_sv (0 - 1) "pm" prim_missing in
+  fb_save_sv (0 - 1) "bt" raise_bt
+and fb_set_exc_new = fn world -> fn (c: str) -> fn (m: str) ->
+  let (_, _, _, iv) = world in
+  let _ = map_set iv "$exc" (VExc (c, m)) in
+  let _ = map_clear prim_missing in
+  let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
+  fb_set_exc_carry world
+// ...and put back on the receiving side, over its own restored state, then raised
+and fb_raise_carried = fn world ->
+  let (_, _, _, iv) = world in
+  let _ = fb_restore_k (0 - 1) "iv" iv "$exc" in
+  let _ = fb_overlay_sv (0 - 1) "pm" prim_missing in
+  let _ = fb_overlay_sv (0 - 1) "bt" raise_bt in
+  let m = "mere-ruby: (ruby exception raised)" in
+  let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in
+  (let _ = fail m in VNil)
+// raise an exception object on the running stack, exactly as Kernel#raise does
+and fb_raise_here = fn world -> fn (exc: Val) ->
+  let (_, _, _, iv) = world in
+  let _ = map_set iv "$exc" exc in
+  let _ = note_raise_site () in
+  let _ = tp_raise world exc in
+  let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
+  let m = "mere-ruby: (ruby exception raised)" in
+  let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in
+  (let _ = fail m in VNil)
+
+// What a stack does when it is woken: take the value it was handed, or raise
+// what it was handed, or unwind because it was killed.
+and fb_after_wake = fn world ->
+  let me = fb_cur () in
+  let k = (if map_has fb_xk "k" then map_get fb_xk "k" else 0) in
+  let _ = map_set fb_xk "k" 0 in
+  let v = (if map_has fb_xfer "v" then map_get fb_xfer "v" else VNil) in
+  let _ = (if map_has fb_xfer "v" then map_delete fb_xfer "v" else ()) in
+  if k == 1 then fb_raise_carried world
+  else if k == 2 then fb_raise_here world v
+  else if k == 3 then fb_kill_here me
+  else if k == 4 then (let _ = map_set fb_st "abandon" 1 in raise_exc world "__FiberAbandon" "abandon")
+  else v
+// raise the kill on the running stack, aimed at fiber t: it unwinds this stack
+// (ensure runs, no rescue sees it) and every fiber it crosses on the way up,
+// and ends at t, which terminates as though its body had returned nil
+and fb_kill_here = fn (t: int) ->
+  let _ = map_set fb_st "kt" t in
+  raise_exc (fb_world ()) "__FiberKill" "kill"
+// the value a resume or a yield hands over: nothing is nil, one is itself,
+// more are an Array
+and fb_pack = fn (args: Val list) ->
+  match args with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new args
+
+and fb_err = fn world -> fn (m: str) -> raise_exc world "FiberError" m
+
+// resume (xfer = false) and transfer (xfer = true)
+and fb_resume = fn world -> fn (recv: Val) -> fn (args: Val list) -> fn (xfer: bool) ->
+  let _ = fb_boot () in
+  let t = fb_index_of world recv in
+  let me = fb_cur () in
+  let st = fb_state_of t in
+  if fb_thread_of t != fb_thread_of me then fb_err world "fiber called across threads"
+  else if t == me then
+    (if xfer then fb_pack args else fb_err world "attempt to resume the current fiber")
+  else if st == 3 then
+    fb_err world (if xfer then "attempt to transfer to a terminated fiber" else "attempt to resume a terminated fiber")
+  else if st == 1 then
+    fb_err world (if xfer then "attempt to transfer to a resuming fiber" else "attempt to resume a resuming fiber")
+  else if xfer && st == 2 && (if map_has fb_sus_x t then false else true) then
+    fb_err world "attempt to transfer to a yielding fiber"
+  else if (if xfer then false else true) && st == 2 && (map_has fb_xferd t || map_has fb_sus_x t) then
+    fb_err world "attempt to resume a transferring fiber"
+  else fb_enter world t args xfer 0
+// hand control to fiber t (starting it if it has not run) and wait to be
+// handed it back. kind: 0 values, 2 raise the value there, 3 kill it there.
+and fb_enter = fn world -> fn (t: int) -> fn (args: Val list) -> fn (xfer: bool) -> fn (kind: int) ->
+  let me = fb_cur () in
+  let st = fb_state_of t in
+  let _ = (if xfer
+           then (let _ = map_set fb_xferd t 1 in
+                 map_set fb_ret t (if map_has fb_xferd me then fb_return_target me else me))
+           else (let _ = (if map_has fb_xferd t then map_delete fb_xferd t else ()) in
+                 map_set fb_parent t me)) in
+  // the resumer stays "resumed" (it is waiting in #resume); a transferring
+  // stack is suspended, and may be transferred back to
+  let _ = (if xfer then (let _ = map_set fb_state me 2 in map_set fb_sus_x me 1) else ()) in
+  let _ = map_set fb_state t 1 in
+  let _ = (if st == 0 then map_set fb_xfer "v" (arr_new args)
+           else if kind == 0 then map_set fb_xfer "v" (fb_pack args)
+           else map_set fb_xfer "v" (match args with Cons (v, _) -> v | Nil -> VNil)) in
+  let _ = map_set fb_xk "k" kind in
+  let _ = (if st == 0
+           then (let inbox = fb_inbox_of t in
+                 let _ = fb_inbox_of me in
+                 let _ = fb_live_add 1 in
+                 let _ = map_set fb_bodies t (fn (u: unit) -> fb_thread_main t) in
+                 // a thread the host will not start is ruby's "can't alloc
+                 // machine stack": the fiber stays unborn and can be tried again
+                 match try_or (fn (u: unit) -> let _ = fb_start_thread t inbox in Cons (1, Nil)) (Nil : int list) with
+                 | Nil ->
+                   (let _ = fb_live_add (0 - 1) in
+                    let _ = map_delete fb_bodies t in
+                    let _ = map_set fb_state t 0 in
+                    let _ = map_set fb_state me 1 in
+                    let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+                    let _ = fb_err world "can't alloc machine stack to fiber: Resource temporarily unavailable" in ())
+                 | _ -> ())
+           else ()) in
+  let _ = fb_switch me t in
+  let _ = map_set fb_state me 1 in
+  let _ = (if map_has fb_sus_x me then map_delete fb_sus_x me else ()) in
+  fb_after_wake world
+and fb_yield = fn world -> fn (args: Val list) ->
+  let _ = fb_boot () in
+  let me = fb_cur () in
+  if fb_is_root me || map_has fb_xferd me then fb_err world "attempt to yield on a not resumed fiber"
+  else if (if fb_can_suspend then false else true) then
+    raise_exc world "NotImplementedError" "Fiber.yield: this build has no threads, so a fiber runs to completion (m_fiber_nothreads.mere)"
+  else
+    (let p = (if map_has fb_parent me then map_get fb_parent me else 0) in
+     let _ = map_set fb_state me 2 in
+     let _ = map_set fb_state p 1 in
+     let _ = map_set fb_xfer "v" (fb_pack args) in
+     let _ = map_set fb_xk "k" 0 in
+     let _ = fb_switch me p in
+     let _ = map_set fb_state me 1 in
+     fb_after_wake world)
+and fb_raise = fn world -> fn (recv: Val) -> fn (args: Val list) ->
+  let _ = fb_boot () in
+  let t = fb_index_of world recv in
+  let me = fb_cur () in
+  let st = fb_state_of t in
+  if fb_thread_of t != fb_thread_of me then fb_err world "fiber called across threads"
+  else if st == 0 then fb_err world "cannot raise exception on unborn fiber"
+  else if st == 3 then fb_err world "attempt to resume a terminated fiber"
+  else
+    (let (pos9, _) = peel_kw_hash args in
+     let _ = (match pos9 with
+              | Cons (VStr _, Cons (_, _)) -> raise_exc world "TypeError" "exception class/object expected"
+              | Cons (VStr _, Nil) -> VNil
+              | Cons (VClass _, _) -> VNil
+              | Cons (VObj _, _) -> VNil
+              | Cons (VExc (_, _), _) -> VNil
+              | Nil -> VNil
+              | _ -> raise_exc world "TypeError" "exception class/object expected") in
+     let exc = (match args with
+                | Nil -> make_exc_w world (Cons (VClass "RuntimeError", Cons (mkstr "unhandled exception", Nil)))
+                | _ -> make_exc_w world args) in
+     // on itself, or on a fiber waiting further up the resume chain: that is
+     // Kernel#raise here -- it propagates up to it
+     if t == me || st == 1 then fb_raise_here world exc
+     else fb_enter world t (Cons (exc, Nil)) (map_has fb_xferd t) 2)
+and fb_kill = fn world -> fn (recv: Val) ->
+  let _ = fb_boot () in
+  let t = fb_index_of world recv in
+  let me = fb_cur () in
+  let st = fb_state_of t in
+  if fb_thread_of t != fb_thread_of me then fb_err world "fiber called across threads"
+  else if st == 3 then recv
+  else if st == 0 then (let _ = map_set fb_state t 3 in recv)
+  // itself, or a fiber up the resume chain: the kill starts HERE and unwinds
+  // to it (ruby does not run the rest of a child that killed its parent)
+  else if t == me || st == 1 then (let _ = fb_kill_here t in recv)
+  else (let _ = fb_enter world t Nil false 3 in recv)
+// the status word #inspect shows
+and fb_status_word = fn (i: int) ->
+  let st = fb_state_of i in
+  if st == 0 then "created" else if st == 1 then "resumed" else if st == 2 then "suspended" else "terminated"
+and fb_inspect = fn world -> fn (recv: Val) ->
+  let i = fb_index_of world recv in
+  match recv with
+  | VObj oid ->
+    (let loc = (match fb_iv world oid "@__fb_loc" with VStr h -> " " ++ sget h | _ -> "") in
+     "#<" ++ cls_display world (map_get obj_cls oid) ++ ":0x" ++ hex_pad16 oid ++ loc ++ " (" ++ fb_status_word i ++ ")>")
+  | _ -> "#<Fiber>"
+// whose table Thread#[] and friends read. The fiber-locals ([] []= keys key?
+// fetch) of the RUNNING thread belong to the running fiber when that is not
+// the thread's root; the thread-variables always belong to the thread.
+and fb_tl_base = fn world -> fn (tid: int) -> fn (name: str) ->
+  let fiber_local = (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "[]=")
+                    || (str_len name == 4 && str_eq name "keys") || (str_len name == 4 && str_eq name "key?")
+                    || (str_len name == 5 && str_eq name "fetch") in
+  let running = (match (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) with VObj t -> t == tid | _ -> false) in
+  let i = fb_cur () in
+  if fiber_local && running && (if fb_is_root i then false else true)
+  then (match fb_obj_for world i with VObj o -> str_of_int o | _ -> str_of_int tid)
+  else str_of_int tid
+// A source that cannot run a program's code -- a builtin iteration of an
+// Array, Hash, String or finite Range that no subclass has redefined -- gives
+// the same answers whether it is driven ahead or one element at a time, so its
+// #next reads a buffer filled once instead of suspending a Fiber. That matters
+// beyond speed: a suspended fiber stops every collection until it is done
+// (m_fiber.mere), and `e = arr.each; e.next` in a loop would then never collect.
+and en_can_buffer = fn world -> fn (id: int) ->
+  let (_, _, ocls, iv) = world in
+  let k = str_of_int id in
+  // (a build without threads has only the buffer)
+  if (if fb_can_suspend then false else true) then true
+  else if map_has iv (k ++ "@__x_fb") || map_has iv (k ++ "@__e_blk") || map_has iv (k ++ "@__x_feedset") then false
+  else if (if str_eq (map_get ocls id) "Enumerator" then false else true) then false
+  else
+    (let src = (if map_has iv (k ++ "@recv") then map_get iv (k ++ "@recv") else VNil) in
+     let meth = (match (if map_has iv (k ++ "@meth") then map_get iv (k ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
+     let finite = (match src with
+                   | VArr _ -> true | VHsh _ -> true | VStr _ -> true
+                   | VRange (VInt _, VInt _, _) -> true
+                   | _ -> false) in
+     finite && (if has_meth world (dispatch_cls_of world src) meth then false else true)
+     && (str_eq meth "each" || str_eq meth "each_with_index" || str_eq meth "each_pair" || str_eq meth "each_key"
+         || str_eq meth "each_value" || str_eq meth "each_char" || str_eq meth "each_byte" || str_eq meth "each_line"
+         || str_eq meth "each_index" || str_eq meth "reverse_each" || str_eq meth "each_entry"))
+// ...the buffered form: drive the source once, keep what it produced
+and en_buf_step = fn env -> fn world -> fn blk -> fn (id: int) -> fn (consume: bool) ->
+  let (_, _, _, ivars) = world in
+  let pos = (if map_has ivars (str_of_int id ++ "@__e_pos") then (match map_get ivars (str_of_int id ++ "@__e_pos") with VInt k -> k | _ -> 0) else 0) in
+  let bk = str_of_int id ++ "@__e_buf" in
+  let av = (if map_has ivars bk then map_get ivars bk
+            else (let a9 = enum_take_m env world blk id (0 - 1) true in
+                  let _ = map_set ivars bk a9 in a9)) in
+  let xs = (match av with VArr aid -> deref aid | _ -> Nil) in
+  if pos >= val_list_len xs then
+    // every iteration buffered here (en_can_buffer) answers its receiver, which
+    // is therefore StopIteration#result -- it read nil before
+    raise_exc_iv world "StopIteration" "iteration reached an end"
+      (Cons (("result", (if map_has ivars (str_of_int id ++ "@__e_ret") then map_get ivars (str_of_int id ++ "@__e_ret")
+                         else if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil)), Nil))
+  else
+    (let v = val_nth xs pos in
+     let _ = (if consume then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
+     v)
+// one step of an Enumerator's external iteration: the arguments of the next
+// yield, as an Array (kept for #peek, handed out and forgotten for #next)
+and en_ext_step = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (consume: bool) ->
+  let (_, _, _, iv) = world in
+  let k = str_of_int id in
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  if map_has iv (k ++ "@__x_buf") then
+    (let v = map_get iv (k ++ "@__x_buf") in
+     let _ = (if consume then map_delete iv (k ++ "@__x_buf") else ()) in
+     v)
+  else if map_has iv (k ++ "@__x_done") then en_ext_stop world id
+  else
+    (let started = map_has iv (k ++ "@__x_fb") in
+     let fb = (if started then map_get iv (k ++ "@__x_fb")
+               // Enumerator's own method, named: a Lazy's dispatcher does not
+               // reach the prelude's Enumerator methods by itself
+               else (let f = invoke world noblk recv "Enumerator" "__ext_fiber" Nil in
+                     let _ = map_set iv (k ++ "@__x_fb") f in f)) in
+     // a #feed value answers the yield the source is suspended in, so it is
+     // handed over only when resuming a started iteration
+     let feedv = (if started && map_has iv (k ++ "@__x_feedset")
+                  then (let v = (if map_has iv (k ++ "@__x_feed") then map_get iv (k ++ "@__x_feed") else VNil) in
+                        let _ = map_delete iv (k ++ "@__x_feedset") in
+                        let _ = (if map_has iv (k ++ "@__x_feed") then map_delete iv (k ++ "@__x_feed") else ()) in
+                        v)
+                  else VNil) in
+     let r = try_or (fn (u: unit) -> Cons (fb_resume world fb (Cons (feedv, Nil)) false, Nil)) (Nil : Val list) in
+     match r with
+     // the source raised: that is this #next's exception, and the NEXT #next
+     // starts the iteration over
+     | Nil ->
+       (let _ = map_delete iv (k ++ "@__x_fb") in
+        let m = "mere-ruby: (ruby exception raised)" in
+        let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in
+        (let _ = fail m in VNil))
+     | Cons (v, _) ->
+       (if map_has iv (k ++ "@__x_done") then
+          (let _ = map_delete iv (k ++ "@__x_fb") in en_ext_stop world id)
+        else (let _ = (if consume then () else map_set iv (k ++ "@__x_buf") v) in v)))
+and en_ext_stop = fn world -> fn (id: int) ->
+  let (_, _, _, iv) = world in
+  let k = str_of_int id in
+  raise_exc_iv world "StopIteration" "iteration reached an end"
+    (Cons (("result", (if map_has iv (k ++ "@__x_ret") then map_get iv (k ++ "@__x_ret") else VNil)), Nil))
+// forget an iteration in progress (#rewind). ⚠ Its fiber is KILLED, which runs
+// the source's ensure clauses now -- ruby leaves the abandoned fiber to the
+// collector, which never runs them. Killing is what gives the thread back.
+and en_ext_drop = fn world -> fn (id: int) ->
+  let (_, _, _, iv) = world in
+  let k = str_of_int id in
+  let _ = (match (if map_has iv (k ++ "@__x_fb") then map_get iv (k ++ "@__x_fb") else VNil) with
+           | VObj f -> (if fb_state_of (fb_index_of world (VObj f)) == 2 then (let _ = fb_kill world (VObj f) in ()) else ())
+           | _ -> ()) in
+  let rec del = fn (ns: str list) ->
+    match ns with
+    | Nil -> ()
+    | Cons (n, r) -> (let _ = (if map_has iv (k ++ n) then map_delete iv (k ++ n) else ()) in del r) in
+  del (Cons ("@__x_fb", Cons ("@__x_done", Cons ("@__x_ret", Cons ("@__x_buf", Cons ("@__x_feed", Cons ("@__x_feedset",
+       Cons ("@__e_buf", Cons ("@__e_pos", Nil)))))))))
+and fb_blocking_now = fn (u: unit) ->
+  let i = fb_cur () in
+  fb_is_root i || map_has fb_blocking i
+
 and make_proc_status = fn world -> fn (rc: int) ->
   let (m9, s9, ocls9, iv9) = world in
   let oid9 = alloc_oid ocls9 in
@@ -31047,14 +31687,15 @@ and caller_args = fn env -> fn world -> fn (args: Val list) ->
 // line markers landed. A comment that explains why something cannot be done
 // outlives the reason.
 and caller_loc_list = fn world -> fn (i: int) ->
-  if i < 0 then (Nil : Val list)
+  if i < fb_depth_base () then (Nil : Val list)
   else Cons (loc_obj world (frame_file i) (frame_line i) (frame_label_at i), caller_loc_list world (i - 1))
 
 and caller_locs = fn world -> fn (skip: int) -> fn (want: int) ->
   let cd = caller_depth () in
+  let b = fb_depth_base () in
   let here = loc_obj world (cur_file ()) (cur_line ())
-               (if cd <= 0 then "<main>" else meth_label (cur_meth ())) in
-  let all = (if cd <= 0 then Cons (here, (Nil : Val list)) else Cons (here, caller_loc_list world (cd - 1))) in
+               (if cd <= b then "<main>" else meth_label (cur_meth ())) in
+  let all = (if cd <= b then Cons (here, (Nil : Val list)) else Cons (here, caller_loc_list world (cd - 1))) in
   (if want < 0 then vdrop all skip else vtake (vdrop all skip) want)
 
 
@@ -34024,7 +34665,9 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
            let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
            let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
 
-           run_rescues env world blk exc rescues
+           // (an abandoned fiber unwinds through here with nothing running)
+           if map_has fb_st "abandon" then re_raise world exc
+           else run_rescues env world blk exc rescues
          else FRaise VNil   // flow pending — skip rescue
        | FReturn v -> FReturn v
        | FBreak v -> FBreak v
@@ -34045,9 +34688,9 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
                // implementation detail in a variable a program reads.
                (if (if map_has flow_sig "k" then false else true) && map_has ivars "$exc"
                    && (match map_get ivars "$exc" with
-                       | VExc (c9, _) -> (if str_eq c9 "__ThreadPark" then false else true)
+                       | VExc (c9, _) -> (if str_eq c9 "__ThreadPark" || str_eq c9 "__FiberKill" then false else true)
                        | VObj o9 -> (let (_, _, ocls9, _) = world in
-                                     if str_eq (map_get ocls9 o9) "__ThreadPark" then false else true)
+                                     if str_eq (map_get ocls9 o9) "__ThreadPark" || str_eq (map_get ocls9 o9) "__FiberKill" then false else true)
                        | _ -> true)
                 then map_set globals "!" (map_get ivars "$exc")
                 else ())
@@ -34114,10 +34757,11 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
     //   slot there loses the park: core/thread/alive_spec stopped finishing at
     //   all and went DIFF -> SLOW, which is a worse answer than the wrong one
     //   it gave before. One slot, two meanings; only the ruby one is replaced.
-    let park9 = (match saved_exc with VExc (c9, _) -> str_eq c9 "__ThreadPark" | _ -> false) in
+    // (and a Fiber#kill, which unwinds a fiber the same way: ensure runs, no rescue sees it)
+    let park9 = (match saved_exc with VExc (c9, _) -> str_eq c9 "__ThreadPark" || str_eq c9 "__FiberKill" | _ -> false) in
     let _ = (if has_ens && saved_had && (if park9 then false else true)
              then map_delete ivars "$exc" else ()) in
-    let ensf = (if has_ens then run_stmts env world blk ens else FNext VNil) in
+    let ensf = (if has_ens && (if map_has fb_st "abandon" then false else true) then run_stmts env world blk ens else FNext VNil) in
     let _ = (if saved_had && (if map_has ivars "$exc" then false else true)
              then (let _ = map_set ivars "$exc" saved_exc in
                    let _ = (match saved_rl with VNil -> () | v -> map_set prim_missing "rl" v) in

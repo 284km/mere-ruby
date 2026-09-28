@@ -12,7 +12,12 @@ set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
 # MERE overrides the compiler, for a checkout that is not on PATH.
-"${MERE:-mere}" -w "$root/main.mere" > "$here/mere-ruby.wat"
+# ⚠ From a copy with no threads (tools/nothreads_tree.sh): a module that
+# spawns needs a shared memory the page cannot have, and the Wasm backend
+# refuses mere.toml's stack request by name. Fibers there run to completion.
+nt=$(sh "$root/tools/nothreads_tree.sh")
+trap 'rm -rf "$nt"' EXIT
+"${MERE:-mere}" -w "$nt/main.mere" > "$here/mere-ruby.wat"
 wat2wasm --enable-tail-call "$here/mere-ruby.wat" -o "$here/mere-ruby.wasm"
 rm -f "$here/mere-ruby.wat"
 echo "built $here/mere-ruby.wasm ($(wc -c < "$here/mere-ruby.wasm" | tr -d ' ') bytes)"

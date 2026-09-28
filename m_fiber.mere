@@ -1,0 +1,358 @@
+// ---- Fibers: one OS thread per fiber, and a strict hand-off ----------------
+//
+// The evaluator recurses on the C stack, so suspending a Fiber means leaving
+// its C stack where it is and coming back to it later. Nothing in Mere does
+// that on one thread, so a Fiber's body runs on a thread of its own (spawn),
+// and control is handed between threads over channels so that EXACTLY ONE
+// runs interpreter code at any moment. A fiber "switch" is: save what this
+// logical stack owns, send a token to the target's inbox, wait on our own.
+//
+// The half that needs threads -- the inboxes, the switch, starting a thread --
+// is m_fiber_threads.mere, imported below; a build without threads swaps in
+// m_fiber_nothreads.mere (tools/nothreads_tree.sh).
+//
+// Everything here is world-free on purpose: the part that runs Ruby code
+// (the thread body, resume, yield) lives in the evaluator, and it calls these
+// with nothing but fiber indices.
+//
+// Index 0 is the main thread's root fiber. A Ruby Thread's root fiber gets an
+// index when its body starts (see Thread.new); it runs on the OS thread that
+// created it, which is waiting below it -- so its inbox works like any other.
+//
+// ⚠ This relies on `spawn` NOT checking what a named top-level function
+//   touches (Q-179 in the language's open questions): the thread body reads
+//   and writes the interpreter's global maps, which is only sound because the
+//   hand-off is strict. If the language closes that door it has to open
+//   another at the same time; the replacement is expected to be a same-thread
+//   coroutine, and only this file and the thread body would change.
+
+// "cur": the running logical fiber. "next": the next index to hand out.
+// "live": fibers started and not yet terminated. While that is above zero,
+// some C stack other than the running one holds values no collection can see,
+// so nothing may collect (gc_collect's callers ask fb_live).
+let fb_st = map_new ();
+// index -> the Fiber object (a Val, so a GC root)
+let fb_obj = map_new ();
+// index -> the fiber that resumed it, to return to on yield or termination
+let fb_parent = map_new ();
+// index -> 0 created, 1 resumed, 2 suspended, 3 terminated
+let fb_state = map_new ();
+// index -> the Thread it belongs to (object id; 0 for the main thread)
+let fb_thr = map_new ();
+// index -> 1 when it is a thread's root fiber
+let fb_root = map_new ();
+// index -> 1 once it has transferred (or been transferred to)
+let fb_xferd = map_new ();
+// what crosses a switch: "v" the value. fb_xk "k": 0 a value, 1 an exception
+// the other side must re-raise, 2 an exception to raise AT the yield point
+// (Fiber#raise), 3 a kill (Fiber#kill)
+let fb_xfer = map_new ();
+let fb_xk = map_new ();
+// the saved contexts of suspended logical stacks (see fb_ctx_save)
+let fb_sv = map_new ();
+let fb_si = map_new ();
+let fb_ss = map_new ();
+let fb_sn = map_new ();
+
+let fb_cur = fn (u: unit) -> if map_has fb_st "cur" then map_get fb_st "cur" else 0;
+let fb_live = fn (u: unit) -> if map_has fb_st "live" then map_get fb_st "live" else 0;
+let fb_live_add = fn (d: int) -> map_set fb_st "live" (fb_live () + d);
+let fb_state_of = fn (i: int) -> if map_has fb_state i then map_get fb_state i else 0;
+let fb_new_index = fn (u: unit) ->
+  let i = (if map_has fb_st "next" then map_get fb_st "next" else 1) in
+  let _ = map_set fb_st "next" (i + 1) in
+  i;
+// A method frame is live on THIS fiber's stack. live_frames used to hold 1;
+// it holds the owner's index + 1 now, because a `break` or `return` aimed at a
+// frame on another fiber's stack cannot unwind to it -- the frame is suspended
+// somewhere else -- and must be a LocalJumpError instead.
+let fb_frame_mark = fn (fid: int) -> map_set live_frames fid (fb_cur () + 1);
+let fb_frame_live = fn (fid: int) ->
+  map_has live_frames fid && map_get live_frames fid == fb_cur () + 1;
+
+// Each fiber owns a band of call depths, so the tables keyed by depth
+// (call_names_s, call_lines, ...) never collide between two stacks, and the
+// recursion guard counts from the band's base. 20000 is above the guard.
+let fb_band = 20000;
+let fb_depth_base = fn (u: unit) -> if map_has struct_ctr "base" then map_get struct_ctr "base" else 0;
+
+// ---- saving what a logical stack owns --------------------------------------
+// The interpreter keeps its per-stack state in global maps (the depth, the
+// flow signal in flight, the exception in flight, the catch tags, $~ ...),
+// written as though there were one stack. At a switch the leaving stack's
+// entries are copied out, keyed by its index, and put back when it resumes.
+// Whole maps for the small ones that are per-stack through and through; single
+// keys for maps that also hold process-wide entries.
+let fb_key = fn (f: int) -> fn (t: str) -> str_of_int f ++ "|" ++ t;
+let fb_save_sv = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let _ = map_set fb_sn b 0 in
+  map_iter tbl (fn (k: str) -> fn (v: Val) ->
+    let n = map_get fb_sn b in
+    let _ = map_set fb_ss (b ++ "#" ++ str_of_int n) k in
+    let _ = map_set fb_sv (b ++ "=" ++ k) v in
+    map_set fb_sn b (n + 1));
+let fb_restore_sv = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let n = (if map_has fb_sn b then map_get fb_sn b else 0) in
+  let _ = map_clear tbl in
+  let rec go = fn (i: int) ->
+    if i >= n then ()
+    else (let kk = b ++ "#" ++ str_of_int i in
+          let k = map_get fb_ss kk in
+          let _ = map_set tbl k (map_get fb_sv (b ++ "=" ++ k)) in
+          let _ = map_delete fb_ss kk in
+          let _ = map_delete fb_sv (b ++ "=" ++ k) in
+          go (i + 1)) in
+  let _ = go 0 in
+  map_delete fb_sn b;
+let fb_save_si = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let _ = map_set fb_sn b 0 in
+  map_iter tbl (fn (k: str) -> fn (v: int) ->
+    let n = map_get fb_sn b in
+    let _ = map_set fb_ss (b ++ "#" ++ str_of_int n) k in
+    let _ = map_set fb_si (b ++ "=" ++ k) v in
+    map_set fb_sn b (n + 1));
+let fb_restore_si = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let n = (if map_has fb_sn b then map_get fb_sn b else 0) in
+  let _ = map_clear tbl in
+  let rec go = fn (i: int) ->
+    if i >= n then ()
+    else (let kk = b ++ "#" ++ str_of_int i in
+          let k = map_get fb_ss kk in
+          let _ = map_set tbl k (map_get fb_si (b ++ "=" ++ k)) in
+          let _ = map_delete fb_ss kk in
+          let _ = map_delete fb_si (b ++ "=" ++ k) in
+          go (i + 1)) in
+  let _ = go 0 in
+  map_delete fb_sn b;
+let fb_save_ss = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let _ = map_set fb_sn b 0 in
+  map_iter tbl (fn (k: str) -> fn (v: str) ->
+    let n = map_get fb_sn b in
+    let _ = map_set fb_ss (b ++ "#" ++ str_of_int n) k in
+    let _ = map_set fb_ss (b ++ "=" ++ k) v in
+    map_set fb_sn b (n + 1));
+let fb_restore_ss = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let n = (if map_has fb_sn b then map_get fb_sn b else 0) in
+  let _ = map_clear tbl in
+  let rec go = fn (i: int) ->
+    if i >= n then ()
+    else (let kk = b ++ "#" ++ str_of_int i in
+          let k = map_get fb_ss kk in
+          let _ = map_set tbl k (map_get fb_ss (b ++ "=" ++ k)) in
+          let _ = map_delete fb_ss kk in
+          let _ = map_delete fb_ss (b ++ "=" ++ k) in
+          go (i + 1)) in
+  let _ = go 0 in
+  map_delete fb_sn b;
+// one key of a map that is otherwise process-wide
+let fb_save_k = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
+  let kk = fb_key f t ++ "=" ++ k in
+  if map_has tbl k then (let _ = map_set fb_sv kk (map_get tbl k) in map_set fb_si (kk ++ "?") 1)
+  else map_set fb_si (kk ++ "?") 0;
+let fb_restore_k = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
+  let kk = fb_key f t ++ "=" ++ k in
+  let had = (if map_has fb_si (kk ++ "?") then map_get fb_si (kk ++ "?") else 0) in
+  let _ = (if had == 1 then map_set tbl k (map_get fb_sv kk)
+           else if map_has tbl k then map_delete tbl k else ()) in
+  let _ = (if map_has fb_sv kk then map_delete fb_sv kk else ()) in
+  map_delete fb_si (kk ++ "?");
+let fb_save_ki = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
+  let kk = fb_key f t ++ "=" ++ k in
+  if map_has tbl k then (let _ = map_set fb_si kk (map_get tbl k) in map_set fb_si (kk ++ "?") 1)
+  else map_set fb_si (kk ++ "?") 0;
+let fb_restore_ki = fn (f: int) -> fn (t: str) -> fn tbl -> fn (k: str) ->
+  let kk = fb_key f t ++ "=" ++ k in
+  let had = (if map_has fb_si (kk ++ "?") then map_get fb_si (kk ++ "?") else 0) in
+  let _ = (if had == 1 then map_set tbl k (map_get fb_si kk)
+           else if map_has tbl k then map_delete tbl k else ()) in
+  let _ = (if map_has fb_si kk then map_delete fb_si kk else ()) in
+  map_delete fb_si (kk ++ "?");
+
+// the match globals: $! $~ $_ and $1..$9
+let fb_gvar_keys = Cons ("!", Cons ("~", Cons ("_", Cons ("1", Cons ("2", Cons ("3",
+  Cons ("4", Cons ("5", Cons ("6", Cons ("7", Cons ("8", Cons ("9", Nil))))))))))));
+let rec fb_save_gvars = fn (f: int) -> fn (ks: str list) ->
+  match ks with Nil -> () | Cons (k, r) -> let _ = fb_save_k f "g" globals k in fb_save_gvars f r;
+let rec fb_restore_gvars = fn (f: int) -> fn (ks: str list) ->
+  match ks with Nil -> () | Cons (k, r) -> let _ = fb_restore_k f "g" globals k in fb_restore_gvars f r;
+
+let fb_ctx_save = fn (f: int) ->
+  let _ = fb_save_sv f "tf" thread_flag in
+  let _ = fb_save_sv f "fs" flow_sig in
+  let _ = fb_save_sv f "pm" prim_missing in
+  let _ = fb_save_sv f "bt" raise_bt in
+  let _ = fb_save_sv f "ph" pending_home in
+  let _ = fb_save_sv f "lc" load_ctx in
+  let _ = fb_save_sv f "fz" frz_busy in
+  let _ = fb_save_sv f "fk" fm_kw in
+  let _ = fb_save_sv f "bb" bm_bypass in
+  let _ = fb_save_sv f "cd" catch_depth in
+  let _ = fb_save_sv f "ra" ref_active in
+  let _ = fb_save_sv f "ct" cur_thr in
+  let _ = fb_save_si f "cp" cur_pos in
+  let _ = fb_save_si f "bo" blk_ok in
+  let _ = fb_save_si f "ps" pending_srcproc in
+  let _ = fb_save_si f "cs" conv_soft in
+  let _ = fb_save_si f "gb" gc_bare in
+  let _ = fb_save_ss f "cq" cur_pos_s in
+  let _ = fb_save_ss f "xc" lex_cref in
+  let _ = fb_save_ss f "xn" lex_nest in
+  let _ = fb_save_ss f "fl" fsl_ctx in
+  let _ = fb_save_gvars f fb_gvar_keys in
+  let _ = fb_save_k f "iv" ivars_g "$exc" in
+  let _ = fb_save_k f "tr" trace_fn "busy" in
+  let _ = fb_save_k f "tr" trace_fn "tpbusy" in
+  let _ = fb_save_k f "tr" trace_fn "gvbusy" in
+  let _ = fb_save_ki f "sc" struct_ctr "cd" in
+  let _ = fb_save_ki f "sc" struct_ctr "base" in
+  let _ = (if map_has rx_wide 1 then (let _ = map_set fb_si (fb_key f "rw") (map_get rx_wide 1) in map_set fb_si (fb_key f "rw?") 1)
+           else map_set fb_si (fb_key f "rw?") 0) in
+  // the gc_bare baton must not leak to another stack: a method entered there
+  // would skip its unsafe push
+  map_clear gc_bare;
+let fb_ctx_restore = fn (f: int) ->
+  let _ = fb_restore_sv f "tf" thread_flag in
+  let _ = fb_restore_sv f "fs" flow_sig in
+  let _ = fb_restore_sv f "pm" prim_missing in
+  let _ = fb_restore_sv f "bt" raise_bt in
+  let _ = fb_restore_sv f "ph" pending_home in
+  let _ = fb_restore_sv f "lc" load_ctx in
+  let _ = fb_restore_sv f "fz" frz_busy in
+  let _ = fb_restore_sv f "fk" fm_kw in
+  let _ = fb_restore_sv f "bb" bm_bypass in
+  let _ = fb_restore_sv f "cd" catch_depth in
+  let _ = fb_restore_sv f "ra" ref_active in
+  let _ = fb_restore_sv f "ct" cur_thr in
+  let _ = fb_restore_si f "cp" cur_pos in
+  let _ = fb_restore_si f "bo" blk_ok in
+  let _ = fb_restore_si f "ps" pending_srcproc in
+  let _ = fb_restore_si f "cs" conv_soft in
+  let _ = fb_restore_si f "gb" gc_bare in
+  let _ = fb_restore_ss f "cq" cur_pos_s in
+  let _ = fb_restore_ss f "xc" lex_cref in
+  let _ = fb_restore_ss f "xn" lex_nest in
+  let _ = fb_restore_ss f "fl" fsl_ctx in
+  let _ = fb_restore_gvars f fb_gvar_keys in
+  let _ = fb_restore_k f "iv" ivars_g "$exc" in
+  let _ = fb_restore_k f "tr" trace_fn "busy" in
+  let _ = fb_restore_k f "tr" trace_fn "tpbusy" in
+  let _ = fb_restore_k f "tr" trace_fn "gvbusy" in
+  let _ = fb_restore_ki f "sc" struct_ctr "cd" in
+  let _ = fb_restore_ki f "sc" struct_ctr "base" in
+  let rk = fb_key f "rw" in
+  let _ = (if (if map_has fb_si (rk ++ "?") then map_get fb_si (rk ++ "?") else 0) == 1
+           then map_set rx_wide 1 (map_get fb_si rk)
+           else if map_has rx_wide 1 then map_delete rx_wide 1 else ()) in
+  let _ = (if map_has fb_si rk then map_delete fb_si rk else ()) in
+  map_delete fb_si (rk ++ "?");
+
+// A fiber's first run starts from the resumer's state with the per-stack
+// parts emptied: no flow or exception in flight, no catch tags, not "directly
+// inside a Thread block", its own depth band, and the match globals unset.
+let rec fb_clear_gvars = fn (ks: str list) ->
+  match ks with Nil -> () | Cons (k, r) -> let _ = (if map_has globals k then map_delete globals k else ()) in fb_clear_gvars r;
+let fb_ctx_fresh = fn (idx: int) ->
+  let _ = map_clear thread_flag in
+  let _ = map_clear flow_sig in
+  let _ = map_clear prim_missing in
+  let _ = map_clear raise_bt in
+  let _ = map_clear pending_home in
+  let _ = map_clear frz_busy in
+  let _ = map_clear fm_kw in
+  let _ = map_clear bm_bypass in
+  let _ = map_clear catch_depth in
+  let _ = map_clear pending_srcproc in
+  let _ = map_clear conv_soft in
+  let _ = map_clear gc_bare in
+  let _ = fb_clear_gvars fb_gvar_keys in
+  let _ = (if map_has ivars_g "$exc" then map_delete ivars_g "$exc" else ()) in
+  let _ = (if map_has trace_fn "busy" then map_delete trace_fn "busy" else ()) in
+  let _ = (if map_has trace_fn "tpbusy" then map_delete trace_fn "tpbusy" else ()) in
+  let _ = (if map_has trace_fn "gvbusy" then map_delete trace_fn "gvbusy" else ()) in
+  let _ = (if map_has rx_wide 1 then map_delete rx_wide 1 else ()) in
+  // the base is one ABOVE the band's start: the body's block is entered at the
+  // start and is the bottom frame of this stack -- a fiber's backtrace is its
+  // own frames only, and `caller` in the block is empty, as in ruby
+  let _ = map_set struct_ctr "cd" (idx * fb_band) in
+  map_set struct_ctr "base" (idx * fb_band + 1);
+
+// index -> the fiber's storage Hash (a Val, so a GC root); absent = none yet
+let fb_storage = map_new ();
+// Thread (object id, 0 = main) -> its Fiber scheduler (a Val, so a GC root)
+let fb_sched = map_new ();
+// index -> 1 for a fiber made with blocking: true
+let fb_blocking = map_new ();
+// index -> where a fiber entered by transfer returns when it ends
+let fb_ret = map_new ();
+// index -> 1 while it is suspended in a #transfer (it may be transferred back to;
+// a fiber suspended in Fiber.yield may not)
+let fb_sus_x = map_new ();
+
+// put saved entries back OVER a map without emptying it first (the carried
+// exception's report fields, laid over the receiver's own)
+let fb_overlay_sv = fn (f: int) -> fn (t: str) -> fn tbl ->
+  let b = fb_key f t in
+  let n = (if map_has fb_sn b then map_get fb_sn b else 0) in
+  let rec go = fn (i: int) ->
+    if i >= n then ()
+    else (let kk = b ++ "#" ++ str_of_int i in
+          let k = map_get fb_ss kk in
+          let _ = map_set tbl k (map_get fb_sv (b ++ "=" ++ k)) in
+          let _ = map_delete fb_ss kk in
+          let _ = map_delete fb_sv (b ++ "=" ++ k) in
+          go (i + 1)) in
+  let _ = go 0 in
+  map_delete fb_sn b;
+
+// ---- starting a fiber's thread ------------------------------------------------
+// The body is a closure the evaluator registers here (it lives in the
+// evaluator's recursive group, whose members `spawn` will not capture), and
+// the thread is started by a top-level function that captures nothing but an
+// index and a channel. ⚠ The thread reads the table only AFTER its first
+// token: until then the resumer is still running and may be writing it.
+let fb_bodies = map_new ();
+import "m_fiber_threads.mere";
+
+// ---- the envs of every stack, while fibers exist ------------------------------
+// A suspended fiber's locals live in env maps that only its own C stack points
+// at, so no mark can see them -- which is why nothing collects while a fiber
+// is suspended, and why a fiber nobody can reach any more cannot be told from
+// one that is merely waiting. While any fiber is live, every method frame and
+// block env is registered here on entry (key: 2*__eid for a block, 2*__fid+1
+// for a method frame) with the stack it belongs to, and dropped on exit.
+// Before the first fiber exists nothing is registered: the only stack is the
+// running one, and the reclaim pass below runs only at a top-level safepoint,
+// where the running stack holds no frame.
+let fb_envs = map_new ();
+// the reclaim pass's view of the roots: the body procs and the active blocks
+// of the suspended fibers, left out of the scan until their fiber is reached
+let fb_rc_pid = map_new ();
+let fb_rc_eid = map_new ();
+let fb_env_owner = map_new ();
+let fb_env_in = fn (key: int) -> fn env ->
+  if fb_live () > 0
+  then (let _ = map_set fb_envs key env in map_set fb_env_owner key (fb_cur ()))
+  else ();
+let fb_env_out = fn (key: int) ->
+  if map_len fb_envs > 0 && map_has fb_envs key
+  then (let _ = map_delete fb_envs key in map_delete fb_env_owner key)
+  else ();
+
+// abandoning a fiber nobody can reach: it is handed a token that makes it
+// unwind with nothing running on the way (fb_st "abandon" makes rescue and
+// ensure step aside), and its thread ends. ruby never runs an unreachable
+// fiber's ensure either; the collector frees it.
+let fb_abandon = fn (i: int) ->
+  let me = fb_cur () in
+  let _ = (if map_has fb_xferd i then map_delete fb_xferd i else ()) in
+  let _ = map_set fb_parent i me in
+  let _ = map_set fb_state i 1 in
+  let _ = map_set fb_xk "k" 4 in
+  let _ = fb_switch me i in
+  map_set fb_state me 1;

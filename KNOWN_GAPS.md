@@ -67,6 +67,75 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
+## A Fiber runs on a thread of its own, and while one is suspended nothing is collected
+
+```ruby
+fib = Fiber.new { a, b = 0, 1; loop { Fiber.yield a; a, b = b, a + b } }
+p 10.times.map { fib.resume }     # works: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+e = Enumerator.new { |y| loop { y << rand } }
+e.next                            # works: the source is stepped, not drained
+```
+
+The evaluator recurses on the C stack, so suspending a fiber means leaving its
+C stack where it is. Mere has no way to do that on one thread, so each fiber's
+body runs on an OS thread of its own (`spawn`), and control is handed between
+threads over channels so that exactly one runs interpreter code at any moment
+(`m_fiber.mere`, `m_fiber_threads.mere`). Everything the interpreter keeps
+per stack in global maps -- the depth, the flow or exception in flight, the
+catch tags, `$~` -- is saved at a switch and put back, and each fiber has a band
+of call depths of its own.
+
+**What it costs.**
+
+- **A switch is about 4.6 µs** (a round trip through a pthread condition
+  variable measures 4.0-4.4 µs on the same machine; CRuby's is about 0.1 µs).
+- **A live fiber is an OS thread**: 8192 per process on macOS
+  (`kern.num_taskthreads`). Past that, starting one is
+  `FiberError: can't alloc machine stack to fiber`.
+- **Its stack is the interpreter's 512 MB** (address space, not memory:
+  `mere.toml` asks for it and the compiler gives it to every spawned thread,
+  mere v0.1.540), so a fiber recurses as deep as the main thread -- deeper than
+  ruby's fibers, whose smaller VM stack stops at about 1250 levels.
+
+**While a fiber is suspended, nothing is collected.** Its C stack holds values
+that no mark can see, and a collection compacts the arenas those values point
+into. Where the driver would collect, a pass first finds the suspended fibers
+nobody can reach any more -- marking without the fibers' own stacks, which
+count only once their Fiber object is reached -- and abandons them: they
+unwind with no `rescue` or `ensure` running (ruby never runs an unreachable
+fiber's ensure either) and give their threads back. A fiber that IS still
+reachable holds collection off until it ends: `while row = csv.shift` keeps
+the CSV's parser fiber alive for the whole loop, and nothing the loop builds is
+collected until then.
+
+**`Enumerator#next` uses a fiber only when it has to.** A builtin iteration of
+a finite Array, Hash, String or Range cannot run a program's code, so it gives
+the same answers driven ahead, and its `#next` reads a buffer filled once --
+no fiber, no hold on the collector. A generator, a Lazy, an object's own
+`#each` or an endless range is stepped on a fiber. `#rewind` of one in progress
+KILLS its fiber, so the source's `ensure` runs then; ruby leaves the abandoned
+fiber to the collector, which does not run it.
+
+**Threads are not scheduled by this.** `Thread.new` still runs its body at
+once (see the synchronous model); a Thread body gets a root fiber of its own,
+so `Fiber.current`, fiber storage and `Thread#[]` inside it answer as ruby's.
+
+**The builds without threads** -- the Wasm playground (a module that spawns
+needs a shared memory the page cannot have) and the RV targets (no `spawn`) --
+compile `m_fiber_nothreads.mere` in `m_fiber_threads.mere`'s place
+(`tools/nothreads_tree.sh`): a fiber runs to completion on its first `#resume`
+and `Fiber.yield` is `NotImplementedError`.
+
+**It rests on a gap in the language.** `spawn`'s capture check does not follow
+a named top-level function into the globals it touches (Q-179 in the
+language's open questions), and the fiber threads touch the interpreter's
+global maps; that is sound only because the hand-off is strict.
+
+**What fixing it would take.** A coroutine that runs on the same thread
+(a language primitive that switches C stacks), which removes the thread per
+fiber, the switch cost and the Q-179 dependence at once; and frames that are
+roots, which is what collecting under a suspended stack needs.
+
 ## ENV is read through a subprocess, so it carries the shell's own variables
 
 ```sh
