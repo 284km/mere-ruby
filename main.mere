@@ -7854,6 +7854,10 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // for the same reason: the generic form printed the bookkeeping ivars
     else if (if has_meth world cls "inspect" then false else true) && map_has iv2 (str_of_int oid ++ "@__fb_idx")
     then fb_inspect world v
+    // ...and `p thread` is Thread#inspect, which printed its @__tst
+    else if (if has_meth world cls "inspect" then false else true) && map_has iv2 (str_of_int oid ++ "@__tst")
+            && thr_is_thread world v
+    then thread_inspect world v
     // an #inspect that answers a NON-String is asked #to_s, and only if THAT
     // is not a String either does the default rendering stand in. #to_str is
     // never asked (the spec pins that too). `to_s other` skipped the dispatch
@@ -10364,7 +10368,8 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      | VObj oid ->
        let (_, _, ocls9, _) = world in
        let c9 = map_get ocls9 oid in
-       if (str_len name == 4 && str_eq name "to_s") then mkstr ("#<" ++ cls_display world (obj_print_cls world c9) ++ ":0x" ++ hex_pad16 oid ++ ">")
+       if thr_is_thread world recv then thread_inspect_v world recv
+       else if (str_len name == 4 && str_eq name "to_s") then mkstr ("#<" ++ cls_display world (obj_print_cls world c9) ++ ":0x" ++ hex_pad16 oid ++ ">")
        else mkstr (inspect_w env world recv)
      | _ -> mkstr (inspect_w env world recv))
   // `o.singleton_class.to_s` -- an explicit call, so it arrives here rather than
@@ -16879,7 +16884,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
           else if (str_len name == 8 && str_eq name "priority") then VInt 0
           else if (str_len name == 9 && str_eq name "priority=") then (match args with Cons (v, _) -> v | _ -> VNil)
           else if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") then
-            mkstr ("#<Thread " ++ (match tst with VStr h -> sget h | VBool _ -> "dead" | _ -> "dead") ++ ">")
+            thread_inspect_v world recv
           // the universal names, same reason as the ThreadGroup arm above --
           // this one refused four of them.
           else if is_prim_method name then dispatch_prim env world blk recv name args false
@@ -18575,6 +18580,8 @@ and invoke_with_block = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (na
           let tid = alloc_oid ocls3 in
           let _ = map_set ocls3 tid "Thread" in
           let _ = map_set iv3 (str_of_int tid ++ "@__tst") (mkstr "run") in
+          // where it was made, which #inspect shows
+          let _ = map_set iv3 (str_of_int tid ++ "@__tloc") (mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()))) in
           let _ = map_set all_thr (str_of_int (map_len all_thr)) (VObj tid) in
           let savedcur = (if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
           let savedthr = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
@@ -27248,6 +27255,14 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        // method must reach it (Date.parse builds its result that way).
        if (str_len name == 3 && str_eq name "new") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then new_obj world c args
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world noblk (VClass c) ("(sng:" ++ c ++ ")") name args
+       // ⚠ Kernel's three bare specials (sleep, fork, exit) live in
+       //   undef_call_exc_x, and the receiver dispatcher below has no arm for
+       //   them -- so a bare `sleep` in a class method, or in a Thread block
+       //   written inside one, was "undefined method 'sleep' for module M"
+       //   and killed the thread instead of parking it. A class is an Object
+       //   and has Kernel's private methods like any other.
+       else if kernel_bare_special name && (if has_meth world "Module" name then false else true) then
+         undef_call_exc_x world (blamed (VClass c)) name args explicit
        // a bare call inside a class/module body (self is the class) routes
        // through the receiver dispatcher so builtins like module_eval/class_eval
        // apply; invoke_val_c raises NoMethodError itself if truly undefined.
@@ -27351,6 +27366,9 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
        // method must reach it (Date.parse builds its result that way).
        if (str_len name == 3 && str_eq name "new") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then new_obj world c args
        else if has_meth world ("(sng:" ++ c ++ ")") name then invoke world noblk (VClass c) ("(sng:" ++ c ++ ")") name args
+       // ...and Kernel's bare specials, as in try_self_call_x's VClass arm
+       else if kernel_bare_special name && (if has_meth world "Module" name then false else true) then
+         undef_call_exc world (blamed (VClass c)) name args
        else invoke_val_c env world noblk (VClass c) name args false
      | other ->
        // primitive self (a reopened built-in class's method body): user
@@ -30602,6 +30620,26 @@ and fb_index_of = fn world -> fn (v: Val) ->
   | VObj id -> (match fb_iv world id "@__fb_idx" with VInt i -> i | _ -> 0 - 1)
   | _ -> 0 - 1
 and fb_is_fiber = fn world -> fn (v: Val) -> fb_index_of world v >= 0
+// Thread#inspect / #to_s: `#<Thread:0x..[@name] [file:line ]status>`, the
+// place being where Thread.new was called (the main thread has none) and the
+// status word what #status says, `dead` for both ways of ending
+and thread_inspect = fn world -> fn (v: Val) ->
+  match v with
+  | VObj oid ->
+    (let (_, _, o9, iv9) = world in
+     let k = str_of_int oid in
+     let nm = (match (if map_has iv9 (k ++ "@__tname") then map_get iv9 (k ++ "@__tname") else VNil) with
+               | VStr h -> "@" ++ sget h | _ -> "") in
+     let loc = (match (if map_has iv9 (k ++ "@__tloc") then map_get iv9 (k ++ "@__tloc") else VNil) with
+                | VStr h -> " " ++ sget h | _ -> "") in
+     let st = (match (if map_has iv9 (k ++ "@__tst") then map_get iv9 (k ++ "@__tst") else VBool false) with
+               | VStr h -> sget h | _ -> "dead") in
+     "#<" ++ cls_display world (obj_print_cls world (map_get o9 oid)) ++ ":0x" ++ hex_pad16 oid ++ nm ++ loc ++ " " ++ st ++ ">")
+  | _ -> "#<Thread>"
+// ...as a String: BINARY, unless a name made it UTF-8 (ruby's answer)
+and thread_inspect_v = fn world -> fn (v: Val) ->
+  let s9 = thread_inspect world v in
+  mkstr_e s9 (if enc_all7 s9 then "ASCII-8BIT" else "UTF-8")
 // Kernel#raise's body, for the callers that reach it by NAME
 and kernel_raise_now = fn world -> fn (args: Val list) ->
   let (_, _, _, iv0) = world in
