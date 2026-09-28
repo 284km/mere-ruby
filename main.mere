@@ -11349,7 +11349,7 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
        else if (str_len name == 16 && str_eq name "handle_interrupt") then
          raise_exc world "ArgumentError" "block is needed."
        else if (str_len name == 18 && str_eq name "pending_interrupt?") then
-         VBool (map_has ivars (str_of_int (sch_me ()) ++ "@__tpend"))
+         VBool (sch_pending_is world (sch_me ()) args)
        // under the scheduler Thread.stop waits until woken -- unless nobody
        // else is alive to wake it
        else if (str_len name == 4 && str_eq name "stop") && fb_can_suspend then
@@ -11550,6 +11550,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     //   and a method call clears it, so a bare sleep inside a method a thread
     //   calls returns at once instead of parking. Which thread is running is
     //   what the question is about, and cur_thr answers it.
+    // under the scheduler it is a millisecond's wait that lets every other
+    // thread run first (the prelude's readiness loop asks again after it)
+    else if str_eq c "IO" && (str_len name == 6 && str_eq name "__park") && fb_can_suspend then
+      (let _ = sch_block world 1 0 (sch_now () + 1000000) in VNil)
+    else if str_eq c "IO" && (str_len name == 8 && str_eq name "__sched?") then VBool fb_can_suspend
     else if str_eq c "IO" && (str_len name == 6 && str_eq name "__park") then
       (let t9 = (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) in
        let m9 = (if map_has all_thr "0" then map_get all_thr "0" else VNil) in
@@ -31120,16 +31125,21 @@ and sch_me = fn (u: unit) ->
   | _ -> sch_main ()
 // Hand the thread to t -- to the fiber t was running when it stopped -- and
 // come back when something hands it back.
-and sch_run = fn (t: int) ->
+and sch_run = fn world -> fn (t: int) ->
+  let (_, _, _, iv) = world in
   let me = sch_me () in
   let _ = map_set sch_fb me (fb_cur ()) in
-  fb_switch (fb_cur ()) (map_get sch_fb t)
+  // $? belongs to the thread (the last child IT waited for): kept on the
+  // Thread object while another thread runs
+  let _ = map_set iv (str_of_int me ++ "@__tq") (if map_has globals "?" then map_get globals "?" else VNil) in
+  let _ = fb_switch (fb_cur ()) (map_get sch_fb t) in
+  map_set globals "?" (if map_has iv (str_of_int me ++ "@__tq") then map_get iv (str_of_int me ++ "@__tq") else VNil)
 // Let the others run until something makes `me` runnable and picks it.
 and sch_dispatch = fn world -> fn (me: int) ->
   let (_, _, _, iv) = world in
   let t = sch_pick () in
   if t == me then ()
-  else if t >= 0 then sch_run t
+  else if t >= 0 then sch_run world t
   else if t == 0 - 1 then
     // nobody can run and every live thread waits on another: the main thread
     // is told, and whoever it was waiting on stays waiting
@@ -31208,8 +31218,31 @@ and sch_mask_mode = fn world -> fn (me: int) -> fn (e: Val) ->
 // the block. What it lets through that is already pending runs first; what
 // it held back runs when the block ends -- even when the block raised, and
 // then the interrupt is what propagates.
+// is an interrupt pending for t -- of the given class, when one is named?
+and sch_pending_is = fn world -> fn (t: int) -> fn (args: Val list) ->
+  let (_, _, ocls, iv) = world in
+  let k = str_of_int t ++ "@__tpend" in
+  if (if map_has iv k then false else true) then false
+  else
+    (match args with
+     | Cons (VClass c, _) ->
+       (let ecls = (match map_get iv k with VExc (c9, _) -> c9 | VObj o -> (if map_has ocls o then map_get ocls o else "Object") | _ -> "Object") in
+        exc_is_a world ecls c)
+     | _ -> true)
 and thread_handle_interrupt = fn env -> fn world -> fn blk -> fn newblk -> fn (args: Val list) ->
   let (_, _, _, iv) = world in
+  // every mode in the mask must be one of the three
+  let _ = (match args with
+           | Cons (VHsh hid, _) ->
+             (let rec chk = fn (ps: Val list) ->
+                match ps with
+                | Cons (_, Cons (VSym md, r)) ->
+                  (if str_eq md "immediate" || str_eq md "on_blocking" || str_eq md "never" then chk r
+                   else raise_exc world "ArgumentError" "unknown mask signature")
+                | Cons (_, Cons (_, _)) -> raise_exc world "ArgumentError" "unknown mask signature"
+                | _ -> VNil in
+              chk (hderef hid))
+           | _ -> VNil) in
   let me = sch_me () in
   let k = str_of_int me ++ "@__tmask" in
   let mask = (match args with Cons (h, _) -> h | Nil -> VNil) in
@@ -31328,6 +31361,8 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
   let _ = map_set catch_depth "n" (VInt 0) in
   let _ = map_set thread_flag "n" (VBool true) in
   let _ = map_set globals "~" VNil in
+  // ...and no $? of its own yet (Process.last_status is nil in a new thread)
+  let _ = map_set globals "?" VNil in
   let args = (match (if map_has iv3 (k ++ "@__targs") then map_get iv3 (k ++ "@__targs") else VNil) with
               | VArr aid -> deref aid | _ -> (Nil : Val list)) in
   let result = try_or (fn (u: unit) ->
@@ -31607,7 +31642,7 @@ and thread_inst_sch = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (tid:
      | a9 -> raise_exc world "TypeError" ("can't convert " ++ class_name a9 ++ " into time interval"))
   else if (str_len name == 6 && str_eq name "status") then
     (if alive then (if sch_status_sleeping tid then mkstr "sleep" else tst) else tst)
-  else if (str_len name == 18 && str_eq name "pending_interrupt?") then VBool (map_has ivars (k ++ "@__tpend"))
+  else if (str_len name == 18 && str_eq name "pending_interrupt?") then VBool (sch_pending_is world tid args)
   else if (str_len name == 6 && str_eq name "alive?") then VBool alive
   else if (str_len name == 5 && str_eq name "stop?") then
     VBool (if alive then sch_status_sleeping tid else true)
