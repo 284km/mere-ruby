@@ -8890,18 +8890,20 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
      && (if has_meth world (dispatch_cls_of world recv) name then false else true)
      && (if has_meth world (dispatch_cls_of world recv) "method_missing" then false else true)
      // ...except Fiber#raise, which raises in THAT fiber
-     && (if (str_len name == 5 && str_eq name "raise") && fb_is_fiber world recv then false else true) then
-    (let (m9r, s9r, o9r, iv0) = world in
-     let exc = (match args with
-                | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
-                          then map_get globals "!" else make_exc_w world Nil)
-                | _ -> make_exc_w world args) in
-     let _ = map_set iv0 "$exc" exc in
-     let _ = note_raise_site () in
-     let _ = tp_raise world exc in
-     let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
-     (let m = "mere-ruby: (ruby exception raised)" in
-      let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m))
+     && (if (str_len name == 5 && str_eq name "raise") && fb_is_fiber world recv then false else true)
+     // ...and Thread#raise aimed at ANOTHER thread, which the Thread arm
+     //   delivers (or ignores, for a dead one). ⚠ This arm took it and
+     //   raised "undefined method 'raise' for main" in the CALLER.
+     && (if (str_len name == 5 && str_eq name "raise") && thr_is_thread world recv && (if thr_is_current recv then false else true)
+         then false else true) then
+    (
+     // `Thread.current.raise` with no argument is a RuntimeError with an
+     // empty message even inside a rescue: unlike Kernel#raise it does not
+     // re-raise $!
+     let args = (match args with
+                 | Nil -> (if (str_len name == 5 && str_eq name "raise") && thr_is_thread world recv then Cons (mkstr "", Nil) else Nil)
+                 | _ -> args) in
+     kernel_raise_now world args)
   else
   // a mutating method on a frozen String / Array / Hash raises FrozenError
   // before any dispatch (CRuby's message: `can't modify frozen X: <inspect>`).
@@ -13212,6 +13214,11 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
                                 Cons ("blocking?", Cons ("storage", Cons ("storage=", Cons ("inspect", Cons ("to_s", Nil)))))))))))
                        (fn (nf9: str) -> (if fb_inst_name nf9 && (if map_has meths0 (pfx ++ nf9) then false else true) then push9 nf9 else ()))
                    else ()) in
+          // ...THREAD's, which live in the dispatcher the same way
+          let _ = (if str_eq cx "Thread" && (if want_prot || want_priv then false else true) then
+                     list_iter (thread_inst_names ())
+                       (fn (nt9: str) -> (if map_has meths0 (pfx ++ nt9) then () else push9 nt9))
+                   else ()) in
           // ...and CLASS's.
           let _ = (if str_eq cx "Class" && (if want_prot then false else true) then
                      list_iter (str_split (name_spec (if want_priv then "clspriv" else "clspub")) "|")
@@ -16725,6 +16732,9 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
     //     recorded rows with it.
     else if is_kernel_builtin name && (if kernel_bare_special name then false else true)
             && (if has_meth world cls name then false else true)
+            // ⚠ ...but not a name THREAD answers itself: `t.raise` is
+            //   Thread#raise, and Kernel's took it (raising in the caller)
+            && (if str_eq cls "Thread" && str_list_has (thread_inst_names ()) name then false else true)
             && str_list_has (ancestors_of world cls) "Kernel" then
       try_self_call_x env world recv name args true
     // Thread instance surface (synchronous model): the body already ran to
@@ -16770,16 +16780,18 @@ and invoke_val_c = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0:
             //   boundary to keep nil instead of the block's value.
             (let _ = (if alive then (let _ = map_set ivars (k ++ "@__tkill") (VBool true) in
                                      map_set ivars (k ++ "@__tst") (VBool false)) else ()) in recv)
+          // raising into the CURRENT thread is Kernel#raise, except that no
+          // argument means RuntimeError "" even inside a rescue
+          else if (str_len name == 5 && str_eq name "raise") && thr_is_current recv then
+            kernel_raise_now world (match args with Nil -> Cons (mkstr "", Nil) | _ -> args)
           else if (str_len name == 5 && str_eq name "raise") then
             // raising into a parked thread kills it with the exception (join
             // re-raises); raising into a dead thread is a no-op.
             (let _ =
                (if alive then
                   let exc = (match args with
-                             | Cons (VClass ec, Cons (VStr mh, _)) -> VExc (ec, sget mh)
-                             | Cons (VClass ec, _) -> VExc (ec, ec)
-                             | Cons (VStr mh, _) -> VExc ("RuntimeError", sget mh)
-                             | _ -> VExc ("RuntimeError", "")) in
+                             | Nil -> VExc ("RuntimeError", "")
+                             | _ -> make_exc_w world args) in
                   let _ = map_set ivars (k ++ "@__texc") exc in
                   map_set ivars (k ++ "@__tst") VNil
                 else ()) in
@@ -30590,6 +30602,31 @@ and fb_index_of = fn world -> fn (v: Val) ->
   | VObj id -> (match fb_iv world id "@__fb_idx" with VInt i -> i | _ -> 0 - 1)
   | _ -> 0 - 1
 and fb_is_fiber = fn world -> fn (v: Val) -> fb_index_of world v >= 0
+// Kernel#raise's body, for the callers that reach it by NAME
+and kernel_raise_now = fn world -> fn (args: Val list) ->
+  let (_, _, _, iv0) = world in
+  let exc = (match args with
+             | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
+                       then map_get globals "!" else make_exc_w world Nil)
+             | _ -> make_exc_w world args) in
+  let _ = map_set iv0 "$exc" exc in
+  let _ = note_raise_site () in
+  let _ = tp_raise world exc in
+  let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
+  (let m = "mere-ruby: (ruby exception raised)" in
+   let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr m)) in fail m)
+// a Thread object (or one of a Thread subclass's), and whether it is the
+// thread this code runs on -- the two cases of Thread#raise
+and thr_is_thread = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id -> (let (_, _, o9, _) = world in
+                map_has o9 id && (let c9 = map_get o9 id in str_eq c9 "Thread" || str_list_has (ancestors_of world c9) "Thread"))
+  | _ -> false
+and thr_is_current = fn (v: Val) ->
+  let cur = (if map_has cur_thr "t" then map_get cur_thr "t" else if map_has cur_thr "v" then map_get cur_thr "v" else VNil) in
+  (match (v, cur) with
+   | (VObj a, VObj b) -> a == b
+   | _ -> false)
 and fb_thread_of = fn (i: int) -> if map_has fb_thr i then map_get fb_thr i else 0
 and fb_is_root = fn (i: int) -> map_has fb_root i
 // the object for an index, made on first ask (a root fiber has none until
