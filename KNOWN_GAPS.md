@@ -3808,7 +3808,61 @@ no descriptor. NotImplementedError is what ruby raises on a platform without
 `dirfd`, and it is the honest answer -- a made-up number would be accepted by
 every caller and wrong for all of them.
 
-## An IO here has a descriptor now, but does not READ OR WRITE through it
+## A descriptor IO reads and writes through its descriptor; a File still does not
+
+Updated 2026-09-29. There are two kinds of stream here, and they are no longer
+the same model with a descriptor bolted on:
+
+  - A DESCRIPTOR STREAM -- what IO.new / IO.for_fd / IO.open / IO.sysopen /
+    IO.pipe / IO.popen make, and STDOUT.dup -- is ruby, in the prelude's IO
+    layer (m_driver's core_prelude_k), over one-system-call primitives
+    (io_fd_prim: open, read, write, lseek, close, dup, dup2, pipe, fsync). It
+    has a read buffer and a write buffer the way ruby's rb_io_t does, and every
+    stream method answers from the descriptor. The dispatcher sends such an
+    object's `x` to the layer's `__fd_x` (fdio_route), so none of it shadows
+    the File model.
+  - A FILE is still a path, a mode, a position and a write buffer over the
+    whole-file externs. Its READERS AND WRITERS are ruby now (read, write,
+    print, puts, gets, each_line, readlines, getc, ungetc ...) over two
+    builtin byte primitives (`__f_read`, `__f_write`), which is what gives it
+    the separators, limits, paragraph mode, #lineno, pushback, BOMs, keyword
+    options and the encodings -- none of which the builtin arm could see.
+
+What the kernel cannot be asked, and how each is answered instead:
+
+  - fcntl(2) is variadic and no extern can declare it. The process keeps its
+    own table of what it opened (fd_acc / fd_nb / fd_keep in m_state): the
+    access mode (IO.new refuses a mode the descriptor was not opened with --
+    EINVAL, as F_GETFL tells ruby), O_NONBLOCK, and close-on-exec. `#fcntl`
+    answers F_GETFD / F_SETFD / F_GETFL / F_SETFL from it and refuses the rest.
+  - CLOSE-ON-EXEC is honoured where this interpreter starts a child: the shell
+    Process.spawn and IO.popen start closes every descriptor the process holds
+    except those the program cleared the flag on (and the ones a redirect
+    hands down). `system` and backticks go through the runtime's own spawn and
+    still inherit them.
+  - `nonblock = false` cannot clear O_NONBLOCK (fcntl again). It is recorded
+    on the stream and #nonblock? reports it; reads on it wait for data as a
+    blocking one would, which the layer does on a would-block anyway.
+  - A pipe's ends are non-blocking, as ruby 3's are, and a read that would
+    block WAITS in IO.select's readiness loop -- letting other threads run,
+    and naming a pipe nothing in this process can ever write to as the
+    deadlock it is. SIGPIPE is ignored from the first IO.pipe on, so a write
+    nobody reads is Errno::EPIPE (sigignore(2)); not at startup, because the
+    builtin output path does not look at a write's result.
+  - IO.popen runs its child through Process.spawn, so the child is a
+    grandchild (see the next section): #pid is its real pid and #close sets
+    $?, but a child killed by a signal reports an exit status, and `popen("-")`
+    (fork) is NotImplementedError.
+  - A File opens no descriptor until one is asked for, so opening a device
+    that cannot be opened (/dev/tty with no controlling terminal: ENXIO) is not
+    refused at the open. A read of a file whose whole-file read is empty is
+    asked of its descriptor, which is what makes /dev/zero read as zeros.
+  - A File cannot be #reopen'ed onto a descriptor stream (it has no path);
+    onto another File it takes that File's path, mode and position.
+  - Standard input is read as it arrives (stdin_more), one read(2) at a time,
+    into the buffer Kernel#gets and STDIN share.
+
+## The old note on the descriptor, kept for what it measured
 
 Updated 2026-09-23. A File carries a real descriptor: `#fileno` answers the
 kernel's number, `IO.new(fd, path:)` and `IO.for_fd(fd)` attach to one, and
@@ -3860,8 +3914,8 @@ because the process is not this one's child in the kernel's sense. Divergences:
   - `pgroup:` is recorded (so `Process.wait(0)` skips such a child) but no
     group is made; `rlimit_*`, `close_others` and `new_pgroup` are accepted
     and ignored;
-  - `IO.popen` still does not exist: its pipe ends are non-blocking here (see
-    above), and a child writing into or reading from one would see EAGAIN.
+  - IO.popen is written over this (the pipes it hands the child are blocking
+    ones), so a popen'd child that dies of a signal is an exit status too.
 
 ## The old note, kept for the shape of the problem
 

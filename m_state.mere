@@ -146,6 +146,20 @@ extern fn fd_dup: int -> int;
 extern fn dup2: int -> int -> int;
 extern fn fd_isatty: int -> int;
 extern fn fd_pipe: unit -> int;
+// dup2(2) and fsync(2) are plain <unistd.h> functions of ints, so an extern
+// names them exactly (`int dup2(int, int)`, `int fsync(int)`): IO#reopen puts
+// another stream's descriptor UNDER this one's number, which is the one thing
+// dup(2) cannot do, and #fsync is the kernel's own promise.
+extern fn dup2: int -> int -> int;
+extern fn fsync: int -> int;
+// ...and SIGPIPE's disposition, which is the difference between a write to a
+// pipe nobody reads any more being Errno::EPIPE (ruby) and the process dying
+// of the signal (C's default). <signal.h> declares `int sigignore(int)`, so
+// this is exact too. It is asked for when the program makes its first pipe
+// and not at startup: the builtin output path does not look at a write's
+// result, so a program whose OWN stdout is a closed pipe is ended by the
+// signal and would otherwise go on printing into nothing.
+extern fn sigignore: int -> int;
 // O_NONBLOCK on a descriptor. ⚠ Both ends of a pipe get it, and the reason is
 //   this interpreter's THREAD MODEL rather than performance: a thread body
 //   here runs to completion at Thread.new, so when a read would block there is
@@ -329,9 +343,10 @@ let str_is_ascii = fn (hid: int) ->
 let sset = fn (id: int) -> fn (s: str) ->
   let _ = map_delete str_ascii id in
   let _ = vec_set str_store (id - handle_base) s in ();
-// Kernel#gets state: stdin is slurped once (read_stdin) into stdin_src "s",
-// then handed out one line at a time via a cursor stdin_src_pos "p". Lets
-// `while line = gets` terminate at EOF (nil) the way Ruby does.
+// Kernel#gets state: what has been read of stdin, in stdin_src "s", handed
+// out through a cursor stdin_src_pos "p"; stdin_src "done" is the end of the
+// input (see stdin_more). Lets `while line = gets` terminate at EOF (nil) the
+// way Ruby does.
 let stdin_src = map_new ();
 let stdin_src_pos = map_new ();
 // hashes are mutable reference types too: VHsh is a HANDLE into hash_store,
@@ -1307,14 +1322,14 @@ let name_spec = fn (tag: str) ->
   else if str_eq tag "filens" then ("absolute_path|absolute_path?|basename|binread|binwrite|chmod|delete|"
     ++ "directory?|dirname|"
     ++ "empty?|executable?|executable_real?|exist?|expand_path|extname|file?|"
-    ++ "fnmatch|fnmatch?|foreach|identical?|join|link|new|open|path|read|readable?|"
-    ++ "readable_real?|readlines|rename|size|size?|split|symlink|"
+    ++ "fnmatch|fnmatch?|identical?|join|link|new|open|path|read|readable?|"
+    ++ "readable_real?|rename|size|size?|split|symlink|"
     ++ "symlink?|truncate|unlink|writable?|writable_real?|write|zero?")
   // ...and which of those are the stat predicates, whose argument is checked
   // the way rb_stat checks it (fpred_args in main.mere)
   else if str_eq tag "fpred" then ("directory?|empty?|executable?|executable_real?|exist?|file?|"
     ++ "identical?|readable?|readable_real?|size|size?|symlink?|writable?|writable_real?|zero?")
-  else if str_eq tag "ions" then ("read|write|binread|binwrite|readlines|foreach")
+  else if str_eq tag "ions" then ("binread")
   else if str_eq tag "dirns" then ("[]|chdir|__children|delete|__entries|exist?|getwd|glob|home|mkdir|new|"
     ++ "open|pwd|rmdir|tmpdir|unlink")
   else if str_eq tag "mathns" then ("acos|acosh|asin|asinh|atan|atan2|atanh|cbrt|cos|cosh|erf|erfc|exp|"
@@ -1467,6 +1482,38 @@ let tcp_arena = fn () ->
   if map_has tcp_buf "p" then (match map_get tcp_buf "p" with VInt p -> p | _ -> 0)
   else (let p = mem_alloc 65536 in let _ = map_set tcp_buf "p" (VInt p) in p);
 
+// ⚠ STANDARD INPUT IS READ AS IT ARRIVES, one read(2) at a time, into the
+//   buffer Kernel#gets, STDIN and ARGF share. It used to be slurped whole on
+//   the first read, so nothing could be read from a pipe until its writer
+//   closed it: a prompt's answer, or a child answering its parent through
+//   IO.popen, waited for an end of file that was never going to come
+//   (core/io/copy_stream's popen'd child hung the sweep on exactly that).
+//   The Wasm host has no descriptor 0 to read, which is the end of the input.
+let stdin_more = fn (u: unit) ->
+  if map_has stdin_src "done" then false
+  else
+    (let p = tcp_arena () in
+     let n = fd_read 0 p 65536 in
+     if n <= 0 then (let _ = map_set stdin_src "done" "1" in false)
+     else
+       (let _ = map_set stdin_src "s" ((if map_has stdin_src "s" then map_get stdin_src "s" else "") ++ mem_to_str p n) in
+        true));
+let stdin_buf = fn (u: unit) -> if map_has stdin_src "s" then map_get stdin_src "s" else "";
+let stdin_cur = fn (u: unit) -> if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0;
+// the buffer with the whole of the input in it
+let rec stdin_all_go = fn (u: unit) -> if stdin_more () then stdin_all_go () else ();
+let stdin_whole = fn (u: unit) -> let _ = stdin_all_go () in stdin_buf ();
+// ...or at least `want` bytes past the cursor (fewer only at the end)
+let rec stdin_want = fn (want: int) ->
+  if str_len (stdin_buf ()) - stdin_cur () >= want then ()
+  else if stdin_more () then stdin_want want else ();
+// ...or a whole line past the cursor (or the rest, at the end)
+let rec stdin_nl_from = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then false else if str_eq (char_at s i) "\n" then true else stdin_nl_from s (i + 1);
+let rec stdin_line = fn (u: unit) ->
+  if stdin_nl_from (stdin_buf ()) (stdin_cur ()) then ()
+  else if stdin_more () then stdin_line () else ();
+
 // The names a CLOSED File still answers. Measured against the reference over
 // 47 methods, not guessed: `close`, `closed?`, `path`, `to_path`, `each_line`,
 // `each`, `inspect` and `to_s` answer, and everything else raises IOError --
@@ -1489,6 +1536,7 @@ let _ = map_set closed_ok "inspect" VNil;
 let _ = map_set closed_ok "to_s" VNil;
 // ...and #reopen, whose whole point is a handle that is closed now
 let _ = map_set closed_ok "reopen" VNil;
+let _ = map_set closed_ok "__f_reopen" VNil;
 
 // ⚠ A MODE IS A DIRECTION, AND THE DIRECTION WAS NEVER CHECKED. A File
 // opened "w" happily answered #gets, #readlines and #eof? from the bytes on
@@ -1504,6 +1552,7 @@ let _ = map_set closed_ok "reopen" VNil;
 // stream rather than its contents and runs whichever way it was opened.
 let io_reads = map_new ();
 let _ = map_set io_reads "read" VNil;
+let _ = map_set io_reads "__f_read" VNil;
 let _ = map_set io_reads "gets" VNil;
 let _ = map_set io_reads "readlines" VNil;
 let _ = map_set io_reads "readline" VNil;
@@ -1533,6 +1582,7 @@ let stdio_bypass = map_new ();
 let _ = map_set stdio_bypass "" 0;
 let io_writes = map_new ();
 let _ = map_set io_writes "write" VNil;
+let _ = map_set io_writes "__f_write" VNil;
 let _ = map_set io_writes "puts" VNil;
 let _ = map_set io_writes "print" VNil;
 let _ = map_set io_writes "printf" VNil;
@@ -1941,38 +1991,48 @@ let fd_put = fn (fd: int) -> fn (s: str) ->
   let n = str_len s in
   let _ = (if str_has_nul s then tcp_put_bytes p s 0 n else (let _ = mem_copy_str p 0 s in ())) in
   fd_write fd p n;
+// ...and all of a string, 64 KiB at a time (the arena is one block): how many
+// bytes the kernel took, stopping at the first refusal -- -1 only when it took
+// none. A non-blocking pipe that fills part way answers the part.
+let rec fd_put_all = fn (fd: int) -> fn (s: str) -> fn (off: int) -> fn (done: int) ->
+  if off >= str_len s then done
+  else
+    (let e = (if off + 65536 > str_len s then str_len s else off + 65536) in
+     let n = fd_put fd (substring s off e) in
+     if n < 0 then (if done == 0 then 0 - 1 else done)
+     else if n == 0 then done
+     else fd_put_all fd s (off + n) (done + n));
+// the IO subclasses whose instances are descriptor streams (IO.__fdclass)
+let fdio_cls = map_new ();
+// What the process knows about a descriptor it opened, which the kernel would
+// answer through fcntl(2) -- a variadic function no extern can declare. The
+// ACCESS a descriptor was opened with (0 read, 1 write, 2 both: IO.new checks
+// a mode against it, as ruby's F_GETFL does; +16 when it appends, a bit of
+// this table's own since O_APPEND's value is the platform's), and whether O_NONBLOCK was set
+// on it (only this process's code sets it: io_set_nonblocking). dup and dup2
+// carry both, since the copy shares the open file description; close forgets.
+let fd_acc = map_new ();
+let fd_nb = map_new ();
+// ...and the descriptors whose close-on-exec flag the program CLEARED. Every
+// other one it knows is closed in a child (Process.spawn / IO.popen say so to
+// the shell that starts it), which is what FD_CLOEXEC -- ruby's default for
+// every descriptor above 2 -- does at exec.
+let fd_keep = map_new ();
+// ...and the path a descriptor was opened by, when it was (IO.sysopen): a File
+// here is a path, so reopening one onto a descriptor stream means that path
+let fd_path = map_new ();
+// ...all of them forgotten when the descriptor is closed: its number is reused
+let fd_forget = fn (fd: int) ->
+  let _ = (if map_has fd_path fd then map_delete fd_path fd else ()) in
+  let _ = (if map_has fd_acc fd then map_delete fd_acc fd else ()) in
+  let _ = (if map_has fd_keep fd then map_delete fd_keep fd else ()) in
+  if map_has fd_nb fd then map_delete fd_nb fd else ();
 // read up to 64 KiB; "" at end of file, and a refusal is "" too -- the caller
 // that needs to tell them apart asks fd_read itself.
 let fd_get = fn (fd: int) ->
   let p = tcp_arena () in
   let n = fd_read fd p 65536 in
   if n <= 0 then "" else mem_to_str p n;
-// ⚠ A SEPARATE "would it block?" PROBE CANNOT BE WRITTEN HERE. The first
-//   version asked `fd_read fd p 0` -- a zero-length read -- and the family's
-//   own contract answers -1 for a capacity of zero, so it said "would block"
-//   for every pipe including one at end of file. Reading one byte instead
-//   would answer correctly and CONSUME the byte.
-//   So the read itself is the probe: on a non-blocking descriptor fd_read
-//   answers -1 for "nothing now" and 0 for "end of file", and those two mean
-//   opposite things. These return VNil for the first and a string otherwise,
-//   and the caller decides what -1 means from what else it knows.
-let rec fd_slurp_go = fn (fd: int) -> fn (acc: str) ->
-  let p = tcp_arena () in
-  let n = fd_read fd p 65536 in
-  if n <= 0 then acc else fd_slurp_go fd (acc ++ mem_to_str p n);
-let fd_slurp = fn (fd: int) ->
-  let p = tcp_arena () in
-  let n = fd_read fd p 65536 in
-  if n < 0 then VNil
-  else if n == 0 then mkstr ""
-  else mkstr (fd_slurp_go fd (mem_to_str p n));
-let fd_slurp_limited = fn (fd: int) -> fn (want: int) ->
-  let p = tcp_arena () in
-  let cap = (if want > 65536 then 65536 else want) in
-  let n = (if cap <= 0 then 0 else fd_read fd p cap) in
-  if n < 0 then VNil
-  else if n == 0 then mkstr ""
-  else mkstr (mem_to_str p n);
 // One poll(2) over `fds`, each with the interest at the same position (1 read,
 // 2 write), for up to `ms` milliseconds (-1: no limit). Answers the ready bits
 // per position (1 read, 2 write, 4 error or hang-up; 0 when nothing happened).
@@ -2011,12 +2071,6 @@ let io_poll_bits = fn (fds: Val list) -> fn (ints: Val list) -> fn (ms: int) ->
   let _ = (if n > 0 then io_poll_read s got 0 n else ()) in
   let _ = io_poll_drain s fds in
   io_poll_answer got fds;
-// the bytes a descriptor-born IO has taken off its descriptor and not yet
-// handed out (#getc reads ahead, #ungetc pushes back), "" when none
-let io_rbuf_of = fn ivars -> fn (id: int) ->
-  if map_has ivars (str_of_int id ++ "@__io_rbuf")
-  then (match map_get ivars (str_of_int id ++ "@__io_rbuf") with VStr h -> sget h | _ -> "")
-  else "";
 let rec fd_get_all = fn (fd: int) -> fn (acc: str) ->
   let chunk = fd_get fd in
   if str_eq chunk "" then acc else fd_get_all fd (acc ++ chunk);

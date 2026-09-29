@@ -1488,7 +1488,13 @@ let core_prelude_d =
   "end\n" ++
   "class IO\n" ++
   "  # IO.copy_stream(src, dst, copy_length = nil, src_offset = nil): src and\n" ++
-  "  # dst are IOs or paths (#to_path); answers the number of bytes copied\n" ++
+  "  # dst are IOs, objects with readpartial/read and write, or paths (#to_path);\n" ++
+  "  # answers the number of bytes copied.\n" ++
+  "  # ⚠ IN PIECES, as ruby copies: each is one readpartial (or read) of at most\n" ++
+  "  #   16 KiB, written before the next is asked for. Reading the whole source\n" ++
+  "  #   first could not end while the other side of a pipe waited for the\n" ++
+  "  #   first bytes -- a child copying its STDIN to its STDOUT for a parent\n" ++
+  "  #   that writes, then reads, then closes.\n" ++
   "  def self.copy_stream(src, dst, copy_length = nil, src_offset = nil)\n" ++
   "    path = ->(x) \{\n" ++
   "      next x if x.is_a?(String)\n" ++
@@ -1497,25 +1503,63 @@ let core_prelude_d =
   "      raise TypeError, \"can't convert #\{x.class} to String (#\{x.class}#to_path gives #\{pth.class})\" unless pth.is_a?(String)\n" ++
   "      pth\n" ++
   "    }\n" ++
-  "    data =\n" ++
-  "      if src.respond_to?(:read) && !src.is_a?(String)\n" ++
-  "        if src_offset\n" ++
-  "          src.respond_to?(:pread) ? src.pread(copy_length || (src.size - src_offset), src_offset) : (src.seek(src_offset); src.read(copy_length))\n" ++
-  "        else\n" ++
-  "          copy_length ? src.read(copy_length) : src.read\n" ++
-  "        end\n" ++
+  "    if src.respond_to?(:read) && !src.is_a?(String) && src_offset\n" ++
+  "      data = src.respond_to?(:pread) ? src.pread(copy_length || (src.size - src_offset), src_offset) : (src.seek(src_offset); src.read(copy_length))\n" ++
+  "      data = (data || +\"\").b\n" ++
+  "      if dst.respond_to?(:write) && !dst.is_a?(String)\n" ++
+  "        dst.write(data)\n" ++
   "      else\n" ++
-  "        whole = File.binread(path.(src))\n" ++
-  "        off = src_offset || 0\n" ++
-  "        whole.byteslice(off, copy_length || (whole.bytesize - off)) || +\"\"\n" ++
+  "        File.binwrite(path.(dst), data)\n" ++
   "      end\n" ++
-  "    data = (data || +\"\").b\n" ++
-  "    if dst.respond_to?(:write) && !dst.is_a?(String)\n" ++
-  "      dst.write(data)\n" ++
-  "    else\n" ++
-  "      File.binwrite(path.(dst), data)\n" ++
+  "      return data.bytesize\n" ++
   "    end\n" ++
-  "    data.bytesize\n" ++
+  "    unless (src.respond_to?(:readpartial) || src.respond_to?(:read)) && !src.is_a?(String)\n" ++
+  "      whole = File.binread(path.(src))\n" ++
+  "      off = src_offset || 0\n" ++
+  "      src = __copy_src_string(whole, off, copy_length)\n" ++
+  "    end\n" ++
+  "    out = dst\n" ++
+  "    opened = nil\n" ++
+  "    unless dst.respond_to?(:write) && !dst.is_a?(String)\n" ++
+  "      opened = out = File.open(path.(dst), \"wb\")\n" ++
+  "    end\n" ++
+  "    total = 0\n" ++
+  "    buf = +\"\".b\n" ++
+  "    begin\n" ++
+  "      loop do\n" ++
+  "        want = copy_length ? copy_length - total : 16384\n" ++
+  "        want = 16384 if want > 16384\n" ++
+  "        break if want <= 0\n" ++
+  "        chunk = if src.is_a?(IO) || src.respond_to?(:readpartial)\n" ++
+  "                  begin\n" ++
+  "                    src.readpartial(want, buf)\n" ++
+  "                  rescue EOFError\n" ++
+  "                    nil\n" ++
+  "                  end\n" ++
+  "                else\n" ++
+  "                  src.read(want, buf)\n" ++
+  "                end\n" ++
+  "        break if chunk.nil? || chunk.empty?\n" ++
+  "        out.write(chunk)\n" ++
+  "        total += chunk.bytesize\n" ++
+  "      end\n" ++
+  "    ensure\n" ++
+  "      opened.close if opened\n" ++
+  "    end\n" ++
+  "    total\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a path's bytes, handed out as a source object reads them\n" ++
+  "  def self.__copy_src_string(whole, off, len)\n" ++
+  "    o = Object.new\n" ++
+  "    o.instance_variable_set(:@s, (whole.byteslice(off, len || (whole.bytesize - off)) || +\"\").b)\n" ++
+  "    def o.read(n, buf = nil)\n" ++
+  "      return nil if @s.empty?\n" ++
+  "      r = @s.byteslice(0, n)\n" ++
+  "      @s = @s.byteslice(n, @s.bytesize - n) || +\"\".b\n" ++
+  "      buf ? buf.replace(r) : r\n" ++
+  "    end\n" ++
+  "    o\n" ++
   "  end\n" ++
   "end\n" ++
   "class Encoding\n" ++
@@ -1975,10 +2019,26 @@ let core_prelude_d =
   "\n" ++
   "  def argv; __setup; @argv; end\n" ++
   "\n" ++
+  "  # In-place editing (-i[ext], or #inplace_mode=): each file is read from\n" ++
+  "  # where it was moved to -- its backup, or a name of this process's that is\n" ++
+  "  # deleted after -- while $stdout writes the new file under the old name,\n" ++
+  "  # until the reader moves on.\n" ++
   "  def __open_next\n" ++
+  "    __inplace_done\n" ++
   "    name = @argv.shift\n" ++
   "    @filename = name\n" ++
-  "    @file = (name == \"-\") ? $stdin : File.open(name, \"r\")\n" ++
+  "    if name != \"-\" && !$-i.nil?\n" ++
+  "      ext = $-i.to_s\n" ++
+  "      src = ext.empty? ? name + \".mere-ruby-inplace.\" + Process.pid.to_s : name + ext\n" ++
+  "      @__ip_tmp = ext.empty? ? src : nil\n" ++
+  "      File.rename(name, src)\n" ++
+  "      @file = File.open(src, \"r\")\n" ++
+  "      @__ip_saved = $stdout\n" ++
+  "      @__ip_out = File.open(name, \"w\")\n" ++
+  "      $stdout = @__ip_out\n" ++
+  "    else\n" ++
+  "      @file = (name == \"-\") ? $stdin : File.open(name, \"r\")\n" ++
+  "    end\n" ++
   "    @flines = 0\n" ++
   "    @file.binmode if @binmode\n" ++
   "    true\n" ++
@@ -2008,8 +2068,23 @@ let core_prelude_d =
   "  end\n" ++
   "\n" ++
   "  # the current file is exhausted: close it and open the next, if any\n" ++
+  "  def __inplace_done\n" ++
+  "    return unless @__ip_out\n" ++
+  "    @__ip_out.close\n" ++
+  "    $stdout = @__ip_saved\n" ++
+  "    @__ip_out = nil\n" ++
+  "    File.delete(@__ip_tmp) if @__ip_tmp && File.exist?(@__ip_tmp)\n" ++
+  "    @__ip_tmp = nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def inplace_mode = $-i\n" ++
+  "  def inplace_mode=(ext)\n" ++
+  "    $-i = ext.nil? ? nil : ext.to_str\n" ++
+  "  end\n" ++
+  "\n" ++
   "  def __advance\n" ++
   "    @file.close unless @file == $stdin || @file.closed?\n" ++
+  "    __inplace_done\n" ++
   "    return false if @argv.empty?\n" ++
   "    __open_next\n" ++
   "  end\n" ++
@@ -2142,6 +2217,34 @@ let core_prelude_d =
   "      return buf\n" ++
   "    end\n" ++
   "    chunk\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the current file's read_nonblock: its end is \"\" while another file\n" ++
+  "  # follows and EOFError (or nil) after the last one\n" ++
+  "  def read_nonblock(len, buf = nil, exception: true)\n" ++
+  "    __prep\n" ++
+  "    buf.replace(\"\") if buf\n" ++
+  "    if __closed_now?\n" ++
+  "      return nil unless exception\n" ++
+  "      raise EOFError, \"end of file reached\"\n" ++
+  "    end\n" ++
+  "    chunk = @file.read_nonblock(len, exception: false)\n" ++
+  "    if chunk == :wait_readable\n" ++
+  "      return :wait_readable unless exception\n" ++
+  "      raise IO::EAGAINWaitReadable, \"read would block\"\n" ++
+  "    end\n" ++
+  "    if chunk.nil?\n" ++
+  "      last = @argv.empty?\n" ++
+  "      __advance\n" ++
+  "      if last\n" ++
+  "        return nil unless exception\n" ++
+  "        raise EOFError, \"end of file reached\"\n" ++
+  "      end\n" ++
+  "      chunk = +\"\"\n" ++
+  "    end\n" ++
+  "    chunk.force_encoding(Encoding::BINARY)\n" ++
+  "    return chunk unless buf\n" ++
+  "    buf.replace(chunk)\n" ++
   "  end\n" ++
   "\n" ++
   "  def getc\n" ++
@@ -2297,21 +2400,6 @@ let core_prelude_d =
   "module Kernel\n" ++
   "  def trap(*args, &blk) = Signal.trap(*args, &blk)\n" ++
   "  module_function :trap\n" ++
-  "end\n" ++
-  "class IO\n" ++
-  "  # IO.pipe with a block: the pair is yielded and both ends are closed after.\n" ++
-  "  # Only the BLOCK form reaches this definition; the primitive is called\n" ++
-  "  # under its other name, since a call made from inside a block-taking\n" ++
-  "  # method can still see that block and would come back here.\n" ++
-  "  def self.pipe(*args)\n" ++
-  "    pair = IO.__pipe(*args)\n" ++
-  "    return pair unless block_given?\n" ++
-  "    begin\n" ++
-  "      yield pair\n" ++
-  "    ensure\n" ++
-  "      pair.each \{ |io| io.close unless io.closed? }\n" ++
-  "    end\n" ++
-  "  end\n" ++
   "end\n" ++
   "class File\n" ++
   "  # File.umask: the process's file-creation mask, as the shell it starts\n" ++
@@ -2596,46 +2684,35 @@ let core_prelude_d =
   "    __wait_for(WRITABLE, timeout) ? self : nil\n" ++
   "  end\n" ++
   "\n" ++
+  "  # A File and the three standard streams: a descriptor stream's pair is the\n" ++
+  "  # layer's (IO#__fd_read_nonblock, core_prelude_k). A File is always ready,\n" ++
+  "  # and standard input is the buffer Kernel#gets reads, all of it here.\n" ++
   "  def read_nonblock(len, buf = nil, exception: true)\n" ++
   "    raise IOError, \"closed stream\" if closed?\n" ++
   "    len = len.to_int\n" ++
   "    raise ArgumentError, \"negative length \" + len.to_s + \" given\" if len < 0\n" ++
   "    if __sel_fd.nil?\n" ++
-  "      return nil if !exception && len != 0 && eof?\n" ++
-  "      return sysread(len, buf)\n" ++
+  "      begin\n" ++
+  "        return sysread(len, buf)\n" ++
+  "      rescue EOFError\n" ++
+  "        raise if exception\n" ++
+  "        return nil\n" ++
+  "      end\n" ++
   "    end\n" ++
-  "    if len == 0\n" ++
-  "      return \"\" if buf.nil?\n" ++
-  "      buf.clear\n" ++
-  "      return buf\n" ++
-  "    end\n" ++
-  "    s = self.__nbread(len)\n" ++
-  "    if s.is_a?(String)\n" ++
-  "      s.force_encoding(Encoding::BINARY)\n" ++
-  "      return s if buf.nil?\n" ++
-  "      enc = buf.encoding\n" ++
-  "      buf.replace(s)\n" ++
-  "      buf.force_encoding(enc)\n" ++
-  "      return buf\n" ++
-  "    end\n" ++
-  "    buf.clear unless buf.nil?\n" ++
+  "    raise IOError, \"not opened for reading\" unless __sel_fd == 0\n" ++
+  "    s = self.read(len)\n" ++
   "    if s.nil?\n" ++
+  "      buf.clear unless buf.nil?\n" ++
   "      return nil unless exception\n" ++
   "      raise EOFError, \"end of file reached\"\n" ++
   "    end\n" ++
-  "    return :wait_readable unless exception\n" ++
-  "    raise IO::EAGAINWaitReadable, \"read would block\"\n" ++
+  "    return s if buf.nil?\n" ++
+  "    buf.replace(s)\n" ++
   "  end\n" ++
   "\n" ++
   "  def write_nonblock(s, exception: true)\n" ++
   "    raise IOError, \"closed stream\" if closed?\n" ++
-  "    s = s.to_s\n" ++
-  "    return syswrite(s) if __sel_fd.nil?\n" ++
-  "    return 0 if s.empty?\n" ++
-  "    n = self.__nbwrite(s)\n" ++
-  "    return n if n >= 0\n" ++
-  "    return :wait_writable unless exception\n" ++
-  "    raise IO::EAGAINWaitWritable, \"write would block\"\n" ++
+  "    syswrite(s.to_s)\n" ++
   "  end\n" ++
   "end\n" ++
   // ⚠ slice_before / slice_after were in the LIST this interpreter uses to
@@ -3778,9 +3855,26 @@ let core_prelude_f =
   "    # the child is started by a background shell that waits for it; stdin is\n" ++
   "    # handed down explicitly, because an asynchronous list's is /dev/null, and\n" ++
   "    # so is stderr, because the waiting shell's own (\"Killed: 9\") is not ours.\n" ++
-  "    # They travel on 9 and 8, out of the way of the low descriptors a pipe or\n" ++
-  "    # a redirect names.\n" ++
-  "    rc = Process.__sh((newpg ? \"set -m; \" : \"\") + \"exec 9<&0 8>&2; ( ( \" + inner + \" ) <&9 2>&8 9<&- 8>&- & echo $! > \" + __q(pidf + \".t\") + \"; mv \" + __q(pidf + \".t\") + \" \" + __q(pidf) +\n" ++
+  "    # They travel on two high single digits, out of the way of the low\n" ++
+  "    # descriptors a pipe or a redirect names -- and of the ones it hands down.\n" ++
+  "    # ⚠ EVERY OTHER DESCRIPTOR THIS PROCESS HOLDS IS CLOSED FOR THE CHILD, as\n" ++
+  "    #   ruby's are (FD_CLOEXEC), unless the program cleared #close_on_exec.\n" ++
+  "    #   Inherited, a pipe's write end kept its reader from ever seeing the end\n" ++
+  "    #   of file -- IO.popen's child held its own parent's end. The ones a\n" ++
+  "    #   redirect reads from are kept until the child has them, then the\n" ++
+  "    #   waiting shell lets go of its copies too.\n" ++
+  "    keep = []\n" ++
+  "    opts.each do |k, v|\n" ++
+  "      next unless k.is_a?(Array) || (!k.is_a?(String) && __fd_of(k))\n" ++
+  "      v = v.to_io if !v.is_a?(IO) && !v.is_a?(Integer) && v.respond_to?(:to_io)\n" ++
+  "      keep << v if v.is_a?(Integer)\n" ++
+  "      keep << v.fileno if v.is_a?(IO) && !v.closed?\n" ++
+  "    end\n" ++
+  "    shut = (IO.__fdlist - keep).map \{ |fd| fd.to_s + \">&- \" }.join\n" ++
+  "    held = keep.select \{ |fd| fd > 2 }.uniq.map \{ |fd| fd.to_s + \">&-\" }\n" ++
+  "    held = held.empty? ? \"\" : \"exec \" + held.join(\" \") + \"; \"\n" ++
+  "    si, se = ([9, 8, 7, 6, 5, 4, 3] - keep).first(2).map(&:to_s)\n" ++
+  "    rc = Process.__sh((newpg ? \"set -m; \" : \"\") + \"exec \" + shut + si + \"<&0 \" + se + \">&2; ( ( \" + inner + \" ) <&\" + si + \" 2>&\" + se + \" \" + si + \"<&- \" + se + \">&- & \" + held + \"echo $! > \" + __q(pidf + \".t\") + \"; mv \" + __q(pidf + \".t\") + \" \" + __q(pidf) +\n" ++
   "                 \"; wait $!; echo $? > \" + __q(stf + \".t\") + \"; mv \" + __q(stf + \".t\") + \" \" + __q(stf) + \" ) 2>/dev/null &\")\n" ++
   "    n = 0\n" ++
   "    until File.exist?(pidf)\n" ++
@@ -4610,6 +4704,10 @@ let core_prelude_i =
   // a STRING-backed buffer over a new string of that many NULs: external and
   // writable for the block, freed after it, and the string is the answer
   "    def self.string(length)\n" ++
+  "      raise LocalJumpError, \"no block given\" unless block_given?\n" ++
+  "      length = __int!(length)\n" ++
+  "      raise ArgumentError, \"Size can't be negative!\" if length < 0\n" ++
+  "      raise RangeError, \"Size too large!\" if length > 2147483647\n" ++
   "      str = (\"\\x00\" * length).b\n" ++
   "      b = allocate\n" ++
   "      b.__init_for(str, true)\n" ++
@@ -4631,9 +4729,15 @@ let core_prelude_i =
   "    # MAPPED set -- 0, EXTERNAL alone and SHARED alone all raise\n" ++
   "    # AllocationError, because they describe memory that came from somewhere\n" ++
   "    # and `new` has nowhere to get it from.\n" ++
-  "    def initialize(size = DEFAULT_SIZE, flags = INTERNAL)\n" ++
-  "      raise ArgumentError, \"negative size\" if size < 0\n" ++
-  "      unless (flags & (INTERNAL | MAPPED)) != 0\n" ++
+  "    # (a size of a page or more is MAPPED unless flags say otherwise: ruby asks\n" ++
+  "    # the kernel for pages from there on)\n" ++
+  "    def initialize(size = DEFAULT_SIZE, flags = nil)\n" ++
+  "      size = IO::Buffer.__int!(size)\n" ++
+  "      raise ArgumentError, \"Size can't be negative!\" if size < 0\n" ++
+  "      flags = size >= PAGE_SIZE ? MAPPED : INTERNAL if flags.nil?\n" ++
+  "      flags = IO::Buffer.__int!(flags)\n" ++
+  "      raise ArgumentError, \"Flags can't be negative!\" if flags < 0\n" ++
+  "      unless size == 0 || (flags & (INTERNAL | MAPPED)) != 0\n" ++
   "        raise IO::Buffer::AllocationError, \"Could not allocate buffer!\"\n" ++
   "      end\n" ++
   "      @s = \"\\x00\".b * size\n" ++
@@ -4641,6 +4745,12 @@ let core_prelude_i =
   // (a zero-size buffer allocates nothing: it is NULL, not INTERNAL)
   "      @flags = size == 0 ? 0 : flags\n" ++
   "      @__null = size == 0\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # a size and flags are Integers, and nothing else converts to one\n" ++
+  "    def self.__int!(v)\n" ++
+  "      raise TypeError, \"not an Integer\" unless v.is_a?(Integer)\n" ++
+  "      v\n" ++
   "    end\n" ++
   "\n" ++
   "    # `for` is a view over the caller's string: EXTERNAL, and ruby marks it\n" ++
@@ -4658,16 +4768,64 @@ let core_prelude_i =
   "    end\n" ++
   "    private :__store\n" ++
   "\n" ++
+  "    # ⚠ A SLICE IS A VIEW, not a copy: [what it looks into, offset, length].\n" ++
+  "    #   It looks into the BUFFER for memory a buffer owns (new, map), and into\n" ++
+  "    #   the STRING for a string-backed one (for, string) -- which is why a\n" ++
+  "    #   slice of a freed string-backed buffer stays valid while the string\n" ++
+  "    #   lives, and a slice of a freed or transferred buffer does not. Writes go\n" ++
+  "    #   through to what it looks into.\n" ++
+  "    def __init_view(src, off, len, ro)\n" ++
+  "      @__view = [src, off, len]\n" ++
+  "      @s = nil\n" ++
+  "      @freed = false\n" ++
+  "      @flags = EXTERNAL | (ro ? READONLY : 0)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def __own = (@freed ? nil : @s)\n" ++
+  "\n" ++
+  "    # the bytes this buffer shows (a view reads them from its source)\n" ++
+  "    def __raw\n" ++
+  "      return @s unless @__view\n" ++
+  "      raise IO::Buffer::InvalidatedError, \"Buffer has been invalidated!\" unless valid?\n" ++
+  "      src, off, len = @__view\n" ++
+  "      (src.is_a?(String) ? src : src.__own).b.byteslice(off, len) || +\"\".b\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # write `bytes` at `offset` of what this buffer shows\n" ++
+  "    def __put(offset, bytes)\n" ++
+  "      unless @__view\n" ++
+  "        whole = @s.b\n" ++
+  "        __store(whole.byteslice(0, offset).to_s + bytes + whole.byteslice(offset + bytes.bytesize, whole.bytesize).to_s)\n" ++
+  "        return\n" ++
+  "      end\n" ++
+  "      raise IO::Buffer::InvalidatedError, \"Buffer has been invalidated!\" unless valid?\n" ++
+  "      src, off, = @__view\n" ++
+  "      if src.is_a?(String)\n" ++
+  "        enc = src.encoding\n" ++
+  "        whole = src.b\n" ++
+  "        src.replace((whole.byteslice(0, off + offset).to_s + bytes + whole.byteslice(off + offset + bytes.bytesize, whole.bytesize).to_s).force_encoding(enc))\n" ++
+  "      else\n" ++
+  "        src.__put(off + offset, bytes)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "\n" ++
   "    def __mark_mapped(flags = 0)\n" ++
   "      priv = (flags & PRIVATE) != 0\n" ++
   "      @flags = MAPPED | (priv ? PRIVATE : (EXTERNAL | SHARED)) | (flags & READONLY)\n" ++
   "    end\n" ++
   "\n" ++
-  "    def size = @freed ? 0 : @s.bytesize\n" ++
+  "    def size = @freed ? 0 : (@__view ? @__view[2] : @s.bytesize)\n" ++
   "    def empty? = size == 0\n" ++
   "    def null? = @freed || @__null == true\n" ++
-  // valid unless it is a slice whose parent was freed
-  "    def valid? = @__parent.nil? || !@__parent.null?\n" ++
+  // valid unless it is a slice whose source was freed, transferred, or cut
+  // short of it
+  "    def valid?\n" ++
+  "      return true unless @__view\n" ++
+  "      return false if @freed\n" ++
+  "      src, off, len = @__view\n" ++
+  "      mem = src.is_a?(String) ? src : src.__own\n" ++
+  "      !mem.nil? && off + len <= mem.bytesize\n" ++
+  "    end\n" ++
   "    # ⚠ a freed buffer reads as INTERNAL and NULL whatever it was before:\n" ++
   "    # ruby prints `#<IO::Buffer 0x0+0 NULL INTERNAL>` for a transferred one.\n" ++
   "    def external? = !@freed && (@flags & EXTERNAL) != 0\n" ++
@@ -4681,6 +4839,7 @@ let core_prelude_i =
   "    def free\n" ++
   "      raise IO::Buffer::LockedError, \"Buffer is locked!\" if locked?\n" ++
   "      @s = +\"\".b\n" ++
+  "      @__view = nil\n" ++
   "      @freed = true\n" ++
   "      self\n" ++
   "    end\n" ++
@@ -4696,10 +4855,11 @@ let core_prelude_i =
   // (BINARY unless an encoding is asked for, whatever the backing string's)
   "    def get_string(offset = 0, length = nil, encoding = nil)\n" ++
   "      return +\"\".b if @freed\n" ++
-  "      length = @s.bytesize - offset if length.nil?\n" ++
-  "      raise ArgumentError, \"offset out of range\" if offset < 0 || offset > @s.bytesize\n" ++
-  "      raise ArgumentError, \"length out of range\" if length < 0 || offset + length > @s.bytesize\n" ++
-  "      r = (@s.byteslice(offset, length) || +\"\").b\n" ++
+  "      raw = __raw\n" ++
+  "      length = raw.bytesize - offset if length.nil?\n" ++
+  "      raise ArgumentError, \"offset out of range\" if offset < 0 || offset > raw.bytesize\n" ++
+  "      raise ArgumentError, \"length out of range\" if length < 0 || offset + length > raw.bytesize\n" ++
+  "      r = (raw.byteslice(offset, length) || +\"\").b\n" ++
   "      encoding ? r.force_encoding(encoding) : r\n" ++
   "    end\n" ++
   "\n" ++
@@ -4708,28 +4868,40 @@ let core_prelude_i =
   "      raise IO::Buffer::AccessError, \"Buffer is not writable!\" if readonly?\n" ++
   "      src = string.to_s.b\n" ++
   "      src = src.byteslice(source_offset, length || (src.bytesize - source_offset)) || +\"\".b\n" ++
-  "      raise ArgumentError, \"offset out of range\" if offset < 0 || offset + src.bytesize > @s.bytesize\n" ++
-  "      __store(@s.b.byteslice(0, offset).to_s + src + (@s.b.byteslice(offset + src.bytesize, @s.bytesize).to_s))\n" ++
+  "      raise ArgumentError, \"offset out of range\" if offset < 0 || offset + src.bytesize > size\n" ++
+  "      __put(offset, src)\n" ++
   "      src.bytesize\n" ++
   "    end\n" ++
   "\n" ++
   "    def clear(value = 0, offset = 0, length = nil)\n" ++
   "      __check!\n" ++
-  "      length = @s.bytesize - offset if length.nil?\n" ++
-  "      __store(@s.b.byteslice(0, offset).to_s + (value.chr * length) + (@s.b.byteslice(offset + length, @s.bytesize).to_s))\n" ++
+  "      length = size - offset if length.nil?\n" ++
+  "      __put(offset, (value.chr * length).b)\n" ++
   "      self\n" ++
   "    end\n" ++
   "\n" ++
   "    def resize(new_size)\n" ++
   "      raise IO::Buffer::LockedError, \"Cannot resize locked buffer!\" if locked?\n" ++
   "      raise IO::Buffer::AccessError, \"Cannot resize external buffer!\" if external?\n" ++
-  "      raise ArgumentError, \"negative size\" if new_size < 0\n" ++
-  // a null or freed buffer comes back as a regular internal one
+  "      new_size = IO::Buffer.__int!(new_size)\n" ++
+  "      raise ArgumentError, \"Size can't be negative!\" if new_size < 0\n" ++
+  // to 0 frees it; a null or freed one comes back as a new buffer of that
+  // size (a page or more is MAPPED, as `new` makes it); and a shared mapping
+  // is reallocated as INTERNAL, which is what a platform without mremap does
+  "      if new_size == 0\n" ++
+  "        @s = +\"\".b\n" ++
+  "        @freed = false\n" ++
+  "        @__null = true\n" ++
+  "        @flags = 0\n" ++
+  "        return self\n" ++
+  "      end\n" ++
   "      if null?\n" ++
   "        @s = +\"\".b\n" ++
   "        @freed = false\n" ++
-  "        @__null = new_size == 0\n" ++
-  "        @flags = new_size == 0 ? 0 : INTERNAL\n" ++
+  "        @__null = false\n" ++
+  "        @flags = new_size >= PAGE_SIZE ? MAPPED : INTERNAL\n" ++
+  "      elsif (@flags & MAPPED) != 0 && (@flags & PRIVATE) == 0\n" ++
+  "        @flags = (@flags & ~MAPPED) | INTERNAL\n" ++
   "      end\n" ++
   "      cur = @s.bytesize\n" ++
   "      @s = new_size <= cur ? @s.byteslice(0, new_size) : @s + (\"\\x00\".b * (new_size - cur))\n" ++
@@ -4737,12 +4909,24 @@ let core_prelude_i =
   "    end\n" ++
   "\n" ++
   "    def slice(offset = 0, length = nil)\n" ++
-  "      return IO::Buffer.for(+\"\".b) if @freed\n" ++
-  "      length = @s.bytesize - offset if length.nil?\n" ++
-  "      raise ArgumentError, \"offset out of range\" if offset < 0 || offset > @s.bytesize\n" ++
-  "      raise ArgumentError, \"length out of range\" if length < 0 || offset + length > @s.bytesize\n" ++
-  "      sl = IO::Buffer.for(@s.byteslice(offset, length))\n" ++
-  "      sl.instance_variable_set(:@__parent, self)\n" ++
+  "      length = size - offset if length.nil?\n" ++
+  "      raise ArgumentError, \"offset out of range\" if offset < 0 || offset > size\n" ++
+  "      raise ArgumentError, \"length out of range\" if length < 0 || offset + length > size\n" ++
+  "      sl = self.class.allocate\n" ++
+  "      # a slice of nothing is nothing\n" ++
+  "      if null?\n" ++
+  "        sl.__init_view(self, 0, 0, readonly?)\n" ++
+  "        sl.instance_variable_set(:@__null, true)\n" ++
+  "        return sl\n" ++
+  "      end\n" ++
+  "      if @__view\n" ++
+  "        src, base, = @__view\n" ++
+  "      elsif (@flags & EXTERNAL) != 0 && (@flags & MAPPED) == 0\n" ++
+  "        src, base = @s, 0\n" ++
+  "      else\n" ++
+  "        src, base = self, 0\n" ++
+  "      end\n" ++
+  "      sl.__init_view(src, base + offset, length, readonly?)\n" ++
   "      sl\n" ++
   "    end\n" ++
   "\n" ++
@@ -4766,10 +4950,12 @@ let core_prelude_i =
   // left null
   "      b = self.class.allocate\n" ++
   "      b.instance_variable_set(:@s, @s)\n" ++
+  "      b.instance_variable_set(:@__view, @__view)\n" ++
   "      b.instance_variable_set(:@freed, false)\n" ++
   "      b.instance_variable_set(:@flags, @flags)\n" ++
   "      b.instance_variable_set(:@__addr, __addr)\n" ++
   "      @s = +\"\".b\n" ++
+  "      @__view = nil\n" ++
   "      @freed = true\n" ++
   "      b\n" ++
   "    end\n" ++
@@ -4791,11 +4977,12 @@ let core_prelude_i =
   "    def inspect = to_s + (size == 0 ? \"\" : \"\\n\" + hexdump)\n" ++
   "\n" ++
   "    def hexdump\n" ++
-  "      return \"\" if @freed || @s.bytesize == 0\n" ++
+  "      return \"\" if @freed || size == 0\n" ++
+  "      raw = __raw\n" ++
   "      out = []\n" ++
   "      i = 0\n" ++
-  "      while i < @s.bytesize\n" ++
-  "        row = @s.byteslice(i, 16)\n" ++
+  "      while i < raw.bytesize\n" ++
+  "        row = raw.byteslice(i, 16)\n" ++
   "        hex = row.bytes.map \{ |b| format(\"%02x\", b) }.join(\" \")\n" ++
   "        asc = row.bytes.map \{ |b| (b >= 32 && b < 127) ? b.chr : \".\" }.join\n" ++
   "        out << format(\"0x%08x  %-48s %s\", i, hex, asc)\n" ++
@@ -4834,7 +5021,7 @@ let core_prelude_i =
   "      unless other.is_a?(IO::Buffer)\n" ++
   "        raise TypeError, \"wrong argument type \" + (other.nil? ? \"nil\" : other.class.to_s) + \" (expected IO::Buffer)\"\n" ++
   "      end\n" ++
-  "      a = @s.bytes\n" ++
+  "      a = __raw.bytes\n" ++
   "      b = other.get_string.bytes\n" ++
   "      out = +\"\".b\n" ++
   "      i = 0\n" ++
@@ -4857,7 +5044,7 @@ let core_prelude_i =
   "\n" ++
   "    def ~\n" ++
   "      __check!\n" ++
-  "      __new_internal(@s.bytes.map \{ |b| (~b & 255).chr }.join.b)\n" ++
+  "      __new_internal(__raw.bytes.map \{ |b| (~b & 255).chr }.join.b)\n" ++
   "    end\n" ++
   // ...and IN PLACE, answering the buffer itself
   "    def not!\n" ++
@@ -4870,6 +5057,35 @@ let core_prelude_i =
   "    # (`IO::Buffer.new(4).respond_to?(:bit_count)` is false), and\n" ++
   "    # core/io/buffer/bit_count_spec.rb is guarded for a version that does.\n" ++
   "    # Shipping a method the oracle lacks is a divergence, not a bonus.\n" ++
+  "\n" ++
+  "    # the typed values: lower case little-endian, upper case big-endian, as\n" ++
+  "    # String#unpack1 spells them\n" ++
+  "    VALUE_TYPES = \{ U8: [\"C\", 1], S8: [\"c\", 1],\n" ++
+  "                    u16: [\"S<\", 2], U16: [\"S>\", 2], s16: [\"s<\", 2], S16: [\"s>\", 2],\n" ++
+  "                    u32: [\"L<\", 4], U32: [\"L>\", 4], s32: [\"l<\", 4], S32: [\"l>\", 4],\n" ++
+  "                    u64: [\"Q<\", 8], U64: [\"Q>\", 8], s64: [\"q<\", 8], S64: [\"q>\", 8],\n" ++
+  "                    f32: [\"e\", 4], F32: [\"g\", 4], f64: [\"E\", 8], F64: [\"G\", 8] }.freeze\n" ++
+  "\n" ++
+  "    def self.__type(t)\n" ++
+  "      VALUE_TYPES[t] || raise(ArgumentError, \"Invalid type name!\")\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def get_value(type, offset)\n" ++
+  "      fmt, n = IO::Buffer.__type(type)\n" ++
+  "      raise ArgumentError, \"Specified offset+length exceeds buffer size!\" if offset < 0 || offset + n > size\n" ++
+  "      __raw.byteslice(offset, n).unpack1(fmt)\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def each(type, offset = 0, count = nil)\n" ++
+  "      return to_enum(:each, type, offset, count) unless block_given?\n" ++
+  "      _, n = IO::Buffer.__type(type)\n" ++
+  "      count = (size - offset) / n if count.nil?\n" ++
+  "      count.times do |i|\n" ++
+  "        o = offset + i * n\n" ++
+  "        yield o, get_value(type, o)\n" ++
+  "      end\n" ++
+  "      self\n" ++
+  "    end\n" ++
   "\n" ++
   "    def <=>(other) = other.is_a?(IO::Buffer) ? (get_string <=> other.get_string) : nil\n" ++
   "    def ==(other) = other.is_a?(IO::Buffer) && get_string == other.get_string\n" ++
@@ -4907,10 +5123,39 @@ let core_prelude_j =
   "  end\n" ++
   "  private :__closed!\n" ++
   "\n" ++
+  "  # --- reading -------------------------------------------------------------\n" ++
+  "  # read(length = nil, buffer = nil): with a length, BYTES (BINARY), nil at\n" ++
+  "  # the end, into a buffer that keeps its own encoding; without one, the rest\n" ++
+  "  # of the file in the stream's encodings, \"\" at the end.\n" ++
+  "  def read(len = nil, buf = nil)\n" ++
+  "    unless buf.nil?\n" ++
+  "      buf = IO.__fd_str(buf)\n" ++
+  "      raise FrozenError, \"can't modify frozen String: \" + buf.inspect if buf.frozen?\n" ++
+  "    end\n" ++
+  "    self.__f_read(0)\n" ++
+  "    __f_bom_skip\n" ++
+  "    if len.nil?\n" ++
+  "      s = self.__f_read\n" ++
+  "      ext, int = __ln_encs\n" ++
+  "      s.force_encoding(ext)\n" ++
+  "      s = s.encode(int, ext, **(@__f_ecopts || \{})) if int\n" ++
+  "      return s if buf.nil?\n" ++
+  "      return buf.replace(s)\n" ++
+  "    end\n" ++
+  "    len = IO.__fd_long(IO.__fd_int(len))\n" ++
+  "    raise ArgumentError, \"negative length \" + len.to_s + \" given\" if len < 0\n" ++
+  "    s = self.__f_read(len)\n" ++
+  "    if s.nil?\n" ++
+  "      buf.clear if buf\n" ++
+  "      return nil\n" ++
+  "    end\n" ++
+  "    __into(buf, s)\n" ++
+  "  end\n" ++
+  "\n" ++
   "  # --- byte and character readers -----------------------------------------\n" ++
   "  def getbyte\n" ++
   "    __closed!\n" ++
-  "    s = self.read(1)\n" ++
+  "    s = self.__f_read(1)\n" ++
   "    s.nil? || s.empty? ? nil : s.getbyte(0)\n" ++
   "  end\n" ++
   "\n" ++
@@ -4920,19 +5165,37 @@ let core_prelude_j =
   "    b\n" ++
   "  end\n" ++
   "\n" ++
+  "  # ⚠ A CHARACTER IS AS LONG AS ITS LEAD BYTE SAYS, and a lead byte that\n" ++
+  "  # starts no character is a character of one byte (invalid, as ruby's is):\n" ++
+  "  # the reader used to keep taking bytes until what it held was valid, so a\n" ++
+  "  # read from inside a character swallowed the next one with it. It reads in\n" ++
+  "  # the stream's encoding (#external_encoding), transcoding to the internal.\n" ++
   "  def getc\n" ++
   "    __closed!\n" ++
-  "    return nil if self.eof?\n" ++
-  "    # a character is not a byte: take one byte, and keep taking while what we\n" ++
-  "    # have is not yet a valid character.\n" ++
-  "    s = +\"\".b\n" ++
-  "    while (b = self.read(1))\n" ++
-  "      s << b\n" ++
-  "      t = s.dup.force_encoding(Encoding::UTF_8)\n" ++
-  "      return t if t.valid_encoding?\n" ++
-  "      return s if s.bytesize >= 4\n" ++
+  "    self.__f_read(0)\n" ++
+  "    __f_bom_skip\n" ++
+  "    b = self.__f_read(1)\n" ++
+  "    return nil if b.nil? || b.empty?\n" ++
+  "    ext, int = __ln_encs\n" ++
+  "    s = b.b\n" ++
+  "    lead = s.getbyte(0)\n" ++
+  "    if lead >= 0x80 && ext != Encoding::BINARY && ext.ascii_compatible? && !s.dup.force_encoding(ext).valid_encoding?\n" ++
+  "      max = ext == Encoding::UTF_8 ? (lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC2 ? 2 : 1) : 4\n" ++
+  "      rest = max > 1 ? self.__f_read(max - 1).to_s.b : +\"\".b\n" ++
+  "      n = 1\n" ++
+  "      (2..(1 + rest.bytesize)).each do |k|\n" ++
+  "        if (s + rest.byteslice(0, k - 1)).force_encoding(ext).valid_encoding?\n" ++
+  "          n = k\n" ++
+  "          break\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      s << rest.byteslice(0, n - 1)\n" ++
+  "      back = rest.bytesize - (n - 1)\n" ++
+  "      self.pos = self.pos - back if back > 0\n" ++
   "    end\n" ++
-  "    s.empty? ? nil : s\n" ++
+  "    s.force_encoding(ext)\n" ++
+  "    s = s.encode(int, ext) if int && s.valid_encoding?\n" ++
+  "    s\n" ++
   "  end\n" ++
   "\n" ++
   "  def readchar\n" ++
@@ -4941,9 +5204,11 @@ let core_prelude_j =
   "    c\n" ++
   "  end\n" ++
   "\n" ++
+  "  # the enumerators come first: a closed stream still hands one out (it\n" ++
+  "  # refuses when it is read), and its size is not known without reading\n" ++
   "  def each_byte\n" ++
+  "    return to_enum(:each_byte) \{ nil } unless block_given?\n" ++
   "    __closed!\n" ++
-  "    return to_enum(:each_byte) unless block_given?\n" ++
   "    while (b = getbyte)\n" ++
   "      yield b\n" ++
   "    end\n" ++
@@ -4951,8 +5216,8 @@ let core_prelude_j =
   "  end\n" ++
   "\n" ++
   "  def each_char\n" ++
+  "    return to_enum(:each_char) \{ nil } unless block_given?\n" ++
   "    __closed!\n" ++
-  "    return to_enum(:each_char) unless block_given?\n" ++
   "    while (c = getc)\n" ++
   "      yield c\n" ++
   "    end\n" ++
@@ -4960,30 +5225,75 @@ let core_prelude_j =
   "  end\n" ++
   "\n" ++
   "  def each_codepoint\n" ++
+  "    return to_enum(:each_codepoint) \{ nil } unless block_given?\n" ++
   "    __closed!\n" ++
-  "    return to_enum(:each_codepoint) unless block_given?\n" ++
-  "    each_char \{ |c| yield c.ord }\n" ++
+  "    each_char do |c|\n" ++
+  "      raise ArgumentError, \"invalid byte sequence in \" + c.encoding.to_s unless c.valid_encoding?\n" ++
+  "      yield c.ord\n" ++
+  "    end\n" ++
   "    self\n" ++
   "  end\n" ++
   "\n" ++
   "  # --- pushback ------------------------------------------------------------\n" ++
-  "  # ⚠ ungetc does NOT write to the file: it moves the read position back,\n" ++
-  "  # which is the only part of its behaviour this model can represent. Pushing\n" ++
-  "  # back a character other than the one just read is therefore not visible --\n" ++
-  "  # said here rather than left to be discovered.\n" ++
+  "  # The bytes go back in FRONT of what is left to read (@__f_unget, which the\n" ++
+  "  # builtin reader, #eof? and #pos all honour), whatever they are: pushing\n" ++
+  "  # back a character that was never read is how a parser peeks. An Integer\n" ++
+  "  # is a codepoint in the external encoding for #ungetc and a byte for\n" ++
+  "  # #ungetbyte.\n" ++
+  "  def __unget(bytes)\n" ++
+  "    __closed!\n" ++
+  "    self.__f_read(0)\n" ++
+  "    @__f_unget = bytes.b + (@__f_unget || \"\").b\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "  private :__unget\n" ++
+  "\n" ++
   "  def ungetbyte(b)\n" ++
   "    __closed!\n" ++
+  "    self.__f_read(0)\n" ++
   "    return nil if b.nil?\n" ++
-  "    n = b.is_a?(Integer) ? 1 : b.to_s.bytesize\n" ++
-  "    self.pos = self.pos - n < 0 ? 0 : self.pos - n\n" ++
-  "    nil\n" ++
+  "    __unget(b.is_a?(Integer) ? (b & 0xff).chr : IO.__fd_str(b))\n" ++
   "  end\n" ++
   "\n" ++
   "  def ungetc(c)\n" ++
-  "    ungetbyte(c)\n" ++
+  "    __closed!\n" ++
+  "    self.__f_read(0)\n" ++
+  "    if c.is_a?(Integer)\n" ++
+  "      ext, = __ln_encs\n" ++
+  "      s = (ext == Encoding::BINARY || c < 0x80) ? (c & 0xff).chr : c.chr(ext)\n" ++
+  "    else\n" ++
+  "      s = IO.__fd_str(c)\n" ++
+  "    end\n" ++
+  "    __unget(s)\n" ++
   "  end\n" ++
   "\n" ++
-  "  # --- reading at an offset, without moving the position -------------------\n" ++
+  "  # the BOM at the start of the stream names its encoding, and is read past\n" ++
+  "  def set_encoding_by_bom\n" ++
+  "    __closed!\n" ++
+  "    m = @__f_mode.to_s\n" ++
+  "    return nil unless m.start_with?(\"r\") || m.include?(\"+\")\n" ++
+  "    unless @__f_binmode || m.split(\":\", 2)[0].include?(\"b\")\n" ++
+  "      raise ArgumentError, \"ASCII incompatible encoding needs binmode\"\n" ++
+  "    end\n" ++
+  "    ext, int = __ln_encs\n" ++
+  "    raise ArgumentError, \"encoding conversion is set\" if int\n" ++
+  "    raise ArgumentError, \"encoding is set to \" + ext.to_s + \" already\" if ext != Encoding::BINARY\n" ++
+  "    head = (self.__f_read(4) || \"\").b\n" ++
+  "    enc, n = if head.start_with?(\"\\xEF\\xBB\\xBF\".b) then [Encoding::UTF_8, 3]\n" ++
+  "             elsif head.start_with?(\"\\xFE\\xFF\".b) then [Encoding::UTF_16BE, 2]\n" ++
+  "             elsif head.start_with?(\"\\xFF\\xFE\\x00\\x00\".b) then [Encoding::UTF_32LE, 4]\n" ++
+  "             elsif head.start_with?(\"\\xFF\\xFE\".b) then [Encoding::UTF_16LE, 2]\n" ++
+  "             elsif head.start_with?(\"\\x00\\x00\\xFE\\xFF\".b) then [Encoding::UTF_32BE, 4]\n" ++
+  "             else [nil, 0]\n" ++
+  "             end\n" ++
+  "    back = head.bytesize - n\n" ++
+  "    self.pos = self.pos - back if back > 0\n" ++
+  "    return nil if enc.nil?\n" ++
+  "    __f_setencs(enc, nil, true, false, false)\n" ++
+  "    enc\n" ++
+  "  end\n" ++
+  "\n" ++
+  "\" ++  \"  # --- reading at an offset, without moving the position -------------------\n" ++
   "  # Integers through #to_int and a buffer through #to_str; a zero length\n" ++
   "  # reads nothing and leaves the buffer as it was, wherever the offset is;\n" ++
   "  # the buffer keeps its own encoding.\n" ++
@@ -4995,7 +5305,7 @@ let core_prelude_j =
   "      buffer = buffer.to_str\n" ++
   "    end\n" ++
   "    __closed!\n" ++
-  "    self.read(0)\n" ++
+  "    self.__f_read(0)\n" ++
   "    raise ArgumentError, \"negative string size (or size too big)\" if length < 0\n" ++
   "    raise Errno::EINVAL, \"pread(2)\" if offset < 0\n" ++
   "    return buffer || +\"\" if length == 0\n" ++
@@ -5035,41 +5345,65 @@ let core_prelude_j =
   "  # through a buffer flushed at close, so the DIFFERENCE they name does not\n" ++
   "  # exist here -- they are the plain read and write, and a program that used\n" ++
   "  # them to defeat buffering gets no guarantee it did.\n" ++
+  "  # ...refused while bytes read AHEAD of the program are still waiting: what\n" ++
+  "  # #ungetc pushed back, or the rest of the chunk a line reader took (ruby's\n" ++
+  "  # read buffer, which this model keeps as @__f_ahead until the position\n" ++
+  "  # moves or a write discards it)\n" ++
   "  def sysread(length, buffer = nil)\n" ++
-  "    data = self.read(length)\n" ++
-  "    raise EOFError, \"end of file reached\" if data.nil?\n" ++
-  "    buffer.nil? ? data : buffer.replace(data)\n" ++
+  "    __closed!\n" ++
+  "    buffer = IO.__fd_str(buffer) unless buffer.nil?\n" ++
+  "    length = IO.__fd_long(IO.__fd_int(length))\n" ++
+  "    raise ArgumentError, \"negative length \" + length.to_s + \" given\" if length < 0\n" ++
+  "    raise IOError, \"sysread for buffered IO\" if @__f_ahead || (@__f_unget && !@__f_unget.empty?)\n" ++
+  "    return buffer || +\"\".b if length == 0\n" ++
+  "    data = self.__f_read(length)\n" ++
+  "    if data.nil?\n" ++
+  "      buffer.clear if buffer\n" ++
+  "      raise EOFError, \"end of file reached\"\n" ++
+  "    end\n" ++
+  "    __into(buffer, data)\n" ++
   "  end\n" ++
   "\n" ++
-  "  def syswrite(string)\n" ++
-  "    __closed!\n" ++
-  "    n = self.write(string)\n" ++
-  "    flush\n" ++
-  "    n\n" ++
+  "  # a buffer argument is filled in place and keeps its own encoding\n" ++
+  "  def __into(buffer, data)\n" ++
+  "    return data if buffer.nil?\n" ++
+  "    enc = buffer.encoding\n" ++
+  "    buffer.replace(data)\n" ++
+  "    buffer.force_encoding(enc)\n" ++
   "  end\n" ++
+  "  private :__into\n" ++
   "\n" ++
   "  def readpartial(length, buffer = nil)\n" ++
   "    raise IOError, \"closed stream\" if self.closed?\n" ++
-  "    data = self.read(length)\n" ++
+  "    data = self.__f_read(length)\n" ++
   "    raise EOFError, \"end of file reached\" if data.nil?\n" ++
-  "    buffer.nil? ? data : buffer.replace(data)\n" ++
+  "    __into(buffer, data)\n" ++
   "  end\n" ++
   "\n" ++
   "  # --- the line counter ----------------------------------------------------\n" ++
+  "  # the READ side's: a stream that cannot be read has none, and the count is\n" ++
+  "  # a C int\n" ++
   "  def lineno\n" ++
   "    __closed!\n" ++
+  "    self.__f_read(0)\n" ++
   "    @__f_lineno ||= 0\n" ++
   "  end\n" ++
   "\n" ++
   "  def lineno=(n)\n" ++
   "    __closed!\n" ++
-  "    @__f_lineno = n.to_int\n" ++
+  "    self.__f_read(0)\n" ++
+  "    @__f_lineno = IO.__fd_cint(n)\n" ++
   "  end\n" ++
   "\n" ++
   "  # --- the flags -----------------------------------------------------------\n" ++
   "  def binmode\n" ++
   "    __closed!\n" ++
   "    @__f_binmode = true\n" ++
+  "    # ...which is BINARY both ways: external binary, no internal\n" ++
+  "    @__f_ext = Encoding::BINARY\n" ++
+  "    @__f_int = nil\n" ++
+  "    @__f_int_given = true\n" ++
+  "    @__f_encs_set = true\n" ++
   "    self\n" ++
   "  end\n" ++
   "\n" ++
@@ -5078,51 +5412,74 @@ let core_prelude_j =
   "    @__f_binmode ? true : false\n" ++
   "  end\n" ++
   "\n" ++
+  "  # A File is not duplex: closing the side it has is closing it, and\n" ++
+  "  # closing one side of a stream that has both is refused (ruby's rule).\n" ++
   "  def close_read\n" ++
-  "    raise IOError, \"closing non-duplex IO for reading\" unless __opened_readable?\n" ++
-  "    @__f_closed_read = true\n" ++
-  "    nil\n" ++
+  "    return nil if self.closed?\n" ++
+  "    raise IOError, \"closing non-duplex IO for reading\" if __opened_writable?\n" ++
+  "    self.close\n" ++
   "  end\n" ++
   "\n" ++
   "  def close_write\n" ++
-  "    raise IOError, \"closing non-duplex IO for writing\" unless __opened_writable?\n" ++
-  "    flush\n" ++
-  "    @__f_closed_write = true\n" ++
-  "    nil\n" ++
+  "    return nil if self.closed?\n" ++
+  "    raise IOError, \"closing non-duplex IO for writing\" if __opened_readable?\n" ++
+  "    self.close\n" ++
   "  end\n" ++
   "\n" ++
-  "  def __opened_readable? = !@__f_mode.to_s.start_with?(\"w\") && !@__f_mode.to_s.start_with?(\"a\")\n" ++
-  "  def __opened_writable? = @__f_mode.to_s != \"r\"\n" ++
+  "  def __opened_readable? = @__f_mode.to_s.start_with?(\"r\") || @__f_mode.to_s.split(\":\", 2)[0].to_s.include?(\"+\")\n" ++
+  "  def __opened_writable? = !@__f_mode.to_s.start_with?(\"r\") || @__f_mode.to_s.split(\":\", 2)[0].to_s.include?(\"+\")\n" ++
   "  private :__opened_readable?, :__opened_writable?\n" ++
   "\n" ++
   "  def to_io = self\n" ++
   "  def eof = self.eof?\n" ++
   "\n" ++
-  "  def external_encoding = Encoding.default_external\n" ++
-  "  def internal_encoding = nil\n" ++
-  "  def set_encoding(*_a) = self\n" ++
-  "  def set_encoding_by_bom = nil\n" ++
+  "  # the encodings the line reader reads with (IO#__ln_encs): the mode\n" ++
+  "  # string's, until #set_encoding names others. A stream opened for writing\n" ++
+  "  # that named none has no external encoding, as in ruby.\n" ++
+  "  # (a closed stream still answers both)\n" ++
+  "  def external_encoding\n" ++
+  "    enc, int = __f_encstate\n" ++
+  "    return enc if int\n" ++
+  "    m = @__f_mode.to_s\n" ++
+  "    m = @__f_lastmode.to_s if m.empty?\n" ++
+  "    return enc if !m.start_with?(\"r\") || m.split(\":\", 2)[0].to_s.include?(\"+\")\n" ++
+  "    enc || Encoding.default_external\n" ++
+  "  end\n" ++
+  "  def internal_encoding = __f_encstate[1]\n" ++
+  "  # set_encoding(ext [, int] [, **conversion options]), against the default\n" ++
+  "  # encodings in force NOW: nil is \"the defaults\", a lone external takes the\n" ++
+  "  # default internal, \"-\" as the internal is none; the options (invalid:,\n" ++
+  "  # undef:, replace: ...) are kept for the reads that transcode\n" ++
+  "  def set_encoding(*args, **opts)\n" ++
+  "    __closed!\n" ++
+  "    if args.empty? || args.size > 2\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1..2)\"\n" ++
+  "    end\n" ++
+  "    @__f_dext = Encoding.default_external\n" ++
+  "    @__f_dint = Encoding.default_internal\n" ++
+  "    if args.size == 2 && !args[1].nil?\n" ++
+  "      @__f_ext = IO.__fd_enc(args[0])\n" ++
+  "      @__f_int = IO.__fd_enc(args[1])\n" ++
+  "      @__f_int_given = true\n" ++
+  "    elsif args[0].nil?\n" ++
+  "      @__f_ext = nil\n" ++
+  "      @__f_int = nil\n" ++
+  "      @__f_int_given = false\n" ++
+  "    elsif args[0].is_a?(Encoding)\n" ++
+  "      @__f_ext = args[0]\n" ++
+  "      @__f_int = nil\n" ++
+  "      @__f_int_given = false\n" ++
+  "    else\n" ++
+  "      e1, e2 = IO.__fd_str(args[0]).split(\":\", 2)\n" ++
+  "      @__f_ext = IO.__fd_enc(e1)\n" ++
+  "      @__f_int = e2 ? IO.__fd_enc(e2) : nil\n" ++
+  "      @__f_int_given = !e2.nil?\n" ++
+  "    end\n" ++
+  "    @__f_ecopts = opts.empty? ? nil : opts\n" ++
+  "    @__f_encs_set = true\n" ++
+  "    self\n" ++
+  "  end\n" ++
   "\n" ++
-  "  def printf(fmt, *args)\n" ++
-  "    __closed!\n" ++
-  "    self.write(format(fmt, *args))\n" ++
-  "  end\n" ++
-  "  # rb_io_putc: a String's first character, anything else NUM2CHR -- an\n" ++
-  "  # Integer's low byte, by #to_int for an object (it used to take the first\n" ++
-  "  # character of #to_s, so a mock wrote \"#\").\n" ++
-  "  def putc(c)\n" ++
-  "    __closed!\n" ++
-  "    s = if c.is_a?(String) then c[0, 1]\n" ++
-  "        elsif c.is_a?(Integer) then (c & 255).chr\n" ++
-  "        elsif c.is_a?(Float) then (c.to_i & 255).chr\n" ++
-  "        elsif c.nil? then raise TypeError, \"no implicit conversion from nil to integer\"\n" ++
-  "        elsif c == true || c == false then raise TypeError, \"no implicit conversion of #\{c} into Integer\"\n" ++
-  "        elsif c.respond_to?(:to_int) then (Integer(c.to_int) & 255).chr\n" ++
-  "        else raise TypeError, \"no implicit conversion of #\{c.class} into Integer\"\n" ++
-  "        end\n" ++
-  "    self.write(s)\n" ++
-  "    c\n" ++
-  "  end\n" ++
   "\n" ++
   "  # `fsync` and `fdatasync` are the buffer flush: there is no descriptor to ask\n" ++
   "  # the kernel about, so what they can honestly promise is that this object has\n" ++
@@ -5133,6 +5490,1884 @@ let core_prelude_j =
   "    0\n" ++
   "  end\n" ++
   "  def fdatasync = fsync\n" ++
+  "end\n";
+
+// The IO that is built on a descriptor, and the line reader a File shares
+// with it: IO.new / for_fd / open / sysopen / pipe / popen and every stream
+// method of what they make, over the one-system-call primitives IO.__fd*
+// (io_fd_prim). The dispatcher sends a descriptor stream's `x` to `__fd_x`
+// here (fdio_route), so none of it shadows the File model's builtin arm.
+let core_prelude_k =
+  "class IO\n" ++
+  "  # === the IO that is built on a descriptor ================================\n" ++
+  "  # IO.new / for_fd / open / sysopen / pipe / popen, and every stream method\n" ++
+  "  # of the objects they make, written over the one-system-call primitives\n" ++
+  "  # IO.__fd* (see io_fd_prim). The dispatcher sends a descriptor stream's\n" ++
+  "  # method `x` here as `__fd_x` (fdio_route), so these never shadow the File\n" ++
+  "  # model's builtin arm: a File is a path and a buffer, a descriptor stream is\n" ++
+  "  # a descriptor, a read buffer and a write buffer -- the shape ruby's own\n" ++
+  "  # rb_io_t has.\n" ++
+  "  #\n" ++
+  "  # The line reader at the end is shared: a File's gets / each_line /\n" ++
+  "  # readlines / readline reach it too, over the File's own read(n).\n" ++
+  "\n" ++
+  "  # --- conversions --------------------------------------------------------\n" ++
+  "  def self.__fd_int(v, what = \"Integer\")\n" ++
+  "    return v if v.is_a?(Integer)\n" ++
+  "    if v.nil? || !v.respond_to?(:to_int)\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + __fd_cname(v) + \" into \" + what\n" ++
+  "    end\n" ++
+  "    r = v.to_int\n" ++
+  "    unless r.is_a?(Integer)\n" ++
+  "      raise TypeError, \"can't convert \" + v.class.to_s + \" to Integer (\" + v.class.to_s + \"#to_int gives \" + r.class.to_s + \")\"\n" ++
+  "    end\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__fd_str(v)\n" ++
+  "    return v if v.is_a?(String)\n" ++
+  "    unless v.respond_to?(:to_str)\n" ++
+  "      raise TypeError, \"no implicit conversion of \" + __fd_cname(v) + \" into String\"\n" ++
+  "    end\n" ++
+  "    r = v.to_str\n" ++
+  "    raise TypeError, \"can't convert \" + v.class.to_s + \" to String (\" + v.class.to_s + \"#to_str gives \" + r.class.to_s + \")\" unless r.is_a?(String)\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__fd_cname(v)\n" ++
+  "    v.nil? ? \"nil\" : v == true ? \"true\" : v == false ? \"false\" : v.class.to_s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a C long: ruby refuses a length or a limit that does not fit one\n" ++
+  "  def self.__fd_long(n)\n" ++
+  "    if n > 9223372036854775807 || n < -9223372036854775808\n" ++
+  "      raise RangeError, \"bignum too big to convert into 'long'\"\n" ++
+  "    end\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a C int, which is what a line number is\n" ++
+  "  def self.__fd_cint(n)\n" ++
+  "    n = __fd_int(n)\n" ++
+  "    raise RangeError, \"integer \" + n.to_s + \" too big to convert to 'int'\" if n > 2147483647\n" ++
+  "    raise RangeError, \"integer \" + n.to_s + \" too small to convert to 'int'\" if n < -2147483648\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__fd_path(p)\n" ++
+  "    p = p.to_path if !p.is_a?(String) && p.respond_to?(:to_path)\n" ++
+  "    __fd_str(p)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__fd_enc(e)\n" ++
+  "    return nil if e.nil?\n" ++
+  "    return e if e.is_a?(Encoding)\n" ++
+  "    s = __fd_str(e)\n" ++
+  "    return nil if s == \"-\"\n" ++
+  "    s = s[4..] if s.upcase.start_with?(\"BOM|\")\n" ++
+  "    begin\n" ++
+  "      Encoding.find(s)\n" ++
+  "    rescue ArgumentError\n" ++
+  "      warn(\"warning: Unsupported encoding: \" + s + \" ignored\")\n" ++
+  "      nil\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- modes --------------------------------------------------------------\n" ++
+  "  # A mode and its options as ruby's rb_io_extract_modeenc reads them:\n" ++
+  "  # [open(2) flags, binmode, textmode, external, internal, internal given].\n" ++
+  "  # The mode is a String (\"r+b:utf-8:iso-8859-1\"), an Integer of open(2)\n" ++
+  "  # flags, or nil; `mode:` may say it instead, and `flags:` adds to it.\n" ++
+  "  def self.__fd_modeenc(mode, opts, default = \"r\")\n" ++
+  "    if opts.key?(:mode)\n" ++
+  "      raise ArgumentError, \"mode specified twice\" if !mode.nil? && !opts[:mode].nil?\n" ++
+  "      mode = opts[:mode] if mode.nil?\n" ++
+  "    end\n" ++
+  "    ext = nil\n" ++
+  "    int = nil\n" ++
+  "    int_given = false\n" ++
+  "    enc_in_mode = false\n" ++
+  "    bin = false\n" ++
+  "    text = false\n" ++
+  "    if mode.nil?\n" ++
+  "      flags = __fd_strflags(default)\n" ++
+  "    elsif mode.is_a?(Integer) || (!mode.is_a?(String) && !mode.respond_to?(:to_str) && mode.respond_to?(:to_int))\n" ++
+  "      flags = __fd_int(mode)\n" ++
+  "    else\n" ++
+  "      m = __fd_str(mode)\n" ++
+  "      m, encs = m.split(\":\", 2)\n" ++
+  "      m = m.to_s\n" ++
+  "      flags = __fd_strflags(m, mode)\n" ++
+  "      bin = m.include?(\"b\")\n" ++
+  "      text = m.include?(\"t\")\n" ++
+  "      if encs\n" ++
+  "        enc_in_mode = true\n" ++
+  "        e1, e2 = encs.split(\":\", 2)\n" ++
+  "        ext = __fd_enc(e1)\n" ++
+  "        if e2\n" ++
+  "          int_given = true\n" ++
+  "          int = __fd_enc(e2)\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    flags |= __fd_int(opts[:flags]) if opts.key?(:flags) && !opts[:flags].nil?\n" ++
+  "    unless opts[:textmode].nil?\n" ++
+  "      raise ArgumentError, \"textmode specified twice\" if text\n" ++
+  "      raise ArgumentError, \"both textmode and binmode specified\" if bin\n" ++
+  "      text = true if opts[:textmode]\n" ++
+  "    end\n" ++
+  "    unless opts[:binmode].nil?\n" ++
+  "      raise ArgumentError, \"binmode specified twice\" if bin\n" ++
+  "      raise ArgumentError, \"both textmode and binmode specified\" if text\n" ++
+  "      bin = true if opts[:binmode]\n" ++
+  "    end\n" ++
+  "    has_ext = opts.key?(:external_encoding)\n" ++
+  "    has_int = opts.key?(:internal_encoding)\n" ++
+  "    if enc_in_mode && (opts.key?(:encoding) || has_ext || has_int)\n" ++
+  "      raise ArgumentError, \"encoding specified twice\"\n" ++
+  "    end\n" ++
+  "    if has_ext || has_int\n" ++
+  "      if opts.key?(:encoding) && !opts[:encoding].nil?\n" ++
+  "        e = opts[:encoding]\n" ++
+  "        warn(\"warning: Ignoring encoding parameter '\" + (e.is_a?(Encoding) ? e.to_s : __fd_str(e)) + \"': \" +\n" ++
+  "             (has_ext ? \"external\" : \"internal\") + \"_encoding is used\")\n" ++
+  "      end\n" ++
+  "      ext = __fd_enc(opts[:external_encoding]) if has_ext\n" ++
+  "      if has_int\n" ++
+  "        int_given = true\n" ++
+  "        iv = opts[:internal_encoding]\n" ++
+  "        int = (iv.is_a?(String) || iv.respond_to?(:to_str)) && __fd_str(iv) == \"-\" ? nil : __fd_enc(iv)\n" ++
+  "      end\n" ++
+  "    elsif opts.key?(:encoding) && !opts[:encoding].nil?\n" ++
+  "      e = opts[:encoding]\n" ++
+  "      if e.is_a?(Encoding)\n" ++
+  "        ext = e\n" ++
+  "      else\n" ++
+  "        e1, e2 = __fd_str(e).split(\":\", 2)\n" ++
+  "        ext = __fd_enc(e1)\n" ++
+  "        if e2\n" ++
+  "          int_given = true\n" ++
+  "          int = __fd_enc(e2)\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    int = nil if int && ext && int == ext\n" ++
+  "    # binmode without an encoding reads BINARY\n" ++
+  "    ext = Encoding::BINARY if bin && ext.nil? && !int_given\n" ++
+  "    [flags, bin, text, ext, int, int_given]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # \"r\" / \"w\" / \"a\", then \"+\", \"b\", \"t\" and (after \"w\") \"x\", in any order\n" ++
+  "  def self.__fd_strflags(m, orig = m)\n" ++
+  "    bad = -> \{ raise ArgumentError, \"invalid access mode \" + m.to_s }\n" ++
+  "    bad.call if m.empty?\n" ++
+  "    rest = m[1..]\n" ++
+  "    case m[0]\n" ++
+  "    when \"r\" then f = RDONLY\n" ++
+  "    when \"w\" then f = WRONLY | CREAT | TRUNC\n" ++
+  "    when \"a\" then f = WRONLY | CREAT | APPEND\n" ++
+  "    else bad.call\n" ++
+  "    end\n" ++
+  "    seen = +\"\"\n" ++
+  "    rest.each_char do |c|\n" ++
+  "      bad.call if seen.include?(c)\n" ++
+  "      case c\n" ++
+  "      when \"+\" then f = (f & ~3) | RDWR\n" ++
+  "      when \"b\", \"t\" then bad.call if (c == \"b\" && seen.include?(\"t\")) || (c == \"t\" && seen.include?(\"b\"))\n" ++
+  "      when \"x\" then m[0] == \"w\" ? (f |= EXCL) : bad.call\n" ++
+  "      else bad.call\n" ++
+  "      end\n" ++
+  "      seen << c\n" ++
+  "    end\n" ++
+  "    f\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # open(2) flags as the fopen mode the runtime's open takes; the flags it\n" ++
+  "  # cannot say -- O_CREAT without O_TRUNC, O_EXCL -- are done around it\n" ++
+  "  def self.__fd_fopen(flags)\n" ++
+  "    acc = flags & 3\n" ++
+  "    if (flags & APPEND) != 0\n" ++
+  "      acc == RDWR ? \"a+\" : \"a\"\n" ++
+  "    elsif (flags & TRUNC) != 0 && acc != RDONLY\n" ++
+  "      acc == RDWR ? \"w+\" : \"w\"\n" ++
+  "    else\n" ++
+  "      acc == RDONLY ? \"r\" : \"r+\"\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- opening ------------------------------------------------------------\n" ++
+  "  def self.__fd_open(path, flags, perm)\n" ++
+  "    perm = 0666 if perm.nil?\n" ++
+  "    exists = File.exist?(path)\n" ++
+  "    raise Errno::EEXIST, path if exists && (flags & EXCL) != 0 && (flags & CREAT) != 0\n" ++
+  "    unless exists\n" ++
+  "      if (flags & CREAT) == 0 || !File.directory?(File.dirname(path))\n" ++
+  "        raise Errno::ENOENT, path\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    if File.directory?(path) && (flags & 3) != RDONLY\n" ++
+  "      raise Errno::EISDIR, path\n" ++
+  "    end\n" ++
+  "    fm = __fd_fopen(flags)\n" ++
+  "    if !exists && fm.start_with?(\"r\")\n" ++
+  "      # O_CREAT without O_TRUNC: make the file, then open it where it is\n" ++
+  "      fd = IO.__fdopen(path, \"a\", perm)\n" ++
+  "      IO.__fdclose(fd) if fd >= 0\n" ++
+  "    end\n" ++
+  "    fd = IO.__fdopen(path, fm, perm)\n" ++
+  "    raise Errno::EACCES, path if fd < 0\n" ++
+  "    fd\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.sysopen(path, mode = nil, perm = nil)\n" ++
+  "    path = __fd_path(path)\n" ++
+  "    flags = mode.nil? ? RDONLY : (mode.is_a?(Integer) ? mode : __fd_strflags(__fd_str(mode).split(\":\", 2)[0].to_s, mode))\n" ++
+  "    perm = perm.nil? ? 0666 : __fd_int(perm)\n" ++
+  "    __fd_open(path, flags, perm)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- construction -------------------------------------------------------\n" ++
+  "  def initialize(fd, mode = nil, **opts)\n" ++
+  "    if block_given?\n" ++
+  "      warn(\"warning: \" + self.class.to_s + \"::new() does not take block; use \" + self.class.to_s + \"::open() instead\")\n" ++
+  "    end\n" ++
+  "    fd = IO.__fd_int(fd)\n" ++
+  "    raise Errno::EBADF if fd < 0\n" ++
+  "    probe = IO.__fddup(fd)\n" ++
+  "    raise Errno::EBADF if probe < 0\n" ++
+  "    IO.__fdclose(probe)\n" ++
+  "    acc = IO.__fdacc(fd)\n" ++
+  "    acc &= 3 if acc >= 0\n" ++
+  "    dflt = acc == 1 ? \"w\" : acc == 2 ? \"r+\" : \"r\"\n" ++
+  "    flags, bin, text, ext, int, int_given = IO.__fd_modeenc(mode, opts, dflt)\n" ++
+  "    want = flags & 3\n" ++
+  "    if acc >= 0 && ((acc == 0 && want != RDONLY) || (acc == 1 && want != WRONLY))\n" ++
+  "      raise Errno::EINVAL\n" ++
+  "    end\n" ++
+  "    IO.__fdclass(self.class) unless self.class.equal?(IO)\n" ++
+  "    __fd_setup(fd, flags, bin, ext, int, int_given)\n" ++
+  "    @__io_ac = opts.key?(:autoclose) ? (opts[:autoclose] ? true : false) : true\n" ++
+  "    @__io_path = opts[:path].nil? ? nil : IO.__fd_str(opts[:path]).dup if opts.key?(:path)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_setup(fd, flags, bin, ext, int, int_given)\n" ++
+  "    @__io_fd = fd\n" ++
+  "    @__io_wfd = nil\n" ++
+  "    acc = flags & 3\n" ++
+  "    @__io_r = acc != WRONLY\n" ++
+  "    @__io_w = acc != RDONLY\n" ++
+  "    @__io_app = (flags & APPEND) != 0\n" ++
+  "    @__io_closed = nil\n" ++
+  "    @__io_rbuf = +\"\".b\n" ++
+  "    @__io_wbuf = +\"\".b\n" ++
+  "    @__io_lineno = 0\n" ++
+  "    @__io_sync = false\n" ++
+  "    @__io_bin = bin ? true : false\n" ++
+  "    @__io_pid = nil\n" ++
+  "    @__io_ac = true\n" ++
+  "    __fd_setencs(ext, int, int_given)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # ruby's rb_io_ext_int_to_encs: the external is kept only when it was\n" ++
+  "  # named; the internal is the default internal unless one was given, and\n" ++
+  "  # none at all when it is the external or the external is BINARY\n" ++
+  "  def __fd_setencs(ext, int, int_given)\n" ++
+  "    named = !ext.nil?\n" ++
+  "    e = ext || Encoding.default_external\n" ++
+  "    i = int_given ? int : (e == Encoding::BINARY ? nil : Encoding.default_internal)\n" ++
+  "    if i.nil? || i == e\n" ++
+  "      @__io_ext = named ? e : nil\n" ++
+  "      @__io_int = nil\n" ++
+  "    else\n" ++
+  "      @__io_ext = e\n" ++
+  "      @__io_int = i\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.for_fd(*args, **opts, &blk) = new(*args, **opts, &blk)\n" ++
+  "\n" ++
+  "  def self.open(*args, **opts)\n" ++
+  "    io = new(*args, **opts)\n" ++
+  "    return io unless block_given?\n" ++
+  "    begin\n" ++
+  "      yield io\n" ++
+  "    ensure\n" ++
+  "      begin\n" ++
+  "        io.close unless io.closed?\n" ++
+  "      rescue IOError\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # both ends non-blocking, as ruby 3's are (#nonblock? answers true), and\n" ++
+  "  # the write end synchronous; SIGPIPE is ignored from the first pipe on, so a\n" ++
+  "  # write nobody will read is Errno::EPIPE and not the end of the process\n" ++
+  "  def self.pipe(*args, **opts)\n" ++
+  "    ext = nil\n" ++
+  "    int = nil\n" ++
+  "    int_given = false\n" ++
+  "    if args.size > 2\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 0..2)\"\n" ++
+  "    end\n" ++
+  "    if args.size >= 1 && !args[0].nil?\n" ++
+  "      if args.size == 1 && !args[0].is_a?(Encoding)\n" ++
+  "        e1, e2 = __fd_str(args[0]).split(\":\", 2)\n" ++
+  "        ext = __fd_enc(e1)\n" ++
+  "        if e2\n" ++
+  "          int_given = true\n" ++
+  "          int = __fd_enc(e2)\n" ++
+  "        end\n" ++
+  "      else\n" ++
+  "        ext = __fd_enc(args[0])\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    if args.size == 2\n" ++
+  "      int_given = true\n" ++
+  "      int = __fd_enc(args[1])\n" ++
+  "    end\n" ++
+  "    int = nil if int && int == ext\n" ++
+  "    pr = IO.__fdpipe\n" ++
+  "    raise Errno::EMFILE, \"Too many open files - pipe\" if pr.nil?\n" ++
+  "    IO.__fdsigpipe\n" ++
+  "    rfd, wfd = pr\n" ++
+  "    IO.__fdnonblock(rfd)\n" ++
+  "    IO.__fdnonblock(wfd)\n" ++
+  "    r = allocate\n" ++
+  "    r.send(:initialize, rfd, \"r\")\n" ++
+  "    r.__fd_setencs(ext, int, int_given)\n" ++
+  "    r.instance_variable_set(:@__io_peer, wfd)\n" ++
+  "    w = allocate\n" ++
+  "    w.send(:initialize, wfd, \"w\")\n" ++
+  "    w.instance_variable_set(:@__io_peer, rfd)\n" ++
+  "    w.sync = true\n" ++
+  "    pair = [r, w]\n" ++
+  "    return pair unless block_given?\n" ++
+  "    begin\n" ++
+  "      yield r, w\n" ++
+  "    ensure\n" ++
+  "      pair.each \{ |io| io.close unless io.closed? }\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- state --------------------------------------------------------------\n" ++
+  "  def __fd_closed! = (raise IOError, \"closed stream\" if @__io_closed)\n" ++
+  "  def __fd_reading!\n" ++
+  "    __fd_closed!\n" ++
+  "    raise IOError, \"not opened for reading\" unless @__io_r\n" ++
+  "  end\n" ++
+  "  def __fd_writing!\n" ++
+  "    __fd_closed!\n" ++
+  "    raise IOError, \"not opened for writing\" unless @__io_w\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_closed? = @__io_closed ? true : false\n" ++
+  "  def __fd_fileno = (__fd_closed!; @__io_fd)\n" ++
+  "  def __fd_to_i = __fd_fileno\n" ++
+  "  def __fd_to_io = self\n" ++
+  "  def __fd_autoclose? = (__fd_closed!; @__io_ac)\n" ++
+  "  def __fd_autoclose=(v)\n" ++
+  "    __fd_closed!\n" ++
+  "    @__io_ac = v ? true : false\n" ++
+  "  end\n" ++
+  "  def __fd_close_on_exec? = (__fd_closed!; IO.__fdcloexec(@__io_fd))\n" ++
+  "  def __fd_close_on_exec=(v)\n" ++
+  "    __fd_closed!\n" ++
+  "    IO.__fdcloexec(@__io_fd, v ? true : false)\n" ++
+  "    IO.__fdcloexec(@__io_wfd, v ? true : false) if @__io_wfd\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "  def __fd_sync = (__fd_closed!; @__io_sync)\n" ++
+  "  def __fd_sync=(v)\n" ++
+  "    __fd_closed!\n" ++
+  "    @__io_sync = v ? true : false\n" ++
+  "    __fd_flush_w if @__io_sync\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "  def __fd_binmode?\n" ++
+  "    __fd_closed!\n" ++
+  "    @__io_bin\n" ++
+  "  end\n" ++
+  "  def __fd_binmode\n" ++
+  "    __fd_closed!\n" ++
+  "    @__io_bin = true\n" ++
+  "    @__io_ext = Encoding::BINARY\n" ++
+  "    @__io_int = nil\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "  def __fd_tty? = (__fd_closed!; IO.__fdtty(@__io_fd))\n" ++
+  "  def __fd_isatty = __fd_tty?\n" ++
+  "  def __fd_pid = (__fd_closed!; @__io_pid)\n" ++
+  "  def __fd_path = @__io_path\n" ++
+  "  def __fd_to_path = @__io_path\n" ++
+  "  def __fd_lineno = (__fd_reading!; @__io_lineno)\n" ++
+  "  def __fd_lineno=(n)\n" ++
+  "    __fd_reading!\n" ++
+  "    @__io_lineno = IO.__fd_cint(n)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_external_encoding\n" ++
+  "    return @__io_ext if @__io_int\n" ++
+  "    return @__io_ext if @__io_w\n" ++
+  "    @__io_ext || Encoding.default_external\n" ++
+  "  end\n" ++
+  "  def __fd_internal_encoding = @__io_int\n" ++
+  "\n" ++
+  "  def __fd_set_encoding(*args, **opts)\n" ++
+  "    __fd_closed!\n" ++
+  "    if args.empty? || args.size > 2\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 1..2)\"\n" ++
+  "    end\n" ++
+  "    if args.size == 1 && !args[0].nil? && !args[0].is_a?(Encoding)\n" ++
+  "      e1, e2 = IO.__fd_str(args[0]).split(\":\", 2)\n" ++
+  "      __fd_setencs(IO.__fd_enc(e1), e2 ? IO.__fd_enc(e2) : nil, !e2.nil?)\n" ++
+  "    elsif args[0].nil? && (args.size == 1 || args[1].nil?)\n" ++
+  "      __fd_setencs(nil, nil, false)\n" ++
+  "    else\n" ++
+  "      int_given = args.size == 2 && !args[1].nil?\n" ++
+  "      __fd_setencs(IO.__fd_enc(args[0]), int_given ? IO.__fd_enc(args[1]) : nil, int_given)\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_inspect\n" ++
+  "    nm = @__io_path ? @__io_path.to_s : \"fd \" + @__io_fd.to_s\n" ++
+  "    return \"#<\" + self.class.to_s + \":\" + (@__io_path ? @__io_path.to_s + \" \" : \"\") + \"(closed)>\" if @__io_closed\n" ++
+  "    \"#<\" + self.class.to_s + \":\" + nm + \">\"\n" ++
+  "  end\n" ++
+  "  def __fd_to_s = __fd_inspect\n" ++
+  "\n" ++
+  "  # --- the write side -----------------------------------------------------\n" ++
+  "  # a write that the kernel refuses: a pipe with no reader is EPIPE, anything\n" ++
+  "  # else here is a descriptor that is no longer one\n" ++
+  "  def __fd_wfail\n" ++
+  "    raise Errno::EPIPE if @__io_peer || @__io_pid\n" ++
+  "    raise Errno::EBADF\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_wfd = @__io_wfd || @__io_fd\n" ++
+  "\n" ++
+  "  # the write buffer out, as far as the kernel takes it: what it did not\n" ++
+  "  # take stays, so a flush that failed fails again at close (ruby's order)\n" ++
+  "  def __fd_flush_w\n" ++
+  "    return if @__io_wbuf.nil? || @__io_wbuf.empty?\n" ++
+  "    fd = __fd_wfd\n" ++
+  "    until @__io_wbuf.empty?\n" ++
+  "      n = IO.__fdwrite(fd, @__io_wbuf)\n" ++
+  "      if n < 0\n" ++
+  "        __fd_wfail unless IO.__fdnb(fd)\n" ++
+  "        IO.__sel_wait([[fd, 2, self]], -1)\n" ++
+  "        n = IO.__fdwrite(fd, @__io_wbuf)\n" ++
+  "        __fd_wfail if n < 0\n" ++
+  "      end\n" ++
+  "      @__io_wbuf = @__io_wbuf.byteslice(n, @__io_wbuf.bytesize - n)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # what #write puts out for one object: its #to_s, converted to the\n" ++
+  "  # external encoding when the stream NAMED one (a BINARY one converts\n" ++
+  "  # nothing). A string already in it, or ASCII into an ASCII-compatible\n" ++
+  "  # one, is written as it is; anything else is transcoded -- a BINARY string\n" ++
+  "  # too, which is how a byte no encoding can map is refused.\n" ++
+  "  def self.__wstr(o, ext)\n" ++
+  "    s = o.is_a?(String) ? o : o.to_s\n" ++
+  "    s = IO.__fdanystr(o) unless s.is_a?(String)\n" ++
+  "    if ext && ext != Encoding::BINARY && s.encoding != ext && !(s.ascii_only? && ext.ascii_compatible?)\n" ++
+  "      s = s.encode(ext)\n" ++
+  "    end\n" ++
+  "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_wstr(o) = IO.__wstr(o, @__io_ext)\n" ++
+  "\n" ++
+  "  # a synchronous stream writes straight through, so a write the kernel\n" ++
+  "  # refuses leaves nothing behind; otherwise the bytes wait in the buffer\n" ++
+  "  def __fd_write(*objs)\n" ++
+  "    __fd_writing!\n" ++
+  "    n = 0\n" ++
+  "    objs.each do |o|\n" ++
+  "      s = __fd_wstr(o)\n" ++
+  "      n += s.bytesize\n" ++
+  "      __fd_seek_rbuf\n" ++
+  "      @__io_wbuf << s.b\n" ++
+  "    end\n" ++
+  "    if @__io_sync\n" ++
+  "      begin\n" ++
+  "        __fd_flush_w\n" ++
+  "      ensure\n" ++
+  "        @__io_wbuf = +\"\".b\n" ++
+  "      end\n" ++
+  "    elsif @__io_wbuf.bytesize >= 8192\n" ++
+  "      __fd_flush_w\n" ++
+  "    end\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a read-ahead buffer is given back before a write, so the write lands at\n" ++
+  "  # the position the program sees\n" ++
+  "  def __fd_seek_rbuf\n" ++
+  "    return if @__io_rbuf.empty?\n" ++
+  "    IO.__fdseek(@__io_fd, -@__io_rbuf.bytesize, 1)\n" ++
+  "    @__io_rbuf = +\"\".b\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_append(o)\n" ++
+  "    __fd_write(o)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # print / puts / printf / putc for every stream this layer and the File\n" ++
+  "  # model answer, over the stream's own #write\n" ++
+  "  def __io_print(objs)\n" ++
+  "    objs = [$_] if objs.empty?\n" ++
+  "    objs.each_with_index do |o, i|\n" ++
+  "      self.write($,) if i > 0 && !$,.nil?\n" ++
+  "      self.write(o.nil? ? \"\" : o)\n" ++
+  "    end\n" ++
+  "    self.write($\\) unless $\\.nil?\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __io_puts(objs)\n" ++
+  "    return (self.write(\"\\n\"); nil) if objs.empty?\n" ++
+  "    objs.each \{ |o| __io_puts1(o, []) }\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __io_printf(fmt, args)\n" ++
+  "    return nil if fmt.nil?\n" ++
+  "    self.write(format(IO.__fd_str(fmt), *args))\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __io_putc(c)\n" ++
+  "    s = c.is_a?(String) ? c[0].to_s : (c.is_a?(Integer) || !c.respond_to?(:to_str) ? (IO.__fd_int(c) & 0xff).chr : IO.__fd_str(c)[0].to_s)\n" ++
+  "    self.write(s)\n" ++
+  "    c\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_print(*objs) = __io_print(objs)\n" ++
+  "  def __fd_puts(*objs) = __io_puts(objs)\n" ++
+  "\n" ++
+  "  def __io_puts1(o, seen)\n" ++
+  "    if o.is_a?(String)\n" ++
+  "      s = o\n" ++
+  "    elsif o.nil?\n" ++
+  "      s = \"\"\n" ++
+  "    else\n" ++
+  "      a = o.is_a?(Array) ? o : (o.respond_to?(:to_ary) ? o.to_ary : nil)\n" ++
+  "      if a.is_a?(Array)\n" ++
+  "        if seen.any? \{ |x| x.equal?(a) }\n" ++
+  "          s = \"[...]\"\n" ++
+  "        else\n" ++
+  "          a.each \{ |x| __io_puts1(x, seen + [a]) }\n" ++
+  "          return\n" ++
+  "        end\n" ++
+  "      else\n" ++
+  "        s = o.to_s\n" ++
+  "        s = IO.__fdanystr(o) unless s.is_a?(String)\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    self.write(s.end_with?(\"\\n\") ? s : s + \"\\n\")\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_printf(fmt = nil, *args) = __io_printf(fmt, args)\n" ++
+  "\n" ++
+  "  def __fd_putc(c)\n" ++
+  "    __fd_writing!\n" ++
+  "    __io_putc(c)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_flush\n" ++
+  "    __fd_closed!\n" ++
+  "    __fd_flush_w\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_fsync\n" ++
+  "    __fd_writing!\n" ++
+  "    __fd_flush_w\n" ++
+  "    IO.__fdsync(__fd_wfd) < 0 ? nil : 0\n" ++
+  "  end\n" ++
+  "  def __fd_fdatasync = __fd_fsync\n" ++
+  "\n" ++
+  "  def __fd_syswrite(s)\n" ++
+  "    __fd_writing!\n" ++
+  "    s = __fd_wstr(s)\n" ++
+  "    warn(\"warning: syswrite for buffered IO\") unless @__io_wbuf.empty?\n" ++
+  "    __fd_flush_w\n" ++
+  "    n = IO.__fdwrite(__fd_wfd, s.b)\n" ++
+  "    __fd_wfail if n < 0\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_write_nonblock(s, exception: true)\n" ++
+  "    __fd_writing!\n" ++
+  "    s = __fd_wstr(s)\n" ++
+  "    __fd_flush_w\n" ++
+  "    return 0 if s.empty?\n" ++
+  "    fd = __fd_wfd\n" ++
+  "    IO.__fdnonblock(fd) unless IO.__fdnb(fd)\n" ++
+  "    n = IO.__fdwrite(fd, s.b)\n" ++
+  "    return n if n >= 0\n" ++
+  "    __fd_wfail unless IO.__poll([fd], [2], 0)[0] == 0\n" ++
+  "    return :wait_writable unless exception\n" ++
+  "    raise IO::EAGAINWaitWritable, \"write would block\"\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- the read side ------------------------------------------------------\n" ++
+  "  # one read(2) onto the buffer: false at end of file. A descriptor with\n" ++
+  "  # nothing in it yet is WAITED on (the readiness loop lets other threads run,\n" ++
+  "  # and names a pipe nothing can ever write to as the deadlock it is).\n" ++
+  "  def __fd_fill(want = 65536)\n" ++
+  "    fd = @__io_fd\n" ++
+  "    loop do\n" ++
+  "      # a wait another thread ended by closing the stream\n" ++
+  "      raise IOError, \"stream closed in another thread\" if @__io_closed\n" ++
+  "      s = IO.__fdread(fd, want)\n" ++
+  "      if s.is_a?(String)\n" ++
+  "        @__io_rbuf << s\n" ++
+  "        return true\n" ++
+  "      end\n" ++
+  "      return false if s.nil?\n" ++
+  "      raise Errno::EISDIR if @__io_path && File.directory?(@__io_path.to_s)\n" ++
+  "      raise Errno::EBADF unless IO.__fdnb(fd)\n" ++
+  "      IO.__sel_wait([[fd, 1, self]], -1)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the bytes of the buffer, up to `n`, taken off it\n" ++
+  "  def __fd_take(n)\n" ++
+  "    s = @__io_rbuf.byteslice(0, n)\n" ++
+  "    @__io_rbuf = @__io_rbuf.byteslice(n, @__io_rbuf.bytesize - n) || +\"\".b\n" ++
+  "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_rd_enc = @__io_ext || (@__io_bin ? Encoding::BINARY : Encoding.default_external)\n" ++
+  "\n" ++
+  "  # a string read as characters: tagged with the read encoding and, when an\n" ++
+  "  # internal one is set, transcoded into it\n" ++
+  "  def __fd_chars(s)\n" ++
+  "    s.force_encoding(__fd_rd_enc)\n" ++
+  "    s = s.encode(@__io_int, __fd_rd_enc) if @__io_int && __fd_rd_enc != Encoding::BINARY\n" ++
+  "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a buffer argument is filled in place and keeps its own encoding\n" ++
+  "  def __fd_into(buf, s)\n" ++
+  "    return s if buf.nil?\n" ++
+  "    e = buf.encoding\n" ++
+  "    buf.replace(s)\n" ++
+  "    buf.force_encoding(e)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_buf!(buf)\n" ++
+  "    return nil if buf.nil?\n" ++
+  "    buf = IO.__fd_str(buf)\n" ++
+  "    raise FrozenError, \"can't modify frozen String: \" + buf.inspect if buf.frozen?\n" ++
+  "    buf\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_len!(len)\n" ++
+  "    len = IO.__fd_long(IO.__fd_int(len))\n" ++
+  "    raise ArgumentError, \"negative length \" + len.to_s + \" given\" if len < 0\n" ++
+  "    len\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_read(len = nil, buf = nil)\n" ++
+  "    __fd_reading!\n" ++
+  "    buf = __fd_buf!(buf)\n" ++
+  "    __fd_flush_w\n" ++
+  "    if len.nil?\n" ++
+  "      nil while __fd_fill\n" ++
+  "      s = __fd_chars(__fd_take(@__io_rbuf.bytesize))\n" ++
+  "      return s if buf.nil?\n" ++
+  "      return buf.replace(s)\n" ++
+  "    end\n" ++
+  "    len = __fd_len!(len)\n" ++
+  "    if len == 0\n" ++
+  "      return buf ? buf.replace(\"\".b).force_encoding(buf.encoding) : \"\".b\n" ++
+  "    end\n" ++
+  "    while @__io_rbuf.bytesize < len\n" ++
+  "      break unless __fd_fill(len - @__io_rbuf.bytesize)\n" ++
+  "    end\n" ++
+  "    if @__io_rbuf.empty?\n" ++
+  "      buf.clear if buf\n" ++
+  "      return nil\n" ++
+  "    end\n" ++
+  "    s = __fd_take(len)\n" ++
+  "    return s if buf.nil?\n" ++
+  "    buf.replace(s)\n" ++
+  "    buf.force_encoding(Encoding::BINARY)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_readpartial(len, buf = nil)\n" ++
+  "    __fd_reading!\n" ++
+  "    buf = __fd_buf!(buf)\n" ++
+  "    len = __fd_len!(len)\n" ++
+  "    if len == 0\n" ++
+  "      return buf ? buf.replace(\"\") : \"\".b\n" ++
+  "    end\n" ++
+  "    __fd_flush_w\n" ++
+  "    if @__io_rbuf.empty? && !__fd_fill(len)\n" ++
+  "      buf.clear if buf\n" ++
+  "      raise EOFError, \"end of file reached\"\n" ++
+  "    end\n" ++
+  "    __fd_into(buf, __fd_take(len))\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_sysread(len, buf = nil)\n" ++
+  "    __fd_reading!\n" ++
+  "    buf = __fd_buf!(buf)\n" ++
+  "    len = __fd_len!(len)\n" ++
+  "    raise IOError, \"sysread for buffered IO\" unless @__io_rbuf.empty?\n" ++
+  "    if len == 0\n" ++
+  "      return buf ? buf.replace(\"\") : \"\".b\n" ++
+  "    end\n" ++
+  "    unless __fd_fill(len)\n" ++
+  "      buf.clear if buf\n" ++
+  "      raise EOFError, \"end of file reached\"\n" ++
+  "    end\n" ++
+  "    __fd_into(buf, __fd_take(len))\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_read_nonblock(len, buf = nil, exception: true)\n" ++
+  "    __fd_reading!\n" ++
+  "    buf = __fd_buf!(buf)\n" ++
+  "    len = __fd_len!(len)\n" ++
+  "    if len == 0\n" ++
+  "      return buf ? buf.replace(\"\") : \"\".b\n" ++
+  "    end\n" ++
+  "    fd = @__io_fd\n" ++
+  "    IO.__fdnonblock(fd) unless IO.__fdnb(fd)\n" ++
+  "    @__nb_off = nil\n" ++
+  "    if @__io_rbuf.empty?\n" ++
+  "      s = IO.__fdread(fd, len)\n" ++
+  "      if s.nil?\n" ++
+  "        buf.clear if buf\n" ++
+  "        return nil unless exception\n" ++
+  "        raise EOFError, \"end of file reached\"\n" ++
+  "      elsif !s.is_a?(String)\n" ++
+  "        buf.clear if buf\n" ++
+  "        return :wait_readable unless exception\n" ++
+  "        raise IO::EAGAINWaitReadable, \"read would block\"\n" ++
+  "      end\n" ++
+  "      @__io_rbuf << s\n" ++
+  "    end\n" ++
+  "    __fd_into(buf, __fd_take(len))\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_eof?\n" ++
+  "    __fd_reading!\n" ++
+  "    return false unless @__io_rbuf.empty?\n" ++
+  "    !__fd_fill\n" ++
+  "  end\n" ++
+  "  def __fd_eof = __fd_eof?\n" ++
+  "\n" ++
+  "  # the byte length of the character that starts `s` at byte `i`, in the\n" ++
+  "  # read encoding (1 when the encoding is a single-byte one)\n" ++
+  "  def __fd_clen(s, i)\n" ++
+  "    e = __fd_rd_enc\n" ++
+  "    b = s.getbyte(i)\n" ++
+  "    return 1 if b.nil? || b < 0x80\n" ++
+  "    if e == Encoding::UTF_8\n" ++
+  "      return b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1\n" ++
+  "    end\n" ++
+  "    return 1 if e == Encoding::BINARY || e == Encoding::US_ASCII || !e.ascii_compatible?\n" ++
+  "    n = 1\n" ++
+  "    while n <= 4 && i + n <= s.bytesize\n" ++
+  "      return n if s.byteslice(i, n).force_encoding(e).valid_encoding?\n" ++
+  "      n += 1\n" ++
+  "    end\n" ++
+  "    1\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_getc\n" ++
+  "    __fd_reading!\n" ++
+  "    __fd_flush_w\n" ++
+  "    return nil if @__io_rbuf.empty? && !__fd_fill\n" ++
+  "    n = __fd_clen(@__io_rbuf, 0)\n" ++
+  "    while @__io_rbuf.bytesize < n\n" ++
+  "      break unless __fd_fill\n" ++
+  "    end\n" ++
+  "    __fd_chars(__fd_take(n))\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_readchar\n" ++
+  "    c = __fd_getc\n" ++
+  "    raise EOFError, \"end of file reached\" if c.nil?\n" ++
+  "    c\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_getbyte\n" ++
+  "    __fd_reading!\n" ++
+  "    __fd_flush_w\n" ++
+  "    return nil if @__io_rbuf.empty? && !__fd_fill\n" ++
+  "    __fd_take(1).getbyte(0)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_readbyte\n" ++
+  "    b = __fd_getbyte\n" ++
+  "    raise EOFError, \"end of file reached\" if b.nil?\n" ++
+  "    b\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_ungetbyte(b)\n" ++
+  "    __fd_reading!\n" ++
+  "    return nil if b.nil?\n" ++
+  "    s = b.is_a?(Integer) ? (b & 0xff).chr.b : IO.__fd_str(b).b\n" ++
+  "    @__io_rbuf = s + @__io_rbuf\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_ungetc(c)\n" ++
+  "    __fd_reading!\n" ++
+  "    return nil if c.nil?\n" ++
+  "    if c.is_a?(Integer)\n" ++
+  "      e = __fd_rd_enc\n" ++
+  "      s = e == Encoding::BINARY || c < 0x80 ? (c & 0xff).chr : c.chr(e)\n" ++
+  "    else\n" ++
+  "      s = IO.__fd_str(c)\n" ++
+  "    end\n" ++
+  "    @__io_rbuf = s.b + @__io_rbuf\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_each_byte\n" ++
+  "    return enum_for(:each_byte) \{ nil } unless block_given?\n" ++
+  "    while (b = __fd_getbyte)\n" ++
+  "      yield b\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_each_char\n" ++
+  "    return enum_for(:each_char) \{ nil } unless block_given?\n" ++
+  "    while (c = __fd_getc)\n" ++
+  "      yield c\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_each_codepoint\n" ++
+  "    return enum_for(:each_codepoint) \{ nil } unless block_given?\n" ++
+  "    while (c = __fd_getc)\n" ++
+  "      raise ArgumentError, \"invalid byte sequence in \" + c.encoding.to_s unless c.valid_encoding?\n" ++
+  "      yield c.ord\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- position -----------------------------------------------------------\n" ++
+  "  def __fd_whence(w)\n" ++
+  "    return w if w.is_a?(Integer)\n" ++
+  "    case w\n" ++
+  "    when :SET then 0\n" ++
+  "    when :CUR then 1\n" ++
+  "    when :END then 2\n" ++
+  "    else IO.__fd_int(w)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_lseek(off, whence)\n" ++
+  "    r = IO.__fdseek(@__io_fd, off, whence)\n" ++
+  "    if r < 0\n" ++
+  "      raise Errno::ESPIPE if @__io_peer || @__io_pid\n" ++
+  "      raise Errno::EINVAL\n" ++
+  "    end\n" ++
+  "    r\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_pos\n" ++
+  "    __fd_closed!\n" ++
+  "    __fd_lseek(0, 1) - @__io_rbuf.bytesize + @__io_wbuf.bytesize\n" ++
+  "  end\n" ++
+  "  def __fd_tell = __fd_pos\n" ++
+  "\n" ++
+  "  def __fd_seek(off, whence = 0)\n" ++
+  "    __fd_closed!\n" ++
+  "    off = IO.__fd_long(IO.__fd_int(off))\n" ++
+  "    whence = __fd_whence(whence)\n" ++
+  "    __fd_flush_w\n" ++
+  "    off -= @__io_rbuf.bytesize if whence == 1\n" ++
+  "    __fd_lseek(off, whence)\n" ++
+  "    @__io_rbuf = +\"\".b\n" ++
+  "    0\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_pos=(off)\n" ++
+  "    __fd_seek(off, 0)\n" ++
+  "    off\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_rewind\n" ++
+  "    __fd_seek(0, 0)\n" ++
+  "    @__io_lineno = 0\n" ++
+  "    0\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_sysseek(off, whence = 0)\n" ++
+  "    __fd_closed!\n" ++
+  "    off = IO.__fd_long(IO.__fd_int(off))\n" ++
+  "    whence = __fd_whence(whence)\n" ++
+  "    raise IOError, \"sysseek for buffered IO\" unless @__io_rbuf.empty?\n" ++
+  "    warn(\"warning: sysseek for buffered IO\") unless @__io_wbuf.empty?\n" ++
+  "    __fd_flush_w\n" ++
+  "    __fd_lseek(off, whence)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- closing ------------------------------------------------------------\n" ++
+  "  def __fd_close\n" ++
+  "    return nil if @__io_closed\n" ++
+  "    err = nil\n" ++
+  "    begin\n" ++
+  "      __fd_flush_w if @__io_w\n" ++
+  "    rescue SystemCallError => e\n" ++
+  "      err = e\n" ++
+  "    end\n" ++
+  "    @__io_closed = true\n" ++
+  "    @__io_r = false\n" ++
+  "    @__io_w = false\n" ++
+  "    if @__io_ac\n" ++
+  "      IO.__fdclose(@__io_fd)\n" ++
+  "      IO.__fdclose(@__io_wfd) if @__io_wfd\n" ++
+  "    end\n" ++
+  "    __fd_reap\n" ++
+  "    raise err if err\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the child of a popen'd stream, waited for when the stream is closed\n" ++
+  "  def __fd_reap\n" ++
+  "    return if @__io_pid.nil?\n" ++
+  "    pid = @__io_pid\n" ++
+  "    begin\n" ++
+  "      Process.wait(pid)\n" ++
+  "    rescue Errno::ECHILD\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_close_read\n" ++
+  "    return nil if @__io_closed\n" ++
+  "    if @__io_wfd\n" ++
+  "      IO.__fdclose(@__io_fd) if @__io_r\n" ++
+  "      @__io_r = false\n" ++
+  "      return nil\n" ++
+  "    end\n" ++
+  "    raise IOError, \"closing non-duplex IO for reading\" if @__io_w\n" ++
+  "    __fd_close\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_close_write\n" ++
+  "    return nil if @__io_closed\n" ++
+  "    if @__io_wfd\n" ++
+  "      if @__io_w\n" ++
+  "        __fd_flush_w\n" ++
+  "        IO.__fdclose(@__io_wfd)\n" ++
+  "        @__io_w = false\n" ++
+  "      end\n" ++
+  "      return nil\n" ++
+  "    end\n" ++
+  "    raise IOError, \"closing non-duplex IO for writing\" if @__io_r\n" ++
+  "    __fd_close\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the descriptor's own stat, through the /dev/fd name the stat(1) child\n" ++
+  "  # inherits it under (File::Stat asks stat(1); see there)\n" ++
+  "  def __fd_stat\n" ++
+  "    __fd_closed!\n" ++
+  "    __fd_flush_w\n" ++
+  "    File::Stat.new(\"/dev/fd/\" + @__io_fd.to_s)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_advise(advice, offset = 0, len = 0)\n" ++
+  "    __fd_closed!\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + IO.__fd_cname(advice) + \" into Symbol\" unless advice.is_a?(Symbol)\n" ++
+  "    IO.__fd_int(offset)\n" ++
+  "    IO.__fd_int(len)\n" ++
+  "    unless %i[normal sequential random willneed dontneed noreuse].include?(advice)\n" ++
+  "      raise NotImplementedError, \"Unsupported advice: \" + advice.inspect\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # --- duplication --------------------------------------------------------\n" ++
+  "  def __fd_initialize_copy(orig)\n" ++
+  "    raise IOError, \"closed stream\" if orig.closed?\n" ++
+  "    orig.flush if orig.instance_variable_get(:@__io_w)\n" ++
+  "    nfd = IO.__fddup(orig.fileno)\n" ++
+  "    raise Errno::EMFILE if nfd < 0\n" ++
+  "    orig.instance_variables.each do |n|\n" ++
+  "      v = orig.instance_variable_get(n)\n" ++
+  "      instance_variable_set(n, v.is_a?(String) ? v.dup : v)\n" ++
+  "    end\n" ++
+  "    @__io_fd = nfd\n" ++
+  "    @__io_wfd = IO.__fddup(orig.instance_variable_get(:@__io_wfd)) if @__io_wfd\n" ++
+  "    @__io_pid = nil\n" ++
+  "    @__io_ac = true\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  def __fd_dup\n" ++
+  "    o = self.class.allocate\n" ++
+  "    o.__fd_initialize_copy(self)\n" ++
+  "    o\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_clone(freeze: nil)\n" ++
+  "    o = __fd_dup\n" ++
+  "    o.freeze if freeze || (freeze.nil? && frozen?)\n" ++
+  "    o\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # === the line reader =====================================================\n" ++
+  "  # gets / readline / readlines / each_line / each, and IO.foreach /\n" ++
+  "  # IO.readlines, for a descriptor stream AND for a File: one reader over two\n" ++
+  "  # byte sources. A descriptor stream keeps its read buffer between calls; a\n" ++
+  "  # File is a path and a position, so the bytes a line did not use are given\n" ++
+  "  # back to the position before the call returns (the File's own #read and\n" ++
+  "  # #pos then agree with what the program has seen).\n" ++
+  "  def __ln_file? = @__io_fd.nil?\n" ++
+  "\n" ++
+  "  def __ln_begin\n" ++
+  "    if __ln_file?\n" ++
+  "      self.__f_read(0)\n" ++
+  "      __f_bom_skip\n" ++
+  "      # what #ungetc pushed back is read first; the file's own bytes are\n" ++
+  "      # counted, so what is left over can go back where each part came from\n" ++
+  "      @__io_rbuf = (@__f_unget || \"\").b\n" ++
+  "      @__f_unget = nil\n" ++
+  "      @__ln_fbytes = 0\n" ++
+  "    else\n" ++
+  "      __fd_reading!\n" ++
+  "      __fd_flush_w\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ln_end\n" ++
+  "    return unless __ln_file?\n" ++
+  "    left = @__io_rbuf.bytesize\n" ++
+  "    unless left == 0\n" ++
+  "      back = left < @__ln_fbytes ? left : @__ln_fbytes\n" ++
+  "      self.pos = self.pos - back if back > 0\n" ++
+  "      @__f_unget = @__io_rbuf.byteslice(0, left - back) if left > back\n" ++
+  "      # a line reader read ahead: ruby's buffer would hold these (see sysread)\n" ++
+  "      @__f_ahead = true\n" ++
+  "    end\n" ++
+  "    @__io_rbuf = nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ln_fill\n" ++
+  "    return __fd_fill unless __ln_file?\n" ++
+  "    s = self.__f_read(8192)\n" ++
+  "    return false if s.nil? || s.empty?\n" ++
+  "    @__io_rbuf << s.b\n" ++
+  "    @__ln_fbytes += s.bytesize\n" ++
+  "    true\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # [read encoding, internal encoding] -- a File's come from its mode string\n" ++
+  "  # and #set_encoding; a descriptor stream's were settled when it was opened\n" ++
+  "  def __ln_encs\n" ++
+  "    return [__fd_rd_enc, @__io_int] unless __ln_file?\n" ++
+  "    enc, int = __f_encstate\n" ++
+  "    [enc || Encoding.default_external, int]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # A File's encodings, as rb_io_ext_int_to_encs settles them: [the external\n" ++
+  "  # it holds (nil: the default external, whatever that is when asked), the\n" ++
+  "  # internal (nil: none)]. What the stream NAMED -- its mode string, #binmode,\n" ++
+  "  # #set_encoding, the keyword options -- comes first; the defaults are the\n" ++
+  "  # ones it was opened under (@__f_dext / @__f_dint, recorded at the open).\n" ++
+  "  def __f_encstate\n" ++
+  "    if @__f_encs_set\n" ++
+  "      named = @__f_ext\n" ++
+  "      int = @__f_int\n" ++
+  "      int_given = @__f_int_given\n" ++
+  "    else\n" ++
+  "      m = @__f_mode.to_s\n" ++
+  "      m = @__f_lastmode.to_s if m.empty?\n" ++
+  "      acc, encs = m.split(\":\", 2)\n" ++
+  "      named = nil\n" ++
+  "      int = nil\n" ++
+  "      int_given = false\n" ++
+  "      if encs\n" ++
+  "        e1, e2 = encs.split(\":\", 2)\n" ++
+  "        named = IO.__fd_enc(e1)\n" ++
+  "        if e2\n" ++
+  "          int = IO.__fd_enc(e2)\n" ++
+  "          int_given = true\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "      named = Encoding::BINARY if named.nil? && !int_given && (acc.to_s.include?(\"b\") || @__f_binmode)\n" ++
+  "    end\n" ++
+  "    dext = instance_variable_defined?(:@__f_dext) ? @__f_dext : Encoding.default_external\n" ++
+  "    dint = instance_variable_defined?(:@__f_dint) ? @__f_dint : Encoding.default_internal\n" ++
+  "    e = named || dext\n" ++
+  "    i = int_given ? int : (e == Encoding::BINARY ? nil : dint)\n" ++
+  "    return [e, i] unless i.nil? || i == e\n" ++
+  "    [named || (i.nil? ? nil : e), nil]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ln_str(b)\n" ++
+  "    ext, int = __ln_encs\n" ++
+  "    b.force_encoding(ext)\n" ++
+  "    b = b.encode(int, ext, **(@__f_ecopts || \{})) if int\n" ++
+  "    b\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ln_count\n" ++
+  "    if __ln_file?\n" ++
+  "      @__f_lineno = (@__f_lineno || 0) + 1\n" ++
+  "      $. = @__f_lineno\n" ++
+  "    else\n" ++
+  "      @__io_lineno += 1\n" ++
+  "      $. = @__io_lineno\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # (sep, limit) from gets' positional arguments, as ruby's\n" ++
+  "  # prepare_getline_args reads them: one argument is a separator if it is (or\n" ++
+  "  # converts to) a String and a limit otherwise; two are both. A negative\n" ++
+  "  # limit is no limit.\n" ++
+  "  def self.__ln_args(args)\n" ++
+  "    case args.size\n" ++
+  "    when 0\n" ++
+  "      sep = $/\n" ++
+  "      limit = nil\n" ++
+  "    when 1\n" ++
+  "      a = args[0]\n" ++
+  "      if a.nil?\n" ++
+  "        sep = nil\n" ++
+  "        limit = nil\n" ++
+  "      elsif a.is_a?(String) || (!a.is_a?(Integer) && a.respond_to?(:to_str))\n" ++
+  "        sep = __fd_str(a)\n" ++
+  "        limit = nil\n" ++
+  "      else\n" ++
+  "        sep = $/\n" ++
+  "        limit = __fd_long(__fd_int(a))\n" ++
+  "      end\n" ++
+  "    when 2\n" ++
+  "      sep = args[0].nil? ? nil : __fd_str(args[0])\n" ++
+  "      limit = args[1].nil? ? nil : __fd_long(__fd_int(args[1]))\n" ++
+  "    else\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 0..2)\"\n" ++
+  "    end\n" ++
+  "    limit = nil if limit && limit < 0\n" ++
+  "    [sep, limit]\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ln_skip_nl\n" ++
+  "    loop do\n" ++
+  "      break if @__io_rbuf.empty? && !__ln_fill\n" ++
+  "      i = 0\n" ++
+  "      n = @__io_rbuf.bytesize\n" ++
+  "      i += 1 while i < n && @__io_rbuf.getbyte(i) == 10\n" ++
+  "      @__io_rbuf = @__io_rbuf.byteslice(i, n - i)\n" ++
+  "      break unless @__io_rbuf.empty?\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a limit never splits a character: the bytes after it are taken until the\n" ++
+  "  # last character is whole, at most 16 of them (ruby's own bound)\n" ++
+  "  def __ln_char_end(e, enc)\n" ++
+  "    return e unless enc == Encoding::UTF_8\n" ++
+  "    extra = 0\n" ++
+  "    while extra < 16\n" ++
+  "      j = e - 1\n" ++
+  "      k = 0\n" ++
+  "      while j > 0 && k < 3 && (@__io_rbuf.getbyte(j) & 0xC0) == 0x80\n" ++
+  "        j -= 1\n" ++
+  "        k += 1\n" ++
+  "      end\n" ++
+  "      break if @__io_rbuf.byteslice(j, e - j).force_encoding(enc).valid_encoding?\n" ++
+  "      break if e >= @__io_rbuf.bytesize && !__ln_fill\n" ++
+  "      break if e >= @__io_rbuf.bytesize\n" ++
+  "      e += 1\n" ++
+  "      extra += 1\n" ++
+  "    end\n" ++
+  "    e\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # one line, as bytes, or nil at the end\n" ++
+  "  def __ln_get(sep, limit, chomp)\n" ++
+  "    ext, = __ln_encs\n" ++
+  "    para = false\n" ++
+  "    if sep == \"\"\n" ++
+  "      para = true\n" ++
+  "      sep = \"\\n\\n\"\n" ++
+  "      __ln_skip_nl\n" ++
+  "    end\n" ++
+  "    unless sep.nil? || sep.encoding == ext || sep.ascii_only? || ext == Encoding::BINARY || sep.encoding == Encoding::BINARY\n" ++
+  "      sep = sep.encode(ext) rescue sep\n" ++
+  "    end\n" ++
+  "    sepb = sep.nil? ? nil : sep.b\n" ++
+  "    e = nil\n" ++
+  "    scan = 0\n" ++
+  "    loop do\n" ++
+  "      if sepb\n" ++
+  "        i = @__io_rbuf.byteindex(sepb, scan)\n" ++
+  "        if i\n" ++
+  "          e = i + sepb.bytesize\n" ++
+  "          break\n" ++
+  "        end\n" ++
+  "        scan = @__io_rbuf.bytesize - sepb.bytesize + 1\n" ++
+  "        scan = 0 if scan < 0\n" ++
+  "      end\n" ++
+  "      break if limit && @__io_rbuf.bytesize >= limit\n" ++
+  "      break unless __ln_fill\n" ++
+  "    end\n" ++
+  "    total = @__io_rbuf.bytesize\n" ++
+  "    return nil if total == 0\n" ++
+  "    hit = !e.nil?\n" ++
+  "    e ||= total\n" ++
+  "    # a line the LIMIT ended is not counted by #lineno -- one a separator or\n" ++
+  "    # the end of the input ended, shorter than the limit, is (ruby's rule,\n" ++
+  "    # measured: gets(nil, n) of an n-byte file counts nothing)\n" ++
+  "    @__ln_counts = hit ? (limit.nil? || e <= limit) : (limit.nil? || e < limit)\n" ++
+  "    if limit && e > limit\n" ++
+  "      e = __ln_char_end(limit, ext)\n" ++
+  "      hit = false\n" ++
+  "    end\n" ++
+  "    line = __fd_take(e)\n" ++
+  "    __ln_skip_nl if para && hit\n" ++
+  "    if chomp && sepb && line.end_with?(sepb)\n" ++
+  "      line = line.byteslice(0, line.bytesize - sepb.bytesize)\n" ++
+  "      line = line.byteslice(0, line.bytesize - 1) if sep == \"\\n\" && line.end_with?(\"\\r\")\n" ++
+  "    end\n" ++
+  "    line\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __ln_line(sep, limit, chomp)\n" ++
+  "    __ln_begin\n" ++
+  "    begin\n" ++
+  "      if limit == 0\n" ++
+  "        ext, = __ln_encs\n" ++
+  "        return (+\"\").force_encoding(ext)\n" ++
+  "      end\n" ++
+  "      b = __ln_get(sep, limit, chomp)\n" ++
+  "      return nil if b.nil?\n" ++
+  "      __ln_count if @__ln_counts\n" ++
+  "      __ln_str(b)\n" ++
+  "    ensure\n" ++
+  "      __ln_end\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_gets(*args, chomp: false)\n" ++
+  "    sep, limit = IO.__ln_args(args)\n" ++
+  "    $_ = __ln_line(sep, limit, chomp)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_readline(*args, chomp: false)\n" ++
+  "    sep, limit = IO.__ln_args(args)\n" ++
+  "    l = __ln_line(sep, limit, chomp)\n" ++
+  "    raise EOFError, \"end of file reached\" if l.nil?\n" ++
+  "    $_ = l\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_readlines(*args, chomp: false, **_opts)\n" ++
+  "    sep, limit = IO.__ln_args(args)\n" ++
+  "    raise ArgumentError, \"invalid limit: 0 for readlines\" if limit == 0\n" ++
+  "    out = []\n" ++
+  "    while (l = __ln_line(sep, limit, chomp))\n" ++
+  "      out << l\n" ++
+  "    end\n" ++
+  "    out\n" ++
+  "  end\n" ++
+  "  def __fd_to_a(*args, chomp: false) = __fd_readlines(*args, chomp: chomp)\n" ++
+  "\n" ++
+  "  def __fd_each_line(*args, chomp: false, &blk)\n" ++
+  "    unless blk\n" ++
+  "      return chomp ? enum_for(:each_line, *args, chomp: true) \{ nil } : enum_for(:each_line, *args) \{ nil }\n" ++
+  "    end\n" ++
+  "    sep, limit = IO.__ln_args(args)\n" ++
+  "    raise ArgumentError, \"invalid limit: 0 for each_line\" if limit == 0\n" ++
+  "    while (l = __ln_line(sep, limit, chomp))\n" ++
+  "      yield l\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_each(*args, chomp: false, &blk)\n" ++
+  "    unless blk\n" ++
+  "      return chomp ? enum_for(:each, *args, chomp: true) \{ nil } : enum_for(:each, *args) \{ nil }\n" ++
+  "    end\n" ++
+  "    __fd_each_line(*args, chomp: chomp, &blk)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a path and the options IO.foreach / IO.readlines open it with\n" ++
+  "  def self.__ln_open(name, opts)\n" ++
+  "    raise TypeError, \"no implicit conversion of nil into String\" if name.nil?\n" ++
+  "    name = __fd_path(name)\n" ++
+  "    mode = opts[:mode] || \"r\"\n" ++
+  "    mode = __fd_str(mode) unless mode.is_a?(Integer)\n" ++
+  "    perm = opts[:perm]\n" ++
+  "    f = perm.nil? ? File.open(name, mode) : File.open(name, mode, __fd_int(perm))\n" ++
+  "    encs = [opts[:external_encoding], opts[:internal_encoding]]\n" ++
+  "    if opts[:encoding] && encs.compact.empty?\n" ++
+  "      f.set_encoding(opts[:encoding])\n" ++
+  "    elsif !encs.compact.empty?\n" ++
+  "      f.set_encoding(*encs)\n" ++
+  "    end\n" ++
+  "    f.binmode if opts[:binmode] && f.external_encoding.nil?\n" ++
+  "    f.instance_variable_set(:@__f_binmode, true) if opts[:binmode]\n" ++
+  "    f\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.foreach(name, *args, chomp: false, **opts, &blk)\n" ++
+  "    unless blk\n" ++
+  "      return enum_for(:foreach, name, *args, chomp: chomp, **opts) \{ nil }\n" ++
+  "    end\n" ++
+  "    sep, limit = __ln_args(args)\n" ++
+  "    raise ArgumentError, \"invalid limit: 0 for foreach\" if limit == 0\n" ++
+  "    f = __ln_open(name, opts)\n" ++
+  "    begin\n" ++
+  "      while (l = f.__ln_line(sep, limit, chomp))\n" ++
+  "        $_ = l\n" ++
+  "        yield l\n" ++
+  "      end\n" ++
+  "      $_ = nil\n" ++
+  "    ensure\n" ++
+  "      f.close\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.readlines(name, *args, chomp: false, **opts)\n" ++
+  "    sep, limit = __ln_args(args)\n" ++
+  "    raise ArgumentError, \"invalid limit: 0 for readlines\" if limit == 0\n" ++
+  "    f = __ln_open(name, opts)\n" ++
+  "    begin\n" ++
+  "      out = []\n" ++
+  "      while (l = f.__ln_line(sep, limit, chomp))\n" ++
+  "        out << l\n" ++
+  "      end\n" ++
+  "      out\n" ++
+  "    ensure\n" ++
+  "      f.close\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  # === IO.popen ==============================================================\n" ++
+  "  # A child started by Process.spawn (the one way this interpreter starts a\n" ++
+  "  # process) with its standard input and/or output on a pipe, and the stream\n" ++
+  "  # over the other end of it: the pid is the child's own, #close waits for it\n" ++
+  "  # and sets $?. The pipes are blocking -- the child reads and writes them\n" ++
+  "  # knowing nothing of this process -- and every other descriptor this\n" ++
+  "  # process holds is closed for the child (see Process.spawn).\n" ++
+  "  POPEN_IO_KEYS = %i[mode flags external_encoding internal_encoding encoding textmode binmode autoclose path].freeze\n" ++
+  "\n" ++
+  "  def self.popen(*args, **opts, &blk)\n" ++
+  "    env = nil\n" ++
+  "    if !args.empty? && (args[0].is_a?(Hash) || (!args[0].is_a?(String) && !args[0].is_a?(Array) && args[0].respond_to?(:to_hash)))\n" ++
+  "      env = args.shift\n" ++
+  "      env = env.to_hash unless env.is_a?(Hash)\n" ++
+  "    end\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given 0, expected 1+)\" if args.empty?\n" ++
+  "    if args.size > 2\n" ++
+  "      raise ArgumentError, \"wrong number of arguments (given \" + (args.size + (env ? 1 : 0)).to_s + \", expected 1..3)\"\n" ++
+  "    end\n" ++
+  "    cmd, mode = args\n" ++
+  "    copts = \{}\n" ++
+  "    if cmd.is_a?(Array) || (!cmd.is_a?(String) && cmd.respond_to?(:to_ary))\n" ++
+  "      words = (cmd.is_a?(Array) ? cmd : cmd.to_ary).dup\n" ++
+  "      if !words.empty? && words[0].is_a?(Hash)\n" ++
+  "        e2 = words.shift\n" ++
+  "        env = env ? env.merge(e2) : e2\n" ++
+  "      end\n" ++
+  "      copts = words.pop if !words.empty? && words[-1].is_a?(Hash)\n" ++
+  "      raise ArgumentError, \"wrong number of arguments\" if words.empty?\n" ++
+  "    else\n" ++
+  "      s = __fd_str(cmd)\n" ++
+  "      if s == \"-\"\n" ++
+  "        raise NotImplementedError, \"fork() function is unimplemented on this machine\"\n" ++
+  "      end\n" ++
+  "      words = [s]\n" ++
+  "    end\n" ++
+  "    io_opts = \{}\n" ++
+  "    sp_opts = \{}\n" ++
+  "    opts.merge(copts).each do |k, v|\n" ++
+  "      (POPEN_IO_KEYS.include?(k) ? io_opts : sp_opts)[k] = v\n" ++
+  "    end\n" ++
+  "    flags, bin, _text, ext, int, int_given = __fd_modeenc(mode, io_opts)\n" ++
+  "    acc = flags & 3\n" ++
+  "    rd = acc != WRONLY\n" ++
+  "    wr = acc != RDONLY\n" ++
+  "    pr = rd ? IO.__fdpipe : nil\n" ++
+  "    pw = wr ? IO.__fdpipe : nil\n" ++
+  "    sp_opts[:out] = pr[1] if rd\n" ++
+  "    sp_opts[:in] = pw[0] if wr\n" ++
+  "    begin\n" ++
+  "      pid = env ? Process.spawn(env, *words, **sp_opts) : Process.spawn(*words, **sp_opts)\n" ++
+  "    rescue Exception\n" ++
+  "      (pr.to_a + pw.to_a).each \{ |fd| IO.__fdclose(fd) }\n" ++
+  "      raise\n" ++
+  "    end\n" ++
+  "    IO.__fdclose(pr[1]) if rd\n" ++
+  "    IO.__fdclose(pw[0]) if wr\n" ++
+  "    io = allocate\n" ++
+  "    io.send(:initialize, rd ? pr[0] : pw[1], rd ? \"r\" : \"w\")\n" ++
+  "    if rd && wr\n" ++
+  "      io.instance_variable_set(:@__io_wfd, pw[1])\n" ++
+  "      io.instance_variable_set(:@__io_w, true)\n" ++
+  "    end\n" ++
+  "    io.__fd_setencs(ext, int, int_given)\n" ++
+  "    io.instance_variable_set(:@__io_bin, true) if bin\n" ++
+  "    io.instance_variable_set(:@__io_pid, pid)\n" ++
+  "    io.instance_variable_set(:@__io_sync, true)\n" ++
+  "    return io unless blk\n" ++
+  "    begin\n" ++
+  "      yield io\n" ++
+  "    ensure\n" ++
+  "      io.close unless io.closed?\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # === fcntl, over what this process knows of its descriptors ================\n" ++
+  "  # The kernel's fcntl(2) is variadic and no extern can declare it. What a\n" ++
+  "  # program asks of it here is answered from the same bookkeeping IO.new and\n" ++
+  "  # Process.spawn use: the access mode and O_NONBLOCK a descriptor was given\n" ++
+  "  # (F_GETFL / F_SETFL), and its close-on-exec flag (F_GETFD / F_SETFD), which\n" ++
+  "  # is honoured where this interpreter starts a child.\n" ++
+  "  def __fd_fcntl(cmd, arg = 0)\n" ++
+  "    __fd_closed!\n" ++
+  "    IO.__fd_fcntl(@__io_fd, cmd, arg)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def self.__fd_fcntl(fd, cmd, arg)\n" ++
+  "    cmd = __fd_int(cmd)\n" ++
+  "    arg = arg == true ? 1 : arg == false || arg.nil? ? 0 : __fd_int(arg)\n" ++
+  "    case cmd\n" ++
+  "    when 1 then IO.__fdcloexec(fd) ? 1 : 0\n" ++
+  "    when 2 then IO.__fdcloexec(fd, (arg & 1) != 0); 0\n" ++
+  "    when 3\n" ++
+  "      a = IO.__fdacc(fd)\n" ++
+  "      (a < 0 ? 2 : a & 3) | (a >= 0 && (a & 16) != 0 ? File::APPEND : 0) | (IO.__fdnb(fd) ? File::NONBLOCK : 0)\n" ++
+  "    when 4\n" ++
+  "      IO.__fdnonblock(fd) if (arg & File::NONBLOCK) != 0\n" ++
+  "      0\n" ++
+  "    else\n" ++
+  "      raise NotImplementedError, \"fcntl(\" + cmd.to_s + \") is not answered here: only F_GETFD, F_SETFD, F_GETFL and F_SETFL are\"\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  # === the flags every stream has ============================================\n" ++
+  "  # A descriptor stream answers these through the layer (__fd_*, routed); a\n" ++
+  "  # File and the three standard streams reach them here, over #fileno.\n" ++
+  "  def __any_closed! = (raise IOError, \"closed stream\" if self.closed?)\n" ++
+  "\n" ++
+  "  def autoclose?\n" ++
+  "    __any_closed!\n" ++
+  "    !@__f_keep_fd\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def autoclose=(v)\n" ++
+  "    __any_closed!\n" ++
+  "    @__f_keep_fd = v ? nil : true\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # 0, 1 and 2 are inherited by every child, which is what ruby answers too\n" ++
+  "  def close_on_exec?\n" ++
+  "    __any_closed!\n" ++
+  "    fd = self.fileno\n" ++
+  "    fd > 2 && IO.__fdcloexec(fd)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def close_on_exec=(v)\n" ++
+  "    __any_closed!\n" ++
+  "    fd = self.fileno\n" ++
+  "    IO.__fdcloexec(fd, v ? true : false) if fd > 2\n" ++
+  "    v\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def fcntl(cmd, arg = 0)\n" ++
+  "    __any_closed!\n" ++
+  "    IO.__fd_fcntl(self.fileno, cmd, arg)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def pid\n" ++
+  "    __any_closed!\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a standard stream's stat is its descriptor's -- through a copy above 2,\n" ++
+  "  # since the stat(1) child's own 0, 1 and 2 are not this process's\n" ++
+  "  def stat\n" ++
+  "    __any_closed!\n" ++
+  "    fd = IO.__fddup(self.fileno)\n" ++
+  "    raise Errno::EBADF if fd < 0\n" ++
+  "    begin\n" ++
+  "      File::Stat.new(\"/dev/fd/\" + fd.to_s)\n" ++
+  "    ensure\n" ++
+  "      IO.__fdclose(fd)\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def advise(advice, offset = 0, len = 0)\n" ++
+  "    __any_closed!\n" ++
+  "    raise TypeError, \"no implicit conversion of \" + IO.__fd_cname(advice) + \" into Symbol\" unless advice.is_a?(Symbol)\n" ++
+  "    IO.__fd_long(IO.__fd_int(offset))\n" ++
+  "    IO.__fd_long(IO.__fd_int(len))\n" ++
+  "    unless %i[normal sequential random willneed dontneed noreuse].include?(advice)\n" ++
+  "      raise NotImplementedError, \"Unsupported advice: \" + advice.inspect\n" ++
+  "    end\n" ++
+  "    nil\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the offset after the move; a File has no read-ahead to refuse over\n" ++
+  "  def sysseek(off, whence = 0)\n" ++
+  "    __any_closed!\n" ++
+  "    raise IOError, \"sysseek for buffered IO\" if @__f_ahead || (@__f_unget && !@__f_unget.empty?)\n" ++
+  "    off = IO.__fd_long(IO.__fd_int(off))\n" ++
+  "    whence = \{ SET: 0, CUR: 1, END: 2 }[whence] || whence if whence.is_a?(Symbol)\n" ++
+  "    self.seek(off, whence)\n" ++
+  "    self.pos\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  # IO.read(name, length = nil, offset = nil, **opts): the file opened with the\n" ++
+  "  # options (or with :open_args, which replace them), read from the offset\n" ++
+  "  def self.read(name, length = nil, offset = nil, **opts)\n" ++
+  "    raise TypeError, \"no implicit conversion of nil into String\" if name.nil?\n" ++
+  "    length = length.nil? ? nil : __fd_long(__fd_int(length))\n" ++
+  "    raise ArgumentError, \"negative length \" + length.to_s + \" given\" if length && length < 0\n" ++
+  "    offset = offset.nil? ? nil : __fd_long(__fd_int(offset))\n" ++
+  "    raise ArgumentError, \"negative offset \" + offset.to_s + \" given\" if offset && offset < 0\n" ++
+  "    if opts.key?(:open_args)\n" ++
+  "      oa = Array(opts[:open_args]).dup\n" ++
+  "      o2 = oa.last.is_a?(Hash) ? oa.pop : \{}\n" ++
+  "      o2 = o2.merge(mode: oa[0]) unless oa.empty? || oa[0].nil?\n" ++
+  "      f = __ln_open(name, o2)\n" ++
+  "    else\n" ++
+  "      f = __ln_open(name, opts)\n" ++
+  "    end\n" ++
+  "    begin\n" ++
+  "      f.seek(offset) if offset\n" ++
+  "      f.read(length)\n" ++
+  "    ensure\n" ++
+  "      f.close\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class File\n" ++
+  "  # File.new / File.open with keyword options (the builtin hands them here):\n" ++
+  "  # the mode and the options as IO.new reads them, then the File opened with\n" ++
+  "  # the plain mode and given the encodings and flags the options named\n" ++
+  "  def self.__open_kw(path, mode = nil, perm = nil, **opts, &blk)\n" ++
+  "    flags, bin, text, ext, int, int_given = IO.__fd_modeenc(mode, opts)\n" ++
+  "    f = File.new(path, flags, *[perm].compact)\n" ++
+  "    f.__f_setencs(ext, int, int_given, bin, text)\n" ++
+  "    # newline: (or the older crlf_newline: / cr_newline:) -- what \"\\n\" is\n" ++
+  "    # written as\n" ++
+  "    nl = opts[:newline]\n" ++
+  "    nl = :crlf if opts[:crlf_newline]\n" ++
+  "    nl = :cr if opts[:cr_newline]\n" ++
+  "    f.instance_variable_set(:@__f_nl, nl) if nl == :crlf || nl == :cr\n" ++
+  "    m = opts.key?(:mode) && !opts[:mode].nil? ? opts[:mode] : mode\n" ++
+  "    if m.is_a?(String) && m.split(\":\", 2)[1].to_s.upcase.start_with?(\"BOM|\")\n" ++
+  "      f.instance_variable_set(:@__f_bom_mode, true)\n" ++
+  "    end\n" ++
+  "    return f unless blk\n" ++
+  "    begin\n" ++
+  "      yield f\n" ++
+  "    ensure\n" ++
+  "      f.close unless f.closed?\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # \"BOM|enc\" in the mode: a BOM at the start of the file names the external\n" ++
+  "  # encoding instead, and is read past -- once, before the first read\n" ++
+  "  def __f_bom_skip\n" ++
+  "    return unless @__f_bom.nil?\n" ++
+  "    @__f_bom = false\n" ++
+  "    _, encs = @__f_mode.to_s.split(\":\", 2)\n" ++
+  "    return unless @__f_bom_mode || (encs && encs.upcase.start_with?(\"BOM|\"))\n" ++
+  "    return unless self.pos == 0\n" ++
+  "    head = (self.__f_read(4) || \"\").b\n" ++
+  "    enc, n = if head.start_with?(\"\\xEF\\xBB\\xBF\".b) then [Encoding::UTF_8, 3]\n" ++
+  "             elsif head.start_with?(\"\\xFE\\xFF\".b) then [Encoding::UTF_16BE, 2]\n" ++
+  "             elsif head.start_with?(\"\\xFF\\xFE\\x00\\x00\".b) then [Encoding::UTF_32LE, 4]\n" ++
+  "             elsif head.start_with?(\"\\xFF\\xFE\".b) then [Encoding::UTF_16LE, 2]\n" ++
+  "             elsif head.start_with?(\"\\x00\\x00\\xFE\\xFF\".b) then [Encoding::UTF_32BE, 4]\n" ++
+  "             else [nil, 0]\n" ++
+  "             end\n" ++
+  "    back = head.bytesize - n\n" ++
+  "    self.pos = self.pos - back if back > 0\n" ++
+  "    return if enc.nil?\n" ++
+  "    _, int = __ln_encs\n" ++
+  "    __f_setencs(enc, int, !int.nil?, false, false)\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __f_setencs(ext, int, int_given, bin, text)\n" ++
+  "    @__f_dint = Encoding.default_internal\n" ++
+  "    @__f_binmode = true if bin\n" ++
+  "    @__f_ext = ext\n" ++
+  "    @__f_int = int\n" ++
+  "    @__f_int_given = int_given\n" ++
+  "    @__f_encs_set = true\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the external encoding a write converts into: only one the stream named\n" ++
+  "  def __f_wext = __f_encstate[0]\n" ++
+  "\n" ++
+  "  def write(*objs)\n" ++
+  "    __closed!\n" ++
+  "    @__f_ahead = nil\n" ++
+  "    n = 0\n" ++
+  "    ext = __f_wext\n" ++
+  "    objs.each do |o|\n" ++
+  "      s = IO.__wstr(o, ext)\n" ++
+  "      next if s.empty?\n" ++
+  "      s = s.gsub(\"\\n\", @__f_nl == :crlf ? \"\\r\\n\" : \"\\r\") if @__f_nl\n" ++
+  "      n += self.__f_write(s)\n" ++
+  "    end\n" ++
+  "    n\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def <<(o)\n" ++
+  "    self.write(o)\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def print(*objs) = __io_print(objs)\n" ++
+  "  def puts(*objs) = __io_puts(objs)\n" ++
+  "  def printf(fmt = nil, *args) = __io_printf(fmt, args)\n" ++
+  "  def putc(c)\n" ++
+  "    __closed!\n" ++
+  "    __io_putc(c)\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  # IO.write / IO.binwrite(name, string, offset = nil, **opts): created when\n" ++
+  "  # missing, truncated unless an offset says where to write; :open_args\n" ++
+  "  # replace every other option, and name no mode unless they say one\n" ++
+  "  def self.write(name, string, offset = nil, **opts) = __write_file(name, string, offset, opts, false)\n" ++
+  "  def self.binwrite(name, string, offset = nil, **opts) = __write_file(name, string, offset, opts, true)\n" ++
+  "\n" ++
+  "  def self.__write_file(name, string, offset, opts, bin)\n" ++
+  "    raise TypeError, \"no implicit conversion of nil into String\" if name.nil?\n" ++
+  "    offset = offset.nil? ? nil : __fd_long(__fd_int(offset))\n" ++
+  "    raise ArgumentError, \"negative offset \" + offset.to_s + \" given\" if offset && offset < 0\n" ++
+  "    if opts.key?(:open_args)\n" ++
+  "      oa = Array(opts[:open_args]).dup\n" ++
+  "      o2 = oa.last.is_a?(Hash) ? oa.pop.dup : \{}\n" ++
+  "      o2[:mode] = oa[0] unless oa[0].nil?\n" ++
+  "      o2[:perm] = oa[1] unless oa[1].nil?\n" ++
+  "    else\n" ++
+  "      o2 = opts.dup\n" ++
+  "      if o2[:mode].nil?\n" ++
+  "        path = __fd_path(name)\n" ++
+  "        o2[:mode] = offset.nil? || !File.exist?(path) ? \"w\" : \"r+\"\n" ++
+  "      end\n" ++
+  "      o2[:binmode] = true if bin && !o2.key?(:binmode) && !o2[:mode].to_s.include?(\"b\")\n" ++
+  "    end\n" ++
+  "    m = o2[:mode]\n" ++
+  "    if m.is_a?(String) || (!m.nil? && !m.is_a?(Integer) && m.respond_to?(:to_str))\n" ++
+  "      m1, encs = __fd_str(m).split(\":\", 2)\n" ++
+  "      if encs && (o2.key?(:encoding) || o2.key?(:external_encoding) || o2.key?(:internal_encoding))\n" ++
+  "        raise ArgumentError, \"encoding specified twice\"\n" ++
+  "      end\n" ++
+  "    end\n" ++
+  "    f = __ln_open(name, o2)\n" ++
+  "    begin\n" ++
+  "      f.seek(offset) if offset\n" ++
+  "      f.write(string)\n" ++
+  "    ensure\n" ++
+  "      f.close\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  # === reopen and dup ========================================================\n" ++
+  "  # #reopen puts another stream's descriptor (or a newly opened path) UNDER\n" ++
+  "  # this one's number with dup2(2): the object and its #fileno stay, what the\n" ++
+  "  # number refers to changes -- which is why output written to fd 1 by the\n" ++
+  "  # interpreter itself goes wherever STDOUT was reopened to.\n" ++
+  "  def __reopen_src(other, mode)\n" ++
+  "    if !other.is_a?(IO) && !other.is_a?(String) && other.respond_to?(:to_io)\n" ++
+  "      io = other.to_io\n" ++
+  "      raise TypeError, \"can't convert \" + other.class.to_s + \" to IO (\" + other.class.to_s + \"#to_io gives \" + io.class.to_s + \")\" unless io.is_a?(IO)\n" ++
+  "      other = io\n" ++
+  "    end\n" ++
+  "    if other.is_a?(IO)\n" ++
+  "      raise IOError, \"closed stream\" if other.closed?\n" ++
+  "      other.flush if !other.equal?(STDIN) && (other.instance_variable_get(:@__io_w) || other.instance_variable_get(:@__f_path))\n" ++
+  "      [other.fileno, false]\n" ++
+  "    else\n" ++
+  "      path = IO.__fd_path(other)\n" ++
+  "      m = mode.nil? ? (@__io_w && !@__io_r ? \"w\" : (self.fileno == 0 ? \"r\" : \"w\")) : mode\n" ++
+  "      flags = m.is_a?(Integer) ? m : IO.__fd_strflags(IO.__fd_str(m).split(\":\", 2)[0].to_s, m)\n" ++
+  "      [IO.__fd_open(path, flags, 0666), true]\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def reopen(other = nil, mode = nil, **opts)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given 0, expected 1..2)\" if other.nil? && mode.nil?\n" ++
+  "    __any_closed!\n" ++
+  "    fd = self.fileno\n" ++
+  "    src, fresh = __reopen_src(other, mode)\n" ++
+  "    r = IO.__fddup2(src, fd)\n" ++
+  "    IO.__fdclose(src) if fresh\n" ++
+  "    raise Errno::EBADF if r < 0\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def __fd_reopen(other = nil, mode = nil, **opts)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given 0, expected 1..2)\" if other.nil? && mode.nil?\n" ++
+  "    __fd_closed!\n" ++
+  "    __fd_flush_w if @__io_w\n" ++
+  "    src, fresh = __reopen_src(other, mode)\n" ++
+  "    r = IO.__fddup2(src, @__io_fd)\n" ++
+  "    IO.__fdclose(src) if fresh\n" ++
+  "    raise Errno::EBADF if r < 0\n" ++
+  "    @__io_rbuf = +\"\".b\n" ++
+  "    @__io_wbuf = +\"\".b\n" ++
+  "    if other.is_a?(IO)\n" ++
+  "      @__io_r = other.instance_variable_get(:@__io_r) != false\n" ++
+  "      @__io_w = other.instance_variable_get(:@__io_w) != false\n" ++
+  "    end\n" ++
+  "    self\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # a standard stream's copy is a descriptor stream over dup(2) of it\n" ++
+  "  def dup\n" ++
+  "    __any_closed!\n" ++
+  "    fd = IO.__fddup(self.fileno)\n" ++
+  "    raise Errno::EMFILE if fd < 0\n" ++
+  "    IO.for_fd(fd, self.fileno == 0 ? \"r\" : \"w\")\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class File\n" ++
+  "  # a File's copy is the same file opened again, where this one is: its own\n" ++
+  "  # descriptor (when asked for one), its own position, the same flags\n" ++
+  "  def dup\n" ++
+  "    __closed!\n" ++
+  "    self.flush\n" ++
+  "    m = @__f_mode.to_s\n" ++
+  "    acc = m.split(\":\", 2)[0].to_s\n" ++
+  "    f = File.new(@__f_path, acc.start_with?(\"r\") ? acc : \"r+\")\n" ++
+  "    f.instance_variable_set(:@__f_mode, m)\n" ++
+  "    f.seek(self.pos)\n" ++
+  "    %i[@__f_binmode @__f_ext @__f_int @__f_int_given @__f_encs_set @__f_sync @__f_lineno @__f_nl].each do |iv|\n" ++
+  "      f.instance_variable_set(iv, instance_variable_get(iv)) if instance_variable_defined?(iv)\n" ++
+  "    end\n" ++
+  "    f\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class File\n" ++
+  "  # a File is a path: it reopens onto a path, or onto another File's path at\n" ++
+  "  # that File's position -- not onto a descriptor stream, which has none\n" ++
+  "  def reopen(other = nil, mode = nil, **opts)\n" ++
+  "    raise ArgumentError, \"wrong number of arguments (given 0, expected 1..2)\" if other.nil? && mode.nil?\n" ++
+  "    if !other.is_a?(IO) && !other.is_a?(String) && other.respond_to?(:to_io)\n" ++
+  "      io = other.to_io\n" ++
+  "      raise TypeError, \"can't convert \" + other.class.to_s + \" to IO (\" + other.class.to_s + \"#to_io gives \" + io.class.to_s + \")\" unless io.is_a?(IO)\n" ++
+  "      other = io\n" ++
+  "    end\n" ++
+  "    if other.is_a?(File)\n" ++
+  "      __closed!\n" ++
+  "      raise IOError, \"closed stream\" if other.closed?\n" ++
+  "      other.flush\n" ++
+  "      m = other.instance_variable_get(:@__f_mode).to_s.split(\":\", 2)[0].to_s\n" ++
+  "      self.__f_reopen(other.path, m.start_with?(\"w\") ? \"r+\" : m)\n" ++
+  "      instance_variable_set(:@__f_mode, m)\n" ++
+  "      self.pos = other.pos\n" ++
+  "      return self\n" ++
+  "    end\n" ++
+  "    if other.is_a?(IO)\n" ++
+  "      __closed!\n" ++
+  "      raise IOError, \"closed stream\" if other.closed?\n" ++
+  "      # a descriptor stream opened by a path (IO.sysopen) is that path, where\n" ++
+  "      # it is now; one that never had a path has nothing a File can be\n" ++
+  "      opath = other.instance_variable_get(:@__io_path) || IO.__fdpath(other.fileno)\n" ++
+  "      raise NotImplementedError, \"a File here is a path, and \" + other.inspect + \" has none to reopen onto\" if opath.nil?\n" ++
+  "      at = other.pos\n" ++
+  "      acc = IO.__fdacc(other.fileno)\n" ++
+  "      m = acc < 0 ? \"r\" : [\"r\", \"w\", \"r+\"][acc & 3]\n" ++
+  "      m = \"a\" if acc >= 0 && (acc & 16) != 0\n" ++
+  "      self.__f_reopen(opath.to_s, m.start_with?(\"w\") ? \"r+\" : m)\n" ++
+  "      instance_variable_set(:@__f_mode, m)\n" ++
+  "      self.pos = at\n" ++
+  "      return self\n" ++
+  "    end\n" ++
+  "    # a path is reopened with the mode given, or with this stream's own (a\n" ++
+  "    # closed stream can be reopened this way)\n" ++
+  "    cur = @__f_mode.to_s.split(\":\", 2)[0].to_s\n" ++
+  "    cur = @__f_lastmode.to_s if cur.empty?\n" ++
+  "    m = mode.nil? ? (cur.empty? ? \"r\" : cur) : mode\n" ++
+  "    ms = m.is_a?(Integer) ? m : IO.__fd_str(m)\n" ++
+  "    # a writing mode opens as it would: \"w\" truncates, \"a\" creates\n" ++
+  "    path = IO.__fd_path(other)\n" ++
+  "    if ms.is_a?(String) && (ms.start_with?(\"w\") || (ms.start_with?(\"a\") && !File.exist?(path)))\n" ++
+  "      File.open(path, \"w\") \{ }\n" ++
+  "    end\n" ++
+  "    self.__f_reopen(path, ms)\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class IO\n" ++
+  "  # the object as an IO: itself, or what its #to_io answers (which must be\n" ++
+  "  # one); nil for anything that has no #to_io -- a BasicObject, which has no\n" ++
+  "  # #respond_to? to ask, included\n" ++
+  "  def self.try_convert(obj)\n" ++
+  "    return obj if obj.is_a?(IO)\n" ++
+  "    ok = begin\n" ++
+  "      obj.respond_to?(:to_io)\n" ++
+  "    rescue NoMethodError\n" ++
+  "      false\n" ++
+  "    end\n" ++
+  "    return nil unless ok\n" ++
+  "    io = obj.to_io\n" ++
+  "    return io if io.nil? || io.is_a?(IO)\n" ++
+  "    raise TypeError, \"can't convert \" + obj.class.to_s + \" into IO (\" + obj.class.to_s + \"#to_io gives \" + io.class.to_s + \")\"\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "class File\n" ++
+  "  # seek(offset, whence = IO::SEEK_SET): the offset through #to_int and as a\n" ++
+  "  # C off_t, the whence a number or :SET / :CUR / :END; a position before the\n" ++
+  "  # start is EINVAL and moves nothing\n" ++
+  "  def seek(off, whence = 0)\n" ++
+  "    @__f_ahead = nil\n" ++
+  "    off = IO.__fd_long(IO.__fd_int(off))\n" ++
+  "    whence = \{ SET: 0, CUR: 1, END: 2 }[whence] || whence if whence.is_a?(Symbol)\n" ++
+  "    whence = IO.__fd_int(whence)\n" ++
+  "    raise Errno::EINVAL, \"Invalid argument @ rb_io_seek - \" + path.to_s unless whence >= 0 && whence <= 2\n" ++
+  "    raise Errno::EINVAL, \"Invalid argument @ rb_io_seek - \" + path.to_s if self.__f_seek(off, whence) < 0\n" ++
+  "    0\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  def pos=(off)\n" ++
+  "    seek(off, 0)\n" ++
+  "    off\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the unbuffered write: no conversion, straight to the file -- after a\n" ++
+  "  # warning when buffered writes are still waiting ahead of it\n" ++
+  "  def syswrite(s)\n" ++
+  "    __closed!\n" ++
+  "    s = IO.__wstr(s, nil)\n" ++
+  "    warn(\"warning: syswrite for buffered IO\") unless @__f_buf.to_s.empty?\n" ++
+  "    @__f_ahead = nil\n" ++
+  "    n = self.__f_write(s)\n" ++
+  "    self.flush\n" ++
+  "    n\n" ++
+  "  end\n" ++
   "end\n";
 
 let core_prelude = core_prelude_a ++ core_prelude_b ++ core_prelude_c ++ core_prelude_d ++ core_prelude_e ++ core_prelude_f ++ core_prelude_g ++ core_prelude_h ++ core_prelude_i ++ core_prelude_j;
@@ -6073,9 +8308,16 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
            let ppf9 = (if map_has load_ctx "pfile" then map_get load_ctx "pfile" else VNil) in
            let _ = map_set load_ctx "pfile" (mkstr "<internal:prelude>") in
            let (pprog, _) = parse_stmts (number_nls core_prelude (lex_go core_prelude 0)) Nil in
+           // ⚠ THE IO LAYER IS A SECOND PASS, not more of the same string: the
+           //   lexer, the parser and the evaluator recurse over their lists, so
+           //   native stack use grows with the prelude's length, and with the
+           //   layer appended an -O0 build (the --fast one, larger frames)
+           //   died of stack overflow before the first line of a program ran.
+           let (kprog, _) = parse_stmts (number_nls core_prelude_k (lex_go core_prelude_k 0)) Nil in
            let _ = (match ppf9 with VNil -> map_delete load_ctx "pfile" | _ -> map_set load_ctx "pfile" ppf9) in
            let _ = map_set fsl_ctx "v" fsl9 in
-           hoist_run env world noblk pprog) in
+           let _ = hoist_run env world noblk pprog in
+           hoist_run env world noblk kprog) in
   // DATA: the main script's text after `__END__`, as a File open on the
   // script and positioned there (see src_prepare). Made with the prelude's
   // own machinery, before the program runs.
@@ -6266,6 +8508,10 @@ let rec take_flags = fn (argl: str list) ->
                 then map_set warn_cats (substring c9 3 (str_len c9)) (VBool false)
                 else map_set warn_cats c9 (VBool true)) in take_flags rest)
     else if str_eq a "--disable-gems" || str_eq a "--disable=gems" then let _ = map_set cli_opt "nogems" "1" in take_flags rest
+    // -i[ext]: ARGF edits its files in place, keeping each as file+ext when an
+    // extension is given ($-i is what ARGF reads)
+    else if str_len a >= 2 && str_eq (substring a 0 2) "-i" then
+      let _ = map_set globals (gvar_slot "-i") (mkstr (substring a 2 (str_len a))) in take_flags rest
     else if str_eq a "--enable=frozen-string-literal" then let _ = map_set cli_fsl "on" "1" in take_flags rest
     // --backtrace-limit=N: what Thread::Backtrace.limit reports
     else if str_len a > 18 && str_eq (substring a 0 18) "--backtrace-limit=" then

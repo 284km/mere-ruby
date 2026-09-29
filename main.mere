@@ -4126,20 +4126,28 @@ and stdin_read_name = fn (name: str) ->
   || (str_len name == 8 && (str_eq name "readline" || str_eq name "readchar" || str_eq name "readbyte"))
   || (str_len name == 9 && (str_eq name "readlines" || str_eq name "each_line"))
   || (str_len name == 4 && str_eq name "each") || (str_len name == 11 && str_eq name "readpartial")
-and stdin_all = fn (u: unit) ->
-  let _ = (if map_has stdin_src "done" then ()
-           else
-             let _ = map_set stdin_src "s" (read_stdin ()) in
-             let _ = map_set stdin_src "done" "1" in
-             map_set stdin_src_pos "p" 0) in
-  map_get stdin_src "s"
+  || (str_len name == 6 && str_eq name "ungetc") || (str_len name == 9 && str_eq name "ungetbyte")
 and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
-  let s = stdin_all () in
-  let pos = (if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0) in
+  // as much of the input as this call needs, and no more: a whole read wants
+  // all of it, a length that many bytes, readpartial whatever one read gives,
+  // a character or a byte the next one (see stdin_more)
+  let _ = (if str_eq name "read" then
+             (match args with
+              | Cons (VInt k, _) -> stdin_want k
+              | _ -> stdin_all_go ())
+           else if str_eq name "readpartial" then
+             (if str_len (stdin_buf ()) > stdin_cur () then () else (let _ = stdin_more () in ()))
+           else if str_eq name "getc" || str_eq name "readchar" then stdin_want 4
+           else if str_eq name "getbyte" || str_eq name "readbyte" || str_eq name "eof?" || str_eq name "eof" then stdin_want 1
+           else if str_eq name "ungetc" || str_eq name "ungetbyte" || str_eq name "gets" || str_eq name "readline" then ()
+           else stdin_all_go ()) in
+  let s = stdin_buf () in
+  let pos = stdin_cur () in
   let n = str_len s in
   let eofe = fn (u: unit) -> raise_exc world "EOFError" "end of file reached" in
   if str_eq name "read" || str_eq name "readpartial" then
     (match args with
+     | Cons (VInt 0, _) -> mkstr_e "" "ASCII-8BIT"
      | Cons (VInt k, rest9) ->
        (if pos >= n then (if str_eq name "readpartial" then eofe () else VNil)
         else
@@ -4164,6 +4172,19 @@ and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
     (if pos >= n then (if str_eq name "readbyte" then eofe () else VNil)
      else (let _ = map_set stdin_src_pos "p" (pos + 1) in VInt (ord (char_at s pos))))
   else if str_eq name "eof?" || str_eq name "eof" then VBool (pos >= n)
+  // pushback goes in front of what is left: the buffer IS the rest of the
+  // input, so the bytes are simply put there (a character of the external
+  // encoding for an Integer to #ungetc, one byte for #ungetbyte)
+  else if str_eq name "ungetc" || str_eq name "ungetbyte" then
+    (let back9 = (match args with
+                  | Cons (VStr h9, _) -> sget h9
+                  | Cons (VInt c9, _) ->
+                    (if str_eq name "ungetbyte" || c9 < 128 then chr (c9 - (c9 / 256) * 256) else utf8_enc c9)
+                  | Cons (VNil, _) -> ""
+                  | _ -> "") in
+     let _ = map_set stdin_src "s" (back9 ++ (if pos >= n then "" else substring s pos n)) in
+     let _ = map_set stdin_src_pos "p" 0 in
+     VNil)
   else
     // readlines / each_line / each
     (let lines9 = rb_readlines () in
@@ -11781,47 +11802,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // NoMethodError -- `File.const_defined?` is what devise and sidekiq-pro ask
     // when they check for a constant before using it. (Math and Kernel decline
     // the same set for the same reason, a few branches down.)
-    // IO.pipe: a real pipe pair needs the OS, and nothing here can hand one out --
-    // the socket FFI does not cover pipes and `run` shells out rather than
-    // plumbing descriptors. It refuses by name so a caller sees which primitive
-    // is missing instead of a NoMethodError on IO, which says nothing about why.
-    // Reached from Open3 (bundler requires it lazily inside the methods that
-    // capture a subprocess).
-    // IO.new(fd) / IO.for_fd(fd): an IO over a descriptor the caller already
-    // has. ⚠ This did not exist, so `IO.new(f.fileno)` built an object with no
-    //   descriptor in it at all -- it printed as "#<IO:fd >" -- and five
-    //   core/io files construct their subject exactly that way. Now that a
-    //   File hands out a real fileno (see file_fd_of) there is something to
-    //   attach to.
-    //   `path:` is carried because ruby carries it: an IO made from a bare
-    //   descriptor has no name to answer #path with, and the keyword is how a
-    //   caller supplies one. Anything else in the options hash is accepted and
-    //   not acted on -- see KNOWN_GAPS, reads and writes have not moved onto
-    //   the descriptor yet.
-    else if str_eq c "IO" && ((str_len name == 3 && str_eq name "new") || (str_len name == 6 && str_eq name "for_fd")) then
-      (match args with
-       | Cons (VInt fd9, rest9) ->
-         (if fd9 < 0 then raise_exc world "ArgumentError" ("negative file descriptor: " ++ str_of_int fd9)
-          else
-            (let (m9, s9, ocls9, iv9) = world in
-             let oid9 = alloc_oid ocls9 in
-             let _ = map_set ocls9 oid9 "IO" in
-             let _ = map_set iv9 (str_of_int oid9 ++ "@__io_fd") (VInt fd9) in
-             let _ = (match io_new_path env world rest9 with
-                      | VStr h9 -> map_set iv9 (str_of_int oid9 ++ "@__io_path") (VStr h9)
-                      | _ -> ()) in
-             VObj oid9))
-       | Cons (other9, _) -> raise_exc world "TypeError"
-                               ("no implicit conversion of " ++ class_name other9 ++ " into Integer")
-       | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
-    // ⚠ IO.pipe was refused for want of a primitive. There is one now
-    //   (fd_pipe, compiler v0.1.523): pipe(2) fills the caller's int[2], which
-    //   no plain extern can name, so the family packs the two descriptors into
-    //   one integer -- read end high, write end low. The two IOs read and
-    //   write THROUGH those descriptors, which is what makes the pair actually
-    //   carry bytes rather than be two objects that look like a pipe.
-    // (__pipe is the same primitive under a name the prelude's block form of
-    // IO.pipe can call without reaching itself again)
+    // The DESCRIPTOR PRIMITIVES, and nothing else: the IO that is built on a
+    // descriptor -- IO.new / for_fd / open / sysopen / pipe / popen, and
+    // every read, write, seek and close on one -- is ruby, in the prelude's
+    // IO layer (core_prelude_k), written over these. Each is one system call
+    // and answers what the call answered: a count or a descriptor, -1 for a
+    // refusal (the family does not read errno; the layer names the errno from
+    // what it knows), and for a read the bytes, BINARY, or nil at end of file.
+    // ⚠ These used to be IO.new / for_fd / pipe themselves, answered HERE and
+    //   before any ruby method, so the options hash was "accepted and not acted
+    //   on", a mode was never checked against the descriptor, and a subclass's
+    //   own #initialize was the only way in that ran ruby at all. Construction
+    //   is the layer's now, so IO.new is Class#new -- allocate, then the
+    //   layer's #initialize -- for IO and every subclass alike.
+    else if str_eq c "IO" && str_len name > 4 && str_eq (substring name 0 4) "__fd"
+            && (if str_eq (char_at name 4) "_" then false else true) then
+      io_fd_prim world name args
     // the one readiness primitive the prelude's IO.select / IO#wait are
     // written over: descriptors, interests (1 read, 2 write) and a wait in
     // milliseconds (-1 for none) in, the ready bits per descriptor out.
@@ -11900,30 +11896,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                      | VObj b9 -> (if a9 == b9 then VNil else raise_exc world "__ThreadPark" "sleep")
                      | _ -> VNil)
        | _ -> VNil)
-    else if str_eq c "IO" && ((str_len name == 4 && str_eq name "pipe") || (str_len name == 6 && str_eq name "__pipe")) then
-      (let pk9 = fd_pipe () in
-       if pk9 < 0 then raise_exc world "Errno::EMFILE" "Too many open files - pipe"
-       else
-         (let (m9, s9, ocls9, iv9) = world in
-          let pr9 = pk9 / 4294967296 in
-          let pw9 = pk9 - pr9 * 4294967296 in
-          // ⚠ BOTH ENDS ARE NON-BLOCKING, and the reason is the thread model,
-          //   not speed. A thread body here runs to completion at Thread.new,
-          //   so a read that would block has no other thread left to write to
-          //   it and the wait can never end -- ruby/spec's core/io/copy_stream
-          //   is that exact shape and it cost a 600-SECOND WALL BOUND on every
-          //   sweep. The peer descriptor is recorded so a would-block can be
-          //   told from an end of file: peer still open means nothing can ever
-          //   arrive, which is a deadlock this model can name in microseconds
-          //   instead of hanging.
-          let mk9 = fn (fd9: int) -> fn (peer9: int) ->
-            (let oid9 = alloc_oid ocls9 in
-             let _ = map_set ocls9 oid9 "IO" in
-             let _ = io_set_nonblocking fd9 in
-             let _ = map_set iv9 (str_of_int oid9 ++ "@__io_fd") (VInt fd9) in
-             let _ = map_set iv9 (str_of_int oid9 ++ "@__io_peer") (VInt peer9) in
-             VObj oid9) in
-          arr_new (Cons (mk9 pr9 pw9, Cons (mk9 pw9 pr9, Nil)))))
     // IO.read / IO.write and friends are the same methods as File's in ruby (File
     // < IO, and these are IO's own class methods), so the branch answers for both
     // rather than a second copy drifting from this one.
@@ -11956,7 +11928,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                       ("path name must be ASCII-compatible (" ++ e9 ++ "): " ++ inspect (VStr eh9)) in ()))
                    | _ -> ())
                 else ()) in
-       if (str_len name == 4 && str_eq name "read") || (str_len name == 7 && str_eq name "binread") then
+       // File.read with keyword options (mode:, encoding:, open_args: ...) is
+       // IO.read, which is the prelude's (core_prelude_k): this arm reads the
+       // path and the numbers
+       if (str_len name == 4 && str_eq name "read") && file_kw_args args && has_meth world "(sng:IO)" "read" then
+         invoke_val_c env world blk (VClass "IO") "read" args false
+       else if (str_len name == 4 && str_eq name "read") || (str_len name == 7 && str_eq name "binread") then
          // mere str is byte-safe (length header), so binary content with NULs
          // round-trips. binread tags the result ASCII-8BIT so slicing and
          // indexing are byte-based.
@@ -12308,64 +12285,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let n = fsize_of (sget ph) in
              if n > 0 then VInt n else VNil)
           | _ -> VNil)
-       // File.readlines(path, sep = $/, chomp: false): the separator and chomp
-       // were ignored, so `File.readlines(f, ".")` answered lines
-       else if (str_len name == 9 && str_eq name "readlines") then
-         (let chomp9 = (match vlast args with
-                        | VHsh h9 -> (match hash_lookup (hderef h9) (VSym "chomp") with (true, cv9) -> truthy cv9 | _ -> false)
-                        | _ -> false) in
-          let sep9 = (match args with Cons (_, Cons (VStr sh9, _)) -> sget sh9 | Cons (_, Cons (VNil, _)) -> "" | _ -> "\n") in
-          let whole9 = (match args with Cons (_, Cons (VNil, _)) -> true | _ -> false) in
-          match args with
-          | Cons (VStr ph, _) ->
-            (let c = (if file_exists (sget ph) then read_file (sget ph) else "") in
-             let rec pieces9 = fn (i: int) ->
-               (if i >= str_len c then Nil
-                else
-                  (let rest9 = substring c i (str_len c) in
-                   let ix9 = (if whole9 then 0 - 1 else str_index_of rest9 sep9) in
-                   let e9 = (if ix9 < 0 then str_len c else i + ix9 + str_len sep9) in
-                   let piece9 = substring c i e9 in
-                   let piece9 = (if chomp9 && (if whole9 then false else true) && ix9 >= 0
-                                 then substring piece9 0 (str_len piece9 - str_len sep9) else piece9) in
-                   Cons (mkstr piece9, pieces9 e9))) in
-             if str_eq sep9 "\n" && (if chomp9 then false else true)
-             then arr_new (val_list_of_strs (str_lines_go c 0 0 (str_len c)))
-             else arr_new (pieces9 0))
-          | _ -> arr_new Nil)
-       // ⚠ `foreach` was in this arm's ENTRY condition and nowhere in its body,
-       //   so File.foreach and IO.foreach entered here and fell out of the
-       //   bottom as "undefined method 'foreach' for File" -- a name the
-       //   dispatcher claimed and did not answer. (tools/ns_names_check.sh
-       //   compares the two and is what found it.) It is readlines, yielded.
-       else if (str_len name == 7 && str_eq name "foreach") then
-         (match args with
-          | Cons (VStr ph, _) ->
-            (let c = (if file_exists (sget ph) then read_file (sget ph) else "") in
-             let ls = val_list_of_strs (str_lines_go c 0 0 (str_len c)) in
-             match blk with
-             | (true, _, _, _) ->
-               (let rec each9 = fn (xs: Val list) ->
-                  (match xs with
-                   | Nil -> VNil
-                   // $. counts the lines as each one is yielded, as #gets does
-                   | Cons (l9, t9) ->
-                     (let _ = map_set globals "." (VInt ((match (if map_has globals "." then map_get globals "." else VInt 0) with VInt n -> n | _ -> 0) + 1)) in
-                      let _ = run_block world noblk blk (Cons (l9, Nil)) in each9 t9)) in
-                let _ = map_set globals "." (VInt 0) in
-                let r9 = each9 ls in
-                // ...and leaves $_ unset afterwards
-                let _ = map_set globals "_" VNil in
-                r9)
-             // no block: ruby answers an Enumerator over the same lines, whose
-             // size it does not know without reading the file.
-             | _ ->
-               (let e9 = make_enum world (arr_new ls) "each" in
-                let _ = (match e9 with
-                         | VObj eo9 -> (let (_, _, _, iv9) = world in map_set iv9 (str_of_int eo9 ++ "@__e_size") VNil)
-                         | _ -> ()) in
-                e9))
-          | _ -> VNil)
        else if (str_len name == 13 && str_eq name "absolute_path") then
          (match args with
           | Cons (VStr ph, rest) ->
@@ -12470,6 +12389,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let md = chmod_mode env world mv in
              chmod_paths world (oct12 md) paths9 0)
           | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)")
+       // keyword options (mode:, encoding:, binmode: ...) are the prelude's to
+       // read (File.__open_kw), which opens through here with the plain mode
+       else if ((str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open"))
+               && file_kw_args args && has_meth world "(sng:File)" "__open_kw" then
+         invoke_val_c env world blk recv "__open_kw" args false
        else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then file_open_obj world args
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
     // Dir class methods (pwd via env, mkdir via the shell).
@@ -15058,7 +14982,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     let cls = (let c0 = map_get ocls id in
                if is_sng_cls c0 && (if has_meth world c0 name then false else true)
                then sng_supername world c0 else c0) in
-    if has_meth world cls name then
+    // a descriptor stream's stream methods are the prelude's IO layer (see
+    // fdio_route), ahead of IO's own -- which are the File model's
+    if fdio_route world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
+    else if has_meth world cls name then
       (if vischeck && meth_private world cls name
        then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
        else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true)
@@ -15753,18 +15680,53 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // gave "" -- every chunked reader saw one giant chunk and then nothing.
        // With no length it reads to the end and answers "" at EOF; WITH one it
        // answers nil at EOF, which is how a caller tells the two apart.
-       if (str_len name == 4 && str_eq name "read") then
+       // ⚠ THE BYTES ONLY: #read itself is the prelude's (core_prelude_h), which
+       //   takes the buffer argument, refuses a negative length and tags the
+       //   whole-file answer with the stream's encodings -- none of which this
+       //   arm could see. This is what it reads with, and what the other ruby
+       //   readers (getc, the line reader) read with.
+       if (str_len name == 8 && str_eq name "__f_read") then
          (let content = (if file_exists path then read_file path else "") in
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
           let len = (match args with Cons (VInt n, _) -> n | _ -> 0 - 1) in
-          if len < 0 then
-            (let _ = map_set ivars (k ++ "@__f_pos") (VInt (str_len content)) in
-             mkstr (if pos >= str_len content then "" else substring content pos (str_len content)))
-          else if pos >= str_len content then (if len == 0 then mkstr "" else VNil)
+          // the file's own bytes from the position: all of them (n < 0), or n
+          // (⚠ `id` is re-bound first: the closure otherwise captures it as
+          // the name of a function, and the emitted C does not compile)
+          let fid9 = id in
+          let from_file = fn (n: int) ->
+            // ⚠ A FILE WITH NO BYTES MAY BE A DEVICE: /dev/zero reads as the
+            //   empty whole-file string and has any number of bytes to give.
+            //   What came back empty is asked of the descriptor instead -- a
+            //   regular empty file answers the same end of file either way.
+            (let dev9 = (if n > 0 && str_len content == 0 then
+                           (let fd9 = file_fd_of world fid9 in
+                            let p9 = tcp_arena () in
+                            let got9 = (if fd9 < 0 then 0 else fd_read fd9 p9 (if n > 65536 then 65536 else n)) in
+                            if got9 > 0 then mem_to_str p9 got9 else "")
+                         else "") in
+             if str_len dev9 > 0 then mkstr_e dev9 "ASCII-8BIT"
+             else if n < 0 then
+               (let _ = map_set ivars (k ++ "@__f_pos") (VInt (str_len content)) in
+                mkstr (if pos >= str_len content then "" else substring content pos (str_len content)))
+             // ...and with a length the answer is BYTES: ruby tags it BINARY,
+             // whatever the file's encoding, since a length can end mid-character
+             else if pos >= str_len content then (if n == 0 then mkstr_e "" "ASCII-8BIT" else VNil)
+             else
+               (let stop = (if pos + n > str_len content then str_len content else pos + n) in
+                let _ = map_set ivars (k ++ "@__f_pos") (VInt stop) in
+                mkstr_e (substring content pos stop) "ASCII-8BIT")) in
+          // what #ungetc / #ungetbyte pushed back (the prelude keeps it in
+          // @__f_unget) comes out first, as ruby's read buffer hands it out
+          let ug9 = (match (if map_has ivars (k ++ "@__f_unget") then map_get ivars (k ++ "@__f_unget") else VNil) with
+                     | VStr h -> sget h | _ -> "") in
+          if str_len ug9 == 0 || len == 0 then from_file len
+          else if len > 0 && len <= str_len ug9 then
+            (let _ = map_set ivars (k ++ "@__f_unget") (mkstr_e (substring ug9 len (str_len ug9)) "ASCII-8BIT") in
+             mkstr_e (substring ug9 0 len) "ASCII-8BIT")
           else
-            (let stop = (if pos + len > str_len content then str_len content else pos + len) in
-             let _ = map_set ivars (k ++ "@__f_pos") (VInt stop) in
-             mkstr (substring content pos stop)))
+            (let _ = map_delete ivars (k ++ "@__f_unget") in
+             let rest9 = (match from_file (if len < 0 then 0 - 1 else len - str_len ug9) with VStr h -> sget h | _ -> "") in
+             if len < 0 then mkstr (ug9 ++ rest9) else mkstr_e (ug9 ++ rest9) "ASCII-8BIT"))
        // ⚠ A WRITE MOVES THE POSITION, and this one did not touch it: #pos
        //   after `f.write("abc")` answered 0, #eof? was false on a handle
        //   sitting at the end, and the buffer had no idea WHERE it belonged.
@@ -15773,72 +15735,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   and the position after it -- so flush can splice instead of
        //   append. One function, because write/print/<</puts are four doors
        //   into it and three of them used to get this wrong silently.
-       else if (str_len name == 5 && str_eq name "write") || (str_len name == 5 && str_eq name "print") || (str_len name == 2 && str_eq name "<<") then
+       // ⚠ ...and those doors are the prelude's now (core_prelude_h), which
+       //   converts each object with ITS #to_s and into the stream's external
+       //   encoding -- this arm's own join had no world, so an object wrote
+       //   "#<object>". What reaches here is bytes.
+       else if (str_len name == 9 && str_eq name "__f_write") then
          (let piece = io_join_go args "" in
           let _ = file_write_at world id piece in
           let _ = (if map_has ivars (k ++ "@__f_sync") then (let _ = file_flush_obj world id in ()) else ()) in
-          if (str_len name == 2 && str_eq name "<<") then recv
-          else if (str_len name == 5 && str_eq name "write") then VInt (str_len piece) else VNil)
-       else if (str_len name == 4 && str_eq name "puts") then
-         (let _ = file_write_at world id (file_puts_str args "") in VNil)
-       else if (str_len name == 4 && str_eq name "gets") || (str_len name == 8 && str_eq name "readline") then
-         (let content = (if file_exists path then read_file path else "") in
-          let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
-          // gets(sep = $/, limit = nil, chomp: false): the SEPARATOR, the
-          // LIMIT and chomp were all ignored, so `f.gets(".")` read a whole
-          // line and `f.gets(nil)` stopped at the first newline
-          let chomp9 = (match args with
-                        | Nil -> false
-                        | _ -> (match vlast args with
-                                | VHsh h9 -> (match hash_lookup (hderef h9) (VSym "chomp") with (true, cv9) -> truthy cv9 | _ -> false)
-                                | _ -> false)) in
-          let pos_args9 = (match args with
-                           | Nil -> Nil
-                           | _ -> (match vlast args with VHsh _ -> vinit args | _ -> args)) in
-          let (sep9, limit9) = (match pos_args9 with
-                                | Cons (VStr sh9, Cons (VInt l9, _)) -> (VStr sh9, l9)
-                                | Cons (VNil, Cons (VInt l9, _)) -> (VNil, l9)
-                                | Cons (VInt l9, _) -> (mkstr "\n", l9)
-                                | Cons (VStr sh9, _) -> (VStr sh9, 0 - 1)
-                                | Cons (VNil, _) -> (VNil, 0 - 1)
-                                | _ -> (mkstr "\n", 0 - 1)) in
-          if pos >= str_len content then
-            (if (str_len name == 8 && str_eq name "readline") then raise_exc world "EOFError" "end of file reached" else VNil)
-          else
-            let e0 = (match sep9 with
-                      | VStr sh9 ->
-                        (let sp9 = sget sh9 in
-                         if str_eq sp9 "\n" then line_end_from content pos
-                         else if str_eq sp9 "" then line_end_from content pos
-                         else (let rest9 = substring content pos (str_len content) in
-                               let ix9 = str_index_of rest9 sp9 in
-                               if ix9 < 0 then str_len content else pos + ix9 + str_len sp9))
-                      | _ -> str_len content) in
-            let e = (if limit9 >= 0 && e0 - pos > limit9 then pos + limit9 else e0) in
-            let _ = map_set ivars (k ++ "@__f_pos") (VInt e) in
-            let line9 = substring content pos e in
-            let line9 = (if chomp9 then
-                           (match sep9 with
-                            | VStr sh9 ->
-                              (let sp9 = sget sh9 in
-                               let lsp9 = str_len sp9 in
-                               if str_eq sp9 "\n" && str_len line9 >= 2 && str_eq (substring line9 (str_len line9 - 2) (str_len line9)) "\r\n"
-                               then substring line9 0 (str_len line9 - 2)
-                               else if lsp9 > 0 && str_len line9 >= lsp9 && str_eq (substring line9 (str_len line9 - lsp9) (str_len line9)) sp9
-                               then substring line9 0 (str_len line9 - lsp9)
-                               else line9)
-                            | _ -> line9)
-                         else line9) in
-            mkstr line9)
-       // ⚠ ...and `each`, which IS each_line on an IO. It is the name a
-       //   for-loop and every Enumerable method reaches for, and it was not
-       //   here at all.
-       else if (str_len name == 9 && str_eq name "each_line") || (str_len name == 9 && str_eq name "readlines")
-               || (str_len name == 4 && str_eq name "each") then
-         (let content = (if file_exists path then read_file path else "") in
-          let av = file_lines_arr content 0 in
-          if (str_len name == 9 && str_eq name "readlines") then av
-          else invoke_val_c env world blk av "each" Nil vischeck)
+          VInt (str_len piece))
        else if (str_len name == 5 && str_eq name "close") then (let _ = file_close_obj world id in VNil)
        else if (str_len name == 7 && str_eq name "closed?") then VBool (str_eq mode "")
        // a NEW String each call, as ruby gives, but carrying the encoding the
@@ -15855,17 +15760,34 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   f.rewind; f.read` would put "ab" at 0 twice over.
        else if (str_len name == 6 && str_eq name "rewind") then
          (let _ = file_flush_obj world id in
+          let _ = (if map_has ivars (k ++ "@__f_unget") then map_delete ivars (k ++ "@__f_unget") else ()) in
+          // ...and the line count starts again (the prelude's #lineno), with
+          // nothing read ahead any more
+          let _ = map_set ivars (k ++ "@__f_lineno") (VInt 0) in
+          let _ = (if map_has ivars (k ++ "@__f_ahead") then map_delete ivars (k ++ "@__f_ahead") else ()) in
           let _ = map_set ivars (k ++ "@__f_pos") (VInt 0) in
           let _ = map_set ivars (k ++ "@__f_wpos") (VInt 0) in VInt 0)
        // the read position this arm already keeps in @__f_pos -- #rewind and
        // #eof? both use it, and it simply had no reader or writer.
+       // ...less what was pushed back, which the program has not read again
        else if (str_len name == 3 && str_eq name "pos") || (str_len name == 4 && str_eq name "tell") then
-         (match map_get ivars (k ++ "@__f_pos") with VInt n -> VInt n | _ -> VInt 0)
+         (match map_get ivars (k ++ "@__f_pos") with VInt n -> VInt (n - file_unget_len ivars k) | _ -> VInt 0)
        // ...and #seek's SECOND argument is the WHENCE, which this ignored:
        // SEEK_CUR (1) and SEEK_END (2) both landed at the absolute offset, so
        // `f.seek(-5, IO::SEEK_END)` went to a negative position and read "".
-       else if (str_len name == 4 && str_eq name "pos=") || (str_len name == 4 && str_eq name "seek") then
+       // (#seek and #pos= are the prelude's, which convert the offset and the
+       // whence; this moves the position, answering it, or -1 for one before
+       // the start, which it leaves alone)
+       else if (str_len name == 8 && str_eq name "__f_seek") then
          (let _ = file_flush_obj world id in
+          // a SEEK_CUR is from the position the program sees
+          let ugl9 = file_unget_len ivars k in
+          let _ = (if map_has ivars (k ++ "@__f_unget") then map_delete ivars (k ++ "@__f_unget") else ()) in
+          let _ = (if ugl9 > 0 then
+                     (match map_get ivars (k ++ "@__f_pos") with
+                      | VInt p9 -> map_set ivars (k ++ "@__f_pos") (VInt (p9 - ugl9))
+                      | _ -> ())
+                   else ()) in
           match args with
           | Cons (VInt n, rest9) ->
             (let wh9 = (match rest9 with Cons (VInt w, _) -> w | _ -> 0) in
@@ -15873,14 +15795,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                          | VInt c -> c | _ -> 0) in
              let sz9 = (if file_exists path then str_len (read_file path) else 0) in
              let np9 = (if wh9 == 1 then cur9 + n else if wh9 == 2 then sz9 + n else n) in
-             let _ = map_set ivars (k ++ "@__f_pos") (VInt np9) in
-             let _ = map_set ivars (k ++ "@__f_wpos") (VInt np9) in
-             if (str_len name == 4 && str_eq name "seek") then VInt 0 else VInt np9)
-          | _ -> VInt 0)
+             if np9 < 0 then VInt (0 - 1)
+             else
+               (let _ = map_set ivars (k ++ "@__f_pos") (VInt np9) in
+                let _ = map_set ivars (k ++ "@__f_wpos") (VInt np9) in
+                VInt np9))
+          | _ -> VInt (0 - 1))
        else if (str_len name == 4 && str_eq name "eof?") || (str_len name == 3 && str_eq name "eof") then
          (let content = (if file_exists path then read_file path else "") in
           let pos = (match map_get ivars (k ++ "@__f_pos") with VInt n -> n | _ -> 0) in
-          VBool (pos >= str_len content))
+          VBool (pos >= str_len content && (file_unget_len ivars k == 0)))
        // These four were promised by `responds` and not implemented: respond_to?
        // said yes and calling raised NoMethodError, which is worse than either
        // answer alone (a library that checks first still breaks).
@@ -15897,8 +15821,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       else (if map_has ivars (k ++ "@__f_sync") then map_delete ivars (k ++ "@__f_sync") else ())) in
              let _ = (if truthy v then (let _ = file_flush_obj world id in ()) else ()) in v)
           | _ -> VNil)
-       // a file is not a terminal, and here nothing is
-       else if (str_len name == 4 && str_eq name "tty?") || (str_len name == 6 && str_eq name "isatty") then VBool false
+       // a file is a terminal when its descriptor is one (/dev/tty is a file)
+       else if (str_len name == 4 && str_eq name "tty?") || (str_len name == 6 && str_eq name "isatty") then
+         VBool (fd_isatty (file_fd_of world id) == 1)
        // There is no descriptor to report: a File here is a path, a mode and a
        // buffer (see file_close_obj), and the host interface reads and writes
        // whole files. Refusing says so where a made-up number would not -- the
@@ -15915,7 +15840,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   opened for the OLD path, with the new path sitting in @__f_path
        //   where #path reports it. Nothing about that is visible until
        //   something reads.
-       else if (str_len name == 6 && str_eq name "reopen") then
+       // (#reopen itself is the prelude's, which reopens onto another File's
+       // path as well as onto a path; this is the path half)
+       else if (str_len name == 10 && str_eq name "__f_reopen") then
          (match path_args_all noblk world args with
           | Cons (VStr np9, rest9) ->
             (let np = sget np9 in
@@ -15924,7 +15851,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                       | _ -> "r") in
              let _ = file_flush_obj world id in
              let _ = (match (if map_has ivars (k ++ "@__f_fd") then map_get ivars (k ++ "@__f_fd") else VNil) with
-                      | VInt fd9 -> (if fd9 >= 0 then (let _ = fd_close fd9 in ()) else ())
+                      | VInt fd9 -> (if fd9 >= 0 then (let _ = fd_close fd9 in fd_forget fd9) else ())
                       | _ -> ()) in
              let _ = map_delete ivars (k ++ "@__f_fd") in
              if (if file_exists np then false else true)
@@ -15991,12 +15918,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 3 && str_eq name "pos") || (str_len name == 4 && str_eq name "tell") then
          VInt (if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0)
        else if (str_len name == 4 && str_eq name "eof?") || (str_len name == 3 && str_eq name "eof") then
-         (let _ = (if map_has stdin_src "done" then ()
-                   else (let _ = map_set stdin_src "s" (read_stdin ()) in
-                         let _ = map_set stdin_src "done" "1" in
-                         map_set stdin_src_pos "p" 0)) in
-          VBool ((if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0)
-                 >= str_len (map_get stdin_src "s")))
+         (let _ = stdin_want 1 in VBool (stdin_cur () >= str_len (stdin_buf ())))
        // ⚠ ...and the Enumerable surface. ARGF is extended by Enumerable, and
        //   saying so (is_a?) while `ARGF.map` stayed a NoMethodError would be
        //   the claim without the method. The lines are the REST of the input
@@ -16014,162 +15936,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // STDOUT / STDERR: IO objects keyed by @__io_fd (1 = out, 2 = err).
     else if str_eq cls "IO" && map_has ivars (str_of_int id ++ "@__io_fd") then
       (let fd = (match map_get ivars (str_of_int id ++ "@__io_fd") with VInt n -> n | _ -> 1) in
-       // ⚠ A descriptor above the three standard ones is a REAL FILE OR PIPE,
-       //   and writing to it used to print to this process's stdout. Every
-       //   IO.new(fd) and every pipe end went to the terminal. 0/1/2 keep the
-       //   buffered path they have always had, because that is where the
-       //   capture in io_cap lives and the spec suite reads it.
-       // ⚠ A descriptor-born IO had no CLOSED state: `r.close` left the object
-       //   answering closed? false and reading on happily. The three standard
-       //   streams are never closed here, so the mark only exists above 2.
+       // A descriptor ABOVE the three standard ones is a descriptor stream,
+       // and its stream methods are the prelude's IO layer (fdio_route sends
+       // them there before this arm is reached); what arrives here for one is
+       // only the universal names, below.
        // STDIN READS, over the one buffer Kernel#gets already keeps (so the
        // two never read the same line twice): read / gets / getc / getbyte /
        // eof? / readline(s) / each_line were all NoMethodError on $stdin,
        // and a program piping data in could only reach it through gets.
        if fd == 0 && stdin_read_name name then stdin_io_call env world blk recv name args
-       // #dup is a NEW descriptor (dup(2)) on a new IO -- it answered the
-       // receiver itself, so closing the "copy" closed the original -- and
-       // #reopen(io) is dup2(2): the SAME object, its descriptor now naming
-       // what the argument's does. mspec's output_to_fd is exactly this pair
-       // around STDOUT/STDERR; every write here goes through write(2) on the
-       // descriptor, so what the block writes lands in the file.
-       else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
-         (let nfd9 = fd_dup fd in
-          if nfd9 < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
-          else
-            (let oid9 = alloc_oid ocls in
-             let _ = map_set ocls oid9 "IO" in
-             let _ = map_set ivars (str_of_int oid9 ++ "@__io_fd") (VInt nfd9) in
-             VObj oid9))
-       else if (str_len name == 6 && str_eq name "reopen") && (match args with Cons (VObj _, _) -> true | _ -> false) then
-         (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-          let tgt0 = (match args with Cons (t9, _) -> t9 | Nil -> VNil) in
-          let tgt9 = (if responds world tgt0 "to_io" then invoke_val_c env world nb9 tgt0 "to_io" Nil false else tgt0) in
-          let _ = (if responds world tgt9 "flush" then (let _ = invoke_val_c env world nb9 tgt9 "flush" Nil false in ()) else ()) in
-          let tfd9 = (match invoke_val_c env world nb9 tgt9 "fileno" Nil false with VInt n9 -> n9 | _ -> 0 - 1) in
-          if tfd9 < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
-          else if tfd9 == fd then recv
-          else if dup2 tfd9 fd < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
-          else
-            (let _ = (if map_has ivars (str_of_int id ++ "@__io_closed") then map_delete ivars (str_of_int id ++ "@__io_closed") else ()) in
-             recv))
-       else if fd > 2 && (str_len name == 5 && str_eq name "close") then
-         (let _ = fd_close fd in
-          let _ = map_set ivars (str_of_int id ++ "@__io_closed") (VBool true) in
-          VNil)
-       else if fd > 2 && (str_len name == 7 && str_eq name "closed?") then
-         VBool (map_has ivars (str_of_int id ++ "@__io_closed"))
-       // ...and every read or write after that is an IOError, not a syscall.
-       else if fd > 2 && map_has ivars (str_of_int id ++ "@__io_closed")
-               && (if (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s")
-                      || (str_len name == 4 && str_eq name "path") || (str_len name == 7 && str_eq name "to_path")
-                   then false else true) then
-         raise_exc world "IOError" "closed stream"
-       // ONE read(2) and ONE write(2), which is what the prelude's
-       // read_nonblock and write_nonblock are written over: on these
-       // non-blocking descriptors -1 is "nothing now" (answered as :wait),
-       // and a read of 0 is the end of the file (nil). Bytes that #getc
-       // already took off the descriptor come first, as they do in ruby's
-       // buffer -- unless the stream converts newlines, when ruby refuses a
-       // byte read of a CHARACTER buffer.
-       else if fd > 2 && (str_len name == 8 && str_eq name "__nbread") then
-         (let n9 = (match args with Cons (VInt n, _) -> n | _ -> 0) in
-          let rb9 = io_rbuf_of ivars id in
-          if str_len rb9 > 0 then
-            (if map_has ivars (str_of_int id ++ "@__io_univ")
-             then raise_exc world "IOError" "byte oriented read for character buffered IO"
-             else (let k9 = (if n9 < str_len rb9 then n9 else str_len rb9) in
-                   let _ = map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (substring rb9 k9 (str_len rb9))) in
-                   mkstr (substring rb9 0 k9)))
-          else
-            (let p9 = tcp_arena () in
-             let cap9 = (if n9 > 65536 then 65536 else n9) in
-             let got9 = (if cap9 <= 0 then 0 else fd_read fd p9 cap9) in
-             if got9 < 0 then VSym "wait" else if got9 == 0 then VNil else mkstr (mem_to_str p9 got9)))
-       else if fd > 2 && (str_len name == 9 && str_eq name "__nbwrite") then
-         (match args with
-          | Cons (VStr h9, _) ->
-            (let s9 = sget h9 in
-             VInt (fd_put fd (if str_len s9 > 65536 then substring s9 0 65536 else s9)))
-          | _ -> VInt 0)
-       // #getc fills the buffer the way ruby's does -- whatever the pipe holds
-       // now, not one byte -- so a byte read after it sees what ruby's sees.
-       else if fd > 2 && (str_len name == 4 && str_eq name "getc") then
-         (let rb0 = io_rbuf_of ivars id in
-          let p9 = tcp_arena () in
-          let got9 = (if str_len rb0 > 0 then 0 else fd_read fd p9 65536) in
-          let rb9 = (if str_len rb0 > 0 then rb0 else if got9 > 0 then mem_to_str p9 got9 else "") in
-          if str_len rb0 == 0 && got9 < 0 && map_has ivars (str_of_int id ++ "@__io_peer") then
-            raise_exc world "IOError"
-              "deadlock: reading a pipe with nothing in it, and this interpreter runs thread bodies to completion, so nothing is left that could write to it"
-          else if str_len rb9 == 0 then VNil
-          else
-            (let b9 = ord (char_at rb9 0) in
-             let w0 = (if b9 >= 240 then 4 else if b9 >= 224 then 3 else if b9 >= 192 then 2 else 1) in
-             let w9 = (if w0 > str_len rb9 then str_len rb9 else w0) in
-             let _ = map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (substring rb9 w9 (str_len rb9))) in
-             mkstr (substring rb9 0 w9)))
-       else if fd > 2 && (str_len name == 6 && str_eq name "ungetc") then
-         (let back9 = (match args with
-                       | Cons (VStr h9, _) -> sget h9
-                       | Cons (VInt n9, _) -> (if n9 < 256 then chr n9 else "")
-                       | _ -> "") in
-          let _ = map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (back9 ++ io_rbuf_of ivars id)) in
-          VNil)
-       else if fd > 2 && ((str_len name == 5 && str_eq name "write")
-                          || (str_len name == 8 && str_eq name "syswrite")
-                          || (str_len name == 2 && str_eq name "<<")
-                          || (str_len name == 5 && str_eq name "print")
-                          || (str_len name == 4 && str_eq name "puts")) then
-         (let s2 = (if (str_len name == 4 && str_eq name "puts")
-                    then (match args with Nil -> "\n" | _ -> io_join_go args "" ++ "\n")
-                    else io_join_go args "") in
-          let n9 = fd_put fd s2 in
-          if n9 < 0 then raise_exc world "IOError" "closed stream"
-          else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "syswrite") then VInt n9
-          else if (str_len name == 2 && str_eq name "<<") then recv
-          else VNil)
-       else if fd > 2 && ((str_len name == 4 && str_eq name "read")
-                          || (str_len name == 11 && str_eq name "readpartial")
-                          || (str_len name == 7 && str_eq name "sysread")) then
-         // The READ ITSELF is the probe -- see fd_slurp. VNil back means the
-         // descriptor had nothing right now, and on a pipe whose PEER IS STILL
-         // OPEN that can never change here (a thread body runs to completion at
-         // Thread.new, so no writer is left to run). Say so rather than wait.
-         (let peer9 = (if map_has ivars (str_of_int id ++ "@__io_peer")
-                       then (match map_get ivars (str_of_int id ++ "@__io_peer") with VInt pv -> pv | _ -> 0 - 1)
-                       else 0 - 1) in
-          // what #getc buffered is read first, and only what is still
-          // wanted after it goes to the descriptor
-          let rb9 = io_rbuf_of ivars id in
-          let _ = (if str_len rb9 > 0 then map_delete ivars (str_of_int id ++ "@__io_rbuf") else ()) in
-          let got0 = (match args with
-                      | Cons (VInt n9, _) ->
-                        (if str_len rb9 >= n9 && str_len rb9 > 0 then
-                           (let _ = (if str_len rb9 > n9
-                                     then map_set ivars (str_of_int id ++ "@__io_rbuf") (mkstr (substring rb9 n9 (str_len rb9)))
-                                     else ()) in
-                            mkstr "")
-                         else fd_slurp_limited fd (n9 - str_len rb9))
-                      | _ -> fd_slurp fd) in
-          let got9 = (if str_len rb9 == 0 then got0
-                      else (match args with
-                            | Cons (VInt n9, _) ->
-                              (if str_len rb9 >= n9 then mkstr (substring rb9 0 n9)
-                               else (match got0 with VStr g9 -> mkstr (rb9 ++ sget g9) | _ -> mkstr rb9))
-                            | _ -> (match got0 with VStr g9 -> mkstr (rb9 ++ sget g9) | _ -> mkstr rb9))) in
-          match got9 with
-          | VNil ->
-            (if peer9 >= 0 then
-               raise_exc world "IOError"
-                 "deadlock: reading a pipe with nothing in it, and this interpreter runs thread bodies to completion, so nothing is left that could write to it"
-             else raise_exc world "IOError" "closed stream")
-          | VStr h9 ->
-            // #read with no length answers "" at end of file; with one, nil.
-            (match args with
-             | Cons (VInt _, _) -> (if str_eq (sget h9) "" then VNil else got9)
-             | _ -> got9)
-          | _ -> got9)
+       // ...and the other two were never readable
+       else if (fd == 1 || fd == 2) && stdin_read_name name then raise_exc world "IOError" "not opened for reading"
        // ⚠ STDOUT.puts / STDERR.puts write to THAT stream, not through $stdout
        //   / $stderr: the formatting helpers are Kernel#puts's, which ask the
        //   global, so the write is marked direct while they run (io_std_direct)
@@ -16274,11 +16051,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | Nil -> ())
                    | Nil -> ()) in
           recv)
-       // Mere has no isatty capability, and the browser build has no terminal
-       // at all, so an IO here is never a tty. That matches the redirected /
-       // piped case exactly (which is how CRuby answers under the harnesses),
-       // and libraries that colorize only for a tty degrade to plain output.
-       else if (str_len name == 4 && str_eq name "tty?") || (str_len name == 6 && str_eq name "isatty") then VBool false
+       // isatty(3) on the stream's descriptor (the fd_ family has it; the
+       // browser build answers no, having no terminal)
+       else if (str_len name == 4 && str_eq name "tty?") || (str_len name == 6 && str_eq name "isatty") then
+         VBool (fd_isatty fd == 1)
        // ruby's own Logger asks `log.respond_to?(:path) and log.path` before
        // deciding what to open, and a standard stream answers with its name.
        else if (str_len name == 4 && str_eq name "path") || (str_len name == 7 && str_eq name "to_path") then
@@ -19516,17 +19292,6 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           flow_value other))
     // Thread.new/start/fork with a block routes through the class-method
     // dispatcher below (same file), so nothing needed here.
-    // File#each_line { block }: materialize the lines and drive Array#each.
-    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "File") | _ -> false)
-            && ((str_len name == 9 && str_eq name "each_line") || (str_len name == 4 && str_eq name "each")) then
-      (match recv with
-       | VObj id ->
-         (let (m0, s0, ocls0, iv0) = world in
-          let path = (match (if map_has iv0 (str_of_int id ++ "@__f_path") then map_get iv0 (str_of_int id ++ "@__f_path") else VNil) with VStr h -> sget h | _ -> "") in
-          let content = (if file_exists path then read_file path else "") in
-          let av = file_lines_arr content 0 in
-          invoke_with_block env world blk av "each" Nil newblk)
-       | _ -> VNil)
     // Enumerator#each { block }: drive the captured @recv.@meth with this
     // block. `for x in enum_for(:m)` desugars to `enum.each { |__for| ... }`,
     // and #each just forwards to the underlying method (whose `yield` runs the
@@ -19865,7 +19630,10 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_chdir0 - " ++ back))
             else fail "mere-ruby: (exception propagates after Dir.chdir)")
        else if str_eq c "File" && ((str_len name == 4 && str_eq name "open") || (str_len name == 3 && str_eq name "new")) then
-         (let fobj = file_open_obj world (path_args (false, (Nil : str list), (Nil : Stmt list), env) world "open" args) in
+         (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          let fobj = (if file_kw_args args && has_meth world "(sng:File)" "__open_kw"
+                      then invoke_val_c env world nb9 recv "__open_kw" args false
+                      else file_open_obj world (path_args nb9 world "open" args)) in
           let r = flow_value (run_block world blk newblk (Cons (fobj, Nil))) in
           let _ = (match fobj with VObj fid -> file_close_obj world fid | _ -> ()) in
           r)
@@ -20100,9 +19868,12 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
      | VObj id ->
        let (meths, sup, ocls, ivars) = world in
        let cls = map_get ocls id in
+       let fcls9 = (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) in
+       // a descriptor stream's block methods, as in the plain dispatch
+       if fdio_route world id fcls9 name then invoke world newblk recv "IO" (fdio_mname name) args
        // ARGF.each with a block: each(nil) yields the whole ARGV/stdin stream
        // as one record; plain each / each_line yields it line by line.
-       if str_eq cls "ARGF" && ((str_len name == 4 && str_eq name "each") || (str_len name == 9 && str_eq name "each_line")) then
+       else if str_eq cls "ARGF" && ((str_len name == 4 && str_eq name "each") || (str_len name == 9 && str_eq name "each_line")) then
          (match args with
           | Cons (VNil, _) ->
             let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
@@ -29741,6 +29512,15 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      | _ -> prim_method recv meth args)
   else
   let dcls = dispatch_cls_of world recv in
+  // a descriptor stream's stream methods are the prelude layer's (fdio_route),
+  // so `super` from a singleton override -- a mock of #close that calls the
+  // real one -- lands there
+  if (match recv with
+      | VObj oid9 -> (let (_, _, oc9, _) = world in
+                      let c9 = map_get oc9 oid9 in
+                      fdio_route world oid9 (if is_sng_cls c9 then sng_supername world c9 else c9) meth)
+      | _ -> false) then
+    invoke world superblk recv "IO" (fdio_mname meth) args
   // Object's own methods (freeze / dup / to_s / hash / ...) live in the
   // primitive table rather than the user method map, so `super` from an
   // override of one has to reach them here — they are ancestors in Ruby, and
@@ -29751,7 +29531,7 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // `super` from an exception class's own #exception / #set_backtrace /
   // #backtrace reaches Exception's (a class that logs and calls super is how
   // a spec watches raise use them)
-  if (str_eq meth "exception" || str_eq meth "set_backtrace" || str_eq meth "backtrace")
+  else if (str_eq meth "exception" || str_eq meth "set_backtrace" || str_eq meth "backtrace")
      && (match recv with VObj _ -> true | _ -> false) && exc_is_a world dcls "Exception" then
     (let (_, _, _, iv9) = world in
      match recv with
@@ -31260,12 +31040,8 @@ and frz_inspect = fn env -> fn world -> fn (v: Val) ->
 // What is left of ARGF's input from the shared position, as lines, and the
 // position moved to the end (see rb_gets for the slurp and the position).
 and argf_rest_lines = fn (u: unit) ->
-  let _ = (if map_has stdin_src "done" then ()
-           else (let _ = map_set stdin_src "s" (read_stdin ()) in
-                 let _ = map_set stdin_src "done" "1" in
-                 map_set stdin_src_pos "p" 0)) in
-  let s9 = map_get stdin_src "s" in
-  let p9 = (if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0) in
+  let s9 = stdin_whole () in
+  let p9 = stdin_cur () in
   let _ = map_set stdin_src_pos "p" (str_len s9) in
   if p9 >= str_len s9 then (Nil : Val list)
   else val_list_of_strs (str_lines_go s9 p9 p9 (str_len s9))
@@ -31917,14 +31693,147 @@ and first_non_str = fn (args: Val list) ->
   | Cons (VStr _, t9) -> first_non_str t9
   | Cons (v9, _) -> Cons (v9, Nil)
 
-// `IO.new(fd, mode, path: "...")`: the name a descriptor-born IO answers #path
-// with. ruby takes it as a keyword and there is nowhere else it could come
-// from -- a bare descriptor has no name.
-and io_new_path = fn env -> fn world -> fn (rest: Val list) ->
-  match rest with
-  | Nil -> VNil
-  | Cons (VHsh hid9, Nil) -> hash_get (hderef hid9) (VSym "path")
-  | Cons (_, t9) -> io_new_path env world t9
+// The descriptor primitives (see the IO arm of the class dispatch): one
+// system call each, over the fd_* family and the byte arena. A read is one
+// read(2) of at most 64 KiB -- the arena block -- and a write loops over
+// 64 KiB pieces until the kernel takes no more, answering how many bytes it
+// took (-1 only when it took none), so a short write on a full pipe is the
+// layer's to finish rather than lost here.
+// ⚠ THE READ IS ITS OWN PROBE. On a non-blocking descriptor -1 is "nothing
+//   now" and 0 is the end of the file -- opposite answers -- and no separate
+//   "would it block?" question can be asked first: a zero-length read is -1
+//   by the family's contract, for every pipe, and a one-byte read consumes
+//   the byte. The layer tells -1 apart by whether O_NONBLOCK is set (fd_nb).
+and io_fd_prim = fn world -> fn (name: str) -> fn (args: Val list) ->
+  let ia = fn (i: int) -> (match val_drop args i with Cons (VInt n, _) -> n | _ -> 0 - 1) in
+  let forget = fd_forget in
+  let carry = fn (a: int) -> fn (b: int) ->
+    (let _ = forget b in
+     let _ = (if map_has fd_path a then map_set fd_path b (map_get fd_path a) else ()) in
+     let _ = (if map_has fd_acc a then map_set fd_acc b (map_get fd_acc a) else ()) in
+     if map_has fd_nb a then map_set fd_nb b 1 else ()) in
+  if str_eq name "__fdopen" then
+    (match args with
+     | Cons (VStr ph, Cons (VStr mh, _)) ->
+       (let m9 = sget mh in
+        let fd = fd_open (sget ph) m9 (ia 2) in
+        let _ = (if fd >= 0 then
+                   (let _ = forget fd in
+                    let _ = map_set fd_path fd (sget ph) in
+                    map_set fd_acc fd ((if str_contains m9 "+" then 2 else if str_eq (substring m9 0 1) "r" then 0 else 1)
+                                       + (if str_eq (substring m9 0 1) "a" then 16 else 0)))
+                 else ()) in
+        VInt fd)
+     | _ -> VInt (0 - 1))
+  else if str_eq name "__fdacc" then VInt (if map_has fd_acc (ia 0) then map_get fd_acc (ia 0) else 0 - 1)
+  else if str_eq name "__fdnb" then VBool (map_has fd_nb (ia 0))
+  else if str_eq name "__fdpath" then (if map_has fd_path (ia 0) then mkstr (map_get fd_path (ia 0)) else VNil)
+  else if str_eq name "__fdsigpipe" then VInt (sigignore 13)
+  // close-on-exec: read (one argument) or set (two); see fd_keep
+  else if str_eq name "__fdcloexec" then
+    (match args with
+     | Cons (VInt fd, Nil) -> VBool (if map_has fd_keep fd then false else true)
+     | Cons (VInt fd, Cons (v, _)) ->
+       (let _ = (if truthy v then (if map_has fd_keep fd then map_delete fd_keep fd else ())
+                 else map_set fd_keep fd 1) in VNil)
+     | _ -> VNil)
+  // the descriptors above 2 a child must not inherit, lowest first
+  else if str_eq name "__fdlist" then
+    (let acc9 = map_new () in
+     let _ = map_iter fd_acc (fn (fd: int) -> fn (a: int) ->
+               if fd > 2 && (if map_has fd_keep fd then false else true) then map_set acc9 fd 1 else ()) in
+     let rec up = fn (i: int) -> fn (left: int) ->
+       (if left <= 0 then (Nil : Val list)
+        else if map_has acc9 i then Cons (VInt i, up (i + 1) (left - 1))
+        else up (i + 1) left) in
+     arr_new (up 3 (map_len acc9)))
+  else if str_eq name "__fdread" then
+    (let p = tcp_arena () in
+     let cap = (if ia 1 > 65536 then 65536 else ia 1) in
+     let got = (if cap <= 0 then 0 - 1 else fd_read (ia 0) p cap) in
+     if got < 0 then VInt (0 - 1) else if got == 0 then VNil else mkstr_e (mem_to_str p got) "ASCII-8BIT")
+  else if str_eq name "__fdwrite" then
+    (match args with
+     | Cons (VInt fd, Cons (VStr h, _)) -> VInt (fd_put_all fd (sget h) 0 0)
+     | _ -> VInt (0 - 1))
+  else if str_eq name "__fdseek" then VInt (fd_seek (ia 0) (ia 1) (ia 2))
+  else if str_eq name "__fdclose" then
+    (let r = fd_close (ia 0) in let _ = (if r == 0 then forget (ia 0) else ()) in VInt r)
+  else if str_eq name "__fddup" then
+    (let n = fd_dup (ia 0) in let _ = (if n >= 0 then carry (ia 0) n else ()) in VInt n)
+  else if str_eq name "__fddup2" then
+    (let n = (if ia 0 < 0 || ia 1 < 0 then 0 - 1 else dup2 (ia 0) (ia 1)) in
+     let _ = (if n >= 0 && ia 0 != ia 1 then carry (ia 0) n else ()) in VInt n)
+  else if str_eq name "__fdtty" then VBool (fd_isatty (ia 0) == 1)
+  else if str_eq name "__fdsync" then VInt (if ia 0 < 0 then 0 - 1 else fsync (ia 0))
+  else if str_eq name "__fdnonblock" then
+    (let r = io_set_nonblocking (ia 0) in let _ = (if r >= 0 then map_set fd_nb (ia 0) 1 else ()) in VInt r)
+  // pipe(2): the two descriptors, read end first, as they come -- blocking.
+  // The layer's IO.pipe makes its own ends non-blocking (see there); a pipe
+  // handed to a CHILD must not be, since the child reads and writes it with
+  // no idea that it would have to wait.
+  else if str_eq name "__fdpipe" then
+    (let pk = fd_pipe () in
+     if pk < 0 then VNil
+     else (let r = pk / 4294967296 in
+           let w = pk - r * 4294967296 in
+           let _ = forget r in let _ = forget w in
+           let _ = map_set fd_acc r 0 in let _ = map_set fd_acc w 1 in
+           arr_new (Cons (VInt r, Cons (VInt w, Nil)))))
+  // rb_any_to_s -- "#<Class:0x...>", Object's own #to_s whatever the object
+  // defines -- which #write and #puts print for an object whose #to_s does not
+  // answer a String
+  else if str_eq name "__fdanystr" then
+    (match args with
+     | Cons (VObj oid, _) ->
+       (let (_, _, oc9, _) = world in
+        mkstr ("#<" ++ cls_display world (obj_print_cls world (map_get oc9 oid)) ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ ">"))
+     | Cons (v, _) -> mkstr (to_s v)
+     | Nil -> VNil)
+  // a subclass of IO whose instances are descriptor streams: the dispatcher
+  // routes their stream methods to the layer the way it does IO's own (see
+  // fdio_route), and it can only know the class by being told.
+  else if str_eq name "__fdclass" then
+    (match args with
+     | Cons (VClass c9, _) -> (let _ = map_set fdio_cls c9 1 in VNil)
+     | _ -> VNil)
+  else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for class IO")
+// the layer's name for a stream method: `<<` is not a name a def can spell
+and fdio_mname = fn (name: str) ->
+  if str_eq name "<<" then "__fd_append" else "__fd_" ++ name
+// Is this call a descriptor stream's, to be answered by the layer? An IO (or
+// a subclass the layer registered) whose descriptor is above the standard
+// three -- 0, 1 and 2 keep the builtin streams, which is where the output
+// capture lives -- and a name the layer defines. The receiver's own
+// singleton methods are not reached through here (`cls` is the singleton
+// when it defines the name), so a mock still wins.
+//
+// ...and a File's LINE methods, which are the same reader over the File's own
+// read(n) (see the layer): the builtin arm read whole-file lines and ignored
+// the separator, the limit, paragraph mode, #lineno and the encodings.
+and fdio_route = fn world -> fn (id: int) -> fn (cls: str) -> fn (name: str) ->
+  ((str_eq cls "IO" || (map_len fdio_cls > 0 && map_has fdio_cls cls))
+   && (let (_, _, _, iv9) = world in
+       let k9 = str_of_int id ++ "@__io_fd" in
+       map_has iv9 k9 && (match map_get iv9 k9 with VInt fd9 -> fd9 > 2 | _ -> false))
+   && has_meth world "IO" (fdio_mname name))
+  || (str_eq cls "File" && fdio_line_name name && has_meth world "IO" (fdio_mname name))
+// File.new / File.open called with keyword options: the last argument is a
+// Hash after the path (a positional Hash where a mode goes is a keyword hash
+// here too, which is how the parser passes them)
+// the bytes #ungetc / #ungetbyte pushed back onto a File and not yet read
+and file_unget_len = fn ivars -> fn (k: str) ->
+  (match (if map_has ivars (k ++ "@__f_unget") then map_get ivars (k ++ "@__f_unget") else VNil) with
+   | VStr h -> str_len (sget h) | _ -> 0)
+and file_kw_args = fn (args: Val list) ->
+  (match args with
+   | Cons (_, Nil) -> false
+   | Cons (_, _) -> (match vlast args with VHsh _ -> true | _ -> false)
+   | Nil -> false)
+and fdio_line_name = fn (name: str) ->
+  (str_len name == 4 && (str_eq name "gets" || str_eq name "each"))
+  || (str_len name == 8 && str_eq name "readline")
+  || (str_len name == 9 && (str_eq name "readlines" || str_eq name "each_line"))
 
 // ⚠ "<p>/" and not "<p>/.": a trailing slash makes the kernel require that
 //   the name be a directory WITHOUT searching it, while "<p>/." looks inside

@@ -5050,6 +5050,46 @@ and stdlib_src = fn (name: str) ->
     "    nil\n" ++
     "  end\n" ++
     "end\n"
+  // io/nonblock: O_NONBLOCK, as far as the descriptor bookkeeping can say it.
+  // Setting it is real (io_set_nonblocking). CLEARING it is not something
+  // this interpreter can ask of the kernel -- it takes fcntl(2), which no
+  // extern can declare -- so `nonblock = false` is recorded on the stream,
+  // #nonblock? reports it, and a read on it waits for data as a blocking one
+  // would (the layer's reads wait on a would-block anyway).
+  // A socket is non-blocking from the start in ruby 3, and here.
+  else if str_eq n "io/nonblock" then
+    "class IO\n" ++
+    "  def nonblock?\n" ++
+    "    raise IOError, \"closed stream\" if self.closed?\n" ++
+    "    !@__nb_off && IO.__fdnb(self.fileno)\n" ++
+    "  end\n" ++
+    "  def nonblock=(v)\n" ++
+    "    raise IOError, \"closed stream\" if self.closed?\n" ++
+    "    if v\n" ++
+    "      IO.__fdnonblock(self.fileno)\n" ++
+    "      @__nb_off = nil\n" ++
+    "    else\n" ++
+    "      @__nb_off = true\n" ++
+    "    end\n" ++
+    "    v\n" ++
+    "  end\n" ++
+    "  def nonblock(v = true)\n" ++
+    "    was = nonblock?\n" ++
+    "    self.nonblock = v\n" ++
+    "    begin\n" ++
+    "      yield self\n" ++
+    "    ensure\n" ++
+    "      self.nonblock = was\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "class BasicSocket\n" ++
+    "  def nonblock? = !@__nb_off\n" ++
+    "  def nonblock=(v)\n" ++
+    "    @__nb_off = v ? nil : true\n" ++
+    "    v\n" ++
+    "  end\n" ++
+    "end\n"
   else if str_eq n "socket" then
     "class SocketError < StandardError; end\n" ++
     "class BasicSocket\n" ++
@@ -14381,6 +14421,14 @@ and file_open_obj = fn world -> fn (args: Val list) ->
     let _ = map_set ivars (str_of_int id ++ "@__f_pos") (VInt 0) in
     // where the write buffer's first byte belongs; see file_flush_obj
     let _ = map_set ivars (str_of_int id ++ "@__f_wpos") (VInt 0) in
+    // the default encodings AS THEY ARE NOW: a stream that names none keeps
+    // the ones it was opened under (the prelude's #external_encoding reads
+    // these), whatever Encoding.default_* say later
+    let _ = map_set ivars (str_of_int id ++ "@__f_dext")
+              (if map_has def_ext_enc "v" then map_get def_ext_enc "v"
+               else if map_has enc_objs "UTF-8" then map_get enc_objs "UTF-8" else VNil) in
+    let _ = map_set ivars (str_of_int id ++ "@__f_dint")
+              (if map_has def_int_enc "v" then map_get def_int_enc "v" else VNil) in
     VObj id
 and file_flush_obj = fn world -> fn (id: int) ->
   let (meths, sup, ocls, ivars) = world in
@@ -14453,6 +14501,11 @@ and file_fd_of = fn world -> fn (id: int) ->
                  else if str_contains mode "w" then "r+" else "r") in
      let fd9 = fd_open path fdm9 438 in
      let _ = map_set ivars (k ++ "@__f_fd") (VInt fd9) in
+     // what the descriptor was opened with, which IO.new checks a mode against
+     let _ = (if fd9 >= 0 then
+                (let _ = fd_forget fd9 in
+                 map_set fd_acc fd9 (if str_eq fdm9 "r" then 0 else if str_eq fdm9 "a" then 17 else 2))
+              else ()) in
      fd9)
 
 and file_close_obj = fn world -> fn (id: int) ->
@@ -14463,18 +14516,20 @@ and file_close_obj = fn world -> fn (id: int) ->
   // ...and the descriptor goes with it. A File that is opened and never closed
   // would otherwise hold one until the process ends, and the spec suite opens
   // thousands.
+  // (#autoclose = false leaves it open: the program took it over)
+  let keep9 = map_has ivars (k ++ "@__f_keep_fd") && truthy (map_get ivars (k ++ "@__f_keep_fd")) in
   let _ = (match (if map_has ivars (k ++ "@__f_fd") then map_get ivars (k ++ "@__f_fd") else VNil) with
-           | VInt fd9 -> (if fd9 >= 0 then (let _ = fd_close fd9 in ()) else ())
+           | VInt fd9 -> (if fd9 >= 0 && (if keep9 then false else true) then (let _ = fd_close fd9 in fd_forget fd9) else ())
            | _ -> ()) in
   let _ = map_delete ivars (k ++ "@__f_fd") in
+  // the mode it had, which #reopen onto a path uses again (the prelude's)
+  let _ = (match (if map_has ivars (k ++ "@__f_mode") then map_get ivars (k ++ "@__f_mode") else VNil) with
+           | VStr h9 -> (if str_eq (sget h9) "" then () else map_set ivars (k ++ "@__f_lastmode") (VStr h9))
+           | _ -> ()) in
   map_set ivars (k ++ "@__f_mode") (mkstr "")
 and rb_gets = fn (u: unit) ->
-  let _ = (if map_has stdin_src "done" then ()
-           else
-             let _ = map_set stdin_src "s" (read_stdin ()) in
-             let _ = map_set stdin_src "done" "1" in
-             let _ = map_set stdin_src_pos "p" 0 in ()) in
-  let s = map_get stdin_src "s" in
+  let _ = stdin_line () in
+  let s = stdin_buf () in
   let pos = (if map_has stdin_src_pos "p" then map_get stdin_src_pos "p" else 0) in
   if pos >= str_len s then (let _ = map_set globals "_" VNil in VNil)
   else
@@ -14493,8 +14548,14 @@ and rb_readlines = fn (u: unit) ->
 and argf_input = fn (u: unit) ->
   let av = (if map_has cli_argv "v" then map_get cli_argv "v" else arr_new Nil) in
   match av with
-  | VArr id -> (match deref id with Nil -> read_stdin () | paths -> argf_concat paths "")
-  | _ -> read_stdin ()
+  | VArr id -> (match deref id with Nil -> argf_stdin_rest () | paths -> argf_concat paths "")
+  | _ -> argf_stdin_rest ()
+// the rest of standard input from the shared cursor, which it then passes
+and argf_stdin_rest = fn (u: unit) ->
+  let s9 = stdin_whole () in
+  let p9 = stdin_cur () in
+  let _ = map_set stdin_src_pos "p" (str_len s9) in
+  if p9 >= str_len s9 then "" else substring s9 p9 (str_len s9)
 and argf_concat = fn (paths: Val list) -> fn (acc: str) ->
   match paths with
   | Nil -> acc
@@ -14905,26 +14966,6 @@ and io_join_go = fn (args: Val list) -> fn (acc: str) ->
   | Nil -> acc
   | Cons (VStr h, t) -> io_join_go t (acc ++ sget h)
   | Cons (h, t) -> io_join_go t (acc ++ to_s h)
-and file_puts_str = fn (args: Val list) -> fn (acc: str) ->
-  match args with
-  | Nil -> (if str_eq acc "" then "\n" else acc)
-  | Cons (h, t) -> file_puts_str_go (Cons (h, t)) acc
-and file_puts_str_go = fn (args: Val list) -> fn (acc: str) ->
-  match args with
-  | Nil -> acc
-  | Cons (VArr aid, t) -> file_puts_str_go t (file_puts_str_go (deref aid) acc)
-  | Cons (VStr sh, t) ->
-    let s2 = sget sh in
-    let s3 = (if str_len s2 > 0 && str_eq (char_at s2 (str_len s2 - 1)) "\n" then s2 else s2 ++ "\n") in
-    file_puts_str_go t (acc ++ s3)
-  | Cons (h, t) -> file_puts_str_go t (acc ++ to_s h ++ "\n")
-and file_lines_arr = fn (content: str) -> fn (i: int) ->
-  arr_new (file_lines_go content i)
-and file_lines_go = fn (content: str) -> fn (i: int) ->
-  if i >= str_len content then (Nil : Val list)
-  else
-    let e = line_end_from content i in
-    Cons (mkstr (substring content i e), file_lines_go content e)
 and mk_lazy = fn world -> fn (src: Val) -> fn (ops: Val list) ->
   let (meths, sup, ocls, ivars) = world in
   let id = alloc_oid ocls in
