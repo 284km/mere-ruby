@@ -703,11 +703,6 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter comp_outer mk in
   let _ = map_iter loaded_files mk in
   let _ = map_iter modules mk in
-  let _ = map_iter mrsh_dsyms mk in
-  let _ = map_iter mrsh_syms mk in
-  // the load-side object table DOES hold values (the objects read so far), so
-  // unlike its write-side twin it is a real root.
-  let _ = map_iter mrsh_rlinks mk in
   let _ = map_iter parser_flags mk in
   let _ = map_iter pending_home mk in
   let _ = map_iter prim_missing mk in
@@ -14308,22 +14303,73 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let _ = (match args with
                 | Cons (VBool true, _) -> map_set hook_flags "tp" VNil
                 | _ -> if map_has hook_flags "tp" then map_delete hook_flags "tp" else ()) in VNil)
-    else if str_eq c "Marshal" && (str_len name == 4 && str_eq name "dump") then
+    // ⚠ MARSHAL IS RUBY NOW. The dispatcher had a subset -- nil, booleans,
+    //   Integer, Float, Symbol, String, Array, Hash -- and refused everything
+    //   else with "no _dump_data is defined for class X": an Object, a Struct, a
+    //   Range, a Class, a Bignum, marshal_dump / _dump objects, Time, Regexp,
+    //   Exception. core/marshal's dump and load specs were 116 and 140 ERRORs of
+    //   that. The whole format is stdlib_src "__marshal", transcribed from
+    //   marshal.c; this arm loads it on first use and then steps aside, so the
+    //   call reaches the ruby methods like any other singleton method.
+    else if str_eq c "Marshal" && (if map_has hook_flags "mrb" then false else true)
+            && ((str_len name == 4 && (str_eq name "dump" || str_eq name "load")) || (str_len name == 7 && str_eq name "restore")) then
+      (let _ = map_set hook_flags "mrb" VNil in
+       let _ = exec_stmt env world blk (SRequire (false, EStrL "__marshal")) in
+       invoke_val_c env world blk recv name args false)
+    // RBASIC_SET_CLASS for the loader: a String / Array / Hash becomes an
+    // instance of a subclass in place, keeping its identity (the object table
+    // already holds it) and without running the subclass's initialize.
+    else if str_eq c "Marshal" && (str_len name == 7 && str_eq name "__retag") then
       (match args with
-       | Cons (v, _) ->
-         (let out = mkstr (mrsh_dump env world v) in
-          let _ = (match out with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in out)
-       | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
-    // Marshal.load: the reader half of the same subset.
-    else if str_eq c "Marshal" && ((str_len name == 4 && str_eq name "load") || (str_len name == 7 && str_eq name "restore")) then
+       | Cons (v9, Cons (VClass k9, _)) ->
+         (let hk9 = hng_key v9 in
+          let _ = (if str_len hk9 > 0 then map_set hng_store hk9 k9 else ()) in v9)
+       | Cons (v9, _) -> v9
+       | _ -> VNil)
+    // rb_ary_push and OBJ_FREEZE for the loader: the builtin act, never a
+    // subclass's own #push / #<< or an object's own #freeze (ruby/spec checks
+    // both -- an Array subclass whose << raises, an object whose freeze does)
+    else if str_eq c "Marshal" && (str_len name == 6 && str_eq name "__push") then
       (match args with
-       | Cons (VStr h, _) -> mrsh_load env world (sget h)
-       | Cons (v, _) ->
-         // an IO-ish argument: read it first, as ruby does.
-         (match invoke_val_c env world blk v "read" Nil false with
-          | VStr h -> mrsh_load env world (sget h)
-          | _ -> raise_exc world "TypeError" "instance of IO needed")
-       | _ -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
+       | Cons (VArr aid9, Cons (x9, _)) -> (let _ = arr_push_many aid9 (Cons (x9, Nil)) in VArr aid9)
+       | Cons (a9, _) -> a9
+       | _ -> VNil)
+    else if str_eq c "Marshal" && (str_len name == 8 && str_eq name "__freeze") then
+      (match args with
+       | Cons (v9, _) ->
+         (match v9 with
+          | VStr id9 -> (let _ = sfrozen_set id9 in v9)
+          | VArr id9 -> (let _ = cfrozen_set 0 id9 in v9)
+          | VHsh id9 -> (let _ = cfrozen_set 1 id9 in v9)
+          | VProc id9 -> (let _ = cfrozen_set 2 id9 in v9)
+          | VObj id9 -> (let _ = ofrozen_set id9 in v9)
+          | _ -> v9)
+       | _ -> VNil)
+    // a class's own name, as Module#name answers it before any `def self.name`
+    // a program adds (the dump writes the constant path, not what #name says)
+    else if str_eq c "Marshal" && (str_len name == 7 && str_eq name "__cname") then
+      (match args with
+       | Cons (VClass k9, _) ->
+         (if is_sng_cls k9 then VNil
+          else if map_has anon_name k9 then map_get anon_name k9
+          else if is_anon_cls k9 && str_find_from k9 "::" 0 > 0 then mkstr (to_s (VClass k9))
+          else if is_anon_cls k9 then VNil
+          else mkstr k9)
+       | _ -> VNil)
+    // whether a value HAS a singleton class, asked without making one: most
+    // objects have none, and making one to look (Object#singleton_class) would
+    // give every dumped String a class of its own.
+    else if str_eq c "Marshal" && (str_len name == 5 && str_eq name "__sng") then
+      (match args with
+       | Cons (VObj id9, _) ->
+         (let (_, _, ocls9, _) = world in
+          let cur9 = map_get ocls9 id9 in
+          if is_sng_cls cur9 then VClass cur9 else VNil)
+       | Cons (v9, _) ->
+         (let hk9 = hng_key v9 in
+          if str_len hk9 > 0 && map_has hng_store hk9 && is_sng_cls (map_get hng_store hk9)
+          then VClass (map_get hng_store hk9) else VNil)
+       | _ -> VNil)
     // Process.clock_gettime(clock_id) -- one clock behind every id, in
     // seconds as a Float. Enough for the elapsed-time measurements libraries
     // use it for; not a separate CPU-time source.
@@ -33291,242 +33337,12 @@ and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
 
 // the ordinal of a Time object (its @__t ivar), or a sentinel if absent.
 
-// --- Marshal.load ---------------------------------------------------------
-// A loader for the subset a data file actually uses: nil / true / false,
-// Integer, Symbol (with the back-reference table), String, Array, Hash,
-// Float, and the ivar wrapper that carries a String's encoding. Anything
-// else (an object, a link, a Bignum, a user class) names its own tag in the
-// error rather than loading something wrong.
 // String#to_i / #to_f read as far as they can and answer 0 when that is
 // nowhere: `"".to_i`, `"abc".to_i` and `"12abc".to_i` are 0, 0 and 12 in ruby,
 // where a strict parse raises. Underscores between digits are ignored, as in a
 // literal.
 // keep in step with the top-level is_ws_ch: \v and \f are whitespace too
 // (this shadowing copy lacked them, so "\v1.2".to_f read nothing).
-
-
-
-
-
-
-
-// Marshal's packed integer: one byte carries the small values, and 1..4
-// following bytes (little-endian) the rest -- a negative count meaning the
-// value is that many bytes below 256^n.
-
-and mrsh_val = fn env -> fn world -> fn (s: str) -> fn (i: int) ->
-  let t = char_at s i in
-  if str_eq t "0" then (VNil, i + 1)
-  else if str_eq t "T" then (VBool true, i + 1)
-  else if str_eq t "F" then (VBool false, i + 1)
-  else if str_eq t "i" then (let (n, j) = mrsh_long s (i + 1) in (VInt n, j))
-  else if str_eq t ":" then
-    (let (n, j) = mrsh_long s (i + 1) in
-     let nm = substring s j (j + n) in
-     let _ = map_set mrsh_syms (str_of_int (map_len mrsh_syms)) (mkstr nm) in
-     (VSym nm, j + n))
-  else if str_eq t ";" then
-    (let (k, j) = mrsh_long s (i + 1) in
-     ((if map_has mrsh_syms (str_of_int k)
-       then (match map_get mrsh_syms (str_of_int k) with VStr h -> VSym (sget h) | _ -> VNil)
-       else VNil), j))
-  else if str_eq t "\"" then
-    // a bare string is BINARY; only the `I` wrapper below says otherwise.
-    (let (n, j) = mrsh_long s (i + 1) in
-     let v = mkstr (substring s j (j + n)) in
-     let _ = (match v with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in
-     // a String takes an object index too, in the same order the writer gave
-     // it -- the `I` wrapper around it does not take one of its own.
-     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) v in
-     (v, j + n))
-  else if str_eq t "f" then
-    (let (n, j) = mrsh_long s (i + 1) in
-     let txt = substring s j (j + n) in
-     let fv = (if str_eq txt "inf" then VFlt (1.0 / 0.0)
-               else if str_eq txt "-inf" then VFlt (0.0 - 1.0 / 0.0)
-               else if str_eq txt "nan" then VFlt (0.0 / 0.0)
-               else VFlt (float_of_str txt)) in
-     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) fv in
-     (fv, j + n))
-  // ⚠ the container claims its index BEFORE its elements are read. A
-  //   self-referential array is written as `[` length `@0`, and the `@0` can
-  //   only resolve to an array that already exists -- so it is created empty,
-  //   registered, filled.
-  else if str_eq t "[" then
-    (let (n, j) = mrsh_long s (i + 1) in
-     let av = arr_new Nil in
-     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) av in
-     let (xs, j2) = mrsh_vals env world s j n Nil in
-     let _ = (match av with VArr aid -> arr_set aid xs | _ -> ()) in
-     (av, j2))
-  else if ord t == 123 then
-    (let (n, j) = mrsh_long s (i + 1) in
-     let hv = mkhash Nil in
-     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) hv in
-     let (xs, j2) = mrsh_vals env world s j (n * 2) Nil in
-     let _ = (match hv with VHsh hid -> hset hid (hash_merge Nil xs) | _ -> ()) in
-     (hv, j2))
-  // "@<index>" -- a value already written once in this stream.
-  else if str_eq t "@" then
-    (let (k, j) = mrsh_long s (i + 1) in
-     ((if map_has mrsh_rlinks (str_of_int k) then map_get mrsh_rlinks (str_of_int k) else VNil), j))
-  // `I` wraps an object in its instance variables; for a String they are the
-  // encoding, which mere-ruby tracks separately, so the pairs are consumed
-  // and dropped.
-  else if str_eq t "I" then
-    (let (v, j) = mrsh_val env world s (i + 1) in
-     let (n, j2) = mrsh_long s j in
-     let j3 = mrsh_ivars env world s j2 n v in
-     (v, j3))
-  // `U` class-name data: allocate the class, register the object BEFORE its
-  //   data is read (the data may link back to it), then #marshal_load.
-  else if str_eq t "U" then
-    (let (cv, j) = mrsh_val env world s (i + 1) in
-     let cn = (match cv with VSym nm -> nm | _ -> "") in
-     let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-     let ov = invoke_val_c env world nb9 (VClass cn) "allocate" Nil false in
-     let _ = map_set mrsh_rlinks (str_of_int (map_len mrsh_rlinks)) ov in
-     let (dv, j2) = mrsh_val env world s j in
-     let _ = (if responds world ov "marshal_load" then invoke_val_c env world nb9 ov "marshal_load" (Cons (dv, Nil)) false
-              else raise_exc world "TypeError" ("instance of " ++ cn ++ " needs to have method `marshal_load'")) in
-     (ov, j2))
-  else
-    (let _ = raise_exc world "TypeError" ("marshal data too short or unsupported (tag " ++ t ++ ")") in (VNil, i + 1))
-
-and mrsh_vals = fn env -> fn world -> fn (s: str) -> fn (i: int) -> fn (n: int) -> fn (acc: Val list) ->
-  if n <= 0 then (rev_app acc Nil, i)
-  else (let (v, j) = mrsh_val env world s i in mrsh_vals env world s j (n - 1) (Cons (v, acc)))
-// the ivar pairs of an `I`-wrapped object. For a String the only one that
-// carries meaning here is the encoding: `E` true/false is UTF-8/US-ASCII,
-// and `encoding` names it outright. The rest are consumed and dropped.
-and mrsh_ivars = fn env -> fn world -> fn (s: str) -> fn (i: int) -> fn (n: int) -> fn (owner: Val) ->
-  if n <= 0 then i
-  else (let (k, j) = mrsh_val env world s i in
-        let (v, j2) = mrsh_val env world s j in
-        let _ = (match owner with
-                 | VStr h ->
-                   (match k with
-                    | VSym kn ->
-                      // `E false` is US-ASCII, which inspects like BINARY
-                      // (ruby escapes \xNN there, not \uXXXX).
-                      (if str_eq kn "E" then senc_set h (match v with VBool true -> "UTF-8" | _ -> "US-ASCII")
-                       else if str_eq kn "encoding" then (match v with VStr eh -> senc_set h (sget eh) | _ -> ())
-                       else ())
-                    | _ -> ())
-                 | _ -> ()) in
-        mrsh_ivars env world s j2 (n - 1) owner)
-
-// ---- Marshal.dump: the writer half of the same subset -------------------
-// The length/count encoding: 0 is one zero byte, a small number rides in one
-// byte biased by 5, and anything else is a signed byte count followed by that
-// many little-endian bytes.
-
-
-
-// a symbol is written out once; later mentions are ";" plus its index.
-
-// ⚠ THE OBJECT TABLE. ruby gives every non-immediate, non-Symbol value an
-// index the first time it writes it, counting from 0 at the top level, and
-// writes "@<index>" for any later mention. Without it `a = []; a << a;
-// Marshal.dump(a)` recursed until the stack died -- one CRASH row for one
-// example -- and every "uses object links for objects repeatedly dumped"
-// example wrote the object twice. Symbols are NOT here: they have their own
-// table (";<index>") and do not consume an object index. Floats ARE: ruby's
-// flonums make `[1.5, 1.5]` two mentions of one object, and it links them.
-and mrsh_link_key = fn (v: Val) ->
-  match v with
-  | VStr h -> "s" ++ str_of_int h
-  | VArr id -> "a" ++ str_of_int id
-  | VHsh id -> "h" ++ str_of_int id
-  | VObj id -> "o" ++ str_of_int id
-  | VFlt f -> "f" ++ mrsh_float_text f
-  | _ -> ""
-
-and mrsh_dump_val = fn env -> fn world -> fn (v: Val) ->
-  let k = mrsh_link_key v in
-  if str_eq k "" then mrsh_dump_val_raw env world v
-  else if map_has mrsh_links k then
-    "@" ++ mrsh_dump_long (match map_get mrsh_links k with VInt n9 -> n9 | _ -> 0)
-  else
-    // the index is claimed BEFORE the body is written, which is what makes a
-    // cycle terminate: the inner mention finds the entry already there.
-    (let _ = map_set mrsh_links k (VInt (map_len mrsh_links)) in
-     mrsh_dump_val_raw env world v)
-
-and mrsh_dump_val_raw = fn env -> fn world -> fn (v: Val) ->
-  match v with
-  | VNil -> "0"
-  | VBool b -> (if b then "T" else "F")
-  | VInt n -> "i" ++ mrsh_dump_long n
-  | VSym nm -> mrsh_dump_sym nm
-  | VFlt f -> (let t = mrsh_float_text f in "f" ++ mrsh_dump_long (str_len t) ++ t)
-  | VStr h ->
-    // a BINARY string is written bare; any other encoding rides in the `I`
-    // wrapper as the :E ivar (true = UTF-8), which is what load reads back.
-    (let body = sget h in
-     let enc = senc_get h in
-     let raw = "\"" ++ mrsh_dump_long (str_len body) ++ body in
-     if str_eq enc "ASCII-8BIT" then raw
-     else if str_eq enc "UTF-8" || str_eq enc "US-ASCII" then
-       "I" ++ raw ++ mrsh_dump_long 1 ++ mrsh_dump_sym "E" ++ (if str_eq enc "UTF-8" then "T" else "F")
-     else "I" ++ raw ++ mrsh_dump_long 1 ++ mrsh_dump_sym "encoding"
-          ++ "\"" ++ mrsh_dump_long (str_len enc) ++ enc)
-  | VArr id -> (let xs = deref id in "[" ++ mrsh_dump_long (vals_len xs 0) ++ mrsh_dump_vals env world xs)
-  | VHsh h ->
-    // the pair list is flat: [k1, v1, k2, v2, ...], so the count is half of it
-    (let xs = hderef h in "\{" ++ mrsh_dump_long (vals_len xs 0 / 2) ++ mrsh_dump_vals env world xs)
-  // ⚠ the thread primitives refuse by their QUALIFIED names, and two of
-  //   them with a different sentence: Queue, SizedQueue and ConditionVariable
-  //   define marshal_dump to raise "can't dump Thread::X", while Mutex has
-  //   none and gets the generic one -- naming Thread::Mutex. Asked of the
-  //   reference, one at a time.
-  // `U`: an object that answers #marshal_dump is written as its class name
-  //   and whatever that method returns, and the reader hands the value back
-  //   to #marshal_load on a fresh allocation of the class (Addrinfo is one).
-  //   Its object index was taken by mrsh_dump_val, before the body, as ruby
-  //   takes it.
-  | VObj _ when responds world v "marshal_dump" ->
-    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-     let dv = invoke_val_c env world nb9 v "marshal_dump" Nil false in
-     "U" ++ mrsh_dump_sym (class_name v) ++ mrsh_dump_val env world dv)
-  | _ -> (let cn9 = class_name v in
-          let _ = (if str_eq cn9 "Queue" || str_eq cn9 "SizedQueue" || str_eq cn9 "ConditionVariable"
-                   then raise_exc world "TypeError" ("can't dump Thread::" ++ cn9)
-                   else if str_eq cn9 "Mutex"
-                   then raise_exc world "TypeError" "no _dump_data is defined for class Thread::Mutex"
-                   else raise_exc world "TypeError" ("no _dump_data is defined for class " ++ cn9)) in "")
-
-// Marshal writes a float as its shortest decimal digits: no trailing ".0", an
-// exponent with neither "+" nor leading zeros (3.0e-05 is "3e-5"), and the
-// exponent form whenever the plain one would need trailing zeros (100.0 is
-// "1e2", 123000.0 is "1.23e5", but 105.0 stays "105").
-
-// an integral value whose digits end in zeros is written in exponent form.
-
-
-
-
-
-
-
-and mrsh_dump_vals = fn env -> fn world -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> ""
-  | Cons (h, t) -> mrsh_dump_val env world h ++ mrsh_dump_vals env world t
-
-and mrsh_dump = fn env -> fn world -> fn (v: Val) ->
-  let _ = map_clear mrsh_dsyms in
-  let _ = map_clear mrsh_links in
-  chr 4 ++ chr 8 ++ mrsh_dump_val env world v
-
-and mrsh_load = fn env -> fn world -> fn (s: str) ->
-  let _ = map_clear mrsh_rlinks in
-  if str_len s < 3 then raise_exc world "ArgumentError" "marshal data too short"
-  else if (if mrsh_at s 0 == 4 && mrsh_at s 1 <= 8 then false else true) then
-    raise_exc world "TypeError" "incompatible marshal file format"
-  else
-    (let _ = map_clear mrsh_syms in
-     let (v, _) = mrsh_val env world s 2 in v)
 
 // a Thread::Backtrace::Location for the file being executed. The class is
 // registered on first use, with the readers ruby's own has.
