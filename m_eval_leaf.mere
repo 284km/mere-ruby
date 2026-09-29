@@ -13616,6 +13616,260 @@ and pad_left_zeros = fn (s9: str) -> fn (w: int) ->
 //   in a program decided the other. Now the day's two ENDS are asked (the next
 //   day shares its start, so a run of days costs about one date(1) each), and
 //   only a day whose ends disagree is bisected, once, to the second.
+// ---- the tz database, read the way libc reads it --------------------------
+// ⚠ ONE date(1) PER QUESTION WAS THE COST OF EVERY LOCAL TIME. Each answer was
+//   a shell and a date process, and a local Time needs several (its own
+//   instant, the offsets around a transition), so `0.upto(2100) { |y|
+//   Time.local(y) }` -- ruby/spec's time_params asks exactly that, in four
+//   files -- ran past the harness's budget. The zone is now read from its
+//   TZif file once (the TZ name under /usr/share/zoneinfo, or /etc/localtime
+//   when TZ is unset) and answered from the transition table, with the
+//   file's POSIX footer for instants after the last transition. A TZ that is
+//   a POSIX string rather than a file ("PDT8:00:00", what mspec's
+//   with_timezone sets) is parsed as one. Only a TZ that is neither still asks
+//   date(1).
+//
+// Everything lives in tz_db as strings, keyed by the TZ value:
+//   k            "f" (a file was read), "p" (a POSIX string) or "d" (ask date)
+//   n            the number of transitions;  t<i> / y<i> their instant / type
+//   o<k> a<k> s<k>  type k's offset, abbreviation and isdst
+//   ft           the POSIX footer ("" when there is none)
+//   and for a POSIX rule, under a prefix: sn so dn do r1 r2 (see tzp_parse)
+and tz_be32 = fn (d: str) -> fn (i: int) ->
+  let v = ord (char_at d i) * 16777216 + ord (char_at d (i + 1)) * 65536
+          + ord (char_at d (i + 2)) * 256 + ord (char_at d (i + 3)) in
+  if v >= 2147483648 then v - 4294967296 else v
+and tz_be64 = fn (d: str) -> fn (i: int) ->
+  let hi = tz_be32 d i in
+  let lo0 = tz_be32 d (i + 4) in
+  let lo = (if lo0 < 0 then lo0 + 4294967296 else lo0) in
+  hi * 4294967296 + lo
+and tz_cstr = fn (d: str) -> fn (i: int) -> fn (lim: int) ->
+  if i >= lim || ord (char_at d i) == 0 then "" else char_at d i ++ tz_cstr d (i + 1) lim
+and tz_db_put = fn (tz9: str) -> fn (k: str) -> fn (v: str) -> map_set tz_db (tz9 ++ "\n" ++ k) v
+and tz_db_get = fn (tz9: str) -> fn (k: str) ->
+  if map_has tz_db (tz9 ++ "\n" ++ k) then map_get tz_db (tz9 ++ "\n" ++ k) else ""
+and tz_db_int = fn (tz9: str) -> fn (k: str) -> int_of_str (tz_db_get tz9 k)
+// the TZif body at `base`: `w` is 4 for version 1's times and 8 after.
+// Answers where the body ends, or -1 when the file is shorter than it says.
+and tzif_read = fn (tz9: str) -> fn (d: str) -> fn (base: int) -> fn (w: int) ->
+  let isutc = tz_be32 d (base + 20) in
+  let isstd = tz_be32 d (base + 24) in
+  let leap = tz_be32 d (base + 28) in
+  let tcnt = tz_be32 d (base + 32) in
+  let ycnt = tz_be32 d (base + 36) in
+  let ccnt = tz_be32 d (base + 40) in
+  let tbase = base + 44 in
+  let ibase = tbase + tcnt * w in
+  let ybase = ibase + tcnt in
+  let cbase = ybase + ycnt * 6 in
+  let endb = cbase + ccnt + leap * (w + 4) + isstd + isutc in
+  if endb > str_len d then 0 - 1
+  else
+    (let rec trans = fn (i: int) ->
+       (if i >= tcnt then ()
+        else (let _ = tz_db_put tz9 ("t" ++ str_of_int i) (str_of_int (if w == 8 then tz_be64 d (tbase + i * 8) else tz_be32 d (tbase + i * 4))) in
+              let _ = tz_db_put tz9 ("y" ++ str_of_int i) (str_of_int (ord (char_at d (ibase + i)))) in
+              trans (i + 1))) in
+     let rec types = fn (k: int) ->
+       (if k >= ycnt then ()
+        else (let p = ybase + k * 6 in
+              let _ = tz_db_put tz9 ("o" ++ str_of_int k) (str_of_int (tz_be32 d p)) in
+              let _ = tz_db_put tz9 ("s" ++ str_of_int k) (str_of_int (ord (char_at d (p + 4)))) in
+              let _ = tz_db_put tz9 ("a" ++ str_of_int k) (tz_cstr d (cbase + ord (char_at d (p + 5))) (cbase + ccnt)) in
+              types (k + 1))) in
+     let _ = trans 0 in
+     let _ = types 0 in
+     let _ = tz_db_put tz9 "n" (str_of_int tcnt) in
+     endb)
+and tz_has_sub = fn (s: str) -> fn (sub: str) -> fn (i: int) ->
+  if i + str_len sub > str_len s then false
+  else if str_eq (substring s i (i + str_len sub)) sub then true
+  else tz_has_sub s sub (i + 1)
+and tz_footer_end = fn (d: str) -> fn (i: int) ->
+  if i >= str_len d || str_eq (char_at d i) "\n" then i else tz_footer_end d (i + 1)
+// the zone for this TZ value, read once: "f", "p" or "d"
+and tz_kind = fn (tz9: str) ->
+  let k0 = tz_db_get tz9 "k" in
+  if str_len k0 > 0 then k0
+  else
+    (let nm = (if str_len tz9 > 0 && str_eq (char_at tz9 0) ":" then substring tz9 1 (str_len tz9) else tz9) in
+     let path = (if str_eq nm "" then "/etc/localtime"
+                 else if str_eq (char_at nm 0) "/" then nm
+                 else "/usr/share/zoneinfo/" ++ nm) in
+     // a relative name may not climb out of the database
+     let safe = (if tz_has_sub nm ".." 0 then false else true) in
+     let d = (if safe && file_exists path && (if file_exists (path ++ "/.") then false else true) then read_file path else "") in
+     let k = (if str_len d >= 44 && str_eq (substring d 0 4) "TZif" then
+                (let v1end = tzif_read tz9 d 0 4 in
+                 if v1end < 0 then "d"
+                 else if ord (char_at d 4) >= 50 then
+                   // version 2+: a second header with 64-bit times, then the footer
+                   (let v2end = tzif_read tz9 d v1end 8 in
+                    if v2end < 0 then "d"
+                    else
+                      (let fe = (if v2end < str_len d && str_eq (char_at d v2end) "\n" then tz_footer_end d (v2end + 1) else v2end) in
+                       let ft = (if fe > v2end + 1 then substring d (v2end + 1) fe else "") in
+                       let ok = (if str_len ft > 0 then tzp_parse tz9 "F" ft else false) in
+                       let _ = tz_db_put tz9 "ft" (if ok then ft else "") in
+                       "f"))
+                 else (let _ = tz_db_put tz9 "ft" "" in "f"))
+              else if str_len nm > 0 && tzp_parse tz9 "P" nm then "p"
+              else "d") in
+     let _ = tz_db_put tz9 "k" k in
+     k)
+// ---- POSIX TZ strings: std offset [dst [offset] [,start[/time],end[/time]]]
+// a zone name: letters, or anything between < and >; its end index
+and tzp_name_end = fn (s: str) -> fn (i: int) ->
+  if i < str_len s && str_eq (char_at s i) "<" then
+    (let rec go = fn (j: int) -> (if j >= str_len s || str_eq (char_at s j) ">" then j else go (j + 1)) in
+     go (i + 1))
+  else
+    (let rec go = fn (j: int) ->
+       (if j < str_len s && (let c = ord (char_at s j) in (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) then go (j + 1) else j) in
+     go i)
+and tzp_name_of = fn (s: str) -> fn (i: int) ->
+  let j = tzp_name_end s i in
+  if i < str_len s && str_eq (char_at s i) "<" then substring s (i + 1) j else substring s i j
+and tzp_name_next = fn (s: str) -> fn (i: int) ->
+  let j = tzp_name_end s i in
+  if i < str_len s && str_eq (char_at s i) "<" && j < str_len s then j + 1 else j
+and tzp_digits = fn (s: str) -> fn (j: int) -> fn (acc: int) ->
+  if j < str_len s && is_digit (char_at s j) then tzp_digits s (j + 1) (acc * 10 + ord (char_at s j) - 48) else acc
+and tzp_digits_end = fn (s: str) -> fn (j: int) ->
+  if j < str_len s && is_digit (char_at s j) then tzp_digits_end s (j + 1) else j
+// [+-]hh[:mm[:ss]] as seconds (POSIX's sign), or the end index; -1 = no digits
+and tzp_hms_end = fn (s: str) -> fn (i: int) ->
+  let i1 = (if i < str_len s && (str_eq (char_at s i) "-" || str_eq (char_at s i) "+") then i + 1 else i) in
+  let i2 = tzp_digits_end s i1 in
+  if i2 == i1 then 0 - 1
+  else
+    (let i3 = (if i2 < str_len s && str_eq (char_at s i2) ":" then tzp_digits_end s (i2 + 1) else i2) in
+     if i3 > i2 && i3 < str_len s && str_eq (char_at s i3) ":" then tzp_digits_end s (i3 + 1) else i3)
+and tzp_hms = fn (s: str) -> fn (i: int) ->
+  let sg = (if i < str_len s && str_eq (char_at s i) "-" then 0 - 1 else 1) in
+  let i1 = (if i < str_len s && (str_eq (char_at s i) "-" || str_eq (char_at s i) "+") then i + 1 else i) in
+  let h = tzp_digits s i1 0 in
+  let i2 = tzp_digits_end s i1 in
+  let m = (if i2 < str_len s && str_eq (char_at s i2) ":" then tzp_digits s (i2 + 1) 0 else 0) in
+  let i3 = (if i2 < str_len s && str_eq (char_at s i2) ":" then tzp_digits_end s (i2 + 1) else i2) in
+  let sec = (if i3 > i2 && i3 < str_len s && str_eq (char_at s i3) ":" then tzp_digits s (i3 + 1) 0 else 0) in
+  sg * (h * 3600 + m * 60 + sec)
+// Parse `s` under prefix `pf`. The stored offsets are ruby's (east positive);
+// POSIX writes them west positive. A rule is kept as its two texts.
+and tzp_parse = fn (tz9: str) -> fn (pf: str) -> fn (s: str) ->
+  let sn = tzp_name_of s 0 in
+  let i1 = tzp_name_next s 0 in
+  let i2 = tzp_hms_end s i1 in
+  if str_len sn < 3 || i2 < 0 then false
+  else
+    (let so = tzp_hms s i1 in
+     let _ = tz_db_put tz9 (pf ++ "sn") sn in
+     let _ = tz_db_put tz9 (pf ++ "so") (str_of_int (0 - so)) in
+     let dn = tzp_name_of s i2 in
+     let i3 = tzp_name_next s i2 in
+     if str_len dn == 0 then (let _ = tz_db_put tz9 (pf ++ "dn") "" in i2 == str_len s)
+     else
+       (let i4 = tzp_hms_end s i3 in
+        let dof = (if i4 < 0 then 0 - so + 3600 else 0 - tzp_hms s i3) in
+        let i5 = (if i4 < 0 then i3 else i4) in
+        let _ = tz_db_put tz9 (pf ++ "dn") dn in
+        let _ = tz_db_put tz9 (pf ++ "do") (str_of_int dof) in
+        // no rule given: the US one, as libc assumes
+        let rules = (if i5 < str_len s && str_eq (char_at s i5) "," then substring s (i5 + 1) (str_len s) else "M3.2.0,M11.1.0") in
+        (match str_split rules "," with
+         | Cons (r1, Cons (r2, _)) ->
+           (let _ = tz_db_put tz9 (pf ++ "r1") r1 in
+            let _ = tz_db_put tz9 (pf ++ "r2") r2 in true)
+         | _ -> false)))
+// the instant, in seconds of local wall time from 1970, that a rule
+// "Mm.w.d[/time]", "Jn[/time]" or "n[/time]" names in year y
+and tzp_rule_secs = fn (r: str) -> fn (y: int) ->
+  let (body, tm) = (match str_split r "/" with
+                    | Cons (b9, Cons (t9, _)) -> (b9, tzp_hms t9 0)
+                    | _ -> (r, 7200)) in
+  let y0 = days_from_civil y 1 1 in
+  let day =
+    (if str_len body > 0 && str_eq (char_at body 0) "M" then
+       (match str_split (substring body 1 (str_len body)) "." with
+        | Cons (ms, Cons (ws, Cons (ds, _))) ->
+          (let m = int_of_str ms in
+           let w = int_of_str ws in
+           let dw = int_of_str ds in
+           let first = days_from_civil y m 1 in
+           let wd1 = imod (first + 4) 7 in
+           let d1 = 1 + imod (dw - wd1 + 7) 7 + (w - 1) * 7 in
+           let d2 = (if d1 > days_in_month y m then d1 - 7 else d1) in
+           days_from_civil y m d2 - y0)
+        | _ -> 0)
+     else if str_len body > 0 && str_eq (char_at body 0) "J" then
+       (let n = int_of_str (substring body 1 (str_len body)) in
+        n - 1 + (if is_leap_year y && n >= 60 then 1 else 0))
+     else int_of_str body) in
+  (y0 + day) * 86400 + tm
+// (offset, name) of a POSIX rule under prefix pf at instant ep
+and tzp_at = fn (tz9: str) -> fn (pf: str) -> fn (ep: int) ->
+  let so = tz_db_int tz9 (pf ++ "so") in
+  let sn = tz_db_get tz9 (pf ++ "sn") in
+  let dn = tz_db_get tz9 (pf ++ "dn") in
+  if str_len dn == 0 then (so, sn)
+  else
+    (let dof = tz_db_int tz9 (pf ++ "do") in
+     let (y, _, _) = civil_from_days (idiv_floor (ep + so) 86400) in
+     // the start is written in standard time and the end in daylight time
+     let st = tzp_rule_secs (tz_db_get tz9 (pf ++ "r1")) y - so in
+     let en = tzp_rule_secs (tz_db_get tz9 (pf ++ "r2")) y - dof in
+     let indst = (if st < en then ep >= st && ep < en else (if ep >= en && ep < st then false else true)) in
+     if indst then (dof, dn) else (so, sn))
+// is this Darwin (whose libc reads the 32-bit table for early instants)?
+and tz_darwin = fn (u: unit) ->
+  (if map_has tz_db "\ndarwin" then str_eq (map_get tz_db "\ndarwin") "1"
+   else (let v = file_exists "/System/Library/CoreServices/SystemVersion.plist" in
+         let _ = map_set tz_db "\ndarwin" (if v then "1" else "0") in v))
+// the last transition at or before ep lies in [lo, hi)
+and tzf_bs = fn (tz9: str) -> fn (ep: int) -> fn (lo: int) -> fn (hi: int) ->
+  if hi - lo <= 1 then lo
+  else (let mid = lo + (hi - lo) / 2 in
+        if tz_db_int tz9 ("t" ++ str_of_int mid) <= ep then tzf_bs tz9 ep mid hi else tzf_bs tz9 ep lo mid)
+and tzf_type = fn (tz9: str) -> fn (k: int) ->
+  (tz_db_int tz9 ("o" ++ str_of_int k), tz_db_get tz9 ("a" ++ str_of_int k))
+// whether the zone is in daylight saving at ep: the type's own isdst flag,
+// the POSIX rule's, and for a zone date(1) answers, an offset ahead of the
+// smaller of January's and July's
+and tz_dst_in = fn (tz9: str) -> fn (ep: int) ->
+  let k = tz_kind tz9 in
+  if str_eq k "f" then tzf_dst tz9 ep
+  else if str_eq k "p" then tzp_dst tz9 "P" ep
+  else
+    (let (o9, _) = tz_local_date tz9 ep in
+     let (y9, _, _) = civil_from_days (idiv_floor (ep + o9) 86400) in
+     let (oj9, _) = tz_local_date tz9 (days_from_civil y9 1 1 * 86400 + 43200) in
+     let (ol9, _) = tz_local_date tz9 (days_from_civil y9 7 1 * 86400 + 43200) in
+     o9 > (if oj9 < ol9 then oj9 else ol9))
+and tzp_dst = fn (tz9: str) -> fn (pf: str) -> fn (ep: int) ->
+  let (o9, _) = tzp_at tz9 pf ep in
+  str_len (tz_db_get tz9 (pf ++ "dn")) > 0 && o9 == tz_db_int tz9 (pf ++ "do") && o9 != tz_db_int tz9 (pf ++ "so")
+and tzf_dst = fn (tz9: str) -> fn (ep: int) ->
+  let n = tz_db_int tz9 "n" in
+  let hasft = str_len (tz_db_get tz9 "ft") > 0 in
+  if ep < 0 - 2147483648 && tz_darwin () then tzf_dst tz9 0
+  else if n == 0 then (if hasft then tzp_dst tz9 "F" ep else tz_db_int tz9 "s0" == 1)
+  else if ep < tz_db_int tz9 "t0" then tz_db_int tz9 "s0" == 1
+  else if hasft && ep >= tz_db_int tz9 ("t" ++ str_of_int (n - 1)) then tzp_dst tz9 "F" ep
+  else tz_db_int tz9 ("s" ++ tz_db_get tz9 ("y" ++ str_of_int (tzf_bs tz9 ep 0 n))) == 1
+// (offset, name) of a TZif zone at instant ep
+and tzf_at = fn (tz9: str) -> fn (ep: int) ->
+  let n = tz_db_int tz9 "n" in
+  let hasft = str_len (tz_db_get tz9 "ft") > 0 in
+  // ⚠ before 1901-12-13 (-2**31) Darwin's localtime(3) refuses, and ruby
+  //   falls back to the zone as it was at the epoch (time.c's
+  //   guess_local_offset): the reference says BST for London there, JST for
+  //   Tokyo, EST for New York -- 1970's answers, not the table's LMT.
+  if ep < 0 - 2147483648 && tz_darwin () then tzf_at tz9 0
+  else if n == 0 then (if hasft then tzp_at tz9 "F" ep else tzf_type tz9 0)
+  else if ep < tz_db_int tz9 "t0" then tzf_type tz9 0
+  else if hasft && ep >= tz_db_int tz9 ("t" ++ str_of_int (n - 1)) then tzp_at tz9 "F" ep
+  else tzf_type tz9 (tz_db_int tz9 ("y" ++ str_of_int (tzf_bs tz9 ep 0 n)))
 and tz_at = fn (tz9: str) -> fn (ep: int) ->
   let key = tz9 ++ "|@" ++ str_of_int ep in
   let raw9 = (if map_has tz_cache key then map_get tz_cache key
@@ -13646,6 +13900,12 @@ and tz_local = fn (ep: int) -> tz_local_in (rb_env_get "TZ") ep
 and time_tz_of = fn (oid: int) ->
   if map_has time_ltz (str_of_int oid) then map_get time_ltz (str_of_int oid) else rb_env_get "TZ"
 and tz_local_in = fn (tz9: str) -> fn (ep: int) ->
+  let k = tz_kind tz9 in
+  if str_eq k "f" then tzf_at tz9 ep
+  else if str_eq k "p" then tzp_at tz9 "P" ep
+  else tz_local_date tz9 ep
+// ...and where there is no database to read, date(1), per day
+and tz_local_date = fn (tz9: str) -> fn (ep: int) ->
   let d0 = idiv_floor ep 86400 * 86400 in
   let (oa, na) = tz_at tz9 d0 in
   let (ob, nb) = tz_at tz9 (d0 + 86400) in
