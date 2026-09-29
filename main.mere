@@ -1886,6 +1886,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // printed nothing at all. With no arguments it writes `$_`.
     else if (str_len name == 5 && str_eq name "print") && (if kernel_overridden env world "print" then false else true) then
       (let _ = (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ()) in VNil)
+    // ...and a bare `p` / `pp` prints nothing and answers nil; it was a
+    // NoMethodError here, since the method lives in the argument-taking arm.
+    else if ((str_len name == 1 && str_eq name "p") || (str_len name == 2 && str_eq name "pp"))
+            && (if kernel_overridden env world name then false else true) then VNil
     else if (str_len name == 4 && str_eq name "rand") && (if map_has meths "rand" then false else true) then rand_val world Nil
     else if (str_len name == 5 && str_eq name "srand") && (if map_has meths "srand" then false else true) then srand_val env world Nil
     else if (str_len name == 4 && str_eq name "gets") && (if kernel_overridden env world "gets" then false else true) then kernel_gets world
@@ -3603,7 +3607,9 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
   // warnings are on
   let _ = (if (str_eq slot ";" || str_eq slot ",") && (match v with VNil -> false | _ -> true)
               && map_has warn_cats "deprecated" && truthy (map_get warn_cats "deprecated")
-           then print_err (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: non-nil '$" ++ slot ++ "' is deprecated")
+           // (through rb_warn: silent under $VERBOSE = nil, as suppress_warning
+           // expects, and handed to Warning.warn like every other warning)
+           then rb_warn world ("non-nil '$" ++ slot ++ "' is deprecated")
            else ()) in
   let _ = map_set globals slot v in
   if map_has hook_flags "gvt" && map_has gvar_traces slot
@@ -17948,6 +17954,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // explicit self at the top level dispatches to top-level methods.
     let (meths, sup, ocls, ivars) = world in
     if map_has meths name then call_method env world noblk name args
+    // (Kernel's output functions, `send(:print, x)` at the top level: see
+    // try_self_call_x)
+    else if (str_len name == 5 && str_eq name "print") || (str_len name == 4 && str_eq name "putc")
+            || (str_len name == 4 && str_eq name "puts") || (str_len name == 1 && str_eq name "p")
+            || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf") then
+      try_self_call_x env world VMain name args true
     else dispatch_prim env world blk recv name args vischeck
   | VProc pid ->
     // a CURRIED proc collects arguments until it has the arity it was curried
@@ -28109,8 +28121,22 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // VNil = "blame whatever self turned out to be"; a caller that routed an
   // explicit receiver through here passes that receiver instead.
   let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
+  // Kernel's output functions sent to an explicit receiver
+  // (`obj.send(:putc, x)`, as the io_putc shared spec does): they live in
+  // the implicit-self call path (puts is even a statement there), so they are
+  // run from it, with self the receiver.
+  if explicit && ((str_len name == 5 && str_eq name "print") || (str_len name == 4 && str_eq name "putc")
+                  || (str_len name == 4 && str_eq name "puts") || (str_len name == 1 && str_eq name "p")
+                  || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf")) then
+    (let e2 = map_new () in
+     let _ = map_set e2 "self" blame in
+     let _ = map_set e2 "__ka" (arr_new args) in
+     let ka = Cons (ESplat (EVar "__ka"), Nil) in
+     if (str_len name == 4 && str_eq name "puts") then
+       (match exec_stmt e2 world noblk (SPuts ka) with FNext v9 -> v9 | _ -> VNil)
+     else eval_e e2 world noblk (ECall (name, ka)))
   // bare method(:name) — Kernel#method on the implicit self.
-  if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
+  else if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
   // Kernel#load -- unless the implicit self defines its own `load`, which is
   // not exotic: a YAML or JSON module calling its own load from load_file
@@ -37004,6 +37030,15 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
       (let self0 = (if lv_has env "self" then lv_get env "self" else VMain) in
        let args = eval_args env world blk es in
        FNext (invoke_val_c env world blk self0 "puts" args false))
+    // ...and Kernel#puts is `$stdout.puts(*args)` (rb_f_puts forwards): a
+    // replaced $stdout whose class or singleton defines #puts gets the call
+    // itself -- a spec mock `$stdout.should_receive(:puts)` expects exactly
+    // that -- and one that only has #write is written line by line below.
+    else if (match stdio_hook world "stdout" with
+             | VObj hid9 -> has_meth world (dispatch_cls_of world (VObj hid9)) "puts"
+             | _ -> false) then
+      (let args = eval_args env world blk es in
+       FNext (invoke_val_c env world blk (stdio_hook world "stdout") "puts" args false))
     else
     // Through eval_args -- the SAME evaluator the overridden `puts` above
     // goes through. Having a second one is what made the two halves of this
@@ -40458,10 +40493,25 @@ and puts_one_nonl = fn world -> fn (v: Val) ->
 
 // Kernel#p / #pp use #inspect, which for objects/containers must reach a
 // user-defined #inspect — so go through the world-aware inspect_w.
+// Through a replaced $stdout that is ruby's rb_io_writev: the inspection and
+// the newline as two strings (out_emit_line), and a File is flushed after,
+// so the text is in the file before `p` returns.
 and p_print_w = fn env -> fn world -> fn (args: Val list) ->
+  let _ = p_print_each env world args in
+  (match args with
+   | Nil -> ()
+   | _ ->
+     (match stdio_hook world "stdout" with
+      | VObj hid9 ->
+        (if obj_is_a world (dispatch_cls_of world (VObj hid9)) "File" then
+           (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+            let _ = invoke_val_c env world nb9 (VObj hid9) "flush" Nil false in ())
+         else ())
+      | _ -> ()))
+and p_print_each = fn env -> fn world -> fn (args: Val list) ->
   match args with
   | Nil -> ()
-  | Cons (v, t) -> let _ = out_emit world (inspect_w env world v ++ "\n") in p_print_w env world t
+  | Cons (v, t) -> let _ = out_emit_line_x world (inspect_w env world v) false in p_print_each env world t
 
 // puts of one value: arrays flatten recursively; an object uses its
 // user-defined to_s if present (Ruby would otherwise print an address,
@@ -40489,7 +40539,10 @@ and puts_one = fn world -> fn (v: Val) ->
 // strings -- `write(line, "\n")`, or two calls when #write takes one argument
 // (rb_io_writev) -- so a recorder sees ["k2", "\n"], not ["k2\n"].
 and out_emit_line = fn world -> fn (s: str) ->
-  let has_nl = str_len s > 0 && str_eq (char_at s (str_len s - 1)) "\n" in
+  out_emit_line_x world s (str_len s > 0 && str_eq (char_at s (str_len s - 1)) "\n")
+// ...with the newline decision made by the caller: Kernel#p always adds one,
+// even after an #inspect that ends in a newline.
+and out_emit_line_x = fn world -> fn (s: str) -> fn (has_nl: bool) ->
   match stdio_hook world "stdout" with
   | VNil -> out_print_no_nl (if has_nl then s else s ++ "\n")
   | t9 ->
