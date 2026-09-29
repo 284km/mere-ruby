@@ -9052,6 +9052,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   let args0 = (match recv with
                | VClass fc ->
                  (if str_eq fc "File" || str_eq fc "IO" || str_eq fc "Dir" || str_eq fc "FileUtils"
+                     // ⚠ FileTest is File's predicates under another name,
+                     //   and it was left out: `FileTest.exist?(pathname)`
+                     //   answered false where `File.exist?` answered true.
+                     || str_eq fc "FileTest"
                   then path_args (false, (Nil : str list), (Nil : Stmt list), env) world name args0 else args0)
                | _ -> args0) in
   // duck-type String/Array args via to_str/to_ary for the methods that need a
@@ -11885,7 +11889,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if ((str_eq c "File" || str_eq c "FileTest") || str_eq c "IO")
             && ns_class_method c name
             && (if is_module_method name then false else true) then
-      (if (str_len name == 4 && str_eq name "read") || (str_len name == 7 && str_eq name "binread") then
+      (let args = (if (str_eq c "File" || str_eq c "FileTest") && fpred_names name
+                   then fpred_args noblk world name args else args) in
+       // ⚠ the path-SPLITTING names read the bytes of '/' and '.', which is
+       //   only meaningful in an ASCII-compatible encoding: ruby refuses a
+       //   UTF-16/UTF-32 path before looking at it, and these cut its bytes
+       //   in the wrong places instead.
+       let _ = (if (str_len name == 8 && str_eq name "basename") || (str_len name == 7 && str_eq name "dirname")
+                   || (str_len name == 7 && str_eq name "extname") then
+                  (match args with
+                   | Cons (VStr eh9, _) ->
+                     (let e9 = enc_canon_name (senc_get eh9) in
+                      if enc_ascii_compat e9 then ()
+                      else (let _ = raise_exc world "Encoding::CompatibilityError"
+                                      ("path name must be ASCII-compatible (" ++ e9 ++ "): " ++ inspect (VStr eh9)) in ()))
+                   | _ -> ())
+                else ()) in
+       if (str_len name == 4 && str_eq name "read") || (str_len name == 7 && str_eq name "binread") then
          // mere str is byte-safe (length header), so binary content with NULs
          // round-trips. binread tags the result ASCII-8BIT so slicing and
          // indexing are byte-based.
@@ -11972,9 +11992,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // native questions rather than a third shell.
        else if (str_len name == 5 && str_eq name "file?") then
          (match args with
+          // ⚠ ...and "not a directory" is not "regular": /dev/null exists, is
+          //   no directory, and is a character device, so ruby says false.
+          //   The shell is asked only once both native answers say "maybe",
+          //   which keeps mkdir_p's walk over directories off it.
           | Cons (VStr ph, _) ->
             (let p9 = sget ph in
-             VBool (file_exists p9 && (if file_exists (p9 ++ "/.") then false else true)))
+             VBool (file_exists p9 && (if file_exists (p9 ++ "/.") then false else true)
+                    && run ("test -f " ++ shq p9 ++ " 2> /dev/null") == 0))
           | _ -> VBool false)
        // File.fnmatch?(pattern, path): the same matcher Dir.glob uses.
        // ⚠ BRACES ARE NOT A fnmatch PATTERN unless FNM_EXTGLOB is passed.
@@ -12081,8 +12106,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with
           // ⚠ ...and the EMPTY path is not a directory, though "/." is: the
           //   trick appends, so "" would ask about the root.
-          | Cons (VStr ph, _) -> (let p9 = sget ph in
-                                  VBool (str_len p9 > 0 && file_exists (p9 ++ "/.")))
+          //   (dir_there is the whole question, unsearchable directories too)
+          | Cons (VStr ph, _) -> VBool (dir_there (sget ph))
           | _ -> VBool false)
        // File.symlink(old, new): symlink(2), which answers 0 or -1.
        // ⚠ there is no errno reader here, so the failure is classified by
@@ -12092,15 +12117,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   therefore named wrongly -- said here rather than left to be
        //   discovered.
        else if (str_len name == 7 && str_eq name "symlink") then
+         // ⚠ EXACTLY two Strings: a third argument was ignored and anything
+         //   else answered 0 as if a link had been made.
          (match args with
-          | Cons (VStr a9, Cons (VStr b9, _)) ->
+          | Cons (VStr a9, Cons (VStr b9, Nil)) ->
             (let src = sget a9 in let dst = sget b9 in
              if symlink src dst == 0 then VInt 0
-             else if file_exists dst then
+             else if file_exists dst || run ("test -L " ++ shq dst ++ " 2> /dev/null") == 0 then
                raise_exc world "Errno::EEXIST" ("File exists @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")")
              else
                raise_exc world "Errno::ENOENT" ("No such file or directory @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")"))
-          | _ -> VInt 0)
+          | _ -> path_arg_err world args 2 2)
        // The rest of the write side, each one libc directly (see the extern
        // block in m_state.mere for why THESE and not chmod/umask/mkfifo).
        // ⚠ Every one reports failure the way `symlink` above does: the errno
@@ -12116,7 +12143,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | _ -> path_arg_err world args 2 2)
        else if (str_len name == 4 && str_eq name "link") then
          (match args with
-          | Cons (VStr a9, Cons (VStr b9, _)) ->
+          | Cons (VStr a9, Cons (VStr b9, Nil)) ->
             (let src = sget a9 in let dst = sget b9 in
              if link src dst == 0 then VInt 0
              else if file_exists dst then
@@ -12150,8 +12177,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let flag = (if (str_len name == 9 && str_eq name "writable?") then "-w" else if (str_len name == 9 && str_eq name "readable?") then "-r" else "-x") in
              VBool (run ("test " ++ flag ++ " " ++ shq (sget ph) ++ " 2> /dev/null") == 0))
           | _ -> VBool false)
+       // ⚠ A MISSING path is ENOENT for File.size (size? says nil, zero? says
+       //   false); this answered 0, the size of an empty file that is there.
        else if (str_len name == 4 && str_eq name "size") then
-         (match args with Cons (VStr ph, _) -> VInt (str_len (if file_exists (sget ph) then read_file (sget ph) else "")) | _ -> VInt 0)
+         (match args with
+          | Cons (VStr ph, _) ->
+            (let n9 = fsize_of (sget ph) in
+             if n9 < 0 then raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_file_s_size - " ++ sget ph)
+             else VInt n9)
+          | _ -> VInt 0)
        // ⚠ only the predicates this interpreter can actually ANSWER. `zero?` /
        // `empty?` are "exists and is empty", `identical?` is "the same path
        // after expansion", and the `_real?` trio is the same question as the
@@ -12163,8 +12197,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // one. See KNOWN_GAPS.
        else if (str_len name == 5 && str_eq name "zero?") || (str_len name == 6 && str_eq name "empty?") then
          (match args with
-          | Cons (VStr ph, _) ->
-            VBool (file_exists (sget ph) && str_len (read_file (sget ph)) == 0)
+          | Cons (VStr ph, _) -> VBool (fsize_of (sget ph) == 0)
           | _ -> VBool false)
        // ...asked of the shell, the way readable?/writable?/executable? are:
        // `test a -ef b` is "the same file", which is what #identical? means.
@@ -12184,7 +12217,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 5 && str_eq name "size?") then
          (match args with
           | Cons (VStr ph, _) ->
-            (let n = str_len (if file_exists (sget ph) then read_file (sget ph) else "") in
+            (let n = fsize_of (sget ph) in
              if n > 0 then VInt n else VNil)
           | _ -> VNil)
        // File.readlines(path, sep = $/, chomp: false): the separator and chomp
@@ -31027,8 +31060,15 @@ and io_new_path = fn env -> fn world -> fn (rest: Val list) ->
   | Cons (VHsh hid9, Nil) -> hash_get (hderef hid9) (VSym "path")
   | Cons (_, t9) -> io_new_path env world t9
 
+// ⚠ "<p>/." exists only for a directory the process may SEARCH, so a
+//   directory chmod'ed 0644 (or 0000) read as not-a-directory: mspec's rm_r
+//   then handed it to File.delete / Dir.rmdir as a file and the cleanup died
+//   with ENOTDIR (core/file/world_readable, core/dir/glob). The fast answer
+//   stays native; only a path that exists and fails it asks the shell.
 and dir_there = fn (p9: str) ->
-  str_len p9 > 0 && file_exists (p9 ++ "/.")
+  str_len p9 > 0
+  && (file_exists (p9 ++ "/.")
+      || (file_exists p9 && run ("test -d " ++ shq p9 ++ " 2> /dev/null") == 0))
 // ...and how opening one fails. ruby names dir_initialize in both messages and
 // tells the two causes apart: a path that is there but is not a directory is
 // ENOTDIR, a path that is not there at all is ENOENT.
@@ -31076,13 +31116,121 @@ and delete_paths = fn world -> fn (paths: Val list) -> fn (acc: int) ->
    | Nil -> VInt acc
    | Cons (VStr h9, rest9) ->
      (let ph = sget h9 in
-      if file_exists ph then
+      // ⚠ unlink(2) removes a LINK, and file_exists asks about its target:
+      //   a dangling symlink "was not there" and could not be deleted, so
+      //   mspec's rm_r died in the after-hook of every spec that leaves one
+      //   (core/file/realpath, readlink, lutime ...). Asked only on a miss.
+      if file_exists ph || run ("test -L " ++ shq ph ++ " 2> /dev/null") == 0 then
         (let _ = run ("rm -f " ++ shq ph) in delete_paths world rest9 (acc + 1))
       else raise_exc world "Errno::ENOENT" ("No such file or directory @ apply2files - " ++ ph))
    // ⚠ ...and a non-String was SILENTLY SKIPPED here, so `File.delete(1)`
    //   answered 0 and removed nothing where ruby raises.
    | Cons (v9, _) -> raise_exc world "TypeError"
                        ("no implicit conversion of " ++ class_name v9 ++ " into String"))
+
+// The file PREDICATES (exist?, directory?, size?, identical? ...) and what
+// they accept, which is ruby's rb_stat: an IO is asked about its descriptor,
+// anything with #to_io becomes that IO first, and everything else must be a
+// path -- #to_path / #to_str have already run (path_args), so a value that is
+// still not a String here is a TypeError.
+// ⚠ Every one of these answered FALSE for a wrong argument and for a wrong
+//   NUMBER of them: `File.exist?(nil)`, `File.exist?()` and
+//   `File.file?(a, b)` were all a quiet false where ruby raises, so a program
+//   that handed a predicate the wrong thing read "no such file" instead of its
+//   own mistake. The shared ruby/spec examples read exactly those three rows,
+//   in 30 files across core/file, core/filetest and core/file/stat.
+// An IO with no path (STDIN, a pipe end) is named by /dev/fd/N, which is the
+// same descriptor to every native question asked below -- the one place the
+// platform lets a path stand for an fd.
+// How many bytes a path holds, -1 when it is not there. Read, because there
+// is no stat extern; a DEVICE is not read (a tty would block, /dev/fd/0 would
+// eat stdin) and answers 0, which is what ruby's st_size says for /dev/null.
+// A directory is not read either: its size is the filesystem's business, and
+// read_file of one answers nothing useful.
+and fsize_of = fn (p9: str) ->
+  if (if file_exists p9 then false else true) then 0 - 1
+  else if file_exists (p9 ++ "/.") then
+    (match run_backtick ("ls -ldn " ++ shq p9 ++ " 2> /dev/null | awk '\{printf \"%s\", $5}'") with
+     | VStr h9 -> (let t9 = sget h9 in if str_len t9 > 0 && is_digit (char_at t9 0) then int_of_str t9 else 0)
+     | _ -> 0)
+  else if str_len p9 >= 5 && str_eq (substring p9 0 5) "/dev/"
+          && run ("test -f " ++ shq p9 ++ " 2> /dev/null") != 0 then 0
+  else str_len (read_file p9)
+// expand_path's "~": HOME for "~" and "~/...", the user database for "~user"
+// (asked of the shell, as Dir.home(user) is -- `echo ~user` answers the text
+// unchanged for a user it does not know). A name with anything but the
+// portable user-name characters is not sent to a shell at all.
+and xp_tilde = fn world -> fn (p: str) ->
+  if str_len p > 0 && str_eq (char_at p 0) "~" then
+    (let sl9 = str_index_of p "/" in
+     let user9 = (if sl9 < 0 then substring p 1 (str_len p) else substring p 1 sl9) in
+     let rest9 = (if sl9 < 0 then "" else substring p sl9 (str_len p)) in
+     // HOME UNSET is not HOME empty: unset, ruby asks the user database
+     // for the login user; empty (or relative) is refused.
+     let unset9 = (if map_has env_ovr "HOME"
+                   then (match map_get env_ovr "HOME" with VStr _ -> false | _ -> true)
+                   else (if env_is_set "HOME" then false else true)) in
+     if str_eq user9 "" && unset9 then
+       (match run_backtick "eval echo ~$( (logname || id -un) 2> /dev/null)" with
+        | VStr g9 -> (let t9 = sget g9 in
+                      let t9 = (if str_len t9 > 0 && str_eq (char_at t9 (str_len t9 - 1)) "\n"
+                                then substring t9 0 (str_len t9 - 1) else t9) in
+                      if str_len t9 > 0 && str_eq (char_at t9 0) "/" then t9 ++ rest9
+                      else (let _ = raise_exc world "ArgumentError" "couldn't find login name -- expanding '~'" in p))
+        | _ -> p)
+     else if str_eq user9 "" then
+       (let h9 = rb_env_get "HOME" in
+        if str_len h9 > 0 && str_eq (char_at h9 0) "/" then h9 ++ rest9
+        else (let _ = raise_exc world "ArgumentError" "non-absolute home" in p))
+     else
+       (let ok9 = xp_user_ok user9 0 in
+        let got0 = (if ok9 then (match run_backtick ("echo ~" ++ user9) with VStr g -> sget g | _ -> "") else "") in
+        let got = (if str_len got0 > 0 && str_eq (char_at got0 (str_len got0 - 1)) "\n"
+                   then substring got0 0 (str_len got0 - 1) else got0) in
+        if str_len got > 0 && str_eq (char_at got 0) "/" then got ++ rest9
+        else (let _ = raise_exc world "ArgumentError" ("user " ++ user9 ++ " doesn't exist") in p)))
+  else p
+and xp_user_ok = fn (u: str) -> fn (i: int) ->
+  if i >= str_len u then true
+  else (let c9 = char_at u i in
+        (is_alnum_ascii c9 || str_eq c9 "_" || str_eq c9 "-" || str_eq c9 ".") && xp_user_ok u (i + 1))
+// path_norm, except that a leading run of two or more slashes is kept
+and xp_norm = fn (p: str) ->
+  let n9 = xp_lead p 0 in
+  if n9 >= 2 then substring p 0 (n9 - 1) ++ path_norm p else path_norm p
+and xp_lead = fn (p: str) -> fn (i: int) ->
+  if i < str_len p && str_eq (char_at p i) "/" then xp_lead p (i + 1) else i
+and fpred_arity = fn (name: str) ->
+  if (str_len name == 10 && str_eq name "identical?") then 2 else 1
+and fpred_names = fn (name: str) ->
+  map_has (name_set "fpred") name
+and fpred_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
+  let want9 = fpred_arity name in
+  let n9 = vlen args in
+  if n9 != want9 then
+    (let _ = prim_raise "ArgumentError"
+               ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected " ++ str_of_int want9 ++ ")") in args)
+  else fpred_each nb world args
+and fpred_each = fn nb -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> Nil
+  | Cons (a9, t9) -> Cons (fpred_one nb world a9 0, fpred_each nb world t9)
+and fpred_one = fn nb -> fn world -> fn (v: Val) -> fn (depth: int) ->
+  let (_, _, _, iv9) = world in
+  match v with
+  | VStr _ -> v
+  | VObj o9 when map_has iv9 (str_of_int o9 ++ "@__f_path") -> to_path_str nb world v
+  | VObj o9 when map_has iv9 (str_of_int o9 ++ "@__io_fd") ->
+    (match map_get iv9 (str_of_int o9 ++ "@__io_fd") with
+     | VInt fd9 -> mkstr ("/dev/fd/" ++ str_of_int fd9)
+     | _ -> v)
+  | VObj _ when depth == 0 && has_meth world (dispatch_cls_of world v) "to_io" ->
+    (let io9 = invoke world nb v (dispatch_cls_of world v) "to_io" Nil in
+     match fpred_one nb world io9 1 with
+     | VStr h9 -> VStr h9
+     | _ -> raise_exc world "TypeError"
+              ("can't convert " ++ class_name v ++ " to IO (" ++ class_name v ++ "#to_io gives " ++ class_name io9 ++ ")"))
+  | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String")
 
 and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
   // ⚠ Dir.glob and Dir[] take MANY patterns, and an Array of them. Converting
@@ -31105,6 +31253,9 @@ and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
    | Cons (a, rest) ->
      Cons (to_path_str nb world a,
            (if (str_len name == 6 && str_eq name "rename") || (str_len name == 7 && str_eq name "symlink") || (str_len name == 4 && str_eq name "link")
+               || (str_len name == 10 && str_eq name "identical?")
+               || (str_len name == 11 && str_eq name "expand_path") || (str_len name == 13 && str_eq name "absolute_path")
+               || (str_len name == 7 && str_eq name "fnmatch") || (str_len name == 8 && str_eq name "fnmatch?")
             then (match rest with Cons (b, r2) -> Cons (to_path_str nb world b, r2) | Nil -> Nil)
             else rest)))
 
