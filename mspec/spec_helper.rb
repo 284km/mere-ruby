@@ -788,8 +788,16 @@ class OutputToFDMatcher
   end
 end
 def output_to_fd(what, where = STDOUT); OutputToFDMatcher.new(what, where); end
+# mspec's own (helpers/warning.rb): the block runs with $VERBOSE = nil. A bare
+# yield let every warning through, and since run_spec.sh runs the reference
+# under -W0 and mere-ruby without it, only one side printed them -- the
+# "already initialized constant STDOUT" in core/io/shared/new.rb was that.
 def suppress_warning
+  verbose = $VERBOSE
+  $VERBOSE = nil
   yield
+ensure
+  $VERBOSE = verbose
 end
 
 # Run a Ruby snippet and return its captured stdout. Real mspec spawns a
@@ -894,6 +902,13 @@ end
 # needs this; without it every such example died with NoMethodError on both
 # sides and the file read DIFF on the difference between two failures.
 RUBY_EXE = ENV["MSPEC_RUBY_EXE"] || "ruby" unless defined?(RUBY_EXE)
+# ...and what MSpecScript#setup_env puts in the environment for the programs a
+# spec starts (utils/script.rb): the runner's flag, the interpreter, its flags.
+# core/process/fixtures/kill.rb reads ENV["RUBY_FLAGS"].split, and without it
+# the four process-group examples were a NoMethodError on both sides.
+ENV["MSPEC_RUNNER"] = "1"
+ENV["RUBY_EXE"] ||= RUBY_EXE
+ENV["RUBY_FLAGS"] ||= ""
 def ruby_cmd(code, opts = {})
   body = code
   body = "-e #{code.inspect}" if code and !File.exist?(code)
