@@ -14244,6 +14244,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else raise_exc world "Zlib::GzipFile::Error" "not in gzip format")
        else
          mkstr (bytevec_to_str (inflate (bytevec_pad v) (zlib_body_start v))))
+    // the stream half of Zlib::Inflate: one zlib stream decoded as far as
+    // the input goes -- [status, output, bytes consumed, dictionary id], the
+    // status as zi_zlib numbers it (the Ruby class turns it into its errors)
+    else if str_eq c "Zlib" && (str_len name == 11 && str_eq name "__inflate_x") then
+      (let sv9 = (match args with Cons (VStr h, _) -> sget h | _ -> "") in
+       let dv9 = (match args with Cons (_, Cons (VStr h, _)) -> str_to_bytevec (sget h) | _ -> vec_new ()) in
+       let (st9, out9, used9, did9) = zi_zlib (str_to_bytevec sv9) dv9 in
+       let o9 = mkstr (bytevec_to_str out9) in
+       let _ = (match o9 with VStr h9 -> senc_set h9 "ASCII-8BIT" | _ -> ()) in
+       arr_new (Cons (VInt st9, Cons (o9, Cons (VInt used9, Cons (VInt did9, Nil))))))
     // The socket capability: the raw fd operations the `socket` library (Ruby
     // source, see stdlib_src) builds TCPSocket / TCPServer on. Only names
     // starting with __ are answered, so a program's own `class Socket` is not
@@ -15417,6 +15427,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // the universal names, same reason as the ThreadGroup arm above.
        else if is_prim_method name then dispatch_prim env world blk recv name args false
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of Mutex"))
+    // a File that was ALLOCATED and never opened (File.allocate, or YAML's
+    // !ruby/object:File) has no stream behind it: its readers and writers are
+    // ruby's "uninitialized stream", not a method this arm lacks
+    else if str_eq cls "File" && (if map_has ivars (str_of_int id ++ "@__f_path") then false else true)
+            && (map_has io_reads name || map_has io_writes name) then
+      raise_exc world "IOError" "uninitialized stream"
     // File handles from File.open/File.new: buffered writes, read-through
     // reads, #gets tracked by @__f_pos.
     else if str_eq cls "File" && map_has ivars (str_of_int id ++ "@__f_path") then
@@ -21616,11 +21632,18 @@ and hash_find_key_w = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
 // does this container hold an object whose class defines #== ? Only such a
 // member can disagree with the structural comparison, and asking one that does
 // NOT define it is a NoMethodError rather than an answer.
-and arr_has_obj = fn world -> fn (xs: Val list) ->
+and arr_has_obj = fn world -> fn (xs: Val list) -> arr_has_obj_d world xs 8
+// ⚠ ...and inside a nested container too, as cmp_member_w compares: a Hash
+//   whose values are Arrays of Dates (YAML's complex-key example) answered
+//   the structural "unequal" because only the top level was looked at. The
+//   depth bound is what keeps a self-containing array finite.
+and arr_has_obj_d = fn world -> fn (xs: Val list) -> fn (d: int) ->
   match xs with
   | Nil -> false
-  | Cons (VObj o9, t) -> (if obj_answers_eq world (VObj o9) then true else arr_has_obj world t)
-  | Cons (_, t) -> arr_has_obj world t
+  | Cons (VObj o9, t) -> (if obj_answers_eq world (VObj o9) then true else arr_has_obj_d world t d)
+  | Cons (VArr a9, t) -> (if d > 0 && arr_has_obj_d world (deref a9) (d - 1) then true else arr_has_obj_d world t d)
+  | Cons (VHsh h9, t) -> (if d > 0 && arr_has_obj_d world (hderef h9) (d - 1) then true else arr_has_obj_d world t d)
+  | Cons (_, t) -> arr_has_obj_d world t d
 
 // can the dispatcher answer #== for this object? A user method, or a builtin
 // arm (a Time compares by its instant, a Method by its definition). Asking one
@@ -30530,6 +30553,181 @@ and time_parse_off1 = fn world -> fn (v: Val) ->
 // The part of a Float or Rational below 1, in units of 1/scale, truncated
 // (a Rational exactly; `9999r/10000` usec is 999 ns, not 1000). An Integer
 // usec is whole units, which a caller handles before asking.
+// ---- inflate for a STREAM: where the data ended, and whether it did -----
+// mgz's inflate answers the output and nothing else, and reads past the end
+// of what it is given (its caller pads with zeros), so a stream object could
+// not tell "incomplete, wait for more" from "complete, and here is what
+// follows it", which is the whole of Zlib::Inflate's contract: #finish
+// refuses an incomplete stream with BufError, and what arrives after the end
+// passes through unchanged. This is the same decoder (mgz's Huffman tables
+// and length/distance bases) over a bit reader that STOPS at the end of the
+// input and says so, with the zlib header and trailer read here: a preset
+// dictionary (FDICT) is asked for and then seeds the window, and the Adler-32
+// is checked.
+//
+// st: [byte position, bit buffer, bits left in it, ran out (1)]
+and zi_bit = fn st -> fn data -> fn (n: int) ->
+  let _ = (if (vec_get st 2 : int) == 0 then
+             (let p = (vec_get st 0 : int) in
+              if p >= n then (let _ = vec_set st 3 1 in let _ = vec_set st 1 0 in vec_set st 2 8)
+              else (let _ = vec_set st 1 (vec_get data p) in
+                    let _ = vec_set st 0 (p + 1) in
+                    vec_set st 2 8))
+           else ()) in
+  let buf = (vec_get st 1 : int) in
+  let _ = vec_set st 1 (bit_shr buf 1) in
+  let _ = vec_set st 2 ((vec_get st 2 : int) - 1) in
+  bit_and buf 1
+and zi_bits = fn st -> fn data -> fn (n: int) -> fn (k: int) ->
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    (if i == k then acc else go (i + 1) (bit_or acc (bit_shl (zi_bit st data n) i))) in
+  go 0 0
+and zi_decode = fn st -> fn data -> fn (n: int) -> fn count -> fn syms ->
+  let rec go = fn (len: int) -> fn (code0: int) -> fn (first: int) -> fn (index: int) ->
+    (if len == 16 || (vec_get st 3 : int) == 1 then 0 - 1
+     else
+       (let code = bit_or code0 (zi_bit st data n) in
+        let c = (vec_get count len : int) in
+        if code < first + c then (vec_get syms (index + (code - first)) : int)
+        else go (len + 1) (bit_shl code 1) (bit_shl (first + c) 1) (index + c))) in
+  go 1 0 0 0
+// the codes of one Huffman block; false when the input ran out or a code was
+// bad (st[3] says which)
+and zi_codes = fn st -> fn data -> fn (n: int) -> fn out -> fn lc -> fn ls -> fn dc -> fn ds ->
+  let rec loop = fn (u: unit) ->
+    (let sym = zi_decode st data n lc ls in
+     if (vec_get st 3 : int) == 1 || sym < 0 then false
+     else if sym < 256 then (let _ = vec_push out sym in loop ())
+     else if sym == 256 then true
+     else if sym > 285 then false
+     else
+       (let li = sym - 257 in
+        let len = (vec_get len_base li : int) + zi_bits st data n (vec_get len_extra li) in
+        let dsym = zi_decode st data n dc ds in
+        if dsym < 0 || dsym > 29 then false
+        else
+          (let dist = (vec_get dist_base dsym : int) + zi_bits st data n (vec_get dist_extra dsym) in
+           let from = vec_len out - dist in
+           if from < 0 || (vec_get st 3 : int) == 1 then false
+           else
+             (let rec copy = fn (i: int) ->
+                (if i == len then () else (let _ = vec_push out (vec_get out (from + i)) in copy (i + 1))) in
+              let _ = copy 0 in
+              loop ())))) in
+  loop ()
+and zi_dynamic = fn st -> fn data -> fn (n: int) ->
+  let hlit = zi_bits st data n 5 + 257 in
+  let hdist = zi_bits st data n 5 + 1 in
+  let hclen = zi_bits st data n 4 + 4 in
+  let cl = vec_new () in
+  let rec z19 = fn (i: int) -> (if i == 19 then () else (let _ = vec_push cl 0 in z19 (i + 1))) in
+  let _ = z19 0 in
+  let rec rd = fn (i: int) ->
+    (if i == hclen then () else (let _ = vec_set cl (vec_get clen_order i) (zi_bits st data n 3) in rd (i + 1))) in
+  let _ = rd 0 in
+  let (clc, cls) = huff_build cl in
+  let lengths = vec_new () in
+  let total = hlit + hdist in
+  let rec rep = fn (k: int) -> fn (v: int) ->
+    (if k <= 0 || vec_len lengths >= total then () else (let _ = vec_push lengths v in rep (k - 1) v)) in
+  let rec fill = fn (u: unit) ->
+    (if vec_len lengths >= total || (vec_get st 3 : int) == 1 then ()
+     else
+       (let sym = zi_decode st data n clc cls in
+        if sym < 0 then (let _ = vec_set st 3 2 in ())
+        else if sym < 16 then (let _ = vec_push lengths sym in fill ())
+        else if sym == 16 then
+          (if vec_len lengths == 0 then (let _ = vec_set st 3 2 in ())
+           else (let prev = (vec_get lengths (vec_len lengths - 1) : int) in
+                 let _ = rep (3 + zi_bits st data n 2) prev in fill ()))
+        else if sym == 17 then (let _ = rep (3 + zi_bits st data n 3) 0 in fill ())
+        else (let _ = rep (11 + zi_bits st data n 7) 0 in fill ()))) in
+  let _ = fill () in
+  let llen = vec_new () in
+  let dlen = vec_new () in
+  let rec split = fn (i: int) ->
+    (if i >= vec_len lengths then ()
+     else (let _ = (if i < hlit then vec_push llen (vec_get lengths i) else vec_push dlen (vec_get lengths i)) in
+           split (i + 1))) in
+  let _ = split 0 in
+  (llen, dlen)
+// the deflate blocks from st's position: 0 = done, 1 = ran out, 2 = bad data
+and zi_blocks = fn st -> fn data -> fn (n: int) -> fn out ->
+  let final = zi_bit st data n in
+  let btype = zi_bits st data n 2 in
+  if (vec_get st 3 : int) == 1 then 1
+  else
+    (let ok =
+       (if btype == 0 then
+          (let _ = vec_set st 1 0 in
+           let _ = vec_set st 2 0 in
+           let p = (vec_get st 0 : int) in
+           if p + 4 > n then (let _ = vec_set st 3 1 in false)
+           else
+             (let len = (vec_get data p : int) + bit_shl (vec_get data (p + 1)) 8 in
+              let nlen = (vec_get data (p + 2) : int) + bit_shl (vec_get data (p + 3)) 8 in
+              if bit_xor len nlen != 0xFFFF then (let _ = vec_set st 3 2 in false)
+              else if p + 4 + len > n then (let _ = vec_set st 3 1 in false)
+              else
+                (let rec copy = fn (i: int) ->
+                   (if i == len then () else (let _ = vec_push out (vec_get data (p + 4 + i)) in copy (i + 1))) in
+                 let _ = copy 0 in
+                 let _ = vec_set st 0 (p + 4 + len) in
+                 true)))
+        else if btype == 1 then
+          (let (lc, ls) = huff_build (fixed_lit_lengths ()) in
+           let (dc, ds) = huff_build (fixed_dist_lengths ()) in
+           zi_codes st data n out lc ls dc ds)
+        else if btype == 2 then
+          (let (llen, dlen) = zi_dynamic st data n in
+           if (vec_get st 3 : int) != 0 then false
+           else
+             (let (lc, ls) = huff_build llen in
+              let (dc, ds) = huff_build dlen in
+              zi_codes st data n out lc ls dc ds))
+        else (let _ = vec_set st 3 2 in false)) in
+     if ok then (if final == 1 then 0 else zi_blocks st data n out)
+     else (if (vec_get st 3 : int) == 1 then 1 else 2))
+// a whole zlib stream: (status, output, bytes consumed, dictionary id)
+// status 0 done, 1 needs more input, 2 bad data, 3 needs the dictionary,
+// 4 bad check value
+and zi_zlib = fn data -> fn dict ->
+  let n = vec_len data in
+  if n < 2 then (1, vec_new (), 0, 0)
+  else
+    (let cmf = (vec_get data 0 : int) in
+     let flg = (vec_get data 1 : int) in
+     if bit_and cmf 15 != 8 || floor_mod (cmf * 256 + flg) 31 != 0 then (2, vec_new (), 0, 0)
+     else
+       (let hasdict = bit_and flg 32 != 0 in
+        if hasdict && n < 6 then (1, vec_new (), 0, 0)
+        else
+          (let did = (if hasdict then
+                        bit_or (bit_shl (vec_get data 2) 24) (bit_or (bit_shl (vec_get data 3) 16) (bit_or (bit_shl (vec_get data 4) 8) (vec_get data 5)))
+                      else 0) in
+           if hasdict && vec_len dict == 0 then (3, vec_new (), 0, did)
+           else
+             (let out = vec_new () in
+              let dn = (if hasdict then vec_len dict else 0) in
+              let rec seed = fn (i: int) -> (if i >= dn then () else (let _ = vec_push out (vec_get dict i) in seed (i + 1))) in
+              let _ = seed 0 in
+              let st = vec_new () in
+              let _ = vec_push st (if hasdict then 6 else 2) in
+              let _ = vec_push st 0 in
+              let _ = vec_push st 0 in
+              let _ = vec_push st 0 in
+              let r = zi_blocks st data n out in
+              let body = vec_new () in
+              let rec strip = fn (i: int) -> (if i >= vec_len out then () else (let _ = vec_push body (vec_get out i) in strip (i + 1))) in
+              let _ = strip dn in
+              if r != 0 then (r, body, 0, did)
+              else
+                (let p = (vec_get st 0 : int) in
+                 if p + 4 > n then (1, body, 0, did)
+                 else
+                   (let want = bit_or (bit_shl (vec_get data p) 24) (bit_or (bit_shl (vec_get data (p + 1)) 16) (bit_or (bit_shl (vec_get data (p + 2)) 8) (vec_get data (p + 3)))) in
+                    if want != adler32_vec body 1 then (4, body, p + 4, did)
+                    else (0, body, p + 4, did)))))))
 // a String in US-ASCII: what ruby's Time printers answer
 and mkstr_ascii = fn (s: str) ->
   let v = mkstr s in
