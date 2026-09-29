@@ -11825,6 +11825,49 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        | Cons (VArr fa9, Cons (VArr ia9, Cons (VInt ms9, _))) -> arr_new (io_poll_bits (deref fa9) (deref ia9) ms9)
        | _ -> arr_new Nil)
+    // The bare descriptor primitives the prelude's IO.sysopen, Dir#fileno and
+    // Dir.fchdir are written over: open(2) with an fopen-style mode (fd_open's
+    // contract), close(2), and "is this a descriptor at all" -- dup(2) fails
+    // only for a bad one, which is the one errno the callers need told apart.
+    else if str_eq c "IO" && (str_len name == 9 && str_eq name "__fd_open") then
+      (match args with
+       | Cons (VStr ph9, Cons (VStr mh9, Cons (VInt pm9, _))) -> VInt (fd_open (sget ph9) (sget mh9) pm9)
+       | _ -> VInt (0 - 1))
+    else if str_eq c "IO" && (str_len name == 10 && str_eq name "__fd_close") then
+      (match args with Cons (VInt fd9, _) -> VInt (fd_close fd9) | _ -> VInt (0 - 1))
+    else if str_eq c "IO" && (str_len name == 7 && str_eq name "__fd_ok") then
+      (match args with
+       | Cons (VInt fd9, _) ->
+         (let d9 = fd_dup fd9 in
+          if d9 < 0 then VBool false else (let _ = fd_close d9 in VBool true))
+       | _ -> VBool false)
+    // fchdir(2), and then the cwd it moved to: Dir.pwd here is the PWD this
+    // interpreter keeps (dir_chdir_to), and a descriptor carries no path, so
+    // the one who knows is the kernel -- asked through `pwd -P` in a child,
+    // which inherits the new cwd.
+    // ...unless the caller already KNOWS the name (Dir#chdir moving to its
+    // own path, or back to where it came from): then no child is asked, and
+    // none is started in a cwd that may have been removed under it.
+    else if str_eq c "Dir" && (str_len name == 8 && str_eq name "__fchdir") then
+      (match args with
+       | Cons (VInt fd9, Cons (VStr kh9, _)) ->
+         (let rc9 = fchdir fd9 in
+          let _ = (if rc9 == 0 then map_set env_cache "PWD" (mkstr (sget kh9)) else ()) in
+          VInt rc9)
+       | Cons (VInt fd9, _) ->
+         (let rc9 = fchdir fd9 in
+          let _ = (if rc9 == 0 then
+                     (match run_backtick "pwd -P 2> /dev/null" with
+                      | VStr h9 -> (let t9 = sget h9 in
+                                    let t9 = (if str_len t9 > 0 && str_eq (char_at t9 (str_len t9 - 1)) "\n"
+                                              then substring t9 0 (str_len t9 - 1) else t9) in
+                                    if str_len t9 > 0 then map_set env_cache "PWD" (mkstr t9) else ())
+                      | _ -> ())
+                   else ()) in
+          VInt rc9)
+       | _ -> VInt (0 - 1))
+    else if str_eq c "Dir" && (str_len name == 8 && str_eq name "__chroot") then
+      (match args with Cons (VStr ph9, _) -> VInt (chroot (sget ph9)) | _ -> VInt (0 - 1))
     // ...and a wait that cannot be answered now, on a thread that is not the
     // main one: the thread PARKS, as a bare sleep in its body would. ⚠ Not
     //   `sleep` from the prelude: in_thread() is the Thread.new BLOCK's flag
@@ -12429,7 +12472,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with
           | Cons (VStr ph, _) ->
             (let p9 = sget ph in
-             if (if file_exists p9 then false else true) then
+             // ⚠ "not there" and "cannot be looked at" are the same miss to
+             //   file_exists: under a parent chmod'ed 0000 the child is
+             //   invisible and was reported ENOENT where rmdir(2) says EACCES.
+             //   A parent that is a directory we may not search is the tell.
+             let par9 = dirname_of p9 in
+             if (if file_exists p9 then false else true) && dir_there par9
+                && (if file_exists (par9 ++ "/.") then false else true) then
+               raise_exc world "Errno::EACCES" ("Permission denied @ dir_s_rmdir - " ++ p9)
+             else if (if file_exists p9 then false else true) then
                raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_s_rmdir - " ++ p9)
              // ⚠ THREE causes, and only two were told apart: a path that is
              //   there but is NOT A DIRECTORY was reported as "directory not
@@ -12461,7 +12512,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                                 | _ -> "UTF-8")
                       | _ -> "UTF-8") in
           arr_new (val_strs_tag (val_uniq (glob_all ("p" ++ glob_fnm_flags args) pats base) Nil) penc))
-       else if (str_len name == 7 && str_eq name "entries") || (str_len name == 8 && str_eq name "children") then
+       // (the names ruby calls are the prelude's -- Dir.entries(path,
+       // encoding:) -- which tag what these two list)
+       else if (str_len name == 9 && str_eq name "__entries") || (str_len name == 10 && str_eq name "__children") then
          (match args with
           | Cons (VStr ph, _) ->
             (let p9 = sget ph in
@@ -12473,7 +12526,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              // directory listing names only what is inside.
              let kids = glob_drop_dot (glob_lines (glob_find p9 1) 0) in
              let names = val_sort (glob_strs kids) in
-             arr_new (if (str_len name == 7 && str_eq name "entries") then Cons (mkstr ".", Cons (mkstr "..", names)) else names))
+             arr_new (if (str_len name == 9 && str_eq name "__entries") then Cons (mkstr ".", Cons (mkstr "..", names)) else names))
           | _ -> arr_new Nil)
        // Dir.home / Dir.home(user). The no-argument form is ENV["HOME"] -- the
        // ruby-visible one, see rb_env_get -- and nil means the same thing.
@@ -12482,10 +12535,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   here: the shell expands a name it knows and hands back the text
        //   unchanged for one it does not, which is exactly the ArgumentError
        //   case.
+       // ⚠ ...and with HOME UNSET the no-argument form is the user database
+       //   too (ruby's getpwuid fallback): it answered "", which is not a
+       //   directory at all. Asked the same way, for the user id(1) names.
        else if (str_len name == 4 && str_eq name "home") then
-         (match args with
-          | Nil -> mkstr (rb_env_get "HOME")
-          | Cons (VNil, _) -> mkstr (rb_env_get "HOME")
+         (let own9 = fn (u: unit) ->
+            (let h9 = rb_env_get "HOME" in
+             if str_len h9 > 0 then mkstr h9
+             else
+               (let got0 = (match run_backtick "eval echo ~$(id -un)" with VStr g -> sget g | _ -> "") in
+                mkstr (if str_len got0 > 0 && str_eq (char_at got0 (str_len got0 - 1)) "\n"
+                       then substring got0 0 (str_len got0 - 1) else got0))) in
+          match args with
+          | Nil -> own9 ()
+          | Cons (VNil, _) -> own9 ()
           | Cons (VStr uh, _) ->
             (let u9 = sget uh in
              let got0 = (match run_backtick ("echo ~" ++ u9) with VStr g -> sget g | _ -> "") in
@@ -12499,14 +12562,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // prelude); with a block it yields the object and answers the block.
        else if (str_len name == 4 && str_eq name "open") || (str_len name == 3 && str_eq name "new") then
          (match args with
-          | Cons (VStr ph, _) ->
+          // ...and the rest of the arguments go to #initialize: `encoding:`
+          // was dropped here, so the Dir never heard it.
+          | Cons (VStr ph, rest9) ->
             (let p9 = sget ph in
              if dir_there p9
              // ⚠ #to_path answers a String with the ARGUMENT's encoding, and
              //   mkstr makes a UTF-8 one.
              then (let ph9 = mkstr p9 in
                    let _ = (match ph9 with VStr h9 -> senc_set h9 (senc_get ph) | _ -> ()) in
-                   new_obj world "Dir" (Cons (ph9, Nil)))
+                   new_obj world "Dir" (Cons (ph9, rest9)))
              else dir_open_fail world p9)
           | _ -> VNil)
        // Dir.mktmpdir / Dir.tmpdir: `tmpdir` is a stdlib file in CRuby; here
