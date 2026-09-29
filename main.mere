@@ -2038,13 +2038,34 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    | VObj id -> let (mm, sp, ocls, iv) = world in (if has_meth world (map_get ocls id) "`" then false else true)
                    | _ -> true)
                 else true) then
-      (match args with
-       | Cons (VStr cs, _) ->
-         // ...and $? is the command's status, as system already set it
-         (let out9 = run_backtick (sget cs) in
-          let _ = map_set globals "?" (make_proc_status world (if map_has bt_rc "v" then map_get bt_rc "v" else 0)) in
-          out9)
-       | _ -> mkstr "")
+      (let cmd9 = (match args with
+                   | Cons (VStr cs, _) -> sget cs
+                   | Cons (a9, _) -> fmt_str_arg env world a9
+                   | Nil -> raise_exc_str world "ArgumentError" "wrong number of arguments (given 0, expected 1)") in
+       // a command with no shell syntax is exec'd directly by ruby, so one
+       // that is not on the PATH is Errno::ENOENT (and $? says 127) -- not
+       // sh's "command not found" on stderr and an empty string
+       let _ = (if cmd_needs_shell cmd9 then ()
+                else
+                  (let w9 = (match str_split cmd9 " " with Cons (h9, _) -> h9 | Nil -> "") in
+                   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                   match invoke_val_c env world nb9 (VClass "Process") "__which" (Cons (mkstr w9, Cons (mkstr (rb_env_get "PATH"), Nil))) false with
+                   | VNil ->
+                     (let _ = map_set globals "?" (make_proc_status world 127) in
+                      let _ = raise_exc world "Errno::ENOENT" ("No such file or directory - " ++ w9) in ())
+                   | _ -> ())) in
+       // ...and $? is the command's status, as system already set it
+       let out9 = run_backtick cmd9 in
+       let _ = map_set globals "?" (make_proc_status world (if map_has bt_rc "v" then map_get bt_rc "v" else 0)) in
+       // the output is in the default external encoding (Encoding.default_external=
+       // changes what the next command's output is labelled)
+       let _ = (match (if map_has def_ext_enc "v" then map_get def_ext_enc "v" else VNil) with
+                | VObj eid9 ->
+                  (if map_has enc_name (str_of_int eid9) then
+                     (match out9 with VStr oh9 -> senc_set oh9 (map_get enc_name (str_of_int eid9)) | _ -> ())
+                   else ())
+                | _ -> ()) in
+       out9)
     // Kernel#system: the same command, reporting only whether it succeeded.
     // Ruby answers nil when the command could not be executed at all and false
     // when it ran and failed; `run` reports one status for both, so this says
@@ -2052,8 +2073,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // ...and every other form of it (options, env, argv words) is the
     // prelude's Process.__system, over spawn: `system(cmd, out: File::NULL)`
     // ran the command with its output on the terminal, the options dropped.
+    // A lone string with no shell syntax in it is not given to a shell either
+    // (ruby execs it directly): a command that is not there is nil with
+    // nothing printed, not sh's "command not found" and false.
     else if (str_len name == 6 && str_eq name "system") && (if kernel_overridden env world "system" then false else true)
-            && (match args with Cons (VStr _, Nil) -> false | Cons (_, _) -> true | Nil -> false) then
+            && (match args with
+                | Cons (VStr h9, Nil) -> (if cmd_needs_shell (sget h9) then false else true)
+                | Cons (_, _) -> true
+                | Nil -> false) then
       invoke_val_c env world noblk (VClass "Process") "__system" args false
     else if (str_len name == 6 && str_eq name "system") && (if kernel_overridden env world "system" then false else true)
             && (match args with Cons (VStr _, _) -> true | _ -> false) then
@@ -2062,7 +2089,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // ⚠ `$?` was never set, so `system("false"); $?.exitstatus` was a
          //   NoMethodError on nil -- the status of the command that just ran
          //   is the one thing a caller of system asks for next.
-         (let rc9 = run (sget cs) in
+         (let rc9 = run (env_sh_prefix () ++ sget cs) in
           let _ = map_set globals "?" (make_proc_status world rc9) in
           VBool (rc9 == 0))
        | _ -> VBool false)
@@ -11974,21 +12001,47 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | _ -> path_arg_err world args 1 3)
        // write / binwrite both write the string's bytes: a mere str carries its
        // length, so a zero byte in the content is not a terminator.
+       // File.write(path, string, [offset], mode:, perm:): an offset writes
+       // over the file from there without truncating it, mode "a" appends,
+       // and perm is the mode a file the call CREATES gets (less the umask,
+       // as open(2) applies it). All three were ignored: `mode: "a"`
+       // truncated, and `perm: 0o700` left a script unexecutable.
        else if (str_len name == 5 && str_eq name "write") || (str_len name == 8 && str_eq name "binwrite") then
          (match args with
           // ⚠ ...and a path whose DIRECTORY is not there is ruby's ENOENT: the
           //   primitive write failed below the level that has a ruby exception,
           //   and the program saw "(ruby exception raised)" as a StandardError.
           //   The same test file_open_obj makes, for the same reason.
-          | Cons (VStr ph, Cons (v, _)) ->
-            (let content = (match v with VStr ch -> sget ch | _ -> to_s v) in
-             if (if file_exists (dirname_of (sget ph)) then false else true) then
-               raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ sget ph)
-             else if dir_there (sget ph) then
-               raise_exc world "Errno::EISDIR" ("Is a directory @ rb_sysopen - " ++ sget ph)
+          | Cons (VStr ph, Cons (v, rest9)) ->
+            (let p9 = sget ph in
+             let content = (match v with VStr ch -> sget ch | _ -> to_s v) in
+             let opts9 = (match rev_app rest9 Nil with Cons (VHsh oh9, _) -> hderef oh9 | _ -> (Nil : Val list)) in
+             let off9 = (match rest9 with Cons (VInt o9, _) -> o9 | _ -> 0 - 1) in
+             let mode9 = (match hash_lookup opts9 (VSym "mode") with (true, VStr mh9) -> sget mh9 | _ -> "w") in
+             if (if file_exists (dirname_of p9) then false else true) then
+               raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_sysopen - " ++ p9)
+             else if dir_there p9 then
+               raise_exc world "Errno::EISDIR" ("Is a directory @ rb_sysopen - " ++ p9)
              else
-               (let _ = write_file (sget ph) content in
-                VInt (str_len content)))
+             let existed9 = file_exists p9 in
+             let old9 = (if existed9 && (off9 >= 0 || (str_len mode9 > 0 && str_eq (substring mode9 0 1) "a")) then read_file p9 else "") in
+             let body9 = (if off9 >= 0 then
+                            (let pad9 = (if str_len old9 < off9 then str_repeat (chr 0) (off9 - str_len old9) else "") in
+                             let head9 = substring (old9 ++ pad9) 0 off9 in
+                             let tail9 = (if str_len old9 > off9 + str_len content then substring old9 (off9 + str_len content) (str_len old9) else "") in
+                             head9 ++ content ++ tail9)
+                          else old9 ++ content) in
+             let _ = write_file p9 body9 in
+             let _ = (match hash_lookup opts9 (VSym "perm") with
+                      | (true, VInt pm9) ->
+                        (if existed9 then ()
+                         else
+                           (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                            let um9 = (match invoke_val_c env world nb9 (VClass "File") "umask" Nil false with VInt u9 -> u9 | _ -> 0) in
+                            let _ = invoke_val_c env world nb9 (VClass "File") "chmod"
+                                      (Cons (VInt (pm9 - (bit_and pm9 um9)), Cons (VStr ph, Nil))) false in ()))
+                      | _ -> ()) in
+             VInt (str_len content))
           | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
        // File.split(path) -> [dirname, basename]
        else if (str_len name == 5 && str_eq name "split") then
@@ -14639,7 +14692,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (if i9 >= map_len m9 then (Nil : Val list) else Cons (map_get m9 i9, vals9 m9 (i9 + 1))) in
        arr_new (Cons (arr_new (vals9 objs9 0), Cons (arr_new (vals9 clss9 0), Nil))))
     else if str_eq c "Process" && (str_len name == 4 && str_eq name "__sh") then
-      (match args with Cons (VStr h9, _) -> VInt (run (sget h9)) | _ -> VInt (0 - 1))
+      (match args with Cons (VStr h9, _) -> VInt (run (env_sh_prefix () ++ sget h9)) | _ -> VInt (0 - 1))
     else if str_eq c "Process" && (str_len name == 10 && str_eq name "__set_last") then
       (match args with Cons (v9, _) -> (let _ = map_set globals "?" v9 in v9) | _ -> VNil)
     // ⚠ Signalling THIS process raises, it does not deliver: ruby's default
@@ -14956,8 +15009,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (if (str_len name == 5 && str_eq name "raise") || (str_len name == 4 && str_eq name "fail") then
          kernel_raise_now world args
        // `Kernel.`(cmd)`: the command literal's method, called by name.
+       // (the literal's own arm does the work: #to_str, ENOENT, $?, encoding)
        else if (str_len name == 1 && str_eq name "`") then
-         (match args with Cons (VStr cs, _) -> run_backtick (sget cs) | _ -> mkstr "")
+         (let e2 = map_new () in
+          let _ = map_set e2 "__ka" (arr_new args) in
+          eval_e e2 world blk (ECall ("`", Cons (ESplat (EVar "__ka"), Nil))))
        else try_self_call_x env world recv name args true)
     // a class that does `extend Enumerable` and defines `self.each` gets the
     // Enumerable surface on the class object itself (Gem::Specification is
@@ -15960,6 +16016,32 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // eof? / readline(s) / each_line were all NoMethodError on $stdin,
        // and a program piping data in could only reach it through gets.
        if fd == 0 && stdin_read_name name then stdin_io_call env world blk recv name args
+       // #dup is a NEW descriptor (dup(2)) on a new IO -- it answered the
+       // receiver itself, so closing the "copy" closed the original -- and
+       // #reopen(io) is dup2(2): the SAME object, its descriptor now naming
+       // what the argument's does. mspec's output_to_fd is exactly this pair
+       // around STDOUT/STDERR; every write here goes through write(2) on the
+       // descriptor, so what the block writes lands in the file.
+       else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
+         (let nfd9 = fd_dup fd in
+          if nfd9 < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
+          else
+            (let oid9 = alloc_oid ocls in
+             let _ = map_set ocls oid9 "IO" in
+             let _ = map_set ivars (str_of_int oid9 ++ "@__io_fd") (VInt nfd9) in
+             VObj oid9))
+       else if (str_len name == 6 && str_eq name "reopen") && (match args with Cons (VObj _, _) -> true | _ -> false) then
+         (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          let tgt0 = (match args with Cons (t9, _) -> t9 | Nil -> VNil) in
+          let tgt9 = (if responds world tgt0 "to_io" then invoke_val_c env world nb9 tgt0 "to_io" Nil false else tgt0) in
+          let _ = (if responds world tgt9 "flush" then (let _ = invoke_val_c env world nb9 tgt9 "flush" Nil false in ()) else ()) in
+          let tfd9 = (match invoke_val_c env world nb9 tgt9 "fileno" Nil false with VInt n9 -> n9 | _ -> 0 - 1) in
+          if tfd9 < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
+          else if tfd9 == fd then recv
+          else if dup2 tfd9 fd < 0 then raise_exc world "Errno::EBADF" "Bad file descriptor"
+          else
+            (let _ = (if map_has ivars (str_of_int id ++ "@__io_closed") then map_delete ivars (str_of_int id ++ "@__io_closed") else ()) in
+             recv))
        else if fd > 2 && (str_len name == 5 && str_eq name "close") then
          (let _ = fd_close fd in
           let _ = map_set ivars (str_of_int id ++ "@__io_closed") (VBool true) in
@@ -16146,7 +16228,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 9 && str_eq name "object_id") || (str_len name == 6 && str_eq name "__id__") then VInt id
        else if (str_len name == 7 && str_eq name "frozen?") then VBool false
        else if (str_len name == 4 && str_eq name "hash") then VInt (val_hash recv)
-       else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then recv
        else if (str_len name == 17 && str_eq name "external_encoding") then
          (if map_has ivars (str_of_int id ++ "@__io_ext") then map_get ivars (str_of_int id ++ "@__io_ext")
           else if fd == 0 then
@@ -32772,6 +32853,21 @@ and scoped_read_missing = fn env -> fn world -> fn blk -> fn (c: str) -> fn (cn:
      || has_own_meth world c "const_missing"
   then invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym cn, Nil)) false
   else raise_uninit_const world c cn ("uninitialized constant " ++ cn)
+
+// Does a one-string command need `sh -c`? ruby's rule (and spawn's, in the
+// prelude): a shell metacharacter anywhere, or a first word that is a
+// reserved word or a special builtin.
+and cmd_needs_shell = fn (c: str) ->
+  let meta = "*?\{}[]<>()~&|\\$;'`\"\n#=%" in
+  let rec any = fn (i: int) ->
+    (if i >= str_len c then false
+     else if str_contains meta (char_at c i) then true
+     else any (i + 1)) in
+  let rec first_end = fn (i: int) -> (if i >= str_len c || str_eq (char_at c i) " " || str_eq (char_at c i) "\t" then i else first_end (i + 1)) in
+  let rec skip_ws = fn (i: int) -> (if i < str_len c && (str_eq (char_at c i) " " || str_eq (char_at c i) "\t") then skip_ws (i + 1) else i) in
+  let b9 = skip_ws 0 in
+  let w9 = substring c b9 (first_end b9) in
+  any 0 || str_contains " case do done elif else esac fi for if in then until while ! . : break continue eval exec exit export readonly return set shift times trap unset " (" " ++ w9 ++ " ")
 
 // A missing constant is Module#const_missing's NameError: #name is the
 // constant's own name (no namespace) and #receiver the module it was looked
