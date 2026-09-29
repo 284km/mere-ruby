@@ -12051,30 +12051,32 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   always, which is why the expansion sits in glob_expand and is
        //   reached from glob_paths without a flag -- the two callers want
        //   different defaults from the same matcher.
+       // (ruby's own matcher now -- see fnm_match -- and its argument rules:
+       // two or three arguments, a String pattern, a path, an Integer flag
+       // word by #to_int; a wrong one was a quiet false)
        else if (str_len name == 7 && str_eq name "fnmatch") || (str_len name == 8 && str_eq name "fnmatch?") then
-         (match args with
-          | Cons (VStr pp, Cons (VStr sp, _)) ->
-            VBool (glob_any (glob_fnm_flags args)
-                     (if fnm_extglob args then glob_expand (sget pp) else Cons (sget pp, Nil))
-                     (sget sp))
-          | _ -> VBool false)
-       // File.realpath / realdirpath: the absolute path, raising when it does
-       // not exist. mere-ruby has no lstat, so symlinks are NOT resolved —
-       // the result is expand_path's, which differs only under a symlink.
-       else if (str_len name == 8 && str_eq name "realpath") || (str_len name == 11 && str_eq name "realdirpath") then
-         (match args with
-          | Cons (VStr ph, rest) ->
-            (let p1 = sget ph in
-             let base0 = (match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") in
-             // ...and a RELATIVE base is expanded first: `File.realpath(p, ".")`
-             // answered a relative path, and realpath's answer is absolute.
-             let base = (if str_len base0 > 0 && str_eq (char_at base0 0) "/" then base0
-                         else env_get "PWD" ++ "/" ++ base0) in
-             let abs = (if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else base ++ "/" ++ p1) in
-             let full = path_norm abs in
-             if file_exists full then mkstr full
-             else raise_exc world "Errno::ENOENT" ("No such file or directory @ realpath_rec - " ++ full))
-          | _ -> mkstr "")
+         (let n9 = vlen args in
+          if n9 < 2 || n9 > 3 then
+            prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected 2..3)")
+          else
+            (let fl9 = (match args with
+                        | Cons (_, Cons (_, Cons (fv9, _))) ->
+                          (match coerce_int_args env world (Cons (fv9, Nil)) with
+                           | Cons (VInt k9, _) -> k9
+                           | _ -> (let _ = raise_exc world "TypeError"
+                                     ("no implicit conversion of " ++ conv_gives_name fv9 ++ " into Integer") in 0))
+                        | _ -> 0) in
+             match args with
+             | Cons (VStr pp, Cons (VStr sp, _)) ->
+               (let pats9 = (if fnm_extglob (Cons (VInt fl9, Nil)) then glob_expand (sget pp) else Cons (sget pp, Nil)) in
+                let rec any9 = fn (xs: str list) ->
+                  (match xs with Nil -> false | Cons (x9, t9) -> fnm_match fl9 x9 (sget sp) || any9 t9) in
+                VBool (any9 pats9))
+             | Cons (VStr _, Cons (o9, _)) -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name o9 ++ " into String")
+             | Cons (o9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name o9 ++ " into String")
+             | _ -> VBool false))
+       // (File.realpath / realdirpath resolve symlinks, and are the prelude's:
+       // see File.__realpath in m_driver.mere)
        // File.path(obj): the string form of a path — the object itself when it
        // is already a String, else its #to_path.
        else if (str_len name == 4 && str_eq name "path") then
@@ -12324,9 +12326,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 13 && str_eq name "absolute_path") then
          (match args with
           | Cons (VStr ph, rest) ->
+            // ⚠ the joined path is NORMALISED, as ruby's is: a base of "/"
+            //   gave "//~" for "~", and "a/../b" kept its "..". A leading
+            //   "//" is the one run of slashes ruby keeps, so it is kept.
             (let p1 = sget ph in
-             if str_len p1 > 0 && str_eq (char_at p1 0) "/" then mkstr p1
-             else mkstr ((match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") ++ "/" ++ p1))
+             let b9 = (match rest with Cons (VStr b, _) -> sget b | _ -> env_get "PWD") in
+             let b9 = (if str_len b9 > 0 && str_eq (char_at b9 0) "/" then b9 else env_get "PWD" ++ "/" ++ b9) in
+             let j9 = (if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else b9 ++ "/" ++ p1) in
+             let lead9 = (if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1 else b9) in
+             mkstr (if str_len lead9 > 2 && str_eq (substring lead9 0 2) "//" && (if str_eq (char_at lead9 2) "/" then false else true)
+                    then "/" ++ path_norm (substring j9 1 (str_len j9))
+                    else path_norm j9))
           | _ -> mkstr "")
        // ⚠ File.join FLATTENS ARRAYS and collapses the separators at every
        //   boundary. It did neither: an Array argument was stringified whole
@@ -12345,17 +12355,39 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // base when given (that is how a library says "next to this file",
          // File.expand_path("x", __dir__)), and against the CWD otherwise.
          // "~" is the home directory, and "." / ".." segments are resolved.
+         // ⚠ Four things ruby does that this did not: "~user" is the user
+         //   database (and an unknown user an ArgumentError, where this
+         //   answered a relative path under the cwd); a HOME that is not
+         //   absolute is refused rather than joined; a leading RUN of
+         //   slashes is kept as written ("////a" stays), since only POSIX's
+         //   "one slash" is certain to mean the root; and the answer carries
+         //   the argument's encoding, where mkstr stamped UTF-8 on it.
          (match args with
           | Cons (VStr ph, rest) ->
-            (let path = tilde_expand (sget ph) in
-             if str_len path > 0 && str_eq (char_at path 0) "/" then mkstr (path_norm path)
-             else
-               let base = (match rest with
-                           | Cons (VStr b, _) -> let b = tilde_expand (sget b) in
-                             (if str_len b > 0 && str_eq (char_at b 0) "/" then b
-                              else env_get "PWD" ++ "/" ++ b)
-                           | _ -> env_get "PWD") in
-               mkstr (path_norm (base ++ "/" ++ path)))
+            (let path = xp_tilde world (sget ph) in
+             let whole = (if str_len path > 0 && str_eq (char_at path 0) "/" then path
+                          else
+                            // the cwd is a filesystem-encoded string, and it
+                            // cannot be joined to anything if that encoding
+                            // is not ASCII-compatible
+                            (let dx9 = (match (if map_has def_ext_enc "v" then map_get def_ext_enc "v" else VNil) with
+                                        | VObj eo9 -> (if map_has enc_name (str_of_int eo9) then map_get enc_name (str_of_int eo9) else "UTF-8")
+                                        | _ -> "UTF-8") in
+                             let _ = (if enc_ascii_compat (enc_canon_name dx9) then ()
+                                      else (let _ = raise_exc world "Encoding::CompatibilityError"
+                                                      ("incompatible character encodings: " ++ enc_canon_name dx9 ++ " and "
+                                                       ++ enc_canon_name (senc_get ph)) in ())) in
+                             let base = (match rest with
+                                         | Cons (VStr b, _) -> let b = xp_tilde world (sget b) in
+                                           (if str_len b > 0 && str_eq (char_at b 0) "/" then b
+                                            else env_get "PWD" ++ "/" ++ b)
+                                         | _ -> env_get "PWD") in
+                             base ++ "/" ++ path)) in
+             // (the run of slashes kept is the one the PATH was written with;
+             // a base of "/" joined to "bin" is "/bin", not "//bin")
+             let r9 = mkstr (if str_len path > 0 && str_eq (char_at path 0) "/" then xp_norm whole else path_norm whole) in
+             let _ = (match r9 with VStr rh9 -> senc_set rh9 (senc_get ph) | _ -> ()) in
+             r9)
           | _ -> path_arg_err world args 1 2)
        // ⚠ `File.delete` takes ANY number of paths and answers how many it
        // removed. This took the first and answered 1 whatever it was handed,
@@ -30195,6 +30227,138 @@ and glob_class = fn (fl: str) -> fn (p: str) -> fn (i: int) -> fn (s: str) -> fn
     else
       let hit = glob_class_has p st e (char_at s j) in
       if (if neg then (if hit then false else true) else hit) then glob_go fl p (e + 1) s (j + 1) else false
+
+// --- File.fnmatch ------------------------------------------------------------
+// ⚠ THIS IS RUBY'S fnmatch, transcribed from dir.c (fnmatch / fnmatch_helper /
+//   bracket), and it is a different matcher from the one above. File.fnmatch
+//   used glob_match, which is Dir.glob's -- and the two disagree exactly where
+//   ruby/spec looks: without FNM_PATHNAME a "*" crosses "/" and "**" is only
+//   "*", so '**/*.rb' does NOT match 'main.rb' (glob_match's "**/ may be zero
+//   directories" said it did); with it, "**/" is the one recursive form and
+//   'nested/**' stops at the next "/"; FNM_NOESCAPE (1) and FNM_CASEFOLD (8)
+//   were not read at all; and a leading period is protected only at the
+//   start of the string (or of each component under FNM_PATHNAME).
+//   The flags are the bits: NOESCAPE 1, PATHNAME 2, DOTMATCH 4, CASEFOLD 8.
+//   Characters are stepped as UTF-8 sequences, so "?" is one character.
+and fnm_bit = fn (fl: int) -> fn (b: int) -> (fl / b) - (fl / (b * 2)) * 2 == 1
+and fnm_clen = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then 1
+  else (match utf8_cp_strict s i with (_, l, v) -> (if v && l > 0 then l else 1))
+and fnm_cp = fn (s: str) -> fn (i: int) ->
+  (match utf8_cp_strict s i with (c, _, v) -> (if v then c else ord (char_at s i)))
+// ASCII-only case folding, which is what rb_enc_toupper does for these
+and fnm_up = fn (c: int) -> if c >= 97 && c <= 122 then c - 32 else c
+and fnm_isend = fn (fl: int) -> fn (p: str) -> fn (i: int) ->
+  i >= str_len p || (fnm_bit fl 2 && str_eq (char_at p i) "/")
+and fnm_unesc = fn (fl: int) -> fn (p: str) -> fn (i: int) ->
+  if (if fnm_bit fl 1 then false else true) && i < str_len p && str_eq (char_at p i) "\\" then i + 1 else i
+and fnm_same = fn (a: str) -> fn (ai: int) -> fn (r: int) -> fn (b: str) -> fn (bi: int) ->
+  bi + r <= str_len b && ai + r <= str_len a && str_eq (substring a ai (ai + r)) (substring b bi (bi + r))
+// bracket(): the index just past the closing "]" when the class matches the
+// character at s[si], -1 when it does not (or the class never closes).
+and fnm_bracket = fn (fl: int) -> fn (p: str) -> fn (pi0: int) -> fn (s: str) -> fn (si: int) ->
+  if pi0 >= str_len p then 0 - 1
+  else
+    let neg = str_eq (char_at p pi0) "!" || str_eq (char_at p pi0) "^" in
+    fnm_br_go fl p (if neg then pi0 + 1 else pi0) s si false neg
+and fnm_br_go = fn (fl: int) -> fn (p: str) -> fn (pi: int) -> fn (s: str) -> fn (si: int) -> fn (ok: bool) -> fn (neg: bool) ->
+  if pi >= str_len p then 0 - 1
+  else if str_eq (char_at p pi) "]" then (if ok == neg then 0 - 1 else pi + 1)
+  else
+    let esc = (if fnm_bit fl 1 then false else true) in
+    let t1 = (if esc && str_eq (char_at p pi) "\\" then pi + 1 else pi) in
+    if t1 >= str_len p then 0 - 1
+    else
+      let r = fnm_clen p t1 in
+      let nx = t1 + r in
+      if nx >= str_len p then 0 - 1
+      else if str_eq (char_at p nx) "-" && nx + 1 < str_len p && (if str_eq (char_at p (nx + 1)) "]" then false else true) then
+        (let t2 = (if esc && str_eq (char_at p (nx + 1)) "\\" then nx + 2 else nx + 1) in
+         if t2 >= str_len p then 0 - 1
+         else
+           let r2 = fnm_clen p t2 in
+           let after = t2 + r2 in
+           if ok then fnm_br_go fl p after s si ok neg
+           else if fnm_same p t1 r s si || fnm_same p t2 r2 s si then fnm_br_go fl p after s si true neg
+           else
+             (let fold = fn (c: int) -> (if fnm_bit fl 8 then fnm_up c else c) in
+              let c1 = fold (fnm_cp s si) in
+              let lo = fold (fnm_cp p t1) in
+              let hi = fold (fnm_cp p t2) in
+              fnm_br_go fl p after s si (c1 >= lo && c1 <= hi) neg))
+      else if ok then fnm_br_go fl p nx s si ok neg
+      else if fnm_same p t1 r s si then fnm_br_go fl p nx s si true neg
+      else if fnm_bit fl 8 && fnm_up (fnm_cp s si) == fnm_up (fnm_cp p t1) then fnm_br_go fl p nx s si true neg
+      else fnm_br_go fl p nx s si false neg
+// fnmatch_helper: one component under FNM_PATHNAME (it stops at "/"), the
+// whole string otherwise. Answers (matched, p index, s index) -- the caller
+// under FNM_PATHNAME continues from where this stopped.
+and fnm_helper = fn (fl: int) -> fn (p: str) -> fn (pi: int) -> fn (s: str) -> fn (si: int) ->
+  let period = (if fnm_bit fl 4 then false else true) in
+  let pu = fnm_unesc fl p pi in
+  if period && si < str_len s && str_eq (char_at s si) "."
+     && (if pu < str_len p && str_eq (char_at p pu) "." then false else true)
+  then (false, pi, si)
+  else fnm_help_go fl p pi s si (0 - 1) (0 - 1)
+and fnm_help_go = fn (fl: int) -> fn (p: str) -> fn (pi: int) -> fn (s: str) -> fn (si: int) -> fn (ptmp: int) -> fn (stmp: int) ->
+  let failed = fn (u: unit) ->
+    (if ptmp >= 0 && stmp >= 0 then
+       (let st2 = stmp + fnm_clen s stmp in fnm_help_go fl p ptmp s st2 ptmp st2)
+     else (false, pi, si)) in
+  let c = (if pi < str_len p then char_at p pi else "") in
+  if str_eq c "*" then
+    (let rec skip = fn (k: int) -> (if k < str_len p && str_eq (char_at p k) "*" then skip (k + 1) else k) in
+     let p2 = skip pi in
+     let pu2 = fnm_unesc fl p p2 in
+     if fnm_isend fl p pu2 then (true, pu2, si)
+     else if fnm_isend fl s si then (false, p2, si)
+     else fnm_help_go fl p p2 s si p2 si)
+  else if str_eq c "?" then
+    (if fnm_isend fl s si then (false, pi, si)
+     else fnm_help_go fl p (pi + 1) s (si + fnm_clen s si) ptmp stmp)
+  else if str_eq c "[" then
+    (if fnm_isend fl s si then (false, pi, si)
+     else
+       (let t = fnm_bracket fl p (pi + 1) s si in
+        if t >= 0 then fnm_help_go fl p t s (si + fnm_clen s si) ptmp stmp
+        else failed ()))
+  else
+    (let pu = fnm_unesc fl p pi in
+     if fnm_isend fl s si then (fnm_isend fl p pu, pu, si)
+     else if fnm_isend fl p pu then failed ()
+     else
+       (let r = fnm_clen p pu in
+        if fnm_same p pu r s si then fnm_help_go fl p (pu + r) s (si + r) ptmp stmp
+        else if fnm_bit fl 8 && fnm_up (fnm_cp p pu) == fnm_up (fnm_cp s si) then
+          fnm_help_go fl p (pu + r) s (si + fnm_clen s si) ptmp stmp
+        else failed ()))
+// fnmatch(): under FNM_PATHNAME a component at a time, with "**/" the one
+// form that may stand for any number of whole components (never ones that
+// start with "." unless FNM_DOTMATCH).
+and fnm_match = fn (fl: int) -> fn (p: str) -> fn (s: str) ->
+  if fnm_bit fl 2 then fnm_path_go fl p 0 s 0 (0 - 1) (0 - 1)
+  else (match fnm_helper fl p 0 s 0 with (ok, _, _) -> ok)
+and fnm_path_go = fn (fl: int) -> fn (p: str) -> fn (pi: int) -> fn (s: str) -> fn (si: int) -> fn (ptmp0: int) -> fn (stmp0: int) ->
+  let rec skip = fn (k: int) ->
+    (if k + 2 < str_len p && str_eq (substring p k (k + 3)) "**/" then skip (k + 3) else k) in
+  let rec to_sep = fn (k: int) -> (if k < str_len s && (if str_eq (char_at s k) "/" then false else true) then to_sep (k + 1) else k) in
+  let starred = pi + 2 < str_len p && str_eq (substring p pi (pi + 3)) "**/" in
+  let pi = (if starred then skip pi else pi) in
+  let ptmp = (if starred then pi else ptmp0) in
+  let stmp = (if starred then si else stmp0) in
+  let retry = fn (u: unit) ->
+    (let period = (if fnm_bit fl 4 then false else true) in
+     if ptmp >= 0 && stmp >= 0 && (if period && stmp < str_len s && str_eq (char_at s stmp) "." then false else true) then
+       (let e = to_sep stmp in
+        if e < str_len s then fnm_path_go fl p ptmp s (e + 1) ptmp (e + 1) else false)
+     else false) in
+  match fnm_helper fl p pi s si with
+  | (true, p2, s2) ->
+    (let s3 = to_sep s2 in
+     if p2 < str_len p && s3 < str_len s then fnm_path_go fl p (p2 + 1) s (s3 + 1) ptmp stmp
+     else if p2 >= str_len p && s3 >= str_len s then true
+     else retry ())
+  | _ -> retry ()
 
 // the longest leading run of the pattern with no metacharacter, cut at the
 // last "/" — the directory find(1) can start from.
