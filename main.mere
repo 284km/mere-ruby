@@ -7111,8 +7111,35 @@ and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
         then prim_raise "RangeError" ((if f > 0.0 then "Infinity" else "-Infinity") ++ " out of range")
         else VInt (int_of_float f))
      | _ -> v) in
+  // an index is a C long: a Bignum converted fine and is simply too big
+  let long_ok = fn (v: Val) ->
+    (match v with
+     | VBig _ -> raise_exc world "RangeError" "bignum too big to convert into 'long'"
+     | _ -> v) in
+  // (index, length): each is an index conversion, and nothing else is one --
+  // `"hello"["", 0]` is a TypeError, not a substring search with a length
+  let toint = fn (v: Val) ->
+    (match v with
+     | VInt _ -> v
+     | VBig _ -> long_ok v
+     | VFlt f -> (if flt_is_nan f || flt_is_inf f then toi v else VInt (int_of_float f))
+     | VNil -> raise_exc world "TypeError" "no implicit conversion from nil to integer"
+     | VObj _ ->
+       (match toi v with
+        | VInt n -> VInt n
+        | VBig b -> long_ok (VBig b)
+        | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into Integer"))
+     | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into Integer")) in
   match args with
-  | Cons (VRange (lo, hi, ex), rest) -> Cons (VRange (toi lo, toi hi, ex), rest)
+  | Cons (VRange (lo, hi, ex), Nil) -> Cons (VRange (long_ok (toi lo), long_ok (toi hi), ex), Nil)
+  // a Range is the whole subscript: with a length beside it, it is not an index
+  | Cons (VRange (_, _, _), Cons (_, _)) -> (let _ = raise_exc world "TypeError" "no implicit conversion of Range into Integer" in args)
+  // (a Regexp and a capture: a name stays a name, an object is an index
+  // conversion -- #to_int, not #to_str, as match_backref_number asks)
+  | Cons (VRegex (b9, f9, e9), Cons (VObj o9, rest9)) -> Cons (VRegex (b9, f9, e9), Cons (toint (VObj o9), rest9))
+  | Cons (VRegex (_, _, _), _) -> args
+  | Cons (VBig _, _) -> (let _ = raise_exc world "RangeError" "bignum too big to convert into 'long'" in args)
+  | Cons (a9, Cons (b9, Nil)) -> Cons (toint a9, Cons (toint b9, Nil))
   // a Float index truncates ("hello".slice!(0.5) is the h) -- but an
   // INFINITE one is ruby's RangeError, not a huge integer.
   | Cons (VFlt f, rest) ->
@@ -9096,8 +9123,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               // becomes nil..nil, the whole string), a real Range converts
               // its non-Integer bounds with #to_int, everything else follows
               // the usual to_str-then-to_int per-argument rule.
+              // ⚠ ...and `[]` is the same method as slice (ruby aliases them),
+              //   so it takes the same protocol. It went through the
+              //   per-argument #to_int list further down, which leaves a Range
+              //   alone: `"symbol"[0..2.5]` was the whole string, a Range with
+              //   #to_int bounds was ignored, and a Range subclass refused.
               else if (match recv with VStr _ -> true | _ -> false)
-                      && ((str_len name == 5 && str_eq name "slice") || (str_len name == 6 && str_eq name "slice!") || (str_len name == 9 && str_eq name "byteslice"))
+                      && ((str_len name == 5 && str_eq name "slice") || (str_len name == 6 && str_eq name "slice!") || (str_len name == 9 && str_eq name "byteslice")
+                          || (str_len name == 2 && str_eq name "[]"))
               then coerce_slice_args env world args0
               // the rest of the String methods whose argument is a string, a
               // pattern, or a count: to_str first, to_int second, per argument.
@@ -17305,13 +17338,27 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              if st < 0 || st > n0 then VNil else arr_new (val_slice all st en))
           | Cons (VInt n, _) ->
             // through the exposed list, not the raw group numbers: a pattern
-            // with named groups has fewer entries than the engine numbered
+            // with named groups has fewer entries than the engine numbered.
+            // ⚠ A negative index counts back over the GROUPS only: it never
+            //   reaches the whole match (rb_reg_nth_match), so with one group
+            //   m[-2] is nil, not m[0]. The (start, length) and Range forms
+            //   above are the Array-like ones that can.
             (let i2 = (if n < 0 then n0 + n else n) in
-             if i2 < 0 || i2 >= n0 then VNil else val_nth all i2)
+             if i2 < 0 || i2 >= n0 || (n < 0 && i2 == 0) then VNil else val_nth all i2)
           // by NAME: `m[:scheme]` / `m["scheme"]`, resolved through the group
           // names recorded when the pattern was compiled.
           | Cons (VSym nm, _) -> md_by_name world ivars id nm
           | Cons (VStr nh, _) -> md_by_name world ivars id (sget nh)
+          // ⚠ anything else is an INDEX CONVERSION, as Array#[]'s is: a Float
+          //   truncates, an object answers #to_int, and what cannot is a
+          //   TypeError. `m[nil]` and `m[Object.new]` answered nil, which reads
+          //   as "no such group" rather than "that is not an index".
+          | Cons (VNil, Nil) -> raise_exc world "TypeError" "no implicit conversion from nil to integer"
+          | Cons (VFlt f9, Nil) -> invoke_val_c env world blk recv "[]" (Cons (VInt (int_of_float f9), Nil)) false
+          | Cons (other9, Nil) ->
+            (match coerce_int_args env world (Cons (other9, Nil)) with
+             | Cons (VInt k9, _) -> invoke_val_c env world blk recv "[]" (Cons (VInt k9, Nil)) false
+             | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into Integer"))
           | _ -> VNil)
        else if (str_len name == 4 && str_eq name "size") || (str_len name == 6 && str_eq name "length") then
          VInt (val_list_len (matchdata_arr ivars id 0))
@@ -21269,7 +21316,20 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                        let _ = map_set globals "~" VNil in
                        let _ = rx_pub_groups s 1 false "UTF-8" in ()))
                  | _ -> ()) in
-        prim_method recv name args)
+        // ⚠ `str[re, capture]` IS `$~[capture]` (rb_str_subpat): an index
+        //   counted from the end when negative, a group NAME (IndexError when
+        //   there is no such group), an index conversion otherwise (nil and
+        //   an object without #to_int are TypeErrors), and duplicate names
+        //   answering the last group that matched. The leaf read an index
+        //   only, as a group NUMBER without the negative form, and treated a
+        //   name as no capture at all -- `"har"[/(.)(.)(.)/, -2]` was nil.
+        //   No match is nil before the capture is looked at, as in ruby.
+        (match args with
+         | Cons (_, Cons (cap9, _)) ->
+           (match (if map_has globals "~" then map_get globals "~" else VNil) with
+            | VNil -> VNil
+            | md9 -> invoke_val_c env world blk md9 "[]" (Cons (cap9, Nil)) false)
+         | _ -> prim_method recv name args))
      | _ -> VNil)
   else if ((str_len name == 5 && str_eq name "index") || (str_len name == 6 && str_eq name "rindex") || (str_len name == 9 && str_eq name "byteindex") || (str_len name == 10 && str_eq name "byterindex")
            || (str_len name == 9 && str_eq name "partition") || (str_len name == 10 && str_eq name "rpartition"))
