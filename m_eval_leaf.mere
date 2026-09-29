@@ -221,6 +221,10 @@ and splat_name = fn (ts: str list) ->
 and list_str_len = fn (ts: str list) -> match ts with Nil -> 0 | Cons (_, t) -> 1 + list_str_len t
 and exc_set_cause = fn world -> fn (v: Val) -> fn (cz9: Val) ->
   let (_, _, ocls9, ivars9) = world in
+  // a cause whose own chain leads back to the exception would make the chain
+  // a loop, and ruby refuses it
+  if cause_chain_has world cz9 v 0 then raise_exc world "ArgumentError" "circular causes"
+  else
   match v with
   | VObj id9 -> (let _ = map_set ivars9 (str_of_int id9 ++ "@__cause") cz9 in v)
   // the pair representation has nowhere to keep one, so an explicit cause
@@ -234,6 +238,18 @@ and exc_set_cause = fn world -> fn (v: Val) -> fn (cz9: Val) ->
              let _ = map_set ivars9 (str_of_int id9 ++ "@__cause") cz9 in
              VObj id9))
   | _ -> v
+and cause_chain_has = fn world -> fn (c: Val) -> fn (target: Val) -> fn (n: int) ->
+  let (_, _, _, ivars9) = world in
+  if n > 64 then false
+  else
+    (match c with
+     | VObj id9 ->
+       (if (match target with VObj t9 -> t9 == id9 | _ -> false) then true
+        else if map_has ivars9 (str_of_int id9 ++ "@__cause")
+        then cause_chain_has world (map_get ivars9 (str_of_int id9 ++ "@__cause")) target (n + 1)
+        else false)
+     | VExc (_, _) -> (match target with VExc (_, _) -> rb_eq c target | _ -> false)
+     | _ -> false)
 and cause_bt_now = fn (v: Val) ->
   match v with
   | VExc (_, _) ->
@@ -248,8 +264,11 @@ and exc_with_cause = fn world -> fn (v: Val) ->
         | VNil -> v
         // `raise $!` re-raises the very exception in flight; it is not its own
         // cause, and ruby leaves cause alone for it.
+        // ...and neither is an exception the one in flight was CAUSED by:
+        // `rescue => e1; begin; raise "2"; rescue; raise e1` leaves e1's
+        // cause alone rather than closing the chain into a loop
         | prev ->
-          (if rb_eq prev v then v
+          (if rb_eq prev v || cause_chain_has world prev v 0 then v
            else
              (let (_, _, ocls9, ivars9) = world in
               let id9 = alloc_oid ocls9 in
@@ -421,6 +440,14 @@ and raise_exc_iv = fn world -> fn (cls: str) -> fn (msg: str) -> fn (fields: (st
      | Nil -> ()
      | Cons ((nm, v), t) -> (let _ = map_set ivars (str_of_int id ++ "@" ++ nm) v in put t)) in
   let _ = put fields in
+  // an exception the interpreter raises inside a rescue has a cause as any
+  // other does: the one being handled (`rescue => e1; foo` -- the NameError's
+  // cause is e1)
+  let _ = (if map_has globals "!" then
+             (match map_get globals "!" with
+              | VNil -> ()
+              | prev -> map_set ivars (str_of_int id ++ "@__cause") prev)
+           else ()) in
   let _ = note_raise_site () in
   let bt9 = arr_new (caller_frames 0) in
   let _ = map_set raise_bt "v" bt9 in
@@ -449,14 +476,29 @@ and raise_exc = fn world -> fn (cls: str) -> fn (msg: str) ->
   // puts the caller's line back as it unwinds, so by the time this reaches the
   // top level, reading the current line would name the call site instead.
   let _ = note_raise_site () in
+  // a pair whose backtrace was set to nil gets this raise's frames: the nil
+  // set_backtrace left beside it (raise_bt "eb") would otherwise still answer
+  let _ = (if map_has raise_bt "e" && map_has raise_bt "eb" && rb_eq (map_get raise_bt "e") (VExc (cls, msg))
+              && (match map_get raise_bt "eb" with VNil -> true | _ -> false)
+           then (let _ = map_delete raise_bt "e" in map_delete raise_bt "eb") else ()) in
   let _ = map_set raise_bt "v" (arr_new (caller_frames 0)) in
   let _ = map_set raise_bt "vx" (VExc (cls, msg)) in
+  // raised inside a rescue, it has the handled exception as its cause, and a
+  // pair has nowhere to keep one: it becomes an object (exc_with_cause), with
+  // these frames on it
+  let _ = (match exc_with_cause world (VExc (cls, msg)) with
+           | VObj x9 ->
+             (let _ = map_set ivars (str_of_int x9 ++ "@__bt") (map_get raise_bt "v") in
+              map_set ivars "$exc" (VObj x9))
+           | _ -> ()) in
   let _ = (if map_has raise_bt "lf" then map_delete raise_bt "lf" else ()) in
   let _ = if map_has prim_missing "n" then map_delete prim_missing "n" else () in
   // a real Ruby exception must never inherit a stale internal-failure message
   let _ = if map_has prim_missing "i" then map_delete prim_missing "i" else () in
            let _ = if map_has prim_missing "f" then map_delete prim_missing "f" else () in
            let _ = if map_has prim_missing "rl" then map_delete prim_missing "rl" else () in
+           let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
+           let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
            let _ = if map_has prim_missing "rm" then map_delete prim_missing "rm" else () in
            let _ = if map_has prim_missing "rf" then map_delete prim_missing "rf" else () in
 
@@ -2568,6 +2610,9 @@ and conv_clear_raise = fn () ->
   let _ = (if map_has prim_missing "m" then map_delete prim_missing "m" else ()) in
   let _ = (if map_has prim_missing "f" then map_delete prim_missing "f" else ()) in
   let _ = (if map_has prim_missing "rl" then map_delete prim_missing "rl" else ()) in
+  let _ = if map_has prim_missing "rd" then map_delete prim_missing "rd" else () in
+  let _ = bi_rescued () in
+  let _ = if map_has prim_missing "rbt" then map_delete prim_missing "rbt" else () in
   ()
 and kern_unwrap_cpx = fn (v: Val) ->
   match v with VCpx (re, im) -> (if exact_zero_val im then re else v) | other -> other
@@ -3494,7 +3539,10 @@ and note_raise_bt = fn world -> fn (exc: Val) ->
   let _ = (if map_has raise_bt "lf" then map_delete raise_bt "lf" else ()) in
   (match exc with
    | VObj oid9 ->
-     (if map_has ivars9 (str_of_int oid9 ++ "@__bt") then ()
+     // (a backtrace set to nil is none: `e.set_backtrace(nil); raise e`
+     // gets the frames of the new raise)
+     (if map_has ivars9 (str_of_int oid9 ++ "@__bt")
+         && (match map_get ivars9 (str_of_int oid9 ++ "@__bt") with VNil -> false | _ -> true) then ()
       else map_set ivars9 (str_of_int oid9 ++ "@__bt") bt9)
    | _ -> ())
 and lookup_anc = fn world -> fn (anc: str list) -> fn (name: str) ->
@@ -11960,9 +12008,49 @@ and frame_line = fn (i: int) ->
 and frame_file = fn (i: int) ->
   (if map_has call_files_s i then map_get call_files_s i else "")
 and frame_label_at = fn (i: int) ->
-  // the bottom of THIS stack: a fiber's band starts at its base
-  if i <= fb_depth_base () then "<main>"
-  else (if map_has call_names_s (i - 1) then meth_label (map_get call_names_s (i - 1)) else "?")
+  // the bottom of THIS stack. The main stack's is <main>; a fiber's or a
+  // thread's is the block its body is -- `Fiber.new { caller(0) }` answers
+  // 'block in <main>' and nothing under it -- which the band's first entry
+  // (at base - 1) labels like any block frame. Below the base is nothing of
+  // this stack's.
+  if i <= 0 || i < fb_depth_base () then "<main>"
+  else if map_has call_names_s (i - 1) then
+    (let n = map_get call_names_s (i - 1) in
+     // a block's frame is labelled when it is ASKED for, from its env (see
+     // block_label): the label depends on where the block was written, and
+     // building it at every block call was a string per iteration
+     if str_eq n blk_frame_mark
+     then (if map_has fb_env_at (i - 1) then block_label (map_get fb_env_at (i - 1)) else "block in <main>")
+     else meth_label n)
+  else "?"
+// ruby's label for a block's frame: `block in X`, or `block (N levels) in X`
+// when it is written inside N-1 other blocks, where X is the label of the
+// method, class body, required file or main it is written in. Walked from the
+// block's own env up its scope chain: every env with a parent is one more
+// block (a define_method body is one too -- ruby calls it `block in
+// <class:K>`), and the walk stops at a method frame, at a scope that names
+// itself (__scope: a class body, `<top (required)>`), or at the root, which
+// is <main>.
+and block_label = fn e ->
+  let rec up = fn e9 -> fn (lvl: int) ->
+    if map_has e9 "__scope" then (lvl, (match map_get e9 "__scope" with VStr h -> sget h | _ -> "<main>"))
+    else if map_has e9 "__meth" && (if map_has e9 "__in_dm" then false else true) then
+      (lvl, meth_label ((match (if map_has e9 "__defcls" then map_get e9 "__defcls" else VNil) with
+                         | VClass c -> c ++ "#"
+                         | _ -> "")
+                        ++ (match map_get e9 "__meth" with VStr h -> sget h | _ -> "?")))
+    else
+      (let (has, p9) = lv_parent_of e9 in
+       // a lambda's call puts a frame of its own (the env holding its return
+       // boundary, __fid) between its body and the env it was written in;
+       // that is no block of the program's, and is not a level
+       // ...and so does instance_exec / class_exec: the child env that
+       // rebinds self (an own "self") is the same block, not one more
+       let own9 = (if (map_has e9 "__fid" || map_has e9 "self") && (if map_has e9 "__meth" then false else true) then 0 else 1) in
+       if has then up p9 (lvl + own9) else ((if lvl < 1 then 1 else lvl), "<main>")) in
+  let (lvl, base) = up e 0 in
+  if lvl <= 1 then "block in " ++ base
+  else "block (" ++ str_of_int lvl ++ " levels) in " ++ base
 and frame_str = fn (i: int) ->
   frame_file i ++ ":" ++ str_of_int (frame_line i) ++ ":in '" ++ frame_label_at i ++ "'"
 and caller_list = fn (i: int) ->
@@ -11992,7 +12080,7 @@ and caller_frames = fn (skip: int) ->
   // `caller(0)` answers with there (and `caller` -- skipping it -- is empty)
   let b = fb_depth_base () in
   let here = mkstr (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in '"
-                    ++ (if cd <= b then "<main>" else meth_label (cur_meth ())) ++ "'") in
+                    ++ (frame_label_at cd) ++ "'") in
   let all = (if cd <= b then Cons (here, (Nil : Val list))
              else Cons (here, caller_list (cd - 1))) in
   vdrop all skip

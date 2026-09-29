@@ -549,13 +549,29 @@ Overriding these methods works (corpus/142); keeping hold of the original does
 not. `require` is not affected -- it is a real entry in the table, which is why
 rubygems can wrap it (corpus/141).
 
-## `Exception#exception` and `#cause` are absent, and respond_to? says so
+## A raised exception is sometimes a pair, and a pair has no identity
 
-An exception answers `message`, `to_s`, `inspect`, `==`, `backtrace`,
-`set_backtrace`, `backtrace_locations` and `full_message`. `#exception` (which
-returns self, or a copy with a new message) and `#cause` (the exception that was
-in flight when this one was raised) are not implemented, and `respond_to?`
-answers false for them rather than promising what is not there.
+`Exception#exception`, `#cause`, `#set_backtrace` and `#backtrace_locations` are
+implemented (the section that stood here said the first two were absent; that
+has not been true for a long time). `raise` refuses what is not an exception
+(`raise true`, `raise "m", extra`: TypeError), a cause chain that would loop is
+ArgumentError "circular causes", an exception the interpreter raises inside a
+rescue has the handled one as its cause, a backtrace set to nil is replaced by
+the next raise's frames, one given as Locations is kept as the Locations, and a
+class's own `#exception` / `#set_backtrace` are called where ruby calls them
+(corpus/237).
+
+What is left is one representation. `raise "x"` does not build an object: the
+exception is a class and a message, compared by value, and whatever it carries
+(its frames, a backtrace set on it) is kept BESIDE it, in one slot for the raise
+in flight. It is promoted to an object when it needs to carry something itself
+-- a cause, frames that must survive a thread's death -- but the rescued value
+and the promoted one are then two values. So ruby/spec's "re-raises a
+previously rescued exception with cleaned backtrace" (a rescued pair,
+`set_backtrace(nil)`, raised again in ANOTHER thread or fiber, then compared
+with `==`) fails in core/thread/raise and core/fiber/raise: the copy that comes
+back has frames, the one the program kept has none. Kernel#raise, which stays
+in one stack, passes it.
 
 ## `encode` has no character tables, and `$?` is not set
 
@@ -676,14 +692,27 @@ There IS a call stack now: `caller` answers real frames, formatted as the
 reference ruby writes them, an uncaught error names `file:line:in 'meth'`, and
 `Exception#backtrace` answers the frames of the raise.
 
-Two limits. **A block gets no frame at all**: inside `[1].each { }` in a method
-`outer`, ruby's labels are `["block in outer", "each", "outer"]` and this answers
-`["outer", "<main>"]` -- the block and the builtin that called it are both
-missing, rather than the block being mislabelled. Giving a block a frame means
-three more per-depth entries per block invocation, and the reclamation
-measurements above say what that costs: a call already leaks 13.4 KB and nothing
-is ever given back. So this is a cost decision waiting on reclamation, not an
-oversight. And a backtrace belongs to the raise that is
+**Every frame has its label now (2026-09-29).** A block is a frame, labelled
+where it was WRITTEN (`block in Object#m`, `block (2 levels) in <main>`,
+`block in <class:K>` for a define_method body); a class body is `<class:K>` /
+`<module:M>` / `singleton class`, a required file `<top (required)>`; and a
+builtin is a frame too, named after the class or module that DEFINES it, which
+is not always the receiver's: `1.then { }` runs in `Kernel#then`,
+`[1].inject { }` in `Enumerable#inject` with `Array#each` under it, and a
+builtin's refusal has the builtin on top (`Integer("z")` raises in
+`Kernel#Integer`). The owners come from ruby's own reflection
+(tools/gen_owner_table.rb writes m_owners.mere); `Method#owner` for a builtin
+reads the same table. A block's label is computed when a backtrace asks, from
+the frame's env -- building it at every block call was a string per iteration.
+
+What is still not a frame: a builtin that calls back into Ruby WITHOUT a block
+(`sort`'s `<=>`, `Integer()`'s `to_int`) -- only the block-taking ones push
+one, and a refusal names its builtin after the fact; the internal frames of an
+Enumerator chain (`[1].each_with_index.map { }` is `Enumerable#map` alone
+here, where ruby has `Array#each`, `Enumerable#each_with_index` and
+`Enumerator#each` under it -- an Enumerator here collects its values rather
+than re-running its source); and a builtin that mere-ruby implements in its
+Ruby prelude shows the prelude's own frames. And a backtrace belongs to the raise that is
 IN FLIGHT: the built-in exception representation is a class and a message with no
 identity, so there is nowhere on it to keep a copy. The frames live in one slot,
 answered for the exception in `$!`; an exception that was rescued and put aside
