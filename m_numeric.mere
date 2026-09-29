@@ -168,6 +168,16 @@ let str_comparable = fn (a: int) -> fn (b: int) ->
      let a7 = ca && str_is_ascii a in
      let b7 = cb && str_is_ascii b in
      (a7 && (b7 || cb)) || (b7 && ca));
+// Which CLASS of number a value is, or "" for a value that is not one. VInt
+// and VBig are one class (Integer): which of the two holds a value is this
+// interpreter's representation choice, not something ruby can see.
+// (Defined ahead of rb_eq: hash equality finds its keys with hkey_eql, which
+// is in rb_eq's group now.)
+let num_kind_tag = fn (v: Val) ->
+  match v with
+  | VInt _ -> "i" | VBig _ -> "i" | VFlt _ -> "f"
+  | VRat (_, _) -> "r" | VCpx (_, _) -> "c"
+  | _ -> "";
 let rec rb_eq = fn (va: Val) -> fn (vb: Val) ->
   // A Complex whose imaginary part is zero IS the real it wraps, and `==` says
   // so from BOTH sides. The arms below are keyed on the LEFT value and each
@@ -315,7 +325,9 @@ and eq_list = fn (xs: Val list) -> fn (ys: Val list) ->
 // value (both are flat [k,v,k,v,...] lists; keys are unique in a hash).
 and hlookup_eq = fn (ys: Val list) -> fn (k: Val) ->
   match ys with
-  | Cons (yk, Cons (yv, rest)) -> if rb_eq k yk then Cons (yv, Nil) else hlookup_eq rest k
+  // a KEY is found the way a Hash finds it -- by eql?, so `{1 => "x"} ==
+  // {1.0 => "x"}` is false (rb_eq said the keys were the same)
+  | Cons (yk, Cons (yv, rest)) -> if hkey_eql k yk then Cons (yv, Nil) else hlookup_eq rest k
   | _ -> Nil
 // ...and the identity form, which is the same walk with `equal?` for the key.
 and hlookup_eq_x = fn (ident: bool) -> fn (ys: Val list) -> fn (k: Val) ->
@@ -330,7 +342,7 @@ and hlookup_eq_x = fn (ident: bool) -> fn (ys: Val list) -> fn (k: Val) ->
                      | (VObj x9, VObj y9) -> x9 == y9
                      | (VProc x9, VProc y9) -> x9 == y9
                      | _ -> rb_eq k yk)
-                  else rb_eq k yk) in
+                  else hkey_eql k yk) in
      if same9 then Cons (yv, Nil) else hlookup_eq_x ident rest k)
   | _ -> Nil
 and hash_eq_go = fn (xs: Val list) -> fn (ys: Val list) ->
@@ -349,20 +361,12 @@ and vllen = fn (xs: Val list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + vll
 and hash_eq_unordered = fn (xs: Val list) -> fn (ys: Val list) ->
   if vllen xs == vllen ys then hash_eq_go xs ys else false
 and hash_eq_unordered_x = fn (ident: bool) -> fn (xs: Val list) -> fn (ys: Val list) ->
-  if vllen xs == vllen ys then hash_eq_go_x ident xs ys else false;
+  if vllen xs == vllen ys then hash_eq_go_x ident xs ys else false
 
 // Two keys are the same key when they are EQL?, which is not ==: 1 and 1.0 are
 // equal and not eql?, so `{4 => 0}.include?(4.0)` is false and a hash can hold
 // both. Ruby's rule is "same #hash and #eql?"; across the numeric classes that
 // comes down to the class having to match, which is what this checks.
-// Which CLASS of number a value is, or "" for a value that is not one. VInt
-// and VBig are one class (Integer): which of the two holds a value is this
-// interpreter's representation choice, not something ruby can see.
-let num_kind_tag = fn (v: Val) ->
-  match v with
-  | VInt _ -> "i" | VBig _ -> "i" | VFlt _ -> "f"
-  | VRat (_, _) -> "r" | VCpx (_, _) -> "c"
-  | _ -> "";
 // A hash key matches by `eql?`, which is `==` AND "the same class of number":
 // `{0 => 1}[0.0]` is nil though `0 == 0.0`. This used to be a list of the
 // cross-kind PAIRS that must not match -- a list someone has to keep complete,
@@ -371,7 +375,7 @@ let num_kind_tag = fn (v: Val) ->
 // be incomplete: a kind that is added later is excluded by default rather than
 // by being remembered.
 // element-wise eql?, for a container used as a hash key
-let rec hkey_list_eql = fn (xs: Val list) -> fn (ys: Val list) ->
+and hkey_list_eql = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
   | Nil -> (match ys with Nil -> true | _ -> false)
   | Cons (h, t) ->
@@ -388,7 +392,17 @@ and hkey_eql = fn (a: Val) -> fn (b: Val) ->
   // a compound key is eql? when its parts are, in the same sense.
   if (match (a, b) with (VArr _, VArr _) -> true | _ -> false) then
     (match (a, b) with
-     | (VArr x, VArr y) -> x == y || hkey_list_eql (deref x) (deref y)
+     // ...under rb_eq's cycle guard: two arrays that each hold themselves
+     // (`a << a`) were walked forever -- by `&` once it asked eql?
+     | (VArr x, VArr y) ->
+       x == y
+       || (let k9 = "e" ++ str_of_int x ++ ":e" ++ str_of_int y in
+           if map_has eq_seen k9 then true
+           else
+             (let _ = map_set eq_seen k9 (VInt 1) in
+              let r9 = hkey_list_eql (deref x) (deref y) in
+              let _ = map_delete eq_seen k9 in
+              r9))
      | _ -> false)
   else if (match (a, b) with (VHsh _, VHsh _) -> true | _ -> false) then
     (match (a, b) with
@@ -1205,6 +1219,11 @@ let rec flatten1 = fn (xs: Val list) ->
 
 let rec val_member = fn (xs: Val list) -> fn (v: Val) ->
   match xs with Nil -> false | Cons (h, t) -> rb_eq h v || val_member t v;
+// ...and the SET operations' membership, which is eql? (hash-key sameness),
+// not ==: `[5.0, 4.0] & [5, 4]` is [] and `[5.0] | [5]` keeps both. Asking
+// val_member made them agree with #include? instead of with a Hash.
+let rec val_member_eql = fn (xs: Val list) -> fn (v: Val) ->
+  match xs with Nil -> false | Cons (h, t) -> hkey_eql v h || val_member_eql t v;
 let rec val_remove = fn (xs: Val list) -> fn (v: Val) ->
   match xs with
   | Nil -> Nil
@@ -1213,16 +1232,16 @@ let rec val_remove = fn (xs: Val list) -> fn (v: Val) ->
 let rec val_dedup_into = fn (xs: Val list) -> fn (acc: Val list) ->
   match xs with
   | Nil -> acc
-  | Cons (h, t) -> if val_member acc h then val_dedup_into t acc else val_dedup_into t (list_append acc (Cons (h, Nil)));
+  | Cons (h, t) -> if val_member_eql acc h then val_dedup_into t acc else val_dedup_into t (list_append acc (Cons (h, Nil)));
 // Array#- : keep the elements the other side does not have.
 let rec val_difference = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
   | Nil -> Nil
-  | Cons (h, t) -> if val_member ys h then val_difference t ys else Cons (h, val_difference t ys);
+  | Cons (h, t) -> if val_member_eql ys h then val_difference t ys else Cons (h, val_difference t ys);
 let rec val_intersect = fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
   | Nil -> Nil
-  | Cons (h, t) -> if val_member ys h then Cons (h, val_intersect t ys) else val_intersect t ys;
+  | Cons (h, t) -> if val_member_eql ys h then Cons (h, val_intersect t ys) else val_intersect t ys;
 
 // native 64-bit bitwise (two's-complement, so negatives are correct) — the
 // mere builtins map straight to C & | ^.

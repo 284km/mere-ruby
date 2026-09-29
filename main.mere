@@ -2563,7 +2563,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // hands back an Enumerator (the error waits for its #each).
        let _ = chill_touch world recv name in
        let _ = (if builtin_mut_on_frozen world recv name
-                   && (if enum_needs_block name then false else true)
+                   && (if enum_needs_block name || transform_bang_bare name args then false else true)
                    && (if delete_is_noop env world recv name args then false else true)
                 then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil)) in ()
                 else ()) in
@@ -3024,14 +3024,19 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     // ordinary array keeps the fast path. Answered beside the operator rather
     // than only in #intersection / #difference, or the two spellings of one
     // operation would disagree.
-    else if (str_eq op "&" || str_eq op "-")
+    else if (str_eq op "&" || str_eq op "-" || str_eq op "|")
+            && (match (va0, vb) with (VArr _, VArr _) -> false | (VArr _, _) -> true | _ -> false) then
+      eval_bin_prim env world blk op va0 (ary_set_arg env world vb)
+    else if (str_eq op "&" || str_eq op "-" || str_eq op "|")
             && (match (va0, vb) with
                 | (VArr xa, VArr xb) -> elem_has_user_eql world (deref xa) || elem_has_user_eql world (deref xb)
                 | _ -> false) then
       (match (va0, vb) with
        | (VArr xa, VArr xb) ->
          (if str_eq op "&"
-          then arr_new (val_intersect_w env world (val_dedup_into (deref xa) Nil) (deref xb))
+          then arr_new (val_intersect_w env world (val_dedup_w env world (deref xa) Nil) (deref xb))
+          else if str_eq op "|"
+          then arr_new (val_dedup_w env world (deref xb) (val_dedup_w env world (deref xa) Nil))
           else arr_new (val_subtract_w env world (deref xa) (deref xb)))
        | _ -> VNil)
     // A BEGINLESS range is a sequence too -- `(..5) % 2` starts at nil and
@@ -3137,8 +3142,12 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              else if str_eq op "<=" then VBool (hash_subset_of world xs ys ci)
              else if str_eq op ">" then VBool (nb2 < na && hash_subset_of world ys xs ci)
              else VBool (hash_subset_of world ys xs ci))
-          | _ -> raise_exc world "TypeError"
-                   ("no implicit conversion of " ++ conv_gives_name vb ++ " into Hash"))
+          // the other side through #to_hash first, as ruby's to_hash does
+          | _ ->
+            (match conv_try env world vb "to_hash" with
+             | VHsh h9 -> eval_bin_prim env world blk op va0 (VHsh h9)
+             | _ -> raise_exc world "TypeError"
+                      ("no implicit conversion of " ++ conv_gives_name vb ++ " into Hash")))
        | _ -> VNil)
     // Array <=> Array through the OPERATOR: the same element-by-element answer
     // the method form gives, nil included. This arm was missing, so the pair
@@ -7506,6 +7515,27 @@ and rb_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
         then truthy (invoke_val_c env world nb9 a "eql?" (Cons (b, Nil)) false)
         else ia == ib)
      | _ -> false)
+  // an Array is eql? element by element in the SAME sense -- falling to rb_eq
+  // made `[[1], [1.0]].uniq` one element, since `[1] == [1.0]`. The cycle
+  // guard is rb_eql's.
+  | VArr xa ->
+    (match b with
+     | VArr xb ->
+       (if xa == xb then true
+        else
+          (let k7 = "q" ++ str_of_int xa ++ ":q" ++ str_of_int xb in
+           if map_has eq_seen k7 then true
+           else
+             (let _ = map_set eq_seen k7 (VInt 1) in
+              let rec go = fn (xs: Val list) -> fn (ys: Val list) ->
+                (match (xs, ys) with
+                 | (Nil, Nil) -> true
+                 | (Cons (x9, xt), Cons (y9, yt)) -> rb_eql_w env world x9 y9 && go xt yt
+                 | _ -> false) in
+              let r7 = go (deref xa) (deref xb) in
+              let _ = map_delete eq_seen k7 in
+              r7)))
+     | _ -> false)
   | _ -> rb_eq a b
 
 // `xs <=> ys` element by element, answering VNil the moment a pair does not
@@ -7799,7 +7829,10 @@ and elem_has_user_eql = fn world -> fn (xs: Val list) ->
 and val_member_eqlw = fn env -> fn world -> fn (ys: Val list) -> fn (x: Val) ->
   match ys with
   | Nil -> false
-  | Cons (h9, t9) -> if rb_eql_w env world h9 x then true else val_member_eqlw env world t9 x
+  // ruby's rb_ary_includes_by_eql asks the element being LOOKED FOR:
+  // `x.eql?(y)`, x from the receiver. The other way round, `[obj1] - [obj2]`
+  // asked obj2, which had no opinion, and kept obj1.
+  | Cons (h9, t9) -> if rb_eql_w env world x h9 then true else val_member_eqlw env world t9 x
 
 and val_intersect_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
   match xs with
@@ -7822,6 +7855,30 @@ and val_any_in_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) 
   | Nil -> false
   | Cons (h9, t9) -> if val_member_eqlw env world ys h9 then true else val_any_in_w env world t9 ys
 
+// Array#| / #union / #& with an element's own #eql?: keep the first of each,
+// asking the NEW element whether it is one already kept (rb_ary_union)
+and val_dedup_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with
+  | Nil -> acc
+  | Cons (h9, t9) ->
+    (if val_member_eqlw env world acc h9 then val_dedup_w env world t9 acc
+     else val_dedup_w env world t9 (vappend acc (Cons (h9, Nil))))
+and arr_union_args_w = fn env -> fn world -> fn (args: Val list) -> fn (acc: Val list) ->
+  match args with
+  | Nil -> acc
+  | Cons (VArr o9, rest9) -> arr_union_args_w env world rest9 (val_dedup_w env world (deref o9) acc)
+  | Cons (_, rest9) -> arr_union_args_w env world rest9 acc
+// the set operations' arguments, each through ary_set_arg
+and val_map_conv = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> (Nil : Val list)
+  | Cons (a9, t9) -> Cons (ary_set_arg env world a9, val_map_conv env world t9)
+// does any argument array carry an element with its own #hash / #eql?
+and arr_args_user_eql = fn world -> fn (args: Val list) ->
+  match args with
+  | Nil -> false
+  | Cons (VArr a9, t9) -> elem_has_user_eql world (deref a9) || arr_args_user_eql world t9
+  | Cons (_, t9) -> arr_args_user_eql world t9
 and arr_intersect_args_w = fn env -> fn world -> fn (args: Val list) -> fn (acc: Val list) ->
   match args with
   | Nil -> acc
@@ -9359,8 +9416,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               && (match (if map_has globals ";" then map_get globals ";" else VNil) with VNil -> false | _ -> true)
               && deprecation_says ()
            then rb_warn world "$; is set to non-nil value" else ()) in
+  // (transform_keys! / transform_values! are yielders too, when given
+  // nothing -- `frozen.transform_keys!` is an Enumerator; with a mapping Hash
+  // they write at once and refuse here)
   if builtin_mut_on_frozen world recv name
      && (if enum_needs_block name then false else true)
+     && (if transform_bang_bare name args
+            && (let (hb9, _, _, _) = blk in if hb9 then false else true)
+         then false else true)
      && (if delete_is_noop env world recv name args then false else true) then
     raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   else
@@ -9499,16 +9562,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // nil. `a[(11..12) % 2]` refuses while `a[(10..12) % 2]` is [].
   // ...and the NAMED spellings of the same set operations, for the same
   // reason: the primitive layer they live in has no env to call #eql? with.
-  if ((str_len name == 10 && str_eq name "intersect?") || (str_len name == 12 && str_eq name "intersection") || (str_len name == 10 && str_eq name "difference"))
-     && (match recv with VArr xa9 -> elem_has_user_eql world (deref xa9) | _ -> false) then
+  let args = (if ((str_len name == 10 && str_eq name "intersect?") || (str_len name == 12 && str_eq name "intersection")
+                  || (str_len name == 10 && str_eq name "difference") || (str_len name == 5 && str_eq name "union"))
+                 && (match recv with VArr _ -> true | _ -> false)
+              then val_map_conv env world args
+              else args) in
+  if ((str_len name == 10 && str_eq name "intersect?") || (str_len name == 12 && str_eq name "intersection") || (str_len name == 10 && str_eq name "difference")
+      || (str_len name == 5 && str_eq name "union"))
+     && (match recv with VArr xa9 -> elem_has_user_eql world (deref xa9) || arr_args_user_eql world args | _ -> false) then
     (match recv with
      | VArr xa9 ->
-       (if (str_len name == 10 && str_eq name "intersect?") then
+       (if (str_len name == 5 && str_eq name "union") then
+          arr_new (arr_union_args_w env world args (val_dedup_w env world (deref xa9) Nil))
+        else if (str_len name == 10 && str_eq name "intersect?") then
           (match args with
            | Cons (VArr xb9, _) -> VBool (val_any_in_w env world (deref xa9) (deref xb9))
            | _ -> VBool false)
         else if (str_len name == 12 && str_eq name "intersection") then
-          arr_new (arr_intersect_args_w env world args (val_dedup_into (deref xa9) Nil))
+          arr_new (arr_intersect_args_w env world args (val_dedup_w env world (deref xa9) Nil))
         else arr_new (arr_difference_args_w env world args (deref xa9)))
      | _ -> VNil)
   else if (str_len name == 2 && str_eq name "[]") && (match recv with VArr _ -> true | _ -> false)
@@ -10014,7 +10085,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               | _ -> false) then
     (match recv with
      | VHsh h1 -> (match args with
-                   | Cons (VHsh h2, _) -> VBool (hash_eq_w env world h1 h2)
+                   | Cons (VHsh h2, _) -> VBool (hash_eq_wm env world h1 h2 (str_len name == 4 && str_eq name "eql?"))
                    | _ -> VBool false)
      | _ -> VBool false)
   // ...and two Arrays the same way: element by element, asking an object its own
@@ -19072,6 +19143,14 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
 // An interpreter-issued warning, in ruby's shape: "<file>:<line>: warning:
 // <text>" on $stderr, and SILENT when $VERBOSE is nil -- the same gate
 // Kernel#warn answers to (false, the default, still warns).
+// ruby's rb_warning: said only when $VERBOSE is TRUE (`ruby -w`), where
+// rb_warn is silenced only by nil
+and rb_warning = fn world -> fn (msg: str) ->
+  (if (if map_has globals (gvar_slot "VERBOSE")
+       then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
+       else false)
+   then err_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: " ++ msg)
+   else ())
 and rb_warn = fn world -> fn (msg: str) ->
   (if (if map_has globals (gvar_slot "VERBOSE")
        then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
@@ -19951,8 +20030,17 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if str_eq c "Array" && (str_len name == 3 && str_eq name "new") then
          // Array.new(n) { |i| ... }: the block's value per index, with the same
          // size refusal the value form gets (and a break answers its value).
-         (match args with
-          | Nil -> arr_new (Nil : Val list)
+         // ...and the forms that take no block say so or ignore it, as ruby's
+         // rb_ary_initialize does: nothing at all is `[]` with a warning under
+         // -w, and an Array (or a #to_ary) is copied. Both ran the block.
+         (let conv9 = (match args with
+                       | Cons (VArr src9, Nil) -> VArr src9
+                       | Cons (VObj o9, Nil) -> conv_try env world (VObj o9) "to_ary"
+                       | _ -> VNil) in
+          match args with
+          | Nil -> (let _ = rb_warning world "given block not used" in arr_new (Nil : Val list))
+          | _ when (match conv9 with VArr _ -> true | _ -> false) ->
+            (match conv9 with VArr src9 -> arr_new (deref src9) | _ -> arr_new (Nil : Val list))
           | _ ->
             (let a9 = coerce_int_args env world args in
              let n9 = array_new_size env world a9 in
@@ -21974,6 +22062,25 @@ and rx_union_conv = fn env -> fn world -> fn (sym_ok: bool) -> fn (xs: Val list)
                      // CLASS (conv_name stops at "Object" for a user class).
                      | _ -> rx_union_refuse world other9))) in
      Cons (v9, rx_union_conv env world sym_ok t9))
+// an Array operand of a set operation (`-`, `&`, `|`, #union, #difference,
+// #intersection, #intersect?): an Array, or whatever #to_ary makes of it, or
+// ruby's TypeError. The value-level arms can do neither, and answered an
+// internal "mere-ruby: & type error" -- or, for the named forms, silently
+// skipped the argument.
+// transform_keys! / transform_values! given nothing: a yielder, which
+// writes nothing until it is walked (so a frozen hash answers an Enumerator)
+and transform_bang_bare = fn (name: str) -> fn (args: Val list) ->
+  ((str_len name == 15 && str_eq name "transform_keys!") || (str_len name == 17 && str_eq name "transform_values!"))
+  && (match args with Nil -> true | _ -> false)
+and ary_set_arg = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VArr _ -> v
+  | _ ->
+    (match conv_try env world v "to_ary" with
+     | VArr a9 -> VArr a9
+     | VNil -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name v ++ " into Array")
+     | r9 -> raise_exc world "TypeError"
+               ("can't convert " ++ class_name v ++ " to Array (" ++ class_name v ++ "#to_ary gives " ++ class_name r9 ++ ")"))
 and conv_try = fn env -> fn world -> fn (v: Val) -> fn (mname: str) ->
   match v with
   | VObj id ->
@@ -22046,10 +22153,14 @@ and arr_eq_w = fn env -> fn world -> fn (xs: Val list) -> fn (ys: Val list) ->
   | (_, _) -> false
 
 and hash_eq_w = fn env -> fn world -> fn (h1: int) -> fn (h2: int) ->
+  hash_eq_wm env world h1 h2 false
+// Hash#== asks each value's ==, Hash#eql? its eql? (`useeql`); the keys are
+// found the same way for both
+and hash_eq_wm = fn env -> fn world -> fn (h1: int) -> fn (h2: int) -> fn (useeql: bool) ->
   let xs = hderef h1 in
   let ys = hderef h2 in
-  if hash_len xs == hash_len ys then hash_eq_w_go env world h2 xs else false
-and hash_eq_w_go = fn env -> fn world -> fn (h2: int) -> fn (xs: Val list) ->
+  if hash_len xs == hash_len ys then hash_eq_w_go env world h2 xs useeql else false
+and hash_eq_w_go = fn env -> fn world -> fn (h2: int) -> fn (xs: Val list) -> fn (useeql: bool) ->
   match xs with
   | Cons (k, Cons (v, t)) ->
     (let ci2 = hcbi_on h2 in
@@ -22060,10 +22171,16 @@ and hash_eq_w_go = fn env -> fn world -> fn (h2: int) -> fn (xs: Val list) ->
      | (false, _) -> false
      | (_, v2) ->
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-        let same = (if obj_answers_eq world v
+        let same = (if useeql then
+                      (match v with
+                       | VObj _ -> (if has_meth world (dispatch_cls_of world v) "eql?" || hng_sng_has world v "eql?"
+                                    then truthy (invoke_val_c env world nb9 v "eql?" (Cons (v2, Nil)) false)
+                                    else rb_eql_w env world v v2)
+                       | _ -> rb_eql_w env world v v2)
+                    else if obj_answers_eq world v
                     then truthy (invoke_val_c env world nb9 v "==" (Cons (v2, Nil)) false)
                     else cmp_member_w env world v v2) in
-        if same then hash_eq_w_go env world h2 t else false))
+        if same then hash_eq_w_go env world h2 t useeql else false))
   | _ -> true
 
 and hash_find_key_w = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
@@ -22119,7 +22236,10 @@ and obj_answers_eq = fn world -> fn (v: Val) ->
                has_meth world c9 "==" || builtin_obj_has (display_cls world c9) "==")
   | _ -> false
 
-and hash_has_obj = fn world -> fn (xs: Val list) -> arr_has_obj world xs
+// ...or one with its own #eql? / #hash: a KEY that says it is eql? to
+// another is found by the other hash only when asked (`{k1 => 1} == {k2 =>
+// 1}` for k1.eql?(k2)), and Hash#eql? asks each value's #eql?
+and hash_has_obj = fn world -> fn (xs: Val list) -> arr_has_obj world xs || elem_has_user_eql world xs
 
 and key_has_own_eql = fn world -> fn (k: Val) ->
   match k with
@@ -22539,6 +22659,29 @@ and rb_eql = fn (a: Val) -> fn (b: Val) ->
      // numerically -- true, for two objects ruby says are not interchangeable
      // (they hash differently, which is what eql? is for).
      | VCpx (ar, ai) -> (match b with VCpx (br, bi) -> rb_eql ar br && rb_eql ai bi | _ -> false)
+     // ...and a Hash is eql? when every key finds a value that is eql? to its
+     // own: `{1 => 1}.eql?({1 => 1.0})` is false, where == says true
+     | VHsh ha ->
+       (match b with
+        | VHsh hb ->
+          (if ha == hb then true
+           else if rb_eq a b then
+             (let k7 = "l" ++ str_of_int ha ++ ":l" ++ str_of_int hb in
+              if map_has eq_seen k7 then true
+              else
+                (let _ = map_set eq_seen k7 (VInt 1) in
+                 let rec go = fn (xs: Val list) ->
+                   (match xs with
+                    | Cons (k9, Cons (v9, t9)) ->
+                      (match hlookup_eq_x (hcbi_on hb) (hderef hb) k9 with
+                       | Cons (w9, _) -> rb_eql v9 w9 && go t9
+                       | _ -> false)
+                    | _ -> true) in
+                 let r7 = go (hderef ha) in
+                 let _ = map_delete eq_seen k7 in
+                 r7))
+           else false)
+        | _ -> false)
      | _ -> rb_eq a b)
   else false
 
