@@ -1403,6 +1403,12 @@ and builtin_cls_has = fn (cls: str) -> fn (name: str) ->
     (str_len name == 3 && str_eq name "new")
   else if str_eq cls "Marshal" then
     (str_len name == 4 && str_eq name "dump") || (str_len name == 4 && str_eq name "load")
+  // ⚠ Warning's switches answer from the dispatcher, and respond_to? did not
+  //   know it: mspec's own setup asks `Warning.respond_to?(:[]=)` before it
+  //   turns deprecation warnings on, and got false -- so under the shim no
+  //   deprecation ever printed.
+  else if str_eq cls "Warning" then
+    (str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "[]=")
   else if str_eq cls "Process" then
     (str_len name == 3 && str_eq name "pid") || (str_len name == 4 && str_eq name "ppid") ||
     (str_len name == 4 && str_eq name "exit") || (str_len name == 5 && str_eq name "exit!") ||
@@ -7087,8 +7093,15 @@ and stdlib_src = fn (name: str) ->
     "  def self.getwd\n" ++
     "    new(Dir.pwd)\n" ++
     "  end\n" ++
+    "  # ⚠ #to_path, then a String and nothing else: `path.to_s` made\n" ++
+    "  # Pathname.new(nil) the empty path and Pathname.new(obj) its inspect.\n" ++
     "  def initialize(path)\n" ++
-    "    @path = path.to_s\n" ++
+    "    path = path.to_path if !path.is_a?(String) && path.respond_to?(:to_path)\n" ++
+    "    unless path.is_a?(String)\n" ++
+    "      raise TypeError, \"no implicit conversion of #\{path.nil? ? 'nil' : path.class} into String\"\n" ++
+    "    end\n" ++
+    "    raise ArgumentError, \"pathname contains null byte\" if path.include?(\"\\0\")\n" ++
+    "    @path = path.dup\n" ++
     "  end\n" ++
     "  def to_s\n" ++
     "    @path\n" ++
@@ -7277,11 +7290,23 @@ and stdlib_src = fn (name: str) ->
     "      Pathname.new(c)\n" ++
     "    end\n" ++
     "  end\n" ++
-    "  def glob(pattern)\n" ++
-    "    Dir.glob(pattern, base: @path).map do |c|\n" ++
+    "  # both globs take Dir.glob's flags, and with a block yield each match\n" ++
+    "  # and answer nil\n" ++
+    "  def glob(pattern, flags = 0, &blk)\n" ++
+    "    found = Dir.glob(pattern, flags, base: @path).map do |c|\n" ++
     "      self + c\n" ++
     "    end\n" ++
+    "    return found unless blk\n" ++
+    "    found.each(&blk)\n" ++
+    "    nil\n" ++
     "  end\n" ++
+    "  def self.glob(pattern, flags = 0, base: nil, &blk)\n" ++
+    "    found = (base ? Dir.glob(pattern, flags, base: base) : Dir.glob(pattern, flags)).map \{ |c| new(c) }\n" ++
+    "    return found unless blk\n" ++
+    "    found.each(&blk)\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def birthtime = File.birthtime(@path)\n" ++
     "  def cleanpath\n" ++
     "    parts = []\n" ++
     "    abs = @path.start_with?(\"/\")\n" ++
@@ -9155,6 +9180,7 @@ and stdlib_src = fn (name: str) ->
   // NOT the full stdlib -- mere-ruby's Time has no zone, so a parsed time
   // without one is UTC where CRuby would make it local.
   else if str_eq n "time" then
+    "require \"date\"\n" ++
     "# A subset of the stdlib `time`, built on mere-ruby's Time -- which has no\n" ++
     "# concept of a zone and is always UTC. So `Time.parse(\"2023-11-15 07:13:20\")`\n" ++
     "# reads that as UTC, where CRuby would read it as local time.\n" ++
@@ -10623,7 +10649,7 @@ and stdlib_src = fn (name: str) ->
     "\n" ++
     "  def self.valid_commercial?(cwyear, cweek, cwday, _start = nil)\n" ++
     "    return false unless cwday.is_a?(Integer) && cweek.is_a?(Integer) && cwyear.is_a?(Integer)\n" ++
-    "    cwday = 7 if cwday == 0\n" ++
+    "    # 1..7, or -7..-1 counted back from Sunday; 0 is not a day\n" ++
     "    cwday += 8 if cwday < 0\n" ++
     "    return false if cwday < 1 || cwday > 7\n" ++
     "    if cweek < 0\n" ++
@@ -11148,6 +11174,77 @@ and stdlib_src = fn (name: str) ->
     "  def strftime(fmt = \"%FT%T%:z\")\n" ++
     "    Time.__strf(fmt, [year, month, day, yday, wday, hour, minute, second, sec_fraction,\n" ++
     "                      (offset * 86400).round, false, zone, __utc_seconds - 2440588 * 86400, true])\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "# DateTime.new as date_core's datetime_s_civil checks it. ⚠ It took any\n" ++
+    "# fields: an hour of -10 stayed -10, 25 and 1.5 were accepted, a Rational\n" ++
+    "# day was dropped. A fraction is allowed only in the LAST argument given\n" ++
+    "# (num2int_with_frac), where it carries into the fields below; a negative\n" ++
+    "# hour, minute or second counts back from the end of the day, hour or\n" ++
+    "# minute; hour 24 is the next day's midnight; and anything else is\n" ++
+    "# Date::Error \"invalid date\".\n" ++
+    "class DateTime\n" ++
+    "  class << self\n" ++
+    "    alias_method :__new_fields, :new\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.new(*args)\n" ++
+    "    if args.size > 8\n" ++
+    "      raise ArgumentError, \"wrong number of arguments (given #\{args.size}, expected 0..8)\"\n" ++
+    "    end\n" ++
+    "    y, m, d, h, mi, s, off, _st = args\n" ++
+    "    n = args.size\n" ++
+    "    y = -4712 if y.nil?\n" ++
+    "    m = 1 if m.nil?\n" ++
+    "    d = 1 if d.nil?\n" ++
+    "    h = 0 if h.nil?\n" ++
+    "    mi = 0 if mi.nil?\n" ++
+    "    s = 0 if s.nil?\n" ++
+    "    off = 0 if off.nil?\n" ++
+    "    split = lambda do |v, pos|\n" ++
+    "      next [v, 0] if v.is_a?(Integer)\n" ++
+    "      r = v.is_a?(Numeric) ? v.to_r : v\n" ++
+    "      i = r.floor\n" ++
+    "      fr = r - i\n" ++
+    "      raise Date::Error, \"invalid fraction\" if fr != 0 && n > pos\n" ++
+    "      [i, fr]\n" ++
+    "    end\n" ++
+    "    d, dfr = split.(d, 3)\n" ++
+    "    h, hfr = split.(h, 4)\n" ++
+    "    mi, mfr = split.(mi, 5)\n" ++
+    "    si, sfr = split.(s, 99)\n" ++
+    "    h += 24 if h < 0\n" ++
+    "    mi += 60 if mi < 0\n" ++
+    "    si += 60 if si < 0\n" ++
+    "    if h < 0 || h > 24 || mi < 0 || mi > 59 || si < 0 || si > 59 || (h == 24 && (mi > 0 || si > 0))\n" ++
+    "      raise Date::Error, \"invalid date\"\n" ++
+    "    end\n" ++
+    "    next_day = h == 24\n" ++
+    "    h = 0 if next_day\n" ++
+    "    obj = __new_fields(y, m, d, h, mi, sfr == 0 ? si : si + sfr, off)\n" ++
+    "    obj += 1 if next_day\n" ++
+    "    carry = dfr * 86400 + hfr * 3600 + mfr * 60\n" ++
+    "    obj += Rational(carry, 86400) if carry != 0\n" ++
+    "    obj\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # DateTime.jd with the time of day: the calendar day of that Julian Day\n" ++
+    "  # (read in `start`'s calendar), then its clock\n" ++
+    "  def self.jd(jd = 0, h = 0, min = 0, s = 0, off = 0, start = Date::ITALY)\n" ++
+    "    d = Date.jd(jd, start)\n" ++
+    "    new(d.year, d.month, d.day, h, min, s, off)\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "# date's own additions to Time: the day, and the instant, in the default\n" ++
+    "# calendar reform. The Julian Day comes from Time's proleptic Gregorian\n" ++
+    "# fields; the civil fields a Date then shows are its own calendar's.\n" ++
+    "class Time\n" ++
+    "  def to_date = Date.jd(Date.civil_to_jd(year, mon, mday, Date::GREGORIAN))\n" ++
+    "\n" ++
+    "  def to_datetime\n" ++
+    "    DateTime.jd(Date.civil_to_jd(year, mon, mday, Date::GREGORIAN), hour, min, sec + subsec, Rational(utc_offset, 86400))\n" ++
     "  end\n" ++
     "end\n"
   else if str_eq n "tmpdir" then
@@ -15363,6 +15460,29 @@ and kw_names_of = fn (kws: str list) ->
   match kws with Nil -> Nil | Cons (p, r) ->
     if str_len p > 1 && str_eq (substring p 0 2) "**" then kw_names_of r
     else Cons (substring p 0 (str_len p - 1), kw_names_of r)
+// the keywords a call gave that no parameter takes, and the required ones it
+// did not give -- ruby's two refusals NAME them ("unknown keywords: :a, :b",
+// "missing keyword: :b"), where these said only "unknown keyword"
+and kw_unknown_keys = fn (names: str list) -> fn (kwhash: Val list) ->
+  match kwhash with
+  | Cons (k, Cons (_, rest)) ->
+    let kn = (match k with VSym s -> s | _ -> "\{notsym}") in
+    if str_list_has names kn then kw_unknown_keys names rest else Cons (k, kw_unknown_keys names rest)
+  | _ -> Nil
+and kw_missing_names = fn (kws: str list) -> fn (defaults: (str * Expr) list) -> fn (kwhash: Val list) ->
+  match kws with
+  | Nil -> Nil
+  | Cons (p, r) ->
+    if str_len p > 1 && str_eq (substring p 0 2) "**" then kw_missing_names r defaults kwhash
+    else (let nm = substring p 0 (str_len p - 1) in
+          if hash_haskey kwhash (VSym nm) || has_default defaults p then kw_missing_names r defaults kwhash
+          else Cons (VSym nm, kw_missing_names r defaults kwhash))
+and kw_refusal = fn (what: str) -> fn (ks: Val list) ->
+  let rec join = fn (xs: Val list) ->
+    (match xs with Nil -> "" | Cons (x, Nil) -> inspect x | Cons (x, t) -> inspect x ++ ", " ++ join t) in
+  (match ks with
+   | Cons (_, Cons (_, _)) -> what ++ " keywords: " ++ join ks
+   | _ -> what ++ " keyword: " ++ join ks)
 and kw_has_unknown = fn (names: str list) -> fn (kwhash: Val list) ->
   match kwhash with
   | Nil -> false

@@ -1298,14 +1298,29 @@ let core_prelude_d =
   "    unless callable.respond_to?(:call)\n" ++
   "      raise ArgumentError, \"wrong type argument \" + callable.class.to_s + \" (should be callable)\"\n" ++
   "    end\n" ++
+  "    # an immediate is never collected, so it cannot have one (asked before\n" ++
+  "    # the frozen check, as ruby does: a Symbol is both)\n" ++
+  "    if ::NilClass === obj || ::TrueClass === obj || ::FalseClass === obj || ::Integer === obj || ::Float === obj || ::Symbol === obj\n" ++
+  "      raise ArgumentError, \"cannot define finalizer for \" + obj.class.to_s\n" ++
+  "    end\n" ++
   "    __fin_frozen(obj)\n" ++
+  "    # a finalizer whose receiver IS the object keeps it alive for ever\n" ++
+  "    rcv = if ::Method === callable then callable.receiver\n" ++
+  "          elsif ::Proc === callable then (callable.binding.receiver rescue nil)\n" ++
+  "          end\n" ++
+  "    warn(\"finalizer references object to be finalized\", uplevel: 1) if rcv.equal?(obj)\n" ++
   "    unless @__fin_hooked\n" ++
   "      @__fin_hooked = true\n" ++
   "      at_exit do\n" ++
   "        ObjectSpace.__run_finalizers\n" ++
   "      end\n" ++
   "    end\n" ++
-  "    (@__fin[obj.object_id] ||= []) << callable\n" ++
+  "    # the same finalizer (by ==, so a dup of a proc too) is kept once, and\n" ++
+  "    # the one kept is what a second definition answers\n" ++
+  "    list = (@__fin[obj.object_id] ||= [])\n" ++
+  "    same = list.find \{ |c| c == callable }\n" ++
+  "    return [0, same] if same\n" ++
+  "    list << callable\n" ++
   "    [0, callable]\n" ++
   "  end\n" ++
   "  def self.undefine_finalizer(obj)\n" ++
@@ -1313,13 +1328,38 @@ let core_prelude_d =
   "    @__fin.delete(obj.object_id)\n" ++
   "    obj\n" ++
   "  end\n" ++
+  "  # one at a time until none is left: a finalizer may define another (it\n" ++
+  "  # runs too), may call exit (the rest still run), and may raise (reported\n" ++
+  "  # unless $VERBOSE is nil, and the rest still run)\n" ++
+  "  # deprecated in ruby 4.0 (and says so where deprecations are shown). The\n" ++
+  "  # immediates are computed from the id; anything else is looked for among\n" ++
+  "  # the live objects each_object walks.\n" ++
+  "  def self._id2ref(id)\n" ++
+  "    warn(\"ObjectSpace._id2ref is deprecated\", uplevel: 1, category: :deprecated)\n" ++
+  "    id = Integer(id)\n" ++
+  "    return nil if id == nil.object_id\n" ++
+  "    return true if id == true.object_id\n" ++
+  "    return false if id == false.object_id\n" ++
+  "    return (id - 1) / 2 if id.odd? && id.abs < 2**48\n" ++
+  "    objs, classes = ObjectSpace.__objects(nil)\n" ++
+  "    (objs + classes).each \{ |o| return o if o.object_id == id }\n" ++
+  "    raise RangeError, id.to_s.inspect + \" is not an id value\"\n" ++
+  "  end\n" ++
   "  def self.__run_finalizers\n" ++
-  "    @__fin.each do |id, cs|\n" ++
+  "    until @__fin.empty?\n" ++
+  "      id, cs = @__fin.shift\n" ++
   "      cs.each do |c|\n" ++
-  "        c.call(id)\n" ++
+  "        begin\n" ++
+  "          c.call(id)\n" ++
+  "        rescue SystemExit\n" ++
+  "        rescue Exception => e\n" ++
+  "          unless $VERBOSE.nil?\n" ++
+  "            $stderr.puts \"warning: Exception in finalizer \" + c.inspect\n" ++
+  "            $stderr.puts e.message + \" (\" + e.class.to_s + \")\"\n" ++
+  "          end\n" ++
+  "        end\n" ++
   "      end\n" ++
   "    end\n" ++
-  "    @__fin.clear\n" ++
   "  end\n" ++
   "  # each_object(mod = nil) \{ |obj| }: every live object that is a `mod`\n" ++
   "  # (every object, for nil) -- classes and modules included, as ruby's are\n" ++
@@ -1363,10 +1403,13 @@ let core_prelude_d =
   "    def length; @h.size; end\n" ++
   "    def keys; @h.keys; end\n" ++
   "    def values; @h.values; end\n" ++
-  "    def each(&b); @h.each(&b); self; end\n" ++
-  "    def each_pair(&b); @h.each(&b); self; end\n" ++
-  "    def each_key(&b); @h.each_key(&b); self; end\n" ++
-  "    def each_value(&b); @h.each_value(&b); self; end\n" ++
+  // the iterators want a block -- they make no Enumerator -- except over an
+  // empty map, where ruby never gets as far as yielding
+  "    def __blk!(b); raise LocalJumpError, 'no block given' if b.nil? && !@h.empty?; end\n" ++
+  "    def each(&b); __blk!(b); @h.each(&b) unless @h.empty?; self; end\n" ++
+  "    def each_pair(&b); __blk!(b); @h.each(&b) unless @h.empty?; self; end\n" ++
+  "    def each_key(&b); __blk!(b); @h.each_key(&b) unless @h.empty?; self; end\n" ++
+  "    def each_value(&b); __blk!(b); @h.each_value(&b) unless @h.empty?; self; end\n" ++
   // (no #{} in this source: Mere interpolates its own strings the same way)
   // ruby shows the map's address and then each pair
   "    def inspect\n" ++
@@ -1382,7 +1425,13 @@ let core_prelude_d =
   // ...and the stored key is the OBJECT given, not the copy a Hash makes of an
   // unfrozen String key, so the originals are kept beside the table.
   "    def initialize; @h = Hash.new; @ks = []; end\n" ++
+  // an immediate cannot be collected, so it cannot be a weak key; and the key
+  // is hashed, so one without #hash (a BasicObject) is refused by that call
   "    def []=(k, v)\n" ++
+  "      if ::NilClass === k || ::TrueClass === k || ::FalseClass === k || ::Integer === k || ::Float === k || ::Symbol === k\n" ++
+  "        raise ArgumentError, 'WeakKeyMap keys must be garbage collectable'\n" ++
+  "      end\n" ++
+  "      k.hash\n" ++
   "      @ks << k unless @h.key?(k)\n" ++
   "      @h[k] = v\n" ++
   "      v\n" ++
@@ -3118,9 +3167,17 @@ let core_prelude_f =
   "  #   having them: a program that reads GC.stat to decide something would\n" ++
   "  #   decide it on fiction. :count and :time are real and are what the spec\n" ++
   "  #   asks for.\n" ++
+  "  #   ...and :major_gc_count, which is not fiction here: this collector has\n" ++
+  "  #   no minor collections, so every one it runs is a full (major) one.\n" ++
   "  def self.stat(arg = nil)\n" ++
-  "    s = \{ count: GC.count, time: GC.total_time / 1_000_000 }\n" ++
-  "    return s[arg] if arg.is_a?(Symbol)\n" ++
+  "    s = \{ count: GC.count, time: GC.total_time / 1_000_000, major_gc_count: GC.count, minor_gc_count: 0 }\n" ++
+  "    unless arg.nil? || arg.is_a?(Symbol) || arg.is_a?(Hash)\n" ++
+  "      raise TypeError, \"non-hash or symbol given\"\n" ++
+  "    end\n" ++
+  "    if arg.is_a?(Symbol)\n" ++
+  "      raise ArgumentError, \"unknown key: #\{arg}\" unless s.key?(arg)\n" ++
+  "      return s[arg]\n" ++
+  "    end\n" ++
   "    # `GC.stat(hash)` FILLS the hash it is given and answers it -- keys already\n" ++
   "    # in it that the collector does not know are left alone, which the spec\n" ++
   "    # reads.\n" ++
