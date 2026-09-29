@@ -1018,6 +1018,9 @@ and cvar_name_shaped = fn (nm: str) ->
   str_len nm >= 3 && str_eq (substring nm 0 2) "@@" && is_alpha (char_at nm 2)
 and ivar_name_checked = fn world -> fn (nm: str) ->
   if ivar_name_shaped nm then ivar_arg_name nm
+  // a struct member's slot (struct_slot) is reached by name from Struct's
+  // ruby half, and a member may be any Symbol -- `:"1 non symbol member"`
+  else if str_len nm >= 2 && str_eq (char_at nm 0) "@" && struct_is_slot nm then ivar_arg_name nm
   else (let _ = raise_exc world "NameError"
                   ("'" ++ nm ++ "' is not allowed as an instance variable name") in "")
 and cvar_name_checked = fn world -> fn (nm: str) ->
@@ -3661,32 +3664,6 @@ and struct_sym_lits = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, struct_sym_lits r)
 and struct_sym_vals = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (VSym m, struct_sym_vals r)
-and struct_to_h_pairs = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons (ESym m, Cons (EIVar (struct_slot m), struct_to_h_pairs r))
-and struct_index_body = fn (ms: str list) -> fn (i: int) ->
-  struct_index_go ms 0 (struct_len ms)
-and struct_len = fn (ms: str list) ->
-  match ms with Nil -> 0 | Cons (_, r) -> 1 + struct_len r
-and struct_index_go = fn (ms: str list) -> fn (i: int) -> fn (n: int) ->
-  match ms with
-  | Nil -> struct_index_refuse ()
-  | Cons (m, r) ->
-    ETern (struct_key_test m i n, EIVar (struct_slot m), struct_index_go r (i + 1) n)
-and struct_key_test = fn (m: str) -> fn (i: int) -> fn (n: int) ->
-  EBin ("||",
-        EBin ("||", EBin ("==", EVar "__k", ESym m), EBin ("==", EVar "__k", EStrL m)),
-        EBin ("||", EBin ("==", EVar "__k", EInt i), EBin ("==", EVar "__k", EInt (i - n))))
-and struct_index_refuse = fn (u: unit) ->
-  EStmt (SIf (Cons ((EMethod (EVar "__k", "is_a?", Cons (EConst "Integer", Nil)),
-                     Cons (SExpr (ERaise (Cons (EConst "IndexError",
-                            Cons (EBin ("+",
-                                        EBin ("+", EStrL "offset ", EMethod (EVar "__k", "to_s", (Nil : Expr list))),
-                                        EBin ("+", EStrL " too large for struct(size:",
-                                              EBin ("+", EMethod (EMethod (EMethod (ESelf, "to_a", (Nil : Expr list)), "size", (Nil : Expr list)), "to_s", (Nil : Expr list)),
-                                                    EStrL ")"))), Nil)))), Nil)), Nil),
-              Cons (SExpr (ERaise (Cons (EConst "NameError",
-                     Cons (EBin ("+", EBin ("+", EStrL "no member '", EMethod (EVar "__k", "to_s", (Nil : Expr list))),
-                                 EStrL "' in struct"), Nil)))), Nil)))
 and struct_kw_nil = fn (args: Val list) ->
   match args with
   | Nil -> false
@@ -3705,12 +3682,8 @@ and struct_kw_init = fn (args: Val list) ->
      | (true, v9) -> truthy v9
      | _ -> false)
   | Cons (_, r) -> struct_kw_init r
-and struct_kw_params = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons (m ++ ":", struct_kw_params r)
 and struct_pos_defaults = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons ((m, ENil), struct_pos_defaults r)
-and struct_kw_defaults = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons ((m ++ ":", ENil), struct_kw_defaults r)
 and struct_each_body = fn (ms: str list) ->
   Cons (SIf (Cons ((EUn ("!", EVar "block_given?"),
                     // `enum_for(:each) { self.class.members.size }`: Struct#each
@@ -3836,12 +3809,82 @@ and struct_common_src = fn (u: unit) ->
     "    self\n" ++
     "  end\n" ++
     "\n" ++
+    // ⚠ A struct can hold ITSELF (`car[:make] = car`), and comparing or
+    // hashing one walked it until the stack gave out. ruby's guards, written
+    // with a table of the walks in flight: == and eql? answer true for a
+    // PAIR already being compared (rb_exec_recursive_paired), and #hash is
+    // decided by the OUTERMOST call, which answers the class's hash alone
+    // once any inner one finds itself (rb_exec_recursive_outer) -- so two
+    // structs that are eql? through their cycles hash the same.
+    // The class is part of the hash, too: `Struct.new(:x).new(1)` and
+    // `Struct.new(:y).new(1)` hashed alike, as their to_a does.
+    // a keyword_init struct's #initialize (the generated one forwards here):
+    // keywords, or one positional Hash of them, and Symbol keys that name
+    // members -- every other key is listed in the refusal.
+    "  def __struct_kw_init(args, kw)\n" ++
+    "    unless args.empty?\n" ++
+    "      raise ArgumentError, \"wrong number of arguments (given \" + args.size.to_s + \", expected 0)\" if args.size > 1 || !kw.empty? || !(Hash === args[0])\n" ++
+    "      kw = args[0]\n" ++
+    "    end\n" ++
+    "    ms = self.class.members\n" ++
+    "    bad = kw.keys.reject \{ |k| Symbol === k && ms.include?(k) }\n" ++
+    "    raise ArgumentError, \"unknown keywords: \" + bad.map(&:to_s).join(\", \") unless bad.empty?\n" ++
+    "    kw.each \{ |k, v| instance_variable_set(\"@\" + k.to_s + 1.chr, v) }\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def __recur\n" ++
+    "    ::Struct.instance_variable_get(:@__recur) || ::Struct.instance_variable_set(:@__recur, \{})\n" ++
+    "  end\n" ++
+    "  private :__recur\n" ++
+    "\n" ++
     "  def hash\n" ++
-    "    to_a.hash\n" ++
+    "    seen = __recur\n" ++
+    "    throw seen[:__hash_outer] if seen.key?([:hash, __id__])\n" ++
+    "    outer = !seen.key?(:__hash_outer)\n" ++
+    "    seen[:__hash_outer] = Object.new if outer\n" ++
+    "    seen[[:hash, __id__]] = true\n" ++
+    "    begin\n" ++
+    "      return [self.class, *to_a].hash unless outer\n" ++
+    "      done = false\n" ++
+    "      h = catch(seen[:__hash_outer]) do\n" ++
+    "        v = [self.class, *to_a].hash\n" ++
+    "        done = true\n" ++
+    "        v\n" ++
+    "      end\n" ++
+    "      done ? h : [self.class].hash\n" ++
+    "    ensure\n" ++
+    "      seen.delete([:hash, __id__])\n" ++
+    "      seen.delete(:__hash_outer) if outer\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def ==(o)\n" ++
+    "    return true if equal?(o)\n" ++
+    "    return false unless o.class == self.class\n" ++
+    "    seen = __recur\n" ++
+    "    k = [:==, __id__, o.__id__]\n" ++
+    "    return true if seen.key?(k)\n" ++
+    "    seen[k] = true\n" ++
+    "    begin\n" ++
+    "      to_a == o.to_a\n" ++
+    "    ensure\n" ++
+    "      seen.delete(k)\n" ++
+    "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def eql?(o)\n" ++
-    "    o.class == self.class && to_a == o.to_a\n" ++
+    "    return true if equal?(o)\n" ++
+    "    return false unless o.class == self.class\n" ++
+    "    seen = __recur\n" ++
+    "    k = [:eql?, __id__, o.__id__]\n" ++
+    "    return true if seen.key?(k)\n" ++
+    "    seen[k] = true\n" ++
+    "    begin\n" ++
+    "      to_a.eql?(o.to_a)\n" ++
+    "    ensure\n" ++
+    "      seen.delete(k)\n" ++
+    "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def deconstruct_keys(ks)\n" ++
