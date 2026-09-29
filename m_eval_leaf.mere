@@ -10568,9 +10568,12 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "  def inspect = \"#<DateTime: #\{self}>\"\n" ++
     "\n" ++
-    "  def self.now\n" ++
+    "  # ⚠ with the fraction and the OFFSET: this read the local wall clock and\n" ++
+    "  # built it at +00:00, so `DateTime.now.to_time` was the local offset away\n" ++
+    "  # from Time.now (nine hours, on the machine that found it)\n" ++
+    "  def self.now(_start = Date::ITALY)\n" ++
     "    t = Time.now\n" ++
-    "    new(t.year, t.month, t.day, t.hour, t.min, t.sec)\n" ++
+    "    new(t.year, t.month, t.day, t.hour, t.min, t.sec + t.subsec, Rational(t.utc_offset, 86400))\n" ++
     "  end\n" ++
     "end\n" ++
     "\n" ++
@@ -13571,6 +13574,7 @@ and make_time_at_ns = fn world -> fn (secs: int) -> fn (ns: int) ->
   let _ = map_set ocls9 id "Time" in
   let _ = map_set iv9 (str_of_int id ++ "@__t") (VInt (time_ord_of_epoch cs)) in
   let _ = map_set time_inst (str_of_int id) (time_ord_of_epoch cs) in
+  let _ = map_set time_ltz (str_of_int id) (rb_env_get "TZ") in
   let _ = map_set iv9 (str_of_int id ++ "@__epoch") (VInt cs) in
   let _ = (if cn == 0 then () else map_set iv9 (str_of_int id ++ "@__tn") (VInt cn)) in
   VObj id
@@ -13604,9 +13608,16 @@ and pad_left_zeros = fn (s9: str) -> fn (w: int) ->
 // fails on GNU (-r wants a file) and falls through to the second. Where no
 // date(1) answers at all (the Wasm build's `run` is a constant), the zone is
 // UTC -- the old answer, now only where there is nothing better to ask.
-and tz_local = fn (ep: int) ->
-  let tz9 = rb_env_get "TZ" in
-  let key = tz9 ++ "|" ++ str_of_int (idiv_floor ep 86400) in
+//
+// ⚠ PER DAY WAS TOO COARSE. The first instant asked about in a day decided the
+//   whole day, so on a transition day every later question got the first
+//   one's answer: EST5EDT's `Time.local(2010, 3, 14, 1, 59, 59) + 1` stayed
+//   at -05:00 where ruby moves to -04:00, and whichever of the two came first
+//   in a program decided the other. Now the day's two ENDS are asked (the next
+//   day shares its start, so a run of days costs about one date(1) each), and
+//   only a day whose ends disagree is bisected, once, to the second.
+and tz_at = fn (tz9: str) -> fn (ep: int) ->
+  let key = tz9 ++ "|@" ++ str_of_int ep in
   let raw9 = (if map_has tz_cache key then map_get tz_cache key
               else
                 (let pre9 = (if str_eq tz9 "" then "" else "TZ=" ++ shq tz9 ++ " ") in
@@ -13623,6 +13634,28 @@ and tz_local = fn (ep: int) ->
      let nm9 = strip_nl (substring raw9 (if str_len raw9 > 6 then 6 else str_len raw9) (str_len raw9)) in
      (sg9 * (hh9 * 3600 + mm9 * 60), nm9))
   else (0, "UTC")
+// the first second of [lo, hi] that answers what hi answers (lo does not)
+and tz_bisect = fn (tz9: str) -> fn (lo: int) -> fn (hi: int) -> fn (olo: int) -> fn (nlo: str) ->
+  if hi - lo <= 1 then hi
+  else
+    (let mid = lo + (hi - lo) / 2 in
+     let (om, nm) = tz_at tz9 mid in
+     if om == olo && str_eq nm nlo then tz_bisect tz9 mid hi olo nlo else tz_bisect tz9 lo mid olo nlo)
+and tz_local = fn (ep: int) -> tz_local_in (rb_env_get "TZ") ep
+// the zone a local Time was made under (see time_ltz), else the current one
+and time_tz_of = fn (oid: int) ->
+  if map_has time_ltz (str_of_int oid) then map_get time_ltz (str_of_int oid) else rb_env_get "TZ"
+and tz_local_in = fn (tz9: str) -> fn (ep: int) ->
+  let d0 = idiv_floor ep 86400 * 86400 in
+  let (oa, na) = tz_at tz9 d0 in
+  let (ob, nb) = tz_at tz9 (d0 + 86400) in
+  if oa == ob && str_eq na nb then (oa, na)
+  else
+    (let key = tz9 ++ "|sw" ++ str_of_int d0 in
+     let sw = (if map_has tz_cache key then int_of_str (map_get tz_cache key)
+               else (let s9 = tz_bisect tz9 d0 (d0 + 86400) oa na in
+                     let _ = map_set tz_cache key (str_of_int s9) in s9)) in
+     if ep < sw then (oa, na) else (ob, nb))
 and strip_nl = fn (s9: str) ->
   if str_len s9 > 0 && str_eq (char_at s9 (str_len s9 - 1)) "\n" then substring s9 0 (str_len s9 - 1) else s9
 
@@ -13634,7 +13667,7 @@ and time_off = fn world -> fn (v: Val) ->
     (if map_has iv9 (str_of_int oid ++ "@__utc") then 0
      else if map_has iv9 (str_of_int oid ++ "@__off")
      then (match map_get iv9 (str_of_int oid ++ "@__off") with VInt n9 -> n9 | _ -> 0)
-     else (match tz_local (match prim_time_epoch world v with VInt n -> n | _ -> 0) with (o9, _) -> o9))
+     else (match tz_local_in (time_tz_of oid) (match prim_time_epoch world v with VInt n -> n | _ -> 0) with (o9, _) -> o9))
   | _ -> 0
 and time_is_utc = fn world -> fn (v: Val) ->
   let (_, _, _, iv9) = world in
@@ -13678,7 +13711,10 @@ and time_str_of = fn world -> fn (v: Val) -> fn (withfrac: bool) ->
   let (_, _, _, iv9) = world in
   let (yy, mo, dd, hh, mi, ss) = time_local_parts world v in
   let utc = time_is_utc world v in
-  pad_left_zeros (str_of_int yy) 4 ++ "-" ++ pad_left_zeros (str_of_int mo) 2 ++ "-"
+  // a negative year is its sign and then four digits (-0005), not the
+  // digits of "-5" zero-padded into "00-5"
+  (if yy < 0 then "-" ++ pad_left_zeros (str_of_int (0 - yy)) 4 else pad_left_zeros (str_of_int yy) 4)
+  ++ "-" ++ pad_left_zeros (str_of_int mo) 2 ++ "-"
   ++ pad_left_zeros (str_of_int dd) 2 ++ " " ++ pad_left_zeros (str_of_int hh) 2 ++ ":"
   ++ pad_left_zeros (str_of_int mi) 2 ++ ":" ++ pad_left_zeros (str_of_int ss) 2
   ++ (if withfrac then time_frac_str (time_nsec_of world v) else "")
@@ -13717,7 +13753,8 @@ and time_ord = fn (args: Val list) ->
   let s = (match args with
            | Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (VInt a, _)))))) -> a
            | Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (VFlt f9, _)))))) -> int_of_float f9
-           | Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (VRat (rn9, rd9), _)))))) -> int_of_float (rat_to_f rn9 rd9)
+           // exactly, not through a Float: 59 + 999999999/10^9 is second 59
+           | Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (VRat (rn9, rd9), _)))))) -> int_of_str (big_div_s rn9 rd9)
            | _ -> 0) in
   days_from_civil y m d * 86400 + h * 3600 + mi * 60 + s
 and time_ord_of = fn world -> fn (v: Val) ->
