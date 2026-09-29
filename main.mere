@@ -932,6 +932,15 @@ let gc_collect = fn env -> fn world ->
     let _ = map_clear str_frozen in
     let _ = map_iter liveF (fn (k: int) -> fn (v: str) -> map_set str_frozen k v) in
     let _ = (if nc then () else map_compact str_frozen) in
+    // ...and the chilled marks, which are keyed the same way (as text): a
+    // dead string's mark would otherwise outlive it -- one per literal
+    // evaluated and per Symbol#to_s, kept forever.
+    let liveC = map_new () in
+    let _ = map_iter str_chilled (fn (k: str) -> fn (v: str) ->
+      if map_has live (int_of_str k * 8 + 1) then (let _ = map_set liveC k v in ()) else ()) in
+    let _ = map_clear str_chilled in
+    let _ = map_iter liveC (fn (k: str) -> fn (v: str) -> map_set str_chilled k v) in
+    let _ = (if nc then () else map_compact str_chilled) in
     // The call-bookkeeping maps: one write per name/file/meth/line PER CALL
     // and a live_frames set+delete per frame, all keyed by depth (or a fixed
     // flag), so the live population is at most the recursion guard's 15000
@@ -2552,6 +2561,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // before the in-place fast paths below (which bypass invoke_val_c) --
        // except for a yielder called with NO block, which mutates nothing and
        // hands back an Enumerator (the error waits for its #each).
+       let _ = chill_touch world recv name in
        let _ = (if builtin_mut_on_frozen world recv name
                    && (if enum_needs_block name then false else true)
                    && (if delete_is_noop env world recv name args then false else true)
@@ -2754,6 +2764,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // an object whose class defines the operator dispatches to it.
     let va0 = eval_e env world blk a in
     // `<<` mutates a String/Array receiver in place — FrozenError first.
+    let _ = (if str_eq op "<<" then chill_touch world va0 "<<" else ()) in
     let _ = (if str_eq op "<<" && builtin_mut_on_frozen world va0 "<<"
              then let _ = raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name va0 ++ ": " ++ inspect va0) (Cons (("__recv", va0), Nil)) in ()
              else ()) in
@@ -3650,9 +3661,8 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
   // a non-nil $; or $, is deprecated, and ruby says so when the deprecation
   // warnings are on
   let _ = (if (str_eq slot ";" || str_eq slot ",") && (match v with VNil -> false | _ -> true)
-              && map_has warn_cats "deprecated" && truthy (map_get warn_cats "deprecated")
-           // (through rb_warn: silent under $VERBOSE = nil, as suppress_warning
-           // expects, and handed to Warning.warn like every other warning)
+              && deprecation_says ()
+           // (through rb_warn: handed to Warning.warn like every other warning)
            then rb_warn world ("non-nil '$" ++ slot ++ "' is deprecated")
            else ()) in
   let _ = map_set globals slot v in
@@ -5484,6 +5494,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
   // The frozen check in invoke_val_c only guards the non-block dispatch, so a
   // block-form mutator (delete_if / keep_if / map! / sort! ...) reached this
   // far without one.
+  let _ = chill_touch world recv name in
   if builtin_mut_on_frozen world recv name then
     raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
   else
@@ -9318,6 +9329,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // assignment inside it is what refuses. The Set shipped here has a private
   // `__modify!` that raises with ruby's message, and this guard was answering
   // first, about `Object` (`can't modify frozen Object: #<object>`).
+  let _ = chill_touch world recv name in
+  // String#split with no pattern falls back to $;, and a non-nil $; is
+  // deprecated: ruby says so (as a deprecation) every time it is used.
+  let _ = (if (str_len name == 5 && str_eq name "split") && (match recv with VStr _ -> true | _ -> false)
+              && (match args with Nil -> true | Cons (VNil, _) -> true | _ -> false)
+              && (match (if map_has globals ";" then map_get globals ";" else VNil) with VNil -> false | _ -> true)
+              && deprecation_says ()
+           then rb_warn world "$; is set to non-nil value" else ()) in
   if builtin_mut_on_frozen world recv name
      && (if enum_needs_block name then false else true)
      && (if delete_is_noop env world recv name args then false else true) then
@@ -10611,6 +10630,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  then (if map_has sup9 tag0 then map_get sup9 tag0 else "String")
                  else tag0) in
      let _ = (if tagged9 then map_set hng_store (hng_key cp) tag9 else ()) in
+     // ...and so does a CHILLED literal's state: #clone of one is chilled
+     // too (it warns when mutated), #dup is an ordinary string
+     let _ = (match (recv, cp) with
+              | (VStr h9, VStr c9) ->
+                (if (str_len name == 5 && str_eq name "clone") && map_has str_chilled (str_of_int h9)
+                 then map_set str_chilled (str_of_int c9) (map_get str_chilled (str_of_int h9)) else ())
+              | _ -> ()) in
      let c99 = (if tagged9 then (if is_sng_cls tag9 && map_has sup9 tag9 then map_get sup9 tag9 else tag9) else class_name recv) in
      let _ = (if has_meth world c99 "initialize_copy"
               then (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -12426,10 +12452,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 3 && str_eq name "new") || (str_len name == 4 && str_eq name "open") then file_open_obj world args
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for File"))
     // Dir class methods (pwd via env, mkdir via the shell).
-    // Warning[:category] — the warning-category switches. mere-ruby emits no
-    // categorised warnings, so every category reads false and a write is
+    // Warning[:category] — the warning-category switches: a write is
     // accepted and remembered (`Warning[:deprecated] = true` is a common
-    // opening line in a test suite).
+    // opening line in a test suite), and the deprecations this interpreter
+    // does issue (a chilled string mutated, see chill_touch) read it.
     else if str_eq c "Warning" && ((str_len name == 2 && str_eq name "[]") || (str_len name == 3 && str_eq name "[]=")) then
       // the four categories ruby knows; anything else is refused, a
       // non-Symbol by type. :experimental is ON by default, the rest off.
@@ -12725,7 +12751,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VRegex (b2, f2, e2), rest9) ->
          (let _ = (match rest9 with
                    | Cons (VNil, _) -> () | Cons (VHsh _, _) -> () | Nil -> ()
-                   | _ -> rb_warn world "flags ignored") in
+                   | _ -> (if verbose_set () then rb_warn world "flags ignored" else ())) in
           VRegex (b2, f2, e2))
        | Cons (other9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into String")
        | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
@@ -22600,6 +22626,46 @@ and meth_source_location = fn world -> fn (own0: str) -> fn (nm: str) -> fn (rec
 // raises at the write, so `def zap!; :ok; end` answers on a frozen receiver;
 // the Set shipped here has a private `__modify!` that raises with ruby's own
 // message, and the guard was answering first, about `Object`.
+// A CHILLED string (a literal in a file with no frozen_string_literal
+// comment, or what Symbol#to_s answers) is not frozen, but ruby 3.4+ warns
+// the first time one is changed -- and then it is an ordinary string, so the
+// warning comes once. Giving it a singleton class or an instance variable is
+// a change too. The warning is a deprecation, so it is said only while
+// Warning[:deprecated] is on (and $VERBOSE is not nil, see rb_warn).
+and chill_touch = fn world -> fn (recv: Val) -> fn (name: str) ->
+  match recv with
+  | VStr h ->
+    // (a chilled string frozen since is simply frozen: FrozenError, no warning)
+    (if map_has str_chilled (str_of_int h) && chill_changes name && (if sfrozen_get h then false else true)
+        && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
+       (let how = map_get str_chilled (str_of_int h) in
+        let _ = map_delete str_chilled (str_of_int h) in
+        if deprecation_says () then
+          rb_warn world (if str_len how > 1 && str_eq (substring how 0 1) ":"
+                         then "string returned by " ++ how ++ ".to_s will be frozen in the future"
+                         else "literal string will be frozen in the future (run with --debug-frozen-string-literal for more information)")
+        else ())
+     else ())
+  | _ -> ()
+// Is a DEPRECATION to be said? Only while Warning[:deprecated] is on and
+// $VERBOSE is not nil -- and $VERBOSE here is nil until a program sets it
+// (it reads nil, which is -W0's answer). ⚠ That second half is what keeps
+// these off in the spec harness, where the reference runs with -W0 and a
+// deprecation outside a `complain` block is silent: the harness's shim turns
+// the category on, and every chilled literal a spec mutated would otherwise
+// have been a line only this side printed.
+and deprecation_says = fn (u: unit) ->
+  map_has warn_cats "deprecated" && truthy (map_get warn_cats "deprecated") && verbose_set ()
+// $VERBOSE set, and not to nil (the warnings this interpreter learned to give
+// recently are gated on it, for the reason above)
+and verbose_set = fn (u: unit) ->
+  map_has globals (gvar_slot "VERBOSE")
+  && (match map_get globals (gvar_slot "VERBOSE") with VNil -> false | _ -> true)
+// the String methods that change their receiver (String#delete does not)
+and chill_changes = fn (name: str) ->
+  (is_mutating_method name && (if str_eq name "delete" then false else true))
+  || str_eq name "bytesplice" || str_eq name "singleton_class" || str_eq name "instance_variable_set"
+  || str_eq name "extend" || str_eq name "define_singleton_method"
 and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
   is_mutating_method name && val_frozen_mut recv
   && (if has_meth world (dispatch_cls_of world recv) name then false else true)
@@ -23242,10 +23308,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBool _ -> str_fstring (mkstr (to_s recv))
      | VNil -> str_fstring (mkstr "")
      // a Symbol's text carries the symbol's encoding (see sym_enc_name).
+     // ...and is CHILLED (ruby 3.4..4.0): mutating it warns, naming the
+     // symbol (see chill_touch)
      | VSym sy ->
        (let c = mkstr sy in
         (match c with
-         | VStr cid -> (let _ = senc_set cid (sym_enc_name sy) in c)
+         | VStr cid -> (let _ = senc_set cid (sym_enc_name sy) in
+                        let _ = map_set str_chilled (str_of_int cid) (":" ++ sy) in c)
          | _ -> c))
      | _ -> mkstr (to_s recv))
   // true / false / nil inspect to their ONE frozen string too (for the two
