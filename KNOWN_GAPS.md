@@ -67,7 +67,7 @@ self to nil and refusing its captured environment -- the same machinery
 `instance_exec` already has, pointed the other way. Parallelism is a different
 project, and nothing in the corpus needs it.
 
-## A Fiber runs on a coroutine, and while one is suspended nothing is compacted
+## A Fiber runs on a coroutine, and a suspended one is read conservatively
 
 ```ruby
 fib = Fiber.new { a, b = 0, 1; loop { Fiber.yield a; a, b = b, a + b } }
@@ -107,16 +107,14 @@ two threads over channels. Measured against that build, same machine:
   came to 1.7 GB. There is no fixed ceiling on the number (the thread build's
   was 8192); on Linux each takes two mappings of the 65530 a process may have.
 
-**While a fiber is suspended, collections run but do not compact.** A
-suspended stack holds pointers into the stores' arenas in C variables, and
-compaction frees an arena; clearing a store and setting its survivors back
-frees nothing, so a collection under a suspended fiber gives back entries --
-ids, table slots, the side tables -- and not bytes. The bytes come back at the
-first collection with no fiber suspended. Measured on a loop of short-lived
-values under a held Enumerator (300,000 iterations): 608 MB and no collection
-at all before, 546 MB and five collections now.
+**Collections run and compact while fibers are suspended.** A suspended stack
+holds pointers into the stores' arenas in C variables, and the runtime keeps
+any arena such a stack points into (mere v0.1.547-548) and frees it at a later
+compaction. Measured on a loop of short-lived values under a held Enumerator
+(300,000 iterations): 546 MB -> 357 MB with compaction (the control without a
+fiber, 383 MB).
 
-What a suspended stack holds is rooted in two parts. Its frames' locals (each
+What a suspended stack holds is rooted in three parts. Its frames' locals (each
 frame's env is kept by call depth), and what each frame's statement has built
 so far but not stored -- the array a `map` is filling, an argument already
 evaluated, the left side of an operator. Every allocation takes its id from a
@@ -141,12 +139,33 @@ fs.map(&:resume)
 working: until the intervals, the array `map` was building was held by a C
 variable only, and that pass abandoned all 1100 fibers in it.
 
-**What is still not seen**: a value that was reachable when its statement
-began and is held only by a C variable since -- `q = [mk]; [q.pop,
-Fiber.yield(1)]`, where the popped string was built by an earlier statement and
-nothing reachable holds it after the pop. A collection while that fiber is
-suspended can blank it. Seeing it takes a scan of the suspended stack itself,
-which is also what compaction under a suspended fiber would need.
+The third part is what a statement TOOK: a value that was reachable when the
+statement began and is held only by a C variable since -- `[q.pop,
+Fiber.yield(1)]`, where the queue no longer has the popped object. The
+intervals cannot see it (it is older than the statement), and a collection
+while the fiber was suspended freed it: the fiber crashed when it resumed (2 of
+4 shapes; corpus/235 has 13). Each collection now reads every suspended stack
+for the handles it holds (mere's `coro_scan_ints`, v0.1.549; `fb_scan_stack`):
+the words of the stack, and the nodes they point at, followed through the
+fiber's own regions and three hops into anything else. It is conservative --
+a number that only looks like a handle keeps that entry one collection longer
+-- and every handle is numbered from 2^48 so that a loop index or an
+Integer's value is never one (`handle_base`; `object_id` and the inspect
+address subtract it, so what a program sees is unchanged). A stack is read
+once per stop and its answer kept until it runs again. What it costs:
+`bench/csv.sh` parse_line 5.03 -> 5.19 s, generate_line 1.26 -> 1.40 s; a
+statement that makes and drops 9000 stepped Enumerators, 0.97 -> 1.67 s (each
+is still a suspended fiber the collection must treat as able to run).
+
+⚠ **Which fibers can run again is decided WITHOUT the scan.** A pointer into
+the middle of a table's arrays reads the neighbouring handles too, and letting
+those numbers make fibers reachable made every dropped Enumerator of a loop
+"reachable" -- the reclaim pass gave back none of 9000. So the reclaim pass
+decides precisely, as before, and reads only the RUNNING stack (which it
+interrupts mid-statement) to spare a Fiber held in a C variable there. **A
+Fiber held only in a C variable of ANOTHER suspended fiber can still be given
+back by that pass** -- `[fibers.pop, Fiber.yield]` inside a fiber, with more
+than 1024 fibers live while it waits.
 
 A fiber that IS reachable keeps its stack's values alive until it ends:
 `while row = csv.shift` keeps the CSV's parser fiber for the whole loop.
