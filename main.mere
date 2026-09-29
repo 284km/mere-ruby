@@ -1071,6 +1071,7 @@ let fb_reclaim = fn env -> fn world ->
   };
 
 import "m_eval_leaf.mere";
+import "m_pack.mere";
 
 let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   match e with
@@ -2430,9 +2431,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          if tagged && has_meth world tagcls name then invoke world newblk other tagcls name args
          else if tagged && (if str_eq (blt_alias_lookup world (ancestors_of world tagcls) name) "" then false else true) then
            (let src = blt_alias_lookup world (ancestors_of world tagcls) name in
-            match args with
-            | Cons (arg, _) -> if is_binary_op_name src then arith_bin src other arg else prim_method other src args
-            | Nil -> prim_method other src args)
+            blt_alias_call env world other src args)
          else
            let pcls = class_name other in
            if has_meth world pcls name then invoke world newblk other pcls name args
@@ -9055,21 +9054,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     (if str_eq name0 "!" then VBool (if truthy recv0 then false else true)
      else apply_bin_vals world blk "-" (VInt (0 - 1)) recv0)
   else
-  // ⚠ Array#pack's ARMS CANNOT CONVERT: pack_one is a pure function in the
-  //   leaf module with no world and no dispatcher, so every arm matches
-  //   `Cons (VStr h, t)` and falls through for anything else --
-  //   `[obj_with_to_str].pack("a3")` answered "\x00" instead of the object's
-  //   text, and six spec files read exactly that. The conversion has to
-  //   happen where there IS a world, which is here.
-  //   An object that answers #to_str becomes its String and one that answers
-  //   #to_int becomes its Integer; anything already one of those, or with
-  //   neither, is untouched. So this can only add conversions that used to be
-  //   dropped, never change a value pack already understood.
-  let recv0 = (if (str_len name0 == 4 && str_eq name0 "pack")
-               then (match recv0 with
-                     | VArr aid9 -> arr_new (pack_conv_args env world (deref aid9))
-                     | _ -> recv0)
-               else recv0) in
   let recv = recv0 in
   let name = name0 in
   // File.read(pathname), Dir.glob(pathname), IO.write(pathname, s): a path
@@ -10799,18 +10783,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // "+"), everything else through prim_method.
   else if (if str_eq hk "" then false else true) && map_has hng_store hk && (if str_eq (blt_alias_lookup world (ancestors_of world (map_get hng_store hk)) name) "" then false else true) then
     (let src = blt_alias_lookup world (ancestors_of world (map_get hng_store hk)) name in
-     match args with
-     | Cons (arg, _) -> if is_binary_op_name src then arith_bin src recv arg else prim_method recv src args
-     | Nil -> prim_method recv src args)
+     blt_alias_call env world recv src args)
   // a plain builtin value (no subclass tag) whose class has an alias-to-builtin
   // registered (e.g. `class Integer; alias_method :old_plus, :+; end`): the
   // alias delegates to the source builtin — a binary operator via arith_bin
   // (prim_method has no "+"), everything else via prim_method.
   else if (if str_eq (blt_alias_lookup world (ancestors_of world (class_name recv)) name) "" then false else true) then
     (let src = blt_alias_lookup world (ancestors_of world (class_name recv)) name in
-     match args with
-     | Cons (arg, _) -> if is_binary_op_name src then arith_bin src recv arg else prim_method recv src args
-     | Nil -> prim_method recv src args)
+     blt_alias_call env world recv src args)
   // an interpolated regex literal materializes here: validate at runtime —
   // a malformed interpolation is a RegexpError (unlike the SyntaxError a
   // malformed LITERAL raises at parse time).
@@ -20143,6 +20123,15 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                && (let (m9, _, _, _) = world in
                    if map_has m9 name then false else true) then
          run_loop_builtin env world blk newblk
+       // String#unpack with a block hands it each value and answers nil;
+       // #unpack1 takes no block and ignores one.
+       else if ((str_len name == 6 && str_eq name "unpack") || (str_len name == 7 && str_eq name "unpack1"))
+               && (match recv with VStr _ -> true | _ -> false) then
+         (match recv with
+          | VStr h ->
+            (if str_len name == 7 then (match unpack_call env world h 2 args with Cons (v, _) -> v | Nil -> VNil)
+             else iter_each_result (arr_each world blk newblk (unpack_call env world h 1 args)) VNil)
+          | _ -> recv)
        else builtin_iter world blk newblk recv name args))
 
 // dispatch on a primitive receiver: reopened built-in classes win (class
@@ -21007,45 +20996,17 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | _ -> make_enum_a world recv name args)
   else if (str_len name == 5 && str_eq name "bytes") && (match recv with VStr _ -> true | _ -> false) then
     (match recv with VStr s -> arr_new (str_bytes_val (sget s) 0) | _ -> recv)
-  // String#unpack — the inverse of the Array#pack subset: "U*" yields
-  // codepoints, "C*"/"c*" (and anything else, as a default) yields bytes.
+  // String#unpack / #unpack1 and Array#pack: the engine is m_pack.mere, and
+  // the conversions it asks for are unpack_call's / pack_call's.
   else if ((str_len name == 6 && str_eq name "unpack") || (str_len name == 7 && str_eq name "unpack1")) && (match recv with VStr _ -> true | _ -> false) then
     (match recv with
-     | VStr s ->
-       (match args with
-        | Cons (VStr fmt, rest) ->
-          let f = sget fmt in
-          // ...and the same refusal for unpack. unpack1 stops at its first
-          // value, so ruby only reaches a `%` there when it comes first.
-          let _ = (if (if (str_len name == 7 && str_eq name "unpack1")
-                       then str_len f > 0 && str_eq (char_at f 0) "%" else str_contains f "%")
-                   then (let _ = raise_exc world "ArgumentError" "% is not supported" in ()) else ()) in
-          // unpack(fmt, offset: n) starts n BYTES in; negative refuses, past
-          // the end refuses, AT the end unpacks the empty string.
-          let sv0 = sget s in
-          let off = (match rest with
-                     | Cons (VHsh h9, _) ->
-                       (match hash_lookup (hderef h9) (VSym "offset") with
-                        | (true, VInt o) -> o
-                        | _ -> 0)
-                     | _ -> 0) in
-          let _ = (if off < 0 then (let _ = prim_raise "ArgumentError" "offset can't be negative" in ())
-                   else if off > str_len sv0 then (let _ = prim_raise "ArgumentError" "offset outside of string" in ())
-                   else ()) in
-          let sv = (if off > 0 then substring sv0 off (str_len sv0) else sv0) in
-          let d0 = (if str_len f > 0 then char_at f 0 else "") in
-          // "U" (UTF-8 codepoints) keeps its own path; everything else goes
-          // through the byte-directive unpacker (N/n/V/v/C/c/H/a/A + count/*).
-          let arr = (if str_eq d0 "U" then arr_new (utf8_codepoints sv 0)
-                     else rb_unpack sv f) in
-          // unpack1 returns just the first element (nil when empty).
-          if (str_len name == 7 && str_eq name "unpack1") then
-            (match arr with VArr id -> (match deref id with Cons (v, _) -> v | Nil -> VNil) | _ -> VNil)
-          else arr
-        | Cons (VNil, _) -> prim_raise "TypeError" "no implicit conversion of nil into String"
-        | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ class_name other ++ " into String")
-        | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
+     | VStr h ->
+       (let vals = unpack_call env world h (if str_len name == 7 then 2 else 0) args in
+        if str_len name == 7 then (match vals with Cons (v, _) -> v | Nil -> VNil)
+        else arr_new vals)
      | _ -> recv)
+  else if (str_len name == 4 && str_eq name "pack") && (match recv with VArr _ -> true | _ -> false) then
+    (match recv with VArr id -> pack_call env world (deref id) args | _ -> recv)
   // combination / permutation without a block are ENUMERATORS, not the list of
   // tuples: the enumerator is answered from the array as it is when it is
   // WALKED, so `enum = a.permutation; a << 3; enum.to_a` sees the third element.
@@ -25817,54 +25778,6 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // (which arrives here, unlike an Array's) answered `{a: 1, b: 2, a: 3}` --
   // a hash printing one key twice, whose [] then found the first.
   else if (str_len name == 4 && str_eq name "to_h") then (match recv with VArr id -> mkhash (hash_merge Nil (val_to_h (deref id))) | VHsh _ -> recv | VNil -> mkhash Nil | _ -> (let _ = prim_nm_set (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
-  // Array#pack — a small but common subset: "U"/"U*" encode integer codepoints
-  // as UTF-8, "C"/"c" pack the low byte of each integer. A bare directive packs
-  // one element, "*" packs all. (Other directives are not implemented.)
-  else if (str_len name == 4 && str_eq name "pack") then
-    (match recv with
-     | VArr id ->
-       let xs = deref id in
-       (match args with
-        | Cons (VStr fmt, _) ->
-          let fmt = sget fmt in
-          // ⚠ `%` is a directive ruby names and refuses ("% is not
-          //   supported"); the walk below skipped it as unknown and packed
-          //   the rest as if it had not been there.
-          let _ = (if str_contains fmt "%" then (let _ = prim_raise "ArgumentError" "% is not supported" in ()) else ()) in
-          // A format has MANY directives, each with its own count: "NN" packs
-          // two 32-bit words, not one. Walk them, consuming values as we go.
-          let packed = pack_go fmt (str_len fmt) 0 xs "" in
-          // `pack(fmt, buffer: s)` APPENDS to s and answers s itself, so the
-          // caller can pack into one string repeatedly without reallocating.
-          // a packed result is BINARY, except "U" (UTF-8 characters).
-          // ⚠ ...and except a format that emits only ASCII TEXT. `m`, `M` and
-          //   `u` (base64, quoted-printable, uuencode) produce printable ASCII,
-          //   and ruby tags that result US-ASCII -- as it does the empty
-          //   format. Answering BINARY for them made every Base64.encode64
-          //   result BINARY, which three library/base64 and core/array/pack
-          //   rows read. Asked of the reference directive by directive: one
-          //   binary directive anywhere (C, a, N, x ...) makes it BINARY, and
-          //   a leading U makes it UTF-8.
-          let penc = (if str_contains fmt "U" then "UTF-8"
-                      else if pack_fmt_is_text fmt 0 then "US-ASCII"
-                      else "ASCII-8BIT") in
-          let tag = fn (v: Val) -> (match v with VStr rid -> (let _ = senc_set rid penc in v) | _ -> v) in
-          (match args with
-           | Cons (_, Cons (VHsh hid, _)) ->
-             // ...and the format runs OVER the buffer: `@n` is an offset from
-             // the buffer's start, so a longer buffer is cut there and a
-             // shorter one padded with NULs. The buffer must be a String and
-             // not frozen.
-             (match hash_lookup (hderef hid) (VSym "buffer") with
-              | (true, VStr bh) ->
-                (if sfrozen_get bh then prim_raise "FrozenError" ("can't modify frozen String: " ++ inspect (VStr bh))
-                 else (let _ = sset bh (pack_go fmt (str_len fmt) 0 xs (sget bh)) in VStr bh))
-              | (true, VNil) -> tag (mkstr packed)
-              | (true, other9) -> prim_raise "TypeError" ("buffer must be String, not " ++ class_name other9)
-              | _ -> tag (mkstr packed))
-           | _ -> tag (mkstr packed))
-        | _ -> mkstr "")
-     | _ -> (let _ = prim_nm_set (mkstr "pack") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pack'")) in fail "mere-ruby: undefined method 'pack'")))
   // Hash
   // Array mutation (in place; VArr is a handle into the shared store).
   else if (str_len name == 4 && str_eq name "push") || (str_len name == 6 && str_eq name "append") then
@@ -27997,6 +27910,21 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
 
 // implicit-self send when self is a primitive: honour a subclass tag (its own
 // method, then an alias-to-builtin) before the base primitive class + prims.
+// An alias of a builtin (`alias _orig_pack pack`) runs the builtin under its
+// source name: a binary operator through arith_bin, everything else through
+// prim_method. ⚠ ...except the builtins whose arm needs a WORLD, which
+// prim_method (the world-less leaf) does not have: pack and unpack convert
+// their values through methods, so their alias was "undefined method" while
+// the direct call worked. They are called here directly -- not through
+// dispatch_prim, which asks the class for a user method of the same name
+// first, and the usual reason for the alias is that there is one.
+and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn (args: Val list) ->
+  match (recv, args) with
+  | (VArr id, _) when str_eq src "pack" -> pack_call env world (deref id) args
+  | (VStr h, _) when str_eq src "unpack" -> arr_new (unpack_call env world h 0 args)
+  | (VStr h, _) when str_eq src "unpack1" -> (match unpack_call env world h 2 args with Cons (v, _) -> v | Nil -> VNil)
+  | (_, Cons (arg, _)) when is_binary_op_name src -> arith_bin src recv arg
+  | _ -> prim_method recv src args
 and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> fn (args: Val list) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   let hk = hng_key other in
@@ -28005,9 +27933,7 @@ and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> 
   if tagged && has_meth world tagcls name then invoke world noblk other tagcls name args
   else if tagged && (if str_eq (blt_alias_lookup world (ancestors_of world tagcls) name) "" then false else true) then
     (let src = blt_alias_lookup world (ancestors_of world tagcls) name in
-     match args with
-     | Cons (arg, _) -> if is_binary_op_name src then arith_bin src other arg else prim_method other src args
-     | Nil -> prim_method other src args)
+     blt_alias_call env world other src args)
   else
     let cls = class_name other in
     if has_meth world cls name then invoke world noblk other cls name args
@@ -28015,9 +27941,7 @@ and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> 
     // `class Integer; alias_method :old_plus, :+`): delegate to the source.
     else if (if str_eq (blt_alias_lookup world (ancestors_of world cls) name) "" then false else true) then
       (let src = blt_alias_lookup world (ancestors_of world cls) name in
-       match args with
-       | Cons (arg, _) -> if is_binary_op_name src then arith_bin src other arg else prim_method other src args
-       | Nil -> prim_method other src args)
+       blt_alias_call env world other src args)
     // the FULL receiver dispatcher, not just prim_method: an implicit-self call
     // inside a builtin subclass (`gsub!` in a String subclass, `store` in a
     // Hash one) must see everything `self.name` would, and get a proper
@@ -31052,16 +30976,6 @@ and argf_rest_lines = fn (u: unit) ->
   if p9 >= str_len s9 then (Nil : Val list)
   else val_list_of_strs (str_lines_go s9 p9 p9 (str_len s9))
 
-// Is every directive in a pack format one of the text encoders (m, M, u)?
-// Counts, `*`, `0` and whitespace are not directives. An empty format is text.
-and pack_fmt_is_text = fn (f: str) -> fn (i: int) ->
-  if i >= str_len f then true
-  else
-    (let c9 = char_at f i in
-     if str_eq c9 "m" || str_eq c9 "M" || str_eq c9 "u" || str_eq c9 "*"
-        || str_eq c9 " " || str_eq c9 "\n" || str_eq c9 "\t" || is_digit c9
-     then pack_fmt_is_text f (i + 1)
-     else false)
 
 // log of an Integer too wide for a double.
 // ⚠ `to_f` of 2**10001 is Infinity, so every Math log of a large bignum
@@ -32087,218 +32001,6 @@ and path_args_all = fn nb -> fn world -> fn (args: Val list) ->
 // ARGF input: the concatenation of every file named in ARGV (read via
 // read_file), or stdin when ARGV is empty — the stream ARGF presents.
 
-// --- String#unpack (a byte-safe subset) --------------------------------
-// A byte at index i (0..255). char_at/ord are byte-safe on the length-header
-// str representation, so embedded NULs read fine.
-// n big-endian bytes at i as an unsigned integer.
-// n little-endian bytes at i (mul starts at 1, grows *256).
-// read a count after a directive: an integer, '*' (rest), or 1 (default).
-// returns (count_or_-1_for_star, next_fmt_index).
-// Array#pack: walk the format's directives, each consuming `count` values.
-
-
-// unpack `s` per `fmt`, accumulating Vals (newest-first, reversed at the end).
-and rb_unpack = fn (s: str) -> fn (fmt: str) ->
-  arr_new (rev_vals (rb_unpack_go s (str_len s) 0 fmt (str_len fmt) 0 Nil))
-and rb_unpack_go = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str) -> fn (fl: int) -> fn (fi: int) -> fn (acc: Val list) ->
-  if fi >= fl then acc
-  else
-    let d = char_at fmt fi in
-    if str_eq d " " then rb_unpack_go s slen si fmt fl (fi + 1) acc
-    else
-      // ⚠ ...and `<`/`>` are read here too. unpack had the same gap as pack:
-      //   the modifier was left for rb_count, which is not a count, so every
-      //   modified directive unpacked as its unmodified self.
-      let (d, fi1) = pack_mods fmt fl (fi + 1) d in
-      let (cnt, fi2) = rb_count fmt fl fi1 in
-      // width per element for fixed-width directives (0 = string-consuming).
-      // ⚠ int_dir_width is the SAME TABLE pack reads. Before this, unpack knew
-      //   only N/n/V/v/C/c, so `"\x02\x01".unpack("S*")` answered [] -- an
-      //   empty array for a directive ruby understands, which is the quietest
-      //   possible wrong answer. One table, both directions.
-      let w = (if int_dir_width d > 0 then int_dir_width d
-               else if str_eq d "C" || str_eq d "c" then 1
-               else flt_dir_width d) in
-      // ⚠ `@` and `x` MOVE THE READ INDEX and produce no value. `@n` is an
-      //   ABSOLUTE position -- `"abcde".unpack("@2C")` reads the third byte --
-      //   and past the end is an ArgumentError, which is ruby's message word
-      //   for word. `xn` skips n bytes forward.
-      // (a bare `@` is `@0`, the start: fi2 == fi1 means no count was written)
-      if str_eq d "@" then
-        // (`@*` moves to len - pos: that is what ruby does, measured)
-        (let want = (if fi2 == fi1 then 0 else if cnt < 0 then slen - si else cnt) in
-         if want > slen then
-           (let _ = prim_raise "ArgumentError" "@ outside of string" in acc)
-         else rb_unpack_go s slen want fmt fl fi2 acc)
-      else if str_eq d "x" then
-        // (`x*` skips to the end)
-        (let n9 = (if cnt < 0 && fi2 > fi1 then slen - si else if cnt < 0 then 1 else cnt) in
-         let nxt = si + n9 in
-         if nxt > slen then
-           (let _ = prim_raise "ArgumentError" "x outside of string" in acc)
-         else rb_unpack_go s slen nxt fmt fl fi2 acc)
-      else if w > 0 then
-        // repeat the fixed-width read `cnt` times (or until end for '*').
-        let reps = (if cnt < 0 then floor_div (slen - si) w else cnt) in
-        rb_unpack_fixed s slen si fmt fl fi2 d w reps acc
-      // ⚠ `h` -- hex, LOW nibble first -- was not here while `H` was, so
-      //   `"\xab".unpack("h*")` answered [] where ruby gives "ba". It is the
-      //   other half of the same round trip and pack has had both for a while.
-      else if str_eq d "h" then
-        (let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
-         let nb = floor_div (nib + 1) 2 in
-         let last = (if si + nb < slen then si + nb else slen) in
-         // exactly `nib` nibbles: an odd count leaves the last byte's other half
-         (let hx9 = rb_hex_lo s si last "" in
-          rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (if str_len hx9 > nib then substring hx9 0 nib else hx9) "US-ASCII", acc))))
-      // ⚠ `Z` reads up to the first NUL and SKIPS PAST IT; it was not here at
-      //   all, so `"ab\x00cd".unpack("Z*")` answered []. `A` strips trailing
-      //   NULs and spaces, which `a` does not -- they shared one arm and both
-      //   kept the padding.
-      // a NUL is no directive at all
-      else if str_eq d (chr 0) then
-        (let _ = prim_raise "ArgumentError" ("unknown unpack directive '\\0' in '" ++ fmt ++ "'") in acc)
-      // `X` backs up: count bytes (a bare one is 1), never before the start
-      else if str_eq d "X" then
-        // (`X*` backs up by as many bytes as remain after the position)
-        (let n9 = (if fi2 == fi1 then 1 else if cnt < 0 then slen - si else cnt) in
-         if n9 > si then (let _ = prim_raise "ArgumentError" "X outside of string" in acc)
-         else rb_unpack_go s slen (si - n9) fmt fl fi2 acc)
-      // `u`: uuencoded lines, each led by its length character
-      else if str_eq d "u" then
-        (let rec lines9 = fn (i: int) -> fn (out: str) ->
-           (if i >= slen then (out, i)
-            else
-              (let ln9 = floor_mod (ord (char_at s i) - 32) 64 in
-               if ln9 == 0 then (out, slen)
-               else
-                 (let rec grp9 = fn (j: int) -> fn (left: int) -> fn (o2: str) ->
-                    (if left <= 0 || j + 3 >= slen + 3 then (o2, j)
-                     else
-                       (let c9 = fn (k: int) -> (if j + k < slen then floor_mod (ord (char_at s (j + k)) - 32) 64 else 0) in
-                        let v9 = c9 0 * 262144 + c9 1 * 4096 + c9 2 * 64 + c9 3 in
-                        let b3 = chr (v9 / 65536) ++ chr (floor_mod (v9 / 256) 256) ++ chr (floor_mod v9 256) in
-                        grp9 (j + 4) (left - 3) (o2 ++ (if left >= 3 then b3 else substring b3 0 left)))) in
-                  match grp9 (i + 1) ln9 "" with
-                  | (piece9, j9) ->
-                    (let rec eol9 = fn (k: int) -> (if k < slen && (if str_eq (char_at s k) "\n" then false else true) then eol9 (k + 1) else k) in
-                     let e9 = eol9 j9 in
-                     lines9 (if e9 < slen then e9 + 1 else e9) (out ++ piece9))))) in
-         match lines9 si "" with
-         | (bytes9, i9) -> rb_unpack_go s slen i9 fmt fl fi2 (Cons (mkstr_e bytes9 "ASCII-8BIT", acc)))
-      // `#` to the end of the line is a comment
-      else if str_eq d "#" then
-        (let rec skip9 = fn (k: int) -> (if k < fl && (if str_eq (char_at fmt k) "\n" then false else true) then skip9 (k + 1) else k) in
-         rb_unpack_go s slen si fmt fl (skip9 fi1 + 1) acc)
-      // `w`: BER-compressed integers, seven bits a byte, high bit = more;
-      // the count is how many (`*` all of them), and a big one is a Bignum
-      else if str_eq d "w" then
-        (let rec one9 = fn (i: int) -> fn (v: str) ->
-           (if i >= slen then (v, i)
-            else (let b9 = ord (char_at s i) in
-                  let v2 = big_add_s (big_mul_s v "128") (str_of_int (b9 - (b9 / 128) * 128)) in
-                  if b9 >= 128 then one9 (i + 1) v2 else (v2, i + 1))) in
-         // how many: `*` all of them, bare one, else the count
-         let want9 = (if cnt < 0 && fi2 > fi1 then 0 - 1 else if fi2 == fi1 then 1 else cnt) in
-         let rec many9 = fn (i: int) -> fn (k: int) -> fn (out: Val list) ->
-           (if i >= slen || (want9 >= 0 && k >= want9) then (i, out)
-            else (match one9 i "0" with (v9, i2) -> many9 i2 (k + 1) (Cons (norm_big v9, out)))) in
-         match many9 si 0 acc with
-         | (i3, acc3) -> rb_unpack_go s slen i3 fmt fl fi2 acc3)
-      else if str_eq d "Z" then
-        (let take = (if cnt < 0 then slen - si else cnt) in
-         let last = (if si + take < slen then si + take else slen) in
-         let z9 = nul_at s si last in
-         let text = rb_str_of_bytes s si z9 "" in
-         // `*` consumes the NUL too; a counted Z consumes the whole field.
-         let nxt = (if cnt < 0 then (if z9 < last then z9 + 1 else last) else last) in
-         rb_unpack_go s slen nxt fmt fl fi2 (Cons (mkstr_e text "ASCII-8BIT", acc)))
-      else if str_eq d "H" then
-        // hex string of `cnt` NIBBLES (or all remaining bytes for '*').
-        let nib = (if cnt < 0 then (slen - si) * 2 else cnt) in
-        let nb = floor_div (nib + 1) 2 in
-        let last = (if si + nb < slen then si + nb else slen) in
-        (let hx9 = rb_hex_of s si last "" in
-         rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e (if str_len hx9 > nib then substring hx9 0 nib else hx9) "US-ASCII", acc)))
-      else if str_eq d "a" || str_eq d "A" then
-        let take = (if cnt < 0 then slen - si else cnt) in
-        let last = (if si + take < slen then si + take else slen) in
-        let raw9 = rb_str_of_bytes s si last "" in
-        // A strips trailing NULs and spaces; a keeps everything.
-        let txt9 = (if str_eq d "A" then rstrip_pad raw9 (str_len raw9) else raw9) in
-        rb_unpack_go s slen last fmt fl fi2 (Cons (mkstr_e txt9 "ASCII-8BIT", acc))
-      else if str_eq d "B" || str_eq d "b" then
-        // bit string: "B" walks each byte's bits MSB-first, "b" LSB-first;
-        // the count is in BITS ('*' = all of them).
-        (let nbits = (if cnt < 0 then (slen - si) * 8 else cnt) in
-         let msb = str_eq d "B" in
-         let avail = (slen - si) * 8 in
-         let take = (if nbits > avail then avail else nbits) in
-         let pw2 = fn (k: int) -> (if k == 0 then 1 else if k == 1 then 2 else if k == 2 then 4 else if k == 3 then 8
-                                   else if k == 4 then 16 else if k == 5 then 32 else if k == 6 then 64 else 128) in
-         let rec bits9 = fn (k: int) -> fn (out: str) ->
-           if k >= take then out
-           else
-             let by = ord (char_at s (si + floor_div k 8)) in
-             let pos = floor_mod k 8 in
-             let bit = (if msb then floor_mod (floor_div by (pw2 (7 - pos))) 2
-                        else floor_mod (floor_div by (pw2 pos)) 2) in
-             bits9 (k + 1) (out ++ str_of_int bit) in
-         let consumed = floor_div (take + 7) 8 in
-         rb_unpack_go s slen (si + consumed) fmt fl fi2 (Cons (mkstr_e (bits9 0 "") "US-ASCII", acc)))
-      else if str_eq d "m" then
-        // base64: decode the rest of the input, skipping '=' padding and
-        // anything outside the alphabet (newlines), as ruby's loose "m" does.
-        // "m0" is the STRICT decoder: a byte outside the alphabet refuses.
-        (let strict = cnt == 0 in
-         let b64v = fn (c: int) ->
-           if c >= 65 && c <= 90 then c - 65
-           else if c >= 97 && c <= 122 then c - 71
-           else if c >= 48 && c <= 57 then c + 4
-           else if c == 43 then 62
-           else if c == 47 then 63
-           else 0 - 1 in
-         let rec go9 = fn (i: int) -> fn (bits: int) -> fn (nb: int) -> fn (out: str) ->
-           if i >= slen then out
-           else
-             let v = b64v (ord (char_at s i)) in
-             if v < 0 then
-               (let _ = (if strict && (if ord (char_at s i) == 61 then false else true)
-                         then (let _ = prim_raise "ArgumentError" "invalid base64" in ()) else ()) in
-                go9 (i + 1) bits nb out)
-             else
-               let bits2 = bits * 64 + v in
-               let nb2 = nb + 6 in
-               if nb2 >= 8 then
-                 (let sh = nb2 - 8 in
-                  let dv = (if sh == 0 then 1 else if sh == 2 then 4 else 16) in
-                  go9 (i + 1) (floor_mod bits2 dv) sh (out ++ chr (floor_div bits2 dv)))
-               else go9 (i + 1) bits2 nb2 out in
-         rb_unpack_go s slen slen fmt fl fi2 (Cons (mkstr_e (go9 si 0 0 "") "ASCII-8BIT", acc)))
-      else rb_unpack_go s slen si fmt fl fi2 acc  // unknown directive: skip
-// pack helpers: an integer's low w bytes, big- or little-endian.
-and rb_unpack_fixed = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: str) -> fn (fl: int) -> fn (fi2: int) -> fn (d: str) -> fn (w: int) -> fn (reps: int) -> fn (acc: Val list) ->
-  if reps <= 0 then rb_unpack_go s slen si fmt fl fi2 acc
-  else if si + w > slen then rb_unpack_fixed s slen si fmt fl fi2 d w 0 (Cons (VNil, acc))  // short: nil, stop
-  else
-    let vv = (if flt_dir_width d > 0 then rb_unpack_flt s si d
-              else if int_dir_width d > 0 then
-                // ⚠ ...and the SIGNED directives come back signed. The lowercase
-                //   letters (s, l, q, i, j) are two's complement over their own
-                //   width; the uppercase ones are not. Reading them all as
-                //   unsigned made `"\xff\xff".unpack("s")` answer 65535.
-                (let raw = (if int_dir_big d then rb_be s si (int_dir_width d) 0
-                            else rb_le s si (int_dir_width d) 1 0) in
-                 VInt (if int_dir_signed d then int_signed raw (int_dir_width d) else raw))
-              else VInt (if str_eq d "C" then rb_sbyte s si
-                         else // "c": signed byte
-                           let b = rb_sbyte s si in (if b >= 128 then b - 256 else b))) in
-    rb_unpack_fixed s slen (si + w) fmt fl fi2 d w (reps - 1) (Cons (vv, acc))
-
-// read the bytes of a float back. `k` counts from the most significant end,
-// which is where the sign and the exponent live whichever way round they were
-// written.
-
 // puts semantics onto stderr: arrays flatten, one trailing newline per item
 // (print_err itself appends the newline).
 // The text Kernel#warn writes, WITHOUT its final newline (err_emit adds that,
@@ -32788,34 +32490,149 @@ and lz_size = fn env -> fn world -> fn blk -> fn (id: int) ->
 // does not answer would raise where ruby simply reports nil.
 // The lazy steps that cannot run without a block, and the name ruby reports
 // for each: an alias is reported under the method it aliases.
-// ⚠ pack's ARMS CANNOT CONVERT. pack_one is a pure function in the leaf
-//   module -- no world, no dispatcher -- so every arm matches `Cons (VStr h,
-//   t)` and falls through for anything else, which is why
-//   `[obj_with_to_str].pack("a3")` answered "\x00" instead of the object's
-//   text. Six spec files read exactly that.
-//
-//   The conversion happens HERE instead, before the format is walked, because
-//   doing it inside would mean threading a closure through a function that
-//   only recurses twice but branches thirty ways -- and re-deciding per
-//   directive at the call site would be the format parser written twice.
-//   An object that answers #to_str becomes its String and one that answers
-//   #to_int becomes its Integer; nothing that already is one is touched, and
-//   an object with neither is left exactly as it was. So this can only add
-//   conversions that used to be silently dropped, never change a value pack
-//   already understood.
-and pack_conv_args = fn env -> fn world -> fn (xs: Val list) ->
-  match xs with
-  | Nil -> Nil
-  | Cons (x9, t9) -> Cons (pack_conv_one env world x9, pack_conv_args env world t9)
-and pack_conv_one = fn env -> fn world -> fn (v: Val) ->
-  match v with
-  | VObj _ ->
-    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-     let c9 = dispatch_cls_of world v in
-     if has_meth world c9 "to_str" then invoke world nb9 v c9 "to_str" Nil
-     else if has_meth world c9 "to_int" then invoke world nb9 v c9 "to_int" Nil
-     else v)
-  | _ -> v
+// ---- Array#pack / String#unpack: the half that needs a world ------------
+// The engine is m_pack.mere and needs no world; what it asks of a value is a
+// CONVERSION, and a conversion may call a method, so the conversions live
+// here. ⚠ They used to happen once, up front, for every element whatever
+// directive would read it (an object with #to_str became its String even
+// under `C`), and a Float under an integer directive was refused where
+// rb_to_int truncates it. Now each directive asks for what pack.c asks for:
+//   "str" StringValue       -- #to_str, else "no implicit conversion"
+//   "int" rb_to_int         -- a Float truncates, else #to_int
+//   "flt" rb_to_float       -- a Numeric's #to_f; a String is REFUSED
+//   "s"   rb_obj_as_string  -- #to_s, for `M`
+//   "ptr" the address `p`/`P` write, which is a stand-in (see pack_ptr_of)
+and pack_cv = fn env -> fn world -> fn (assoc: int) -> fn (kind: str) -> fn (v: Val) ->
+  let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+  if str_eq kind "str" then
+    (match v with
+     | VStr _ -> v
+     | VObj _ ->
+       (if responds world v "to_str" then
+          (match invoke_val_c env world nb v "to_str" Nil false with
+           | VStr h -> VStr h
+           | bad -> prim_raise "TypeError" ("can't convert " ++ class_name v ++ " to String (" ++ class_name v
+                                           ++ "#to_str gives " ++ class_name bad ++ ")"))
+        else prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String"))
+     | _ -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String"))
+  else if str_eq kind "int" then
+    (match v with
+     | VInt _ -> v
+     | VBig _ -> v
+     // Float#to_int is a truncation, and its refusal of NaN and the
+     // infinities is FloatDomainError -- which Float#to_i already says
+     | VFlt _ -> invoke_val_c env world nb v "to_i" Nil false
+     | VObj _ ->
+       (match coerce_int_args env world (Cons (v, Nil)) with
+        | Cons (VInt n, _) -> VInt n
+        | Cons (VBig b, _) -> VBig b
+        | _ -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into Integer"))
+     | _ -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into Integer"))
+  else if str_eq kind "flt" then
+    (match v with
+     | VFlt _ -> v
+     | VInt n -> VFlt (float_of_int n)
+     | VBig _ -> VFlt (to_f v)
+     | VRat (_, _) -> VFlt (to_f v)
+     | VObj _ ->
+       (if obj_is_a world (dispatch_cls_of world v) "Numeric" && responds world v "to_f" then
+          (match invoke_val_c env world nb v "to_f" Nil false with
+           | VFlt f -> VFlt f
+           | bad -> prim_raise "TypeError" ("can't convert " ++ class_name v ++ " into Float (" ++ class_name v
+                                           ++ "#to_f gives " ++ class_name bad ++ ")"))
+        else prim_raise "TypeError" ("can't convert " ++ class_name v ++ " into Float"))
+     | _ -> prim_raise "TypeError" ("can't convert " ++ conv_gives_name v ++ " into Float"))
+  else if str_eq kind "s" then
+    (match v with
+     | VStr _ -> v
+     | _ -> (match invoke_val_c env world nb v "to_s" Nil false with
+             | VStr h -> VStr h
+             | _ -> mkstr (to_s v)))
+  else
+    (match v with
+     | VStr h -> (let _ = arr_push_many assoc (Cons (v, Nil)) in VInt (pack_ptr_of h))
+     | _ -> VInt 0)
+// ⚠ `p` and `P` write the ADDRESS of a string's bytes, which a handle-based
+//   interpreter does not have. What ruby promises about that address is
+//   narrow: nil packs as 0, it is pointer-sized, and unpack gives the String
+//   back only from the packed string itself (or a copy), which carries the
+//   strings it points at -- `packed.to_sym.to_s.unpack("p")` is "no
+//   associated pointer". So the address here is a number derived from the
+//   String's handle, and the packed result carries the Strings in a hidden
+//   ivar that #dup copies like any other.
+and pack_ptr_of = fn (h: int) -> 4096 + h * 16
+and pack_assoc_key = fn (h: int) -> hng_key (VStr h) ++ "@__pk_assoc"
+and pack_ptr_back = fn world -> fn (h: int) -> fn (t: int) ->
+  let (_, _, _, iv) = world in
+  let k = pack_assoc_key h in
+  if (if map_has iv k then false else true) then prim_raise "ArgumentError" "no associated pointer"
+  else
+    (let rec find = fn (xs: Val list) ->
+       (match xs with
+        | Nil -> prim_raise "ArgumentError" "non associated pointer"
+        | Cons (VStr h2, rest) -> (if pack_ptr_of h2 == t then VStr h2 else find rest)
+        | Cons (_, rest) -> find rest) in
+     match map_get iv k with VArr aid -> find (deref aid) | _ -> find Nil)
+// the format: StringValue, and whether its escapes are written as \u
+and pack_fmt_of = fn env -> fn world -> fn (v: Val) ->
+  match pack_cv env world 0 "str" v with
+  | VStr h -> (sget h, str_len (senc_get h) >= 3 && str_eq (substring (senc_get h) 0 3) "UTF")
+  | _ -> ("", false)
+// Array#pack(fmt, buffer: nil)
+and pack_call = fn env -> fn world -> fn (xs: Val list) -> fn (args: Val list) ->
+  match args with
+  | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)"
+  | Cons (fv, rest) ->
+    (let (f, uni) = pack_fmt_of env world fv in
+     let assoc = (match arr_new Nil with VArr a -> a | _ -> 0) in
+     let cv = pack_cv env world assoc in
+     let enc_of = fn (e: int) -> (if e == 1 then "US-ASCII" else if e == 2 then "UTF-8" else "ASCII-8BIT") in
+     // the pointed-at Strings travel with the result that holds the addresses
+     let finish = fn (res: Val) ->
+       (match res with
+        | VStr rh -> (match deref assoc with
+                      | Nil -> res
+                      | _ -> (let (_, _, _, iv) = world in let _ = map_set iv (pack_assoc_key rh) (VArr assoc) in res))
+        | _ -> res) in
+     let buf = (match rest with
+                | Cons (VHsh hid, _) ->
+                  (match hash_lookup (hderef hid) (VSym "buffer") with
+                   | (true, VNil) -> VNil
+                   | (true, VStr bh) -> VStr bh
+                   | (true, other) -> prim_raise "TypeError" ("buffer must be String, not " ++ class_name other)
+                   | _ -> VNil)
+                | _ -> VNil) in
+     match buf with
+     | VStr bh ->
+       (if sfrozen_get bh then prim_raise "FrozenError" ("can't modify frozen String: " ++ inspect (VStr bh))
+        else
+          (match pk_pack cv f uni xs (sget bh) bh with
+           | (bytes, e) ->
+             (let _ = sset bh bytes in
+              let _ = (if e == 0 then () else senc_set bh (enc_of e)) in
+              finish (VStr bh))))
+     | _ ->
+       (match pk_pack cv f uni xs "" (0 - 1) with
+        | (bytes, e) -> finish (mkstr_e bytes (enc_of e))))
+// String#unpack / #unpack1 (mode as pk_unpack: 0 array, 1 block, 2 first)
+and unpack_call = fn env -> fn world -> fn (h: int) -> fn (mode: int) -> fn (args: Val list) ->
+  match args with
+  | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)"
+  | Cons (fv, rest) ->
+    (let (f, uni) = pack_fmt_of env world fv in
+     let s = sget h in
+     // offset: n starts n BYTES in; negative refuses, past the end refuses,
+     // AT the end unpacks the empty string (ruby 4.0.6's two sentences)
+     let off = (match rest with
+                | Cons (VHsh h9, _) ->
+                  (match hash_lookup (hderef h9) (VSym "offset") with
+                   | (true, ov) -> (match pack_cv env world 0 "int" ov with VInt o -> o | _ -> str_len s + 1)
+                   | _ -> 0)
+                | _ -> 0) in
+     let _ = (if off < 0 then (let _ = prim_raise "ArgumentError" "offset can't be negative" in ())
+              else if off > str_len s then (let _ = prim_raise "ArgumentError" "offset outside of string" in ())
+              else ()) in
+     pk_unpack (fn (t: int) -> pack_ptr_back world h t) f uni s off mode)
 
 // ⚠ A CONSTANT REACHED THROUGH A VARIABLE asks #const_missing too.
 //   `Named::Hello` (a literal path) consulted the hook and `k::Hello` -- the

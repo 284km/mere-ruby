@@ -1,0 +1,639 @@
+// Array#pack and String#unpack, read off pack.c directive for directive.
+//
+// ⚠ WHY ONE ENGINE, WRITTEN AGAIN. The two directions had grown one arm at a
+//   time (pack_go / pack_one / rb_unpack_go), each arm matching the shape it
+//   was added for, and what no arm owned was never done: a format ran out of
+//   values silently instead of "too few arguments", an unknown directive was
+//   skipped instead of refused, `!` after a directive that has no native size
+//   was swallowed, a Float packed through `C` was a TypeError, `M` (quoted-
+//   printable) did not exist on the pack side, and a directive's `*` meant
+//   whatever the arm that read it guessed. ruby/spec reads all of that through
+//   shared example files, so each gap failed once per directive: 44 files of
+//   core/array/pack and core/string/unpack, some with a hundred rows.
+//
+//   pack.c is one loop with one count rule and one table of widths; this is
+//   that loop. It needs no world: the conversions a directive asks for
+//   (StringValue, rb_to_int, rb_to_float, rb_obj_as_string) are the caller's,
+//   handed in as `cv kind value` -- the caller is where methods can be called.
+//
+// A module spliced by `import` right after the leaf chain, so it sees
+// everything declared there and above.
+
+// ---- small pieces --------------------------------------------------------
+
+// Concatenate pieces in order by halving: `acc ++ piece` in a loop is
+// quadratic, and a base64 of a megabyte is seventeen thousand lines.
+let rec pk_join = fn (xs: str list) -> fn (n: int) ->
+  if n <= 0 then ""
+  else if n == 1 then (match xs with Cons (h, _) -> h | Nil -> "")
+  else (let h = n / 2 in pk_join xs h ++ pk_join (pk_drop xs h) (n - h))
+and pk_drop = fn (xs: str list) -> fn (k: int) ->
+  if k <= 0 then xs else (match xs with Cons (_, t) -> pk_drop t (k - 1) | Nil -> Nil)
+and pk_rev = fn (xs: str list) -> fn (acc: str list) ->
+  match xs with Nil -> acc | Cons (h, t) -> pk_rev t (Cons (h, acc))
+and pk_slen = fn (xs: str list) -> match xs with Nil -> 0 | Cons (_, t) -> 1 + pk_slen t
+// the output so far (newest piece first) as one string
+and pk_flat = fn (out: str list) -> pk_join (pk_rev out Nil) (pk_slen out)
+and pk_fill = fn (c: str) -> fn (n: int) ->
+  if n <= 0 then ""
+  else if n == 1 then c
+  else (let h = n / 2 in let s = pk_fill c h in if n - h == h then s ++ s else s ++ s ++ c)
+and pk_in = fn (c: str) -> fn (set: str) -> str_len c == 1 && str_contains set c
+and pk_isspace = fn (c: str) ->
+  let o = ord c in o == 32 || (o >= 9 && o <= 13)
+and pk_isdigit = fn (c: str) -> let o = ord c in o >= 48 && o <= 57
+and pk_isalpha = fn (c: str) -> let o = ord c in (o >= 65 && o <= 90) || (o >= 97 && o <= 122)
+and pk_hex2 = fn (n: int) ->
+  let d = fn (k: int) -> char_at "0123456789ABCDEF" k in
+  d (n / 16) ++ d (floor_mod n 16)
+and pk_hex2lc = fn (n: int) ->
+  let d = fn (k: int) -> char_at "0123456789abcdef" k in
+  d (n / 16) ++ d (floor_mod n 16)
+
+// The format as ruby's message quotes it (rb_str_quote_unprintable): a
+// printable character as it is, the C escapes by name, NUL as \0 and DEL as
+// \c?, other controls as \uXXXX in a Unicode format and \xXX in a binary one,
+// and a byte that is not part of a valid character as \xXX.
+and pk_quote = fn (f: str) -> fn (uni: bool) -> fn (i: int) -> fn (acc: str list) ->
+  let n = str_len f in
+  if i >= n then pk_flat acc
+  else
+    (let b = ord (char_at f i) in
+     let one = fn (s: str) -> pk_quote f uni (i + 1) (Cons (s, acc)) in
+     if b == 0 then one "\\0"
+     else if b == 10 then one "\\n" else if b == 13 then one "\\r"
+     else if b == 9 then one "\\t" else if b == 12 then one "\\f"
+     else if b == 11 then one "\\v" else if b == 8 then one "\\b"
+     else if b == 7 then one "\\a" else if b == 27 then one "\\e"
+     else if b == 127 then one "\\c?"
+     else if b < 32 then one (if uni then "\\u00" ++ pk_hex2 b else "\\x" ++ pk_hex2 b)
+     else if b < 128 then one (char_at f i)
+     else if uni then
+       (match utf8_cp_strict f i with
+        | (_, w, true) -> pk_quote f uni (i + w) (Cons (substring f i (i + w), acc))
+        | _ -> one ("\\x" ++ pk_hex2 b))
+     else one ("\\x" ++ pk_hex2 b))
+and pk_unknown = fn (mode: str) -> fn (ty: str) -> fn (f: str) -> fn (uni: bool) ->
+  let b = ord ty in
+  let shown = (if b >= 32 && b < 127 then ty else "\\x" ++ pk_hex2lc b) in
+  prim_raise "ArgumentError" ("unknown " ++ mode ++ " directive '" ++ shown ++ "' in '" ++ pk_quote f uni 0 Nil ++ "'")
+
+// `_` / `!` (native size) and `<` / `>` (byte order) after a directive.
+// Only the integer directives take either, and never both orders at once.
+and pk_mods = fn (f: str) -> fn (fl: int) -> fn (p: int) -> fn (ty: str) -> fn (nat: bool) -> fn (en: str) ->
+  if p >= fl then (p, nat, en)
+  else
+    (let c = char_at f p in
+     if str_eq c "_" || str_eq c "!" then
+       (if pk_in ty "sSiIlLqQjJ" then pk_mods f fl (p + 1) ty true en
+        else (let _ = prim_raise "ArgumentError" ("'" ++ c ++ "' allowed only after types sSiIlLqQjJ") in (p, nat, en)))
+     else if str_eq c "<" || str_eq c ">" then
+       (if (if pk_in ty "sSiIlLqQjJ" then false else true)
+        then (let _ = prim_raise "ArgumentError" ("'" ++ c ++ "' allowed only after types sSiIlLqQjJ") in (p, nat, en))
+        else if (if str_eq en "" then false else true)
+        then (let _ = prim_raise "RangeError" "Can't use both '<' and '>'" in (p, nat, en))
+        else pk_mods f fl (p + 1) ty nat c)
+     else (p, nat, en))
+and pk_digits = fn (f: str) -> fn (fl: int) -> fn (p: int) -> fn (acc: int) ->
+  if p < fl && pk_isdigit (char_at f p) then
+    (if acc > 99999999999999999
+     then (let _ = prim_raise "RangeError" "pack length too big" in (acc, p))
+     else pk_digits f fl (p + 1) (acc * 10 + ord (char_at f p) - 48))
+  else (acc, p)
+// (width, big-endian, signed) of an integer directive; width 0 = not one.
+// This platform is LP64 and little-endian: `l!`/`L!` are a C long (8), `i`
+// is a C int (4) with or without `!`, and `j`/`J` are a pointer (8).
+and pk_int_dir = fn (ty: str) -> fn (nat: bool) -> fn (en: str) ->
+  let (w, big) = (if str_eq ty "c" || str_eq ty "C" then (1, false)
+                  else if str_eq ty "s" || str_eq ty "S" then (2, false)
+                  else if str_eq ty "i" || str_eq ty "I" then (4, false)
+                  else if str_eq ty "l" || str_eq ty "L" then ((if nat then 8 else 4), false)
+                  else if str_eq ty "q" || str_eq ty "Q" || str_eq ty "j" || str_eq ty "J" then (8, false)
+                  else if str_eq ty "n" then (2, true) else if str_eq ty "N" then (4, true)
+                  else if str_eq ty "v" then (2, false) else if str_eq ty "V" then (4, false)
+                  else (0, false)) in
+  let big = (if str_eq en ">" then true else if str_eq en "<" then false else big) in
+  (w, big, pk_in ty "csilqj")
+// (width, big-endian) of a float directive; width 0 = not one.
+and pk_flt_dir = fn (ty: str) ->
+  if str_eq ty "f" || str_eq ty "F" || str_eq ty "e" then (4, false)
+  else if str_eq ty "g" then (4, true)
+  else if str_eq ty "d" || str_eq ty "D" || str_eq ty "E" then (8, false)
+  else if str_eq ty "G" then (8, true)
+  else (0, false)
+
+// ---- integers ------------------------------------------------------------
+
+// the low 64 bits of an Integer, as a machine int (two's complement)
+and pk_low64 = fn (v: Val) ->
+  match v with
+  | VInt n -> n
+  | VBig b ->
+    (let r = big_mod_s b "18446744073709551616" in
+     if big_cmp_s r "9223372036854775808" >= 0
+     then int_of_str (big_sub_s r "18446744073709551616")
+     else int_of_str r)
+  | _ -> 0
+// `w` bytes of n, little- or big-endian. floor_div / floor_mod carry the sign
+// down, which is exactly two's complement for a negative n.
+and pk_le = fn (n: int) -> fn (w: int) ->
+  if w <= 0 then "" else chr (floor_mod n 256) ++ pk_le (floor_div n 256) (w - 1)
+and pk_be = fn (n: int) -> fn (w: int) ->
+  if w <= 0 then "" else pk_be (floor_div n 256) (w - 1) ++ chr (floor_mod n 256)
+// read `w` bytes at i as an Integer. The top byte carries the sign for a
+// signed directive; an unsigned 8-byte value past 2**63 is a Bignum.
+and pk_rd_int = fn (s: str) -> fn (i: int) -> fn (w: int) -> fn (big: bool) -> fn (sg: bool) ->
+  let at = fn (k: int) -> ord (char_at s (if big then i + k else i + w - 1 - k)) in
+  let rec low = fn (k: int) -> fn (acc: int) -> (if k >= w then acc else low (k + 1) (acc * 256 + at k)) in
+  let top = at 0 in
+  let rest = low 1 0 in
+  let scale = pk_pow256 (w - 1) in
+  if sg && top >= 128 then VInt ((top - 256) * scale + rest)
+  else if w == 8 && top >= 128 then norm_big (big_add_s (big_mul_s (str_of_int top) "72057594037927936") (str_of_int rest))
+  else VInt (top * scale + rest)
+and pk_pow256 = fn (k: int) -> if k <= 0 then 1 else 256 * pk_pow256 (k - 1)
+
+// UTF-8 of a codepoint, up to the six-byte forms pack("U") still writes.
+and pk_utf8 = fn (uv: int) ->
+  let cont = fn (sh: int) -> chr (128 + floor_mod (bit_shr uv sh) 64) in
+  if uv <= 127 then chr uv
+  else if uv <= 2047 then chr (192 + bit_shr uv 6) ++ cont 0
+  else if uv <= 65535 then chr (224 + bit_shr uv 12) ++ cont 6 ++ cont 0
+  else if uv <= 2097151 then chr (240 + bit_shr uv 18) ++ cont 12 ++ cont 6 ++ cont 0
+  else if uv <= 67108863 then chr (248 + bit_shr uv 24) ++ cont 18 ++ cont 12 ++ cont 6 ++ cont 0
+  else if uv <= 2147483647 then chr (252 + bit_shr uv 30) ++ cont 24 ++ cont 18 ++ cont 12 ++ cont 6 ++ cont 0
+  else (let _ = prim_raise "RangeError" "pack(U): value out of range" in "")
+
+// BER: seven bits a byte, most significant first, the high bit set on every
+// byte but the last (dec is a non-negative decimal)
+and pk_ber = fn (dec: str) -> fn (acc: str) ->
+  (match big_divmod_s dec "128" with
+   | (q, r) ->
+     (let byte = int_of_str r + (if str_eq acc "" then 0 else 128) in
+      let acc2 = chr byte ++ acc in
+      if str_eq q "0" then acc2 else pk_ber q acc2))
+
+// ---- text encoders -------------------------------------------------------
+
+// pack.c's encodes(): one line of base64 or uuencode for `len` bytes at i.
+and pk_encodes = fn (src: str) -> fn (i: int) -> fn (len: int) -> fn (uu: bool) -> fn (lf: bool) ->
+  let tbl = (if uu then "`!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
+             else "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") in
+  let pad = (if uu then "`" else "=") in
+  let t = fn (k: int) -> char_at tbl (floor_mod k 64) in
+  let b = fn (k: int) -> ord (char_at src k) in
+  let rec groups = fn (j: int) -> fn (left: int) -> fn (acc: str list) ->
+    (if left >= 3 then
+       groups (j + 3) (left - 3)
+         (Cons (t (b j / 4) ++ t (floor_mod (b j) 4 * 16 + b (j + 1) / 16)
+                ++ t (floor_mod (b (j + 1)) 16 * 4 + b (j + 2) / 64) ++ t (b (j + 2)), acc))
+     else if left == 2 then
+       Cons (t (b j / 4) ++ t (floor_mod (b j) 4 * 16 + b (j + 1) / 16) ++ t (floor_mod (b (j + 1)) 16 * 4) ++ pad, acc)
+     else if left == 1 then
+       Cons (t (b j / 4) ++ t (floor_mod (b j) 4 * 16) ++ pad ++ pad, acc)
+     else acc) in
+  (if uu then chr (len + 32) else "") ++ pk_flat (groups i len Nil) ++ (if lf then "\n" else "")
+// m / u: whole lines of `per` input bytes, then the short last one
+and pk_lines = fn (src: str) -> fn (i: int) -> fn (per: int) -> fn (uu: bool) -> fn (acc: str list) ->
+  let left = str_len src - i in
+  if left <= 0 then pk_flat acc
+  else (let todo = (if left > per then per else left) in
+        pk_lines src (i + todo) per uu (Cons (pk_encodes src i todo uu true, acc)))
+// pack.c's qpencode(): quoted-printable, soft breaks past `len` columns.
+and pk_qp = fn (s: str) -> fn (i: int) -> fn (len: int) -> fn (n: int) -> fn (prev: int) -> fn (acc: str list) ->
+  if i >= str_len s then pk_flat (if n > 0 then Cons ("=\n", acc) else acc)
+  else
+    (let c = ord (char_at s i) in
+     let (piece, n2, prev2) =
+       (if c > 126 || (c < 32 && c != 10 && c != 9) || c == 61 then ("=" ++ pk_hex2 c, n + 3, 0 - 1)
+        else if c == 10 then ((if prev == 32 || prev == 9 then "=\n" else "") ++ "\n", 0, c)
+        else (char_at s i, n + 1, c)) in
+     if n2 > len then pk_qp s (i + 1) len 0 10 (Cons ("=\n", Cons (piece, acc)))
+     else pk_qp s (i + 1) len n2 prev2 (Cons (piece, acc)))
+
+// b / B / h / H: `len` characters of the source become bits or nibbles
+and pk_bits = fn (src: str) -> fn (len: int) -> fn (msb: bool) ->
+  let rec go = fn (i: int) -> fn (byte: int) -> fn (acc: str list) ->
+    (if i >= len then
+       pk_flat (if floor_mod len 8 == 0 then acc
+                else Cons (chr (if msb then bit_shl byte (8 - floor_mod len 8) else bit_shr byte (8 - floor_mod len 8)), acc))
+     else
+       (let bit = floor_mod (ord (char_at src i)) 2 in
+        let byte2 = (if msb then byte * 2 + bit else bit_shr byte 1 + bit * 128) in
+        if floor_mod (i + 1) 8 == 0 then go (i + 1) 0 (Cons (chr (floor_mod byte2 256), acc))
+        else go (i + 1) byte2 acc)) in
+  go 0 0 Nil
+and pk_nibble = fn (c: str) ->
+  let o = ord c in if pk_isalpha c then bit_and (bit_and o 15 + 9) 15 else bit_and o 15
+and pk_hex = fn (src: str) -> fn (len: int) -> fn (hi: bool) ->
+  let rec go = fn (i: int) -> fn (acc: str list) ->
+    (if i >= len then pk_flat acc
+     else
+       (let a = pk_nibble (char_at src i) in
+        let b = (if i + 1 < len then pk_nibble (char_at src (i + 1)) else 0) in
+        go (i + 2) (Cons (chr (if hi then a * 16 + b else b * 16 + a), acc)))) in
+  go 0 Nil
+
+// ---- Array#pack -----------------------------------------------------------
+
+// Pack `xs` by `f` onto `base` (the buffer's bytes, or ""). `bh` is the
+// buffer's handle, or -1: packing the buffer into itself is refused.
+// Answers the bytes and the encoding pack.c settles on -- US-ASCII while only
+// m/M/u have run, UTF-8 when a U came first, BINARY once anything else has.
+and pk_pack = fn (cv: str -> Val -> Val) -> fn (f: str) -> fn (uni: bool) -> fn (xs: Val list) -> fn (base: str) -> fn (bh: int) ->
+  pk_pack_go cv f uni (str_len f) 0 xs (Cons (base, Nil)) (str_len base) 1 bh
+and pk_pack_go = fn (cv: str -> Val -> Val) -> fn (f: str) -> fn (uni: bool) -> fn (fl: int) -> fn (p0: int) -> fn (xs: Val list) -> fn (out: str list) -> fn (olen: int) -> fn (enc: int) -> fn (bh: int) ->
+  if p0 >= fl then (pk_flat out, enc)
+  else
+    (let ty = char_at f p0 in
+     let p1 = p0 + 1 in
+     if pk_isspace ty then pk_pack_go cv f uni fl p1 xs out olen enc bh
+     else if str_eq ty "#" then
+       (let rec eol = fn (k: int) -> (if k < fl && (if str_eq (char_at f k) "\n" then false else true) then eol (k + 1) else k) in
+        let e = eol p1 in
+        pk_pack_go cv f uni fl (if e < fl then e + 1 else e) xs out olen enc bh)
+     else
+       (let (p2, nat, en) = pk_mods f fl p1 ty false "" in
+        let star = p2 < fl && str_eq (char_at f p2) "*" in
+        let (len, p3) = (if star then
+                           ((if pk_in ty "@Xxu" then 0 else if pk_in ty "PMm" then 1 else vlen xs), p2 + 1)
+                         else if p2 < fl && pk_isdigit (char_at f p2) then pk_digits f fl p2 0
+                         else (1, p2)) in
+        let enc2 = (if str_eq ty "U" then (if enc == 1 then 2 else enc)
+                    else if pk_in ty "mMu" then enc else 0) in
+        let too_few = fn (u: unit) -> prim_raise "ArgumentError" "too few arguments" in
+        let not_buf = fn (v: Val) ->
+          (match v with
+           | VStr h -> (if h == bh then (let _ = prim_raise "ArgumentError" "cannot pack buffer object into itself" in v) else v)
+           | _ -> v) in
+        let str_from = fn (v: Val) -> (match not_buf (cv "str" v) with VStr h -> sget h | _ -> "") in
+        let emit = fn (piece: str) -> fn (rest: Val list) ->
+          pk_pack_go cv f uni fl p3 rest (Cons (piece, out)) (olen + str_len piece) enc2 bh in
+        // pad with NULs, or cut the output back, to an absolute length
+        let resize = fn (want: int) ->
+          (if want >= olen then pk_pack_go cv f uni fl p3 xs (Cons (pk_fill (chr 0) (want - olen), out)) want enc2 bh
+           else pk_pack_go cv f uni fl p3 xs (Cons (substring (pk_flat out) 0 want, Nil)) want enc2 bh) in
+        let (iw, ibig, _) = pk_int_dir ty nat en in
+        let (fw, fbig) = pk_flt_dir ty in
+        if pk_in ty "AaZBbHh" then
+          (match xs with
+           | Nil -> (let _ = too_few () in (pk_flat out, enc))
+           | Cons (v, rest) ->
+             (let src = (match v with VNil -> "" | _ -> str_from v) in
+              let plen = str_len src in
+              let len = (if star then plen else len) in
+              if pk_in ty "AaZ" then
+                (if plen >= len then emit (substring src 0 len ++ (if star && str_eq ty "Z" then chr 0 else "")) rest
+                 else emit (src ++ pk_fill (if str_eq ty "A" then " " else chr 0) (len - plen)) rest)
+              else if pk_in ty "Bb" then
+                (let grow = (if len > plen then (len - plen + 1) / 2 else 0) in
+                 let n = (if len > plen then plen else len) in
+                 emit (pk_bits src n (str_eq ty "B") ++ pk_fill (chr 0) grow) rest)
+              else
+                (let grow = (if len > plen then (len + 1) / 2 - (plen + 1) / 2 else 0) in
+                 let n = (if len > plen then plen else len) in
+                 emit (pk_hex src n (str_eq ty "H") ++ pk_fill (chr 0) grow) rest)))
+        else if iw > 0 then
+          (let rec ints = fn (k: int) -> fn (ys: Val list) -> fn (acc: str list) ->
+             (if k <= 0 then (pk_flat acc, ys)
+              else (match ys with
+                    | Nil -> (let _ = too_few () in ("", ys))
+                    | Cons (v, t) ->
+                      (let n = pk_low64 (cv "int" v) in
+                       ints (k - 1) t (Cons ((if ibig then pk_be n iw else pk_le n iw), acc))))) in
+           match ints len xs Nil with (piece, rest) -> emit piece rest)
+        else if fw > 0 then
+          (let rec flts = fn (k: int) -> fn (ys: Val list) -> fn (acc: str list) ->
+             (if k <= 0 then (pk_flat acc, ys)
+              else (match ys with
+                    | Nil -> (let _ = too_few () in ("", ys))
+                    | Cons (v, t) ->
+                      (let d = (match cv "flt" v with VFlt d -> d | _ -> 0.0) in
+                       flts (k - 1) t (Cons ((if fw == 8 then flt_pack64 d fbig else flt_pack32 d fbig), acc))))) in
+           match flts len xs Nil with (piece, rest) -> emit piece rest)
+        else if str_eq ty "U" then
+          (let rec us = fn (k: int) -> fn (ys: Val list) -> fn (acc: str list) ->
+             (if k <= 0 then (pk_flat acc, ys)
+              else (match ys with
+                    | Nil -> (let _ = too_few () in ("", ys))
+                    | Cons (v, t) ->
+                      (let l = (match cv "int" v with
+                                | VInt l -> l
+                                | _ -> (let _ = prim_raise "RangeError" "bignum too big to convert into 'long'" in 0)) in
+                       let _ = (if l < 0 then (let _ = prim_raise "RangeError" "pack(U): value out of range" in ()) else ()) in
+                       us (k - 1) t (Cons (pk_utf8 l, acc))))) in
+           match us len xs Nil with (piece, rest) -> emit piece rest)
+        else if str_eq ty "w" then
+          (let rec ws = fn (k: int) -> fn (ys: Val list) -> fn (acc: str list) ->
+             (if k <= 0 then (pk_flat acc, ys)
+              else (match ys with
+                    | Nil -> (let _ = too_few () in ("", ys))
+                    | Cons (v, t) ->
+                      (let dec = (match cv "int" v with VInt n -> str_of_int n | VBig b -> b | _ -> "0") in
+                       let _ = (if big_sign dec < 0 then (let _ = prim_raise "ArgumentError" "can't compress negative numbers" in ()) else ()) in
+                       ws (k - 1) t (Cons (pk_ber dec "", acc))))) in
+           match ws len xs Nil with (piece, rest) -> emit piece rest)
+        else if str_eq ty "m" || str_eq ty "u" then
+          (match xs with
+           | Nil -> (let _ = too_few () in (pk_flat out, enc))
+           | Cons (v, rest) ->
+             (let src = str_from v in
+              if len == 0 && str_eq ty "m" then emit (pk_encodes src 0 (str_len src) false false) rest
+              else
+                (let per = (if len <= 2 then 45 else if len > 63 && str_eq ty "u" then 63 else len / 3 * 3) in
+                 emit (pk_lines src 0 per (str_eq ty "u") Nil) rest)))
+        else if str_eq ty "M" then
+          (match xs with
+           | Nil -> (let _ = too_few () in (pk_flat out, enc))
+           | Cons (v, rest) ->
+             (let src = (match not_buf (cv "s" v) with VStr h -> sget h | _ -> "") in
+              emit (pk_qp src 0 (if len <= 1 then 72 else len) 0 (0 - 1) Nil) rest))
+        else if str_eq ty "P" || str_eq ty "p" then
+          // a pointer: the address of the string's bytes, which this
+          // interpreter does not have. pack_ptr (the caller's) hands out a
+          // stand-in and remembers which String it stands for, so unpack of
+          // the SAME packed string can give that String back -- which is all
+          // ruby promises for p/P.
+          (let _ = (if str_eq ty "P" then
+                      (match xs with
+                       | Nil -> (let _ = too_few () in ())
+                       | Cons (VNil, _) -> ()
+                       | Cons (v, _) ->
+                         (let src = str_from v in
+                          if str_len src < len
+                          then (let _ = prim_raise "ArgumentError" ("too short buffer for P(" ++ str_of_int (str_len src) ++ " for " ++ str_of_int len ++ ")") in ())
+                          else ()))
+                    else ()) in
+           let n = (if str_eq ty "P" then 1 else len) in
+           let rec ps = fn (k: int) -> fn (ys: Val list) -> fn (acc: str list) ->
+             (if k <= 0 then (pk_flat acc, ys)
+              else (match ys with
+                    | Nil -> (let _ = too_few () in ("", ys))
+                    | Cons (v, t) ->
+                      (let addr = (match v with VNil -> 0 | _ -> (match cv "ptr" (not_buf (cv "str" v)) with VInt a -> a | _ -> 0)) in
+                       ps (k - 1) t (Cons (pk_le addr 8, acc))))) in
+           match ps n xs Nil with (piece, rest) -> emit piece rest)
+        else if str_eq ty "x" then
+          pk_pack_go cv f uni fl p3 xs (Cons (pk_fill (chr 0) len, out)) (olen + len) enc2 bh
+        else if str_eq ty "X" then
+          (if len > olen then (let _ = prim_raise "ArgumentError" "X outside of string" in (pk_flat out, enc))
+           else resize (olen - len))
+        else if str_eq ty "@" then resize len
+        else if str_eq ty "%" then (let _ = prim_raise "ArgumentError" "% is not supported" in (pk_flat out, enc))
+        else (let _ = pk_unknown "pack" ty f uni in (pk_flat out, enc))))
+
+// ---- String#unpack --------------------------------------------------------
+
+// pack.c's utf8_to_uv at byte i: (codepoint, bytes), refusing what it refuses
+and pk_utf8_rd = fn (s: str) -> fn (i: int) -> fn (slen: int) ->
+  let c = ord (char_at s i) in
+  if c < 128 then (c, 1)
+  else if c < 192 then (let _ = prim_raise "ArgumentError" "malformed UTF-8 character" in (0, 1))
+  else
+    (let (n, uv) = (if c < 224 then (2, c - 192) else if c < 240 then (3, c - 224)
+                    else if c < 248 then (4, c - 240) else if c < 252 then (5, c - 248)
+                    else if c < 254 then (6, c - 252) else (0, 0)) in
+     if n == 0 then (let _ = prim_raise "ArgumentError" "malformed UTF-8 character" in (0, 1))
+     else if n > slen - i then
+       (let _ = prim_raise "ArgumentError" ("malformed UTF-8 character (expected " ++ str_of_int n
+                                            ++ " bytes, given " ++ str_of_int (slen - i) ++ " bytes)") in (0, 1))
+     else
+       (let rec more = fn (k: int) -> fn (acc: int) ->
+          (if k >= n then acc
+           else (let b = ord (char_at s (i + k)) in
+                 if b < 128 || b >= 192 then (let _ = prim_raise "ArgumentError" "malformed UTF-8 character" in acc)
+                 else more (k + 1) (acc * 64 + (b - 128)))) in
+        let uv2 = more 1 uv in
+        let lim = (if n == 2 then 128 else if n == 3 then 2048 else if n == 4 then 65536
+                   else if n == 5 then 2097152 else 67108864) in
+        if uv2 < lim then (let _ = prim_raise "ArgumentError" "redundant UTF-8 sequence" in (uv2, n))
+        else (uv2, n)))
+
+// Unpack `s` from byte `off` by `f`. `mode` is 0 for #unpack, 1 for #unpack
+// with a block and 2 for #unpack1: a block is not handed the nils that pad a
+// short read, and unpack1 stops at the first value it has. `ptr` turns a
+// stand-in address back into its String (see pk_pack), or raises.
+// Answers the values, oldest first.
+and pk_unpack = fn (ptr: int -> Val) -> fn (f: str) -> fn (uni: bool) -> fn (s: str) -> fn (off: int) -> fn (mode: int) ->
+  pk_rev_v (pk_unpack_go ptr f uni (str_len f) 0 s (str_len s) off mode Nil) Nil
+and pk_rev_v = fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with Nil -> acc | Cons (h, t) -> pk_rev_v t (Cons (h, acc))
+and pk_unpack_go = fn (ptr: int -> Val) -> fn (f: str) -> fn (uni: bool) -> fn (fl: int) -> fn (p0: int) -> fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (mode: int) -> fn (acc: Val list) ->
+  if p0 >= fl || (mode == 2 && (match acc with Nil -> false | _ -> true)) then acc
+  else
+    (let ty = char_at f p0 in
+     let p1 = p0 + 1 in
+     if pk_isspace ty then pk_unpack_go ptr f uni fl p1 s slen si mode acc
+     else if str_eq ty "#" then
+       (let rec eol = fn (k: int) -> (if k < fl && (if str_eq (char_at f k) "\n" then false else true) then eol (k + 1) else k) in
+        let e = eol p1 in
+        pk_unpack_go ptr f uni fl (if e < fl then e + 1 else e) s slen si mode acc)
+     else
+       (let (p2, nat, en) = pk_mods f fl p1 ty false "" in
+        let star = p2 < fl && str_eq (char_at f p2) "*" in
+        let (len, p3) = (if p2 >= fl then (1, p2)
+                         else if star then (slen - si, p2 + 1)
+                         else if pk_isdigit (char_at f p2) then pk_digits f fl p2 0
+                         else ((if str_eq ty "@" then 0 else 1), p2)) in
+        let rem = slen - si in
+        let next = fn (si2: int) -> fn (acc2: Val list) -> pk_unpack_go ptr f uni fl p3 s slen si2 mode acc2 in
+        let bstr = fn (a: int) -> fn (b: int) -> mkstr_e (substring s a b) "ASCII-8BIT" in
+        let (iw, ibig, isg) = pk_int_dir ty nat en in
+        let (fw, fbig) = pk_flt_dir ty in
+        // a fixed-width run: as many as fit, then (for #unpack, when the
+        // count was not `*`) a nil for each one that did not
+        let fixed = fn (w: int) -> fn (rd: int -> Val) ->
+          (let n = (if len > rem / w then rem / w else len) in
+           let short = (if len > rem / w && (if star then false else true) && mode == 0 then len - rem / w else 0) in
+           let rec go = fn (k: int) -> fn (i: int) -> fn (a: Val list) ->
+             (if k >= n || (mode == 2 && (match a with Nil -> false | _ -> true)) then (i, a)
+              else go (k + 1) (i + w) (Cons (rd i, a))) in
+           match go 0 si acc with
+           | (i2, a2) ->
+             (let rec nils = fn (k: int) -> fn (a: Val list) -> (if k <= 0 then a else nils (k - 1) (Cons (VNil, a))) in
+              next i2 (nils short a2))) in
+        if str_eq ty "%" then (let _ = prim_raise "ArgumentError" "% is not supported" in acc)
+        else if str_eq ty "A" then
+          (let n = (if len > rem then rem else len) in
+           let rec trim = fn (e: int) ->
+             (if e > si && (let c = ord (char_at s (e - 1)) in c == 32 || c == 0) then trim (e - 1) else e) in
+           next (si + n) (Cons (bstr si (trim (si + n)), acc)))
+        else if str_eq ty "Z" then
+          (let n = (if len > rem then rem else len) in
+           let rec nul = fn (t: int) -> (if t < si + n && ord (char_at s t) != 0 then nul (t + 1) else t) in
+           let t = nul si in
+           let t2 = (if t < slen then t + 1 else t) in
+           next (if star then t2 else si + n) (Cons (bstr si t, acc)))
+        else if str_eq ty "a" then
+          (let n = (if len > rem then rem else len) in next (si + n) (Cons (bstr si (si + n), acc)))
+        else if pk_in ty "bB" then
+          (let n = (if star || len > rem * 8 then rem * 8 else len) in
+           let rec go = fn (k: int) -> fn (a: str list) ->
+             (if k >= n then pk_flat a
+              else (let by = ord (char_at s (si + k / 8)) in
+                    let sh = (if str_eq ty "B" then 7 - floor_mod k 8 else floor_mod k 8) in
+                    go (k + 1) (Cons ((if floor_mod (bit_shr by sh) 2 == 1 then "1" else "0"), a)))) in
+           next (si + (n + 7) / 8) (Cons (mkstr_e (go 0 Nil) "US-ASCII", acc)))
+        else if pk_in ty "hH" then
+          (let n = (if star || len > rem * 2 then rem * 2 else len) in
+           let rec go = fn (k: int) -> fn (a: str list) ->
+             (if k >= n then pk_flat a
+              else (let by = ord (char_at s (si + k / 2)) in
+                    let hi = (if str_eq ty "H" then floor_mod k 2 == 0 else floor_mod k 2 == 1) in
+                    go (k + 1) (Cons (char_at "0123456789abcdef" (if hi then by / 16 else floor_mod by 16), a)))) in
+           next (si + (n + 1) / 2) (Cons (mkstr_e (go 0 Nil) "US-ASCII", acc)))
+        else if iw > 0 then fixed iw (fn (i: int) -> pk_rd_int s i iw ibig isg)
+        else if fw > 0 then
+          fixed fw (fn (i: int) ->
+            (let at = fn (k: int) -> ord (char_at s (if fbig then i + k else i + fw - 1 - k)) in
+             let rec acc9 = fn (k: int) -> fn (a: int) -> (if k >= fw then a else acc9 (k + 1) (a * 256 + at k)) in
+             let b0 = at 0 in
+             let b1 = at 1 in
+             if fw == 8 then VFlt (flt_from64 (b0 / 128) (floor_mod b0 128 * 16 + b1 / 16) (acc9 2 (floor_mod b1 16)))
+             else VFlt (flt_from32 (b0 / 128) (floor_mod b0 128 * 2 + b1 / 128) (acc9 2 (floor_mod b1 128)))))
+        else if str_eq ty "U" then
+          (let n = (if len > rem then rem else len) in
+           let rec go = fn (k: int) -> fn (i: int) -> fn (a: Val list) ->
+             (if k <= 0 || i >= slen || (mode == 2 && (match a with Nil -> false | _ -> true)) then (i, a)
+              else (match pk_utf8_rd s i slen with (cp, w) -> go (k - 1) (i + w) (Cons (VInt cp, a)))) in
+           match go n si acc with (i2, a2) -> next i2 a2)
+        else if str_eq ty "u" then
+          (let cap = rem * 3 / 4 in
+           let ok = fn (i: int) -> i < slen && ord (char_at s i) >= 32 && ord (char_at s i) < 97 in
+           let v6 = fn (i: int) -> (if ok i then (floor_mod (ord (char_at s i) - 32) 64, i + 1) else (0, i)) in
+           let rec line = fn (i: int) -> fn (total: int) -> fn (a: str list) ->
+             (if i < slen && ord (char_at s i) > 32 && ord (char_at s i) < 97 then
+                (let n0 = floor_mod (ord (char_at s i) - 32) 64 in
+                 let total2 = total + n0 in
+                 let n = (if total2 > cap then n0 - (total2 - cap) else n0) in
+                 let total3 = (if total2 > cap then cap else total2) in
+                 let rec hunks = fn (j: int) -> fn (left: int) -> fn (a2: str list) ->
+                   (if left <= 0 then (j, a2)
+                    else
+                      (let (a9, j1) = v6 j in
+                       let (b9, j2) = v6 j1 in
+                       let (c9, j3) = v6 j2 in
+                       let (d9, j4) = v6 j3 in
+                       let h = chr (floor_mod (a9 * 4 + b9 / 16) 256) ++ chr (floor_mod (b9 * 16 + c9 / 4) 256) ++ chr (floor_mod (c9 * 64 + d9) 256) in
+                       let m = (if left > 3 then 3 else left) in
+                       hunks j4 (left - m) (Cons (substring h 0 m, a2)))) in
+                 match hunks (i + 1) n a with
+                 | (j, a3) ->
+                   (let j2 = (if j < slen && ord (char_at s j) != 13 && ord (char_at s j) != 10 then j + 1 else j) in
+                    let j3 = (if j2 < slen && ord (char_at s j2) == 13 then j2 + 1 else j2) in
+                    let j4 = (if j3 < slen && ord (char_at s j3) == 10 then j3 + 1 else j3) in
+                    line j4 total3 a3))
+              else (i, a)) in
+           match line si 0 Nil with (i2, a) -> next i2 (Cons (mkstr_e (pk_flat a) "ASCII-8BIT", acc)))
+        else if str_eq ty "m" then
+          (let x = fn (i: int) ->
+             (if i >= slen then 0 - 1
+              else (let c = ord (char_at s i) in
+                    if c >= 65 && c <= 90 then c - 65 else if c >= 97 && c <= 122 then c - 71
+                    else if c >= 48 && c <= 57 then c + 4 else if c == 43 then 62 else if c == 47 then 63 else 0 - 1)) in
+           let eq = fn (i: int) -> i < slen && ord (char_at s i) == 61 in
+           let tri = fn (a: int) -> fn (b: int) -> fn (c: int) -> fn (d: int) ->
+             chr (floor_mod (a * 4 + b / 16) 256) ++ chr (floor_mod (b * 16 + c / 4) 256) ++ chr (floor_mod (c * 64 + d) 256) in
+           let bad = fn (u: unit) -> prim_raise "ArgumentError" "invalid base64" in
+           let out = (if len == 0 then
+                        // strict (m0): whole quads only, `=` only as padding at the very end
+                        (let rec go = fn (i: int) -> fn (a: str list) ->
+                           (if i >= slen then pk_flat a
+                            else
+                              (let a9 = x i in
+                               let _ = (if i + 1 >= slen || a9 < 0 then (let _ = bad () in ()) else ()) in
+                               let b9 = x (i + 1) in
+                               let _ = (if i + 2 >= slen || b9 < 0 then (let _ = bad () in ()) else ()) in
+                               if eq (i + 2) then
+                                 (if i + 4 == slen && eq (i + 3) then
+                                    (let _ = (if floor_mod b9 16 != 0 then (let _ = bad () in ()) else ()) in
+                                     pk_flat (Cons (chr (floor_mod (a9 * 4 + b9 / 16) 256), a)))
+                                  else (let _ = bad () in pk_flat a))
+                               else
+                                 (let c9 = x (i + 2) in
+                                  let _ = (if i + 3 >= slen || c9 < 0 then (let _ = bad () in ()) else ()) in
+                                  if i + 4 == slen && eq (i + 3) then
+                                    (let _ = (if floor_mod c9 4 != 0 then (let _ = bad () in ()) else ()) in
+                                     pk_flat (Cons (chr (floor_mod (a9 * 4 + b9 / 16) 256) ++ chr (floor_mod (b9 * 16 + c9 / 4) 256), a)))
+                                  else
+                                    (let d9 = x (i + 3) in
+                                     let _ = (if d9 < 0 then (let _ = bad () in ()) else ()) in
+                                     go (i + 4) (Cons (tri a9 b9 c9 d9, a)))))) in
+                         go si Nil)
+                      else
+                        // loose: anything outside the alphabet is skipped, `=` ends it
+                        (let rec skip = fn (i: int) -> fn (stop_eq: bool) ->
+                           (if i < slen && x i < 0 && (if stop_eq && eq i then false else true) then skip (i + 1) stop_eq else i) in
+                         let rec go = fn (i: int) -> fn (a: str list) ->
+                           (let ia = skip i false in
+                            if ia >= slen then pk_flat a
+                            else
+                              (let ib = skip (ia + 1) false in
+                               if ib >= slen then pk_flat a
+                               else
+                                 (let ic = skip (ib + 1) true in
+                                  let one = chr (floor_mod (x ia * 4 + x ib / 16) 256) in
+                                  if ic >= slen || eq ic then pk_flat (Cons (one, a))
+                                  else
+                                    (let id = skip (ic + 1) true in
+                                     if id >= slen || eq id then pk_flat (Cons (one ++ chr (floor_mod (x ib * 16 + x ic / 4) 256), a))
+                                     else go (id + 1) (Cons (tri (x ia) (x ib) (x ic) (x id), a)))))) in
+                         go si Nil)) in
+           // (the loose form reads to the end; so does the strict one, or it raised)
+           next slen (Cons (mkstr_e out "ASCII-8BIT", acc)))
+        else if str_eq ty "M" then
+          (let hx = fn (i: int) ->
+             (let c = ord (char_at s i) in
+              if c >= 48 && c <= 57 then c - 48 else if c >= 97 && c <= 102 then c - 87
+              else if c >= 65 && c <= 70 then c - 55 else 0 - 1) in
+           let rec go = fn (i: int) -> fn (a: str list) ->
+             // answers (decoded, where the undecodable tail starts)
+             (if i >= slen then (a, i)
+              else if ord (char_at s i) == 61 then
+                (let i1 = i + 1 in
+                 if i1 == slen then (a, i)
+                 else
+                   (let i2 = (if i1 + 1 < slen && ord (char_at s i1) == 13 && ord (char_at s (i1 + 1)) == 10 then i1 + 1 else i1) in
+                    if ord (char_at s i2) == 10 then go (i2 + 1) a
+                    else
+                      (let c1 = hx i2 in
+                       if c1 < 0 then (a, i)
+                       else if i2 + 1 == slen then (a, i)
+                       else
+                         (let c2 = hx (i2 + 1) in
+                          if c2 < 0 then (a, i)
+                          else go (i2 + 2) (Cons (chr (c1 * 16 + c2), a))))))
+              else go (i + 1) (Cons (char_at s i, a))) in
+           match go si Nil with
+           | (a, tail) -> next slen (Cons (mkstr_e (pk_flat a ++ substring s tail slen) "ASCII-8BIT", acc)))
+        else if str_eq ty "@" then
+          (if len > slen then (let _ = prim_raise "ArgumentError" "@ outside of string" in acc) else next len acc)
+        else if str_eq ty "X" then
+          (if len > si then (let _ = prim_raise "ArgumentError" "X outside of string" in acc) else next (si - len) acc)
+        else if str_eq ty "x" then
+          (if len > rem then (let _ = prim_raise "ArgumentError" "x outside of string" in acc) else next (si + len) acc)
+        else if str_eq ty "P" then
+          (if rem >= 8 then
+             (let t = (match pk_rd_int s si 8 false false with VInt a -> a | _ -> 0) in
+              let v = (if t == 0 then VNil else ptr t) in
+              let v2 = (match v with
+                        | VStr h -> (if len < str_len (sget h) then mkstr_e (substring (sget h) 0 len) (senc_get h) else v)
+                        | _ -> v) in
+              next (si + 8) (Cons (v2, acc)))
+           else next si acc)
+        else if str_eq ty "p" then
+          (let n = (if len > rem / 8 then rem / 8 else len) in
+           let rec go = fn (k: int) -> fn (i: int) -> fn (a: Val list) ->
+             (if k >= n then (i, a)
+              else (let t = (match pk_rd_int s i 8 false false with VInt a9 -> a9 | _ -> 0) in
+                    go (k + 1) (i + 8) (Cons ((if t == 0 then VNil else ptr t), a)))) in
+           match go 0 si acc with (i2, a2) -> next i2 a2)
+        else if str_eq ty "w" then
+          (let rec go = fn (k: int) -> fn (i: int) -> fn (v: str) -> fn (a: Val list) ->
+             (if k <= 0 || i >= slen then (i, a)
+              else (let b = ord (char_at s i) in
+                    let v2 = big_add_s (big_mul_s v "128") (str_of_int (floor_mod b 128)) in
+                    if b >= 128 then go k (i + 1) v2 a
+                    else go (k - 1) (i + 1) "0" (Cons (norm_big v2, a)))) in
+           match go len si "0" acc with (i2, a2) -> next i2 a2)
+        else (let _ = pk_unknown "unpack" ty f uni in acc)));

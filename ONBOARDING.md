@@ -115,7 +115,7 @@ how much room is left, on every CI run.
 
 ## 3. How the code is organized
 
-~60,000 lines of Mere across eight files. Sizes are a rough guide to where
+~60,000 lines of Mere across nine files. Sizes are a rough guide to where
 things are, not a map:
 
 | file | lines | what lives there |
@@ -128,6 +128,7 @@ things are, not a map:
 | `m_numeric.mere` | 2,000 | the numeric tower |
 | `m_strutil.mere` | 1,600 | string helpers |
 | `m_unicode.mere` | 1,300 | case tables, normalization, grapheme breaks |
+| `m_pack.mere` | 600 | `Array#pack` / `String#unpack`, read off pack.c |
 
 ### The two things that are Ruby, not Mere
 
