@@ -2318,7 +2318,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if (str_len name == 4 && str_eq name "fork") && (if map_has meths "fork" then false else true) then
       raise_exc world "NotImplementedError" "fork() function is unimplemented on this machine"
     // proc { } / lambda { } capture the block as a first-class VProc.
-    else if (str_len name == 4 && str_eq name "proc") || (str_len name == 6 && str_eq name "lambda") then
+    // (...unless self's class defines its own: then `lambda { return 1 }` is a
+    // call to it with a block, which stays a proc)
+    else if ((str_len name == 4 && str_eq name "proc") || (str_len name == 6 && str_eq name "lambda"))
+            && (if self_defines env world name then false else true) then
       // `proc(&pr)` answers pr ITSELF, not a copy of its body: the two are
       // `equal?` in ruby, and a lambda stays a lambda. pending_srcproc is the
       // proc the block was made from -- Hash.new(&pr) already reads it for the
@@ -2326,7 +2329,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (if map_has pending_srcproc "v" then
          (let pid0 = map_get pending_srcproc "v" in
           let _ = map_delete pending_srcproc "v" in
-          VProc pid0)
+          // ...but `lambda(&pr)` cannot turn a PROC into a lambda, and ruby
+          // refuses rather than hand back something that is not one
+          if (str_len name == 6 && str_eq name "lambda")
+             && (if map_has lambda_ids (str_of_int pid0) then false else true)
+          then raise_exc world "ArgumentError" "the lambda method requires a literal block"
+          else VProc pid0)
        else
        let id = (handle_base + map_len proc_store) in
        let _ = store_proc (str_of_int id) (true, bp, bb, env) in
@@ -8482,8 +8490,9 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
        let nm9 = (if str_eq cls "Method" then gv9 "@__m_name" else gv9 "@__um_name") in
        let rcv9 = (if map_has iv2 (str_of_int oid ++ "@__m_recv") then map_get iv2 (str_of_int oid ++ "@__m_recv") else VMain) in
        let own9 = (if str_eq own9 "" then class_name rcv9 else own9) in
-       meth_inspect_str world cls own9 nm9 (bm_params world own9 nm9)
-         (meth_source_location world own9 nm9 rcv9))
+       (if str_eq cls "Method" then bound_meth_inspect world (gv9 "@__m_owner") nm9 rcv9
+        else meth_inspect_str world cls own9 nm9 (bm_params world own9 nm9)
+         (meth_source_location world own9 nm9 rcv9)))
     else if map_has md_whole oid then
       "#<MatchData " ++ inspect (mkstr (map_get md_whole oid))
       ++ md_insp_groups iv2 oid 1 ++ ">"
@@ -8730,6 +8739,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      let _ = (if pub9 then public_send_guard world recv0 m9 else ()) in
      if str_eq m9 "eval" then do_eval env world blk rest9
      else invoke_val_c env world blk recv0 m9 rest9 pub9)
+  // `Class.allocate` is a class that was never initialized: it has no
+  // superclass to name, and cannot be made a subclass of Class
+  else if (str_eq name0 "superclass" || (str_eq name0 "initialize" && (match args0 with Cons (VClass cc9, _) -> str_eq cc9 "Class" | _ -> false)))
+          && (match recv0 with VObj oid9 -> (let (_, _, oc9, _) = world in str_eq (map_get oc9 oid9) "Class") | _ -> false) then
+    (if str_eq name0 "superclass" then raise_exc world "TypeError" "uninitialized class"
+     else raise_exc world "TypeError" "can't make subclass of Class")
+  // Module's own surface on an instance of a Module subclass (mod_inst_delegates)
+  else if mod_inst_delegates world recv0 name0 then
+    invoke_val_c env world blk (mod_inst_backing world recv0) name0 args0 vischeck
   // Kernel#then / #yield_self WITHOUT a block: an Enumerator of the receiver,
   // of size 1. The block form is invoke_with_block's; this one had no arm.
   else if (str_eq name0 "then" || str_eq name0 "yield_self")
@@ -11130,9 +11148,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       // top level was a NameError: main's method table holds
                       // what the program defined, and nothing else, so every
                       // name every object answers was missing from it.
+                      // (...and Kernel's own functions, `method(:load)`)
                       | VMain -> (let (m9, _, _, _) = world in
-                                  map_has m9 nm || is_prim_method nm)
-                      | _ -> responds world recv nm || is_binary_op_name nm
+                                  map_has m9 nm || is_prim_method nm || is_kernel_builtin nm)
+                      // ⚠ Kernel#method asks respond_to_missing? ONCE, with
+                      //   the flag TRUE (below). `responds` asks it with
+                      //   false first, which a mock expecting (name, true)
+                      //   rejects -- so #method takes the table-only answer
+                      //   here, and a Kernel function (private everywhere)
+                      //   counts.
+                      | _ -> (if (str_len name == 6 && str_eq name "method")
+                              then responds_real world recv nm
+                                   || (is_kernel_builtin nm && str_list_has (ancestors_of world (dispatch_cls_of world recv)) "Kernel")
+                              else responds world recv nm)
+                             || is_binary_op_name nm
                              // ⚠ ...and #public_method does NOT: it asks the
                              //   same question #respond_to? asks, which is
                              //   what `responds` already did above. Sharing
@@ -11191,8 +11220,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 | other -> (let hk3 = hng_key other in
                             if (if str_eq hk3 "" then false else true) && map_has hng_store hk3
                             then map_get hng_store hk3 else "")) in
-     if (if str_eq sng "" then false else true) && has_own_meth world sng nm
-     then mk_bound_method world recv sng nm
+     // ...and in a module mixed INTO that singleton (extend, or include /
+     // prepend on the singleton class): ruby 3.4 looks there too, and stops at
+     // the class the object had -- which is where a plain method lives.
+     let home9 = (if str_eq sng "" then ""
+                  else if has_own_meth world sng nm then sng
+                  else
+                    (let stop9 = sng_supername world sng in
+                     let rec walk9 = fn (xs: str list) ->
+                       (match xs with
+                        | Nil -> ""
+                        | Cons (a9, t9) ->
+                          (if str_eq a9 sng then walk9 t9
+                           else if is_sng_cls a9 || str_eq a9 stop9 then ""
+                           else if has_own_meth world a9 nm then a9
+                           else walk9 t9)) in
+                     walk9 (ancestors_of world sng))) in
+     if (if str_eq home9 "" then false else true)
+     then mk_bound_method world recv home9 nm
      else raise_exc world "NameError"
             // ruby QUOTES the receiver here: "for 'false'", not "for false".
             ("undefined singleton method '" ++ nm ++ "' for '" ++ inspect recv ++ "'"))
@@ -11329,6 +11374,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 9 && str_eq name "exception") && exc_is_a world c "Exception"
             && (if has_meth world ("(sng:" ++ c ++ ")") "exception" then false else true) then
       invoke_val_c env world blk recv "new" args false
+    // Class#dup / #clone and Module's: a real copy (cls_copy). BasicObject is
+    // the root and ruby refuses it; a singleton class keeps the old answer.
+    else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+            && (if is_sng_cls c then false else true)
+            // (a builtin class has nothing in these tables to copy; it keeps the old answer)
+            && (if builtin_cls_name c && (if str_eq c "BasicObject" then false else true) then false else true)
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      (if str_eq c "BasicObject" then raise_exc world "TypeError" "can't copy the root class"
+       else cls_copy world c ((str_len name == 5 && str_eq name "clone")
+                              && (match args with
+                                  | Cons (VHsh h9, _) -> (match hash_get (hderef h9) (VSym "freeze") with VBool false -> false | _ -> true)
+                                  | _ -> true)))
     // true / false / nil are the ONLY instances of their classes: ruby gives
     // those three classes no allocator (TypeError) and no `new` at all
     // (NoMethodError) -- two different refusals, which is what the specs
@@ -14020,7 +14077,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = collect_cls_methods world c names in
           let out = map_new () in
           let _ = map_iter names (fn (k: str) -> fn (v: Val) -> let i = map_len out in map_set out (str_of_int i) v) in
-          arr_new (idx_to_list out 0 (map_len out))))
+          let own9 = idx_to_list out 0 (map_len out) in
+          // ...with the modules the class (or a superclass) was extended with
+          arr_new (list_append own9 (sng_mixin_syms world ("(sng:" ++ c ++ ")") own9))))
     // private_instance_methods(false) / public_instance_methods(false): the
     // own methods split by the visibility table.
     else if (str_len name == 24 && str_eq name "private_instance_methods") || (str_len name == 23 && str_eq name "public_instance_methods")
@@ -15081,9 +15140,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            || (if str_eq (lookup_anc world (ancestors_of world c) n9) "" then false else true)
                            || builtin_has_meth c n9
                         then ()
-                        else (let _ = raise_exc world "NameError"
+                        // ...naming the class as it prints (an anonymous one is
+                        // `#<Module:0x...>`, not its internal key); a CLASS's
+                        // metaclass is named by the class, as ruby does
+                        else (let shown9 = (if is_sng_cls c && (let i9 = sng_inner c in
+                                                                 if str_len i9 > 0 && is_digit (char_at i9 0) then false
+                                                                 else (if is_sng_cls i9 then false else true))
+                                            then cls_display world (sng_inner c) else cls_display world c) in
+                              let _ = raise_exc_iv world "NameError"
                                 ("undefined method '" ++ n9 ++ "' for "
-                                 ++ (if map_has modules c then "module '" else "class '") ++ c ++ "'") in ()))
+                                 ++ (if map_has modules c then "module '" else "class '") ++ shown9 ++ "'")
+                                (Cons (("__name", VSym n9), Nil)) in ()))
                      else
                        (if map_has meths0 key then ()
                         else (let _ = raise_exc world "NameError"
@@ -15201,9 +15268,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          let _ = const_store world key value in value
        | _ -> VNil)
     else if has_meth world ("(sng:" ++ c ++ ")") name then
-      (if vischeck && meth_private world ("(sng:" ++ c ++ ")") name
-       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ c)
-       else invoke world noblk recv ("(sng:" ++ c ++ ")") name args)
+      // a refused call goes to the class's own #method_missing when it has
+      // one (ruby calls it for a visibility refusal exactly as for a missing
+      // name), and a PROTECTED class method is refused too -- the mark
+      // `protected :m` in `class << self` wrote was never read here.
+      (let sc9 = "(sng:" ++ c ++ ")" in
+       let refused9 = (if vischeck && meth_private world sc9 name then "private"
+                       else if vischeck && meth_protected world sc9 name && (if protected_ok env world sc9 then false else true) then "protected"
+                       else "") in
+       if str_eq refused9 "" then invoke world noblk recv sc9 name args
+       else if has_meth world sc9 "method_missing" then invoke world noblk recv sc9 "method_missing" (Cons (VSym name, args))
+       else raise_exc_iv world "NoMethodError"
+              (refused9 ++ " method '" ++ name ++ "' called for " ++ (if map_has modules c then "module " else "class ") ++ display_cls world c)
+              (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
     // a class method aliased to a BUILTIN one (concurrent-ruby writes
     // `singleton_class.send :alias_method, :[], :new`, so `Node[a, b]` is
     // `Node.new(a, b)`): the alias table records the source name.
@@ -15299,11 +15376,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // fdio_route), ahead of IO's own -- which are the File model's
     if fdio_route world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
     else if has_meth world cls name then
-      (if vischeck && meth_private world cls name
-       then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
-       else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true)
-       then raise_exc world "NoMethodError" ("protected method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
-       else invoke world noblk recv cls name args)
+      // ⚠ a visibility refusal is a MISSING method as far as #method_missing
+      //   is concerned: ruby hands `obj.priv` to the object's method_missing
+      //   when it has one, and raises only when it does not.
+      (let refused9 = (if vischeck && meth_private world cls name then "private"
+                       else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true) then "protected"
+                       else "") in
+       if str_eq refused9 "" then invoke world noblk recv cls name args
+       else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
+       else raise_exc_iv world "NoMethodError" (refused9 ++ " method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
+              (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil)))))
     // a private Kernel method a class (or an object's singleton) made PUBLIC
     // -- `class << obj; public :raise; end`, which is how ruby/spec gets a
     // public #raise to share examples with Thread#raise -- is called on the
@@ -15352,7 +15434,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && (if map_has privates k then false else true)
          then (let m = map_len tmp in map_set tmp (str_of_int m) (VSym (substring k plen (str_len k))))
          else ()) in
-       arr_new (idx_to_list tmp 0 (map_len tmp)))
+       let own9 = idx_to_list tmp 0 (map_len tmp) in
+       // ...and, unless asked for `false`, those of the modules it was
+       // extended with (see sng_mixin_syms)
+       if (match args with Cons (VBool false, _) -> true | Cons (VNil, _) -> true | _ -> false)
+          || (if is_sng_cls (map_get ocls id) then false else true)
+       then arr_new own9
+       else arr_new (list_append own9 (sng_mixin_syms world (map_get ocls id) own9)))
     else if (str_len name == 21 && str_eq name "instance_variable_get") then
       (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_name_val_r env world recv v in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
     else if (str_len name == 21 && str_eq name "instance_variable_set") then
@@ -15514,8 +15602,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let ocl = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
           // the ORIGINAL name, for the reason given in the UnboundMethod arm.
           let mnm = original_name_of world ocl mnm in
-          let anc9 = ancestors_of world ocl in
-          let above0 = lookup_anc_above world anc9 ocl mnm in
+          // ⚠ the chain walked is the RECEIVER's, not the owner's: a method
+          //   found in a module the object was extended with (or included
+          //   anywhere) has the object's class above it, and the owner's own
+          //   ancestors -- the module alone -- have nothing, so the first
+          //   super_method of `obj.extend(M).method(:m)` was nil.
+          let anc9 = (let rc9 = dispatch_cls_of world mrecv in
+                      let ra9 = ancestors_of world rc9 in
+                      if str_list_has ra9 ocl then ra9 else ancestors_of world ocl) in
+          let above0 = super_owner_above world anc9 ocl mnm in
           // ...or the universal name's home, Kernel (see the UnboundMethod arm)
           let above = (if str_eq above0 "" && is_prim_method mnm
                           && (if str_eq ocl "Kernel" then false else true) && anc_has anc9 "Kernel"
@@ -15674,9 +15769,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // name, the parameter SHAPE and where it was written. It used to be
          // the class and the name alone, and for an object with ivars the
          // default printer showed the internal ones instead.
-         (let ocl9 = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
-          mkstr (meth_inspect_str world "Method" ocl9 mnm
-                   (bm_params world ocl9 mnm) (meth_source_location world mown mnm mrecv)))
+         mkstr (bound_meth_inspect world mown mnm mrecv)
        // the universal names, same reason as the ThreadGroup arm above (this
        // one refused `nil?` and `itself`).
        else if is_prim_method name then dispatch_prim env world blk recv name args false
@@ -17110,7 +17203,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //   ORIGINAL NAME strictly above the OWNER.
          (let anc = ancestors_of world ucls in
           let unm = original_name_of world ucls unm in
-          let above = lookup_anc_above world anc ucls unm in
+          let above = super_owner_above world anc ucls unm in
           if str_eq above "" then
             // ...and the BUILTIN above it: `String.instance_method(:to_s)`
             // answers Kernel#to_s in ruby, because #to_s is Kernel's and
@@ -19386,6 +19479,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     // `each_slice(2, 2) { }` is the same wrong count as without one.
     let __amb = builtin_arity_msg_b world recv name args true in
     if (if str_eq __amb "" then false else true) then raise_exc world "ArgumentError" __amb
+    // Module's own surface on an instance of a Module subclass (mod_inst_delegates)
+    else if mod_inst_delegates world recv name then
+      invoke_with_block env world blk (mod_inst_backing world recv) name args newblk
     // the argument wins and the block is dropped (see arg_beats_block), unless
     // a USER class defines the name itself -- this is CRuby's builtin
     // behaviour, not a rule about the name.
@@ -22586,6 +22682,132 @@ and kernel_by_name = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args:
      let r9 = eval_e e9 world blk call9 in
      let _ = blk_env_put e9 in
      r9)
+// The class whose `name` is the SUPER of the one `owner` answers. When the
+// owner holds only a visibility statement for it (`public :m` on an inherited
+// m -- ruby's zsuper entry, which is why #owner names that class), the method
+// that actually runs is the next definition up, and super starts above THAT.
+and super_owner_above = fn world -> fn (anc: str list) -> fn (owner: str) -> fn (name: str) ->
+  let (m9, _, _, _) = world in
+  let start9 = (if map_has vis_marks (owner ++ "#" ++ name) && (if map_has m9 (owner ++ "#" ++ name) then false else true)
+                then lookup_anc_above world anc owner name else owner) in
+  if str_eq start9 "" then "" else lookup_anc_above world anc start9 name
+// The public and protected methods of the MODULES mixed into a singleton class
+// (`obj.extend(M)`, and M's own includes), as Symbols, for #singleton_methods:
+// ruby lists them with the singleton's own unless given `false`. The walk is
+// the singleton's ancestry up to the first ordinary class -- the object's
+// class, or `Class` for a class's metaclass chain.
+and sng_mixin_syms = fn world -> fn (sng: str) -> fn (skip: Val list) ->
+  let (m9, _, _, _) = world in
+  let seen9 = map_new () in
+  let _ = list_iter_vals skip (fn (v9: Val) -> (match v9 with VSym s9 -> map_set seen9 s9 VNil | _ -> ())) in
+  let out9 = map_new () in
+  let rec walk9 = fn (xs: str list) ->
+    (match xs with
+     | Nil -> ()
+     | Cons (a9, t9) ->
+       (if is_sng_cls a9 then walk9 t9
+        else if (if map_has modules a9 then false else true) then ()
+        else
+          (let pfx9 = a9 ++ "#" in
+           let pl9 = str_len pfx9 in
+           let _ = map_iter m9 (fn (k: str) -> fn (v: Meth) ->
+             if str_len k > pl9 && str_eq (substring k 0 pl9) pfx9
+                && (if map_has privates k then false else true)
+                && (if str_contains (substring k pl9 (str_len k)) "#" then false else true)
+                && (if map_has seen9 (substring k pl9 (str_len k)) then false else true)
+             then (let n9 = substring k pl9 (str_len k) in
+                   let _ = map_set seen9 n9 VNil in
+                   map_set out9 (str_of_int (map_len out9)) (VSym n9))
+             else ()) in
+           walk9 t9))) in
+  let _ = walk9 (ancestors_of world sng) in
+  idx_to_list out9 0 (map_len out9)
+// ⚠ AN INSTANCE OF A SUBCLASS OF MODULE is an ordinary object here (it has
+//   the subclass's methods and its own ivars, which is most of what such a
+//   class is for), and so it had none of MODULE's own surface: `SubModule.new
+//   .constants` and `.module_exec { }` were NoMethodErrors. The module half is
+//   a real anonymous module kept beside the object, and Module's reflection
+//   and evaluation names go to it -- unless the subclass defines the name.
+//   The names that describe the OBJECT (singleton_class, ivars, allocate,
+//   superclass) stay with the object.
+and mod_inst_delegates = fn world -> fn (recv: Val) -> fn (name: str) ->
+  match recv with
+  | VObj id ->
+    is_module_method name
+    && (if str_eq name "singleton_class" || str_eq name "singleton_class?" || str_eq name "instance_variable_get"
+           || str_eq name "allocate" || str_eq name "attached_object" || str_eq name "superclass"
+           || str_eq name "subclasses" then false else true)
+    && (let (_, _, oc9, _) = world in
+        let c9 = map_get oc9 id in
+        (if has_meth world c9 name then false else true)
+        && str_list_has (ancestors_of world c9) "Module")
+  | _ -> false
+and mod_inst_backing = fn world -> fn (recv: Val) ->
+  let (_, _, _, iv9) = world in
+  match recv with
+  | VObj id ->
+    (let k9 = str_of_int id ++ "@__modbk" in
+     if map_has iv9 k9 then map_get iv9 k9
+     else (let m9 = make_anon_cls world "Module" Nil in
+           let _ = map_set iv9 k9 m9 in m9))
+  | _ -> recv
+// ⚠ Class#dup / Module#dup / #clone answered THE RECEIVER: `M.dup` was M, so
+//   whatever a program did to the copy it did to the original (a frozen
+//   "copy" froze M; remove_class_variable on it removed M's), and the copy's
+//   #name was the original's. A copy is a fresh anonymous class or module
+//   holding what the original holds at that moment: its methods (instance and
+//   singleton, with their visibility), its mixins, constants, class variables
+//   and ivars, under the same superclass. It has no name until a constant is
+//   given it, like any anonymous class.
+and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
+  let (m9, s9, o9, iv9) = world in
+  let ismod = map_has modules c in
+  let nc = fresh_anon (if ismod then "AnonModule_" else "AnonClass_") in
+  let _ = (if ismod then map_set modules nc VNil
+           else set_sup s9 nc (if map_has s9 c then map_get s9 c else "Object")) in
+  // the pairs to copy are collected first: the tables are written while
+  // being read otherwise
+  let rec_pfx = fn (src: str) -> fn (dst: str) ->
+    (let pl9 = str_len src in
+     let ks9 = map_new () in
+     let _ = map_iter m9 (fn (k: str) -> fn (v: Meth) ->
+       if str_len k > pl9 && str_eq (substring k 0 pl9) src
+          && (if str_contains (substring k pl9 (str_len k)) "#" then false else true)
+       then map_set ks9 (str_of_int (map_len ks9)) (mkstr k) else ()) in
+     list_iter_vals (idx_to_list ks9 0 (map_len ks9)) (fn (kv: Val) ->
+       (match kv with
+        | VStr kh ->
+          (let k = sget kh in
+           let nk = dst ++ substring k pl9 (str_len k) in
+           let _ = set_meth m9 nk (map_get m9 k) in
+           let _ = (if map_has meth_cref k then map_set meth_cref nk (map_get meth_cref k) else ()) in
+           let _ = copy_meth_src nk k in
+           let _ = (if map_has privates k then map_set privates nk VNil else ()) in
+           let _ = (if map_has protecteds k then map_set protecteds nk VNil else ()) in
+           if map_has alias_srcname k then map_set alias_srcname nk (map_get alias_srcname k) else ())
+        | _ -> ()))) in
+  let _ = rec_pfx (c ++ "#") (nc ++ "#") in
+  let _ = rec_pfx ("(sng:" ++ c ++ ")#") ("(sng:" ++ nc ++ ")#") in
+  let _ = (if map_has includes c then set_inc nc (map_get includes c) else ()) in
+  let _ = (if map_has prepends c then set_pre nc (map_get prepends c) else ()) in
+  let _ = (if map_has includes ("(sng:" ++ c ++ ")") then set_inc ("(sng:" ++ nc ++ ")") (map_get includes ("(sng:" ++ c ++ ")")) else ()) in
+  // constants, class variables and the class's own ivars, by key prefix
+  let copy_kv = fn tbl -> fn (src: str) -> fn (dst: str) -> fn (nested_sep: str) ->
+    (let pl9 = str_len src in
+     let ks9 = map_new () in
+     let _ = map_iter tbl (fn (k: str) -> fn (v: Val) ->
+       if str_len k > pl9 && str_eq (substring k 0 pl9) src
+          && (if str_eq nested_sep "" then true else (if str_contains (substring k pl9 (str_len k)) nested_sep then false else true))
+       then map_set ks9 (str_of_int (map_len ks9)) (mkstr k) else ()) in
+     list_iter_vals (idx_to_list ks9 0 (map_len ks9)) (fn (kv: Val) ->
+       (match kv with
+        | VStr kh -> (let k = sget kh in map_set tbl (dst ++ substring k pl9 (str_len k)) (map_get tbl k))
+        | _ -> ()))) in
+  let _ = copy_kv consts (c ++ "::") (nc ++ "::") "::" in
+  let _ = copy_kv cvars (c ++ "@") (nc ++ "@") "" in
+  let _ = copy_kv iv9 ("cls:" ++ c ++ "@") ("cls:" ++ nc ++ "@") "" in
+  let _ = (if keep_frozen && map_has cls_frozen c then map_set cls_frozen nc (map_get cls_frozen c) else ()) in
+  VClass nc
 and kernel_made_public = fn (anc: str list) -> fn (name: str) ->
   match anc with
   | Nil -> false
@@ -29694,7 +29916,13 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     let _ = fire_trace world "call" name defcls in
     let slf9 = (if lv_has frame "self" then lv_get frame "self" else VNil) in
     let _ = fire_tp_v world "call" name defcls VNil slf9 in
-    let out = (match method_body_flow frame world blk body with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
+    let flow9 = method_body_flow frame world blk body in
+    let out = (match flow9 with FNext v -> v | FReturn v -> v | FRaise v -> v | FBreak v -> v | FLoopNext v -> v) in
+    // whether THIS call ended because its block broke out of it (meth_broke):
+    // written only when it changes, so an ordinary call pays one lookup
+    let _ = (match flow9 with
+             | FBreak _ -> map_set meth_broke 0 1
+             | _ -> (if map_has meth_broke 0 then map_delete meth_broke 0 else ())) in
     // the frame dies here unless something captured it (or its chain):
     // recycled and pooled, its arena wound back to the warm seed. Safe on
     // every exit path -- method_body_flow converts raises to Flow values,
@@ -30727,7 +30955,9 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
         // iff this is that frame, otherwise keep propagating to the outer method.
         let target = (if map_has flow_sig "fid" then (match map_get flow_sig "fid" with VInt t -> t | _ -> 0) else 0) in
         let myfid = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> t | _ -> 0) else 0) in
-        if target == myfid then (let _ = map_delete flow_sig "fid" in FNext v)
+        // (a BREAK that lands here comes back as FBreak: the value is the same,
+        // and the caller can tell the call was broken out of -- see meth_broke)
+        if target == myfid then (let _ = map_delete flow_sig "fid" in if str_eq k "breakret" then FBreak v else FNext v)
         else (let _ = map_set flow_sig "k" (mkstr k) in
               let _ = map_set flow_sig "fid" (VInt target) in
               let _ = map_set flow_sig "v" v in
@@ -35533,7 +35763,9 @@ and new_obj_wb = fn world -> fn (cls: str) -> fn (args: Val list) -> fn theblk -
   let obj = VObj id in
   let _ = seed_builtin_subclass_ivars world cls id args in
   if has_meth world cls "initialize" then
-    let _ = invoke world theblk obj cls "initialize" args in obj
+    // ...and a block that BREAKS out of #initialize is the value of `new`
+    (let r9 = invoke world theblk obj cls "initialize" args in
+     if map_has meth_broke 0 then (let _ = map_delete meth_broke 0 in r9) else obj)
   else init_arity_refuse world cls args obj
 
 // a Regexp SUBCLASS instance keeps its pattern (Regexp#initialize would
@@ -37255,6 +37487,9 @@ and protected_ok = fn env -> fn world -> fn (cls: str) ->
     (let (meths, sup, ocls, ivars) = world in
      match lv_get env "self" with
      | VObj id -> obj_is_a world (map_get ocls id) cls
+     // a CLASS self is kind_of? its own metaclass chain, which is where a
+     // protected class method lives
+     | VClass sc -> str_list_has (ancestors_of world ("(sng:" ++ sc ++ ")")) cls
      | _ -> false)
   else false
 
@@ -38232,6 +38467,14 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // instance_eval it aliases into the receiver's singleton class, so the
     // alias is the object's alone (`AliasObject.new.__value` stays a
     // NoMethodError). Reading only self put it on the object's class.
+    // ...and an immediate (instance_eval on 1 or :sym) has no singleton class
+    // to put one in: ruby's TypeError, where this aliased at the top level
+    if lv_has env "__definee_recv"
+       && (match lv_get env "__definee_recv" with
+           | VInt _ -> true | VBig _ -> true | VFlt _ -> true | VSym _ -> true
+           | _ -> false) then
+      (let _ = raise_exc world "TypeError" "can't define singleton" in FNext VNil)
+    else
     let dcls = definee_cls_of env world in
     if str_eq dcls "" then
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
@@ -40206,7 +40449,27 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
 // `#<Method: A#foo(a, b=...) file:line>` / `#<UnboundMethod: ...>`: a class
 // method is written with a DOT, everything else with a hash, and a builtin has
 // no source to name.
-and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm: str) -> fn (params: Val) -> fn (loc: Val) ->
+// A BOUND method names the receiver's class too when the method was found
+// somewhere else: `#<Method: MySub(MyMod)#bar ...>`, and a class receiver's is
+// its metaclass, `#<Class:C>(M)#bar` for a method C was extended with. The
+// owner is known only where the method table recorded one (mown), so a
+// builtin keeps the old one-name form.
+and bound_meth_inspect = fn world -> fn (mown: str) -> fn (mnm: str) -> fn (mrecv: Val) ->
+  let ocl9 = (if str_eq mown "" then dispatch_cls_of world mrecv else mown) in
+  let base9 = meth_inspect_str world "Method" ocl9 mnm (bm_params world ocl9 mnm) (meth_source_location world mown mnm mrecv) in
+  let klass9 = (match mrecv with
+                | VClass c9 -> cls_display world ("(sng:" ++ c9 ++ ")")
+                | VObj _ -> cls_display world (display_cls world (dispatch_cls_of world mrecv))
+                | VMain -> "Object"
+                | _ -> class_name mrecv) in
+  if str_eq mown "" || is_sng_cls mown || str_eq klass9 (cls_display world mown) then base9
+  else "#<Method: " ++ klass9 ++ "(" ++ cls_display world mown ++ ")#" ++ substring base9 (str_len ("#<Method: " ++ cls_display world mown ++ "#")) (str_len base9)
+and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm0: str) -> fn (params: Val) -> fn (loc: Val) ->
+  // an ALIAS names what it was made from, in parentheses after its own name
+  // (`AL#ali(orig)`, `Array#append(push)`), as does a method define_method'd
+  // from another one
+  let orig9 = original_name_of world owner nm0 in
+  let nm = (if str_eq orig9 nm0 || str_eq orig9 "" then nm0 else nm0 ++ "(" ++ orig9 ++ ")") in
   // ⚠ ...but an UNBOUND one has no receiver to put before the dot: it names
   //   its owner, the singleton class, with a hash (`#<Class:C>#foo`). And a
   //   bound one on an OBJECT'S singleton names the object, which the owner
