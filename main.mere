@@ -1164,7 +1164,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           if has_own_meth world ("(sng:" ++ rc0 ++ ")") "const_missing"
              || has_own_meth world rc0 "const_missing"
           then invoke_val_c env world blk (VClass rc0) "const_missing" (Cons (VSym cn0, Nil)) false
-          else raise_exc world "NameError" ("private constant " ++ name ++ " referenced"))
+          else priv_const_err world name)
        else if map_has consts name then map_get consts name
        else
          // walk the segments left to right: the head can itself be lexically
@@ -1192,7 +1192,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // public: `Inc::X` finds PM2::X along the chain, and private_constant
          // closed that name off wherever it is reached from.
          else if (if str_eq akey "" then false else true) && map_has private_consts akey then
-           raise_exc world "NameError" ("private constant " ++ akey ++ " referenced")
+           priv_const_err world akey
          else if (if str_eq akey "" then false else true) then map_get consts akey
          else if has_meth world ("(sng:" ++ rc ++ ")") "const_missing" || has_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
@@ -1234,9 +1234,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // constant path. Only the name-path form checked, so anything reached
        // through a variable holding the module read straight past it.
        if map_has private_consts key then
-         raise_exc world "NameError" ("private constant " ++ key ++ " referenced")
+         priv_const_err world key
        else if (if str_eq akey "" then false else true) && map_has private_consts akey then
-         raise_exc world "NameError" ("private constant " ++ akey ++ " referenced")
+         priv_const_err world akey
        else if map_has consts key then map_get consts key
        else if (if str_eq akey "" then false else true) then map_get consts akey
        else if map_has consts cn then map_get consts cn
@@ -15350,56 +15350,77 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          | Nil -> VNil
          | Cons (a, rest) ->
            let n = (match a with VSym sy -> sy | VStr h -> sget h | other -> to_s other) in
-           let full = c ++ "::" ++ n in
+           // (Object's own constants are the top level's, keyed bare)
+           let full = (if str_eq c "Object" && (if map_has consts (c ++ "::" ++ n) then false else true) then n else c ++ "::" ++ n) in
            if map_has consts full then
              (let _ = (if priv then map_set private_consts full VNil
                        else (if map_has private_consts full then map_delete private_consts full else ())) in
               go rest)
-           else raise_exc world "NameError" ("constant " ++ full ++ " not defined") in
+           else raise_exc world "NameError" ("constant " ++ cls_display world c ++ "::" ++ n ++ " not defined") in
        go args)
     // const_get(:Name) reads a constant; const_set(:Name, v) defines one.
     else if (str_len name == 9 && str_eq name "const_get") then
       (match args with
-       | Cons (v, _) ->
-         (let n0 = sym_or_str_arg env world v in
-          // ⚠ ...and the NAME has to BE one. `const_get("nope")` is "wrong
-          //   constant name nope" in ruby, not "uninitialized constant nope" --
-          //   the difference is a typo in the program against a constant that
-          //   has not been defined yet, and a caller reads the two differently.
+       | Cons (v, rest0) ->
+         (let n00 = sym_or_str_arg env world v in
+          // ⚠ ruby's rules, which this answered only in part:
+          //   - a SYMBOL names one constant: `:"A::B"` and `:"::A"` are
+          //     "wrong constant name" (only a String is a path);
+          //   - a leading "::" starts the path at Object;
+          //   - `inherit` (any truthy value; nil and false are false) decides
+          //     whether the ancestors -- and for a module, Object -- are
+          //     searched for the FIRST segment: `M.const_get(:TOP, false)` is
+          //     a NameError, and it answered the top-level constant;
+          //   - every LATER segment is looked up in what the previous one
+          //     answered, along its ancestors but never the top level:
+          //     `Object.const_get("ConstantSpecs::CS_CONST1")` is a NameError
+          //     although CS_CONST1 exists at the top;
+          //   - the NameError names the constant (#name) and the path it was
+          //     looked for under.
+          let issym9 = (match v with VSym _ -> true | _ -> false) in
+          let _ = (if issym9 && str_contains n00 "::"
+                   then (let _ = raise_exc_iv world "NameError" ("wrong constant name " ++ n00) (Cons (("__name", VSym n00), Nil)) in ())
+                   else ()) in
+          let top9 = (str_len n00 >= 2 && str_eq (substring n00 0 2) "::") in
+          let n0 = (if top9 then substring n00 2 (str_len n00) else n00) in
           let _ = (if is_const_path n0 then ()
-                   else (let _ = raise_exc world "NameError"
-                           ("wrong constant name " ++ n0) in ())) in
-          // ...and a QUALIFIED name is resolved a segment at a time, so the
-          // refusal names the segment that is missing ("uninitialized constant
-          // Nope" for "Nope::Deeper") rather than repeating the whole path.
-          let n = (let i8 = first_sep_at n0 0 in
-                   if i8 < 0 then n0 else substring n0 0 i8) in
-          let rest8 = (let i8 = first_sep_at n0 0 in
-                       if i8 < 0 then "" else substring n0 (i8 + 2) (str_len n0)) in
-          let key = (if str_eq c "Object" then n else c ++ "::" ++ n) in
-          // ⚠ ...and the ANCESTORS, which is where `::` already looks: a
-          // constant on a superclass or an included module answers
-          // `Child.const_get(:X)` in ruby, and this stopped at the class
-          // itself and the top level.
-          let akey = anc_const_key world c n in
-          // ...and when there IS a rest, the found value answers the rest.
-          let deeper8 = fn (found8: Val) ->
-            (if str_eq rest8 "" then found8
-             else invoke_val_c env world blk found8 "const_get" (Cons (mkstr rest8, Nil)) false) in
-          if map_has consts key then deeper8 (map_get consts key)
-          else if (if str_eq akey "" then false else true) then deeper8 (map_get consts akey)
-          else if map_has consts n then deeper8 (map_get consts n)
-          // the constant may only be registered as an autoload so far
-          else if autoload_fire env world blk key || autoload_fire env world blk n then
-            (if map_has consts key then map_get consts key
-             else if map_has consts n then map_get consts n
-             else raise_exc world "NameError" ("uninitialized constant " ++ n))
-          // const_missing is the documented hook and const_get has to honour
-          // it, not just a bare `Const` reference: regexp_parser resolves its
-          // per-ruby-version syntax classes entirely through const_get.
-          else if has_meth world ("(sng:" ++ c ++ ")") "const_missing" || has_meth world c "const_missing" then
-            invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym n, Nil)) false
-          else raise_exc world "NameError" ("uninitialized constant " ++ n))
+                   else (let _ = raise_exc_iv world "NameError" ("wrong constant name " ++ n00) (Cons (("__name", VSym n00), Nil)) in ())) in
+          let inherit9 = (match rest0 with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+          let start9 = (if top9 then "Object" else c) in
+          // one segment in the class cx: own, then (inh) its ancestors, then
+          // (withtop) the top level; then an autoload registration; else ""
+          let rec seg9 = fn (cx: str) -> fn (sn: str) -> fn (inh: bool) -> fn (withtop: bool) -> fn (again: bool) ->
+            (let own9 = (if str_eq cx "Object" then sn else cx ++ "::" ++ sn) in
+             if map_has consts own9 then own9
+             else if inh && (if str_eq (anc_const_go (ancestors_of world cx) sn) "" then false else true)
+             then anc_const_go (ancestors_of world cx) sn
+             else if withtop && map_has consts sn then sn
+             // (a constant written `Object::X = v` is keyed under Object's name)
+             else if (withtop || str_eq cx "Object") && map_has consts ("Object::" ++ sn) then "Object::" ++ sn
+             else if again && (autoload_fire env world blk own9 || (withtop && autoload_fire env world blk sn))
+             then seg9 cx sn inh withtop false
+             else "") in
+          let rec walk9 = fn (cx: str) -> fn (path: str) -> fn (first: bool) ->
+            (let i8 = first_sep_at path 0 in
+             let sn = (if i8 < 0 then path else substring path 0 i8) in
+             let rest8 = (if i8 < 0 then "" else substring path (i8 + 2) (str_len path)) in
+             let withtop9 = first && (str_eq cx "Object" || (inherit9 && (map_has modules cx || str_list_has (ancestors_of world cx) "Object"))) in
+             let k9 = seg9 cx sn (if first then inherit9 else true) withtop9 true in
+             if str_eq k9 "" then
+               (if has_meth world ("(sng:" ++ cx ++ ")") "const_missing" || has_meth world cx "const_missing" then
+                  (let r9 = invoke_val_c env world blk (VClass cx) "const_missing" (Cons (VSym sn, Nil)) false in
+                   if str_eq rest8 "" then r9
+                   else (match r9 with VClass nc9 -> walk9 nc9 rest8 false | _ -> r9))
+                else raise_exc_iv world "NameError"
+                       ("uninitialized constant " ++ (if str_eq cx "Object" then sn else cls_display world cx ++ "::" ++ sn))
+                       (Cons (("__name", VSym sn), Cons (("__recv", VClass cx), Nil))))
+             else
+               (let v9 = map_get consts k9 in
+                if str_eq rest8 "" then v9
+                else (match v9 with
+                      | VClass nc9 -> walk9 nc9 rest8 false
+                      | _ -> raise_exc world "TypeError" (inspect_w env world v9 ++ " does not refer to class/module")))) in
+          walk9 start9 n0 true)
        | _ -> VNil)
     // Module#autoload(:Const, path) / #autoload?(:Const). The registration is
     // qualified with the receiver, so Gem.autoload :Requirement, "..." answers
@@ -23093,6 +23114,16 @@ and cls_meth_own = fn world -> fn (c: str) -> fn (name: str) ->
   && (if (map_has (name_set "modpub") name || map_has (name_set "modpriv") name)
          && str_list_has (ancestors_of world "Object") (lookup_anc world (ancestors_of world ("(sng:" ++ c ++ ")")) name)
       then false else true)
+// The NameError for reading a private constant through the scope operator. It
+// carries what ruby's carries: #name (the constant) and #receiver (the class
+// that DEFINES it -- where the key says it lives, which for a constant reached
+// through an ancestor is the ancestor, not the class written).
+and priv_const_err = fn world -> fn (key: str) ->
+  let i9 = str_rindex_go key "::" (str_len key - 2) in
+  let own9 = (if i9 < 0 then "Object" else substring key 0 i9) in
+  let cn9 = (if i9 < 0 then key else substring key (i9 + 2) (str_len key)) in
+  raise_exc_iv world "NameError" ("private constant " ++ key ++ " referenced")
+    (Cons (("__name", VSym cn9), Cons (("__recv", VClass own9), Nil)))
 and list_any_val = fn (xs: Val list) -> fn (f: Val -> bool) ->
   match xs with Nil -> false | Cons (h, t) -> (if f h then true else list_any_val t f)
 and kernel_made_public = fn (anc: str list) -> fn (name: str) ->
@@ -29600,7 +29631,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        let n = (match cn with VSym sy -> sy | VStr h -> sget h | _ -> to_s cn) in
        let oc = (match owner with VClass c2 -> c2 | _ -> "Object") in
        raise_uninit_const world oc n
-         ("uninitialized constant " ++ (if str_eq oc "Object" then n else oc ++ "::" ++ n))
+         ("uninitialized constant " ++ (if str_eq oc "Object" then n else cls_display world oc ++ "::" ++ n))
      | _ -> VNil)
   // The path a `require_relative` written in <file> names: its sibling, made
   // absolute. A path that is already absolute is itself (ruby resolves one that
