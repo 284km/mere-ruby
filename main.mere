@@ -2399,6 +2399,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                       let _ = map_set dm_had_blk ok9 (map_get dm_had_blk key) in
                       if map_has privates ok9 then map_delete privates ok9 else ())
                    else ()) in
+          // ...and the class (or, for a singleton, the object) hears of it,
+          // as for every other door into the method table
+          let _ = (if str_eq c "" then () else run_method_added world c nm) in
           VSym nm
        | _ -> VNil)
     // refine Target do <defs> end — inside a Module.new body (self is the
@@ -15139,6 +15142,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                        (if map_has meths0 key
                            || (if str_eq (lookup_anc world (ancestors_of world c) n9) "" then false else true)
                            || builtin_has_meth c n9
+                           // BasicObject's private singleton hooks, which every
+                           // object has (a singleton may undef them)
+                           || str_eq n9 "singleton_method_added" || str_eq n9 "singleton_method_removed"
+                           || str_eq n9 "singleton_method_undefined"
                         then ()
                         // ...naming the class as it prints (an anonymous one is
                         // `#<Module:0x...>`, not its internal key); a CLASS's
@@ -15358,7 +15365,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //   fixture is this shape (FileStat.method_missing forwards every
     //   predicate to File.lstat) and 17 core/file/stat files died on it.
     else if (if is_prim_method name then false else true)
-            && has_meth world ("(sng:" ++ c ++ ")") "method_missing" then
+            && has_meth world ("(sng:" ++ c ++ ")") "method_missing"
+            && (if str_eq name "method_missing" then false else true)
+            && (if responds world recv name then false else true) then
       invoke world noblk recv ("(sng:" ++ c ++ ")") "method_missing" (Cons (VSym name, args))
     else prim_method recv name args
   | VObj id ->
@@ -19720,6 +19729,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
           let _ = dm_store_closure (target ++ "#" ++ nm) (h2, ps2, bb2, e2) in
           let _ = stamp_meth_src (target ++ "#" ++ nm) in
+          // the method lands in the singleton, so the object hears of it
+          let _ = (if is_sng_cls target then run_method_added world target nm else ()) in
           VSym nm))
     else if (str_len name == 13 && str_eq name "define_method") && (match recv with VClass _ -> true | _ -> false) then
       (match recv with
@@ -19737,6 +19748,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          let _ = map_set dm_methods (c ++ "#" ++ nm) VNil in
          let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
          let _ = stamp_meth_src (c ++ "#" ++ nm) in
+         let _ = run_method_added world c nm in
          VSym nm
        | _ -> VNil)
     // ENV.fetch / ENV.delete with a block: the block supplies the value for
@@ -22701,11 +22713,19 @@ and sng_mixin_syms = fn world -> fn (sng: str) -> fn (skip: Val list) ->
   let seen9 = map_new () in
   let _ = list_iter_vals skip (fn (v9: Val) -> (match v9 with VSym s9 -> map_set seen9 s9 VNil | _ -> ())) in
   let out9 = map_new () in
+  // ...and not the modules the BASE brings (one prepended to Module is in
+  // every module's metaclass chain, ahead of Module itself): the base is the
+  // object's class, or Class / Module for a metaclass
+  let inner9 = sng_inner sng in
+  let base9 = (if str_len inner9 > 0 && is_digit (char_at inner9 0) then sng_supername world sng
+               else if map_has modules inner9 then "Module" else "Class") in
+  let base_anc9 = ancestors_of world base9 in
   let rec walk9 = fn (xs: str list) ->
     (match xs with
      | Nil -> ()
      | Cons (a9, t9) ->
        (if is_sng_cls a9 then walk9 t9
+        else if str_list_has base_anc9 a9 then ()
         else if (if map_has modules a9 then false else true) then ()
         else
           (let pfx9 = a9 ++ "#" in
@@ -22853,21 +22873,37 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
             | Nil -> (let _ = raise_exc world "ArgumentError"
                         "wrong number of arguments (given 0, expected 1..2)" in "")) in
   let c9 = dispatch_cls_of world recv in
+  // ⚠ #respond_to_missing? is asked exactly when the answer would otherwise
+  //   be false, and ONCE, with the include_all flag the caller gave: for a
+  //   protected method without include_all, for a private one without it,
+  //   for a name nobody defines -- and never when the method is there to be
+  //   seen (a private one with include_all included). It was asked inside
+  //   the table walk with `false` whatever the flag, so a private method with
+  //   include_all asked it and a protected one never did; and a CLASS
+  //   receiver's hook was not asked at all.
+  let rtm9 = fn (u: unit) ->
+    (let hc9 = (match recv with VClass c8 -> "(sng:" ++ c8 ++ ")" | _ -> c9) in
+     if has_meth world hc9 "respond_to_missing?"
+     then VBool (truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv
+                          "respond_to_missing?" (Cons (VSym nm, Cons (VBool all, Nil))) false))
+     else VBool false) in
   // the TABLE form: this function is the builtin #respond_to?, so asking the
   // object's own override from here is asking itself.
-  if responds_tbl world recv nm then
+  if responds_real world recv nm then
     (if all then VBool true
-     else VBool (if meth_protected world c9 nm then false else true))
-  else if all then
-    // include_all: the private ones too. A class receiver answers through its
-    // METACLASS chain, and `.new` is a builtin with no table entry -- when
-    // private_class_method hid it, the mark is the only record that it is there.
-    VBool (match recv with
-           | VClass c8 ->
-             (let sng8 = "(sng:" ++ c8 ++ ")" in
-              has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
-           | _ -> has_meth world c9 nm)
-  else VBool false
+     else if meth_protected world c9 nm then rtm9 ()
+     else VBool true)
+  else if all
+          // include_all: the private ones too. A class receiver answers through
+          // its METACLASS chain, and `.new` is a builtin with no table entry --
+          // when private_class_method hid it, the mark is the only record that
+          // it is there.
+          && (match recv with
+              | VClass c8 ->
+                (let sng8 = "(sng:" ++ c8 ++ ")" in
+                 has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
+              | _ -> has_meth world c9 nm) then VBool true
+  else rtm9 ()
 
 // ruby's coerce protocol does NOT go through respond_to?: it looks the method
 // up and calls it, so a PRIVATE #coerce is used like any other (`(10**20) + obj`
@@ -28828,9 +28864,19 @@ and kernel_bare_special = fn (name: str) ->
   || (str_len name == 4 && str_eq name "exit")
 
 and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args: Val list) -> fn (explicit: bool) ->
+  // ⚠ a CLASS (or module) with a `def self.method_missing` gets the call
+  //   instead of the NoMethodError: every other receiver kind asks its
+  //   method_missing before giving up, and the class-method path came here
+  //   without asking (`ModuleMM.not_defined_method`).
+  if (match blame with
+      | VClass c9 -> has_meth world ("(sng:" ++ c9 ++ ")") "method_missing" && (if str_eq name "method_missing" then false else true)
+      | _ -> false) then
+    (match blame with
+     | VClass c9 -> invoke world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) blame ("(sng:" ++ c9 ++ ")") "method_missing" (Cons (VSym name, args))
+     | _ -> VNil)
   // last-resort Kernel methods that reach here as bare names (the ECall
   // path handles the argument forms in try_self_call_x).
-  if (str_len name == 5 && str_eq name "sleep") then
+  else if (str_len name == 5 && str_eq name "sleep") then
     (if fb_sched_here () then fb_sched_sleep gc_cenv0 world Nil
      // (a frame of its own, as in the arm with arguments: see there)
      else if fb_can_suspend then with_builtin_frame world VNil "sleep" (fn (u: unit) -> sch_sleep gc_cenv0 world VNil)
@@ -30185,7 +30231,19 @@ and run_method_added = fn world -> fn (cls: str) -> fn (nm: str) ->
 and run_singleton_method_added = fn world -> fn (recv: Val) -> fn (nm: str) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let c9 = (match recv with VClass c8 -> "(sng:" ++ c8 ++ ")" | _ -> dispatch_cls_of world recv) in
-  if has_meth world c9 "singleton_method_added"
+  // ...and the DEFAULT hook is a real (private) method of BasicObject: a
+  // singleton that undef's it has none, so ruby's call of it goes to
+  // method_missing, or is the NoMethodError when there is none
+  if undef_blocked world c9 "singleton_method_added" then
+    (if has_meth world c9 "method_missing"
+     then (let _ = invoke world noblk recv c9 "method_missing" (Cons (VSym "singleton_method_added", Cons (VSym nm, Nil))) in ())
+     else (let _ = raise_exc_iv world "NoMethodError"
+                     ("undefined method 'singleton_method_added' for "
+                      ++ (match recv with
+                          | VClass c8 -> (if map_has modules c8 then "module " else "class ") ++ cls_display world c8
+                          | _ -> for_recv_obj gc_cenv0 world recv c9))
+                     (Cons (("__name", VSym "singleton_method_added"), Cons (("__recv", recv), Nil))) in ()))
+  else if has_meth world c9 "singleton_method_added"
   then (let _ = invoke world noblk recv c9 "singleton_method_added" (Cons (VSym nm, Nil)) in ())
   else ()
 
@@ -38204,7 +38262,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           // `Module.new { self.freeze; def foo; end }` runs its body as a
           // BLOCK with self rebound, not through the class-body walker, so the
           // walker's per-statement check never saw this def.
-          | VClass c -> (let _ = frz_cls_check world c in c ++ "#" ++ name)
+          // (an OBJECT's singleton class as self -- a def run inside `class <<
+          // obj`, from a block -- tells the object, before the write, as the
+          // other object-singleton doors do)
+          | VClass c -> (let _ = frz_cls_check world c in
+                         let _ = (if is_sng_cls c && (let i9 = sng_inner c in str_len i9 > 0 && is_digit (char_at i9 0))
+                                  then run_method_added world c name else ()) in
+                         c ++ "#" ++ name)
           // nil/true/false are singletons: def in their instance_eval defines
           // on NilClass/TrueClass/FalseClass so nil.<method> can reach it.
           | VNil -> "NilClass#" ++ name
