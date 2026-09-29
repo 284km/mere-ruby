@@ -17,7 +17,7 @@ plus the libraries this ships — see
 
 ```sh
 ./tools/build.sh            # or, by hand, the line below
-./tools/build.sh --fast     # -O0: 30s instead of 112s, ~1.7x slower to run.
+./tools/build.sh --fast     # -O1: faster to build than -O2, slower to run (-O0 cannot run the prelude).
                             # For shaping a change, NOT for the record -- the
                             # sweep refuses an -O0 binary, because every verdict
                             # in it is bounded in CPU seconds.

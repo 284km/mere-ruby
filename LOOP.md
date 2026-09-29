@@ -453,7 +453,7 @@ Item 2 of the list above is now `tools/build.sh`:
 
 ```sh
 ./tools/build.sh            # -O2, the build that sweeps and the build that ships
-./tools/build.sh --fast     # -O0, the build for edit -> run one witness -> edit
+./tools/build.sh --fast     # -O1, the build for edit -> run one witness -> edit
 ./tools/build.sh --cc-only  # skip the emit, compile the mr.c that is there
 ```
 

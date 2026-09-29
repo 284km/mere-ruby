@@ -125,9 +125,11 @@ fi
 # down, and this is what reads it. Silent when there is no stamp, because a
 # hand-built binary is still the normal case.
 sb_build_mode="$(cat "$here/../.build_mode" 2>/dev/null || echo)"
-if [ "$sb_build_mode" = "O0" ] && [ "${SPEC_BUILD_OK:-0}" != 1 ]; then
+# (--fast is -O1 now -- -O0 can no longer run the prelude -- and it is refused
+# for the same reason: anything but the -O2 build measures another table.)
+if { [ "$sb_build_mode" = "O0" ] || [ "$sb_build_mode" = "O1" ]; } && [ "${SPEC_BUILD_OK:-0}" != 1 ]; then
   echo "scoreboard.sh: REFUSING to sweep -- .build_mode says this mere-ruby was built" >&2
-  echo "with tools/build.sh --fast (-O0), which runs about 1.7x slower. Every verdict" >&2
+  echo "with tools/build.sh --fast ($sb_build_mode), which runs slower. Every verdict" >&2
   echo "here is bounded in CPU seconds, so the table would move for a reason that is" >&2
   echo "not the interpreter. Rebuild with ./tools/build.sh, or set SPEC_BUILD_OK=1." >&2
   exit 2

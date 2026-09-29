@@ -2,7 +2,7 @@
 # Build mere-ruby. Two modes, because they answer different questions.
 #
 #   ./tools/build.sh            -O2 -- the build that sweeps and the build that ships
-#   ./tools/build.sh --fast     -O0 -- the build for "edit, run one witness, edit again"
+#   ./tools/build.sh --fast     -O1 -- the build for "edit, run one witness, edit again"
 #   ./tools/build.sh --cc-only  skip the emit and compile the mr.c that is there
 #
 # Measured 2026-09-22 on this machine (Apple silicon), `/usr/bin/time -p`:
@@ -15,12 +15,20 @@
 # 3.7x off the build for 1.7x on the run. Fifteen builds in a working day is
 # normal here, so --fast is about twenty minutes of a day.
 #
+# ⚠ --fast WAS -O0, and -O0 stopped being able to run anything (2026-09-29):
+# `p 1` died of "stack overflow" in the lexer. lex_go calls itself once per
+# token, a tail call that clang turns into a loop at -O1 and above and leaves
+# as a frame at -O0 -- and the prelude reached the size where one frame per
+# token no longer fits in the 512 MB the interpreter runs on. -O1 keeps the
+# tail calls and compiles in about 2 minutes instead of 30 s; still not the
+# build for the record (scoreboard refuses anything but -O2).
+#
 # ⚠ AND IT IS THE WRONG BUILD FOR THE RECORD. The sweep runs the interpreter
 # five thousand times and bounds each run in CPU SECONDS, so a binary that is
 # 1.7x slower measures a different table -- files near the budget would cross
 # it and the record would report a regression that is the compiler's -O level.
 # Which build made a binary is not visible in the binary, so this writes it
-# down and mspec/scoreboard.sh refuses to sweep an -O0 one. A sentence in a
+# down and mspec/scoreboard.sh refuses to sweep a --fast one. A sentence in a
 # README cannot refuse anything.
 #
 # The build line itself lived only in prose, in two dialects (README.md has
@@ -36,7 +44,7 @@ opt=-O2
 emit=1
 for a in "$@"; do
   case "$a" in
-    --fast|-O0)  mode=O0; opt=-O0 ;;
+    --fast|-O1)  mode=O1; opt=-O1 ;;
     --cc-only)   emit=0 ;;
     -h|--help)   sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "build.sh: unknown argument '$a'" >&2; exit 2 ;;

@@ -84,7 +84,7 @@ question from the sweep. The harness pins the reference itself; you should too.
 
 ```sh
 ./tools/build.sh           # -O2: emit 41s + clang 112s. THE build for the record.
-./tools/build.sh --fast    # -O0: 30s, and the binary runs ~1.7x slower.
+./tools/build.sh --fast    # -O1: ~2 min, and the binary runs slower (-O0 can no longer run the prelude).
 ./tools/build.sh --cc-only # skip the emit, compile the mr.c that is there
 ```
 
