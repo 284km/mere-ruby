@@ -14260,13 +14260,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (a9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name a9 ++ " into Integer")
           | _ -> VNil)
        else
-         (let sg = (match args with Cons (VStr h, _) -> sget h | Cons (VSym sy, _) -> sy | Cons (VInt n, _) -> signal_name_of n | _ -> "") in
-          let prev = (if map_has signal_traps sg then map_get signal_traps sg else mkstr "DEFAULT") in
-          let hnd = (match args with
-                     | Cons (_, Cons (v, _)) -> v
-                     | _ -> (match blk with (true, _, _, _) -> mkstr "(block)" | _ -> mkstr "DEFAULT")) in
-          let _ = map_set signal_traps sg hnd in
-          prev))
+         (match args with
+          | Cons (_, Cons (v, _)) -> signal_trap env world args v
+          | _ ->
+            (match blk with
+             | (true, _, _, _) ->
+               (let pid9 = (handle_base + map_len proc_store) in
+                let _ = store_proc (str_of_int pid9) blk in
+                signal_trap env world args (VProc pid9))
+             | _ -> raise_exc world "ArgumentError" "tried to create Proc object without a block")))
     // RbConfig.ruby -- the path to "the ruby". RbConfig::CONFIG already carries a
     // borrowed one (derived from GEM_HOME, so the fiction agrees with the tree
     // this interpreter was pointed at), and this answers the same string rather
@@ -14637,6 +14639,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // signal 0 delivers nothing: it asks whether the process exists and
          // may be signalled, and our own always does.
          (if (pid9 == getpid () || pid9 == 0) && (match sig9 with VInt 0 -> true | _ -> false) then VInt 1
+          // a signal to ourselves goes to what was trapped for it first
+          else if (pid9 == getpid () || pid9 == 0)
+                  && signal_deliver_self env world
+                       (match sig9 with
+                        | VInt k9 -> signal_name_of k9
+                        | VStr h9 -> sget h9
+                        | VSym y9 -> y9
+                        | _ -> "") then VInt 1
           // ⚠ ...and SIGINT's default handler raises INTERRUPT, not a
           //   SignalException: `rescue Interrupt` around a self-kill caught
           //   nothing. Its message is empty (ruby's, measured).
@@ -18750,6 +18760,90 @@ and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
      else theblk)
   | _ -> theblk
 
+// Signal.trap(sig, handler), as signal.c's trap_signm / trap_handler / trap:
+// the signal is an Integer below NSIG, a name with or without SIG (a
+// String by #to_str, or a Symbol), and nothing else ("bad signal type");
+// ruby's reserved signals and the two the OS keeps are refused. The handler
+// is stored in the form trap hands back as the PREVIOUS one: "IGNORE",
+// "DEFAULT" (ruby's own handler), "SYSTEM_DEFAULT" (the OS's), "EXIT", nil,
+// or the callable itself. A signal nobody trapped answers from its initial
+// state -- ruby installs its handler for INT HUP QUIT TERM ALRM USR1 USR2,
+// a do-nothing one for PIPE and SYS (which trap reports as nil), and leaves
+// the rest to the OS.
+and signal_short = fn (nm: str) ->
+  if str_len nm > 3 && str_eq (substring nm 0 3) "SIG" then substring nm 3 (str_len nm) else nm
+and signal_ruby_handled = fn (nm: str) ->
+  str_eq nm "INT" || str_eq nm "HUP" || str_eq nm "QUIT" || str_eq nm "TERM"
+  || str_eq nm "ALRM" || str_eq nm "USR1" || str_eq nm "USR2"
+and signal_initial = fn (nm: str) ->
+  if signal_ruby_handled nm then mkstr "DEFAULT"
+  else if str_eq nm "PIPE" || str_eq nm "SYS" || str_eq nm "EXIT" then VNil
+  else mkstr "SYSTEM_DEFAULT"
+and signal_arg_name = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VInt n9 ->
+    (if n9 < 0 || n9 >= 32 then raise_exc_str world "ArgumentError" ("invalid signal number (" ++ str_of_int n9 ++ ")")
+     else signal_name_of n9)
+  | VSym y9 -> signal_arg_named world y9
+  | VStr h9 -> signal_arg_named world (sget h9)
+  | _ ->
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     if responds world v "to_str" then
+       (match invoke_val_c env world nb9 v "to_str" Nil false with
+        | VStr h9 -> signal_arg_named world (sget h9)
+        | _ -> raise_exc_str world "ArgumentError" ("bad signal type " ++ class_name v))
+     else raise_exc_str world "ArgumentError" ("bad signal type " ++ class_name v))
+and signal_arg_named = fn world -> fn (nm0: str) ->
+  let nm = signal_short nm0 in
+  if str_eq nm "EXIT" || signal_num_of nm > 0 then nm
+  else raise_exc_str world "ArgumentError" ("unsupported signal 'SIG" ++ nm ++ "'")
+and raise_exc_str = fn world -> fn (cls: str) -> fn (msg: str) ->
+  let _ = raise_exc world cls msg in ""
+and signal_trap = fn env -> fn world -> fn (args: Val list) -> fn (hnd: Val) ->
+  let sg = (match args with Cons (v9, _) -> signal_arg_name env world v9 | Nil -> "") in
+  let _ = (if str_eq sg "SEGV" || str_eq sg "BUS" || str_eq sg "ILL" || str_eq sg "FPE" || str_eq sg "VTALRM"
+           then (let _ = raise_exc world "ArgumentError" ("can't trap reserved signal: SIG" ++ sg) in ())
+           else if str_eq sg "KILL" || str_eq sg "STOP"
+           then (let _ = raise_exc world "Errno::EINVAL" ("Invalid argument - SIG" ++ sg) in ())
+           else ()) in
+  let prev = (if map_has signal_traps sg then map_get signal_traps sg else signal_initial sg) in
+  let word = (match hnd with
+              | VStr h9 -> sget h9
+              | VSym y9 -> y9
+              | _ -> "") in
+  let isw = (match hnd with VStr _ -> true | VSym _ -> true | _ -> false) in
+  let stored = (if (if isw then false else true) then hnd
+                else if str_eq word "" || str_eq word "SIG_IGN" || str_eq word "IGNORE" then mkstr "IGNORE"
+                else if str_eq word "SIG_DFL" || str_eq word "DEFAULT" then
+                  (if signal_ruby_handled sg then mkstr "DEFAULT"
+                   else if str_eq sg "PIPE" || str_eq sg "SYS" || str_eq sg "EXIT" then VNil
+                   else mkstr "SYSTEM_DEFAULT")
+                else if str_eq word "SYSTEM_DEFAULT" then mkstr "SYSTEM_DEFAULT"
+                else if str_eq word "EXIT" then mkstr "EXIT"
+                else mkstr word) in
+  let _ = map_set signal_traps sg stored in
+  prev
+
+// A signal this process sends ITSELF, delivered to what was trapped for it:
+// true when a handler took it (a callable is called with the number, as
+// ruby's signal_exec does; "IGNORE" and nil drop it), false when the default
+// action -- the SignalException / Interrupt the caller raises -- applies.
+and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
+  let nm = signal_short sg in
+  if (if map_has signal_traps nm then false else true) then false
+  else
+    (match map_get signal_traps nm with
+     | VNil -> true
+     | VStr h9 ->
+       (let w9 = sget h9 in
+        if str_eq w9 "IGNORE" then true
+        else if str_eq w9 "EXIT" then (let _ = raise_system_exit world 0 "exit" in true)
+        else false)
+     | h9 ->
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+        let _ = invoke_val_c env world nb9 h9 "call" (Cons (VInt (signal_num_of nm), Nil)) false in
+        true))
+
 // The at_exit handlers, newest first. They are taken out of the store before
 // any of them runs, so a handler that calls `exit` (or registers another one)
 // cannot make them run twice.
@@ -18763,6 +18857,10 @@ and run_at_exits = fn world ->
                    (let _ = map_delete signal_traps k9 in
                     let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
                     let _ = try_or (fn (u: unit) -> run_block world nb9 (proc_as_block pid9) (Cons (VInt 0, Nil))) (FNext VNil) in ())
+                 | VObj oid9 ->
+                   (let _ = map_delete signal_traps k9 in
+                    let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+                    let _ = try_or (fn (u: unit) -> FNext (invoke_val_c gc_cenv0 world nb9 (VObj oid9) "call" (Cons (VInt 0, Nil)) false)) (FNext VNil) in ())
                  | _ -> ())) in
   let n = map_len at_exits in
   if n == 0 then ()
@@ -19079,11 +19177,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     // delivers a signal); what matters is that the program starts.
     else if (str_len name == 4 && str_eq name "trap")
             && (match recv with VClass sc -> str_eq sc "Signal" | _ -> false) then
-      (let sg = (match args with Cons (VStr h, _) -> sget h | Cons (VSym sy, _) -> sy
-                               | Cons (VInt n, _) -> signal_name_of n | _ -> "") in
-       let prev = (if map_has signal_traps sg then map_get signal_traps sg else mkstr "DEFAULT") in
-       let _ = map_set signal_traps sg (mkstr "(block)") in
-       prev)
+      (let pid9 = (handle_base + map_len proc_store) in
+       let _ = store_proc (str_of_int pid9) newblk in
+       signal_trap env world args (VProc pid9))
     // `pr.call(x) { ... }` -- a Proc called with a block. The block belongs to
     // the proc's BODY (that is what makes `Method#to_proc` able to forward one:
     // `method(:m).to_proc.call(5) { }` has to reach `m`'s yield), and without
