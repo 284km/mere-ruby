@@ -5657,8 +5657,20 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        iter_each_result (arr_each world encl theblk tuples) recv)
     // Array#initialize(n) { |i| ... } (through `send`): each index gets the
     // block's value, and a break answers its value with the prefix kept.
+    // ...and, as Array.new's block form, no size is `[]` with a warning under
+    // -w and an Array (or #to_ary) is copied, the block unused either way.
     else if (str_len name == 10 && str_eq name "initialize") then
-      (match args with
+      (let conv9 = (match args with
+                    | Cons (VArr src9, Nil) -> VArr src9
+                    | Cons (VObj o9, Nil) -> conv_try gc_cenv0 world (VObj o9) "to_ary"
+                    | _ -> VNil) in
+       match args with
+       | Nil -> (let _ = rb_warning world "given block not used" in
+                 let _ = arr_set id (Nil : Val list) in recv)
+       | _ when (match conv9 with VArr _ -> true | _ -> false) ->
+         (match conv9 with
+          | VArr src9 -> (let _ = arr_set id (deref src9) in recv)
+          | _ -> recv)
        | Cons (_, Cons (_, Cons (_, _))) ->
          raise_exc world "ArgumentError"
            ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..2)")
@@ -7331,8 +7343,16 @@ and coerce_arr_index_args = fn env -> fn world -> fn (name: str) -> fn (args: Va
           || (str_len name == 2 && str_eq name "at") || (str_len name == 9 && str_eq name "delete_at") || (str_len name == 5 && str_eq name "fetch") then
     (match args with Cons (a0, rest) -> Cons (toi a0, rest) | Nil -> Nil)
   else
-    (match args with
+    // (start, length): both are INDICES, converted the refusing way -- a
+    // length that does not fit a long is a RangeError (`a[1, 8e19]` was
+    // truncated), and a Range is no start (`a[1..2, 1]` sliced the range)
+    (let strict = fn (v: Val) ->
+       (match v with
+        | VRange (_, _, _) -> raise_exc world "TypeError" "no implicit conversion of Range into Integer"
+        | _ -> toi v) in
+     match args with
      | Cons (a0, Nil) -> Cons (as_range a0, Nil)
+     | Cons (a0, Cons (a1, Nil)) -> Cons (strict a0, Cons (strict a1, Nil))
      | Cons (a0, rest) -> Cons (toi a0, coerce_int_args env world rest)
      | Nil -> Nil)
 
@@ -9860,6 +9880,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     (match recv with
      | VArr id0 ->
        (let xs0 = deref id0 in
+        // a separator taken from a non-nil `$,` is deprecated, and ruby says
+        // so at every such join (deprecation warnings on), the empty one too
+        let _ = (match args with
+                 | Nil -> warn_output_fs world
+                 | Cons (VNil, _) -> warn_output_fs world
+                 | _ -> ()) in
         // an EMPTY array joins to a US-ASCII "" and must not touch the
         // separator at all (the spec pins that it receives no #to_str), so
         // this answer comes before the separator is even looked at.
@@ -14002,6 +14028,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                 Cons ("blocking?", Cons ("storage", Cons ("storage=", Cons ("inspect", Cons ("to_s", Nil)))))))))))
                        (fn (nf9: str) -> (if fb_inst_name nf9 && (if map_has meths0 (pfx ++ nf9) then false else true) then push9 nf9 else ()))
                    else ()) in
+          // ...MATH's module functions, which are its PRIVATE instance methods
+          // (`include Math` then `sqrt(4)` is how a program uses them) and
+          // live in the dispatcher's Math arm
+          let _ = (if str_eq cx "Math" && want_priv then
+                     list_iter (str_split "acos|acosh|asin|asinh|atan|atan2|atanh|cbrt|cos|cosh|erf|erfc|exp|expm1|frexp|gamma|hypot|ldexp|lgamma|log|log10|log1p|log2|sin|sinh|sqrt|tan|tanh" "|")
+                       (fn (nm9: str) -> (if map_has meths0 (pfx ++ nm9) then () else push9 nm9))
+                   else ()) in
           // ...THREAD's, which live in the dispatcher the same way
           let _ = (if str_eq cx "Thread" && (if want_prot || want_priv then false else true) then
                      list_iter (thread_inst_names ())
@@ -16316,7 +16349,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (match env_lookup_v k2 with
              | VNil -> (match rest with
                         | Cons (d, _) -> d
-                        | Nil -> raise_exc world "KeyError" ("key not found: \"" ++ k2 ++ "\""))
+                        // (the error carries ENV and the key, as Hash#fetch's does)
+                        | Nil -> raise_exc_iv world "KeyError" ("key not found: \"" ++ k2 ++ "\"")
+                                   (Cons (("__key", kv), Cons (("__recv", recv), Nil))))
              | v -> v)
           | _ -> VNil)
        else if (str_len name == 4 && str_eq name "key?") || (str_len name == 8 && str_eq name "has_key?") || (str_len name == 8 && str_eq name "include?") || (str_len name == 7 && str_eq name "member?") then
@@ -19143,6 +19178,13 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
 // An interpreter-issued warning, in ruby's shape: "<file>:<line>: warning:
 // <text>" on $stderr, and SILENT when $VERBOSE is nil -- the same gate
 // Kernel#warn answers to (false, the default, still warns).
+// "$, is set to non-nil value" (a deprecation-category warning) when a
+// separator is read from a non-nil `$,`
+and warn_output_fs = fn world ->
+  if (match (if map_has globals "," then map_get globals "," else VNil) with VNil -> false | _ -> true)
+     && map_has warn_cats "deprecated" && truthy (map_get warn_cats "deprecated")
+  then rb_warn world "$, is set to non-nil value"
+  else ()
 // ruby's rb_warning: said only when $VERBOSE is TRUE (`ruby -w`), where
 // rb_warn is silenced only by nil
 and rb_warning = fn world -> fn (msg: str) ->
@@ -21799,7 +21841,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   else if (str_len name == 5 && str_eq name "fetch") && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
     (match recv with
      | VHsh h -> let xs = hderef h in let ci = hcbi_on h in (match args with Cons (k, rest) -> (if hix_has h ci xs k then hix_get h ci xs k else (match rest with Cons (d, _) -> d | Nil -> raise_exc_iv world "KeyError" ("key not found: " ++ inspect k) (Cons (("__key", k), Cons (("__recv", recv), Nil))))) | _ -> VNil)
-     | VArr id -> let ys = deref id in let n = val_list_len ys in (match args with Cons (VInt i, rest) -> let j = (if i < 0 then n + i else i) in (if j >= 0 && j < n then val_nth ys j else (match rest with Cons (d, _) -> d | Nil -> raise_exc world "IndexError" ("index " ++ str_of_int i ++ " outside of array bounds: -" ++ str_of_int n ++ "..." ++ str_of_int n))) | _ -> VNil)
+     | VArr id -> let ys = deref id in let n = val_list_len ys in (match args with Cons (VInt i, rest) -> let j = (if i < 0 then n + i else i) in (if j >= 0 && j < n then val_nth ys j else (match rest with Cons (d, _) -> d | Nil -> raise_exc world "IndexError" ("index " ++ str_of_int i ++ " outside of array bounds: " ++ str_of_int (0 - n) ++ "..." ++ str_of_int n))) | _ -> VNil)
      | _ -> VNil)
   // Array#min(n) / #max(n): the argument is an integer CONVERSION, and a
   // non-negative one. Matching `VInt n` alone made every other kind of
