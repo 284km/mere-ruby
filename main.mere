@@ -8709,6 +8709,31 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // looks at what they are.
   let __am = builtin_arity_msg world recv0 name0 args0 in
   if (if str_eq __am "" then false else true) then raise_exc world "ArgumentError" __am
+  // ⚠ send / __send__ / public_send reached BY NAME -- `o.send(:send, :m)`,
+  //   `o.method(:send).call(:m)`, a `respond_to?`-guarded forwarder. The call
+  //   sites unwrap the name they were written with, once; the name they
+  //   unwrap to came here and found no method, so every shared ruby/spec
+  //   group that runs `obj.send(@method, ...)` with @method = :send read
+  //   "undefined method 'send'". Unwrap it again, with the same rules.
+  else if (str_eq name0 "send" || str_eq name0 "__send__" || str_eq name0 "public_send")
+          && (if user_defines_send world recv0 name0 then false else true)
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
+    (let pub9 = str_eq name0 "public_send" in
+     let m9 = send_name_arg env world args0 in
+     let rest9 = (match args0 with Cons (_, r9) -> r9 | Nil -> Nil) in
+     let _ = (if pub9 then public_send_guard world recv0 m9 else ()) in
+     if str_eq m9 "eval" then do_eval env world blk rest9
+     else invoke_val_c env world blk recv0 m9 rest9 pub9)
+  // Kernel#then / #yield_self WITHOUT a block: an Enumerator of the receiver,
+  // of size 1. The block form is invoke_with_block's; this one had no arm.
+  else if (str_eq name0 "then" || str_eq name0 "yield_self")
+          && (match args0 with Nil -> true | _ -> false)
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
+    (let e9 = make_enum world recv0 name0 in
+     let _ = (match e9 with
+              | VObj eid9 -> (let (_, _, _, iv9) = world in map_set iv9 (str_of_int eid9 ++ "@__e_size") (VInt 1))
+              | _ -> ()) in
+     e9)
   // ⚠ `respond_to?` lived ONLY in the syntactic method-call arm, so
   //   `x.respond_to?(:y)` answered and `send(:respond_to?, :y)` -- and every
   //   bare `respond_to?(:y)` inside a method, which is the same dispatcher --
@@ -17916,7 +17941,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             //   Thread#raise, and Kernel's took it (raising in the caller)
             && (if thr_obj_here world recv cls && str_list_has (thread_inst_names ()) name then false else true)
             && str_list_has (ancestors_of world cls) "Kernel" then
-      try_self_call_x env world recv name args true
+      // ⚠ ...and they are PRIVATE: `obj.puts` with a receiver is refused the
+      //   way ruby refuses it ("private method 'puts' called for an instance
+      //   of Object"), and this answered "undefined method 'puts' for main" --
+      //   naming the CALLER. A class that says `public :raise` (ruby/spec's
+      //   raise spec does, on a singleton) makes it callable with one.
+      (if vischeck && (if kernel_made_public (ancestors_of world (dispatch_cls_of world recv)) name then false else true)
+       then raise_exc_iv world "NoMethodError"
+              ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
+              (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+       // raise is an expression form here and try_self_call_x has no arm for it
+       else if str_eq name "raise" || str_eq name "fail" then kernel_raise_now world args
+       else kernel_by_name env world blk name args)
     // Thread instance surface (synchronous model): the body already ran to
     // completion, a park, or an exception (see the Thread.new boundary).
     // An instance of a subclass is served here too, for every name the
@@ -18182,6 +18218,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf"))
             && (if kernel_overridden env world name then false else true) then
       try_self_call_x env world VMain name args true
+    // main's Kernel functions by name (`send(:puts, x)`): see kernel_by_name
+    else if (if vischeck then false else true) && is_kernel_builtin name
+            && (if kernel_bare_special name then false else true)
+            && (if has_meth world "Object" name then false else true) then
+      (if str_eq name "raise" || str_eq name "fail" then kernel_raise_now world args
+       else kernel_by_name env world blk name args)
     else dispatch_prim env world blk recv name args vischeck
   | VProc pid ->
     // a CURRIED proc collects arguments until it has the arity it was curried
@@ -22485,6 +22527,58 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
 // still refuses public_send. vischeck answers the first question, so the
 // second has to be asked separately -- `public_send :protected_method` from
 // inside the object's own method ran the method.
+// Kernel's private builtins have no method-table entry, so `public :puts` in a
+// class records only a visibility mark (vis_marks) -- the nearest class in the
+// chain that marks the name decides, as the nearest definition would.
+// ⚠ A KERNEL FUNCTION REACHED BY NAME. Most of Kernel is implemented as arms of
+//   the bare-call evaluator (ECall) -- `puts x`, `format(...)`, `binding`,
+//   `catch`, `at_exit`, `block_given?` -- and not as entries any receiver
+//   dispatcher can find, so the same method spelled `send(:puts, x)`,
+//   `obj.send(:format, ...)` or `method(:p).call(1)` was "undefined method
+//   'puts' for main" (measured: 22 of 30 Kernel functions, even with self as
+//   the receiver). The name is dispatched here as the bare call it is, in a
+//   child of the CALLER's scope: Kernel's functions ignore their receiver and
+//   read the caller's frame (binding, local_variables, block_given?, eval),
+//   exactly as ruby's C functions do. The arguments are already values, so
+//   each travels in a hidden local of its own (an arm that matches on "no
+//   arguments" sees none). A name the bare evaluator does not implement
+//   either comes back here with THAT frame as its env, which is how the round
+//   trip is stopped after one lap (the frame is not recycled if the call
+//   unwinds; it is one small map). `puts` is a statement form, not a call.
+and kernel_by_name = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
+  if map_has env "__kbn" then try_self_call_x env world VNil name args true
+  else if str_eq name "puts" then
+    (let _ = (match args with Nil -> out_emit world "\n" | vs -> puts_each world vs) in VNil)
+  // ...and the three that take their body as a BLOCK: reached this way they
+  // have none (a block rides the block path, invoke_with_block).
+  else if str_eq name "lambda" || str_eq name "proc" then
+    raise_exc world "ArgumentError" "tried to create Proc object without a block"
+  else if str_eq name "at_exit" then raise_exc world "ArgumentError" "called without a block"
+  // (a bare name with no arguments -- `block_given?`, `__method__`, `__dir__`
+  // -- is a VARIABLE-or-call to the parser, and its arm lives in EVar)
+  else
+    (let e9 = blk_env_get env in
+     let _ = map_set e9 "__kbn" VNil in
+     let rec bind9 = fn (xs: Val list) -> fn (i: int) ->
+       (match xs with
+        | Nil -> (Nil : Expr list)
+        | Cons (v9, t9) ->
+          (let k9 = "__kbn" ++ str_of_int i in
+           let _ = map_set e9 k9 v9 in
+           Cons (EVar k9, bind9 t9 (i + 1)))) in
+     let call9 = (match args with
+                  | Nil -> (if lv_has env name then ECall (name, Nil) else EVar name)
+                  | _ -> ECall (name, bind9 args 0)) in
+     let r9 = eval_e e9 world blk call9 in
+     let _ = blk_env_put e9 in
+     r9)
+and kernel_made_public = fn (anc: str list) -> fn (name: str) ->
+  match anc with
+  | Nil -> false
+  | Cons (c9, rest9) ->
+    (let k9 = c9 ++ "#" ++ name in
+     if map_has vis_marks k9 then (if map_has privates k9 || map_has protecteds k9 then false else true)
+     else kernel_made_public rest9 name)
 and public_send_guard = fn world -> fn (recv: Val) -> fn (m: str) ->
   let c9 = dispatch_cls_of world recv in
   if meth_protected world c9 m
