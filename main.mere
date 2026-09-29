@@ -7106,6 +7106,23 @@ and errno_arg_int = fn env -> fn world -> fn (args: Val list) ->
 // is (so existing behavior / errors are unchanged).
 // The integer form of the same protocol: an object that answers #to_int is
 // accepted wherever an index or a count is wanted.
+// Enumerator#with_index's offset: nil is none, a Float truncates, anything
+// else converts with #to_int or is ruby's TypeError (rb_num2long). Every
+// non-Integer offset was read as 0.
+and wi_offset_args = fn env -> fn world -> fn (args: Val list) ->
+  match args with
+  | Cons (VNil, _) -> Nil
+  | Cons (VInt _, _) -> args
+  | Cons (VFlt f, _) -> Cons (VInt (int_of_float f), Nil)
+  | Cons (a, _) ->
+    (match a with
+     | VObj _ ->
+       (match conv_try env world a "to_int" with
+        | VInt k -> Cons (VInt k, Nil)
+        | _ -> (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ class_name a ++ " into Integer") in Nil))
+     | VRat (_, _) -> Cons (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "to_i" Nil false, Nil)
+     | _ -> (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ class_name a ++ " into Integer") in Nil))
+  | Nil -> Nil
 and coerce_int_args = fn env -> fn world -> fn (args: Val list) ->
   match args with
   | Nil -> Nil
@@ -13234,6 +13251,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ⚠ Random.new must build an INSTANCE with its own generator. It used to
     // answer the class itself, so `Random.new(42)` shared Kernel#rand's stream
     // and the seed went nowhere: three runs, three sequences.
+    // ⚠ ...seeded the way srand is: the MAGNITUDE's 32-bit words, so a seed
+    //   past 32 bits (a Bignum) goes through init_by_array as ruby's does.
+    //   Masking it to its low word gave `Random.new(2**252)` another stream
+    //   (and #seed a different number from the one given).
+    else if str_eq c "Random" && (str_len name == 3 && str_eq name "new")
+            && (match args with Cons (VBig _, _) -> true | _ -> false) then
+      (let bv9 = (match args with Cons (b9, _) -> b9 | Nil -> VNil) in
+       let g9 = mt_alloc_gid () in
+       let _ = mt_seed_from g9 (match bv9 with VBig b9 -> big_mag b9 | _ -> "0") in
+       let _ = map_set mt_seed_of (str_of_int g9) (to_s bv9) in
+       let ob9 = new_obj world "Random" Nil in
+       (match ob9 with
+        | VObj oid9 ->
+          (let (_, _, _, iv9) = world in
+           let _ = map_set iv9 (str_of_int oid9 ++ "@__gid") (VInt g9) in
+           let _ = map_set iv9 (str_of_int oid9 ++ "@__seed") bv9 in ob9)
+        | _ -> ob9))
     else if str_eq c "Random" && (str_len name == 3 && str_eq name "new") then
       (let sd9 = (match args with
                   | Cons (VInt k9, _) -> k9
@@ -13282,6 +13316,19 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             raise_exc world "ArgumentError" ("invalid argument - " ++ str_of_int n9)
           | Cons (VFlt f9, _) when f9 < 0.0 && (str_len name == 4 && str_eq name "rand") ->
             raise_exc world "ArgumentError" ("invalid argument - " ++ to_s (VFlt f9))
+          // Random.bytes(n) is n bytes from the default generator (it was
+          // answering rand(n))
+          | Cons (VInt n9, _) when (str_len name == 5 && str_eq name "bytes") ->
+            (let rec go9 = fn (k: int) -> fn (acc: str) ->
+               (if k <= 0 then acc
+                else
+                  (let w9 = mt_genrand_int32 0 in
+                   let take = (if k > 4 then 4 else k) in
+                   let rec emit9 = fn (b: int) -> fn (v: int) -> fn (a2: str) ->
+                     (if b <= 0 then a2 else emit9 (b - 1) (bit_shr v 8) (a2 ++ chr (bit_and v 255))) in
+                   go9 (k - take) (emit9 take w9 acc))) in
+             let r9 = mkstr (go9 n9 "") in
+             (match r9 with VStr h9 -> (let _ = senc_set h9 "ASCII-8BIT" in r9) | _ -> r9))
           | _ -> rand_val world ca9))
     // `SystemCallError.new(msg, errno)` is an instance of THAT errno's class:
     // the number picks it, and a number nothing claims stays a SystemCallError.
@@ -16647,6 +16694,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              | VFlt f9 when flt_is_inf f9 -> VFlt f9
              | n9 -> go9 t9 (eval_bin_prim env world blk "+" acc n9))) in
        go9 (chain_srcs world id) (VInt 0))
+    // Enumerator::Chain#rewind: each source the walk has reached, from the
+    // last back to the first, is sent #rewind if it answers it (ruby's
+    // enum_chain_rewind); the position moves down as it goes
+    else if str_eq cls "Enumerator::Chain" && (str_len name == 6 && str_eq name "rewind") then
+      (let srcs9 = chain_srcs world id in
+       let pk9 = str_of_int id ++ "@__ch_pos" in
+       let rec go9 = fn (i: int) ->
+         (if i < 0 then ()
+          else
+            (let src9 = val_nth srcs9 i in
+             let _ = (if responds world src9 "rewind" then (let _ = invoke_val_c env world blk src9 "rewind" Nil false in ()) else ()) in
+             let _ = map_set ivars pk9 (VInt (i - 1)) in
+             go9 (i - 1))) in
+       let _ = go9 (match (if map_has ivars pk9 then map_get ivars pk9 else VInt (0 - 1)) with VInt k9 -> k9 | _ -> 0 - 1) in
+       recv)
     // Enumerator::Chain surface: each is handled by the block dispatcher;
     // everything enumerable materializes.
     else if str_eq cls "Enumerator::Chain"
@@ -16947,7 +17009,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // #each_with_index takes no argument at all
       (if (str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> false | _ -> true)
        then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
-       else make_enum_a world recv name args)
+       else make_enum_a world recv name (wi_offset_args env world args))
     // first / take are bounded (usable on infinite generators).
     else if is_enum_cls cls && ((str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take")) then
       (let n = (match args with Cons (VInt k, _) -> k | _ -> 1) in
@@ -17593,21 +17655,29 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Each carries its own generator id, so two of them seeded the same way
     // walk the same sequence and neither disturbs Kernel#rand.
     else if str_eq cls "Random" && ((str_len name == 4 && str_eq name "rand") || (str_len name == 4 && str_eq name "seed")
-                                    || (str_len name == 5 && str_eq name "bytes") || (str_len name == 2 && str_eq name "==")) then
+                                    || (str_len name == 5 && str_eq name "bytes") || (str_len name == 2 && str_eq name "==")
+                                    || (str_len name == 5 && str_eq name "state")) then
       (let g9 = (if map_has ivars (str_of_int id ++ "@__gid")
                  then (match map_get ivars (str_of_int id ++ "@__gid") with VInt k9 -> k9 | _ -> 0) else 0) in
        let sd9 = (if map_has ivars (str_of_int id ++ "@__seed")
                   then map_get ivars (str_of_int id ++ "@__seed") else VInt 0) in
        if (str_len name == 4 && str_eq name "seed") then sd9
-       // two Randoms are equal when they were seeded alike.
+       else if (str_len name == 5 && str_eq name "state") then
+         (if vischeck then raise_exc world "NoMethodError" "private method 'state' called for an instance of Random"
+          else VInt (mt_state_digest g9))
+       // two Randoms are equal when they were seeded alike AND stand at the
+       // same place in their streams (ruby's rand_mt_equal)
        else if (str_len name == 2 && str_eq name "==") then
          (match args with
           | Cons (VObj o2, _) ->
             (let c2 = map_get ocls o2 in
              if str_eq c2 "Random" && map_has ivars (str_of_int o2 ++ "@__seed")
-             then VBool (match (sd9, map_get ivars (str_of_int o2 ++ "@__seed")) with
+             then VBool ((match (sd9, map_get ivars (str_of_int o2 ++ "@__seed")) with
                           | (VInt x9, VInt y9) -> x9 == y9
                           | _ -> false)
+                         && (match (if map_has ivars (str_of_int o2 ++ "@__gid") then map_get ivars (str_of_int o2 ++ "@__gid") else VNil) with
+                             | VInt g2 -> mt_same_state g9 g2
+                             | _ -> false))
              else VBool false)
           | _ -> VBool false)
        else if (str_len name == 5 && str_eq name "bytes") then
@@ -19700,7 +19770,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "Enumerator::Chain") | _ -> false)
             && (str_len name == 4 && str_eq name "each") then
       (match recv with
-       | VObj id -> (let _ = chain_drive env world blk (chain_srcs world id) newblk in recv)
+       | VObj id -> (let _ = chain_drive env world blk id 0 (chain_srcs world id) newblk in recv)
        | _ -> VNil)
     // other Enumerator methods (map/select/... with a block): materialize the
     // elements, then run the array operation with the same block.
@@ -19717,7 +19787,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             // `each.with_index` answers the receiver. So pair the elements with
             // their index and run that source method over the pairs.
             (let (_, _, _, iv9) = world in
-             let off = (match args with Cons (VInt o, _) -> o | _ -> 0) in
+             let off = (match wi_offset_args env world args with Cons (VInt o, _) -> o | _ -> 0) in
              let src = (match (if map_has iv9 (str_of_int id ++ "@meth") then map_get iv9 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
              // ruby's with_index does NOT materialise and re-run: it calls the
              // source method ONCE with the block wrapped in an index counter, so a
@@ -34784,14 +34854,18 @@ and chain_to_arr = fn env -> fn world -> fn blk -> fn (id: int) ->
                                   EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
                                   EVar "__e"), Nil))), Nil),
                    cenv2) in
-  let _ = chain_drive env world blk (chain_srcs world id) collector in
+  let _ = chain_drive env world blk id 0 (chain_srcs world id) collector in
   accv
-and chain_drive = fn env -> fn world -> fn blk -> fn (srcs: Val list) -> fn theblk ->
+// ...recording, as ruby's enum_chain_each does, which source it has reached
+// (@__ch_pos): #rewind rewinds exactly those, last first
+and chain_drive = fn env -> fn world -> fn blk -> fn (id: int) -> fn (i: int) -> fn (srcs: Val list) -> fn theblk ->
   match srcs with
   | Nil -> ()
   | Cons (src, rest) ->
+    let (_, _, _, iv9) = world in
+    let _ = map_set iv9 (str_of_int id ++ "@__ch_pos") (VInt i) in
     let _ = invoke_with_block env world blk src "each" Nil theblk in
-    chain_drive env world blk rest theblk
+    chain_drive env world blk id (i + 1) rest theblk
 
 // Enumerator.produce driver: yield v to the collector block, then step.
 and enum_produce_go = fn env -> fn world -> fn blk -> fn collector -> fn stepblk -> fn (v: Val) ->
