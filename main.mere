@@ -2046,8 +2046,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // `ruby2_keywords :m` (or `ruby2_keywords def m ... end`, whose def
     // returns :m): mark method m so it keeps a `key:` hash's kwarg-ness.
     else if (str_len name == 14 && str_eq name "ruby2_keywords") && (if map_has meths name then false else true) then
-      (let _ = (match args with Cons (VSym s, _) -> map_set r2k_methods s VNil | _ -> ()) in
-       (match args with Cons (a, _) -> a | _ -> VNil))
+      (match (if lv_has env "self" then lv_get env "self" else VMain) with
+       // in a class body it is Module#ruby2_keywords (mod_ruby2_keywords)
+       | VClass c9 -> mod_ruby2_keywords env world c9 args
+       | _ -> (let _ = (match args with Cons (VSym s, _) -> map_set r2k_methods s VNil | _ -> ()) in
+               (match args with Cons (a, _) -> a | _ -> VNil)))
     else if (str_len name == 15 && str_eq name "local_variables") && (if map_has meths name then false else true) then local_vars_of env
     else if (str_len name == 16 && str_eq name "global_variables") && (if map_has meths name then false else true) then global_vars_of ()
     // ⚠ a top-level `def include` is a private method of OBJECT, and inside a
@@ -3723,6 +3726,11 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                        | other -> (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name (VObj oid) ++ " to Array (" ++ class_name (VObj oid) ++ "#to_a gives " ++ class_name other ++ ")") in Cons (VObj oid, Nil)))
                     else Cons (VObj oid, Nil)
                   | v -> Cons (v, Nil)) in
+    // a ruby2_keywords-flagged hash at the END of a splat is keywords to the
+    // callee (r2k_unflag_tail reads the note)
+    let _ = (match vlast spread with
+             | VHsh lh9 -> (if map_has r2k_marks (str_of_int lh9) then map_set r2k_splat lh9 1 else ())
+             | _ -> ()) in
     list_append spread (eval_args env world blk t)
   // **h passes the hash's pairs as keyword args: a fresh, kwarg-marked copy
   // (so the original hash variable is unaffected and it binds as kwargs).
@@ -11883,11 +11891,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Module#ruby2_keywords via a receiver path (e.g. `send :ruby2_keywords,
     // :m` routes here): mark the named method, same as the bare-call handler.
     else if (str_len name == 14 && str_eq name "ruby2_keywords") && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
-      (let _ = (match args with
-                | Cons (VSym s, _) -> map_set r2k_methods s VNil
-                | Cons (VStr s, _) -> map_set r2k_methods (sget s) VNil
-                | _ -> ()) in
-       VNil)
+      mod_ruby2_keywords env world c args
     // (the string form's arguments converted first -- see eval_str_args)
     else if ((str_len name == 10 && str_eq name "class_eval") || (str_len name == 11 && str_eq name "module_eval")
              || (str_len name == 13 && str_eq name "instance_eval"))
@@ -14799,6 +14803,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  else (let _ = raise_exc_iv world "NameError"
                                  ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world c ++ "'")
                                  (Cons (("__name", VSym n2), Nil)) in ()) in
+         // ...and a ruby2_keywords method's alias is the same method, flag and all
+         let _ = (if map_has r2k_methods n2 then map_set r2k_methods n1 VNil else ()) in
          // ...and the names ruby keeps private whatever is aliased to them
          // (initialize, initialize_copy, respond_to_missing?, ...) stay so
          let _ = (if always_private_meth n1 then
@@ -18592,9 +18598,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let ps9 = (match map_get proc_store (str_of_int pid) with (h9, ps9, _, _) -> strip_marker_params ps9) in
        // ruby WARNS (and does nothing) for a proc that cannot carry the flag:
        // one with keyword parameters, or with no bare splat to collect into.
-       let ok9 = (match kw_params ps9 with Nil -> str_eq (dsplat_name ps9) "" | _ -> false)
-                 && psplat_any ps9 in
-       let _ = (if ok9 then map_set r2k_procs (r2k_root (str_of_int pid)) VNil else ()) in
+       let ok9 = r2k_params_ok ps9 in
+       let _ = (if ok9 then map_set r2k_procs (r2k_root (str_of_int pid)) VNil
+                else rb_warn world "Skipping set of ruby2_keywords flag for proc (proc accepts keywords or post arguments or proc does not accept argument splat)") in
        recv)
     // Proc#>> / Proc#<< compose. `f >> g` runs f then g; `f << g` runs g then
     // f. Both reduce to "outer(inner(*args))", and the argument may be ANY
@@ -23154,6 +23160,59 @@ and priv_const_err = fn world -> fn (key: str) ->
   let cn9 = (if i9 < 0 then key else substring key (i9 + 2) (str_len key)) in
   raise_exc_iv world "NameError" ("private constant " ++ key ++ " referenced")
     (Cons (("__name", VSym cn9), Cons (("__recv", VClass own9), Nil)))
+// Can a method (or proc) with these parameters carry the ruby2_keywords flag?
+// Only one that collects its arguments in a bare splat and takes no keywords,
+// no keyword splat and (ruby 4.0) nothing after the splat.
+and r2k_params_ok = fn (ps: str list) ->
+  let rec post9 = fn (xs: str list) -> fn (seen: bool) ->
+    (match xs with
+     | Nil -> false
+     | Cons (p9, t9) ->
+       (if str_len p9 > 0 && str_eq (char_at p9 0) "*" && (if str_len p9 > 1 && str_eq (char_at p9 1) "*" then false else true)
+        then post9 t9 true
+        else if seen && str_len p9 > 0 && (if str_eq (char_at p9 0) "&" then false else true)
+                && (if str_eq (char_at p9 (str_len p9 - 1)) ":" then false else true)
+        then true
+        else post9 t9 seen)) in
+  (match kw_params ps with Nil -> str_eq (dsplat_name ps) "" | _ -> false)
+  && psplat_any ps && (if post9 ps false then false else true)
+// Module#ruby2_keywords(*names): each name is read as a name argument (a
+// TypeError otherwise), must be a method of the module (NameError), and is
+// marked only when its parameters can carry the flag -- ruby WARNS and skips
+// one that cannot. Answers nil. The mark reaches the aliases made from it
+// earlier too, since ruby flags the method body, not the name.
+and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val list) ->
+  let (m9, _, _, _) = world in
+  let _ = list_iter_vals args (fn (a9: Val) ->
+    (let nm9 = sym_or_str_arg env world a9 in
+     let own9 = lookup_anc world (ancestors_of world cls) nm9 in
+     if str_eq own9 "" then
+       (let _ = raise_exc_iv world "NameError"
+                  ("undefined method '" ++ nm9 ++ "' for " ++ (if map_has modules cls then "module '" else "class '") ++ cls_display world cls ++ "'")
+                  (Cons (("__name", VSym nm9), Nil)) in ())
+     else
+       (match map_get m9 (own9 ++ "#" ++ nm9) with
+        | Meth (ps9, _, _) ->
+          (if r2k_params_ok ps9 then
+             (let _ = map_set r2k_methods nm9 VNil in
+              let pfx9 = cls ++ "#" in
+              map_iter alias_srcname (fn (k: str) -> fn (src: str) ->
+                if str_eq src nm9 && str_len k > str_len pfx9 && str_eq (substring k 0 (str_len pfx9)) pfx9
+                then map_set r2k_methods (substring k (str_len pfx9) (str_len k)) VNil else ()))
+           else rb_warn world ("Skipping set of ruby2_keywords flag for " ++ nm9
+                               ++ " (method accepts keywords or post arguments or method does not accept argument splat)"))))) in
+  VNil
+// the argument list with a ruby2_keywords-flagged LAST hash replaced by an
+// unflagged copy (see bind_params)
+// -- only a hash that arrived through a SPLAT (r2k_splat, noted by eval_args):
+// passed directly, `bar(h)`, it is an ordinary positional argument and is the
+// same object in the callee.
+and r2k_unflag_tail = fn (args: Val list) ->
+  match args with
+  | Nil -> Nil
+  | Cons (VHsh id, Nil) ->
+    (if map_has r2k_marks (str_of_int id) && map_has r2k_splat id then Cons (mkhash (hderef id), Nil) else args)
+  | Cons (h, t) -> Cons (h, r2k_unflag_tail t)
 and list_any_val = fn (xs: Val list) -> fn (f: Val -> bool) ->
   match xs with Nil -> false | Cons (h, t) -> (if f h then true else list_any_val t f)
 and kernel_made_public = fn (anc: str list) -> fn (name: str) ->
@@ -36225,7 +36284,17 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
             else if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
     let _ = map_set frame nm v in bind_kw_params frame world blk rest defaults kwhash
 
-and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params0: str list) -> fn (defaults: (str * Expr) list) -> fn (args0: Val list) ->
+and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params0: str list) -> fn (defaults: (str * Expr) list) -> fn (args00: Val list) ->
+  // ⚠ a ruby2_keywords-FLAGGED hash splatted into a method that takes no
+  //   keywords arrives as a plain positional COPY: ruby converts the keywords
+  //   back into a new, unflagged hash, and the flagged one stays as it was.
+  //   It arrived as the flagged hash itself.
+  let args0 = (let ps8 = strip_block_params params0 in
+               if (match kw_params ps8 with Nil -> str_eq (dsplat_name ps8) "" | _ -> false)
+                  && (if map_has r2k_methods (meth_base name) || str_list_has ps8 "*__fwd" then false else true)
+               then r2k_unflag_tail args00 else args00) in
+  // (the splat notes are this call's; none may outlive it)
+  let _ = (if map_len r2k_splat > 0 then map_clear r2k_splat else ()) in
   // a block forwarded as `&proc` carries its home frame in pending_home;
   // record it on this frame so a `break` in that block unwinds to the home.
   let _ = if map_has pending_home "v" then
