@@ -1135,7 +1135,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if (if str_eq (anc_const_key world "Object" n) "" then false else true)
        then map_get consts (anc_const_key world "Object" n)
        else if autoload_fire env world blk n then eval_e env world blk (EConst ("::" ++ n))
-       else raise_exc world "NameError" ("uninitialized constant " ++ n))
+       else raise_uninit_const world "Object" n ("uninitialized constant " ++ n))
     // scoped `A::B` keeps its existing handling; a bare `Const` resolves
     // through the lexical scope (cref) first, then top level.
     else if str_contains name "::" then
@@ -1187,7 +1187,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          else if has_meth world ("(sng:" ++ rc ++ ")") "const_missing" || has_meth world rc "const_missing" then
            invoke_val_c env world blk (VClass rc) "const_missing" (Cons (VSym cn, Nil)) false
          else if autoload_fire env world blk name then eval_e env world blk (EConst name)
-         else raise_exc world "NameError" ("uninitialized constant " ++ name)
+         else raise_uninit_const world rc cn ("uninitialized constant " ++ name)
           | found -> found))
     else
       let cref = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s -> sget s | _ -> "") else cur_lex ()) in
@@ -1209,7 +1209,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       // looked for in: inside `module A; class B`, a missing MISSING is
       // "uninitialized constant A::B::MISSING". Reporting the bare name lost
       // the one piece of the message that says where the search happened.
-      else raise_exc world "NameError"
+      else raise_uninit_const world (if str_eq cref "" then "Object" else cref) name
              ("uninitialized constant " ++ (if str_eq cref "" then name else cref ++ "::" ++ name))
   | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
   | EScopedRead (recv_e, cn) ->
@@ -13921,10 +13921,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if (str_len name == 18 && str_eq name "class_variable_get") then
       (match args with
-       | Cons (v, _) -> let nm = cvar_name_checked world (sym_or_str_arg env world v) in
+       | Cons (v, _) ->
+         // a name that is not one is a NameError whose #name is the argument
+         // itself (the very object) and whose #receiver is the class
+         let s9 = sym_or_str_arg env world v in
+         let _ = (if cvar_name_shaped s9 then ()
+                  else (let _ = raise_exc_iv world "NameError" ("'" ++ s9 ++ "' is not allowed as a class variable name")
+                                  (Cons (("__name", v), Cons (("__recv", VClass c), Nil))) in ())) in
+         let nm = cvar_name_checked world s9 in
          (if cvar_overtaken world c nm then raise_exc world "RuntimeError" ("class variable @@" ++ nm ++ " of " ++ c ++ " is overtaken by " ++ c)
           else if cvar_defined_from world c nm then cvar_get_from world c nm
-          else raise_exc world "NameError" ("uninitialized class variable @@" ++ nm ++ " in " ++ c))
+          else raise_exc_iv world "NameError" ("uninitialized class variable @@" ++ nm ++ " in " ++ c)
+                 (Cons (("__name", VSym ("@@" ++ nm)), Cons (("__recv", VClass c), Nil))))
        | _ -> VNil)
     else if (str_len name == 18 && str_eq name "class_variable_set") then
       (match args with
@@ -15033,7 +15041,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if (str_len name == 21 && str_eq name "instance_variable_get") then
-      (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_name_val env world v in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
+      (match args with Cons (v, _) -> let k = str_of_int id ++ "@" ++ ivar_name_val_r env world recv v in (if map_has ivars k then map_get ivars k else VNil) | _ -> VNil)
     else if (str_len name == 21 && str_eq name "instance_variable_set") then
       // the NAME is checked first: `nil.instance_variable_set(:foo, 42)` is a
       // NameError about the name, not a FrozenError about nil.
@@ -16933,6 +16941,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // and returns the value (enough for specs that compare backtraces).
     else if (str_len name == 9 && str_eq name "backtrace") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (if map_has ivars (str_of_int id ++ "@__bt") then map_get ivars (str_of_int id ++ "@__bt") else VNil)
+    // set_backtrace takes what rb_check_backtrace takes: nil, one String (a
+    // one-line backtrace), an Array of Strings, or -- since 3.4 -- an Array of
+    // Thread::Backtrace::Location, which is kept as the locations and printed
+    // as the strings. Anything else, a Symbol or a nil inside the Array
+    // included, is a TypeError; it used to be stored as given.
     else if (str_len name == 13 && str_eq name "set_backtrace") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       (match args with Cons (v, _) -> exc_set_bt world id v | _ -> VNil)
     // ...and the Locations: the ones it was raised with, the raise's own
@@ -18844,11 +18857,15 @@ and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
         let _ = invoke_val_c env world nb9 h9 "call" (Cons (VInt (signal_num_of nm), Nil)) false in
         true))
 
-// The at_exit handlers, newest first. They are taken out of the store before
-// any of them runs, so a handler that calls `exit` (or registers another one)
-// cannot make them run twice.
-
-and run_at_exits = fn world ->
+// The at_exit handlers, as the top level runs them: a handler's unrescued
+// exception goes to `report` (the top-level report, which lives in m_driver),
+// and this answers the exit status the handlers decided, or -1 if they left it alone.
+// ruby's rb_ec_exec_end_proc: every handler runs even when one raises; a
+// SystemExit from one sets the status (`at_exit { exit 43 }; exit 42` ends
+// with 43), any other exception is printed, becomes $! for the handlers
+// after it, and makes the status 1; and a handler registered WHILE another
+// runs goes right after that one, not at the end.
+and run_at_exits_r = fn world -> fn report ->
   // a `trap(:EXIT, handler)` runs first, before the at_exit handlers, and once
   let _ = (let k9 = (if map_has signal_traps "EXIT" then "EXIT" else if map_has signal_traps "SIGEXIT" then "SIGEXIT" else "") in
            if str_eq k9 "" then ()
@@ -18862,22 +18879,53 @@ and run_at_exits = fn world ->
                     let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
                     let _ = try_or (fn (u: unit) -> FNext (invoke_val_c gc_cenv0 world nb9 (VObj oid9) "call" (Cons (VInt 0, Nil)) false)) (FNext VNil) in ())
                  | _ -> ())) in
+  let st = map_new () in
+  let _ = run_at_exit_batch world report st in
+  if map_has st "v" then map_get st "v" else 0 - 1
+
+// the handlers registered so far, newest first, taken out of the store before
+// any of them runs (so one that calls `exit`, or registers another, cannot
+// make them run twice).
+and run_at_exit_batch = fn world -> fn report -> fn st ->
   let n = map_len at_exits in
   if n == 0 then ()
   else
     (let xs = at_exit_list 0 n Nil in
      let _ = map_clear at_exits in
-     run_at_exit_procs world xs)
+     run_at_exit_procs world report st xs)
 
-and run_at_exit_procs = fn world -> fn (xs: Val list) ->
+and run_at_exit_procs = fn world -> fn report -> fn st -> fn (xs: Val list) ->
   match xs with
   | Nil -> ()
   | Cons (VProc pid, rest) ->
-    // one handler raising does not stop the others, as in ruby
+    let (_, _, ocls9, ivars9) = world in
     let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
-    let _ = try_or (fn (u: unit) -> run_block world nb (proc_as_block pid) Nil) (FNext VNil) in
-    run_at_exit_procs world rest
-  | Cons (_, rest) -> run_at_exit_procs world rest
+    let before9 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else VNil) in
+    let ok = map_new () in
+    let _ = try_or (fn (u: unit) ->
+                      (match run_block world nb (proc_as_block pid) Nil with
+                       | FRaise v9 -> FRaise v9
+                       | r9 -> (let _ = map_set ok "y" 1 in r9))) (FNext VNil) in
+    let _ = (if map_has ok "y" then ()
+             else
+               (let exc9 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else before9) in
+                let sx9 = (match exc9 with
+                           | VObj eid9 -> exc_is_a world (map_get ocls9 eid9) "SystemExit"
+                           | _ -> false) in
+                if sx9 then
+                  (match exc9 with
+                   | VObj eid9 ->
+                     map_set st "v" (if map_has ivars9 (str_of_int eid9 ++ "@__status")
+                                     then (match map_get ivars9 (str_of_int eid9 ++ "@__status") with VInt k9 -> k9 | _ -> 0)
+                                     else 0)
+                   | _ -> ())
+                else
+                  (let _ = report exc9 in
+                   let _ = map_set globals "!" exc9 in
+                   map_set st "v" 1))) in
+    let _ = run_at_exit_batch world report st in
+    run_at_exit_procs world report st rest
+  | Cons (_, rest) -> run_at_exit_procs world report st rest
 
 // a fresh proc that stands for "this target, these arguments so far, this
 // arity". `like` is the proc whose lambda-ness it inherits (curry preserves
@@ -20186,6 +20234,18 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
 // is a TypeError about its TYPE, where `to_s` turned it into a NameError about
 // its printed form ("'123' is not allowed as an instance variable name" for the
 // Integer 123, which was never a name at all).
+// ...and from #instance_variable_get, where the refusal also names the
+// receiver, and #name is the argument as given (the same object).
+and ivar_name_val_r = fn env -> fn world -> fn (recv: Val) -> fn (v: Val) ->
+  let s9 = (match v with
+            | VSym sy -> sy
+            | VStr h -> sget h
+            | other -> (match conv_try env world other "to_str" with VStr h -> sget h | _ -> "@")) in
+  if ivar_name_shaped s9 then ivar_name_val env world v
+  else raise_exc_str_iv world "NameError" ("'" ++ s9 ++ "' is not allowed as an instance variable name")
+         (Cons (("__name", v), Cons (("__recv", recv), Nil)))
+and raise_exc_str_iv = fn world -> fn (cls: str) -> fn (msg: str) -> fn (fields: (str * Val) list) ->
+  let _ = raise_exc_iv world cls msg fields in ""
 and ivar_name_val = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VSym sy -> ivar_name_checked world sy
@@ -28406,7 +28466,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
      | Cons (owner, Cons (cn, _)) ->
        let n = (match cn with VSym sy -> sy | VStr h -> sget h | _ -> to_s cn) in
        let oc = (match owner with VClass c2 -> c2 | _ -> "Object") in
-       raise_exc world "NameError"
+       raise_uninit_const world oc n
          ("uninitialized constant " ++ (if str_eq oc "Object" then n else oc ++ "::" ++ n))
      | _ -> VNil)
   // The path a `require_relative` written in <file> names: its sibling, made
@@ -29129,7 +29189,8 @@ and cvar_get = fn env -> fn world -> fn (name: str) ->
   if str_eq cls "" then raise_exc world "RuntimeError" "class variable access from toplevel"
   // reading an uninitialised class variable is a NameError in Ruby.
   else if cvar_defined_from world cls name then cvar_get_from world cls name
-  else raise_exc world "NameError" ("uninitialized class variable @@" ++ name ++ " in " ++ cls)
+  else raise_exc_iv world "NameError" ("uninitialized class variable @@" ++ name ++ " in " ++ cls)
+         (Cons (("__name", VSym ("@@" ++ name)), Cons (("__recv", VClass cls), Nil)))
 
 // the chain a class variable is looked up along: the receiver, then everything
 // it inherits from or includes, in the order dispatch uses.
@@ -32684,7 +32745,14 @@ and scoped_read_missing = fn env -> fn world -> fn blk -> fn (c: str) -> fn (cn:
   if has_own_meth world ("(sng:" ++ c ++ ")") "const_missing"
      || has_own_meth world c "const_missing"
   then invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym cn, Nil)) false
-  else raise_exc world "NameError" ("uninitialized constant " ++ cn)
+  else raise_uninit_const world c cn ("uninitialized constant " ++ cn)
+
+// A missing constant is Module#const_missing's NameError: #name is the
+// constant's own name (no namespace) and #receiver the module it was looked
+// for in -- Object at the top level. Both were nil.
+and raise_uninit_const = fn world -> fn (owner: str) -> fn (cn: str) -> fn (msg: str) ->
+  raise_exc_iv world "NameError" msg
+    (Cons (("__name", VSym cn), Cons (("__recv", VClass (if str_eq owner "" then "Object" else owner)), Nil)))
 
 // Mark every method `attr_*` just generated in one visibility table and take
 // it out of the other. `want_w` says whether the writer half is marked too --
@@ -34608,20 +34676,22 @@ and loc_obj = fn world -> fn (path: str) -> fn (line: int) -> fn (label: str) ->
       let _ = map_set ivars (str_of_int id ++ "@base_label") (mkstr (loc_base_label label)) in
       VObj id)
    | other -> other)
-// Location#base_label: the label without the block and the owner -- 'block (2
-// levels) in Object#m' and 'Object#m' are both "m", '<main>' is itself
+// Location#base_label: the label without its "block in" / "rescue in" /
+// "ensure in" wrapping and without the owner it is qualified by -- "bar" for
+// "block (2 levels) in Foo#bar", while "<main>" stays "<main>".
 and loc_base_label = fn (label: str) ->
-  let l0 = (if str_len label > 9 && str_eq (substring label 0 9) "block in " then substring label 9 (str_len label)
-            else if str_len label > 7 && str_eq (substring label 0 7) "block (" then
-              (let i = str_index_of label " in " in
-               if i < 0 then label else substring label (i + 4) (str_len label))
-            else label) in
-  if str_len l0 > 0 && str_eq (char_at l0 0) "<" then l0
-  else (let rec last = fn (i: int) -> fn (from: int) ->
-          if i >= str_len l0 then from
-          else if str_eq (char_at l0 i) "#" || str_eq (char_at l0 i) "." then last (i + 1) (i + 1)
-          else last (i + 1) from in
-        substring l0 (last 0 0) (str_len l0))
+  let k9 = str_index_of label " in " in
+  let pre9 = (if k9 >= 0 then substring label 0 k9 else "") in
+  let wrapped9 = str_eq pre9 "block" || str_eq pre9 "rescue" || str_eq pre9 "ensure"
+                 || (str_len pre9 > 7 && str_eq (substring pre9 0 7) "block (") in
+  let l9 = (if wrapped9 then substring label (k9 + 4) (str_len label) else label) in
+  if str_len l9 > 0 && str_eq (char_at l9 0) "<" then l9
+  else
+    (let rec last_sep = fn (i: int) -> fn (best: int) ->
+       (if i >= str_len l9 then best
+        else last_sep (i + 1) (if str_eq (char_at l9 i) "#" || str_eq (char_at l9 i) "." then i else best)) in
+     let j9 = last_sep 0 (0 - 1) in
+     if j9 >= 0 then substring l9 (j9 + 1) (str_len l9) else l9)
 
 
 and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
