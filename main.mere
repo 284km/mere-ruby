@@ -2723,6 +2723,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          else if has_meth world cls "method_missing" then
            invoke_val_c env world blk (VObj id) "~" Nil false
          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unary ~ on non-integer")) in fail "mere-ruby: unary ~ on non-integer")
+       // `~ /re/` is Regexp#~: the pattern against $_ (nil when $_ is not a
+       // String), which is `$_ =~ /re/`
+       | VRegex (p9, f9, e9) ->
+         (match (if map_has globals "_" then map_get globals "_" else VNil) with
+          | VStr sh9 -> (let _ = rx_enc_guard world (VRegex (p9, f9, e9)) (VStr sh9) in
+                         rx_do_match world p9 f9 (sget sh9) (senc_get sh9))
+          | _ -> (let _ = map_set globals "~" VNil in VNil))
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: unary ~ on non-integer")) in fail "mere-ruby: unary ~ on non-integer"))
     else
       (match eval_e env world blk a with
@@ -2750,6 +2757,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match a with
        | ERegex (pat, pfl) ->
          let vb = eval_e env world blk b in
+         let _ = rx_enc_guard world (VRegex (pat, pfl, "")) vb in
          (match vb with
           | VStr sv -> let se9 = senc_get sv in let sv = sget sv in
             let r = rx_do_match world pat pfl sv se9 in
@@ -3046,6 +3054,10 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     // regexp_parser selects its version constants that way.
     else if str_eq op "=~" then
       (let vb = vb in
+       let _ = (match (va0, vb) with
+                | (VStr _, VRegex (_, _, _)) -> rx_enc_guard world vb va0
+                | (VRegex (_, _, _), VStr _) -> rx_enc_guard world va0 vb
+                | _ -> ()) in
        match va0 with
        | VStr sv0 ->
          (let sv = sget sv0 in
@@ -20197,7 +20209,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // ...for a SYMBOL too: it has the same #match, and this arm named only
        // String, so `:abc.match(/b/) { }` dropped the block and answered the
        // MatchData instead of the block's value.
-       else if (str_len name == 5 && str_eq name "match") && (match recv with VStr _ -> true | VSym _ -> true | _ -> false) then
+       else if (str_len name == 5 && str_eq name "match") && (match recv with VStr _ -> true | VSym _ -> true | VRegex (_, _, _) -> true | _ -> false) then
          (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
           match invoke_val_c env world nb recv "match" args false with
           | VNil -> VNil
@@ -20972,8 +20984,17 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
     (if vischeck && meth_private world cls name
      then raise_exc world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world cls)
      else invoke world noblk recv cls name args)
+  else
+  let _ = (if (str_len name == 2 && str_eq name "=~") || (str_len name == 5 && str_eq name "match")
+              || (str_len name == 6 && str_eq name "match?") || (str_len name == 3 && str_eq name "===")
+           then (match (recv, args) with
+                 | (VRegex (_, _, _), Cons (VStr s9, _)) -> rx_enc_guard world recv (VStr s9)
+                 | (VStr _, Cons (VRegex (p9, f9, e9), _)) ->
+                   (if str_len name == 3 then () else rx_enc_guard world (VRegex (p9, f9, e9)) recv)
+                 | _ -> ())
+           else ()) in
   // explicit operator-method call (r.=~("s")) publishes $~ like the operator.
-  else if (str_len name == 2 && str_eq name "=~") then
+  if (str_len name == 2 && str_eq name "=~") then
     (match recv with
      | VRegex (p, pf, _) -> (match args with Cons (VStr sv, _) -> rx_do_match world p pf (sget sv) (senc_get sv) | _ -> VNil)
      | VStr sv ->
@@ -21188,7 +21209,13 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         | Cons (VRegex (p, pf, _), _) -> VBool (rx_match p pf sv)
         | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv)
         | _ -> VBool false)
-     | VRegex (p, pf, _) -> (match args with Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv)) | Cons (VSym sv, _) -> VBool (rx_match p pf sv) | _ -> VBool false)
+     // re.match?(str, pos) is str.match?(re, pos): the position counts
+     | VRegex (p, pf, e) ->
+       (match args with
+        | Cons (VStr sv, Cons (pos9, _)) -> invoke_val_c env world blk (VStr sv) name (Cons (VRegex (p, pf, e), Cons (pos9, Nil))) false
+        | Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv))
+        | Cons (VSym sv, _) -> VBool (rx_match p pf sv)
+        | _ -> VBool false)
      | _ -> VBool false)
   // gsub/sub with a String or Hash replacement, handled where `world` is:
   // $~ ends up holding the last (gsub) / first (sub) match, hash values go
@@ -21495,9 +21522,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
              else hit_at p pf s9 (utf8_boff s9 cst9 0) (senc_get sv))
         | Cons (VStr sv, _) -> hit p pf (sget sv) (senc_get sv)
         | Cons (VSym sv, _) -> hit p pf sv (sym_enc_name sv)
-        // nil matches nothing (and does NOT refuse); anything else has to be
+        // nil matches nothing (and does NOT refuse) -- and that is a failed
+        // match, so $~ is nil after it; anything else has to be
         // string-like, and ruby names what it could not convert.
-        | Cons (VNil, _) -> VNil
+        | Cons (VNil, _) -> (let _ = map_set globals "~" VNil in VNil)
         | Cons (other, _) ->
           (match conv_try env world other "to_str" with
            | VStr sv2 -> hit p pf (sget sv2) (senc_get sv2)
@@ -40046,6 +40074,35 @@ and rxe_backref_many = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int
 
 // =~ / .match / ===: run the match and publish $~ / $1..$9. New engine with
 // legacy fallback for uncompilable patterns.
+// What ruby checks before a Regexp meets a String (rb_reg_prepare_enc):
+// a subject that is broken in its own encoding cannot be searched; one in an
+// ASCII-INCOMPATIBLE encoding (UTF-16/32) only matches a pattern of that same
+// encoding; a pattern FIXED to an encoding refuses a different one unless
+// the subject is plain ASCII (and the pattern's encoding ASCII-compatible);
+// and a /n pattern warns about a non-ASCII subject that is not BINARY. The
+// engine here matches bytes, so none of this happened: `/./` on UTF-16LE
+// text matched a byte of it and `"\x80" =~ /./` answered 0.
+and rx_enc_guard = fn world -> fn (re: Val) -> fn (subj: Val) ->
+  match (re, subj) with
+  | (VRegex (p, fl, ev), VStr h) ->
+    (let se = enc_canon_name (senc_get h) in
+     let sv = sget h in
+     let _ = (if str_eq se "UTF-8" && (if str_is_ascii h then false else (if str_valid_utf8_h h then false else true))
+              then (let _ = raise_exc world "ArgumentError" "invalid byte sequence in UTF-8" in ()) else ()) in
+     let ren = enc_canon_name (rx_enc_name p fl ev) in
+     let fixed = str_contains fl "u" || (if str_eq ren "US-ASCII" || str_contains fl "n" then false else true) in
+     let bad = fn (u: unit) ->
+       raise_exc world "Encoding::CompatibilityError"
+         ("incompatible encoding regexp match (" ++ ren ++ " regexp with " ++ se ++ " string)") in
+     if (if enc_ascii_compat se then false else true) then
+       (if str_eq ren se then () else (let _ = bad () in ()))
+     else if fixed && ((if enc_ascii_compat ren then false else true) || (if str_is_ascii h then false else true))
+             && (if str_eq ren se then false else true) then (let _ = bad () in ())
+     else if str_contains fl "n" && (if str_eq se "ASCII-8BIT" then false else true) && (if str_is_ascii h then false else true)
+             && verbose_set () then
+       rb_warn world ("historical binary regexp match /.../n against " ++ se ++ " string")
+     else ())
+  | _ -> ()
 and rx_do_match = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) -> fn (enc: str) ->
   rx_do_match_at world pat fl sv 0 enc
 // ⚠ MATCHING FROM AN OFFSET MUST NOT SLICE THE SUBJECT. `re.match(str, pos)`
