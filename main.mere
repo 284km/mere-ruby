@@ -2055,13 +2055,23 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                       let _ = raise_exc world "Errno::ENOENT" ("No such file or directory - " ++ w9) in ())
                    | _ -> ())) in
        // ...and $? is the command's status, as system already set it
-       let out9 = run_backtick cmd9 in
-       let st9 = make_proc_status world (if map_has bt_rc "v" then map_get bt_rc "v" else 0) in
-       let _ = (match st9 with
-                | VObj so9 -> (if map_has bt_rc "p" && map_get bt_rc "p" > 0
-                               then map_set ivars (str_of_int so9 ++ "@__pid") (VInt (map_get bt_rc "p")) else ())
-                | _ -> ()) in
-       let _ = map_set globals "?" st9 in
+       let off_main9 = fb_can_suspend
+                       && (match (if map_has cur_thr "t" then map_get cur_thr "t" else VNil) with
+                           | VObj a9 -> (match (if map_has all_thr "0" then map_get all_thr "0" else VNil) with
+                                         | VObj b9 -> a9 != b9
+                                         | _ -> false)
+                           | _ -> false) in
+       let out9 = (if off_main9 then
+                     invoke_val_c env world noblk (VClass "Process") "__bt_async" (Cons (mkstr cmd9, Nil)) false
+                   else
+                     (let o9 = run_backtick cmd9 in
+                      let st9 = make_proc_status world (if map_has bt_rc "v" then map_get bt_rc "v" else 0) in
+                      let _ = (match st9 with
+                               | VObj so9 -> (if map_has bt_rc "p" && map_get bt_rc "p" > 0
+                                              then map_set ivars (str_of_int so9 ++ "@__pid") (VInt (map_get bt_rc "p")) else ())
+                               | _ -> ()) in
+                      let _ = map_set globals "?" st9 in
+                      o9)) in
        // the output is in the default external encoding (Encoding.default_external=
        // changes what the next command's output is labelled)
        let _ = (match (if map_has def_ext_enc "v" then map_get def_ext_enc "v" else VNil) with
@@ -14705,52 +14715,48 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // which is what `-> { Process.kill(:TERM, Process.pid) }.should.raise` is
     // watching for. Another pid is out of reach here -- there are no
     // subprocesses -- so it is refused by name rather than answered with a lie.
+    // Process.kill(sig, *pids): every pid (#to_int), the count answered. A
+    // negative signal (-15, "-TERM", :"-SIGTERM") signals process GROUPS,
+    // and pid 0 is our own group; a group is its members (pgrep -g), each
+    // signalled as one pid is -- so our own process, if in it, goes to its
+    // trapped handler rather than to kill(1). Only one pid was read (the
+    // second of `kill(sig, a, b)` was never signalled, and its child waited
+    // for ever) and a group signal was "unsupported".
     else if str_eq c "Process" && (str_len name == 4 && str_eq name "kill") then
       (match args with
-       | Cons (sig9, Cons (VInt pid9, _)) ->
-         // signal 0 delivers nothing: it asks whether the process exists and
-         // may be signalled, and our own always does.
-         (if (pid9 == getpid () || pid9 == 0) && (match sig9 with VInt 0 -> true | _ -> false) then VInt 1
-          // a signal to ourselves goes to what was trapped for it first
-          else if (pid9 == getpid () || pid9 == 0)
-                  && signal_deliver_self env world
-                       (match sig9 with
-                        | VInt k9 -> signal_name_of k9
-                        | VStr h9 -> sget h9
-                        | VSym y9 -> y9
-                        | _ -> "") then VInt 1
-          // ⚠ ...and SIGINT's default handler raises INTERRUPT, not a
-          //   SignalException: `rescue Interrupt` around a self-kill caught
-          //   nothing. Its message is empty (ruby's, measured).
-          else if (pid9 == getpid () || pid9 == 0)
-                  && (match sig9 with
-                      | VInt k9 -> k9 == 2
-                      | VStr h9 -> str_eq (sget h9) "INT" || str_eq (sget h9) "SIGINT"
-                      | VSym y9 -> str_eq y9 "INT" || str_eq y9 "SIGINT"
-                      | _ -> false) then
-            raise_exc_val world (make_exc_w world (Cons (VClass "Interrupt", Cons (mkstr "", Nil))))
-          else if pid9 == getpid () || pid9 == 0 then
-            // SignalException#initialize resolves the name and number itself
-            // (see the prelude), so the signal is handed over as given.
-            raise_exc_val world (make_exc_w world (Cons (VClass "SignalException", Cons (sig9, Nil))))
-          // ⚠ ANOTHER pid goes to kill(1), and its refusal is the answer:
-          //   ESRCH when there is no such process, EPERM when there is one we
-          //   may not signal -- `ps -p` tells the two apart, since kill's own
-          //   exit status is the same failure for both. This used to be a
-          //   NotImplementedError for every pid but our own.
-          else
-            (let short9 = (fn (n9: str) -> if str_len n9 > 3 && str_eq (substring n9 0 3) "SIG" then substring n9 3 (str_len n9) else n9) in
-             let num9 = (match sig9 with
-                         | VInt k9 -> k9
-                         | VStr h9 -> signal_num_of (short9 (sget h9))
-                         | VSym y9 -> signal_num_of (short9 y9)
-                         | _ -> 0 - 1) in
-             if num9 < 0 || (num9 == 0 && (match sig9 with VInt _ -> false | _ -> true))
-             then raise_exc world "ArgumentError" ("unsupported signal '" ++ to_s sig9 ++ "'")
-             else if run ("kill -" ++ str_of_int num9 ++ " " ++ str_of_int pid9 ++ " 2>/dev/null") == 0 then VInt 1
-             else if run ("ps -p " ++ str_of_int pid9 ++ " >/dev/null 2>&1") == 0
-             then raise_exc world "Errno::EPERM" "Operation not permitted"
-             else raise_exc world "Errno::ESRCH" "No such process"))
+       | Cons (sig0, pids0) when (match pids0 with Nil -> false | _ -> true) ->
+         (let (grp9, sig9) = (match sig0 with
+                              | VInt k9 -> (if k9 < 0 then (true, VInt (0 - k9)) else (false, sig0))
+                              | VStr h9 -> (let t9 = sget h9 in
+                                            if str_len t9 > 1 && str_eq (char_at t9 0) "-" then (true, mkstr (substring t9 1 (str_len t9))) else (false, sig0))
+                              | VSym y9 -> (if str_len y9 > 1 && str_eq (char_at y9 0) "-" then (true, VSym (substring y9 1 (str_len y9))) else (false, sig0))
+                              | _ -> (false, sig0)) in
+          let pids9 = coerce_int_args env world pids0 in
+          let rec each = fn (ps: Val list) -> fn (n: int) ->
+            (match ps with
+             | Nil -> VInt n
+             | Cons (VInt p9, t9) ->
+               (let _ = (if grp9 || (p9 == 0 && (match sig9 with VInt 0 -> false | _ -> true)) then
+                           (let g9 = (if p9 == 0 then getpgid 0 else p9) in
+                            let ms9 = (match run_backtick ("pgrep -g " ++ str_of_int g9) with
+                                       | VStr oh9 -> str_split (sget oh9) (chr 10)
+                                       | _ -> (Nil : str list)) in
+                            let rec go = fn (xs: str list) -> fn (hit: bool) ->
+                              (match xs with
+                               | Nil -> (if hit then () else (let _ = raise_exc world "Errno::ESRCH" "No such process" in ()))
+                               | Cons (m9, r9) ->
+                                 (if str_eq m9 "" then go r9 hit
+                                  else
+                                    (let mp9 = str_to_int_base m9 10 in
+                                     // ourselves LAST: a default action raises here
+                                     if mp9 == getpid () then go r9 true
+                                     else (let _ = try_or (fn (u: unit) -> proc_kill_one env world sig9 mp9) VNil in go r9 true)))) in
+                            let _ = go ms9 false in
+                            if str_list_has ms9 (str_of_int (getpid ())) then (let _ = proc_kill_one env world sig9 (getpid ()) in ()) else ())
+                         else (let _ = proc_kill_one env world sig9 p9 in ())) in
+                each t9 (n + 1))
+             | Cons (o9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name o9 ++ " into Integer")) in
+          each pids9 0)
        | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
     // remove_const(:Name) deletes the constant, returning its value.
     else if (str_len name == 12 && str_eq name "remove_const") then
@@ -18042,9 +18048,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     if map_has meths name then call_method env world noblk name args
     // (Kernel's output functions, `send(:print, x)` at the top level: see
     // try_self_call_x)
-    else if (str_len name == 5 && str_eq name "print") || (str_len name == 4 && str_eq name "putc")
-            || (str_len name == 4 && str_eq name "puts") || (str_len name == 1 && str_eq name "p")
-            || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf") then
+    else if ((str_len name == 5 && str_eq name "print") || (str_len name == 4 && str_eq name "putc")
+             || (str_len name == 4 && str_eq name "puts") || (str_len name == 1 && str_eq name "p")
+             || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf"))
+            && (if kernel_overridden env world name then false else true) then
       try_self_call_x env world VMain name args true
     else dispatch_prim env world blk recv name args vischeck
   | VProc pid ->
@@ -18870,6 +18877,52 @@ and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
         match theblk with (h, ps, b, e) -> (h, Cons (yblk_marker ++ str_of_int pid, ps), b, e))
      else theblk)
   | _ -> theblk
+
+// One pid of Process.kill (see its arm).
+and proc_kill_one = fn env -> fn world -> fn (sig9: Val) -> fn (pid9: int) ->
+         // signal 0 delivers nothing: it asks whether the process exists and
+         // may be signalled, and our own always does.
+         (if (pid9 == getpid () || pid9 == 0) && (match sig9 with VInt 0 -> true | _ -> false) then VInt 1
+          // a signal to ourselves goes to what was trapped for it first
+          else if (pid9 == getpid () || pid9 == 0)
+                  && signal_deliver_self env world
+                       (match sig9 with
+                        | VInt k9 -> signal_name_of k9
+                        | VStr h9 -> sget h9
+                        | VSym y9 -> y9
+                        | _ -> "") then VInt 1
+          // ⚠ ...and SIGINT's default handler raises INTERRUPT, not a
+          //   SignalException: `rescue Interrupt` around a self-kill caught
+          //   nothing. Its message is empty (ruby's, measured).
+          else if (pid9 == getpid () || pid9 == 0)
+                  && (match sig9 with
+                      | VInt k9 -> k9 == 2
+                      | VStr h9 -> str_eq (sget h9) "INT" || str_eq (sget h9) "SIGINT"
+                      | VSym y9 -> str_eq y9 "INT" || str_eq y9 "SIGINT"
+                      | _ -> false) then
+            raise_exc_val world (make_exc_w world (Cons (VClass "Interrupt", Cons (mkstr "", Nil))))
+          else if pid9 == getpid () || pid9 == 0 then
+            // SignalException#initialize resolves the name and number itself
+            // (see the prelude), so the signal is handed over as given.
+            raise_exc_val world (make_exc_w world (Cons (VClass "SignalException", Cons (sig9, Nil))))
+          // ⚠ ANOTHER pid goes to kill(1), and its refusal is the answer:
+          //   ESRCH when there is no such process, EPERM when there is one we
+          //   may not signal -- `ps -p` tells the two apart, since kill's own
+          //   exit status is the same failure for both. This used to be a
+          //   NotImplementedError for every pid but our own.
+          else
+            (let short9 = (fn (n9: str) -> if str_len n9 > 3 && str_eq (substring n9 0 3) "SIG" then substring n9 3 (str_len n9) else n9) in
+             let num9 = (match sig9 with
+                         | VInt k9 -> k9
+                         | VStr h9 -> signal_num_of (short9 (sget h9))
+                         | VSym y9 -> signal_num_of (short9 y9)
+                         | _ -> 0 - 1) in
+             if num9 < 0 || (num9 == 0 && (match sig9 with VInt _ -> false | _ -> true))
+             then raise_exc world "ArgumentError" ("unsupported signal '" ++ to_s sig9 ++ "'")
+             else if run ("kill -" ++ str_of_int num9 ++ " " ++ str_of_int pid9 ++ " 2>/dev/null") == 0 then VInt 1
+             else if run ("ps -p " ++ str_of_int pid9 ++ " >/dev/null 2>&1") == 0
+             then raise_exc world "Errno::EPERM" "Operation not permitted"
+             else raise_exc world "Errno::ESRCH" "No such process"))
 
 // Signal.trap(sig, handler), as signal.c's trap_signm / trap_handler / trap:
 // the signal is an Integer below NSIG, a name with or without SIG (a
@@ -28211,9 +28264,12 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // (`obj.send(:putc, x)`, as the io_putc shared spec does): they live in
   // the implicit-self call path (puts is even a statement there), so they are
   // run from it, with self the receiver.
+  // (not when the program defines the name itself: that definition is what a
+  // call reaches, and the implicit-self path would hand it straight back)
   if explicit && ((str_len name == 5 && str_eq name "print") || (str_len name == 4 && str_eq name "putc")
                   || (str_len name == 4 && str_eq name "puts") || (str_len name == 1 && str_eq name "p")
-                  || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf")) then
+                  || (str_len name == 2 && str_eq name "pp") || (str_len name == 6 && str_eq name "printf"))
+     && (if kernel_overridden env world name then false else true) then
     (let e2 = map_new () in
      let _ = map_set e2 "self" blame in
      let _ = map_set e2 "__ka" (arr_new args) in
