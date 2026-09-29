@@ -12634,7 +12634,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
     else if str_eq c "Regexp" && ((str_len name == 3 && str_eq name "new") || (str_len name == 7 && str_eq name "compile")) then
-      (match args with
+      // the pattern is StringValue'd: an object with #to_str is its String
+      (let args = (match args with
+                   | Cons (VStr _, _) -> args
+                   | Cons (VRegex (_, _, _), _) -> args
+                   | Cons (a0, rest0) -> Cons (pack_cv env world 0 "str" a0, rest0)
+                   | Nil -> args) in
+       let verbose = (if map_has globals (gvar_slot "VERBOSE")
+                      then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false) else false) in
+       match args with
        | Cons (VStr src, rest) ->
          (let body = sget src in
           let fl = (match rest with
@@ -12652,17 +12660,38 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       // answered #fixed_encoding? false for the option that
                       // exists to make it true.
                       (if (opt / 16) - (opt / 32) * 2 == 1 then "u" else "")
-                    | Cons (VStr fs, _) -> sget fs
-                    | _ -> "") in
+                    // a String of flags is "imx" and nothing else
+                    | Cons (VStr fs, _) ->
+                      (let f9 = sget fs in
+                       let rec okf = fn (i: int) -> (if i >= str_len f9 then true
+                                                    else if str_contains "imx" (char_at f9 i) then okf (i + 1) else false) in
+                       if okf 0 then f9 else (let _ = raise_exc world "ArgumentError" ("unknown regexp option: " ++ f9) in ""))
+                    | Cons (VNil, _) -> ""
+                    | Cons (VBool false, _) -> ""
+                    | Cons (VHsh _, _) -> ""
+                    | Nil -> ""
+                    // anything else is truthy, which is IGNORECASE -- and
+                    // ruby says so, when it is being verbose
+                    | Cons (other9, _) ->
+                      (let _ = (if verbose then rb_warn world ("expected true or false as ignorecase: " ++ inspect other9) else ()) in "i")) in
           // FIXEDENCODING means "this source string's encoding", so it is kept
           // whether or not the text would contribute one on its own:
           // `Regexp.new("a".encode("ISO-8859-1"), Regexp::FIXEDENCODING)` is an
           // ISO-8859-1 pattern even though every byte in it is ASCII.
           let renc9 = (if str_contains fl "u" then enc_canon_name (senc_get src) else rx_one_enc (VStr src)) in
-          if rx_validate body fl then rx_build_once body fl renc9 args
-          else raise_exc world "RegexpError" ("invalid regular expression: /" ++ body ++ "/"))
-       | Cons (VRegex (b2, f2, e2), _) -> VRegex (b2, f2, e2)
-       | Cons (other9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ class_name other9 ++ " into String")
+          // ...and a pattern that does not parse is refused with the reason,
+          // "premature end of char-class: /^[$/" as ruby words it
+          let why9 = rx_invalid_msg body fl in
+          if str_eq why9 "" then rx_build_once body fl renc9 args
+          else raise_exc world "RegexpError" (why9 ++ ": /" ++ body ++ "/"))
+       // a Regexp is copied as it is; options beside it are ignored, which
+       // ruby says unless they are nil (or keywords)
+       | Cons (VRegex (b2, f2, e2), rest9) ->
+         (let _ = (match rest9 with
+                   | Cons (VNil, _) -> () | Cons (VHsh _, _) -> () | Nil -> ()
+                   | _ -> rb_warn world "flags ignored") in
+          VRegex (b2, f2, e2))
+       | Cons (other9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into String")
        | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
     // Regexp.last_match / .last_match(n): the same MatchData `$~` holds, which
     // is how a `method =~ /re/` test reads its capture afterwards.
@@ -38902,7 +38931,7 @@ and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
 
 and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
-  if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: trailing backslash")) in fail "mere-ruby: regexp: trailing backslash")
+  if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: too short escape sequence")) in fail "mere-ruby: regexp: too short escape sequence")
   else
     let c = char_at pat p in
     if str_eq c "d" then (NClass (Cons (CDigit, Nil), false, false), p + 1, g)
@@ -38994,13 +39023,25 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
     // The subject is bytes here, so a codepoint escape is a byte sequence --
     // and without it `/\A\u3042/` was "unsupported escape" and every multi-byte
     // spec that writes its pattern that way could not run at all.
+    // ⚠ ...and a malformed one is refused in ruby's words: an empty list or a
+    //   non-hex digit is "invalid Unicode list", more than six digits or a
+    //   codepoint past U+10FFFF "invalid Unicode range", and \u with fewer
+    //   than four digits "invalid Unicode escape". The digits were read by
+    //   str_to_int_base, which reads what it can, so `\u{abcX}` was U+ABC.
     else if str_eq c "u" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) "\{" then
       (let close = str_find_from pat "}" (p + 2) in
-       if close < 0 then
-         (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unterminated \\u brace")) in fail "mere-ruby: regexp parse: unterminated \\u brace")
-       else (NSeq (rxp_u_cps (str_split (substring pat (p + 2) close) " ")), close + 1, g))
-    else if str_eq c "u" && p + 4 < str_len pat && rxp_hexv (char_at pat (p + 1)) >= 0 then
-      (NSeq (rxp_u_bytes (utf8_enc (rxp_hex4 pat (p + 1))) 0), p + 5, g)
+       let toks = (if close < 0 then Nil else rxp_u_toks (str_split (substring pat (p + 2) close) " ")) in
+       let why = (match toks with Nil -> "invalid Unicode list" | _ -> rxp_u_check toks) in
+       if (if str_eq why "" then false else true) then
+         (let __fm = "mere-ruby: regexp: " ++ why in
+          let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
+       else (NSeq (rxp_u_cps toks), close + 1, g))
+    else if str_eq c "u" then
+      (if p + 4 < str_len pat && rxp_hexv (char_at pat (p + 1)) >= 0 && rxp_hexv (char_at pat (p + 2)) >= 0
+          && rxp_hexv (char_at pat (p + 3)) >= 0 && rxp_hexv (char_at pat (p + 4)) >= 0
+       then (NSeq (rxp_u_bytes (utf8_enc (rxp_hex4 pat (p + 1))) 0), p + 5, g)
+       else (let __fm = "mere-ruby: regexp: invalid Unicode escape" in
+             let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm))
     else if str_eq c "k" || str_eq c "g" || str_eq c "p" ||
             str_eq c "K" || str_eq c "X" || str_eq c "u" then
       (if map_has rx_lenient "n" then (NEmpty, p + 1, g) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unsupported escape")) in fail "mere-ruby: regexp: unsupported escape"))
@@ -39120,6 +39161,35 @@ and rx_num_ref_target = fn (nm: str) -> fn (g: int) ->
   else if str_eq c0 "+" then g + int_of_str (substring nm 1 (str_len nm)) - 1
   else int_of_str nm
 
+// the non-empty codepoint tokens of a \u{...} list, and the refusal of a
+// token that is not a codepoint (see rxp_escape)
+and rxp_u_toks = fn (xs: str list) ->
+  match xs with Nil -> Nil | Cons (h, t) -> (if str_eq h "" then rxp_u_toks t else Cons (h, rxp_u_toks t))
+and rxp_u_check = fn (xs: str list) ->
+  match xs with
+  | Nil -> ""
+  | Cons (h, t) ->
+    (let rec hexy = fn (i: int) -> (if i >= str_len h then true else if rxp_hexv (char_at h i) >= 0 then hexy (i + 1) else false) in
+     if (if hexy 0 then false else true) then "invalid Unicode list"
+     else if str_len h > 6 || str_to_int_base h 16 > 1114111 then "invalid Unicode range"
+     else rxp_u_check t)
+// Why a pattern does not parse, in ruby's words where the parser has them
+// ("premature end of char-class", "invalid hex escape", ...); "" when it does.
+// The reason rides in the failure's internal message, which is cleared first
+// so that an earlier failure's text cannot answer for this one.
+and rx_invalid_msg = fn (body: str) -> fn (fl: str) ->
+  let _ = map_set rx_lenient "n" VNil in
+  let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+  let ok = try_or (fn (u: unit) -> let _ = rxp_parse body fl in true) false in
+  let _ = map_delete rx_lenient "n" in
+  if ok then ""
+  else
+    (let m = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "") else "") in
+     let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
+     let strip = fn (pfx: str) -> fn (t: str) ->
+       (if str_len t >= str_len pfx && str_eq (substring t 0 (str_len pfx)) pfx then substring t (str_len pfx) (str_len t) else t) in
+     let r = strip "mere-ruby: regexp: " (strip "mere-ruby: regexp parse: " m) in
+     if str_eq r "" || str_eq r m then "invalid regular expression" else r)
 and rx_validate = fn (body: str) -> fn (fl: str) ->
   let _ = map_set rx_lenient "n" VNil in
   let ok = try_or (fn (u: unit) -> let _ = rxp_parse body fl in true) false in
