@@ -13662,6 +13662,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       if str_eq a9 "" then origin else a9) in
           let _ = map_set ivars0 (str_of_int id ++ "@__um_owner") (mkstr own9) in
           let _ = map_set ivars0 (str_of_int id ++ "@__um_name") (mkstr mname) in
+          // the definition it was made from (see make_unbound_method)
+          let k9 = origin ++ "#" ++ mname in
+          let _ = (if map_has meth_src k9 && map_has meth_src ("f" ++ k9) then
+                     map_set ivars0 (str_of_int id ++ "@__um_def")
+                       (mkstr (to_s (map_get meth_src ("f" ++ k9)) ++ ":" ++ to_s (map_get meth_src k9)))
+                   else ()) in
           VObj id))
     // define_method(:name, unbound_or_proc): the non-block form. An
     // UnboundMethod transplants its body into `c` (super then resolves in c's
@@ -14597,8 +14603,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let (methsA, _, _, _) = world in
        match args with
        | Cons (a, Cons (b, _)) ->
-         let n1 = (match a with VSym s -> s | VStr h -> sget h | _ -> "") in
-         let n2 = (match b with VSym s -> s | VStr h -> sget h | _ -> "") in
+         // (the names read as every name argument does: #to_str, else TypeError)
+         let n1 = sym_or_str_arg env world a in
+         let n2 = sym_or_str_arg env world b in
          // resolve the source through the ancestor chain (an alias can name an
          // inherited/included method), and remember the origin so a `super`
          // inside the aliased method resumes above where the source was defined.
@@ -14626,10 +14633,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                     // used to live under a bare key; once it became the private
                     // Object#ret1 it is found HERE, and the alias came out
                     // public -- `k2.new.bar` answered where ruby refuses.
-                    let _ = if map_has privates (origin ++ "#" ++ n2) then map_set privates (c ++ "#" ++ n1) VNil else () in
-                    let _ = if map_has protecteds (origin ++ "#" ++ n2) then map_set protecteds (c ++ "#" ++ n1) VNil else () in
-                    let _ = if str_eq origin c then () else map_set alias_origin (c ++ "#" ++ n1) origin in
-                    if str_eq n1 n2 then () else map_set alias_srcname (c ++ "#" ++ n1) n2)
+                    // ...as it is seen FROM HERE: `public :m` in this class makes an
+                    // inherited private m public, and its alias is public too
+                    let _ = if meth_private world c n2 then map_set privates (c ++ "#" ++ n1) VNil else () in
+                    let _ = if meth_protected world c n2 then map_set protecteds (c ++ "#" ++ n1) VNil else () in
+                    // ⚠ an alias OF AN ALIAS names the first definition: its
+                    //   origin and its source name are the alias's, not the
+                    //   alias itself. `alias_method :a, :m; alias_method :m, :a`
+                    //   recorded m -> a and a -> m, a cycle, and m's `super`
+                    //   searched from the class instead of above the module
+                    //   that wrote the body.
+                    let sk9 = origin ++ "#" ++ n2 in
+                    let origin9 = (if map_has alias_origin sk9 then map_get alias_origin sk9 else origin) in
+                    let src9 = (if map_has alias_srcname sk9 then map_get alias_srcname sk9 else n2) in
+                    let _ = if str_eq origin9 c then () else map_set alias_origin (c ++ "#" ++ n1) origin9 in
+                    if str_eq n1 src9 then (if map_has alias_srcname (c ++ "#" ++ n1) then map_delete alias_srcname (c ++ "#" ++ n1) else ())
+                    else map_set alias_srcname (c ++ "#" ++ n1) src9)
                  // A TOP-LEVEL method is stored under its bare name, with no
                  // class prefix -- `alias_method :hash, :ret1` where ret1 is a
                  // top-level def found nothing here and silently made no alias
@@ -14654,6 +14673,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  else (let _ = raise_exc_iv world "NameError"
                                  ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world c ++ "'")
                                  (Cons (("__name", VSym n2), Nil)) in ()) in
+         // ...and the names ruby keeps private whatever is aliased to them
+         // (initialize, initialize_copy, respond_to_missing?, ...) stay so
+         let _ = (if always_private_meth n1 then
+                    (let _ = (if map_has protecteds (c ++ "#" ++ n1) then map_delete protecteds (c ++ "#" ++ n1) else ()) in
+                     map_set privates (c ++ "#" ++ n1) VNil)
+                  else ()) in
          // aliasing adds a method under a new name, so the hook fires (same
          // reason as the `alias` keyword above).
          let _ = run_method_added world c n1 in
@@ -15311,6 +15336,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (match args with
        | Cons (v, Cons (value, _)) ->
          let cn9 = sym_or_str_arg env world v in
+         // ...and the name has to BE one constant name (one segment, an
+         // uppercase first letter): "wrong constant name", as const_get says
+         let _ = (if is_const_path cn9 && (if str_contains cn9 "::" then false else true) then ()
+                  else (let _ = raise_exc_iv world "NameError" ("wrong constant name " ++ cn9)
+                                  (Cons (("__name", VSym cn9), Nil)) in ())) in
          let key = (if str_eq c "Object" then cn9 else c ++ "::" ++ cn9) in
          // ruby warns here too: const_set over an existing constant is the
          // same replacement as writing `C = v`.
@@ -17252,9 +17282,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //   of an inherited method, of an own method with and without a
          //   super, and a plain method -- one rule explains all four: look up
          //   ORIGINAL NAME strictly above the OWNER.
-         (let anc = ancestors_of world ucls in
+         // ...from the OWNER when it is not where the body is (a class that
+         // only published an inherited method is the owner; its chain is the
+         // one with the rest above it)
+         (let own8 = (if map_has ivars (str_of_int id ++ "@__um_owner")
+                      then (match map_get ivars (str_of_int id ++ "@__um_owner") with VStr h8 -> sget h8 | _ -> ucls)
+                      else ucls) in
+          let anc = ancestors_of world own8 in
           let unm = original_name_of world ucls unm in
-          let above = super_owner_above world anc ucls unm in
+          let above = super_owner_above world anc own8 unm in
           if str_eq above "" then
             // ...and the BUILTIN above it: `String.instance_method(:to_s)`
             // answers Kernel#to_s in ruby, because #to_s is Kernel's and
@@ -17305,7 +17341,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              // classes made an alias unequal to what it aliases.
              VBool (str_eq (map_get ocls oid2) "UnboundMethod"
                     && str_eq (meth_origin_cls world uc2 un2) (meth_origin_cls world ucls unm)
-                    && str_eq (defined_as_name world uc2 un2) (defined_as_name world ucls unm)))
+                    && str_eq (defined_as_name world uc2 un2) (defined_as_name world ucls unm)
+                    // ...made from the SAME definition (see make_unbound_method)
+                    && (let d1 = str_of_int id ++ "@__um_def" in
+                        let d2 = str_of_int oid2 ++ "@__um_def" in
+                        if map_has ivars d1 && map_has ivars d2
+                        then str_eq (to_s (map_get ivars d1)) (to_s (map_get ivars d2))
+                        else true)))
           | _ -> VBool false)
        // the universal names, same reason as the ThreadGroup arm above (this
        // one refused `nil?` and `itself`).
@@ -36627,6 +36669,8 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
   // rubocop-ast registers its visitors from that hook and writes
   // `alias visit_number visit_symbol`, so an alias that stays quiet leaves the
   // visitor unregistered and the compiler recurses forever.
+  // (a name ruby keeps private -- initialize & co. -- stays private)
+  let _ = (if always_private_meth n1 then map_set privates (cls ++ "#" ++ n1) VNil else ()) in
   run_method_added world cls n1
 // ⚠ an entry is spelled the way ruby PRINTS it (`#<Class:M>` for a
 //   `class << self`), but the singleton class itself is `(sng:M)`: the
