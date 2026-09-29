@@ -3005,6 +3005,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          (if elem_has_user_eq world (deref xa) || elem_has_user_eq world (deref xb)
           then VBool (arr_eq_w env world (deref xa) (deref xb))
           else VBool (rb_eq va0 (vb)))
+       // a Range's bounds by their own == (rng_eq_w), a subclass instance too
+       | (VRange (lo, hi, ex), _) -> VBool (rb_eq va0 vb || rng_eq_w env world lo hi ex vb false)
        | _ -> VBool (rb_eq va0 (vb)))
     else if str_eq op "!=" then
       (match (va0, vb) with
@@ -3012,6 +3014,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          (if elem_has_user_eq world (deref xa) || elem_has_user_eq world (deref xb)
           then VBool (if arr_eq_w env world (deref xa) (deref xb) then false else true)
           else (if rb_eq va0 (vb) then VBool false else VBool true))
+       | (VRange (lo, hi, ex), _) -> VBool (if rb_eq va0 vb || rng_eq_w env world lo hi ex vb false then false else true)
        | _ -> (if rb_eq va0 (vb) then VBool false else VBool true))
     // `(1..10) % 3` is `(1..10).step(3)`: the same arithmetic sequence, and
     // ruby spells it both ways. Answered here rather than in the dispatcher so
@@ -8740,6 +8743,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (match recv0 with VObj _ -> true | _ -> false)
           && (if has_meth world (dispatch_cls_of world recv0) "!=" then false else true) then
     VBool (if truthy (invoke_val_c env world blk recv0 "==" args0 false) then false else true)
+  // a Range SUBCLASS instance compares as the range it carries
+  else if (str_eq name0 "==" || str_eq name0 "eql?")
+          && (match recv0 with
+              | VObj o9 -> (let (_, _, oc9, iv9) = world in
+                            exc_is_a world (map_get oc9 o9) "Range" && map_has iv9 (str_of_int o9 ++ "@__rg_lo")
+                            && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true))
+              | _ -> false) then
+    (match (recv0, args0) with
+     | (VObj o9, Cons (b9, _)) ->
+       (let (_, _, _, iv9) = world in
+        VBool (rng_eq_w env world (map_get iv9 (str_of_int o9 ++ "@__rg_lo")) (map_get iv9 (str_of_int o9 ++ "@__rg_hi"))
+                 (match (if map_has iv9 (str_of_int o9 ++ "@__rg_ex") then map_get iv9 (str_of_int o9 ++ "@__rg_ex") else VBool false) with
+                  | VBool x9 -> x9 | _ -> false)
+                 b9 (str_eq name0 "eql?")))
+     | _ -> VBool false)
   else if str_eq name0 "=="
           && (match recv0 with VObj _ -> true | _ -> false)
           && (let oc9 = dispatch_cls_of world recv0 in
@@ -9074,6 +9092,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // the succ walk from "a" to "e". Raising for every object begin was the
   // other half of the same mistake -- it took Time and #succ-bearing objects
   // with it.
+  // cover? with a RANGE argument asks whether the whole range is inside
+  else if str_eq name0 "cover?"
+          && (match recv0 with VRange (_, _, _) -> true | _ -> false)
+          && (match args0 with
+              | Cons (VRange (_, _, _), Nil) -> true
+              | Cons (VObj o9, Nil) -> (let (_, _, oc9, _) = world in exc_is_a world (map_get oc9 o9) "Range")
+              | _ -> false) then
+    invoke_val_c env world blk recv0 "__cover_range" args0 false
   else if (str_eq name0 "include?" || str_eq name0 "member?")
           && (match args0 with Cons (_, Nil) -> true | _ -> false)
           && (match recv0 with VRange (_, _, _) -> true | _ -> false) then
@@ -10113,6 +10139,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      | VHsh h1 -> (match args with
                    | Cons (VHsh h2, _) -> VBool (hash_eq_wm env world h1 h2 (str_len name == 4 && str_eq name "eql?"))
                    | _ -> VBool false)
+     | _ -> VBool false)
+  // ...two Ranges: the same exclusion and bounds that are == (eql? for
+  // #eql?) by their OWN method -- a bound object that defines == was compared
+  // by identity -- and the other side may be a Range SUBCLASS instance, which
+  // is an object carrying its bounds (seed_builtin_subclass_ivars)
+  else if ((str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?"))
+          && (match recv with VRange (_, _, _) -> true | _ -> false)
+          && (match args with Cons (_, _) -> true | _ -> false) then
+    (match (recv, args) with
+     | (VRange (lo, hi, ex), Cons (o9, _)) -> VBool (rng_eq_w env world lo hi ex o9 (str_len name == 4 && str_eq name "eql?"))
      | _ -> VBool false)
   // ...and two Arrays the same way: element by element, asking an object its own
   else if ((str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?"))
@@ -22269,6 +22305,33 @@ and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
      | (VHsh h3, VHsh g3) -> hash_eq_w env world h3 g3
      | (_, _) -> false)
 
+// Range#== / #eql? against `other`: a Range, or a Range subclass instance
+and rng_eq_w = fn env -> fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (ex: bool) -> fn (other: Val) -> fn (useeql: bool) ->
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  let (_, _, ocls9, iv9) = world in
+  let parts = (match other with
+               | VRange (l2, h2, e2) -> (true, l2, h2, e2)
+               | VObj o9 ->
+                 (if exc_is_a world (map_get ocls9 o9) "Range" && map_has iv9 (str_of_int o9 ++ "@__rg_lo") then
+                    (true, map_get iv9 (str_of_int o9 ++ "@__rg_lo"), map_get iv9 (str_of_int o9 ++ "@__rg_hi"),
+                     (match (if map_has iv9 (str_of_int o9 ++ "@__rg_ex") then map_get iv9 (str_of_int o9 ++ "@__rg_ex") else VBool false) with
+                      | VBool b9 -> b9 | _ -> false))
+                  else (false, VNil, VNil, false))
+               | _ -> (false, VNil, VNil, false)) in
+  let same = fn (a: Val) -> fn (b: Val) ->
+    (if rb_eq a b && (if useeql then rb_eql a b else true) then true
+     else
+       (match a with
+        | VObj _ ->
+          (if useeql then
+             (if has_meth world (dispatch_cls_of world a) "eql?" then truthy (invoke_val_c env world nb9 a "eql?" (Cons (b, Nil)) false)
+              else false)
+           else if obj_answers_eq world a then truthy (invoke_val_c env world nb9 a "==" (Cons (b, Nil)) false)
+           else false)
+        | _ -> (if useeql then rb_eql_w env world a b else cmp_member_w env world a b))) in
+  match parts with
+  | (true, l2, h2, e2) -> ex == e2 && same lo l2 && same hi h2
+  | _ -> false
 and obj_answers_eq = fn world -> fn (v: Val) ->
   match v with
   // through the DISPLAY class: an object with a singleton (a Time with a
@@ -26733,7 +26796,9 @@ and rng_bad_bounds = fn world -> fn (lo: Val) -> fn (hi: Val) ->
      // equal bounds always compare: Object#<=> answers 0 for a pair it
      // considers ==, whatever the class, which is why ruby builds `(//..//)`
      // (two empty Regexps) and refuses `(/a/../b/)`.
-     | _ when rb_eq lo hi -> false
+     // ...except an OBJECT, which is always asked (`(obj..obj)` calls
+     // obj <=> obj in ruby; a mock that expects it saw nothing)
+     | _ when rb_eq lo hi && (match lo with VObj _ -> false | _ -> true) -> false
      | _ ->
        // every numeric kind compares with every other: a Bignum bound is what
        // sidekiq-pro's (0..2**64) has, and `is_num` does not count those.
@@ -27034,10 +27099,26 @@ and rng_include = fn env -> fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl
                  ("can't iterate from " ++ display_cls_msg world (dispatch_cls_of world lo))))
 
 and rng_covers_w = fn world -> fn (lo: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (v: Val) ->
-  if (match lo with VNil -> false | _ -> (if cmp_possible_w world v lo then false else true)) then false
+  // a primitive begin asked about an OBJECT goes through the begin's own
+  // #<=>, which is the coerce protocol for a number (`1 <=> obj` asks
+  // obj.coerce); nil from it is "not covered"
+  if (match (lo, v) with (VObj _, _) -> false | (VNil, _) -> false | (_, VObj _) -> true | _ -> false) then
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     match invoke_val_c gc_cenv0 world nb9 lo "<=>" (Cons (v, Nil)) false with
+     | VInt c9 ->
+       c9 <= 0
+       && (match hi with
+           | VNil -> true
+           | _ -> (if cmp_possible_w world v hi
+                   then (if excl then cmp_vals_w world v hi < 0 else cmp_vals_w world v hi <= 0)
+                   else false))
+     | _ -> false)
+  else if (match lo with VNil -> false | _ -> (if cmp_possible_w world lo v then false else true)) then false
   else if (match hi with VNil -> false | _ -> (if cmp_possible_w world v hi then false else true)) then false
   else
-    (match lo with VNil -> true | _ -> cmp_vals_w world v lo >= 0)
+    // the BEGIN is asked (`beg <=> val`, ruby's r_cover_p), not the value:
+    // `(obj..'z').cover?('b')` is obj's <=> to answer
+    (match lo with VNil -> true | _ -> cmp_vals_w world lo v <= 0)
     && (match hi with
         | VNil -> true
         | _ -> if excl then cmp_vals_w world v hi < 0 else cmp_vals_w world v hi <= 0)
