@@ -1346,7 +1346,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
         else
           (let lv9 = defined_eval_recv env world blk l in
            match lv9 with
-           | VSym m9 -> (if str_eq m9 "__mere_defined_fail__" then VNil else mkstr "method")
+           | VSym m9 -> (if str_eq m9 "__mere_defined_fail__" then VNil else if responds world lv9 op then mkstr "method" else VNil)
            | _ -> (if responds world lv9 op then mkstr "method" else VNil)))
      | EUn (_, x) ->
        (if defined_operand_failed env world blk x then VNil else mkstr "method")
@@ -1393,7 +1393,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           else if map_has globals k then mkstr "global-variable" else VNil)
        else if str_len name >= 2 && str_eq (substring name 0 2) "@@" then
          let (m2, s2, o2, iv2) = world in
-         (if map_has cvars (cvar_cls env world ++ "@" ++ substring name 2 (str_len name)) then mkstr "class variable" else VNil)
+         // (along the chain, as the read does -- cvar_defined_from)
+         (let cc9 = cvar_cls env world in
+          if (if str_eq cc9 "" then false else cvar_defined_from world cc9 (substring name 2 (str_len name))) then mkstr "class variable" else VNil)
        else if str_len name > 0 && str_eq (char_at name 0) "@" then
          let (m2, s2, o2, ivars2) = world in
          let iv = substring name 1 (str_len name) in
@@ -1411,6 +1413,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else VNil
      | ECall (name, _) -> if is_method_defined env world name || is_kernel_builtin name then mkstr "method" else VNil
      | ECallB (name, _, _, _) -> if is_method_defined env world name || is_kernel_builtin name then mkstr "method" else VNil
+     // `@@x` parses as the ivar "@x": a CLASS variable, asked along the chain
+     // the read uses (it answered from the object's ivars, so never)
+     | EIVar name when str_len name > 1 && str_eq (char_at name 0) "@" ->
+       (let cc9 = cvar_cls env world in
+        if (if str_eq cc9 "" then false else cvar_defined_from world cc9 (substring name 1 (str_len name)))
+        then mkstr "class variable" else VNil)
      | EIVar name ->
        let (meths, sup, ocls, ivars) = world in
        (let k = ivar_self_key (lv_get env "self") name in
@@ -1461,14 +1469,34 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            if has_meth world cls name then
              (if meth_private world cls name then VNil
               else if meth_protected world cls name
-              then (if protected_ok env world cls then mkstr "method" else VNil)
+              then (if protected_ok_m env world cls name then mkstr "method" else VNil)
               else mkstr "method")
            // a method the dispatcher implements (`o.to_s`) is defined too...
            else if is_prim_method name || builtin_obj_has cls name then mkstr "method"
            // ...and so is one the object only CLAIMS, through respond_to? or
            // respond_to_missing? -- which is why ruby ends up asking it.
-           else if responds world rv name then mkstr "method" else VNil)
-        | VClass c -> if (str_len name == 3 && str_eq name "new") || has_meth world c name || has_meth world ("(sng:" ++ c ++ ")") name then mkstr "method" else VNil
+           // ⚠ ...asking #respond_to_missing? ITSELF, not #respond_to?: ruby's
+           //   defined? looks the method up and then calls the hook directly,
+           //   so an object whose own #respond_to? says no (mspec's mock does)
+           //   is still "method" when the hook says yes.
+           //   (...through rb_check_funcall: an object that overrides
+           //   #respond_to? is first asked whether it responds to
+           //   :respond_to_missing? at all, and a no is nil)
+           else if responds_real world rv name then mkstr "method"
+           else if has_meth world cls "respond_to_missing?"
+                   && (if has_meth world cls "respond_to?"
+                       then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) rv
+                                      "respond_to?" (Cons (VSym "respond_to_missing?", Cons (VBool true, Nil))) false)
+                       else true)
+                   && truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) rv
+                                "respond_to_missing?" (Cons (VSym name, Cons (VBool false, Nil))) false)
+           then mkstr "method"
+           else VNil)
+        // (...and what the class object answers publicly -- `Kernel.puts` is
+        // one of Kernel's module functions, public on Kernel itself)
+        | VClass c -> if (str_len name == 3 && str_eq name "new") || has_meth world c name || has_meth world ("(sng:" ++ c ++ ")") name
+                         || (str_eq c "Kernel" && is_kernel_builtin name && (if is_kernel_priv_only name then false else true))
+                      then mkstr "method" else VNil
         // ...and a PRIMITIVE receiver is asked too. This answered "method"
         // for anything at all, so `defined?(1.foo)` and `defined?("s".nope)`
         // both claimed a method that does not exist.
@@ -1484,7 +1512,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let rv = defined_eval_recv env world blk recv in
        if (match rv with VSym m -> str_eq m "__mere_defined_fail__" | _ -> false) then VNil
        else (match rv with
-             | VClass c -> if map_has consts (c ++ "::" ++ cn) then mkstr "constant" else VNil
+             // (along the receiver's ancestors, as the read does: `self::X`
+             // in a subclass finds the superclass's X)
+             | VClass c -> if map_has consts (c ++ "::" ++ cn)
+                              || (if str_eq (anc_const_key_q world c cn) "" then false
+                                  else (if map_has private_consts (anc_const_key_q world c cn) then false else true))
+                           then mkstr "constant" else VNil
              | _ -> VNil)
      | EYield _ -> let (has, _, _, _) = blk in if has then mkstr "yield" else VNil
      // An array LITERAL is defined only if every element is: ruby answers nil
@@ -3539,8 +3572,18 @@ and defined_super_str = fn env -> fn world ->
     (let sc9 = sng_supername world defcls in
      if has_meth world sc9 meth then mkstr "super" else VNil)
   else
-    (let a9 = lookup_anc world (anc_after (ancestors_of world (super_base world recv9)) defcls) meth in
-     if str_eq a9 "" then VNil else mkstr "super")
+    // ...stopping at an `undef` on the way up: a superclass that undef'd the
+    // method has none to give (lookup_anc reads the tables only)
+    (let above9 = anc_after (ancestors_of world (super_base world recv9)) defcls in
+     let rec up9 = fn (xs: str list) ->
+       (match xs with
+        | Nil -> false
+        | Cons (a9, t9) ->
+          (if map_has undefs (a9 ++ "#" ++ meth) then true
+           else if map_has m2 (a9 ++ "#" ++ meth) then false
+           else up9 t9)) in
+     let a9 = lookup_anc world above9 meth in
+     if str_eq a9 "" || up9 above9 then VNil else mkstr "super")
 
 and coerce_operand_display = fn world -> fn (v: Val) ->
   match v with
@@ -3646,7 +3689,14 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   | Cons (ESplat e, t) ->
     let spread = (match eval_e env world blk e with
                   | VArr id -> deref id
-                  | VHsh xs -> let xs = hderef xs in hash_to_a xs   // *hash spreads as [k, v] pairs
+                  // *hash spreads as [k, v] pairs -- through #to_a when the
+                  // hash (or its class) defines one of its own
+                  | VHsh xs ->
+                    (if prim_user_has world (VHsh xs) "to_a" then
+                       (match invoke_val_c env world blk (VHsh xs) "to_a" Nil false with
+                        | VArr aid -> deref aid
+                        | _ -> hash_to_a (hderef xs))
+                     else hash_to_a (hderef xs))
                   | VNil -> Nil   // [*nil] is empty
                   // `[*(0..2)]` is [0, 1, 2]: a splat asks for to_a, and a
                   // Range has one. It used to spread as the Range itself.
@@ -15405,7 +15455,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // `protected :m` in `class << self` wrote was never read here.
       (let sc9 = "(sng:" ++ c ++ ")" in
        let refused9 = (if vischeck && meth_private world sc9 name then "private"
-                       else if vischeck && meth_protected world sc9 name && (if protected_ok env world sc9 then false else true) then "protected"
+                       else if vischeck && meth_protected world sc9 name && (if protected_ok_m env world sc9 name then false else true) then "protected"
                        else "") in
        if str_eq refused9 "" then invoke world noblk recv sc9 name args
        else if has_meth world sc9 "method_missing" then invoke world noblk recv sc9 "method_missing" (Cons (VSym name, args))
@@ -15513,7 +15563,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       //   is concerned: ruby hands `obj.priv` to the object's method_missing
       //   when it has one, and raises only when it does not.
       (let refused9 = (if vischeck && meth_private world cls name then "private"
-                       else if vischeck && meth_protected world cls name && (if protected_ok env world cls then false else true) then "protected"
+                       else if vischeck && meth_protected world cls name && (if protected_ok_m env world cls name then false else true) then "protected"
                        else "") in
        if str_eq refused9 "" then invoke world noblk recv cls name args
        else if has_meth world cls "method_missing" then invoke world noblk recv cls "method_missing" (Cons (VSym name, args))
@@ -15745,7 +15795,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       if str_list_has ra9 ocl then ra9 else ancestors_of world ocl) in
           let above0 = super_owner_above world anc9 ocl mnm in
           // ...or the universal name's home, Kernel (see the UnboundMethod arm)
-          let above = (if str_eq above0 "" && is_prim_method mnm
+          // ...but only for a class that has builtins of its OWN to override
+          // Kernel's (String#to_s); a builtin reached on an ordinary object
+          // IS Kernel's, with nothing above it (`Object.new.method(:method)
+          // .super_method` is nil)
+          let plain9 = str_eq mown "" && (match mrecv with
+                                          | VObj _ -> (let dc9 = display_cls world (dispatch_cls_of world mrecv) in
+                                                       str_eq dc9 "Object" || (if builtin_cls_name dc9 then false else true))
+                                          | VMain -> true
+                                          | _ -> false) in
+          let above = (if str_eq above0 "" && is_prim_method mnm && (if plain9 then false else true)
                           && (if str_eq ocl "Kernel" then false else true) && anc_has anc9 "Kernel"
                        then "Kernel" else above0) in
           if str_eq above "" then VNil
@@ -19286,7 +19345,9 @@ and lambda_arity_check = fn world -> fn (ps0: str list) -> fn (body: Stmt list) 
 and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
   match cur with
   | (true, _, _, _) ->
-    (if bare_yield_stmts body then
+    (if (let _ = map_set yscan_defined "y" 1 in
+         let r9 = bare_yield_stmts body in
+         let _ = map_delete yscan_defined "y" in r9) then
        (let pid = (handle_base + map_len proc_store) in
         let _ = store_proc (str_of_int pid) cur in
         let _ = store_yblk (str_of_int pid) cur in
@@ -19540,6 +19601,11 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   | VSym s -> (true, Cons ("__bp", Nil), Cons (SExpr (EMethod (EVar "__bp", s, Nil)), Nil), env)
   | _ ->
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+    // an object with no #to_proc is not a block, and one whose #to_proc
+    // answers something else is refused by name (ruby's two TypeErrors)
+    if (if responds world bv "to_proc" then false else true) then
+      (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ class_name bv ++ " into Proc") in noblk)
+    else
     (match invoke_val_c env world noblk bv "to_proc" Nil false with
      // the proc #to_proc answered IS the proc this block was made from -- a
      // Method's is a lambda, and `&m` lost that by not recording it here the
@@ -19548,7 +19614,10 @@ and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
        (let _ = if map_has proc_home (str_of_int pid) then map_set pending_home "v" (map_get proc_home (str_of_int pid)) else () in
         let _ = map_set pending_srcproc "v" pid in
         proc_as_block pid)
-     | _ -> noblk)
+     | bad ->
+       (let _ = raise_exc world "TypeError"
+                  ("can't convert " ++ class_name bv ++ " to Proc (" ++ class_name bv ++ "#to_proc gives " ++ class_name bad ++ ")") in
+        noblk))
 
 // ⚠ Seven methods take an ARGUMENT or a block, never both -- and with an
 // argument ruby ignores the block, says so, and answers from the argument.
@@ -37772,6 +37841,12 @@ and incl_each_go = fn world -> fn (c: str) -> fn (args: Val list) ->
 
 // a protected call is allowed when the caller's self is a kind of the
 // method's class.
+// ...asked about the class that DEFINES the method (its owner), not the
+// receiver's class: a PB instance may call a protected PB#m on a PS < PB
+// instance, and asking "is self a PS" refused it
+and protected_ok_m = fn env -> fn world -> fn (cls: str) -> fn (name: str) ->
+  let own9 = lookup_anc world (ancestors_of world cls) name in
+  protected_ok env world (if str_eq own9 "" then cls else own9)
 and protected_ok = fn env -> fn world -> fn (cls: str) ->
   if lv_has env "self" then
     (let (meths, sup, ocls, ivars) = world in
@@ -37925,6 +38000,18 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
         | FBreak v -> FBreak v
         | FLoopNext v -> FLoopNext v
         | FNext v -> FNext v)
+     // a `defined?` whose value is discarded is not compiled at all by ruby
+     // (compile.c emits nothing for a popped NODE_DEFINED), so a receiver it
+     // names is not run: `defined?(DS.side_effects / 2)` as a statement has
+     // no side effects
+     // (and with $VERBOSE true ruby says so, as it does for every useless
+     // expression in void context)
+     | _ when (match s with SExpr (EDefined _) -> true | _ -> false) ->
+       (let _ = (if map_has globals (gvar_slot "VERBOSE")
+                    && (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
+                 then err_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: possibly useless use of defined? in void context")
+                 else ()) in
+        run_stmts env world blk rest)
      | _ ->
        // A REGION PER STATEMENT whose value is discarded -- every statement but
        // the last of a body. What a statement builds and throws away (the
@@ -39417,6 +39504,11 @@ and bare_yield_expr = fn (e: Expr) ->
   | ESplat a -> bare_yield_expr a
   | EKwSplat a -> bare_yield_expr a
   | EBlockPass a -> bare_yield_expr a
+  // `defined?(yield)` asks about the method's block without calling it, so a
+  // block literal holding it must carry that block too (blk_capture) -- but it
+  // is not a `yield` for the "Invalid yield" check, which ruby does not raise
+  // for it anywhere. The capture reader sets the flag.
+  | EDefined (EVar w) when str_eq w "yield" -> map_has yscan_defined "y"
   | EDefined a -> bare_yield_expr a
   | EAssign (_, a) -> bare_yield_expr a
   | EFlow (_, a) -> bare_yield_expr a
