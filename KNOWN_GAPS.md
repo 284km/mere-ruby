@@ -598,7 +598,7 @@ construction, so a browser sees every command as not found -- which it is.
 A File here is a path, a mode, a read position and a write buffer; the host
 interface reads and writes whole files. `fileno` therefore has nothing to
 answer, and it raises NotImplementedError rather than inventing a number --
-the same choice the UDP and UNIX sockets make. `flush`, `sync`, `sync=`,
+the same choice the UNIX sockets make. `flush`, `sync`, `sync=`,
 `tty?` and `isatty` are real: the buffer exists, so flushing it is a real
 operation, `sync = true` makes each write flush, and a file is not a terminal.
 
@@ -852,23 +852,66 @@ Linking real TLS would be a decision, not a gap: Mere has `tcp_starttls`
 (OpenSSL, native only), so the cost is a permanent libssl dependency that the
 Wasm target cannot carry.
 
-## `socket` speaks TCP, and only TCP
+## `socket`: the addresses are whole, a socket is what the fd primitives reach
 
-`TCPSocket`, `TCPServer`, `BasicSocket`, `IPSocket`, `Socket` (constants and
-`Socket.tcp`) and a minimal `Addrinfo` are real, over Mere's own socket FFI:
-connect, listen, accept, read, write, close, timeout. `UDPSocket`,
-`UNIXSocket` and `UNIXServer` exist — code that mentions them loads — but
-every one of their methods raises `NotImplementedError` rather than silently
-doing nothing.
+The ADDRESS half of CRuby's ext/socket is data, and it is all here: `Addrinfo`
+keeps the sockaddr as the C struct's bytes, its readers and predicates and
+`inspect` are raddrinfo.c's, `Socket::Option` and `Socket::AncillaryData` are
+their structs, and `Socket::Constants` is the pinned reference's table in
+mkconstants.rb's order. ruby/spec's addrinfo, option, ancillarydata and
+constants directories went from 0 of 64 files to 64 of 64 on that alone.
 
-Two known holes inside TCP itself:
+The SOCKET half is what can be done without handing the kernel a
+`struct sockaddr *`, which no extern here can spell:
 
-- **A listener cannot report the port it got.** `TCPServer.new(0)` binds an
-  ephemeral port, and there is no `getsockname` in the FFI to read it back, so
-  `#addr` answers 0. Tests that ask the kernel for a free port need a fixed one
-  here.
-- **There is no `select`.** A read blocks; `io/wait`'s `wait_readable` is the
-  identity and `ready?` answers nil rather than guessing.
+- **TCP, either family.** `TCPSocket`/`Socket#connect` go through
+  `tcp_connect` (the C library resolves, so a name works there); a listener
+  on port 0 is socket(2) + listen(2), which binds the wildcard of the family
+  itself; a chosen IPv4 port is `tcp_listen`. `TCPServer.new("127.0.0.1", 0)`
+  is therefore a listener on EVERY interface, and `#addr` / `#local_address`
+  say so -- 0.0.0.0 -- because that is the kernel's answer; ipsocket/addr_spec
+  asks for the requested address back and stays DIFF for it. A chosen port on
+  IPv6 is refused by name.
+- **getsockname / getpeername are read from outside**: lsof(8) on macOS,
+  /proc on Linux, the same shape File::Stat takes with stat(1). About 35 ms
+  per socket, asked once when the pair can no longer change. No lsof and no
+  /proc is a SocketError, never a guessed address.
+- **UDP, connected only.** `UDPSocket#connect` / `send` / `recv` are the
+  runtime's udp_open / send / recv. `#bind` and `#send` to an address need
+  bind(2) and sendto(2) and raise NotImplementedError, which is why
+  ipsocket/inspect_spec and ipsocket/recvfrom_spec (they receive on a bound
+  socket) stay DIFF.
+- **UNIX sockets** need a sockaddr_un for connect(2) and bind(2) and an array
+  for socketpair(2); they raise NotImplementedError. `Addrinfo.unix` and
+  `Socket.sockaddr_un` are data and work.
+- **`Socket#bind` is deferred** to the call that can honour it: listen(2)
+  binds the wildcard with the port asked for, and connect(2) takes the local
+  address the route gives -- and a requested local address the kernel did not
+  choose is refused after the fact rather than reported as bound.
+- **A read waits in IO's readiness loop**, so under the thread scheduler the
+  peer runs while a reader waits (a bare read(2) would stop the process).
+- **`connect` hands back a new descriptor.** The runtime's connect functions
+  make their own socket, so `Socket#connect` and `UDPSocket#connect` close the
+  one `new` made and carry the new one: `fileno` can change across a connect.
+- **Name resolution is the "files" half of the C library**: numeric hosts
+  (inet_pton, then inet_aton's forms), /etc/hosts and /etc/services, with
+  macOS's result order (DGRAM before STREAM, IPv6 before IPv4). There is no
+  DNS client, so a name only DNS knows is "nodename nor servname provided, or
+  not known" from `Addrinfo.getaddrinfo` -- while `TCPSocket.new` of the same
+  name, which resolves inside the C runtime, connects.
+- **The constants and the sockaddr layout are macOS's** (AF_INET6 = 30,
+  sin_len first), as fcntl's are. What reaches the kernel is translated
+  (socket(2) is asked for AF_INET6 as 10 on Linux), but a Linux program
+  printing `Socket::AF_INET6` sees 30.
+- **A connect cannot be given a deadline**: the runtime's connect(2) blocks.
+  A timeout of zero is answered without connecting (no connect completes in
+  no time; ruby's own nonblocking connect times out on it even over
+  loopback), and a positive one is not enforced -- the kernel's own connect
+  timeout applies.
+- SIGPIPE is ignored from the first socket on (sigignore(2)), so a write to a
+  peer that has gone is Errno::EPIPE rather than the end of the process.
+  Before, only a program that had run tcp_listen got that.
+- setsockopt accepts and ignores its options (it takes a pointer).
 
 ## `bigdecimal` is not implemented
 
@@ -3253,7 +3296,7 @@ exactly, because the other half would have to invent something:
 | `cgi` — escapeHTML, unescapeHTML, the URI encoders, escapeElement | the request-shaped instance methods `#params`, `#header`, `#out`, `#[]`: they need a request environment, and this process is not a CGI script. ⚠ `CGI.new` itself SUCCEEDS and hands back an object none of them answer for -- the one row here that fails somewhere other than the name you asked for |
 | `io/console` — `StringIO#getch` | `#getpass`: ruby consumes one character more than "a line without the newline", and a method that is close but not the same is a wrong answer where a missing one is an honest refusal |
 | `openssl` — `OpenSSL::Digest`, HMAC | TLS, X509, PKey: a gem should fail on the constant that names the missing capability, not load and fail somewhere else |
-| `socket` — TCPSocket, TCPServer | UDP and UNIX sockets EXIST and raise `NotImplementedError`, for the same reason |
+| `socket` — Addrinfo, Option, AncillaryData, constants; TCP in both families, connected UDP | bind(2)/sendto(2) to a chosen address and UNIX sockets EXIST and raise `NotImplementedError`, for the same reason (see the `socket` entry) |
 
 ⚠ Each of these was added because something failed by NAME rather than by
 behaviour: `require "fcntl"` on line four of core/io/reopen_spec took that

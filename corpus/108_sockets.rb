@@ -39,8 +39,9 @@ rescue Errno::ECONNREFUSED => e
   p e.class
 end
 
-# The sockets mere-ruby does not speak exist and refuse; ruby implements them,
-# so only their presence is compared here (what they raise is in KNOWN_GAPS).
+# UDP is spoken only connected, and UNIX sockets not at all (both need a
+# sockaddr handed to the kernel); ruby implements them, so only their presence
+# is compared here (what they refuse is in KNOWN_GAPS).
 p [defined?(UDPSocket), defined?(UNIXSocket), defined?(UNIXServer)]
 
 # Addrinfo carries the pair it was given

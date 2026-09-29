@@ -4122,11 +4122,18 @@ and shq_go = fn (s2: str) -> fn (i: int) -> fn (acc: str) ->
     shq_go s2 (i + 1) (acc ++ (if str_eq c "'" then "'\\''" else c))
 and stdlib_src = fn (name: str) ->
   let n = (if ends_with_rb name then substring name 0 (str_len name - 3) else name) in
-  // socket: TCPSocket / TCPServer over the interpreter's fd primitives, which
-  // are Mere's own TCP externs. UNIX and UDP sockets are NOT provided as
-  // working classes -- they exist and raise NotImplementedError, because a
-  // socket library that silently does nothing moves the failure away from its
-  // cause (see KNOWN_GAPS on `require "enumerator"`).
+  // socket: CRuby's ext/socket, ported. The address half is DATA and is
+  // whole -- Addrinfo keeps the sockaddr as the C struct's bytes (BSD
+  // layout), getaddrinfo is raddrinfo.c's numeric fast path and then the
+  // "files" half of the C library (/etc/hosts, /etc/services; no DNS client),
+  // Socket::Option and Socket::AncillaryData are their structs, and the
+  // constants are the pinned reference's. The socket half is what the fd
+  // primitives reach: TCP connect/listen/accept in either family, a connected
+  // UDP socket, and getsockname/getpeername read back from lsof(8) or /proc.
+  // What needs a sockaddr passed IN -- bind(2) to a chosen address, sendto(2),
+  // UNIX sockets -- raises NotImplementedError by name, because a socket
+  // library that silently does nothing moves the failure away from its cause
+  // (see KNOWN_GAPS on `require "enumerator"`).
   // openssl: the half of it that is a HASH FUNCTION, which mere-ruby already
   // ships -- OpenSSL::Digest over Digest, and HMAC written out in ruby (it is
   // two hashes and an xor). TLS, X509 and PKey are NOT defined, not even as
@@ -4916,22 +4923,71 @@ and stdlib_src = fn (name: str) ->
   else if str_eq n "socket" then
     "class SocketError < StandardError; end\n" ++
     "class BasicSocket\n" ++
+    "  # BasicSocket.do_not_reverse_lookup is ONE process-wide flag in CRuby, and a\n" ++
+    "  # socket copies it when it is made.\n" ++
+    "  @__dnrl = true\n" ++
+    "  def self.do_not_reverse_lookup\n" ++
+    "    BasicSocket.instance_variable_get(:@__dnrl)\n" ++
+    "  end\n" ++
+    "  def self.do_not_reverse_lookup=(v)\n" ++
+    "    BasicSocket.instance_variable_set(:@__dnrl, v ? true : false)\n" ++
+    "    v\n" ++
+    "  end\n" ++
+    "  # IO.open's contract: new, and with a block, yield and close\n" ++
+    "  def self.open(*args, **kw)\n" ++
+    "    s = kw.empty? ? new(*args) : new(*args, **kw)\n" ++
+    "    return s unless block_given?\n" ++
+    "    begin\n" ++
+    "      yield s\n" ++
+    "    ensure\n" ++
+    "      s.close unless s.closed?\n" ++
+    "    end\n" ++
+    "  end\n" ++
     "  def self.for_fd(fd)\n" ++
     "    s = allocate\n" ++
     "    s.__setup(fd)\n" ++
     "    s\n" ++
     "  end\n" ++
-    "  def __setup(fd)\n" ++
+    "  def __setup(fd, socktype = Socket::SOCK_STREAM)\n" ++
+    "    # SIGPIPE ignored, as ruby has it, before the first socket can be written\n" ++
+    "    unless BasicSocket.instance_variable_get(:@__nosig)\n" ++
+    "      Socket.__nosigpipe\n" ++
+    "      BasicSocket.instance_variable_set(:@__nosig, true)\n" ++
+    "    end\n" ++
     "    @fd = fd\n" ++
     "    @closed = false\n" ++
     "    @rbuf = \"\".b\n" ++
+    "    @socktype = socktype\n" ++
+    "    @do_not_reverse_lookup = BasicSocket.do_not_reverse_lookup\n" ++
     "    self\n" ++
+    "  end\n" ++
+    "  def __fd\n" ++
+    "    @fd\n" ++
+    "  end\n" ++
+    "  # what IO.select asks of what it is given (see IO.__sel_io)\n" ++
+    "  def __sel_fd\n" ++
+    "    @fd\n" ++
+    "  end\n" ++
+    "  def __sel_pending?\n" ++
+    "    !@rbuf.empty?\n" ++
+    "  end\n" ++
+    "  def do_not_reverse_lookup\n" ++
+    "    @do_not_reverse_lookup\n" ++
+    "  end\n" ++
+    "  def do_not_reverse_lookup=(v)\n" ++
+    "    @do_not_reverse_lookup = v ? true : false\n" ++
     "  end\n" ++
     "  def fileno\n" ++
     "    @fd\n" ++
     "  end\n" ++
+    "  def to_i\n" ++
+    "    @fd\n" ++
+    "  end\n" ++
     "  def closed?\n" ++
     "    @closed\n" ++
+    "  end\n" ++
+    "  def __check_open\n" ++
+    "    raise IOError, \"closed stream\" if @closed\n" ++
     "  end\n" ++
     "  def close\n" ++
     "    return nil if @closed\n" ++
@@ -4940,10 +4996,65 @@ and stdlib_src = fn (name: str) ->
     "    nil\n" ++
     "  end\n" ++
     "  def write(data)\n" ++
+    "    __check_open\n" ++
+    "    raise IOError, \"not opened for writing\" if @write_closed\n" ++
     "    s = data.to_s\n" ++
     "    n = Socket.__write(@fd, s)\n" ++
-    "    raise SocketError, \"write failed\" if n < 0\n" ++
+    "    __write_error(n) if n < 0\n" ++
     "    n\n" ++
+    "  end\n" ++
+    "  # the runtime's write codes: -1 would block, -2 the peer is gone (EPIPE,\n" ++
+    "  # ECONNRESET, ENOTCONN, ETIMEDOUT -- which of them is not visible), -3 any\n" ++
+    "  # other failure\n" ++
+    "  def __write_error(n)\n" ++
+    "    raise IO::EAGAINWaitWritable, \"write would block\" if n == -1\n" ++
+    "    raise Errno::EPIPE, \"write(2)\" if n == -2\n" ++
+    "    raise SocketError, \"write failed\"\n" ++
+    "  end\n" ++
+    "  # poll(2) for this descriptor with no wait: is it readable (or at its\n" ++
+    "  # end), writable, now?\n" ++
+    "  def __ready?(bits)\n" ++
+    "    (IO.__poll([@fd], [bits], 0)[0] & (bits == 1 ? 5 : 6)) != 0\n" ++
+    "  end\n" ++
+    "  def read_nonblock(len, buf = nil, exception: true)\n" ++
+    "    __check_readable\n" ++
+    "    if @rbuf.empty?\n" ++
+    "      unless __ready?(1)\n" ++
+    "        return :wait_readable unless exception\n" ++
+    "        raise IO::EAGAINWaitReadable, \"read would block\"\n" ++
+    "      end\n" ++
+    "      chunk = Socket.__read(@fd, 65536)\n" ++
+    "      if chunk.nil? || chunk.empty?\n" ++
+    "        return nil unless exception\n" ++
+    "        raise EOFError, \"end of file reached\"\n" ++
+    "      end\n" ++
+    "      @rbuf << chunk\n" ++
+    "    end\n" ++
+    "    out = @rbuf[0, len]\n" ++
+    "    @rbuf = @rbuf[out.bytesize, @rbuf.bytesize - out.bytesize] || \"\".b\n" ++
+    "    buf ? buf.replace(out) : out\n" ++
+    "  end\n" ++
+    "  def recv_nonblock(maxlen, flags = 0, buf = nil, exception: true)\n" ++
+    "    __check_readable\n" ++
+    "    if @rbuf.empty?\n" ++
+    "      unless __ready?(1)\n" ++
+    "        return :wait_readable unless exception\n" ++
+    "        raise IO::EAGAINWaitReadable, \"recvfrom(2) would block\"\n" ++
+    "      end\n" ++
+    "      chunk = Socket.__read(@fd, 65536)\n" ++
+    "      return nil if chunk.nil? || chunk.empty?\n" ++
+    "      @rbuf << chunk\n" ++
+    "    end\n" ++
+    "    recv(maxlen, flags, buf)\n" ++
+    "  end\n" ++
+    "  def write_nonblock(data, exception: true)\n" ++
+    "    __check_open\n" ++
+    "    raise IOError, \"not opened for writing\" if @write_closed\n" ++
+    "    unless __ready?(2)\n" ++
+    "      return :wait_writable unless exception\n" ++
+    "      raise IO::EAGAINWaitWritable, \"write would block\"\n" ++
+    "    end\n" ++
+    "    write(data)\n" ++
     "  end\n" ++
     "  def <<(data)\n" ++
     "    write(data)\n" ++
@@ -4974,17 +5085,27 @@ and stdlib_src = fn (name: str) ->
     "  def sync=(v)\n" ++
     "    v\n" ++
     "  end\n" ++
+    "  # setsockopt(2) takes a pointer, which nothing here can pass; the options\n" ++
+    "  # are accepted and not applied, as before.\n" ++
     "  def setsockopt(*args)\n" ++
-    "    nil\n" ++
+    "    0\n" ++
+    "  end\n" ++
+    "  # A read WAITS for readability first, through IO's readiness loop, so that\n" ++
+    "  # under the thread scheduler the other threads run while this one waits --\n" ++
+    "  # one of them may be the peer. A bare read(2) would stop the whole process.\n" ++
+    "  def __wait_readable\n" ++
+    "    IO.__sel_wait([[@fd, 1, self]], -1)\n" ++
     "  end\n" ++
     "  def __fill\n" ++
-    "    return false if @closed\n" ++
+    "    __check_readable\n" ++
+    "    __wait_readable\n" ++
     "    chunk = Socket.__read(@fd, 65536)\n" ++
     "    return false if chunk.nil? || chunk.empty?\n" ++
     "    @rbuf << chunk\n" ++
     "    true\n" ++
     "  end\n" ++
     "  def read(len = nil)\n" ++
+    "    __check_readable\n" ++
     "    if len.nil?\n" ++
     "      @rbuf << \"\" while __fill\n" ++
     "      out = @rbuf\n" ++
@@ -4998,21 +5119,32 @@ and stdlib_src = fn (name: str) ->
     "    out\n" ++
     "  end\n" ++
     "  def readpartial(maxlen)\n" ++
+    "    __check_readable\n" ++
     "    __fill if @rbuf.empty?\n" ++
     "    raise EOFError, \"end of file reached\" if @rbuf.empty?\n" ++
     "    read(maxlen < @rbuf.bytesize ? maxlen : @rbuf.bytesize)\n" ++
     "  end\n" ++
-    "  def recv(maxlen)\n" ++
-    "    readpartial(maxlen)\n" ++
+    "  # recv(2) on a stream: what has arrived, up to maxlen, and \"\" at end of\n" ++
+    "  # stream. MSG_PEEK leaves it in the buffer for the next read.\n" ++
+    "  def recv(maxlen, flags = 0, outbuf = nil)\n" ++
+    "    __check_readable\n" ++
+    "    __fill if @rbuf.empty?\n" ++
+    "    # a stream at its end answers nil, not \"\" (rsock_s_recvfrom)\n" ++
+    "    return nil if @rbuf.empty? && maxlen > 0\n" ++
+    "    out = @rbuf[0, maxlen] || \"\".b\n" ++
+    "    @rbuf = @rbuf[out.bytesize, @rbuf.bytesize - out.bytesize] || \"\".b if (flags.to_i & Socket::MSG_PEEK) == 0\n" ++
+    "    outbuf ? outbuf.replace(out) : out\n" ++
     "  end\n" ++
-    "  def send(data, flags = 0)\n" ++
+    "  def send(data, flags = 0, *dest)\n" ++
     "    write(data)\n" ++
     "  end\n" ++
     "  def eof?\n" ++
+    "    __check_readable\n" ++
     "    return false unless @rbuf.empty?\n" ++
     "    !__fill\n" ++
     "  end\n" ++
     "  def gets(sep = \"\\n\")\n" ++
+    "    __check_readable\n" ++
     "    i = @rbuf.index(sep)\n" ++
     "    while i.nil?\n" ++
     "      break unless __fill\n" ++
@@ -5037,125 +5169,1761 @@ and stdlib_src = fn (name: str) ->
     "    Socket.__timeout(@fd, (sec * 1000).to_i)\n" ++
     "    sec\n" ++
     "  end\n" ++
-    "end\n" ++
-    "class IPSocket < BasicSocket\n" ++
-    "  def addr\n" ++
-    "    [\"AF_INET\", @port.to_i, @host.to_s, @host.to_s]\n" ++
+    "  def shutdown(how = Socket::SHUT_RDWR)\n" ++
+    "    __check_open\n" ++
+    "    h = how.is_a?(Integer) ? how : Socket::Constants.__name_to_int(how, /\\ASHUT_/, /\\ASHUT_/, \"unknown shutdown argument\")\n" ++
+    "    raise ArgumentError, \"`how' should be either :SHUT_RD, :SHUT_WR, :SHUT_RDWR\" unless (0..2).include?(h)\n" ++
+    "    if Socket.__shutdown(@fd, h) < 0\n" ++
+    "      raise Errno::ENOTCONN, \"shutdown(2)\"\n" ++
+    "    end\n" ++
+    "    0\n" ++
     "  end\n" ++
-    "  def peeraddr\n" ++
+    "  # Each half closes on its own, and closing the second closes the socket.\n" ++
+    "  def close_read\n" ++
+    "    __check_open\n" ++
+    "    return close if @write_closed\n" ++
+    "    Socket.__shutdown(@fd, Socket::SHUT_RD)\n" ++
+    "    @read_closed = true\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def close_write\n" ++
+    "    __check_open\n" ++
+    "    return close if @read_closed\n" ++
+    "    Socket.__shutdown(@fd, Socket::SHUT_WR)\n" ++
+    "    @write_closed = true\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def __check_readable\n" ++
+    "    __check_open\n" ++
+    "    raise IOError, \"not opened for reading\" if @read_closed\n" ++
+    "    # read(2) on a listening socket is ENOTCONN; waiting for it to become\n" ++
+    "    # readable would wait for a connection instead\n" ++
+    "    raise Errno::ENOTCONN, \"read(2)\" if @listening\n" ++
+    "  end\n" ++
+    "  # The kernel's own answer to getsockname(2) / getpeername(2), read from\n" ++
+    "  # outside (see Socket::Endpoint__): once a socket is listening or connected\n" ++
+    "  # the pair cannot change, so it is asked once.\n" ++
+    "  def __endpoints\n" ++
+    "    return @__ep if @__ep\n" ++
+    "    ep = Socket::Endpoint__.of(@fd)\n" ++
+    "    @__ep = ep if ep && (ep[:remote] || ep[:listening])\n" ++
+    "    ep\n" ++
+    "  end\n" ++
+    "  def local_address\n" ++
+    "    __check_open\n" ++
+    "    ep = __endpoints\n" ++
+    "    raise SocketError, \"cannot read the local address of this socket\" unless ep\n" ++
+    "    Socket::Endpoint__.addrinfo(ep[:family], ep[:local], @socktype)\n" ++
+    "  end\n" ++
+    "  def remote_address\n" ++
+    "    __check_open\n" ++
+    "    ep = __endpoints\n" ++
+    "    if ep.nil? || ep[:remote].nil?\n" ++
+    "      raise Errno::ENOTCONN, \"getpeername(2)\"\n" ++
+    "    end\n" ++
+    "    Socket::Endpoint__.addrinfo(ep[:family], ep[:remote], @socktype)\n" ++
+    "  end\n" ++
+    "  def getsockname\n" ++
+    "    local_address.to_sockaddr\n" ++
+    "  end\n" ++
+    "  def getpeername\n" ++
+    "    remote_address.to_sockaddr\n" ++
+    "  end\n" ++
+    "  def connect_address\n" ++
+    "    addr = local_address\n" ++
+    "    afamily = addr.afamily\n" ++
+    "    if afamily == Socket::AF_INET\n" ++
+    "      raise SocketError, \"unbound IPv4 socket\" if addr.ip_port == 0\n" ++
+    "      if addr.ip_address == \"0.0.0.0\"\n" ++
+    "        addr = Addrinfo.new([\"AF_INET\", addr.ip_port, nil, \"127.0.0.1\"], addr.pfamily, addr.socktype, addr.protocol)\n" ++
+    "      end\n" ++
+    "    elsif afamily == Socket::AF_INET6\n" ++
+    "      raise SocketError, \"unbound IPv6 socket\" if addr.ip_port == 0\n" ++
+    "      if addr.ip_address == \"::\" || addr.ip_address == \"0.0.0.0\" || addr.ip_address == \"::ffff:0.0.0.0\"\n" ++
+    "        addr = Addrinfo.new([\"AF_INET6\", addr.ip_port, nil, \"::1\"], addr.pfamily, addr.socktype, addr.protocol)\n" ++
+    "      end\n" ++
+    "    elsif afamily == Socket::AF_UNIX\n" ++
+    "      raise SocketError, \"unbound Unix socket\" if addr.unix_path == \"\"\n" ++
+    "    end\n" ++
     "    addr\n" ++
     "  end\n" ++
     "end\n" ++
-    "class TCPSocket < IPSocket\n" ++
-    "  def initialize(host = nil, port = nil, local_host = nil, local_port = nil)\n" ++
-    "    @host = host\n" ++
-    "    @port = port\n" ++
-    "    fd = Socket.__connect(host.to_s, port.to_i)\n" ++
-    "    if fd < 0\n" ++
-    "      raise Errno::ECONNREFUSED, \"Connection refused - connect(2) for #\{host}:#\{port}\"\n" ++
+    "\n" ++
+    "class IPSocket < BasicSocket\n" ++
+    "  def self.getaddress(host)\n" ++
+    "    Addrinfo.__getaddrinfo(host, nil, 0, 0, 0, 0, false)[0].ip_address\n" ++
+    "  end\n" ++
+    "  def __reverse?(arg)\n" ++
+    "    case arg\n" ++
+    "    when nil then !@do_not_reverse_lookup\n" ++
+    "    when true, :hostname then true\n" ++
+    "    when false, :numeric then false\n" ++
+    "    else raise ArgumentError, \"invalid reverse_lookup flag: #\{arg.inspect}\"\n" ++
     "    end\n" ++
-    "    __setup(fd)\n" ++
+    "  end\n" ++
+    "  def __ipaddr(ai, reverse)\n" ++
+    "    host = reverse ? Addrinfo.__reverse_name(ai) : ai.ip_address\n" ++
+    "    [ai.ipv6? ? \"AF_INET6\" : \"AF_INET\", ai.ip_port, host, ai.ip_address]\n" ++
+    "  end\n" ++
+    "  def addr(reverse_lookup = nil)\n" ++
+    "    rev = __reverse?(reverse_lookup)\n" ++
+    "    __ipaddr(local_address, rev)\n" ++
+    "  end\n" ++
+    "  def peeraddr(reverse_lookup = nil)\n" ++
+    "    rev = __reverse?(reverse_lookup)\n" ++
+    "    __ipaddr(remote_address, rev)\n" ++
+    "  end\n" ++
+    "  def recvfrom(maxlen, flags = 0)\n" ++
+    "    data = recv(maxlen, flags)\n" ++
+    "    return nil if data.nil?\n" ++
+    "    [data, peeraddr]\n" ++
+    "  end\n" ++
+    "  def inspect\n" ++
+    "    return \"#<#\{self.class}:(closed)>\" if @closed\n" ++
+    "    a = local_address\n" ++
+    "    \"#<#\{self.class}:fd #\{@fd}, #\{a.ipv6? ? 'AF_INET6' : 'AF_INET'}, #\{a.ip_address}, #\{a.ip_port}>\"\n" ++
     "  end\n" ++
     "end\n" ++
-    "class TCPServer < TCPSocket\n" ++
-    "  def initialize(host = nil, port = nil)\n" ++
-    "    port = host if port.nil?\n" ++
-    "    @host = \"0.0.0.0\"\n" ++
-    "    @port = port.to_i\n" ++
-    "    fd = Socket.__listen(@port)\n" ++
-    "    raise Errno::EADDRINUSE, \"Address already in use - bind(2) for port #\{port}\" if fd < 0\n" ++
-    "    @port = Socket.__port(fd) if @port == 0\n" ++
+    "\n" ++
+    "class TCPSocket < IPSocket\n" ++
+    "  def self.gethostbyname(host)\n" ++
+    "    list = Addrinfo.__getaddrinfo(host, nil, 0, Socket::SOCK_STREAM, 0, Socket::AI_CANONNAME, false)\n" ++
+    "    names = [list[0].canonname || host, []]\n" ++
+    "    fam = list[0].afamily\n" ++
+    "    [names[0], [], fam, *list.map(&:ip_address)]\n" ++
+    "  end\n" ++
+    "  # A connect here is the runtime's blocking connect(2): it cannot be given\n" ++
+    "  # a deadline. A deadline of zero is the one that is known in advance -- no\n" ++
+    "  # connect completes in no time, and ruby's own nonblocking connect times out\n" ++
+    "  # on it even over loopback -- so it is answered without connecting. A\n" ++
+    "  # positive one is not enforced (KNOWN_GAPS).\n" ++
+    "  def initialize(host, port, local_host = nil, local_port = nil, connect_timeout: nil, open_timeout: nil, resolv_timeout: nil, fast_fallback: true)\n" ++
+    "    @host = host\n" ++
+    "    @port = port\n" ++
+    "    t = open_timeout || connect_timeout\n" ++
+    "    raise IO::TimeoutError, \"user specified timeout for #\{host}:#\{port}\" if t && t <= 0\n" ++
+    "    fd = Socket.__connect(host.to_s, Addrinfo.__port_of(port, \"tcp\"))\n" ++
+    "    if fd < 0\n" ++
+    "      raise Errno::ECONNREFUSED, \"connect(2) for #\{host}:#\{port}\"\n" ++
+    "    end\n" ++
     "    __setup(fd)\n" ++
+    "    Socket::Endpoint__.check_local(self, local_host, local_port) if local_host || local_port\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "class TCPServer < TCPSocket\n" ++
+    "  # A listener is the WILDCARD of its family: bind(2) needs a sockaddr, and the\n" ++
+    "  # two ways to get a listening socket here -- tcp_listen(port) and listen(2)\n" ++
+    "  # on a socket nothing has bound -- both take the whole host. So a server made\n" ++
+    "  # for 127.0.0.1 also answers on the other interfaces, and #addr says so\n" ++
+    "  # (0.0.0.0), which is what the kernel says. A chosen port on IPv6 has no\n" ++
+    "  # door at all and is refused rather than quietly served over IPv4.\n" ++
+    "  def initialize(host = nil, port = nil)\n" ++
+    "    port, host = host, nil if port.nil?\n" ++
+    "    portnum = Addrinfo.__port_of(port, \"tcp\")\n" ++
+    "    v6 = false\n" ++
+    "    if host && host != \"\"\n" ++
+    "      ai = Addrinfo.__getaddrinfo(host, nil, 0, Socket::SOCK_STREAM, 0, Socket::AI_PASSIVE, false)[0]\n" ++
+    "      v6 = ai.ipv6?\n" ++
+    "    end\n" ++
+    "    fd = Socket::Endpoint__.listen_on(v6 ? Socket::AF_INET6 : Socket::AF_INET, portnum, Socket::SOMAXCONN)\n" ++
+    "    __setup(fd)\n" ++
+    "    @listening = true\n" ++
     "  end\n" ++
     "  def accept\n" ++
+    "    __check_open\n" ++
+    "    __wait_readable\n" ++
     "    fd = Socket.__accept(@fd)\n" ++
     "    raise SocketError, \"accept failed\" if fd < 0\n" ++
     "    TCPSocket.for_fd(fd)\n" ++
     "  end\n" ++
-    "  def accept_nonblock\n" ++
+    "  def accept_nonblock(exception: true)\n" ++
+    "    __check_open\n" ++
+    "    unless __ready?(1)\n" ++
+    "      return :wait_readable unless exception\n" ++
+    "      raise IO::EAGAINWaitReadable, \"accept(2) would block\"\n" ++
+    "    end\n" ++
     "    accept\n" ++
+    "  end\n" ++
+    "  def sysaccept\n" ++
+    "    __check_open\n" ++
+    "    __wait_readable\n" ++
+    "    fd = Socket.__accept(@fd)\n" ++
+    "    raise SocketError, \"accept failed\" if fd < 0\n" ++
+    "    fd\n" ++
     "  end\n" ++
     "  def listen(backlog)\n" ++
     "    0\n" ++
     "  end\n" ++
-    "  def addr\n" ++
-    "    [\"AF_INET\", @port.to_i, \"0.0.0.0\", \"0.0.0.0\"]\n" ++
-    "  end\n" ++
     "end\n" ++
-    "class Socket < BasicSocket\n" ++
-    "  AF_UNSPEC = 0\n" ++
-    "  AF_UNIX = 1\n" ++
-    "  AF_INET = 2\n" ++
-    "  AF_INET6 = 30\n" ++
-    "  PF_UNSPEC = 0\n" ++
-    "  PF_UNIX = 1\n" ++
-    "  PF_INET = 2\n" ++
-    "  PF_INET6 = 30\n" ++
-    "  SOCK_STREAM = 1\n" ++
-    "  SOCK_DGRAM = 2\n" ++
-    "  SOL_SOCKET = 65535\n" ++
-    "  SO_REUSEADDR = 4\n" ++
-    "  SO_KEEPALIVE = 8\n" ++
-    "  IPPROTO_TCP = 6\n" ++
-    "  IPPROTO_UDP = 17\n" ++
-    "  TCP_NODELAY = 1\n" ++
-    "  SHUT_RD = 0\n" ++
-    "  SHUT_WR = 1\n" ++
-    "  SHUT_RDWR = 2\n" ++
-    "  def self.tcp(host, port)\n" ++
-    "    s = TCPSocket.new(host, port)\n" ++
-    "    return s unless block_given?\n" ++
-    "    begin\n" ++
-    "      yield s\n" ++
-    "    ensure\n" ++
-    "      s.close\n" ++
-    "    end\n" ++
-    "  end\n" ++
-    "  def self.gethostname\n" ++
-    "    \"localhost\"\n" ++
-    "  end\n" ++
-    "end\n" ++
-    "class Addrinfo\n" ++
-    "  def self.tcp(host, port)\n" ++
-    "    new(host, port)\n" ++
-    "  end\n" ++
-    "  def initialize(host, port)\n" ++
-    "    @host = host\n" ++
-    "    @port = port\n" ++
-    "  end\n" ++
-    "  def ip_address\n" ++
-    "    @host.to_s\n" ++
-    "  end\n" ++
-    "  def ip_port\n" ++
-    "    @port.to_i\n" ++
-    "  end\n" ++
-    "  def afamily\n" ++
-    "    Socket::AF_INET\n" ++
-    "  end\n" ++
-    "  def pfamily\n" ++
-    "    Socket::PF_INET\n" ++
-    "  end\n" ++
-    "  def socktype\n" ++
-    "    Socket::SOCK_STREAM\n" ++
-    "  end\n" ++
-    "  def to_s\n" ++
-    "    \"#\{@host}:#\{@port}\"\n" ++
-    "  end\n" ++
-    "  def inspect\n" ++
-    "    \"#<Addrinfo: #\{@host}:#\{@port} TCP>\"\n" ++
-    "  end\n" ++
-    "end\n" ++
+    "\n" ++
     "class UDPSocket < IPSocket\n" ++
-    "  def initialize(*args)\n" ++
-    "    raise NotImplementedError, \"UDPSocket is not implemented (mere-ruby speaks TCP only)\"\n" ++
+    "  # A datagram socket here can be CONNECTED -- udp_open is socket + connect --\n" ++
+    "  # and then send and receive; bind(2) and sendto(2) take a sockaddr, so a\n" ++
+    "  # socket that must receive on a chosen address is refused by name.\n" ++
+    "  def initialize(family = Socket::AF_INET)\n" ++
+    "    fam = Socket::Constants.__family_arg(family)\n" ++
+    "    fd = Socket.__socket(Socket::Endpoint__.kernel_family(fam), Socket::SOCK_DGRAM, 0)\n" ++
+    "    raise Errno::EAFNOSUPPORT, \"socket(2) - udp\" if fd < 0\n" ++
+    "    @family = fam\n" ++
+    "    __setup(fd, Socket::SOCK_DGRAM)\n" ++
+    "  end\n" ++
+    "  def bind(host, port)\n" ++
+    "    raise NotImplementedError, \"UDPSocket#bind is not implemented (mere-ruby cannot pass a sockaddr to bind(2))\"\n" ++
+    "  end\n" ++
+    "  def connect(host, port)\n" ++
+    "    __check_open\n" ++
+    "    fd = Socket.__udp_open(host.to_s, Addrinfo.__port_of(port, \"udp\"))\n" ++
+    "    raise Errno::ECONNREFUSED, \"connect(2) for #\{host}:#\{port}\" if fd < 0\n" ++
+    "    Socket.__close(@fd)\n" ++
+    "    @fd = fd\n" ++
+    "    @__ep = nil\n" ++
+    "    0\n" ++
+    "  end\n" ++
+    "  def send(mesg, flags = 0, host = nil, port = nil)\n" ++
+    "    __check_open\n" ++
+    "    if host\n" ++
+    "      raise NotImplementedError, \"UDPSocket#send to an address is not implemented (sendto(2) takes a sockaddr)\"\n" ++
+    "    end\n" ++
+    "    n = Socket.__udp_send(@fd, mesg.to_s)\n" ++
+    "    raise Errno::EDESTADDRREQ, \"send(2)\" if n < 0\n" ++
+    "    n\n" ++
+    "  end\n" ++
+    "  def write(mesg)\n" ++
+    "    send(mesg)\n" ++
+    "  end\n" ++
+    "  def recv(maxlen, flags = 0, outbuf = nil)\n" ++
+    "    __check_open\n" ++
+    "    __wait_readable\n" ++
+    "    d = Socket.__udp_recv(@fd, maxlen)\n" ++
+    "    raise Errno::EAGAIN, \"recvfrom(2)\" if d.nil?\n" ++
+    "    outbuf ? outbuf.replace(d) : d\n" ++
     "  end\n" ++
     "end\n" ++
+    "\n" ++
     "class UNIXSocket < BasicSocket\n" ++
     "  def initialize(*args)\n" ++
-    "    raise NotImplementedError, \"UNIXSocket is not implemented (mere-ruby speaks TCP only)\"\n" ++
+    "    raise NotImplementedError, \"UNIXSocket is not implemented (mere-ruby cannot pass a sockaddr_un to connect(2))\"\n" ++
+    "  end\n" ++
+    "  def self.pair(*args)\n" ++
+    "    raise NotImplementedError, \"UNIXSocket.pair is not implemented (socketpair(2) fills an array)\"\n" ++
+    "  end\n" ++
+    "  def self.socketpair(*args)\n" ++
+    "    pair(*args)\n" ++
     "  end\n" ++
     "end\n" ++
     "class UNIXServer < UNIXSocket\n" ++
+    "end\n" ++
+    "\n" ++
+    "class Socket < BasicSocket\n" ++
+    "  module Constants\n" ++
+    "    def self.__table\n" ++
+    "      @__table ||= begin\n" ++
+    "        h = \{}\n" ++
+    "        Socket::Constants.__order.each \{ |n| h[n] = Socket::Constants.const_get(n) }\n" ++
+    "        h\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    def self.__order\n" ++
+    "      @__order\n" ++
+    "    end\n" ++
+    "    @__order = []\n" ++
+    "    \"SOCK_STREAM=1 SOCK_DGRAM=2 SOCK_RAW=3 SOCK_RDM=4 SOCK_SEQPACKET=5 AF_UNSPEC=0 PF_UNSPEC=0 AF_INET=2 PF_INET=2 AF_INET6=30 PF_INET6=30 AF_UNIX=1 PF_UNIX=1 AF_IPX=23 PF_IPX=23 AF_APPLETALK=16 PF_APPLETALK=16 AF_LOCAL=1 PF_LOCAL=1 AF_IMPLINK=3 PF_IMPLINK=3 AF_PUP=4 PF_PUP=4 AF_CHAOS=5 PF_CHAOS=5 AF_NS=6 PF_NS=6 AF_ISO=7 PF_ISO=7 AF_OSI=7 PF_OSI=7 AF_ECMA=8 PF_ECMA=8 AF_DATAKIT=9 PF_DATAKIT=9 AF_CCITT=10 PF_CCITT=10 AF_SNA=11 PF_SNA=11 AF_DECnet=12 PF_DECnet=12 AF_DLI=13 PF_DLI=13 AF_LAT=14 PF_LAT=14 AF_HYLINK=15 PF_HYLINK=15 AF_ROUTE=17 PF_ROUTE=17 AF_LINK=18 PF_LINK=18 AF_COIP=20 PF_COIP=20 AF_CNT=21 PF_CNT=21 AF_SIP=24 PF_SIP=24 AF_NDRV=27 PF_NDRV=27 AF_ISDN=28 PF_ISDN=28 AF_NATM=31 PF_NATM=31 AF_SYSTEM=32 PF_SYSTEM=32 AF_NETBIOS=33 PF_NETBIOS=33 AF_PPP=34 PF_PPP=34 AF_MAX=41 PF_MAX=41 AF_E164=28 PF_XTP=19 PF_RTIP=22 PF_PIP=25 PF_KEY=29 AF_VSOCK=40 PF_VSOCK=40 MSG_OOB=1 MSG_PEEK=2 MSG_DONTROUTE=4 MSG_EOR=8 MSG_TRUNC=16 MSG_CTRUNC=32 MSG_WAITALL=64 MSG_DONTWAIT=128 MSG_EOF=256 MSG_FLUSH=1024 MSG_HOLD=2048 MSG_SEND=4096 MSG_HAVEMORE=8192 MSG_RCVMORE=16384 MSG_NOSIGNAL=524288 SOL_SOCKET=65535 IPPROTO_IP=0 IPPROTO_ICMP=1 IPPROTO_IGMP=2 IPPROTO_GGP=3 IPPROTO_TCP=6 IPPROTO_EGP=8 IPPROTO_PUP=12 IPPROTO_UDP=17 IPPROTO_IDP=22 IPPROTO_HELLO=63 IPPROTO_ND=77 IPPROTO_TP=29 IPPROTO_XTP=36 IPPROTO_EON=80 IPPROTO_AH=51 IPPROTO_DSTOPTS=60 IPPROTO_ESP=50 IPPROTO_FRAGMENT=44 IPPROTO_HOPOPTS=0 IPPROTO_ICMPV6=58 IPPROTO_IPV6=41 IPPROTO_NONE=59 IPPROTO_ROUTING=43 IPPROTO_RAW=255 IPPROTO_MAX=256 IPPORT_RESERVED=1024 IPPORT_USERRESERVED=5000 INADDR_ANY=0 INADDR_BROADCAST=4294967295 INADDR_LOOPBACK=2130706433 INADDR_UNSPEC_GROUP=3758096384 INADDR_ALLHOSTS_GROUP=3758096385 INADDR_MAX_LOCAL_GROUP=3758096639 INADDR_NONE=4294967295 IP_OPTIONS=1 IP_HDRINCL=2 IP_TOS=3 IP_TTL=4 IP_RECVOPTS=5 IP_RECVRETOPTS=6 IP_RECVDSTADDR=7 IP_RETOPTS=8 IP_DONTFRAG=28 IP_RECVTTL=24 IP_RECVIF=20 IP_PORTRANGE=19 IP_MULTICAST_IF=9 IP_MULTICAST_TTL=10 IP_MULTICAST_LOOP=11 IP_ADD_MEMBERSHIP=12 IP_DROP_MEMBERSHIP=13 IP_DEFAULT_MULTICAST_TTL=1 IP_DEFAULT_MULTICAST_LOOP=1 IP_MAX_MEMBERSHIPS=4095 IP_PKTINFO=26 IP_RECVTOS=27 IP_IPSEC_POLICY=21 IP_UNBLOCK_SOURCE=73 IP_BLOCK_SOURCE=72 IP_ADD_SOURCE_MEMBERSHIP=70 IP_DROP_SOURCE_MEMBERSHIP=71 IP_MSFILTER=74 MCAST_JOIN_GROUP=80 MCAST_BLOCK_SOURCE=84 MCAST_UNBLOCK_SOURCE=85 MCAST_LEAVE_GROUP=81 MCAST_JOIN_SOURCE_GROUP=82 MCAST_LEAVE_SOURCE_GROUP=83 MCAST_EXCLUDE=2 MCAST_INCLUDE=1 SO_DEBUG=1 SO_REUSEADDR=4 SO_REUSEPORT=512 SO_TYPE=4104 SO_ERROR=4103 SO_DONTROUTE=16 SO_BROADCAST=32 SO_SNDBUF=4097 SO_RCVBUF=4098 SO_KEEPALIVE=8 SO_OOBINLINE=256 SO_LINGER=128 SO_RCVLOWAT=4100 SO_SNDLOWAT=4099 SO_RCVTIMEO=4102 SO_SNDTIMEO=4101 SO_ACCEPTCONN=2 SO_USELOOPBACK=64 SO_DONTTRUNC=8192 SO_WANTMORE=16384 SO_WANTOOBFLAG=32768 SO_NREAD=4128 SO_NKE=4129 SO_NOSIGPIPE=4130 SO_BINDTODEVICE=4404 SO_TIMESTAMP=1024 TCP_NODELAY=1 TCP_MAXSEG=2 TCP_CONNECTION_INFO=262 TCP_KEEPALIVE=16 TCP_KEEPCNT=258 TCP_KEEPINTVL=257 TCP_NOOPT=8 TCP_NOPUSH=4 TCP_FASTOPEN=261 EAI_ADDRFAMILY=1 EAI_AGAIN=2 EAI_BADFLAGS=3 EAI_FAIL=4 EAI_FAMILY=5 EAI_MEMORY=6 EAI_NODATA=7 EAI_NONAME=8 EAI_OVERFLOW=14 EAI_SERVICE=9 EAI_SOCKTYPE=10 EAI_SYSTEM=11 EAI_BADHINTS=12 EAI_PROTOCOL=13 EAI_MAX=15 AI_PASSIVE=1 AI_CANONNAME=2 AI_NUMERICHOST=4 AI_NUMERICSERV=4096 AI_MASK=5127 AI_ALL=256 AI_V4MAPPED_CFG=512 AI_ADDRCONFIG=1024 AI_V4MAPPED=2048 AI_DEFAULT=1536 NI_MAXHOST=1025 NI_MAXSERV=32 NI_NOFQDN=1 NI_NUMERICHOST=2 NI_NAMEREQD=4 NI_NUMERICSERV=8 NI_DGRAM=16 SHUT_RD=0 SHUT_WR=1 SHUT_RDWR=2 IPV6_JOIN_GROUP=12 IPV6_LEAVE_GROUP=13 IPV6_MULTICAST_HOPS=10 IPV6_MULTICAST_IF=9 IPV6_MULTICAST_LOOP=11 IPV6_UNICAST_HOPS=4 IPV6_V6ONLY=27 IPV6_CHECKSUM=26 IPV6_DONTFRAG=62 IPV6_DSTOPTS=50 IPV6_HOPLIMIT=47 IPV6_HOPOPTS=49 IPV6_NEXTHOP=48 IPV6_PATHMTU=44 IPV6_PKTINFO=46 IPV6_RECVDSTOPTS=40 IPV6_RECVHOPLIMIT=37 IPV6_RECVHOPOPTS=39 IPV6_RECVPKTINFO=61 IPV6_RECVRTHDR=38 IPV6_RECVTCLASS=35 IPV6_RTHDR=51 IPV6_RTHDRDSTOPTS=57 IPV6_RTHDR_TYPE_0=0 IPV6_RECVPATHMTU=43 IPV6_TCLASS=36 IPV6_USE_MIN_MTU=42 INET_ADDRSTRLEN=16 INET6_ADDRSTRLEN=46 IFNAMSIZ=16 IF_NAMESIZE=16 SOMAXCONN=128 SCM_RIGHTS=1 SCM_TIMESTAMP=2 SCM_CREDS=3 LOCAL_PEERCRED=1 IFF_ALLMULTI=512 IFF_ALTPHYS=16384 IFF_BROADCAST=2 IFF_DEBUG=4 IFF_LINK0=4096 IFF_LINK1=8192 IFF_LINK2=16384 IFF_LOOPBACK=8 IFF_MULTICAST=32768 IFF_NOARP=128 IFF_NOTRAILERS=32 IFF_OACTIVE=1024 IFF_POINTOPOINT=16 IFF_PROMISC=256 IFF_RUNNING=64 IFF_SIMPLEX=2048 IFF_UP=1\".split.each do |kv|\n" ++
+    "      k, v = kv.split(\"=\")\n" ++
+    "      const_set(k, v.to_i)\n" ++
+    "      @__order << k\n" ++
+    "    end\n" ++
+    "    # NUM2INT for the socket library: an Integer, a Float truncated, #to_int,\n" ++
+    "    # and otherwise the TypeError ruby's own conversion raises.\n" ++
+    "    def self.__int(v)\n" ++
+    "      return v if v.is_a?(Integer)\n" ++
+    "      return v.to_i if v.is_a?(Float)\n" ++
+    "      raise TypeError, \"no implicit conversion from nil to integer\" if v.nil?\n" ++
+    "      raise TypeError, \"no implicit conversion of #\{v.class} into Integer\" unless v.respond_to?(:to_int)\n" ++
+    "      v.to_int\n" ++
+    "    end\n" ++
+    "    # constdefs.c's name_to_int: the full constant name, or (where the\n" ++
+    "    # table has an optional prefix) the name with that prefix taken off.\n" ++
+    "    def self.__lookup(name, pat, prefix)\n" ++
+    "      t = __table\n" ++
+    "      return t[name] if pat =~ name && t.key?(name)\n" ++
+    "      if prefix\n" ++
+    "        __order.each do |c|\n" ++
+    "          next unless pat =~ c\n" ++
+    "          m = prefix.match(c)\n" ++
+    "          return t[c] if m && m.post_match == name\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      nil\n" ++
+    "    end\n" ++
+    "    # constants.c's constant_arg: a Symbol or a String (or anything with\n" ++
+    "    # #to_str) is a NAME and must be one; anything else is an Integer.\n" ++
+    "    def self.__name_to_int(arg, pat, prefix, errmsg)\n" ++
+    "      if arg.is_a?(Symbol)\n" ++
+    "        s = arg.to_s\n" ++
+    "      elsif arg.is_a?(String)\n" ++
+    "        s = arg\n" ++
+    "      elsif arg.respond_to?(:to_str)\n" ++
+    "        s = arg.to_str\n" ++
+    "      else\n" ++
+    "        return Socket::Constants.__int(arg)\n" ++
+    "      end\n" ++
+    "      v = __lookup(s, pat, prefix)\n" ++
+    "      raise SocketError, \"#\{errmsg}: #\{s}\" if v.nil?\n" ++
+    "      v\n" ++
+    "    end\n" ++
+    "    # ...and the reverse, constdefs.c's intern: the FIRST name (in the order\n" ++
+    "    # mkconstants lists them) that has the value, with the prefix taken off\n" ++
+    "    # when the table has one.\n" ++
+    "    def self.__intern(val, pat, prefix = nil)\n" ++
+    "      __order.each do |c|\n" ++
+    "        next unless pat =~ c && __table[c] == val\n" ++
+    "        if prefix\n" ++
+    "          m = prefix.match(c)\n" ++
+    "          next unless m\n" ++
+    "          return m.post_match\n" ++
+    "        end\n" ++
+    "        return c\n" ++
+    "      end\n" ++
+    "      nil\n" ++
+    "    end\n" ++
+    "    def self.__family_arg(v)\n" ++
+    "      __name_to_int(v, /\\A(AF_|PF_)/, /\\AAF_/, \"unknown socket domain\")\n" ++
+    "    end\n" ++
+    "    def self.__socktype_arg(v)\n" ++
+    "      __name_to_int(v, /\\ASOCK_/, /\\ASOCK_/, \"unknown socket type\")\n" ++
+    "    end\n" ++
+    "    def self.__ip_family?(f)\n" ++
+    "      f == Socket::AF_INET || f == Socket::AF_INET6\n" ++
+    "    end\n" ++
+    "    def self.__level_arg(family, v)\n" ++
+    "      if __ip_family?(family)\n" ++
+    "        __name_to_int(v, /\\A(SOL_SOCKET\\z|IPPROTO_)/, /\\A(SOL_|IPPROTO_)/, \"unknown protocol level\")\n" ++
+    "      else\n" ++
+    "        __name_to_int(v, /\\ASOL_SOCKET\\z/, /\\ASOL_/, \"unknown protocol level\")\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    # the option-name table of each level, and what its error calls it\n" ++
+    "    def self.__opt_table(k)\n" ++
+    "      case k\n" ++
+    "      when \"SO\" then [/\\ASO_/, \"socket level option name\", \"UNIX control message\"]\n" ++
+    "      when \"IP\" then [/\\AIP_/, \"IP level option name\", \"IP control message\"]\n" ++
+    "      when \"IPV6\" then [/\\AIPV6_/, \"IPv6 level option name\", \"IPv6 control message\"]\n" ++
+    "      when \"TCP\" then [/\\ATCP_/, \"TCP level option name\", \"TCP control message\"]\n" ++
+    "      when \"UDP\" then [/\\AUDP_/, \"UDP level option name\", \"UDP control message\"]\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    def self.__level_kind(family, level)\n" ++
+    "      if __ip_family?(family)\n" ++
+    "        case level\n" ++
+    "        when Socket::SOL_SOCKET then \"SO\"\n" ++
+    "        when Socket::IPPROTO_IP then \"IP\"\n" ++
+    "        when Socket::IPPROTO_IPV6 then \"IPV6\"\n" ++
+    "        when Socket::IPPROTO_TCP then \"TCP\"\n" ++
+    "        when Socket::IPPROTO_UDP then \"UDP\"\n" ++
+    "        end\n" ++
+    "      else\n" ++
+    "        level == Socket::SOL_SOCKET ? \"SO\" : nil\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    def self.__optname_arg(family, level, v)\n" ++
+    "      k = __level_kind(family, level)\n" ++
+    "      return Socket::Constants.__int(v) if k.nil?\n" ++
+    "      pat, what, = __opt_table(k)\n" ++
+    "      __name_to_int(v, pat, Regexp.new(\"\\\\A#\{k}_\"), \"unknown #\{what}\")\n" ++
+    "    end\n" ++
+    "    def self.__cmsg_type_arg(family, level, v)\n" ++
+    "      k = __level_kind(family, level)\n" ++
+    "      return Socket::Constants.__int(v) if k.nil?\n" ++
+    "      if k == \"SO\"\n" ++
+    "        __name_to_int(v, /\\ASCM_/, /\\ASCM_/, \"unknown UNIX control message\")\n" ++
+    "      else\n" ++
+    "        pat, _, what = __opt_table(k)\n" ++
+    "        __name_to_int(v, pat, Regexp.new(\"\\\\A#\{k}_\"), \"unknown #\{what}\")\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  Constants.__order.each \{ |n| const_set(n, Constants.const_get(n)) }\n" ++
+    "\n" ++
+    "  class ResolutionError < SocketError\n" ++
+    "    def initialize(msg = nil, code = nil)\n" ++
+    "      super(msg)\n" ++
+    "      @error_code = code\n" ++
+    "    end\n" ++
+    "    attr_reader :error_code\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def initialize(domain, socktype, protocol = nil)\n" ++
+    "    @family = Constants.__family_arg(domain)\n" ++
+    "    st = Constants.__socktype_arg(socktype)\n" ++
+    "    @protocol = protocol.nil? ? 0 : Socket::Constants.__int(protocol)\n" ++
+    "    fd = Socket.__socket(Socket::Endpoint__.kernel_family(@family), st, @protocol)\n" ++
+    "    raise Errno::EAFNOSUPPORT, \"socket(2)\" if fd < 0\n" ++
+    "    __setup(fd, st)\n" ++
+    "  end\n" ++
+    "  def __sockaddr_ai(addr)\n" ++
+    "    return addr if addr.is_a?(Addrinfo)\n" ++
+    "    Addrinfo.new(addr.to_str, @family, @socktype, @protocol)\n" ++
+    "  end\n" ++
+    "  def ipv6only!\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  # bind(2) is DEFERRED to the operation that can honour it: listen(2) binds\n" ++
+    "  # the wildcard of the family with the chosen port, and connect(2) chooses\n" ++
+    "  # the local address the route gives. A request neither can meet is refused\n" ++
+    "  # there, by name, rather than accepted and ignored.\n" ++
+    "  def bind(addr)\n" ++
+    "    __check_open\n" ++
+    "    ai = __sockaddr_ai(addr)\n" ++
+    "    if ai.ip? && ai.afamily != @family\n" ++
+    "      raise Errno::EAFNOSUPPORT, \"bind(2) for #\{ai.inspect_sockaddr}\"\n" ++
+    "    end\n" ++
+    "    raise NotImplementedError, \"binding a UNIX socket is not implemented (bind(2) takes a sockaddr_un)\" if ai.unix?\n" ++
+    "    @bind_addr = ai\n" ++
+    "    0\n" ++
+    "  end\n" ++
+    "  def listen(backlog = Socket::SOMAXCONN)\n" ++
+    "    __check_open\n" ++
+    "    port = @bind_addr ? @bind_addr.ip_port : 0\n" ++
+    "    if port != 0 || @socktype != Socket::SOCK_STREAM\n" ++
+    "      fd = Socket::Endpoint__.listen_on(@family, port, backlog)\n" ++
+    "      Socket.__close(@fd)\n" ++
+    "      @fd = fd\n" ++
+    "    elsif Socket.__listenfd(@fd, backlog) < 0\n" ++
+    "      raise Errno::EOPNOTSUPP, \"listen(2)\"\n" ++
+    "    end\n" ++
+    "    @__ep = nil\n" ++
+    "    @listening = true\n" ++
+    "    0\n" ++
+    "  end\n" ++
+    "  def connect(addr)\n" ++
+    "    __check_open\n" ++
+    "    ai = __sockaddr_ai(addr)\n" ++
+    "    raise NotImplementedError, \"connecting a UNIX socket is not implemented (connect(2) takes a sockaddr_un)\" if ai.unix?\n" ++
+    "    if @bind_addr && @bind_addr.ip_port != 0\n" ++
+    "      raise NotImplementedError, \"connecting from a chosen local port is not implemented (bind(2) takes a sockaddr)\"\n" ++
+    "    end\n" ++
+    "    fd = if @socktype == Socket::SOCK_DGRAM\n" ++
+    "      Socket.__udp_open(ai.ip_address, ai.ip_port)\n" ++
+    "    else\n" ++
+    "      Socket.__connect(ai.ip_address, ai.ip_port)\n" ++
+    "    end\n" ++
+    "    raise Errno::ECONNREFUSED, \"connect(2) for #\{ai.inspect_sockaddr}\" if fd < 0\n" ++
+    "    Socket.__close(@fd)\n" ++
+    "    @fd = fd\n" ++
+    "    @__ep = nil\n" ++
+    "    Socket::Endpoint__.check_local(self, @bind_addr.ip_address, 0) if @bind_addr\n" ++
+    "    0\n" ++
+    "  end\n" ++
+    "  def connect_nonblock(addr, exception: true)\n" ++
+    "    connect(addr)\n" ++
+    "  end\n" ++
+    "  def accept\n" ++
+    "    __check_open\n" ++
+    "    raise Errno::EINVAL, \"accept(2)\" unless @listening\n" ++
+    "    __wait_readable\n" ++
+    "    fd = Socket.__accept(@fd)\n" ++
+    "    raise SocketError, \"accept failed\" if fd < 0\n" ++
+    "    s = Socket.allocate\n" ++
+    "    s.__setup(fd, @socktype)\n" ++
+    "    s.instance_variable_set(:@family, @family)\n" ++
+    "    s.instance_variable_set(:@protocol, @protocol)\n" ++
+    "    [s, s.remote_address]\n" ++
+    "  end\n" ++
+    "  def accept_nonblock(exception: true)\n" ++
+    "    __check_open\n" ++
+    "    raise Errno::EINVAL, \"accept(2)\" unless @listening\n" ++
+    "    unless __ready?(1)\n" ++
+    "      return :wait_readable unless exception\n" ++
+    "      raise IO::EAGAINWaitReadable, \"accept(2) would block\"\n" ++
+    "    end\n" ++
+    "    accept\n" ++
+    "  end\n" ++
+    "  def sysaccept\n" ++
+    "    s, a = accept\n" ++
+    "    [s.fileno, a]\n" ++
+    "  end\n" ++
+    "  def recvfrom(maxlen, flags = 0)\n" ++
+    "    [recv(maxlen, flags), remote_address]\n" ++
+    "  end\n" ++
+    "  def inspect\n" ++
+    "    return \"#<Socket:(closed)>\" if @closed\n" ++
+    "    \"#<Socket:fd #\{@fd}>\"\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.tcp(host, port, local_host = nil, local_port = nil, connect_timeout: nil, resolv_timeout: nil, open_timeout: nil, fast_fallback: true)\n" ++
+    "    t = open_timeout || connect_timeout\n" ++
+    "    raise Errno::ETIMEDOUT, \"user specified timeout for #\{host}:#\{port}\" if t && t <= 0\n" ++
+    "    local = nil\n" ++
+    "    local = Addrinfo.getaddrinfo(local_host, local_port, nil, :STREAM)[0] if local_host || local_port\n" ++
+    "    last = nil\n" ++
+    "    Addrinfo.getaddrinfo(host, port, nil, :STREAM).each do |ai|\n" ++
+    "      begin\n" ++
+    "        s = local ? ai.connect_from(local, timeout: connect_timeout) : ai.connect(timeout: connect_timeout)\n" ++
+    "      rescue SystemCallError => e\n" ++
+    "        last = e\n" ++
+    "        next\n" ++
+    "      end\n" ++
+    "      return s unless block_given?\n" ++
+    "      begin\n" ++
+    "        return yield(s)\n" ++
+    "      ensure\n" ++
+    "        s.close\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    raise last || SocketError.new(\"no appropriate local address\")\n" ++
+    "  end\n" ++
+    "  def self.gethostname\n" ++
+    "    @__hostname ||= `hostname 2>/dev/null`.chomp\n" ++
+    "  end\n" ++
+    "  def self.getaddrinfo(host, service, family = nil, socktype = nil, protocol = nil, flags = nil, reverse_lookup = nil)\n" ++
+    "    rev = case reverse_lookup\n" ++
+    "      when nil then !BasicSocket.do_not_reverse_lookup\n" ++
+    "      when true, :hostname then true\n" ++
+    "      when false, :numeric then false\n" ++
+    "      else raise ArgumentError, \"invalid reverse_lookup flag: #\{reverse_lookup.inspect}\"\n" ++
+    "    end\n" ++
+    "    fam = family.nil? || family == 0 ? 0 : Constants.__family_arg(family)\n" ++
+    "    st = socktype.nil? || socktype == 0 ? 0 : Constants.__socktype_arg(socktype)\n" ++
+    "    pr = protocol.nil? ? 0 : Socket::Constants.__int(protocol)\n" ++
+    "    fl = flags.nil? ? 0 : Socket::Constants.__int(flags)\n" ++
+    "    Addrinfo.__getaddrinfo(host, service, fam, st, pr, fl, false).map do |ai|\n" ++
+    "      h = rev ? Addrinfo.__reverse_name(ai) : ai.ip_address\n" ++
+    "      [ai.ipv6? ? \"AF_INET6\" : \"AF_INET\", ai.ip_port, h, ai.ip_address, ai.afamily, ai.socktype, ai.protocol]\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.getnameinfo(sockaddr, flags = 0)\n" ++
+    "    if sockaddr.is_a?(Array)\n" ++
+    "      fam, port, host = sockaddr.length == 3 ? sockaddr : [sockaddr[0], sockaddr[1], sockaddr[3] || sockaddr[2]]\n" ++
+    "      ai = Addrinfo.__getaddrinfo(host, port, 0, 0, 0, 0, false)[0]\n" ++
+    "    else\n" ++
+    "      ai = Addrinfo.new(sockaddr)\n" ++
+    "    end\n" ++
+    "    ai.getnameinfo(flags)\n" ++
+    "  end\n" ++
+    "  def self.sockaddr_in(port, host)\n" ++
+    "    Addrinfo.__getaddrinfo(host, port, 0, 0, 0, 0, true)[0].to_sockaddr\n" ++
+    "  end\n" ++
+    "  def self.pack_sockaddr_in(port, host)\n" ++
+    "    sockaddr_in(port, host)\n" ++
+    "  end\n" ++
+    "  def self.unpack_sockaddr_in(addr)\n" ++
+    "    ai = addr.is_a?(Addrinfo) ? addr : Addrinfo.new(addr.to_str)\n" ++
+    "    raise ArgumentError, \"not an AF_INET/AF_INET6 sockaddr\" unless ai.ip?\n" ++
+    "    [ai.ip_port, ai.ip_address]\n" ++
+    "  end\n" ++
+    "  def self.sockaddr_un(path)\n" ++
+    "    Addrinfo.__unix_sockaddr(path.to_str)\n" ++
+    "  end\n" ++
+    "  def self.pack_sockaddr_un(path)\n" ++
+    "    sockaddr_un(path)\n" ++
+    "  end\n" ++
+    "  def self.unpack_sockaddr_un(addr)\n" ++
+    "    ai = addr.is_a?(Addrinfo) ? addr : Addrinfo.new(addr.to_str)\n" ++
+    "    raise ArgumentError, \"not an AF_UNIX sockaddr\" unless ai.unix?\n" ++
+    "    ai.unix_path\n" ++
+    "  end\n" ++
+    "  def self.socketpair(*args)\n" ++
+    "    raise NotImplementedError, \"Socket.socketpair is not implemented (socketpair(2) fills an array)\"\n" ++
+    "  end\n" ++
+    "  def self.pair(*args)\n" ++
+    "    socketpair(*args)\n" ++
+    "  end\n" ++
+    "  def self.unix(path)\n" ++
+    "    raise NotImplementedError, \"Socket.unix is not implemented (connect(2) takes a sockaddr_un)\"\n" ++
+    "  end\n" ++
+    "  def self.unix_server_socket(path)\n" ++
+    "    raise NotImplementedError, \"Socket.unix_server_socket is not implemented (bind(2) takes a sockaddr_un)\"\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # getsockname(2) / getpeername(2) from OUTSIDE the process. Both take a\n" ++
+    "  # `struct sockaddr *`, which no extern here can pass, so the kernel's answer\n" ++
+    "  # is read where the kernel publishes it: lsof(8) on macOS, /proc on Linux --\n" ++
+    "  # the same shape File::Stat takes with stat(1). A socket neither can see is\n" ++
+    "  # a nil, never a guessed address.\n" ++
+    "  module Endpoint__\n" ++
+    "    # A local address asked for before a connect is honoured only when it is\n" ++
+    "    # the one the kernel chose anyway: a chosen port cannot be (bind(2)), and\n" ++
+    "    # a different address is refused, the socket closed, rather than reported\n" ++
+    "    # as bound.\n" ++
+    "    def self.check_local(sock, host, port)\n" ++
+    "      if port && port != 0 && port != \"0\"\n" ++
+    "        sock.close\n" ++
+    "        raise NotImplementedError, \"connecting from a chosen local port is not implemented (bind(2) takes a sockaddr)\"\n" ++
+    "      end\n" ++
+    "      return if host.nil? || host == \"\" || host == \"0.0.0.0\" || host == \"::\"\n" ++
+    "      want = Addrinfo.__getaddrinfo(host, nil, 0, 0, 0, 0, false)[0].ip_address\n" ++
+    "      got = sock.local_address.ip_address\n" ++
+    "      if got != want\n" ++
+    "        sock.close\n" ++
+    "        raise NotImplementedError, \"the kernel connected from #\{got}, not the requested #\{want} (bind(2) takes a sockaddr)\"\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    # The address family the KERNEL means. The constants above are the values\n" ++
+    "    # of the platform they were read from (macOS); AF_INET is 2 everywhere, but\n" ++
+    "    # AF_INET6 is 30 on macOS and 10 on Linux, and socket(2) is asked in the\n" ++
+    "    # host's own numbers.\n" ++
+    "    def self.kernel_family(f)\n" ++
+    "      return f unless f == Socket::AF_INET6\n" ++
+    "      RUBY_PLATFORM.include?(\"linux\") ? 10 : f\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    # A listening socket of one family, the way this build can make one: a\n" ++
+    "    # chosen IPv4 port through tcp_listen (SO_REUSEADDR, INADDR_ANY), and any\n" ++
+    "    # ephemeral port through socket(2) + listen(2), which binds the wildcard of\n" ++
+    "    # the family on its own.\n" ++
+    "    def self.listen_on(family, port, backlog)\n" ++
+    "      if port != 0\n" ++
+    "        if family != Socket::AF_INET\n" ++
+    "          raise NotImplementedError, \"listening on a chosen IPv6 port is not implemented (bind(2) takes a sockaddr)\"\n" ++
+    "        end\n" ++
+    "        fd = Socket.__listen(port)\n" ++
+    "        raise Errno::EADDRINUSE, \"bind(2) for port #\{port}\" if fd < 0\n" ++
+    "        return fd\n" ++
+    "      end\n" ++
+    "      fd = Socket.__socket(kernel_family(family), Socket::SOCK_STREAM, 0)\n" ++
+    "      raise Errno::EAFNOSUPPORT, \"socket(2)\" if fd < 0\n" ++
+    "      if Socket.__listenfd(fd, backlog) < 0\n" ++
+    "        Socket.__close(fd)\n" ++
+    "        raise SystemCallError.new(\"listen(2)\", 0)\n" ++
+    "      end\n" ++
+    "      fd\n" ++
+    "    end\n" ++
+    "    def self.of(fd)\n" ++
+    "      if File.exist?(\"/proc/net/tcp\")\n" ++
+    "        proc_of(fd)\n" ++
+    "      else\n" ++
+    "        lsof_of(fd)\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    def self.parse_hostport(s, v6)\n" ++
+    "      return nil if s.nil?\n" ++
+    "      if s.start_with?(\"[\")\n" ++
+    "        i = s.index(\"]\")\n" ++
+    "        host = s[1...i]\n" ++
+    "        port = s[(i + 2)..-1]\n" ++
+    "      else\n" ++
+    "        i = s.rindex(\":\")\n" ++
+    "        return nil if i.nil?\n" ++
+    "        host = s[0...i]\n" ++
+    "        port = s[(i + 1)..-1]\n" ++
+    "      end\n" ++
+    "      if host == \"*\"\n" ++
+    "        host = v6 ? \"::\" : \"0.0.0.0\"\n" ++
+    "      elsif v6 && !host.include?(\":\")\n" ++
+    "        host = \"::ffff:\" + host\n" ++
+    "      end\n" ++
+    "      [host, port == \"*\" ? 0 : port.to_i]\n" ++
+    "    end\n" ++
+    "    def self.lsof_of(fd)\n" ++
+    "      out = `lsof -a -nP -p #\{Process.pid} -d #\{fd} -F tPTn 2>/dev/null`\n" ++
+    "      fam = nil\n" ++
+    "      name = nil\n" ++
+    "      proto = nil\n" ++
+    "      listening = false\n" ++
+    "      out.each_line do |l|\n" ++
+    "        l = l.chomp\n" ++
+    "        case l[0]\n" ++
+    "        when \"t\" then fam = l[1..-1]\n" ++
+    "        when \"P\" then proto = l[1..-1]\n" ++
+    "        when \"T\" then listening = true if l == \"TST=LISTEN\"\n" ++
+    "        when \"n\" then name = l[1..-1]\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      return nil unless name && (fam == \"IPv4\" || fam == \"IPv6\")\n" ++
+    "      v6 = fam == \"IPv6\"\n" ++
+    "      loc, rem = name.split(\"->\", 2)\n" ++
+    "      \{ family: v6 ? Socket::AF_INET6 : Socket::AF_INET, local: parse_hostport(loc, v6),\n" ++
+    "        remote: parse_hostport(rem, v6), listening: listening, proto: proto }\n" ++
+    "    end\n" ++
+    "    def self.proc_of(fd)\n" ++
+    "      link = `readlink /proc/#\{Process.pid}/fd/#\{fd} 2>/dev/null`.chomp\n" ++
+    "      ino = link[/\\Asocket:\\[(\\d+)\\]\\z/, 1]\n" ++
+    "      return nil unless ino\n" ++
+    "      [[\"tcp\", false], [\"tcp6\", true], [\"udp\", false], [\"udp6\", true]].each do |file, v6|\n" ++
+    "        path = \"/proc/net/#\{file}\"\n" ++
+    "        next unless File.exist?(path)\n" ++
+    "        File.read(path).each_line.drop(1).each do |l|\n" ++
+    "          f = l.split\n" ++
+    "          next unless f[9] == ino\n" ++
+    "          loc = proc_addr(f[1], v6)\n" ++
+    "          rem = proc_addr(f[2], v6)\n" ++
+    "          rem = nil if rem[1] == 0\n" ++
+    "          return \{ family: v6 ? Socket::AF_INET6 : Socket::AF_INET, local: loc, remote: rem,\n" ++
+    "                   listening: f[3] == \"0A\" && file.start_with?(\"tcp\"), proto: file.start_with?(\"tcp\") ? \"TCP\" : \"UDP\" }\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      nil\n" ++
+    "    end\n" ++
+    "    # /proc/net writes each address as the kernel's in-memory words in hex:\n" ++
+    "    # four bytes per word, little-endian on the machines this runs on.\n" ++
+    "    def self.proc_addr(s, v6)\n" ++
+    "      a, p = s.split(\":\")\n" ++
+    "      bytes = [a].pack(\"H*\").unpack(\"C*\")\n" ++
+    "      words = bytes.each_slice(4).map \{ |w| w.reverse }.flatten\n" ++
+    "      raw = words.pack(\"C*\")\n" ++
+    "      ip = v6 ? Addrinfo.__ntop6(raw) : raw.unpack(\"C4\").join(\".\")\n" ++
+    "      if v6 && raw[0, 12] == (\"\\0\" * 10 + \"\\xff\\xff\").b\n" ++
+    "        ip = \"::ffff:\" + raw[12, 4].unpack(\"C4\").join(\".\")\n" ++
+    "      end\n" ++
+    "      [ip, p.to_i(16)]\n" ++
+    "    end\n" ++
+    "    def self.addrinfo(family, hp, socktype)\n" ++
+    "      host, port = hp\n" ++
+    "      sa = Addrinfo.__getaddrinfo(host, port, family, 0, 0, Socket::AI_NUMERICHOST, true)[0].to_sockaddr\n" ++
+    "      Addrinfo.new(sa, family, socktype, 0)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "class Addrinfo\n" ++
+    "  # The sockaddr is kept as the C struct's BYTES, as CRuby keeps it, in the\n" ++
+    "  # BSD layout the constants come from: sin_len and sin_family are one byte\n" ++
+    "  # each, then the port big-endian.\n" ++
+    "  SIN_LEN__ = 16\n" ++
+    "  SIN6_LEN__ = 28\n" ++
+    "  SUN_LEN__ = 106\n" ++
+    "  GAI_MSG__ = \{\n" ++
+    "    1 => \"Address family for nodename not supported\", 2 => \"Temporary failure in name resolution\",\n" ++
+    "    3 => \"Invalid value for ai_flags\", 4 => \"Non-recoverable failure in name resolution\",\n" ++
+    "    5 => \"ai_family not supported\", 6 => \"Memory allocation failure\",\n" ++
+    "    7 => \"No address associated with nodename\", 8 => \"nodename nor servname provided, or not known\",\n" ++
+    "    9 => \"servname not supported for ai_socktype\", 10 => \"ai_socktype not supported\",\n" ++
+    "    11 => \"System error\", 12 => \"Bad hints\", 13 => \"Resolved protocol is unknown\",\n" ++
+    "    14 => \"Argument buffer overflow\",\n" ++
+    "  }\n" ++
+    "  def self.__gai_error(what, code)\n" ++
+    "    raise Socket::ResolutionError.new(\"#\{what}: #\{GAI_MSG__[code]}\", code)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # ---- the addresses themselves ----------------------------------------\n" ++
+    "  # inet_pton(3), strictly: four decimal octets, no leading zeros.\n" ++
+    "  def self.__pton4(s)\n" ++
+    "    parts = s.split(\".\", -1)\n" ++
+    "    return nil unless parts.length == 4\n" ++
+    "    out = []\n" ++
+    "    parts.each do |p|\n" ++
+    "      return nil unless p =~ /\\A\\d\{1,3}\\z/\n" ++
+    "      return nil if p.length > 1 && p[0] == \"0\"\n" ++
+    "      v = p.to_i\n" ++
+    "      return nil if v > 255\n" ++
+    "      out << v\n" ++
+    "    end\n" ++
+    "    out.pack(\"C4\")\n" ++
+    "  end\n" ++
+    "  # inet_aton(3), which getaddrinfo(3) also accepts for a numeric host:\n" ++
+    "  # one to four parts, each decimal, 0-octal or 0x-hex, the last one filling\n" ++
+    "  # the bytes that remain.\n" ++
+    "  def self.__aton(s)\n" ++
+    "    parts = s.split(\".\", -1)\n" ++
+    "    return nil if parts.empty? || parts.length > 4\n" ++
+    "    vals = parts.map do |p|\n" ++
+    "      if p =~ /\\A0[xX]\\h*\\z/ then p[2..-1].to_i(16)\n" ++
+    "      elsif p =~ /\\A0[0-7]*\\z/ then p.to_i(8)\n" ++
+    "      elsif p =~ /\\A[1-9]\\d*\\z/ then p.to_i\n" ++
+    "      else return nil\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    last = vals.pop\n" ++
+    "    return nil if vals.any? \{ |v| v > 255 }\n" ++
+    "    rest = 4 - vals.length\n" ++
+    "    return nil if last >= 256 ** rest\n" ++
+    "    n = 0\n" ++
+    "    vals.each \{ |v| n = n * 256 + v }\n" ++
+    "    n = n * (256 ** rest) + last\n" ++
+    "    [n].pack(\"N\")\n" ++
+    "  end\n" ++
+    "  # inet_pton(3) for AF_INET6, with the dotted IPv4 tail it allows.\n" ++
+    "  def self.__pton6(s)\n" ++
+    "    return nil if s.empty? || s.count(\":\") < 2\n" ++
+    "    tail = nil\n" ++
+    "    if s.include?(\".\")\n" ++
+    "      i = s.rindex(\":\")\n" ++
+    "      tail = __pton4(s[(i + 1)..-1])\n" ++
+    "      return nil if tail.nil?\n" ++
+    "      s = s[0..i] + \"0:0\"\n" ++
+    "    end\n" ++
+    "    halves = s.split(\"::\", -1)\n" ++
+    "    return nil if halves.length > 2\n" ++
+    "    parse = lambda do |part|\n" ++
+    "      return [] if part.empty?\n" ++
+    "      g = part.split(\":\", -1)\n" ++
+    "      g.map \{ |x| return nil unless x =~ /\\A\\h\{1,4}\\z/; x.to_i(16) }\n" ++
+    "    end\n" ++
+    "    if halves.length == 2\n" ++
+    "      a = parse.call(halves[0])\n" ++
+    "      b = parse.call(halves[1])\n" ++
+    "      return nil if a.nil? || b.nil? || a.length + b.length > 7\n" ++
+    "      words = a + [0] * (8 - a.length - b.length) + b\n" ++
+    "    else\n" ++
+    "      words = parse.call(halves[0])\n" ++
+    "      return nil if words.nil? || words.length != 8\n" ++
+    "    end\n" ++
+    "    raw = words.pack(\"n8\")\n" ++
+    "    raw = raw[0, 12] + tail if tail\n" ++
+    "    raw\n" ++
+    "  end\n" ++
+    "  # inet_ntop(3) for AF_INET6, BSD's: the longest run of two or more zero\n" ++
+    "  # words becomes \"::\" (the first, on a tie), and an address whose first 96\n" ++
+    "  # bits are zero -- or ::ffff: before its last 32 -- ends in dotted IPv4,\n" ++
+    "  # except when that would spell ::1 or ::a.b (the run is then 7 words).\n" ++
+    "  def self.__ntop6(raw)\n" ++
+    "    w = raw.unpack(\"n8\")\n" ++
+    "    best = -1\n" ++
+    "    bestlen = 0\n" ++
+    "    i = 0\n" ++
+    "    while i < 8\n" ++
+    "      if w[i] == 0\n" ++
+    "        j = i\n" ++
+    "        j += 1 while j < 8 && w[j] == 0\n" ++
+    "        if j - i > bestlen\n" ++
+    "          best = i\n" ++
+    "          bestlen = j - i\n" ++
+    "        end\n" ++
+    "        i = j\n" ++
+    "      else\n" ++
+    "        i += 1\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    if bestlen < 2\n" ++
+    "      best = -1\n" ++
+    "      bestlen = 0\n" ++
+    "    end\n" ++
+    "    out = +\"\"\n" ++
+    "    i = 0\n" ++
+    "    while i < 8\n" ++
+    "      if best >= 0 && i >= best && i < best + bestlen\n" ++
+    "        out << \":\" if i == best\n" ++
+    "        i += 1\n" ++
+    "        next\n" ++
+    "      end\n" ++
+    "      out << \":\" if i != 0\n" ++
+    "      if i == 6 && best == 0 && (bestlen == 6 || (bestlen == 5 && w[5] == 0xffff))\n" ++
+    "        out << raw[12, 4].unpack(\"C4\").join(\".\")\n" ++
+    "        break\n" ++
+    "      end\n" ++
+    "      out << w[i].to_s(16)\n" ++
+    "      i += 1\n" ++
+    "    end\n" ++
+    "    out << \":\" if best >= 0 && best + bestlen == 8\n" ++
+    "    out\n" ++
+    "  end\n" ++
+    "  def self.__sin(addr4, port)\n" ++
+    "    [SIN_LEN__, Socket::AF_INET, port].pack(\"CCn\") + addr4 + (\"\\0\" * 8)\n" ++
+    "  end\n" ++
+    "  def self.__sin6(addr16, port, scope = 0)\n" ++
+    "    [SIN6_LEN__, Socket::AF_INET6, port, 0].pack(\"CCnN\") + addr16 + [scope].pack(\"L\")\n" ++
+    "  end\n" ++
+    "  def self.__unix_sockaddr(path)\n" ++
+    "    if path.bytesize > SUN_LEN__ - 2\n" ++
+    "      raise ArgumentError, \"too long unix socket path (#\{path.bytesize} bytes given but #\{SUN_LEN__ - 2} bytes max)\"\n" ++
+    "    end\n" ++
+    "    ([SUN_LEN__, Socket::AF_UNIX].pack(\"CC\") + path.b + (\"\\0\" * (SUN_LEN__ - 2 - path.bytesize))).b\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # ---- getaddrinfo(3) ----------------------------------------------------\n" ++
+    "  # /etc/hosts and /etc/services are the \"files\" half of what the C library\n" ++
+    "  # resolves through. A name neither answers is not looked up anywhere else:\n" ++
+    "  # there is no DNS client in here, and saying \"not known\" is the refusal\n" ++
+    "  # getaddrinfo itself gives.\n" ++
+    "  def self.__hosts\n" ++
+    "    @__hosts ||= begin\n" ++
+    "      list = []\n" ++
+    "      (File.read(\"/etc/hosts\") rescue \"\").each_line do |l|\n" ++
+    "        l = l.sub(/#.*/, \"\").strip\n" ++
+    "        next if l.empty?\n" ++
+    "        f = l.split\n" ++
+    "        list << [f[0], f[1..-1]]\n" ++
+    "      end\n" ++
+    "      list\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.__services\n" ++
+    "    @__services ||= begin\n" ++
+    "      list = []\n" ++
+    "      (File.read(\"/etc/services\") rescue \"\").each_line do |l|\n" ++
+    "        l = l.sub(/#.*/, \"\").strip\n" ++
+    "        next if l.empty?\n" ++
+    "        f = l.split\n" ++
+    "        port, proto = f[1].to_s.split(\"/\")\n" ++
+    "        next unless proto\n" ++
+    "        list << [f[0], port.to_i, proto, f[2..-1]]\n" ++
+    "      end\n" ++
+    "      list\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.__service_port(name, proto)\n" ++
+    "    __services.each do |n, port, pr, aliases|\n" ++
+    "      return port if pr == proto && (n == name || aliases.include?(name))\n" ++
+    "    end\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  def self.__service_name(port, proto)\n" ++
+    "    __services.each \{ |n, p, pr, _| return n if p == port && pr == proto }\n" ++
+    "    nil\n" ++
+    "  end\n" ++
+    "  # A port argument as the socket methods take one: an Integer, or a\n" ++
+    "  # service name looked up in /etc/services.\n" ++
+    "  def self.__port_of(port, proto)\n" ++
+    "    return 0 if port.nil?\n" ++
+    "    return port if port.is_a?(Integer)\n" ++
+    "    s = port.to_s\n" ++
+    "    return s.to_i if s =~ /\\A\\d+\\z/\n" ++
+    "    p = __service_port(s, proto)\n" ++
+    "    __gai_error(\"getaddrinfo\", 8) if p.nil?\n" ++
+    "    p\n" ++
+    "  end\n" ++
+    "  def self.__reverse_name(ai)\n" ++
+    "    ip = ai.ip_address\n" ++
+    "    __hosts.each \{ |addr, names| return names[0] if addr == ip }\n" ++
+    "    ip\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # One result: [family, socktype, protocol, sockaddr, canonname].\n" ++
+    "  NUMERIC_LIST__ = [[1, 6], [2, 17], [3, 0]]\n" ++
+    "  def self.__numeric_port(service)\n" ++
+    "    return 0 if service.nil?\n" ++
+    "    return nil unless service =~ /\\A\\d*\\z/\n" ++
+    "    v = service.to_i\n" ++
+    "    v >= 0x10000 ? nil : v\n" ++
+    "  end\n" ++
+    "  # raddrinfo.c's numeric_getaddrinfo: the fast path CRuby takes before the\n" ++
+    "  # C library, for a numeric host and a numeric (or no) service.\n" ++
+    "  def self.__numeric_gai(node, service, family, socktype, protocol)\n" ++
+    "    return nil if node.nil?\n" ++
+    "    port = __numeric_port(service)\n" ++
+    "    return nil if port.nil?\n" ++
+    "    res = []\n" ++
+    "    if (family == 0 || family == Socket::AF_INET6) && node =~ /\\A[0-9a-fA-F.:]*\\z/ && (a6 = __pton6(node))\n" ++
+    "      NUMERIC_LIST__.each do |st, pr|\n" ++
+    "        if (socktype == 0 || socktype == st) && (protocol == 0 || pr == 0 || protocol == pr)\n" ++
+    "          res << [Socket::AF_INET6, st, protocol != 0 ? protocol : pr, __sin6(a6, port), nil]\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "    elsif (family == 0 || family == Socket::AF_INET) && node =~ /\\A[0-9.]*\\z/ && (a4 = __pton4(node))\n" ++
+    "      NUMERIC_LIST__.each do |st, pr|\n" ++
+    "        if (socktype == 0 || socktype == st) && (protocol == 0 || pr == 0 || protocol == pr)\n" ++
+    "          res << [Socket::AF_INET, st, protocol != 0 ? protocol : pr, __sin(a4, port), nil]\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    res.empty? ? nil : res\n" ++
+    "  end\n" ++
+    "  # ...and what the C library answers when the fast path does not: the\n" ++
+    "  # socket types it knows (DGRAM before STREAM when none is asked for, as\n" ++
+    "  # macOS lists them), the protocol each one allows, the service looked up\n" ++
+    "  # per protocol, then the host as a number or a name in /etc/hosts.\n" ++
+    "  def self.__system_gai(node, service, family, socktype, protocol, flags)\n" ++
+    "    unless family == 0 || family == Socket::AF_INET || family == Socket::AF_INET6\n" ++
+    "      __gai_error(\"getaddrinfo\", 5)\n" ++
+    "    end\n" ++
+    "    __gai_error(\"getaddrinfo\", 8) if node.nil? && service.nil?\n" ++
+    "    types = case socktype\n" ++
+    "      when 0\n" ++
+    "        t = [[2, 17], [1, 6]]\n" ++
+    "        if protocol != 0\n" ++
+    "          t = t.select \{ |_, pr| pr == protocol }\n" ++
+    "          __gai_error(\"getaddrinfo\", 12) if t.empty?\n" ++
+    "        end\n" ++
+    "        t\n" ++
+    "      when 1 then (protocol == 0 || protocol == 6) ? [[1, 6]] : __gai_error(\"getaddrinfo\", 12)\n" ++
+    "      when 2 then (protocol == 0 || protocol == 17) ? [[2, 17]] : __gai_error(\"getaddrinfo\", 12)\n" ++
+    "      when 3 then [[3, protocol]]\n" ++
+    "      else __gai_error(\"getaddrinfo\", 12)\n" ++
+    "    end\n" ++
+    "    ports = \{}\n" ++
+    "    types.each do |st, pr|\n" ++
+    "      if service.nil?\n" ++
+    "        ports[st] = 0\n" ++
+    "      elsif service =~ /\\A\\d+\\z/\n" ++
+    "        v = service.to_i\n" ++
+    "        __gai_error(\"getaddrinfo\", 8) if v >= 0x10000\n" ++
+    "        ports[st] = v\n" ++
+    "      elsif st == 3\n" ++
+    "        __gai_error(\"getaddrinfo\", 9)\n" ++
+    "      else\n" ++
+    "        v = __service_port(service, st == 1 ? \"tcp\" : \"udp\")\n" ++
+    "        ports[st] = v if v\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    __gai_error(\"getaddrinfo\", 8) if ports.empty?\n" ++
+    "    addrs = []\n" ++
+    "    canon = nil\n" ++
+    "    if node.nil?\n" ++
+    "      passive = (flags & Socket::AI_PASSIVE) != 0\n" ++
+    "      addrs << [Socket::AF_INET6, passive ? (\"\\0\" * 16).b : __pton6(\"::1\")]\n" ++
+    "      addrs << [Socket::AF_INET, passive ? (\"\\0\" * 4).b : __pton4(\"127.0.0.1\")]\n" ++
+    "    elsif (a6 = __pton6(node))\n" ++
+    "      addrs << [Socket::AF_INET6, a6]\n" ++
+    "    elsif (a4 = __aton(node))\n" ++
+    "      addrs << [Socket::AF_INET, a4]\n" ++
+    "    elsif (flags & Socket::AI_NUMERICHOST) != 0\n" ++
+    "      __gai_error(\"getaddrinfo\", 8)\n" ++
+    "    else\n" ++
+    "      v6 = []\n" ++
+    "      v4 = []\n" ++
+    "      __hosts.each do |addr, names|\n" ++
+    "        next unless names.include?(node)\n" ++
+    "        canon ||= names[0]\n" ++
+    "        if (a = __pton6(addr))\n" ++
+    "          v6 << [Socket::AF_INET6, a]\n" ++
+    "        elsif (a = __pton4(addr))\n" ++
+    "          v4 << [Socket::AF_INET, a]\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "      addrs = v6 + v4\n" ++
+    "    end\n" ++
+    "    addrs = addrs.select \{ |f, _| family == 0 || f == family }\n" ++
+    "    __gai_error(\"getaddrinfo\", 8) if addrs.empty?\n" ++
+    "    res = []\n" ++
+    "    addrs.each do |f, a|\n" ++
+    "      types.each do |st, pr|\n" ++
+    "        next unless ports.key?(st)\n" ++
+    "        sa = f == Socket::AF_INET6 ? __sin6(a, ports[st]) : __sin(a, ports[st])\n" ++
+    "        res << [f, st, pr, sa, nil]\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    if (flags & Socket::AI_CANONNAME) != 0 && !res.empty?\n" ++
+    "      res[0][4] = canon || node\n" ++
+    "    end\n" ++
+    "    res\n" ++
+    "  end\n" ++
+    "  def self.__host_str(host)\n" ++
+    "    return nil if host.nil?\n" ++
+    "    if host.is_a?(Integer)\n" ++
+    "      return [host].pack(\"N\").unpack(\"C4\").join(\".\")\n" ++
+    "    end\n" ++
+    "    s = host.respond_to?(:to_str) ? host.to_str : (raise TypeError, \"no implicit conversion of #\{host.class} into String\")\n" ++
+    "    return \"0.0.0.0\" if s.empty? || s == \"<any>\"\n" ++
+    "    return \"255.255.255.255\" if s == \"<broadcast>\"\n" ++
+    "    s\n" ++
+    "  end\n" ++
+    "  def self.__port_str(port)\n" ++
+    "    return nil if port.nil?\n" ++
+    "    return port.to_s if port.is_a?(Integer)\n" ++
+    "    port.to_str\n" ++
+    "  end\n" ++
+    "  # rsock_getaddrinfo: the list of results, each [family, socktype, protocol,\n" ++
+    "  # sockaddr, canonname].\n" ++
+    "  def self.__gai(host, port, family, socktype, protocol, flags, socktype_hack)\n" ++
+    "    node = __host_str(host)\n" ++
+    "    service = __port_str(port)\n" ++
+    "    socktype = 2 if socktype_hack && socktype == 0 && service =~ /\\A\\d+\\z/\n" ++
+    "    res = __numeric_gai(node, service, family, socktype, protocol)\n" ++
+    "    return res if res\n" ++
+    "    if node && node.end_with?(\"\\n\")\n" ++
+    "      raise SocketError, \"newline at the end of hostname\"\n" ++
+    "    end\n" ++
+    "    # macOS: a service of \"0\" is passed as none at all.\n" ++
+    "    service = nil if node && service =~ /\\A\\d+\\z/ && service.to_i == 0\n" ++
+    "    res = __system_gai(node, service, family, socktype, protocol, flags)\n" ++
+    "    res.each do |r|\n" ++
+    "      r[1] = socktype if r[1] == 0\n" ++
+    "      r[2] = (r[1] == 2 ? 17 : r[1] == 1 ? 6 : 0) if r[2] == 0\n" ++
+    "    end\n" ++
+    "    res\n" ++
+    "  end\n" ++
+    "  def self.__getaddrinfo(host, port, family, socktype, protocol, flags, socktype_hack)\n" ++
+    "    __gai(host, port, family, socktype, protocol, flags, socktype_hack).map do |f, st, pr, sa, canon|\n" ++
+    "      ai = allocate\n" ++
+    "      ai.__init(sa, f, st, pr, canon, nil)\n" ++
+    "      ai\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  # make_inspectname: what the caller wrote, where it differs from what the\n" ++
+    "  # numeric address and port already show.\n" ++
+    "  def self.__inspectname(node, service, sa)\n" ++
+    "    ai = allocate\n" ++
+    "    ai.__init(sa, 0, 0, 0, nil, nil)\n" ++
+    "    h, p = ai.__numeric_pair\n" ++
+    "    node = nil if node.is_a?(String) && h == node\n" ++
+    "    if service.is_a?(String) && p == service\n" ++
+    "      service = nil\n" ++
+    "    elsif service.is_a?(Integer) && p.to_i == service\n" ++
+    "      service = nil\n" ++
+    "    end\n" ++
+    "    name = node.is_a?(String) ? node.dup : nil\n" ++
+    "    if service.is_a?(String)\n" ++
+    "      name = (name || \"\") + \":\" + service\n" ++
+    "    elsif service.is_a?(Integer) && service != 0\n" ++
+    "      name = (name || \"\") + \":\" + service.to_s\n" ++
+    "    end\n" ++
+    "    name && name.freeze\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def self.getaddrinfo(node, service, family = nil, socktype = nil, protocol = nil, flags = nil, timeout: nil)\n" ++
+    "    fam = family.nil? ? 0 : Socket::Constants.__family_arg(family)\n" ++
+    "    st = socktype.nil? ? 0 : Socket::Constants.__socktype_arg(socktype)\n" ++
+    "    pr = protocol.nil? ? 0 : Socket::Constants.__int(protocol)\n" ++
+    "    fl = flags.nil? ? 0 : Socket::Constants.__int(flags)\n" ++
+    "    res = __gai(node, service, fam, st, pr, fl, false)\n" ++
+    "    iname = __inspectname(node, service, res[0][3])\n" ++
+    "    res.map do |f, s, p, sa, canon|\n" ++
+    "      ai = allocate\n" ++
+    "      ai.__init(sa, f, s, p, canon && canon.dup.freeze, iname)\n" ++
+    "      ai\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.__firstonly(node, service, family, socktype, protocol, flags)\n" ++
+    "    res = __gai(node, service, family, socktype, protocol, flags, false)\n" ++
+    "    f, s, p, sa, canon = res[0]\n" ++
+    "    ai = allocate\n" ++
+    "    ai.__init(sa, f, s, p, canon && canon.dup.freeze, __inspectname(node, service, sa))\n" ++
+    "    ai\n" ++
+    "  end\n" ++
+    "  def self.ip(host)\n" ++
+    "    ai = __firstonly(host, nil, 0, 0, 0, 0)\n" ++
+    "    ai.__init(ai.to_sockaddr, ai.afamily, 0, 0, ai.canonname, ai.__inspect_name)\n" ++
+    "    ai\n" ++
+    "  end\n" ++
+    "  def self.tcp(host, port)\n" ++
+    "    __firstonly(host, port, 0, Socket::SOCK_STREAM, Socket::IPPROTO_TCP, 0)\n" ++
+    "  end\n" ++
+    "  def self.udp(host, port)\n" ++
+    "    __firstonly(host, port, 0, Socket::SOCK_DGRAM, Socket::IPPROTO_UDP, 0)\n" ++
+    "  end\n" ++
+    "  def self.unix(path, socktype = nil)\n" ++
+    "    st = socktype.nil? ? Socket::SOCK_STREAM : Socket::Constants.__socktype_arg(socktype)\n" ++
+    "    ai = allocate\n" ++
+    "    ai.__init(__unix_sockaddr(path.to_str), Socket::PF_UNIX, st, 0, nil, nil)\n" ++
+    "    ai\n" ++
+    "  end\n" ++
+    "  def self.foreach(nodename, service, family = nil, socktype = nil, protocol = nil, flags = nil, timeout: nil, &block)\n" ++
+    "    getaddrinfo(nodename, service, family, socktype, protocol, flags, timeout: timeout).each(&block)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def __init(sa, pfamily, socktype, protocol, canonname, inspectname)\n" ++
+    "    @sockaddr = sa.b\n" ++
+    "    @pfamily = pfamily\n" ++
+    "    @socktype = socktype\n" ++
+    "    @protocol = protocol\n" ++
+    "    @canonname = canonname\n" ++
+    "    @inspectname = inspectname\n" ++
+    "    self\n" ++
+    "  end\n" ++
+    "  def __inspect_name\n" ++
+    "    @inspectname\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def initialize(sockaddr, family = nil, socktype = nil, protocol = nil)\n" ++
+    "    raise TypeError, \"already initialized socket address\" if @sockaddr\n" ++
+    "    pf = family.nil? ? 0 : Socket::Constants.__family_arg(family)\n" ++
+    "    st = socktype.nil? ? 0 : Socket::Constants.__socktype_arg(socktype)\n" ++
+    "    pr = protocol.nil? ? 0 : Socket::Constants.__int(protocol)\n" ++
+    "    ary = sockaddr.is_a?(Array) ? sockaddr : (sockaddr.respond_to?(:to_ary) ? sockaddr.to_ary : nil)\n" ++
+    "    if ary\n" ++
+    "      afs = ary[0]\n" ++
+    "      afs = afs.to_str unless afs.is_a?(String)\n" ++
+    "      af = Socket::Constants.__lookup(afs, /\\A(AF_|PF_)/, /\\AAF_/)\n" ++
+    "      raise SocketError, \"unknown address family: #\{afs}\" if af.nil?\n" ++
+    "      if af == Socket::AF_INET || af == Socket::AF_INET6\n" ++
+    "        service = Socket::Constants.__int(ary[1])\n" ++
+    "        nodename = ary[2]\n" ++
+    "        nodename = nodename.to_str unless nodename.nil? || nodename.is_a?(String)\n" ++
+    "        numeric = ary[3]\n" ++
+    "        numeric = numeric.to_str unless numeric.is_a?(String)\n" ++
+    "        fam = pf != 0 ? pf : af\n" ++
+    "        res = Addrinfo.__gai(numeric, service, fam, st, pr, Socket::AI_NUMERICHOST | Socket::AI_NUMERICSERV, true)\n" ++
+    "        iname = numeric == nodename ? nil : Addrinfo.__inspectname(nodename, service, res[0][3])\n" ++
+    "        canon = res[0][4]\n" ++
+    "        __init(res[0][3], fam, st, pr, canon && canon.dup.freeze, iname)\n" ++
+    "      elsif af == Socket::AF_UNIX\n" ++
+    "        path = ary[1]\n" ++
+    "        path = path.to_str unless path.is_a?(String)\n" ++
+    "        __init(Addrinfo.__unix_sockaddr(path), Socket::PF_UNIX, Socket::SOCK_STREAM, 0, nil, nil)\n" ++
+    "      else\n" ++
+    "        raise SocketError, \"unexpected address family\"\n" ++
+    "      end\n" ++
+    "    else\n" ++
+    "      s = sockaddr.is_a?(String) ? sockaddr : sockaddr.to_str\n" ++
+    "      __init(s, pf, st, pr, nil, nil)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def afamily\n" ++
+    "    @sockaddr.bytesize >= 2 ? @sockaddr.getbyte(1) : Socket::AF_UNSPEC\n" ++
+    "  end\n" ++
+    "  attr_reader :pfamily, :socktype, :protocol, :canonname\n" ++
+    "  def to_sockaddr\n" ++
+    "    @sockaddr.dup\n" ++
+    "  end\n" ++
+    "  alias to_s to_sockaddr\n" ++
+    "  def ip?\n" ++
+    "    f = afamily\n" ++
+    "    f == Socket::AF_INET || f == Socket::AF_INET6\n" ++
+    "  end\n" ++
+    "  def ipv4?\n" ++
+    "    afamily == Socket::AF_INET\n" ++
+    "  end\n" ++
+    "  def ipv6?\n" ++
+    "    afamily == Socket::AF_INET6\n" ++
+    "  end\n" ++
+    "  def unix?\n" ++
+    "    afamily == Socket::AF_UNIX\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # getnameinfo(NI_NUMERICHOST|NI_NUMERICSERV): the address and port text.\n" ++
+    "  def __numeric_pair\n" ++
+    "    case afamily\n" ++
+    "    when Socket::AF_INET\n" ++
+    "      Addrinfo.__gai_error(\"getnameinfo\", 5) if @sockaddr.bytesize < SIN_LEN__\n" ++
+    "      [@sockaddr[4, 4].unpack(\"C4\").join(\".\"), @sockaddr[2, 2].unpack1(\"n\").to_s]\n" ++
+    "    when Socket::AF_INET6\n" ++
+    "      Addrinfo.__gai_error(\"getnameinfo\", 5) if @sockaddr.bytesize < SIN6_LEN__\n" ++
+    "      h = __ntop6_text\n" ++
+    "      [h, @sockaddr[2, 2].unpack1(\"n\").to_s]\n" ++
+    "    else\n" ++
+    "      Addrinfo.__gai_error(\"getnameinfo\", 5)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def __ntop6_text\n" ++
+    "    raw = @sockaddr[8, 16]\n" ++
+    "    h = Addrinfo.__ntop6(raw)\n" ++
+    "    scope = @sockaddr[24, 4].unpack1(\"L\")\n" ++
+    "    h += \"%\" + scope.to_s if scope != 0\n" ++
+    "    h\n" ++
+    "  end\n" ++
+    "  def getnameinfo(flags = 0)\n" ++
+    "    fl = Socket::Constants.__int(flags)\n" ++
+    "    fl |= Socket::NI_DGRAM if @socktype == Socket::SOCK_DGRAM\n" ++
+    "    h, p = __numeric_pair\n" ++
+    "    if (fl & Socket::NI_NUMERICHOST) == 0\n" ++
+    "      name = nil\n" ++
+    "      Addrinfo.__hosts.each \{ |addr, names| (name = names[0]; break) if addr == h }\n" ++
+    "      Addrinfo.__gai_error(\"getnameinfo\", 8) if name.nil? && (fl & Socket::NI_NAMEREQD) != 0\n" ++
+    "      h = name if name\n" ++
+    "    end\n" ++
+    "    if (fl & Socket::NI_NUMERICSERV) == 0\n" ++
+    "      s = Addrinfo.__service_name(p.to_i, (fl & Socket::NI_DGRAM) != 0 ? \"udp\" : \"tcp\")\n" ++
+    "      p = s if s\n" ++
+    "    end\n" ++
+    "    [h, p]\n" ++
+    "  end\n" ++
+    "  def ip_unpack\n" ++
+    "    raise SocketError, \"need IPv4 or IPv6 address\" unless ip?\n" ++
+    "    h, p = __numeric_pair\n" ++
+    "    [h, p.to_i]\n" ++
+    "  end\n" ++
+    "  def ip_address\n" ++
+    "    raise SocketError, \"need IPv4 or IPv6 address\" unless ip?\n" ++
+    "    __numeric_pair[0]\n" ++
+    "  end\n" ++
+    "  def ip_port\n" ++
+    "    raise SocketError, \"need IPv4 or IPv6 address\" unless ip?\n" ++
+    "    if afamily == Socket::AF_INET\n" ++
+    "      raise SocketError, \"unexpected sockaddr size for IPv4\" if @sockaddr.bytesize != SIN_LEN__\n" ++
+    "    else\n" ++
+    "      raise SocketError, \"unexpected sockaddr size for IPv6\" if @sockaddr.bytesize != SIN6_LEN__\n" ++
+    "    end\n" ++
+    "    @sockaddr[2, 2].unpack1(\"n\")\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def __in4\n" ++
+    "    ipv4? && @sockaddr.bytesize >= 8 ? @sockaddr[4, 4].unpack1(\"N\") : nil\n" ++
+    "  end\n" ++
+    "  def __in6\n" ++
+    "    ipv6? && @sockaddr.bytesize >= 24 ? @sockaddr[8, 16].unpack(\"C16\") : nil\n" ++
+    "  end\n" ++
+    "  def ipv4_private?\n" ++
+    "    a = __in4\n" ++
+    "    return false unless a\n" ++
+    "    (a & 0xff000000) == 0x0a000000 || (a & 0xfff00000) == 0xac100000 || (a & 0xffff0000) == 0xc0a80000\n" ++
+    "  end\n" ++
+    "  def ipv4_loopback?\n" ++
+    "    a = __in4\n" ++
+    "    a ? (a & 0xff000000) == 0x7f000000 : false\n" ++
+    "  end\n" ++
+    "  def ipv4_multicast?\n" ++
+    "    a = __in4\n" ++
+    "    a ? (a & 0xf0000000) == 0xe0000000 : false\n" ++
+    "  end\n" ++
+    "  def ipv6_unspecified?\n" ++
+    "    b = __in6\n" ++
+    "    b ? b.all?(&:zero?) : false\n" ++
+    "  end\n" ++
+    "  def ipv6_loopback?\n" ++
+    "    b = __in6\n" ++
+    "    b ? b[0, 15].all?(&:zero?) && b[15] == 1 : false\n" ++
+    "  end\n" ++
+    "  def ipv6_multicast?\n" ++
+    "    b = __in6\n" ++
+    "    b ? b[0] == 0xff : false\n" ++
+    "  end\n" ++
+    "  def ipv6_linklocal?\n" ++
+    "    b = __in6\n" ++
+    "    b ? b[0] == 0xfe && (b[1] & 0xc0) == 0x80 : false\n" ++
+    "  end\n" ++
+    "  def ipv6_sitelocal?\n" ++
+    "    b = __in6\n" ++
+    "    b ? b[0] == 0xfe && (b[1] & 0xc0) == 0xc0 : false\n" ++
+    "  end\n" ++
+    "  def ipv6_unique_local?\n" ++
+    "    b = __in6\n" ++
+    "    b ? (b[0] & 0xfe) == 0xfc : false\n" ++
+    "  end\n" ++
+    "  def ipv6_v4mapped?\n" ++
+    "    b = __in6\n" ++
+    "    b ? b[0, 10].all?(&:zero?) && b[10] == 0xff && b[11] == 0xff : false\n" ++
+    "  end\n" ++
+    "  def ipv6_v4compat?\n" ++
+    "    b = __in6\n" ++
+    "    return false unless b && b[0, 12].all?(&:zero?)\n" ++
+    "    v = (b[12] << 24) | (b[13] << 16) | (b[14] << 8) | b[15]\n" ++
+    "    v != 0 && v != 1\n" ++
+    "  end\n" ++
+    "  def __mc_scope?(scope)\n" ++
+    "    b = __in6\n" ++
+    "    b ? b[0] == 0xff && (b[1] & 0x0f) == scope : false\n" ++
+    "  end\n" ++
+    "  def ipv6_mc_nodelocal?\n" ++
+    "    __mc_scope?(1)\n" ++
+    "  end\n" ++
+    "  def ipv6_mc_linklocal?\n" ++
+    "    __mc_scope?(2)\n" ++
+    "  end\n" ++
+    "  def ipv6_mc_sitelocal?\n" ++
+    "    __mc_scope?(5)\n" ++
+    "  end\n" ++
+    "  def ipv6_mc_orglocal?\n" ++
+    "    __mc_scope?(8)\n" ++
+    "  end\n" ++
+    "  def ipv6_mc_global?\n" ++
+    "    __mc_scope?(0x0e)\n" ++
+    "  end\n" ++
+    "  def ipv6_to_ipv4\n" ++
+    "    return nil unless ipv6?\n" ++
+    "    return nil unless ipv6_v4mapped? || ipv6_v4compat?\n" ++
+    "    ai = Addrinfo.allocate\n" ++
+    "    ai.__init(Addrinfo.__sin(@sockaddr[20, 4], 0), Socket::PF_INET, @socktype, @protocol, @canonname, @inspectname)\n" ++
+    "    ai\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # unixsocket_len: the path is what is left once the trailing NULs go.\n" ++
+    "  def __unix_len\n" ++
+    "    return -1 if @sockaddr.bytesize < 2\n" ++
+    "    e = @sockaddr.bytesize\n" ++
+    "    e -= 1 while e > 2 && @sockaddr.getbyte(e - 1) == 0\n" ++
+    "    e - 2\n" ++
+    "  end\n" ++
+    "  def unix_path\n" ++
+    "    raise SocketError, \"need AF_UNIX address\" unless unix?\n" ++
+    "    n = __unix_len\n" ++
+    "    @sockaddr[2, n]\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def inspect_sockaddr\n" ++
+    "    sa = @sockaddr\n" ++
+    "    len = sa.bytesize\n" ++
+    "    return \"empty-sockaddr\" if len == 0\n" ++
+    "    return \"too-short-sockaddr\" if len < 2\n" ++
+    "    case sa.getbyte(1)\n" ++
+    "    when Socket::AF_UNSPEC\n" ++
+    "      \"UNSPEC\"\n" ++
+    "    when Socket::AF_INET\n" ++
+    "      out = +\"\"\n" ++
+    "      out << (len >= 5 ? sa.getbyte(4).to_s : \"?\")\n" ++
+    "      out << (len >= 6 ? \".#\{sa.getbyte(5)}\" : \".?\")\n" ++
+    "      out << (len >= 7 ? \".#\{sa.getbyte(6)}\" : \".?\")\n" ++
+    "      out << (len >= 8 ? \".#\{sa.getbyte(7)}\" : \".?\")\n" ++
+    "      if len > 4\n" ++
+    "        port = sa[2, 2].unpack1(\"n\")\n" ++
+    "        out << \":#\{port}\" if port != 0\n" ++
+    "      else\n" ++
+    "        out << \":?\"\n" ++
+    "      end\n" ++
+    "      out << \" (#\{len} bytes for #\{SIN_LEN__} bytes sockaddr_in)\" if len != SIN_LEN__\n" ++
+    "      out\n" ++
+    "    when Socket::AF_INET6\n" ++
+    "      return \"too-short-AF_INET6-sockaddr #\{len} bytes\" if len < SIN6_LEN__\n" ++
+    "      h = __ntop6_text\n" ++
+    "      port = sa[2, 2].unpack1(\"n\")\n" ++
+    "      out = port == 0 ? h : \"[#\{h}]:#\{port}\"\n" ++
+    "      out += \"(sockaddr #\{len - SIN6_LEN__} bytes too long)\" if len > SIN6_LEN__\n" ++
+    "      out\n" ++
+    "    when Socket::AF_UNIX\n" ++
+    "      n = __unix_len\n" ++
+    "      return \"too-short-AF_UNIX-sockaddr\" if n < 0\n" ++
+    "      return \"empty-path-AF_UNIX-sockaddr\" if n == 0\n" ++
+    "      path = sa[2, n]\n" ++
+    "      if path.bytes.all? \{ |c| c > 0x20 && c < 0x7f }\n" ++
+    "        (path.getbyte(0) == 0x2f ? \"\" : \"UNIX \") + path\n" ++
+    "      else\n" ++
+    "        \"UNIX\" + path.bytes.map \{ |c| format(\":%02x\", c) }.join\n" ++
+    "      end\n" ++
+    "    else\n" ++
+    "      id = Socket::Constants.__intern(sa.getbyte(1), /\\AAF_/)\n" ++
+    "      id ? \"#\{id} address format unknown\" : \"unknown address family #\{sa.getbyte(1)}\"\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def inspect\n" ++
+    "    out = \"#<#\{self.class}: \" + inspect_sockaddr\n" ++
+    "    if @pfamily != 0 && afamily != @pfamily\n" ++
+    "      id = Socket::Constants.__intern(@pfamily, /\\APF_/)\n" ++
+    "      out << (id ? \" #\{id}\" : \" PF_???(#\{@pfamily})\")\n" ++
+    "    end\n" ++
+    "    internet = @pfamily == Socket::PF_INET || @pfamily == Socket::PF_INET6\n" ++
+    "    if internet && @socktype == Socket::SOCK_STREAM && (@protocol == 0 || @protocol == Socket::IPPROTO_TCP)\n" ++
+    "      out << \" TCP\"\n" ++
+    "    elsif internet && @socktype == Socket::SOCK_DGRAM && (@protocol == 0 || @protocol == Socket::IPPROTO_UDP)\n" ++
+    "      out << \" UDP\"\n" ++
+    "    else\n" ++
+    "      if @socktype != 0\n" ++
+    "        id = Socket::Constants.__intern(@socktype, /\\ASOCK_/)\n" ++
+    "        out << (id ? \" #\{id}\" : \" SOCK_???(#\{@socktype})\")\n" ++
+    "      end\n" ++
+    "      if @protocol != 0\n" ++
+    "        id = internet ? Socket::Constants.__intern(@protocol, /\\AIPPROTO_/) : nil\n" ++
+    "        out << (id ? \" #\{id}\" : \" UNKNOWN_PROTOCOL(#\{@protocol})\")\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    out << \" #\{@canonname}\" if @canonname\n" ++
+    "    out << \" (#\{@inspectname})\" if @inspectname\n" ++
+    "    out << \">\"\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def marshal_dump\n" ++
+    "    af = afamily\n" ++
+    "    pf = Socket::Constants.__intern(@pfamily, /\\APF_/)\n" ++
+    "    raise SocketError, \"unknown protocol family: #\{@pfamily}\" if pf.nil?\n" ++
+    "    st = 0\n" ++
+    "    if @socktype != 0\n" ++
+    "      st = Socket::Constants.__intern(@socktype, /\\ASOCK_/)\n" ++
+    "      raise SocketError, \"unknown socktype: #\{@socktype}\" if st.nil?\n" ++
+    "    end\n" ++
+    "    pr = 0\n" ++
+    "    if @protocol != 0\n" ++
+    "      raise SocketError, \"unknown protocol: #\{@protocol}\" unless Socket::Constants.__ip_family?(af)\n" ++
+    "      pr = Socket::Constants.__intern(@protocol, /\\AIPPROTO_/)\n" ++
+    "      raise SocketError, \"unknown IP protocol: #\{@protocol}\" if pr.nil?\n" ++
+    "    end\n" ++
+    "    afs = Socket::Constants.__intern(af, /\\AAF_/)\n" ++
+    "    raise SocketError, \"unknown address family: #\{af}\" if afs.nil?\n" ++
+    "    sa = af == Socket::AF_UNIX ? unix_path : __numeric_pair\n" ++
+    "    [afs, sa, pf, st, pr, @canonname, @inspectname]\n" ++
+    "  end\n" ++
+    "  def marshal_load(ary)\n" ++
+    "    raise TypeError, \"already initialized socket address\" if @sockaddr\n" ++
+    "    ary = ary.to_ary\n" ++
+    "    af = Socket::Constants.__lookup(ary[0].to_str, /\\A(AF_|PF_)/, /\\AAF_/)\n" ++
+    "    raise TypeError, \"unexpected address family\" if af.nil?\n" ++
+    "    pf = Socket::Constants.__lookup(ary[2].to_str, /\\A(AF_|PF_)/, /\\AAF_/)\n" ++
+    "    raise TypeError, \"unexpected protocol family\" if pf.nil?\n" ++
+    "    st = ary[3] == 0 ? 0 : Socket::Constants.__lookup(ary[3].to_str, /\\ASOCK_/, /\\ASOCK_/)\n" ++
+    "    raise TypeError, \"unexpected socktype\" if st.nil?\n" ++
+    "    pr = 0\n" ++
+    "    if ary[4] != 0\n" ++
+    "      raise TypeError, \"unexpected protocol\" unless Socket::Constants.__ip_family?(af)\n" ++
+    "      pr = Socket::Constants.__lookup(ary[4].to_str, /\\AIPPROTO_/, /\\AIPPROTO_/)\n" ++
+    "      raise TypeError, \"unexpected protocol\" if pr.nil?\n" ++
+    "    end\n" ++
+    "    canon = ary[5].nil? ? nil : ary[5].to_str\n" ++
+    "    iname = ary[6].nil? ? nil : ary[6].to_str\n" ++
+    "    if af == Socket::AF_UNIX\n" ++
+    "      sa = Addrinfo.__unix_sockaddr(ary[1].to_str)\n" ++
+    "    else\n" ++
+    "      pair = ary[1].to_ary\n" ++
+    "      sa = Addrinfo.__gai(pair[0], pair[1], pf, st, pr, Socket::AI_NUMERICHOST | Socket::AI_NUMERICSERV, true)[0][3]\n" ++
+    "    end\n" ++
+    "    __init(sa, pf, st, pr, canon, iname)\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  def family_addrinfo(*args)\n" ++
+    "    if args.empty?\n" ++
+    "      raise ArgumentError, \"no address specified\"\n" ++
+    "    elsif Addrinfo === args.first\n" ++
+    "      raise ArgumentError, \"too many arguments\" if args.length != 1\n" ++
+    "      addrinfo = args.first\n" ++
+    "      if (self.pfamily != addrinfo.pfamily) || (self.socktype != addrinfo.socktype)\n" ++
+    "        raise ArgumentError, \"Addrinfo type mismatch\"\n" ++
+    "      end\n" ++
+    "      addrinfo\n" ++
+    "    elsif self.ip?\n" ++
+    "      raise ArgumentError, \"IP address needs host and port but #\{args.length} arguments given\" if args.length != 2\n" ++
+    "      host, port = args\n" ++
+    "      Addrinfo.getaddrinfo(host, port, self.pfamily, self.socktype, self.protocol)[0]\n" ++
+    "    elsif self.unix?\n" ++
+    "      raise ArgumentError, \"UNIX socket needs single path argument but #\{args.length} arguments given\" if args.length != 1\n" ++
+    "      path, = args\n" ++
+    "      Addrinfo.unix(path)\n" ++
+    "    else\n" ++
+    "      raise ArgumentError, \"unexpected family\"\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def connect_internal(local_addrinfo, timeout = nil)\n" ++
+    "    if timeout && timeout <= 0\n" ++
+    "      raise Errno::ETIMEDOUT, \"user specified timeout for #\{ip_address}:#\{ip_port}\"\n" ++
+    "    end\n" ++
+    "    sock = Socket.new(self.pfamily, self.socktype, self.protocol)\n" ++
+    "    begin\n" ++
+    "      sock.bind(local_addrinfo) if local_addrinfo\n" ++
+    "      sock.connect(self)\n" ++
+    "    rescue Exception\n" ++
+    "      sock.close\n" ++
+    "      raise\n" ++
+    "    end\n" ++
+    "    if block_given?\n" ++
+    "      begin\n" ++
+    "        yield sock\n" ++
+    "      ensure\n" ++
+    "        sock.close\n" ++
+    "      end\n" ++
+    "    else\n" ++
+    "      sock\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  protected :connect_internal\n" ++
+    "  def connect_from(*args, timeout: nil, &block)\n" ++
+    "    connect_internal(family_addrinfo(*args), timeout, &block)\n" ++
+    "  end\n" ++
+    "  def connect(timeout: nil, &block)\n" ++
+    "    connect_internal(nil, timeout, &block)\n" ++
+    "  end\n" ++
+    "  def connect_to(*args, timeout: nil, &block)\n" ++
+    "    remote_addrinfo = family_addrinfo(*args)\n" ++
+    "    remote_addrinfo.connect_internal(self, timeout, &block)\n" ++
+    "  end\n" ++
+    "  def bind\n" ++
+    "    sock = Socket.new(self.pfamily, self.socktype, self.protocol)\n" ++
+    "    begin\n" ++
+    "      sock.setsockopt(:SOCKET, :REUSEADDR, 1)\n" ++
+    "      sock.bind(self)\n" ++
+    "    rescue Exception\n" ++
+    "      sock.close\n" ++
+    "      raise\n" ++
+    "    end\n" ++
+    "    if block_given?\n" ++
+    "      begin\n" ++
+    "        yield sock\n" ++
+    "      ensure\n" ++
+    "        sock.close\n" ++
+    "      end\n" ++
+    "    else\n" ++
+    "      sock\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def listen(backlog = Socket::SOMAXCONN)\n" ++
+    "    sock = Socket.new(self.pfamily, self.socktype, self.protocol)\n" ++
+    "    begin\n" ++
+    "      sock.bind(self)\n" ++
+    "      sock.listen(backlog)\n" ++
+    "    rescue Exception\n" ++
+    "      sock.close\n" ++
+    "      raise\n" ++
+    "    end\n" ++
+    "    if block_given?\n" ++
+    "      begin\n" ++
+    "        yield sock\n" ++
+    "      ensure\n" ++
+    "        sock.close\n" ++
+    "      end\n" ++
+    "    else\n" ++
+    "      sock\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "class Socket < BasicSocket\n" ++
+    "  class Option\n" ++
+    "    def initialize(family, level, optname, data)\n" ++
+    "      @family = Constants.__family_arg(family)\n" ++
+    "      @level = Constants.__level_arg(@family, level)\n" ++
+    "      @optname = Constants.__optname_arg(@family, @level, optname)\n" ++
+    "      @data = data.is_a?(String) ? data : data.to_str\n" ++
+    "    end\n" ++
+    "    attr_reader :family, :level, :optname, :data\n" ++
+    "    alias to_s data\n" ++
+    "    def self.__new(family, level, optname, data)\n" ++
+    "      o = allocate\n" ++
+    "      o.instance_variable_set(:@family, family)\n" ++
+    "      o.instance_variable_set(:@level, level)\n" ++
+    "      o.instance_variable_set(:@optname, optname)\n" ++
+    "      o.instance_variable_set(:@data, data)\n" ++
+    "      o\n" ++
+    "    end\n" ++
+    "    def self.__args(family, level, optname)\n" ++
+    "      f = Constants.__family_arg(family)\n" ++
+    "      l = Constants.__level_arg(f, level)\n" ++
+    "      [f, l, Constants.__optname_arg(f, l, optname)]\n" ++
+    "    end\n" ++
+    "    def self.int(family, level, optname, integer)\n" ++
+    "      f, l, o = __args(family, level, optname)\n" ++
+    "      __new(f, l, o, [Socket::Constants.__int(integer)].pack(\"i\"))\n" ++
+    "    end\n" ++
+    "    def self.byte(family, level, optname, integer)\n" ++
+    "      f, l, o = __args(family, level, optname)\n" ++
+    "      __new(f, l, o, [Socket::Constants.__int(integer)].pack(\"c\"))\n" ++
+    "    end\n" ++
+    "    def self.bool(family, level, optname, bool)\n" ++
+    "      f, l, o = __args(family, level, optname)\n" ++
+    "      __new(f, l, o, [bool ? 1 : 0].pack(\"i\"))\n" ++
+    "    end\n" ++
+    "    def self.linger(onoff, secs)\n" ++
+    "      on = onoff.respond_to?(:to_int) ? onoff.to_int : (onoff ? 1 : 0)\n" ++
+    "      __new(Socket::AF_UNSPEC, Socket::SOL_SOCKET, Socket::SO_LINGER, [on, Socket::Constants.__int(secs)].pack(\"i2\"))\n" ++
+    "    end\n" ++
+    "    def __check_size(size, what)\n" ++
+    "      if @data.bytesize != size\n" ++
+    "        raise TypeError, \"size differ.  expected as #\{what}=#\{size} but #\{@data.bytesize}\"\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "    def int\n" ++
+    "      __check_size(4, \"sizeof(int)\")\n" ++
+    "      @data.unpack1(\"i\")\n" ++
+    "    end\n" ++
+    "    def byte\n" ++
+    "      __check_size(1, \"sizeof(char)\")\n" ++
+    "      @data.unpack1(\"c\")\n" ++
+    "    end\n" ++
+    "    def bool\n" ++
+    "      return @data.getbyte(0) != 0 if @data.bytesize == 1\n" ++
+    "      __check_size(4, \"sizeof(int)\")\n" ++
+    "      @data.unpack1(\"i\") != 0\n" ++
+    "    end\n" ++
+    "    def linger\n" ++
+    "      if @level != Socket::SOL_SOCKET || @optname != Socket::SO_LINGER\n" ++
+    "        raise TypeError, \"linger socket option expected\"\n" ++
+    "      end\n" ++
+    "      __check_size(8, \"sizeof(struct linger)\")\n" ++
+    "      on, secs = @data.unpack(\"i2\")\n" ++
+    "      [on == 0 ? false : on == 1 ? true : on, secs]\n" ++
+    "    end\n" ++
+    "    def unpack(template)\n" ++
+    "      @data.unpack(template)\n" ++
+    "    end\n" ++
+    "    INT_SO__ = %w[SO_DEBUG SO_ACCEPTCONN SO_BROADCAST SO_REUSEADDR SO_KEEPALIVE SO_OOBINLINE\n" ++
+    "                  SO_SNDBUF SO_RCVBUF SO_DONTROUTE SO_RCVLOWAT SO_SNDLOWAT]\n" ++
+    "    def inspect\n" ++
+    "      out = \"#<#\{self.class}:\"\n" ++
+    "      fid = Constants.__intern(@family, /\\AAF_/, /\\AAF_/)\n" ++
+    "      out << (fid ? \" #\{fid}\" : \" family:#\{@family}\")\n" ++
+    "      kind = nil\n" ++
+    "      if @level == Socket::SOL_SOCKET\n" ++
+    "        out << \" SOCKET\"\n" ++
+    "        oid = Constants.__intern(@optname, /\\ASO_/, /\\ASO_/)\n" ++
+    "        out << (oid ? \" #\{oid}\" : \" optname:#\{@optname}\")\n" ++
+    "        kind = \"SO_#\{oid}\" if oid\n" ++
+    "      elsif Constants.__ip_family?(@family)\n" ++
+    "        lid = Constants.__intern(@level, /\\A(SOL_SOCKET\\z|IPPROTO_)/, /\\A(SOL_|IPPROTO_)/)\n" ++
+    "        out << (lid ? \" #\{lid}\" : \" level:#\{@level}\")\n" ++
+    "        k = Constants.__level_kind(@family, @level)\n" ++
+    "        oid = k && Constants.__intern(@optname, Constants.__opt_table(k)[0], Regexp.new(\"\\\\A#\{k}_\"))\n" ++
+    "        out << (oid ? \" #\{oid}\" : \" optname:#\{@optname}\")\n" ++
+    "      else\n" ++
+    "        out << \" level:#\{@level} optname:#\{@optname}\"\n" ++
+    "      end\n" ++
+    "      if kind == \"SO_LINGER\" && @data.bytesize == 8\n" ++
+    "        on, secs = @data.unpack(\"i2\")\n" ++
+    "        out << (on == 0 ? \" off\" : on == 1 ? \" on\" : \" on(#\{on})\")\n" ++
+    "        out << \" #\{secs}sec\"\n" ++
+    "      elsif kind && INT_SO__.include?(kind) && @data.bytesize == 4\n" ++
+    "        out << \" #\{@data.unpack1('i')}\"\n" ++
+    "      else\n" ++
+    "        out << \" \" << @data.dump\n" ++
+    "      end\n" ++
+    "      out << \">\"\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  class AncillaryData\n" ++
+    "    def initialize(family, level, type, data)\n" ++
+    "      @family = Constants.__family_arg(family)\n" ++
+    "      @level = Constants.__level_arg(@family, level)\n" ++
+    "      @type = Constants.__cmsg_type_arg(@family, @level, type)\n" ++
+    "      @data = data.is_a?(String) ? data : data.to_str\n" ++
+    "    end\n" ++
+    "    attr_reader :family, :level, :type, :data\n" ++
+    "    def self.__new(family, level, type, data)\n" ++
+    "      a = allocate\n" ++
+    "      a.instance_variable_set(:@family, family)\n" ++
+    "      a.instance_variable_set(:@level, level)\n" ++
+    "      a.instance_variable_set(:@type, type)\n" ++
+    "      a.instance_variable_set(:@data, data)\n" ++
+    "      a\n" ++
+    "    end\n" ++
+    "    def self.int(family, level, type, integer)\n" ++
+    "      f = Constants.__family_arg(family)\n" ++
+    "      l = Constants.__level_arg(f, level)\n" ++
+    "      t = Constants.__cmsg_type_arg(f, l, type)\n" ++
+    "      __new(f, l, t, [Socket::Constants.__int(integer)].pack(\"i\"))\n" ++
+    "    end\n" ++
+    "    def int\n" ++
+    "      if @data.bytesize != 4\n" ++
+    "        raise TypeError, \"size differ.  expected as sizeof(int)=4 but #\{@data.bytesize}\"\n" ++
+    "      end\n" ++
+    "      @data.unpack1(\"i\")\n" ++
+    "    end\n" ++
+    "    def cmsg_is?(level, type)\n" ++
+    "      l = Constants.__level_arg(@family, level)\n" ++
+    "      t = Constants.__cmsg_type_arg(@family, l, type)\n" ++
+    "      @level == l && @type == t\n" ++
+    "    end\n" ++
+    "    def self.unix_rights(*ios)\n" ++
+    "      ios.each \{ |io| raise TypeError, \"IO expected\" unless io.is_a?(IO) || io.is_a?(BasicSocket) }\n" ++
+    "      a = __new(Socket::AF_UNIX, Socket::SOL_SOCKET, Socket::SCM_RIGHTS, ios.map(&:fileno).pack(\"i*\"))\n" ++
+    "      a.instance_variable_set(:@unix_rights, ios)\n" ++
+    "      a\n" ++
+    "    end\n" ++
+    "    def unix_rights\n" ++
+    "      if @level != Socket::SOL_SOCKET || @type != Socket::SCM_RIGHTS\n" ++
+    "        raise TypeError, \"SCM_RIGHTS ancillary data expected\"\n" ++
+    "      end\n" ++
+    "      @unix_rights\n" ++
+    "    end\n" ++
+    "    def self.__sa(v)\n" ++
+    "      v.is_a?(Addrinfo) ? v.to_sockaddr : v.to_str\n" ++
+    "    end\n" ++
+    "    # struct in_pktinfo is \{ ifindex, spec_dst, addr }: 4 + 4 + 4 bytes.\n" ++
+    "    def self.ip_pktinfo(addr, ifindex, spec_dst = nil)\n" ++
+    "      a = __sa(addr)\n" ++
+    "      idx = Socket::Constants.__int(ifindex)\n" ++
+    "      d = spec_dst.nil? ? a : __sa(spec_dst)\n" ++
+    "      raise ArgumentError, \"addr size different to AF_INET sockaddr\" if a.bytesize != 16\n" ++
+    "      raise ArgumentError, \"addr is not AF_INET sockaddr\" if a.getbyte(1) != Socket::AF_INET\n" ++
+    "      raise ArgumentError, \"spec_dat size different to AF_INET sockaddr\" if d.bytesize != 16\n" ++
+    "      raise ArgumentError, \"spec_dst is not AF_INET sockaddr\" if d.getbyte(1) != Socket::AF_INET\n" ++
+    "      __new(Socket::AF_INET, Socket::IPPROTO_IP, Socket::IP_PKTINFO, [idx].pack(\"L\") + d[4, 4] + a[4, 4])\n" ++
+    "    end\n" ++
+    "    def ip_pktinfo\n" ++
+    "      if @level != Socket::IPPROTO_IP || @type != Socket::IP_PKTINFO || @data.bytesize != 12\n" ++
+    "        raise TypeError, \"IP_PKTINFO ancillary data expected\"\n" ++
+    "      end\n" ++
+    "      idx = @data[0, 4].unpack1(\"L\")\n" ++
+    "      addr = Addrinfo.allocate.__init(Addrinfo.__sin(@data[8, 4], 0), Socket::PF_INET, 0, 0, nil, nil)\n" ++
+    "      dst = Addrinfo.allocate.__init(Addrinfo.__sin(@data[4, 4], 0), Socket::PF_INET, 0, 0, nil, nil)\n" ++
+    "      [addr, idx, dst]\n" ++
+    "    end\n" ++
+    "    # struct in6_pktinfo is \{ addr[16], ifindex }.\n" ++
+    "    def self.ipv6_pktinfo(addr, ifindex)\n" ++
+    "      a = __sa(addr)\n" ++
+    "      idx = Socket::Constants.__int(ifindex)\n" ++
+    "      raise ArgumentError, \"addr size different to AF_INET6 sockaddr\" if a.bytesize != 28\n" ++
+    "      raise ArgumentError, \"addr is not AF_INET6 sockaddr\" if a.getbyte(1) != Socket::AF_INET6\n" ++
+    "      __new(Socket::AF_INET6, Socket::IPPROTO_IPV6, Socket::IPV6_PKTINFO, a[8, 16] + [idx].pack(\"L\"))\n" ++
+    "    end\n" ++
+    "    def __ipv6_pktinfo\n" ++
+    "      if @level != Socket::IPPROTO_IPV6 || @type != Socket::IPV6_PKTINFO || @data.bytesize != 20\n" ++
+    "        raise TypeError, \"IPV6_PKTINFO ancillary data expected\"\n" ++
+    "      end\n" ++
+    "      raw = @data[0, 16]\n" ++
+    "      idx = @data[16, 4].unpack1(\"L\")\n" ++
+    "      linklocal = raw.getbyte(0) == 0xfe && (raw.getbyte(1) & 0xc0) == 0x80\n" ++
+    "      sa = Addrinfo.__sin6(raw, 0, linklocal ? idx : 0)\n" ++
+    "      [Addrinfo.allocate.__init(sa, Socket::PF_INET6, 0, 0, nil, nil), idx]\n" ++
+    "    end\n" ++
+    "    def ipv6_pktinfo\n" ++
+    "      __ipv6_pktinfo\n" ++
+    "    end\n" ++
+    "    def ipv6_pktinfo_addr\n" ++
+    "      __ipv6_pktinfo[0]\n" ++
+    "    end\n" ++
+    "    def ipv6_pktinfo_ifindex\n" ++
+    "      __ipv6_pktinfo[1]\n" ++
+    "    end\n" ++
+    "    def inspect\n" ++
+    "      fid = Constants.__intern(@family, /\\AAF_/, /\\AAF_/)\n" ++
+    "      \"#<#\{self.class}: #\{fid || \"family:#\{@family}\"} #\{@level} #\{@type} #\{@data.inspect}>\"\n" ++
+    "    end\n" ++
+    "  end\n" ++
     "end\n"
   else
   // A monitor is a Mutex, an owner and a count, and its condition variable is
