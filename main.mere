@@ -2169,20 +2169,31 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                     then err_emit world (pre9 ++ body9) else ()))
                 | Nil -> ()) in
        VNil)
-    // Kernel#printf: format, then write it (no newline).
+    // Kernel#printf: format, then write it (no newline). ruby's rb_f_printf
+    // decides by the FIRST argument's type alone: a String is the format and
+    // the output is $stdout; anything else is the IO, sent #write with the
+    // formatted rest (whose format is then converted with #to_str). Only the
+    // String form existed, so `printf(io, "%d", 1)` printed nothing anywhere.
     else if (str_len name == 6 && str_eq name "printf") && (if kernel_overridden env world "printf" then false else true) then
       (let _ = (match args with
                 | Cons (VStr h, rest) -> out_emit world (rb_format env world (sget h) rest)
-                | _ -> ()) in VNil)
-    // Kernel#format / #sprintf: sprintf-style formatting.
+                | Cons (io9, Cons (f9, rest9)) ->
+                  (let fs9 = fmt_str_arg env world f9 in
+                   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                   let _ = invoke_val_c env world nb9 io9 "write" (Cons (mkstr (rb_format env world fs9 rest9), Nil)) false in ())
+                | Cons (_, Nil) -> (let _ = raise_exc world "ArgumentError" "too few arguments" in ())
+                | Nil -> ()) in VNil)
+    // Kernel#format / #sprintf: sprintf-style formatting. A format that is not
+    // a String is converted with #to_str (StringValue), not formatted as "".
     else if ((str_len name == 6 && str_eq name "format") || (str_len name == 7 && str_eq name "sprintf")) && (if kernel_overridden env world name then false else true) then
       (match args with
        | Cons (VStr h, rest) ->
-         let out = rb_format env world (sget h) rest in
+         let out = rb_format_in env world (senc_get h) (sget h) rest in
          let renc = rb_fmt_enc (senc_get h) (sget h) rest in
          let r = mkstr out in
          (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
-       | _ -> mkstr "")
+       | Cons (f9, rest) -> mkstr (rb_format env world (fmt_str_arg env world f9) rest)
+       | Nil -> raise_exc world "ArgumentError" "too few arguments")
     // Kernel#fail is Kernel#raise. `raise` is a parser keyword here (ERaise), so
     // `fail` could not borrow that path and had no branch of its own: `fail "x"`
     // reported an undefined method while `Kernel.fail "x"` worked. This is the
@@ -3268,7 +3279,7 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
         (match va0 with
          | VStr h ->
            let args2 = rb_fmt_args env world vb in
-           let out = rb_format env world (sget h) args2 in
+           let out = rb_format_in env world (senc_get h) (sget h) args2 in
            let renc = rb_fmt_enc (senc_get h) (sget h) args2 in
            let r = mkstr out in
            (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
@@ -26887,10 +26898,27 @@ and rb_format = fn env -> fn world -> fn (fmt: str) -> fn (args: Val list) ->
   let (out, used, mode) = rb_format_go env world fmt 0 args 0 0 "" in
   // leftover arguments are an error only under $DEBUG, and only for the
   // sequential style: numbered and named formats may leave arguments unread.
+  // Under $VERBOSE (true, not merely non-nil) the same case is a warning. A
+  // lone Hash argument is exempt from both: it is there for %{name}, and a
+  // format that happens not to use it is not "too many" (ruby bug #20593).
   let dbg = (if map_has globals "DEBUG" then (match map_get globals "DEBUG" with VNil -> false | VBool b -> b | _ -> true) else false) in
-  if dbg && mode <= 1 && used < val_list_len args then
+  let lone_hash = (match args with Cons (VHsh _, Nil) -> true | _ -> false) in
+  let extra = mode <= 1 && used < val_list_len args && (if lone_hash then false else true) in
+  if dbg && extra then
     (let _ = prim_raise "ArgumentError" "too many arguments for format string" in out)
+  else if extra && (if map_has globals (gvar_slot "VERBOSE")
+                    then (match map_get globals (gvar_slot "VERBOSE") with VBool b -> b | _ -> false) else false) then
+    (let _ = rb_warn world "too many arguments for format string" in out)
   else out
+
+// rb_format with the format String's encoding in view (see fmt_enc_cur).
+and rb_format_in = fn env -> fn world -> fn (enc: str) -> fn (fmt: str) -> fn (args: Val list) ->
+  let had = map_has fmt_enc_cur "v" in
+  let prev = (if had then map_get fmt_enc_cur "v" else "") in
+  let _ = map_set fmt_enc_cur "v" (enc_canon_name enc) in
+  let out = rb_format env world fmt args in
+  let _ = (if had then map_set fmt_enc_cur "v" prev else map_delete fmt_enc_cur "v") in
+  out
 
 and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (acc: str) ->
   let n = str_len fmt in
@@ -26899,26 +26927,6 @@ and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (arg
     let c = char_at fmt i in
     if str_eq c "%" then
       (if i + 1 < n && str_eq (char_at fmt (i + 1)) "%" then rb_format_go env world fmt (i + 2) args nextarg mode (acc ++ "%")
-       // `%{name}` substitutes the hash entry with no format spec at all, and
-       // `%<name>05.2f` names the argument for one. rubocop-ast generates its
-       // node matchers this way, so a format that does not substitute becomes a
-       // syntax error somewhere else entirely.
-       else if i + 1 < n && str_eq (char_at fmt (i + 1)) "\{" then
-         let (key, j) = rb_fmt_name fmt (i + 2) "" "}" in
-         let m2 = rb_fmt_to_named mode in
-         rb_format_go env world fmt j args nextarg m2 (acc ++ rb_fmt_one env world "" (0 - 1) (0 - 1) false "s" (rb_fmt_named args key "\{" "}"))
-       else if i + 1 < n && str_eq (char_at fmt (i + 1)) "<" then
-         let (key, j0) = rb_fmt_name fmt (i + 2) "" ">" in
-         let av = rb_fmt_named args key "<" ">" in
-         let m2 = rb_fmt_to_named mode in
-         // the spec after the name formats exactly this one value: run the
-         // directive parser over a one-element argument list in numbered mode
-         // with the position preset, so a stray %s inside cannot consume the
-         // real argument list.
-         let (piece, j, na9, m9) = rb_fmt_dir env world fmt j0 (Cons (av, Nil)) 0 2 "" (0 - 1) false (0 - 1) false 1 in
-         let _ = na9 in
-         let _ = m9 in
-         rb_format_go env world fmt j args nextarg m2 (acc ++ piece)
        else
          let (piece, j, na2, m2) = rb_fmt_dir env world fmt (i + 1) args nextarg mode "" (0 - 1) false (0 - 1) false 0 in
          rb_format_go env world fmt j args na2 m2 (acc ++ piece))
@@ -26934,14 +26942,25 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
   fn (nextarg: int) -> fn (mode: int) -> fn (flags: str) -> fn (width: int) -> fn (wset: bool) ->
   fn (prec: int) -> fn (pset: bool) -> fn (pos: int) ->
   let n = str_len fmt in
-  if i >= n then (let _ = prim_raise "ArgumentError" "incomplete format specifier; use %% (double %) instead" in ("", i, nextarg, mode))
+  // Where the format ENDS mid-directive decides ruby's (3.4+) message: a bare
+  // "%" is incomplete; after flags, a "$" or a name it is malformed; while a
+  // number is still being read (width, ".", "*") it names the number
+  // ("malformed format string - %*[0-9]"). A newline or NUL is malformed
+  // rather than a type -- ruby used to print it as a literal "%".
+  let mal_num = fn (k: int) -> (let _ = prim_raise "ArgumentError" "malformed format string - %*[0-9]" in ("", k, nextarg, mode)) in
+  if i >= n then
+    (if str_eq flags "" && (if wset then false else true) && (if pset then false else true) && pos <= 0
+     then (let _ = prim_raise "ArgumentError" "incomplete format specifier; use %% (double %) instead" in ("", i, nextarg, mode))
+     else (let _ = prim_raise "ArgumentError" "malformed format string" in ("", i, nextarg, mode)))
   else
     let c = char_at fmt i in
-    if str_eq c "-" || str_eq c "+" || str_eq c " " || str_eq c "#" || str_eq c "0" then
+    if str_eq c "\n" || ord c == 0 then (let _ = prim_raise "ArgumentError" "malformed format string" in ("", i + 1, nextarg, mode))
+    else if str_eq c "-" || str_eq c "+" || str_eq c " " || str_eq c "#" || str_eq c "0" then
       rb_fmt_dir env world fmt (i + 1) args nextarg mode (flags ++ c) width wset prec pset pos
     else if is_digit c then
       let (k, j) = rb_fmt_digits fmt i 0 false in
-      (if j < n && str_eq (char_at fmt j) "$" then
+      (if j >= n then mal_num j
+       else if str_eq (char_at fmt j) "$" then
          (if pos > 0 then (let _ = prim_raise "ArgumentError" ("value given twice - " ++ int_to_base k 10 ++ "$") in ("", j, nextarg, mode))
           else if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in ("", j, nextarg, mode))
           else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in ("", j, nextarg, mode))
@@ -26949,14 +26968,16 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
        else if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", j, nextarg, mode))
        else rb_fmt_dir env world fmt j args nextarg mode flags k true prec pset pos)
     else if str_eq c "*" then
-      (if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
+      (if i + 1 >= n then mal_num (i + 1)
+       else if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
        else
          let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode in
          (if w < 0 then rb_fmt_dir env world fmt j args na2 m2 (flags ++ "-") (0 - w) true prec pset pos
           else rb_fmt_dir env world fmt j args na2 m2 flags w true prec pset pos))
     else if str_eq c "." then
       (if pset then (let _ = prim_raise "ArgumentError" "precision given twice" in ("", i, nextarg, mode))
-       else if i + 1 < n && str_eq (char_at fmt (i + 1)) "*" then
+       else if i + 1 >= n then mal_num (i + 1)
+       else if str_eq (char_at fmt (i + 1)) "*" then
          let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args nextarg mode in
          rb_fmt_dir env world fmt j args na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
        else
@@ -26964,6 +26985,7 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
          // a precision that cannot fit an int is ruby's own refusal (the
          // accumulated value has already wrapped, so measure the DIGITS).
          let _ = (if j - (i + 1) > 9 then (let _ = prim_raise "ArgumentError" "prec too big" in ()) else ()) in
+         let _ = (if j >= n then (let _ = mal_num j in ()) else ()) in
          rb_fmt_dir env world fmt j args nextarg mode flags width wset (if p < 0 then 0 else p) true pos)
     else if rb_fmt_is_type c then
       let (av, na2, m2) =
@@ -26972,8 +26994,61 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
          else if nextarg >= val_list_len args then (let _ = prim_raise "ArgumentError" "too few arguments" in (VNil, nextarg, mode))
          else (val_nth args nextarg, nextarg + 1, 1)) in
       (rb_fmt_one env world flags width prec pset c av, i + 1, na2, m2)
+    // `%{name}` substitutes the hash entry, and `%<name>05.2f` names the
+    // argument for one directive. Either may come AFTER flags, width and
+    // precision (`%-20.5{foo}`, `%+20.10<foo>f`), so the name is one more part
+    // of the directive rather than a form of its own: reading it only right
+    // after the '%' made every such format "malformed format string - %<".
+    // rubocop-ast generates its node matchers this way, so a format that does
+    // not substitute becomes a syntax error somewhere else entirely.
+    else if str_eq c "<" || str_eq c "\{" then
+      let cl = (if str_eq c "<" then ">" else "}") in
+      let (key, j0) = rb_fmt_name fmt (i + 1) "" cl in
+      let _ = rb_fmt_to_named mode in
+      let av = rb_fmt_named_w env world args key c cl in
+      // %{name} takes no type: the value's #to_s is the string, and what follows
+      // the brace is plain text again (`%{foo}d` is "123d").
+      if str_eq c "\{" then (rb_fmt_one env world flags width prec pset "s" av, j0, nextarg, 3)
+      else
+        // the spec after the name formats exactly this one value: run the
+        // directive parser over a one-element argument list with the position
+        // preset, so a stray %s inside cannot consume the real argument list.
+        let (piece, j, na9, m9) = rb_fmt_dir env world fmt j0 (Cons (av, Nil)) 0 2 flags width wset prec pset 1 in
+        let _ = na9 in
+        let _ = m9 in
+        (piece, j, nextarg, 3)
     else (let _ = prim_raise "ArgumentError" ("malformed format string - %" ++ c) in ("", i + 1, nextarg, mode))
 
+
+// A format argument that is not a String: #to_str, as StringValue asks it.
+and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
+  match v with
+  | VStr h -> sget h
+  | _ ->
+    (match conv_try env world v "to_str" with
+     | VStr h -> sget h
+     | VNil -> (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ conv_name v ++ " into String") in "")
+     | other -> (let _ = raise_exc world "TypeError" ("can't convert " ++ class_name v ++ " to String (" ++ class_name v
+                                                      ++ "#to_str gives " ++ class_name other ++ ")") in ""))
+
+// A named reference reads the ONE hash argument (ruby's get_hash: any other
+// argument count is "one hash required"). A missing key asks the hash's
+// #default with the key -- `Hash.new(123)` and `Hash.new { 123 }` both
+// substitute -- and only a nil default is the KeyError, which carries the hash
+// as its receiver and the Symbol as its key (err.key / err.receiver). An
+// existing key whose value is nil is not missing.
+and rb_fmt_named_w = fn env -> fn world -> fn (args: Val list) -> fn (key: str) -> fn (op: str) -> fn (cl: str) ->
+  match args with
+  | Cons (VHsh h, Nil) ->
+    let xs = hderef h in
+    if hash_haskey xs (VSym key) then hash_get xs (VSym key)
+    else
+      (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+       match invoke_val_c env world nb (VHsh h) "default" (Cons (VSym key, Nil)) false with
+       | VNil -> raise_exc_iv world "KeyError" ("key" ++ op ++ key ++ cl ++ " not found")
+                   (Cons (("__key", VSym key), Cons (("__recv", VHsh h), Nil)))
+       | d -> d)
+  | _ -> prim_raise "ArgumentError" "one hash required"
 
 // `*` reads its number from the arguments: a bare `*` takes the next
 // sequential argument, `*3$` a numbered one. Digits NOT followed by '$' are
@@ -27619,9 +27694,18 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
                 then (if str_eq typ "o" then "0" else if str_eq typ "x" || str_eq typ "X" then "0x" else "0b")
                 else "") in
     // no prefix on a zero (%#x % 0 is "0"), nor on an octal already led by 0.
-    let pfx = (if str_eq typ "o" then (if str_len ds > 0 && str_eq (substring ds 0 1) "0" then "" else pfx0)
+    // For %#o the flag is C's "raise the precision until the first digit is
+    // 0": with a precision given, that is the precision's job ("%#.0o" of 0 is
+    // "0", "%#.3o" of 8 is "010"), and the ".." form of a negative is left
+    // alone ("%#o" of -87 is "..7651").
+    let led0 = str_len ds > 0 && str_eq (substring ds 0 1) "0" in
+    let oct = str_eq typ "o" in
+    let pfx = (if oct then (if led0 || neg || pset then "" else pfx0)
                else if str_eq ds "0" then "" else pfx0) in
-    let body = rb_fmt_intlike flags width prec pset neg ds base pfx in
+    let prec2 = (if oct && pset && str_contains flags "#" && (if neg then false else true) then
+                   (let need = (if led0 then str_len ds else str_len ds + 1) in if prec > need then prec else need)
+                 else prec) in
+    let body = rb_fmt_intlike flags width prec2 pset neg ds base pfx in
     (if str_eq typ "X" || str_eq typ "B" then ascii_up body else body)
   else if str_eq typ "s" then
     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -27636,39 +27720,65 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     rb_pad_str s flags width
   else if str_eq typ "c" then
     // each conversion may DECLINE by answering nil (the mspec mocks answer
-    // nil for whatever they were not told): to_str, then to_ary, then to_int.
+    // nil for whatever they were not told): to_str, then to_int.
     let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
     let first_ch = fn (s0: str) -> (if str_len s0 == 0 then "" else utf8_substr s0 0 1) in
+    // A codepoint is a character OF THE FORMAT'S ENCODING, which is exactly
+    // Integer#chr(enc): "%c" in EUC-JP of 0x8FABB1 is those three bytes, and
+    // in US-ASCII 1286 is "1286 out of char range" (RangeError).
+    let fenc = (if map_has fmt_enc_cur "v" then map_get fmt_enc_cur "v" else "UTF-8") in
+    let cp_chr = fn (cp: int) ->
+      (if enc_utf8_family fenc then utf8_enc cp
+       // ...except that US-ASCII's character length is one BYTE for anything
+       // under 256 (onigmo's code_to_mbclen), so "%c" there takes 200 where
+       // 200.chr("US-ASCII") refuses it.
+       else if str_eq fenc "US-ASCII" && cp >= 0 && cp < 256 then chr cp
+       else
+         (let eo = invoke_val_c env world nb (VClass "Encoding") "find" (Cons (mkstr fenc, Nil)) false in
+          match invoke_val_c env world nb (VInt cp) "chr" (Cons (eo, Nil)) false with
+          | VStr q -> sget q
+          | _ -> "")) in
     let s = (match av with
       | VStr h -> first_ch (sget h)
-      | VInt cp -> utf8_enc cp
+      | VInt cp -> cp_chr cp
       | _ ->
         let ts = (if responds world av "to_str" then invoke_val_c env world nb av "to_str" Nil false else VNil) in
         (match ts with
          | VStr h -> first_ch (sget h)
-         | _ ->
-           let ta = (if responds world av "to_ary" then invoke_val_c env world nb av "to_ary" Nil false else VNil) in
-           (match ta with
-            | VArr id -> (match deref id with
-                          | Cons (VInt cp, _) -> utf8_enc cp
-                          | Cons (VStr h, _) -> first_ch (sget h)
-                          | _ -> "")
-            | _ ->
-              let ti = (if responds world av "to_int" then invoke_val_c env world nb av "to_int" Nil false else VNil) in
-              (match ti with
-               | VInt cp -> utf8_enc cp
-               | _ -> (let _ = prim_raise "TypeError" ("no implicit conversion of " ++ class_name av ++ " into Integer") in ""))))) in
+         | VNil ->
+           // ruby's %c is rb_check_string_type, then NUM2INT -- an Array is
+           // not asked for #to_ary ("%c" % [[97]] is a TypeError).
+           let ti = (if responds world av "to_int" then invoke_val_c env world nb av "to_int" Nil false else VNil) in
+           (match ti with
+            | VInt cp -> cp_chr cp
+            | VNil -> (let _ = prim_raise "TypeError" ("no implicit conversion of " ++ class_name av ++ " into Integer") in "")
+            | _ -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name av ++ " into Integer") in ""))
+         | _ -> (let _ = prim_raise "TypeError" ("can't convert " ++ class_name av ++ " into String") in ""))) in
     rb_pad_str s flags width
-  else if str_eq typ "f" || str_eq typ "e" || str_eq typ "E" || str_eq typ "g" || str_eq typ "G" then
+  else if str_eq typ "f" || str_eq typ "e" || str_eq typ "E" || str_eq typ "g" || str_eq typ "G" || str_eq typ "a" || str_eq typ "A" then
     let fv = rb_fmt_flt env world av in
-    let sign = (if fv < 0.0 then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
+    // -0.0 is negative to printf (C's signbit): "%f" % -0.0 is "-0.000000".
+    let neg = fv < 0.0 || (fv == 0.0 && 1.0 / fv < 0.0) in
+    let sign = (if neg then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
     let sp = float_special fv in
+    let alt = str_contains flags "#" in
     if str_len sp > 0 then rb_pad_special sign sp flags width
+    else if str_eq typ "a" || str_eq typ "A" then
+      // the zero padding goes between "0x" and the digits ("0x0001.8p+1").
+      (let (digits, ex) = fmt_hex_abs fv (if pset && prec >= 0 then prec else 0 - 1) alt in
+       let body = rb_pad_num (sign ++ "0x") (digits ++ ex) flags width in
+       if str_eq typ "A" then ascii_up body else body)
     else
       let p = (if pset && prec >= 0 then prec else if str_eq typ "g" || str_eq typ "G" then 0 - 1 else 6) in
-      let body = (if str_eq typ "f" then fmt_float_abs (VFlt fv) p
-                  else if str_eq typ "g" || str_eq typ "G" then fmt_g_abs (VFlt fv) p (str_eq typ "G") (str_contains flags "#")
-                  else fmt_sci_abs (VFlt fv) p (str_eq typ "E")) in
+      let body0 = (if str_eq typ "f" then fmt_float_abs (VFlt fv) p
+                   else if str_eq typ "g" || str_eq typ "G" then fmt_g_abs (VFlt fv) p (str_eq typ "G") alt
+                   else fmt_sci_abs (VFlt fv) p (str_eq typ "E")) in
+      // '#' keeps the decimal point when no digit follows it: "%#.0f" of 123.4
+      // is "123.", "%#.0e" of 100 is "1.e+02" (and %#g's exponent form too).
+      let body = (if alt && (if str_contains body0 "." then false else true) then
+                    (let ei = g_e_index body0 0 in
+                     if ei < 0 then body0 ++ "." else substring body0 0 ei ++ "." ++ substring body0 ei (str_len body0))
+                  else body0) in
       rb_pad_num sign body flags width
   else if str_eq typ "" then ""
   else "%" ++ typ
@@ -37309,9 +37419,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
         let _ = store_proc (str_of_int pid) (true, (Nil : str list), body, env) in
         let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
         FNext VNil))
+  // ⚠ The parser also builds this for a CHAINED assignment (`$g = a = 5`,
+  // `X = y = 1`), whose target is not necessarily a local: binding every one
+  // with lv_set left the global or constant unassigned (nil) and made a
+  // local named "$g" instead. mspec's printf spec swaps $stdout exactly so
+  // (`$stdout = io = StringIO.new`), and the output went to the terminal.
   | SLocalFrom (name, s) ->
     (match exec_stmt env world blk s with
-     | FNext v -> let _ = lv_set env name v in FNext v
+     | FNext v ->
+       let _ = (if str_len name > 0 && (str_eq (char_at name 0) "$" || str_eq (char_at name 0) "@" || is_upper_first name)
+                then assign_one env world name v
+                else lv_set env name v) in
+       FNext v
      | other -> other)
   | SMultiAssign (targets, rhs) ->
     // build the value list: a single array RHS is destructured; several
