@@ -1045,3 +1045,34 @@ across workers, and neither scheduling nor worker count moves it. The two
 remaining items in the loop are both outside this repository: the 41s emit and
 the ~350s `clang` invocation, which needs the emitted C split into several
 translation units.
+
+## 2026-09-30: a hung spec can empty the rest of a sweep
+
+The first full sweep after merging eight parallel clusters recorded **308 SKIPs**
+where the record had none: from the middle of `core/argf` on, every file's
+reference side printed no tally, across all six workers. Swept again one group
+at a time, every one of those groups ran normally (`core/io` 0 → 77/81). The same
+run had three files the harness had to stop:
+
+- `core/process/spawn_spec` -- `run_spec.sh` itself past the outer 1260 s bound.
+  `spawn(..., close_others: true)` ignored the option, the child kept a pipe's
+  write end, and the parent waited on a read for an end of file; the child it
+  had started was left polling for a file nobody would delete.
+- `core/process/exit_spec` and `core/kernel/exit_spec` -- the 600 s wall. `exit`
+  in a thread never reached the main thread, which slept on.
+
+With the three fixed, the next full sweep had **0 SKIPs** and MATCH 2717 (2722
+after two follow-ups). The link between the hangs and the collapse is inferred
+from that before/after, not traced.
+
+- ⚠ **Read the SKIP column before the MATCH column.** A SKIP means the
+  reference did not run: a block of them says "the instrument broke here", and
+  recorded as it stood the table would have shown hundreds of files lost.
+- Compare the new table to the recorded one group by group (MATCH down, SKIP
+  up) before replacing it. `scoreboard.sh <root> <group> ...` re-sweeps only the
+  named groups and keeps every other row.
+- A file stopped by a bound is found example by example with a throwaway tree
+  whose shim prints each example's name to stderr before running it.
+- ⚠ **`--fast` is -O1 now.** -O0 could no longer run the prelude at all (the
+  lexer's per-token tail call is a frame at -O0), and `scoreboard.sh` refuses
+  an O1 build as it refused O0.
