@@ -1537,7 +1537,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       run_meth world superblk recv ext9 meth (map_get meths (ext9 ++ "#" ++ meth)) args
     else if is_sng_cls defcls then
       (let supercls = sng_supername world defcls in
-       if has_meth world supercls meth then invoke world superblk recv supercls meth args
+       // ⚠ a module the singleton was EXTENDED with comes before the
+       //   superclass's singleton (a module function's super reaches it:
+       //   `m.extend(sm); module_function; def foo = super`), and asking the
+       //   superclass alone skipped it
+       let ext9 = lookup_anc world (anc_after_or_all (ancestors_of world defcls) defcls) meth in
+       if (if str_eq ext9 "" then false else map_has modules ext9) then
+         run_meth world superblk recv ext9 meth (map_get meths (ext9 ++ "#" ++ meth)) args
+       else if has_meth world supercls meth then invoke world superblk recv supercls meth args
        // a definition hook (inherited / included / ...) is a no-op in Ruby,
        // so `super` from an override of one has somewhere to land.
        else if is_definition_hook meth then VNil
@@ -2401,6 +2408,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    else ()) in
           // ...and the class (or, for a singleton, the object) hears of it,
           // as for every other door into the method table
+          let _ = (if str_eq c "" then () else dm_scope_vis env world c nm) in
           let _ = (if str_eq c "" then () else run_method_added world c nm) in
           VSym nm
        | _ -> VNil)
@@ -13757,7 +13765,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              | _ -> Cons (mkstr (sym_or_str_arg env world o9), conv9 t9))) in
        let names = vis_arg_names (conv9 args) in
        let _ = (match names with
-                | Nil -> ()
+                // with NO names it sets the default visibility of the scope it
+                // was called from (see "__vis" in register_class_v) -- a
+                // `send :private`, or a `private` inside a block in the body
+                | Nil -> (if (match args with Nil -> true | _ -> false)
+                             && (if (str_len name == 20 && str_eq name "private_class_method") || (str_len name == 19 && str_eq name "public_class_method") then false else true)
+                             && lv_has env "__vis"
+                          then lv_set env "__vis" (mkstr name) else ())
                 | _ -> if (str_len name == 15 && str_eq name "module_function") then
                          (if map_has modules c then modfunc_promote_hooked world c names
                           // ...and it is a MODULE's method: a class has no
@@ -13773,7 +13787,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                          (let _ = vis_names_check world ("(sng:" ++ c ++ ")") names in
                           mark_vis_mode meths0 ("(sng:" ++ c ++ ")") names "public")
                        else (let _ = vis_names_check world c names in
-                             mark_vis_mode meths0 c names name)) in
+                             // ⚠ an INHERITED method that already has this
+                             //   visibility gets no entry here: ruby copies it
+                             //   into the class only to CHANGE it, so
+                             //   `private :m` in a child of a private m left
+                             //   `child.private_instance_methods(false)` empty
+                             let rec keep9 = fn (ns: str list) ->
+                               (match ns with
+                                | Nil -> (Nil : str list)
+                                | Cons (n9, t9) ->
+                                  (let cur9 = (if meth_private world c n9 then "private"
+                                               else if meth_protected world c n9 then "protected" else "public") in
+                                   if (if map_has meths0 (c ++ "#" ++ n9) then false else true)
+                                      && (if map_has vis_marks (c ++ "#" ++ n9) then false else true)
+                                      && has_meth world c n9 && str_eq cur9 name
+                                   then keep9 t9 else Cons (n9, keep9 t9))) in
+                             mark_vis_mode meths0 c (keep9 names) name)) in
        // Ruby returns the argument, or the list of them when given several --
        // except private_class_method / public_class_method, which answer the
        // receiver
@@ -13833,7 +13862,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (let (meths0, sup0, ocls0, ivars0) = world in
        let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr h, _) -> sget h | _ -> "") in
        let src = (match args with Cons (_, Cons (s, _)) -> s | _ -> VNil) in
-       (match src with
+       let r9 = (match src with
         | VObj uid ->
           // an UnboundMethod and a bound Method name the same thing here -- a
           // method that already exists somewhere else -- and only the pair of
@@ -13898,7 +13927,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              let _ = dm_store_closure (c ++ "#" ++ nm) (h2, ps2, bb2, e2) in
              let _ = stamp_meth_src_proc (c ++ "#" ++ nm) (str_of_int pid) in
              VSym nm)
-        | _ -> VSym nm))
+        | _ -> VSym nm) in
+       // ...under the default visibility of the scope it was called from
+       let _ = dm_scope_vis env world c nm in
+       r9)
     // instance_methods(false): the method names defined directly on this
     // class, as symbols (enumerated from the method table via map_iter). The
     // inherited form (no arg / true) is not distinguished — own methods only.
@@ -14132,13 +14164,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let add_from9 = fn (cx: str) ->
          (let pfx = cx ++ "#" in
           let plen = str_len pfx in
+          // ⚠ the NEAREST class decides a name: one found here with a
+          //   different visibility is settled (seen) and not listed, so a
+          //   farther class cannot list it -- a public Object#m with a
+          //   `private :m` in Kernel is public, and
+          //   `Object.private_instance_methods` listed it.
           let _ = map_iter meths0 (fn (k: str) -> fn (v: Meth) ->
             if str_len k > plen && str_eq (substring k 0 plen) pfx
                && (if str_contains (substring k plen (str_len k)) "#" then false else true)
-               && (if want_prot then map_has protecteds k
-                   else if map_has protecteds k then false
-                   else if map_has privates k then want_priv else (if want_priv then false else true))
-            then push9 (substring k plen (str_len k))
+            then (if (if want_prot then map_has protecteds k
+                      else if map_has protecteds k then false
+                      else if map_has privates k then want_priv else (if want_priv then false else true))
+                  then push9 (substring k plen (str_len k))
+                  // (Kernel's own functions are decided by the builtin list below: the
+                  // prelude's Ruby bodies for some of them are not the visibility)
+                  else if str_eq cx "Kernel" && is_kernel_builtin (substring k plen (str_len k)) then ()
+                  else map_set seen9 (substring k plen (str_len k)) 1)
             else ()) in
           // ⚠ Complex and Rational have #marshal_dump as a PRIVATE instance
           //   method (not #marshal_load, which ruby does not list): it lives in
@@ -14152,10 +14193,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = map_iter vis_marks (fn (k: str) -> fn (v: Val) ->
             if str_len k > plen && str_eq (substring k 0 plen) pfx && (if map_has meths0 k then false else true)
                && (if str_contains (substring k plen (str_len k)) "#" then false else true)
-               && (if want_prot then map_has protecteds k
-                   else if map_has protecteds k then false
-                   else if map_has privates k then want_priv else (if want_priv then false else true))
-            then push9 (substring k plen (str_len k))
+            then (if (if want_prot then map_has protecteds k
+                      else if map_has protecteds k then false
+                      else if map_has privates k then want_priv else (if want_priv then false else true))
+                  then push9 (substring k plen (str_len k))
+                  else map_set seen9 (substring k plen (str_len k)) 1)
             else ()) in
           // ⚠ `initialize` is INHERITED by most classes, not owned by them.
           //   The rule here was "every class except one that defines its own",
@@ -22828,6 +22870,19 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
   let _ = copy_kv iv9 ("cls:" ++ c ++ "@") ("cls:" ++ nc ++ "@") "" in
   let _ = (if keep_frozen && map_has cls_frozen c then map_set cls_frozen nc (map_get cls_frozen c) else ()) in
   VClass nc
+// A define_method CALLED from a class body (its env reaches the body's
+// "__vis", see register_class_v) takes the body's default visibility, as a
+// def there does -- and in `module_function` mode it is a module function.
+and dm_scope_vis = fn env -> fn world -> fn (c: str) -> fn (nm: str) ->
+  if lv_has env "__vis" && (match (if lv_has env "self" then lv_get env "self" else VMain) with VClass c8 -> str_eq c8 c | _ -> false) then
+    (let m9 = (match lv_get env "__vis" with VStr h9 -> sget h9 | _ -> "public") in
+     let k9 = c ++ "#" ++ nm in
+     if str_eq m9 "private" then map_set privates k9 VNil
+     else if str_eq m9 "protected" then map_set protecteds k9 VNil
+     else if str_eq m9 "module_function" then
+       (let _ = map_set privates k9 VNil in modfunc_promote_hooked world c (Cons (nm, Nil)))
+     else ())
+  else ()
 and kernel_made_public = fn (anc: str list) -> fn (name: str) ->
   match anc with
   | Nil -> false
@@ -36924,6 +36979,15 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
     // lets `class K; end` reopen a frozen K and raises on the first statement
     // that would change it, so this is per statement, not at the entry.
     let _ = (if map_len cls_frozen > 0 && cls_body_writes s then frz_cls_check world cls else ()) in
+    // ⚠ THE DEFAULT VISIBILITY IS A PROPERTY OF THE SCOPE, not of the syntax
+    //   that set it: `send :private`, `1.times { private }` and an eval'd
+    //   `private` set it too, and a def run by eval or by a block inside the
+    //   body reads it. It lives in the body's env as "__vis" (a child scope
+    //   -- a block, an eval -- reaches it through the chain), written here
+    //   before each statement and read back after it, so a statement that
+    //   changed it is heard.
+    let _ = (if map_has cenv "__vis" && (match map_get cenv "__vis" with VStr h9 -> str_eq (sget h9) vis | _ -> false) then ()
+             else map_set cenv "__vis" (mkstr vis)) in
     let vis2 = (match s with SVis (m, Nil) -> m | _ -> vis) in
     let f =
       (match s with
@@ -37233,6 +37297,14 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                        // body resolve against this class, and a method built
                        // from a block needs it just as much.
                        let _ = map_set meth_cref (cls ++ "#" ++ nm) (lex_pack ()) in
+                       // ...under the body's default visibility, as a def is:
+                       // in `module_function` mode it is a module function too
+                       let _ = (if str_eq vis2 "private" then map_set privates (cls ++ "#" ++ nm) VNil
+                                else if str_eq vis2 "protected" then map_set protecteds (cls ++ "#" ++ nm) VNil
+                                else if str_eq vis2 "module_function" then
+                                  (let _ = map_set privates (cls ++ "#" ++ nm) VNil in
+                                   modfunc_promote_hooked world cls (Cons (nm, Nil)))
+                                else ()) in
                        // define_method adds a method, so the hook fires for it too
                        run_method_added world cls nm)
                     | _ -> ()) in
@@ -37240,11 +37312,15 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          else exec_stmt cenv world noblk s
        // everything else is plain code — a class body executes.
        | _ -> exec_stmt cenv world noblk s) in
+    // (a statement that set the mode dynamically wrote it to __vis)
+    let vis3 = (match s with
+                | SVis (_, _) -> vis2
+                | _ -> (if map_has cenv "__vis" then (match map_get cenv "__vis" with VStr h9 -> sget h9 | _ -> vis2) else vis2)) in
     (match f with
      // the class expression's value is its body's last statement value.
      | FNext v -> (match rest with
                    | Nil -> FNext v
-                   | _ -> register_class_v world cls rest vis2 cenv)
+                   | _ -> register_class_v world cls rest vis3 cenv)
      | esc -> esc)
 
 // shallow scan of a body for local-assignment targets (if-branch locals
@@ -38280,6 +38356,25 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let _ = set_meth meths key (Meth (params, defs, body)) in
     let _ = map_set meth_cref key (lex_pack ()) in
     let _ = stamp_meth_src key in
+    // ...and a def run as a STATEMENT inside a class scope (an eval'd body, a
+    // block in the body) takes that scope's default visibility ("__vis", see
+    // register_class_v), as the body's own defs do
+    let _ = (match (if lv_has env "self" then lv_get env "self" else VMain) with
+             | VClass c9 ->
+               (if str_eq key (c9 ++ "#" ++ name) && lv_has env "__vis" then
+                  (let m9 = (match lv_get env "__vis" with VStr h9 -> sget h9 | _ -> "public") in
+                   let _ = (if map_has privates key then map_delete privates key else ()) in
+                   let _ = (if map_has protecteds key then map_delete protecteds key else ()) in
+                   if str_eq m9 "private" then map_set privates key VNil
+                   else if str_eq m9 "protected" then map_set protecteds key VNil
+                   else if str_eq m9 "module_function" then
+                     (let mk9 = "(sng:" ++ c9 ++ ")#" ++ name in
+                      let _ = set_meth meths mk9 (Meth (params, defs, body)) in
+                      let _ = map_set meth_cref mk9 (lex_pack ()) in
+                      map_set privates key VNil)
+                   else ())
+                else ())
+             | _ -> ()) in
     // A TOP-LEVEL `def` is a PRIVATE instance method of Object -- that is the
     // whole reason a bare call works from inside any class. The bare key alone
     // made it reachable by the receiverless call path and by nothing else:
@@ -38591,7 +38686,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // top-level defs that follow.
     let _ = (match names with
              | Nil -> (match (if lv_has env "self" then lv_get env "self" else VMain) with
-                       | VClass _ -> ()
+                       // in a class scope run as statements (an eval'd body)
+                       // it is that scope's default visibility (register_class_v)
+                       | VClass _ -> map_set env "__vis" (mkstr mode)
                        // a BOOL, not the mode string: a VStr is a handle into
                        // the string store, and a root that holds one has to be
                        // marked. Nothing here needs the word.
@@ -39352,7 +39449,13 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   // so a read that lexically precedes the assignment (or a nested eval sharing
   // the same binding) sees nil rather than a NameError.
   let _ = declare_nils env (body_targets prog2) in
+  // an eval'd `private` is the eval's own: the default visibility of the
+  // scope it runs in (see register_class_v's "__vis") is put back after it
+  let vis9 = (if map_has env "__vis" then map_get env "__vis" else VNil) in
   let f = try_or (fn (u: unit) -> hoist_run env world blk prog2) (FRaise VNil) in
+  let _ = (match vis9 with
+           | VNil -> (if map_has env "__vis" then map_delete env "__vis" else ())
+           | v9 -> map_set env "__vis" v9) in
   (match f with
    | FRaise _ ->
      if map_has flow_sig "k" then
