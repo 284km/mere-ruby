@@ -1515,7 +1515,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // resume the method search in the receiver's ancestor chain, strictly
     // after the class/module the current method is defined in — so super walks
     // included modules too. A singleton-class defcls uses the singleton chain.
-    if is_sng_cls defcls then
+    // ⚠ ...and a singleton class's ancestors start with the modules EXTENDED
+    //   into it: `o.extend M; def o.f; super; end` reaches M#f, and so does
+    //   `def Warning.warn(m) = super` (Warning extends itself). Going straight
+    //   to the superclass's singleton skipped them.
+    let ext9 = (if is_sng_cls defcls then
+                  (let a9 = lookup_anc world (anc_after_or_all (ancestors_of world defcls) defcls) meth in
+                   if (if str_eq a9 "" then false else true) && map_has modules a9 then a9 else "")
+                else "") in
+    if (if str_eq ext9 "" then false else true) then
+      run_meth world superblk recv ext9 meth (map_get meths (ext9 ++ "#" ++ meth)) args
+    else if is_sng_cls defcls then
       (let supercls = sng_supername world defcls in
        if has_meth world supercls meth then invoke world superblk recv supercls meth args
        // a definition hook (inherited / included / ...) is a no-op in Ruby,
@@ -1549,7 +1559,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      | _ -> (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                   else (match lv_get env "__args" with VArr id -> deref id | _ -> Nil))
                else eval_args env world blk arges in
-    if is_sng_cls defcls then
+    let ext9 = (if is_sng_cls defcls then
+                  (let a9 = lookup_anc world (anc_after_or_all (ancestors_of world defcls) defcls) meth in
+                   if (if str_eq a9 "" then false else true) && map_has modules a9 then a9 else "")
+                else "") in
+    if (if str_eq ext9 "" then false else true) then
+      run_meth world (sbh, sbp, sbb, sbe) recv ext9 meth (map_get meths (ext9 ++ "#" ++ meth)) args
+    else if is_sng_cls defcls then
       (let supercls = sng_supername world defcls in
        if has_meth world supercls meth then invoke world (sbh, sbp, sbb, sbe) recv supercls meth args
        // a definition hook (inherited / included / ...) is a no-op in Ruby,
@@ -2078,103 +2094,26 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                    | _ -> invoke_val_c env world nb9 hook9 "write" (Cons (ch9, Nil)) false) in
           c9)
        | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
-    // Kernel#warn: writes to stderr, which stdout byte-comparison never sees,
-    // so a no-op is output-equivalent (and avoids a NoMethodError crash).
-    // ...but the ARGUMENTS are still checked: `uplevel:` is a number of frames
-    // and ruby refuses anything else. A no-op that accepts everything is a
-    // no-op that hides a caller's mistake, and `category:` has a fixed set of
-    // names too.
+    // Kernel#warn(*msgs, uplevel: nil, category: nil), as ruby's rb_warn_m.
+    // Asked of ruby rather than assumed:
+    //     warn "a"                       -> "a\n"
+    //     warn "a", "b"                  -> "a\nb\n" (ONE write)
+    //     warn "a\n"                     -> "a\n" (not two)
+    //     warn 42                        -> "42\n"
+    //     warn ["x", "y"]                -> "x\ny\n"
+    //     warn "u", uplevel: 0           -> "FILE:LINE: warning: u\n", the line
+    //                                       being uplevel frames up from the call
+    //     warn "c", category: :deprecated-> nothing, unless Warning[:deprecated]
+    //     warn "b", category: :nope      -> ArgumentError
+    //     warn                           -> nothing
+    // ⚠ $VERBOSE = nil silences it entirely -- and FALSE, the default, does not.
+    // ⚠ ...and the text is not WRITTEN here: it is handed to Warning.warn, which
+    //   a program overrides to capture or reroute warnings (and mspec's mocks
+    //   expect with `category:`). Only when self IS the Warning module -- a
+    //   Warning#warn override calling super -- is it written directly, which is
+    //   how ruby avoids the recursion.
     else if (str_len name == 4 && str_eq name "warn") && (if kernel_overridden env world "warn" then false else true) then
-      (let _ = (match args with
-                | Cons (_, _) ->
-                  (let (pos9, kw9) = peel_kw_hash args in
-                   let _ = (if hash_haskey kw9 (VSym "uplevel") then
-                              (match hash_get kw9 (VSym "uplevel") with
-                               | VNil -> ()
-                               | VInt _ -> ()
-                               | VBig _ -> ()
-                               | bad9 ->
-                                 (let _ = raise_exc world "TypeError"
-                                            ("no implicit conversion of "
-                                             ++ display_cls_msg world (dispatch_cls_of world bad9)
-                                             ++ " into Integer") in ()))
-                            else ()) in
-                   // `category:` is nil or a name: a Symbol, a String, or an
-                   // object with #to_sym. Anything else is refused BY NAME --
-                   // it used to be accepted and dropped.
-                   let _ = (if hash_haskey kw9 (VSym "category") then
-                              (match hash_get kw9 (VSym "category") with
-                               | VNil -> ()
-                               | VSym _ -> ()
-                               | VStr _ -> ()
-                               | bad9 ->
-                                 (if responds world bad9 "to_sym" then ()
-                                  else
-                                    (let _ = raise_exc world "TypeError"
-                                               ("no implicit conversion of "
-                                                ++ display_cls_msg world (dispatch_cls_of world bad9)
-                                                ++ " into Symbol") in ())))
-                            else ()) in
-                   // ⚠ ...AND THEN IT WRITES. This arm validated the keywords
-                   //   and returned nil: `warn "x"` produced no output at all,
-                   //   anywhere. mspec's `complain` matcher is built on it and
-                   //   so are seven recorded rows.
-                   //   Asked of ruby rather than assumed:
-                   //     warn "a"                       -> "a\n"
-                   //     warn "a", "b"                  -> "a\nb\n" (ONE write)
-                   //     warn "a\n"                     -> "a\n" (not two)
-                   //     warn 42                        -> "42\n"
-                   //     warn ["x", "y"]                -> "x\ny\n"
-                   //     warn "u", uplevel: 0           -> "FILE:LINE: warning: u\n"
-                   //     warn "c", category: :deprecated-> nothing, unless
-                   //                                       Warning[:deprecated]
-                   //     warn "e", category: :experimental -> "e\n" (on by default)
-                   //     warn "b", category: :nope      -> ArgumentError
-                   //     warn                           -> nothing
-                   let cat9 = (if hash_haskey kw9 (VSym "category")
-                               then hash_get kw9 (VSym "category") else VNil) in
-                   let on9 = (match cat9 with
-                              | VNil -> true
-                              | VSym cn ->
-                                (if str_eq cn "deprecated" then
-                                   (if map_has warn_cats cn then truthy (map_get warn_cats cn) else false)
-                                 else if str_eq cn "experimental" || str_eq cn "performance" then
-                                   (if map_has warn_cats cn then truthy (map_get warn_cats cn) else true)
-                                 else (let _ = raise_exc world "ArgumentError" ("unknown category: " ++ cn) in false))
-                              | _ -> true) in
-                   // ⚠ uplevel: n is the location n frames UP -- the value was
-                   //   ignored and every warning named the line of the warn
-                   //   call itself, so a library's `warn(msg, uplevel: 1)`
-                   //   blamed the library instead of its caller. Past the top
-                   //   of the stack there is no location, as in ruby.
-                   let pre9 = (match (if hash_haskey kw9 (VSym "uplevel")
-                                      then hash_get kw9 (VSym "uplevel") else VNil) with
-                               | VInt n9 ->
-                                 (if n9 <= 0 then cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: "
-                                  else (let i9 = caller_depth () - n9 in
-                                        if i9 >= fb_depth_base ()
-                                        then frame_file i9 ++ ":" ++ str_of_int (frame_line i9) ++ ": warning: "
-                                        else "warning: "))
-                               | VBig _ -> "warning: "
-                               | _ -> "") in
-                   // ⚠ $VERBOSE = nil silences warn entirely -- and FALSE, the
-                   //   default, does not. Measured, because the intuition here
-                   //   is the wrong way round:
-                   //     $VERBOSE = nil   -> nothing
-                   //     $VERBOSE = false -> "x\n"
-                   //     $VERBOSE = true  -> "x\n"
-                   let vnil9 = (if map_has globals (gvar_slot "VERBOSE")
-                                then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
-                                else false) in
-                   // ...and `warn("")` writes a newline while `warn` with NO
-                   // arguments writes nothing: the empty case is the ARGUMENT
-                   // LIST, never the joined text.
-                   let body9 = warn_join world pos9 "" in
-                   (if on9 && (if vnil9 then false else true)
-                       && (match pos9 with Nil -> false | _ -> true)
-                    then err_emit world (pre9 ++ body9) else ()))
-                | Nil -> ()) in
-       VNil)
+      kernel_warn env world args
     // Kernel#printf: format, then write it (no newline). ruby's rb_f_printf
     // decides by the FIRST argument's type alone: a String is the format and
     // the output is $stdout; anything else is the IO, sent #write with the
@@ -18917,7 +18856,18 @@ and rb_warn = fn world -> fn (msg: str) ->
        then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
        else false)
    then ()
-   else err_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: " ++ msg))
+   else warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: " ++ msg ++ "\n") VNil)
+
+// A warning's text (its newline included) handed to Warning.warn, as ruby's
+// rb_warn_category hands every warning -- the interpreter's own and
+// Kernel#warn's -- so that a program overriding Warning.warn sees them all.
+// Before the prelude has defined it, the text goes to $stderr directly.
+and warning_emit = fn world -> fn (s: str) -> fn (cat: Val) ->
+  if responds world (VClass "Warning") "__kernel_warn" then
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     let _ = invoke_val_c gc_cenv0 world nb9 (VClass "Warning") "__kernel_warn" (Cons (mkstr s, Cons (cat, Nil))) false in ())
+  else if stdio_emit world "stderr" s then ()
+  else err_raw s
 
 // Is this name answered by the interpreter (or the prelude's own modules)
 // rather than by something the program wrote? ⚠ `has_meth` cannot tell: the
@@ -29498,6 +29448,13 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // answers false. `m == :ok || super` is how the method is written, so it is
   // on the same path as method_missing below and failed the same way.
   else if str_eq meth "respond_to_missing?" then VBool false
+  // `super` from a Warning#warn override (or any warn defined over Kernel's)
+  // is Kernel#warn itself, run with the same self -- which, when self is the
+  // Warning module, writes the text instead of calling Warning.warn again.
+  else if str_eq meth "warn" then
+    (let e2 = map_new () in
+     let _ = map_set e2 "self" recv in
+     kernel_warn e2 world args)
   else if is_prim_method meth then prim_method recv meth args
   // a Thread subclass's `super` from #initialize is Thread#initialize, which
   // starts the body (with the block super was given)
@@ -32108,10 +32065,103 @@ and rb_unpack_fixed = fn (s: str) -> fn (slen: int) -> fn (si: int) -> fn (fmt: 
 // and print_err on the unhooked path adds it too). An Array argument spreads
 // over lines, and a message that already ends in a newline does not get a
 // second one -- both measured against ruby rather than assumed.
-and warn_join = fn world -> fn (xs: Val list) -> fn (acc: str) ->
+// Kernel#warn's body (see the comment at its dispatch arm), a function of
+// its own because `super` from a Warning#warn override reaches it too, with
+// self the Warning module -- dispatching `warn` again from there would find
+// the override and never end.
+and kernel_warn = fn env -> fn world -> fn (args: Val list) ->
+  (let _ = (match args with
+            | Cons (_, _) ->
+              (let (pos9, kw9) = peel_kw_hash args in
+               let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+               // uplevel is a frame count by NUM2LONG: a Float or Rational
+               // truncates, a negative one is refused, and anything that is
+               // not a number is a TypeError.
+               let neg9 = fn (n9: int) -> (if n9 < 0 then (let _ = raise_exc world "ArgumentError" ("negative level (" ++ str_of_int n9 ++ ")") in 0) else n9) in
+               let lev9 = (if hash_haskey kw9 (VSym "uplevel") then
+                             (match hash_get kw9 (VSym "uplevel") with
+                              | VNil -> 0 - 1
+                              | VInt n9 -> neg9 n9
+                              | VBig b9 -> (if str_len b9 > 0 && str_eq (char_at b9 0) "-"
+                                            then (let _ = raise_exc world "ArgumentError" ("negative level (" ++ b9 ++ ")") in 0)
+                                            else 1000000000)
+                              | VFlt f9 -> neg9 (int_of_float f9)
+                              | VRat (_, _) -> neg9 (int_of_float (to_f (hash_get kw9 (VSym "uplevel"))))
+                              | bad9 ->
+                                (let _ = raise_exc world "TypeError"
+                                           ("no implicit conversion of "
+                                            ++ display_cls_msg world (dispatch_cls_of world bad9)
+                                            ++ " into Integer") in 0))
+                           else 0 - 1) in
+               // `category:` is nil or a name: a Symbol, a String, or an
+               // object with #to_sym (rb_to_symbol_type). Anything else is
+               // refused BY NAME -- it used to be accepted and dropped.
+               let cat9 = (if hash_haskey kw9 (VSym "category") then
+                             (match hash_get kw9 (VSym "category") with
+                              | VNil -> VNil
+                              | VSym y9 -> VSym y9
+                              | VStr h9 -> VSym (sget h9)
+                              | bad9 ->
+                                (if responds world bad9 "to_sym" then invoke_val_c env world nb9 bad9 "to_sym" Nil false
+                                 else raise_exc world "TypeError"
+                                        (inspect_w env world bad9 ++ " is not a symbol nor a string")))
+                           else VNil) in
+               // a category that is off means Warning.warn is not called at
+               // all; an unknown one is Warning[]'s ArgumentError.
+               let on9 = (match cat9 with
+                          | VNil -> true
+                          | _ -> truthy (invoke_val_c env world nb9 (VClass "Warning") "[]" (Cons (cat9, Nil)) false)) in
+               let vnil9 = (if map_has globals (gvar_slot "VERBOSE")
+                            then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
+                            else false) in
+               // the frame uplevel levels above the call, skipping the
+               // <internal: frames of methods the core defines in ruby; one
+               // past the top of the stack is a bare "warning: ".
+               let pre9 = (if lev9 < 0 then ""
+                           else
+                             (let rec keep = fn (fs: Val list) ->
+                                (match fs with
+                                 | Nil -> (Nil : Val list)
+                                 | Cons (VStr fh, t) ->
+                                   (if str_len (sget fh) >= 10 && str_eq (substring (sget fh) 0 10) "<internal:"
+                                    then keep t else Cons (VStr fh, keep t))
+                                 | Cons (_, t) -> keep t) in
+                              match val_nth (keep (caller_frames 0)) lev9 with
+                              | VStr fh ->
+                                (let f9 = sget fh in
+                                 let k9 = str_index_of f9 ":in " in
+                                 (if k9 >= 0 then substring f9 0 k9 else f9) ++ ": warning: ")
+                              | _ -> "warning: ")) in
+               // ...and `warn("")` writes a newline while `warn` with NO
+               // arguments writes nothing: the empty case is the ARGUMENT
+               // LIST, never the joined text.
+               let body9 = warn_join world pos9 in
+               (if on9 && (if vnil9 then false else true)
+                   && (match pos9 with Nil -> false | _ -> true)
+                then
+                  (let text9 = pre9 ++ body9 ++ "\n" in
+                   match (if lv_has env "self" then lv_get env "self" else VNil) with
+                   | VClass "Warning" -> (if stdio_emit world "stderr" text9 then () else err_raw text9)
+                   | _ -> warning_emit world text9 cat9)
+                else ()))
+            | Nil -> ()) in
+   VNil)
+
+// The lines of a warning, joined with newlines (each one's own trailing
+// newline dropped, as puts would not double it). ⚠ The pieces are collected
+// before they are joined: folding into an accumulator took an EMPTY first
+// piece for "nothing yet", so `warn "", "x"` lost its first line.
+and warn_join = fn world -> fn (xs: Val list) ->
+  let rec cat = fn (ps: str list) ->
+    (match ps with
+     | Nil -> ""
+     | Cons (p9, Nil) -> p9
+     | Cons (p9, t9) -> p9 ++ "\n" ++ cat t9) in
+  cat (warn_pieces world xs)
+and warn_pieces = fn world -> fn (xs: Val list) ->
   match xs with
-  | Nil -> acc
-  | Cons (VArr aid, t) -> warn_join world t (warn_join world (deref aid) acc)
+  | Nil -> (Nil : str list)
+  | Cons (VArr aid, t) -> list_append_str (warn_pieces world (deref aid)) (warn_pieces world t)
   | Cons (h, t) ->
     // ⚠ an object is asked for ITS #to_s, not the value-level one: ruby's
     //   `warn(obj)` calls the method, and a spec mock counts the call.
@@ -32127,7 +32177,7 @@ and warn_join = fn world -> fn (xs: Val list) -> fn (acc: str) ->
                | other -> to_s other) in
      let s9 = (if str_len s9 > 0 && str_eq (char_at s9 (str_len s9 - 1)) "\n"
                then substring s9 0 (str_len s9 - 1) else s9) in
-     warn_join world t (if str_eq acc "" then s9 else acc ++ "\n" ++ s9))
+     Cons (s9, warn_pieces world t))
 
 and err_puts_each = fn world -> fn (xs: Val list) ->
   match xs with
@@ -38982,7 +39032,7 @@ and warn_flush_go = fn world -> fn (i: int) -> fn (n: int) ->
      let _ = (if (if map_has globals (gvar_slot "VERBOSE")
                   then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
                   else false)
-              then () else err_emit world s9) in
+              then () else warning_emit world (s9 ++ "\n") VNil) in
      warn_flush_go world (i + 1) n)
 
 // mark everything queued so far as already looked at -- for a lex done only
