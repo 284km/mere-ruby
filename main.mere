@@ -7124,6 +7124,10 @@ and coerce_str_int_args = fn env -> fn world -> fn (args: Val list) ->
 
 // String#slice / #slice! index arguments (see the dispatch comment): range
 // protocol first, then per-bound / per-argument #to_int.
+and slice_flt_idx = fn (f: float) ->
+  if flt_is_nan f then prim_raise "RangeError" "float NaN out of range of integer"
+  else if flt_is_inf f then prim_raise "RangeError" ("float " ++ (if f > 0.0 then "Inf" else "-Inf") ++ " out of range of integer")
+  else VInt (int_of_float f)
 and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
   let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
   let toi = fn (v: Val) ->
@@ -7132,10 +7136,9 @@ and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
        (if responds world v "to_int"
         then (match invoke_val_c env world nb v "to_int" Nil false with VInt n -> VInt n | _ -> v)
         else v)
-     | VFlt f ->
-       (if (if f == 0.0 then false else f * 0.5 == f)
-        then prim_raise "RangeError" ((if f > 0.0 then "Infinity" else "-Infinity") ++ " out of range")
-        else VInt (int_of_float f))
+     // a Float index truncates; the infinities and NaN are not indices, in
+     // NUM2LONG's words
+     | VFlt f -> slice_flt_idx f
      | _ -> v) in
   // an index is a C long: a Bignum converted fine and is simply too big
   let long_ok = fn (v: Val) ->
@@ -7168,11 +7171,7 @@ and coerce_slice_args = fn env -> fn world -> fn (args: Val list) ->
   | Cons (a9, Cons (b9, Nil)) -> Cons (toint a9, Cons (toint b9, Nil))
   // a Float index truncates ("hello".slice!(0.5) is the h) -- but an
   // INFINITE one is ruby's RangeError, not a huge integer.
-  | Cons (VFlt f, rest) ->
-    (if (if f == 0.0 then false else f * 0.5 == f)
-     then (match prim_raise "RangeError" ((if f > 0.0 then "Infinity" else "-Infinity") ++ " out of range") with
-           | _ -> args)
-     else Cons (VInt (int_of_float f), coerce_slice_args env world rest))
+  | Cons (VFlt f, rest) -> Cons (slice_flt_idx f, coerce_slice_args env world rest)
   // the range protocol applies only to a SINGLE argument (the two-argument
   // form is (index, length): both go through #to_int).
   | Cons (VObj o0, Nil) ->
@@ -20595,7 +20594,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
       || (str_len name == 11 && str_eq name "start_with?") || (str_len name == 9 && str_eq name "end_with?"))
      && (match recv with VSym _ -> true | _ -> false) then
     (match recv with
-     | VSym sy9 -> invoke_val_c env world blk (mkstr sy9) name args false
+     | VSym sy9 -> invoke_val_c env world blk (mkstr_e sy9 (sym_enc_name sy9)) name args false
      | _ -> VNil)
   else
   // #full_message / #detailed_message on the lightweight class-and-message
@@ -21595,12 +21594,15 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         //   answered true. The check is the ENCODING's, not the value's -- the
         //   same bytes tagged BINARY are three characters and the answer is
         //   true -- so it only applies to a UTF-8 receiver.
-        let utf8 = str_eq (enc_canon_name (senc_get h)) "UTF-8" in
+        let e9 = enc_canon_name (senc_get h) in
+        let utf8 = str_eq e9 "UTF-8" in
+        // (and in any other multi-byte encoding, a boundary is where the walk
+        // by characters lands: "\xd8\x00\xdc\x00" in UTF-16BE is ONE pair)
         let bnd = fn (k: int) ->
-          (if utf8 then
-             (if k >= str_len sv || k <= 0 then true
-              else (let b9 = ord (char_at sv k) in
-                    if b9 >= 128 && b9 < 192 then false else true))
+          (if k >= str_len sv || k <= 0 then true
+           else if utf8 then (let b9 = ord (char_at sv k) in if b9 >= 128 && b9 < 192 then false else true)
+           else if enc_multibyte e9 then
+             (let rec walk = fn (i: int) -> (if i >= k then i == k else walk (i + enc_clen sv e9 i)) in walk 0)
            else true) in
         let hit1 = fn (pp: str) ->
           (if starts then str_starts_with sv pp && bnd (str_len pp)
@@ -21608,7 +21610,14 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         let rec go = fn (ps: Val list) ->
           (match ps with
            | Nil -> VBool false
-           | Cons (VStr ph, t9) -> (if hit1 (sget ph) then VBool true else go t9)
+           // two texts that cannot meet in one encoding are refused, as
+           // any comparison of them is (rb_enc_check)
+           | Cons (VStr ph, t9) ->
+             (if str_len (sget ph) > 0 && str_len sv > 0 && (if str_comparable h ph then false else true)
+                 && (if enc_ascii_compat e9 && enc_ascii_compat (enc_canon_name (senc_get ph)) then true else false)
+              then raise_exc world "Encoding::CompatibilityError"
+                     ("incompatible character encodings: " ++ e9 ++ " and " ++ enc_canon_name (senc_get ph))
+              else if hit1 (sget ph) then VBool true else go t9)
            | Cons (VRegex (pat, pf, _), t9) ->
              (if starts then
                 // a match must begin AT 0, and a miss leaves $~ nil -- which
