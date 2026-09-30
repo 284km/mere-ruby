@@ -2968,8 +2968,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                raise_exc world "Encoding::CompatibilityError"
                  ("incompatible character encodings: " ++ enc_canon_name (senc_get h) ++ " and " ++ enc_canon_name (senc_get y))
              else (let _ = sset h (sget h ++ sget y) in let _ = senc_set h renc in va0))
-          | VInt n -> let _ = sset h (sget h ++ chr n) in va0
-          | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: << string needs a string")) in fail "mere-ruby: << string needs a string"))
+          // the rest is String#<<'s (str_append_val): a codepoint, or an
+          // object asked for #to_str -- which this operator form never did,
+          // so `s << obj` died on "needs a string" where `s.concat(obj)` ran.
+          | VObj o9 ->
+            (match conv_try env world (VObj o9) "to_str" with
+             | VStr y -> str_append_val h (VStr y)
+             | _ -> str_append_val h (VObj o9))
+          | other -> str_append_val h other)
        | _ -> VNil)
     else
     // BasicObject#!= is `==` negated, so a class that redefines only `==`
@@ -12269,29 +12275,48 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // carry, or nil. Strings (and Symbols, Regexps) bring their bytes; an
     // Encoding brings none, so it is never "empty" nor "ASCII only" -- and
     // between two Encodings the US-ASCII one yields.
+    // Encoding.compatible?(a, b) is rb_enc_compatible, rule for rule
+    // (enc_compatible_latter). Only a STRING counts as text there: a Symbol, a
+    // Regexp and an Encoding are just an encoding, so an empty or ASCII-only
+    // Symbol does not yield the way an empty String does, and an Encoding
+    // US-ASCII on either side yields to the other. Reading the non-strings as
+    // strings (an Encoding as the byte 0xFF) answered nil for
+    // `compatible?("\u3042", Encoding::US_ASCII)`, and the ASCII-only pattern
+    // of a EUC-JP Regexp took over a UTF-8 String.
     else if str_eq c "Encoding" && (str_len name == 11 && str_eq name "compatible?") then
       (let side = fn (v: Val) ->
          (match v with
-          | VStr h9 -> (senc_get h9, sget h9, false, true)
-          | VSym sy9 -> ((if enc_all7 sy9 then "US-ASCII" else "UTF-8"), sy9, false, true)
-          | VRegex (rp9, _, re9) -> ((if str_eq re9 "" then (if enc_all7 rp9 then "US-ASCII" else "UTF-8") else re9), rp9, false, true)
-          | VObj eo9 when map_has enc_name (str_of_int eo9) -> (map_get enc_name (str_of_int eo9), "", true, true)
+          | VStr h9 -> (enc_canon_name (senc_get h9), sget h9, true, true)
+          | VSym sy9 -> (enc_canon_name (sym_enc_name sy9), sy9, false, true)
+          | VRegex (rp9, _, re9) -> ((if str_eq re9 "" then (if enc_all7 rp9 then "US-ASCII" else "UTF-8") else enc_canon_name re9), rp9, false, true)
+          | VObj eo9 when map_has enc_name (str_of_int eo9) -> (enc_canon_name (map_get enc_name (str_of_int eo9)), "", false, true)
           | _ -> ("", "", false, false)) in
        match args with
        | Cons (a9, Cons (b9, _)) ->
          (match (side a9, side b9) with
-          | ((ae, as9, aenc, aok), (be, bs9, benc, bok)) ->
+          | ((e1, s1, str1, aok), (e2, s2, str2, bok)) ->
             (if (if aok && bok then false else true) then VNil
              else
-               (let ae2 = enc_canon_name ae in
-                let be2 = enc_canon_name be in
-                let r9 = (if aenc && benc then
-                            (if str_eq ae2 be2 then ae2
-                             else if enc_is_dummy ae2 || enc_is_dummy be2 then ""
-                             else if str_eq be2 "US-ASCII" && enc_ascii_compat ae2 then ae2
-                             else if str_eq ae2 "US-ASCII" && enc_ascii_compat be2 then be2
-                             else "")
-                          else enc_compat2 ae (if aenc then chr 255 else as9) be (if benc then chr 255 else bs9)) in
+               (let r9 = (if str_eq e1 e2 then e1
+                          else if str2 && str_len s2 == 0 then e1
+                          else if str1 && str2 && str_len s1 == 0 then
+                            (if enc_ascii_compat e1 && enc_ascii_compat e2 && enc_all7 s2 then e1 else e2)
+                          else if (if enc_ascii_compat e1 && enc_ascii_compat e2 then false else true) then ""
+                          else if (if str2 then false else str_eq e2 "US-ASCII") then e1
+                          else if (if str1 then false else str_eq e1 "US-ASCII") then e2
+                          // the string side decides; with two strings, an
+                          // ASCII-only one yields to the other
+                          else if str1 && str2 then
+                            (let a7 = enc_all7 s1 in
+                             let b7 = enc_all7 s2 in
+                             if b7 then e1 else if a7 then e2 else "")
+                          // one string: an ASCII-only one answers the OTHER
+                          // side's encoding when it is first, and its OWN when
+                          // it is second -- CRuby swaps the operands to put the
+                          // string first but not the encodings it returns.
+                          else if str1 then (if enc_all7 s1 then e2 else "")
+                          else if str2 then (if enc_all7 s2 then e2 else "")
+                          else "") in
                 if str_eq r9 "" then VNil
                 else if map_has enc_objs r9 then map_get enc_objs r9 else VNil)))
        | _ -> raise_exc world "ArgumentError" "wrong number of arguments (expected 2)")
@@ -16216,8 +16241,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // a binary operator on a primitive is not in the method table -- it
           // is arith_bin -- so `1.method(:+)` has to route there, the same way
           // an alias to a builtin operator does.
+          // ⚠ ...but not String#<<, which is a MUTATION: arith_bin answers a
+          //   new string, so `s.method(:<<).call("q")` left s unchanged. The
+          //   by-name path appends in place (str_append_val).
           | _ ->
             if is_binary_op_name mnm
+               && (if (str_len mnm == 2 && str_eq mnm "<<") && (match mrecv with VStr _ -> true | _ -> false) then false else true)
                && (if has_meth world (dispatch_cls_of world mrecv) mnm then false else true) then
               (match args with
                | Cons (a1, _) -> arith_bin mnm mrecv a1
@@ -22054,10 +22083,13 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        (let encname_of = fn (v: Val) ->
           (match v with
            | VStr nm -> enc_canon_name (sget nm)
-           | VObj oid9 ->
-             (let (m9e, s9e, o9e, i9e) = world in
-              if map_has enc_name (str_of_int oid9) then map_get enc_name (str_of_int oid9)
-              else enc_canon_name (to_s (VObj oid9)))
+           | VObj oid9 when map_has enc_name (str_of_int oid9) -> map_get enc_name (str_of_int oid9)
+           // anything else names an encoding through #to_str (rb_to_encoding);
+           // reading its #to_s made the name "#<object>"
+           | VObj _ ->
+             (match conv_try env world v "to_str" with
+              | VStr nm -> enc_canon_name (sget nm)
+              | _ -> (match raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String") with _ -> ""))
            | _ -> "") in
         let (pos1, pos2, opts) =
           (match args with
@@ -22071,25 +22103,65 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
           (match opts with
            | VHsh oh -> (match hash_lookup (hderef oh) (VSym k) with (true, v) -> v | _ -> VNil)
            | _ -> VNil) in
+        // xml: is :text or :attr and nothing else (rb_econv_prepare_options)
+        let xml9 = (match optv "xml" with
+                    | VNil -> ""
+                    | VSym x9 ->
+                      (if str_eq x9 "text" || str_eq x9 "attr" then x9
+                       else (match raise_exc world "ArgumentError" ("unexpected value for xml option: " ++ x9) with _ -> ""))
+                    | _ -> (match raise_exc world "ArgumentError" "unexpected value for xml option" with _ -> "")) in
         let from = (match pos2 with VNil -> enc_canon_name (senc_get h) | v -> encname_of v) in
-        let to = (match pos1 with VNil -> from | v -> encname_of v) in
-        let inv_rep = (match optv "invalid" with VSym r9 -> str_eq r9 "replace" | _ -> false) in
-        let und_rep = (match optv "undef" with VSym r9 -> str_eq r9 "replace" | _ -> false) in
+        // `encode` with no destination is Encoding.default_internal when one
+        // is set -- and then undefined and invalid characters are REPLACED,
+        // which str_transcode0 turns on for exactly this form. Without one,
+        // the string's own encoding (which only the options can change).
+        let di9 = (if map_has def_int_enc "v"
+                   then (match map_get def_int_enc "v" with
+                         | VObj oi9 -> (if map_has enc_name (str_of_int oi9) then map_get enc_name (str_of_int oi9) else "")
+                         | _ -> "")
+                   else "") in
+        let implicit9 = (match pos1 with VNil -> (if str_eq di9 "" then false else true) | _ -> false) in
+        let to = (match pos1 with VNil -> (if implicit9 then enc_canon_name di9 else from) | v -> encname_of v) in
+        let inv_rep0 = (match optv "invalid" with VSym r9 -> str_eq r9 "replace" | _ -> false) in
+        let inv_rep = inv_rep0 || implicit9 in
+        let und_rep = (match optv "undef" with VSym r9 -> str_eq r9 "replace" | _ -> false) || implicit9 in
         let fbv = optv "fallback" in
         // the replacement's codepoints (its own encoding respected).
         let rep_cps = (match optv "replace" with
                        | VStr rh -> decode_cps (sget rh) (enc_canon_name (senc_get rh)) 0
                        | _ -> (if str_eq to "UTF-8" || str_eq (substring to 0 (if str_len to < 3 then str_len to else 3)) "UTF"
                                then Cons (65533, Nil) else Cons (63, Nil))) in
-        // the same encoding on both sides, with nothing asked of the
-        // conversion, is no conversion at all: ruby hands the bytes back as
-        // they are, broken or not ("\xff".encode("UTF-8") is "\xFF")
-        let noop9 = str_eq from to && (match opts with
-                                       | VHsh oh -> (match hderef oh with Nil -> true | _ -> false)
-                                       | _ -> true) in
-        if noop9 then
-          (if (str_len name == 7 && str_eq name "encode!") then recv
-           else (let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id to in c | _ -> c)))
+        let nl9 = truthy (optv "universal_newline") || truthy (optv "cr_newline") || truthy (optv "crlf_newline") in
+        let deco9 = nl9 || (if str_eq xml9 "" then false else true) in
+        let relabel9 = fn (bs9: str) ->
+          (if (str_len name == 7 && str_eq name "encode!") then (let _ = sset h bs9 in let _ = senc_set h to in recv)
+           else (let c = mkstr bs9 in (match c with VStr id -> let _ = senc_set id to in c | _ -> c))) in
+        // str_transcode0's short cuts, in its order. Without a decorator (xml:
+        // or a newline option): the same encoding on both sides is no
+        // conversion -- the bytes come back as they are, broken or not, unless
+        // :invalid => :replace was ASKED for, which scrubs -- and an ASCII-only
+        // string between two ASCII-compatible encodings is only relabelled,
+        // which is how BINARY "y" reaches Emacs-Mule, an encoding with no
+        // converter at all.
+        if (if str_eq (enc_find_canon from) "" then true else str_eq (enc_find_canon to) "")
+        then raise_exc world "Encoding::ConverterNotFoundError" ("code converter not found (" ++ from ++ " to " ++ to ++ ")")
+        else if (if deco9 then false else str_eq from to) then
+          (if inv_rep0 then
+             (let rep9 = (match encode_cps rep_cps to "" with (b9, _) -> b9) in
+              match rb_scrub (sget h) to rep9 with (out9, _) -> relabel9 out9)
+           else relabel9 (sget h))
+        else if (if deco9 then false else enc_ascii_compat from && enc_ascii_compat to && enc_all7 (sget h)) then
+          relabel9 (sget h)
+        // CRuby has no converter to or from these (Encoding::Converter.new
+        // refuses every one of them against UTF-8), so there is no path.
+        else if (if str_eq from to then false
+                 else enc_no_converter from || enc_no_converter to) then
+          raise_exc world "Encoding::ConverterNotFoundError" ("code converter not found (" ++ from ++ " to " ++ to ++ ")")
+        // a decorator on the SAME ASCII-compatible encoding converts nothing:
+        // it only rewrites the ASCII bytes it is about, so an invalid byte
+        // passes through (`"a\xFF<".encode(xml: :text)` is "a\xFF&lt;").
+        else if str_eq from to && enc_ascii_compat to then
+          relabel9 (enc_decorate_bytes (sget h) xml9 (truthy (optv "universal_newline")) (truthy (optv "cr_newline")) (truthy (optv "crlf_newline")))
         else
         let cps0 = enc_decode_marked (sget h) from in
         let _ = (let rec anybad = fn (xs: int list) ->
@@ -22123,6 +22195,22 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                 (match xs with Nil -> (Nil : int list) | Cons (10, t9) -> Cons (13, Cons (10, crlf t9)) | Cons (c9, t9) -> Cons (c9, crlf t9)) in
               crlf cps0)
            else cps0) in
+        // xml: escapes the markup characters of the decoded text (" only for
+        // an attribute), before anything is encoded
+        let cps1 = (if str_eq xml9 "" then cps1
+                    else
+                      (let rec xe = fn (xs: int list) ->
+                         (match xs with
+                          | Nil -> (Nil : int list)
+                          | Cons (c9, t9) ->
+                            (let rs9 = (if c9 == 38 then "&amp;" else if c9 == 60 then "&lt;" else if c9 == 62 then "&gt;"
+                                        else if c9 == 34 && str_eq xml9 "attr" then "&quot;" else "") in
+                             if str_eq rs9 "" then Cons (c9, xe t9)
+                             else
+                               (let rec app9 = fn (ys: int list) ->
+                                  (match ys with Nil -> xe t9 | Cons (y9, yt9) -> Cons (y9, app9 yt9)) in
+                                app9 (decode_cps rs9 "UTF-8" 0)))) in
+                       xe cps1)) in
         // ⚠ THE BYTE-ORDER MARK BELONGS TO THE STRING, NOT TO EACH CHARACTER.
         // encode_cps writes a BOM for the byte-order-free names UTF-16 and
         // UTF-32, and the loop below hands it ONE codepoint at a time -- so
@@ -22156,20 +22244,41 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                     (let explicit9 = (match optv "replace" with VStr _ -> true | _ -> false) in
                      if und_rep && explicit9 then emit t9 (acc ++ rep_bytes)
                      else
+                     // the fallback is handed the character as the failing
+                     // step sees it -- in UTF-8, the pivot every path here
+                     // goes through. A Hash is asked by #[] (so its default
+                     // and default_proc answer), an object only if it has #[].
                      let ch = (let cb = utf8_enc c9 in
                                let cv = mkstr cb in
-                               (match cv with VStr ci -> (let _ = senc_set ci from in cv) | _ -> cv)) in
-                     let fb = (match fbv with
-                               | VHsh fh -> (match hash_lookup (hderef fh) ch with (true, v9) -> v9 | _ -> VNil)
-                               | VProc _ -> invoke_val_c env world nb fbv "call" (Cons (ch, Nil)) false
-                               | VObj _ -> invoke_val_c env world nb fbv "[]" (Cons (ch, Nil)) false
-                               | _ -> VNil) in
+                               (match cv with VStr ci -> (let _ = senc_set ci "UTF-8" in cv) | _ -> cv)) in
+                     let fb0 = (match fbv with
+                                | VHsh _ -> invoke_val_c env world nb fbv "[]" (Cons (ch, Nil)) false
+                                | VProc _ -> invoke_val_c env world nb fbv "call" (Cons (ch, Nil)) false
+                                | VObj _ -> (if responds world fbv "[]" then invoke_val_c env world nb fbv "[]" (Cons (ch, Nil)) false else VNil)
+                                | _ -> VNil) in
+                     // what it answers must BE a String (#to_str, never #to_s)
+                     let fb = (match fb0 with
+                               | VNil -> VNil
+                               | VStr _ -> fb0
+                               | VObj _ ->
+                                 (match conv_try env world fb0 "to_str" with
+                                  | VStr fs9 -> VStr fs9
+                                  | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name fb0 ++ " into String"))
+                               | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name fb0 ++ " into String")) in
                      match fb with
                      | VStr fh2 ->
+                       // ...and one the destination can hold: ruby's
+                       // rb_econv_insert_output fails, in these words
                        (match encode_cps (decode_cps (sget fh2) (enc_canon_name (senc_get fh2)) 0) to_enc9 "" with
-                        | (fb9, _) -> emit t9 (acc ++ fb9))
+                        | (fb9, fok9) ->
+                          if fok9 then emit t9 (acc ++ fb9)
+                          else (match raise_exc world "ArgumentError" "too big fallback string" with _ -> acc))
                      | _ ->
                        if und_rep then emit t9 (acc ++ rep_bytes)
+                       // xml: writes what the destination lacks as a
+                       // hexadecimal character reference, upper case
+                       else if (if str_eq xml9 "" then false else true) then
+                         emit t9 (acc ++ (match encode_cps (decode_cps ("&#x" ++ hex_up c9 ++ ";") "UTF-8" 0) to_enc9 "" with (hb9, _) -> hb9))
                        // the two encoding NAMES ride on the exception, so its
                        // #source_encoding / #destination_encoding readers (in
                        // the prelude) can answer -- they were NoMethodError.
@@ -22188,7 +22297,11 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                                      (Cons (("source_encoding_name", mkstr sn9),
                                        Cons (("destination_encoding_name", mkstr to), Nil))) with
                              | _ -> acc)))) in
-        let bytes = (let b0 = emit cps1 "" in if str_eq b0 "" then b0 else bom9 ++ b0) in
+        // xml: :attr quotes the whole value, in the destination's bytes; and
+        // ISO-2022-JP is stateful -- one character at a time each came out
+        // wrapped in its own ESC $ B ... ESC ( B, so a run is re-joined.
+        let q9 = (if str_eq xml9 "attr" then (match encode_cps (Cons (34, Nil)) to_enc9 "" with (qb9, _) -> qb9) else "") in
+        let bytes = (let b0 = q9 ++ iso2022_join to_enc9 (emit cps1 "") ++ q9 in if str_eq b0 "" then b0 else bom9 ++ b0) in
         if (str_len name == 7 && str_eq name "encode!") then (let _ = sset h bytes in let _ = senc_set h to in recv)
         else (let c = mkstr bytes in (match c with VStr id -> let _ = senc_set id to in c | _ -> c)))
      | _ -> VNil)
@@ -24482,6 +24595,39 @@ and str_slice_bang_rx = fn env -> fn world -> fn (h: int) -> fn (args: Val list)
          let _ = rx_pub_groups s 1 false "UTF-8" in VNil))
    | _ -> VNil)
 
+// String#<< / #concat with one argument: rb_str_concat.
+// * A String is appended with the encoding negotiated as for any
+//   concatenation (enc_compat2), and two texts that cannot meet are refused.
+// * An Integer is a CODEPOINT in the receiver's encoding -- the character
+//   Integer#chr(enc) makes, with its RangeErrors -- except that a US-ASCII or
+//   BINARY receiver takes a BYTE up to 255, and US-ASCII given one above 127
+//   becomes BINARY (#5855). A negative number is out of char range
+//   everywhere, a Bignum always.
+// * Anything else is a TypeError; #to_str has been asked by then.
+and str_append_val = fn (h: int) -> fn (v: Val) ->
+  match v with
+  | VStr y ->
+    (let renc = enc_compat2 (senc_get h) (sget h) (senc_get y) (sget y) in
+     if str_eq renc "" then
+       prim_raise "Encoding::CompatibilityError"
+         ("incompatible character encodings: " ++ enc_canon_name (senc_get h) ++ " and " ++ enc_canon_name (senc_get y))
+     else (let _ = sset h (sget h ++ sget y) in let _ = senc_set h renc in VStr h))
+  | VInt n ->
+    (let e = enc_canon_name (senc_get h) in
+     if n < 0 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
+     else if str_eq e "ASCII-8BIT" || str_eq e "US-ASCII" then
+       (if n > 255 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
+        else
+          (let _ = sset h (sget h ++ chr n) in
+           let _ = (if n > 127 && str_eq e "US-ASCII" then senc_set h "ASCII-8BIT" else ()) in
+           VStr h))
+     else
+       (match prim_method (VInt n) "chr" (Cons (mkstr e, Nil)) with
+        | VStr c -> (let _ = sset h (sget h ++ sget c) in VStr h)
+        | other -> other))
+  | VBig _ -> prim_raise "RangeError" "bignum out of char range"
+  | other -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
+
 // mutate the string behind handle h in place; returns the method's value
 // (the receiver itself, nil for an unchanged bang method, the assigned
 // value for []=). Out-of-range []= indices are clamped.
@@ -24529,7 +24675,26 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
      // (an object with #to_str was converted before this; what is left has none)
      | Cons (v, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String")
      | Nil -> VStr h)
-  else if (str_len name == 6 && str_eq name "concat") then let _ = sset h (s ++ str_concat_vals args) in VStr h
+  // concat(*args) appends each argument as `<<` would (str_append_val); with
+  // more than one they are first gathered in a buffer of the receiver's
+  // encoding and that is appended, as rb_str_concat_multi does -- which is
+  // also why `s.concat(s, s)` appends the ORIGINAL text twice. Appending
+  // each argument's #to_s had made `"".concat(33)` "33" instead of "!".
+  else if (str_len name == 6 && str_eq name "concat") || (str_len name == 2 && str_eq name "<<") then
+    (match args with
+     | Nil -> (if str_len name == 2 then prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)" else VStr h)
+     | Cons (a, Nil) -> str_append_val h a
+     | _ ->
+       (if str_len name == 2 then prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)")
+        else
+          (let buf = mkstr "" in
+           let _ = (match buf with VStr bh -> senc_set bh (senc_get h) | _ -> ()) in
+           let rec go = fn (xs: Val list) ->
+             (match xs with
+              | Nil -> ()
+              | Cons (x, t) -> (match buf with VStr bh -> (let _ = str_append_val bh x in go t) | _ -> ())) in
+           let _ = go args in
+           str_append_val h buf)))
   // String#append_as_bytes(*args): appends BYTES. A String contributes its
   // bytes as they are and an Integer one byte, its least significant -- so it
   // can build a string that is not valid in its own encoding, which is the
