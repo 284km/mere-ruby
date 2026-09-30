@@ -822,10 +822,22 @@ made on its own.
 ## The regex engine has no true subroutine calls
 
 `\g<name>` is implemented by INLINING the named group's pattern at the call
-site (its captures made shy), which is what ruby's RFC3986 URI pattern needs
-and what makes `require "uri"` work here. A group that calls itself would
+site, which is what ruby's RFC3986 URI pattern needs and what makes
+`require "uri"` work here. The copy captures under the called group's number
+(so `(?<foo>foo.)bar\g<foo>` leaves foo at what the call matched, as onigmo
+does); the groups INSIDE the copy are shy. A group that calls itself would
 inline forever, so genuine recursion — `(?<p>\(\g<p>*\))` for balanced
-parens — is not supported. Real subroutine calls need a call stack in the VM.
+parens — is not supported, and neither is a backreference to another
+recursion LEVEL: `\k<a+0>` is the plain `\k<a>`, `\k<a+1>` / `\k<a-1>` are
+refused as unsupported (RegexpError). Real subroutine calls need a call stack
+in the VM, and levels need captures kept per call. Two examples of
+language/regexp/subexpression_call_spec.
+
+The warnings onigmo prints while it parses a pattern are not printed: "nested
+repeat operator '?' and '+' was replaced with '*'", "redundant nested repeat
+operator", "character class has ']' without escape". The patterns themselves
+match as ruby's do. One example of language/regexp/repetition_spec
+(`{0,1}+` must complain).
 
 A MatchData holds 64 capture groups (ruby exposes only `$1`..`$9` as globals,
 but `m[10]` and `m[:name]` are answered up to 64). A pattern with more than
