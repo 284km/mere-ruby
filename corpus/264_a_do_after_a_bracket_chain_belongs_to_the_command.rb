@@ -18,3 +18,8 @@ class K
   end
 end
 p K.new.ab, K.new.cd
+
+# p and pp have a branch of their own for `p [..]`, and the same holds there:
+# the block is p's, Kernel#p ignores it, and what p prints is the Enumerator
+p [1, 2].map do |x| x end
+p([3].each do end.class)
