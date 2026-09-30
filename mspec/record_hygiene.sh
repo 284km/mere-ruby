@@ -29,7 +29,7 @@ root="$(cd "$here/.." && pwd)"
 if [ "$#" -gt 0 ]; then
   files="$*"
 else
-  files=$(cd "$root" && git ls-files 'mspec/*.txt' 'CAUSES.md' 'EXAMPLES.md' 'SPEC_STATUS.md' 'SPEC_STATUS_STDLIB.md' 'bootstraptest/*.txt' 2>/dev/null | sed "s|^|$root/|")
+  files=$(cd "$root" && git ls-files 'mspec/*.txt' 'CAUSES.md' 'EXAMPLES.md' 'SPEC_STATUS.md' 'SPEC_STATUS_STDLIB.md' 'bootstraptest/*.txt' 'unittest/*.txt' 'unittest/STATUS.md' 2>/dev/null | sed "s|^|$root/|")
 fi
 [ -n "$files" ] || { echo "no records to check" >&2; exit 2; }
 rc=0
