@@ -5036,7 +5036,12 @@ and rescues_targets = fn rescues ->
   match rescues with
   | Nil -> Nil
   | Cons (rc, rest) ->
-    let (cs, v, b) = rc in list_append_str (deep_targets b) (rescues_targets rest)
+    // `rescue => e` binds e as a local of the scope, even when that rescue
+    // never ran
+    let (cs, v, b) = rc in
+    let tail = list_append_str (deep_targets b) (rescues_targets rest) in
+    if str_len v == 0 || str_eq (char_at v 0) "@" || str_eq (char_at v 0) "$" then tail
+    else Cons (v, tail)
 
 // A value's identity, for a guard that has to tell one PAIR from another. The
 // reference types carry a handle; everything else is compared by what it prints,
@@ -37480,7 +37485,15 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                       | VArr h8 -> hng_cls_of world (VArr h8) "Array" ++ "#" ++ meth_base mname
                       | VHsh h8 -> hng_cls_of world (VHsh h8) "Hash" ++ "#" ++ meth_base mname
                       | VClass c8 -> "(sng:" ++ c8 ++ ")#" ++ meth_base mname
-                      | _ -> "(sng:" ++ recv_base mname ++ ")#" ++ meth_base mname)
+                      // a constant receiver is looked up lexically, from this
+                      // body out: `class A; class C; def C.m` is A::C's, and the
+                      // bare name made a "(sng:C)" nothing reaches (resolv.rb's
+                      // `def Config.default_config_hash`)
+                      | _ -> (let r8 = recv_base mname in
+                              let k8 = (if is_upper_first r8 then lex_const_key cls r8 else "") in
+                              let c8 = (if str_eq k8 "" then r8
+                                        else (match map_get consts k8 with VClass cc8 -> cc8 | _ -> r8)) in
+                              "(sng:" ++ c8 ++ ")#" ++ meth_base mname))
                    else if is_selfdef then "(sng:" ++ cls ++ ")#" ++ mname
                    else cls ++ "#" ++ mname in
          let _ = set_meth meths key (Meth (params, defs, mbody)) in
@@ -38165,6 +38178,8 @@ and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (la
     (match run_while_top env world blk c b 100000 with
      | 0 -> (0, 0, lastv)
      | 1 ->
+       // the body's targets exist after the loop, run or not (see SWhile)
+       let _ = declare_nils env (deep_targets b) in
        (if gc_pressure world then (1, 0, VNil)
         else let (cn, f, lv) = run_until_gc env world blk rest VNil in (cn + 1, f, lv))
      | _ -> (0, 2, lastv))
@@ -38645,15 +38660,25 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   | SIf (clauses, els) ->
     // after the if, declare (as nil) any assignment targets in branches
     // that did not run — Ruby defines locals at parse time.
+    // The scan is deep: an assignment inside a `begin`, a loop or a nested
+    // `if` of the branch that did not run declares its name too (resolv.rb's
+    // `hosts = ... rescue LoadError` under an untaken `if` is exactly that).
     let f = run_if env world blk clauses els in
-    let _ = declare_clause_targets env clauses in
-    let _ = declare_nils env (body_targets els) in
+    let _ = declare_nils env (clauses_targets clauses) in
+    let _ = declare_nils env (deep_targets els) in
     f
-  | SWhile (cond, body) -> run_while env world blk cond body
+  | SWhile (cond, body) ->
+    // a body that never ran, or stopped before an assignment, still declares
+    let f = run_while env world blk cond body in
+    let _ = declare_nils env (deep_targets body) in
+    f
   | SCase (subj, whens, els) ->
-    (match subj with
-     | ECaseNone -> run_case_truthy env world blk whens els
-     | _ -> run_case env world blk (eval_e env world blk subj) whens els)
+    let f = (match subj with
+             | ECaseNone -> run_case_truthy env world blk whens els
+             | _ -> run_case env world blk (eval_e env world blk subj) whens els) in
+    let _ = declare_nils env (whens_targets whens) in
+    let _ = declare_nils env (deep_targets els) in
+    f
   | SCaseIn (subj, clauses, has_else, els) ->
     // Ruby declares every pattern variable at parse time (they exist as nil
     // even when no clause matches). Pre-declare, then try each clause.
@@ -38680,7 +38705,16 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              | _ -> m)
           else m)
        else if str_contains name "#" then
-         let recv = recv_base name in
+         // `def C.m` names C the way any constant reference does: lexically
+         // first. Asked at the top level only, `class A; class C; def C.m`
+         // defined a bare `m` and `A::C.m` was missing (resolv.rb's
+         // `def Config.default_config_hash`, net/http's `def HTTP.version_1_1?`).
+         let recv = (let r0 = recv_base name in
+                     if is_upper_first r0 then
+                       (let cr = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s2 -> sget s2 | _ -> "") else cur_lex ()) in
+                        let k = lex_const_key cr r0 in
+                        if str_eq k "" then r0 else k)
+                     else r0) in
          let m = meth_base name in
          // `def @obj.m` -- the receiver is an ivar of the current self: the
          // singleton goes on the OBJECT the ivar holds, like a local's would.
@@ -39234,7 +39268,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     else FReturn v
   | SBreak e -> FBreak (eval_e env world blk e)
   | SNext e -> FLoopNext (eval_e env world blk e)
-  | SBegin (body, rescues, els, ens) -> run_begin env world blk body rescues els ens
+  | SBegin (body, rescues, els, ens) ->
+    // a statement skipped by a raise, or a rescue that did not run, declares
+    let f = run_begin env world blk body rescues els ens in
+    let _ = declare_nils env (stmt_targets (SBegin (body, rescues, els, ens))) in
+    f
   // reached only when nested (top-level BEGIN/END are handled by hoist_run):
   // a BEGIN inside a block/method is a SyntaxError; a nested END just runs.
   | SPreexe _ -> (let _ = raise_exc world "SyntaxError" "BEGIN is permitted only at toplevel" in FNext VNil)
