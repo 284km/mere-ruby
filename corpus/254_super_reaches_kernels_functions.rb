@@ -58,3 +58,18 @@ print "a", "b"
 $stdout.print "c"
 $\ = nil
 print "done\n"
+
+# initialize_copy is a Kernel name too, and `super` from an override of it is
+# the default copy -- rubygems' Gem::Requirement is written this way
+class Req
+  attr_reader :parts
+  def initialize(parts) = @parts = parts
+  def initialize_copy(other)
+    @parts = other.parts.dup
+    super
+  end
+end
+a = Req.new([1, 2])
+b = a.dup
+b.parts << 3
+p [a.parts, b.parts]
