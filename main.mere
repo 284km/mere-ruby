@@ -5896,20 +5896,10 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
           let r = iter_each_result (arr_each world encl theblk cps) recv in
           if bad then prim_raise "ArgumentError" ("invalid byte sequence in " ++ enc_canon_name (senc_get h))
           else r)
-     else if (str_len name == 9 && str_eq name "each_line") then
-       // each_line(sep = $/): the same separator rules as String#lines.
-       (let sepv = (match args with
-                    | Cons (VStr sp, _) -> VStr sp
-                    | Cons (VNil, _) -> VNil
-                    | _ -> (if map_has globals "/" then map_get globals "/" else mkstr "\n")) in
-        let ls = (match sepv with
-                  | VNil -> (if str_len sv == 0 then (Nil : Val list) else Cons (mkstr sv, Nil))
-                  | VStr sph ->
-                    let sep = sget sph in
-                    (if str_eq sep "\n" then val_list_of_strs (str_lines_go sv 0 0 (str_len sv))
-                     else val_list_of_strs (str_lines_sep sv sep))
-                  | _ -> val_list_of_strs (str_lines_go sv 0 0 (str_len sv))) in
-        iter_each_result (arr_each world encl theblk (val_strs_tag ls (senc_get h))) recv)
+     // each_line and the block form of lines (which yields instead of
+     // collecting, and answers the receiver): str_lines_of's pieces.
+     else if (str_len name == 9 && str_eq name "each_line") || (str_len name == 5 && str_eq name "lines") then
+       iter_each_result (arr_each world encl theblk (str_lines_of h args)) recv
      else if (str_len name == 15 && str_eq name "each_with_index") then iter_each_result (arr_each world encl theblk (with_index_pairs (utf8_chars_val sv 0) 0)) recv
      else prim_method recv name args)
   | VArr id -> let xs = deref id in
@@ -17661,10 +17651,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // answer: how many times they yield depends on what the block says, so
        // ruby reports UNKNOWN rather than the number materialising happens to
        // produce (and materialising here now raises, since a collecting block
-       // does not answer the comparison bsearch demands).
+       // does not answer the comparison bsearch demands). each_line is nil
+       // for the same reason: CRuby does not count the lines ahead (String's,
+       // IO's and ARGF's alike), where materialising answered 2.
        else if (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
                 | VStr mh -> str_eq (sget mh) "gsub" || str_eq (sget mh) "gsub!"
                              || str_eq (sget mh) "bsearch" || str_eq (sget mh) "bsearch_index"
+                             || str_eq (sget mh) "each_line"
                 | _ -> false) then VNil
        // each_codepoint / codepoints know their size without running: the
        // string's character count (materialising would RAISE on a string
@@ -24724,6 +24717,66 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
 // argument. That distinction is why Integer#to_s / #inspect, String#to_i,
 // #chomp, #upcase and the rest of the optional-argument family are absent here.
 
+// String#lines / #each_line: the pieces, for all three spellings (each_line
+// with a block, lines with a block, and the Array lines builds) -- their
+// separator rules had been written twice and the block form of #lines not at
+// all, so `s.lines { }` quietly built the Array and yielded nothing.
+// (record_separator = $/, chomp: false), in rb_str_enumerate_lines' order:
+// * nil answers the receiver ITSELF, empty or not (`"".lines(nil)` is [""]);
+// * an empty receiver answers nothing, before the separator is looked at, so
+//   `"".lines(false)` is [] where `"x".lines(false)` is a TypeError;
+// * the default separator of an ASCII-incompatible receiver is "\n" in ITS
+//   encoding: "\n\0" for UTF-16LE, and for the dummy UTF-16 / UTF-32 the BOM
+//   and all, which never occurs mid-string -- ruby does not split those. UTF-7
+//   has no converter to take it there and refuses;
+// * any other separator must be compatible with the receiver.
+and str_lines_of = fn (h: int) -> fn (args: Val list) ->
+  let s = sget h in
+  let e = enc_canon_name (senc_get h) in
+  let chomp = (match rev_app args Nil with
+               | Cons (VHsh hid, _) ->
+                 (match hash_lookup (hderef hid) (VSym "chomp") with
+                  | (true, cv) -> truthy cv
+                  | _ -> false)
+               | _ -> false) in
+  let pos = (match rev_app args Nil with
+             | Cons (VHsh _, t) -> rev_app t Nil
+             | _ -> args) in
+  let _ = (match pos with
+           | Cons (_, Cons (_, _)) ->
+             prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len pos) ++ ", expected 0..1)")
+           | _ -> VNil) in
+  let given = (match pos with Cons (_, _) -> true | Nil -> false) in
+  let sepv = (match pos with
+              | Cons (v, _) -> v
+              | Nil -> (if map_has globals "/" then map_get globals "/" else mkstr "\n")) in
+  let tag = fn (xs: str list) -> val_strs_tag (val_list_of_strs xs) e in
+  (match sepv with
+   | VNil -> Cons (VStr h, Nil)
+   | _ ->
+     if str_len s == 0 then (Nil : Val list)
+     else
+       (match sepv with
+        | VStr sph ->
+          let sep = sget sph in
+          if (if given then false else str_eq sep "\n") && (if enc_ascii_compat e then false else true) then
+            (if str_eq e "UTF-7" then prim_raise "Encoding::ConverterNotFoundError" "code converter not found (ASCII-8BIT to UTF-7)"
+             else
+               (let nl = (if str_eq e "UTF-16LE" then "\n" ++ chr 0
+                          else if str_eq e "UTF-16BE" then chr 0 ++ "\n"
+                          else if str_eq e "UTF-32LE" then "\n" ++ chr 0 ++ chr 0 ++ chr 0
+                          else if str_eq e "UTF-32BE" then chr 0 ++ chr 0 ++ chr 0 ++ "\n"
+                          else if str_eq e "UTF-16" then chr 254 ++ chr 255 ++ chr 0 ++ "\n"
+                          else if str_eq e "UTF-32" then chr 0 ++ chr 0 ++ chr 254 ++ chr 255 ++ chr 0 ++ chr 0 ++ chr 0 ++ "\n"
+                          else if str_eq e "IBM037" then chr 37
+                          else "\n") in
+                tag (str_line_pieces s nl false)))
+          else if (if given then str_eq (enc_pair_or h sph) "" else false) then
+            prim_raise "Encoding::CompatibilityError"
+              ("incompatible character encodings: " ++ e ++ " and " ++ enc_canon_name (senc_get sph))
+          else tag (str_line_pieces s sep chomp)
+        | other -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")))
+
 and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // what the call WAS, for the NoMethodError this may become: the leaf has no
   // world to raise an object with, and the rescue that materialises the
@@ -27335,31 +27388,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | _ -> (let _ = prim_nm_set (mkstr "scan") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scan'")) in fail "mere-ruby: undefined method 'scan'")))
   // `lines(chomp: true)` drops each terminator, which is what a caller
-  // splitting input almost always wants.
-  else if (str_len name == 5 && str_eq name "lines") then (match recv with VStr s -> let se9 = senc_get s in let s = sget s in
-      // lines(sep = $/, chomp: false): a custom separator stays attached to
-      // each piece, "" is paragraph mode, and $/ = nil means one piece.
-      (let copt = (let rec last_hash = fn (xs: Val list) -> fn (acc: bool) ->
-                     (match xs with
-                      | Nil -> acc
-                      | Cons (VHsh hid, t) ->
-                        last_hash t (match hash_lookup (hderef hid) (VSym "chomp") with
-                                     | (true, cv) -> truthy cv
-                                     | _ -> acc)
-                      | Cons (_, t) -> last_hash t acc) in
-                   last_hash args false) in
-       let sepv = (match args with
-                   | Cons (VStr sp, _) -> VStr sp
-                   | Cons (VNil, _) -> VNil
-                   | _ -> (if map_has globals "/" then map_get globals "/" else mkstr "\n")) in
-       let ls = (match sepv with
-                 | VNil -> (if str_len s == 0 then (Nil : Val list) else Cons (mkstr s, Nil))
-                 | VStr sph ->
-                   let sep = sget sph in
-                   (if str_eq sep "\n" then val_list_of_strs (str_lines_go s 0 0 (str_len s))
-                    else val_list_of_strs (str_lines_sep s sep))
-                 | _ -> val_list_of_strs (str_lines_go s 0 0 (str_len s))) in
-       if copt then arr_new (val_strs_tag (val_map_chomp ls) se9) else arr_new (val_strs_tag ls se9)) | _ -> (let _ = prim_nm_set (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
+  // splitting input almost always wants. The rules are str_lines_of's.
+  else if (str_len name == 5 && str_eq name "lines") then
+    (match recv with
+     | VStr h -> arr_new (str_lines_of h args)
+     | _ -> (let _ = prim_nm_set (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
   else if (str_len name == 5 && str_eq name "split") then
     (match recv with
      | VStr sh0 ->
