@@ -21,3 +21,10 @@ p Kernel.equal?(Kernel), Kernel.__send__(:equal?, Kernel)
 # mixins are not listed
 p IO.ancestors.take(3), Dir.ancestors.take(2)
 p IO.ancestors.none? { |m| m.name.to_s.end_with?("__Impl") }
+
+# RbConfig is a module, and a program may reopen it (CRuby's test framework does)
+p RbConfig.class
+module RbConfig
+  def self.reopened = :yes
+end
+p RbConfig.reopened
