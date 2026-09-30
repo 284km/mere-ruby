@@ -3976,3 +3976,30 @@ answers Enumerable#include? -- membership, not ancestry -- and an arm for the
 name hijacked it: corpus/56_gem_surface's `Registry.include?(2)` came back
 "wrong number of arguments (given 1, expected 1)", a message absurd on its
 face. One name, two meanings, and only the receiver tells them apart.
+
+## core/thread/list_spec counts a number that is different on every run
+
+The row is DIFF with nothing failing on either side: mere-ruby prints
+`pass=911 fail=0 err=0`, ruby printed `pass=536017` on one sweep and
+`pass=493473` on the next. The shim counts EXPECTATIONS, as mspec does, and
+the file's last example asserts once per thread per lap of
+
+```ruby
+begin
+  Thread.list.each { |th| th.should.is_a?(Thread) }
+end while spawner.alive?
+```
+
+so the count is however many laps the loop managed while another thread was
+starting a hundred threads -- a number set by the scheduler's timing, not by
+anything either interpreter answers. mere-ruby's scheduler runs the spawner
+to completion in a few laps, so its count is small and the same every time;
+ruby's changes run to run.
+
+**Why it is still here.** There is nothing to make equal: the two outputs
+cannot agree unless the laps do, and no interpreter controls that. Counting
+examples instead of expectations would make the row MATCH, but it would do
+so by changing what every other row compares, for one file.
+
+**What fixing it would take.** Nothing in mere-ruby. The file is correct
+on both sides (zero failures); read the row as unmeasurable.
