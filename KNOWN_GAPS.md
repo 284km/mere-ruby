@@ -4228,3 +4228,33 @@ real reason.
 **What fixing it would take.** A faster Etc.getgrgid (a cache is not
 faithful: groups can change under a running process). Read this row as
 "passes, and sometimes too slowly to be told".
+
+## `json`: what the shipped C half does not reproduce
+
+`require "json"` is json 2.18's own ruby (m_json_lib.mere, generated) over a
+parser and a generator written in Mere (m_json.mere). CRuby's test/json runs
+under unittest/run.sh; what is red there and why, as of this entry:
+
+- **Not json's.** A String/Array/Hash SUBCLASS loses its own `to_s` /
+  `inspect` (`class A < Array; def to_s; ...; end; end` answers "[]"), and a
+  String-subclass Hash KEY becomes a plain String on insertion, so the
+  generator never sees the subclass (5 generator tests). `super` from an
+  Array subclass's `<<` does not reach Array#<< (1). A `prepend` on
+  Tempfile's singleton class sends `super` from `new` into Delegator's
+  method_missing, and tool/lib's leak checker installs exactly that, so every
+  test that makes a Tempfile errors (7, json_common_interface). A local
+  assigned inside a default argument (`o2 = (predicate = true; nil)`, tool/lib's
+  assert_operator) is not a local of the method (1). A Time subclass cannot
+  call Time's builtins with an implicit receiver (1). `Regexp.new` called
+  implicitly inside `class Regexp` builds a plain object (json/add/regexp,
+  1). `Rational.respond_to?(:new)` is true here, so `decimal_class: Rational`
+  takes the `new` branch where ruby takes Kernel#Rational.
+- **Not reproducible here.** BigDecimal is not implemented (see its entry),
+  and Ractor runs sequentially (json's ractor tests are never reached).
+- **Deliberately approximate.** The generator writes to an IO once, at the
+  end (fbuffer flushes every time its buffer fills; the bytes are the same,
+  the number of #write calls is not). A Hash key an on_load proc turned into
+  an object with its own #hash/#eql? is not merged with an equal one
+  (duplicate detection there is by identity). A Float that is NaN compares
+  equal to another NaN when strict + as_json asks "did as_json return the
+  same object".
