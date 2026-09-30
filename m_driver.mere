@@ -7779,6 +7779,29 @@ let top_report = fn env -> fn world -> fn (exc: Val) -> fn (name: str) ->
   let s9 = exc_blocks env world chain9 false in
   if str_len s9 > 0 && str_eq (char_at s9 (str_len s9 - 1)) "\n" then substring s9 0 (str_len s9 - 1) else s9;
 
+// The report for a main program that does not parse. ruby's reads
+// "<file>: <file>:<line>: syntax errors found (SyntaxError)" and then prism's
+// own diagnostic; the diagnostic here is this parser's, so what is kept of
+// ruby's shape is what a caller looks for -- the file and the class. Before,
+// the parser's `fail` went straight out as the interpreter's own
+// "fail: mere-ruby: ..." line, which named neither.
+let cli_syntax_report = fn (name: str) ->
+  let m = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error") in
+  let m2 = (if str_len m > 11 && str_eq (substring m 0 11) "mere-ruby: " then substring m 11 (str_len m) else m) in
+  name ++ ": " ++ m2 ++ " (SyntaxError)";
+// -E / -K / -U / --encoding: the default encodings, set once the Encoding
+// objects exist. A name no encoding answers to is ruby's RuntimeError, and
+// nothing runs.
+let cli_apply_enc = fn (slot: str) ->
+  let k = "enc_" ++ slot in
+  if map_has cli_opt k then
+    (let nm = map_get cli_opt k in
+     let c = enc_find_canon nm in
+     if str_eq c "" || (if map_has enc_objs c then false else true) then
+       (let _ = print_err ("mere-ruby: unknown encoding name - " ++ nm ++ " (RuntimeError)") in exit 1)
+     else map_set (if str_eq slot "external" then def_ext_enc else def_int_enc) "v" (map_get enc_objs c))
+  else ();
+
 // -n / -p: the program is the body of `while gets ... end`, with what -l, -a
 // and -F add around it, and Kernel#chomp / #chop exist (private, on $_) -- ruby
 // defines those two only under these switches. The wrapper is Ruby, parsed on
@@ -7828,16 +7851,32 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set load_ctx "file" (mkstr name) in
   let _ = map_set loaded_files name VNil in
   let cod0 = src_coding src in
+  // with no magic comment the main script is UTF-8 -- or what -K named, which
+  // is the one thing that switch is for (__ENCODING__ and the literals)
+  let cod0 = (if str_eq cod0 "" && map_has cli_opt "enc_source" then str_upcase (map_get cli_opt "enc_source") else cod0) in
   let _ = map_set load_ctx "coding" (mkstr (if str_eq cod0 "" then "UTF-8" else cod0)) in
   let _ = map_set fsl_ctx "v" (src_fsl src) in
-  let toks = number_nls src (lex_go src 0) in
-  let _ = parse_line_reset (count_nls toks) in
-  let (prog, rest) = parse_stmts toks Nil in
-  let _ = rx_check_pending () in
-  let _ =
-    (match rest with
-     | Cons (TEOF, _) -> ()
-     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in fail ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in
+  // ⚠ A PROGRAM THAT DOES NOT PARSE IS REPORTED AFTER -r, not here. ruby
+  // requires the -r libraries BEFORE it parses the main script, so their
+  // output comes first and then the SyntaxError; parsing first and failing
+  // meant a -r library never ran at all. The parse still happens here (the
+  // world below is built around it), but a failure is held in cli_opt
+  // "synerr" and reported where ruby would have reached the parse.
+  let pok9 = map_new () in
+  let (prog, rest) = try_or (fn (u: unit) ->
+      let toks = number_nls src (lex_go src 0) in
+      let _ = parse_line_reset (count_nls toks) in
+      let r9 = parse_stmts toks Nil in
+      let _ = rx_check_pending () in
+      let (_, rest9) = r9 in
+      let _ =
+        (match rest9 with
+         | Cons (TEOF, _) -> ()
+         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in fail ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in
+      let _ = map_set pok9 "y" 1 in r9) ((Nil : Stmt list), (Nil : Tok list)) in
+  let _ = (if map_has pok9 "y" then ()
+           else (let _ = map_set cli_opt "synerr" (cli_syntax_report name) in
+                 if map_has prim_missing "i" then map_delete prim_missing "i" else ())) in
   let prog = cli_loop_wrap prog in
   let env = map_new () in
   // The program's middle (non-BEGIN/END) statements, computed once, OUTSIDE
@@ -8352,7 +8391,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = galias "-v" "VERBOSE" in
   let _ = galias "-w" "VERBOSE" in
   // ...and the switches READ as false when they were not given, not nil.
-  let _ = map_set globals "DEBUG" (VBool false) in
+  let _ = map_set globals "DEBUG" (VBool (map_has cli_opt "debug")) in
   // `$.` is the line number of the last read, and it starts at ZERO, not nil.
   // Nothing here read it strictly, so nil went unnoticed for a long time --
   // until the refusal below made `$. = saved_lineno` a TypeError, and
@@ -8649,6 +8688,8 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
               let _ = (match ppf8 with VNil -> map_delete load_ctx "pfile" | _ -> map_set load_ctx "pfile" ppf8) in
               let _ = try_or (fn (u: unit) -> let _ = hoist_run env world noblk dprog in VNil) VNil in ())
            else ()) in
+  let _ = cli_apply_enc "external" in
+  let _ = cli_apply_enc "internal" in
   // -r's libraries, required as the script itself would require them
   let _ = (if map_has cli_reqs "v" then
              (let rec reqs9 = fn (xs: str list) ->
@@ -8659,6 +8700,8 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
               let (rprog, _) = parse_stmts (number_nls rsrc (lex_go rsrc 0)) Nil in
               let _ = hoist_run env world noblk rprog in ())
            else ()) in
+  // ...and this is where ruby would have parsed the main script (see pok9)
+  let _ = (if map_has cli_opt "synerr" then (let _ = print_err (map_get cli_opt "synerr") in exit 1) else ()) in
   // the main script's locals exist from here on: a file -r loaded ran before
   // the script was compiled and saw none of them
   let _ = map_set tl_decl "v" (tl_decl_names (deep_targets prog)) in
@@ -8828,48 +8871,222 @@ let is_loop_short = fn (a: str) ->
   str_len a >= 2 && str_eq (char_at a 0) "-"
   && (let c = char_at a 1 in str_eq c "n" || str_eq c "p" || str_eq c "l" || str_eq c "a" || str_eq c "F");
 
-// consume CLI flags (--enable/--disable-frozen-string-literal), returning the
-// remaining args with those flags removed (mutating cli_fsl as a side effect).
+// ---- the rest of ruby's switches ------------------------------------------
+// A switch that cannot go on is RuntimeError in ruby, printed as
+// "ruby: <message> (RuntimeError)" before anything runs. The first one wins,
+// as ruby stops at it; run_cli prints it.
+let cli_fatal = fn (msg: str) ->
+  if map_has cli_opt "fatal" then () else map_set cli_opt "fatal" msg;
+// ...and the one ruby raises as `fatal` instead (rb_fatal: a -C to nowhere)
+let cli_fatal_f = fn (msg: str) ->
+  if map_has cli_opt "fatal" then ()
+  else (let _ = map_set cli_opt "fatal_cls" "fatal" in map_set cli_opt "fatal" msg);
+// ruby's set_option_encoding_once: -E / --encoding / --external-encoding /
+// --internal-encoding / -U fill ONE slot each, and a second switch naming a
+// DIFFERENT encoding is refused ("default_internal already set to ascii")
+// rather than quietly winning. The same name again, compared case-blind as
+// ruby compares it, is not a change -- `-U -U` is fine.
+let cli_enc_once = fn (slot: str) -> fn (nm: str) ->
+  let k = "enc_" ++ slot in
+  if map_has cli_opt k && (if str_eq (str_upcase (map_get cli_opt k)) (str_upcase nm) then false else true) then
+    cli_fatal ("default_" ++ slot ++ " already set to " ++ map_get cli_opt k)
+  else map_set cli_opt k nm;
+// -E ext[:int] and --encoding ext[:int], ruby's set_encoding_part: an empty
+// part leaves its slot alone (`-E :SJIS` names only the internal encoding,
+// `-E SJIS:` only the external one) and a THIRD part is an error.
+let cli_enc_arg = fn (flag: str) -> fn (s: str) ->
+  let c1 = str_find_from s ":" 0 in
+  if c1 < 0 then cli_enc_once "external" s
+  else
+    let _ = (if c1 > 0 then cli_enc_once "external" (substring s 0 c1) else ()) in
+    let s2 = substring s (c1 + 1) (str_len s) in
+    if str_eq s2 "" then ()
+    else
+      let c2 = str_find_from s2 ":" 0 in
+      if c2 < 0 then cli_enc_once "internal" s2
+      else
+        let _ = (if c2 > 0 then cli_enc_once "internal" (substring s2 0 c2) else ()) in
+        let s3 = substring s2 (c2 + 1) (str_len s2) in
+        if str_eq s3 "" then () else cli_fatal ("extra argument for " ++ flag ++ ": " ++ s3);
+// -K<kcode>: the main script's SOURCE encoding, and the external one unless
+// something already named it (ruby writes ext only when it is unset). An
+// unknown code is ignored, as ruby ignores it.
+let cli_kcode = fn (c: str) ->
+  let nm = (if str_eq c "e" || str_eq c "E" then "EUC-JP"
+            else if str_eq c "s" || str_eq c "S" then "Windows-31J"
+            else if str_eq c "u" || str_eq c "U" then "UTF-8"
+            else if str_eq c "n" || str_eq c "N" || str_eq c "a" || str_eq c "A" then "ASCII-8BIT"
+            else "") in
+  if str_eq nm "" then ()
+  else (let _ = map_set cli_opt "enc_source" nm in
+        if map_has cli_opt "enc_external" then () else map_set cli_opt "enc_external" nm);
+// -0[octal]: ruby's scan_oct over up to FOUR characters starting AT the 0, so
+// `-072` is ':' and `-0` alone is "\0". A value past 0377 means no separator
+// at all ($/ = nil, `-0777` slurps), and `-00` (a zero spelled with two
+// digits) is paragraph mode, "". The separator is frozen (4.0).
+let rec cli_oct = fn (s: str) -> fn (i: int) -> fn (left: int) -> fn (acc: int) ->
+  if left <= 0 || i >= str_len s then (acc, i)
+  else
+    let c = char_at s i in
+    if c >= "0" && c <= "7" then cli_oct s (i + 1) (left - 1) (acc * 8 + (ord c - 48))
+    else (acc, i);
+let cli_dash0 = fn (a: str) ->
+  let (v, e) = cli_oct a 1 4 0 in
+  let n = e - 1 in
+  if v > 255 then map_set globals (gvar_slot "/") VNil
+  else
+    let rs = mkstr (if v == 0 && n >= 2 then "" else chr v) in
+    let _ = (match rs with VStr h -> sfrozen_set h | _ -> ()) in
+    map_set globals (gvar_slot "/") rs;
+// -I's directory is EXPANDED from the current directory (ruby's
+// expand_include_path), except one spelled "./..." which stays as written; a
+// symlink in it is kept, not resolved. Added as written, `-I fixtures` put
+// the bare "fixtures" on $LOAD_PATH, and a Dir.chdir later moved every
+// library it named.
+let cli_inc_expand = fn (d: str) ->
+  if str_len d == 0 then d
+  else if str_eq (char_at d 0) "/" then d
+  else if str_len d >= 2 && str_eq (substring d 0 2) "./" then d
+  else if str_eq d "~" then env_get "HOME"
+  else if str_len d >= 2 && str_eq (substring d 0 2) "~/" then env_get "HOME" ++ substring d 1 (str_len d)
+  else path_norm (env_get "PWD" ++ "/" ++ d);
+// -C dir / -X dir / -x dir: the directory is changed WHILE the switches are
+// read, as ruby does it, so a relative script path after it is looked up
+// from there.
+let cli_chdir = fn (d: str) ->
+  if dir_chdir_to d == 0 then () else cli_fatal_f ("Can't chdir to " ++ d);
+// --enable / --disable: a comma-separated list of features, each named by
+// any leading part of its name with '-' and '_' alike (ruby's NAME_MATCH_P:
+// `--disable=gem`, `--enable-did-you-mean`), or `all`. An unknown one is a
+// warning and nothing else. Only three of them switch anything here: gems
+// (whether rubygems is required first), frozen_string_literal (what a literal
+// with no magic comment is) and rubyopt (whether RUBYOPT is read at all);
+// the rest are accepted and have nothing to switch.
+let cli_feature_names = Cons ("gems", Cons ("error_highlight", Cons ("did_you_mean", Cons ("syntax_suggest",
+                          Cons ("rubyopt", Cons ("frozen_string_literal", Cons ("yjit", Cons ("zjit", Nil))))))));
+let rec cli_us = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
+  if i >= str_len s then acc
+  else cli_us s (i + 1) (acc ++ (if str_eq (char_at s i) "-" then "_" else char_at s i));
+let rec cli_feat_find = fn (nm: str) -> fn (fs: str list) ->
+  match fs with
+  | Nil -> ""
+  | Cons (f, t) ->
+    if str_len nm > 0 && str_len nm <= str_len f && str_eq (substring f 0 (str_len nm)) nm then f
+    else cli_feat_find nm t;
+let cli_feat_set = fn (f: str) -> fn (on: bool) ->
+  if str_eq f "gems" then (if on then (if map_has cli_opt "nogems" then map_delete cli_opt "nogems" else ()) else map_set cli_opt "nogems" "1")
+  else if str_eq f "rubyopt" then (if on then (if map_has cli_opt "norubyopt" then map_delete cli_opt "norubyopt" else ()) else map_set cli_opt "norubyopt" "1")
+  else if str_eq f "frozen_string_literal" then
+    (let _ = (if map_has cli_fsl "on" then map_delete cli_fsl "on" else ()) in
+     let _ = (if map_has cli_fsl "off" then map_delete cli_fsl "off" else ()) in
+     map_set cli_fsl (if on then "on" else "off") "1")
+  else ();
+let rec cli_feat_all = fn (fs: str list) -> fn (on: bool) ->
+  match fs with Nil -> () | Cons (f, t) -> let _ = cli_feat_set f on in cli_feat_all t on;
+let rec cli_features = fn (flag: str) -> fn (on: bool) -> fn (items: str list) ->
+  match items with
+  | Nil -> ()
+  | Cons (it0, t) ->
+    let it = cli_us it0 0 "" in
+    let _ = (if str_eq it "" then ()
+             else if str_eq it "all" then cli_feat_all cli_feature_names on
+             else
+               (let f = cli_feat_find it cli_feature_names in
+                if str_eq f "" then
+                  (let _ = print_err ("mere-ruby: warning: unknown argument for " ++ flag ++ ": '" ++ it0 ++ "'\n"
+                                      ++ "mere-ruby: warning: features are [gems, error_highlight, did_you_mean, syntax_suggest, rubyopt, frozen_string_literal, yjit, zjit].") in ())
+                else cli_feat_set f on)) in
+    cli_features flag on t;
+// RUBYOPT is read like the command line but refuses the switches that would
+// change WHAT runs rather than how (ruby's `envopt` arms): "invalid switch in
+// RUBYOPT: -e". The long ones are named in full, the short ones by letter.
+let cli_envopt_bad = fn (a: str) ->
+  if str_len a >= 2 && str_eq (substring a 0 2) "--" then
+    (let eq = str_find_from a "=" 0 in
+     let nm = (if eq < 0 then a else substring a 0 eq) in
+     str_eq nm "--help" || str_eq nm "--copyright" || str_eq nm "--version" || str_eq nm "--yydebug" || str_eq nm "--dump")
+  else if str_len a >= 2 && str_eq (char_at a 0) "-" then str_contains "apnycshlSeixCXF0" (char_at a 1)
+  else false;
+let cli_switch_name = fn (a: str) ->
+  if str_len a >= 2 && str_eq (substring a 0 2) "--" then
+    (let eq = str_find_from a "=" 0 in if eq < 0 then a else substring a 0 eq)
+  else substring a 0 2;
+// -s: the script's leading `-name` / `-name=value` arguments become globals
+// ($name = true, or the value), the first dash dropped and every other one
+// turned into an underscore (`--name` is $_name), up to a `--` (removed) or
+// the first argument that is not a switch -- ruby's process_sflag.
+let rec cli_sflag = fn (xs: str list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (a, rest) ->
+    if str_eq a "--" then rest
+    else if str_len a < 2 || (if str_eq (char_at a 0) "-" then false else true) then xs
+    else
+      (let eq = str_find_from a "=" 1 in
+       let nm = cli_us (substring a 1 (if eq < 0 then str_len a else eq)) 0 "" in
+       let v = (if eq < 0 then VBool true else mkstr (substring a (eq + 1) (str_len a))) in
+       let _ = map_set globals (gvar_slot nm) v in
+       cli_sflag rest);
+let cli_verbose = fn (v: Val) -> map_set globals (gvar_slot "VERBOSE") v;
+
+// consume CLI flags, returning the remaining args with those flags removed
+// (the switches are recorded in cli_opt / cli_fsl / globals as a side effect).
+// The same function reads RUBYOPT (cli_opt "in_rubyopt"), which is the command
+// line's grammar with the envopt refusals in front.
 let rec take_flags = fn (argl: str list) ->
   match argl with
   | Nil -> Nil
   | Cons (a, rest) ->
-    if str_eq a "--enable-frozen-string-literal" then let _ = map_set cli_fsl "on" "1" in take_flags rest
-    // --disable-gems / --disable=gems: do not load rubygems first (the
-    // MERE_RUBY_NO_GEMS switch, as a flag); the other --disable= / --enable=
-    // features are accepted and have nothing here to switch
+    if map_has cli_opt "in_rubyopt" && cli_envopt_bad a then
+      let _ = cli_fatal ("invalid switch in RUBYOPT: " ++ cli_switch_name a) in Nil
     // -w / -W[level] / -W:category: $VERBOSE and the deprecation warnings,
     // as ruby's command line sets them (level 2 is -w; 1 is false; 0 is nil)
     else if str_eq a "-w" || str_eq a "-W" || str_eq a "-W2" then
-      let _ = map_set globals (gvar_slot "VERBOSE") (VBool true) in
+      let _ = cli_verbose (VBool true) in
       let _ = map_set warn_cats "deprecated" (VBool true) in take_flags rest
-    else if str_eq a "-W1" then let _ = map_set globals (gvar_slot "VERBOSE") (VBool false) in take_flags rest
-    else if str_eq a "-W0" then let _ = map_set globals (gvar_slot "VERBOSE") VNil in take_flags rest
+    else if str_eq a "-W1" then let _ = cli_verbose (VBool false) in take_flags rest
+    else if str_eq a "-W0" then let _ = cli_verbose VNil in take_flags rest
     else if str_len a > 3 && str_eq (substring a 0 3) "-W:" then
       (let c9 = substring a 3 (str_len a) in
        let _ = (if str_len c9 > 3 && str_eq (substring c9 0 3) "no-"
                 then map_set warn_cats (substring c9 3 (str_len c9)) (VBool false)
                 else map_set warn_cats c9 (VBool true)) in take_flags rest)
-    else if str_eq a "--disable-gems" || str_eq a "--disable=gems" then let _ = map_set cli_opt "nogems" "1" in take_flags rest
+    // -d / --debug: $DEBUG (and $-d, its alias) true, and $VERBOSE with it.
+    // run_src seeds $DEBUG false, so the switch is kept in cli_opt and
+    // applied there.
+    else if str_eq a "-d" || str_eq a "--debug" then
+      let _ = map_set cli_opt "debug" "1" in
+      let _ = cli_verbose (VBool true) in take_flags rest
+    // --debug=frozen-string-literal and the like: accepted, nothing to switch
+    else if str_len a > 8 && str_eq (substring a 0 8) "--debug=" then take_flags rest
+    else if str_eq a "--verbose" then let _ = cli_verbose (VBool true) in take_flags rest
     // -i[ext]: ARGF edits its files in place, keeping each as file+ext when an
     // extension is given ($-i is what ARGF reads)
     else if str_len a >= 2 && str_eq (substring a 0 2) "-i" then
       let _ = map_set globals (gvar_slot "-i") (mkstr (substring a 2 (str_len a))) in take_flags rest
-    else if str_eq a "--enable=frozen-string-literal" then let _ = map_set cli_fsl "on" "1" in take_flags rest
-    // --backtrace-limit=N: what Thread::Backtrace.limit reports
+    // --backtrace-limit=N: what Thread::Backtrace.limit reports, and how many
+    // frames an uncaught exception's report prints
     else if str_len a > 18 && str_eq (substring a 0 18) "--backtrace-limit=" then
       let _ = map_set globals "__backtrace_limit" (VInt (int_of_str (substring a 18 (str_len a)))) in take_flags rest
-    else if str_len a > 10 && (str_eq (substring a 0 10) "--disable=" || str_eq (substring a 0 9) "--enable=") then take_flags rest
-    // the other feature switches (--disable-did-you-mean, --enable-yjit ...):
-    // accepted, with nothing here to switch
-    else if str_len a > 10 && (str_eq (substring a 0 10) "--disable-" || str_eq (substring a 0 9) "--enable-") then take_flags rest
-    else if str_eq a "--disable-frozen-string-literal" then let _ = (if map_has cli_fsl "on" then map_delete cli_fsl "on" else ()) in take_flags rest
+    // --enable=LIST / --enable-LIST / --enable LIST, and --disable the same
+    else if str_len a > 9 && str_eq (substring a 0 9) "--enable=" then
+      let _ = cli_features "--enable" true (str_split (substring a 9 (str_len a)) ",") in take_flags rest
+    else if str_len a > 9 && str_eq (substring a 0 9) "--enable-" then
+      let _ = cli_features "--enable" true (str_split (substring a 9 (str_len a)) ",") in take_flags rest
+    else if str_len a > 10 && str_eq (substring a 0 10) "--disable=" then
+      let _ = cli_features "--disable" false (str_split (substring a 10 (str_len a)) ",") in take_flags rest
+    else if str_len a > 10 && str_eq (substring a 0 10) "--disable-" then
+      let _ = cli_features "--disable" false (str_split (substring a 10 (str_len a)) ",") in take_flags rest
+    else if str_eq a "--enable" || str_eq a "--disable" then
+      (match rest with
+       | Cons (l9, rest2) -> let _ = cli_features a (str_eq a "--enable") (str_split l9 ",") in take_flags rest2
+       | Nil -> Nil)
     // -I<dir> / -I <dir>: prepend to $LOAD_PATH, in the order given.
     else if str_len a > 2 && str_eq (substring a 0 2) "-I" then
-      let _ = add_inc (substring a 2 (str_len a)) in take_flags rest
+      let _ = add_inc (cli_inc_expand (substring a 2 (str_len a))) in take_flags rest
     else if str_eq a "-I" then
       (match rest with
-       | Cons (d, rest2) -> let _ = add_inc d in take_flags rest2
+       | Cons (d, rest2) -> let _ = add_inc (cli_inc_expand d) in take_flags rest2
        | Nil -> Nil)
     // -r<lib> / -r <lib>: require the library before the script runs
     else if str_len a > 2 && str_eq (substring a 0 2) "-r" then
@@ -8878,10 +9095,52 @@ let rec take_flags = fn (argl: str list) ->
       (match rest with
        | Cons (d, rest2) -> let _ = add_cli_req d in take_flags rest2
        | Nil -> Nil)
+    // -E ext[:int] / -Eext[:int] / --encoding=... / --encoding ...
+    else if str_eq a "-E" || str_eq a "--encoding" then
+      (match rest with
+       | Cons (e9, rest2) -> let _ = cli_enc_arg (if str_eq a "-E" then "-E" else "--encoding") e9 in take_flags rest2
+       | Nil -> Nil)
+    else if str_len a > 2 && str_eq (substring a 0 2) "-E" then
+      let _ = cli_enc_arg "-E" (substring a 2 (str_len a)) in take_flags rest
+    else if str_len a > 11 && str_eq (substring a 0 11) "--encoding=" then
+      let _ = cli_enc_arg "--encoding" (substring a 11 (str_len a)) in take_flags rest
+    else if str_eq a "--external-encoding" || str_eq a "--internal-encoding" then
+      (match rest with
+       | Cons (e9, rest2) -> let _ = cli_enc_once (if str_eq a "--external-encoding" then "external" else "internal") e9 in take_flags rest2
+       | Nil -> Nil)
+    else if str_len a > 20 && str_eq (substring a 0 20) "--external-encoding=" then
+      let _ = cli_enc_once "external" (substring a 20 (str_len a)) in take_flags rest
+    else if str_len a > 20 && str_eq (substring a 0 20) "--internal-encoding=" then
+      let _ = cli_enc_once "internal" (substring a 20 (str_len a)) in take_flags rest
+    // -U: the internal encoding is UTF-8 (the same slot -E's :int fills)
+    else if str_eq a "-U" then let _ = cli_enc_once "internal" "UTF-8" in take_flags rest
+    else if str_len a >= 2 && str_eq (substring a 0 2) "-K" then
+      let _ = (if str_len a > 2 then cli_kcode (char_at a 2) else ()) in take_flags rest
+    else if str_len a >= 2 && str_eq (substring a 0 2) "-0" then let _ = cli_dash0 a in take_flags rest
+    // -C dir / -Cdir / -X dir (the old spelling of the same switch)
+    else if str_eq a "-C" || str_eq a "-X" then
+      (match rest with
+       | Cons (d, rest2) -> let _ = cli_chdir d in (if map_has cli_opt "fatal" then Nil else take_flags rest2)
+       | Nil -> Nil)
+    else if str_len a > 2 && (str_eq (substring a 0 2) "-C" || str_eq (substring a 0 2) "-X") then
+      let _ = cli_chdir (substring a 2 (str_len a)) in (if map_has cli_opt "fatal" then Nil else take_flags rest)
+    // -x[dir]: the program starts at its first `#!...ruby` line (cli_x_start)
+    else if str_len a >= 2 && str_eq (substring a 0 2) "-x" then
+      let _ = map_set cli_opt "xflag" "1" in
+      let _ = (if str_len a > 2 then cli_chdir (substring a 2 (str_len a)) else ()) in
+      (if map_has cli_opt "fatal" then Nil else take_flags rest)
+    // -c: check the syntax and run nothing
+    else if str_eq a "-c" then let _ = map_set cli_opt "check" "1" in take_flags rest
+    // -s: the script's own switches become globals (cli_sflag)
+    else if str_eq a "-s" then let _ = map_set cli_opt "sflag" "1" in take_flags rest
     // -v / --version: print the version. ruby's -v also sets $VERBOSE and
     // carries on to the script, so this does not stop parsing: `-v FILE` runs
     // FILE, and a bare `-v` exits 0 because no script follows it.
-    else if str_eq a "-v" || str_eq a "--version" then
+    // (--version prints and stops; $VERBOSE is -v's alone)
+    else if str_eq a "-v" then
+      let _ = map_set cli_opt "ver" "1" in
+      let _ = cli_verbose (VBool true) in take_flags rest
+    else if str_eq a "--version" then
       let _ = map_set cli_opt "ver" "1" in take_flags rest
     else if str_eq a "-h" || str_eq a "--help" then
       let _ = map_set cli_opt "help" "1" in take_flags rest
@@ -8923,6 +9182,43 @@ let rec take_flags = fn (argl: str list) ->
     // -Ilib as an interpreter flag instead of passing it to foo.rb in ARGV.
     else Cons (a, rest);
 
+// RUBYOPT, read AFTER the command line and through the same switches (ruby's
+// moreswitches): its -I directories and -r libraries come after the command
+// line's, and a first word without a dash gets one (`RUBYOPT=rubygems` was
+// the old `-rubygems`). What the command line already DECIDED is not taken
+// back -- $VERBOSE (`RUBYOPT=-W2 ruby -W0` is nil) and the three encoding
+// slots, which ruby saves around the RUBYOPT pass and restores, so `-U` there
+// cannot collide with a -E given on the command line. --disable=rubyopt
+// skips all of it.
+let rec cli_words = fn (s: str) -> fn (i: int) -> fn (cur: str) ->
+  if i >= str_len s then (if str_eq cur "" then Nil else Cons (cur, Nil))
+  else
+    let c = char_at s i in
+    if str_eq c " " || str_eq c "\t" || str_eq c "\n" || str_eq c "\r" then
+      (if str_eq cur "" then cli_words s (i + 1) "" else Cons (cur, cli_words s (i + 1) ""))
+    else cli_words s (i + 1) (cur ++ c);
+let cli_rubyopt = fn (u: unit) ->
+  if map_has cli_opt "norubyopt" || map_has cli_opt "fatal" || map_has cli_opt "bad" then ()
+  else
+    (match cli_words (env_get "RUBYOPT") 0 "" with
+     | Nil -> ()
+     | Cons (w0, t0) ->
+       let w1 = (if str_eq (char_at w0 0) "-" then w0 else "-" ++ w0) in
+       let vk = gvar_slot "VERBOSE" in
+       let vset = map_has globals vk in
+       let vval = (if vset then map_get globals vk else VNil) in
+       let stash = fn (k: str) -> (if map_has cli_opt k then (let v9 = map_get cli_opt k in let _ = map_delete cli_opt k in v9) else "") in
+       let e9 = stash "enc_external" in
+       let i9 = stash "enc_internal" in
+       let s9 = stash "enc_source" in
+       let _ = map_set cli_opt "in_rubyopt" "1" in
+       let _ = take_flags (Cons (w1, t0)) in
+       let _ = map_delete cli_opt "in_rubyopt" in
+       let _ = (if vset then map_set globals vk vval else ()) in
+       let _ = (if str_eq e9 "" then () else map_set cli_opt "enc_external" e9) in
+       let _ = (if str_eq i9 "" then () else map_set cli_opt "enc_internal" i9) in
+       if str_eq s9 "" then () else map_set cli_opt "enc_source" s9);
+
 // `mere-ruby --parse-only FILE`: read and parse, run nothing. A parse error is
 // the one failure that takes a WHOLE file with it, so it is worth being able
 // to ask about it in isolation -- over a few thousand files, without executing
@@ -8939,12 +9235,71 @@ let parse_only = fn (path: str) ->
   | _ ->
     let _ = print_err ("mere-ruby: unexpected token at top level" ++ parsing_file ()) in 1;
 
+// -x, and a first line that is a shebang for some OTHER interpreter (ruby's
+// load_file: "not ruby script, assume -x flag"): the program starts at the
+// first line that begins "#!" and mentions ruby. What is above it is not ruby
+// -- a shell preamble, a mail header -- and is blanked byte for byte but its
+// newlines, so the line numbers and DATA's offset are still the file's, as
+// ruby's are. (false, _) is "no Ruby script found in input".
+let rec cli_x_find = fn (src: str) -> fn (i: int) ->
+  if i >= str_len src then 0 - 1
+  else
+    let e = line_end src i in
+    if e - i >= 2 && str_eq (substring src i (i + 2)) "#!" && str_contains (substring src i e) "ruby" then i
+    else cli_x_find src (e + 1);
+let rec cli_blank = fn (src: str) -> fn (i: int) -> fn (n: int) -> fn (acc: str) ->
+  if i >= n then acc
+  else cli_blank src (i + 1) n (acc ++ (if str_eq (char_at src i) "\n" then "\n" else " "));
+let cli_x_src = fn (src: str) ->
+  let e0 = line_end src 0 in
+  let other = str_len src >= 2 && str_eq (substring src 0 2) "#!"
+              && (if str_contains (substring src 0 e0) "ruby" then false else true) in
+  if map_has cli_opt "xflag" || other then
+    (let off = cli_x_find src (if map_has cli_opt "xflag" then 0 else e0 + 1) in
+     if off < 0 then (false, src)
+     else if off == 0 then (true, src)
+     else (true, cli_blank src 0 off "" ++ substring src off (str_len src)))
+  else (true, src);
+
+// -c: parse, say "Syntax OK", run nothing -- the same parse run_src makes, so
+// the answer is about the program that would have run.
+let cli_check = fn (src0: str) -> fn (name: str) ->
+  let (src, _) = src_prepare src0 in
+  let cod9 = src_coding src in
+  let _ = map_set load_ctx "coding" (mkstr (if str_eq cod9 "" then "UTF-8" else cod9)) in
+  let _ = map_set load_ctx "file" (mkstr name) in
+  let ok9 = map_new () in
+  let _ = try_or (fn (u: unit) ->
+            let toks = number_nls src (lex_go src 0) in
+            let _ = parse_line_reset (count_nls toks) in
+            let (_, rest) = parse_stmts toks Nil in
+            let _ = rx_check_pending () in
+            (match rest with Cons (TEOF, _) -> map_set ok9 "y" 1 | _ -> ())) () in
+  if map_has ok9 "y" then let _ = print "Syntax OK" in 0
+  else let _ = print_err (cli_syntax_report name) in 1;
+
+// The program as the command line names it, through -x, then -c or the run.
+let cli_go = fn (src0: str) -> fn (name: str) -> fn (print_result: bool) ->
+  let (found, src) = (if str_eq name "-e" then (true, src0) else cli_x_src src0) in
+  if (if found then false else true) then
+    let _ = print_err (name ++ ": no Ruby script found in input (LoadError)") in 1
+  else if map_has cli_opt "check" then cli_check src name
+  else let _ = run_src src print_result name in 0;
+
 let run_cli = fn () ->
-  let argl = take_flags (args ()) in
+  let argl0 = take_flags (args ()) in
+  let _ = cli_rubyopt () in
+  // -s: the script's own leading switches are globals, not ARGV
+  let sfl = fn (xs: str list) -> (if map_has cli_opt "sflag" then cli_sflag xs else xs) in
   // An unrecognised option is reported and nothing runs: continuing would run
   // a DIFFERENT program than the one that was asked for.
   if map_has cli_opt "bad" then
     let _ = print_err ("mere-ruby: invalid option " ++ map_get cli_opt "bad" ++ "  (-h will show valid options)") in 1
+  // ...and so is a switch ruby refuses with a RuntimeError (a second
+  // encoding for one slot, a -e in RUBYOPT, a -C to nowhere)
+  else if map_has cli_opt "fatal" then
+    let _ = print_err ("mere-ruby: " ++ map_get cli_opt "fatal" ++ " ("
+                       ++ (if map_has cli_opt "fatal_cls" then map_get cli_opt "fatal_cls" else "RuntimeError") ++ ")") in 1
   else if map_has cli_opt "help" then let _ = print usage_line in 0
   else
   // -v prints before the program runs, like ruby's does.
@@ -8953,10 +9308,10 @@ let run_cli = fn () ->
     // -e wins over a script path, and the remaining args are ARGV. __FILE__ is
     // "-e", which is what ruby reports.
     let _ = map_set cli_file "p" "-e" in
-    let _ = map_set cli_argv "v" (arr_new (strs_to_vals argl)) in
-    let _ = run_src (map_get cli_opt "eval") false "-e" in 0
+    let _ = map_set cli_argv "v" (arr_new (strs_to_vals (sfl argl0))) in
+    cli_go (map_get cli_opt "eval") "-e" false
   else
-  match argl with
+  match argl0 with
   | Nil ->
     // Browser playground entry (mere v0.1.127 Wasm target): the wasm host
     // makes `read_file` of this sentinel return the editor's Ruby source, so
@@ -8976,7 +9331,7 @@ let run_cli = fn () ->
        else
          (let _ = map_set cli_file "p" "-" in
           let _ = map_set cli_argv "v" (arr_new (Nil : Val list)) in
-          let _ = run_src (read_stdin ()) false "-" in 0))
+          cli_go (read_stdin ()) "-" false))
     else let _ = run_src src false "(playground)" in 0
   | Cons (a0, rest) ->
     if str_eq a0 "--parse-only" then
@@ -8990,10 +9345,10 @@ let run_cli = fn () ->
     // `-` reads the program from stdin, as it does for ruby.
     else if str_eq a0 "-" then
       let _ = map_set cli_file "p" "-" in
-      let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest)) in
-      let _ = run_src (read_stdin ()) false "-" in 0
+      let _ = map_set cli_argv "v" (arr_new (strs_to_vals (sfl rest))) in
+      cli_go (read_stdin ()) "-" false
     // a script that is not there is ruby's LoadError, on stderr, exit 1 --
     // not an interpreter failure that printed the path back and nothing else
     else if (if file_exists a0 then false else true) then
       let _ = print_err ("mere-ruby: No such file or directory -- " ++ a0 ++ " (LoadError)") in 1
-    else let _ = map_set cli_file "p" a0 in let _ = map_set cli_argv "v" (arr_new (strs_to_vals rest)) in let _ = run_prog a0 false in 0;
+    else let _ = map_set cli_file "p" a0 in let _ = map_set cli_argv "v" (arr_new (strs_to_vals (sfl rest))) in cli_go (read_file a0) a0 false;

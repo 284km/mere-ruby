@@ -855,7 +855,27 @@ def __mspec_shell_args(a)
   else a.to_s
   end
 end
+# mspec's `env:` option (helpers/ruby_exe.rb): the variables are set in THIS
+# process's ENV around the run, so the child inherits them, and put back
+# after. Ignored, `ruby_exe(..., env: {"RUBYOPT" => "-w"})` ran with no
+# RUBYOPT at all and both sides failed the same examples for a reason neither
+# interpreter had anything to do with.
 def ruby_exe(code = :__not_given, *rest, **opts)
+  env = opts.delete(:env)
+  return __mspec_ruby_exe(code, *rest, **opts) if env.nil? || env.empty?
+  saved = {}
+  env.each do |k, v|
+    k = k.to_s
+    saved[k] = ENV[k]
+    ENV[k] = v
+  end
+  begin
+    __mspec_ruby_exe(code, *rest, **opts)
+  ensure
+    saved.each { |k, v| ENV[k] = v }
+  end
+end
+def __mspec_ruby_exe(code = :__not_given, *rest, **opts)
   # with no code, mspec answers the command line itself, as words
   return RUBY_EXE.split(" ") if code == :__not_given
   # nil code: the interpreter runs what its options and args give it (a

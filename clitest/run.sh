@@ -92,6 +92,40 @@ cmp_stdin "-n BEGIN / END"    "$lines" -n -e 'BEGIN { puts :hi }; print $_; END 
 cmp_stdin "-n chomp / chop"   "$lines" -W0 -n -e 'chomp; chop; p $_'
 cmp_stdin "-p next skips"     "$lines" -p -e 'next if $_.start_with?("a")'
 
+cmp_stdin "-n with an integer flip-flop" "$lines" -ne 'print if 2..2'
+printf 'a\nxb\ny\nz\n' > "$tmp/ff.txt"
+cmp_both "-n with a regexp flip-flop" -- -ne 'print if /x/../y/' "$tmp/ff.txt"
+
+# The switches beyond the loop ones. Each prints what it set, so a switch
+# that is accepted and does nothing reads as a mismatch.
+cmp_both "-s globals"         -- -s -e 'p $n, $_name, ARGV' -- -n --name=x y
+cmp_both "-0 octal"           -- -072 -e 'p $/, $-0'
+cmp_both "-00 paragraph"      -- -00 -e 'p $/'
+cmp_both "-0777 slurp"        -- -0777 -e 'p $/'
+cmp_both "-d"                 -- --disable-gems -d -e 'p [$DEBUG, $-d, $VERBOSE]'
+cmp_both "-c"                 -- -c -e 'puts 1' -e 'x = 2'
+cmp_both "-K source encoding" -- -Ke -e 'p __ENCODING__, Encoding.default_external'
+cmp_both "-E ext:int"         -- -E euc-jp:Shift_JIS -e 'p Encoding.default_external, Encoding.default_internal'
+cmp_both "-U"                 -- -U -e 'p Encoding.default_internal'
+cmp_both "-C dir"             -- -C / -e 'p Dir.pwd'
+cmp_both "--disable=LIST"     -- --disable=gems,frozen-string-literal -e 'p "a".frozen?'
+printf 'junk\n#!ruby\np __LINE__\n' > "$tmp/x.txt"
+cmp_both "-x"                 -- -x "$tmp/x.txt"
+# RUBYOPT: read after the command line, which keeps what it decided
+cmp_env() {
+  name="$1"; ev="$2"; shift 2; [ "$1" = "--" ] && shift
+  go=$(env RUBYOPT="$ev" "$mr" "$@" 2>&1); grc=$?
+  ro=$(env RUBYOPT="$ev" "$ref" "$@" 2>&1); rrc=$?
+  if [ "$go" = "$ro" ] && [ "$grc" = "$rrc" ]; then
+    pass=$((pass+1)); printf 'MATCH   %s\n' "$name"
+  else
+    fail=$((fail+1))
+    printf 'FAIL    %s\n  mere(%s): %s\n  ruby(%s): %s\n' "$name" "$grc" "$go" "$rrc" "$ro"
+  fi
+}
+cmp_env "RUBYOPT -I -W0"      "-Eutf-8 -I/nonexistent/q -W0" -- -e 'p $:[0], $VERBOSE'
+cmp_env "RUBYOPT under a CLI -W1" "-Eutf-8 -w" -- -W1 -e 'p $VERBOSE'
+
 # Failure shapes: a wrong exit STATUS is what a caller in a pipeline sees.
 for bad in -Z --nope; do
   go=$("$mr" "$bad" 2>&1); grc=$?
@@ -102,6 +136,31 @@ for bad in -Z --nope; do
     fail=$((fail+1)); printf 'FAIL    invalid option %s: mere rc=%s ruby rc=%s\n' "$bad" "$grc" "$rrc"
   fi
 done
+# ...and the ones ruby refuses with a RuntimeError before anything runs (the
+# message names the interpreter, so only the status is compared)
+for bad in "-Eascii:ascii -U" "--encoding=a:b:c"; do
+  go=$("$mr" $bad -e 1 2>&1); grc=$?
+  ro=$("$ref" $bad -e 1 2>&1); rrc=$?
+  if [ "$grc" -ne 0 ] && [ "$rrc" -ne 0 ]; then
+    pass=$((pass+1)); printf 'MATCH   refused %s (both non-zero)\n' "$bad"
+  else
+    fail=$((fail+1)); printf 'FAIL    refused %s: mere rc=%s ruby rc=%s\n' "$bad" "$grc" "$rrc"
+  fi
+done
+go=$(env RUBYOPT=-a "$mr" -e 1 2>&1); grc=$?
+ro=$(env RUBYOPT=-a "$ref" -e 1 2>&1); rrc=$?
+if [ "$grc" -ne 0 ] && [ "$rrc" -ne 0 ]; then
+  pass=$((pass+1)); echo "MATCH   RUBYOPT=-a refused (both non-zero)"
+else
+  fail=$((fail+1)); printf 'FAIL    RUBYOPT=-a: mere rc=%s ruby rc=%s\n' "$grc" "$rrc"
+fi
+go=$("$mr" -e 'a{' 2>&1); grc=$?
+ro=$("$ref" -e 'a{' 2>&1); rrc=$?
+case "$go" in
+  *SyntaxError*) if [ "$grc" -ne 0 ] && [ "$rrc" -ne 0 ]; then pass=$((pass+1)); echo "MATCH   syntax error is a SyntaxError, non-zero"
+                 else fail=$((fail+1)); printf 'FAIL    syntax error: mere rc=%s ruby rc=%s\n' "$grc" "$rrc"; fi ;;
+  *) fail=$((fail+1)); printf 'FAIL    syntax error does not say SyntaxError: %s\n' "$go" ;;
+esac
 go=$("$mr" "$tmp/nope.rb" 2>&1); grc=$?
 ro=$("$ref" "$tmp/nope.rb" 2>&1); rrc=$?
 if [ "$grc" -ne 0 ] && [ "$rrc" -ne 0 ]; then
