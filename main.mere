@@ -1146,7 +1146,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // `::Name` is top level and nothing else -- no lexical walk.
     if str_len name > 2 && str_eq (substring name 0 2) "::" then
       (let n = substring name 2 (str_len name) in
-       if map_has consts n then map_get consts n
+       // ⚠ `::X` is the scope operator too, and a private top-level
+       //   constant is closed to it ("private constant Object::X
+       //   referenced") while the bare `X` still reads it.
+       // (the mark is under either spelling of Object's key: the statement
+       // form in `class Object` writes "Object::X" for a constant the class
+       // body stored bare)
+       if (map_has consts n || map_has consts ("Object::" ++ n))
+          && (map_has private_consts n || map_has private_consts ("Object::" ++ n))
+       then priv_const_err world ("Object::" ++ n)
+       else if map_has consts n then map_get consts n
        // ⚠ ...and Object's OWN namespace is top level too. A constant assigned
        // inside `class Object` is stored under "Object::X", so `::X` -- which
        // reads exactly that namespace -- could not find what `Object::X` could.
@@ -1177,7 +1186,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              || has_own_meth world rc0 "const_missing"
           then invoke_val_c env world blk (VClass rc0) "const_missing" (Cons (VSym cn0, Nil)) false
           else priv_const_err world name)
-       else if map_has consts name then map_get consts name
+       else if map_has consts name then (let _ = const_read_note world name in map_get consts name)
        else
          // walk the segments left to right: the head can itself be lexically
          // scoped (inside `module B`, `E::K` means `B::E::K`), and any segment
@@ -1224,8 +1233,25 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       // walk the full lexical nesting (M::Base -> M -> top), not just one level.
       let key = (if str_eq iek9 "" then lex_const_key cref name else iek9) in
       let key = (if str_eq key "" then anc_const_key world (if str_eq iec9 "" then cref else iec9) name else key) in
-      if (if str_eq key "" then false else true) then map_get consts key
-      else if map_has consts name then map_get consts name
+      // ⚠ ruby asks each scope of the nesting for a constant OR an autoload
+      //   before it moves outward, and the whole nesting before the
+      //   ancestors. The walks above found a constant anywhere first, so an
+      //   autoload registered in the innermost scope lost to a same-named
+      //   constant in an enclosing one (or an ancestor) and its file never
+      //   ran. When the nearest registration is deeper than the nearest
+      //   lexical constant, it is loaded first and the name asked again.
+      let ak9 = (if str_eq key "" || map_len autoloads == 0 then "" else lex_autoload_key cref name) in
+      let lk9 = (if str_eq ak9 "" then "" else lex_const_key cref name) in
+      // (Only a registration in a NAMED scope: a top-level one is Object's,
+      // which ruby reaches after the ancestors, not before them; and not one
+      // whose constant already has a value.)
+      if (if str_eq ak9 "" then false else true) && str_contains ak9 "::"
+         && (if map_has consts ak9 then false else true)
+         && (str_eq lk9 "" || last_sep_at lk9 0 (0 - 1) < last_sep_at ak9 0 (0 - 1))
+         && autoload_fire env world blk ak9
+      then eval_e env world blk (EConst name)
+      else if (if str_eq key "" then false else true) then (let _ = const_read_note world key in map_get consts key)
+      else if map_has consts name then (let _ = const_read_note world name in map_get consts name)
       // an autoload registered ANYWHERE along the lexical nesting, or at top
       // level. Only the innermost cref and the bare name were tried, so a
       // library reading its own autoloaded sibling from inside one of its own
@@ -1253,12 +1279,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // scope operator too -- `c::Foo` where c is a value rather than a
        // constant path. Only the name-path form checked, so anything reached
        // through a variable holding the module read straight past it.
-       if map_has private_consts key then
+       // (...and, as the name-path form does, a module with its OWN
+       // #const_missing is asked instead: a private constant is "not there"
+       // to the scope operator, and ruby calls the hook exactly as for a
+       // name never defined)
+       if (map_has private_consts key || ((if str_eq akey "" then false else true) && map_has private_consts akey))
+          && (has_own_meth world ("(sng:" ++ c ++ ")") "const_missing" || has_own_meth world c "const_missing") then
+         invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym cn, Nil)) false
+       else if map_has private_consts key then
          priv_const_err world key
        else if (if str_eq akey "" then false else true) && map_has private_consts akey then
          priv_const_err world akey
-       else if map_has consts key then map_get consts key
-       else if (if str_eq akey "" then false else true) then map_get consts akey
+       else if map_has consts key then (let _ = const_read_note world key in map_get consts key)
+       else if (if str_eq akey "" then false else true) then (let _ = const_read_note world akey in map_get consts akey)
        else if map_has consts cn then map_get consts cn
        else if autoload_fire env world blk key || autoload_fire env world blk cn then
          (if map_has consts key then map_get consts key
@@ -1454,12 +1487,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        (if str_contains name "::" && map_has private_consts name then VNil
         else if str_len name > 2 && str_eq (substring name 0 2) "::" then
           (let n9 = substring name 2 (str_len name) in
-           if map_has consts n9 || map_has consts ("Object::" ++ n9) then mkstr "constant" else VNil)
+           if map_has private_consts n9 || map_has private_consts ("Object::" ++ n9) then VNil
+           else if map_has consts n9 || map_has consts ("Object::" ++ n9) then mkstr "constant" else VNil)
         // an autoload (Set, Pathname) is a constant that exists before it loads
-        else if map_has consts name || map_has autoloads name then mkstr "constant"
+        // -- except to the thread loading it, where it is not there yet
+        else if map_has consts name || autoload_pending world name then mkstr "constant"
         else if (let cref9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr s9 -> sget s9 | _ -> "") else cur_lex ()) in
                  (if str_eq (lex_const_key cref9 name) "" then false else true)
-                 || (if str_eq (anc_const_key world cref9 name) "" then false else true)) then mkstr "constant"
+                 || (if str_eq (anc_const_key world cref9 name) "" then false else true)
+                 // ...and one registered along the lexical nesting: inside
+                 // `module Q; autoload :R, f`, `defined?(R)` is "constant"
+                 // without loading anything
+                 || (let k9 = lex_autoload_key cref9 name in
+                     if str_eq k9 "" then false else autoload_pending world k9)) then mkstr "constant"
         else if str_contains name "::" then
           // ⚠ a PRIVATE constant is not defined? through the scope operator --
           // the whole point of private_constant is that `M::X` cannot see it,
@@ -1472,7 +1512,22 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
            // ... and, as when reading it, along the receiver's ancestors.
            let anc = (if str_eq (anc_const_key_q world (recv_of_scoped name) (const_of_scoped name)) "" then false else true) in
            if ((if str_eq hk "" then false else true) && map_has consts (hk ++ "::" ++ const_tail name)) || anc
-           then mkstr "constant" else VNil)
+           then mkstr "constant"
+           // ⚠ ...and a qualifier that is still only an AUTOLOAD is loaded to
+           //   answer: ruby evaluates `A::GoodParent` (the file runs) and asks
+           //   about `Nested` in what it answered, and a load that raises is
+           //   nil. The walk above only read the table, so the qualifier's
+           //   file never ran and the answer was nil for a constant that is
+           //   there once it has.
+           else
+             (let pfx9 = recv_of_scoped name in
+              if (if str_eq (lex_autoload_key cref0 pfx9) "" then false else true) then
+                (match defined_eval_recv env world blk (EConst pfx9) with
+                 | VClass c9 -> (let k9 = c9 ++ "::" ++ const_of_scoped name in
+                                 if (map_has consts k9 || autoload_pending world k9) && (if map_has private_consts k9 then false else true)
+                                 then mkstr "constant" else VNil)
+                 | _ -> VNil)
+              else VNil))
         else VNil)
      | EMethod (recv, name, _) ->
        let (meths, sup, ocls, ivars) = world in
@@ -1534,7 +1589,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else (match rv with
              // (along the receiver's ancestors, as the read does: `self::X`
              // in a subclass finds the superclass's X)
+             // (...and an autoload registered there, which is a constant
+             // before its file runs: `defined?(M::Dog::R)` loads nothing)
              | VClass c -> if map_has consts (c ++ "::" ++ cn)
+                              || (autoload_pending world (c ++ "::" ++ cn) && (if map_has private_consts (c ++ "::" ++ cn) then false else true))
                               || (if str_eq (anc_const_key_q world c cn) "" then false
                                   else (if map_has private_consts (anc_const_key_q world c cn) then false else true))
                            then mkstr "constant" else VNil
@@ -2014,7 +2072,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          let cn = (match nm with VSym sy -> sy | VStr h -> sget h | _ -> "") in
          let ns = autoload_cref env in
          let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
-         (if map_has autoloads key then map_get autoloads key else VNil)
+         (if autoload_pending world key then map_get autoloads key else VNil)
        | _ -> VNil)
     else if is_kernel_conv name then kernel_conv_fn env world name args
     // using refinery — activate the refinery's refinements into ref_active.
@@ -4018,8 +4076,16 @@ and const_added_hook = fn world -> fn (key: str) ->
   // so this is where the definition site is stamped for
   // Module#const_source_location. Not in `<internal:...>` code: what the
   // prelude defines is core, which ruby reports as [] ("defined in C").
+  // ...and a constant that now HAS a value is no longer an autoload: ruby's
+  // entry is replaced by the value. (Not while its own autoload is running --
+  // that load is still in flight, and autoload_settle retires it.)
+  let _ = (if map_len autoloads > 0 && map_has autoloads key && map_has consts key
+              && (if map_has autoload_busy key then false else true)
+           then map_delete autoloads key else ()) in
   let f9 = cur_file () in
   let _ = (if str_len f9 > 10 && str_eq (substring f9 0 10) "<internal:" then ()
+           else if map_has autoload_busy key && map_has autoloads key
+           then map_set const_src_pend key (f9 ++ "\n" ++ str_of_int (cur_line ()))
            else map_set const_src key (f9 ++ "\n" ++ str_of_int (cur_line ()))) in
   (if map_has hook_flags "ca" then
      (let i9 = last_sep_at key 0 (0 - 1) in
@@ -4027,6 +4093,33 @@ and const_added_hook = fn world -> fn (key: str) ->
       let simple9 = (if i9 < 0 then key else substring key (i9 + 2) (str_len key)) in
       run_cls_hook world owner9 "const_added" simple9)
    else ())
+
+// What a READ of an existing constant has to do besides answer it. The reads
+// that ask (the lexical and scoped EConst, EScopedRead, const_get,
+// remove_const) call this with the key they found; both tables are empty for
+// almost every program, and the hot path asks their sizes before it hashes.
+//  - a constant ANOTHER THREAD is autoloading is not yet anybody else's: ruby
+//    makes the reader wait for the load to finish, so it never sees the
+//    module half-built. `module Mod0; sleep; def self.foo` in the file was
+//    read as soon as `module Mod0` had run, and `Mod0.foo` was
+//    NoMethodError in every thread but the loader.
+//  - one `deprecate_constant` marked warns, on EVERY read, with the owner
+//    written as #inspect would ("#<Module:0x...>" for an anonymous one) and
+//    the top level as "::X", when the deprecated category is on and $VERBOSE
+//    is not nil.
+and const_read_note = fn world -> fn (key: str) ->
+  let _ = (if map_len autoload_busy > 0 && fb_can_suspend && map_has autoload_busy key
+              && (if map_get autoload_busy key == sch_me () then false else true) then
+             (let rec wait9 = fn (u: unit) ->
+                (if map_has autoload_busy key then (let _ = sch_pass world in wait9 ()) else ()) in
+              wait9 ())
+           else ()) in
+  if map_len deprecated_consts > 0 && map_has deprecated_consts key && deprecation_says () then
+    (let i9 = last_sep_at key 0 (0 - 1) in
+     let owner9 = (if i9 < 0 then "Object" else substring key 0 i9) in
+     let simple9 = (if i9 < 0 then key else substring key (i9 + 2) (str_len key)) in
+     rb_warn world ("constant " ++ (if str_eq owner9 "Object" then "" else cls_display world owner9) ++ "::" ++ simple9 ++ " is deprecated"))
+  else ()
 
 // index of the LAST "::" in a constant key, or -1.
 and last_sep_at = fn (k: str) -> fn (i: int) -> fn (best: int) ->
@@ -8445,7 +8538,16 @@ and const_walk_go = fn env -> fn world -> fn blk -> fn (sofar: str) -> fn (rest:
                  else sofar) in
     let seg = const_head rest in
     let key = sofar ++ "::" ++ seg in
-    if map_has consts key then const_walk_go env world blk key (const_tail rest)
+    // ⚠ every segment after the head is reached through the SCOPE OPERATOR,
+    //   which private_constant closes: `PCM::PRIV` written inside a module
+    //   that includes PCM resolves its head lexically and then must refuse
+    //   PRIV. The caller's privacy test read the name as written
+    //   ("PCM::PRIV"), which is not the key, so it answered the value.
+    if map_has consts key && map_has private_consts key then
+      (if has_own_meth world ("(sng:" ++ sofar ++ ")") "const_missing" || has_own_meth world sofar "const_missing"
+       then invoke_val_c env world blk (VClass sofar) "const_missing" (Cons (VSym seg, Nil)) false
+       else priv_const_err world key)
+    else if map_has consts key then const_walk_go env world blk key (const_tail rest)
     else if autoload_fire env world blk key && map_has consts key
     then const_walk_go env world blk key (const_tail rest)
     else VNil
@@ -8486,19 +8588,122 @@ and autoload_register = fn env -> fn world -> fn (ns: str) -> fn (args: Val list
               else (let _ = raise_exc_iv world "NameError" ("autoload must be constant name: " ++ cn) (Cons (("__name", VSym cn), Nil)) in ())) in
      let key = (if str_eq ns "" then cn else ns ++ "::" ++ cn) in
      let fresh9 = (if map_has autoloads key || map_has consts key then false else true) in
-     let _ = map_set autoloads key (mkstr pth) in
+     // ⚠ ...and a constant that already HAS a value is left alone: ruby's
+     //   rb_autoload_str returns at once, so `autoload :S, f` after S was
+     //   defined registers nothing and autoload?(:S) stays nil. It was
+     //   registered anyway, and answered its path.
+     let _ = (if map_has consts key then () else map_set autoloads key (mkstr pth)) in
      let _ = (if fresh9 then const_added_hook world key else ()) in
      VNil
    | _ -> VNil)
 and autoload_fire = fn env -> fn world -> fn blk -> fn (key: str) ->
   if map_has autoloads key then
     (let path = (match map_get autoloads key with VStr h -> sget h | _ -> "") in
-     // removed FIRST: a file that does not define the constant must fail as a
-     // NameError, not spin here.
-     let _ = map_delete autoloads key in
-     if str_eq path "" then false
-     else (let _ = exec_stmt env world blk (SRequire (false, EStrL path)) in true))
+     let me9 = sch_me () in
+     // ⚠ THE ENTRY USED TO BE REMOVED BEFORE THE FILE RAN, so that a file not
+     //   defining the constant would fail as a NameError instead of spinning
+     //   here. That also made every question asked DURING the load, and after
+     //   a load that raised, answer "no such constant": const_defined? false,
+     //   `constants` without it, const_source_location nil, and a second read
+     //   after a LoadError a NameError where ruby tries the file again. Now
+     //   the entry stays, and the thread running the file is recorded
+     //   (autoload_busy): to that thread the constant is undefined -- which
+     //   is what stops the spin -- and another thread waits for it.
+     if map_has autoload_busy key && map_get autoload_busy key == me9 then false
+     else if map_has autoload_busy key then
+       (if fb_can_suspend then
+          (let _ = const_read_note world key in
+           if map_has consts key then true else autoload_fire env world blk key)
+        else false)
+     else if str_eq path "" then false
+     // ...and one whose feature is already provided has nothing to load:
+     // `autoload :X, __FILE__` inside the file being required, then `class
+     // X` -- ruby does not require the file again, and does not warn that it
+     // failed to define X. The registration stays until X is defined.
+     else if (if autoload_pending world key then false else true) then false
+     else
+       (let _ = map_set autoload_busy key me9 in
+        let ok9 = try_or (fn (u: unit) -> (let _ = exec_stmt env world blk (SRequire (false, EStrL path)) in true)) false in
+        let _ = autoload_settle key in
+        // a file that ran and did not define the constant is worth a word
+        // under -w (ruby's rb_warning), once: the registration is spent
+        let _ = (if ok9 && (if map_has consts key then false else true) then
+                   (let i9 = last_sep_at key 0 (0 - 1) in
+                    let disp9 = (if i9 < 0 then key else cls_display world (substring key 0 i9) ++ substring key i9 (str_len key)) in
+                    rb_warning world ("Expected " ++ path ++ " to define " ++ disp9 ++ " but it didn't"))
+                 else ()) in
+        if ok9 then (let _ = map_delete autoloads key in true)
+        // a require that RAISED (LoadError, or the file's own exception)
+        // leaves the autoload registered, and the exception goes on
+        else fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")))
   else false
+// an autoload the calling thread would see: registered, and not the one this
+// thread is in the middle of loading (to it, that constant is not there yet).
+and autoload_live = fn (key: str) ->
+  map_has autoloads key && (if map_has autoload_busy key then (if map_get autoload_busy key == sch_me () then false else true) else true)
+// the load of `key` is over, however it ended: nobody is loading it, and a
+// location its file gave the constant is now everyone's
+and autoload_settle = fn (key: str) ->
+  let _ = map_delete autoload_busy key in
+  // (a registration whose file defined the constant is spent for good)
+  let _ = (if map_has consts key && map_has autoloads key then map_delete autoloads key else ()) in
+  if map_has const_src_pend key then
+    (let _ = map_set const_src key (map_get const_src_pend key) in map_delete const_src_pend key)
+  else ()
+// the feature an autoload's path names, canonical as do_require names it
+// (absolute, "./"/"../" against the working directory, else found on the
+// load path), or "" when it names nothing that exists yet.
+and autoload_resolve = fn world -> fn (p0: str) ->
+  if map_len req_loading > 0 && map_has req_loading p0 then map_get req_loading p0 else
+  let p1 = (if ends_with_rb p0 then p0 else p0 ++ ".rb") in
+  let f9 = (if str_len p1 > 0 && str_eq (char_at p1 0) "/" then p1
+            else if str_len p1 >= 2 && (str_eq (substring p1 0 2) "./" || (str_len p1 >= 3 && str_eq (substring p1 0 3) "../"))
+            then env_get "PWD" ++ "/" ++ p1
+            else load_path_find world p1) in
+  if str_eq f9 "" then ""
+  else (let n9 = path_norm f9 in
+        if str_len n9 > 0 && str_eq (char_at n9 0) "/" then n9 else path_norm (env_get "PWD" ++ "/" ++ n9))
+// An autoload that still has something to load -- what autoload?,
+// const_defined? and defined? answer about. Not to the thread running it;
+// and not once its FEATURE is provided, however that happened: an autoload
+// registered for a file already required (or for the one being required
+// right now, `autoload :X, __FILE__`), or one whose file was required
+// directly and did not define it, is spent -- though the constant stays in
+// `constants`, as in ruby. A feature ANOTHER thread is still loading is not
+// provided yet (ruby's rb_feature_provided says "loading"). Resolving the
+// path costs a stat per load-path entry, and only these questions pay it.
+and autoload_pending = fn world -> fn (key: str) ->
+  autoload_live key
+  && (map_has autoload_busy key
+      || (match map_get autoloads key with
+          | VStr h -> (let f9 = autoload_resolve world (sget h) in
+                       if str_eq f9 "" then true else (if feature_loaded f9 then false else true))
+          | _ -> true))
+// The autoloads a require of the feature `full` (canonical, as do_require
+// names it) RUNS: every registration whose path resolves to that file and
+// that nobody is loading yet. Ruby keys an autoload by its FEATURE, so a
+// `require` of the same file -- direct, relative, or nested inside another --
+// is that autoload running: while the file runs the constant is undefined to
+// it (defined? nil, autoload? nil), and afterwards the provided feature has
+// spent it (autoload_pending) -- which is also how two modules sharing one
+// request (`mod.dup` of a module with an autoload) are both answered by one
+// load. The basename is compared first so that only a plausible registration
+// pays for resolving its path.
+and autoload_keys_for = fn world -> fn (full: str) ->
+  let base9 = substring full (last_slash full 0 (0 - 1) + 1) (str_len full) in
+  let out9 = map_new () in
+  let _ = map_iter autoloads (fn (k: str) -> fn (v: Val) ->
+    (match v with
+     | VStr h ->
+       (let p0 = sget h in
+        let p1 = (if ends_with_rb p0 then p0 else p0 ++ ".rb") in
+        if (if str_eq (substring p1 (last_slash p1 0 (0 - 1) + 1) (str_len p1)) base9 then false else true) then ()
+        else if map_has autoload_busy k then ()
+        else if str_eq (autoload_resolve world p1) full then map_set out9 (str_of_int (map_len out9)) k
+        else ())
+     | _ -> ())) in
+  let rec coll9 = fn (i: int) -> (if i >= map_len out9 then (Nil : str list) else Cons (map_get out9 (str_of_int i), coll9 (i + 1))) in
+  coll9 0
 
 // ruby's rb_str_escape: every non-ASCII CHARACTER of `s` (read in encoding
 // `enc`) as \uXXXX, so the result is plain ASCII and can be appended to any
@@ -13744,10 +13949,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          //   argument `false` asks for this class's own only.
          // (an autoload -- Set, Pathname -- is defined before it is loaded)
          let inh8 = (match args with Cons (_, Cons (VBool false, _)) -> false | Cons (_, Cons (VNil, _)) -> false | _ -> true) in
-         VBool (map_has consts (c ++ "::" ++ n)
-                || (str_eq c "Object" && (map_has consts n || map_has autoloads n))
+         // ⚠ ...and an autoload is a constant wherever it was registered, not
+         //   only at the top level: `M.autoload :B, f` then
+         //   `M.const_defined?(:B, false)` is true before anything loads, and
+         //   so is a superclass's registration for a subclass. (Not the one
+         //   this thread is loading: to it, the constant is not there yet.)
+         //   (Nor one whose file has been provided without defining it.)
+         let rec anc_al8 = fn (xs: str list) ->
+           (match xs with
+            | Nil -> false
+            | Cons (a8, t8) -> autoload_pending world (a8 ++ "::" ++ n) || anc_al8 t8) in
+         VBool (map_has consts (c ++ "::" ++ n) || autoload_pending world (c ++ "::" ++ n)
+                || (str_eq c "Object" && (map_has consts n || autoload_pending world n))
                 || (inh8 && ((if str_eq (anc_const_key world c n) "" then false else true)
-                             || map_has consts n || map_has autoloads n)))
+                             || anc_al8 (ancestors_of world c)
+                             || map_has consts n || autoload_pending world n)))
        | _ -> VBool false)
     // instance_method(:name): an UnboundMethod, represented as an
     // UnboundMethod-classed object carrying the origin class (where the method
@@ -14786,21 +15002,29 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (if map_has seen nm9 then ()
           else (let _ = map_set seen nm9 1 in
                 let m = map_len tmp in map_set tmp (str_of_int m) (VSym nm9))) in
+       // ⚠ ...from BOTH tables: a registered autoload is in ruby's constant
+       //   table before its file runs (and while it runs), so `constants`
+       //   lists it; reading only `consts` left every autoload out until it
+       //   had loaded.
        let add1 = fn (cx: str) ->
          (let pfx = cx ++ "::" in
           let plen = str_len pfx in
-          let _ = map_iter consts (fn (k: str) -> fn (v: Val) ->
-            if str_len k > plen && str_eq (substring k 0 plen) pfx
-               && (if str_contains (substring k plen (str_len k)) "::" then false else true)
-               && (if map_has private_consts k then false else true)
-            then push8 (substring k plen (str_len k))
-            else ()) in
+          let own8 = fn (k: str) -> fn (v: Val) ->
+            (if str_len k > plen && str_eq (substring k 0 plen) pfx
+                && (if str_contains (substring k plen (str_len k)) "::" then false else true)
+                && (if map_has private_consts k then false else true)
+             then push8 (substring k plen (str_len k))
+             else ()) in
+          let _ = map_iter consts own8 in
+          let _ = map_iter autoloads own8 in
           // Object's own are the unqualified keys.
           (if str_eq cx "Object" then
-             map_iter consts (fn (k: str) -> fn (v: Val) ->
-               if (if str_contains k "::" then false else true)
-                  && (if map_has private_consts k then false else true)
-               then push8 k else ())
+             (let top8 = fn (k: str) -> fn (v: Val) ->
+                (if (if str_contains k "::" then false else true)
+                    && (if map_has private_consts k then false else true)
+                 then push8 k else ()) in
+              let _ = map_iter consts top8 in
+              map_iter autoloads top8)
            else ())) in
        let _ = add1 c in
        // ⚠ ...but NOT Object's, unless the receiver IS Object. Every class has
@@ -15375,6 +15599,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                   else (let _ = raise_exc world "NameError"
                           ("constant " ++ cls_display world c ++ "::" ++ n0 ++ " not defined") in ())) in
          let old = if map_has consts n then map_get consts n else VNil in
+         let _ = const_read_note world n in
+         let _ = if map_has deprecated_consts n then map_delete deprecated_consts n else () in
          let _ = if map_has consts n then map_delete consts n else () in
          let _ = if auto9 then map_delete autoloads al9 else () in
          old
@@ -15488,6 +15714,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
            if map_has consts full then
              (let _ = (if priv then map_set private_consts full VNil
                        else (if map_has private_consts full then map_delete private_consts full else ())) in
+              // ...and making one of Object's public clears BOTH spellings
+              // of its mark (see the `::X` read): `class Object;
+              // private_constant :X` marked "Object::X" for a constant keyed
+              // bare, and `Object.public_constant :X` cleared only the bare one
+              let _ = (if priv || (if str_eq c "Object" then false else true) then ()
+                       else if map_has private_consts ("Object::" ++ n) then map_delete private_consts ("Object::" ++ n)
+                       else ()) in
               go rest)
            else raise_exc world "NameError" ("constant " ++ cls_display world c ++ "::" ++ n ++ " not defined") in
        go args)
@@ -15549,6 +15782,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                        (Cons (("__name", VSym sn), Cons (("__recv", VClass cx), Nil))))
              else
                (let v9 = map_get consts k9 in
+                let _ = const_read_note world k9 in
                 if str_eq rest8 "" then v9
                 else (match v9 with
                       | VClass nc9 -> walk9 nc9 rest8 false
@@ -15606,9 +15840,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              if i8 < 0 then
                (let withtop9 = first && (str_eq cx "Object" || (inherit9 && (map_has modules cx || str_list_has (ancestors_of world cx) "Object"))) in
                 let k9 = seg9 cx sn inh8 withtop9 in
+                // (a constant its autoload is still defining is where the
+                // loading thread defined it -- to that thread only)
+                let pend9 = map_has const_src_pend k9 && map_has autoload_busy k9 && map_get autoload_busy k9 == sch_me () in
                 if str_eq k9 "" then VNil
-                else if map_has const_src k9 then
-                  (let l9 = map_get const_src k9 in
+                else if pend9 || map_has const_src k9 then
+                  (let l9 = map_get (if pend9 then const_src_pend else const_src) k9 in
                    let nl9 = str_index_of l9 "\n" in
                    arr_new (Cons (mkstr (substring l9 0 nl9), Cons (VInt (int_of_str (substring l9 (nl9 + 1) (str_len l9))), Nil))))
                 else arr_new Nil)
@@ -15635,18 +15872,32 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          let key_in = fn (ns9: str) -> (if str_eq ns9 "" || str_eq ns9 "Object" then cn else ns9 ++ "::" ++ cn) in
          let own9 = (if str_eq c "Kernel" then autoload_cref env else if str_eq c "Object" then "" else c) in
          let inherit9 = (match rest9 with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
-         if map_has autoloads (key_in own9) then map_get autoloads (key_in own9)
+         // (the one this thread is loading is not an autoload to it any more)
+         if autoload_pending world (key_in own9) then map_get autoloads (key_in own9)
          else if inherit9 && (if str_eq c "Kernel" then false else true) then
            (let rec walk9 = fn (xs: str list) ->
               (match xs with
                | Nil -> VNil
-               | Cons (a9, t9) -> (if map_has autoloads (key_in a9) then map_get autoloads (key_in a9) else walk9 t9)) in
+               | Cons (a9, t9) -> (if autoload_pending world (key_in a9) then map_get autoloads (key_in a9) else walk9 t9)) in
             walk9 (ancestors_of world c))
          else VNil
        | _ -> VNil)
-    // Module#deprecate_constant marks a constant as deprecated; the constant
-    // keeps working and CRuby only warns on use, which mere-ruby does not do.
-    else if (str_len name == 18 && str_eq name "deprecate_constant") then recv
+    // Module#deprecate_constant marks constants as deprecated: each keeps
+    // working, and every read of it warns (const_read_note). It answered self
+    // and marked nothing, so no read ever warned -- and a name that is not a
+    // constant is a NameError, the same refusal private_constant gives.
+    else if (str_len name == 18 && str_eq name "deprecate_constant") then
+      (let rec go = fn (as0: Val list) ->
+         (match as0 with
+          | Nil -> recv
+          | Cons (a, rest) ->
+            let n = sym_or_str_arg env world a in
+            let full = (if str_eq c "Object" && (if map_has consts (c ++ "::" ++ n) then false else true) then n else c ++ "::" ++ n) in
+            if map_has consts full || map_has autoloads full then
+              (let _ = map_set deprecated_consts full 1 in go rest)
+            else raise_exc_iv world "NameError" ("constant " ++ cls_display world c ++ "::" ++ n ++ " not defined")
+                   (Cons (("__name", VSym n), Cons (("__recv", recv), Nil)))) in
+       go args)
     else if (str_len name == 9 && str_eq name "const_set") then
       // the constant belongs to the RECEIVER's namespace, the same key rule
       // const_get and autoload use -- writing it bare put `Schemes.const_set
@@ -23407,6 +23658,10 @@ and cls_copy = fn world -> fn (c: str) -> fn (keep_frozen: bool) ->
         | VStr kh -> (let k = sget kh in map_set tbl (dst ++ substring k pl9 (str_len k)) (map_get tbl k))
         | _ -> ()))) in
   let _ = copy_kv consts (c ++ "::") (nc ++ "::") "::" in
+  // ...and the autoloads, which are constants too: `mod.dup` answers
+  // autoload?(:T) with the same path, and -- since the two registrations name
+  // one feature -- loading it through either answers both (autoload_keys_for)
+  let _ = copy_kv autoloads (c ++ "::") (nc ++ "::") "::" in
   let _ = copy_kv cvars (c ++ "@") (nc ++ "@") "" in
   let _ = copy_kv iv9 ("cls:" ++ c ++ "@") ("cls:" ++ nc ++ "@") "" in
   let _ = (if keep_frozen && map_has cls_frozen c then map_set cls_frozen nc (map_get cls_frozen c) else ()) in
@@ -34425,7 +34680,20 @@ and scoped_read_missing = fn env -> fn world -> fn blk -> fn (c: str) -> fn (cn:
   if has_own_meth world ("(sng:" ++ c ++ ")") "const_missing"
      || has_own_meth world c "const_missing"
   then invoke_val_c env world blk (VClass c) "const_missing" (Cons (VSym cn, Nil)) false
-  else raise_uninit_const world c cn ("uninitialized constant " ++ cn)
+  // ⚠ the message names WHERE it was looked for, as ruby's const_missing
+  //   does: "uninitialized constant M::X", the module written by its #name
+  //   -- ASKED, so an override is what the message says -- or by #inspect
+  //   when that is nil (an anonymous one). The bare "uninitialized constant
+  //   X" was right only for Object, which is the one it stays bare for.
+  else if str_eq c "Object" then raise_uninit_const world c cn ("uninitialized constant " ++ cn)
+  else
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let disp9 = (match invoke_val_c env world nb9 (VClass c) "name" Nil false with
+                  | VStr h9 -> sget h9
+                  | _ -> (match invoke_val_c env world nb9 (VClass c) "inspect" Nil false with
+                          | VStr h8 -> sget h8
+                          | _ -> cls_display world c)) in
+     raise_uninit_const world c cn ("uninitialized constant " ++ disp9 ++ "::" ++ cn))
 
 // Does a one-string command need `sh -c`? ruby's rule (and spawn's, in the
 // prelude): a shell metacharacter anywhere, or a first word that is a
@@ -37903,6 +38171,40 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // superclass: record its module-ness (that is what makes #class
          // answer Module) and give it no superclass.
          let is_mod = str_eq csuper "(module)" in
+         // ⚠ OPENING AN AUTOLOADED CONSTANT LOADS IT FIRST: `class E` /
+         //   `module F` on a name that is only an autoload registration reopens
+         //   what the file defines. Without this the keyword made a fresh
+         //   empty class, and the file -- when something else loaded it --
+         //   reopened that one. (A file that does not define it is no error
+         //   here: the keyword then creates the constant.)
+         let _ = (if map_has consts full then () else (let _ = autoload_fire cenv world noblk full in ())) in
+         // ⚠ ...and a constant holding an ANONYMOUS class or module (`K =
+         //   Class.new`) is reopened as that object -- the top-level path
+         //   already did this (anon_target), the nested one registered the
+         //   body under the constant's name, a second class nothing points to:
+         //   `module M; class K; def y` left M::K without #y. That is also
+         //   what an autoload into `Class.new { autoload :C, f }` meets, since
+         //   the file reopens the class by the name it was given.
+         let anon9 = (if map_has consts full then
+                        (match map_get consts full with
+                         | VClass rc9 -> if is_anon_cls rc9 then rc9 else ""
+                         | _ -> "")
+                      else "") in
+         if (if str_eq anon9 "" then false else true) then
+           (let _ = (if is_mod && (if map_has modules anon9 then false else true)
+                     then (let _ = raise_exc world "TypeError" (full ++ " is not a module") in ())
+                     else if (if is_mod then false else true) && map_has modules anon9
+                     then (let _ = raise_exc world "TypeError" (full ++ " is not a class") in ())
+                     else ()) in
+            let saved_lex = cur_lex () in
+            let saved_nest = cur_nest () in
+            let _ = push_nest anon9 in
+            let _ = set_lex anon9 in
+            let r = register_class world anon9 cbody in
+            let _ = set_lex saved_lex in
+            let _ = set_nest saved_nest in
+            r)
+         else
          let _ = if is_mod then (let _ = map_set modules full VNil in ()) else () in
          let qsuper = (if str_eq csuper "" || is_mod then "" else named_class_of_al cenv world (false, (Nil : str list), (Nil : Stmt list), cenv) cscope (resolve_scope_name cscope csuper)) in
          let was_new = if map_has consts full then false else true in
@@ -38790,6 +39092,12 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = set_nest "" in
        // a raise unwinds through Mere's `fail`, so catch it here the way every
        // other body-runner does -- the exception itself is already in $exc.
+       // the autoloads this file satisfies are loading from here on, in this
+       // thread (see autoload_keys_for) -- marked only now that nothing
+       // before the run can raise, and released below however the run ends
+       let _ = map_set req_loading p0 full in
+       let alk9 = (if map_len autoloads > 0 then autoload_keys_for world full else (Nil : str list)) in
+       let _ = (let me9 = sch_me () in list_iter alk9 (fn (k: str) -> map_set autoload_busy k me9)) in
        let f = in_scope_frame "<top (required)>" fenv (fn (u: unit) -> run_stmts fenv world noblk2 prog2) in
        let _ = set_lex (pack_cref savedlex) in
        let _ = set_nest (pack_nest savedlex) in
@@ -38797,6 +39105,11 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
        let _ = map_set load_ctx "file" savedf in
        let _ = map_set load_ctx "coding" savedc in
        let _ = map_set fsl_ctx "v" savedfsl in
+       // (the registrations stay: the feature is provided now, which is what
+       // spends them -- see autoload_pending -- and taking it back out of
+       // $LOADED_FEATURES makes them live again)
+       let _ = map_delete req_loading p0 in
+       let _ = list_iter alk9 autoload_settle in
        (match f with
         // A require that raised did NOT load the feature. Ruby takes it back
         // out of $LOADED_FEATURES so a later require retries; leaving it
@@ -39278,6 +39591,12 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              (map_has consts b && (match map_get consts b with VClass _ -> false | _ -> true)) ||
              (lv_has env b && (match lv_get env b with VClass _ -> false | _ -> true))) then
       (let _ = raise_exc world "TypeError" (recv_of_scoped name ++ " is not a class/module") in FNext VNil)
+    // ⚠ `module A::B::Priv` names Priv THROUGH THE SCOPE OPERATOR, which is
+    //   exactly what private_constant closes off: ruby refuses the reopen
+    //   ("private constant A::B::Priv referenced") where the lexical `module
+    //   A::B; module Priv` is allowed. This reopened it.
+    else if str_contains name "::" && map_has private_consts name then
+      (let _ = priv_const_err world name in FNext VNil)
     else
     // a bare class name reached here inside a class/module body (via control
     // flow such as a begin/if block) is lexically nested: qualify with the
@@ -39324,6 +39643,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                 let miss = (if map_has consts head then super0 else head) in
                 let _ = raise_exc world "NameError" ("uninitialized constant " ++ miss) in ())) in
     let is_module = str_eq super0 "(module)" in
+    // (an autoloaded constant is loaded before it is reopened -- see the
+    // nested path in register_class)
+    let _ = (if map_has consts name then () else (let _ = autoload_fire env world blk name in ())) in
     // `X = Module.new; module X ... end` reopens the object the constant
     // HOLDS, not a new module called X. An anonymous class/module keeps its
     // internal name, and that is where its methods and its module-ness live,
