@@ -57,6 +57,11 @@ strip_noise() {  # stdin -> stdout, a line usable as a bucket key
   # A cause is a SUMMARY. Losing the contents of a hash costs a little
   # readability (`{"a" => 1}` collapses too) and removes a whole class of
   # accident: there is no boundary left to get wrong.
+  # A checkout OUTSIDE $HOME is masked by its shape too: a worktree under
+  # /private/tmp/claude-<uid>/ carries the operator's home path spelled with
+  # dashes (`-Users-<name>-...`), which neither the $HOME rule nor
+  # record_hygiene's `/Users/` sees. core/kernel/__dir__ printed it into
+  # EXAMPLES.md and it was pushed on 2026-09-30.
   # ⚠ LC_ALL=C on the tools themselves, not on the shell that sources this:
   #   sed refuses a line containing an invalid byte under a UTF-8 locale
   #   ("RE error: illegal byte sequence") and the whole masking stage dies --
@@ -66,6 +71,7 @@ strip_noise() {  # stdin -> stdout, a line usable as a bucket key
       -e 's|/[^ ]*/mrb_[A-Za-z0-9]*|TMPDIR|g' \
       -e 's|/var/folders/[^ ]*|TMPDIR|g' \
       -e "s|${HOME}[^ \"]*|HOME|g" \
+      -e 's|\(/private\)\{0,1\}/tmp/claude-[0-9]*/[^ "]*|TMPDIR|g' \
       -e 's|{"[^}]*}|{...}|g' \
       -e 's|{"[^}]*$|{...|' \
       -e 's|0x[0-9a-f]*|0xADDR|g' \

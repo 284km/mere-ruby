@@ -48,7 +48,9 @@ rc=0
 # this machine's layout and still in a public record -- and every pattern below
 # it looks for the SPELLING BEFORE the mask, so it read as clean. Found on
 # 2026-09-04, already pushed.
-for pat in '/Users/' '/home/' 'HOME/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SOCK' \
+# '-Users-' and '/tmp/claude-' are the same home path spelled as a directory
+# NAME: a worktree under /private/tmp/claude-<uid>/-Users-<name>-.../ (2026-10-01).
+for pat in '/Users/' '-Users-' '/tmp/claude-' '/home/' 'HOME/' '/var/folders/' 'ruby-btest-' 'SSH_AUTH_SOCK' \
            'SECURITYSESSIONID' 'XPC_SERVICE_NAME' \
            'CLAUDE_CODE_SESSION_ID' 'LaunchInstanceID' '__CF_USER_TEXT_ENCODING' \
            'VSCODE_IPC_HOOK' 'GVM_PATH_BACKUP' 'LD_LIBRARY_PATH' 'SSH_AGENT_PID'; do
