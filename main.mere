@@ -485,7 +485,7 @@ let rec gc_args_simple = fn (es: Expr list) ->
 // has no arena bytes to be under pressure from. The entry-count axis still
 // works, so collection still happens -- see gc_should_run, which ORs the two.
 let gc_store_bytes = fn (u: unit) ->
-  if arena_measurable then vec_bytes str_store + map_bytes arr_store + vec_bytes hash_store
+  if arena_measurable then vec_bytes str_store + map_bytes str_pch + map_bytes arr_store + vec_bytes hash_store
   else 0;
 
 // Pressure is INCREMENTAL on both axes. Entries: the amortized threshold in
@@ -924,6 +924,18 @@ let gc_collect = fn env -> fn world ->
     let _ = map_clear hash_indexed in
     let _ = map_iter liveHM (fn (k: int) -> fn (b: bool) -> map_set hash_indexed k b) in
     let _ = (if nc then () else vec_compact hash_store) in
+    // ⚠ and the appends queued for a string (str_pend): a live string's are
+    // folded in and a dead one's dropped, BEFORE the sweep below reads the
+    // store -- then the queue's table is compacted, which is where the old
+    // copies its merges left behind go back. (The fold is O(what is queued),
+    // and this pass copies every live string anyway.)
+    let pks = map_new () in
+    let _ = map_iter str_pend (fn (k: int) -> fn (n: int) -> map_set pks k n) in
+    let _ = map_iter pks (fn (k: int) -> fn (n: int) ->
+      if map_has live (k * 8 + 1) then (let _ = str_flush k in ()) else str_pend_drop k) in
+    let _ = map_clear str_pch in
+    let _ = (if nc then () else map_compact str_pch) in
+    let _ = (if nc then () else map_compact str_pend) in
     let rec blank_s = fn (i: int) ->
       if i >= vec_len str_store then ()
       else
@@ -3018,11 +3030,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           //   `+""` fed UTF-8 characters stayed BINARY -- a string whose ==
           //   against the same text in UTF-8 is (rightly) false.
           | VStr y ->
-            (let renc = enc_compat2 (senc_get h) (sget h) (senc_get y) (sget y) in
+            (let renc = enc_compat2_h (senc_get h) h (senc_get y) (sget y) in
              if str_eq renc "" then
                raise_exc world "Encoding::CompatibilityError"
                  ("incompatible character encodings: " ++ enc_canon_name (senc_get h) ++ " and " ++ enc_canon_name (senc_get y))
-             else (let _ = sset h (sget h ++ sget y) in let _ = senc_set h renc in va0))
+             else (let _ = str_push h (sget y) in let _ = senc_set h renc in va0))
           // the rest is String#<<'s (str_append_val): a codepoint, or an
           // object asked for #to_str -- which this operator form never did,
           // so `s << obj` died on "needs a string" where `s.concat(obj)` ran.
@@ -24818,25 +24830,27 @@ and str_slice_bang_rx = fn env -> fn world -> fn (h: int) -> fn (args: Val list)
 and str_append_val = fn (h: int) -> fn (v: Val) ->
   match v with
   // the same label on both sides has nothing to negotiate (the common case)
-  | VStr y when str_eq (senc_get h) (senc_get y) -> (let _ = sset h (sget h ++ sget y) in VStr h)
+  // (str_push: the receiver is never read here -- see str_pend -- and the
+  // negotiation asks only its length and ASCII-ness, enc_compat2_h)
+  | VStr y when str_eq (senc_get h) (senc_get y) -> (let _ = str_push h (sget y) in VStr h)
   | VStr y ->
-    (let renc = enc_compat2 (senc_get h) (sget h) (senc_get y) (sget y) in
+    (let renc = enc_compat2_h (senc_get h) h (senc_get y) (sget y) in
      if str_eq renc "" then
        prim_raise "Encoding::CompatibilityError"
          ("incompatible character encodings: " ++ enc_canon_name (senc_get h) ++ " and " ++ enc_canon_name (senc_get y))
-     else (let _ = sset h (sget h ++ sget y) in let _ = senc_set h renc in VStr h))
+     else (let _ = str_push h (sget y) in let _ = senc_set h renc in VStr h))
   | VInt n ->
     (let e = enc_canon_name (senc_get h) in
      if n < 0 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
      else if str_eq e "ASCII-8BIT" || str_eq e "US-ASCII" then
        (if n > 255 then prim_raise "RangeError" (str_of_int n ++ " out of char range")
         else
-          (let _ = sset h (sget h ++ chr n) in
+          (let _ = str_push h (chr n) in
            let _ = (if n > 127 && str_eq e "US-ASCII" then senc_set h "ASCII-8BIT" else ()) in
            VStr h))
      else
        (match prim_method (VInt n) "chr" (Cons (mkstr e, Nil)) with
-        | VStr c -> (let _ = sset h (sget h ++ sget c) in VStr h)
+        | VStr c -> (let _ = str_push h (sget c) in VStr h)
         | other -> other))
   | VBig _ -> prim_raise "RangeError" "bignum out of char range"
   | other -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
@@ -24845,55 +24859,16 @@ and str_append_val = fn (h: int) -> fn (v: Val) ->
 // (the receiver itself, nil for an unchanged bang method, the assigned
 // value for []=). Out-of-range []= indices are clamped.
 and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
-  let s = sget h in
-  // slice!(...) removes what #[](...) would return and hands it back. Every
-  // form String#[] accepts works here, which is why it delegates rather than
-  // repeating the index rules -- and the positions are characters, like #[]'s.
-  if (str_len name == 6 && str_eq name "slice!") then
-    // remove the SPAN #[] would select, not the first occurrence of the text
-    // it returns (slice!(-1) on "worl" used to remove the l at index 2).
-    (let n = str_len s in
-     let cn = utf8_len s in
-     let span = (match args with
-       | Cons (VInt i, Nil) ->
-         (let ci = (if i < 0 then cn + i else i) in
-          if ci < 0 || ci >= cn then (0 - 1, 0 - 1)
-          else (utf8_boff s ci 0, (if ci + 1 >= cn then n else utf8_boff s (ci + 1) 0)))
-       | Cons (VInt i, Cons (VInt l, Nil)) ->
-         (let ci = (if i < 0 then cn + i else i) in
-          if l < 0 || ci < 0 || ci > cn then (0 - 1, 0 - 1)
-          else (utf8_boff s ci 0, utf8_boff s (if ci + l > cn then cn else ci + l) 0))
-       | Cons (VRange (lov, hiv, ex), Nil) ->
-         (let (st9, en9) = rng_slice_bounds lov hiv ex cn in
-          if st9 < 0 || st9 > cn then (0 - 1, 0 - 1)
-          else (utf8_boff s st9 0, utf8_boff s (if en9 > cn then cn else if en9 < st9 then st9 else en9) 0))
-       | Cons (VStr sub, Nil) ->
-         (let i = str_find_from s (sget sub) 0 in
-          if i < 0 then (0 - 1, 0 - 1) else (i, i + str_len (sget sub)))
-       | Cons (VRegex (p, pf, _), Nil) ->
-         (match rxv_search p pf s 0 with RHit (st9, en9, _) -> (st9, en9) | _ -> (0 - 1, 0 - 1))
-       | _ -> (0 - 1, 0 - 1)) in
-     match span with (b0, b1) ->
-     if b0 < 0 then VNil
-     else
-       let piece = substring s b0 b1 in
-       let _ = sset h (substring s 0 b0 ++ substring s b1 n) in
-       let c = mkstr piece in
-       (match c with VStr rid -> (let _ = senc_set rid (senc_get h) in c) | _ -> c))
-  else if (str_len name == 5 && str_eq name "clear") then let _ = sset h "" in VStr h
-  // String#replace takes the other string's ENCODING too, as ruby does
-  else if (str_len name == 7 && str_eq name "replace") then
-    (match args with
-     | Cons (VStr a, _) -> (let _ = sset h (sget a) in let _ = senc_set h (senc_get a) in VStr h)
-     // (an object with #to_str was converted before this; what is left has none)
-     | Cons (v, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String")
-     | Nil -> VStr h)
+  // ⚠ THE APPENDS COME FIRST, AHEAD OF `let s = sget h`: they never look at
+  // the receiver (str_push queues beside it, see str_pend), and reading it
+  // here would fold the queue in on every call and make `s.concat(x)` in a
+  // loop quadratic again.
   // concat(*args) appends each argument as `<<` would (str_append_val); with
   // more than one they are first gathered in a buffer of the receiver's
   // encoding and that is appended, as rb_str_concat_multi does -- which is
   // also why `s.concat(s, s)` appends the ORIGINAL text twice. Appending
   // each argument's #to_s had made `"".concat(33)` "33" instead of "!".
-  else if (str_len name == 6 && str_eq name "concat") || (str_len name == 2 && str_eq name "<<") then
+  if (str_len name == 6 && str_eq name "concat") || (str_len name == 2 && str_eq name "<<") then
     (match args with
      | Nil -> (if str_len name == 2 then prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)" else VStr h)
      | Cons (a, Nil) -> str_append_val h a
@@ -24937,7 +24912,51 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
           // prim_raise, not raise_exc: this arm has no world (see prim_method).
           prim_raise "TypeError"
             ("wrong argument type " ++ class_name bad9 ++ " (expected String or Integer)")) in
-     let _ = sset h (s ++ go9 args "") in VStr h)
+     let _ = str_push h (go9 args "") in VStr h)
+  else
+  let s = sget h in
+  // slice!(...) removes what #[](...) would return and hands it back. Every
+  // form String#[] accepts works here, which is why it delegates rather than
+  // repeating the index rules -- and the positions are characters, like #[]'s.
+  if (str_len name == 6 && str_eq name "slice!") then
+    // remove the SPAN #[] would select, not the first occurrence of the text
+    // it returns (slice!(-1) on "worl" used to remove the l at index 2).
+    (let n = str_len s in
+     let cn = utf8_len s in
+     let span = (match args with
+       | Cons (VInt i, Nil) ->
+         (let ci = (if i < 0 then cn + i else i) in
+          if ci < 0 || ci >= cn then (0 - 1, 0 - 1)
+          else (utf8_boff s ci 0, (if ci + 1 >= cn then n else utf8_boff s (ci + 1) 0)))
+       | Cons (VInt i, Cons (VInt l, Nil)) ->
+         (let ci = (if i < 0 then cn + i else i) in
+          if l < 0 || ci < 0 || ci > cn then (0 - 1, 0 - 1)
+          else (utf8_boff s ci 0, utf8_boff s (if ci + l > cn then cn else ci + l) 0))
+       | Cons (VRange (lov, hiv, ex), Nil) ->
+         (let (st9, en9) = rng_slice_bounds lov hiv ex cn in
+          if st9 < 0 || st9 > cn then (0 - 1, 0 - 1)
+          else (utf8_boff s st9 0, utf8_boff s (if en9 > cn then cn else if en9 < st9 then st9 else en9) 0))
+       | Cons (VStr sub, Nil) ->
+         (let i = str_find_from s (sget sub) 0 in
+          if i < 0 then (0 - 1, 0 - 1) else (i, i + str_len (sget sub)))
+       | Cons (VRegex (p, pf, _), Nil) ->
+         (match rxv_search p pf s 0 with RHit (st9, en9, _) -> (st9, en9) | _ -> (0 - 1, 0 - 1))
+       | _ -> (0 - 1, 0 - 1)) in
+     match span with (b0, b1) ->
+     if b0 < 0 then VNil
+     else
+       let piece = substring s b0 b1 in
+       let _ = sset h (substring s 0 b0 ++ substring s b1 n) in
+       let c = mkstr piece in
+       (match c with VStr rid -> (let _ = senc_set rid (senc_get h) in c) | _ -> c))
+  else if (str_len name == 5 && str_eq name "clear") then let _ = sset h "" in VStr h
+  // String#replace takes the other string's ENCODING too, as ruby does
+  else if (str_len name == 7 && str_eq name "replace") then
+    (match args with
+     | Cons (VStr a, _) -> (let _ = sset h (sget a) in let _ = senc_set h (senc_get a) in VStr h)
+     // (an object with #to_str was converted before this; what is left has none)
+     | Cons (v, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name v ++ " into String")
+     | Nil -> VStr h)
   else if (str_len name == 7 && str_eq name "prepend") then
     // every argument must already be a String (#to_str was tried upstream).
     (let rec ck = fn (xs: Val list) ->
@@ -26590,7 +26609,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh xs -> let xs = hderef xs in VInt (hash_len xs) | _ -> prim_raise "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_name recv))
   else if (str_len name == 6 && str_eq name "empty?") then
     (match recv with
-     | VArr id -> VBool (val_list_len (deref id) == 0) | VStr s -> let s = sget s in VBool (str_len s == 0)
+     | VArr id -> VBool (val_list_len (deref id) == 0) | VStr s -> VBool (str_blen s == 0)
      | VHsh xs -> let xs = hderef xs in VBool (hash_len xs == 0) | _ -> prim_raise "NoMethodError" ("undefined method 'empty?' for " ++ for_recv_name recv))
   else if (str_len name == 2 && str_eq name "[]") then
     (match recv with
@@ -27397,7 +27416,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set (mkstr "force_encoding") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'force_encoding'")) in fail "mere-ruby: undefined method 'force_encoding'")))
   else if (str_len name == 1 && str_eq name "b") then
     (match recv with VStr h -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id "ASCII-8BIT" in c | _ -> c) | _ -> (let _ = prim_nm_set (mkstr "b") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'b'")) in fail "mere-ruby: undefined method 'b'")))
-  else if (str_len name == 8 && str_eq name "bytesize") then (match recv with VStr h -> VInt (str_len (sget h)) | _ -> (let _ = prim_nm_set (mkstr "bytesize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesize'")) in fail "mere-ruby: undefined method 'bytesize'")))
+  else if (str_len name == 8 && str_eq name "bytesize") then (match recv with VStr h -> VInt (str_blen h) | _ -> (let _ = prim_nm_set (mkstr "bytesize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesize'")) in fail "mere-ruby: undefined method 'bytesize'")))
   else if (str_len name == 11 && str_eq name "ascii_only?") then
     (match recv with
      | VStr h -> VBool (enc_ascii_compat (enc_canon_name (senc_get h)) && str_ascii_only (sget h) 0)

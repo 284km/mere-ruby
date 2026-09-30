@@ -352,7 +352,89 @@ let mkstr = fn (s: str) ->
   let id = handle_base + vec_len str_store in
   let _ = vec_push str_store s in
   VStr id;
-let sget = fn (id: int) -> vec_get str_store (id - handle_base);
+// ⚠ AN APPEND GOES INTO A QUEUE BESIDE THE STRING, AND THE NEXT READ FOLDS IT IN.
+// A Mere `str` is immutable, so `s << x` was `sset h (sget h ++ x)`: a copy of
+// the whole receiver per append, and building a string with `<<` was O(n^2).
+// Measured on `s = +''; N.times { s << 'ab' }`: 0.40 s at 20k, 1.71 s at 80k
+// (ruby: 0.09 s at 80k), and 300k appends took 25 s. Array#<< had the same
+// shape and the same cure (arr_pending above).
+//
+// ⚠ NOT A StrBuf, although Mere has one. A StrBuf is a REFERENCE type: a map
+// holding it holds a pointer, `map_compact` does not move it, and its bytes
+// live in the region its type names -- for a buffer kept in a global table,
+// the default region, which nothing ever gives back. So every buffer a
+// program opened and dropped (a method that builds a 10 KB string per call,
+// `buf << x; buf.slice!(..)` in a loop) would have been memory for the rest
+// of the run (that is read off the generated C, not measured), where the old
+// copies of a str die with str_store's arena at the next compaction. So the queue is made of plain `str`s in a map (`map_set` copies
+// a str INTO the map's arena, and gc_collect compacts that arena like
+// str_store's), and the growth is kept linear by merging:
+//
+//   str_pch (id * 64 + i)   the i-th queued chunk of string `id`, oldest first
+//   str_pend id             how many chunks are queued (absent: none)
+//
+// An append pushes its text as a new chunk and then merges from the top while
+// the chunk below is at most twice the top (and the settled string itself,
+// in str_store, is the bottom of that stack). So every chunk is more than
+// twice the one above it, a string never has more than log2(n) of them, and
+// a byte is copied O(log n) times over the whole build -- the binary counter.
+// A string that is still small stays out of the queue entirely: its first
+// appends merge straight into str_store.
+//
+// Every read goes through sget, which folds the queue in first (the fold is
+// from the top down, so it too is linear), and every rewrite goes through
+// sset, which drops the queue. Those two are the only ways into str_store --
+// that is what makes this safe, and it is why nothing else may vec_get it.
+let str_pend = map_new ();
+let str_pch = map_new ();
+// 1: folds (MERE_RUBY_STORE_STATS) -- the number that says whether some read
+// path keeps undoing the queue
+let str_pend_n = map_new ();
+// delete the chunks from index i up, as far as they go (a merge leaves the
+// keys above the new top in place, to be overwritten by the next push)
+let rec str_pend_clear = fn (id: int) -> fn (i: int) ->
+  if map_has str_pch (id * 64 + i)
+  then (let _ = map_delete str_pch (id * 64 + i) in str_pend_clear id (i + 1))
+  else ();
+let str_pend_drop = fn (id: int) ->
+  let _ = map_delete str_pend id in
+  str_pend_clear id 0;
+let rec str_pend_fold = fn (id: int) -> fn (i: int) -> fn (acc: str) ->
+  if i < 0 then acc else str_pend_fold id (i - 1) (map_get str_pch (id * 64 + i) ++ acc);
+let str_flush = fn (id: int) ->
+  let k = map_get str_pend id in
+  let tail = str_pend_fold id (k - 2) (map_get str_pch (id * 64 + k - 1)) in
+  let _ = str_pend_drop id in
+  let _ = map_set str_pend_n 1 ((if map_has str_pend_n 1 then map_get str_pend_n 1 else 0) + 1) in
+  let _ = vec_set str_store (id - handle_base) (vec_get str_store (id - handle_base) ++ tail) in
+  vec_get str_store (id - handle_base);
+// `map_len` first: nothing is queued in most programs, and then a read costs
+// one comparison more than it did.
+let sget = fn (id: int) ->
+  if map_len str_pend == 0 then vec_get str_store (id - handle_base)
+  else if map_has str_pend id then str_flush id
+  else vec_get str_store (id - handle_base);
+// the BYTE length, queue included, without folding it in
+let rec str_pend_len = fn (id: int) -> fn (i: int) -> fn (acc: int) ->
+  if i < 0 then acc else str_pend_len id (i - 1) (acc + str_len (map_get str_pch (id * 64 + i)));
+let str_blen = fn (id: int) ->
+  let n0 = str_len (vec_get str_store (id - handle_base)) in
+  if map_len str_pend > 0 && map_has str_pend id then str_pend_len id (map_get str_pend id - 1) n0
+  else n0;
+// merge the top chunk (index k-1) down while the one below is at most twice it
+let rec str_pend_settle = fn (id: int) -> fn (k: int) ->
+  let top = map_get str_pch (id * 64 + k - 1) in
+  if k >= 2 then
+    (let below = map_get str_pch (id * 64 + k - 2) in
+     if str_len below <= 2 * str_len top
+     then (let _ = map_set str_pch (id * 64 + k - 2) (below ++ top) in str_pend_settle id (k - 1))
+     else (let _ = map_set str_pend id k in ()))
+  else
+    (let p = vec_get str_store (id - handle_base) in
+     if str_len p <= 2 * str_len top
+     then (let _ = vec_set str_store (id - handle_base) (p ++ top) in
+           (if map_len str_pend > 0 && map_has str_pend id then str_pend_drop id else str_pend_clear id 0))
+     else (let _ = map_set str_pend id 1 in ()));
 // ⚠ IS THIS STRING ALL ASCII? Cached per handle, because the answer decides
 // whether a CHARACTER index is also a BYTE index -- and when it is, #length,
 // #[] and matching from an offset are O(1) instead of a UTF-8 walk from the
@@ -373,10 +455,38 @@ let str_is_ascii = fn (hid: int) ->
   if map_has str_ascii hid then map_get str_ascii hid
   else (let a = (let v = sget hid in str_all_ascii_go v 0 (str_len v)) in
         let _ = map_set str_ascii hid a in a);
-// the ONE place a stored string changes, so the one place the answer expires
+// APPEND y to string id -- String#<<, #concat, #append_as_bytes -- through
+// the queue above. The two answers cached per string are KEPT rather than
+// dropped where the appended text decides them: ASCII + ASCII is ASCII, and
+// ASCII after a string that was valid UTF-8 (or was not) leaves it so -- an
+// ASCII byte can neither finish nor break a multibyte character. Dropping
+// them made every `s << x; s.size` rescan the whole receiver.
+let str_push = fn (id: int) -> fn (y: str) ->
+  if str_len y == 0 then ()
+  else
+    let a_c = map_has str_ascii id in
+    let v_c = map_has str_valid8 id in
+    let _ = (if a_c || v_c then
+               (let y7 = str_all_ascii_go y 0 (str_len y) in
+                let _ = (if y7 then () else (if a_c then (let _ = map_set str_ascii id false in ()) else ())) in
+                (if y7 then () else (if v_c then (let _ = map_delete str_valid8 id in ()) else ())))
+             else ()) in
+    if map_len str_pend > 0 && map_has str_pend id then
+      (let k = map_get str_pend id in
+       let _ = map_set str_pch (id * 64 + k) y in
+       str_pend_settle id (k + 1))
+    else
+      (let p = vec_get str_store (id - handle_base) in
+       // still small beside what arrives: straight in, no queue
+       if str_len p <= 2 * str_len y then (let _ = vec_set str_store (id - handle_base) (p ++ y) in ())
+       else (let _ = map_set str_pch (id * 64) y in
+             let _ = map_set str_pend id 1 in ()));
+// the ONE place a stored string is REPLACED, so the one place the answers
+// expire -- and whatever was queued for it is superseded
 let sset = fn (id: int) -> fn (s: str) ->
   let _ = map_delete str_ascii id in
   let _ = map_delete str_valid8 id in
+  let _ = (if map_len str_pend > 0 && map_has str_pend id then str_pend_drop id else ()) in
   let _ = vec_set str_store (id - handle_base) s in ();
 // Kernel#gets state: what has been read of stdin, in stdin_src "s", handed
 // out through a cursor stdin_src_pos "p"; stdin_src "done" is the end of the
@@ -2984,7 +3094,10 @@ let rec be_bytes = fn (n: int) ->
   if n < 0 then ""
   else if n < 256 then chr n
   else be_bytes (n / 256) ++ chr (n - (n / 256) * 256);
-let enc_compat2 = fn (ae0: str) -> fn (as_: str) -> fn (be0: str) -> fn (bs: str) ->
+// (the first side is asked only its byte length and whether it is all ASCII,
+// each through a thunk, so that the handle form below can answer both without
+// reading the string -- see enc_compat2_h)
+let enc_compat2_k = fn (ae0: str) -> fn (alen: unit -> int) -> fn (a7: unit -> bool) -> fn (be0: str) -> fn (bs: str) ->
   let ae = enc_canon_name ae0 in
   let be = enc_canon_name be0 in
   if str_eq ae be then ae
@@ -2995,13 +3108,23 @@ let enc_compat2 = fn (ae0: str) -> fn (as_: str) -> fn (be0: str) -> fn (bs: str
   //   `Encoding.compatible?("".encode("US-ASCII"), "")` is US-ASCII; handing
   //   every empty receiver the argument's encoding answered BINARY and UTF-8.
   //   (ASCII-only means ASCII-compatible first: "abc" in UTF-16LE is not.)
-  else if str_len as_ == 0 then (if enc_ascii_compat ae && enc_ascii_compat be && enc_all7 bs then ae else be)
+  else if alen () == 0 then (if enc_ascii_compat ae && enc_ascii_compat be && enc_all7 bs then ae else be)
   else if enc_is_dummy ae || enc_is_dummy be then ""
   else if enc_ascii_compat ae && enc_ascii_compat be then
-    (let a7 = enc_all7 as_ in
+    (let av = a7 () in
      let b7 = enc_all7 bs in
-     if a7 && b7 then ae else if a7 then be else if b7 then ae else "")
+     if av && b7 then ae else if av then be else if b7 then ae else "")
   else "";
+let enc_compat2 = fn (ae0: str) -> fn (as_: str) -> fn (be0: str) -> fn (bs: str) ->
+  enc_compat2_k ae0 (fn (u: unit) -> str_len as_) (fn (u: unit) -> enc_all7 as_) be0 bs;
+// ...and with the first side a string HANDLE, for an append: its length and
+// ASCII-ness come from str_blen and the str_ascii cache (which str_push keeps
+// up to date), so negotiating does not fold the receiver's queue in -- and
+// does not rescan the receiver -- on every call. `String.new << "ab"` is a
+// BINARY receiver and a UTF-8 argument every time, so this is the common path
+// for a binary buffer, not a rare one.
+let enc_compat2_h = fn (ae0: str) -> fn (ah: int) -> fn (be0: str) -> fn (bs: str) ->
+  enc_compat2_k ae0 (fn (u: unit) -> str_blen ah) (fn (u: unit) -> str_is_ascii ah) be0 bs;
 // the negotiated encoding for two string HANDLES, or "" when incompatible;
 // the guard form raises the CompatibilityError ruby's searches raise.
 let enc_pair_or = fn (ah: int) -> fn (bh: int) ->
