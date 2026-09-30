@@ -61,7 +61,11 @@ for rb in "$dir"/*/p*.rb; do
   # in ~16s here, so a 15s alarm made the tally flip between pass and err run
   # to run. A gate has to measure the interpreter, not the cutoff.
   if [ "${BT_NO_DRIFT_CHECK:-}" != 1 ]; then
-    rbgot=$(perl -e 'alarm 20; exec @ARGV' ruby $flags -e 'print(eval(File.read(ARGV[0]), TOPLEVEL_BINDING, ARGV[0]))' "$rb" 2>/dev/null)
+    # ⚠ KILLED at the bound, not signalled: a Ractor whose threads sit in
+    # wait_readable (test_thread's p37) never acts on SIGALRM, and `exec` under
+    # a bare alarm left the reference running for 21 minutes with the whole
+    # gate waiting on it. fork + KILL, as mspec/run_spec.sh does it.
+    rbgot=$(perl -e '$SIG{ALRM} = sub { kill 9, $pid; exit 142 }; $pid = fork; if (!$pid) { exec @ARGV } alarm 20; waitpid($pid, 0); exit($? >> 8)' ruby $flags -e 'print(eval(File.read(ARGV[0]), TOPLEVEL_BINDING, ARGV[0]))' "$rb" 2>/dev/null)
     if [ "$rbgot" != "$exp" ]; then
       drift=$((drift + 1))
       total=$((total + 1))
