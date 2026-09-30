@@ -5190,28 +5190,16 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "end\n"
   else
-  // io/wait: the readiness predicates. A mere-ruby socket read BLOCKS -- there
-  // is no select here -- so waiting for readability is the identity, and
-  // `ready?` answers "unknown" rather than a guess. net/protocol and resolv
-  // require this file for those three names.
+  // io/wait: net/protocol and resolv require this file. IO's own wait /
+  // wait_readable / wait_writable are in the prelude, over poll(2) -- ruby 4
+  // has them without this require -- and a socket is an IO, so they are its
+  // too (they were the identity on a BasicSocket of its own, which answered
+  // "ready" for a socket with nothing in it). `ready?` answers "unknown"
+  // rather than a guess.
+  // ⚠ Nothing here may open `class BasicSocket`: without a superclass that
+  //   would make it an Object subclass, and the `socket` library's
+  //   `class BasicSocket < IO` after it a superclass mismatch.
   if str_eq n "io/wait" then
-    "class BasicSocket\n" ++
-    "  def wait_readable(timeout = nil)\n" ++
-    "    self\n" ++
-    "  end\n" ++
-    "  def wait_writable(timeout = nil)\n" ++
-    "    self\n" ++
-    "  end\n" ++
-    "  def wait(*args)\n" ++
-    "    self\n" ++
-    "  end\n" ++
-    "  def ready?\n" ++
-    "    nil\n" ++
-    "  end\n" ++
-    "end\n" ++
-    // IO's own wait / wait_readable / wait_writable are in the prelude, over
-    // poll(2) -- ruby 4 has them without this require -- and redefining them
-    // here as `self` would take a real answer away from whoever required it.
     "class IO\n" ++
     "  def ready?\n" ++
     "    nil\n" ++
@@ -5223,7 +5211,8 @@ and stdlib_src = fn (name: str) ->
   // extern can declare -- so `nonblock = false` is recorded on the stream,
   // #nonblock? reports it, and a read on it waits for data as a blocking one
   // would (the layer's reads wait on a would-block anyway).
-  // A socket is non-blocking from the start in ruby 3, and here.
+  // A socket is non-blocking from the start in ruby 3, and here -- and an IO,
+  // so these are its methods too.
   else if str_eq n "io/nonblock" then
     "class IO\n" ++
     "  def nonblock?\n" ++
@@ -5249,17 +5238,22 @@ and stdlib_src = fn (name: str) ->
     "      self.nonblock = was\n" ++
     "    end\n" ++
     "  end\n" ++
-    "end\n" ++
-    "class BasicSocket\n" ++
-    "  def nonblock? = !@__nb_off\n" ++
-    "  def nonblock=(v)\n" ++
-    "    @__nb_off = v ? nil : true\n" ++
-    "    v\n" ++
-    "  end\n" ++
     "end\n"
+  // A socket IS an IO, as it is in CRuby: BasicSocket < IO, and what a socket
+  // reads and writes goes through the prelude's descriptor layer (IO#__fd_*),
+  // the same read buffer, write buffer and readiness loop an IO.pipe end has.
+  // ⚠ It used to be a class of its own under Object, with its own read / write /
+  // gets / puts over the tcp_* FFI. TCPSocket.ancestors ended at Object, so
+  // every IO name it had not copied was missing: net/ftp wraps its socket with
+  // `IO.select([@sock.to_io], ...)` and all 38 library/net-ftp files died on
+  // "undefined method 'to_io' for an instance of Socket", and each_line /
+  // readline / sysread / getc / IO.select's type check went the same way. The
+  // descriptors the runtime's tcp_* functions hand out are plain file
+  // descriptors (tcp_read is read(2)), so the layer's fd_read / fd_write reach
+  // them as they reach a pipe.
   else if str_eq n "socket" then
     "class SocketError < StandardError; end\n" ++
-    "class BasicSocket\n" ++
+    "class BasicSocket < IO\n" ++
     "  # BasicSocket.do_not_reverse_lookup is ONE process-wide flag in CRuby, and a\n" ++
     "  # socket copies it when it is made.\n" ++
     "  @__dnrl = true\n" ++
@@ -5285,28 +5279,32 @@ and stdlib_src = fn (name: str) ->
     "    s.__setup(fd)\n" ++
     "    s\n" ++
     "  end\n" ++
+    "  # rsock_init_sock: a read-write stream, binary (ASCII-8BIT, binmode?), sync,\n" ++
+    "  # and non-blocking as every ruby 3 socket is -- the layer waits in its\n" ++
+    "  # readiness loop on a read that would block, so under the thread scheduler\n" ++
+    "  # the peer runs meanwhile. The class is registered with the layer so its\n" ++
+    "  # stream methods are routed there (fdio_route), and a subclass is too.\n" ++
     "  def __setup(fd, socktype = Socket::SOCK_STREAM)\n" ++
     "    # SIGPIPE ignored, as ruby has it, before the first socket can be written\n" ++
     "    unless BasicSocket.instance_variable_get(:@__nosig)\n" ++
     "      Socket.__nosigpipe\n" ++
     "      BasicSocket.instance_variable_set(:@__nosig, true)\n" ++
     "    end\n" ++
-    "    @fd = fd\n" ++
-    "    @closed = false\n" ++
-    "    @rbuf = \"\".b\n" ++
+    "    IO.__fdclass(self.class)\n" ++
+    "    __fd_setup(fd, IO::RDWR, true, Encoding::BINARY, nil, false)\n" ++
+    "    @__io_sync = true\n" ++
+    "    IO.__fdnonblock(fd)\n" ++
     "    @socktype = socktype\n" ++
     "    @do_not_reverse_lookup = BasicSocket.do_not_reverse_lookup\n" ++
     "    self\n" ++
     "  end\n" ++
-    "  def __fd\n" ++
-    "    @fd\n" ++
-    "  end\n" ++
-    "  # what IO.select asks of what it is given (see IO.__sel_io)\n" ++
-    "  def __sel_fd\n" ++
-    "    @fd\n" ++
-    "  end\n" ++
-    "  def __sel_pending?\n" ++
-    "    !@rbuf.empty?\n" ++
+    "  # `connect` hands back a NEW descriptor (the runtime's connect makes its\n" ++
+    "  # own socket; see KNOWN_GAPS): the stream moves onto it\n" ++
+    "  def __move_to(fd)\n" ++
+    "    IO.__fdclose(@__io_fd)\n" ++
+    "    @__io_fd = fd\n" ++
+    "    IO.__fdnonblock(fd)\n" ++
+    "    @__ep = nil\n" ++
     "  end\n" ++
     "  def do_not_reverse_lookup\n" ++
     "    @do_not_reverse_lookup\n" ++
@@ -5314,235 +5312,99 @@ and stdlib_src = fn (name: str) ->
     "  def do_not_reverse_lookup=(v)\n" ++
     "    @do_not_reverse_lookup = v ? true : false\n" ++
     "  end\n" ++
-    "  def fileno\n" ++
-    "    @fd\n" ++
-    "  end\n" ++
-    "  def to_i\n" ++
-    "    @fd\n" ++
-    "  end\n" ++
-    "  def closed?\n" ++
-    "    @closed\n" ++
-    "  end\n" ++
     "  def __check_open\n" ++
-    "    raise IOError, \"closed stream\" if @closed\n" ++
+    "    __fd_closed!\n" ++
     "  end\n" ++
-    "  def close\n" ++
-    "    return nil if @closed\n" ++
-    "    @closed = true\n" ++
-    "    Socket.__close(@fd)\n" ++
-    "    nil\n" ++
+    "  # a write the kernel refused on a socket is a peer that has gone (EPIPE,\n" ++
+    "  # ECONNRESET -- which of them fd_write does not say), not a bad descriptor\n" ++
+    "  def __fd_wfail\n" ++
+    "    raise Errno::EPIPE, \"write(2)\"\n" ++
     "  end\n" ++
-    "  def write(data)\n" ++
-    "    __check_open\n" ++
-    "    raise IOError, \"not opened for writing\" if @write_closed\n" ++
-    "    s = data.to_s\n" ++
-    "    n = Socket.__write(@fd, s)\n" ++
-    "    __write_error(n) if n < 0\n" ++
-    "    n\n" ++
-    "  end\n" ++
-    "  # the runtime's write codes: -1 would block, -2 the peer is gone (EPIPE,\n" ++
-    "  # ECONNRESET, ENOTCONN, ETIMEDOUT -- which of them is not visible), -3 any\n" ++
-    "  # other failure\n" ++
-    "  def __write_error(n)\n" ++
-    "    raise IO::EAGAINWaitWritable, \"write would block\" if n == -1\n" ++
-    "    raise Errno::EPIPE, \"write(2)\" if n == -2\n" ++
-    "    raise SocketError, \"write failed\"\n" ++
+    "  # read(2) on a listening socket is ENOTCONN; waiting for it to become\n" ++
+    "  # readable would wait for a connection instead\n" ++
+    "  def __fd_fill(want = 65536)\n" ++
+    "    raise Errno::ENOTCONN, \"read(2)\" if @listening\n" ++
+    "    super\n" ++
     "  end\n" ++
     "  # poll(2) for this descriptor with no wait: is it readable (or at its\n" ++
     "  # end), writable, now?\n" ++
     "  def __ready?(bits)\n" ++
-    "    (IO.__poll([@fd], [bits], 0)[0] & (bits == 1 ? 5 : 6)) != 0\n" ++
-    "  end\n" ++
-    "  def read_nonblock(len, buf = nil, exception: true)\n" ++
-    "    __check_readable\n" ++
-    "    if @rbuf.empty?\n" ++
-    "      unless __ready?(1)\n" ++
-    "        return :wait_readable unless exception\n" ++
-    "        raise IO::EAGAINWaitReadable, \"read would block\"\n" ++
-    "      end\n" ++
-    "      chunk = Socket.__read(@fd, 65536)\n" ++
-    "      if chunk.nil? || chunk.empty?\n" ++
-    "        return nil unless exception\n" ++
-    "        raise EOFError, \"end of file reached\"\n" ++
-    "      end\n" ++
-    "      @rbuf << chunk\n" ++
-    "    end\n" ++
-    "    out = @rbuf[0, len]\n" ++
-    "    @rbuf = @rbuf[out.bytesize, @rbuf.bytesize - out.bytesize] || \"\".b\n" ++
-    "    buf ? buf.replace(out) : out\n" ++
+    "    (IO.__poll([@__io_fd], [bits], 0)[0] & (bits == 1 ? 5 : 6)) != 0\n" ++
     "  end\n" ++
     "  def recv_nonblock(maxlen, flags = 0, buf = nil, exception: true)\n" ++
-    "    __check_readable\n" ++
-    "    if @rbuf.empty?\n" ++
-    "      unless __ready?(1)\n" ++
+    "    __fd_reading!\n" ++
+    "    if @__io_rbuf.empty?\n" ++
+    "      s = IO.__fdread(@__io_fd, 65536)\n" ++
+    "      return nil if s.nil?\n" ++
+    "      unless s.is_a?(String)\n" ++
     "        return :wait_readable unless exception\n" ++
     "        raise IO::EAGAINWaitReadable, \"recvfrom(2) would block\"\n" ++
     "      end\n" ++
-    "      chunk = Socket.__read(@fd, 65536)\n" ++
-    "      return nil if chunk.nil? || chunk.empty?\n" ++
-    "      @rbuf << chunk\n" ++
+    "      @__io_rbuf << s\n" ++
     "    end\n" ++
     "    recv(maxlen, flags, buf)\n" ++
-    "  end\n" ++
-    "  def write_nonblock(data, exception: true)\n" ++
-    "    __check_open\n" ++
-    "    raise IOError, \"not opened for writing\" if @write_closed\n" ++
-    "    unless __ready?(2)\n" ++
-    "      return :wait_writable unless exception\n" ++
-    "      raise IO::EAGAINWaitWritable, \"write would block\"\n" ++
-    "    end\n" ++
-    "    write(data)\n" ++
-    "  end\n" ++
-    "  def <<(data)\n" ++
-    "    write(data)\n" ++
-    "    self\n" ++
-    "  end\n" ++
-    "  def print(*args)\n" ++
-    "    args.each \{ |a| write(a.to_s) }\n" ++
-    "    nil\n" ++
-    "  end\n" ++
-    "  def puts(*args)\n" ++
-    "    if args.empty?\n" ++
-    "      write(\"\\n\")\n" ++
-    "    else\n" ++
-    "      args.each do |a|\n" ++
-    "        s = a.to_s\n" ++
-    "        write(s)\n" ++
-    "        write(\"\\n\") unless s.end_with?(\"\\n\")\n" ++
-    "      end\n" ++
-    "    end\n" ++
-    "    nil\n" ++
-    "  end\n" ++
-    "  def flush\n" ++
-    "    self\n" ++
-    "  end\n" ++
-    "  def sync\n" ++
-    "    true\n" ++
-    "  end\n" ++
-    "  def sync=(v)\n" ++
-    "    v\n" ++
     "  end\n" ++
     "  # setsockopt(2) takes a pointer, which nothing here can pass; the options\n" ++
     "  # are accepted and not applied, as before.\n" ++
     "  def setsockopt(*args)\n" ++
     "    0\n" ++
     "  end\n" ++
-    "  # A read WAITS for readability first, through IO's readiness loop, so that\n" ++
-    "  # under the thread scheduler the other threads run while this one waits --\n" ++
-    "  # one of them may be the peer. A bare read(2) would stop the whole process.\n" ++
+    "  # accept(2) waits for readability first, through IO's readiness loop, so\n" ++
+    "  # that under the thread scheduler the other threads run while this one\n" ++
+    "  # waits -- one of them may be the peer.\n" ++
     "  def __wait_readable\n" ++
-    "    IO.__sel_wait([[@fd, 1, self]], -1)\n" ++
+    "    IO.__sel_wait([[@__io_fd, 1, self]], -1)\n" ++
     "  end\n" ++
-    "  def __fill\n" ++
-    "    __check_readable\n" ++
-    "    __wait_readable\n" ++
-    "    chunk = Socket.__read(@fd, 65536)\n" ++
-    "    return false if chunk.nil? || chunk.empty?\n" ++
-    "    @rbuf << chunk\n" ++
-    "    true\n" ++
-    "  end\n" ++
-    "  def read(len = nil)\n" ++
-    "    __check_readable\n" ++
-    "    if len.nil?\n" ++
-    "      @rbuf << \"\" while __fill\n" ++
-    "      out = @rbuf\n" ++
-    "      @rbuf = \"\".b\n" ++
-    "      return out\n" ++
-    "    end\n" ++
-    "    @rbuf << \"\" while @rbuf.bytesize < len && __fill\n" ++
-    "    return nil if @rbuf.empty? && len > 0\n" ++
-    "    out = @rbuf[0, len]\n" ++
-    "    @rbuf = @rbuf[len, @rbuf.bytesize - len] || \"\".b\n" ++
-    "    out\n" ++
-    "  end\n" ++
-    "  def readpartial(maxlen)\n" ++
-    "    __check_readable\n" ++
-    "    __fill if @rbuf.empty?\n" ++
-    "    raise EOFError, \"end of file reached\" if @rbuf.empty?\n" ++
-    "    read(maxlen < @rbuf.bytesize ? maxlen : @rbuf.bytesize)\n" ++
-    "  end\n" ++
-    "  # recv(2) on a stream: what has arrived, up to maxlen, and \"\" at end of\n" ++
+    "  # recv(2) on a stream: what has arrived, up to maxlen, and nil at end of\n" ++
     "  # stream. MSG_PEEK leaves it in the buffer for the next read.\n" ++
     "  def recv(maxlen, flags = 0, outbuf = nil)\n" ++
-    "    __check_readable\n" ++
-    "    __fill if @rbuf.empty?\n" ++
+    "    __fd_reading!\n" ++
+    "    __fd_fill if @__io_rbuf.empty?\n" ++
     "    # a stream at its end answers nil, not \"\" (rsock_s_recvfrom)\n" ++
-    "    return nil if @rbuf.empty? && maxlen > 0\n" ++
-    "    out = @rbuf[0, maxlen] || \"\".b\n" ++
-    "    @rbuf = @rbuf[out.bytesize, @rbuf.bytesize - out.bytesize] || \"\".b if (flags.to_i & Socket::MSG_PEEK) == 0\n" ++
+    "    return nil if @__io_rbuf.empty? && maxlen > 0\n" ++
+    "    out = @__io_rbuf.byteslice(0, maxlen) || \"\".b\n" ++
+    "    __fd_take(out.bytesize) if (flags.to_i & Socket::MSG_PEEK) == 0\n" ++
     "    outbuf ? outbuf.replace(out) : out\n" ++
     "  end\n" ++
     "  def send(data, flags = 0, *dest)\n" ++
     "    write(data)\n" ++
     "  end\n" ++
-    "  def eof?\n" ++
-    "    __check_readable\n" ++
-    "    return false unless @rbuf.empty?\n" ++
-    "    !__fill\n" ++
-    "  end\n" ++
-    "  def gets(sep = \"\\n\")\n" ++
-    "    __check_readable\n" ++
-    "    i = @rbuf.index(sep)\n" ++
-    "    while i.nil?\n" ++
-    "      break unless __fill\n" ++
-    "      i = @rbuf.index(sep)\n" ++
-    "    end\n" ++
-    "    return nil if @rbuf.empty?\n" ++
-    "    if i.nil?\n" ++
-    "      out = @rbuf\n" ++
-    "      @rbuf = \"\".b\n" ++
-    "      out\n" ++
-    "    else\n" ++
-    "      read(i + sep.bytesize)\n" ++
-    "    end\n" ++
-    "  end\n" ++
-    "  def each_line(sep = \"\\n\")\n" ++
-    "    while (line = gets(sep))\n" ++
-    "      yield line\n" ++
-    "    end\n" ++
-    "    self\n" ++
-    "  end\n" ++
     "  def timeout=(sec)\n" ++
-    "    Socket.__timeout(@fd, (sec * 1000).to_i)\n" ++
+    "    Socket.__timeout(@__io_fd, (sec * 1000).to_i)\n" ++
     "    sec\n" ++
     "  end\n" ++
     "  def shutdown(how = Socket::SHUT_RDWR)\n" ++
     "    __check_open\n" ++
     "    h = how.is_a?(Integer) ? how : Socket::Constants.__name_to_int(how, /\\ASHUT_/, /\\ASHUT_/, \"unknown shutdown argument\")\n" ++
     "    raise ArgumentError, \"`how' should be either :SHUT_RD, :SHUT_WR, :SHUT_RDWR\" unless (0..2).include?(h)\n" ++
-    "    if Socket.__shutdown(@fd, h) < 0\n" ++
+    "    if Socket.__shutdown(@__io_fd, h) < 0\n" ++
     "      raise Errno::ENOTCONN, \"shutdown(2)\"\n" ++
     "    end\n" ++
     "    0\n" ++
     "  end\n" ++
-    "  # Each half closes on its own, and closing the second closes the socket.\n" ++
+    "  # rb_io_close_read / rb_io_close_write on a socket: shutdown(2) of that\n" ++
+    "  # half, and closing the second half closes the socket.\n" ++
     "  def close_read\n" ++
     "    __check_open\n" ++
-    "    return close if @write_closed\n" ++
-    "    Socket.__shutdown(@fd, Socket::SHUT_RD)\n" ++
-    "    @read_closed = true\n" ++
+    "    Socket.__shutdown(@__io_fd, Socket::SHUT_RD)\n" ++
+    "    @__io_r = false\n" ++
+    "    return close unless @__io_w\n" ++
     "    nil\n" ++
     "  end\n" ++
     "  def close_write\n" ++
     "    __check_open\n" ++
-    "    return close if @read_closed\n" ++
-    "    Socket.__shutdown(@fd, Socket::SHUT_WR)\n" ++
-    "    @write_closed = true\n" ++
+    "    __fd_flush_w if @__io_w\n" ++
+    "    Socket.__shutdown(@__io_fd, Socket::SHUT_WR)\n" ++
+    "    @__io_w = false\n" ++
+    "    return close unless @__io_r\n" ++
     "    nil\n" ++
-    "  end\n" ++
-    "  def __check_readable\n" ++
-    "    __check_open\n" ++
-    "    raise IOError, \"not opened for reading\" if @read_closed\n" ++
-    "    # read(2) on a listening socket is ENOTCONN; waiting for it to become\n" ++
-    "    # readable would wait for a connection instead\n" ++
-    "    raise Errno::ENOTCONN, \"read(2)\" if @listening\n" ++
     "  end\n" ++
     "  # The kernel's own answer to getsockname(2) / getpeername(2), read from\n" ++
     "  # outside (see Socket::Endpoint__): once a socket is listening or connected\n" ++
     "  # the pair cannot change, so it is asked once.\n" ++
     "  def __endpoints\n" ++
     "    return @__ep if @__ep\n" ++
-    "    ep = Socket::Endpoint__.of(@fd)\n" ++
+    "    ep = Socket::Endpoint__.of(@__io_fd)\n" ++
     "    @__ep = ep if ep && (ep[:remote] || ep[:listening])\n" ++
     "    ep\n" ++
     "  end\n" ++
@@ -5616,9 +5478,9 @@ and stdlib_src = fn (name: str) ->
     "    [data, peeraddr]\n" ++
     "  end\n" ++
     "  def inspect\n" ++
-    "    return \"#<#\{self.class}:(closed)>\" if @closed\n" ++
+    "    return \"#<#\{self.class}:(closed)>\" if closed?\n" ++
     "    a = local_address\n" ++
-    "    \"#<#\{self.class}:fd #\{@fd}, #\{a.ipv6? ? 'AF_INET6' : 'AF_INET'}, #\{a.ip_address}, #\{a.ip_port}>\"\n" ++
+    "    \"#<#\{self.class}:fd #\{@__io_fd}, #\{a.ipv6? ? 'AF_INET6' : 'AF_INET'}, #\{a.ip_address}, #\{a.ip_port}>\"\n" ++
     "  end\n" ++
     "end\n" ++
     "\n" ++
@@ -5628,6 +5490,23 @@ and stdlib_src = fn (name: str) ->
     "    names = [list[0].canonname || host, []]\n" ++
     "    fam = list[0].afamily\n" ++
     "    [names[0], [], fam, *list.map(&:ip_address)]\n" ++
+    "  end\n" ++
+    "  # getaddrinfo(3)'s answers are tried IN TURN, as ruby's connect does\n" ++
+    "  # (fast_fallback only races them): \"localhost\" is ::1 and then 127.0.0.1,\n" ++
+    "  # and a server on 127.0.0.1 is reached on the second. A name only DNS\n" ++
+    "  # knows (the files half has no answer for it) is left to the runtime's\n" ++
+    "  # own resolver, which tries its first address.\n" ++
+    "  def self.__connect_any(host, port)\n" ++
+    "    addrs = begin\n" ++
+    "      Addrinfo.__getaddrinfo(host, nil, 0, Socket::SOCK_STREAM, 0, 0, false).map(&:ip_address).uniq\n" ++
+    "    rescue SocketError\n" ++
+    "      [host.to_s]\n" ++
+    "    end\n" ++
+    "    addrs.each do |a|\n" ++
+    "      fd = Socket.__connect(a, port)\n" ++
+    "      return fd if fd >= 0\n" ++
+    "    end\n" ++
+    "    -1\n" ++
     "  end\n" ++
     "  # A connect here is the runtime's blocking connect(2): it cannot be given\n" ++
     "  # a deadline. A deadline of zero is the one that is known in advance -- no\n" ++
@@ -5639,9 +5518,9 @@ and stdlib_src = fn (name: str) ->
     "    @port = port\n" ++
     "    t = open_timeout || connect_timeout\n" ++
     "    raise IO::TimeoutError, \"user specified timeout for #\{host}:#\{port}\" if t && t <= 0\n" ++
-    "    fd = Socket.__connect(host.to_s, Addrinfo.__port_of(port, \"tcp\"))\n" ++
+    "    fd = TCPSocket.__connect_any(host, Addrinfo.__port_of(port, \"tcp\"))\n" ++
     "    if fd < 0\n" ++
-    "      raise Errno::ECONNREFUSED, \"connect(2) for #\{host}:#\{port}\"\n" ++
+    "      raise Errno::ECONNREFUSED, \"connect(2) for #\{host.inspect} port #\{port}\"\n" ++
     "    end\n" ++
     "    __setup(fd)\n" ++
     "    Socket::Endpoint__.check_local(self, local_host, local_port) if local_host || local_port\n" ++
@@ -5670,7 +5549,7 @@ and stdlib_src = fn (name: str) ->
     "  def accept\n" ++
     "    __check_open\n" ++
     "    __wait_readable\n" ++
-    "    fd = Socket.__accept(@fd)\n" ++
+    "    fd = Socket.__accept(@__io_fd)\n" ++
     "    raise SocketError, \"accept failed\" if fd < 0\n" ++
     "    TCPSocket.for_fd(fd)\n" ++
     "  end\n" ++
@@ -5685,7 +5564,7 @@ and stdlib_src = fn (name: str) ->
     "  def sysaccept\n" ++
     "    __check_open\n" ++
     "    __wait_readable\n" ++
-    "    fd = Socket.__accept(@fd)\n" ++
+    "    fd = Socket.__accept(@__io_fd)\n" ++
     "    raise SocketError, \"accept failed\" if fd < 0\n" ++
     "    fd\n" ++
     "  end\n" ++
@@ -5712,9 +5591,7 @@ and stdlib_src = fn (name: str) ->
     "    __check_open\n" ++
     "    fd = Socket.__udp_open(host.to_s, Addrinfo.__port_of(port, \"udp\"))\n" ++
     "    raise Errno::ECONNREFUSED, \"connect(2) for #\{host}:#\{port}\" if fd < 0\n" ++
-    "    Socket.__close(@fd)\n" ++
-    "    @fd = fd\n" ++
-    "    @__ep = nil\n" ++
+    "    __move_to(fd)\n" ++
     "    0\n" ++
     "  end\n" ++
     "  def send(mesg, flags = 0, host = nil, port = nil)\n" ++
@@ -5722,7 +5599,7 @@ and stdlib_src = fn (name: str) ->
     "    if host\n" ++
     "      raise NotImplementedError, \"UDPSocket#send to an address is not implemented (sendto(2) takes a sockaddr)\"\n" ++
     "    end\n" ++
-    "    n = Socket.__udp_send(@fd, mesg.to_s)\n" ++
+    "    n = Socket.__udp_send(@__io_fd, mesg.to_s)\n" ++
     "    raise Errno::EDESTADDRREQ, \"send(2)\" if n < 0\n" ++
     "    n\n" ++
     "  end\n" ++
@@ -5732,7 +5609,7 @@ and stdlib_src = fn (name: str) ->
     "  def recv(maxlen, flags = 0, outbuf = nil)\n" ++
     "    __check_open\n" ++
     "    __wait_readable\n" ++
-    "    d = Socket.__udp_recv(@fd, maxlen)\n" ++
+    "    d = Socket.__udp_recv(@__io_fd, maxlen)\n" ++
     "    raise Errno::EAGAIN, \"recvfrom(2)\" if d.nil?\n" ++
     "    outbuf ? outbuf.replace(d) : d\n" ++
     "  end\n" ++
@@ -5924,9 +5801,8 @@ and stdlib_src = fn (name: str) ->
     "    port = @bind_addr ? @bind_addr.ip_port : 0\n" ++
     "    if port != 0 || @socktype != Socket::SOCK_STREAM\n" ++
     "      fd = Socket::Endpoint__.listen_on(@family, port, backlog)\n" ++
-    "      Socket.__close(@fd)\n" ++
-    "      @fd = fd\n" ++
-    "    elsif Socket.__listenfd(@fd, backlog) < 0\n" ++
+    "      __move_to(fd)\n" ++
+    "    elsif Socket.__listenfd(@__io_fd, backlog) < 0\n" ++
     "      raise Errno::EOPNOTSUPP, \"listen(2)\"\n" ++
     "    end\n" ++
     "    @__ep = nil\n" ++
@@ -5946,9 +5822,7 @@ and stdlib_src = fn (name: str) ->
     "      Socket.__connect(ai.ip_address, ai.ip_port)\n" ++
     "    end\n" ++
     "    raise Errno::ECONNREFUSED, \"connect(2) for #\{ai.inspect_sockaddr}\" if fd < 0\n" ++
-    "    Socket.__close(@fd)\n" ++
-    "    @fd = fd\n" ++
-    "    @__ep = nil\n" ++
+    "    __move_to(fd)\n" ++
     "    Socket::Endpoint__.check_local(self, @bind_addr.ip_address, 0) if @bind_addr\n" ++
     "    0\n" ++
     "  end\n" ++
@@ -5959,7 +5833,7 @@ and stdlib_src = fn (name: str) ->
     "    __check_open\n" ++
     "    raise Errno::EINVAL, \"accept(2)\" unless @listening\n" ++
     "    __wait_readable\n" ++
-    "    fd = Socket.__accept(@fd)\n" ++
+    "    fd = Socket.__accept(@__io_fd)\n" ++
     "    raise SocketError, \"accept failed\" if fd < 0\n" ++
     "    s = Socket.allocate\n" ++
     "    s.__setup(fd, @socktype)\n" ++
@@ -5984,8 +5858,8 @@ and stdlib_src = fn (name: str) ->
     "    [recv(maxlen, flags), remote_address]\n" ++
     "  end\n" ++
     "  def inspect\n" ++
-    "    return \"#<Socket:(closed)>\" if @closed\n" ++
-    "    \"#<Socket:fd #\{@fd}>\"\n" ++
+    "    return \"#<Socket:(closed)>\" if closed?\n" ++
+    "    \"#<Socket:fd #\{@__io_fd}>\"\n" ++
     "  end\n" ++
     "\n" ++
     "  def self.tcp(host, port, local_host = nil, local_port = nil, connect_timeout: nil, resolv_timeout: nil, open_timeout: nil, fast_fallback: true)\n" ++
@@ -7195,7 +7069,7 @@ and stdlib_src = fn (name: str) ->
     "      @level == l && @type == t\n" ++
     "    end\n" ++
     "    def self.unix_rights(*ios)\n" ++
-    "      ios.each \{ |io| raise TypeError, \"IO expected\" unless io.is_a?(IO) || io.is_a?(BasicSocket) }\n" ++
+    "      ios.each \{ |io| raise TypeError, \"IO expected\" unless io.is_a?(IO) }\n" ++
     "      a = __new(Socket::AF_UNIX, Socket::SOL_SOCKET, Socket::SCM_RIGHTS, ios.map(&:fileno).pack(\"i*\"))\n" ++
     "      a.instance_variable_set(:@unix_rights, ios)\n" ++
     "      a\n" ++

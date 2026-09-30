@@ -939,14 +939,26 @@ constants directories went from 0 of 64 files to 64 of 64 on that alone.
 The SOCKET half is what can be done without handing the kernel a
 `struct sockaddr *`, which no extern here can spell:
 
+- **A socket is an IO.** `BasicSocket < IO`, and a socket's stream methods
+  are the prelude's descriptor layer -- the read buffer, write buffer and
+  readiness loop an `IO.pipe` end has -- over fd_read / fd_write of the
+  descriptor the tcp functions hand out (they are plain descriptors). Two
+  answers are coarser than ruby's because fd_read and fd_write report -1
+  without errno: a write the kernel refuses is always Errno::EPIPE (ruby
+  can also say ECONNRESET), and a connection the peer RESET reads as end of
+  file where ruby raises Errno::ECONNRESET.
 - **TCP, either family.** `TCPSocket`/`Socket#connect` go through
-  `tcp_connect` (the C library resolves, so a name works there); a listener
-  on port 0 is socket(2) + listen(2), which binds the wildcard of the family
-  itself; a chosen IPv4 port is `tcp_listen`. `TCPServer.new("127.0.0.1", 0)`
-  is therefore a listener on EVERY interface, and `#addr` / `#local_address`
-  say so -- 0.0.0.0 -- because that is the kernel's answer; ipsocket/addr_spec
-  asks for the requested address back and stays DIFF for it. A chosen port on
-  IPv6 is refused by name.
+  `tcp_connect`. `TCPSocket.new` resolves the host itself and tries each
+  address in turn, as ruby does ("localhost" is ::1, then 127.0.0.1); a name
+  the files half cannot resolve is left to `tcp_connect`'s own resolver,
+  which tries only its first address. A listener on port 0 is socket(2) +
+  listen(2), which binds the wildcard of the family itself; a chosen IPv4
+  port is `tcp_listen`. `TCPServer.new("127.0.0.1", 0)` is therefore a
+  listener on EVERY interface, and `#addr` / `#local_address` say so --
+  0.0.0.0 -- because that is the kernel's answer (and
+  `TCPServer.new("localhost", 0)` says `::`, where ruby, which bound ::1,
+  says `::1`); ipsocket/addr_spec asks for the requested address back and
+  stays DIFF for it. A chosen port on IPv6 is refused by name.
 - **getsockname / getpeername are read from outside**: lsof(8) on macOS,
   /proc on Linux, the same shape File::Stat takes with stat(1). About 35 ms
   per socket, asked once when the pair can no longer change. No lsof and no
@@ -963,8 +975,9 @@ The SOCKET half is what can be done without handing the kernel a
   binds the wildcard with the port asked for, and connect(2) takes the local
   address the route gives -- and a requested local address the kernel did not
   choose is refused after the fact rather than reported as bound.
-- **A read waits in IO's readiness loop**, so under the thread scheduler the
-  peer runs while a reader waits (a bare read(2) would stop the process).
+- **A read waits in IO's readiness loop** (the socket is non-blocking, as
+  every ruby 3 socket is), so under the thread scheduler the peer runs while
+  a reader waits (a bare read(2) would stop the process).
 - **`connect` hands back a new descriptor.** The runtime's connect functions
   make their own socket, so `Socket#connect` and `UDPSocket#connect` close the
   one `new` made and carry the new one: `fileno` can change across a connect.

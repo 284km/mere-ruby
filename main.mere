@@ -3091,7 +3091,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let (meths, sup, ocls, ivars) = world in
        let ocl = map_get ocls oid in
        let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
-       if has_meth world ocl op then
+       // a descriptor stream's `<<` is the layer's, as with a method call:
+       // has_meth found IO's File-model #<< for a socket, which is not one
+       if fdio_route_call world oid (if is_sng_cls ocl && (if has_meth world ocl op then false else true) then sng_supername world ocl else ocl) op then
+         invoke world noblk va0 "IO" (fdio_mname op) (Cons (eval_e env world blk b, Nil))
+       else if has_meth world ocl op then
          invoke world noblk va0 ocl op (Cons (eval_e env world blk b, Nil))
        // a builtin-backed class may answer the operator without a method-table
        // entry: Time compares by its instant, and `t1 < t2` has to reach that
@@ -15501,22 +15505,6 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with Cons (VInt port, _) -> VInt (tcp_listen port) | _ -> VInt (0 - 1))
        else if (str_len name == 8 && str_eq name "__accept") then
          (match args with Cons (VInt fd, _) -> VInt (tcp_accept fd) | _ -> VInt (0 - 1))
-       else if (str_len name == 6 && str_eq name "__read") then
-         // a short read is normal; "" means the peer closed (or the read timed
-         // out). The bytes are BINARY -- nothing here knows their encoding.
-         (match args with
-          | Cons (VInt fd, Cons (VInt cap, _)) ->
-            (let p = tcp_arena () in
-             let n = tcp_read fd p (if cap > 65536 then 65536 else cap) in
-             if n <= 0 then (let v = mkstr "" in
-                             let _ = (match v with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in v)
-             else (let v = mkstr (mem_to_str p n) in
-                   let _ = (match v with VStr h -> senc_set h "ASCII-8BIT" | _ -> ()) in v))
-          | _ -> mkstr "")
-       else if (str_len name == 7 && str_eq name "__write") then
-         (match args with
-          | Cons (VInt fd, Cons (VStr h, _)) -> VInt (tcp_put fd (sget h))
-          | _ -> VInt (0 - 1))
        else if (str_len name == 7 && str_eq name "__close") then
          (match args with Cons (VInt fd, _) -> (let _ = tcp_close fd in VNil) | _ -> VNil)
        else if (str_len name == 9 && str_eq name "__timeout") then
@@ -16250,7 +16238,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                then sng_supername world c0 else c0) in
     // a descriptor stream's stream methods are the prelude's IO layer (see
     // fdio_route), ahead of IO's own -- which are the File model's
-    if fdio_route world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
+    if fdio_route_call world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
     else if has_meth world cls name then
       // ⚠ a visibility refusal is a MISSING method as far as #method_missing
       //   is concerned: ruby hands `obj.priv` to the object's method_missing
@@ -21449,7 +21437,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        let cls = map_get ocls id in
        let fcls9 = (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) in
        // a descriptor stream's block methods, as in the plain dispatch
-       if fdio_route world id fcls9 name then invoke world newblk recv "IO" (fdio_mname name) args
+       if fdio_route_call world id fcls9 name then invoke world newblk recv "IO" (fdio_mname name) args
        // ARGF.each with a block: each(nil) yields the whole ARGV/stdin stream
        // as one record; plain each / each_line yields it line by line.
        else if str_eq cls "ARGF" && ((str_len name == 4 && str_eq name "each") || (str_len name == 9 && str_eq name "each_line")) then
@@ -24273,6 +24261,10 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
     // ...and the list method_defined? answers from, which is the same fact
     // asked through a different door. See builtin_pub_meth.
     || builtin_pub_meth cls name
+    // ...and a descriptor stream of an IO SUBCLASS (a socket) answers the
+    // layer's stream methods: the lists above name IO's by the class name, so
+    // `sock.respond_to?(:read)` and a bare `closed?` inside one were false
+    || fdio_route_call world id cls name
     // an exception really does respond to the methods answered for it further
     // in (respond_to?(:message) said false while #message worked, which is the
     // pair of answers a library checks before calling)
@@ -30807,7 +30799,13 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
     (match lv_get env "self" with
      | VObj id ->
        let cls = map_get ocls id in
-       if has_meth world cls name then invoke world noblk (VObj id) cls name args
+       // a descriptor stream's stream method called bare -- `closed?` inside
+       // IPSocket#inspect, `write` inside a socket's own method -- is the
+       // layer's, as it is with a receiver (the dispatcher asks fdio_route_call
+       // first too). has_meth alone found IO's File-model #write, or nothing.
+       if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
+       then invoke world noblk (VObj id) "IO" (fdio_mname name) args
+       else if has_meth world cls name then invoke world noblk (VObj id) cls name args
        // the string form of instance_eval/instance_exec on an object self
        // (e.g. inside an instance_exec block) routes to the prim dispatcher,
        // exactly like the VMain special case below.
@@ -30941,7 +30939,10 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
     (match lv_get env "self" with
      | VObj id ->
        let cls = map_get ocls id in
-       if has_meth world cls name then invoke world noblk (VObj id) cls name args
+       // (a descriptor stream's stream method: see try_self_call_x)
+       if fdio_route_call world id (if is_sng_cls cls && (if has_meth world cls name then false else true) then sng_supername world cls else cls) name
+       then invoke world noblk (VObj id) "IO" (fdio_mname name) args
+       else if has_meth world cls name then invoke world noblk (VObj id) cls name args
        // an Enumerable-mixin method (map/count/inject/...) or a name the
        // object responds to (method_missing) with implicit self routes through
        // the receiver dispatcher, exactly as `self.name` would; a genuinely
@@ -34261,6 +34262,16 @@ and fdio_route = fn world -> fn (id: int) -> fn (cls: str) -> fn (name: str) ->
        map_has iv9 k9 && (match map_get iv9 k9 with VInt fd9 -> fd9 > 2 | _ -> false))
    && has_meth world "IO" (fdio_mname name))
   || (str_eq cls "File" && fdio_line_name name && has_meth world "IO" (fdio_mname name))
+// ...and for a CALL (not a `super`): not when the receiver's class defines
+// the name below IO. A subclass's own method wins over the layer, as it wins
+// over IO's in ruby -- TCPSocket's #inspect is IPSocket's, UDPSocket's #write
+// is send(2) -- while a name only IO (or what IO includes) defines is the
+// layer's. A `super` from such an override is asked with fdio_route alone,
+// so it still lands in the layer.
+and fdio_route_call = fn world -> fn (id: int) -> fn (cls: str) -> fn (name: str) ->
+  fdio_route world id cls name
+  && (str_eq cls "IO" || str_eq cls "File"
+      || str_eq (lookup_anc world (ancestors_of world cls) name) (lookup_anc world (ancestors_of world "IO") name))
 // File.new / File.open called with keyword options: the last argument is a
 // Hash after the path (a positional Hash where a mode goes is a keyword hash
 // here too, which is how the parser passes them)
