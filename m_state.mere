@@ -688,7 +688,28 @@ let set_lex = fn (c: str) -> let _ = map_set lex_cref "c" c in ();
 // eleven to learn about it, and the one that forgot would answer a stale
 // nesting. So the nesting rides INSIDE the cref value, after a \r, and
 // meth_cref_of / meth_nest_of split it back out.
-let lex_pack = fn (u: unit) -> cur_lex () ++ chr 13 ++ cur_nest ();
+// ⚠ ...and the REFINEMENT scope rides in it too, for the same reason: a
+// refinement is lexical, so a method sees the refinements that were active
+// where it was WRITTEN, and every one of those eleven copies has to carry that
+// along with the cref. It is a suffix, chr 14 and the id of the snapshot
+// (see ref_snaps), and it is only written once a program has called `using`
+// at all -- until then the packed value is byte-for-byte what it always was.
+// ref_active lives here rather than beside the rest of the refinement tables
+// because this is the first thing that reads it.
+let ref_active = map_new ();   // "<target>"        -> VClass impl_cls
+// (0 -> 1 once any `using` or refine body has run; see ref_on)
+let ref_flag = map_new ();
+let ref_on = fn (u: unit) -> map_len ref_flag > 0;
+// the id of the snapshot ref_active currently holds (0: none active). It is
+// kept INSIDE the table, under a key no class name can have, so everything
+// that saves and restores ref_active -- a class body, a fiber switch --
+// carries it along without knowing it is there.
+let ref_cur_id = fn (u: unit) ->
+  if map_has ref_active "~rid" then (match map_get ref_active "~rid" with VInt n -> n | _ -> 0) else 0;
+let lex_pack = fn (u: unit) ->
+  if map_len ref_flag == 0 then cur_lex () ++ chr 13 ++ cur_nest ()
+  else (let rid = ref_cur_id () in
+        cur_lex () ++ chr 13 ++ cur_nest () ++ (if rid > 0 then chr 14 ++ str_of_int rid else ""));
 let rec pack_at = fn (v: str) -> fn (i: int) ->
   if i >= str_len v then 0 - 1
   else if str_eq (char_at v i) (chr 13) then i
@@ -696,7 +717,15 @@ let rec pack_at = fn (v: str) -> fn (i: int) ->
 let pack_cref = fn (v: str) ->
   let i = pack_at v 0 in if i < 0 then v else substring v 0 i;
 let pack_nest = fn (v: str) ->
-  let i = pack_at v 0 in if i < 0 then "" else substring v (i + 1) (str_len v);
+  let i = pack_at v 0 in
+  if i < 0 then ""
+  else (let n = substring v (i + 1) (str_len v) in
+        if map_len ref_flag == 0 then n
+        else (let j = str_index_of n (chr 14) in if j < 0 then n else substring n 0 j));
+// the refinement snapshot a packed cref carries (0: none)
+let pack_rf = fn (v: str) ->
+  let j = str_index_of v (chr 14) in
+  if j < 0 then 0 else int_of_str (substring v (j + 1) (str_len v));
 let meth_cref = map_new ();
 // the shared Encoding objects, keyed by canonical name; enc_name maps an
 // Encoding object's handle id -> name so the (world-free) printer can format it.
@@ -932,7 +961,10 @@ let proc_origin = map_new ();
 let refine_cnt = map_new ();   // "<refinery>"      -> VInt count
 let refine_tgt = map_new ();   // "<refinery>#<i>"  -> VStr target class
 let refine_cls = map_new ();   // "<refinery>#<i>"  -> VStr impl_cls class
-let ref_active = map_new ();   // "<target>"        -> VStr impl_cls class
+// (ref_active itself is defined above lex_pack, which reads it)
+// Each distinct table `using` has produced, encoded (see ref_snapshot): the
+// packed cref of a method and the "__rf" slot of an env name one by its id.
+let ref_snaps = map_new ();    // "<id>"            -> VStr the encoded table
 // per-case memo of #deconstruct / #deconstruct_keys results, so a case with
 // several `in` clauses calls the method once (Ruby caches). Keyed by value
 // handle; cleared at the start of each case.
@@ -1463,6 +1495,91 @@ let lv_get = fn env -> fn (n: str) ->
 let lv_set = fn env -> fn (n: str) -> fn (v: Val) ->
   let (found, f) = lv_owner env n in
   map_set (if found then f else env) n v;
+
+// ---- refinement scopes ----------------------------------------------------
+// ⚠ A REFINEMENT IS LEXICAL, and ref_active was one global table that `using`
+// wrote and only a class body put back. So it followed the CALL STACK instead
+// of the source: a method written outside `using` saw the refinement when it
+// was called from inside (ruby/spec's "is not active for code defined outside
+// the current scope" got "foo from refinement"), a method written inside lost
+// it the moment it was called from anywhere else ("is active for method
+// defined in a scope wherever it's called" got "foo"), and a `using` at the
+// top of a `load`ed file stayed on for the rest of the program.
+//
+// The table is still global -- every reader (dispatch, `===`, deconstruct,
+// used_refinements) keeps reading ref_active -- but it is now SWITCHED at the
+// points where the lexical scope changes, to the snapshot that scope was
+// written under:
+//   - a method body: the snapshot its packed cref carries (lex_pack, taken at
+//     `def`), which is also put in the frame as "__rf" for its blocks;
+//   - a block body: the "__rf" its defining env chain holds -- set by `using`
+//     in that env, or by the method / class body the block was written in;
+//   - a class body, a load, an eval: see their call sites.
+// Nothing is switched until a program has called `using` (ref_on), so a
+// program that never does pays one map_len per call and per block.
+
+// the table ref_active holds, as one string: "<target>\1<impl>\2" per entry.
+// A key "@<refinery>" is a LIVE entry -- every refinement that refinery has
+// when the table is installed, which is what a refine body sees (its own
+// module's refinements, including the ones refined after it; see do_refine).
+let ref_snapshot = fn (u: unit) ->
+  let acc = map_new () in
+  let _ = map_set acc 0 "" in
+  let _ = map_iter ref_active (fn (k: str) -> fn (v: Val) ->
+            if str_eq k "~rid" then ()
+            else map_set acc 0 (map_get acc 0 ++ k ++ chr 1 ++ (match v with VClass c -> c | _ -> "") ++ chr 2)) in
+  let id = map_len ref_snaps + 1 in
+  let _ = map_set ref_snaps (str_of_int id) (mkstr (map_get acc 0)) in
+  let _ = map_set ref_active "~rid" (VInt id) in
+  id;
+// every refinement `r` has right now, into ref_active (a live entry)
+let rec ref_live_go = fn (r: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= n then ()
+  else (let k = r ++ "#" ++ str_of_int i in
+        let t = (if map_has refine_tgt k then (match map_get refine_tgt k with VStr h -> sget h | _ -> "") else "") in
+        let c = (if map_has refine_cls k then (match map_get refine_cls k with VStr h -> sget h | _ -> "") else "") in
+        let _ = (if str_eq t "" || str_eq c "" then () else map_set ref_active t (VClass c)) in
+        ref_live_go r (i + 1) n);
+let ref_live = fn (r: str) ->
+  ref_live_go r 0 (if map_has refine_cnt r then (match map_get refine_cnt r with VInt k -> k | _ -> 0) else 0);
+// make ref_active the snapshot `id` (0: no refinement active). A no-op when
+// it already is, which is the common case: most calls stay in one scope.
+let ref_install = fn (id: int) ->
+  if id == ref_cur_id () then ()
+  else
+    (let _ = map_clear ref_active in
+     if id == 0 then ()
+     else
+       (let enc = (if map_has ref_snaps (str_of_int id)
+                   then (match map_get ref_snaps (str_of_int id) with VStr h -> sget h | _ -> "") else "") in
+        let ents = str_split enc (chr 2) in
+        // the fixed entries first, then the live ones over them: a refine
+        // body's own module wins over what was active around it
+        let _ = list_iter ents (fn (e: str) ->
+                  let j = str_index_of e (chr 1) in
+                  if j <= 0 || str_eq (char_at e 0) "@" then ()
+                  else map_set ref_active (substring e 0 j) (VClass (substring e (j + 1) (str_len e)))) in
+        let _ = list_iter ents (fn (e: str) ->
+                  let j = str_index_of e (chr 1) in
+                  if j <= 1 || (if str_eq (char_at e 0) "@" then false else true) then ()
+                  else (let r = substring e 1 j in
+                        let _ = map_set ref_active ("@" ++ r) VNil in
+                        ref_live r)) in
+        map_set ref_active "~rid" (VInt id)));
+// the snapshot an env's lexical scope was written under
+let ref_env_id = fn env -> (match lv_get env "__rf" with VInt n -> n | _ -> 0);
+// entering a method body (its packed cref) / a block body (its env): install
+// its table and answer the one to put back on the way out
+let ref_enter_meth = fn frame -> fn (crefv: str) ->
+  let prev = ref_cur_id () in
+  let id = pack_rf crefv in
+  let _ = (if id > 0 then map_set frame "__rf" (VInt id) else ()) in
+  let _ = ref_install id in
+  prev;
+let ref_enter_env = fn env ->
+  let prev = ref_cur_id () in
+  let _ = ref_install (ref_env_id env) in
+  prev;
 // flatten a chain into one detached map (inner shadows outer). `binding` and
 // the env copies that install a different self must not write back through
 // the chain, so the flattened copy carries no parent link.
