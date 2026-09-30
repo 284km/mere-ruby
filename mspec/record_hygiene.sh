@@ -29,7 +29,7 @@ root="$(cd "$here/.." && pwd)"
 if [ "$#" -gt 0 ]; then
   files="$*"
 else
-  files=$(cd "$root" && git ls-files 'mspec/*.txt' 'CAUSES.md' 'EXAMPLES.md' 'SPEC_STATUS.md' 'bootstraptest/*.txt' 2>/dev/null | sed "s|^|$root/|")
+  files=$(cd "$root" && git ls-files 'mspec/*.txt' 'CAUSES.md' 'EXAMPLES.md' 'SPEC_STATUS.md' 'SPEC_STATUS_STDLIB.md' 'bootstraptest/*.txt' 2>/dev/null | sed "s|^|$root/|")
 fi
 [ -n "$files" ] || { echo "no records to check" >&2; exit 2; }
 rc=0
@@ -115,9 +115,15 @@ badenc=$(for f in $files; do
 # DIFF moves, and goes red only when the two files stop describing one run.
 # Refused, not skipped, when the summary is absent: a check that quietly does
 # nothing when its oracle is missing is the same green as a check that passed.
-status="$root/SPEC_STATUS.md"
+# Two records have this shape: SPEC_STATUS.md with mspec/tags/ (what ships),
+# and SPEC_STATUS_STDLIB.md with mspec/tags_stdlib/ (the library groups swept
+# with CRuby's stdlib on RUBYLIB, scoreboard.sh SPEC_WITH_STDLIB=1). Each pair
+# is asked the same questions; the second only when it exists.
+check_pair() {
+sname="$1"; tname="$2"
+status="$root/$sname"
 if [ ! -f "$status" ]; then
-  echo "NO SUMMARY  SPEC_STATUS.md is missing, so the rows in mspec/tags/ cannot be"
+  echo "NO SUMMARY  $sname is missing, so the rows in mspec/$tname/ cannot be"
   echo "            checked for completeness against anything."
   rc=1
 else
@@ -146,9 +152,9 @@ else
         printf "        %s: SPEC_STATUS says %d/%d/%d/%d (diff/crash/skip/slow), %s.txt has %d/%d/%d/%d\n", \
                g, d, c, sk, sl, f, hd, hc, hsk, hsl
     }
-  ' tags="$root/mspec/tags" "$status")
+  ' tags="$root/mspec/$tname" "$status")
   if [ -n "$mismatch" ]; then
-    echo "PARTIAL  a record disagrees with SPEC_STATUS.md (a killed sweep truncates the rows"
+    echo "PARTIAL  a record disagrees with $sname (a killed sweep truncates the rows"
     echo "         it was mid-way through; the summary is written last and still reads full):"
     echo "$mismatch"
     rc=1
@@ -171,17 +177,20 @@ else
   # so the row reads as a tag file with no row (here) and as a group the
   # default sweep never refreshes (scoreboard.sh, same expression).
   expected=$(sed -n 's/^| \([a-zA-Z][a-zA-Z_0-9/-]*\) |.*/\1/p' "$status" | tr '/' '_')
-  orphan=$(for t in "$root"/mspec/tags/*.txt; do
+  orphan=$(for t in "$root"/mspec/"$tname"/*.txt; do
              [ -e "$t" ] || continue
              b=$(basename "$t" .txt)
              printf '%s\n' "$expected" | grep -qxF "$b" || echo "        $b.txt"
            done)
   if [ -n "$orphan" ]; then
-    echo "ORPHAN  a record in mspec/tags/ has no row in SPEC_STATUS.md:"
+    echo "ORPHAN  a record in mspec/$tname/ has no row in $sname:"
     echo "$orphan"
     rc=1
   fi
 fi
+}
+check_pair SPEC_STATUS.md tags
+[ -f "$root/SPEC_STATUS_STDLIB.md" ] && check_pair SPEC_STATUS_STDLIB.md tags_stdlib
 
 # ...and the DOCUMENTS, for one failure they share with records: saying two
 # things at once. LOOP.md is append-only by design, and three successive edits

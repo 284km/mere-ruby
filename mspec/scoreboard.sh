@@ -51,6 +51,25 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="${1:?usage: scoreboard.sh <spec-root> [dir ...]}"
 shift
 dirs="$*"
+# ⚠ TWO RECORDS, TWO QUESTIONS. SPEC_STATUS.md asks what mere-ruby does with
+# what it SHIPS: $LOAD_PATH starts empty, so a spec for a pure-Ruby library that
+# is not compiled in (uri, erb, open3, net/http ...) is a LoadError there, and
+# those groups never had a row -- 781 files of library/ that no sweep asked
+# about (measured 2026-09-30, note 259). SPEC_WITH_STDLIB=1 asks the other
+# question: those groups with the REFERENCE's stdlib and bundled gems on
+# RUBYLIB, as gemtest's "with a stdlib" column does. It is recorded apart
+# (SPEC_STATUS_STDLIB.md, mspec/tags_stdlib/) so that neither table's number
+# means something different from row to row. RUBYLIB reaches both sides, and
+# the reference loses nothing by being shown its own library.
+if [ "${SPEC_WITH_STDLIB:-0}" = 1 ]; then
+  rec_status="SPEC_STATUS_STDLIB.md"; rec_tags="tags_stdlib"
+  sb_stdlib="$("$REF_RUBY_BIN" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
+  [ -n "$sb_stdlib" ] || { echo "scoreboard.sh: could not ask $REF_RUBY_BIN for its rubylibdir" >&2; exit 2; }
+  RUBYLIB="$sb_stdlib${RUBYLIB:+:$RUBYLIB}"
+  export RUBYLIB
+else
+  rec_status="SPEC_STATUS.md"; rec_tags="tags"
+fi
 # Which checkout this is, for the footer: the remote and the revision, so the
 # next reader can tell whether a moved number is the interpreter or the suite.
 spec_subject="$( (cd "$root" 2>/dev/null && printf '%s@%s' \
@@ -67,16 +86,16 @@ if [ -z "$dirs" ]; then
   # the 152 rows from the default sweep (every digest/* and win32ole/* and
   # openssl/x509/*, plus library/base64 and library/English), so those rows
   # kept whatever an older run had put there.
-  dirs="$(sed -n 's/^| \([a-zA-Z][a-zA-Z_0-9/-]*\) |.*/\1/p' "$here/../SPEC_STATUS.md" 2>/dev/null | grep -v '^group$' | tr '\n' ' ')"
+  dirs="$(sed -n 's/^| \([a-zA-Z][a-zA-Z_0-9/-]*\) |.*/\1/p' "$here/../$rec_status" 2>/dev/null | grep -v '^group$' | tr '\n' ' ')"
   [ -n "$dirs" ] || dirs="language"
 fi
-tagdir="$here/tags"
+tagdir="$here/$rec_tags"
 mkdir -p "$tagdir"
 # write to a per-pid temp and move into place at the end, so two runs never
 # interleave their writes into SPEC_STATUS.md (they would produce a garbled,
 # doubled table otherwise).
-status="$here/../SPEC_STATUS.md.$$"
-status_final="$here/../SPEC_STATUS.md"
+status="$here/../$rec_status.$$"
+status_final="$here/../$rec_status"
 
 # The spec root is passed in on the command line and was recorded NOWHERE, so a
 # sweep against a DIFFERENT ruby/spec checkout produced rows that read as
@@ -229,7 +248,18 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   vline="$(printf '%s' "$out" | tail -1)"
   verdict="${vline%%	*}"
   if [ "$vline" = "$verdict" ]; then vcause="-"; else vcause="${vline#*	}"; fi
-  if [ "$verdict" = "MATCH" ]; then printf 'MATCH\t-\n'; return; fi
+  # ⚠ A MATCH IN WHICH THE REFERENCE RAN NOTHING MEASURES NOTHING. Two sides
+  # that both print "pass=0 fail=0 err=0" agree, and win32ole's 54 files --
+  # every example behind a platform guard -- read as 54 MATCHes (note 259).
+  # That is ruby not running the file here, which is what SKIP says.
+  if [ "$verdict" = "MATCH" ]; then
+    if printf '%s' "$out" | sed -n '/--- ruby:/,$p' | grep -a 'pass=' | tail -1 | grep -q '^pass=0 fail=0 err=0$'; then
+      printf 'SKIP\t-\n'
+    else
+      printf 'MATCH\t-\n'
+    fi
+    return
+  fi
   # run_spec.sh says SLOW when one of ITS bounds fired: the file works and was
   # stopped, which is not the same finding as aborting. Its cause says WHICH --
   # over the CPU budget (a fact about the file) or stuck with the budget unspent
@@ -281,7 +311,8 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo "- **MATCH** identical output under mere-ruby and ruby"
   echo "- **DIFF** runs on both, output differs (fidelity gap — often an error message or a frozen check)"
   echo "- **CRASH** mere-ruby aborts ON ITS OWN where ruby does not (missing feature)"
-  echo "- **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable)"
+  echo "- **SKIP** ruby itself does not run it here (mock/subprocess/platform — unmeasurable),"
+  echo "  including a file whose examples are all behind a guard: both sides ran zero, which agrees and measures nothing"
   echo "- **SLOW** stopped by one of this harness's bounds — CPU seconds, wall clock or bytes —"
   echo "  and so working, not aborting. The row in \`mspec/tags/\` names which bound answered."
   echo
@@ -297,6 +328,13 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo "the 368 files were ones whose newly compared examples differed, not behaviour that"
   echo "was lost. (From 2026-09-30 the shim's suppress_warning silences \`\$VERBOSE\` and the"
   echo "environment carries RUBY_EXE / RUBY_FLAGS, as mspec's do.)"
+  if [ "$rec_status" = "SPEC_STATUS_STDLIB.md" ]; then
+    echo
+    echo "⚠ **This is the second record.** These groups are swept with the reference's stdlib and"
+    echo "bundled gems on RUBYLIB (\`SPEC_WITH_STDLIB=1 mspec/scoreboard.sh\`): pure-Ruby libraries"
+    echo "that mere-ruby does not compile in, run from CRuby's own source. SPEC_STATUS.md, without"
+    echo "them, is what ships; the two are not added together."
+  fi
   echo "| group | MATCH | DIFF | CRASH | SKIP | SLOW | total |"
   echo "|---|---|---|---|---|---|---|"
 } > "$status"
