@@ -4137,3 +4137,22 @@ so by changing what every other row compares, for one file.
 
 **What fixing it would take.** Nothing in mere-ruby. The file is correct
 on both sides (zero failures); read the row as unmeasurable.
+
+## `Refinement#import_methods(Zlib)` imports nothing instead of refusing
+
+```ruby
+Module.new { refine(String) { import_methods Zlib } }
+# ruby:      ArgumentError "Can't import method which is not defined with Ruby code: Zlib#adler32"
+# mere-ruby: no error, and nothing imported
+```
+
+import_methods refuses a module whose instance methods are not Ruby code,
+and it finds them by asking the module for them (`instance_methods(false)`
+and `private_instance_methods(false)`) and looking for a body behind each
+name. That is how `import_methods Kernel` raises. Zlib's module functions,
+though, are answered by the Zlib receiver's own dispatcher and are not
+PRIVATE INSTANCE METHODS of Zlib here -- `Zlib.private_instance_methods(false)`
+is `[]` where ruby lists six -- so there is no name to refuse, and the module
+looks like one with nothing in it. Fixing it is making Zlib's module
+functions enumerable (the same gap as "Reflection cannot ENUMERATE a builtin
+class's methods"), not a change to import_methods.
