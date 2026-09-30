@@ -4228,3 +4228,23 @@ real reason.
 **What fixing it would take.** A faster Etc.getgrgid (a cache is not
 faithful: groups can change under a running process). Read this row as
 "passes, and sometimes too slowly to be told".
+
+## RbConfig::CONFIG has the facts, not the build (library/rbconfig_spec stays DIFF)
+
+The keys that are facts about the ruby mere-ruby reports being are answered:
+MAJOR / MINOR / TEENY / PATCHLEVEL, RUBY_PROGRAM_VERSION, RUBY_API_VERSION,
+RUBY_BASE_NAME, and the cpu / os / vendor parts of RUBY_PLATFORM (host_*,
+target_*), with `prefix` equal to RbConfig::TOPDIR. What is not answered is
+CRuby's BUILD: its compiler, flags, library names and installation paths
+(254 keys in 4.0.6; this has 26).
+
+**Why it is still here.** There is no build of CRuby to describe. Copying a
+reference installation's table would put one machine's paths and compiler
+flags into every mere-ruby, and would be wrong on the next machine.
+rbconfig_spec's first example asserts once per key, so its expectation count
+follows the size of the table and the file cannot MATCH without copying all
+254 -- a count, like core/thread/list_spec's, not a defect. The four examples
+left read the installation's directories (rubylibdir exists, archdir holds
+etc.bundle, sitelibdir is on $LOAD_PATH), which mere-ruby does not have.
+
+**What fixing it would take.** An installation layout of mere-ruby's own.
