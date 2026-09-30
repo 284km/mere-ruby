@@ -351,7 +351,7 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
 # to be identical -- if a spec ever leaves something behind, that check is
 # where it shows.
 sb_mktree() {  # $1 = where to build it
-  for sb_d0 in core language library shared fixtures; do
+  for sb_d0 in core language library command_line shared fixtures; do
     [ -d "$root/$sb_d0" ] || continue
     cp -Rc "$root/$sb_d0" "$1/$sb_d0" 2>/dev/null || cp -R "$root/$sb_d0" "$1/$sb_d0"
   done

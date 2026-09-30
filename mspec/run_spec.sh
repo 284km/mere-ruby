@@ -56,7 +56,7 @@ elif [ -n "$specroot" ]; then
   # which is the instrument's answer and not the subject's -- mere-ruby ships
   # set, pathname, digest, csv, zlib, socket, stringio and more, and
   # library/pathname/absolute_spec is MATCH the moment the directory is there.
-  for d in core language library shared fixtures; do
+  for d in core language library command_line shared fixtures; do
     [ -d "$specroot/$d" ] || continue
     cp -Rc "$specroot/$d" "$tmp/$d" 2>/dev/null || cp -R "$specroot/$d" "$tmp/$d"
   done
