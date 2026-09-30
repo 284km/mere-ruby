@@ -290,13 +290,14 @@ everything, an `ensure` body consuming the exception it ran under, and
 Against a sample of 29 installed gems — of which the reference ruby itself
 loads **23** here (two need a Rails application to exist, three need a gem
 this gem home lacks, one needs protobuf's C extension) —
-`gemtest/run.sh` loads **19** with a CRuby stdlib on `-I` and **18** on
-what mere-ruby ships (measured 2026-09-30). With the stdlib, the four that do
-not are two boundaries: `json/ext/parser` three times (aws-sdk-s3,
-openapi_parser, sidekiq-pro -- json's parser and generator are C extensions,
-and mere-ruby does not answer them yet) and `OpenSSL::SSL::SSLSocket` once
-(excon; a TLS stack is out of scope, above). Without the stdlib, `json` itself
-is missing for the same three, and `ipaddr` for excon and http-cookie.
+`gemtest/run.sh` loads **21** with a CRuby stdlib on `-I` and **19** on
+what mere-ruby ships (measured 2026-10-01). With the stdlib, the two that do
+not both stop at OpenSSL (aws-sdk-s3's `OpenSSL::SSL::SSLError`, excon's
+`SSLSocket`; a TLS stack is out of scope, above). Without it, the pure-Ruby
+libraries mere-ruby does not ship are what is missing: `net/protocol`
+(aws-sdk-s3), `ipaddr` (excon, http-cookie) and `open-uri` (openapi_parser).
+`json` is answered by the interpreter (json 2.18's own Ruby files, and its
+C parser and generator in Mere), which is what moved three of them.
 
 ⚠ **This number fell from 21 to 4 with no gate noticing**, and the cause was
 one line: the source was cut at its first NUL byte anywhere, and rubygems
