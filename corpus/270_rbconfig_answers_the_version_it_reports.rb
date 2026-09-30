@@ -28,3 +28,11 @@ module RbConfig
   def self.reopened = :yes
 end
 p RbConfig.reopened
+
+# rbconfig/sizeof: the platform's C type sizes and limits
+require "rbconfig/sizeof"
+p RbConfig::SIZEOF["int"], RbConfig::SIZEOF["long"], RbConfig::SIZEOF["void*"]
+p RbConfig::LIMITS["FIXNUM_MAX"] == 2**62 - 1, RbConfig::LIMITS["INT_MAX"]
+
+# a multibyte character literal is one character
+p ?に, [?に, ?a], ?é.bytes

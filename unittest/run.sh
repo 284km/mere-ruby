@@ -63,7 +63,8 @@ fi
 list="$(mktemp)"; trap 'rm -f "$list"' EXIT
 for p in "$@"; do
   if [ -d "$src/test/$p" ]; then
-    (cd "$src/test" && find "$p" -maxdepth 1 \( -name '*_test.rb' -o -name 'test_*.rb' \) -type f | sort) >> "$list"
+    # (test_helper.rb is a helper by that name, not a test file)
+    (cd "$src/test" && find "$p" -maxdepth 1 \( -name '*_test.rb' -o -name 'test_*.rb' \) ! -name 'test_helper.rb' -type f | sort) >> "$list"
   elif [ -f "$src/test/$p" ]; then
     echo "$p" >> "$list"
   else
