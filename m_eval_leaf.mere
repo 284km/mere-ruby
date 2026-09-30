@@ -16771,8 +16771,14 @@ and rxp_flags = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (seen: str) -
     else if str_eq c "i" || str_eq c "m" || str_eq c "x" then
       (let fl2 = (if neg then rxp_flag_del fl c else (if str_contains fl c then fl else fl ++ c)) in
        rxp_flags pat (p + 1) fl2 (seen ++ c) neg)
-    // a/d/u (char-class semantics selectors) are accepted and ignored.
-    else if str_eq c "a" || str_eq c "d" || str_eq c "u" then rxp_flags pat (p + 1) fl seen neg
+    // a/d/u select what \w \d \s \b and the POSIX brackets mean: (?a) ASCII
+    // only, (?u) Unicode for all of them, (?d) ruby's default (\w \d \s
+    // ASCII, the brackets and \b Unicode). They were accepted and ignored,
+    // so `/(?u)\w+/` stopped at "あ". Kept as "A" / "U" in the flags: the
+    // lowercase letters are the literal's encoding options elsewhere.
+    else if str_eq c "a" || str_eq c "d" || str_eq c "u" then
+      (let base = rxp_flag_del (rxp_flag_del fl "A") "U" in
+       rxp_flags pat (p + 1) (if str_eq c "a" then base ++ "A" else if str_eq c "u" then base ++ "U" else base) seen neg)
     else if map_has rx_lenient "n" then rxp_flags pat (p + 1) fl seen neg
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unknown inline flag")) in fail "mere-ruby: regexp: unknown inline flag")
 and rxp_flag_del = fn (fl: str) -> fn (c: str) ->
@@ -16820,39 +16826,57 @@ and rxp_name = fn (pat: str) -> fn (p: int) -> fn (term: str) -> fn (acc: str) -
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unterminated group name")) in fail "mere-ruby: regexp: unterminated group name")
   else if str_eq (char_at pat p) term then (acc, p + 1)
   else rxp_name pat (p + 1) term (acc ++ char_at pat p)
-and rxp_class = fn (pat: str) -> fn (p: int) ->
+and rxp_class = fn (pat: str) -> fn (p: int) -> fn (fl: str) ->
   let (neg, p2) = (if p < str_len pat && str_eq (char_at pat p) "^" then (true, p + 1) else (false, p)) in
-  rxp_class_items pat p2 neg Nil true
-and rxp_class_items = fn (pat: str) -> fn (p: int) -> fn (neg: bool) -> fn (acc: RCls list) -> fn (first: bool) ->
+  rxp_class_items pat p2 fl neg Nil true
+and rxp_class_items = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (neg: bool) -> fn (acc: RCls list) -> fn (first: bool) ->
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: premature end of char-class")) in fail "mere-ruby: regexp: premature end of char-class")
   else
     let c = char_at pat p in
     if str_eq c "]" && (if first then false else true) then (rev_app acc Nil, neg, p + 1)
     else if str_eq c "[" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) ":" then
       (let (nm, negp, p2) = rxp_posix pat (p + 2) in
-       rxp_class_items pat p2 neg (Cons (CPosix (nm, negp), acc)) false)
+       let bit = uprop_posix_bit nm in
+       // ⚠ an unknown name is refused, as ruby does ("invalid POSIX bracket
+       //   type"); it reached the matcher and failed there, per character.
+       let _ = (if bit < 0 then rxp_refuse "invalid POSIX bracket type" else ()) in
+       let _ = rxp_no_range_from pat p2 in
+       rxp_class_items pat p2 fl neg (Cons ((if str_contains fl "A" then CPosix (nm, negp) else CUProp (1, bit, negp)), acc)) false)
     else if str_eq c "[" && p + 1 < str_len pat && str_eq (char_at pat (p + 1)) "]" then
       // "[]" — a literal '[' then closing... treat '[' as a literal member.
-      rxp_class_items pat (p + 1) neg (Cons (CChr "[", acc)) false
+      rxp_class_items pat (p + 1) fl neg (Cons (CChr "[", acc)) false
     else
-      let (lo, p2) = rxp_class_atom pat p in
+      let (lo, p2) = rxp_class_atom pat p fl in
       (match lo with
        | CChr ch ->
          if p2 + 1 <= str_len pat && p2 < str_len pat && str_eq (char_at pat p2) "-"
             && p2 + 1 < str_len pat && (if str_eq (char_at pat (p2 + 1)) "]" then false else true) then
-           (let (hi, p3) = rxp_class_atom pat (p2 + 1) in
+           (let _ = (if str_eq (char_at pat (p2 + 1)) "[" && p2 + 2 < str_len pat && str_eq (char_at pat (p2 + 2)) ":"
+                     then rxp_refuse "char-class value at end of range" else ()) in
+            let (hi, p3) = rxp_class_atom pat (p2 + 1) fl in
             match hi with
-            | CChr ch2 -> rxp_class_items pat p3 neg (Cons (CRange (ch, ch2), acc)) false
-            | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: bad class range")) in fail "mere-ruby: regexp: bad class range"))
-         else rxp_class_items pat p2 neg (Cons (lo, acc)) false
-       | _ -> rxp_class_items pat p2 neg (Cons (lo, acc)) false)
-and rxp_class_atom = fn (pat: str) -> fn (p: int) ->
+            | CChr ch2 -> rxp_class_items pat p3 fl neg (Cons (CRange (ch, ch2), acc)) false
+            | _ -> (let _ = rxp_refuse "char-class value at end of range" in fail "char-class value at end of range"))
+         else rxp_class_items pat p2 fl neg (Cons (lo, acc)) false
+       | _ -> (let _ = rxp_no_range_from pat p2 in rxp_class_items pat p2 fl neg (Cons (lo, acc)) false))
+// ruby's words for a set used as the START of a range (`[\d-z]`,
+// `[[:alpha:]-[:digit:]]`): a range needs a character at each end, and the
+// `-` was taken as a literal member instead.
+and rxp_no_range_from = fn (pat: str) -> fn (p: int) ->
+  if p + 1 < str_len pat && str_eq (char_at pat p) "-" && (if str_eq (char_at pat (p + 1)) "]" then false else true)
+  then rxp_refuse "unmatched range specifier in char-class" else ()
+// (a unit: every caller is a statement, and the tail of `fail` would
+// otherwise take the first caller's type for all of them)
+and rxp_refuse = fn (why: str) ->
+  let __fm = "mere-ruby: regexp: " ++ why in
+  let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in
+  let _ = (fail __fm : unit) in ()
+and rxp_class_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) ->
   let c = char_at pat p in
   if str_eq c "\\" && p + 1 < str_len pat then
     (let e = char_at pat (p + 1) in
-     if str_eq e "d" then (CDigit, p + 2) else if str_eq e "D" then (CNDigit, p + 2)
-     else if str_eq e "w" then (CWord, p + 2) else if str_eq e "W" then (CNWord, p + 2)
-     else if str_eq e "s" then (CSpace, p + 2) else if str_eq e "S" then (CNSpace, p + 2)
+     if str_eq e "d" || str_eq e "D" || str_eq e "w" || str_eq e "W" || str_eq e "s" || str_eq e "S" then (rxp_perl_cls e fl, p + 2)
+     else if str_eq e "p" || str_eq e "P" then rxp_prop pat (p + 1)
      else if str_eq e "h" then (CHex, p + 2) else if str_eq e "H" then (CNHex, p + 2)
      else if str_eq e "n" then (CChr "\n", p + 2) else if str_eq e "t" then (CChr "\t", p + 2)
      else if str_eq e "r" then (CChr "\r", p + 2)
@@ -16897,6 +16921,41 @@ and rxp_class_atom = fn (pat: str) -> fn (p: int) ->
   // where every member is such a byte: one of them failed to parse, two
   // "worked", three failed again, which is the parity of a swallowed byte.
   else (let l = rxp_clen pat p in (CChr (substring pat p (p + l)), p + l))
+// \d \D \w \W \s \S: ASCII by default and under (?a) (ruby's \w does not
+// match "à"), the Unicode classes under (?u)
+and rxp_perl_cls = fn (e: str) -> fn (fl: str) ->
+  if str_contains fl "U" then
+    (let nm = (if str_eq e "d" || str_eq e "D" then "digit" else if str_eq e "w" || str_eq e "W" then "word" else "space") in
+     CUProp (1, uprop_posix_bit nm, str_eq e "D" || str_eq e "W" || str_eq e "S"))
+  else if str_eq e "d" then CDigit else if str_eq e "D" then CNDigit
+  else if str_eq e "w" then CWord else if str_eq e "W" then CNWord
+  else if str_eq e "s" then CSpace else CNSpace
+// \p{Name} \p{^Name} \P{Name} (p is at the p): the class item, and the
+// position after the closing brace. The name is resolved by uprop_lookup;
+// ruby refuses a name it does not know ("invalid character property name
+// {Foo}"), and a name it knows that the table has no answer for (a block, an
+// age) is UNSUPPORTED -- valid ruby this engine cannot run, which the
+// literal check lets through and the match refuses (rx_check_go).
+// ⚠ \p with no brace is ruby's literal "p" (with a warning this does not
+//   print), not an error.
+and rxp_prop = fn (pat: str) -> fn (p: int) ->
+  let e = char_at pat p in
+  if p + 1 >= str_len pat || (if str_eq (char_at pat (p + 1)) "\{" then false else true) then (CChr e, p + 1)
+  else
+    (let close = str_find_from pat "}" (p + 2) in
+     let raw = (if close < 0 then "" else substring pat (p + 2) close) in
+     let caret = str_len raw > 0 && str_eq (char_at raw 0) "^" in
+     let nm = (if caret then substring raw 1 (str_len raw) else raw) in
+     let neg = (if caret then (if str_eq e "P" then false else true) else str_eq e "P") in
+     let k = (if close < 0 then "" else uprop_lookup nm) in
+     if str_eq k "" then (let _ = rxp_refuse ("invalid character property name \{" ++ raw ++ "}") in fail "invalid character property name")
+     else if str_eq k "?" then (let _ = rxp_refuse ("unsupported character property \{" ++ raw ++ "}") in fail "unsupported character property")
+     else
+       (let arg = substring k 1 (str_len k) in
+        let t = char_at k 0 in
+        ((if str_eq t "g" then CUProp (0, str_to_int_base arg 16, neg)
+          else if str_eq t "f" then CUProp (1, int_of_str arg, neg)
+          else CUProp (2, int_of_str arg, neg)), close + 1)))
 and rxp_clen = fn (pat: str) -> fn (p: int) ->
   let n = str_len pat in
   let bt = fn (k: int) -> if k < n then ord (char_at pat k) else 0 in
@@ -17117,6 +17176,21 @@ and rxv_slot_get = fn (saves: (int * int) list) -> fn (k: int) ->
   | Cons ((k2, v), rest) -> if k2 == k then v else rxv_slot_get rest k
 and rxv_is_word = fn (c: str) ->
   (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || str_eq c "_"
+// is the character at byte i (or the one ENDING at byte i) a word character
+// for \b? asc: (?a), bytes only.
+and rxv_word_at = fn (s: str) -> fn (i: int) -> fn (asc: bool) ->
+  let c = char_at s i in
+  if asc || ord c < 128 then rxv_is_word c
+  else uprop_has 1 (uprop_posix_bit "word") (utf8_char_at s i)
+and rxv_word_before = fn (s: str) -> fn (i: int) -> fn (asc: bool) ->
+  let c = char_at s (i - 1) in
+  if asc || ord c < 128 then rxv_is_word c
+  else
+    // back over the continuation bytes to the character's lead byte
+    (let rec lead = fn (j: int) ->
+       (if j > 0 && i - j < 4 && ord (char_at s j) >= 128 && ord (char_at s j) < 192 then lead (j - 1) else j) in
+     let j = lead (i - 1) in
+     if j + utf8_clen s j == i then uprop_has 1 (uprop_posix_bit "word") (utf8_char_at s j) else false)
 and rxv_cls_one = fn (it: RCls) -> fn (c: str) ->
   match it with
   | CChr x -> str_eq x c
@@ -17132,6 +17206,9 @@ and rxv_cls_one = fn (it: RCls) -> fn (c: str) ->
   | CPosix (nm, negp) ->
     let r = rxv_posix nm c in
     if negp then (if r then false else true) else r
+  | CUProp (kind, arg, negp) ->
+    let r = uprop_has kind arg c in
+    if negp then (if r then false else true) else r
 and rxv_posix = fn (nm: str) -> fn (c: str) ->
   if str_eq nm "alpha" then (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
   else if str_eq nm "alnum" then (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
@@ -17143,8 +17220,10 @@ and rxv_posix = fn (nm: str) -> fn (c: str) ->
   else if str_eq nm "word" then rxv_is_word c
   else if str_eq nm "blank" then str_eq c " " || str_eq c "\t"
   else if str_eq nm "cntrl" then c < " " || str_eq c (chr 127)
-  else if str_eq nm "print" then c >= " " && (if str_eq c (chr 127) then false else true)
-  else if str_eq nm "graph" then c > " " && (if str_eq c (chr 127) then false else true)
+  // (only (?a) asks these now, and a character past ASCII is none of them:
+  //  "à" sorts after " " as bytes, so it was printable)
+  else if str_eq nm "print" then c >= " " && c < chr 127
+  else if str_eq nm "graph" then c > " " && c < chr 127
   else if str_eq nm "punct" then (c > " " && c < "0") || (c > "9" && c < "A") || (c > "Z" && c < "a" && (if str_eq c "_" then false else true)) || (c > "z" && c <= "~")
   else if str_eq nm "ascii" then c <= chr 127
   else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unknown posix class")) in fail "mere-ruby: regexp: unknown posix class")

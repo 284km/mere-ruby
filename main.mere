@@ -257,10 +257,14 @@ type Flow = FNext of Val | FReturn of Val | FRaise of Val
 // ---- regex AST (compiled engine) -----------------------------------------
 // Character-class atoms. Ranges compare byte strings directly (Mere string
 // comparison is lexicographic on bytes).
+// CPosix is the ASCII-only reading of a POSIX bracket (under (?a)); CUProp is
+// a Unicode property (kind, arg, negated) as uprop_has reads it -- the POSIX
+// brackets by default, `\p{...}`, and \w \d \s under (?u).
 type RCls = CChr of str | CRange of str * str
           | CDigit | CWord | CSpace | CHex
           | CNDigit | CNWord | CNSpace | CNHex
-          | CPosix of str * bool;
+          | CPosix of str * bool
+          | CUProp of int * int * bool;
 // Pattern AST. The i/m/x flags are fully resolved at PARSE time: i turns
 // letters into NCharCI and sets the class ci bit, m turns `.` into NAnyNL,
 // x is consumed by the parser (whitespace/#-comments). Ruby's ^/$ are always
@@ -273,10 +277,12 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
            | NGroup of RNode * int * str           // body, gnum (0 = shy), name
            | NBackref of int * bool                // group, ci
            | NBOL | NEOL | NBOS | NEOS | NEOSNL | NGANCHOR
-           | NWordB of bool
+           | NWordB of bool * bool                  // boundary (not \B), ASCII-only (?a)
            | NLook of RNode * bool | NLookB of RNode * bool   // body, negated
            | NAtomic of RNode                       // (?>...) atomic group
            | NFlagsRest of str
+           | NGrapheme                              // \X: one extended grapheme cluster
+           | NCond of int * RNode * RNode           // (?(g)yes|no)
            | NEmpty;
 // Compiled instructions (a program is an int-key Map "0".."N-1" -> RInst,
 // plus "meta" -> IMeta (count, ngroups) and "name:<x>" -> IMeta (gnum, 0)).
@@ -284,9 +290,10 @@ type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
            | IClass of RCls list * bool * bool
            | ISplit of int * int | IJmp of int | ISave of int
            | IBOL | IEOL | IBOS | IEOS | IEOSNL | IGANCHOR
-           | IWordB of bool | IBackref of int * bool
+           | IWordB of bool * bool | IBackref of int * bool
            | ILook of int * bool | ILookB of int * int * int * bool
-           | IAtomic of int
+           | IAtomic of int | IGrapheme
+           | ICond of int * int                     // group, pc of the no-branch
            | IMark of int | ICheck of int * int
            | IOk | IOkAt | IMatch
            | IMeta of int * int;
@@ -40533,9 +40540,97 @@ and rxp_parse = fn (pat: str) -> fn (fl: str) ->
   let _ = map_clear rx_gnums in
   let _ = map_clear rx_gnall in
   let _ = map_clear rx_gbodies in
+  let _ = map_delete rx_named_mode "ref" in
   let _ = (if rxp_has_named pat 0 false then map_set rx_named_mode "on" 1 else map_delete rx_named_mode "on") in
   let (n, p, g) = rxp_alt pat 0 fl 1 in
-  if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )") else n
+  if p < str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp parse: unmatched )")) in fail "mere-ruby: regexp parse: unmatched )")
+  // ⚠ a reference past the last group is refused once the groups are all
+  //   counted (a FORWARD one, `/\1()/`, is fine): `/(a)\2/` matched nothing
+  //   where ruby says "invalid backref number/name".
+  else if map_has rx_named_mode "ref" && map_get rx_named_mode "ref" > g - 1 then
+    (let _ = rxp_refuse "invalid backref number/name" in n)
+  else n
+
+// \1 .. \999: onigmo's reading of a backslash and digits. The whole number
+// is a BACKREFERENCE when it is at most 9 or names a group already opened
+// (and at most 1000); otherwise \8 and \9 are the digit itself and anything
+// else is an octal escape of up to three digits. Only the first digit was
+// read, so `\10` was group 1 and a "0" -- and ruby's `/\10()()()()()()()()()()/`
+// (a forward \10 is the byte 8) did not match "\x08".
+// ⚠ ...and beside a named group a number is no reference at all ("numbered
+//   backref/call is not allowed"); `/(?<a>a)\1/` matched as group 1.
+and rxp_num_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  let rec digs = fn (j: int) -> fn (acc: int) ->
+    (if j < str_len pat && char_at pat j >= "0" && char_at pat j <= "9"
+     then digs (j + 1) (if acc > 100000 then acc else acc * 10 + int_of_str (char_at pat j)) else (acc, j)) in
+  let (num, p2) = digs p 0 in
+  let c = char_at pat p in
+  if num <= 1000 && (num <= 9 || num <= g - 1) then
+    (if map_has rx_named_mode "on" then
+       (let _ = rxp_refuse "numbered backref/call is not allowed. (use name)" in (NEmpty, p2, g))
+     else (let _ = rxp_note_ref num in (NBackref (num, str_contains fl "i"), p2, g)))
+  else if str_eq c "8" || str_eq c "9" then (NChar c, p + 1, g)
+  else
+    (let rec oct = fn (j: int) -> fn (acc: int) -> fn (k: int) ->
+       (if k > 0 && j < str_len pat && char_at pat j >= "0" && char_at pat j <= "7"
+        then oct (j + 1) (acc * 8 + int_of_str (char_at pat j)) (k - 1) else (acc, j)) in
+     let (v, p3) = oct p 0 3 in
+     if v > 255 then (let _ = rxp_refuse "invalid escape code" in (NEmpty, p3, g))
+     else (NChar (chr v), p3, g))
+// the highest group a reference names, for the check at the end of rxp_parse
+and rxp_note_ref = fn (k: int) ->
+  if map_has rx_named_mode "ref" && map_get rx_named_mode "ref" >= k then () else map_set rx_named_mode "ref" k
+// `\k<name>` / `(?(<name>)...)`: the group a name refers to. A `+` or `-`
+// after its first character starts a LEVEL (`\k<a+0>`, a recursion level):
+// the name is what comes before, so `\k<a+1>` names "a" -- which ruby then
+// refuses when only "a+1" exists. Level 0 is this level, the only one there
+// is without recursion; another level is refused as unsupported.
+and rxp_ref_by_name = fn (nm0: str) ->
+  let rec lvl_at = fn (j: int) ->
+    (if j >= str_len nm0 then 0 - 1
+     else if str_eq (char_at nm0 j) "+" || str_eq (char_at nm0 j) "-" then j else lvl_at (j + 1)) in
+  let li = (if str_len nm0 > 1 then lvl_at 1 else 0 - 1) in
+  let nm = (if li < 0 then nm0 else substring nm0 0 li) in
+  let lvl = (if li < 0 then "0" else substring nm0 (li + 1) (str_len nm0)) in
+  if (if str_eq lvl "" then true else rx_all_digits lvl 0) then
+    (if map_has rx_gnums nm then
+       (if int_of_str lvl == 0 then (match map_get rx_gnums nm with VInt k -> k | _ -> 0)
+        else (let _ = rxp_refuse "unsupported backreference level" in 0))
+     else (let _ = rxp_refuse ("undefined name <" ++ nm ++ "> reference") in 0))
+  else (let _ = rxp_refuse ("invalid group name <" ++ nm0 ++ ">") in 0)
+// (?(cond)yes|no), p just after the second "(": cond is a group number
+// (`1`, `01`), or one delimited as `<1>` / `'1'` / `<-1>` (relative) /
+// `<name>` / `'name'`. A bare name is not a condition ("invalid
+// conditional pattern"), and neither is a third branch. It was skipped
+// whole by the literal check and failed at the match, so `(a)(?(1)a|b)`
+// matched nothing.
+and rxp_cond = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
+  let o = (if p < str_len pat then char_at pat p else "") in
+  let delim = str_eq o "<" || str_eq o "'" in
+  let close = (if str_eq o "<" then ">" else if str_eq o "'" then "'" else ")") in
+  let st = (if delim then p + 1 else p) in
+  let e = str_find_from pat close st in
+  let _ = (if e < 0 then rxp_refuse "invalid conditional pattern" else ()) in
+  let cs = substring pat st e in
+  let p2 = (if delim then e + 2 else e + 1) in
+  let _ = (if delim && (e + 1 >= str_len pat || (if str_eq (char_at pat (e + 1)) ")" then false else true))
+           then rxp_refuse "invalid conditional pattern" else ()) in
+  let tgt =
+    (if delim && rx_num_ref cs then
+       (let t = rx_num_ref_target cs g in
+        if t <= 0 then (let _ = rxp_refuse ("invalid group name <" ++ cs ++ ">") in 0) else t)
+     else if delim then rxp_ref_by_name cs
+     else if str_len cs > 0 && char_at cs 0 >= "0" && char_at cs 0 <= "9" then
+       (if rx_all_digits cs 0 && int_of_str cs > 0 then int_of_str cs
+        else (let _ = rxp_refuse ("invalid group name <" ++ cs ++ ">") in 0))
+     else (let _ = rxp_refuse "invalid conditional pattern" in 0)) in
+  let _ = rxp_note_ref tgt in
+  let (n, p3, g2) = rxp_alt pat p2 fl g in
+  let (yes, no) = (match n with
+                   | NAlt (Cons (a, Cons (b, Nil))) -> (a, b)
+                   | NAlt _ -> (let _ = rxp_refuse "invalid conditional pattern" in (NEmpty, NEmpty))
+                   | other -> (other, NEmpty)) in
+  (NCond (tgt, yes, no), rxp_close pat p3, g2)
 
 // An inlined `\g<name>` body must not re-capture: the same group numbers are
 // already spoken for by the definition, so every group in the copy goes shy.
@@ -40548,6 +40643,7 @@ and rxp_shy = fn (n: RNode) ->
   | NLook (b, neg) -> NLook (rxp_shy b, neg)
   | NLookB (b, neg) -> NLookB (rxp_shy b, neg)
   | NAtomic b -> NAtomic (rxp_shy b)
+  | NCond (k, a, b) -> NCond (k, rxp_shy a, rxp_shy b)
   | other -> other
 and rxp_shy_list = fn (xs: RNode list) ->
   match xs with Nil -> Nil | Cons (h, t) -> Cons (rxp_shy h, rxp_shy_list t)
@@ -40563,6 +40659,7 @@ and rxp_ngroups = fn (n: RNode) ->
   | NLook (b, _) -> rxp_ngroups b
   | NLookB (b, _) -> rxp_ngroups b
   | NAtomic b -> rxp_ngroups b
+  | NCond (_, a, b) -> rxp_ngroups a + rxp_ngroups b
   | _ -> 0
 and rxp_ngroups_list = fn (xs: RNode list) ->
   match xs with Nil -> 0 | Cons (h, t) -> rxp_ngroups h + rxp_ngroups_list t
@@ -40617,7 +40714,7 @@ and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   let c = char_at pat p in
   if str_eq c "(" then rxp_group pat (p + 1) fl g
   else if str_eq c "[" then
-    (let (items, neg, p2) = rxp_class pat (p + 1) in
+    (let (items, neg, p2) = rxp_class pat (p + 1) fl in
      (NClass (items, neg, str_contains fl "i"), p2, g))
   else if str_eq c "." then ((if str_contains fl "m" then NAnyNL else NAny), p + 1, g)
   else if str_eq c "^" then (NBOL, p + 1, g)
@@ -40630,16 +40727,16 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: too short escape sequence")) in fail "mere-ruby: regexp: too short escape sequence")
   else
     let c = char_at pat p in
-    if str_eq c "d" then (NClass (Cons (CDigit, Nil), false, false), p + 1, g)
-    else if str_eq c "D" then (NClass (Cons (CDigit, Nil), true, false), p + 1, g)
-    else if str_eq c "w" then (NClass (Cons (CWord, Nil), false, false), p + 1, g)
-    else if str_eq c "W" then (NClass (Cons (CWord, Nil), true, false), p + 1, g)
-    else if str_eq c "s" then (NClass (Cons (CSpace, Nil), false, false), p + 1, g)
-    else if str_eq c "S" then (NClass (Cons (CSpace, Nil), true, false), p + 1, g)
+    if str_eq c "d" || str_eq c "D" || str_eq c "w" || str_eq c "W" || str_eq c "s" || str_eq c "S" then
+      (NClass (Cons (rxp_perl_cls c fl, Nil), false, false), p + 1, g)
+    // \p{...}: a class of one item, case-folded under i like any class
+    else if str_eq c "p" || str_eq c "P" then
+      (let (it, p2) = rxp_prop pat p in (NClass (Cons (it, Nil), false, str_contains fl "i"), p2, g))
+    else if str_eq c "X" then (NGrapheme, p + 1, g)
     else if str_eq c "h" then (NClass (Cons (CHex, Nil), false, false), p + 1, g)
     else if str_eq c "H" then (NClass (Cons (CHex, Nil), true, false), p + 1, g)
-    else if str_eq c "b" then (NWordB true, p + 1, g)
-    else if str_eq c "B" then (NWordB false, p + 1, g)
+    else if str_eq c "b" then (NWordB (true, str_contains fl "A"), p + 1, g)
+    else if str_eq c "B" then (NWordB (false, str_contains fl "A"), p + 1, g)
     else if str_eq c "A" then (NBOS, p + 1, g)
     else if str_eq c "z" then (NEOS, p + 1, g)
     else if str_eq c "Z" then (NEOSNL, p + 1, g)
@@ -40651,7 +40748,7 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
     else if str_eq c "e" then (NChar (chr 27), p + 1, g)
     else if str_eq c "a" then (NChar (chr 7), p + 1, g)
     else if str_eq c "x" then rxp_hex pat (p + 1) g
-    else if c >= "1" && c <= "9" then (NBackref (int_of_str c, str_contains fl "i"), p + 1, g)
+    else if c >= "1" && c <= "9" then rxp_num_escape pat p fl g
     // `\k<name>` -- a backreference by name, and `\g<name>` -- a SUBROUTINE
     // call, which re-matches that group's pattern here. The call is inlined
     // (the group's body is spliced in, its own captures made shy) rather than
@@ -40667,15 +40764,17 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
        //   pattern has a NAMED group ("numbered backref/call is not allowed"),
        //   and refuses group 0 always. Only the by-NAME spellings were parsed,
        //   and a literal that fell through took the process down with it.
-       if rx_num_ref nm then
+       // ⚠ `\k<+1>` is not relative: ruby reads it as the NAME "+1" (only
+       //   `\g<+1>` counts forward), and refuses it as undefined.
+       if rx_num_ref nm && (if str_eq c "k" && str_eq (char_at nm 0) "+" then false else true) then
          (let tgt = rx_num_ref_target nm g in
-          if map_len rx_gnums > 0 then
+          if map_has rx_named_mode "on" then
             (let __fm = "mere-ruby: regexp parse: numbered backref/call is not allowed. (use name)" in
              let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
           else if tgt <= 0 then
-            (let __fm = ("mere-ruby: regexp parse: invalid backref number: " ++ nm) in
+            (let __fm = "mere-ruby: regexp parse: invalid backref number/name" in
              let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
-          else if str_eq c "k" then (NBackref (tgt, str_contains fl "i"), p2, g)
+          else if str_eq c "k" then (let _ = rxp_note_ref tgt in (NBackref (tgt, str_contains fl "i"), p2, g))
           else
             (let bk = "#" ++ str_of_int tgt in
              if map_has rx_gbodies bk
@@ -40683,11 +40782,7 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
                    let (nb, _, _) = rxp_alt src 0 fl 1 in (rxp_shy nb, p2, g))
              else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
                    let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
-       else if str_eq c "k" then
-         (if map_has rx_gnums nm
-          then (NBackref ((match map_get rx_gnums nm with VInt k -> k | _ -> 0), str_contains fl "i"), p2, g)
-          else (let __fm = ("mere-ruby: regexp parse: undefined group name reference: " ++ nm) in
-                let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm))
+       else if str_eq c "k" then (NBackref (rxp_ref_by_name nm, str_contains fl "i"), p2, g)
        else
          (if map_has rx_gbodies nm
           then (let src = (match map_get rx_gbodies nm with VStr h -> sget h | _ -> "") in
@@ -40795,9 +40890,10 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
      else if str_eq c2 ">" then
        (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
         (NAtomic n, rxp_close pat p2, g2))
-     // (?(cond)...) conditional, (?~...) absent: valid Ruby that this engine
-     // defers — lenient validation skips the balanced group.
-     else if str_eq c2 "(" || str_eq c2 "~" || str_eq c2 "#" then
+     else if str_eq c2 "(" then rxp_cond pat (p + 2) fl g
+     // (?~...) absent: valid Ruby that this engine defers — lenient validation
+     // skips the balanced group.
+     else if str_eq c2 "~" || str_eq c2 "#" then
        (if str_eq c2 "#" then (NEmpty, rxp_skip_group pat p 1, g)   // (?# comment) is fully supported by skipping
         else if map_has rx_lenient "n" then (NEmpty, rxp_skip_group pat p 1, g)
         else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unsupported group")) in fail "mere-ruby: regexp: unsupported group"))
@@ -40965,6 +41061,7 @@ and rx_check_go = fn (i: int) -> fn (n: int) ->
 and rxc_nullable = fn (n: RNode) ->
   match n with
   | NChar _ -> false | NCharCI _ -> false | NAny -> false | NAnyNL -> false
+  | NGrapheme -> false
   | NClass (_, _, _) -> false
   // a backreference to an empty (or unset-then-set) group matches "" — treat
   // as nullable so star loops over it get the empty-iteration guard.
@@ -40973,6 +41070,7 @@ and rxc_nullable = fn (n: RNode) ->
   | NAlt xs -> rxc_null_any xs
   | NRep (b, lo, _, _) -> lo == 0 || rxc_nullable b
   | NGroup (b, _, _) -> rxc_nullable b
+  | NCond (_, a, b) -> rxc_nullable a || rxc_nullable b
   | _ -> true
 and rxc_null_all = fn (xs: RNode list) ->
   match xs with Nil -> true | Cons (h, t) -> rxc_nullable h && rxc_null_all t
@@ -40986,12 +41084,14 @@ and rxc_null_any = fn (xs: RNode list) ->
 and rxc_wmin = fn (n: RNode) ->
   match n with
   | NChar _ -> 1 | NCharCI _ -> 1 | NAny -> 1 | NAnyNL -> 1 | NClass (_, _, _) -> 1
+  | NGrapheme -> 1
   | NSeq xs -> rxc_wmin_sum xs
   | NAlt xs -> rxc_wmin_alt xs
   | NRep (b, lo, _, _) -> (let w = rxc_wmin b in if w < 0 then 0 - 1 else w * lo)
   | NGroup (b, _, _) -> rxc_wmin b
   | NBackref (_, _) -> 0 - 1
   | NAtomic b -> rxc_wmin b
+  | NCond (_, a, b) -> rxc_wmin_alt (Cons (a, Cons (b, Nil)))
   | _ -> 0
 and rxc_wmin_sum = fn (xs: RNode list) ->
   match xs with
@@ -41005,12 +41105,15 @@ and rxc_wmin_alt = fn (xs: RNode list) ->
 and rxc_wmax = fn (n: RNode) ->
   match n with
   | NChar _ -> 1 | NCharCI _ -> 1 | NAny -> 1 | NAnyNL -> 1 | NClass (_, _, _) -> 1
+  // a cluster is any number of characters: unbounded, like a backreference
+  | NGrapheme -> 0 - 1
   | NSeq xs -> rxc_wmax_sum xs
   | NAlt xs -> rxc_wmax_alt xs
   | NRep (b, _, hi, _) -> (let w = rxc_wmax b in if w < 0 || hi < 0 then 0 - 1 else w * hi)
   | NGroup (b, _, _) -> rxc_wmax b
   | NBackref (_, _) -> 0 - 1
   | NAtomic b -> rxc_wmax b
+  | NCond (_, a, b) -> rxc_wmax_alt (Cons (a, Cons (b, Nil)))
   | _ -> 0
 and rxc_wmax_sum = fn (xs: RNode list) ->
   match xs with
@@ -41030,6 +41133,7 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   | NCharCI c -> let _ = map_set prog pc (ICharCI c) in pc + 1
   | NAny -> let _ = map_set prog pc IAny in pc + 1
   | NAnyNL -> let _ = map_set prog pc IAnyNL in pc + 1
+  | NGrapheme -> let _ = map_set prog pc IGrapheme in pc + 1
   | NClass (items, neg, ci) -> let _ = map_set prog pc (IClass (items, neg, ci)) in pc + 1
   | NBOL -> let _ = map_set prog pc IBOL in pc + 1
   | NEOL -> let _ = map_set prog pc IEOL in pc + 1
@@ -41037,7 +41141,7 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
   | NEOS -> let _ = map_set prog pc IEOS in pc + 1
   | NEOSNL -> let _ = map_set prog pc IEOSNL in pc + 1
   | NGANCHOR -> let _ = map_set prog pc IGANCHOR in pc + 1
-  | NWordB b -> let _ = map_set prog pc (IWordB b) in pc + 1
+  | NWordB (b, asc) -> let _ = map_set prog pc (IWordB (b, asc)) in pc + 1
   | NBackref (g, ci) -> let _ = map_set prog pc (IBackref (g, ci)) in pc + 1
   | NSeq xs -> rxc_emit_seq prog pc xs
   | NAlt xs ->
@@ -41095,6 +41199,13 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
      let _ = map_set prog pc (IJmp (pc2 + 1)) in
      let _ = map_set prog (pc2 + 1) (ILookB (subpc, wlo, whi, negd)) in
      pc2 + 2)
+  | NCond (k, yes, no) ->
+    // COND(k, NO); yes; jmp END; NO: no; END
+    (let pc2 = rxc_emit prog (pc + 1) yes in
+     let pc3 = rxc_emit prog (pc2 + 1) no in
+     let _ = map_set prog pc (ICond (k, pc2 + 1)) in
+     let _ = map_set prog pc2 (IJmp pc3) in
+     pc3)
   | NAtomic b ->
     // Same shape as a lookahead sub-program, but IAtomic CONSUMES the body's
     // match: jmp AFTER; SUB: body IOk; AFTER: IAtomic(SUB).
@@ -41268,6 +41379,15 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   | IAnyNL ->
     if i < str_len s then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
     else rxv_fail prog s bt
+  | IGrapheme ->
+    if i < str_len s then rxv_run prog s (pc + 1) (gcb_cluster_end s i) saves bt
+    else rxv_fail prog s bt
+  // the yes-branch when group k has matched (both ends saved, as a
+  // backreference requires), the no-branch otherwise
+  | ICond (k, nopc) ->
+    (let a = rxv_slot_get saves (2 * k) in
+     let b = rxv_slot_get saves (2 * k + 1) in
+     if a >= 0 && b >= a then rxv_run prog s (pc + 1) i saves bt else rxv_run prog s nopc i saves bt)
   | IClass (items, neg, ci) ->
     if i < str_len s && rxv_cls items neg ci (utf8_char_at s i)
     then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
@@ -41302,9 +41422,13 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   | IEOSNL ->
     if i >= str_len s || (i == str_len s - 1 && str_eq (char_at s i) "\n") then rxv_run prog s (pc + 1) i saves bt
     else rxv_fail prog s bt
-  | IWordB want ->
-    (let w1 = i > 0 && rxv_is_word (char_at s (i - 1)) in
-     let w2 = i < str_len s && rxv_is_word (char_at s i) in
+  | IWordB (want, asc) ->
+    // ⚠ ruby's \b is a UNICODE boundary even where its \w is ASCII: "é" is a
+    //   word character to `/\b/` ("xé" =~ /x\b/ is nil) and only (?a) makes
+    //   it a byte. The bytes were asked, so a boundary fell inside "é" and
+    //   none before it. A byte < 0x80 is still answered as one (rxv_word_at).
+    (let w1 = i > 0 && rxv_word_before s i asc in
+     let w2 = i < str_len s && rxv_word_at s i asc in
      let atb = (if w1 then (if w2 then false else true) else w2) in
      if (if want then atb else (if atb then false else true)) then rxv_run prog s (pc + 1) i saves bt
      else rxv_fail prog s bt)
