@@ -4297,3 +4297,11 @@ under unittest/run.sh; what is red there and why, as of this entry:
   (duplicate detection there is by identity). A Float that is NaN compares
   equal to another NaN when strict + as_json asks "did as_json return the
   same object".
+
+## `42.upto(Float::INFINITY).size` never returns
+
+The size of an Integer#upto / #downto enumerator with a Float::INFINITY
+bound is computed by walking it, so it does not return (ruby answers
+Float::INFINITY). CRuby's test_enumerator (test_size_for_downup_to) hangs
+there and the rest of the file is never reached; unittest/run.sh fixes the
+seed so the file stops at the same place every run.

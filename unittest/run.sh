@@ -55,6 +55,12 @@ ref="${REF_RUBY_BIN:-ruby}"
 # the per-file bound, per side: a test file that hangs (a thread waiting on a
 # pipe nobody writes) is KILLED, not signalled -- see bootstraptest/all.sh
 wall="${UNITTEST_WALL:-300}"
+# ⚠ ONE SEED FOR BOTH SIDES AND EVERY RUN. tool/lib's runner shuffles the
+#   tests with a random seed, so a file that hangs or dies part-way reached a
+#   different set of tests each run: test_enumerator read 47 MATCH on one run
+#   and 5 on the next with the same interpreter, because the hanging test
+#   (42.upto(Float::INFINITY).size) came first the second time.
+seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
 
 if [ "$#" -eq 0 ]; then
@@ -113,8 +119,8 @@ tm=0; tr=0; tb=0; tx=0; tt=0
 } > "$status"
 while read -r rel; do
   dir="$src/test/$(dirname "$rel")"; base="$(basename "$rel")"
-  ro="$(cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" "$base" -v --show-skip < /dev/null 2>&1 | verdicts)"
-  mo="$(cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" "$base" -v --show-skip < /dev/null 2>&1 | verdicts)"
+  ro="$(cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
+  mo="$(cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
   rf="$(mktemp)"; mf="$(mktemp)"
   printf '%s\n' "$ro" | grep -v '^$' > "$rf"; printf '%s\n' "$mo" | grep -v '^$' > "$mf"
   tag="$here/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
