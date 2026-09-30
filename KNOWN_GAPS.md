@@ -999,7 +999,9 @@ The SOCKET half is what can be done without handing the kernel a
 - SIGPIPE is ignored from the first socket on (sigignore(2)), so a write to a
   peer that has gone is Errno::EPIPE rather than the end of the process.
   Before, only a program that had run tcp_listen got that.
-- setsockopt accepts and ignores its options (it takes a pointer).
+- setsockopt reads and checks its arguments as ruby does, and does not apply
+  them (setsockopt(2) takes a pointer); getsockopt, recvmsg and sendmsg are
+  missing for the same reason.
 
 ## `bigdecimal` is not implemented
 
