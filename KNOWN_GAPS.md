@@ -585,6 +585,21 @@ this replaced emitted the codepoint as a single byte for every target it did not
 know, so `"ab".encode("UTF-16BE").bytesize` answered 2 where ruby says 4, and a
 Latin-1 character "converted" to Shift_JIS by accident.
 
+JIS X 0208 has since arrived (EUC-JP, Shift_JIS, ISO-2022-JP), and so have
+tables for IBM437, ISO-8859-9/-15 and Windows-1252 as sources. Three holes
+are still tables or models that do not exist here, and each is refused rather
+than guessed:
+
+- **JIS X 0212**, EUC-JP's three-byte `0x8F` plane. `"\u00fc".encode("EUC-JP")`
+  is `"\x8F\xAB\xE4"` in ruby and UndefinedConversionError here, and such a
+  character read from EUC-JP is one unknown character. Four examples of
+  core/string/encode (`encode("euc-jp", "ibm437")`) and one of sprintf/% (`%c`
+  of 0x8FABB1 compared with `"é".encode("EUC-JP")`) are this.
+- **The other single-byte code pages** as targets (Windows-1251 and friends):
+  the sprintf/% example that builds `"Ђ".encode("windows-1251")` stops there.
+- **Emacs-Mule** has no validity model, so `encode(invalid: :replace)` and
+  #scrub leave its broken bytes in place (ruby writes "?").
+
 A command literal and `system` do run the command (Mere's `run`, through a file
 for the output, since `run` answers with the exit status). Two limits: `$?` is
 not set, because there is no Process::Status here, so code that reads
