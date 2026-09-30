@@ -402,31 +402,21 @@ the way `md_whole` holds a MatchData's captures -- then the ivar table is empty
 for a struct and every reader goes through the side table. Two spec files
 (`instance_variables`, `instance_variable_get`) turn on it.
 
-## A bare `mere-ruby` prints usage; ruby reads stdin
+## A bare `mere-ruby` reads stdin -- except at a terminal (closed)
 
 ```sh
 echo 'puts 1' | ruby           # ruby: 1
-echo 'puts 1' | mere-ruby      # mere-ruby: usage: ... (exit 2)
-echo 'puts 1' | mere-ruby -    # mere-ruby: 1
+echo 'puts 1' | mere-ruby      # mere-ruby: 1
+mere-ruby                      # at a terminal: usage (ruby waits for input)
 ```
 
-`-` reads the program from stdin and agrees with ruby. What diverges is the
-*bare* invocation with no arguments at all.
-
-**Why it is still here.** `read_stdin` blocks until EOF, so making the bare
-form read stdin means a caller that runs the binary with no arguments and no
-input HANGS instead of failing. A hanging gate is worse than a failing one:
-the failing one names a defect, the hanging one has to be killed from outside
-and reports nothing. Every caller that wants stdin can write `-`, which is
-what a pipeline writes anyway.
-
-**What fixing it would take.** A way to ask whether stdin is a terminal.
-`isatty` exists inside the C backend's terminal builtins but is not reachable
-as a Mere function, so this needs a host builtin (`stdin_is_tty : unit ->
-bool`) before the bare form can read stdin only when something is piped in.
-Until then the gate records this as a DELIBERATE divergence with a bounded
-wait, so a regression to blocking fails rather than hangs
-(`clitest/run.sh`).
+This entry used to record the bare invocation as a deliberate divergence,
+because read_stdin blocks until EOF and there was no way to ask whether stdin
+is a terminal. `fd_isatty` answers that now: redirected or piped, the program
+is read from stdin as ruby reads it (all of language/magic_comment_spec's
+`ruby_exe(nil, args: "< file")`), and only a person at a terminal gets the
+usage line instead of a silent prompt. clitest checks both redirected shapes
+with a bounded wait.
 
 ## The command line: what is still not ruby's (16 red examples in command_line/)
 
@@ -4219,3 +4209,22 @@ is `[]` where ruby lists six -- so there is no name to refuse, and the module
 looks like one with nothing in it. Fixing it is making Zlib's module
 functions enumerable (the same gap as "Reflection cannot ENUMERATE a builtin
 class's methods"), not a change to import_methods.
+
+## library/etc/getgrgid_spec moves between MATCH, SLOW and DIFF with the same code
+
+Every example passes on both sides (`pass=2011` each). The file's last example
+has twenty threads call `Etc.getgrgid` a hundred times each, and one lookup
+here costs about 0.1 s -- it goes to the machine's directory service -- so the
+file's CPU time sits right at the harness's per-side budget. Measured on one
+binary: SLOW, SLOW, MATCH in three runs; across sweeps it has also been DIFF
+once, when a lookup failed inside a thread under load and the thread's report
+went to the output.
+
+**Why it is still here.** The verdict is set by the machine's load and its
+directory service, not by an answer either interpreter gives. Raising the
+harness's budget for one file would hide the next file that is slow for a
+real reason.
+
+**What fixing it would take.** A faster Etc.getgrgid (a cache is not
+faithful: groups can change under a running process). Read this row as
+"passes, and sometimes too slowly to be told".

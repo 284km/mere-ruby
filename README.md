@@ -288,22 +288,21 @@ everything, an `ensure` body consuming the exception it ran under, and
 `File.open` refusing the `Pathname` bundler writes the lockfile through.
 
 Against a sample of 29 installed gems — of which the reference ruby itself
-loads **27** here, two needing a Rails application to exist —
-`gemtest/run.sh` loads **21** with a CRuby stdlib on `-I` and **17** on
-what mere-ruby ships. With the stdlib, every one of the six that do not is a
-boundary this README already names: `openssl` three times (aws-sdk-s3, excon,
-fog-aws), `bigdecimal.so` once (devise, which loads the whole activesupport /
-i18n / concurrent-ruby stack before it gets there), protobuf once
-(sassc-embedded), and rubocop-rails running past the gate's 120-second budget
-while loading rubocop's ~600 cop files (see [KNOWN_GAPS.md](KNOWN_GAPS.md) —
-it is a slowdown, not a hang; it reads unicode-display_width's gzipped
-`Marshal` index and compiles rubocop-ast's node patterns on the way).
+loads **23** here (two need a Rails application to exist, three need a gem
+this gem home lacks, one needs protobuf's C extension) —
+`gemtest/run.sh` loads **19** with a CRuby stdlib on `-I` and **18** on
+what mere-ruby ships (measured 2026-09-30). With the stdlib, the four that do
+not are two boundaries: `json/ext/parser` three times (aws-sdk-s3,
+openapi_parser, sidekiq-pro -- json's parser and generator are C extensions,
+and mere-ruby does not answer them yet) and `OpenSSL::SSL::SSLSocket` once
+(excon; a TLS stack is out of scope, above). Without the stdlib, `json` itself
+is missing for the same three, and `ipaddr` for excon and http-cookie.
 
-Without a stdlib on `-I`, ten fail, and the four extra ones are what that
-stdlib was answering: seven of the ten are a pure-Ruby library that is simply
-not here (`net/protocol`, `ipaddr` ×3, `open-uri`, `shellwords`, `cgi/escape`)
-and two ask for `File#fileno`. That difference is what the two numbers are
-for.
+⚠ **This number fell from 21 to 4 with no gate noticing**, and the cause was
+one line: the source was cut at its first NUL byte anywhere, and rubygems
+writes gemspec stubs with NUL-separated extension lists, so every such
+gemspec evaluated to nil. gemtest is not in CI (it needs an installed gem
+home); run it after any change to loading, parsing or rubygems' paths.
 
 ## In the browser
 

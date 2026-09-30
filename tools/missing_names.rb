@@ -41,7 +41,11 @@ SKIP = %w[exit exit! abort sleep gets readline readlines fork exec system spawn 
           `  freeze srand readpartial read sysread readchar readbyte getc getbyte each_line each_byte
           each_char each_codepoint each_grapheme_cluster times upto downto step each each_with_index
           each_with_object each_entry each_slice each_cons cycle lazy to_enum enum_for each_pair
-          each_key each_value each_index reverse_each pass stop join value run wakeup].freeze
+          each_key each_value each_index reverse_each pass stop join value run wakeup
+          wait_readable wait_writable wait_priority].freeze
+# (the three waits: on $stdout, a pipe when the probe's output is captured,
+#  wait_readable blocks for good -- as ruby's does -- once IO#wait_* really
+#  poll the descriptor)
 mode, file = ARGV
 if mode == "list"
   SAMPLES.each_key do |cn|
