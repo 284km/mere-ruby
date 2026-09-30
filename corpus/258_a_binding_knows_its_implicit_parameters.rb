@@ -45,7 +45,11 @@ p err { b1.local_variable_defined?(:A) }
 out = 1
 p proc { inner = 2; binding.local_variables }.call.first(2)
 bf = binding
+bf.instance_variable_set(:@iv, 1)
+p bf.dup.instance_variables, bf.clone.instance_variable_get(:@iv)
 p bf.frozen?, bf.freeze.frozen?, bf.clone.frozen?, bf.dup.frozen?
+p((bf.instance_variable_set(:@iv, 2) rescue $!.class))
+p(("x".freeze.instance_variable_set(:@a, 1) rescue $!.message))
 
 # Binding#eval takes a file and a line, as Kernel#eval does.
 p b1.eval("[__FILE__, __LINE__]", "(named)", 88)

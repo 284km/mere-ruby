@@ -1693,6 +1693,54 @@ storage is keyed by the string's handle. `dup` copies the string but not that
 storage, so the copy answers nil. An object's `dup` does copy its ivars; this
 is the primitive path, which does not have the world to copy them through.
 
+## A Binding is a snapshot of its scope, not a view of it
+
+```ruby
+x = 1
+b = binding
+x = 2
+b.local_variable_get(:x)      # mere-ruby: 1     ruby: 2
+b.local_variable_set(:x, 5)
+x                             # mere-ruby: 2     ruby: 5
+```
+
+`binding` copies the variables it can see (bnd_snapshot) and puts a frame of
+its own on top. What is defined THROUGH the binding stays in it, and a
+#dup / #clone shares what the binding already had -- both as in ruby, since
+2026-09-30 -- but the copy is taken when the binding is made, so the scope
+and the binding stop agreeing about a variable the moment either assigns it.
+TOPLEVEL_BINDING is the exception: it IS the main script's frame.
+
+**Why it is a snapshot.** Two readers depend on it. A numbered parameter is
+not a binding local since ruby 4.0 (`binding.eval("_1")` is NameError), and
+the snapshot is where they are filtered out; a live view would reach the
+block's `_1` through the scope chain. And the frame pool recycles a frame at
+return unless something captured it, which a snapshot does not need to know.
+
+**What it costs.** `core/binding/local_variable_set_spec`'s "overwrites an
+existing local variable defined before a Binding", and every program that
+reads a local through a binding after changing it.
+
+**What fixing it would take.** Make `binding` a child of the LIVE frame
+(`lv_child env`, with `mark_captured env` so the pool keeps it), and give
+numbered parameters the rule ruby's parser already enforces: one is read only
+in the frame that bound it, never through the chain (`_1` of an outer block
+inside a block with parameters is a SyntaxError, so no correct program reads
+one that way). That rule is a check on the variable-read path, which is why
+it was not done on the side.
+
+### ...and it lists only the variables assigned so far
+
+ruby's local table is fixed at parse time: `binding.local_variables` in a
+method lists the locals assigned LATER in that method too (as nil), and
+`core/binding/local_variables_spec` and `dup_spec` read that (3 examples).
+Here only the main script's declared locals are known ahead (tl_decl); a
+method's or a block's are known only once assigned. The list exists at parse
+time (deep_targets), but a frame does not carry its body, and a map stores a
+deep copy of what it is given, so keeping it per frame is the same problem
+Binding#implicit_parameters solved with a count -- and a count does not
+carry names.
+
 ## A character literal is one BYTE unless it is an escape
 
 `?a`, `?\001`, `?\x41`, `?\n`, `?\s` and `?\u00e9` all read as ruby reads
