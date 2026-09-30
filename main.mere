@@ -2624,7 +2624,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          // a bare block call inside a class method is `self.name { }`; route
          // through the receiver dispatcher so builtins (module_eval/class_eval/
          // new/...) and Module/Class fallbacks all apply, not just own methods.
-         invoke_with_block env world blk (VClass c) name args newblk
+         // ⚠ ...but a method the class's singleton chain defines is called
+         //   directly, as the VObj arm does: the dispatcher is the EXPLICIT
+         //   receiver's path and refuses a private method, and a bare call
+         //   is allowed to reach one. test-unit's `def setup(*names, &cb) =
+         //   register_fixture(:setup, *names, &cb)` -- a private method of
+         //   the module the class extends -- was "private method called".
+         (let sc9 = "(sng:" ++ c ++ ")" in
+          if has_meth world sc9 name then invoke world newblk (VClass c) sc9 name args
+          else invoke_with_block env world blk (VClass c) name args newblk)
        // at the top level self is main, an ordinary Object: a bare block call
        // that is not a top-level method (checked above) is `self.name { }`,
        // which is how `instance_eval do .. end` gets a receiver here.
@@ -2805,7 +2813,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // every alias sees it (unless the class redefines the method).
        else if (match recv with VStr _ -> true | _ -> false)
                && (is_str_mut name || (str_len name == 3 && str_eq name "[]="))
-               && (if has_meth world "String" name then false else true) then
+               && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
          (match recv with
           | VStr h ->
             // []= duck-types its index: something with #begin AND #end is a
@@ -2857,9 +2865,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              else str_mut_do h name args)
           | _ -> VNil)
        // in-place hash mutation: rewrite the receiver's store entry.
+       // ⚠ "does the program define it" is asked of the RECEIVER'S class, not
+       //   of Hash: a subclass's own #[]= (test-unit's StringifyKeyHash turns
+       //   every key into a String) was bypassed by `h[k] = v` and `h[k] ||= v`
+       //   while its #[] was honoured, so a value stored under :a was looked up
+       //   as "a" and test-unit could not load.
        else if (match recv with VHsh _ -> true | _ -> false)
                && ((str_len name == 3 && str_eq name "[]=") || (str_len name == 5 && str_eq name "store"))
-               && (if has_meth world "Hash" name then false else true) then
+               && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
          (match recv with
           | VHsh h -> (match args with
                        | Cons (k, Cons (v, _)) ->
@@ -2991,7 +3004,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              else ()) in
     // `s << x` on a string appends in place (store rewrite: aliases see it).
     // An integer appends the codepoint's character, as in Ruby.
-    if str_eq op "<<" && (match va0 with VStr _ -> true | _ -> false) then
+    // (Not for a String subclass that defines its own #<<: that one is called,
+    //  and its super comes back to the append through super_missing.)
+    if str_eq op "<<" && (match va0 with VStr _ -> true | _ -> false)
+       && (if has_meth world (dispatch_cls_of world va0) "<<" then false else true) then
       (match va0 with
        | VStr h ->
          (match eval_e env world blk b with
@@ -3080,8 +3096,19 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // equality -- routing == there was "unknown operator: ==").
        | _ -> VBool (if str_eq op "==" then rb_eq va0 bv9 else (if rb_eq va0 bv9 then false else true)))
     else
-    if str_eq op "!=" && (let dc = dispatch_cls_of world va0 in
-                          has_meth world dc "==" && (if has_meth world dc "!=" then false else true)) then
+    // (not for a CLASS receiver: dispatch_cls_of answers the class itself, so
+    //  `K != Object` asked K's INSTANCE #== -- test-unit's TestCase#== -- and
+    //  `ancestor != self` in its attribute lookup raised NoMethodError. A class's
+    //  != goes through the path below, which asks its singleton chain.)
+    if str_eq op "!=" && (match va0 with VClass c9 -> (let sc9 = "(sng:" ++ c9 ++ ")" in has_meth world sc9 "==" && (if has_meth world sc9 "!=" then false else true)) | _ -> false) then
+      (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+       match va0 with
+       | VClass c9 -> VBool (if truthy (invoke world noblk va0 ("(sng:" ++ c9 ++ ")") "==" (Cons (eval_e env world blk b, Nil))) then false else true)
+       | _ -> VNil)
+    else
+    if str_eq op "!=" && (match va0 with VClass _ -> false | _ -> true)
+       && (let dc = dispatch_cls_of world va0 in
+           has_meth world dc "==" && (if has_meth world dc "!=" then false else true)) then
       (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
        let dc = dispatch_cls_of world va0 in
        VBool (if truthy (invoke world noblk va0 dc "==" (Cons (eval_e env world blk b, Nil))) then false else true))
@@ -10030,7 +10057,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // A class that redefines the method keeps priority.
   if (match recv with VStr _ -> true | _ -> false)
      && (is_str_mut name || (str_len name == 3 && str_eq name "[]="))
-     && (if has_meth world "String" name then false else true) then
+     && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
     (match recv with
      | VStr h ->
        (if (str_len name == 6 && str_eq name "slice!") && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
@@ -30821,9 +30848,13 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        //   back here -- so a bare `select` inside any method (or an mspec
        //   example, whose self is Object.new) bounced between the two until
        //   the native stack ran out: core/kernel/select_spec CRASHed.
+       // ...and Object's public instance methods, which a bare call reaches as
+       // `self.name` does: `remove_instance_variable(name)` in test-unit's
+       // TestCase#run was "undefined method" while `self.remove_instance_variable`
+       // answered.
        else if (is_enum_method name
                 && (if is_kernel_builtin name then str_list_has (ancestors_of world cls) "Enumerable" else true))
-               || is_prim_method name then invoke_val_c env world noblk (VObj id) name args false
+               || is_prim_method name || is_kernel_pub_instance name then invoke_val_c env world noblk (VObj id) name args false
        // ⚠ `include Math` MAKES MATH'S FUNCTIONS PRIVATE INSTANCE METHODS.
        //   They live in the Math namespace arm, which only ever answered for
        //   the Math receiver -- so `class C; include Math; def t; sin(0); end;
@@ -30857,7 +30888,7 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        else if (str_len name == 11 && str_eq name "respond_to?") then respond_to_answer env world VMain args
        // a universal primitive (instance_variable_get, frozen?, send, ...)
        // with an implicit self at the top level, exactly as `self.name` would
-       else if is_prim_method name then dispatch_prim env world noblk VMain name args false
+       else if is_prim_method name || is_kernel_pub_instance name then dispatch_prim env world noblk VMain name args false
        // ...and the same for the top-level self (see the VObj arm above).
        else if is_kernel_builtin name && (if kernel_bare_special name then false else true) then dispatch_prim env world noblk VMain name args false
        // (a bare `using` with no argument is still main.using, which says
@@ -31913,9 +31944,27 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // reach the builtin: prim_method has none, so an each/map/... super answered
   // as if no block had been given.
   if (if str_eq hk "" then false else true) then
-    (match superblk with
-     | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
-     | _ -> prim_method recv meth args)
+    (match recv with
+     // ...and the in-place mutations, which prim_method does not do: they
+     // rewrite the receiver's store entry, which is the fast path's job, and a
+     // subclass that defines its own #[]= / #<< reaches that path only through
+     // super now that the fast path asks the receiver's class first.
+     | VStr h9 when is_str_mut meth || (str_len meth == 3 && str_eq meth "[]=") ->
+       (if (str_len meth == 6 && str_eq meth "slice!") && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
+        then str_slice_bang_rx gc_cenv0 world h9 args
+        else if (str_len meth == 6 && str_eq meth "slice!") then str_mut_do h9 meth (coerce_slice_args gc_cenv0 world args)
+        else if (str_len meth == 15 && str_eq meth "append_as_bytes") then str_mut_do h9 meth args
+        else str_mut_do h9 meth (coerce_dyck_args gc_cenv0 world recv args))
+     | VHsh h9 when (str_len meth == 3 && str_eq meth "[]=") || (str_len meth == 5 && str_eq meth "store") ->
+       (match args with
+        | Cons (k, Cons (v, _)) ->
+          (let k9 = hash_store_key gc_cenv0 world h9 k in
+           hput_or_queue_w gc_cenv0 world h9 (hcbi_on h9) k9 v (fn (u: unit) -> hash_put_wx gc_cenv0 world h9 (hcbi_on h9) (hderef h9) k9 v))
+        | _ -> VNil)
+     | _ ->
+       (match superblk with
+        | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
+        | _ -> prim_method recv meth args))
   else
   let dcls = dispatch_cls_of world recv in
   // a descriptor stream's stream methods are the prelude layer's (fdio_route),
