@@ -504,7 +504,11 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if str_eq c ":" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "$"
             && is_gvar_punct (char_at s (i + 2)) then
       Cons (TSym (sym_note (substring s (i + 1) (i + 3))), lex_go s (i + 3))
-    else if str_eq c ":" && i + 1 < str_len s && is_op_sym_start (char_at s (i + 1)) then
+    // ...and only where a symbol can open at all: a colon glued to a name is a
+    // label, so `show_src_lines_frame:['...']` (debug's config table) and
+    // `{a:-1}` are a key and its value, not the symbols `:[]` and `:-`.
+    else if str_eq c ":" && i + 1 < str_len s && is_op_sym_start (char_at s (i + 1))
+            && colon_opens_sym s i then
       // operator symbols: :=== :== :<=> :+ :[] :[]= etc.
       let (opname, j) = scan_op_sym s (i + 1) in
       Cons (TSym (sym_note opname), lex_go s j)
@@ -1450,6 +1454,10 @@ and pw_word = fn (interp: bool) -> fn (t: str) -> fn (i: int) -> fn (acc: str) -
                    else if str_eq nx " " || str_eq nx "\\" || str_eq nx "\n" then nx
                    else "\\" ++ nx) in
       pw_word interp t (i + 2) (acc ++ piece)
+    // an interpolation is CODE, and a space inside it does not end the word:
+    // fiddle's extconf writes `%W[CXXFLAGS=#{RbConfig.expand("$(CXXFLAGS)".dup, nowarn)}]`.
+    else if interp && str_eq c "#" && i + 1 < str_len t && str_eq (char_at t (i + 1)) "\{" then
+      (let j = interp_close t (i + 2) 1 in pw_word interp t j (acc ++ substring t i j))
     else if str_eq c " " || str_eq c "\n" then (acc, i)
     else pw_word interp t (i + 1) (acc ++ c)
 
@@ -1489,12 +1497,15 @@ and hexv = fn (c: str) ->
   else 0
 
 // up to 3 octal digits from i; returns (value, index-after).
+// Three octal digits reach 0o777 = 511, and ruby keeps the low byte: "\666"
+// is "\xB6" and "\400" is "\0", without a warning. The value went to `chr`
+// whole, which refused 438 and took minitest's assertion tests with it.
 and scan_octal = fn (s: str) -> fn (i: int) -> fn (acc: int) -> fn (n: int) ->
-  if n >= 3 || i >= str_len s then (acc, i)
+  if n >= 3 || i >= str_len s then (acc - (acc / 256) * 256, i)
   else
     let c = char_at s i in
     if c >= "0" && c <= "7" then scan_octal s (i + 1) (acc * 8 + (ord c - 48)) (n + 1)
-    else (acc, i)
+    else (acc - (acc / 256) * 256, i)
 
 // index of the closing double-quote of a string body starting at i.
 and dq_str_end = fn (s: str) -> fn (i: int) ->
@@ -1892,6 +1903,9 @@ and regex_position = fn (s: str) -> fn (i: int) ->
   else
     let c = char_at s p in
     if str_eq c "(" || str_eq c "," || str_eq c "=" || str_eq c "~" ||
+       // after a binary operator a VALUE follows: `src + <<"SRC"` (mkmf's
+       // macro_defined?) is a heredoc and `a * /x/` could only be a regexp.
+       str_eq c "+" || str_eq c "-" || str_eq c "*" ||
        str_eq c "!" || str_eq c "|" || str_eq c "&" || str_eq c "\n" || str_eq c ";" ||
        // `=> /re/` in a hash literal, `x > /re/`: ruby reads a regex after `>` too
        str_eq c "<" || str_eq c ">" || str_eq c "[" || str_eq c "\{" ||
@@ -2355,7 +2369,18 @@ and lambda_bare_after = fn (n: str) -> fn r -> fn (acc: str list) -> fn (ds: (st
 // statement modifier — `(i += 1 until i > 9)` is a while-statement value.
 // A leading break/next/return statement (with its modifier) also works:
 // `(break 123 until false)`.
+// A parenthesised group is a new context for the "nodo" flag, as a def body
+// is (see parse_def): the flag stops a COMMAND's argument from taking the
+// command's do-block, and inside parens there is no such command. debug's DAP
+// server writes `send_response req, breakpoints: (bps.map do |bp| ... end)`,
+// and the `do` was refused to `map` and left dangling.
 and paren_body = fn toks ->
+  let had = map_has parser_flags "nodo" in
+  let _ = if had then map_delete parser_flags "nodo" else () in
+  let res = paren_body_go toks in
+  let _ = if had then map_set parser_flags "nodo" VNil else () in
+  res
+and paren_body_go = fn toks ->
   match skip_nls toks with
   | Cons (TId w, _) ->
     if str_eq w "break" || str_eq w "next" || str_eq w "return" then
@@ -2420,7 +2445,11 @@ and paren_expr_body = fn toks ->
 // a multiple assignment inside a paren group: `)` ends it, but a `;` means it
 // was only the first statement of a sequence --
 // `until (parent, base = File.split(p); parent == p)` in fileutils.
-and paren_after_stmt = fn (s2: Stmt) -> fn r2 ->
+and paren_after_stmt = fn (s1: Stmt) -> fn r1 ->
+  // a multiple assignment inside parens takes the modifiers a statement does:
+  // racc's grammar file parser loops on `while (sym, idx = enum.next rescue
+  // nil)`, and the `rescue` met the closing-paren check instead.
+  let (s2, r2) = apply_modifier s1 r1 in
   (match skip_nls r2 with
    | Cons (TP rp, r3) -> if str_eq rp ")" then (EStmt s2, r3) else paren_seq (skip_nls r2) (Cons (s2, Nil))
    | _ -> paren_seq (skip_nls r2) (Cons (s2, Nil)))
@@ -2489,6 +2518,14 @@ and parse_range = fn toks ->
             if str_eq p3 ")" || str_eq p3 "]" || str_eq p3 "}" then (ERange (lo, ENil, excl), rest2)
             else let (hi, r2) = parse_bin rest2 1 in (ERange (lo, hi, excl), r2)
           | Cons (TEOF, _) -> (ERange (lo, ENil, excl), rest)
+          // ...nor a keyword that closes the clause: net-imap's sequence set
+          // writes `if min == STAR_INT then yield :*..` and `elsif` on the next
+          // line, where the range is endless and the `elsif` is the if's.
+          | Cons (TId k3, _) ->
+            if str_eq k3 "elsif" || str_eq k3 "else" || str_eq k3 "end" || str_eq k3 "when" ||
+               str_eq k3 "in" || str_eq k3 "rescue" || str_eq k3 "ensure" || str_eq k3 "then" then
+              (ERange (lo, ENil, excl), rest)
+            else let (hi, r2) = parse_bin rest2 1 in (ERange (lo, hi, excl), r2)
           | _ -> let (hi, r2) = parse_bin rest2 1 in (ERange (lo, hi, excl), r2))
        | Cons (TEOF, _) -> (ERange (lo, ENil, excl), rest)
        | Cons (TId g, _) ->
@@ -2621,7 +2658,10 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
   | Cons (TNL _, _) ->
     let t2 = skip_nls toks in
     (match t2 with
-     | Cons (TP dot, _) -> if str_eq dot "." then parse_postfix_more recv t2 else (recv, toks)
+     // ...and so does a newline followed by `&.method`: net-imap's
+     // response parser writes `quoted` then `&.gsub!(...)` then
+     // `&.force_encoding(...)`, one call per line.
+     | Cons (TP dot, _) -> if str_eq dot "." || str_eq dot "&." then parse_postfix_more recv t2 else (recv, toks)
      | _ -> (recv, toks))
   | Cons (TP dot0, r0) ->
     // A space-marked `[` after a COMPLETE expression is an index, not an array
@@ -2669,7 +2709,10 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
                  else if str_eq op "=" then
                    (match r4 with
                     | Cons (TP lp2, r5) ->
-                      if str_eq lp2 "(" then
+                      // `defined?(Warning.[]=)` (ruby's own test/lib envutil):
+                      // the setter NAMED, with nothing after it.
+                      if str_eq lp2 ")" then parse_postfix_more (EMethod (recv, "[]=", Nil)) r4
+                      else if str_eq lp2 "(" then
                         (let (argv, r6) = parse_call_args r5 in
                          parse_postfix_more (EMethod (recv, "[]=", argv)) r6)
                       else (let (rhs, r5b) = parse_expr r4 in (EMethod (recv, "[]=", Cons (rhs, Nil)), r5b))
@@ -2767,13 +2810,13 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
             else if starts_block r2 then
               let (bp, bb, r4) = parse_block r2 in
               parse_postfix_more (ESafeB (recv, name, Nil, bp, bb)) r4
-            else parse_postfix_more (ESafe (recv, name, Nil)) r2
+            else safe_nav_bare recv name r2
        // `do` is a name token, so a do-block lands here rather than above.
        | _ ->
          if starts_block r2 then
            let (bp, bb, r4) = parse_block r2 in
            parse_postfix_more (ESafeB (recv, name, Nil, bp, bb)) r4
-         else parse_postfix_more (ESafe (recv, name, Nil)) r2)
+         else safe_nav_bare recv name r2)
     // scope resolution: Foo::Bar (nested constant, looked up by bare name)
     // or Foo::meth(...) (module/class method call).
     else if str_eq dot "::" then
@@ -2799,6 +2842,11 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               // op-assigns read first, so an undefined constant raises NameError.
               let readx = if str_eq base "||" then EScopedReadOrNil (EVar tmp, name) else EScopedRead (EVar tmp, name) in
               (EStmt (SBegin (Cons (SAssign (tmp, recv), Cons (SExpr (EScopedAssign (EVar tmp, name, EBin (base, readx, v))), Nil)), Nil, Nil, Nil)), r4)
+            // `Gem::URI source_uri` -- a method named like a constant, called
+            // with a paren-less argument, as `URI source_uri` is at the top
+            // (see the is_cap case in parse_primary). A constant takes no
+            // argument, so an argument settles it as a call.
+            else if is_cap name && starts_bare_arg r2 then attach_block_method recv name Nil r2
             else if is_cap name then parse_postfix_more mkread r2
             // `Recv::name = v` is the setter call `Recv.name = v` -- `::` and
             // `.` are interchangeable for method calls, and concurrent-ruby's
@@ -2811,11 +2859,29 @@ and parse_postfix_more = fn (recv: Expr) -> fn toks ->
               (EAttrOp (recv, name, opassign_base p, rhs), r4)
             else attach_block_method recv name Nil r2
           | _ ->
-            if is_cap name then parse_postfix_more mkread r2
+            if is_cap name && starts_bare_arg r2 then attach_block_method recv name Nil r2
+            else if is_cap name then parse_postfix_more mkread r2
             else attach_block_method recv name Nil r2)
        | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected name after ::" ++ parsing_file ()))) in fail ("mere-ruby: expected name after ::" ++ parsing_file ())))
     else (recv, toks)
   | _ -> (recv, toks)
+
+// `recv&.meth a, b` -- a paren-less argument list after safe navigation, the
+// same command form `recv.meth a, b` has. rubygems' package.rb writes
+// `@security_policy&.verify_signatures @spec, @digests, @signatures`, and the
+// call used to end at the name, leaving `@spec, ...` to fail as a statement.
+and safe_nav_bare = fn (recv: Expr) -> fn (name: str) -> fn toks ->
+  if starts_bare_arg toks || starts_sp_bracket toks then
+    (let had = map_has parser_flags "nodo" in
+     let _ = map_set parser_flags "nodo" VNil in
+     let (es, r2) = parse_puts_args toks Nil in
+     let _ = if had then () else map_delete parser_flags "nodo" in
+     let (es2, hasbp, bp0, bb0) = extract_block_pass es in
+     if hasbp then parse_postfix_more (ESafeB (recv, name, es2, bp0, bb0)) r2
+     else if starts_do_block r2 then
+       (let (bp, bb, r3) = parse_block r2 in parse_postfix_more (ESafeB (recv, name, es, bp, bb)) r3)
+     else parse_postfix_more (ESafe (recv, name, es)) r2)
+  else parse_postfix_more (ESafe (recv, name, Nil)) toks
 
 // a trailing `{ }` / `do end` block turns a method call into EMethodB.
 // the method name after `&.`. Usually an ordinary name, but an operator
@@ -2869,6 +2935,13 @@ and attach_block_method = fn (recv: Expr) -> fn (name: str) -> fn (argv: Expr li
 // decides -- unless a `do` block follows, which only a CALL can take. Ruby's
 // own specs are written that way (`argf [@file1, @file2] do ... end`), and 42
 // of the 75 files the parse sweep could not read were this one shape.
+and is_binop_tok = fn (p: str) ->
+  str_eq p "*" || str_eq p "+" || str_eq p "-" || str_eq p "/" || str_eq p "%" ||
+  str_eq p "**" || str_eq p "<<" || str_eq p ">>" || str_eq p "&" || str_eq p "|" ||
+  str_eq p "^" || str_eq p "==" || str_eq p "!=" || str_eq p "<" || str_eq p ">" ||
+  str_eq p "<=" || str_eq p ">=" || str_eq p "<=>" || str_eq p "===" || str_eq p "=~" ||
+  str_eq p "!~" || str_eq p "&&" || str_eq p "||"
+
 and ambig_or_call = fn (id: str) -> fn (ae: Expr) -> fn toks ->
   if starts_do_block toks then
     (let (bp, bb, r) = parse_block toks in (ECallB (id, Cons (ae, Nil), bp, bb), r))
@@ -2945,6 +3018,11 @@ and starts_bare_arg = fn toks ->
     // (`ruby2_keywords def m...`); structural keywords are not arguments.
     if str_eq w "true" || str_eq w "false" || str_eq w "nil" || str_eq w "self" ||
        str_eq w "def" || str_eq w "yield" then true
+    // `say case options[:format] when ... end` (rubygems' specification
+    // command) and `x = foo begin ... end`: `case` and `begin` can only OPEN
+    // an expression -- neither has a modifier form -- so after a name they
+    // are its argument.
+    else if str_eq w "case" || str_eq w "begin" then true
     else if is_keyword w || str_eq w "and" || str_eq w "or" || str_eq w "not" ||
        str_eq w "in" || str_eq w "for" then false
     else true
@@ -3301,6 +3379,18 @@ and parse_primary = fn toks ->
            let (e, r3) = parse_expr (skip_nls r2) in (EAssign (id, EBin (opassign_base eq, EIVar (substring id 1 (str_len id)), e)), r3)
          else (EIVar (substring id 1 (str_len id)), r)
        | _ -> (EIVar (substring id 1 (str_len id)), r))
+    // `SP?` / `SP!` (net-imap's response parser): a capitalized name ending
+    // in `?` or `!` can only be a METHOD -- no constant is spelled that way --
+    // so it is a call with or without arguments, never a constant lookup.
+    else if is_cap id && (let lc = char_at id (str_len id - 1) in str_eq lc "?" || str_eq lc "!") then
+      (match r with
+       | Cons (TP lp, r2) ->
+         if str_eq lp "(" then let (argv, r3) = parse_call_args r2 in (ECall (id, argv), r3)
+         else if starts_bare_arg r then let (argv, r3) = parse_puts_args r Nil in (ECall (id, argv), r3)
+         else (ECall (id, Nil), r)
+       | _ ->
+         if starts_bare_arg r then let (argv, r3) = parse_puts_args r Nil in (ECall (id, argv), r3)
+         else (ECall (id, Nil), r))
     else if is_cap id then
       (match r with
        | Cons (TP eq, r2) ->
@@ -3371,7 +3461,9 @@ and parse_primary = fn toks ->
             str_eq p "," || str_eq p "&&" || str_eq p "||" || str_eq p "==" ||
             str_eq p "!=" || str_eq p "=>" || str_eq p "?" || str_eq p "." ||
             str_eq p "<" || str_eq p ">" || str_eq p "<=" || str_eq p ">=" ||
-            str_eq p "<=>" || str_eq p "=~" then (ERaise Nil, r)
+            str_eq p "<=>" || str_eq p "=~" ||
+            // the `:` of a ternary: typeprof's `s[1..-2] || raise : s`
+            str_eq p ":" then (ERaise Nil, r)
          else let (es, r2) = parse_puts_args r Nil in (ERaise es, r2)
        | _ -> let (es, r2) = parse_puts_args r Nil in (ERaise es, r2))
     else if str_eq id "super" then
@@ -3481,12 +3573,8 @@ and parse_primary = fn toks ->
               if str_eq st "*" then
                 let (e, r3) = parse_expr (skip_nls r2b) in (EAssign (id, EArr (Cons (ESplat e, Nil))), r3)
               else let (e, r3) = parse_expr (skip_nls r2) in (EAssign (id, e), r3)
-            // ⚠ the value may start on the NEXT line here too. Only a
-            //   punctuation token was followed past newlines, so
-            //   `assert_equal @go, l =\n JSON(...)` -- an assignment as an
-            //   ARGUMENT with its value below it, in json's test of
-            //   GenericObject -- stopped at the newline and the file did not
-            //   parse. A statement-level `l =\n 2` never came here.
+            // the value may be on the next line here too, as it may for a
+            // statement: rbs writes `if as =` and the `if` expression below.
             | _ -> let (e, r3) = parse_expr (skip_nls r2) in (EAssign (id, e), r3))
          else if not (str_eq (opassign_base p) "") then
            // op-assign as an expression: `(i += 1) >= 5`.
@@ -3526,6 +3614,20 @@ and parse_primary = fn toks ->
                  if starts_do_block r2d
                  then (let (bp, bb, r2e) = parse_block r2d in (ECallB (id, es, bp, bb), r2e))
                  else (ECall (id, es), r2d))
+              // ...and so does a comma after a BINARY operator's right side:
+              // `assert_equal [1, 2, 3] * size, before_list` (minitest) is
+              // the call `assert_equal([1, 2, 3] * size, before_list)`. The
+              // lexer only leaves " [" after a name its local table does not
+              // know (see lvt_prev_local), and an index of a local followed by
+              // a comma is no statement ruby accepts either.
+              else if is_binop_tok cm then
+                (let (es, r2d) = parse_puts_args r Nil in
+                 match es with
+                 | Cons (_, Cons (_, _)) ->
+                   if starts_do_block r2d
+                   then (let (bp, bb, r2e) = parse_block r2d in (ECallB (id, es, bp, bb), r2e))
+                   else (ECall (id, es), r2d)
+                 | _ -> ambig_or_call id ae r2b)
               else ambig_or_call id ae r2b
             | _ -> ambig_or_call id ae r2b)
          // a double-quoted string argument: `d "desc" do ... end`.
@@ -4044,7 +4146,14 @@ and parse_puts_args = fn toks -> fn (acc: Expr list) ->
   | Cons (TId kname, Cons (TP colon, r0)) ->
     if str_eq colon ":" then
       let (hp, r) = parse_bare_kw_pairs r0 kname Nil in
-      (rev_app (Cons (EKwHash hp, acc)) Nil, r)
+      // the pairs may be followed by a block-pass (parse_bare_kw_pairs stops
+      // in front of it): rbs writes `any_node? child, nodes: nodes, &block`.
+      (match r with
+       | Cons (TP amp9, r9) ->
+         if str_eq amp9 "&" || str_eq amp9 " &" then
+           (let (bpe, r10) = parse_expr r9 in (rev_app (Cons (EBlockPass bpe, Cons (EKwHash hp, acc))) Nil, r10))
+         else (rev_app (Cons (EKwHash hp, acc)) Nil, r)
+       | _ -> (rev_app (Cons (EKwHash hp, acc)) Nil, r))
     else parse_puts_args_pos toks acc
   | Cons (TP st, r0) ->
     // A no-space `(` right after the command word is a real argument list:
@@ -4116,6 +4225,8 @@ and parse_bare_kw_pairs = fn toks -> fn (kname: str) -> fn (acc: Expr list) ->
        | Cons (TId k2, Cons (TP colon2, r3)) ->
          if str_eq colon2 ":" then parse_bare_kw_pairs r3 k2 acc2
          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected keyword argument" ++ parsing_file ()))) in fail ("mere-ruby: expected keyword argument" ++ parsing_file ()))
+       // `, &block` ends the pairs; the caller takes the block-pass.
+       | Cons (TP amp, _) when str_eq amp "&" || str_eq amp " &" -> (rev_app acc2 Nil, skip_nls r2)
        // `m f, filename: filename, **kwargs` -- the splat joins these pairs
        // (doubled, the marker hsh_eval_items uses), it is not a new argument.
        | Cons (TP dsp, r3) ->
@@ -4180,6 +4291,18 @@ and parse_stmts = fn toks -> fn (acc: Stmt list) ->
 // trailing statement modifiers: `STMT if C`, `unless C`, `while C`,
 // `until C`. Each desugars to the corresponding block form wrapping the
 // single statement.
+// `unless data.encoding in Encoding::ASCII | Encoding::UTF_8`, `next unless k
+// in Rational`, `return input if input in Literal | Literal8` (net-imap): a
+// one-line pattern test is a condition like any other boolean, in the
+// statement form and the modifier form alike.
+and cond_in_pattern = fn (cr: (Expr * Tok list)) ->
+  let (c, r) = cr in
+  match r with
+  | Cons (TId inw, rin) ->
+    if str_eq inw "in" then (let (pat, r2) = parse_pattern_top rin in (EMatchTest (c, pat), r2))
+    else (c, r)
+  | _ -> (c, r)
+
 and apply_modifier = fn (s: Stmt) -> fn toks ->
   match toks with
   // ruby 4.0: a line that BEGINS with `and` / `or` continues the statement
@@ -4204,11 +4327,11 @@ and apply_modifier = fn (s: Stmt) -> fn toks ->
        | SExpr e -> let (pat, r2) = parse_pattern_top r in apply_modifier (SExpr (EMatchTest (e, pat))) r2
        | _ -> (s, toks))
     else if str_eq id "if" then
-      let (c0, r2) = parse_andor (skip_nls r) in
+      let (c0, r2) = cond_in_pattern (parse_andor (skip_nls r)) in
       let c = cond_ff c0 in
       apply_modifier (SIf (Cons ((c, Cons (s, Nil)), Nil), decl_of s)) r2
     else if str_eq id "unless" then
-      let (c0, r2) = parse_andor (skip_nls r) in
+      let (c0, r2) = cond_in_pattern (parse_andor (skip_nls r)) in
       let c = cond_ff c0 in
       apply_modifier (SIf (Cons ((EUn ("!", c), Cons (s, Nil)), Nil), decl_of s)) r2
     else if str_eq id "while" then
@@ -4888,7 +5011,9 @@ and parse_stmt_id = fn toks ->
                 | _ -> false) then
       (let mode = (if str_eq id "attr_accessor" then "rw" else if str_eq id "attr_reader" then "r" else "w") in
        match r with
-       | Cons (TSym _, _) -> parse_attr mode r
+       | Cons (TSym _, _) ->
+         if attr_plain_list r then parse_attr mode r
+         else let (es, r2) = parse_puts_args r Nil in apply_modifier (SExpr (ECall (id, es))) r2
        | _ -> let (es, r2) = parse_puts_args r Nil in apply_modifier (SExpr (ECall (id, es))) r2)
     // `attr :sym` (and `attr :a, :b`) is the classic reader-only form.
     else if str_eq id "attr" && (match r with Cons (TSym _, _) -> true | _ -> false) then parse_attr "r" r
@@ -5134,7 +5259,10 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TNL _, _) -> (SBreak ENil, r)
        | Cons (TEOF, _) -> (SBreak ENil, r)
-       | Cons (TId k, _) -> if stops_value k then (SBreak ENil, r) else let (e, r2) = parse_expr r in (SBreak e, r2)
+       // `break k, visit(v)` hands back BOTH values, as an Array, whatever the
+       // first one starts with -- a name went through parse_expr alone and
+       // the `, visit(v)` was left over (rubygems' safe_marshal to_ruby.rb).
+       | Cons (TId k, _) -> if stops_value k then (SBreak ENil, r) else flow_values r (fn e -> SBreak e)
        | Cons (TP p, _) ->
          if str_eq p "}" || str_eq p ")" || str_eq p ";" then (SBreak ENil, r)
          else flow_values r (fn e -> SBreak e)
@@ -5143,7 +5271,10 @@ and parse_stmt_id = fn toks ->
       (match r with
        | Cons (TNL _, _) -> (SNext ENil, r)
        | Cons (TEOF, _) -> (SNext ENil, r)
-       | Cons (TId k, _) -> if stops_value k then (SNext ENil, r) else let (e, r2) = parse_expr r in (SNext e, r2)
+       // `next k, visit(v)` hands back BOTH values, as an Array, whatever the
+       // first one starts with -- a name went through parse_expr alone and
+       // the `, visit(v)` was left over (rubygems' safe_marshal to_ruby.rb).
+       | Cons (TId k, _) -> if stops_value k then (SNext ENil, r) else flow_values r (fn e -> SNext e)
        | Cons (TP p, _) ->
          if str_eq p "}" || str_eq p ")" || str_eq p ";" then (SNext ENil, r)
          else flow_values r (fn e -> SNext e)
@@ -5357,6 +5488,10 @@ and parse_rescue_classes = fn toks -> fn (acc: str list) ->
          // line and said so. Ruby evaluates whatever is there and matches with
          // `===`, which is what makes `rescue C.new` (a matcher object) work.
          else if str_eq p "." then parse_rescue_expr_item toks acc false
+         // ...and so is one followed by the `?` of a ternary: rubygems'
+         // request.rb rescues `Gem::HAVE_OPENSSL ? OpenSSL::SSL::SSLError :
+         // Errno::EHOSTDOWN, Errno::EHOSTDOWN => e`.
+         else if str_eq p "?" then parse_rescue_expr_item toks acc false
          // a constant that continues (`::` handled by scoped_name) is just the
          // constant here; `=>` / newline end the class list.
          else (rev_app (Cons (full, acc)) Nil, r0)
@@ -5418,6 +5553,17 @@ and parse_opt_kw_block = fn toks -> fn (kw: str) ->
   match toks with
   | Cons (TId id, r) -> if str_eq id kw then parse_stmts r Nil else (Nil, toks)
   | _ -> (Nil, toks)
+
+// Is the argument list nothing but names (`:a, :b`, `"c"`)? A keyword
+// argument makes it a call to whatever attr_accessor is in scope: net-imap's
+// Config defines its own, and writes `attr_accessor :debug, type: :boolean,
+// default: false`, which the declaration reader refused ("expected :symbol").
+and attr_plain_list = fn toks ->
+  match toks with
+  | Cons (TSym _, r) -> (match r with Cons (TP p, r2) -> (if str_eq p "," then attr_plain_list (skip_nls r2) else true) | _ -> true)
+  | Cons (TStrL _, r) -> (match r with Cons (TP p, r2) -> (if str_eq p "," then attr_plain_list (skip_nls r2) else true) | _ -> true)
+  | Cons (TP g, _) -> str_eq g "(s"
+  | _ -> false
 
 and parse_attr = fn (mode: str) -> fn toks ->
   let (syms, r) = parse_sym_list toks Nil in
@@ -5549,7 +5695,7 @@ and ff_operand = fn (e: Expr) ->
   | _ -> e
 
 and parse_if = fn toks -> fn (negate: bool) ->
-  let (cond1, r0) = parse_andor toks in
+  let (cond1, r0) = cond_in_pattern (parse_andor toks) in
   // `if x = compute rescue next` -- the rescue modifier binds tighter than the
   // `if`, so the CONDITION is `(x = compute) rescue next` (activesupport's
   // Messages::Rotator writes exactly that inside a block).
@@ -5594,7 +5740,7 @@ and parse_for = fn toks ->
   if for_targets_complex toks then
     let (targets, r2) = parse_for_xtargets toks Nil in
     let (e0, r3) = parse_for_expr r2 in
-    let (e, body, r4) = parse_for_iter e0 r3 in
+    let (e, body, r4) = parse_for_iter (for_bare_do r2) e0 r3 in
     (match targets with
      | Cons (t, Nil) ->
        (SExpr (EMethodB (e, "each", Nil, Cons ("__forv", Nil), Cons (for_xassign t (EVar "__forv"), body))), r4)
@@ -5603,7 +5749,7 @@ and parse_for = fn toks ->
   else
   let (vars, r2) = parse_for_vars toks Nil in
   let (e0, r3) = parse_for_expr r2 in
-  let (e, body, r4) = parse_for_iter e0 r3 in
+  let (e, body, r4) = parse_for_iter (for_bare_do r2) e0 r3 in
   (match vars with
    | Cons (v, Nil) ->
      // A single SPLAT target collects rather than binds: `for *r in [[1,2]]`
@@ -5638,9 +5784,14 @@ and parse_for_expr = fn toks ->
 
 // `for i in x do ... end` — a bare-variable iterable grabs the do-block as its
 // own; unwrap it back into the loop body. Shared by both for-target paths.
-and parse_for_iter = fn (e0: Expr) -> fn r3 ->
+// ...but only a `do` does that: `for k, v in sort{|a1, a2| ...}` (irb's
+// CONF#inspect) is a call with a brace block, which is the iterable itself,
+// and unwrapping it made the block the loop body and left `end` over.
+and for_bare_do = fn toks ->
+  match toks with Cons (TId _, Cons (TId d, _)) -> str_eq d "do" | _ -> false
+and parse_for_iter = fn (bare_do: bool) -> fn (e0: Expr) -> fn r3 ->
   match e0 with
-  | ECallB (nm, Nil, bps, bb) -> (match bps with Nil -> (EVar nm, bb, r3) | _ -> (e0, Nil, r3))
+  | ECallB (nm, Nil, bps, bb) when bare_do -> (match bps with Nil -> (EVar nm, bb, r3) | _ -> (e0, Nil, r3))
   | _ ->
     let r3b = (match r3 with Cons (TId d, rr) -> (if str_eq d "do" then rr else r3) | _ -> r3) in
     let (b, r4b) = parse_stmts r3b Nil in
@@ -6271,7 +6422,10 @@ and parse_whens = fn (subj: Expr) -> fn toks -> fn acc -> fn (seen: (str * int) 
   | Cons (TId id, r) ->
     if str_eq id "when" then
       let ln9 = tok_line t in
-      let (vs, r2) = parse_when_vals r Nil in
+      // the values may start on the NEXT line: ruby reads `when` then a
+      // newline then the value as one clause (rubygems' request.rb ends its
+      // certificate-error case that way), where this parsed an empty value.
+      let (vs, r2) = parse_when_vals (skip_nls r) Nil in
       let seen2 = when_note_dups vs seen ln9 in
       let (b, r3) = parse_stmts (skip_then r2) Nil in
       parse_whens subj r3 (Cons ((vs, b), acc)) seen2
@@ -6480,7 +6634,9 @@ and parse_def_inner = fn toks ->
       (match r with
        | Cons (TP p, r3) ->
          if is_lparen p then parse_params r3 Nil Nil
-         else if str_eq p "*" || str_eq p "&" || str_eq p " &" then parse_bare_params r Nil Nil
+         // `def send **kw` (debug's DAP/CDP servers): a paren-less list may
+         // open with the double splat as well as the single one.
+         else if str_eq p "*" || str_eq p "**" || str_eq p "&" || str_eq p " &" then parse_bare_params r Nil Nil
          else (Nil, Nil, r)
        | Cons (TId _, _) -> parse_bare_params r Nil Nil
        | _ -> (Nil, Nil, r)) in
@@ -6671,7 +6827,9 @@ and parse_bare_params = fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) 
 and parse_bare_after = fn (name: str) -> fn toks -> fn (acc: str list) -> fn (defs: (str * Expr) list) ->
   match toks with
   | Cons (TP p, r) ->
-    if str_eq p "," then parse_bare_params r (Cons (name, acc)) defs
+    // the list may wrap after a comma, as a call's does: debug's session.rb
+    // writes `def register_command *names,` and the keywords on the lines below.
+    if str_eq p "," then parse_bare_params (skip_nls r) (Cons (name, acc)) defs
     else (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, toks)
   | _ -> (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, toks);
 
