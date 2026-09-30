@@ -193,3 +193,36 @@ parser built on regexes and StringScanner rather than String#split -- so the
 quoted row is not measuring csv, it is measuring what this interpreter charges
 for a regex match and a scanner step. That is where to look before optimising
 anything the plain row touches.
+
+## `append.sh`
+
+```
+./bench/append.sh [mere-ruby ...]      # REPS (default 3), best-of, alternating
+```
+
+Is `String#<<` linear? A Mere `str` is immutable, so an append used to copy
+the whole receiver; now it queues beside the string and the next read folds
+the queue in (`str_pend` in m_state.mere). Six shapes -- the operator, the
+method, a BINARY buffer fed UTF-8 (negotiates every time), an Integer, a read
+after every append, and StringIO#write at the end of the stream -- each
+checked by its output against ruby, so a DIFF is reported instead of a time.
+As of 2026-09-30, -O2, seconds:
+
+| shape | before | after | ruby 4.0.6 |
+|---|---|---|---|
+| `s << 'ab'` x 20k | 0.207 | 0.160 | 0.105 |
+| `s << 'ab'` x 80k | 1.823 | 0.253 | 0.130 |
+| `s << 'ab'` x 300k | 24.574 | 0.766 | 0.142 |
+| `s.concat('ab')` x 80k | 2.029 | 0.259 | 0.119 |
+| `String.new << 'ab'` x 80k | 9.260 | 0.295 | 0.125 |
+| `s << 97` x 80k | 1.018 | 0.374 | 0.112 |
+| `s << 'ab'; s.size` x 20k | 0.795 | 0.231 | 0.125 |
+| `s << 'ab'; s.size` x 80k | 9.387 | 0.585 | 0.136 |
+| `io.write('ab')` x 20k | 1.797 | 0.845 | 0.105 |
+
+The 300k build peaked at 6.8 GB RSS before and 306 MB after. What the queue
+does NOT change: a read that needs the bytes (`s[i]`, a match, `slice!`) after
+every append still folds every time, so `buf << x; buf.slice!(0, k)` costs
+what it did -- the same peak footprint too (632 MB vs 633 MB for 50k rounds
+on a 4 KB buffer), which is the case a StrBuf-backed queue would have leaked.
+StringIO's remaining cost is its Ruby-level #write, linear but ~40 us a call.
