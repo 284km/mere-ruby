@@ -28,7 +28,7 @@ Classified: 221 files.
 
 </details>
 
-## DIFF — 218 files, 103 kinds
+## DIFF — 218 files, 102 kinds
 
 | files | kind |
 |---|---|
@@ -50,6 +50,7 @@ Classified: 221 files.
 | 3 | `FAILED expected not to be identical` |
 | 3 | `FAILED expected N, got nil` |
 | 3 | `FAILED expected "S" to match` |
+| 3 | `ERROR LoadError` |
 | 3 | `ERROR Encoding::UndefinedConversionError` |
 | 2 | `FAILED expected truthy from #start_with?` |
 | 2 | `FAILED expected truthy from #signaled?` |
@@ -60,7 +61,6 @@ Classified: 221 files.
 | 2 | `FAILED expected TypeError "S" to be raised` |
 | 2 | `FAILED expected #<OBJ>, got #<OBJ>` |
 | 2 | `FAILED expected "S", got nil` |
-| 2 | `ERROR LoadError` |
 | 2 | `ERROR Errno::ENOENT` |
 | 2 | `(tallies differ, lines identical)` |
 | 1 | `mere-ruby: invalid option N (-h will show valid options)` |
@@ -124,7 +124,6 @@ Classified: 221 files.
 | 1 | `FAILED expected "Kernel#warn spec edge case` |
 | 1 | `FAILED expected "#<TracePoint:SYM 'S' TMPDIR to match` |
 | 1 | `FAILED expected "` |
-| 1 | `ERROR SystemStackError` |
 | 1 | `ERROR StandardError` |
 | 1 | `ERROR RuntimeError` |
 | 1 | `<internal:SYM>:N:SYM 'S': No such file or directory @ rb_sysopen - (Errno::ENOENT)` |
