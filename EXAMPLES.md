@@ -8,77 +8,18 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **218** of **218** recorded DIFF files.
+Visited **189** of **189** recorded DIFF files.
 
 | file | what fails |
 |---|---|
 | command_line/backtrace_limit_spec.rb | pass=0 fail=3 err=0 pass=3 fail=0 err=0 |
-| command_line/dash_0_spec.rb | pass=0 fail=2 err=0 pass=2 fail=0 err=0 |
-| command_line/dash_0_spec.rb | FAILED: sets $/ and $-0: expected ": |
-| command_line/dash_c_spec.rb | pass=0 fail=2 err=0 pass=2 fail=0 err=0 |
-| command_line/dash_c_spec.rb | FAILED: checks syntax in given file: expected "Syntax OK", got "" |
-| command_line/dash_d_spec.rb | pass=0 fail=3 err=0 pass=3 fail=0 err=0 |
-| command_line/dash_d_spec.rb | FAILED: sets $DEBUG to true: expected "$DEBUG true", got "" |
-| command_line/dash_d_spec.rb | FAILED: sets $VERBOSE to true: expected "$VERBOSE true", got "" |
-| command_line/dash_e_spec.rb | pass=5 fail=4 err=0 pass=9 fail=0 err=0 |
-| command_line/dash_encoding_spec.rb | pass=0 fail=5 err=0 pass=4 fail=1 err=0 |
-| command_line/dash_encoding_spec.rb | FAILED: does not accept a third encoding: expected "[\"UTF-8\", nil]" to match |
-| command_line/dash_encoding_spec.rb | FAILED: if given a single encoding with an =: expected "[\"Big5\", nil]", got "" |
-| command_line/dash_encoding_spec.rb | FAILED: if given a single encoding as a separate argument: expected "[\"Big5\", nil]", got "" |
-| command_line/dash_external_encoding_spec.rb | pass=0 fail=2 err=0 pass=2 fail=0 err=0 |
-| command_line/dash_external_encoding_spec.rb | FAILED: if given an encoding with an =: expected "Big5", got "" |
-| command_line/dash_internal_encoding_spec.rb | pass=0 fail=2 err=0 pass=2 fail=0 err=0 |
-| command_line/dash_internal_encoding_spec.rb | FAILED: if given an encoding with an =: expected "Big5", got "" |
-| command_line/dash_r_spec.rb | pass=6 fail=3 err=0 pass=9 fail=0 err=0 |
-| command_line/dash_r_spec.rb | FAILED: requires the file before parsing the main script: expected truthy from #include? |
-| command_line/dash_r_spec.rb | FAILED: requires the file before parsing the main script: expected truthy from #include? |
-| command_line/dash_s_spec.rb | pass=0 fail=8 err=0 pass=8 fail=0 err=0 |
-| command_line/dash_s_spec.rb | FAILED: sets the value to true without an explicit value: expected "true", got "" |
-| command_line/dash_s_spec.rb | FAILED: parses single letter args into globals: expected "blah", got "" |
-| command_line/dash_upper_c_spec.rb | pass=0 fail=3 err=0 pass=3 fail=0 err=0 |
-| command_line/dash_upper_c_spec.rb | FAILED: changes the PWD when using a file: expected "/privateTMPDIR got "" |
-| command_line/dash_upper_c_spec.rb | FAILED: does not need a space after -C for the argument: expected "/privateTMPDIR got "" |
-| command_line/dash_upper_e_spec.rb | pass=0 fail=7 err=0 pass=7 fail=0 err=0 |
-| command_line/dash_upper_e_spec.rb | FAILED: sets the external encoding with '-E external': expected "EUC-JP", got "" |
-| command_line/dash_upper_e_spec.rb | FAILED: also sets the filesystem encoding with '-E external': expected "EUC-JP", got "" |
-| command_line/dash_upper_i_spec.rb | pass=3 fail=3 err=0 pass=6 fail=0 err=0 |
-| command_line/dash_upper_i_spec.rb | FAILED: adds the path at the front of $LOAD_PATH: expected truthy from #< |
-| command_line/dash_upper_i_spec.rb | FAILED: adds the path expanded from CWD to $LOAD_PATH: expected truthy from #include? |
-| command_line/dash_upper_k_spec.rb | pass=0 fail=11 err=0 pass=11 fail=0 err=0 |
-| command_line/dash_upper_k_spec.rb | FAILED: ignores unknown codes: expected "[\"UTF-8\", \"UTF-8\", nil]", got "" |
-| command_line/dash_upper_k_spec.rb | FAILED: to Encoding::BINARY with -Ka: expected "[\"ASCII-8BIT\", \"ASCII-8BIT\", nil]", got "" |
-| command_line/dash_upper_s_spec.rb | pass=2 fail=6 err=0 pass=2 fail=6 err=0 |
-| command_line/dash_upper_s_spec.rb | FAILED: runs launcher found in RUBYPATH, but only code after the first /#!.*ruby.*/-ish line in target file: expected "mere-ruby: invalid option -S  (-h will show valid options) |
-| command_line/dash_upper_s_spec.rb | FAILED: runs launcher found in PATH, but only code after the first /#!.*ruby.*/-ish line in target file: expected "mere-ruby: invalid option -S  (-h will show valid options) |
-| command_line/dash_upper_s_spec.rb | FAILED: runs launcher found in RUBYPATH: expected "mere-ruby: invalid option -S  (-h will show valid options) |
-| command_line/dash_upper_u_spec.rb | pass=0 fail=10 err=0 pass=10 fail=0 err=0 |
-| command_line/dash_upper_u_spec.rb | FAILED: sets Encoding.default_internal to UTF-8: expected "UTF-8", got "" |
-| command_line/dash_upper_u_spec.rb | FAILED: sets Encoding.default_internal to UTF-8 when RUBYOPT is empty or only spaces: expected "#<Encoding:UTF-8> |
-| command_line/dash_upper_x_spec.rb | pass=0 fail=3 err=0 pass=3 fail=0 err=0 |
-| command_line/dash_upper_x_spec.rb | FAILED: changes the PWD when using a file: expected "/privateTMPDIR got "" |
-| command_line/dash_upper_x_spec.rb | FAILED: does not need a space after -C for the argument: expected "/privateTMPDIR got "" |
-| command_line/dash_v_spec.rb | pass=1 fail=1 err=0 pass=2 fail=0 err=0 |
-| command_line/dash_x_spec.rb | pass=0 fail=4 err=0 pass=4 fail=0 err=0 |
-| command_line/dash_x_spec.rb | FAILED: runs code after the first /#!.*ruby.*/-ish line in target file: expected "success |
-| command_line/dash_x_spec.rb | FAILED: changes the working directory when given: expected "/privateTMPDIR |
-| command_line/feature_spec.rb | pass=10 fail=16 err=0 pass=24 fail=2 err=0 |
+| command_line/dash_r_spec.rb | pass=8 fail=1 err=0 pass=9 fail=0 err=0 |
+| command_line/dash_upper_i_spec.rb | pass=5 fail=1 err=0 pass=6 fail=0 err=0 |
+| command_line/feature_spec.rb | pass=16 fail=10 err=0 pass=26 fail=0 err=0 |
 | command_line/feature_spec.rb | FAILED: can be used with gems: expected "\"constant\"", got "nil" |
 | command_line/feature_spec.rb | FAILED: can be used with gems: expected "\"constant\"", got "nil" |
 | command_line/feature_spec.rb | FAILED: can be used with gem: expected "\"constant\"", got "nil" |
-| command_line/frozen_strings_spec.rb | pass=7 fail=10 err=0 pass=17 fail=0 err=0 |
-| command_line/frozen_strings_spec.rb | FAILED: produce the same object each time: expected "true", got "false" |
-| command_line/frozen_strings_spec.rb | FAILED: produce the same object for literals with the same content: expected "true", got "false" |
-| command_line/frozen_strings_spec.rb | FAILED: produce the same object for literals with the same content in different files: expected "true", got "false" |
-| command_line/rubylib_spec.rb | pass=9 fail=2 err=1 pass=10 fail=1 err=1 |
-| command_line/rubylib_spec.rb | FAILED: adds the directory at the front of $LOAD_PATH: expected truthy from #< |
-| command_line/rubylib_spec.rb | FAILED: adds the directory after directories added by -I within RUBYOPT: expected truthy from #include? |
-| command_line/rubylib_spec.rb | ERROR: The RUBYLIB environment variable adds the directory after directories added by -I within RUBYOPT: ArgumentError -- comparison of NilClass with 0 failed |
-| command_line/rubyopt_spec.rb | pass=5 fail=30 err=0 pass=35 fail=0 err=0 |
-| command_line/rubyopt_spec.rb | FAILED: adds the -I path to $LOAD_PATH: expected "optrubyspecincl", got nil |
-| command_line/rubyopt_spec.rb | FAILED: sets $DEBUG to true for '-d': expected "value of $DEBUG is false |
-| command_line/rubyopt_spec.rb | FAILED: prints the version number for '-v': expected "ruby 4.0.6 (2026-07-14 revision 03b6d3f889) [arm64-darwin25]", got "" |
-| command_line/syntax_error_spec.rb | pass=0 fail=2 err=0 pass=2 fail=0 err=0 |
-| command_line/syntax_error_spec.rb | FAILED: prints an error when given a file with invalid syntax: expected truthy from #include? |
+| command_line/rubylib_spec.rb | pass=11 fail=1 err=0 pass=12 fail=0 err=0 |
 | core/basicobject/__id__spec.rb | pass=12 fail=1 err=0 pass=13 fail=0 err=0 |
 | core/basicobject/basicobject_spec.rb | pass=7 fail=6 err=0 pass=13 fail=0 err=0 |
 | core/basicobject/basicobject_spec.rb | FAILED: raises NoMethodError for nonexistent methods after #method_missing is removed: expected "NoMethodError", got "" |
@@ -90,7 +31,6 @@ Visited **218** of **218** recorded DIFF files.
 | core/binding/dup_spec.rb | pass=23 fail=3 err=0 pass=26 fail=0 err=0 |
 | core/binding/dup_spec.rb | FAILED: copies the finalizer: expected ["finalized |
 | core/binding/dup_spec.rb | FAILED: retains original binding variables but the list is distinct: expected [:a, :bind1, :bind2], got [:a, :bind1] |
-| core/binding/eval_spec.rb | pass=21 fail=0 err=1 pass=22 fail=0 err=0 |
 | core/binding/local_variable_set_spec.rb | pass=12 fail=1 err=0 pass=13 fail=0 err=0 |
 | core/binding/local_variables_spec.rb | pass=4 fail=2 err=0 pass=6 fail=0 err=0 |
 | core/binding/local_variables_spec.rb | FAILED: includes local variables defined after calling binding.local_variables: expected [:a, :b], got [] |
@@ -119,12 +59,12 @@ Visited **218** of **218** recorded DIFF files.
 | core/fiber/raise_spec.rb | ERROR: with cause keyword argument uses the cause from the calling context: RuntimeError -- second error |
 | core/fiber/raise_spec.rb | ERROR: with cause keyword argument accepts a cause keyword argument that overrides the last exception: RuntimeError -- second error |
 | core/file/basename_spec.rb | pass=191 fail=0 err=1 pass=193 fail=0 err=0 |
-| core/file/new_spec.rb | pass=41 fail=3 err=6 pass=54 fail=0 err=0 |
-| core/file/new_spec.rb | ERROR: File.new returns a new File with modus num and permissions: NotImplementedError -- umask() function is unimplemented on this machine |
+| core/file/new_spec.rb | pass=46 fail=1 err=5 pass=54 fail=0 err=0 |
+| core/file/new_spec.rb | FAILED: returns a new File with modus num and permissions: expected "100744", got "100666" |
 | core/file/new_spec.rb | ERROR: File.new returns a new File with modus fd: Errno::ENOENT -- No such file or directory @ rb_sysopen - |
-| core/file/new_spec.rb | FAILED: raises an Errno::EEXIST if the file exists when create a new file with File::CREAT\|File::EXCL: expected Errno::EEXIST to be raised |
-| core/file/open_spec.rb | pass=89 fail=21 err=10 pass=130 fail=0 err=0 |
-| core/file/open_spec.rb | ERROR: File.open opens the file when passed mode, num and permissions: NotImplementedError -- umask() function is unimplemented on this machine |
+| core/file/new_spec.rb | ERROR: File.new does not use the given block and warns to use File::open: RuntimeError -- |
+| core/file/open_spec.rb | pass=103 fail=11 err=9 pass=130 fail=0 err=0 |
+| core/file/open_spec.rb | FAILED: opens the file when passed mode, num and permissions: expected "100744", got "100666" |
 | core/file/open_spec.rb | FAILED: opens the file when passed mode, num, permissions and block: expected "100755", got "100644" |
 | core/file/open_spec.rb | FAILED: creates a new write-only file when invoked with 'w' and '0222': expected false, got true |
 | core/file/size_spec.rb | pass=21 fail=0 err=1 pass=22 fail=0 err=0 |
@@ -133,7 +73,6 @@ Visited **218** of **218** recorded DIFF files.
 | core/file/stat/socket_spec.rb | pass=2 fail=0 err=1 pass=2 fail=0 err=1 |
 | core/file/stat/socket_spec.rb | ERROR: File::Stat#socket? returns true if the file is a socket: NotImplementedError -- UNIXSocket is not implemented (mere-ruby cannot pass a sockaddr_un to connect(2)) |
 | core/file/stat_spec.rb | pass=6 fail=0 err=1 pass=14 fail=0 err=0 |
-| core/file/umask_spec.rb | pass=5 fail=0 err=1 pass=7 fail=0 err=0 |
 | core/filetest/socket_spec.rb | pass=3 fail=0 err=1 pass=3 fail=0 err=1 |
 | core/filetest/socket_spec.rb | ERROR: FileTest.socket? returns true if the file is a socket: NotImplementedError -- UNIXSocket is not implemented (mere-ruby cannot pass a sockaddr_un to connect(2)) |
 | core/gc/config_spec.rb | pass=12 fail=0 err=0 pass=19 fail=0 err=0 |
@@ -158,8 +97,7 @@ Visited **218** of **218** recorded DIFF files.
 | core/kernel/__dir___spec.rb | FAILED: returns the real name of the directory containing the currently-executing file: expected "/privateTMPDIR got "TMPDIR |
 | core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected ".", got "TMPDIR" |
 | core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected "foo", got "TMPDIR" |
-| core/kernel/at_exit_spec.rb | pass=15 fail=2 err=0 pass=17 fail=0 err=0 |
-| core/kernel/at_exit_spec.rb | FAILED: runs handlers even if the main script fails to parse: expected truthy from #include? |
+| core/kernel/at_exit_spec.rb | pass=16 fail=1 err=0 pass=17 fail=0 err=0 |
 | core/kernel/autoload_spec.rb | pass=24 fail=0 err=1 pass=25 fail=0 err=0 |
 | core/kernel/binding_spec.rb | pass=9 fail=0 err=1 pass=14 fail=0 err=0 |
 | core/kernel/caller_locations_spec.rb | pass=29 fail=1 err=0 pass=31 fail=1 err=0 |
@@ -169,7 +107,7 @@ Visited **218** of **218** recorded DIFF files.
 | core/kernel/caller_spec.rb | FAILED: returns an Array with the block given to #at_exit at the base of the stack: expected 2, got 3 |
 | core/kernel/chomp_spec.rb | pass=9 fail=1 err=0 pass=10 fail=0 err=0 |
 | core/kernel/chop_spec.rb | pass=6 fail=1 err=0 pass=7 fail=0 err=0 |
-| core/kernel/eval_spec.rb | pass=91 fail=8 err=5 pass=104 fail=0 err=0 |
+| core/kernel/eval_spec.rb | pass=92 fail=8 err=4 pass=104 fail=0 err=0 |
 | core/kernel/eval_spec.rb | FAILED: does not share locals across eval scopes: expected "NameError", got "2" |
 | core/kernel/eval_spec.rb | FAILED: includes file and line information in syntax error: expected "syntax error" to match |
 | core/kernel/eval_spec.rb | FAILED: evaluates string with given filename and negative linenumber: expected "syntax error" to match |
@@ -198,10 +136,6 @@ Visited **218** of **218** recorded DIFF files.
 | core/kernel/warn_spec.rb | FAILED: does not call Warning.warn if self is the Warning module: expected "Kernel#warn spec edge case |
 | core/kernel/warn_spec.rb | FAILED: does not call Warning.warn if self is the Warning module: expected truthy from #success? |
 | core/main/include_spec.rb | pass=1 fail=1 err=0 pass=2 fail=0 err=0 |
-| core/main/using_spec.rb | pass=1 fail=2 err=8 pass=17 fail=0 err=0 |
-| core/main/using_spec.rb | ERROR: main.using requires one Module argument: NameError -- undefined local variable or method 'using' for main |
-| core/main/using_spec.rb | ERROR: main.using uses refinements from the given module only in the target file: StandardError -- mere-ruby: undefined method 'should' |
-| core/main/using_spec.rb | FAILED: uses refinements from the given module for method calls in the target file: expected NoMethodError to be raised |
 | core/marshal/dump_spec.rb | pass=226 fail=0 err=2 pass=228 fail=0 err=0 |
 | core/marshal/dump_spec.rb | ERROR: with a Regexp dumps a Regexp with instance variables: FrozenError -- can't modify frozen Regexp: // |
 | core/marshal/load_spec.rb | pass=316 fail=4 err=3 pass=325 fail=0 err=0 |
@@ -223,15 +157,6 @@ Visited **218** of **218** recorded DIFF files.
 | core/module/define_method_spec.rb | FAILED: sets the visibility to private when method is named :initialize: expected truthy from #include? |
 | core/module/define_method_spec.rb | FAILED: raises TypeError if name cannot converted to String: expected TypeError /is not a symbol nor a string/ to be raised |
 | core/module/prepend_spec.rb | pass=74 fail=12 err=1 pass=88 fail=0 err=0 |
-| core/module/refine_spec.rb | pass=30 fail=3 err=10 pass=46 fail=0 err=0 |
-| core/module/refine_spec.rb | ERROR: Module#refine applies refinements to the module: NoMethodError -- undefined method 'foo?' for an instance of Array |
-| core/module/refine_spec.rb | ERROR: Module#refine applies refinements to calls in the refine block: NoMethodError -- undefined method 'foo' for an instance of String |
-| core/module/refine_spec.rb | FAILED: does not make available methods from another refinement module: expected NoMethodError to be raised |
-| core/module/used_refinements_spec.rb | pass=3 fail=1 err=0 pass=4 fail=0 err=0 |
-| core/module/using_spec.rb | pass=12 fail=5 err=3 pass=20 fail=0 err=0 |
-| core/module/using_spec.rb | FAILED: does not accept class: expected TypeError to be raised |
-| core/module/using_spec.rb | ERROR: Module#using raises TypeError if passed something other than module: RuntimeError -- Module#using is not called on self |
-| core/module/using_spec.rb | FAILED: returns self: expected to be identical |
 | core/objectspace/define_finalizer_spec.rb | pass=20 fail=2 err=0 pass=22 fail=0 err=0 |
 | core/objectspace/define_finalizer_spec.rb | FAILED: warns if an exception is raised in finalizer: expected truthy from #include? |
 | core/proc/clone_spec.rb | pass=10 fail=1 err=1 pass=12 fail=0 err=0 |
@@ -256,14 +181,6 @@ Visited **218** of **218** recorded DIFF files.
 | core/process/daemon_spec.rb | pass=1 fail=0 err=1 pass=25 fail=0 err=0 |
 | core/process/exec_spec.rb | pass=24 fail=3 err=0 pass=27 fail=0 err=0 |
 | core/process/fork_spec.rb | pass=2 fail=0 err=1 pass=8 fail=0 err=0 |
-| core/process/getpriority_spec.rb | pass=0 fail=0 err=4 pass=4 fail=0 err=0 |
-| core/process/getpriority_spec.rb | ERROR: Process.getpriority coerces arguments to Integers: NoMethodError -- undefined method 'getpriority' for module Process |
-| core/process/getpriority_spec.rb | ERROR: Process.getpriority gets the scheduling priority for a specified process: NoMethodError -- undefined method 'getpriority' for module Process |
-| core/process/getpriority_spec.rb | ERROR: Process.getpriority gets the scheduling priority for a specified process group: NoMethodError -- undefined method 'getpriority' for module Process |
-| core/process/getrlimit_spec.rb | pass=0 fail=0 err=9 pass=29 fail=0 err=0 |
-| core/process/getrlimit_spec.rb | ERROR: Process.getrlimit returns a two-element Array of Integers: NoMethodError -- undefined method 'getrlimit' for module Process |
-| core/process/getrlimit_spec.rb | ERROR: when passed an Object calls #to_int to convert to an Integer: NoMethodError -- undefined method 'getrlimit' for module Process |
-| core/process/getrlimit_spec.rb | ERROR: when passed an Object raises a TypeError if #to_int does not return an Integer: NoMethodError -- undefined method 'getrlimit' for module Process |
 | core/process/kill_spec.rb | pass=6 fail=12 err=0 pass=18 fail=0 err=0 |
 | core/process/kill_spec.rb | FAILED: accepts a Symbol as a signal name: expected "signaled", got "" |
 | core/process/kill_spec.rb | FAILED: accepts a String as signal name: expected "signaled", got "" |
@@ -274,11 +191,8 @@ Visited **218** of **218** recorded DIFF files.
 | core/process/setpgid_spec.rb | (nothing failed -- the record may be stale) |
 | core/process/setpgrp_spec.rb | pass=0 fail=0 err=0 pass=1 fail=0 err=0 |
 | core/process/setpgrp_spec.rb | (nothing failed -- the record may be stale) |
-| core/process/setpriority_spec.rb | pass=0 fail=0 err=1 pass=2 fail=0 err=0 |
-| core/process/setrlimit_spec.rb | pass=0 fail=0 err=30 pass=30 fail=0 err=0 |
-| core/process/setrlimit_spec.rb | ERROR: when passed an Object calls #to_int to convert resource to an Integer: NoMethodError -- undefined method 'getrlimit' for module Process |
-| core/process/setrlimit_spec.rb | ERROR: when passed an Object raises a TypeError if #to_int for resource does not return an Integer: NoMethodError -- undefined method 'getrlimit' for module Process |
-| core/process/setrlimit_spec.rb | ERROR: when passed an Object calls #to_int to convert the soft limit to an Integer: NoMethodError -- undefined method 'getrlimit' for module Process |
+| core/process/setrlimit_spec.rb | pass=28 fail=0 err=2 pass=30 fail=0 err=0 |
+| core/process/setrlimit_spec.rb | ERROR: when passed a Symbol coerces :STACK into RLIMIT_STACK: Errno::EINVAL -- Invalid argument - setrlimit |
 | core/process/spawn_spec.rb | pass=96 fail=4 err=0 pass=100 fail=0 err=0 |
 | core/process/status/exited_spec.rb | pass=1 fail=1 err=0 pass=2 fail=0 err=0 |
 | core/process/status/exitstatus_spec.rb | pass=1 fail=1 err=0 pass=2 fail=0 err=0 |
@@ -295,10 +209,7 @@ Visited **218** of **218** recorded DIFF files.
 | core/range/clone_spec.rb | pass=10 fail=2 err=0 pass=12 fail=0 err=0 |
 | core/range/clone_spec.rb | FAILED: duplicates the range: expected not to be identical |
 | core/range/dup_spec.rb | pass=6 fail=1 err=0 pass=7 fail=0 err=0 |
-| core/refinement/import_methods_spec.rb | pass=0 fail=0 err=15 pass=19 fail=0 err=0 |
-| core/refinement/import_methods_spec.rb | ERROR: Refinement#import_methods warns if a module includes/prepends some other module: NoMethodError -- undefined method 'import_methods' for module #<refinement:String@#<Module:0xADDR>> |
-| core/refinement/import_methods_spec.rb | ERROR: Refinement#import_methods doesn't import methods from included/prepended modules: NoMethodError -- undefined method 'import_methods' for module #<refinement:String@#<Module:0xADDR>> |
-| core/refinement/import_methods_spec.rb | ERROR: Refinement#import_methods doesn't import any methods if one of the arguments is not a module: NoMethodError -- undefined method 'import_methods' for module #<refinement:String@#<Module:0xADDR>> |
+| core/refinement/import_methods_spec.rb | pass=18 fail=1 err=0 pass=19 fail=0 err=0 |
 | core/regexp/initialize_spec.rb | pass=3 fail=0 err=1 pass=4 fail=0 err=0 |
 | core/regexp/last_match_spec.rb | pass=9 fail=2 err=0 pass=11 fail=0 err=0 |
 | core/regexp/last_match_spec.rb | FAILED: raises an IndexError when given a missing name: expected IndexError to be raised |
@@ -329,7 +240,7 @@ Visited **218** of **218** recorded DIFF files.
 | core/thread/element_set_spec.rb | pass=8 fail=0 err=1 pass=9 fail=0 err=0 |
 | core/thread/handle_interrupt_spec.rb | pass=21 fail=0 err=0 pass=21 fail=2 err=0 |
 | core/thread/handle_interrupt_spec.rb | (nothing failed -- the record may be stale) |
-| core/thread/list_spec.rb | pass=911 fail=0 err=0 pass=498571 fail=0 err=0 |
+| core/thread/list_spec.rb | pass=911 fail=0 err=0 pass=556061 fail=0 err=0 |
 | core/thread/list_spec.rb | (nothing failed -- the record may be stale) |
 | core/thread/native_thread_id_spec.rb | pass=0 fail=0 err=3 pass=5 fail=0 err=0 |
 | core/thread/native_thread_id_spec.rb | ERROR: Thread#native_thread_id returns an integer when the thread is alive: NoMethodError -- undefined method 'native_thread_id' for an instance of Thread |
@@ -378,8 +289,7 @@ Visited **218** of **218** recorded DIFF files.
 | core/unboundmethod/source_location_spec.rb | pass=8 fail=1 err=0 pass=9 fail=0 err=0 |
 | core/warning/element_set_spec.rb | pass=8 fail=1 err=0 pass=9 fail=0 err=0 |
 | core/warning/performance_warning_spec.rb | pass=0 fail=1 err=0 pass=1 fail=0 err=0 |
-| language/END_spec.rb | pass=16 fail=2 err=0 pass=18 fail=0 err=0 |
-| language/END_spec.rb | FAILED: runs handlers even if the main script fails to parse: expected truthy from #include? |
+| language/END_spec.rb | pass=17 fail=1 err=0 pass=18 fail=0 err=0 |
 | language/assignments_spec.rb | pass=59 fail=2 err=2 pass=63 fail=0 err=0 |
 | language/assignments_spec.rb | ERROR: given block argument raises SyntaxError: ArgumentError -- wrong number of arguments (given 3, expected 2) |
 | language/assignments_spec.rb | FAILED: raises SyntaxError when given keyword arguments in index assignments: expected SyntaxError /keywords are not allowed in index assignment expressions\|keyword arg given in index assignment/ to be raised |
@@ -407,16 +317,10 @@ Visited **218** of **218** recorded DIFF files.
 | language/hash_spec.rb | pass=95 fail=0 err=2 pass=97 fail=0 err=0 |
 | language/hash_spec.rb | ERROR: hash with omitted value raises a SyntaxError when the hash key ends with `!`: SyntaxError -- syntax error |
 | language/heredoc_spec.rb | pass=24 fail=1 err=0 pass=25 fail=0 err=0 |
-| language/if_spec.rb | pass=59 fail=2 err=0 pass=61 fail=0 err=0 |
-| language/if_spec.rb | FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc> |
 | language/lambda_spec.rb | pass=119 fail=6 err=2 pass=129 fail=0 err=0 |
 | language/lambda_spec.rb | FAILED: : expected to be identical |
 | language/lambda_spec.rb | FAILED: : expected [9, 8, [7], [], 6, 5, 4, 3, {}, #<Proc:0xADDR TMPDIR (lambda)>], got [9, 8, [7], [], 6, 5, 4, 3, {}, #<Proc:0xADDR TMPDIR |
 | language/lambda_spec.rb | FAILED: : expected [1, 1, [], 2, 3, 2, 4, {h: 5, i: 6}, #<Proc:0xADDR TMPDIR (lambda)>], got [1, 1, [], 2, 3, 2, 4, {h: 5, i: 6}, #<Proc:0xADDR TMPDIR |
-| language/magic_comment_spec.rb | pass=23 fail=30 err=1 pass=54 fail=0 err=0 |
-| language/magic_comment_spec.rb | FAILED: are case-insensitive: expected "Big5", got "UTF-8" |
-| language/magic_comment_spec.rb | FAILED: can be after the shebang: expected "Big5", got "UTF-8" |
-| language/magic_comment_spec.rb | FAILED: can take Emacs style: expected "Big5", got "UTF-8" |
 | language/method_spec.rb | pass=296 fail=5 err=0 pass=301 fail=0 err=0 |
 | language/method_spec.rb | FAILED: warns when passing a block argument to a method that never uses it: matcher did not match #<Proc> |
 | language/method_spec.rb | FAILED: warns when passing a block argument to a method that calls #block_given?: matcher did not match #<Proc> |
@@ -455,12 +359,12 @@ Visited **218** of **218** recorded DIFF files.
 | language/return_spec.rb | FAILED: is not allowed: expected LocalJumpError to be raised |
 | language/return_spec.rb | ERROR: within BEGIN is allowed: SyntaxError -- BEGIN is permitted only at toplevel |
 | language/safe_navigator_spec.rb | pass=24 fail=1 err=0 pass=25 fail=0 err=0 |
-| language/string_spec.rb | pass=76 fail=4 err=1 pass=81 fail=0 err=0 |
+| language/string_spec.rb | pass=79 fail=1 err=1 pass=81 fail=0 err=0 |
 | language/string_spec.rb | FAILED: backslashes follow the same rules as interpolation: expected " |
-| language/string_spec.rb | ERROR: Ruby character strings allows a dynamic string to parse a nested do...end block as an argument to a call without parens, interpolated: SyntaxError -- syntax error |
-| language/string_spec.rb | FAILED: produce the same object each time: expected "true", got "false" |
 | language/variables_spec.rb | pass=170 fail=2 err=0 pass=172 fail=0 err=0 |
 | language/variables_spec.rb | FAILED: parses a non-ASCII upcased character as a constant identifier: expected SyntaxError /dynamic constant assignment/ to be raised |
+| library/etc/getgrgid_spec.rb | pass=2011 fail=0 err=0 |
+| library/etc/getgrgid_spec.rb | (nothing failed -- the record may be stale) |
 | library/irb/irb_spec.rb | pass=0 fail=1 err=0 pass=1 fail=0 err=0 |
 | library/logger/logger/new_spec.rb | pass=11 fail=3 err=1 pass=16 fail=0 err=0 |
 | library/logger/logger/new_spec.rb | FAILED: receives a maximum logfile size as third argument: expected truthy from #exist? |

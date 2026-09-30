@@ -32,11 +32,11 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 64 of 1413 names
-  IO (19): binmode binmode? close_read close_write fdatasync fsync ioctl lineno pos pread pwrite rewind seek set_encoding_by_bom tell timeout to_i to_io wait_priority
-  Kernel (17): !~ === __callee__ __dir__ __method__ block_given? define_singleton_method format gem gem_original_require global_variables lambda load local_variables proc singleton_method sprintf
-  Process (8): _fork getpriority getrlimit setpgid setpgrp setpriority setproctitle setrlimit
+ABSENT: 58 of 1410 names
+  IO (18): binmode binmode? close_read close_write fdatasync fsync ioctl lineno pos pread pwrite rewind seek set_encoding_by_bom tell timeout to_i to_io
+  Kernel (16): !~ === __callee__ __dir__ __method__ block_given? define_singleton_method format gem gem_original_require global_variables lambda local_variables proc singleton_method sprintf
   Dir (7): close fileno pos rewind seek tell to_path
+  Process (4): _fork setpgid setpgrp setproctitle
   GC (3): latest_gc_info stat_heap verify_internal_consistency
   Thread (3): add_trace_func native_thread_id set_trace_func
   Module (2): define_method used_modules
@@ -45,11 +45,20 @@ ABSENT: 64 of 1413 names
   ObjectSpace (1): count_objects
   Random (1): seed
 
-SEND-ONLY: 6 of 1413 names
+SEND-ONLY: 5 of 1410 names
   IO (3): lineno= pos= timeout=
-  Kernel (2): autoload load
+  Kernel (1): autoload
   Dir (1): pos=
 ```
+
+2026-09-30, later: **58 ABSENT of 1410**. Process lost `getrlimit`
+`setrlimit` `getpriority` `setpriority` (mere v0.1.550's host builtins),
+Kernel `load` (a `super` into it reaches it now). The list is three names
+shorter because the probe now skips `wait_readable` / `wait_writable` /
+`wait_priority`: on `$stdout`, a pipe when the output is captured, they
+block for good -- as ruby's do -- once IO#wait_* really poll the descriptor,
+and the probe hung on them.
+
 
 2026-09-30: **64 ABSENT of 1413**, same reference (4.0.6), re-probed after the
 eight parallel clusters and the constants / regexp / string / binding work
