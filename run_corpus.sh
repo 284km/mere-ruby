@@ -109,17 +109,25 @@ sb_both=0
 
 pass=0
 for f in corpus/*.rb; do
-  ruby "$f" > "$exp" 2>/dev/null
-  "$MR_BIN" "$f" > "$got"
+  # ⚠ THE EXIT STATUS IS PART OF THE ANSWER, and under `set -e` a program that
+  # ended non-zero stopped the gate on that line: no FAIL, no diff, just exit
+  # 1 -- even when both sides failed the same way and printed the same thing.
+  # Both statuses are read, and a difference in either is a FAIL that says so.
+  rrc=0; ruby "$f" > "$exp" 2>/dev/null || rrc=$?
+  mrc=0; "$MR_BIN" "$f" > "$got" || mrc=$?
   if ! diff -u "$exp" "$got" > "$dif"; then
     echo "FAIL $f"
     cat "$dif"
     exit 1
   fi
+  if [ "$rrc" != "$mrc" ]; then
+    echo "FAIL $f (same output, but ruby exited $rrc and mere-ruby $mrc)"
+    exit 1
+  fi
   if [ "$sb_both" = 1 ]; then
-    MERE_RUBY_NO_HASH_INDEX=1 "$MR_BIN" "$f" > "$got"
-    if ! diff -u "$exp" "$got" > "$dif"; then
-      echo "FAIL $f (with MERE_RUBY_NO_HASH_INDEX=1)"
+    mrc=0; MERE_RUBY_NO_HASH_INDEX=1 "$MR_BIN" "$f" > "$got" || mrc=$?
+    if ! diff -u "$exp" "$got" > "$dif" || [ "$rrc" != "$mrc" ]; then
+      echo "FAIL $f (with MERE_RUBY_NO_HASH_INDEX=1; ruby exited $rrc, mere-ruby $mrc)"
       cat "$dif"
       exit 1
     fi
