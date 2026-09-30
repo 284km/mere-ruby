@@ -1944,7 +1944,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // answered VNil: `while gets; print; end` -- ruby's -n loop written out --
     // printed nothing at all. With no arguments it writes `$_`.
     else if (str_len name == 5 && str_eq name "print") && (if kernel_overridden env world "print" then false else true) then
-      (let _ = (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ()) in VNil)
+      (let _ = (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ()) in
+       let _ = (let rs = print_ors () in if str_eq rs "" then () else out_emit world rs) in VNil)
     // ...and a bare `p` / `pp` prints nothing and answers nil; it was a
     // NoMethodError here, since the method lives in the argument-taking arm.
     else if ((str_len name == 1 && str_eq name "p") || (str_len name == 2 && str_eq name "pp"))
@@ -2178,9 +2179,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       // ⚠ with NO arguments it writes `$_` -- the last line `gets` read. An
       // empty argument list is not "print nothing"; `while gets; print; end`
       // is the whole of ruby's -n loop and it printed nothing here.
-      (match args with
-       | Nil -> (let _ = (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ()) in VNil)
-       | _ -> let _ = print_each world args in VNil)
+      (let _ = (match args with
+                | Nil -> (if map_has globals "_" then puts_one_nonl world (map_get globals "_") else ())
+                | _ -> print_each world args) in
+       let _ = (let rs = print_ors () in if str_eq rs "" then () else out_emit world rs) in VNil)
     // Kernel#putc: one character of a String, or the low byte of an integer
     // (#to_int), written THROUGH $stdout like print -- a replaced $stdout gets
     // #putc when it has one of its own and #write otherwise (rb_f_putc
@@ -16648,7 +16650,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           VNil)
        else if (str_len name == 5 && str_eq name "print") then
          (let _ = io_std_direct (if fd == 2 then "stderr" else "stdout") (fn (u: unit) ->
-                    (if fd == 2 then err_raw (io_join_go args "") else print_each world args)) in
+                    (if fd == 2 then err_raw (io_join_go args "" ++ print_ors ())
+                     else (let _ = print_each world args in
+                           let rs = print_ors () in if str_eq rs "" then () else out_emit world rs))) in
           VNil)
        // printf and putc were missing on the standard streams (NoMethodError)
        else if (str_len name == 6 && str_eq name "printf") then
@@ -22971,6 +22975,26 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
 //   either comes back here with THAT frame as its env, which is how the round
 //   trip is stopped after one lap (the frame is not recycled if the call
 //   unwinds; it is one small map). `puts` is a statement form, not a call.
+// `super` into a Kernel function: the function runs as the bare call it is,
+// with self the receiver, in a frame marked __ksuper so that the checks which
+// let a program's own definition win (self_defines, kernel_overridden) do not
+// hand it back to the override that called super. The arguments travel as
+// hidden locals, as in kernel_by_name.
+and kernel_super = fn world -> fn superblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let e9 = map_new () in
+  let _ = map_set e9 "self" recv in
+  let _ = map_set e9 "__ksuper" VNil in
+  let _ = map_set e9 "__kbn" VNil in
+  let rec bind9 = fn (xs: Val list) -> fn (i: int) ->
+    (match xs with
+     | Nil -> (Nil : Expr list)
+     | Cons (v9, t9) ->
+       (let k9 = "__kbn" ++ str_of_int i in
+        let _ = map_set e9 k9 v9 in
+        Cons (EVar k9, bind9 t9 (i + 1)))) in
+  if str_eq name "puts" then
+    (match exec_stmt e9 world superblk (SPuts (bind9 args 0)) with FNext v9 -> v9 | _ -> VNil)
+  else eval_e e9 world superblk (ECall (name, bind9 args 0))
 and kernel_by_name = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
   if map_has env "__kbn" then try_self_call_x env world VNil name args true
   else if str_eq name "puts" then
@@ -29917,7 +29941,11 @@ and srand_val = fn env -> fn world -> fn (args: Val list) ->
    prev)
 
 and self_defines = fn env -> fn world -> fn (name: str) ->
-  if lv_has env "self" then
+  // a Kernel function reached by `super` (kernel_super): the definition self
+  // has IS the one that called super, and answering "self defines it" would
+  // send the call straight back to it
+  if lv_has env "__ksuper" then false
+  else if lv_has env "self" then
     (match lv_get env "self" with
      | VObj id -> (let (_, _, ocls0, _) = world in has_meth world (map_get ocls0 id) name)
      | VClass c -> has_meth world ("(sng:" ++ c ++ ")") name
@@ -30950,6 +30978,12 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
      let _ = map_set e2 "self" recv in
      kernel_warn e2 world args)
   else if is_prim_method meth then prim_method recv meth args
+  // Kernel's functions are ancestors of every object, so `super` from an
+  // override of one reaches it: `def load(name, wrap = false) = super` is how
+  // ruby/spec's CodeLoadingSpecs::Method calls Kernel#load, and `def puts(x)
+  // = super` is the ordinary way to wrap output. See kernel_super.
+  else if is_kernel_builtin meth && (if kernel_bare_special meth then false else true) then
+    kernel_super world superblk recv meth args
   // a Thread subclass's `super` from #initialize is Thread#initialize, which
   // starts the body (with the block super was given)
   else if str_eq meth "initialize" && thr_is_thread world recv then
@@ -42158,6 +42192,12 @@ and print_each = fn world -> fn (args: Val list) ->
   match args with
   | Nil -> ()
   | Cons (v, t) -> let _ = puts_one_nonl world v in print_each world t
+
+// `$\`, the output record separator: print writes it after its arguments
+// (ruby -l sets it to $/, which is how `-lpe` ends each line)
+and print_ors = fn (u: unit) ->
+  let k = gvar_slot "\\" in
+  if map_has globals k then (match map_get globals k with VStr h -> sget h | _ -> "") else ""
 
 // like puts_one but without the trailing newline (for Kernel#print).
 and puts_one_nonl = fn world -> fn (v: Val) ->

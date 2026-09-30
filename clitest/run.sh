@@ -19,11 +19,11 @@
 #     reference-free half is checked always (`-v` must equal
 #     RUBY_DESCRIPTION, because two copies of one string drift), and the
 #     comparison is made only when the versions match, and SKIPped out loud.
-#   * the bare invocation -- ruby reads stdin, mere-ruby prints usage on
-#     purpose (read_stdin blocks until EOF, so a bare run with no input would
-#     HANG instead of failing, and a hanging gate is worse than a failing one).
-#     Checked as a DELIBERATE divergence with a bounded wait, so if it ever
-#     starts blocking this fails instead of never returning.
+#   * the bare invocation at a TERMINAL -- ruby waits for a program on stdin,
+#     mere-ruby prints usage (a person at a silent prompt is the case it is
+#     for). A gate has no terminal, so what is checked here is the other half:
+#     with stdin redirected, both read the program from it. The wait is
+#     bounded, so a run that blocks fails instead of never returning.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 # see run_corpus.sh: a candidate build is gated before it takes over the path.
@@ -78,6 +78,19 @@ cmp_both "flags after FILE -> ARGV" -- "-I$tmp/inc" "$tmp/s.rb" -Ilib --foo
 cmp_both "-- ends options"    -- "-I$tmp/inc" -- "$tmp/s.rb" -v
 cmp_stdin "- reads stdin"     'puts "stdin ok"' -
 cmp_stdin "- then ARGV"       'p ARGV' - a b
+# The loop switches: here stdin is the program's INPUT, and -e the program.
+lines='a b
+c:d'
+cmp_stdin "-n"                "$lines" -n -e 'puts $_.size'
+cmp_stdin "-p"                "$lines" -p -e '$_ = $_.upcase'
+cmp_stdin "-ne glued"         "$lines" -ne 'print $.'
+cmp_stdin "-nl chomps"        "$lines" -nl -e 'p $_'
+cmp_stdin "-lpe and \$\\"   "$lines" -lpe '$_ += "!"'
+cmp_stdin "-na splits"        "$lines" -na -e 'p $F'
+cmp_stdin "-naF: separator"   "$lines" -naF: -e 'p $F'
+cmp_stdin "-n BEGIN / END"    "$lines" -n -e 'BEGIN { puts :hi }; print $_; END { puts :bye }'
+cmp_stdin "-n chomp / chop"   "$lines" -W0 -n -e 'chomp; chop; p $_'
+cmp_stdin "-p next skips"     "$lines" -p -e 'next if $_.start_with?("a")'
 
 # Failure shapes: a wrong exit STATUS is what a caller in a pipeline sees.
 for bad in -Z --nope; do
@@ -140,17 +153,19 @@ case "$inv" in
   *) fail=$((fail+1)); printf 'FAIL    invalid-option message does not name -h: %s\n' "$inv" ;;
 esac
 
-# DELIBERATE divergence: bare invocation. Bounded, so a regression to blocking
-# FAILS rather than hanging the gate.
-bo=$(perl -e 'alarm 10; exec @ARGV' "$mr" < /dev/null 2>&1); brc=$?
-case "$bo" in
-  usage:*) diverge=$((diverge+1)); echo "DIVERGE bare mere-ruby prints usage (ruby reads stdin) -- on purpose, see header" ;;
-  *) if [ "$brc" -eq 142 ] || [ "$brc" -eq 14 ]; then
-       fail=$((fail+1)); echo "FAIL    bare mere-ruby BLOCKED (alarm fired) -- it must not read stdin"
-     else
-       fail=$((fail+1)); printf 'FAIL    bare mere-ruby: rc=%s %s\n' "$brc" "$bo"
-     fi ;;
-esac
+# Bare invocation, stdin redirected: the program is read from it, as ruby
+# does. Bounded, so a run that blocks FAILS rather than hanging the gate.
+for bin_src in "" 'p [1, ARGV, __FILE__]'; do
+  bo=$(printf '%s' "$bin_src" | perl -e 'alarm 10; exec @ARGV' "$mr" 2>&1); brc=$?
+  br=$(printf '%s' "$bin_src" | "$ref" -Eutf-8 2>&1); brrc=$?
+  if [ "$brc" -eq 142 ] || [ "$brc" -eq 14 ]; then
+    fail=$((fail+1)); echo "FAIL    bare mere-ruby BLOCKED on stdin (alarm fired)"
+  elif [ "$bo" = "$br" ] && [ "$brc" -eq "$brrc" ]; then
+    pass=$((pass+1)); echo "MATCH   bare invocation reads the program from stdin (${bin_src:-empty})"
+  else
+    fail=$((fail+1)); printf 'FAIL    bare invocation, stdin %s: mere-ruby rc=%s %s / ruby rc=%s %s\n' "${bin_src:-empty}" "$brc" "$bo" "$brrc" "$br"
+  fi
+done
 
 printf '\n%s pass / %s fail / %s skip / %s deliberate-diverge\n' "$pass" "$fail" "$skip" "$diverge"
 [ "$fail" -eq 0 ] || exit 1

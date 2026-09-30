@@ -7627,6 +7627,43 @@ let top_report = fn env -> fn world -> fn (exc: Val) -> fn (name: str) ->
   let s9 = exc_blocks env world chain9 false in
   if str_len s9 > 0 && str_eq (char_at s9 (str_len s9 - 1)) "\n" then substring s9 0 (str_len s9 - 1) else s9;
 
+// -n / -p: the program is the body of `while gets ... end`, with what -l, -a
+// and -F add around it, and Kernel#chomp / #chop exist (private, on $_) -- ruby
+// defines those two only under these switches. The wrapper is Ruby, parsed on
+// its own; the program's statements replace its placeholder, and its BEGIN
+// blocks stay outside the loop (END registers once per site either way).
+let cli_loop_on = fn (u: unit) -> map_has cli_opt "loop_n" || map_has cli_opt "loop_p";
+let cli_loop_src = fn (u: unit) ->
+  let l = map_has cli_opt "flag_l" in
+  (if l then "$\\ = $/\n" else "")
+  ++ (if map_has cli_opt "flag_F" then "$; = Regexp.new($__mr_loop_F)\n" else "")
+  ++ "module Kernel\n  private def chomp(*a) = ($_ = $_.chomp(*a))\n  private def chop = ($_ = $_.chop)\nend\n"
+  ++ "while gets\n" ++ (if l then "$_.chomp!\n" else "")
+  ++ (if map_has cli_opt "flag_a" then "$F = $_.split\n" else "")
+  ++ "__mr_loop_body__\n"
+  ++ (if map_has cli_opt "loop_p" then "print $_\n" else "") ++ "end\n";
+let rec stmts_app = fn (xs: Stmt list) -> fn (ys: Stmt list) ->
+  match xs with Nil -> ys | Cons (h, t) -> Cons (h, stmts_app t ys);
+let rec loop_splice = fn (xs: Stmt list) -> fn (mids: Stmt list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (SExpr (EVar v), t) ->
+    if str_eq v "__mr_loop_body__" then stmts_app mids (loop_splice t mids)
+    else Cons (SExpr (EVar v), loop_splice t mids)
+  | Cons (SWhile (c, b), t) -> Cons (SWhile (c, loop_splice b mids), loop_splice t mids)
+  | Cons (s, t) -> Cons (s, loop_splice t mids);
+let rec pre_only = fn (xs: Stmt list) ->
+  match xs with
+  | Nil -> Nil
+  | Cons (SPreexe b, t) -> Cons (SPreexe b, pre_only t)
+  | Cons (_, t) -> pre_only t;
+let cli_loop_wrap = fn (prog: Stmt list) ->
+  if cli_loop_on () then
+    (let w = cli_loop_src () in
+     let (wp, _) = parse_stmts (number_nls w (lex_go w 0)) Nil in
+     stmts_app (pre_only prog) (loop_splice wp (filter_mid prog)))
+  else prog;
+
 let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   let (src, doff9) = src_prepare src0 in
   let _ = (if doff9 >= 0 && (if str_eq name "-e" then false else true) then map_set data_ctx "off" doff9 else ()) in
@@ -7649,6 +7686,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
     (match rest with
      | Cons (TEOF, _) -> ()
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in fail ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in
+  let prog = cli_loop_wrap prog in
   let env = map_new () in
   // The program's middle (non-BEGIN/END) statements, computed once, OUTSIDE
   // the loop: the carried cursor is an INDEX into this default-region list,
@@ -8174,9 +8212,10 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   // nil -- and mere-ruby is invoked without that switch because it has no
   // warnings to silence. Setting false would be right standalone and a DIFF
   // against the harness, for one assertion; the asymmetry is the harness's.)
-  let _ = map_set globals "-a" (VBool false) in
-  let _ = map_set globals "-l" (VBool false) in
-  let _ = map_set globals "-p" (VBool false) in
+  let _ = map_set globals "-a" (VBool (map_has cli_opt "flag_a")) in
+  let _ = map_set globals "-l" (VBool (map_has cli_opt "flag_l")) in
+  let _ = map_set globals "-p" (VBool (map_has cli_opt "loop_p")) in
+  let _ = (if map_has cli_opt "flag_F" then map_set globals (gvar_slot "__mr_loop_F") (mkstr (map_get cli_opt "flag_F")) else ()) in
   // STDOUT / STDERR / STDIN: IO objects keyed by @__io_fd; $stdout/$stderr
   // are globals holding the same objects.
   let outid = alloc_oid ocls in
@@ -8611,6 +8650,25 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
 let run_prog = fn (path: str) -> fn (print_result: bool) ->
   run_src (read_file path) print_result path;
 
+// The loop switches, which ruby lets you run together: -n, -p, -l, -a, -F<pat>
+// and a trailing e (`-ne CODE`, `-naF:`, `-lpe'...'`). Records each in
+// cli_opt and answers "" when the argument is done, "e" when the next argument
+// is -e's CODE, and "e:CODE" when the CODE was attached.
+let rec loop_short = fn (a: str) -> fn (i: int) ->
+  if i >= str_len a then ""
+  else
+    let c = char_at a i in
+    if str_eq c "n" then let _ = map_set cli_opt "loop_n" "1" in loop_short a (i + 1)
+    else if str_eq c "p" then let _ = map_set cli_opt "loop_p" "1" in loop_short a (i + 1)
+    else if str_eq c "l" then let _ = map_set cli_opt "flag_l" "1" in loop_short a (i + 1)
+    else if str_eq c "a" then let _ = map_set cli_opt "flag_a" "1" in loop_short a (i + 1)
+    else if str_eq c "F" then let _ = map_set cli_opt "flag_F" (substring a (i + 1) (str_len a)) in ""
+    else if str_eq c "e" then (if i + 1 < str_len a then "e:" ++ substring a (i + 1) (str_len a) else "e")
+    else let _ = map_set cli_opt "bad" a in "";
+let is_loop_short = fn (a: str) ->
+  str_len a >= 2 && str_eq (char_at a 0) "-"
+  && (let c = char_at a 1 in str_eq c "n" || str_eq c "p" || str_eq c "l" || str_eq c "a" || str_eq c "F");
+
 // consume CLI flags (--enable/--disable-frozen-string-literal), returning the
 // remaining args with those flags removed (mutating cli_fsl as a side effect).
 let rec take_flags = fn (argl: str list) ->
@@ -8668,6 +8726,17 @@ let rec take_flags = fn (argl: str list) ->
       let _ = map_set cli_opt "ver" "1" in take_flags rest
     else if str_eq a "-h" || str_eq a "--help" then
       let _ = map_set cli_opt "help" "1" in take_flags rest
+    else if is_loop_short a then
+      (let r9 = loop_short a 1 in
+       let add_code = fn (code: str) ->
+         map_set cli_opt "eval" ((if map_has cli_opt "eval" then map_get cli_opt "eval" ++ "\n" else "") ++ code) in
+       if str_eq r9 "e" then
+         (match rest with
+          | Cons (code, rest2) -> let _ = add_code code in take_flags rest2
+          | Nil -> let _ = map_set cli_opt "bad" "-e" in Nil)
+       else if str_len r9 > 2 then let _ = add_code (substring r9 2 (str_len r9)) in take_flags rest
+       else if map_has cli_opt "bad" then Nil
+       else take_flags rest)
     // -e CODE / -eCODE: run CODE instead of a script file. Repeated -e join
     // with "\n" -- they are LINES OF ONE PROGRAM, not separate programs, which
     // is why `-e 'a = 1' -e 'puts a'` has to see one scope.
@@ -8737,12 +8806,18 @@ let run_cli = fn () ->
     // try_or falls back to "" -- so a bare `mere-ruby` still prints usage.
     let src = try_or (fn () -> read_file "@mere-ruby-playground@") "" in
     if str_eq src "" then
-      // A bare `mere-ruby` deliberately does NOT read stdin, though ruby does.
-      // read_stdin blocks until EOF, so a gate (or a person) that runs the
-      // binary with no arguments and no input would HANG rather than fail, and
-      // a hanging gate is worse than a failing one. `-` asks for stdin
-      // explicitly and is the form a pipeline writes anyway.
-      (if map_has cli_opt "ver" then 0 else let _ = print usage_line in 2)
+      // A bare `mere-ruby` reads its program from stdin, as ruby does -- but
+      // only when stdin is NOT a terminal. read_stdin blocks until EOF, so a
+      // person who types `mere-ruby` would sit at a silent prompt; the usage
+      // line is kinder there. Redirected or piped, the program is on stdin,
+      // and ruby/spec asks for exactly that (`ruby_exe(nil, args: "< file")`,
+      // all of language/magic_comment_spec). -v alone still just prints.
+      (if map_has cli_opt "ver" then 0
+       else if fd_isatty 0 == 1 then let _ = print usage_line in 2
+       else
+         (let _ = map_set cli_file "p" "-" in
+          let _ = map_set cli_argv "v" (arr_new (Nil : Val list)) in
+          let _ = run_src (read_stdin ()) false "-" in 0))
     else let _ = run_src src false "(playground)" in 0
   | Cons (a0, rest) ->
     if str_eq a0 "--parse-only" then
