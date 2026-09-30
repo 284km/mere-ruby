@@ -73,3 +73,19 @@ a = Req.new([1, 2])
 b = a.dup
 b.parts << 3
 p [a.parts, b.parts]
+
+# a path that is not a String is converted (#to_path, then #to_str) or refused,
+# through super as well as directly -- and neither loops back into the override
+class Loader
+  def load(name, wrap = false) = super
+end
+Dir.mktmpdir do |d|
+  f = File.join(d, "via_to_str.rb")
+  File.write(f, "puts :via_to_str\n")
+  path = Object.new
+  path.define_singleton_method(:to_str) { f }
+  Loader.new.load(path)
+  p((Loader.new.load(nil) rescue [$!.class, $!.message]))
+  p((Loader.new.load(3) rescue [$!.class, $!.message]))
+  p((load(nil) rescue $!.class))
+end

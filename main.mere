@@ -23639,13 +23639,19 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
 //   trip is stopped after one lap (the frame is not recycled if the call
 //   unwinds; it is one small map). `puts` is a statement form, not a call.
 // `super` into a Kernel function: the function runs as the bare call it is,
-// with self the receiver, in a frame marked __ksuper so that the checks which
-// let a program's own definition win (self_defines, kernel_overridden) do not
-// hand it back to the override that called super. The arguments travel as
-// hidden locals, as in kernel_by_name.
+// in a frame marked __ksuper so that the checks which let a program's own
+// definition win (self_defines, kernel_overridden) do not hand it back to the
+// override that called super. The arguments travel as hidden locals, as in
+// kernel_by_name.
+// ⚠ SELF IS main THERE, NOT THE RECEIVER. With self the receiver, a call the
+//   bare evaluator had no arm for -- `load(nil)`, `load(obj_with_to_str)` --
+//   went on to the receiver's own methods, found the override, and its super
+//   came back here until SystemStackError (core/kernel/load_spec, 16 rows).
+//   These functions do not read self; the ones that read the CALLER'S frame
+//   instead are not sent here at all (kernel_reads_frame).
 and kernel_super = fn world -> fn superblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   let e9 = map_new () in
-  let _ = map_set e9 "self" recv in
+  let _ = map_set e9 "self" VMain in
   let _ = map_set e9 "__ksuper" VNil in
   let _ = map_set e9 "__kbn" VNil in
   let rec bind9 = fn (xs: Val list) -> fn (i: int) ->
@@ -23658,6 +23664,12 @@ and kernel_super = fn world -> fn superblk -> fn (recv: Val) -> fn (name: str) -
   if str_eq name "puts" then
     (match exec_stmt e9 world superblk (SPuts (bind9 args 0)) with FNext v9 -> v9 | _ -> VNil)
   else eval_e e9 world superblk (ECall (name, bind9 args 0))
+// the Kernel functions whose answer is the CALLER'S frame -- its binding, its
+// block, its method name, its backtrace -- which a fresh frame cannot give
+and kernel_reads_frame = fn (name: str) ->
+  str_eq name "binding" || str_eq name "eval" || str_eq name "block_given?" || str_eq name "iterator?"
+  || str_eq name "__method__" || str_eq name "__callee__" || str_eq name "caller"
+  || str_eq name "caller_locations" || str_eq name "respond_to_missing?" || str_eq name "local_variables"
 and kernel_by_name = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Val list) ->
   if map_has env "__kbn" then try_self_call_x env world VNil name args true
   else if str_eq name "puts" then
@@ -30224,9 +30236,20 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // Kernel#load -- unless the implicit self defines its own `load`, which is
   // not exotic: a YAML or JSON module calling its own load from load_file
   // would otherwise reach Kernel's and try to run the data as Ruby.
-  else if (str_len name == 4 && str_eq name "load") && (match args with Cons (VStr _, _) -> true | _ -> false)
+  // ...and a path that is not a String is converted the way ruby's
+  // FilePathValue does -- #to_path, then #to_str -- or refused as TypeError.
+  // Only a String was taken, and anything else fell through to "undefined
+  // method 'load'" (core/kernel/load_spec's `calls #to_str on non-String
+  // objects`, `raises a TypeError if passed nil`).
+  else if (str_len name == 4 && str_eq name "load") && (match args with Cons (_, _) -> true | Nil -> false)
           && (if self_defines env world name then false else true) then
-    (match args with Cons (VStr ph, _) -> rb_load env world (sget ph) | _ -> VNil)
+    (match args with
+     | Cons (a9, _) ->
+       (match to_path_str noblk world a9 with
+        | VStr ph -> rb_load env world (sget ph)
+        | _ -> raise_exc world "TypeError"
+                 ("no implicit conversion of " ++ conv_gives_name a9 ++ " into String"))
+     | Nil -> VNil)
   // Kernel#select is IO.select. It is answered HERE, as a bare name with
   // arguments, and not as a Kernel method in the prelude: that one sat in the
   // ancestry of every Array and changed what `Array.instance_method(:select)`
@@ -31809,7 +31832,8 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   //   name too, and taken here it was re-dispatched to the override that
   //   called super -- Gem::Requirement#initialize_copy recursed 15000 deep and
   //   `require "rubygems"` died of it (bundlertest).
-  else if is_kernel_builtin meth && (if kernel_bare_special meth then false else true) then
+  else if is_kernel_builtin meth && (if kernel_bare_special meth then false else true)
+          && (if kernel_reads_frame meth then false else true) then
     kernel_super world superblk recv meth args
   else if has_meth world dcls "method_missing"
   then invoke world superblk recv dcls "method_missing" (Cons (VSym meth, args))
