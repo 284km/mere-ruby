@@ -475,17 +475,21 @@ subtraction against the command word.
 
 **Why it is still here.** Ruby decides this by knowing whether the name
 on the left is a *local variable*: `a -b` is subtraction when `a` is a
-local and `a(-b)` when `a` is a method. This parser does not track
-assigned locals, so it cannot make that distinction, and guessing either
-way breaks the other. `p a -b` (subtraction) works today and is the more
-common shape in real code, so the current behaviour is the safer half.
+local and `a(-b)` when `a` is a method. The LEXER now keeps that table
+(`lvt_*` in m_parse.mere: scopes pushed by def/class/module and blocks,
+filled by assignments, parameters, `for` targets and `rescue => e`), and
+uses it for `/`, `%`, `?`, ` &`, ` ::`, ` [` and heredocs -- but only in one
+direction: a name it KNOWS is a local reads as one, and any other name
+keeps the old guess. `-` and `*` are still read as binary for every name.
 
-**What fixing it takes.** A set of locals threaded through the parser —
-assignments, block and method parameters, `for` targets, rescue bindings
-— consulted when an identifier is followed by a space-minus-no-space. The
-lexer already emits space-marked variants of `(`, `[`, `&` and `::` for
-exactly this class of ambiguity, so the token side is a small addition;
-the scope tracking is the real work.
+**What fixing it takes.** Emit a space-marked ` -` / ` *` (space before,
+none after) when the name before is not in the table, and read it in the
+parser as the start of a paren-less argument. The risk is the table's blind
+spots, which today cost nothing and would then turn a subtraction into a
+call: pattern-matching variables (`in [a, b]`, `=> x`), named captures
+(`/(?<x>..)/ =~ s`), `binding.local_variable_set`, and an eval string, which
+is lexed with no knowledge of the enclosing scope's locals. Those would
+have to be recorded first.
 
 **What it costs today.** Nothing measured. No gem in the sample hits it;
 it surfaced only in a hand-written test. `p(-1)` and `puts -1` (where the
