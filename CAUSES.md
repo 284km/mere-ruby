@@ -10,227 +10,176 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 725 files.
+Classified: 221 files.
 
-## DIFF — 725 files, 170 kinds
+## CRASH — 3 files, 2 kinds
 
 | files | kind |
 |---|---|
-| 167 | `ERROR NoMethodError` |
-| 52 | `FAILED expected "S", got "S"` |
-| 43 | `ERROR NameError` |
-| 23 | `FAILED expected true, got false` |
-| 21 | `FAILED expected N, got N` |
-| 21 | `FAILED expected ArgumentError to be raised` |
-| 20 | `ERROR ArgumentError` |
-| 19 | `FAILED expected truthy from #include?` |
-| 17 | `FAILED expected TypeError to be raised` |
-| 14 | `FAILED matcher did not match #<OBJ>` |
-| 14 | `FAILED expected N, got nil` |
-| 13 | `FAILED expected false, got true` |
-| 12 | `FAILED expected to be identical` |
-| 11 | `FAILED expected #<OBJ>, got #<OBJ>` |
-| 11 | `FAILED expected "S", got nil` |
-| 10 | `ERROR NotImplementedError` |
-| 9 | `pass=N fail=N err=N` |
-| 9 | `*.rb:N: warning: already initialized constant Digest::MN` |
-| 8 | `FAILED expected NoMethodError to be raised` |
-| 7 | `ERROR TypeError` |
-| 7 | `ERROR StandardError` |
-| 6 | `FAILED raised NoMethodError, expected TypeError` |
-| 6 | `FAILED expected falsy from #include?` |
-| 6 | `ERROR SystemExit` |
-| 4 | `FAILED raised NoMethodError, expected ArgumentError` |
-| 4 | `FAILED expected nil, got "S"` |
-| 4 | `FAILED expected SyntaxError to be raised` |
-| 4 | `FAILED expected RangeError to be raised` |
-| 4 | `FAILED expected NameError to be raised` |
-| 4 | `FAILED expected "S" to match` |
-| 3 | `FAILED expected not to be identical` |
-| 3 | `FAILED expected false, got nil` |
-| 3 | `FAILED expected [:SYM, :SYM], got nil` |
-| 3 | `FAILED expected ["S"], got []` |
-| 3 | `FAILED expected Math::DomainError to be raised` |
-| 3 | `FAILED expected IOError to be raised` |
-| 3 | `FAILED expected :SYM, got nil` |
-| 2 | `TMPDIR` |
-| 2 | `FAILED raised TypeError, expected ArgumentError` |
-| 2 | `FAILED raised StandardError, expected FrozenError` |
-| 2 | `FAILED raised NoMethodError, expected FrozenError` |
-| 2 | `FAILED expected {...}, got {...}` |
-| 2 | `FAILED expected truthy from #closed?` |
-| 2 | `FAILED expected to receive #to_str` |
-| 2 | `FAILED expected to receive #rewind` |
-| 2 | `FAILED expected a Integer, got N` |
-| 2 | `FAILED expected [nil, N, N, N, N, nil, :SYM, [], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N] ...[clipped]` |
-| 2 | `FAILED expected [], got [N, N, N]` |
-| 2 | `FAILED expected [N, N, N, N], got [N, N, N, N]` |
-| 2 | `FAILED expected Zlib::GzipFile::Error to be raised` |
-| 2 | `FAILED expected ThreadError to be raised` |
-| 2 | `FAILED expected SystemCallError to be raised` |
-| 2 | `FAILED expected NNN N:N:N +N, got NNN N:N:N UTC` |
-| 2 | `FAILED expected :SYM, got false` |
-| 2 | `FAILED expected #<OBJ>, got nil` |
-| 2 | `ERROR Zlib::GzipFile::Error` |
-| 2 | `ERROR SystemStackError` |
-| 2 | `ERROR Errno::ENOENT` |
-| 1 | `This is experimental warning.` |
-| 1 | `FAILED raised ThreadError, expected ArgumentError` |
-| 1 | `FAILED raised StandardError, expected RuntimeError` |
-| 1 | `FAILED raised StandardError, expected ArgumentError` |
-| 1 | `FAILED raised NoMethodError, expected ThreadError` |
-| 1 | `FAILED raised NoMethodError, expected LocalJumpError` |
-| 1 | `FAILED raised NoMethodError, expected Date::Error` |
-| 1 | `FAILED raised NameError, expected ArgumentError` |
-| 1 | `FAILED raised LoadError, expected NameError` |
-| 1 | `FAILED raised FrozenError, expected TypeError` |
-| 1 | `FAILED raised ArgumentError, expected SyntaxError` |
-| 1 | `FAILED raised ArgumentError, expected IOError` |
-| 1 | `FAILED flunked` |
-| 1 | `FAILED expected {year: N, month: N, day: N, yday: N, wday: N, hour: N, min: N, sec: N, sec_fraction: N, zone: "S"}, got {year: N, month: N, day: N, yday: N, wday: N}` |
-| 1 | `FAILED expected {#<OBJ> => N}, got {}` |
-| 1 | `FAILED expected truthy from #start_with?` |
-| 1 | `FAILED expected truthy from #null?` |
-| 1 | `FAILED expected truthy from #fixed_anchor?` |
-| 1 | `FAILED expected truthy from #exist?` |
-| 1 | `FAILED expected truthy from #const_defined?` |
-| 1 | `FAILED expected truthy from #>=` |
-| 1 | `FAILED expected true, got nil` |
-| 1 | `FAILED expected to receive #to_int` |
-| 1 | `FAILED expected to receive #to_a` |
-| 1 | `FAILED expected to receive #respond_to_missing?` |
-| 1 | `FAILED expected not true` |
-| 1 | `FAILED expected not nil` |
-| 1 | `FAILED expected not N` |
-| 1 | `FAILED expected nil, got NaN` |
-| 1 | `FAILED expected nil to match` |
-| 1 | `FAILED expected a Enumerable, got #<OBJ>` |
-| 1 | `FAILED expected a Array, got nil` |
-| 1 | `FAILED expected [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [:SYM, :SYM], [], [N], [N, N], [N, N, N]], got [nil, N, [N, N], [N, N, N], [N, N, N], nil, :SYM, [], [], [N], [N, N], [N, ...[clipped]` |
-| 1 | `FAILED expected [], got [:SYM]` |
-| 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got nil` |
-| 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
-| 1 | `FAILED expected [[:SYM, :*], [:SYM, :**], [:SYM, :&]], got [[:SYM, :SYM], [:SYM, :&]]` |
-| 1 | `FAILED expected [[#<OBJ>, #<OBJ>], [#<OBJ>, #<OBJ>], [#<OBJ>, #<OBJ>]], got []` |
-| 1 | `FAILED expected [["S", "S", "S"], ["S", "S"]], got []` |
-| 1 | `FAILED expected [N], got [N]` |
-| 1 | `FAILED expected [N, nil, nil, N, nil, nil], got []` |
-| 1 | `FAILED expected [N, N], got [N, "S", N, "S", "S", nil, nil, nil]` |
-| 1 | `FAILED expected [N, N, [N], {x: N}, N, {}], got [[N, N, N, {x: N}], N, [], nil, N, {}]` |
-| 1 | `FAILED expected [N, N, N], got []` |
-| 1 | `FAILED expected [N, N, N, N, N, N, N], got []` |
-| 1 | `FAILED expected [N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, N, ...[clipped]` |
-| 1 | `FAILED expected [CoreClassSpecs::Inherited::D, #<OBJ>], got [#<OBJ>]` |
-| 1 | `FAILED expected [:SYM], got [:SYM, :SYM]` |
-| 1 | `FAILED expected [:SYM, N, :SYM, N, :SYM, N, :SYM, N], got []` |
-| 1 | `FAILED expected [:SYM, :SYM], got []` |
-| 1 | `FAILED expected [:SYM, :SYM], got [:SYM]` |
-| 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM], got []` |
-| 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
-| 1 | `FAILED expected [#<OBJ>], got []` |
-| 1 | `FAILED expected [#<OBJ>, ModuleSpecs::Nesting, ModuleSpecs], got [#<OBJ>, ModuleSpecs::Nesting, ModuleSpecs]` |
-| 1 | `FAILED expected ["S"], got ["S"]` |
-| 1 | `FAILED expected ["S"], got ["S", "S"]` |
-| 1 | `FAILED expected ["S", "S"], got []` |
-| 1 | `FAILED expected ["S", "S"], got ["S"]` |
-| 1 | `FAILED expected ["S", "S", "S", "S"], got []` |
-| 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S"], got ["S", "S", "S", "S", "S"]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S"], got [#<OBJ>>, #<Enumerator::Lazy: #<Enumerator: "S":SYM ...[clipped]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "su ...[clipped]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "sp ...[clipped]` |
-| 1 | `FAILED expected ["S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "subdir_tw ...[clipped]` |
-| 1 | `FAILED expected [" def foo` |
-| 1 | `FAILED expected StringScanner::Error to be raised` |
-| 1 | `FAILED expected RuntimeError to be raised` |
-| 1 | `FAILED expected NNN N:N:N UTC, got NNN N:N:N UTC` |
-| 1 | `FAILED expected N, got Infinity` |
-| 1 | `FAILED expected IndexError to be raised` |
-| 1 | `FAILED expected IO::Buffer::AccessError to be raised` |
-| 1 | `FAILED expected :SYM, got :SYM` |
-| 1 | `FAILED expected (N/N), got (N/N)` |
-| 1 | `FAILED expected #<UnboundMethod: Zlib::GzipReader#pos() TMPDIR got #<UnboundMethod: Zlib::GzipReader#tell() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Zlib::GzipReader#eof?() TMPDIR got #<UnboundMethod: Zlib::GzipReader#eof() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Zlib::GzipReader#each(&block) TMPDIR got #<UnboundMethod: Zlib::GzipReader#each_line() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Date#xmlschema() TMPDIR got #<UnboundMethod: Date#isoN() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Date#second() TMPDIR got #<UnboundMethod: Date#sec() TMPDIR` |
-| 1 | `FAILED expected #<UnboundMethod: Date#minute() TMPDIR got #<UnboundMethod: Date#min() TMPDIR` |
-| 1 | `FAILED expected #<OBJ>, got "S"` |
-| 1 | `FAILED expected #<Method: Time.rfcN(str) TMPDIR got #<Method: Time.rfcN(str) TMPDIR` |
-| 1 | `FAILED expected "x\xNCc\xN` |
-| 1 | `FAILED expected "x\xNCN\xN` |
-| 1 | `FAILED expected "\xDN\xNC\xDN\xNF\xBN\xEN\xN` |
-| 1 | `FAILED expected "TMPDIR got nil` |
-| 1 | `FAILED expected "TMPDIR` |
-| 1 | `FAILED expected "S"km\"S", got "S"km\"S"` |
-| 1 | `FAILED expected "S"abcde\"S", got nil` |
-| 1 | `FAILED expected "S"\uN\"S", got "S"` |
-| 1 | `FAILED expected "S"This ...\"S", got "S"` |
-| 1 | `FAILED expected "S", got N` |
-| 1 | `FAILED expected "S", got "v\xNN{` |
-| 1 | `FAILED expected "S", got "eeNbNddNafNeNaaNaNeeNcNaeNfNeNfNaNdNeNdbN ...[clipped]` |
-| 1 | `FAILED expected "S", got "\xNF\xN\xDN\xN\xNL}e\xNA/\xEA\xAN\xCNZ\xDN\xAN\xBFO\e+\xN,\xDN]l\xBN\xFN` |
-| 1 | `FAILED expected "S", got "\xEE&\xBN\xDDJ\xFN\xENI\xAA\x ...[clipped]` |
-| 1 | `FAILED expected "NMLJNI\xND$` |
-| 1 | `FAILED expected "Another Test!` |
-| 1 | `FAILED expected "(N&!ANF-DN` |
-| 1 | `FAILED expected "` |
-| 1 | `FAILED calls respond_to_missing? with true to include private methods: #respond_to_missing? received with unexpected arguments` |
-| 1 | `ERROR fatal` |
-| 1 | `ERROR SignalException` |
-| 1 | `ERROR RuntimeError` |
-| 1 | `ERROR RangeError` |
-| 1 | `ERROR LocalJumpError` |
-| 1 | `ERROR IOError` |
-| 1 | `ERROR IO::Buffer::AccessError` |
-| 1 | `ERROR FrozenError` |
-| 1 | `ERROR Encoding::UndefinedConversionError` |
+| 2 | `(unclassified: swept before causes were recorded)` |
+| 1 | `fail: mere-ruby: (exception re-raised past all rescues)` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 21 | `FAILED: expected ArgumentError to be raised` |
-| 17 | `FAILED: expected TypeError to be raised` |
-| 9 | `*.rb:N: warning: already initialized constant Digest::M32` |
-| 8 | `FAILED: expected NoMethodError to be raised` |
-| 6 | `FAILED: raised NoMethodError, expected TypeError` |
-| 4 | `FAILED: raised NoMethodError, expected ArgumentError` |
-| 4 | `FAILED: is a private method: expected truthy from #include?` |
-| 4 | `FAILED: expected SyntaxError to be raised` |
-| 4 | `FAILED: expected RangeError to be raised` |
-| 4 | `FAILED: expected NameError to be raised` |
-| 3 | `FAILED: is not defined: expected falsy from #include?` |
-| 3 | `FAILED: is a public method: expected truthy from #include?` |
-| 3 | `FAILED: expected Math::DomainError to be raised` |
-| 3 | `FAILED: expected IOError to be raised` |
-| 2 | `pass=7 fail=0 err=0` |
-| 2 | `TMPDIR` |
-| 2 | `FAILED: uses the passed Object as the StringIO backend: expected to be identical` |
-| 2 | `FAILED: round-trips a string through pack and unpack: expected ["hello"], got []` |
-| 2 | `FAILED: returns a US_ASCII encoded string: expected #<Encoding:US-ASCII>, got #<Encoding:BINARY (ASCII-8BIT)>` |
-| 2 | `FAILED: raised TypeError, expected ArgumentError` |
-| 2 | `FAILED: raised StandardError, expected FrozenError` |
-| 2 | `FAILED: raised NoMethodError, expected FrozenError` |
-| 2 | `FAILED: keeps size: expected 100, got nil` |
-| 2 | `FAILED: is delegated: expected :foo, got false` |
-| 2 | `FAILED: includes all public methods of the delegated class: expected truthy from #include?` |
-| 2 | `FAILED: includes Enumerable: expected true, got false` |
-| 2 | `FAILED: expected Zlib::GzipFile::Error to be raised` |
-| 2 | `FAILED: expected ThreadError to be raised` |
-| 2 | `FAILED: expected SystemCallError to be raised` |
+| 2 | `(unclassified)` |
+| 1 | `fail: mere-ruby: (exception re-raised past all rescues)` |
+
+</details>
+
+## DIFF — 218 files, 103 kinds
+
+| files | kind |
+|---|---|
+| 16 | `ERROR NoMethodError` |
+| 12 | `pass=N fail=N err=N` |
+| 12 | `FAILED expected "S", got "S"` |
+| 11 | `ERROR NameError` |
+| 9 | `ERROR NotImplementedError` |
+| 8 | `FAILED expected truthy from #include?` |
+| 7 | `FAILED expected "S"TMPDIR` |
+| 6 | `FAILED matcher did not match #<OBJ>` |
+| 5 | `FAILED expected N, got N` |
+| 4 | `FAILED expected true, got false` |
+| 4 | `FAILED expected [:@ivar], got []` |
+| 4 | `ERROR TypeError` |
+| 4 | `ERROR SyntaxError` |
+| 4 | `ERROR FrozenError` |
+| 4 | `ERROR ArgumentError` |
+| 3 | `FAILED expected not to be identical` |
+| 3 | `FAILED expected N, got nil` |
+| 3 | `FAILED expected "S" to match` |
+| 3 | `ERROR Encoding::UndefinedConversionError` |
+| 2 | `FAILED expected truthy from #start_with?` |
+| 2 | `FAILED expected truthy from #signaled?` |
+| 2 | `FAILED expected truthy from #<` |
+| 2 | `FAILED expected not N` |
+| 2 | `FAILED expected ["finalized` |
+| 2 | `FAILED expected TypeError to be raised` |
+| 2 | `FAILED expected TypeError "S" to be raised` |
+| 2 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 2 | `FAILED expected "S", got nil` |
+| 2 | `ERROR LoadError` |
+| 2 | `ERROR Errno::ENOENT` |
+| 2 | `(tallies differ, lines identical)` |
+| 1 | `mere-ruby: invalid option N (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -x (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -s (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -c (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -X (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -U (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -KZ (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -E (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -C (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option --internal-encoding=bigN (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option --external-encoding=bigN (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option --encoding=bigN (-h will show valid options)` |
+| 1 | `fail: mere-ruby: (ruby exception raised)` |
+| 1 | `FAILED matcher did not match "--- !ruby/object:YAMLSpecs::Example` |
+| 1 | `FAILED expected truthy from #exist?` |
+| 1 | `FAILED expected to receive #to_a` |
+| 1 | `FAILED expected to receive #tmpdir` |
+| 1 | `FAILED expected to be identical` |
+| 1 | `FAILED expected nil, got false` |
+| 1 | `FAILED expected nil, got N` |
+| 1 | `FAILED expected falsy from #include?` |
+| 1 | `FAILED expected false, got true` |
+| 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got nil` |
+| 1 | `FAILED expected [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM]], got [[:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, :SYM], [:SYM, : ...[clipped]` |
+| 1 | `FAILED expected [N], got [N]` |
+| 1 | `FAILED expected [N, nil, nil, N, nil, nil], got [N, N, N, N]` |
+| 1 | `FAILED expected [N, N], got [[N, N], [N, N]]` |
+| 1 | `FAILED expected [N, N, N, N], got N` |
+| 1 | `FAILED expected [:SYM, :SYM], got []` |
+| 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM]` |
+| 1 | `FAILED expected [:SYM, :SYM, :SYM, :SYM, :SYM, :SYM], got [:SYM, :SYM, :SYM, :SYM, :SYM]` |
+| 1 | `FAILED expected [#<OBJ>>], got []` |
+| 1 | `FAILED expected ["S"], got ["S"]` |
+| 1 | `FAILED expected ["S"./file_fixture.rb"]` |
+| 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
+| 1 | `FAILED expected ["S", "S", "S", "TMPDIR 'Object#__mspec_ ...[clipped]` |
+| 1 | `FAILED expected ["S", "S", "S", "S"], got [nil, nil, nil, nil]` |
+| 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
+| 1 | `FAILED expected [" def foo` |
+| 1 | `FAILED expected TypeError /can't convert Object into an exact number/ to be raised` |
+| 1 | `FAILED expected SyntaxError to be raised` |
+| 1 | `FAILED expected SyntaxError /dynamic constant assignment/ to be raised` |
+| 1 | `FAILED expected RuntimeError "S" to be raised` |
+| 1 | `FAILED expected NoMethodError /protected method ['S' called/ to be raised` |
+| 1 | `FAILED expected IndexError to be raised` |
+| 1 | `FAILED expected :+, got nil` |
+| 1 | `FAILED expected (N/N), got (N/N)` |
+| 1 | `FAILED expected #<OBJ>, got nil` |
+| 1 | `FAILED expected "x\xNCc\xN` |
+| 1 | `FAILED expected "x\xNCN\xN` |
+| 1 | `FAILED expected "true` |
+| 1 | `FAILED expected "top` |
+| 1 | `FAILED expected "mere-ruby: invalid option -S (-h will show valid options)` |
+| 1 | `FAILED expected "current fiber ensure` |
+| 1 | `FAILED expected "S"constant\"S", got "S"` |
+| 1 | `FAILED expected "S"\uN\"S", got "S"` |
+| 1 | `FAILED expected "NMLJNI\xND$` |
+| 1 | `FAILED expected "N` |
+| 1 | `FAILED expected "Kernel#warn spec edge case` |
+| 1 | `FAILED expected "#<TracePoint:SYM 'S' TMPDIR to match` |
+| 1 | `FAILED expected "` |
+| 1 | `ERROR SystemStackError` |
+| 1 | `ERROR StandardError` |
+| 1 | `ERROR RuntimeError` |
+| 1 | `<internal:SYM>:N:SYM 'S': No such file or directory @ rb_sysopen - (Errno::ENOENT)` |
+| 1 | `<internal:SYM>:N:SYM 'S': Broken pipe (Errno::EPIPE)` |
+| 1 | `<internal:SYM>:N:SYM 'S': Bad file descriptor (Errno::EBADF)` |
+| 1 | `/privateTMPDIR 'S': undefined method 'S' for an instance of Binding (NoMethodError)` |
+| 1 | `/privateTMPDIR 'S': method 'S' not defined in BasicObject (NameError)` |
+| 1 | `-e:N:SYM 'S': super: no superclass method 'S' for an instance of Integer (NoMethodError)` |
+| 1 | `*.rb:N: warning: already initialized constant A` |
+| 1 | `#<OBJ> terminated with exception (report_on_exception is true):` |
+
+<details><summary>the same rows by exact cause (top 40)</summary>
+
+| files | cause |
+|---|---|
+| 4 | `FAILED: copies instance variables: expected [:@ivar], got []` |
+| 2 | `pass=0 fail=0 err=0` |
+| 2 | `FAILED: sets the first value to the path of the file in which the method was defined: expected "/privateTMPDIR got "TMPDIR` |
+| 2 | `FAILED: runs handlers even if the main script fails to parse: expected truthy from #include?` |
+| 2 | `FAILED: is a public method only when -n is passed: expected true, got false` |
+| 2 | `FAILED: expected not 0` |
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
-| 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected true, got false` |
-| 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 49, got nil` |
-| 2 | `FAILED: converts a key that is neither String nor Symbol with #to_str: expected 1, got nil` |
-| 2 | `FAILED: calls the enclosed object's rewind method if one exists: expected to receive #rewind` |
-| 2 | `FAILED: calls the block with initial values when yield with multiple arguments: expected [nil, 0, 0, 0, 0, nil, :default_arg, [], [], [0], [0, 1], [0, 1, 2]], got [nil, 0, [0, 1], [0, 1, 2], [0, 1, 2], nil, :default_arg, [], [], [0], [0, 1] ...[clipped]` |
-| 2 | `FAILED: calls supplied block if the key is not found: expected 5, got nil` |
-| 2 | `FAILED: calls #to_str to convert an Object to a String: expected "abcdef", got ""` |
-| 2 | `ERROR: for a child that exited normally returns true: SystemExit` |
-| 2 | `ERROR: Encoding::UndefinedConversionError#source_encoding_name returns a String: NoMethodError` |
-| 1 | `pass=6 fail=0 err=0` |
+| 2 | `FAILED: copies the finalizer: expected ["finalized` |
+| 2 | `(tallies differ, lines identical)` |
+| 1 | `pass=911 fail=0 err=0` |
+| 1 | `pass=7 fail=0 err=0` |
+| 1 | `pass=5 fail=0 err=0` |
+| 1 | `pass=46 fail=0 err=0` |
+| 1 | `pass=29 fail=1 err=0` |
+| 1 | `pass=221 fail=0 err=0` |
+| 1 | `pass=21 fail=0 err=0` |
+| 1 | `pass=17 fail=0 err=0` |
+| 1 | `pass=16 fail=0 err=0` |
+| 1 | `pass=12 fail=0 err=0` |
+| 1 | `mere-ruby: invalid option -x (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -s (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -c (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -X (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -U (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -KZ (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -E (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -C (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option -072 (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option --internal-encoding=big5 (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option --external-encoding=big5 (-h will show valid options)` |
+| 1 | `mere-ruby: invalid option --encoding=big5 (-h will show valid options)` |
+| 1 | `fail: mere-ruby: (ruby exception raised)` |
+| 1 | `FAILED: yields the first value to a single-argument block: expected [1, 3], got [[1, 2], [3, 4]]` |
+| 1 | `FAILED: with ensure on the root fiber: expected "current fiber ensure` |
+| 1 | `FAILED: with a boolean argument emits a warning when $VERBOSE is true: matcher did not match #<Proc>` |
+| 1 | `FAILED: warns when passing a block argument to a method that never uses it: matcher did not match #<Proc>` |
+| 1 | `FAILED: warns when Integer literals are used instead of predicates: matcher did not match #<Proc>` |
+| 1 | `FAILED: warns if an exception is raised in finalizer: expected truthy from #include?` |
+| 1 | `FAILED: tracks microseconds: expected 123456, got 123455` |
+| 1 | `FAILED: traces all the events triggered in specified location: expected [:b_call, :b_return, :call, :line, :return], got [:call, :return]` |
 
 </details>
 
@@ -243,64 +192,23 @@ class column says where the weight sits.
 
 | class | absent names (from the spec filenames) |
 |---|---|
-| process (15) | `argv0 clock_getres detach egid euid gid kill last_status spawn times uid wait2 wait waitall warmup` |
-| module (14) | `alias_method const_defined const_missing const_set const_source_location deprecate_constant included initialize module_exec name public_instance_method refine remove_class_variable remove_const` |
-| converter (12) | `asciicompat_encoding convert convpath destination_encoding finish last_error new primitive_errinfo putback replacement search_convpath source_encoding` |
-| thread (10) | `backtrace_locations backtrace current each_caller_location fetch handle_interrupt ignore_deadlock keys pending_interrupt thread_variables` |
-| kernel (9) | `autoload binding chomp chop open select singleton_class system test` |
-| io (9) | `close_read close close_write copy_stream pid popen pos stat sysopen` |
-| fiber (9) | `alive blocking current kill new resume storage transfer yield` |
-| invalid_byte_sequence_error (7) | `destination_encoding_name destination_encoding error_bytes incomplete_input readagain_bytes source_encoding_name source_encoding` |
-| gc (7) | `auto_compact config count garbage_collect measure_total_time stat total_time` |
-| file (7) | `chmod constants flock new reopen truncate umask` |
-| argf (7) | `argv each eof path tell to_a to_i` |
-| enumerator (6) | `each each_with_object feed initialize new product` |
-| encoding (6) | `aliases compatible find list name_list names` |
-| yaml (5) | `dump load_file parse_file parse to_yaml` |
-| undefined_conversion_error (5) | `destination_encoding_name destination_encoding error_char source_encoding_name source_encoding` |
-| profiler (5) | `disable enable enabled result total_time` |
-| tms (4) | `cstime cutime stime utime` |
-| time (4) | `_dump deconstruct_keys to_date to_datetime` |
-| stat (4) | `comparison gid mode new` |
-| buffer (4) | `initialize locked map not` |
-| binding (4) | `implicit_parameter_defined implicit_parameter_get implicit_parameters source_location` |
-| securerandom (3) | `base64 hex random_bytes` |
-| regexp (3) | `timeout escapes subexpression_call` |
-| pathname (3) | `empty glob realdirpath` |
-| objectspace (3) | `_id2ref each_object garbage_collect` |
-| dir (3) | `delete fileno mktmpdir` |
-| date (3) | `constants infinity iso8601` |
-| warning (2) | `categories warn` |
-| singleton (2) | `dump load` |
-| refinement (2) | `import_methods target` |
-| random (2) | `equal_value urandom` |
-| openssl (2) | `fixed_length_secure_compare secure_compare` |
-| io-wait (2) | `wait_readable wait_writable` |
-| etc (2) | `sysconfdir uname` |
-| datetime (2) | `new second_fraction` |
-| zstream (1) | `data_type` |
-| zlib (1) | `zlib_version` |
-| weakkeymap (1) | `clear` |
-| unboundmethod (1) | `super_method` |
-| tracepoint (1) | `trace` |
-| stringio (1) | `seek` |
+| process (8) | `_fork daemon fork getpriority getrlimit set_proctitle setpriority setrlimit` |
+| regexp (2) | `timeout subexpression_call` |
+| kernel (2) | `binding instance_variable_get` |
+| unboundmethod (1) | `equal_value` |
+| time (1) | `dup` |
+| thread (1) | `native_thread_id` |
 | store (1) | `verify` |
-| status (1) | `wait` |
+| refinement (1) | `import_methods` |
 | proc (1) | `new` |
 | name (1) | `parse` |
-| monitor (1) | `synchronize` |
-| method (1) | `super_method` |
-| main (1) | `define_method` |
-| location (1) | `base_label` |
-| lazy (1) | `chunk` |
-| language (1) | `module` |
-| irb (1) | `irb` |
-| instance (1) | `update` |
-| enumerable (1) | `to_h` |
-| digest (1) | `hexencode` |
-| delegate_class (1) | `instance_method` |
-| deflate (1) | `params` |
-| class (1) | `allocate` |
-| basicobject (1) | `not_equal` |
+| module (1) | `refine` |
+| main (1) | `using` |
+| location (1) | `label` |
+| language (1) | `constants` |
+| kdf (1) | `pbkdf2_hmac` |
+| exception (1) | `receiver` |
+| binding (1) | `eval` |
+| basicobject (1) | `instance_exec` |
 
 _Generated by `mspec/causes.sh`._

@@ -328,6 +328,11 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   echo "the 368 files were ones whose newly compared examples differed, not behaviour that"
   echo "was lost. (From 2026-09-30 the shim's suppress_warning silences \`\$VERBOSE\` and the"
   echo "environment carries RUBY_EXE / RUBY_FLAGS, as mspec's do.)"
+  echo
+  echo "⚠ **From 2026-09-30 a file in which the reference ran NO example is SKIP, not MATCH.**"
+  echo "Both sides printing zero agreed and measured nothing -- win32ole, the cgi that ruby 4.0"
+  echo "dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP at once,"
+  echo "so MATCH 2722 before it and 2410 on it are not the same question either."
   if [ "$rec_status" = "SPEC_STATUS_STDLIB.md" ]; then
     echo
     echo "⚠ **This is the second record.** These groups are swept with the reference's stdlib and"

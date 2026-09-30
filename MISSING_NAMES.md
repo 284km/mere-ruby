@@ -32,29 +32,33 @@ What it is good for is the shape: which classes are thin, and whether a day's
 work moved the number.
 
 ```
-ABSENT: 159 of 1413 names
-  IO (43): advise autoclose? binmode binmode? close_on_exec? close_read close_write copy_stream eof eof? fcntl fdatasync for_fd fsync ioctl lineno open pid popen pos pread printf pwrite read_nonblock reopen rewind seek set_encoding_by_bom stat sysopen sysseek syswrite tell timeout to_i to_io try_convert ungetbyte ungetc wait_priority wait_readable wait_writable write_nonblock
-  Kernel (24): !~ === __callee__ __dir__ __method__ autoload autoload? block_given? define_singleton_method format gem gem_original_require global_variables lambda load local_variables open printf proc singleton_method sprintf test then yield_self
-  Process (21): _fork argv0 clock_getres getpgid getpgrp getpriority getrlimit getsid groups initgroups last_status maxgroups setpgid setpgrp setpriority setproctitle setrlimit setsid waitall waitpid2 warmup
-  File (14): absolute_path? chmod chown flock lchmod lchown link lutime mkfifo readlink rename truncate umask utime
-  Dir (13): chroot close each_child empty? fchdir fileno for_fd foreach pos rewind seek tell to_path
-  GC (13): auto_compact compact config count garbage_collect latest_compact_info latest_gc_info measure_total_time stat stat_heap total_time verify_compaction_references verify_internal_consistency
-  Thread (10): add_trace_func backtrace backtrace_locations each_caller_location handle_interrupt ignore_deadlock keys native_thread_id pending_interrupt? thread_variables
-  ObjectSpace (6): _id2ref count_objects define_finalizer each_object garbage_collect undefine_finalizer
-  Module (5): class_exec const_source_location define_method module_exec used_modules
-  Encoding (5): _dump _load aliases compatible? name_list
-  Enumerator (2): produce product
-  Random (2): seed urandom
-  Exception (1): exception
+ABSENT: 64 of 1413 names
+  IO (19): binmode binmode? close_read close_write fdatasync fsync ioctl lineno pos pread pwrite rewind seek set_encoding_by_bom tell timeout to_i to_io wait_priority
+  Kernel (17): !~ === __callee__ __dir__ __method__ block_given? define_singleton_method format gem gem_original_require global_variables lambda load local_variables proc singleton_method sprintf
+  Process (8): _fork getpriority getrlimit setpgid setpgrp setpriority setproctitle setrlimit
+  Dir (7): close fileno pos rewind seek tell to_path
+  GC (3): latest_gc_info stat_heap verify_internal_consistency
+  Thread (3): add_trace_func native_thread_id set_trace_func
+  Module (2): define_method used_modules
+  Encoding (2): _dump _load
+  File (1): flock
+  ObjectSpace (1): count_objects
+  Random (1): seed
 
-SEND-ONLY: 17 of 1413 names
-  Process (6): egid= euid= gid= groups= maxgroups= uid=
-  IO (5): autoclose= close_on_exec= lineno= pos= timeout=
-  Kernel (2): public_send send
-  GC (2): auto_compact= measure_total_time=
+SEND-ONLY: 6 of 1413 names
+  IO (3): lineno= pos= timeout=
+  Kernel (2): autoload load
   Dir (1): pos=
-  Thread (1): ignore_deadlock=
 ```
+
+2026-09-30: **64 ABSENT of 1413**, same reference (4.0.6), re-probed after the
+eight parallel clusters and the constants / regexp / string / binding work
+that followed. Most of the ninety-five came from the clusters (IO, File, Dir, Process, GC, Thread, ObjectSpace) and had simply not
+been probed, and `Module#const_source_location` is new. What is left in
+Process -- `getrlimit` / `setrlimit` / `getpriority` / `setpriority` -- is out
+of an `extern`'s reach (KNOWN_GAPS). The Kernel bucket is mostly the probe's
+own upper bound (see above): `format`, `lambda` and `proc` answer when called
+as a program calls them.
 
 2026-09-22: **159 ABSENT of 1413**, same reference (4.0.6) and the same binary
 as the record above. The drop of twenty-six is three things, and only two of
