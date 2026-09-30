@@ -428,6 +428,54 @@ Until then the gate records this as a DELIBERATE divergence with a bounded
 wait, so a regression to blocking fails rather than hangs
 (`clitest/run.sh`).
 
+## The command line: what is still not ruby's (16 red examples in command_line/)
+
+RUBYOPT and ruby's switches are read (`-E -K -U -0 -C -X -x -c -d -s -S`,
+`--encoding`, `--enable`/`--disable` lists, `--debug`). What is left of
+command_line/ after that is not about the switches:
+
+- **`$VERBOSE` reads nil when nothing set it** (see the comment beside the
+  globals in run_src): every gate runs the reference as `ruby -W0`, and a
+  default of false would print warnings only this side gives. ruby's own
+  default is false, so an example that prints `$VERBOSE` in a child with no
+  switch reads `nil` here -- dash_r "requires in order" (1), and feature's
+  `--disable=rubyopt` / `--disable=all` (4). Fixing it means defaulting to
+  false AND passing `-W0` to mere-ruby in run_spec.sh, which changes every
+  file's measurement at once; a harness change of its own.
+- **`$LOAD_PATH` has no stdlib directories.** ruby's ends with site_ruby,
+  vendor_ruby and rubylibdir, so "-I / RUBYLIB adds at the front" is asked as
+  "not the last entry"; here the -I directory IS the whole path (dash_upper_i,
+  rubylib: 1 each). Adding directories that are not there would cost a stat
+  per require per entry, and GEM_HOME would make rubygems load every run.
+- **`Gem` and `DidYouMean` exist only when rubygems is on the load path**, so
+  `--enable=gems` / `--enable=did_you_mean` cannot make them defined
+  (feature: 6).
+- **`__dir__` is not a realpath** (Dir.pwd and File.realpath are textual
+  here), so backtrace_limit_spec's `out.gsub(__dir__, '')` leaves a
+  "/private" in front of every frame; the three outputs are ruby's byte for
+  byte otherwise (3).
+- **Switches on the shebang line are not read** (`#!ruby -w` sets $VERBOSE in
+  ruby). No spec asks; -x finds the line and ignores what follows "ruby".
+- **`$DEBUG` does not trace raises**: ruby prints "Exception 'X' at file:line
+  - message" for each one under -d. Only the literal-site half of `--debug`
+  is there.
+- **A syntax error is this parser's message**: "<file>: <message>
+  (SyntaxError)", without prism's annotated source.
+
+## An alias of IO#close in a File's singleton class names nothing
+
+```ruby
+f = File.open(path)
+class << f; alias_method :original_close, :close; def close = original_close; end
+f.close   # mere-ruby: undefined method 'original_close' for an instance of File
+```
+
+File.open's block form closes through #close now (File.__open_blk), but the
+four close examples of core/file/open_spec redefine it this way, and the alias
+of a builtin inherited from IO is not found from the object's singleton
+(`class File; alias_method :c2, :close; end` fails the same way). String and
+Array builtins alias fine; the IO arms are reached by a different dispatcher.
+
 ## `p -1` parses as `p - 1`
 
 ```ruby
