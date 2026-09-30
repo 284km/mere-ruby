@@ -424,14 +424,9 @@ RUBYOPT and ruby's switches are read (`-E -K -U -0 -C -X -x -c -d -s -S`,
 `--encoding`, `--enable`/`--disable` lists, `--debug`). What is left of
 command_line/ after that is not about the switches:
 
-- **`$VERBOSE` reads nil when nothing set it** (see the comment beside the
-  globals in run_src): every gate runs the reference as `ruby -W0`, and a
-  default of false would print warnings only this side gives. ruby's own
-  default is false, so an example that prints `$VERBOSE` in a child with no
-  switch reads `nil` here -- dash_r "requires in order" (1), and feature's
-  `--disable=rubyopt` / `--disable=all` (4). Fixing it means defaulting to
-  false AND passing `-W0` to mere-ruby in run_spec.sh, which changes every
-  file's measurement at once; a harness change of its own.
+- ~~`$VERBOSE` reads nil when nothing set it~~ -- closed: the default is false,
+  as ruby's is, and run_spec.sh passes `-W0` to both sides (dash_r 9/9,
+  feature 20/26 with the rest below).
 - **`$LOAD_PATH` has no stdlib directories.** ruby's ends with site_ruby,
   vendor_ruby and rubylibdir, so "-I / RUBYLIB adds at the front" is asked as
   "not the last entry"; here the -I directory IS the whole path (dash_upper_i,
@@ -480,17 +475,21 @@ subtraction against the command word.
 
 **Why it is still here.** Ruby decides this by knowing whether the name
 on the left is a *local variable*: `a -b` is subtraction when `a` is a
-local and `a(-b)` when `a` is a method. This parser does not track
-assigned locals, so it cannot make that distinction, and guessing either
-way breaks the other. `p a -b` (subtraction) works today and is the more
-common shape in real code, so the current behaviour is the safer half.
+local and `a(-b)` when `a` is a method. The LEXER now keeps that table
+(`lvt_*` in m_parse.mere: scopes pushed by def/class/module and blocks,
+filled by assignments, parameters, `for` targets and `rescue => e`), and
+uses it for `/`, `%`, `?`, ` &`, ` ::`, ` [` and heredocs -- but only in one
+direction: a name it KNOWS is a local reads as one, and any other name
+keeps the old guess. `-` and `*` are still read as binary for every name.
 
-**What fixing it takes.** A set of locals threaded through the parser —
-assignments, block and method parameters, `for` targets, rescue bindings
-— consulted when an identifier is followed by a space-minus-no-space. The
-lexer already emits space-marked variants of `(`, `[`, `&` and `::` for
-exactly this class of ambiguity, so the token side is a small addition;
-the scope tracking is the real work.
+**What fixing it takes.** Emit a space-marked ` -` / ` *` (space before,
+none after) when the name before is not in the table, and read it in the
+parser as the start of a paren-less argument. The risk is the table's blind
+spots, which today cost nothing and would then turn a subtraction into a
+call: pattern-matching variables (`in [a, b]`, `=> x`), named captures
+(`/(?<x>..)/ =~ s`), `binding.local_variable_set`, and an eval string, which
+is lexed with no knowledge of the enclosing scope's locals. Those would
+have to be recorded first.
 
 **What it costs today.** Nothing measured. No gem in the sample hits it;
 it surfaced only in a hand-written test. `p(-1)` and `puts -1` (where the
@@ -926,45 +925,55 @@ their structs, and `Socket::Constants` is the pinned reference's table in
 mkconstants.rb's order. ruby/spec's addrinfo, option, ancillarydata and
 constants directories went from 0 of 64 files to 64 of 64 on that alone.
 
-The SOCKET half is what can be done without handing the kernel a
-`struct sockaddr *`, which no extern here can spell:
+The SOCKET half is what the runtime can do with a `struct sockaddr *`, which
+no extern here can spell. Since compiler v0.1.555 it keeps the sockaddr on its
+side -- an address crosses as text, the family as a name -- and binds, listens
+on a chosen address and answers getsockname / getpeername itself:
 
 - **A socket is an IO.** `BasicSocket < IO`, and a socket's stream methods
   are the prelude's descriptor layer -- the read buffer, write buffer and
   readiness loop an `IO.pipe` end has -- over fd_read / fd_write of the
-  descriptor the tcp functions hand out (they are plain descriptors). Two
-  answers are coarser than ruby's because fd_read and fd_write report -1
-  without errno: a write the kernel refuses is always Errno::EPIPE (ruby
-  can also say ECONNRESET), and a connection the peer RESET reads as end of
-  file where ruby raises Errno::ECONNRESET.
+  descriptor the tcp functions hand out (they are plain descriptors). A
+  refused read or write carries the errno the runtime kept (fd_last_errno),
+  so a connection the peer RESET is Errno::ECONNRESET and a refused write is
+  whatever the kernel named -- for pipes and files too, since the layer is
+  shared. The messages are the class's own text; ruby's sometimes add the
+  call site (`@ io_fillbuf - fd:11`), which is not reproduced.
 - **TCP, either family.** `TCPSocket`/`Socket#connect` go through
   `tcp_connect`. `TCPSocket.new` resolves the host itself and tries each
   address in turn, as ruby does ("localhost" is ::1, then 127.0.0.1); a name
   the files half cannot resolve is left to `tcp_connect`'s own resolver,
-  which tries only its first address. A listener on port 0 is socket(2) +
-  listen(2), which binds the wildcard of the family itself; a chosen IPv4
-  port is `tcp_listen`. `TCPServer.new("127.0.0.1", 0)` is therefore a
-  listener on EVERY interface, and `#addr` / `#local_address` say so --
-  0.0.0.0 -- because that is the kernel's answer (and
-  `TCPServer.new("localhost", 0)` says `::`, where ruby, which bound ::1,
-  says `::1`); ipsocket/addr_spec asks for the requested address back and
-  stays DIFF for it. A chosen port on IPv6 is refused by name.
-- **getsockname / getpeername are read from outside**: lsof(8) on macOS,
-  /proc on Linux, the same shape File::Stat takes with stat(1). About 35 ms
-  per socket, asked once when the pair can no longer change. No lsof and no
-  /proc is a SocketError, never a guessed address.
-- **UDP, connected only.** `UDPSocket#connect` / `send` / `recv` are the
-  runtime's udp_open / send / recv. `#bind` and `#send` to an address need
-  bind(2) and sendto(2) and raise NotImplementedError, which is why
-  ipsocket/inspect_spec and ipsocket/recvfrom_spec (they receive on a bound
-  socket) stay DIFF.
+  which tries only its first address. `TCPServer.new` is the runtime's
+  tcp_listen_at, which is init_inetsock_internal's loop: every AI_PASSIVE
+  answer in turn gets socket(2), SO_REUSEADDR and bind(2), the first that
+  binds is the listener, and a refusal is the Errno the kernel named
+  (EADDRINUSE, EADDRNOTAVAIL, EACCES) with ruby's message. So
+  `TCPServer.new("localhost", 0).addr` is `::1` where ruby says `::1`, and
+  either family takes a chosen port.
+- **getsockname / getpeername are the kernel's own** (sock_local_addr /
+  sock_peer_addr). They were read from outside -- lsof(8) on macOS, /proc on
+  Linux, about 35 ms a socket -- before the runtime could ask.
+- **UDP binds and connects, but cannot send to an address.**
+  `UDPSocket#bind` is bind(2), `#connect` / `send` / `recv` are the runtime's
+  udp_open / send / recv. `#send` to an address needs sendto(2) and raises
+  NotImplementedError, and a datagram's sender needs recvfrom(2): `#recvfrom`
+  on a socket that is not connected is Errno::ENOTCONN from getpeername(2),
+  which is why ipsocket/recvfrom_spec and socket/recvfrom_spec stay DIFF. A
+  datagram is one recv(2) / send(2) and never passes through the stream
+  buffer, so an empty one is `""` and is actually sent.
 - **UNIX sockets** need a sockaddr_un for connect(2) and bind(2) and an array
   for socketpair(2); they raise NotImplementedError. `Addrinfo.unix` and
   `Socket.sockaddr_un` are data and work.
-- **`Socket#bind` is deferred** to the call that can honour it: listen(2)
-  binds the wildcard with the port asked for, and connect(2) takes the local
-  address the route gives -- and a requested local address the kernel did not
-  choose is refused after the fact rather than reported as bound.
+- **`Socket#bind` is bind(2)**, and `#listen` is listen(2) on the same
+  descriptor. A connect after a bind is still the runtime's own socket (see
+  below), so a chosen local PORT for a connect is refused by name and a
+  local address the kernel did not choose is refused after the fact rather
+  than reported as bound.
+- **Socket options are read, not applied.** setsockopt(2) / getsockopt(2)
+  take a pointer; `#setsockopt` checks its arguments as ruby does and changes
+  nothing, and `#getsockopt` is missing (tcpserver/new_spec's SO_REUSEADDR
+  example is an ERROR for it). SO_REUSEADDR itself is set by the runtime on
+  every TCPServer, as ruby sets it.
 - **A read waits in IO's readiness loop** (the socket is non-blocking, as
   every ruby 3 socket is), so under the thread scheduler the peer runs while
   a reader waits (a bare read(2) would stop the process).
@@ -4228,6 +4237,36 @@ real reason.
 **What fixing it would take.** A faster Etc.getgrgid (a cache is not
 faithful: groups can change under a running process). Read this row as
 "passes, and sometimes too slowly to be told".
+
+## RbConfig::CONFIG has the facts, not the build (library/rbconfig_spec stays DIFF)
+
+The keys that are facts about the ruby mere-ruby reports being are answered:
+MAJOR / MINOR / TEENY / PATCHLEVEL, RUBY_PROGRAM_VERSION, RUBY_API_VERSION,
+RUBY_BASE_NAME, and the cpu / os / vendor parts of RUBY_PLATFORM (host_*,
+target_*), with `prefix` equal to RbConfig::TOPDIR. What is not answered is
+CRuby's BUILD: its compiler, flags, library names and installation paths
+(254 keys in 4.0.6; this has 26).
+
+**Why it is still here.** There is no build of CRuby to describe. Copying a
+reference installation's table would put one machine's paths and compiler
+flags into every mere-ruby, and would be wrong on the next machine.
+rbconfig_spec's first example asserts once per key, so its expectation count
+follows the size of the table and the file cannot MATCH without copying all
+254 -- a count, like core/thread/list_spec's, not a defect. The four examples
+left read the installation's directories (rubylibdir exists, archdir holds
+etc.bundle, sitelibdir is on $LOAD_PATH), which mere-ruby does not have.
+
+**What fixing it would take.** An installation layout of mere-ruby's own.
+
+## A Proc's instance variables are not carried by #dup / #clone
+
+A Proc can hold instance variables now (they were refused as if it were
+frozen), but its copies do not get them: core/proc/dup_spec and clone_spec
+"copies instance variables" went from an error to a failure. The copy is
+made in the Proc's own path, and the ivars ("prc:<id>@name") are keyed the
+way the String/Array/Hash copies' are, so the fix is the same few lines as
+the primitive dup arm, in the Proc's copy. "copies the finalizer" is the
+Kernel#dup gap (ObjectSpace finalizers are not copied for any object).
 
 ## `json`: what the shipped C half does not reproduce
 

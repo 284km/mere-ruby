@@ -229,7 +229,7 @@ sb_runner='
 '
 out_m="$( ( ulimit -c 0; ulimit -S -t "$sb_cpu" 2>/dev/null
             MSPEC_RUBY_EXE="$mr"; export MSPEC_RUBY_EXE
-            spec_env /usr/bin/time -l -o "$tmp/ru_m" perl -e "$sb_runner" "$sb_wall" "$tmp/rc_m" "$mr" "$tmp/driver.rb"
+            spec_env /usr/bin/time -l -o "$tmp/ru_m" perl -e "$sb_runner" "$sb_wall" "$tmp/rc_m" "$mr" -W0 "$tmp/driver.rb"
           ) 2>/dev/null | head -c "$out_cap")"
 rc_m="$(cat "$tmp/rc_m" 2>/dev/null || echo 0)"
 # the REAL ruby binary, not rbenv's shim: the shim exports RBENV_* and RUBYLIB
