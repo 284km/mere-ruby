@@ -12,6 +12,7 @@ p proc { it; binding.implicit_parameter_get("it") }.call(:z)
 p proc { _2; [1, 2, 3, 4].map { |i| binding.implicit_parameter_defined?(:"_#{i}") } }.call
 p proc { it; binding.implicit_parameter_defined?(:_1) }.call(1)
 p proc { _2; %i[_1 _2 _3 it].map { |n| binding.implicit_parameter_defined?(n) } }.call
+p proc { _1; pr = proc { }; [pr.binding.implicit_parameters, pr.binding.implicit_parameter_get(:_1)] }.call(7)
 def err
   yield
 rescue NameError, TypeError => e
