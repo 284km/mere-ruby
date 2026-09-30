@@ -3805,11 +3805,17 @@ and it can hand bytes back through the arena it already owns. The point of
 writing the three walls down is that they say exactly what that builtin buys,
 and it is more than one method.
 
-⚠ `File.flock` is behind a FOURTH wall and no builtin fixes it: it takes a file
-descriptor, and a File here is a path, a mode and a buffer (see *`File#fileno`
-refuses*).
+⚠ `File#flock` was written here as behind a FOURTH wall -- it takes a file
+descriptor, and a File was a path, a mode and a buffer. That wall went when a
+File began opening its descriptor alongside (`fd_open`, compiler v0.1.522), and
+flock(2) itself then turned out to need no builtin: <sys/file.h> is not
+included, so a plain extern had nothing to conflict with. It goes through the
+compiler's `file_flock` now (v0.1.550) for a different reason -- the extern
+answered 0 or -1, so a lock held elsewhere and a bad descriptor were one
+number and the prelude raised EBADF for both; `file_flock` answers 1 for the
+first.
 
-### `Process.getrlimit` / `setrlimit` / `getpriority` / `setpriority`: walls 2 and 3
+### `Process.getrlimit` / `setrlimit` / `getpriority` / `setpriority`: walls 2 and 3, and what closed them
 
 Measured 2026-09-30 with the build's own clang (macOS SDK), one extern each in
 a four-line Mere program:
@@ -3822,41 +3828,38 @@ extern fn getrlimit:   int -> int -> int;   error: conflicting types for 'getrli
 ⚠ **The header is NOT the wall here**, which an earlier note in m_state.mere
 said it was. `<sys/resource.h>` is in every emitted program already --
 `<stdlib.h>` includes `<sys/wait.h>`, which includes it -- so the prototype
-Mere writes meets the real one and loses:
+Mere writes meets the real one and loses: `getpriority(int, id_t)` is wall 2
+(`id_t` is an unsigned typedef) and `getrlimit(int, struct rlimit *)` is wall 3
+(the limits come back through a struct pointer).
 
-* `getpriority(int, id_t)` and `setpriority(int, id_t, int)` are wall 2: `id_t`
-  is an unsigned 32-bit typedef, and `extern int getpriority(int, int)` is a
-  different function to C.
-* `getrlimit(int, struct rlimit *)` and `setrlimit(int, const struct rlimit *)`
-  are wall 3: the limits come back through a struct pointer, which no extern
-  can spell and an arena offset cannot stand in for.
+**Closed by the compiler's `proc_*` runtime (v0.1.550)**, the shape this entry
+asked for, with one change: the resource crosses **by name** rather than by
+number, so RLIMIT_NOFILE being 8 on macOS and 7 on Linux stays in C, and the
+Process::RLIMIT_* constants are made at startup from what the runtime says this
+platform has (`proc_rlimit_names` / `proc_rlimit_resource`) instead of being
+darwin's numbers written in the prelude. A limit of -1 is RLIM_INFINITY both
+ways, RLIM_INFINITY itself comes back in decimal (2^64-1 on Linux is a Bignum),
+and the errno of the last call is kept beside the answer because -1 is a
+legitimate priority. The coercion the specs spend most of their examples on is
+ordinary Ruby in the prelude on top of the calls. getrlimit_spec 0/9 err ->
+29/29, setrlimit_spec 0/30 err -> 28/30, getpriority_spec 0/4 err -> 4/4,
+setpriority_spec 0/1 err -> 2/2.
 
-**What it costs.** Process.getrlimit, Process.setrlimit, Process.getpriority and
-Process.setpriority are NoMethodError, and so every example of their four spec
-files is red: 29 + 30 + 4 + 2 examples that ruby passes. The Process::RLIMIT_*
-and PRIO_* constants are not defined either, since a constant with no call
-that takes it would only let a program get one step further before failing.
+**What is left: the two `:STACK` examples of setrlimit_spec, and they are this
+binary's link line rather than the method.** `Process.setrlimit(:STACK,
+*Process.getrlimit(:STACK))` -- setting the limits to exactly what they are --
+is Errno::EINVAL here and nil under ruby. A six-line C program reproduces it
+with no Mere in it: macOS refuses a stack soft limit below the stack the main
+thread really has, and `tools/build.sh` links with `-stack_size 0x20000000`
+(512 MB, the evaluator's recursion; see mere.toml), while getrlimit still
+reports the 8 MB the process inherited. Built without that flag the same call
+succeeds. It goes when the evaluator stops needing the big main stack, not
+before.
 
-**What fixing it would take, on the Mere side** -- the same shape as the
-`fd_open` family, a host builtin written in C against the real headers:
-
-* `rlimit_get: int -> int -> int` (resource, 0 soft / 1 hard) and
-  `rlimit_set: int -> int -> int -> int`, answering `-errno` on failure so
-  Errno::EINVAL / EPERM can be raised by name;
-* `prio_get: int -> int -> int` that clears and reads `errno` itself, because
-  -1 is a legitimate priority and the extern's int result cannot tell it from
-  failure -- a fourth reason a plain extern would not do even if the types
-  agreed;
-* and the NUMBERS: RLIMIT_NOFILE is 8 on macOS and 7 on Linux, RLIM_INFINITY
-  is 2^63-1 on one and 2^64-1 (a Bignum in ruby) on the other. They are
-  platform constants, so the C side has to hand them out (`rlimit_const: str
-  -> int`); writing either table into the interpreter would be right on one
-  host and quietly wrong on the other.
-
-Nothing on the mere-ruby side is missing beyond that: the argument coercion
-the specs spend most of their examples on (a Symbol or String short name,
-`#to_int`, `#to_str`, ArgumentError for an unknown resource) is ordinary Ruby
-and would go in the prelude on top of the four calls.
+Two differences that no spec reads, both from the runtime's contract refusing
+before the kernel is asked: a negative limit other than RLIM_INFINITY's is
+EINVAL here (ruby wraps it to a huge unsigned value and darwin says EPERM), and
+a priority selector that is not 0 / 1 / 2 is EINVAL here (darwin says EPERM).
 
 ### `Process.daemon` is NoMethodError, like `Process.fork`
 
