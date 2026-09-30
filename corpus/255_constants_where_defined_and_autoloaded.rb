@@ -129,6 +129,11 @@ p Shop::Anon.new.y
 
 Warning[:deprecated] = true
 $VERBOSE = false
+# (the warnings go through Warning.warn, which is how a program sees them;
+# printing them here keeps them on stdout, where the corpus compares)
+module Warning
+  def self.warn(msg, category: nil) = print("[#{category.inspect}] #{msg.sub(/\A.*?warning: /, "")}")
+end
 module Shop
   OLD = 1
   deprecate_constant :OLD
