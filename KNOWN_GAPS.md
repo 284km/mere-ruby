@@ -424,14 +424,9 @@ RUBYOPT and ruby's switches are read (`-E -K -U -0 -C -X -x -c -d -s -S`,
 `--encoding`, `--enable`/`--disable` lists, `--debug`). What is left of
 command_line/ after that is not about the switches:
 
-- **`$VERBOSE` reads nil when nothing set it** (see the comment beside the
-  globals in run_src): every gate runs the reference as `ruby -W0`, and a
-  default of false would print warnings only this side gives. ruby's own
-  default is false, so an example that prints `$VERBOSE` in a child with no
-  switch reads `nil` here -- dash_r "requires in order" (1), and feature's
-  `--disable=rubyopt` / `--disable=all` (4). Fixing it means defaulting to
-  false AND passing `-W0` to mere-ruby in run_spec.sh, which changes every
-  file's measurement at once; a harness change of its own.
+- ~~`$VERBOSE` reads nil when nothing set it~~ -- closed: the default is false,
+  as ruby's is, and run_spec.sh passes `-W0` to both sides (dash_r 9/9,
+  feature 20/26 with the rest below).
 - **`$LOAD_PATH` has no stdlib directories.** ruby's ends with site_ruby,
   vendor_ruby and rubylibdir, so "-I / RUBYLIB adds at the front" is asked as
   "not the last entry"; here the -I directory IS the whole path (dash_upper_i,
