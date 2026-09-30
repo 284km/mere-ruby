@@ -55,7 +55,7 @@ dirs="$*"
 # what it SHIPS: $LOAD_PATH starts empty, so a spec for a pure-Ruby library that
 # is not compiled in (uri, erb, open3, net/http ...) is a LoadError there, and
 # those groups never had a row -- 781 files of library/ that no sweep asked
-# about (measured 2026-09-30, note 259). SPEC_WITH_STDLIB=1 asks the other
+# about (measured 2026-09-30). SPEC_WITH_STDLIB=1 asks the other
 # question: those groups with the REFERENCE's stdlib and bundled gems on
 # RUBYLIB, as gemtest's "with a stdlib" column does. It is recorded apart
 # (SPEC_STATUS_STDLIB.md, mspec/tags_stdlib/) so that neither table's number
@@ -250,7 +250,7 @@ run_one() {  # $1 = spec file -> echoes VERDICT<TAB>CAUSE
   if [ "$vline" = "$verdict" ]; then vcause="-"; else vcause="${vline#*	}"; fi
   # ⚠ A MATCH IN WHICH THE REFERENCE RAN NOTHING MEASURES NOTHING. Two sides
   # that both print "pass=0 fail=0 err=0" agree, and win32ole's 54 files --
-  # every example behind a platform guard -- read as 54 MATCHes (note 259).
+  # every example behind a platform guard -- read as 54 MATCHes.
   # That is ruby not running the file here, which is what SKIP says.
   if [ "$verdict" = "MATCH" ]; then
     if printf '%s' "$out" | sed -n '/--- ruby:/,$p' | grep -a 'pass=' | tail -1 | grep -q '^pass=0 fail=0 err=0$'; then
@@ -518,9 +518,13 @@ fi
     { k = grp($0); if (k in nr) print nr[k]; else print }
   ' "$old_rows"
   # ... and a group measured for the first time is appended
-  awk -F'|' '
+  # ⚠ FILENAME, not NR == FNR: with no table yet $old_rows is EMPTY, NR == FNR
+  #   then holds all through $rows too, every measured row was filed as "had",
+  #   and the first SPEC_STATUS_STDLIB.md came out with 68 groups swept and no
+  #   rows at all. The main table always existed, so it never showed.
+  awk -F'|' -v old="$old_rows" '
     function grp(l,  f, k) { split(l, f, "|"); k = f[2]; gsub(/^ +| +$/, "", k); return k }
-    NR == FNR { had[grp($0)] = 1; next }
+    FILENAME == old { had[grp($0)] = 1; next }
     !(grp($0) in had) { print }
   ' "$old_rows" "$rows"
   echo
