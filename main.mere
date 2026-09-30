@@ -1924,7 +1924,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // not shadow a real method).
     else if (str_len name == 7 && str_eq name "binding") && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = (handle_base + map_len bind_store) in
-      let _ = map_set bind_store (str_of_int id) (bnd_snapshot env) in
+      // (a frame of its own over the snapshot: what is defined THROUGH the
+      // binding is listed first and a #dup shares the rest -- see Binding#dup)
+      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_snapshot env)) in
       // where it was made, for #source_location
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
@@ -2027,7 +2029,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // as a first-class Binding, unless the user redefined `binding`.
     else if (str_len name == 7 && str_eq name "binding") && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = (handle_base + map_len bind_store) in
-      let _ = map_set bind_store (str_of_int id) (bnd_snapshot env) in
+      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_snapshot env)) in
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
     // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
@@ -4895,6 +4897,34 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // block (a hidden "__f..." param) runs directly in the enclosing env and
   // leaves its loop variable and body locals behind, exactly as Ruby does.
   let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam in
+  // ⚠ WHICH implicit parameters this frame HAS is a property of the body, not
+  //   of the env: bind_numbered puts _1.._9 into every parameter-less block's
+  //   frame, whether the body names them or not, and ruby 4.0's
+  //   Binding#implicit_parameters answers only the ones the body declares
+  //   (`proc { _3; binding.implicit_parameters }` is [:_1, :_2, :_3], and
+  //   `proc { binding.implicit_parameters }` is [] -- measured, all 46 of the
+  //   implicit_parameter* examples were NoMethodError). The count is recorded
+  //   in the frame itself ("__ip": N for _1.._N, 0 for `it`) so a `binding`
+  //   made anywhere in the body can read it; the body cannot be kept instead,
+  //   since a map stores a deep copy of what it is given. Only a body that
+  //   names one pays the map write.
+  // ⚠ ONE walk, not the two arity uses (max_numbered_stmts, then
+  //   uses_it_stmts when that found nothing -- which is every ordinary block).
+  //   This runs on every call of every parameter-less block: measured on
+  //   `2_000_000.times { i += 1; j = i * 2; k = j - i }` (-O1, user seconds)
+  //   the two walks cost 5% of the run (6.31 -> 6.64); with the single one
+  //   (ip_scan_stmts) the best of six runs is the same as without any walk
+  //   (6.94 before, 6.91 after) and the mean 3% above it, inside this
+  //   machine's noise.
+  let _ = (match params with
+           | Nil ->
+             (let ip9 = ip_scan_stmts body in
+              if ip9 == 0 then ()
+              else if ip9 < 10 then map_set benv "__ip" (VInt ip9)
+              // a LOCAL named `it` further out makes `it` that local, not a parameter
+              else if lv_has cenv "it" then ()
+              else map_set benv "__ip" (VInt 0))
+           | _ -> ()) in
   // A raising body used to need explicit cleanup here (restoring saved params
   // and dropping created locals) or the bindings leaked into the shared env
   // and were visible to later sibling blocks; with a per-invocation frame the
@@ -18865,7 +18895,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 7 && str_eq name "binding") then
       (let (h9, ps9, b9, cenv9) = proc_as_block pid in
        let bid = (handle_base + map_len bind_store) in
-       let _ = map_set bind_store (str_of_int bid) (lv_flat cenv9) in
+       // (with a frame of its own on top, like Kernel#binding's)
+       let _ = map_set bind_store (str_of_int bid) (lv_child (lv_flat cenv9)) in
        VBind bid)
     // Proc#to_proc is the proc ITSELF -- the name was claimed with nothing
     // behind it, so `pr.to_proc` was a NoMethodError on a Proc.
@@ -18925,16 +18956,31 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // binding.eval(str) runs str against the captured env; local_variable_get
     // reads one captured local. class reports Binding.
     let benv = map_get bind_store (str_of_int bid) in
+    // Binding#eval(src, file = nil, line = 1) IS `Kernel#eval(src, self, file,
+    // line)` -- one door, so it names the eval "(eval at FILE:LINE)" when no
+    // file is given, starts __LINE__ at the third argument and checks the
+    // source the way every eval does. It had a parser of its own that read
+    // only the first argument: `b.eval("__LINE__", "(test)", 88)` was 1 and
+    // `b.eval("__FILE__")` answered "(eval) __FILE__", the source itself.
     if (str_len name == 4 && str_eq name "eval") then
-      (match args with
-       | Cons (VStr code, _) -> let code = sget code in
-         let _ = set_parsing_eval code in
-         let toks = number_nls code (lex_go code 0) in
-         let _ = parse_line_reset (count_nls toks) in
-         let (p2, _) = parse_stmts toks Nil in
-         let _ = map_set load_ctx "parsing" (mkstr "") in
-         eval_run benv world blk p2
-       | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: Binding#eval expects a string")) in fail "mere-ruby: Binding#eval expects a string"))
+      do_eval env world blk (match args with Cons (c9, r9) -> Cons (c9, Cons (recv, r9)) | Nil -> Nil)
+    // #dup / #clone: a copy that SHARES the variables the binding already has
+    // and keeps the ones defined through it to itself -- ruby's "shallow copy"
+    // (`eval("a = false", b1)` is seen by b2, `b1.local_variable_set(:x, 1)`
+    // is not). Both answered the receiver itself, so a dup was == its original
+    // and a variable set in either appeared in both.
+    // ⚠ TWO new frames over the original's, not one: a copy that is merely a
+    //   child still sees what the ORIGINAL defines later, through its parent.
+    //   So the original moves onto a fresh frame of its own as well, and what
+    //   either defines from now on stays in its own.
+    else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
+      (let nb9 = handle_base + map_len bind_store in
+       let _ = map_set bind_store (str_of_int nb9) (lv_child benv) in
+       let _ = (if tl_is bid then () else map_set bind_store (str_of_int bid) (lv_child benv)) in
+       let _ = (if map_has bind_loc (str_of_int bid) then map_set bind_loc (str_of_int nb9) (map_get bind_loc (str_of_int bid)) else ()) in
+       // #clone keeps the frozen state and #dup drops it
+       let _ = (if str_len name == 5 && cfrozen_get 3 bid then cfrozen_set 3 nb9 else ()) in
+       VBind nb9)
     // Binding#local_variables: the names the binding can see, as symbols.
     // ⚠ NOT the interpreter's own entries -- `self` and the `__`-prefixed
     //   bookkeeping (__cref, __definee_recv, ...) live in the same map and are
@@ -18956,22 +19002,37 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else if map_has tmp9 (str_of_int i) then Cons (map_get tmp9 (str_of_int i), dyn_in9 (i + 1))
           else dyn_in9 (i + 1)) in
        arr_new (strs_to_syms (list_append_str ds9 (dyn_in9 0))))
+    // ⚠ ...frame by frame, INNERMOST FIRST, the way ruby lists them: what was
+    //   defined through the binding comes before what it captured
+    //   (`b = binding; b.local_variable_set(:a, 1)` lists [:a, :b]), and a
+    //   copy's own variables before its original's.
     else if (str_len name == 15 && str_eq name "local_variables") then
-      (let out9 = arr_new Nil in
-       let _ = (match out9 with
-                | VArr aid9 ->
-                  map_iter benv (fn (k9: str) -> fn (v9: Val) ->
-                    if bnd_is_local k9
-                    then arr_set aid9 (list_append (deref aid9) (Cons (VSym k9, Nil)))
-                    else ())
-                | _ -> ()) in
-       out9)
+      (let seen9 = map_new () in
+       let acc9 = map_new () in
+       let rec walk9 = fn e9 ->
+         (let _ = map_iter e9 (fn (k9: str) -> fn (v9: Val) ->
+                    if bnd_is_local k9 && (if map_has seen9 k9 then false else true)
+                    then (let _ = map_set seen9 k9 1 in map_set acc9 (str_of_int (map_len acc9)) (VSym k9))
+                    else ()) in
+          let (has9, p9) = lv_parent_of e9 in
+          if has9 then walk9 p9 else ()) in
+       let _ = walk9 benv in
+       arr_new (idx_to_list acc9 0 (map_len acc9)))
     // ⚠ the NAME argument reads the way every name argument does -- a
     //   Symbol, a String, anything with #to_str, and a TypeError for the rest
     //   (sym_or_str_arg). All three arms matched VSym only, so a String name
     //   answered nil and an Object answered nil instead of refusing.
+    // ⚠ ...and a name that cannot BE a local (`:$0`, `:@a`, `:A`, `:"a b"`)
+    //   is ruby's NameError, for all three. local_variable_set stored it as a
+    //   local and answered the value; the other two answered nil / false.
     else if ((str_len name == 18 && str_eq name "local_variable_get") || (str_len name == 18 && str_eq name "local_variable_set")
              || (str_len name == 23 && str_eq name "local_variable_defined?"))
+            && (match args with Cons (VSym n9, _) -> numbered_digit n9 == 0 && (if bnd_lvar_name_ok n9 then false else true) | _ -> false) then
+      raise_exc world "NameError" ("wrong local variable name '" ++ (match args with Cons (VSym n9, _) -> n9 | _ -> "") ++ "' for " ++ inspect recv)
+    else if ((str_len name == 18 && str_eq name "local_variable_get") || (str_len name == 18 && str_eq name "local_variable_set")
+             || (str_len name == 23 && str_eq name "local_variable_defined?")
+             || (str_len name == 22 && str_eq name "implicit_parameter_get")
+             || (str_len name == 27 && str_eq name "implicit_parameter_defined?"))
             && (match args with Cons (VSym _, _) -> false | Nil -> false | _ -> true) then
       invoke_val_c env world blk recv name
         (match args with Cons (a9, t9) -> Cons (VSym (sym_or_str_arg env world a9), t9) | Nil -> Nil) vischeck
@@ -18983,7 +19044,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // ⚠ a name the binding does not hold is a NameError, not nil. Answering
           // nil made `binding.local_variable_get(:it)` look like a local holding
           // nothing -- and the same for every misspelt name.
-          else if map_has benv n then map_get benv n
+          else if lv_has benv n then lv_get benv n
           // a declared toplevel local not assigned yet holds nil
           else if tl_is bid && tl_declared n then VNil
           else raise_exc world "NameError"
@@ -18994,7 +19055,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VSym n, Cons (v, _)) ->
          (if numbered_digit n > 0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
-          else (let _ = map_set benv n v in
+          // lv_set: a variable the binding already has is assigned where it
+          // lives (a copy shares it); a new one is the binding's own
+          else (let _ = lv_set benv n v in
                 let _ = (if tl_is bid && (if map_has tl_dyn n then false else true)
                          then map_set tl_dyn n (map_len tl_dyn) else ()) in v))
        | _ -> VNil)
@@ -19003,10 +19066,37 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VSym n, _) ->
          (if numbered_digit n > 0
           then raise_exc world "NameError" ("numbered parameter '" ++ n ++ "' is not a local variable")
-          else VBool (map_has benv n || (tl_is bid && tl_declared n)))
+          else VBool (lv_has benv n || (tl_is bid && tl_declared n)))
        | _ -> VBool false)
+    // Binding#implicit_parameters / #implicit_parameter_get /
+    // #implicit_parameter_defined? (ruby 4.0): the numbered parameters up to
+    // the highest one the body names, or `it` -- of the frame the binding was
+    // made in, which bnd_snapshot recorded as "__ip" (N, or 0 for `it`) with
+    // the values beside it. A name that could never be one (`:a`, `:_0`,
+    // `:_10`) is a NameError of its own, before the question is asked.
+    else if (str_len name == 19 && str_eq name "implicit_parameters") then
+      (match (if lv_has benv "__ip" then lv_get benv "__ip" else VNil) with
+       | VInt 0 -> arr_new (Cons (VSym "it", Nil))
+       | VInt n9 -> arr_new (strs_to_syms (bnd_numbered_names 1 n9))
+       | _ -> arr_new (Nil : Val list))
+    else if (str_len name == 22 && str_eq name "implicit_parameter_get")
+            || (str_len name == 27 && str_eq name "implicit_parameter_defined?") then
+      (match args with
+       | Cons (VSym n, _) ->
+         (let slot9 = (if str_eq n "it" then 0 else numbered_digit n) in
+          let ip9 = (match (if lv_has benv "__ip" then lv_get benv "__ip" else VNil) with VInt k9 -> k9 | _ -> 0 - 1) in
+          // `it` is slot 1 of an `it` frame; _k is slot k of a frame whose
+          // highest numbered parameter is at least k
+          let has9 = (if slot9 == 0 then ip9 == 0 else ip9 >= slot9) in
+          if (if str_eq n "it" then false else slot9 == 0) then
+            raise_exc world "NameError" ("'" ++ n ++ "' is not an implicit parameter")
+          else if str_len name == 27 then VBool has9
+          else if has9 then lv_get benv ("__ipv" ++ str_of_int (if slot9 == 0 then 1 else slot9))
+          else raise_exc world "NameError"
+                 ("implicit parameter '" ++ n ++ "' is not defined for " ++ inspect recv))
+       | _ -> VNil)
     else if (str_len name == 8 && str_eq name "receiver") || (str_len name == 4 && str_eq name "self") then
-      (if map_has benv "self" then map_get benv "self" else VMain)
+      (if lv_has benv "self" then lv_get benv "self" else VMain)
     else if (str_len name == 5 && str_eq name "class") then VClass "Binding"
     // [file, line] of the `binding` call that made it
     else if (str_len name == 15 && str_eq name "source_location") then
@@ -19140,6 +19230,47 @@ and uses_it_exprs = fn (es: Expr list) ->
   match es with
   | Nil -> false
   | Cons (e, rest) -> uses_it_expr e || uses_it_exprs rest
+// max_numbered_stmts and uses_it_stmts in ONE walk, for the per-call question
+// run_block asks: the highest _N the body names (1..9), 10 when it names `it`
+// instead, 0 for neither. (The two cannot both be there: `it` beside a
+// numbered parameter is a SyntaxError.) Same shapes, same rule about not
+// descending into a nested block's body.
+and ip_scan_stmts = fn (body: Stmt list) ->
+  match body with
+  | Nil -> 0
+  | Cons (s, rest) -> imax (ip_scan_stmt s) (ip_scan_stmts rest)
+and ip_scan_stmt = fn (s: Stmt) ->
+  match s with
+  | SExpr e -> ip_scan_expr e
+  | SAssign (_, e) -> ip_scan_expr e
+  | SIVarAssign (_, e) -> ip_scan_expr e
+  | SReturn e -> ip_scan_expr e
+  | SPuts es -> ip_scan_exprs es
+  | SWhile (c, b) -> imax (ip_scan_expr c) (ip_scan_stmts b)
+  | SIf (clauses, els) -> imax (ip_scan_clauses clauses) (ip_scan_stmts els)
+  | _ -> 0
+and ip_scan_clauses = fn (clauses: (Expr * Stmt list) list) ->
+  match clauses with
+  | Nil -> 0
+  | Cons ((c, b), rest) -> imax (imax (ip_scan_expr c) (ip_scan_stmts b)) (ip_scan_clauses rest)
+and ip_scan_expr = fn (e: Expr) ->
+  match e with
+  | EVar n -> (if str_len n == 2 && str_eq n "it" then 10 else numbered_digit n)
+  | ECall (n, args) -> (match args with Nil -> (if str_eq n "it" then 10 else 0) | _ -> ip_scan_exprs args)
+  | EBin (_, a, b) -> imax (ip_scan_expr a) (ip_scan_expr b)
+  | EUn (_, a) -> ip_scan_expr a
+  | EMethod (r, _, args) -> imax (ip_scan_expr r) (ip_scan_exprs args)
+  | EMethodB (r, _, args, _, _) -> imax (ip_scan_expr r) (ip_scan_exprs args)
+  | ECallB (_, args, _, _) -> ip_scan_exprs args
+  | EArr es -> ip_scan_exprs es
+  | EHsh es -> ip_scan_exprs es
+  | ETern (a, b, c) -> imax (imax (ip_scan_expr a) (ip_scan_expr b)) (ip_scan_expr c)
+  | EYield es -> ip_scan_exprs es
+  | _ -> 0
+and ip_scan_exprs = fn (es: Expr list) ->
+  match es with
+  | Nil -> 0
+  | Cons (e, rest) -> imax (ip_scan_expr e) (ip_scan_exprs rest)
 // the block's implicit parameter count: the numbered ones, or one for `it`.
 and implicit_params_of = fn (body: Stmt list) ->
   (let n9 = max_numbered_stmts body in
@@ -24600,7 +24731,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // it was created under --enable-frozen-string-literal or explicitly frozen.
     // an object's singleton class is frozen exactly when the object is.
     VBool (val_is_frozen recv)
-  else if (str_len name == 6 && str_eq name "freeze") then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set 0 id in recv | VHsh id -> let _ = cfrozen_set 1 id in recv | VProc id -> let _ = cfrozen_set 2 id in recv | VObj id -> let _ = ofrozen_set id in recv | VClass c -> let _ = clsfrozen_set c in recv | _ -> recv)
+  else if (str_len name == 6 && str_eq name "freeze") then (match recv with VStr id -> let _ = sfrozen_set id in recv | VArr id -> let _ = cfrozen_set 0 id in recv | VHsh id -> let _ = cfrozen_set 1 id in recv | VProc id -> let _ = cfrozen_set 2 id in recv | VBind id -> let _ = cfrozen_set 3 id in recv | VObj id -> let _ = ofrozen_set id in recv | VClass c -> let _ = clsfrozen_set c in recv | _ -> recv)
   // String#-@ interns: a frozen string is returned as is, otherwise a frozen
   // copy. (CRuby also deduplicates; that is unobservable apart from identity,
   // and mere-ruby strings are handles, so a fresh frozen copy behaves the
@@ -26073,6 +26204,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VArr id -> VInt (3000000 + id * 8)
      | VHsh id -> VInt (4000000 + id * 8)
      | VProc id -> VInt (5000000 + id * 8)
+     // a Binding answered 0, so every binding -- and its copies -- had one id
+     | VBind id -> VInt (6000000 + id * 8)
      | VFlt f -> VInt (7000000 + int_of_float (f * 1000.0))
      | _ -> VInt 0)
   // #nan? / #next_float / #prev_float belong to Float alone: an Integer
