@@ -94,7 +94,7 @@ p Encoding.compatible?("".encode("US-ASCII"), "")
 # encoding with no converter is refused rather than guessed.
 def t
   p yield
-rescue ArgumentError, TypeError, EncodingError => e
+rescue ArgumentError, TypeError, IndexError, RangeError, EncodingError => e
   p [e.class, e.message]
 end
 t { "B�".encode("US-ASCII", fallback: { "�" => "bar" }) }
@@ -124,3 +124,21 @@ end
 enc = Object.new
 def enc.to_str = "utf-8"
 t { "\xA4\xA2".force_encoding("EUC-JP").encode(enc) }
+
+# \k<name> in a replacement is the named group; an ISO-2022-JP converter
+# stays in JIS mode until #finish; only a Unicode string has grapheme
+# clusters -- any other encoding answers its characters.
+p "hello".gsub(/(?<foo>[aeiou])/, '<\k<foo>>'), "hello".sub(/(?<a>h)(?<b>e)/, '\k<b>\k<a>')
+p "hello".gsub(/(?<foo>e)/, '<\\\\k<foo>>')
+t { "hello".gsub(/(?<foo>e)/, '\k<bar>') }
+ec = Encoding::Converter.new("utf-8", "iso-2022-jp")
+p ec.convert("\u{9999}").b, ec.convert("\u{9999}a").b, ec.convert("\u{9999}").b, ec.finish.b, ec.finish.b
+p "\u{24B62}".b.grapheme_clusters.size, "\u{24B62}".dup.force_encoding("Shift_JIS").grapheme_clusters.map(&:bytesize)
+p "abcd".dup.force_encoding("UTF-16").each_grapheme_cluster.to_a.size
+# %c reads its codepoint in the format's encoding
+t { "%c".encode("US-ASCII") % 1286 }
+t { ("%c".dup.force_encoding("EUC-JP") % 0xA4A2).b }
+t { "%c".dup.force_encoding("EUC-JP") % 0x81 }
+t { "%c" % -1 }
+t { "%c" % 0x110000 }
+t { "%c".encode("ISO-8859-1") % 300 }
