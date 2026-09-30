@@ -4243,3 +4243,13 @@ left read the installation's directories (rubylibdir exists, archdir holds
 etc.bundle, sitelibdir is on $LOAD_PATH), which mere-ruby does not have.
 
 **What fixing it would take.** An installation layout of mere-ruby's own.
+
+## A Proc's instance variables are not carried by #dup / #clone
+
+A Proc can hold instance variables now (they were refused as if it were
+frozen), but its copies do not get them: core/proc/dup_spec and clone_spec
+"copies instance variables" went from an error to a failure. The copy is
+made in the Proc's own path, and the ivars ("prc:<id>@name") are keyed the
+way the String/Array/Hash copies' are, so the fix is the same few lines as
+the primitive dup arm, in the Proc's copy. "copies the finalizer" is the
+Kernel#dup gap (ObjectSpace finalizers are not copied for any object).
