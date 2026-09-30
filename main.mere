@@ -264,7 +264,9 @@ type RCls = CChr of str | CRange of str * str
           | CDigit | CWord | CSpace | CHex
           | CNDigit | CNWord | CNSpace | CNHex
           | CPosix of str * bool
-          | CUProp of int * int * bool;
+          | CUProp of int * int * bool
+          // a class nested in a class (items, negated), and `&&`: both sides
+          | CSub of RCls list * bool | CInter of RCls list * RCls list;
 // Pattern AST. The i/m/x flags are fully resolved at PARSE time: i turns
 // letters into NCharCI and sets the class ci bit, m turns `.` into NAnyNL,
 // x is consumed by the parser (whitespace/#-comments). Ruby's ^/$ are always
@@ -283,6 +285,7 @@ type RNode = NChar of str | NCharCI of str | NAny | NAnyNL
            | NFlagsRest of str
            | NGrapheme                              // \X: one extended grapheme cluster
            | NCond of int * RNode * RNode           // (?(g)yes|no)
+           | NAbsent of RNode                       // (?~absent)
            | NEmpty;
 // Compiled instructions (a program is an int-key Map "0".."N-1" -> RInst,
 // plus "meta" -> IMeta (count, ngroups) and "name:<x>" -> IMeta (gnum, 0)).
@@ -294,6 +297,7 @@ type RInst = IChar of str | ICharCI of str | IAny | IAnyNL
            | ILook of int * bool | ILookB of int * int * int * bool
            | IAtomic of int | IGrapheme
            | ICond of int * int                     // group, pc of the no-branch
+           | IAbsent of int                         // pc of the absent sub-program
            | IMark of int | ICheck of int * int
            | IOk | IOkAt | IMatch
            | IMeta of int * int;
@@ -13125,6 +13129,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 6 && str_eq name "tmpdir") then
          (let t = rb_env_get "TMPDIR" in mkstr (if str_eq t "" then "/tmp" else t))
        else raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for Dir"))
+    // Regexp.compile is Regexp.new under another name, inherited like it: a
+    // subclass's was undefined
+    else if (str_len name == 7 && str_eq name "compile") && (if str_eq c "Regexp" then false else true)
+            && exc_is_a world c "Regexp"
+            && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then new_obj_wb world c args blk
     // Regexp.new / Regexp.compile: build from a source string (options: an
     // int of IGNORECASE|EXTENDED|MULTILINE bits, true = i, or a flags string).
     else if str_eq c "Regexp" && ((str_len name == 3 && str_eq name "new") || (str_len name == 7 && str_eq name "compile")) then
@@ -18152,6 +18161,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 || (str_len name == 5 && str_eq name "names") || (str_len name == 14 && str_eq name "named_captures")
                 || (str_len name == 9 && str_eq name "casefold?") || (str_len name == 4 && str_eq name "to_s") || (str_len name == 4 && str_eq name "hash")) then
       raise_exc world "TypeError" "uninitialized Regexp"
+    // an initialized one refuses a second #initialize (the private one, sent)
+    else if exc_is_a world cls "Regexp"
+            && map_has ivars (str_of_int id ++ "@__rx_src")
+            && str_len name == 10 && str_eq name "initialize"
+            && (if has_meth world cls name then false else true) then
+      raise_exc world "TypeError" "already initialized regexp"
     // ...and one that HAS a pattern answers the Regexp readers from it. A
     // Regexp subclass instance is an object carrying @__rx_src / @__rx_flags
     // (see new_obj_wb), and only `super` from an override rebuilt the regexp:
@@ -30995,6 +31010,16 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // starts the body (with the block super was given)
   else if str_eq meth "initialize" && thr_is_thread world recv then
     thread_init world superblk recv args superblk
+  // a Regexp subclass's `super` from #initialize is Regexp#initialize, which
+  // takes the pattern (and options) -- it was BasicObject's, which takes
+  // nothing, so `def initialize(*a) = super` could not be constructed. The
+  // pattern is what the subclass passes up, so it is seeded again from here.
+  else if str_eq meth "initialize"
+          && (match recv with VObj _ -> true | _ -> false)
+          && exc_is_a world (dispatch_cls_of world recv) "Regexp" then
+    (match recv with
+     | VObj id9 -> (let _ = seed_builtin_subclass_ivars world (dispatch_cls_of world recv) id9 args in VNil)
+     | _ -> VNil)
   // BasicObject#initialize is an ancestor too: it takes no arguments and does
   // nothing, so `super()` from an initialize with no user-defined superclass
   // method has somewhere to land instead of raising.
@@ -40644,6 +40669,7 @@ and rxp_shy = fn (n: RNode) ->
   | NLookB (b, neg) -> NLookB (rxp_shy b, neg)
   | NAtomic b -> NAtomic (rxp_shy b)
   | NCond (k, a, b) -> NCond (k, rxp_shy a, rxp_shy b)
+  | NAbsent b -> NAbsent (rxp_shy b)
   | other -> other
 and rxp_shy_list = fn (xs: RNode list) ->
   match xs with Nil -> Nil | Cons (h, t) -> Cons (rxp_shy h, rxp_shy_list t)
@@ -40655,14 +40681,17 @@ and rxp_ngroups = fn (n: RNode) ->
   | NSeq xs -> rxp_ngroups_list xs
   | NAlt xs -> rxp_ngroups_list xs
   | NRep (b, _, _, _) -> rxp_ngroups b
-  | NGroup (b, gn, _) -> (if gn > 0 then 1 else 0) + rxp_ngroups b
+  | NGroup (b, gn, _) -> (let k = rxp_ngroups b in if gn > k then gn else k)
   | NLook (b, _) -> rxp_ngroups b
   | NLookB (b, _) -> rxp_ngroups b
   | NAtomic b -> rxp_ngroups b
-  | NCond (_, a, b) -> rxp_ngroups a + rxp_ngroups b
+  | NCond (_, a, b) -> (let x = rxp_ngroups a in let y = rxp_ngroups b in if x > y then x else y)
+  | NAbsent b -> rxp_ngroups b
   | _ -> 0
+// (the highest group NUMBER, which is the count: groups are numbered 1..n in
+//  order, and an inlined \g<name> repeats the number it calls)
 and rxp_ngroups_list = fn (xs: RNode list) ->
-  match xs with Nil -> 0 | Cons (h, t) -> rxp_ngroups h + rxp_ngroups_list t
+  match xs with Nil -> 0 | Cons (h, t) -> (let x = rxp_ngroups h in let y = rxp_ngroups_list t in if x > y then x else y)
 
 // alternation: seq ('|' seq)*
 and rxp_alt = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
@@ -40779,14 +40808,19 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
             (let bk = "#" ++ str_of_int tgt in
              if map_has rx_gbodies bk
              then (let src = (match map_get rx_gbodies bk with VStr h -> sget h | _ -> "") in
-                   let (nb, _, _) = rxp_alt src 0 fl 1 in (rxp_shy nb, p2, g))
+                   let (nb, _, _) = rxp_alt src 0 fl 1 in (NGroup (rxp_shy nb, tgt, ""), p2, g))
              else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
                    let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
        else if str_eq c "k" then (NBackref (rxp_ref_by_name nm, str_contains fl "i"), p2, g)
        else
          (if map_has rx_gbodies nm
           then (let src = (match map_get rx_gbodies nm with VStr h -> sget h | _ -> "") in
-                let (nb, _, _) = rxp_alt src 0 fl 1 in (rxp_shy nb, p2, g))
+                let (nb, _, _) = rxp_alt src 0 fl 1 in
+                // ⚠ a CALL captures: after `(?<foo>foo.)bar\g<foo>` group foo is
+                //   what the call matched ("foo2"), as in onigmo. The whole copy
+                //   went shy, so it kept the definition's "foo1". The groups
+                //   INSIDE the body stay shy (their numbers are the definition's).
+                (NGroup (rxp_shy nb, (if map_has rx_gnums nm then (match map_get rx_gnums nm with VInt k -> k | _ -> 0) else 0), nm), p2, g))
           else (let __fm = ("mere-ruby: regexp parse: undefined group reference: " ++ nm) in
                 let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
     // \cX / \C-X control escapes: the char's code masked to the control range.
@@ -40891,12 +40925,13 @@ and rxp_group = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
        (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
         (NAtomic n, rxp_close pat p2, g2))
      else if str_eq c2 "(" then rxp_cond pat (p + 2) fl g
-     // (?~...) absent: valid Ruby that this engine defers — lenient validation
-     // skips the balanced group.
-     else if str_eq c2 "~" || str_eq c2 "#" then
-       (if str_eq c2 "#" then (NEmpty, rxp_skip_group pat p 1, g)   // (?# comment) is fully supported by skipping
-        else if map_has rx_lenient "n" then (NEmpty, rxp_skip_group pat p 1, g)
-        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: unsupported group")) in fail "mere-ruby: regexp: unsupported group"))
+     // (?~absent): the longest run that does not CONTAIN a match of absent
+     // (onigmo's absent operator). It was an unsupported group, so
+     // `Regexp.new("(?~foo)")` matched "" where ruby matches "hello".
+     else if str_eq c2 "~" then
+       (let (n, p2, g2) = rxp_alt pat (p + 2) fl g in
+        (NAbsent n, rxp_close pat p2, g2))
+     else if str_eq c2 "#" then (NEmpty, rxp_skip_group pat p 1, g)   // (?# comment) is fully supported by skipping
      else
        // (?imx-imx:...) scoped or (?imx-imx) rest-of-sequence flags.
        let (fl2, p2, colon) = rxp_flags pat (p + 1) fl "" false in
@@ -41042,7 +41077,9 @@ and rx_check_go = fn (i: int) -> fn (n: int) ->
       //   always answered for them.
       (let why = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "") else "") in
        let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
-       if str_contains why "unsupported" || str_contains why "undefined group"
+       // ("undefined group REFERENCE", the \g<name> call to a later group --
+       //  not "undefined group option", which is ruby's refusal of `(?o)`)
+       if str_contains why "unsupported" || str_contains why "undefined group reference"
           || str_contains why "numbered backref"
        then rx_check_go (i + 1) n
        else (let _ = map_set prim_missing "i" (mkstr "mere-ruby: regexp: invalid regular expression") in fail "mere-ruby: regexp: invalid regular expression"))
@@ -41071,6 +41108,7 @@ and rxc_nullable = fn (n: RNode) ->
   | NRep (b, lo, _, _) -> lo == 0 || rxc_nullable b
   | NGroup (b, _, _) -> rxc_nullable b
   | NCond (_, a, b) -> rxc_nullable a || rxc_nullable b
+  | NAbsent _ -> true
   | _ -> true
 and rxc_null_all = fn (xs: RNode list) ->
   match xs with Nil -> true | Cons (h, t) -> rxc_nullable h && rxc_null_all t
@@ -41092,6 +41130,7 @@ and rxc_wmin = fn (n: RNode) ->
   | NBackref (_, _) -> 0 - 1
   | NAtomic b -> rxc_wmin b
   | NCond (_, a, b) -> rxc_wmin_alt (Cons (a, Cons (b, Nil)))
+  | NAbsent _ -> 0
   | _ -> 0
 and rxc_wmin_sum = fn (xs: RNode list) ->
   match xs with
@@ -41114,6 +41153,7 @@ and rxc_wmax = fn (n: RNode) ->
   | NBackref (_, _) -> 0 - 1
   | NAtomic b -> rxc_wmax b
   | NCond (_, a, b) -> rxc_wmax_alt (Cons (a, Cons (b, Nil)))
+  | NAbsent _ -> 0 - 1
   | _ -> 0
 and rxc_wmax_sum = fn (xs: RNode list) ->
   match xs with
@@ -41206,6 +41246,14 @@ and rxc_emit = fn prog -> fn (pc: int) -> fn (n: RNode) ->
      let _ = map_set prog pc (ICond (k, pc2 + 1)) in
      let _ = map_set prog pc2 (IJmp pc3) in
      pc3)
+  | NAbsent b ->
+    // jmp AFTER; SUB: body IOk; AFTER: IAbsent(SUB) -- the lookahead shape
+    (let subpc = pc + 1 in
+     let pc2 = rxc_emit prog subpc b in
+     let _ = map_set prog pc2 IOk in
+     let _ = map_set prog pc (IJmp (pc2 + 1)) in
+     let _ = map_set prog (pc2 + 1) (IAbsent subpc) in
+     pc2 + 2)
   | NAtomic b ->
     // Same shape as a lookahead sub-program, but IAtomic CONSUMES the body's
     // match: jmp AFTER; SUB: body IOk; AFTER: IAtomic(SUB).
@@ -41384,6 +41432,14 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     else rxv_fail prog s bt
   // the yes-branch when group k has matched (both ends saved, as a
   // backreference requires), the no-branch otherwise
+  // (?~absent) at i: every end e whose [i, e) holds no match of absent is a
+  // candidate, longest first. Those ends are a prefix of the positions from
+  // i (a longer run contains a shorter one's matches), so the longest is
+  // found by a binary search and the shorter ones are pushed as the
+  // alternatives to backtrack into.
+  | IAbsent sub ->
+    (let e = rxv_absent_end prog s sub i in
+     rxv_run prog s (pc + 1) e saves (rxv_absent_alts s (pc + 1) i e saves bt))
   | ICond (k, nopc) ->
     (let a = rxv_slot_get saves (2 * k) in
      let b = rxv_slot_get saves (2 * k + 1) in
@@ -41485,6 +41541,35 @@ and rxv_lookb_try = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
      | RFail -> rxv_lookb_try prog s sub i wlo (whi - 1) saves)
 
 
+// does [i, e) of s contain a match of the sub-program? (the subject cut at e,
+// so no match may run past it)
+and rxv_absent_hit = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> fn (e: int) ->
+  let t = substring s 0 e in
+  let rec from = fn (j: int) ->
+    (if j > e then false
+     else (match rxv_run prog t sub j Nil Nil with
+           | RFound (_, _) -> true
+           | RFail -> from (j + (if j < e then utf8_clen t j else 1)))) in
+  from i
+// the longest end (a character boundary) with no match of absent before it
+and rxv_absent_end = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
+  let rec bounds = fn (j: int) -> fn (acc: int list) ->
+    (if j >= str_len s then Cons (str_len s, acc) else bounds (j + utf8_clen s j) (Cons (j, acc))) in
+  let v = vec_new () in
+  let _ = rxv_absent_fill v (rev_app (bounds i Nil) Nil) in
+  // v holds i .. len ascending; the ends that are clean are a prefix of it
+  let rec bs = fn (lo: int) -> fn (hi: int) ->
+    (if lo >= hi then lo
+     else (let mid = (lo + hi + 1) / 2 in
+           if rxv_absent_hit prog s sub i (vec_get v mid) then bs lo (mid - 1) else bs mid hi)) in
+  vec_get v (bs 0 (vec_len v - 1))
+and rxv_absent_fill = fn v -> fn (xs: int list) ->
+  match xs with Nil -> () | Cons (h, t) -> let _ = vec_push v h in rxv_absent_fill v t
+// the shorter clean ends, i .. e (exclusive), as backtrack entries: the
+// nearest to e is tried first, so it goes on top
+and rxv_absent_alts = fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (e: int) -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
+  if i >= e then bt
+  else rxv_absent_alts s pc (i + utf8_clen s i) e saves (Cons ((pc, i, saves), bt))
 and rxv_fail = fn prog -> fn (s: str) -> fn (bt: (int * int * ((int * int) list)) list) ->
   match bt with
   | Nil -> RFail

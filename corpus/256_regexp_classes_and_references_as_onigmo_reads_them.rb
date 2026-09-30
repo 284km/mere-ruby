@@ -48,3 +48,45 @@ p refusal("(a)(?(1)a|b|c)"), refusal("(?<a>a)(?(a)a|b)"), refusal("(a)(?(2)a|b)"
 # a + or - after a name's first character is a level: \k<a+1> names "a"
 p refusal("(?<a+1>a)\\k<a+1>"), refusal("(?<a-1>a)(?('a-1')a|b)"), /(?<a>a)\k<a+0>/.match("aa").to_a
 p refusal("(a)\\k<+1>"), refusal("(a)\\k<-2>")
+
+# a class inside a class, and && between two
+p (/[a-z&&[^a-c]]+/.match("abcdef").to_a), (/[a-z&&[^d-i&&[^d-f]]]+/.match("abcdefghi").to_a)
+["[a[b]]", "[a[^b]]", "[&&a]", "[^a-z&&b-d]", "[a-c&&b-d&&c]", "[[:alpha:]&&[^a]]"].each do |src|
+  p [src, "abcdefx[]&-".scan(Regexp.new(src))]
+end
+
+# a subexpression call captures what it matched
+p (/(?<foo>foo.)bar\g<foo>/.match("foo1barfoo2").to_a), (/(a.)-\g<1>/.match("ab-ac").to_a)
+
+# (?~absent): the longest run not containing absent
+p Regexp.new("(?~foo)").match("hello").to_a, "foo".scan(Regexp.new("(?~foo)")), "xfoo"[/(?~fo)o/]
+p refusal("(?o)"), refusal("(?o:)"), ((begin; eval("/(?o)/"); rescue SyntaxError; :syntax_error; end))
+
+# a regexp literal alone in a condition matches $_, with a warning
+require "stringio"
+def warned
+  old = $stderr
+  $stderr = StringIO.new
+  r = yield
+  [r, $stderr.string.sub(/\A.*?: warning: /, "")]
+ensure
+  $stderr = old
+end
+$_ = nil
+p warned { eval("[(true if /foo/), (/o/ ? 1 : 2)]") }
+$_ = "foo"
+p warned { eval("[(true if /foo/), (:no unless /x/)]") }
+p warned { "a" =~ /(.)/; eval("$4294967296") }
+
+# a Regexp subclass: Regexp.compile is inherited, and super from #initialize
+# reaches Regexp#initialize
+class LoggedRegexp < Regexp
+  def initialize(*args)
+    super
+    @args = args
+  end
+  attr_reader :args
+end
+r = LoggedRegexp.compile("h(i)")
+p r.class, r.args, r.source, r.match("oh hi")[1]
+p((begin; Class.new(Regexp).new("").send(:initialize, ""); rescue TypeError => e; e.message; end))
