@@ -3746,6 +3746,62 @@ and it is more than one method.
 descriptor, and a File here is a path, a mode and a buffer (see *`File#fileno`
 refuses*).
 
+### `Process.getrlimit` / `setrlimit` / `getpriority` / `setpriority`: walls 2 and 3
+
+Measured 2026-09-30 with the build's own clang (macOS SDK), one extern each in
+a four-line Mere program:
+
+```
+extern fn getpriority: int -> int -> int;   error: conflicting types for 'getpriority'
+extern fn getrlimit:   int -> int -> int;   error: conflicting types for 'getrlimit'
+```
+
+⚠ **The header is NOT the wall here**, which an earlier note in m_state.mere
+said it was. `<sys/resource.h>` is in every emitted program already --
+`<stdlib.h>` includes `<sys/wait.h>`, which includes it -- so the prototype
+Mere writes meets the real one and loses:
+
+* `getpriority(int, id_t)` and `setpriority(int, id_t, int)` are wall 2: `id_t`
+  is an unsigned 32-bit typedef, and `extern int getpriority(int, int)` is a
+  different function to C.
+* `getrlimit(int, struct rlimit *)` and `setrlimit(int, const struct rlimit *)`
+  are wall 3: the limits come back through a struct pointer, which no extern
+  can spell and an arena offset cannot stand in for.
+
+**What it costs.** Process.getrlimit, Process.setrlimit, Process.getpriority and
+Process.setpriority are NoMethodError, and so every example of their four spec
+files is red: 29 + 30 + 4 + 2 examples that ruby passes. The Process::RLIMIT_*
+and PRIO_* constants are not defined either, since a constant with no call
+that takes it would only let a program get one step further before failing.
+
+**What fixing it would take, on the Mere side** -- the same shape as the
+`fd_open` family, a host builtin written in C against the real headers:
+
+* `rlimit_get: int -> int -> int` (resource, 0 soft / 1 hard) and
+  `rlimit_set: int -> int -> int -> int`, answering `-errno` on failure so
+  Errno::EINVAL / EPERM can be raised by name;
+* `prio_get: int -> int -> int` that clears and reads `errno` itself, because
+  -1 is a legitimate priority and the extern's int result cannot tell it from
+  failure -- a fourth reason a plain extern would not do even if the types
+  agreed;
+* and the NUMBERS: RLIMIT_NOFILE is 8 on macOS and 7 on Linux, RLIM_INFINITY
+  is 2^63-1 on one and 2^64-1 (a Bignum in ruby) on the other. They are
+  platform constants, so the C side has to hand them out (`rlimit_const: str
+  -> int`); writing either table into the interpreter would be right on one
+  host and quietly wrong on the other.
+
+Nothing on the mere-ruby side is missing beyond that: the argument coercion
+the specs spend most of their examples on (a Symbol or String short name,
+`#to_int`, `#to_str`, ArgumentError for an unknown resource) is ordinary Ruby
+and would go in the prelude on top of the four calls.
+
+### `Process.daemon` is NoMethodError, like `Process.fork`
+
+`core/process/daemon_spec` runs its 24 real examples only where
+`Process.respond_to?(:fork)`, and this interpreter has no fork (Kernel#fork is
+NotImplementedError). Daemonizing IS fork -- the parent exits and the child
+carries on -- so there is nothing to build until fork exists.
+
 ## `File.delete` removed one file however many it was given
 
 ```ruby

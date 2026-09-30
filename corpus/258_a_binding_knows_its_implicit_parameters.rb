@@ -52,3 +52,7 @@ p b1.eval("[__FILE__, __LINE__]", "(named)", 88)
 p b1.eval("\n__LINE__", "(named)", 88)
 p b1.eval("__FILE__") == "(eval at #{__FILE__}:#{__LINE__})"
 
+# GC.stat answers what this collector keeps: its allocations are real counts.
+before = GC.stat(:total_allocated_objects)
+strs = Array.new(50) { |i| "s#{i}" }
+p GC.stat(:total_allocated_objects) - before >= 50, GC.stat.values.all?(Integer)
