@@ -111,6 +111,16 @@ cmp_both "-C dir"             -- -C / -e 'p Dir.pwd'
 cmp_both "--disable=LIST"     -- --disable=gems,frozen-string-literal -e 'p "a".frozen?'
 printf 'junk\n#!ruby\np __LINE__\n' > "$tmp/x.txt"
 cmp_both "-x"                 -- -x "$tmp/x.txt"
+# -S: the script is found along RUBYPATH (then PATH)
+mkdir -p "$tmp/rp"
+printf 'puts "found by -S"\n' > "$tmp/rp/s_script"
+go=$(env RUBYPATH="$tmp/rp" "$mr" -S s_script 2>&1); grc=$?
+ro=$(env RUBYPATH="$tmp/rp" "$ref" -S s_script 2>&1); rrc=$?
+if [ "$go" = "$ro" ] && [ "$grc" = "$rrc" ]; then
+  pass=$((pass+1)); echo "MATCH   -S along RUBYPATH"
+else
+  fail=$((fail+1)); printf 'FAIL    -S along RUBYPATH\n  mere(%s): %s\n  ruby(%s): %s\n' "$grc" "$go" "$rrc" "$ro"
+fi
 # RUBYOPT: read after the command line, which keeps what it decided
 cmp_env() {
   name="$1"; ev="$2"; shift 2; [ "$1" = "--" ] && shift
