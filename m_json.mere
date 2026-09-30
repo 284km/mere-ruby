@@ -1,0 +1,1316 @@
+// json's C half: ext/json/parser/parser.c and ext/json/generator/generator.c
+// (json 2.18.0, as CRuby 4.0.6 ships it), read function by function.
+//
+// ⚠ WHY NATIVE AND NOT RUBY. The rest of mere-ruby's C-extension answers
+//   (digest, date, zlib's streams, socket) are ruby source; this one is not,
+//   because a JSON parser is a loop over every byte of its input, and ruby
+//   loops here cost what an interpreter's loops cost. Measured before writing
+//   a line of it: a `while i < n; s.getbyte(i)` scan over 650 KB took 2.98 s
+//   (ruby: 0.034 s), and the StringScanner shape json's old pure parser used
+//   did not finish the same 650 KB in two minutes. A parser in ruby would have
+//   made `JSON.parse` of a few megabytes a thing nobody could wait for. Here
+//   the byte loops are Mere, compiled.
+//
+// What stays RUBY is what is ruby-visible: JSON::Ext::ParserConfig and
+// JSON::Ext::Generator::State (their option reading, accessors and the
+// GeneratorMethods modules) are json_ext_src below, and they reach the two
+// engines here through `ParserConfig.__json_parse` / `State.__json_generate`
+// (the arms in invoke_val_c0). Everything the engines need from ruby -- an
+// on_load proc, a decimal_class, #to_json of an object it does not know,
+// as_json, String#encode -- goes back up through the callback `cb` the arm
+// hands in, so this file needs no world beyond raising.
+//
+// A module spliced by `import` after m_pack, so it sees the leaf chain.
+
+// ---- shared ---------------------------------------------------------------
+
+// fpconv.c's powers_ten[]: 87 cached powers of ten as (high 32 bits, low 32
+// bits, binary exponent), filled from json_pow_src on the first float that
+// is generated. (Its one top-level `let`; everything else is one chain.)
+let json_pow_tab = vec_new ();
+
+// the byte at i, or 0 past the end: parser.c's peek() reads the NUL that ends
+// a ruby string's buffer, and a NUL byte INSIDE the source reads the same way
+// (both are "unexpected end of input" there, and so here).
+let rec jb = fn (s: str) -> fn (n: int) -> fn (i: int) ->
+  if i < n && i >= 0 then ord (char_at s i) else 0
+and jhex = fn (d: int) -> char_at "0123456789abcdef" d
+and jhex4 = fn (u: int) ->
+  jhex (bit_and (bit_shr u 12) 15) ++ jhex (bit_and (bit_shr u 8) 15) ++ jhex (bit_and (bit_shr u 4) 15) ++ jhex (bit_and u 15)
+// convert_UTF32_to_UTF8
+and jutf8 = fn (ch: int) ->
+  if ch <= 127 then chr ch
+  else if ch <= 2047 then chr (bit_or (bit_shr ch 6) 192) ++ chr (bit_or (bit_and ch 63) 128)
+  else if ch <= 65535 then
+    chr (bit_or (bit_shr ch 12) 224) ++ chr (bit_or (bit_and (bit_shr ch 6) 63) 128) ++ chr (bit_or (bit_and ch 63) 128)
+  else if ch <= 2097151 then
+    chr (bit_or (bit_shr ch 18) 240) ++ chr (bit_or (bit_and (bit_shr ch 12) 63) 128)
+      ++ chr (bit_or (bit_and (bit_shr ch 6) 63) 128) ++ chr (bit_or (bit_and ch 63) 128)
+  else "?"
+
+// ---- the parser (parser.c) ------------------------------------------------
+//
+// fl, the ParserConfig as bits: 1 symbolize_names, 2 freeze, 4 allow_nan,
+// 8 allow_trailing_comma, 16 allow_control_characters, 32 an on_load proc,
+// 64 a decimal_class. dk is on_duplicate_key: 0 deprecated (warn), 1 ignore,
+// 2 raise. cb k v: 0 on_load(v), 1 decimal_class(text), 2 the deprecation
+// warning (v is its message).
+
+// cursor_position: the column counts BYTES back to the previous newline, the
+// cursor's own byte included -- and the newline, when the cursor sits on one,
+// is not a byte of this line (so a raise AT a newline says column 0, which
+// ruby does).
+and jp_line_col = fn (s: str) -> fn (n: int) -> fn (i: int) ->
+  let rec back = fn (p: int) -> fn (col: int) ->
+    if p < 0 then (p, col)
+    else if jb s n p == 10 then (p - 1, col)
+    else back (p - 1) (col + 1) in
+  let (p2, col) = back i 0 in
+  let rec lines = fn (p: int) -> fn (l: int) ->
+    if p < 0 then l else lines (p - 1) (if jb s n p == 10 then l + 1 else l) in
+  (lines p2 1, col)
+// raise_parse_error's %s: up to 32 bytes from the cursor, stopping at
+// whitespace or NUL, quoted -- and then, as parser.c does, the LAST character
+// is dropped if it is not ASCII: the loop steps back over continuation bytes
+// and then over the lead byte, so a complete "é" at the end goes as well as
+// a cut one. With nothing to quote (the cursor on whitespace) the C passes
+// the cursor itself to %s, which prints the source from there to its NUL.
+and jp_frag = fn (s: str) -> fn (n: int) -> fn (i: int) ->
+  if i >= n then "EOF"
+  else
+    let rec ln = fn (k: int) ->
+      if k >= 32 then k
+      else (let c = jb s n (i + k) in
+            if c == 0 || c == 10 || c == 32 || c == 9 || c == 13 then k else ln (k + 1)) in
+    let l0 = ln 0 in
+    if l0 == 0 then
+      (let rec nul = fn (k: int) -> if k >= n then k else if jb s n k == 0 then k else nul (k + 1) in
+       substring s i (nul i))
+    else
+      (let rec trim = fn (l: int) ->
+         if l >= 1 && (let c = jb s n (i + l - 1) in c >= 128 && c < 192) then trim (l - 1) else l in
+       let l1 = trim l0 in
+       let l2 = (if l1 >= 1 && jb s n (i + l1 - 1) >= 192 then l1 - 1 else l1) in
+       "'" ++ substring s i (i + l2) ++ "'")
+and jp_raise = fn world -> fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (msg: str) ->
+  let (line, col) = jp_line_col s n i in
+  raise_exc_iv world "JSON::ParserError" (msg ++ " at line " ++ str_of_int line ++ " column " ++ str_of_int col)
+    (Cons (("line", VInt line), Cons (("column", VInt col), Nil)))
+// a message with a %s in it gets the fragment there (every format parser.c
+// passes has at most one)
+and jp_err = fn world -> fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (fmt: str) ->
+  jp_raise world s n i (if str_contains fmt "%s" then str_replace fmt "%s" (jp_frag s n i) else fmt)
+and jp_nest = fn world -> fn (d: int) ->
+  raise_exc_iv world "JSON::NestingError" ("nesting of " ++ str_of_int d ++ " is too deep") Nil
+
+// json_eat_whitespace, comments included (json 2.x accepts /* */ and //)
+and jp_ws = fn world -> fn (s: str) -> fn (n: int) -> fn (i: int) ->
+  if i >= n then i
+  else
+    let c = ord (char_at s i) in
+    if c == 32 || c == 10 || c == 9 || c == 13 then jp_ws world s n (i + 1)
+    else if c == 47 then jp_ws world s n (jp_comment world s n i)
+    else i
+and jp_comment = fn world -> fn (s: str) -> fn (n: int) -> fn (st: int) ->
+  let c = jb s n (st + 1) in
+  if c == 47 then
+    (let rec eol = fn (k: int) -> if k >= n then n else if jb s n k == 10 then k + 1 else eol (k + 1) in
+     eol (st + 2))
+  else if c == 42 then
+    (let rec star = fn (k: int) ->
+       if k >= n then (let _ = jp_err world s n st "unterminated comment, expected closing '*/'" in n)
+       else if jb s n k == 42 then (if jb s n (k + 1) == 47 then k + 2 else star (k + 1))
+       else star (k + 1) in
+     star (st + 2))
+  else (let _ = jp_err world s n st "unexpected token %s" in n)
+
+and jp_push = fn cb -> fn (fl: int) -> fn (v: Val) ->
+  if bit_and fl 32 == 0 then v else cb 0 v
+
+// the four hex digits of a \u escape; a bad one is reported at the backslash
+and jp_hex4 = fn world -> fn (s: str) -> fn (n: int) -> fn (p: int) ->
+  let dv = fn (c: int) ->
+    (if c >= 48 && c <= 57 then c - 48
+     else if c >= 97 && c <= 102 then c - 87
+     else if c >= 65 && c <= 70 then c - 55
+     else 0 - 1) in
+  let rec go = fn (k: int) -> fn (acc: int) ->
+    if k >= 4 then acc
+    else (let d = dv (jb s n (p + k)) in
+          if d < 0 then (let _ = jp_err world s n (p - 2) "incomplete unicode character escape sequence at %s" in 0)
+          else go (k + 1) (acc * 16 + d)) in
+  go 0 0
+
+// json_string_unescape over s[st, e): the text between the quotes, which has
+// at least one backslash or (allowed) control character in it. `p` is where
+// the text not yet copied starts, and several errors are reported THERE
+// rather than at the backslash, because that is the pointer parser.c hands
+// to raise_parse_error_at.
+and jp_unescape = fn world -> fn (fl: int) -> fn (s: str) -> fn (n: int) -> fn (st: int) -> fn (e: int) ->
+  let b = strbuf_new () in
+  let rec nextbs = fn (k: int) -> if k >= e then 0 - 1 else if jb s n k == 92 then k else nextbs (k + 1) in
+  let rec go = fn (p: int) -> fn (from: int) ->
+    let pe = (if from < e then nextbs from else 0 - 1) in
+    if pe < 0 then (if e > p then strbuf_push b (substring s p e) else ())
+    else
+      let _ = (if pe > p then strbuf_push b (substring s p pe) else ()) in
+      let c = jb s n (pe + 1) in
+      if c == 34 || c == 47 then go (pe + 1) (pe + 1)
+      else if c == 92 then (let _ = strbuf_push b "\\" in go (pe + 2) (pe + 2))
+      else if c == 110 then (let _ = strbuf_push b "\n" in go (pe + 2) (pe + 2))
+      else if c == 114 then (let _ = strbuf_push b "\r" in go (pe + 2) (pe + 2))
+      else if c == 116 then (let _ = strbuf_push b "\t" in go (pe + 2) (pe + 2))
+      else if c == 98 then (let _ = strbuf_push b (chr 8) in go (pe + 2) (pe + 2))
+      else if c == 102 then (let _ = strbuf_push b (chr 12) in go (pe + 2) (pe + 2))
+      else if c == 117 then
+        (if pe + 1 > e - 5 then (let _ = jp_err world s n p "incomplete unicode character escape sequence at %s" in ())
+         else
+           (let ch = jp_hex4 world s n (pe + 2) in
+            let q = pe + 6 in
+            if bit_and ch 64512 == 55296 then
+              (if q > e - 6 then (let _ = jp_err world s n p "incomplete surrogate pair at %s" in ())
+               else if jb s n q == 92 && jb s n (q + 1) == 117 then
+                 (let sur = jp_hex4 world s n (q + 2) in
+                  if bit_and sur 64512 == 56320 then
+                    (let full = bit_or (bit_or (bit_shl (bit_and ch 63) 10) (bit_shl ((bit_and (bit_shr ch 6) 15) + 1) 16)) (bit_and sur 1023) in
+                     let _ = strbuf_push b (jutf8 full) in
+                     go (q + 6) (q + 6))
+                  else (let _ = jp_err world s n p "invalid surrogate pair at %s" in ()))
+               else (let _ = jp_err world s n p "incomplete surrogate pair at %s" in ()))
+            else (let _ = strbuf_push b (jutf8 ch) in go q q)))
+      else if c < 32 then
+        (if bit_and fl 16 == 0 then
+           (let _ = jp_err world s n pe (if c == 10 then "Invalid unescaped newline character (\\n) in string: %s"
+                                         else "invalid ASCII control character in string: %s") in ())
+         // allowed: nothing is unescaped, and the backslash stays in the text
+         else go p (pe + 1))
+      else (let _ = jp_err world s n pe "invalid escape character in string: %s" in ()) in
+  let _ = go st st in
+  strbuf_to_str b
+
+// the string as a value: a NAME is interned (frozen) or a Symbol; any other
+// string is frozen only under `freeze: true`
+and jp_mkstr = fn (fl: int) -> fn (txt: str) -> fn (is_name: bool) ->
+  if is_name && bit_and fl 1 != 0 then VSym txt
+  else
+    (let v = mkstr txt in
+     let _ = (if is_name || bit_and fl 2 != 0 then (match v with VStr h -> sfrozen_set h | _ -> ()) else ()) in
+     v)
+
+// json_parse_string: i is at the opening quote. The fast path is a string
+// with no backslash and no control character in it.
+and jp_scan = fn (s: str) -> fn (n: int) -> fn (k: int) ->
+  if k >= n then k
+  else (let c = ord (char_at s k) in if c < 32 || c == 34 || c == 92 then k else jp_scan s n (k + 1))
+and jp_string = fn world -> fn (fl: int) -> fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (is_name: bool) ->
+  let st = i + 1 in
+  let k = jp_scan s n st in
+  if k >= n then (jp_err world s n k "unexpected end of input, expected closing \"", n)
+  else if jb s n k == 34 then (jp_mkstr fl (substring s st k) is_name, k + 1)
+  else
+    // json_parse_escaped_string: a backslash takes the byte after it with
+    // it, so an escaped quote does not end the string
+    (let rec esc = fn (k2: int) ->
+       let c = jb s n k2 in
+       if c == 34 then (jp_mkstr fl (jp_unescape world fl s n st k2) is_name, k2 + 1)
+       else if c == 92 then more (k2 + 2)
+       else if bit_and fl 16 == 0 then (jp_err world s n k2 "invalid ASCII control character in string: %s", n)
+       else more (k2 + 1)
+     and more = fn (k3: int) ->
+       let k4 = jp_scan s n k3 in
+       if k4 >= n then (jp_err world s n k4 "unexpected end of input, expected closing \"", n)
+       else esc k4 in
+     esc k)
+
+// json_parse_number: i is at the first digit, start at the sign if any
+and jp_digits = fn (s: str) -> fn (n: int) -> fn (k: int) ->
+  if k < n && (let c = ord (char_at s k) in c >= 48 && c <= 57) then jp_digits s n (k + 1) else k
+and jp_number = fn world -> fn cb -> fn (fl: int) -> fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (neg: bool) -> fn (start: int) ->
+  let first = jb s n i in
+  let d1 = jp_digits s n i in
+  let md = d1 - i in
+  if (first == 48 && md > 1) || (neg && md == 0) then (jp_err world s n start "invalid number: %s", n)
+  else
+    let (k2, frac) =
+      (if jb s n d1 == 46 then
+         (let d2 = jp_digits s n (d1 + 1) in
+          if d2 == d1 + 1 then (let _ = jp_err world s n start "invalid number: %s" in (n, 0)) else (d2, d2 - d1 - 1))
+       else (d1, 0 - 1)) in
+    let (k3, hasexp) =
+      (if jb s n k2 == 101 || jb s n k2 == 69 then
+         (let e0 = (if jb s n (k2 + 1) == 43 || jb s n (k2 + 1) == 45 then k2 + 2 else k2 + 1) in
+          let e1 = jp_digits s n e0 in
+          if e1 == e0 then (let _ = jp_err world s n start "invalid number: %s" in (n, true)) else (e1, true))
+       else (k2, false)) in
+    let txt = substring s start k3 in
+    if frac < 0 && (if hasexp then false else true) then
+      (if md < 18 then (VInt (int_of_str txt), k3) else (norm_big txt, k3))
+    else if bit_and fl 64 != 0 then (cb 1 (mkstr txt), k3)
+    else (VFlt (float_of_str txt), k3)
+
+// hkey_digest is the hash index's own idea of which keys are the same key, so
+// asking it here cannot disagree with the Hash built from the pairs. A key it
+// has no digest for (a key an on_load proc turned into some object) is never
+// merged -- a duplicate of such a key is a pair too many, not a wrong value.
+and jp_obj_put = fn (keys) -> fn (vals) -> fn (seen) -> fn (k: Val) -> fn (v: Val) ->
+  let d = hkey_digest k in
+  if (if str_eq d "" then false else true) && map_has seen d then
+    (let _ = vec_set vals (map_get seen d) v in true)
+  else
+    (let _ = (if str_eq d "" then () else map_set seen d (vec_len keys)) in
+     let _ = vec_push keys k in
+     let _ = vec_push vals v in false)
+and jp_pairs = fn (keys) -> fn (vals) -> fn (i: int) -> fn (acc: Val list) ->
+  if i < 0 then acc else jp_pairs keys vals (i - 1) (Cons (vec_get keys i, Cons (vec_get vals i, acc)))
+and jp_rev = fn (xs: Val list) -> fn (acc: Val list) ->
+  match xs with Nil -> acc | Cons (h, t) -> jp_rev t (Cons (h, acc))
+
+and jp_any = fn world -> fn cb -> fn (fl: int) -> fn (maxn: int) -> fn (dk: int) -> fn (s: str) -> fn (n: int) -> fn (i0: int) -> fn (depth: int) ->
+  let i = jp_ws world s n i0 in
+  let c = jb s n i in
+  let lit = fn (w: str) -> i + str_len w <= n && str_eq (substring s i (i + str_len w)) w in
+  if c == 110 then (if lit "null" then (jp_push cb fl VNil, i + 4) else (jp_err world s n i "unexpected token %s", n))
+  else if c == 116 then (if lit "true" then (jp_push cb fl (VBool true), i + 4) else (jp_err world s n i "unexpected token %s", n))
+  else if c == 102 then (if lit "false" then (jp_push cb fl (VBool false), i + 5) else (jp_err world s n i "unexpected token %s", n))
+  else if c == 78 then
+    (if bit_and fl 4 != 0 && lit "NaN" then (jp_push cb fl (VFlt (0.0 / 0.0)), i + 3)
+     else (jp_err world s n i "unexpected token %s", n))
+  else if c == 73 then
+    (if bit_and fl 4 != 0 && lit "Infinity" then (jp_push cb fl (VFlt (1.0 / 0.0)), i + 8)
+     else (jp_err world s n i "unexpected token %s", n))
+  else if c == 45 then
+    (if lit "-Infinity" then
+       (if bit_and fl 4 != 0 then (jp_push cb fl (VFlt (0.0 - 1.0 / 0.0)), i + 9)
+        else (jp_err world s n i "unexpected token %s", n))
+     else (let (v, k) = jp_number world cb fl s n (i + 1) true i in (jp_push cb fl v, k)))
+  else if c >= 48 && c <= 57 then
+    (let (v, k) = jp_number world cb fl s n i false i in (jp_push cb fl v, k))
+  else if c == 34 then
+    (let (v, k) = jp_string world fl s n i false in (jp_push cb fl v, k))
+  else if c == 91 then jp_array world cb fl maxn dk s n i depth
+  else if c == 123 then jp_object world cb fl maxn dk s n i depth
+  else if c == 0 then (jp_err world s n i "unexpected end of input", n)
+  else (jp_err world s n i "unexpected character: %s", n)
+
+and jp_mkarr = fn (fl: int) -> fn (xs: Val list) ->
+  let v = arr_new xs in
+  let _ = (if bit_and fl 2 != 0 then (match v with VArr id -> cfrozen_set 0 id | _ -> ()) else ()) in
+  v
+and jp_array = fn world -> fn cb -> fn (fl: int) -> fn (maxn: int) -> fn (dk: int) -> fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (depth: int) ->
+  let k0 = jp_ws world s n (i + 1) in
+  if jb s n k0 == 93 then (jp_push cb fl (jp_mkarr fl Nil), k0 + 1)
+  else
+    let d = depth + 1 in
+    let _ = (if maxn != 0 && maxn < d then jp_nest world d else VNil) in
+    let (v0, k1) = jp_any world cb fl maxn dk s n k0 d in
+    let rec loop = fn (k: int) -> fn (acc: Val list) ->
+      let k2 = jp_ws world s n k in
+      let c = jb s n k2 in
+      if c == 44 then
+        (let k3 = k2 + 1 in
+         if bit_and fl 8 != 0 && jb s n (jp_ws world s n k3) == 93 then loop (jp_ws world s n k3) acc
+         else (let (v, k4) = jp_any world cb fl maxn dk s n k3 d in loop k4 (Cons (v, acc))))
+      else if c == 93 then (jp_push cb fl (jp_mkarr fl (jp_rev acc Nil)), k2 + 1)
+      else (jp_err world s n k2 "expected ',' or ']' after array value", n) in
+    loop k1 (Cons (v0, Nil))
+
+and jp_object = fn world -> fn cb -> fn (fl: int) -> fn (maxn: int) -> fn (dk: int) -> fn (s: str) -> fn (n: int) -> fn (i: int) -> fn (depth: int) ->
+  let k0 = jp_ws world s n (i + 1) in
+  if jb s n k0 == 125 then (jp_push cb fl (jp_mkhash fl Nil), k0 + 1)
+  else
+    let d = depth + 1 in
+    let _ = (if maxn != 0 && maxn < d then jp_nest world d else VNil) in
+    let keys = vec_new () in
+    let vals = vec_new () in
+    let seen = map_new () in
+    let dup = vec_new () in
+    let pair = fn (k: int) ->
+      (let (kv, k1) = jp_string world fl s n k true in
+       let kv = jp_push cb fl kv in
+       let k2 = jp_ws world s n k1 in
+       (kv, k2)) in
+    let put = fn (kv: Val) -> fn (v: Val) ->
+      (if jp_obj_put keys vals seen kv v then (if vec_len dup == 0 then vec_push dup kv else ()) else ()) in
+    let _ = (if jb s n k0 == 34 then VNil else jp_err world s n k0 "expected object key, got %s") in
+    let (kv0, k1) = pair k0 in
+    let _ = (if jb s n k1 == 58 then VNil else jp_err world s n k1 "expected ':' after object key") in
+    let (v0, k2) = jp_any world cb fl maxn dk s n (k1 + 1) d in
+    let _ = put kv0 v0 in
+    let rec loop = fn (k: int) ->
+      let k3 = jp_ws world s n k in
+      let c = jb s n k3 in
+      if c == 125 then
+        // the duplicate check reports at the OBJECT's start, where parser.c
+        // rewinds the cursor to before decoding it
+        (let _ = (if vec_len dup == 0 || dk == 1 then VNil
+                  else
+                    (let key = vec_get dup 0 in
+                     let ks = inspect (match key with VSym y -> mkstr y | _ -> key) in
+                     if dk == 2 then jp_raise world s n i ("duplicate key " ++ ks)
+                     else
+                       (let (line, col) = jp_line_col s n i in
+                        cb 2 (mkstr ("detected duplicate key " ++ ks ++ " in JSON object. This will raise an error in json 3.0 unless enabled via `allow_duplicate_key: true`"
+                                     ++ " at line " ++ str_of_int line ++ " column " ++ str_of_int col))))) in
+         (jp_push cb fl (jp_mkhash fl (jp_pairs keys vals (vec_len keys - 1) Nil)), k3 + 1))
+      else if c == 44 then
+        (let k4 = jp_ws world s n (k3 + 1) in
+         if bit_and fl 8 != 0 && jb s n k4 == 125 then loop k4
+         else
+           (let _ = (if jb s n k4 == 34 then VNil else jp_err world s n k4 "expected object key, got: %s") in
+            let (kv, k5) = pair k4 in
+            let _ = (if jb s n k5 == 58 then VNil else jp_err world s n k5 "expected ':' after object key, got: %s") in
+            let (v, k6) = jp_any world cb fl maxn dk s n (k5 + 1) d in
+            let _ = put kv v in
+            loop k6))
+      else (jp_err world s n k3 "expected ',' or '}' after object value, got: %s", n) in
+    loop k2
+and jp_mkhash = fn (fl: int) -> fn (xs: Val list) ->
+  let v = mkhash xs in
+  let _ = (if bit_and fl 2 != 0 then (match v with VHsh id -> cfrozen_set 1 id | _ -> ()) else ()) in
+  v
+
+// cParser_parse: one value, then nothing but whitespace
+and json_parse = fn world -> fn cb -> fn (fl: int) -> fn (maxn: int) -> fn (dk: int) -> fn (s: str) ->
+  let n = str_len s in
+  let (v, k) = jp_any world cb fl maxn dk s n 0 0 in
+  let k2 = jp_ws world s n k in
+  if k2 < n then jp_err world s n k2 "unexpected token at end of stream %s" else v
+
+// ---- the generator (generator.c) --------------------------------------------
+//
+// cfg is the State as generate_json reads it: (indent, space, space_before,
+// object_nl, array_nl, fl, max_nesting, dk), "" for an unset string. fl:
+// 1 allow_nan, 2 ascii_only, 4 script_safe, 8 strict, 16 an as_json proc.
+// dk as above (0 deprecated, 1 ignore, 2 raise).
+//
+// cb k v d, the ruby half (State.__json_cb):
+//   0  generate_json_fallback: [true, obj.to_json(state)] or [false, obj.to_s]
+//   1  as_json(v, false)   2  as_json(v, true)
+//   3  JSON.on_mixed_keys_hash(v, d == 1)
+//   4  the key's #to_s (rb_convert_type / convert_string_subclass)
+//   5  ensure_valid_encoding's last step: v.encode(UTF-8), rescued into a
+//      GeneratorError
+//   6  the "UTF-8 string passed as BINARY" warning
+
+and jg_err = fn world -> fn (obj: Val) -> fn (msg: str) ->
+  raise_exc_iv world "JSON::GeneratorError" msg (Cons (("invalid_object", obj), Nil))
+
+// the escape of one byte below 0x20, or of " \ / (escape_UTF8_char_basic)
+and jg_esc1 = fn (c: int) ->
+  if c == 34 then "\\\"" else if c == 92 then "\\\\" else if c == 47 then "\\/"
+  else if c == 8 then "\\b" else if c == 12 then "\\f" else if c == 10 then "\\n"
+  else if c == 13 then "\\r" else if c == 9 then "\\t"
+  else "\\u00" ++ jhex (bit_shr c 4) ++ jhex (bit_and c 15)
+// the length a lead byte claims (the tables' CHAR_LENGTH_MASK)
+and jg_clen = fn (c: int) ->
+  if c < 128 then 1 else if c < 192 then 1 else if c < 224 then 2 else if c < 240 then 3
+  else if c < 248 then 4 else if c < 252 then 5 else if c < 254 then 6 else 1
+// convert_UTF8_to_JSON / _script_safe_ / _ASCII_only_: runs of bytes that
+// need nothing are copied as one substring.
+and jg_escape = fn (b) -> fn (fl: int) -> fn (s: str) ->
+  let n = str_len s in
+  let ss = bit_and fl 4 != 0 in
+  let ao = bit_and fl 2 != 0 in
+  let flush = fn (st: int) -> fn (i: int) -> (if i > st then strbuf_push b (substring s st i) else ()) in
+  let rec go = fn (st: int) -> fn (i: int) ->
+    if i >= n then flush st n
+    else
+      let c = ord (char_at s i) in
+      if c < 32 || c == 34 || c == 92 || (ss && c == 47) then
+        (let _ = flush st i in let _ = strbuf_push b (jg_esc1 c) in go (i + 1) (i + 1))
+      else if c < 128 then go st (i + 1)
+      else if ao then
+        (let l = jg_clen c in
+         let _ = flush st i in
+         let w0 = (if l == 2 then bit_and c 31 else if l == 3 then bit_and c 15 else if l == 4 then bit_and c 7 else c) in
+         let rec acc = fn (k: int) -> fn (w: int) -> if k >= l then w else acc (k + 1) (bit_or (bit_shl w 6) (bit_and (jb s n (i + k)) 63)) in
+         let w = acc 1 w0 in
+         let _ = (if w <= 65535 then strbuf_push b ("\\u" ++ jhex4 w)
+                  else (let w2 = w - 65536 in
+                        strbuf_push b ("\\u" ++ jhex4 (55296 + bit_shr w2 10) ++ "\\u" ++ jhex4 (56320 + bit_and w2 1023)))) in
+         go (i + l) (i + l))
+      else if ss && c == 226 && jb s n (i + 1) == 128 && bit_shr (jb s n (i + 2)) 1 == 84 then
+        (let _ = flush st i in
+         let _ = strbuf_push b (if bit_and (jb s n (i + 2)) 1 == 1 then "\\u2029" else "\\u2028") in
+         go (i + 3) (i + 3))
+      else go st (i + 1) in
+  go 0 0
+
+// the string's coderange, as generator.c asks it: 0 7bit, 1 valid, 2 broken
+and jg_crange = fn (h: int) ->
+  let s = sget h in
+  let e = senc_get h in
+  if enc_ascii_compat e && enc_all7 s then 0
+  else if str_eq e "UTF-8" then (if str_valid_utf8_h h then 1 else 2)
+  else if str_eq e "ASCII-8BIT" || str_eq e "BINARY" then 1
+  else if str_eq e "US-ASCII" then 2
+  else 1
+// valid_json_string_p: 7-bit in any ASCII-compatible encoding, or valid and
+// UTF-8 (or US-ASCII) -- anything else is transcoded first
+and jg_valid = fn (h: int) ->
+  let r = jg_crange h in
+  if r == 0 then true
+  else if r == 1 then (let e = senc_get h in str_eq e "UTF-8" || str_eq e "US-ASCII")
+  else false
+// the exact class, as `RBASIC_CLASS(obj) == rb_cString` asks it: a subclass
+// instance, or one with a singleton, is tagged in hng_store
+and jg_plain = fn (v: Val) ->
+  let hk = hng_key v in
+  if str_eq hk "" then true else (if map_has hng_store hk then false else true)
+
+// ensure_valid_encoding
+and jg_ensure = fn world -> fn cb -> fn cfg -> fn (v: Val) -> fn (as_called: bool) -> fn (is_key: bool) ->
+  let (_, _, _, _, _, fl, _, _) = cfg in
+  match v with
+  | VStr h ->
+    if jg_valid h then v
+    else
+      let coerced = (if (if as_called then false else true) && bit_and fl 8 != 0 && bit_and fl 16 != 0
+                     then cb 1 v 0 else v) in
+      let same = (match coerced with VStr h2 -> h2 == h | _ -> false) in
+      if (if same then false else true) then
+        (match coerced with
+         | VStr h2 -> (if jg_valid h2 then coerced else jg_err world v "source sequence is illegal/malformed utf-8")
+         | _ -> (if is_key then jg_err world coerced (class_name coerced ++ " not allowed as object key in JSON") else coerced))
+      else if str_eq (senc_get h) "ASCII-8BIT" || str_eq (senc_get h) "BINARY" then
+        (let s = sget h in
+         if enc_all7 s then mkstr s
+         else if enc_valid_utf8 s then (let _ = cb 6 v 0 in mkstr s)
+         else cb 5 v 0)
+      else cb 5 v 0
+  | _ -> v
+
+and jg_indent = fn (b) -> fn (ind: str) -> fn (d: int) ->
+  if d <= 0 || str_eq ind "" then () else (let _ = strbuf_push b ind in jg_indent b ind (d - 1))
+
+// increase_depth
+and jg_deeper = fn world -> fn (maxn: int) -> fn (d: int) ->
+  if d > maxn && maxn != 0 then
+    (let _ = raise_exc_iv world "JSON::NestingError"
+               ("nesting of " ++ str_of_int (d - 1) ++ " is too deep. Did you try to serialize objects with circular references?") Nil in ())
+  else ()
+
+// ---- vendor/fpconv.c: Grisu2, the float writer json 2.18 uses -------------
+//
+// ⚠ NOT ruby's shortest digits. The first version took Float#to_s's digits
+//   and laid them out as fpconv's emit_digits does, and a 3 MB generate was
+//   12 bytes off the reference: Grisu2 (without Grisu3's fallback) is not
+//   always shortest -- 314.46701118584963 is what json writes where
+//   Float#to_s writes 314.4670111858496, eleven such floats in 20,000. The
+//   algorithm is the answer, so the algorithm is here, transcribed.
+//
+// Its arithmetic is unsigned 64-bit, and a Mere int is a signed one whose
+// overflow the C backend does not promise to wrap. So every u64 is a PAIR
+// (high 32 bits, low 32 bits), each 0 <= x < 2^32, and every operation
+// below is exact on those: products are taken 16 bits at a time and nothing
+// ever exceeds 2^62. Wrapping, where fpconv's C wraps (a shift that loses
+// bits, `delta - rem`), is modulo 2^64 exactly as uint64_t is.
+and jf_norm = fn (h: int) -> fn (l: int) ->
+  let c = floor_div l 4294967296 in
+  (floor_mod (h + c) 4294967296, l - c * 4294967296)
+and jf_add = fn (a: (int * int)) -> fn (b: (int * int)) ->
+  let (ah, al) = a in let (bh, bl) = b in jf_norm (ah + bh) (al + bl)
+and jf_sub = fn (a: (int * int)) -> fn (b: (int * int)) ->
+  let (ah, al) = a in let (bh, bl) = b in jf_norm (ah - bh) (al - bl)
+and jf_lt = fn (a: (int * int)) -> fn (b: (int * int)) ->
+  let (ah, al) = a in let (bh, bl) = b in ah < bh || (ah == bh && al < bl)
+and jf_of_int = fn (n: int) -> (n / 4294967296, floor_mod n 4294967296)
+// a << n, bits past 64 dropped (n < 32 per step keeps every product < 2^63)
+and jf_shl = fn (a: (int * int)) -> fn (n: int) ->
+  let (ah, al) = a in
+  if n <= 0 then a
+  else if n >= 64 then (0, 0)
+  else if n >= 32 then jf_shl (al, 0) (n - 32)
+  else (let p = bit_shl 1 n in
+        let x = al * p in
+        (floor_mod (ah * p + x / 4294967296) 4294967296, floor_mod x 4294967296))
+and jf_shr = fn (a: (int * int)) -> fn (n: int) ->
+  let (ah, al) = a in
+  if n <= 0 then a
+  else if n >= 64 then (0, 0)
+  else if n >= 32 then (0, bit_shr ah (n - 32))
+  else (bit_shr ah n, bit_shr al n + floor_mod ah (bit_shl 1 n) * bit_shl 1 (32 - n))
+// a & (2^n - 1)
+and jf_low = fn (a: (int * int)) -> fn (n: int) ->
+  let (ah, al) = a in
+  if n >= 64 then a
+  else if n >= 32 then (floor_mod ah (bit_shl 1 (n - 32)), al)
+  else (0, floor_mod al (bit_shl 1 n))
+// the full 64-bit product of two 32-bit numbers, as a pair
+and jf_mul32 = fn (x: int) -> fn (y: int) ->
+  let x1 = bit_shr x 16 in let x0 = bit_and x 65535 in
+  let y1 = bit_shr y 16 in let y0 = bit_and y 65535 in
+  let mid = x0 * y1 + x1 * y0 in
+  let lo = x0 * y0 + floor_mod mid 65536 * 65536 in
+  (x1 * y1 + mid / 65536 + lo / 4294967296, floor_mod lo 4294967296)
+// the low 64 bits of a 64 x 64 product (uint64_t `*`)
+and jf_mullo = fn (a: (int * int)) -> fn (b: (int * int)) ->
+  let (ah, al) = a in let (bh, bl) = b in
+  let (ph, pl) = jf_mul32 al bl in
+  let (_, c1) = jf_mul32 ah bl in
+  let (_, c2) = jf_mul32 al bh in
+  (floor_mod (ph + c1 + c2) 4294967296, pl)
+// fpconv's multiply(): the high 64 bits of the product, rounded
+and jf_mul = fn (a: (int * int)) -> fn (b: (int * int)) ->
+  let (ah, al) = a in let (bh, bl) = b in
+  let (ahbl_h, ahbl_l) = jf_mul32 ah bl in
+  let (albh_h, albh_l) = jf_mul32 al bh in
+  let (albl_h, _) = jf_mul32 al bl in
+  let ahbh = jf_mul32 ah bh in
+  let tmp = ahbl_l + albh_l + albl_h + 2147483648 in
+  jf_add ahbh (jf_of_int (ahbl_h + albh_h + tmp / 4294967296))
+and jf_p10 = fn (n: int) -> if n <= 0 then (0, 1) else jf_mullo (jf_p10 (n - 1)) (0, 10)
+and jf_pow = fn (idx: int) ->
+  let _ = (if vec_len json_pow_tab == 0 then
+             (let rec fill = fn (xs: str list) ->
+                (match xs with
+                 | Nil -> ()
+                 | Cons (w, t) ->
+                   (let _ = (match str_split w "," with
+                             | Cons (h, Cons (l, Cons (e, _))) ->
+                               (let _ = vec_push json_pow_tab (int_of_str h) in
+                                let _ = vec_push json_pow_tab (int_of_str l) in
+                                vec_push json_pow_tab (int_of_str e))
+                             | _ -> ()) in
+                    fill t)) in
+              fill (str_split (json_pow_src ()) " "))
+           else ()) in
+  ((vec_get json_pow_tab (idx * 3), vec_get json_pow_tab (idx * 3 + 1)), vec_get json_pow_tab (idx * 3 + 2))
+and json_pow_src = fn (u: unit) -> "4203730336,136053384,-1220 3132023167,2722021238,-1193 2333539104,810921078,-1166 3477244234,1573795306,-1140 2590748842,1432697645,-1113 3860516611,1025131999,-1087 2876309015,3348809418,-1060 4286034428,3200048207,-1034 3193344495,1097586188,-1007 2379227053,2424306748,-980 3545324584,827693699,-954 2641472655,2913388981,-927 3936100983,602835915,-901 2932623761,1081627501,-874 2184974969,1572261463,-847 3255866422,1308317239,-821 2425809519,944281679,-794 3614737867,629291719,-768 2693189581,2545915892,-741 4013165208,388672741,-715 2990041083,708162190,-688 2227754207,3536207675,-661 3319612455,450088378,-635 2473304014,3139815830,-608 3685510180,2103616900,-582 2745919064,224385782,-555 4091738259,3737383206,-529 3048582568,2868871352,-502 2271371013,1820084875,-475 3384606560,885076051,-449 2521728396,2444895829,-422 3757668132,1881767613,-396 2799680927,3102062735,-369 4171849679,2289335700,-343 3108270227,2410191823,-316 2315841784,3205436779,-289 3450873173,1697722806,-263 2571100870,3497754540,-236 3831238852,707476230,-210 2854495385,1769181907,-183 4253529586,2197867022,-157 3169126500,2450594539,-130 2361183241,1867548876,-103 3518437208,3793315116,-77 2621440000,0,-50 3906250000,0,-24 2910383045,2892103680,3 2168404344,4170451332,30 3231174267,3372684723,56 2407412430,2078956656,83 3587324068,2884206696,109 2672764710,395977285,136 3982729777,3569679143,162 2967364920,2361961896,189 2210859150,447440347,216 3294436857,1114709402,242 2454546732,2786846552,269 3657559652,443583978,295 2725094297,2599384906,322 4060706939,3028118405,348 3025462433,2044532855,375 2254145170,1536935362,402 3358938053,3365297469,428 2502603868,4204241075,455 3729170365,2577424355,481 2778448436,3677981733,508 4140210802,2744688476,534 3084697427,1424604878,561 2298278679,4062331362,588 3424702107,3546052773,614 2551601907,2065781727,641 3802183132,2535403578,667 2832847187,1558426518,694 4221271257,2762425404,720 3145092172,2812560400,747 2343276271,3057687578,774 3491753744,2790753324,800 2601559269,3918606633,827 3876625403,2711358621,853 2888311001,1648096297,880 2151959390,2057817989,907 3206669376,61660461,933 2389154863,1581580175,960 3560118173,2626467905,986 2652494738,3034782633,1013 3952525166,3135207385,1039 2944860731,2616258155,1066"
+// round_digit, over the digits so far (newest first)
+and jf_round = fn (ds: int list) -> fn (delta: (int * int)) -> fn (rem: (int * int)) -> fn (kappa: (int * int)) -> fn (frac: (int * int)) ->
+  if jf_lt rem frac && (if jf_lt (jf_sub delta rem) kappa then false else true)
+     && (jf_lt (jf_add rem kappa) frac || jf_lt (jf_sub (jf_add rem kappa) frac) (jf_sub frac rem)) then
+    (match ds with
+     | Cons (d, t) -> jf_round (Cons (d - 1, t)) delta (jf_add rem kappa) kappa frac
+     | Nil -> ds)
+  else ds
+and jf_digits_s = fn (ds: int list) -> fn (acc: str) ->
+  match ds with Nil -> acc | Cons (d, t) -> jf_digits_s t (chr (d + 48) ++ acc)
+// grisu2 + generate_digits: the digits and K (value = digits x 10^K)
+and jf_grisu = fn (d: float) ->
+  let hi = bit_and (float_bits_hi d) 2147483647 in
+  let lo = floor_mod (float_bits_lo d) 4294967296 in
+  let bexp = bit_and (bit_shr hi 20) 2047 in
+  let fh = bit_and hi 1048575 in
+  let frac = (if bexp != 0 then (fh + 1048576, lo) else (fh, lo)) in
+  let e = (if bexp != 0 then bexp - 1075 else 0 - 1074) in
+  // get_normalized_boundaries, from the unnormalized value
+  let rec upn = fn (u: (int * int)) -> fn (ue: int) ->
+    (let (uh, _) = u in
+     if bit_and uh 2097152 == 0 then upn (jf_shl u 1) (ue - 1) else (jf_shl u 10, ue - 10)) in
+  let (upper0, uexp) = upn (jf_add (jf_shl frac 1) (0, 1)) (e - 1) in
+  let lsh = (let (fh2, fl2) = frac in if fh2 == 1048576 && fl2 == 0 then 2 else 1) in
+  let lower0 = jf_shl (jf_sub (jf_shl frac lsh) (0, 1)) ((e - lsh) - uexp) in
+  // normalize
+  let rec nrm = fn (w: (int * int)) -> fn (we: int) ->
+    (let (wh, _) = w in
+     if bit_and wh 1048576 == 0 then nrm (jf_shl w 1) (we - 1) else (jf_shl w 11, we - 11)) in
+  let (w0, wexp) = nrm frac e in
+  // find_cachedpow10
+  let approx = int_of_float (float_of_int (0 - (uexp + 87)) * 0.30102999566398114) in
+  let rec fc = fn (idx: int) ->
+    (let (_, pe) = jf_pow idx in
+     let cur = uexp + pe + 64 in
+     if cur < 0 - 60 then fc (idx + 1) else if cur > 0 - 32 then fc (idx - 1) else idx) in
+  let idx = fc ((approx + 348) / 8) in
+  let (cp, pe) = jf_pow idx in
+  let k = (0 - 348) + idx * 8 in
+  let w = jf_mul w0 cp in
+  let upper = jf_sub (jf_mul upper0 cp) (0, 1) in
+  let lower = jf_add (jf_mul lower0 cp) (0, 1) in
+  let ex = 0 - (uexp + pe + 64) in
+  let _ = wexp in
+  // generate_digits
+  let wfrac = jf_sub upper w in
+  let delta = jf_sub upper lower in
+  let onef = jf_shl (0, 1) ex in
+  let part1 = (let (_, p1) = jf_shr upper ex in p1) in
+  let part2 = jf_low upper ex in
+  let rec g1 = fn (div: int) -> fn (kappa: int) -> fn (p1: int) -> fn (ds: int list) ->
+    let digit = p1 / div in
+    let ds2 = (match ds with Nil -> (if digit == 0 then ds else Cons (digit, ds)) | _ -> Cons (digit, ds)) in
+    let p1b = p1 - digit * div in
+    let kap = kappa - 1 in
+    let tmp = jf_add (jf_shl (jf_of_int p1b) ex) part2 in
+    if (if jf_lt delta tmp then false else true) then
+      (jf_round ds2 delta tmp (jf_shl (jf_of_int div) ex) wfrac, kap)
+    else if kap > 0 then g1 (div / 10) kap p1b ds2
+    else g2 part2 delta kap 18 ds2
+  and g2 = fn (p2: (int * int)) -> fn (dl: (int * int)) -> fn (kappa: int) -> fn (u: int) -> fn (ds: int list) ->
+    let p2b = jf_mullo p2 (0, 10) in
+    let dlb = jf_mullo dl (0, 10) in
+    let kap = kappa - 1 in
+    let digit = (let (_, dg) = jf_shr p2b ex in dg) in
+    let ds2 = (match ds with Nil -> (if digit == 0 then ds else Cons (digit, ds)) | _ -> Cons (digit, ds)) in
+    let p2c = jf_low p2b ex in
+    if jf_lt p2c dlb then (jf_round ds2 dlb p2c onef (jf_mullo wfrac (jf_p10 (19 - u))), kap)
+    else g2 p2c dlb kap (u - 1) ds2 in
+  let (ds, kap) = g1 1000000000 10 part1 Nil in
+  (jf_digits_s ds "", 0 - k + kap)
+
+// fpconv_dtoa: the sign, the zero, then emit_digits' layout (value =
+// digits x 10^K): plain up to 10^15 with a ".0" added, a leading "0."
+// down to 1e-7ish, the exponent form outside that ("1e+20", "5e-324").
+and jg_float_s = fn (f: float) ->
+  let neg = f < 0.0 || (f == 0.0 && (let r = rb_float_str f in str_eq (substring r 0 1) "-")) in
+  if f == 0.0 then (if neg then "-0.0" else "0.0")
+  else
+    let (d, kk) = jf_grisu (if neg then 0.0 - f else f) in
+    let nd = str_len d in
+    let dp = kk + nd in
+    let ex2 = (if dp - 1 < 0 then 1 - dp else dp - 1) in
+    let zs = fn (m: int) -> str_repeat "0" m in
+    let sgn = (if neg then "-" else "") in
+    if kk >= 0 && ex2 < 15 then sgn ++ d ++ zs kk ++ ".0"
+    else if kk < 0 && (kk > 0 - 7 || ex2 < 10) then
+      (if dp <= 0 then sgn ++ "0." ++ zs (0 - dp) ++ d
+       else sgn ++ substring d 0 dp ++ "." ++ substring d dp nd)
+    else
+      sgn ++ substring d 0 1 ++ (if nd > 1 then "." ++ substring d 1 nd else "")
+        ++ "e" ++ (if dp - 1 < 0 then "-" else "+") ++ str_of_int ex2
+
+and jg_float = fn world -> fn cb -> fn cfg -> fn (b) -> fn (v: Val) -> fn (f: float) -> fn (depth: int) ->
+  let (_, _, _, _, _, fl, maxn, _) = cfg in
+  let special = (if f == f then (f != 0.0 && f * 0.5 == f) else true) in
+  if special then
+    (if bit_and fl 1 != 0 then strbuf_push b (rb_float_str f)
+     else
+       (let casted = (if bit_and fl 8 != 0 && bit_and fl 16 != 0 then cb 1 v 0 else v) in
+        let same = (match casted with
+                    | VFlt g -> (if g == g then g == f else (if f == f then false else true))
+                    | _ -> false) in
+        if same then (let _ = jg_err world v (rb_float_str f ++ " not allowed in JSON") in ())
+        else (let _ = jg_deeper world maxn (depth + 1) in jg_value world cb cfg b casted depth false)))
+  else strbuf_push b (jg_float_s f)
+
+// generate_json
+and jg_value = fn world -> fn cb -> fn cfg -> fn (b) -> fn (v: Val) -> fn (depth: int) -> fn (as_called: bool) ->
+  let (_, _, _, _, _, fl, _, _) = cfg in
+  match v with
+  | VNil -> strbuf_push b "null"
+  | VBool t -> strbuf_push b (if t then "true" else "false")
+  | VInt k -> strbuf_push b (str_of_int k)
+  | VBig s -> strbuf_push b s
+  | VFlt f -> jg_float world cb cfg b v f depth
+  | VSym y -> (if bit_and fl 8 != 0 then jg_str world cb cfg b (mkstr y) as_called else jg_fallback world cb cfg b v depth)
+  | VStr h ->
+    (if jg_plain v then
+       (if jg_valid h then jg_raw world cfg b h
+        else if as_called then (let _ = jg_err world v "source sequence is illegal/malformed utf-8" in ())
+        else jg_value world cb cfg b (jg_ensure world cb cfg v false false) depth true)
+     else jg_general world cb cfg b v depth as_called)
+  | VArr id -> (if jg_plain v then jg_array world cb cfg b id depth else jg_general world cb cfg b v depth as_called)
+  | VHsh id -> (if jg_plain v then jg_object world cb cfg b v id depth else jg_general world cb cfg b v depth as_called)
+  | _ -> jg_general world cb cfg b v depth as_called
+and jg_general = fn world -> fn cb -> fn cfg -> fn (b) -> fn (v: Val) -> fn (depth: int) -> fn (as_called: bool) ->
+  let (_, _, _, _, _, fl, _, _) = cfg in
+  // JSON::Fragment is a Struct, and generate_json takes its #json as it is
+  // (T_STRUCT with klass == cFragment) before strict mode is asked anything
+  // (the EXACT class: JSON::Fragment is `Struct.new(:json)`, whose own name
+  // here is the generated one, so it is compared with what the constant holds)
+  let frag = (match v with
+              | VObj oid ->
+                (let (_, _, ocls, _) = world in
+                 match (if map_has consts "JSON::Fragment" then map_get consts "JSON::Fragment" else VNil) with
+                 | VClass fc -> str_eq (map_get ocls oid) fc
+                 | _ -> false)
+              | _ -> false) in
+  if frag then jg_fallback world cb cfg b v depth
+  else if bit_and fl 8 != 0 then
+    (if bit_and fl 16 != 0 && (if as_called then false else true) then
+       jg_value world cb cfg b (cb 1 v 0) depth true
+     else (let _ = jg_err world v (class_name v ++ " not allowed in JSON") in ()))
+  else jg_fallback world cb cfg b v depth
+and jg_fallback = fn world -> fn cb -> fn cfg -> fn (b) -> fn (v: Val) -> fn (depth: int) ->
+  match cb 0 v depth with
+  | VArr id ->
+    (match deref id with
+     | Cons (VBool true, Cons (VStr h, _)) -> strbuf_push b (sget h)
+     | Cons (_, Cons (s2, _)) -> jg_str world cb cfg b s2 false
+     | _ -> ())
+  | _ -> ()
+// generate_json_string: made valid, then escaped
+and jg_str = fn world -> fn cb -> fn cfg -> fn (b) -> fn (v: Val) -> fn (as_called: bool) ->
+  match jg_ensure world cb cfg v as_called false with
+  | VStr h -> jg_raw world cfg b h
+  | other -> jg_value world cb cfg b other 0 true
+// raw_generate_json_string: a broken string is refused here whoever let it in
+and jg_raw = fn world -> fn cfg -> fn (b) -> fn (h: int) ->
+  let (_, _, _, _, _, fl, _, _) = cfg in
+  if jg_crange h == 2 then (let _ = jg_err world (VStr h) "source sequence is illegal/malformed utf-8" in ())
+  else
+    (let _ = strbuf_push b "\"" in
+     let _ = jg_escape b fl (sget h) in
+     strbuf_push b "\"")
+
+and jg_array = fn world -> fn cb -> fn cfg -> fn (b) -> fn (id: int) -> fn (depth0: int) ->
+  let (ind, _, _, _, anl, _, maxn, _) = cfg in
+  let depth = depth0 + 1 in
+  let _ = jg_deeper world maxn depth in
+  match deref id with
+  | Nil -> strbuf_push b "[]"
+  | xs ->
+    let _ = strbuf_push b "[" in
+    let _ = (if str_eq anl "" then () else strbuf_push b anl) in
+    let rec go = fn (ys: Val list) -> fn (first: bool) ->
+      match ys with
+      | Nil -> ()
+      | Cons (y, t) ->
+        (let _ = (if first then () else (let _ = strbuf_push b "," in if str_eq anl "" then () else strbuf_push b anl)) in
+         let _ = jg_indent b ind depth in
+         let _ = jg_value world cb cfg b y depth false in
+         go t false) in
+    let _ = go xs true in
+    let _ = (if str_eq anl "" then () else (let _ = strbuf_push b anl in jg_indent b ind depth0)) in
+    strbuf_push b "]"
+
+// json_object_i, per pair. kt is the first key's type (1 String, 2 Symbol,
+// 3 other); the mixed-keys inspection runs once per hash, and only for a
+// String or Symbol key that differs from the first key.
+and jg_object = fn world -> fn cb -> fn cfg -> fn (b) -> fn (hv: Val) -> fn (id: int) -> fn (depth0: int) ->
+  let (ind, sp, spb, onl, _, _, maxn, dk) = cfg in
+  let depth = depth0 + 1 in
+  let _ = jg_deeper world maxn depth in
+  match hderef id with
+  | Nil -> strbuf_push b "\{\}"
+  | xs ->
+    let _ = strbuf_push b "\{" in
+    let mixed = vec_new () in
+    let ktype = fn (k: Val) -> (match k with VStr _ -> 1 | VSym _ -> 2 | _ -> 3) in
+    let rec go = fn (ys: Val list) -> fn (kt: int) ->
+      match ys with
+      | Cons (k, Cons (v, t)) ->
+        (let kt0 = (if kt == 0 then ktype k else kt) in
+         let _ = (if kt == 0 then () else strbuf_push b ",") in
+         let _ = (if str_eq onl "" then () else strbuf_push b onl) in
+         let _ = jg_indent b ind depth in
+         let _ = (let t1 = ktype k in
+                  if t1 != 3 && t1 != kt0 && vec_len mixed == 0 then
+                    (let _ = vec_push mixed 1 in
+                     if dk == 1 then VNil else cb 3 hv (if dk == 2 then 1 else 0))
+                  else VNil) in
+         let _ = jg_key world cb cfg b k false in
+         let _ = (if str_eq spb "" then () else strbuf_push b spb) in
+         let _ = strbuf_push b ":" in
+         let _ = (if str_eq sp "" then () else strbuf_push b sp) in
+         let _ = jg_value world cb cfg b v depth false in
+         go t kt0)
+      | _ -> () in
+    let _ = go xs 0 in
+    let _ = (if str_eq onl "" then () else (let _ = strbuf_push b onl in jg_indent b ind depth0)) in
+    strbuf_push b "\}"
+and jg_key = fn world -> fn cb -> fn cfg -> fn (b) -> fn (k: Val) -> fn (as_called: bool) ->
+  let (_, _, _, _, _, fl, _, _) = cfg in
+  let ks = (match k with
+            | VStr _ -> (if jg_plain k then k else cb 4 k 0)
+            | VSym y -> mkstr y
+            | _ ->
+              (if bit_and fl 8 != 0 then
+                 (if bit_and fl 16 != 0 && (if as_called then false else true) then VNil
+                  else jg_err world k (class_name k ++ " not allowed as object key in JSON"))
+               else cb 4 k 0)) in
+  match ks with
+  // strict + as_json: the key goes through as_json(key, true) and round again
+  | VNil -> jg_key world cb cfg b (cb 2 k 0) true
+  | _ ->
+    (match jg_ensure world cb cfg ks as_called true with
+     | VStr h -> (if jg_plain (VStr h) then jg_raw world cfg b h else jg_value world cb cfg b (VStr h) 0 false)
+     | other -> jg_value world cb cfg b other 0 false)
+
+// cState_partial_generate. mode is which generator_func the caller chose:
+// 0 generate_json (State#generate), 1 an object, 2 an array, 3 a string,
+// 4 an Integer, 5 a Float -- the GeneratorMethods#to_json of that class,
+// which generates its receiver as that type whatever its exact class is.
+and json_generate = fn world -> fn cb -> fn cfg -> fn (mode: int) -> fn (depth: int) -> fn (v: Val) ->
+  let b = strbuf_new () in
+  let _ = (match v with
+           | VHsh id -> (if mode == 1 then jg_object world cb cfg b v id depth else jg_value world cb cfg b v depth false)
+           | VArr id -> (if mode == 2 then jg_array world cb cfg b id depth else jg_value world cb cfg b v depth false)
+           | VStr _ -> (if mode == 3 then jg_str world cb cfg b v false else jg_value world cb cfg b v depth false)
+           | _ -> jg_value world cb cfg b v depth false) in
+  strbuf_to_str b
+
+// ---- the ruby-visible half of the C extensions ----------------------------
+//
+// json/ext/parser and json/ext/generator: what parser.c and generator.c
+// define that ruby can see, written in ruby over the two engines above.
+// Answered by do_require after stdlib_src and json_lib_src.
+and json_ext_src = fn (name: str) ->
+  let n = (if ends_with_rb name then substring name 0 (str_len name - 3) else name) in
+  if str_eq n "json/ext/parser" then
+    "# frozen_string_literal: true\n" ++
+    "#\n" ++
+    "# json/ext/parser, as mere-ruby answers it. In CRuby this feature is the C\n" ++
+    "# extension ext/json/parser/parser.c (json 2.18.0); what it defines that ruby\n" ++
+    "# code can see is here, in ruby, and the parse itself is native\n" ++
+    "# (m_json.mere's json_parse), reached through ParserConfig.__json_parse.\n" ++
+    "require 'json/common'\n" ++
+    "\n" ++
+    "module JSON\n" ++
+    "  module Ext\n" ++
+    "    class ParserConfig\n" ++
+    "      # cParserConfig_initialize / parser_config_init. The options are read\n" ++
+    "      # key by key in the hash's order, as parser_config_init_i does, and a\n" ++
+    "      # key it does not know is ignored.\n" ++
+    "      def initialize(opts)\n" ++
+    "        raise FrozenError, \"can't modify frozen #\{self.class\}: #\{inspect\}\" if frozen?\n" ++
+    "        @__flags = 0\n" ++
+    "        @__max_nesting = 100\n" ++
+    "        @__dupkey = 0\n" ++
+    "        @__on_load = nil\n" ++
+    "        @__decimal = nil\n" ++
+    "        @__decimal_method = nil\n" ++
+    "        unless opts.nil?\n" ++
+    "          unless Hash === opts\n" ++
+    "            raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(opts)\} (expected Hash)\"\n" ++
+    "          end\n" ++
+    "          opts.each do |key, val|\n" ++
+    "            case key\n" ++
+    "            when :max_nesting then @__max_nesting = val ? Integer(val) : 0\n" ++
+    "            when :allow_nan then __json_flag(4, val)\n" ++
+    "            when :allow_trailing_comma then __json_flag(8, val)\n" ++
+    "            when :allow_control_characters then __json_flag(16, val)\n" ++
+    "            when :symbolize_names then __json_flag(1, val)\n" ++
+    "            when :freeze then __json_flag(2, val)\n" ++
+    "            when :on_load\n" ++
+    "              @__on_load = val ? val : nil\n" ++
+    "              __json_flag(32, val)\n" ++
+    "            when :allow_duplicate_key then @__dupkey = val ? 1 : 2\n" ++
+    "            when :decimal_class\n" ++
+    "              if val\n" ++
+    "                if val.respond_to?(:try_convert)\n" ++
+    "                  @__decimal, @__decimal_method = val, :try_convert\n" ++
+    "                elsif val.respond_to?(:new)\n" ++
+    "                  @__decimal, @__decimal_method = val, :new\n" ++
+    "                elsif Class === val\n" ++
+    "                  # a class that answers neither is taken as the name of a\n" ++
+    "                  # conversion METHOD: BigDecimal is Kernel#BigDecimal, and\n" ++
+    "                  # A::B is A.B\n" ++
+    "                  name = val.name\n" ++
+    "                  if (i = name.rindex(\":\"))\n" ++
+    "                    @__decimal = Object.const_get(name[0, i - 1])\n" ++
+    "                    @__decimal_method = name[(i + 1)..].to_sym\n" ++
+    "                  else\n" ++
+    "                    @__decimal, @__decimal_method = Kernel, name.to_sym\n" ++
+    "                  end\n" ++
+    "                end\n" ++
+    "                __json_flag(64, @__decimal)\n" ++
+    "              end\n" ++
+    "            end\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "        self\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      # cParserConfig_parse\n" ++
+    "      def parse(source)\n" ++
+    "        ParserConfig.__json_parse(self, JSON::Ext.__json_source(source), @__flags, @__max_nesting, @__dupkey)\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      # what the native parser calls back for (see m_json.mere)\n" ++
+    "      def __json_on_load(value)\n" ++
+    "        @__on_load.call(value)\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      def __json_decimal(text)\n" ++
+    "        @__decimal.__send__(@__decimal_method, text)\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      private\n" ++
+    "\n" ++
+    "      def __json_flag(bit, val)\n" ++
+    "        @__flags = val ? (@__flags | bit) : (@__flags & ~bit)\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    class Parser\n" ++
+    "      # cParser_m_parse: the source first, then the options, and no config\n" ++
+    "      # object for anyone to see\n" ++
+    "      def self.parse(source, opts)\n" ++
+    "        src = JSON::Ext.__json_source(source)\n" ++
+    "        ParserConfig.new(opts).parse(src)\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    # Check_Type's name for a value: nil, true and false by name\n" ++
+    "    def self.__json_tname(v)\n" ++
+    "      case v\n" ++
+    "      when nil then \"nil\"\n" ++
+    "      when true then \"true\"\n" ++
+    "      when false then \"false\"\n" ++
+    "      else v.class.to_s\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    # StringValue, then convert_encoding: UTF-8 as it is, BINARY\n" ++
+    "    # reinterpreted as UTF-8 (\"for historical reason\"), anything else\n" ++
+    "    # transcoded.\n" ++
+    "    def self.__json_source(source)\n" ++
+    "      unless String === source\n" ++
+    "        unless source.respond_to?(:to_str)\n" ++
+    "          raise TypeError, \"no implicit conversion of #\{__json_tname(source)\} into String\"\n" ++
+    "        end\n" ++
+    "        source = source.to_str\n" ++
+    "      end\n" ++
+    "      enc = source.encoding\n" ++
+    "      if enc == Encoding::UTF_8\n" ++
+    "        source\n" ++
+    "      elsif enc == Encoding::BINARY\n" ++
+    "        source.dup.force_encoding(Encoding::UTF_8)\n" ++
+    "      else\n" ++
+    "        source.encode(Encoding::UTF_8)\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "end\n"
+  else if str_eq n "json/ext/generator" then
+    "# frozen_string_literal: true\n" ++
+    "#\n" ++
+    "# json/ext/generator, as mere-ruby answers it. In CRuby this feature is the C\n" ++
+    "# extension ext/json/generator/generator.c (json 2.18.0): the State class's\n" ++
+    "# C half (its fields, accessors, _configure and generate) and the\n" ++
+    "# GeneratorMethods modules. Those are here, in ruby; the generation itself is\n" ++
+    "# native (m_json.mere's json_generate), reached through\n" ++
+    "# State.__json_generate. The ruby half of State is json's own\n" ++
+    "# json/ext/generator/state.rb, required at the end exactly as Init_generator\n" ++
+    "# does.\n" ++
+    "#\n" ++
+    "# The fields live in @__ ivars, which Object#instance_variables does not\n" ++
+    "# list: State#to_h (state.rb) adds every listed ivar to its answer, and the C\n" ++
+    "# struct's fields are not ivars.\n" ++
+    "require 'json/common'\n" ++
+    "\n" ++
+    "module JSON\n" ++
+    "  module Ext\n" ++
+    "    module Generator\n" ++
+    "      class State\n" ++
+    "        # cState_from_state_s: a State as it is, a Hash as the options of a\n" ++
+    "        # new one (asked of the receiver), anything else a default State\n" ++
+    "        def self.from_state(opts)\n" ++
+    "          if opts.is_a?(self)\n" ++
+    "            opts\n" ++
+    "          elsif opts.is_a?(Hash)\n" ++
+    "            new(opts)\n" ++
+    "          else\n" ++
+    "            State.new\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        # cState_m_generate: the options go into a State nobody sees, which\n" ++
+    "        # is only made if some object's #to_json needs to be handed one\n" ++
+    "        def self.generate(obj, opts, io)\n" ++
+    "          cfg = __json_config_of(opts)\n" ++
+    "          __json_finish(__json_generate(obj, 0, cfg, [nil, nil, opts, cfg[9]]), io)\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        # cState_generate\n" ++
+    "        def generate(obj, io = nil)\n" ++
+    "          cfg = __json_config\n" ++
+    "          State.__json_finish(State.__json_generate(obj, 0, cfg, [self, nil, nil, cfg[9]]), io)\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        # cState_initialize is replaced by state.rb's #initialize; the fields\n" ++
+    "        # start as state_init leaves them (max_nesting 100,\n" ++
+    "        # buffer_initial_length 1024, the rest zero)\n" ++
+    "\n" ++
+    "        def indent\n" ++
+    "          @__indent || \"\"\n" ++
+    "        end\n" ++
+    "        def space\n" ++
+    "          @__space || \"\"\n" ++
+    "        end\n" ++
+    "        def space_before\n" ++
+    "          @__space_before || \"\"\n" ++
+    "        end\n" ++
+    "        def object_nl\n" ++
+    "          @__object_nl || \"\"\n" ++
+    "        end\n" ++
+    "        def array_nl\n" ++
+    "          @__array_nl || \"\"\n" ++
+    "        end\n" ++
+    "        def indent=(v); __json_modify!; @__indent = State.__json_strcfg(v); nil; end\n" ++
+    "        def space=(v); __json_modify!; @__space = State.__json_strcfg(v); nil; end\n" ++
+    "        def space_before=(v); __json_modify!; @__space_before = State.__json_strcfg(v); nil; end\n" ++
+    "        def object_nl=(v); __json_modify!; @__object_nl = State.__json_strcfg(v); nil; end\n" ++
+    "        def array_nl=(v); __json_modify!; @__array_nl = State.__json_strcfg(v); nil; end\n" ++
+    "\n" ++
+    "        def as_json\n" ++
+    "          @__as_json.nil? ? false : @__as_json\n" ++
+    "        end\n" ++
+    "        def as_json=(v)\n" ++
+    "          __json_modify!\n" ++
+    "          @__as_json = State.__json_proc(v)\n" ++
+    "          nil\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        def max_nesting\n" ++
+    "          @__max_nesting.nil? ? 100 : @__max_nesting\n" ++
+    "        end\n" ++
+    "        def max_nesting=(v); __json_modify!; @__max_nesting = State.__json_long(v); nil; end\n" ++
+    "        def check_circular?\n" ++
+    "          max_nesting != 0\n" ++
+    "        end\n" ++
+    "        def depth\n" ++
+    "          @__depth.nil? ? 0 : @__depth\n" ++
+    "        end\n" ++
+    "        def depth=(v); __json_modify!; @__depth = State.__json_long(v); nil; end\n" ++
+    "        def buffer_initial_length\n" ++
+    "          @__buffer_initial_length.nil? ? 1024 : @__buffer_initial_length\n" ++
+    "        end\n" ++
+    "        def buffer_initial_length=(v)\n" ++
+    "          __json_modify!\n" ++
+    "          @__buffer_initial_length = State.__json_buflen(v, buffer_initial_length)\n" ++
+    "          nil\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        def script_safe\n" ++
+    "          @__script_safe ? true : false\n" ++
+    "        end\n" ++
+    "        def script_safe=(v); __json_modify!; @__script_safe = v ? true : false; nil; end\n" ++
+    "        alias_method :script_safe?, :script_safe\n" ++
+    "        alias_method :escape_slash, :script_safe\n" ++
+    "        alias_method :escape_slash?, :script_safe?\n" ++
+    "        alias_method :escape_slash=, :script_safe=\n" ++
+    "        def strict\n" ++
+    "          @__strict ? true : false\n" ++
+    "        end\n" ++
+    "        def strict=(v); __json_modify!; @__strict = v ? true : false; nil; end\n" ++
+    "        alias_method :strict?, :strict\n" ++
+    "        def allow_nan?\n" ++
+    "          @__allow_nan ? true : false\n" ++
+    "        end\n" ++
+    "        def allow_nan=(v); __json_modify!; @__allow_nan = v ? true : false; nil; end\n" ++
+    "        def ascii_only?\n" ++
+    "          @__ascii_only ? true : false\n" ++
+    "        end\n" ++
+    "        def ascii_only=(v); __json_modify!; @__ascii_only = v ? true : false; nil; end\n" ++
+    "\n" ++
+    "        private\n" ++
+    "\n" ++
+    "        # rb_check_frozen, which every C setter starts with: the refusal comes\n" ++
+    "        # before the value is looked at\n" ++
+    "        def __json_modify!\n" ++
+    "          raise FrozenError.new(\"can't modify frozen #\{self.class\}: #\{inspect\}\", receiver: self) if frozen?\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        # cState_configure / configure_state_i: the keys it knows, in the\n" ++
+    "        # hash's order; any other key is ignored\n" ++
+    "        def _configure(opts)\n" ++
+    "          __json_modify!\n" ++
+    "          return self unless opts\n" ++
+    "          raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(opts)\} (expected Hash)\" unless Hash === opts\n" ++
+    "          opts.each do |key, val|\n" ++
+    "            case key\n" ++
+    "            when :indent then @__indent = State.__json_strcfg(val)\n" ++
+    "            when :space then @__space = State.__json_strcfg(val)\n" ++
+    "            when :space_before then @__space_before = State.__json_strcfg(val)\n" ++
+    "            when :object_nl then @__object_nl = State.__json_strcfg(val)\n" ++
+    "            when :array_nl then @__array_nl = State.__json_strcfg(val)\n" ++
+    "            when :max_nesting then @__max_nesting = State.__json_long(val)\n" ++
+    "            when :allow_nan then @__allow_nan = val ? true : false\n" ++
+    "            when :ascii_only then @__ascii_only = val ? true : false\n" ++
+    "            when :depth then @__depth = State.__json_long(val)\n" ++
+    "            when :buffer_initial_length then @__buffer_initial_length = State.__json_buflen(val, buffer_initial_length)\n" ++
+    "            when :script_safe, :escape_slash then @__script_safe = val ? true : false\n" ++
+    "            when :strict then @__strict = val ? true : false\n" ++
+    "            when :allow_duplicate_key then @__dupkey = val ? 1 : 2\n" ++
+    "            when :as_json then @__as_json = val ? State.__json_proc(val) : false\n" ++
+    "            end\n" ++
+    "          end\n" ++
+    "          self\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        # cState_allow_duplicate_key_p: true / false once set, nil while it\n" ++
+    "        # is the deprecated default\n" ++
+    "        def allow_duplicate_key?\n" ++
+    "          case @__dupkey\n" ++
+    "          when 1 then true\n" ++
+    "          when 2 then false\n" ++
+    "          else nil\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        public\n" ++
+    "\n" ++
+    "        # what the native generator reads, in m_json.mere's cfg order\n" ++
+    "        def __json_config\n" ++
+    "          fl = 0\n" ++
+    "          fl |= 1 if @__allow_nan\n" ++
+    "          fl |= 2 if @__ascii_only\n" ++
+    "          fl |= 4 if @__script_safe\n" ++
+    "          fl |= 8 if @__strict\n" ++
+    "          fl |= 16 if @__as_json\n" ++
+    "          [@__indent || \"\", @__space || \"\", @__space_before || \"\", @__object_nl || \"\", @__array_nl || \"\",\n" ++
+    "           fl, max_nesting, depth, @__dupkey || 0, @__as_json]\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        class << self\n" ++
+    "          # a configuration that never becomes a State (cState_m_generate's\n" ++
+    "          # stack struct): the same reading, into a throwaway one\n" ++
+    "          def __json_config_of(opts)\n" ++
+    "            st = allocate\n" ++
+    "            st.__send__(:_configure, opts)\n" ++
+    "            st.__json_config\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          def __json_finish(str, io)\n" ++
+    "            return str unless io\n" ++
+    "            io.write(str)\n" ++
+    "            io.flush\n" ++
+    "            io\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          # string_config: a non-empty String is kept (frozen), \"\" and a\n" ++
+    "          # false value are \"unset\"\n" ++
+    "          def __json_strcfg(v)\n" ++
+    "            return false unless v\n" ++
+    "            raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(v)\} (expected String)\" unless String === v\n" ++
+    "            v.empty? ? false : -v\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          def __json_long(v)\n" ++
+    "            v ? Integer(v) : 0\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          def __json_buflen(v, old)\n" ++
+    "            raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(v)\} (expected Integer)\" unless Integer === v\n" ++
+    "            v > 0 ? v : old\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          def __json_proc(v)\n" ++
+    "            return v if Proc === v\n" ++
+    "            raise TypeError, \"no implicit conversion of #\{JSON::Ext.__json_tname(v)\} into Proc\" unless v.respond_to?(:to_proc)\n" ++
+    "            pr = v.to_proc\n" ++
+    "            raise TypeError, \"can't convert #\{v.class\} to Proc (#\{v.class\}#to_proc gives #\{pr.class\})\" unless Proc === pr\n" ++
+    "            pr\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          # the calls back from the native generator (m_json.mere, cb)\n" ++
+    "          def __json_cb(ctx, kind, obj, depth)\n" ++
+    "            case kind\n" ++
+    "            when 0 # generate_json_fallback, with json_call_to_json's State\n" ++
+    "              if obj.respond_to?(:to_json)\n" ++
+    "                st = (ctx[1] ||= __json_spill(ctx))\n" ++
+    "                st.depth = depth\n" ++
+    "                s = obj.to_json(st)\n" ++
+    "                raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(s)\} (expected String)\" unless String === s\n" ++
+    "                [true, s]\n" ++
+    "              else\n" ++
+    "                s = obj.to_s\n" ++
+    "                raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(s)\} (expected String)\" unless String === s\n" ++
+    "                [false, s]\n" ++
+    "              end\n" ++
+    "            when 1, 2 # json_call_as_json\n" ++
+    "              __json_as_json(ctx).call(obj, kind == 2)\n" ++
+    "            when 3\n" ++
+    "              JSON.__send__(:on_mixed_keys_hash, obj, depth == 1)\n" ++
+    "            when 4 # rb_convert_type(key, T_STRING, \"String\", \"to_s\")\n" ++
+    "              s = obj.to_s\n" ++
+    "              unless String === s\n" ++
+    "                raise TypeError, \"can't convert #\{obj.class\} to String (#\{obj.class\}#to_s gives #\{s.class\})\"\n" ++
+    "              end\n" ++
+    "              s\n" ++
+    "            when 5\n" ++
+    "              begin\n" ++
+    "                obj.encode(Encoding::UTF_8)\n" ++
+    "              rescue => e\n" ++
+    "                raise JSON::GeneratorError.new(e.message, obj)\n" ++
+    "              end\n" ++
+    "            when 6\n" ++
+    "              warn \"JSON.generate: UTF-8 string passed as BINARY, this will raise an encoding error in json 3.0\"\n" ++
+    "              nil\n" ++
+    "            end\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          # vstate_spill: a State with the generating one's fields, never the\n" ++
+    "          # generating one itself (it may be frozen, and its depth is written)\n" ++
+    "          def __json_spill(ctx)\n" ++
+    "            if ctx[0]\n" ++
+    "              ctx[0].dup\n" ++
+    "            else\n" ++
+    "              st = allocate\n" ++
+    "              st.__send__(:_configure, ctx[2]) if ctx[2]\n" ++
+    "              st\n" ++
+    "            end\n" ++
+    "          end\n" ++
+    "\n" ++
+    "          def __json_as_json(ctx)\n" ++
+    "            ctx[3]\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      module GeneratorMethods\n" ++
+    "        module Object\n" ++
+    "          # mObject_to_json: #to_s, generated as a string\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            s = to_s\n" ++
+    "            raise TypeError, \"wrong argument type #\{JSON::Ext.__json_tname(s)\} (expected String)\" unless String === s\n" ++
+    "            State.__json_to_json(s, 3, state)\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module Hash\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            State.__json_to_json(self, 1, state)\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module Array\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            State.__json_to_json(self, 2, state)\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module Integer\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            State.__json_to_json(self, 4, state)\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module Float\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            State.__json_to_json(self, 5, state)\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module String\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            State.__json_to_json(self, 3, state)\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module TrueClass\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            \"true\"\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module FalseClass\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            \"false\"\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "\n" ++
+    "        module NilClass\n" ++
+    "          def to_json(state = nil)\n" ++
+    "            \"null\"\n" ++
+    "          end\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "\n" ++
+    "      class State\n" ++
+    "        # cState_partial_generate with a GeneratorMethods' own generator_func\n" ++
+    "        def self.__json_to_json(obj, mode, state)\n" ++
+    "          st = from_state(state)\n" ++
+    "          cfg = st.__json_config\n" ++
+    "          __json_generate(obj, mode, cfg, [st, nil, nil, cfg[9]])\n" ++
+    "        end\n" ++
+    "      end\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "end\n" ++
+    "\n" ++
+    "require 'json/ext/generator/state'\n"
+  else "";
