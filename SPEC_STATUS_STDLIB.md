@@ -40,14 +40,14 @@ them, is what ships; the two are not added together.
 | library/uri/generic | 2 | 0 | 0 | 42 | 0 | 44 |
 | library/bigdecimal | 0 | 0 | 57 | 0 | 0 | 57 |
 | library/win32ole/win32ole_type | 0 | 0 | 0 | 19 | 0 | 19 |
-| library/matrix | 63 | 5 | 0 | 2 | 0 | 70 |
-| library/open3 | 0 | 1 | 0 | 10 | 0 | 11 |
+| library/matrix | 64 | 4 | 0 | 2 | 0 | 70 |
+| library/open3 | 1 | 0 | 0 | 10 | 0 | 11 |
 | library/syslog | 0 | 0 | 20 | 0 | 0 | 20 |
 | library/matrix/scalar | 0 | 0 | 0 | 9 | 0 | 9 |
 | library/net-http/http | 50 | 0 | 0 | 7 | 0 | 57 |
 | library/net-ftp | 53 | 1 | 0 | 2 | 0 | 56 |
 | library/socket/unixserver | 8 | 0 | 0 | 0 | 0 | 8 |
-| library/openstruct | 2 | 11 | 0 | 0 | 0 | 13 |
+| library/openstruct | 10 | 3 | 0 | 0 | 0 | 13 |
 | library/net-http | 7 | 0 | 0 | 0 | 0 | 7 |
 | library/getoptlong | 10 | 0 | 0 | 0 | 0 | 10 |
 | library/matrix/vector | 5 | 0 | 0 | 0 | 0 | 5 |
@@ -62,13 +62,13 @@ them, is what ships; the two are not added together.
 | library/ipaddr | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/prime/integer | 4 | 0 | 0 | 0 | 0 | 4 |
 | library/uri/ldap | 0 | 0 | 0 | 12 | 0 | 12 |
-| library/socket/basicsocket | 7 | 16 | 0 | 1 | 0 | 24 |
+| library/socket/basicsocket | 9 | 14 | 0 | 1 | 0 | 24 |
 | library/uri | 14 | 0 | 0 | 5 | 0 | 19 |
 | library/timeout | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/find | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/net-http/httprequest | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/socket/unixsocket | 9 | 6 | 0 | 0 | 0 | 15 |
-| library/socket/udpsocket | 3 | 7 | 0 | 0 | 0 | 10 |
+| library/socket/udpsocket | 5 | 5 | 0 | 0 | 0 | 10 |
 | library/socket/tcpsocket | 7 | 2 | 0 | 0 | 0 | 9 |
 | library/win32ole/win32ole_variable | 0 | 0 | 0 | 8 | 0 | 8 |
 | library/uri/mailto | 1 | 0 | 0 | 7 | 0 | 8 |
@@ -79,11 +79,11 @@ them, is what ships; the two are not added together.
 | library/csv/writer | 0 | 0 | 0 | 7 | 0 | 7 |
 | library/uri/escape | 0 | 0 | 0 | 4 | 0 | 4 |
 | library/csv/basicwriter | 0 | 0 | 0 | 3 | 0 | 3 |
-| library/socket/tcpserver | 5 | 2 | 0 | 0 | 0 | 7 |
+| library/socket/tcpserver | 6 | 1 | 0 | 0 | 0 | 7 |
 | library/optionparser | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/random/formatter | 0 | 1 | 0 | 0 | 0 | 1 |
 | library/drb | 0 | 0 | 0 | 1 | 0 | 1 |
-| library/matrix/eigenvalue_decomposition | 0 | 6 | 0 | 0 | 0 | 6 |
+| library/matrix/eigenvalue_decomposition | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/resolv | 0 | 4 | 0 | 0 | 0 | 4 |
 | library/uri/http | 1 | 0 | 0 | 1 | 0 | 2 |
 | library/net-http/httpexceptions | 2 | 0 | 0 | 0 | 0 | 2 |
@@ -94,7 +94,7 @@ them, is what ships; the two are not added together.
 | library/rubygems/gem | 1 | 1 | 0 | 0 | 0 | 2 |
 | library/csv/stringreader | 0 | 0 | 0 | 2 | 0 | 2 |
 | library/logger | 1 | 0 | 0 | 0 | 0 | 1 |
-| library/socket/socket | 25 | 16 | 0 | 0 | 2 | 43 |
+| library/socket/socket | 27 | 14 | 0 | 0 | 2 | 43 |
 | library/win32ole/win32ole_method | 0 | 0 | 0 | 19 | 0 | 19 |
 | library/csv/streambuf | 0 | 0 | 0 | 11 | 0 | 11 |
 | library/csv | 5 | 0 | 0 | 4 | 0 | 9 |
@@ -102,7 +102,7 @@ them, is what ships; the two are not added together.
 | library/matrix/lup_decomposition | 7 | 0 | 0 | 0 | 0 | 7 |
 | library/coverage | 0 | 0 | 5 | 0 | 0 | 5 |
 | library/csv/iobuf | 0 | 0 | 0 | 4 | 0 | 4 |
-| library/rbconfig/sizeof | 0 | 0 | 2 | 0 | 0 | 2 |
+| library/rbconfig/sizeof | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/uri/util | 0 | 0 | 0 | 1 | 0 | 1 |
 | library/erb/defmethod | 1 | 0 | 0 | 0 | 0 | 1 |
 

@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 192 files.
+Classified: 186 files.
 
 ## CRASH — 3 files, 2 kinds
 
@@ -28,28 +28,26 @@ Classified: 192 files.
 
 </details>
 
-## DIFF — 189 files, 90 kinds
+## DIFF — 183 files, 88 kinds
 
 | files | kind |
 |---|---|
 | 12 | `pass=N fail=N err=N` |
-| 10 | `FAILED expected "S", got "S"` |
 | 10 | `ERROR NameError` |
+| 9 | `FAILED expected "S", got "S"` |
 | 9 | `ERROR NoMethodError` |
 | 7 | `FAILED expected "S"TMPDIR` |
-| 6 | `FAILED expected truthy from #include?` |
-| 6 | `ERROR NotImplementedError` |
+| 6 | `FAILED expected [:@ivar], got []` |
+| 6 | `FAILED expected N, got N` |
 | 5 | `FAILED matcher did not match #<OBJ>` |
-| 5 | `FAILED expected N, got N` |
-| 4 | `FAILED expected true, got false` |
-| 4 | `FAILED expected [:@ivar], got []` |
+| 5 | `FAILED expected truthy from #include?` |
+| 5 | `FAILED expected true, got false` |
 | 4 | `ERROR TypeError` |
 | 4 | `ERROR SyntaxError` |
-| 4 | `ERROR FrozenError` |
+| 4 | `ERROR NotImplementedError` |
 | 4 | `ERROR ArgumentError` |
 | 3 | `FAILED expected not to be identical` |
 | 3 | `FAILED expected N, got nil` |
-| 3 | `FAILED expected "S" to match` |
 | 3 | `ERROR LoadError` |
 | 3 | `ERROR Encoding::UndefinedConversionError` |
 | 2 | `FAILED expected truthy from #start_with?` |
@@ -59,9 +57,10 @@ Classified: 192 files.
 | 2 | `FAILED expected ["finalized` |
 | 2 | `FAILED expected TypeError "S" to be raised` |
 | 2 | `FAILED expected #<OBJ>, got #<OBJ>` |
+| 2 | `FAILED expected "S" to match` |
+| 2 | `ERROR FrozenError` |
 | 2 | `ERROR Errno::ENOENT` |
 | 2 | `(tallies differ, lines identical)` |
-| 2 | `#<OBJ> terminated with exception (report_on_exception is true):` |
 | 1 | `fail: mere-ruby: (ruby exception raised)` |
 | 1 | `FAILED matcher did not match "--- !ruby/object:YAMLSpecs::Example` |
 | 1 | `FAILED expected truthy from #exist?` |
@@ -85,13 +84,13 @@ Classified: 192 files.
 | 1 | `FAILED expected ["S"./file_fixture.rb"]` |
 | 1 | `FAILED expected ["S", "S"], got ["S", "S"]` |
 | 1 | `FAILED expected ["S", "S", "S", "TMPDIR 'Object#__mspec_ ...[clipped]` |
-| 1 | `FAILED expected ["S", "S", "S", "S"], got [nil, nil, nil, nil]` |
 | 1 | `FAILED expected ["S", "S", "S", "S"], got ["S", "S", "S", "S"]` |
 | 1 | `FAILED expected [" def foo` |
 | 1 | `FAILED expected TypeError to be raised` |
 | 1 | `FAILED expected TypeError /can't convert Object into an exact number/ to be raised` |
 | 1 | `FAILED expected SyntaxError to be raised` |
 | 1 | `FAILED expected SyntaxError /dynamic constant assignment/ to be raised` |
+| 1 | `FAILED expected SyntaxError /anonymous rest parameter is also used within block/ to be raised` |
 | 1 | `FAILED expected RuntimeError "S" to be raised` |
 | 1 | `FAILED expected NoMethodError /protected method ['S' called/ to be raised` |
 | 1 | `FAILED expected IndexError to be raised` |
@@ -107,13 +106,12 @@ Classified: 192 files.
 | 1 | `FAILED expected "S"constant\"S", got "S"` |
 | 1 | `FAILED expected "S"\uN\"S", got "S"` |
 | 1 | `FAILED expected "S", got nil` |
-| 1 | `FAILED expected "REQUIRED` |
 | 1 | `FAILED expected "NMLJNI\xND$` |
 | 1 | `FAILED expected "Kernel#warn spec edge case` |
 | 1 | `FAILED expected "#<TracePoint:SYM 'S' TMPDIR to match` |
 | 1 | `FAILED expected "` |
-| 1 | `ERROR StandardError` |
 | 1 | `ERROR RuntimeError` |
+| 1 | `ERROR Errno::ENOTCONN` |
 | 1 | `ERROR Errno::EINVAL` |
 | 1 | `<internal:SYM>:N:SYM 'S': No such file or directory @ rb_sysopen - (Errno::ENOENT)` |
 | 1 | `<internal:SYM>:N:SYM 'S': Broken pipe (Errno::EPIPE)` |
@@ -121,13 +119,13 @@ Classified: 192 files.
 | 1 | `/privateTMPDIR 'S': undefined method 'S' for an instance of Binding (NoMethodError)` |
 | 1 | `/privateTMPDIR 'S': method 'S' not defined in BasicObject (NameError)` |
 | 1 | `-e:N:SYM 'S': super: no superclass method 'S' for an instance of Integer (NoMethodError)` |
-| 1 | `*.rb:N: warning: already initialized constant A` |
+| 1 | `#<OBJ> terminated with exception (report_on_exception is true):` |
 
 <details><summary>the same rows by exact cause (top 40)</summary>
 
 | files | cause |
 |---|---|
-| 4 | `FAILED: copies instance variables: expected [:@ivar], got []` |
+| 6 | `FAILED: copies instance variables: expected [:@ivar], got []` |
 | 2 | `pass=0 fail=0 err=0` |
 | 2 | `FAILED: sets the first value to the path of the file in which the method was defined: expected "/privateTMPDIR got "TMPDIR` |
 | 2 | `FAILED: runs handlers even if the main script fails to parse: expected truthy from #include?` |
@@ -136,7 +134,6 @@ Classified: 192 files.
 | 2 | `FAILED: duplicates the range: expected not to be identical` |
 | 2 | `FAILED: copies the finalizer: expected ["finalized` |
 | 2 | `(tallies differ, lines identical)` |
-| 2 | `#<Thread:0xADDR TMPDIR run> terminated with exception (report_on_exception is true):` |
 | 1 | `pass=911 fail=0 err=0` |
 | 1 | `pass=7 fail=0 err=0` |
 | 1 | `pass=5 fail=0 err=0` |
@@ -149,10 +146,10 @@ Classified: 192 files.
 | 1 | `pass=12 fail=0 err=0` |
 | 1 | `fail: mere-ruby: (ruby exception raised)` |
 | 1 | `FAILED: yields the first value to a single-argument block: expected [1, 3], got [[1, 2], [3, 4]]` |
+| 1 | `FAILED: with \|\|= do not reassign: expected 20, got 10` |
 | 1 | `FAILED: with ensure on the root fiber: expected "current fiber ensure` |
 | 1 | `FAILED: with a boolean argument emits a warning when $VERBOSE is true: matcher did not match #<Proc>` |
 | 1 | `FAILED: warns when passing a block argument to a method that never uses it: matcher did not match #<Proc>` |
-| 1 | `FAILED: warns if an exception is raised in finalizer: expected truthy from #include?` |
 | 1 | `FAILED: tracks microseconds: expected 123456, got 123455` |
 | 1 | `FAILED: traces all the events triggered in specified location: expected [:b_call, :b_return, :call, :line, :return], got [:call, :return]` |
 | 1 | `FAILED: supports /n (No encoding): expected ["\xC3"], got ["\xC3\xA9"]` |
@@ -167,6 +164,7 @@ Classified: 192 files.
 | 1 | `FAILED: returns the signal: expected 15, got nil` |
 | 1 | `FAILED: returns the real name of the directory containing the currently-executing file: expected "/privateTMPDIR got "TMPDIR` |
 | 1 | `FAILED: returns the parameters of block: expected [[:opt, :x], [:opt, :y], [:opt, :z]], got nil` |
+| 1 | `FAILED: returns the file path that raised an exception: expected "/privateTMPDIR got "TMPDIR` |
 
 </details>
 

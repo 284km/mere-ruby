@@ -8,14 +8,13 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **189** of **189** recorded DIFF files.
+Visited **183** of **183** recorded DIFF files.
 
 | file | what fails |
 |---|---|
 | command_line/backtrace_limit_spec.rb | pass=0 fail=3 err=0 pass=3 fail=0 err=0 |
-| command_line/dash_r_spec.rb | pass=8 fail=1 err=0 pass=9 fail=0 err=0 |
 | command_line/dash_upper_i_spec.rb | pass=5 fail=1 err=0 pass=6 fail=0 err=0 |
-| command_line/feature_spec.rb | pass=16 fail=10 err=0 pass=26 fail=0 err=0 |
+| command_line/feature_spec.rb | pass=20 fail=6 err=0 pass=26 fail=0 err=0 |
 | command_line/feature_spec.rb | FAILED: can be used with gems: expected "\"constant\"", got "nil" |
 | command_line/feature_spec.rb | FAILED: can be used with gems: expected "\"constant\"", got "nil" |
 | command_line/feature_spec.rb | FAILED: can be used with gem: expected "\"constant\"", got "nil" |
@@ -107,7 +106,7 @@ Visited **189** of **189** recorded DIFF files.
 | core/kernel/caller_spec.rb | FAILED: returns an Array with the block given to #at_exit at the base of the stack: expected 2, got 3 |
 | core/kernel/chomp_spec.rb | pass=9 fail=1 err=0 pass=10 fail=0 err=0 |
 | core/kernel/chop_spec.rb | pass=6 fail=1 err=0 pass=7 fail=0 err=0 |
-| core/kernel/eval_spec.rb | pass=92 fail=8 err=4 pass=104 fail=0 err=0 |
+| core/kernel/eval_spec.rb | pass=93 fail=8 err=3 pass=104 fail=0 err=0 |
 | core/kernel/eval_spec.rb | FAILED: does not share locals across eval scopes: expected "NameError", got "2" |
 | core/kernel/eval_spec.rb | FAILED: includes file and line information in syntax error: expected "syntax error" to match |
 | core/kernel/eval_spec.rb | FAILED: evaluates string with given filename and negative linenumber: expected "syntax error" to match |
@@ -157,16 +156,14 @@ Visited **189** of **189** recorded DIFF files.
 | core/module/define_method_spec.rb | FAILED: sets the visibility to private when method is named :initialize: expected truthy from #include? |
 | core/module/define_method_spec.rb | FAILED: raises TypeError if name cannot converted to String: expected TypeError /is not a symbol nor a string/ to be raised |
 | core/module/prepend_spec.rb | pass=74 fail=12 err=1 pass=88 fail=0 err=0 |
-| core/objectspace/define_finalizer_spec.rb | pass=20 fail=2 err=0 pass=22 fail=0 err=0 |
-| core/objectspace/define_finalizer_spec.rb | FAILED: warns if an exception is raised in finalizer: expected truthy from #include? |
-| core/proc/clone_spec.rb | pass=10 fail=1 err=1 pass=12 fail=0 err=0 |
-| core/proc/clone_spec.rb | ERROR: Proc#clone copies instance variables: FrozenError -- can't modify frozen Proc: #<Proc:0xADDR TMPDIR (lambda)> |
+| core/proc/clone_spec.rb | pass=10 fail=2 err=0 pass=12 fail=0 err=0 |
+| core/proc/clone_spec.rb | FAILED: copies instance variables: expected [:@ivar], got [] |
 | core/proc/curry_spec.rb | pass=40 fail=6 err=0 pass=46 fail=0 err=0 |
 | core/proc/curry_spec.rb | FAILED: can be passed superfluous arguments if created from a proc: expected 6, got 12 |
 | core/proc/curry_spec.rb | FAILED: produces Procs that raise ArgumentError for #binding: expected ArgumentError to be raised |
 | core/proc/curry_spec.rb | FAILED: produces Procs that can be passed as the block for instance_exec: expected 6, got nil |
-| core/proc/dup_spec.rb | pass=10 fail=1 err=1 pass=12 fail=0 err=0 |
-| core/proc/dup_spec.rb | ERROR: Proc#dup copies instance variables: FrozenError -- can't modify frozen Proc: #<Proc:0xADDR TMPDIR (lambda)> |
+| core/proc/dup_spec.rb | pass=10 fail=2 err=0 pass=12 fail=0 err=0 |
+| core/proc/dup_spec.rb | FAILED: copies instance variables: expected [:@ivar], got [] |
 | core/proc/new_spec.rb | pass=22 fail=2 err=6 pass=36 fail=0 err=0 |
 | core/proc/new_spec.rb | ERROR: called on a subclass of Proc returns an instance of the subclass: NoMethodError -- undefined method 'call' for an instance of #<Class:0xADDR> |
 | core/proc/new_spec.rb | ERROR: using a reified block parameter returns an instance of the subclass: NoMethodError -- undefined method 'call' for an instance of #<Class:0xADDR> |
@@ -240,7 +237,7 @@ Visited **189** of **189** recorded DIFF files.
 | core/thread/element_set_spec.rb | pass=8 fail=0 err=1 pass=9 fail=0 err=0 |
 | core/thread/handle_interrupt_spec.rb | pass=21 fail=0 err=0 pass=21 fail=2 err=0 |
 | core/thread/handle_interrupt_spec.rb | (nothing failed -- the record may be stale) |
-| core/thread/list_spec.rb | pass=911 fail=0 err=0 pass=556061 fail=0 err=0 |
+| core/thread/list_spec.rb | pass=911 fail=0 err=0 pass=647049 fail=0 err=0 |
 | core/thread/list_spec.rb | (nothing failed -- the record may be stale) |
 | core/thread/native_thread_id_spec.rb | pass=0 fail=0 err=3 pass=5 fail=0 err=0 |
 | core/thread/native_thread_id_spec.rb | ERROR: Thread#native_thread_id returns an integer when the thread is alive: NoMethodError -- undefined method 'native_thread_id' for an instance of Thread |
@@ -287,7 +284,6 @@ Visited **189** of **189** recorded DIFF files.
 | core/unboundmethod/equal_value_spec.rb | ERROR: UnboundMethod#== considers methods through aliasing equal: NameError -- undefined method 'n' for class '#<Class:0xADDR>' |
 | core/unboundmethod/equal_value_spec.rb | ERROR: UnboundMethod#== considers methods through visibility change equal: NameError -- undefined method 'new' for class 'Class' |
 | core/unboundmethod/source_location_spec.rb | pass=8 fail=1 err=0 pass=9 fail=0 err=0 |
-| core/warning/element_set_spec.rb | pass=8 fail=1 err=0 pass=9 fail=0 err=0 |
 | core/warning/performance_warning_spec.rb | pass=0 fail=1 err=0 pass=1 fail=0 err=0 |
 | language/END_spec.rb | pass=17 fail=1 err=0 pass=18 fail=0 err=0 |
 | language/assignments_spec.rb | pass=59 fail=2 err=2 pass=63 fail=0 err=0 |
@@ -309,8 +305,7 @@ Visited **189** of **189** recorded DIFF files.
 | language/defined_spec.rb | FAILED: returns 'global-variable' for $&: expected "global-variable", got nil |
 | language/defined_spec.rb | FAILED: returns 'global-variable' for $`: expected "global-variable", got nil |
 | language/defined_spec.rb | FAILED: returns 'global-variable' for $': expected "global-variable", got nil |
-| language/delegation_spec.rb | pass=11 fail=3 err=1 pass=15 fail=0 err=0 |
-| language/delegation_spec.rb | ERROR: delegation with def(...) parses as open endless Range when brackets are omitted: StandardError -- mere-ruby: unexpected keyword: end in (eval)         def delegate(...) |
+| language/delegation_spec.rb | pass=12 fail=3 err=0 pass=15 fail=0 err=0 |
 | language/delegation_spec.rb | FAILED: does not allow delegating rest: expected SyntaxError /anonymous rest parameter is also used within block/ to be raised |
 | language/delegation_spec.rb | FAILED: does not allow delegating kwargs: expected SyntaxError /anonymous keyword rest parameter is also used within block/ to be raised |
 | language/file_spec.rb | pass=9 fail=1 err=0 pass=10 fail=0 err=0 |
@@ -359,12 +354,9 @@ Visited **189** of **189** recorded DIFF files.
 | language/return_spec.rb | FAILED: is not allowed: expected LocalJumpError to be raised |
 | language/return_spec.rb | ERROR: within BEGIN is allowed: SyntaxError -- BEGIN is permitted only at toplevel |
 | language/safe_navigator_spec.rb | pass=24 fail=1 err=0 pass=25 fail=0 err=0 |
-| language/string_spec.rb | pass=79 fail=1 err=1 pass=81 fail=0 err=0 |
-| language/string_spec.rb | FAILED: backslashes follow the same rules as interpolation: expected " |
+| language/string_spec.rb | pass=80 fail=1 err=0 pass=81 fail=0 err=0 |
 | language/variables_spec.rb | pass=170 fail=2 err=0 pass=172 fail=0 err=0 |
 | language/variables_spec.rb | FAILED: parses a non-ASCII upcased character as a constant identifier: expected SyntaxError /dynamic constant assignment/ to be raised |
-| library/etc/getgrgid_spec.rb | pass=2011 fail=0 err=0 |
-| library/etc/getgrgid_spec.rb | (nothing failed -- the record may be stale) |
 | library/irb/irb_spec.rb | pass=0 fail=1 err=0 pass=1 fail=0 err=0 |
 | library/logger/logger/new_spec.rb | pass=11 fail=3 err=1 pass=16 fail=0 err=0 |
 | library/logger/logger/new_spec.rb | FAILED: receives a maximum logfile size as third argument: expected truthy from #exist? |
@@ -379,20 +371,14 @@ Visited **189** of **189** recorded DIFF files.
 | library/openssl/x509/store/verify_spec.rb | pass=0 fail=0 err=3 pass=3 fail=0 err=0 |
 | library/openssl/x509/store/verify_spec.rb | ERROR: OpenSSL::X509::Store#verify returns true for valid certificate: NameError -- uninitialized constant OpenSSL::PKey::RSA |
 | library/openssl/x509/store/verify_spec.rb | ERROR: OpenSSL::X509::Store#verify returns false for an expired certificate: NameError -- uninitialized constant OpenSSL::PKey::RSA |
-| library/rbconfig/rbconfig_spec.rb | pass=34 fail=5 err=2 pass=525 fail=0 err=0 |
-| library/rbconfig/rbconfig_spec.rb | FAILED: has MAJOR, MINOR, TEENY, and PATCHLEVEL matching RUBY_VERSION and RUBY_PATCHLEVEL: expected ["4", "0", "6", "0"], got [nil, nil, nil, nil] |
+| library/rbconfig/rbconfig_spec.rb | pass=62 fail=3 err=1 pass=525 fail=0 err=0 |
 | library/rbconfig/rbconfig_spec.rb | FAILED: ['rubylibdir'] returns the directory containing Ruby standard libraries: expected true, got false |
 | library/rbconfig/rbconfig_spec.rb | FAILED: ['rubylibdir'] returns the directory containing Ruby standard libraries: expected truthy from #exist? |
-| library/socket/ipsocket/addr_spec.rb | pass=8 fail=14 err=0 pass=22 fail=0 err=0 |
-| library/socket/ipsocket/addr_spec.rb | FAILED: returns an array with the socket's information: expected "localhost", got "0.0.0.0" |
-| library/socket/ipsocket/addr_spec.rb | FAILED: returns an array with the socket's information: expected "127.0.0.1", got "0.0.0.0" |
-| library/socket/ipsocket/addr_spec.rb | FAILED: returns an address in the array if do_not_reverse_lookup is true: expected "127.0.0.1", got "0.0.0.0" |
-| library/socket/ipsocket/inspect_spec.rb | pass=2 fail=0 err=2 pass=4 fail=0 err=0 |
-| library/socket/ipsocket/inspect_spec.rb | ERROR: IPSocket#inspect returns a String with the fd, family, address and port for UDPSocket: NotImplementedError -- UDPSocket#bind is not implemented (mere-ruby cannot pass a sockaddr to bind(2)) |
+| library/rbconfig/rbconfig_spec.rb | ERROR: RbConfig::CONFIG ['archdir'] returns the directory containing standard libraries C extensions: TypeError -- no implicit conversion of nil into String |
 | library/socket/ipsocket/recvfrom_spec.rb | pass=6 fail=0 err=8 pass=18 fail=0 err=0 |
-| library/socket/ipsocket/recvfrom_spec.rb | ERROR: using IPv4 returns an empty String as received data: NotImplementedError -- UDPSocket#bind is not implemented (mere-ruby cannot pass a sockaddr to bind(2)) |
-| library/socket/ipsocket/recvfrom_spec.rb | ERROR: using IPv6 returns an empty String as received data: NotImplementedError -- UDPSocket#bind is not implemented (mere-ruby cannot pass a sockaddr to bind(2)) |
-| library/socket/ipsocket/recvfrom_spec.rb | ERROR: using IPv4 returns an Array containing up to N bytes and address information: NotImplementedError -- UDPSocket#bind is not implemented (mere-ruby cannot pass a sockaddr to bind(2)) |
+| library/socket/ipsocket/recvfrom_spec.rb | ERROR: using IPv4 returns an empty String as received data: Errno::ENOTCONN -- Socket is not connected - getpeername(2) |
+| library/socket/ipsocket/recvfrom_spec.rb | ERROR: using IPv6 returns an empty String as received data: Errno::ENOTCONN -- Socket is not connected - getpeername(2) |
+| library/socket/ipsocket/recvfrom_spec.rb | ERROR: using IPv4 returns an Array containing up to N bytes and address information: Errno::ENOTCONN -- Socket is not connected - getpeername(2) |
 | library/stringio/puts_spec.rb | pass=22 fail=1 err=0 pass=22 fail=1 err=0 |
 | library/stringio/puts_spec.rb | FAILED: returns general object info if :to_s does not return a string: expected "#<MockObject> |
 | library/tempfile/create_spec.rb | pass=30 fail=13 err=1 pass=44 fail=0 err=0 |
