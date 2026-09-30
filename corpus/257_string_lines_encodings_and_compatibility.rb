@@ -142,3 +142,8 @@ t { "%c".dup.force_encoding("EUC-JP") % 0x81 }
 t { "%c" % -1 }
 t { "%c" % 0x110000 }
 t { "%c".encode("ISO-8859-1") % 300 }
+# Array#join takes its first string's encoding outright (rb_enc_copy) and
+# negotiates the rest; a nested Array is not a first string
+p %w(a b).join(" ").encoding, [].join.encoding, [1, 2].join(",").encoding, [1, "é"].join.encoding
+p ["", "\xE9".b].join.encoding, [["a"], "b"].join.encoding, [["é"], "b"].join.encoding
+p ("" + "abc".b).encoding, ("".b + "abc").encoding
