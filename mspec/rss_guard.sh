@@ -37,7 +37,12 @@ log=${2:-mspec/rss_kills.log}
 poll=${3:-1}
 while :; do
   ps -axo pid=,rss=,args= 2>/dev/null | while read -r pid rss args; do
+    # ⚠ the C compiler BUILDING mere-ruby has the name in its arguments too
+    #   (`-o mere-ruby`, `-dumpdir mere-ruby.new-`, the checkout's path), and
+    #   clang -O1 over mr.c is past 6 GB: a build started while a sweep ran
+    #   was killed as a runaway. The guard is for what runs, not what builds.
     case "$args" in
+      *clang*|*/cc\ *|cc\ *) ;;
       *mere-ruby*|*driver.rb*) [ "$rss" -gt "$cap_kb" ] 2>/dev/null && {
         echo "$(date '+%H:%M:%S') killed pid=$pid rss=$((rss/1024))MB $args" >> "$log"
         kill -9 "$pid" 2>/dev/null; };;

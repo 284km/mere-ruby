@@ -24,7 +24,12 @@
 #
 # A test is `.` when it ran and is in no report, F / E / S when it is under a
 # Failure / Error / Skipped report. A test the reference runs and mere-ruby
-# never names (the file stopped before it) is ABSENT. The columns:
+# never names (the file stopped before it) is ABSENT.
+# ⚠ "IN NO REPORT" MEANS NOTHING WHEN THERE IS NO REPORT. The reports come
+#   after the last test, so a file killed on its last test (test_exception ran
+#   into the 6 GB guard there) named all 98 and reported none, and read as
+#   98 MATCH; finished, it is 49. A test that ran in a file that never printed
+#   its "N tests, M assertions" line is X, not `.`. The columns:
 #
 #   MATCH   both sides passed it
 #   RED     the reference passed it and mere-ruby did not (failed, errored,
@@ -101,7 +106,8 @@ verdicts() {
     /^ *[0-9]+\) Error:/   { want = "E"; next }
     /^ *[0-9]+\) Skipped:/ { want = "S"; next }
     want != "" { n = $1; sub(/:$/, "", n); bad[n] = want; ran[n] = 1; want = ""; next }
-    END { for (n in ran) print n "\t" ((n in bad) ? bad[n] : ".") }' | sort -u
+    /^[0-9]+ tests, [0-9]+ assertions, / { done = 1; next }
+    END { for (n in ran) print n "\t" ((n in bad) ? bad[n] : (done ? "." : "X")) }' | sort -u
 }
 
 # ONE FILE, both sides -- the unit the loop below hands out, as
