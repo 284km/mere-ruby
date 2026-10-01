@@ -389,6 +389,19 @@ sb_sweep_litter() {
   return 0
 }
 sb_cwd="$PWD"
+# ⚠ THE CHECKOUT'S PATH IS PART OF WHAT A UNIX-SOCKET SPEC MEASURES. Its socket
+#   is `<cwd>/rubyspec_temp/<pid>/unix.sock`, and SocketSpecs.socket_path SKIPS
+#   the example when that passes sun_path's 104 bytes -- on both sides, so the
+#   file reads as agreeing while nothing ran. Swept from a worktree under the
+#   session's scratch directory (144 bytes), library/socket/unixserver was
+#   8/8 MATCH; from a checkout whose path fits, 0/8. 72 leaves room for the
+#   rest of that path.
+if [ "${#sb_cwd}" -gt 72 ] && [ "${SPEC_LONG_CWD_OK:-0}" != 1 ]; then
+  echo "scoreboard.sh: this checkout's path is ${#sb_cwd} bytes; a UNIX socket under" >&2
+  echo "  $sb_cwd/rubyspec_temp/<pid>/ passes 104 and its specs skip on both sides." >&2
+  echo "  Sweep from a checkout at a path of 72 bytes or less (SPEC_LONG_CWD_OK=1 to override)." >&2
+  exit 2
+fi
 # before, so a sweep does not run on top of the last one's droppings...
 sb_sweep_litter
 

@@ -139,7 +139,20 @@ fi
 #   and a mere-ruby run can take a few GB, so this is a number for the machine
 #   and not for the record: the verdicts are per test and do not depend on it.
 jobs="${UNITTEST_JOBS:-1}"
-work="$(mktemp -d)"; trap 'rm -f "$list"; rm -rf "$work"' EXIT
+# ⚠ ...AND THE BYTES ARE BOUNDED HERE, as the sweep bounds them: the first run
+#   of this list four files at a time had no guard, and the machine went down
+#   part-way. mspec/rss_guard.sh kills any mere-ruby (or reference) past the
+#   cap, one at a time; a killed file reads as ABSENT tests, so check
+#   mspec/rss_kills.log before believing a file that stopped. An operator's
+#   guard already up is left to it, as scoreboard.sh does.
+ut_guard=""
+if pgrep -f 'rss_guard\.sh' >/dev/null 2>&1; then
+  echo "unittest: an rss_guard.sh is already running; leaving it to it" >&2
+else
+  sh "$root/mspec/rss_guard.sh" "${SPEC_RSS_KB:-6291456}" "$root/mspec/rss_kills.log" 1 &
+  ut_guard=$!
+fi
+work="$(mktemp -d)"; trap '[ -n "$ut_guard" ] && kill "$ut_guard" 2>/dev/null; rm -f "$list"; rm -rf "$work"' EXIT INT TERM
 mkdir -p "$here/tags"
 awk '{ print NR " " $0 }' "$list" | xargs -n 2 -P "$jobs" sh "$0" "$src" --one "$work"
 status="$here/STATUS.md.$$"
