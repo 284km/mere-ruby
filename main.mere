@@ -2312,7 +2312,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           let _ = map_set globals "?" (make_proc_status world rc9) in
           VBool (rc9 == 0))
        | _ -> VBool false)
-    else if (str_len name == 1 && str_eq name "p") || (str_len name == 2 && str_eq name "pp") then
+    // ...unless the program has its own: PP's `pp(obj)` is how pp.rb prints the
+    // parts of a Hash or an object INTO its buffer, and answering Kernel#pp
+    // here sent them to stdout -- `{1=>2}.pretty_inspect` was "{ => }" with
+    // "1\n2" printed beside it, which is every failure message test/unit builds.
+    else if ((str_len name == 1 && str_eq name "p") || (str_len name == 2 && str_eq name "pp"))
+            && (if kernel_overridden env world name then false else true) then
       let _ = p_print_w env world args in
       (match args with Nil -> VNil | Cons (v, Nil) -> v | _ -> arr_new args)
     // Kernel#print: write each arg's to_s (no separators, no newline).
@@ -8378,6 +8383,25 @@ and val_rindex_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) -> fn 
 // asks `obj == x`, which a structural comparison never does. The value-level
 // rb_eq cannot reach a user method, so this walk is world-aware.
 // the VALUES of a pair list (every second entry)
+
+// how many tuples Array#permutation / combination / repeated_permutation /
+// repeated_combination(k) yields over n elements, as a decimal string
+and combi_count = fn (m: str) -> fn (n: int) -> fn (k: int) ->
+  if k < 0 then "0"
+  else if str_eq m "permutation" then (if k > n then "0" else combi_fall n k "1")
+  else if str_eq m "combination" then (if k > n then "0" else combi_choose n k 1 "1")
+  else if str_eq m "repeated_permutation" then combi_pow (str_of_int n) k "1"
+  else if k == 0 then "1" else if n == 0 then "0"
+  else combi_choose (n + k - 1) k 1 "1"
+// n * (n-1) * ... (k factors)
+and combi_fall = fn (n: int) -> fn (k: int) -> fn (acc: str) ->
+  if k <= 0 then acc else combi_fall (n - 1) (k - 1) (big_mul_s acc (str_of_int n))
+// C(n, k), built as C(n-k+i, i) for i = 1..k: each step is exact
+and combi_choose = fn (n: int) -> fn (k: int) -> fn (i: int) -> fn (acc: str) ->
+  if i > k then acc
+  else combi_choose n k (i + 1) (big_div_s (big_mul_s acc (str_of_int (n - k + i))) (str_of_int i))
+and combi_pow = fn (b: str) -> fn (k: int) -> fn (acc: str) ->
+  if k <= 0 then acc else combi_pow b (k - 1) (big_mul_s acc b)
 
 and hash_key_of_w = fn env -> fn world -> fn (xs: Val list) -> fn (v: Val) ->
   match xs with
@@ -17928,6 +17952,56 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | VArr aid9 -> (match deref aid9 with Cons (a9, _) -> a9 | _ -> VNil)
                       | _ -> VNil) in
           raise_exc world "ArgumentError" ("comparison of Integer with " ++ conv_name lim9 ++ " failed"))
+       // An Array's permutation / combination / repeated_* enumerator is
+       // counted, not run: `(1..42).to_a.permutation(30).size` is a 43-digit
+       // number, and materialising it to count overflowed the native stack
+       // (test_enumerator stopped there, 31 of its tests with it).
+       else if (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
+                | VStr mh -> (let m9 = sget mh in
+                              str_eq m9 "permutation" || str_eq m9 "combination"
+                              || str_eq m9 "repeated_permutation" || str_eq m9 "repeated_combination")
+                | _ -> false)
+               && (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                   | VArr _ -> true | _ -> false)
+               && (match (if map_has ivars (str_of_int id ++ "@eargs") then map_get ivars (str_of_int id ++ "@eargs") else VNil) with
+                   | VArr aid9 -> (match deref aid9 with Cons (VInt _, Nil) -> true | Nil -> true | _ -> false)
+                   | _ -> true) then
+         (let m9 = (match map_get ivars (str_of_int id ++ "@meth") with VStr mh -> sget mh | _ -> "") in
+          let n9 = (match map_get ivars (str_of_int id ++ "@recv") with VArr a9 -> vlen (deref a9) | _ -> 0) in
+          let k9 = (match (if map_has ivars (str_of_int id ++ "@eargs") then map_get ivars (str_of_int id ++ "@eargs") else VNil) with
+                    | VArr aid9 -> (match deref aid9 with Cons (VInt k, _) -> k | _ -> n9)
+                    | _ -> n9) in
+          norm_big (combi_count m9 n9 k9))
+       // An Integer's #upto/#downto over a NUMERIC limit is counted, not run:
+       // `42.upto(Float::INFINITY).size` is Infinity, and materialising it to
+       // count never returned (test_enumerator stopped there).
+       else if (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
+                | VStr mh -> str_eq (sget mh) "upto" || str_eq (sget mh) "downto"
+                | _ -> false)
+               && (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                   | VInt _ -> true | _ -> false)
+               && (match (if map_has ivars (str_of_int id ++ "@eargs") then map_get ivars (str_of_int id ++ "@eargs") else VNil) with
+                   | VArr aid9 -> (match deref aid9 with
+                                   | Cons (VInt _, Nil) -> true
+                                   | Cons (VFlt _, Nil) -> true
+                                   | _ -> false)
+                   | _ -> false) then
+         (let up9 = (match map_get ivars (str_of_int id ++ "@meth") with VStr mh -> str_eq (sget mh) "upto" | _ -> true) in
+          let n9 = (match map_get ivars (str_of_int id ++ "@recv") with VInt n -> n | _ -> 0) in
+          let cnt9 = fn (d: int) -> VInt (if d < 0 then 0 else d) in
+          match map_get ivars (str_of_int id ++ "@eargs") with
+          | VArr aid9 ->
+            (match deref aid9 with
+             | Cons (VInt l, _) -> cnt9 (if up9 then l - n9 + 1 else n9 - l + 1)
+             | Cons (VFlt f, _) ->
+               if flt_is_nan f then raise_exc world "FloatDomainError" "NaN"
+               else if flt_is_inf f then
+                 (if (up9 && f > 0.0) || ((if up9 then false else true) && f < 0.0) then VFlt (1.0 / 0.0) else VInt 0)
+               // the last value reached is floor(f) going up, ceil(f) going down
+               else if up9 then cnt9 (flt_floor f - n9 + 1)
+               else cnt9 (n9 + flt_floor (0.0 - f) + 1)
+             | _ -> VNil)
+          | _ -> VNil)
        // ⚠ only a STRING's #upto is unknowable -- it walks succ until it
        // passes the limit. An Integer's counts exactly, and naming the METHOD
        // rather than the receiver made `1.upto(3).size` nil as well.
@@ -40995,6 +41069,12 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
     let caught = FRaise VNil in
     // run the body; a raise unwinds via fail and try_or yields `caught`.
     let result = try_or (fn (u: unit) -> run_stmts env world blk body) caught in
+    // a body that did not finish -- a raise, a return, a break -- leaves the
+    // locals it had not reached unbound, and the rescue and ensure below are
+    // lexically AFTER them, where ruby reads them as nil: EnvUtil.invoke_ruby's
+    // ensure says `th.kill if th` for a thread a raising spawn never started,
+    // and that was a NameError which replaced the exception being reported.
+    let _ = (match result with FNext _ -> () | _ -> (let _ = declare_nils env (deep_targets body) in ())) in
     // a flow signal (break/next/return crossing this begin) is NOT an
     // exception: remember it, run ensure, then keep unwinding.
     let flowk = (match result with
