@@ -5339,7 +5339,11 @@ and expr_pat_vars = fn (e: Expr) ->
   | EArr es -> exprs_pat_vars es
   | EHsh es -> exprs_pat_vars es
   | ESafe (recv, _, args) -> list_append_str (expr_pat_vars recv) (exprs_pat_vars args)
-  | EAssign (_, v) -> expr_pat_vars v
+  // an assignment INSIDE an expression declares its target too, as ruby's
+  // parser does: `(y = 1; 2)` -- the sequence a parameter default or a
+  // condition is written as -- is a SBegin of SExpr (EAssign ...), and the
+  // name was dropped here, so a skipped default left `y` undefined
+  | EAssign (n, v) -> Cons (n, expr_pat_vars v)
   // a statement used as an expression (`case ... end.should ==`) declares the
   // targets that statement would — including a nested case/in's pattern vars.
   | EStmt s -> stmt_targets s
@@ -37894,7 +37898,12 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
       bind_kw_params frame world blk rest defaults kwhash
     else
     let nm = substring p 0 (str_len p - 1) in
-    let v = if hash_haskey kwhash (VSym nm) then hash_get kwhash (VSym nm)
+    // (a keyword given leaves its default unevaluated, and what the default
+    // assigns is still a nil local -- as for a positional one)
+    let v = if hash_haskey kwhash (VSym nm)
+            then (let _ = (if has_default defaults p
+                           then declare_nils frame (expr_pat_vars (get_default defaults p)) else ()) in
+                  hash_get kwhash (VSym nm))
             else if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
     let _ = map_set frame nm v in bind_kw_params frame world blk rest defaults kwhash
 
@@ -38061,6 +38070,12 @@ and bind_defaulted = fn frame -> fn world -> fn blk -> fn (params: str list) -> 
        // raised NameError instead of reading nil.
        let _ = (if has_default defaults p
                 then decl_default_names frame (get_default defaults p) else ()) in
+       // ...and not only a top-level chain: tool/lib's
+       // `def assert_operator o1, op, o2 = (predicate = true; nil)` assigns
+       // inside a parenthesized sequence, and every three-argument call was a
+       // NameError for `predicate` (138 of the RED tests call it so).
+       let _ = (if has_default defaults p
+                then declare_nils frame (expr_pat_vars (get_default defaults p)) else ()) in
        let _ = bind_seq_one frame world p a in bind_defaulted frame world blk ps defaults rest
      | Nil ->
        // Ruby declares the parameter (as nil) before its default runs, so a
@@ -41303,6 +41318,13 @@ and run_begin = fn env -> fn world -> fn blk -> fn (body: Stmt list) -> fn rescu
        | FBreak v -> FBreak v
        | FLoopNext v -> FLoopNext v
        | FNext v -> (match els with Nil -> FNext v | _ -> run_stmts env world blk els))) caught in
+    // ...and the ensure is lexically after the rescue clauses and the else
+    // too: `rescue => e` that never ran is a nil local THERE, not only after
+    // the begin. assert_raise's `ensure; unless e; flunk ...` -- the report
+    // for "nothing was raised" -- was a NameError for `e` instead.
+    let _ = (match ens with
+             | Nil -> ()
+             | _ -> declare_nils env (list_append_str (rescues_targets rescues) (deep_targets els))) in
     // ensure always runs; an escape (return/break/next) inside ensure
     // OVERRIDES the pending outcome and swallows a pending exception.
     // while an exception is still propagating through this begin (no rescue
