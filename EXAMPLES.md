@@ -8,7 +8,7 @@ a file and not the diagnosis.
 Regenerate with `./mspec/examples.sh <spec-root>` (slow: it runs every
 file below, both sides). Paths and addresses are masked by mask.sh.
 
-Visited **183** of **183** recorded DIFF files.
+Visited **185** of **185** recorded DIFF files.
 
 | file | what fails |
 |---|---|
@@ -58,6 +58,7 @@ Visited **183** of **183** recorded DIFF files.
 | core/fiber/raise_spec.rb | ERROR: with cause keyword argument uses the cause from the calling context: RuntimeError -- second error |
 | core/fiber/raise_spec.rb | ERROR: with cause keyword argument accepts a cause keyword argument that overrides the last exception: RuntimeError -- second error |
 | core/file/basename_spec.rb | pass=191 fail=0 err=1 pass=193 fail=0 err=0 |
+| core/file/ftype_spec.rb | pass=11 fail=0 err=1 pass=12 fail=0 err=0 |
 | core/file/new_spec.rb | pass=46 fail=1 err=5 pass=54 fail=0 err=0 |
 | core/file/new_spec.rb | FAILED: returns a new File with modus num and permissions: expected "100744", got "100666" |
 | core/file/new_spec.rb | ERROR: File.new returns a new File with modus fd: Errno::ENOENT -- No such file or directory @ rb_sysopen - |
@@ -67,13 +68,11 @@ Visited **183** of **183** recorded DIFF files.
 | core/file/open_spec.rb | FAILED: opens the file when passed mode, num, permissions and block: expected "100755", got "100644" |
 | core/file/open_spec.rb | FAILED: creates a new write-only file when invoked with 'w' and '0222': expected false, got true |
 | core/file/size_spec.rb | pass=21 fail=0 err=1 pass=22 fail=0 err=0 |
-| core/file/socket_spec.rb | pass=3 fail=0 err=1 pass=3 fail=0 err=1 |
-| core/file/socket_spec.rb | ERROR: File.socket? returns true if the file is a socket: NotImplementedError -- UNIXSocket is not implemented (mere-ruby cannot pass a sockaddr_un to connect(2)) |
-| core/file/stat/socket_spec.rb | pass=2 fail=0 err=1 pass=2 fail=0 err=1 |
-| core/file/stat/socket_spec.rb | ERROR: File::Stat#socket? returns true if the file is a socket: NotImplementedError -- UNIXSocket is not implemented (mere-ruby cannot pass a sockaddr_un to connect(2)) |
+| core/file/socket_spec.rb | pass=3 fail=0 err=1 pass=4 fail=0 err=0 |
+| core/file/stat/ftype_spec.rb | pass=7 fail=0 err=1 pass=8 fail=0 err=0 |
+| core/file/stat/socket_spec.rb | pass=2 fail=0 err=1 pass=3 fail=0 err=0 |
 | core/file/stat_spec.rb | pass=6 fail=0 err=1 pass=14 fail=0 err=0 |
-| core/filetest/socket_spec.rb | pass=3 fail=0 err=1 pass=3 fail=0 err=1 |
-| core/filetest/socket_spec.rb | ERROR: FileTest.socket? returns true if the file is a socket: NotImplementedError -- UNIXSocket is not implemented (mere-ruby cannot pass a sockaddr_un to connect(2)) |
+| core/filetest/socket_spec.rb | pass=3 fail=0 err=1 pass=4 fail=0 err=0 |
 | core/gc/config_spec.rb | pass=12 fail=0 err=0 pass=19 fail=0 err=0 |
 | core/gc/config_spec.rb | (nothing failed -- the record may be stale) |
 | core/gc/stat_spec.rb | pass=20 fail=0 err=1 pass=47 fail=0 err=0 |
@@ -94,8 +93,8 @@ Visited **183** of **183** recorded DIFF files.
 | core/io/write_spec.rb | FAILED: raises SignalException SIGPIPE if the stream is closed instead of Errno::EPIPE like other IOs: expected truthy from #signaled? |
 | core/kernel/__dir___spec.rb | pass=3 fail=4 err=0 pass=7 fail=0 err=0 |
 | core/kernel/__dir___spec.rb | FAILED: returns the real name of the directory containing the currently-executing file: expected "/privateTMPDIR got "TMPDIR |
-| core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected ".", got "TMPDIR" |
-| core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected "foo", got "TMPDIR" |
+| core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected ".", got "HOME" |
+| core/kernel/__dir___spec.rb | FAILED: returns File.dirname(filename): expected "foo", got "HOME" |
 | core/kernel/at_exit_spec.rb | pass=16 fail=1 err=0 pass=17 fail=0 err=0 |
 | core/kernel/autoload_spec.rb | pass=24 fail=0 err=1 pass=25 fail=0 err=0 |
 | core/kernel/binding_spec.rb | pass=9 fail=0 err=1 pass=14 fail=0 err=0 |
@@ -237,7 +236,7 @@ Visited **183** of **183** recorded DIFF files.
 | core/thread/element_set_spec.rb | pass=8 fail=0 err=1 pass=9 fail=0 err=0 |
 | core/thread/handle_interrupt_spec.rb | pass=21 fail=0 err=0 pass=21 fail=2 err=0 |
 | core/thread/handle_interrupt_spec.rb | (nothing failed -- the record may be stale) |
-| core/thread/list_spec.rb | pass=911 fail=0 err=0 pass=647049 fail=0 err=0 |
+| core/thread/list_spec.rb | pass=911 fail=0 err=0 pass=498877 fail=0 err=0 |
 | core/thread/list_spec.rb | (nothing failed -- the record may be stale) |
 | core/thread/native_thread_id_spec.rb | pass=0 fail=0 err=3 pass=5 fail=0 err=0 |
 | core/thread/native_thread_id_spec.rb | ERROR: Thread#native_thread_id returns an integer when the thread is alive: NoMethodError -- undefined method 'native_thread_id' for an instance of Thread |
@@ -360,7 +359,7 @@ Visited **183** of **183** recorded DIFF files.
 | library/irb/irb_spec.rb | pass=0 fail=1 err=0 pass=1 fail=0 err=0 |
 | library/logger/logger/new_spec.rb | pass=11 fail=3 err=1 pass=16 fail=0 err=0 |
 | library/logger/logger/new_spec.rb | FAILED: receives a maximum logfile size as third argument: expected truthy from #exist? |
-| library/logger/logger/new_spec.rb | ERROR: Logger#new receives a maximum logfile size as third argument: Errno::ENOENT -- No such file or directory @ rb_sysopen - TMPDIR ...[clipped] |
+| library/logger/logger/new_spec.rb | ERROR: Logger#new receives a maximum logfile size as third argument: Errno::ENOENT -- No such file or directory @ rb_sysopen - HOME |
 | library/logger/logger/new_spec.rb | FAILED: receives level symbol as keyword argument: expected 1, got :info |
 | library/mkmf/mkmf_spec.rb | pass=0 fail=1 err=0 pass=1 fail=0 err=0 |
 | library/openssl/kdf/pbkdf2_hmac_spec.rb | pass=0 fail=0 err=1 pass=25 fail=0 err=0 |

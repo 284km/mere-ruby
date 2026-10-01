@@ -10,7 +10,7 @@ what to work on. **CAUSE** is the line as recorded, for reproducing one.
 
 Regenerate with `./mspec/causes.sh` (reads `mspec/tags/`, no sweep).
 
-Classified: 186 files.
+Classified: 188 files.
 
 ## CRASH — 3 files, 2 kinds
 
@@ -28,7 +28,7 @@ Classified: 186 files.
 
 </details>
 
-## DIFF — 183 files, 88 kinds
+## DIFF — 185 files, 88 kinds
 
 | files | kind |
 |---|---|
@@ -39,12 +39,12 @@ Classified: 186 files.
 | 7 | `FAILED expected "S"TMPDIR` |
 | 6 | `FAILED expected [:@ivar], got []` |
 | 6 | `FAILED expected N, got N` |
+| 6 | `ERROR NotImplementedError` |
 | 5 | `FAILED matcher did not match #<OBJ>` |
 | 5 | `FAILED expected truthy from #include?` |
 | 5 | `FAILED expected true, got false` |
 | 4 | `ERROR TypeError` |
 | 4 | `ERROR SyntaxError` |
-| 4 | `ERROR NotImplementedError` |
 | 4 | `ERROR ArgumentError` |
 | 3 | `FAILED expected not to be identical` |
 | 3 | `FAILED expected N, got nil` |

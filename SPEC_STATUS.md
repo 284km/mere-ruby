@@ -84,7 +84,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/fiber | 11 | 1 | 0 | 1 | 0 | 13 |
 | core/dir | 32 | 0 | 0 | 2 | 0 | 34 |
-| core/file | 60 | 6 | 0 | 2 | 0 | 68 |
+| core/file | 59 | 7 | 0 | 2 | 0 | 68 |
 | core/time | 58 | 5 | 0 | 3 | 0 | 66 |
 | core/io | 76 | 4 | 0 | 1 | 0 | 81 |
 | library/date | 60 | 0 | 0 | 38 | 0 | 98 |
@@ -112,7 +112,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/enumerator/lazy | 29 | 0 | 0 | 0 | 1 | 30 |
 | core/enumerator/product | 6 | 0 | 0 | 0 | 0 | 6 |
 | core/file/constants | 1 | 0 | 0 | 0 | 0 | 1 |
-| core/file/stat | 39 | 1 | 0 | 3 | 0 | 43 |
+| core/file/stat | 38 | 2 | 0 | 3 | 0 | 43 |
 | core/gc/profiler | 5 | 0 | 0 | 2 | 0 | 7 |
 | core/io/buffer | 19 | 2 | 0 | 1 | 0 | 22 |
 | core/marshal | 4 | 2 | 0 | 0 | 0 | 6 |
