@@ -43,7 +43,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/exception | 34 | 5 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 47 | 0 | 0 | 3 | 0 | 50 |
-| core/integer | 59 | 0 | 0 | 9 | 2 | 70 |
+| core/integer | 59 | 1 | 0 | 9 | 1 | 70 |
 | core/kernel | 85 | 20 | 0 | 12 | 1 | 118 |
 | core/matchdata | 28 | 0 | 0 | 2 | 0 | 30 |
 | core/method | 18 | 4 | 0 | 4 | 0 | 26 |
