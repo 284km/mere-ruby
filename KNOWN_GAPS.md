@@ -68,6 +68,29 @@ schoolbook on base-10000 limbs, and the squarings of a 24-million-digit
 power (`4r**40000000`, test_rational) would take hours. Refusing is the
 error a program can see.
 
+## A deep repeat of a starred group overflows the regexp matcher's stack
+
+```ruby
+Regexp.new('^([0-9a-zA-Z\-/]*){1,256}$').match?("test1-test2-test3-test4-test_5")
+# ruby: false; here: "stack overflow (recursion too deep)", and the process ends
+```
+
+The matcher backtracks by recursion, and a bounded repeat of a group that can
+match empty nests a frame per iteration per position. ruby answers through
+its match cache. test_regexp's test_cache_opcodes_initialize asks, and the
+file stops there.
+
+## A child Ruby is spawned as `./ruby`
+
+`RbConfig.ruby` is answered by the interpreter and `defined?(RbConfig.ruby)`
+is nil, so tool/lib's `EnvUtil.rubybin` falls back to "ruby" and sets
+`CONFIG['bindir']` to "."; the built-in `RbConfig.ruby` then answers
+"./ruby" ahead of envutil's own `attr_reader`. Every test that starts a child
+interpreter (`assert_in_out_err`, `EnvUtil.invoke_ruby`) fails with
+`Errno::ENOENT - ./ruby` -- 24 of test_exception's 49 errors. Fixing it means
+`defined?` seeing the method, a program's singleton method winning over the
+built-in one, and an answer that names this interpreter.
+
 ## Ractor runs sequentially: one thread of control, no isolation
 
 ```ruby

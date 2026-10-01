@@ -5653,6 +5653,18 @@ and rng_bs_int = fn world -> fn encl -> fn theblk -> fn (lo: int) -> fn (hi: int
     else if verd == 0 then rng_bs_int world encl theblk lo (mid - 1) mid true
     else if verd == 5 then rng_bs_int world encl theblk lo (mid - 1) best found
     else rng_bs_int world encl theblk (mid + 1) hi best found
+// ...the same search with bignum bounds, on decimal strings
+and rng_bs_big = fn world -> fn encl -> fn theblk -> fn (lo: str) -> fn (hi: str) -> fn (best: str) -> fn (found: bool) ->
+  if big_cmp_s lo hi > 0 then (if found then (norm_big best, false, VNil) else (VNil, false, VNil))
+  else
+    let mid = big_add_s lo (big_div_s (big_sub_s hi lo) "2") in
+    let (verd, extra) = rng_bs_ask world encl theblk (norm_big mid) in
+    if verd == 3 then (VNil, true, extra)
+    else if verd == 4 then rng_bs_type_err world extra
+    else if verd == 2 then (norm_big mid, false, VNil)
+    else if verd == 0 then rng_bs_big world encl theblk lo (big_sub_s mid "1") mid true
+    else if verd == 5 then rng_bs_big world encl theblk lo (big_sub_s mid "1") best found
+    else rng_bs_big world encl theblk (big_add_s mid "1") hi best found
 // an endless integer end has no bound to halve, so one is PROBED outward --
 // beg+1, beg+2, beg+4 ... -- until the block stops sending the search right.
 and rng_bs_int_probe = fn world -> fn encl -> fn theblk -> fn (beg: int) -> fn (w: int) -> fn (n: int) ->
@@ -5789,6 +5801,16 @@ and rng_bsearch = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (hi: Va
         let hi_ord = (if excl then flt_ord hif0 - 1 else flt_ord hif0) in
         if lo_ord > hi_ord then (VNil, false, VNil)
         else rng_bs_ord world encl theblk lo_ord hi_ord 0 false 80))
+  // ⚠ a BIGNUM bound is bisected as a bignum. It was read with int_of_str,
+  //   which does not fit, and `(-2**100..-123456789).bsearch { true }` bisected
+  //   the wrapped value without end (test_range's bsearch_for_floats).
+  else if (match lo with VBig _ -> true | _ -> false)
+          || (if hi_endless then false else (match hi with VBig _ -> true | _ -> false)) then
+    (let los = (match lo with VBig b -> b | VInt n -> str_of_int n | _ -> "0") in
+     let his0 = (match hi with VBig b -> b | VInt n -> str_of_int n | _ -> "0") in
+     let his = (if excl then big_sub_s his0 "1" else his0) in
+     if hi_endless then (VNil, false, VNil)
+     else rng_bs_big world encl theblk los his "0" false)
   else
     (let loi = (match lo with VNil -> 0 - int_max | VInt n -> n | VBig b -> int_of_str b | _ -> 0) in
      let hii = (if hi_endless then rng_bs_int_probe world encl theblk loi 1 62
@@ -6526,7 +6548,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
               | VInt b -> iter_each_result (range_down world encl theblk (if excl then b - 1 else b) (0 - int_max)) recv
               | _ -> raise_exc world "TypeError" "can't iterate from NilClass")
            | _ ->
-             (if rng_is_int lo && rng_is_int hi then
+             // (an exclusive range that ends where it begins is empty BEFORE
+             // the end is stepped back: `hi - 1` at int64's minimum is its
+             // maximum, and `(-2**63...-2**63).reverse_each` walked all of it)
+             (if rng_is_int lo && rng_is_int hi && excl && rng_int hi <= rng_int lo then
+                iter_each_result (FNext VNil) recv
+              else if rng_is_int lo && rng_is_int hi then
                 iter_each_result (range_down world encl theblk (if excl then rng_int hi - 1 else rng_int hi) (rng_int lo)) recv
               // a non-integer begin with an integer end is ruby's odd one out:
               // the message names the END ("can't iterate from Integer")
@@ -6581,6 +6608,15 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
      // Range#__step_generic in the prelude. (Numbers and Strings keep their
      // own walks below.)
      else if (str_len name == 4 && str_eq name "step") && (match lo with VObj _ -> true | _ -> false) then
+       (let benv9 = (match encl with (_, _, _, e7) -> e7) in
+        invoke_with_block benv9 world encl recv "__step_generic" args theblk)
+     // ...and so does a RATIONAL step between integer bounds: ruby adds it,
+     // so `(1..3).step(1r)` yields 1, (2/1), (3/1). The integer walk asked for
+     // an Integer step and raised. (A Float bound makes it a Float walk, below.)
+     else if (str_len name == 4 && str_eq name "step")
+             && (match args with Cons (VRat (_, _), _) -> true | _ -> false)
+             && (match lo with VFlt _ -> false | VNil -> false | _ -> true)
+             && (match hi with VFlt _ -> false | _ -> true) then
        (let benv9 = (match encl with (_, _, _, e7) -> e7) in
         invoke_with_block benv9 world encl recv "__step_generic" args theblk)
      else if (str_len name == 4 && str_eq name "step")
@@ -6642,6 +6678,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then
           iter_result (range_map world encl theblk a int_max Nil) recv
         else builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args)
+     // (an exclusive end at int64's minimum has nothing below it to step back
+     // to: `hi - 1` would be the maximum, and `(-2**63...-2**63).each` walked
+     // every int64 -- see reverse_each)
+     else if rng_is_int lo && rng_is_int hi && excl && rng_int hi == 0 - int_max - 1 then
+       (if (str_len name == 4 && str_eq name "each") || (str_len name == 4 && str_eq name "step") then iter_each_result (FNext VNil) recv
+        else builtin_iter world encl theblk (arr_new Nil) name args)
      else if rng_is_int lo && rng_is_int hi then
        (let last = (if excl then rng_int hi - 1 else rng_int hi) in
         if (str_len name == 4 && str_eq name "each") then iter_each_result (range_each world encl theblk (rng_int lo) last) recv
@@ -9036,7 +9078,16 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
                   else if str_len raw9 >= 7 && str_eq (substring raw9 0 7) "Struct_" then ""
                   else raw9 ++ " ") in
        let ms = (match map_get struct_mem mc9 with VArr aid -> deref aid | _ -> Nil) in
-       "#<struct " ++ nm9 ++ struct_fields env world oid ms "" ++ ">")
+       // ⚠ a struct that holds itself recursed until the stack died
+       //   (test_struct's `o.a = o`): ruby prints the class path and "..."
+       //   there, the path of an anonymous one being `#<Class:0x..>`.
+       if map_has insp_seen ("o" ++ str_of_int oid) then
+         "#<struct " ++ cls_display world cls ++ ":...>"
+       else
+         (let _ = map_set insp_seen ("o" ++ str_of_int oid) 1 in
+          let r9 = "#<struct " ++ nm9 ++ struct_fields env world oid ms "" ++ ">" in
+          let _ = map_delete insp_seen ("o" ++ str_of_int oid) in
+          r9))
     // Ruby's default: `#<ClassName:0xADDR>`, and with instance variables
     // `#<C:0xADDR @a=1, @b="x">`. This printed `#<object>` for every object of
     // every class, which is the one thing an inspect is for -- telling them
@@ -9503,6 +9554,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          | Nil -> true
          | Cons (VInt _, _) -> true | Cons (VFlt _, _) -> true | Cons (VBig _, _) -> true
          | Cons (VHsh _, _) -> true
+         // ...a Rational is one: `(1..Float::INFINITY).step(1r)` went to the
+         // leaf, which materialized the endless range until the stack died
+         | Cons (VRat (_, _), _) -> true
          | _ -> false)
      && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true))
   then aseq_of world recv0 args0
@@ -10679,7 +10733,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       (let r2 = (if responds world h "to_ary"
                                  then invoke_val_c env world noblk h "to_ary" Nil false else VNil) in
                        match r2 with
-                       | VArr aid -> sub aid e0
+                       // ⚠ the recursion is the OBJECT's, as ruby keys it: a
+                       //   #to_ary that answers a fresh `[self]` is a new
+                       //   array every time, so the array check never fired
+                       //   and the join recursed until the stack died
+                       | VArr aid ->
+                         (if map_has seen ("o" ++ str_of_int oid)
+                          then (let _ = raise_exc world "ArgumentError" "recursive array join" in e0)
+                          else (let _ = map_set seen ("o" ++ str_of_int oid) VNil in
+                                let r9 = sub aid e0 in
+                                let _ = map_delete seen ("o" ++ str_of_int oid) in r9))
                        | _ ->
                          (let (m2, s2, ocls2, iv2) = world in
                           let cls = map_get ocls2 oid in
@@ -29685,7 +29748,11 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
       (if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
        else
          let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode in
-         (if w < 0 then rb_fmt_dir env world fmt j args na2 m2 (flags ++ "-") (0 - w) true prec pset pos
+         // (a negative width is a left-justified one, and negating INT_MIN
+         // does not fit an int: ruby's "width too big", where this padded
+         // 2^31 spaces and ran out of stack)
+         (if w < 0 && 0 - w > 2147483647 then (let _ = prim_raise "ArgumentError" "width too big" in ("", j, na2, m2))
+          else if w < 0 then rb_fmt_dir env world fmt j args na2 m2 (flags ++ "-") (0 - w) true prec pset pos
           else rb_fmt_dir env world fmt j args na2 m2 flags w true prec pset pos))
     else if str_eq c "." then
       (if pset then (let _ = prim_raise "ArgumentError" "precision given twice" in ("", i, nextarg, mode))
