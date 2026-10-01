@@ -90,8 +90,11 @@ let str_tr = fn (s: str) -> fn (from0: str) -> fn (to0: str) ->
   let to = str_expand_set to0 0 "" in
   let tn = str_len to in
   let tcn = utf8_len to in
-  let rec go = fn (i: int) -> fn (acc: str) ->
-    if i >= str_len s then acc
+  // (into a StrBuf: `acc ++ c` per character copied the result so far --
+  // tr, delete and squeeze alike)
+  let gb = strbuf_new () in
+  let rec go = fn (i: int) ->
+    if i >= str_len s then ()
     else
       let c = utf8_char_at s i in
       let k = char_pos_r from c in
@@ -101,40 +104,49 @@ let str_tr = fn (s: str) -> fn (from0: str) -> fn (to0: str) ->
                             else if k >= tcn then utf8_char to (tcn - 1)
                             else utf8_char to k)
                else c in
-      go (i + utf8_clen s i) (acc ++ nc) in
-  go 0 "";
+      let _ = strbuf_push gb nc in
+      go (i + utf8_clen s i) in
+  let _ = go 0 in
+  strbuf_to_str gb;
 let str_count_sets = fn (s: str) -> fn (sets: str list) ->
   let rec go = fn (i: int) -> fn (n: int) ->
     if i >= str_len s then n
     else go (i + utf8_clen s i) (if all_sets_has sets (utf8_char_at s i) then n + 1 else n) in
   go 0 0;
 let str_delete_sets = fn (s: str) -> fn (sets: str list) ->
-  let rec go = fn (i: int) -> fn (acc: str) ->
-    if i >= str_len s then acc
+  let gb = strbuf_new () in
+  let rec go = fn (i: int) ->
+    if i >= str_len s then ()
     else let c = utf8_char_at s i in
-         go (i + utf8_clen s i) (if all_sets_has sets c then acc else acc ++ c) in
-  go 0 "";
+         let _ = (if all_sets_has sets c then () else strbuf_push gb c) in
+         go (i + utf8_clen s i) in
+  let _ = go 0 in
+  strbuf_to_str gb;
 // collapse runs of the same character (optionally only those in `set`).
 let str_squeeze = fn (s: str) -> fn (set0: str) -> fn (use_set: bool) ->
-  let rec go = fn (i: int) -> fn (prev: str) -> fn (acc: str) ->
-    if i >= str_len s then acc
+  let gb = strbuf_new () in
+  let rec go = fn (i: int) -> fn (prev: str) ->
+    if i >= str_len s then ()
     else
       let c = utf8_char_at s i in
       let w = utf8_clen s i in
-      if str_eq c prev && (if use_set then str_set_has set0 c else true) then go (i + w) c acc
-      else go (i + w) c (acc ++ c) in
-  go 0 "" "";
+      if str_eq c prev && (if use_set then str_set_has set0 c else true) then go (i + w) c
+      else (let _ = strbuf_push gb c in go (i + w) c) in
+  let _ = go 0 "" in
+  strbuf_to_str gb;
 // squeeze against SEVERAL set arguments: ruby intersects them, exactly as
 // count and delete do.
 let str_squeeze_sets = fn (s: str) -> fn (sets: str list) ->
-  let rec go = fn (i: int) -> fn (prev: str) -> fn (acc: str) ->
-    if i >= str_len s then acc
+  let gb = strbuf_new () in
+  let rec go = fn (i: int) -> fn (prev: str) ->
+    if i >= str_len s then ()
     else
       let c = utf8_char_at s i in
       let w = utf8_clen s i in
-      if str_eq c prev && all_sets_has sets c then go (i + w) c acc
-      else go (i + w) c (acc ++ c) in
-  go 0 "" "";
+      if str_eq c prev && all_sets_has sets c then go (i + w) c
+      else (let _ = strbuf_push gb c in go (i + w) c) in
+  let _ = go 0 "" in
+  strbuf_to_str gb;
 // tr, but consecutive characters TRANSLATED to the same character collapse
 // to one; an untranslated duplicate stays ("hello".tr_s("el","hx") keeps the
 // h that was already an h and squeezes only the translated xx).
@@ -953,8 +965,34 @@ let rec val_min = fn (xs: Val list) -> fn (best: Val) ->
 let rec val_max = fn (xs: Val list) -> fn (best: Val) ->
   match xs with Nil -> best | Cons (h, t) -> val_max t (if cmp_vals h best > 0 then h else best);
 
-let rec val_sum = fn (xs: Val list) -> fn (acc: Val) ->
-  match xs with Nil -> acc | Cons (h, t) -> val_sum t (arith_bin "+" acc h);
+let rec val_sum_go = fn (xs: Val list) -> fn (acc: Val) ->
+  match xs with Nil -> acc | Cons (h, t) -> val_sum_go t (arith_bin "+" acc h);
+// Strings of the init's own encoding are one concatenation into a StrBuf: the
+// fold made (and kept) a new String per element -- `a.sum("")` over 40,000
+// strings reached 6 GB inside the one call, where nothing is collected.
+let val_sum = fn (xs: Val list) -> fn (acc: Val) ->
+  match acc with
+  | VStr ih ->
+    (let e9 = enc_canon_name (senc_get ih) in
+     let rec same = fn (zs: Val list) ->
+       (match zs with
+        | Nil -> true
+        // (a US-ASCII piece onto an ASCII-compatible init keeps the init's
+        // encoding, as String#+ does: `"" + 1.to_s` is UTF-8)
+        | Cons (VStr h9, t9) ->
+          (let pe9 = enc_canon_name (senc_get h9) in
+           (str_eq pe9 e9 || (str_eq pe9 "US-ASCII" && enc_ascii_compat e9)) && same t9)
+        | _ -> false) in
+     if same xs then
+       (let b9 = strbuf_new () in
+        let _ = strbuf_push b9 (sget ih) in
+        let rec put = fn (zs: Val list) -> (match zs with Cons (VStr h9, t9) -> (let _ = strbuf_push b9 (sget h9) in put t9) | _ -> ()) in
+        let _ = put xs in
+        let r9 = mkstr (strbuf_to_str b9) in
+        let _ = (match r9 with VStr rh -> senc_set rh (senc_get ih) | _ -> ()) in
+        r9)
+     else val_sum_go xs acc)
+  | _ -> val_sum_go xs acc;
 
 // hash (VHsh flat [k1,v1,k2,v2,...]) accessors.
 let rec hash_keys = fn (xs: Val list) ->
