@@ -63,20 +63,25 @@ wall="${UNITTEST_WALL:-300}"
 seed="${UNITTEST_SEED:-1}"
 stdlib="$("$ref" -e 'print(([RbConfig::CONFIG["rubylibdir"]] + Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort).join(":"))')"
 
-if [ "$#" -eq 0 ]; then
-  set -- $(grep -v '^#' "$here/files.txt" | grep -v '^$')
-fi
-list="$(mktemp)"; trap 'rm -f "$list"' EXIT
-for p in "$@"; do
-  if [ -d "$src/test/$p" ]; then
-    # (test_helper.rb is a helper by that name, not a test file)
-    (cd "$src/test" && find "$p" -maxdepth 1 \( -name '*_test.rb' -o -name 'test_*.rb' \) ! -name 'test_helper.rb' -type f | sort) >> "$list"
-  elif [ -f "$src/test/$p" ]; then
-    echo "$p" >> "$list"
-  else
-    echo "unittest: no test/$p in $src" >&2
+if [ "${1:-}" != "--one" ]; then
+  if [ "$#" -eq 0 ]; then
+    set -- $(grep -v '^#' "$here/files.txt" | grep -v '^$' | grep -v '^-')
   fi
-done
+  list="$(mktemp)"; trap 'rm -f "$list"' EXIT
+  for p in "$@"; do
+    if [ -d "$src/test/$p" ]; then
+      # (test_helper.rb is a helper by that name, not a test file)
+      (cd "$src/test" && find "$p" -maxdepth 1 \( -name '*_test.rb' -o -name 'test_*.rb' \) ! -name 'test_helper.rb' -type f | sort) >> "$list"
+    elif [ -f "$src/test/$p" ]; then
+      echo "$p" >> "$list"
+    else
+      echo "unittest: no test/$p in $src" >&2
+    fi
+  done
+  # files.txt may take a file back out of a directory it named: `-ruby/test_x.rb`
+  grep '^-' "$here/files.txt" | sed 's/^-//' > "$list.x"
+  grep -v -x -F -f "$list.x" "$list" > "$list.k"; mv -f "$list.k" "$list"; rm -f "$list.x"
+fi
 
 runner='
   my ($wall, @cmd) = @ARGV;
@@ -99,25 +104,12 @@ verdicts() {
     END { for (n in ran) print n "\t" ((n in bad) ? bad[n] : ".") }' | sort -u
 }
 
-mkdir -p "$here/tags"
-status="$here/STATUS.md.$$"
-tm=0; tr=0; tb=0; tx=0; tt=0
-{
-  echo "# mere-ruby — CRuby's own tests"
-  echo
-  echo "CRuby's test/ files at the reference's release, run under mere-ruby and under"
-  echo "ruby $REF_RUBY_VERSION test by test (\`unittest/run.sh\`). A second yardstick beside"
-  echo "SPEC_STATUS.md: ruby/spec asks what the language and core classes do; these are the"
-  echo "tests CRuby itself keeps, with the framework it keeps them in (tool/lib)."
-  echo
-  echo "- **MATCH** both passed · **RED** ruby passed, mere-ruby did not (failed, errored,"
-  echo "  or never reached it) · **BOTH** neither passed (ruby's own failures here) ·"
-  echo "  **EXTRA** only mere-ruby passed"
-  echo
-  echo "| file | tests | MATCH | RED | BOTH | EXTRA |"
-  echo "|---|---|---|---|---|---|"
-} > "$status"
-while read -r rel; do
+# ONE FILE, both sides -- the unit the loop below hands out, as
+# `run.sh <src> --one <work> <n> <rel>`. It writes the file's tag and a row,
+# <work>/<n>.row ("tests match red both extra"); the table is assembled from
+# the rows in list order, so how many files ran at once does not show in it.
+if [ "${1:-}" = "--one" ]; then
+  work="$2"; n="$3"; rel="$4"
   dir="$src/test/$(dirname "$rel")"; base="$(basename "$rel")"
   ro="$(cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
   mo="$(cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
@@ -139,6 +131,39 @@ while read -r rel; do
   set -- $counts
   [ -s "$tag" ] || rm -f "$tag"
   [ -f "$tag" ] && { strip_noise < "$tag" > "$tag.m" && mv "$tag.m" "$tag"; }
+  printf '%s %s %s %s %s\n' "$1" "$2" "$3" "$4" "$5" > "$work/$n.row"
+  exit 0
+fi
+
+# ⚠ UNITTEST_JOBS files at once (default 1). Each file is two processes,
+#   and a mere-ruby run can take a few GB, so this is a number for the machine
+#   and not for the record: the verdicts are per test and do not depend on it.
+jobs="${UNITTEST_JOBS:-1}"
+work="$(mktemp -d)"; trap 'rm -f "$list"; rm -rf "$work"' EXIT
+mkdir -p "$here/tags"
+awk '{ print NR " " $0 }' "$list" | xargs -n 2 -P "$jobs" sh "$0" "$src" --one "$work"
+status="$here/STATUS.md.$$"
+tm=0; tr=0; tb=0; tx=0; tt=0
+{
+  echo "# mere-ruby — CRuby's own tests"
+  echo
+  echo "CRuby's test/ files at the reference's release, run under mere-ruby and under"
+  echo "ruby $REF_RUBY_VERSION test by test (\`unittest/run.sh\`). A second yardstick beside"
+  echo "SPEC_STATUS.md: ruby/spec asks what the language and core classes do; these are the"
+  echo "tests CRuby itself keeps, with the framework it keeps them in (tool/lib)."
+  echo
+  echo "- **MATCH** both passed · **RED** ruby passed, mere-ruby did not (failed, errored,"
+  echo "  or never reached it) · **BOTH** neither passed (ruby's own failures here) ·"
+  echo "  **EXTRA** only mere-ruby passed"
+  echo
+  echo "| file | tests | MATCH | RED | BOTH | EXTRA |"
+  echo "|---|---|---|---|---|---|"
+} > "$status"
+i=0
+while read -r rel; do
+  i=$((i + 1))
+  [ -f "$work/$i.row" ] || { echo "unittest: no result for $rel" >&2; continue; }
+  set -- $(cat "$work/$i.row")
   printf '| %s | %s | %s | %s | %s | %s |\n' "$rel" "$1" "$2" "$3" "$4" "$5" >> "$status"
   printf '%-48s %4s tests  MATCH %4s  RED %4s  BOTH %3s  EXTRA %3s\n' "$rel" "$1" "$2" "$3" "$4" "$5"
   tt=$((tt + $1)); tm=$((tm + $2)); tr=$((tr + $3)); tb=$((tb + $4)); tx=$((tx + $5))
