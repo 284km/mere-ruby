@@ -425,67 +425,74 @@ let str_rblen = fn (hid: int) ->
         cnt 0 0);
 // encode codepoints to the target; second tuple element is false on an
 // undefined conversion (a codepoint the target can't represent).
-let rec encode_cps = fn (cps: int list) -> fn (to: str) -> fn (acc: str) ->
+// ⚠ THE BYTES GO INTO A StrBuf. `encode_cps t to (acc ++ c)` built a new string
+//   of the whole output for every codepoint, so encoding n characters copied
+//   n^2/2 bytes: test_transcode's 200,000 euro signs reached 5 GB in two
+//   seconds. encode_cps keeps its signature (acc in, bytes and ok out).
+let rec encode_cps_go = fn (cps: int list) -> fn (to: str) -> fn b ->
   match cps with
-  | Nil -> (acc, true)
+  | Nil -> true
   | Cons (cp, t) ->
     (let tu = enc_up to in
-     if str_eq tu "UTF-8" then encode_cps t to (acc ++ utf8_enc cp)
-     else if enc_is_utf16 to then encode_cps t to (acc ++ utf16_enc cp (enc_utf16_be to))
-     else if enc_is_utf32 to then encode_cps t to (acc ++ utf32_enc cp (str_eq tu "UTF-32BE"))
+     let put = fn (x: str) -> (let _ = strbuf_push b x in encode_cps_go t to b) in
+     if str_eq tu "UTF-8" then put (utf8_enc cp)
+     else if enc_is_utf16 to then put (utf16_enc cp (enc_utf16_be to))
+     else if enc_is_utf32 to then put (utf32_enc cp (str_eq tu "UTF-32BE"))
      // the BOM-carrying names write big-endian with a leading BOM.
      else if str_eq tu "UTF-16" then
-       (match encode_cps cps "UTF-16BE" "" with
-        | (bytes, ok) -> ((if str_eq acc "" then "" else acc) ++ chr 254 ++ chr 255 ++ bytes, ok))
+       (let _ = strbuf_push b (chr 254 ++ chr 255) in encode_cps_go cps "UTF-16BE" b)
      else if str_eq tu "UTF-32" then
-       (match encode_cps cps "UTF-32BE" "" with
-        | (bytes, ok) -> ((if str_eq acc "" then "" else acc) ++ chr 0 ++ chr 0 ++ chr 254 ++ chr 255 ++ bytes, ok))
+       (let _ = strbuf_push b (chr 0 ++ chr 0 ++ chr 254 ++ chr 255) in encode_cps_go cps "UTF-32BE" b)
      else if str_eq tu "EUC-JP" || str_eq tu "SHIFT_JIS" || str_eq tu "WINDOWS-31J" then
-       (if cp < 0 then (acc, false)
-        else if cp < 128 then encode_cps t to (acc ++ chr cp)
+       (if cp < 0 then false
+        else if cp < 128 then put (chr cp)
         else if cp >= 65377 && cp <= 65439 then
-          encode_cps t to (acc ++ (if str_eq tu "EUC-JP" then chr 142 ++ chr (cp - 65377 + 161) else chr (cp - 65377 + 161)))
+          put (if str_eq tu "EUC-JP" then chr 142 ++ chr (cp - 65377 + 161) else chr (cp - 65377 + 161))
         else
           let pair = jis_u2e_pair (utf8_enc cp) in
-          (if str_eq pair "" then (acc, false)
+          (if str_eq pair "" then false
            else
              let e1 = jis_hex pair 0 2 0 in
              let e2 = jis_hex pair 2 4 0 in
-             encode_cps t to (acc ++ (if str_eq tu "EUC-JP" then chr e1 ++ chr e2 else sjis_of_jis (e1 - 128) (e2 - 128)))))
+             put (if str_eq tu "EUC-JP" then chr e1 ++ chr e2 else sjis_of_jis (e1 - 128) (e2 - 128))))
      else if str_eq tu "ISO-2022-JP" then
        // stateful JIS: ASCII bytes as-is, JIS X 0208 pairs inside
        // ESC $ B ... ESC ( B mode switches, closed back to ASCII at the end.
-       (let rec go2 = fn (xs: int list) -> fn (mode: int) -> fn (a2: str) ->
+       (let rec go2 = fn (xs: int list) -> fn (mode: int) ->
           (match xs with
-           | Nil -> (a2 ++ (if mode == 1 then chr 27 ++ "(B" else ""), true)
+           | Nil -> (let _ = (if mode == 1 then strbuf_push b (chr 27 ++ "(B") else ()) in true)
            | Cons (cp2, t2) ->
              if cp2 >= 0 && cp2 < 128 then
-               go2 t2 0 (a2 ++ (if mode == 1 then chr 27 ++ "(B" else "") ++ chr cp2)
+               (let _ = (if mode == 1 then strbuf_push b (chr 27 ++ "(B") else ()) in
+                let _ = strbuf_push b (chr cp2) in go2 t2 0)
              else
                let pair = jis_u2e_pair (utf8_enc cp2) in
-               (if str_eq pair "" then (a2, false)
+               (if str_eq pair "" then false
                 else
                   let e1 = jis_hex pair 0 2 0 in
                   let e2 = jis_hex pair 2 4 0 in
-                  go2 t2 1 (a2 ++ (if mode == 0 then chr 27 ++ "$B" else "")
-                            ++ chr (e1 - 128) ++ chr (e2 - 128)))) in
-        match go2 cps 0 "" with (bytes, ok) -> (acc ++ bytes, ok))
+                  let _ = (if mode == 0 then strbuf_push b (chr 27 ++ "$B") else ()) in
+                  let _ = strbuf_push b (chr (e1 - 128) ++ chr (e2 - 128)) in
+                  go2 t2 1)) in
+        go2 cps 0)
      else if str_eq tu "ISO-8859-15" then
-       (let b = cp_to_iso15 cp in
-        if b < 0 then (acc, false) else encode_cps t to (acc ++ chr b))
+       (let c9 = cp_to_iso15 cp in if c9 < 0 then false else put (chr c9))
      else if str_eq tu "ISO-8859-9" then
-       (let b = cp_to_iso9 cp in
-        if b < 0 then (acc, false) else encode_cps t to (acc ++ chr b))
+       (let c9 = cp_to_iso9 cp in if c9 < 0 then false else put (chr c9))
      else if str_eq tu "IBM437" || str_eq tu "CP437" then
-       (let b = cp_to_ibm437 cp in
-        if b < 0 then (acc, false) else encode_cps t to (acc ++ chr b))
+       (let c9 = cp_to_ibm437 cp in if c9 < 0 then false else put (chr c9))
      // ISO-8859-1 is the only single-byte target whose upper half this knows;
      // for any other name only ASCII is safe, because ASCII is the one range
      // every ASCII-compatible encoding agrees on. Above that, refuse: emitting
      // the codepoint as one byte is what made Shift_JIS "work" by accident.
      else if cp <= (if str_eq tu "ISO-8859-1" || str_eq tu "ASCII-8BIT" || str_eq tu "BINARY" then 255 else 127)
-     then encode_cps t to (acc ++ chr cp)
-     else (acc, false));
+     then put (chr cp)
+     else false);
+let encode_cps = fn (cps: int list) -> fn (to: str) -> fn (acc: str) ->
+  let b = strbuf_new () in
+  let _ = strbuf_push b acc in
+  let ok = encode_cps_go cps to b in
+  (strbuf_to_str b, ok);
 let enc_canon = fn (nm: str) -> if str_eq nm "BINARY" || str_eq nm "binary" then "ASCII-8BIT" else nm;
 // the encodings CRuby has no converter for in either direction:
 // `Encoding::Converter.new(e, "UTF-8")` and the reverse refuse every one of
@@ -1233,21 +1240,45 @@ let check_radix = fn (b: int) ->
   if b < 2 || b > 36 then
     (let _ = prim_raise "ArgumentError" ("invalid radix " ++ str_of_int b) in 0)
   else b;
-let int_to_base = fn (n: int) -> fn (base: int) ->
+let rec int_to_base = fn (n: int) -> fn (base: int) ->
   if n == 0 then "0"
+  // (int64's minimum has no positive twin: negating it wraps, and
+  // `(-2**63).to_s(2)` came out as punctuation)
+  else if n == int_min then "-" ++ int_to_base_go (0 - (n / base)) base "" ++ int_to_base (0 - (n - (n / base) * base)) base
   else if n < 0 then "-" ++ int_to_base_go (0 - n) base ""
   else int_to_base_go n base "";
 // a bignum's decimal digit string (optionally "-" prefixed) rendered in
 // base N, by repeated division; the divisor is one digit wide so each step
 // is a single big_divmod_s. Integer#to_s(base) fed a VBig used to answer in
 // decimal no matter what base it was asked for.
-let rec big_to_base_go = fn (v: str) -> fn (bs: str) -> fn (base: int) -> fn (acc: str) ->
-  if str_eq v "0" then (if str_eq acc "" then "0" else acc)
-  else (match big_divmod_s v bs with (q, r) -> big_to_base_go q bs base (int_to_base (int_of_str r) base ++ acc));
+// (k digits at a time: the largest power of the base under 2^40 is divided
+// off the limbs per pass, where one digit and a new string per step made
+// `(2**200000).to_s(16)` a 3.5 GB question)
 let big_to_base_s = fn (s0: str) -> fn (base: int) ->
   let neg = str_len s0 > 0 && str_eq (substring s0 0 1) "-" in
-  let s = (if neg then substring s0 1 (str_len s0) else s0) in
-  (if neg then "-" else "") ++ big_to_base_go s (int_to_base base 10) base "";
+  let s = mag_strip (if neg then substring s0 1 (str_len s0) else s0) 0 in
+  if str_eq s "0" || str_eq s "" then "0"
+  else
+    (let rec pk = fn (p: int) -> fn (k: int) -> if p * base > limb_chunk then (p, k) else pk (p * base) (k + 1) in
+     let (p, k) = pk base 1 in
+     let v = mag_limbs s in
+     let cs = vec_new () in
+     let rec take = fn (u: unit) -> if limbs_zero v then () else (let _ = vec_push cs (limbs_divsmall v p) in take ()) in
+     let _ = take () in
+     let out = strbuf_new () in
+     let _ = (if neg then strbuf_push out "-" else ()) in
+     let n = vec_len cs in
+     let _ = strbuf_push out (int_to_base (vec_get cs (n - 1)) base) in
+     let rec low = fn (j: int) ->
+       if j < 0 then ()
+       else
+         (let d = int_to_base (vec_get cs j) base in
+          let rec pad = fn (z: int) -> if z <= 0 then () else (let _ = strbuf_push out "0" in pad (z - 1)) in
+          let _ = pad (k - str_len d) in
+          let _ = strbuf_push out d in
+          low (j - 1)) in
+     let _ = low (n - 2) in
+     strbuf_to_str out);
 let rec int_digits_go = fn (n: int) -> fn (base: int) ->
   if n == 0 then Nil else Cons (VInt (n - (n / base) * base), int_digits_go (n / base) base);
 let int_digits = fn (n: int) -> fn (base: int) ->
@@ -1306,12 +1337,14 @@ let big_bit_length = fn (b: str) ->
   else
     // floor(d * log2 10) + 2 is strictly above the answer for every d, and
     // 3.3219281 is log2 10 rounded UP so the bound never falls short.
-    let k_hi = (str_len m * 33219281) / 10000000 + 2 in
-    let rec down = fn (k: int) -> fn (pw: str) ->
-      if k <= 1 then 1
-      else if mag_cmp pw m <= 0 then k
-      else down (k - 1) (big_div_s pw "2") in
-    down k_hi (two_pow_s (k_hi - 1));
+    // (forty bits at a time off the limbs: the power-of-two ladder this
+    // replaced halved a string as wide as the number at every bit)
+    let v = mag_limbs m in
+    let rec chunks = fn (c: int) -> fn (last: int) ->
+      if limbs_zero v then (c, last) else chunks (c + 1) (limbs_divsmall v limb_chunk) in
+    let (c, top) = chunks 0 0 in
+    let rec blen = fn (x: int) -> fn (n: int) -> if x == 0 then n else blen (bit_shr x 1) (n + 1) in
+    40 * (c - 1) + blen top 0;
 
 // digits: least significant first, like Integer#digits. Negative receivers
 // raise Math::DomainError in ruby, which the caller checks for.

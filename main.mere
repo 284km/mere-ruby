@@ -4006,9 +4006,15 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
         let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
         // a raise inside the tracer belongs to the ASSIGNMENT: ruby lets it
         // out, so the rescue around `$var = 100` is the one that sees it.
-        // The busy flag is cleared first, or the unwind would leave it set.
+        // ⚠ The busy flag stays up WHILE the tracer runs -- an assignment to
+        //   the same global inside it (`trace_var :$x, proc{$x *= 2}`) does not
+        //   call the tracer again -- and comes down on either way out. It used
+        //   to be cleared before the call, so that tracer recursed until the
+        //   machine ran out of memory (test_trace).
+        let ok9 = try_or (fn (u: unit) -> (let _ = run_block world nb (proc_as_block pid) (Cons (v, Nil)) in true)) false in
         let _ = map_delete trace_fn "gvbusy" in
-        let _ = run_block world nb (proc_as_block pid) (Cons (v, Nil)) in ())
+        if ok9 then ()
+        else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)"))
      // a String tracer is ruby source, evaluated at the top level
      | VStr sh ->
        (let fenv9 = map_new () in
@@ -5248,11 +5254,39 @@ and block_body_flow = fn cenv -> fn world -> fn encl -> fn (body: Stmt list) ->
 
       if str_eq k "break" then FBreak v
       else if str_eq k "next" then FLoopNext v
-      else if str_eq k "redo" then let _ = tick () in block_body_flow cenv world encl body
+      // ⚠ a `for` loop's redo does NOT re-bind the loop variable: the body is
+      //   a block whose first statement copies the hidden param into it, and
+      //   running that again undid `i -= 1; redo if i > 0` every time -- the
+      //   loop never ended (test_whileuntil's test_while).
+      else if str_eq k "redo" then let _ = tick () in block_body_flow cenv world encl (redo_from body)
       else if str_eq k "retry" then FRaise (raise_exc world "SyntaxError" "Invalid retry")
       else flow_rethrow k v
     else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: (ruby exception raised)")) in fail "mere-ruby: (ruby exception raised)")
   | other -> other
+
+// the body a `redo` restarts: past a `for` loop's prologue (the statements
+// that copy its hidden __for / __forv / __fN params into the loop variables)
+and redo_from = fn (body: Stmt list) ->
+  match body with
+  | Cons (st, t) -> if for_prologue_stmt st then redo_from t else body
+  | Nil -> body
+and for_hidden = fn (e: Expr) ->
+  match e with
+  | EVar h -> str_len h >= 3 && str_eq (substring h 0 3) "__f" && (if str_eq h "__fwd" then false else true)
+  | ESplat x -> for_hidden x
+  | _ -> false
+and for_prologue_stmt = fn (st: Stmt) ->
+  match st with
+  | SAssign (_, e) -> for_hidden e
+  | SIVarAssign (_, e) -> for_hidden e
+  | SMultiAssign (_, Cons (e, Nil)) -> for_hidden e
+  | SMultiAssignX (_, Cons (e, Nil)) -> for_hidden e
+  | SExpr (EMethod (_, _, args)) -> (match list_last_e args with Some e -> for_hidden e | None -> false)
+  | SExpr (ESafe (_, _, args)) -> (match list_last_e args with Some e -> for_hidden e | None -> false)
+  | SExpr (EScopedAssign (_, _, e)) -> for_hidden e
+  | _ -> false
+and list_last_e = fn (xs: Expr list) ->
+  match xs with Nil -> None | Cons (x, Nil) -> Some x | Cons (_, t) -> list_last_e t
 
 // deep scan for local-assignment targets (stops at def/class boundaries;
 // the hidden for-loop assignment is excluded so `for` keeps leaking).
@@ -7058,7 +7092,8 @@ and range_each = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: in
   if i > last then FNext VNil
   else (match run_block world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
-        | _ -> range_each world encl theblk (i + 1) last)
+        // (stop AT the last value: above int64's maximum is a wrap, see range_down)
+        | _ -> if i == last then FNext VNil else range_each world encl theblk (i + 1) last)
 
 // The step of an integer walk: an Integer, 1 when absent, and a TypeError for
 // anything else -- which is when ruby complains about `(1..2).step(Object.new)`:
@@ -7118,7 +7153,10 @@ and range_down = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: in
   if i < last then FNext VNil
   else (match run_block world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
-        | _ -> range_down world encl theblk (i - 1) last)
+        // (stop AT the last value rather than below it: below int64's
+        // minimum is a wrap to its maximum, and `(-2**63..-2**63).reverse_each`
+        // never ended -- test_range's single-point ranges)
+        | _ -> if i == last then FNext VNil else range_down world encl theblk (i - 1) last)
 
 // n.step(limit, by) { |i| }: by may be negative (descending).
 and range_step = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (limit: int) -> fn (by: int) ->
@@ -7131,7 +7169,8 @@ and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int
   if i > last then FNext (arr_new (val_rev acc Nil))
   else (match run_block world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
-        | f -> range_map world encl theblk (i + 1) last (Cons (flow_value f, acc)))
+        | f -> if i == last then FNext (arr_new (val_rev (Cons (flow_value f, acc)) Nil))
+               else range_map world encl theblk (i + 1) last (Cons (flow_value f, acc)))
 
 and arr_reduce = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (acc: Val) ->
   match xs with
@@ -8069,6 +8108,28 @@ and arr_sum_w = fn env -> fn world -> fn (xs: Val list) -> fn (init: Val) ->
   // elements and then add the init, which is the same rule when the init is a
   // number and the wrong one when it is not -- an object with a `+` was
   // refused for want of a #coerce it never needed.
+  // Strings of the init's own encoding, with String#+ as shipped, are the
+  // same concatenation done once into a StrBuf: the fold made a new String
+  // per element and kept every one (`a.map(&:to_s).sum("")` over 40,000 took
+  // 1.7 GB inside one call, where nothing is collected).
+  let all_same_enc9 = fn (e9: str) ->
+    (let rec chk = fn (zs: Val list) ->
+       (match zs with
+        | Nil -> true
+        | Cons (VStr h9, t9) -> str_eq (enc_canon_name (senc_get h9)) e9 && chk t9
+        | _ -> false) in
+     chk xs) in
+  if (match init with
+      | VStr ih -> (if prim_user_has world init "+" then false else true) && all_same_enc9 (enc_canon_name (senc_get ih))
+      | _ -> false) then
+    (let b9 = strbuf_new () in
+     let _ = (match init with VStr ih -> strbuf_push b9 (sget ih) | _ -> ()) in
+     let rec put9 = fn (zs: Val list) -> (match zs with Cons (VStr h9, t9) -> (let _ = strbuf_push b9 (sget h9) in put9 t9) | _ -> ()) in
+     let _ = put9 xs in
+     let r9 = mkstr (strbuf_to_str b9) in
+     let _ = (match (r9, init) with (VStr rh, VStr ih) -> senc_set rh (senc_get ih) | _ -> ()) in
+     r9)
+  else
   if (match init with VInt _ -> false | VFlt _ -> false | VBig _ -> false
                     | VRat (_, _) -> false | VCpx (_, _) -> false | _ -> true) then
     (let rec fold9 = fn (zs: Val list) -> fn (acc: Val) ->
@@ -9119,12 +9180,18 @@ and obj_ivar_dump_sel = fn env -> fn world -> fn (oid: int) -> fn (cls: str) -> 
 
 
 and ivar_dump_go = fn env -> fn world -> fn iv -> fn (oid: int) -> fn (names: str list) -> fn (acc: str) ->
-  match names with
-  | Nil -> acc
-  | Cons (n, t) ->
-    let v = map_get iv (str_of_int oid ++ "@" ++ n) in
-    ivar_dump_go env world iv oid t
-      (acc ++ (if str_eq acc "" then "" else ", ") ++ "@" ++ n ++ "=" ++ inspect_w env world v)
+  let b = strbuf_new () in
+  let _ = strbuf_push b acc in
+  let rec go = fn (ns: str list) -> fn (first: bool) ->
+    (match ns with
+     | Nil -> ()
+     | Cons (n, t) ->
+       (let v = map_get iv (str_of_int oid ++ "@" ++ n) in
+        let x = inspect_w env world v in
+        let _ = strbuf_push b ((if first then "" else ", ") ++ "@" ++ n ++ "=" ++ x) in
+        go t false)) in
+  let _ = go names (str_eq acc "") in
+  strbuf_to_str b
 
 and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> fn (acc: str) ->
   match ms with
@@ -9138,23 +9205,37 @@ and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> 
      struct_fields env world oid t (if str_eq acc "" then piece else acc ++ ", " ++ piece))
   | Cons (_, t) -> struct_fields env world oid t acc
 
+// ⚠ The three joiners below build into a StrBuf. Each used to extend `acc`
+//   by one element per step, copying everything joined so far: `p` of a
+//   40,000-element Array took 4 GB, and every assertion message test/unit
+//   builds goes through here.
 and join_inspect_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
-  match xs with
-  | Nil -> acc
-  | Cons (h, t) ->
-    let piece = if str_eq acc "" then inspect_w env world h else acc ++ ", " ++ inspect_w env world h in
-    join_inspect_w env world t piece
+  let b = strbuf_new () in
+  let _ = strbuf_push b acc in
+  let rec go = fn (ys: Val list) -> fn (first: bool) ->
+    (match ys with
+     | Nil -> ()
+     | Cons (h, t) ->
+       (let x = inspect_w env world h in
+        let _ = (if first then () else strbuf_push b ", ") in
+        let _ = strbuf_push b x in
+        go t false)) in
+  let _ = go xs (str_eq acc "") in
+  strbuf_to_str b
 
 and join_pairs_w = fn env -> fn world -> fn (xs: Val list) -> fn (acc: str) ->
-  match xs with
-  | Nil -> acc
-  | Cons (k, rest) ->
-    (match rest with
-     | Cons (v, t) ->
-       let pair = hash_key_prefix k (inspect_w env world k) ++ inspect_w env world v in
-       let acc2 = if str_eq acc "" then pair else acc ++ ", " ++ pair in
-       join_pairs_w env world t acc2
-     | Nil -> acc)
+  let b = strbuf_new () in
+  let _ = strbuf_push b acc in
+  let rec go = fn (ys: Val list) -> fn (first: bool) ->
+    (match ys with
+     | Cons (k, Cons (v, t)) ->
+       (let pair = hash_key_prefix k (inspect_w env world k) ++ inspect_w env world v in
+        let _ = (if first then () else strbuf_push b ", ") in
+        let _ = strbuf_push b pair in
+        go t false)
+     | _ -> ()) in
+  let _ = go xs (str_eq acc "") in
+  strbuf_to_str b
 
 // "wrong number of arguments (given N, expected R)" if the builtin under this
 // name takes a different count -- "" when it is fine, when no row covers it,
@@ -10541,58 +10622,72 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         //   it into an empty US-ASCII buffer made `%w(a b).join(" ")` US-ASCII
         //   once an empty ASCII-compatible side stopped yielding to an
         //   ASCII-only one (enc_compat2).
-        let app = fn (acc: str) -> fn (ae: str) -> fn (piece: str) -> fn (pe: str) ->
-          (if str_eq ae "" then (acc ++ piece, pe)
+        // ⚠ ...into a StrBuf, with the two facts the negotiation reads about
+        //   what is there -- its length and whether it is all ASCII -- kept as
+        //   pieces arrive. `acc ++ piece` copied the whole result per element
+        //   (and enc_all7 rescanned it), so joining 40,000 numbers took 10 GB.
+        let jb = strbuf_new () in
+        let jst = vec_new () in
+        let _ = vec_push jst 0 in
+        let _ = vec_push jst 1 in
+        let app = fn (ae: str) -> fn (piece: str) -> fn (pe: str) ->
+          (let put = fn (e: str) ->
+             (let _ = strbuf_push jb piece in
+              let _ = vec_set jst 0 (vec_get jst 0 + str_len piece) in
+              let _ = (if vec_get jst 1 == 1 && (if enc_all7 piece then false else true) then vec_set jst 1 0 else ()) in
+              e) in
+           if str_eq ae "" then put pe
            else
-           let ae2 = enc_compat2 ae acc pe piece in
+           let ae2 = enc_compat2_k ae (fn (u: unit) -> vec_get jst 0) (fn (u: unit) -> vec_get jst 1 == 1) pe piece in
            if str_eq ae2 "" then
              (let _ = raise_exc world "Encoding::CompatibilityError"
-                        ("incompatible character encodings: " ++ ae ++ " and " ++ pe) in (acc, ae))
-           else (acc ++ piece, ae2)) in
+                        ("incompatible character encodings: " ++ ae ++ " and " ++ pe) in ae)
+           else put ae2) in
         let seen = map_new () in
         let _ = map_set seen ("a" ++ str_of_int id0) VNil in
         // an element is a String, an Array (joined with the SAME separator at
         // every depth), or an object asked #to_str, then #to_ary, then #to_s.
-        let rec ljoin = fn (ys: Val list) -> fn (acc: str) -> fn (ae: str) -> fn (first: bool) ->
+        let rec ljoin = fn (ys: Val list) -> fn (ae: str) -> fn (first: bool) ->
           (match ys with
-           | Nil -> (acc, ae)
+           | Nil -> ae
            | Cons (h, t) ->
-             (let (a0, e0) = (if first then (acc, ae) else app acc ae sep sepe) in
-              let sub = fn (aid: int) -> fn (a9: str) -> fn (e9: str) ->
+             (let e0 = (if first then ae else app ae sep sepe) in
+              let sub = fn (aid: int) -> fn (e9: str) ->
                 (if map_has seen ("a" ++ str_of_int aid)
-                 then (let _ = raise_exc world "ArgumentError" "recursive array join" in (a9, e9))
+                 then (let _ = raise_exc world "ArgumentError" "recursive array join" in e9)
                  else (let _ = map_set seen ("a" ++ str_of_int aid) VNil in
                        // (a nested Array is not a first STRING: ruby clears
                        // its "first" before joining into the US-ASCII buffer)
-                       let (r9, re9) = ljoin (deref aid) a9 (if str_eq e9 "" then "US-ASCII" else e9) true in
-                       let _ = map_delete seen ("a" ++ str_of_int aid) in (r9, re9))) in
-              let str_of = fn (v: Val) -> fn (a9: str) -> fn (e9: str) ->
+                       let re9 = ljoin (deref aid) (if str_eq e9 "" then "US-ASCII" else e9) true in
+                       let _ = map_delete seen ("a" ++ str_of_int aid) in re9)) in
+              let str_of = fn (v: Val) -> fn (e9: str) ->
                 (match v with
-                 | VStr sh -> app a9 e9 (sget sh) (enc_canon_name (senc_get sh))
-                 | other -> app a9 e9 (to_s other) "US-ASCII") in
-              let (a1, e1) =
+                 | VStr sh -> app e9 (sget sh) (enc_canon_name (senc_get sh))
+                 | other -> app e9 (to_s other) "US-ASCII") in
+              let e1 =
                 (match h with
-                 | VStr sh -> app a0 e0 (sget sh) (enc_canon_name (senc_get sh))
-                 | VArr aid -> sub aid a0 e0
+                 | VStr sh -> app e0 (sget sh) (enc_canon_name (senc_get sh))
+                 | VArr aid -> sub aid e0
                  | VObj oid ->
                    (let r1 = (if responds world h "to_str"
                               then invoke_val_c env world noblk h "to_str" Nil false else VNil) in
                     match r1 with
-                    | VStr sh -> app a0 e0 (sget sh) (enc_canon_name (senc_get sh))
+                    | VStr sh -> app e0 (sget sh) (enc_canon_name (senc_get sh))
                     | _ ->
                       (let r2 = (if responds world h "to_ary"
                                  then invoke_val_c env world noblk h "to_ary" Nil false else VNil) in
                        match r2 with
-                       | VArr aid -> sub aid a0 e0
+                       | VArr aid -> sub aid e0
                        | _ ->
                          (let (m2, s2, ocls2, iv2) = world in
                           let cls = map_get ocls2 oid in
                           if has_meth world cls "to_s"
-                          then str_of (invoke world noblk h cls "to_s" Nil) a0 e0
-                          else app a0 e0 (to_s h) "US-ASCII")))
-                 | _ -> app a0 e0 (to_s h) "US-ASCII") in
-              ljoin t a1 e1 false)) in
-        let (txt, tenc0) = ljoin xs0 "" "" true in
+                          then str_of (invoke world noblk h cls "to_s" Nil) e0
+                          else app e0 (to_s h) "US-ASCII")))
+                 | _ -> app e0 (to_s h) "US-ASCII") in
+              ljoin t e1 false)) in
+        let tenc0 = ljoin xs0 "" true in
+        let txt = strbuf_to_str jb in
         let tenc = (if str_eq tenc0 "" then "US-ASCII" else tenc0) in
         let h9 = mkstr txt in
         let _ = (match h9 with VStr sh9 -> senc_set sh9 tenc | _ -> ()) in
@@ -13979,11 +14074,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //   past 32 bits (a Bignum) goes through init_by_array as ruby's does.
     //   Masking it to its low word gave `Random.new(2**252)` another stream
     //   (and #seed a different number from the one given).
+    // (...and so is a FIXNUM past 32 bits: `Random.new(2**32)` was masked to
+    //  its low word, 0, and gave seed 0's stream where ruby's init_by_array
+    //  gives another)
     else if str_eq c "Random" && (str_len name == 3 && str_eq name "new")
-            && (match args with Cons (VBig _, _) -> true | _ -> false) then
+            && (match args with
+                | Cons (VBig _, _) -> true
+                | Cons (VInt k9, _) -> k9 > 4294967295 || k9 < 0 - 4294967295
+                | _ -> false) then
       (let bv9 = (match args with Cons (b9, _) -> b9 | Nil -> VNil) in
        let g9 = mt_alloc_gid () in
-       let _ = mt_seed_from g9 (match bv9 with VBig b9 -> big_mag b9 | _ -> "0") in
+       let _ = mt_seed_from g9 (match bv9 with VBig b9 -> big_mag b9 | VInt k9 -> big_mag (str_of_int k9) | _ -> "0") in
        let _ = map_set mt_seed_of (str_of_int g9) (to_s bv9) in
        let ob9 = new_obj world "Random" Nil in
        (match ob9 with
@@ -22600,23 +22701,28 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                     else "") in
         let rep_bytes = (match encode_cps rep_cps to_enc9 "" with (b9, _) -> b9) in
         let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
+        // ⚠ into a StrBuf: `emit t9 (acc ++ b9)` copied the output so far once
+        //   per character, so 200,000 euro signs out of ISO-8859-15 took 8 GB
+        //   (test_transcode's test_length). `acc` is kept as a parameter and
+        //   no longer read; what an early way out answers is the buffer so far.
+        let eb = strbuf_new () in
         let rec emit = fn (xs: int list) -> fn (acc: str) ->
           (match xs with
-           | Nil -> acc
+           | Nil -> strbuf_to_str eb
            | Cons (c9, t9) ->
-             if c9 < 0 then emit t9 (acc ++ rep_bytes)
+             if c9 < 0 then emit_put t9 (rep_bytes)
              else
                (match encode_cps (Cons (c9, Nil)) to_enc9 "" with
                 | (b9, ok90) ->
                   // a BINARY byte above 0x7F is no character at all, so no
                   // other encoding has it (it was read as Latin-1)
                   let ok9 = ok90 && (if str_eq from "ASCII-8BIT" && c9 >= 128 then str_eq to "ASCII-8BIT" else true) in
-                  if ok9 then emit t9 (acc ++ b9)
+                  if ok9 then emit_put t9 (b9)
                   else
                     // undefined in the destination: the fallback decides,
                     // then :undef => :replace, then ruby's own error.
                     (let explicit9 = (match optv "replace" with VStr _ -> true | _ -> false) in
-                     if und_rep && explicit9 then emit t9 (acc ++ rep_bytes)
+                     if und_rep && explicit9 then emit_put t9 (rep_bytes)
                      else
                      // the fallback is handed the character as the failing
                      // step sees it -- in UTF-8, the pivot every path here
@@ -22645,14 +22751,14 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                        // rb_econv_insert_output fails, in these words
                        (match encode_cps (decode_cps (sget fh2) (enc_canon_name (senc_get fh2)) 0) to_enc9 "" with
                         | (fb9, fok9) ->
-                          if fok9 then emit t9 (acc ++ fb9)
-                          else (match raise_exc world "ArgumentError" "too big fallback string" with _ -> acc))
+                          if fok9 then emit_put t9 (fb9)
+                          else (match raise_exc world "ArgumentError" "too big fallback string" with _ -> strbuf_to_str eb))
                      | _ ->
-                       if und_rep then emit t9 (acc ++ rep_bytes)
+                       if und_rep then emit_put t9 (rep_bytes)
                        // xml: writes what the destination lacks as a
                        // hexadecimal character reference, upper case
                        else if (if str_eq xml9 "" then false else true) then
-                         emit t9 (acc ++ (match encode_cps (decode_cps ("&#x" ++ hex_up c9 ++ ";") "UTF-8" 0) to_enc9 "" with (hb9, _) -> hb9))
+                         emit_put t9 ((match encode_cps (decode_cps ("&#x" ++ hex_up c9 ++ ";") "UTF-8" 0) to_enc9 "" with (hb9, _) -> hb9))
                        // the two encoding NAMES ride on the exception, so its
                        // #source_encoding / #destination_encoding readers (in
                        // the prelude) can answer -- they were NoMethodError.
@@ -22670,7 +22776,8 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                              match raise_exc_iv world "Encoding::UndefinedConversionError" msg9
                                      (Cons (("source_encoding_name", mkstr sn9),
                                        Cons (("destination_encoding_name", mkstr to), Nil))) with
-                             | _ -> acc)))) in
+                             | _ -> strbuf_to_str eb))))
+        and emit_put = fn (t9: int list) -> fn (x9: str) -> (let _ = strbuf_push eb x9 in emit t9 "") in
         // xml: :attr quotes the whole value, in the destination's bytes; and
         // ISO-2022-JP is stateful -- one character at a time each came out
         // wrapped in its own ESC $ B ... ESC ( B, so a run is re-joined.
@@ -27190,7 +27297,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set (mkstr "nonzero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nonzero?'")) in fail "mere-ruby: undefined method 'nonzero?'")))
   else if (str_len name == 9 && str_eq name "positive?") then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> (let _ = prim_nm_set (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
   else if (str_len name == 9 && str_eq name "negative?") then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = prim_nm_set (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
-  else if (str_len name == 4 && str_eq name "succ") || (str_len name == 4 && str_eq name "next") then (match recv with VInt n -> VInt (n + 1) | VBig b -> norm_big (big_add_s b "1") | VStr s -> mkstr (str_succ (sget s)) | _ -> (let _ = prim_nm_set (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
+  // (at the int64 edge the next integer is a Bignum: `(-2**63).pred` wrapped
+  // to 2**63-1, and a reverse_each down from there never reached its end)
+  else if (str_len name == 4 && str_eq name "succ") || (str_len name == 4 && str_eq name "next") then (match recv with VInt n -> (if n == int_max then norm_big (big_add_s (str_of_int n) "1") else VInt (n + 1)) | VBig b -> norm_big (big_add_s b "1") | VStr s -> mkstr (str_succ (sget s)) | _ -> (let _ = prim_nm_set (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
   // Integer#ceildiv(other): the division rounded UP, which is the floor of the
   // negated numerator negated back (7.ceildiv(2) is 4, -7.ceildiv(2) is -3).
   else if (str_len name == 7 && str_eq name "ceildiv") then
@@ -27202,7 +27311,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                       | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
         | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "ceildiv") in VNil))
-  else if (str_len name == 4 && str_eq name "pred") then (match recv with VInt n -> VInt (n - 1) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = prim_nm_set (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
+  else if (str_len name == 4 && str_eq name "pred") then (match recv with VInt n -> (if n == int_min then norm_big (big_sub_s (str_of_int n) "1") else VInt (n - 1)) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = prim_nm_set (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
   else if (str_len name == 3 && str_eq name "abs") || (str_len name == 9 && str_eq name "magnitude") then
     (match recv with
      // ...and the magnitude of the machine minimum does not fit a machine int.
@@ -43666,11 +43775,19 @@ and rx_gsub_blk = fn world -> fn newblk -> fn (pat: str) -> fn (s: str) -> fn (a
 
 // gsub/sub against a regex pattern, expanding \& / \0 / \1..\9 in the
 // replacement. all=true replaces every match, all=false only the first.
+// ⚠ the two literal-replacement walkers below write into a StrBuf; each used
+//   to rebuild the result so far per match, and `("x" * 40000).gsub("x",
+//   "yz")` took 2.4 GB. The str-in, str-out forms are kept for the callers.
 and rx_gsub_go = fn (pat: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn (acc: str) ->
+  let b = strbuf_new () in
+  let _ = strbuf_push b acc in
+  let _ = rx_gsub_gob pat s rep i all b in
+  strbuf_to_str b
+and rx_gsub_gob = fn (pat: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn b ->
   let n = str_len s in
   let ps = rxe_start pat in
   let st = rx_find_start pat s i in
-  if st < 0 then acc ++ substring s i n
+  if st < 0 then strbuf_push b (substring s i n)
   else
     let _ = rx_clear_caps 1 in
     let en0 = rxe_alts pat ps s st in
@@ -43678,14 +43795,16 @@ and rx_gsub_go = fn (pat: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) ->
     if en <= st then
       // zero-width match: insert the replacement here, then copy one char and
       // advance (so // interleaves rep around every character, as in Ruby).
-      let acc2 = acc ++ substring s i st ++ rx_expand_rep rep s st st 0 "" in
-      if all then
-        (if st >= n then acc2 else rx_gsub_go pat s rep (st + 1) all (acc2 ++ substring s st (st + 1)))
-      else acc2 ++ substring s st n
+      (let _ = strbuf_push b (substring s i st) in
+       let _ = strbuf_push b (rx_expand_rep rep s st st 0 "") in
+       if all then
+         (if st >= n then () else (let _ = strbuf_push b (substring s st (st + 1)) in rx_gsub_gob pat s rep (st + 1) all b))
+       else strbuf_push b (substring s st n))
     else
-      let acc2 = acc ++ substring s i st ++ rx_expand_rep rep s st en 0 "" in
-      if all then rx_gsub_go pat s rep en all acc2
-      else acc2 ++ substring s en n
+      (let _ = strbuf_push b (substring s i st) in
+       let _ = strbuf_push b (rx_expand_rep rep s st en 0 "") in
+       if all then rx_gsub_gob pat s rep en all b
+       else strbuf_push b (substring s en n))
 
 // String#scan: collect every non-overlapping match. With no capture group
 // each item is the whole match; with groups each item is an array of the
@@ -43719,24 +43838,31 @@ and rx_scan_all2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) -
     Cons (item, rx_scan_all2 pat fl s nexti)
 
 and rx_gsub_go2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn (acc: str) ->
+  let b = strbuf_new () in
+  let _ = strbuf_push b acc in
+  let _ = rx_gsub_go2b pat fl s rep i all b in
+  strbuf_to_str b
+and rx_gsub_go2b = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn b ->
   let n = str_len s in
   match rxv_search pat fl s i with
-  | RBadPat -> rx_gsub_go pat s rep i all acc
-  | RNoHit -> acc ++ substring s i n
+  | RBadPat -> rx_gsub_gob pat s rep i all b
+  | RNoHit -> strbuf_push b (substring s i n)
   | RHit (st, en, saves) ->
     let _ = rxv_export_caps saves (rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat))) in
     if en <= st then
       // zero-width match: insert the replacement here, copy ONE CHARACTER
       // (a byte step relanded inside multibyte characters), advance.
-      (let acc2 = acc ++ substring s i st ++ rx_expand_rep rep s st st 0 "" in
+      (let _ = strbuf_push b (substring s i st) in
+       let _ = strbuf_push b (rx_expand_rep rep s st st 0 "") in
        let w9 = (if st < n then utf8_clen s st else 1) in
        if all then
-         (if st >= n then acc2 else rx_gsub_go2 pat fl s rep (st + w9) all (acc2 ++ substring s st (st + w9)))
-       else acc2 ++ substring s st n)
+         (if st >= n then () else (let _ = strbuf_push b (substring s st (st + w9)) in rx_gsub_go2b pat fl s rep (st + w9) all b))
+       else strbuf_push b (substring s st n))
     else
-      (let acc2 = acc ++ substring s i st ++ rx_expand_rep rep s st en 0 "" in
-       if all then rx_gsub_go2 pat fl s rep en all acc2
-       else acc2 ++ substring s en n)
+      (let _ = strbuf_push b (substring s i st) in
+       let _ = strbuf_push b (rx_expand_rep rep s st en 0 "") in
+       if all then rx_gsub_go2b pat fl s rep en all b
+       else strbuf_push b (substring s en n))
 
 // gsub/sub with a BLOCK, over the receiver's handle: the result's encoding
 // folds along with the text exactly as the replacement-argument engine's
@@ -43748,16 +43874,28 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
   let s = sget sid in
   let e0 = enc_canon_name (senc_get sid) in
   let n = str_len s in
-  let app = fn (acc: str) -> fn (ae: str) -> fn (piece: str) -> fn (pe: str) ->
-    (let ae2 = enc_compat2 ae acc pe piece in
+  // (into a StrBuf, with the length and ASCII-ness the negotiation reads
+  // kept as pieces arrive -- as Array#join does; `acc ++ piece` per match
+  // copied the result so far)
+  let gb = strbuf_new () in
+  let gst = vec_new () in
+  let _ = vec_push gst 0 in
+  let _ = vec_push gst 1 in
+  let app = fn (ae: str) -> fn (piece: str) -> fn (pe: str) ->
+    (let ae2 = enc_compat2_k ae (fn (u: unit) -> vec_get gst 0) (fn (u: unit) -> vec_get gst 1 == 1) pe piece in
      if str_eq ae2 "" then
        (let _ = prim_raise "Encoding::CompatibilityError"
-                  ("incompatible character encodings: " ++ ae ++ " and " ++ pe) in (acc, ae))
-     else (acc ++ piece, ae2)) in
-  let rec go = fn (i: int) -> fn (acc: str) -> fn (ae: str) ->
+                  ("incompatible character encodings: " ++ ae ++ " and " ++ pe) in ae)
+     else
+       (let _ = strbuf_push gb piece in
+        let _ = vec_set gst 0 (vec_get gst 0 + str_len piece) in
+        let _ = (if vec_get gst 1 == 1 && (if enc_all7 piece then false else true) then vec_set gst 1 0 else ()) in
+        ae2)) in
+  let fin = fn (ae: str) -> (strbuf_to_str gb, ae) in
+  let rec go = fn (i: int) -> fn (ae: str) ->
     (match rxv_search pat fl s i with
-     | RBadPat -> (rx_gsub_blk world newblk pat s all i (senc_get sid) acc, ae)
-     | RNoHit -> app acc ae (substring s i n) e0
+     | RBadPat -> (rx_gsub_blk world newblk pat s all i (senc_get sid) (strbuf_to_str gb), ae)
+     | RNoHit -> fin (app ae (substring s i n) e0)
      | RHit (st, en, saves) ->
        let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
        let ng2 = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
@@ -43770,18 +43908,17 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
        let (rep, re9) = (match bv with
                          | VStr rh -> (sget rh, enc_canon_name (senc_get rh))
                          | ov -> (w_to_s world ov, "UTF-8")) in
-       let (acc1, ae1) = app acc ae (substring s i st) e0 in
-       let (acc2, ae2) = app acc1 ae1 rep re9 in
+       let ae1 = app ae (substring s i st) e0 in
+       let ae2 = app ae1 rep re9 in
        if en <= st then
          (let w9 = (if st < n then utf8_clen s st else 1) in
-          if all then (if st >= n then (acc2, ae2)
-                       else (match app acc2 ae2 (substring s st (st + w9)) e0 with
-                             | (acc3, ae3) -> go (st + w9) acc3 ae3))
-          else app acc2 ae2 (substring s st n) e0)
+          if all then (if st >= n then fin ae2
+                       else go (st + w9) (app ae2 (substring s st (st + w9)) e0))
+          else fin (app ae2 (substring s st n) e0))
        else
-         (if all then go en acc2 ae2
-          else app acc2 ae2 (substring s en n) e0)) in
-  go 0 "" e0
+         (if all then go en ae2
+          else fin (app ae2 (substring s en n) e0))) in
+  go 0 e0
 
 // String#scan with a block: walk matches from cursor `i`, yielding each to
 // the block (the capture array when the pattern has groups, else the matched
