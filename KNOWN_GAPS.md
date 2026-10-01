@@ -345,24 +345,30 @@ prints one group rather than two nested ones -- it reads the inline `(?i)` /
 and wraps it, so the result matches on the same strings but is not the same
 text. One example in `core/regexp/to_s_spec`.
 
-## Anonymous arguments can be DECLARED but not FORWARDED
+## `defined? (;x)` answers "local-variable"; ruby 4.0.6 says "expression"
 
 ```ruby
-def m(*); end          # parses and binds
-def m(**); end         # parses and binds
-def m(&); end          # parses and binds
-def outer(*); inner(*); end     # mere-ruby: parse error at `)`
-def outer(**); inner(**); end   # mere-ruby: parse error at `)`
+x = 1
+defined? (;x)     # ruby 4.0.6: "expression"   mere-ruby: "local-variable"
+defined? (x;)     # likewise
+defined? (\n  x\n)   # both: "local-variable"
 ```
 
-The parameter side of ruby 3.2's anonymous arguments works: a bare `*`, `**`
-or `&` gets a hidden name and binds like a named one (`__anonkw` for `**`, the
-way `__anonblk` already worked for `&`). The CALL side does not: `inner(*)`
-needs the argument parser to read a `*` followed by `)` or `,` as "splat the
-anonymous rest", and it reads it as a splat with a missing operand. A parse
-error takes the whole FILE, so this shows up as `language/delegation_spec`
-failing entirely rather than as one example. `def m(...)` -- the older, more
-common delegation form -- forwards correctly.
+Parentheses holding a `;` are a sequence of statements to ruby 4.0.6 (ruby
+3.4 answered "local-variable" too). mere-ruby's lexer gives `;` and a newline
+the same token, so the parser cannot tell `(;x)` from `(\nx)`, and reads both
+as the expression inside. Telling them apart needs a token for `;` of its own,
+which every statement loop would then have to accept; one example of
+test_defined is the cost.
+
+## `callcc` escapes, but a continuation cannot be re-entered
+
+`require "continuation"` gives `callcc` as an escape: calling the continuation
+inside the block, or from code the block calls, returns from `callcc` with the
+value. Calling it after `callcc` has returned -- jumping back into a finished
+frame -- raises NotImplementedError by name. Re-entry needs the stack that was
+left; every use in CRuby's test/ruby (test_hash's iteration-level checks) is
+the escape.
 
 ## Reflection cannot ENUMERATE a builtin class's methods
 
