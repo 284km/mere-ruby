@@ -34,6 +34,40 @@ so this corner is known-broken upstream through 3.3.
 The row is expected to go back to MATCH when the gate's ruby is upgraded; if
 it does not, this entry is wrong and the hook suppression is real.
 
+## Nothing is collected while a method or block body is running
+
+```ruby
+def f = 300_000.times { [1, 2, 3].map(&:to_s) }
+f    # MERE_RUBY_GC_LOG=1 reports 0 collections; at the top level, 24
+```
+
+A collection may run only at a statement boundary with no method or block
+body below it on the stack (`gc_unsafe`, main.mere): a caller's half-evaluated
+expression can hold a value nothing else reaches -- `arr.pop.foo(bar)` while
+`bar` runs -- and the mark cannot see it. So a long method, a long block, and
+everything under `at_exit` run uncollected. That is all of a test/unit file
+(its runner is an at_exit block): test_class, test_integer and test_yield
+reach 5-6 GB on what they allocate, not on what they keep. Collecting inside
+bodies needs those in-flight values rooted -- the evaluator's argument lists
+and receivers, and the accumulators of every builtin that yields -- which is
+a change to the collector, not to any one method.
+
+## An Array of ten million elements overflows the native stack
+
+`(1..10_000_000).to_a` and `f(*(1..10_000_000))` end in "stack overflow
+(recursion too deep)"; five million is fine. An Array is a list here, and
+the functions that build and walk lists recurse once per element. test_method's
+test_splat_long_array is the one test that asks.
+
+## A power past a million digits is refused
+
+`Integer#**` raises ruby's ArgumentError "exponent is too large" when the
+result would pass 2^34 bits, as ruby does, and also past a million decimal
+digits, which ruby computes: integers here are decimal strings multiplied by
+schoolbook on base-10000 limbs, and the squarings of a 24-million-digit
+power (`4r**40000000`, test_rational) would take hours. Refusing is the
+error a program can see.
+
 ## Ractor runs sequentially: one thread of control, no isolation
 
 ```ruby
