@@ -1719,7 +1719,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if is_definition_hook meth then VNil
        // `super` from a `def self.new` override is Class#new: allocate and
        // run initialize, exactly as the built-in path would have.
-       else if str_eq meth "new" then (match recv with VClass c9 -> new_obj_wb world c9 args superblk | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
+       // (a Thread subclass's `super` is Thread.new, which starts it: see super_missing)
+       else if str_eq meth "new" then (match recv with VClass c9 -> (if obj_is_a world c9 "Thread" then thread_new world superblk c9 meth args superblk else new_obj_wb world c9 args superblk) | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
        // the methods Class/Module themselves provide (append_features,
        // autoload, method_missing, ...) are ancestors of a singleton too, so
        // `super` from a `def self.` override of one lands there rather than
@@ -1759,7 +1760,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if is_definition_hook meth then VNil
        // `super` from a `def self.new` override is Class#new: allocate and
        // run initialize, exactly as the built-in path would have.
-       else if str_eq meth "new" then (match recv with VClass c9 -> new_obj_wb world c9 args (sbh, sbp, sbb, sbe) | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
+       else if str_eq meth "new" then (match recv with VClass c9 -> (if obj_is_a world c9 "Thread" then thread_new world (sbh, sbp, sbb, sbe) c9 meth args (sbh, sbp, sbb, sbe) else new_obj_wb world c9 args (sbh, sbp, sbb, sbe)) | _ -> raise_exc world "NoMethodError" (super_missing_msg meth recv))
        else raise_exc world "NoMethodError" (super_missing_msg meth recv))
     else
       (let a2 = lookup_anc world (anc_after_or_all (ancestors_of world (super_base world recv)) defcls) meth in
@@ -2210,6 +2211,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
             && map_has meths name && (match (if lv_has env "self" then lv_get env "self" else VNil) with VClass _ -> true | _ -> false) then
       invoke_val_c env world noblk (lv_get env "self") name args false
+    // ...and with MAIN as self -- in a top-level method, or a module method
+    // run there -- main's own `include` (and `prepend`) is Object's, splat and
+    // several modules included. Only the one-module statement form reached
+    // it, so test/unit's separated_runner, `include(*ancestors.select ...)` in
+    // every assert_separately child, was a NoMethodError for main.
+    else if ((str_len name == 7 && str_eq name "include") || (str_len name == 7 && str_eq name "prepend"))
+            && (if map_has meths name then false else true)
+            && (match (if lv_has env "self" then lv_get env "self" else VNil) with VMain -> true | _ -> false)
+            && (match args with Nil -> false | _ -> true) then
+      (let _ = (if (str_len name == 7 && str_eq name "include") then incl_each world "Object" args
+                else prep_each world "Object" args) in VClass "Object")
     else if map_has meths name then call_method env world noblk name args
     // `catch :tag` with no block: the block IS the method, so there is nothing
     // to run and nothing to catch. ruby reports a LocalJumpError; this reached
@@ -15575,19 +15587,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 let _ = store_proc (str_of_int pid9) blk in
                 signal_trap env world args (VProc pid9))
              | _ -> raise_exc world "ArgumentError" "tried to create Proc object without a block")))
-    // RbConfig.ruby -- the path to "the ruby". RbConfig::CONFIG already carries a
-    // borrowed one (derived from GEM_HOME, so the fiction agrees with the tree
-    // this interpreter was pointed at), and this answers the same string rather
-    // than inventing a second one. It is a fact about the CRuby installation on
-    // the load path, NOT about mere-ruby: a program that re-executes it runs
-    // CRuby, which is the caveat KNOWN_GAPS records. Answering nothing was worse
-    // in a measurable way -- `bundle --version` stopped here.
-    else if str_eq c "RbConfig" && (str_len name == 4 && str_eq name "ruby") then
-      (match (if map_has consts "RbConfig::CONFIG" then map_get consts "RbConfig::CONFIG" else VNil) with
-       | VHsh hid -> (match hash_lookup (hderef hid) (mkstr "bindir") with
-                      | (true, VStr h) -> mkstr (sget h ++ "/ruby")
-                      | _ -> mkstr "/usr/bin/ruby")
-       | _ -> mkstr "/usr/bin/ruby")
+    // (RbConfig.ruby is the prelude's: an ordinary singleton method, so that
+    // `defined?` sees it and a program's own definition replaces it)
     // ⚠ EVERY GC METHOD ANSWERED nil. `GC.start` did not collect, `GC.enable`
     //   and `GC.disable` did not switch anything and answered nil where ruby
     //   answers the PREVIOUS state, and count/stat/total_time did not exist at
@@ -20675,7 +20676,26 @@ and run_at_exits_r = fn world -> fn report ->
                  | _ -> ())) in
   let st = map_new () in
   let _ = run_at_exit_batch world report st in
+  // ...and after them, what was written and never flushed: an IO's buffer
+  // (the prelude keeps the open writable ones) and a File's (@__f_buf), as
+  // ruby's finalizers write them at exit. Both were dropped.
+  let _ = try_or (fn (u: unit) ->
+            (let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+             let _ = invoke_val_c gc_cenv0 world nb9 (VClass "IO") "__flush_open" Nil false in ())) () in
+  let _ = flush_files_at_exit world in
   if map_has st "v" then map_get st "v" else 0 - 1
+
+and flush_files_at_exit = fn world ->
+  let (_, _, _, ivars) = world in
+  let ids = map_new () in
+  let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+            (if str_len k > 8 && str_eq (substring k (str_len k - 8) (str_len k)) "@__f_buf"
+             then (match v with
+                   | VStr h -> (if str_len (sget h) > 0 then map_set ids (substring k 0 (str_len k - 8)) VNil else ())
+                   | _ -> ())
+             else ())) in
+  map_iter ids (fn (k: str) -> fn (v: Val) ->
+    (let _ = try_or (fn (u: unit) -> file_flush_obj world (int_of_str k)) () in ()))
 
 // the handlers registered so far, newest first, taken out of the store before
 // any of them runs (so one that calls `exit`, or registers another, cannot
@@ -32377,6 +32397,23 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
         | _ -> prim_method recv meth args))
   else
+  // ⚠ `super` from a Thread SUBCLASS's own `self.new` (test_thread's
+  //   `class Thread < ::Thread; def self.new(*); th = super; ...`) is Thread's
+  //   new, which starts the thread. It reached Class#new -- allocate and
+  //   initialize -- and answered an object of the subclass that was no
+  //   thread: alive?, join, kill and value were all NoMethodErrors.
+  //   ...and `super` from a `new` in a module PREPENDED to a class's
+  //   singleton (leakchecker's `class << Tempfile; prepend TempfileCounter`)
+  //   is Class#new as well. It ran out of chain into the INSTANCE side's
+  //   method_missing -- Tempfile's is Delegator's, so every Tempfile.create
+  //   under test/unit was "undefined method '__getobj__' for class Tempfile".
+  match recv with
+  | VClass tc9 when ((str_len meth == 3 && str_eq meth "new") || (str_len meth == 5 && str_eq meth "start") || (str_len meth == 4 && str_eq meth "fork"))
+                    && (if str_eq tc9 "Thread" then false else true) && obj_is_a world tc9 "Thread" ->
+    thread_new world superblk tc9 meth args superblk
+  | VClass nc9 when (str_len meth == 3 && str_eq meth "new") && (if map_has modules nc9 then false else true) ->
+    new_obj_wb world nc9 args superblk
+  | _ ->
   let dcls = dispatch_cls_of world recv in
   // a descriptor stream's stream methods are the prelude layer's (fdio_route),
   // so `super` from a singleton override -- a mock of #close that calls the

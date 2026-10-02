@@ -3419,6 +3419,11 @@ let core_prelude_f =
   "    def termsig = nil\n" ++
   "    def stopped? = false\n" ++
   "    def stopsig = nil\n" ++
+  "    # no core dump is ever observed here (the waiting shell sees an exit\n" ++
+  "    # status), and assert_in_out_err asks this of every child it waits for\n" ++
+  "    def coredump? = false\n" ++
+  "    def &(n) = to_i & n\n" ++
+  "    def >>(n) = to_i >> n\n" ++
   "    def pid = (@__pid || Process.pid)\n" ++
   "    def to_s = \"pid #\{pid} exit #\{@__st}\"\n" ++
   "    # Process::Status.wait with no children answers a status whose pid is -1\n" ++
@@ -4341,6 +4346,29 @@ let core_prelude_f =
   "         else 1000\n" ++
   "         end\n" ++
   "    __in_unit(ns / 1000000000.0, unit)\n" ++
+  "  end\n" ++
+  "end\n" ++
+  "\n" ++
+  "# RbConfig.ruby: the interpreter that is RUNNING, as ruby's names its own\n" ++
+  "# binary. tool/lib's EnvUtil.rubybin re-executes it for every test that starts\n" ++
+  "# a child (assert_in_out_err, assert_separately). It answered CONFIG's bindir +\n" ++
+  "# \"/ruby\" -- a CRuby, and after envutil set bindir to \".\", \"./ruby\". It is an\n" ++
+  "# ordinary singleton method so that `defined?` sees it and a program's own\n" ++
+  "# (envutil's attr_reader) replaces it. The path is asked of the OS once:\n" ++
+  "# /proc/<pid>/exe where there is one, else lsof's txt entry for this process.\n" ++
+  "module RbConfig\n" ++
+  "  def self.ruby\n" ++
+  "    @__self_ruby ||= begin\n" ++
+  "      pid = Process.pid\n" ++
+  "      exe = (File.readlink(\"/proc/#\{pid}/exe\") rescue nil) if File.exist?(\"/proc/#\{pid}/exe\")\n" ++
+  "      if exe.nil? || exe.empty?\n" ++
+  "        out = (`lsof -p #\{pid} -a -d txt -Fn 2>/dev/null` rescue \"\")\n" ++
+  "        line = out.lines.find \{ |l| l.start_with?(\"n/\") }\n" ++
+  "        exe = line[1..].chomp if line\n" ++
+  "      end\n" ++
+  "      exe = File.join(CONFIG[\"bindir\"], CONFIG[\"ruby_install_name\"]) if exe.nil? || exe.empty?\n" ++
+  "      exe.freeze\n" ++
+  "    end\n" ++
   "  end\n" ++
   "end\n" ++
   "\n" ++
@@ -6049,6 +6077,23 @@ let core_prelude_k =
   "    @__io_pid = nil\n" ++
   "    @__io_ac = true\n" ++
   "    __fd_setencs(ext, int, int_given)\n" ++
+  "    IO.__wopen[__id__] = self if @__io_w\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # ⚠ THE WRITE BUFFER OF AN IO NOBODY CLOSED IS FLUSHED AT EXIT, after the\n" ++
+  "  #   at_exit handlers, as ruby's finalizers do. It was dropped: test/unit's\n" ++
+  "  #   separated_runner writes the child's result with `IO.new(fd, \"w\").puts`\n" ++
+  "  #   in an at_exit and never flushes, so every assert_separately parent\n" ++
+  "  #   read nothing back (`unpack1` for nil).\n" ++
+  "  def self.__wopen = (@__wopen ||= \{})\n" ++
+  "  def self.__flush_open\n" ++
+  "    return if @__wopen.nil?\n" ++
+  "    @__wopen.values.each do |io|\n" ++
+  "      begin\n" ++
+  "        io.__fd_flush_w unless io.__fd_closed?\n" ++
+  "      rescue StandardError\n" ++
+  "      end\n" ++
+  "    end\n" ++
   "  end\n" ++
   "\n" ++
   "  # ruby's rb_io_ext_int_to_encs: the external is kept only when it was\n" ++
@@ -6721,6 +6766,7 @@ let core_prelude_k =
   "    @__io_closed = true\n" ++
   "    @__io_r = false\n" ++
   "    @__io_w = false\n" ++
+  "    IO.__wopen.delete(__id__)\n" ++
   "    if @__io_ac\n" ++
   "      IO.__fdclose(@__io_fd)\n" ++
   "      IO.__fdclose(@__io_wfd) if @__io_wfd\n" ++
@@ -8804,7 +8850,13 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   let _ = map_set gc_state "nolvup" (if str_eq (env_get "MERE_RUBY_GC_NO_LVUP_ROOT") "" then 0 else 1) in
   let _ = map_set gc_state "tight" (if str_eq (env_get "MERE_RUBY_GC_TIGHT") "" then 0 else 1) in
   let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
-  let _ = run_pre env world noblk prog in
+  // ⚠ BEGIN { } runs before the driver, and an exception out of it went past
+  //   everything to the runtime, which printed "fail: mere-ruby: (ruby
+  //   exception raised)" -- no class, no message, no line. assert_separately
+  //   puts its whole harness in a BEGIN, so every child's failure read so.
+  //   A BEGIN that raises ends the program the way an unrescued exception in
+  //   the body does: the same report, at_exit first, and nothing else runs.
+  let pre_ok = try_or (fn (u: unit) -> let _ = run_pre env world noblk prog in true) false in
   // The driver: plain recursion, no carry -- the collection is a function
   // now (gc_collect) and every store rebuilds in place through stable
   // handles, so nothing needs an arena swap. Each chunk runs inside its own
@@ -8913,7 +8965,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
          | VHsh _ -> print_no_nl (inspect_w gc_cenv0 world lastv)
          | v -> print_no_nl (to_s v))
       else ()) in
-  gc_drive 0 VNil;
+  gc_drive (if pre_ok then 0 else gc_total + 2) VNil;
 
 
 let run_prog = fn (path: str) -> fn (print_result: bool) ->
