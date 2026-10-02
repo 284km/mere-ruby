@@ -56,27 +56,22 @@ check asserts once per value the search yielded (60 to 130 assertions), an
 assertion allocates 20-60 KB, and 1274 checks pass 6 GB. It finished while
 `assert_operator` was a NameError on its first call (note 266).
 
-## A dangling value in test/unit's failure path ends in a deadlock
+## Mere's map recycle can overrun a dedicated block (mere-ruby works around it)
 
-```
-cd <ruby-src>/test/ruby
-# a test whose assert_in_out_err fails on the child's stderr, run under the
-# runner, after `M.module_eval(...) do end` style finalizer warnings
-```
-
-Seen once, reliably, with test_objectspace's test_finalizer_with_super
-before its child stopped printing warnings (its own bug, fixed): in the
-parent, inside assert_all_assertions' ensure, `invoke_val_c` records its
-receiver (bi_reg_set) by copying it into a global map, and the receiver --
-a two-string tuple -- points into freed region memory. The copy reads a
-garbage length, malloc fails, and Mere's "out of memory" fail is raised
-while the allocator holds the default region's lock, so the next
-allocation waits on itself forever (the lock's owner is the waiting
-thread). The same file at fd6671e hangs the same way once its child can be
-started, so it is older than the change that exposed it. Two things are
-wrong: a value outlives its region (mere-ruby or Mere), and an allocation
-failure leaves the region lock held (Mere's runtime).
-
+A container's private arena keeps its OLDEST block when `*_recycle` winds it
+back, and calls it the 4 KB seed; but a value bigger than a quarter of the
+seed gets a dedicated block chained in BEHIND the bump block, so with the
+seed still current the oldest block is the dedicated one, and the next
+allocations run off its end into the heap. In mere-ruby's frame pool that
+corrupted an exception's message beside it, a deep copy asked malloc for an
+absurd size, and Mere's "out of memory" fail left the default region's lock
+held: the process stopped silently in test/unit's failure path (note 269,
+unittest/repro/269_frame_pool_overflow.rb). frame_pool_put now compacts a
+frame whose arena grew past its seed instead of recycling it. The runtime
+fix (recycle keeps the block's real capacity; no out-of-memory fail while
+the region lock is held) is a patch for Mere, not yet in a Mere release;
+until it is, any other `map_recycle` / `vec_recycle` of a grown container
+has the same edge.
 ## An Array of ten million elements overflows the native stack
 
 `(1..10_000_000).to_a` and `f(*(1..10_000_000))` end in "stack overflow
