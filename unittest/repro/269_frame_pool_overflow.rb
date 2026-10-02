@@ -1,5 +1,5 @@
 # Run under test/unit's runner with tool/lib on -I, from <ruby-src>/test/ruby:
-#   RUBYLIB=<stdlib> mere-ruby -I ../../tool/lib repro_test.rb
+#   RUBYLIB=<stdlib> mere-ruby -I ../../tool/lib <this file>
 # Stopped silently (CPU 0%) up to c0e7377 -- a recycled frame bump-allocated past
 # a dedicated block into the heap (note 269); with tools/asan_build.sh it was a
 # use-after-poison in bind_params under Test::Unit::TestCase#run. Now: 1 Failure.
