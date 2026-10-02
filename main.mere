@@ -2455,7 +2455,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        | _ -> make_enum_user world recv "each" Nil)
     // Kernel#gets / readline / readlines: read stdin (slurped once). gets and
     // readlines cover the common `while line = gets` / batch cases; readline
-    // raises EOFError at end like Ruby. Args (separator/limit) are not modeled.
+    // raises EOFError at end like Ruby.
+    // ⚠ ...and WITH arguments they are ARGF's, separator, limit and `chomp:`
+    //   included: Kernel#readline is ARGF.readline. The arguments were
+    //   dropped, so `readline(chomp: true)` kept its newline.
+    else if ((str_len name == 4 && str_eq name "gets") || (str_len name == 8 && str_eq name "readline") || (str_len name == 9 && str_eq name "readlines"))
+            && (match args with Nil -> false | _ -> true)
+            && (if kernel_overridden env world name then false else true)
+            && (match (if map_has consts "ARGF" then map_get consts "ARGF" else VNil) with VObj _ -> true | _ -> false) then
+      (let av9 = map_get consts "ARGF" in
+       invoke world (false, (Nil : str list), (Nil : Stmt list), map_new ()) av9 (dispatch_cls_of world av9) name args)
     else if (str_len name == 4 && str_eq name "gets") && (if kernel_overridden env world "gets" then false else true) then kernel_gets world
     else if (str_len name == 8 && str_eq name "readline") && (if kernel_overridden env world "readline" then false else true) then
       (match rb_gets () with VNil -> raise_exc world "EOFError" "end of file reached" | v -> v)
@@ -4541,6 +4550,15 @@ and stdin_read_name = fn (name: str) ->
   || (str_len name == 9 && (str_eq name "readlines" || str_eq name "each_line"))
   || (str_len name == 4 && str_eq name "each") || (str_len name == 11 && str_eq name "readpartial")
   || (str_len name == 6 && str_eq name "ungetc") || (str_len name == 9 && str_eq name "ungetbyte")
+and stdin_kw_chomp = fn (args: Val list) ->
+  (match vlast args with
+   | VHsh h -> (match hash_lookup (hderef h) (VSym "chomp") with (true, VBool true) -> true | _ -> false)
+   | _ -> false)
+and line_chomp = fn (l: str) ->
+  let n = str_len l in
+  if n >= 2 && str_eq (substring l (n - 2) n) "\r\n" then substring l 0 (n - 2)
+  else if n >= 1 && str_eq (char_at l (n - 1)) "\n" then substring l 0 (n - 1)
+  else l
 and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // as much of the input as this call needs, and no more: a whole read wants
   // all of it, a length that many bytes, readpartial whatever one read gives,
@@ -4574,9 +4592,12 @@ and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      | _ ->
        (let _ = map_set stdin_src_pos "p" n in
         mkstr (if pos >= n then "" else substring s pos n)))
+  // (`chomp: true` takes the line's end off -- "\n" or "\r\n" -- as ruby's
+  // does; it was ignored, and ARGF reading standard input comes here)
   else if str_eq name "gets" || str_eq name "readline" then
     (match rb_gets () with
      | VNil -> (if str_eq name "readline" then eofe () else VNil)
+     | VStr h9 when stdin_kw_chomp args -> mkstr (line_chomp (sget h9))
      | v -> v)
   else if str_eq name "getc" || str_eq name "readchar" then
     (if pos >= n then (if str_eq name "readchar" then eofe () else VNil)
@@ -4601,7 +4622,12 @@ and stdin_io_call = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
      VNil)
   else
     // readlines / each_line / each
-    (let lines9 = rb_readlines () in
+    (let rec chl9 = fn (xs: Val list) ->
+       (match xs with
+        | Nil -> (Nil : Val list)
+        | Cons (VStr h9, t9) -> Cons (mkstr (line_chomp (sget h9)), chl9 t9)
+        | Cons (o9, t9) -> Cons (o9, chl9 t9)) in
+     let lines9 = (if stdin_kw_chomp args then chl9 (rb_readlines ()) else rb_readlines ()) in
      if str_eq name "readlines" then arr_new lines9
      else (let _ = invoke_val_c env world blk (arr_new lines9) "each" Nil false in recv))
 // stderr text as given: print_err ENDS every write with a newline, so
@@ -34675,6 +34701,12 @@ and io_fd_prim = fn world -> fn (name: str) -> fn (args: Val list) ->
      | _ -> VInt (0 - 1))
   else if str_eq name "__fdacc" then VInt (if map_has fd_acc (ia 0) then map_get fd_acc (ia 0) else 0 - 1)
   else if str_eq name "__fdnb" then VBool (map_has fd_nb (ia 0))
+  // is there standard input to read WITHOUT waiting: bytes in the buffer
+  // Kernel#gets keeps, the end of it, or (one poll(2), no wait) a descriptor
+  // with something on it. STDIN.read_nonblock asks before it reads.
+  else if str_eq name "__fdstdinready" then
+    VBool (str_len (stdin_buf ()) > stdin_cur () || map_has stdin_src "done"
+           || (match io_poll_bits (Cons (VInt 0, Nil)) (Cons (VInt 1, Nil)) 0 with Cons (VInt b, _) -> b != 0 | _ -> true))
   else if str_eq name "__fdpath" then (if map_has fd_path (ia 0) then mkstr (map_get fd_path (ia 0)) else VNil)
   else if str_eq name "__fdsigpipe" then VInt (sigignore 13)
   // close-on-exec: read (one argument) or set (two); see fd_keep
