@@ -3444,16 +3444,23 @@ let core_prelude_f =
   "module Process\n" ++
   "  # ⚠ `system` set no status at all, so `system(\"false\"); $?.exitstatus` was a\n" ++
   "  #   NoMethodError on nil -- the status of the command that just ran is the\n" ++
-  "  #   first thing its caller asks for. This carries the exit code and nothing\n" ++
-  "  #   else: there are no signals to report here, because `run` gives back an\n" ++
-  "  #   exit code and not a wait(2) status.\n" ++
+  "  #   first thing its caller asks for. What a child left is what the waiting\n" ++
+  "  #   shell says, which is an exit code and not a wait(2) status.\n" ++
+  "  # ⚠ ...SO A CHILD KILLED BY A SIGNAL ARRIVES AS 128 + ITS NUMBER, the\n" ++
+  "  #   shell's convention, and read as an exit code it was `exited?` with\n" ++
+  "  #   status 141 -- where ruby's is `signaled?`, termsig 13 (test_io's closed\n" ++
+  "  #   pipe asks exactly that, note 270). A status from 129 to 192 is read as\n" ++
+  "  #   the signal: the shell cannot tell it from a program that exits with\n" ++
+  "  #   that number, and no CRuby test does (KNOWN_GAPS). #to_i is the wait(2)\n" ++
+  "  #   status ruby answers: the signal's number, or the exit code shifted by 8.\n" ++
   "  class Status\n" ++
-  "    def exitstatus = @__st\n" ++
-  "    def to_i = @__st\n" ++
-  "    def success? = (@__st == 0)\n" ++
-  "    def exited? = true\n" ++
-  "    def signaled? = false\n" ++
-  "    def termsig = nil\n" ++
+  "    def __sig = (@__st.is_a?(Integer) && @__st > 128 && @__st <= 192) ? @__st - 128 : nil\n" ++
+  "    def exitstatus = __sig ? nil : @__st\n" ++
+  "    def to_i = __sig || (@__st << 8)\n" ++
+  "    def success? = __sig ? nil : (@__st == 0)\n" ++
+  "    def exited? = __sig.nil?\n" ++
+  "    def signaled? = !__sig.nil?\n" ++
+  "    def termsig = __sig\n" ++
   "    def stopped? = false\n" ++
   "    def stopsig = nil\n" ++
   "    # no core dump is ever observed here (the waiting shell sees an exit\n" ++
@@ -3462,7 +3469,7 @@ let core_prelude_f =
   "    def &(n) = to_i & n\n" ++
   "    def >>(n) = to_i >> n\n" ++
   "    def pid = (@__pid || Process.pid)\n" ++
-  "    def to_s = \"pid #\{pid} exit #\{@__st}\"\n" ++
+  "    def to_s = __sig ? \"pid #\{pid} SIG#\{Signal.signame(__sig)} (signal #\{__sig})\" : \"pid #\{pid} exit #\{@__st}\"\n" ++
   "    # Process::Status.wait with no children answers a status whose pid is -1\n" ++
   "    # (and exitstatus 0) rather than raising, which is ruby's documented\n" ++
   "    # difference from Process.wait; with one, it is Process.wait's status.\n" ++
@@ -3485,7 +3492,7 @@ let core_prelude_f =
   "    def inspect = \"#<Process::Status: #\{self}>\"\n" ++
   "    # two statuses are equal when they carry the same status (there is no\n" ++
   "    # #== above this one to defer to: `super` was a NoMethodError)\n" ++
-  "    def ==(o) = (o.is_a?(Integer) ? o == @__st : (o.is_a?(Process::Status) ? o.to_i == to_i : false))\n" ++
+  "    def ==(o) = (o.is_a?(Integer) ? o == to_i : (o.is_a?(Process::Status) ? o.to_i == to_i : false))\n" ++
   "  end\n" ++
   "end\n" ++
   "\n" ++
@@ -4091,7 +4098,17 @@ let core_prelude_f =
   "      elsif k == :unsetenv_others\n" ++
   "        # (first of all: the env given to spawn is set AFTER it)\n" ++
   "        unset_others = true if v\n" ++
-  "      elsif k == :close_others || k == :new_pgroup || k == :rlimit_core\n" ++
+  "      elsif k == :close_others || k == :new_pgroup\n" ++
+  "      elsif k.is_a?(Symbol) && k.to_s.start_with?(\"rlimit_\") && (u = __ulimit_flag(k))\n" ++
+  "        # a resource limit for the child: the shell that starts it sets it\n" ++
+  "        # (ulimit), so it is the child's and not ours. An Integer is both\n" ++
+  "        # limits, [cur, max] the two; RLIM_INFINITY is unlimited. A limit the\n" ++
+  "        # kernel refuses is left as it was. (It was \"wrong exec option\n" ++
+  "        # symbol\", and test_io's ruby() helper passes rlimit_nproc to every\n" ++
+  "        # child it starts.)\n" ++
+  "        cur, max = v.is_a?(Array) ? v : [v, v]\n" ++
+  "        lim = ->(x) \{ x.is_a?(Integer) && x >= 0 && x != Process::RLIM_INFINITY ? x.to_s : \"unlimited\" }\n" ++
+  "        pre << \"\{ ulimit -S -\" + u + \" \" + lim.(cur) + \" && ulimit -H -\" + u + \" \" + lim.(max) + \"; } 2>/dev/null || \{ ulimit -H -\" + u + \" \" + lim.(max) + \"; ulimit -S -\" + u + \" \" + lim.(cur) + \"; } 2>/dev/null;\"\n" ++
   "      elsif k.is_a?(Array)\n" ++
   "        # one open shared by every descriptor named, as ruby does it\n" ++
   "        fs = k.map \{ |kk| __fd_of(kk) }\n" ++
@@ -4210,9 +4227,12 @@ let core_prelude_f =
   "    st = $?\n" ++
   "    if exc && !st.success?\n" ++
   "      words = args.reject \{ |a| a.is_a?(Hash) }.map \{ |a| a.is_a?(Array) ? a[0] : a }\n" ++
-  "      raise RuntimeError, \"Command failed with exit #\{st.exitstatus}: #\{words.join(' ')}\"\n" ++
+  "      how = st.signaled? ? \"SIG#\{Signal.signame(st.termsig)} (signal #\{st.termsig})\" : \"exit #\{st.exitstatus}\"\n" ++
+  "      raise RuntimeError, \"Command failed with #\{how}: #\{words.join(' ')}\"\n" ++
   "    end\n" ++
-  "    st.success?\n" ++
+  "    # (false, not nil, for a child a signal killed: ruby's answer is the\n" ++
+  "    # status compared with success, and only a refused start is nil)\n" ++
+  "    st.success? == true\n" ++
   "  end\n" ++
   "\n" ++
   "  def self.__set_status(st, pid)\n" ++
@@ -4221,6 +4241,13 @@ let core_prelude_f =
   "    s.instance_variable_set(:@__pid, pid)\n" ++
   "    Process.__set_last(s)\n" ++
   "    s\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # the sh ulimit letter of a spawn option rlimit_<name>, or nil\n" ++
+  "  def self.__ulimit_flag(k)\n" ++
+  "    \{ rlimit_core: \"c\", rlimit_cpu: \"t\", rlimit_data: \"d\", rlimit_fsize: \"f\",\n" ++
+  "      rlimit_nofile: \"n\", rlimit_stack: \"s\", rlimit_as: \"v\", rlimit_nproc: \"u\",\n" ++
+  "      rlimit_memlock: \"l\", rlimit_rss: \"m\" }[k]\n" ++
   "  end\n" ++
   "\n" ++
   "  def self.__to_pid(pid)\n" ++
@@ -6878,6 +6905,7 @@ let core_prelude_k =
   "      instance_variable_set(n, v.is_a?(String) ? v.dup : v)\n" ++
   "    end\n" ++
   "    @__io_fd = nfd\n" ++
+  "    @__io_timeout = orig.instance_variable_get(:@__io_timeout)\n" ++
   "    @__io_wfd = IO.__fddup(orig.instance_variable_get(:@__io_wfd)) if @__io_wfd\n" ++
   "    @__io_pid = nil\n" ++
   "    @__io_ac = true\n" ++
@@ -7351,6 +7379,15 @@ let core_prelude_k =
   "  def autoclose?\n" ++
   "    __any_closed!\n" ++
   "    !@__f_keep_fd\n" ++
+  "  end\n" ++
+  "\n" ++
+  "  # IO#timeout (ruby 3.2): nil, or the seconds a blocking read or write may\n" ++
+  "  # wait. Kept and answered, and carried by #dup; the wait itself does not\n" ++
+  "  # end by it yet (KNOWN_GAPS).\n" ++
+  "  def timeout = @__io_timeout\n" ++
+  "  def timeout=(t)\n" ++
+  "    raise TypeError, \"no implicit conversion of #\{t.class} into Float\" unless t.nil? || t.is_a?(Numeric)\n" ++
+  "    @__io_timeout = t\n" ++
   "  end\n" ++
   "\n" ++
   "  def autoclose=(v)\n" ++
@@ -7882,6 +7919,9 @@ let store_stats = fn world ->
   let _ = row "bytes_thread_flag" (map_bytes thread_flag) in
   let _ = row "bytes_gc_bare" (map_bytes gc_bare) in
   let _ = row "gc_blocked" (if map_has gc_state "blocked" then map_get gc_state "blocked" else 0) in
+  // ...and how many of the collections ran in the middle of a body, on a
+  // stack of their own (note 270, gc_collect_off_stack)
+  let _ = row "gc_in_body" (if map_has gc_state "nib" then map_get gc_state "nib" else 0) in
   row "insp_seen" (map_len insp_seen);
 
 let data_ctx = map_new ();
@@ -7974,6 +8014,15 @@ let cli_loop_wrap = fn (prog: Stmt list) ->
      stmts_app (pre_only prog) (loop_splice wp (filter_mid prog)))
   else prog;
 
+// The end of a process OF a signal (ruby's ruby_default_signal): stdout's
+// buffer out first -- a signal ends the process without flushing stdio --
+// then the default disposition and the signal. A signal whose default is to
+// be ignored, or one this host does not deliver, comes back here, and the
+// exit status a shell shows for it is the answer.
+let die_of_signal = fn (sg: int) -> fn (st: int) ->
+  let _ = print_no_nl "" in
+  let _ = (if sg > 0 then (let _ = proc_sig_default sg in proc_sig_raise sg) else 0) in
+  exit st;
 let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   let (src, bom9) = src_prepare src0 in
   // diagnostics that must see the rubygems PRELOAD switch on here, first:
@@ -8897,6 +8946,17 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   //     pressure" stopped being a guess.
   let _ = map_set gc_state "nolvup" (if str_eq (env_get "MERE_RUBY_GC_NO_LVUP_ROOT") "" then 0 else 1) in
   let _ = map_set gc_state "tight" (if str_eq (env_get "MERE_RUBY_GC_TIGHT") "" then 0 else 1) in
+  //   MERE_RUBY_GC_STRESS=N collects off the stack at every Nth body safepoint
+  //     (gc_point), pressure or not: a missing root shows up in a corpus run
+  //   MERE_RUBY_GC_KEEP_PROCS=1 sweeps no proc (every proc is kept, as before
+  //     note 270): whether a lost value was a proc the sweep took
+  let _ = (if str_eq (env_get "MERE_RUBY_GC_KEEP_PROCS") "" then () else map_set gc_state "keepprocs" 1) in
+  let _ = (let v9 = env_get "MERE_RUBY_GC_STRESS" in
+           if str_eq v9 "" then () else map_set gc_state "stress" (int_of_str v9)) in
+  // SIGPIPE is caught and does nothing, as ruby has it from its first
+  // instruction: a write to a pipe or socket nobody reads is Errno::EPIPE,
+  // and a child started later begins with the default (m_state's extern)
+  let _ = proc_sig_noop 13 in
   let _ = (if str_eq (env_get "MERE_RUBY_INTERN_LOG") "" then () else map_set intern_log "on" 1) in
   // ⚠ BEGIN { } runs before the driver, and an exception out of it went past
   //   everything to the runtime, which printed "fail: mere-ruby: (ruby
@@ -8941,7 +9001,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
          // while any is left (see gc_collect).
          let _ = (if gc_auto_off () then ()
                   else (let _ = (if fb_live () > 0 then (let _ = fb_reclaim env world in ()) else ()) in
-                        gc_collect env world)) in
+                        gc_collect_any env world)) in
          gc_drive (cursor + consumed) v2)
       else if flag == 1 then gc_drive gc_total v2
       else if flag == 2 then gc_drive (gc_total + 1) lastv
@@ -8974,14 +9034,30 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
                          then (match map_get ivars (str_of_int eid ++ "@__status") with VInt n -> n | _ -> 0)
                          else 0) in
                exit (ae9 exc st))
-            // ...and an unrescued SignalException (Interrupt too) ends it the
-            // way the signal would: nothing printed, a 128 + signo status
+            // ...and an unrescued SignalException (Interrupt too) ends it OF
+            // the signal, as ruby's does (exiting_split): the at_exit handlers
+            // first, then the default disposition and the signal itself, so the
+            // parent's wait sees `signaled?` and the signal's number. Nothing
+            // is printed for SignalException itself; a subclass (Interrupt)
+            // is reported first, as ruby reports it. (It was an exit with
+            // status 128 + signo, which a shell prints the same and
+            // Process::Status does not: signaled? was false.)
             else if str_eq ec "SignalException" || str_eq ec "Interrupt"
                     || str_list_has (ancestors_of world ec) "SignalException" then
               (let sg9 = (match (if map_has ivars (str_of_int eid ++ "@__sigpair") then map_get ivars (str_of_int eid ++ "@__sigpair") else VNil) with
                           | VArr a9 -> (match deref a9 with Cons (VInt n9, _) -> n9 | _ -> 0)
                           | _ -> 0) in
-               exit (ae9 exc (128 + sg9)))
+               let st9 = ae9 exc (128 + sg9) in
+               let _ = (if str_eq ec "SignalException" then () else print_err (top_report env world exc name)) in
+               die_of_signal sg9 st9)
+            // ...and an Errno a write to stdout raised with SIGPIPE attached
+            // (out_refused, ruby's rb_sys_fail_on_write): unrescued, it ends
+            // the process of that signal, and says nothing
+            else if (match (if map_has ivars (str_of_int eid ++ "@__signo") then map_get ivars (str_of_int eid ++ "@__signo") else VNil) with
+                     | VInt _ -> str_list_has (ancestors_of world ec) "SystemCallError"
+                     | _ -> false) then
+              (let sg9 = (match map_get ivars (str_of_int eid ++ "@__signo") with VInt n9 -> n9 | _ -> 0) in
+               die_of_signal sg9 (ae9 exc (128 + sg9)))
             else
             let st9 = ae9 exc 1 in
             let _ = print_err (top_report env world exc name) in

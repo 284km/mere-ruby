@@ -29,6 +29,9 @@ fi
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 (cd "$root" && "$MERE" -c main.mere > "$tmp/mr.c")
 python3 "$here/asan_patch.py" "$tmp/mr.c" "$tmp/mr_asan.c"
-clang -O1 -fsanitize=address -fno-omit-frame-pointer -Wl,-stack_size,0x20000000 \
+# -D__LANG_CORO_ASAN: the runtime tells ASan about each coroutine switch, which
+# it needs once a collection runs on a coroutine of its own (note 270) -- every
+# collection, in a build that has them
+clang -O1 -fsanitize=address -fno-omit-frame-pointer -D__LANG_CORO_ASAN -Wl,-stack_size,0x20000000 \
   -fbracket-depth=1024 -w "$tmp/mr_asan.c" -o "$out"
 echo "asan_build: $out"

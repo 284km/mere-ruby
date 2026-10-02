@@ -34,44 +34,56 @@ so this corner is known-broken upstream through 3.3.
 The row is expected to go back to MATCH when the gate's ruby is upgraded; if
 it does not, this entry is wrong and the hook suppression is real.
 
-## Nothing is collected while a method or block body is running
+## A collection in the middle of a body needs a build with coroutines
 
 ```ruby
 def f = 300_000.times { [1, 2, 3].map(&:to_s) }
-f    # MERE_RUBY_GC_LOG=1 reports 0 collections; at the top level, 24
+f    # collected in the middle of the block now (gc_in_body in MERE_RUBY_STORE_STATS)
 ```
 
-A collection may run only at a statement boundary with no method or block
-body below it on the stack (`gc_unsafe`, main.mere): a caller's half-evaluated
-expression can hold a value nothing else reaches -- `arr.pop.foo(bar)` while
-`bar` runs -- and the mark cannot see it. So a long method, a long block, and
-everything under `at_exit` run uncollected. That is all of a test/unit file
-(its runner is an at_exit block): test_class, test_integer and test_yield
-reach 5-6 GB on what they allocate, not on what they keep. Collecting inside
-bodies needs those in-flight values rooted -- the evaluator's argument lists
-and receivers, and the accumulators of every builtin that yields -- which is
-a change to the collector, not to any one method.
-test_range's test_range_bsearch_for_floats is the plainest case: every
-check asserts once per value the search yielded (60 to 130 assertions), an
-assertion allocates 20-60 KB, and 1274 checks pass 6 GB. It finished while
-`assert_operator` was a NameError on its first call (note 266).
+Until note 270 a collection could run only at a statement boundary with no
+method or block body below it on the stack: a caller's half-evaluated
+expression -- `arr.pop.foo(bar)` while `bar` runs -- holds a value only a C
+variable names. All of a test/unit file runs under at_exit, so test_class,
+test_yield and test_range reached 6 GB uncollected. Every collection now runs
+on a coroutine of its own (`gc_collect_any`): the interrupted stack is
+suspended for the length of it and is rooted as a suspended fiber's is (its
+frames by depth, the watermarks, a scan of what it reaches), and Mere's pin
+keeps every arena it points into. What is left:
 
-## Mere's map recycle can overrun a dedicated block (mere-ruby works around it)
+- **Wasm and the RV targets** have no coroutines (m_fiber_nothreads.mere), so
+  there a body's boundaries are still not safepoints, as before.
+- **A store a suspended stack points into is not compacted** (Mere v0.1.589:
+  a compaction under a pin does nothing). Its dead entries are deleted in
+  place, but its bytes come back only at a collection where no stack points
+  there -- with two thousand fibers suspended, that is never. The fiber
+  benchmark in note 270 holds 1.66 GB where the unsound pin let go to 1.15 GB.
+- **A value only a C variable holds, past three hops through someone else's
+  arena,** is not seen by the scan (as for a suspended fiber, Q-182). Nothing
+  in the corpus, in a collection at every third safepoint, has met it.
 
-A container's private arena keeps its OLDEST block when `*_recycle` winds it
-back, and calls it the 4 KB seed; but a value bigger than a quarter of the
-seed gets a dedicated block chained in BEHIND the bump block, so with the
-seed still current the oldest block is the dedicated one, and the next
-allocations run off its end into the heap. In mere-ruby's frame pool that
-corrupted an exception's message beside it, a deep copy asked malloc for an
-absurd size, and Mere's "out of memory" fail left the default region's lock
-held: the process stopped silently in test/unit's failure path (note 269,
-unittest/repro/269_frame_pool_overflow.rb). frame_pool_put now compacts a
-frame whose arena grew past its seed instead of recycling it. The runtime
-fix (recycle keeps the block's real capacity; no out-of-memory fail while
-the region lock is held) is a patch for Mere, not yet in a Mere release;
-until it is, any other `map_recycle` / `vec_recycle` of a grown container
-has the same edge.
+`MERE_RUBY_GC_STRESS=N` collects at every Nth safepoint whatever the pressure,
+and `MERE_RUBY_GC_KEEP_PROCS=1` keeps every proc (the rule before note 270,
+when every proc and everything it captured was a root): the two switches a
+lost value is chased with.
+
+## A child a signal killed is told from an exit code by its number
+
+```ruby
+pid = spawn("kill -PIPE $$"); Process.wait(pid)
+$?.signaled?   # true, termsig 13 -- as ruby
+system("exit 141"); $?.signaled?   # true here; ruby: false, exitstatus 141
+```
+
+A child is started and waited for by a shell (Process.spawn), and what the
+shell reports is an exit status: a child killed by signal N is `128 + N`,
+which is also what `exit 128 + N` gives. Process::Status reads 129 to 192 as
+the signal -- `exitstatus` nil, `signaled?`, `termsig`, ruby's `to_s` -- so
+CRuby's test_io sees the SIGPIPE its closed-pipe test asks for. A program
+that exits with one of those numbers on purpose reads as signaled; no test in
+CRuby's test/ does. Telling them apart needs the wait(2) status, which the
+shell does not pass on.
+
 ## An Array of ten million elements overflows the native stack
 
 `(1..10_000_000).to_a` and `f(*(1..10_000_000))` end in "stack overflow

@@ -34,13 +34,27 @@ extern fn udp_recv: int -> int -> int -> int;
 extern fn socket: int -> int -> int -> int;
 extern fn listen: int -> int -> int;
 extern fn shutdown: int -> int -> int;
-// sigignore(2) is <signal.h>'s int-only way to set SIG_IGN. A write to a
-// socket whose peer is gone raises SIGPIPE, whose default is to END the
-// process without a word; ruby ignores it and answers Errno::EPIPE. The
-// runtime's tcp_listen did this as a side effect, so a program that only
-// connected, or only listened through listen(2), died on its first write to a
-// closed peer. The socket library asks for it once, when it makes a socket.
-extern fn sigignore: int -> int;
+// SIGPIPE's disposition, and what became of a write to stdout (Mere
+// v0.1.589). A write to a pipe or socket nobody reads any more raises
+// SIGPIPE, whose default is to END the process without a word; ruby catches
+// it with a handler that does nothing (install_sighandler(SIGPIPE,
+// sig_do_nothing)) and answers Errno::EPIPE. proc_sig_noop is that handler,
+// installed at startup (run_src), with ruby's rule for what was inherited: a
+// disposition that is not the default is kept.
+// ⚠ It was sigignore(2) -- SIG_IGN, asked for at the first pipe or socket --
+//   and an ignored signal STAYS ignored across exec(2): every child started
+//   afterwards ignored SIGPIPE too, and the runtime dropped the refused writes,
+//   so a child `loop { puts :ok }` whose reader had gone printed into nothing
+//   until something killed it (94 s of test_io, note 270). A handler goes back
+//   to the default at exec, so a child starts as ruby's children do.
+// proc_out_errno is the errno of the last write print_no_nl could not make
+// (asking clears it): out_check turns it into ruby's Errno, and a stdout one
+// carries SIGPIPE (rb_sys_fail_on_write), which an unrescued EPIPE then dies
+// of -- proc_sig_default and proc_sig_raise (m_driver's top level).
+extern fn proc_sig_noop: int -> int;
+extern fn proc_sig_default: int -> int;
+extern fn proc_sig_raise: int -> int;
+extern fn proc_out_errno: unit -> int;
 // bind(2), getsockname(2) and getpeername(2) take a `struct sockaddr *`, which
 // no extern can spell, so compiler v0.1.555 keeps the sockaddr on its side:
 // an address goes in as the text getaddrinfo(3) reads and comes out as
@@ -52,6 +66,10 @@ extern fn sigignore: int -> int;
 // read the peer reset is -1 with ECONNRESET, where it used to be a bare -1.
 extern fn tcp_listen_at: str -> int -> int -> int;
 extern fn sock_bind: int -> str -> int -> int;
+// socketpair(2) fills an array, so Mere v0.1.589 keeps it on its side: an
+// AF_UNIX pair, both descriptors in one int (first * 2^20 + second); type 1
+// stream, 2 datagram, 5 seqpacket; -1 with fd_last_errno
+extern fn sock_pair: int -> int;
 extern fn sock_local_addr: int -> str;
 extern fn sock_peer_addr: int -> str;
 extern fn fd_last_errno: unit -> int;
@@ -190,14 +208,6 @@ extern fn fd_pipe: unit -> int;
 // dup(2) cannot do, and #fsync is the kernel's own promise.
 extern fn dup2: int -> int -> int;
 extern fn fsync: int -> int;
-// ...and SIGPIPE's disposition, which is the difference between a write to a
-// pipe nobody reads any more being Errno::EPIPE (ruby) and the process dying
-// of the signal (C's default). <signal.h> declares `int sigignore(int)`, so
-// this is exact too. It is asked for when the program makes its first pipe
-// and not at startup: the builtin output path does not look at a write's
-// result, so a program whose OWN stdout is a closed pipe is ended by the
-// signal and would otherwise go on printing into nothing.
-extern fn sigignore: int -> int;
 // O_NONBLOCK on a descriptor. ⚠ Both ends of a pipe get it, and the reason is
 //   this interpreter's THREAD MODEL rather than performance: a thread body
 //   here runs to completion at Thread.new, so when a read would block there is
@@ -271,6 +281,13 @@ let alloc_oid = fn om ->
   let _ = map_set oid_next "n" (id + 1) in
   id;
 let arr_store = map_new ();
+// ⚠ an arena of its own FROM BIRTH (note 270): map_bytes answers 0 for a
+//   container that lives in the default region, so the collector's byte
+//   pressure (gc_store_bytes) read nothing until a first collection had
+//   compacted the stores -- and a program that makes arrays and strings but
+//   few objects never reached the entry threshold either: it was not
+//   collected at all. (Empty here, so the compaction moves nothing.)
+let _ = map_compact arr_store;
 // Array ids come from a counter: the collector deletes dead entries now, so
 // map_len shrinks and a length-derived id would collide with a survivor's.
 // Slots, not names: every key here is a literal in this tree, and a string
@@ -344,6 +361,7 @@ let arr_set = fn (id: int) -> fn (xs: Val list) ->
 // evaluation — entries are never removed. A vec gives O(1) alloc/get/set
 // (string allocation is far hotter than array allocation).
 let str_store = vec_new ();
+let _ = vec_compact str_store;  // (an arena of its own from birth: see arr_store)
 // ⚠ ONE SNAPSHOT PER SUBJECT, NOT PER MATCH. A MatchData keeps the subject it
 // matched against (for #string / #pre_match / #post_match / $` / $'), and it
 // has to be the text AS IT WAS -- ruby's MatchData holds a frozen copy. Making
@@ -395,6 +413,7 @@ let mkstr = fn (s: str) ->
 // that is what makes this safe, and it is why nothing else may vec_get it.
 let str_pend = map_new ();
 let str_pch = map_new ();
+let _ = map_compact str_pch;  // (an arena of its own from birth: see arr_store)
 // 1: folds (MERE_RUBY_STORE_STATS) -- the number that says whether some read
 // path keeps undoing the queue
 let str_pend_n = map_new ();
@@ -506,6 +525,7 @@ let stdin_src_pos = map_new ();
 // which holds the interleaved [k1,v1,k2,v2,...] pair list. Aliases share one
 // mutable hash (h[k]=v is seen through every reference).
 let hash_store = vec_new ();
+let _ = vec_compact hash_store;  // (an arena of its own from birth: see arr_store)
 // The signal names a program may trap, and the handlers it registered
 // (signal_traps, keyed by the short name). Nothing outside delivers a signal
 // to this process's handlers; the one source there is -- Process.kill of our
@@ -964,6 +984,7 @@ let enc_ascii_compat = fn (nm: str) ->
 // (has, params, body, captured env) — the env is a Map, so like arrays a
 // proc lives behind an int handle rather than inside the Val variant.
 let proc_store = map_new ();
+let _ = map_compact proc_store;  // (its own arena: gc_churn_bytes, note 270)
 // proc id -> the block in scope where the proc/lambda was created, so that
 // `yield` inside a proc body resolves to the DEFINING method's block (Ruby
 // semantics), not the block of whatever method later runs the proc.
@@ -1156,9 +1177,17 @@ let map_copy = fn m ->
 //   0 n (the generation)   1 off (MERE_RUBY_NO_MRO_CACHE, read once)
 let mro_gen = map_new ();
 let mro_anc = map_new ();      // cls -> its linearized ancestors
+let _ = map_compact mro_anc;  // (its own arena: gc_churn_bytes, note 270)
 let mro_anc_gen = map_new ();  // cls -> the generation that list was built at
 let mro_mods = map_new ();     // cls -> the modules included into it, expanded
+let _ = map_compact mro_mods;  // (its own arena: gc_churn_bytes, note 270)
 let mro_mods_gen = map_new ();
+// two lists of names, element by element (a memo above is rewritten only when
+// what it holds changed: see ancestors_of)
+let rec strs_same = fn (a: str list) -> fn (b: str list) ->
+  match a with
+  | Nil -> (match b with Nil -> true | _ -> false)
+  | Cons (x, xs) -> (match b with Cons (y, ys) -> str_eq x y && strs_same xs ys | Nil -> false);
 let mro_bump = fn () ->
   let n = (if map_has mro_gen 0 then map_get mro_gen 0 else 0) in
   map_set mro_gen 0 (n + 1);
@@ -1174,6 +1203,7 @@ let mro_now = fn () -> if map_has mro_gen 0 then map_get mro_gen 0 else 0;
 // -- which is also how it is tested: the corpus and the spec sweep have to
 // give the same answers with the memo off as with it on.
 let hm_memo = map_new ();
+let _ = map_compact hm_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo_gen = map_new ();
 
 let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
@@ -1267,8 +1297,9 @@ let frame_pool_put = fn f ->
       map_set frame_pool_n 5
         ((if map_has frame_pool_n 5 then map_get frame_pool_n 5 else 0) + map_bytes f)
     else () in
-  // ⚠ ...but NOT by map_recycle when the arena grew past its seed. Recycling
-  //   keeps the OLDEST block and calls it the 4 KB seed, and a value bigger
+  // ⚠ Until Mere v0.1.589 a frame whose arena grew past its seed could not be
+  //   wound back by map_recycle. Recycling keeps the OLDEST block and called
+  //   it the 4 KB seed, and a value bigger
   //   than a quarter of the seed gets a dedicated block chained in BEHIND the
   //   bump block -- so with the seed still current, the oldest block is that
   //   dedicated one (2928 bytes for a test/unit failure message), and the
@@ -1276,12 +1307,11 @@ let frame_pool_put = fn f ->
   //   What lived there (an exception's message, here) came back as garbage,
   //   a deep copy of it asked malloc for an absurd size, and Mere's "out of
   //   memory" fail left the default region's lock held: the next allocation
-  //   waited on itself, silently (note 269). A grown frame starts over in a
-  //   fresh 4 KB region instead (map_compact on an empty map), its old blocks
-  //   freed whole; a frame that stayed in its seed is wound back as before.
-  let _ = (if arena_measurable && map_bytes f > 4096
-           then (let _ = map_clear f in map_compact f)
-           else map_recycle f) in
+  //   waited on itself, silently (note 269). A grown frame was compacted
+  //   instead. v0.1.589 recycles to the kept block's own capacity, so every
+  //   frame is wound back again (note 270);
+  //   unittest/repro/269_frame_pool_overflow.rb is the witness.
+  let _ = map_recycle f in
   let n = (if map_has frame_pool_n 0 then map_get frame_pool_n 0 else 0) in
   // cap the pool at the deepest call stack seen; past that, drop the frame
   // (its arena was already wound back, so the residue is the struct alone).
@@ -1626,7 +1656,19 @@ let stamp_meth_src_proc = fn (key: str) -> fn (pk: str) ->
   then (let _ = map_set meth_src key (map_get proc_src pk) in
         map_set meth_src ("f" ++ key) (map_get proc_src ("f" ++ pk)))
   else ();
+// ⚠ HOW MANY PROC IDS WERE EVER ISSUED, not how many procs there are (note
+//   270). A new proc's id was `handle_base + map_len proc_store` at forty
+//   sites, which is only an unused id while nothing is ever deleted -- and the
+//   collector now sweeps the procs nothing reaches. proc_next answers what
+//   map_len did for as long as no proc was swept, and never goes back.
+let proc_hi = map_new ();
+let proc_next = fn (u: unit) -> handle_base + (if map_has proc_hi 0 then map_get proc_hi 0 else map_len proc_store);
+let proc_issued = fn (k: str) ->
+  let n = int_of_str k - handle_base + 1 in
+  let cur = (if map_has proc_hi 0 then map_get proc_hi 0 else map_len proc_store) in
+  if n > cur then map_set proc_hi 0 n else ();
 let store_proc = fn (k: str) -> fn entry ->
+  let _ = proc_issued k in
   let (_, _, _, penv) = entry in
   let _ = mark_captured penv in
   let _ = (if map_has proc_src k then () else map_set proc_src k (VInt (cur_line ()))) in
@@ -2575,6 +2617,7 @@ let autoload_busy = map_new ();
 // this is how `autoload :Set, "set"` knows that `require "set"` is running it.
 let req_loading = map_new ();
 let prim_missing = map_new ();
+let _ = map_compact prim_missing;  // (its own arena: gc_churn_bytes, note 270)
 
 // A parse error is raised deep in the parser, which has no idea which file it
 // is reading: a gem's syntax error arrived as a bare "unexpected token: =",
@@ -2676,7 +2719,31 @@ let raise_bt = map_new ();
 let bi_owner_set = map_new ();
 let bi_owner_memo = map_new ();
 let bi_reg_n = map_new ();
+let _ = map_compact bi_reg_n;  // (its own arena: gc_churn_bytes, note 270)
 let bi_reg_r = map_new ();
+let _ = map_compact bi_reg_r;  // (its own arena: gc_churn_bytes, note 270)
+// THE TABLES REWRITTEN AS THE PROGRAM RUNS (note 270). A write into a map
+// copies the value into the map's arena, and the copy it replaces stays there:
+// a memo rebuilt at every generation (mro_anc, mro_mods, hm_memo), the
+// builtin running now (bi_reg_n / bi_reg_r), the call a NoMethodError may be
+// built from (prim_missing). Each has an arena of its own from birth (the
+// map_compact after its definition), the collector compacts it -- the
+// replaced copies go back as a whole -- and its bytes count toward the
+// collector's pressure, so a program whose garbage is only here is collected.
+// (In the default region they could never be given back at all.)
+let gc_churn_bytes = fn (u: unit) ->
+  map_bytes mro_anc + map_bytes mro_mods + map_bytes hm_memo
+  + map_bytes prim_missing + map_bytes bi_reg_n + map_bytes bi_reg_r
+  // ...and the procs: each one copies its body's AST into this arena, and the
+  // dead ones are swept now (gc_collect)
+  + map_bytes proc_store;
+let gc_churn_compact = fn (u: unit) ->
+  let _ = map_compact mro_anc in
+  let _ = map_compact mro_mods in
+  let _ = map_compact hm_memo in
+  let _ = map_compact prim_missing in
+  let _ = map_compact bi_reg_n in
+  map_compact bi_reg_r;
 let bi_reg_get = fn (u: unit) ->
   (if map_has bi_reg_n 0 then map_get bi_reg_n 0 else "",
    if map_has bi_reg_r 0 then map_get bi_reg_r 0 else VNil,
@@ -2694,9 +2761,27 @@ let bi_light = fn (r: Val) ->
   | VBig _ -> VBig "1"
   | VRat (_, _) -> VRat ("0", "1")
   | other -> other;
+// ...and the receiver is written only when it changes (the name already was,
+// map_set_si): a write copies into the map's arena and the copy it replaces
+// stays there, once per builtin call -- 81 MB of test_subclass_gc's default
+// region (note 270)
+let bi_same = fn (a: Val) -> fn (b: Val) ->
+  match a with
+  | VInt x -> (match b with VInt y -> x == y | _ -> false)
+  | VStr x -> (match b with VStr y -> x == y | _ -> false)
+  | VArr x -> (match b with VArr y -> x == y | _ -> false)
+  | VHsh x -> (match b with VHsh y -> x == y | _ -> false)
+  | VObj x -> (match b with VObj y -> x == y | _ -> false)
+  | VSym x -> (match b with VSym y -> str_eq x y | _ -> false)
+  | VClass x -> (match b with VClass y -> str_eq x y | _ -> false)
+  | VExc (x, _) -> (match b with VExc (y, _) -> str_eq x y | _ -> false)
+  | VNil -> (match b with VNil -> true | _ -> false)
+  | VBool x -> (match b with VBool y -> x == y | _ -> false)
+  | _ -> false;
 let bi_reg_set = fn (n: str) -> fn (r: Val) -> fn (d: int) ->
   let _ = map_set_si bi_reg_n 0 n in
-  let _ = map_set bi_reg_r 0 (bi_light r) in
+  let lr = bi_light r in
+  let _ = (if map_has bi_reg_r 0 && bi_same (map_get bi_reg_r 0) lr then () else map_set bi_reg_r 0 lr) in
   map_set struct_ctr "bd" d;
 // a rescue ends whatever builtin raised at or above its own depth; a later
 // raise at this depth is the program's, not that builtin's

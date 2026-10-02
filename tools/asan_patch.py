@@ -43,7 +43,21 @@ rep('''      r->top = (char*)old + new_al;
       r->alloc_total += new_al - old_al;''', '''      r->top = (char*)old + new_al;
       ASAN_UNPOISON_MEMORY_REGION(old, new_al);
       r->alloc_total += new_al - old_al;''')
-rep('''    r->blocks = b;
+# (Mere v0.1.589: the recycle keeps the block's own capacity, b->pad, where it
+# claimed 4096 -- the overrun note 269 found -- so the seed is poisoned as far
+# as that block reaches; the old shape is still accepted for an older Mere)
+if s.count('''    r->top = r->base;
+    r->cap = b->pad;''') > 0:
+    rep('''    r->blocks = b;
+    r->base = (char*)(b + 1);
+    r->top = r->base;
+    r->cap = b->pad;''', '''    r->blocks = b;
+    r->base = (char*)(b + 1);
+    ASAN_POISON_MEMORY_REGION(r->base, b->pad);
+    r->top = r->base;
+    r->cap = b->pad;''', 'any')
+else:
+    rep('''    r->blocks = b;
     r->base = (char*)(b + 1);
     r->top = r->base;
     r->cap = 4096;''', '''    r->blocks = b;
