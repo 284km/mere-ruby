@@ -51,6 +51,31 @@ reach 5-6 GB on what they allocate, not on what they keep. Collecting inside
 bodies needs those in-flight values rooted -- the evaluator's argument lists
 and receivers, and the accumulators of every builtin that yields -- which is
 a change to the collector, not to any one method.
+test_range's test_range_bsearch_for_floats is the plainest case: every
+check asserts once per value the search yielded (60 to 130 assertions), an
+assertion allocates 20-60 KB, and 1274 checks pass 6 GB. It finished while
+`assert_operator` was a NameError on its first call (note 266).
+
+## A dangling value in test/unit's failure path ends in a deadlock
+
+```
+cd <ruby-src>/test/ruby
+# a test whose assert_in_out_err fails on the child's stderr, run under the
+# runner, after `M.module_eval(...) do end` style finalizer warnings
+```
+
+Seen once, reliably, with test_objectspace's test_finalizer_with_super
+before its child stopped printing warnings (its own bug, fixed): in the
+parent, inside assert_all_assertions' ensure, `invoke_val_c` records its
+receiver (bi_reg_set) by copying it into a global map, and the receiver --
+a two-string tuple -- points into freed region memory. The copy reads a
+garbage length, malloc fails, and Mere's "out of memory" fail is raised
+while the allocator holds the default region's lock, so the next
+allocation waits on itself forever (the lock's owner is the waiting
+thread). The same file at fd6671e hangs the same way once its child can be
+started, so it is older than the change that exposed it. Two things are
+wrong: a value outlives its region (mere-ruby or Mere), and an allocation
+failure leaves the region lock held (Mere's runtime).
 
 ## An Array of ten million elements overflows the native stack
 
@@ -79,17 +104,6 @@ The matcher backtracks by recursion, and a bounded repeat of a group that can
 match empty nests a frame per iteration per position. ruby answers through
 its match cache. test_regexp's test_cache_opcodes_initialize asks, and the
 file stops there.
-
-## A child Ruby is spawned as `./ruby`
-
-`RbConfig.ruby` is answered by the interpreter and `defined?(RbConfig.ruby)`
-is nil, so tool/lib's `EnvUtil.rubybin` falls back to "ruby" and sets
-`CONFIG['bindir']` to "."; the built-in `RbConfig.ruby` then answers
-"./ruby" ahead of envutil's own `attr_reader`. Every test that starts a child
-interpreter (`assert_in_out_err`, `EnvUtil.invoke_ruby`) fails with
-`Errno::ENOENT - ./ruby` -- 24 of test_exception's 49 errors. Fixing it means
-`defined?` seeing the method, a program's singleton method winning over the
-built-in one, and an answer that names this interpreter.
 
 ## Ractor runs sequentially: one thread of control, no isolation
 
