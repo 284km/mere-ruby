@@ -59,7 +59,11 @@ mr="${MR_BIN:-$root/mere-ruby}"
 ref="${REF_RUBY_BIN:-ruby}"
 # the per-file bound, per side: a test file that hangs (a thread waiting on a
 # pipe nobody writes) is KILLED, not signalled -- see bootstraptest/all.sh
-wall="${UNITTEST_WALL:-300}"
+# ⚠ 600, not 300: test_io takes about 270 s alone (one test, a child writing
+#   to a closed pipe, runs 94 s -- note 269), so two files at once put it
+#   past 300 and every one of its 249 tests read as X (no report). A file
+#   that really hangs costs the wall either way.
+wall="${UNITTEST_WALL:-600}"
 # ⚠ ONE SEED FOR BOTH SIDES AND EVERY RUN. tool/lib's runner shuffles the
 #   tests with a random seed, so a file that hangs or dies part-way reached a
 #   different set of tests each run: test_enumerator read 47 MATCH on one run
