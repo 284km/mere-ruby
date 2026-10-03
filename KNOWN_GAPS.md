@@ -67,6 +67,13 @@ and `MERE_RUBY_GC_KEEP_PROCS=1` keeps every proc (the rule before note 270,
 when every proc and everything it captured was a root): the two switches a
 lost value is chased with.
 
+## IO#timeout is kept but does not end a wait
+
+`r.timeout = 0.1` is kept, answered, and carried by `#dup` (test_io's
+dup_timeout), but a blocking read or write does not raise IO::TimeoutError
+when it runs out: the readiness loop of the IO layer waits as before.
+test_io's blocking_timeout and recycled_fd_close need the wait itself.
+
 ## A child a signal killed is told from an exit code by its number
 
 ```ruby
