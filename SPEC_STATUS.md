@@ -40,7 +40,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 42 | 0 | 0 | 1 | 0 | 43 |
 | core/env | 44 | 0 | 0 | 1 | 0 | 45 |
-| core/exception | 34 | 5 | 0 | 0 | 0 | 39 |
+| core/exception | 36 | 3 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 47 | 0 | 0 | 3 | 0 | 50 |
 | core/integer | 59 | 1 | 0 | 9 | 1 | 70 |
@@ -86,9 +86,9 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/dir | 32 | 0 | 0 | 2 | 0 | 34 |
 | core/file | 59 | 7 | 0 | 2 | 0 | 68 |
 | core/time | 58 | 5 | 0 | 3 | 0 | 66 |
-| core/io | 76 | 4 | 0 | 1 | 0 | 81 |
+| core/io | 77 | 3 | 0 | 1 | 0 | 81 |
 | library/date | 60 | 0 | 0 | 38 | 0 | 98 |
-| library/etc | 12 | 0 | 0 | 7 | 0 | 19 |
+| library/etc | 11 | 0 | 0 | 7 | 1 | 19 |
 | library/pathname | 18 | 0 | 0 | 2 | 0 | 20 |
 | library/stringio | 61 | 1 | 0 | 2 | 0 | 64 |
 | library/cgi | 8 | 0 | 0 | 7 | 0 | 15 |
@@ -120,7 +120,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/objectspace/weakmap | 15 | 0 | 0 | 0 | 0 | 15 |
 | core/process | 28 | 11 | 0 | 1 | 0 | 40 |
 | core/process/gid | 0 | 0 | 0 | 8 | 0 | 8 |
-| core/process/status | 2 | 6 | 0 | 9 | 0 | 17 |
+| core/process/status | 7 | 1 | 0 | 9 | 0 | 17 |
 | core/process/sys | 0 | 0 | 0 | 15 | 0 | 15 |
 | core/process/tms | 4 | 0 | 0 | 0 | 0 | 4 |
 | core/process/uid | 0 | 0 | 0 | 8 | 0 | 8 |

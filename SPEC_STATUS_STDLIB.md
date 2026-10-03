@@ -67,14 +67,14 @@ them, is what ships; the two are not added together.
 | library/timeout | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/find | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/net-http/httprequest | 1 | 0 | 0 | 0 | 0 | 1 |
-| library/socket/unixsocket | 1 | 14 | 0 | 0 | 0 | 15 |
+| library/socket/unixsocket | 2 | 13 | 0 | 0 | 0 | 15 |
 | library/socket/udpsocket | 5 | 5 | 0 | 0 | 0 | 10 |
 | library/socket/tcpsocket | 7 | 2 | 0 | 0 | 0 | 9 |
 | library/win32ole/win32ole_variable | 0 | 0 | 0 | 8 | 0 | 8 |
 | library/uri/mailto | 1 | 0 | 0 | 7 | 0 | 8 |
 | library/net-http/httpgenericrequest | 10 | 0 | 0 | 0 | 0 | 10 |
 | library/uri/ftp | 2 | 0 | 0 | 5 | 0 | 7 |
-| library/objectspace | 0 | 1 | 6 | 0 | 0 | 7 |
+| library/objectspace | 2 | 5 | 0 | 0 | 0 | 7 |
 | library/win32ole/win32ole_param | 0 | 0 | 0 | 8 | 0 | 8 |
 | library/csv/writer | 0 | 0 | 0 | 7 | 0 | 7 |
 | library/uri/escape | 0 | 0 | 0 | 4 | 0 | 4 |
@@ -89,7 +89,7 @@ them, is what ships; the two are not added together.
 | library/net-http/httpexceptions | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/pp | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/abbrev | 1 | 0 | 0 | 0 | 0 | 1 |
-| library/weakref | 2 | 3 | 0 | 0 | 0 | 5 |
+| library/weakref | 2 | 1 | 0 | 0 | 2 | 5 |
 | library/erb/util | 3 | 1 | 0 | 0 | 0 | 4 |
 | library/rubygems/gem | 1 | 1 | 0 | 0 | 0 | 2 |
 | library/csv/stringreader | 0 | 0 | 0 | 2 | 0 | 2 |
