@@ -527,7 +527,11 @@ let gc_pressure = fn world ->
   if gc_auto_off () then false
   else map_has gc_state "req"
   || map_len ivars + map_len ocls > limit
-  || gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432);
+  || gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432)
+  // ...and the captured frames waiting in lv_cap, each a frame's arena (4 KB
+  // and up) that no store's byte count sees: a loop that makes a lambda per
+  // turn and nothing else ran 80k turns without one collection (note 272)
+  || map_len lv_cap > (if map_has gc_state "cl" then map_get gc_state "cl" else 2048);
 
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
@@ -565,6 +569,22 @@ let rec gc_suffix = fn (xs: Stmt list) -> fn (n: int) ->
 // kind` says the same thing in a register: no id is negative and there are six
 // kinds, so the mapping is injective.
 //   0 obj   1 str   2 arr   3 hash   4 proc   5 bind
+// the object id a singleton class is named after: "(sng:123)", or a key that
+// starts with it ("(sng:123)#foo"), is 123; anything else is -1 (a class's
+// own singleton, "(sng:Foo)", and the nested ones are not an object's)
+let sng_key_id = fn (k: str) ->
+  if str_len k > 6 && str_eq (char_at k 0) "(" && str_eq (char_at k 4) ":" && is_digit (char_at k 5)
+     && str_eq (substring k 0 5) "(sng:" then
+    (let rec go = fn (i: int) -> fn (acc: int) ->
+       if i < str_len k && is_digit (char_at k i) then go (i + 1) (acc * 10 + (ord (char_at k i) - 48))
+       else if i < str_len k && str_eq (char_at k i) ")" then acc
+       else 0 - 1 in
+     go 5 0)
+  else 0 - 1;
+// ruby's ARY_MAX_SIZE (LONG_MAX / sizeof(VALUE)): an index a write cannot
+// reach, and how long a splice's replacement is (an Array's length, else 1)
+let ary_max_size = 1152921504606846975;
+let ary_rlen = fn (v: Val) -> match v with VArr a -> val_list_len (deref a) | _ -> 1;
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VObj id -> let k = id * 8 in
@@ -584,8 +604,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                  else let _ = map_set live k VNil in
                       let pk = str_of_int id in
                       let _ = (if map_has proc_store pk
-                               then (let (_, _, _, penv) = map_get proc_store pk in
-                                     map_iter penv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
+                               then (let (_, _, _, penv) = map_get proc_store pk in gc_mark_env live penv)
                                else ()) in
                       // ...the proc a curried one will call (its id, as a VInt)
                       let _ = (if map_has curry_target pk
@@ -604,19 +623,34 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                       // proc sweep in gc_collect: these are reached through their
                       // proc now, not all of them always)
                       (if map_has proc_yblk pk
-                       then (let (_, _, _, benv) = map_get proc_yblk pk in
-                             map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
+                       then (let (_, _, _, benv) = map_get proc_yblk pk in gc_mark_env live benv)
                        else ()))
   | VBind id -> let k = id * 8 + 5 in
                 (if map_has live k then ()
                  else let _ = map_set live k VNil in
                       (if map_has bind_store (str_of_int id)
-                       then map_iter (map_get bind_store (str_of_int id))
-                              (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)
+                       then gc_mark_env live (map_get bind_store (str_of_int id))
                        else ()))
   | VRange (a, b, _) -> let _ = gc_mark_val live a in gc_mark_val live b
   | VCpx (a, b) -> let _ = gc_mark_val live a in gc_mark_val live b
+  // an object's singleton class, held as a value (`o.singleton_class`), keeps
+  // its object: the class's methods are swept with the object (note 272)
+  | VClass c -> (let i = sng_key_id c in if i >= 0 then gc_mark_val live (VObj i) else ())
   | _ -> ()
+// an env and, through lv_up, the chain of scopes it reads through (note 272):
+// each frame id once (kind 6 of the live set). The chain used to be rooted
+// whole, every entry of lv_up, so a frame a dead proc had captured was kept
+// with everything it held; now a frame is reached through what holds it --
+// a live proc, a binding, a stack -- and lv_cap's that nothing reached are
+// given back after the mark (gc_sweep_captured).
+and gc_mark_env = fn live -> fn e ->
+  match (if map_has e "__eid" then map_get e "__eid" else VNil) with
+  | VInt n -> (let k = n * 8 + 6 in
+               if map_has live k then ()
+               else (let _ = map_set live k VNil in
+                     let _ = map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
+                     if map_has lv_up n then gc_mark_env live (map_get lv_up n) else ()))
+  | _ -> map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)
 // a parameter list's yield-block markers (`yblk_marker ++ pid`, proc_as_block):
 // each names a proc whose proc_yblk entry the tuple will read
 and gc_mark_yblk_params = fn live -> fn (ps: str list) ->
@@ -697,13 +731,7 @@ let gc_fixpoint = fn ivars -> fn live ->
 // map is the direction to fear when adding a new global store.
 let gc_mark_roots = fn env -> fn live ->
   let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
-  let mkenv = fn (k: str) -> fn (benv) ->
-    map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
-  // the same walk over a table keyed by an INT (lv_up is keyed by frame id).
-  // `map_iter`'s callback takes the key, so one callback cannot serve both.
-  let mkenvi = fn (k: int) -> fn (benv) ->
-    map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv) in
-  let _ = map_iter env mk in
+  let _ = gc_mark_env live env in
   let _ = map_iter globals mk in
   let _ = map_iter consts mk in
   let _ = map_iter enc_objs mk in
@@ -823,7 +851,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = (if fbx then ()
            else map_iter fb_state (fn (i: int) -> fn (st: int) ->
                   if (st == 1 || st == 2) && i != fb_cur ()
-                  then (let _ = fb_stack_envs i (fn (e) -> map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
+                  then (let _ = fb_stack_envs i (fn (e) -> gc_mark_env live e) in
                         let _ = fb_stack_wm i (gc_mark_wm live) in
                         // ...and what it holds in C variables (Q-182): what its
                         // statements TOOK, which the watermarks cannot see. Read
@@ -841,11 +869,16 @@ let gc_mark_roots = fn env -> fn live ->
   // (the innermost one's interval runs to now), and what it holds in C
   // variables. (fb_cur is still that stack: the collection's coroutine is not
   // a fiber.)
+  // MERE_RUBY_GC_DBG=<bits> leaves out one route of this stack's roots at a
+  // time -- 1 its frames, 2 what its statements built, 4 the scan of what it
+  // holds -- to say which one keeps a value alive. UNSOUND; a diagnostic. It
+  // said "4" for the procs `n.times { proc { } }` kept (note 272).
+  let dbg9 = (if map_has gc_state "dbg" then map_get gc_state "dbg" else 0) in
   let _ = (if map_has gc_state "inbody"
            then (let i9 = fb_cur () in
-                 let _ = fb_stack_envs i9 (fn (e) -> map_iter e (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv)) in
-                 let _ = fb_stack_wm i9 (gc_mark_wm live) in
-                 fb_scan_stack i9 handle_base hi9 (gc_mark_cand live))
+                 let _ = (if bit_and dbg9 1 != 0 then () else fb_stack_envs i9 (fn (e) -> gc_mark_env live e)) in
+                 let _ = (if bit_and dbg9 2 != 0 then () else fb_stack_wm i9 (gc_mark_wm live)) in
+                 (if bit_and dbg9 4 != 0 then () else fb_scan_stack i9 handle_base hi9 (gc_mark_cand live)))
            else ()) in
   // the subject string a match last snapshotted, which the next match of the
   // same text hands out again by its handle (rx_src_hnd, an int, so nothing
@@ -892,14 +925,98 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter yblk_pin (fn (d: int) -> fn (pid: int) -> gc_mark_val live (VProc pid)) in
   let _ = map_iter meths_g (fn (k: str) -> fn (m: Meth) ->
     match m with Meth (ps9, _, _) -> gc_mark_yblk_params live ps9) in
-  let _ = map_iter bind_store mkenv in
+  let _ = map_iter bind_store (fn (k: str) -> fn (benv) -> gc_mark_env live benv) in
   // the scope-chain parents: env maps linked by id, each holding Vals
   // (...and the parent links of a suspended fiber's active blocks, likewise)
   let _ = (if (if map_has gc_state "nolvup" then map_get gc_state "nolvup" else 0) == 1 then ()
            else if fbx then map_iter lv_up (fn (k: int) -> fn (benv) ->
                               if map_has fb_rc_eid k then () else map_iter benv (fn (kk: str) -> fn (vv: Val) -> gc_mark_val live vv))
-           else map_iter lv_up mkenvi) in
+           // ...except the links of the captured frames that have left the
+           // stack (lv_cap): those are reached through what holds them
+           else map_iter lv_up (fn (k: int) -> fn (benv) ->
+                  if map_has lv_cap k || map_has lv_capx k then () else gc_mark_env live benv)) in
   ();
+
+// the captured frames that have left the stack (lv_cap) and that the mark did
+// not reach: their lv_up links go and the frames go back to the pool, wound
+// back like any other (note 272). Only where the mark sees every stack's
+// frames -- a build with coroutines, where every collection runs off the
+// stack -- and not under the switches that keep procs or drop the links.
+let gc_sweep_captured = fn live ->
+  if fb_off_stack && (if map_has gc_state "keepprocs" then false else true)
+     && (if map_has gc_state "nolvup" then map_get gc_state "nolvup" else 0) != 1
+  then
+    (let dead = vec_new () in
+     let _ = map_iter lv_cap (fn (k: int) -> fn (e) ->
+       if map_has live (k * 8 + 6) then () else vec_push dead k) in
+     let rec go = fn (i: int) ->
+       if i >= vec_len dead then ()
+       else (let k = vec_get dead i in
+             let e = map_get lv_cap k in
+             let _ = map_delete lv_cap k in
+             let _ = (if map_has lv_up k then map_delete lv_up k else ()) in
+             let _ = frame_pool_put e in
+             go (i + 1)) in
+     let _ = go 0 in
+     let deadx = vec_new () in
+     let _ = map_iter lv_capx (fn (k: int) -> fn (e) ->
+       if map_has live (k * 8 + 6) then () else vec_push deadx k) in
+     let rec gox = fn (i: int) ->
+       if i >= vec_len deadx then ()
+       else (let k = vec_get deadx i in
+             let _ = map_delete lv_capx k in
+             let _ = (if map_has lv_up k then map_delete lv_up k else ()) in
+             gox (i + 1)) in
+     let _ = gox 0 in
+     let _ = map_set gc_state "cl" (if 2 * map_len lv_cap > 2048 then 2 * map_len lv_cap else 2048) in
+     map_set gc_state "capfree" ((if map_has gc_state "capfree" then map_get gc_state "capfree" else 0) + vec_len dead))
+  else ();
+
+// THE SINGLETON CLASSES OF THE OBJECTS THAT DIED (note 272): `def` in an
+// instance_eval, define_singleton_method, `class << o` -- each gives the object
+// a class "(sng:<id>)", and its methods, superclass link, cref and ancestor
+// list stayed in the class tables for the life of the process (2000 objects
+// made that way kept 6 table rows and an array each). The tables are walked
+// only when one of the dead had such a class.
+// (a key may carry a one-letter prefix: meth_src keeps a method's file under
+// "f" ++ its "cls#name")
+let gc_purge_tbl = fn tbl -> fn dead ->
+  let dk = vec_new () in
+  let _ = map_iter tbl (fn (k: str) -> fn v ->
+    let i = sng_key_id k in
+    let i = (if i < 0 && str_len k > 7 && str_eq (char_at k 0) "f" && str_eq (char_at k 1) "("
+             then sng_key_id (substring k 1 (str_len k)) else i) in
+    if i >= 0 && map_has dead i then vec_push dk k else ()) in
+  gc_drop_s tbl dk;
+let gc_purge_sng = fn world -> fn (dOC: Vec['d, int]) ->
+  let (meths, sup, _, _) = world in
+  let dead = map_new () in
+  let rec go = fn (i: int) ->
+    if i >= vec_len dOC then ()
+    else (let id = vec_get dOC i in
+          let _ = (if map_has sup ("(sng:" ++ str_of_int id ++ ")") then map_set dead id 1 else ()) in
+          go (i + 1)) in
+  let _ = go 0 in
+  if map_len dead == 0 then ()
+  else
+    (let _ = gc_purge_tbl meths dead in
+     let _ = gc_purge_tbl sup dead in
+     let _ = gc_purge_tbl meth_cref dead in
+     let _ = gc_purge_tbl mro_anc dead in
+     let _ = gc_purge_tbl mro_anc_gen dead in
+     let _ = gc_purge_tbl privates dead in
+     let _ = gc_purge_tbl protecteds dead in
+     let _ = gc_purge_tbl undefs dead in
+     let _ = gc_purge_tbl includes dead in
+     let _ = gc_purge_tbl prepends dead in
+     let _ = gc_purge_tbl alias_origin dead in
+     let _ = gc_purge_tbl alias_srcname dead in
+     let _ = gc_purge_tbl meth_params dead in
+     let _ = gc_purge_tbl meth_src dead in
+     let _ = gc_purge_tbl dm_methods dead in
+     let _ = gc_purge_tbl dm_captured dead in
+     let _ = gc_purge_tbl dm_closenv dead in
+     mro_bump ());
 
 // THE COLLECTION, as a plain function. Everything it needs reaches it
 // through stable handles: the world maps are rebuilt IN PLACE (survivors
@@ -950,6 +1067,7 @@ let gc_collect = fn env -> fn world ->
     let live = map_new () in
     let _ = gc_mark_roots env live in
     let _ = gc_fixpoint ivars live in
+    let _ = gc_sweep_captured live in
     // THE PROCS NOTHING REACHED (the VProc arm of gc_mark_val marks the ones
     // something does), and what was kept beside each by its id. Before note
     // 270 every proc was a root, and with it everything it had captured.
@@ -996,6 +1114,7 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter ocls (fn (k: int) -> fn (v: str) ->
       if map_has live (k * 8) then () else vec_push dOC k) in
     let _ = gc_drop_i ocls dOC in
+    let _ = gc_purge_sng world dOC in
     let _ = (if nc then () else map_compact ocls) in
     // ⚠ md_whole had NO sweep. It is one entry per successful match -- the
     // text the match covered, keyed by the MatchData's id -- and it was kept
@@ -3579,9 +3698,11 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
     else if str_eq op "!~" then
       (let vb = vb in
        match va0 with
-       | VStr sv -> let sv = sget sv in (match vb with VRegex (p, pf, _) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
-       | VSym sv -> (match vb with VRegex (p, pf, _) -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
-       | VRegex (p, pf, _) -> (match vb with VStr sv -> let sv = sget sv in VBool (if rx_match p pf sv then false else true) | VSym sv -> VBool (if rx_match p pf sv then false else true) | _ -> VBool true)
+       // `!~` is `=~` answered the other way round, so a match leaves `$~`
+       // set like `=~` does (test_time_tz reads `$~.captures` after `!~`).
+       | VStr sv0 -> let sv = sget sv0 in (match vb with VRegex (p, pf, _) -> VBool (if truthy (rx_do_match world p pf sv (senc_get sv0)) then false else true) | _ -> VBool true)
+       | VSym sv -> (match vb with VRegex (p, pf, _) -> VBool (if truthy (rx_do_match world p pf sv (sym_enc_name sv)) then false else true) | _ -> VBool true)
+       | VRegex (p, pf, _) -> (match vb with VStr sv -> VBool (if truthy (rx_do_match world p pf (sget sv) (senc_get sv)) then false else true) | VSym sv -> VBool (if truthy (rx_do_match world p pf sv (sym_enc_name sv)) then false else true) | _ -> VBool true)
        // `!~` is `=~` negated, and Object has no #=~ since ruby 3.2: a receiver
        // that does not answer it raises rather than saying "no match". A class
        // that defines either one keeps its answer.
@@ -6206,15 +6327,19 @@ and enum_collect_a = fn world -> fn (recv: Val) -> fn (cls: str) -> fn (eargs: V
    | _ -> accv)
 
 // cycle: iterate the list n times (n < 0 = forever, until a break unwinds).
-and arr_cycle = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (n: int) ->
+// Array#cycle reads the LIVE array each round, as rb_ary_cycle does: a block
+// that empties it ends the cycle (`a.cycle { a.clear }` is nil). Walking the
+// snapshot never ended, and test_array stopped there (note 272).
+and arr_cycle_live = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (n: int) ->
   if n == 0 then FNext VNil
-  // cycling an empty collection yields nothing and returns nil immediately.
-  else if (match xs with Nil -> true | _ -> false) then FNext VNil
   else
-    let _ = tick () in
-    (match arr_each world encl theblk xs with
-     | FNext _ -> arr_cycle world encl theblk xs (if n < 0 then n else n - 1)
-     | other -> other)
+    (let xs = deref id in
+     if (match xs with Nil -> true | _ -> false) then FNext VNil
+     else
+       (let _ = tick () in
+        match arr_each_live world encl theblk id 0 xs (arr_ver id) 0 with
+        | FNext _ -> arr_cycle_live world encl theblk id (if n < 0 then n else n - 1)
+        | other -> other))
 
 // the yielders that take no arguments at all (so a blockless call WITH one is
 // a wrong-arity error rather than an Enumerator). each_slice / each_cons /
@@ -6330,12 +6455,12 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     // combination / permutation with a block yield each one and return self.
     else if (str_len name == 11 && str_eq name "combination") then
       (match args with
-       | Cons (VInt k, _) -> iter_each_result (arr_each world encl theblk (arr_combinations xs k)) recv
+       | Cons (VInt k, _) -> iter_each_result (arr_tuples_yield world encl theblk xs k 0) recv
        | _ -> recv)
     else if (str_len name == 11 && str_eq name "permutation") then
       (match args with
-       | Cons (VInt k, _) -> iter_each_result (arr_each world encl theblk (arr_permutations xs k)) recv
-       | _ -> iter_each_result (arr_each world encl theblk (arr_permutations xs (val_list_len xs))) recv)
+       | Cons (VInt k, _) -> iter_each_result (arr_tuples_yield world encl theblk xs k 1) recv
+       | _ -> iter_each_result (arr_tuples_yield world encl theblk xs (val_list_len xs) 1) recv)
     // product with a block yields every tuple and answers SELF (the block form
     // reached prim_method, which has no product at all: NoMethodError).
     else if (str_len name == 7 && str_eq name "product") then
@@ -6348,8 +6473,8 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
                 | Cons (VInt k9, _) -> k9
                 | Cons (VFlt f9, _) -> int_of_float f9
                 | _ -> 0) in
-       let tuples = (if (str_len name == 20 && str_eq name "repeated_combination") then arr_rep_combos xs k else arr_rep_perms xs k) in
-       iter_each_result (arr_each world encl theblk tuples) recv)
+       iter_each_result (arr_tuples_yield world encl theblk xs k
+                           (if (str_len name == 20 && str_eq name "repeated_combination") then 2 else 3)) recv)
     // Array#initialize(n) { |i| ... } (through `send`): each index gets the
     // block's value, and a break answers its value with the prefix kept.
     // ...and, as Array.new's block form, no size is `[]` with a warning under
@@ -6611,7 +6736,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        | Cons (_, Cons (_, _)) ->
          raise_exc world "ArgumentError" "wrong number of arguments (given 2, expected 0..1)"
        | _ -> (match n9 with
-               | VInt n -> done9 (arr_cycle world encl theblk xs n)
+               | VInt n -> done9 (arr_cycle_live world encl theblk id n)
                | _ -> VNil))
     // a size below 1 is refused BEFORE the walk: val_slices never shortens on
     // a zero step, so `each_slice(0) { }` ran until the stack gave out.
@@ -7153,9 +7278,44 @@ and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> FNext VNil
   | Cons (h, t) ->
-    (match run_block world encl theblk (Cons (h, Nil)) with
+    (match run_block_turn world encl theblk (Cons (h, Nil)) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> arr_each world encl theblk t)
+
+// combination / permutation / repeated_* with a block: the tuples one at a
+// time, in ruby's (index-lexicographic) order, each yielded as it is made.
+// They were built as a list first and then walked, so
+// `(0..100).to_a.combination(50) { break }` built 100C50 of them before the
+// break (test_array's test_combination2 ran into the 6 GB guard there).
+//   mode 0 combination, 1 permutation, 2 repeated_combination,
+//   3 repeated_permutation. `pre` is the tuple so far, reversed; `used` the
+//   indices a permutation has taken.
+and arr_tuples_yield = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (k: int) -> fn (mode: int) ->
+  if k < 0 then FNext VNil
+  else if k > val_list_len xs && (mode == 0 || mode == 1) then FNext VNil
+  else if k > 0 && (match xs with Nil -> true | _ -> false) then FNext VNil
+  else arr_tuples_go world encl theblk xs xs 0 k mode Nil Nil
+and arr_tuples_go = fn world -> fn encl -> fn theblk -> fn (all: Val list) -> fn (from: Val list) -> fn (fi: int) -> fn (need: int) -> fn (mode: int) -> fn (pre: Val list) -> fn (used: int list) ->
+  if need == 0 then
+    (match run_block_turn world encl theblk (Cons (arr_new (rev_vals pre), Nil)) with
+     | FBreak v -> FBreak v | FReturn v -> FReturn v
+     | _ -> FNext VNil)
+  else
+    (let rec walk = fn (ys: Val list) -> fn (i: int) ->
+       (match ys with
+        | Nil -> FNext VNil
+        | Cons (h, t) ->
+          (if mode == 1 && int_list_has used i then walk t (i + 1)
+           else
+             (let r = (if mode == 0 then arr_tuples_go world encl theblk all t (i + 1) (need - 1) mode (Cons (h, pre)) used
+                       else if mode == 2 then arr_tuples_go world encl theblk all ys i (need - 1) mode (Cons (h, pre)) used
+                       else arr_tuples_go world encl theblk all all 0 (need - 1) mode (Cons (h, pre)) (Cons (i, used))) in
+              match r with
+              | FBreak v -> FBreak v | FReturn v -> FReturn v
+              | _ -> walk t (i + 1)))) in
+     walk from fi)
+and int_list_has = fn (xs: int list) -> fn (x: int) ->
+  match xs with Nil -> false | Cons (h, t) -> if h == x then true else int_list_has t x
 
 // Array#each / #each_index / #each_with_index index into the LIVE array: the
 // block may shift, pop or unshift, and what comes next is whatever is at the
@@ -7183,7 +7343,7 @@ and arr_each_live = fn world -> fn encl -> fn theblk -> fn (id: int) ->
     (let a9 = (if mode == 1 then Cons (VInt i, Nil)
                else if mode == 2 then Cons (h, Cons (VInt i, Nil))
                else Cons (h, Nil)) in
-     match run_block world encl theblk a9 with
+     match run_block_turn world encl theblk a9 with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> arr_each_live world encl theblk id (i + 1) t ver mode)
 
@@ -7194,7 +7354,7 @@ and arr_reverse_each_live = fn world -> fn encl -> fn theblk -> fn (id: int) -> 
   if i0 <= 0 then FNext VNil
   else
     (let i = i0 - 1 in
-     match run_block world encl theblk (Cons (val_nth (deref id) i, Nil)) with
+     match run_block_turn world encl theblk (Cons (val_nth (deref id) i, Nil)) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> (let n = val_list_len (deref id) in
              arr_reverse_each_live world encl theblk id (if i > n then n else i)))
@@ -7379,13 +7539,27 @@ and arr_each_idx = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (
   match xs with
   | Nil -> FNext VNil
   | Cons (h, t) ->
-    (match run_block world encl theblk (Cons (h, Cons (VInt i, Nil))) with
+    (match run_block_turn world encl theblk (Cons (h, Cons (VInt i, Nil))) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> arr_each_idx world encl theblk t (i + 1))
 
+// one turn of an iterator that throws the block's value away (each, times,
+// upto ...), in a region of its own. The value comes out of the block's
+// region into the region current at the call, and for an iterator that is the
+// region of the statement that called it, open for the whole loop: every
+// turn's value was kept there until the loop ended, and the collector's scan
+// of a stack reads the regions open on it to the end -- so
+// `80_000.times { |i| proc { i } }` kept every one of its procs alive through
+// the loop (note 272). Here only break / return values leave the turn.
+and run_block_turn = fn world -> fn encl -> fn theblk -> fn (args: Val list) ->
+  region TURN {
+    match run_block world encl theblk args with
+    | FNext _ -> FNext VNil
+    | f -> f
+  }
 and range_each = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
   if i > last then FNext VNil
-  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+  else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         // (stop AT the last value: above int64's maximum is a wrap, see range_down)
         | _ -> if i == last then FNext VNil else range_each world encl theblk (i + 1) last)
@@ -7427,26 +7601,26 @@ and rng_str_step_int = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
 and rng_str_step_add = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (add: str) -> fn (hi: str) -> fn (has_hi: bool) -> fn (excl: bool) ->
   if has_hi && (let c = str_compare cur hi in if excl then c >= 0 else c > 0) then FNext VNil
   else
-    (match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+    (match run_block_turn world encl theblk (Cons (mkstr cur, Nil)) with
      | FBreak v -> FBreak v | FReturn v -> FReturn v
      | _ -> rng_str_step_add world encl theblk (cur ++ add) add hi has_hi excl)
 
 and rng_str_step_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (k: int) ->
-  match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+  match run_block_turn world encl theblk (Cons (mkstr cur, Nil)) with
   | FBreak v -> FBreak v | FReturn v -> FReturn v
   | _ -> rng_str_step_endless world encl theblk (str_succ_n cur k) k
 // every k-th element of a list, starting with the first
 
 // ("A"..).each { }: #succ forever, until the block breaks (or returns).
 and rng_str_each_endless = fn world -> fn encl -> fn theblk -> fn (cur: str) ->
-  match run_block world encl theblk (Cons (mkstr cur, Nil)) with
+  match run_block_turn world encl theblk (Cons (mkstr cur, Nil)) with
   | FBreak v -> FBreak v | FReturn v -> FReturn v
   | _ -> rng_str_each_endless world encl theblk (str_succ cur)
 
 // n.downto(m) { |i| }: descending.
 and range_down = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) ->
   if i < last then FNext VNil
-  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+  else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         // (stop AT the last value rather than below it: below int64's
         // minimum is a wrap to its maximum, and `(-2**63..-2**63).reverse_each`
@@ -7456,7 +7630,7 @@ and range_down = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: in
 // n.step(limit, by) { |i| }: by may be negative (descending).
 and range_step = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (limit: int) -> fn (by: int) ->
   if (by > 0 && i > limit) || (by < 0 && i < limit) || by == 0 then FNext VNil
-  else (match run_block world encl theblk (Cons (VInt i, Nil)) with
+  else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
         | _ -> range_step world encl theblk (i + by) limit by)
 
@@ -12125,6 +12299,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | _ -> (if (str_len name == 6 && str_eq name "method")
                               then responds_real world recv nm
                                    || (is_kernel_builtin nm && str_list_has (ancestors_of world (dispatch_cls_of world recv)) "Kernel")
+                                   // ...and a class's PRIVATE builtins, which
+                                   // responds_real does not count: ruby's own
+                                   // table says who has them (test_settracefunc
+                                   // reads `Module.method(:method_added)` while
+                                   // the file loads)
+                                   || ((match recv with VClass _ -> true | _ -> false)
+                                       && (if str_eq (builtin_frame_label world recv nm) "" then false else true))
                               else responds world recv nm)
                              || is_binary_op_name nm
                              // ⚠ ...and #public_method does NOT: it asks the
@@ -15525,6 +15706,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                  let m8 = map_len tmp8 in map_set tmp8 (str_of_int m8) (VClass im8)))
           | _ -> ())) in
        arr_new (idx_to_list tmp8 0 (map_len tmp8)))
+    // Module.used_modules: the modules whose refinements are active here --
+    // the refinery of each used_refinements entry, once each, in that order
+    // (an impl class is named "<refinery>_<i>" after "#<refinement:" 7 chars).
+    else if str_eq c "Module" && (str_len name == 12 && str_eq name "used_modules") then
+      (let tmp7 = map_new () in
+       let seen7 = map_new () in
+       let _ = map_iter ref_active (fn (k7: str) -> fn (v7: Val) ->
+         (let im7 = (match v7 with VStr h7 -> sget h7 | VClass n7 -> n7 | _ -> "") in
+          if str_eq im7 "" || (if is_refine_impl im7 then false else true) then ()
+          else (let rest7 = substring im7 7 (str_len im7) in
+                let u7 = str_rfind rest7 "_" 0 (0 - 1) in
+                let rf7 = (if u7 < 0 then rest7 else substring rest7 0 u7) in
+                if map_has seen7 rf7 then ()
+                else (let _ = map_set seen7 rf7 1 in
+                      let m7 = map_len tmp7 in map_set tmp7 (str_of_int m7) (VClass rf7))))) in
+       arr_new (idx_to_list tmp7 0 (map_len tmp7)))
     else if (str_len name == 11 && str_eq name "refinements") then
       (let n9 = (if map_has refine_cnt c then (match map_get refine_cnt c with VInt k -> k | _ -> 0) else 0) in
        let tmp9 = map_new () in
@@ -16218,14 +16415,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | _ -> VInt 22)
     // the names this platform has, and one name's RLIMIT_ number (-1: none),
     // which is what Process::RLIMIT_* are made from at startup
+    // ⚠ ...and a target with no C library (RV64, where the program is the
+    //   machine) has none: the extern is a named failure there, and this runs
+    //   in the prelude, so every program stopped before its first line. No
+    //   names and no constants is that platform's answer.
     else if str_eq c "Process" && (str_len name == 14 && str_eq name "__rlimit_names") then
-      mkstr (proc_rlimit_names ())
+      mkstr (try_or (fn (u: unit) -> proc_rlimit_names ()) "")
     else if str_eq c "Process" && (str_len name == 17 && str_eq name "__rlimit_resource") then
       (match args with Cons (VStr n9, _) -> VInt (proc_rlimit_resource (sget n9)) | _ -> VInt (0 - 1))
     // RLIM_INFINITY / RLIM_SAVED_* in decimal ("" when undefined): 2^64-1 on
     // Linux, which the prelude turns into a Bignum with #to_i
     else if str_eq c "Process" && (str_len name == 12 && str_eq name "__rlim_const") then
-      (match args with Cons (VStr n9, _) -> mkstr (proc_rlim_const (sget n9)) | _ -> mkstr "")
+      (match args with Cons (VStr n9, _) -> mkstr (try_or (fn (u: unit) -> proc_rlim_const (sget n9)) "") | _ -> mkstr "")
     else if str_eq c "Process" && (str_len name == 13 && str_eq name "__getpriority") then
       (match args with
        | Cons (VInt w9, Cons (VInt i9, _)) ->
@@ -16755,7 +16956,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 4 && str_eq name "eval") then
          (let e9 = lv_child env in
           let _ = map_set e9 "self" recv in
-          do_eval e9 world blk args)
+          let r9 = do_eval e9 world blk args in
+          let _ = lv_child_done e9 in
+          r9)
        else try_self_call_x env world recv name args true)
     // a class that does `extend Enumerable` and defines `self.each` gets the
     // Enumerable surface on the class object itself (Gem::Specification is
@@ -21724,7 +21927,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // would change what `class`, `clone` and `singleton_class?` answer.
        let _ = map_set e3c "__definee_recv" recv in
        let blkargs = if (str_len name == 13 && str_eq name "instance_exec") then args else Cons (recv, Nil) in
-       flow_value (run_block world blk (h3, ps3, bb3, e3c) blkargs))
+       let r3 = flow_value (run_block world blk (h3, ps3, bb3, e3c) blkargs) in
+       let _ = lv_child_done e3c in
+       r3)
     else
     (match recv with
      | VClass c ->
@@ -23180,7 +23385,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
        //   The block form was given this and the string form was not, which is
        //   the same rule living in one of its two places.
        let _ = map_set env2 "__definee_recv" recv in
-       eval_run env2 world blk p2
+       let r2 = eval_run env2 world blk p2 in
+       let _ = lv_child_done env2 in
+       r2
      | _ -> VNil)
   // is_a? / kind_of? walk the real (exception) hierarchy.
   else if ((str_len name == 5 && str_eq name "is_a?") || (str_len name == 8 && str_eq name "kind_of?") || (str_len name == 12 && str_eq name "instance_of?")) then
@@ -24784,12 +24991,17 @@ and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val li
 // -- only a hash that arrived through a SPLAT (r2k_splat, noted by eval_args):
 // passed directly, `bar(h)`, it is an ordinary positional argument and is the
 // same object in the callee.
+// (the last argument is found by a loop and the list rebuilt only when it
+// changes: this rebuilt every list on the way down, one C frame per argument,
+// and test_method's `rest(*(1..10_000_000))` ran out of stack here)
 and r2k_unflag_tail = fn (args: Val list) ->
-  match args with
-  | Nil -> Nil
-  | Cons (VHsh id, Nil) ->
-    (if map_has r2k_marks (str_of_int id) && map_has r2k_splat id then Cons (mkhash (hderef id), Nil) else args)
-  | Cons (h, t) -> Cons (h, r2k_unflag_tail t)
+  let rec last9 = fn (xs: Val list) -> (match xs with Nil -> VNil | Cons (h9, Nil) -> h9 | Cons (_, t9) -> last9 t9) in
+  match last9 args with
+  | VHsh id ->
+    (if map_has r2k_marks (str_of_int id) && map_has r2k_splat id
+     then rev_vals (Cons (mkhash (hderef id), (match rev_vals args with Cons (_, t9) -> t9 | Nil -> (Nil : Val list))))
+     else args)
+  | _ -> args
 // A module nested in an anonymous one is named through it (`#<Module:0x..>::N`,
 // see name_anon_x), so a temporary name given to -- or taken from -- the owner
 // renames what is under it: "m::N", or no name at all once it is cleared.
@@ -29077,6 +29289,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                ("index " ++ str_of_int i ++ " too small for array; minimum: -" ++ str_of_int n)
            else if len < 0 then
              prim_raise "IndexError" ("negative length (" ++ str_of_int len ++ ")")
+           else if j >= ary_max_size - ary_rlen v then prim_raise "IndexError" ("index " ++ str_of_int j ++ " too big")
            else let _ = arr_set id (arr_splice xs j len v) in v)
         | Cons (VRange (lov, hiv, excl), Cons (v, Nil)) ->
           (let xs = deref id in
@@ -29089,7 +29302,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              prim_raise "RangeError" (inspect (VRange (lov, hiv, excl)) ++ " out of range")
            else
              (let (st, enx) = rng_slice_bounds lov hiv excl n in
-              let _ = arr_set id (arr_splice xs st (if enx - st < 0 then 0 else enx - st) v) in v))
+              if st >= ary_max_size - ary_rlen v then prim_raise "IndexError" ("index " ++ str_of_int st ++ " too big")
+              else let _ = arr_set id (arr_splice xs st (if enx - st < 0 then 0 else enx - st) v) in v))
         | Cons (VInt i, Cons (v, _)) ->
           let xs = deref id in
           let n = val_list_len xs in
@@ -29098,6 +29312,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           // IndexError names the minimum, where this quietly appended.
           (if j < 0 then prim_raise "IndexError"
                            ("index " ++ str_of_int i ++ " too small for array; minimum: -" ++ str_of_int n)
+           // ...and one at or past ruby's ARY_MAX_SIZE is "too big": this
+           // padded with nils up to it, one C frame per nil, and test_array's
+           // `[0][LONGP] = 2` ended the whole file in a stack overflow
+           else if j >= ary_max_size then prim_raise "IndexError" ("index " ++ str_of_int j ++ " too big")
            else let _ = arr_set id (val_set_at xs j v) in v)
         | _ -> VNil)
      // a Hash write reached through the primitive dispatcher rather than the
@@ -31817,7 +32035,14 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     // every exit path -- method_body_flow converts raises to Flow values,
     // so this line always runs.
     let _ = (if from_pool && (if map_has frame "__captured" then false else true)
-             then frame_pool_put frame else ()) in
+             then frame_pool_put frame
+             // (a captured one waits in lv_cap for a collection that does
+             // not reach it)
+             else if from_pool then
+               (match (if map_has frame "__eid" then map_get frame "__eid" else VNil) with
+                | VInt n9 -> map_set lv_cap n9 frame
+                | _ -> ())
+             else ()) in
      let _ = fire_trace world "return" name "Object" in
      let _ = fire_tp_v world "return" name "Object" out slf9 in
      let _ = rx_state_restore mstate in
@@ -32147,7 +32372,14 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     // every exit path -- method_body_flow converts raises to Flow values,
     // so this line always runs.
     let _ = (if from_pool && (if map_has frame "__captured" then false else true)
-             then frame_pool_put frame else ()) in
+             then frame_pool_put frame
+             // (a captured one waits in lv_cap for a collection that does
+             // not reach it)
+             else if from_pool then
+               (match (if map_has frame "__eid" then map_get frame "__eid" else VNil) with
+                | VInt n9 -> map_set lv_cap n9 frame
+                | _ -> ())
+             else ()) in
     let _ = fire_trace world "return" name defcls in
     let _ = fire_tp_v world "return" name defcls out slf9 in
     let _ = rx_state_restore mstate in
@@ -34845,7 +35077,6 @@ and time_copy_zone = fn world -> fn (src: Val) -> fn (dst: Val) ->
 // offset that applies is the one at the instant being found: the first uses
 // the offset at the civil value read as UTC, the second corrects across a
 // DST change.
-and time_local_epoch = fn (civ: int) -> time_local_epoch_d civ false
 // the instant local wall time `civ` names. Near a transition there can be TWO
 // (the hour repeated when clocks go back) or NONE (the hour skipped), so the
 // offsets from three hours either side are both tried. ⚠ Asked of the
@@ -38097,6 +38328,11 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
         let zarg = (match pos9 with
                     | Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (_, Cons (z9, _))))))) -> z9
                     | _ -> time_in_kw args) in
+        // :dst / :std in the zone's place are the local zone with the
+        // isdst hint, which picks between the two readings of a repeated
+        // hour (Time.local's ten-argument isdst, test_time_tz's zdump cases)
+        let zdst9 = (match zarg with VSym zs9 -> if str_eq zs9 "dst" then 1 else if str_eq zs9 "std" then 2 else 0 | _ -> 0) in
+        let zarg = (if zdst9 > 0 then VNil else zarg) in
         let zarg = (match time_find_tz world cls (Cons (zarg, Nil)) with Cons (z9, _) -> z9 | Nil -> zarg) in
         let (kind9, secs9, ex9) = time_parse_off3 world zarg in
         // a Rational offset is subtracted EXACTLY: 13:00:00.5 at +3600.5 is
@@ -38109,7 +38345,7 @@ and new_obj = fn world -> fn (cls: str) -> fn (args: Val list) ->
         let fr9 = fr9 - offn9 in
         let (civ, fr9) = (if fr9 < 0 then (civ - 1, fr9 + 1000000000) else (civ, fr9)) in
         let ep9 = (if kind9 == 1 then civ else if kind9 == 2 then civ - offw9
-                   else if kind9 == 3 then time_tzo_epoch world ex9 civ else time_local_epoch civ) in
+                   else if kind9 == 3 then time_tzo_epoch world ex9 civ else time_local_epoch_d civ (zdst9 == 1)) in
         let id = alloc_oid ocls in
         let _ = map_set ocls id cls in
         let _ = map_set ivars (str_of_int id ++ "@__t") (VInt ep9) in
@@ -39265,6 +39501,7 @@ and register_class_ieval = fn world -> fn (cls: str) -> fn (body: Stmt list) -> 
   let _ = map_set cenv "__cscope" (mkstr bcref9) in
   let _ = map_set cenv "__cref" (mkstr bcref9) in
   let r = try_or (fn (u: unit) -> register_class_v world ("(sng:" ++ cls ++ ")") body "public" cenv) (FRaise VNil) in
+  let _ = lv_child_done cenv in
   let _ = restore_ref_active saved in
   (match r with
    | FRaise _ -> fail (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "exception") else "exception")
@@ -39350,6 +39587,7 @@ and register_class_blk = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn
   // left the refinement active for the rest of the program), as
   // register_class does
   let r = try_or (fn (u: unit) -> register_class_v world cls body "public" cenv) (FRaise VNil) in
+  let _ = lv_child_done cenv in
   let _ = set_lex saved_lex in
   let _ = restore_ref_active saved in
   (match r with
@@ -40742,12 +40980,13 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      //   lines up) had the identical two lines and the identical two faults --
      //   fixing the one I found first changed nothing, because the writer
      //   generated by attr_writer comes through THIS one.
-     // (...except the prelude's own "@__" state, which no Ruby code sees: a
-     // frozen IO is still closed, read and inspected, and the IO layer keeps
+     // (...except the IO layer's own "@__io_" state, which no Ruby code sees:
+     // a frozen IO is still closed, read and inspected, and the prelude keeps
      // its descriptor's state there -- test_io's frozen_fileno, inspect and
-     // frozen_autoclose closed a frozen pipe in their ensure)
+     // frozen_autoclose closed a frozen pipe in their ensure. Only that prefix:
+     // a user's `@__getobj__` (ruby/spec's frozen Delegator) is still refused.)
      let _ = (if (val_frozen_mut slf || val_is_immediate slf)
-                 && (if str_len name > 2 && str_eq (substring name 0 2) "__" then val_is_immediate slf else true)
+                 && (if str_len name > 5 && str_eq (substring name 0 5) "__io_" then val_is_immediate slf else true)
               then (let _ = raise_exc_iv world "FrozenError"
                               ("can't modify frozen " ++ class_name slf ++ ": " ++ frz_inspect env world slf)
                               (Cons (("__recv", slf), Nil)) in ())

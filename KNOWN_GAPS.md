@@ -91,13 +91,6 @@ that exits with one of those numbers on purpose reads as signaled; no test in
 CRuby's test/ does. Telling them apart needs the wait(2) status, which the
 shell does not pass on.
 
-## An Array of ten million elements overflows the native stack
-
-`(1..10_000_000).to_a` and `f(*(1..10_000_000))` end in "stack overflow
-(recursion too deep)"; five million is fine. An Array is a list here, and
-the functions that build and walk lists recurse once per element. test_method's
-test_splat_long_array is the one test that asks.
-
 ## A power past a million digits is refused
 
 `Integer#**` raises ruby's ArgumentError "exponent is too large" when the
@@ -1256,7 +1249,11 @@ bookkeeping (`cur_pos`, `struct_ctr`, `call_lines`, `live_frames`, the
 region -- `bench/def_maps.sh` had charged 260 of 302 MB to those eleven maps.
 What remains is named in `bench/README.md`: ~165 B per block invocation held by
 the iterator's enclosing statement until the loop returns (a `while` gets a
-region per iteration, a block loop does not), and the collector's trigger,
+region per iteration, a block loop does not -- except, since note 272, the
+iterators that throw the block's value away: each, times, upto, step and the
+combination family run each turn in a region of their own, because the value
+kept there was read by the collector's stack scan and kept every proc a
+`n.times { proc { } }` made), and the collector's trigger,
 which watches the object stores and so never fires for a loop that allocates
 only frames.
 

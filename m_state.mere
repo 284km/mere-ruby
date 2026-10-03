@@ -1212,6 +1212,20 @@ let _ = map_compact hm_memo;  // (its own arena: gc_churn_bytes, note 270)
 let hm_memo_gen = map_new ();
 
 let lv_up = map_new ();    // "<frame id>" -> that frame's parent env
+// THE CAPTURED FRAMES THAT HAVE LEFT THE STACK, by frame id (note 272). A
+// block's env or a method's frame that a proc captured is not given back to
+// the frame pool when its call ends (the proc reads and writes through it),
+// and it used to stay for the life of the process: its arena, and its lv_up
+// entry -- a root, so everything it held too. `50_000.times { x = 1; lambda
+// { x } }` kept 6.6 KB per turn, and test/unit's assert_equal, whose message
+// is a lambda in its own frame, 69 KB per assertion. A collection marks the
+// envs it reaches (gc_mark_env) and gives the rest of these back.
+let lv_cap = map_new ();
+// ...and the scope envs lv_child made (an eval's, an instance_exec's, a
+// class_exec body's) once their run is over, captured by a proc made in them:
+// their links go the same way, but they are not pool frames and are not
+// handed back to the pool (lv_child_done)
+let lv_capx = map_new ();
 let lv_ctr = map_new ();   // "n" -> next frame id
 let lv_child = fn parent ->
   let e = map_new () in
@@ -1245,10 +1259,19 @@ let rec lv_owner = fn env -> fn (n: str) ->
 // neither may any parent on its scope chain (the proc reads and writes
 // through the chain). Marked at the choke points where an env leaves the
 // call's extent; run_meth recycles only unmarked frames.
+// ...and every captured env gets a frame id if it has none (a method's
+// frame has none of its own): when it leaves the stack it is recorded in
+// lv_cap by that id, and a collection that does not reach it gives it back
+// (gc_sweep_captured). A method frame with an id and no lv_up entry is still
+// a root of its chain (lv_parent_of answers "no parent").
 let rec mark_captured = fn env ->
   if map_has env "__captured" then ()
   else
     let _ = map_set env "__captured" (VBool true) in
+    let _ = (if map_has env "__eid" then ()
+             else (let n = (if map_has lv_ctr "n" then map_get lv_ctr "n" else 0) in
+                   let _ = map_set lv_ctr "n" (n + 1) in
+                   map_set env "__eid" (VInt n))) in
     (match lv_parent_of env with
      | (true, p) -> mark_captured p
      | _ -> ());
@@ -1349,7 +1372,11 @@ let blk_env_get = fn parent ->
   let _ = map_set lv_up n parent in
   e;
 let blk_env_put = fn e ->
-  if map_has e "__captured" then pool_ctr 6
+  if map_has e "__captured" then
+    (let _ = pool_ctr 6 in
+     match (if map_has e "__eid" then map_get e "__eid" else VNil) with
+     | VInt n -> map_set lv_cap n e
+     | _ -> ())
   else
     (let _ = (if map_has e "__eid" then
                 (match map_get e "__eid" with
@@ -1358,6 +1385,16 @@ let blk_env_put = fn e ->
               else ()) in
      let _ = pool_ctr 7 in
      frame_pool_put e);
+
+// a scope env lv_child made, at the end of its run: its lv_up link is the
+// chain's only record of it, and it was kept for the life of the process --
+// one entry per eval, instance_exec and class_exec ever run (note 272). A
+// captured one waits in lv_capx for a collection that does not reach it.
+let lv_child_done = fn e ->
+  match (if map_has e "__eid" then map_get e "__eid" else VNil) with
+  | VInt n -> (if map_has e "__captured" then map_set lv_capx n e
+               else if map_has lv_up n then map_delete lv_up n else ())
+  | _ -> ();
 
 // Per-statement / per-call bookkeeping. These used to be str -> Val maps, and
 // every write of an existing key copies the new value into the map's arena --

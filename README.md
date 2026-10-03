@@ -498,6 +498,23 @@ the numbers above are reproducible rather than a snapshot -- and every row of
 one table is measured by ONE build (`a/sweep_resume.sh` pins it and says so at
 the end).
 
+⚠ **The record is measured against ONE ruby/spec tree, and it is not ruby's
+master.** `SPEC_STATUS.md` names it on its last line (`ruby@84a27934cf53`, the
+ruby/ruby commit whose `spec/ruby` it is). A checkout of anything newer has a
+different number of files in some groups (core/string has 124 on 2026-10-03's
+master and 114 in the record), and `scoreboard.sh` refuses to sweep it rather
+than let the new files read as regressions. Make the tree once, beside your
+ruby checkout, and sweep that:
+
+```sh
+git -C <ruby-checkout> worktree add --detach ../ruby-spec-84a2793 84a27934cf53
+./mspec/scoreboard.sh ../ruby-spec-84a2793/spec/ruby          # core, language, ...
+SPEC_WITH_STDLIB=1 ./mspec/scoreboard.sh ../ruby-spec-84a2793/spec/ruby   # library/
+```
+
+Moving the record to a newer tree is a deliberate upgrade of the suite
+(`SPEC_TOTALS_OK=1`, the whole table re-measured together), not a pull.
+
 **`core` and `language` are now measured in full**: 2133 of 2133 core files and
 80 of 80 language files, every directory the suite has, nested ones included.
 `library` is measured for the libraries this ships: **735 of 1516**, across 66
