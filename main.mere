@@ -604,7 +604,7 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                  else let _ = map_set live k VNil in
                       let pk = str_of_int id in
                       let _ = (if map_has proc_store pk
-                               then (let (_, _, _, penv) = map_get proc_store pk in gc_mark_env live penv)
+                               then (let (_, _, _, penv) = proc_get pk in gc_mark_env live penv)
                                else ()) in
                       // ...the proc a curried one will call (its id, as a VInt)
                       let _ = (if map_has curry_target pk
@@ -614,16 +614,16 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                                else ()) in
                       // ...the procs its parameters name by a yield-block marker
                       let _ = (if map_has proc_store pk
-                               then (let (_, ps9, _, _) = map_get proc_store pk in gc_mark_yblk_params live ps9)
+                               then (let (_, ps9, _, _) = proc_get pk in gc_mark_yblk_params live ps9)
                                else ()) in
                       let _ = (if map_has proc_yblk pk
-                               then (let (_, ps9, _, _) = map_get proc_yblk pk in gc_mark_yblk_params live ps9)
+                               then (let (_, ps9, _, _) = yblk_get pk in gc_mark_yblk_params live ps9)
                                else ()) in
                       // ...and the block it yields to, captured with it (see the
                       // proc sweep in gc_collect: these are reached through their
                       // proc now, not all of them always)
                       (if map_has proc_yblk pk
-                       then (let (_, _, _, benv) = map_get proc_yblk pk in gc_mark_env live benv)
+                       then (let (_, _, _, benv) = yblk_get pk in gc_mark_env live benv)
                        else ()))
   | VBind id -> let k = id * 8 + 5 in
                 (if map_has live k then ()
@@ -1079,6 +1079,9 @@ let gc_collect = fn env -> fn world ->
                     if map_has live (int_of_str k * 8 + 4) then () else vec_push dP k)) in
     let _ = gc_drop_s proc_store dP in
     let _ = gc_drop_sh proc_yblk dP "" in
+    // (and the ids of their bodies; the bodies stay, once each, note 273)
+    let _ = gc_drop_sh proc_bkey dP "" in
+    let _ = gc_drop_sh yblk_bkey dP "" in
     let _ = gc_drop_sh proc_src dP "" in
     let _ = gc_drop_sh proc_src dP "f" in
     let _ = gc_drop_sh proc_home dP "" in
@@ -7292,7 +7295,8 @@ and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
 //   3 repeated_permutation. `pre` is the tuple so far, reversed; `used` the
 //   indices a permutation has taken.
 and arr_tuples_yield = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (k: int) -> fn (mode: int) ->
-  if k < 0 then FNext VNil
+  if mode == 1 && k > 0 then arr_perm_yield world encl theblk xs k
+  else if k < 0 then FNext VNil
   else if k > val_list_len xs && (mode == 0 || mode == 1) then FNext VNil
   else if k > 0 && (match xs with Nil -> true | _ -> false) then FNext VNil
   else arr_tuples_go world encl theblk xs xs 0 k mode Nil Nil
@@ -7315,6 +7319,50 @@ and arr_tuples_go = fn world -> fn encl -> fn theblk -> fn (all: Val list) -> fn
               | FBreak v -> FBreak v | FReturn v -> FReturn v
               | _ -> walk t (i + 1)))) in
      walk from fi)
+// Array#permutation(k), k > 0: the index arrangements in ruby's order
+// (lexicographic), each made from the last in time linear in the size. The
+// walk above kept the taken indices in a list and scanned it at every level,
+// so `Array.new(100_000).permutation { break }` spent n^2 steps before its
+// first tuple (test_array's permutation_stack_error and sort_with_replace,
+// thirty seconds each, into their subprocess's timeout). The classic way:
+// yield a[0..k-1], reverse a[k..], next_permutation(a) -- the suffix after
+// the prefix is kept ascending, so reversing it makes it the last
+// arrangement of that prefix and the next permutation moves the prefix on.
+and arr_perm_yield = fn world -> fn encl -> fn theblk -> fn (xs: Val list) -> fn (k: int) ->
+  let n = val_list_len xs in
+  if k > n then FNext VNil
+  else
+    (let ev = vec_new () in
+     let rec load = fn (ys: Val list) -> (match ys with Nil -> () | Cons (y, t) -> (let _ = vec_push ev y in load t)) in
+     let _ = load xs in
+     let a = vec_new () in
+     let rec fill = fn (i: int) -> if i >= n then () else (let _ = vec_push a i in fill (i + 1)) in
+     let _ = fill 0 in
+     let rec rev = fn (lo: int) -> fn (hi: int) ->
+       (if lo >= hi then ()
+        else (let t = (vec_get a lo : int) in
+              let _ = vec_set a lo (vec_get a hi) in
+              let _ = vec_set a hi t in
+              rev (lo + 1) (hi - 1))) in
+     let rec pivot = fn (i: int) ->
+       (if i < 0 then 0 - 1 else if (vec_get a i : int) < vec_get a (i + 1) then i else pivot (i - 1)) in
+     let rec above = fn (j: int) -> fn (v: int) -> (if (vec_get a j : int) > v then j else above (j - 1) v) in
+     let next_perm = fn (u: unit) ->
+       (let i = pivot (n - 2) in
+        if i < 0 then false
+        else (let j = above (n - 1) (vec_get a i) in
+              let t = (vec_get a i : int) in
+              let _ = vec_set a i (vec_get a j) in
+              let _ = vec_set a j t in
+              let _ = rev (i + 1) (n - 1) in
+              true)) in
+     let rec tuple = fn (i: int) -> fn (acc: Val list) ->
+       (if i < 0 then acc else tuple (i - 1) (Cons ((vec_get ev (vec_get a i) : Val), acc))) in
+     let rec go = fn (u: unit) ->
+       (match run_block_turn world encl theblk (Cons (arr_new (tuple (k - 1) Nil), Nil)) with
+        | FBreak v -> FBreak v | FReturn v -> FReturn v
+        | _ -> (let _ = rev k (n - 1) in if next_perm () then go () else FNext VNil)) in
+     go ())
 and int_list_has = fn (xs: int list) -> fn (x: int) ->
   match xs with Nil -> false | Cons (h, t) -> if h == x then true else int_list_has t x
 
@@ -8477,7 +8525,19 @@ and rb_eql_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
 // spellings on purpose -- an index before the front CLAMPS to 0, a range that
 // begins before it is a RangeError -- and a negative or zero length means
 // "change nothing" rather than an error.
+// ...and a span that reaches ruby's ARY_MAX_SIZE is "argument too big"
+// (rb_ary_fill); below it but past what a machine holds, ruby's malloc fails.
+// This padded with nils up to it: test_array's `[].fill(0, 1, LONGP)` was
+// the process killed from outside.
 and arr_fill_span = fn env -> fn world -> fn (n: int) -> fn (idxargs: Val list) ->
+  let (b, l) = arr_fill_span_raw env world n idxargs in
+  if l <= 0 then (b, l)
+  else if b >= ary_max_size || l > ary_max_size - b then
+    (let _ = raise_exc world "ArgumentError" "argument too big" in (0, 0))
+  else if b + l > 1099511627776 then
+    (let _ = raise_exc world "NoMemoryError" "failed to allocate memory" in (0, 0))
+  else (b, l)
+and arr_fill_span_raw = fn env -> fn world -> fn (n: int) -> fn (idxargs: Val list) ->
   let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let toi9 = fn (v: Val) ->
     (match v with
@@ -11459,7 +11519,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                    | Nil -> VNil) in
          match a0 with
          | VProc pid ->
-           (let ar9 = (match map_get proc_store (str_of_int pid) with
+           (let ar9 = (match proc_get (str_of_int pid) with
                        | (_, ps9, _, _) -> mandatory_pos_count ps9 (Nil : (str * Expr) list)) in
             if map_has lambda_ids (str_of_int pid) && (if ar9 == 2 then false else true) then
               raise_exc world "TypeError" "default_proc takes two arguments (2 for 1)"
@@ -17432,7 +17492,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         else
          (match (if map_has ivars (str_of_int id ++ "@__y_blk") then map_get ivars (str_of_int id ++ "@__y_blk") else VNil) with
           | VProc bpid ->
-            (match run_block world (false, (Nil : str list), (Nil : Stmt list), env) (map_get proc_store (str_of_int bpid)) args with
+            (match run_block world (false, (Nil : str list), (Nil : Stmt list), env) (proc_get (str_of_int bpid)) args with
              | FBreak v -> raise_exc world "StopIteration" "iteration reached an end"
              | FNext r -> (if (str_len name == 2 && str_eq name "<<") then recv else r)
              | other -> (if (str_len name == 2 && str_eq name "<<") then recv else flow_value other))
@@ -20048,7 +20108,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // flag is per PROC, the way ruby2_keywords is per method, and the method
     // side has had r2k_methods all along.
     else if (str_len name == 14 && str_eq name "ruby2_keywords") then
-      (let ps9 = (match map_get proc_store (str_of_int pid) with (h9, ps9, _, _) -> strip_marker_params ps9) in
+      (let ps9 = (match proc_get (str_of_int pid) with (h9, ps9, _, _) -> strip_marker_params ps9) in
        // ruby WARNS (and does nothing) for a proc that cannot carry the flag:
        // one with keyword parameters, or with no bare splat to collect into.
        let ok9 = r2k_params_ok ps9 in
@@ -20124,7 +20184,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // where ruby answers :b. The pair is per call rather than a flag somewhere,
     // because with_index nests (a block can drive another enumerator).
     else if (str_len name == 9 && str_eq name "__wi_call") then
-      (match run_block world blk (map_get proc_store (str_of_int pid)) args with
+      (match run_block world blk (proc_get (str_of_int pid)) args with
        | FBreak v -> arr_new (Cons (VBool true, Cons (v, Nil)))
        | fl -> arr_new (Cons (VBool false, Cons (flow_value fl, Nil))))
     // call/./[]/yield run the stored block; class reports Proc.
@@ -20133,7 +20193,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // keywords -- that is the whole point of the flag: the hash it collects
       // into *rest can be re-splatted and still arrive as keywords.
       let _ = (if map_has r2k_procs (r2k_root (str_of_int pid)) then mark_r2k_tail args else ()) in
-      let theblk = map_get proc_store (str_of_int pid) in
+      let theblk = proc_get (str_of_int pid) in
       // a lambda checks arity strictly (procs stay lenient).
       let _ =
         if map_has lambda_ids (str_of_int pid) then
@@ -20268,7 +20328,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // behind it, so `pr.to_proc` was a NoMethodError on a Proc.
     else if (str_len name == 7 && str_eq name "to_proc") then recv
     else if (str_len name == 10 && str_eq name "parameters") then
-      (match map_get proc_store (str_of_int pid) with
+      (match proc_get (str_of_int pid) with
        (h, ps, body, e) ->
          // `parameters(lambda: true)` asks for the answer a LAMBDA would give
          // (leading positionals :req) and `lambda: false` for a proc's (:opt),
@@ -20303,7 +20363,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 5 && str_eq name "arity") && map_has proc_arity (str_of_int pid) then
       map_get proc_arity (str_of_int pid)
     else if (str_len name == 5 && str_eq name "arity") then
-      (match map_get proc_store (str_of_int pid) with
+      (match proc_get (str_of_int pid) with
        (h, ps0, body, e) ->
          // a lambda carries a marker as its first param; it is not one.
          let ps = (match ps0 with Cons (m, rest) -> if str_eq m lambda_blk_marker then rest else ps0 | _ -> ps0) in
@@ -21546,7 +21606,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        | VProc pid ->
          (if map_has comp_inner (str_of_int pid) || map_has curry_target (str_of_int pid)
           then proc_derived_call env world newblk pid args
-          else flow_value (run_block world newblk (map_get proc_store (str_of_int pid)) args))
+          else flow_value (run_block world newblk (proc_get (str_of_int pid)) args))
        | _ -> VNil)
     // recv.define_method(:name) { block } with an explicit class receiver:
     // register the block as an instance method of that class (used on singleton
@@ -21694,7 +21754,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                // ...and #each answers what the GENERATOR block answered, as
                // ruby's does (`Enumerator.new { |y| y << 1; :ret }.each { }` is
                // :ret) -- which is also StopIteration#result at the end of #next
-               flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil)))
+               flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil)))
              | _ -> VNil)
           else
           let recv2 = (if map_has ivars0 (str_of_int id ++ "@recv") then map_get ivars0 (str_of_int id ++ "@recv") else VNil) in
@@ -21825,7 +21885,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                    let yid = alloc_oid ocls9 in
                    let _ = map_set ocls9 yid "Enumerator::Yielder" in
                    let _ = map_set iv9 (str_of_int yid ++ "@__y_blk") (VProc bpid) in
-                   flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil))))
+                   flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil))))
                 | _ -> VNil)
              else
              // Anything else (a produce form) is materialised and walked as pairs.
@@ -32001,7 +32061,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     let from_pool = (if map_has dm_closenv name then false else true) in
      let frame = (if map_has dm_closenv name then
                     (match map_get dm_closenv name with
-                     | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
+                     | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
                      | _ -> frame_pool_get ())
                   else frame_pool_get ()) in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
@@ -32270,7 +32330,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     let blk = (match blk with
                | (true, _, _, _) -> blk
                | _ -> if map_has dm_captured dk
-                      then (match map_get dm_captured dk with VProc pid -> map_get proc_store (str_of_int pid) | _ -> blk)
+                      then (match map_get dm_captured dk with VProc pid -> proc_get (str_of_int pid) | _ -> blk)
                       else blk) in
     // a define_method body is a closure: its frame is a CHILD of the scope the
     // block was written in, so the body reads those locals -- and writes reach
@@ -32284,7 +32344,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     let from_pool = (if map_has dm_closenv dk then false else true) in
     let frame = (if map_has dm_closenv dk then
                    (match map_get dm_closenv dk with
-                    | VProc pid -> (match map_get proc_store (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
+                    | VProc pid -> (match proc_get (str_of_int pid) with (_, _, _, cenv) -> lv_child cenv)
                     | _ -> frame_pool_get ())
                  else frame_pool_get ()) in
     let _ = map_set frame "__fid" (VInt (next_fid ())) in
@@ -33546,7 +33606,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
              (match map_get ivars0 (str_of_int eid ++ "@__e_step") with
               | VProc spid ->
                 (let seed = (if map_has ivars0 (str_of_int eid ++ "@__e_seed") then map_get ivars0 (str_of_int eid ++ "@__e_seed") else VNil) in
-                 let f = try_or (fn (u: unit) -> let _ = enum_produce_go env world blk collector (map_get proc_store (str_of_int spid)) seed in FNext VNil) (FRaise VNil) in
+                 let f = try_or (fn (u: unit) -> let _ = enum_produce_go env world blk collector (proc_get (str_of_int spid)) seed in FNext VNil) (FRaise VNil) in
                  (match f with
                   | FRaise _ ->
                     (let ecls = (if map_has ivars0 "$exc" then (match map_get ivars0 "$exc" with VExc (c2, _) -> c2 | _ -> "") else "") in
@@ -33582,7 +33642,7 @@ and enum_take_m = fn env -> fn world -> fn blk -> fn (eid: int) -> fn (n: int) -
                 // A run to the end keeps what the generator RETURNED: that is
                 // the finished iterator's StopIteration#result.
                 let f = try_or (fn (u: unit) ->
-                          let r9 = run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Nil)) in
+                          let r9 = run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Nil)) in
                           let _ = (if n < 0 then map_set ivars0 (str_of_int eid ++ "@__e_ret") (flow_value r9) else ()) in
                           FNext VNil) (FRaise VNil) in
                 (match f with
@@ -35780,7 +35840,7 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
     // survivor: hand to the final consumer or accumulate (bound-checked).
     (match (if map_has ivars0 (str_of_int did ++ "@__fin") then map_get ivars0 (str_of_int did ++ "@__fin") else VNil) with
      | VProc fpid ->
-       let _ = flow_value (run_block world blk (map_get proc_store (str_of_int fpid)) (Cons (v, Nil))) in
+       let _ = flow_value (run_block world blk (proc_get (str_of_int fpid)) (Cons (v, Nil))) in
        VNil
      | _ ->
        (match (if map_has ivars0 (str_of_int did ++ "@__acc") then map_get ivars0 (str_of_int did ++ "@__acc") else VNil) with
@@ -35806,7 +35866,7 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
           let argl9 = (if raw9 && i == 0 && map_has ivars0 mk9
                        then (match map_get ivars0 mk9 with VArr ma9 -> deref ma9 | _ -> Cons (pv, Nil))
                        else Cons (pv, Nil)) in
-          flow_value (run_block world blk (map_get proc_store (str_of_int ppid)) argl9))
+          flow_value (run_block world blk (proc_get (str_of_int ppid)) argl9))
        | _ -> VNil) in
     if str_eq kind "map" then lz_step_ops env world blk did rest (i + 1) (callp v)
     else if str_eq kind "select" then
@@ -35869,15 +35929,15 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
            let filled = (match cur with Nil -> false | _ -> true) in
            let call1 = fn (x: Val) ->
              (match bfn with
-              | VProc fp1 -> truthy (flow_value (run_block world blk (map_get proc_store (str_of_int fp1)) (Cons (x, Nil))))
+              | VProc fp1 -> truthy (flow_value (run_block world blk (proc_get (str_of_int fp1)) (Cons (x, Nil))))
               | _ -> case_eqq world pat x) in
            let key1 = fn (x: Val) ->
              (match bfn with
-              | VProc fp2 -> flow_value (run_block world blk (map_get proc_store (str_of_int fp2)) (Cons (x, Nil)))
+              | VProc fp2 -> flow_value (run_block world blk (proc_get (str_of_int fp2)) (Cons (x, Nil)))
               | _ -> VNil) in
            let call2 = fn (a9: Val) -> fn (b9: Val) ->
              (match bfn with
-              | VProc fp3 -> truthy (flow_value (run_block world blk (map_get proc_store (str_of_int fp3)) (Cons (a9, Cons (b9, Nil)))))
+              | VProc fp3 -> truthy (flow_value (run_block world blk (proc_get (str_of_int fp3)) (Cons (a9, Cons (b9, Nil)))))
               | _ -> false) in
            let pk = str_of_int did ++ "@__sp" ++ str_of_int i in
            let prev = (if map_has ivars0 pk then map_get ivars0 pk else VNil) in
@@ -35917,7 +35977,7 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
        let _ = map_set ivars0 (str_of_int yid ++ "@__y_lzi") (VInt (i + 1)) in
        (match payload with
         | VProc gpid ->
-          (let _ = flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (VObj yid, Cons (v, Nil)))) in VNil)
+          (let _ = flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (VObj yid, Cons (v, Nil)))) in VNil)
         | _ -> VNil))
     else if str_eq kind "grep" || str_eq kind "grep_v" then
       (let (pat, gfn) = (match payload with
@@ -35928,7 +35988,7 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
        let hit = case_eqq world pat v in
        if (if str_eq kind "grep" then hit else (if hit then false else true)) then
          (let out = (match gfn with
-                     | VProc gpid -> flow_value (run_block world blk (map_get proc_store (str_of_int gpid)) (Cons (v, Nil)))
+                     | VProc gpid -> flow_value (run_block world blk (proc_get (str_of_int gpid)) (Cons (v, Nil)))
                      | _ -> v) in
           lz_step_ops env world blk did rest (i + 1) out)
        else VNil)
@@ -35939,7 +35999,7 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
        let sv = (if map_has ivars0 sk then map_get ivars0 sk
                  else (let a9 = arr_new Nil in let _ = map_set ivars0 sk a9 in a9)) in
        let key = (match payload with
-                  | VProc upid -> flow_value (run_block world blk (map_get proc_store (str_of_int upid)) (Cons (v, Nil)))
+                  | VProc upid -> flow_value (run_block world blk (proc_get (str_of_int upid)) (Cons (v, Nil)))
                   | _ -> v) in
        (match sv with
         | VArr said ->
@@ -35975,7 +36035,7 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
        let _ = map_set ivars0 ck (VInt (c + 1)) in
        (match wfn with
         | VProc wpid ->
-          (let _ = flow_value (run_block world blk (map_get proc_store (str_of_int wpid)) (Cons (v, Cons (VInt (off + c), Nil)))) in
+          (let _ = flow_value (run_block world blk (proc_get (str_of_int wpid)) (Cons (v, Cons (VInt (off + c), Nil)))) in
            lz_step_ops env world blk did rest (i + 1) v)
         | _ -> lz_step_ops env world blk did rest (i + 1) (arr_new (Cons (v, Cons (VInt (off + c), Nil))))))
     // a SHORT argument pads with nil, which is why the row is built by index
@@ -36698,7 +36758,7 @@ and thread_body = fn world -> fn blk -> fn (tid: int) -> fn (r: int) ->
                  // raised at it (or killed) before it ever ran
                  let _ = sch_deliver world tid in
                  match (if map_has iv3 (k ++ "@__tblk") then map_get iv3 (k ++ "@__tblk") else VNil) with
-                 | VProc pid -> run_block world blk (map_get proc_store (str_of_int pid)) args
+                 | VProc pid -> run_block world blk (proc_get (str_of_int pid)) args
                  | _ -> FNext VNil)
                (FRaise VNil) in
   let _ = thread_report world tid result in
@@ -37357,7 +37417,7 @@ and fb_thread_main = fn (i: int) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
   let r = (match fb_iv world oid "@__fb_blk" with
            | VProc pid ->
-             try_or (fn (u: unit) -> run_block world noblk (map_get proc_store (str_of_int pid)) args) (FRaise VNil)
+             try_or (fn (u: unit) -> run_block world noblk (proc_get (str_of_int pid)) args) (FRaise VNil)
            | _ -> FNext VNil) in
   // what the body ended with, as a value or an exception for the other side
   let _ = (match r with

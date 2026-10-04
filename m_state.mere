@@ -1711,17 +1711,69 @@ let proc_issued = fn (k: str) ->
   let n = int_of_str k - handle_base + 1 in
   let cur = (if map_has proc_hi 0 then map_get proc_hi 0 else map_len proc_store) in
   if n > cur then map_set proc_hi 0 n else ();
+// THE BODIES, ONCE EACH (note 273). A proc's entry is (lambda?, params,
+// body, env), and `map_set` copies what it is given into the table's arena --
+// the body too, a whole statement list, for every proc and every block kept
+// beside one. test/unit makes two or three per assertion (assert_equal's
+// message is a block of thirty lines), and since the collector cannot compact
+// an arena a stopped stack points into, proc_store and proc_yblk grew by 80 KB
+// an assertion: 2.5 GB for 40000 assert_equal, and test_array, test_range and
+// test_yield past the guard. A body is the parsed tree, which nothing writes,
+// so it is kept once in blk_bodies, and an entry holds Nil and the body's id
+// (proc_bkey / yblk_bkey); proc_get / yblk_get hand the entry back with the
+// body pointing into blk_bodies, copying nothing.
+// The id is found by a key -- the params, the statement count, the first line
+// and file -- and then the trees are COMPARED: two blocks on one line with the
+// same params (`a.map { |x| .. }.select { |x| .. }`) share a key, never an id.
+let blk_bodies = map_new ();   // id -> Stmt list
+let blk_keys = map_new ();     // "<key>#<i>" -> id, and "<key>" -> how many
+let proc_bkey = map_new ();    // "<proc id>" -> body id
+let yblk_bkey = map_new ();    // "<proc id>" -> body id (its yield block)
+let blk_key = fn (ps: str list) -> fn (body: Stmt list) ->
+  let rec go = fn (xs: Stmt list) -> fn (n: int) -> fn (line: int) -> fn (file: str) ->
+    (match xs with
+     | Nil -> str_of_int n ++ ":" ++ str_of_int line ++ ":" ++ file
+     | Cons (SLine l, t) -> go t (n + 1) (if line < 0 then l else line) file
+     | Cons (SFile f, t) -> go t (n + 1) line (if str_eq file "" then f else file)
+     | Cons (_, t) -> go t (n + 1) line file) in
+  str_join "," ps ++ "|" ++ go body 0 (0 - 1) "";
+let blk_intern = fn (ps: str list) -> fn (body: Stmt list) ->
+  let k = blk_key ps body in
+  let n = (if map_has blk_keys k then map_get blk_keys k else 0) in
+  let rec find = fn (i: int) ->
+    (if i >= n then
+       (let id = map_len blk_bodies in
+        let _ = map_set blk_bodies id body in
+        let _ = map_set blk_keys (k ++ "#" ++ str_of_int i) id in
+        let _ = map_set blk_keys k (i + 1) in
+        id)
+     else
+       (let id = map_get blk_keys (k ++ "#" ++ str_of_int i) in
+        if map_get blk_bodies id == body then id else find (i + 1))) in
+  find 0;
 let store_proc = fn (k: str) -> fn entry ->
   let _ = proc_issued k in
-  let (_, _, _, penv) = entry in
+  let (h, ps, body, penv) = entry in
   let _ = mark_captured penv in
   let _ = (if map_has proc_src k then () else map_set proc_src k (VInt (cur_line ()))) in
   let _ = (if map_has proc_src ("f" ++ k) then () else map_set proc_src ("f" ++ k) (mkstr (cur_file ()))) in
-  map_set proc_store k entry;
+  let _ = map_set proc_bkey k (blk_intern ps body) in
+  map_set proc_store k (h, ps, (Nil : Stmt list), penv);
 let store_yblk = fn (k: str) -> fn b ->
-  let (_, _, _, cenv) = b in
+  let (h, ps, body, cenv) = b in
   let _ = mark_captured cenv in
-  map_set proc_yblk k b;
+  let _ = map_set yblk_bkey k (blk_intern ps body) in
+  map_set proc_yblk k (h, ps, (Nil : Stmt list), cenv);
+// the entry, with its body (an entry written before its body had an id --
+// none is, but the table is the authority -- keeps the body it holds)
+let proc_get = fn (k: str) ->
+  let (h, ps, body, env) = map_get proc_store k in
+  if map_has proc_bkey k then (h, ps, map_get blk_bodies (map_get proc_bkey k), env)
+  else (h, ps, body, env);
+let yblk_get = fn (k: str) ->
+  let (h, ps, body, env) = map_get proc_yblk k in
+  if map_has yblk_bkey k then (h, ps, map_get blk_bodies (map_get yblk_bkey k), env)
+  else (h, ps, body, env);
 
 let lv_has = fn env -> fn (n: str) -> let (found, _) = lv_owner env n in found;
 let lv_get = fn env -> fn (n: str) ->
