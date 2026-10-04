@@ -67,6 +67,20 @@ and `MERE_RUBY_GC_KEEP_PROCS=1` keeps every proc (the rule before note 270,
 when every proc and everything it captured was a root): the two switches a
 lost value is chased with.
 
+## On RISC-V, what needs the C library is NotImplementedError
+
+A build for RV64 (`mere -rv64` of `tools/nothreads_tree.sh`'s tree) runs on
+a machine with no C library: no sockets, no poll, no pipe or dup, no umask or
+rlimits, no libm beyond what Mere implements itself. Mere refuses such an
+extern by a named failure when it is called, and mere-ruby reports it as
+ruby reports a function the machine does not have -- `IO.pipe` raises
+NotImplementedError, "fd_pipe() function is unimplemented on this machine",
+which a `rescue NotImplementedError` catches and an unrescued one reports
+with its line. (Before, the name was dropped on the way out and every such
+call read "mere-ruby: (ruby exception raised) (StandardError)".) What the
+startup and every write ask -- getpid, the signal setup, the rlimit table,
+the errno of a refused write -- is asked once and answered empty instead.
+
 ## IO#timeout is kept but does not end a wait
 
 `r.timeout = 0.1` is kept, answered, and carried by `#dup` (test_io's
