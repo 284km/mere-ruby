@@ -585,10 +585,13 @@ let sng_key_id = fn (k: str) ->
 // reach, and how long a splice's replacement is (an Array's length, else 1)
 let ary_max_size = 1152921504606846975;
 let ary_rlen = fn (v: Val) -> match v with VArr a -> val_list_len (deref a) | _ -> 1;
+// the objects marked live that gc_fixpoint has not yet marked the ivars of
+// (emptied where a mark begins, in gc_mark_roots)
+let gc_obj_pend = map_new ();
 let rec gc_mark_val = fn live -> fn (v: Val) ->
   match v with
   | VObj id -> let k = id * 8 in
-               (if map_has live k then () else (let _ = map_set live k VNil in ()))
+               (if map_has live k then () else (let _ = map_set live k VNil in let _ = map_set gc_obj_pend id 0 in ()))
   | VStr id -> let k = id * 8 + 1 in
                (if map_has live k then () else (let _ = map_set live k VNil in ()))
   | VArr id -> let k = id * 8 + 2 in
@@ -740,19 +743,35 @@ let gc_owner_of = fn (k: str) ->
   else if is_digit (char_at k 0) then gc_owner_go k 0 0
   else 0 - 1;
 
-// fixpoint: values of entries whose owner is live (or ownerless) are marked;
-// repeat until the live set stops growing.
+// fixpoint: values of entries whose owner is live (or ownerless) are marked,
+// until no object is newly live. ivars is read ONCE, into owner -> values,
+// and then each object made live is asked for its own entries.
+// ⚠ It walked the whole table until the live set stopped growing, and a pass
+//   only reached one more link of a chain pointing at older objects (the
+//   table is in the order the entries were made): 100000 `l = S.new(l)` was
+//   100000 passes over 100000 entries, and test_gc never finished.
 let gc_fixpoint = fn ivars -> fn live ->
-  let rec go = fn (guard: int) ->
-    let before = map_len live in
-    let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
-      let owner = gc_owner_of k in
-      if owner < 0 then gc_mark_val live v
-      else if map_has live (owner * 8) then gc_mark_val live v
-      else ()) in
-    let _ = (if gc_log_on () then print_err ("gc: fixpoint pass live=" ++ str_of_int (map_len live)) else ()) in
-    if map_len live > before && guard > 0 then go (guard - 1) else () in
-  go 1000000;
+  let idx = map_new () in
+  let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
+    let owner = gc_owner_of k in
+    if owner < 0 then gc_mark_val live v
+    else if map_has idx owner then map_set idx owner (Cons (v, map_get idx owner))
+    else map_set idx owner (Cons (v, Nil))) in
+  let rec drain = fn (rounds: int) ->
+    (if map_len gc_obj_pend == 0 then rounds
+     else
+       (let ks = vec_new () in
+        let _ = map_iter gc_obj_pend (fn (o: int) -> fn (u: int) -> vec_push ks o) in
+        let _ = map_clear gc_obj_pend in
+        let rec each = fn (i: int) ->
+          (if i >= vec_len ks then ()
+           else (let o = vec_get ks i in
+                 let _ = (if map_has idx o then gc_mark_vals live (map_get idx o) else ()) in
+                 each (i + 1))) in
+        let _ = each 0 in
+        drain (rounds + 1))) in
+  let n = drain 0 in
+  (if gc_log_on () then print_err ("gc: fixpoint rounds=" ++ str_of_int n ++ " live=" ++ str_of_int (map_len live)) else ());
 
 // the root scan, shared by every collection. EVERY top-level map that holds
 // Val values is a root -- the list was built by classifying all 120 globals
@@ -762,6 +781,7 @@ let gc_fixpoint = fn ivars -> fn live ->
 // list honest in one direction: a non-Val map here is a build error. A MISSING
 // map is the direction to fear when adding a new global store.
 let gc_mark_roots = fn env -> fn live ->
+  let _ = map_clear gc_obj_pend in
   let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
   let _ = gc_mark_env live env in
   let _ = map_iter globals mk in
@@ -8536,7 +8556,19 @@ and has_own_eq = fn world -> fn (v: Val) ->
      has_meth world c "==" || obj_is_a world (display_cls world c) "Time")
   | _ -> false
 
+// an Integer, Float or String whose class the program gave its own == asks it
+// (rb_equal: the very same value is equal without asking)
+and prim_eq_redefined = fn world ->
+  has_meth world "Integer" "==" || has_meth world "Float" "==" || has_meth world "String" "=="
 and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
+  if (match a with VInt _ -> true | VFlt _ -> true | VStr _ -> true | _ -> false)
+     && has_meth world (dispatch_cls_of world a) "==" then
+    (match (a, b) with
+     | (VInt x9, VInt y9) when x9 == y9 -> true
+     | (VStr x9, VStr y9) when x9 == y9 -> true
+     | _ -> truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false))
+  else rb_eq_w0 env world a b
+and rb_eq_w0 = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
   match a with
   | VObj _ ->
     if has_own_eq world a
@@ -9599,6 +9631,11 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     //   code and gave different answers -- the printer said #<EnvHash:0x..>
     //   while the method said the environment. Ask once, here.
     if str_eq cls "EnvHash" then inspect_w env world (mkhash (env_hash_list ()))
+    // a BasicObject has no #inspect (Kernel's is Object's): `p b` and
+    // `[b].inspect` are ruby's NoMethodError, unless it defined one
+    else if (if has_meth world cls "inspect" then false else true) && is_basic_obj world v then
+      (let _ = raise_exc world "NoMethodError"
+                 ("undefined method 'inspect' for " ++ for_recv_cls world (dispatch_cls_of world v)) in "")
     // ⚠ ...and `p time` is Time#inspect. Time's #inspect is a dispatcher arm,
     //   not a method-table entry, so the printer fell to the generic object
     //   form and showed the bookkeeping: `p Time.at(0)` printed
@@ -12201,8 +12238,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   else if (str_len name == 5 && str_eq name "count")
           && (match args with Cons (_, Nil) -> true | _ -> false)
           && (match recv with
-              | VArr id -> elem_has_user_eq world (deref id)
-                           || has_meth world "Integer" "==" || has_meth world "Float" "==" || has_meth world "String" "=="
+              | VArr id -> elem_has_user_eq world (deref id) || prim_eq_redefined world
               | _ -> false) then
     (match (recv, args) with
      | (VArr cid9, Cons (v, _)) ->
@@ -12210,13 +12246,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           (match ys with
            | Nil -> n
            | Cons (h, t) ->
-             (let hit = (match (h, v) with
-                         | (VObj _, _) -> rb_eq_w env world h v
-                         // rb_equal: the same fixnum is equal without asking
-                         | (VInt a9, VInt b9) when a9 == b9 -> true
-                         | _ -> (if has_meth world (dispatch_cls_of world h) "=="
-                                 then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) h "==" (Cons (v, Nil)) false)
-                                 else rb_eq_w env world h v)) in
+             (let hit = rb_eq_w env world h v in
               let n2 = (if hit then n + 1 else n) in
               let v2 = arr_ver cid9 in
               if v2 == ver then go t (i + 1) ver n2
@@ -12232,7 +12262,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           //   fired for a user-defined #==, so an array-like element was
           //   skipped and the answer was nil.
           && (match recv with
-              | VArr id -> elem_has_user_eq world (deref id)
+              | VArr id -> elem_has_user_eq world (deref id) || prim_eq_redefined world
                            || (((str_len name == 5 && str_eq name "assoc") || (str_len name == 6 && str_eq name "rassoc"))
                                && elem_has_vobj (deref id))
               | _ -> false) then
@@ -19085,6 +19115,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                            | VArr a9 -> deref a9 | _ -> Nil) in
              make_enum_a world (map_get ivars (str_of_int id ++ "@recv")) meth9 (list_append eargs9 args))
           else make_enum_a world recv name args))
+    // #count walks the source and keeps a number (the prelude's __gen_count)
+    else if is_enum_cls cls && (str_len name == 5 && str_eq name "count")
+            && (match args with Nil -> true | Cons (_, Nil) -> true | _ -> false) then
+      invoke_val_c env world blk recv "__gen_count" args false
     // Enumerator without a block: enum methods materialize the elements and
     // delegate to the array implementation.
     else if is_enum_cls cls
@@ -22240,6 +22274,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                            | VArr aid3 -> deref aid3
                            | _ -> Nil) in
              invoke_with_block env world blk recv2 src2 eargs2 newblk)
+          // #count with a block keeps a number, never the elements
+          else if (str_len name == 5 && str_eq name "count") && (match args with Nil -> true | _ -> false) then
+            invoke_with_block env world blk recv "__gen_count" Nil newblk
           // ...except the walks that can STOP: on a generator (which may never
           // end -- Enumerator.produce always is one) materialising first never
           // returns, where ruby stops at the first element that decides. The
@@ -30421,7 +30458,7 @@ and val_is_nan = fn (v: Val) -> match v with VFlt f -> (if f == f then false els
 and cmp_other_name_f = fn (v: Val) -> match v with VFlt f -> rb_float_str f | _ -> cmp_other_name v
 // an object of a class under BasicObject that never passes Object: it has no
 // #<=> (Kernel is Object's), so comparing it is NoMethodError
-and basic_obj_cmp_check = fn world -> fn (x: Val) ->
+and is_basic_obj = fn world -> fn (x: Val) ->
   (match x with
    | VObj _ ->
      (let (m9, s9, o9, i9) = world in
@@ -30429,12 +30466,13 @@ and basic_obj_cmp_check = fn world -> fn (x: Val) ->
         (if str_eq c "BasicObject" then true
          else if str_eq c "Object" || str_eq c "" || k > 64 then false
          else basic (if map_has s9 c then map_get s9 c else "") (k + 1)) in
-      let c9 = dispatch_cls_of world x in
-      if basic c9 0 then
-        (let _ = raise_exc world "NoMethodError"
-                   ("undefined method '<=>' for " ++ for_recv_cls world c9) in ())
-      else ())
-   | _ -> ())
+      basic (dispatch_cls_of world x) 0)
+   | _ -> false)
+and basic_obj_cmp_check = fn world -> fn (x: Val) ->
+  (if is_basic_obj world x then
+     (let _ = raise_exc world "NoMethodError"
+                ("undefined method '<=>' for " ++ for_recv_cls world (dispatch_cls_of world x)) in ())
+   else ())
 and opt_cmp = fn world -> fn (a: Val) -> fn (b: Val) ->
   let _ = basic_obj_cmp_check world a in
   if val_is_num a && val_is_num b then
@@ -45340,8 +45378,26 @@ and puts_one_nonl = fn world -> fn (v: Val) ->
       (match invoke world noblk v cls "to_s" Nil with
        | VStr s -> let s = sget s in out_emit world s
        | _ -> out_emit world ("#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 (id - handle_base) ++ ">"))
-    else out_emit world (to_s v)
+    else if map_has enc_name (str_of_int id) then out_emit world (map_get enc_name (str_of_int id))
+    else out_emit world (obj_to_s_default world v)
   | _ -> out_emit world (to_s v)
+// Kernel#to_s for an object that has no #to_s of its own: `#<Foo:0x...>`
+// (puts and print wrote "#<Foo>", with no address), and a BasicObject has
+// none at all -- that is ruby's NoMethodError
+and obj_to_s_default = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id ->
+    (if is_basic_obj world v then
+       (let _ = raise_exc world "NoMethodError"
+                  ("undefined method 'to_s' for " ++ for_recv_cls world (dispatch_cls_of world v)) in "")
+     else
+       // the builtin #to_s through the dispatcher, which knows MatchData,
+       // Struct, Time, Method and the plain `#<Foo:0x...>`
+       (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        match invoke_val_c gc_cenv0 world nb9 v "to_s" Nil false with
+        | VStr h9 -> sget h9
+        | _ -> to_s v))
+  | _ -> to_s v
 
 
 // Kernel#p / #pp use #inspect, which for objects/containers must reach a
@@ -45383,7 +45439,7 @@ and puts_one = fn world -> fn (v: Val) ->
        | VStr s -> let s = sget s in out_emit_line world s
        | _ -> out_emit_line world ("#<" ++ cls_display world (obj_print_cls world cls) ++ ":0x" ++ hex_pad16 (id - handle_base) ++ ">"))
     else if map_has enc_name (str_of_int id) then out_emit_line world (map_get enc_name (str_of_int id))
-    else out_emit_line world ("#<" ++ display_cls world cls ++ ">")
+    else out_emit_line world (obj_to_s_default world v)
   | VStr s -> out_emit_line world (sget s)
   | _ -> out_emit_line world (to_s v)
 // One line of Kernel#puts. A line already ending in a newline doesn't get
