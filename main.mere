@@ -6983,6 +6983,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
       (match recv with
        | VHsh hid ->
          (let (out9, broke9, bv9) = hash_tv_b world encl theblk xs in
+          let _ = hash_frz_after_block world recv in
           let _ = hset hid out9 in
           if broke9 then bv9 else recv)
        | _ -> recv)
@@ -7003,6 +7004,7 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
        let changed = (match f with
                       | FNext (VHsh nid) ->
                         let after = val_list_len (hderef nid) in
+                        let _ = (if before == after then () else hash_frz_after_block world recv) in
                         let _ = (match recv with VHsh hid -> hset hid (hderef nid) | _ -> ()) in
                         not (before == after)
                       | _ -> false) in
@@ -13540,6 +13542,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && ((str_len name == 3 && str_eq name "new") || (str_len name == 5 && str_eq name "start") || (str_len name == 4 && str_eq name "fork"))
             && obj_is_a world c "Thread" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
       thread_new world blk c name args (false, (Nil : str list), (Nil : Stmt list), env)
+    // ...and the rest of Thread's class methods (current, pass, list ...) on a
+    // SUBCLASS that does not define them: they are Thread's (test_thread's own
+    // `class Thread < ::Thread` called TestThread::Thread.pass)
+    else if (if str_eq c "Thread" then false else true) && thread_cls_name name
+            && obj_is_a world c "Thread" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      invoke_val_c env world blk (VClass "Thread") name args vischeck
     else if str_eq c "Thread" && thread_cls_name name then
       (let (mth0, sup0, ocl0, ivars) = world in
        if (str_len name == 7 && str_eq name "current") then
@@ -18512,6 +18520,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     //
     // to_s and inspect are the exceptions ENV does own (ruby answers "ENV" and
     // the environment's contents, not #<Object:0x..>).
+    // ENV cannot be frozen (env.c's env_freeze; #clone has its own refusal
+    // below): freezing it for real left every later write a
+    // FrozenError (37 of test_env's tests, after test_frozen_env)
+    else if str_eq cls "EnvHash"
+            && (str_len name == 6 && str_eq name "freeze") then
+      raise_exc world "TypeError" "cannot freeze ENV"
     else if str_eq cls "EnvHash"
             && (if is_prim_method name
                 then (str_len name == 4 && str_eq name "to_s") || (str_len name == 7 && str_eq name "inspect")
@@ -22481,6 +22495,10 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // Thread.each_caller_location(start = 1, length = nil) { |loc| }: the
        // locations caller_locations would answer, one at a time; nil, or
        // what a `break` carries. It takes no keywords.
+       else if (if str_eq c "Thread" then false else true)
+               && ((str_len name == 16 && str_eq name "handle_interrupt") || (str_len name == 20 && str_eq name "each_caller_location"))
+               && obj_is_a world c "Thread" && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+         invoke_with_block env world blk (VClass "Thread") name args newblk
        else if str_eq c "Thread" && (str_len name == 16 && str_eq name "handle_interrupt") then
          (match args with
           | Cons (VHsh _, _) -> thread_handle_interrupt env world blk newblk args
@@ -22935,7 +22953,8 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        else if ((str_len name == 5 && str_eq name "merge") || (str_len name == 6 && str_eq name "merge!") || (str_len name == 6 && str_eq name "update")) && (match recv with VHsh _ -> true | _ -> false) then
          (match recv with
           | VHsh h -> let merged = hash_merge_block world newblk (hderef h) args in
-            (if (str_len name == 5 && str_eq name "merge") then mkhash merged else let _ = hset h merged in recv)
+            (if (str_len name == 5 && str_eq name "merge") then mkhash merged
+             else (let _ = hash_frz_after_block world recv in let _ = hset h merged in recv))
           | _ -> recv)
        // String#gsub/sub with a block: the block computes each replacement.
        // The bang forms write the result back and answer nil when nothing
@@ -25720,7 +25739,15 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
                 // answering true ran test_process's fork tests, which left the
                 // next spawn waiting forever)
                 || ((if bo_notimpl c name then false else true)
-                    && (let _ = bo_ensure () in map_has bi_owner_set (c ++ "." ++ name)))
+                    && (let _ = bo_ensure () in
+                        // the class's own row, or a builtin ancestor's (a
+                        // subclass of Thread answers Thread's class methods)
+                        let rec anc9 = fn (cs: str list) ->
+                          (match cs with
+                           | Nil -> false
+                           | Cons (a9, t9) -> map_has bi_owner_set (a9 ++ "." ++ name) || anc9 t9) in
+                        map_has bi_owner_set (c ++ "." ++ name)
+                        || (if is_sng_cls c then false else anc9 (ancestors_of world c))))
                 || (str_len name == 9 && str_eq name "autoload?") || (str_len name == 13 && str_eq name "define_method")
                 || (str_len name == 23 && str_eq name "define_singleton_method")
                 || (str_len name == 21 && str_eq name "instance_variable_set") || (str_len name == 23 && str_eq name "private_method_defined?")
@@ -39402,6 +39429,14 @@ and frz_recv_check = fn env -> fn world -> fn (recv: Val) ->
 // an Array a block froze while a mutator was walking it: ruby's
 // rb_ary_modify_check after each block (select!, delete_if, map!) and before
 // sort! / uniq! write back -- the array stays as it was (note 275)
+// a Hash the block froze is not written back: ruby refuses the first change
+// after the freeze (rb_hash_modify_check inside the iteration), and the hash
+// keeps what it held (test_hash's delete_if / keep_if / select! / reject! /
+// transform_values! / merge! with a freezing block, 16 tests)
+and hash_frz_after_block = fn world -> fn (recv: Val) ->
+  if val_frozen_mut recv then
+    (let _ = raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect recv) in ())
+  else ()
 and arr_frz_check = fn world -> fn (id: int) ->
   if val_frozen_mut (VArr id)
   then (let _ = raise_exc_iv world "FrozenError"
