@@ -7714,7 +7714,8 @@ and arr_filter_ip = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (want
                        else (if truthy (flow_value f) then false else true)) in
            let touched = (if arr_ver id == ver then false else true) in
            let _ = (if keep && (if i1 == i2 then false else true)
-                    then arr_set id (val_set_at (deref id) i2 h) else ()) in
+                    // one slot, not the whole list again (note 281)
+                    then (if i2 < arr_len id then arr_aset id i2 h else arr_set id (val_set_at (deref id) i2 h)) else ()) in
            let i2b = (if keep then i2 + 1 else i2) in
            let _ = map_set pos "i1" (i1 + 1) in
            let _ = map_set pos "i2" i2b in
@@ -7737,7 +7738,10 @@ and arr_map_ip = fn world -> fn encl -> fn theblk -> fn (id: int) ->
         | f ->
           (let _ = arr_frz_check world id in
            let touched = (if arr_ver id == ver then false else true) in
-           let _ = arr_set id (val_set_at (deref id) i (flow_value f)) in
+           // one slot of the Vec form (arr_aset), not the whole list rebuilt per
+           // element -- `map!` over 10,000 was n^2 (json_encoding_test, 213 s)
+           let _ = (if i < arr_len id then arr_aset id i (flow_value f)
+                    else arr_set id (val_set_at (deref id) i (flow_value f))) in
            go (i + 1) t (if touched then ver else arr_ver id)))) in
   go 0 (deref id) (arr_ver id)
 
@@ -8804,10 +8808,15 @@ and arr_fill_go = fn world -> fn encl -> fn theblk -> fn (useblk: bool) -> fn (i
         | FReturn v -> FReturn v
         | f ->
           (let v9 = (if useblk then flow_value f else fillv) in
-           let cur = deref id in
-           let n9 = val_list_len cur in
-           let base = (if i >= n9 then list_append cur (val_repeat (i - n9 + 1) VNil) else cur) in
-           let _ = arr_set id (val_set_at base i v9) in
+           let n9 = arr_len id in
+           let _ = (if i < n9 then arr_aset id i v9
+                    // ...and one exactly at the end is a push: Array.new(n) { }
+                    // fills an empty array that way, one element past the end
+                    // each time, and rebuilt the whole list per element
+                    else if i == n9 then arr_push_many id (Cons (v9, Nil))
+                    else (let cur = deref id in
+                          let base = list_append cur (val_repeat (i - n9 + 1) VNil) in
+                          arr_set id (val_set_at base i v9))) in
            go (i + 1)))) in
   // a span that cannot exist is refused BEFORE anything is written: ruby has an
   // array-size ceiling and raises rather than trying, and `fill(10, 1, 2**62-1)`
@@ -44392,6 +44401,23 @@ and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm0:
 
 
 
+// ⚠ a failure pops the backtrack list HERE, in rxv_run itself, not through
+//   rxv_fail: Mere loops a function's tail call to ITSELF, and the two calling
+//   each other left one C frame per instruction run -- a backtracking-heavy
+//   pattern (`^([0-9a-zA-Z\-/]*){1,256}$`, test_regexp's cache tests) ran the
+//   stack out and the process died (note 281)
+// how many times this search has backtracked; past the budget it is ruby's
+// Regexp::TimeoutError (what ruby raises when Regexp.timeout is set). ruby
+// does not need one: its match cache keeps a backtracking pattern linear, and
+// this VM has none, so `^([0-9a-zA-Z\-/]*){1,256}$` on a 30-character
+// string that does not match ran for minutes
+and rxv_tick = fn (u: unit) ->
+  let n = vec_get rxv_steps 0 + 1 in
+  let _ = vec_set rxv_steps 0 n in
+  if n > rxv_budget then
+    (let _ = vec_set rxv_steps 0 0 in
+     let _ = prim_raise "Regexp::TimeoutError" "regexp match timeout" in ())
+  else ()
 and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
            -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
   match rxv_fetch prog pc with
@@ -44400,14 +44426,14 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   | IOkAt ->
     // end of a lookbehind body: only a run that lands exactly on the
     // lookbehind's position counts, so `(?<=\A|/)` can take either branch.
-    (if i == map_get rxv_lb_end "e" then RFound (i, saves) else rxv_fail prog s bt)
+    (if i == map_get rxv_lb_end "e" then RFound (i, saves) else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | IChar c ->
     if i < str_len s && str_eq (char_at s i) c then rxv_run prog s (pc + 1) (i + 1) saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | ICharCI c ->
     if i < str_len s && (str_eq (char_at s i) c || str_eq (rxv_swapcase (char_at s i)) c || str_eq (char_at s i) (rxv_swapcase c))
     then rxv_run prog s (pc + 1) (i + 1) saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IAny ->
     // Ruby's `.` is one CHARACTER. This VM walks bytes, so on a UTF-8 subject it
     // consumed one byte of a multibyte character: `"こんにちは"[/に./]` came back
@@ -44417,13 +44443,13 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     // classes character-aware is the rest of that question and not this fix.
     if i < str_len s && (if str_eq (char_at s i) "\n" then false else true)
     then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IAnyNL ->
     if i < str_len s then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IGrapheme ->
     if i < str_len s then rxv_run prog s (pc + 1) (gcb_cluster_end s i) saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   // the yes-branch when group k has matched (both ends saved, as a
   // backreference requires), the no-branch otherwise
   // (?~absent) at i: every end e whose [i, e) holds no match of absent is a
@@ -44441,7 +44467,7 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
   | IClass (items, neg, ci) ->
     if i < str_len s && rxv_cls items neg ci (utf8_char_at s i)
     then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | ISplit (a, b) -> rxv_run prog s a i saves (Cons ((b, i, saves), bt))
   | IJmp t -> rxv_run prog s t i saves bt
   | ISave slot -> rxv_run prog s (pc + 1) i (Cons ((slot, i), saves)) bt
@@ -44459,19 +44485,19 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     // line start: position 0, or right after a \n — but NOT the end-of-string
     // position after a trailing \n (there is no empty last line in Ruby).
     if i == 0 || (i < str_len s && str_eq (char_at s (i - 1)) "\n") then rxv_run prog s (pc + 1) i saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IEOL ->
     if i >= str_len s || str_eq (char_at s i) "\n" then rxv_run prog s (pc + 1) i saves bt
-    else rxv_fail prog s bt
-  | IBOS -> if i == 0 then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+  | IBOS -> if i == 0 then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IGANCHOR ->
     // \G: match only at the search's start offset (set by rxv_search).
     (let g = (if map_has rx_ganchor "g" then map_get rx_ganchor "g" else 0) in
-     if i == g then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
-  | IEOS -> if i >= str_len s then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt
+     if i == g then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+  | IEOS -> if i >= str_len s then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IEOSNL ->
     if i >= str_len s || (i == str_len s - 1 && str_eq (char_at s i) "\n") then rxv_run prog s (pc + 1) i saves bt
-    else rxv_fail prog s bt
+    else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
   | IWordB (want, asc) ->
     // ⚠ ruby's \b is a UNICODE boundary even where its \w is ASCII: "é" is a
     //   word character to `/\b/` ("xé" =~ /x\b/ is nil) and only (?a) makes
@@ -44481,23 +44507,23 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
      let w2 = i < str_len s && rxv_word_at s i asc in
      let atb = (if w1 then (if w2 then false else true) else w2) in
      if (if want then atb else (if atb then false else true)) then rxv_run prog s (pc + 1) i saves bt
-     else rxv_fail prog s bt)
+     else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | IBackref (g, ci) ->
     (let a = rxv_slot_get saves (2 * g) in
      let b = rxv_slot_get saves (2 * g + 1) in
-     if a < 0 || b < a then rxv_fail prog s bt
+     if a < 0 || b < a then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
      else
        let seg = substring s a b in
        let here = (if i + (b - a) <= str_len s then substring s i (i + (b - a)) else "") in
        let eqv = (if ci then str_eq (str_upcase seg) (str_upcase here) else str_eq seg here) in
        if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
-       else rxv_fail prog s bt)
+       else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | ILook (sub, negd) ->
     (match rxv_run prog s sub i saves Nil with
      | RFound (_, sv2) ->
-       if negd then rxv_fail prog s bt else rxv_run prog s (pc + 1) i sv2 bt
+       if negd then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)) else rxv_run prog s (pc + 1) i sv2 bt
      | RFail ->
-       if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
+       if negd then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | IAtomic sub ->
     // Run the body on a FRESH backtrack stack (its internal choices stay
     // contained); take its first match, consume to that end, keep its
@@ -44505,17 +44531,17 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     // back into the group. That is atomic-group / possessive semantics.
     (match rxv_run prog s sub i saves Nil with
      | RFound (e, sv2) -> rxv_run prog s (pc + 1) e sv2 bt
-     | RFail -> rxv_fail prog s bt)
+     | RFail -> (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | ILookB (sub, wlo, whi, negd) ->
     // try every start the body could have had, longest first, and require it
     // to end exactly here -- that is what makes differing-width alternatives
     // in a lookbehind work.
     (match rxv_lookb_try prog s sub i wlo whi saves with
      | RFound (_, sv2) ->
-       if negd then rxv_fail prog s bt else rxv_run prog s (pc + 1) i sv2 bt
+       if negd then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)) else rxv_run prog s (pc + 1) i sv2 bt
      | RFail ->
-       if negd then rxv_run prog s (pc + 1) i saves bt else rxv_fail prog s bt)
-  | IMeta (_, _) -> rxv_fail prog s bt
+       if negd then rxv_run prog s (pc + 1) i saves bt else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
+  | IMeta (_, _) -> (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
 
 // did this loop iteration (the saves newer than the most recent `k` mark
 // entry) change any capture slot's value vs before the iteration?
@@ -44564,14 +44590,11 @@ and rxv_absent_fill = fn v -> fn (xs: int list) ->
 and rxv_absent_alts = fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (e: int) -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
   if i >= e then bt
   else rxv_absent_alts s pc (i + utf8_clen s i) e saves (Cons ((pc, i, saves), bt))
-and rxv_fail = fn prog -> fn (s: str) -> fn (bt: (int * int * ((int * int) list)) list) ->
-  match bt with
-  | Nil -> RFail
-  | Cons ((pc, i, saves), rest) -> rxv_run prog s pc i saves rest
 
 // search: the leftmost match at or after `start` (compile cached; RBadPat
 // when the new engine cannot handle the pattern -> caller uses the legacy one).
 and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int) ->
+  let _ = vec_set rxv_steps 0 0 in
   let key = fl ++ chr 1 ++ pat in
   // record this search's start offset so \G (IGANCHOR) can anchor to it.
   // rindex pins \G to ITS offset argument while attempting matches at
