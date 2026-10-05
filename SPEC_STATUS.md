@@ -39,7 +39,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/range | 31 | 2 | 0 | 2 | 0 | 35 |
 | core/comparable | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/complex | 42 | 0 | 0 | 1 | 0 | 43 |
-| core/env | 44 | 0 | 0 | 1 | 0 | 45 |
+| core/env | 43 | 1 | 0 | 1 | 0 | 45 |
 | core/exception | 36 | 3 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
 | core/float | 47 | 0 | 0 | 3 | 0 | 50 |
@@ -104,7 +104,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | library/shellwords | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/observer | 5 | 0 | 0 | 0 | 0 | 5 |
 | core/array/pack | 26 | 0 | 0 | 1 | 0 | 27 |
-| core/encoding/converter | 15 | 0 | 0 | 1 | 0 | 16 |
+| core/encoding/converter | 14 | 1 | 0 | 1 | 0 | 16 |
 | core/encoding/invalid_byte_sequence_error | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/encoding/undefined_conversion_error | 5 | 0 | 0 | 0 | 0 | 5 |
 | core/enumerator/arithmetic_sequence | 12 | 0 | 0 | 0 | 0 | 12 |
