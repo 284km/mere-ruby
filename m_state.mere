@@ -331,17 +331,61 @@ let arr_new = fn (xs: Val list) ->
 let arr_pending = map_new ();
 let rec vec_tail_list = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
   if i < 0 then acc else vec_tail_list v (i - 1) (Cons (vec_get v i, acc));
+// ⚠ AND SHIFTS ARE A COUNT, NOT A COPY. `shift` stored the rest of the list,
+// which copies it into the table (a list is a value), so a queue -- `a << x;
+// a.shift` -- copied the whole array per turn: 1000 elements, 200,000 turns,
+// 15 GB (note 278). arr_off is how many elements at the front of the stored
+// list have been shifted off, and arr_slen caches the stored list's length,
+// so that size and shift need not walk or copy it. Every reader goes through
+// deref, which drops the front; a write (arr_set, the fold below) starts over.
+let arr_off = map_new ();
+let arr_slen = map_new ();
+// ...and the queue's own length, which can be SHORTER than its Vec: a pop
+// takes the last element by counting it off (Mere's Vec has no pop), and the
+// next push writes into that slot again. Absent: all of the Vec is in use.
+let arr_plen = map_new ();
+// ...and the Vec a fold turned back into the list, kept while nothing has
+// changed the array since (its version then, in arr_vc_ver): a write that
+// alternates with a whole-array read takes it back instead of copying the
+// list into a new Vec every time (note 278 §4)
+let arr_vc = map_new ();
+let arr_vc_ver = map_new ();
+let arr_vc_len = map_new ();
+let rec list_drop_k = fn (xs: Val list) -> fn (k: int) ->
+  if k <= 0 then xs else (match xs with Nil -> xs | Cons (_, t) -> list_drop_k t (k - 1));
+let arr_off_of = fn (id: int) -> (if map_len arr_off > 0 && map_has arr_off id then map_get arr_off id else 0);
+let arr_forget_off = fn (id: int) ->
+  let _ = (if map_len arr_off > 0 && map_has arr_off id then map_delete arr_off id else ()) in
+  (if map_len arr_slen > 0 && map_has arr_slen id then map_delete arr_slen id else ());
+let arr_has_q = fn (id: int) -> map_len arr_pending > 0 && map_has arr_pending id;
+let arr_qlen = fn (id: int) ->
+  if arr_has_q id then
+    (if map_len arr_plen > 0 && map_has arr_plen id then map_get arr_plen id else vec_len (map_get arr_pending id))
+  else 0;
+let arr_drop_q = fn (id: int) ->
+  let _ = (if arr_has_q id then map_delete arr_pending id else ()) in
+  (if map_len arr_plen > 0 && map_has arr_plen id then map_delete arr_plen id else ());
 let deref = fn (id: int) ->
   // `map_len` first: nothing is queued in most programs, and then this costs
   // one comparison rather than a hash on every array read.
-  if map_len arr_pending > 0 && map_has arr_pending id
+  if arr_has_q id
   then
     (let v = map_get arr_pending id in
-     let merged = list_append (map_get arr_store id) (vec_tail_list v (vec_len v - 1) (Nil : Val list)) in
+     let stored0 = list_drop_k (map_get arr_store id) (arr_off_of id) in
+     let qn = arr_qlen id in
+     let merged = list_append stored0 (vec_tail_list v (qn - 1) (Nil : Val list)) in
+     // a Vec that holds the WHOLE array is kept for the next write
+     let _ = (match stored0 with
+              | Nil -> (let _ = map_set arr_vc id v in
+                        let _ = map_set arr_vc_len id qn in
+                        map_set arr_vc_ver id (if map_has arr_vers id then map_get arr_vers id else 0))
+              | _ -> ()) in
      let _ = map_set arr_store id merged in
-     let _ = map_delete arr_pending id in
+     let _ = arr_drop_q id in
+     let _ = arr_forget_off id in
      merged)
-  else map_get arr_store id;
+  else (let o = arr_off_of id in
+        if o == 0 then map_get arr_store id else list_drop_k (map_get arr_store id) o);
 let arr_vers = map_new ();
 let arr_ver = fn (id: int) -> (if map_has arr_vers id then map_get arr_vers id else 0);
 // push without writing the map or the array: O(1) per element
@@ -351,13 +395,107 @@ let arr_push_many = fn (id: int) -> fn (xs: Val list) ->
   let v = (if map_has arr_pending id then map_get arr_pending id
            else (let nv = vec_new () in let _ = map_set arr_pending id nv in nv)) in
   let _ = map_set arr_vers id (arr_ver id + 1) in
-  vec_push_all v xs;
+  if map_len arr_plen > 0 && map_has arr_plen id then
+    // slots a pop counted off are written again before the Vec grows
+    (let rec put = fn (ys: Val list) -> fn (p: int) ->
+       (match ys with
+        | Nil -> (if p >= vec_len v then map_delete arr_plen id else map_set arr_plen id p)
+        | Cons (y, t) ->
+          (let _ = (if p < vec_len v then vec_set v p y else vec_push v y) in put t (p + 1))) in
+     put xs (map_get arr_plen id))
+  else vec_push_all v xs;
 let arr_set = fn (id: int) -> fn (xs: Val list) ->
   let _ = map_set arr_vers id (arr_ver id + 1) in
+  let _ = arr_forget_off id in
   // a whole-array replacement supersedes anything queued for it
-  let _ = (if map_len arr_pending > 0 && map_has arr_pending id
-           then (let _ = map_delete arr_pending id in ()) else ()) in
+  let _ = arr_drop_q id in
   let _ = map_set arr_store id xs in ();
+// the length without folding or walking: the stored list's (cached), less
+// what has been shifted off, plus what is queued
+let rec list_len_v = fn (xs: Val list) -> fn (n: int) -> match xs with Nil -> n | Cons (_, t) -> list_len_v t (n + 1);
+let arr_slen_of = fn (id: int) ->
+  if map_len arr_slen > 0 && map_has arr_slen id then map_get arr_slen id
+  else (let n = list_len_v (map_get arr_store id) 0 in let _ = map_set arr_slen id n in n);
+let arr_len = fn (id: int) -> arr_slen_of id - arr_off_of id + arr_qlen id;
+// the first element off (the array is not empty). From the stored part when
+// it has any: the count goes up, and once half of the stored list is shifted
+// off the rest is stored again (one copy per that many shifts). When only
+// queued elements are left, they are folded in first.
+let arr_shift1 = fn (id: int) ->
+  let _ = map_set arr_vers id (arr_ver id + 1) in
+  let _ = (if arr_slen_of id - arr_off_of id > 0 then () else (let _ = deref id in ())) in
+  let o = arr_off_of id in
+  let rest = list_drop_k (map_get arr_store id) o in
+  match rest with
+  | Nil -> VNil
+  | Cons (h, t) ->
+    (let n = arr_slen_of id in
+     let o2 = o + 1 in
+     let _ = (if o2 >= 32 && o2 * 2 >= n
+              then (let _ = map_set arr_store id t in
+                    let _ = map_set arr_slen id (n - o2) in
+                    if map_has arr_off id then map_delete arr_off id else ())
+              else map_set arr_off id o2) in
+     h);
+// k elements off the front of an array whose queue is folded (after deref):
+// the count goes up, and the rest is stored again once half is off
+let arr_drop_front = fn (id: int) -> fn (k: int) ->
+  let _ = map_set arr_vers id (arr_ver id + 1) in
+  let o = arr_off_of id + k in
+  let n = arr_slen_of id in
+  if o >= 32 && o * 2 >= n
+  then (let _ = map_set arr_store id (list_drop_k (map_get arr_store id) o) in
+        let _ = map_set arr_slen id (n - o) in
+        if map_has arr_off id then map_delete arr_off id else ())
+  else map_set arr_off id o;
+// THE VEC FORM. A write that is not at the end -- pop, `a[i] = x` -- moves
+// the whole array into its queue once (the stored list becomes empty), and
+// from then on such writes are a slot of a Vec, not a copy of the array. A
+// reader that wants the list (deref) folds it back, as it folds appends.
+let arr_to_vec = fn (id: int) ->
+  let xs = deref id in
+  let keep = map_len arr_vc > 0 && map_has arr_vc id && map_get arr_vc_ver id == arr_ver id in
+  let v = (if keep then map_get arr_vc id else (let v0 = vec_new () in let _ = vec_push_all v0 xs in v0)) in
+  let _ = (if keep then (if map_get arr_vc_len id < vec_len v then map_set arr_plen id (map_get arr_vc_len id) else ()) else ()) in
+  let _ = (if map_len arr_vc > 0 && map_has arr_vc id
+           then (let _ = map_delete arr_vc id in let _ = map_delete arr_vc_ver id in map_delete arr_vc_len id) else ()) in
+  let _ = map_set arr_store id (Nil : Val list) in
+  let _ = arr_forget_off id in
+  let _ = map_set arr_slen id 0 in
+  let _ = map_set arr_pending id v in ();
+// position i of the stored part (after what was shifted off), or of the queue
+let arr_base = fn (id: int) -> arr_slen_of id - arr_off_of id;
+let arr_at = fn (id: int) -> fn (i: int) ->
+  let b = arr_base id in
+  if i >= b then vec_get (map_get arr_pending id) (i - b)
+  else (match list_drop_k (map_get arr_store id) (arr_off_of id + i) with Cons (h, _) -> h | Nil -> VNil);
+// the last element off (the array is not empty)
+let arr_pop1 = fn (id: int) ->
+  let _ = (if arr_qlen id > 0 then () else arr_to_vec id) in
+  let _ = map_set arr_vers id (arr_ver id + 1) in
+  let v = map_get arr_pending id in
+  let p = arr_qlen id - 1 in
+  let x = vec_get v p in
+  // (the slot lets go of the value: it is not the array's any more)
+  let _ = vec_set v p VNil in
+  let _ = map_set arr_plen id p in
+  x;
+// a[i] = x for 0 <= i < length
+let arr_aset = fn (id: int) -> fn (i: int) -> fn (x: Val) ->
+  let _ = (if i >= arr_base id then () else arr_to_vec id) in
+  let _ = map_set arr_vers id (arr_ver id + 1) in
+  vec_set (map_get arr_pending id) (i - arr_base id) x;
+// every element, without folding: the collector's view (marking must not
+// build lists)
+let arr_each_val = fn (id: int) -> fn f ->
+  let rec go = fn (xs: Val list) -> (match xs with Nil -> () | Cons (h, t) -> (let _ = f h in go t)) in
+  let _ = go (list_drop_k (map_get arr_store id) (arr_off_of id)) in
+  if arr_has_q id then
+    (let v = map_get arr_pending id in
+     let n = arr_qlen id in
+     let rec gq = fn (i: int) -> (if i >= n then () else (let _ = f (vec_get v i) in gq (i + 1))) in
+     gq 0)
+  else ();
 
 // strings are mutable reference types too (Ruby semantics): VStr is a HANDLE
 // into str_store, so aliases share one mutable string. Fresh id per literal

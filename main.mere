@@ -596,9 +596,9 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                (if map_has live k then () else (let _ = map_set live k VNil in ()))
   | VArr id -> let k = id * 8 + 2 in
                (if map_has live k then ()
-                // `deref` folds the pending appends in first, so marking what
-                // it returns marks them; nothing queued can be missed.
-                else let _ = map_set live k VNil in gc_mark_vals live (deref id))
+                // every element, the queued ones (and the Vec form's) too,
+                // read where they are: marking builds no list (note 278)
+                else let _ = map_set live k VNil in arr_each_val id (fn (x: Val) -> gc_mark_val live x))
   | VHsh id -> let k = id * 8 + 3 in
                (if map_has live k then ()
                 else let _ = map_set live k VNil in gc_mark_vals live (hderef id))
@@ -1092,6 +1092,12 @@ let gc_drop_i = fn tbl -> fn (dead: Vec['d, int]) ->
 let gc_drop_s = fn tbl -> fn (dead: Vec['d, str]) ->
   let rec go = fn (i: int) -> if i >= vec_len dead then () else (let _ = map_delete tbl (vec_get dead i) in go (i + 1)) in
   go 0;
+// ...and from an int-keyed table that may not have them
+let gc_drop_ih = fn tbl -> fn (dead: Vec['d, int]) ->
+  let rec go = fn (i: int) ->
+    if i >= vec_len dead then ()
+    else (let k = vec_get dead i in let _ = (if map_has tbl k then map_delete tbl k else ()) in go (i + 1)) in
+  go 0;
 // ...and from a table that may not have them (the ones kept beside a proc)
 let gc_drop_sh = fn tbl -> fn (dead: Vec['d, str]) -> fn (pre: str) ->
   let rec go = fn (i: int) ->
@@ -1197,6 +1203,14 @@ let gc_collect = fn env -> fn world ->
       if map_has live (k * 8 + 2) then () else vec_push dPK k) in
     let _ = gc_drop_i arr_pending dPK in
     let _ = gc_drop_i arr_store dAK in
+    // ...and what was kept beside a dead array: its shifted-off count, its
+    // stored length, its queue's length
+    let _ = gc_drop_ih arr_off dAK in
+    let _ = gc_drop_ih arr_slen dAK in
+    let _ = gc_drop_ih arr_plen dAK in
+    let _ = gc_drop_ih arr_vc dAK in
+    let _ = gc_drop_ih arr_vc_ver dAK in
+    let _ = gc_drop_ih arr_vc_len dAK in
     let _ = (if nc then () else map_compact arr_store) in
     let rec blank_h = fn (i: int) ->
       if i >= vec_len hash_store then ()
@@ -27936,16 +27950,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> VNil)
   else if (str_len name == 4 && str_eq name "size") || (str_len name == 6 && str_eq name "length") then
     (match recv with
-     | VArr id -> VInt (val_list_len (deref id))
+     | VArr id -> VInt (arr_len id)
      | VStr sh0 -> VInt (str_rblen sh0)
      | VSym s -> VInt (utf8_len s)
      | VHsh xs -> let xs = hderef xs in VInt (hash_len xs) | _ -> prim_raise "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_name recv))
   else if (str_len name == 6 && str_eq name "empty?") then
     (match recv with
-     | VArr id -> VBool (val_list_len (deref id) == 0) | VStr s -> VBool (str_blen s == 0)
+     | VArr id -> VBool (arr_len id == 0) | VStr s -> VBool (str_blen s == 0)
      | VHsh xs -> let xs = hderef xs in VBool (hash_len xs == 0) | _ -> prim_raise "NoMethodError" ("undefined method 'empty?' for " ++ for_recv_name recv))
   else if (str_len name == 2 && str_eq name "[]") then
     (match recv with
+     // one index reads the element where it is, folding nothing (arr_at)
+     | VArr id when (match args with Cons (VInt _, Nil) -> true | _ -> false) ->
+       (match args with
+        | Cons (VInt i, _) ->
+          (let n = arr_len id in
+           let j = (if i < 0 then n + i else i) in
+           if j < 0 || j >= n then VNil else arr_at id j)
+        | _ -> VNil)
      | VArr id ->
        let xs = deref id in
        (match args with
@@ -29235,6 +29257,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> VNil)
   else if (str_len name == 5 && str_eq name "first") then
     (match recv with
+     | VArr id when (match args with Nil -> true | _ -> false) -> (if arr_len id == 0 then VNil else arr_at id 0)
      | VArr id ->
        let xs = deref id in
        (match args with
@@ -29243,6 +29266,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set (mkstr "first") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'first'")) in fail "mere-ruby: undefined method 'first'")))
   else if (str_len name == 4 && str_eq name "last") then
     (match recv with
+     | VArr id when (match args with Nil -> true | _ -> false) -> (let n = arr_len id in if n == 0 then VNil else arr_at id (n - 1))
      | VArr id ->
        let xs = deref id in
        let len = val_list_len xs in
@@ -29613,6 +29637,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with VArr id -> let xs = deref id in let c = val_compact xs in let _ = arr_set id c in (if val_list_len c == val_list_len xs then VNil else recv) | _ -> (let _ = prim_nm_set (mkstr "compact!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact!'")) in fail "mere-ruby: undefined method 'compact!'")))
   else if (str_len name == 3 && str_eq name "pop") then
     (match recv with
+     // the plain form counts the last element off the Vec form (arr_pop1)
+     | VArr id when (match args with Nil -> true | _ -> false) -> (if arr_len id == 0 then VNil else arr_pop1 id)
      | VArr id -> let xs = deref id in let len = val_list_len xs in
        // one optional count, and a NEGATIVE count is not "pop nothing" -- both
        // spellings were being accepted silently.
@@ -29691,6 +29717,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh h -> (match hderef h with
                   | Cons (k, Cons (v, t)) -> let _ = hset h t in arr_new (Cons (k, Cons (v, Nil)))
                   | _ -> VNil)
+     // the plain form takes the head and counts it off (arr_shift1), without
+     // folding, walking or copying the array
+     | VArr id when (match args with Nil -> true | _ -> false) -> (if arr_len id == 0 then VNil else arr_shift1 id)
      | VArr id -> let xs = deref id in let len = val_list_len xs in
        // see pop: one optional count, no negative counts.
        (match args with
@@ -29700,7 +29729,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VInt n, _) ->
           (if n < 0 then prim_raise "ArgumentError" "negative array size"
            else let k = if n > len then len else n in
-             let _ = arr_set id (vdrop xs k) in arr_new (vtake xs k))
+             let _ = arr_drop_front id k in arr_new (vtake xs k))
         | _ -> (match xs with Nil -> VNil | Cons (h, t) -> let _ = arr_set id t in h))
      | _ -> (let _ = prim_nm_set (mkstr "shift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shift'")) in fail "mere-ruby: undefined method 'shift'")))
   // Array#replace: swap in the other array's contents (aliases see it).
@@ -29742,6 +29771,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set (mkstr "clear") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'clear'")) in fail "mere-ruby: undefined method 'clear'"))))
   else if (str_len name == 3 && str_eq name "[]=") then
     (match recv with
+     // an index inside the array writes one slot of the Vec form (arr_aset)
+     | VArr id when (match args with
+                     | Cons (VInt i, Cons (_, Nil)) -> (let n = arr_len id in (if i < 0 then n + i else i) >= 0 && (if i < 0 then n + i else i) < n)
+                     | _ -> false) ->
+       (match args with
+        | Cons (VInt i, Cons (v, _)) -> (let n = arr_len id in let _ = arr_aset id (if i < 0 then n + i else i) v in v)
+        | _ -> VNil)
      | VArr id ->
        (match args with
         // `a[start, len] = v`: a start below -size has no position to write to
