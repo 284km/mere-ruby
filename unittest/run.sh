@@ -52,6 +52,17 @@ src="${1:?usage: unittest/run.sh <ruby-src> [path under test/ ...]}"
 shift
 src="$(cd "$src" && pwd)"
 [ -d "$src/tool/lib" ] && [ -d "$src/test" ] || { echo "unittest: $src has no tool/lib and test/" >&2; exit 2; }
+# ⚠ THE TEST EXTENSIONS AN INSTALLED RUBY DOES NOT CARRY. test_file,
+#   test_file_exhaustive and test_dir_m17n require -test-/file, test_call
+#   -test-/iter, test_keyword -test-/rb_call_super_kw -- C extensions built
+#   only inside a CRuby build tree -- and the reference ruby fails to load them
+#   as surely as mere-ruby does: about 400 tests measured on NEITHER side.
+#   unittest/shim/-test-/ has a Ruby stand-in for each, and BOTH sides get it
+#   on the load path (and pass it to the children assert_separately starts,
+#   which inherit $:), so it is part of the instrument as mspec's shim is. A
+#   stand-in that answered differently from the extension would show as the
+#   reference's own failure (BOTH), not as a verdict on mere-ruby.
+shim="$here/shim"
 . "$root"/tools/ref_ruby.sh
 . "$root"/mspec/mask.sh
 mr="${MR_BIN:-$root/mere-ruby}"
@@ -121,8 +132,8 @@ verdicts() {
 if [ "${1:-}" = "--one" ]; then
   work="$2"; n="$3"; rel="$4"
   dir="$src/test/$(dirname "$rel")"; base="$(basename "$rel")"
-  ro="$(cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
-  mo="$(cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
+  ro="$(cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
+  mo="$(cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
   rf="$(mktemp)"; mf="$(mktemp)"
   printf '%s\n' "$ro" | grep -v '^$' > "$rf"; printf '%s\n' "$mo" | grep -v '^$' > "$mf"
   tag="$here/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
