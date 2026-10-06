@@ -14867,6 +14867,33 @@ and file_open_obj = fn world -> fn (args: Val list) ->
               | Cons (_, Cons (VStr h, _)) -> str_contains (sget h) "x"
               | _ -> false) in
   let nargs9 = list_len args in
+  // ⚠ O_CREAT in an INTEGER mode, and the permission (the third argument):
+  //   File::RDWR | File::CREAT | File::EXCL reads as "r+" above, which opens
+  //   only a file that is there -- so it was never created, and ruby's own
+  //   tempfile.rb (which opens exactly that, perm 0600) failed with ENOENT;
+  //   and the permission was not read at all, every new file 0666 less the
+  //   umask. A file this open creates is made here first, and given perm
+  //   less the umask, as open(2) gives it. (Whether it was there BEFORE is
+  //   what O_EXCL asks below.)
+  let existed0 = file_exists path in
+  let icreat9 = (match args with Cons (_, Cons (VInt n9, _)) -> (n9 / 512) - (n9 / 1024) * 2 == 1 | _ -> false) in
+  let perm9 = (match args with Cons (_, Cons (_, Cons (VInt p9, _))) -> p9 | _ -> 0 - 1) in
+  let _ = (if str_len path > 0 && (if existed0 then false else true) && nargs9 <= 3
+              && (icreat9 || (perm9 >= 0 && (str_contains mode "w" || str_contains mode "a")))
+              && file_exists (dirname_of path)
+           then (let _ = write_file path "" in
+                 if perm9 >= 0 then
+                   (let fin9 = try_or (fn (u: unit) ->
+                                         (let um9 = file_umask 0 in
+                                          let _ = file_umask um9 in
+                                          bit_and perm9 (bit_xor um9 4095))) perm9 in
+                    let writes9 = icreat9 && (match args with Cons (_, Cons (VInt n9, _)) -> n9 - (n9 / 4) * 4 != 0 | _ -> false)
+                                  || str_contains mode "w" || str_contains mode "a" || str_contains mode "+" in
+                    // (no owner write bit and a File that writes: at its close)
+                    if writes9 && bit_and fin9 128 == 0 then map_set file_perm_at_close path fin9
+                    else (let _ = try_or (fn (u: unit) -> file_chmod path fin9) 0 in ()))
+                 else ())
+           else ()) in
   if nargs9 > 3 then
     raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int nargs9 ++ ", expected 1..3)")
   // a mode string ruby would not take ("q", "fake", "rx") is its ArgumentError,
@@ -14876,7 +14903,7 @@ and file_open_obj = fn world -> fn (args: Val list) ->
   // a nil path is a conversion refusal, not a missing file named ""
   else if (match args with Cons (VNil, _) -> true | _ -> false) then
     raise_exc world "TypeError" "no implicit conversion of nil into String"
-  else if excl && file_exists path then
+  else if excl && existed0 then
     raise_exc world "Errno::EEXIST" ("File exists @ rb_sysopen - " ++ path)
   // ⚠ A FIFO's open(2) waits for the other end, and the other end would be
   //   another thread -- which here is this same OS thread, so the open (or
@@ -15029,6 +15056,15 @@ and file_close_obj = fn world -> fn (id: int) ->
   let k = str_of_int id in
   // one path for getting bytes out, so a close after a flush cannot undo it
   let _ = file_flush_obj world id in
+  // ...and a permission held back until now (file_perm_at_close)
+  let _ = (match (if map_has ivars (k ++ "@__f_path") then map_get ivars (k ++ "@__f_path") else VNil) with
+           | VStr ph9 -> (let p9 = sget ph9 in
+                          if map_has file_perm_at_close p9 then
+                            (let m9 = map_get file_perm_at_close p9 in
+                             let _ = map_delete file_perm_at_close p9 in
+                             let _ = try_or (fn (u: unit) -> file_chmod p9 m9) 0 in ())
+                          else ())
+           | _ -> ()) in
   // ...and the descriptor goes with it. A File that is opened and never closed
   // would otherwise hold one until the process ends, and the spec suite opens
   // thousands.
