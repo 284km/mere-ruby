@@ -2423,7 +2423,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
           invoke_val_c env world nb9 (eval_e env world blk (EConst "ARGF")) "filename" Nil false)
        else if str_eq k "*" && (if map_has globals "*" then false else true) then eval_e env world blk (EConst "ARGV")
-       else if map_has globals k then map_get globals k else VNil)
+       else if map_has globals k then map_get globals k
+       // (an ordinary global never assigned reads nil, and -w says so)
+       else (let c9 = char_at name 1 in
+             let _ = (if is_alpha c9 || str_eq c9 "_"
+                      then rb_warning world ("global variable '" ++ name ++ "' not initialized") else ()) in
+             VNil))
     else
     let (meths, sup, ocls, ivars) = world in
     let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -4652,7 +4657,18 @@ and const_opassign = fn env -> fn world -> fn blk -> fn (name: str) -> fn (e: Ex
 
 and const_store = fn world -> fn (key: str) -> fn (v: Val) ->
   let _ = (if map_has consts key
-           then rb_warn world ("already initialized constant " ++ key) else ()) in
+           then (let _ = rb_warn world ("already initialized constant " ++ key) in
+                 // ...and where the old one was set, as ruby says next
+                 // (nothing for one the interpreter or the prelude seeded)
+                 if map_has const_src key && (if rb_verbose_nil () then false else true) then
+                   (let fl9 = map_get const_src key in
+                    let i9 = str_find_from fl9 "\n" 0 in
+                    if i9 > 0 then
+                      warning_emit world (substring fl9 0 i9 ++ ":" ++ substring fl9 (i9 + 1) (str_len fl9)
+                                          ++ ": warning: previous definition of " ++ const_tail key ++ " was here\n") VNil
+                    else ())
+                 else ())
+           else ()) in
   let _ = map_set consts key v in
   // ⚠ ...and an ANONYMOUS class or module gains its name here. Two of the
   //   assignment paths called name_anon and the rest did not, so
@@ -17109,6 +17125,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Nil -> ()
           | Cons (v, rest9) ->
             let n9 = sym_or_str_arg env world v in
+            let _ = warn_serious world (if tomb then "undefining" else "removing") n9 in
             let key = c ++ "#" ++ n9 in
             // ⚠ ...and both refuse a name that is not there, with DIFFERENT
             //   messages: remove_method wants the class's OWN definition
@@ -17156,6 +17173,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // took effect for the rest.
     else if (str_len name == 16 && str_eq name "private_constant") || (str_len name == 15 && str_eq name "public_constant") then
       (let priv = (str_len name == 16 && str_eq name "private_constant") in
+       // (with no names it does nothing, and -w says so)
+       let _ = (match args with Nil -> rb_warning world (name ++ " with no argument is just ignored") | _ -> ()) in
        let rec go = fn (as0: Val list) ->
          match as0 with
          | Nil -> VNil
@@ -21882,6 +21901,57 @@ and rb_warning = fn world -> fn (msg: str) ->
    // assert_warning's captured $stderr never saw `Array.new { }`'s warning
    then warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: " ++ msg ++ "\n") VNil
    else ())
+// a `def` over a method of the same name in the same class or module: ruby's
+// rb_method_entry_make warns -- under -w, "method redefined; discarding old
+// m", and where the old one was written, "previous definition of m was here".
+// object_id and __send__ are warned about whatever $VERBOSE says (rb_warn).
+// Nothing is said for the prelude's own definitions, which are ruby's C
+// methods: neither while the prelude runs, nor as a "previous definition".
+and warn_internal_file = fn (f: str) ->
+  (str_len f > 10 && str_eq (substring f 0 10) "<internal:") || map_has shipped_files f
+and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
+  let (meths, _, _, _) = world in
+  if warn_internal_file (cur_file ()) then ()
+  else
+    (let _ = (if str_eq name "object_id" || str_eq name "__send__"
+              then rb_warn world ("redefining '" ++ name ++ "' may cause serious problems") else ()) in
+     // (...only over a method a program wrote: one the prelude defined is
+     // ruby's C method, and a stdlib file that redefines it -- pp.rb's
+     // Kernel#pp -- must not make every -w child process warn)
+     if map_has meth_aliased key then map_delete meth_aliased key
+     else if map_has meths key && rb_verbose_true () then
+       (let f9 = (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "") in
+        let l9 = (if map_has meth_src key then (match map_get meth_src key with VInt n -> n | _ -> 0) else 0) in
+        if str_eq f9 "" || l9 <= 0 || warn_internal_file f9 then ()
+        else
+          (let _ = rb_warning world ("method redefined; discarding old " ++ name) in
+           warning_emit world (f9 ++ ":" ++ str_of_int l9 ++ ": warning: previous definition of " ++ name ++ " was here\n") VNil))
+     else ())
+// undef / undef_method / remove_method of the three methods the VM leans on
+// (rb_undef, rb_remove_method): "undefining 'object_id' may cause serious
+// problems", unless $VERBOSE is nil
+and warn_serious = fn world -> fn (verb: str) -> fn (name: str) ->
+  if str_eq name "object_id" || str_eq name "__send__" || str_eq name "initialize"
+  then rb_warn world (verb ++ " '" ++ name ++ "' may cause serious problems")
+  else ()
+// (an undef writes an entry over the name, and for object_id and __send__
+// ruby's entry-maker then says "redefining" too)
+and warn_serious_all = fn world -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, t) ->
+    (let _ = warn_serious world "undefining" n in
+     let _ = (if str_eq n "object_id" || str_eq n "__send__"
+              then rb_warn world ("redefining '" ++ n ++ "' may cause serious problems") else ()) in
+     warn_serious_all world t)
+and rb_verbose_nil = fn (u: unit) ->
+  if map_has globals (gvar_slot "VERBOSE")
+  then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
+  else false
+and rb_verbose_true = fn (u: unit) ->
+  if map_has globals (gvar_slot "VERBOSE")
+  then (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false)
+  else false
 and rb_warn = fn world -> fn (msg: str) ->
   (if (if map_has globals (gvar_slot "VERBOSE")
        then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
@@ -40397,6 +40467,11 @@ and do_class_alias = fn world -> fn (cls: str) -> fn (n1: str) -> fn (n2: str) -
            else (let _ = raise_exc_iv world "NameError"
                            ("undefined method '" ++ n2 ++ "' for class '" ++ cls_display world cls ++ "'")
                            (Cons (("__name", VSym n2), Nil)) in ())) in
+  // (an alias over a method of this class discards it, and -w says so --
+  // not `alias m m`, and from now on neither name warns when redefined)
+  let _ = (if str_eq n1 n2 then () else warn_redef world (cls ++ "#" ++ n1) n1) in
+  let _ = map_set meth_aliased (cls ++ "#" ++ n1) "1" in
+  let _ = map_set meth_aliased (src ++ "#" ++ n2) "1" in
   // the name this alias was made FROM, which is what Method#original_name
   // answers. alias_method recorded it and the `alias` keyword did not, so the
   // same alias written two ways gave two different original_names -- one
@@ -40850,7 +40925,11 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                    // ...for THIS class: a block run later with another self
                    // (a define_method body) is not in its scope
                    if map_has cenv "__visc" then () else map_set cenv "__visc" (mkstr cls))) in
-    let vis2 = (match s with SVis (m, Nil) -> m | _ -> vis) in
+    // (a bare `private_constant` / `public_constant` names nothing and sets no
+    // mode: it took over the def visibility of everything after it)
+    let vis2 = (match s with
+                | SVis (m, Nil) -> (if str_eq m "private_constant" || str_eq m "public_constant" then vis else m)
+                | _ -> vis) in
     let f =
       (match s with
        // named form: mark (or unmark) those methods directly. `module_function
@@ -40858,7 +40937,8 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        // namespace so it is callable as a module method.
        | SVis (m, names) ->
          let _ = (match names with
-                  | Nil -> ()
+                  | Nil -> (if str_eq m "private_constant" || str_eq m "public_constant"
+                            then rb_warning world (m ++ " with no argument is just ignored") else ())
                   | _ -> if str_eq m "module_function" then modfunc_promote_hooked world cls names
                          // (the named class methods have to exist, as the method form checks)
                          else if str_eq m "private_class_method" then
@@ -40869,7 +40949,9 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                          else if str_eq m "public_class_method" then
                            (let _ = vis_names_check world ("(sng:" ++ cls ++ ")") names in
                             mark_vis_mode meths ("(sng:" ++ cls ++ ")") names "public")
-                         else if str_eq m "private_constant" then mark_private_consts cls names
+                         else if str_eq m "private_constant" then
+                           (let _ = (match names with Nil -> rb_warning world "private_constant with no argument is just ignored" | _ -> ()) in
+                            mark_private_consts cls names)
                          else
                            // ⚠ a visibility statement about an INHERITED method
                            //   makes an entry in this class, and ruby announces
@@ -40919,6 +41001,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                               "(sng:" ++ c8 ++ ")#" ++ meth_base mname))
                    else if is_selfdef then "(sng:" ++ cls ++ ")#" ++ mname
                    else cls ++ "#" ++ mname in
+         let _ = warn_redef world key (meth_base mname) in
          let _ = set_meth meths key (Meth (params, defs, mbody)) in
          let _ = (if str_eq (meth_base mname) "method_added" then map_set hook_flags "ma" VNil else ()) in
          // ...and the same trick for const_added, which fires from the single
@@ -41176,6 +41259,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        // already fires it, and only one of the two paths had the hook.
        | SUndef names ->
          (let _ = undef_check world cls names in
+          let _ = warn_serious_all world names in
           let _ = undef_all meths cls names in
           let _ = list_iter names (fn (n8: str) -> run_cls_hook world cls "method_undefined" n8) in
           // ...and in a singleton class body the owner hears of it too
@@ -41969,6 +42053,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
          FNext (VBool true)
        else
        let _ = (if str_eq shipped "" then () else map_set stdlib_ran shipped VNil) in
+       let _ = (if str_eq shipped "" then () else map_set shipped_files full "1") in
        // A library mere-ruby SHIPS (see stdlib_src) is its implementation of
        // that feature, so it wins over a file of the same name on the load
        // path -- CRuby's monitor.rb would only `require "monitor.so"` here.
@@ -42427,6 +42512,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           // reachable per-object method this way, so keep the bare name.
           | _ -> name)
        else name) in
+    let _ = warn_redef world key (meth_base name) in
     let _ = set_meth meths key (Meth (params, defs, body)) in
     let _ = map_set meth_cref key (lex_pack ()) in
     let _ = stamp_meth_src key in
@@ -42766,16 +42852,18 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let dcls = definee_cls_of env world in
     if str_eq dcls "" then
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
-     | VClass c -> let _ = undef_check world c names in let _ = undef_all meths c names in FNext VNil
+     | VClass c -> let _ = undef_check world c names in let _ = warn_serious_all world names in let _ = undef_all meths c names in FNext VNil
      | _ -> let _ = undef_top meths names in FNext VNil)
     // ...and so does `undef`: inside an instance_eval it hides the name on
     // THIS object only, leaving every other instance of the class answering.
-    else (let _ = undef_check world dcls names in let _ = undef_all meths dcls names in FNext VNil)
+    else (let _ = undef_check world dcls names in let _ = warn_serious_all world names in let _ = undef_all meths dcls names in FNext VNil)
   // Top-level visibility is a no-op except for one case that is observable:
   // a top-level `def` is a PRIVATE method of Object, and `public def m` (or
   // `public :m`) makes it public -- so `"str".m` and `:sym.m` work. Copying it
   // into Object's table is what makes every receiver find it; a plain
   // top-level def stays where it is, reachable only without a receiver.
+  | SVis (mode, Nil) when str_eq mode "private_constant" || str_eq mode "public_constant" ->
+    let _ = rb_warning world (mode ++ " with no argument is just ignored") in FNext VNil
   | SVis (mode, names) ->
     let (meths, sup, ocls, ivars) = world in
     let _ = (if str_eq mode "public" then publish_toplevel meths names else ()) in
