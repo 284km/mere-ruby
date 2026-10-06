@@ -1436,10 +1436,9 @@ let rec val_intersect = fn (xs: Val list) -> fn (ys: Val list) ->
 // srand(10), core/array/shuffle wants a named permutation -- so "some
 // reproducible generator" is not enough; it has to be this one.
 //
-// State lives in a map keyed "<gid>:<i>" so several generators can exist at
+// Each generator has its own state (mt_vec below) so several can exist at
 // once: gid 0 is the one Kernel#rand and srand share, and every Random
 // instance gets its own.
-let mt_state = map_new ();
 let mt_pos = map_new ();      // gid -> how many words of the block are used
 let mt_seeded = map_new ();   // gid -> "1" once initialised
 let mt_seed_of = map_new ();  // gid -> the seed it was given, as DECIMAL TEXT so a
@@ -1448,10 +1447,23 @@ let mt_next_gid = map_new (); // one counter, so each Random instance gets its o
 let mt_n = 624;
 let mt_m = 397;
 let mt_mask32 = 4294967295;
+// ⚠ the 624 words of a generator are a Vec now, found by its gid. Each word
+//   was its own map entry keyed "<gid>:<i>", so every read and write built
+//   that key: about 440 bytes of garbage per 32-bit draw, which made
+//   Random#bytes(10 MB) take 1.1 GB (and 100 MB past the 6 GB guard) and
+//   2.5 million #rand calls 6.6 GB.
+let mt_vecs = map_new ();
+let mt_vec = fn (g: int) ->
+  if map_has mt_vecs g then map_get mt_vecs g
+  else (let v = vec_new () in
+        let rec z = fn (i: int) -> (if i >= 624 then () else (let _ = vec_push v 0 in z (i + 1))) in
+        let _ = z 0 in
+        let _ = map_set mt_vecs g v in
+        v);
 let mt_get = fn (g: int) -> fn (i: int) ->
-  (let k = str_of_int g ++ ":" ++ str_of_int i in if map_has mt_state k then map_get mt_state k else 0);
+  (if map_has mt_vecs g then vec_get (map_get mt_vecs g) i else 0);
 let mt_set = fn (g: int) -> fn (i: int) -> fn (v: int) ->
-  (let _ = map_set mt_state (str_of_int g ++ ":" ++ str_of_int i) v in ());
+  (let _ = vec_set (mt_vec g) i v in ());
 // is generator a in the same place as generator b? The 624 words and the
 // position in them -- ruby's Random#== compares exactly that (rand_mt_equal).
 let mt_same_state = fn (a: int) -> fn (b: int) ->
@@ -1523,12 +1535,13 @@ let mt_next_state = fn (g: int) ->
    let _ = go 0 in
    let _ = map_set mt_pos (str_of_int g) 0 in ());
 let mt_genrand_int32 = fn (g: int) ->
-  (let _ = (if map_has mt_seeded (str_of_int g) then () else mt_init_genrand g 5489) in
-   let pos = (if map_has mt_pos (str_of_int g) then map_get mt_pos (str_of_int g) else mt_n) in
+  (let kg = str_of_int g in
+   let _ = (if map_has mt_seeded kg then () else mt_init_genrand g 5489) in
+   let pos = (if map_has mt_pos kg then map_get mt_pos kg else mt_n) in
    let _ = (if pos >= mt_n then mt_next_state g else ()) in
-   let pos2 = map_get mt_pos (str_of_int g) in
+   let pos2 = map_get mt_pos kg in
    let y0 = mt_get g pos2 in
-   let _ = map_set mt_pos (str_of_int g) (pos2 + 1) in
+   let _ = map_set mt_pos kg (pos2 + 1) in
    // tempering
    let y1 = bit_xor y0 (bit_shr y0 11) in
    let y2 = bit_xor y1 (bit_and (bit_and (y1 * 128) mt_mask32) 2636928640) in
@@ -1539,8 +1552,36 @@ let mt_genrand_int32 = fn (g: int) ->
 // as fast and answer different bytes for the same seed. Random#bytes and
 // Random.bytes (generator 0, the one srand seeds) both read it.
 // (into a StrBuf: `acc ++ chr b` built the string anew for every byte, n^2/2
-// bytes of garbage for n -- Random.new.bytes(100 MB) grew past 12 GB)
-let mt_bytes = fn (g: int) -> fn (n: int) ->
+// bytes of garbage for n -- Random.new.bytes(100 MB) grew past 12 GB.
+// ...and the bytes are written into the byte arena 64 KiB at a time, one
+// string per block: a one-character string per byte (`chr b`) still came to
+// 7 GB for those 100 MB. Where the arena is refused (RISC-V) the bytes go
+// into the StrBuf one at a time.)
+let mt_bytes_arena = fn (g: int) -> fn (n: int) ->
+  (let p9 = tcp_arena () in
+   let b9 = strbuf_new () in
+   // fill the block from offset off with k more bytes, words as CRuby draws
+   // them (low byte first), then hand back how far it got
+   let rec fill9 = fn (k: int) -> fn (off: int) ->
+     (if k <= 0 || off >= 65536 then off
+      else
+        (let w9 = mt_genrand_int32 g in
+         let take = (if k > 4 then 4 else k) in
+         let rec emit9 = fn (b: int) -> fn (v: int) -> fn (o9: int) ->
+           (if b <= 0 then o9 else (let _ = mem_set_u8 p9 o9 (bit_and v 255) in emit9 (b - 1) (bit_shr v 8) (o9 + 1))) in
+         let o2 = emit9 take w9 off in
+         fill9 (k - take) o2)) in
+   let rec blocks9 = fn (left: int) ->
+     (if left <= 0 then ()
+      else
+        // a block holds a whole number of words, so no draw straddles two
+        (let want = (if left > 65536 then 65536 else left) in
+         let got = fill9 want 0 in
+         let _ = strbuf_push b9 (mem_to_str p9 got) in
+         blocks9 (left - got))) in
+   let _ = blocks9 n in
+   strbuf_to_str b9);
+let mt_bytes_slow = fn (g: int) -> fn (n: int) ->
   (let b9 = strbuf_new () in
    let rec go9 = fn (k: int) ->
      (if k <= 0 then ()
@@ -1553,6 +1594,10 @@ let mt_bytes = fn (g: int) -> fn (n: int) ->
          go9 (k - take))) in
    let _ = go9 n in
    strbuf_to_str b9);
+let mt_bytes = fn (g: int) -> fn (n: int) ->
+  if n <= 0 then ""
+  else (let ok9 = try_or (fn (u: unit) -> (let _ = tcp_arena () in true)) false in
+        if ok9 then mt_bytes_arena g n else mt_bytes_slow g n);
 // The seed as CRuby packs it: 32-bit words, least significant first. One word
 // means init_genrand; more means init_by_array -- the two seedings give
 // different streams, so which one runs is part of reproducing the sequence.

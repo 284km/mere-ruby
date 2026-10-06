@@ -241,3 +241,7 @@ and `gsub(str, str)` -- each an `acc ++ piece` per step into an immutable
 `str`. `Random.new.bytes(100 MB)` reached 12-16 GB and the 6 GB guard. The
 first eight now go through a StrBuf (or a digest Map for `to_h`); `gsub`
 goes through the regexp path and its per-match `$~`, which is a separate arc.
+`Random#bytes` had a second cost under the first: each Mersenne Twister word
+was a map entry keyed `"<gid>:<i>"`, built on every read and write (about
+440 bytes per 32-bit draw). With the state in a Vec and the bytes written
+into the byte arena, `Random.new.bytes(100 MB)` is 1.5 s and 0.98 GB.
