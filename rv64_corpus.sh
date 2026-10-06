@@ -36,9 +36,14 @@ $CC -O2 -w -o "$TMP/rvrun64" "$TMP/rvrun64.c" 2>"$TMP/err" \
   || { echo "FAIL: cc refused the emulator"; head -5 "$TMP/err"; exit 1; }
 
 echo "rv64_corpus: compiling main.mere for RV64 (--ram $RAM)"
-# (from a copy with no threads: the RISC-V backends have no `spawn`, and a
-# Fiber there runs to completion -- see tools/nothreads_tree.sh)
-NT=$(sh "$ROOT/tools/nothreads_tree.sh")
+# (from a copy without mere.toml -- see tools/nothreads_tree.sh -- and, with
+# FIBERS= set empty, one where a Fiber runs to completion)
+# The real Fibers (coroutines on RV since Mere 0.1.623, the collector's pin
+# since 0.1.624) by default: 240 of 279 against 235 with fibers run to
+# completion (213, 220, 231, 233 and 237 agree; 214, 219 and 235 still run
+# out of the shared bump heap). FIBERS= (empty) builds the old way.
+FIBERS="${FIBERS-coro}"
+NT=$(sh "$ROOT/tools/nothreads_tree.sh" ${FIBERS:+--$FIBERS})
 if ! "$MERE" -rv64 --ram "$RAM" "$NT/main.mere" > "$TMP/prog.bin" 2>"$TMP/err"; then
   echo "FAIL: the RISC-V backend refused mere-ruby itself"; head -20 "$TMP/err"; exit 1
 fi
