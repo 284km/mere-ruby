@@ -805,6 +805,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter cur_thr mk in
   let _ = map_iter cvars mk in
   let _ = map_iter deco_memo mk in
+  let _ = map_iter pm_why_v mk in
   let _ = map_iter def_ext_enc mk in
   let _ = map_iter def_int_enc mk in
   let _ = map_iter dfl_tg mk in
@@ -1551,7 +1552,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ESelf -> if lv_has env "self" then lv_get env "self" else VNil
   | EConst name ->
     // `::Name` is top level and nothing else -- no lexical walk.
-    if str_len name > 2 && str_eq (substring name 0 2) "::" then
+    // (`::Object::X` is `::X`: Object's namespace IS the top level, and the
+    // name is stored without the qualifier -- it raised "uninitialized
+    // constant Object::Integer" for a constant every program has)
+    if str_len name > 10 && str_eq (substring name 0 10) "::Object::" then
+      eval_e env world blk (EConst ("::" ++ substring name 10 (str_len name)))
+    else if str_len name > 2 && str_eq (substring name 0 2) "::" then
       (let n = substring name 2 (str_len name) in
        // ⚠ `::X` is the scope operator too, and a private top-level
        //   constant is closed to it ("private constant Object::X
@@ -1908,8 +1914,11 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        else if lv_has env name then mkstr "local-variable"
        else if is_method_defined env world name || is_kernel_builtin name then mkstr "method"
        else VNil
-     | ECall (name, _) -> if is_method_defined env world name || is_kernel_builtin name then mkstr "method" else VNil
-     | ECallB (name, _, _, _) -> if is_method_defined env world name || is_kernel_builtin name then mkstr "method" else VNil
+     // (every argument has to be defined first -- see defined_args_ok)
+     | ECall (name, a9) -> if defined_args_ok env world blk a9 && (is_method_defined env world name || is_kernel_builtin name) then mkstr "method" else VNil
+     | ECallB (name, a9, _, _) -> if defined_args_ok env world blk a9 && (is_method_defined env world name || is_kernel_builtin name) then mkstr "method" else VNil
+     // `puts(x)` parses to its own statement; it is a Kernel call like print
+     | EStmt (SPuts a9) -> if defined_args_ok env world blk a9 then mkstr "method" else VNil
      // `@@x` parses as the ivar "@x": a CLASS variable, asked along the chain
      // the read uses (it answered from the object's ivars, so never)
      | EIVar name when str_len name > 1 && str_eq (char_at name 0) "@" ->
@@ -1973,6 +1982,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                  | _ -> VNil)
               else VNil))
         else VNil)
+     | EMethod (_, _, args9) when (if defined_args_ok env world blk args9 then false else true) -> VNil
      | EMethod (recv, name, _) ->
        let (meths, sup, ocls, ivars) = world in
        // evaluating the receiver may raise (undefined var); defined? is nil.
@@ -2182,10 +2192,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      | FRaise v -> v)
   | EMatchTest (e, pat) ->
     let v = eval_e env world blk e in
+    let _ = pm_begin v in
     if pat_match env world blk pat v then VBool true else VBool false
   | EMatchBind (e, pat) ->
     let v = eval_e env world blk e in
-    let _ = if pat_match env world blk pat v then () else (let _ = raise_exc world "NoMatchingPatternError" (inspect v) in ()) in
+    let _ = pm_begin v in
+    let _ = if pat_match env world blk pat v then () else (let _ = pm_raise env world v true in ()) in
     VNil
   | EFlow (kind, e) ->
     let v = eval_e env world blk e in
@@ -4184,6 +4196,29 @@ and defined_all_elems = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
     (match eval_e env world blk (EDefined h) with
      | VNil -> false
      | _ -> defined_all_elems env world blk t)
+
+// The ARGUMENTS of a call asked by defined?: each one is asked defined? in its
+// turn, and one that is not makes the call nil -- `defined?(a.first(nope))`,
+// `defined?(puts(nope))`. They are not run: `defined?(a.first(sx))` leaves sx
+// uncalled (CRuby compiles a defined_expr for each argument, ahead of the
+// receiver). A splat, a double splat and a block argument are asked about
+// what they spread; `&:sym` is a literal.
+// ⚠ This answered "method" whatever the arguments were, and a setter call
+//   `defined?(a[0] = nope)` is one of these calls (see defined_assign_node).
+and defined_args_ok = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
+  match es with
+  | Nil -> true
+  | Cons (h, t) ->
+    (let ok9 = (match h with
+                | ESplat x -> defined_one_ok env world blk x
+                | EKwSplat x -> defined_one_ok env world blk x
+                | EBlockPass (ESym _) -> true
+                | EBlockPass x -> defined_one_ok env world blk x
+                | EKwHash kv -> defined_args_ok env world blk kv
+                | _ -> defined_one_ok env world blk h) in
+     if ok9 then defined_args_ok env world blk t else false)
+and defined_one_ok = fn env -> fn world -> fn blk -> fn (e: Expr) ->
+  match eval_e env world blk (EDefined e) with VNil -> false | _ -> true
 
 // Is this operand a reason for the whole `defined?` to be nil? Two ways, and
 // only one of them is a raise:
@@ -41851,9 +41886,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     // even when no clause matches). Pre-declare, then try each clause.
     let _ = declare_nils env (clauses_pat_vars clauses) in
     // #deconstruct(_keys) is cached across this case's clauses (called once).
-    let _ = map_clear deco_memo in
     let v = eval_e env world blk subj in
-    run_case_in env world blk v clauses has_else els
+    let _ = pm_begin v in
+    run_case_in env world blk v clauses has_else els (if has_else then false else (match clauses with Cons (_, Nil) -> true | _ -> false))
   | SDef (name, params, defs, body) ->
     let (meths, sup, ocls, ivars) = world in
     // `def recv.m` where recv is a live local naming an object defines a
@@ -43494,17 +43529,58 @@ and refined_impl_go = fn world -> fn (ancs: str list) -> fn (name: str) ->
     else refined_impl_go world rest name
 
 // ---- pattern matching (case/in) -----------------------------------------
-and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> fn (has_else: bool) -> fn (els: Stmt list) ->
+// (`single`: one clause and no else -- the case that says why, see pm_why)
+and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> fn (has_else: bool) -> fn (els: Stmt list) -> fn (single: bool) ->
   match clauses with
   | Nil ->
     if has_else then run_stmts env world blk els
-    else let _ = raise_exc world "NoMatchingPatternError" (inspect v) in FNext VNil
+    else let _ = pm_raise env world v single in FNext VNil
   | Cons (cl, rest) ->
     let (pat, guard, body) = cl in
     // the guard is only evaluated when the pattern matched (&& short-circuits).
-    if pat_match env world blk pat v && truthy (eval_e env world blk guard)
+    if pat_match env world blk pat v && (truthy (eval_e env world blk guard) || pm_fail "guard clause does not return true")
     then run_stmts env world blk body
-    else run_case_in env world blk v rest has_else els
+    else run_case_in env world blk v rest has_else els single
+
+and deco_key = fn (v: Val) -> "d:" ++ hng_key v ++ (match v with VObj oid -> "obj:" ++ str_of_int oid | _ -> "")
+// a new match begins: forget the last one's reasons and #deconstruct, and
+// name the subject (the one value whose #deconstruct is cached)
+and pm_begin = fn (v: Val) ->
+  let _ = pm_reset () in
+  let _ = map_clear deco_memo in
+  map_set pm_why "dsubj" (deco_key v)
+
+// ---- why a single pattern failed (pm_why) --------------------------------
+and pm_reset = fn (u: unit) ->
+  let _ = map_delete pm_why "r" in
+  let _ = map_delete pm_why "kerr" in
+  let _ = map_delete pm_why_v "m" in
+  map_delete pm_why_v "k"
+and pm_fail = fn (r: str) ->
+  let _ = map_set pm_why "r" r in
+  let _ = map_delete pm_why "kerr" in
+  false
+and pm_key_fail = fn env -> fn world -> fn (h: Val) -> fn (k: Val) ->
+  let _ = map_set pm_why "r" ("key not found: " ++ inspect_w env world k) in
+  let _ = map_set pm_why "kerr" "1" in
+  let _ = map_set pm_why_v "m" h in
+  let _ = map_set pm_why_v "k" k in
+  false
+// "v: why" for a single pattern, "v" for any other; a missing key raises the
+// KeyError subclass with what was searched and for what.
+and pm_raise = fn env -> fn world -> fn (v: Val) -> fn (single: bool) ->
+  let head = inspect_w env world v in
+  if single && map_has pm_why "r" then
+    (let msg = head ++ ": " ++ map_get pm_why "r" in
+     if map_has pm_why "kerr" && map_has pm_why_v "m" then
+       (let m9 = map_get pm_why_v "m" in
+        let k9 = map_get pm_why_v "k" in
+        let _ = pm_reset () in
+        raise_exc_iv world "NoMatchingPatternKeyError" msg (Cons (("__matchee", m9), Cons (("__key", k9), Nil))))
+     else (let _ = pm_reset () in raise_exc world "NoMatchingPatternError" msg))
+  else raise_exc world "NoMatchingPatternError" head
+and pm_eqq_fail = fn env -> fn world -> fn (pv: Val) -> fn (v: Val) ->
+  pm_fail (inspect_w env world pv ++ " === " ++ inspect_w env world v ++ " does not return true")
 
 // match a value against a pattern, binding variables into env as a side
 // effect. Bindings made before a later sub-pattern fails are left in place
@@ -43512,18 +43588,20 @@ and run_case_in = fn env -> fn world -> fn blk -> fn (v: Val) -> fn clauses -> f
 and pat_match = fn env -> fn world -> fn blk -> fn (p: Pat) -> fn (v: Val) ->
   match p with
   | PVar nm -> let _ = lv_set env nm v in true
-  | PVal e -> match_eqq env world blk (eval_e env world blk e) v
+  | PVal e -> (let pv = eval_e env world blk e in match_eqq env world blk pv v || pm_eqq_fail env world pv v)
   // a pin `^expr` matches via `expr === value` (so ^(/re/), ^(range), ^Class
   // work), matching Ruby.
-  | PPin e -> match_eqq env world blk (eval_e env world blk e) v
+  | PPin e -> (let pv = eval_e env world blk e in match_eqq env world blk pv v || pm_eqq_fail env world pv v)
   | PAltP alts -> pat_match_any env world blk alts v
   | PAsP (sub, nm) -> if pat_match env world blk sub v then (let _ = lv_set env nm v in true) else false
   | PArrP elems -> pat_match_array env world blk elems v
   | PHashP (items, rest) -> pat_match_hash env world blk items rest v
   | PConstP (ce, inner) ->
     let cls = eval_e env world blk ce in
-    if case_eqq world cls v then pat_match env world blk inner v else false
-  | PSplatP _ -> true
+    if case_eqq world cls v then pat_match env world blk inner v else pm_eqq_fail env world cls v
+  // `in *a` -- a splat with no brackets around it -- is an array pattern of
+  // that one splat. Read as a bare splat it matched anything and bound nil.
+  | PSplatP _ -> pat_match_array env world blk (Cons (p, Nil)) v
 
 and pat_match_any = fn env -> fn world -> fn blk -> fn (alts: Pat list) -> fn (v: Val) ->
   match alts with
@@ -43534,11 +43612,17 @@ and pat_match_array = fn env -> fn world -> fn blk -> fn (elems: Pat list) -> fn
   let (ok, xs) = deconstruct_of env world blk v in
   if ok then
     let ns = count_splats elems in
+    // (the reasons name the DECONSTRUCTED array, as ruby's do)
+    let lenfail = fn (want: str) ->
+      pm_fail (inspect_w env world (arr_new xs) ++ " length mismatch (given " ++ str_of_int (val_list_len xs) ++ ", expected " ++ want ++ ")") in
     if ns == 0 then
-      (if val_list_len xs == pat_list_len elems then match_seq env world blk elems xs else false)
-    else if ns == 1 then match_one_splat env world blk elems xs
-    else match_find env world blk elems xs
-  else false
+      (if val_list_len xs == pat_list_len elems then match_seq env world blk elems xs else lenfail (str_of_int (pat_list_len elems)))
+    else if ns == 1 then
+      (if val_list_len xs < pat_list_len elems - 1 then lenfail (str_of_int (pat_list_len elems - 1) ++ "+")
+       else match_one_splat env world blk elems xs)
+    else if val_list_len xs < pat_list_len elems - 2 then lenfail (str_of_int (pat_list_len elems - 2) ++ "+")
+    else (match_find env world blk elems xs || pm_fail (inspect_w env world (arr_new xs) ++ " does not match to find pattern"))
+  else pm_fail (inspect_w env world v ++ " does not respond to #deconstruct")
 
 // deconstruct a value into a Val list for an array pattern. Real arrays are
 // used directly; a VObj must define #deconstruct returning an Array.
@@ -43572,12 +43656,18 @@ and deconstruct_of = fn env -> fn world -> fn blk -> fn (v: Val) ->
 
 // invoke recv.deconstruct on class `cls`, memoised per case; the result must be
 // an Array (else TypeError). Returns (ok, elements).
+// ⚠ ...memoised for the case's SUBJECT only (pm_why "dsubj"), as ruby's one
+//   cache slot is. A value met deeper down is asked again in every clause:
+//   `case [obj] in [[1]] ... in [[1]]` calls obj.deconstruct twice, and an
+//   object whose #deconstruct answers something new each time (test_pattern_
+//   matching's CDeconstructCache) matched against its first answer forever.
 and call_deco = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (cls: str) ->
-  let mk = "d:" ++ hng_key v ++ (match v with VObj oid -> "obj:" ++ str_of_int oid | _ -> "") in
-  if map_has deco_memo mk then (match map_get deco_memo mk with VArr id2 -> (true, deref id2) | _ -> (false, (Nil : Val list)))
+  let mk = deco_key v in
+  let top = map_has pm_why "dsubj" && str_eq (map_get pm_why "dsubj") mk in
+  if top && map_has deco_memo mk then (match map_get deco_memo mk with VArr id2 -> (true, deref id2) | _ -> (false, (Nil : Val list)))
   else
     (match invoke world (false, (Nil : str list), (Nil : Stmt list), env) v cls "deconstruct" Nil with
-     | VArr id2 -> let _ = map_set deco_memo mk (VArr id2) in (true, deref id2)
+     | VArr id2 -> let _ = (if top then map_set deco_memo mk (VArr id2) else ()) in (true, deref id2)
      | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct must return Array") in (false, (Nil : Val list)))
 
 
@@ -43638,14 +43728,17 @@ and find_window = fn env -> fn world -> fn blk -> fn (mids: Pat list) -> fn (mid
 and pat_match_hash = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list) -> fn (rest: str) -> fn (v: Val) ->
   let (ok, pairs) = deconstruct_keys_of env world blk v items rest in
   if ok then
+    // (the hash the reasons name is what #deconstruct_keys answered)
+    let hv = (match v with VHsh _ -> v | _ -> mkhash pairs) in
     // `{}` (no keys, no rest) matches only an empty hash.
-    if (match items with Nil -> true | _ -> false) && str_eq rest "" then val_list_len pairs == 0
-    else if match_hash_items env world blk items pairs then
-      (if str_eq rest "nil" then hash_only_keys pairs items
+    if (match items with Nil -> true | _ -> false) && str_eq rest "" then
+      (val_list_len pairs == 0 || pm_fail (inspect_w env world hv ++ " is not empty"))
+    else if match_hash_items env world blk items pairs hv then
+      (if str_eq rest "nil" then (hash_only_keys pairs items || pm_fail ("rest of " ++ inspect_w env world (hash_without pairs items) ++ " is not empty"))
        else if str_eq rest "" || str_eq rest "*" then true
        else let _ = lv_set env rest (hash_without pairs items) in true)
     else false
-  else false
+  else pm_fail (inspect_w env world v ++ " does not respond to #deconstruct_keys")
 
 and deconstruct_keys_of = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (items: (str * Pat) list) -> fn (rest: str) ->
   match v with
@@ -43663,8 +43756,10 @@ and deconstruct_keys_of = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (ite
     else if has_meth world cls "deconstruct_keys" || responds_pm env world v "deconstruct_keys" then
       // Ruby passes the list of requested keys, or nil when a **rest binding is
       // present (the method may then need every key).
-      let named_rest = if str_eq rest "" || str_eq rest "nil" || str_eq rest "*" then false else true in
-      let karg = if named_rest then VNil else arr_new (hash_key_syms items) in
+      // (...and nil for `{}` and for `**nil` too: ruby names the keys only
+      // when it has some and nothing past them is needed or refused)
+      let named_rest = if str_eq rest "" || str_eq rest "*" then false else true in
+      let karg = if named_rest || (match items with Nil -> true | _ -> false) then VNil else arr_new (hash_key_syms items) in
       (match invoke_val_c env world blk v "deconstruct_keys" (Cons (karg, Nil)) false with
        | VHsh id2 -> (true, hderef id2)
        | _ -> let _ = raise_exc world "TypeError" (class_name v ++ "#deconstruct_keys must return Hash") in (false, (Nil : Val list)))
@@ -43672,14 +43767,14 @@ and deconstruct_keys_of = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (ite
   | _ -> (false, (Nil : Val list))
 
 
-and match_hash_items = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list) -> fn (pairs: Val list) ->
+and match_hash_items = fn env -> fn world -> fn blk -> fn (items: (str * Pat) list) -> fn (pairs: Val list) -> fn (whole: Val) ->
   match items with
   | Nil -> true
   | Cons (kp, rest) ->
     let (k, sub) = kp in
     let (found, hv) = hash_lookup pairs (VSym k) in
-    if found then (if pat_match env world blk sub hv then match_hash_items env world blk rest pairs else false)
-    else false
+    if found then (if pat_match env world blk sub hv then match_hash_items env world blk rest pairs whole else false)
+    else pm_key_fail env world whole (VSym k)
 
 // scan interleaved [k1,v1,k2,v2,...] for a key equal to target.
 
