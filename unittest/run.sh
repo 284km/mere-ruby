@@ -132,8 +132,19 @@ verdicts() {
 if [ "${1:-}" = "--one" ]; then
   work="$2"; n="$3"; rel="$4"
   dir="$src/test/$(dirname "$rel")"; base="$(basename "$rel")"
-  ro="$(cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
-  mo="$(cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null 2>&1 | verdicts)"
+  # ⚠ INTO A FILE, then read: a pipe is not done until every process holding
+  #   its write end is gone, and a test can leave one behind. test_process's
+  #   fifo tests start `cat < fifo` from a ruby they interrupt; under
+  #   mere-ruby that cat outlived it, blocked opening the fifo, holding the
+  #   inherited stderr -- and `| verdicts` waited on it for 2 h 40 m, the
+  #   whole sweep stopped behind one file, whose verdicts then came out empty
+  #   (MATCH 57 -> 0). An orphan holding a file holds nothing up.
+  out1="$(mktemp)"
+  (cd "$dir" && perl -e "$runner" "$wall" "$ref" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2>&1)
+  ro="$(verdicts < "$out1")"
+  (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2>&1)
+  mo="$(verdicts < "$out1")"
+  rm -f "$out1"
   rf="$(mktemp)"; mf="$(mktemp)"
   printf '%s\n' "$ro" | grep -v '^$' > "$rf"; printf '%s\n' "$mo" | grep -v '^$' > "$mf"
   tag="$here/tags/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').txt"
