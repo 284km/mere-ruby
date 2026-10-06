@@ -1459,12 +1459,6 @@ let mt_same_state = fn (a: int) -> fn (b: int) ->
    let pb = (if map_has mt_pos (str_of_int b) then map_get mt_pos (str_of_int b) else 0 - 1) in
    let rec go = fn (i: int) -> (if i >= mt_n then true else if mt_get a i == mt_get b i then go (i + 1) else false) in
    pa == pb && go 0);
-// ...and a digest of that state for the private #state (ruby answers the
-// words as one Bignum; what a program can do with it is compare it)
-let mt_state_digest = fn (g: int) ->
-  (let rec go = fn (i: int) -> fn (acc: int) ->
-     (if i >= mt_n then acc else go (i + 1) (bit_and (acc * 31 + mt_get g i) 2305843009213693951)) in
-   go 0 (if map_has mt_pos (str_of_int g) then map_get mt_pos (str_of_int g) else 0 - 1));
 // init_genrand: state[0] = s, then a Knuth LCG down the array.
 let mt_init_genrand = fn (g: int) -> fn (s: int) ->
   (let _ = mt_set g 0 (bit_and s mt_mask32) in
@@ -1603,6 +1597,87 @@ let mt_limited = fn (g: int) -> fn (limit: int) ->
         (let v = bit_and (mt_genrand_int32 g) mask in
          if v <= limit then v else (if guard <= 0 then 0 else go (guard - 1))) in
       go 10000));
+// limited_big_rand: an integer in [0, lim] for a limit of any width, given and
+// answered as 32-bit words, least significant first. The top word draws under
+// its own mask and every word below it under all ones; while the draws so far
+// equal the limit's words, one above them starts again. It is also what
+// limited_rand does for a limit past 32 bits (the two agree word for word), so
+// it serves every limit above 0xffffffff, a Fixnum's as much as a Bignum's --
+// mt_limited masked ONE draw with a mask wider than the draw, and a limit like
+// 2**48 never reached its upper bits.
+let mt_limited_words = fn (g: int) -> fn (lim: int list) ->
+  (let lv = vec_new () in
+   let rec fill = fn (xs: int list) -> (match xs with Nil -> () | Cons (h, t) -> (let _ = vec_push lv h in fill t)) in
+   let _ = fill lim in
+   let len = vec_len lv in
+   let rv = vec_new () in
+   let rec zero = fn (k: int) -> (if k <= 0 then () else (let _ = vec_push rv 0 in zero (k - 1))) in
+   let _ = zero len in
+   let rec word = fn (i: int) -> fn (mask: int) -> fn (boundary: bool) ->
+     (if i < 0 then true
+      else
+        (let l9 = vec_get lv i in
+         let m2 = (if mask == 0 then mt_make_mask l9 else mt_mask32) in
+         if m2 == 0 then (let _ = vec_set rv i 0 in word (i - 1) m2 boundary)
+         else
+           (let r = bit_and (mt_genrand_int32 g) m2 in
+            if boundary && l9 < r then false
+            else (let _ = vec_set rv i r in word (i - 1) m2 (boundary && (if r < l9 then false else true)))))) in
+   let rec attempt = fn (guard: int) -> (if word (len - 1) 0 true || guard <= 0 then () else attempt (guard - 1)) in
+   let _ = attempt 100000 in
+   let rec lst = fn (k: int) -> fn (acc: int list) -> (if k < 0 then acc else lst (k - 1) (Cons (vec_get rv k, acc))) in
+   lst (len - 1) Nil);
+// 32-bit words, least significant first, as a decimal magnitude (in limbs:
+// a Random's 624-word state built as a decimal string a word at a time made
+// one Marshal round trip of test_rand take seconds)
+let mt_words_dec = fn (ws: int list) ->
+  (let rec rev = fn (xs: int list) -> fn (acc: int list) -> (match xs with Nil -> acc | Cons (h, t) -> rev t (Cons (h, acc))) in
+   let v = vec_new () in
+   let _ = vec_push v 0 in
+   let rec go = fn (xs: int list) -> (match xs with Nil -> () | Cons (h, t) -> (let _ = limbs_mul_add v 4294967296 h in go t)) in
+   let _ = go (rev ws Nil) in
+   limbs_dec v);
+// random_real with excl false: [0, 1], both ends included -- what a Float range
+// `a..b` draws from (int_pair_to_real_inclusive). The 128-bit product
+// ((a<<32|b) * (2**53+1)) >> 64 is the top 53 bits of the pair plus a carry
+// out of the low ones, which is (b & 0x7ff) * 2**21 + a reaching 2**32.
+let mt_rand_real_incl = fn (g: int) ->
+  (let a = mt_genrand_int32 g in
+   let b = mt_genrand_int32 g in
+   let carry = (if bit_and b 2047 * 2097152 + a >= 4294967296 then 1 else 0) in
+   float_of_int (a * 2097152 + bit_shr b 11 + carry) / 9007199254740992.0);
+// generator b becomes a copy of generator a: its words, where it stands in
+// them, and its seed (Random#dup / #clone, rand_mt_copy). Before this a copy
+// carried a's NUMBER, and the two drew from one stream.
+let mt_copy = fn (a: int) -> fn (b: int) ->
+  (let rec go = fn (i: int) -> (if i >= mt_n then () else (let _ = mt_set b i (mt_get a i) in go (i + 1))) in
+   let _ = go 0 in
+   let ka = str_of_int a in
+   let kb = str_of_int b in
+   let _ = (if map_has mt_pos ka then map_set mt_pos kb (map_get mt_pos ka) else map_delete mt_pos kb) in
+   let _ = (if map_has mt_seeded ka then map_set mt_seeded kb (map_get mt_seeded ka) else map_delete mt_seeded kb) in
+   if map_has mt_seed_of ka then map_set mt_seed_of kb (map_get mt_seed_of ka) else map_delete mt_seed_of kb);
+// Random#marshal_dump's first two: the 624 words as one Integer (word 0 least
+// significant) and ruby's `left`, which counts the words not yet read plus one
+// (a generator that has to twist before its next draw says 1).
+let mt_state_dec = fn (g: int) ->
+  (let rec go = fn (i: int) -> fn (acc: int list) -> (if i < 0 then acc else go (i - 1) (Cons (mt_get g i, acc))) in
+   mt_words_dec (go (mt_n - 1) Nil));
+let mt_left = fn (g: int) ->
+  (let pos = (if map_has mt_pos (str_of_int g) then map_get mt_pos (str_of_int g) else mt_n) in
+   mt_n - pos + 1);
+// ...and #marshal_load's: the words from the Integer's magnitude (zeros past
+// its top, the low 624 if it is wider) and the place from `left`.
+let mt_load = fn (g: int) -> fn (mag: str) -> fn (left: int) ->
+  (let ws = mt_seed_words mag in
+   let rec go = fn (i: int) -> fn (xs: int list) ->
+     (if i >= mt_n then ()
+      else (match xs with
+            | Cons (h, t) -> (let _ = mt_set g i h in go (i + 1) t)
+            | Nil -> (let _ = mt_set g i 0 in go (i + 1) Nil))) in
+   let _ = go 0 ws in
+   let _ = map_set mt_pos (str_of_int g) (mt_n - left + 1) in
+   map_set mt_seeded (str_of_int g) 1);
 // rand(n) for a positive n: an index in [0, n).
 let mt_rand_int = fn (g: int) -> fn (n: int) -> (if n <= 1 then 0 else mt_limited g (n - 1));
 // rand() with no argument: 53 bits of resolution, built from TWO draws exactly
@@ -1621,6 +1696,36 @@ let int_bitop = fn (op: str) -> fn (x: int) -> fn (y: int) ->
 // (both directions move forty bits at a time through the limbs; the bit
 // lists may end in zeros above the top bit, which & | ^ and the way back read
 // as zeros)
+// A magnitude as bytes, least significant first, no zero bytes on top (""
+// for 0) -- and back. Marshal writes a Bignum this way, and it did so in Ruby
+// with `v & 0xffff; v >>= 16` over the whole number per short, which made a
+// Random's 20,000-bit state take seconds each way. Four bytes move per limb
+// pass here.
+let mag_le_bytes = fn (mag: str) ->
+  let v = mag_limbs mag in
+  let out = strbuf_new () in
+  let rec go = fn (u: unit) ->
+    if limbs_zero v then ()
+    else (let r = limbs_divsmall v 4294967296 in
+          let _ = strbuf_push out (chr (bit_and r 255) ++ chr (bit_and (bit_shr r 8) 255) ++ chr (bit_and (bit_shr r 16) 255) ++ chr (bit_shr r 24)) in
+          go ()) in
+  let _ = go () in
+  let b = strbuf_to_str out in
+  let rec top = fn (n: int) -> if n > 0 && ord (char_at b (n - 1)) == 0 then top (n - 1) else n in
+  substring b 0 (top (str_len b));
+let le_bytes_mag = fn (b: str) ->
+  let v = vec_new () in
+  let _ = vec_push v 0 in
+  let n = str_len b in
+  let byte = fn (i: int) -> if i < n then ord (char_at b i) else 0 in
+  // whole words from the top down; the top word may be short
+  let rec go = fn (w: int) ->
+    if w < 0 then ()
+    else (let i = w * 4 in
+          let _ = limbs_mul_add v 4294967296 (byte i + byte (i + 1) * 256 + byte (i + 2) * 65536 + byte (i + 3) * 16777216) in
+          go (w - 1)) in
+  let _ = go ((n + 3) / 4 - 1) in
+  limbs_dec v;
 let big_to_bits = fn (s: str) ->
   if str_eq s "0" then (Nil : int list)
   else
