@@ -81,7 +81,7 @@ them, is what ships; the two are not added together.
 | library/csv/basicwriter | 0 | 0 | 0 | 3 | 0 | 3 |
 | library/socket/tcpserver | 6 | 1 | 0 | 0 | 0 | 7 |
 | library/optionparser | 2 | 0 | 0 | 0 | 0 | 2 |
-| library/random/formatter | 0 | 1 | 0 | 0 | 0 | 1 |
+| library/random/formatter | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/drb | 0 | 0 | 0 | 1 | 0 | 1 |
 | library/matrix/eigenvalue_decomposition | 6 | 0 | 0 | 0 | 0 | 6 |
 | library/resolv | 0 | 4 | 0 | 0 | 0 | 4 |
