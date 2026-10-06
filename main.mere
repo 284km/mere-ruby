@@ -13947,6 +13947,28 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (VStr ph9, _) ->
          VInt (fs_mode (sget ph9) false)
        | _ -> VInt (0 - 1))
+    // File.__stat_fields(path, follow): the 13 numbers of stat(2) / lstat(2)
+    // in file_stat_field's order (dev ino mode nlink uid gid rdev size atime
+    // mtime ctime blksize blocks), nil when there is no such entry, and
+    // :unavailable where the target has no file-metadata calls. File::Stat
+    // ran stat(1) in a shell for these, 66 ms a snapshot.
+    else if str_eq c "File" && (str_len name == 13 && str_eq name "__stat_fields") then
+      (match args with
+       | Cons (VStr ph9, rest9) ->
+         (let follow9 = (match rest9 with Cons (VBool false, _) -> false | Cons (VNil, _) -> false | _ -> true) in
+          let rc9 = try_or (fn (u: unit) -> (if follow9 then file_stat (sget ph9) else file_lstat (sget ph9))) (0 - 2) in
+          if rc9 == 0 - 2 then VSym "unavailable"
+          else if rc9 != 0 then VNil
+          else arr_new (stat_fields_from 0))
+       | _ -> VNil)
+    // File.__utime(path, atime, mtime): utime(2) in seconds, 0 or -1, and
+    // :unavailable where the device is refused (File.utime then runs touch)
+    else if str_eq c "File" && (str_len name == 7 && str_eq name "__utime") then
+      (match args with
+       | Cons (VStr ph9, Cons (VInt a9, Cons (VInt m9, _))) ->
+         (let r9 = try_or (fn (u: unit) -> file_utime (sget ph9) a9 m9) (0 - 2) in
+          if r9 == 0 - 2 then VSym "unavailable" else VInt r9)
+       | _ -> VInt (0 - 1))
     // File.__readlink(path): the link's target, or nil when it is not a link
     // (or cannot be read), or :unavailable where readlink(2) is not there
     else if str_eq c "File" && (str_len name == 10 && str_eq name "__readlink") then
@@ -14288,10 +14310,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (VStr a9, Cons (VStr b9, Nil)) ->
             (let src = sget a9 in let dst = sget b9 in
              if symlink src dst == 0 then VInt 0
-             else if file_exists dst || run ("test -L " ++ shq dst ++ " 2> /dev/null") == 0 then
-               raise_exc world "Errno::EEXIST" ("File exists @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")")
+             else if file_exists dst || fs_mode dst false >= 0 then
+               raise_exc world "Errno::EEXIST" ("File exists @ syserr_fail2_in - " ++ dst)
+             // a target of PATH_MAX bytes or more (1024 on darwin; linux
+             // takes up to 4095 and never fails here) where the link's
+             // directory is there: ENAMETOOLONG, which the test that grows
+             // a target until it is refused waits for
+             else if str_len src >= 1024 && dir_there (dirname_of dst) then
+               raise_exc world "Errno::ENAMETOOLONG" ("File name too long @ rb_file_s_symlink - (" ++ src ++ ", " ++ dst ++ ")")
              else
-               raise_exc world "Errno::ENOENT" ("No such file or directory @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")"))
+               raise_exc world "Errno::ENOENT" ("No such file or directory @ rb_file_s_symlink - (" ++ src ++ ", " ++ dst ++ ")"))
           | _ -> path_arg_err world args 2 2)
        // The rest of the write side, each one libc directly (see the extern
        // block in m_state.mere for why THESE and not chmod/umask/mkfifo).
@@ -14311,10 +14339,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (VStr a9, Cons (VStr b9, Nil)) ->
             (let src = sget a9 in let dst = sget b9 in
              if link src dst == 0 then VInt 0
-             else if file_exists dst then
-               raise_exc world "Errno::EEXIST" ("File exists @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")")
+             else if file_exists dst || fs_mode dst false >= 0 then
+               raise_exc world "Errno::EEXIST" ("File exists @ syserr_fail2_in - " ++ dst)
              else raise_exc world "Errno::ENOENT"
-               ("No such file or directory @ sys_fail2 - (" ++ src ++ ", " ++ dst ++ ")"))
+               ("No such file or directory @ rb_file_s_link - (" ++ src ++ ", " ++ dst ++ ")"))
           | _ -> path_arg_err world args 2 2)
        // File.absolute_path? asks about the STRING, not the filesystem, so it
        // needs nothing from the host at all.
@@ -14333,18 +14361,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             (let m9 = fs_mode (sget ph) false in
              VBool (m9 >= 0 && bit_and m9 61440 == 40960))
           | _ -> VBool false)
-       // File.writable? / readable? / executable?: the shell's own tests, as
-       // directory? above. ⚠ The sentence that used to be here -- "there is no
-       // stat here, so these three are the whole of it" -- is no longer true:
-       // File::Stat answers the permission bits, and world_readable? /
-       // world_writable? / owned? / the kinds come from it. These three stay
-       // on `test` because it asks about the EFFECTIVE user, which the mode
-       // bits alone do not settle.
+       // File.writable? / readable? / executable?: access(2) (fs_access), not
+       // the mode bits, because it is the kernel that settles what THIS user
+       // may do. They were the shell's `test -w` and the rest, a child each.
        else if (str_len name == 9 && str_eq name "writable?") || (str_len name == 9 && str_eq name "readable?") || (str_len name == 11 && str_eq name "executable?") then
          (match args with
           | Cons (VStr ph, _) ->
             (let flag = (if (str_len name == 9 && str_eq name "writable?") then "-w" else if (str_len name == 9 && str_eq name "readable?") then "-r" else "-x") in
-             VBool (run ("test " ++ flag ++ " " ++ shq (sget ph) ++ " 2> /dev/null") == 0))
+             VBool (fs_access (sget ph) flag))
           | _ -> VBool false)
        // ⚠ A MISSING path is ENOENT for File.size (size? says nil, zero? says
        //   false); this answered 0, the size of an empty file that is there.
@@ -14368,12 +14392,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with
           | Cons (VStr ph, _) -> VBool (fsize_of (sget ph) == 0)
           | _ -> VBool false)
-       // ...asked of the shell, the way readable?/writable?/executable? are:
-       // `test a -ef b` is "the same file", which is what #identical? means.
+       // "the same file" is the same st_dev and st_ino (fs_same), which is
+       // what the shell's `test a -ef b` compared, a child a question.
        else if (str_len name == 10 && str_eq name "identical?") then
          (match args with
           | Cons (VStr a9, Cons (VStr b9, _)) ->
-            VBool (run ("test " ++ shq (sget a9) ++ " -ef " ++ shq (sget b9) ++ " 2> /dev/null") == 0)
+            (let same9 = fs_same (sget a9) (sget b9) in
+             if same9 == 0 - 2 then
+               VBool (run ("test " ++ shq (sget a9) ++ " -ef " ++ shq (sget b9) ++ " 2> /dev/null") == 0)
+             else VBool (same9 == 1))
           | _ -> VBool false)
        else if (str_len name == 14 && str_eq name "readable_real?") || (str_len name == 14 && str_eq name "writable_real?")
                || (str_len name == 16 && str_eq name "executable_real?") then
@@ -14381,7 +14408,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (VStr ph, _) ->
             (let flag = (if (str_len name == 14 && str_eq name "writable_real?") then "-w"
                          else if (str_len name == 14 && str_eq name "readable_real?") then "-r" else "-x") in
-             VBool (run ("test " ++ flag ++ " " ++ shq (sget ph) ++ " 2> /dev/null") == 0))
+             VBool (fs_access (sget ph) flag))
           | _ -> VBool false)
        else if (str_len name == 5 && str_eq name "size?") then
          (match args with
@@ -14604,7 +14631,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              //   empty", which names the wrong thing entirely.
              else if (if dir_there p9 then false else true) then
                raise_exc world "Errno::ENOTDIR" ("Not a directory @ dir_s_rmdir - " ++ p9)
-             else if run ("rmdir " ++ shq p9 ++ " 2>/dev/null") == 0 then VInt 0
+             else if (let r9 = try_or (fn (u: unit) -> rmdir p9) (0 - 2) in
+                      // (-2: refused here, and rmdir(1) is asked instead)
+                      if r9 == 0 - 2 then run ("rmdir " ++ shq p9 ++ " 2>/dev/null") else r9) == 0 then VInt 0
              else raise_exc world "Errno::ENOTEMPTY" ("Directory not empty @ dir_s_rmdir - " ++ p9))
           | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
        // ⚠ `exists?` is REMOVED in ruby 4.0 -- on File, on FileTest and on Dir.
@@ -36711,6 +36740,28 @@ and xp_norm = fn (p: str) ->
   if n9 >= 2 then substring p 0 (n9 - 1) ++ path_norm p else path_norm p
 and xp_lead = fn (p: str) -> fn (i: int) ->
   if i < str_len p && str_eq (char_at p i) "/" then xp_lead p (i + 1) else i
+// access(2) for the shell test's flag (-r -w -x), the test itself where the
+// call is refused. ⚠ access asks about the REAL uid where ruby's readable?
+// asks the effective one (eaccess); they differ only under setuid, which
+// this interpreter has no way to be.
+and fs_access = fn (p9: str) -> fn (flag: str) ->
+  let bit9 = (if str_eq flag "-r" then 4 else if str_eq flag "-w" then 2 else 1) in
+  let rc9 = try_or (fn (u: unit) -> access p9 bit9) (0 - 2) in
+  if rc9 == 0 - 2 then run ("test " ++ flag ++ " " ++ shq p9 ++ " 2> /dev/null") == 0
+  else rc9 == 0
+// File.identical?: 1 when both are there and are the same file (st_dev and
+// st_ino of stat(2), what `test -ef` compares), 0 when not, -2 where there is
+// no stat to ask
+and fs_same = fn (a9: str) -> fn (b9: str) ->
+  try_or (fn (u: unit) ->
+            (if file_stat a9 != 0 then 0
+             else (let d9 = file_stat_field 0 in
+                   let i9 = file_stat_field 1 in
+                   if file_stat b9 != 0 then 0
+                   else if file_stat_field 0 == d9 && file_stat_field 1 == i9 then 1 else 0))) (0 - 2)
+// the fields of the snapshot file_stat / file_lstat just took, from i on
+and stat_fields_from = fn (i: int) ->
+  if i >= 13 then Nil else Cons (VInt (file_stat_field i), stat_fields_from (i + 1))
 and fpred_arity = fn (name: str) ->
   if (str_len name == 10 && str_eq name "identical?") then 2 else 1
 and fpred_names = fn (name: str) ->
@@ -36750,7 +36801,12 @@ and path_args = fn nb -> fn world -> fn (name: str) -> fn (args: Val list) ->
   //   both: glob_pat_args discards anything that is not already a String, so
   //   an unconverted path object left no trace at all. The trailing options
   //   hash passes through untouched, because to_path_str only converts objects.
-  if (str_len name == 4 && str_eq name "glob") || (str_len name == 2 && str_eq name "[]")
+  // a CLOSED File handed to a predicate has no descriptor to ask, and ruby
+  // says so (rb_stat goes through the fd); converted to its path below, it
+  // was asked about as if it were still open
+  if fpred_names name && fpred_any_closed world args then
+    (let _ = raise_exc world "IOError" "closed stream" in args)
+  else if (str_len name == 4 && str_eq name "glob") || (str_len name == 2 && str_eq name "[]")
   then path_args_all nb world args
   // File.chmod(mode, *paths): the LEADING argument is the mode, not a path,
   // and every argument after it is one.
@@ -36790,11 +36846,21 @@ and chmod_paths = fn world -> fn (md: str) -> fn (paths: Val list) -> fn (acc: i
      (let ph = sget h9 in
       if (if file_exists ph then false else true) then
         raise_exc world "Errno::ENOENT" ("No such file or directory @ apply2files - " ++ ph)
-      else (let _ = run ("chmod " ++ md ++ " " ++ shq ph ++ " 2>/dev/null") in
+      // chmod(2) through the device; chmod(1) where it is refused
+      else (let r9 = try_or (fn (u: unit) -> file_chmod ph (str_to_int_base md 8)) (0 - 2) in
+            let _ = (if r9 == 0 - 2 then run ("chmod " ++ md ++ " " ++ shq ph ++ " 2>/dev/null") else 0) in
             chmod_paths world md rest9 (acc + 1)))
    | Cons (other9, _) ->
      raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into String"))
 
+and fpred_any_closed = fn world -> fn (args: Val list) ->
+  let (_, _, _, iv9) = world in
+  match args with
+  | Nil -> false
+  | Cons (VObj o9, t9) when map_has iv9 (str_of_int o9 ++ "@__f_path") ->
+    (match map_get iv9 (str_of_int o9 ++ "@__f_mode") with VStr h9 -> str_len (sget h9) == 0 | _ -> true)
+    || fpred_any_closed world t9
+  | Cons (_, t9) -> fpred_any_closed world t9
 and path_args_all = fn nb -> fn world -> fn (args: Val list) ->
   match args with
   | Nil -> Nil

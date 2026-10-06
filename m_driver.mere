@@ -4887,14 +4887,11 @@ let core_prelude_f =
   "  # One stat(2) snapshot, which is what CRuby's File::Stat is: the fields are\n" ++
   "  # read ONCE, at construction, and every reader answers from that copy.\n" ++
   "  #\n" ++
-  "  # ⚠ The read goes through stat(1), not stat(2). This interpreter's host\n" ++
-  "  # language has no struct-reading FFI -- its externs carry ints, floats and\n" ++
-  "  # strings -- so the choice was between a hardcoded `struct stat` offset table\n" ++
-  "  # (which is an ABI claim this repository cannot check, and differs between\n" ++
-  "  # the macOS it is developed on and the Linux CI runs) and one subprocess.\n" ++
-  "  # A subprocess per SNAPSHOT is the honest cost, and it is the same cost model\n" ++
-  "  # File.writable? has had all along (`test -w`). It is one process per\n" ++
-  "  # File.stat, not one per field, because the snapshot is the unit.\n" ++
+  "  # The read is stat(2) through Mere's file-metadata devices (file_stat\n" ++
+  "  # takes the snapshot, file_stat_field reads one field of it), which know\n" ++
+  "  # the platform's `struct stat` so this does not have to. It went through\n" ++
+  "  # stat(1), a subprocess per snapshot (66 ms); that is kept for a target\n" ++
+  "  # without the devices and for the birth time, which they do not carry.\n" ++
   "  class Stat\n" ++
   "    include Comparable\n" ++
   "\n" ++
@@ -4932,7 +4929,19 @@ let core_prelude_f =
   "    #   dialects), so File.stat answered lstat's snapshot: a link to a file\n" ++
   "    #   said symlink? true and file? false. `follow` is the difference\n" ++
   "    #   between the two calls.\n" ++
+  "    # stat(2) itself (File.__stat_fields), the shell only where the target\n" ++
+  "    # has no file-metadata calls. The birth time is not in that snapshot and\n" ++
+  "    # is asked of the shell when #birthtime wants it (:btime absent).\n" ++
   "    def self.__raw(path, follow = true)\n" ++
+  "      f = File.__stat_fields(path, follow)\n" ++
+  "      return __raw_sh(path, follow) if f == :unavailable\n" ++
+  "      return nil if f.nil?\n" ++
+  "      \{ dev: f[0], ino: f[1], mode: f[2], nlink: f[3], uid: f[4], gid: f[5],\n" ++
+  "        rdev: f[6], size: f[7], atime: f[8], mtime: f[9], ctime: f[10],\n" ++
+  "        blksize: f[11], blocks: f[12], path: path, follow: follow }\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    def self.__raw_sh(path, follow = true)\n" ++
   "      q = __shq(path)\n" ++
   "      l = follow ? \"-L \" : \"\"\n" ++
   "      if __bsd?\n" ++
@@ -4957,25 +4966,51 @@ let core_prelude_f =
   "    # a path as rb_get_path takes one: a String, #to_path, then #to_str\n" ++
   "    def self.__path(path)\n" ++
   "      return path if path.is_a?(String)\n" ++
-  "      return path.to_path if path.respond_to?(:to_path)\n" ++
-  "      return path.to_str if path.respond_to?(:to_str)\n" ++
+  "      # (an IO answers #to_path too, with nil: that is ruby's TypeError)\n" ++
+  "      path = path.to_path if path.respond_to?(:to_path)\n" ++
+  "      path = path.to_str if !path.is_a?(String) && path.respond_to?(:to_str)\n" ++
+  "      return path if path.is_a?(String)\n" ++
   "      raise TypeError, \"no implicit conversion of #\{path.nil? ? 'nil' : path.class} into String\"\n" ++
   "    end\n" ++
   "\n" ++
-  "    def initialize(path)\n" ++
-  "      path = File::Stat.__path(path)\n" ++
-  "      h = File::Stat.__raw(path)\n" ++
-  "      raise Errno::ENOENT.new(path, \"rb_file_s_stat\") if h.nil?\n" ++
-  "      @h = h\n" ++
+  "    # rb_stat, which the time readers and the predicates use (stat and\n" ++
+  "    # lstat do not): an IO is asked about its descriptor, not its path\n" ++
+  "    def self.__fd_path(x) = x.is_a?(IO) ? \"/dev/fd/#\{x.fileno}\" : x\n" ++
+  "\n" ++
+  "    # the snapshot, or the error ruby names for a missing one. stat(2)'s\n" ++
+  "    # errno is not handed back, so the one other answer a reader sees is\n" ++
+  "    # worked out: a prefix that is there and is not a directory (or a\n" ++
+  "    # trailing slash on a file) is ENOTDIR, which this called ENOENT.\n" ++
+  "    def self.__snap(path, follow, func)\n" ++
+  "      path = __path(path)\n" ++
+  "      h = __raw(path, follow)\n" ++
+  "      return h unless h.nil?\n" ++
+  "      d = path\n" ++
+  "      d = d.chomp(\"/\") while d.size > 1 && d.end_with?(\"/\")\n" ++
+  "      notdir = d != path && File.exist?(d) && !File.directory?(d)\n" ++
+  "      until notdir || (up = File.dirname(d)) == d\n" ++
+  "        d = up\n" ++
+  "        notdir = File.exist?(d) && !File.directory?(d)\n" ++
+  "      end\n" ++
+  "      raise Errno::ENOTDIR.new(path, func) if notdir\n" ++
+  "      raise Errno::ENOENT.new(path, func)\n" ++
   "    end\n" ++
   "\n" ++
-  "    # File.lstat: the same snapshot of the link itself\n" ++
-  "    def self.__lstat(path)\n" ++
-  "      path = __path(path)\n" ++
-  "      h = __raw(path, false)\n" ++
-  "      raise Errno::ENOENT.new(path, \"rb_file_s_lstat\") if h.nil?\n" ++
+  "    def initialize(path)\n" ++
+  "      @h = File::Stat.__snap(path, true, \"rb_file_s_stat\")\n" ++
+  "    end\n" ++
+  "\n" ++
+  "    # File.lstat: the same snapshot of the link itself; __for, File.mtime\n" ++
+  "    # and the others, which name their own function in the message\n" ++
+  "    def self.__lstat(path) = __for(path, false, \"rb_file_s_lstat\")\n" ++
+  "    def initialize_copy(o)\n" ++
+  "      raise TypeError, \"initialize_copy should take same class object\" unless o.is_a?(File::Stat)\n" ++
+  "      @h = o.instance_variable_get(:@h).dup\n" ++
+  "      self\n" ++
+  "    end\n" ++
+  "    def self.__for(path, follow, func)\n" ++
   "      s = allocate\n" ++
-  "      s.instance_variable_set(:@h, h)\n" ++
+  "      s.instance_variable_set(:@h, __snap(path, follow, func))\n" ++
   "      s\n" ++
   "    end\n" ++
   "\n" ++
@@ -4996,6 +5031,10 @@ let core_prelude_f =
   "    #   ctime, a different instant for any file changed since it was made.\n" ++
   "    #   A filesystem that does not record one says 0, and ruby says so too.\n" ++
   "    def birthtime\n" ++
+  "      unless @h.key?(:btime)\n" ++
+  "        sh = File::Stat.__raw_sh(@h[:path], @h[:follow])\n" ++
+  "        @h[:btime] = sh ? sh[:btime] : 0\n" ++
+  "      end\n" ++
   "      raise NotImplementedError, \"birthtime() function is unimplemented on this machine\" if @h[:btime] == 0\n" ++
   "      Time.at(@h[:btime])\n" ++
   "    end\n" ++
@@ -5074,24 +5113,24 @@ let core_prelude_f =
   "  def self.stat(path) = File::Stat.new(path)\n" ++
   "  def self.lstat(path) = File::Stat.__lstat(path)\n" ++
   "\n" ++
-  "  def self.atime(path) = stat(path).atime\n" ++
-  "  def self.mtime(path) = stat(path).mtime\n" ++
-  "  def self.ctime(path) = stat(path).ctime\n" ++
-  "  def self.birthtime(path) = stat(path).birthtime\n" ++
+  "  def self.atime(path) = File::Stat.__for(File::Stat.__fd_path(path), true, \"rb_file_s_atime\").atime\n" ++
+  "  def self.mtime(path) = File::Stat.__for(File::Stat.__fd_path(path), true, \"rb_file_s_mtime\").mtime\n" ++
+  "  def self.ctime(path) = File::Stat.__for(File::Stat.__fd_path(path), true, \"rb_file_s_ctime\").ctime\n" ++
+  "  def self.birthtime(path) = File::Stat.__for(File::Stat.__fd_path(path), true, \"rb_file_s_birthtime\").birthtime\n" ++
   "  # the type of the NAME, not what it points at: ruby asks lstat(2) here\n" ++
   "  def self.ftype(path) = lstat(path).ftype\n" ++
   "\n" ++
-  "  def self.owned?(path) = (stat(path).owned? rescue false)\n" ++
-  "  def self.grpowned?(path) = (stat(path).grpowned? rescue false)\n" ++
-  "  def self.setuid?(path) = (stat(path).setuid? rescue false)\n" ++
-  "  def self.setgid?(path) = (stat(path).setgid? rescue false)\n" ++
-  "  def self.sticky?(path) = (stat(path).sticky? rescue false)\n" ++
-  "  def self.pipe?(path) = (stat(path).pipe? rescue false)\n" ++
-  "  def self.socket?(path) = (stat(path).socket? rescue false)\n" ++
-  "  def self.blockdev?(path) = (stat(path).blockdev? rescue false)\n" ++
-  "  def self.chardev?(path) = (stat(path).chardev? rescue false)\n" ++
-  "  def self.world_readable?(path) = (stat(path).world_readable? rescue nil)\n" ++
-  "  def self.world_writable?(path) = (stat(path).world_writable? rescue nil)\n" ++
+  "  def self.owned?(path) = (stat(File::Stat.__fd_path(path)).owned? rescue false)\n" ++
+  "  def self.grpowned?(path) = (stat(File::Stat.__fd_path(path)).grpowned? rescue false)\n" ++
+  "  def self.setuid?(path) = (stat(File::Stat.__fd_path(path)).setuid? rescue false)\n" ++
+  "  def self.setgid?(path) = (stat(File::Stat.__fd_path(path)).setgid? rescue false)\n" ++
+  "  def self.sticky?(path) = (stat(File::Stat.__fd_path(path)).sticky? rescue false)\n" ++
+  "  def self.pipe?(path) = (stat(File::Stat.__fd_path(path)).pipe? rescue false)\n" ++
+  "  def self.socket?(path) = (stat(File::Stat.__fd_path(path)).socket? rescue false)\n" ++
+  "  def self.blockdev?(path) = (stat(File::Stat.__fd_path(path)).blockdev? rescue false)\n" ++
+  "  def self.chardev?(path) = (stat(File::Stat.__fd_path(path)).chardev? rescue false)\n" ++
+  "  def self.world_readable?(path) = (stat(File::Stat.__fd_path(path)).world_readable? rescue nil)\n" ++
+  "  def self.world_writable?(path) = (stat(File::Stat.__fd_path(path)).world_writable? rescue nil)\n" ++
   "  # ⚠ utime(2), umask(2), mkfifo(2) and lchmod(2) live in headers an emitted\n" ++
   "  #   program does not include (the extern block in m_state.mere measured\n" ++
   "  #   which ones), so each of these asks the command that makes the same\n" ++
@@ -5116,6 +5155,14 @@ let core_prelude_f =
   "      raise Errno::ENOENT.new(p, \"apply2files\")\n" ++
   "    end\n" ++
   "    return 0 if paths.empty?\n" ++
+  "    # utime(2) itself for the paths (whole seconds, as touch -t); touch(1)\n" ++
+  "    # for the link itself, and where the device is refused\n" ++
+  "    unless link\n" ++
+  "      ai = (atime.nil? ? now : (atime.is_a?(Time) ? atime : Time.at(atime))).to_i\n" ++
+  "      mi = (mtime.nil? ? now : (mtime.is_a?(Time) ? mtime : Time.at(mtime))).to_i\n" ++
+  "      rs = paths.map \{ |p| File.__utime(p, ai, mi) }\n" ++
+  "      return paths.size unless rs.include?(:unavailable)\n" ++
+  "    end\n" ++
   "    q = paths.map \{ |p| File::Stat.__shq(p) }.join(\" \")\n" ++
   "    h = link ? \"-h \" : \"\"\n" ++
   "    `TZ=UTC0 touch -c #\{h}-a -t #\{a} #\{q} 2>/dev/null`\n" ++
@@ -5373,7 +5420,8 @@ let core_prelude_h =
   "  def mtime = (__closed!; File.mtime(@__f_path))\n" ++
   "  def ctime = (__closed!; File.ctime(@__f_path))\n" ++
   "  def birthtime = (__closed!; File.birthtime(@__f_path))\n" ++
-  "  def size = (__closed!; File.size(@__f_path))\n" ++
+  "  # what is still in the write buffer counts, as ruby flushes first\n" ++
+  "  def size = (__closed!; flush; File.size(@__f_path))\n" ++
   "  # flock(2) on the File's descriptor (the one #fileno hands out). A lock that\n" ++
   "  # has to WAIT waits the way IO's readiness loop does -- asked with LOCK_NB,\n" ++
   "  # the other threads run between asks -- because a flock(2) that blocked\n" ++
