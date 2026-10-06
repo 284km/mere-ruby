@@ -191,20 +191,25 @@ let scrub_bad_span = fn (s: str) -> fn (i: int) ->
 // everything else is already all-valid (or left alone).
 let rb_scrub = fn (s: str) -> fn (e: str) -> fn (rep: str) ->
   let n = str_len s in
+  // (the two common ones into a StrBuf: `acc ++` per character was quadratic)
   if str_eq e "UTF-8" then
-    (let rec go = fn (i: int) -> fn (acc: str) -> fn (ch: bool) ->
-       if i >= n then (acc, ch)
+    (let b9 = strbuf_new () in
+     let rec go = fn (i: int) -> fn (ch: bool) ->
+       if i >= n then ch
        else (match utf8_cp_strict s i with
              | (c, l, ok) ->
-               if ok then go (i + l) (acc ++ substring s i (i + l)) ch
-               else (let sp = scrub_bad_span s i in go (i + sp) (acc ++ rep) true)) in
-     go 0 "" false)
+               if ok then (let _ = strbuf_push b9 (substring s i (i + l)) in go (i + l) ch)
+               else (let sp = scrub_bad_span s i in let _ = strbuf_push b9 rep in go (i + sp) true)) in
+     let ch9 = go 0 false in
+     (strbuf_to_str b9, ch9))
   else if str_eq e "US-ASCII" then
-    (let rec go = fn (i: int) -> fn (acc: str) -> fn (ch: bool) ->
-       if i >= n then (acc, ch)
-       else if ord (char_at s i) < 128 then go (i + 1) (acc ++ char_at s i) ch
-       else go (i + 1) (acc ++ rep) true in
-     go 0 "" false)
+    (let b9 = strbuf_new () in
+     let rec go = fn (i: int) -> fn (ch: bool) ->
+       if i >= n then ch
+       else if ord (char_at s i) < 128 then (let _ = strbuf_push b9 (char_at s i) in go (i + 1) ch)
+       else (let _ = strbuf_push b9 rep in go (i + 1) true) in
+     let ch9 = go 0 false in
+     (strbuf_to_str b9, ch9))
   else if str_eq e "UTF-16LE" || str_eq e "UTF-16BE" then
     (let be = str_eq e "UTF-16BE" in
      let unit = fn (k: int) ->
@@ -607,11 +612,19 @@ let rb_crypt_des = fn (pw: str) -> fn (salt: str) ->
 // Ruby's widths are in characters: `"日本語abcあ".ljust(9, ".")` pads a
 // seven-character string to nine. Measured in bytes it was already 12 wide and
 // nothing was added at all.
-let rec str_pad_to = fn (pad: str) -> fn (k: int) ->
+// (written into a StrBuf: `pad ++ str_pad_to pad (k - pn)` copied everything
+// after it once per repetition, and `"a".center(n)` was quadratic in n)
+let str_pad_to = fn (pad: str) -> fn (k: int) ->
   let pn = utf8_len pad in
   if k <= 0 || pn == 0 then ""
-  else if k >= pn then pad ++ str_pad_to pad (k - pn)
-  else utf8_substr pad 0 k;
+  else
+    (let b9 = strbuf_new () in
+     let rec go9 = fn (r: int) ->
+       (if r >= pn then (let _ = strbuf_push b9 pad in go9 (r - pn))
+        else if r > 0 then strbuf_push b9 (utf8_substr pad 0 r)
+        else ()) in
+     let _ = go9 k in
+     strbuf_to_str b9);
 let str_ljust = fn (s: str) -> fn (w: int) -> fn (pad: str) ->
   let n = utf8_len s in if n >= w || str_len pad == 0 then s else s ++ str_pad_to pad (w - n);
 let str_rjust = fn (s: str) -> fn (w: int) -> fn (pad: str) ->
@@ -1063,10 +1076,51 @@ let rec hash_put = fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
      | Cons (v2, t) -> if hkey_eql k2 k then Cons (k2, Cons (v, t)) else Cons (k2, Cons (v2, hash_put t k v))
      | Nil -> Cons (k, Cons (v, Nil)));
 // merge other's pairs into base (other wins on conflict).
-let rec hash_merge = fn (base: Val list) -> fn (other: Val list) ->
+// ⚠ one hash_put per pair is a scan per pair: `(0...n).to_h { ... }` and
+//   `Array#to_h` were quadratic (8192 pairs 0.92 s, 4x that 13x the time).
+//   When every key has a digest -- the rule the hash index already uses for
+//   eql? -- the pairs are deduplicated through a Map in one pass; a key
+//   keeps its first position and its first key object, and takes its last
+//   value, as hash_put gives. Anything else keeps the scan.
+let rec hash_merge_scan = fn (base: Val list) -> fn (other: Val list) ->
   match other with
   | Nil -> base
-  | Cons (k, rest) -> (match rest with Cons (v, t) -> hash_merge (hash_put base k v) t | Nil -> base);
+  | Cons (k, rest) -> (match rest with Cons (v, t) -> hash_merge_scan (hash_put base k v) t | Nil -> base);
+let rec hpairs_digestible = fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (_, t)) -> (if str_eq (hkey_digest k) "" then false else hpairs_digestible t)
+  | Nil -> true
+  | _ -> false;
+let rec hash_npairs_go = fn (xs: Val list) -> fn (n: int) ->
+  match xs with Cons (_, Cons (_, t)) -> hash_npairs_go t (n + 1) | _ -> n;
+let hash_npairs = fn (xs: Val list) -> hash_npairs_go xs 0;
+let hash_merge = fn (base: Val list) -> fn (other: Val list) ->
+  match other with
+  | Nil -> base
+  | _ ->
+    if (if hpairs_digestible base then hpairs_digestible other else false) then
+      (let vals9 = map_new () in
+       let rec walk9 = fn (xs: Val list) -> fn (ks: Val list) -> fn (ds: str list) ->
+         (match xs with
+          | Cons (k, Cons (v, t)) ->
+            (let d9 = hkey_digest k in
+             if map_has vals9 d9 then (let _ = map_set vals9 d9 v in walk9 t ks ds)
+             else (let _ = map_set vals9 d9 v in walk9 t (Cons (k, ks)) (Cons (d9, ds))))
+          | _ -> (ks, ds)) in
+       // base is a hash already, so two of its keys sharing a digest are two
+       // keys (compare_by_identity's "str" and "str"): that one keeps the scan
+       let (ks1, ds1) = walk9 base Nil Nil in
+       if map_len vals9 != hash_npairs base then hash_merge_scan base other else
+       let (ks2, ds2) = walk9 other ks1 ds1 in
+       // the lists are newest-first, so the result is built back to front
+       let rec build9 = fn (ks: Val list) -> fn (ds: str list) -> fn (acc: Val list) ->
+         (match ks with
+          | Cons (k, kt) -> (match ds with
+                             | Cons (d9, dt) -> build9 kt dt (Cons (k, Cons (map_get vals9 d9, acc)))
+                             | Nil -> acc)
+          | Nil -> acc) in
+       build9 ks2 ds2 Nil)
+    else hash_merge_scan base other;
 // merge every VHsh argument into base, left to right.
 let rec hash_merge_all = fn (base: Val list) -> fn (args: Val list) ->
   match args with
@@ -1137,8 +1191,10 @@ let utf8_seq_ok = fn (s: str) -> fn (i: int) ->
   let n = utf8_seq_len s i in
   if n == 0 || i + n > str_len s then false else utf8_cont_ok s (i + 1) (i + n);
 
-let rec esc_str_b = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (bin: bool) ->
-  if i >= str_len s then acc
+// (written into a StrBuf: `acc ++ piece` per character made inspect, dump
+// and everything that prints a String quadratic in its length)
+let rec esc_str_b_go = fn b9 -> fn (s: str) -> fn (i: int) -> fn (bin: bool) ->
+  if i >= str_len s then ()
   else
     let c = char_at s i in
     if bin && (ord c >= 128 || ord c < 32 || ord c == 127) then
@@ -1152,16 +1208,16 @@ let rec esc_str_b = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (bin: bool
          else if ord c == 7 then "\\a"
          else if ord c == 27 then "\\e"
          else "\\x" ++ hex2 (ord c) in
-       esc_str_b s (i + 1) (acc ++ piece) bin)
+       (let _ = strbuf_push b9 (piece) in esc_str_b_go b9 s (i + 1) bin))
     else
     if ord c >= 128 then
       (if utf8_seq_ok s i then
          (let cp = (match utf8_cp s i with (cc, ll) -> cc) in
           let l = (match utf8_cp s i with (cc, ll) -> ll) in
           let esc = if cp >= 128 && cp <= 159 then "\\u" ++ hex4 cp else substring s i (i + l) in
-          esc_str_b s (i + l) (acc ++ esc) bin)
+          (let _ = strbuf_push b9 (esc) in esc_str_b_go b9 s (i + l) bin))
        // a byte that starts no valid sequence is shown as itself, in hex
-       else esc_str_b s (i + 1) (acc ++ "\\x" ++ hex2 (ord c)) bin)
+       else (let _ = strbuf_push b9 ("\\x" ++ hex2 (ord c)) in esc_str_b_go b9 s (i + 1) bin))
     else
     let piece =
       if str_eq c "\\" then "\\\\"
@@ -1182,7 +1238,12 @@ let rec esc_str_b = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (bin: bool
               (str_eq (char_at s (i + 1)) "\{" || str_eq (char_at s (i + 1)) "$" || str_eq (char_at s (i + 1)) "@")
       then "\\#"
       else c in
-    esc_str_b s (i + 1) (acc ++ piece) bin;
+    (let _ = strbuf_push b9 (piece) in esc_str_b_go b9 s (i + 1) bin);
+let esc_str_b = fn (s: str) -> fn (i: int) -> fn (acc: str) -> fn (bin: bool) ->
+  let b9 = strbuf_new () in
+  let _ = strbuf_push b9 acc in
+  let _ = esc_str_b_go b9 s i bin in
+  strbuf_to_str b9;
 
 
 // render a float as Ruby does, including Infinity / -Infinity / NaN.

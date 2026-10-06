@@ -226,3 +226,18 @@ every append still folds every time, so `buf << x; buf.slice!(0, k)` costs
 what it did -- the same peak footprint too (632 MB vs 633 MB for 50k rounds
 on a 4 KB buffer), which is the case a StrBuf-backed queue would have leaked.
 StringIO's remaining cost is its Ruby-level #write, linear but ~40 us a call.
+
+## `quad_strings.rb`
+
+```
+./mere-ruby bench/quad_strings.rb [n]      # and the same under ruby
+```
+
+Thirty-six operations that build a string (or a hash), each at n and 4n. A
+ratio near 4 is linear; above 10 is printed `SUPERLINEAR`. On 2026-10-06
+(note 290) nine were: `Random#bytes`, `String#reverse`, `#inspect`, `#dump`,
+`#scrub`, `#center`, `format("%-*s")`, `Array#to_h` (through `hash_merge`),
+and `gsub(str, str)` -- each an `acc ++ piece` per step into an immutable
+`str`. `Random.new.bytes(100 MB)` reached 12-16 GB and the 6 GB guard. The
+first eight now go through a StrBuf (or a digest Map for `to_h`); `gsub`
+goes through the regexp path and its per-match `$~`, which is a separate arc.
