@@ -9729,7 +9729,8 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     // ⚠ `p ENV` and `ENV.inspect` are the same question. They reached different
     //   code and gave different answers -- the printer said #<EnvHash:0x..>
     //   while the method said the environment. Ask once, here.
-    if str_eq cls "EnvHash" then inspect_w env world (mkhash (env_hash_list ()))
+    // (through a singleton too: pp.rb's `class << ENV` retags it)
+    if str_eq cls "EnvHash" || (is_sng_cls cls && str_eq (sng_supername world cls) "EnvHash") then inspect_w env world (mkhash (env_hash_list ()))
     // a BasicObject has no #inspect (Kernel's is Object's): `p b` and
     // `[b].inspect` are ruby's NoMethodError, unless it defined one
     else if (if has_meth world cls "inspect" then false else true) && is_basic_obj world v
@@ -12511,9 +12512,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // answer `#<EnvHash:0x..>`, which leaks a class name that ruby does not have
   // (ENV.class is Object there).
   else if ((str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s"))
-          && (match recv with
-              | VObj oid -> (let (_, _, ocls9, _) = world in str_eq (map_get ocls9 oid) "EnvHash")
-              | _ -> false) then
+          && env_is_recv world recv name then
     (if (str_len name == 4 && str_eq name "to_s") then mkstr "ENV"
      else mkstr (inspect_w env world (mkhash (env_hash_list ()))))
   else if ((str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s"))
@@ -18673,7 +18672,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | VStr h9 -> (if str_contains (sget h9) (chr 0)
                                     then (let _ = raise_exc world "ArgumentError"
                                             "bad environment variable value: contains null byte" in ())
-                                    else ())
+                                    else env_str_ok world v "value")
                       | _ -> ()) in
              match v with
              | VNil -> (let _ = map_set env_ovr k2 VNil in VNil)
@@ -18720,7 +18719,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if (str_len name == 3 && str_eq name "key") then
          (match args with
           | Cons (kv, _) ->
-            let target = env_key_of env world kv in
+            // (a VALUE: no name check)
+            let target = env_key_of0 env world kv in
             let hit = map_new () in
             let _ = map_iter env_ovr (fn (k2: str) -> fn (v: Val) ->
               (match v with
@@ -18772,6 +18772,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // boolean and no other name is accepted, and only then does ENV say it
        // cannot be cloned at all. Refusing before looking made the spec that
        // asks for that ArgumentError get the TypeError instead.
+       // (a positional argument is the arity error before anything else:
+       // `ENV.clone(1)` and `ENV.clone(1, foo: false)` alike)
+       else if (str_len name == 5 && str_eq name "clone")
+               && (match args with Nil -> false | Cons (VHsh _, Nil) -> false | _ -> true) then
+         raise_exc world "ArgumentError"
+           ("wrong number of arguments (given " ++ str_of_int (vals_len (match args with Cons (_, _) -> (let rec pos9 = fn (xs: Val list) -> (match xs with Cons (VHsh _, Nil) -> (Nil : Val list) | Cons (h, t) -> Cons (h, pos9 t) | Nil -> Nil) in pos9 args) | Nil -> Nil) 0) ++ ", expected 0)")
        else if (str_len name == 5 && str_eq name "clone") then
          (match env_clone_kw_err args with
           | "" -> raise_exc world "TypeError" "Cannot clone ENV, use ENV.to_h to get a copy of ENV as a hash"
@@ -22213,7 +22219,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     // ENV.fetch / ENV.delete with a block: the block supplies the value for
     // a missing key (fetch) or the return value (delete); an existing key
     // never runs the block.
-    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "EnvHash") | _ -> false)
+    else if env_is_recv world recv name
             && ((str_len name == 5 && str_eq name "fetch") || (str_len name == 6 && str_eq name "delete")) then
       (match args with
        | Cons (kv, _) ->
@@ -22228,7 +22234,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
     // own semantics for each / each_pair / select / reject / delete_if /
     // keep_if / partition / group_by / sum / min_by / ... instead of an arm per
     // name, each written once and each able to be subtly different.
-    else if (match recv with VObj id -> (let (_, _, ocls, _) = world in str_eq (map_get ocls id) "EnvHash") | _ -> false) then
+    else if env_is_recv world recv name then
       (// ⚠ a mutator this does not know about must not run on the copy and
        //   report success while the environment stands still. Ends in ! or = is
        //   a rule; the ones that end in neither are named.
@@ -34812,8 +34818,14 @@ and rb_load = fn env -> fn world -> fn (p0: str) ->
 and env_coerce_args = fn env -> fn world -> fn (name: str) -> fn (args: Val list) ->
   // ([]= and store are not here: they answer the object they were GIVEN, so
   // the conversion happens where the value is stored, not in the argument list)
-  if (str_len name == 9 && str_eq name "values_at") || (str_len name == 5 && str_eq name "assoc")
-          || (str_len name == 3 && str_eq name "key") || (str_len name == 6 && str_eq name "delete") || (str_len name == 2 && str_eq name "[]")
+  // (#key's argument is a VALUE: converted as a key is, but a NUL in it is
+  // just a value nothing equals, not a bad name)
+  if (str_len name == 3 && str_eq name "key") then
+    (match args with
+     | Cons (k9, rest9) -> Cons (mkstr (env_key_of0 env world k9), rest9)
+     | Nil -> args)
+  else if (str_len name == 9 && str_eq name "values_at") || (str_len name == 5 && str_eq name "assoc")
+          || (str_len name == 6 && str_eq name "delete") || (str_len name == 2 && str_eq name "[]")
           || (str_len name == 4 && str_eq name "key?") || (str_len name == 8 && str_eq name "has_key?")
           || (str_len name == 8 && str_eq name "include?") || (str_len name == 7 && str_eq name "member?") then
     env_hard_strs env world args
@@ -34847,7 +34859,42 @@ and env_soft_strs = fn env -> fn world -> fn (args: Val list) ->
            | VObj _ -> (if responds world v9 "to_str" then mkstr (env_key_of env world v9) else v9)
            | _ -> v9),
           env_soft_strs env world t9)
+// (env_name: a NUL in the name is refused by EVERY door, reading ones
+// included, as ruby's are -- a C string cannot carry it. Only `[]=` refused
+// it; ENV.delete("a\0b") was answered, and left a deletion of that name in
+// env_ovr which every later spawn handed to sh, cut short at the NUL: from
+// test_env's test_delete on, every child process failed to start.)
+// is this receiver ENV, for the arms that run its methods with a block? By
+// the class it HAD: pp.rb's `class << ENV` retags it "(sng:...)", and these two
+// arms compared the class name, so after `require "pp"` -- which test/unit's
+// core_assertions does -- every `ENV.reject! { }` lost its block and answered
+// an Enumerator (the block-free path already looked through the singleton).
+and env_is_recv = fn world -> fn (recv: Val) -> fn (name: str) ->
+  match recv with
+  | VObj id ->
+    (let (_, _, ocls, _) = world in
+     let c0 = map_get ocls id in
+     str_eq c0 "EnvHash"
+     || (is_sng_cls c0 && (if has_meth world c0 name then false else true) && str_eq (sng_supername world c0) "EnvHash"))
+  | _ -> false
+
 and env_key_of = fn env -> fn world -> fn (v: Val) ->
+  let k = env_key_of0 env world v in
+  let _ = env_str_ok world v "name" in
+  if str_contains k (chr 0)
+  then (let _ = raise_exc world "ArgumentError" "bad environment variable name: contains null byte" in k)
+  else k
+// ...and a String in an encoding that is not ASCII-compatible (UTF-16LE,
+// ISO-2022-JP) is refused as a name or a value: its bytes are not the name
+// the C environment would hold (rb_must_asciicompat in env_name / env_aset)
+and env_str_ok = fn world -> fn (v: Val) -> fn (what: str) ->
+  match v with
+  | VStr h ->
+    (let e9 = enc_canon_name (senc_get h) in
+     if enc_ascii_compat e9 then ()
+     else (let _ = raise_exc world "ArgumentError" ("bad environment variable " ++ what ++ ": ASCII incompatible encoding: " ++ e9) in ()))
+  | _ -> ()
+and env_key_of0 = fn env -> fn world -> fn (v: Val) ->
   match v with
   | VStr h -> sget h
   | VObj id ->
@@ -34925,33 +34972,25 @@ and env_pair_ok = fn env -> fn world -> fn (k: Val) -> fn (v: Val) ->
                          | _ -> raise_exc world "TypeError"
                                   ("no implicit conversion of " ++ dispatch_cls_of world other
                                    ++ " into String"))) in
-   let _ = (if (str_eq k2 "" || str_contains k2 "=") && (match v2 with VNil -> false | _ -> true)
+   // (a NUL in either half is the ArgumentError `[]=` gives: update and
+   // replace wrote "a\0" into the overlay)
+   let _ = env_str_ok world k "name" in
+   let _ = env_str_ok world v2 "value" in
+   let _ = (if str_contains k2 (chr 0)
+            then (let _ = raise_exc world "ArgumentError" "bad environment variable name: contains null byte" in ())
+            else if (match v2 with VStr h9 -> str_contains (sget h9) (chr 0) | _ -> false)
+            then (let _ = raise_exc world "ArgumentError" "bad environment variable value: contains null byte" in ())
+            else if (str_eq k2 "" || str_contains k2 "=") && (match v2 with VNil -> false | _ -> true)
             then (let _ = raise_exc_iv world "Errno::EINVAL"
                     ("Invalid argument - setenv(" ++ k2 ++ ")") (Cons (("__recv", k), Nil)) in ())
             else ()) in
    (k2, v2))
+// (the pair through env_pair_ok, which makes every refusal: this kept a copy
+// of those checks, and the copy was where a NUL got past)
 and env_set_pairs = fn env -> fn world -> fn (xs: Val list) ->
   match xs with
   | Cons (k, Cons (v, t)) ->
-    (let k2 = (match k with
-               | VStr h -> sget h
-               | other -> (match conv_try env world other "to_str" with
-                           | VStr h2 -> sget h2
-                           | _ -> (match raise_exc world "TypeError"
-                                     ("no implicit conversion of " ++ dispatch_cls_of world other
-                                      ++ " into String") with _ -> ""))) in
-     let v2 = (match v with
-               | VStr _ -> v
-               | VNil -> v
-               | other -> (match conv_try env world other "to_str" with
-                           | VStr h2 -> VStr h2
-                           | _ -> raise_exc world "TypeError"
-                                    ("no implicit conversion of " ++ dispatch_cls_of world other
-                                     ++ " into String"))) in
-     let _ = (if (str_eq k2 "" || str_contains k2 "=") && (match v2 with VNil -> false | _ -> true)
-              then (let _ = raise_exc_iv world "Errno::EINVAL"
-                      ("Invalid argument - setenv(" ++ k2 ++ ")") (Cons (("__recv", k), Nil)) in ())
-              else ()) in
+    (let (k2, v2) = env_pair_ok env world k v in
      let _ = map_set env_ovr k2 v2 in
      env_set_pairs env world t)
   | _ -> ()
