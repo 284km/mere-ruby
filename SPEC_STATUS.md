@@ -118,7 +118,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/marshal | 4 | 2 | 0 | 0 | 0 | 6 |
 | core/objectspace/weakkeymap | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/objectspace/weakmap | 15 | 0 | 0 | 0 | 0 | 15 |
-| core/process | 28 | 11 | 0 | 1 | 0 | 40 |
+| core/process | 29 | 10 | 0 | 1 | 0 | 40 |
 | core/process/gid | 0 | 0 | 0 | 8 | 0 | 8 |
 | core/process/status | 7 | 1 | 0 | 9 | 0 | 17 |
 | core/process/sys | 0 | 0 | 0 | 15 | 0 | 15 |
