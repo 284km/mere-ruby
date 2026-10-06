@@ -43,6 +43,11 @@ if ! "$MERE" -rv64 --ram "$RAM" "$NT/main.mere" > "$TMP/prog.bin" 2>"$TMP/err"; 
   echo "FAIL: the RISC-V backend refused mere-ruby itself"; head -20 "$TMP/err"; exit 1
 fi
 echo "rv64_corpus: prog.bin is $(wc -c < "$TMP/prog.bin") bytes"
+# The guest runs in $TMP (the emulator loads prog.bin from its working
+# directory), and the reference runs from the repository: a program that
+# opens "corpus/..." by a relative path (152) found nothing in $TMP and read
+# as a wrong answer. The same relative path resolves in both now.
+ln -s "$ROOT/corpus" "$TMP/corpus"
 
 # "answers differently" and "did not finish in $TIMEOUT seconds on an emulated
 # CPU" are different facts, and adding them together makes the slow ones look

@@ -21759,12 +21759,84 @@ and signal_trap = fn env -> fn world -> fn (args: Val list) -> fn (hnd: Val) ->
                 else if str_eq word "EXIT" then mkstr "EXIT"
                 else mkstr word) in
   let _ = map_set signal_traps sg stored in
+  let _ = sig_apply sg stored in
   prev
 
 // A signal this process sends ITSELF, delivered to what was trapped for it:
 // true when a handler took it (a callable is called with the number, as
 // ruby's signal_exec does; "IGNORE" and nil drop it), false when the default
 // action -- the SignalException / Interrupt the caller raises -- applies.
+// the host's number for a signal name (the kernel's, for proc_sig_*), and the
+// name for one (see signal_names_linux in m_state)
+and sig_on_linux = fn (u: unit) ->
+  (if map_has sig_queue "L" then str_eq (map_get sig_queue "L") "1"
+   else (let l9 = dir_there "/proc/self" in
+         let _ = map_set sig_queue "L" (if l9 then "1" else "0") in l9))
+and sig_tab_num = fn (tab: str) -> fn (nm: str) ->
+  (let t9 = " " ++ tab ++ " " in
+   let k9 = " " ++ nm ++ ":" in
+   let i9 = str_index_of t9 k9 in
+   if i9 < 0 then 0 - 1
+   else (let j9 = i9 + str_len k9 in
+         let e9 = str_index_of (substring t9 j9 (str_len t9)) " " in
+         str_to_int_base (substring t9 j9 (j9 + e9)) 10))
+and sig_host_num = fn (nm: str) ->
+  if sig_on_linux () then sig_tab_num signal_names_linux nm
+  else (let n9 = signal_num_of nm in if n9 == 0 && (if str_eq nm "EXIT" then false else true) then 0 - 1 else n9)
+and sig_host_name = fn (n: int) ->
+  if sig_on_linux () then sig_tab_name signal_names_linux (" " ++ signal_names_linux ++ " ") n
+  else signal_name_of n
+and sig_tab_name = fn (tab: str) -> fn (rest: str) -> fn (n: int) ->
+  (let k9 = ":" ++ str_of_int n ++ " " in
+   let i9 = str_index_of rest k9 in
+   if i9 < 0 then ""
+   else (let pre9 = substring rest 0 i9 in
+         let rec back9 = fn (j: int) -> (if j <= 0 then 0 else if str_eq (char_at pre9 (j - 1)) " " then j else back9 (j - 1)) in
+         substring pre9 (back9 (str_len pre9)) i9))
+// the OS side of a trap: a Ruby handler (a callable, or "EXIT") catches the
+// signal, "IGNORE" is SIG_IGN, and the defaults put the default back. PIPE
+// stays as the runtime set it unless a handler is installed for it, and EXIT
+// is no signal at all. Where the calls are refused (RISC-V) nothing changes.
+and sig_apply = fn (nm: str) -> fn (stored: Val) ->
+  if str_eq nm "EXIT" then ()
+  else
+    (let n9 = sig_host_num nm in
+     if n9 <= 0 then ()
+     else
+       (let callable9 = (match stored with VStr h9 -> str_eq (sget h9) "EXIT" | VNil -> false | _ -> true) in
+        let word9 = (match stored with VStr h9 -> sget h9 | _ -> "") in
+        if callable9 then
+          (let r9 = try_or (fn (u: unit) -> proc_sig_catch n9 0) (0 - 2) in
+           if r9 >= 0 then map_set sig_armed nm 1 else ())
+        else
+          (let _ = (if map_has sig_armed nm then map_delete sig_armed nm else ()) in
+           if str_eq word9 "IGNORE" then (let _ = try_or (fn (u: unit) -> proc_sig_ignore n9) 0 in ())
+           else if str_eq nm "PIPE" then ()
+           else (let _ = try_or (fn (u: unit) -> proc_sig_default n9) 0 in ()))))
+// At a statement boundary: the signals the runtime marked since the last look,
+// delivered on the MAIN thread as ruby delivers them -- one taken on another
+// thread waits in sig_queue for the main thread's next statement.
+and sig_poll = fn env -> fn world ->
+  (let n9 = try_or (fn (u: unit) -> proc_sig_take ()) 0 in
+   let _ = (if n9 > 0 then
+              (let nm9 = sig_host_name n9 in
+               let q9 = (if map_has sig_queue "q" then map_get sig_queue "q" else "") in
+               map_set sig_queue "q" (q9 ++ nm9 ++ " "))
+            else ()) in
+   if in_thread () then ()
+   else
+     (match (if map_has sig_queue "q" then map_get sig_queue "q" else "") with
+      | q9 ->
+        (if str_len q9 == 0 then ()
+         else
+           (let sp9 = str_index_of q9 " " in
+            let nm9 = substring q9 0 sp9 in
+            let _ = map_set sig_queue "q" (substring q9 (sp9 + 1) (str_len q9)) in
+            if signal_deliver_self env world nm9 then ()
+            // a trap set back to the default between the mark and now: the
+            // default is ruby's SignalException (Interrupt for INT)
+            else (let _ = (if str_eq nm9 "INT" then raise_exc world "Interrupt" ""
+                           else raise_exc world "SignalException" ("SIG" ++ nm9)) in ())))))
 and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
   let nm = signal_short sg in
   if (if map_has signal_traps nm then false else true) then false
@@ -41951,6 +42023,8 @@ and run_until_gc = fn env -> fn world -> fn blk -> fn (rem: Stmt list) -> fn (la
      | _ -> (0, 2, lastv))
   | Cons (s, rest) ->
     let _ = fb_wm_stmt () in
+    // (the top level's statements, which run_stmts does not see)
+    let _ = (if map_len sig_armed > 0 then sig_poll env world else ()) in
     (match region STMT { exec_stmt env world blk s } with
      | FNext v ->
        (if gc_pressure world then (1, 0, v)
@@ -41979,6 +42053,8 @@ and run_stmts = fn env -> fn world -> fn blk -> fn (prog: Stmt list) ->
     let _ = fb_wm_stmt () in
     // ...and, with more than one thread alive, the preemption count (sch_tick)
     let _ = (if map_len sch_live > 1 then sch_tick world else ()) in
+    // ...and a signal the runtime marked, where a trap is waiting for one
+    let _ = (if map_len sig_armed > 0 then sig_poll env world else ()) in
     (match rest with
      // The LAST statement of a body used to run bare, on the grounds that its
      // value is the body's result. But "bare" means "into whatever region is
