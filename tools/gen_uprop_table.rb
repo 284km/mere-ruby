@@ -17,7 +17,11 @@
 # The candidate names are the ones in onigmo's name table
 # (enc/unicode/<version>/name2ctype.h of a ruby checkout, passed as ARGV[0]);
 # each one is asked of this ruby before it is listed.
-# It prints the three `let` lines that go between the markers verbatim:
+#   uage_raw   "lo-hi:A" (hex): A = the age a codepoint was first assigned in,
+#              an index into the ages sorted by version; a name "age=X" is
+#              "a<index>" and matches first age <= X.
+#   ublk_raw   "lo-hi:B" (hex): B = the block index; a block name is "b<index>".
+# It prints the five `let` lines that go between the markers verbatim:
 #   ruby tools/gen_uprop_table.rb path/to/name2ctype.h
 hdr = File.read(ARGV[0] || abort("usage: gen_uprop_table.rb name2ctype.h"))
 
@@ -77,11 +81,46 @@ puts "let uprop_raw = \"#{ranges(packed)}\";"
 puts "let usc_raw = \"#{ranges(sc)}\";"
 
 names = hdr.scan(/sizeof\("([^"]+)"\)/).flatten.uniq
+
+# ages: the version a codepoint was first assigned in, as an index into the
+# ages sorted by version (1-based). \p{age=X} is cumulative -- every
+# codepoint assigned in X or before -- so it is "first age <= X".
+ages = names.grep(/\Aage=/).select { |nm| (Regexp.new("\\p{#{nm}}") rescue nil) }
+            .sort_by { |nm| nm.sub("age=", "").split(".").map(&:to_i) }
+age_first = Array.new(0x110000, 0)
+ages.each_with_index do |nm, i|
+  set_of("\\p{#{nm}}").each { |c| age_first[c] = i + 1 if age_first[c] == 0 }
+end
+age_ix = ages.each_with_index.to_h { |nm, i| [nm, i + 1] }
+puts "let uage_raw = \"#{ranges(age_first)}\";"
+
+# blocks: \p{In_Hiragana}, one per codepoint (In_No_Block is the rest)
+blk = Array.new(0x110000, 0)
+blk_ix = {}
+names.grep(/\Ain/).each do |nm|
+  next unless (Regexp.new("\\p{#{nm}}") rescue nil)
+  s = set_of("\\p{#{nm}}")
+  next if s.empty? || script_sets[s] || posix_sets.index(s)
+  next if s.any? { |c| blk[c] != 0 }
+  k = blk_ix.size + 1
+  s.each { |c| blk[c] = k }
+  blk_ix[nm] = k
+end
+puts "let ublk_raw = \"#{ranges(blk)}\";"
+
 out = []
 names.each do |nm|
   begin
     Regexp.new("\\p{#{nm}}")
   rescue RegexpError
+    next
+  end
+  if age_ix[nm]
+    out << "#{nm}:a#{age_ix[nm].to_s(16)}"
+    next
+  end
+  if blk_ix[nm]
+    out << "#{nm}:b#{blk_ix[nm].to_s(16)}"
     next
   end
   s = set_of("\\p{#{nm}}")
