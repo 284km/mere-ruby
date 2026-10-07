@@ -14026,6 +14026,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if str_eq c "IO" && (str_len name == 6 && str_eq name "__park") && fb_can_suspend then
       (let _ = map_set sch_io (sch_me ()) 1 in
        let _ = sch_block world 1 0 (sch_now () + 1000000) in VNil)
+    // every thread waiting for a descriptor polls again: a stream was closed
+    // under it (test_io's recycled_fd_close joined a reader 300 times and
+    // waited out a millisecond for each, while another thread ran laps)
+    else if str_eq c "IO" && (str_len name == 13 && str_eq name "__wake_parked") then
+      (let ts9 = map_new () in
+       let _ = map_iter sch_io (fn (t: int) -> fn (v: int) -> map_set ts9 (map_len ts9) t) in
+       let rec go9 = fn (i: int) ->
+         (if i >= map_len ts9 then ()
+          else (let t = map_get ts9 i in
+                let _ = (if sch_waiting t && sch_wait_kind t == 1 then sch_unpark t else ()) in
+                go9 (i + 1))) in
+       let _ = go9 0 in VNil)
     else if str_eq c "IO" && (str_len name == 8 && str_eq name "__unpark") then
       (let _ = (if map_has sch_io (sch_me ()) then map_delete sch_io (sch_me ()) else ()) in VNil)
     else if str_eq c "IO" && (str_len name == 8 && str_eq name "__sched?") then VBool fb_can_suspend
@@ -19999,12 +20011,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                (if (str_len name == 6 && str_eq name "offset") || (str_len name == 10 && str_eq name "byteoffset") then arr_new (Cons (VNil, Cons (VNil, Nil))) else VNil)
              // #begin / #end / #offset count CHARACTERS; the byte* family
              // answers the byte positions the engine actually recorded.
-             else if (str_len name == 5 && str_eq name "begin") then VInt (utf8_cidx src gst)
-             else if (str_len name == 3 && str_eq name "end") then VInt (utf8_cidx src gen)
+             // (a subject the handle knows is ASCII counts bytes as characters:
+             //  utf8_cidx copied and walked everything before the match, every
+             //  call, 5% of a CSV parse)
+             else if (str_len name == 5 && str_eq name "begin") then VInt (md_cidx ivars id src gst)
+             else if (str_len name == 3 && str_eq name "end") then VInt (md_cidx ivars id src gen)
              else if (str_len name == 9 && str_eq name "bytebegin") then VInt gst
              else if (str_len name == 7 && str_eq name "byteend") then VInt gen
              else if (str_len name == 10 && str_eq name "byteoffset") then arr_new (Cons (VInt gst, Cons (VInt gen, Nil)))
-             else arr_new (Cons (VInt (utf8_cidx src gst), Cons (VInt (utf8_cidx src gen), Nil))))))
+             else arr_new (Cons (VInt (md_cidx ivars id src gst), Cons (VInt (md_cidx ivars id src gen), Nil))))))
     // MatchData#to_s is the WHOLE match, and #inspect shows it with its
     // groups. bootstraptest prints its results (`print(...)`, so to_s), and a
     // MatchData printed as "#<object>" is how this was noticed.
@@ -43965,6 +43980,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
     // magic comment (usually none), not that of the file loading right now
     let savedfsl9 = (if map_has fsl_ctx "v" then map_get fsl_ctx "v" else "") in
     let _ = map_set fsl_ctx "v" (src_fsl code) in
+    let _ = syn_why_take () in
     let prog2 = try_or (fn (u: unit) ->
       let toks = number_nls_at code (lex_src code) ebase9 in
       let _ = parse_line_reset (count_nls toks) in
@@ -43981,8 +43997,11 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
          // Ruby's parser reports trailing junk after a complete statement as
          // an unexpected token; reproduce the common identifier case (e.g.
          // eval("1ir") lexes as `1 ir`).
-         (let why9 = (if map_has rx_cur "why" then (match map_get rx_cur "why" with VStr h -> sget h | _ -> "") else "") in
+         (let why0 = (if map_has rx_cur "why" then (match map_get rx_cur "why" with VStr h -> sget h | _ -> "") else "") in
           let _ = (if map_has rx_cur "why" then map_delete rx_cur "why" else ()) in
+          // ...or the parser's own reason (syn_refuse)
+          let sw9 = syn_why_take () in
+          let why9 = (if str_len why0 > 0 then why0 else sw9) in
           let msg = (if str_len why9 > 0 then (if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ why9 else try_or (fn (u: unit) ->
             let toks2 = number_nls code (lex_src code) in
             let (st1, rest1) = parse_stmt toks2 in
@@ -46145,6 +46164,14 @@ and rx_do_match_atp = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) 
      // the position Ruby reports is in characters, not bytes
      (if wantpos then VInt (utf8_cidx sv st) else VBool true))
 
+// a MatchData's byte position as a character position, through the subject
+// handle's cached ASCII answer when it has one
+and md_cidx = fn ivars -> fn (id: int) -> fn (src: str) -> fn (b: int) ->
+  match (if map_has ivars (str_of_int id ++ "@__src") then map_get ivars (str_of_int id ++ "@__src") else VNil) with
+  // (only an answer already cached: working it out for a fresh subject is a
+  //  walk in Mere, slower than the count it would save)
+  | VStr h9 -> if map_has str_ascii h9 && map_get str_ascii h9 then b else utf8_cidx src b
+  | _ -> utf8_cidx src b
 // String#index(regexp, offset): search from a byte offset, publish $~ and
 // the groups exactly as =~ does, and answer the hit in CHARACTERS (or nil).
 and rx_idx_pub = fn world -> fn (p: str) -> fn (pf: str) -> fn (sv: str) -> fn (bst: int) -> fn (enc: str) ->

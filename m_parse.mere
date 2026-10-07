@@ -487,10 +487,15 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
     else if str_eq c "@" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "@" then
       // @@classvar: both @ kept in the identifier text
       let j = scan_ident s (i + 2) in
+      // ⚠ a name must follow, and not one starting with a digit (prism's
+      //   "'@@' without identifiers" / "'@@1' is not allowed")
+      let _ = lex_var_name_check s i (i + 2) j "class" in
       Cons (TId (substring s i j), lex_go s j)
     else if str_eq c "@" then
       // @ivar: keep the leading @ in the identifier text
       let j = scan_ident s (i + 1) in
+      // (`def -@` / `+@` / `!@` / `~@` name a unary operator, not a variable)
+      let _ = (if i > 0 && str_contains "+-!~" (char_at s (i - 1)) then () else lex_var_name_check s i (i + 1) j "instance") in
       Cons (TId (substring s i j), lex_go s j)
     else if str_eq c "$" && i + 1 < str_len s && is_alpha (char_at s (i + 1)) then
       // $global: keep the leading $ in the identifier text
@@ -498,23 +503,30 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
       Cons (TId (substring s i j), lex_go s j)
     // `$-0` / `$-w` and the rest of the dash globals are THREE characters:
     // taking two would leave a bare `0` behind and the statement fell apart.
-    else if str_eq c "$" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "-" then
+    else if str_eq c "$" && i + 2 < str_len s && str_eq (char_at s (i + 1)) "-" && lex_alnum (char_at s (i + 2)) then
       Cons (TId (substring s i (i + 3)), lex_go s (i + 3))
+    else if str_eq c "$" && i + 1 < str_len s && str_eq (char_at s (i + 1)) "-" then
+      (let _ = syn_refuse "'$-' is not allowed as a global variable name" in Cons (TId "$-", lex_go s (i + 2)))
     // a capture global takes ALL its digits: `$128` is one name, and taking
     // two characters left a bare `28` behind for the statement to trip over.
     // ⚠ ...and one past 2**30-1 is no capture at all: ruby warns "'$N' is too
     //   big for a number variable, always nil" (the value was already nil).
     else if str_eq c "$" && i + 1 < str_len s && is_digit (char_at s (i + 1)) then
       (let j = scan_base s (i + 1) 10 in
+       // `$0` is the program name and `$1`... the captures; a leading zero
+       // before more digits names nothing
+       let _ = (if str_eq (char_at s (i + 1)) "0" && j > i + 2 then syn_refuse ("'" ++ substring s i j ++ "' is not allowed as a global variable name") else ()) in
        let _ = (if j - i - 1 > 10 || (j - i - 1 == 10 && int_of_str (substring s (i + 1) j) > 1073741823) then
                   (let rec nls = fn (k: int) -> fn (n: int) -> (if k >= i then n else nls (k + 1) (if str_eq (char_at s k) "\n" then n + 1 else n)) in
                    warn_note (parse_time_file () ++ ":" ++ str_of_int (nls 0 1) ++ ": warning: '" ++ substring s i j
                               ++ "' is too big for a number variable, always nil"))
                 else ()) in
        Cons (TId (substring s i j), lex_go s j))
-    else if str_eq c "$" && i + 1 < str_len s then
+    else if str_eq c "$" && i + 1 < str_len s && str_contains "~!&`'+*$?:;,./\\<>_\"@=" (char_at s (i + 1)) then
       // special globals ($~ $! $& ...) lex as identifiers (default nil).
       Cons (TId (substring s i (i + 2)), lex_go s (i + 2))
+    else if str_eq c "$" then
+      (let _ = syn_refuse "'$' without identifiers is not allowed as a global variable name" in Cons (TId "$", lex_go s (i + 1)))
     // A `:` GLUED to the end of an identifier is a label, not the start of a
     // symbol: `def f(red:nil)` and `{a:1}` are `red:` / `a:` followed by a
     // value, which is how ruby reads them. Only a colon that does not follow
@@ -7061,14 +7073,60 @@ and str_before_char = fn (s: str) -> fn (ch: str) -> fn (i: int) ->
   if i >= str_len s then s
   else if str_eq (char_at s i) ch then substring s 0 i
   else str_before_char s ch (i + 1)
+and lex_alnum = fn (c: str) ->
+  str_len c == 1 && ((c >= "0" && c <= "9") || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || str_eq c "_")
+// `@` / `@@` with no name after it, or a name starting with a digit
+and lex_var_name_check = fn (s: str) -> fn (i: int) -> fn (st: int) -> fn (j: int) -> fn (kind: str) ->
+  let sig = substring s i st in
+  if j == st then
+    (if st < str_len s && is_digit (char_at s st) then
+       (let rec dg = fn (k: int) -> (if k < str_len s && lex_alnum (char_at s k) then dg (k + 1) else k) in
+        syn_refuse ("'" ++ substring s i (dg st) ++ "' is not allowed as " ++ (if str_eq kind "instance" then "an" else "a") ++ " " ++ kind ++ " variable name"))
+     else syn_refuse ("'" ++ sig ++ "' without identifiers is not allowed as " ++ (if str_eq kind "instance" then "an" else "a") ++ " " ++ kind ++ " variable name"))
+  else if is_digit (char_at s st) then
+    syn_refuse ("'" ++ substring s i j ++ "' is not allowed as " ++ (if str_eq kind "instance" then "an" else "a") ++ " " ++ kind ++ " variable name")
+  else ()
+// a parameter name used twice is ruby's SyntaxError ("duplicated argument
+// name"); `_` and names starting with it may repeat, and the hidden names a
+// bare `*` / `**` / `&` gets start with it too
+and param_dup_check = fn (ps: str list) ->
+  let _ = param_kind_check ps in
+  if param_has_dup ps then syn_refuse "duplicated argument name" else ()
+// a formal argument is a local name: not a constant, not an instance, class
+// or global variable, and not a name ending in ? or !
+and param_kind_check = fn (ps: str list) ->
+  match ps with
+  | Nil -> ()
+  | Cons (h, t) ->
+    (let b = pbase h in
+     let _ = (if str_len b == 0 then ()
+              else (let c0 = char_at b 0 in
+                    if c0 >= "A" && c0 <= "Z" then syn_refuse "invalid formal argument; formal argument cannot be a constant"
+                    else if str_len b >= 2 && str_eq (substring b 0 2) "@@" then syn_refuse "invalid formal argument; formal argument cannot be a class variable"
+                    else if str_eq c0 "@" then syn_refuse "invalid formal argument; formal argument cannot be an instance variable"
+                    else if str_eq c0 "$" then syn_refuse "invalid formal argument; formal argument cannot be a global variable"
+                    else if str_eq (char_at b (str_len b - 1)) "?" || str_eq (char_at b (str_len b - 1)) "!" then syn_refuse ("identifier " ++ b ++ " is not valid to set")
+                    else ())) in
+     param_kind_check t)
+and param_has_dup = fn (ps: str list) ->
+  match ps with
+  | Nil -> false
+  | Cons (h, t) ->
+    (let b = pbase h in
+     (if str_len b == 0 || str_eq (char_at b 0) "_" then false else param_has_base t b) || param_has_dup t)
+and param_has_base = fn (ps: str list) -> fn (b: str) ->
+  match ps with Nil -> false | Cons (h, t) -> str_eq (pbase h) b || param_has_base t b
 and pcount_base = fn (acc: str list) -> fn (base: str) ->
   match acc with Nil -> 0 | Cons (h, t) -> (if str_eq (pbase h) base then 1 else 0) + pcount_base t base
 // Ruby allows the ignore-name `_` to repeat in a parameter list; give each
 // repeat a unique internal storage key (first keeps the bare `_`) so they bind
 // to distinct slots and a bare `super` forwards them positionally. Other
 // duplicate names are a SyntaxError in Ruby, so they are left untouched.
+// (not a KEYWORD `_:` -- its name is the key a caller passes, `_: 42`, and a
+//  renamed one answered "unknown keyword: :_")
 and uniq_param = fn (name: str) -> fn (acc: str list) ->
-  if (if str_eq (pbase name) "_" then true else false) && pcount_base acc "_" > 0 then
+  if str_len name >= 1 && str_eq (char_at name (str_len name - 1)) ":" then name
+  else if (if str_eq (pbase name) "_" then true else false) && pcount_base acc "_" > 0 then
     (let u = "_~" ++ str_of_int (pcount_base acc "_") in
      if str_len name >= 2 && str_eq (substring name 0 2) "**" then "**" ++ u
      else if str_len name >= 1 && (str_eq (char_at name 0) "*" || str_eq (char_at name 0) "&") then substring name 0 1 ++ u
@@ -7083,7 +7141,7 @@ and parse_params = fn toks0 -> fn (acc: str list) -> fn (defs: (str * Expr) list
   let toks = skip_nls toks0 in
   match toks with
   | Cons (TP p, r) ->
-    if str_eq p ")" then (rev_app acc Nil, rev_app defs Nil, r)
+    if str_eq p ")" then (let ps9 = rev_app acc Nil in let _ = param_dup_check ps9 in (ps9, rev_app defs Nil, r))
     else if str_eq p "*" then
       (match r with
        | Cons (TId name, r2) -> parse_params_after (uniq_param ("*" ++ name) acc) r2 acc defs
@@ -7143,7 +7201,7 @@ and parse_params_after = fn (name: str) -> fn toks0 -> fn (acc: str list) -> fn 
   match toks with
   | Cons (TP p, r) ->
     if str_eq p "," then parse_params r (Cons (name, acc)) defs
-    else if str_eq p ")" then (rev_app (Cons (name, acc)) Nil, rev_app defs Nil, r)
+    else if str_eq p ")" then (let ps9 = rev_app (Cons (name, acc)) Nil in let _ = param_dup_check ps9 in (ps9, rev_app defs Nil, r))
     else (let __fm = ("mere-ruby: expected , or ) in parameters, got " ++ p ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated parameter list" ++ parsing_file ()))) in fail ("mere-ruby: unterminated parameter list" ++ parsing_file ()))
 
