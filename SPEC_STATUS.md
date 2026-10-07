@@ -46,7 +46,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/integer | 59 | 1 | 0 | 9 | 1 | 70 |
 | core/kernel | 85 | 20 | 0 | 12 | 1 | 118 |
 | core/matchdata | 28 | 0 | 0 | 2 | 0 | 30 |
-| core/method | 18 | 4 | 0 | 4 | 0 | 26 |
+| core/method | 17 | 5 | 0 | 4 | 0 | 26 |
 | core/mutex | 7 | 0 | 0 | 0 | 0 | 7 |
 | core/nil | 16 | 0 | 0 | 2 | 0 | 18 |
 | core/numeric | 45 | 0 | 0 | 0 | 1 | 46 |
