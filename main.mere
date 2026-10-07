@@ -445,13 +445,28 @@ import "m_strutil.mere";
 // never passes through run_meth, so a required file's statement boundaries
 // sit at zero -- which is exactly where a gem load needs its collections.
 let gc_state = map_new ();
-let gc_unsafe = map_new ();
-let gc_unsafe_push = fn (u: unit) ->
-  let n = (if map_has gc_unsafe "n" then map_get gc_unsafe "n" else 0) in
-  map_set gc_unsafe "n" (n + 1);
+// THE KNOBS EVERY STATEMENT READS, as slots rather than gc_state's string
+// keys: gc_safe_now and gc_pressure run between any two statements, and their
+// eleven string-keyed lookups were an eighth of a bare top-level loop.
+//   0 the entry threshold ("t", 4000 until the first collection)
+//   1 the byte baseline ("b")      2 MERE_RUBY_GC_TIGHT ("tight", 0/1)
+//   3 the captured-frame threshold ("cl")
+//   4 GC.disable ("off", 0/1)       5 a GC.start left for a safepoint ("req")
+//   6 the stress period (MERE_RUBY_GC_STRESS / GC.stress=; -1 when unset)
+//   7 the unsafe depth (gc_unsafe below)
+let gc_knob = vec_new ();
+let _ = vec_push gc_knob 4000;
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 2048;
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob (0 - 1);
+let _ = vec_push gc_knob 0;
+let gc_unsafe_push = fn (u: unit) -> vec_set gc_knob 7 (vec_get gc_knob 7 + 1);
 let gc_unsafe_pop = fn (u: unit) ->
-  let n = (if map_has gc_unsafe "n" then map_get gc_unsafe "n" else 0) in
-  map_set gc_unsafe "n" (if n > 0 then n - 1 else 0);
+  let n = vec_get gc_knob 7 in
+  vec_set gc_knob 7 (if n > 0 then n - 1 else 0);
 // MERE_RUBY_GC_LOG: the env readers live inside the interpreter group,
 // after this block -- so the DRIVER (run_src) reads the variable once and
 // records it in gc_state ("log": 1/0); the collector only looks it up.
@@ -459,7 +474,7 @@ let gc_log_on = fn (u: unit) ->
   (if map_has gc_state "log" then map_get gc_state "log" else 0) == 1;
 
 let gc_safe_now = fn (u: unit) ->
-  (if map_has gc_unsafe "n" then map_get gc_unsafe "n" else 0) == 0;
+  vec_get gc_knob 7 == 0;
 // a countdown, so a body's statement boundary asks for the pressure one time
 // in 32 (see the in-stack safepoint in run_stmts)
 let gc_tick = map_new ();
@@ -467,12 +482,16 @@ let gc_body_tick = fn (u: unit) ->
   let n = (if map_has gc_tick 0 then map_get gc_tick 0 else 0) in
   if n <= 0 then (let _ = map_set gc_tick 0 31 in true)
   else (let _ = map_set gc_tick 0 (n - 1) in false);
+let gc_bytes_due = fn (u: unit) ->
+  let n = (if map_has gc_tick 2 then map_get gc_tick 2 else 0) in
+  if n <= 0 then (let _ = map_set gc_tick 2 15 in true)
+  else (let _ = map_set gc_tick 2 (n - 1) in false);
 // MERE_RUBY_GC_STRESS=N (read once, by run_src): collect off the stack at
 // every Nth safepoint gc_point is asked at, pressure or not -- the way to make
 // a corpus program meet a collection in the middle of every kind of body, and
 // so the way a root that is missing shows itself (note 270)
 let gc_stress_due = fn (u: unit) ->
-  let every = (if map_has gc_state "stress" then map_get gc_state "stress" else 0) in
+  let every = vec_get gc_knob 6 in
   if every <= 0 then false
   else
     (let n = (if map_has gc_tick 1 then map_get gc_tick 1 else 0) in
@@ -519,20 +538,23 @@ let gc_store_bytes = fn (u: unit) ->
 //   GC.disable; GC.start moves GC.count by one). "req" is a GC.start that
 //   arrived where a collection is not safe (see the GC.start arm): the next
 //   safepoint takes it.
-let gc_auto_off = fn (u: unit) -> map_has gc_state "off";
+let gc_auto_off = fn (u: unit) -> vec_get gc_knob 4 == 1;
 let gc_pressure = fn world ->
   let (_, _, ocls, ivars) = world in
-  let limit = (if map_has gc_state "t" then map_get gc_state "t" else 4000) in
-  let bbase = (if map_has gc_state "b" then map_get gc_state "b" else 0) in
-  let tight = (if map_has gc_state "tight" then map_get gc_state "tight" else 0) == 1 in
+  let limit = vec_get gc_knob 0 in
+  let bbase = vec_get gc_knob 1 in
+  let tight = vec_get gc_knob 2 == 1 in
   if gc_auto_off () then false
-  else map_has gc_state "req"
+  else vec_get gc_knob 5 == 1
   || map_len ivars + map_len ocls > limit
-  || gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432)
   // ...and the captured frames waiting in lv_cap, each a frame's arena (4 KB
   // and up) that no store's byte count sees: a loop that makes a lambda per
   // turn and nothing else ran 80k turns without one collection (note 272)
-  || map_len lv_cap > (if map_has gc_state "cl" then map_get gc_state "cl" else 2048);
+  || map_len lv_cap > vec_get gc_knob 3
+  // the byte axis measures a dozen arenas, so it is asked one time in 16
+  // (gc_tick 2) -- it was the costliest test of a statement boundary, and
+  // sixteen statements late is well inside the slack of a 32 MB threshold
+  || (gc_bytes_due () && gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432));
 
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
@@ -722,7 +744,7 @@ let gc_mark_cand = fn live -> fn (n: int) ->
 // every handle there is lies in [handle_base, gc_cand_hi ())
 let gc_cand_hi = fn (u: unit) ->
   let mx = fn (a: int) -> fn (b: int) -> if a > b then a else b in
-  mx (if map_has oid_next "n" then map_get oid_next "n" else handle_base)
+  mx (oid_peek handle_base)
      (mx (if map_has arr_ctr 0 then map_get arr_ctr 0 else handle_base)
          (handle_base + (mx (vec_len str_store)
                             (mx (vec_len hash_store) (mx ((proc_next ())) ((handle_base + map_len bind_store)))))));
@@ -1027,7 +1049,7 @@ let gc_sweep_captured = fn live ->
              let _ = (if map_has lv_up k then map_delete lv_up k else ()) in
              gox (i + 1)) in
      let _ = gox 0 in
-     let _ = map_set gc_state "cl" (if 2 * map_len lv_cap > 2048 then 2 * map_len lv_cap else 2048) in
+     let _ = vec_set gc_knob 3 (if 2 * map_len lv_cap > 2048 then 2 * map_len lv_cap else 2048) in
      map_set gc_state "capfree" ((if map_has gc_state "capfree" then map_get gc_state "capfree" else 0) + vec_len dead))
   else ();
 
@@ -1128,7 +1150,7 @@ let gc_collect = fn env -> fn world ->
     //   depth 0, no builtin in flight) leaves nothing on the stack to pin.
     let nc = map_has gc_state "oncall"
              || ((if fb_off_stack then false else true)
-                 && (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0) > 0) in
+                 && (cd_get ()) > 0) in
     // ⚠ The collector kept no count of itself, so `GC.count` and `GC.total_time`
     //   had nothing to answer with and core/gc could not ask this interpreter a
     //   single question about its own collector. These two are the whole of it:
@@ -1136,7 +1158,7 @@ let gc_collect = fn env -> fn world ->
     //   numbers -- they are this collector's, which is the only honest thing a
     //   different collector can report.
     let _ = map_set gc_state "n" ((if map_has gc_state "n" then map_get gc_state "n" else 0) + 1) in
-    let _ = (if map_has gc_state "req" then map_delete gc_state "req" else ()) in
+    let _ = vec_set gc_knob 5 0 in
     let t0 = int_of_float (time () * 1000000000.0) in
     let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)) else ()) in
     let live = map_new () in
@@ -1316,7 +1338,6 @@ let gc_collect = fn env -> fn world ->
     // biggest emitter after `globals`. Safe to compact because its only reader
     // extracts the int (a Val read out of a compacted map must not be held:
     // see thread_flag).
-    let _ = (if nc then () else map_compact cur_pos) in
     let _ = (if nc then () else map_compact live_frames) in
     let _ = (if nc then () else map_compact struct_ctr) in
     let _ = (if nc then () else map_compact thread_flag) in
@@ -1331,8 +1352,8 @@ let gc_collect = fn env -> fn world ->
     // post-collection baseline (gc_pressure fires at 2x it plus 32 MB).
     let scan = map_len arr_store + vec_len hash_store + vec_len str_store in
     let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
-    let _ = map_set gc_state "t" (map_len ivars + map_len ocls + delta) in
-    let _ = map_set gc_state "b" (gc_store_bytes ()) in
+    let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
+    let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
     // ...and the time this run took, in nanoseconds, added to the total --
     // unless GC.measure_total_time is false, when ruby's total stands still
     let _ = (if map_has gc_state "notime" then ()
@@ -3435,17 +3456,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // unary -/+ on an object dispatch to its -@ / +@ method.
        | other -> invoke_val_c env world blk other (op ++ "@") Nil false)
   | EBin (op, a, b) ->
-    if str_eq op "&&" then
+    if str_len op == 2 && str_eq op "&&" then
       let va = eval_e env world blk a in
       if truthy va then eval_e env world blk b else va
-    else if str_eq op "||" then
+    else if str_len op == 2 && str_eq op "||" then
       let va = eval_e env world blk a in
       if truthy va then va else eval_e env world blk b
     // `/literal regex/ =~ str` with named captures binds a local variable per
     // named group (only for a literal regex on the LHS, per Ruby).
     // ...unless the program redefined Regexp#=~, in which case even a literal
     // regex has to go through the method table like any other receiver.
-    else if str_eq op "=~" && (match a with ERegex _ -> true | _ -> false)
+    else if (match a with ERegex _ -> true | _ -> false) && str_eq op "=~"
             && (if has_meth world "Regexp" "=~" then false else true) then
       (match a with
        | ERegex (pat, pfl) ->
@@ -3464,6 +3485,25 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else
     // an object whose class defines the operator dispatches to it.
     let va0 = eval_e env world blk a in
+    // ⚠ TWO INTEGERS AND A PLAIN OPERATOR, before even the chain of operator
+    //   names below (`<<`, `==`, `!=` ...): `i < n` and `i += 1` paid a dozen
+    //   string comparisons on the way to the fast path further down. The
+    //   right side is read here only when reading it twice is harmless -- a
+    //   literal or a bound local -- so a call on the right still runs once,
+    //   in order, below.
+    let (fast8, fv8) = (match va0 with
+                        | VInt ia ->
+                          (match b with
+                           | EInt ib -> (if int_ops_plain world then int_fast_op op ia ib else (false, VNil))
+                           | EVar n8 ->
+                             (if lv_has env n8 then
+                                (match lv_get env n8 with
+                                 | VInt ib -> (if int_ops_plain world then int_fast_op op ia ib else (false, VNil))
+                                 | _ -> (false, VNil))
+                              else (false, VNil))
+                           | _ -> (false, VNil))
+                        | _ -> (false, VNil)) in
+    if fast8 then fv8 else
     // `<<` mutates a String/Array receiver in place — FrozenError first.
     let _ = (if str_eq op "<<" then chill_touch world va0 "<<" else ()) in
     let _ = (if str_eq op "<<" && builtin_mut_on_frozen world va0 "<<"
@@ -3699,6 +3739,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // defines `#+` has to reach the new method. Looking the receiver's
        // singleton up before the argument ran meant it never could.
        let vb = eval_e env world blk b in
+       // ⚠ TWO INTEGERS AND A PLAIN OPERATOR answer here, before the walk
+       //   below: the complex-object test, the singleton table, has_meth's
+       //   string-keyed memo and eval_bin_prim's chain of operator names were
+       //   paid for every `i < n` and `i += 1` -- string comparisons were 45%
+       //   of a loop inside a method. Only while Integer's operators are the
+       //   builtins (int_ops_plain) and no refinement is in force.
+       let (fast9, fv9) = (match va0 with
+                           | VInt ia -> (match vb with
+                                         | VInt ib -> (if int_ops_plain world then int_fast_op op ia ib else (false, VNil))
+                                         | _ -> (false, VNil))
+                           | _ -> (false, VNil)) in
+       if fast9 then fv9 else
        let hk = hng_key va0 in
        if cpx_obj_applies world va0 op (Cons (vb, Nil)) then cpx_obj_call env world va0 op (Cons (vb, Nil))
        else if (if str_eq hk "" then false else true) && map_has hng_store hk && has_meth world (map_get hng_store hk) op then
@@ -3721,6 +3773,45 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
 // use the primitive. Every operator here evaluates both sides anyway (the
 // short-circuit ones are Logic, not Bin), so nothing is evaluated that was
 // not before.
+// are Integer's operators (and Comparable's, which it includes) still the
+// builtins? Asked of has_meth once per method-table generation (mro_now
+// moves on every write to a method table), and never under a refinement
+and int_ops_plain = fn world ->
+  if ref_on () then false
+  else
+    (let g = mro_now () in
+     if vec_get int_fast_st 2 == 1 && vec_get int_fast_st 0 == g then vec_get int_fast_st 1 == 1
+     else
+       (let rec none = fn (ops: str list) ->
+          (match ops with
+           | Nil -> true
+           | Cons (o, t) -> (if has_meth world "Integer" o then false else none t)) in
+        let ok = none (Cons ("+", Cons ("-", Cons ("*", Cons ("<", Cons ("<=", Cons (">", Cons (">=", Cons ("==", Cons ("!=", Nil)))))))))) in
+        let _ = vec_set int_fast_st 0 g in
+        let _ = vec_set int_fast_st 1 (if ok then 1 else 0) in
+        let _ = vec_set int_fast_st 2 1 in
+        ok))
+// the answer for two machine integers, or (false, _) for any other operator
+// (the overflow into a Bignum is add_int_ov's, as the general path's is)
+and int_fast_op = fn (op: str) -> fn (a: int) -> fn (b: int) ->
+  let n = str_len op in
+  // (told apart by their bytes: < 60, > 62, + 43, - 45, * 42, = 61, ! 33)
+  if n == 1 then
+    (let c = ord (char_at op 0) in
+     if c == 60 then (true, VBool (a < b))
+     else if c == 62 then (true, VBool (a > b))
+     else if c == 43 then (true, add_int_ov a b)
+     else if c == 45 then (true, sub_int_ov a b)
+     else if c == 42 then (true, mul_int_ov a b)
+     else (false, VNil))
+  else if n == 2 && ord (char_at op 1) == 61 then
+    (let c = ord (char_at op 0) in
+     if c == 60 then (true, VBool (a <= b))
+     else if c == 62 then (true, VBool (a >= b))
+     else if c == 61 then (true, VBool (a == b))
+     else if c == 33 then (true, VBool (a != b))
+     else (false, VNil))
+  else (false, VNil)
 and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val) -> fn (vb: Val) ->
     // Array#== compares ELEMENT BY ELEMENT with each element's own ==, so an
     // array of objects that define == compares by their rule. rb_eq is
@@ -5590,14 +5681,14 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   //   because that is where the block is written, while the running frame is
   //   Object#y. lv_* walks the chain, so cenv resolves the defining method's
   //   __meth even from a nested block.
-  let bcd9 = (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0) in
+  let bcd9 = (cd_get ()) in
   // ...and it runs under the refinements of the scope it was WRITTEN in, which
   // its defining env chain names: a lambda made inside `using` keeps them when
   // a method written elsewhere calls it (see ref_enter_env)
   let rfprev9 = (if ref_on () then ref_enter_env cenv else 0 - 1) in
   // (its label -- `block in X`, `block (N levels) in X` -- is computed from
   // this frame's env when a backtrace asks for it: block_label)
-  let _ = map_set struct_ctr "cd" (bcd9 + 1) in
+  let _ = cd_set (bcd9 + 1) in
   let _ = map_set_si call_names_s bcd9 blk_frame_mark in
   let _ = map_set call_lines bcd9 (cur_line ()) in
   let _ = map_set_si call_files_s bcd9 (cur_file ()) in
@@ -5715,7 +5806,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   let _ = (if rfprev9 >= 0 then ref_install rfprev9 else ()) in
   // the block frame comes back off here, on every exit path (try_or has already
   // turned a raise into FRaise above).
-  let _ = map_set struct_ctr "cd" bcd9 in
+  let _ = cd_set bcd9 in
   // the env dies here unless a closure captured it (see blk_env_put). On every
   // exit path: try_or has already turned a raise into FRaise, so this runs
   // before the re-raise below. The Flow value `f` does not point into the
@@ -16665,24 +16756,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        else if gc_collect_off_stack world then VNil
        else
          (let _ = map_set gc_state "n" ((if map_has gc_state "n" then map_get gc_state "n" else 0) + 1) in
-          let _ = map_set gc_state "req" 1 in
+          let _ = vec_set gc_knob 5 1 in
           VNil))
     else if str_eq c "GC" && ((str_len name == 6 && str_eq name "enable") || (str_len name == 7 && str_eq name "disable")) then
       // ruby answers the state BEFORE the call: enable on an enabled GC is
       // false, and disable on an enabled one is false too -- the answer is
       // "was it already disabled", not "did this work".
-      (let was9 = (if map_has gc_state "off" then true else false) in
-       let _ = (if (str_len name == 7 && str_eq name "disable")
-                then map_set gc_state "off" 1
-                else (if map_has gc_state "off" then map_delete gc_state "off" else ())) in
+      (let was9 = vec_get gc_knob 4 == 1 in
+       let _ = vec_set gc_knob 4 (if (str_len name == 7 && str_eq name "disable") then 1 else 0) in
        VBool was9)
     else if str_eq c "GC" && (str_len name == 6 && str_eq name "stress") then
-      VBool (map_has gc_state "stress")
+      VBool (vec_get gc_knob 6 >= 0)
     else if str_eq c "GC" && (str_len name == 7 && str_eq name "stress=") then
       (match args with
        | Cons (v9, _) ->
-         (let _ = (if truthy v9 then map_set gc_state "stress" 1
-                   else (if map_has gc_state "stress" then map_delete gc_state "stress" else ())) in v9)
+         (let _ = vec_set gc_knob 6 (if truthy v9 then 1 else 0 - 1) in v9)
        | Nil -> VNil)
     else if str_eq c "GC" && (str_len name == 5 && str_eq name "count") then
       VInt (if map_has gc_state "n" then map_get gc_state "n" else 0)
@@ -16693,7 +16781,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // counts what this interpreter allocates -- strings it builds for itself
     // included -- which is the same question asked of a different heap.
     else if str_eq c "GC" && (str_len name == 18 && str_eq name "__allocated_so_far") then
-      VInt (((if map_has oid_next "n" then map_get oid_next "n" else handle_base) - handle_base)
+      VInt (((oid_peek handle_base) - handle_base)
             + ((if map_has arr_ctr 0 then map_get arr_ctr 0 else handle_base) - handle_base)
             + vec_len str_store + vec_len hash_store + map_len proc_store + map_len bind_store)
     else if str_eq c "GC" && (str_len name == 10 && str_eq name "total_time") then
@@ -21695,7 +21783,7 @@ and blk_capture = fn cur -> fn theblk -> fn (body: Stmt list) ->
         let _ = store_yblk (str_of_int pid) cur in
         // the proc is named only by the marker below: pinned at this depth
         // while the call it is handed to runs (see proc_as_block)
-        let _ = map_set yblk_pin (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0) pid in
+        let _ = map_set yblk_pin (cd_get ()) pid in
         match theblk with (h, ps, b, e) -> (h, Cons (yblk_marker ++ str_of_int pid, ps), b, e))
      else theblk)
   | _ -> theblk
@@ -34832,7 +34920,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   // existing per-body try_or below, so it is decremented on EVERY exit path
   // (normal return, propagating exception, or break/next/return flow signal)
   // and never leaks, without adding a new try_or to the hot path.
-  let cd = (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0) in
+  let cd = (cd_get ()) in
   // 15000 is measured, not guessed. With the required -stack_size (512MB) a
   // heavy frame (block, hash, string, begin/rescue) reaches 100000 native
   // frames before the stack fails, so this is well inside what the stack
@@ -34850,7 +34938,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
      // REPORTER adds when nothing rescues it, so having it here printed it twice
      raise_exc world "SystemStackError" "stack level too deep" in FRaise VNil)
   else
-  let _ = map_set struct_ctr "cd" (cd + 1) in
+  let _ = cd_set (cd + 1) in
   // A method body may run with UNROOTED values in flight above it (the
   // caller's half-evaluated expression); a safepoint may not collect while
   // any such context is on the stack. Two exceptions stay collectable:
@@ -34910,10 +34998,10 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
             (fn (m: str) -> let _ = note_extern_refused m in FRaise VNil) in
   // restore depth: runs whether the body returned normally, re-raised, or
   // emitted a flow signal (try_or has already caught any fail by this point).
-  let _ = map_set struct_ctr "cd" cd in
+  let _ = cd_set cd in
   let _ = (if gcbare then () else gc_unsafe_pop ()) in
   // ... and with it the caller's line and file, for the same reason
-  let _ = map_set cur_pos "l" (if map_has call_lines cd then map_get call_lines cd else 0) in
+  let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
   let _ = map_set_s cur_pos_s "f" (if map_has call_files_s cd then map_get call_files_s cd else "") in
   let _ = map_set_s cur_pos_s "m" (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
   // read, compare, write only if it differs -- the body may have left the flag
@@ -41045,10 +41133,10 @@ and with_builtin_frame = fn world -> fn (recv: Val) -> fn (name: str) -> fn (bod
                   && (match recv with VArr _ -> true | VHsh _ -> true | VRange _ -> true | _ -> false)
                then builtin_frame_label world recv "each" else "") in
      let top = (if str_len l2 == 0 then cd + 1 else (let _ = bi_frame_put (cd + 1) l2 in cd + 2)) in
-     let _ = map_set struct_ctr "cd" top in
+     let _ = cd_set top in
      let _ = map_set struct_ctr "bf" top in
      let (ok, v, m) = try_or_msg (fn (u: unit) -> (true, body (), "")) (fn (m: str) -> (false, VNil, m)) in
-     let _ = map_set struct_ctr "cd" cd in
+     let _ = cd_set cd in
      let _ = map_set struct_ctr "bf" pbf in
      if ok then v else (let _ = note_extern_refused m in fail m))
 and bi_frame_put = fn (d: int) -> fn (l: str) ->
@@ -41075,9 +41163,9 @@ and bi_raise_frame = fn world -> fn (exc_cls: str) ->
      else builtin_frame_label world (if map_has prim_missing "rbr" then map_get prim_missing "rbr" else VNil) n)
   else ""
 and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
-  let cd = (if map_has struct_ctr "cd" then map_get struct_ctr "cd" else 0) in
+  let cd = (cd_get ()) in
   let _ = fb_wm_call (cd - 1) in
-  let _ = map_set struct_ctr "cd" (cd + 1) in
+  let _ = cd_set (cd + 1) in
   let _ = map_set_si call_names_s cd label in
   let _ = map_set call_lines cd (cur_line ()) in
   let _ = map_set_si call_files_s cd (cur_file ()) in
@@ -41086,8 +41174,8 @@ and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
   let _ = map_set fb_env_at cd senv in
   let _ = map_set senv "__scope" (mkstr label) in
   let r = try_or body (FRaise VNil) in
-  let _ = map_set struct_ctr "cd" cd in
-  let _ = map_set cur_pos "l" (if map_has call_lines cd then map_get call_lines cd else 0) in
+  let _ = cd_set cd in
+  let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
   let _ = map_set_s cur_pos_s "f" (if map_has call_files_s cd then map_get call_files_s cd else "") in
   let _ = map_set_s cur_pos_s "m" (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
   r
@@ -42571,10 +42659,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   // matters, because the last statement is the body's value.
   // ...and it is where a :line tracepoint fires: one statement, one event.
   //   A program with no tracepoint pays the one flag lookup.
-  | SLine n -> let _ = map_set cur_pos "l" n in
+  | SLine n -> let _ = cur_line_set n in
     //   ...but not in `<internal:...>` code (the prelude): ruby's own core
     //   code emits no :line events.
-    let _ = (if map_has hook_flags "tp"
+    let _ = (if map_len hook_flags > 0 && map_has hook_flags "tp"
                 && (let f9 = cur_file () in
                     if str_len f9 > 10 && str_eq (substring f9 0 10) "<internal:" then false else true)
              then fire_tp_v world "line" "" "" VNil (if lv_has env "self" then lv_get env "self" else VMain)
@@ -42628,7 +42716,17 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                     | _ -> false) in
     let _ = (if barecall then map_set gc_bare "y" 0 else ()) in
     let v = eval_e env world blk e in
-    let _ = (if map_has gc_bare "y" then map_delete gc_bare "y" else ()) in
+    let _ = (if map_len gc_bare > 0 && map_has gc_bare "y" then map_delete gc_bare "y" else ()) in
+    FNext v
+  // a plain local -- lowercase or `_` first, no `::` -- skips the tests below
+  // for a global, a constant and a scoped constant, which it took twice per
+  // `i += 1` (and const_opassign answers only for a constant)
+  | SAssign (name, e) when str_len name > 0
+                           && (let c = ord (char_at name 0) in (c >= 97 && c <= 122) || c == 95)
+                           && (if str_contains name "::" then false else true) ->
+    let _ = (if lv_has env name then () else lv_set env name VNil) in
+    let v = eval_e env world blk e in
+    let _ = lv_set env name v in
     FNext v
   | SAssign (name, e) ->
     // `A::C = v` where A is not a class/module is a TypeError.
@@ -44068,12 +44166,12 @@ and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (e
     // would overwrite the file the caller named the moment it runs.
     (let prog2 = drop_file_marks prog2 in
      let of9 = (if map_has cur_pos_s "f" then map_get cur_pos_s "f" else "") in
-     let ol9 = (if map_has cur_pos "l" then map_get cur_pos "l" else 0) in
+     let ol9 = (cur_line ()) in
      let _ = map_set_s cur_pos_s "f" efile in
-     let _ = map_set cur_pos "l" eline in
+     let _ = cur_line_set eline in
      let r9 = eval_run env world blk prog2 in
      let _ = map_set_s cur_pos_s "f" of9 in
-     let _ = map_set cur_pos "l" ol9 in
+     let _ = cur_line_set ol9 in
      r9)
 
 
