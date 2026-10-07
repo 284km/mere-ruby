@@ -809,8 +809,53 @@ and hkey_seq_go = fn (xs: Val list) -> fn (acc: str) ->
 //  plain question "does this hash have an index", asked while maintaining it)
 let hidx_off = map_new ();
 let hidx_on = fn (id: int) -> map_has hash_indexed id;
+// ⚠ AN OVERWRITE IS WRITTEN TO THE INDEX ONLY. Storing a new value under a key
+//   the hash already has rebuilt the whole list and replaced it (hset), and
+//   hset drops the index -- so after one `h[k] = v` on an existing key every
+//   later read and write of that hash walked it: 100,000 overwrites over
+//   10,000 keys took 35.7 s, ruby's 0.0045. The index holds the newest value
+//   for every key of an indexed hash already; the list is marked STALE here
+//   (hash_stale) and its values are taken from the index when someone needs
+//   the list (hderef, hstale_fold) -- the keys and their order do not change
+//   on an overwrite, in ruby either.
+let hash_pending = map_new ();
+let rec hvec_pairs = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
+  if i < 0 then acc else hvec_pairs v (i - 1) (Cons (vec_get v i, acc));
+// the queue of new pairs folded into the stored list (see hash_pending's note
+// below for why there is a queue)
+let hpend_fold = fn (id: int) ->
+  if map_len hash_pending > 0 && map_has hash_pending id
+  then
+    (let q = map_get hash_pending id in
+     let merged = list_append (vec_get hash_store (id - handle_base)) (hvec_pairs q (vec_len q - 1) (Nil : Val list)) in
+     let _ = vec_set hash_store (id - handle_base) merged in
+     let _ = map_delete hash_pending id in ())
+  else ();
+let hash_stale = map_new ();
+let rec hstale_vals = fn (id: int) -> fn (xs: Val list) ->
+  match xs with
+  | Cons (k, Cons (v, t)) ->
+    (let d = hkey_digest k in
+     let ix = map_get hash_index id in
+     Cons (k, Cons ((if str_len d > 0 && map_has ix d then map_get ix d else v), hstale_vals id t)))
+  | other -> other;
+// the stored list with the index's values put back into it (the queue of new
+// pairs is folded by hderef first)
+let hstale_fold = fn (id: int) ->
+  if map_len hash_stale > 0 && map_has hash_stale id then
+    // (a pair still in the queue may be the one overwritten: fold it in first)
+    (let _ = hpend_fold id in
+     let _ = map_delete hash_stale id in
+     if map_has hash_index id then
+       (let ys = hstale_vals id (vec_get hash_store (id - handle_base)) in
+        let _ = vec_set hash_store (id - handle_base) ys in ())
+     else ())
+  else ();
 // anything the index cannot describe: the hash goes back to scanning
 let hidx_drop = fn (id: int) ->
+  // (a stale list is brought up to date while the index can still say how --
+  //  the queue of new pairs keeps its own values, and hderef folds it later)
+  let _ = hstale_fold id in
   if map_has hash_indexed id
   then (let _ = map_delete hash_indexed id in
         let _ = (if map_has hash_index id then (let _ = map_delete hash_index id in ()) else ()) in ())
@@ -858,23 +903,16 @@ let mkhash = fn (xs: Val list) ->
 // ⚠ What is left is the scan: finding whether the key is already there is
 // still a walk, so building a hash is still quadratic -- about ten times
 // cheaper, not linear. An index is the next change, not this one.
-let hash_pending = map_new ();
-let rec hvec_pairs = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
-  if i < 0 then acc else hvec_pairs v (i - 1) (Cons (vec_get v i, acc));
 // a plain append, no dedup: only keys the caller has already found ABSENT are
 // queued, so folding cannot introduce a duplicate. (`hash_put` and `hkey_eql`
 // live in modules spliced after this one and are not reachable here -- which
 // is also why the membership test below takes the comparison as an argument
 // rather than writing the rule a second time.)
 let hderef = fn (id: int) ->
-  if map_len hash_pending > 0 && map_has hash_pending id
-  then
-    (let q = map_get hash_pending id in
-     let merged = list_append (vec_get hash_store (id - handle_base)) (hvec_pairs q (vec_len q - 1) (Nil : Val list)) in
-     let _ = vec_set hash_store (id - handle_base) merged in
-     let _ = map_delete hash_pending id in
-     merged)
-  else vec_get hash_store (id - handle_base);
+  let _ = hpend_fold id in
+  // ...and the values overwritten since, from the index (see hash_stale)
+  let _ = hstale_fold id in
+  vec_get hash_store (id - handle_base);
 // the settled part WITHOUT folding the queue in -- the membership test that
 // decides whether to queue must not flush the thing it is deciding about.
 let hsettled = fn (id: int) -> vec_get hash_store (id - handle_base);
@@ -885,6 +923,7 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
   // which is what makes the index safe to believe when it is still there.
   let _ = (if map_len hash_pending > 0 && map_has hash_pending id
            then (let _ = map_delete hash_pending id in ()) else ()) in
+  let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   let _ = hidx_drop id in
   let _ = vec_set hash_store (id - handle_base) xs in ();
 let hderef_fwd = fn (id: int) -> hderef id;
@@ -897,11 +936,18 @@ let hderef_fwd = fn (id: int) -> hderef id;
 let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
   let keep = hidx_on id && (if str_eq (hkey_digest k) "" then false else true) in
   let _ = (if keep then (let _ = map_delete (map_get hash_index id) (hkey_digest k) in ()) else ()) in
+  // (xs came from hderef, so it is current: nothing is stale any more)
+  let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   // hset would drop the index; write the list underneath it instead
   let _ = (if map_len hash_pending > 0 && map_has hash_pending id
            then (let _ = map_delete hash_pending id in ()) else ()) in
   let _ = (if keep then () else hidx_drop id) in
   let _ = vec_set hash_store (id - handle_base) xs in ();
+// an existing key of an INDEXED hash takes a new value: the index says it,
+// and the list is stale until someone reads it (hderef)
+let hput_over = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
+  let _ = hidx_put id d v in
+  map_set hash_stale id true;
 // queue a pair whose key is NOT already present (the caller has checked)
 let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
   let q = (if map_has hash_pending id then map_get hash_pending id
