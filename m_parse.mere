@@ -356,7 +356,13 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
             (if je < str_len s && str_eq (char_at s je) "i"
                 && (je + 1 >= str_len s || (let nc = char_at s (je + 1) in if is_alnum nc || str_eq nc "_" then false else true)) then
                Cons (TImagF (float_of_str (strip_us (substring s i je) 0 "")), lex_go s (je + 1))
-             else Cons (TFlt (float_of_str (strip_us (substring s i je) 0 "")), lex_go s je))
+             else
+               (let f9 = float_of_str (strip_us (substring s i je) 0 "") in
+                // past the largest double it reads as Infinity, which ruby
+                // says under -w
+                let _ = (if f9 > 1.7976931348623157e308 && parse_verbose () then
+                           lex_warn_at s i ("Float " ++ substring s i je ++ " out of range") else ()) in
+                Cons (TFlt f9, lex_go s je)))
           // rational-imaginary: 1ri == Complex(0, Rational(1, 1)).
           else if j + 1 < str_len s && str_eq (char_at s j) "r" && str_eq (char_at s (j + 1)) "i"
                   && (j + 2 >= str_len s || (let nc = char_at s (j + 2) in if is_alnum nc || str_eq nc "_" then false else true)) then
@@ -2808,11 +2814,23 @@ and is_nonassoc_op = fn (op: str) ->
   str_eq op "==" || str_eq op "!=" || str_eq op "===" || str_eq op "<=>" ||
   str_eq op "=~" || str_eq op "!~"
 
+and is_cmp_op = fn (op: str) -> str_eq op "<" || str_eq op "<=" || str_eq op ">" || str_eq op ">="
 and parse_more = fn (lhs: Expr) -> fn toks -> fn (minp: int) ->
   match toks with
   | Cons (TP op, rest) ->
     let p = prec_of op in
     if p > 0 && p >= minp then
+      // `0 < x < 2` compares a boolean with 2: ruby says so under -w (said
+      // before the right side is read, which may run past a `;` and its line)
+      let _ = (if is_cmp_op op && parse_verbose () then
+                 (match lhs with
+                  | EBin (lop, _, _) ->
+                    (if is_cmp_op lop then
+                       (let ln9 = tok_line rest in
+                        warn_note (parse_time_file () ++ ":" ++ str_of_int (if ln9 > 0 then ln9 else parse_line_now ()) ++ ": warning: comparison '" ++ op ++ "' after comparison"))
+                     else ())
+                  | _ -> ())
+               else ()) in
       // the RHS may continue on the next line (trailing-operator style).
       let (rhs, r2) = parse_bin (skip_nls rest) (p + 1) in
       // reject chaining of a non-associative operator (`a == b == c`).
@@ -4439,6 +4457,8 @@ and finish_call_args = fn (pos: Expr list) -> fn (hp: Expr list) ->
     // where it was evaluated as an ordinary argument (a stray nil).
     let ps0 = rev_app pos Nil in
     let ps = drop_blockpass ps0 in
+    // the keyword pairs are a hash literal too: `m(k: 1, k: 2)` warns
+    let _ = hsh_note_dups (rev_app hp Nil) (Nil : (str * int) list) (parse_line_now ()) in
     eapp (drop_kwsplats ps)
          (Cons (EKwHash (eapp (rev_app hp Nil) (kwsplats_doubled ps)), only_blockpass ps0))
 
@@ -4549,6 +4569,7 @@ and parse_bare_pair = fn toks -> fn (hp: Expr list) ->
 // a paren-less call's arguments end with its bare hash, and maybe a block-pass
 // after it (rbs writes `any_node? child, nodes: nodes, &block`)
 and bare_hash_done = fn (acc: Expr list) -> fn (hp: Expr list) -> fn r ->
+  let _ = hsh_note_dups hp (Nil : (str * int) list) (parse_line_now ()) in
   match r with
   | Cons (TP amp9, r9) when str_eq amp9 "&" || str_eq amp9 " &" ->
     let (bpe, r10) = parse_expr r9 in (rev_app (Cons (EBlockPass bpe, Cons (EKwHash hp, acc))) Nil, r10)
@@ -6043,7 +6064,24 @@ and cond_ff = fn (e: Expr) ->
   | ERegex (_, _) ->
     let _ = cond_lit_warn "regex literal in condition" in
     EBin ("=~", e, EVar "$_")
+  // a string literal is always true, and `if x = 1` is almost always a
+  // mistyped `==`: ruby says so (for -e too); a symbol literal only under -w
+  | EStrL _ -> let _ = cond_warn "string literal in condition" in e
+  | ESym _ -> let _ = (if parse_verbose () then cond_warn "symbol literal in condition" else ()) in e
+  | EAssign (_, v) ->
+    (let _ = (match v with
+              | EInt _ -> cond_warn "found '= literal' in conditional, should be =="
+              | EFlt _ -> cond_warn "found '= literal' in conditional, should be =="
+              | EStrL _ -> cond_warn "found '= literal' in conditional, should be =="
+              | ESym _ -> cond_warn "found '= literal' in conditional, should be =="
+              | ENil -> cond_warn "found '= literal' in conditional, should be =="
+              | EBool _ -> cond_warn "found '= literal' in conditional, should be =="
+              | _ -> ()) in e)
   | _ -> e
+
+// a parse-time warning at the line being read, -e included
+and cond_warn = fn (what: str) ->
+  warn_note (parse_time_file () ++ ":" ++ str_of_int (parse_line_now ()) ++ ": warning: " ++ what)
 
 // ruby's warning for a literal where a condition is read. It is not given for
 // a -e program (prism's warn_unless_e_option: the one-liner idioms are what
@@ -6297,8 +6335,11 @@ and parse_while = fn toks -> fn (negate: bool) ->
   // (`while x do y end` = while x; then y; not x { y }).
   let had = map_has parser_flags "nodo" in
   let _ = map_set parser_flags "nodo" VNil in
-  let (cond0, r) = parse_andor toks in
+  let (cond00, r) = parse_andor toks in
   let _ = if had then () else map_delete parser_flags "nodo" in
+  // read as a condition, as `if`'s is: a flip-flop, a bare regexp, and the
+  // literal warnings
+  let cond0 = cond_ff cond00 in
   let cond = if negate then EUn ("!", cond0) else cond0 in
   let (body, r2) = parse_stmts (skip_then r) Nil in
   (SWhile (cond, body), expect_kw r2 "end")
