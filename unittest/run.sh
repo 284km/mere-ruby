@@ -144,6 +144,10 @@ if [ "${1:-}" = "--one" ]; then
   ro="$(verdicts < "$out1")"
   (cd "$dir" && RUBYLIB="$stdlib" perl -e "$runner" "$wall" "$mr" -I "$src/tool/lib" -I "$shim" "$base" -v --show-skip --seed="$seed" < /dev/null > "$out1" 2>&1)
   mo="$(verdicts < "$out1")"
+  # UNITTEST_KEEP=<dir> keeps mere-ruby's side of each file there, as
+  # <test/path with / as _>.out -- the failure messages a survey clusters
+  # (the verdicts alone say which tests, not why)
+  [ -n "${UNITTEST_KEEP:-}" ] && cp "$out1" "$UNITTEST_KEEP/$(printf '%s' "$rel" | sed 's|/|_|g; s|\.rb$||').out"
   rm -f "$out1"
   rf="$(mktemp)"; mf="$(mktemp)"
   printf '%s\n' "$ro" | grep -v '^$' > "$rf"; printf '%s\n' "$mo" | grep -v '^$' > "$mf"
