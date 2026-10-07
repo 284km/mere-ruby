@@ -787,9 +787,126 @@ let rec succ_byte_at = fn (s: str) -> fn (i: int) ->
 let rec has_alnum_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then false
   else if is_alnum_ascii (char_at s i) then true else has_alnum_go s (i + 1);
+// ...but a whole UTF-8 character at the end is incremented as a CHARACTER
+// (rb_str_succ's enc_succ_char): the next valid one of the same byte length,
+// and past the last of that length, the first of it with a carry into the
+// character before ("\u{FFFF}".succ is "\u0001\u0800"). The bytes were
+// incremented, and "\u{7FF}".succ was the broken "\xDF\xC0" -- a range of
+// characters from U+1123F to U+11241 had 123 members.
+let succ_mb_start = fn (s: str) -> fn (e: int) ->
+  let rec back = fn (k: int) -> (if k > 0 && e - k < 4 && (let o = ord (char_at s k) in o >= 128 && o < 192) then back (k - 1) else k) in
+  back (e - 1);
+let rec succ_mb_at = fn (s: str) -> fn (e: int) ->
+  if e <= 0 then chr 1 ++ s
+  else
+    (let st = succ_mb_start s e in
+     match utf8_cp_strict s st with
+     | (cp, l, ok) ->
+       if ok && l >= 2 && st + l == e then
+         (let hi = (if l == 2 then 2047 else if l == 3 then 65535 else 1114111) in
+          let lo = (if l == 2 then 128 else if l == 3 then 2048 else 65536) in
+          let nx = (if cp + 1 == 55296 then 57344 else cp + 1) in
+          if nx <= hi then substring s 0 st ++ utf8_enc nx ++ substring s e (str_len s)
+          else succ_mb_at (substring s 0 st ++ utf8_enc lo ++ substring s e (str_len s)) st)
+       else succ_byte_at s (e - 1));
+// ⚠ A STRING WITH UTF-8 CHARACTERS IN IT is rb_str_succ's walk over
+//   characters, ported as it is: a character is alphanumeric by Unicode
+//   (\p{Alpha} or \p{Digit}, "চ" is a letter), and its successor is the next
+//   one of the same kind within two steps; failing that the run of its kind
+//   it sits in wraps to its first member and carries (enc_succ_alnum_char).
+//   ("\u{999}".."\u{9999}").include?("\u{9995}") walks Bengali letters, wraps
+//   and grows past the end's length: false, where the codepoint walk said
+//   true. A run of one is not alphanumeric for this. An ASCII string with an
+//   alphanumeric takes this walk too, for its stop: past a non-alphanumeric,
+//   a letter does not take a wrapped digit's carry ("No.9".succ is "No.10";
+//   succ_at said "Np.0"). Broken bytes, and ASCII with no alphanumeric (whose
+//   "\x7f" depends on an encoding this does not see), keep the walks above.
+// the successor (1, c) / wrapped first-of-length (2, c) of a whole UTF-8
+// character, as enc_succ_char: the next valid codepoint of the same length
+let succ_u_next = fn (c: str) ->
+  match utf8_cp_strict c 0 with
+  | (cp, l, _) ->
+    (let hi = (if l == 1 then 127 else if l == 2 then 2047 else if l == 3 then 65535 else 1114111) in
+     let lo = (if l == 1 then 0 else if l == 2 then 128 else if l == 3 then 2048 else 65536) in
+     let nx = (if cp + 1 == 55296 then 57344 else cp + 1) in
+     if nx <= hi then (1, utf8_enc nx) else (2, utf8_enc lo));
+// the predecessor of the same length, or (0, c) below the first of it
+let succ_u_prev = fn (c: str) ->
+  match utf8_cp_strict c 0 with
+  | (cp, l, _) ->
+    (let lo = (if l == 1 then 0 else if l == 2 then 128 else if l == 3 then 2048 else 65536) in
+     let pv = (if cp - 1 == 57343 then 55295 else cp - 1) in
+     if pv >= lo then (1, utf8_enc pv) else (0, c));
+// 1 digit, 2 alpha, 0 neither (Unicode, as onigmo's ctype asks)
+let succ_u_kind = fn (c: str) ->
+  if str_len c == 1 then
+    (let o = ord c in if o >= 48 && o <= 57 then 1 else if (o >= 65 && o <= 90) || (o >= 97 && o <= 122) then 2 else 0)
+  else if uprop_has 1 4 c then 1 else if uprop_has 1 0 c then 2 else 0;
+// the start of the run of kind k that c sits in, and the run's length so far
+let rec succ_u_first = fn (k: int) -> fn (x: str) -> fn (n: int) ->
+  match succ_u_prev x with
+  | (1, px) -> if succ_u_kind px == k then succ_u_first k px (n + 1) else (x, n)
+  | _ -> (x, n);
+// enc_succ_alnum_char: (0 not alnum, _, _) / (1 found, c', _) / (2 wrapped, c', carry)
+let succ_u_alnum = fn (c: str) ->
+  let k = succ_u_kind c in
+  let near = (if k == 0 then ""
+              else (match succ_u_next c with
+                    | (1, c1) ->
+                      if succ_u_kind c1 == k then c1
+                      else (match succ_u_next c1 with (1, c2) -> (if succ_u_kind c2 == k then c2 else "") | _ -> "")
+                    | _ -> "")) in
+  if k == 0 then (0, c, "")
+  else if str_len near > 0 then (1, near, "")
+  else
+    (match succ_u_first k c 1 with
+     | (st, n) ->
+       if n == 1 then (0, c, "")
+       else if k == 1 then (2, st, (match succ_u_next st with (_, s2) -> s2))
+       else (2, st, st));
+let succ_ascii_alpha = fn (c: str) -> str_len c == 1 && (let o = ord c in (o >= 65 && o <= 90) || (o >= 97 && o <= 122));
+let succ_ascii_digit = fn (c: str) -> str_len c == 1 && (let o = ord c in o >= 48 && o <= 57);
+let succ_utf8 = fn (s: str) ->
+  let v = vec_new () in
+  let rec split = fn (i: int) -> (if i >= str_len s then () else (match utf8_cp_strict s i with (_, l, _) -> let _ = vec_push v (substring s i (i + l)) in split (i + l))) in
+  let _ = split 0 in
+  let n = vec_len v in
+  let join = fn (u: unit) -> (let rec go = fn (i: int) -> fn (acc: str) -> (if i >= n then acc else go (i + 1) (acc ++ vec_get v i)) in go 0 "") in
+  // the alphanumeric walk, right to left: (0, _, _) done, (1, _, _) no
+  // alphanumeric, (2, pos, carry) the last wrap and what goes before it
+  let rec walk = fn (i: int) -> fn (prev_not: bool) -> fn (last: str) -> fn (st: int) -> fn (cpos: int) -> fn (carry: str) ->
+    if i < 0 then (st, cpos, carry)
+    else
+      (let c = vec_get v i in
+       if prev_not && str_len last > 0
+          && (if succ_ascii_alpha last then succ_ascii_digit c else if succ_ascii_digit last then succ_ascii_alpha c else false)
+       then (st, cpos, carry)
+       else
+         (match succ_u_alnum c with
+          | (0, _, _) -> walk (i - 1) true last st cpos carry
+          | (1, c1, _) -> (let _ = vec_set v i c1 in (0, 0, ""))
+          | (_, c1, cr) -> (let _ = vec_set v i c1 in walk (i - 1) false c1 2 i cr))) in
+  match walk (n - 1) false "" 1 0 "" with
+  | (0, _, _) -> join ()
+  | (1, _, _) ->
+    // no alphanumeric: each character's successor, wrapping leftwards, and
+    // "\x01" before the leftmost when every one wrapped
+    (let rec nw = fn (i: int) ->
+       (if i < 0 then 0 - 1
+        else (match succ_u_next (vec_get v i) with
+              | (1, c1) -> (let _ = vec_set v i c1 in i)
+              | (_, c1) -> (let _ = vec_set v i c1 in nw (i - 1)))) in
+     if nw (n - 1) >= 0 then join () else chr 1 ++ join ())
+  | (_, cp, carry) ->
+    (let _ = vec_set v cp (carry ++ vec_get v cp) in join ());
+let rec succ_all_utf8 = fn (s: str) -> fn (i: int) -> fn (hi: bool) ->
+  if i >= str_len s then hi
+  else (match utf8_cp_strict s i with (_, l, ok) -> if ok then succ_all_utf8 s (i + l) (hi || l > 1) else false);
 let str_succ = fn (s: str) ->
   if str_len s == 0 then ""
+  else if succ_all_utf8 s 0 false || (has_alnum_go s 0 && succ_all_utf8 s 0 true) then succ_utf8 s
   else if has_alnum_go s 0 then succ_at s (str_len s - 1) (0 - 1)
+  else if ord (char_at s (str_len s - 1)) >= 128 then succ_mb_at s (str_len s)
   else succ_byte_at s (str_len s - 1);
 // String#upto between two one-character ASCII strings walks BYTE values
 // ("9".upto("A") passes through ":" .. "@"), where the general walk is
