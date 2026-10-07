@@ -79,7 +79,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/gc | 9 | 2 | 0 | 0 | 0 | 11 |
 | core/binding | 8 | 4 | 0 | 0 | 0 | 12 |
 | core/refinement | 6 | 1 | 0 | 1 | 0 | 8 |
-| core/warning | 4 | 1 | 0 | 0 | 0 | 5 |
+| core/warning | 5 | 0 | 0 | 0 | 0 | 5 |
 | core/conditionvariable | 4 | 0 | 0 | 0 | 0 | 4 |
 | core/builtin_constants | 1 | 0 | 0 | 0 | 0 | 1 |
 | core/fiber | 11 | 1 | 0 | 1 | 0 | 13 |
