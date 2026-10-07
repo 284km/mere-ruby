@@ -14600,11 +14600,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                             // arm above made about paths.
                             | _ -> (let _ = raise_exc world "TypeError"
                                       ("no implicit conversion of " ++ conv_gives_name pv ++ " into Integer") in 0 - 1))) in
-             if file_exists p9 then
-               raise_exc world "Errno::EEXIST" ("File exists @ dir_s_mkdir - " ++ p9)
-             else if run ("mkdir " ++ (if perm < 0 then "" else "-m " ++ oct12 perm ++ " ") ++ shq p9 ++ " 2>/dev/null") == 0 then
-               VInt 0
-             else raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_s_mkdir - " ++ p9))
+             // mkdir(2) itself, through Mere's dir_create (v0.1.630, all five
+             // backends -- RISC-V too, where `mkdir` could not run): the umask
+             // is taken off the mode as ruby's mkdir(2) takes it, which
+             // `mkdir -m` did not, and the refusal is the kernel's errno
+             if dir_create p9 perm == 0 then VInt 0
+             else dir_errno_raise world (proc_last_errno ()) "dir_s_mkdir" p9)
           | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
        // ⚠ Dir.rmdir was MISSING while Dir.mkdir was here, and the pair is
        // what a temp directory needs. mspec's own `rm_r` walks a tree and ends
@@ -14618,25 +14619,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with
           | Cons (VStr ph, _) ->
             (let p9 = sget ph in
-             // ⚠ "not there" and "cannot be looked at" are the same miss to
-             //   file_exists: under a parent chmod'ed 0000 the child is
-             //   invisible and was reported ENOENT where rmdir(2) says EACCES.
-             //   A parent that is a directory we may not search is the tell.
-             let par9 = dirname_of p9 in
-             if (if file_exists p9 then false else true) && dir_there par9
-                && (if file_exists (par9 ++ "/.") then false else true) then
-               raise_exc world "Errno::EACCES" ("Permission denied @ dir_s_rmdir - " ++ p9)
-             else if (if file_exists p9 then false else true) then
-               raise_exc world "Errno::ENOENT" ("No such file or directory @ dir_s_rmdir - " ++ p9)
-             // ⚠ THREE causes, and only two were told apart: a path that is
-             //   there but is NOT A DIRECTORY was reported as "directory not
-             //   empty", which names the wrong thing entirely.
-             else if (if dir_there p9 then false else true) then
-               raise_exc world "Errno::ENOTDIR" ("Not a directory @ dir_s_rmdir - " ++ p9)
-             else if (let r9 = try_or (fn (u: unit) -> rmdir p9) (0 - 2) in
-                      // (-2: refused here, and rmdir(1) is asked instead)
-                      if r9 == 0 - 2 then run ("rmdir " ++ shq p9 ++ " 2>/dev/null") else r9) == 0 then VInt 0
-             else raise_exc world "Errno::ENOTEMPTY" ("Directory not empty @ dir_s_rmdir - " ++ p9))
+             // rmdir(2) through Mere's dir_remove (v0.1.630, all five
+             // backends), and the refusal is the kernel's errno. It was
+             // reasoned out from file_exists and dir_there -- EACCES under a
+             // parent that could not be searched, ENOENT, ENOTDIR, else
+             // ENOTEMPTY -- and on RISC-V there was no rmdir at all.
+             if dir_remove p9 == 0 then VInt 0
+             else dir_errno_raise world (proc_last_errno ()) "dir_s_rmdir" p9)
           | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
        // ⚠ `exists?` is REMOVED in ruby 4.0 -- on File, on FileTest and on Dir.
        //   Answering it made three specs read DIFF for a method that should
@@ -14716,10 +14705,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              // so this is where all four stop being willing to list a
              // directory that is not there.
              if (if dir_there p9 then false else true) then dir_open_fail world p9 else
-             // glob_lines keeps find's own "." line as a glob candidate; a
-             // directory listing names only what is inside.
-             let kids = glob_drop_dot (glob_lines (glob_find p9 1) 0) in
-             let names = val_sort (glob_strs kids) in
+             // getdents through Mere's dir_entries (v0.1.630, every backend
+             // but LLVM): the names in the directory's own order, as ruby's
+             // readdir gives them. This ran find(1) and SORTED the names --
+             // a child process per listing, an order ruby does not give, and
+             // nothing at all on RISC-V.
+             let raw9 = dir_entries p9 in
+             if str_len raw9 == 0 && proc_last_errno () != 0 then dir_open_fail world p9 else
+             let names = dir_names_split raw9 0 in
              arr_new (if (str_len name == 9 && str_eq name "__entries") then Cons (mkstr ".", Cons (mkstr "..", names)) else names))
           | _ -> arr_new Nil)
        // Dir.home / Dir.home(user). The no-argument form is ENV["HOME"] -- the
@@ -22070,7 +22063,8 @@ and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
   let (meths, _, _, _) = world in
   if warn_internal_file (cur_file ()) then ()
   else
-    (let _ = (if str_eq name "object_id" || str_eq name "__send__"
+    (let _ = warn_perf_redef world key in
+     let _ = (if str_eq name "object_id" || str_eq name "__send__"
               then rb_warn world ("redefining '" ++ name ++ "' may cause serious problems") else ()) in
      // (...only over a method a program wrote: one the prelude defined is
      // ruby's C method, and a stdlib file that redefines it -- pp.rb's
@@ -22084,6 +22078,43 @@ and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
           (let _ = rb_warning world ("method redefined; discarding old " ++ name) in
            warning_emit world (f9 ++ ":" ++ str_of_int l9 ++ ": warning: previous definition of " ++ name ++ " was here\n") VNil))
      else ())
+// ruby 4's performance warning: a builtin the VM runs as a basic operation
+// (vm.c's vm_init_redefined_flag) replaced by a program's own definition --
+// the FIRST time, while the builtin is what the class has, and only when
+// Warning[:performance] is on. test_optimization asks it of 21 operators.
+// (an `undef` replaces the builtin too, and ruby says so at the undef)
+and warn_perf_undef = fn world -> fn (cls: str) -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n9, t9) -> (let _ = warn_perf_redef world (cls ++ "#" ++ n9) in warn_perf_undef world cls t9)
+and warn_perf_redef = fn world -> fn (key: str) ->
+  let (meths, _, _, _) = world in
+  if (if map_has warn_cats "performance" then truthy (map_get warn_cats "performance") else false)
+     && str_contains (perf_bop_keys ()) (" " ++ key ++ " ")
+     // (once per method: what replaced the builtin -- a def or an undef --
+     // is no builtin, and ruby does not say it again)
+     && (if map_has perf_replaced key then false else true)
+     // (still the builtin: no definition of the program's own is there)
+     && (if map_has meths key
+         then (let f9 = (if map_has meth_src ("f" ++ key) then (match map_get meth_src ("f" ++ key) with VStr h -> sget h | _ -> "") else "") in
+               str_eq f9 "" || warn_internal_file f9)
+         else true)
+  then
+    (let _ = map_set perf_replaced key 1 in
+     let sh9 = str_index_of key "#" in
+     warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: Redefining '"
+                         ++ substring key 0 sh9 ++ "#" ++ substring key (sh9 + 1) (str_len key)
+                         ++ "' disables interpreter and JIT optimizations\n") (VSym "performance"))
+  else ()
+// vm_init_redefined_flag's table, class by class
+and perf_bop_keys = fn (u: unit) ->
+  " Integer#+ Float#+ String#+ Array#+ Integer#- Float#- Integer#* Float#* Integer#/ Float#/ Integer#% Float#%"
+  ++ " Integer#== Float#== String#== Symbol#== Integer#=== Float#=== Symbol#=== String#=== NilClass#=== TrueClass#=== FalseClass#==="
+  ++ " Integer#< Float#< Integer#<= Float#<= Integer#> Float#> Integer#>= Float#>= String#<< Array#<< Integer#>>"
+  ++ " Array#[] Hash#[] Integer#[] Array#[]= Hash#[]= Array#length String#length Hash#length Array#size String#size Hash#size"
+  ++ " Array#empty? String#empty? Hash#empty? Integer#succ String#succ Regexp#=~ String#=~ String#freeze Array#freeze Hash#freeze"
+  ++ " String#-@ Array#max Array#min Array#hash Proc#call Integer#& Integer#| NilClass#nil? Integer#<=> Float#<=> String#<=>"
+  ++ " Hash#default Array#include? "
 // undef / undef_method / remove_method of the three methods the VM leans on
 // (rb_undef, rb_remove_method): "undefining 'object_id' may cause serious
 // problems", unless $VERBOSE is nil
@@ -36879,6 +36910,23 @@ and fs_same = fn (a9: str) -> fn (b9: str) ->
                    let i9 = file_stat_field 1 in
                    if file_stat b9 != 0 then 0
                    else if file_stat_field 0 == d9 && file_stat_field 1 == i9 then 1 else 0))) (0 - 2)
+// dir_entries' answer -- each name followed by a NUL -- as Strings
+and dir_names_split = fn (raw: str) -> fn (i: int) ->
+  if i >= str_len raw then (Nil : Val list)
+  else (let e9 = nul_end_from raw i in
+        Cons (mkstr (substring raw i e9), dir_names_split raw (e9 + 1)))
+// A directory call's errno (dir_create, dir_remove, dir_entries: Mere keeps it
+// in proc_last_errno) as ruby's Errno: the numbers those calls give, by name,
+// because the table errno_by_num is darwin's and ENOTEMPTY, ENAMETOOLONG and
+// ELOOP differ on linux. Anything else is a SystemCallError with the number.
+and dir_errno_raise = fn world -> fn (e: int) -> fn (fn9: str) -> fn (p: str) ->
+  let nm9 = (if e == 17 then "EEXIST" else if e == 2 then "ENOENT" else if e == 13 then "EACCES"
+             else if e == 20 then "ENOTDIR" else if e == 66 || e == 39 then "ENOTEMPTY"
+             else if e == 1 then "EPERM" else if e == 30 then "EROFS" else if e == 16 then "EBUSY"
+             else if e == 21 then "EISDIR" else if e == 22 then "EINVAL"
+             else if e == 63 || e == 36 then "ENAMETOOLONG" else if e == 62 || e == 40 then "ELOOP" else "") in
+  if str_eq nm9 "" then raise_exc world "SystemCallError" ("unknown error " ++ str_of_int e ++ " @ " ++ fn9 ++ " - " ++ p)
+  else raise_exc world ("Errno::" ++ nm9) (errno_desc nm9 ++ " @ " ++ fn9 ++ " - " ++ p)
 // the fields of the snapshot file_stat / file_lstat just took, from i on
 and stat_fields_from = fn (i: int) ->
   if i >= 13 then Nil else Cons (VInt (file_stat_field i), stat_fields_from (i + 1))
@@ -41501,6 +41549,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
        | SUndef names ->
          (let _ = undef_check world cls names in
           let _ = warn_serious_all world names in
+          let _ = warn_perf_undef world cls names in
           let _ = undef_all meths cls names in
           let _ = list_iter names (fn (n8: str) -> run_cls_hook world cls "method_undefined" n8) in
           // ...and in a singleton class body the owner hears of it too
@@ -43097,11 +43146,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let dcls = definee_cls_of env world in
     if str_eq dcls "" then
     (match (if lv_has env "self" then lv_get env "self" else VMain) with
-     | VClass c -> let _ = undef_check world c names in let _ = warn_serious_all world names in let _ = undef_all meths c names in FNext VNil
+     | VClass c -> let _ = undef_check world c names in let _ = warn_serious_all world names in let _ = warn_perf_undef world c names in let _ = undef_all meths c names in FNext VNil
      | _ -> let _ = undef_top meths names in FNext VNil)
     // ...and so does `undef`: inside an instance_eval it hides the name on
     // THIS object only, leaving every other instance of the class answering.
-    else (let _ = undef_check world dcls names in let _ = warn_serious_all world names in let _ = undef_all meths dcls names in FNext VNil)
+    else (let _ = undef_check world dcls names in let _ = warn_serious_all world names in let _ = warn_perf_undef world dcls names in let _ = undef_all meths dcls names in FNext VNil)
   // Top-level visibility is a no-op except for one case that is observable:
   // a top-level `def` is a PRIVATE method of Object, and `public def m` (or
   // `public :m`) makes it public -- so `"str".m` and `:sym.m` work. Copying it

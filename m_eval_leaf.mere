@@ -4081,7 +4081,25 @@ and env_load = fn (u: unit) ->
   if map_has env_cache "\0loaded" then ()
   else
     let _ = map_set env_cache "\0loaded" (mkstr "1") in
-    env_cache_fill (env_all_pairs ())
+    let _ = env_cache_fill (env_all_pairs ()) in
+    // ⚠ PWD is what the PARENT left, and a child started elsewhere
+    //   (spawn's chdir:, `cd x && mere-ruby`) inherits a stale one. The
+    //   listing went through a shell before env_pairs, and the shell set
+    //   PWD to where it was; environ does not. Kept when it names this
+    //   directory (the same st_dev and st_ino as "."), else asked of the
+    //   shell, as before. (There is no getcwd here.)
+    let pw9 = (if map_has env_cache "PWD" then (match map_get env_cache "PWD" with VStr h -> sget h | _ -> "") else "") in
+    let same9 = try_or (fn (u: unit) ->
+                  (if str_len pw9 == 0 || file_stat pw9 != 0 then false
+                   else (let d9 = file_stat_field 0 in
+                         let i9 = file_stat_field 1 in
+                         file_stat "." == 0 && file_stat_field 0 == d9 && file_stat_field 1 == i9))) true in
+    if same9 then ()
+    else (match run_backtick "pwd -P" with
+          | VStr h -> (let t9 = sget h in
+                       let t9 = (if str_len t9 > 0 && str_eq (char_at t9 (str_len t9 - 1)) "\n" then substring t9 0 (str_len t9 - 1) else t9) in
+                       if str_len t9 > 0 then map_set env_cache "PWD" (mkstr t9) else ())
+          | _ -> ())
 and env_cache_fill = fn (ps: (str * str) list) ->
   match ps with
   | Nil -> ()
@@ -4089,8 +4107,34 @@ and env_cache_fill = fn (ps: (str * str) list) ->
 and dir_chdir_to = fn (p: str) ->
   let abs = (if str_len p > 0 && str_eq (char_at p 0) "/" then p else env_get "PWD" ++ "/" ++ p) in
   let rc = chdir p in
-  let _ = (if rc == 0 then (let _ = map_set env_cache "PWD" (mkstr (path_norm abs)) in ()) else ()) in
+  // (env_get above loaded the environment, so the PWD written below is not
+  // replaced by the one inherited from the parent when it is loaded later;
+  // the listing went through a shell before env_pairs, and the shell's own
+  // PWD hid this)
+  let _ = env_load () in
+  // Dir.pwd is getcwd(3) in ruby: the PHYSICAL path. The logical one is kept
+  // unless a component of it is a symlink (darwin's /tmp, /var), when the
+  // shell's `pwd -P` says where the process is -- one child per such chdir.
+  let _ = (if rc == 0 then
+             (let n9 = path_norm abs in
+              let phys9 = (if path_has_link n9 1 then
+                             (match run_backtick "pwd -P" with
+                              | VStr h -> (let t9 = sget h in
+                                           if str_len t9 > 0 && str_eq (char_at t9 (str_len t9 - 1)) "\n" then substring t9 0 (str_len t9 - 1) else t9)
+                              | _ -> n9)
+                           else n9) in
+              let _ = map_set env_cache "PWD" (mkstr (if str_len phys9 > 0 then phys9 else n9)) in ())
+           else ()) in
   rc
+// does some leading part of the absolute path p name a symlink? (lstat each
+// prefix ending before a "/" at or after i, then the whole path)
+and path_has_link = fn (p: str) -> fn (i: int) ->
+  if i > str_len p then false
+  else if i == str_len p || str_eq (char_at p i) "/" then
+    (let m9 = fs_mode (substring p 0 i) false in
+     if m9 >= 0 && bit_and m9 61440 == 40960 then true
+     else if i == str_len p then false else path_has_link p (i + 1))
+  else path_has_link p (i + 1)
 and env_is_set = fn (k2: str) ->
   let _ = env_load () in map_has env_cache k2
 and env_get = fn (k2: str) ->
@@ -4167,35 +4211,14 @@ and env_has_value = fn (xs: Val list) -> fn (target: str) ->
 and env_all_pairs = fn () ->
   try_or (fn (u: unit) -> env_all_pairs_host ()) (Nil : (str * str) list)
 and env_all_pairs_host = fn () ->
-  // ⚠ the pid is in the name, and a stale file is removed first: random_int
-  //   draws the same number in every process, so a dump a killed run left
-  //   behind (mode 000 under a spec's umask) answered "Permission denied" to
-  //   the next run that drew the name -- core/env/shift_spec in a sweep.
-  let tmpf = "/tmp/.mrb_env_" ++ str_of_int (getpid ()) ++ "_" ++ str_of_int (random_int 100000000) in
-  let _ = run ("rm -f " ++ shq tmpf) in
-  // ⚠ `env` alone frames its records with a NEWLINE, and a newline is a legal
-  // byte inside an environment VALUE -- so the two cannot be told apart. A
-  // value of "a\nB=evil" came back as "a" AND as a variable B nobody set: the
-  // dump both truncated a value and invented a name. `env -0` frames with a
-  // NUL, the one byte a value cannot contain, so the split is exact. Mere
-  // strings carry their length, so a NUL travels through read_file and
-  // char_at unharmed (that is what makes the framed form readable at all).
-  // Where `env` has no -0 (it is not in POSIX) the file comes back with no NUL
-  // in it and the old line split runs, ambiguity and all -- the dump is never
-  // empty, so "no NUL anywhere" is a reliable signal and not a guess.
-  let _ = run ("env -0 > " ++ shq tmpf ++ " 2> /dev/null") in
-  let content0 = (if file_exists tmpf then read_file tmpf else "") in
-  let framed = str_has_nul content0 0 in
-  let content =
-    (if framed then content0
-     else (let _ = run ("env > " ++ shq tmpf ++ " 2> /dev/null") in
-           (if file_exists tmpf then read_file tmpf else ""))) in
-  let _ = run ("rm -f " ++ shq tmpf) in
-  // `_` is the dump's own doing -- the shell sets it to the command it is
-  // about to run, so it names /usr/bin/env and nothing else. It is the one
-  // key we can be sure this program does not have (see KNOWN_GAPS for the
-  // two we cannot: the shell's PWD and SHLVL).
-  env_drop_underscore (if framed then env_pairs_nul content 0 else env_pairs_go content 0)
+  // environ itself, through Mere's env_pairs (v0.1.630, all five backends):
+  // "K=V" and a NUL after each, the frame `env -0` wrote. This dumped `env -0`
+  // into a temporary file and read it back -- a child process and a file per
+  // ENV.each, ENV.to_h or ENV.keys, and on RISC-V nothing at all. A NUL is the
+  // one byte a value cannot contain, so the split is exact. `_` is no longer
+  // dropped: it was the `env` command's own (the shell names what it is about
+  // to run), and environ's is the one ruby sees too.
+  env_pairs_nul (env_pairs ()) 0
 and str_has_nul = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then false
   else if str_eq (char_at s i) "\0" then true
@@ -4211,21 +4234,6 @@ and nul_end_from = fn (content: str) -> fn (i: int) ->
   if i >= str_len content then str_len content
   else if str_eq (char_at content i) "\0" then i
   else nul_end_from content (i + 1)
-and env_drop_underscore = fn (ps: (str * str) list) ->
-  match ps with
-  | Nil -> Nil
-  | Cons ((k, v), t) ->
-    if str_eq k "_" && str_len v >= 4 && str_eq (substring v (str_len v - 4) (str_len v)) "/env"
-    then env_drop_underscore t
-    else Cons ((k, v), env_drop_underscore t)
-and env_pairs_go = fn (content: str) -> fn (i: int) ->
-  if i >= str_len content then (Nil : (str * str) list)
-  else
-    let e = line_end_from content i in
-    let stop = (if e > i && str_eq (char_at content (e - 1)) "\n" then e - 1 else e) in
-    let eq = env_eq_at content i stop in
-    if eq < 0 then env_pairs_go content e
-    else Cons ((substring content i eq, substring content (eq + 1) stop), env_pairs_go content e)
 and env_eq_at = fn (content: str) -> fn (j: int) -> fn (stop: int) ->
   if j >= stop then (0 - 1)
   else if str_eq (char_at content j) "=" then j
@@ -14763,13 +14771,6 @@ and glob_last_slash = fn (p: str) -> fn (i: int) -> fn (lim: int) -> fn (best: i
   else glob_last_slash p (i + 1) lim (if str_eq (char_at p i) "/" then i else best)
 and glob_slashes = fn (p: str) -> fn (i: int) -> fn (n: int) ->
   if i >= str_len p then n else glob_slashes p (i + 1) (if str_eq (char_at p i) "/" then n + 1 else n)
-and glob_find = fn (root: str) -> fn (depth: int) ->
-  let tmpf = "/tmp/.mrb_glob_" ++ str_of_int (random_int 100000000) in
-  let dflag = (if depth > 0 then " -maxdepth " ++ str_of_int depth else "") in
-  let _ = run ("cd " ++ shq root ++ " 2> /dev/null && find ." ++ dflag ++ " -print > " ++ shq tmpf ++ " 2> /dev/null") in
-  let content = (if file_exists tmpf then read_file tmpf else "") in
-  let _ = run ("rm -f " ++ shq tmpf) in
-  content
 and glob_lines = fn (content: str) -> fn (i: int) ->
   if i >= str_len content then (Nil : str list)
   else
