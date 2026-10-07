@@ -13947,13 +13947,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           VInt rc9)
        | Cons (VInt fd9, _) ->
          (let rc9 = fchdir fd9 in
+          // (where fchdir landed is getcwd's answer: Mere's proc_cwd)
           let _ = (if rc9 == 0 then
-                     (match run_backtick "pwd -P 2> /dev/null" with
-                      | VStr h9 -> (let t9 = sget h9 in
-                                    let t9 = (if str_len t9 > 0 && str_eq (char_at t9 (str_len t9 - 1)) "\n"
-                                              then substring t9 0 (str_len t9 - 1) else t9) in
-                                    if str_len t9 > 0 then map_set env_cache "PWD" (mkstr t9) else ())
-                      | _ -> ())
+                     (let t9 = proc_cwd () in if str_len t9 > 0 then map_set env_cache "PWD" (mkstr t9) else ())
                    else ()) in
           VInt rc9)
        | _ -> VInt (0 - 1))
@@ -18523,7 +18519,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (match args with
           | Cons (mv9, Nil) ->
             (let m9 = chmod_mode env world mv9 in
-             let _ = run ("chmod " ++ oct12 m9 ++ " " ++ shq path ++ " 2>/dev/null") in VInt 0)
+             // chmod(2) through Mere's file_chmod; the shell only where the
+             // target has none (-2)
+             let r9 = try_or (fn (u: unit) -> file_chmod path m9) (0 - 2) in
+             let _ = (if r9 == 0 - 2 then run ("chmod " ++ oct12 m9 ++ " " ++ shq path ++ " 2>/dev/null") else 0) in VInt 0)
           | _ -> path_arg_err world args 1 1)
        else if (str_len name == 8 && str_eq name "truncate") then
          (match args with
@@ -35560,43 +35559,57 @@ and gl2_unesc = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
   else gl2_unesc s (i + 1) (acc ++ char_at s i)
 // the listing of directory `d` (a path as the walk builds it; "" is the cwd)
 // and everything under it to `depth` levels (0: all of it)
+// ⚠ THE WALK IS getdents AND stat NOW (Mere's dir_entries, v0.1.630), not two
+//   find(1) children per directory a pattern reads: a glob was two processes
+//   and a temporary file on the host, and nothing at all on RISC-V (Dir.glob
+//   raised there). The table is the one find filled: "k:<path>" the kind as
+//   lstat sees it ("d" "f", "l" for a link), "c:<dir>" the names in it, and
+//   "L:<dir>" for a directory whose whole contents are held. Like `find -L`,
+//   the walk goes through a link to a directory -- "**/" refusing to is
+//   gl2_help's rule, read from "k:" -- and stops at a directory already on
+//   its own path (the same device and inode), where find -L reported a loop.
 and gl2_list = fn g -> fn (d: str) -> fn (depth: int) ->
   let nd = gl2_norm d in
   if map_has g ("L:" ++ nd) then ()
   else
-    (let tmpf = "/tmp/.mrb_glob_" ++ str_of_int (random_int 100000000) in
-     let md = (if depth > 0 then " -maxdepth " ++ str_of_int depth else "") in
-     let dir = (if str_eq d "" then "." else d) in
-     let _ = run ("cd " ++ shq dir ++ " 2> /dev/null && \{ find -L . -mindepth 1" ++ md
-                  ++ " \\( -type d -exec printf 'd%s\\n' \{} + \\) -o -exec printf 'f%s\\n' \{} + ; find . -mindepth 1" ++ md
-                  ++ " -type l -exec printf 'l%s\\n' \{} + ; } > " ++ shq tmpf ++ " 2> /dev/null") in
-     let content = (if file_exists tmpf then read_file tmpf else "") in
-     let _ = run ("rm -f " ++ shq tmpf) in
+    (let dir = (if str_eq d "" then "." else d) in
      let _ = map_set g ("L:" ++ nd) "1" in
-     let rec lines = fn (i: int) ->
-       (if i >= str_len content then ()
-        else
-          (let e = line_end_from content i in
-           let stop = (if e > i && str_eq (char_at content (e - 1)) "\n" then e - 1 else e) in
-           let ln = substring content i stop in
-           let _ = (if str_len ln > 3 && str_eq (substring ln 1 3) "./" then
-                      (let t = char_at ln 0 in
-                       let rel = substring ln 3 (str_len ln) in
-                       let key = gl2_key d rel in
-                       if str_eq t "l" then map_set g ("k:" ++ key) "l"
+     gl2_walk g d nd dir "" 1 depth (gl2_devino dir))
+// "dev:ino;" of a directory (followed), "" when stat refuses it
+and gl2_devino = fn (p: str) ->
+  if (try_or (fn (u: unit) -> file_stat p) (0 - 2)) == 0
+  then str_of_int (file_stat_field 0) ++ ":" ++ str_of_int (file_stat_field 1) ++ ";"
+  else ""
+and gl2_walk = fn g -> fn (d: str) -> fn (nd: str) -> fn (dir: str) -> fn (rel: str) -> fn (lvl: int) -> fn (depth: int) -> fn (anc: str) ->
+  let here = (if str_eq rel "" then dir else dir ++ "/" ++ rel) in
+  let raw = dir_entries here in
+  let pk = (if str_eq rel "" then nd else gl2_key d rel) in
+  let rec each = fn (i: int) ->
+    (if i >= str_len raw then ()
+     else
+       (let e = nul_end_from raw i in
+        let name = substring raw i e in
+        let _ = (if str_eq name "." || str_eq name ".." || str_eq name "" then ()
+                 else
+                   (let relp = (if str_eq rel "" then name else rel ++ "/" ++ name) in
+                    let full = dir ++ "/" ++ relp in
+                    let key = gl2_key d relp in
+                    let lm = fs_mode full false in
+                    let isl = lm >= 0 && bit_and lm 61440 == 40960 in
+                    let m = (if isl then fs_mode full true else lm) in
+                    let isd = m >= 0 && bit_and m 61440 == 16384 in
+                    let _ = map_set g ("k:" ++ key) (if isl then "l" else if isd then "d" else "f") in
+                    let old = (if map_has g ("c:" ++ pk) then map_get g ("c:" ++ pk) else "") in
+                    let _ = map_set g ("c:" ++ pk) (if str_eq old "" then name else old ++ "\n" ++ name) in
+                    if isd && (depth == 0 || lvl < depth) then
+                      (let di = gl2_devino full in
+                       if str_len di > 0 && str_contains anc di then ()
                        else
-                         (let _ = (if map_has g ("k:" ++ key) then () else map_set g ("k:" ++ key) t) in
-                          let sl = glob_last_slash rel 0 (str_len rel) (0 - 1) in
-                          let pk = (if sl < 0 then nd else gl2_key d (substring rel 0 sl)) in
-                          let nm = (if sl < 0 then rel else substring rel (sl + 1) (str_len rel)) in
-                          let old = (if map_has g ("c:" ++ pk) then map_get g ("c:" ++ pk) else "") in
-                          let _ = map_set g ("c:" ++ pk) (if str_eq old "" then nm else old ++ "\n" ++ nm) in
-                          // a directory whose whole contents this listing holds
-                          if str_eq t "d" && (depth == 0 || glob_slashes rel 0 0 + 1 < depth)
-                          then map_set g ("L:" ++ key) "1" else ()))
-                    else ()) in
-           lines e)) in
-     lines 0)
+                         (let _ = map_set g ("L:" ++ key) "1" in
+                          gl2_walk g d nd dir relp (lvl + 1) depth (anc ++ di)))
+                    else ())) in
+        each (e + 1))) in
+  each 0
 and gl2_kids = fn g -> fn (d: str) ->
   let nd = gl2_norm d in
   let raw = (if map_has g ("c:" ++ nd) then map_get g ("c:" ++ nd) else "") in
@@ -35622,7 +35635,7 @@ and gl2_lkind = fn g -> fn (p: str) ->
   let k = gl2_norm p in
   if map_has g ("k:" ++ k) then map_get g ("k:" ++ k)
   else if file_exists p then (if dir_there p then "d" else "f")
-  else if run ("test -L " ++ shq p ++ " 2> /dev/null") == 0 then "l"
+  else if (let m9 = fs_mode p false in m9 >= 0 && bit_and m9 61440 == 40960) then "l"
   else "n"
 and gl2_skind = fn g -> fn (p: str) ->
   let k = gl2_lkind g p in
