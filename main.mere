@@ -14822,7 +14822,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // ...and a pattern that does not parse is refused with the reason,
           // "premature end of char-class: /^[$/" as ruby words it
           let why9 = rx_invalid_msg body fl in
-          if str_eq why9 "" then rx_build_once body fl renc9 args
+          if str_eq why9 "" then rx_with_tmo env world (rx_build_once body fl renc9 args) args
           else raise_exc world "RegexpError" (why9 ++ ": /" ++ body ++ "/"))
        // a Regexp is copied as it is; options beside it are ignored, which
        // ruby says unless they are nil (or keywords)
@@ -14830,7 +14830,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let _ = (match rest9 with
                    | Cons (VNil, _) -> () | Cons (VHsh _, _) -> () | Nil -> ()
                    | _ -> (if verbose_set () then rb_warn world "flags ignored" else ())) in
-          VRegex (b2, f2, e2))
+          // (the copy does not keep the original's timeout: ruby's is nil
+          // unless this call gives one)
+          rx_with_tmo env world (VRegex (b2, rx_fl_plain f2, e2)) args)
        | Cons (other9, _) -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into String")
        | Nil -> raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1..3)")
     // Regexp.last_match / .last_match(n): the same MatchData `$~` holds, which
@@ -14903,14 +14905,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              else VNil)
           | Nil -> VNil)
        | _ -> VNil)
-    // Regexp.timeout: a global this engine does not enforce. nil is the honest
-    // answer (ruby's default), and the writer keeps what it was told so the
-    // reader does not contradict it.
+    // Regexp.timeout: every match without its own timeout gives up after this
+    // many seconds with Regexp::TimeoutError (rxv_search sets the deadline)
     else if str_eq c "Regexp" && (str_len name == 7 && str_eq name "timeout") then
-      (if map_has rx_cur "timeout" then map_get rx_cur "timeout" else VNil)
+      rx_tmo_val (vec_get rx_tmo_glob 0)
     else if str_eq c "Regexp" && (str_len name == 8 && str_eq name "timeout=") then
       (match args with
-       | Cons (v9, _) -> (let _ = map_set rx_cur "timeout" v9 in v9)
+       | Cons (VNil, _) -> (let _ = vec_set rx_tmo_glob 0 0 in VNil)
+       | Cons (v9, _) -> (let _ = vec_set rx_tmo_glob 0 (rx_tmo_ns env world v9) in v9)
        | Nil -> VNil)
     // Regexp.linear_time?: whether the pattern can be matched without
     // backtracking. This engine backtracks, so the answer is about the
@@ -27570,6 +27572,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
          | _ -> r9))
      | _ -> (let _ = prim_nm_set (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
   // Regexp#casefold?: the `i` flag, which #options already carries as bit 0.
+  else if (str_len name == 7 && str_eq name "timeout") && (match recv with VRegex _ -> true | _ -> false) then
+    (match recv with VRegex (_, fl, _) -> rx_tmo_val (rx_fl_tmo fl) | _ -> VNil)
   else if (str_len name == 9 && str_eq name "casefold?") && (match recv with VRegex _ -> true | _ -> false) then
     (match recv with VRegex (_, fl, _) -> VBool (str_contains fl "i") | _ -> VBool false)
   // Regexp#fixed_encoding?: true for a pattern PINNED to one encoding, which
@@ -45457,10 +45461,89 @@ and meth_inspect_str = fn world -> fn (kind: str) -> fn (owner: str) -> fn (nm0:
 and rxv_tick = fn (u: unit) ->
   let n = vec_get rxv_steps 0 + 1 in
   let _ = vec_set rxv_steps 0 n in
-  if n > rxv_budget then
+  let _ = (if n == vec_get rxv_mc 4 then rxv_mc_start () else ()) in
+  let _ = rxv_clock () in
+  // (with the cache on, the marks bound the work, and the budget is not asked)
+  if n > rxv_budget && vec_get rxv_mc 0 == 0 then
     (let _ = vec_set rxv_steps 0 0 in
      let _ = prim_raise "Regexp::TimeoutError" "regexp match timeout" in ())
   else ()
+// a timeout in seconds as the ns rx_fl_tmo keeps: rb_num2dbl's refusals,
+// "invalid timeout" for one not above zero, and ruby's ceiling past
+// (2**64-1) ns
+and rx_tmo_ns = fn env -> fn world -> fn (v: Val) ->
+  let bad9 = (match v with
+              | VInt _ -> "" | VFlt _ -> "" | VBig _ -> "" | VRat _ -> "" | VObj _ -> ""
+              | VStr _ -> "no implicit conversion to float from string"
+              | VNil -> "no implicit conversion to float from nil"
+              | VBool true -> "no implicit conversion to float from true"
+              | VBool false -> "no implicit conversion to float from false"
+              | _ -> "can't convert " ++ class_name v ++ " into Float") in
+  if str_len bad9 > 0 then (let _ = raise_exc world "TypeError" bad9 in 0)
+  else
+    (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+     let f = (match v with
+              | VInt n -> float_of_int n
+              | VFlt x -> x
+              | _ -> (match invoke_val_c env world noblk v "to_f" Nil false with VFlt x -> x | VInt n -> float_of_int n | _ -> 0.0)) in
+     if (if f > 0.0 then false else true) then (let _ = raise_exc world "ArgumentError" ("invalid timeout: " ++ inspect v) in 0)
+     else if f >= 18446744073.709553 then 0 - 1
+     else (let ns = int_of_float (f * 1000000000.0) in if ns < 1 then 1 else ns))
+// ...and back: nil, the ceiling, or the seconds
+and rx_tmo_val = fn (ns: int) ->
+  if ns == 0 then VNil else if ns < 0 then VFlt 18446744073.709553 else VFlt (float_of_int ns / 1000000000.0)
+// Regexp.new's `timeout:` keyword, kept with the flags (see rx_fl_tmo)
+and rx_with_tmo = fn env -> fn world -> fn (r: Val) -> fn (args: Val list) ->
+  if sch_kw_has_timeout args then
+    (match (sch_kw_timeout args, r) with
+     | (VNil, _) -> r
+     | (t9, VRegex (b9, f9, e9)) ->
+       (let ns = rx_tmo_ns env world t9 in
+        VRegex (b9, rx_fl_plain f9 ++ chr 2 ++ (if ns < 0 then "max" else str_of_int ns), e9))
+     | _ -> r)
+  else r
+// past the search's deadline, Regexp::TimeoutError (the clock is read every
+// 1024 calls)
+and rxv_clock = fn (u: unit) ->
+  if vec_get rxv_dl 0 == 0 then ()
+  else
+    (let c = vec_get rxv_dl 1 + 1 in
+     if c < 1024 then vec_set rxv_dl 1 c
+     else
+       (let _ = vec_set rxv_dl 1 0 in
+        if sch_now () > vec_get rxv_dl 0 then
+          (let _ = vec_set rxv_dl 0 0 in
+           let _ = prim_raise "Regexp::TimeoutError" "regexp match timeout" in ())
+        else ()))
+// the cache's marks, all clear, for this search (see rxv_mc)
+and rxv_mc_start = fn (u: unit) ->
+  let words = (vec_get rxv_mc 1 * vec_get rxv_mc 2) / 60 + 1 in
+  let rec fill = fn (j: int) ->
+    (if j >= words then ()
+     else (let _ = (if j < vec_len rxv_mc_bits then vec_set rxv_mc_bits j 0 else vec_push rxv_mc_bits 0) in fill (j + 1))) in
+  let _ = fill 0 in
+  vec_set rxv_mc 0 1
+// an inner run (a lookaround's, an atomic group's, an absent's body) on its
+// own backtrack stack, one level deeper: the cache marks only the outer run
+and rxv_inner = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> fn (saves: (int * int) list) ->
+  let _ = vec_set rxv_mc 3 (vec_get rxv_mc 3 + 1) in
+  let r = rxv_run prog s sub i saves Nil in
+  let _ = vec_set rxv_mc 3 (vec_get rxv_mc 3 - 1) in
+  r
+// may this program use the cache? Not when what it matches depends on what
+// it captured (a backreference, a conditional on a group); and not, as
+// Onigmo gives up on it too, for an atomic group beside a loop whose body can
+// be empty (`d()*+|a*a*bc`, Bug #20886: ruby times that one out, and the test
+// says so)
+and rxv_mc_allowed = fn prog -> fn (pc: int) -> fn (n: int) -> fn (at: bool) -> fn (ck: bool) ->
+  if pc >= n then (if at && ck then false else true)
+  else (match rxv_fetch prog pc with
+        | IBackref (_, _) -> false
+        | ICond (_, _) -> false
+        | IAtomic _ -> rxv_mc_allowed prog (pc + 1) n true ck
+        | ICheck (_, _) -> rxv_mc_allowed prog (pc + 1) n at true
+        | _ -> rxv_mc_allowed prog (pc + 1) n at ck)
+and rxv_mc_size = fn prog -> match map_get prog (0 - 1) with IMeta (n, _) -> n | _ -> 0
 and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
            -> fn (saves: (int * int) list) -> fn (bt: (int * int * ((int * int) list)) list) ->
   match rxv_fetch prog pc with
@@ -45511,7 +45594,16 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     if i < str_len s && rxv_cls items neg ci (utf8_char_at s i)
     then rxv_run prog s (pc + 1) (i + utf8_clen s i) saves bt
     else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
-  | ISplit (a, b) -> rxv_run prog s a i saves (Cons ((b, i, saves), bt))
+  | ISplit (a, b) ->
+    let _ = rxv_clock () in
+    if vec_get rxv_mc 0 == 1 && vec_get rxv_mc 3 == 0 then
+      (let k = pc * vec_get rxv_mc 1 + i in
+       let w = k / 60 in
+       let m = bit_shl 1 (k - w * 60) in
+       let x = vec_get rxv_mc_bits w in
+       if bit_and x m != 0 then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9))
+       else (let _ = vec_set rxv_mc_bits w (bit_or x m) in rxv_run prog s a i saves (Cons ((b, i, saves), bt))))
+    else rxv_run prog s a i saves (Cons ((b, i, saves), bt))
   | IJmp t -> rxv_run prog s t i saves bt
   | ISave slot -> rxv_run prog s (pc + 1) i (Cons ((slot, i), saves)) bt
   | IMark k -> rxv_run prog s (pc + 1) i (Cons ((k, i), saves)) bt
@@ -45562,7 +45654,7 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
        if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
        else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | ILook (sub, negd) ->
-    (match rxv_run prog s sub i saves Nil with
+    (match rxv_inner prog s sub i saves with
      | RFound (_, sv2) ->
        if negd then (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)) else rxv_run prog s (pc + 1) i sv2 bt
      | RFail ->
@@ -45572,7 +45664,7 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
     // contained); take its first match, consume to that end, keep its
     // captures, and continue with the OUTER stack — so we never backtrack
     // back into the group. That is atomic-group / possessive semantics.
-    (match rxv_run prog s sub i saves Nil with
+    (match rxv_inner prog s sub i saves with
      | RFound (e, sv2) -> rxv_run prog s (pc + 1) e sv2 bt
      | RFail -> (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | ILookB (sub, wlo, whi, negd) ->
@@ -45597,7 +45689,7 @@ and rxv_lookb_try = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) ->
   else
     (let prev = (if map_has rxv_lb_end "e" then map_get rxv_lb_end "e" else 0 - 1) in
      let _ = map_set rxv_lb_end "e" i in
-     let r = rxv_run prog s sub (i - whi) saves Nil in
+     let r = rxv_inner prog s sub (i - whi) saves in
      let _ = map_set rxv_lb_end "e" prev in
      match r with
      | RFound (e, sv2) -> RFound (e, sv2)
@@ -45610,7 +45702,7 @@ and rxv_absent_hit = fn prog -> fn (s: str) -> fn (sub: int) -> fn (i: int) -> f
   let t = substring s 0 e in
   let rec from = fn (j: int) ->
     (if j > e then false
-     else (match rxv_run prog t sub j Nil Nil with
+     else (match rxv_inner prog t sub j Nil with
            | RFound (_, _) -> true
            | RFail -> from (j + (if j < e then utf8_clen t j else 1)))) in
   from i
@@ -45649,6 +45741,19 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
     if ok then
       (let _ = map_set rx_cur "k" (mkstr key) in
        let prog = map_get rx_progs key in
+       let ok9 = (if map_has rx_mc_ok key then map_get rx_mc_ok key == 1
+                  else (let a9 = rxv_mc_allowed prog 0 (rxv_mc_size prog) false false in
+                        let _ = map_set rx_mc_ok key (if a9 then 1 else 0) in a9)) in
+       let _ = vec_set rxv_mc 0 0 in
+       let _ = vec_set rxv_mc 1 (str_len s + 1) in
+       let _ = vec_set rxv_mc 2 (rxv_mc_size prog) in
+       let _ = vec_set rxv_mc 3 0 in
+       // the deadline: this pattern's own timeout, else Regexp.timeout
+       let tmo9 = (let t9 = rx_fl_tmo fl in if t9 == 0 then vec_get rx_tmo_glob 0 else t9) in
+       let _ = vec_set rxv_dl 0 (if tmo9 > 0 then sch_now () + tmo9 else 0) in
+       let _ = vec_set rxv_dl 1 0 in
+       // (at most half the budget, or a long subject would run out of it first)
+       let _ = vec_set rxv_mc 4 (if ok9 then (let t9 = (str_len s + 1) * rxv_mc_size prog in if t9 > rxv_budget / 2 then rxv_budget / 2 else t9) else 0 - 1) in
        // ⚠ AN ANCHORED PROGRAM HAS EXACTLY ONE POSITION TO TRY. A pattern whose
        // FIRST instruction is `\G` or `\A` can only match where the anchor is,
        // so a failure there is a failure everywhere -- but the search walked
