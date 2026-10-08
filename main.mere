@@ -6710,28 +6710,43 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
      // answer replaces it. scrub! writes the result back (frozen refuses
      // only when something actually changed).
      else if (str_len name == 5 && str_eq name "scrub") || (str_len name == 6 && str_eq name "scrub!") then
+       // (rb_enc_str_scrub: a valid receiver answers itself before anything
+       //  is asked; each span is yielded in the receiver's encoding, the
+       //  block must leave the receiver alone and answer a valid string that
+       //  meets it; `break` ends the walk -- note 301)
        (let e = enc_canon_name (senc_get h) in
-        let n = str_len sv in
-        let out =
-          (if str_eq e "UTF-8" then
-             (let rec go = fn (i: int) -> fn (acc: str) ->
-                if i >= n then acc
-                else (match utf8_cp_strict sv i with
-                      | (c, l, ok) ->
-                        if ok then go (i + l) (acc ++ substring sv i (i + l))
-                        else
-                          let sp = scrub_bad_span sv i in
-                          let bv = flow_value (run_block world encl theblk (Cons (mkstr (substring sv i (i + sp)), Nil))) in
-                          go (i + sp) (acc ++ (match bv with VStr bh -> sget bh | ov -> w_to_s world ov))) in
-              go 0 "")
-           else sv) in
-        if (str_len name == 6 && str_eq name "scrub!") then
-          (if str_eq out sv then recv
-           else if sfrozen_get h then prim_raise "FrozenError" ("can't modify frozen String: " ++ inspect recv)
-           else (let _ = sset h out in recv))
+        let bang9 = str_len name == 6 in
+        let _ = (match args with
+                 | Cons (VNil, _) -> ()
+                 | Cons (_, _) -> (let _ = prim_raise "ArgumentError" "both of block and replacement given" in ())
+                 | Nil -> ()) in
+        if (enc_ascii_compat e && str_is_ascii h) || enc_is_dummy e || enc_valid sv e then
+          (if bang9 then recv else mkstr_e sv (senc_get h))
         else
-          (let c = mkstr out in
-           (match c with VStr id -> (let _ = senc_set id (senc_get h) in c) | _ -> c)))
+          (let brk9 = vec_new () in
+           let rp9 = fn (bad: str) ->
+             (if vec_len brk9 > 0 then ""
+              else
+                (match run_block world encl theblk (Cons (mkstr_e bad (senc_get h), Nil)) with
+                 | FBreak bv9 -> (let _ = vec_push brk9 bv9 in "")
+                 | fl9 ->
+                   (let _ = (if str_eq (sget h) sv then () else (let _ = prim_raise "RuntimeError" "string modified" in ())) in
+                    let rv9 = (match flow_value fl9 with
+                               | VStr bh -> VStr bh
+                               | other -> (match conv_try gc_cenv0 world other "to_str" with
+                                           | VStr ch9 -> VStr ch9
+                                           | _ -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String"))) in
+                    match rv9 with
+                    | VStr bh -> (let _ = scrub_rep_check bh e in sget bh)
+                    | _ -> ""))) in
+           match scrub_walk sv e rp9 with
+           | (out, _) ->
+             (if vec_len brk9 > 0 then vec_get brk9 0
+              else if bang9 then
+                (if str_eq out sv then recv
+                 else if sfrozen_get h then prim_raise "FrozenError" ("can't modify frozen String: " ++ inspect recv)
+                 else (let _ = sset h out in recv))
+              else mkstr_e out (senc_get h))))
      else if (str_len name == 9 && str_eq name "each_char") then iter_each_result (arr_each world encl theblk (utf8_chars_enc sv (enc_canon_name (senc_get h)) 0)) recv
      // String#upto(limit) walks self, self.succ, ... up to limit.
      else if (str_len name == 4 && str_eq name "upto") then
@@ -10372,9 +10387,23 @@ and ascii_tag_v = fn (v: Val) ->
 // ruby asks rb_enc_check first, and two texts that cannot meet (EUC-JP and
 // BINARY with high bytes) are an Encoding::CompatibilityError -- these went
 // ahead and compared bytes (test_m17n's count / delete / chomp / [] / []=)
+// the encoding a receiver and its String arguments meet in (the receiver's
+// when one cannot meet -- that is the CompatibilityError's to raise): the
+// char-set methods cut their sets by it, so a Shift_JIS "\x81a" set holds
+// ONE character and does not take the "a" out of an ASCII receiver
+and args_enc_meet = fn (h: int) -> fn (args: Val list) ->
+  let rec go = fn (e: str) -> fn (acc: str) -> fn (xs: Val list) ->
+    (match xs with
+     | Cons (VStr y, t) ->
+       (let e2 = enc_compat2 e acc (senc_get y) (sget y) in
+        if str_eq e2 "" then senc_get h else go e2 (acc ++ sget y) t)
+     | Cons (_, t) -> go e acc t
+     | Nil -> e) in
+  go (senc_get h) (sget h) args
 and str_arg_enc_method = fn (name: str) ->
   str_eq name "count" || str_eq name "delete" || str_eq name "delete!" || str_eq name "squeeze" || str_eq name "squeeze!"
-  || str_eq name "chomp" || str_eq name "chomp!" || str_eq name "[]" || str_eq name "slice" || str_eq name "slice!"
+  || str_eq name "delete_prefix" || str_eq name "delete_suffix" || str_eq name "delete_prefix!" || str_eq name "delete_suffix!"
+  || str_eq name "[]" || str_eq name "slice" || str_eq name "slice!"
   || str_eq name "[]=" || str_eq name "split" || str_eq name "scan" || str_eq name "sub" || str_eq name "gsub"
   || str_eq name "sub!" || str_eq name "gsub!" || str_eq name "tr" || str_eq name "tr_s" || str_eq name "tr!" || str_eq name "tr_s!"
 and str_arg_enc_check = fn world -> fn (h: int) -> fn (args: Val list) ->
@@ -10393,14 +10422,45 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   let _ = (match recv0 with
            | VStr h0 -> (if (match args0 with Nil -> false | _ -> true) && str_arg_enc_method name0
                            && (if prim_user_has world recv0 name0 then false else true)
+                           // (an EMPTY receiver of tr / tr_s / delete answers
+                           //  itself with no question asked of its arguments)
+                           && (if str_blen h0 == 0 && (str_eq name0 "tr" || str_eq name0 "tr_s" || str_eq name0 "tr!" || str_eq name0 "tr_s!" || str_eq name0 "delete" || str_eq name0 "delete!")
+                               then false else true)
                         // (split refuses a broken receiver BEFORE its pattern
                         //  meets it -- ArgumentError, not a CompatibilityError)
                         then (let _ = (if str_eq name0 "split" then str_broken_refuse h0 else ()) in
+                              // (a broken String pattern is refused before it
+                              //  meets the receiver: RegexpError for scan / sub
+                              //  / gsub, ArgumentError for split -- note 301)
+                              let _ = (match args0 with
+                                       | Cons (VStr p9, _) ->
+                                         (if str_eq name0 "scan" || str_eq name0 "sub" || str_eq name0 "gsub" || str_eq name0 "sub!" || str_eq name0 "gsub!"
+                                          then rx_str_pat_check p9
+                                          else if str_eq name0 "split" then str_broken_refuse p9
+                                          else ())
+                                       | _ -> ()) in
+                              // (scan refuses a broken receiver after its
+                              //  pattern, before the two meet)
+                              let _ = (if str_eq name0 "scan" then str_broken_refuse h0 else ()) in
+                              // (sub / gsub meet their replacement only on a
+                              //  match, and a Regexp pattern first refuses a
+                              //  broken receiver -- rb_reg_search)
+                              let sub9 = str_eq name0 "sub" || str_eq name0 "gsub" || str_eq name0 "sub!" || str_eq name0 "gsub!" in
+                              let _ = (if sub9 then (match args0 with
+                                                     | Cons (VRegex (rp9, rf9, re9), _) ->
+                                                       (let _ = str_broken_refuse h0 in rx_enc_guard world (VRegex (rp9, rf9, re9)) recv0)
+                                                     | _ -> ()) else ()) in
                               str_arg_enc_check world h0
-                               (if str_eq name0 "[]=" then (match args0 with Cons (i9, _) -> Cons (i9, Nil) | Nil -> Nil)
+                               (if str_eq name0 "[]=" || sub9 then (match args0 with Cons (i9, _) -> Cons (i9, Nil) | Nil -> Nil)
                                 // chomp's separator in an encoding that is not
                                 // ASCII-compatible is matched as a newline
                                 // ("smart chomp", [Bug #10893]), not refused
+                                // a broken prefix / suffix takes nothing and
+                                // asks nothing (deleted_prefix_length)
+                                else if (str_eq name0 "delete_prefix" || str_eq name0 "delete_suffix" || str_eq name0 "delete_prefix!" || str_eq name0 "delete_suffix!")
+                                        && (match args0 with
+                                            | Cons (VStr y9, _) -> (if str_is_ascii y9 || enc_valid (sget y9) (enc_canon_name (senc_get y9)) then false else true)
+                                            | _ -> false) then Nil
                                 else if (str_eq name0 "chomp" || str_eq name0 "chomp!")
                                         && (if enc_ascii_compat (enc_canon_name (senc_get h0)) then false else true) then Nil
                                 else if (str_eq name0 "chomp" || str_eq name0 "chomp!")
@@ -12962,6 +13022,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
         //   before the pattern is compiled: an ArgumentError with the bare
         //   reason ("too short escape sequence", "invalid Unicode list")
         (let _ = rx_wq_take () in
+         // (pieces that are not valid in the merged encoding are refused by
+         //  rb_reg_preprocess as well: ArgumentError, no pattern named)
+         let _ = (if str_is_ascii sp || enc_valid body (enc_canon_name (senc_get sp)) then ()
+                  else (let _ = raise_exc world "ArgumentError" "invalid multibyte character" in ())) in
          let why9 = rx_invalid_msg body fl in
          let _ = rx_emit_warns world (rx_wq_take ()) body in
          if str_eq why9 "" then rx_build_once body fl (rx_one_enc recv) args
@@ -14995,6 +15059,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        match args with
        | Cons (VStr src, rest) ->
          (let body = sget src in
+          // a source that is not valid in its own encoding is no pattern:
+          // RegexpError "invalid multibyte character" (note 301)
+          let _ = rx_str_pat_check src in
           let fl = (match rest with
                     | Cons (VBool true, _) -> "i"
                     | Cons (VInt opt, _) ->
@@ -23629,11 +23696,15 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             (let e9 = enc_canon_name (senc_get sid) in
              // a receiver whose bytes are invalid in its encoding cannot be
              // searched (ruby's ArgumentError, before any matching).
-             let _ = (if str_eq e9 "UTF-8" && (if enc_valid_utf8 s0 then false else true)
-                      then (let _ = prim_raise "ArgumentError" "invalid byte sequence in UTF-8" in ()) else ()) in
+             // (in any encoding, and the pattern must meet it -- the same
+             //  questions the block-less form asks in invoke_val_c0, note 301)
              let (pat9, pf9, okp) = (match args with
-                                     | Cons (VRegex (p9, f9, _), _) -> (p9, f9, true)
-                                     | Cons (VStr p9, _) -> (let _ = rx_str_pat_check p9 in (rx_escape (sget p9), "", true))
+                                     | Cons (VRegex (p9, f9, ev9), _) ->
+                                       (let _ = str_broken_refuse sid in
+                                        let _ = rx_enc_guard world (VRegex (p9, f9, ev9)) recv in (p9, f9, true))
+                                     | Cons (VStr p9, _) ->
+                                       (let _ = rx_str_pat_check p9 in
+                                        let _ = str_arg_enc_check world sid (Cons (VStr p9, Nil)) in (rx_escape (sget p9), "", true))
                                      | _ -> ("", "", false)) in
              if okp == false then recv
              else
@@ -23646,7 +23717,10 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                let _ = (if all9 then (let _ = rb_scan_lastpub world pat9 pf9 s0 (senc_get sid) in ())
                         else (let _ = rb_sub_firstpub world pat9 pf9 s0 (senc_get sid) in ())) in
                if bang9 then
-                 (if str_eq r s0 then VNil
+                 // (nil only when nothing matched: a block that answered the
+                 //  match itself still leaves the receiver as the answer)
+                 (if str_eq r s0 && str_eq re (senc_get sid) then
+                    (match rxv_search_e pat9 pf9 s0 0 (senc_get sid) with RHit (_, _, _) -> recv | _ -> VNil)
                   else (let _ = sset sid r in let _ = senc_set sid re in recv))
                else (let c = mkstr r in (match c with VStr rid -> (let _ = senc_set rid re in c) | _ -> c)))
           | _ -> recv)
@@ -24595,7 +24669,15 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   else
   let _ = (if (str_len name == 2 && str_eq name "=~") || (str_len name == 5 && str_eq name "match")
               || (str_len name == 6 && str_eq name "match?") || (str_len name == 3 && str_eq name "===")
+              // (str[re] / str.slice(re) search too: a broken receiver and a
+              //  pattern that cannot meet it are refused -- note 301)
+              || ((str_len name == 2 && str_eq name "[]") || (str_len name == 5 && str_eq name "slice"))
+                 && (match (recv, args) with (VStr _, Cons (VRegex (_, _, _), _)) -> true | _ -> false)
            then (match (recv, args) with
+                 // (a negative position before the start answers nil before
+                 //  the two meet -- rb_reg_match_m's pos check, note 301)
+                 | (VRegex (_, _, _), Cons (VStr s9, Cons (VInt ps9, _))) when ps9 < 0 && ps9 + es_len (sget s9) (senc_get s9) < 0 -> ()
+                 | (VStr s9, Cons (VRegex (_, _, _), Cons (VInt ps9, _))) when ps9 < 0 && ps9 + es_len (sget s9) (senc_get s9) < 0 -> ()
                  | (VRegex (_, _, _), Cons (VStr s9, _)) -> rx_enc_guard world recv (VStr s9)
                  | (VStr _, Cons (VRegex (p9, f9, e9), _)) ->
                    (if str_len name == 3 then () else rx_enc_guard world (VRegex (p9, f9, e9)) recv)
@@ -24814,14 +24896,15 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                  | Cons (VRegex (p, pf, _), _) -> VBool (rx_match p pf sv)
                  | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv)
                  | _ -> VBool false))
-        | Cons (VRegex (p, pf, _), _) -> VBool (rx_match p pf sv)
+        // (cut in the subject's encoding, as =~ is -- note 301)
+        | Cons (VRegex (p, pf, _), _) -> VBool (rx_match_e p pf sv (senc_get h))
         | Cons (VStr p, _) -> VBool (rx_match (sget p) "" sv)
         | _ -> VBool false)
      // re.match?(str, pos) is str.match?(re, pos): the position counts
      | VRegex (p, pf, e) ->
        (match args with
         | Cons (VStr sv, Cons (pos9, _)) -> invoke_val_c env world blk (VStr sv) name (Cons (VRegex (p, pf, e), Cons (pos9, Nil))) false
-        | Cons (VStr sv, _) -> VBool (rx_match p pf (sget sv))
+        | Cons (VStr sv, _) -> VBool (rx_match_e p pf (sget sv) (senc_get sv))
         | Cons (VSym sv, _) -> VBool (rx_match p pf sv)
         | Cons (VNil, _) -> VBool false
         // anything else is StringValue'd: #to_str, or "no implicit conversion"
@@ -24887,8 +24970,11 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
      | VStr h ->
        (let s0 = sget h in
         let e0 = enc_canon_name (senc_get h) in
-        // a receiver invalid in its own encoding refuses before matching.
-        let _ = (if str_eq e0 "UTF-8" && (if enc_valid_utf8 s0 then false else true)
+        // a receiver invalid in its own encoding refuses before matching --
+        // a REGEXP; a String pattern is searched for as text (rb_str_index),
+        // and `"\xC2".sub("", "")` answers "\xC2" (note 301)
+        let _ = (if str_eq e0 "UTF-8" && (match args with Cons (VRegex (_, _, _), _) -> true | _ -> false)
+                    && (if enc_valid_utf8 s0 then false else true)
                  then (let _ = prim_raise "ArgumentError" "invalid byte sequence in UTF-8" in ()) else ()) in
         let (pat, pf) = (match args with
                          | Cons (VRegex (p9, f9, _), _) -> (p9, f9)
@@ -24917,6 +25003,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                         ("incompatible character encodings: " ++ enc_msg_name ae ++ " and " ++ enc_msg_name pe) in ae)
            else (let _ = put9 piece in ae2)) in
         let fin = fn (ae: str) -> (strbuf_to_str gb, ae) in
+        // (sub! / gsub! answer nil only when NOTHING matched: a match that
+        //  rewrote to the same text is still the receiver)
+        let hit9 = vec_new () in
+        let _ = vec_push hit9 0 in
         let rec go = fn (i: int) -> fn (ae: str) -> fn (found: bool) ->
           (match rxv_search_e pat pf s0 i e0 with
            | RNoHit ->
@@ -24927,6 +25017,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
               fin (app ae (substring s0 i n) e0))
            | RBadPat -> (let _ = put9 (substring s0 i n) in fin ae)
            | RHit (st, en, saves) ->
+             let _ = vec_set hit9 0 1 in
              let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
              let _ = rxv_export_caps saves ng in
              let _ = rx_publish_at world s0 st en ng (senc_get h) in
@@ -24945,7 +25036,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                                | _ -> ("", "US-ASCII")) in
              let ae1 = app ae (substring s0 i st) e0 in
              let ae2 = app ae1 rep re9 in
-             let w9 = (if st < n then (if enc_cut e0 == 2 then enc_clen s0 e0 st else utf8_clen s0 st) else 1) in
+             let w9 = (if st < n then (if enc_cut e0 == 2 then enc_clen s0 e0 st else if enc_cut e0 == 0 then 1 else utf8_clen s0 st) else 1) in
              if en <= st then
                (if all then
                   (if st >= n then fin ae2
@@ -24957,7 +25048,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         match go 0 e0 false with
         | (r, re) ->
           (if (str_len name == 5 && str_eq name "gsub!") || (str_len name == 4 && str_eq name "sub!") then
-             (if str_eq r s0 then VNil else (let _ = sset h r in let _ = senc_set h re in recv))
+             (if vec_get hit9 0 == 0 then VNil
+              else if str_eq r s0 && str_eq re (senc_get h) then recv
+              else (let _ = sset h r in let _ = senc_set h re in recv))
            else (let c = mkstr r in (match c with VStr rid -> (let _ = senc_set rid re in c) | _ -> c))))
      | _ -> VNil)
   // blockless String#scan leaves $~ holding the LAST match (nil when none),
@@ -24973,7 +25066,12 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                          | Cons (VRegex (p9, f9, _), _) -> (p9, f9)
                          | Cons (VStr p9, _) -> (let _ = rx_str_pat_check p9 in (rx_escape (sget p9), ""))
                          | _ -> ("", "")) in
-        let items = (if enc_cut e == 2 && enc_ascii_compat e
+        // (a one-byte receiver steps one byte at a time too -- BINARY
+        //  "\xC2\xA1".scan("") is three empty matches -- when the pattern
+        //  itself is plain ASCII)
+        let items = (if (enc_cut e == 2 && enc_ascii_compat e)
+                        || (enc_cut e == 0 && enc_ascii_compat e && str_all_ascii_go pat 0 (str_len pat)
+                            && (if str_all_ascii_go sv 0 (str_len sv) then false else true))
                      then (let _ = cut_set e in let it9 = rx_scan_all2 pat pf sv 0 in let _ = cut_set "UTF-8" in it9)
                      else rx_scan_all2 pat pf sv 0) in
         let _ = rb_scan_lastpub world pat pf sv (senc_get h) in
@@ -25142,20 +25240,19 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         // ⚠ `re.match(str, pos)` starts AT pos, in characters, and a negative
         // one counts from the end -- `String#match` has honoured its second
         // argument all along and this one dropped it, so every match started at
-        // 0 whatever it was told. A position past the end matches nothing
-        // rather than being clamped.
+        // 0 whatever it was told. A negative position before the start is
+        // nil; one past the end is CLAMPED to the end (rb_str_offset), where
+        // only an empty match can still hit -- `//.match("a", 2)` begins at 1.
+        // Characters are the subject's own encoding's (note 301).
         | Cons (VStr sv, Cons (VInt off9, _)) ->
           (let s9 = sget sv in
-           if str_is_ascii sv then
-             (let cn9 = str_len s9 in
-              if off9 < 0 && cn9 + off9 < 0 then VNil
-              else let cst9 = (if off9 < 0 then cn9 + off9 else off9) in
-                   if cst9 > cn9 then VNil else hit_at p pf s9 cst9 (senc_get sv))
-           else
-             let cn9 = utf8_len s9 in
-             let cst9 = (if off9 < 0 then cn9 + off9 else off9) in
-             if cst9 < 0 || cst9 > cn9 then VNil
-             else hit_at p pf s9 (utf8_boff s9 cst9 0) (senc_get sv))
+           let e9 = senc_get sv in
+           let a9 = str_is_ascii sv in
+           let cn9 = (if a9 then str_len s9 else es_len s9 e9) in
+           let cst0 = (if off9 < 0 then cn9 + off9 else off9) in
+           if cst0 < 0 then VNil
+           else (let cst9 = (if cst0 > cn9 then cn9 else cst0) in
+                 hit_at p pf s9 (if a9 then cst9 else es_boff s9 e9 cst9) e9))
         | Cons (VStr sv, _) -> hit p pf (sget sv) (senc_get sv)
         | Cons (VSym sv, _) -> hit p pf sv (sym_enc_name sv)
         // nil matches nothing (and does NOT refuse) -- and that is a failed
@@ -26910,11 +27007,27 @@ and builtin_mut_on_frozen = fn world -> fn (recv: Val) -> fn (name: str) ->
 // non-participating is nil), publish $~ like the non-bang form, and answer
 // the removed piece carrying the receiver's encoding. Lives outside
 // str_mut_do because publishing $~ needs the world.
+// a scrub replacement must be valid in its own encoding, and meet the
+// receiver's: an ASCII one in any ASCII-compatible receiver, anything else
+// only in the receiver's very encoding (str_compat_and_valid)
+and scrub_rep_check = fn (rh: int) -> fn (e: str) ->
+  let re9 = enc_canon_name (senc_get rh) in
+  let a9 = enc_ascii_compat re9 && str_is_ascii rh in
+  if (if a9 then false else (if enc_valid (sget rh) re9 then false else true)) then
+    (let _ = prim_raise "ArgumentError" ("replacement must be valid byte sequence '" ++ inspect (VStr rh) ++ "'") in ())
+  else if (if a9 then (if enc_ascii_compat e then false else true) else (if str_eq re9 e then false else true)) then
+    (let _ = prim_raise "Encoding::CompatibilityError"
+               ("incompatible character encodings: " ++ enc_msg_name e ++ " and " ++ enc_msg_name re9) in ())
+  else ()
 and str_slice_bang_rx = fn env -> fn world -> fn (h: int) -> fn (args: Val list) ->
   let s = sget h in
   (match args with
-   | Cons (VRegex (p, pf, _), rest) ->
-     (match rxv_search p pf s 0 with
+   | Cons (VRegex (p, pf, ev), rest) ->
+     // (a broken receiver and a pattern that cannot meet it are refused
+     //  before the search, which cuts in the receiver's encoding -- note 301)
+     let _ = str_broken_refuse h in
+     let _ = rx_enc_guard world (VRegex (p, pf, ev)) (VStr h) in
+     (match rxv_search_e p pf s 0 (senc_get h) with
       | RHit (st, en, saves) ->
         (let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ p)) in
          let _ = rxv_export_caps saves ng in
@@ -27062,7 +27175,8 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
           if st9 < 0 || st9 > cn then (0 - 1, 0 - 1)
           else (es_boff s e9 st9, es_boff s e9 (if en9 > cn then cn else if en9 < st9 then st9 else en9)))
        | Cons (VStr sub, Nil) ->
-         (let i = es_find s (sget sub) e9 0 in
+         (let _ = enc_pair_guard h sub in
+          let i = es_find s (sget sub) e9 0 in
           if i < 0 then (0 - 1, 0 - 1) else (i, i + str_len (sget sub)))
        | Cons (VRegex (p, pf, _), Nil) ->
          (match rxv_search_e p pf s 0 e9 with RHit (st9, en9, _) -> (st9, en9) | _ -> (0 - 1, 0 - 1))
@@ -27073,7 +27187,10 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
        let piece = substring s b0 b1 in
        let _ = sset h (substring s 0 b0 ++ substring s b1 n) in
        let c = mkstr piece in
-       (match c with VStr rid -> (let _ = senc_set rid (senc_get h) in c) | _ -> c))
+       // (a String argument: the piece is a copy OF IT, with its encoding --
+       //  rb_str_subpat dups the argument; note 301)
+       let re9 = (match args with Cons (VStr a9, Nil) -> senc_get a9 | _ -> senc_get h) in
+       (match c with VStr rid -> (let _ = senc_set rid re9 in c) | _ -> c))
   else if (str_len name == 5 && str_eq name "clear") then let _ = sset h "" in VStr h
   // String#replace takes the other string's ENCODING too, as ruby does
   else if (str_len name == 7 && str_eq name "replace") then
@@ -27145,12 +27262,14 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
        // (the pattern meets the receiver first -- ruby's rb_enc_check, a
        //  CompatibilityError for an EUC-JP receiver and broken UTF-8 bytes --
        //  and matches only on a character head)
+       //  (the replacement meets it only once the pattern is found:
+       //  IndexError before CompatibilityError)
        let _ = enc_pair_guard h sub in
-       let _ = enc_pair_guard h r in
-       let renc = enc_pair_or h r in
        let sub = sget sub in let i = es_find s sub e9 0 in
        (if i < 0 then prim_raise "IndexError" "string not matched"
         else
+          let _ = enc_pair_guard h r in
+          let renc = enc_pair_or h r in
           let _ = sset h (substring s 0 i ++ sget r ++ substring s (i + str_len sub) n) in
           let _ = senc_set h renc in VStr r)
      // s[/re/] = r : replace the first match, which must exist.
@@ -27214,6 +27333,8 @@ and str_mut_do = fn (h: int) -> fn (name: str) -> fn (args: Val list) ->
        let ns2 = sget ns in
        let _ = senc_set h (senc_get ns) in
        if str_eq base "succ" || str_eq base "next" || str_eq base "reverse" then (let _ = sset h ns2 in VStr h)
+       // (scrub! answers the receiver whether or not anything changed)
+       else if str_eq base "scrub" && str_eq ns2 s then VStr h
        else if str_eq ns2 s then VNil
        // a bang that DOES change a frozen receiver refuses here (the ones the
        // dispatch gate exempts, like scrub!, only pass when nothing changes).
@@ -27922,8 +28043,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr b2, _) ->
           (if str_eq (enc_pair_or ah b2) "" then VNil
            else
-             let a = str_downcase_ascii (sget ah) in
-             let b3 = str_downcase_ascii (sget b2) in
+             // (in EUC-JP, Shift_JIS ... only the one-byte ASCII characters
+             //  fold: the "A" inside Shift_JIS "\x81A" is half a character)
+             let e9 = enc_pair_or ah b2 in
+             let a = (if enc_cut e9 == 2 then es_downcase_ascii (sget ah) e9 else str_downcase_ascii (sget ah)) in
+             let b3 = (if enc_cut e9 == 2 then es_downcase_ascii (sget b2) e9 else str_downcase_ascii (sget b2)) in
              VInt (let c = str_compare a b3 in if c < 0 then 0 - 1 else if c > 0 then 1 else 0))
         | _ -> VNil)
      | _ -> (let _ = prim_nm_set (mkstr "casecmp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp'")) in fail "mere-ruby: undefined method 'casecmp'")))
@@ -27950,7 +28074,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else if str_len salt < 2 then prim_raise "ArgumentError" "salt too short (need >=2 bytes)"
            else if ord (char_at salt 0) == 0 || ord (char_at salt 1) == 0
            then prim_raise "ArgumentError" "salt too short (need >=2 bytes)"
-           else mkstr (rb_crypt_des pw salt))
+           // (the hash is BINARY whatever the receiver, as ruby's crypt)
+           else mkstr_e (rb_crypt_des pw salt) "ASCII-8BIT")
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | _ -> (let _ = prim_nm_set (mkstr "crypt") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'crypt'")) in fail "mere-ruby: undefined method 'crypt'")))
@@ -28168,7 +28293,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (VStr b2, _) ->
           (if str_eq (enc_pair_or ah b2) "" then VNil
-           else VBool (str_eq (str_fold_case (sget ah)) (str_fold_case (sget b2))))
+           else if enc_utf8_family (enc_canon_name (senc_get ah)) && enc_utf8_family (enc_canon_name (senc_get b2))
+                   && enc_valid_utf8 (sget ah) && enc_valid_utf8 (sget b2) then
+             VBool (str_eq (str_fold_case (sget ah)) (str_fold_case (sget b2)))
+           // (other encodings fold their own characters -- and a broken side
+           //  is refused, "input string invalid" -- through the case map that
+           //  downcase(:fold) uses, note 301)
+           else
+             (match (rb_case_apply ah "d" "f", rb_case_apply b2 "d" "f") with
+              | (VStr x9, VStr y9) -> VBool (str_eq (sget x9) (sget y9))
+              | _ -> VBool false))
         | _ -> VNil)
      | _ -> (let _ = prim_nm_set (mkstr "casecmp?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp?'")) in fail "mere-ruby: undefined method 'casecmp?'")))
   else if (str_len name == 3 && str_eq name "ord") && (match recv with VStr h -> str_len (sget h) == 0 | _ -> false) then
@@ -28889,7 +29023,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let j = if i < 0 then n + i else i in
           if j >= 0 && j < n then mkstr (if a1 then substring s j (j + 1) else utf8_char s j) else VNil
         // s["sub"]: the substring itself if present, else nil.
-        | Cons (VStr sub, _) -> let sub = sget sub in if str_contains s sub then mkstr sub else VNil
+        // (a copy of the ARGUMENT, in its encoding, found on a character head
+        //  of the receiver's -- rb_str_subpat dups the argument; note 301)
+        | Cons (VStr subh, _) -> let sub = sget subh in if es_find s sub e9 0 >= 0 then mkstr_e sub (senc_get subh) else VNil
         // A Float index is truncated toward zero, the way Ruby does it -- but
         // Inf and NaN are not indices at all and are a RangeError there. This
         // arm and the one below used to be a single `VNil`: every argument that
@@ -29189,7 +29325,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // (at the int64 edge the next integer is a Bignum: `(-2**63).pred` wrapped
   // to 2**63-1, and a reverse_each down from there never reached its end)
   else if (str_len name == 4 && str_eq name "succ") || (str_len name == 4 && str_eq name "next") then (match recv with VInt n -> (if n == int_max then norm_big (big_add_s (str_of_int n) "1") else VInt (n + 1)) | VBig b -> norm_big (big_add_s b "1") | VStr s -> (let e9 = enc_canon_name (senc_get s) in
-              if es_succ_applies (sget s) e9 then mkstr_e (es_succ (sget s) e9) (senc_get s)
+              // (UTF-16/32 carry a whole character: step the code points as
+              //  UTF-8 and encode them back -- "9".encode("UTF-16LE").succ is
+              //  "10" there, not a stray byte -- note 301)
+              if (if enc_ascii_compat e9 then false else true) && str_len (sget s) > 0 && enc_valid (sget s) e9 then
+                (match encode_cps (decode_cps (sget s) e9 0) "UTF-8" "" with
+                 | (u9, _) -> (match encode_cps (decode_cps (str_succ u9) "UTF-8" 0) e9 "" with
+                               | (w9, _) -> mkstr_e w9 (senc_get s)))
+              else if str_eq e9 "US-ASCII" && str_len (sget s) > 0 && (if es_has_alnum (sget s) e9 0 then false else true)
+                      && ord (char_at (sget s) (str_len (sget s) - 1)) == 127 then mkstr_e (es_succ_ascii7 (sget s)) (senc_get s)
+              else if es_succ_applies (sget s) e9 then mkstr_e (es_succ (sget s) e9) (senc_get s)
               else mkstr (str_succ (sget s))) | _ -> (let _ = prim_nm_set (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
   // Integer#ceildiv(other): the division rounded UP, which is the floor of the
   // negated numerator negated back (7.ceildiv(2) is 4, -7.ceildiv(2) is -3).
@@ -29680,9 +29825,36 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr sh0 ->
        let e = enc_canon_name (senc_get sh0) in
        let s = sget sh0 in
+       // a separator that is ONE newline of its own encoding ("\n", or
+       // UTF-16LE "\n\0") chomps the receiver's own line end, \r\n too,
+       // and asks nothing of the two encodings ([Bug #10893], chompped_length)
+       let nlsep9 = (fn (h9: int) ->
+                       (let e9 = enc_canon_name (senc_get h9) in
+                        let v9 = sget h9 in
+                        str_len v9 <= str_len s
+                        && (if enc_ascii_compat e9 then str_eq v9 "\n"
+                            else (match decode_cps v9 e9 0 with Cons (10, Nil) -> true | _ -> false)))) in
        if enc_ascii_compat e then
          (match args with
-          | Cons (VStr suf, _) -> mkstr (str_chomp_sep s (sget suf))
+          | Cons (VStr suf, _) when nlsep9 suf -> mkstr (str_chomp s)
+          // (the separator comes off only from a character head of the
+          //  receiver's encoding: EUC-JP "\x8F\xA1\xA1".chomp("\xA1\xA1")
+          //  keeps all three bytes -- note 301)
+          // (a separator longer than the receiver takes nothing and asks
+          //  nothing; otherwise the two must meet -- chompped_length)
+          | Cons (VStr suf, _) when str_eq (enc_pair_or sh0 suf) "" ->
+            (if str_blen suf == 0 || str_blen suf > str_len s then mkstr_e s (senc_get sh0)
+             else prim_raise "Encoding::CompatibilityError"
+                    ("incompatible character encodings: " ++ enc_msg_name (senc_get sh0) ++ " and " ++ enc_msg_name (senc_get suf)))
+          // (a separator broken in its own encoding takes nothing)
+          | Cons (VStr suf, _) when (if es_pat_ok (sget suf) (enc_canon_name (senc_get suf)) then false else true) -> mkstr s
+          | Cons (VStr suf, _) ->
+            (let sf = sget suf in
+             let n9 = str_len s - str_len sf in
+             if enc_cut e == 2 && str_len sf > 0 && n9 >= 0 && str_eq (substring s n9 (str_len s)) sf
+                && (if es_head s e n9 then false else true)
+             then mkstr s
+             else mkstr (str_chomp_sep s sf))
           | Cons (VNil, _) -> mkstr s
           | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
           | Nil ->
@@ -29705,7 +29877,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
             let cps = decode_cps s e 0 in
             let rcps = (let rec rv = fn (xs: int list) -> fn (acc: int list) -> (match xs with Nil -> acc | Cons (hh, tt) -> rv tt (Cons (hh, acc))) in rv cps Nil) in
             let rkept =
-              (if str_eq sep "\n" then
+              (if str_eq sep "\n" || nlsep9 seph then
                  (match rcps with
                   | Cons (10, Cons (13, t)) -> t
                   | Cons (10, t) -> t
@@ -29777,10 +29949,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // (cut by the receiver's encoding around the call -- cut_set, note 299)
      | VStr sh9 -> let s = sget sh9 in
        (match args with
+        | Cons (VStr f, Cons (VStr t, _)) when str_len s == 0 -> mkstr_e "" (senc_get sh9)
         | Cons (VStr f, Cons (VStr t, _)) ->
-          (let _ = tr_enc_check sh9 f t in
+          (let en9 = tr_enc_check sh9 f t in
            let _ = str_broken_refuse sh9 in
-           let _ = cut_set (senc_get sh9) in let r9 = str_tr s (sget f) (sget t) in let _ = cut_set "UTF-8" in mkstr r9)
+           // (an empty FROM changes nothing; a broken FROM or TO is refused
+           //  after the receiver -- note 301)
+           if str_len (sget f) == 0 then mkstr_e s (senc_get sh9) else
+           let _ = str_broken_refuse f in
+           let _ = str_broken_refuse t in
+           let _ = cut_set en9 in let r9 = str_tr s (sget f) (sget t) in let _ = cut_set "UTF-8" in
+           // (the met encoding only when something was replaced: an untouched
+           //  receiver keeps its own, as ruby's tr_trans)
+           mkstr_e r9 (if str_eq r9 s then senc_get sh9 else en9))
         | _ -> mkstr s)
      | _ -> (let _ = prim_nm_set (mkstr "tr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr'")) in fail "mere-ruby: undefined method 'tr'")))
   // tr_s: translate, squeezing runs the TRANSLATION created (never runs that
@@ -29789,10 +29970,24 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr sh9 -> let s = sget sh9 in
        (match args with
+        | Cons (VStr f, Cons (VStr t, _)) when str_len s == 0 -> mkstr_e "" (senc_get sh9)
         | Cons (VStr f, Cons (VStr t, _)) ->
-          (let _ = tr_enc_check sh9 f t in
+          (let en9 = tr_enc_check sh9 f t in
            let _ = str_broken_refuse sh9 in
-           let _ = cut_set (senc_get sh9) in let r9 = str_tr_s s (sget f) (sget t) in let _ = cut_set "UTF-8" in mkstr r9)
+           // (an empty FROM changes nothing; a broken FROM or TO is refused
+           //  after the receiver -- note 301)
+           // (tr_s builds its result afresh: the met encoding even when
+           //  nothing changed, unlike tr -- only an empty TO, which deletes,
+           //  keeps the receiver's)
+           //  (and "something changed" includes the met encoding differing
+           //  from the receiver's meeting with FROM -- tr_trans's may_modify)
+           let e1_9 = enc_pair_or sh9 f in
+           let moved9 = (if str_eq e1_9 "" then false else (if str_eq e1_9 en9 then false else true)) in
+           if str_len (sget f) == 0 then mkstr_e s (if str_len (sget t) == 0 || (if moved9 then false else true) then senc_get sh9 else en9) else
+           let _ = str_broken_refuse f in
+           let _ = str_broken_refuse t in
+           let _ = cut_set en9 in let r9 = str_tr_s s (sget f) (sget t) in let _ = cut_set "UTF-8" in
+           mkstr_e r9 (if str_eq r9 s && (str_len (sget t) == 0 || (if moved9 then false else true)) then senc_get sh9 else en9))
         | Cons (_, Nil) -> prim_raise "ArgumentError" "wrong number of arguments (given 1, expected 2)"
         | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2)")
      | _ -> (let _ = prim_nm_set (mkstr "tr_s") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr_s'")) in fail "mere-ruby: undefined method 'tr_s'")))
@@ -29806,7 +30001,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           // non-String or a set with bytes invalid in its encoding).
           (let sets9 = str_set_args args in
            let _ = str_broken_refuse sh9 in
-           let _ = cut_set (senc_get sh9) in let r9 = str_squeeze_sets s sets9 in let _ = cut_set "UTF-8" in mkstr r9))
+           let _ = cut_set (args_enc_meet sh9 args) in let r9 = str_squeeze_sets s sets9 in let _ = cut_set "UTF-8" in mkstr r9))
      | _ -> (let _ = prim_nm_set (mkstr "squeeze") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'squeeze'")) in fail "mere-ruby: undefined method 'squeeze'")))
   else if (str_len name == 5 && str_eq name "ljust") || (str_len name == 5 && str_eq name "rjust") || (str_len name == 6 && str_eq name "center") then
     // one shape for the padding family: the width is an Integer (a Float
@@ -29823,9 +30018,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                  | Cons (other, _) -> (match prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Integer") with _ -> 0)
                  | Nil -> (match prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)" with _ -> 0)) in
         // (an EUC-JP or Shift_JIS receiver counts its own characters -- note 299)
-        let e9 = senc_get sh in
-        let apply = fn (pad: str) ->
-          (if enc_cut e9 == 2 then
+        //  ...in the encoding the receiver and the pad meet in: a BINARY
+        //  "" padded with EUC-JP "\xA1\xA1" counts EUC-JP characters
+        let apply = fn (pad: str) -> fn (e9: str) ->
+          (if enc_cut e9 == 2 || enc_cut e9 == 0 then
              es_justify (if (str_len name == 5 && str_eq name "ljust") then "l" else if (str_len name == 5 && str_eq name "rjust") then "r" else "c") s e9 w pad
            else if (str_len name == 5 && str_eq name "ljust") then str_ljust s w pad
            else if (str_len name == 5 && str_eq name "rjust") then str_rjust s w pad
@@ -29837,12 +30033,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            let pad = sget ph in
            if str_len pad == 0 then prim_raise "ArgumentError" "zero width padding"
            else
-             let v = mkstr (apply pad) in
+             let v = mkstr (apply pad renc) in
              (match v with VStr id -> (let _ = senc_set id renc in v) | _ -> v))
         | Cons (_, Cons (other, _)) ->
           prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | _ ->
-          (let v = mkstr (apply " ") in
+          (let v = mkstr (apply " " (senc_get sh)) in
            (match v with VStr id -> (let _ = senc_set id (senc_get sh) in v) | _ -> v)))
      | _ -> (let _ = prim_nm_set (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
   else if (str_len name == 9 && str_eq name "partition") || (str_len name == 10 && str_eq name "rpartition") then
@@ -29883,12 +30079,20 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr sh ->
        (let s = sget sh in
         match args with
-        | Cons (VStr p, _) ->
-          let p = sget p in
+        | Cons (VStr ph9, _) ->
+          let p = sget ph9 in
           let k = str_len p in
-          if str_starts_with s p
-             && (if str_eq (enc_canon_name (senc_get sh)) "UTF-8" && k < str_len s
-                    && (let o = ord (char_at s k) in o >= 128 && o < 192) then false else true)
+          // (the cut must land on a character head of the receiver's
+          //  encoding, and a broken prefix removes nothing -- es_*, note 301)
+          let e9 = enc_canon_name (senc_get sh) in
+          // (a prefix broken in its own encoding comes off only a receiver
+          //  that is broken too -- "prefix in a valid string cannot be
+          //  broken", deleted_prefix_length)
+          let pok9 = (if es_pat_ok p (enc_canon_name (senc_get ph9)) then es_pat_ok p e9
+                      else (if str_is_ascii sh || enc_valid s e9 then false else true)) in
+          if str_starts_with s p && pok9
+             && (if enc_cut e9 == 2 then es_head s e9 k
+                 else (if enc_cut e9 == 1 && k < str_len s && (let o = ord (char_at s k) in o >= 128 && o < 192) then false else true))
           then mkstr (substring s k (str_len s)) else mkstr s
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | _ -> mkstr s)
@@ -29898,12 +30102,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr sh ->
        (let s = sget sh in
         match args with
-        | Cons (VStr p, _) ->
-          let p = sget p in
+        | Cons (VStr ph9, _) ->
+          let p = sget ph9 in
           let cut = str_len s - str_len p in
-          if str_ends_with s p
-             && (if str_eq (enc_canon_name (senc_get sh)) "UTF-8" && cut > 0 && cut < str_len s
-                    && (let o = ord (char_at s cut) in o >= 128 && o < 192) then false else true)
+          let e9 = enc_canon_name (senc_get sh) in
+          if str_ends_with s p && es_pat_ok p e9 && es_pat_ok p (enc_canon_name (senc_get ph9))
+             && (if enc_cut e9 == 2 then es_head s e9 cut
+                 else (if enc_cut e9 == 1 && cut > 0 && cut < str_len s && (let o = ord (char_at s cut) in o >= 128 && o < 192) then false else true))
           then mkstr (substring s 0 cut) else mkstr s
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | _ -> mkstr s)
@@ -29913,25 +30118,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr h ->
        (let s = sget h in
         let e = enc_canon_name (senc_get h) in
-        let rep = (match args with
-                   | Cons (VStr rh, _) ->
-                     (let re2 = enc_canon_name (senc_get rh) in
-                      let _ = (if enc_valid (sget rh) re2 then ()
-                               else (let _ = prim_raise "ArgumentError" ("replacement must be valid byte sequence '" ++ sget rh ++ "'") in ())) in
-                      sget rh)
-                   | Cons (other, _) ->
-                     (match prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String") with _ -> "")
-                   | Nil ->
-                     // the default replacement: U+FFFD in Unicode encodings
-                     // (in the receiver's own byte order), "?" elsewhere.
-                     (if str_eq e "UTF-8" then utf8_enc 65533
-                      else if str_eq e "UTF-16LE" || str_eq e "UTF-16BE" || str_eq e "UTF-32LE" || str_eq e "UTF-32BE"
-                      then (match encode_cps (Cons (65533, Nil)) e "" with (b9, _) -> b9)
-                      else "?")) in
-        match rb_scrub s e rep with
-        | (r, ch) ->
-          (let c = mkstr r in
-           (match c with VStr id -> (let _ = senc_set id (senc_get h) in c) | _ -> c)))
+        // (a valid receiver -- or one in a dummy encoding -- answers a copy of
+        //  itself before its replacement is looked at; rb_enc_str_scrub)
+        if (enc_ascii_compat e && str_is_ascii h) || enc_is_dummy e || enc_valid s e then mkstr_e s (senc_get h)
+        else
+          (let rep = (match args with
+                      | Cons (VStr rh, _) -> (let _ = scrub_rep_check rh e in sget rh)
+                      | Cons (VNil, _) -> scrub_default_rep e
+                      | Cons (other, _) ->
+                        (match prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String") with _ -> "")
+                      | Nil -> scrub_default_rep e) in
+           match scrub_walk s e (fn (x: str) -> rep) with
+           | (r, _) -> mkstr_e r (senc_get h)))
      | _ -> (let _ = prim_nm_set (mkstr "scrub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scrub'")) in fail "mere-ruby: undefined method 'scrub'")))
   else if (str_len name == 6 && str_eq name "undump") then
     (match recv with
@@ -30064,14 +30262,22 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              // character mode. With a positive limit: limit-1 characters and
              // the rest verbatim -- ONE final "" when the limit overruns
              // (which a negative limit keeps too).
-             (if lim == 0 then arr_new (tag_all (utf8_chars_val s 0))
-              else if lim < 0 then arr_new (tag_all (rev_app (rev_app (utf8_chars_val s 0) Nil) (Cons (mkstr "", Nil))))
+             // (characters of the receiver's encoding -- note 301)
+             (let e9 = enc_canon_name (senc_get sh0) in
+              let chars9 = fn (x: str) -> (if enc_cut e9 == 1 then utf8_chars_val x 0 else utf8_chars_enc x e9 0) in
+              if lim == 0 then arr_new (tag_all (chars9 s))
+              else if lim < 0 then arr_new (tag_all (rev_app (rev_app (chars9 s) Nil) (Cons (mkstr "", Nil))))
               else
-                (let cn = utf8_len s in
-                 if lim > cn then arr_new (tag_all (rev_app (rev_app (utf8_chars_val s 0) Nil) (Cons (mkstr "", Nil))))
-                 else (let b = utf8_boff s (lim - 1) 0 in
-                       arr_new (tag_all (rev_app (rev_app (utf8_chars_val (substring s 0 b) 0) Nil)
+                (let cn = es_len s e9 in
+                 if lim > cn then arr_new (tag_all (rev_app (rev_app (chars9 s) Nil) (Cons (mkstr "", Nil))))
+                 else (let b = es_boff s e9 (lim - 1) in
+                       arr_new (tag_all (rev_app (rev_app (chars9 (substring s 0 b)) Nil)
                                            (Cons (mkstr (substring s b (str_len s)), Nil)))))))
+           // (a multibyte receiver splits only at a separator on a character
+           //  head of its own, es_split)
+           else if enc_cut (enc_canon_name (senc_get sh0)) == 2 && lim <= 0 then
+             (let parts9 = es_split s sep (enc_canon_name (senc_get sh0)) in
+              arr_new (tag_all (val_list_of_strs (if lim == 0 then strlist_trim_empty parts9 else parts9))))
            else if lim == 0 then arr_new (tag_all (val_list_of_strs (strlist_trim_empty (str_split s sep))))
            else if lim < 0 then arr_new (tag_all (val_list_of_strs (str_split s sep)))
            else arr_new (tag_all (val_list_of_strs (split_with_limit s sep lim))))
@@ -30342,7 +30548,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (VStr sub, Cons (VInt off, _)) ->
           // an offset outside the string (either side) finds nothing.
-          let _ = enc_pair_guard sh0 sub in
+          // (a negative one past the start answers before the two meet:
+          //  rb_str_index_m returns nil, then rb_enc_check -- note 301)
           // (an all-ASCII receiver: a character index is a byte index, and
           // neither the length nor the offset is a walk -- str_is_ascii)
           // (and characters are cut by the receiver's encoding -- es_*, note 299)
@@ -30350,7 +30557,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let a1 = str_is_ascii sh0 in
           let cn = (if a1 then str_len s else es_len s e9) in
           let cst = (if off < 0 then cn + off else off) in
-          (if cst < 0 || cst > cn then VNil
+          if cst < 0 || cst > cn then VNil else
+          let _ = enc_pair_guard sh0 sub in
+          (if cst > cn then VNil
            else
              let bst = (if a1 then cst else es_boff s e9 cst) in
              let i = es_find s (sget sub) e9 bst in
@@ -30381,7 +30590,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)"
         | _ -> (let sets9 = str_set_args args in
                 let _ = str_broken_refuse s in
-                let _ = cut_set (senc_get s) in let r9 = str_count_sets (sget s) sets9 in let _ = cut_set "UTF-8" in VInt r9))
+                let _ = cut_set (args_enc_meet s args) in let r9 = str_count_sets (sget s) sets9 in let _ = cut_set "UTF-8" in VInt r9))
      | VHsh xs -> VInt (vlen (hash_keys (hderef xs)))
      | _ -> (let _ = prim_nm_set (mkstr "count") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'count'")) in fail "mere-ruby: undefined method 'count'")))
   else if (str_len name == 4 && str_eq name "join") then
@@ -30495,9 +30704,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr s ->
        (match args with
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)"
+        | _ when str_blen s == 0 -> mkstr_e "" (senc_get s)
         | _ -> (let sets9 = str_set_args args in
                 let _ = str_broken_refuse s in
-                let _ = cut_set (senc_get s) in let r9 = str_delete_sets (sget s) sets9 in let _ = cut_set "UTF-8" in mkstr r9))
+                let _ = cut_set (args_enc_meet s args) in let r9 = str_delete_sets (sget s) sets9 in let _ = cut_set "UTF-8" in mkstr r9))
      | _ -> (let _ = prim_nm_set (mkstr "delete") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete'")) in fail "mere-ruby: undefined method 'delete'")))
   else if (str_len name == 8 && str_eq name "flatten!") then
     // nil when nothing was nested to flatten (the same rule as compact!)
@@ -45192,7 +45402,44 @@ and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   else if str_eq c "$" then (NEOL, p + 1, g)
   else if str_eq c "\\" then rxp_escape pat (p + 1) fl g
   else if str_eq c "*" || str_eq c "+" || str_eq c "?" then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: target of repeat operator is not specified")) in fail "mere-ruby: regexp: target of repeat operator is not specified")
+  else if str_contains fl "i" && ord c >= 128 then rxp_ci_mb pat p g
   else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
+
+// a non-ASCII literal under /i: the WHOLE character of the subject's cut
+// (UTF-8, or the multibyte encoding rxv_search_e set) and its one-codepoint
+// upcase / downcase / fold, as an alternation of byte sequences -- the VM
+// compares bytes, so "\uFF41" matches "\uFF21" only as whole characters
+// (EUC-JP \xA3\xE1 / \xA3\xC1, [Bug #11486]). One that does not decode
+// stays the byte it was.
+// ⚠ the program cache is keyed by the pattern's bytes and flags, not the
+//   cut: the same bytes compiled under another multibyte encoding would be
+//   reused. A pattern meets a subject of its own encoding (anything else is
+//   a CompatibilityError first), so the bytes decide the encoding in practice.
+and rxp_ci_mb = fn (pat: str) -> fn (p: int) -> fn (g: int) ->
+  let k9 = vec_get cut_k 0 in
+  let e9 = (if k9 == 2 then enc_canon_name (vec_get cut_e 0) else "UTF-8") in
+  let n9 = (if k9 == 0 then 1 else cut_clen pat p) in
+  let ch9 = substring pat p (p + n9) in
+  let rec bytes9 = fn (x: str) -> fn (i: int) -> (if i >= str_len x then (Nil : RNode list) else Cons (NChar (char_at x i), bytes9 x (i + 1))) in
+  let rec list_has_int = fn (xs: int list) -> fn (v: int) -> (match xs with Nil -> false | Cons (h9, t9) -> (if h9 == v then true else list_has_int t9 v)) in
+  if k9 == 0 || n9 <= 1 || p + n9 > str_len pat || (if enc_valid ch9 e9 then false else true) then (NChar (char_at pat p), p + 1, g)
+  else
+    (match decode_cps ch9 e9 0 with
+     | Cons (cp9, Nil) ->
+       let one9 = fn (xs: int list) -> (match xs with Cons (v9, Nil) -> v9 | _ -> cp9) in
+       let cands9 = Cons (one9 (cp_up_seq cp9), Cons (one9 (cp_down_seq cp9), Cons (one9 (cp_fold_seq cp9), Nil))) in
+       let rec alts9 = fn (xs: int list) -> fn (seen: int list) -> fn (acc: RNode list) ->
+         (match xs with
+          | Nil -> acc
+          | Cons (v9, t9) ->
+            (if v9 == cp9 || list_has_int seen v9 then alts9 t9 seen acc
+             else (match encode_cps (Cons (v9, Nil)) e9 "" with
+                   | (w9, true) -> alts9 t9 (Cons (v9, seen)) (Cons (NSeq (bytes9 w9 0), acc))
+                   | _ -> alts9 t9 seen acc))) in
+       (match alts9 cands9 Nil Nil with
+        | Nil -> (NSeq (bytes9 ch9 0), p + n9, g)
+        | more9 -> (NAlt (Cons (NSeq (bytes9 ch9 0), more9)), p + n9, g))
+     | _ -> (NChar (char_at pat p), p + 1, g))
 
 and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   if p >= str_len pat then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: regexp: too short escape sequence")) in fail "mere-ruby: regexp: too short escape sequence")
@@ -45796,8 +46043,16 @@ and rxc_emit_alt = fn prog -> fn (pc: int) -> fn (xs: RNode list) -> fn (jmps: i
     rxc_emit_alt prog (pc2 + 1) rest (Cons (pc2, jmps))
 
 // compile (with per-pattern cache); fails on unsupported constructs.
+// the program's cache key. A non-ASCII pattern under /i is compiled for the
+// multibyte cut it meets (rxp_ci_mb groups its bytes into characters of that
+// encoding), so it is cached per cut; the plain key still holds a program of
+// the same groups, which is all its other readers (rxv_prog_ng) ask of it.
+and rx_cut_key = fn (pat: str) -> fn (fl: str) ->
+  let k9 = fl ++ chr 1 ++ pat in
+  if vec_get cut_k 0 == 2 && str_contains fl "i" && (if str_all_ascii_go pat 0 (str_len pat) then false else true)
+  then k9 ++ chr 2 ++ vec_get cut_e 0 else k9
 and rxc_get = fn (pat: str) -> fn (fl: str) ->
-  let key = fl ++ chr 1 ++ pat in
+  let key = rx_cut_key pat fl in
   if map_has rx_progs key then map_get rx_progs key
   else
     // ⚠ THE PARSE HAPPENS HERE, at MATCH time -- not when the literal was
@@ -45822,6 +46077,9 @@ and rxc_get = fn (pat: str) -> fn (fl: str) ->
     let _ = map_set rx_progs key prog in
     // the names are still in rx_gnums from the parse just above
     let _ = map_set rx_prog_names key (mkstr (rx_names_join ())) in
+    let plain9 = fl ++ chr 1 ++ pat in
+    let _ = (if map_has rx_progs plain9 then ()
+             else (let _ = map_set rx_progs plain9 prog in map_set rx_prog_names plain9 (mkstr (rx_names_join ())))) in
     prog
 
 // the parse's named groups, flattened to "name=number|..." (insertion order is
@@ -46190,7 +46448,7 @@ and rxv_absent_alts = fn (s: str) -> fn (pc: int) -> fn (i: int) -> fn (e: int) 
 // when the new engine cannot handle the pattern -> caller uses the legacy one).
 and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int) ->
   let _ = vec_set rxv_steps 0 0 in
-  let key = fl ++ chr 1 ++ pat in
+  let key = rx_cut_key pat fl in
   // record this search's start offset so \G (IGANCHOR) can anchor to it.
   // rindex pins \G to ITS offset argument while attempting matches at
   // earlier positions; the override slot ("o") carries that pin.
@@ -46250,6 +46508,12 @@ and rxv_search_go = fn prog -> fn (s: str) -> fn (i: int) -> fn (len: int) ->
 // and + * on single elements. Backtracking, no groups.
 and rx_match = fn (pat: str) -> fn (fl: str) -> fn (s: str) ->
   match rxv_search pat fl s 0 with
+  | RHit (_, _, _) -> true
+  | RNoHit -> false
+  | RBadPat -> rx_match_legacy pat s
+
+and rx_match_e = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (enc: str) ->
+  match rxv_search_e pat fl s 0 enc with
   | RHit (_, _, _) -> true
   | RNoHit -> false
   | RBadPat -> rx_match_legacy pat s
@@ -46400,15 +46664,34 @@ and rxe_backref_many = fn (pat: str) -> fn (p: int) -> fn (s: str) -> fn (i: int
 // and a /n pattern warns about a non-ASCII subject that is not BINARY. The
 // engine here matches bytes, so none of this happened: `/./` on UTF-16LE
 // text matched a byte of it and `"\x80" =~ /./` answered 0.
+// does a pattern's source write a byte above 127 -- raw, or as a \xHH
+// escape from \x80 up (which is how /\xC2\xA1/n names its bytes)?
+and rx_src_nonascii = fn (p: str) -> fn (i: int) ->
+  if i >= str_len p then false
+  else if ord (char_at p i) >= 128 then true
+  else if str_eq (char_at p i) "\\" && i + 2 < str_len p then
+    (if str_eq (char_at p (i + 1)) "x" && (let c = char_at p (i + 2) in (c >= "8" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F"))
+     then true else rx_src_nonascii p (i + 2))
+  else rx_src_nonascii p (i + 1)
 and rx_enc_guard = fn world -> fn (re: Val) -> fn (subj: Val) ->
   match (re, subj) with
   | (VRegex (p, fl, ev), VStr h) ->
     (let se = enc_canon_name (senc_get h) in
      let sv = sget h in
      let _ = (if str_eq se "UTF-8" && (if str_is_ascii h then false else (if str_valid_utf8_h h then false else true))
-              then (let _ = raise_exc world "ArgumentError" "invalid byte sequence in UTF-8" in ()) else ()) in
+              then (let _ = raise_exc world "ArgumentError" "invalid byte sequence in UTF-8" in ())
+              // (a broken subject of any encoding, before the two meet --
+              //  rb_reg_prepare_enc, note 301)
+              else if (if str_eq se "UTF-8" then false else true) && (if str_is_ascii h then false else (if enc_valid sv se then false else true))
+              then (let _ = raise_exc world "ArgumentError" ("invalid byte sequence in " ++ se) in ())
+              else ()) in
      let ren = enc_canon_name (rx_enc_name p fl ev) in
-     let fixed = str_contains fl "u" || (if str_eq ren "US-ASCII" || str_contains fl "n" then false else true) in
+     // (/../n is lenient only over an ASCII source: a BINARY pattern with
+     //  bytes above 127 is fixed to BINARY, as Regexp.union("\xC2\xA1".b) is)
+     let fixed = str_contains fl "u"
+                 || (if str_eq ren "US-ASCII" then false
+                     else if str_contains fl "n" then rx_src_nonascii p 0
+                     else true) in
      let bad = fn (u: unit) ->
        raise_exc world "Encoding::CompatibilityError"
          ("incompatible encoding regexp match (" ++ ren ++ " regexp with " ++ se ++ " string)") in
@@ -46449,7 +46732,9 @@ and rx_do_match_at = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) -
 //   subject two bytes at a time (memory_status's `ps` reading stopped
 //   matching half way through test_string).
 and rxv_search_e = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int) -> fn (enc: str) ->
-  if enc_cut enc == 2 && enc_ascii_compat (enc_canon_name enc) then
+  // (a one-byte encoding steps byte by byte: BINARY "\xC2\xA1" is two
+  //  characters, so /\xA1/ is found at 1 and gsub(//) visits three places)
+  if enc_cut enc != 1 && enc_ascii_compat (enc_canon_name enc) then
     (let _ = cut_set enc in
      let r = rxv_search pat fl s start in
      let _ = cut_set "UTF-8" in
@@ -46837,7 +47122,7 @@ and rx_scan_all2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (i: int) -
     let ng = rxv_prog_ng (map_get rx_progs (fl ++ chr 1 ++ pat)) in
     let _ = rxv_export_caps saves ng in
     let item = (if ng == 0 then mkstr (substring s st en) else arr_new (rx_scan_groups s 1 ng)) in
-    let nexti = (if en > st then en else st + (if st < str_len s then utf8_clen s st else 1)) in
+    let nexti = (if en > st then en else st + (if st < str_len s then cut_clen s st else 1)) in
     Cons (item, rx_scan_all2 pat fl s nexti)
 
 and rx_gsub_go2 = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (rep: str) -> fn (i: int) -> fn (all: bool) -> fn (acc: str) ->
@@ -46914,7 +47199,7 @@ and rx_gsub_blk2 = fn world -> fn newblk -> fn (pat: str) -> fn (fl: str) -> fn 
        let ae1 = app ae (substring s i st) e0 in
        let ae2 = app ae1 rep re9 in
        if en <= st then
-         (let w9 = (if st < n then (if enc_cut e0 == 2 then enc_clen s e0 st else utf8_clen s st) else 1) in
+         (let w9 = (if st < n then (if enc_cut e0 == 2 then enc_clen s e0 st else if enc_cut e0 == 0 then 1 else utf8_clen s st) else 1) in
           if all then (if st >= n then fin ae2
                        else go (st + w9) (app ae2 (substring s st (st + w9)) e0))
           else fin (app ae2 (substring s st n) e0))

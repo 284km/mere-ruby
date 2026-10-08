@@ -324,6 +324,118 @@ let rb_scrub = fn (s: str) -> fn (e: str) -> fn (rep: str) ->
 
 // decoded codepoints with each INVALID SPAN as one (0-1) marker -- encode's
 // :invalid handling replaces per broken sequence, not per broken byte.
+// ---- String#scrub, as rb_enc_str_scrub (note 301) ----------------------
+// the longest character of e, and its shortest (the step a wide encoding
+// takes over an invalid unit)
+let scrub_maxlen = fn (e: str) ->
+  if enc_utf8_family e then 4
+  else if str_eq e "UTF-16LE" || str_eq e "UTF-16BE" || str_eq e "UTF-32LE" || str_eq e "UTF-32BE" then 4
+  else if str_eq e "EUC-JP" || str_eq e "eucJP-ms" || str_eq e "CP51932" || str_eq e "EUC-JIS-2004" then 3
+  else if str_eq e "EUC-TW" || str_eq e "GB18030" then 4
+  else if enc_multibyte e then 2
+  else 1;
+let scrub_minlen = fn (e: str) ->
+  if str_eq e "UTF-16LE" || str_eq e "UTF-16BE" then 2
+  else if str_eq e "UTF-32LE" || str_eq e "UTF-32BE" then 4
+  else 1;
+// one character at byte p of s, reading no further than lim -- onigmo's
+// precise_mbclen: (0, len) a whole character, (1, 0) invalid, (2, 0) the
+// bytes so far begin a character that needs more of them.
+let scrub_mbclen = fn (s: str) -> fn (p: int) -> fn (lim: int) -> fn (e: str) ->
+  let avail = lim - p in
+  let b = fn (k: int) -> ord (char_at s k) in
+  if avail <= 0 then (2, 0)
+  else if enc_utf8_family e then
+    (let b0 = b p in
+     if b0 < 128 then (0, 1)
+     else if b0 < 194 || b0 > 244 then (1, 0)
+     else
+       (let need = (if b0 < 224 then 2 else if b0 < 240 then 3 else 4) in
+        let lo = (if b0 == 224 then 160 else if b0 == 240 then 144 else 128) in
+        let hi = (if b0 == 237 then 159 else if b0 == 244 then 143 else 191) in
+        let rec chk = fn (j: int) ->
+          (if j >= need then (0, need)
+           else if p + j >= lim then (2, 0)
+           else (let x = b (p + j) in
+                 if (if j == 1 then x >= lo && x <= hi else x >= 128 && x <= 191) then chk (j + 1) else (1, 0))) in
+        chk 1))
+  else if str_eq e "UTF-16LE" || str_eq e "UTF-16BE" then
+    (let be = str_eq e "UTF-16BE" in
+     let unit = fn (k: int) -> (if be then b k * 256 + b (k + 1) else b (k + 1) * 256 + b k) in
+     if avail < 2 then (2, 0)
+     else (let w = unit p in
+           if w >= 55296 && w <= 56319 then
+             (if avail < 4 then (2, 0)
+              else (let w2 = unit (p + 2) in if w2 >= 56320 && w2 <= 57343 then (0, 4) else (1, 0)))
+           else if w >= 56320 && w <= 57343 then (1, 0)
+           else (0, 2)))
+  else if str_eq e "UTF-32LE" || str_eq e "UTF-32BE" then
+    (if avail < 4 then (2, 0)
+     else (let v = (if str_eq e "UTF-32BE" then ((b p * 256 + b (p + 1)) * 256 + b (p + 2)) * 256 + b (p + 3)
+                    else ((b (p + 3) * 256 + b (p + 2)) * 256 + b (p + 1)) * 256 + b p) in
+           if v > 1114111 || (v >= 55296 && v <= 57343) then (1, 0) else (0, 4)))
+  else if scrub_maxlen e == 1 then (if enc_valid (char_at s p) e then (0, 1) else (1, 0))
+  else
+    (let w = substring s p lim in
+     let l = enc_clen w e 0 in
+     if enc_valid (substring w 0 l) e then (0, l)
+     else
+       // (a short window that some completion makes ONE character is a
+       //  character still arriving, not an invalid one)
+       (let mx = scrub_maxlen e in
+        let rec rep = fn (c: str) -> fn (k: int) -> if k <= 0 then "" else c ++ rep c (k - 1) in
+        let cands = Cons (chr 161, Cons (chr 254, Cons (chr 64, Cons (chr 128, Cons (chr 176, Cons (chr 48, Cons (chr 129, Nil))))))) in
+        let rec more = fn (r: int) -> fn (cs: str list) ->
+          (if avail + r > mx then (1, 0)
+           else (match cs with
+                 | Nil -> more (r + 1) cands
+                 | Cons (c, t) ->
+                   (let w2 = w ++ rep c r in
+                    if enc_clen w2 e 0 == avail + r && enc_valid w2 e then (2, 0) else more r t))) in
+        if avail >= mx then (1, 0) else more 1 cands));
+// how many bytes one invalid span covers: the longest prefix (stepping by
+// the encoding's unit) that is still only missing bytes, else one unit
+let scrub_span = fn (s: str) -> fn (p: int) -> fn (n: int) -> fn (e: str) ->
+  let mn = scrub_minlen e in
+  let c0 = (let m = scrub_maxlen e in if n - p < m then n - p else m) in
+  if c0 <= mn * 2 then mn
+  else
+    (let rec dn = fn (c: int) ->
+       (if c <= mn then mn
+        else (match scrub_mbclen s p (p + c) e with
+              | (2, _) -> c
+              | (1, _) -> dn (c - mn)
+              | _ -> c)) in
+     dn (c0 - mn));
+// walk s, handing each invalid span to `rp` and putting its answer in place;
+// answers (result, changed). A character cut short at the end is one span.
+let scrub_walk = fn (s: str) -> fn (e: str) -> fn (rp: str -> str) ->
+  let n = str_len s in
+  let b9 = strbuf_new () in
+  let rec go = fn (p: int) -> fn (p1: int) -> fn (ch: bool) ->
+    if p >= n then (let _ = strbuf_push b9 (substring s p1 n) in ch)
+    else
+      (match scrub_mbclen s p n e with
+       | (0, l) -> go (p + l) p1 ch
+       | (2, _) ->
+         (let _ = strbuf_push b9 (substring s p1 p) in
+          let _ = strbuf_push b9 (rp (substring s p n)) in true)
+       | _ ->
+         (let c = scrub_span s p n e in
+          let _ = strbuf_push b9 (substring s p1 p) in
+          let _ = strbuf_push b9 (rp (substring s p (p + c))) in
+          go (p + c) (p + c) true)) in
+  let ch9 = go 0 0 false in
+  (strbuf_to_str b9, ch9);
+// the replacement when none is given: U+FFFD in UTF-8 and in the four wide
+// Unicode encodings (their own byte order), "?" anywhere else
+let scrub_default_rep = fn (e: str) ->
+  if str_eq e "UTF-8" then chr 239 ++ chr 191 ++ chr 189
+  else if str_eq e "UTF-16BE" then chr 255 ++ chr 253
+  else if str_eq e "UTF-16LE" then chr 253 ++ chr 255
+  else if str_eq e "UTF-32BE" then chr 0 ++ chr 0 ++ chr 255 ++ chr 253
+  else if str_eq e "UTF-32LE" then chr 253 ++ chr 255 ++ chr 0 ++ chr 0
+  else "?";
 let enc_decode_marked = fn (s: str) -> fn (from: str) ->
   let n = str_len s in
   if str_eq from "UTF-8" then
@@ -791,6 +903,31 @@ let es_rfind = fn (s: str) -> fn (pat: str) -> fn (e: str) -> fn (from: int) ->
   if k == 2 then (if enc_valid pat e then es_rfind_go s pat e from 0 (0 - 1) else 0 - 1)
   else if k == 1 && (if es_pat_ok pat e then false else true) then 0 - 1
   else str_rindex_go s pat from;
+// split at every separator that begins a character of e (an empty one is
+// the caller's character mode). ruby's own loop (SPLIT_TYPE_STRING): a match
+// that is not on a character head moves the SEARCH past that character but
+// not the piece's start, and the tail is cut from where the search stopped --
+// so EUC-JP "\x8F\xA1\xA1".split("\xA1\xA1") is [] and we answer the same.
+let rec es_split_go = fn (s: str) -> fn (sep: str) -> fn (e: str) -> fn (ptr: int) -> fn (sub: int) -> fn (acc: str list) ->
+  let k = (if ptr >= str_len s then 0 - 1 else str_find_from s sep ptr) in
+  if k < 0 then rev_app_str (Cons (substring s ptr (str_len s), acc)) Nil
+  else if es_head s e k then es_split_go s sep e (k + str_len sep) (k + str_len sep) (Cons (substring s sub k, acc))
+  else
+    (let rec adv = fn (x: int) -> if x > k || x >= str_len s then x else adv (x + enc_clen s e x) in
+     es_split_go s sep e (adv ptr) sub acc);
+let es_split = fn (s: str) -> fn (sep: str) -> fn (e: str) -> es_split_go s sep e 0 0 Nil;
+// ASCII letters lowered where they are whole one-byte characters of e
+let es_downcase_ascii = fn (s: str) -> fn (e: str) ->
+  let b9 = strbuf_new () in
+  let rec go = fn (i: int) ->
+    if i >= str_len s then ()
+    else
+      (let l = enc_clen s e i in
+       let c = substring s i (i + l) in
+       let _ = strbuf_push b9 (if l == 1 && (let o = ord c in o >= 65 && o <= 90) then chr (ord c + 32) else c) in
+       go (i + l)) in
+  let _ = go 0 in
+  strbuf_to_str b9;
 // the characters reversed
 let rec es_rev_go = fn (s: str) -> fn (e: str) -> fn (i: int) -> fn (acc: str list) ->
   if i >= str_len s then acc else (let l = enc_clen s e i in es_rev_go s e (i + l) (Cons (substring s i (i + l), acc)));
@@ -836,15 +973,19 @@ let str_broken_refuse = fn (sh: int) ->
      else (let _ = prim_raise "ArgumentError" ("invalid byte sequence in " ++ e) in ()));
 // tr's three texts meet: the receiver with FROM, and that with TO -- a TO
 // that cannot meet them is a CompatibilityError naming the two
+// ...and answers the encoding they meet in, which the result carries and the
+// cutting uses: BINARY "a".tr("a", EUC-JP "\xA1\xA1") is EUC-JP "\xA1\xA1"
+// (the receiver's when the receiver and FROM do not meet: that is the
+// generic check's refusal to make)
 let tr_enc_check = fn (sh: int) -> fn (fh: int) -> fn (th: int) ->
   let r1 = enc_pair_or sh fh in
-  if str_eq r1 "" then ()
+  if str_eq r1 "" then senc_get sh
   else
     (let r2 = enc_compat2 r1 (sget sh ++ sget fh) (senc_get th) (sget th) in
      if str_eq r2 "" then
        (let _ = prim_raise "Encoding::CompatibilityError"
-                  ("incompatible character encodings: " ++ enc_msg_name r1 ++ " and " ++ enc_msg_name (senc_get th)) in ())
-     else ());
+                  ("incompatible character encodings: " ++ enc_msg_name r1 ++ " and " ++ enc_msg_name (senc_get th)) in senc_get sh)
+     else r2);
 // a String pattern (scan / sub / gsub) that is broken in its encoding is a
 // RegexpError, ruby's "invalid multibyte character: /\xA1/" -- it becomes a
 // regexp of that text, which cannot be compiled
@@ -1169,6 +1310,16 @@ let rec es_has_alnum = fn (s: str) -> fn (e: str) -> fn (i: int) ->
 // rightmost VALID character counts up (its broken neighbours stay as they
 // are), and with none valid "\x01" goes in front -- ruby's "\xC2\xC2".succ
 // is "\x01\xC2\xC2" and EUC-JP "\xA1\xA1\xA1" is "\xA1\xA2\xA1".
+// US-ASCII's last character is \x7F: past it the byte wraps to \x00 and
+// carries, as BINARY's \xFF does -- "\x7F".succ is "\x01\x00" (only for a
+// string with no letter or digit, where the byte itself is what steps)
+let es_succ_ascii7 = fn (s: str) ->
+  let rec zeros = fn (n: int) -> if n <= 0 then "" else chr 0 ++ zeros (n - 1) in
+  let rec go = fn (i: int) ->
+    if i < 0 then chr 1 ++ zeros (str_len s)
+    else if ord (char_at s i) >= 127 then go (i - 1)
+    else substring s 0 i ++ chr (ord (char_at s i) + 1) ++ zeros (str_len s - i - 1) in
+  go (str_len s - 1);
 let es_succ_applies = fn (s: str) -> fn (e: str) ->
   let k = enc_cut e in
   str_len s > 0 && enc_ascii_compat e && (if es_has_alnum s (if k == 1 then "BINARY" else e) 0 then false else true)
@@ -2090,7 +2241,7 @@ and inspect = fn (v: Val) ->
              && enc_ascii_compat e9 && (if str_eq e9 "ASCII-8BIT" then rx_src_all7 sy 0 else true)
      then ":\"" ++ esc_str_b sy 0 "" (rx_src_all7 sy 0) ++ "\""
      else ":" ++ inspect (mkstr_e sy e9))
-  | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ enc_display_name (map_get enc_name (str_of_int id)) ++ ">" else "#<object>"
+  | VObj id -> if map_has enc_name (str_of_int id) then "#<Encoding:" ++ enc_display_name (map_get enc_name (str_of_int id)) ++ (if enc_is_dummy (map_get enc_name (str_of_int id)) then " (dummy)" else "") ++ ">" else "#<object>"
   // #<Proc:0xADDR file:line> -- and " (lambda)" for a lambda, which is how
   // ruby tells the two apart in one line of output.
   | VProc pid9 -> proc_to_s pid9
