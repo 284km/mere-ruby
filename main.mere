@@ -3690,6 +3690,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
        let r8 = truthy (invoke_val_c env world noblk bv8 "==" (Cons (va0, Nil)) false) in
        VBool (if str_eq op "==" then r8 else (if r8 then false else true)))
+    // ...and `hash == obj` when obj answers #to_hash (rb_hash_equal)
+    else if (str_eq op "==" || str_eq op "!=")
+       && (match va0 with VHsh _ -> true | _ -> false)
+       && (if has_meth world "Hash" "==" then false else true)
+       && (let bv8 = eval_e env world blk b in
+           (match bv8 with VObj _ -> responds world bv8 "to_hash" | _ -> false)) then
+      (let bv8 = eval_e env world blk b in
+       let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+       let r8 = truthy (invoke_val_c env world noblk bv8 "==" (Cons (va0, Nil)) false) in
+       VBool (if str_eq op "==" then r8 else (if r8 then false else true)))
     // ...and `ary == obj` the same way when obj answers #to_ary (rb_ary_equal)
     else if (str_eq op "==" || str_eq op "!=")
        && (match va0 with VArr _ -> true | _ -> false)
@@ -6746,7 +6756,24 @@ and arr_cycle_live = fn world -> fn encl -> fn theblk -> fn (id: int) -> fn (n: 
 // built-in block-taking iterators on primitive receivers. `encl` is the
 // enclosing method's block (threaded so a yield inside the iterated block
 // reaches it); `theblk` is the block being iterated.
+// the Hash methods that ITERATE their receiver with the block (ruby's
+// rb_hash_foreach, which raises iter_lev) -- not fetch / delete / a default,
+// whose block may add the very key it is asked for
+and hash_iterating_name = fn (name: str) ->
+  map_has (name_set "hash_iter") name
+// a hash's iterator counts itself running while the block does, and counts
+// itself off however it ends: the block's break / next / raise come back as
+// Flows (block_body_flow), and a raise out of the iterator itself is caught
+// here, counted off, and sent on.
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
+  match recv with
+  | VHsh hid9 when hash_iterating_name name ->
+    (let _ = hiter_inc hid9 in
+     let r9 = try_or_msg (fn (u: unit) -> builtin_iter_raw world encl theblk recv name args)
+                (fn (m: str) -> (let _ = hiter_dec hid9 in fail m)) in
+     let _ = hiter_dec hid9 in r9)
+  | _ -> builtin_iter_raw world encl theblk recv name args
+and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // The frozen check in invoke_val_c only guards the non-block dispatch, so a
   // block-form mutator (delete_if / keep_if / map! / sort! ...) reached this
   // far without one.
@@ -7262,26 +7289,27 @@ and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (nam
     else if (str_len name == 15 && str_eq name "transform_keys!") then
       (match recv with
        | VHsh hid ->
-         // a `break` leaves the keys already processed TRANSFORMED and the rest
-         // as they were -- and a transformed key wins over an untouched pair of
-         // the same name (`{a: 1, b: 2, c: 3, d: 4}` broken at :c is
-         // {b: 1, c: 2, d: 4}).
-         (let rec go9 = fn (ys: Val list) -> fn (acc: Val list) ->
+         // ⚠ ruby's own loop (rb_hash_transform_keys_bang), pair by pair over
+         //   a snapshot: yield the key; delete the old key unless an earlier
+         //   pair already made it; store the value under the new key (an
+         //   existing key keeps its place, a new one goes to the end); note
+         //   the new key. So a `break` at :b of {a: 1, b: 2, c: 3} upcasing
+         //   leaves {b: 2, c: 3, A: 1}, and a block that freezes the hash at
+         //   :b has deleted :b before the store refuses -- {c: 3, A: 1}.
+         // (the working list is written back once, or before the refusal)
+         (let rec go9 = fn (ys: Val list) -> fn (newk: Val list) -> fn (cur9: Val list) ->
             (match ys with
              | Cons (k9, Cons (v9, t9)) ->
                (match run_block world encl theblk (Cons (k9, Nil)) with
-                | FBreak bv9 -> (acc, Cons (k9, Cons (v9, t9)), true, bv9)
-                | FReturn rv9 -> (acc, Cons (k9, Cons (v9, t9)), true, rv9)
-                | f9 -> go9 t9 (list_append acc (Cons (flow_value f9, Cons (v9, Nil)))))
-             | _ -> (acc, (Nil : Val list), false, VNil)) in
-          let (done9, rest9, broke9, bv9) = go9 xs (Nil : Val list) in
-          let base9 = hash_merge Nil done9 in
-          let rec fill9 = fn (ys: Val list) -> fn (acc: Val list) ->
-            (match ys with
-             | Cons (k9, Cons (v9, t9)) ->
-               fill9 t9 (if hash_haskey acc k9 then acc else hash_put acc k9 v9)
-             | _ -> acc) in
-          let out9 = fill9 rest9 base9 in
+                | FBreak bv9 -> (true, bv9, cur9)
+                | FReturn rv9 -> (true, rv9, cur9)
+                | f9 ->
+                  (let nk9 = flow_value f9 in
+                   let c1 = (if hash_haskey newk k9 then cur9 else hash_del cur9 k9) in
+                   let _ = (if val_frozen_mut recv then (let _ = hset hid c1 in hash_frz_after_block world recv) else ()) in
+                   go9 t9 (Cons (nk9, Cons (VNil, newk))) (hash_put c1 (hash_store_key gc_cenv0 world hid nk9) v9)))
+             | _ -> (false, VNil, cur9)) in
+          let (broke9, bv9, out9) = go9 xs (Nil : Val list) xs in
           let _ = hset hid out9 in
           if broke9 then bv9 else recv)
        | _ -> recv)
@@ -8954,6 +8982,15 @@ and rb_eq_w0 = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
         then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
         else rb_eq a b)
      | _ -> rb_eq a b)
+  // ...and `{} == obj` asks the object when it answers #to_hash (rb_hash_equal:
+  //   `rb_equal(hash2, hash1)`), test_equal2
+  | VHsh _ ->
+    (match b with
+     | VObj _ ->
+       (if responds world b "to_hash"
+        then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) b "==" (Cons (a, Nil)) false)
+        else rb_eq a b)
+     | _ -> rb_eq a b)
   | _ -> rb_eq a b
 
 and rb_eq_num_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
@@ -9713,13 +9750,23 @@ and hidx_use = fn (hid: int) ->
 // Set#classify is written `h[k] = Set.new unless h.key?(k); h[k].add(x)`, and
 // with a block that mutates its result -- which is what core/set's "yields
 // each Object in self" does -- that pair became `nil.add`.
+// ⚠ ...and BOTH halves of ruby's rule for a container key: the hash taken at
+//   the store (the digest) AND #eql? against the key as it is NOW. A key
+//   Array mutated after the store still matched its old digest here, so
+//   `a = [1]; h = {a => 1}; a << 2; h[[1]]` answered 1 where ruby says nil
+//   (until #rehash). Only container keys can change in place.
+and hix_key_now = fn (ci: bool) -> fn (xs: Val list) -> fn (k: Val) ->
+  match k with
+  | VArr _ -> hash_haskey_x ci xs k
+  | VHsh _ -> hash_haskey_x ci xs k
+  | _ -> true
 and hix_has = fn (hid: int) -> fn (ci: bool) -> fn (xs: Val list) -> fn (k: Val) ->
   if hidx_use hid && (if str_eq (hkey_digest k) "" then false else true)
-  then hidx_has hid (hkey_digest k)
+  then hidx_has hid (hkey_digest k) && hix_key_now ci xs k
   else hash_haskey_x ci xs k
 and hix_get = fn (hid: int) -> fn (ci: bool) -> fn (xs: Val list) -> fn (k: Val) ->
   if hidx_use hid && (if str_eq (hkey_digest k) "" then false else true)
-  then (if hidx_has hid (hkey_digest k) then hidx_get hid (hkey_digest k) else VNil)
+  then (if hidx_has hid (hkey_digest k) && hix_key_now ci xs k then hidx_get hid (hkey_digest k) else VNil)
   else (if hash_haskey_x ci xs k then hash_get_x ci xs k else VNil)
 and hput_or_queue = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: Val) -> fn (slow: unit -> Val list) ->
   // ⚠ ASK THE INDEX FIRST. Without this the write still WALKED to find out
@@ -9732,10 +9779,14 @@ and hput_or_queue = fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: V
   then (if hidx_has hid (hkey_digest k)
         // an overwrite goes to the index alone (see hash_stale)
         then (let _ = hput_over hid (hkey_digest k) v in v)
-        else (let _ = hpush_new hid k v in v))
+        else (let _ = hput_new_check hid in let _ = hpush_new hid k v in v))
   else if hash_haskey_x ident (hsettled hid) k || hpending_has hid ident k
   then (let _ = hset hid (slow ()) in v)
-  else (let _ = hpush_new hid k v in v)
+  else (let _ = hput_new_check hid in let _ = hpush_new hid k v in v)
+// a NEW key while the hash is being iterated is ruby's RuntimeError (an
+// existing key may take a new value, and a key may be deleted)
+and hput_new_check = fn (hid: int) ->
+  if hiter_on hid then (let _ = prim_raise "RuntimeError" "can't add a new key into hash during iteration" in ()) else ()
 // ⚠ A KEY WITH ITS OWN #hash NEVER QUEUES. `hash_put_wx` sends exactly those
 // down a protocol path -- it records the hash the key HAD when it was stored,
 // so a key whose #hash changes afterwards stops finding its own entry until
@@ -12084,7 +12135,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              (if hash_haskey_w env world h xs k7 then hash_get_w env world h xs k7
               else (match rest7 with
                     | Cons (d7, _) -> d7
-                    | Nil -> raise_exc world "KeyError" ("key not found: " ++ inspect_w env world k7)))
+                    | Nil -> raise_exc world "KeyError" ("key not found: " ++ key_err_desc (inspect_w env world k7))))
            else VBool (hash_haskey_w env world h xs k7))
         | _ -> VNil)
      | _ -> VNil)
@@ -12113,6 +12164,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   else if (str_len name == 6 && str_eq name "rehash") && (match recv with VHsh _ -> true | _ -> false)
           && (if prim_user_has world recv name then false else true) then
     (match recv with
+     | VHsh hid9 when hiter_on hid9 -> raise_exc world "RuntimeError" "rehash during iteration"
      | VHsh hid9 ->
        // ⚠ ci9 AND hd9 travel as PARAMETERS, not captures: the lambda lifter
        //   drops a capture chosen by name (PAIN.md M10) and the emitted C came
@@ -23745,9 +23797,14 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // Hash#merge/merge!/update with a conflict block.
        else if ((str_len name == 5 && str_eq name "merge") || (str_len name == 6 && str_eq name "merge!") || (str_len name == 6 && str_eq name "update")) && (match recv with VHsh _ -> true | _ -> false) then
          (match recv with
-          | VHsh h -> let merged = hash_merge_block world newblk (hderef h) args in
-            (if (str_len name == 5 && str_eq name "merge") then mkhash merged
-             else (let _ = hash_frz_after_block world recv in let _ = hset h merged in recv))
+          | VHsh h ->
+            (if (str_len name == 5 && str_eq name "merge") then mkhash (hash_merge_block world newblk (hderef h) args)
+             // ⚠ the bang forms take each pair AS THEY GO, as ruby's does: a
+             //   block that freezes the hash, or raises, leaves the pairs
+             //   before it in place (test_update5); while the block runs the
+             //   hash counts as iterated, so rehash in it is refused
+             //   (test_update_modify_in_block).
+             else (let _ = hash_update_each world newblk recv h args in recv))
           | _ -> recv)
        // String#gsub/sub with a block: the block computes each replacement.
        // The bang forms write the result back and answer nil when nothing
@@ -25459,13 +25516,13 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
            | Nil -> (Nil : Val list)
            | Cons (k, t) ->
              Cons ((if hix_has h ci xs k then hix_get h ci xs k
-                    else raise_exc_iv world "KeyError" ("key not found: " ++ inspect k)
+                    else raise_exc_iv world "KeyError" ("key not found: " ++ key_err_desc (inspect k))
                            (Cons (("__key", k), Cons (("__recv", recv), Nil)))), go t)) in
         arr_new (go args))
      | _ -> recv)
   else if (str_len name == 5 && str_eq name "fetch") && (match recv with VHsh _ -> true | VArr _ -> true | _ -> false) then
     (match recv with
-     | VHsh h -> let xs = hderef h in let ci = hcbi_on h in (match args with Cons (k, rest) -> (if hix_has h ci xs k then hix_get h ci xs k else (match rest with Cons (d, _) -> d | Nil -> raise_exc_iv world "KeyError" ("key not found: " ++ inspect k) (Cons (("__key", k), Cons (("__recv", recv), Nil))))) | _ -> VNil)
+     | VHsh h -> let xs = hderef h in let ci = hcbi_on h in (match args with Cons (k, rest) -> (if hix_has h ci xs k then hix_get h ci xs k else (match rest with Cons (d, _) -> d | Nil -> raise_exc_iv world "KeyError" ("key not found: " ++ key_err_desc (inspect k)) (Cons (("__key", k), Cons (("__recv", recv), Nil))))) | _ -> VNil)
      | VArr id -> let ys = deref id in let n = val_list_len ys in (match args with Cons (VInt i, rest) -> let j = (if i < 0 then n + i else i) in (if j >= 0 && j < n then val_nth ys j else (match rest with Cons (d, _) -> d | Nil -> raise_exc world "IndexError" ("index " ++ str_of_int i ++ " outside of array bounds: " ++ str_of_int (0 - n) ++ "..." ++ str_of_int n))) | _ -> VNil)
      | _ -> VNil)
   // Array#min(n) / #max(n): the argument is an integer CONVERSION, and a
@@ -29119,7 +29176,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh hid ->
        (match args with
         | Cons (k, _) when hidx_use hid && (if str_eq (hkey_digest k) "" then false else true) ->
-          (let d = hkey_digest k in if hidx_has hid d then hidx_get hid d else hdflt_get hid)
+          (let d = hkey_digest k in if hidx_has hid d && hix_key_now (hcbi_on hid) (hderef hid) k then hidx_get hid d else hdflt_get hid)
         | _ ->
           let xs = hderef hid in let ci = hcbi_on hid in (match args with Cons (k, _) -> if hash_haskey_x ci xs k then hash_get_x ci xs k else hdflt_get hid | _ -> VNil))
      // Integer#[i]: bit i of the number (0 for out-of-range high bits).
@@ -30672,6 +30729,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // marking a hash changes how it looks keys up, which a frozen hash refuses.
      | VHsh hid -> (if cfrozen_get 1 hid then
                       prim_raise "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+                    else if hiter_on hid then prim_raise "RuntimeError" "compare_by_identity during iteration"
                     // ⚠ compare_by_identity DROPS THE INDEX. Two equal Strings are two keys
                           // under it, and the digest of a String is its CONTENT -- so the
                           // index would answer one where the hash holds two. Found by the
@@ -31843,6 +31901,34 @@ and hash_merge_block = fn world -> fn nb -> fn (base: Val list) -> fn (args: Val
   | Cons (VHsh o, t) -> hash_merge_block world nb (hash_merge_one_block world nb base (hderef o)) t
   | Cons (_, t) -> hash_merge_block world nb base t
 
+// Hash#update / #merge! with a block, one pair at a time into the receiver
+and hash_update_each = fn world -> fn nb -> fn (recv: Val) -> fn (h: int) -> fn (args: Val list) ->
+  match args with
+  | Nil -> ()
+  | Cons (VHsh o, t) ->
+    (let amb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
+     let rec go = fn (xs: Val list) ->
+       (match xs with
+        | Cons (k, Cons (v, rest)) ->
+          (let cur9 = hderef h in
+           let ci9 = hcbi_on h in
+           let had9 = hix_has h ci9 cur9 k in
+           // (counted as iterated only while the block runs: a new key of
+           //  the argument still goes in)
+           let nv = (if had9 then
+                       (let _ = hiter_inc h in
+                        let r9 = try_or_msg (fn (u: unit) -> flow_value (run_block world amb nb (Cons (k, Cons (hix_get h ci9 cur9 k, Cons (v, Nil))))))
+                                   (fn (m: str) -> (let _ = hiter_dec h in fail m)) in
+                        let _ = hiter_dec h in r9)
+                     else v) in
+           let _ = hash_frz_after_block world recv in
+           let k9 = hash_store_key gc_cenv0 world h k in
+           let _ = hput_or_queue_w gc_cenv0 world h (hcbi_on h) k9 nv (fn (u: unit) -> hash_put_wx gc_cenv0 world h (hcbi_on h) (hderef h) k9 nv) in
+           go rest)
+        | _ -> ()) in
+     let _ = go (hderef o) in
+     hash_update_each world nb recv h t)
+  | Cons (_, t) -> hash_update_each world nb recv h t
 and hash_merge_one_block = fn world -> fn nb -> fn (base: Val list) -> fn (other: Val list) ->
   match other with
   | Nil -> base
@@ -32139,6 +32225,10 @@ and rb_fmt_int = fn env -> fn world -> fn (v: Val) ->
 // one has to land on, which is the documented way to write one
 // (`def initialize_clone(other, **kw); super(other); end`). One body, both
 // callers: a second copy for the super path would be a second set of answers.
+// the key a KeyError names, as ruby shortens it (rb_str_ellipsize to 65
+// characters): `fetch("gumby" * 20)` says `key not found: "gumbygumby...`
+and key_err_desc = fn (d: str) ->
+  if utf8_len d > 65 then substring d 0 (utf8_boff d 62 0) ++ "..." else d
 and kernel_copy_hook = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let other9 = (match args with Cons (o9, _) -> o9 | Nil -> VNil) in
@@ -32151,6 +32241,15 @@ and kernel_copy_hook = fn env -> fn world -> fn (recv: Val) -> fn (name: str) ->
     // copying a thing onto ITSELF asks nothing of it -- not even that it be
     // unfrozen, which is why the frozen check comes second.
     (if rb_identical recv other9 then recv
+     // a Hash's is Hash#replace: the argument is made a Hash (to_hash) and
+     // its pairs become the receiver's (test_clear_initialize_copy,
+     // test_bad_initialize_copy)
+     else if (match recv with VHsh _ -> true | _ -> false) then
+       (match (recv, (match other9 with VHsh _ -> other9 | _ -> conv_try env world other9 "to_hash")) with
+        | (VHsh h9, VHsh o9) ->
+          (if val_is_frozen recv then raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
+           else (let _ = hset h9 (hderef o9) in recv))
+        | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into Hash"))
      else if val_is_frozen recv
      then raise_exc world "FrozenError"
             ("can't modify frozen " ++ display_cls_msg world (rcls9 recv) ++ ": " ++ inspect recv)
@@ -34876,10 +34975,14 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // super from a method of a primitive subclass (Array/String/Hash) into the
   // builtin base: use the builtin implementation.
   let hk = hng_key recv in
+  // (the copy hooks are Kernel's, and a subclass's super reaches them too)
+  if (str_len meth == 15 && str_eq meth "initialize_copy") || (str_len meth == 14 && str_eq meth "initialize_dup")
+     || (str_len meth == 16 && str_eq meth "initialize_clone") then
+    kernel_copy_hook gc_cenv0 world recv meth args
   // `super do |k, v| ... end` from a subclass's ITERATOR needs the block to
   // reach the builtin: prim_method has none, so an each/map/... super answered
   // as if no block had been given.
-  if (if str_eq hk "" then false else true) then
+  else if (if str_eq hk "" then false else true) then
     (match recv with
      // ...and the in-place mutations, which prim_method does not do: they
      // rewrite the receiver's store entry, which is the fast path's job, and a
@@ -39377,7 +39480,7 @@ and thread_fetch = fn env -> fn world -> fn blk -> fn (tid: int) -> fn (args: Va
         else if hasblk then flow_value (run_block world blk newblk (Cons (kv, Nil)))
         else (match rest with
               | Cons (d, _) -> d
-              | Nil -> raise_exc world "KeyError" ("key not found: " ++ inspect kv)))
+              | Nil -> raise_exc world "KeyError" ("key not found: " ++ key_err_desc (inspect kv))))
      | Nil -> VNil)
 // the dispatcher's cheap form of thr_is_thread: a started thread carries
 // @__tst, whatever its class
