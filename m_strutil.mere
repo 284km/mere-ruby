@@ -10,6 +10,58 @@ let rec range_chars = fn (lo: int) -> fn (hi: int) ->
 // a codepoint range as UTF-8 characters ("あ-う" spans by codepoint).
 let rec cp_range_chars = fn (lo: int) -> fn (hi: int) ->
   if lo > hi then "" else utf8_enc lo ++ cp_range_chars (lo + 1) hi;
+// ⚠ CUT BY THE RECEIVER'S ENCODING (note 299): these walked UTF-8 whatever the
+//   string was, so an EUC-JP "\xA1\xA1" (one character) squeezed to one byte
+//   and a Shift_JIS range was read as codepoints. The caller names the
+//   encoding (cut_set) around the call and puts UTF-8 back after it;
+//   cut_clen and friends then cut as that encoding does:
+//   1 UTF-8 (as before), 0 one byte per character, 2 by enc_clen.
+let cut_e = vec_new ();
+let _ = vec_push cut_e "UTF-8";
+let cut_k = vec_new ();
+let _ = vec_push cut_k 1;
+let cut_set = fn (e: str) ->
+  let _ = vec_set cut_e 0 e in
+  vec_set cut_k 0 (if enc_utf8_family e then 1 else if enc_multibyte e then 2 else 0);
+let cut_clen = fn (s: str) -> fn (i: int) ->
+  let k = vec_get cut_k 0 in
+  if k == 1 then utf8_clen s i else if k == 0 then 1 else enc_clen s (vec_get cut_e 0) i;
+let cut_char_at = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then "" else substring s i (i + cut_clen s i);
+let rec cut_len_go = fn (s: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= str_len s then n else cut_len_go s (i + cut_clen s i) (n + 1);
+let cut_len = fn (s: str) -> if vec_get cut_k 0 == 1 then utf8_len s else cut_len_go s 0 0;
+let rec cut_char_go = fn (s: str) -> fn (k: int) -> fn (i: int) ->
+  if i >= str_len s then "" else if k <= 0 then cut_char_at s i else cut_char_go s (k - 1) (i + cut_clen s i);
+let cut_char = fn (s: str) -> fn (k: int) -> if vec_get cut_k 0 == 1 then utf8_char s k else cut_char_go s k 0;
+let rec cut_contains_go = fn (set: str) -> fn (c: str) -> fn (i: int) ->
+  if i >= str_len set then false
+  else if str_eq (cut_char_at set i) c then true
+  else cut_contains_go set c (i + cut_clen set i);
+// is c one of set's characters? (a byte search would find the second half of
+// one multibyte character and the first of the next)
+let cut_contains = fn (set: str) -> fn (c: str) ->
+  if vec_get cut_k 0 == 1 then str_contains set c else cut_contains_go set c 0;
+// the character's number for a range: its codepoint in UTF-8, its bytes read
+// big-endian otherwise ("\x83\x7D" is 0x837D in Shift_JIS, as ruby counts)
+let cut_code = fn (s: str) -> fn (i: int) ->
+  if vec_get cut_k 0 == 1 then (match utf8_cp s i with (cp, _) -> cp)
+  else
+    (let l = cut_clen s i in
+     let rec go = fn (j: int) -> fn (acc: int) -> if j >= l then acc else go (j + 1) (acc * 256 + ord (char_at s (i + j))) in
+     go 0 0);
+// a range lo..hi as characters: by codepoint in UTF-8; otherwise every number
+// whose bytes are one whole character of the encoding
+let rec cut_bytes_of = fn (c: int) -> if c < 256 then chr c else cut_bytes_of (c / 256) ++ chr (c - (c / 256) * 256);
+let rec cut_range_go = fn (lo: int) -> fn (hi: int) -> fn b9 ->
+  if lo > hi then ()
+  else
+    (let t = cut_bytes_of lo in
+     let _ = (if lo < 128 || cut_clen t 0 == str_len t then strbuf_push b9 t else ()) in
+     cut_range_go (lo + 1) hi b9);
+let cut_range_chars = fn (lo: int) -> fn (hi: int) ->
+  if vec_get cut_k 0 == 1 then cp_range_chars lo hi
+  else (let b9 = strbuf_new () in let _ = cut_range_go lo hi b9 in strbuf_to_str b9);
 // expand a tr/count set spec ("a-z0-9") into the explicit character list:
 // characters, not bytes; a backslash protects the next character (so "\\-"
 // is a hyphen); a trailing "-" is a literal hyphen.
@@ -17,15 +69,15 @@ let rec str_expand_set = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
   let n = str_len s in
   if i >= n then acc
   else
-    let w = utf8_clen s i in
+    let w = cut_clen s i in
     let c = substring s i (i + w) in
     if str_eq c "\\" && i + w < n then
-      (let w2 = utf8_clen s (i + w) in
+      (let w2 = cut_clen s (i + w) in
        str_expand_set s (i + w + w2) (acc ++ substring s (i + w) (i + w + w2)))
     else if i + w < n && str_eq (char_at s (i + w)) "-" && i + w + 1 < n then
-      (let lo = (match utf8_cp s i with (cp, _) -> cp) in
-       let hi = (match utf8_cp s (i + w + 1) with (cp, _) -> cp) in
-       let w3 = utf8_clen s (i + w + 1) in
+      (let lo = cut_code s i in
+       let hi = cut_code s (i + w + 1) in
+       let w3 = cut_clen s (i + w + 1) in
        if lo > hi then
          (let _ = prim_raise "ArgumentError"
                     ("invalid range \"" ++ substring s i (i + w + 1 + w3) ++ "\" in string transliteration") in "")
@@ -35,7 +87,7 @@ let rec str_expand_set = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
        //   difference shows -- `"123456789".tr("2-23", "xy")` maps 2 to x
        //   under ruby 4 and to y (the second pairing) under 3.2. Membership
        //   cannot tell the two apart, which is why only tr and tr_s moved.
-       else str_expand_set s (i + w + 1 + w3) (acc ++ cp_range_chars lo hi))
+       else str_expand_set s (i + w + 1 + w3) (acc ++ cut_range_chars lo hi))
     else str_expand_set s (i + w) (acc ++ c);
 // The character index of `c` in `set` (-1 if absent). These helpers all used to
 // walk BYTES: `"日本語".tr("日", "X")` replaced each byte of 日 that appeared in
@@ -44,20 +96,20 @@ let rec str_expand_set = fn (s: str) -> fn (i: int) -> fn (acc: str) ->
 // looked wrong until a test used Japanese.
 let rec char_pos_go = fn (set: str) -> fn (c: str) -> fn (i: int) -> fn (k: int) ->
   if i >= str_len set then 0 - 1
-  else if str_eq (utf8_char_at set i) c then k
-  else char_pos_go set c (i + utf8_clen set i) (k + 1);
+  else if str_eq (cut_char_at set i) c then k
+  else char_pos_go set c (i + cut_clen set i) (k + 1);
 // the LAST occurrence: tr's pairing is written left to right and a later
 // pair for the same character WINS (the doubled one-character range above).
 let rec char_pos_r_go = fn (set: str) -> fn (c: str) -> fn (i: int) -> fn (k: int) -> fn (best: int) ->
   if i >= str_len set then best
-  else char_pos_r_go set c (i + utf8_clen set i) (k + 1) (if str_eq (utf8_char_at set i) c then k else best);
+  else char_pos_r_go set c (i + cut_clen set i) (k + 1) (if str_eq (cut_char_at set i) c then k else best);
 let char_pos_r = fn (set: str) -> fn (c: str) -> char_pos_r_go set c 0 0 (0 - 1);
 
 // membership in a single set spec: leading ^ (len>=2) negates; a-z expands.
 let str_set_has = fn (set0: str) -> fn (c: str) ->
   if str_len set0 >= 2 && str_eq (char_at set0 0) "^" then
-    (if str_contains (str_expand_set (substring set0 1 (str_len set0)) 0 "") c then false else true)
-  else str_contains (str_expand_set set0 0 "") c;
+    (if cut_contains (str_expand_set (substring set0 1 (str_len set0)) 0 "") c then false else true)
+  else cut_contains (str_expand_set set0 0 "") c;
 // a char passes when it is in EVERY set (Ruby intersects multiple set args).
 let rec all_sets_has = fn (sets: str list) -> fn (c: str) ->
   match sets with Nil -> true | Cons (h, t) -> if str_set_has h c then all_sets_has t c else false;
@@ -76,6 +128,9 @@ let strip_selectors = fn (args: Val list) ->
 // strip the CHARACTERS (UTF-8 codepoints) every selector admits, from the
 // left (`l`) and/or the right (`r`).
 let str_strip_sel = fn (s: str) -> fn (sels: str list) -> fn (l: bool) -> fn (r: bool) ->
+  // (the selectors are read as UTF-8 here: put the cutting back to it, which
+  //  a tr that raised half way could have left at another encoding)
+  let _ = cut_set "UTF-8" in
   let cps = decode_cps s "UTF-8" 0 in
   let hit = fn (cp: int) -> all_sets_has sels (utf8_enc cp) in
   let rec dropl = fn (xs: int list) -> (match xs with Cons (c, t) -> if hit c then dropl t else xs | Nil -> Nil) in
@@ -89,37 +144,37 @@ let str_tr = fn (s: str) -> fn (from0: str) -> fn (to0: str) ->
   let from = str_expand_set (if neg then substring from0 1 (str_len from0) else from0) 0 "" in
   let to = str_expand_set to0 0 "" in
   let tn = str_len to in
-  let tcn = utf8_len to in
+  let tcn = cut_len to in
   // (into a StrBuf: `acc ++ c` per character copied the result so far --
   // tr, delete and squeeze alike)
   let gb = strbuf_new () in
   let rec go = fn (i: int) ->
     if i >= str_len s then ()
     else
-      let c = utf8_char_at s i in
+      let c = cut_char_at s i in
       let k = char_pos_r from c in
       let hit = if neg then (if k < 0 then true else false) else (if k >= 0 then true else false) in
       let nc = if hit then (if tcn == 0 then ""
-                            else if neg then utf8_char to (tcn - 1)
-                            else if k >= tcn then utf8_char to (tcn - 1)
-                            else utf8_char to k)
+                            else if neg then cut_char to (tcn - 1)
+                            else if k >= tcn then cut_char to (tcn - 1)
+                            else cut_char to k)
                else c in
       let _ = strbuf_push gb nc in
-      go (i + utf8_clen s i) in
+      go (i + cut_clen s i) in
   let _ = go 0 in
   strbuf_to_str gb;
 let str_count_sets = fn (s: str) -> fn (sets: str list) ->
   let rec go = fn (i: int) -> fn (n: int) ->
     if i >= str_len s then n
-    else go (i + utf8_clen s i) (if all_sets_has sets (utf8_char_at s i) then n + 1 else n) in
+    else go (i + cut_clen s i) (if all_sets_has sets (cut_char_at s i) then n + 1 else n) in
   go 0 0;
 let str_delete_sets = fn (s: str) -> fn (sets: str list) ->
   let gb = strbuf_new () in
   let rec go = fn (i: int) ->
     if i >= str_len s then ()
-    else let c = utf8_char_at s i in
+    else let c = cut_char_at s i in
          let _ = (if all_sets_has sets c then () else strbuf_push gb c) in
-         go (i + utf8_clen s i) in
+         go (i + cut_clen s i) in
   let _ = go 0 in
   strbuf_to_str gb;
 // collapse runs of the same character (optionally only those in `set`).
@@ -128,8 +183,8 @@ let str_squeeze = fn (s: str) -> fn (set0: str) -> fn (use_set: bool) ->
   let rec go = fn (i: int) -> fn (prev: str) ->
     if i >= str_len s then ()
     else
-      let c = utf8_char_at s i in
-      let w = utf8_clen s i in
+      let c = cut_char_at s i in
+      let w = cut_clen s i in
       if str_eq c prev && (if use_set then str_set_has set0 c else true) then go (i + w) c
       else (let _ = strbuf_push gb c in go (i + w) c) in
   let _ = go 0 "" in
@@ -141,8 +196,8 @@ let str_squeeze_sets = fn (s: str) -> fn (sets: str list) ->
   let rec go = fn (i: int) -> fn (prev: str) ->
     if i >= str_len s then ()
     else
-      let c = utf8_char_at s i in
-      let w = utf8_clen s i in
+      let c = cut_char_at s i in
+      let w = cut_clen s i in
       if str_eq c prev && all_sets_has sets c then go (i + w) c
       else (let _ = strbuf_push gb c in go (i + w) c) in
   let _ = go 0 "" in
@@ -154,18 +209,18 @@ let str_tr_s = fn (s: str) -> fn (from0: str) -> fn (to0: str) ->
   let neg = str_len from0 >= 2 && str_eq (char_at from0 0) "^" in
   let from = str_expand_set (if neg then substring from0 1 (str_len from0) else from0) 0 "" in
   let to = str_expand_set to0 0 "" in
-  let tcn = utf8_len to in
+  let tcn = cut_len to in
   let rec go = fn (i: int) -> fn (prev: str) -> fn (prev_tr: bool) -> fn (acc: str) ->
     if i >= str_len s then acc
     else
-      let c = utf8_char_at s i in
-      let w = utf8_clen s i in
+      let c = cut_char_at s i in
+      let w = cut_clen s i in
       let k = char_pos_r from c in
       let hit = (if neg then k < 0 else k >= 0) in
       let nc = (if hit then (if tcn == 0 then ""
-                             else if neg then utf8_char to (tcn - 1)
-                             else if k >= tcn then utf8_char to (tcn - 1)
-                             else utf8_char to k)
+                             else if neg then cut_char to (tcn - 1)
+                             else if k >= tcn then cut_char to (tcn - 1)
+                             else cut_char to k)
                 else c) in
       if hit && prev_tr && str_eq nc prev then go (i + w) prev true acc
       else go (i + w) nc hit (acc ++ nc) in
@@ -647,6 +702,94 @@ let rec str_rindex_go = fn (s: str) -> fn (sub: str) -> fn (i: int) ->
   if i < 0 then 0 - 1
   else if str_eq (substring s i (i + str_len sub)) sub then i
   else str_rindex_go s sub (i - 1);
+
+// ---- characters by the string's own encoding (note 299) --------------------
+// Every character position was counted as UTF-8 (utf8_len / utf8_boff /
+// utf8_cidx) whatever the string's encoding, so in an EUC-JP or Shift_JIS
+// string `index` answered byte offsets, `reverse` reversed bytes and a search
+// could match half of a character. How a string of encoding e is cut:
+//   0  one byte per character (US-ASCII, BINARY, the single-byte tables)
+//   1  UTF-8, by the utf8_* walkers as before (and their ASCII shortcuts)
+//   2  another multibyte encoding, by enc_clen (ruby's mbclen)
+let enc_cut = fn (e: str) ->
+  if enc_utf8_family e then 1 else if enc_multibyte e then 2 else 0;
+let rec es_len_go = fn (s: str) -> fn (e: str) -> fn (i: int) -> fn (n: int) ->
+  if i >= str_len s then n else es_len_go s e (i + enc_clen s e i) (n + 1);
+// the number of characters
+let es_len = fn (s: str) -> fn (e: str) ->
+  let k = enc_cut e in
+  if k == 1 then utf8_len s else if k == 0 then str_len s else es_len_go s e 0 0;
+// the byte offset of character c (clamped to the end)
+let es_boff = fn (s: str) -> fn (e: str) -> fn (c: int) ->
+  let k = enc_cut e in
+  if k == 1 then utf8_boff s c 0
+  else if k == 0 then (if c < 0 then 0 else if c > str_len s then str_len s else c)
+  else enc_boff s e c 0;
+// how many characters begin before byte b
+let rec es_cidx_go = fn (s: str) -> fn (e: str) -> fn (b: int) -> fn (i: int) -> fn (n: int) ->
+  if i >= b || i >= str_len s then n else es_cidx_go s e b (i + enc_clen s e i) (n + 1);
+let es_cidx = fn (s: str) -> fn (e: str) -> fn (b: int) ->
+  let k = enc_cut e in
+  if k == 1 then utf8_cidx s b
+  else if k == 0 then (if b < 0 then 0 else if b > str_len s then str_len s else b)
+  else es_cidx_go s e b 0 0;
+// does a character of s begin at byte b? (the end counts)
+let rec es_head_go = fn (s: str) -> fn (e: str) -> fn (b: int) -> fn (i: int) ->
+  if i >= b then i == b else es_head_go s e b (i + enc_clen s e i);
+let es_head = fn (s: str) -> fn (e: str) -> fn (b: int) ->
+  if enc_cut e == 2 then es_head_go s e b 0 else true;
+// the first occurrence of pat at or after byte `from` that BEGINS a character,
+// or -1 -- and none at all when pat is not a valid string of e: ruby's
+// rb_str_index refuses a broken pattern ("\xA1" alone is half of an EUC-JP
+// character, and `"\xA1\xA1".include?("\xA1")` is false). For UTF-8 and the
+// one-byte encodings this is the plain search it always was.
+let rec es_find_go = fn (s: str) -> fn (pat: str) -> fn (e: str) -> fn (pos: int) -> fn (w: int) ->
+  let k = str_find_from s pat pos in
+  if k < 0 then 0 - 1
+  else
+    (let rec adv = fn (x: int) -> if x >= k || x >= str_len s then x else adv (x + enc_clen s e x) in
+     let w2 = adv w in
+     if w2 == k then k else es_find_go s pat e w2 w2);
+let es_find = fn (s: str) -> fn (pat: str) -> fn (e: str) -> fn (from: int) ->
+  if enc_cut e == 2 then (if enc_valid pat e then es_find_go s pat e from 0 else 0 - 1)
+  else str_find_from s pat from;
+// the last occurrence beginning at or before byte `from`, on a character head
+let rec es_rfind_go = fn (s: str) -> fn (pat: str) -> fn (e: str) -> fn (from: int) -> fn (i: int) -> fn (best: int) ->
+  if i > from || i > str_len s - str_len pat then best
+  else
+    (let best2 = (if str_eq (substring s i (i + str_len pat)) pat then i else best) in
+     if i >= str_len s then best2 else es_rfind_go s pat e from (i + enc_clen s e i) best2);
+let es_rfind = fn (s: str) -> fn (pat: str) -> fn (e: str) -> fn (from: int) ->
+  if enc_cut e == 2 then (if enc_valid pat e then es_rfind_go s pat e from 0 (0 - 1) else 0 - 1)
+  else str_rindex_go s pat from;
+// the characters reversed
+let rec es_rev_go = fn (s: str) -> fn (e: str) -> fn (i: int) -> fn (acc: str list) ->
+  if i >= str_len s then acc else (let l = enc_clen s e i in es_rev_go s e (i + l) (Cons (substring s i (i + l), acc)));
+// the padding family for a string cut by its encoding (str_ljust & co. count
+// UTF-8 characters): widths in characters of e, the pad cut likewise
+let es_pad_to = fn (pad: str) -> fn (e: str) -> fn (k: int) ->
+  let pn = es_len pad e in
+  if k <= 0 || pn == 0 then ""
+  else
+    (let b9 = strbuf_new () in
+     let rec go9 = fn (r: int) ->
+       (if r >= pn then (let _ = strbuf_push b9 pad in go9 (r - pn))
+        else if r > 0 then strbuf_push b9 (substring pad 0 (es_boff pad e r))
+        else ()) in
+     let _ = go9 k in
+     strbuf_to_str b9);
+let es_justify = fn (how: str) -> fn (s: str) -> fn (e: str) -> fn (w: int) -> fn (pad: str) ->
+  let n = es_len s e in
+  if n >= w || str_len pad == 0 then s
+  else if str_eq how "l" then s ++ es_pad_to pad e (w - n)
+  else if str_eq how "r" then es_pad_to pad e (w - n) ++ s
+  else (let total = w - n in let left = total / 2 in
+        es_pad_to pad e left ++ s ++ es_pad_to pad e (total - left));
+let es_reverse = fn (s: str) -> fn (e: str) ->
+  let b9 = strbuf_new () in
+  let rec put9 = fn (xs: str list) -> (match xs with Nil -> () | Cons (x9, t9) -> (let _ = strbuf_push b9 x9 in put9 t9)) in
+  let _ = put9 (es_rev_go s e 0 Nil) in
+  strbuf_to_str b9;
 
 // the source file's magic comment ("# -*- encoding: us-ascii -*-",
 // "# coding: utf-8"): the upcased encoding name, or "" if none. Scans the
