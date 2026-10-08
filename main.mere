@@ -463,6 +463,25 @@ let _ = vec_push gc_knob 0;
 let _ = vec_push gc_knob 0;
 let _ = vec_push gc_knob (0 - 1);
 let _ = vec_push gc_knob 0;
+// THE SLOTS A SWEEP HAS TO LOOK AT. A string or hash handle is never reused,
+// so a slot the sweep found dead and blanked stays dead: the next sweep needs
+// only the slots the last one KEPT and the ones issued since. Walking every
+// slot ever issued made each collection as long as the run so far --
+// test_integer_comb spent 70% of its time in that walk and its 41 tests ran
+// into the 600 s wall.
+//   8 / 9 the str_store / hash_store length at the last sweep
+//   10 / 11 how many of gc_str_surv / gc_hash_surv are this sweep's
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 0;
+let _ = vec_push gc_knob 0;
+let gc_str_surv = vec_new ();
+let _ = vec_push gc_str_surv 0;
+let gc_hash_surv = vec_new ();
+let _ = vec_push gc_hash_surv 0;
+// write the k-th survivor (a slot past the end is pushed)
+let gc_surv_put = fn v -> fn (k: int) -> fn (x: int) ->
+  if k < vec_len v then vec_set v k x else vec_push v x;
 let gc_unsafe_push = fn (u: unit) -> vec_set gc_knob 7 (vec_get gc_knob 7 + 1);
 let gc_unsafe_pop = fn (u: unit) ->
   let n = vec_get gc_knob 7 in
@@ -482,10 +501,6 @@ let gc_body_tick = fn (u: unit) ->
   let n = (if map_has gc_tick 0 then map_get gc_tick 0 else 0) in
   if n <= 0 then (let _ = map_set gc_tick 0 31 in true)
   else (let _ = map_set gc_tick 0 (n - 1) in false);
-let gc_bytes_due = fn (u: unit) ->
-  let n = (if map_has gc_tick 2 then map_get gc_tick 2 else 0) in
-  if n <= 0 then (let _ = map_set gc_tick 2 15 in true)
-  else (let _ = map_set gc_tick 2 (n - 1) in false);
 // MERE_RUBY_GC_STRESS=N (read once, by run_src): collect off the stack at
 // every Nth safepoint gc_point is asked at, pressure or not -- the way to make
 // a corpus program meet a collection in the middle of every kind of body, and
@@ -551,10 +566,10 @@ let gc_pressure = fn world ->
   // and up) that no store's byte count sees: a loop that makes a lambda per
   // turn and nothing else ran 80k turns without one collection (note 272)
   || map_len lv_cap > vec_get gc_knob 3
-  // the byte axis measures a dozen arenas, so it is asked one time in 16
-  // (gc_tick 2) -- it was the costliest test of a statement boundary, and
-  // sixteen statements late is well inside the slack of a 32 MB threshold
-  || (gc_bytes_due () && gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432));
+  // ...and the byte axis last: it measures a dozen arenas. (Asking it one
+  //   time in 16 let a bignum-heavy test file collect later and peak past
+  //   the 6 GB guard, so it is asked every time again.)
+  || gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432);
 
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
@@ -1246,16 +1261,24 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_ih arr_vc_ver dAK in
     let _ = gc_drop_ih arr_vc_len dAK in
     let _ = (if nc then () else map_compact arr_store) in
-    let rec blank_h = fn (i: int) ->
-      if i >= vec_len hash_store then ()
+    // (the last sweep's survivors and the slots issued since -- see gc_hash_surv;
+    //  the survivors are rewritten in place, never past the one being read)
+    let blank_h1 = fn (i: int) -> fn (k: int) ->
+      let h9 = handle_base + i in
+      if map_has live (h9 * 8 + 3) then (let _ = gc_surv_put gc_hash_surv k i in k + 1)
       else
-        let h9 = handle_base + i in
-        let _ = (if map_has live (h9 * 8 + 3) then ()
-                 else (match hderef h9 with
-                       | Nil -> ()
-                       | _ -> (let _ = hset h9 (Nil : Val list) in ()))) in
-        blank_h (i + 1) in
-    let _ = blank_h 0 in
+        (let _ = (match hderef h9 with
+                  | Nil -> ()
+                  | _ -> (let _ = hset h9 (Nil : Val list) in ())) in
+         k) in
+    let hold = vec_get gc_knob 11 in
+    let rec blank_ho = fn (j: int) -> fn (k: int) ->
+      if j >= hold then k else blank_ho (j + 1) (blank_h1 (vec_get gc_hash_surv j) k) in
+    let rec blank_hn = fn (i: int) -> fn (k: int) ->
+      if i >= vec_len hash_store then k else blank_hn (i + 1) (blank_h1 i k) in
+    let hk = blank_hn (vec_get gc_knob 9) (blank_ho 0 0) in
+    let _ = vec_set gc_knob 11 hk in
+    let _ = vec_set gc_knob 9 (vec_len hash_store) in
     // ⚠ and the pairs queued for a hash but not yet folded in -- as reachable
     // as the hash itself (gc_mark_val folds them in through hderef before
     // marking), and a dead hash's queue goes with it.
@@ -1293,14 +1316,19 @@ let gc_collect = fn env -> fn world ->
     let _ = map_clear str_pch in
     let _ = (if nc then () else map_compact str_pch) in
     let _ = (if nc then () else map_compact str_pend) in
-    let rec blank_s = fn (i: int) ->
-      if i >= vec_len str_store then ()
-      else
-        let s9 = handle_base + i in
-        let _ = (if map_has live (s9 * 8 + 1) then ()
-                 else (if str_eq (sget s9) "" then () else sset s9 "")) in
-        blank_s (i + 1) in
-    let _ = blank_s 0 in
+    // (as for the hashes above: the last sweep's survivors, then the new slots)
+    let blank_s1 = fn (i: int) -> fn (k: int) ->
+      let s9 = handle_base + i in
+      if map_has live (s9 * 8 + 1) then (let _ = gc_surv_put gc_str_surv k i in k + 1)
+      else (let _ = (if str_eq (sget s9) "" then () else sset s9 "") in k) in
+    let sold = vec_get gc_knob 10 in
+    let rec blank_so = fn (j: int) -> fn (k: int) ->
+      if j >= sold then k else blank_so (j + 1) (blank_s1 (vec_get gc_str_surv j) k) in
+    let rec blank_sn = fn (i: int) -> fn (k: int) ->
+      if i >= vec_len str_store then k else blank_sn (i + 1) (blank_s1 i k) in
+    let sk = blank_sn (vec_get gc_knob 8) (blank_so 0 0) in
+    let _ = vec_set gc_knob 10 sk in
+    let _ = vec_set gc_knob 8 (vec_len str_store) in
     let _ = (if nc then () else vec_compact str_store) in
     let dE = vec_new () in
     let _ = map_iter str_enc (fn (k: int) -> fn (v: str) ->
