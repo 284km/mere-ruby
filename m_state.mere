@@ -1003,13 +1003,25 @@ let str_enc = map_new ();
 // string, nearly all of them "UTF-8". A string that is already tagged is a
 // different matter: setting UTF-8 there is a real change, and has to remove the
 // tag rather than skip the write.
+// ⚠ AN INDEX, NOT THE NAME. A str value is copied into the map's arena on
+// every write, and the arena is given back only by a compaction -- which does
+// not run while a call is in progress. 3 million `i.to_s` (each tagged
+// US-ASCII) left 268 MB in this map for 11 live entries (note 301). The
+// names live once in enc_names; the map holds small ints.
+let enc_names = vec_new ();
+let enc_name_ix = map_new ();
+let enc_ix_of = fn (nm: str) ->
+  if map_has enc_name_ix nm then map_get enc_name_ix nm
+  else (let i = vec_len enc_names in
+        let _ = vec_push enc_names nm in
+        let _ = map_set enc_name_ix nm i in i);
 let senc_set = fn (id: int) -> fn (nm: str) ->
   if str_eq nm "UTF-8"
   then (if map_has str_enc id
         then (let _ = map_delete str_enc id in ())
         else ())
-  else (let _ = map_set str_enc id nm in ());
-let senc_get = fn (id: int) -> if map_has str_enc id then map_get str_enc id else "UTF-8";
+  else (let _ = map_set str_enc id (enc_ix_of nm) in ());
+let senc_get = fn (id: int) -> if map_has str_enc id then vec_get enc_names (map_get str_enc id) else "UTF-8";
 // A new String that carries a GIVEN encoding. Every string derived from a
 // subject must wear the subject's encoding, not the default: a MatchData over
 // an EUC-JP string answered UTF-8 for #[0] / #pre_match / $& / $1, because the
@@ -1020,12 +1032,16 @@ let mkstr_e = fn (s: str) -> fn (enc: str) ->
 // frozen-string tracking + CLI frozen-string-literal mode + __FILE__ path.
 let str_frozen = map_new ();
 let str_chilled = map_new ();
-let sfrozen_set = fn (id: int) -> let _ = map_set str_frozen id "1" in ();
+// (ints, by handle: a str value or a str_of_int key is an arena copy per
+//  write, and every literal evaluated is a write -- see senc_set)
+let sfrozen_set = fn (id: int) -> let _ = map_set str_frozen id 1 in ();
 // CHILLED (ruby 3.4): a literal from a file with no frozen_string_literal
 // comment. Not frozen -- #frozen? is false and it can be mutated -- but `+str`
 // answers a copy, which is the whole observable difference.
-let schilled_set = fn (id: int) -> let _ = map_set str_chilled (str_of_int id) "1" in ();
-let schilled_get = fn (id: int) -> map_has str_chilled (str_of_int id);
+// 1 a literal, 2 a Symbol#to_s (whose symbol is in str_chilled_sym)
+let str_chilled_sym = map_new ();
+let schilled_set = fn (id: int) -> let _ = map_set str_chilled id 1 in ();
+let schilled_get = fn (id: int) -> map_has str_chilled id;
 // --debug / --debug=frozen-string-literal: where each string LITERAL was
 // made ("file:line", by string id), which FrozenError's message and the
 // chilled-string warning then name ("created at", "the string was created
@@ -1224,6 +1240,16 @@ let str_fstring = fn (v: Val) ->
                 else ()) in
        let _ = map_set str_intern_tbl k cv in cv)
   | _ -> v;
+// a frozen LITERAL's fstring, from its text: the table is asked first, so a
+// literal evaluated again costs no string at all. Interning a fresh copy and
+// dropping it made one dead String slot per evaluation -- 3 million for
+// `3_000_000.times { x = "ab" }` under frozen_string_literal (note 301).
+let str_fstring_text = fn (s: str) ->
+  let k = "UTF-8" ++ chr 1 ++ s in
+  if map_has str_intern_tbl k then map_get str_intern_tbl k
+  else (match mkstr s with
+        | VStr id -> (let _ = sfrozen_set id in str_fstring (VStr id))
+        | v -> v);
 let enc_ascii_compat = fn (nm: str) ->
   if enc_is_dummy nm then false
   else if str_len nm >= 6 && (str_eq (substring nm 0 6) "UTF-16" || str_eq (substring nm 0 6) "UTF-32") then false
@@ -3215,6 +3241,20 @@ let raise_bt = map_new ();
 // (class, name) resolved to -- see builtin_frame_label in main.mere
 let bi_owner_set = map_new ();
 let bi_owner_memo = map_new ();
+// ⚠ INTS, NOT THE NAME AND THE VALUE (note 301). Every builtin call writes
+//   these, and a write of a str or a Val copies it into the map's arena --
+//   which a running builtin (`n.times { }`) pins, so no collection inside it
+//   can compact the copies away: 3 million `i.to_s` doubled both to 134 MB.
+//   bi_reg_n holds the name's index in bi_names (one entry per distinct
+//   name); bi_reg_r holds the receiver as kind / handle-or-int / name index,
+//   which is what its class needs (bi_reg_recv rebuilds a stand-in).
+let bi_names = vec_new ();
+let bi_name_ix = map_new ();
+let bi_nix = fn (n: str) ->
+  if map_has bi_name_ix n then map_get bi_name_ix n
+  else (let i = vec_len bi_names in
+        let _ = vec_push bi_names n in
+        let _ = map_set bi_name_ix n i in i);
 let bi_reg_n = map_new ();
 let _ = map_compact bi_reg_n;  // (its own arena: gc_churn_bytes, note 270)
 let bi_reg_r = map_new ();
@@ -3250,44 +3290,41 @@ let gc_churn_compact = fn (u: unit) ->
 //   and a collection inside that builtin compacts bi_reg_n (gc_churn_compact),
 //   which frees the arena the map_get answer pointed into. ASan on the
 //   nothreads tree (GC.start inside a call) read it after the free.
+let bi_reg_recv = fn (u: unit) ->
+  if map_has bi_reg_r 0 then
+    (let k = map_get bi_reg_r 0 in
+     let p = (if map_has bi_reg_r 1 then map_get bi_reg_r 1 else 0) in
+     let nm = (fn (u2: unit) -> (if map_has bi_reg_r 2 then (let n9 = vec_get bi_names (map_get bi_reg_r 2) in substring n9 0 (str_len n9)) else "")) in
+     if k == 1 then VInt p else if k == 2 then VStr p else if k == 3 then VArr p
+     else if k == 4 then VHsh p else if k == 5 then VObj p else if k == 7 then VBool (p == 1)
+     else if k == 8 then VSym (nm ()) else if k == 9 then VClass (nm ()) else if k == 10 then VExc (nm (), "")
+     else if k == 11 then VBig "1" else if k == 12 then VRat ("0", "1") else if k == 13 then VFlt 0.0
+     else if k == 14 then VCpx (VInt 0, VInt 0) else if k == 15 then VRange (VInt 0, VInt 0, false)
+     else if k == 16 then VProc p else if k == 17 then VBind p else if k == 18 then VRegex ("", "", "")
+     else if k == 19 then VMain else VNil)
+  else VNil;
+// ⚠ the name is a COPY: the caller holds it across the builtin it brackets,
+//   and a collection inside that builtin may move what it was read from.
 let bi_reg_get = fn (u: unit) ->
-  (if map_has bi_reg_n 0 then (let n9 = map_get bi_reg_n 0 in substring n9 0 (str_len n9)) else "",
-   if map_has bi_reg_r 0 then map_get bi_reg_r 0 else VNil,
+  (if map_has bi_reg_n 0 then (let n9 = vec_get bi_names (map_get bi_reg_n 0) in substring n9 0 (str_len n9)) else "",
+   bi_reg_recv (),
    if map_has struct_ctr "bd" then map_get struct_ctr "bd" else (0 - 1));
-// ⚠ what is kept of the receiver is only what its CLASS needs (the one
-//   reader, builtin_frame_label, asks dispatch_cls_of): writing the value
-//   into the map copies it into the map's arena, and every builtin call
-//   writes it, so the copies a slot overwrite leaves behind pile up -- a
-//   long exception message (a test/unit failure) or a big Integer's digits
-//   per call. `e.message` 100k times on a 2 KB message took 1 GB. A stand-in
-//   of the same class, with nothing of unbounded size in it, is kept instead.
-let bi_light = fn (r: Val) ->
-  match r with
-  | VExc (c, _) -> VExc (c, "")
-  | VBig _ -> VBig "1"
-  | VRat (_, _) -> VRat ("0", "1")
-  | other -> other;
-// ...and the receiver is written only when it changes (the name already was,
-// map_set_si): a write copies into the map's arena and the copy it replaces
-// stays there, once per builtin call -- 81 MB of test_subclass_gc's default
-// region (note 270)
-let bi_same = fn (a: Val) -> fn (b: Val) ->
-  match a with
-  | VInt x -> (match b with VInt y -> x == y | _ -> false)
-  | VStr x -> (match b with VStr y -> x == y | _ -> false)
-  | VArr x -> (match b with VArr y -> x == y | _ -> false)
-  | VHsh x -> (match b with VHsh y -> x == y | _ -> false)
-  | VObj x -> (match b with VObj y -> x == y | _ -> false)
-  | VSym x -> (match b with VSym y -> str_eq x y | _ -> false)
-  | VClass x -> (match b with VClass y -> str_eq x y | _ -> false)
-  | VExc (x, _) -> (match b with VExc (y, _) -> str_eq x y | _ -> false)
-  | VNil -> (match b with VNil -> true | _ -> false)
-  | VBool x -> (match b with VBool y -> x == y | _ -> false)
-  | _ -> false;
+// the receiver as (kind, handle or int, name index) -- what its class needs:
+// a stand-in of the same class for anything that carries more (an
+// exception's message, a big Integer's digits, a Range's bounds)
 let bi_reg_set = fn (n: str) -> fn (r: Val) -> fn (d: int) ->
-  let _ = map_set_si bi_reg_n 0 n in
-  let lr = bi_light r in
-  let _ = (if map_has bi_reg_r 0 && bi_same (map_get bi_reg_r 0) lr then () else map_set bi_reg_r 0 lr) in
+  let _ = map_set bi_reg_n 0 (bi_nix n) in
+  let (k, p, ni) = (match r with
+                    | VInt x -> (1, x, 0 - 1) | VStr h -> (2, h, 0 - 1) | VArr h -> (3, h, 0 - 1)
+                    | VHsh h -> (4, h, 0 - 1) | VObj h -> (5, h, 0 - 1) | VNil -> (6, 0, 0 - 1)
+                    | VBool b -> (7, (if b then 1 else 0), 0 - 1)
+                    | VSym x -> (8, 0, bi_nix x) | VClass c -> (9, 0, bi_nix c) | VExc (c, _) -> (10, 0, bi_nix c)
+                    | VBig _ -> (11, 0, 0 - 1) | VRat (_, _) -> (12, 0, 0 - 1) | VFlt _ -> (13, 0, 0 - 1)
+                    | VCpx (_, _) -> (14, 0, 0 - 1) | VRange (_, _, _) -> (15, 0, 0 - 1) | VProc h -> (16, h, 0 - 1)
+                    | VBind h -> (17, h, 0 - 1) | VRegex (_, _, _) -> (18, 0, 0 - 1) | VMain -> (19, 0, 0 - 1)) in
+  let _ = map_set bi_reg_r 0 k in
+  let _ = map_set bi_reg_r 1 p in
+  let _ = (if ni >= 0 then map_set bi_reg_r 2 ni else (if map_has bi_reg_r 2 then map_delete bi_reg_r 2 else ())) in
   map_set struct_ctr "bd" d;
 // a rescue ends whatever builtin raised at or above its own depth; a later
 // raise at this depth is the program's, not that builtin's
@@ -3305,10 +3342,20 @@ let bi_rescued = fn (u: unit) ->
 // stale site for a later one. Without it that exception had no backtrace at
 // all: `begin; 1.nope; rescue => e; e.backtrace; end` was nil.
 let prim_nm_set = fn (v: Val) ->
+  // (a failure that cannot say what it was called on leaves no receiver of
+  //  an earlier one behind for pending_exc to pair with this name)
+  let _ = (if map_has prim_missing "rvv" then map_delete prim_missing "rvv" else ()) in
+  let _ = (if map_has prim_missing "av" then map_delete prim_missing "av" else ()) in
   let _ = map_set prim_missing "n" v in
   let _ = map_set prim_missing "nl" (VInt (cur_line ())) in
   let _ = map_set prim_missing "nd" (VInt (cd_get ())) in
   map_set prim_missing "nf" (mkstr (cur_file ()));
+// ...and one that can: what the call was made on and with, for the
+// NoMethodError's #receiver and #args
+let prim_nm_set_ra = fn (recv: Val) -> fn (args: Val list) -> fn (v: Val) ->
+  let _ = prim_nm_set v in
+  let _ = map_set prim_missing "rvv" recv in
+  map_set prim_missing "av" (arr_new args);
 let note_raise_site = fn (u: unit) ->
   // the builtin that was running when this raise happened, if it was running
   // at the depth the raise happened at (a Ruby method it called is deeper)

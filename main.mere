@@ -475,6 +475,8 @@ let _ = vec_push gc_knob 0;
 let _ = vec_push gc_knob 0;
 let _ = vec_push gc_knob 0;
 let _ = vec_push gc_knob 0;
+//   12 the bytes of the dead string slots inside knob 1's baseline (below)
+let _ = vec_push gc_knob 0;
 let gc_str_surv = vec_new ();
 let _ = vec_push gc_str_surv 0;
 let gc_hash_surv = vec_new ();
@@ -537,8 +539,17 @@ let rec gc_args_simple = fn (es: Expr list) ->
 // rather than a lie: this feeds a pressure threshold, and a target with no arena
 // has no arena bytes to be under pressure from. The entry-count axis still
 // works, so collection still happens -- see gc_should_run, which ORs the two.
+// the top-level env, which every top-level assignment writes: a map that lived
+// in the default region, so each write's old copy stayed there (192 MB for
+// 3 million `s = i.to_s`). It has an arena of its own (run_src) and the
+// collector compacts it here like the other tables a statement rewrites.
+let top_env_reg = map_new ();
+// (counted with the stores: a top-level loop that assigns a variable and
+// makes nothing else -- `3_000_000.times { |i| x = i + 1 }` -- grew this arena
+// to 290 MB and never asked for a collection, note 301)
 let gc_store_bytes = fn (u: unit) ->
   if arena_measurable then vec_bytes str_store + map_bytes str_pch + map_bytes arr_store + vec_bytes hash_store + gc_churn_bytes ()
+                           + (if map_has top_env_reg 0 then map_bytes (map_get top_env_reg 0) else 0)
   else 0;
 
 // Pressure is INCREMENTAL on both axes. Entries: the amortized threshold in
@@ -569,7 +580,8 @@ let gc_pressure = fn world ->
   // ...and the byte axis last: it measures a dozen arenas. (Asking it one
   //   time in 16 let a bignum-heavy test file collect later and peak past
   //   the 6 GB guard, so it is asked every time again.)
-  || gc_store_bytes () > (if tight then bbase + 8388608 else bbase * 2 + 33554432);
+  || gc_store_bytes () > (if tight then bbase + 8388608
+                          else bbase + (let st9 = vec_get gc_knob 12 in if st9 < bbase then bbase - st9 else 0) + 33554432);
 
 
 // nth suffix of a list -- the driver's cursor walks the top-level statement
@@ -838,7 +850,7 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter flow_sig mk in
   // the receiver of the builtin running now (bi_reg_r, one slot): it is
   // asked for its class when a refusal names the builtin
-  let _ = map_iter bi_reg_r (fn (k: int) -> fn (v: Val) -> gc_mark_val live v) in
+  let _ = gc_mark_val live (bi_reg_recv ()) in
   let _ = map_iter cli_argv mk in
   let _ = map_iter all_thr mk in
   let _ = map_iter at_exits mk in
@@ -1181,7 +1193,9 @@ let gc_collect = fn env -> fn world ->
     let _ = map_set gc_state "n" ((if map_has gc_state "n" then map_get gc_state "n" else 0) + 1) in
     let _ = vec_set gc_knob 5 0 in
     let t0 = int_of_float (time () * 1000000000.0) in
-    let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)) else ()) in
+    let _ = (if gclog then print_err ("gc: BEGIN ivars=" ++ str_of_int (map_len ivars) ++ " arr=" ++ str_of_int (map_len arr_store) ++ " str=" ++ str_of_int (vec_len str_store)
+                                 ++ " bytes=" ++ str_of_int (gc_store_bytes ()) ++ " base=" ++ str_of_int (vec_get gc_knob 1)
+                                 ++ " stub=" ++ str_of_int (vec_get gc_knob 12)) else ()) in
     let live = map_new () in
     let _ = gc_mark_roots env live in
     let _ = gc_fixpoint ivars live in
@@ -1349,12 +1363,12 @@ let gc_collect = fn env -> fn world ->
     let _ = vec_set gc_knob 8 (vec_len str_store) in
     let _ = (if nc then () else vec_compact str_store) in
     let dE = vec_new () in
-    let _ = map_iter str_enc (fn (k: int) -> fn (v: str) ->
+    let _ = map_iter str_enc (fn (k: int) -> fn (v: int) ->
       if map_has live (k * 8 + 1) then () else vec_push dE k) in
     let _ = gc_drop_i str_enc dE in
     let _ = (if nc then () else map_compact str_enc) in
     let dF = vec_new () in
-    let _ = map_iter str_frozen (fn (k: int) -> fn (v: str) ->
+    let _ = map_iter str_frozen (fn (k: int) -> fn (v: int) ->
       if map_has live (k * 8 + 1) then () else vec_push dF k) in
     let _ = gc_drop_i str_frozen dF in
     let _ = (if nc then () else map_compact str_frozen) in
@@ -1362,9 +1376,13 @@ let gc_collect = fn env -> fn world ->
     // dead string's mark would otherwise outlive it -- one per literal
     // evaluated and per Symbol#to_s, kept forever.
     let dC = vec_new () in
-    let _ = map_iter str_chilled (fn (k: str) -> fn (v: str) ->
-      if map_has live (int_of_str k * 8 + 1) then () else vec_push dC k) in
-    let _ = gc_drop_s str_chilled dC in
+    let _ = map_iter str_chilled (fn (k: int) -> fn (v: int) ->
+      if map_has live (k * 8 + 1) then () else vec_push dC k) in
+    let _ = gc_drop_i str_chilled dC in
+    let dCS = vec_new () in
+    let _ = map_iter str_chilled_sym (fn (k: int) -> fn (v: str) ->
+      if map_has live (k * 8 + 1) then () else vec_push dCS k) in
+    let _ = gc_drop_i str_chilled_sym dCS in
     let _ = (if nc then () else map_compact str_chilled) in
     // The call-bookkeeping maps: one write per name/file/meth/line PER CALL
     // and a live_frames set+delete per frame, all keyed by depth (or a fixed
@@ -1392,7 +1410,16 @@ let gc_collect = fn env -> fn world ->
     // gc_churn_bytes): their entries are all kept, the copies the writes
     // replaced go back with the old arena
     let _ = (if nc then () else gc_churn_compact ()) in
-    let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len ivars)) else ()) in
+    let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len ivars)
+                                     ++ " str_store=" ++ str_of_int (vec_bytes str_store) ++ " str_pch=" ++ str_of_int (map_bytes str_pch)
+                                     ++ " arr_store=" ++ str_of_int (map_bytes arr_store) ++ " hash_store=" ++ str_of_int (vec_bytes hash_store)
+                                     ++ " churn=" ++ str_of_int (gc_churn_bytes ()) ++ " nc=" ++ (if nc then "1" else "0")
+                                     ++ " topenv=" ++ str_of_int (if map_has top_env_reg 0 then map_bytes (map_get top_env_reg 0) else 0)
+                                     ++ " [mro_anc=" ++ str_of_int (map_bytes mro_anc) ++ " mro_mods=" ++ str_of_int (map_bytes mro_mods)
+                                     ++ " hm_memo=" ++ str_of_int (map_bytes hm_memo) ++ " prim_missing=" ++ str_of_int (map_bytes prim_missing)
+                                     ++ " bi_reg_n=" ++ str_of_int (map_bytes bi_reg_n) ++ " bi_reg_r=" ++ str_of_int (map_bytes bi_reg_r)
+                                     ++ " meths_g=" ++ str_of_int (map_bytes meths_g) ++ " proc_store=" ++ str_of_int (map_bytes proc_store)
+                                     ++ " proc_yblk=" ++ str_of_int (map_bytes proc_yblk) ++ "]") else ()) in
     // the next thresholds, set HERE so any caller at any depth inherits the
     // same amortization: entries = live + max(scan/2, 4000); bytes = the
     // post-collection baseline (gc_pressure fires at 2x it plus 32 MB).
@@ -1400,6 +1427,14 @@ let gc_collect = fn env -> fn world ->
     let delta = (if scan / 2 > 4000 then scan / 2 else 4000) in
     let _ = vec_set gc_knob 0 (map_len ivars + map_len ocls + delta) in
     let _ = vec_set gc_knob 1 (gc_store_bytes ()) in
+    // ⚠ the dead slots' share of that baseline. A string handle is never
+    //   reused, so every String ever made leaves a stub in str_store that no
+    //   compaction removes -- and doubling a baseline made mostly of stubs set
+    //   each next collection twice as far off as the last: 3 million `i.to_s`
+    //   collected 5 times and peaked at 1 GB with 1,500 live objects
+    //   (note 301). The stubs are counted once, not doubled.
+    let ns9 = vec_len str_store in
+    let _ = vec_set gc_knob 12 (if ns9 > 0 then (vec_bytes str_store / ns9) * (ns9 - vec_get gc_knob 10) else 0) in
     // ...and the time this run took, in nanoseconds, added to the total --
     // unless GC.measure_total_time is false, when ruby's total stands still
     let _ = (if map_has gc_state "notime" then ()
@@ -1434,11 +1469,6 @@ let gc_collect = fn env -> fn world ->
 // ASan). Off the stack, the caller's stack is suspended and pinned like any
 // other, and the env in hand is handed over (gc_off_env) to be rooted as before.
 let gc_off_env = map_new ();
-// the top-level env, which every top-level assignment writes: a map that lived
-// in the default region, so each write's old copy stayed there (192 MB for
-// 3 million `s = i.to_s`). It has an arena of its own (run_src) and the
-// collector compacts it here like the other tables a statement rewrites.
-let top_env_reg = map_new ();
 let gc_collect_any = fn env -> fn world ->
   if fb_off_stack then
     (let _ = map_set gc_off_env 0 env in
@@ -1610,6 +1640,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | EImagF f -> VCpx (VInt 0, VFlt f)
   | EImagRat (n, d) -> VCpx (VInt 0, mk_rat_s n d)
   | EFlt f -> VFlt f
+  | EStrL s when fsl_on () -> str_fstring_text s
   | EStrL s -> (let v = mkstr s in
                 let _ = (if map_has cli_opt "dbg_fsl" then
                            (match v with
@@ -3254,7 +3285,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
               | EMethod (a9, m9, Nil) -> str_len m9 > 10 && str_eq (substring m9 0 10) "__lit_fsl~" && statstr a9
               | _ -> false) in
            statstr recv_e) then
-      str_fstring (eval_e env world blk recv_e)
+      // (the text is the literals' own, so it is looked up before anything
+      //  is made: one evaluation is a table hit, not three dead Strings)
+      (let rec stattext = fn (e9: Expr) ->
+         (match e9 with
+          | EStrL s9 -> s9
+          | EBin (_, a9, b9) -> stattext a9 ++ stattext b9
+          | EMethod (a9, _, Nil) -> stattext a9
+          | _ -> "") in
+       str_fstring_text (stattext recv_e))
     // a parse-time literal-encoding marker (see the TStrL parse): tag the
     // fresh literal with the file's magic-comment encoding.
     // the file's frozen_string_literal comment, applied to the fresh literal:
@@ -3263,11 +3302,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // object per content and encoding, so `"abc".equal?("abc")` is true and
     // the same literal evaluated twice is the same object. Frozen but fresh
     // each time, every identity question about a frozen literal said false.
+    else if str_len name > 10 && str_eq (substring name 0 10) "__lit_fsl~"
+            && str_eq (substring name 10 (str_len name)) "on" && (match recv_e with EStrL _ -> true | _ -> false) then
+      (match recv_e with EStrL s9 -> str_fstring_text s9 | _ -> VNil)
     else if str_len name > 10 && str_eq (substring name 0 10) "__lit_fsl~" then
       (let v = eval_e env world blk recv_e in
        (match v with
         | VStr h ->
-          (let _ = (if map_has str_chilled (str_of_int h) then map_delete str_chilled (str_of_int h) else ()) in
+          (let _ = (if map_has str_chilled h then map_delete str_chilled h else ()) in
            if str_eq (substring name 10 (str_len name)) "on" then (let _ = sfrozen_set h in str_fstring v) else v)
         | _ -> v))
     else if str_len name > 10 && str_eq (substring name 0 10) "__lit_enc~" then
@@ -5670,6 +5712,11 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
   // (an exception that left a search or a tr half way leaves the character
   //  cutting at its encoding: put it back to UTF-8 -- cut_set, note 299)
   let _ = (if vec_get cut_k 0 == 1 then () else cut_set "UTF-8") in
+  // (...and the cycle guards of a #hash / #<=> walk it cut short stay
+  //  behind: a SystemStackError out of a 30,000-deep nesting left 29,946
+  //  keys, and a later Hash that took one of those ids answered the
+  //  "recursive" constant -- test_hash's test_inverse_hash, note 301)
+  let _ = (if map_len cyc_seen > 0 then map_clear cyc_seen else ()) in
   match rescues with
   | Nil -> re_raise world exc
   | Cons (rc, rest) ->
@@ -9262,10 +9309,12 @@ and arr_hash_w = fn env -> fn world -> fn (id: int) ->
   if map_has cyc_flag "f" then 4919 else r
 
 and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
-  if map_has cyc_seen ("h" ++ str_of_int id) then (let _ = map_set cyc_flag "f" 1 in 4919)
+  // (an ARRAY's guard is "a" ++ id, as val_hash keys it: "h" is a Hash's,
+  //  and the two number spaces overlap)
+  if map_has cyc_seen ("a" ++ str_of_int id) then (let _ = map_set cyc_flag "f" 1 in 4919)
   else
     (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-     let _ = map_set cyc_seen ("h" ++ str_of_int id) 1 in
+     let _ = map_set cyc_seen ("a" ++ str_of_int id) 1 in
      let rec go = fn (ys: Val list) -> fn (acc: int) ->
        (match ys with
         | Nil -> acc
@@ -9283,7 +9332,7 @@ and arr_hash_rec = fn env -> fn world -> fn (id: int) ->
                      | _ -> val_hash h) in
            go t (floor_mod (acc * 31 + hv) 1000000007))) in
      let r = go (deref id) 17 in
-     let _ = map_delete cyc_seen ("h" ++ str_of_int id) in
+     let _ = map_delete cyc_seen ("a" ++ str_of_int id) in
      r)
 
 
@@ -12776,8 +12825,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      // too (it warns when mutated), #dup is an ordinary string
      let _ = (match (recv, cp) with
               | (VStr h9, VStr c9) ->
-                (if (str_len name == 5 && str_eq name "clone") && map_has str_chilled (str_of_int h9)
-                 then map_set str_chilled (str_of_int c9) (map_get str_chilled (str_of_int h9)) else ())
+                (if (str_len name == 5 && str_eq name "clone") && map_has str_chilled h9
+                 then (let _ = map_set str_chilled c9 (map_get str_chilled h9) in
+                       if map_has str_chilled_sym h9 then map_set str_chilled_sym c9 (map_get str_chilled_sym h9) else ())
+                 else ())
               | _ -> ()) in
      let c99 = (if tagged9 then (if is_sng_cls tag9 && map_has sup9 tag9 then map_get sup9 tag9 else tag9) else class_name recv) in
      let _ = (if has_meth world c99 "initialize_copy"
@@ -26964,10 +27015,10 @@ and chill_touch = fn world -> fn (recv: Val) -> fn (name: str) ->
   match recv with
   | VStr h ->
     // (a chilled string frozen since is simply frozen: FrozenError, no warning)
-    (if map_has str_chilled (str_of_int h) && chill_changes name && (if sfrozen_get h then false else true)
+    (if map_has str_chilled h && chill_changes name && (if sfrozen_get h then false else true)
         && (if has_meth world (dispatch_cls_of world recv) name then false else true) then
-       (let how = map_get str_chilled (str_of_int h) in
-        let _ = map_delete str_chilled (str_of_int h) in
+       (let how = (if map_get str_chilled h == 2 && map_has str_chilled_sym h then ":" ++ map_get str_chilled_sym h else "1") in
+        let _ = map_delete str_chilled h in
         if deprecation_says () then
           rb_warn world (if str_len how > 1 && str_eq (substring how 0 1) ":"
                          then "string returned by " ++ how ++ ".to_s will be frozen in the future"
@@ -27431,8 +27482,11 @@ and prim_method = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // world to raise an object with, and the rescue that materialises the
   // exception has only the name. ruby's NoMethodError answers #name, #args and
   // #receiver, and this is the last place that knows all three.
-  let _ = map_set prim_missing "av" (arr_new args) in
-  let _ = map_set prim_missing "rvv" recv in
+  // (they are recorded where a call FAILS -- prim_nm_set_ra -- not before
+  //  every call: that wrote a new Array and two copies per primitive call
+  //  into a table a running builtin pins, so it was never compacted and
+  //  3 million `i.to_s` held 270 MB there and 1.3 million dead arrays,
+  //  note 301)
   let _ = (match args with
            | Nil -> ()
            | _ ->
@@ -27798,7 +27852,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (let c = mkstr sy in
         (match c with
          | VStr cid -> (let _ = senc_set cid (sym_enc_name sy) in
-                        let _ = map_set str_chilled (str_of_int cid) (":" ++ sy) in c)
+                        let _ = map_set str_chilled cid 2 in
+                        let _ = map_set str_chilled_sym cid sy in c)
          | _ -> c))
      | _ -> mkstr (to_s recv))
   // true / false / nil inspect to their ONE frozen string too (for the two
@@ -27937,7 +27992,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            (let _ = (if map_has prim_missing "i" then map_delete prim_missing "i" else ()) in
             prim_raise "RegexpError" ("invalid regular expression: /" ++ sp ++ "/"))
          | _ -> r9))
-     | _ -> (let _ = prim_nm_set (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "__regex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '__regex'")) in fail "mere-ruby: undefined method '__regex'")))
   // Regexp#casefold?: the `i` flag, which #options already carries as bit 0.
   else if (str_len name == 7 && str_eq name "timeout") && (match recv with VRegex _ -> true | _ -> false) then
     (match recv with VRegex (_, fl, _) -> rx_tmo_val (rx_fl_tmo fl) | _ -> VNil)
@@ -28000,7 +28055,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         (match v9 with
          | VStr id9 -> (let _ = senc_set id9 (rx_enc_name p fl ev9) in v9)
          | _ -> v9))
-     | _ -> (let _ = prim_nm_set (mkstr "source") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'source'")) in fail "mere-ruby: undefined method 'source'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "source") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'source'")) in fail "mere-ruby: undefined method 'source'")))
   // casecmp is the three-way form of casecmp? (nil when the other side is
   // not a string, which is how callers tell "incomparable" from "unequal").
   else if (str_len name == 4 && str_eq name "dump") && (match recv with VStr _ -> true | _ -> false) then
@@ -28050,7 +28105,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              let b3 = (if enc_cut e9 == 2 then es_downcase_ascii (sget b2) e9 else str_downcase_ascii (sget b2)) in
              VInt (let c = str_compare a b3 in if c < 0 then 0 - 1 else if c > 0 then 1 else 0))
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "casecmp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp'")) in fail "mere-ruby: undefined method 'casecmp'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "casecmp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp'")) in fail "mere-ruby: undefined method 'casecmp'")))
   // byte-level access. mere-ruby strings are byte-safe (a length header, not
   // NUL termination), so these are plain indexing rather than a re-encode.
   else if (str_len name == 7 && str_eq name "getbyte") then
@@ -28062,7 +28117,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (other, Nil) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Integer")
         | _ -> prim_raise "ArgumentError"
                  ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
-     | _ -> (let _ = prim_nm_set (mkstr "getbyte") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'getbyte'")) in fail "mere-ruby: undefined method 'getbyte'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "getbyte") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'getbyte'")) in fail "mere-ruby: undefined method 'getbyte'")))
   else if (str_len name == 5 && str_eq name "crypt") then
     (match recv with
      | VStr h ->
@@ -28078,7 +28133,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else mkstr_e (rb_crypt_des pw salt) "ASCII-8BIT")
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
-     | _ -> (let _ = prim_nm_set (mkstr "crypt") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'crypt'")) in fail "mere-ruby: undefined method 'crypt'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "crypt") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'crypt'")) in fail "mere-ruby: undefined method 'crypt'")))
   else if (str_len name == 7 && str_eq name "setbyte") then
     (match recv with
      | VStr h -> let a = sget h in
@@ -28093,7 +28148,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (other, _) ->
           prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Integer")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2)")
-     | _ -> (let _ = prim_nm_set (mkstr "setbyte") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'setbyte'")) in fail "mere-ruby: undefined method 'setbyte'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "setbyte") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'setbyte'")) in fail "mere-ruby: undefined method 'setbyte'")))
   else if (str_len name == 10 && str_eq name "bytesplice") then
     // bytesplice(idx, len, str[, sidx, slen]) / bytesplice(range, str[, srange]):
     // BYTE offsets, each end checked against character boundaries; the result
@@ -28198,7 +28253,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VRange (_, _, _), Cons (other9, _)) ->
           prim_raise "TypeError" ("no implicit conversion of " ++ conv_name other9 ++ " into String")
         | _ -> prim_raise "TypeError" "no implicit conversion into Integer")
-     | _ -> (let _ = prim_nm_set (mkstr "bytesplice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesplice'")) in fail "mere-ruby: undefined method 'bytesplice'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "bytesplice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesplice'")) in fail "mere-ruby: undefined method 'bytesplice'")))
   else if (str_len name == 9 && str_eq name "byteslice") then
     (match recv with
      | VStr h -> let a = sget h in let len = str_len a in
@@ -28220,11 +28275,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // conversion is what fails, and `"".byteslice(nil, nil)` says so.
         | Cons (_, _) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "byteslice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'byteslice'")) in fail "mere-ruby: undefined method 'byteslice'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "byteslice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'byteslice'")) in fail "mere-ruby: undefined method 'byteslice'")))
   else if (str_len name == 17 && str_eq name "grapheme_clusters") then
     (match recv with
      | VStr h -> arr_new (rb_graphemes (sget h) (enc_canon_name (senc_get h)))
-     | _ -> (let _ = prim_nm_set (mkstr "grapheme_clusters") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'grapheme_clusters'")) in fail "mere-ruby: undefined method 'grapheme_clusters'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "grapheme_clusters") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'grapheme_clusters'")) in fail "mere-ruby: undefined method 'grapheme_clusters'")))
   else if (str_len name == 17 && str_eq name "unicode_normalize") || (str_len name == 19 && str_eq name "unicode_normalized?") then
     // decode in the receiver's (Unicode) encoding, normalize the codepoints,
     // encode back; anything non-Unicode is ruby's CompatibilityError.
@@ -28245,7 +28300,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (if (str_len name == 19 && str_eq name "unicode_normalized?") then VBool (norm_ieq cps out)
            else (match encode_cps out e "" with
                  | (bytes, _) -> (let c = mkstr bytes in (match c with VStr rid -> (let _ = senc_set rid e in c) | _ -> c)))))
-     | _ -> (let _ = prim_nm_set (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
   else if (str_len name == 9 && str_eq name "byteindex") || (str_len name == 10 && str_eq name "byterindex") then
     // BYTE offsets in, byte position out; an offset that lands inside a
     // multi-byte character is an IndexError, not a silent adjustment.
@@ -28284,7 +28339,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                    if i < 0 then VNil else VInt i))
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
-     | _ -> (let _ = prim_nm_set (mkstr "byteindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'byteindex'")) in fail "mere-ruby: undefined method 'byteindex'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "byteindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'byteindex'")) in fail "mere-ruby: undefined method 'byteindex'")))
   else if (str_len name == 8 && str_eq name "casecmp?") then
     // an argument that offers no string conversion answers nil, not false;
     // so does one whose encoding is incompatible.
@@ -28304,7 +28359,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
               | (VStr x9, VStr y9) -> VBool (str_eq (sget x9) (sget y9))
               | _ -> VBool false))
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "casecmp?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp?'")) in fail "mere-ruby: undefined method 'casecmp?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "casecmp?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'casecmp?'")) in fail "mere-ruby: undefined method 'casecmp?'")))
   else if (str_len name == 3 && str_eq name "ord") && (match recv with VStr h -> str_len (sget h) == 0 | _ -> false) then
     prim_raise "ArgumentError" "empty string"
   else if (str_len name == 3 && str_eq name "ord") then
@@ -28334,7 +28389,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else VInt (match utf8_cp sv 0 with (c, l) -> c))
      | VInt n -> VInt n
      | VBig b -> VBig b
-     | _ -> (let _ = prim_nm_set (mkstr "ord") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ord'")) in fail "mere-ruby: undefined method 'ord'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "ord") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ord'")) in fail "mere-ruby: undefined method 'ord'")))
   // a bignum is never a character: ruby's RangeError, not a NoMethodError.
   else if (str_len name == 3 && str_eq name "chr") && (match recv with VBig _ -> true | _ -> false) then
     prim_raise "RangeError" ("bignum out of char range")
@@ -28441,7 +28496,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr svh -> let sv = sget svh in let e9 = senc_get svh in
        (let c9 = (if enc_cut e9 == 1 then utf8_char sv 0 else substring sv 0 (es_boff sv e9 1)) in
         let v9 = mkstr c9 in (match v9 with VStr id9 -> (let _ = senc_set id9 e9 in v9) | _ -> v9))
-     | _ -> (let _ = prim_nm_set (mkstr "chr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chr'")) in fail "mere-ruby: undefined method 'chr'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "chr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chr'")) in fail "mere-ruby: undefined method 'chr'")))
   // Symbol#id2name is #to_s, and Symbol#name is the same string FROZEN. Both
   // were absent, which also made `:s.respond_to?(:id2name)` false for a name
   // ruby has.
@@ -28496,7 +28551,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           let _ = sym_note s in
           VSym s)
      | VSym s -> VSym s
-     | _ -> (let _ = prim_nm_set (mkstr "to_sym") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_sym'")) in fail "mere-ruby: undefined method 'to_sym'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_sym") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_sym'")) in fail "mere-ruby: undefined method 'to_sym'")))
   // the implicit-conversion protocol: unlike to_s / to_a / to_i these exist
   // only on the type itself, which is exactly what makes them useful for
   // duck-typing (`if x.respond_to? :to_str`).
@@ -28507,9 +28562,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr h -> (match args with Cons (VStr o, _) -> let _ = sset h (sget o) in recv | _ -> recv)
      | _ -> recv)
   else if (str_len name == 6 && str_eq name "to_str") then
-    (match recv with VStr _ -> recv | _ -> (let _ = prim_nm_set (mkstr "to_str") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_str'")) in fail "mere-ruby: undefined method 'to_str'")))
+    (match recv with VStr _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_str") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_str'")) in fail "mere-ruby: undefined method 'to_str'")))
   else if (str_len name == 6 && str_eq name "to_ary") then
-    (match recv with VArr _ -> recv | _ -> (let _ = prim_nm_set (mkstr "to_ary") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_ary'")) in fail "mere-ruby: undefined method 'to_ary'")))
+    (match recv with VArr _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_ary") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_ary'")) in fail "mere-ruby: undefined method 'to_ary'")))
   else if (str_len name == 6 && str_eq name "to_int") then
     // Numeric#to_int is Integer#to_i for every Numeric, not Integer's alone --
     // Float, Rational and Complex all answer it (a Complex with an imaginary
@@ -28524,9 +28579,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VCpx (cre, cim) ->
        (if exact_zero_val cim then prim_method cre "to_i" (Nil : Val list)
         else prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Integer"))
-     | _ -> (let _ = prim_nm_set (mkstr "to_int") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_int'")) in fail "mere-ruby: undefined method 'to_int'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_int") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_int'")) in fail "mere-ruby: undefined method 'to_int'")))
   else if (str_len name == 7 && str_eq name "to_hash") then
-    (match recv with VHsh _ -> recv | _ -> (let _ = prim_nm_set (mkstr "to_hash") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_hash'")) in fail "mere-ruby: undefined method 'to_hash'")))
+    (match recv with VHsh _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_hash") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_hash'")) in fail "mere-ruby: undefined method 'to_hash'")))
   // eql? is == without any numeric conversion, so it also demands one class.
   else if (str_len name == 4 && str_eq name "eql?") then
     (match args with Cons (b, _) -> VBool (rb_eql recv b) | _ -> VBool false)
@@ -28608,7 +28663,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else if (str_len name == 9 && str_eq name "backtrace") && map_has raise_bt "v"
                 && map_has raise_bt "vx" && rb_eq (map_get raise_bt "vx") recv
         then map_get raise_bt "v" else VNil)
-     | _ -> (let _ = prim_nm_set (mkstr name) in
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in
              (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in
               fail ("mere-ruby: undefined method '" ++ name ++ "'"))))
   // Exception#exception on the PAIR representation: self with no argument, a
@@ -28747,7 +28802,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        else (let rf9 = rng_iter_refusal lo hi in
              if str_eq rf9 "" then arr_new (range_vals_raw lo hi excl)
              else prim_raise "TypeError" ("can't iterate from " ++ rf9))
-     | _ -> (let _ = prim_nm_set (mkstr "entries") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'entries'")) in fail "mere-ruby: undefined method 'entries'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "entries") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'entries'")) in fail "mere-ruby: undefined method 'entries'")))
   else if (str_len name == 4 && str_eq name "to_a") && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
      | VArr id -> if str_eq (hng_key recv) "" || (if map_has hng_store (hng_key recv) then false else true)
@@ -29097,10 +29152,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      else if (str_len name == 3 && str_eq name "lcm") then norm_big (big_mul_s (big_div_s a9 g9) b9)
      else arr_new (Cons (norm_big g9, Cons (norm_big (big_mul_s (big_div_s a9 g9) b9), Nil))))
   else if (str_len name == 3 && str_eq name "gcd") then (match recv with VInt a -> (match args with Cons (VInt b, _) -> VInt (int_gcd a b) | Cons (VBig b, _) -> norm_big (big_gcd_s (big_mag (str_of_int a)) (big_mag b)) | _ -> VInt a)
-     | VBig a -> (match args with Cons (b, _) -> norm_big (big_gcd_s (big_mag a) (big_mag (num_dec b))) | _ -> norm_big (big_mag a)) | _ -> (let _ = prim_nm_set (mkstr "gcd") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcd'")) in fail "mere-ruby: undefined method 'gcd'")))
+     | VBig a -> (match args with Cons (b, _) -> norm_big (big_gcd_s (big_mag a) (big_mag (num_dec b))) | _ -> norm_big (big_mag a)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "gcd") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcd'")) in fail "mere-ruby: undefined method 'gcd'")))
   else if (str_len name == 3 && str_eq name "lcm") then
     (match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in VInt (if l < 0 then 0 - l else l)) | Cons (VBig b, _) -> (let g = big_gcd_s (big_mag (str_of_int a)) (big_mag b) in norm_big (big_mul_s (big_div_s (big_mag (str_of_int a)) g) (big_mag b))) | _ -> VInt a)
-     | VBig a -> (match args with Cons (b, _) -> (let bm = big_mag (num_dec b) in let g = big_gcd_s (big_mag a) bm in norm_big (big_mul_s (big_div_s (big_mag a) g) bm)) | _ -> norm_big (big_mag a)) | _ -> (let _ = prim_nm_set (mkstr "lcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lcm'")) in fail "mere-ruby: undefined method 'lcm'")))
+     | VBig a -> (match args with Cons (b, _) -> (let bm = big_mag (num_dec b) in let g = big_gcd_s (big_mag a) bm in norm_big (big_mul_s (big_div_s (big_mag a) g) bm)) | _ -> norm_big (big_mag a)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "lcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lcm'")) in fail "mere-ruby: undefined method 'lcm'")))
   else if (str_len name == 6 && str_eq name "gcdlcm") then
     // ...for a BIGNUM on either side too: this arm took two machine ints and
     // reported the method undefined for anything else, so `(10**20).gcdlcm(35)`
@@ -29112,7 +29167,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         let g9 = big_gcd_s a9 b9 in
         arr_new (Cons (norm_big g9, Cons (norm_big (big_mul_s (big_div_s a9 g9) b9), Nil))))
      else
-     match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = prim_nm_set (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
+     match recv with VInt a -> (match args with Cons (VInt b, _) -> (let g = int_gcd a b in let l = (a / g) * b in arr_new (Cons (VInt g, Cons (VInt (if l < 0 then 0 - l else l), Nil)))) | _ -> VNil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "gcdlcm") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'gcdlcm'")) in fail "mere-ruby: undefined method 'gcdlcm'")))
   else if (str_len name == 6 && str_eq name "digits") then
     // The RADIX and the sign are checked first. Dividing by 1 never reaches
     // zero, so `12345.digits(1)` recursed until the stack went -- and a
@@ -29135,7 +29190,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBig b ->
        (let _ = neg_guard (big_sign b < 0) in
         match args with Cons (bs, _) -> (let _ = radix_guard bs in arr_new (big_digits_go (big_mag b) (num_dec bs))) | _ -> arr_new (big_digits_go (big_mag b) "10"))
-     | _ -> (let _ = prim_nm_set (mkstr "digits") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'digits'")) in fail "mere-ruby: undefined method 'digits'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "digits") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'digits'")) in fail "mere-ruby: undefined method 'digits'")))
   // Marshal's Bignum bytes (see mag_le_bytes): the magnitude, LSB first, as a
   // binary String -- and a String of them back to the magnitude
   else if (str_len name == 8 && str_eq name "__mag_le") && (match recv with VInt _ -> true | VBig _ -> true | _ -> false) then
@@ -29144,7 +29199,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      (match r9 with VStr h9 -> (let _ = senc_set h9 "ASCII-8BIT" in r9) | _ -> r9))
   else if (str_len name == 8 && str_eq name "__le_mag") && (match recv with VStr _ -> true | _ -> false) then
     (match recv with VStr h -> norm_big (le_bytes_mag (sget h)) | _ -> VNil)
-  else if (str_len name == 10 && str_eq name "bit_length") then (match recv with VInt n -> VInt (int_bit_length (if n < 0 then 0 - n - 1 else n)) | VBig b -> VInt (big_bit_length b) | _ -> (let _ = prim_nm_set (mkstr "bit_length") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit_length'")) in fail "mere-ruby: undefined method 'bit_length'")))
+  else if (str_len name == 10 && str_eq name "bit_length") then (match recv with VInt n -> VInt (int_bit_length (if n < 0 then 0 - n - 1 else n)) | VBig b -> VInt (big_bit_length b) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "bit_length") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit_length'")) in fail "mere-ruby: undefined method 'bit_length'")))
   else if (str_len name == 6 && str_eq name "divmod") then
     (match recv with
      | VInt a -> (match args with Cons (VInt b, _) -> arr_new (Cons (VInt (floor_div a b), Cons (VInt (floor_mod a b), Nil))) | Cons (VBig b, _) -> arr_new (Cons (norm_big (big_div_s (str_of_int a) b), Cons (norm_big (big_mod_s (str_of_int a) b), Nil))) | Cons (VFlt b, _) -> (match flt_divmod_pair (float_of_int a) b with (d9, m9) -> arr_new (Cons (VInt (flt_floor d9), Cons (VFlt m9, Nil)))) | Cons (VRat (_, _), _) -> rat_divmod_pair recv (match args with Cons (b9, _) -> b9 | Nil -> VInt 1) | _ -> VNil)
@@ -29169,7 +29224,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (b, _) -> rat_divmod_pair recv b
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "divmod") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'divmod'")) in fail "mere-ruby: undefined method 'divmod'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "divmod") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'divmod'")) in fail "mere-ruby: undefined method 'divmod'")))
   else if (str_len name == 4 && str_eq name "fdiv") then
     // ...and an argument that is not a number is refused in the receiver's
     // own words: `to_f` on it was an internal failure ("not a number").
@@ -29192,7 +29247,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // Rational and Bignum divide as floats like every other Numeric does
      | VRat (_, _) -> (match args with Cons (b, _) -> VFlt (to_f recv / to_f b) | _ -> VNil)
      | VBig _ -> (match args with Cons (b, _) -> VFlt (to_f recv / to_f b) | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "fdiv") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fdiv'")) in fail "mere-ruby: undefined method 'fdiv'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "fdiv") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fdiv'")) in fail "mere-ruby: undefined method 'fdiv'")))
   // ⚠ pow's second argument is a MODULUS and has to be an integer. A
   // non-integer did not refuse: it fell past the `Cons (VInt e, Cons (VInt m, _))`
   // pattern into the one-argument arm, so `2.pow(3, "x")` answered 8 -- the
@@ -29222,9 +29277,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBig b -> (match args with
                   | Cons (VInt e, Cons (m, _)) -> norm_big (big_mod_s (big_pow b e "1") (num_dec m))
                   | Cons (VInt e, _) -> norm_big (big_pow b e "1")
-                  | _ -> VBig b) | _ -> (let _ = prim_nm_set (mkstr "pow") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pow'")) in fail "mere-ruby: undefined method 'pow'")))
-  else if (str_len name == 5 && str_eq name "even?") then (match recv with VInt n -> VBool (floor_mod n 2 == 0) | VBig b -> VBool (big_even b) | _ -> (let _ = prim_nm_set (mkstr "even?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'even?'")) in fail "mere-ruby: undefined method 'even?'")))
-  else if (str_len name == 4 && str_eq name "odd?") then (match recv with VInt n -> VBool (floor_mod n 2 != 0) | VBig b -> VBool (if big_even b then false else true) | _ -> (let _ = prim_nm_set (mkstr "odd?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'odd?'")) in fail "mere-ruby: undefined method 'odd?'")))
+                  | _ -> VBig b) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "pow") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pow'")) in fail "mere-ruby: undefined method 'pow'")))
+  else if (str_len name == 5 && str_eq name "even?") then (match recv with VInt n -> VBool (floor_mod n 2 == 0) | VBig b -> VBool (big_even b) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "even?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'even?'")) in fail "mere-ruby: undefined method 'even?'")))
+  else if (str_len name == 4 && str_eq name "odd?") then (match recv with VInt n -> VBool (floor_mod n 2 != 0) | VBig b -> VBool (if big_even b then false else true) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "odd?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'odd?'")) in fail "mere-ruby: undefined method 'odd?'")))
   // Integer#allbits?/anybits?/nobits?(mask): bit-mask predicates.
   else if (str_len name == 8 && str_eq name "allbits?") || (str_len name == 8 && str_eq name "anybits?") || (str_len name == 7 && str_eq name "nobits?") then
     (match args with
@@ -29233,7 +29288,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         if (str_len name == 8 && str_eq name "allbits?") then VBool (rb_eq masked m)
         else if (str_len name == 8 && str_eq name "anybits?") then VBool (if rb_eq masked (VInt 0) then false else true)
         else VBool (rb_eq masked (VInt 0)))
-     | _ -> (let _ = prim_nm_set (mkstr "bit predicate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit predicate'")) in fail "mere-ruby: undefined method 'bit predicate'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "bit predicate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bit predicate'")) in fail "mere-ruby: undefined method 'bit predicate'")))
   // Integer#coerce(other): [other, self]. Both become Float if either is a
   // Float, else both stay Integer. (A non-numeric arg is a TypeError; raised
   // by the world-aware dispatch layer, so here it just fails.)
@@ -29278,12 +29333,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            // unparsable string Float() was handed.
            else prim_raise "TypeError" (conv_name o ++ " can't be coerced into Complex"))
         | _ -> arr_new (Cons (o, Cons (recv, Nil))))
-     | _ -> (let _ = prim_nm_set (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "coerce") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'coerce'")) in fail "mere-ruby: undefined method 'coerce'")))
   else if (str_len name == 5 && str_eq name "zero?") then (match recv with VInt n -> VBool (n == 0) | VFlt f -> VBool (f == 0.0) | VBig s -> VBool (str_eq s "0")
      | VRat (rn, rd) -> VBool (str_eq rn "0")
      // a Complex is zero when BOTH parts are
      | VCpx (cre, cim) -> VBool (rb_eq cre (VInt 0) && rb_eq cim (VInt 0))
-     | _ -> (let _ = prim_nm_set (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "zero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zero?'")) in fail "mere-ruby: undefined method 'zero?'")))
   // Numeric#integer?. `is_num_method` has claimed this name all along with no
   // branch behind it, so `respond_to?(:integer?)` said true and the call
   // raised. A name list is a claim, not an implementation -- three of the
@@ -29301,7 +29356,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (let e = enc_canon_name (senc_get h) in
         if enc_ascii_compat e then rb_str_to_c (sget h)
         else prim_raise "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ e))
-     | _ -> (let _ = prim_nm_set (mkstr "to_c") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_c'")) in fail "mere-ruby: undefined method 'to_c'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_c") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_c'")) in fail "mere-ruby: undefined method 'to_c'")))
   else if (str_len name == 8 && str_eq name "integer?") then
     (match recv with
      | VInt _ -> VBool true | VBig _ -> VBool true
@@ -29309,7 +29364,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      // about the CLASS, not the value (ruby: Complex(2,0).integer? is false)
      | VCpx _ -> VBool false
      | VFlt _ -> VBool false | VRat _ -> VBool false
-     | _ -> (let _ = prim_nm_set (mkstr "integer?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'integer?'")) in fail "mere-ruby: undefined method 'integer?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "integer?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'integer?'")) in fail "mere-ruby: undefined method 'integer?'")))
   // Numeric#nonzero?: self, or nil when it IS zero — the idiom behind
   // `(a <=> b).nonzero? || ...` in a multi-key comparator.
   else if (str_len name == 8 && str_eq name "nonzero?") then
@@ -29319,9 +29374,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VBig s2 -> (if str_eq s2 "0" then VNil else recv)
      | VRat (n, d) -> (if big_sign n == 0 then VNil else recv)
      | VCpx (cre, cim) -> (if rb_eq cre (VInt 0) && rb_eq cim (VInt 0) then VNil else recv)
-     | _ -> (let _ = prim_nm_set (mkstr "nonzero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nonzero?'")) in fail "mere-ruby: undefined method 'nonzero?'")))
-  else if (str_len name == 9 && str_eq name "positive?") then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> (let _ = prim_nm_set (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
-  else if (str_len name == 9 && str_eq name "negative?") then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = prim_nm_set (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "nonzero?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nonzero?'")) in fail "mere-ruby: undefined method 'nonzero?'")))
+  else if (str_len name == 9 && str_eq name "positive?") then (match recv with VInt n -> VBool (n > 0) | VFlt f -> VBool (f > 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) > 0) | VRat (n, d) -> VBool (big_sign n > 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "positive?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'positive?'")) in fail "mere-ruby: undefined method 'positive?'")))
+  else if (str_len name == 9 && str_eq name "negative?") then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
   // (at the int64 edge the next integer is a Bignum: `(-2**63).pred` wrapped
   // to 2**63-1, and a reverse_each down from there never reached its end)
   else if (str_len name == 4 && str_eq name "succ") || (str_len name == 4 && str_eq name "next") then (match recv with VInt n -> (if n == int_max then norm_big (big_add_s (str_of_int n) "1") else VInt (n + 1)) | VBig b -> norm_big (big_add_s b "1") | VStr s -> (let e9 = enc_canon_name (senc_get s) in
@@ -29335,7 +29390,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
               else if str_eq e9 "US-ASCII" && str_len (sget s) > 0 && (if es_has_alnum (sget s) e9 0 then false else true)
                       && ord (char_at (sget s) (str_len (sget s) - 1)) == 127 then mkstr_e (es_succ_ascii7 (sget s)) (senc_get s)
               else if es_succ_applies (sget s) e9 then mkstr_e (es_succ (sget s) e9) (senc_get s)
-              else mkstr (str_succ (sget s))) | _ -> (let _ = prim_nm_set (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
+              else mkstr (str_succ (sget s))) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
   // Integer#ceildiv(other): the division rounded UP, which is the floor of the
   // negated numerator negated back (7.ceildiv(2) is 4, -7.ceildiv(2) is -3).
   else if (str_len name == 7 && str_eq name "ceildiv") then
@@ -29347,7 +29402,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                       | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
         | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "ceildiv") in VNil))
-  else if (str_len name == 4 && str_eq name "pred") then (match recv with VInt n -> (if n == int_min then norm_big (big_sub_s (str_of_int n) "1") else VInt (n - 1)) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = prim_nm_set (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
+  else if (str_len name == 4 && str_eq name "pred") then (match recv with VInt n -> (if n == int_min then norm_big (big_sub_s (str_of_int n) "1") else VInt (n - 1)) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = prim_nm_set_ra recv args (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
   else if (str_len name == 3 && str_eq name "abs") || (str_len name == 9 && str_eq name "magnitude") then
     (match recv with
      // ...and the magnitude of the machine minimum does not fit a machine int.
@@ -29363,13 +29418,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (if rb_eq i (VInt 0) then num_abs r
         else if rb_eq r (VInt 0) then num_abs i
         else VFlt (sqrt (to_f (cpx_comp "+" (cpx_comp "*" r r) (cpx_comp "*" i i)))))
-     | _ -> (let _ = prim_nm_set (mkstr "abs") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'abs'")) in fail "mere-ruby: undefined method 'abs'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "abs") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'abs'")) in fail "mere-ruby: undefined method 'abs'")))
   else if (str_len name == 10 && str_eq name "next_float") then
     (match recv with VFlt f -> VFlt (flt_next f)
-     | _ -> (let _ = prim_nm_set (mkstr "next_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'next_float'")) in fail "mere-ruby: undefined method 'next_float'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "next_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'next_float'")) in fail "mere-ruby: undefined method 'next_float'")))
   else if (str_len name == 10 && str_eq name "prev_float") then
     (match recv with VFlt f -> VFlt (flt_prev f)
-     | _ -> (let _ = prim_nm_set (mkstr "prev_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'prev_float'")) in fail "mere-ruby: undefined method 'prev_float'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "prev_float") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'prev_float'")) in fail "mere-ruby: undefined method 'prev_float'")))
   else if (str_len name == 9 && str_eq name "object_id") || (str_len name == 6 && str_eq name "__id__") then
     (match recv with
      | VInt n -> VInt (2 * n + 1)
@@ -29389,7 +29444,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // answering false (or a Float) for them is a name Integer does not have.
   else if (str_len name == 4 && str_eq name "nan?") then
     (match recv with VFlt f -> VBool (if f == f then false else true)
-     | _ -> (let _ = prim_nm_set (mkstr "nan?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nan?'")) in fail "mere-ruby: undefined method 'nan?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "nan?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'nan?'")) in fail "mere-ruby: undefined method 'nan?'")))
   // ⚠ Every numeric shape answers these, and the catch-all said `false` --
   // which for #finite? is not "unknown", it is "this number is infinite".
   // `(2**70).finite?`, `Rational(1,2).finite?` and `Complex(1,2).finite?` were
@@ -29434,7 +29489,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      else (let m9 = big_pow "10" (0 - d) "1" in
                            norm_big (big_mul_s (rat_int_mode "floor" b m9) m9)))
                   | _ -> VBig b)
-     | _ -> (let _ = prim_nm_set (mkstr "floor") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'floor'")) in fail "mere-ruby: undefined method 'floor'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "floor") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'floor'")) in fail "mere-ruby: undefined method 'floor'")))
   else if (str_len name == 4 && str_eq name "ceil") then
     (match recv with
      | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (0 - (floor_div (0 - n) m) * m)) | _ -> VInt n)
@@ -29456,7 +29511,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      else (let m9 = big_pow "10" (0 - d) "1" in
                            norm_big (big_mul_s (rat_int_mode "ceil" b m9) m9)))
                   | _ -> VBig b)
-     | _ -> (let _ = prim_nm_set (mkstr "ceil") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ceil'")) in fail "mere-ruby: undefined method 'ceil'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "ceil") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'ceil'")) in fail "mere-ruby: undefined method 'ceil'")))
   // ⚠ ndigits has to FIT: ruby refuses a precision beyond a signed int rather
   // than rounding to it, and refuses a float that is not a number at all. These
   // fell through to "an Integer rounds to itself", so `42.round(1<<31)` and
@@ -29516,7 +29571,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      else (let m9 = big_pow "10" (0 - d) "1" in
                            norm_big (big_mul_s (rat_int_mode "round" b m9) m9)))
                   | _ -> VBig b)
-     | _ -> (let _ = prim_nm_set (mkstr "round") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'round'")) in fail "mere-ruby: undefined method 'round'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "round") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'round'")) in fail "mere-ruby: undefined method 'round'")))
   // ...and truncate's precision is an Integer too. `Rational(1,2).truncate("x")`
   // fell through to the no-argument form and answered 0 -- the truncation of a
   // precision ruby refuses to read.
@@ -29544,7 +29599,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                            norm_big (big_mul_s (rat_int_mode "truncate" b m9) m9)))
                   | _ -> VBig b)
      | VRat (rn, rd) -> (match args with Cons (VInt p, _) -> rat_round_prec "truncate" rn rd p | _ -> norm_big (rat_int_mode "truncate" rn rd))
-     | _ -> (let _ = prim_nm_set (mkstr "truncate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'truncate'")) in fail "mere-ruby: undefined method 'truncate'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "truncate") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'truncate'")) in fail "mere-ruby: undefined method 'truncate'")))
   // ⚠ numerator/denominator are the whole numeric tower's, not Rational's alone.
   //   Integer and Rational answered; Float and Complex said "undefined method".
   //   A Float's pair is its EXACT value (0.1 -> 3602879701896397/36028797018963968),
@@ -29561,7 +29616,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if ((str_len name == 3 && str_eq name "arg") || (str_len name == 5 && str_eq name "angle") || (str_len name == 5 && str_eq name "phase"))
           && (match recv with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false) then
     recv
-  else if (str_len name == 9 && str_eq name "numerator") then (match recv with VRat (n, d) -> norm_big n | VInt n -> VInt n | VBig b -> norm_big b | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big n2 | v -> v) | VCpx (r, i) -> (let dn = cpx_common_den r i in VCpx (num_scale_to r dn, num_scale_to i dn)) | _ -> (let _ = prim_nm_set (mkstr "numerator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'numerator'")) in fail "mere-ruby: undefined method 'numerator'")))
+  else if (str_len name == 9 && str_eq name "numerator") then (match recv with VRat (n, d) -> norm_big n | VInt n -> VInt n | VBig b -> norm_big b | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big n2 | v -> v) | VCpx (r, i) -> (let dn = cpx_common_den r i in VCpx (num_scale_to r dn, num_scale_to i dn)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "numerator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'numerator'")) in fail "mere-ruby: undefined method 'numerator'")))
   // marshal_dump: the pair a Marshal round-trip needs. Ruby has these as
   // private methods on both classes, so a direct call is a NoMethodError in
   // ruby too and the specs reach them through `send`.
@@ -29569,8 +29624,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VRat (n, d) -> arr_new (Cons (norm_big n, Cons (norm_big d, Nil)))
      | VCpx (r, i) -> arr_new (Cons (r, Cons (i, Nil)))
-     | _ -> (let _ = prim_nm_set (mkstr "marshal_dump") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'marshal_dump'")) in fail "mere-ruby: undefined method 'marshal_dump'")))
-  else if (str_len name == 11 && str_eq name "denominator") then (match recv with VRat (n, d) -> norm_big d | VInt n -> VInt 1 | VBig _ -> VInt 1 | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big d2 | v -> VInt 1) | VCpx (r, i) -> norm_big (cpx_common_den r i) | _ -> (let _ = prim_nm_set (mkstr "denominator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'denominator'")) in fail "mere-ruby: undefined method 'denominator'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "marshal_dump") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'marshal_dump'")) in fail "mere-ruby: undefined method 'marshal_dump'")))
+  else if (str_len name == 11 && str_eq name "denominator") then (match recv with VRat (n, d) -> norm_big d | VInt n -> VInt 1 | VBig _ -> VInt 1 | VFlt f -> (match mk_rat_s (match flt_rat_parts f 0 with (n, d) -> n) (match flt_rat_parts f 0 with (n, d) -> d) with VRat (n2, d2) -> norm_big d2 | v -> VInt 1) | VCpx (r, i) -> norm_big (cpx_common_den r i) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "denominator") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'denominator'")) in fail "mere-ruby: undefined method 'denominator'")))
   // Float#to_r is the float's EXACT value, not a rounded one: 0.1 becomes
   // 3602879701896397/36028797018963968. flt_rat_parts already computes that
   // pair for Rational(), so the branch was missing rather than the arithmetic.
@@ -29587,7 +29642,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              | VRat (n9, d9) -> VRat (n9, d9) | VInt n9 -> mk_rat n9 1 | VBig b9 -> mk_rat_s b9 "1"
              | VFlt f9 -> (match flt_rat_parts f9 0 with (n9, d9) -> mk_rat_s n9 d9)
              | _ -> mk_rat_s "0" "1")
-       else (let _ = prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Rational") in VRat ("0", "1"))) | _ -> (let _ = prim_nm_set (mkstr "to_r") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_r'")) in fail "mere-ruby: undefined method 'to_r'")))
+       else (let _ = prim_raise "RangeError" ("can't convert " ++ to_s recv ++ " into Rational") in VRat ("0", "1"))) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_r") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_r'")) in fail "mere-ruby: undefined method 'to_r'")))
   else if (str_len name == 4 && str_eq name "real") then (match recv with VCpx (r, i) -> r | VRat (n, d) -> recv | _ -> recv)
   else if (str_len name == 9 && str_eq name "imaginary") || (str_len name == 4 && str_eq name "imag") then (match recv with VCpx (r, i) -> i | _ -> VInt 0)
   else if (str_len name == 5 && str_eq name "real?") then (match recv with VCpx (r, i) -> VBool false | _ -> VBool true)
@@ -29614,7 +29669,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (if (match v with VFlt _ -> true | _ -> false) || (match b with VFlt _ -> true | _ -> false)
            then VFlt (to_f v / to_f b)
            else rat_arith "/" (match v with VRat _ -> v | VInt n -> mk_rat n 1 | VBig bb -> mk_rat_s bb "1" | x -> x) b))
-     | _ -> (let _ = prim_nm_set (mkstr "quo") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'quo'")) in fail "mere-ruby: undefined method 'quo'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "quo") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'quo'")) in fail "mere-ruby: undefined method 'quo'")))
   else if (str_len name == 5 && str_eq name "polar") then
     (match recv with
      | VCpx (r, i) ->
@@ -29682,11 +29737,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VNil -> mk_rat_s "0" "1"
      | VRat (n, d) -> (match args with Nil -> recv | _ -> rq_answer bounds)
      | VFlt f -> if f == 0.0 then mk_rat_s "0" "1" else rq_answer bounds
-     | _ -> (let _ = prim_nm_set (mkstr "rationalize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rationalize'")) in fail "mere-ruby: undefined method 'rationalize'"))) 
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "rationalize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rationalize'")) in fail "mere-ruby: undefined method 'rationalize'"))) 
   else if (str_len name == 1 && str_eq name "i") then
     // Numeric#i: this value as the imaginary part. Complex has no #i in ruby.
     (match recv with
-     | VCpx (_, _) -> (let _ = prim_nm_set (mkstr "i") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'i'")) in fail "mere-ruby: undefined method 'i'"))
+     | VCpx (_, _) -> (let _ = prim_nm_set_ra recv args (mkstr "i") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'i'")) in fail "mere-ruby: undefined method 'i'"))
      | v -> VCpx (VInt 0, v))
   else if (str_len name == 4 && str_eq name "rect") || (str_len name == 11 && str_eq name "rectangular") then
     (match recv with
@@ -29706,7 +29761,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VRegex (p, fl, ev9) ->
        (let nm = rx_enc_name p fl ev9 in
         if map_has enc_objs nm then map_get enc_objs nm else mkstr nm)
-     | _ -> (let _ = prim_nm_set (mkstr "encoding") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'encoding'")) in fail "mere-ruby: undefined method 'encoding'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "encoding") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'encoding'")) in fail "mere-ruby: undefined method 'encoding'")))
   else if (str_len name == 14 && str_eq name "force_encoding") then
     (match recv with
      | VStr h ->
@@ -29743,10 +29798,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else enc_find_canon nm0) in
         if str_eq canon "" then prim_raise "ArgumentError" ("unknown encoding name - " ++ nm0)
         else let _ = senc_set h canon in recv)
-     | _ -> (let _ = prim_nm_set (mkstr "force_encoding") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'force_encoding'")) in fail "mere-ruby: undefined method 'force_encoding'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "force_encoding") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'force_encoding'")) in fail "mere-ruby: undefined method 'force_encoding'")))
   else if (str_len name == 1 && str_eq name "b") then
-    (match recv with VStr h -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id "ASCII-8BIT" in c | _ -> c) | _ -> (let _ = prim_nm_set (mkstr "b") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'b'")) in fail "mere-ruby: undefined method 'b'")))
-  else if (str_len name == 8 && str_eq name "bytesize") then (match recv with VStr h -> VInt (str_blen h) | _ -> (let _ = prim_nm_set (mkstr "bytesize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesize'")) in fail "mere-ruby: undefined method 'bytesize'")))
+    (match recv with VStr h -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id "ASCII-8BIT" in c | _ -> c) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "b") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'b'")) in fail "mere-ruby: undefined method 'b'")))
+  else if (str_len name == 8 && str_eq name "bytesize") then (match recv with VStr h -> VInt (str_blen h) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "bytesize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'bytesize'")) in fail "mere-ruby: undefined method 'bytesize'")))
   else if (str_len name == 11 && str_eq name "ascii_only?") then
     (match recv with
      | VStr h -> VBool (enc_ascii_compat (enc_canon_name (senc_get h)) && str_ascii_only (sget h) 0)
@@ -29756,7 +29811,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr h -> VBool (enc_valid (sget h) (enc_canon_name (senc_get h)))
      | _ -> VBool false)
   else if (str_len name == 6 && str_eq name "encode") || (str_len name == 7 && str_eq name "encode!") then
-    (match recv with VStr h -> (match args with Cons (nm, _) -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id (to_s nm) in c | _ -> c) | _ -> recv) | _ -> (let _ = prim_nm_set (mkstr "encode") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'encode'")) in fail "mere-ruby: undefined method 'encode'")))
+    (match recv with VStr h -> (match args with Cons (nm, _) -> let c = mkstr (sget h) in (match c with VStr id -> let _ = senc_set id (to_s nm) in c | _ -> c) | _ -> recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "encode") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'encode'")) in fail "mere-ruby: undefined method 'encode'")))
   // upcase / downcase / capitalize / swapcase take symbol OPTIONS (:ascii,
   // :turkic, :lithuanian, :fold). Anything else is `invalid option` in Ruby,
   // where this used to ignore the argument entirely.
@@ -29767,8 +29822,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (str_len name == 6 && str_eq name "upcase") || (str_len name == 8 && str_eq name "downcase") then
     (match recv with
      | VStr h -> rb_case_apply h (if (str_len name == 6 && str_eq name "upcase") then "u" else "d") (rb_case_opt args ((str_len name == 8 && str_eq name "downcase")))
-     | _ -> (let _ = prim_nm_set (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
-  else if (str_len name == 10 && str_eq name "capitalize") then (match recv with VStr h -> rb_case_apply h "c" (rb_case_opt args false) | _ -> (let _ = prim_nm_set (mkstr "capitalize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'capitalize'")) in fail "mere-ruby: undefined method 'capitalize'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
+  else if (str_len name == 10 && str_eq name "capitalize") then (match recv with VStr h -> rb_case_apply h "c" (rb_case_opt args false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "capitalize") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'capitalize'")) in fail "mere-ruby: undefined method 'capitalize'")))
   else if (str_len name == 7 && str_eq name "reverse") then
     (match recv with
      | VStr sh0 ->
@@ -29782,9 +29837,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (let rec rv = fn (a: int list) -> fn (b: int list) -> (match a with Nil -> b | Cons (h, t) -> rv t (Cons (h, b))) in
            match encode_cps (rv (decode_cps (sget sh0) e 0) Nil) e "" with
            | (bytes, _) -> (let v = mkstr bytes in (match v with VStr id -> (let _ = senc_set id e in v) | _ -> v))))
-     | VArr id -> arr_new (val_rev (deref id) Nil) | _ -> (let _ = prim_nm_set (mkstr "reverse") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse'")) in fail "mere-ruby: undefined method 'reverse'")))
-  else if (str_len name == 5 && str_eq name "strip") then (match recv with VStr s -> (match args with Nil -> (let sh9 = s in let s = sget s in let _ = strip_lcheck sh9 s (str_len s - str_len (str_lstrip s)) in let _ = strip_rcheck sh9 in mkstr (str_lstrip (str_rstrip s))) | _ -> mkstr (str_strip_sel (sget s) (strip_selectors args) true true)) | _ -> (let _ = prim_nm_set (mkstr "strip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'strip'")) in fail "mere-ruby: undefined method 'strip'")))
-  else if (str_len name == 8 && str_eq name "swapcase") then (match recv with VStr h -> rb_case_apply h "s" (rb_case_opt args false) | _ -> (let _ = prim_nm_set (mkstr "swapcase") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'swapcase'")) in fail "mere-ruby: undefined method 'swapcase'")))
+     | VArr id -> arr_new (val_rev (deref id) Nil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "reverse") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse'")) in fail "mere-ruby: undefined method 'reverse'")))
+  else if (str_len name == 5 && str_eq name "strip") then (match recv with VStr s -> (match args with Nil -> (let sh9 = s in let s = sget s in let _ = strip_lcheck sh9 s (str_len s - str_len (str_lstrip s)) in let _ = strip_rcheck sh9 in mkstr (str_lstrip (str_rstrip s))) | _ -> mkstr (str_strip_sel (sget s) (strip_selectors args) true true)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "strip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'strip'")) in fail "mere-ruby: undefined method 'strip'")))
+  else if (str_len name == 8 && str_eq name "swapcase") then (match recv with VStr h -> rb_case_apply h "s" (rb_case_opt args false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "swapcase") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'swapcase'")) in fail "mere-ruby: undefined method 'swapcase'")))
   else if (str_len name == 6 && str_eq name "lstrip") then
     (match recv with
      | VStr sh ->
@@ -29800,7 +29855,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         let st = sk 0 in
         let _ = strip_lcheck sh sv st in
         mkstr (substring sv st n)))
-     | _ -> (let _ = prim_nm_set (mkstr "lstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lstrip'")) in fail "mere-ruby: undefined method 'lstrip'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "lstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lstrip'")) in fail "mere-ruby: undefined method 'lstrip'")))
   else if (str_len name == 6 && str_eq name "rstrip") then
     (match recv with
      | VStr sh ->
@@ -29816,7 +29871,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         //  coderange -- a CompatibilityError, ruby's own quirk; note 301)
         let _ = strip_rcheck sh in
         mkstr (substring sv 0 (en + 1))))
-     | _ -> (let _ = prim_nm_set (mkstr "rstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rstrip'")) in fail "mere-ruby: undefined method 'rstrip'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "rstrip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rstrip'")) in fail "mere-ruby: undefined method 'rstrip'")))
   else if (str_len name == 5 && str_eq name "chomp") then
     // the default separator is $/ (nil there means "remove nothing"). A
     // receiver in a non-ASCII-compatible encoding (UTF-16/32) chomps in
@@ -29902,7 +29957,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
             (match encode_cps kept e "" with
              | (bytes, _) -> (let c = mkstr bytes in (match c with VStr rid -> (let _ = senc_set rid e in c) | _ -> c)))
           | _ -> mkstr s)
-     | _ -> (let _ = prim_nm_set (mkstr "chomp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chomp'")) in fail "mere-ruby: undefined method 'chomp'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "chomp") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chomp'")) in fail "mere-ruby: undefined method 'chomp'")))
   else if (str_len name == 4 && str_eq name "chop") then
     (match recv with
      | VStr sh0 ->
@@ -29936,7 +29991,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                      | Nil -> Nil) in
            match encode_cps (rv r2 Nil) e "" with
            | (bytes, _) -> (let v = mkstr bytes in (match v with VStr id -> (let _ = senc_set id e in v) | _ -> v))))
-     | _ -> (let _ = prim_nm_set (mkstr "chop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chop'")) in fail "mere-ruby: undefined method 'chop'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "chop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chop'")) in fail "mere-ruby: undefined method 'chop'")))
   // Hash#slice returns a sub-hash; for String and Array slice IS []
   else if (str_len name == 5 && str_eq name "slice") && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
@@ -29963,7 +30018,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            //  receiver keeps its own, as ruby's tr_trans)
            mkstr_e r9 (if str_eq r9 s then senc_get sh9 else en9))
         | _ -> mkstr s)
-     | _ -> (let _ = prim_nm_set (mkstr "tr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr'")) in fail "mere-ruby: undefined method 'tr'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "tr") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr'")) in fail "mere-ruby: undefined method 'tr'")))
   // tr_s: translate, squeezing runs the TRANSLATION created (never runs that
   // were already in the input untranslated).
   else if (str_len name == 4 && str_eq name "tr_s") then
@@ -29990,7 +30045,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            mkstr_e r9 (if str_eq r9 s && (str_len (sget t) == 0 || (if moved9 then false else true)) then senc_get sh9 else en9))
         | Cons (_, Nil) -> prim_raise "ArgumentError" "wrong number of arguments (given 1, expected 2)"
         | _ -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2)")
-     | _ -> (let _ = prim_nm_set (mkstr "tr_s") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr_s'")) in fail "mere-ruby: undefined method 'tr_s'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "tr_s") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tr_s'")) in fail "mere-ruby: undefined method 'tr_s'")))
   else if (str_len name == 7 && str_eq name "squeeze") then
     (match recv with
      | VStr sh9 -> let s = sget sh9 in
@@ -30002,7 +30057,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           (let sets9 = str_set_args args in
            let _ = str_broken_refuse sh9 in
            let _ = cut_set (args_enc_meet sh9 args) in let r9 = str_squeeze_sets s sets9 in let _ = cut_set "UTF-8" in mkstr r9))
-     | _ -> (let _ = prim_nm_set (mkstr "squeeze") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'squeeze'")) in fail "mere-ruby: undefined method 'squeeze'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "squeeze") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'squeeze'")) in fail "mere-ruby: undefined method 'squeeze'")))
   else if (str_len name == 5 && str_eq name "ljust") || (str_len name == 5 && str_eq name "rjust") || (str_len name == 6 && str_eq name "center") then
     // one shape for the padding family: the width is an Integer (a Float
     // truncates, anything else refuses by type), the pad is a non-empty
@@ -30040,7 +30095,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ ->
           (let v = mkstr (apply " " (senc_get sh)) in
            (match v with VStr id -> (let _ = senc_set id (senc_get sh) in v) | _ -> v)))
-     | _ -> (let _ = prim_nm_set (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
   else if (str_len name == 9 && str_eq name "partition") || (str_len name == 10 && str_eq name "rpartition") then
     // the pieces carry the RECEIVER-vs-PATTERN negotiated encoding (a
     // US-ASCII haystack split by an ASCII-only UTF-8 needle answers
@@ -30071,7 +30126,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                                      Cons (t1 (substring s (i + str_len sep) (str_len s)) se, Nil)))))
         | Cons (other, _) -> prim_raise "TypeError" ("type mismatch: " ++ class_name other ++ " given")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
-     | _ -> (let _ = prim_nm_set (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
   else if (str_len name == 13 && str_eq name "delete_prefix") then
     // only WHOLE characters come off: a byte-prefix that would cut into a
     // multibyte character (the next byte is a continuation) removes nothing.
@@ -30096,7 +30151,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           then mkstr (substring s k (str_len s)) else mkstr s
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | _ -> mkstr s)
-     | _ -> (let _ = prim_nm_set (mkstr "delete_prefix") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_prefix'")) in fail "mere-ruby: undefined method 'delete_prefix'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "delete_prefix") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_prefix'")) in fail "mere-ruby: undefined method 'delete_prefix'")))
   else if (str_len name == 13 && str_eq name "delete_suffix") then
     (match recv with
      | VStr sh ->
@@ -30112,7 +30167,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           then mkstr (substring s 0 cut) else mkstr s
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | _ -> mkstr s)
-     | _ -> (let _ = prim_nm_set (mkstr "delete_suffix") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_suffix'")) in fail "mere-ruby: undefined method 'delete_suffix'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "delete_suffix") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_suffix'")) in fail "mere-ruby: undefined method 'delete_suffix'")))
   else if (str_len name == 5 && str_eq name "scrub") then
     (match recv with
      | VStr h ->
@@ -30130,7 +30185,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                       | Nil -> scrub_default_rep e) in
            match scrub_walk s e (fn (x: str) -> rep) with
            | (r, _) -> mkstr_e r (senc_get h)))
-     | _ -> (let _ = prim_nm_set (mkstr "scrub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scrub'")) in fail "mere-ruby: undefined method 'scrub'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "scrub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scrub'")) in fail "mere-ruby: undefined method 'scrub'")))
   else if (str_len name == 6 && str_eq name "undump") then
     (match recv with
      | VStr h ->
@@ -30141,7 +30196,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              (let c = mkstr bytes in
               (match c with VStr id -> (let _ = senc_set id (if str_eq fe "" then e else fe) in c) | _ -> c)))
         else prim_raise "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ e))
-     | _ -> (let _ = prim_nm_set (mkstr "undump") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'undump'")) in fail "mere-ruby: undefined method 'undump'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "undump") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'undump'")) in fail "mere-ruby: undefined method 'undump'")))
   else if (str_len name == 3 && str_eq name "sub") || (str_len name == 4 && str_eq name "gsub") then
     (match recv with
      | VStr s -> let s = sget s in
@@ -30155,8 +30210,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VRegex (pat, pf, _), Cons (VHsh h, _)) ->
           mkstr (rx_gsub_hash (hderef h) pat pf s ((str_len name == 4 && str_eq name "gsub")) 0 "")
         | _ -> mkstr s)
-     | _ -> (let _ = prim_nm_set (mkstr "sub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sub'")) in fail "mere-ruby: undefined method 'sub'")))
-  else if (str_len name == 5 && str_eq name "chars") then (match recv with VStr s -> arr_new (utf8_chars_enc (sget s) (enc_canon_name (senc_get s)) 0) | _ -> (let _ = prim_nm_set (mkstr "chars") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chars'")) in fail "mere-ruby: undefined method 'chars'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sub") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sub'")) in fail "mere-ruby: undefined method 'sub'")))
+  else if (str_len name == 5 && str_eq name "chars") then (match recv with VStr s -> arr_new (utf8_chars_enc (sget s) (enc_canon_name (senc_get s)) 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "chars") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'chars'")) in fail "mere-ruby: undefined method 'chars'")))
   else if (str_len name == 10 && str_eq name "codepoints") then
     (match recv with
      | VStr s ->
@@ -30164,9 +30219,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | (cps, bad) ->
           if bad then prim_raise "ArgumentError" ("invalid byte sequence in " ++ enc_canon_name (senc_get s))
           else arr_new cps)
-     | _ -> (let _ = prim_nm_set (mkstr "codepoints") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'codepoints'")) in fail "mere-ruby: undefined method 'codepoints'")))
-  else if (str_len name == 3 && str_eq name "hex") && (match recv with VStr _ -> true | _ -> false) then (match recv with VStr s -> VInt (radix_parse (sget s) 16 false) | _ -> (let _ = prim_nm_set (mkstr "hex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'hex'")) in fail "mere-ruby: undefined method 'hex'")))
-  else if (str_len name == 3 && str_eq name "oct") && (match recv with VStr _ -> true | _ -> false) then (match recv with VStr s -> VInt (radix_parse (sget s) 8 true) | _ -> (let _ = prim_nm_set (mkstr "oct") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'oct'")) in fail "mere-ruby: undefined method 'oct'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "codepoints") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'codepoints'")) in fail "mere-ruby: undefined method 'codepoints'")))
+  else if (str_len name == 3 && str_eq name "hex") && (match recv with VStr _ -> true | _ -> false) then (match recv with VStr s -> VInt (radix_parse (sget s) 16 false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "hex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'hex'")) in fail "mere-ruby: undefined method 'hex'")))
+  else if (str_len name == 3 && str_eq name "oct") && (match recv with VStr _ -> true | _ -> false) then (match recv with VStr s -> VInt (radix_parse (sget s) 8 true) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "oct") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'oct'")) in fail "mere-ruby: undefined method 'oct'")))
   else if (str_len name == 3 && str_eq name "sum") && (match recv with VStr _ -> true | _ -> false) then
     (match recv with
      | VStr s ->
@@ -30174,7 +30229,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         let total = str_byte_sum (sget s) 0 0 in
         if bits <= 0 then VInt total
         else VInt (int_bitop "&" total (shl_int 1 bits - 1)))
-     | _ -> (let _ = prim_nm_set (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
   else if (str_len name == 4 && str_eq name "scan") then
     // a String pattern scans for the LITERAL string (it is not a regexp).
     (match recv with
@@ -30184,13 +30239,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VStr pat, _) -> arr_new (rx_scan_all2 (rx_escape (sget pat)) "" s 0)
         | Cons (other, _) -> prim_raise "TypeError" ("wrong argument type " ++ class_name other ++ " (expected Regexp)")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
-     | _ -> (let _ = prim_nm_set (mkstr "scan") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scan'")) in fail "mere-ruby: undefined method 'scan'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "scan") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'scan'")) in fail "mere-ruby: undefined method 'scan'")))
   // `lines(chomp: true)` drops each terminator, which is what a caller
   // splitting input almost always wants. The rules are str_lines_of's.
   else if (str_len name == 5 && str_eq name "lines") then
     (match recv with
      | VStr h -> arr_new (str_lines_of h args)
-     | _ -> (let _ = prim_nm_set (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "lines") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'lines'")) in fail "mere-ruby: undefined method 'lines'")))
   else if (str_len name == 5 && str_eq name "split") then
     (match recv with
      | VStr sh0 ->
@@ -30283,7 +30338,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else arr_new (tag_all (val_list_of_strs (split_with_limit s sep lim))))
         | VNil -> arr_new (tag_all (val_list_of_strs (if lim < 0 then awk_neg 0 else if lim == 0 then awk_split s else awk_split_lim s lim)))
         | _ -> arr_new Nil)
-     | _ -> (let _ = prim_nm_set (mkstr "split") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'split'")) in fail "mere-ruby: undefined method 'split'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "split") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'split'")) in fail "mere-ruby: undefined method 'split'")))
   else if (str_len name == 8 && str_eq name "include?") then
     (match recv with
      | VStr sh ->
@@ -30298,11 +30353,11 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1)")
      | VArr id -> (match args with Cons (v, _) -> VBool (val_contains (deref id) v) | _ -> VBool false)
      | VHsh hid -> let xs = hderef hid in (match args with Cons (k, _) -> VBool (hix_has hid (hcbi_on hid) xs k) | _ -> VBool false)
-     | _ -> (let _ = prim_nm_set (mkstr "include?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'include?'")) in fail "mere-ruby: undefined method 'include?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "include?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'include?'")) in fail "mere-ruby: undefined method 'include?'")))
   else if (str_len name == 11 && str_eq name "start_with?") then
-    (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in VBool (str_starts_with s p) | _ -> VBool false) | _ -> (let _ = prim_nm_set (mkstr "start_with?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'start_with?'")) in fail "mere-ruby: undefined method 'start_with?'")))
+    (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in VBool (str_starts_with s p) | _ -> VBool false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "start_with?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'start_with?'")) in fail "mere-ruby: undefined method 'start_with?'")))
   else if (str_len name == 9 && str_eq name "end_with?") then
-    (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in VBool (str_ends_with s p) | _ -> VBool false) | _ -> (let _ = prim_nm_set (mkstr "end_with?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'end_with?'")) in fail "mere-ruby: undefined method 'end_with?'")))
+    (match recv with VStr s -> let s = sget s in (match args with Cons (VStr p, _) -> let p = sget p in VBool (str_ends_with s p) | _ -> VBool false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "end_with?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'end_with?'")) in fail "mere-ruby: undefined method 'end_with?'")))
   // Array
   // Range#begin / #end / #exclude_end? -- the endpoints as WRITTEN, which is
   // what an arity range is read with (`node.arity_range.begin`). Bare `last`
@@ -30326,7 +30381,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (VInt n, _) -> arr_new (vtake xs (if n < 0 then 0 else n))
         | _ -> val_nth xs 0)
-     | _ -> (let _ = prim_nm_set (mkstr "first") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'first'")) in fail "mere-ruby: undefined method 'first'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "first") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'first'")) in fail "mere-ruby: undefined method 'first'")))
   else if (str_len name == 4 && str_eq name "last") then
     (match recv with
      | VArr id when (match args with Nil -> true | _ -> false) -> (let n = arr_len id in if n == 0 then VNil else arr_at id (n - 1))
@@ -30336,9 +30391,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (VInt n, _) -> let k = if n < 0 then 0 else n in arr_new (vdrop xs (if len - k < 0 then 0 else len - k))
         | _ -> val_nth xs (len - 1))
-     | _ -> (let _ = prim_nm_set (mkstr "last") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'last'")) in fail "mere-ruby: undefined method 'last'")))
-  else if (str_len name == 4 && str_eq name "sort") then (match recv with VArr id -> arr_new (val_sort (deref id)) | VHsh xs -> arr_new (val_sort (hash_pairs (hderef xs))) | _ -> (let _ = prim_nm_set (mkstr "sort") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sort'")) in fail "mere-ruby: undefined method 'sort'")))
-  else if (str_len name == 4 && str_eq name "uniq") then (match recv with VArr id -> arr_new (val_uniq (deref id) Nil) | _ -> (let _ = prim_nm_set (mkstr "uniq") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq'")) in fail "mere-ruby: undefined method 'uniq'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "last") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'last'")) in fail "mere-ruby: undefined method 'last'")))
+  else if (str_len name == 4 && str_eq name "sort") then (match recv with VArr id -> arr_new (val_sort (deref id)) | VHsh xs -> arr_new (val_sort (hash_pairs (hderef xs))) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sort") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sort'")) in fail "mere-ruby: undefined method 'sort'")))
+  else if (str_len name == 4 && str_eq name "uniq") then (match recv with VArr id -> arr_new (val_uniq (deref id) Nil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "uniq") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq'")) in fail "mere-ruby: undefined method 'uniq'")))
   // $LOAD_PATH.resolve_feature_path(feature) -> [:rb, absolute_path] or nil.
   // In CRuby this lives only on the $LOAD_PATH object; here it is an Array
   // method, because rubygems calls it and nothing else in reach does.
@@ -30376,7 +30431,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into Integer")
         | _ -> prim_raise "ArgumentError"
                  ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)"))
-     | _ -> (let _ = prim_nm_set (mkstr "flatten") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten'")) in fail "mere-ruby: undefined method 'flatten'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "flatten") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten'")) in fail "mere-ruby: undefined method 'flatten'")))
   // (a HASH drops its nil-VALUED pairs; compact! answers nil when there were
   // none, which is the rule about the NAME, not about the type.)
   else if (str_len name == 7 && str_eq name "compact") && (match recv with VHsh _ -> true | _ -> false) then
@@ -30405,16 +30460,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         let _ = hset hid out9 in
         if hash_len out9 == before9 then VNil else recv)
      | _ -> recv)
-  else if (str_len name == 7 && str_eq name "compact") then (match recv with VArr id -> arr_new (val_compact (deref id)) | _ -> (let _ = prim_nm_set (mkstr "compact") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact'")) in fail "mere-ruby: undefined method 'compact'")))
-  else if (str_len name == 11 && str_eq name "deconstruct") then (match recv with VArr _ -> recv | _ -> (let _ = prim_nm_set (mkstr "deconstruct") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'deconstruct'")) in fail "mere-ruby: undefined method 'deconstruct'")))
+  else if (str_len name == 7 && str_eq name "compact") then (match recv with VArr id -> arr_new (val_compact (deref id)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "compact") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact'")) in fail "mere-ruby: undefined method 'compact'")))
+  else if (str_len name == 11 && str_eq name "deconstruct") then (match recv with VArr _ -> recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "deconstruct") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'deconstruct'")) in fail "mere-ruby: undefined method 'deconstruct'")))
   else if (str_len name == 5 && str_eq name "union") then
-    (match recv with VArr id -> arr_new (val_dedup_into (arr_union_args args (deref id)) Nil) | _ -> (let _ = prim_nm_set (mkstr "union") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'union'")) in fail "mere-ruby: undefined method 'union'")))
+    (match recv with VArr id -> arr_new (val_dedup_into (arr_union_args args (deref id)) Nil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "union") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'union'")) in fail "mere-ruby: undefined method 'union'")))
   else if (str_len name == 12 && str_eq name "intersection") then
-    (match recv with VArr id -> arr_new (arr_intersect_args args (val_dedup_into (deref id) Nil)) | _ -> (let _ = prim_nm_set (mkstr "intersection") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'intersection'")) in fail "mere-ruby: undefined method 'intersection'")))
+    (match recv with VArr id -> arr_new (arr_intersect_args args (val_dedup_into (deref id) Nil)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "intersection") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'intersection'")) in fail "mere-ruby: undefined method 'intersection'")))
   else if (str_len name == 10 && str_eq name "difference") then
-    (match recv with VArr id -> arr_new (arr_difference_args args (deref id)) | _ -> (let _ = prim_nm_set (mkstr "difference") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'difference'")) in fail "mere-ruby: undefined method 'difference'")))
+    (match recv with VArr id -> arr_new (arr_difference_args args (deref id)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "difference") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'difference'")) in fail "mere-ruby: undefined method 'difference'")))
   else if (str_len name == 10 && str_eq name "intersect?") then
-    (match recv with VArr id -> (match args with Cons (VArr o, _) -> VBool (val_any_in (deref id) (deref o)) | _ -> VBool false) | _ -> (let _ = prim_nm_set (mkstr "intersect?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'intersect?'")) in fail "mere-ruby: undefined method 'intersect?'")))
+    (match recv with VArr id -> (match args with Cons (VArr o, _) -> VBool (val_any_in (deref id) (deref o)) | _ -> VBool false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "intersect?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'intersect?'")) in fail "mere-ruby: undefined method 'intersect?'")))
   else if (str_len name == 5 && str_eq name "assoc") then
     (match recv with
      | VArr id -> (match args with Cons (k, _) -> arr_assoc (deref id) k 0 | _ -> VNil)
@@ -30430,14 +30485,14 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
               | _ -> VNil) in
            go xs)
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "assoc") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'assoc'")) in fail "mere-ruby: undefined method 'assoc'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "assoc") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'assoc'")) in fail "mere-ruby: undefined method 'assoc'")))
   else if (str_len name == 6 && str_eq name "rassoc") then
     (match recv with
      | VArr id -> (match args with Cons (k, _) -> arr_assoc (deref id) k 1 | _ -> VNil)
      | VHsh h -> (match args with Cons (v, _) -> hash_rassoc (hderef h) v | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "rassoc") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rassoc'")) in fail "mere-ruby: undefined method 'rassoc'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "rassoc") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rassoc'")) in fail "mere-ruby: undefined method 'rassoc'")))
   else if (str_len name == 10 && str_eq name "each_index") then
-    (match recv with VArr id -> arr_new (int_range_list 0 (val_list_len (deref id))) | _ -> (let _ = prim_nm_set (mkstr "each_index") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'each_index'")) in fail "mere-ruby: undefined method 'each_index'")))
+    (match recv with VArr id -> arr_new (int_range_list 0 (val_list_len (deref id))) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "each_index") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'each_index'")) in fail "mere-ruby: undefined method 'each_index'")))
   else if (str_len name == 6 && str_eq name "rindex") then
     // recv may be an Array (last matching element) or a String (last matching
     // substring). This branch precedes the String-only rindex below and used
@@ -30468,18 +30523,18 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
              (if i < 0 then VNil else VInt (if a1 then i else es_cidx s e9 i)))
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
-     | _ -> (let _ = prim_nm_set (mkstr "rindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rindex'")) in fail "mere-ruby: undefined method 'rindex'")))
-  else if (str_len name == 5 && str_eq name "tally") then (match recv with VArr id -> val_tally (deref id) Nil | _ -> (let _ = prim_nm_set (mkstr "tally") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tally'")) in fail "mere-ruby: undefined method 'tally'")))
-  else if (str_len name == 6 && str_eq name "minmax") then (match recv with VArr id -> val_minmax (deref id) | _ -> (let _ = prim_nm_set (mkstr "minmax") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'minmax'")) in fail "mere-ruby: undefined method 'minmax'")))
-  else if (str_len name == 10 && str_eq name "each_slice") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> (if n < 1 then (let _ = prim_nm_set (mkstr "each_slice") in arr_new Nil) else arr_new (val_slices (deref id) n)) | _ -> recv) | _ -> (let _ = prim_nm_set (mkstr "each_slice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'each_slice'")) in fail "mere-ruby: undefined method 'each_slice'")))
-  else if (str_len name == 9 && str_eq name "each_cons") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (val_cons_windows (deref id) n) | _ -> recv) | _ -> (let _ = prim_nm_set (mkstr "each_cons") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'each_cons'")) in fail "mere-ruby: undefined method 'each_cons'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "rindex") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'rindex'")) in fail "mere-ruby: undefined method 'rindex'")))
+  else if (str_len name == 5 && str_eq name "tally") then (match recv with VArr id -> val_tally (deref id) Nil | _ -> (let _ = prim_nm_set_ra recv args (mkstr "tally") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'tally'")) in fail "mere-ruby: undefined method 'tally'")))
+  else if (str_len name == 6 && str_eq name "minmax") then (match recv with VArr id -> val_minmax (deref id) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "minmax") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'minmax'")) in fail "mere-ruby: undefined method 'minmax'")))
+  else if (str_len name == 10 && str_eq name "each_slice") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> (if n < 1 then (let _ = prim_nm_set_ra recv args (mkstr "each_slice") in arr_new Nil) else arr_new (val_slices (deref id) n)) | _ -> recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "each_slice") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'each_slice'")) in fail "mere-ruby: undefined method 'each_slice'")))
+  else if (str_len name == 9 && str_eq name "each_cons") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (val_cons_windows (deref id) n) | _ -> recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "each_cons") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'each_cons'")) in fail "mere-ruby: undefined method 'each_cons'")))
   else if ((str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop"))
           && (match args with Cons (VInt n, _) -> n < 0 | _ -> false) then
     prim_raise "ArgumentError" ("attempt to " ++ name ++ " negative size")
-  else if (str_len name == 4 && str_eq name "take") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (deref id) n) | _ -> arr_new Nil) | _ -> (let _ = prim_nm_set (mkstr "take") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'take'")) in fail "mere-ruby: undefined method 'take'")))
-  else if (str_len name == 4 && str_eq name "drop") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vdrop (deref id) n) | _ -> recv) | _ -> (let _ = prim_nm_set (mkstr "drop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'drop'")) in fail "mere-ruby: undefined method 'drop'")))
+  else if (str_len name == 4 && str_eq name "take") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (deref id) n) | _ -> arr_new Nil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "take") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'take'")) in fail "mere-ruby: undefined method 'take'")))
+  else if (str_len name == 4 && str_eq name "drop") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vdrop (deref id) n) | _ -> recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "drop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'drop'")) in fail "mere-ruby: undefined method 'drop'")))
   else if (str_len name == 3 && str_eq name "zip") then
-    (match recv with VArr id -> let xs = deref id in arr_new (val_zip xs args 0 (val_list_len xs)) | _ -> (let _ = prim_nm_set (mkstr "zip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zip'")) in fail "mere-ruby: undefined method 'zip'")))
+    (match recv with VArr id -> let xs = deref id in arr_new (val_zip xs args 0 (val_list_len xs)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "zip") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'zip'")) in fail "mere-ruby: undefined method 'zip'")))
   else if (str_len name == 9 && str_eq name "transpose") then
     (match recv with
      | VArr id -> let rows = deref id in
@@ -30507,7 +30562,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // a row that is not an array (and offers no #to_ary, tried upstream)
         // is ruby's conversion error, not an internal failure.
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Array"))
-     | _ -> (let _ = prim_nm_set (mkstr "transpose") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'transpose'")) in fail "mere-ruby: undefined method 'transpose'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "transpose") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'transpose'")) in fail "mere-ruby: undefined method 'transpose'")))
   else if (str_len name == 6 && str_eq name "rotate") || (str_len name == 7 && str_eq name "rotate!") then
     // rotate!(n) is rotate(n) written back; both refuse a non-Integer count
     // (a String argument was silently rotating by the default 1).
@@ -30523,10 +30578,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         let out = (if len == 0 then (Nil : Val list)
                    else (let k = floor_mod n0 len in list_append (vdrop xs k) (vtake xs k))) in
         if (str_len name == 7 && str_eq name "rotate!") then (let _ = arr_set id out in recv) else arr_new out)
-     | _ -> (let _ = prim_nm_set (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
-  else if (str_len name == 3 && str_eq name "min") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_sort (deref id)) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_min t h)) | _ -> (let _ = prim_nm_set (mkstr "min") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'min'")) in fail "mere-ruby: undefined method 'min'")))
-  else if (str_len name == 3 && str_eq name "max") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_rev (val_sort (deref id)) Nil) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_max t h)) | _ -> (let _ = prim_nm_set (mkstr "max") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'max'")) in fail "mere-ruby: undefined method 'max'")))
-  else if (str_len name == 3 && str_eq name "sum") then (match recv with VArr id -> val_sum (deref id) (match args with Cons (init, _) -> init | _ -> VInt 0) | VRange (lo, hi, excl) -> rng_sum lo hi excl (match args with Cons (init, _) -> init | _ -> VInt 0) | _ -> (let _ = prim_nm_set (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: undefined method '" ++ name ++ "'"))) in fail "mere-ruby: undefined method")))
+  else if (str_len name == 3 && str_eq name "min") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_sort (deref id)) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_min t h)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "min") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'min'")) in fail "mere-ruby: undefined method 'min'")))
+  else if (str_len name == 3 && str_eq name "max") then (match recv with VArr id -> (match args with Cons (VInt n, _) -> arr_new (vtake (val_rev (val_sort (deref id)) Nil) n) | _ -> (match deref id with Nil -> VNil | Cons (h, t) -> val_max t h)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "max") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'max'")) in fail "mere-ruby: undefined method 'max'")))
+  else if (str_len name == 3 && str_eq name "sum") then (match recv with VArr id -> val_sum (deref id) (match args with Cons (init, _) -> init | _ -> VInt 0) | VRange (lo, hi, excl) -> rng_sum lo hi excl (match args with Cons (init, _) -> init | _ -> VInt 0) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sum") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sum'")) in fail "mere-ruby: undefined method 'sum'")))
   // Range#step(n) without a block: materialise the stepped values (the usual
   // consumer is `.step(n).to_a`/`.each`/`.map` on the result).
   else if (str_len name == 4 && str_eq name "step") then
@@ -30534,8 +30589,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VRange (lo, hi, excl) -> (match args with Cons (VInt n, _) -> arr_new (range_step_arr (rng_int lo) (if excl then rng_int hi - 1 else rng_int hi) n) | _ -> arr_new (range_vals_raw lo hi excl))
      // Integer#step(limit, by) without a block: the stepped values, so
      // `1.step(10, 3).to_a`/`.each`/`.map` work like the Range form.
-     | VInt lo -> (match args with Cons (VInt limit, Cons (VInt n, _)) -> arr_new (range_step_arr lo limit n) | Cons (VInt limit, _) -> arr_new (range_step_arr lo limit 1) | _ -> (let _ = prim_nm_set (mkstr "step") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'step'")) in fail "mere-ruby: undefined method 'step'")))
-     | _ -> (let _ = prim_nm_set (mkstr "step") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'step'")) in fail "mere-ruby: undefined method 'step'")))
+     | VInt lo -> (match args with Cons (VInt limit, Cons (VInt n, _)) -> arr_new (range_step_arr lo limit n) | Cons (VInt limit, _) -> arr_new (range_step_arr lo limit 1) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "step") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'step'")) in fail "mere-ruby: undefined method 'step'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "step") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'step'")) in fail "mere-ruby: undefined method 'step'")))
   else if (str_len name == 5 && str_eq name "index") || ((str_len name == 10 && str_eq name "find_index") && (match recv with VArr _ -> true | _ -> false)) then
     (match recv with
      | VArr id -> (match args with Cons (v, _) -> val_index_of (deref id) v 0 | _ -> VNil)
@@ -30581,7 +30636,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            | _ -> VNil)
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1..2)")
-     | _ -> (let _ = prim_nm_set (mkstr "index") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'index'")) in fail "mere-ruby: undefined method 'index'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "index") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'index'")) in fail "mere-ruby: undefined method 'index'")))
   else if (str_len name == 5 && str_eq name "count") then
     (match recv with
      | VArr id -> let xs = deref id in (match args with Cons (v, _) -> VInt (val_count_eq xs v) | Nil -> VInt (val_list_len xs))
@@ -30592,12 +30647,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                 let _ = str_broken_refuse s in
                 let _ = cut_set (args_enc_meet s args) in let r9 = str_count_sets (sget s) sets9 in let _ = cut_set "UTF-8" in VInt r9))
      | VHsh xs -> VInt (vlen (hash_keys (hderef xs)))
-     | _ -> (let _ = prim_nm_set (mkstr "count") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'count'")) in fail "mere-ruby: undefined method 'count'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "count") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'count'")) in fail "mere-ruby: undefined method 'count'")))
   else if (str_len name == 4 && str_eq name "join") then
     // Value-level fallback: no `world` here, so objects stringify to the
     // default. invoke_val_c intercepts join with a world-aware element
     // stringifier before reaching this path (so user #to_s is honored).
-    (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join to_s xs sep "" true) | _ -> mkstr (val_join to_s xs "" "" true)) | _ -> (let _ = prim_nm_set (mkstr "join") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'join'")) in fail "mere-ruby: undefined method 'join'")))
+    (match recv with VArr id -> let xs = deref id in (match args with Cons (VStr sep, _) -> let sep = sget sep in mkstr (val_join to_s xs sep "" true) | _ -> mkstr (val_join to_s xs "" "" true)) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "join") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'join'")) in fail "mere-ruby: undefined method 'join'")))
   // NilClass#to_h is {} (and #to_a is []), which is how a library writes
   // `maybe_nil.to_h.map { ... }` without a guard.
   // Hash#compare_by_identity marks the hash; its lookups then compare keys
@@ -30622,17 +30677,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // leaf built the pair list straight into a hash, so an Enumerable's #to_h
   // (which arrives here, unlike an Array's) answered `{a: 1, b: 2, a: 3}` --
   // a hash printing one key twice, whose [] then found the first.
-  else if (str_len name == 4 && str_eq name "to_h") then (match recv with VArr id -> mkhash (hash_merge Nil (val_to_h (deref id))) | VHsh _ -> recv | VNil -> mkhash Nil | _ -> (let _ = prim_nm_set (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
+  else if (str_len name == 4 && str_eq name "to_h") then (match recv with VArr id -> mkhash (hash_merge Nil (val_to_h (deref id))) | VHsh _ -> recv | VNil -> mkhash Nil | _ -> (let _ = prim_nm_set_ra recv args (mkstr "to_h") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'to_h'")) in fail "mere-ruby: undefined method 'to_h'")))
   // Hash
   // Array mutation (in place; VArr is a handle into the shared store).
   else if (str_len name == 4 && str_eq name "push") || (str_len name == 6 && str_eq name "append") then
-    (match recv with VArr id -> let _ = arr_push_many id args in recv | _ -> (let _ = prim_nm_set (mkstr "push") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'push'")) in fail "mere-ruby: undefined method 'push'")))
+    (match recv with VArr id -> let _ = arr_push_many id args in recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "push") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'push'")) in fail "mere-ruby: undefined method 'push'")))
   else if (str_len name == 5 && str_eq name "sort!") then
-    (match recv with VArr id -> let _ = arr_set id (val_sort (deref id)) in recv | _ -> (let _ = prim_nm_set (mkstr "sort!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sort!'")) in fail "mere-ruby: undefined method 'sort!'")))
+    (match recv with VArr id -> let _ = arr_set id (val_sort (deref id)) in recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sort!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sort!'")) in fail "mere-ruby: undefined method 'sort!'")))
   else if (str_len name == 8 && str_eq name "reverse!") then
-    (match recv with VArr id -> let _ = arr_set id (val_rev (deref id) Nil) in recv | _ -> (let _ = prim_nm_set (mkstr "reverse!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse!'")) in fail "mere-ruby: undefined method 'reverse!'")))
+    (match recv with VArr id -> let _ = arr_set id (val_rev (deref id) Nil) in recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "reverse!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'reverse!'")) in fail "mere-ruby: undefined method 'reverse!'")))
   else if (str_len name == 5 && str_eq name "uniq!") then
-    (match recv with VArr id -> let before = val_list_len (deref id) in let _ = arr_set id (val_uniq (deref id) Nil) in (if val_list_len (deref id) == before then VNil else recv) | _ -> (let _ = prim_nm_set (mkstr "uniq!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq!'")) in fail "mere-ruby: undefined method 'uniq!'")))
+    (match recv with VArr id -> let before = val_list_len (deref id) in let _ = arr_set id (val_uniq (deref id) Nil) in (if val_list_len (deref id) == before then VNil else recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "uniq!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'uniq!'")) in fail "mere-ruby: undefined method 'uniq!'")))
   else if (str_len name == 6 && str_eq name "insert") then
     (match recv with
      | VArr id ->
@@ -30675,9 +30730,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VInt _, Cons (other, _)) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into String")
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Integer")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 2)")
-     | _ -> (let _ = prim_nm_set (mkstr "insert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'insert'")) in fail "mere-ruby: undefined method 'insert'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "insert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'insert'")) in fail "mere-ruby: undefined method 'insert'")))
   else if (str_len name == 4 && str_eq name "fill") then
-    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (val_repeat (val_list_len (deref id)) v) in recv | _ -> recv) | _ -> (let _ = prim_nm_set (mkstr "fill") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fill'")) in fail "mere-ruby: undefined method 'fill'")))
+    (match recv with VArr id -> (match args with Cons (v, _) -> let _ = arr_set id (val_repeat (val_list_len (deref id)) v) in recv | _ -> recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "fill") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fill'")) in fail "mere-ruby: undefined method 'fill'")))
   else if (str_len name == 6 && str_eq name "delete") then
     (match recv with
      | VArr id ->
@@ -30708,12 +30763,12 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> (let sets9 = str_set_args args in
                 let _ = str_broken_refuse s in
                 let _ = cut_set (args_enc_meet s args) in let r9 = str_delete_sets (sget s) sets9 in let _ = cut_set "UTF-8" in mkstr r9))
-     | _ -> (let _ = prim_nm_set (mkstr "delete") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete'")) in fail "mere-ruby: undefined method 'delete'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "delete") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete'")) in fail "mere-ruby: undefined method 'delete'")))
   else if (str_len name == 8 && str_eq name "flatten!") then
     // nil when nothing was nested to flatten (the same rule as compact!)
-    (match recv with VArr id -> let d0 = (match args with Cons (VInt d, _) -> d | _ -> 0 - 1) in let nested = has_arr_elem (deref id) in let flat = val_flatten (deref id) d0 in let _ = arr_set id flat in (if d0 == 0 then VNil else if nested then recv else VNil) | _ -> (let _ = prim_nm_set (mkstr "flatten!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten!'")) in fail "mere-ruby: undefined method 'flatten!'")))
+    (match recv with VArr id -> let d0 = (match args with Cons (VInt d, _) -> d | _ -> 0 - 1) in let nested = has_arr_elem (deref id) in let flat = val_flatten (deref id) d0 in let _ = arr_set id flat in (if d0 == 0 then VNil else if nested then recv else VNil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "flatten!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'flatten!'")) in fail "mere-ruby: undefined method 'flatten!'")))
   else if (str_len name == 8 && str_eq name "compact!") then
-    (match recv with VArr id -> let xs = deref id in let c = val_compact xs in let _ = arr_set id c in (if val_list_len c == val_list_len xs then VNil else recv) | _ -> (let _ = prim_nm_set (mkstr "compact!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact!'")) in fail "mere-ruby: undefined method 'compact!'")))
+    (match recv with VArr id -> let xs = deref id in let c = val_compact xs in let _ = arr_set id c in (if val_list_len c == val_list_len xs then VNil else recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "compact!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'compact!'")) in fail "mere-ruby: undefined method 'compact!'")))
   else if (str_len name == 3 && str_eq name "pop") then
     (match recv with
      // the plain form counts the last element off the Vec form (arr_pop1)
@@ -30730,7 +30785,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else let k = if n > len then len else n in
              let _ = arr_set id (vtake xs (len - k)) in arr_new (vdrop xs (len - k)))
         | _ -> (match xs with Nil -> VNil | _ -> let _ = arr_set id (val_init xs) in val_last xs))
-     | _ -> (let _ = prim_nm_set (mkstr "pop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pop'")) in fail "mere-ruby: undefined method 'pop'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "pop") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'pop'")) in fail "mere-ruby: undefined method 'pop'")))
   // Array#at(i): index without the slice forms (negative counts from the end).
   else if (str_len name == 2 && str_eq name "at") then
     (match recv with
@@ -30743,7 +30798,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VNil, Nil) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
         | Cons (other, Nil) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Integer")
         | _ -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 1)"))
-     | _ -> (let _ = prim_nm_set (mkstr "at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'at'")) in fail "mere-ruby: undefined method 'at'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'at'")) in fail "mere-ruby: undefined method 'at'")))
   // Array#delete_at(i): remove and return that element (nil if out of range).
   else if (str_len name == 9 && str_eq name "delete_at") then
     (match recv with
@@ -30756,7 +30811,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
           else let v = val_nth xs i in
                let _ = arr_set id (list_append (vtake xs i) (vdrop xs (i + 1))) in v
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "delete_at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_at'")) in fail "mere-ruby: undefined method 'delete_at'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "delete_at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'delete_at'")) in fail "mere-ruby: undefined method 'delete_at'")))
   // Array#slice!(i) / slice!(start, len) / slice!(range): cut the elements out
   // and return them (nil / the element, matching Array#slice's return shape).
   else if (str_len name == 6 && str_eq name "slice!") then
@@ -30789,7 +30844,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
             let _ = arr_set id (list_append (vtake xs i) (vdrop xs (i + 1))) in
             v
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "slice!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'slice!'")) in fail "mere-ruby: undefined method 'slice!'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "slice!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'slice!'")) in fail "mere-ruby: undefined method 'slice!'")))
   else if (str_len name == 5 && str_eq name "shift") then
     (match recv with
      // Hash#shift removes the FIRST pair and returns it as [key, value].
@@ -30810,7 +30865,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
            else let k = if n > len then len else n in
              let _ = arr_drop_front id k in arr_new (vtake xs k))
         | _ -> (match xs with Nil -> VNil | Cons (h, t) -> let _ = arr_set id t in h))
-     | _ -> (let _ = prim_nm_set (mkstr "shift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shift'")) in fail "mere-ruby: undefined method 'shift'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "shift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shift'")) in fail "mere-ruby: undefined method 'shift'")))
   // Array#replace: swap in the other array's contents (aliases see it).
   else if (str_len name == 7 && str_eq name "replace") && (match recv with VArr _ -> true | _ -> false) then
     (match recv with
@@ -30822,7 +30877,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> recv)
   else if (str_len name == 7 && str_eq name "unshift") || (str_len name == 7 && str_eq name "prepend") then
     // every argument goes in front, in order: [1].unshift(9, 8) is [9, 8, 1]
-    (match recv with VArr id -> (match args with Nil -> recv | _ -> let _ = arr_set id (list_append args (deref id)) in recv) | _ -> (let _ = prim_nm_set (mkstr "unshift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'unshift'")) in fail "mere-ruby: undefined method 'unshift'")))
+    (match recv with VArr id -> (match args with Nil -> recv | _ -> let _ = arr_set id (list_append args (deref id)) in recv) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "unshift") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'unshift'")) in fail "mere-ruby: undefined method 'unshift'")))
   else if (str_len name == 6 && str_eq name "concat") then
     (match recv with
      // every argument is appended, and each one is READ BEFORE the receiver
@@ -30838,7 +30893,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Nil -> recv
         | _ -> (let add = snap args in
                 let _ = arr_set id (list_append (deref id) add) in recv))
-     | _ -> (let _ = prim_nm_set (mkstr "concat") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'concat'")) in fail "mere-ruby: undefined method 'concat'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "concat") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'concat'")) in fail "mere-ruby: undefined method 'concat'")))
   else if (str_len name == 5 && str_eq name "clear") then
     (match args with
      | Cons (_, _) -> prim_raise "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0)")
@@ -30847,7 +30902,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VArr id -> let _ = arr_set id Nil in recv
      | VHsh h -> let _ = hset h Nil in recv
      | VStr h -> let _ = sset h "" in recv
-     | _ -> (let _ = prim_nm_set (mkstr "clear") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'clear'")) in fail "mere-ruby: undefined method 'clear'"))))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "clear") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'clear'")) in fail "mere-ruby: undefined method 'clear'"))))
   else if (str_len name == 3 && str_eq name "[]=") then
     (match recv with
      // an index inside the array writes one slot of the Vec form (arr_aset)
@@ -30906,9 +30961,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match args with
         | Cons (k, Cons (v, _)) -> hput_or_queue h (hcbi_on h) k v (fn (u: unit) -> hash_put_x (hcbi_on h) (hderef h) k v)
         | _ -> VNil)
-     | _ -> (let _ = prim_nm_set (mkstr "[]=") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '[]='")) in fail "mere-ruby: undefined method '[]='")))
-  else if (str_len name == 4 && str_eq name "keys") then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_keys xs) | _ -> (let _ = prim_nm_set (mkstr "keys") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'keys'")) in fail "mere-ruby: undefined method 'keys'")))
-  else if (str_len name == 6 && str_eq name "values") then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values xs) | _ -> (let _ = prim_nm_set (mkstr "values") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'values'")) in fail "mere-ruby: undefined method 'values'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "[]=") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method '[]='")) in fail "mere-ruby: undefined method '[]='")))
+  else if (str_len name == 4 && str_eq name "keys") then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_keys xs) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "keys") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'keys'")) in fail "mere-ruby: undefined method 'keys'")))
+  else if (str_len name == 6 && str_eq name "values") then (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values xs) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "values") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'values'")) in fail "mere-ruby: undefined method 'values'")))
   else if (str_len name == 4 && str_eq name "key?") || (str_len name == 8 && str_eq name "has_key?") || (str_len name == 8 && str_eq name "include?") || (str_len name == 7 && str_eq name "member?") then
     // #member? is #include? for an ARRAY too -- this arm answered only for a
     // Hash and reported the HASH name it had been dispatched under, so
@@ -30916,9 +30971,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VHsh hid -> let xs = hderef hid in (match args with Cons (k, _) -> VBool (hix_has hid (hcbi_on hid) xs k) | _ -> VBool false)
      | VArr aid -> (match args with Cons (k, _) -> VBool (val_contains (deref aid) k) | _ -> VBool false)
-     | _ -> (let _ = prim_nm_set (mkstr "key?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'key?'")) in fail "mere-ruby: undefined method 'key?'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "key?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'key?'")) in fail "mere-ruby: undefined method 'key?'")))
   else if (str_len name == 10 && str_eq name "has_value?") || (str_len name == 6 && str_eq name "value?") then
-    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (v, _) -> VBool (hash_has_value xs v) | _ -> VBool false) | _ -> (let _ = prim_nm_set (mkstr "value?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'value?'")) in fail "mere-ruby: undefined method 'value?'")))
+    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (v, _) -> VBool (hash_has_value xs v) | _ -> VBool false) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "value?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'value?'")) in fail "mere-ruby: undefined method 'value?'")))
   else if (str_len name == 9 && str_eq name "each_pair") && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with VHsh xs -> arr_new (hash_pairs (hderef xs)) | _ -> VNil)
   else if (str_len name == 5 && str_eq name "merge") then
@@ -30935,9 +30990,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                                               | _ -> ()))
                                           | _ -> ()) in
                                  r9)
-     | _ -> (let _ = prim_nm_set (mkstr "merge") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge'")) in fail "mere-ruby: undefined method 'merge'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "merge") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge'")) in fail "mere-ruby: undefined method 'merge'")))
   else if (str_len name == 6 && str_eq name "merge!") || (str_len name == 6 && str_eq name "update") then
-    (match recv with VHsh h -> let _ = hset h (hash_merge_all (hderef h) args) in recv | _ -> (let _ = prim_nm_set (mkstr "merge!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge!'")) in fail "mere-ruby: undefined method 'merge!'")))
+    (match recv with VHsh h -> let _ = hset h (hash_merge_all (hderef h) args) in recv | _ -> (let _ = prim_nm_set_ra recv args (mkstr "merge!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'merge!'")) in fail "mere-ruby: undefined method 'merge!'")))
   else if (str_len name == 7 && str_eq name "default") then (match recv with VHsh hid -> hdflt_get hid | _ -> VNil)
   else if (str_len name == 8 && str_eq name "default=") then
     (match recv with
@@ -30956,15 +31011,15 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VArr id -> let xs = deref id in let n = val_list_len xs in
        (if n == 0 then VNil else val_nth xs (mt_rand_int 0 n))
-     | _ -> (let _ = prim_nm_set (mkstr "sample") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sample'")) in fail "mere-ruby: undefined method 'sample'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "sample") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'sample'")) in fail "mere-ruby: undefined method 'sample'")))
   else if (str_len name == 7 && str_eq name "shuffle") then
     (match recv with
      | VArr id -> let xs = deref id in arr_new (val_shuffle xs (val_list_len xs))
-     | _ -> (let _ = prim_nm_set (mkstr "shuffle") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shuffle'")) in fail "mere-ruby: undefined method 'shuffle'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "shuffle") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shuffle'")) in fail "mere-ruby: undefined method 'shuffle'")))
   else if (str_len name == 8 && str_eq name "shuffle!") then
     (match recv with
      | VArr id -> let xs = deref id in let _ = arr_set id (val_shuffle xs (val_list_len xs)) in recv
-     | _ -> (let _ = prim_nm_set (mkstr "shuffle!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shuffle!'")) in fail "mere-ruby: undefined method 'shuffle!'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "shuffle!") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'shuffle!'")) in fail "mere-ruby: undefined method 'shuffle!'")))
   // replace swaps the contents in place, so every alias of the hash sees it.
   else if (str_len name == 7 && str_eq name "replace") && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
@@ -31009,10 +31064,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (str_len name == 12 && str_eq name "fetch_values") then
     (match recv with
      | VHsh xs -> let xs = hderef xs in arr_new (hash_fetch_values xs args)
-     | _ -> (let _ = prim_nm_set (mkstr "fetch_values") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fetch_values'")) in fail "mere-ruby: undefined method 'fetch_values'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "fetch_values") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fetch_values'")) in fail "mere-ruby: undefined method 'fetch_values'")))
   else if (str_len name == 6 && str_eq name "except") then
     (match recv with VHsh xs -> (let r9 = mkhash (hash_except (hderef xs) args) in
-                                 let _ = hcbi_copy xs r9 in r9) | _ -> (let _ = prim_nm_set (mkstr "except") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'except'")) in fail "mere-ruby: undefined method 'except'")))
+                                 let _ = hcbi_copy xs r9 in r9) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "except") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'except'")) in fail "mere-ruby: undefined method 'except'")))
   // Hash#deconstruct_keys(keys) is the pattern-matching hook: it answers self
   // (the keys argument only tells it what will be read).
   else if (str_len name == 16 && str_eq name "deconstruct_keys") then
@@ -31034,13 +31089,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (str_len name == 6 && str_eq name "invert") then
     // a value that appears twice becomes ONE key, taking the LATER pair
     // (the flat list was handed to mkhash unmerged, so the hash held it twice).
-    (match recv with VHsh xs -> mkhash (hash_merge Nil (hash_invert (hderef xs))) | _ -> (let _ = prim_nm_set (mkstr "invert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'invert'")) in fail "mere-ruby: undefined method 'invert'")))
+    (match recv with VHsh xs -> mkhash (hash_merge Nil (hash_invert (hderef xs))) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "invert") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'invert'")) in fail "mere-ruby: undefined method 'invert'")))
   else if (str_len name == 5 && str_eq name "fetch") then
-    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (k, rest) -> if hash_haskey xs k then hash_get xs k else (match rest with Cons (d, _) -> d | Nil -> VNil) | _ -> VNil) | _ -> (let _ = prim_nm_set (mkstr "fetch") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fetch'")) in fail "mere-ruby: undefined method 'fetch'")))
+    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (k, rest) -> if hash_haskey xs k then hash_get xs k else (match rest with Cons (d, _) -> d | Nil -> VNil) | _ -> VNil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "fetch") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'fetch'")) in fail "mere-ruby: undefined method 'fetch'")))
   else if (str_len name == 3 && str_eq name "key") then
-    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (v, _) -> hash_key_of xs v | _ -> VNil) | _ -> (let _ = prim_nm_set (mkstr "key") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'key'")) in fail "mere-ruby: undefined method 'key'")))
+    (match recv with VHsh xs -> let xs = hderef xs in (match args with Cons (v, _) -> hash_key_of xs v | _ -> VNil) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "key") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'key'")) in fail "mere-ruby: undefined method 'key'")))
   else if (str_len name == 9 && str_eq name "values_at") then
-    (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values_at xs args) | VArr id -> arr_new (arr_values_at (deref id) args) | _ -> (let _ = prim_nm_set (mkstr "values_at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'values_at'")) in fail "mere-ruby: undefined method 'values_at'")))
+    (match recv with VHsh xs -> let xs = hderef xs in arr_new (hash_values_at xs args) | VArr id -> arr_new (arr_values_at (deref id) args) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "values_at") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'values_at'")) in fail "mere-ruby: undefined method 'values_at'")))
   else if (str_len name == 3 && str_eq name "dig") then
     (match recv with
      | VHsh xs -> let xs = hderef xs in (match args with Cons (k, rest) -> let v = hash_get xs k in (match rest with Nil -> v | _ -> if (match v with VNil -> true | _ -> false) then VNil else prim_method v "dig" rest) | _ -> VNil)
@@ -31052,7 +31107,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | Cons (VNil, _) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
         | Cons (other, _) -> prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other ++ " into Integer")
         | Nil -> prim_raise "ArgumentError" "wrong number of arguments (given 0, expected 1+)")
-     | _ -> (let _ = prim_nm_set (mkstr "dig") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'dig'")) in fail "mere-ruby: undefined method 'dig'")))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "dig") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'dig'")) in fail "mere-ruby: undefined method 'dig'")))
   // `super` from a builtin subclass's own #initialize (`class Uncountables <
   // Array`). The instance already IS the builtin value -- storage was created
   // before initialize ran -- so the base initialize only applies its arguments
@@ -31077,13 +31132,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                  | Nil -> (if map_has hash_dflt (str_of_int h) then map_delete hash_dflt (str_of_int h) else ())) in
         recv)
      | VStr h -> (let _ = (match args with Cons (v, _) -> sset h (match v with VStr a -> sget a | _ -> to_s v) | Nil -> ()) in VNil)
-     | _ -> (let _ = prim_nm_set (mkstr name) in (let __fm = ("mere-ruby: undefined method '" ++ name ++ "' for this value") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr name) in (let __fm = ("mere-ruby: undefined method '" ++ name ++ "' for this value") in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)))
   // A class receiver ends up here (invoke_val_c's VClass arm falls through to
   // the primitive dispatcher), and this is the terminal that answers for an
   // unknown name -- so record WHO it was asked of, not just the name. Without
   // it `Gem::Platform.match` reported `undefined method 'match'` and finding
   // the receiver took a separate probe.
-  else (let _ = prim_nm_set (mkstr name) in
+  else (let _ = prim_nm_set_ra recv args (mkstr name) in
         let _ = map_set prim_missing "rv" (mkstr (prim_blame recv)) in
         // ... and the receiver's class NAME, because prim_method has no world
         // and a singleton class of an OBJECT cannot be named without one:
