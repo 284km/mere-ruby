@@ -89,7 +89,7 @@ them, is what ships; the two are not added together.
 | library/net-http/httpexceptions | 2 | 0 | 0 | 0 | 0 | 2 |
 | library/pp | 1 | 0 | 0 | 0 | 0 | 1 |
 | library/abbrev | 1 | 0 | 0 | 0 | 0 | 1 |
-| library/weakref | 2 | 1 | 0 | 0 | 2 | 5 |
+| library/weakref | 2 | 3 | 0 | 0 | 0 | 5 |
 | library/erb/util | 3 | 1 | 0 | 0 | 0 | 4 |
 | library/rubygems/gem | 1 | 1 | 0 | 0 | 0 | 2 |
 | library/csv/stringreader | 0 | 0 | 0 | 2 | 0 | 2 |
