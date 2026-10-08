@@ -789,6 +789,9 @@ let gc_owner_of = fn (k: str) ->
 //   table is in the order the entries were made): 100000 `l = S.new(l)` was
 //   100000 passes over 100000 entries, and test_gc never finished.
 let gc_fixpoint = fn ivars -> fn live ->
+  // (the owner index in a region of its own: one per collection went to the
+  //  default region)
+  region GFX {
   let idx = map_new () in
   let _ = map_iter ivars (fn (k: str) -> fn (v: Val) ->
     let owner = gc_owner_of k in
@@ -809,7 +812,8 @@ let gc_fixpoint = fn ivars -> fn live ->
         let _ = each 0 in
         drain (rounds + 1))) in
   let n = drain 0 in
-  (if gc_log_on () then print_err ("gc: fixpoint rounds=" ++ str_of_int n ++ " live=" ++ str_of_int (map_len live)) else ());
+  (if gc_log_on () then print_err ("gc: fixpoint rounds=" ++ str_of_int n ++ " live=" ++ str_of_int (map_len live)) else ())
+  };
 
 // the root scan, shared by every collection. EVERY top-level map that holds
 // Val values is a root -- the list was built by classifying all 120 globals
@@ -820,6 +824,8 @@ let gc_fixpoint = fn ivars -> fn live ->
 // map is the direction to fear when adding a new global store.
 let gc_mark_roots = fn env -> fn live ->
   let _ = map_clear gc_obj_pend in
+  // (the frame texts: one handle each, shared by every frame -- frame_text)
+  let _ = map_iter frame_str_ids (fn (k: str) -> fn (h: int) -> gc_mark_val live (VStr h)) in
   let mk = fn (k: str) -> fn (v: Val) -> gc_mark_val live v in
   let _ = gc_mark_env live env in
   let _ = map_iter globals mk in
@@ -1205,6 +1211,18 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_sh comp_outer dP "" in
     let _ = (if nc then () else map_compact proc_store) in
     let _ = (if nc then () else map_compact proc_yblk) in
+    // (and their side tables: the dropped entries left the old copies behind
+    //  in the default region, 250 MB of proc_src in test_integer_comb)
+    let _ = (if nc then () else map_compact proc_src) in
+    let _ = (if nc then () else map_compact proc_home) in
+    let _ = (if nc then () else map_compact proc_arity) in
+    let _ = (if nc then () else map_compact lambda_ids) in
+    let _ = (if nc then () else map_compact proc_symsrc) in
+    let _ = (if nc then () else map_compact curry_args) in
+    let _ = (if nc then () else map_compact comp_inner) in
+    let _ = (if nc then () else map_compact comp_outer) in
+    let _ = (if nc then () else map_compact proc_bkey) in
+    let _ = (if nc then () else map_compact yblk_bkey) in
     // THE SWEEP DELETES WHAT DIED, WHERE IT IS (note 270). Every table here
     // was emptied and refilled with its survivors, then compacted -- which
     // copied each live entry twice, and, when the compaction did not happen,
@@ -1359,7 +1377,6 @@ let gc_collect = fn env -> fn world ->
     let _ = (if nc then () else map_compact call_names_s) in
     let _ = (if nc then () else map_compact call_files_s) in
     let _ = (if nc then () else map_compact call_meths_s) in
-    let _ = (if nc then () else map_compact cur_pos_s) in
     let _ = (if nc then () else map_compact call_lines) in
     // cur_pos: two keys, one write per STATEMENT executed (the SLine marker) --
     // 14.9M writes and 456 MB of orphaned boxes in a rubocop load, the second
@@ -1367,6 +1384,7 @@ let gc_collect = fn env -> fn world ->
     // extracts the int (a Val read out of a compacted map must not be held:
     // see thread_flag).
     let _ = (if nc then () else map_compact live_frames) in
+    let _ = (if nc || (if map_has top_env_reg 0 then false else true) then () else map_compact (map_get top_env_reg 0)) in
     let _ = (if nc then () else map_compact struct_ctr) in
     let _ = (if nc then () else map_compact thread_flag) in
     let _ = (if nc then () else map_compact gc_bare) in
@@ -1416,6 +1434,11 @@ let gc_collect = fn env -> fn world ->
 // ASan). Off the stack, the caller's stack is suspended and pinned like any
 // other, and the env in hand is handed over (gc_off_env) to be rooted as before.
 let gc_off_env = map_new ();
+// the top-level env, which every top-level assignment writes: a map that lived
+// in the default region, so each write's old copy stayed there (192 MB for
+// 3 million `s = i.to_s`). It has an arena of its own (run_src) and the
+// collector compacts it here like the other tables a statement rewrites.
+let top_env_reg = map_new ();
 let gc_collect_any = fn env -> fn world ->
   if fb_off_stack then
     (let _ = map_set gc_off_env 0 env in
@@ -3174,39 +3197,47 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   // write the attribute through the normal method dispatch.
   | EAttrOp (recv_e, name, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
-    let e2 = lv_flat env in
+    // (a pooled scratch env -- see lv_flat_pooled -- so the value returned is
+    //  the one computed here, never one read back out of it: Ruby's value of
+    //  `recv.attr op= v` is the value assigned, not what the setter returns)
+    let e2 = lv_flat_pooled env in
     let _ = map_set e2 "__opr" r in
     // self-receiver keeps ESelf so private accessors stay reachable (self is
     // side-effect-free, so evaluating it twice is harmless).
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
     let cur = eval_e e2 world blk (EMethod (rx, name, Nil)) in
-    if str_eq op "||" then
-      (if truthy cur then cur
-       else let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))))
-    else if str_eq op "&&" then
-      (if truthy cur then (let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil)))) else cur)
-    else
-      let v = eval_e env world blk rhs_e in
-      let _ = map_set e2 "__opv" (apply_bin_vals world blk op cur v) in
-      eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil)))
+    let set9 = fn (v: Val) -> (let _ = map_set e2 "__opv" v in let _ = eval_e e2 world blk (EMethod (rx, name ++ "=", Cons (EVar "__opv", Nil))) in v) in
+    let res9 =
+      (if str_eq op "||" then
+         (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
+       else if str_eq op "&&" then
+         (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
+       else
+         (let v = eval_e env world blk rhs_e in
+          set9 (apply_bin_vals world blk op cur v))) in
+    let _ = scratch_env_done e2 in
+    res9
   // recv[idx..] op= rhs — evaluate recv and the indices once (bound to temps).
   | EIdxOp (recv_e, idx_es, op, rhs_e) ->
     let r = eval_e env world blk recv_e in
     let idxs = eval_args env world blk idx_es in
-    let e2 = lv_flat env in
+    // (a pooled scratch env, as for EAttrOp above)
+    let e2 = lv_flat_pooled env in
     let _ = map_set e2 "__opr" r in
     let rx = (match recv_e with ESelf -> ESelf | _ -> EVar "__opr") in
     let ies = idx_temp_exprs e2 idxs 0 in
     let cur = eval_e e2 world blk (EMethod (rx, "[]", ies)) in
-    if str_eq op "||" then
-      (if truthy cur then cur
-       else let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))))
-    else if str_eq op "&&" then
-      (if truthy cur then (let v = eval_e env world blk rhs_e in let _ = map_set e2 "__opv" v in eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil))))) else cur)
-    else
-      let v = eval_e env world blk rhs_e in
-      let _ = map_set e2 "__opv" (apply_bin_vals world blk op cur v) in
-      eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil))))
+    let set9 = fn (v: Val) -> (let _ = map_set e2 "__opv" v in let _ = eval_e e2 world blk (EMethod (rx, "[]=", eapp ies (Cons (EVar "__opv", Nil)))) in v) in
+    let res9 =
+      (if str_eq op "||" then
+         (if truthy cur then cur else set9 (eval_e env world blk rhs_e))
+       else if str_eq op "&&" then
+         (if truthy cur then set9 (eval_e env world blk rhs_e) else cur)
+       else
+         (let v = eval_e env world blk rhs_e in
+          set9 (apply_bin_vals world blk op cur v))) in
+    let _ = scratch_env_done e2 in
+    res9
   | EMethod (recv_e, name, arges) ->
     // `"literal".freeze` is ruby's interning special form: every evaluation
     // of the same literal-freeze answers ONE object (CRuby compiles it to
@@ -20920,7 +20951,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        then (let f9 = (if map_has proc_src ("f" ++ str_of_int pid) then map_get proc_src ("f" ++ str_of_int pid) else mkstr "") in
              match f9 with
              | VStr h9 -> (if str_eq (sget h9) "" then VNil
-                           else arr_new (Cons (f9, Cons (map_get proc_src (str_of_int pid), Nil))))
+                           // (a copy: the file's text is one handle shared by every
+                           //  proc written there -- frame_text)
+                           else arr_new (Cons (mkstr (sget h9), Cons (map_get proc_src (str_of_int pid), Nil))))
              | _ -> VNil)
        else VNil)
     // currying a curried proc curries the proc BEHIND it, not the collector.
@@ -31408,6 +31441,17 @@ and insert_w = fn world -> fn (x: Val) -> fn (sorted: Val list) ->
 // apply a binary operator (named by a symbol like :+) to two runtime values
 // by evaluating a real EBin over a scratch env — reuses all operator logic.
 and apply_bin_vals = fn world -> fn blk -> fn (op: str) -> fn (a: Val) -> fn (b: Val) ->
+  // ⚠ two integers and a plain operator answer without the scratch env (a
+  //   container that goes to the default region and stays): that is
+  //   `self.assertions += 1`, once per assertion. A frame from the pool here
+  //   instead answered 4 for `h[:x] <<= [*b, 3]` inside a method, and was
+  //   not chased further (note 300).
+  let (fast9, fv9) = (match a with
+                      | VInt ia -> (match b with
+                                    | VInt ib -> (if int_ops_plain world then int_fast_op op ia ib else (false, VNil))
+                                    | _ -> (false, VNil))
+                      | _ -> (false, VNil)) in
+  if fast9 then fv9 else
   let e2 = map_new () in
   let _ = map_set e2 "__ra" a in
   let _ = map_set e2 "__rb" b in
@@ -33571,7 +33615,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
                      | _ -> frame_pool_get ())
                   else frame_pool_get ()) in
      let _ = map_set frame "__fid" (VInt (next_fid ())) in
-     let _ = map_set frame "__meth" (mkstr name) in
+     let _ = map_set frame "__meth" (frame_text name) in
      // Whether THIS call was given a block. `block_given?` asks about the
      // enclosing METHOD frame, and Ruby's rule reaches it through any number
      // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
@@ -33584,9 +33628,9 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
     // in the slot its ten readers already know, and the nesting in one of its
     // own. Unpacked here, once, rather than at each reader.
     let crefv9 = (if map_has meth_cref name then map_get meth_cref name else "") in
-    let _ = map_set frame "__cref" (mkstr (pack_cref crefv9)) in
+    let _ = map_set frame "__cref" (frame_text (pack_cref crefv9)) in
     let _ = (let n9 = pack_nest crefv9 in
-             if str_eq n9 "" then () else map_set frame "__nest" (mkstr n9)) in
+             if str_eq n9 "" then () else map_set frame "__nest" (frame_text n9)) in
     // the refinements the method was WRITTEN under (see ref_enter_meth)
     let rfprev9 = (if ref_on () then ref_enter_meth frame crefv9 else 0 - 1) in
      let _ = bind_params frame world blk name params defaults args in
@@ -33885,10 +33929,10 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
               then (match map_get alias_srcname dk with s -> s)
               else name in
     let _ = map_set frame "__defcls" (VClass dc) in
-    let _ = map_set frame "__meth" (mkstr mnm) in
+    let _ = map_set frame "__meth" (frame_text mnm) in
     // __callee__ answers the name the method was CALLED by; only an alias
     // makes it differ from __meth (the name it was defined under).
-    let _ = (if str_eq mnm name then () else map_set frame "__callee" (mkstr name)) in
+    let _ = (if str_eq mnm name then () else map_set frame "__callee" (frame_text name)) in
     // Whether THIS call was given a block. `block_given?` asks about the
     // enclosing METHOD frame, and Ruby's rule reaches it through any number
     // of blocks -- `m { }` with `def m; [1].each { block_given? }; end` is
@@ -33904,9 +33948,9 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
     //   proc's own env through the parent link, and writing "" here hid it --
     //   `FLOAT_VALUES` inside test_sprintf_comb's procs was a NameError
     let keep_proc_cref = (if from_pool then false else (if map_has meth_cref dk then false else true)) in
-    let _ = (if keep_proc_cref then () else map_set frame "__cref" (mkstr (pack_cref crefv8))) in
+    let _ = (if keep_proc_cref then () else map_set frame "__cref" (frame_text (pack_cref crefv8))) in
     let _ = (let n8 = pack_nest crefv8 in
-             if str_eq n8 "" then () else map_set frame "__nest" (mkstr n8)) in
+             if str_eq n8 "" then () else map_set frame "__nest" (frame_text n8)) in
     // the refinements the method was WRITTEN under, not the caller's: a
     // refinement is lexical (see ref_enter_meth)
     let rfprev8 = (if ref_on () then ref_enter_meth frame crefv8 else 0 - 1) in
@@ -34989,7 +35033,7 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let _ = map_set call_lines cd (cur_line ()) in
   let _ = map_set_si call_files_s cd (cur_file ()) in
   let _ = map_set_si call_meths_s cd (cur_meth ()) in
-  let _ = map_set_s cur_pos_s "m" mlabel9 in
+  let _ = cur_meth_set mlabel9 in
   // mark this frame live so a break targeting it (via a block's home) can find
   // it; once the body has unwound to here (any outcome) the frame is done.
   let fidk = (if map_has frame "__fid" then (match map_get frame "__fid" with VInt t -> t | _ -> 0 - 1) else 0 - 1) in
@@ -35027,8 +35071,8 @@ and method_body_flow = fn frame -> fn world -> fn blk -> fn (body: Stmt list) ->
   let _ = (if gcbare then () else gc_unsafe_pop ()) in
   // ... and with it the caller's line and file, for the same reason
   let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
-  let _ = map_set_s cur_pos_s "f" (if map_has call_files_s cd then map_get call_files_s cd else "") in
-  let _ = map_set_s cur_pos_s "m" (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
+  let _ = cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "") in
+  let _ = cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
   // read, compare, write only if it differs -- the body may have left the flag
   // set (a nested Thread.new), so "skip the restore because we skipped the
   // entry write" would be wrong.
@@ -41195,14 +41239,14 @@ and in_scope_frame = fn (label: str) -> fn senv -> fn (body: unit -> Flow) ->
   let _ = map_set call_lines cd (cur_line ()) in
   let _ = map_set_si call_files_s cd (cur_file ()) in
   let _ = map_set_si call_meths_s cd (cur_meth ()) in
-  let _ = map_set_s cur_pos_s "m" label in
+  let _ = cur_meth_set label in
   let _ = map_set fb_env_at cd senv in
   let _ = map_set senv "__scope" (mkstr label) in
   let r = try_or body (FRaise VNil) in
   let _ = cd_set cd in
   let _ = cur_line_set (if map_has call_lines cd then map_get call_lines cd else 0) in
-  let _ = map_set_s cur_pos_s "f" (if map_has call_files_s cd then map_get call_files_s cd else "") in
-  let _ = map_set_s cur_pos_s "m" (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
+  let _ = cur_file_set (if map_has call_files_s cd then map_get call_files_s cd else "") in
+  let _ = cur_meth_set (if map_has call_meths_s cd then map_get call_meths_s cd else "") in
   r
 // `<class:Name>` / `<module:Name>`: the last segment of the name
 and scope_label_of = fn (cls: str) ->
@@ -42693,7 +42737,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
              then fire_tp_v world "line" "" "" VNil (if lv_has env "self" then lv_get env "self" else VMain)
              else ()) in
     FNext VNil
-  | SFile f -> let _ = map_set_s cur_pos_s "f" f in FNext VNil
+  | SFile f -> let _ = cur_file_set f in FNext VNil
   | SPuts es ->
     // `puts` is a statement in this parser, so a user-defined one was not merely
     // outranked -- it was never consulted. Hand the statement to it when one is
@@ -44190,12 +44234,12 @@ and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (e
     // the parsed program carries an SFile naming the eval'd SOURCE, which
     // would overwrite the file the caller named the moment it runs.
     (let prog2 = drop_file_marks prog2 in
-     let of9 = (if map_has cur_pos_s "f" then map_get cur_pos_s "f" else "") in
+     let of9 = (cur_file ()) in
      let ol9 = (cur_line ()) in
-     let _ = map_set_s cur_pos_s "f" efile in
+     let _ = cur_file_set efile in
      let _ = cur_line_set eline in
      let r9 = eval_run env world blk prog2 in
-     let _ = map_set_s cur_pos_s "f" of9 in
+     let _ = cur_file_set of9 in
      let _ = cur_line_set ol9 in
      r9)
 
