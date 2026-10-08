@@ -869,19 +869,67 @@ let hstale_fold = fn (id: int) ->
      else ())
   else ();
 // anything the index cannot describe: the hash goes back to scanning
+// ⚠ AN INDEX IS A CONTAINER, AND A CONTAINER MADE HERE IS NEVER GIVEN BACK
+//   (note 302). `map_new ()` stored in a global table lives in Mere's shared
+//   default region, and every digest and value written into it is copied
+//   there for good: dropping the index from hash_index drops the handle,
+//   not the bytes. Every Hash had one from birth -- 1,000,000 throwaway `{}`
+//   peaked at 379 MB, `{a: 1, ..., i: 9}` at 2.3 GB.
+//   So (1) a small hash of plain keys has no index at all (hplain_small,
+//   below -- CRuby's AR table is the same idea), and (2) the index a big one
+//   gets has an arena of its own and goes back to a pool when it is dropped,
+//   wound back by map_recycle, as interpreter frames do (frame_pool).
+let hidx_pool = vec_new ();
+let hidx_pool_n = vec_new ();
+let _ = vec_push hidx_pool_n 0;
+let hidx_release = fn (id: int) ->
+  if map_has hash_index id then
+    (let ix = map_get hash_index id in
+     let _ = map_delete hash_index id in
+     let _ = map_recycle ix in
+     let n = vec_get hidx_pool_n 0 in
+     if n >= 4096 then ()
+     else (let _ = (if n < vec_len hidx_pool then vec_set hidx_pool n ix else vec_push hidx_pool ix) in
+           vec_set hidx_pool_n 0 (n + 1)))
+  else ();
 let hidx_drop = fn (id: int) ->
   // (a stale list is brought up to date while the index can still say how --
   //  the queue of new pairs keeps its own values, and hderef folds it later)
   let _ = hstale_fold id in
   if map_has hash_indexed id
   then (let _ = map_delete hash_indexed id in
-        let _ = (if map_has hash_index id then (let _ = map_delete hash_index id in ()) else ()) in ())
+        let _ = hidx_release id in ())
   else ();
-// a hash created EMPTY starts indexed; one created from pairs does not (the
-// pairs would have to be walked and classified, and a literal is small)
 let hidx_start = fn (id: int) ->
   let _ = map_set hash_indexed id true in
-  let _ = map_set hash_index id (map_new ()) in ();
+  let n = vec_get hidx_pool_n 0 in
+  let ix = (if n > 0 then (let _ = vec_set hidx_pool_n 0 (n - 1) in vec_get hidx_pool (n - 1))
+            else (let m = map_new () in let _ = map_recycle m in m)) in
+  let _ = map_set hash_index id ix in ();
+// keys a plain list can hold without an index: ones that cannot change after
+// they are stored (a String key is stored as a frozen copy) and compare by
+// value the way the digest does. A container key, an object with its own
+// #hash, a NaN, ... keep the index's "digest taken at the store" rule.
+// (a String key is plain only FROZEN: Hash[] stores the caller's own string,
+//  which the caller may still change -- test_s_AREF_key_tampering)
+let fn sfrozen_fwd: int -> bool;
+let fn hcbi_fwd: int -> bool;
+let hplain_key = fn (k: Val) ->
+  match k with
+  | VInt _ -> true | VSym _ -> true | VNil -> true | VBool _ -> true | VStr h -> sfrozen_fwd h
+  | VFlt f -> f == f
+  | _ -> false;
+let hsmall_max = 16;
+// at most hsmall_max pairs, every key plain (lim counts pairs still allowed)
+let rec hplain_small_go = fn (xs: Val list) -> fn (lim: int) ->
+  match xs with
+  | Nil -> true
+  | Cons (k, Cons (_, t)) -> lim > 0 && hplain_key k && hplain_small_go t (lim - 1)
+  | _ -> false;
+let hplain_small = fn (xs: Val list) -> hplain_small_go xs hsmall_max;
+// the number of pairs, counted no further than lim
+let rec hpairs_upto = fn (xs: Val list) -> fn (n: int) -> fn (lim: int) ->
+  if n >= lim then n else (match xs with Cons (_, Cons (_, t)) -> hpairs_upto t (n + 1) lim | _ -> n);
 let hidx_put = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
   map_set (map_get hash_index id) d v;
 let hidx_has = fn (id: int) -> fn (d: str) -> map_has (map_get hash_index id) d;
@@ -902,10 +950,10 @@ let rec hidx_seed = fn (id: int) -> fn (ys: Val list) ->
 let mkhash = fn (xs: Val list) ->
   let id = handle_base + vec_len hash_store in
   let _ = vec_push hash_store xs in
-  let _ = (match xs with
-           | Nil -> hidx_start id
-           | _ -> (let _ = hidx_start id in
-                   if hidx_seed id xs then () else hidx_drop id)) in
+  // (a small hash of plain keys -- `{}`, `{a: 1}` -- is its list alone)
+  let _ = (if hplain_small xs then ()
+           else (let _ = hidx_start id in
+                 if hidx_seed id xs then () else hidx_drop id)) in
   VHsh id;
 // ⚠ NEW PAIRS QUEUE IN A Vec, for the reason arr_pending does: `hset` is
 // `vec_set hash_store id xs` and a `Val list` is a VALUE type, so storing it
@@ -967,6 +1015,22 @@ let hput_over = fn (id: int) -> fn (d: str) -> fn (v: Val) ->
   map_set hash_stale id true;
 // queue a pair whose key is NOT already present (the caller has checked)
 let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
+  // a small plain hash queues the pair WITHOUT an index; one that outgrows
+  // hsmall_max pairs, or meets a key that is not plain, gets its index here,
+  // over what it holds. (Writing the pair into the list instead -- a short
+  // copy per insertion -- was worse: hash_store's arena is pinned while a
+  // loop runs, so the copies piled up, 961 -> 1601 MB for 300k hashes of ten
+  // insertions, note 302.)
+  let qn9 = (if map_len hash_pending > 0 && map_has hash_pending id then vec_len (map_get hash_pending id) / 2 else 0) in
+  let plain9 = (if hidx_on id || hcbi_fwd id then false
+                else if map_has hidx_off "o" then (match map_get hidx_off "o" with 1 -> false | _ -> true)
+                else true) in
+  let _ = (if plain9 && (if hplain_key k && hpairs_upto (hsettled id) 0 hsmall_max + qn9 < hsmall_max then false else true)
+              && hplain_small (hsettled id)
+           then (let _ = hpend_fold id in
+                 let _ = hidx_start id in
+                 if hidx_seed id (hsettled id) then () else hidx_drop id)
+           else ()) in
   let q = (if map_has hash_pending id then map_get hash_pending id
            else (let nq = vec_new () in let _ = map_set hash_pending id nq in nq)) in
   // keep the index in step, or give it up: a key it cannot digest means the
@@ -1048,6 +1112,7 @@ let schilled_get = fn (id: int) -> map_has str_chilled id;
 // here"). Written only under the switch, so nothing pays for it otherwise.
 let str_lit_site = map_new ();
 let sfrozen_get = fn (id: int) -> map_has str_frozen id;
+let sfrozen_fwd = fn (id: int) -> sfrozen_get id;
 // frozen state of ordinary objects (keyed by object id string), consulted by
 // #frozen? on the object and on its singleton class.
 // frozen state of arrays / hashes. Arrays and hashes live in separate stores,
@@ -2606,7 +2671,10 @@ let cyc_flag = map_new ();
 // compare keys with `equal?` rather than `==`, so two equal Strings are two
 // different keys.
 let hcbi = map_new ();
-let hcbi_on = fn (id: int) -> map_has hcbi (str_of_int id);
+// (keyed by the handle as an int: a str_of_int key is an arena copy per
+//  compare_by_identity -- note 302)
+let hcbi_on = fn (id: int) -> map_has hcbi id;
+let hcbi_fwd = fn (id: int) -> hcbi_on id;
 // the hash code each stored key had when it was stored: "<hash handle>|<key>".
 let hstored = map_new ();
 // the keyword hash the current #full_message was called with, for the
@@ -2617,7 +2685,7 @@ let fm_kw = map_new ();
 // in ruby. Every derived hash was built with a plain mkhash, which loses it.
 let hcbi_copy = fn (src: int) -> fn (dst: Val) ->
   match dst with
-  | VHsh d -> (if map_has hcbi (str_of_int src) then (let _ = hidx_drop d in map_set hcbi (str_of_int d) 1) else ())
+  | VHsh d -> (if map_has hcbi src then (let _ = hidx_drop d in map_set hcbi d 1) else ())
   | _ -> ();
 
 
