@@ -27888,7 +27888,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     (match recv with
      | VStr h ->
        (let e = enc_canon_name (senc_get h) in
-        if enc_ascii_compat e then
+        // (only UTF-8 dumps through its inspect, with \u escapes: another
+        //  ASCII-compatible encoding writes every high byte as \xNN, as
+        //  rb_str_dump does -- its inspect's "\x{A1A1}" would not undump)
+        if enc_ascii_compat e && enc_utf8_family e then
           (let c = mkstr (str_dump_go (inspect (VStr h)) 0 "") in
            (match c with VStr cid -> (let _ = senc_set cid e in c) | _ -> c))
         else
@@ -27908,8 +27911,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                          else if o >= 32 && o < 127 then char_at s i
                          else "\\x" ++ hex2_up o) in
                go (i + 1) (acc ++ pc) in
-           let c = mkstr ("\"" ++ go 0 "" ++ "\".force_encoding(\"" ++ e ++ "\")") in
-           (match c with VStr cid -> (let _ = senc_set cid "ASCII-8BIT" in c) | _ -> c)))
+           let c = (if enc_ascii_compat e then mkstr ("\"" ++ go 0 "" ++ "\"")
+                    else mkstr ("\"" ++ go 0 "" ++ "\".force_encoding(\"" ++ e ++ "\")")) in
+           (match c with VStr cid -> (let _ = senc_set cid (if enc_ascii_compat e then e else "ASCII-8BIT") in c) | _ -> c)))
      | _ -> VNil)
   else if (str_len name == 7 && str_eq name "casecmp") then
     (match recv with
@@ -28183,6 +28187,16 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         else if str_eq e "US-ASCII" then
           (let b0 = ord (char_at sv 0) in
            if b0 < 128 then VInt b0 else prim_raise "ArgumentError" "invalid byte sequence in US-ASCII")
+        // (another multibyte encoding: the first character's bytes read
+        //  big-endian -- "\xA1\xA1" in EUC-JP is 0xA1A1, as ruby's
+        //  mbc_to_code answers; a one-byte encoding is its byte)
+        else if enc_cut e == 2 && enc_ascii_compat e then
+          (let l = enc_clen sv e 0 in
+           if enc_valid (substring sv 0 l) e then
+             (let rec code = fn (k: int) -> fn (acc: int) -> if k >= l then acc else code (k + 1) (acc * 256 + ord (char_at sv k)) in
+              VInt (code 0 0))
+           else prim_raise "ArgumentError" ("invalid byte sequence in " ++ e))
+        else if enc_cut e == 0 then VInt (ord (char_at sv 0))
         else VInt (match utf8_cp sv 0 with (c, l) -> c))
      | VInt n -> VInt n
      | VBig b -> VBig b
@@ -28801,15 +28815,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        //   UTF-8, so `euc[0]` of "\xA4\xA2" was the single byte "\xA4".
        //   enc_clen is the cutting #chars uses; the pieces keep the encoding.
        let e9 = enc_canon_name (senc_get sid) in
-       let mb9 = (if ascii8 || str_eq e9 "UTF-8" then false else enc_multibyte e9) in
+       // (and BINARY and the other one-byte encodings take the same arms --
+       //  es_boff is O(1) for them; `b("\xC2\xA1")[0]` was cut as UTF-8)
+       let mb9 = (if enc_utf8_family e9 then false else true) in
        // an all-ASCII string (asked once per string, str_is_ascii) is indexed
        // by byte: the walks below were the whole string for its length and
        // up to i for the offset, every call
        let a1 = (if mb9 then false else str_is_ascii sid) in
        let n = (if mb9 then str_rblen sid else if a1 then str_len s else utf8_len s) in
        let mbsub = fn (st: int) -> fn (len: int) ->
-         (let a9 = enc_boff s e9 st 0 in
-          let b9 = enc_boff s e9 len a9 in
+         (let a9 = es_boff s e9 st in
+          let b9 = (if enc_cut e9 == 0 then (if a9 + len > str_len s then str_len s else a9 + len) else enc_boff s e9 len a9) in
           mkstr_e (substring s a9 b9) (senc_get sid)) in
        (match args with
         | Cons (VInt i, Cons (VInt len, _)) when mb9 ->
@@ -29172,7 +29188,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (str_len name == 9 && str_eq name "negative?") then (match recv with VInt n -> VBool (n < 0) | VFlt f -> VBool (f < 0.0) | VBig s -> VBool (cmp_vals recv (VInt 0) < 0) | VRat (n, d) -> VBool (big_sign n < 0) | _ -> (let _ = prim_nm_set (mkstr "negative?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'negative?'")) in fail "mere-ruby: undefined method 'negative?'")))
   // (at the int64 edge the next integer is a Bignum: `(-2**63).pred` wrapped
   // to 2**63-1, and a reverse_each down from there never reached its end)
-  else if (str_len name == 4 && str_eq name "succ") || (str_len name == 4 && str_eq name "next") then (match recv with VInt n -> (if n == int_max then norm_big (big_add_s (str_of_int n) "1") else VInt (n + 1)) | VBig b -> norm_big (big_add_s b "1") | VStr s -> mkstr (str_succ (sget s)) | _ -> (let _ = prim_nm_set (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
+  else if (str_len name == 4 && str_eq name "succ") || (str_len name == 4 && str_eq name "next") then (match recv with VInt n -> (if n == int_max then norm_big (big_add_s (str_of_int n) "1") else VInt (n + 1)) | VBig b -> norm_big (big_add_s b "1") | VStr s -> (let e9 = enc_canon_name (senc_get s) in
+              if es_succ_applies (sget s) e9 then mkstr_e (es_succ (sget s) e9) (senc_get s)
+              else mkstr (str_succ (sget s))) | _ -> (let _ = prim_nm_set (mkstr "succ") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr "mere-ruby: undefined method 'succ'")) in fail "mere-ruby: undefined method 'succ'")))
   // Integer#ceildiv(other): the division rounded UP, which is the floor of the
   // negated numerator negated back (7.ceildiv(2) is 4, -7.ceildiv(2) is -3).
   else if (str_len name == 7 && str_eq name "ceildiv") then
@@ -29720,11 +29738,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // a binary string's characters ARE its bytes: chop removes ONE byte
         // (a UTF-8 walk here removed a whole multibyte sequence, which kept
         // "проверка".b.chop! accidentally valid).
-        if str_eq e "ASCII-8BIT" then
+        if str_eq e "ASCII-8BIT" || (enc_cut e == 0 && enc_ascii_compat e) then
           (let s0 = sget sh0 in
            let n = str_len s0 in
            let cut = (if n >= 2 && str_eq (substring s0 (n - 2) n) "\r\n" then n - 2
                       else if n >= 1 then n - 1 else 0) in
+           let v = mkstr (substring s0 0 cut) in
+           (match v with VStr id -> (let _ = senc_set id e in v) | _ -> v))
+        // (EUC-JP, Shift_JIS ...: the last character of their own -- note 301)
+        else if enc_cut e == 2 && enc_ascii_compat e then
+          (let s0 = sget sh0 in
+           let n = str_len s0 in
+           let rec last = fn (i: int) -> fn (prev: int) -> (if i >= n then prev else last (i + enc_clen s0 e i) i) in
+           let cut = (if n >= 2 && str_eq (substring s0 (n - 2) n) "\r\n" then n - 2 else if n >= 1 then last 0 0 else 0) in
            let v = mkstr (substring s0 0 cut) in
            (match v with VStr id -> (let _ = senc_set id e in v) | _ -> v))
         else if enc_ascii_compat e then mkstr (str_chop (sget sh0))
