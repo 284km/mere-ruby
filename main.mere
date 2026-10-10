@@ -549,6 +549,7 @@ let top_env_reg = map_new ();
 // to 290 MB and never asked for a collection, note 301)
 let gc_store_bytes = fn (u: unit) ->
   if arena_measurable then vec_bytes str_store + map_bytes str_pch + map_bytes arr_store + vec_bytes hash_store + gc_churn_bytes ()
+                           + vec_get qv_ctr 3
                            + (if map_has top_env_reg 0 then map_bytes (map_get top_env_reg 0) else 0)
   else 0;
 
@@ -651,7 +652,21 @@ let rec gc_mark_val = fn live -> fn (v: Val) ->
                 else let _ = map_set live k VNil in arr_each_val id (fn (x: Val) -> gc_mark_val live x))
   | VHsh id -> let k = id * 8 + 3 in
                (if map_has live k then ()
-                else let _ = map_set live k VNil in gc_mark_vals live (hderef id))
+                // read where the pairs are -- the list, the values the index
+                // overwrote since, the queue -- and not folded (hderef): a
+                // fold here copies the hash into hash_store's arena, which a
+                // loop on the stack pins, so a collection every 64k queues
+                // left a copy of every live hash each time (note 303)
+                else let _ = map_set live k VNil in
+                     let _ = gc_mark_vals live (hsettled id) in
+                     let _ = (if map_has hash_index id
+                              then map_iter (map_get hash_index id) (fn (d: str) -> fn (x: Val) -> gc_mark_val live x)
+                              else ()) in
+                     (if hpending_on id then
+                        (let q = hpending_vec id in
+                         let rec gq = fn (i: int) -> (if i >= vec_len q then () else (let _ = gc_mark_val live (vec_get q i) in gq (i + 1))) in
+                         gq 0)
+                      else ()))
   | VProc id -> let k = id * 8 + 4 in
                 (if map_has live k then ()
                  else let _ = map_set live k VNil in
@@ -1282,16 +1297,17 @@ let gc_collect = fn env -> fn world ->
     let dPK = vec_new () in
     let _ = map_iter arr_pending (fn (k: int) -> fn (v: Vec['p, Val]) ->
       if map_has live (k * 8 + 2) then () else vec_push dPK k) in
-    let _ = gc_drop_i arr_pending dPK in
+    // (the queues go back through the quarantine: qv_drop, m_state)
+    let rec dropPK = fn (i: int) -> (if i >= vec_len dPK then () else (let _ = arr_drop_q (vec_get dPK i) in dropPK (i + 1))) in
+    let _ = dropPK 0 in
     let _ = gc_drop_i arr_store dAK in
     // ...and what was kept beside a dead array: its shifted-off count, its
     // stored length, its queue's length
     let _ = gc_drop_ih arr_off dAK in
     let _ = gc_drop_ih arr_slen dAK in
     let _ = gc_drop_ih arr_plen dAK in
-    let _ = gc_drop_ih arr_vc dAK in
-    let _ = gc_drop_ih arr_vc_ver dAK in
-    let _ = gc_drop_ih arr_vc_len dAK in
+    let rec dropVC = fn (i: int) -> (if i >= vec_len dAK then () else (let _ = arr_vc_forget (vec_get dAK i) false in dropVC (i + 1))) in
+    let _ = dropVC 0 in
     let _ = (if nc then () else map_compact arr_store) in
     // (the last sweep's survivors and the slots issued since -- see gc_hash_surv;
     //  the survivors are rewritten in place, never past the one being read)
@@ -1299,9 +1315,12 @@ let gc_collect = fn env -> fn world ->
       let h9 = handle_base + i in
       if map_has live (h9 * 8 + 3) then (let _ = gc_surv_put gc_hash_surv k i in k + 1)
       else
-        (let _ = (match hderef h9 with
+        // (its queue is dropped, not folded in first; the index, the stale
+        //  mark and the rest are swept below)
+        (let _ = hpend_drop h9 in
+         let _ = (match hsettled h9 with
                   | Nil -> ()
-                  | _ -> (let _ = hset h9 (Nil : Val list) in ())) in
+                  | _ -> vec_set hash_store (h9 - handle_base) (Nil : Val list)) in
          k) in
     let hold = vec_get gc_knob 11 in
     let rec blank_ho = fn (j: int) -> fn (k: int) ->
@@ -1312,15 +1331,16 @@ let gc_collect = fn env -> fn world ->
     let _ = vec_set gc_knob 11 hk in
     let _ = vec_set gc_knob 9 (vec_len hash_store) in
     // ⚠ and the pairs queued for a hash but not yet folded in -- as reachable
-    // as the hash itself (gc_mark_val folds them in through hderef before
-    // marking), and a dead hash's queue goes with it.
+    // as the hash itself (gc_mark_val marks them in the queue), and a dead
+    // hash's queue goes with it.
     // ...and the index beside it. Its values are the hash's own values, so it
     // holds nothing the hash does not; a DEAD hash's index is dropped here so
     // the table does not grow with every hash ever made.
     let dHQ = vec_new () in
     let _ = map_iter hash_pending (fn (k: int) -> fn (q: Vec['q, Val]) ->
       if map_has live (k * 8 + 3) then () else vec_push dHQ k) in
-    let _ = gc_drop_i hash_pending dHQ in
+    let rec dropHQ = fn (i: int) -> (if i >= vec_len dHQ then () else (let _ = hpend_drop (vec_get dHQ i) in dropHQ (i + 1))) in
+    let _ = dropHQ 0 in
     let dHI = vec_new () in
     let _ = map_iter hash_index (fn (k: int) -> fn (ix: Map['i, str, Val]) ->
       if map_has live (k * 8 + 3) then () else vec_push dHI k) in
@@ -1331,8 +1351,9 @@ let gc_collect = fn env -> fn world ->
     let _ = map_iter hash_indexed (fn (k: int) -> fn (b: bool) ->
       if map_has live (k * 8 + 3) then () else vec_push dHM k) in
     let _ = gc_drop_i hash_indexed dHM in
-    // (a dead hash's stale mark goes too; a live one's list was folded by
-    //  gc_mark_val's hderef already)
+    // (a dead hash's stale mark goes too; a live one keeps its own, and the
+    //  values in its list the index overwrote were marked with the list --
+    //  kept a collection longer, never lost)
     let dHS = vec_new () in
     let _ = map_iter hash_stale (fn (k: int) -> fn (b: bool) ->
       if map_has live (k * 8 + 3) then () else vec_push dHS k) in
@@ -1417,6 +1438,11 @@ let gc_collect = fn env -> fn world ->
     // gc_churn_bytes): their entries are all kept, the copies the writes
     // replaced go back with the old arena
     let _ = (if nc then () else gc_churn_compact ()) in
+    // ...and the queues and indexes dropped since the last one go back to their
+    // pools, now that every stack is suspended (note 303)
+    let _ = (if nc then () else qv_drain ()) in
+    let _ = (if nc then () else hidx_drain ()) in
+    let _ = vec_set qv_ctr 3 0 in
     let _ = (if gclog then print_err ("gc: END live=" ++ str_of_int (map_len live) ++ " ivars2=" ++ str_of_int (map_len ivars)
                                      ++ " str_store=" ++ str_of_int (vec_bytes str_store) ++ " str_pch=" ++ str_of_int (map_bytes str_pch)
                                      ++ " arr_store=" ++ str_of_int (map_bytes arr_store) ++ " hash_store=" ++ str_of_int (vec_bytes hash_store)

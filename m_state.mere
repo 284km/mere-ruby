@@ -356,6 +356,59 @@ let arr_new = fn (xs: Val list) ->
 // build-then-read (`n.times { a << i }`, and CSV.parse), the settled part is
 // empty and the whole build is linear.
 // ⚠ THE QUEUED VALUES ARE LIVE. gc_roots_check.sh is the gate that says so.
+// ⚠ A QUEUE IS A CONTAINER, AND A CONTAINER MADE HERE IS NEVER GIVEN BACK
+//   (note 303, after note 302's index). `vec_new ()` in a function lives in
+//   Mere's shared default region and so does every value pushed into it:
+//   dropping the queue from the table drops the handle, not the bytes --
+//   `a = []; a << 1 << 2 << 3` a million times held 409 MB. A dropped queue
+//   goes into a QUARANTINE, and a collection that compacts (it runs off the
+//   stack) winds it back with vec_recycle and pools it for the next array or
+//   hash. Not at the drop: a value read out of the queue may still be held in
+//   the middle of an expression on the running stack, which nothing pins --
+//   `foo(h[:k], (h.clear; ...))` handed foo another hash's value when the
+//   index was wound back at the clear (it is quarantined the same way now).
+//   Off the stack, vec_recycle asks every suspended stack (the root's
+//   included) and moves to a fresh arena when one still points in.
+//   A recycled queue has an arena of its own (512 B and up), so the number
+//   that have one is capped, and every queue made counts toward the next
+//   collection (qv_ctr 3, in gc_store_bytes) -- otherwise a loop making
+//   nothing but small hashes never asked for one, and the pool never filled.
+let qv_pool = vec_new ();
+let qv_quar = vec_new ();
+// 0: in the pool, 1: in quarantine, 2: queues with an arena of their own,
+// 3: bytes charged for the queues made since the last collection
+let qv_ctr = vec_new ();
+let _ = vec_push qv_ctr 0;
+let _ = vec_push qv_ctr 0;
+let _ = vec_push qv_ctr 0;
+let _ = vec_push qv_ctr 0;
+let qv_cap = 65536;
+let qv_take = fn (u: unit) ->
+  let _ = vec_set qv_ctr 3 (vec_get qv_ctr 3 + 512) in
+  let n = vec_get qv_ctr 0 in
+  if n > 0 then (let _ = vec_set qv_ctr 0 (n - 1) in vec_get qv_pool (n - 1))
+  else vec_new ();
+let qv_drop = fn v ->
+  let n = vec_get qv_ctr 1 in
+  let _ = (if n < vec_len qv_quar then vec_set qv_quar n v else vec_push qv_quar v) in
+  vec_set qv_ctr 1 (n + 1);
+// (gc_collect, where it compacts)
+let qv_drain = fn (u: unit) ->
+  let rec go = fn (i: int) ->
+    if i >= vec_get qv_ctr 1 then ()
+    else
+      (let v = vec_get qv_quar i in
+       let own = vec_bytes v > 0 in
+       let _ = (if own || vec_get qv_ctr 2 < qv_cap then
+                  (let _ = (if own then () else vec_set qv_ctr 2 (vec_get qv_ctr 2 + 1)) in
+                   let _ = vec_recycle v in
+                   let n = vec_get qv_ctr 0 in
+                   let _ = (if n < vec_len qv_pool then vec_set qv_pool n v else vec_push qv_pool v) in
+                   vec_set qv_ctr 0 (n + 1))
+                else ()) in
+       go (i + 1)) in
+  let _ = go 0 in
+  vec_set qv_ctr 1 0;
 let arr_pending = map_new ();
 let rec vec_tail_list = fn (v) -> fn (i: int) -> fn (acc: Val list) ->
   if i < 0 then acc else vec_tail_list v (i - 1) (Cons (vec_get v i, acc));
@@ -390,9 +443,24 @@ let arr_qlen = fn (id: int) ->
   if arr_has_q id then
     (if map_len arr_plen > 0 && map_has arr_plen id then map_get arr_plen id else vec_len (map_get arr_pending id))
   else 0;
-let arr_drop_q = fn (id: int) ->
-  let _ = (if arr_has_q id then map_delete arr_pending id else ()) in
+// (keep: the queue was handed on -- to arr_vc -- and is not dropped)
+let arr_unq = fn (id: int) -> fn (keep: bool) ->
+  let _ = (if arr_has_q id then
+             (let v = map_get arr_pending id in
+              let _ = map_delete arr_pending id in
+              if keep then () else qv_drop v)
+           else ()) in
   (if map_len arr_plen > 0 && map_has arr_plen id then map_delete arr_plen id else ());
+let arr_drop_q = fn (id: int) -> arr_unq id false;
+// the Vec kept beside an array (arr_vc) goes, and back to the pool unless taken
+let arr_vc_forget = fn (id: int) -> fn (taken: bool) ->
+  if map_len arr_vc > 0 && map_has arr_vc id then
+    (let w = map_get arr_vc id in
+     let _ = map_delete arr_vc id in
+     let _ = map_delete arr_vc_ver id in
+     let _ = map_delete arr_vc_len id in
+     if taken then () else qv_drop w)
+  else ();
 let deref = fn (id: int) ->
   // `map_len` first: nothing is queued in most programs, and then this costs
   // one comparison rather than a hash on every array read.
@@ -403,15 +471,19 @@ let deref = fn (id: int) ->
      let qn = arr_qlen id in
      let merged = list_append stored0 (vec_tail_list v (qn - 1) (Nil : Val list)) in
      // a Vec that holds the WHOLE array is kept for the next write
-     let _ = (match stored0 with
-              | Nil -> (let _ = map_set arr_vc id v in
-                        let _ = map_set arr_vc_len id qn in
-                        map_set arr_vc_ver id (if map_has arr_vers id then map_get arr_vers id else 0))
-              | _ -> ()) in
+     let whole = (match stored0 with Nil -> true | _ -> false) in
+     let _ = (if whole then
+                (let _ = arr_vc_forget id false in
+                 let _ = map_set arr_vc id v in
+                 let _ = map_set arr_vc_len id qn in
+                 map_set arr_vc_ver id (if map_has arr_vers id then map_get arr_vers id else 0))
+              else ()) in
      let _ = map_set arr_store id merged in
-     let _ = arr_drop_q id in
+     let _ = arr_unq id whole in
      let _ = arr_forget_off id in
-     merged)
+     // (the stored copy, not `merged`: merged's elements are the queue's own,
+     //  in the arena the queue is wound back with)
+     map_get arr_store id)
   else (let o = arr_off_of id in
         if o == 0 then map_get arr_store id else list_drop_k (map_get arr_store id) o);
 let arr_vers = map_new ();
@@ -421,7 +493,7 @@ let rec vec_push_all = fn (v) -> fn (xs: Val list) ->
   match xs with Nil -> () | Cons (h, t) -> (let _ = vec_push v h in vec_push_all v t);
 let arr_push_many = fn (id: int) -> fn (xs: Val list) ->
   let v = (if map_has arr_pending id then map_get arr_pending id
-           else (let nv = vec_new () in let _ = map_set arr_pending id nv in nv)) in
+           else (let nv = qv_take () in let _ = map_set arr_pending id nv in nv)) in
   let _ = map_set arr_vers id (arr_ver id + 1) in
   if map_len arr_plen > 0 && map_has arr_plen id then
     // slots a pop counted off are written again before the Vec grows
@@ -483,10 +555,9 @@ let arr_drop_front = fn (id: int) -> fn (k: int) ->
 let arr_to_vec = fn (id: int) ->
   let xs = deref id in
   let keep = map_len arr_vc > 0 && map_has arr_vc id && map_get arr_vc_ver id == arr_ver id in
-  let v = (if keep then map_get arr_vc id else (let v0 = vec_new () in let _ = vec_push_all v0 xs in v0)) in
+  let v = (if keep then map_get arr_vc id else (let v0 = qv_take () in let _ = vec_push_all v0 xs in v0)) in
   let _ = (if keep then (if map_get arr_vc_len id < vec_len v then map_set arr_plen id (map_get arr_vc_len id) else ()) else ()) in
-  let _ = (if map_len arr_vc > 0 && map_has arr_vc id
-           then (let _ = map_delete arr_vc id in let _ = map_delete arr_vc_ver id in map_delete arr_vc_len id) else ()) in
+  let _ = arr_vc_forget id keep in
   let _ = map_set arr_store id (Nil : Val list) in
   let _ = arr_forget_off id in
   let _ = map_set arr_slen id 0 in
@@ -856,7 +927,15 @@ let hpend_fold = fn (id: int) ->
     (let q = map_get hash_pending id in
      let merged = list_append (vec_get hash_store (id - handle_base)) (hvec_pairs q (vec_len q - 1) (Nil : Val list)) in
      let _ = vec_set hash_store (id - handle_base) merged in
-     let _ = map_delete hash_pending id in ())
+     let _ = map_delete hash_pending id in
+     qv_drop q)
+  else ();
+// a whole-hash change drops what was queued for it
+let hpend_drop = fn (id: int) ->
+  if map_len hash_pending > 0 && map_has hash_pending id
+  then (let q = map_get hash_pending id in
+        let _ = map_delete hash_pending id in
+        qv_drop q)
   else ();
 let hash_stale = map_new ();
 let rec hstale_vals = fn (id: int) -> fn (xs: Val list) ->
@@ -889,19 +968,41 @@ let hstale_fold = fn (id: int) ->
 //   below -- CRuby's AR table is the same idea), and (2) the index a big one
 //   gets has an arena of its own and goes back to a pool when it is dropped,
 //   wound back by map_recycle, as interpreter frames do (frame_pool).
+//   ⚠ ...wound back at a COLLECTION, not at the drop (note 303): a value read
+//   out of the index may still be held in the middle of an expression --
+//   `foo(h[:k3], (h.clear; 30.times { ... }), ...)` passed foo `true`, the
+//   next hash's value written over the same bytes. A dropped index waits in
+//   hidx_quar; the collection (off the stack, every stack suspended) clears it
+//   and compacts it, which skips an arena a stack still points into.
 let hidx_pool = vec_new ();
+// 0: in the pool, 1: in quarantine
 let hidx_pool_n = vec_new ();
 let _ = vec_push hidx_pool_n 0;
+let _ = vec_push hidx_pool_n 0;
+let hidx_quar = vec_new ();
 let hidx_release = fn (id: int) ->
   if map_has hash_index id then
     (let ix = map_get hash_index id in
      let _ = map_delete hash_index id in
-     let _ = map_recycle ix in
-     let n = vec_get hidx_pool_n 0 in
-     if n >= 4096 then ()
-     else (let _ = (if n < vec_len hidx_pool then vec_set hidx_pool n ix else vec_push hidx_pool ix) in
-           vec_set hidx_pool_n 0 (n + 1)))
+     let n = vec_get hidx_pool_n 1 in
+     let _ = (if n < vec_len hidx_quar then vec_set hidx_quar n ix else vec_push hidx_quar ix) in
+     vec_set hidx_pool_n 1 (n + 1))
   else ();
+// (gc_collect, where it compacts)
+let hidx_drain = fn (u: unit) ->
+  let rec go = fn (i: int) ->
+    if i >= vec_get hidx_pool_n 1 then ()
+    else
+      (let ix = vec_get hidx_quar i in
+       let n = vec_get hidx_pool_n 0 in
+       let _ = (if n >= 4096 then ()
+                else (let _ = map_clear ix in
+                      let _ = map_compact ix in
+                      let _ = (if n < vec_len hidx_pool then vec_set hidx_pool n ix else vec_push hidx_pool ix) in
+                      vec_set hidx_pool_n 0 (n + 1))) in
+       go (i + 1)) in
+  let _ = go 0 in
+  vec_set hidx_pool_n 1 0;
 let hidx_drop = fn (id: int) ->
   // (a stale list is brought up to date while the index can still say how --
   //  the queue of new pairs keeps its own values, and hderef folds it later)
@@ -996,8 +1097,7 @@ let hset = fn (id: int) -> fn (xs: Val list) ->
   // index cannot describe an arbitrary new list, so it goes too. This is the
   // single door for "the hash changed in a way this file did not choose",
   // which is what makes the index safe to believe when it is still there.
-  let _ = (if map_len hash_pending > 0 && map_has hash_pending id
-           then (let _ = map_delete hash_pending id in ()) else ()) in
+  let _ = hpend_drop id in
   let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   let _ = hidx_drop id in
   let _ = vec_set hash_store (id - handle_base) xs in ();
@@ -1014,8 +1114,7 @@ let hdel_indexed = fn (id: int) -> fn (k: Val) -> fn (xs: Val list) ->
   // (xs came from hderef, so it is current: nothing is stale any more)
   let _ = (if map_len hash_stale > 0 && map_has hash_stale id then map_delete hash_stale id else ()) in
   // hset would drop the index; write the list underneath it instead
-  let _ = (if map_len hash_pending > 0 && map_has hash_pending id
-           then (let _ = map_delete hash_pending id in ()) else ()) in
+  let _ = hpend_drop id in
   let _ = (if keep then () else hidx_drop id) in
   let _ = vec_set hash_store (id - handle_base) xs in ();
 // an existing key of an INDEXED hash takes a new value: the index says it,
@@ -1042,7 +1141,7 @@ let hpush_new = fn (id: int) -> fn (k: Val) -> fn (v: Val) ->
                  if hidx_seed id (hsettled id) then () else hidx_drop id)
            else ()) in
   let q = (if map_has hash_pending id then map_get hash_pending id
-           else (let nq = vec_new () in let _ = map_set hash_pending id nq in nq)) in
+           else (let nq = qv_take () in let _ = map_set hash_pending id nq in nq)) in
   // keep the index in step, or give it up: a key it cannot digest means the
   // index no longer knows everything in this hash.
   let _ = (if hidx_on id then
