@@ -67,7 +67,7 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_fnmatch.rb | 15 | 14 | 1 | 0 | 0 |
 | ruby/test_frozen.rb | 6 | 5 | 1 | 0 | 0 |
 | ruby/test_frozen_error.rb | 5 | 1 | 4 | 0 | 0 |
-| ruby/test_gc.rb | 54 | 28 | 22 | 4 | 0 |
+| ruby/test_gc.rb | 54 | 29 | 21 | 4 | 0 |
 | ruby/test_hash.rb | 306 | 265 | 33 | 8 | 0 |
 | ruby/test_ifunless.rb | 1 | 1 | 0 | 0 | 0 |
 | ruby/test_insns_leaf.rb | 1 | 1 | 0 | 0 | 0 |
@@ -111,7 +111,7 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_rand.rb | 41 | 41 | 0 | 0 | 0 |
 | ruby/test_random_formatter.rb | 26 | 26 | 0 | 0 | 0 |
 | ruby/test_range.rb | 67 | 47 | 20 | 0 | 0 |
-| ruby/test_rational.rb | 52 | 40 | 12 | 0 | 0 |
+| ruby/test_rational.rb | 52 | 41 | 11 | 0 | 0 |
 | ruby/test_rational2.rb | 1 | 1 | 0 | 0 | 0 |
 | ruby/test_readpartial.rb | 4 | 4 | 0 | 0 | 0 |
 | ruby/test_refinement.rb | 122 | 77 | 44 | 1 | 0 |
@@ -126,11 +126,11 @@ tests CRuby itself keeps, with the framework it keeps them in (tool/lib).
 | ruby/test_sprintf.rb | 33 | 21 | 12 | 0 | 0 |
 | ruby/test_sprintf_comb.rb | 126 | 95 | 0 | 31 | 0 |
 | ruby/test_stack.rb | 3 | 1 | 2 | 0 | 0 |
-| ruby/test_string.rb | 442 | 369 | 73 | 0 | 0 |
+| ruby/test_string.rb | 442 | 368 | 74 | 0 | 0 |
 | ruby/test_stringchar.rb | 4 | 2 | 2 | 0 | 0 |
 | ruby/test_struct.rb | 102 | 86 | 16 | 0 | 0 |
 | ruby/test_super.rb | 49 | 39 | 10 | 0 | 0 |
-| ruby/test_symbol.rb | 59 | 50 | 9 | 0 | 0 |
+| ruby/test_symbol.rb | 59 | 49 | 10 | 0 | 0 |
 | ruby/test_syntax.rb | 171 | 87 | 81 | 2 | 1 |
 | ruby/test_system.rb | 9 | 6 | 2 | 0 | 1 |
 | ruby/test_thread.rb | 101 | 65 | 33 | 1 | 2 |
