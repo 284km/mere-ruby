@@ -3042,8 +3042,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                      then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil)
                      else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
                            blk_capture blk (true, bp, bb, env) bb))
-                  | _ -> (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
-                          blk_capture blk (true, bp, bb, env) bb)) in
+                  | _ -> (let s9 = bp_sym world bp bb in
+                          if str_len s9 > 0 then coerce_to_block env world blk (VSym s9)
+                          else (let _ = (if map_has pending_srcproc "v" then map_delete pending_srcproc "v" else ()) in
+                                blk_capture blk (true, bp, bb, env) bb))) in
     // Kernel#loop: run the block until break (or a StopIteration raise).
     if (str_len name == 4 && str_eq name "loop") && (if map_has meths "loop" then false else true) then
       run_loop_builtin env world blk (true, bp, bb, env)
@@ -3528,7 +3530,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let args = eval_args env world blk arges in
     let newblk = (match bp with
                   | Cons (c, Nil) -> if str_eq c "&coerce" then coerce_to_block env world blk (match bb with Cons (SExpr be, _) -> eval_e env world blk be | _ -> VNil) else blk_capture blk (true, bp, bb, env) bb
-                  | _ -> blk_capture blk (true, bp, bb, env) bb) in
+                  | _ -> (let s9 = bp_sym world bp bb in
+                          if str_len s9 > 0 then coerce_to_block env world blk (VSym s9)
+                          else blk_capture blk (true, bp, bb, env) bb)) in
     invoke_with_block env world blk recv name args newblk
   | EArr items -> arr_new (eval_args env world blk items)
   // fold the evaluated pairs through hash_put so duplicate keys (from an
@@ -4628,9 +4632,9 @@ and hsh_eval_items = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
           Cons ((match k with
                  | EStrL s9 -> str_fstring_text s9
                  | EMethod (EStrL s9, m9, Nil) when str_len m9 > 10 && str_eq (substring m9 0 10) "__lit_fsl~" -> str_fstring_text s9
-                 | _ -> hsh_key_of (eval_e env world blk k)),
+                 | _ -> hsh_key_of world (eval_e env world blk k)),
                 Cons (eval_e env world blk v, hsh_eval_items env world blk rest))
-        | Nil -> Cons (hsh_key_of (eval_e env world blk k), Nil)))
+        | Nil -> Cons (hsh_key_of world (eval_e env world blk k), Nil)))
 
 // object identity (equal?): reference types are identical only when they
 // are the same handle; immediates compare by value.
@@ -4998,8 +5002,15 @@ and const_added_hook = fn world -> fn (key: str) ->
 and const_read_note = fn world -> fn (key: str) ->
   let _ = (if map_len autoload_busy > 0 && fb_can_suspend && map_has autoload_busy key
               && (if map_get autoload_busy key == sch_me () then false else true) then
+             // ...PARKED, not passing: a thread that passed until the load
+             // was over spun for as long as the loader slept -- and what each
+             // turn allocated stayed, test_bug_13526's ten threads past 6.5 GB
+             // -- and was never "stopped" to the thread asking (note 305).
+             // autoload_settle wakes it (wait kind 9, on the loader's id).
              (let rec wait9 = fn (u: unit) ->
-                (if map_has autoload_busy key then (let _ = sch_pass world in wait9 ()) else ()) in
+                (if map_has autoload_busy key
+                 then (let _ = sch_block world 9 (map_get autoload_busy key) 0 in wait9 ())
+                 else ()) in
               wait9 ())
            else ()) in
   if map_len deprecated_consts > 0 && map_has deprecated_consts key && deprecation_says () then
@@ -10024,7 +10035,10 @@ and autoload_live = fn (key: str) ->
 // the load of `key` is over, however it ended: nobody is loading it, and a
 // location its file gave the constant is now everyone's
 and autoload_settle = fn (key: str) ->
+  let ld9 = (if map_has autoload_busy key then map_get autoload_busy key else 0 - 1) in
   let _ = map_delete autoload_busy key in
+  // (the threads parked on this load: const_read_note)
+  let _ = (if ld9 >= 0 then sch_wake_all 9 ld9 else ()) in
   // (a registration whose file defined the constant is spent for good)
   let _ = (if map_has consts key && map_has autoloads key then map_delete autoloads key else ()) in
   if map_has const_src_pend key then
@@ -21144,7 +21158,23 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // test_array hands a block in as a `random:` generator (note 275)
     let hk9 = hng_key recv in
     let sc9 = (if map_has hng_store hk9 then map_get hng_store hk9 else "") in
-    if (if str_eq sc9 "" then false else has_meth world sc9 name) then
+    let callish9 = (str_len name == 4 && str_eq name "call") || (str_len name == 2 && str_eq name "()") in
+    // ...then a #call the program defined in Proc, which `pr.call(x)` and
+    // `pr.(x)` ask (and `pr[x]`, `yield`, a block-pass do not, as in ruby),
+    // and an alias of the builtin made in Proc -- the `alias orig_call call`
+    // the new #call calls -- which runs the builtin (note 305: the redefined
+    // #call was never asked, and the alias was a NoMethodError)
+    let bc9 = (if callish9 || map_len builtin_alias == 0 then "" else blt_alias_lookup world (Cons ("Proc", Nil)) name) in
+    let viab9 = callish9 && map_len proc_bcall > 0 in
+    let _ = (if viab9 then map_delete proc_bcall 0 else ()) in
+    if str_len bc9 > 0 then
+      (let _ = (if str_eq bc9 "call" && has_meth world "Proc" "call" then map_set proc_bcall 0 1 else ()) in
+       invoke_val_c env world blk recv bc9 args vischeck)
+    else if callish9 && (if viab9 then false else true)
+            && (if str_eq sc9 "" then true else (if has_meth world sc9 name then false else true))
+            && has_meth world "Proc" "call" then
+      invoke world blk recv "Proc" "call" args
+    else if (if str_eq sc9 "" then false else has_meth world sc9 name) then
       invoke world blk recv sc9 name args
     else if (if str_eq sc9 "" then false
              else (if str_eq (blt_alias_lookup world (Cons (sc9, Nil)) name) "" then false else true)) then
@@ -22437,6 +22467,19 @@ and proc_derived_call = fn env -> fn world -> fn blk -> fn (pid: int) -> fn (arg
 // coerce a `&expr` value into a call block: a Proc uses its own block, nil
 // means no block, a Symbol becomes a symbol-proc, and anything else is
 // converted eagerly via #to_proc (so its side effects run at the call site).
+// the method name of a `&:sym` the parser made into a block (extract_block_pass:
+// `{ |__bp, *__ba| __bp.sym(*__ba) }`), when Symbol#to_proc is not ruby's own
+// -- redefined, or undefined -- and so has to be asked; "" otherwise. A
+// redefined to_proc was never called for `[1, 2].map(&:to_s)` (note 305).
+and bp_sym = fn world -> fn (bp: str list) -> fn (bb: Stmt list) ->
+  match bp with
+  | Cons (m9, Cons (p9, Cons (r9, Nil))) when str_eq m9 lambda_blk_marker && str_eq p9 "__bp" && str_eq r9 "*__ba" ->
+    (match bb with
+     | Cons (SExpr (EMethod (EVar v9, s9, Cons (ESplat (EVar a9), Nil))), Nil)
+       when str_eq v9 "__bp" && str_eq a9 "__ba"
+            && (has_meth world "Symbol" "to_proc" || (map_len undefs > 0 && undef_blocked world "Symbol" "to_proc")) -> s9
+     | _ -> "")
+  | _ -> ""
 and coerce_to_block = fn env -> fn world -> fn blk -> fn (bv: Val) ->
   match bv with
   | VProc pid ->
@@ -26131,7 +26174,7 @@ and hash_store_key = fn env -> fn world -> fn (hid: int) -> fn (k: Val) ->
      | VStr sh9 ->
        // ...unless it is ALREADY frozen, in which case it is stored as it is
        // (there is nothing to protect the hash from).
-       (if ci || sfrozen_get sh9 then k else hkey_str_copy sh9)
+       (if ci || sfrozen_get sh9 || skey_keep world sh9 then k else hkey_str_copy sh9)
      | _ -> k)
 
 // Kernel#respond_to?(name, include_all = false), for every receiver. PUBLIC
@@ -33140,6 +33183,14 @@ and blt_alias_call = fn env -> fn world -> fn (recv: Val) -> fn (src: str) -> fn
   // _remove_const remove_const; public :_remove_const; end`)
   | (VClass _, _) ->
     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false
+  // ...nor a Proc's (call, yield, ===: the dispatcher runs a proc). `class
+  // Proc; alias orig_call call; end` was a NoMethodError for 'call'. It runs
+  // the BUILTIN #call, which a #call the program defined beside the alias must
+  // not take over -- the alias is how the new #call reaches the old one
+  // (proc_bcall, note 305)
+  | (VProc _, _) ->
+    (let _ = (if str_eq src "call" && has_meth world "Proc" "call" then map_set proc_bcall 0 1 else ()) in
+     invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv src args false)
   | _ -> prim_method recv src args
 and prim_self_send = fn env -> fn world -> fn (other: Val) -> fn (name: str) -> fn (args: Val list) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
