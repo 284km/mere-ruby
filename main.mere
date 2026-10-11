@@ -3606,6 +3606,17 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     else if str_len op == 2 && str_eq op "||" then
       let va = eval_e env world blk a in
       if truthy va then va else eval_e env world blk b
+    // an interpolated string, `"a#{x}b"` -- desugared by the lexer to
+    // `"" + "a" + x.__interp_str + "b"` -- is built in ONE pass: the pieces'
+    // bytes are joined and one String is made at the end. The `+` chain made
+    // a String per literal piece, a copy per interpolated one and one more per
+    // `+`: `"#{s}x"` was seven Strings, and each leaves a slot in str_store
+    // that is never reused (note 308). Ruby's interpolation never calls
+    // String#+, so a program that redefined it keeps the chain it had.
+    else if str_len op == 1 && str_eq op "+" && dstr_piece b && dstr_spine a
+            && (dstr_has_interp b || dstr_has_interp_l a)
+            && (if has_meth world "String" "+" then false else true) then
+      eval_dstr env world blk e
     // `/literal regex/ =~ str` with named captures binds a local variable per
     // named group (only for a literal regex on the LHS, per Ruby).
     // ...unless the program redefined Regexp#=~, in which case even a literal
@@ -21732,6 +21743,56 @@ and uses_it_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with
   | Nil -> false
   | Cons ((c, b), rest) -> uses_it_expr c || uses_it_stmts b || uses_it_clauses rest
+// the pieces of an interpolated string (see the EBin arm of eval_e)
+and dstr_piece = fn (e: Expr) ->
+  match e with
+  | EStrL _ -> true
+  | EMethod (_, m, Nil) -> str_len m == 12 && str_eq m "__interp_str"
+  | _ -> false
+and dstr_has_interp = fn (e: Expr) ->
+  match e with EMethod (_, _, _) -> true | _ -> false
+and dstr_spine = fn (e: Expr) ->
+  match e with
+  | EStrL _ -> true
+  | EBin (op, l, r) -> str_len op == 1 && str_eq op "+" && dstr_piece r && dstr_spine l
+  | _ -> false
+and dstr_has_interp_l = fn (e: Expr) ->
+  match e with
+  | EBin (_, l, r) -> dstr_has_interp r || dstr_has_interp_l l
+  | _ -> false
+// evaluated left to right, each piece's encoding folded in as `+` folds it
+// (enc_compat2, and the same CompatibilityError), the String made once
+and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
+  let rec pieces = fn (x: Expr) -> fn (acc: Expr list) ->
+    (match x with
+     | EBin (_, l, r) -> pieces l (Cons (r, acc))
+     | other -> Cons (other, acc)) in
+  let rec go = fn (ps: Expr list) -> fn (acc: str) -> fn (enc: str) ->
+    match ps with
+    | Nil -> (let v = mkstr acc in match v with VStr h -> (let _ = senc_set h enc in v) | _ -> v)
+    | Cons (p, rest) ->
+      (let (t9, e9) = (match p with
+                       | EStrL t -> (t, "UTF-8")
+                       | EMethod (x, _, _) ->
+                         (match eval_e env world blk x with
+                          | VStr h -> (sget h, senc_get h)
+                          | v -> (match invoke_val_c env world blk v "to_s" Nil false with
+                                  | VStr h2 -> (sget h2, senc_get h2)
+                                  // a #to_s that answered something else: ruby
+                                  // interpolates the object as rb_any_to_s
+                                  // writes it, #<Class:0x...>
+                                  | other -> (match v with
+                                              | VObj oid9 ->
+                                                (let (_, _, oc9, _) = world in
+                                                 ("#<" ++ cls_display world (obj_print_cls world (map_get oc9 oid9)) ++ ":0x" ++ hex_pad16 (oid9 - handle_base) ++ ">", "UTF-8"))
+                                              | _ -> (to_s other, "UTF-8"))))
+                       | _ -> ("", "UTF-8")) in
+       let renc = enc_compat2 enc acc e9 t9 in
+       if str_eq renc "" then
+         (let _ = prim_raise "Encoding::CompatibilityError"
+                    ("incompatible character encodings: " ++ enc_msg_name enc ++ " and " ++ enc_msg_name e9) in VNil)
+       else go rest (acc ++ t9) renc) in
+  go (pieces e Nil) "" "UTF-8"
 and uses_it_expr = fn (e: Expr) ->
   match e with
   // `it` parses as a bare name, and a bare name with no arguments is the only
@@ -25203,9 +25264,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         // grow (as Array#join's does): `acc ++ piece` per match copied the
         // result so far, and `("x" * 40000).gsub("x", "yz")` took 2.6 GB.
         let gb = strbuf_new () in
-        let gst = vec_new () in
-        let _ = vec_push gst 0 in
-        let _ = vec_push gst 1 in
+        // (0, 1: the result's length and ASCII-ness; 2: a match was found;
+        //  3-5: the last match's span and group count -- gs_take, m_state)
+        let gst = gs_take () in
+        let _ = vec_set gst 1 1 in
         let put9 = fn (piece: str) ->
           (let _ = strbuf_push gb piece in
            let _ = vec_set gst 0 (vec_get gst 0 + str_len piece) in
@@ -25219,8 +25281,14 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
         let fin = fn (ae: str) -> (strbuf_to_str gb, ae) in
         // (sub! / gsub! answer nil only when NOTHING matched: a match that
         //  rewrote to the same text is still the receiver)
-        let hit9 = vec_new () in
-        let _ = vec_push hit9 0 in
+        // ⚠ $~ IS THE LAST MATCH, published once at the end when the
+        //   replacement is a String: nothing between the matches can read it
+        //   (the template's \1 reads the exported captures). A MatchData per
+        //   match, with a String for the match and for each group, was most
+        //   of the 25 Strings `"aaaaaaaaaaa".gsub(/a/, "")` made (note 308).
+        //   A Hash's default proc can read $~, so a Hash keeps the per-match
+        //   publish, as a block does.
+        let late9 = (match repv with VStr _ -> true | _ -> false) in
         let rec go = fn (i: int) -> fn (ae: str) -> fn (found: bool) ->
           (match rxv_search_e pat pf s0 i e0 with
            | RNoHit ->
@@ -25231,10 +25299,11 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
               fin (app ae (substring s0 i n) e0))
            | RBadPat -> (let _ = put9 (substring s0 i n) in fin ae)
            | RHit (st, en, saves) ->
-             let _ = vec_set hit9 0 1 in
+             let _ = vec_set gst 2 1 in
              let ng = rxv_prog_ng (map_get rx_progs (pf ++ chr 1 ++ pat)) in
              let _ = rxv_export_caps saves ng in
-             let _ = rx_publish_at world s0 st en ng (senc_get h) in
+             let _ = (if late9 then (let _ = vec_set gst 3 st in let _ = vec_set gst 4 en in vec_set gst 5 ng)
+                      else rx_publish_at world s0 st en ng (senc_get h)) in
              let (rep, re9) = (match repv with
                                // (an ASCII template expands in the RECEIVER's
                                //  encoding: `\&` copies the receiver's bytes, as
@@ -25261,8 +25330,13 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
                 else fin (app ae2 (substring s0 en n) e0))) in
         match go 0 e0 false with
         | (r, re) ->
-          (if (str_len name == 5 && str_eq name "gsub!") || (str_len name == 4 && str_eq name "sub!") then
-             (if vec_get hit9 0 == 0 then VNil
+          (let _ = (if late9 && vec_get gst 2 == 1
+                    then rx_publish_at world s0 (vec_get gst 3) (vec_get gst 4) (vec_get gst 5) (senc_get h)
+                    else ()) in
+           let hit9 = vec_get gst 2 in
+           let _ = gs_give gst in
+           if (str_len name == 5 && str_eq name "gsub!") || (str_len name == 4 && str_eq name "sub!") then
+             (if hit9 == 0 then VNil
               else if str_eq r s0 && str_eq re (senc_get h) then recv
               else (let _ = sset h r in let _ = senc_set h re in recv))
            else (let c = mkstr r in (match c with VStr rid -> (let _ = senc_set rid re in c) | _ -> c))))
@@ -46730,7 +46804,13 @@ and rxv_search = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int)
   else
     let ok = try_or (fn (u: unit) -> let _ = rxc_get pat fl in true) false in
     if ok then
-      (let _ = map_set rx_cur "k" (mkstr key) in
+      // (and not written when it is the handle there already: every write
+      //  copies into rx_cur's region, 384 bytes per gsub)
+      (let kh9 = rx_key_handle key in
+       let _ = (if map_has rx_cur "k" && (match map_get rx_cur "k" with
+                                          | VStr o9 -> (match kh9 with VStr n9 -> o9 == n9 | _ -> false)
+                                          | _ -> false)
+                then () else map_set rx_cur "k" kh9) in
        let prog = map_get rx_progs key in
        let ok9 = (if map_has rx_mc_ok key then map_get rx_mc_ok key == 1
                   else (let a9 = rxv_mc_allowed prog 0 (rxv_mc_size prog) false false in
