@@ -349,6 +349,13 @@ let to_f = fn (v: Val) ->
   | VFlt f -> f
   | VBig s -> float_of_str s
   | VRat (n, d) -> rat_to_f n d
+  // a Complex whose imaginary part is an EXACT zero is its real part, as
+  // Complex#to_f answers (rb_to_float asks it): Math.sqrt(c * c.conj) is a
+  // Float, and was "not a number" (note 311)
+  | VCpx (r, VInt 0) -> (match r with
+                         | VInt n -> float_of_int n | VFlt f -> f | VBig b -> float_of_str b
+                         | VRat (n, d) -> rat_to_f n d
+                         | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: not a number")) in fail "mere-ruby: not a number"))
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: not a number")) in fail "mere-ruby: not a number");
 
 // A Numeric the float-based paths can take. VBig and VRat were missing, and
@@ -4431,6 +4438,25 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
               && (match va0 with VInt _ -> true | VBig _ -> true | _ -> false)
               && (match vb with VInt _ -> false | VBig _ -> false | _ -> true) then
         arith_bin op va0 (shift_width_v env world vb)
+      // a Complex to a power: the exponent normalised, then the special
+      // angles exactly, as rb_complex_pow does (note 311) -- and a real base
+      // with a Complex exponent is that base as a Complex (`1 ** Complex(1)`
+      // is (1+0i); it was "** type error")
+      else if str_len op == 2 && str_eq op "**"
+              && ((match va0 with VCpx (_, _) -> true | _ -> false)
+                  || ((match vb with VCpx (_, _) -> true | _ -> false)
+                      && (match va0 with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat (_, _) -> true | _ -> false))) then
+        (let va9 = (match va0 with VCpx (_, _) -> va0 | _ -> VCpx (va0, VInt 0)) in
+         let vb9 = cpx_pow_c14n vb in
+         match cpx_special_pow arith_bin va9 vb9 with
+         | Cons (r9, _) -> r9
+         | Nil -> arith_bin op va9 vb9)
+      // a Complex's components are added, subtracted and multiplied by their
+      // own operators, a redefined one included (cpx_arith_f, note 311)
+      else if str_len op == 1 && (str_eq op "+" || str_eq op "-" || str_eq op "*")
+              && ((match va0 with VCpx (_, _) -> true | _ -> false) || (match vb with VCpx (_, _) -> true | _ -> false))
+              && cpx_ops_redef world then
+        cpx_arith_f (cpx_comp_w env world) op va0 vb
       else arith_bin op va0 vb
 
 // The shift width for Integer#<< / #>>, refused the way CRuby refuses it.
@@ -15438,6 +15464,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                              then "US-ASCII" else renc9) in
                let ufl = (if str_eq final9 "ASCII-8BIT" then "n" else "") in
                VRegex (usrc, ufl, final9))))
+    // Math.sqrt of a Complex is a Complex: rb_math_sqrt's own T_COMPLEX arm
+    // (the root with the imaginary part's sign), not the Float of to_f --
+    // Math.sqrt(c * c.conj) is (2.23606797749979+0.0i) (note 311)
+    else if str_eq c "Math" && (str_len name == 4 && str_eq name "sqrt")
+            && (match args with Cons (VCpx (_, _), Nil) -> true | _ -> false) then
+      (match args with
+       | Cons (VCpx (r9, i9), _) ->
+         (let re = to_f r9 in
+          let im = to_f i9 in
+          let neg = im < 0.0 || (im == 0.0 && 1.0 / im < 0.0) in
+          let d = hypot re im in
+          let im2 = sqrt ((d - re) / 2.0) in
+          let re2 = sqrt ((d + re) / 2.0) in
+          VCpx (VFlt re2, VFlt (if neg then (0.0 - 1.0) * im2 else im2)))
+       | _ -> VNil)
     // Math module functions (only sqrt-derived ones; no trig/log builtin).
     // ...only for the functions Math actually has; anything else (Module's own
     // methods, `class`, `name`, ...) falls through to the general dispatcher.
@@ -21793,6 +21834,18 @@ and eval_dstr = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                     ("incompatible character encodings: " ++ enc_msg_name enc ++ " and " ++ enc_msg_name e9) in VNil)
        else go rest (acc ++ t9) renc) in
   go (pieces e Nil) "" "UTF-8"
+// does the program redefine + - or * on a class a Complex's parts can be?
+and cpx_ops_redef = fn world ->
+  let rec cls = fn (cs: str list) ->
+    match cs with
+    | Nil -> false
+    | Cons (c, r) -> has_meth world c "+" || has_meth world c "-" || has_meth world c "*" || cls r in
+  cls (Cons ("Integer", Cons ("Float", Cons ("Rational", Nil))))
+and cpx_comp_w = fn env -> fn world -> fn (op: str) -> fn (x: Val) -> fn (y: Val) ->
+  let c = (match x with VInt _ -> "Integer" | VBig _ -> "Integer" | VFlt _ -> "Float" | VRat (_, _) -> "Rational" | _ -> "") in
+  if str_len c > 0 && has_meth world c op
+  then invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) x op (Cons (y, Nil)) false
+  else cpx_comp_b op x y
 and uses_it_expr = fn (e: Expr) ->
   match e with
   // `it` parses as a bare name, and a bare name with no arguments is the only
@@ -32527,6 +32580,12 @@ and kernel_conv_fn0 = fn env -> fn world -> fn (name: str) -> fn (args: Val list
 // itself as a real part.
 and kernel_complex = fn env -> fn world -> fn (args0: Val list) ->
   let (pos, raising) = kern_conv_kw args0 in
+  // one or two parts: `Complex()` is an arity error, not the TypeError the
+  // nil it read as gave
+  let npos9 = list_len_v pos 0 in
+  let _ = (if npos9 == 0 || npos9 > 2
+           then (let _ = raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int npos9 ++ ", expected 1..2)") in ())
+           else ()) in
   let has2 = (match pos with Cons (_, Cons (_, _)) -> true | _ -> false) in
   let a1 = (match pos with Cons (a, _) -> a | Nil -> VNil) in
   let a2 = (match pos with Cons (_, Cons (b, _)) -> b | _ -> VNil) in

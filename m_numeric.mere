@@ -1116,14 +1116,79 @@ let cpx_quo = fn (x: Val) -> fn (y: Val) ->
      | VRat (n, d) -> if str_eq d "1" then norm_big n else VRat (n, d)
      | v -> v);
 // +,-,*,/ when at least one operand is Complex (components are boxed numerics).
+// complex.c's f_add / f_sub / f_mul shortcuts, for an operator that is the
+// builtin one: an exact 0 added or subtracted gives the other side back
+// (so -0.0 + 0 stays -0.0: Complex(-0.0, 0) * Complex(0, 0) is (-0.0-0.0i)),
+// and an Integer times 0, or anything times 1, needs no multiplication.
+// Nil is "no shortcut".
+let cpx_short = fn (op: str) -> fn (x: Val) -> fn (y: Val) ->
+  let y0 = (match y with VInt 0 -> true | _ -> false) in
+  let x0 = (match x with VInt 0 -> true | _ -> false) in
+  let y1 = (match y with VInt 1 -> true | _ -> false) in
+  let x1 = (match x with VInt 1 -> true | _ -> false) in
+  let xi = (match x with VInt _ -> true | VBig _ -> true | _ -> false) in
+  let yi = (match y with VInt _ -> true | VBig _ -> true | _ -> false) in
+  if str_eq op "+" then
+    (if xi && x0 then Cons (y, Nil) else if y0 then Cons (x, Nil) else (Nil : Val list))
+  else if str_eq op "-" then (if y0 then Cons (x, Nil) else (Nil : Val list))
+  else if xi then
+    (if y0 then Cons (VInt 0, Nil) else if x0 && yi then Cons (VInt 0, Nil)
+     else if x1 then Cons (y, Nil) else if y1 then Cons (x, Nil) else (Nil : Val list))
+  else if y1 then Cons (x, Nil)
+  else (Nil : Val list);
+// the component operation with no redefinition in play
+let cpx_comp_b = fn (op: str) -> fn (x: Val) -> fn (y: Val) ->
+  match cpx_short op x y with Cons (v, _) -> v | Nil -> cpx_comp op x y;
+// f_zero_p: an exact zero, or a Float zero
+let cpx_zp = fn (x: Val) ->
+  match x with
+  | VInt n -> n == 0
+  | VFlt f -> f == 0.0
+  | VRat (n, _) -> str_eq n "0"
+  | _ -> false;
+// complex.c's safe_mul: a Float that is not NaN, multiplied by an exact or
+// float ZERO while it is not one itself, counts as +-1.0 -- so Infinity * 0
+// in a product is 0, not NaN: Complex(Float::INFINITY, 0) * Complex(1, 0) is
+// (Infinity+0i), and was (Infinity+NaN*i) (note 311)
+let cpx_safe_mul = fn f -> fn (a: Val) -> fn (b: Val) ->
+  let az = cpx_zp a in
+  let bz = cpx_zp b in
+  let a2 = (match a with
+            | VFlt v -> (if (if az then false else true) && bz && v == v then VFlt (if v < 0.0 || (v == 0.0 && 1.0 / v < 0.0) then 0.0 - 1.0 else 1.0) else a)
+            | _ -> a) in
+  let b2 = (match b with
+            | VFlt v -> (if (if bz then false else true) && az && v == v then VFlt (if v < 0.0 || (v == 0.0 && 1.0 / v < 0.0) then 0.0 - 1.0 else 1.0) else b)
+            | _ -> b) in
+  f "*" a2 b2;
+// + - * as complex.c writes them, with the component operation passed in:
+// cpx_comp here; in main, one that asks a redefined Integer/Float/Rational
+// operator, as ruby's f_add / f_sub / f_mul do (rb_funcall) -- Complex(1, 2)
+// + Complex(0, 1) with Integer#+ redefined to 42 is Complex(42, 42). A real
+// right operand leaves the imaginary part as it is, rather than adding 0 to
+// it or multiplying it by the operand's missing imaginary part.
+let cpx_arith_f = fn f -> fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
+  let ar = (match va with VCpx (r, i) -> r | v -> v) in
+  let ai = (match va with VCpx (r, i) -> i | _ -> VInt 0) in
+  let br = (match vb with VCpx (r, i) -> r | v -> v) in
+  let bi = (match vb with VCpx (r, i) -> i | _ -> VInt 0) in
+  let bc = (match vb with VCpx (_, _) -> true | _ -> false) in
+  let ac = (match va with VCpx (_, _) -> true | _ -> false) in
+  if str_eq op "+" then
+    (if ac && (if bc then false else true) then VCpx (f "+" ar vb, ai)
+     else VCpx (f "+" ar br, f "+" ai bi))
+  else if str_eq op "-" then
+    (if ac && (if bc then false else true) then VCpx (f "-" ar vb, ai)
+     else VCpx (f "-" ar br, f "-" ai bi))
+  else
+    (if ac && (if bc then false else true) then VCpx (f "*" ar vb, f "*" ai vb)
+     else VCpx (f "-" (cpx_safe_mul f ar br) (cpx_safe_mul f ai bi),
+                f "+" (cpx_safe_mul f ar bi) (cpx_safe_mul f ai br)));
 let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
   let ar = (match va with VCpx (r, i) -> r | v -> v) in
   let ai = (match va with VCpx (r, i) -> i | _ -> VInt 0) in
   let br = (match vb with VCpx (r, i) -> r | v -> v) in
   let bi = (match vb with VCpx (r, i) -> i | _ -> VInt 0) in
-  if str_eq op "+" then VCpx (cpx_comp "+" ar br, cpx_comp "+" ai bi)
-  else if str_eq op "-" then VCpx (cpx_comp "-" ar br, cpx_comp "-" ai bi)
-  else if str_eq op "*" then VCpx (cpx_comp "-" (cpx_comp "*" ar br) (cpx_comp "*" ai bi), cpx_comp "+" (cpx_comp "*" ar bi) (cpx_comp "*" ai br))
+  if str_eq op "+" || str_eq op "-" || str_eq op "*" then cpx_arith_f cpx_comp_b op va vb
   else if str_eq op "/" then
     (match bi with
      // a real divisor divides each component independently (CRuby does the
@@ -1135,6 +1200,56 @@ let cpx_arith = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
        VCpx (cpx_quo (cpx_comp "+" (cpx_comp "*" ar br) (cpx_comp "*" ai bi)) den,
              cpx_quo (cpx_comp "-" (cpx_comp "*" ai br) (cpx_comp "*" ar bi)) den))
   else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: complex operator unsupported")) in fail "mere-ruby: complex operator unsupported");
+// the exponent as complex.c's rb_complex_pow first writes it: a Rational
+// whose denominator is 1 is its numerator, and a Complex with an exact-zero
+// imaginary part is its real part -- so `Complex(1, 2) ** Rational(2)` is the
+// exact (-3+4i) rather than the float power (note 311)
+let cpx_pow_c14n = fn (vb: Val) ->
+  match vb with
+  | VRat (n, d) -> (if str_eq d "1" then norm_big n else vb)
+  | VCpx (r, VInt 0) -> r
+  | _ -> vb;
+// complex_pow_for_special_angle: a Complex on an axis or a diagonal raised to
+// an INTEGER power is exact -- Complex(-1, 0) ** (10**31 + 1) is (-1+0i),
+// where the general formula gave (0.915+0.402i). `ar` is the arithmetic
+// (arith_bin, which this file defines below and cannot call from here).
+// Nil when the base is at no special angle or the exponent is not an Integer.
+let cpx_special_pow = fn ar -> fn (va: Val) -> fn (vb: Val) ->
+  let isint = (match vb with VInt _ -> true | VBig _ -> true | _ -> false) in
+  match va with
+  | VCpx (re, im) when isint ->
+    (let neg1 = VInt (0 - 1) in
+     let negate = fn (x: Val) -> ar "*" x neg1 in
+     let (x0, d0, ok) =
+       (if cpx_zp im then (re, 0, true)
+        else if cpx_zp re then (im, 2, true)
+        else if rb_eq re im then (re, 1, true)
+        else if rb_eq re (negate im) then (im, 3, true)
+        else (re, 0, false)) in
+     if (if ok then false else true) then (Nil : Val list)
+     else
+       (let neg = (match x0 with
+                   | VInt n -> n < 0
+                   | VBig b -> big_sign b < 0
+                   | VFlt f -> f < 0.0
+                   | VRat (n, _) -> big_sign n < 0
+                   | _ -> false) in
+        let x = (if neg then negate x0 else x0) in
+        let dir = (if neg then d0 + 4 else d0) in
+        let odd = (match vb with VInt n -> n - (n / 2) * 2 != 0 | VBig b -> (if big_even b then false else true) | _ -> false) in
+        let zx = (if dir - (dir / 2) * 2 == 0 then ar "**" x vb
+                  else (let t = ar "**" (ar "*" (ar "*" (VInt 2) x) x) (ar "/" vb (VInt 2)) in
+                        if odd then ar "*" t x else t)) in
+        let m8 = (match ar "%" vb (VInt 8) with VInt k -> k | _ -> 0) in
+        let zd = (dir * m8) - ((dir * m8) / 8) * 8 in
+        // (zero_for: a zero of the magnitude's own kind -- 0.0, (0/1), 0)
+        let zero = (match zx with VFlt _ -> VFlt 0.0 | VRat (_, _) -> VRat ("0", "1") | _ -> VInt 0) in
+        let pick = fn (k: int) -> (if k == 0 then zero else if k == 1 then zx else negate zx) in
+        // the eight directions, {re, im} for 0, 45, 90 ... 315 degrees
+        let dre = (if zd == 0 || zd == 1 || zd == 7 then 1 else if zd == 2 || zd == 6 then 0 else 0 - 1) in
+        let dim = (if zd == 0 || zd == 4 then 0 else if zd == 1 || zd == 2 || zd == 3 then 1 else 0 - 1) in
+        Cons (VCpx (pick dre, pick dim), Nil)))
+  | _ -> (Nil : Val list);
 // x ** y for a Complex in general: exp(y * ln x), with ln(a+bi) =
 // ln|x| + i*arg(x). Both operands become Complex first, and the answer is a
 // Complex of floats -- the same shape ruby gives.
