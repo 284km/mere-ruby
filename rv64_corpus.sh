@@ -17,7 +17,7 @@
 #
 # Usage:
 #   MERE=/path/to/mere.exe MEMU=/path/to/memu sh rv64_corpus.sh
-#   ... RAM=256 TIMEOUT=120 sh rv64_corpus.sh
+#   ... RAM=1024 TIMEOUT=120 sh rv64_corpus.sh
 set -u
 # ⚠ THE REFERENCE IS THE ONE tools/ref_ruby.sh NAMES (4.0.6). This script
 # called `ruby` from PATH, which is rbenv's global -- 3.4.9 here -- so every
@@ -27,7 +27,10 @@ set -u
 . "$(cd "$(dirname "$0")" && pwd)"/tools/ref_ruby.sh
 : "${MERE:?set MERE to a mere binary}"
 : "${MEMU:?set MEMU to a memu checkout}"
-RAM="${RAM:-256}"
+# 1024 MB since Mere v0.1.650 (memu 3315bb6 keeps one host byte per guest byte,
+# so a 1 GB guest is about 1.1 GB on the host -- run one at a time): 219 needs
+# about 245 MB as a C program and did not fit in 256 on RISC-V.
+RAM="${RAM:-1024}"
 TIMEOUT="${TIMEOUT:-120}"
 CC="${CC:-cc}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
