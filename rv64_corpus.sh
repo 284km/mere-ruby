@@ -19,6 +19,12 @@
 #   MERE=/path/to/mere.exe MEMU=/path/to/memu sh rv64_corpus.sh
 #   ... RAM=256 TIMEOUT=120 sh rv64_corpus.sh
 set -u
+# ⚠ THE REFERENCE IS THE ONE tools/ref_ruby.sh NAMES (4.0.6). This script
+# called `ruby` from PATH, which is rbenv's global -- 3.4.9 here -- so every
+# RV64 number before 2026-10-11 was against 3.4: a corpus program written for
+# 4.0 (Set#inspect, `Set[1, 2]`) read as mere-ruby answering wrongly, and the
+# ones 3.4 cannot run were "skipped (the reference ruby itself failed)".
+. "$(cd "$(dirname "$0")" && pwd)"/tools/ref_ruby.sh
 : "${MERE:?set MERE to a mere binary}"
 : "${MEMU:?set MEMU to a memu checkout}"
 RAM="${RAM:-256}"
