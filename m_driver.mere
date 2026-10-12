@@ -3936,6 +3936,12 @@ let core_prelude_f =
   "      s\n" ++
   "    end\n" ++
   "    def inspect = \"#<Process::Status: #\{self}>\"\n" ++
+  "    # Marshal carries the status and the pid (the @__ ivars are the\n" ++
+  "    # interpreter's and do not travel by themselves)\n" ++
+  "    def marshal_dump = [@__st, @__pid]\n" ++
+  "    def marshal_load(a)\n" ++
+  "      @__st, @__pid = a\n" ++
+  "    end\n" ++
   "    # two statuses are equal when they carry the same status (there is no\n" ++
   "    # #== above this one to defer to: `super` was a NoMethodError)\n" ++
   "    def ==(o) = (o.is_a?(Integer) ? o == to_i : (o.is_a?(Process::Status) ? o.to_i == to_i : false))\n" ++
@@ -4156,13 +4162,28 @@ let core_prelude_f =
   "  #   NameError on a module that did not exist. The privilege-CHANGING half of\n" ++
   "  #   these modules is still absent (Process.uid= and its siblings above are\n" ++
   "  #   the setters this interpreter has).\n" ++
+  "  # (re_exchangeable? is setreuid(2)'s, which macOS has as a stub ruby does\n" ++
+  "  #  not trust; sid_available? is the saved id, which every POSIX system has.\n" ++
+  "  #  from_name is the passwd / group database's id for a name.)\n" ++
   "  module UID\n" ++
   "    def self.rid = Process.uid\n" ++
   "    def self.eid = Process.euid\n" ++
+  "    def self.re_exchangeable? = !RUBY_PLATFORM.include?(\"darwin\")\n" ++
+  "    def self.sid_available? = true\n" ++
+  "    def self.from_name(name)\n" ++
+  "      require \"etc\"\n" ++
+  "      Etc.getpwnam(name).uid\n" ++
+  "    end\n" ++
   "  end\n" ++
   "  module GID\n" ++
   "    def self.rid = Process.gid\n" ++
   "    def self.eid = Process.egid\n" ++
+  "    def self.re_exchangeable? = !RUBY_PLATFORM.include?(\"darwin\")\n" ++
+  "    def self.sid_available? = true\n" ++
+  "    def self.from_name(name)\n" ++
+  "      require \"etc\"\n" ++
+  "      Etc.getgrnam(name).gid\n" ++
+  "    end\n" ++
   "  end\n" ++
   "  module Sys\n" ++
   "    def self.getuid = Process.uid\n" ++
@@ -4379,6 +4400,7 @@ let core_prelude_f =
   "  end\n" ++
   "\n" ++
   "  def self.initgroups(user, gid)\n" ++
+  "    raise ArgumentError, \"string contains null byte\" if user.to_str.include?(\"\\0\")\n" ++
   "    raise Errno::EPERM unless uid == 0\n" ++
   "    raise NotImplementedError, \"Process.initgroups is not implemented here\"\n" ++
   "  end\n" ++
@@ -4517,7 +4539,38 @@ let core_prelude_f =
   "    newpg = false\n" ++
   "    unset_others = false\n" ++
   "    path = (env && env.key?(\"PATH\")) ? env[\"PATH\"] : ENV[\"PATH\"]\n" ++
+  "    # (a descriptor named twice is refused, a duplex IO is no redirect, and a\n" ++
+  "    #  PATH a redirect names is opened by ruby in the PARENT -- so a missing\n" ++
+  "    #  one is this call's ENOENT, not the child shell's message)\n" ++
+  "    seen = \{}\n" ++
+  "    twice = ->(x) \{ raise ArgumentError, \"fd #\{x} specified twice\" if seen[x]; seen[x] = true }\n" ++
+  "    duplex = ->(x) \{ x.is_a?(IO) && !x.instance_variable_get(:@__io_wfd).nil? }\n" ++
+  "    path_ok = ->(f, x) \{\n" ++
+  "      pth, md = x.is_a?(Array) ? [x[0], x[1]] : [x, nil]\n" ++
+  "      pth = pth.to_path if !pth.is_a?(String) && pth.respond_to?(:to_path)\n" ++
+  "      if pth.is_a?(String)\n" ++
+  "        md = (f == 0 ? \"r\" : \"w\") if md.nil?\n" ++
+  "        wr = md.is_a?(Integer) ? (md & 3) != 0 : md.to_s.match?(/[wa+]/)\n" ++
+  "        cr = md.is_a?(Integer) ? (md & File::CREAT) != 0 : md.to_s.match?(/[wa]/)\n" ++
+  "        unless File.exist?(pth) || (wr && cr && File.directory?(File.dirname(pth)))\n" ++
+  "          # (the PARENT's failure: system raises it too, as it does not a\n" ++
+  "          #  child that could not start)\n" ++
+  "          e = Errno::ENOENT.new(pth)\n" ++
+  "          e.instance_variable_set(:@__mr_parent, true)\n" ++
+  "          raise e\n" ++
+  "        end\n" ++
+  "      end\n" ++
+  "    }\n" ++
+  "    # (...and opened where the PARENT stands: a relative one is made absolute\n" ++
+  "    #  here, before a :chdir in the child's shell would move it)\n" ++
+  "    absp = ->(x) \{\n" ++
+  "      if x.is_a?(String) then File.expand_path(x)\n" ++
+  "      elsif x.is_a?(Array) && x[0].is_a?(String) then [File.expand_path(x[0])] + x[1..]\n" ++
+  "      else x\n" ++
+  "      end\n" ++
+  "    }\n" ++
   "    opts.each do |k, v|\n" ++
+  "      raise ArgumentError, \"duplex IO redirection\" if duplex.(k) || duplex.(v)\n" ++
   "      if k.is_a?(String)\n" ++
   "        raise ArgumentError, \"wrong exec option: \" + k.inspect\n" ++
   "      elsif k == :chdir\n" ++
@@ -4552,15 +4605,32 @@ let core_prelude_f =
   "        # kernel refuses is left as it was. (It was \"wrong exec option\n" ++
   "        # symbol\", and test_io's ruby() helper passes rlimit_nproc to every\n" ++
   "        # child it starts.)\n" ++
-  "        cur, max = v.is_a?(Array) ? v : [v, v]\n" ++
+  "        raise ArgumentError, \"wrong exec rlimit option\" if v.is_a?(Array) && (v.empty? || v.size > 2)\n" ++
+  "        cur, max = v.is_a?(Array) ? (v.size == 1 ? [v[0], v[0]] : v) : [v, v]\n" ++
   "        lim = ->(x) \{ x.is_a?(Integer) && x >= 0 && x != Process::RLIM_INFINITY ? x.to_s : \"unlimited\" }\n" ++
   "        pre << \"\{ ulimit -S -\" + u + \" \" + lim.(cur) + \" && ulimit -H -\" + u + \" \" + lim.(max) + \"; } 2>/dev/null || \{ ulimit -H -\" + u + \" \" + lim.(max) + \"; ulimit -S -\" + u + \" \" + lim.(cur) + \"; } 2>/dev/null;\"\n" ++
+  "      elsif k == :uid || k == :gid\n" ++
+  "        # the child's user / group: the one this process already is changes\n" ++
+  "        # nothing; another needs privilege this process does not have\n" ++
+  "        g = k == :gid\n" ++
+  "        id = v.is_a?(Integer) ? v : (require(\"etc\"); g ? Etc.getgrnam(v.to_s).gid : Etc.getpwnam(v.to_s).uid)\n" ++
+  "        cur = g ? Process.egid : Process.euid\n" ++
+  "        if id != cur\n" ++
+  "          raise Errno::EPERM unless Process.euid == 0\n" ++
+  "          raise NotImplementedError, \"spawn(\" + k.inspect + \") is not implemented here\"\n" ++
+  "        end\n" ++
   "      elsif k.is_a?(Array)\n" ++
   "        # one open shared by every descriptor named, as ruby does it\n" ++
   "        fs = k.map \{ |kk| __fd_of(kk) }\n" ++
+  "        fs.each \{ |x| twice.(x) }\n" ++
+  "        path_ok.(fs[0], v)\n" ++
+  "        v = absp.(v)\n" ++
   "        redir << __redir(fs[0], v)\n" ++
   "        fs[1..].each \{ |f| redir << f.to_s + \">&\" + fs[0].to_s }\n" ++
   "      elsif (f = __fd_of(k))\n" ++
+  "        twice.(f)\n" ++
+  "        path_ok.(f, v) unless v.is_a?(Array) && v[0] == :child\n" ++
+  "        v = absp.(v)\n" ++
   "        # [:child, fd] names the CHILD's descriptor after the others are set\n" ++
   "        (v.is_a?(Array) && v[0] == :child ? late : redir) << __redir(f, v)\n" ++
   "      else\n" ++
@@ -4669,8 +4739,8 @@ let core_prelude_f =
   "    end\n" ++
   "    begin\n" ++
   "      pid = spawn(*args)\n" ++
-  "    rescue SystemCallError\n" ++
-  "      raise if exc\n" ++
+  "    rescue SystemCallError => e\n" ++
+  "      raise if exc || e.instance_variable_get(:@__mr_parent)\n" ++
   "      return nil\n" ++
   "    end\n" ++
   "    # ⚠ ruby opens a redirect's PATH in the parent, before the fork, so a\n" ++
@@ -4867,7 +4937,32 @@ let core_prelude_f =
   "  end\n" ++
   "  private_class_method :__in_unit\n" ++
   "\n" ++
+  "  # the clocks ruby names by SYMBOL, with the resolution (in nanoseconds) it\n" ++
+  "  # reports for each; one it does not name, and a number that is no CLOCK_\n" ++
+  "  # constant, is EINVAL naming the call (ruby 4.0.6 on this machine)\n" ++
+  "  # ⚠ NOT a constant: `Process.constants.grep(/\\ACLOCK_/)` is how a program\n" ++
+  "  #   finds the clocks, and a CLOCK_ table there is handed to clock_gettime\n" ++
+  "  def self.__clock_sym_res\n" ++
+  "    @__clock_sym_res ||= \{\n" ++
+  "      GETTIMEOFDAY_BASED_CLOCK_REALTIME: 1000, TIME_BASED_CLOCK_REALTIME: 1000000000,\n" ++
+  "      GETRUSAGE_BASED_CLOCK_PROCESS_CPUTIME_ID: 1000, TIMES_BASED_CLOCK_PROCESS_CPUTIME_ID: 10000000,\n" ++
+  "      CLOCK_BASED_CLOCK_PROCESS_CPUTIME_ID: 1000, TIMES_BASED_CLOCK_MONOTONIC: 10000000\n" ++
+  "    }.merge(RUBY_PLATFORM.include?(\"darwin\") ? \{ MACH_ABSOLUTE_TIME_BASED_CLOCK_MONOTONIC: 125.0 / 3 } : \{}).freeze\n" ++
+  "  end\n" ++
+  "  def self.__clock_check(clock, who)\n" ++
+  "    if clock.is_a?(Symbol)\n" ++
+  "      raise Errno::EINVAL, \"#\{who}(#\{clock.inspect})\" unless __clock_sym_res.key?(clock)\n" ++
+  "    else\n" ++
+  "      c = clock.is_a?(Integer) ? clock : (clock.respond_to?(:to_int) ? clock.to_int : nil)\n" ++
+  "      raise TypeError, \"no implicit conversion of #\{clock.class} into Integer\" unless c.is_a?(Integer)\n" ++
+  "      ok = Process.constants.any? \{ |k| k.start_with?(\"CLOCK_\") && Process.const_get(k) == c }\n" ++
+  "      raise Errno::EINVAL, \"#\{who}(#\{c})\" unless ok\n" ++
+  "    end\n" ++
+  "  end\n" ++
+  "  private_class_method :__clock_check\n" ++
+  "\n" ++
   "  def self.clock_gettime(clock, unit = :float_second)\n" ++
+  "    __clock_check(clock, \"clock_gettime\")\n" ++
   "    __in_unit(__clock_raw, unit)\n" ++
   "  end\n" ++
   "\n" ++
@@ -4875,11 +4970,11 @@ let core_prelude_f =
   "  #   answered as documented. The numeric ones are \"observed\", and the spec\n" ++
   "  #   only requires <= 10ms; one microsecond is what a gettimeofday-based\n" ++
   "  #   clock gives and is the honest claim for the one behind __clock_raw.\n" ++
+  "  # (:hertz is the resolution's reciprocal, and only getres takes it)\n" ++
   "  def self.clock_getres(clock, unit = :float_second)\n" ++
-  "    ns = case clock\n" ++
-  "         when :TIME_BASED_CLOCK_REALTIME, :TIME_BASED_CLOCK_MONOTONIC then 1000000000\n" ++
-  "         else 1000\n" ++
-  "         end\n" ++
+  "    __clock_check(clock, \"clock_getres\")\n" ++
+  "    ns = clock.is_a?(Symbol) ? __clock_sym_res[clock] : 1000\n" ++
+  "    return 1000000000.0 / ns if unit == :hertz\n" ++
   "    __in_unit(ns / 1000000000.0, unit)\n" ++
   "  end\n" ++
   "end\n" ++
@@ -7853,6 +7948,14 @@ let core_prelude_k =
   "      end\n" ++
   "      copts = words.pop if !words.empty? && words[-1].is_a?(Hash)\n" ++
   "      raise ArgumentError, \"wrong number of arguments\" if words.empty?\n" ++
+  "      # (an ARRAY of one word is that program, never a shell line -- spawn\n" ++
+  "      #  would read one string as a line and split it -- so a word that a\n" ++
+  "      #  line would split or a shell would read, with no program of that\n" ++
+  "      #  name, is ENOENT here: `IO.popen([\"echo bar\"])`)\n" ++
+  "      if words.size == 1 && words[0].is_a?(String) && words[0].match?(/\\s|[*?\{}\\[\\]<>()~&|\\\\$;'`\"#=%]/) &&\n" ++
+  "         !File.executable?(words[0]) && Process.send(:__which, words[0], (env && env[\"PATH\"]) || ENV[\"PATH\"]).nil?\n" ++
+  "        raise Errno::ENOENT, words[0]\n" ++
+  "      end\n" ++
   "    else\n" ++
   "      s = __fd_str(cmd)\n" ++
   "      if s == \"-\"\n" ++
@@ -9476,7 +9579,8 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
   // the pid -- which is the honest answer to "what is my process id" on a machine
   // that has no processes.
   let _ = try_or (fn (u: unit) -> map_set globals "$" (VInt (getpid ()))) () in
-  let _ = map_set globals (gvar_slot "PROGRAM_NAME") (mkstr name) in
+  // ($0 is frozen from the start, as Process.argv0 is -- test_argv0_frozen)
+  let _ = map_set globals (gvar_slot "PROGRAM_NAME") (match mkstr name with VStr h0 -> (let _ = sfrozen_set h0 in VStr h0) | o0 -> o0) in
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
   // A small core prelude, written in ruby and run before the program: classes
   // that are core (no `require` names them) but are ordinary objects, so

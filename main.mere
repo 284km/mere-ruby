@@ -2626,6 +2626,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (let _ = exit 0 in VNil)
     else if (str_len name == 7 && str_eq name "at_exit") && (if map_has meths "at_exit" then false else true) then
       raise_exc world "ArgumentError" "called without a block"
+    // a bare `abort` is Kernel#abort with no message (it was "undefined
+    // method" -- only `abort()` and `abort "msg"` reached the arm)
+    else if (str_len name == 5 && str_eq name "abort") && (if map_has meths "abort" || kernel_overridden env world "abort" then false else true) then
+      try_self_call_x env world VNil "abort" Nil false
     // ...and `proc` / `lambda` with no block: the block IS the object being
     // asked for. ruby's own wording.
     else if ((str_len name == 4 && str_eq name "proc") || (str_len name == 6 && str_eq name "lambda"))
@@ -4915,14 +4919,20 @@ and gvar_assign_checked = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
                   (match v with
                    | VNil -> "no implicit conversion from nil to integer"
                    | _ -> "no implicit conversion of " ++ display_cls_msg world (dispatch_cls_of world v) ++ " into Integer") in ())))
+  // (what is stored is a FROZEN COPY: `s = "y"; $0 = s` leaves s as it was
+  //  and $0 frozen, as ruby's set_arg0 does)
   else if str_eq slot "0" || str_eq slot "PROGRAM_NAME" then
-    (match v with
-     | VStr _ -> (let _ = gvar_write world slot v in ())
+    (let frz9 = fn (x: Val) -> (match x with
+                                | VStr h9 -> (let c9 = mkstr (sget h9) in
+                                              (match c9 with VStr i9 -> (let _ = senc_set i9 (senc_get h9) in let _ = sfrozen_set i9 in c9) | _ -> c9))
+                                | _ -> x) in
+     match v with
+     | VStr _ -> (let _ = gvar_write world slot (frz9 v) in ())
      | _ ->
        (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
         let ts9 = (if responds world v "to_str" then invoke_val_c env world nb9 v "to_str" Nil false else VNil) in
         match ts9 with
-        | VStr _ -> (let _ = gvar_write world slot ts9 in ())
+        | VStr _ -> (let _ = gvar_write world slot (frz9 ts9) in ())
         | _ -> (let _ = raise_exc world "TypeError"
                   ("no implicit conversion of " ++ (match v with VNil -> "nil" | _ -> display_cls_msg world (dispatch_cls_of world v))
                    ++ " into String") in ())))
@@ -26292,7 +26302,17 @@ and cmp_member_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
     (match (x, y) with
      | (VArr a3, VArr b3) -> arr_eq_w env world (deref a3) (deref b3)
      | (VHsh h3, VHsh g3) -> hash_eq_w env world h3 g3
+     // a NUMBER against an object asks the object (num_equal: rb_equal(y,
+     // x)) -- `[pid, 0] == Process.wait2` is a Status's own ==
+     | (VInt _, VObj _) -> cmp_num_obj_w env world x y
+     | (VFlt _, VObj _) -> cmp_num_obj_w env world x y
+     | (VBig _, VObj _) -> cmp_num_obj_w env world x y
+     | (VRat (_, _), VObj _) -> cmp_num_obj_w env world x y
      | (_, _) -> false)
+and cmp_num_obj_w = fn env -> fn world -> fn (x: Val) -> fn (y: Val) ->
+  (if obj_answers_eq world y
+   then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) y "==" (Cons (x, Nil)) false)
+   else false)
 
 // Range#== / #eql? against `other`: a Range, or a Range subclass instance
 // Module#name, as the class itself answers it: nil for a singleton or an
@@ -33611,7 +33631,31 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
        (let m = fmt_str_arg env world mv in
         let _ = err_emit world m in
         raise_system_exit world 1 m)
-     | Nil -> raise_system_exit world 1 "exit")
+     // (with no message and an exception being handled, ruby prints that
+     //  exception as an uncaught one would be -- rb_ec_error_print -- and
+     //  then ends: `rescue; abort` keeps the report, [Bug #16424])
+     | Nil ->
+       (let ex9 = (if map_has globals "!" then map_get globals "!" else VNil) in
+        let _ = (match ex9 with
+                 | VNil -> ()
+                 | _ -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                         match try_or (fn (u: unit) -> invoke_val_c env world nb9 ex9 "full_message" Nil false) VNil with
+                         | VStr fm9 -> (let t9 = sget fm9 in
+                                        let t9b = (if str_len t9 > 0 && str_eq (char_at t9 (str_len t9 - 1)) "\n" then substring t9 0 (str_len t9 - 1) else t9) in
+                                        err_emit world t9b)
+                         | _ -> ())) in
+        raise_system_exit world 1 "exit"))
+  // Kernel#sleep takes at most one interval, and a NEGATIVE Rational is as
+  // negative as -1 (rb_f_sleep counts first, rb_time_interval refuses the
+  // sign) -- both were slept through
+  else if (str_len name == 5 && str_eq name "sleep")
+          && (match args with
+              | Cons (_, Cons (_, _)) -> true
+              | Cons (VRat (n9, _), Nil) -> str_len n9 > 0 && str_eq (char_at n9 0) "-"
+              | _ -> false) then
+    (match args with
+     | Cons (_, Cons (_, _)) -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (val_list_len args) ++ ", expected 0..1)")
+     | _ -> raise_exc world "ArgumentError" "time interval must not be negative")
   // Kernel#sleep in a non-blocking fiber of a thread that has a Fiber
   // scheduler is the scheduler's #kernel_sleep, with the arguments as given
   else if (str_len name == 5 && str_eq name "sleep") && fb_sched_here () then
