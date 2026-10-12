@@ -7455,7 +7455,11 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
          (let rec go9 = fn (ys: Val list) -> fn (newk: Val list) -> fn (cur9: Val list) ->
             (match ys with
              | Cons (k9, Cons (v9, t9)) ->
-               (match run_block world encl theblk (Cons (k9, Nil)) with
+               // (a Hash argument maps the keys it has; the block is asked
+               //  only for the others -- `transform_keys!({a: :A}, &:to_s)`)
+               (match (match args with
+                       | Cons (VHsh mh9, _) when hash_haskey (hderef mh9) k9 -> FNext (hash_get (hderef mh9) k9)
+                       | _ -> run_block world encl theblk (Cons (k9, Nil))) with
                 | FBreak bv9 -> (true, bv9, cur9)
                 | FReturn rv9 -> (true, rv9, cur9)
                 | f9 ->
@@ -7468,11 +7472,28 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
           let _ = hset hid out9 in
           if broke9 then bv9 else recv)
        | _ -> recv)
+    // ...pair by pair, as rb_hash_transform_values_bang stores them: a block
+    // that freezes the hash leaves the values made BEFORE it in place, and
+    // the store that follows is refused ({a: 2, b: 2, ...} for a freeze at
+    // b). It made every value first and wrote none of them.
     else if (str_len name == 17 && str_eq name "transform_values!") then
       (match recv with
        | VHsh hid ->
-         (let (out9, broke9, bv9) = hash_tv_b world encl theblk xs in
-          let _ = hash_frz_after_block world recv in
+         (let rec rv9 = fn (zs: Val list) -> fn (acc: Val list) -> (match zs with Nil -> acc | Cons (h9, t9) -> rv9 t9 (Cons (h9, acc))) in
+          let rec go9 = fn (ys: Val list) -> fn (done9: Val list) ->
+            (match ys with
+             | Cons (k9, Cons (v9, t9)) ->
+               (match run_block world encl theblk (Cons (v9, Nil)) with
+                | FBreak bv9 -> (true, bv9, list_append (rv9 done9 Nil) ys)
+                | FReturn r9 -> (true, r9, list_append (rv9 done9 Nil) ys)
+                | f9 ->
+                  (let nv9 = flow_value f9 in
+                   let _ = (if val_frozen_mut recv
+                            then (let _ = hset hid (list_append (rv9 done9 Nil) ys) in hash_frz_after_block world recv)
+                            else ()) in
+                   go9 t9 (Cons (nv9, Cons (k9, done9)))))
+             | _ -> (false, VNil, rv9 done9 Nil)) in
+          let (broke9, bv9, out9) = go9 xs Nil in
           let _ = hset hid out9 in
           if broke9 then bv9 else recv)
        | _ -> recv)
@@ -8645,19 +8666,6 @@ and hash_tv = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   | Nil -> Nil
   | Cons (k, rest) -> (match rest with Cons (v, t) -> Cons (k, Cons (flow_value (run_block world encl theblk (Cons (v, Nil))), hash_tv world encl theblk t)) | Nil -> Nil)
 
-// ...and the form that STOPS at a break, leaving the pairs after it as they
-// were: `transform_values!` that breaks half way keeps the rest of the values
-// (flow_value swallowed the break and wrote nil over them).
-and hash_tv_b = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
-  match xs with
-  | Cons (k, Cons (v, t)) ->
-    (match run_block world encl theblk (Cons (v, Nil)) with
-     | FBreak bv -> (Cons (k, Cons (v, t)), true, bv)
-     | FReturn rv -> (Cons (k, Cons (v, t)), true, rv)
-     | f ->
-       (let (rest9, broke9, bv9) = hash_tv_b world encl theblk t in
-        (Cons (k, Cons (flow_value f, rest9)), broke9, bv9)))
-  | other -> (other, false, VNil)
 and hash_tk = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
@@ -9818,10 +9826,13 @@ and hkey_eql_w = fn env -> fn world -> fn (hid: int) -> fn (a: Val) -> fn (b: Va
        //   STORED key first -- asking only that one left the question
        //   unasked whenever the search key was the one carrying #eql?, and
        //   core/set/include_spec's lookup then failed.
+       // ⚠ ...and ONLY the search key: st compares `key.eql?(stored)`, so a
+       //   search key without an #eql? of its own is the builtin one
+       //   (identity for an object), whatever the stored key would say. Asking
+       //   the stored key in its place made `h[obj2] = v` overwrite a stored
+       //   obj whose #eql? said yes to anything (note 318).
        (if has_meth world (dispatch_cls_of world b) "eql?"
         then truthy (invoke_val_c env world nb7 b "eql?" (Cons (a, Nil)) false)
-        else if has_meth world (dispatch_cls_of world a) "eql?"
-        then truthy (invoke_val_c env world nb7 a "eql?" (Cons (b, Nil)) false)
         else hkey_md_eql env world a b)
      else false)
   else hkey_eql a b
@@ -9950,8 +9961,12 @@ and hput_new_check = fn (hid: int) ->
 // got true", and the sweep is what said so. Those keys take the old path, and
 // nothing else changes.
 and hput_or_queue_w = fn env -> fn world -> fn (hid: int) -> fn (ident: bool) -> fn (k: Val) -> fn (v: Val) -> fn (slow: unit -> Val list) ->
+  // (the key's #hash runs FIRST and the pairs are read after it: a #hash
+  //  that stores into this same hash -- test_ar2st_insert -- had its pairs
+  //  written over by the copy read before it ran)
   if (if ident then false else key_has_user_hash world k)
-  then (let _ = hset hid (slow ()) in v)
+  then (let _ = hstored_put env world hid k in
+        let _ = hset hid (hash_put_w env world hid (hderef hid) k v) in v)
   else hput_or_queue hid ident k v slow
 and hash_put_wx = fn env -> fn world -> fn (hid: int) -> fn (ident: bool) -> fn (xs: Val list) -> fn (k: Val) -> fn (v: Val) ->
   // ⚠ compare_by_identity ANSWERS FIRST. A hash comparing by identity asks
@@ -11488,7 +11503,27 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                                               | VHsh x9 -> VHsh x9
                                               | _ -> a9)
                                  | _ -> a9) in
-                       Cons (a2, ch9 t9))) in
+                       // (pairs from an IDENTITY hash into one that is not:
+                       //  a String key goes in as a frozen copy, as every
+                       //  store into such a hash puts it -- `key.upcase!`
+                       //  afterwards renamed the key here)
+                       let a3 = (match (recv, a2) with
+                                 // (not for replace: that one takes the argument's mode too)
+                                 | (VHsh r9, VHsh x9) when hcbi_on x9 && (if hcbi_on r9 then false else true)
+                                                          && (if str_eq name "replace" then false else true) ->
+                                   (let rec cp9 = fn (ps: Val list) ->
+                                      (match ps with
+                                       | Cons (VStr kh9, Cons (v9, pt9)) ->
+                                         (let k9 = (if sfrozen_get kh9 then VStr kh9
+                                                    else (match mkstr (sget kh9) with
+                                                          | VStr nk9 -> (let _ = senc_set nk9 (senc_get kh9) in let _ = sfrozen_set nk9 in VStr nk9)
+                                                          | o9 -> o9)) in
+                                          Cons (k9, Cons (v9, cp9 pt9)))
+                                       | Cons (k9, Cons (v9, pt9)) -> Cons (k9, Cons (v9, cp9 pt9))
+                                       | _ -> (Nil : Val list)) in
+                                    mkhash (cp9 (hderef x9)))
+                                 | _ -> a2) in
+                       Cons (a3, ch9 t9))) in
                  ch9 args0)
               // Array#join / Array#* take a STRING separator: #to_str decides,
               // and `*` falls back to the Integer meaning when it is absent.
@@ -12286,10 +12321,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (match args with Cons (k7, _) -> key_has_user_hash world k7 | _ -> false) then
     (match recv with
      | VHsh h ->
-       (let xs = hderef h in
-        match args with
+       (match args with
         | Cons (k7, rest7) ->
+          // (the key's #hash first, the pairs read after it: a #hash that
+          //  stores into this hash is seen -- test_ar2st_delete)
           (let _ = hash_touch env world k7 in
+           let xs = hderef h in
            if (str_len name == 2 && str_eq name "[]") then hash_get_w env world h xs k7
            else if (str_len name == 6 && str_eq name "delete") then
              (let had = hash_haskey_w env world h xs k7 in
@@ -12460,7 +12497,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      | _ -> VNil)
   else if (str_len name == 2 && str_eq name "[]") && (match recv with VHsh _ -> true | _ -> false)
           && (match args with Cons (_, Nil) -> true | _ -> false)
-          && has_meth world (dispatch_cls_of world recv) "default"
+          // (a SINGLETON's #default too: `def h.default(k)` on one Hash)
+          && (has_meth world (dispatch_cls_of world recv) "default" || hng_sng_has world recv "default")
           && (match recv with
               | VHsh hid9 -> (match args with
                               | Cons (k9, _) -> (if hash_haskey_x (hcbi_on hid9) (hderef hid9) k9 then false else true)
@@ -13954,7 +13992,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 2 && str_eq name "[]") && obj_is_a world c "Array" then
       (let v = arr_new args in
        let _ = map_set hng_store (hng_key v) c in v)
-    else if (str_len name == 2 && str_eq name "[]") && obj_is_a world c "Hash" then hash_bracket world args
+    // ...and a SUBCLASS's: the same conversions (an object with #to_hash or
+    // #to_ary), and the result is an instance of the subclass -- it was a
+    // plain Hash, and `SubHash[o]` with a #to_hash was "odd number"
+    else if (str_len name == 2 && str_eq name "[]") && obj_is_a world c "Hash" then
+      (let a9 = (match args with
+                 | Cons (VObj _, Nil) ->
+                   (match args with
+                    | Cons (o9, Nil) ->
+                      (match conv_try env world o9 "to_hash" with
+                       | VHsh x9 -> Cons (VHsh x9, Nil)
+                       | _ -> (match conv_try env world o9 "to_ary" with
+                               | VArr y9 -> Cons (VArr y9, Nil)
+                               | _ -> args))
+                    | _ -> args)
+                 | _ -> args) in
+       let v9 = hash_bracket world a9 in
+       let _ = (match v9 with VHsh _ -> map_set hng_store (hng_key v9) c | _ -> ()) in
+       v9)
     // Hash.ruby2_keywords_hash?(h) / Hash.ruby2_keywords_hash(h): the "keywords
     // hash" mark is the one a `key:` argument already carries here (a
     // ruby2_keywords method keeps it instead of demoting it), so the predicate
@@ -24386,6 +24441,33 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   else if (str_len name == 9 && str_eq name "iterator?")
           && (if kernel_overridden env world "iterator?" then false else true) then
     VBool (match blk with (true, _, _, _) -> true | _ -> false)
+  // Hash#eql? / #== against something that is no Hash but answers #to_hash
+  // ask IT (hash_equal: rb_eql(hash2, hash1) / rb_equal(hash2, hash1))
+  else if ((str_len name == 4 && str_eq name "eql?") || (str_len name == 2 && str_eq name "=="))
+          && (match recv with VHsh _ -> true | _ -> false)
+          && (match args with Cons (VObj _, Nil) -> true | _ -> false)
+          && (if prim_user_has world recv name then false else true) then
+    (match args with
+     | Cons (o9, _) ->
+       (if responds world o9 "to_hash" then VBool (truthy (invoke_val_c env world noblk o9 name (Cons (recv, Nil)) false))
+        else VBool false)
+     | Nil -> VBool false)
+  // Hash#to_h on a SUBCLASS's instance is a plain Hash (rb_hash_to_h's
+  // hash_dup to rb_cHash): the pairs, the default and compare_by_identity,
+  // and neither the class nor the instance variables
+  else if (str_len name == 4 && str_eq name "to_h") && (match args with Nil -> true | _ -> false)
+          && (match recv with VHsh _ -> map_has hng_store (hng_key recv) | _ -> false)
+          && (if prim_user_has world recv "to_h" then false else true) then
+    // (the primitive's dup copies the table, the default and the identity
+    //  mode, and no instance variables; the subclass's tag is taken off)
+    (let v9 = prim_method recv "dup" Nil in
+     let _ = (if map_has hng_store (hng_key v9) then map_delete hng_store (hng_key v9) else ()) in
+     let _ = (match (recv, v9) with
+              | (VHsh o9, VHsh n9) ->
+                (let _ = (match hdflt_get o9 with VNil -> () | d9 -> hdflt_set n9 d9) in
+                 match hdproc_get o9 with VNil -> () | p9 -> hdproc_set n9 p9)
+              | _ -> ()) in
+     v9)
   // String#match is `pattern.match(self, *rest)` (rb_str_match_m): a Regexp
   // whose #match is its own answers for it -- `def o.match(x, y, z)`
   else if (str_len name == 5 && str_eq name "match") && (match recv with VStr _ -> true | _ -> false)
@@ -30457,6 +30539,20 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // Hash#slice returns a sub-hash; for String and Array slice IS []
   else if (str_len name == 5 && str_eq name "slice") && (match recv with VHsh _ -> true | _ -> false) then
     (match recv with
+     // (an identity hash is asked by IDENTITY, and its result is made one
+     //  before the pairs go in: two "str" keys stayed one otherwise)
+     | VHsh xs when hcbi_on xs ->
+       (let r9 = mkhash Nil in
+        let _ = hcbi_copy xs r9 in
+        let rec put9 = fn (ks: Val list) ->
+          (match ks with
+           | Nil -> ()
+           | Cons (k9, t9) ->
+             (let _ = (if hash_haskey_x true (hderef xs) k9
+                       then (let _ = prim_method r9 "[]=" (Cons (k9, Cons (hash_get_x true (hderef xs) k9, Nil))) in ())
+                       else ()) in
+              put9 t9)) in
+        let _ = put9 args in r9)
      | VHsh xs -> (let r9 = mkhash (hash_slice (hderef xs) args) in
                    let _ = hcbi_copy xs r9 in r9)
      | _ -> recv)
@@ -30899,10 +30995,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VHsh h ->
        (match args with
         | Nil -> arr_new (hderef h)
+        // (0 is the PAIRS, unflattened -- to_a -- and a negative depth is
+        //  every level; nil is refused, rb_hash_flatten's NUM2INT)
         | Cons (VInt d9, Nil) ->
-          (if d9 <= 1 then arr_new (hderef h)
+          (if d9 == 0 then
+             (let rec pairs9 = fn (xs: Val list) ->
+                (match xs with
+                 | Cons (k9, Cons (v9, t9)) -> Cons (arr_new (Cons (k9, Cons (v9, Nil))), pairs9 t9)
+                 | _ -> (Nil : Val list)) in
+              arr_new (pairs9 (hderef h)))
+           else if d9 < 0 then arr_new (val_flatten (hderef h) (0 - 1))
+           else if d9 == 1 then arr_new (hderef h)
            else arr_new (val_flatten (hderef h) (d9 - 1)))
-        | Cons (VNil, Nil) -> arr_new (val_flatten (hderef h) (0 - 1))
+        | Cons (VNil, Nil) -> prim_raise "TypeError" "no implicit conversion from nil to integer"
         | Cons (other9, Nil) ->
           prim_raise "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into Integer")
         | _ -> prim_raise "ArgumentError"
@@ -41536,6 +41641,8 @@ and arr_mut_arity_wrong = fn (recv: Val) -> fn (name: str) -> fn (args: Val list
      else if str_eq name "replace" then n != 1
      else if str_eq name "[]=" then (n < 2 || n > 3)
      else false)
+  // (Hash#replace counts before it asks frozen, as Array#replace does)
+  | VHsh _ -> str_eq name "replace" && val_list_len args != 1
   | _ -> false
 and frz_cls_check = fn world -> fn (c0: str) ->
   // `K.instance_eval { def m; end }` writes to K's SINGLETON namespace, and
