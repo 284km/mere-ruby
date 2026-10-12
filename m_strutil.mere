@@ -470,6 +470,12 @@ let enc_decode_marked = fn (s: str) -> fn (from: str) ->
      go 0)
   else decode_cps s from 0;
 
+// does a dumped string use a \u escape (outside a \\ pair)? ruby's undump
+// answers UTF-8 then, whatever the receiver was ("\"\\u3042\"" in EUC-JP)
+let rec undump_has_u = fn (s: str) -> fn (i: int) ->
+  if i + 1 >= str_len s then false
+  else if str_eq (char_at s i) "\\" then (if str_eq (char_at s (i + 1)) "u" then true else undump_has_u s (i + 2))
+  else undump_has_u s (i + 1);
 // ---- String#undump: parse the #dump wire format back to the raw string ----
 // Answers (bytes, forced-encoding-or-"") or raises ruby's RuntimeErrors.
 let rb_undump = fn (s: str) ->
@@ -519,16 +525,25 @@ let rb_undump = fn (s: str) ->
                 if h1 < 0 || h2 < 0 then (match prim_raise "RuntimeError" "invalid hex escape" with _ -> ("", ""))
                 else go (i + 4) (acc ++ chr (h1 * 16 + h2)))
              else if str_eq e2 "u" then
+               // \u{...} holds any number of codepoints, spaces between
+               // them, and may be empty (undump_after_backslash): each is 1..6
+               // hex digits, at most U+10FFFF and not a surrogate half
                (if i + 2 < n && str_eq (char_at s (i + 2)) "\{" then
                   (let rec hexes = fn (k: int) -> fn (v: int) -> fn (cnt: int) ->
-                     (if k < n && str_eq (char_at s k) "}" then (v, k + 1, cnt)
+                     (let hv = (if k < n then hexv (char_at s k) else 0 - 1) in
+                      if hv < 0 then (v, k, cnt) else hexes (k + 1) (v * 16 + hv) (cnt + 1)) in
+                   let rec cps = fn (k: int) -> fn (a9: str) ->
+                     (if k >= n then (match prim_raise "RuntimeError" "unterminated Unicode escape" with _ -> ("", ""))
+                      else if str_eq (char_at s k) "}" then go (k + 1) (acc ++ a9)
+                      else if str_eq (char_at s k) " " || str_eq (char_at s k) "\t" then cps (k + 1) a9
                       else
-                        let hv = (if k < n then hexv (char_at s k) else 0 - 1) in
-                        if hv < 0 then (0 - 1, k, cnt) else hexes (k + 1) (v * 16 + hv) (cnt + 1)) in
-                   match hexes (i + 3) 0 0 with
-                   | (v, k2, cnt) ->
-                     if v < 0 || cnt == 0 then (match prim_raise "RuntimeError" "invalid Unicode escape" with _ -> ("", ""))
-                     else go k2 (acc ++ utf8_enc v))
+                        (match hexes k 0 0 with
+                         | (v, k2, cnt) ->
+                           if cnt == 0 || cnt > 6 then (match prim_raise "RuntimeError" "invalid Unicode escape" with _ -> ("", ""))
+                           else if v > 1114111 then (match prim_raise "RuntimeError" "invalid Unicode codepoint (too large)" with _ -> ("", ""))
+                           else if v >= 55296 && v <= 57343 then (match prim_raise "RuntimeError" "invalid Unicode codepoint" with _ -> ("", ""))
+                           else cps k2 (a9 ++ utf8_enc v))) in
+                   cps (i + 3) "")
                 else
                   (let d1 = (if i + 2 < n then hexv (char_at s (i + 2)) else 0 - 1) in
                    let d2 = (if i + 3 < n then hexv (char_at s (i + 3)) else 0 - 1) in
@@ -537,7 +552,10 @@ let rb_undump = fn (s: str) ->
                    if d1 < 0 || d2 < 0 || d3 < 0 || d4 < 0
                    then (match prim_raise "RuntimeError" "invalid Unicode escape" with _ -> ("", ""))
                    else go (i + 6) (acc ++ utf8_enc (((d1 * 16 + d2) * 16 + d3) * 16 + d4))))
-             else go (i + 2) (acc ++ e2))
+             // (\\, \" and \# are the character; any other escape is kept
+             //  as written, backslash and all -- "\\ca" undumps to \ca)
+             else if str_eq e2 "\\" || str_eq e2 "\"" || str_eq e2 "#" then go (i + 2) (acc ++ e2)
+             else go (i + 2) (acc ++ "\\" ++ e2))
         else go (i + 1) (acc ++ c) in
     go 1 "";
 
@@ -1007,8 +1025,23 @@ let rx_str_pat_check = fn (ph: int) ->
            else (let o = ord (char_at pv i) in
                  show (i + 1) (acc ++ (if o < 128 && o >= 32 then char_at pv i else "\\x" ++ char_at hd (o / 16) ++ char_at hd (o - (o / 16) * 16))))) in
         let _ = prim_raise "RegexpError" ("invalid multibyte character: /" ++ show 0 "" ++ "/") in ()));
+// strip in CODEPOINTS, for an encoding that is not ASCII-compatible
+// (UTF-16/32): a byte 0x20 inside "\x30\x20" is half of U+3020, not a space.
+// NUL and the ASCII spaces come off, as rb_isspace and the '\0' rule say.
+let cps_strip = fn (s: str) -> fn (e: str) -> fn (left: bool) -> fn (right: bool) ->
+  let sp = fn (c: int) -> c == 0 || c == 32 || (c >= 9 && c <= 13) in
+  let rec dropl = fn (xs: int list) -> (match xs with Cons (c, t) -> (if sp c then dropl t else xs) | Nil -> xs) in
+  let rec rv = fn (xs: int list) -> fn (acc: int list) -> (match xs with Nil -> acc | Cons (h, t) -> rv t (Cons (h, acc))) in
+  let cps0 = decode_cps s e 0 in
+  let cps1 = (if left then dropl cps0 else cps0) in
+  let cps2 = (if right then rv (dropl (rv cps1 Nil)) Nil else cps1) in
+  (match encode_cps cps2 e "" with (bytes, _) -> bytes);
+// rb_str_check_dummy_enc: rstrip (and strip, through it) refuses a dummy
+// encoding outright -- lstrip does not ask.
 let strip_rcheck = fn (sh: int) ->
-  if str_is_ascii sh then ()
+  if enc_is_dummy (enc_canon_name (senc_get sh)) then
+    (let _ = prim_raise "Encoding::CompatibilityError" ("incompatible encoding with this operation: " ++ enc_canon_name (senc_get sh)) in ())
+  else if str_is_ascii sh then ()
   else
     (let e = enc_canon_name (senc_get sh) in
      if enc_valid (sget sh) e then ()

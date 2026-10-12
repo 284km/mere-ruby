@@ -1493,7 +1493,16 @@ let rec val_hash = fn (v: Val) ->
   match v with
   | VInt n -> hash_mix n
   | VBig s -> hash_mix (str_hash_go s 0 7)
-  | VStr h -> hash_mix (str_hash_go (sget h) 0 7)
+  // rb_str_hash: the ENCODING joins the bytes unless the string is ASCII
+  // (empty, or 7-bit in an ASCII-compatible encoding) -- `"\x80".b` and
+  // `"\x80"` are not eql?, and their hashes differ by the encoding.
+  | VStr h ->
+    (let s9 = sget h in
+     let rec hi9 = fn (i: int) -> (if i >= str_len s9 then false else if ord (char_at s9 i) >= 128 then true else hi9 (i + 1)) in
+     let e9 = enc_canon_name (senc_get h) in
+     if str_len s9 == 0 || (enc_ascii_compat e9 && (if hi9 0 then false else true))
+     then hash_mix (str_hash_go s9 0 7)
+     else hash_mix (str_hash_go s9 0 7 + 7919 * (enc_index e9 + 1)))
   | VSym s -> hash_mix (str_hash_go s 0 5381)
   | VBool b -> if b then 1 else 0
   | VNil -> 0
@@ -2507,7 +2516,34 @@ let arith_bin = fn (op: str) -> fn (va: Val) -> fn (vb: Val) ->
      | _ -> coerce_err vb (conv_name va))
   else if str_eq op "*" then
     (match va with
-     | VStr x -> (match vb with VInt y -> (let r = mkstr (str_repeat (sget x) y) in (match r with VStr rid -> let _ = senc_set rid (senc_get x) in r | _ -> r)) | _ -> conv_err vb "Integer")
+     // (the count is refused as rb_str_times refuses it -- the runtime's
+     //  str_repeat stopped the interpreter on a negative one)
+     | VStr x -> (match vb with
+                  | VInt y ->
+                    (let n9 = str_len (sget x) in
+                     if y < 0 then prim_raise "ArgumentError" "negative argument"
+                     // (an empty string is empty however often: str_repeat
+                     //  would still walk the count, 2**62 - 1 times)
+                     else if n9 == 0 then (let r = mkstr "" in (match r with VStr rid -> let _ = senc_set rid (senc_get x) in r | _ -> r))
+                     // (LONG_MAX / n9 without the literal Mere cannot hold:
+                     //  LONG_MAX = 2a + 1 with a = 2**62 - 1)
+                     else if n9 > 1 && y > 2 * (4611686018427387903 / n9) + (2 * (4611686018427387903 - (4611686018427387903 / n9) * n9) + 1) / n9
+                     then prim_raise "ArgumentError" "argument too big"
+                     else if n9 > 0 && y > 1099511627776 / n9 then prim_raise "NoMemoryError" "failed to allocate memory"
+                     else (let r = mkstr (str_repeat (sget x) y) in (match r with VStr rid -> let _ = senc_set rid (senc_get x) in r | _ -> r)))
+                  // a count past 2**62 that still fits a long is ruby's own
+                  // "argument too big" (or the allocation failing); past a
+                  // long it is the conversion that fails
+                  | VBig y ->
+                    (let neg9 = str_len y > 0 && str_eq (char_at y 0) "-" in
+                     let d9 = (if neg9 then substring y 1 (str_len y) else y) in
+                     let fits9 = str_len d9 < 19 || (str_len d9 == 19 && (if str_compare d9 "9223372036854775807" > 0 then false else true)) in
+                     if (if fits9 then false else true) then prim_raise "RangeError" "bignum too big to convert into 'long'"
+                     else if neg9 then prim_raise "ArgumentError" "negative argument"
+                     else if str_len (sget x) == 0 then (let r = mkstr "" in (match r with VStr rid -> let _ = senc_set rid (senc_get x) in r | _ -> r))
+                     else if str_len (sget x) > 1 then prim_raise "ArgumentError" "argument too big"
+                     else prim_raise "NoMemoryError" "failed to allocate memory")
+                  | _ -> conv_err vb "Integer")
      // a NEGATIVE count is ruby's ArgumentError, not an empty array: `a * -1`
      // was answering [] (list_rep stops at zero either way).
      | VArr x -> (match vb with
