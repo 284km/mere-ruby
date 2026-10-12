@@ -51,3 +51,5 @@ t(32) { [S2.new(encoding: "EUC-JP").encoding, S2.new("x").class, S2.try_convert(
 t(33) { s = S2.new("foo"); d = -s; [d.class, d.frozen?, s.frozen?] }
 t(34) { "".freeze.send(:initialize, capacity: 10) }
 t(35) { "".freeze.send(:initialize) }
+t(36) { [3.1, 3.999, -0.5].map { |f| "ab" * f } }
+t(37) { [-3.14, Float::NAN, -Float::INFINITY, 1e30, 5e18].map { |f| begin; "a" * f; rescue Exception => e; "#{e.class}: #{e.message}"; end } }
