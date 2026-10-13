@@ -6749,6 +6749,18 @@ and rng_bsearch = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (hi: Va
   // ⚠ a BIGNUM bound is bisected as a bignum. It was read with int_of_str,
   //   which does not fit, and `(-2**100..-123456789).bsearch { true }` bisected
   //   the wrapped value without end (test_range's bsearch_for_floats).
+  // ⚠ an ENDLESS integer range probes outward by doubling, and the answer
+  //   may lie past an int: the probe stopped at 2**62 and answered nil
+  //   (`(0...).bsearch { |i| i > 2**101 }`). It goes on in bignums.
+  else if hi_endless && (match lo with VNil -> false | _ -> true) then
+    (let los = (match lo with VBig b -> b | VInt n -> str_of_int n | _ -> "0") in
+     rng_bs_big_probe world encl theblk los "1" 400)
+  // ...and a BEGINLESS one probes downward from its end the same way
+  // (`(...0).bsearch { |i| i > -2**101 }` bisected only the ints)
+  else if (match lo with VNil -> true | _ -> false) && (match hi with VInt _ -> true | VBig _ -> true | _ -> false) then
+    (let his0 = (match hi with VBig b -> b | VInt n -> str_of_int n | _ -> "0") in
+     let tops = (if excl then big_sub_s his0 "1" else his0) in
+     rng_bs_big_probe_down world encl theblk tops "1" 400)
   else if (match lo with VBig _ -> true | _ -> false)
           || (if hi_endless then false else (match hi with VBig _ -> true | _ -> false)) then
     (let los = (match lo with VBig b -> b | VInt n -> str_of_int n | _ -> "0") in
@@ -6761,6 +6773,29 @@ and rng_bsearch = fn world -> fn encl -> fn theblk -> fn (lo: Val) -> fn (hi: Va
      let hii = (if hi_endless then rng_bs_int_probe world encl theblk loi 1 62
                 else (match hi with VInt n -> (if excl then n - 1 else n) | VBig b -> int_of_str b | _ -> int_max)) in
      rng_bs_int world encl theblk loi hii 0 false)
+// the beginless probe: ask top - w for w = 1, 2, 4...; the first one the
+// block REFUSES closes the bracket [top - w, top]
+and rng_bs_big_probe_down = fn world -> fn encl -> fn theblk -> fn (tops: str) -> fn (ws: str) -> fn (n: int) ->
+  if n <= 0 then (VNil, false, VNil)
+  else
+    (let v9 = big_sub_s tops ws in
+     let (verd, extra) = rng_bs_ask world encl theblk (norm_big v9) in
+     if verd == 3 then (VNil, true, extra)
+     else if verd == 4 then rng_bs_type_err world extra
+     else if verd == 1 then rng_bs_big world encl theblk v9 tops "0" false
+     else rng_bs_big_probe_down world encl theblk tops (big_add_s ws ws) (n - 1))
+// the endless probe in bignums: ask lo + w for w = 1, 2, 4...; the first one
+// the block accepts closes the bracket [lo, lo + w], searched as rng_bs_big
+// does. (A bounded number of doublings: past 2**400 it answers nil.)
+and rng_bs_big_probe = fn world -> fn encl -> fn theblk -> fn (los: str) -> fn (ws: str) -> fn (n: int) ->
+  if n <= 0 then (VNil, false, VNil)
+  else
+    (let v9 = big_add_s los ws in
+     let (verd, extra) = rng_bs_ask world encl theblk (norm_big v9) in
+     if verd == 3 then (VNil, true, extra)
+     else if verd == 4 then rng_bs_type_err world extra
+     else if verd == 1 then rng_bs_big_probe world encl theblk los (big_add_s ws ws) (n - 1)
+     else rng_bs_big world encl theblk los v9 "0" false)
 
 // #find / #rfind over a LIVE array: the length is re-read on every step (so a
 // block that shrinks the array stops the walk, and one that grows it keeps
@@ -7599,6 +7634,14 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
     (if (str_len name == 7 && str_eq name "bsearch") then
        (let (v9, broke9, bv9) = rng_bsearch world encl theblk lo hi excl in
         if broke9 then bv9 else v9)
+     // a BIGNUM end (or begin) with an integer step: the walk in bignums.
+     // The int arms below never saw one, and `(2**63 - 3..2**63 + 1).step(2)`
+     // was "undefined method 'step'".
+     else if (str_len name == 4 && str_eq name "step")
+             && (match lo with VInt _ -> true | VBig _ -> true | _ -> false)
+             && (match hi with VBig _ -> true | _ -> (match lo with VBig _ -> (match hi with VInt _ -> true | _ -> false) | _ -> false))
+             && (match args with Cons (VInt b9, Nil) -> b9 > 0 | Cons (VBig b9, Nil) -> big_sign b9 > 0 | Nil -> true | _ -> false) then
+       iter_each_result (range_step_bounded world encl theblk lo hi excl (match args with Cons (VInt b9, _) -> VInt b9 | Cons (VBig b9, _) -> VBig b9 | _ -> VInt 1)) recv
      // Range#reverse_each walks from the END, so it is the end that has to be
      // there and the end whose class a refusal names. It answers the RANGE;
      // going through the materialised array answered the array. An endless
@@ -7647,6 +7690,22 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        (match lo with
         | VStr slo -> iter_each_result (rng_str_each_endless world encl theblk (sget slo)) recv
         | _ -> recv)
+     // ...a begin that is a String through #to_str walks as one (ruby's
+     // range_each asks rb_check_string_type before #succ): `(o.."c").each`
+     else if (str_len name == 4 && str_eq name "each")
+             && (match lo with VObj _ -> true | _ -> false)
+             && (match hi with VStr _ -> true | VNil -> true | _ -> false)
+             && (match conv_try gc_cenv0 world lo "to_str" with VStr _ -> true | _ -> false) then
+       (match conv_try gc_cenv0 world lo "to_str" with
+        | VStr s9 -> (let _ = builtin_iter world encl theblk (VRange (VStr s9, hi, excl)) name args in recv)
+        | _ -> recv)
+     // ...and an ENDLESS range of objects with #succ walks #succ until the
+     // block breaks (the materialiser refused to make an Array of it)
+     else if (str_len name == 4 && str_eq name "each")
+             && (match lo with VObj _ -> true | _ -> false)
+             && (match hi with VNil -> true | _ -> false)
+             && responds world lo "succ" then
+       iter_each_result (rng_succ_each_endless world encl theblk lo) recv
      // #min / #max with a COMPARATOR block still cannot walk an endless range
      // to the end, and ruby says so by naming the method: "cannot get the
      // minimum of endless range with custom comparison method". mere-ruby
@@ -8464,7 +8523,40 @@ and range_step = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (limit: i
   if (by > 0 && i > limit) || (by < 0 && i < limit) || by == 0 then FNext VNil
   else (match run_block_turn world encl theblk (Cons (VInt i, Nil)) with
         | FBreak v -> FBreak v | FReturn v -> FReturn v
-        | _ -> range_step world encl theblk (i + by) limit by)
+        | _ ->
+          // ⚠ the next value may not fit an int: `i + by` WRAPPED, and
+          //   `(m..).step(m)` went 2**62, -2**63, -2**62... A bounded walk is
+          //   over (the next value is past its end, which is an int); an
+          //   endless one (limit int_max) carries on in bignums.
+          if (by > 0 && i > int_max - by) || (by < 0 && i < (0 - int_max - 1) - by) then
+            (if (by > 0 && limit == int_max) || (by < 0 && (limit == 0 - int_max || limit == 0 - int_max - 1))
+             then range_step_big world encl theblk (arith_bin "+" (VInt i) (VInt by)) (VInt by)
+             else FNext VNil)
+          else range_step world encl theblk (i + by) limit by)
+// integer ArithmeticSequence bounds with a bignum among them and a step not 0
+and aseq_big_ok = fn (b: Val) -> fn (e: Val) -> fn (st: Val) ->
+  let isi = fn (v: Val) -> (match v with VInt _ -> true | VBig _ -> true | _ -> false) in
+  isi b && isi e && isi st
+  && (match (b, e, st) with (VInt _, VInt _, VInt _) -> false | _ -> true)
+  && (match st with VInt 0 -> false | _ -> true)
+// a bounded walk in bignums: v, v + by, ... while v is inside the range
+and range_step_bounded = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (hi: Val) -> fn (excl: bool) -> fn (by: Val) ->
+  (let c9 = cmp_vals v hi in
+   if (if excl then c9 >= 0 else c9 > 0) then FNext VNil
+   else (match run_block_turn world encl theblk (Cons (v, Nil)) with
+         | FBreak r -> FBreak r | FReturn r -> FReturn r
+         | _ -> range_step_bounded world encl theblk (arith_bin "+" v by) hi excl by))
+// an endless range's #succ walk (`(c..).each { break if ... }`)
+and rng_succ_each_endless = fn world -> fn encl -> fn theblk -> fn (v: Val) ->
+  (match run_block_turn world encl theblk (Cons (v, Nil)) with
+   | FBreak r -> FBreak r | FReturn r -> FReturn r
+   | _ -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+           rng_succ_each_endless world encl theblk (invoke_val_c gc_cenv0 world nb9 v "succ" Nil false)))
+// ...the endless walk past an int, one bignum at a time (until a break)
+and range_step_big = fn world -> fn encl -> fn theblk -> fn (v: Val) -> fn (by: Val) ->
+  (match run_block_turn world encl theblk (Cons (v, Nil)) with
+   | FBreak r -> FBreak r | FReturn r -> FReturn r
+   | _ -> range_step_big world encl theblk (arith_bin "+" v by) by)
 
 and range_map = fn world -> fn encl -> fn theblk -> fn (i: int) -> fn (last: int) -> fn (acc: Val list) ->
   if i > last then FNext (arr_new (val_rev acc Nil))
@@ -11029,11 +11121,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          // is an ArithmeticSequence too, and it went to the leaf, which
          // answered an empty Array.
          | VRange (lo, hi, _) ->
-           (rng_is_int lo || (match lo with VFlt _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | _ -> false)
+           // (a BIGNUM bound too: `(2**64..2**64+3).step(2)` went to the leaf,
+           //  which answered [0])
+           (rng_is_int lo || (match lo with VFlt _ -> true | VRat (_, _) -> true | VCpx (_, _) -> true | VBig _ -> true | _ -> false)
             // a BEGINLESS numeric range makes the sequence too (its class is
             // the answer ruby/spec asks for); walking it is the TypeError.
             || ((match lo with VNil -> true | _ -> false) && (rng_is_int hi || (match hi with VFlt _ -> true | _ -> false))))
-           && (rng_is_int hi || rng_hi_open hi || (match hi with VFlt _ -> true | VRat (_, _) -> true | _ -> false))
+           && (rng_is_int hi || rng_hi_open hi || (match hi with VFlt _ -> true | VRat (_, _) -> true | VBig _ -> true | _ -> false))
          // ...and a Rational receiver: `(1/10r).step(1/2r, 1/10r)`
          | VRat (_, _) -> true
          | _ -> false)
@@ -11060,6 +11154,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           && (match args0 with Cons (VObj _, _) -> true | _ -> false)
           && (let (mm9, _, _, _) = world in (if map_has mm9 "Integer#step" || map_has mm9 "Range#step" then false else true)) then
     make_enum_a world recv0 "step" args0
+  // ...and a range of non-numeric OBJECTS (Time) has no default step
+  else if str_eq name0 "step" && (match args0 with Nil -> true | _ -> false)
+          && (match recv0 with VRange (VObj lo9, _, _) -> true | _ -> false)
+          && (match recv0 with VRange (lo9, _, _) -> (if obj_is_a world (dispatch_cls_of world lo9) "Numeric" then false else true) | _ -> false) then
+    raise_exc world "ArgumentError" "step is required for non-numeric ranges"
   // ...and a beginless range with a NON-numeric end has no sequence to make.
   else if str_eq name0 "step"
           && (match recv0 with
@@ -20048,6 +20147,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                    | _ -> if n == 0 then VNil else VInt (bi + (n - 1) * si)))
           | (VNil, _, _) -> raise_exc world "TypeError" "nil can't be coerced into Integer"
           | (_, VNil, _) -> (if (str_len name == 4 && str_eq name "size") then VFlt (1.0 / 0.0) else raise_exc world "RangeError" "cannot get the last element of endless arithmetic sequence")
+          // integer bounds past an int, counted in bignums (the Float path below
+          // rounded them away: `(2**64..2**64+3).step(2).size` was 1)
+          | (bv9, ev9, sv9) when aseq_big_ok bv9 ev9 sv9 && (match args with Nil -> true | _ -> false) ->
+            (let bs9 = rng_int_side bv9 in let es9 = rng_int_side ev9 in let ss9 = rng_int_side sv9 in
+             let (q9, r9) = big_divmod_s (big_sub_s es9 bs9) ss9 in
+             let n0 = (if big_sign q9 < 0 then "0" else big_add_s q9 "1") in
+             let n9 = (if excl && str_eq r9 "0" && big_sign q9 >= 0 then big_sub_s n0 "1" else n0) in
+             if (str_len name == 4 && str_eq name "size") then norm_big n9
+             else if str_eq n9 "0" then VNil
+             else norm_big (big_add_s bs9 (big_mul_s (big_sub_s n9 "1") ss9)))
           | _ ->
             // A numeric triple with a Float in it is COUNTED, never walked.
             // Mere has no match guards, so the test lives in the arm body.
