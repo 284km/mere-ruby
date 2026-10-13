@@ -164,6 +164,14 @@ SAMPLES.each do |cn, factory|
     end
   end
 end
+# Kernel's #arity, READ the same way (nothing is called: probing Kernel would
+# run exit, fork, gets...). It has no bounds rows -- only what #arity and
+# #parameters report, which the interpreter answered as -1 and [] for every
+# Kernel builtin (`method(:putc).arity` is 1, `method(:proc).arity` 0).
+(Kernel.instance_methods + Kernel.private_instance_methods).uniq.sort.each do |name|
+  arows << "Kernel##{name}:#{Kernel.instance_method(name).arity}"
+rescue NameError, TypeError
+end
 rows.uniq!
 brows.uniq!
 arows.uniq!

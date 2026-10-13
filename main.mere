@@ -1240,6 +1240,7 @@ let gc_collect = fn env -> fn world ->
     let _ = gc_drop_sh proc_src dP "f" in
     let _ = gc_drop_sh proc_home dP "" in
     let _ = gc_drop_sh proc_arity dP "" in
+    let _ = gc_drop_sh proc_arity dP "m" in
     let _ = gc_drop_sh lambda_ids dP "" in
     let _ = gc_drop_sh proc_symsrc dP "" in
     let _ = gc_drop_sh curry_args dP "" in
@@ -3153,7 +3154,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // self (inside a class body): the explicit-receiver arm does the work.
     else if (str_len name == 23 && str_eq name "define_singleton_method")
             && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
-            && (match (if lv_has env "self" then lv_get env "self" else VMain) with VClass _ -> true | _ -> false) then
+            // (and an object's, and main's: `define_singleton_method :m, pr`
+            //  inside an instance method was "undefined method")
+            && (match (if lv_has env "self" then lv_get env "self" else VMain) with VClass _ -> true | VObj _ -> true | VMain -> true | _ -> false) then
       invoke_val_c env world blk (if lv_has env "self" then lv_get env "self" else VMain) name args false
     else if (str_len name == 13 && str_eq name "define_method")
             && (match (if lv_has env "self" then lv_get env "self" else VMain) with
@@ -6036,13 +6039,16 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // `[[1, 2]].each { p _2 }` is 2, and `{a: 2}.sort_by { _2 }` sorts by the
   // value. The numbered ones were bound from the argument list as it came,
   // so _2 was nil whenever one Array was yielded. (`_1` alone, and `it`, take
-  // the Array whole, as in ruby.)
+  // the Array whole, as in ruby.) The count is the ONE scan below
+  // (ip_scan_stmts), made here once for both: a second walk of every
+  // parameter-less body was a measured 5%.
+  let ip9 = (match params with Nil -> ip_scan_stmts body | _ -> 0) in
   let argvals = (match (params, argvals) with
                  | (Nil, Cons (VArr a9, Nil)) ->
-                   (if (if is_lam then false else true) && max_numbered_stmts body >= 2 then deref a9 else argvals)
+                   (if (if is_lam then false else true) && ip9 >= 2 && ip9 < 10 then deref a9 else argvals)
                  // (an object that converts with #to_ary spreads the same way)
                  | (Nil, Cons (VObj _, Nil)) ->
-                   (if (if is_lam then false else true) && max_numbered_stmts body >= 2 then
+                   (if (if is_lam then false else true) && ip9 >= 2 && ip9 < 10 then
                       (match argvals with
                        | Cons (o9, Nil) -> (match conv_try gc_cenv0 world o9 "to_ary" with VArr a9 -> deref a9 | _ -> argvals)
                        | _ -> argvals)
@@ -6070,8 +6076,7 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   //   machine's noise.
   let _ = (match params with
            | Nil ->
-             (let ip9 = ip_scan_stmts body in
-              if ip9 == 0 then ()
+             (if ip9 == 0 then ()
               else if ip9 < 10 then map_set benv "__ip" (VInt ip9)
               // a LOCAL named `it` further out makes `it` that local, not a parameter
               else if lv_has cenv "it" then ()
@@ -6325,9 +6330,13 @@ and bind_block_params = fn cenv -> fn world -> fn blk -> fn (bdefaults: (str * E
   // auto-splat: a block with 2+ params given a single value destructures
   // an Array directly, or an object via to_ary. Lambdas do NOT auto-splat —
   // a single argument stays a single argument (with strict arity).
+  // ⚠ ...and keyword parameters do not stop it: ruby 3 still spreads one
+  //   Array over `|c, b, a: 1|` -- only keywords actually PASSED do
+  //   (`.call([1, 2], a: 5)` keeps the Array whole). This took any keyword
+  //   parameter as the refusal.
   let argvals =
     (if is_lam then argvals0 else
-    (match kws with
+    (match (match kws with Nil -> Nil | _ -> kwhash) with
      | Cons (_, _) -> argvals0
      | Nil ->
        (match params with
@@ -10909,7 +10918,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             raise_exc world "TypeError" "can't bind singleton method to a different class"
         else if (if str_eq own9 "" || str_list_has (ancestors_of world rcls9) own9 || str_eq own9 "Kernel" || str_eq own9 "BasicObject" then false else true) then
             raise_exc world "TypeError" ("bind argument must be a subclass of " ++ cls_display world own9)
-          else raise_exc world "NoMethodError" ("undefined method 'define_singleton_method'"))
+          // the method, bound to this receiver, as the body: what the
+          // Proc form defines (this answered NoMethodError, unimplemented)
+          else
+            (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+             let um9 = (if str_eq (map_get oc9 mo9) "Method" then invoke_val_c env world nb9 (VObj mo9) "unbind" Nil false else VObj mo9) in
+             let bm9 = invoke_val_c env world nb9 um9 "bind" (Cons (recv0, Nil)) false in
+             let pr9 = invoke_val_c env world nb9 bm9 "to_proc" Nil false in
+             match args0 with
+             | Cons (n9, _) -> invoke_val_c env world nb9 recv0 "define_singleton_method" (Cons (n9, Cons (pr9, Nil))) false
+             | Nil -> VNil))
        | _ -> VNil)
   // a Complex with Numeric OBJECTS in it (or one as the operand): see cpx_obj_call
   else if cpx_obj_applies world recv0 name0 args0 then cpx_obj_call env world recv0 name0 args0
@@ -11694,7 +11712,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   // priority. Guarded by ref_active being non-empty, so a non-refinement call
   // pays one map_len check. Reaches both `def`- and define_method-defined
   // refined methods (they live in the refinement's impl_cls, dispatched normally).
-  let refimpl = refined_impl_for world recv name in
+  // (...except the builtin Proc#call a refined #call's super asked for:
+  //  proc_bcall says so, and the refinement would be asked again forever)
+  let refimpl = (if map_len proc_bcall > 0 && (match recv with VProc _ -> true | _ -> false) then ""
+                 else refined_impl_for world recv name) in
   if (if str_eq refimpl "" then false else true) then
     // (a refinement's alias of a BUILTIN is a delegation, not a body: call the
     // builtin it names on the receiver)
@@ -18797,6 +18818,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // class, so the proc reported -1 for every builtin method.
           let _ = map_set proc_arity (str_of_int pid)
                     (VInt (bm_arity world (if str_eq mown "" then dispatch_cls_of world mrecv else mown) mnm)) in
+          // ...and its PARAMETERS are the method's too, which the forwarder's
+          // `*__a, &__b` is not: the Method is kept beside the arity ("m")
+          let _ = map_set proc_arity ("m" ++ str_of_int pid) (VObj id) in
           let _ = map_set lambda_ids (str_of_int pid) VNil in
           // the forwarder is not where the method was written, so the proc
           // reports the METHOD's own location -- ruby's Method#to_proc answers
@@ -21184,7 +21208,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && bo_refuses world cls
             && (if map_has (name_set "bopub") name || map_has (name_set "bopriv") name then false else true) then
       raise_exc world "NoMethodError" ("undefined method '" ++ name ++ "' for an instance of " ++ display_cls_msg world cls)
-    else if is_prim_method name then prim_method recv name args
+    // (define_singleton_method with its body as an argument is answered
+    //  further down, by the arm that defines it; this one made it missing)
+    else if is_prim_method name
+            && (if (str_len name == 23 && str_eq name "define_singleton_method")
+                   && (match args with Cons (_, Cons (_, _)) -> true | _ -> false) then false else true) then
+      prim_method recv name args
     // Enumerable (no block): to_a returns the collected array; others delegate.
     // each_slice / each_cons / cycle take an argument, so is_enum_method leaves
     // them out (it is also the list of names a bare call may enumerate) -- but
@@ -21516,6 +21545,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                       | VObj id9 -> singleton_cls_of world id9
                       | VNil -> "NilClass"
                       | VBool b9 -> (if b9 then "TrueClass" else "FalseClass")
+                      | VMain -> "(main)"
                       | _ -> "") in
        let nm9 = (match args with Cons (VSym s9, _) -> s9 | Cons (VStr s9, _) -> sget s9 | _ -> "") in
        let _ = frz_recv_check env world recv in
@@ -21527,11 +21557,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                   (let ps9 = (match ps9 with
                               | Cons (m9, rest9) -> if str_eq m9 lambda_blk_marker then rest9 else ps9
                               | _ -> ps9) in
-                   let _ = set_meth meths9 (target9 ++ "#" ++ nm9)
+                   let mk9 = (if str_eq target9 "(main)" then nm9 else target9 ++ "#" ++ nm9) in
+                   let _ = set_meth meths9 mk9
                              (Meth (ps9, block_defaults bb9, drop_defaults_prologue bb9)) in
-                   let _ = map_set dm_methods (target9 ++ "#" ++ nm9) VNil in
-                   let _ = dm_store_closure (target9 ++ "#" ++ nm9) (h9, ps9, bb9, e9) in
-                   let _ = stamp_meth_src_proc (target9 ++ "#" ++ nm9) (str_of_int pid9) in
+                   let _ = map_set dm_methods mk9 VNil in
+                   let _ = dm_store_closure mk9 (h9, ps9, bb9, e9) in
+                   let _ = stamp_meth_src_proc mk9 (str_of_int pid9) in
                    VSym nm9))
              | _ -> VSym nm9))
     // an object has no such method — raise a catchable NoMethodError.
@@ -21546,6 +21577,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // explicit self at the top level dispatches to top-level methods.
     let (meths, sup, ocls, ivars) = world in
     if map_has meths name then call_method env world noblk name args
+    // `define_singleton_method(:m, a_proc)` on main: a top-level method, as
+    // the block form and `def self.m` make (it was "undefined method")
+    else if (str_len name == 23 && str_eq name "define_singleton_method")
+            && (match args with Cons (VSym _, Cons (VProc _, _)) -> true | Cons (VStr _, Cons (VProc _, _)) -> true | _ -> false) then
+      (let nm9 = (match args with Cons (VSym s9, _) -> s9 | Cons (VStr s9, _) -> sget s9 | _ -> "") in
+       match args with
+       | Cons (_, Cons (VProc pid9, _)) ->
+         (match proc_as_block pid9 with
+          (h9, ps9, bb9, e9) ->
+            (let ps9 = (match ps9 with
+                        | Cons (m9, rest9) -> if str_eq m9 lambda_blk_marker then rest9 else ps9
+                        | _ -> ps9) in
+             let _ = set_meth meths nm9 (Meth (ps9, block_defaults bb9, drop_defaults_prologue bb9)) in
+             let _ = map_set dm_methods nm9 VNil in
+             let _ = dm_store_closure nm9 (h9, ps9, bb9, e9) in
+             let _ = stamp_meth_src_proc nm9 (str_of_int pid9) in
+             VSym nm9))
+       | _ -> VSym nm9)
     // (Kernel's output functions, `send(:print, x)` at the top level: see
     // try_self_call_x)
     else if ((str_len name == 5 && str_eq name "print") || (str_len name == 4 && str_eq name "putc")
@@ -21626,6 +21675,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if map_has curry_target (str_of_int pid) && (str_len name == 10 && str_eq name "parameters") then
       arr_new (Cons (arr_new (Cons (VSym "rest", Nil)), Nil))
     else if map_has curry_target (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
+    // ...and has no binding: it was not written anywhere (ruby says C level)
+    else if (map_has curry_target (str_of_int pid) || map_has comp_inner (str_of_int pid)) && (str_len name == 7 && str_eq name "binding") then
+      raise_exc world "ArgumentError" "Can't create Binding from C level Proc"
     else if map_has comp_inner (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
     // Proc#source_location: [file, line] of where the block was written, or nil
     // for a proc with no source of its own.
@@ -21821,6 +21873,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // Proc#to_proc is the proc ITSELF -- the name was claimed with nothing
     // behind it, so `pr.to_proc` was a NoMethodError on a Proc.
     else if (str_len name == 7 && str_eq name "to_proc") then recv
+    // a Method's proc describes the METHOD (see Method#to_proc)
+    else if (str_len name == 10 && str_eq name "parameters") && map_has proc_arity ("m" ++ str_of_int pid) then
+      invoke_val_c env world blk (map_get proc_arity ("m" ++ str_of_int pid)) "parameters" Nil false
     else if (str_len name == 10 && str_eq name "parameters") then
       (match proc_get (str_of_int pid) with
        (h, ps, body, e) ->
@@ -22135,6 +22190,8 @@ and uses_it_stmt = fn (s: Stmt) ->
   | SPuts es -> uses_it_exprs es
   | SWhile (c, b) -> uses_it_expr c || uses_it_stmts b
   | SIf (clauses, els) -> uses_it_clauses clauses || uses_it_stmts els
+  | SAndThen (a, b) -> uses_it_stmt a || uses_it_stmt b
+  | SOrElse (a, b) -> uses_it_stmt a || uses_it_stmt b
   | _ -> false
 and uses_it_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with
@@ -22240,6 +22297,9 @@ and ip_scan_stmt = fn (s: Stmt) ->
   | SPuts es -> ip_scan_exprs es
   | SWhile (c, b) -> imax (ip_scan_expr c) (ip_scan_stmts b)
   | SIf (clauses, els) -> imax (ip_scan_clauses clauses) (ip_scan_stmts els)
+  // (a statement-level `x and y` / `x or y`: `_5 and flunk` is test_proc's)
+  | SAndThen (a, b) -> imax (ip_scan_stmt a) (ip_scan_stmt b)
+  | SOrElse (a, b) -> imax (ip_scan_stmt a) (ip_scan_stmt b)
   | _ -> 0
 and ip_scan_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with
@@ -22248,7 +22308,8 @@ and ip_scan_clauses = fn (clauses: (Expr * Stmt list) list) ->
 and ip_scan_expr = fn (e: Expr) ->
   match e with
   | EVar n -> (if str_len n == 2 && str_eq n "it" then 10 else numbered_digit n)
-  | ECall (n, args) -> (match args with Nil -> (if str_eq n "it" then 10 else 0) | _ -> ip_scan_exprs args)
+  // (a bare `_5` at the head of `_5 and x` parses as a CALL, as `it` does)
+  | ECall (n, args) -> (match args with Nil -> (if str_eq n "it" then 10 else numbered_digit n) | _ -> ip_scan_exprs args)
   | EBin (_, a, b) -> imax (ip_scan_expr a) (ip_scan_expr b)
   | EUn (_, a) -> ip_scan_expr a
   | EMethod (r, _, args) -> imax (ip_scan_expr r) (ip_scan_exprs args)
@@ -22280,6 +22341,8 @@ and max_numbered_stmt = fn (s: Stmt) ->
   | SPuts es -> max_numbered_exprs es
   | SWhile (c, b) -> imax (max_numbered_expr c) (max_numbered_stmts b)
   | SIf (clauses, els) -> imax (max_numbered_clauses clauses) (max_numbered_stmts els)
+  | SAndThen (a, b) -> imax (max_numbered_stmt a) (max_numbered_stmt b)
+  | SOrElse (a, b) -> imax (max_numbered_stmt a) (max_numbered_stmt b)
   | _ -> 0
 and max_numbered_clauses = fn (clauses: (Expr * Stmt list) list) ->
   match clauses with
@@ -22290,6 +22353,7 @@ and max_numbered_expr = fn (e: Expr) ->
   | EVar n -> numbered_digit n
   | EBin (_, a, b) -> imax (max_numbered_expr a) (max_numbered_expr b)
   | EUn (_, a) -> max_numbered_expr a
+  | ECall (n, Nil) -> numbered_digit n
   | ECall (_, args) -> max_numbered_exprs args
   | EMethod (r, _, args) -> imax (max_numbered_expr r) (max_numbered_exprs args)
   // ⚠ NOT into the block's own body. A numbered parameter belongs to the
@@ -22934,7 +22998,9 @@ and proc_derived_call = fn env -> fn world -> fn blk -> fn (pid: int) -> fn (arg
      let all9 = rev_app (rev_app got9 Nil) args in
      if vlen all9 >= want9
      then invoke_val_c env world blk (VProc tgt9) "call" all9 false
-     else mk_curried world tgt9 all9 want9 pid)
+     // a block given to a call that only collects is dropped, and ruby says so
+     else (let _ = (match blk with (true, _, _, _) -> rb_warn world "given block not used" | _ -> ()) in
+           mk_curried world tgt9 all9 want9 pid))
 
 
 
@@ -23409,17 +23475,21 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                      // was the only answer here.
                      | VNil -> "NilClass"
                      | VBool b2 -> (if b2 then "TrueClass" else "FalseClass")
+                     // main's singleton methods are its top-level ones, the
+                     // way `def self.m` at the top level makes them
+                     | VMain -> "(main)"
                      | _ -> "") in
        let nm = (match args with Cons (VSym s2, _) -> s2 | Cons (VStr s2, _) -> sget s2 | _ -> "") in
        let _ = frz_recv_check env world recv in
        if str_eq target "" then raise_exc world "TypeError" "can't define singleton"
        else
          (let (h2, ps2, bb2, e2) = newblk in
-          let _ = set_meth meths (target ++ "#" ++ nm)
+          let mk2 = (if str_eq target "(main)" then nm else target ++ "#" ++ nm) in
+          let _ = set_meth meths mk2
                     (Meth (drop_yblk_params ps2, block_defaults bb2, drop_defaults_prologue bb2)) in
-          let _ = map_set dm_methods (target ++ "#" ++ nm) VNil in
-          let _ = dm_store_closure (target ++ "#" ++ nm) (h2, ps2, bb2, e2) in
-          let _ = stamp_meth_src (target ++ "#" ++ nm) in
+          let _ = map_set dm_methods mk2 VNil in
+          let _ = dm_store_closure mk2 (h2, ps2, bb2, e2) in
+          let _ = stamp_meth_src mk2 in
           // the method lands in the singleton, so the object hears of it
           let _ = (if is_sng_cls target then run_method_added world target nm else ()) in
           VSym nm))
@@ -26363,6 +26433,9 @@ and builtin_arity_of = fn world -> fn (cls: str) -> fn (nm: str) ->
              then "Enumerable#" ++ nm
              else if obj_is_a world cls "Comparable" && map_has arity_num_tbl ("Comparable#" ++ nm)
              then "Comparable#" ++ nm
+             // (Kernel's, for every object that has it: `method(:putc)`)
+             else if map_has arity_num_tbl ("Kernel#" ++ nm) && (if bo_refuses world cls then false else true)
+             then "Kernel#" ++ nm
              else key0) in
   if map_has arity_num_tbl key then map_get arity_num_tbl key else 0 - 1
 // The keywords contribute ONE argument between them (the hash): a required
@@ -26397,6 +26470,7 @@ and bm_params = fn world -> fn (owner0: str) -> fn (nm: str) ->
                          && map_has arity_num_tbl ("Enumerable#" ++ nm) then true
                  else if obj_is_a world owner "Comparable"
                          && map_has arity_num_tbl ("Comparable#" ++ nm) then true
+                 else if map_has arity_num_tbl ("Kernel#" ++ nm) && (if bo_refuses world owner then false else true) then true
                  else false) in
      if has9 then
        (if a9 >= 0 then arr_new (bm_kind_meta "req" a9)
@@ -28669,7 +28743,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     // write through to the original. The copy carries the ENCODING (clear on
     // a dup of a Shift_JIS string used to answer UTF-8).
     (let cp = (match recv with
-               | VProc pid9 -> VProc (proc_copy pid9)
+               // (a clone keeps the proc's singleton class, as a String's
+               //  does; a dup does not -- `def pr.foo` survived neither)
+               | VProc pid9 ->
+                 (let np9 = proc_copy pid9 in
+                  let _ = (if (str_len name == 5 && str_eq name "clone") && map_has hng_store ("prc:" ++ str_of_int pid9)
+                           then map_set hng_store ("prc:" ++ str_of_int np9) (map_get hng_store ("prc:" ++ str_of_int pid9)) else ()) in
+                  VProc np9)
                | VArr id -> arr_new (deref id)
                | VStr h -> (let c2 = mkstr (sget h) in (match c2 with VStr nid -> (let _ = senc_set nid (senc_get h) in c2) | _ -> c2))
                // a copy of a compare_by_identity hash compares that way too.
@@ -33917,6 +33997,14 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // bare method(:name) — Kernel#method on the implicit self.
   else if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
+  // ...and define_singleton_method(:m, body) with the body as an ARGUMENT (a
+  // Proc or a Method): the block form has its own door, this one had none on
+  // an object or on main -- `define_singleton_method :m, pr` inside an
+  // instance method was "undefined method"
+  else if (str_len name == 23 && str_eq name "define_singleton_method")
+          && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
+          && (if self_defines env world name then false else true) then
+    invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) name args false
   // Kernel#load -- unless the implicit self defines its own `load`, which is
   // not exotic: a YAML or JSON module calling its own load from load_file
   // would otherwise reach Kernel's and try to run the data as Ruby.
@@ -34762,6 +34850,11 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
   let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
   if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
+  // (define_singleton_method with its body as an argument: see try_self_call_x)
+  else if (str_len name == 23 && str_eq name "define_singleton_method")
+          && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
+          && (if self_defines env world name then false else true) then
+    invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) name args false
   else
   if lv_has env "self" then
     (match lv_get env "self" with
@@ -35841,6 +35934,14 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
           (let k9 = hash_store_key gc_cenv0 world h9 k in
            hput_or_queue_w gc_cenv0 world h9 (hcbi_on h9) k9 v (fn (u: unit) -> hash_put_wx gc_cenv0 world h9 (hcbi_on h9) (hderef h9) k9 v))
         | _ -> VNil)
+     // a PROC's #call from a prepended / refined / redefined #call: the
+     // builtin call, which prim_method cannot make (proc_bcall tells the Proc
+     // arm to skip the program's #call this once, note 305)
+     | VProc _ when (str_len meth == 4 && str_eq meth "call") || (str_len meth == 2 && str_eq meth "()")
+                    || (str_len meth == 5 && str_eq meth "yield") || (str_len meth == 2 && str_eq meth "[]")
+                    || (str_len meth == 3 && str_eq meth "===") ->
+       (let _ = map_set proc_bcall 0 1 in
+        invoke_val_c gc_cenv0 world superblk recv "call" args false)
      | _ ->
        (match superblk with
         | (true, _, _, _) -> builtin_iter world superblk superblk recv meth args
