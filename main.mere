@@ -10905,6 +10905,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ...and the two ways that form goes wrong: no body at all (the caller's
     // block is not borrowed), and a Method whose owner the receiver is not
     // (another object's singleton method, or a method of an unrelated class)
+  // BasicObject#method_missing is PRIVATE: called with a receiver it is that
+  // refusal, on a value as on an object (`1.method_missing(:foo)` said the
+  // method did not exist)
+  else if vischeck && str_eq name0 "method_missing"
+          && (match recv0 with VObj _ -> false | VClass _ -> false | VMain -> false | _ -> true)
+          && (if has_meth world (dispatch_cls_of world recv0) "method_missing" then false else true) then
+    raise_exc_iv world "NoMethodError" ("private method 'method_missing' called for " ++ for_recv_cls world (dispatch_cls_of world recv0))
+      (Cons (("__name", VSym "method_missing"), Cons (("__recv", recv0), Nil)))
   else if str_eq name0 "define_singleton_method" && (match recv0 with VObj _ -> true | _ -> false)
             && (match args0 with Cons (VSym _, Nil) -> true | Cons (VStr _, Nil) -> true | _ -> false) then
       raise_exc world "ArgumentError" "tried to create Proc object without a block"
@@ -13653,6 +13661,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
      | Cons (VSym m, rest) -> make_enum_user world recv m rest
      | Cons (VStr m, rest) -> make_enum_user world recv (sget m) rest
      | _ -> make_enum_user world recv "each" Nil)
+  // an Integer, a Float, a Symbol... has no singleton class to extend
+  else if (str_len name == 6 && str_eq name "extend") && imm_no_singleton recv
+          && (match args with Cons (_, _) -> true | Nil -> false) then
+    raise_exc world "TypeError" "can't define singleton"
   // `recv.extend(M...)` / bare `extend M` (self is a class/object): mix each
   // module's instance methods into the receiver's singleton class.
   else if (str_len name == 6 && str_eq name "extend") && (match recv with VClass _ -> true | VObj _ -> true
@@ -13789,6 +13801,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        invoke_val_c env world blk recv name (map9 args) vischeck)
     // Class#dup / #clone and Module's: a real copy (cls_copy). BasicObject is
     // the root and ruby refuses it; a singleton class keeps the old answer.
+    // ⚠ ...but a singleton class has ONE object it belongs to, and ruby will
+    //   not copy it ("can't copy singleton class"); it answered itself
+    else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+            && is_sng_cls c && (if has_meth world ("(sng:" ++ c ++ ")") name then false else true) then
+      raise_exc world "TypeError" "can't copy singleton class"
     else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
             && (if is_sng_cls c then false else true)
             // (a builtin class has nothing in these tables to copy; it keeps the old answer)
@@ -17073,9 +17090,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 24 && str_eq name "remove_instance_variable") then
       (let (_, _, _, ivars0) = world in
        match args with
-       | Cons (v, _) -> let k = "cls:" ++ c ++ "@" ++ ivar_name_val env world v in
-         let old = (if map_has ivars0 k then map_get ivars0 k else VNil) in
-         let _ = if map_has ivars0 k then map_delete ivars0 k else () in old
+       | Cons (v, _) -> let nm9 = ivar_name_val env world v in
+         let k = "cls:" ++ c ++ "@" ++ nm9 in
+         // (one that was never set is the same NameError an object raises,
+         //  naming the class and the variable; it answered nil)
+         if map_has ivars0 k then (let old = map_get ivars0 k in let _ = map_delete ivars0 k in old)
+         else raise_exc_iv world "NameError" ("instance variable @" ++ nm9 ++ " not defined")
+                (Cons (("__name", VSym ("@" ++ nm9)), Cons (("__recv", recv), Nil)))
        | _ -> VNil)
     // singleton_class of a class/module: a distinct class whose namespace
     // holds the constants/methods defined via the object's instance_eval.
@@ -17164,7 +17185,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          (let inner7 = sng_inner c in
           if str_len inner7 > 0 && is_digit (char_at inner7 0)
           then VObj (int_of_str inner7) else VClass inner7)
-       else raise_exc world "TypeError" ("`" ++ cls_display world c ++ "' is not a singleton class"))
+       else raise_exc world "TypeError" ("'" ++ cls_display world c ++ "' is not a singleton class"))
     // Module#included_modules: the same chain, modules only, without self.
     else if (str_len name == 16 && str_eq name "included_modules") then
       arr_new (mod_vclasses (ancestors_of world c) c)
@@ -18454,6 +18475,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // a descriptor stream's stream methods are the prelude's IO layer (see
     // fdio_route), ahead of IO's own -- which are the File model's
     if fdio_route_call world id cls name then invoke world noblk recv "IO" (fdio_mname name) args
+    // `Class.allocate` is a class that was never initialized: it cannot make
+    // instances or name a superclass (they were "undefined method")
+    else if str_eq cls "Class" && (if has_meth world cls name then false else true)
+            && ((str_len name == 3 && str_eq name "new") || (str_len name == 8 && str_eq name "allocate")) then
+      raise_exc world "TypeError" "can't instantiate uninitialized class"
+    else if str_eq cls "Class" && (str_len name == 10 && str_eq name "superclass") then
+      raise_exc world "TypeError" "uninitialized class"
     else if has_meth world cls name then
       // ⚠ a visibility refusal is a MISSING method as far as #method_missing
       //   is concerned: ruby hands `obj.priv` to the object's method_missing
@@ -18553,7 +18581,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let k9 = str_of_int id ++ "@" ++ nm9 in
           if map_has ivars k9
           then (let old9 = map_get ivars k9 in let _ = map_delete ivars k9 in old9)
-          else raise_exc world "NameError" ("instance variable @" ++ nm9 ++ " not defined"))
+          // (the NameError names the receiver and the variable, as ruby's does)
+          else raise_exc_iv world "NameError" ("instance variable @" ++ nm9 ++ " not defined")
+                 (Cons (("__name", VSym ("@" ++ nm9)), Cons (("__recv", recv), Nil))))
        | _ -> VNil)
     else if (str_len name == 26 && str_eq name "instance_variable_defined?") then
       (match args with Cons (v, _) -> VBool (map_has ivars (str_of_int id ++ "@" ++ ivar_name_val env world v)) | _ -> VBool false)
@@ -24627,8 +24657,11 @@ and ivar_name_val_r = fn env -> fn world -> fn (recv: Val) -> fn (v: Val) ->
   let s9 = (match v with
             | VSym sy -> sy
             | VStr h -> sget h
-            | other -> (match conv_try env world other "to_str" with VStr h -> sget h | _ -> "@")) in
-  if ivar_name_shaped s9 then ivar_name_val env world v
+            // (something that is no name at all is ruby's TypeError, which
+            //  ivar_name_val raises: `instance_variable_get(1)`)
+            | other -> (match conv_try env world other "to_str" with VStr h -> sget h | _ -> "")) in
+  if str_eq s9 "" && (match v with VSym _ -> false | VStr _ -> false | _ -> true) then ivar_name_val env world v
+  else if ivar_name_shaped s9 then ivar_name_val env world v
   else raise_exc_str_iv world "NameError" ("'" ++ s9 ++ "' is not allowed as an instance variable name")
          (Cons (("__name", v), Cons (("__recv", recv), Nil)))
 and raise_exc_str_iv = fn world -> fn (cls: str) -> fn (msg: str) -> fn (fields: (str * Val) list) ->
@@ -25066,7 +25099,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
              (let k9 = base ++ "@" ++ nm9 in
               if map_has ivars0 k9
               then (let old9 = map_get ivars0 k9 in let _ = map_delete ivars0 k9 in old9)
-              else raise_exc world "NameError" ("instance variable @" ++ nm9 ++ " not defined"))
+              // (the NameError names the receiver and the variable, as ruby's does)
+              else raise_exc_iv world "NameError" ("instance variable @" ++ nm9 ++ " not defined")
+                     (Cons (("__name", VSym ("@" ++ nm9)), Cons (("__recv", recv), Nil))))
            else (match args with
                  | Cons (_, Cons (value, _)) -> let _ = map_set ivars0 (base ++ "@" ++ nm9) value in value
                  | _ -> VNil))
@@ -33111,12 +33146,29 @@ and rb_fmt_int = fn env -> fn world -> fn (v: Val) ->
 // characters): `fetch("gumby" * 20)` says `key not found: "gumbygumby...`
 and key_err_desc = fn (d: str) ->
   if utf8_len d > 65 then substring d 0 (utf8_boff d 62 0) ++ "..." else d
+// What ruby says when `v` cannot be a superclass (rb_check_inheritable), or
+// "" when it can: Class itself, a module, a singleton class, and anything
+// that is not a class at all -- named by its class ("given an instance of
+// M🗿"), where the statement form said only "superclass must be a Class".
+and super_refusal = fn world -> fn (v: Val) ->
+  match v with
+  | VClass sc ->
+    (if str_eq sc "Class" then "can't make subclass of Class"
+     else if map_has modules sc then "superclass must be an instance of Class (given an instance of Module)"
+     else if is_sng_cls sc then "can't make subclass of singleton class"
+     else "")
+  | _ -> "superclass must be an instance of Class (given an instance of " ++ display_cls_msg world (dispatch_cls_of world v) ++ ")"
 and kernel_copy_hook = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
   let other9 = (match args with Cons (o9, _) -> o9 | Nil -> VNil) in
   // the object's own class, not its singleton: ruby compares rb_obj_class.
   let rcls9 = fn (v9: Val) ->
-    (let c9 = dispatch_cls_of world v9 in
+    // (a class's class is Class, or Module: its dispatch class is its
+    //  singleton, and two classes' singletons always differ)
+    (match v9 with
+     | VClass vc9 -> (if map_has modules vc9 then "Module" else "Class")
+     | _ ->
+    let c9 = dispatch_cls_of world v9 in
      let (_, sup9, _, _) = world in
      if is_sng_cls c9 && map_has sup9 c9 then map_get sup9 c9 else c9) in
   if (str_len name == 15 && str_eq name "initialize_copy") then
@@ -34051,6 +34103,20 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   // bare method(:name) — Kernel#method on the implicit self.
   else if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
+  // Kernel's private copy hooks and BasicObject#method_missing with no
+  // receiver (see try_self_call)
+  else if (if self_defines env world name then false else true)
+          && ((str_len name == 15 && str_eq name "initialize_copy") || (str_len name == 14 && str_eq name "initialize_dup")
+              || (str_len name == 16 && str_eq name "initialize_clone")) then
+    kernel_copy_hook env world (if lv_has env "self" then lv_get env "self" else VMain) name args
+  else if (str_len name == 14 && str_eq name "method_missing") && (if self_defines env world name then false else true) then
+    (match args with
+     | Nil -> raise_exc world "ArgumentError" "no method name given"
+     | Cons (mn9, _) ->
+       (let slf9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+        let nm9 = (match mn9 with VSym y9 -> y9 | VStr h9 -> sget h9 | _ -> inspect mn9) in
+        raise_exc_iv world "NoMethodError" ("undefined method '" ++ nm9 ++ "' for " ++ for_recv_cls world (dispatch_cls_of world slf9))
+          (Cons (("__name", VSym nm9), Cons (("__recv", slf9), Nil)))))
   // ...and define_singleton_method(:m, body) with the body as an ARGUMENT (a
   // Proc or a Method): the block form has its own door, this one had none on
   // an object or on main -- `define_singleton_method :m, pr` inside an
@@ -34904,6 +34970,22 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
   let blamed = fn (v: Val) -> (match blame with VNil -> v | b -> b) in
   if (str_len name == 6 && str_eq name "method") && (match args with Cons (VSym _, _) -> true | Cons (VStr _, _) -> true | _ -> false) then
     invoke_val_c env world noblk (if lv_has env "self" then lv_get env "self" else VMain) "method" args false
+  // Kernel's private copy hooks and BasicObject#method_missing, called with
+  // no receiver (`instance_eval { initialize_copy(1) }`,
+  // `instance_eval { method_missing }`): they ARE methods of every object,
+  // and these calls were "undefined method"
+  else if (if self_defines env world name then false else true)
+          && ((str_len name == 15 && str_eq name "initialize_copy") || (str_len name == 14 && str_eq name "initialize_dup")
+              || (str_len name == 16 && str_eq name "initialize_clone")) then
+    kernel_copy_hook env world (if lv_has env "self" then lv_get env "self" else VMain) name args
+  else if (str_len name == 14 && str_eq name "method_missing") && (if self_defines env world name then false else true) then
+    (match args with
+     | Nil -> raise_exc world "ArgumentError" "no method name given"
+     | Cons (mn9, _) ->
+       (let slf9 = (if lv_has env "self" then lv_get env "self" else VMain) in
+        let nm9 = (match mn9 with VSym y9 -> y9 | VStr h9 -> sget h9 | _ -> inspect mn9) in
+        raise_exc_iv world "NoMethodError" ("undefined method '" ++ nm9 ++ "' for " ++ for_recv_cls world (dispatch_cls_of world slf9))
+          (Cons (("__name", VSym nm9), Cons (("__recv", slf9), Nil)))))
   // (define_singleton_method with its body as an argument: see try_self_call_x)
   else if (str_len name == 23 && str_eq name "define_singleton_method")
           && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
@@ -37542,14 +37624,10 @@ and make_anon_cls = fn world -> fn (c: str) -> fn (args: Val list) ->
               | Nil -> set_sup sup2 anon "Object"
               // ...and a MODULE is not a class, nor may a singleton class be
               // subclassed
-              | Cons (VClass sc, _) when map_has modules sc ->
-                (let _ = raise_exc world "TypeError" ("superclass must be an instance of Class (given an instance of Module)") in ())
-              | Cons (VClass sc, _) when is_sng_cls sc ->
-                (let _ = raise_exc world "TypeError" "can't make subclass of singleton class" in ())
+              | Cons (VClass sc, _) when (if str_eq (super_refusal world (VClass sc)) "" then false else true) ->
+                (let _ = raise_exc world "TypeError" (super_refusal world (VClass sc)) in ())
               | Cons (VClass sc, _) -> set_sup sup2 anon sc
-              | Cons (v9, _) -> (let _ = raise_exc world "TypeError"
-                                   ("superclass must be an instance of Class (given "
-                                    ++ for_recv_cls world (class_name v9) ++ ")") in ())) in
+              | Cons (v9, _) -> (let _ = raise_exc world "TypeError" (super_refusal world v9) in ())) in
      // ...and the superclass hears of it, BEFORE the block runs: `inherited`
      // fired for `class X < D` and never for `Class.new(D)`
      let _ = call_inherited world gc_cenv0
@@ -42129,7 +42207,10 @@ and frz_cls_check = fn world -> fn (c0: str) ->
   // (...and a singleton class that was itself frozen -- `class << o; self;
   //  end.freeze` -- refuses a def into it, whatever its object is)
   // (ruby names the singleton's OBJECT: "can't modify frozen Object: #<Object:0x...>")
-  else if is_sng_cls c0 && clsfrozen_get c0
+  // ...or whose OBJECT is frozen: a def into a frozen object's singleton class
+  //  (`o.freeze; o.singleton_class.class_eval { def x; end }`) modifies o
+  else if is_sng_cls c0 && (clsfrozen_get c0
+                            || (let in8 = sng_inner c0 in str_len in8 > 0 && is_digit (char_at in8 0) && ofrozen_get (int_of_str in8)))
   then (let in9 = sng_inner c0 in
         let msg9 = (if str_len in9 > 0 && is_digit (char_at in9 0)
                     then (let o9 = VObj (int_of_str in9) in "can't modify frozen " ++ class_name o9 ++ ": " ++ inspect_w gc_cenv0 world o9)
@@ -42986,7 +43067,9 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
     // a frozen class refuses each WRITE in the body -- but not the body: ruby
     // lets `class K; end` reopen a frozen K and raises on the first statement
     // that would change it, so this is per statement, not at the entry.
-    let _ = (if map_len cls_frozen > 0 && cls_body_writes s then frz_cls_check world cls else ()) in
+    // (...and an object's singleton class asks whether its OBJECT is frozen,
+    //  which cls_frozen does not record: `o.freeze; class << o; def x; end`)
+    let _ = (if (map_len cls_frozen > 0 || is_sng_cls cls) && cls_body_writes s then frz_cls_check world cls else ()) in
     // ⚠ THE DEFAULT VISIBILITY IS A PROPERTY OF THE SCOPE, not of the syntax
     //   that set it: `send :private`, `1.times { private }` and an eval'd
     //   `private` set it too, and a def run by eval or by a block inside the
@@ -43261,8 +43344,8 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let scv = eval_e cenv world noblk se in
          (match scv with
           | VClass sc ->
-            if map_has modules sc || (str_len sc >= 5 && str_eq (substring sc 0 5) "(sng:") then
-              (let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
+            if (if str_eq (super_refusal world scv) "" then false else true) then
+              (let _ = raise_exc world "TypeError" (super_refusal world scv) in FNext VNil)
             else
               let full = if str_len cname >= 2 && str_eq (substring cname 0 2) "::" then substring cname 2 (str_len cname)
                          else if str_eq cscope "" then cname else cscope ++ "::" ++ cname in
@@ -43293,7 +43376,7 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
               let r = register_class world full cbody in
               let _ = set_lex saved_lex in
               r
-          | _ -> let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
+          | _ -> let _ = raise_exc world "TypeError" (super_refusal world scv) in FNext VNil)
        // a constant assignment in the body runs at definition time; stored
        // stored under the qualified name only (`Klass::CONST`), so it does not
        // clobber a top-level constant of the same name; bare lookups find it
@@ -44573,7 +44656,11 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // nil/true/false keep the self reading below, which is already right.
        else if lv_has env "__definee_cls"
                && (match lv_get env "__definee_cls" with VStr _ -> true | _ -> false) then
-         (match lv_get env "__definee_cls" with VStr h -> sget h ++ "#" ++ name | _ -> name)
+         // (a frozen class -- or the singleton of a frozen object -- refuses
+         //  the def here too: `o.freeze; o.singleton_class.class_eval { def x }`)
+         (match lv_get env "__definee_cls" with
+          | VStr h -> (let c9 = sget h in let _ = frz_cls_check world c9 in c9 ++ "#" ++ name)
+          | _ -> name)
        else if lv_has env "__definee_recv"
                && (match lv_get env "__definee_recv" with VNil -> false | _ -> true) then
          (let _ = frz_recv_check env world (lv_get env "__definee_recv") in
@@ -44746,6 +44833,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        // scope its `def` was written in), falling back to the lexical stack.
        else register_class_sng_in world (sng_target_cls world env super0 "Object") body
               (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h -> sget h | _ -> cur_lex ()) else cur_lex ()))
+    // `class Foo < Class`: Class has no subclasses
+    else if str_eq super0 "Class" then
+      (let _ = raise_exc world "TypeError" "can't make subclass of Class" in FNext VNil)
     // `class Base::Name` where Base is nil/true/false or a non-class value
     // is a TypeError (nil is not a class/module).
     else if str_contains name "::" &&
@@ -44910,10 +45000,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
     let scv = eval_e env world blk supExpr in
     (match scv with
      | VClass sc ->
-       if map_has modules sc || (str_len sc >= 5 && str_eq (substring sc 0 5) "(sng:") then
-         (let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
+       if (if str_eq (super_refusal world scv) "" then false else true) then
+         (let _ = raise_exc world "TypeError" (super_refusal world scv) in FNext VNil)
        else exec_stmt env world blk (SClass (name, sc, body))
-     | _ -> let _ = raise_exc world "TypeError" "superclass must be a Class" in FNext VNil)
+     | _ -> let _ = raise_exc world "TypeError" (super_refusal world scv) in FNext VNil)
   | SAttr (_, _) -> FNext VNil
   | SAlias (n1, n2) ->
     let (meths, sup, ocls, ivars) = world in
@@ -45754,14 +45844,14 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           // answered nil for the file the caller had just named.
           raise_exc_iv world "SyntaxError" msg
             (Cons (("__path", (if str_eq efile9 "" then VNil else mkstr efile9)), Nil)))
-       else if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+       else if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
        else if has_void_assign prog2 then raise_exc world "SyntaxError" "void value expression"
        else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
-       if invalid_flow_in_defs prog2 then raise_exc world "SyntaxError" "Invalid retry"
+       if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
