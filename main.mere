@@ -6031,6 +6031,23 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // `for` is the exception: it is not a scope in Ruby, so its desugared
   // block (a hidden "__f..." param) runs directly in the enclosing env and
   // leaves its loop variable and body locals behind, exactly as Ruby does.
+  // A block whose body names _2 (or higher) has that many parameters, and a
+  // lone Array argument spreads over them as it does over `|a, b|`:
+  // `[[1, 2]].each { p _2 }` is 2, and `{a: 2}.sort_by { _2 }` sorts by the
+  // value. The numbered ones were bound from the argument list as it came,
+  // so _2 was nil whenever one Array was yielded. (`_1` alone, and `it`, take
+  // the Array whole, as in ruby.)
+  let argvals = (match (params, argvals) with
+                 | (Nil, Cons (VArr a9, Nil)) ->
+                   (if (if is_lam then false else true) && max_numbered_stmts body >= 2 then deref a9 else argvals)
+                 // (an object that converts with #to_ary spreads the same way)
+                 | (Nil, Cons (VObj _, Nil)) ->
+                   (if (if is_lam then false else true) && max_numbered_stmts body >= 2 then
+                      (match argvals with
+                       | Cons (o9, Nil) -> (match conv_try gc_cenv0 world o9 "to_ary" with VArr a9 -> deref a9 | _ -> argvals)
+                       | _ -> argvals)
+                    else argvals)
+                 | _ -> argvals) in
   let _ = bind_block_params benv world encl_call (block_defaults body) params argvals is_lam in
   // ⚠ WHICH implicit parameters this frame HAS is a property of the body, not
   //   of the env: bind_numbered puts _1.._9 into every parameter-less block's
@@ -6899,6 +6916,30 @@ and hash_iterating_name = fn (name: str) ->
 // itself off however it ends: the block's break / next / raise come back as
 // Flows (block_body_flow), and a raise out of the iterator itself is caught
 // here, counted off, and sent on.
+// A receiver walked as the Array of its elements answers what the ARRAY's
+// method answers -- except the iterators whose answer is the receiver itself:
+// each_slice / each_cons hand back the Array they walked (ruby 3.1+ returns
+// the receiver), and a Range's was that temporary Array, not the Range.
+and via_arr_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (arr: Val) -> fn (name: str) -> fn (args: Val list) ->
+  let r9 = builtin_iter world encl theblk arr name args in
+  if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") then
+    (match (r9, arr) with
+     | (VArr a9, VArr b9) -> (if a9 == b9 then recv else r9)
+     | _ -> r9)
+  else r9
+// the count of min(n) / min_by(n) and their neighbours: an Integer, a Float
+// truncated, #to_int, and never below zero
+and nby_count = fn world -> fn (a0: Val) ->
+  let n9 = (match a0 with
+            | VInt k -> k
+            | VFlt f -> int_of_float f
+            | _ ->
+              (match conv_try gc_cenv0 world a0 "to_int" with
+               | VInt k -> k
+               | _ -> (let _ = raise_exc world "TypeError"
+                         ("no implicit conversion of " ++ conv_gives_name a0 ++ " into Integer") in 0))) in
+  if n9 < 0 then (let _ = raise_exc world "ArgumentError" ("negative size (" ++ str_of_int n9 ++ ")") in 0)
+  else n9
 and builtin_iter = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   match recv with
   | VHsh hid9 when hash_iterating_name name ->
@@ -6914,6 +6955,18 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
   let _ = chill_touch world recv name in
   if builtin_mut_on_frozen world recv name then
     raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+  // min_by(n) / max_by(n): the n smallest (largest) by the block's key, in
+  // order. The count was ignored on every builtin receiver -- an Array, a
+  // Range, a Hash, an Enumerator answered the one best element. (A stable
+  // sort: ruby's nmin_run is not, so among EQUAL keys the order may differ.)
+  else if str_len name == 6 && (str_eq name "min_by" || str_eq name "max_by")
+          && (match args with Cons (VNil, _) -> false | Cons (_, _) -> true | Nil -> false) then
+    (let n9 = nby_count world (match args with Cons (a9, _) -> a9 | Nil -> VNil) in
+     match builtin_iter_raw world encl theblk recv "sort_by" Nil with
+     | VArr sid9 ->
+       (let l9 = deref sid9 in
+        arr_new (val_take (if str_eq name "max_by" then rev_app l9 Nil else l9) n9))
+     | other -> other)
   else
   // each iterator returns a Flow: FBreak v (a `break v` fired — that value
   // becomes the whole call's result) or FNext <natural result>.
@@ -7522,7 +7575,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        else iter_each_result f recv)
     // other Enumerable methods iterate the [k,v] pairs as an array; the
     // block's |k, v| params auto-splat each pair.
-    else builtin_iter world encl theblk (arr_new (hash_to_a xs)) name args
+    else via_arr_iter world encl theblk recv (arr_new (hash_to_a xs)) name args
   | VRange (lo, hi, excl) ->
     // An ENDLESS integer range iterates: ruby's `(1..).each` runs until the
     // block breaks, and so does this -- the bound is the largest integer, and
@@ -7683,13 +7736,13 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
            | _ -> VNil)
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then
           iter_result (range_map world encl theblk a int_max Nil) recv
-        else builtin_iter world encl theblk (arr_new (range_vals world lo hi excl)) name args)
+        else via_arr_iter world encl theblk recv (arr_new (range_vals world lo hi excl)) name args)
      // (an exclusive end at int64's minimum has nothing below it to step back
      // to: `hi - 1` would be the maximum, and `(-2**63...-2**63).each` walked
      // every int64 -- see reverse_each)
      else if rng_is_int lo && rng_is_int hi && excl && rng_int hi == 0 - int_max - 1 then
        (if (str_len name == 4 && str_eq name "each") || (str_len name == 4 && str_eq name "step") then iter_each_result (FNext VNil) recv
-        else builtin_iter world encl theblk (arr_new Nil) name args)
+        else via_arr_iter world encl theblk recv (arr_new Nil) name args)
      else if rng_is_int lo && rng_is_int hi then
        (let last = (if excl then rng_int hi - 1 else rng_int hi) in
         if (str_len name == 4 && str_eq name "each") then iter_each_result (range_each world encl theblk (rng_int lo) last) recv
@@ -7698,7 +7751,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
         else if (str_len name == 4 && str_eq name "step") then
           iter_each_result (range_step world encl theblk (rng_int lo) last (rng_step_int world args)) recv
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then iter_result (range_map world encl theblk (rng_int lo) last Nil) recv
-        else builtin_iter world encl theblk (arr_new (range_to_a (rng_int lo) last)) name args)
+        else via_arr_iter world encl theblk recv (arr_new (range_to_a (rng_int lo) last)) name args)
      else
        // `each` answers the RANGE, not the materialized list it walked --
        // `(:a..:c).each { }` returned an Array here. builtin_iter answers
@@ -7710,7 +7763,7 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
        (let els9 = (if rng_is_succ_obj world lo hi
                     then rng_succ_vals world lo hi excl 0 Nil
                     else range_vals world lo hi excl) in
-        let r9 = builtin_iter world encl theblk (arr_new els9) name args in
+        let r9 = via_arr_iter world encl theblk recv (arr_new els9) name args in
         if (str_len name == 4 && str_eq name "each") && (match theblk with (true, _, _, _) -> true | _ -> false)
         then recv else r9))
   // Float#step(limit[, by]) had no arm at all. ruby computes each value as
@@ -8754,6 +8807,8 @@ and wi_offset_args = fn env -> fn world -> fn (args: Val list) ->
   match args with
   | Cons (VNil, _) -> Nil
   | Cons (VInt _, _) -> args
+  // (an offset past a machine word counts on as a bignum: Bug #8010)
+  | Cons (VBig _, _) -> args
   | Cons (VFlt f, _) -> Cons (VInt (int_of_float f), Nil)
   | Cons (a, _) ->
     (match a with
@@ -12016,6 +12071,20 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           (let sh9 = val_shuffle_fy env world rng xs n (if (str_len name == 8 && str_eq name "shuffle!") then aid else 0 - 1) in
            if (str_len name == 8 && str_eq name "shuffle!") then (let _ = arr_set aid sh9 in recv) else arr_new sh9))
      | _ -> VNil)
+  // a finite Range zips as its elements, through the arm below: handed to
+  // prim_method as an Array it skipped the argument's conversion, so
+  // `(1..1).zip(Object.new)` was [[1, nil]] instead of the TypeError
+  else if (str_len name == 3 && str_eq name "zip")
+          && (match recv with VRange (lo9, hi9, _) -> rng_is_int lo9 && rng_is_int hi9 | _ -> false)
+          && (if prim_user_has world recv "zip" then false else true)
+          && (let rec bad = fn (az: Val list) ->
+                (match az with
+                 | Nil -> false
+                 | Cons (VArr _, t) -> bad t
+                 | Cons (VRange _, t) -> bad t
+                 | Cons (_, _) -> true) in
+              bad args) then
+    invoke_val_c env world blk (prim_method recv "to_a" Nil) name args vischeck
   else if (str_len name == 3 && str_eq name "zip") && (match recv with VArr _ -> true | _ -> false)
      // ...unless the receiver has a #zip of its OWN (a subclass method, or a
      // singleton defined on this very array): a builtin arm must never win
@@ -16485,7 +16554,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // no arg / true: inherited methods included (the ancestor walk of
       // collect_methods, privates excluded); false: own methods only.
       (let inherited = (match args with Cons (VBool false, _) -> false | _ -> true) in
-       if inherited then
+       // (Enumerable has nothing above it: its own list is the whole answer)
+       if inherited && (if str_eq c "Enumerable" then false else true) then
          (let names = map_new () in
           // ⚠ ONE walk: collect_vis is what #methods and its three
           //   neighbours use. This arm had its own walk down `sup` alone, so
@@ -16515,6 +16585,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           let _ = (if str_eq c "Enumerator::Lazy" then
                      list_iter (str_split "chunk chunk_while collect collect_concat compact drop drop_while eager enum_for filter filter_map find_all flat_map force grep grep_v lazy map reject select slice_after slice_before slice_when take take_while to_enum uniq with_index zip" " ")
                        (fn (n9: str) -> (let m = map_len tmp in map_set tmp (str_of_int m) (VSym n9)))
+                   else ()) in
+          // ...and Enumerable's are what its implementation module
+          // (Enumerable__Impl) and the dispatcher's Enumerable arm answer:
+          // the list is the reference's, less what the table already named
+          // (`Enumerable.instance_methods(false)` was 2 names of 61)
+          let _ = (if str_eq c "Enumerable" then
+                     (let had9 = map_new () in
+                      let _ = map_iter tmp (fn (k9: str) -> fn (v9: Val) ->
+                                (match v9 with VSym y9 -> map_set had9 y9 1 | _ -> ())) in
+                      list_iter (str_split ("all? any? chain chunk chunk_while collect collect_concat compact count cycle detect drop drop_while each_cons each_entry each_slice each_with_index each_with_object entries filter filter_map find find_all find_index first flat_map grep grep_v group_by "
+                                            ++ "include? inject lazy map max max_by member? min min_by minmax minmax_by none? one? partition reduce reject reverse_each select slice_after slice_before slice_when sort sort_by sum take take_while tally to_a to_h to_set uniq zip") " ")
+                        (fn (n9: str) -> if map_has had9 n9 then () else (let m = map_len tmp in map_set tmp (str_of_int m) (VSym n9))))
                    else ()) in
           // ...plus a visibility statement that made an inherited method this
           // module's own public/protected one (see collect_vis_go)
@@ -18312,8 +18394,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ENV['HOME'] a NoMethodError for every later reader. When the singleton
     // chain does not answer the name, dispatch by the singleton's superclass
     // (the class the object had), which is where the builtins live.
+    // ⚠ ...except Enumerable's own names when it is the SINGLETON that is
+    //   enumerable (`class << obj; include Enumerable; def each`, or
+    //   `obj.extend Enumerable`): the arm that answers them asks the
+    //   dispatch class for #each, and the class the object had has none, so
+    //   `obj.min` / `obj.grep` / `obj.chunk_while` were NoMethodError where
+    //   the same object answered #map and #to_a.
     let cls = (let c0 = map_get ocls id in
                if is_sng_cls c0 && (if has_meth world c0 name then false else true)
+                  && (if enum_by_each name && has_meth world c0 "each"
+                         && str_list_has (ancestors_of world c0) "Enumerable" then false else true)
                then sng_supername world c0 else c0) in
     // a descriptor stream's stream methods are the prelude's IO layer (see
     // fdio_route), ahead of IO's own -- which are the File model's
@@ -18530,7 +18620,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           then (let l9 = builtin_frame_label world mrecv mnm in
                 if str_len l9 > 0 then VClass (substring l9 0 (str_index_of l9 "#"))
                 else VClass (display_cls world (dispatch_cls_of world mrecv)))
-          else VClass mown)
+          else VClass (impl_public mown))
        // The same four as UnboundMethod (see there): the defined-as name, the
        // definition further up, a copy, and a hash. A bound Method's owner may
        // be empty (a method reached on a primitive receiver), in which case the
@@ -20137,7 +20227,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           // (#each_with_index takes no argument: given one, the array path refuses it)
           && (if (str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> false | _ -> true) then false else true)
           && (enum_needs_block name || (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons")
-              || ((str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> true | _ -> false)))
+              || ((str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> true | _ -> false))
+              // (cycle too: its size is the source's size, cycled -- an Array
+              //  copy of a `to_enum { 42 }` that walks nothing said 0)
+              || (str_len name == 5 && str_eq name "cycle"))
           && (match args with
               | Cons (VInt n9, _) -> n9 >= 1 || (if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") then false else true)
               | Nil -> (if (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") then false else true)
@@ -20157,7 +20250,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                 || (str_len name == 11 && str_eq name "next_values") || (str_len name == 11 && str_eq name "peek_values")
                 || (str_len name == 4 && str_eq name "feed")) then
       (let k = str_of_int id in
-       if (str_len name == 6 && str_eq name "rewind") then
+       // all six move the enumerator's position, which a frozen one may not
+       if val_frozen_mut recv then
+         raise_exc_iv world "FrozenError" ("can't modify frozen " ++ display_cls world cls ++ ": " ++ inspect_w env world recv)
+           (Cons (("__recv", recv), Nil))
+       else if (str_len name == 6 && str_eq name "rewind") then
          // ⚠ ...and the SOURCE is told as well: ruby calls the enclosed
          //   object's #rewind when it has one, so an IO- or cursor-backed
          //   enumerator really starts over.
@@ -20190,6 +20287,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       (if (str_len name == 15 && str_eq name "each_with_index") && (match args with Nil -> false | _ -> true)
        then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 0)")
        else make_enum_a world recv name (wi_offset_args env world args))
+    // ...and with_object / each_with_object without a block: an Enumerator over
+    // this one, as with_index's is (it was a NoMethodError)
+    else if is_enum_cls cls && ((str_len name == 11 && str_eq name "with_object") || (str_len name == 16 && str_eq name "each_with_object"))
+            && (let (h9, _, _, _) = blk in (if h9 then false else true)) then
+      (match args with
+       | Cons (_, Nil) -> make_enum_a world recv name args
+       | _ -> raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int (vlen args) ++ ", expected 1)"))
     // first / take are bounded (usable on infinite generators).
     else if is_enum_cls cls && ((str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "take")) then
       // a count below 0 or past what an Array can hold is refused before
@@ -20246,7 +20350,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           else raise_exc world "TypeError" ("bind argument must be an instance of " ++ ucls))
        else if (str_len name == 4 && str_eq name "name") then VSym unm
        else if (str_len name == 5 && str_eq name "owner") then
-         VClass (if map_has ivars (str_of_int id ++ "@__um_owner")
+         VClass (impl_public (if map_has ivars (str_of_int id ++ "@__um_owner")
                  then (match map_get ivars (str_of_int id ++ "@__um_owner") with
                        | VStr h9 -> sget h9
                        | _ -> ucls)
@@ -20254,7 +20358,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                  else if has_meth world ucls unm then ucls
                  else (let _ = bo_ensure () in
                        let l9 = bo_walk (ancestors_of world ucls) unm in
-                       if str_len l9 > 0 then substring l9 0 (str_index_of l9 "#") else ucls))
+                       if str_len l9 > 0 then substring l9 0 (str_index_of l9 "#") else ucls)))
        else if (str_len name == 15 && str_eq name "source_location") then meth_source_location world ucls unm VNil
        else if (str_len name == 5 && str_eq name "arity") then VInt (bm_arity world ucls unm)
        else if (str_len name == 10 && str_eq name "parameters") then bm_params world ucls unm
@@ -20997,6 +21101,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // ivars. A fresh id naturally drops the singleton class (its methods and
     // constants are keyed by the old id) — matching dup, which does not copy
     // the singleton.
+    // ...but an enumerator that has begun external iteration (#next, #peek)
+    // holds a suspended walk, which no copy can share: ruby refuses
+    else if ((str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone"))
+            && is_enum_cls cls
+            && (map_has ivars (str_of_int id ++ "@__x_fb") || map_has ivars (str_of_int id ++ "@__e_pos")) then
+      raise_exc world "TypeError" "can't copy execution context"
     else if (str_len name == 3 && str_eq name "dup") || (str_len name == 5 && str_eq name "clone") then
       (let nid = alloc_oid ocls in
        // `cls` above is the DISPATCH class, which strips the singleton off when
@@ -21085,10 +21195,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // The Array path already did; an object that includes Enumerable fell to
     // the arm below and answered an ENUMERATOR, which is a value the caller
     // cannot use for anything.
+    // ⚠ ...and only for an object that IS Enumerable: a class with an #each
+    //   and no `include Enumerable` answered #min and #sort, where ruby has
+    //   no such method on it.
     else if ((str_len name == 11 && str_eq name "chunk_while") || (str_len name == 10 && str_eq name "slice_when"))
-            && has_meth world cls "each" then
+            && has_meth world cls "each" && str_list_has (ancestors_of world cls) "Enumerable" then
       raise_exc world "ArgumentError" "tried to create Proc object without a block"
-    else if has_meth world cls "each" && (is_enum_method name || enum_arg_iter name) then
+    else if has_meth world cls "each" && (is_enum_method name || enum_arg_iter name)
+            && str_list_has (ancestors_of world cls) "Enumerable" then
       if enum_needs_block name || enum_arg_iter name then
         // each_slice / each_cons need a positive size before anything is
         // built: without one the enumerator re-enters this arm forever.
@@ -23521,7 +23635,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
             // `each.with_index` answers the receiver. So pair the elements with
             // their index and run that source method over the pairs.
             (let (_, _, _, iv9) = world in
-             let off = (match wi_offset_args env world args with Cons (VInt o, _) -> o | _ -> 0) in
+             let off = (match wi_offset_args env world args with Cons (VInt o, _) -> VInt o | Cons (VBig b9, _) -> VBig b9 | _ -> VInt 0) in
              let src = (match (if map_has iv9 (str_of_int id ++ "@meth") then map_get iv9 (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
              // ruby's with_index does NOT materialise and re-run: it calls the
              // source method ONCE with the block wrapped in an index counter, so a
@@ -23561,7 +23675,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
              let av = enum_to_arr env world blk id in
              (match av with
               | VArr aid2 ->
-                (let pairs = arr_new (with_index_pairs_off (deref aid2) off) in
+                (let pairs = arr_new (with_index_pairs_off (deref aid2) (match off with VInt o9 -> o9 | _ -> 0)) in
                  // each_with_object's memo is the enumerator's own argument and is
                  // also its answer; running the source again over the pairs would
                  // build a SECOND memo and nest it inside the block's first
@@ -23595,6 +23709,21 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
                    (if map_has iv9 (str_of_int id ++ "@recv") then map_get iv9 (str_of_int id ++ "@recv") else r)
                  else r)
               | _ -> VNil))
+          // with_object calls the source method ONCE, as with_index does, and
+          // answers the memo: materialising and walking the elements again left
+          // `delete_if.with_object(h) { }` deleting nothing
+          else if (str_len name == 11 && str_eq name "with_object")
+                  && (let (_, _, _, ivw) = world in map_has ivw (str_of_int id ++ "@recv"))
+                  && (match args with Cons (_, Nil) -> true | _ -> false) then
+            (let (_, _, _, ivw) = world in
+             let memo9 = (match args with Cons (m9, _) -> m9 | Nil -> VNil) in
+             let recv2 = map_get ivw (str_of_int id ++ "@recv") in
+             let src2 = (match (if map_has ivw (str_of_int id ++ "@meth") then map_get ivw (str_of_int id ++ "@meth") else mkstr "each") with VStr h -> sget h | _ -> "each") in
+             let eargs2 = (match (if map_has ivw (str_of_int id ++ "@eargs") then map_get ivw (str_of_int id ++ "@eargs") else VNil) with
+                           | VArr aid3 -> deref aid3
+                           | _ -> Nil) in
+             let _ = invoke_with_block env world blk recv2 src2 eargs2 (wo_object_block newblk memo9) in
+             memo9)
           else if (str_len name == 11 && str_eq name "with_object") then
             invoke_with_block env world blk (enum_to_arr env world blk id) "each_with_object" args newblk
           // Enumerator#each with a block IS the source method with that block --
@@ -25351,8 +25480,10 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
            r9)
         | _ -> arr_new Nil)
      | _ -> VNil)
-  else if (str_len name == 4 && str_eq name "one?") && (match recv with VArr _ -> true | _ -> false) then
-    (match recv with
+  // (a Range and a Hash as their elements, as any? / all? / none? below:
+  //  `(1..2).one?` was a NoMethodError)
+  else if (str_len name == 4 && str_eq name "one?") && (match recv with VArr _ -> true | VHsh _ -> true | VRange _ -> true | _ -> false) then
+    (match (match recv with VArr _ -> recv | _ -> prim_method recv "to_a" Nil) with
      | VArr aid ->
        (match args with
         | Cons (pat, _) -> VBool (arr_count_eqq world (deref aid) pat 0 == 1)
@@ -40116,8 +40247,18 @@ and enum_init = fn env -> fn world -> fn (recv: Val) -> fn (cls: str) -> fn (arg
            recv)
         else
           (let _ = map_set iv9 (k ++ "@__e_blk") (VProc pid) in
+           // the size is nil, something to call, Infinity, or converted to an
+           // Integer (`Enumerator.new("42") {}` is a TypeError, 1.5 is 1)
+           let size9 = fn (sz: Val) ->
+             (match sz with
+              | VNil -> sz | VInt _ -> sz | VBig _ -> sz | VProc _ -> sz
+              | VFlt f9 -> (if f9 == 1.0 / 0.0 || f9 == 0.0 - 1.0 / 0.0 then sz else VInt (int_of_float f9))
+              | _ -> (if responds world sz "call" then sz
+                      else (match conv_try gc_cenv0 world sz "to_int" with
+                            | VInt i9 -> VInt i9
+                            | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name sz ++ " into Integer")))) in
            let _ = (match args with
-                    | Cons (sz, _) -> map_set iv9 (k ++ "@__e_size") sz
+                    | Cons (sz, _) -> map_set iv9 (k ++ "@__e_size") (size9 sz)
                     | Nil -> (if map_has iv9 (k ++ "@__e_size") then map_delete iv9 (k ++ "@__e_size") else ())) in
            recv)))
   | _ -> recv
@@ -40609,9 +40750,9 @@ and en_buf_step = fn env -> fn world -> fn blk -> fn (id: int) -> fn (consume: b
   if pos >= val_list_len xs then
     // every iteration buffered here (en_can_buffer) answers its receiver, which
     // is therefore StopIteration#result -- it read nil before
-    raise_exc_iv world "StopIteration" "iteration reached an end"
-      (Cons (("result", (if map_has ivars (str_of_int id ++ "@__e_ret") then map_get ivars (str_of_int id ++ "@__e_ret")
-                         else if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil)), Nil))
+    en_stop_raise world id
+      (if map_has ivars (str_of_int id ++ "@__e_ret") then map_get ivars (str_of_int id ++ "@__e_ret")
+       else if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil)
   else
     (let v = val_nth xs pos in
      let _ = (if consume then map_set ivars (str_of_int id ++ "@__e_pos") (VInt (pos + 1)) else ()) in
@@ -40658,8 +40799,19 @@ and en_ext_step = fn env -> fn world -> fn (recv: Val) -> fn (id: int) -> fn (co
 and en_ext_stop = fn world -> fn (id: int) ->
   let (_, _, _, iv) = world in
   let k = str_of_int id in
-  raise_exc_iv world "StopIteration" "iteration reached an end"
-    (Cons (("result", (if map_has iv (k ++ "@__x_ret") then map_get iv (k ++ "@__x_ret") else VNil)), Nil))
+  en_stop_raise world id (if map_has iv (k ++ "@__x_ret") then map_get iv (k ++ "@__x_ret") else VNil)
+// An enumerator that has reached its end KEEPS the StopIteration it raised:
+// every later #next / #peek raises a new one whose #cause is that first one,
+// as ruby's enumerator_next does with e->stop_exc.
+and en_stop_raise = fn world -> fn (id: int) -> fn (res: Val) ->
+  let (_, _, _, iv) = world in
+  let k = str_of_int id in
+  if map_has iv (k ++ "@__x_stop") then
+    raise_exc_iv world "StopIteration" "iteration reached an end"
+      (Cons (("result", res), Cons (("__cause", map_get iv (k ++ "@__x_stop")), Nil)))
+  else
+    try_or_msg (fn (u: unit) -> raise_exc_iv world "StopIteration" "iteration reached an end" (Cons (("result", res), Nil)))
+      (fn (m: str) -> (let _ = (if map_has iv "$exc" then map_set iv (k ++ "@__x_stop") (map_get iv "$exc") else ()) in fail m))
 // forget an iteration in progress (#rewind). ⚠ Its fiber is KILLED, which runs
 // the source's ensure clauses now -- ruby leaves the abandoned fiber to the
 // collector, which never runs them. Killing is what gives the thread back.
@@ -40674,7 +40826,7 @@ and en_ext_drop = fn world -> fn (id: int) ->
     | Nil -> ()
     | Cons (n, r) -> (let _ = (if map_has iv (k ++ n) then map_delete iv (k ++ n) else ()) in del r) in
   del (Cons ("@__x_fb", Cons ("@__x_done", Cons ("@__x_ret", Cons ("@__x_buf", Cons ("@__x_feed", Cons ("@__x_feedset",
-       Cons ("@__e_buf", Cons ("@__e_pos", Nil)))))))))
+       Cons ("@__e_buf", Cons ("@__e_pos", Cons ("@__x_stop", Nil))))))))))
 and fb_blocking_now = fn (u: unit) ->
   let i = fb_cur () in
   fb_is_root i || map_has fb_blocking i
@@ -40940,7 +41092,15 @@ and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
   let rec join9 = fn (xs: Val list) -> fn (acc: str) ->
     (match xs with
      | Nil -> acc
-     | Cons (x, t) -> join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ inspect_w env world x)) in
+     | Cons (x, t) ->
+       // keywords the method was given print as keywords (`each_with_object(a: 1)`),
+       // the way ruby's inspect reads the kw_splat it kept
+       (let s9 = inspect_w env world x in
+        let s9 = (match (x, t) with
+                  | (VHsh _, Nil) -> (if is_kw_hash x && str_len s9 > 2 && str_eq (substring s9 0 1) "\{"
+                                      then substring s9 1 (str_len s9 - 1) else s9)
+                  | _ -> s9) in
+        join9 t (acc ++ (if str_eq acc "" then "" else ", ") ++ s9))) in
   let argstr = fn (xs: Val list) ->
     (match xs with Nil -> "" | _ -> "(" ++ join9 xs "" ++ ")") in
   // an ALLOCATED enumerator (no source, no generator block) was never set up
@@ -42000,8 +42160,9 @@ and for_recv_obj = fn env -> fn world -> fn (recv: Val) -> fn (c: str) ->
       else for_recv_cls world c)
    | _ -> for_recv_cls world c)
 
-and cls_display = fn world -> fn (c: str) ->
+and cls_display = fn world -> fn (c0: str) ->
   let (meths, sup, ocls, ivars) = world in
+  let c = impl_public c0 in
   if is_sng_cls c then
     (let inner = sng_inner c in
      if str_len inner > 0 && is_digit (char_at inner 0)

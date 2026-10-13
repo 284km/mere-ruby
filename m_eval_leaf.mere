@@ -645,6 +645,10 @@ and flt_of_ord = fn (o: int) ->
            else if e == 0 then ldexp (float_of_int fr) (0 - 1074)
            else ldexp (1.0 + float_of_int fr / 4503599627370496.0) (e - 1023)) in
   if neg then 0.0 - a else a
+// the names the Enumerable arm of dispatch answers by walking #each
+and enum_by_each = fn (name: str) ->
+  is_enum_method name || enum_arg_iter name
+  || (str_len name == 11 && str_eq name "chunk_while") || (str_len name == 10 && str_eq name "slice_when")
 and enum_arg_iter = fn (name: str) ->
   (str_len name == 10 && str_eq name "each_slice") || (str_len name == 9 && str_eq name "each_cons") || (str_len name == 5 && str_eq name "cycle")
   // Every method that YIELDS returns an Enumerator when called without a block
@@ -1982,6 +1986,12 @@ and builtin_owns_here = fn (cls: str) -> fn (name: str) ->
     (str_len name == 4 && str_eq name "lazy") || (str_len name == 4 && str_eq name "feed") ||
     (str_len name == 1 && str_eq name "+") || (str_len name == 7 && str_eq name "inspect") ||
     (str_len name == 4 && str_eq name "each")
+  // ArithmeticSequence's own (`1.step.respond_to?(:size)` was false, so a
+  // size asked through respond_to? -- an each_slice over it -- read nil) and
+  // the Enumerator it is
+  else if str_eq cls "Enumerator::ArithmeticSequence" then
+    str_list_has (str_split "== === begin each end eql? exclude_end? first hash inspect last size step" " ") name
+    || builtin_owns_here "Enumerator" name
   // Thread's INSTANCE surface, which is the other half of the class arm below.
   // ⚠ The row had fallen behind the ARMS before (measured 2026-09-23: eleven
   //   names answered when called and were not here, so respond_to? and
@@ -4925,7 +4935,12 @@ and stdlib_src = fn (name: str) ->
   // a program that never mentions it does not pay for it.
   else if str_eq n "enumerator_product" then
     "class Enumerator::Product < Enumerator\n" ++
-    "  def initialize(*enums)\n" ++
+    "  # (keywords are refused in ruby's words, as Enumerator.product does)\n" ++
+    "  def initialize(*enums, **kw)\n" ++
+    "    unless kw.empty?\n" ++
+    "      ks = kw.keys.map(&:inspect).join(\", \")\n" ++
+    "      raise ArgumentError, (kw.size == 1 ? \"unknown keyword: \" : \"unknown keywords: \") + ks\n" ++
+    "    end\n" ++
     "    raise FrozenError, \"can't modify frozen \" + self.class.to_s + \": \" + inspect if frozen?\n" ++
     "    @__enums = enums\n" ++
     "    self\n" ++
@@ -4982,11 +4997,15 @@ and stdlib_src = fn (name: str) ->
     "  # No sources at all is 1: the product of an empty list is one empty tuple,\n" ++
     "  # which is also why `Enumerator::Product.new.each` yields [].\n" ++
     "  def size\n" ++
+    "    # ruby's enum_product_total_size, in its two passes: an empty source\n" ++
+    "    # empties the product wherever it is; then the FIRST size that is nil\n" ++
+    "    # or infinite is the answer, and anything not an Integer is nil\n" ++
+    "    sizes = @__enums.map \{ |e| e.respond_to?(:size) ? e.size : nil }\n" ++
+    "    return 0 if sizes.any? \{ |s| s == 0 }\n" ++
     "    n = 1\n" ++
-    "    @__enums.each do |e|\n" ++
-    "      s = e.respond_to?(:size) ? e.size : nil\n" ++
-    "      # an Integer, or an infinite Float; anything else means unknown\n" ++
-    "      return nil unless s.is_a?(Integer) || (s.is_a?(Float) && s.infinite?)\n" ++
+    "    sizes.each do |s|\n" ++
+    "      return s if s.nil? || (s.is_a?(Float) && s.infinite?)\n" ++
+    "      return nil unless s.is_a?(Integer)\n" ++
     "      n = n * s\n" ++
     "    end\n" ++
     "    n\n" ++
@@ -15222,12 +15241,12 @@ and pair_firsts = fn (xs: Val list) ->
   match xs with
   | Nil -> Nil
   | Cons (h, t) -> Cons ((match h with VArr aid -> (match deref aid with Cons (a, _) -> a | _ -> h) | _ -> h), pair_firsts t)
-and wi_index_block = fn newblk -> fn (off: int) ->
+and wi_index_block = fn newblk -> fn (off: Val) ->
   let bpid = (proc_next ()) in
   let _ = store_proc (str_of_int bpid) newblk in
   let cenv = map_new () in
   let _ = map_set cenv "__wi_blk" (VProc bpid) in
-  let _ = map_set cenv "__wi_c" (arr_new (Cons (VInt off, Nil))) in
+  let _ = map_set cenv "__wi_c" (arr_new (Cons (off, Nil))) in
   let idx = EMethod (EVar "__wi_c", "[]", Cons (EInt 0, Nil)) in
   // a multi-value yield arrives as the whole list, a single one as itself --
   // the same shape the materialising collector uses.
@@ -15242,6 +15261,24 @@ and wi_index_block = fn newblk -> fn (off: int) ->
               Cons (SExpr (EMethod (EVar "__wi_c", "[]=", Cons (EInt 0, Cons (EBin ("+", idx, EInt 1), Nil)))),
               Cons (SIf (Cons ((EMethod (rv, "[]", Cons (EInt 0, Nil)), Cons (SBreak got, Nil)), Nil), Nil),
               Cons (SExpr got, Nil)))) in
+  (true, Cons ("*__e", Nil), body, cenv)
+// with_object's wrapper: the caller's block gets (element, memo), and what it
+// answers goes back to the SOURCE method, as with_index's does -- so
+// `a.delete_if.with_object(h) { |x, seen| ... }` deletes by the block.
+and wo_object_block = fn newblk -> fn (memo: Val) ->
+  let bpid = (proc_next ()) in
+  let _ = store_proc (str_of_int bpid) newblk in
+  let cenv = map_new () in
+  let _ = map_set cenv "__wi_blk" (VProc bpid) in
+  let _ = map_set cenv "__wo_m" memo in
+  let elem = ETern (EBin ("<=", EMethod (EVar "__e", "length", Nil), EInt 1),
+                    EMethod (EVar "__e", "[]", Cons (EInt 0, Nil)),
+                    EVar "__e") in
+  let rv = EVar "__wi_r" in
+  let got = EMethod (rv, "[]", Cons (EInt 1, Nil)) in
+  let body = Cons (SAssign ("__wi_r", EMethod (EVar "__wi_blk", "__wi_call", Cons (elem, Cons (EVar "__wo_m", Nil)))),
+              Cons (SIf (Cons ((EMethod (rv, "[]", Cons (EInt 0, Nil)), Cons (SBreak got, Nil)), Nil), Nil),
+              Cons (SExpr got, Nil))) in
   (true, Cons ("*__e", Nil), body, cenv)
 and wi_answers_elems = fn (src: str) ->
   str_eq src "select" || str_eq src "filter" || str_eq src "find_all" ||
@@ -15266,6 +15303,10 @@ and with_index_pairs_off = fn (xs: Val list) -> fn (i: int) ->
 and enum_args_str = fn (xs: Val list) ->
   match xs with
   | Nil -> ""
+  // (trailing keywords print as keywords, as ruby's kw_splat does)
+  | Cons (VHsh hk, Nil) when is_kw_hash (VHsh hk) ->
+    (let s9 = inspect (VHsh hk) in
+     if str_len s9 > 2 then substring s9 1 (str_len s9 - 1) else s9)
   | Cons (v, Nil) -> inspect v
   | Cons (v, rest) -> inspect v ++ ", " ++ enum_args_str rest
 and is_enum_cls = fn (cls: str) ->
