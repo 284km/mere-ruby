@@ -18,7 +18,9 @@ rows = Errno.constants.sort.filter_map do |c|
   next unless k.is_a?(Class) && k.const_defined?(:Errno)
   num = k::Errno
   text = k.new.message.sub(/ - .*\z/, "")
-  next if text.include?(",") || text.include?(":")
+  # (a ":" in the text is kept: the reader takes everything after the second
+  # one, and darwin's NOERROR is "Undefined error: 0")
+  next if text.include?(",")
   "#{c}:#{num}:#{text}"
 end
 warn "#{rows.size} errno rows"

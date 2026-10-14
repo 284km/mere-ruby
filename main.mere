@@ -2572,7 +2572,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          (match (if map_has globals "!" then map_get globals "!" else VNil) with
           | VNil -> VNil
           | exc9 -> (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-                     invoke_val_c env world nb9 exc9 "backtrace" Nil false))
+                     bt_must_be_array world (invoke_val_c env world nb9 exc9 "backtrace" Nil false)))
        // $> is $stdout, $< is ARGF and $* is ARGV -- views, which read nil
        // here (and so did the English names for them)
        else if str_eq k ">" && (if map_has globals ">" then false else true) then
@@ -4701,6 +4701,12 @@ and hsh_eval_items = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                        | other9 ->
                          (match conv_try env world other9 "to_hash" with
                           | VHsh xs -> hderef xs
+                          // (an object with no #to_hash at all is "no implicit
+                          //  conversion", as rb_to_hash_type words it)
+                          | _ when (if responds world other9 "to_hash" then false else true) ->
+                            (match raise_exc world "TypeError"
+                                     ("no implicit conversion of " ++ display_cls_msg world (dispatch_cls_of world other9) ++ " into Hash")
+                             with _ -> (Nil : Val list))
                           | _ ->
                             (let cn9 = display_cls_msg world (dispatch_cls_of world other9) in
                              match raise_exc world "TypeError"
@@ -5624,10 +5630,22 @@ and make_exc_w = fn world -> fn (args: Val list) ->
                  | _ -> ()) in
         obj9))
   | _ -> exc
+// a flat keyword list (k, v, k, v, ...) without the key k
+and kw_drop_key = fn (kw: Val list) -> fn (k: Val) ->
+  match kw with
+  | Cons (k9, Cons (v9, t9)) -> (if hkey_eql k9 k then kw_drop_key t9 k else Cons (k9, Cons (v9, kw_drop_key t9 k)))
+  | _ -> (Nil : Val list)
 and make_exc_w1 = fn world -> fn (args: Val list) ->
   let (pos9, kw9) = peel_kw_hash args in
   if hash_haskey kw9 (VSym "cause") then
     (let cz9 = hash_get kw9 (VSym "cause") in
+     // the other keywords are the exception's argument, a Hash without cause
+     // (`raise Exc, "foo" => "bar", cause: e` hands {"foo" => "bar"} to Exc)
+     let rest9 = kw_drop_key kw9 (VSym "cause") in
+     let pos9 = (match (pos9, rest9) with
+                 | (Nil, _) -> pos9
+                 | (_, Nil) -> pos9
+                 | _ -> list_append pos9 (Cons (mkhash rest9, Nil))) in
      match pos9 with
      | Nil -> raise_exc world "ArgumentError" "only cause is given with no arguments"
      | _ ->
@@ -5665,6 +5683,11 @@ and make_exc_w1 = fn world -> fn (args: Val list) ->
 
 
 and make_exc_w0 = fn world -> fn (args: Val list) ->
+  // raise takes at most three: the class or message, the message, the
+  // backtrace (a trailing Hash is the cause: keyword)
+  let n9 = val_list_len args - (match vlast args with VHsh _ -> 1 | _ -> 0) in
+  if n9 > 3 then raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected 0..3)")
+  else
   match args with
   // ⚠ a class that is not an exception is not raisable, and ruby asks before
   //   anything else: `raise String` is a TypeError, not a "String" exception
@@ -5844,6 +5867,11 @@ and make_exc_w0 = fn world -> fn (args: Val list) ->
 // expand "*var" (rescue *var) into the array's class names, and "@rexpr~N"
 // (a non-constant class expression) by evaluating the stashed expression at
 // match time. A "*"-prefixed sentinel splats the evaluated array.
+and resc_all_classes = fn (xs: Val list) ->
+  match xs with
+  | Nil -> true
+  | Cons (VClass _, t) -> resc_all_classes t
+  | Cons (_, _) -> false
 and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str list) ->
   match classes with
   | Nil -> Nil
@@ -5855,6 +5883,10 @@ and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str lis
                 then eval_e env world blk (map_get resc_exprs (substring inner 7 (str_len inner)))
                 else (if lv_has env inner then lv_get env inner else VNil) in
       (match arr with
+       // every member must be a class or a module (`rescue *Array(1)` is
+       // ruby's TypeError, and it was a clause that matched nothing)
+       | VArr id when (if resc_all_classes (deref id) then false else true) ->
+         (let _ = raise_exc world "TypeError" "class or module required for rescue clause" in Nil)
        | VArr id ->
          (let names = class_names_of (deref id) in
           let rest2 = expand_rescue_classes env world blk rest in
@@ -21027,15 +21059,25 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 16 && str_eq name "detailed_message") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
       mkstr (exc_detailed_msg env world recv (kw_flag args "highlight" false))
     else if (str_len name == 12 && str_eq name "full_message") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
-      mkstr (exc_full_message env world recv args (kw_flag args "highlight" false)
-               (str_eq (kw_sym args "order" "top") "bottom"))
+      (let o9 = kw_sym args "order" "top" in
+       // (order: is :top or :bottom, or nil for the default)
+       if (if str_eq o9 "top" || str_eq o9 "bottom" then false else true)
+          && (match vlast args with VHsh hk9 -> (match hash_get (hderef hk9) (VSym "order") with VSym _ -> true | _ -> false) | _ -> false) then
+         raise_exc world "ArgumentError" ("expected :top or :bottom as order: :" ++ o9)
+       else
+       mkstr (exc_full_message env world recv args (kw_flag args "highlight" false)
+               (str_eq o9 "bottom")))
     // Exception#inspect: uses #to_s for the message text. Empty -> just the
     // class name (no #<>); otherwise "#<Class: to_s>".
     else if (str_len name == 7 && str_eq name "inspect") && exc_is_a world cls "Exception" && (if has_meth world cls name then false else true) then
-      (let disp = display_cls world cls in
+      // (an anonymous class as ruby prints it, #<Class:0x..>, not by its
+      //  bookkeeping name)
+      (let disp = cls_display world (display_cls world cls) in
        let msgv = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) recv "to_s" Nil false in
        let msg = (match msgv with VStr h -> sget h | VNil -> disp | other -> to_s other) in
        if str_eq msg "" then mkstr disp
+       // a message with a newline in it is shown inspected (Bug #18170)
+       else if str_contains msg "\n" then mkstr ("#<" ++ disp ++ ":" ++ inspect_w env world (match msgv with VStr _ -> msgv | _ -> mkstr msg) ++ ">")
        else mkstr ("#<" ++ disp ++ ": " ++ msg ++ ">"))
     else if str_eq cls "MatchData" &&
             ((str_len name == 9 && str_eq name "pre_match") || (str_len name == 10 && str_eq name "post_match") ||
@@ -39116,11 +39158,24 @@ and path_args_all = fn nb -> fn world -> fn (args: Val list) ->
 // its own because `super` from a Warning#warn override reaches it too, with
 // self the Warning module -- dispatching `warn` again from there would find
 // the override and never end.
+// the keys of a keyword list (k, v, k, v, ...) that warn does not take,
+// refused as ruby words it: "unknown keyword: :foo" / "unknown keywords: :a, :b"
+and warn_stray_kw = fn world -> fn (kw: Val list) -> fn (acc: str) -> fn (n: int) ->
+  match kw with
+  | Cons (k9, Cons (_, t9)) ->
+    (match k9 with
+     | VSym y9 when str_eq y9 "uplevel" || str_eq y9 "category" -> warn_stray_kw world t9 acc n
+     | _ -> warn_stray_kw world t9 (if n == 0 then inspect k9 else acc ++ ", " ++ inspect k9) (n + 1))
+  | _ ->
+    (if n == 0 then ()
+     else (let _ = raise_exc world "ArgumentError" ((if n == 1 then "unknown keyword: " else "unknown keywords: ") ++ acc) in ()))
 and kernel_warn = fn env -> fn world -> fn (args: Val list) ->
   (let _ = (match args with
             | Cons (_, _) ->
               (let (pos9, kw9) = peel_kw_hash args in
                let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+               // warn takes uplevel: and category: and nothing else
+               let _ = warn_stray_kw world kw9 "" 0 in
                // uplevel is a frame count by NUM2LONG: a Float or Rational
                // truncates, a negative one is refused, and anything that is
                // not a number is a TypeError.
@@ -42566,6 +42621,12 @@ and exc_detailed_msg = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) ->
 // terminal shows. #detailed_message is reached THROUGH the dispatcher, because
 // a program may override it -- that is the method's entire purpose, and
 // computing the text here directly would make the override unreachable.
+// what #backtrace answered, which must be nil or an Array
+and bt_must_be_array = fn world -> fn (v: Val) ->
+  match v with
+  | VNil -> v
+  | VArr _ -> v
+  | _ -> raise_exc world "TypeError" "backtrace must be an Array of String or an Array of Thread::Backtrace::Location"
 and exc_full_message = fn env -> fn world -> fn (recv: Val) -> fn (fargs: Val list) -> fn (hl: bool) -> fn (bottom: bool) ->
   // ⚠ THE CAUSES ARE PART OF THE REPORT. `raise` inside a rescue records the
   // exception being handled as the new one's #cause, and ruby prints the
@@ -42653,19 +42714,21 @@ and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (btov9: Val) ->
                       if hl then e9 ++ "[1;4m" ++ shown8 ++ e9 ++ "[m" else shown8))) in
   let bt9 = (match btov9 with
              | VArr aid8 -> bt_strs_of (deref aid8)
-             | _ -> (match invoke_val_c env world noblk9 recv "backtrace" Nil false with
+             | _ -> (match bt_must_be_array world (invoke_val_c env world noblk9 recv "backtrace" Nil false) with
                      | VArr aid9 -> bt_strs_of (deref aid9)
                      | _ -> (Nil : str list))) in
   let e9 = chr 27 in
-  match bt9 with
   // ⚠ NO BACKTRACE STILL HAS A HEAD LINE. An exception that was built but
   // never raised has none, and ruby names the place full_message was CALLED
   // ("file:line:in 'full_message'") rather than printing the message bare.
+  // (a message that already ends in a newline gets no second one)
+  let nl9 = (if str_len dm9 > 0 && str_eq (char_at dm9 (str_len dm9 - 1)) "\n" then "" else "\n") in
+  match bt9 with
   | Nil ->
-    (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in 'full_message': " ++ dm9 ++ "\n")
+    (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ":in 'full_message': " ++ dm9 ++ nl9)
   | Cons (top9, rest9) ->
-    (if bottom then bt_from_lines_rev rest9 1 ++ top9 ++ ": " ++ dm9 ++ "\n"
-     else top9 ++ ": " ++ dm9 ++ "\n"
+    (if bottom then bt_from_lines_rev rest9 1 ++ top9 ++ ": " ++ dm9 ++ nl9
+     else top9 ++ ": " ++ dm9 ++ nl9
           ++ bt_from_lines_lim rest9 (if map_has globals "__backtrace_limit"
                                       then (match map_get globals "__backtrace_limit" with VInt n9 -> n9 | _ -> 0 - 1)
                                       else 0 - 1))
@@ -43408,7 +43471,8 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          let _ = (match names with
                   | Nil -> (if str_eq m "private_constant" || str_eq m "public_constant"
                             then rb_warning world (m ++ " with no argument is just ignored") else ())
-                  | _ -> if str_eq m "module_function" then modfunc_promote_hooked world cls names
+                  | _ -> if str_eq m "module_function" then
+                           (let _ = vis_names_check_inst world cls names in modfunc_promote_hooked world cls names)
                          // (the named class methods have to exist, as the method form checks)
                          else if str_eq m "private_class_method" then
                            (let _ = vis_names_check world ("(sng:" ++ cls ++ ")") names in
@@ -43432,6 +43496,8 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
                                | Cons (n9, t9) ->
                                  (if map_has meths (cls ++ "#" ++ n9) || map_has vis_marks (cls ++ "#" ++ n9)
                                   then fresh_of9 t9 else Cons (n9, fresh_of9 t9))) in
+                            let _ = (if str_eq m "private" || str_eq m "public" || str_eq m "protected"
+                                     then vis_names_check_inst world cls names else ()) in
                             let fresh9 = fresh_of9 names in
                             let _ = mark_vis_mode meths cls names m in
                             list_iter fresh9 (fn (n9: str) -> run_method_added world cls n9))) in
@@ -43721,6 +43787,17 @@ and register_class_v = fn world -> fn (cls: str) -> fn (body: Stmt list) -> fn (
          // carried the string "mod" and none of the module's methods were
          // found. The top-level arm (SInclude in exec_stmt) has looked the
          // local up all along; this is the copy inside a class body.
+         // (a local that holds something that is not a module at all is
+         //  ruby's TypeError, "wrong argument type Object (expected Module)")
+         let notmod9 = (if lv_has cenv m
+                        then (match lv_get cenv m with
+                              | VClass _ -> false
+                              | VObj o9 -> (if str_list_has (ancestors_of world (dispatch_cls_of world (VObj o9))) "Module" then false else true)
+                              | _ -> true)
+                        else false) in
+         if notmod9 then
+           (let _ = raise_exc world "TypeError" ("wrong argument type " ++ class_name (lv_get cenv m) ++ " (expected Module)") in FNext VNil)
+         else
          let mq = (if lv_has cenv m
                    then (match lv_get cenv m with
                          | VClass mc9 -> mc9
@@ -44010,6 +44087,21 @@ and drop_trail_slash = fn (a9: str) -> fn (i: int) ->
   if i >= 0 && str_eq (char_at a9 i) "/" then drop_trail_slash a9 (i - 1)
   else substring a9 0 (i + 1)
 
+// private / public / protected / module_function with names: each must be a
+// method of the class or of an ancestor -- the interpreter's builtins
+// included, which no method table lists. `Module.new { module_function :foo }`
+// is ruby's NameError, and it was accepted and ignored.
+and vis_names_check_inst = fn world -> fn (cls: str) -> fn (names: str list) ->
+  match names with
+  | Nil -> ()
+  | Cons (n, rest) ->
+    (if is_kernel_builtin n || is_prim_method n || builtin_pub_meth cls n || builtin_has_meth "Object" n
+        || builtin_has_meth "Kernel" n || is_module_method n
+        // (BasicObject's and Kernel's private hooks every object has)
+        || str_eq n "initialize" || str_eq n "initialize_copy" || str_eq n "initialize_dup" || str_eq n "initialize_clone"
+        || str_eq n "method_missing" || str_eq n "respond_to_missing?" || str_eq n "singleton_method_added"
+     then vis_names_check_inst world cls rest
+     else (let _ = vis_names_check world cls (Cons (n, Nil)) in vis_names_check_inst world cls rest))
 and vis_names_check = fn world -> fn (cls: str) -> fn (names: str list) ->
   let (meths0, _, _, _) = world in
   match names with
