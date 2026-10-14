@@ -26,3 +26,8 @@ t(15) { [(::Warning.warn(nil) rescue $!.message), (::Warning.warn(1) rescue $!.m
 class Ex307; end
 def x307(a) = nil
 t(16) { x307(**Ex307.new) }
+# ...and an ALIAS of a builtin is a method a visibility change may name
+# (ostruct's `alias_method :raise!, :raise; private :raise!`)
+class Fo307; alias_method :raise!, :raise; private :raise!; alias_method :fr307, :freeze; public :fr307; end
+class Class; alias _rc307 remove_const; public :_rc307; end
+t(17) { [Fo307.new.respond_to?(:fr307), Fo307.new.fr307.frozen?] }
