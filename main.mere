@@ -17264,7 +17264,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                         let m = map_len tmp in map_set tmp (str_of_int m) (VSym nm9)))
             else ())) in
        let _ = add1 c in
-       let _ = (if inh then list_iter (anc_after (ancestors_of world c) c) add1 else ()) in
+       // (a class's singleton does not walk its own chain: the modules there
+       //  are the ones the class was EXTENDED with, whose class variables are
+       //  not the singleton's -- the attached class's chain is walked below)
+       let sngcls9 = is_sng_cls c && (let i8 = sng_inner c in str_len i8 > 0 && (if is_digit (char_at i8 0) then false else true) && (if is_sng_cls i8 then false else true)) in
+       let _ = (if inh && (if sngcls9 then false else true) then list_iter (anc_after (ancestors_of world c) c) add1 else ()) in
        // ⚠ ...and a CLASS'S SINGLETON also reports the class's, because the
        //   two share a lexical scope (`class << self; @@meta = 1; end` writes
        //   to the class -- see cvar_cls). The sharing is ONE WAY: the class
@@ -17272,9 +17276,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        //   `C.singleton_class.class_variable_set`, so this cannot be done by
        //   rewriting the receiver. The metaclass chain does not contain the
        //   class, which is why it has to be walked separately.
-       let _ = (if inh && is_sng_cls c && (let i8 = sng_inner c in
-                                           map_has consts i8 || map_has modules i8)
-                then list_iter (ancestors_of world (sng_inner c)) add1 else ()) in
+       let _ = (if inh && sngcls9 then list_iter (ancestors_of world (sng_inner c)) add1 else ()) in
        arr_new (idx_to_list tmp 0 (map_len tmp)))
     else if (str_len name == 18 && str_eq name "class_variable_get") then
       (match args with
@@ -17286,8 +17288,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                   else (let _ = raise_exc_iv world "NameError" ("'" ++ s9 ++ "' is not allowed as a class variable name")
                                   (Cons (("__name", v), Cons (("__recv", VClass c), Nil))) in ())) in
          let nm = cvar_name_checked world s9 in
-         (if cvar_overtaken world c nm then raise_exc world "RuntimeError" ("class variable @@" ++ nm ++ " of " ++ c ++ " is overtaken by " ++ c)
-          else if cvar_defined_from world c nm then cvar_get_from world c nm
+         (if cvar_defined_from world c nm then (if cvar_overtake_check world c nm then cvar_get_from world c nm else VNil)
           else raise_exc_iv world "NameError" ("uninitialized class variable @@" ++ nm ++ " in " ++ c)
                  (Cons (("__name", VSym ("@@" ++ nm)), Cons (("__recv", VClass c), Nil))))
        | _ -> VNil)
@@ -17296,7 +17297,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Cons (v, Cons (value, _)) -> let nm = cvar_name_checked world (sym_or_str_arg env world v) in
          let owner0 = cvar_owner world c nm in
          let owner = if str_eq owner0 "" then c else owner0 in
-         let _ = map_set cvars (owner ++ "@" ++ nm) value in value
+         let _ = (if cvar_write_ok world c nm owner then map_set cvars (owner ++ "@" ++ nm) value else ()) in value
        | _ -> VNil)
     // ...and the same chain answers `defined?`: it read one class's key, so it
     // denied a variable class_variable_get finds one line below.
@@ -24247,7 +24248,13 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        // (not the class name) so the hidden singleton class is only created if
        // a def actually happens -- giving one to every instance_eval'd object
        // would change what `class`, `clone` and `singleton_class?` answer.
-       let _ = map_set e3c "__definee_recv" recv in
+       // (nil / true / false have a CLASS as their singleton, and nil cannot
+       //  be told from "no definee" in __definee_recv: the class is named)
+       let _ = (match recv with
+                | VNil -> map_set e3c "__definee_cls" (mkstr "NilClass")
+                | VBool true -> map_set e3c "__definee_cls" (mkstr "TrueClass")
+                | VBool false -> map_set e3c "__definee_cls" (mkstr "FalseClass")
+                | _ -> map_set e3c "__definee_recv" recv) in
        let blkargs = if (str_len name == 13 && str_eq name "instance_exec") then args else Cons (recv, Nil) in
        let r3 = flow_value (run_block world blk (h3, ps3, bb3, e3c) blkargs) in
        let _ = lv_child_done e3c in
@@ -24529,6 +24536,11 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          // bare Const inside resolves in the BLOCK's lexical scope (Ruby: a
          // block does not open a constant scope), not the receiver's namespace.
          (let (h3, ps3, bb3, e3) = newblk in
+          // a block made of a Symbol (`Math.module_eval(&:to_s)`) is a call on
+          // its one argument, which is the module: run it as the block it is
+          // (as class-body statements its `__bp` was a method of the module)
+          if str_list_has ps3 "__bp" then flow_value (run_block world blk newblk (Cons (VClass c, Nil)))
+          else
           let cscope = (if lv_has e3 "__cref" then (match lv_get e3 "__cref" with VStr s -> let s = sget s in s | _ -> "") else "") in
           // ⚠ `module_eval { |mod| ... }` PASSES THE MODULE to its block, and
           //   the exec forms pass their arguments. The body runs as class-body
@@ -35961,27 +35973,51 @@ and cvar_get = fn env -> fn world -> fn (name: str) ->
   // a class variable accessed at the top-level scope is a RuntimeError.
   if str_eq cls "" then raise_exc world "RuntimeError" "class variable access from toplevel"
   // reading an uninitialised class variable is a NameError in Ruby.
-  else if cvar_defined_from world cls name then cvar_get_from world cls name
+  else if cvar_defined_from world cls name then (if cvar_overtake_check world cls name then cvar_get_from world cls name else VNil)
   else raise_exc_iv world "NameError" ("uninitialized class variable @@" ++ name ++ " in " ++ cls)
          (Cons (("__name", VSym ("@@" ++ name)), Cons (("__recv", VClass cls), Nil)))
 
 // the chain a class variable is looked up along: the receiver, then everything
 // it inherits from or includes, in the order dispatch uses.
-and cvar_chain = fn world -> fn (cls: str) -> ancestors_of world cls
+// ...and a CLASS's singleton class looks its class variables up in the class
+// it is attached to (ruby's cvar lookup), not along its own chain, which holds
+// the modules the class was extended with: `c.extend(M)` gave
+// `c.singleton_class.class_variables` M's variables.
+and cvar_chain = fn world -> fn (cls: str) ->
+  if is_sng_cls cls && (let i9 = sng_inner cls in str_len i9 > 0 && (if is_digit (char_at i9 0) then false else true) && (if is_sng_cls i9 then false else true))
+  then ancestors_of world (sng_inner cls)
+  else ancestors_of world cls
 
 and cvar_first_owner = fn world -> fn (anc: str list) -> fn (name: str) ->
   match anc with
   | Nil -> ""
   | Cons (a, rest) -> if map_has cvars (a ++ "@" ++ name) then a else cvar_first_owner world rest name
 
-and cvar_overtaken = fn world -> fn (cls: str) -> fn (name: str) ->
-  // "this class defines it AND so does something above it" -- ruby warns about
-  // that, and the question is asked of the same chain as the lookup.
-  if map_has cvars (cls ++ "@" ++ name)
-  then (if str_eq (cvar_first_owner world (anc_after (cvar_chain world cls) cls) name) "" then false else true)
-  else (if str_eq (cvar_first_owner world (cvar_chain world cls) name) "" then false
-        else cvar_overtaken world (cvar_first_owner world (cvar_chain world cls) name) name)
-
+// the LAST holder of a class variable up the chain (ruby's CVAR_LOOKUP keeps
+// walking past the first and remembers the farthest)
+and cvar_last_owner = fn world -> fn (anc: str list) -> fn (name: str) -> fn (found: str) ->
+  match anc with
+  | Nil -> found
+  | Cons (a, rest) -> cvar_last_owner world rest name (if map_has cvars (a ++ "@" ++ name) then a else found)
+// ruby's cvar_overtaken: when the first holder up the chain (front) is not
+// the farthest one (target), reading or writing is a RuntimeError -- a parent
+// that defined the variable after the child did has taken it over
+// ("class variable @@cv of Child is overtaken by Parent")
+and cvar_overtake_check = fn world -> fn (cls: str) -> fn (name: str) ->
+  let ch9 = cvar_chain world cls in
+  let front9 = cvar_first_owner world ch9 name in
+  if str_eq front9 "" then true
+  else
+    (let target9 = cvar_last_owner world ch9 name "" in
+     if str_eq target9 front9 then true
+     else (let _ = raise_exc world "RuntimeError"
+                     ("class variable @@" ++ name ++ " of " ++ cls_display world front9
+                      ++ " is overtaken by " ++ cls_display world target9) in false))
+// a write to a class variable: not overtaken, and its holder not frozen
+and cvar_write_ok = fn world -> fn (cls: str) -> fn (name: str) -> fn (owner: str) ->
+  if cvar_overtake_check world cls name then
+    (if clsfrozen_get owner then (let _ = frz_cls_check world owner in false) else true)
+  else false
 and cvar_defined_from = fn world -> fn (cls: str) -> fn (name: str) ->
   if str_eq (cvar_first_owner world (cvar_chain world cls) name) "" then false else true
 
@@ -35997,7 +36033,8 @@ and cvar_set = fn env -> fn world -> fn (name: str) -> fn (v: Val) ->
   // anywhere up the chain; otherwise it is created here.
   let owner0 = cvar_first_owner world (cvar_chain world cls) name in
   let owner = if str_eq owner0 "" then cls else owner0 in
-  map_set cvars (owner ++ "@" ++ name) v
+  // (overtaken, and a frozen holder, refuse the write as ruby does)
+  if cvar_write_ok world cls name owner then map_set cvars (owner ++ "@" ++ name) v else ()
 
 and cvar_owner = fn world -> fn (cls: str) -> fn (name: str) ->
   let o9 = cvar_first_owner world (cvar_chain world cls) name in
@@ -45270,6 +45307,9 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
           | VArr h -> hng_cls_of world (VArr h) "Array" ++ "#" ++ name
           | VHsh h -> hng_cls_of world (VHsh h) "Hash" ++ "#" ++ name
           | VProc ph -> hng_cls_of world (VProc ph) "Proc" ++ "#" ++ name
+          // (true and false: their singleton class IS TrueClass / FalseClass)
+          | VBool true -> "TrueClass#" ++ name
+          | VBool false -> "FalseClass#" ++ name
           | _ -> name)
        // ⚠ A nested `def` goes where it was WRITTEN, not to self's class.
        // `class B; class << self; def make; def cm; end; end` puts cm on B's
@@ -46371,6 +46411,10 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
      // as where it was written.
      | _ -> ("(eval at " ++ cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ")", 1)) in
   match args with
+  // a source in an ASCII-incompatible encoding (UTF-16, UTF-32) is not one
+  // ruby can parse: "invalid source encoding"
+  | Cons (VStr code, _) when (if enc_ascii_compat (enc_canon_name (senc_get code)) then false else true) ->
+    raise_exc world "ArgumentError" "invalid source encoding"
   | Cons (VStr code, rest) ->
     // the second argument is a Binding or nil; a Proc is not one (it once was,
     // in ruby 1.8) and ruby refuses it by type.
@@ -46443,6 +46487,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
           raise_exc_iv world "SyntaxError" msg
             (Cons (("__path", (if str_eq efile9 "" then VNil else mkstr efile9)), Nil)))
        else if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
+       else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bad_sym_stmts prog2 then raise_exc world "SyntaxError" "invalid symbol"
@@ -46450,6 +46495,7 @@ and do_eval = fn env -> fn world -> fn blk -> fn (args: Val list) ->
        else eval_run_at eenv world blk prog2 efile9 eline9
      | _ ->
        if (if str_eq (invalid_flow_word_in_defs prog2) "" then false else true) then raise_exc world "SyntaxError" (invalid_flow_word_in_defs prog2)
+       else if (if str_eq (eval_flow_word prog2) "" then false else true) then raise_exc world "SyntaxError" ((if str_eq efile9 "" then "(eval)" else efile9) ++ ":" ++ str_of_int eline9 ++ ": " ++ eval_flow_word prog2)
        else if pseudo_var_assign prog2 then raise_exc world "SyntaxError" "Can't set variable"
        else if dyn_const_in_defs prog2 then raise_exc world "SyntaxError" "dynamic constant assignment"
        else if bare_yield_stmts prog2 then raise_exc world "SyntaxError" "Invalid yield"
