@@ -3919,7 +3919,12 @@ and make_unbound_method = fn world -> fn (cls: str) -> fn (nm: str) ->
                (mkstr (to_s (map_get meth_src ("f" ++ k9)) ++ ":" ++ to_s (map_get meth_src k9)))
            else ()) in
   VObj id
-and struct_slot = fn (m: str) -> m ++ chr 1
+// (a member that starts with `@`, `Struct.new(:@a)`, would make the slot
+// "@a" and its key "<oid>@@a" -- a class variable's spelling, which is how
+// it was read: "class variable access from toplevel". Its slot starts with
+// the marker instead.)
+and struct_slot = fn (m: str) ->
+  if str_len m > 0 && str_eq (char_at m 0) "@" then chr 1 ++ m ++ chr 1 else m ++ chr 1
 and struct_is_slot = fn (nm: str) -> str_contains nm (chr 1)
 and struct_add_attrs = fn world -> fn (cls: str) -> fn (syms: str list) ->
   let (meths, sup, ocls, ivars) = world in
@@ -3928,10 +3933,11 @@ and struct_add_attrs = fn world -> fn (cls: str) -> fn (syms: str list) ->
   | Cons (name, rest) ->
     let _ = set_meth meths (cls ++ "#" ++ name)
               (Meth (Nil, Nil, Cons (SReturn (EIVar (struct_slot name)), Nil))) in
+    // (the setter's one parameter is `_`: ruby's parameters says [[:req, :_]])
     let _ = set_meth meths (cls ++ "#" ++ name ++ "=")
-              (Meth (Cons ("__attr_v", Nil), Nil,
-                     Cons (SIVarAssign (struct_slot name, EVar "__attr_v"),
-                           Cons (SReturn (EVar "__attr_v"), Nil)))) in
+              (Meth (Cons ("_", Nil), Nil,
+                     Cons (SIVarAssign (struct_slot name, EVar "_"),
+                           Cons (SReturn (EVar "_"), Nil)))) in
     struct_add_attrs world cls rest
 and struct_ivar_reads = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons (EIVar (struct_slot m), struct_ivar_reads r)
@@ -3957,6 +3963,11 @@ and struct_kw_init = fn (args: Val list) ->
      | (true, v9) -> truthy v9
      | _ -> false)
   | Cons (_, r) -> struct_kw_init r
+// The generated initialize names its parameters by POSITION (`__sm0`...), not
+// by member: a member need not be a local's name (`Struct.new(:@a)` made a
+// parameter `@a`, and reading it was "class variable access from toplevel").
+and struct_pnames = fn (ms: str list) -> fn (i: int) ->
+  match ms with Nil -> Nil | Cons (_, r) -> Cons ("__sm" ++ str_of_int i, struct_pnames r (i + 1))
 and struct_pos_defaults = fn (ms: str list) ->
   match ms with Nil -> Nil | Cons (m, r) -> Cons ((m, ENil), struct_pos_defaults r)
 and struct_each_body = fn (ms: str list) ->
@@ -3972,9 +3983,15 @@ and struct_each_yields = fn (ms: str list) ->
   match ms with
   | Nil -> Cons (SReturn ESelf, Nil)
   | Cons (m, r) -> Cons (SExpr (EYield (Cons (EIVar (struct_slot m), Nil))), struct_each_yields r)
-and struct_init_body = fn (ms: str list) ->
-  match ms with Nil -> Nil | Cons (m, r) -> Cons (SIVarAssign (struct_slot m, EVar m), struct_init_body r)
+and struct_init_body = fn (ms: str list) -> fn (i: int) ->
+  match ms with Nil -> Nil | Cons (m, r) -> Cons (SIVarAssign (struct_slot m, EVar ("__sm" ++ str_of_int i)), struct_init_body r (i + 1))
 and struct_common_src = fn (u: unit) ->
+    // the ivar name of a member's slot, as struct_slot spells it
+    "  def __mslot(m)\n" ++
+    "    s = m.to_s\n" ++
+    "    s.start_with?(\"@\") ? \"@\" + 1.chr + s + 1.chr : \"@\" + s + 1.chr\n" ++
+    "  end\n" ++
+    "  private :__mslot\n" ++
     "  def __member_index(k)\n" ++
     "    ms = members\n" ++
     // a key that is not a NAME is an INDEX, through #to_int: `s[1.5]` and
@@ -4000,11 +4017,11 @@ and struct_common_src = fn (u: unit) ->
     "  private :__member_index\n" ++
     "\n" ++
     "  def [](k)\n" ++
-    "    instance_variable_get(\"@\" + members[__member_index(k)].to_s + 1.chr)\n" ++
+    "    instance_variable_get(__mslot(members[__member_index(k)]))\n" ++
     "  end\n" ++
     "\n" ++
     "  def []=(k, v)\n" ++
-    "    instance_variable_set(\"@\" + members[__member_index(k)].to_s + 1.chr, v)\n" ++
+    "    instance_variable_set(__mslot(members[__member_index(k)]), v)\n" ++
     "    v\n" ++
     "  end\n" ++
     "\n" ++
@@ -4027,7 +4044,7 @@ and struct_common_src = fn (u: unit) ->
     "    k = k.to_int unless k.is_a?(Integer) || k.is_a?(Symbol) || k.is_a?(String)\n" ++
     "    i = k.is_a?(Integer) ? (k < 0 ? ms.size + k : k) : ms.index(k.to_sym)\n" ++
     "    return nil if i.nil? || i < 0 || i >= ms.size\n" ++
-    "    v = instance_variable_get(\"@\" + ms[i].to_s + 1.chr)\n" ++
+    "    v = instance_variable_get(__mslot(ms[i]))\n" ++
     "    return v if ks.size <= 1\n" ++
     "    return nil if v.nil?\n" ++
     // ...and an intermediate that cannot be dug into is named in a TypeError,
@@ -4065,14 +4082,14 @@ and struct_common_src = fn (u: unit) ->
     "      if i >= ms.size\n" ++
     "        raise IndexError, \"offset \" + k.to_s + \" too large for struct(size:\" + ms.size.to_s + \")\"\n" ++
     "      end\n" ++
-    "      [instance_variable_get(\"@\" + ms[i].to_s + 1.chr)]\n" ++
+    "      [instance_variable_get(__mslot(ms[i]))]\n" ++
     "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def to_h(&b)\n" ++
     "    h = \{}\n" ++
     "    members.each do |m|\n" ++
-    "      h[m] = instance_variable_get(\"@\" + m.to_s + 1.chr)\n" ++
+    "      h[m] = instance_variable_get(__mslot(m))\n" ++
     "    end\n" ++
     "    return h unless b\n" ++
     "    h.to_h(&b)\n" ++
@@ -4104,7 +4121,7 @@ and struct_common_src = fn (u: unit) ->
     "    ms = self.class.members\n" ++
     "    bad = kw.keys.reject \{ |k| Symbol === k && ms.include?(k) }\n" ++
     "    raise ArgumentError, \"unknown keywords: \" + bad.map(&:to_s).join(\", \") unless bad.empty?\n" ++
-    "    kw.each \{ |k, v| instance_variable_set(\"@\" + k.to_s + 1.chr, v) }\n" ++
+    "    kw.each \{ |k, v| instance_variable_set(__mslot(k), v) }\n" ++
     "    nil\n" ++
     "  end\n" ++
     "\n" ++
@@ -13007,7 +13024,9 @@ and stdlib_src = fn (name: str) ->
     "      if major != 4 || minor > 8\n" ++
     "        raise TypeError, \"incompatible marshal file format (can't be read)\\n\\tformat version 4.8 required; #\{major}.#\{minor} given\"\n" ++
     "      end\n" ++
-    "      r.object\n" ++
+    "      v = r.object\n" ++
+    "      r.r2k_flag\n" ++
+    "      v\n" ++
     "    end\n" ++
     "    alias restore load\n" ++
     "\n" ++
@@ -13074,6 +13093,9 @@ and stdlib_src = fn (name: str) ->
     "             end\n" ++
     "        return nil unless ok\n" ++
     "        c = c.const_get(seg, false)\n" ++
+    "        # ...and one that IS there names a class or a module, or the path is\n" ++
+    "        # refused as a path (\"C3 = nil\" is not \"undefined\")\n" ++
+    "        raise TypeError, \"#\{path} does not refer to class/module\" unless Module === c\n" ++
     "      end\n" ++
     "      c\n" ++
     "    end\n" ++
@@ -13498,7 +13520,9 @@ and stdlib_src = fn (name: str) ->
     "          end\n" ++
     "          ivars(num, obj, nil, limit) if num > 0\n" ++
     "        when Hash\n" ++
-    "          num = count_ivars(obj, nil)\n" ++
+    "          # a ruby2_keywords hash carries the flag as one more ivar, \"K\" => true\n" ++
+    "          r2k = ::Hash.ruby2_keywords_hash?(obj)\n" ++
+    "          num = count_ivars(obj, nil) + (r2k ? 1 : 0)\n" ++
     "          byte(0x49) if num > 0\n" ++
     "          uclass(obj, ::Hash)\n" ++
     "          if obj.compare_by_identity?\n" ++
@@ -13518,7 +13542,7 @@ and stdlib_src = fn (name: str) ->
     "            object(v, limit)\n" ++
     "          end\n" ++
     "          object(obj.default, limit) unless obj.default.nil?\n" ++
-    "          ivars(num, obj, nil, limit) if num > 0\n" ++
+    "          write_ivars(num, (r2k ? [[:K, true]] : []) + ivar_pairs(obj), nil, limit) if num > 0\n" ++
     "        when Struct, (defined?(::Data) ? ::Data : Struct)\n" ++
     "          num = count_ivars(obj, nil)\n" ++
     "          byte(0x49) if num > 0\n" ++
@@ -13561,6 +13585,17 @@ and stdlib_src = fn (name: str) ->
     "          end\n" ++
     "        else\n" ++
     "          cn = data_class_name(obj)\n" ++
+    "          # ENV and ARGF are T_DATA-like objects of no dumpable class in the\n" ++
+    "          # reference: an Object and an ARGF.class with no _dump_data\n" ++
+    "          raise TypeError, \"no _dump_data is defined for class Object\" if obj.equal?(::ENV)\n" ++
+    "          raise TypeError, \"no _dump_data is defined for class ARGF.class\" if defined?(::ARGF) && obj.equal?(::ARGF)\n" ++
+    "          # a Time whose _dump is gone is T_DATA: _dump_data's answer under 'd'\n" ++
+    "          if ::Time === obj && obj.respond_to?(:_dump_data, true)\n" ++
+    "            v = obj.__send__(:_dump_data)\n" ++
+    "            klass(0x64, obj, true) # d\n" ++
+    "            object(v, limit)\n" ++
+    "            return\n" ++
+    "          end\n" ++
     "          if obj.is_a?(IO) || obj.is_a?(Dir)\n" ++
     "            raise TypeError, \"can't dump #\{obj.class}\"\n" ++
     "          end\n" ++
@@ -13571,11 +13606,13 @@ and stdlib_src = fn (name: str) ->
     "            raise TypeError, \"no _dump_data is defined for class #\{cn}\"\n" ++
     "          end\n" ++
     "          klass(0x6f, obj, true) # o\n" ++
-    "          names = ivar_names(obj)\n" ++
-    "          long(names.size)\n" ++
-    "          names.each do |nm|\n" ++
+    "          # the values as they were when the object's turn came: a child's\n" ++
+    "          # marshal_dump may remove one of them (Bug #15968)\n" ++
+    "          pairs = ivar_names(obj).map \{ |nm| [nm, obj.instance_variable_get(nm)] }\n" ++
+    "          long(pairs.size)\n" ++
+    "          pairs.each do |nm, x|\n" ++
     "            symbol(nm)\n" ++
-    "            object(obj.instance_variable_get(nm), limit)\n" ++
+    "            object(x, limit)\n" ++
     "          end\n" ++
     "        end\n" ++
     "      end\n" ++
@@ -13594,15 +13631,46 @@ and stdlib_src = fn (name: str) ->
     "      @proc = proc\n" ++
     "      @freeze = freeze\n" ++
     "      @partial = (proc || freeze) ? \{} : nil\n" ++
+    "      # an IO source is read ahead the way marshal.c's load_arg does: the\n" ++
+    "      # elements an Array or a Hash still owes are bytes that must come, so\n" ++
+    "      # while any are owed a byte comes from one #read into a buffer\n" ++
+    "      @readable = 0\n" ++
+    "      @buf = \"\".b\n" ++
+    "      @bufsize = 1024\n" ++
     "    end\n" ++
     "\n" ++
     "    def too_short = raise(ArgumentError, \"marshal data too short\")\n" ++
+    "\n" ++
+    "    # r_byte1_buffered / r_bytes1_buffered\n" ++
+    "    def buffered?\n" ++
+    "      !@str && (@readable > 0 || !@buf.empty?)\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    def buf_fill(n)\n" ++
+    "      s = @src.read(n)\n" ++
+    "      too_short if s.nil?\n" ++
+    "      s.b\n" ++
+    "    end\n" ++
+    "\n" ++
+    "    def r2k_flag\n" ++
+    "      @r2k.each \{ |h| Marshal.__r2k(h) } if @r2k\n" ++
+    "    end\n" ++
     "\n" ++
     "    def byte\n" ++
     "      if @str\n" ++
     "        too_short if @pos >= @src.bytesize\n" ++
     "        b = @src.getbyte(@pos)\n" ++
     "        @pos += 1\n" ++
+    "        b\n" ++
+    "      elsif buffered?\n" ++
+    "        if @buf.empty?\n" ++
+    "          n = @readable < @bufsize ? @readable : @bufsize\n" ++
+    "          s = buf_fill(n)\n" ++
+    "          too_short if s.bytesize < n\n" ++
+    "          @buf = s\n" ++
+    "        end\n" ++
+    "        b = @buf.getbyte(0)\n" ++
+    "        @buf = @buf.byteslice(1, @buf.bytesize - 1)\n" ++
     "        b\n" ++
     "      else\n" ++
     "        b = @src.getbyte\n" ++
@@ -13639,6 +13707,21 @@ and stdlib_src = fn (name: str) ->
     "        s = @src.byteslice(@pos, len)\n" ++
     "        @pos += len\n" ++
     "        s.b\n" ++
+    "      elsif buffered?\n" ++
+    "        if len <= @buf.bytesize\n" ++
+    "          s = @buf.byteslice(0, len)\n" ++
+    "          @buf = @buf.byteslice(len, @buf.bytesize - len)\n" ++
+    "          s\n" ++
+    "        else\n" ++
+    "          need = len - @buf.bytesize\n" ++
+    "          r = @readable + 1\n" ++
+    "          r = @bufsize if r > @bufsize\n" ++
+    "          t = buf_fill(need > r ? need : r)\n" ++
+    "          too_short if t.bytesize < need\n" ++
+    "          s = @buf + t.byteslice(0, need)\n" ++
+    "          @buf = t.byteslice(need, t.bytesize - need)\n" ++
+    "          s\n" ++
+    "        end\n" ++
     "      else\n" ++
     "        s = @src.read(len)\n" ++
     "        too_short if s.nil? || s.bytesize != len\n" ++
@@ -13757,8 +13840,12 @@ and stdlib_src = fn (name: str) ->
     "        if (e = enc_for(k, v))\n" ++
     "          obj.force_encoding(e) if obj.respond_to?(:force_encoding) && obj.encoding != e\n" ++
     "          had = true\n" ++
-    "        elsif k == \"ruby2_keywords_flag\"\n" ++
+    "        elsif k == \"K\"\n" ++
+    "          # the ruby2_keywords flag (name_s_ruby2_keywords_flag is \"K\")\n" ++
     "          raise ArgumentError, \"ruby2_keywords flag is given but #\{obj.inspect} is not a Hash\" unless Hash === obj\n" ++
+    "          # (flagged when the load is over: handing the Hash on as an argument\n" ++
+    "          # until then would take the keywords mark off it again)\n" ++
+    "          (@r2k ||= []) << obj if v\n" ++
     "        elsif @hidden && !k.start_with?(\"@\")\n" ++
     "          @hidden[k] = v\n" ++
     "        elsif Exception === obj && !k.start_with?(\"@\")\n" ++
@@ -13779,6 +13866,9 @@ and stdlib_src = fn (name: str) ->
     "          end\n" ++
     "        elsif defined?(::Range) && Range === obj && !k.start_with?(\"@\")\n" ++
     "          (@range_parts ||= \{})[k] = v\n" ++
+    "        # a name that is no ivar's (\"KEY\") is an internal ivar in the\n" ++
+    "        # reference, set where no program sees it\n" ++
+    "        elsif !k.start_with?(\"@\")\n" ++
     "        else\n" ++
     "          obj.instance_variable_set(k.to_sym, v)\n" ++
     "        end\n" ++
@@ -13934,8 +14024,10 @@ and stdlib_src = fn (name: str) ->
     "        v = klass ? __alloc(klass, ::Array) : []\n" ++
     "        v = entry(v)\n" ++
     "        # rb_ary_push, not the class's own << or push\n" ++
-    "        len.times \{ Marshal.__push(v, object) }\n" ++
+    "        @readable += len - 1\n" ++
+    "        len.times \{ Marshal.__push(v, object); @readable -= 1 }\n" ++
     "        v = leave(v, partial)\n" ++
+    "        @readable += 1\n" ++
     "      when 0x7b, 0x7d\n" ++
     "        v = read_hash(type, partial, false, klass)\n" ++
     "      when 0x53 # S\n" ++
@@ -14010,6 +14102,9 @@ and stdlib_src = fn (name: str) ->
     "        v = entry(v)\n" ++
     "        data = object\n" ++
     "        v.__send__(:marshal_load, data)\n" ++
+    "        # r_copy_ivar: the data's ivars the loaded object does not have yet go\n" ++
+    "        # onto it (a frozen one refuses them with FrozenError)\n" ++
+    "        data.instance_variables.each \{ |n| v.instance_variable_set(n, data.instance_variable_get(n)) unless v.instance_variable_defined?(n) }\n" ++
     "        Marshal.__freeze(v) if @freeze\n" ++
     "        v = post_proc(v)\n" ++
     "        extmod.clear if extmod\n" ++
@@ -14093,11 +14188,14 @@ and stdlib_src = fn (name: str) ->
     "      v = klass ? __alloc(klass, ::Hash) : \{}\n" ++
     "      v.compare_by_identity if ident\n" ++
     "      v = entry(v)\n" ++
+    "      @readable += (len - 1) * 2\n" ++
     "      len.times do\n" ++
     "        k = object\n" ++
     "        val = object\n" ++
     "        STORE.bind_call(v, k, val)\n" ++
+    "        @readable -= 2\n" ++
     "      end\n" ++
+    "      @readable += 2\n" ++
     "      v.default = object if type == 0x7d\n" ++
     "      leave(v, partial)\n" ++
     "    end\n" ++
@@ -14133,8 +14231,12 @@ and stdlib_src = fn (name: str) ->
     "      end\n" ++
     "    end\n" ++
     "\n" ++
+    "    # A subclass's instance is the placeholder itself, initialized in place:\n" ++
+    "    # the object table already handed it out, so a Range that is its own\n" ++
+    "    # begin and end (a link back to it) is the same object afterwards.\n" ++
     "    def __range(c, b, e, excl, placeholder)\n" ++
-    "      r = c.equal?(::Range) ? ::Range.new(b, e, excl) : Marshal.__rng_init(c.allocate, b, e, excl)\n" ++
+    "      return Marshal.__rng_init(placeholder, b, e, excl) unless c.equal?(::Range)\n" ++
+    "      r = ::Range.new(b, e, excl)\n" ++
     "      placeholder.instance_variables.each \{ |n| r.instance_variable_set(n, placeholder.instance_variable_get(n)) }\n" ++
     "      r\n" ++
     "    end\n" ++
@@ -16734,6 +16836,12 @@ and definee_cls_of = fn env -> fn world ->
   else ""
 and is_sng_cls = fn (c: str) ->
   str_len c >= 5 && str_eq (substring c 0 5) "(sng:"
+// ...and the WHOLE name a singleton's: a class defined inside a singleton
+// class is "(sng:6f)::C", which starts the same way (is_sng_cls, which the
+// constant paths rely on) and is an ordinary class -- `C.singleton_class?` is
+// false, and Marshal calls it anonymous rather than a singleton
+and is_sng_whole = fn (c: str) ->
+  is_sng_cls c && str_eq (char_at c (str_len c - 1)) ")"
 and sng_inner = fn (c: str) -> substring c 5 (str_len c - 1)
 and collect_vis_go = fn world -> fn (anc: str list) -> fn names -> fn blocked ->
   fn (want: int) -> fn (recur: bool) -> fn (first: bool) ->

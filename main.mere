@@ -10985,9 +10985,18 @@ and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> 
      // the member lives in its SLOT, not in `@<member>` (struct_slot)
      let k = str_of_int oid ++ "@" ++ struct_slot m in
      let v = (if map_has iv k then map_get iv k else VNil) in
-     let piece = m ++ "=" ++ inspect_w env world v in
+     // (a member that is no local's or constant's name is written as its
+     // Symbol, rb_struct_inspect's rule: `#<struct :@a=1>`)
+     let piece = (if struct_mem_plain m 0 then m else inspect (VSym m)) ++ "=" ++ inspect_w env world v in
      struct_fields env world oid t (if str_eq acc "" then piece else acc ++ ", " ++ piece))
   | Cons (_, t) -> struct_fields env world oid t acc
+and struct_mem_plain = fn (m: str) -> fn (i: int) ->
+  if i >= str_len m then i > 0
+  else
+    let c = char_at m i in
+    if (i == 0 && is_digit c) then false
+    else if is_alnum c || str_eq c "_" || ord c >= 128 then struct_mem_plain m (i + 1)
+    else false
 
 // ⚠ The three joiners below build into a StrBuf. Each used to extend `acc`
 //   by one element per step, copying everything joined so far: `p` of a
@@ -17585,7 +17594,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if (str_len name == 15 && str_eq name "singleton_class") then VClass ("(sng:" ++ c ++ ")")
     // Module#singleton_class?: activesupport refuses to define module
     // attributes on one.
-    else if (str_len name == 16 && str_eq name "singleton_class?") then VBool (is_sng_cls c)
+    else if (str_len name == 16 && str_eq name "singleton_class?") then VBool (is_sng_whole c)
     // respond_to? on a class/module (also reachable via send) -- unless the
     // class defines its own singleton #respond_to?, which then answers.
     else if (str_len name == 11 && str_eq name "respond_to?")
@@ -18267,6 +18276,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // give every dumped String a class of its own.
     // Range#initialize on an allocated Range subclass instance, without the
     // subclass's own initialize (marshal.c's range_loader calls range_init)
+    // Marshal.__r2k(h): give a loaded Hash the ruby2_keywords flag IN PLACE
+    // (marshal.c's rb_hash_ruby2_keywords on the ivar "K"), since the object
+    // table already holds it
+    else if str_eq c "Marshal" && (str_len name == 5 && str_eq name "__r2k") then
+      (match args with
+       | Cons (VHsh h9, _) -> (let _ = map_set r2k_marks (str_of_int h9) VNil in let _ = mark_kw h9 in VHsh h9)
+       | _ -> VNil)
     else if str_eq c "Marshal" && (str_len name == 10 && str_eq name "__rng_init") then
       (match args with
        | Cons (r9, rest9) -> (let _ = rng_sub_init world r9 rest9 true in r9)
@@ -25376,7 +25392,8 @@ and ivar_name_val_r = fn env -> fn world -> fn (recv: Val) -> fn (v: Val) ->
   if str_eq s9 "" && (match v with VSym _ -> false | VStr _ -> false | _ -> true) then ivar_name_val env world v
   // (the name already converted is checked as it is: converting it again
   //  called #to_str a second time, which a counting object sees)
-  else if ivar_name_shaped s9 then ivar_name_checked world s9
+  // (and a Struct member's slot, which ivar_name_checked admits by its marker)
+  else if ivar_name_shaped s9 || (str_len s9 >= 2 && str_eq (char_at s9 0) "@" && struct_is_slot s9) then ivar_name_checked world s9
   else raise_exc_str_iv world "NameError" ("'" ++ s9 ++ "' is not allowed as an instance variable name")
          (Cons (("__name", v), Cons (("__recv", recv), Nil)))
 and raise_exc_str_iv = fn world -> fn (cls: str) -> fn (msg: str) -> fn (fields: (str * Val) list) ->
@@ -28237,7 +28254,8 @@ and respond_to_answer = fn env -> fn world -> fn (recv: Val) -> fn (args: Val li
           && (match recv with
               | VClass c8 ->
                 (let sng8 = "(sng:" ++ c8 ++ ")" in
-                 has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
+                 if map_has undef_names nm && undef_blocked world sng8 nm then false
+                 else has_meth world sng8 nm || (str_eq nm "new" && meth_private world sng8 "new"))
               | _ -> has_meth world c9 nm) then VBool true
   else rtm9 ()
 
@@ -28350,6 +28368,13 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
   //   dispatcher, not just Time. builtin_cls_has is the one list; asking it
   //   under the canonical name is what makes `Time.method(:gm) ==
   //   Time.method(:utc)` the same Method, which is what the specs compare.
+  // (a name the class's singleton chain undefines is not there, and a private
+  // singleton method -- Time._load -- is not answered publicly: `class << U;
+  // undef _load; end` left U.respond_to?(:_load, true) true, and Marshal then
+  // called it rather than refusing)
+  | VClass c when map_has undef_names name && undef_blocked world ("(sng:" ++ c ++ ")") name -> false
+  | VClass c when (if str_eq name "new" then false else has_meth world ("(sng:" ++ c ++ ")") name)
+                  && meth_private world ("(sng:" ++ c ++ ")") name -> false
   | VClass c ->
     ((str_len name == 3 && str_eq name "new") && (if meth_private world ("(sng:" ++ c ++ ")") "new" then false else true))
     || builtin_cls_has c (canon_alias c name)
@@ -37488,11 +37513,11 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
                               Cons (SReturn (EMethod (ESelf, "__struct_kw_init", Cons (EVar "__sa", Cons (EVar "__kw", Nil)))), Nil))
              // Positional members default to nil: Struct.new(:a, :b).new takes
              // 0..2 arguments in Ruby, filling what is missing.
-             else Meth (sappend members (Cons ("*__over", Nil)), struct_pos_defaults members,
+             else Meth (sappend (struct_pnames members 0) (Cons ("*__over", Nil)), struct_pos_defaults (struct_pnames members 0),
                         Cons (SIf (Cons ((EUn ("!", EMethod (EVar "__over", "empty?", Nil)),
                                           Cons (SExpr (ERaise (Cons (EConst "ArgumentError", Cons (EStrL "struct size differs", Nil)))), Nil)), Nil),
                                    Nil),
-                              struct_init_body members))) in
+                              struct_init_body members 0))) in
   let toa = Cons (SReturn (EArr (struct_ivar_reads members)), Nil) in
   let _ = set_meth meths (anon ++ "#to_a") (Meth (Nil, Nil, toa)) in
   let _ = set_meth meths (anon ++ "#to_ary") (Meth (Nil, Nil, toa)) in
@@ -37534,7 +37559,9 @@ and struct_build = fn world -> fn (parent: str) -> fn (args: Val list) ->
                 // is Apple::Computer when Apple < Struct), and replacing one
                 // that exists says so, in ruby's words
                 (let cn = (if str_eq parent "" then "Struct" else parent) ++ "::" ++ nm9 in
-                 let _ = (if map_has consts cn then rb_warn world ("redefining constant " ++ cn) else ()) in
+                 // (the warning names the receiver as ruby shows it: a class
+                 // made by Class.new is its constant's path, not AnonClass_k)
+                 let _ = (if map_has consts cn then rb_warn world ("redefining constant " ++ (if str_eq parent "" then "Struct" else to_s (VClass parent)) ++ "::" ++ nm9) else ()) in
                  let _ = map_set consts cn (VClass anon) in
                  name_anon cn (VClass anon)))
            | _ -> ()) in
