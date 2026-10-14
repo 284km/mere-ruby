@@ -2835,6 +2835,9 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (match (if lv_has env "self" then lv_get env "self" else VMain) with
        // in a class body it is Module#ruby2_keywords (mod_ruby2_keywords)
        | VClass c9 -> mod_ruby2_keywords env world c9 args
+       // ...and at the top level it is Object's: a top-level def is a private
+       // method of Object, refused and warned about the same way
+       | VMain -> mod_ruby2_keywords env world "Object" args
        | _ -> (let _ = (match args with Cons (VSym s, _) -> map_set r2k_methods s VNil | _ -> ()) in
                (match args with Cons (a, _) -> a | _ -> VNil)))
     else if (str_len name == 15 && str_eq name "local_variables") && (if map_has meths name then false else true) then local_vars_of env
@@ -4842,6 +4845,11 @@ and hsh_eval_items = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
 // bind index values to hidden temp vars (__opi0..) in e2 for op-assign, and
 // return EVar references to them (so the index is not re-evaluated).
 
+and only_block_pass = fn (items: Expr list) ->
+  match items with
+  | Nil -> true
+  | Cons (EBlockPass _, t) -> only_block_pass t
+  | _ -> false
 and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
   match items with
   | Nil -> Nil
@@ -4884,8 +4892,10 @@ and eval_args = fn env -> fn world -> fn blk -> fn (items: Expr list) ->
                   | v -> Cons (v, Nil)) in
     // a ruby2_keywords-flagged hash at the END of a splat is keywords to the
     // callee (r2k_unflag_tail reads the note)
+    // -- only when the splat IS the end: `yield(*v, **kw)` (pp's seplist)
+    //    passes the hash positionally, whatever follows it
     let _ = (match vlast spread with
-             | VHsh lh9 -> (if map_has r2k_marks (str_of_int lh9) then map_set r2k_splat lh9 1 else ())
+             | VHsh lh9 -> (if map_has r2k_marks (str_of_int lh9) && only_block_pass t then map_set r2k_splat lh9 1 else ())
              | _ -> ()) in
     list_append spread (eval_args env world blk t)
   // **h passes the hash's pairs as keyword args: a fresh, kwarg-marked copy
@@ -6088,6 +6098,11 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
 // the same peel, when only the parameter list matters (a block that becomes a
 // method body: the marker is bookkeeping, not a parameter).
 
+and blk_head_pos = fn (body: Stmt list) ->
+  match body with
+  | Cons (SFile f, t) -> (let _ = cur_file_set f in blk_head_pos t)
+  | Cons (SLine n, _) -> cur_line_set n
+  | _ -> ()
 and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // consume any pending forwarded-block home: a `&proc` passed to a BUILTIN
   // (e.g. arr.each(&p)) sets pending_home but never reaches bind_params, so
@@ -6189,6 +6204,15 @@ and run_block = fn world -> fn encl -> fn theblk -> fn (argvals: Val list) ->
   // an explicit-empty param list (`{ || .. }` / `-> () { .. }`) runs with zero
   // params; the sentinel only served to reject numbered params at parse time.
   let params = (match params with Cons (m, Nil) -> if str_eq m empty_bp_marker then (Nil : str list) else params | _ -> params) in
+  // (a raise while binding is the block's, at the line and in the file the
+  //  block was written in -- its body's first SFile and SLine -- as ruby
+  //  reports `unknown keyword` for `proc {|a:| a}`; the caller's line was
+  //  still the current one)
+  let _ = (match params with Nil -> () | _ -> blk_head_pos body) in
+  // ...and a lambda's own arity refusal is the lambda's: the builtin that
+  // called it (Proc#call, an each) is not put on top of it
+  let _ = (if is_lam && map_has struct_ctr "bd" && map_get struct_ctr "bd" >= cd_get ()
+           then bi_reg_set "" VNil (0 - 1) else ()) in
   let _ = if is_lam then lambda_arity_check_args world params body argvals else () in
   // The block's params and the locals it first assigns are block-local, so
   // the body runs in a FRESH frame chained to the block's defining scope.
@@ -22338,7 +22362,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // ...and for one Method#to_proc made, whose parameters are the
        // method's (its closure holds the Method object)
        let fm9 = (match proc_get (str_of_int pid) with (_, _, _, ce9) -> lv_has ce9 "__m_meth") in
-       let _ = (if fm9 then rb_warn world "Skipping set of ruby2_keywords flag for proc (proc created from method)"
+       // (a Symbol's proc is no block of ruby code: rb_proc_ruby2_keywords's
+       // default arm)
+       let _ = (if map_has proc_symsrc (str_of_int pid) then rb_warn world "Skipping set of ruby2_keywords flag for proc (proc not defined in Ruby)"
+                else if fm9 then rb_warn world "Skipping set of ruby2_keywords flag for proc (proc created from method)"
                 else if ok9 then map_set r2k_procs (r2k_root (str_of_int pid)) VNil
                 else rb_warn world "Skipping set of ruby2_keywords flag for proc (proc accepts keywords or post arguments or proc does not accept argument splat)") in
        recv)
@@ -22439,7 +22466,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       // a lambda checks arity strictly (procs stay lenient).
       let _ =
         if map_has lambda_ids (str_of_int pid) then
-          (match theblk with (h2, ps, b2, e2) -> lambda_arity_check_args world (strip_marker_params ps) b2 args)
+          (match theblk with (h2, ps, b2, e2) -> lam_check_m world pid (strip_marker_params ps) b2 args)
         else () in
       if map_has lambda_ids (str_of_int pid) then
         // a lambda is method-like: it establishes a return-boundary frame, so a
@@ -23277,6 +23304,19 @@ and numbered_misuse_exprs = fn (es: Expr list) ->
 // belongs to the keyword parameters, and counting it as positional made
 // `->(x: 3){ }.call(x: 9)` "wrong number of arguments (given 1, expected 0)".
 // Both places that check a lambda's arity go through this.
+// the arity check of a lambda called through Proc#call, with the lambda
+// marked as the frame its refusal belongs to (see bind_mark_p)
+and lam_check_m = fn world -> fn (pid: int) -> fn (ps: str list) -> fn (body: Stmt list) -> fn (args: Val list) ->
+  let pd9 = vec_get bind_mark_v 0 in
+  let pk9 = (if pd9 >= 0 then map_get bind_mark_s "k" else "") in
+  let pp9 = vec_get bind_mark_p 0 in
+  let _ = vec_set bind_mark_v 0 (cd_get ()) in
+  let _ = map_set_s bind_mark_s "k" "" in
+  let _ = vec_set bind_mark_p 0 pid in
+  let _ = lambda_arity_check_args world ps body args in
+  let _ = vec_set bind_mark_v 0 pd9 in
+  let _ = vec_set bind_mark_p 0 pp9 in
+  if pd9 >= 0 then map_set_s bind_mark_s "k" pk9 else ()
 and lambda_arity_check_args = fn world -> fn (ps: str list) -> fn (body: Stmt list) -> fn (args: Val list) ->
   let wants_kw9 = (match kw_params ps with
                    | Nil -> (if str_eq (dsplat_name ps) "" then false else true)
@@ -28157,7 +28197,13 @@ and r2k_unflag_tail = fn (args: Val list) ->
   match last9 args with
   | VHsh id ->
     (if map_has r2k_marks (str_of_int id) && map_has r2k_splat id
-     then rev_vals (Cons (mkhash (hderef id), (match rev_vals args with Cons (_, t9) -> t9 | Nil -> (Nil : Val list))))
+     then
+       (let rest9 = (match rev_vals args with Cons (_, t9) -> t9 | Nil -> (Nil : Val list)) in
+        // ...and an EMPTY one is no keywords at all, which pass nothing
+        // (`args.last.clear; opt(*args)` reaches opt's default)
+        match hderef id with
+        | Nil -> rev_vals rest9
+        | prs9 -> rev_vals (Cons (mkhash prs9, rest9)))
      else args)
   | _ -> args
 // A module nested in an anonymous one is named through it (`#<Module:0x..>::N`,
@@ -36179,7 +36225,7 @@ and call_method = fn env -> fn world -> fn blk -> fn (name: str) -> fn (args: Va
              if str_eq n9 "" then () else map_set frame "__nest" (frame_text n9)) in
     // the refinements the method was WRITTEN under (see ref_enter_meth)
     let rfprev9 = (if ref_on () then ref_enter_meth frame crefv9 else 0 - 1) in
-     let _ = bind_params frame world blk name params defaults args in
+     let _ = bind_params_m frame world blk name params defaults args in
      // a top-level method is a frame too, so `$~` is scoped to it as well.
      let mstate = rx_state_save () in
      let _ = fire_trace world "call" name "Object" in
@@ -36534,7 +36580,7 @@ and run_meth = fn world -> fn blk -> fn (recv: Val) -> fn (defcls: str) -> fn (n
                else (let pv = arr_new (param_names_vals params) in
                      let _ = map_set meth_params dk pv in
                      pv)) in
-    let _ = bind_params frame world blk name params defaults args in
+    let _ = bind_params_m frame world blk name params defaults args in
     // `$~` (and with it $1..$9, $&, $`, $') belongs to the frame that matched:
     // ruby makes a method's match invisible to its caller, and the caller's
     // invisible to the method. A block is NOT a frame here -- it shares the
@@ -43096,6 +43142,25 @@ and bind_kw_params = fn frame -> fn world -> fn blk -> fn (kws: str list) -> fn 
             else if has_default defaults p then eval_e frame world blk (get_default defaults p) else VNil in
     let _ = map_set frame nm v in bind_kw_params frame world blk rest defaults kwhash
 
+// bind_params for a METHOD call, with the callee marked as the frame a raise
+// made while binding belongs to (bind_mark_v); the mark before it is put
+// back, since a default value may call another method that binds too.
+and bind_params_m = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params: str list) -> fn (defaults: (str * Expr) list) -> fn (args: Val list) ->
+  let pd9 = vec_get bind_mark_v 0 in
+  let pk9 = (if pd9 >= 0 then map_get bind_mark_s "k" else "") in
+  let pc9 = (if pd9 >= 0 then map_get bind_mark_s "c" else "") in
+  let pm9 = (if pd9 >= 0 then map_get bind_mark_s "m" else "") in
+  let _ = vec_set bind_mark_v 0 (cd_get ()) in
+  let _ = map_set_s bind_mark_s "k" name in
+  let _ = map_set_s bind_mark_s "c" (match (if map_has frame "__defcls" then map_get frame "__defcls" else VNil) with VClass c9 -> c9 | _ -> "") in
+  let _ = map_set_s bind_mark_s "m" (if map_has frame "__meth" then (match map_get frame "__meth" with VStr h9 -> sget h9 | _ -> "?") else "?") in
+  let _ = bind_params frame world blk name params defaults args in
+  let _ = vec_set bind_mark_v 0 pd9 in
+  if pd9 >= 0 then
+    (let _ = map_set_s bind_mark_s "k" pk9 in
+     let _ = map_set_s bind_mark_s "c" pc9 in
+     map_set_s bind_mark_s "m" pm9)
+  else ()
 and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params0: str list) -> fn (defaults: (str * Expr) list) -> fn (args00: Val list) ->
   // ⚠ a ruby2_keywords-FLAGGED hash splatted into a method that takes no
   //   keywords arrives as a plain positional COPY: ruby converts the keywords
@@ -43105,6 +43170,19 @@ and bind_params = fn frame -> fn world -> fn blk -> fn (name: str) -> fn (params
                if (match kw_params ps8 with Nil -> str_eq (dsplat_name ps8) "" | _ -> false)
                   && (if map_has r2k_methods (meth_base name) || str_list_has ps8 "*__fwd" then false else true)
                then r2k_unflag_tail args00 else args00) in
+  // ...and into one that DOES take keywords, the flagged hash splatted at the
+  // end is keywords, whatever has been done with it since it was flagged:
+  // passing it as a positional argument in between (an assert_same) took
+  // its keywords mark away, and `kwargs(*args)` then saw one positional Hash
+  let _ = (if map_len r2k_splat > 0 then
+             (let ps8 = strip_block_params params0 in
+              let wants8 = (match kw_params ps8 with Nil -> (if str_eq (dsplat_name ps8) "" then false else true) | _ -> true) in
+              if wants8 then
+                (match vlast args0 with
+                 | VHsh id8 -> (if map_has r2k_marks (str_of_int id8) && map_has r2k_splat id8 then mark_kw id8 else ())
+                 | _ -> ())
+              else ())
+           else ()) in
   // (the splat notes are this call's; none may outlive it)
   let _ = (if map_len r2k_splat > 0 then map_clear r2k_splat else ()) in
   // a block forwarded as `&proc` carries its home frame in pending_home;
@@ -45773,6 +45851,18 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
 
 // a Val list with every string equal to `s` removed.
 
+// the scope a `def` RUN AS A STATEMENT captures: inside a method that is the
+// method's own (the frame's __cref and __nest, what its constants already
+// resolve through), not whatever scope was live when it was called --
+// `class TC; K = 1; def m; def self.a = K; end; end` left a's cref the
+// caller's, and K "uninitialized" there.
+and lex_pack_env = fn env ->
+  if lv_has env "__meth" && lv_has env "__cref" then
+    (let c9 = (match lv_get env "__cref" with VStr h9 -> sget h9 | _ -> "") in
+     let n9 = (if lv_has env "__nest" then (match lv_get env "__nest" with VStr h9 -> sget h9 | _ -> "") else "") in
+     let rid9 = (if map_len ref_flag == 0 then 0 else ref_cur_id ()) in
+     c9 ++ chr 13 ++ n9 ++ (if rid9 > 0 then chr 14 ++ str_of_int rid9 else ""))
+  else lex_pack ()
 and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
   match s with
   // A line marker: remember where we are, and answer VNil. The parser puts it
@@ -46141,7 +46231,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
        else name) in
     let _ = warn_redef world key (meth_base name) in
     let _ = set_meth meths key (Meth (params, defs, body)) in
-    let _ = map_set meth_cref key (lex_pack ()) in
+    let _ = map_set meth_cref key (lex_pack_env env) in
     let _ = stamp_meth_src key in
     // ...and a def run as a STATEMENT inside a class scope (an eval'd body, a
     // block in the body) takes that scope's default visibility ("__vis", see
@@ -46158,7 +46248,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                    else if str_eq m9 "module_function" then
                      (let mk9 = "(sng:" ++ c9 ++ ")#" ++ name in
                       let _ = set_meth meths mk9 (Meth (params, defs, body)) in
-                      let _ = map_set meth_cref mk9 (lex_pack ()) in
+                      let _ = map_set meth_cref mk9 (lex_pack_env env) in
                       map_set privates key VNil)
                    else ())
                 else ())
@@ -46176,7 +46266,7 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
                 && (if str_len name > 5 && str_eq (substring name 0 5) "self." then false else true)
              then (let ok = "Object#" ++ name in
                    let _ = set_meth meths ok (Meth (params, defs, body)) in
-                   let _ = map_set meth_cref ok (lex_pack ()) in
+                   let _ = map_set meth_cref ok (lex_pack_env env) in
                    let _ = stamp_meth_src ok in
                    if map_has tl_vis "v" && (match map_get tl_vis "v" with VBool b -> b | _ -> false)
                    then (if map_has privates ok then map_delete privates ok else ())
