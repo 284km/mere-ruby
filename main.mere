@@ -874,6 +874,8 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter lz_brk mk in
   // (defined?'s shared answers)
   let _ = map_iter defined_ans mk in
+  // (Symbol#to_proc's procs, one per symbol)
+  let _ = map_iter sym_proc_cache mk in
   // the receiver of the builtin running now (bi_reg_r, one slot): it is
   // asked for its class when a refusal names the builtin
   let _ = gc_mark_val live (bi_reg_recv ()) in
@@ -4161,7 +4163,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              else VNil)
           | _ -> VNil)
        | VObj _ when rx_sub_held world va0 -> invoke_val_c env world blk va0 "=~" (Cons (vb, Nil)) false
-       | VSym sv -> (match vb with VRegex (p, pf, _) -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
+       // (...and anything else on the right is its String's question: `:foo
+       //  =~ o` asks o's #=~ with "foo", `:foo =~ "foo"` is a type mismatch)
+       | VSym sv -> (match vb with
+                     | VRegex (p, pf, _) -> rx_do_match world p pf sv (sym_enc_name sv)
+                     | VStr _ -> raise_exc world "TypeError" "type mismatch: String given"
+                     | VObj _ -> invoke_val_c env world blk vb "=~" (Cons (mkstr sv, Nil)) false
+                     | _ -> VNil)
        | VRegex (p, pf, _) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
        | _ -> VNil)
     else if str_eq op "!~" then
@@ -7887,9 +7895,20 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
      // then that + step -- with <=> deciding the direction; see
      // Range#__step_generic in the prelude. (Numbers and Strings keep their
      // own walks below.)
-     else if (str_len name == 4 && str_eq name "step") && (match lo with VObj _ -> true | _ -> false) then
+     else if (str_len name == 4 && str_eq name "step")
+             && ((match lo with VObj _ -> true | _ -> false)
+                 // (...or a number up to an OBJECT end, which compares by
+                 //  coercing: `(100..num).step(10)` is [100])
+                 || ((match hi with VObj _ -> true | _ -> false) && (match lo with VInt _ -> true | VBig _ -> true | VFlt _ -> true | _ -> false))) then
        (let benv9 = (match encl with (_, _, _, e7) -> e7) in
         invoke_with_block benv9 world encl recv "__step_generic" args theblk)
+     // ...and a SYMBOL range with an Integer step walks as its String range
+     // does (`(:a..:g).step(2)` is :a, :c, :e, :g); it had no arm at all
+     else if (str_len name == 4 && str_eq name "step") && (match lo with VSym _ -> true | _ -> false)
+             && (match hi with VSym _ -> true | VNil -> true | _ -> false)
+             && (match args with Cons (VInt _, _) -> true | Nil -> true | _ -> false) then
+       (let benv9 = (match encl with (_, _, _, e7) -> e7) in
+        invoke_with_block benv9 world encl recv "__step_sym" (match args with Nil -> Cons (VInt 1, Nil) | _ -> args) theblk)
      // ...and so does a RATIONAL step between integer bounds: ruby adds it,
      // so `(1..3).step(1r)` yields 1, (2/1), (3/1). The integer walk asked for
      // an Integer step and raised. (A Float bound makes it a Float walk, below.)
@@ -7972,6 +7991,14 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
      // (an exclusive end at int64's minimum has nothing below it to step back
      // to: `hi - 1` would be the maximum, and `(-2**63...-2**63).each` walked
      // every int64 -- see reverse_each)
+     // ...and a RATIONAL end bounds an Integer walk, floored (`Range.new(1,
+     // 5r, true).each` is 1 to 4), as #size already counts it
+     else if rng_is_int lo && (str_len name == 4 && str_eq name "each")
+             && (match hi with VRat (_, _) -> true | _ -> false)
+             && (match norm_big (rng_int_top hi excl) with VInt _ -> true | _ -> false) then
+       (match norm_big (rng_int_top hi excl) with
+        | VInt t9 -> iter_each_result (range_each world encl theblk (rng_int lo) t9) recv
+        | _ -> recv)
      else if rng_is_int lo && rng_is_int hi && excl && rng_int hi == 0 - int_max - 1 then
        (if (str_len name == 4 && str_eq name "each") || (str_len name == 4 && str_eq name "step") then iter_each_result (FNext VNil) recv
         else via_arr_iter world encl theblk recv (arr_new Nil) name args)
@@ -11376,6 +11403,18 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     (match args0 with
      | Nil -> raise_exc world "ArgumentError" "step is required for non-numeric ranges"
      | _ -> raise_exc world "ArgumentError" "#step for non-numeric beginless ranges is meaningless")
+  // ...and so is a SYMBOL range, and a range with an OBJECT at either end and
+  // a step given (`(100..num).step(10)`, num coercing): the block form adds
+  // the step with <=> deciding (it was walked as integers, 11 elements)
+  else if str_eq name0 "step"
+          && (match args0 with Nil -> (match recv0 with VRange (VSym _, _, _) -> true | _ -> false) | _ -> true)
+          && (match recv0 with
+              | VRange (VSym _, _, _) -> true
+              | VRange (VObj _, _, _) -> true
+              | VRange (_, VObj _, _) -> true
+              | _ -> false)
+          && (let (mm9, _, _, _) = world in (if map_has mm9 "Range#step" then false else true)) then
+    make_enum_a world recv0 "step" args0
   // Range#step over STRINGS with no block is a plain Enumerator (not an
   // arithmetic sequence -- nothing is added), driven by the block form below.
   // It reached the leaf, which answered an Array of one Integer.
@@ -11398,6 +11437,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     (match recv0 with
      | VRange (_, _, _) ->
        raise_exc_iv world "FrozenError" ("can't modify frozen Range: " ++ inspect_w env world recv0) (Cons (("__recv", recv0), Nil))
+     // ...and so is an allocated one that was frozen before it was given
+     // its endpoints
+     | VObj oid9 when ofrozen_get oid9 ->
+       raise_exc_iv world "FrozenError" "can't modify frozen Range: nil..nil" (Cons (("__recv", recv0), Nil))
      | _ ->
        (let n9 = val_list_len args0 in
         if n9 < 2 || n9 > 3 then
@@ -11409,6 +11452,27 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              (if rng_bad_bounds world lo9 hi9 then raise_exc world "ArgumentError" "bad value for range"
               else VNil)
            | _ -> VNil)))
+  // an allocated Range that was never initialized has no endpoints yet:
+  // #begin and #end are nil and #exclude_end? false (Marshal asks all three)
+  else if (str_eq name0 "begin" || str_eq name0 "end" || str_eq name0 "exclude_end?")
+          && (match args0 with Nil -> true | _ -> false)
+          && (match recv0 with VObj _ -> str_eq (dispatch_cls_of world recv0) "Range" | _ -> false)
+          && (if has_meth world "Range" name0 then false else true) then
+    (if str_eq name0 "exclude_end?" then VBool false else VNil)
+  // Range#last(n) of a BEGINLESS range with an Integer end counts back from
+  // the end, as #max(n) does (ruby 4.0: `(..10).last(3)` is [8, 9, 10]); it
+  // went to the walk, which has no begin to start from
+  else if str_eq name0 "last"
+          && (match args0 with Cons (_, Nil) -> true | _ -> false)
+          && (match recv0 with
+              | VRange (VNil, hi9, _) -> (match hi9 with VInt _ -> true | VBig _ -> true | _ -> false)
+              | _ -> false) then
+    (match recv0 with
+     | VRange (_, hi9, ex9) ->
+       (let k9 = (match args0 with Cons (a9, _) -> rng_take_count world a9 false | _ -> 0) in
+        let top = rng_int_top hi9 ex9 in
+        arr_new (rev_app (rng_n_from top (big_sub_s top (str_of_int (k9 + 1))) (0 - 1) k9 Nil) Nil))
+     | _ -> VNil)
   // Range#min(n) / #max(n): arithmetic on integer endpoints, and a refusal on
   // anything else. Enumerating was both wrong (a bignum end answered []) and
   // unbounded (an endless range never returned).
@@ -20356,6 +20420,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     else if str_eq cls "Enumerator::ArithmeticSequence" && (str_len name == 5 && str_eq name "first")
             && (match (if map_has ivars (str_of_int id ++ "@__as_begin") then map_get ivars (str_of_int id ++ "@__as_begin") else VInt 0) with VNil -> true | _ -> false) then
       (match args with Nil -> VNil | _ -> raise_exc world "TypeError" "nil can't be coerced into Integer")
+    // ...and WALKING one (each, to_a and every Enumerable name) is the same
+    // TypeError -- the Float form's when an end or the step is a Float -- not
+    // the Range#step refusal the block form gives
+    else if str_eq cls "Enumerator::ArithmeticSequence"
+            && ((str_len name == 4 && str_eq name "each") || (str_len name == 4 && str_eq name "to_a") || (str_len name == 7 && str_eq name "entries")
+                || (is_enum_method name && (if (str_len name == 5 && str_eq name "first") || (str_len name == 4 && str_eq name "size") then false else true)))
+            && (match (if map_has ivars (str_of_int id ++ "@__as_begin") then map_get ivars (str_of_int id ++ "@__as_begin") else VInt 0) with VNil -> true | _ -> false) then
+      (let flt9 = (match (if map_has ivars (str_of_int id ++ "@__as_end") then map_get ivars (str_of_int id ++ "@__as_end") else VNil) with VFlt _ -> true | _ -> false)
+                  || (match (if map_has ivars (str_of_int id ++ "@__as_step") then map_get ivars (str_of_int id ++ "@__as_step") else VNil) with VFlt _ -> true | _ -> false) in
+       raise_exc world "TypeError" (if flt9 then "no implicit conversion to float from nil" else "nil can't be coerced into Integer"))
     else if str_eq cls "Enumerator::ArithmeticSequence"
             && ((str_len name == 5 && str_eq name "begin") || (str_len name == 3 && str_eq name "end") || (str_len name == 4 && str_eq name "step") || (str_len name == 12 && str_eq name "exclude_end?")
                 || (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_s") || (str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?") || (str_len name == 3 && str_eq name "===")
@@ -20544,6 +20618,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // `("A".."E").step(2).size` is nil, and `("A".."E").step("A")` -- legal
        // since 3.4 -- never ends, so materialising to count is not an option
        // either (it took the process out with it).
+       // (...except #reverse_each of an ENDLESS one, which has no end to start
+       //  from and refuses as the walk would: `("a"..).reverse_each.size`)
+       else if (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
+                | VRange (VStr _, VNil, _) ->
+                  (match (if map_has ivars (str_of_int id ++ "@meth") then map_get ivars (str_of_int id ++ "@meth") else VNil) with
+                   | VStr mh -> str_eq (sget mh) "reverse_each" | _ -> false)
+                | _ -> false) then raise_exc world "TypeError" "can't iterate from NilClass"
        else if (match (if map_has ivars (str_of_int id ++ "@recv") then map_get ivars (str_of_int id ++ "@recv") else VNil) with
                 | VRange (VStr _, _, _) -> true
                 | _ -> false) then VNil
@@ -22134,7 +22215,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       arr_new (Cons (arr_new (Cons (VSym "rest", Nil)), Nil))
     else if map_has curry_target (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
     // ...and has no binding: it was not written anywhere (ruby says C level)
-    else if (map_has curry_target (str_of_int pid) || map_has comp_inner (str_of_int pid)) && (str_len name == 7 && str_eq name "binding") then
+    // (so does Symbol#to_proc's)
+    else if (map_has curry_target (str_of_int pid) || map_has comp_inner (str_of_int pid) || map_has proc_symsrc (str_of_int pid)) && (str_len name == 7 && str_eq name "binding") then
       raise_exc world "ArgumentError" "Can't create Binding from C level Proc"
     else if map_has comp_inner (str_of_int pid) && (str_len name == 15 && str_eq name "source_location") then VNil
     // Proc#source_location: [file, line] of where the block was written, or nil
@@ -26030,6 +26112,9 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
            then invoke world nb (VObj oq) oclq "method_missing" (Cons (VSym "=~", Cons (recv, Nil)))
            else VNil)
         | _ -> VNil)
+     // Symbol#=~ is its String's (`:foo =~ o` asks o's #=~ with "foo", and
+     // `:foo =~ "foo"` is the same type mismatch)
+     | VSym s9 -> invoke_val_c env world blk (mkstr s9) name args false
      | _ -> VNil)
   // enumerable methods without a block return an Enumerator over recv.<name>
   // (Ruby: [1,2].map => #<Enumerator: [1, 2]:map>).
@@ -29138,6 +29223,9 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // object (rubocop-ast keeps `:positive?.to_proc` in a constant).
   else if (str_len name == 7 && str_eq name "to_proc") && (match recv with VSym _ -> true | _ -> false) then
     (match recv with
+     // ...one per symbol: ruby hands back the same Proc every time
+     // (`:itself.to_proc.equal?(:itself.to_proc)`)
+     | VSym sy when map_has sym_proc_cache sy -> map_get sym_proc_cache sy
      | VSym sy ->
        (let pid = (proc_next ()) in
         let _ = store_proc (str_of_int pid)
@@ -29154,6 +29242,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         // that a `return` inside it returns from IT. The marker in the params
         // makes it behave as one; lambda_ids is what #lambda? reads.
         let _ = map_set lambda_ids (str_of_int pid) VNil in
+        let _ = map_set sym_proc_cache sy (VProc pid) in
         VProc pid)
      | _ -> VNil)
   else if (str_len name == 5 && str_eq name "store") && (match recv with VHsh _ -> true | _ -> false) then
@@ -42321,7 +42410,15 @@ and rng_sub_init = fn world -> fn (recv: Val) -> fn (args: Val list) -> fn (from
   match recv with
   | VObj id ->
     (let n9 = val_list_len args in
-     if n9 < 2 || n9 > 3 then
+     // (range_modify asks about frozen first: `Range.allocate.freeze` refuses
+     //  to be initialized)
+     if ofrozen_get id then
+       raise_exc_iv world "FrozenError"
+         ("can't modify frozen " ++ display_cls_msg world (dispatch_cls_of world recv) ++ ": "
+          ++ (if map_has iv9 (str_of_int id ++ "@__rg_lo") then inspect (map_get iv9 (str_of_int id ++ "@__rg_lo")) else "nil")
+          ++ ".." ++ (if map_has iv9 (str_of_int id ++ "@__rg_hi") then inspect (map_get iv9 (str_of_int id ++ "@__rg_hi")) else "nil"))
+         (Cons (("__recv", recv), Nil))
+     else if n9 < 2 || n9 > 3 then
        raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected 2..3)")
      else if map_has iv9 (str_of_int id ++ "@__rg_lo") && (if from_super then false else true) then
        raise_exc world "NameError" "'initialize' called twice"
