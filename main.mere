@@ -3227,6 +3227,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
               | VClass c0 -> VClass c0 | _ -> VClass "") with
        | VClass c ->
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | _ -> "") in
+         let _ = warn_serious_redef world nm in
          // a top-level define_method goes where a top-level `def` goes: under
          // the bare name, which is what makes `method(:it)` find it.
          let key = (if str_eq c "" then nm else c ++ "#" ++ nm) in
@@ -7176,6 +7177,13 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
   let _ = chill_touch world recv name in
   if builtin_mut_on_frozen world recv name then
     raise_exc_iv world "FrozenError" ("can't modify frozen " ++ class_name recv ++ ": " ++ inspect recv) (Cons (("__recv", recv), Nil))
+  // Range#min / #max / #minmax with a block are `super` into Enumerable's,
+  // so with that one undef'd they have no superclass method
+  else if (match recv with VRange (_, _, _) -> true | _ -> false)
+          && (str_eq name "min" || str_eq name "max" || str_eq name "minmax")
+          && map_len undefs > 0 && map_has undefs ("Enumerable#" ++ name) then
+    raise_exc_iv world "NoMethodError" ("super: no superclass method '" ++ name ++ "' for an instance of Range")
+      (Cons (("__name", VSym name), Cons (("__recv", recv), Nil)))
   // min_by(n) / max_by(n): the n smallest (largest) by the block's key, in
   // order. The count was ignored on every builtin receiver -- an Array, a
   // Range, a Hash, an Enumerator answered the one best element. (A stable
@@ -10921,15 +10929,24 @@ and obj_ivar_dump_sel = fn env -> fn world -> fn (oid: int) -> fn (cls: str) -> 
 and ivar_dump_go = fn env -> fn world -> fn iv -> fn (oid: int) -> fn (names: str list) -> fn (acc: str) ->
   let b = strbuf_new () in
   let _ = strbuf_push b acc in
-  let rec go = fn (ns: str list) -> fn (first: bool) ->
+  // the VALUES are taken first too: an ivar's #inspect may remove the
+  // object's ivars (ruby's inspect shows a snapshot), and reading one that
+  // had gone killed the interpreter
+  let rec snap = fn (ns: str list) ->
     (match ns with
-     | Nil -> ()
+     | Nil -> (Nil : Val list)
      | Cons (n, t) ->
-       (let v = map_get iv (str_of_int oid ++ "@" ++ n) in
-        let x = inspect_w env world v in
+       (let k9 = str_of_int oid ++ "@" ++ n in
+        Cons ((if map_has iv k9 then map_get iv k9 else VNil), snap t))) in
+  let vals = snap names in
+  let rec go = fn (ns: str list) -> fn (vs: Val list) -> fn (first: bool) ->
+    (match (ns, vs) with
+     | (Cons (n, t), Cons (v, vt)) ->
+       (let x = inspect_w env world v in
         let _ = strbuf_push b ((if first then "" else ", ") ++ "@" ++ n ++ "=" ++ x) in
-        go t false)) in
-  let _ = go names (str_eq acc "") in
+        go t vt false)
+     | _ -> ()) in
+  let _ = go names vals (str_eq acc "") in
   strbuf_to_str b
 
 and struct_fields = fn env -> fn world -> fn (oid: int) -> fn (ms: Val list) -> fn (acc: str) ->
@@ -12051,6 +12068,10 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     (let c9u = dispatch_cls_of world recv in
      if has_meth world c9u "method_missing"
      then invoke world noblk recv c9u "method_missing" (Cons (VSym name, args))
+     // (an undef'd #method_missing called by name is rb_method_missing with
+     //  what it was given: none is "no method name given")
+     else if (str_len name == 14 && str_eq name "method_missing") && (match args with Nil -> true | _ -> false)
+     then raise_exc world "ArgumentError" "no method name given"
      // the exception CARRIES what failed: ruby's NoMethodError answers #name,
      // #args and #receiver, and this is the site that knows all three.
      else raise_exc_iv world "NoMethodError"
@@ -18511,6 +18532,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           | Cons (v, rest9) ->
             let n9 = sym_or_str_arg env world v in
             let _ = warn_serious world (if tomb then "undefining" else "removing") n9 in
+            // (undef_method writes an entry over the name, as `undef` does)
+            let _ = (if tomb then warn_serious_redef world n9 else ()) in
             let key = c ++ "#" ++ n9 in
             // ⚠ ...and both refuse a name that is not there, with DIFFERENT
             //   messages: remove_method wants the class's OWN definition
@@ -18932,6 +18955,21 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
       raise_exc world "TypeError" "can't instantiate uninitialized class"
     else if str_eq cls "Class" && (str_len name == 10 && str_eq name "superclass") then
       raise_exc world "TypeError" "uninitialized class"
+    // BasicObject#method_missing called by name on an object whose class
+    // defines none: it is PRIVATE (an explicit receiver is refused as such),
+    // and run -- by send, or once a class undef'd it -- it is the missing-name
+    // refusal itself: none given is "no method name given"
+    else if (str_len name == 14 && str_eq name "method_missing") && (if has_meth world cls name then false else true) then
+      (if vischeck then
+         raise_exc_iv world "NoMethodError" ("private method 'method_missing' called for " ++ for_recv_cls world cls)
+           (Cons (("__name", VSym name), Cons (("__args", arr_new args), Cons (("__recv", recv), Nil))))
+       else
+         (match args with
+          | Nil -> raise_exc world "ArgumentError" "no method name given"
+          | Cons (mn9, rest9) ->
+            (let nm9 = (match mn9 with VSym y9 -> y9 | VStr h9 -> sget h9 | _ -> inspect mn9) in
+             raise_exc_iv world "NoMethodError" ("undefined method '" ++ nm9 ++ "' for " ++ for_recv_cls world cls)
+               (Cons (("__name", VSym nm9), Cons (("__args", arr_new rest9), Cons (("__recv", recv), Nil)))))))
     else if has_meth world cls name then
       // ⚠ a visibility refusal is a MISSING method as far as #method_missing
       //   is concerned: ruby hands `obj.priv` to the object's method_missing
@@ -19116,6 +19154,24 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             else if str_eq mown "Module" && str_eq mnm "name" && (match args with Nil -> true | _ -> false)
                     && (match mrecv with VClass _ -> true | _ -> false) then
               (match mrecv with VClass c9 -> mod_name_val c9 | _ -> VNil)
+            // Kernel#inspect bound to a String, Array or Hash (a subclass's,
+            // typically) is Kernel's: the class, an address and the ivars --
+            // not the value's own inspect
+            else if str_eq mown "Kernel" && str_eq mnm "inspect" && (match args with Nil -> true | _ -> false)
+                    && (match mrecv with VStr _ -> true | VArr _ -> true | VHsh _ -> true | _ -> false) then
+              (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+               let ivs9 = (match invoke_val_c env world nb9 mrecv "instance_variables" Nil false with
+                           | VArr a9 -> deref a9 | _ -> Nil) in
+               let rec parts = fn (xs: Val list) ->
+                 (match xs with
+                  | Nil -> (Nil : str list)
+                  | Cons (VSym n9, t9) ->
+                    Cons (n9 ++ "=" ++ inspect_w env world (invoke_val_c env world nb9 mrecv "instance_variable_get" (Cons (VSym n9, Nil)) false), parts t9)
+                  | Cons (_, t9) -> parts t9) in
+               let ps9 = parts ivs9 in
+               let rec join = fn (xs: str list) -> (match xs with Nil -> "" | Cons (x9, Nil) -> x9 | Cons (x9, t9) -> x9 ++ ", " ++ join t9) in
+               mkstr ("#<" ++ cls_display world (obj_print_cls world (dispatch_cls_of world mrecv)) ++ ":0x" ++ hex_pad16 (val_hash mrecv)
+                      ++ (match ps9 with Nil -> "" | _ -> " " ++ join ps9) ++ ">"))
             // a KERNEL method bound to a BasicObject runs on it
             // (`Kernel.instance_method(:inspect).bind(bo).call`): the object
             // has no such method of its own, which is the refusal bo_refuses
@@ -23758,7 +23814,7 @@ and warn_redef = fn world -> fn (key: str) -> fn (name: str) ->
   if warn_internal_file (cur_file ()) then ()
   else
     (let _ = warn_perf_redef world key in
-     let _ = (if str_eq name "object_id" || str_eq name "__send__"
+     let _ = (if str_eq name "object_id" || str_eq name "__id__" || str_eq name "__send__"
               then rb_warn world ("redefining '" ++ name ++ "' may cause serious problems") else ()) in
      // (...only over a method a program wrote: one the prelude defined is
      // ruby's C method, and a stdlib file that redefines it -- pp.rb's
@@ -23821,8 +23877,14 @@ and perf_bop_keys = fn (u: unit) ->
 // (rb_undef, rb_remove_method): "undefining 'object_id' may cause serious
 // problems", unless $VERBOSE is nil
 and warn_serious = fn world -> fn (verb: str) -> fn (name: str) ->
-  if str_eq name "object_id" || str_eq name "__send__" || str_eq name "initialize"
+  if str_eq name "object_id" || str_eq name "__id__" || str_eq name "__send__" || str_eq name "initialize"
   then rb_warn world (verb ++ " '" ++ name ++ "' may cause serious problems")
+  else ()
+// define_method writes a method entry as def does, and ruby's entry-maker
+// warns for the same three names
+and warn_serious_redef = fn world -> fn (nm: str) ->
+  if (str_eq nm "object_id" || str_eq nm "__id__" || str_eq nm "__send__") && (if warn_internal_file (cur_file ()) then false else true)
+  then rb_warn world ("redefining '" ++ nm ++ "' may cause serious problems")
   else ()
 // (an undef writes an entry over the name, and for object_id and __send__
 // ruby's entry-maker then says "redefining" too)
@@ -23831,7 +23893,7 @@ and warn_serious_all = fn world -> fn (names: str list) ->
   | Nil -> ()
   | Cons (n, t) ->
     (let _ = warn_serious world "undefining" n in
-     let _ = (if str_eq n "object_id" || str_eq n "__send__"
+     let _ = (if str_eq n "object_id" || str_eq n "__id__" || str_eq n "__send__"
               then rb_warn world ("redefining '" ++ n ++ "' may cause serious problems") else ()) in
      warn_serious_all world t)
 and rb_verbose_nil = fn (u: unit) ->
@@ -24186,6 +24248,7 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          let _ = frz_cls_check world c in
          let (meths, sup, ocls, ivars) = world in
          let nm = (match args with Cons (VSym s, _) -> s | Cons (VStr s, _) -> sget s | _ -> "") in
+         let _ = warn_serious_redef world nm in
          let (h2, ps2, bb2, e2) = newblk in
          // the block's OPTIONAL parameters are its method's defaults: they
          // live in the body as a prologue, and a Meth with an empty defaults
@@ -42383,7 +42446,10 @@ and caller_locs = fn world -> fn (skip: int) -> fn (want: int) ->
   let b = fb_depth_base () in
   let here = loc_obj world (cur_file ()) (cur_line ())
                (frame_label_at cd) in
-  let all = (if cd <= b then Cons (here, (Nil : Val list)) else Cons (here, caller_loc_list world (cd - 1))) in
+  let all0 = (if cd <= b then Cons (here, (Nil : Val list)) else Cons (here, caller_loc_list world (cd - 1))) in
+  // (the main frame dropped in an exit handler, as caller_frames does)
+  let all = (if map_has in_exit_hooks "y" && cd > b && cd >= 1 && b == 0 && str_eq (frame_label_at 0) "<main>"
+             then vtake all0 (val_list_len all0 - 1) else all0) in
   (if want < 0 then vdrop all skip else vtake (vdrop all skip) want)
 
 
