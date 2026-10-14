@@ -1907,7 +1907,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           "const_missing" (Cons (VSym name, Nil)) false
       else raise_uninit_const world (if str_eq cref "" then "Object" else cref) name
              ("uninitialized constant " ++ (if str_eq cref "" then name else cref ++ "::" ++ name))
-  | EConstOrNil name -> if map_has consts name then map_get consts name else VNil
+  // (a top-level constant is keyed by its bare name: `Object::A ||= 10` and
+  //  `::A ||= 10` read it there, and reassigned one that was defined)
+  | EConstOrNil name ->
+    if map_has consts name then map_get consts name
+    else if str_len name > 8 && str_eq (substring name 0 8) "Object::" && map_has consts (substring name 8 (str_len name))
+    then map_get consts (substring name 8 (str_len name))
+    else if str_len name > 2 && str_eq (substring name 0 2) "::" && map_has consts (substring name 2 (str_len name))
+    then map_get consts (substring name 2 (str_len name))
+    else VNil
   | EScopedRead (recv_e, cn) ->
     (match eval_e env world blk recv_e with
      | VClass c ->
@@ -4433,8 +4441,16 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
                || (match vb with VFlt f7 -> (if f7 == f7 then false else true) | _ -> false) then
          VBool false
        // true, false and nil have no `<` at all: NoMethodError, as in ruby
+       // (with the name, receiver and argument NoMethodError answers: `e.name`
+       //  is :<, which the safe-navigator spec reads)
        else if (match va0 with VBool _ -> true | VNil -> true | _ -> false) then
-         raise_exc world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ inspect va0)
+         raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ inspect va0)
+           (Cons (("__name", VSym op), Cons (("__args", arr_new (Cons (vb, Nil))), Cons (("__recv", va0), Nil))))
+       // ...and an object whose class has no such operator (no Comparable, no
+       //   method of its own) is a NoMethodError too, not a failed comparison
+       else if (match va0 with VObj _ -> true | _ -> false) && (if responds world va0 op then false else true) then
+         raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for " ++ for_recv_cls world (dispatch_cls_of world va0))
+           (Cons (("__name", VSym op), Cons (("__args", arr_new (Cons (vb, Nil))), Cons (("__recv", va0), Nil))))
        else if cmp_incompatible va0 vb then
          raise_exc world "ArgumentError" ("comparison of " ++ class_name va0 ++ " with " ++ (if is_num vb then to_s vb else class_name vb) ++ " failed")
        else
@@ -4464,7 +4480,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
       else if (match va0 with VNil -> true | _ -> false)
               && (str_eq op "+" || str_eq op "-" || str_eq op "*" || str_eq op "/"
                   || str_eq op "%" || str_eq op "**" || str_eq op "<<" || str_eq op ">>")
-      then raise_exc world "NoMethodError" ("undefined method '" ++ op ++ "' for nil")
+      then raise_exc_iv world "NoMethodError" ("undefined method '" ++ op ++ "' for nil")
+             (Cons (("__name", VSym op), Cons (("__args", arr_new (Cons (vb, Nil))), Cons (("__recv", VNil), Nil))))
       // numeric (op) non-matching RHS: the coerce protocol. Arithmetic
       // (+,-,*,/,%,**) accepts any Numeric RHS; bitwise (&,|,^) accepts only
       // Integer/Bignum. A RHS the operator cannot take directly is coerced:
@@ -6033,6 +6050,12 @@ and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str lis
           // can be keeps the two apart.
           | Nil -> Cons ("(empty rescue splat)", rest2)
           | _ -> list_append_str names rest2)
+       // (anything else is converted with #to_a, as a splat is)
+       | VObj _ when responds world arr "to_a" ->
+         (match invoke_val_c env world blk arr "to_a" Nil false with
+          | VArr id -> list_append_str (class_names_of (deref id)) (expand_rescue_classes env world blk rest)
+          | _ -> expand_rescue_classes env world blk rest)
+       | VClass cn -> Cons (cn, expand_rescue_classes env world blk rest)
        | _ -> expand_rescue_classes env world blk rest)
     else if str_len c > 6 && str_eq (substring c 0 7) "@rexpr~" then
       // a non-constant class expression: evaluate; a Class/Module contributes
@@ -6052,6 +6075,20 @@ and expand_rescue_classes = fn env -> fn world -> fn blk -> fn (classes: str lis
           Cons ((if map_has consts r || map_has modules r then r else c),
                 expand_rescue_classes env world blk rest))
 
+// a rescue clause asks each class with #=== (ruby's rule): one whose
+// singleton defines its own === answers for itself, the rest by kind
+and rescue_matches_eqq = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn (classes: str list) ->
+  match classes with
+  | Nil -> rescue_matches world exc classes
+  | _ ->
+    let rec go9 = fn (cs: str list) ->
+      (match cs with
+       | Nil -> false
+       | Cons (c9, t9) ->
+         (if has_meth world ("(sng:" ++ c9 ++ ")") "==="
+          then truthy (invoke_val_c env world blk (VClass c9) "===" (Cons (exc, Nil)) false) || go9 t9
+          else rescue_matches world exc (Cons (c9, Nil)) || go9 t9)) in
+    go9 classes
 and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
   // (an exception that left a search or a tr half way leaves the character
   //  cutting at its encoding: put it back to UTF-8 -- cut_set, note 299)
@@ -6066,7 +6103,7 @@ and run_rescues = fn env -> fn world -> fn blk -> fn (exc: Val) -> fn rescues ->
   | Cons (rc, rest) ->
     let (classes0, var, handler) = rc in
     let classes = expand_rescue_classes env world blk classes0 in
-    if rescue_matches world exc classes then
+    if rescue_matches_eqq env world blk exc classes then
       // ⚠ the target can be a GLOBAL, and `$!`-style names do not live in the
       // frame: `rescue => $g` wrote a local called "$g" and left $g nil. An
       // @ivar target already worked (the ivar writer reads the @ off the name);
@@ -23269,7 +23306,10 @@ and numbered_misuse_stmts = fn (body: Stmt list) ->
   match body with Nil -> false | Cons (s, r) -> numbered_misuse_stmt s || numbered_misuse_stmts r
 and numbered_misuse_stmt = fn (s: Stmt) ->
   match s with
-  | SAssign (n, e) -> numbered_digit n > 0 || numbered_misuse_expr e
+  // (`_1 = 0`: ruby's "_1 is reserved for numbered parameters")
+  | SAssign (n, e) -> (if numbered_digit n > 0 then
+                         (let _ = (if map_has num_misuse_note "why" then () else map_set num_misuse_note "why" (n ++ " is reserved for numbered parameters")) in true)
+                       else numbered_misuse_expr e)
   | SExpr e -> numbered_misuse_expr e
   | SIVarAssign (_, e) -> numbered_misuse_expr e
   | SReturn e -> numbered_misuse_expr e
@@ -23405,7 +23445,12 @@ and nested_num_expr = fn (e: Expr) ->
 and nested_num_exprs = fn (es: Expr list) -> match es with Nil -> false | Cons (e, r) -> nested_num_expr e || nested_num_exprs r
 // a block using a numbered param whose body also has a nested block using one
 // is a SyntaxError ("numbered parameter is already used in outer block").
-and num_nested_bad = fn (bb: Stmt list) -> own_num_stmts bb > 0 && nested_num_stmts bb
+and num_nested_bad = fn (bb: Stmt list) ->
+  (let bad9 = own_num_stmts bb > 0 && nested_num_stmts bb in
+   // (in ruby's words, noted for the refusal as blk_num_bad does)
+   let _ = (if bad9 && (if map_has num_misuse_note "why" then false else true)
+            then map_set num_misuse_note "why" "numbered parameter is already used in outer block" else ()) in
+   bad9)
 
 and numbered_misuse_expr = fn (e: Expr) ->
   match e with

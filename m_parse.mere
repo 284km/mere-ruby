@@ -4409,10 +4409,8 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
      // anything before it in the same eval had already happened.
      | ESym nm when (let n9 = str_len nm in
                      n9 > 0 && (let lc = char_at nm (n9 - 1) in str_eq lc "!" || str_eq lc "?")) ->
-       (let _ = (if map_has prim_missing "i" then ()
-                 else map_set prim_missing "i"
-                        (mkstr ("mere-ruby: identifier " ++ nm ++ " is not valid to get"))) in
-        fail ("mere-ruby: identifier " ++ nm ++ " is not valid to get" ++ parsing_file ()))
+       (let _ = syn_refuse ("identifier " ++ nm ++ " is not valid to get") in
+        hash_items_sep (skip_nls r2) acc)
      | ESym nm -> hash_items_sep (skip_nls r2) (Cons (EVar nm, Cons (k, acc)))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad hash key")) in fail "mere-ruby: bad hash key"))
   else
@@ -4735,6 +4733,14 @@ and cond_in_pattern = fn (cr: (Expr * Tok list)) ->
   | _ -> (c, r)
 
 // `e rescue h` as an expression: a one-line begin/rescue around e
+// the value of an operator assignment takes a rescue modifier for itself:
+// `a += b rescue c` is `a += (b rescue c)` -- a plain `a = b rescue c` is the
+// whole statement's (apply_modifier)
+and opasgn_resc = fn (e: Expr) -> fn toks ->
+  match toks with
+  | Cons (TId w, r) when str_eq w "rescue" ->
+    (let (h, r2) = parse_expr r in (resc_wrap e (SExpr h), r2))
+  | _ -> (e, toks)
 and resc_wrap = fn (e: Expr) -> fn (h: Stmt) ->
   EStmt (SBegin (Cons (SExpr e, Nil), Cons ((Nil, "", Cons (h, Nil)), Nil), Nil, Nil))
 // ...around the LAST argument only (the value an attribute or index write stores)
@@ -5356,11 +5362,20 @@ and sassign_rhs = fn (id: str) -> fn toks ->
 
 // `break 1, 2` / `next a, b` — several values build an array.
 and flow_values = fn toks -> fn (mk: Expr -> Stmt) ->
-  let (es, r) = parse_rhs_list toks Nil in
+  let (es, r) = flow_rhs toks in
   (match es with
    | Cons (e, Nil) -> (match e with ESplat _ -> (mk (EArr es), r) | _ -> (mk e, r))
    | _ -> (mk (EArr es), r))
 
+// the value list of break / next / return. `break true or false` is
+// `(break true) or false`: the jump has no value to be the left side of
+// `or` / `and` -- ruby's "void value expression"
+and flow_rhs = fn toks ->
+  let (es, r) = parse_rhs_list toks Nil in
+  let _ = (match r with
+           | Cons (TId w, _) when str_eq w "or" || str_eq w "and" -> syn_refuse "void value expression"
+           | _ -> ()) in
+  (es, r)
 and parse_rhs_list = fn toks -> fn (acc: Expr list) ->
   let (e, r) =
     (match toks with
@@ -5382,6 +5397,14 @@ and opasgn_const_read = fn (base: str) -> fn (full: str) ->
   if str_eq base "||" then EConstOrNil full else EConst full
 
 and parse_stmt = fn toks ->
+  // a keyword that names a value is no variable: `nil = true` is ruby's
+  // "Can't assign to nil" (and `self = 1` "Can't change the value of self")
+  let _ = (match toks with
+           | Cons (TId w, Cons (TP eq, _)) when (str_eq eq "=" || (if str_eq (opassign_base eq) "" then false else true))
+                                                && (str_eq w "nil" || str_eq w "true" || str_eq w "false" || str_eq w "self"
+                                                    || str_eq w "__FILE__" || str_eq w "__LINE__" || str_eq w "__ENCODING__") ->
+             syn_refuse (if str_eq w "self" then "Can't change the value of self" else "Can't assign to " ++ w)
+           | _ -> ()) in
   if looks_like_multix toks then parse_multix toks
   else if looks_like_multi toks then parse_multi toks else
   match toks with
@@ -5739,21 +5762,21 @@ and parse_stmt_id = fn toks ->
        | Cons (TId w, _) ->
          if str_eq w "if" || str_eq w "unless" || str_eq w "while" || str_eq w "until" then (SReturn ENil, r)
          else
-           let (es, r2) = parse_rhs_list r Nil in
+           let (es, r2) = flow_rhs r in
            (match es with
             | Cons (e, Nil) -> (match e with ESplat _ -> (SReturn (EArr es), r2) | _ -> (SReturn e, r2))
             | _ -> (SReturn (EArr es), r2))
        | Cons (TP rp, _) ->
          if str_eq rp "}" || str_eq rp ")" || str_eq rp ";" then (SReturn ENil, r)
          else
-           let (es, r2) = parse_rhs_list r Nil in
+           let (es, r2) = flow_rhs r in
            (match es with
             // `return *x` returns an array (splat-coerced), like `return a, b`.
             | Cons (e, Nil) -> (match e with ESplat _ -> (SReturn (EArr es), r2) | _ -> (SReturn e, r2))
             | _ -> (SReturn (EArr es), r2))
        | _ ->
          // `return a, b` returns an array of the values.
-         let (es, r2) = parse_rhs_list r Nil in
+         let (es, r2) = flow_rhs r in
          (match es with
           | Cons (e, Nil) -> (match e with ESplat _ -> (SReturn (EArr es), r2) | _ -> (SReturn e, r2))
           | _ -> (SReturn (EArr es), r2)))
@@ -5832,7 +5855,8 @@ and parse_stmt_ident = fn toks -> fn (id: str) -> fn r ->
             | _ -> sassign_rhs id r2)
          else if not (str_eq (opassign_base p) "") && not (is_keyword id) && not (is_cap id) then
            // `var += expr` -> `var = var <op> expr`
-           let (e, r3) = parse_expr (skip_nls r2) in
+           let (e0, r30) = parse_expr (skip_nls r2) in
+           let (e, r3) = opasgn_resc e0 r30 in
            (SAssign (id, EBin (opassign_base p, EVar id, e)), r3)
          else if not (str_eq (opassign_base p) "") && is_cap id then
            // `Const op= expr` — a bare constant op-assign (nil read when undefined).
@@ -6547,10 +6571,10 @@ and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
       // newline, or end. Anything else (e.g. a leftover `+ 1` from `in 1 + 1`,
       // which a value pattern does not consume) is a SyntaxError in Ruby.
       let _ = (match r3 with
-               | Cons (TId g, _) -> if str_eq g "then" || is_block_stop g then () else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))) in fail ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))
+               | Cons (TId g, _) -> if str_eq g "then" || is_block_stop g then () else syn_refuse "expected a delimiter after the patterns of an `in` clause"
                | Cons (TNL _, _) -> ()
                | Cons (TEOF, _) -> ()
-               | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))) in fail ("mere-ruby: expected a delimiter after the patterns of an `in` clause" ++ parsing_file ()))) in
+               | _ -> syn_refuse "expected a delimiter after the patterns of an `in` clause") in
       let (b, r4) = parse_stmts (skip_then r3) Nil in
       parse_case_in subj r4 (Cons ((pat, guard, b), acc))
     else if str_eq id "else" then
@@ -6558,6 +6582,8 @@ and parse_case_in = fn (subj: Expr) -> fn toks -> fn acc ->
       (SCaseIn (subj, rev_app acc Nil, true, b), expect_kw r2 "end")
     else if str_eq id "end" then
       (SCaseIn (subj, rev_app acc Nil, false, Nil), r)
+    // (a `when` among the `in` clauses is ruby's "unexpected 'when'")
+    else if str_eq id "when" then (let _ = syn_refuse "unexpected 'when'" in (SCaseIn (subj, rev_app acc Nil, false, Nil), r))
     else (let __fm = ("mere-ruby: expected in/else/end in case, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated case/in" ++ parsing_file ()))) in fail ("mere-ruby: unterminated case/in" ++ parsing_file ()))
 
@@ -6603,7 +6629,7 @@ and pp_has_dup = fn (names: str list) ->
 and pp_has_real = fn (names: str list) ->
   match names with Nil -> false | Cons (n, rest) -> (if pp_us n then false else true) || pp_has_real rest
 and check_dup_vars = fn (p: Pat) ->
-  if pp_has_dup (pp_names p Nil) then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: duplicated variable name in pattern")) in fail "mere-ruby: duplicated variable name in pattern") else ()
+  if pp_has_dup (pp_names p Nil) then syn_refuse "duplicated variable name" else ()
 
 // `^name` may only pin a variable already bound to its LEFT in the pattern (or
 // a pre-existing local). Pinning a name that the SAME pattern binds later
@@ -6611,11 +6637,16 @@ and check_dup_vars = fn (p: Pat) ->
 and check_pin_order = fn (p: Pat) ->
   let all = pp_names p Nil in
   let (bad, _) = pp_pin_walk p all Nil in
-  if bad then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: no such local variable in pattern (pinned before bound)")) in fail "mere-ruby: no such local variable in pattern (pinned before bound)") else ()
+  if bad then syn_refuse ((match (if map_has parser_flags "pinbad" then map_get parser_flags "pinbad" else VNil) with VStr h9 -> sget h9 | _ -> "") ++ ": no such local variable") else ()
 and pp_pin_walk = fn (p: Pat) -> fn (all: str list) -> fn (seen: str list) ->
   match p with
   | PVar n -> (false, Cons (n, seen))
-  | PPin e -> (match e with EVar n -> ((pp_mem all n) && (if pp_mem seen n then false else true), seen) | _ -> (false, seen))
+  | PPin e -> (match e with
+               | EVar n -> (let b9 = (pp_mem all n) && (if pp_mem seen n then false else true) in
+                            // (the name, for ruby's "n: no such local variable")
+                            let _ = (if b9 then map_set parser_flags "pinbad" (mkstr n) else ()) in
+                            (b9, seen))
+               | _ -> (false, seen))
   | PSplatP n -> (false, if str_eq n "" then seen else Cons (n, seen))
   | PArrP es -> pp_pin_walk_list es all seen
   | PHashP (items, _) -> pp_pin_walk_hitems items all seen
@@ -6912,12 +6943,12 @@ and parse_hash_pat_kv = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) 
   // key: `label:` (identifier) or `"string":` (symbol key).
   let (key, r2) =
     (match toks with
-     | Cons (TId nm, Cons (TP colon, r0)) -> if str_eq colon ":" then (nm, r0) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected label in hash pattern" ++ parsing_file ()))) in fail ("mere-ruby: expected label in hash pattern" ++ parsing_file ()))
-     | Cons (TStrL s, Cons (TP colon, r0)) -> if str_eq colon ":" then (s, r0) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected label in hash pattern" ++ parsing_file ()))) in fail ("mere-ruby: expected label in hash pattern" ++ parsing_file ()))
+     | Cons (TId nm, Cons (TP colon, r0)) -> if str_eq colon ":" then (nm, r0) else (let _ = syn_refuse "expected a label as the key in the hash pattern" in ("", Nil))
+     | Cons (TStrL s, Cons (TP colon, r0)) -> if str_eq colon ":" then (s, r0) else (let _ = syn_refuse "expected a label as the key in the hash pattern" in ("", Nil))
      // a "string": key (double-quoted, no interpolation) lexes as `(s "" + s )`.
      | Cons (TP op, Cons (TStrL empty, Cons (TP plus, Cons (TStrL s, Cons (TP cp, Cons (TP colon, r0)))))) ->
-       if str_eq op "(s" && str_eq plus "+" && str_eq cp ")" && str_eq colon ":" then (s, r0) else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a label as the key in the hash pattern" ++ parsing_file ()))) in fail ("mere-ruby: expected a label as the key in the hash pattern" ++ parsing_file ()))
-     | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: expected a label as the key in the hash pattern" ++ parsing_file ()))) in fail ("mere-ruby: expected a label as the key in the hash pattern" ++ parsing_file ()))) in
+       if str_eq op "(s" && str_eq plus "+" && str_eq cp ")" && str_eq colon ":" then (s, r0) else (let _ = syn_refuse "expected a label as the key in the hash pattern" in ("", Nil))
+     | _ -> (let _ = syn_refuse "expected a label as the key in the hash pattern" in ("", Nil))) in
   // an omitted value (`a:`) binds the key name; otherwise parse a sub-pattern.
   // Do NOT skip newlines here: a newline / `;` ends a brace-less hash pattern
   // -- only inside braces may the value be on the next line.
@@ -6930,7 +6961,7 @@ and parse_hash_pat_kv = fn toks -> fn (acc: (str * Pat) list) -> fn (rest: str) 
      | Cons (TEOF, _) -> (PVar key, r2)
      | _ -> parse_pattern r2) in
   // Ruby rejects a duplicated key name in a hash pattern.
-  let _ = if pp_hitem_haskey acc key then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: duplicated key name in hash pattern")) in fail "mere-ruby: duplicated key name in hash pattern") else () in
+  let _ = if pp_hitem_haskey acc key then syn_refuse "duplicated key name" else () in
   hash_pat_sep r3 (Cons ((key, sub), acc)) rest
 
 and pp_hitem_haskey = fn (items: (str * Pat) list) -> fn (key: str) ->
@@ -7035,6 +7066,8 @@ and parse_whens = fn (subj: Expr) -> fn toks -> fn acc -> fn (seen: (str * int) 
       (SCase (subj, rev_app acc Nil, b), expect_kw r2 "end")
     else if str_eq id "end" then
       (SCase (subj, rev_app acc Nil, Nil), r)
+    // (and an `in` among the `when` clauses, "unexpected 'in'")
+    else if str_eq id "in" then (let _ = syn_refuse "unexpected 'in'" in (SCase (subj, rev_app acc Nil, Nil), r))
     else (let __fm = ("mere-ruby: expected when/else/end in case, got " ++ id ++ parsing_file ()) in let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm)
   | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unterminated case" ++ parsing_file ()))) in fail ("mere-ruby: unterminated case" ++ parsing_file ()))
 
