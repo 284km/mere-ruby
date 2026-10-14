@@ -7981,6 +7981,12 @@ and stdlib_src = fn (name: str) ->
     "    # ruby's set.c walks with #each_entry when the argument has one (a\n" ++
     "    # multi-value #each then arrives packed), #each otherwise\n" ++
     "    m = (Array === enum || Hash === enum || Set === enum || !enum.respond_to?(:each_entry)) ? :each : :each_entry\n" ++
+    "    # a subclass that redefines #add gets every element through it (set.c's\n" ++
+    "    # set_initialize calls add when it is not the builtin one)\n" ++
+    "    if !block && !self.class.equal?(Set) && !Set.instance_method(:add).eql?(method(:add).unbind)\n" ++
+    "      enum.__send__(m) \{ |x| add(x) }\n" ++
+    "      return\n" ++
+    "    end\n" ++
     "    if block\n" ++
     "      enum.__send__(m) \{ |x| @hash[block.call(x)] = true }\n" ++
     "    else\n" ++
@@ -8084,7 +8090,8 @@ and stdlib_src = fn (name: str) ->
     "    delete(o)\n" ++
     "  end\n" ++
     "\n" ++
-    "  def merge(*enums)\n" ++
+    "  def merge(*enums, **kw)\n" ++
+    "    raise ArgumentError, \"no keywords accepted\" unless kw.empty?\n" ++
     "    __modify!(:merge)\n" ++
     "    enums.each do |e|\n" ++
     "      Set.__enum!(e)\n" ++
@@ -8166,10 +8173,28 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "  alias_method :difference, :-\n" ++
     "\n" ++
+    "  # (set.c's: a set of the receiver's class built from the other, then each\n" ++
+    "  # of the receiver's elements toggled in it -- the class and the order)\n" ++
     "  def ^(other)\n" ++
     "    Set.__enum!(other)\n" ++
-    "    os = __as_set(other)\n" ++
-    "    (self | os) - (self & os)\n" ++
+    "    # (a Set argument toggles ITS elements in a copy of the receiver)\n" ++
+    "    if other.is_a?(Set)\n" ++
+    "      n = self.class.new(self)\n" ++
+    "      other.each \{ |o| n.add(o) unless n.delete?(o) }\n" ++
+    "      return n\n" ++
+    "    end\n" ++
+    "    n = self.class.new(other)\n" ++
+    "    each \{ |o| n.add(o) unless n.delete?(o) }\n" ++
+    "    n\n" ++
+    "  end\n" ++
+    "\n" ++
+    "  # rebuilds the table after elements changed their #hash\n" ++
+    "  def reset\n" ++
+    "    __modify!(:reset)\n" ++
+    "    h = \{}\n" ++
+    "    @hash.each_key \{ |k| h[k] = true }\n" ++
+    "    @hash = h\n" ++
+    "    self\n" ++
     "  end\n" ++
     "\n" ++
     "  def subset?(other)\n" ++
@@ -8213,7 +8238,24 @@ and stdlib_src = fn (name: str) ->
     "    # a set that compares by identity is not equal to one that does not, even\n" ++
     "    # when the members would compare equal either way\n" ++
     "    return false unless compare_by_identity? == other.compare_by_identity?\n" ++
-    "    size == other.size && to_a.all? \{ |x| other.include?(x) }\n" ++
+    "    return false unless size == other.size\n" ++
+    "    # (a pair already being compared is equal: a set that contains itself,\n" ++
+    "    # as rb_exec_recursive_paired answers)\n" ++
+    "    ids = Set.__eq_ids\n" ++
+    "    key = [object_id, other.object_id]\n" ++
+    "    return true if ids[key]\n" ++
+    "    ids[key] = true\n" ++
+    "    begin\n" ++
+    "      to_a.all? \{ |x| other.include?(x) }\n" ++
+    "    ensure\n" ++
+    "      ids.delete(key)\n" ++
+    "    end\n" ++
+    "  end\n" ++
+    "  def self.__eq_ids\n" ++
+    "    @__eq_ids ||= \{}\n" ++
+    "  end\n" ++
+    "  def self.__hash_ids\n" ++
+    "    @__hash_ids ||= \{}\n" ++
     "  end\n" ++
     "  alias_method :eql?, :==\n" ++
     "\n" ++
@@ -8231,8 +8273,28 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "  end\n" ++
     "\n" ++
+    "  # order-independent, and a set inside itself counts as nothing (it was\n" ++
+    "  # endless: to_a.hash asked the set's own #hash again)\n" ++
+    "  # (a recursion anywhere inside makes the OUTERMOST answer a constant, as\n" ++
+    "  # the Hash prelude does: a set that contains itself and a copy that\n" ++
+    "  # contains it hash alike, so they can compare equal)\n" ++
     "  def hash\n" ++
-    "    to_a.sort_by \{ |x| x.to_s }.hash\n" ++
+    "    ids = Set.__hash_ids\n" ++
+    "    throw ids[:__outer] if ids.key?(object_id)\n" ++
+    "    outer = !ids.key?(:__outer)\n" ++
+    "    ids[:__outer] = Object.new if outer\n" ++
+    "    ids[object_id] = true\n" ++
+    "    begin\n" ++
+    "      if outer\n" ++
+    "        r = catch(ids[:__outer]) \{ [size, to_a.map \{ |x| x.hash }.sort].hash }\n" ++
+    "        r.nil? ? 0 : r\n" ++
+    "      else\n" ++
+    "        [size, to_a.map \{ |x| x.hash }.sort].hash\n" ++
+    "      end\n" ++
+    "    ensure\n" ++
+    "      ids.delete(object_id)\n" ++
+    "      ids.delete(:__outer) if outer\n" ++
+    "    end\n" ++
     "  end\n" ++
     "\n" ++
     "  def freeze\n" ++
@@ -8396,8 +8458,9 @@ and stdlib_src = fn (name: str) ->
     "  end\n" ++
     "\n" ++
     "  def inspect\n" ++
-    "    exact = self.class == Set\n" ++
-    "    open = exact ? \"Set[\" : \"#<\" + self.class.to_s + \": \{\"\n" ++
+    "    # (Set::CoreSet's subclasses print as Set does, under their own name)\n" ++
+    "    exact = self.class == Set || self.class <= Set::CoreSet\n" ++
+    "    open = exact ? (self.class == Set ? \"Set\" : self.class.to_s) + \"[\" : \"#<\" + self.class.to_s + \": \{\"\n" ++
     "    close = exact ? \"]\" : \"}>\"\n" ++
     "    ids = Set.__insp_ids\n" ++
     "    return open + \"...\" + close if ids[object_id]\n" ++
@@ -8409,6 +8472,10 @@ and stdlib_src = fn (name: str) ->
     "    end\n" ++
     "  end\n" ++
     "  alias_method :to_s, :inspect\n" ++
+    "end\n" ++
+    "# ruby 4.0's core Set keeps the class the C implementation is, under a name\n" ++
+    "# of its own: a subclass of Set with no methods of its own\n" ++
+    "class Set::CoreSet < Set\n" ++
     "end\n" ++
     "\n" ++
     "module Enumerable\n" ++
