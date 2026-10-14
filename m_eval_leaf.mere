@@ -2760,8 +2760,14 @@ and raise_exc_list = fn world -> fn (cls: str) -> fn (msg: str) ->
   let _ = raise_exc world cls msg in Nil
 and range_to_a = fn (i: int) -> fn (last: int) ->
   if i > last then Nil else Cons (VInt i, range_to_a (i + 1) last)
-and rb_fmt_to_named = fn (mode: int) ->
-  if mode == 1 || mode == 2 then (let _ = prim_raise "ArgumentError" "named after unnumbered or numbered format" in 3) else 3
+// a named reference after a numbered or unnumbered one, refused in ruby's
+// words, naming the reference ("named<key>
+// after numbered", "named{key} after unnumbered(2)") -- asked BEFORE the
+// key is looked up, so a mixed format is not a KeyError
+and rb_fmt_to_named_k = fn (mode: int) -> fn (op: str) -> fn (key: str) -> fn (cl: str) -> fn (nextarg: int) ->
+  if mode == 2 then (let _ = prim_raise "ArgumentError" ("named" ++ op ++ key ++ cl ++ " after numbered") in 3)
+  else if mode == 1 then (let _ = prim_raise "ArgumentError" ("named" ++ op ++ key ++ cl ++ " after unnumbered(" ++ int_to_base nextarg 10 ++ ")") in 3)
+  else 3
 and rb_fmt_is_type = fn (c: str) ->
   map_has (name_set "rb_fmt_is_type") c
 and rb_fmt_posarg = fn (args: Val list) -> fn (k: int) ->
@@ -3121,36 +3127,91 @@ and round_half_even = fn (x: float) ->
   if frac > 0.5 then n + 1
   else if frac < 0.5 then n
   else if n - (n / 2) * 2 == 0 then n else n + 1
-and float_big_int_str = fn (f: float) -> float_big_go f 0
-and float_big_go = fn (f: float) -> fn (k: int) ->
-  if f >= 9007199254740992.0 then float_big_go (f / 2.0) (k + 1)
-  else big_mul_s (int_to_base (int_of_float f) 10) (big_pow "2" k "1")
-and fmt_float_abs = fn (av: Val) -> fn (prec: int) ->
-  let f0 = to_f av in
-  let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
-  // 10**19 does not fit in an int, so a precision past that is padded rather
-  // than computed (ruby prints the exact binary expansion there).
-  let prec = (if prec > 18 then 18 else prec) in
-  let pad0 = str_repeat "0" (if prec > 18 then prec - 18 else 0) in
-  let scalei = pow10i prec in
-  if f >= 9007199254740992.0 then
-    (if prec <= 0 then float_big_int_str f
-     else float_big_int_str f ++ "." ++ str_repeat "0" prec)
-  // the whole value scaled at once keeps a tie a tie (see fmt_sci_abs); only
-  // when that product leaves the int range is the split needed.
-  else if f * float_of_int scalei < 4600000000000000000.0 then
-    let si = round_half_even (f * float_of_int scalei) in
-    (if prec == 0 then int_to_base si 10
-     else
-       let ip = si / scalei in
-       let fp = si - ip * scalei in
-       int_to_base ip 10 ++ "." ++ pad_frac (int_to_base fp 10) prec)
+// --- %f, digit by digit -----------------------------------------------------
+// A value is carried as a digit string n and a scale s: n / 10**s, n >= 0.
+// `n` written with p decimals, the point placed p digits from the right
+and dec_place = fn (n: str) -> fn (p: int) ->
+  if p <= 0 then n
   else
-    let ip0 = int_of_float f in
-    let fr0 = round_half_even ((f - float_of_int ip0) * float_of_int scalei) in
-    let (ip, fp) = (if fr0 >= scalei then (ip0 + 1, fr0 - scalei) else (ip0, fr0)) in
-    (if prec == 0 then int_to_base ip 10
-     else int_to_base ip 10 ++ "." ++ pad_frac (int_to_base fp 10) prec)
+    (let n2 = (if str_len n <= p then str_repeat "0" (p + 1 - str_len n) ++ n else n) in
+     substring n2 0 (str_len n2 - p) ++ "." ++ substring n2 (str_len n2 - p) (str_len n2))
+// n / 10**s rounded to p decimals, half to even on an exact tie -- and, with
+// zero_up, a tie whose kept digits are all zero goes up (0.0005 -> "0.001":
+// what ruby's dtoa does with the shortest digits)
+and dec_round_s = fn (n: str) -> fn (s: int) -> fn (p: int) -> fn (zero_up: bool) ->
+  if s <= p then dec_place (if str_eq n "" then "0" else n ++ str_repeat "0" (p - s)) p
+  else
+    (let cut = s - p in
+     let ln = str_len n in
+     let keep = (if cut >= ln then "0" else substring n 0 (ln - cut)) in
+     let rest = (if cut >= ln then str_repeat "0" (cut - ln) ++ n else substring n (ln - cut) ln) in
+     let c0 = char_at rest 0 in
+     let tail0 = (let rec z = fn (i: int) -> if i >= str_len rest then true else if str_eq (char_at rest i) "0" then z (i + 1) else false in z 1) in
+     let half = (if c0 > "5" then 1 else if c0 < "5" then 0 - 1 else (if tail0 then 0 else 1)) in
+     let kz = str_eq (norm_dec keep) "0" in
+     let odd = (let d = ord (char_at keep (str_len keep - 1)) - 48 in d - (d / 2) * 2 == 1) in
+     let up = half > 0 || (half == 0 && (if zero_up && kz && p > 0 then true else odd)) in
+     dec_place (if up then big_add_s keep "1" else norm_dec keep) p)
+and norm_dec = fn (n: str) ->
+  let rec go = fn (i: int) -> if i < str_len n - 1 && str_eq (char_at n i) "0" then go (i + 1) else i in
+  substring n (go 0) (str_len n)
+and big_pow5_s = fn (k: int) ->
+  if k <= 0 then "1"
+  else (let h = big_pow5_s (k / 2) in
+        let hh = big_mul_s h h in
+        if k - (k / 2) * 2 == 1 then big_mul_s hh "5" else hh)
+// a positive finite double EXACTLY, as (n, s)
+and flt_exact_dec = fn (f: float) ->
+  let (_, e, fr) = flt_bits64 f in
+  let m = (if e == 0 then fr else fr + 4503599627370496) in
+  let q = (if e == 0 then 0 - 1074 else e - 1075) in
+  if q >= 0 then (big_mul_s (str_of_int m) (big_pow2_s q), 0)
+  else (big_mul_s (str_of_int m) (big_pow5_s (0 - q)), 0 - q)
+// ...and its SHORTEST digits (Float#to_s's), as (n, s) with s >= 0
+and flt_short_dec = fn (f: float) ->
+  let t = rb_float_str f in
+  let ei = str_index_of t "e" in
+  let mant = (if ei < 0 then t else substring t 0 ei) in
+  let ex = (if ei < 0 then 0
+            else (let es = substring t (ei + 1) (str_len t) in
+                  int_of_str (if str_len es > 0 && str_eq (char_at es 0) "+" then substring es 1 (str_len es) else es))) in
+  let pi = str_index_of mant "." in
+  let ip = (if pi < 0 then mant else substring mant 0 pi) in
+  let fp = (if pi < 0 then "" else substring mant (pi + 1) (str_len mant)) in
+  let s0 = str_len fp - ex in
+  if s0 >= 0 then (ip ++ fp, s0) else (ip ++ fp ++ str_repeat "0" (0 - s0), 0)
+// |av| written with prec decimals. A Float is written as ruby's dtoa does:
+// when the precision cuts INSIDE its shortest digits and asks for at most 14
+// significant ones, the shortest digits are rounded (half to even, so 5.015
+// and 5.025 are both "5.02"); otherwise the exact binary value is (0.35 is
+// "0.34999999999999998" at %.17f). An Integer is exact as it is.
+and fmt_float_abs = fn (av: Val) -> fn (prec: int) ->
+  match av with
+  | VInt i -> dec_round_s (str_of_int (if i < 0 then 0 - i else i)) 0 prec false
+  | VBig b -> dec_round_s (big_mag b) 0 prec false
+  | _ ->
+    (let f0 = to_f av in
+     let f = (if f0 < 0.0 then 0.0 - f0 else f0) in
+     if f == 0.0 then dec_place (str_repeat "0" (prec + 1)) prec
+     else
+       (let (ns, ss) = flt_short_dec f in
+        let nsd = norm_dec ns in
+        let k = str_len nsd - 1 - ss in
+        // (the exact value rounded at a precision at or past the shortest
+        //  digits IS those digits padded with zeros while at most 15
+        //  significant ones are asked for: the two differ by under half an
+        //  ulp, and that is under half of 10**-prec there -- no bignum)
+        if prec >= ss && k + 1 + prec <= 15 then dec_round_s ns ss prec false
+        else if prec >= ss || k + 1 + prec > 14 then
+          (let (ne, se) = flt_exact_dec f in dec_round_s ne se prec false)
+        else dec_round_s ns ss prec true))
+// a Rational with prec decimals, rounded half up on its magnitude (as
+// sprintf.c does: (num * 10**prec + den / 2) / den)
+and rat_fmt_f = fn (rn: str) -> fn (rd: str) -> fn (prec: int) ->
+  let an = big_mag rn in
+  let num = big_add_s (big_mul_s an (big_pow10_s prec)) (big_div_s rd "2") in
+  dec_place (match big_divmod_s num rd with (q, _) -> q) prec
+and big_pow10_s = fn (k: int) -> if k <= 0 then "1" else "1" ++ str_repeat "0" k
 and sci_norm_up = fn (f: float) -> fn (e: int) -> if f >= 10.0 then sci_norm_up (f / 10.0) (e + 1) else (f, e)
 and sci_norm_down = fn (f: float) -> fn (e: int) -> if f < 1.0 then sci_norm_down (f * 10.0) (e - 1) else (f, e)
 and fmt_sci_abs = fn (av: Val) -> fn (prec: int) -> fn (upper: bool) ->

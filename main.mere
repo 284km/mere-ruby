@@ -3026,7 +3026,10 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
               | Nil -> Nil) with
        | Cons (VStr h, rest) ->
          let out = rb_format_in env world (senc_get h) (sget h) rest in
-         let renc = rb_fmt_enc (senc_get h) (sget h) rest in
+         // (a US-ASCII result that came out holding a byte past 127 -- `%c`
+         //  of 0x80 -- is BINARY, as ruby makes it)
+         let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) rest in
+                     if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
          let r = mkstr out in
          (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
        | _ -> raise_exc world "ArgumentError" "too few arguments")
@@ -4405,7 +4408,8 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
          | VStr h ->
            let args2 = rb_fmt_args env world vb in
            let out = rb_format_in env world (senc_get h) (sget h) args2 in
-           let renc = rb_fmt_enc (senc_get h) (sget h) args2 in
+           let renc = (let r9 = rb_fmt_enc (senc_get h) (sget h) args2 in
+                       if str_eq r9 "US-ASCII" && (if str_ascii_only out 0 then false else true) then "ASCII-8BIT" else r9) in
            let r = mkstr out in
            (match r with VStr rid -> (let _ = senc_set rid renc in r) | _ -> r)
          | _ -> va0)
@@ -8045,6 +8049,10 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
                                | VNil -> (if (match by9 with VNil -> 1.0 | v -> to_f v) < 0.0 then 0.0 - 1.0 / 0.0 else 1.0 / 0.0)
                                | v -> to_f v)
                               (match by9 with VNil -> 1.0 | v -> to_f v)) recv)
+       // (a step that is not a number is compared with 0 first, and that is
+       //  ruby's refusal: "comparison of String with 0 failed")
+       | Cons (_, Cons (sv9, _)) when (if is_num sv9 then false else true) ->
+         raise_exc world "ArgumentError" ("comparison of " ++ display_cls_msg world (dispatch_cls_of world sv9) ++ " with 0 failed")
        | Cons (lim9, rest9) ->
          (let sf9 = (match rest9 with Cons (sv9, _) -> to_f sv9 | _ -> 1.0) in
           let lf9 = (match lim9 with VNil -> (if sf9 < 0.0 then 0.0 - 1.0 / 0.0 else 1.0 / 0.0) | _ -> to_f lim9) in
@@ -8213,31 +8221,54 @@ and big_upto = fn world -> fn encl -> fn theblk -> fn (cur: str) -> fn (lim: str
 // limit was +Infinity and the count overflowed)
 and flt_step = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: float) -> fn (st: float) ->
   if st == 0.0 then (let _ = prim_raise "ArgumentError" "step can't be 0" in FNext VNil)
-  else if flt_is_inf lim then (if (lim > 0.0) == (st > 0.0) then flt_step_go world encl theblk b st 0 int_max else FNext VNil)
-  else
-    let n = flt_floor ((lim - b) / st + 0.000000000001) in
-    flt_step_go world encl theblk b st 0 n
+  // (Numeric#step's float walk is ruby_float_step too, end included)
+  else flt_step_x world encl theblk b lim st false
 
 // ...and the same walk for a RANGE, which may exclude its end: the last value
 // is dropped when it lands on the end exactly. An infinite end walks until the
 // block breaks.
 // (both directions: a negative step walks down to the limit, as ruby's
 // ruby_float_step does, and an infinite limit the other way yields nothing)
+// ruby_float_step: the count comes from ruby_float_step_size (the span over
+// the step, floored after an error allowance of a few epsilons of the
+// operands), each element is beg + i*unit, and one that overshoots the end is
+// the end itself -- `(1.0..12.7).step(1.3)` ends at 12.7, not
+// 12.700000000000001. An infinite step yields the begin once (when it is on
+// the end's side) -- `0.0.step(1.0, Float::INFINITY)` is [0.0], not NaN.
 and flt_step_x = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (lim: float) -> fn (st: float) -> fn (excl: bool) ->
-  if flt_is_inf lim then (if (lim > 0.0) == (st > 0.0) then flt_step_go world encl theblk b st 0 int_max else FNext VNil)
+  if flt_is_inf st then
+    (if (if st > 0.0 then b <= lim else b >= lim) then flt_step_go world encl theblk b st lim 0 0 else FNext VNil)
+  else if flt_is_inf lim then (if (lim > 0.0) == (st > 0.0) then flt_step_go world encl theblk b st lim 0 int_max else FNext VNil)
   else
-    let n0 = flt_floor ((lim - b) / st + 0.000000000001) in
-    let n = (if excl && (if st > 0.0 then b + float_of_int n0 * st >= lim else b + float_of_int n0 * st <= lim) then n0 - 1 else n0) in
-    flt_step_go world encl theblk b st 0 n
+    (let n = flt_step_count b lim st excl in
+     if n <= 0 then FNext VNil else flt_step_go world encl theblk b st lim 0 (n - 1))
+and flt_step_count = fn (b: float) -> fn (e: float) -> fn (u: float) -> fn (excl: bool) ->
+  let fab = fn (x: float) -> if x < 0.0 then 0.0 - x else x in
+  let n = (e - b) / u in
+  let err0 = (fab b + fab e + fab (e - b)) / fab u * 2.220446049250313e-16 in
+  let err = (if err0 > 0.5 then 0.5 else err0) in
+  if excl then
+    (if n <= 0.0 then 0
+     else
+       (let n1 = (if n < 1.0 then 0.0 else float_of_int (flt_floor (n - err))) in
+        let d = (n1 + 1.0) * u + b in
+        let n2 = (if b < e then (if d < e then n1 + 1.0 else n1) else if b > e then (if d > e then n1 + 1.0 else n1) else n1) in
+        int_of_float n2 + 1))
+  else (if n < 0.0 then 0 else flt_floor (n + err) + 1)
 
-and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: float) -> fn (i: int) -> fn (n: int) ->
+and flt_step_go = fn world -> fn encl -> fn theblk -> fn (b: float) -> fn (st: float) -> fn (lim: float) -> fn (i: int) -> fn (n: int) ->
   if i > n then FNext VNil
   else
-    (match run_block world encl theblk (Cons (VFlt (b + float_of_int i * st), Nil)) with
+    // (i*unit + beg FUSED, as ruby's arm64 build compiles it: the product is
+    //  not rounded on its own -- 1.0.step(2.0, 0.1) has 1.7, not
+    //  1.7000000000000002)
+    (let d0 = (if i == 0 then b else fma (float_of_int i) st b) in
+     let d = (if flt_is_inf lim then d0 else if (if st >= 0.0 then lim < d0 else d0 < lim) then lim else d0) in
+     match run_block world encl theblk (Cons (VFlt d, Nil)) with
      | FBreak v -> FBreak v
      | FReturn v -> FReturn v
      | FRaise v -> FRaise v
-     | _ -> flt_step_go world encl theblk b st (i + 1) n)
+     | _ -> flt_step_go world encl theblk b st lim (i + 1) n)
 
 and arr_each = fn world -> fn encl -> fn theblk -> fn (xs: Val list) ->
   match xs with
@@ -20492,6 +20523,14 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
              let sf9 = (if numeric9 then aseq_to_flt st else 0.0) in
              let endless9 = numeric9 && (ef9 == inf9 || ef9 == (0.0 - inf9)) in
              if numeric9 && (str_len name == 4 && str_eq name "size") then aseq_size_flt (aseq_to_flt b) ef9 sf9 excl
+             // #last with no count is ARITHMETIC too, as arith_seq_last does
+             // it: beg + (n-1)*unit, not fused and not clamped to the end
+             // (`1.step(to: 10, by: Float::INFINITY).last` is NaN)
+             else if numeric9 && (if endless9 then false else true) && (match args with Nil -> true | _ -> false) then
+               (match aseq_size_flt (aseq_to_flt b) ef9 sf9 excl with
+                | VInt 0 -> VNil
+                | VInt n9 -> VFlt (aseq_to_flt b + float_of_int (n9 - 1) * sf9)
+                | _ -> VNil)
              else if endless9 then
                // last of a sequence running to infinity: CRuby names the end
                // it would have reached, signed by the direction of travel.
@@ -25188,6 +25227,39 @@ and ivar_name_val = fn env -> fn world -> fn (v: Val) ->
                (inspect other ++ " is not a symbol nor a string") in ""))
 
 
+// frexp's exponent: 2**(e-1) <= |x| < 2**e
+and flt_binexp = fn (x: float) ->
+  let rec up = fn (f: float) -> fn (e: int) -> if f >= 1.0 then up (f / 2.0) (e + 1) else (f, e) in
+  let rec dn = fn (f: float) -> fn (e: int) -> if f < 0.5 then dn (f * 2.0) (e - 1) else (f, e) in
+  let (f1, e1) = up (if x < 0.0 then 0.0 - x else x) 0 in
+  (match dn f1 e1 with (_, e2) -> e2)
+// Float#round / #floor / #ceil / #truncate at a LARGE precision, as float.c
+// does it: the binary exponent says whether the precision is past every digit
+// the value has (the value itself: float_round_overflow) or before all of
+// them (zero: float_round_underflow); in between, #round goes through the
+// EXACT rational of the value (ruby's rb_flo_round_by_rational, past 14
+// digits), and so do #floor / #ceil. `1.1e-300.round(300)` is 1.0e-300;
+// every precision past 17 answered the receiver.
+and flt_prec_big = fn (name: str) -> fn (f: float) -> fn (d: int) ->
+  let be = flt_binexp f in
+  let over = d >= 17 - (if be > 0 then be / 4 else be / 3 - 1) in
+  let under = d < 0 - (if be > 0 then be / 3 + 1 else be / 4) in
+  let mode = (if str_eq name "truncate" then (if f > 0.0 then "floor" else "ceil") else name) in
+  if over then VFlt f
+  else if str_eq mode "round" && under then VFlt 0.0
+  else
+    // the magnitude's digits at d places: half up for #round, and for #floor
+    // / #ceil toward or away from zero by the sign
+    (let (n9, s9) = flt_exact_dec (if f < 0.0 then 0.0 - f else f) in
+     let away = (if str_eq mode "floor" then f < 0.0 else f > 0.0) in
+     let k9 = (if s9 <= d then n9 ++ str_repeat "0" (d - s9)
+               else (let u9 = big_pow10_s (s9 - d) in
+                     let (q9, r9) = big_divmod_s n9 u9 in
+                     let bump = (if str_eq mode "round" then big_cmp_s (big_add_s r9 r9) u9 >= 0
+                                 else away && (if str_eq (norm_dec r9) "0" then false else true)) in
+                     if bump then big_add_s q9 "1" else q9)) in
+     let v9 = float_of_str (k9 ++ "e-" ++ str_of_int d) in
+     VFlt (if f < 0.0 then 0.0 - v9 else v9))
 // ruby's round_half_up / round_half_down for x at 10**d (s): the nearest
 // multiple, with a tie settled toward (up) or away from (down) the larger
 // magnitude -- decided by comparing the half point back in x's own scale,
@@ -25229,6 +25301,12 @@ and pow10i = fn (k: int) -> if k <= 0 then 1 else 10 * pow10i (k - 1)
 and round_half_mode = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list) ->
   let kw9 = (match vlast args with VHsh h9 -> hash_get (hderef h9) (VSym "half") | _ -> VNil) in
   let pos9 = (let rec dropl = fn (xs: Val list) -> (match xs with Nil -> Nil | Cons (_, Nil) -> Nil | Cons (x9, t9) -> Cons (x9, dropl t9)) in dropl args) in
+  // (a String mode is read as ASCII, so one in an ASCII-incompatible
+  //  encoding is refused before it is read)
+  let _ = (match kw9 with
+           | VStr h9 when (if enc_ascii_compat (enc_canon_name (senc_get h9)) then false else true) ->
+             (let _ = raise_exc world "Encoding::CompatibilityError" ("ASCII incompatible encoding: " ++ enc_canon_name (senc_get h9)) in ())
+           | _ -> ()) in
   let mode9 = (match kw9 with VNil -> "up" | VSym m9 -> m9 | VStr h9 -> sget h9 | other9 -> inspect other9) in
   let check9 = fn (u: unit) ->
     (if str_eq mode9 "up" || str_eq mode9 "down" || str_eq mode9 "even" then ()
@@ -28977,7 +29055,8 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     prim_raise "ZeroDivisionError" "divided by 0"
   else if ((str_len name == 3 && str_eq name "div") || (str_len name == 6 && str_eq name "divmod"))
           && is_num recv
-          && (match args with Cons (a0, Nil) -> num_is_nan a0 | _ -> false) then
+          // (...or a NaN receiver: `Float::NAN.div(2)` floors NaN)
+          && (num_is_nan recv || (match args with Cons (a0, Nil) -> num_is_nan a0 | _ -> false)) then
     prim_raise "FloatDomainError" "NaN"
   // An operator written as a METHOD is the operator: `10.%(3)` and `s.<<(x)`
   // mean what `10 % 3` and `s << x` mean. Some of these had their own branch
@@ -30213,9 +30292,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   // negative one. `int_pow 10 d` below would overflow long before either --
   // `0.42.round(2.0**23)` asked for 10**8388608.
   else if ((str_len name == 5 && str_eq name "round") || (str_len name == 5 && str_eq name "floor") || (str_len name == 4 && str_eq name "ceil") || (str_len name == 8 && str_eq name "truncate"))
-          && (match recv with VFlt f9 -> (if flt_is_big_whole f9 then false else true) | _ -> false)
-          && (match args with Cons (VInt d9, _) -> d9 > 17 || d9 < (0 - 17) | _ -> false) then
-    (match args with Cons (VInt d9, _) -> (if d9 > 17 then recv else VInt 0) | _ -> recv)
+          // (a big whole Float takes the positive precisions too: they are
+          //  past all its digits, and the arms below overflowed an int)
+          && (match recv with
+              | VFlt f9 -> (if flt_is_big_whole f9 then (match args with Cons (VInt d9, _) -> d9 > 0 | _ -> false) else true)
+              | _ -> false)
+          && (match args with
+              | Cons (VInt d9, _) -> d9 > 14 || d9 < (0 - 17) || (match recv with VFlt f9 -> flt_is_big_whole f9 && d9 > 0 | _ -> false)
+              | _ -> false) then
+    (match (recv, args) with
+     | (VFlt f9, Cons (VInt d9, _)) -> (if d9 > 0 then flt_prec_big name f9 d9 else VInt 0)
+     | _ -> recv)
   // ⚠ ...and anything that is NOT a precision is refused BEFORE the rounding
   //   arms answer, in ruby's two wordings: "no implicit conversion of String
   //   into Integer", and for nil "no implicit conversion FROM nil TO integer"
@@ -33455,12 +33542,12 @@ and rb_format_go = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (arg
        // syntax error somewhere else entirely.
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "\{" then
          let (key, j) = rb_fmt_name fmt (i + 2) "" "}" in
-         let m2 = rb_fmt_to_named mode in
+         let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
          rb_format_go env world fmt j args nextarg m2 (acc ++ rb_fmt_one env world "" (0 - 1) (0 - 1) false "s" (rb_fmt_named_w env world args key "\{" "}"))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "<" then
          let (key, j0) = rb_fmt_name fmt (i + 2) "" ">" in
+         let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
          let av = rb_fmt_named_w env world args key "<" ">" in
-         let m2 = rb_fmt_to_named mode in
          // the spec after the name formats exactly this one value: run the
          // directive parser over a one-element argument list in numbered mode
          // with the position preset, so a stray %s inside cannot consume the
@@ -33509,8 +33596,10 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
        else rb_fmt_dir env world fmt j args nextarg mode flags k true prec pset pos)
     else if str_eq c "*" then
       (if wset then (let _ = prim_raise "ArgumentError" "width given twice" in ("", i, nextarg, mode))
+       // (`%.**d`: a width cannot follow the precision)
+       else if pset then (let _ = prim_raise "ArgumentError" "width after precision" in ("", i, nextarg, mode))
        else
-         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode in
+         let (w, j, na2, m2) = rb_fmt_star env world fmt (i + 1) args nextarg mode "width" in
          // (a negative width is a left-justified one, and negating INT_MIN
          // does not fit an int: ruby's "width too big", where this padded
          // 2^31 spaces and ran out of stack)
@@ -33520,7 +33609,7 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
     else if str_eq c "." then
       (if pset then (let _ = prim_raise "ArgumentError" "precision given twice" in ("", i, nextarg, mode))
        else if i + 1 < n && str_eq (char_at fmt (i + 1)) "*" then
-         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args nextarg mode in
+         let (p, j, na2, m2) = rb_fmt_star env world fmt (i + 2) args nextarg mode "prec" in
          rb_fmt_dir env world fmt j args na2 m2 flags width wset (if p < 0 then 0 - 1 else p) true pos
        else
          let (p, j) = rb_fmt_digits fmt (i + 1) 0 false in
@@ -33540,13 +33629,13 @@ and rb_fmt_dir = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args:
     // ...and `%-20.5{foo}`: the named value as %s, with what came before it
     else if str_eq c "\{" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" "}" in
+       let m2 = rb_fmt_to_named_k mode "\{" key "}" nextarg in
        let av = rb_fmt_named_w env world args key "\{" "}" in
-       let m2 = rb_fmt_to_named mode in
        (rb_fmt_one env world flags width prec pset "s" av, j, nextarg, m2))
     else if str_eq c "<" then
       (let (key, j) = rb_fmt_name fmt (i + 1) "" ">" in
+       let m2 = rb_fmt_to_named_k mode "<" key ">" nextarg in
        let av = rb_fmt_named_w env world args key "<" ">" in
-       let m2 = rb_fmt_to_named mode in
        let (piece, j2, _, _) = rb_fmt_dir env world fmt j (Cons (av, Nil)) 0 2 flags width wset prec pset 1 in
        (piece, j2, nextarg, m2))
     // a character that is not a directive is named when it is printable
@@ -33596,10 +33685,14 @@ and fmt_str_arg = fn env -> fn world -> fn (v: Val) ->
 // sequential argument, `*3$` a numbered one. Digits NOT followed by '$' are
 // left unconsumed -- ruby re-reads them after the star, so `%*5s` is a
 // width-given-twice error, not width 5.
-and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) ->
+and rb_fmt_star = fn env -> fn world -> fn (fmt: str) -> fn (i: int) -> fn (args: Val list) -> fn (nextarg: int) -> fn (mode: int) -> fn (what: str) ->
   let n = str_len fmt in
   let (k, j) = rb_fmt_digits fmt i 0 false in
-  if k >= 0 && j < n && str_eq (char_at fmt j) "$" then
+  // (an argument index that cannot fit an int is ruby's "width too big" /
+  //  "prec too big"; the accumulated value has wrapped, so count the digits)
+  if j - i > 9 && j < n && str_eq (char_at fmt j) "$" then
+    (let _ = prim_raise "ArgumentError" (what ++ " too big") in (0, j + 1, nextarg, mode))
+  else if k >= 0 && j < n && str_eq (char_at fmt j) "$" then
     (if k <= 0 then (let _ = prim_raise "ArgumentError" "invalid index - 0$" in (0, j + 1, nextarg, mode))
      else if mode == 1 || mode == 3 then (let _ = prim_raise "ArgumentError" ("numbered(" ++ int_to_base k 10 ++ "$) after unnumbered(%)") in (0, j + 1, nextarg, mode))
      else (rb_fmt_int env world (rb_fmt_posarg args k), j + 1, nextarg, 2))
@@ -33644,7 +33737,13 @@ and rb_fmt_int_v = fn env -> fn world -> fn (v: Val) ->
   | VInt x -> VInt x
   | VBig s -> VBig s
   | VFlt f ->
-    (if str_len (float_special f) > 0 then (let _ = prim_raise "FloatDomainError" (float_domain_msg f) in VNil) else VInt (int_of_float f))
+    (if str_len (float_special f) > 0 then (let _ = prim_raise "FloatDomainError" (float_domain_msg f) in VNil)
+     // a Float past int64 is the exact integer it stands for (`%d` of
+     // (2**64).to_f is 18446744073709551616; int_of_float saturated it)
+     else if f >= 4611686018427387904.0 || f <= 0.0 - 4611686018427387904.0 then
+       (let (n9, _) = flt_exact_dec (if f < 0.0 then 0.0 - f else f) in
+        norm_big (if f < 0.0 then "-" ++ n9 else n9))
+     else VInt (int_of_float f))
   | VNil -> (let _ = prim_raise "TypeError" "can't convert nil into Integer" in VNil)
   | VStr h -> rb_int_parse (sget h)
   | _ ->
@@ -34165,7 +34264,17 @@ and kernel_float_go = fn env -> fn world -> fn (pos: Val list) ->
   | other ->
     (if responds world other "to_f" then
        (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-        match invoke_val_c env world nb other "to_f" Nil false with
+        // (under `exception: false` a #to_f that RAISES is a refusal too:
+        //  the call runs inside a rescue, and a rescued one answers nil)
+        let tv9 = (if map_has conv_soft "on" then
+                     (let e9 = lv_child env in
+                      let _ = map_set e9 "__mere_fo" other in
+                      eval_e e9 world nb
+                        (EStmt (SBegin (Cons (SExpr (EMethod (EVar "__mere_fo", "to_f", Nil)), Nil),
+                                        Cons ((Nil, "", Cons (SExpr (ESym "__mere_soft_fail__"), Nil)), Nil), Nil, Nil))))
+                   else invoke_val_c env world nb other "to_f" Nil false) in
+        match tv9 with
+        | VSym s9 when str_eq s9 "__mere_soft_fail__" -> (let _ = conv_fail "TypeError" "to_f raised" in VNil)
         | VFlt f -> VFlt f
         | bad -> (let _ = conv_fail "TypeError"
                     ("can't convert " ++ class_name other ++ " into Float ("
@@ -34260,6 +34369,10 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     let (neg, ds) =
       (match rb_fmt_int_v env world av with
        | VBig s -> (if str_len s > 0 && str_eq (substring s 0 1) "-" then (true, substring s 1 (str_len s)) else (false, s))
+       // (int64's minimum has no positive int: `0 - x` wraps back to itself
+       //  and printed a second sign, so its digits come from its own text; the
+       //  test is a comparison, as `0 - x < 0` is folded away by the C compiler)
+       | VInt x when x < (0 - 4611686018427387903) * 2 - 1 -> (true, substring (str_of_int x) 1 (str_len (str_of_int x)))
        | VInt x -> (x < 0, int_to_base (if x < 0 then 0 - x else x) 10)
        | _ -> (false, "0")) in
     rb_fmt_intlike flags width prec pset neg ds 10 ""
@@ -34271,6 +34384,7 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
          (if str_len s > 0 && str_eq (substring s 0 1) "-"
           then (true, big_to_base_s (substring s 1 (str_len s)) base)
           else (false, big_to_base_s s base))
+       | VInt x when x < (0 - 4611686018427387903) * 2 - 1 -> (true, big_to_base_s (substring (str_of_int x) 1 (str_len (str_of_int x))) base)
        | VInt x -> (x < 0, int_to_base (if x < 0 then 0 - x else x) base)
        | _ -> (false, "0")) in
     let pfx0 = (if str_contains flags "#"
@@ -34344,12 +34458,21 @@ and rb_fmt_one = fn env -> fn world -> fn (flags: str) -> fn (width: int) -> fn 
     rb_pad_str s flags width
   else if str_eq typ "f" || str_eq typ "e" || str_eq typ "E" || str_eq typ "g" || str_eq typ "G" then
     let fv = rb_fmt_flt env world av in
-    let sign = (if fv < 0.0 then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
-    let sp = float_special fv in
+    // (an Integer and a Rational keep every digit under %f: they are written
+    //  from the exact value, not from the Float it converts to)
+    let exact9 = str_eq typ "f" && (match av with VInt _ -> true | VBig _ -> true | VRat (_, _) -> true | _ -> false) in
+    let neg9 = (match av with
+                | VInt i9 -> i9 < 0
+                | VBig b9 -> big_sign b9 < 0
+                | VRat (rn9, _) -> big_sign rn9 < 0
+                | _ -> fv < 0.0) in
+    let sign = (if neg9 then "-" else if str_contains flags "+" then "+" else if str_contains flags " " then " " else "") in
+    let sp = (if exact9 then "" else float_special fv) in
     if str_len sp > 0 then rb_pad_special sign sp flags width
     else
       let p = (if pset && prec >= 0 then prec else if str_eq typ "g" || str_eq typ "G" then 0 - 1 else 6) in
-      let body0 = (if str_eq typ "f" then fmt_float_abs (VFlt fv) p
+      let body0 = (if exact9 then (match av with VRat (rn9, rd9) -> rat_fmt_f rn9 rd9 p | _ -> fmt_float_abs av p)
+                   else if str_eq typ "f" then fmt_float_abs (VFlt fv) p
                    else if str_eq typ "g" || str_eq typ "G" then fmt_g_abs (VFlt fv) p (str_eq typ "G") (str_contains flags "#")
                    else fmt_sci_abs (VFlt fv) p (str_eq typ "E")) in
       // # keeps the point when the precision leaves no digit after it:
