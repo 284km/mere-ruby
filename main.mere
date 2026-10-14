@@ -870,6 +870,8 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter dm_closenv mk in
   let _ = map_iter dm_methods mk in
   let _ = map_iter flow_sig mk in
+  // (a `break` value on its way out of Lazy#each)
+  let _ = map_iter lz_brk mk in
   // the receiver of the builtin running now (bi_reg_r, one slot): it is
   // asked for its class when a refusal names the builtin
   let _ = gc_mark_val live (bi_reg_recv ()) in
@@ -7267,8 +7269,15 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
           | FBreak v -> v
           | _ -> recv))
     // zip with a block yields each tuple and answers NIL (not self).
+    // ...the tuples are the blockless zip's, which converts each argument
+    // (a Range, an object with #to_ary or #each): handed over raw, a Range
+    // argument zipped as nils (`[1, 2].zip("a".."b") { }` saw [1, nil])
     else if (str_len name == 3 && str_eq name "zip") then
-      (match arr_each world encl theblk (val_zip xs args 0 (val_list_len xs)) with
+      (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+       let tup9 = (match invoke_val_c gc_cenv0 world nb9 recv "zip" args false with
+                   | VArr t9 -> deref t9
+                   | _ -> val_zip xs args 0 (val_list_len xs)) in
+       match arr_each world encl theblk tup9 with
        | FBreak v -> v
        | _ -> VNil)
     else if (str_len name == 6 && str_eq name "reduce") || (str_len name == 6 && str_eq name "inject") then
@@ -7860,6 +7869,12 @@ and builtin_iter_raw = fn world -> fn encl -> fn theblk -> fn (recv: Val) -> fn 
         else if (str_len name == 3 && str_eq name "map") || (str_len name == 7 && str_eq name "collect") then
           iter_result (range_map world encl theblk a int_max Nil) recv
         else via_arr_iter world encl theblk recv (arr_new (range_vals world lo hi excl)) name args)
+     // ...and an end past int64 (a positive bignum) walks as far as int64
+     // does: `(1..2**70).each { }` walked NOTHING (no arm took it), and so did
+     // every lazy over it -- `(1..2**120).lazy.each_slice(2).first` was nil
+     else if rng_is_int lo && (str_len name == 4 && str_eq name "each")
+             && (match hi with VBig b9 -> (if str_len b9 > 0 && str_eq (char_at b9 0) "-" then false else true) | _ -> false) then
+       iter_each_result (range_each world encl theblk (rng_int lo) int_max) recv
      // (an exclusive end at int64's minimum has nothing below it to step back
      // to: `hi - 1` would be the maximum, and `(-2**63...-2**63).each` walked
      // every int64 -- see reverse_each)
@@ -20089,6 +20104,8 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          raise_exc world "ArgumentError" ("tried to call lazy " ++ lz_canon_name name ++ " without a block")
        else if (str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop") then
          (match args with
+          | Cons (VInt n, _) when n < 0 ->
+            raise_exc world "ArgumentError" (if str_eq name "take" then "attempt to take negative size" else "attempt to drop negative size")
           | Cons (VInt n, _) -> lz_extend world id name (VInt n)
           | _ -> raise_exc world "ArgumentError" "wrong number of arguments")
        else if (str_len name == 5 && str_eq name "first") then
@@ -23960,6 +23977,9 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
          // take(n) / drop(n) ignore a block, as ruby's lazy ones do: they stay
          // pipeline steps instead of walking the source now
          (if ((str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop"))
+             && (match args with Cons (VInt n9, Nil) -> n9 < 0 | _ -> false) then
+            raise_exc world "ArgumentError" (if str_eq name "take" then "attempt to take negative size" else "attempt to drop negative size")
+          else if ((str_len name == 4 && str_eq name "take") || (str_len name == 4 && str_eq name "drop"))
              && (match args with Cons (VInt _, Nil) -> true | _ -> false) then
             (match args with
              | Cons (VInt n, _) -> lz_extend world id name (VInt n)
@@ -24002,8 +24022,10 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
           else if (str_len name == 4 && str_eq name "each") then
             (let pid = (proc_next ()) in
              let _ = store_proc (str_of_int pid) newblk in
+             let _ = (if map_has lz_brk "v" then map_delete lz_brk "v" else ()) in
              let _ = lz_run env world blk id (0 - 1) (VProc pid) in
-             recv)
+             if map_has lz_brk "v" then (let bv9 = map_get lz_brk "v" in let _ = map_delete lz_brk "v" in bv9)
+             else recv)
           else invoke_with_block env world blk (lz_run env world blk id (0 - 1) VNil) name args newblk)
        | _ -> VNil)
     // Enumerator::Chain#each { }: drive each source's #each with the block.
@@ -39385,8 +39407,11 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
     // survivor: hand to the final consumer or accumulate (bound-checked).
     (match (if map_has ivars0 (str_of_int did ++ "@__fin") then map_get ivars0 (str_of_int did ++ "@__fin") else VNil) with
      | VProc fpid ->
-       let _ = flow_value (run_block world blk (proc_get (str_of_int fpid)) (Cons (v, Nil))) in
-       VNil
+       // a `break` in the block stops the source (it ran on forever over an
+       // endless one: `(1..).lazy.each { break }`) and is #each's answer
+       (match run_block world blk (proc_get (str_of_int fpid)) (Cons (v, Nil)) with
+        | FBreak bv -> (let _ = map_set lz_brk "v" bv in raise_exc world "StopIteration" "iteration reached an end")
+        | f9 -> (let _ = flow_value f9 in VNil))
      | _ ->
        (match (if map_has ivars0 (str_of_int did ++ "@__acc") then map_get ivars0 (str_of_int did ++ "@__acc") else VNil) with
         | VArr aid ->
@@ -39559,6 +39584,11 @@ and lz_step_ops = fn env -> fn world -> fn blk -> fn (did: int) -> fn (ops: Val 
       (let r = callp v in
        (match r with
         | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
+        // ...an object with #to_ary is flattened as the Array it converts to
+        | VObj _ when responds world r "to_ary" && (if responds world r "force" then false else true) ->
+          (match invoke_val_c env world blk r "to_ary" Nil false with
+           | VArr faid -> lz_emit_each env world blk did rest (i + 1) (deref faid)
+           | _ -> lz_step_ops env world blk did rest (i + 1) r)
         // ...and so is anything that answers both #each and #force (a lazy
         // enumerator), as ruby's lazy flat_map flattens it
         | VObj lo9 when (let (_, _, oc9, _) = world in str_eq (map_get oc9 lo9) "Enumerator::Lazy")
@@ -41656,6 +41686,10 @@ and enum_inspect_str = fn env -> fn world -> fn (oid: int) -> fn (cls: str) ->
              (let nm = (match nv with VStr h -> sget h | VSym sy -> sy | _ -> "") in
               let vis = (match rest with
                          | Cons (VProc _, _) -> Nil
+                         // (grep / slice_before keep [pattern, block]: the
+                         //  pattern is what ruby prints, `grep(/b/)`)
+                         | Cons (VArr pb9, _) when (str_eq nm "grep" || str_eq nm "grep_v" || str_eq nm "slice_before" || str_eq nm "slice_after") ->
+                           (match deref pb9 with Cons (VNil, _) -> Nil | Cons (p9, _) -> Cons (p9, Nil) | Nil -> Nil)
                          | Cons (v9, _) -> Cons (v9, Nil)
                          | Nil -> Nil) in
               wrap9 t ("#<Enumerator::Lazy: " ++ acc ++ ":" ++ nm ++ argstr vis ++ ">"))
