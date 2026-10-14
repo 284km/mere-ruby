@@ -334,7 +334,18 @@ let rat_to_f = fn (n: str) -> fn (d: str) ->
   let na = (if neg then substring n 1 (str_len n) else n) in
   let ln = str_len na in
   let ld = str_len d in
-  if ln <= 300 && ld <= 300 then float_of_str n / float_of_str d
+  // (ruby's rb_int_fdiv_double: two FIXNUMS -- under 2**62 -- are each made
+  //  a double and divided, as here; with a BIGNUM on either side it divides
+  //  the big digits, which rounds once. Rounding a bignum side first made
+  //  `Rational(1, 10**23).to_f` 1.0000000000000001e-23; the exact quotient to
+  //  40 digits handed to strtod is that one rounding.)
+  if big_cmp_s na "4611686018427387904" < 0 && big_cmp_s d "4611686018427387904" < 0 then float_of_str n / float_of_str d
+  else if ln <= 300 && ld <= 300 then
+    (let p9 = 40 + ld - ln in
+     let q9 = (if p9 >= 0 then big_div_s (big_mul_s na (big_pow "10" p9 "1")) d
+               else big_div_s na (big_mul_s d (big_pow "10" (0 - p9) "1"))) in
+     let f9 = float_of_str (q9 ++ "e" ++ str_of_int (0 - p9)) in
+     if neg then 0.0 - f9 else f9)
   else
     (let k = 20 in
      let nk = (if ln <= k then na else substring na 0 k) in
@@ -12413,10 +12424,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
           (match (shift_width_v env world bv9, shift_width_v env world lv9) with
            | (VInt b9, VInt l9) ->
              (match recv with
+              | VInt n9 when l9 < 0 -> VInt (int_aref2_v n9 b9 l9)
+              // (the slice is (n >> beg) & ((1 << len) - 1) in exact
+              //  arithmetic: a negative beg shifts LEFT, and a mask or a
+              //  shifted value past the machine word is a bignum -- both were
+              //  answered from int64, `-16[-66, 71]` as 0)
+              | _ when l9 >= 0 && l9 <= 1000000 -> int_slice_v recv b9 l9
               | VInt n9 -> VInt (int_aref2_v n9 b9 l9)
-              // a Bignum slice would need the whole shift-and-mask in big
-              // arithmetic; ruby/spec asks only for single bits of one, so
-              // this answers the bit rather than pretending to slice.
               | _ -> int_aref_bit recv (VInt b9))
              | _ -> VInt 0)
         | Cons (VRange (lov9, hiv9, excl9), Nil) ->
@@ -12445,7 +12459,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                     | _ ->
                       (match shift_width_v env world hiv9 with
                        | VInt e9 ->
-                         (if b9 < e9 then VInt (int_aref2_v n9 b9 ((e9 - b9) + (if excl9 then 0 else 1)))
+                         (if b9 < e9 then int_slice_v recv b9 ((e9 - b9) + (if excl9 then 0 else 1))
                           else if b9 == e9 then (if excl9 then VInt 0 else int_aref_bit recv (VInt b9))
                           // ⚠ upper below lower is not an empty slice: ruby
                           // ignores the upper bound and takes everything from
@@ -25378,6 +25392,41 @@ and ivar_name_val = fn env -> fn world -> fn (v: Val) ->
                (inspect other ++ " is not a symbol nor a string") in ""))
 
 
+// Float#floor / #ceil at a positive precision, as float.c's rb_float_floor
+// and rb_float_ceil: past every digit the value has it is the value, and
+// otherwise the scaled floor is checked against the next candidate --
+// `floor(291.4 * 100) / 100` is 291.39, and ruby answers 291.4
+and flt_floor_ceil_prec = fn (is_floor: bool) -> fn (f: float) -> fn (d: int) ->
+  let be = flt_binexp f in
+  let over = d >= 17 - (if be > 0 then be / 4 else be / 3 - 1) in
+  let under = d < 0 - (if be > 0 then be / 3 + 1 else be / 4) in
+  if f == 0.0 || over then VFlt f
+  else if is_floor && f > 0.0 && under then VFlt 0.0
+  else if (if is_floor then false else true) && f < 0.0 && under then VFlt (0.0 - 0.0)
+  else
+    (let s9 = float_of_str ("1e" ++ str_of_int d) in
+     let x9 = f * s9 in
+     if is_floor then
+       (let mul = float_of_int (flt_floor x9) in
+        let res = (mul + 1.0) / s9 in
+        VFlt (if res > f then mul / s9 else res))
+     // (ceil has no second look in float.c: `ceil(x * 10**d) / 10**d`, which
+     //  42,098 ruby-written samples agree with -- -2.675.ceil(8) is
+     //  -2.67499999)
+     else VFlt (float_of_int (flt_ceil x9) / s9))
+// b ** e mod m over big digit strings (e >= 0), the result taking m's sign as
+// Integer#% does
+and big_pow_mod_s = fn (b: str) -> fn (e: str) -> fn (m: str) ->
+  let rec go = fn (acc: str) -> fn (base: str) -> fn (ex: str) ->
+    (if str_eq ex "0" then acc
+     else
+       (let (q9, r9) = big_divmod_s ex "2" in
+        let acc2 = (if str_eq r9 "0" then acc else big_mod_s (big_mul_s acc base) m) in
+        go acc2 (big_mod_s (big_mul_s base base) m) q9)) in
+  go (big_mod_s "1" m) (big_mod_s b m) e
+// Integer#[beg, len] exactly: (n >> beg) & ((1 << len) - 1)
+and int_slice_v = fn (n: Val) -> fn (beg: int) -> fn (len: int) ->
+  arith_bin "&" (arith_bin ">>" n (VInt beg)) (arith_bin "-" (arith_bin "<<" (VInt 1) (VInt len)) (VInt 1))
 // frexp's exponent: 2**(e-1) <= |x| < 2**e
 and flt_binexp = fn (x: float) ->
   let rec up = fn (f: float) -> fn (e: int) -> if f >= 1.0 then up (f / 2.0) (e + 1) else (f, e) in
@@ -25481,6 +25530,24 @@ and round_half_mode = fn env -> fn world -> fn (recv: Val) -> fn (args: Val list
                      else if str_eq mode9 "even" then (if q9 - (q9 / 2) * 2 == 0 then q9 else q9 + 1)
                      else q9 + 1) in
            VInt ((if n9 < 0 then 0 - 1 else 1) * q2 * p9))))
+  // a Bignum at a negative precision: the same three ways of settling a tie,
+  // in big arithmetic (it went to the plain #round, which ignored half:)
+  | VBig b9 ->
+    (match digits9 with
+     | Cons (d9, _) when d9 < 0 ->
+       (let _ = check9 () in
+        let m9 = big_pow "10" (0 - d9) "1" in
+        let a9 = big_mag b9 in
+        let (q9, r9) = big_divmod_s a9 m9 in
+        let c9 = big_cmp_s (big_add_s r9 r9) m9 in
+        let up9 = (if c9 > 0 then true else if c9 < 0 then false
+                   else if str_eq mode9 "down" then false
+                   else if str_eq mode9 "even" then (if big_even q9 then false else true)
+                   else true) in
+        let q2 = (if up9 then big_add_s q9 "1" else q9) in
+        let v9 = big_mul_s q2 m9 in
+        norm_big (if big_sign b9 < 0 then big_sub_s "0" v9 else v9))
+     | _ -> (let _ = check9 () in recv))
   | VRat (rn9, rd9) ->
     (let _ = check9 () in
      let rm9 = (if str_eq mode9 "down" then "round_down" else if str_eq mode9 "even" then "round_even" else "round") in
@@ -25532,6 +25599,17 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   v
 and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // Integer#ceildiv by an object that coerces: `-div(0 - other)` through
+  // dispatch, so 0 - other asks the object's #coerce (the leaf cannot)
+  if (str_len name == 7 && str_eq name "ceildiv") && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+     && (match args with Cons (VObj _, Nil) -> true | _ -> false) then
+    (match args with
+     | Cons (o9, _) ->
+       (let n9 = invoke_val_c env world noblk (VInt 0) "-" (Cons (o9, Nil)) false in
+        let q9 = invoke_val_c env world noblk recv "div" (Cons (n9, Nil)) false in
+        invoke_val_c env world noblk (VInt 0) "-" (Cons (q9, Nil)) false)
+     | _ -> VNil)
+  else
   // Exception#exception(msg) of a PAIR: the copy keeps the original's
   // backtrace (`e.exception("bar").backtrace == e.backtrace`), and a pair
   // has nowhere to keep one, so the copy is an object
@@ -25645,7 +25723,7 @@ and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name:
   // was ignored (every tie went up, and a Float with no digits refused the
   // keyword hash as a precision).
   if (str_len name == 5 && str_eq name "round")
-     && (match recv with VInt _ -> true | VFlt _ -> true | VRat (_, _) -> true | _ -> false)
+     && (match recv with VInt _ -> true | VBig _ -> true | VFlt _ -> true | VRat (_, _) -> true | _ -> false)
      && (match args with Nil -> false | _ -> (match vlast args with VHsh h9 -> (match hash_lookup (hderef h9) (VSym "half") with (true, _) -> true | _ -> false) | _ -> false))
   then round_half_mode env world recv args
   // `tally(hash)` counts INTO the hash it is given (and answers it)
@@ -29229,6 +29307,26 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
   else if (str_len name == 3 && str_eq name "pow") && is_num recv
           && (match args with Cons (_, Cons (m0, _)) -> num_is_zero m0 | _ -> false) then
     prim_raise "ZeroDivisionError" "divided by 0"
+  // Integer#remainder by an infinite Float: the receiver -- as a Float when
+  // the signs agree (that is what x % y gives there), itself otherwise --
+  // where fmod-by-way-of-% answered NaN
+  else if (str_len name == 9 && str_eq name "remainder")
+          && (match recv with VInt _ -> true | VBig _ -> true | _ -> false)
+          && (match args with Cons (VFlt y9, Nil) -> flt_is_inf y9 | _ -> false) then
+    (match args with
+     | Cons (VFlt y9, _) ->
+       (let xneg9 = num_isneg recv in
+        if (y9 > 0.0 && (if xneg9 then false else true)) || (y9 < 0.0 && xneg9) then VFlt (to_f recv) else recv)
+     | _ -> recv)
+  // Rational#remainder by an exact number is exact: x - y * (x / y).truncate
+  // (it went to the Float path and answered 0.0)
+  else if (str_len name == 9 && str_eq name "remainder") && (match recv with VRat (_, _) -> true | _ -> false)
+          && (match args with Cons (VInt _, Nil) -> true | Cons (VBig _, Nil) -> true | Cons (VRat (_, _), Nil) -> true | _ -> false) then
+    (match args with
+     | Cons (y9, _) ->
+       (let q9 = prim_method (arith_bin "/" recv y9) "truncate" Nil in
+        arith_bin "-" recv (arith_bin "*" y9 q9))
+     | _ -> recv)
   else if ((str_len name == 3 && str_eq name "div") || (str_len name == 6 && str_eq name "divmod"))
           && is_num recv
           // (...or a NaN receiver: `Float::NAN.div(2)` floors NaN)
@@ -30929,6 +31027,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
         | _ -> ()) in
      let neg_guard = fn (isneg: bool) ->
        (if isneg then (let _ = prim_raise "Math::DomainError" "out of domain" in ()) else ()) in
+     // (the radix goes through #to_int: a Float or Rational one is truncated,
+     //  a Complex one is the RangeError of converting it, and a String or
+     //  any other non-number is refused -- digits("a") answered base 10)
+     let args = (match args with
+                 | Cons (VFlt f9, t9) -> Cons (flt_trunc_v f9, t9)
+                 | Cons (VRat (rn9, rd9), t9) -> Cons (norm_big (rat_int_mode "truncate" rn9 rd9), t9)
+                 | Cons (VCpx (_, _), _) -> (let _ = prim_raise "RangeError" ("can't convert " ++ to_s (match args with Cons (c9, _) -> c9 | _ -> VNil) ++ " into Integer") in args)
+                 | Cons (VInt _, _) -> args
+                 | Cons (VBig _, _) -> args
+                 | Cons (VNil, _) -> args
+                 | Cons (VObj _, _) -> args
+                 | Cons (o9, _) -> (let _ = conv_err o9 "Integer" in args)
+                 | Nil -> args) in
      match recv with
      | VInt n ->
        (let _ = neg_guard (n < 0) in
@@ -31017,13 +31128,19 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
     //   `1.pow(1.5)` is 1.0 and `1.pow(2r)` is (1/1). Matching only VInt made
     //   every other exponent fall to the catch-all, which answered the
     //   RECEIVER -- so pow(1.5) was 1, an Integer, and looked like a result.
-    (match recv with VInt b -> (match args with Cons (VInt e, Cons (VInt m, _)) -> VInt (int_pow_mod b e m) | Cons (e, Nil) -> arith_bin "**" recv e | _ -> VInt b)
-     // a bignum base: the exact power, and the modular form through the same
-     // big arithmetic rather than a machine int that would overflow.
-     | VBig b -> (match args with
-                  | Cons (VInt e, Cons (m, _)) -> norm_big (big_mod_s (big_pow b e "1") (num_dec m))
-                  | Cons (VInt e, _) -> norm_big (big_pow b e "1")
-                  | _ -> VBig b) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "pow") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'pow'")) in fail "mere-ruby: undefined method 'pow'")))
+    // (the modular form with any bignum in it -- base, exponent or modulus --
+    //  is square-and-multiply on the big digits: a bignum exponent matched no
+    //  arm and the RECEIVER came back as the answer)
+    (match (recv, args) with
+     | (VInt b, Cons (VInt e, Cons (VInt m, _))) -> VInt (int_pow_mod b e m)
+     | (VInt _, Cons (e, Nil)) -> arith_bin "**" recv e
+     | (VInt _, Cons (e, Cons (m, _))) -> norm_big (big_pow_mod_s (num_dec recv) (num_dec e) (num_dec m))
+     | (VBig b, Cons (VInt e, Nil)) -> norm_big (big_pow b e "1")
+     | (VBig b, Cons (e, Cons (m, _))) -> norm_big (big_pow_mod_s b (num_dec e) (num_dec m))
+     | (VBig _, Cons (e, Nil)) -> arith_bin "**" recv e
+     | (VInt b, _) -> VInt b
+     | (VBig b, _) -> VBig b
+     | _ -> (let _ = prim_nm_set_ra recv args (mkstr "pow") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'pow'")) in fail "mere-ruby: undefined method 'pow'")))
   else if (str_len name == 5 && str_eq name "even?") then (match recv with VInt n -> VBool (floor_mod n 2 == 0) | VBig b -> VBool (big_even b) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "even?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'even?'")) in fail "mere-ruby: undefined method 'even?'")))
   else if (str_len name == 4 && str_eq name "odd?") then (match recv with VInt n -> VBool (floor_mod n 2 != 0) | VBig b -> VBool (if big_even b then false else true) | _ -> (let _ = prim_nm_set_ra recv args (mkstr "odd?") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'odd?'")) in fail "mere-ruby: undefined method 'odd?'")))
   // Integer#allbits?/anybits?/nobits?(mask): bit-mask predicates.
@@ -31145,8 +31262,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
        (match recv with
         | VInt a9 -> (match b9 with
                       | VInt c9 -> VInt (0 - floor_div (0 - a9) c9)
-                      | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
-        | _ -> arith_bin "-" (VInt 0) (arith_bin "/" (arith_bin "-" (VInt 0) recv) b9))
+                      // (ruby's `-div(0 - other)`: an Integer whatever the
+                      //  divisor, where `/` answered 2.5 for ceildiv(1.2))
+                      | _ -> arith_bin "-" (VInt 0) (prim_method recv "div" (Cons (arith_bin "-" (VInt 0) b9, Nil))))
+        | _ -> arith_bin "-" (VInt 0) (prim_method recv "div" (Cons (arith_bin "-" (VInt 0) b9, Nil))))
      | _ -> (let _ = map_set prim_missing "n" (mkstr "ceildiv") in VNil))
   else if (str_len name == 4 && str_eq name "pred") then (match recv with VInt n -> (if n == int_min then norm_big (big_sub_s (str_of_int n) "1") else VInt (n - 1)) | VBig b -> norm_big (big_sub_s b "1") | _ -> (let _ = prim_nm_set_ra recv args (mkstr "pred") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'pred'")) in fail "mere-ruby: undefined method 'pred'")))
   else if (str_len name == 3 && str_eq name "abs") || (str_len name == 9 && str_eq name "magnitude") then
@@ -31212,7 +31331,13 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> VBool false)
   else if (str_len name == 5 && str_eq name "floor") then
     (match recv with
-     | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (floor_div n m * m)) | _ -> VInt n)
+     // (a power of ten past an int's range is a bignum: `1.ceil(-20)` overflowed)
+     | VInt n -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VInt n
+                     else if 0 - d > 17 then (let m9 = big_pow "10" (0 - d) "1" in norm_big (big_mul_s (rat_int_mode "floor" (str_of_int n) m9) m9))
+                     else (let m = int_pow 10 (0 - d) in VInt (floor_div n m * m)))
+                  | _ -> VInt n)
      // ⚠ a NEGATIVE precision rounds to that power of ten, and `d <= 0`
      //   dropped it: 12345.678.floor(-2) answered 12345, not 12300. floor of
      //   the integer part, then floor to the place, is the same as flooring
@@ -31221,7 +31346,7 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
                   | Cons (VInt d, _) ->
                     (if d < 0 then prim_method (flt_floor_v f) "floor" args
                      else if d == 0 then flt_floor_v f
-                     else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_floor (f * m)) / m)))
+                     else flt_floor_ceil_prec true f d)
                   | _ -> flt_floor_v f)
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
@@ -31238,12 +31363,17 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | _ -> (let _ = prim_nm_set_ra recv args (mkstr "floor") in (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: undefined method 'floor'")) in fail "mere-ruby: undefined method 'floor'")))
   else if (str_len name == 4 && str_eq name "ceil") then
     (match recv with
-     | VInt n -> (match args with Cons (VInt d, _) -> if d >= 0 then VInt n else (let m = int_pow 10 (0 - d) in VInt (0 - (floor_div (0 - n) m) * m)) | _ -> VInt n)
+     | VInt n -> (match args with
+                  | Cons (VInt d, _) ->
+                    (if d >= 0 then VInt n
+                     else if 0 - d > 17 then (let m9 = big_pow "10" (0 - d) "1" in norm_big (big_mul_s (rat_int_mode "ceil" (str_of_int n) m9) m9))
+                     else (let m = int_pow 10 (0 - d) in VInt (0 - (floor_div (0 - n) m) * m)))
+                  | _ -> VInt n)
      | VFlt f -> (match args with
                   | Cons (VInt d, _) ->
                     (if d < 0 then prim_method (flt_ceil_v f) "ceil" args
                      else if d == 0 then flt_ceil_v f
-                     else (let m = float_of_int (int_pow 10 d) in VFlt (float_of_int (flt_ceil (f * m)) / m)))
+                     else flt_floor_ceil_prec false f d)
                   | _ -> flt_ceil_v f)
      // Rational: the rounding family over the exact fraction. Precision 0
      // (or absent) answers an Integer, a positive precision a Rational.
@@ -34240,6 +34370,10 @@ and kern_rat_side = fn env -> fn world -> fn (v: Val) -> fn (raising: bool) ->
   | VBig b -> VBig b
   | VFlt f -> (match flt_rat_parts f 0 with (n, d) -> mk_rat_s n d)
   | VRat (n, d) -> VRat (n, d)
+  // (under `exception: false` a string that reads as "1/0" is nil as well:
+  //  ruby protects the reading, and the zero denominator raises inside it)
+  | VStr h when (if raising then false else true) ->
+    conv_protect world (fn (u: unit) -> (match rb_str_to_r_x (sget h) with (r, true) -> r | _ -> VNil))
   | VStr h ->
     (match rb_str_to_r_x (sget h) with
      | (r, true) -> r
@@ -34362,7 +34496,10 @@ and kernel_integer_go = fn env -> fn world -> fn (pos: Val list) ->
     // #to_int, then #to_str (parsed), then #to_i. A #to_int that answers a
     // non-Integer is not an error by itself: ruby falls through to #to_i and
     // lets THAT one explain the refusal.
-    (match conv_try env world other "to_int" with
+    // (under `exception: false` a #to_int that raises is a refusal as well)
+    (match (if map_has conv_soft "on" && responds world other "to_int" then call_soft env world other "to_int" VNil
+            else conv_try env world other "to_int") with
+     | VSym s9 when str_eq s9 "__mere_soft_fail__" -> (let _ = conv_fail "TypeError" "to_int raised" in VNil)
      | VInt n -> VInt n
      | VBig b -> VBig b
      | _ ->
@@ -34371,7 +34508,12 @@ and kernel_integer_go = fn env -> fn world -> fn (pos: Val list) ->
         | _ ->
           (if responds world other "to_i" then
              (let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
-              match invoke_val_c env world nb other "to_i" Nil false with
+              // (under `exception: false` a #to_i that RAISES is a refusal,
+              //  as Float() treats #to_f)
+              let tv9 = (if map_has conv_soft "on" then call_soft env world other "to_i" VNil
+                         else invoke_val_c env world nb other "to_i" Nil false) in
+              match tv9 with
+              | VSym s9 when str_eq s9 "__mere_soft_fail__" -> (let _ = conv_fail "TypeError" "to_i raised" in VNil)
               | VInt n -> VInt n
               | VBig b -> VBig b
               | bad -> (let _ = conv_fail "TypeError"
