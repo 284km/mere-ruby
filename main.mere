@@ -2451,6 +2451,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                | _ -> make_exc_w world argvals) in
     // stash the exception, then unwind via Mere's fail to the nearest
     // begin/rescue (which reads it back from "$exc").
+    // (a bare one keeps the frames $@ / #set_backtrace gave a pair -- see
+    //  raise_exc's "keep")
+    //  ...only when it re-raises $!: a bare raise with nothing in flight is a
+    //  NEW RuntimeError, equal by value to any earlier one, with frames of its
+    //  own -- corpus/225)
+    let _ = (match argvals with
+             | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
+                       then map_set raise_bt "keep" (VInt 1) else ())
+             | _ -> ()) in
     raise_exc_val world exc
   | EVar name ->
     // `__FILE__` / `__dir__` with the parsed file attached (see enc_pseudo_var).
@@ -4916,8 +4925,13 @@ and gvar_write = fn world -> fn (slot: str) -> fn (v: Val) ->
              else "$" ++ slot) in
   let _ = (if (str_eq slot ";" || str_eq slot "," || str_eq slot "/") && (match v with VNil -> false | _ -> true)
               && deprecation_says ()
-           // (through rb_warn: handed to Warning.warn like every other warning)
-           then rb_warn world ("non-nil '" ++ wn9 ++ "' is deprecated")
+           // (through rb_warn: handed to Warning.warn like every other
+           //  warning -- in the :deprecated category, as rb_warn_deprecated
+           //  names it)
+           then (if (if map_has globals (gvar_slot "VERBOSE")
+                     then (match map_get globals (gvar_slot "VERBOSE") with VNil -> true | _ -> false)
+                     else false) then ()
+                 else warning_emit world (cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: non-nil '" ++ wn9 ++ "' is deprecated\n") (VSym "deprecated"))
            else ()) in
   let _ = map_set globals slot v in
   if map_has hook_flags "gvt" && map_has gvar_traces slot
@@ -23481,21 +23495,57 @@ and signal_deliver_self = fn env -> fn world -> fn (sg: str) ->
 // after it, and makes the status 1; and a handler registered WHILE another
 // runs goes right after that one, not at the end.
 and run_at_exits_r = fn world -> fn report ->
-  // a `trap(:EXIT, handler)` runs first, before the at_exit handlers, and once
+  let st = map_new () in
+  let _ = map_set in_exit_hooks "y" 1 in
+  // a `trap(:EXIT, handler)` runs FIRST, once -- and what it raises is
+  // reported LAST, after the at_exit handlers' own (ruby holds it as the
+  // error that ends the program); it was swallowed
+  let tex9 = map_new () in
   let _ = (let k9 = (if map_has signal_traps "EXIT" then "EXIT" else if map_has signal_traps "SIGEXIT" then "SIGEXIT" else "") in
            if str_eq k9 "" then ()
            else (match map_get signal_traps k9 with
                  | VProc pid9 ->
                    (let _ = map_delete signal_traps k9 in
+                    let (_, _, ocls9, ivars9) = world in
                     let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
-                    let _ = try_or (fn (u: unit) -> run_block world nb9 (proc_as_block pid9) (Cons (VInt 0, Nil))) (FNext VNil) in ())
+                    let before9 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else VNil) in
+                    let ok9 = map_new () in
+                    let _ = try_or (fn (u: unit) ->
+                                      (match run_block world nb9 (proc_as_block pid9) (Cons (VInt 0, Nil)) with
+                                       | FRaise v9 -> FRaise v9
+                                       | r9 -> (let _ = map_set ok9 "y" 1 in r9))) (FNext VNil) in
+                    if map_has ok9 "y" then ()
+                    else
+                      (let exc9 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else before9) in
+                       match exc9 with
+                       | VNil -> ()
+                       | VObj eid9 when exc_is_a world (map_get ocls9 eid9) "SystemExit" ->
+                         map_set st "v" (if map_has ivars9 (str_of_int eid9 ++ "@__status")
+                                         then (match map_get ivars9 (str_of_int eid9 ++ "@__status") with VInt k9 -> k9 | _ -> 0)
+                                         else 0)
+                       // (a pair keeps its frames only in the last-raise slot,
+                       //  which the handlers' raises overwrite before it is
+                       //  reported: it is kept as an object carrying them)
+                       | _ ->
+                         (let kept9 = (match exc9 with
+                                       | VExc (c9, m9) ->
+                                         (let id9 = alloc_oid ocls9 in
+                                          let _ = map_set ocls9 id9 c9 in
+                                          let _ = map_set ivars9 (str_of_int id9 ++ "@message") (mkstr m9) in
+                                          let _ = map_set ivars9 (str_of_int id9 ++ "@__bt")
+                                                    (if map_has raise_bt "v" then map_get raise_bt "v" else VNil) in
+                                          VObj id9)
+                                       | _ -> exc9) in
+                          let _ = map_set tex9 "e" kept9 in let _ = map_set globals "!" exc9 in map_set st "v" 1)))
                  | VObj oid9 ->
                    (let _ = map_delete signal_traps k9 in
                     let nb9 = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
                     let _ = try_or (fn (u: unit) -> FNext (invoke_val_c gc_cenv0 world nb9 (VObj oid9) "call" (Cons (VInt 0, Nil)) false)) (FNext VNil) in ())
                  | _ -> ())) in
-  let st = map_new () in
+  let _ = (if map_has tex9 "e" then map_set gc_hold "trap_exit_exc" (map_get tex9 "e") else ()) in
   let _ = run_at_exit_batch world report st in
+  let _ = (if map_has tex9 "e" then (let _ = report (map_get tex9 "e") in map_delete gc_hold "trap_exit_exc") else ()) in
+  let _ = map_delete in_exit_hooks "y" in
   // ...and after them, what was written and never flushed: an IO's buffer
   // (the prelude keeps the open writable ones) and a File's (@__f_buf), as
   // ruby's finalizers write them at exit. Both were dropped.
@@ -23535,12 +23585,21 @@ and run_at_exit_procs = fn world -> fn report -> fn st -> fn (xs: Val list) ->
     let (_, _, ocls9, ivars9) = world in
     let nb = (false, (Nil : str list), (Nil : Stmt list), map_new ()) in
     let before9 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else VNil) in
+    let bang9 = (if map_has globals "!" then map_get globals "!" else VNil) in
     let ok = map_new () in
     let _ = try_or (fn (u: unit) ->
                       (match run_block world nb (proc_as_block pid) Nil with
                        | FRaise v9 -> FRaise v9
+                       // (a `return` out of a handler is ruby's TAG_RETURN
+                       //  there: "<script>: unexpected return", status 1)
+                       | FReturn r9 -> (let _ = map_set ok "r" 1 in FReturn r9)
                        | r9 -> (let _ = map_set ok "y" 1 in r9))) (FNext VNil) in
+    let exc0 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else before9) in
     let _ = (if map_has ok "y" then ()
+             // (...and so is a handler that ended without raising anything
+             //  new: the return was thrown past the block)
+             else if map_has ok "r" || (match exc0 with VNil -> true | _ -> rb_eq exc0 before9) then
+               (let _ = print_err (cur_file () ++ ": unexpected return") in map_set st "v" 1)
              else
                (let exc9 = (if map_has ivars9 "$exc" then map_get ivars9 "$exc" else before9) in
                 let sx9 = (match exc9 with
@@ -23554,7 +23613,19 @@ and run_at_exit_procs = fn world -> fn report -> fn st -> fn (xs: Val list) ->
                                      else 0)
                    | _ -> ())
                 else
-                  (let _ = report exc9 in
+                  // (a cause that an earlier handler's report already showed
+                  //  -- the $! this one raised over -- is not shown again)
+                  (let ck9 = (match exc9 with VObj eid9 -> str_of_int eid9 ++ "@__cause" | _ -> "") in
+                   let cv9 = (if str_eq ck9 "" then VNil else if map_has ivars9 ck9 then map_get ivars9 ck9 else VNil) in
+                   //  -- or the exception ending the program, printed after
+                   //  them; a builtin's exception is a value with no id, so
+                   //  it is compared as a value)
+                   let hide9 = (match cv9 with
+                                | VNil -> false
+                                | _ -> (match bang9 with VNil -> false | _ -> rb_eq cv9 bang9)) in
+                   let _ = (if hide9 then map_set ivars9 ck9 VNil else ()) in
+                   let _ = report exc9 in
+                   let _ = (if hide9 then map_set ivars9 ck9 cv9 else ()) in
                    let _ = map_set globals "!" exc9 in
                    map_set st "v" 1))) in
     let _ = run_at_exit_batch world report st in
@@ -25381,6 +25452,24 @@ and dispatch_prim = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: 
   v
 and dispatch_prim0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (name: str) -> fn (args: Val list) -> fn (vischeck: bool) ->
   let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // Exception#exception(msg) of a PAIR: the copy keeps the original's
+  // backtrace (`e.exception("bar").backtrace == e.backtrace`), and a pair
+  // has nowhere to keep one, so the copy is an object
+  if (str_len name == 9 && str_eq name "exception") && (match recv with VExc (_, _) -> true | _ -> false)
+     && (match args with Cons (VNil, _) -> false | Cons (_, _) -> true | Nil -> false) then
+    (match prim_method recv name args with
+     | VExc (c9, m9) ->
+       (match invoke_val_c env world noblk recv "backtrace" Nil false with
+        | VArr bt9 ->
+          (let (_, _, oc9, iv9) = world in
+           let id9 = alloc_oid oc9 in
+           let _ = map_set oc9 id9 c9 in
+           let _ = map_set iv9 (str_of_int id9 ++ "@message") (mkstr m9) in
+           let _ = map_set iv9 (str_of_int id9 ++ "@__bt") (VArr bt9) in
+           VObj id9)
+        | _ -> VExc (c9, m9))
+     | other9 -> other9)
+  else
   // ⚠ KERNEL METHODS CALLED WITH NOTHING. A bare `loop` / `warn` /
   //   `iterator?` reaches here now that try_self_call routes every Kernel name
   //   (it used to be "undefined local variable or method"), and these three
@@ -39710,7 +39799,11 @@ and kernel_warn = fn env -> fn world -> fn (args: Val list) ->
                   (let text9 = pre9 ++ body9 ++ "\n" in
                    match (if lv_has env "self" then lv_get env "self" else VNil) with
                    | VClass "Warning" -> (if stdio_emit world "stderr" text9 then () else err_raw text9)
-                   | _ -> warning_emit world text9 cat9)
+                   // (Kernel#warn goes through Warning.warn, so with that
+                   //  undefined it is a NoMethodError)
+                   | _ -> (if map_len undefs > 0 && undef_blocked world "Warning" "warn"
+                           then (let _ = raise_exc world "NoMethodError" "undefined method 'warn' for module Warning" in ())
+                           else warning_emit world text9 cat9))
                 else ()))
             | Nil -> ()) in
    VNil)
@@ -41302,6 +41395,11 @@ and kernel_raise_now = fn world -> fn (args: Val list) ->
   // (make_exc_w has already decided the cause -- a pair here has none, not
   // even the one in flight, when `cause: nil` said so)
   | VExc (c9, m9) -> (let _ = tp_raise world exc in
+                      // (a bare raise of the $! in flight keeps its frames)
+                      let _ = (match args with
+                               | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
+                                         then map_set raise_bt "keep" (VInt 1) else ())
+                               | _ -> ()) in
                       let _ = map_set globals "!" VNil in
                       raise_exc world c9 m9)
   | _ -> (let _ = map_set iv0 "$exc" exc in raise_exc_val world exc)
@@ -43224,6 +43322,12 @@ and exc_cause_chain = fn env -> fn world -> fn (recv: Val) -> fn (bt9: Val) -> f
     let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
     (match invoke_val_c env world noblk9 recv "cause" Nil false with
      | VNil -> Cons ((recv, bt9), Nil)
+     // (in the top level's report a cause whose message raises is left
+     //  out, with everything behind it, as ruby's printer does)
+     | c9 when map_has exc_report_soft "y"
+               && (match call_soft env world c9 "message" VNil with
+                   | VSym f9 -> str_eq f9 "__mere_soft_fail__"
+                   | _ -> false) -> Cons ((recv, bt9), Nil)
      | c9 -> (if rb_eq c9 recv then Cons ((recv, bt9), Nil)
               else Cons ((recv, bt9), exc_cause_chain env world c9 (exc_cause_bt world recv) (fuel9 - 1))))
 
@@ -43242,6 +43346,38 @@ and exc_blocks_rev = fn env -> fn world -> fn (xs: (Val * Val) list) -> fn (hl: 
   | Nil -> ""
   | Cons ((h9, b9), t9) -> exc_one_message env world h9 b9 hl true ++ exc_blocks_rev env world t9 hl
 
+// recv.name(arg) (no argument for VNil) run inside a rescue: an exception it
+// raises answers :__mere_soft_fail__ instead of propagating
+// (the raise it swallowed leaves no trace: the last raise's frames, $exc and
+//  $! are put back, or the report would print the swallowed one's frames)
+and call_soft = fn env -> fn world -> fn (recv: Val) -> fn (name: str) -> fn (arg: Val) ->
+  let (_, _, _, iv9) = world in
+  let e9 = lv_child env in
+  let _ = map_set e9 "__mere_r" recv in
+  let _ = map_set e9 "__mere_a" arg in
+  let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+  // (kept in gc_hold while the call runs: the raise inside overwrites the
+  //  slots, and then these copies are the only references left)
+  let sv9 = map_new () in
+  let _ = map_iter raise_bt (fn (k9: str) -> fn (v9: Val) -> (let _ = map_set sv9 k9 v9 in map_set gc_hold ("csoft:" ++ k9) v9)) in
+  let exc9 = (if map_has iv9 "$exc" then map_get iv9 "$exc" else VNil) in
+  let bang9 = (if map_has globals "!" then map_get globals "!" else VNil) in
+  let _ = map_set gc_hold "csoft$exc" exc9 in
+  let _ = map_set gc_hold "csoft$!" bang9 in
+  let r9 = eval_e e9 world nb9
+    (EStmt (SBegin (Cons (SExpr (EMethod (EVar "__mere_r", name, (match arg with VNil -> Nil | _ -> Cons (EVar "__mere_a", Nil)))), Nil),
+                    Cons ((Nil, "", Cons (SExpr (ESym "__mere_soft_fail__"), Nil)), Nil), Nil, Nil))) in
+  let _ = (match r9 with
+           | VSym f9 when str_eq f9 "__mere_soft_fail__" ->
+             (let _ = map_clear raise_bt in
+              let _ = map_iter sv9 (fn (k9: str) -> fn (v9: Val) -> map_set raise_bt k9 v9) in
+              let _ = (match exc9 with VNil -> map_delete iv9 "$exc" | _ -> map_set iv9 "$exc" exc9) in
+              map_set globals "!" bang9)
+           | _ -> ()) in
+  let _ = map_iter sv9 (fn (k9: str) -> fn (v9: Val) -> map_delete gc_hold ("csoft:" ++ k9)) in
+  let _ = map_delete gc_hold "csoft$exc" in
+  let _ = map_delete gc_hold "csoft$!" in
+  r9
 and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (btov9: Val) -> fn (hl: bool) -> fn (bottom: bool) ->
   let e9 = chr 27 in
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
@@ -43268,6 +43404,12 @@ and exc_one_message = fn env -> fn world -> fn (recv: Val) -> fn (btov9: Val) ->
   // its message -- the undef question has to be asked as an undef question.
   let dmv9 = (if undef_blocked world (exc_cls_of world recv) "detailed_message"
               then VNil
+              // (in the top level's report a message that raises is caught,
+              //  and the class name stands for it: `def to_s = raise`)
+              else if map_has exc_report_soft "y" then
+                (match call_soft env world recv "detailed_message" kwh9 with
+                 | VSym f9 when str_eq f9 "__mere_soft_fail__" -> VNil
+                 | v9 -> v9)
               else invoke_val_c env world noblk9 recv "detailed_message" (Cons (kwh9, Nil)) false) in
   let dm9 = (match dmv9 with
              | VStr h9 -> sget h9
@@ -46190,7 +46332,10 @@ and exec_stmt = fn env -> fn world -> fn blk -> fn (s: Stmt) ->
      else
        (let _ = map_set end_sites k VNil in
         let pid = (proc_next ()) in
-        let _ = store_proc (str_of_int pid) (true, (Nil : str list), body, env) in
+        // (closed over one more scope than the block itself: ruby compiles
+        //  END { } as a block inside a block, and its frame is "block (2
+        //  levels) in <main>")
+        let _ = store_proc (str_of_int pid) (true, (Nil : str list), body, lv_child env) in
         let _ = map_set at_exits (str_of_int (map_len at_exits)) (VProc pid) in
         FNext VNil))
   // ⚠ The parser also builds this for a CHAINED assignment (`$g = a = 5`,
