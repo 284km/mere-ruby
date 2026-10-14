@@ -3678,6 +3678,8 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
          //   forwards every operator it does not define itself.
          else if has_meth world cls "method_missing" then
            invoke_val_c env world blk (VObj id) "~" Nil false
+         // (a Regexp object -- an allocated one -- answers Regexp#~ itself)
+         else if exc_is_a world cls "Regexp" then invoke_val_c env world blk (VObj id) "~" Nil false
          else (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: unary ~ on non-integer")) in fail "mere-ruby: unary ~ on non-integer")
        // `~ /re/` is Regexp#~: the pattern against $_ (nil when $_ is not a
        // String), which is `$_ =~ /re/`
@@ -3817,6 +3819,18 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
        let r8 = truthy (invoke_val_c env world noblk va0 (if str_eq op "!=" then "==" else op) (Cons (eval_e env world blk b, Nil)) false) in
        VBool (if str_eq op "!=" then (if r8 then false else true) else r8))
+    // an allocated Regexp with no pattern refuses the comparison with another
+    // Regexp (rb_reg_equal), which this operator path never asked
+    else if (str_eq op "==" || str_eq op "!=")
+       && (match va0 with VObj _ -> rx_uninit_v world va0 | _ -> false) then
+      (let r8 = rb_eq_w0 env world va0 (eval_e env world blk b) in
+       VBool (if str_eq op "==" then r8 else (if r8 then false else true)))
+    // ...and `=~` reads the pattern it does not have
+    else if str_eq op "=~" && (match va0 with VObj _ -> rx_uninit_v world va0 | _ -> false) then
+      (let _ = eval_e env world blk b in raise_exc world "TypeError" "uninitialized Regexp")
+    // ...and `===` is false for it, even against itself (rb_reg_eqq)
+    else if str_eq op "===" && (match va0 with VObj _ -> rx_uninit_v world va0 | _ -> false) then
+      (let _ = eval_e env world blk b in VBool false)
     else if (str_eq op "==" || str_eq op "!=")
        && (match va0 with VHsh _ -> true | VArr _ -> true | _ -> false)
        && (let bv8 = eval_e env world blk b in
@@ -9562,8 +9576,51 @@ and rb_eq_w = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
      | (VStr x9, VStr y9) when x9 == y9 -> true
      | _ -> truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false))
   else rb_eq_w0 env world a b
+// is there a capturing group inside a lookaround? `lvl` counts the open
+// parens and `open_at` is the level of the outermost open lookaround (0:
+// none), which closes when its own paren does
+and rx_look_has_cap = fn (src: str) -> fn (i: int) -> fn (lvl: int) -> fn (open_at: int) ->
+  if i >= str_len src then false
+  else
+    let c = char_at src i in
+    if str_eq c "\\" then rx_look_has_cap src (i + 2) lvl open_at
+    else if str_eq c "[" then rx_look_has_cap src (rx_skip_cls src (i + 1)) lvl open_at
+    else if str_eq c "(" then
+      // (a LOOKAHEAD: ruby counts a capture in a lookbehind as linear,
+      //  `/.(?<=(a))/`, and one in a lookahead as not)
+      (let lb = i + 3 < str_len src && str_eq (char_at src (i + 1)) "?" && str_eq (char_at src (i + 2)) "<"
+                && (str_eq (char_at src (i + 3)) "=" || str_eq (char_at src (i + 3)) "!") in
+       let la = i + 2 < str_len src && str_eq (char_at src (i + 1)) "?"
+                && (str_eq (char_at src (i + 2)) "=" || str_eq (char_at src (i + 2)) "!") in
+       let cap = (if i + 1 < str_len src && str_eq (char_at src (i + 1)) "?" then
+                    (i + 2 < str_len src && (str_eq (char_at src (i + 2)) "<" || str_eq (char_at src (i + 2)) "'")
+                     && (if la || lb then false else true))
+                  else true) in
+       if open_at > 0 && cap then true
+       else rx_look_has_cap src (i + 1) (lvl + 1) (if open_at == 0 && la then lvl + 1 else open_at))
+    else if str_eq c ")" then rx_look_has_cap src (i + 1) (lvl - 1) (if open_at == lvl then 0 else open_at)
+    else rx_look_has_cap src (i + 1) lvl open_at
+and rx_skip_cls = fn (src: str) -> fn (i: int) ->
+  if i >= str_len src then i
+  else if str_eq (char_at src i) "\\" then rx_skip_cls src (i + 2)
+  else if str_eq (char_at src i) "]" then i + 1
+  else rx_skip_cls src (i + 1)
+// an allocated Regexp with no pattern: == refuses it against another Regexp
+and rx_uninit_v = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id9 -> (let (_, _, oc9, iv9) = world in
+                 exc_is_a world (map_get oc9 id9) "Regexp" && (if map_has iv9 (str_of_int id9 ++ "@__rx_src") then false else true))
+  | _ -> false
 and rb_eq_w0 = fn env -> fn world -> fn (a: Val) -> fn (b: Val) ->
   match a with
+  | VObj _ when rx_uninit_v world a ->
+    (if rb_identical a b then true
+     else (match b with
+           | VRegex (_, _, _) -> (let _ = raise_exc world "TypeError" "uninitialized Regexp" in false)
+           | VObj o9 when (let (_, _, oc9, _) = world in exc_is_a world (map_get oc9 o9) "Regexp") ->
+             (let _ = raise_exc world "TypeError" "uninitialized Regexp" in false)
+           | _ -> false))
+  | VRegex (_, _, _) when rx_uninit_v world b -> (let _ = raise_exc world "TypeError" "uninitialized Regexp" in false)
   | VObj _ ->
     if has_own_eq world a
     then truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) a "==" (Cons (b, Nil)) false)
@@ -13889,6 +13946,9 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let (_, _, ocls9, _) = world in
        let c9 = map_get ocls9 oid in
        if thr_is_thread world recv then thread_inspect_v world recv
+       // (an allocated Regexp has no pattern to write: Regexp#to_s refuses,
+       //  where #inspect answers the object's form)
+       else if (str_len name == 4 && str_eq name "to_s") && rx_uninit_v world recv then raise_exc world "TypeError" "uninitialized Regexp"
        else if (str_len name == 4 && str_eq name "to_s") then mkstr ("#<" ++ cls_display world (obj_print_cls world c9) ++ ":0x" ++ hex_pad16 (oid - handle_base) ++ ">")
        else mkstr (inspect_w env world recv)
      | _ -> mkstr (inspect_w env world recv))
@@ -16145,6 +16205,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        | Nil -> md)
     else if str_eq c "Regexp" && ((str_len name == 6 && str_eq name "escape") || (str_len name == 5 && str_eq name "quote")) then
       (match args with
+       // (an encoding that is not ASCII-compatible -- UTF-16, UTF-32 -- is
+       //  quoted by its characters, through UTF-8, and stays in it)
+       | Cons (VStr s, _) when (if enc_ascii_compat (senc_get s) then false else true) ->
+         (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+          match invoke_val_c env world nb9 (VStr s) "encode" (Cons (mkstr "UTF-8", Nil)) false with
+          | VStr u9 -> invoke_val_c env world nb9 (mkstr (rx_escape (sget u9))) "encode" (Cons (mkstr (senc_get s), Nil)) false
+          | o9 -> o9)
        | Cons (VStr s, _) ->
          (let e9 = rx_escape (sget s) in
           let v9 = mkstr e9 in
@@ -16210,11 +16277,16 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        let src9 = (match args with
                    | Cons (VRegex (sp9, _, _), _) -> sp9
                    | Cons (VStr sh9, _) -> sget sh9
+                   // (nil and an allocated Regexp with no pattern are refused)
+                   | Cons (VObj o9, _) when rx_uninit_v world (VObj o9) -> (let _ = raise_exc world "TypeError" "uninitialized Regexp" in "")
+                   | Cons (a9, _) -> (let _ = raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name a9 ++ " into String") in "")
                    | _ -> "") in
-       // a lookaround IS linear (ruby answers true for one); a backreference
-       // is what makes a match need to remember and go back.
+       // a lookaround IS linear (ruby answers true for one) -- unless it
+       // captures, which the match cache cannot follow; a backreference is
+       // what makes a match need to remember and go back.
        VBool (if str_contains src9 "\\1" || str_contains src9 "\\2" || str_contains src9 "\\3"
                  || str_contains src9 "\\4" || str_contains src9 "\\5" || str_contains src9 "\\k<"
+                 || rx_look_has_cap src9 0 0 0
               then false else true))
     else if str_eq c "Regexp" && (str_len name == 5 && str_eq name "union") then
       // one array argument or a varargs list; no alternatives at all is the
@@ -21825,10 +21897,33 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
             && (if map_has ivars (str_of_int id ++ "@__rx_src") then false else true)
             && (if has_meth world cls name then false else true)
             && ((str_len name == 6 && str_eq name "source") || (str_len name == 7 && str_eq name "options") || (str_len name == 5 && str_eq name "match")
-                || (str_len name == 6 && str_eq name "match?") || (str_len name == 2 && str_eq name "=~") || (str_len name == 3 && str_eq name "===")
+                || (str_len name == 6 && str_eq name "match?") || (str_len name == 2 && str_eq name "=~")
                 || (str_len name == 5 && str_eq name "names") || (str_len name == 14 && str_eq name "named_captures")
                 || (str_len name == 9 && str_eq name "casefold?") || (str_len name == 4 && str_eq name "to_s") || (str_len name == 4 && str_eq name "hash")) then
       raise_exc world "TypeError" "uninitialized Regexp"
+    // ...=== is false and ~ nil for one (ruby's rb_reg_eqq and rb_reg_match2
+    // answer without reading a pattern there)
+    else if exc_is_a world cls "Regexp"
+            && (if map_has ivars (str_of_int id ++ "@__rx_src") then false else true)
+            && (if has_meth world cls name then false else true)
+            && ((str_len name == 3 && str_eq name "===") || (str_len name == 1 && str_eq name "~")
+                || (str_len name == 8 && str_eq name "encoding") || (str_len name == 15 && str_eq name "fixed_encoding?")) then
+      (if str_eq name "===" || str_eq name "fixed_encoding?" then VBool false
+       // (and its encoding is BINARY: no pattern has given it one)
+       else if str_eq name "encoding" then
+         (let cn9 = enc_find_canon "ASCII-8BIT" in if map_has enc_objs cn9 then map_get enc_objs cn9 else VNil)
+       else VNil)
+    // ...and == / eql? answer true for the same object and refuse against
+    // another Regexp (rb_reg_equal checks both after the identity test)
+    else if exc_is_a world cls "Regexp"
+            && (if map_has ivars (str_of_int id ++ "@__rx_src") then false else true)
+            && (if has_meth world cls name then false else true)
+            && ((str_len name == 2 && str_eq name "==") || (str_len name == 4 && str_eq name "eql?")) then
+      (match args with
+       | Cons (VObj o9, _) when o9 == id -> VBool true
+       | Cons (VRegex (_, _, _), _) -> raise_exc world "TypeError" "uninitialized Regexp"
+       | Cons (VObj o9, _) when exc_is_a world (map_get ocls o9) "Regexp" -> raise_exc world "TypeError" "uninitialized Regexp"
+       | _ -> VBool false)
     // an initialized one refuses a second #initialize (the private one, sent)
     else if exc_is_a world cls "Regexp"
             && map_has ivars (str_of_int id ++ "@__rx_src")
@@ -34262,6 +34357,11 @@ and kernel_copy_hook = fn env -> fn world -> fn (recv: Val) -> fn (name: str) ->
           (if val_is_frozen recv then raise_exc world "FrozenError" ("can't modify frozen Hash: " ++ inspect recv)
            else (let _ = hset h9 (hderef o9) in recv))
         | _ -> raise_exc world "TypeError" ("no implicit conversion of " ++ conv_gives_name other9 ++ " into Hash"))
+     // (a Regexp is a value here and always frozen, where ruby's dup is not:
+     //  its refusal of the wrong kind of argument comes first)
+     else if (match recv with VRegex (_, _, _) -> true | _ -> false)
+             && (if str_eq (rcls9 recv) (rcls9 other9) then false else true)
+     then raise_exc world "TypeError" "initialize_copy should take same class object"
      else if val_is_frozen recv
      then raise_exc world "FrozenError"
             ("can't modify frozen " ++ display_cls_msg world (rcls9 recv) ++ ": " ++ inspect recv)
@@ -48322,7 +48422,32 @@ and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
   else if str_eq c "\\" then rxp_escape pat (p + 1) fl g
   else if str_eq c "*" || str_eq c "+" || str_eq c "?" then (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: regexp: target of repeat operator is not specified")) in fail "mere-ruby: regexp: target of repeat operator is not specified")
   else if str_contains fl "i" && ord c >= 128 then rxp_ci_mb pat p g
-  else ((if str_contains fl "i" && is_alpha c then NCharCI c else NChar c), p + 1, g)
+  else if str_contains fl "i" && is_alpha c then rxp_ci_ascii pat p g
+  else (NChar c, p + 1, g)
+
+// an ASCII letter under /i in a UTF-8 pattern: also the characters outside
+// ASCII that fold to it -- ſ (U+017F) to s and the Kelvin sign (U+212A) to
+// k -- and `ss` (when no quantifier takes the second s) is also ß and ẞ,
+// whose fold is that pair. Onigmo's case fold table; elsewhere the letter.
+and rx_bytes_seq = fn (x: str) ->
+  let rec go = fn (i: int) -> (if i >= str_len x then (Nil : RNode list) else Cons (NChar (char_at x i), go (i + 1))) in
+  NSeq (go 0)
+and rxp_ci_ascii = fn (pat: str) -> fn (p: int) -> fn (g: int) ->
+  let c = char_at pat p in
+  if vec_get rxp_u8 0 == 1 then
+    (let is_s = fn (x: str) -> str_eq x "s" || str_eq x "S" in
+     // (one class instruction, not an alternation: a split per letter was a
+     //  backtrack frame per `s` of every /i match)
+     let salt = NClass (Cons (CChr "s", Cons (CChr "S", Cons (CChr (chr 197 ++ chr 191), Nil))), false, false) in
+     if is_s c && p + 1 < str_len pat && is_s (char_at pat (p + 1))
+        && (if p + 2 < str_len pat && str_contains "*+?\{" (char_at pat (p + 2)) then false else true) then
+       (NAlt (Cons (NSeq (Cons (salt, Cons (salt, Nil))),
+                    Cons (rx_bytes_seq (chr 195 ++ chr 159), Cons (rx_bytes_seq (chr 225 ++ chr 186 ++ chr 158), Nil)))), p + 2, g)
+     else if is_s c then (salt, p + 1, g)
+     else if str_eq c "k" || str_eq c "K" then
+       (NClass (Cons (CChr "k", Cons (CChr "K", Cons (CChr (chr 226 ++ chr 132 ++ chr 170), Nil))), false, false), p + 1, g)
+     else (NCharCI c, p + 1, g))
+  else (NCharCI c, p + 1, g)
 
 // a non-ASCII literal under /i: the WHOLE character of the subject's cut
 // (UTF-8, or the multibyte encoding rxv_search_e set) and its one-codepoint
@@ -48335,9 +48460,12 @@ and rxp_atom = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
 //   reused. A pattern meets a subject of its own encoding (anything else is
 //   a CompatibilityError first), so the bytes decide the encoding in practice.
 and rxp_ci_mb = fn (pat: str) -> fn (p: int) -> fn (g: int) ->
-  let k9 = vec_get cut_k 0 in
+  // (the UTF-8 /i program -- rxc_get's key says so -- is UTF-8 whatever cut
+  //  the parse runs under: an ASCII subject left it one byte at a time)
+  let u89 = vec_get rxp_u8 0 == 1 in
+  let k9 = (if u89 then 1 else vec_get cut_k 0) in
   let e9 = (if k9 == 2 then enc_canon_name (vec_get cut_e 0) else "UTF-8") in
-  let n9 = (if k9 == 0 then 1 else cut_clen pat p) in
+  let n9 = (if k9 == 0 then 1 else if u89 then utf8_clen pat p else cut_clen pat p) in
   let ch9 = substring pat p (p + n9) in
   let rec bytes9 = fn (x: str) -> fn (i: int) -> (if i >= str_len x then (Nil : RNode list) else Cons (NChar (char_at x i), bytes9 x (i + 1))) in
   let rec list_has_int = fn (xs: int list) -> fn (v: int) -> (match xs with Nil -> false | Cons (h9, t9) -> (if h9 == v then true else list_has_int t9 v)) in
@@ -48346,7 +48474,9 @@ and rxp_ci_mb = fn (pat: str) -> fn (p: int) -> fn (g: int) ->
     (match decode_cps ch9 e9 0 with
      | Cons (cp9, Nil) ->
        let one9 = fn (xs: int list) -> (match xs with Cons (v9, Nil) -> v9 | _ -> cp9) in
-       let cands9 = Cons (one9 (cp_up_seq cp9), Cons (one9 (cp_down_seq cp9), Cons (one9 (cp_fold_seq cp9), Nil))) in
+       // (ß's upcase is "SS", so its capital ẞ is named here)
+       let cands9 = Cons (one9 (cp_up_seq cp9), Cons (one9 (cp_down_seq cp9), Cons (one9 (cp_fold_seq cp9),
+                      cp_fold_extra (one9 (cp_fold_seq cp9))))) in
        let rec alts9 = fn (xs: int list) -> fn (seen: int list) -> fn (acc: RNode list) ->
          (match xs with
           | Nil -> acc
@@ -48355,7 +48485,18 @@ and rxp_ci_mb = fn (pat: str) -> fn (p: int) -> fn (g: int) ->
              else (match encode_cps (Cons (v9, Nil)) e9 "" with
                    | (w9, true) -> alts9 t9 (Cons (v9, seen)) (Cons (NSeq (bytes9 w9 0), acc))
                    | _ -> alts9 t9 seen acc))) in
-       (match alts9 cands9 Nil Nil with
+       // ...and a fold that is SEVERAL characters, all ASCII (ß and ẞ fold
+       // to "ss"), is that sequence under /i too
+       let fs9 = cp_fold_seq cp9 in
+       let rec allasc9 = fn (xs: int list) -> (match xs with Nil -> true | Cons (v9, t9) -> v9 < 128 && allasc9 t9) in
+       // (a non-ASCII one in it is its UTF-8 bytes: ŉ folds to "ʼn")
+       let multi9 = (match fs9 with Cons (_, Cons (_, _)) -> allasc9 fs9 || str_eq e9 "UTF-8" | _ -> false) in
+       let rec seq9 = fn (xs: int list) -> (match xs with
+                        | Nil -> (Nil : RNode list)
+                        | Cons (v9, t9) -> Cons ((if v9 >= 128 then rx_bytes_seq (utf8_enc v9)
+                                                  else if is_alpha (chr v9) then NCharCI (chr v9) else NChar (chr v9)), seq9 t9)) in
+       let all9 = (let a9 = alts9 cands9 Nil Nil in if multi9 then Cons (NSeq (seq9 fs9), a9) else a9) in
+       (match all9 with
         | Nil -> (NSeq (bytes9 ch9 0), p + n9, g)
         | more9 -> (NAlt (Cons (NSeq (bytes9 ch9 0), more9)), p + n9, g))
      | _ -> (NChar (char_at pat p), p + 1, g))
@@ -48478,7 +48619,12 @@ and rxp_escape = fn (pat: str) -> fn (p: int) -> fn (fl: str) -> fn (g: int) ->
     else if str_eq c "u" then
       (if p + 4 < str_len pat && rxp_hexv (char_at pat (p + 1)) >= 0 && rxp_hexv (char_at pat (p + 2)) >= 0
           && rxp_hexv (char_at pat (p + 3)) >= 0 && rxp_hexv (char_at pat (p + 4)) >= 0
-       then (NSeq (rxp_u_bytes (utf8_enc (rxp_hex4 pat (p + 1))) 0), p + 5, g)
+       // (under /i a non-ASCII one folds as the literal character does:
+       //  `/^\u00df$/i =~ "ss"`)
+       then (let cp9 = rxp_hex4 pat (p + 1) in
+             if str_contains fl "i" && cp9 >= 128 then
+               (match rxp_ci_mb (utf8_enc cp9) 0 g with (n9, _, g9) -> (n9, p + 5, g9))
+             else (NSeq (rxp_u_bytes (utf8_enc cp9) 0), p + 5, g))
        else (let __fm = "mere-ruby: regexp: invalid Unicode escape" in
              let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr __fm)) in fail __fm))
     else if str_eq c "k" || str_eq c "g" || str_eq c "p" ||
@@ -48969,11 +49115,25 @@ and rxc_emit_alt = fn prog -> fn (pc: int) -> fn (xs: RNode list) -> fn (jmps: i
 and rx_cut_key = fn (pat: str) -> fn (fl: str) ->
   let k9 = fl ++ chr 1 ++ pat in
   if vec_get cut_k 0 == 2 && str_contains fl "i" && (if str_all_ascii_go pat 0 (str_len pat) then false else true)
-  then k9 ++ chr 2 ++ vec_get cut_e 0 else k9
+  then k9 ++ chr 2 ++ vec_get cut_e 0
+  // ...and in a UTF-8 cut a /i pattern with s or k (whose folds reach ſ, ß
+  // and the Kelvin sign, rxp_ci_ascii) or with any non-ASCII byte compiles
+  // differently from the one-byte cut: `(?i:ss)` met an ASCII "ss" first and
+  // that program answered for "ſS" afterwards
+  else if vec_get cut_k 0 == 1 && (str_contains fl "i" || (str_contains pat "(?" && str_contains pat "i"))
+          && (str_contains pat "s" || str_contains pat "S" || str_contains pat "k" || str_contains pat "K"
+              || (if str_all_ascii_go pat 0 (str_len pat) then false else true))
+  then k9 ++ chr 2 ++ "U8"
+  else k9
 and rxc_get = fn (pat: str) -> fn (fl: str) ->
   let key = rx_cut_key pat fl in
   if map_has rx_progs key then map_get rx_progs key
   else
+    // (whether this is the UTF-8 /i program, decided by the key: the parse
+    //  below cuts by the PATTERN's encoding, so cut_k there is not the
+    //  subject's -- rxp_ci_ascii reads this instead)
+    let _ = vec_set rxp_u8 0 (if str_ends_with key (chr 2 ++ "U8") then 1 else 0) in
+
     // ⚠ THE PARSE HAPPENS HERE, at MATCH time -- not when the literal was
     //   built, which is why wrapping the build caught nothing. An unsupported
     //   construct `fail`ed from inside this function and killed the process:
@@ -49294,6 +49454,9 @@ and rxv_run = fn prog -> fn (s: str) -> fn (pc: int) -> fn (i: int)
        let here = (if i + (b - a) <= str_len s then substring s i (i + (b - a)) else "") in
        let eqv = (if ci then str_eq (str_upcase seg) (str_upcase here) else str_eq seg here) in
        if eqv && i + (b - a) <= str_len s then rxv_run prog s (pc + 1) (i + (b - a)) saves bt
+       // (under /i in UTF-8, by folded characters, whose byte lengths may differ)
+       else if ci && vec_get cut_k 0 == 1 && (let n9 = rxv_ci_ref_len s i seg in n9 >= 0) then
+         rxv_run prog s (pc + 1) (i + rxv_ci_ref_len s i seg) saves bt
        else (match bt with Nil -> RFail | Cons ((fpc9, fi9, fsv9), frest9) -> (let _ = rxv_tick () in rxv_run prog s fpc9 fi9 fsv9 frest9)))
   | ILook (sub, negd) ->
     (match rxv_inner prog s sub i saves with
@@ -49664,7 +49827,10 @@ and rx_do_match_at = fn world -> fn (pat: str) -> fn (fl: str) -> fn (sv: str) -
 and rxv_search_e = fn (pat: str) -> fn (fl: str) -> fn (s: str) -> fn (start: int) -> fn (enc: str) ->
   // (a one-byte encoding steps byte by byte: BINARY "\xC2\xA1" is two
   //  characters, so /\xA1/ is found at 1 and gsub(//) visits three places)
-  if enc_cut enc != 1 && enc_ascii_compat (enc_canon_name enc) then
+  // (a US-ASCII subject is cut as UTF-8: its bytes are the same either way,
+  //  and the /i folds of a UTF-8 pattern -- `(?i:ß)` against "ss" -- are the
+  //  UTF-8 program's)
+  if enc_cut enc != 1 && enc_ascii_compat (enc_canon_name enc) && (if str_eq (enc_canon_name enc) "US-ASCII" then false else true) then
     (let _ = cut_set enc in
      let r = rxv_search pat fl s start in
      let _ = cut_set "UTF-8" in
