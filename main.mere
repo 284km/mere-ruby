@@ -2223,6 +2223,15 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     let defcls = (match lv_get env "__defcls" with VClass c -> c | _ -> "") in
     let meth = (match lv_get env "__meth" with VStr s -> let s = sget s in s | _ -> "") in
     let recv = if lv_has env "self" then lv_get env "self" else VMain in
+    // ⚠ super inside an instance_eval of ANOTHER object: self is no longer an
+    //   instance of the class the method is defined in, and ruby refuses
+    //   ("self has wrong type to call super in this context: Object
+    //   (expected Sub)"); it went looking along the wrong object's chain
+    if super_self_check world env defcls recv then
+    raise_exc world "TypeError" ("self has wrong type to call super in this context: "
+                                 ++ cls_display world (display_cls world (dispatch_cls_of world recv))
+                                 ++ " (expected " ++ cls_display world (display_cls world (dispatch_cls_of world (lv_meth_self env recv))) ++ ")")
+    else
     // a bare (implicit-args) `super` from a define_method-defined method has no
     // fixed argument list to forward, so Ruby raises RuntimeError.
     if zsuper && map_has dm_methods (defcls ++ "#" ++ meth) then
@@ -23512,15 +23521,23 @@ and warn_perf_redef = fn world -> fn (key: str) ->
                          ++ substring key 0 sh9 ++ "#" ++ substring key (sh9 + 1) (str_len key)
                          ++ "' disables interpreter and JIT optimizations\n") (VSym "performance"))
   else ()
-// vm_init_redefined_flag's table, class by class
+// the methods whose redefinition ruby warns about, asked of ruby 4.0.6 by
+// tools/gen_perf_bop_keys.rb (vm.c's table is keyed by method DEFINITION, so
+// Array#- and String#% warn though the OP() list does not name them; the list
+// written from vm.c by hand missed them, and test_optimization asks)
 and perf_bop_keys = fn (u: unit) ->
-  " Integer#+ Float#+ String#+ Array#+ Integer#- Float#- Integer#* Float#* Integer#/ Float#/ Integer#% Float#%"
-  ++ " Integer#== Float#== String#== Symbol#== Integer#=== Float#=== Symbol#=== String#=== NilClass#=== TrueClass#=== FalseClass#==="
-  ++ " Integer#< Float#< Integer#<= Float#<= Integer#> Float#> Integer#>= Float#>= String#<< Array#<< Integer#>>"
-  ++ " Array#[] Hash#[] Integer#[] Array#[]= Hash#[]= Array#length String#length Hash#length Array#size String#size Hash#size"
-  ++ " Array#empty? String#empty? Hash#empty? Integer#succ String#succ Regexp#=~ String#=~ String#freeze Array#freeze Hash#freeze"
-  ++ " String#-@ Array#max Array#min Array#hash Proc#call Integer#& Integer#| NilClass#nil? Integer#<=> Float#<=> String#<=>"
-  ++ " Hash#default Array#include? "
+  " Integer#% Integer#& Integer#* Integer#+ Integer#- Integer#-@ Integer#/ Integer#< Integer#<< Integer#<= "
+  ++ " Integer#<=> Integer#== Integer#=== Integer#> Integer#>= Integer#>> Integer#[] Integer#size Integer#succ "
+  ++ " Integer#| Float#% Float#* Float#+ Float#- Float#-@ Float#/ Float#< Float#<= Float#<=> Float#== Float#=== "
+  ++ " Float#> Float#>= Float#hash String#% String#* String#+ String#-@ String#<< String#<=> String#== String#=== "
+  ++ " String#=~ String#[] String#[]= String#empty? String#freeze String#hash String#length String#size String#succ "
+  ++ " Array#& Array#* Array#+ Array#- Array#<< Array#<=> Array#== Array#[] Array#[]= Array#empty? Array#freeze "
+  ++ " Array#hash Array#include? Array#length Array#max Array#min Array#pack Array#size Array#| Hash#< Hash#<= "
+  ++ " Hash#== Hash#> Hash#>= Hash#[] Hash#[]= Hash#default Hash#empty? Hash#freeze Hash#hash Hash#length Hash#size "
+  ++ " Symbol#<=> Symbol#== Symbol#=== Symbol#=~ Symbol#[] Symbol#empty? Symbol#length Symbol#size Symbol#succ "
+  ++ " Regexp#== Regexp#=== Regexp#=~ Regexp#hash NilClass#& NilClass#=== NilClass#=~ NilClass#nil? NilClass#| "
+  ++ " TrueClass#& TrueClass#=== TrueClass#| FalseClass#& FalseClass#=== FalseClass#| Proc#<< Proc#== Proc#=== "
+  ++ " Proc#[] Proc#call Proc#hash "
 // undef / undef_method / remove_method of the three methods the VM leans on
 // (rb_undef, rb_remove_method): "undefining 'object_id' may cause serious
 // problems", unless $VERBOSE is nil
@@ -42252,6 +42269,21 @@ and cls_shown_name = fn world -> fn (v: Val) ->
      | _ -> class_name v)
   | _ -> class_name v
 
+// the self of the METHOD frame around this env (an instance_eval inside the
+// method rebinds self in a child scope; the frame with __meth keeps the
+// method's own receiver)
+and lv_meth_self = fn env -> fn (dflt: Val) ->
+  if map_has env "__meth" then (if map_has env "self" then map_get env "self" else dflt)
+  else (let (has9, p9) = lv_parent_of env in if has9 then lv_meth_self p9 dflt else dflt)
+// super from a method of a CLASS whose self has been rebound (instance_eval)
+// to something that is no instance of that class: ruby's TypeError
+and super_self_check = fn world -> fn env -> fn (defcls: str) -> fn (recv: Val) ->
+  if str_eq defcls "" || is_sng_cls defcls then false
+  else
+    (let ms9 = lv_meth_self env recv in
+     if rb_identical ms9 recv then false
+     else (if str_list_has (ancestors_of world (dispatch_cls_of world recv)) defcls then false else true))
+
 // Is `name` one a Range subclass instance answers as its Range: ruby 4.0's
 // Range.instance_methods(false) + Enumerable.instance_methods.
 and rng_sub_name = fn (name: str) ->
@@ -43158,6 +43190,9 @@ and alias_builtin_exists = fn world -> fn (cls: str) -> fn (n: str) ->
         // a name define_method / alias_method pointed at a builtin
         || map_has builtin_alias (c9 ++ "#" ++ n) || any9 t9)) in
   any9 (Cons (cls, ancestors_of world cls))
+  // (BasicObject's private hooks every class has: `class BasicObject;
+  //  alias_method :initialize, :initialize` -- test_super, Bug #21992)
+  || str_eq n "initialize" || str_eq n "method_missing" || str_eq n "respond_to_missing?"
   // ⚠ ...and a REFINEMENT sees the class it refines: `refine Array do alias
   //   orig_count count end` names Array#count, and the refinement module's
   //   own chain (Refinement, Module, Object...) has no count, so it was a
