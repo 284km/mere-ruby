@@ -12815,6 +12815,13 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
               || (str_len name == 5 && str_eq name "ctime") || (str_len name == 4 && str_eq name "to_s")
               || (str_len name == 7 && str_eq name "inspect") || (str_len name == 4 && str_eq name "to_a")
               || (str_len name == 7 && str_eq name "iso8601") || (str_len name == 9 && str_eq name "xmlschema")
+              // a Time is made whole by its constructor; initializing it
+              // AGAIN is ruby's TypeError (a subclass's own initialize is
+              // the subclass's)
+              || (str_len name == 10 && str_eq name "initialize"
+                  && (match recv with
+                      | VObj oid -> (let (_, _, ocls9, _) = world in not (has_meth world (map_get ocls9 oid) "initialize"))
+                      | _ -> false))
               // ⚠ THE ALIASES, which ruby's Time has for nearly every name it
               //   inherited from C's struct tm: gmt?/utc?, gmtime/utc,
               //   getgm/getutc, gmt_offset and gmtoff for utc_offset,
@@ -13021,17 +13028,22 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // "time"). The argument is how many fractional digits to show, ZERO
        // PADDED to that width -- iso8601(3) of .5 is ".500", not ".5".
        else if (str_len name == 7 && str_eq name "iso8601") || (str_len name == 9 && str_eq name "xmlschema") then
-         (let nd = (match args with Cons (VInt d9, _) -> d9 | _ -> 0) in
+         // the digits are an Integer through to_int (1.9 is 1), and past the
+         // ninth they are zeros: the instant is kept in whole nanoseconds
+         (let nd = (match args with Cons (VInt d9, _) -> d9 | Cons (VFlt f9, _) -> int_of_float f9 | _ -> 0) in
           let (yy, mo, dd, hh, mi, ss) = time_local_parts world recv in
           let utc9 = time_is_utc world recv in
+          let ns9 = pad_left_zeros (str_of_int (time_nsec_of world recv)) 9 in
           let frac = (if nd <= 0 then ""
-                      else "." ++ substring (pad_left_zeros (str_of_int (time_nsec_of world recv)) 9) 0 (if nd > 9 then 9 else nd)) in
+                      else if nd > 9 then "." ++ ns9 ++ str_repeat "0" (nd - 9)
+                      else "." ++ substring ns9 0 nd) in
           mkstr_ascii (pad_left_zeros (str_of_int yy) 4 ++ "-" ++ pad_left_zeros (str_of_int mo) 2 ++ "-"
                  ++ pad_left_zeros (str_of_int dd) 2 ++ "T" ++ pad_left_zeros (str_of_int hh) 2 ++ ":"
                  ++ pad_left_zeros (str_of_int mi) 2 ++ ":" ++ pad_left_zeros (str_of_int ss) 2
                  ++ frac ++ (if utc9 then "Z" else time_off_str (time_off world recv) true)))
        // ⚠ the printers answer US-ASCII, as ruby's do (they were UTF-8 here,
        //   and core/time's to_s and inspect each ask)
+       else if (str_len name == 10 && str_eq name "initialize") then raise_exc world "TypeError" "already initialized Time"
        else if (str_len name == 4 && str_eq name "to_s") then mkstr_ascii (time_str_of world recv false)
        else if (str_len name == 7 && str_eq name "inspect") then mkstr_ascii (time_str_of world recv true)
        else if (str_len name == 4 && str_eq name "to_a") then
@@ -38052,7 +38064,9 @@ and time_parse_off1 = fn world -> fn (v: Val) ->
         let used9 = 3 + (if str_len rest9 == 0 then 0
                          else if str_eq (char_at rest9 0) ":" then 3 + (if str_len r10 > 0 then 3 else 0)
                          else 2 + (if str_len r10 > 0 then 2 else 0)) in
-        if used9 == str_len s9 && hh9 < 24 && mm9 < 60 && ss9 < 60
+        // a NEGATIVE zero ("-0000", "-00") is UTC, RFC 3339's unknown offset
+        if used9 == str_len s9 && sg9 < 0 && hh9 == 0 && mm9 == 0 && ss9 == 0 then (1, 0)
+        else if used9 == str_len s9 && hh9 < 24 && mm9 < 60 && ss9 < 60
         then (2, sg9 * (hh9 * 3600 + mm9 * 60 + ss9))
         else if used9 == str_len s9 && hh9 >= 24 && mm9 < 60 && ss9 < 60
         then (let _ = raise_exc world "ArgumentError" "utc_offset out of range" in (0, 0))
@@ -38333,12 +38347,23 @@ and time_strip_kw = fn (args: Val list) ->
   | Cons (VHsh _, Nil) -> Nil
   | Cons (x9, t9) -> Cons (x9, time_strip_kw t9)
 
-// Time.at's number: an Integer, Float or Rational as it is; an object with
-// both #to_r and #to_int through to_r, with #to_int alone through to_int;
-// anything else "can't convert X into an exact number".
+// Time.at's number, time.c's num_exact_check: an Integer, Float or Rational
+// as it is; an object with #to_r answers through to_r when it also has
+// #to_int (a String or a Time has to_r and is not a number), and one with
+// #to_int alone through to_int. Either answer must be an Integer or a
+// Rational, else "can't convert X into an exact number". Asked through
+// respond_to?, so a SimpleDelegator around a number is that number.
 and time_exact = fn world -> fn (v: Val) ->
   let blk9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
-  let bad9 = fn (u: unit) -> raise_exc world "TypeError" ("can't convert " ++ class_name v ++ " into an exact number") in
+  // the class as its #to_s shows it (EnvUtil.labeled_class names one so)
+  let bad9 = fn (u: unit) ->
+    (let cn9 = (match v with
+                | VObj _ -> (match invoke_val_c gc_cenv0 world blk9 (VClass (dispatch_cls_of world v)) "to_s" Nil false with
+                             | VStr h9 -> sget h9
+                             | _ -> class_name v)
+                | _ -> class_name v) in
+     raise_exc world "TypeError" ("can't convert " ++ cn9 ++ " into an exact number")) in
+  let num9 = fn (x9: Val) -> (match x9 with VInt _ -> x9 | VRat (_, _) -> x9 | _ -> bad9 ()) in
   match v with
   | VInt _ -> v
   | VFlt _ -> v
@@ -38347,9 +38372,10 @@ and time_exact = fn world -> fn (v: Val) ->
     (let c9 = dispatch_cls_of world v in
      // a Numeric HAS #to_int (Numeric's own, served by the dispatcher arm,
      // which no method-table row names)
-     let hasint9 = has_meth world c9 "to_int" || obj_is_a world c9 "Numeric" in
-     if hasint9 && has_meth world c9 "to_r" then invoke_val_c gc_cenv0 world blk9 v "to_r" Nil false
-     else if has_meth world c9 "to_int" then invoke_val_c gc_cenv0 world blk9 v "to_int" Nil false
+     let hasint9 = obj_is_a world c9 "Numeric" || responds world v "to_int" in
+     if responds world v "to_r" then
+       (if hasint9 then num9 (invoke_val_c gc_cenv0 world blk9 v "to_r" Nil false) else bad9 ())
+     else if hasint9 then num9 (invoke_val_c gc_cenv0 world blk9 v "to_int" Nil false)
      else bad9 ())
   | _ -> bad9 ()
 
@@ -38361,7 +38387,7 @@ and time_units_ns = fn (v: Val) -> fn (unit: int) ->
     // the whole part first: f - floor(f) is exact in binary, and scaling
     // the whole of a large float by 1e9 would round its fraction away
     (let w9 = (let t9 = int_of_float f9 in if float_of_int t9 > f9 then t9 - 1 else t9) in
-     w9 * unit + time_bin_frac_units (f9 - float_of_int w9) unit 1)
+     w9 * unit + time_bin_frac_units (f9 - float_of_int w9) unit 0)
   | VRat (rn9, rd9) -> int_of_str (big_div_s (big_mul_s rn9 (str_of_int unit)) rd9)
   | _ -> 0
 
@@ -38369,10 +38395,12 @@ and time_units_ns = fn (v: Val) -> fn (unit: int) ->
 // so the answer is m*unit div 2^k. Scaling the float directly rounds
 // 0.69999999999999996 * 1e9 up to 700000000 (ruby's Time.at(100) + -1.3
 // has usec 699999).
-and time_bin_frac_units = fn (x: float) -> fn (unit: int) -> fn (den: int) ->
-  if x == float_of_int (int_of_float x) || den >= 1152921504606846976 then
-    int_of_str (big_div_s (big_mul_s (str_of_int (int_of_float x)) (str_of_int unit)) (str_of_int den))
-  else time_bin_frac_units (x * 2.0) unit (den * 2)
+// ⚠ The denominator is a power of two counted, not an int: 0.0001 needs
+// 2^66, and stopping at 2^60 dropped its last bits (usec 99, not 100).
+and time_bin_frac_units = fn (x: float) -> fn (unit: int) -> fn (k: int) ->
+  if x == float_of_int (int_of_float x) || k >= 1100 then
+    int_of_str (big_div_s (big_mul_s (str_of_int (int_of_float x)) (str_of_int unit)) (big_pow2_s k))
+  else time_bin_frac_units (x * 2.0) unit (k + 1)
 
 // Time.at(sec [, sub [, unit]]) in nanoseconds since the epoch.
 and time_at_ns = fn world -> fn (pos: Val list) ->
