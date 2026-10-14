@@ -18,3 +18,8 @@ t(7) { [4.remainder(Float::INFINITY), -4.remainder(Float::INFINITY), 4.remainder
 t(8) { [Rational(0) ** Rational(2, 3), 0 ** Rational(2, 3), 1 ** Rational(1, 2), Rational(4) ** Rational(1, 2), (Rational(0) ** Rational(-2, 3) rescue $!.class)] }
 t(9) { o = Object.new; def o.to_int = 10; [10.digits(o), 1.digits(10r), 1.digits(10.0), (10.digits("a") rescue $!.class), (10.digits(10 + 1i) rescue $!.class)] }
 t(10) { o = Object.new; def o.to_i = raise("x"); [Integer(o, exception: false), Rational("1/0", exception: false), "5e_1".to_r, "5e_1".to_c, Rational(1, 10**23).to_f] }
+
+# a zero or an infinity has no binary exponent to walk to, and a large
+# negative precision floors or ceils through the Integer (note 344, after)
+p [0.0.ceil(10), 0.0.floor(10), -0.0.ceil(3), 0.0.ceil(20), 0.0.floor(-5)]
+p [123.0.ceil(-20), 123.0.floor(-20), -123.0.floor(-20), -123.0.ceil(-20), 123.0.round(-20)]
