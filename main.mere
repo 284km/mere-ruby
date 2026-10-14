@@ -3738,7 +3738,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // Two HASHES (or two Arrays) that the structural comparison calls unequal,
     // holding objects: their members' own #== decides, and the value-level
     // comparison cannot ask it. Routed to the dispatcher, which has the arm.
-    if (str_eq op "==" || str_eq op "!=")
+    // (A Regexp SUBCLASS instance compares as the Regexp it holds; its #==
+    //  is the dispatcher's, which an object's identity answered here.)
+    if (str_eq op "==" || str_eq op "!=" || str_eq op "===") && (rx_sub_held world va0 || rng_sub_held world va0)
+       && (if has_meth world (dispatch_cls_of world va0) (if str_eq op "!=" then "==" else op) then false else true) then
+      (let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+       let r8 = truthy (invoke_val_c env world noblk va0 (if str_eq op "!=" then "==" else op) (Cons (eval_e env world blk b, Nil)) false) in
+       VBool (if str_eq op "!=" then (if r8 then false else true) else r8))
+    else if (str_eq op "==" || str_eq op "!=")
        && (match va0 with VHsh _ -> true | VArr _ -> true | _ -> false)
        && (let bv8 = eval_e env world blk b in
            (match (va0, bv8) with
@@ -4106,11 +4113,13 @@ and eval_bin_prim = fn env -> fn world -> fn blk -> fn (op: str) -> fn (va0: Val
              let oclq = map_get ocq oq in
              let nb = (false, (Nil : str list), (Nil : Stmt list), env) in
              if has_meth world oclq "=~" then invoke world nb (VObj oq) oclq "=~" (Cons (va0, Nil))
+             else if rx_sub_held world vb then invoke_val_c env world blk vb "=~" (Cons (va0, Nil)) false
              // a mock's =~ lives behind method_missing: call that directly.
              else if has_meth world oclq "method_missing"
              then invoke world nb (VObj oq) oclq "method_missing" (Cons (VSym "=~", Cons (va0, Nil)))
              else VNil)
           | _ -> VNil)
+       | VObj _ when rx_sub_held world va0 -> invoke_val_c env world blk va0 "=~" (Cons (vb, Nil)) false
        | VSym sv -> (match vb with VRegex (p, pf, _) -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
        | VRegex (p, pf, _) -> (match vb with VStr sv -> rx_do_match world p pf (sget sv) (senc_get sv) | VSym sv -> rx_do_match world p pf sv (sym_enc_name sv) | _ -> VNil)
        | _ -> VNil)
@@ -10422,6 +10431,16 @@ and inspect_w = fn env -> fn world -> fn (v: Val) ->
     else if (if has_meth world cls "inspect" then false else true) && map_has iv2 (str_of_int oid ++ "@__tst")
             && thr_is_thread world v
     then thread_inspect world v
+    // ...and a Range or Regexp SUBCLASS instance prints as what it holds
+    // (a Range that holds itself, test_range's CyclicRange, is
+    //  "(... .. ...)" inside itself, as ruby's recursive inspect says)
+    else if (if has_meth world cls "inspect" then false else true)
+            && (rng_sub_held world v || rx_sub_held world v)
+    then (if map_has insp_seen ("r" ++ str_of_int oid) then "(... .. ...)"
+          else (let _ = map_set insp_seen ("r" ++ str_of_int oid) 1 in
+                let r8 = inspect_w env world (if rng_sub_held world v then rng_sub_as_range world v else rx_sub_as_regex world v) in
+                let _ = map_delete insp_seen ("r" ++ str_of_int oid) in
+                r8))
     // an #inspect that answers a NON-String is asked #to_s, and only if THAT
     // is not a String either does the default rendering stand in. #to_str is
     // never asked (the spec pins that too). `to_s other` skipped the dispatch
@@ -10928,6 +10947,34 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
                         else ())
            | _ -> ()) in
   if (if str_eq __am "" then false else true) then raise_exc world "ArgumentError" __am
+  // a Regexp SUBCLASS instance (an object carrying @__rx_src, see
+  // seed_builtin_subclass_ivars) compares, matches and prints as the Regexp
+  // it holds. These names were answered before the Regexp readers' arm was
+  // reached: `==` by identity, `===` false, inspect as an object.
+  else if (str_eq name0 "==" || str_eq name0 "===" || str_eq name0 "=~" || str_eq name0 "!~" || str_eq name0 "inspect")
+          && (rx_sub_held world recv0
+              || (str_eq name0 "==" && (match recv0 with VRegex (_, _, _) -> true | _ -> false)
+                  && (match args0 with Cons (a9, _) -> rx_sub_held world a9 | Nil -> false)))
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
+    if str_eq name0 "inspect" then mkstr (inspect_w env world recv0) else
+    (let re9 = rx_sub_as_regex world recv0 in
+     let args9 = (if str_eq name0 "==" then (match args0 with Cons (a9, r9) -> Cons (rx_sub_as_regex world a9, r9) | Nil -> Nil) else args0) in
+     invoke_val_c env world blk re9 name0 args9 false)
+  // Range#initialize reached by name on a Range subclass instance
+  // (`allocate` and then `send(:initialize, lo, hi)`, as test_range's
+  // CyclicRange is built): the bounds are taken once, and a second time is
+  // ruby's FrozenError -- a Range is frozen once it has them.
+  else if str_eq name0 "initialize" && (match recv0 with VObj _ -> true | _ -> false)
+          && exc_is_a world (dispatch_cls_of world recv0) "Range"
+          && (if has_meth world (dispatch_cls_of world recv0) "initialize" then false else true) then
+    rng_sub_init world recv0 args0 false
+  // ...and once it has them, a Range subclass instance answers the Range
+  // methods as the Range it holds (they were all "undefined method"), unless
+  // the subclass defines the name itself
+  else if (match recv0 with VObj _ -> true | _ -> false) && rng_sub_name name0 && rng_sub_held world recv0
+          && (if has_meth world (dispatch_cls_of world recv0) name0 then false else true) then
+    (if str_eq name0 "inspect" then mkstr (inspect_w env world recv0)
+     else invoke_val_c env world blk (rng_sub_as_range world recv0) name0 args0 vischeck)
   // the numeric readers refuse an ASCII-incompatible receiver before they
   // read it (rb_must_asciicompat): "12".encode("UTF-16LE").to_i
   else if (match recv0 with VStr h9 -> (if enc_ascii_compat (enc_canon_name (senc_get h9)) then false else true) | _ -> false)
@@ -17902,6 +17949,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // whether a value HAS a singleton class, asked without making one: most
     // objects have none, and making one to look (Object#singleton_class) would
     // give every dumped String a class of its own.
+    // Range#initialize on an allocated Range subclass instance, without the
+    // subclass's own initialize (marshal.c's range_loader calls range_init)
+    else if str_eq c "Marshal" && (str_len name == 10 && str_eq name "__rng_init") then
+      (match args with
+       | Cons (r9, rest9) -> (let _ = rng_sub_init world r9 rest9 true in r9)
+       | Nil -> VNil)
     else if str_eq c "Marshal" && (str_len name == 5 && str_eq name "__sng") then
       (match args with
        | Cons (VObj id9, _) ->
@@ -34220,6 +34273,12 @@ and try_self_call_x = fn env -> fn world -> fn (blame: Val) -> fn (name: str) ->
   let self9 = (if lv_has env "self" then lv_get env "self" else VNil) in
   if (match blame with VNil -> true | b9 -> rb_identical b9 self9) && mod_inst_delegates world self9 name then
     invoke_val_c env world noblk self9 name args false
+  // a bare `initialize(lo, hi)` in a Range subclass instance is Range's
+  // (test_range's CyclicRange: `o.instance_eval { initialize(o, 1) }`)
+  else if (str_len name == 10 && str_eq name "initialize") && (match blame with VNil -> true | b9 -> rb_identical b9 self9)
+          && (match self9 with VObj _ -> exc_is_a world (dispatch_cls_of world self9) "Range" | _ -> false)
+          && (if self_defines env world name then false else true) then
+    rng_sub_init world self9 args false
   else
   // VNil = "blame whatever self turned out to be"; a caller that routed an
   // explicit receiver through here passes that receiver instead.
@@ -35127,6 +35186,11 @@ and try_self_call = fn env -> fn world -> fn (blame: Val) -> fn (name: str) -> f
         let nm9 = (match mn9 with VSym y9 -> y9 | VStr h9 -> sget h9 | _ -> inspect mn9) in
         raise_exc_iv world "NoMethodError" ("undefined method '" ++ nm9 ++ "' for " ++ for_recv_cls world (dispatch_cls_of world slf9))
           (Cons (("__name", VSym nm9), Cons (("__recv", slf9), Nil)))))
+  // (a bare Range#initialize: see try_self_call_x)
+  else if (str_len name == 10 && str_eq name "initialize") && lv_has env "self"
+          && (match lv_get env "self" with VObj _ -> exc_is_a world (dispatch_cls_of world (lv_get env "self")) "Range" | _ -> false)
+          && (if self_defines env world name then false else true) then
+    rng_sub_init world (lv_get env "self") args false
   // (define_singleton_method with its body as an argument: see try_self_call_x)
   else if (str_len name == 23 && str_eq name "define_singleton_method")
           && (match args with Cons (_, Cons (_, _)) -> true | _ -> false)
@@ -36301,6 +36365,11 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // takes the pattern (and options) -- it was BasicObject's, which takes
   // nothing, so `def initialize(*a) = super` could not be constructed. The
   // pattern is what the subclass passes up, so it is seeded again from here.
+  // (...and a Range subclass's is Range#initialize, which takes the bounds)
+  else if str_eq meth "initialize"
+          && (match recv with VObj _ -> true | _ -> false)
+          && exc_is_a world (dispatch_cls_of world recv) "Range" then
+    rng_sub_init world recv args true
   else if str_eq meth "initialize"
           && (match recv with VObj _ -> true | _ -> false)
           && exc_is_a world (dispatch_cls_of world recv) "Regexp" then
@@ -41921,6 +41990,74 @@ and new_obj_wb = fn world -> fn (cls: str) -> fn (args: Val list) -> fn theblk -
      if map_has meth_broke 0 then (let _ = map_delete meth_broke 0 in r9) else obj)
   else init_arity_refuse world cls args obj
 
+// Range#initialize for a Range subclass instance: two or three arguments,
+// bounds that compare (`lo <=> hi` not nil), and not twice (ruby's
+// range_modify: "'initialize' called twice") -- except from
+// `super` in the subclass's own initialize, which `new` already seeded from
+// its arguments (the subclass may pass different ones up).
+and rng_sub_init = fn world -> fn (recv: Val) -> fn (args: Val list) -> fn (from_super: bool) ->
+  let (_, _, _, iv9) = world in
+  match recv with
+  | VObj id ->
+    (let n9 = val_list_len args in
+     if n9 < 2 || n9 > 3 then
+       raise_exc world "ArgumentError" ("wrong number of arguments (given " ++ str_of_int n9 ++ ", expected 2..3)")
+     else if map_has iv9 (str_of_int id ++ "@__rg_lo") && (if from_super then false else true) then
+       raise_exc world "NameError" "'initialize' called twice"
+     else
+       (let lo9 = (match args with Cons (a9, _) -> a9 | Nil -> VNil) in
+        let hi9 = (match args with Cons (_, Cons (b9, _)) -> b9 | _ -> VNil) in
+        let noblk = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        let ok9 = (match (lo9, hi9) with
+                   | (VNil, _) -> true
+                   | (_, VNil) -> true
+                   | _ -> (match invoke_val_c gc_cenv0 world noblk lo9 "<=>" (Cons (hi9, Nil)) false with VNil -> false | _ -> true)) in
+        if ok9 then (let _ = seed_builtin_subclass_ivars world (dispatch_cls_of world recv) id args in VNil)
+        else raise_exc world "ArgumentError" "bad value for range"))
+  | _ -> VNil
+
+// Is `name` one a Range subclass instance answers as its Range: ruby 4.0's
+// Range.instance_methods(false) + Enumerable.instance_methods.
+and rng_sub_name = fn (name: str) ->
+  let _ = (if map_len rng_sub_names == 0 then
+             rng_sub_fill "%|==|===|all?|any?|begin|bsearch|chain|chunk|chunk_while|collect|collect_concat|compact|count|cover?|cycle|detect|drop|drop_while|each|each_cons|each_entry|each_slice|each_with_index|each_with_object|end|entries|eql?|exclude_end?|filter|filter_map|find|find_all|find_index|first|flat_map|grep|grep_v|group_by|hash|include?|inject|inspect|last|lazy|map|max|max_by|member?|min|min_by|minmax|minmax_by|none?|one?|overlap?|partition|reduce|reject|reverse_each|select|size|slice_after|slice_before|slice_when|sort|sort_by|step|sum|take|take_while|tally|to_a|to_h|to_s|to_set|uniq|zip" 0 0
+           else ()) in
+  map_has rng_sub_names name
+and rng_sub_fill = fn (all: str) -> fn (i: int) -> fn (st: int) ->
+  if i >= str_len all then (if i > st then map_set rng_sub_names (substring all st i) true else ())
+  else if str_eq (char_at all i) "|" then (let _ = map_set rng_sub_names (substring all st i) true in rng_sub_fill all (i + 1) (i + 1))
+  else rng_sub_fill all (i + 1) st
+// A Range subclass instance with its bounds, and the Range it holds.
+and rng_sub_held = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id -> (let (_, _, _, iv9) = world in map_has iv9 (str_of_int id ++ "@__rg_lo"))
+  | _ -> false
+and rng_sub_as_range = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id ->
+    (let (_, _, _, iv9) = world in
+     let k9 = str_of_int id in
+     if map_has iv9 (k9 ++ "@__rg_lo") then
+       VRange (map_get iv9 (k9 ++ "@__rg_lo"), map_get iv9 (k9 ++ "@__rg_hi"),
+               (match (if map_has iv9 (k9 ++ "@__rg_ex") then map_get iv9 (k9 ++ "@__rg_ex") else VBool false) with VBool b9 -> b9 | _ -> false))
+     else v)
+  | _ -> v
+
+// Is this a Regexp subclass instance with its pattern, and the Regexp it holds.
+and rx_sub_held = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id -> (let (_, _, _, iv9) = world in map_has iv9 (str_of_int id ++ "@__rx_src"))
+  | _ -> false
+and rx_sub_as_regex = fn world -> fn (v: Val) ->
+  match v with
+  | VObj id ->
+    (let (_, _, _, iv9) = world in
+     if map_has iv9 (str_of_int id ++ "@__rx_src") then
+       VRegex (to_s (map_get iv9 (str_of_int id ++ "@__rx_src")),
+               (if map_has iv9 (str_of_int id ++ "@__rx_flags") then to_s (map_get iv9 (str_of_int id ++ "@__rx_flags")) else ""), "")
+     else v)
+  | _ -> v
+
 // a Regexp SUBCLASS instance keeps its pattern (Regexp#initialize would
 // have): source and flags live in ivars, and the regexp methods rebuild a
 // VRegex from them (see super_missing). A Range SUBCLASS instance keeps its
@@ -42568,7 +42705,13 @@ and for_recv_obj = fn env -> fn world -> fn (recv: Val) -> fn (c: str) ->
 and cls_display = fn world -> fn (c0: str) ->
   let (meths, sup, ocls, ivars) = world in
   let c = impl_public c0 in
-  if is_sng_cls c then
+  // a class defined INSIDE a singleton class, "(sng:N)::K": the singleton as
+  // ruby prints it, then the rest of the path (#<Class:#<Object:0x..>>::K)
+  if is_sng_cls c && (if str_eq (char_at c (str_len c - 1)) ")" then false else true)
+     && str_find_from c ")::" 0 > 0 then
+    (let i9 = str_find_from c ")::" 0 in
+     cls_display world (substring c 0 (i9 + 1)) ++ substring c (i9 + 1) (str_len c))
+  else if is_sng_cls c then
     (let inner = sng_inner c in
      if str_len inner > 0 && is_digit (char_at inner 0)
      then (let oid = int_of_str inner in
