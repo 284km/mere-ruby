@@ -872,6 +872,8 @@ let gc_mark_roots = fn env -> fn live ->
   let _ = map_iter flow_sig mk in
   // (a `break` value on its way out of Lazy#each)
   let _ = map_iter lz_brk mk in
+  // (defined?'s shared answers)
+  let _ = map_iter defined_ans mk in
   // the receiver of the builtin running now (bi_reg_r, one slot): it is
   // asked for its class when a refusal names the builtin
   let _ = gc_mark_val live (bi_reg_recv ()) in
@@ -2085,11 +2087,14 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
        // "constant". Only the bare name was tried here.
        else if is_upper_first name then eval_e env world blk (EDefined (EConst name))
        else if lv_has env name then mkstr "local-variable"
-       else if is_method_defined env world name || is_kernel_builtin name then mkstr "method"
+       else if is_method_defined env world name || is_kernel_builtin name || defined_self_has env world name || defined_self_rtm env world name then mkstr "method"
        else VNil
      // (every argument has to be defined first -- see defined_args_ok)
-     | ECall (name, a9) -> if defined_args_ok env world blk a9 && (is_method_defined env world name || is_kernel_builtin name) then mkstr "method" else VNil
-     | ECallB (name, a9, _, _) -> if defined_args_ok env world blk a9 && (is_method_defined env world name || is_kernel_builtin name) then mkstr "method" else VNil
+     // ...and a call (with parentheses or without -- the bare name above)
+     // asks self's respond_to_missing? too, private methods included
+     // (Bug #11212)
+     | ECall (name, a9) -> if defined_args_ok env world blk a9 && (is_method_defined env world name || is_kernel_builtin name || defined_self_has env world name || defined_self_rtm env world name) then mkstr "method" else VNil
+     | ECallB (name, a9, _, _) -> if defined_args_ok env world blk a9 && (is_method_defined env world name || is_kernel_builtin name || defined_self_has env world name) then mkstr "method" else VNil
      // `puts(x)` parses to its own statement; it is a Kernel call like print
      | EStmt (SPuts a9) -> if defined_args_ok env world blk a9 then mkstr "method" else VNil
      // `@@x` parses as the ivar "@x": a CLASS variable, asked along the chain
@@ -2228,13 +2233,21 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
      // An array LITERAL is defined only if every element is: ruby answers nil
      // for `defined?([Object, Undefined])`. It was "expression" whatever it
      // held, because the literal fell into the catch-all.
-     | EArr es9 -> (if defined_all_elems env world blk es9 then mkstr "expression" else VNil)
+     // (a splat in it is asked about what it spreads, as a call's is, and a
+     //  hash literal is asked the same of its keys and values)
+     | EArr es9 -> (if defined_args_ok env world blk es9 then mkstr "expression" else VNil)
+     | EHsh es9 -> (if defined_args_ok env world blk es9 then mkstr "expression" else VNil)
      // `defined? super` WITHOUT parens parses as a real super node (the
      // parenthesised spelling reaches EVar "super" instead), so this arm was
      // missing and every one of them answered "expression".
      | ESuper (_, _) -> defined_super_str env world
      | _ -> mkstr "expression")) in   // literals, operators, ranges, ternary
-     (match ans9 with VStr h9 -> (let _ = sfrozen_set h9 in ans9) | _ -> ans9))
+     (match ans9 with
+      | VStr h9 ->
+        (let a9 = sget h9 in
+         if map_has defined_ans a9 then map_get defined_ans a9
+         else (let _ = sfrozen_set h9 in let _ = map_set defined_ans a9 ans9 in ans9))
+      | _ -> ans9))
   | ESuper (zsuper, arges) ->
     let (meths, sup, ocls, ivars) = world in
     let defcls = (match lv_get env "__defcls" with VClass c -> c | _ -> "") in
@@ -4611,6 +4624,35 @@ and defined_args_ok = fn env -> fn world -> fn blk -> fn (es: Expr list) ->
                 | EKwHash kv -> defined_args_ok env world blk kv
                 | _ -> defined_one_ok env world blk h) in
      if ok9 then defined_args_ok env world blk t else false)
+// a name every object answers that the method table does not hold -- the
+// builtins the dispatcher implements for self (`defined?(itself)`)
+and defined_self_has = fn env -> fn world -> fn (name: str) ->
+  lv_has env "self" && responds_real world (lv_get env "self") name
+and defined_self_rtm = fn env -> fn world -> fn (name: str) ->
+  lv_has env "self"
+  && (let sv9 = lv_get env "self" in
+      let c9 = dispatch_cls_of world sv9 in
+      (if str_eq c9 "" then false else has_meth world c9 "respond_to_missing?")
+      && truthy (invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) sv9
+                   "respond_to_missing?" (Cons (VSym name, Cons (VBool true, Nil))) false))
+// the rest of a #dig walk, into what one step found. The keys are passed on
+// POSITIONALLY, as the C method passes them: `[c].dig(0, a: 1)` hands c's #dig
+// a Hash, not keywords. An object with its own #method_missing (and no
+// #respond_to_missing? to say no) is asked too, as rb_check_funcall asks it.
+and dig_next = fn env -> fn world -> fn (v: Val) -> fn (rest: Val list) ->
+  let _ = unmark_kwargs rest in
+  let noblk = (false, (Nil : str list), (Nil : Stmt list), env) in
+  match v with
+  | VNil -> VNil
+  | VArr _ -> invoke_val_c env world noblk v "dig" rest false
+  | VHsh _ -> invoke_val_c env world noblk v "dig" rest false
+  | _ ->
+    (let c9 = dispatch_cls_of world v in
+     if responds world v "dig"
+        || ((if str_eq c9 "" then false else has_meth world c9 "method_missing")
+            && (if has_meth world c9 "respond_to_missing?" then false else true))
+     then invoke_val_c env world noblk v "dig" rest false
+     else raise_exc world "TypeError" (class_name v ++ " does not have #dig method"))
 and defined_one_ok = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   match eval_e env world blk (EDefined e) with VNil -> false | _ -> true
 
@@ -12467,14 +12509,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        (let v = invoke_val_c env world noblk recv "[]" (Cons (k0, Nil)) false in
         match rest with
         | Nil -> v
-        | _ ->
-          (match v with
-           | VNil -> VNil
-           | VArr _ -> invoke_val_c env world noblk v "dig" rest false
-           | VHsh _ -> invoke_val_c env world noblk v "dig" rest false
-           | _ ->
-             (if responds world v "dig" then invoke_val_c env world noblk v "dig" rest false
-              else raise_exc world "TypeError" (class_name v ++ " does not have #dig method")))))
+        | _ -> dig_next env world v rest))
   else
   if (str_len name == 3 && str_eq name "dig") && (match recv with VArr _ -> true | _ -> false)
      && (if prim_user_has world recv "dig" then false else true) then
@@ -12484,14 +12519,7 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        (let v = prim_method recv "at" (Cons (i0, Nil)) in
         match rest with
         | Nil -> v
-        | _ ->
-          (match v with
-           | VNil -> VNil
-           | VArr _ -> invoke_val_c env world noblk v "dig" rest false
-           | VHsh _ -> invoke_val_c env world noblk v "dig" rest false
-           | _ ->
-             (if responds world v "dig" then invoke_val_c env world noblk v "dig" rest false
-              else raise_exc world "TypeError" (class_name v ++ " does not have #dig method")))))
+        | _ -> dig_next env world v rest))
   else
   // Array#join asks each element #to_str, then #to_ary, then #to_s -- in that
   // order -- and folds the ENCODING along with the text. prim_method (the
@@ -19238,6 +19266,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
            recv)
         else
          (match (if map_has ivars (str_of_int id ++ "@__y_blk") then map_get ivars (str_of_int id ++ "@__y_blk") else VNil) with
+          // a LAMBDA given as the block (`gen.each(&-> { })`) checks its
+          // arguments, as Proc#call does: `y.yield(a: 1)` to `-> { }` is an
+          // ArgumentError
+          | VProc bpid when map_has lambda_ids (str_of_int bpid) ->
+            (let r9 = invoke_val_c env world (false, (Nil : str list), (Nil : Stmt list), env) (VProc bpid) "call" args false in
+             if (str_len name == 2 && str_eq name "<<") then recv else r9)
           | VProc bpid ->
             (match run_block world (false, (Nil : str list), (Nil : Stmt list), env) (proc_get (str_of_int bpid)) args with
              | FBreak v -> raise_exc world "StopIteration" "iteration reached an end"
@@ -20414,7 +20448,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
          invoke_val_c env world blk (map_get ivars (str_of_int id ++ "@recv")) "size" Nil false
        else if map_has ivars (str_of_int id ++ "@__e_size") then
          (match map_get ivars (str_of_int id ++ "@__e_size") with
-          | VProc spid -> invoke_val_c env world blk (VProc spid) "call" Nil false
+          | VProc spid ->
+            invoke_val_c env world blk (VProc spid) "call"
+              (match (if map_has ivars (str_of_int id ++ "@__e_szargs") then map_get ivars (str_of_int id ++ "@__e_szargs") else VNil) with
+               | VArr sa9 -> deref sa9
+               | _ -> Nil) false
           | VObj oid2 ->
             (let (m9, s9, o9, i9) = world in
              if has_meth world (map_get o9 oid2) "call"
@@ -22060,7 +22098,11 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
        // ruby WARNS (and does nothing) for a proc that cannot carry the flag:
        // one with keyword parameters, or with no bare splat to collect into.
        let ok9 = r2k_params_ok ps9 in
-       let _ = (if ok9 then map_set r2k_procs (r2k_root (str_of_int pid)) VNil
+       // ...and for one Method#to_proc made, whose parameters are the
+       // method's (its closure holds the Method object)
+       let fm9 = (match proc_get (str_of_int pid) with (_, _, _, ce9) -> lv_has ce9 "__m_meth") in
+       let _ = (if fm9 then rb_warn world "Skipping set of ruby2_keywords flag for proc (proc created from method)"
+                else if ok9 then map_set r2k_procs (r2k_root (str_of_int pid)) VNil
                 else rb_warn world "Skipping set of ruby2_keywords flag for proc (proc accepts keywords or post arguments or proc does not accept argument splat)") in
        recv)
     // #dup and #clone copy the proc's instance variables too (an attr_accessor
@@ -23812,7 +23854,12 @@ and invoke_with_block0 = fn env -> fn world -> fn blk -> fn (recv: Val) -> fn (n
        let _ = store_proc (str_of_int sid9) newblk in
        let (m8, s8, o8, iv8) = world in
        let _ = (match e9 with
-                | VObj eid9 -> map_set iv8 (str_of_int eid9 ++ "@__e_size") (VProc sid9)
+                | VObj eid9 ->
+                  (let _ = map_set iv8 (str_of_int eid9 ++ "@__e_size") (VProc sid9) in
+                   // ...and the block is called with the arguments the
+                   // enumerator was made with, keywords as keywords (the
+                   // method name is not one of them)
+                   map_set iv8 (str_of_int eid9 ++ "@__e_szargs") (arr_new (match args with Cons (_, r9) -> r9 | Nil -> Nil)))
                 | _ -> ()) in
        e9)
     else if (str_len name == 4 && str_eq name "loop")
@@ -27638,6 +27685,9 @@ and r2k_params_ok = fn (ps: str list) ->
 // earlier too, since ruby flags the method body, not the name.
 and mod_ruby2_keywords = fn env -> fn world -> fn (cls: str) -> fn (args: Val list) ->
   let (m9, _, _, _) = world in
+  // (it names the methods: there is no bare form that applies to the defs
+  //  that follow, as there is for private)
+  let _ = (match args with Nil -> (let _ = raise_exc world "ArgumentError" "wrong number of arguments (given 0, expected 1+)" in ()) | _ -> ()) in
   let _ = list_iter_vals args (fn (a9: Val) ->
     (let nm9 = sym_or_str_arg env world a9 in
      let own9 = lookup_anc world (ancestors_of world cls) nm9 in
