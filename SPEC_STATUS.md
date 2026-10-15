@@ -32,7 +32,7 @@ dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP
 so MATCH 2722 before it and 2410 on it are not the same question either.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 50 | 17 | 0 | 0 | 0 | 67 |
+| language | 51 | 16 | 0 | 0 | 0 | 67 |
 | core/string | 112 | 2 | 0 | 0 | 0 | 114 |
 | core/array | 103 | 0 | 0 | 1 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
@@ -61,7 +61,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/systemexit | 2 | 0 | 0 | 0 | 0 | 2 |
 | core/proc | 17 | 6 | 0 | 2 | 0 | 25 |
 | core/set | 54 | 0 | 0 | 1 | 0 | 55 |
-| core/regexp | 22 | 2 | 0 | 0 | 0 | 24 |
+| core/regexp | 23 | 1 | 0 | 0 | 0 | 24 |
 | core/enumerable | 58 | 2 | 0 | 1 | 0 | 61 |
 | core/module | 78 | 5 | 0 | 2 | 0 | 85 |
 | core/filetest | 18 | 1 | 0 | 6 | 0 | 25 |
