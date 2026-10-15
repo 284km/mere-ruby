@@ -64,3 +64,20 @@ g = Enumerator.new { |y| 3.times { |i| y << i } }; p g.take(2); p $~&.to_s
 def fib_in_m; /fm/ =~ "fm"; Fiber.new { y1 { /fz/ =~ "fz" }; $~&.to_s }.resume; end; p fib_in_m; p $~&.to_s
 ext = [1,2].each_with_index; /ew/ =~ "ew"; p ext.next; p $~&.to_s
 z = Enumerator.new { |y| y << $~&.to_s }; /zz/ =~ "zz"; p z.next
+
+# ---- 4. a C method (the prelude's) matches into its caller's $~ -------
+klass = Class.new do
+  include Enumerable
+  def each
+    %w(bar baz).each{|e| yield e}
+  end
+end
+svars = []
+klass.new.grep(/(b.)/) { svars << $1 }
+p svars
+p [1, 2].map { |i| /m#{i}/ =~ "m#{i}"; $~&.to_s }; p $~&.to_s
+p({a: 1}.map { /hm/ =~ "hm"; $~&.to_s }); p $~&.to_s
+p [3, 1].sort_by { |i| /sb/ =~ "sb"; i }; p $~&.to_s
+"x y".scan(/\w/) { p $~[0] }; p $~&.to_s
+p klass.new.grep(/(z.)/); p $~&.to_s
+p klass.new.select { |e| e =~ /r/ }; p $~&.to_s
