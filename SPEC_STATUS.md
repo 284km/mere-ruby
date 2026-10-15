@@ -32,7 +32,7 @@ dropped, every platform-guarded Process file. 335 files moved from MATCH to SKIP
 so MATCH 2722 before it and 2410 on it are not the same question either.
 | group | MATCH | DIFF | CRASH | SKIP | SLOW | total |
 |---|---|---|---|---|---|---|
-| language | 44 | 23 | 0 | 0 | 0 | 67 |
+| language | 50 | 17 | 0 | 0 | 0 | 67 |
 | core/string | 112 | 2 | 0 | 0 | 0 | 114 |
 | core/array | 103 | 0 | 0 | 1 | 1 | 105 |
 | core/hash | 68 | 1 | 0 | 0 | 0 | 69 |
@@ -42,7 +42,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/env | 44 | 0 | 0 | 1 | 0 | 45 |
 | core/exception | 36 | 3 | 0 | 0 | 0 | 39 |
 | core/false | 9 | 0 | 0 | 0 | 0 | 9 |
-| core/float | 47 | 0 | 0 | 1 | 2 | 50 |
+| core/float | 47 | 0 | 0 | 3 | 0 | 50 |
 | core/integer | 59 | 1 | 0 | 9 | 1 | 70 |
 | core/kernel | 86 | 19 | 0 | 12 | 1 | 118 |
 | core/matchdata | 28 | 0 | 0 | 2 | 0 | 30 |
@@ -88,7 +88,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/time | 58 | 5 | 0 | 3 | 0 | 66 |
 | core/io | 78 | 2 | 0 | 1 | 0 | 81 |
 | library/date | 60 | 0 | 0 | 38 | 0 | 98 |
-| library/etc | 11 | 1 | 0 | 7 | 0 | 19 |
+| library/etc | 12 | 0 | 0 | 7 | 0 | 19 |
 | library/pathname | 18 | 0 | 0 | 2 | 0 | 20 |
 | library/stringio | 61 | 1 | 0 | 2 | 0 | 64 |
 | library/cgi | 8 | 0 | 0 | 7 | 0 | 15 |
@@ -134,7 +134,7 @@ so MATCH 2722 before it and 2410 on it are not the same question either.
 | core/thread/backtrace/location | 5 | 2 | 0 | 0 | 0 | 7 |
 | core/tracepoint | 12 | 7 | 0 | 0 | 0 | 19 |
 | language/predefined | 2 | 0 | 0 | 0 | 0 | 2 |
-| language/regexp | 8 | 3 | 0 | 0 | 0 | 11 |
+| language/regexp | 9 | 2 | 0 | 0 | 0 | 11 |
 | library/cgi/cookie | 0 | 0 | 0 | 9 | 0 | 9 |
 | library/cgi/htmlextension | 0 | 0 | 0 | 26 | 0 | 26 |
 | library/cgi/queryextension | 0 | 0 | 0 | 38 | 0 | 38 |
