@@ -3603,18 +3603,78 @@ and dm_store_closure = fn (key: str) -> fn b ->
   let pid = (proc_next ()) in
   let _ = store_proc (str_of_int pid) b in
   map_set dm_closenv key (VProc pid)
-and rx_state_save = fn (u: unit) ->
-  if map_has globals "~" then
-    (let v = map_get globals "~" in
-     match v with
-     | VNil -> v
-     | _ -> (let _ = map_set globals "~" VNil in v))
-  else VNil
-and rx_state_restore = fn (v: Val) ->
-  let cur = (if map_has globals "~" then map_get globals "~" else VNil) in
-  match v with
-  | VNil -> (match cur with VNil -> () | _ -> (let _ = map_set globals "~" VNil in ()))
-  | _ -> (let _ = map_set globals "~" v in ())
+// ⚠ `$~` BELONGS TO THE METHOD FRAME A BLOCK IS WRITTEN IN, not to the one
+// that runs it. rx_md holds the value of ONE frame -- the one rx_frame
+// names (0 = the top level; a Fiber's own top is 0 - 1 - its index) -- and the
+// other frames' values wait in rx_parked by fid. A method call parks its
+// caller's and starts the callee empty; a block whose home is not the frame in
+// globals swaps its home's value in, and back out when it is done. Before,
+// the caller's value was a local of the call, so a block run by a method
+// matched into THAT method's `$~`: `obj.foo { /bar/ =~ "bar" }; $~` was the
+// caller's older match, and a `$~` read inside the block was the method's.
+// (a parked value is the int in rx_md; -1, nil, is no entry)
+and rx_park = fn (f: int) -> fn (i: int) ->
+  if i < 0 then (if map_has rx_parked f then map_delete rx_parked f else ())
+  else map_set rx_parked f i
+and rx_parked_of = fn (f: int) -> if map_has rx_parked f then map_get rx_parked f else 0 - 1
+// a method frame starts: the caller's value is parked and the slot cleared.
+// Answers the caller's frame, for rx_call_leave.
+and rx_call_enter = fn (fid: int) ->
+  let f0 = vec_get rx_frame 0 in
+  let i = vec_get rx_md 0 in
+  let _ = (if i < 0 then (if map_has rx_parked f0 then map_delete rx_parked f0 else ())
+           else (let _ = map_set rx_parked f0 i in vec_set rx_md 0 (0 - 1))) in
+  let _ = vec_set rx_frame 0 fid in
+  f0
+// ...and ends: its own entry goes (unless a proc captured the frame and may
+// still match into it), and the caller's value comes back
+and rx_call_leave = fn (fid: int) -> fn (f0: int) -> fn (captured: bool) ->
+  let _ = (if captured then rx_park fid (vec_get rx_md 0)
+           else if map_has rx_parked fid then map_delete rx_parked fid else ()) in
+  let _ = vec_set rx_frame 0 f0 in
+  vec_set rx_md 0 (rx_parked_of f0)
+// the frame whose `$~` a block uses: the method it is written in, wherever
+// that is running -- on another Fiber's stack (an Enumerator's block matches
+// into the `$~` of the code that made it, through #next), or returned (a proc
+// made in a method sees that method's match after it returns) -- except that
+// the method a Fiber's or a Thread's body is written in is, on that Fiber, the
+// Fiber's own top: it starts with `$~` unset and its matches stay its own
+// (ruby's root_lep and root_svar).
+// (a lambda's frame carries a fid of its own, for `return`, and "__rxlam":
+// its `$~` is still the method's it is written in)
+and rx_home_fid = fn env ->
+  let (has, f) = lv_owner env "__fid" in
+  if has then
+    (if map_has f "__rxlam" then (let (hp, p) = lv_parent_of f in if hp then rx_home_fid p else 0)
+     else (match map_get f "__fid" with VInt t -> t | _ -> 0))
+  else 0
+and rx_blk_home = fn (h: int) ->
+  let c = fb_cur () in
+  if c != 0 && map_has rx_fbhome c && map_get rx_fbhome c == h then 0 - 1 - c else h
+// a Fiber or Thread body is about to run on Fiber i
+and rx_fiber_home = fn (i: int) -> fn b ->
+  let (_, _, _, e) = b in
+  map_set rx_fbhome i (rx_home_fid e)
+// a block starts: answers whether it swapped, the frame to put back, and the
+// home it swapped in
+and rx_blk_enter = fn cenv ->
+  let f = vec_get rx_frame 0 in
+  let h0 = rx_home_fid cenv in
+  // (the common case -- a block run by a builtin of the method it is written
+  // in -- is answered before the liveness lookups)
+  let h = (if h0 == f then h0 else rx_blk_home h0) in
+  if h == f then (false, f, h)
+  else
+    (let _ = rx_park f (vec_get rx_md 0) in
+     let _ = vec_set rx_frame 0 h in
+     let _ = vec_set rx_md 0 (rx_parked_of h) in
+     (true, f, h))
+and rx_blk_leave = fn (sw: bool) -> fn (b: int) -> fn (h: int) ->
+  if sw then
+    (let _ = rx_park h (vec_get rx_md 0) in
+     let _ = vec_set rx_frame 0 b in
+     vec_set rx_md 0 (rx_parked_of b))
+  else ()
 and anc_dedupe = fn (xs: str list) ->
   match xs with
   | Nil -> Nil
@@ -18547,7 +18607,7 @@ and rx_publish_at = fn world -> fn (sv: str) -> fn (st: int) -> fn (en: int) -> 
   // `<id>@...`, and there are eight of them on every successful match.
   let idk = str_of_int id in
   let _ = map_set ocls id "MatchData" in
-  let _ = map_set globals "~" (VObj id) in
+  let _ = rx_md_set (VObj id) in
   let _ = map_set ivars (idk ++ "@0") (mkstr_e (substring sv st en) enc) in
   let _ = map_set md_whole id (substring sv st en) in
   // keep the subject and the span, so #pre_match / #post_match / #begin / #end
