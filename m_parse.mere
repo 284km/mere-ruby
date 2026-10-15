@@ -277,6 +277,13 @@ let lex_u8_width = fn (c: str) ->
   let o = ord c in
   if o >= 240 then 4 else if o >= 224 then 3 else if o >= 192 then 2 else 1;
 
+// ⚠ a digit run's underscores as ruby allows them: one between two digits.
+//   `1_` ("trailing '_' in number") and `1__0` ("invalid underscore placement
+//   in number") were numbers, 1 and 10; so were `1.0_` and `1e1_`.
+let num_us_refuse = fn (s: str) -> fn (i: int) -> fn (j: int) ->
+  if j > i && str_eq (char_at s (j - 1)) "_" then syn_refuse "trailing '_' in number"
+  else if j > i && str_index_of (substring s i j) "__" >= 0 then syn_refuse "invalid underscore placement in number"
+  else ();
 let rec lex_go = fn (s: str) -> fn (i: int) ->
   if i >= str_len s then Cons (TEOF, Nil)
   else
@@ -311,25 +318,30 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
                    else if str_eq n "o" || str_eq n "O" then 8
                    else if str_eq n "d" || str_eq n "D" then 10 else 2 in
         let j = scan_base s (i + 2) base in
-        // `0b` with no digit after it is no number at all
-        let _ = (if j == i + 2 then syn_refuse ("invalid " ++ (if base == 16 then "hexadecimal" else if base == 8 then "octal" else if base == 10 then "decimal" else "binary") ++ " number; numeric literal without digits") else ()) in
+        // `0b` with no digit after it is no number at all (nor is `0x_1`)
+        let _ = (if j == i + 2 || str_eq (char_at s (i + 2)) "_" then syn_refuse ("invalid " ++ (if base == 16 then "hexadecimal" else if base == 8 then "octal" else if base == 10 then "decimal" else "binary") ++ " number; numeric literal without digits") else ()) in
+        let _ = num_us_refuse s (i + 2) j in
         let dv = dec_of_base s (i + 2) j base "0" in
         if dec_fits_int dv then ri_suffix s j (parse_base s (i + 2) j base 0)
         else Cons (TBig dv, lex_go s j)
       // leading-zero octal: 017 == 15 (0 then octal digits, not . or e).
       else if str_eq c "0" && i + 1 < str_len s && (let n = char_at s (i + 1) in is_digit n && (if str_eq n "8" || str_eq n "9" then false else true)) then
         let j = scan_base s (i + 1) 8 in
+        let _ = num_us_refuse s (i + 1) j in
         let dv = dec_of_base s (i + 1) j 8 "0" in
         if dec_fits_int dv then ri_suffix s j (parse_base s (i + 1) j 8 0)
         else Cons (TBig dv, lex_go s j)
       else
         // decimal (with `_` separators), optionally a float.
         let j = scan_base s i 10 in
+        let _ = num_us_refuse s i j in
         if j + 1 < str_len s && str_eq (char_at s j) "."
            && is_digit (char_at s (j + 1)) then
           let k0 = scan_base s (j + 1) 10 in
+          let _ = num_us_refuse s (j + 1) k0 in
           // exponent: 1.2e-3 / 4.5E+2 / 6.7e8
           let k = scan_exponent s k0 in
+          let _ = num_us_refuse s k0 k in
           // rational-imaginary literal: 1.2ri == Complex(0, Rational(12, 10)).
           if k == k0 && k0 + 1 < str_len s && str_eq (char_at s k0) "r" && str_eq (char_at s (k0 + 1)) "i"
              && (k0 + 2 >= str_len s || (let nc = char_at s (k0 + 2) in if is_alnum nc || str_eq nc "_" then false else true)) then
@@ -350,6 +362,7 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
             Cons (TFlt (float_of_str (strip_us (substring s i k) 0 "")), lex_go s k)
         else
           let je = scan_exponent s j in
+          let _ = num_us_refuse s j je in
           if je > j then
             // exponent + imaginary: 1e1i == Complex(0, 10.0). (1e1r is a
             // syntax error in Ruby, so no rational counterpart here.)
@@ -409,6 +422,12 @@ let rec lex_go = fn (s: str) -> fn (i: int) ->
           Cons (TStrL (chr (ctrl_code (char_at s (i + 4)))), lex_go s (i + 5))
         else if str_eq e "c" && i + 3 < str_len s then
           Cons (TStrL (chr (ctrl_code (char_at s (i + 3)))), lex_go s (i + 4))
+        // (`?\“`: a backslash before a multibyte character is that character,
+        //  all of its bytes -- the first byte alone was a broken token)
+        else if ord e >= 128 then
+          (let w = lex_u8_width e in
+           let w = (if i + 2 + w > str_len s then 1 else w) in
+           Cons (TStrL (substring s (i + 2) (i + 2 + w)), lex_go s (i + 2 + w)))
         else
         let ch = if str_eq e "n" then "\n" else if str_eq e "t" then "\t"
                  else if str_eq e "r" then chr 13 else if str_eq e "s" then " "
@@ -1304,6 +1323,11 @@ and lex_dstr_t = fn (term: str) -> fn (s: str) -> fn (i: int) -> fn (lit: str) -
         // \uXXXX — emit UTF-8 bytes for the codepoint.
         let cp = hex4 s (i + 2) in
         lex_dstr_t term s (i + 6) (lit ++ utf8_of cp)
+      // ⚠ \cX / \C-X (control) and \M-X (meta), and the two nested: a
+      //   double-quoted string read none of them, so "\cA" was "cA" and
+      //   "\M-\C-a" was "M-C-a" (`?\cA` alone had them: see lex_go)
+      else if str_eq e "c" || ((str_eq e "C" || str_eq e "M") && i + 2 < str_len s && str_eq (char_at s (i + 2)) "-") then
+        (let (v9, j9) = dq_cm s i in lex_dstr_t term s j9 (lit ++ chr v9))
       // \xHH — one byte from up to two hex digits.
       else if str_eq e "x" && i + 2 < str_len s && is_hex_digit (char_at s (i + 2)) then
         let d1 = hex_val (char_at s (i + 2)) in
@@ -1436,6 +1460,39 @@ and pct_value_kw = fn (w: str) ->
 
 // the control-character code for `\C-x`: the low five bits, except that
 // `\C-?` is DEL.
+// a control or meta escape at i (s[i] is the backslash): its byte and where
+// it ends. The argument is one ASCII character or another escape -- a
+// control or meta one, \xHH, octal, or a simple one; `\u` and a multibyte
+// character are "Invalid escape character syntax", as in ruby.
+and dq_cm = fn (s: str) -> fn (i: int) ->
+  let e = char_at s (i + 1) in
+  if str_eq e "c" then (let (v, j) = dq_cm_arg s (i + 2) in (dq_ctl v, j))
+  else if str_eq e "C" then (let (v, j) = dq_cm_arg s (i + 3) in (dq_ctl v, j))
+  else (let (v, j) = dq_cm_arg s (i + 3) in ((v - (v / 128) * 128) + 128, j))
+and dq_ctl = fn (v: int) ->
+  if v == 63 then 127 else (v / 128) * 128 + (v - (v / 32) * 32)
+and dq_cm_bad = fn (u: unit) -> (let _ = syn_refuse "Invalid escape character syntax" in (0, 0))
+and dq_cm_arg = fn (s: str) -> fn (i: int) ->
+  if i >= str_len s then dq_cm_bad ()
+  else
+    let c = char_at s i in
+    if str_eq c "\\" && i + 1 < str_len s then
+      (let e2 = char_at s (i + 1) in
+       if str_eq e2 "c" || ((str_eq e2 "C" || str_eq e2 "M") && i + 2 < str_len s && str_eq (char_at s (i + 2)) "-") then dq_cm s i
+       else if str_eq e2 "x" && i + 2 < str_len s && is_hex_digit (char_at s (i + 2)) then
+         (let d1 = hex_val (char_at s (i + 2)) in
+          if i + 3 < str_len s && is_hex_digit (char_at s (i + 3)) then (d1 * 16 + hex_val (char_at s (i + 3)), i + 4)
+          else (d1, i + 3))
+       else if e2 >= "0" && e2 <= "7" then scan_octal s (i + 1) 0 0
+       else if str_eq e2 "u" || ord e2 >= 128 then dq_cm_bad ()
+       else
+         (let v = (if str_eq e2 "n" then 10 else if str_eq e2 "t" then 9 else if str_eq e2 "r" then 13
+                   else if str_eq e2 "e" then 27 else if str_eq e2 "a" then 7 else if str_eq e2 "b" then 8
+                   else if str_eq e2 "f" then 12 else if str_eq e2 "v" then 11 else if str_eq e2 "s" then 32
+                   else ord e2) in
+          (v, i + 2)))
+    else if ord c >= 128 then dq_cm_bad ()
+    else (ord c, i + 1)
 and ctrl_code = fn (x: str) ->
   if str_eq x "?" then 127 else (let o = ord x in o - (o / 32) * 32)
 
@@ -4401,6 +4458,13 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
         | Cons (TP nx, _) -> str_eq nx "}" || str_eq nx ","
         | _ -> false)
      | _ -> false) in
+  // (a key that is not a plain name has no variable to read: `{"#{x}":}`
+  //  is ruby's "unexpected '}'", where this went on to parse a value)
+  let _ = (match k with
+           | ESym _ -> ()
+           | _ -> (match skip_nls r2 with
+                   | Cons (TP nx, _) -> (if str_eq nx "}" || str_eq nx "," then syn_refuse ("unexpected '" ++ nx ++ "'; expected a value in the hash literal") else ())
+                   | _ -> ())) in
   if omitted then
     (match k with
      // ⚠ the omitted-value form reads a VARIABLE of the same name, and `a!` or
@@ -4411,6 +4475,9 @@ and parse_hash_items_kv = fn toks -> fn (acc: Expr list) ->
                      n9 > 0 && (let lc = char_at nm (n9 - 1) in str_eq lc "!" || str_eq lc "?")) ->
        (let _ = syn_refuse ("identifier " ++ nm ++ " is not valid to get") in
         hash_items_sep (skip_nls r2) acc)
+     // (a CONSTANT's name reads the constant: `{FOO:}` is `{FOO: FOO}`)
+     | ESym nm when str_len nm > 0 && char_at nm 0 >= "A" && char_at nm 0 <= "Z" ->
+       hash_items_sep (skip_nls r2) (Cons (EConst nm, Cons (k, acc)))
      | ESym nm -> hash_items_sep (skip_nls r2) (Cons (EVar nm, Cons (k, acc)))
      | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (cstr_h "mere-ruby: bad hash key")) in fail "mere-ruby: bad hash key"))
   else
@@ -6987,7 +7054,43 @@ and when_lit_key = fn (e: Expr) ->
    | EBool b9 -> (if b9 then "b1" else "b0")
    | EFlt f9 -> "f" ++ str_of_float f9
    | ENil -> "n"
+   // (...and the literals that are not one token's value: an integer past
+   //  int64, a string under a frozen_string_literal comment, a Rational, an
+   //  imaginary, a regexp -- `{"a" => 1, "a" => 2}` in such a file, and
+   //  `{1.0r => 1, 1.0r => 2}`, said nothing)
+   | EBig b9 -> "i" ++ b9
+   | EMethod (e9, m9, Nil) when str_len m9 > 10 && (str_eq (substring m9 0 10) "__lit_fsl~" || str_eq (substring m9 0 10) "__lit_enc~") ->
+     (match lit_static_str e with (true, s9) -> "s" ++ s9 | _ -> "")
+   | EBin (_, _, _) -> (match lit_static_str e with (true, s9) -> "s" ++ s9 | _ -> "")
+   | ERat (n9, d9) -> "r" ++ lit_rat_disp n9 d9
+   | EImag n9 -> "c" ++ str_of_int n9
+   | EImagF f9 -> "c" ++ str_of_float f9
+   | ERegex (p9, f9) -> "x" ++ f9 ++ "/" ++ p9
+   | EVar n9 when str_len n9 >= 8 && str_eq (substring n9 0 8) "__FILE__" -> "F"
+   | EVar n9 when str_len n9 >= 12 && str_eq (substring n9 0 12) "__ENCODING__" -> "E" ++ n9
    | _ -> "")
+// a double-quoted string with nothing interpolated is a `+` chain of pieces
+// (the lexer's desugaring): its text, when every piece is a literal
+and lit_static_str = fn (e: Expr) ->
+  (match e with
+   | EStrL s9 -> (true, s9)
+   // (and through the markers a literal wears: its file's
+   //  frozen_string_literal answer, its source encoding)
+   | EMethod (e9, m9, Nil) when str_len m9 > 10 && (str_eq (substring m9 0 10) "__lit_fsl~" || str_eq (substring m9 0 10) "__lit_enc~") ->
+     lit_static_str e9
+   | EBin (o9, a9, b9) when str_eq o9 "+" ->
+     (match (lit_static_str a9, lit_static_str b9) with
+      | ((true, x9), (true, y9)) -> (true, x9 ++ y9)
+      | _ -> (false, ""))
+   | _ -> (false, ""))
+// a Rational literal's value as ruby inspects it, reduced: `1.0r` is (1/1)
+and lit_rat_disp = fn (n: str) -> fn (d: str) ->
+  if str_len n > 17 || str_len d > 17 then "(" ++ n ++ "/" ++ d ++ ")"
+  else (let a = int_of_str n in let b = int_of_str d in
+        let rec g = fn (x: int) -> fn (y: int) -> if y == 0 then x else g y (x - (x / y) * y) in
+        let k = g (if a < 0 then 0 - a else a) b in
+        let k = (if k == 0 then 1 else k) in
+        "(" ++ str_of_int (a / k) ++ "/" ++ str_of_int (b / k) ++ ")")
 // A hash LITERAL warns about a duplicated key, the way a case/when warns about
 // a duplicated clause -- same literal-key rule, same warn_note. The key that
 // wins is the LAST one, so the warning is about the earlier one being dropped.
@@ -7023,6 +7126,18 @@ and hsh_key_disp = fn (e: Expr) ->
    | EBool b9 -> (if b9 then "true" else "false")
    | EFlt f9 -> str_of_float f9
    | ENil -> "nil"
+   | EBig b9 -> b9
+   | EMethod (e9, m9, Nil) when str_len m9 > 10 && (str_eq (substring m9 0 10) "__lit_fsl~" || str_eq (substring m9 0 10) "__lit_enc~") ->
+     (match lit_static_str e with (true, s9) -> "\"" ++ s9 ++ "\"" | _ -> "?")
+   | EBin (_, _, _) -> (match lit_static_str e with (true, s9) -> "\"" ++ s9 ++ "\"" | _ -> "?")
+   | ERat (n9, d9) -> lit_rat_disp n9 d9
+   | EImag n9 -> "(0+" ++ str_of_int n9 ++ "i)"
+   | EImagF f9 -> "(0+" ++ str_of_float f9 ++ "i)"
+   | ERegex (p9, f9) -> "/" ++ p9 ++ "/" ++ f9
+   | EVar n9 when str_len n9 >= 8 && str_eq (substring n9 0 8) "__FILE__" -> "\"" ++ parse_time_file () ++ "\""
+   // (captured at parse time as "__ENCODING__~<NAME>")
+   | EVar n9 when str_len n9 >= 12 && str_eq (substring n9 0 12) "__ENCODING__" ->
+     "#<Encoding:" ++ (if str_len n9 > 13 then substring n9 13 (str_len n9) else "UTF-8") ++ ">"
    | _ -> "?")
 and when_seen_line = fn (seen: (str * int) list) -> fn (k: str) ->
   (match seen with
