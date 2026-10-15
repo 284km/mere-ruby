@@ -2692,7 +2692,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
       let id = (handle_base + map_len bind_store) in
       // (a frame of its own over the snapshot: what is defined THROUGH the
       // binding is listed first and a #dup shares the rest -- see Binding#dup)
-      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_snapshot env)) in
+      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_capture env)) in
       // where it was made, for #source_location
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
@@ -2804,7 +2804,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // as a first-class Binding, unless the user redefined `binding`.
     else if (str_len name == 7 && str_eq name "binding") && (if map_has meths "binding" || self_defines env world "binding" then false else true) then
       let id = (handle_base + map_len bind_store) in
-      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_snapshot env)) in
+      let _ = map_set bind_store (str_of_int id) (lv_child (bnd_capture env)) in
       let _ = map_set bind_loc (str_of_int id) (cur_file () ++ "\n" ++ str_of_int (cur_line ())) in
       VBind id
     // eval "code" re-enters the interpreter. With a Binding 2nd arg it runs
@@ -3134,6 +3134,12 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
   | ECallB (name, arges, bp, bb) when ((str_len name == 1 && str_eq name "p") || (str_len name == 2 && str_eq name "pp"))
                                       && (if kernel_overridden env world name then false else true) ->
     eval_e env world blk (ECall (name, arges))
+  // `using M do ... end` -- a block given to `using` is ignored, as ruby
+  // ignores it; the argument is checked as for the bare form
+  | ECallB (name, arges, _, _) when (str_len name == 5 && str_eq name "using")
+                                   && (match lv_get env "self" with VMain -> true | VClass _ -> true | _ -> false)
+                                   && (if self_user_defines env world "using" then false else true) ->
+    do_using env world (eval_args env world blk arges)
   | ECallB (name, arges, bp, bb) ->
     let (meths, sup, ocls, ivars) = world in
     let args = eval_args env world blk arges in
@@ -3301,6 +3307,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
     // refine Target do <defs> end — inside a Module.new body (self is the
     // refinery module). Run the block's defs into a fresh impl_cls class and record
     // the (refinery, target, impl_cls) triple for a later `using`.
+    // (a CLASS has no #refine -- Class undefines it, so `Class.new { refine
+    //  Integer do ... end }` is a NoMethodError -- and the block must be a
+    //  literal one: a Proc passed with & is refused, as ruby refuses it)
+    else if (str_len name == 6 && str_eq name "refine")
+            && (match lv_get env "self" with VClass c9 -> (if map_has modules c9 then false else true) | _ -> false) then
+      raise_exc_iv world "NoMethodError" ("undefined method 'refine' for " ++ for_recv_cls world (dispatch_cls_of world (lv_get env "self")))
+        (Cons (("__name", VSym "refine"), Cons (("__recv", lv_get env "self"), Nil)))
+    else if (str_len name == 6 && str_eq name "refine") && (match lv_get env "self" with VClass _ -> true | _ -> false)
+            && (match bp with Cons (c9, Nil) -> str_eq c9 "&coerce" | _ -> false) then
+      raise_exc world "ArgumentError" "can't pass a Proc as a block to Module#refine"
     else if (str_len name == 6 && str_eq name "refine") && (match args with Cons (VClass _, _) -> true | _ -> false) && (match lv_get env "self" with VClass _ -> true | _ -> false) then
       (let refinery = (match lv_get env "self" with VClass rc -> rc | _ -> "") in
        let target = (match args with Cons (VClass t, _) -> t | _ -> "") in
@@ -3410,6 +3426,13 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
           set9 (apply_bin_vals world blk op cur v))) in
     let _ = scratch_env_done e2 in
     res9
+  // `self.using M` is `using M`: a private method called through `self.`
+  // (only the literal `self`: `recv = self; recv.using M` is refused, as
+  // ruby refuses a private call with any other receiver)
+  | EMethod (ESelf, name, arges) when (str_len name == 5 && str_eq name "using")
+                                     && (match lv_get env "self" with VMain -> true | VClass _ -> true | _ -> false)
+                                     && (if self_user_defines env world "using" then false else true) ->
+    do_using env world (eval_args env world blk arges)
   | EMethod (recv_e, name, arges) ->
     // `"literal".freeze` is ruby's interning special form: every evaluation
     // of the same literal-freeze answers ONE object (CRuby compiles it to
@@ -3777,6 +3800,16 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
                            | _ -> (false, VNil))
                         | _ -> (false, VNil)) in
     if fast8 then fv8 else
+    // ⚠ AN ACTIVE REFINEMENT OF THE OPERATOR is a method call. The branches
+    //   below answer a builtin receiver's operator themselves (eval_bin_prim),
+    //   so `using IntegerSlashExt` left `1 / 2` at 0 and `1 + 2` at 3; only
+    //   the two-integer fast path above knew to step aside (int_ops_plain).
+    //   One map_len while nothing is active.
+    //   (The impl is called directly: invoke_val_c brings an Integer's
+    //   operator back here, round and round.)
+    if map_len ref_active > 0 && (if str_eq (refined_impl_for world va0 op) "" then false else true) then
+      ref_call world blk va0 (refined_impl_for world va0 op) op (Cons (eval_e env world blk b, Nil))
+    else
     // `<<` mutates a String/Array receiver in place — FrozenError first.
     let _ = (if str_eq op "<<" then chill_touch world va0 "<<" else ()) in
     let _ = (if str_eq op "<<" && builtin_mut_on_frozen world va0 "<<"
@@ -12333,9 +12366,15 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
   if (if str_eq refimpl "" then false else true) then
     // (a refinement's alias of a BUILTIN is a delegation, not a body: call the
     // builtin it names on the receiver)
-    (if map_has builtin_alias (refimpl ++ "#" ++ name) && (if has_meth world refimpl name then false else true)
+    // ⚠ ...and a PRIVATE refined method is refused to a call with a receiver
+    //   (public_send, `obj.m`) as any private method is: the refinement's
+    //   path called it whatever the visibility
+    (if vischeck && map_has privates (refimpl ++ "#" ++ name)
+     then raise_exc_iv world "NoMethodError" ("private method '" ++ name ++ "' called for " ++ for_recv_cls world (dispatch_cls_of world recv))
+            (Cons (("__name", VSym name), Cons (("__recv", recv), Nil)))
+     else if map_has builtin_alias (refimpl ++ "#" ++ name) && (if has_meth world refimpl name then false else true)
      then invoke_val_c env world blk recv (map_get builtin_alias (refimpl ++ "#" ++ name)) args vischeck
-     else invoke world blk recv refimpl name args)
+     else ref_call world blk recv refimpl name args)
   else
   // Enumerable#to_set lives in the `set` library, which ruby 3.1+ loads on
   // demand rather than making you require it.
@@ -16998,8 +17037,12 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // `Module#using` is only meaningful at the top level or inside a module
     // body, where the parser handles it. Reached as a METHOD it is always the
     // wrong call, and ruby says so by name rather than by NoMethodError.
+    // (...and it is PRIVATE: with an explicit receiver it is refused as any
+    //  private method is, before anything is asked of where it was called)
     else if (str_len name == 5 && str_eq name "using") then
-      raise_exc world "RuntimeError" "Module#using is not called on self"
+      (if vischeck then raise_exc_iv world "NoMethodError" ("private method 'using' called for " ++ (if map_has modules c then "module " else "class ") ++ display_cls_msg world c)
+                          (Cons (("__name", VSym "using"), Cons (("__recv", recv), Nil)))
+       else raise_exc world "RuntimeError" "Module#using is not called on self")
     // Refinement#import_methods: copy each module's OWN methods into the
     // refinement (see refine_import_methods)
     else if (str_len name == 14 && str_eq name "import_methods") && is_refine_impl c then
@@ -17767,28 +17810,17 @@ and invoke_val_c0 = fn env -> fn world -> fn blk -> fn (recv0: Val) -> fn (name0
     // `using` writes (target class -> impl module) and it is already
     // save/restored per scope, so the answer is its values.
     else if str_eq c "Module" && (str_len name == 16 && str_eq name "used_refinements") then
-      (let tmp8 = map_new () in
-       let seen8 = map_new () in
-       let _ = map_iter ref_active (fn (k8: str) -> fn (v8: Val) ->
-         (match v8 with
-          | VStr h8 -> (let im8 = sget h8 in
-                        if map_has seen8 im8 then ()
-                        else (let _ = map_set seen8 im8 1 in
-                              let m8 = map_len tmp8 in map_set tmp8 (str_of_int m8) (VClass im8)))
-          | VClass im8 -> (if map_has seen8 im8 then ()
-                           else (let _ = map_set seen8 im8 1 in
-                                 let m8 = map_len tmp8 in map_set tmp8 (str_of_int m8) (VClass im8)))
-          | _ -> ())) in
-       arr_new (idx_to_list tmp8 0 (map_len tmp8)))
+      // (newest `using` first, as ruby lists them: ref_used_impls)
+      (let rec vs8 = fn (cs: str list) -> (match cs with Nil -> (Nil : Val list) | Cons (c, t) -> Cons (VClass c, vs8 t)) in
+       arr_new (vs8 (ref_used_impls ())))
     // Module.used_modules: the modules whose refinements are active here --
     // the refinery of each used_refinements entry, once each, in that order
     // (an impl class is named "<refinery>_<i>" after "#<refinement:" 7 chars).
     else if str_eq c "Module" && (str_len name == 12 && str_eq name "used_modules") then
       (let tmp7 = map_new () in
        let seen7 = map_new () in
-       let _ = map_iter ref_active (fn (k7: str) -> fn (v7: Val) ->
-         (let im7 = (match v7 with VStr h7 -> sget h7 | VClass n7 -> n7 | _ -> "") in
-          if str_eq im7 "" || (if is_refine_impl im7 then false else true) then ()
+       let _ = list_iter (ref_used_impls ()) (fn (im7: str) ->
+         (if str_eq im7 "" || (if is_refine_impl im7 then false else true) then ()
           else (let rest7 = substring im7 7 (str_len im7) in
                 let u7 = str_rfind rest7 "_" 0 (0 - 1) in
                 let rf7 = (if u7 < 0 then rest7 else substring rest7 0 u7) in
@@ -35234,6 +35266,13 @@ and undef_call_exc_x = fn world -> fn (blame: Val) -> fn (name: str) -> fn (args
     (match blame with
      | VClass c9 -> invoke world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) blame ("(sng:" ++ c9 ++ ")") "method_missing" (Cons (VSym name, args))
      | _ -> VNil)
+  // ⚠ a REFINED method of the receiver's class or an ancestor (`refine
+  //   Kernel do def foo`, then `using M1; foo` at the top level) is found
+  //   here, where the bare name has been looked for everywhere else: main's
+  //   calls never asked the refinements, and `foo` was a NameError
+  else if map_len ref_active > 0 && (match blame with VNil -> false | _ -> true)
+          && (if str_eq (refined_impl_for world blame name) "" then false else true) then
+    ref_call world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) blame (refined_impl_for world blame name) name args
   // last-resort Kernel methods that reach here as bare names (the ECall
   // path handles the argument forms in try_self_call_x).
   else if (str_len name == 5 && str_eq name "sleep") then
@@ -44155,6 +44194,9 @@ and refine_body_env = fn denv -> fn (refinery: str) ->
 and do_using_main = fn env -> fn world -> fn (args: Val list) ->
   if (let cr9 = (if lv_has env "__cref" then (match lv_get env "__cref" with VStr h9 -> sget h9 | _ -> "") else "") in
       if str_eq cr9 "" then false else true)
+     // (...nor from a block whose self is something else: a Module.new body
+     //  is that module's scope, not the top level)
+     || (match (if lv_has env "self" then lv_get env "self" else VMain) with VMain -> false | _ -> true)
   then raise_exc world "RuntimeError" "main.using is permitted only at toplevel"
   else (let e9 = lv_child env in
         let _ = map_set e9 "self" VMain in
@@ -45636,6 +45678,11 @@ and undef_check = fn world -> fn (cls: str) -> fn (names: str list) ->
        || map_has builtin_alias (cls ++ "#" ++ n)
        // (BasicObject's private hooks every class has)
        || str_eq n "method_missing" || str_eq n "respond_to_missing?" || str_eq n "initialize"
+       // (in a refine body, a method of the REFINED class: `refine String do
+       //  undef + end` takes `+` away where the refinement is active)
+       || (is_refine_impl cls && (let t9 = refine_target_of cls in
+                                  (if str_eq t9 "" then false else true)
+                                  && (has_meth world t9 n || is_prim_method n || builtin_anc_has world t9 n || builtin_has_meth t9 n)))
     then undef_check world cls rest
     else (let _ = raise_exc world "NameError" ("undefined method '" ++ n ++ "' for class '" ++ cls ++ "'") in ())
 
@@ -47647,6 +47694,17 @@ and eval_run_at = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) -> fn (e
      r9)
 
 
+// a Binding's env: the locals, and the lexical scope it was made in when that
+// is a class or module body (a method's is in its frame already, as __cref
+// and __nest). `module Sandbox; BINDING = binding; end` and then
+// `eval("module M2; MM; end", Sandbox::BINDING)` found nothing of Sandbox's
+// inside M2, and Module.nesting there was [] (eval_run puts it back on)
+and bnd_capture = fn env ->
+  let snap9 = bnd_snapshot env in
+  let _ = (if lv_has env "__meth" then ()
+           else (let _ = map_set snap9 "__blex" (mkstr (cur_lex ())) in
+                 map_set snap9 "__bnest" (mkstr (cur_nest ())))) in
+  snap9
 and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   // Ruby hoists an eval'd string's local-variable assignments at parse time,
   // so a read that lexically precedes the assignment (or a nested eval sharing
@@ -47661,7 +47719,17 @@ and eval_run = fn env -> fn world -> fn blk -> fn (prog2: Stmt list) ->
   let rfprev9 = ref_cur_id () in
   let rfslot9 = (if map_has env "__rf" then map_get env "__rf" else VNil) in
   let _ = (if ref_on () then ref_install (ref_env_id env) else ()) in
+  // (a binding made in a class or module body runs the string in that body's
+  //  lexical scope: see Kernel#binding)
+  let blex9 = lv_has env "__blex" in
+  let olex9 = cur_lex () in
+  let onest9 = cur_nest () in
+  let _ = (if blex9 then
+             (let _ = set_lex (match lv_get env "__blex" with VStr h9 -> sget h9 | _ -> "") in
+              set_nest (match lv_get env "__bnest" with VStr h9 -> sget h9 | _ -> ""))
+           else ()) in
   let f = try_or (fn (u: unit) -> hoist_run env world blk prog2) (FRaise VNil) in
+  let _ = (if blex9 then (let _ = set_lex olex9 in set_nest onest9) else ()) in
   let _ = (match rfslot9 with
            | VNil -> (if map_has env "__rf" then map_delete env "__rf" else ())
            | v9 -> map_set env "__rf" v9) in
@@ -47816,7 +47884,12 @@ and when_matches = fn env -> fn world -> fn blk -> fn (v: Val) -> fn (vs: Expr l
   | Cons (e, t) ->
     (match e with
      | ESplat inner -> (match eval_e env world blk inner with VArr id -> when_any_eq v (deref id) | _ -> false)
-     | _ -> case_eqq world (eval_e env world blk e) v)
+     | _ -> (let cand9 = eval_e env world blk e in
+             // (a refinement of `===` active here is the comparison, as for
+             //  any call: `using RefineSymbol` made `when :b` match)
+             if map_len ref_active > 0 && (if str_eq (refined_impl_for world cand9 "===") "" then false else true)
+             then truthy (ref_call world blk cand9 (refined_impl_for world cand9 "===") "===" (Cons (v, Nil)))
+             else case_eqq world cand9 v))
     || when_matches env world blk v t
 
 // Ruby's `===` as used by case/when: a Range tests membership, a Class tests
@@ -47944,11 +48017,27 @@ and refined_impl_for = fn world -> fn (recv: Val) -> fn (name: str) ->
   //   to `c.whatever` -- and, with a top-level `def include` in Object (the
   //   spec helper's matcher), `c.include m` went to the refinement and died
   else refined_impl_go world (ancestors_of world (match recv with VClass c -> "(sng:" ++ c ++ ")" | _ -> dispatch_cls_of world recv)) name
+and refined_impl_in = fn world -> fn (ics: str list) -> fn (name: str) ->
+  match ics with
+  | Nil -> ""
+  | Cons (ic, rest) ->
+    if (let (mt9, _, _, _) = world in map_has mt9 (ic ++ "#" ++ name) || map_has builtin_alias (ic ++ "#" ++ name)) then ic
+    // (an undef in the refinement is an answer too: the method is gone)
+    else if map_len undefs > 0 && map_has undefs (ic ++ "#" ++ name) then ic
+    else refined_impl_in world rest name
+// call `name` as the active refinement ri has it -- or refuse it, when ri
+// undefined it
+and ref_call = fn world -> fn blk -> fn (recv: Val) -> fn (ri: str) -> fn (name: str) -> fn (args: Val list) ->
+  if map_len undefs > 0 && map_has undefs (ri ++ "#" ++ name) then
+    raise_exc_iv world "NoMethodError" ("undefined method '" ++ name ++ "' for " ++ for_recv_cls world (dispatch_cls_of world recv))
+      (Cons (("__name", VSym name), Cons (("__recv", recv), Nil)))
+  else invoke world blk recv ri name args
 and refined_impl_go = fn world -> fn (ancs: str list) -> fn (name: str) ->
   match ancs with
   | Nil -> ""
   | Cons (a, rest) ->
-    let ic = ref_impl a in
+    // (every refinement active for a, newest first: ref_put)
+    let ic = refined_impl_in world (ref_chain a) name in
     // An active refinement sits immediately in FRONT of the class it refines,
     // so it beats that class's own method...
     // ⚠ ...a method the REFINEMENT defines, not one it answers: has_meth on a
@@ -47956,8 +48045,7 @@ and refined_impl_go = fn world -> fn (ancs: str list) -> fn (name: str) ->
     //   the refinement is active) `"foo".indent(3).should == ...` found the
     //   spec helper's Object#should "in" the refinement and dispatched it
     //   there, which is an internal "undefined method 'should'".
-    if (if str_eq ic "" then false else true)
-       && (let (mt9, _, _, _) = world in map_has mt9 (ic ++ "#" ++ name) || map_has builtin_alias (ic ++ "#" ++ name)) then ic
+    if (if str_eq ic "" then false else true) then ic
     // ...but only that one. A method defined on a nearer ancestor still wins
     // over a refinement of something further up the chain — Presenter#red
     // (Presenter < String) must beat `refine String do def red …`, or wrapping
