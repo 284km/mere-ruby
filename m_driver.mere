@@ -9612,10 +9612,11 @@ let top_report = fn env -> fn world -> fn (exc: Val) -> fn (name: str) ->
 // ruby's shape is what a caller looks for -- the file and the class. Before,
 // the parser's `fail` went straight out as the interpreter's own
 // "fail: mere-ruby: ..." line, which named neither.
-let cli_syntax_report = fn (name: str) ->
+let cli_syntax_msg = fn (u: unit) ->
   let m = (if map_has prim_missing "i" then (match map_get prim_missing "i" with VStr h -> sget h | _ -> "syntax error") else "syntax error") in
-  let m2 = (if str_len m > 11 && str_eq (substring m 0 11) "mere-ruby: " then substring m 11 (str_len m) else m) in
-  name ++ ": " ++ m2 ++ " (SyntaxError)";
+  if str_len m > 11 && str_eq (substring m 0 11) "mere-ruby: " then substring m 11 (str_len m) else m;
+let cli_syntax_report = fn (name: str) ->
+  name ++ ": " ++ cli_syntax_msg () ++ " (SyntaxError)";
 // -E / -K / -U / --encoding: the default encodings, set once the Encoding
 // objects exist. A name no encoding answers to is ruby's RuntimeError, and
 // nothing runs.
@@ -9725,7 +9726,8 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
          | _ -> (let _ = (if map_has prim_missing "i" then () else map_set prim_missing "i" (mkstr ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in fail ("mere-ruby: unexpected token at top level" ++ parsing_file ()))) in
       let _ = map_set pok9 "y" 1 in r9) ((Nil : Stmt list), (Nil : Tok list)) in
   let _ = (if map_has pok9 "y" then ()
-           else (let _ = map_set cli_opt "synerr" (cli_syntax_report name) in
+           else (let _ = map_set cli_opt "synmsg" (cli_syntax_msg ()) in
+                 let _ = map_set cli_opt "synerr" (cli_syntax_report name) in
                  if map_has prim_missing "i" then map_delete prim_missing "i" else ())) in
   let prog = cli_loop_wrap prog in
   let env = map_new () in
@@ -10618,7 +10620,24 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
                 (fn (m: str) -> let _ = note_extern_refused m in false))
            else true) in
   // ...and this is where ruby would have parsed the main script (see pok9)
-  let _ = (if req_ok && map_has cli_opt "synerr" then (let _ = print_err (map_get cli_opt "synerr") in exit 1) else ()) in
+  // ...as a SyntaxError (its path the script's): one whose class a -r
+  // library gave its own #detailed_message is reported through it, as ruby's
+  // error printer asks it (test_exception's test_syntax_error_detailed_message
+  // and test_syntax_error_path)
+  let _ = (if req_ok && map_has cli_opt "synerr" then
+             (let (_, _, ocls9, ivars9) = world in
+              let txt9 = (if has_meth world "SyntaxError" "detailed_message" then
+                            (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+                             match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VClass "SyntaxError") "new" (Cons (mkstr (map_get cli_opt "synmsg"), Nil)) false) VNil with
+                             | VObj eid9 ->
+                               (let _ = map_set ivars9 (str_of_int eid9 ++ "@__path") (mkstr name) in
+                                match try_or (fn (u: unit) -> invoke_val_c env world nb9 (VObj eid9) "detailed_message" Nil false) VNil with
+                                | VStr h9 -> name ++ ": " ++ sget h9
+                                | _ -> map_get cli_opt "synerr")
+                             | _ -> map_get cli_opt "synerr")
+                          else map_get cli_opt "synerr") in
+              let _ = print_err txt9 in exit 1)
+           else ()) in
   // the main script's locals exist from here on: a file -r loaded ran before
   // the script was compiled and saw none of them
   let _ = map_set tl_decl "v" (tl_decl_names (deep_targets prog)) in
@@ -10738,7 +10757,28 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
          ov9) in
       // the handlers' own unrescued exceptions are reported as the main
       // script's is, and a status they decide replaces the script's
-      let rep9 = fn (e9: Val) -> print_err (top_report env world e9 name) in
+      // ⚠ the report goes to `$stderr` -- the object, which a program may
+      //   have replaced (`$stderr = $stdout; raise "x"` reports on stdout,
+      //   rb_ec_error_print's rb_ractor_stderr) -- written as the message's
+      //   encoding so the IO converts it as any write (test_exception's
+      //   test_output_string_encoding). It went to the process's fd 2.
+      let rep_out = fn (e9: Val) -> fn (txt: str) ->
+        (let se9 = (if map_has globals "stderr" then map_get globals "stderr" else VNil) in
+         let so9 = (if map_has consts "STDERR" then map_get consts "STDERR" else VNil) in
+         let same9 = (match (se9, so9) with
+                      | (VNil, _) -> true
+                      | (VObj a9, VObj b9) -> a9 == b9
+                      | _ -> false) in
+         if same9 then print_err txt
+         else
+           (let nb9 = (false, (Nil : str list), (Nil : Stmt list), env) in
+            let menc9 = (match try_or (fn (u: unit) -> invoke_val_c env world nb9 e9 "message" Nil false) VNil with
+                         | VStr h9 -> senc_get h9 | _ -> "") in
+            let t9 = mkstr (txt ++ "\n") in
+            let _ = (match t9 with VStr h9 -> (if str_eq menc9 "" then () else senc_set h9 menc9) | _ -> ()) in
+            let ok9 = try_or (fn (u: unit) -> let _ = invoke_val_c env world nb9 se9 "write" (Cons (t9, Nil)) false in true) false in
+            if ok9 then () else print_err txt)) in
+      let rep9 = fn (e9: Val) -> rep_out e9 (top_report env world e9 name) in
       // ...and they run with the exception that is ending the program in `$!`
       // (ruby's error_handle has it there; `$!.message` in a handler was a
       // NoMethodError on nil, reported in place of what the handler did)
@@ -10749,7 +10789,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
         (let exc = (if map_has ivars "$exc" then bi_fixup world (map_get ivars "$exc") else VNil) in
          match exc with
          // ruby runs the at_exit handlers FIRST and prints the report after
-         | VExc (_, _) -> let st9 = ae9 exc 1 in let _ = print_err (top_report env world exc name) in exit st9
+         | VExc (_, _) -> let st9 = ae9 exc 1 in let _ = rep_out exc (top_report env world exc name) in exit st9
          | VObj eid ->
            (let ec = map_get ocls eid in
             // an unrescued SystemExit (Kernel#exit / #abort) ends the program
@@ -10774,7 +10814,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
                           | VArr a9 -> (match deref a9 with Cons (VInt n9, _) -> n9 | _ -> 0)
                           | _ -> 0) in
                let st9 = ae9 exc (128 + sg9) in
-               let _ = (if str_eq ec "SignalException" then () else print_err (top_report env world exc name)) in
+               let _ = (if str_eq ec "SignalException" then () else rep_out exc (top_report env world exc name)) in
                die_of_signal sg9 st9)
             // ...and an Errno a write to stdout raised with SIGPIPE attached
             // (out_refused, ruby's rb_sys_fail_on_write): unrescued, it ends
@@ -10786,7 +10826,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
                die_of_signal sg9 (ae9 exc (128 + sg9)))
             else
             let st9 = ae9 exc 1 in
-            let _ = print_err (top_report env world exc name) in
+            let _ = rep_out exc (top_report env world exc name) in
             exit st9)
          // a builtin's refusal that built no exception is still one: the
          // class and message it recorded are what a rescue would have caught
@@ -10794,7 +10834,7 @@ let run_src = fn (src0: str) -> fn (print_result: bool) -> fn (name: str) ->
          | _ when map_has prim_missing "c" || map_has prim_missing "n" ->
            (let exc9 = pending_exc world in
             let st9 = ae9 exc9 1 in
-            let _ = print_err (top_report env world exc9 name) in
+            let _ = rep_out exc9 (top_report env world exc9 name) in
             exit st9)
          | _ ->
            (let m = (if map_has prim_missing "i"

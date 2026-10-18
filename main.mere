@@ -2483,6 +2483,7 @@ let rec eval_e = fn env -> fn world -> fn blk -> fn (e: Expr) ->
              | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
                        then map_set raise_bt "keep" (VInt 1) else ())
              | _ -> ()) in
+    let _ = debug_raise_note world exc in
     raise_exc_val world exc
   | EVar name ->
     // `__FILE__` / `__dir__` with the parsed file attached (see enc_pseudo_var).
@@ -5898,7 +5899,17 @@ and make_exc_w = fn world -> fn (args: Val list) ->
                     else (let _ = exc_set_bt world oid9 bt4 in ()))
                  | _ -> ()) in
         obj9))
-  | _ -> exc
+  // (a class whose #backtrace the program redefined gets an OBJECT, which
+  //  that method is asked on at the raise and which the rescue then sees --
+  //  the class-and-message pair has no identity to keep, note 365)
+  | _ ->
+    (match exc with
+     | VExc (c9, m9) when has_meth world c9 "backtrace" ->
+       (let id9 = alloc_oid ocls in
+        let _ = map_set ocls id9 c9 in
+        let _ = map_set ivars (str_of_int id9 ++ "@message") (mkstr m9) in
+        VObj id9)
+     | _ -> exc)
 // a flat keyword list (k, v, k, v, ...) without the key k
 and kw_drop_key = fn (kw: Val list) -> fn (k: Val) ->
   match kw with
@@ -24269,6 +24280,21 @@ and flush_files_at_exit = fn world ->
 // the handlers registered so far, newest first, taken out of the store before
 // any of them runs (so one that calls `exit`, or registers another, cannot
 // make them run twice).
+// the `@__cause` slot (below the first) in an exception's cause chain whose
+// value is `target`, or "" -- three deep at most
+and exc_cause_link_to = fn world -> fn (exc: Val) -> fn (target: Val) -> fn (depth: int) ->
+  let (_, _, _, iv9) = world in
+  match (exc, target) with
+  | (_, VNil) -> ""
+  | (VObj eid9, _) ->
+    (let k9 = str_of_int eid9 ++ "@__cause" in
+     let c9 = (if map_has iv9 k9 then map_get iv9 k9 else VNil) in
+     match c9 with
+     | VNil -> ""
+     | _ -> (if depth > 0 && rb_eq c9 target then k9
+             else if depth >= 3 then ""
+             else exc_cause_link_to world c9 target (depth + 1)))
+  | _ -> ""
 and run_at_exit_batch = fn world -> fn report -> fn st ->
   let n = map_len at_exits in
   if n == 0 then ()
@@ -24323,8 +24349,16 @@ and run_at_exit_procs = fn world -> fn report -> fn st -> fn (xs: Val list) ->
                                 | VNil -> false
                                 | _ -> (match bang9 with VNil -> false | _ -> rb_eq cv9 bang9)) in
                    let _ = (if hide9 then map_set ivars9 ck9 VNil else ()) in
+                   // (...and so is one deeper in the chain: END{raise "middle"
+                   //  rescued into raise "outer"} after an END{raise
+                   //  "previous"} has previous as middle's cause, and the
+                   //  report showed it a second time -- note 365)
+                   let deep9 = (if hide9 then "" else exc_cause_link_to world exc9 bang9 0) in
+                   let dv9 = (if str_eq deep9 "" then VNil else map_get ivars9 deep9) in
+                   let _ = (if str_eq deep9 "" then () else map_set ivars9 deep9 VNil) in
                    let _ = report exc9 in
                    let _ = (if hide9 then map_set ivars9 ck9 cv9 else ()) in
+                   let _ = (if str_eq deep9 "" then () else map_set ivars9 deep9 dv9) in
                    let _ = map_set globals "!" exc9 in
                    map_set st "v" 1))) in
     let _ = run_at_exit_batch world report st in
@@ -29049,7 +29083,10 @@ and responds_x = fn world -> fn (recv: Val) -> fn (name: str) -> fn (ask_user: b
     || (exc_is_a world cls "Exception"
         && ((str_len name == 7 && str_eq name "message") || (str_len name == 9 && str_eq name "backtrace") || (str_len name == 13 && str_eq name "set_backtrace") || (str_len name == 5 && str_eq name "cause")
             || (str_len name == 19 && str_eq name "backtrace_locations") || (str_len name == 12 && str_eq name "full_message")
-            || (str_len name == 16 && str_eq name "detailed_message") || (str_len name == 9 && str_eq name "exception")))
+            || (str_len name == 16 && str_eq name "detailed_message") || (str_len name == 9 && str_eq name "exception")
+            // (LoadError's and SyntaxError's #path: a method of theirs reads
+            //  it bare -- `def detailed_message(**) = "#{path}..."`)
+            || ((str_len name == 4 && str_eq name "path") && (exc_is_a world cls "LoadError" || exc_is_a world cls "SyntaxError"))))
     // respond_to_missing?(name, include_private=false): a method_missing-based
     // object can claim to respond to names it has no real method for.
     || (ask_rtm && has_meth world cls "respond_to_missing?"
@@ -32844,6 +32881,10 @@ and prim_method_raw = fn (recv: Val) -> fn (name: str) -> fn (args: Val list) ->
      | VStr h ->
        (let e = enc_canon_name (senc_get h) in
         if enc_ascii_compat e then
+          // (a \x escape past 0x7f is a byte of the string's own encoding
+          //  and a \u escape makes it UTF-8: both in one is refused)
+          if undump_has_u (sget h) 0 && undump_has_hi (sget h) 0 then prim_raise "RuntimeError" "hex escape and Unicode escape are mixed"
+          else
           (match rb_undump (sget h) with
            | (bytes, fe) ->
              (let c = mkstr bytes in
@@ -38040,6 +38081,28 @@ and super_missing = fn world -> fn superblk -> fn (recv: Val) -> fn (meth: str) 
   // `super` from an exception class's own #exception / #set_backtrace /
   // #backtrace reaches Exception's (a class that logs and calls super is how
   // a spec watches raise use them)
+  // ...and from its #message / #to_s / #detailed_message / #full_message /
+  // #cause: Exception's own (`def detailed_message(**) = "<#{super}>"`, which
+  // is how a library decorates the report, and `def message = "x: #{super}"`
+  // -- both were "super: no superclass method")
+  else if (str_eq meth "to_s" || str_eq meth "message" || str_eq meth "detailed_message"
+           || str_eq meth "full_message" || str_eq meth "cause")
+          && (match recv with VObj _ -> true | _ -> false) && exc_is_a world dcls "Exception" then
+    (match recv with
+     | VObj id9 ->
+       (let (_, _, _, iv9) = world in
+        let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+        if str_eq meth "to_s" then
+          (match (if map_has iv9 (str_of_int id9 ++ "@message") then map_get iv9 (str_of_int id9 ++ "@message") else VNil) with
+           | VNil -> mkstr (display_cls_msg world dcls)
+           | VStr h -> VStr h
+           | m -> (match invoke_val_c gc_cenv0 world nb9 m "to_s" Nil false with VStr h -> VStr h | other -> mkstr (to_s other)))
+        else if str_eq meth "message" then invoke_val_c gc_cenv0 world nb9 recv "to_s" Nil false
+        else if str_eq meth "detailed_message" then mkstr (exc_detailed_msg gc_cenv0 world recv (kw_flag args "highlight" false))
+        else if str_eq meth "full_message" then
+          mkstr (exc_full_message gc_cenv0 world recv args (kw_flag args "highlight" false) (str_eq (kw_sym args "order" "top") "bottom"))
+        else (if map_has iv9 (str_of_int id9 ++ "@__cause") then map_get iv9 (str_of_int id9 ++ "@__cause") else VNil))
+     | _ -> VNil)
   else if (str_eq meth "exception" || str_eq meth "set_backtrace" || str_eq meth "backtrace")
      && (match recv with VObj _ -> true | _ -> false) && exc_is_a world dcls "Exception" then
     (let (_, _, _, iv9) = world in
@@ -42633,12 +42696,42 @@ and thread_inspect_v = fn world -> fn (v: Val) ->
   let s9 = thread_inspect world v in
   mkstr_e s9 (if enc_all7 s9 then "ASCII-8BIT" else "UTF-8")
 // Kernel#raise's body, for the callers that reach it by NAME
+// under $DEBUG every raise says so on `$stderr` first (setup_exception's
+// "Exception 'C' at file:line - message", the exception's #to_s as its
+// message) -- it said nothing (test_exception's test_errinfo_in_debug)
+and debug_raise_note = fn world -> fn (exc: Val) ->
+  // (...and a program's own #backtrace is asked first, as setup_exception's
+  //  rb_get_backtrace asks it: an override that watches the raise -- test
+  //  _exception's test_redefined_backtrace -- was never called)
+  let _ = (match exc with
+           | VObj _ ->
+             (let c9 = dispatch_cls_of world exc in
+              if has_meth world c9 "backtrace" then
+                (let _ = try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) exc "backtrace" Nil false) VNil in ())
+              else ())
+           | _ -> ()) in
+  if (if map_has globals "DEBUG" then truthy (map_get globals "DEBUG") else false) then
+    (let nb9 = (false, (Nil : str list), (Nil : Stmt list), gc_cenv0) in
+     let cls9 = cls_display world (dispatch_cls_of world exc) in
+     let mv9 = try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world nb9 exc "to_s" Nil false) VNil in
+     let m9 = (match mv9 with VStr h9 -> sget h9 | _ -> "") in
+     let line9 = "Exception '" ++ cls9 ++ "' at " ++ cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ " - " ++ m9 ++ "\n" in
+     // (in the message's encoding: a class named in EUC-JP is written so)
+     let menc9 = (match mv9 with VStr h9 -> (if str_is_ascii h9 then "" else senc_get h9) | _ -> "") in
+     let lv9 = mkstr line9 in
+     let _ = (match lv9 with VStr h9 -> (if str_eq menc9 "" then () else senc_set h9 menc9) | _ -> ()) in
+     let se9 = (if map_has globals "stderr" then map_get globals "stderr" else VNil) in
+     match se9 with
+     | VNil -> print_err (substring line9 0 (str_len line9 - 1))
+     | _ -> (let _ = try_or (fn (u: unit) -> invoke_val_c gc_cenv0 world nb9 se9 "write" (Cons (lv9, Nil)) false) VNil in ()))
+  else ()
 and kernel_raise_now = fn world -> fn (args: Val list) ->
   let (_, _, _, iv0) = world in
   let exc = (match args with
              | Nil -> (if map_has globals "!" && (match map_get globals "!" with VNil -> false | _ -> true)
                        then map_get globals "!" else make_exc_w world Nil)
              | _ -> make_exc_w world args) in
+  let _ = debug_raise_note world exc in
   // raised as the statement form raises: a pair through raise_exc (which
   // remembers it beside its frames, so its #backtrace still answers after the
   // rescue is over -- this set the frames and not whose they were), an object
@@ -44544,7 +44637,9 @@ and frz_cls_check = fn world -> fn (c0: str) ->
 // anonymous class has no name worth adding, so the message stands alone.
 and exc_detailed_msg = fn env -> fn world -> fn (recv: Val) -> fn (hl: bool) ->
   let noblk9 = (false, (Nil : str list), (Nil : Stmt list), env) in
-  let msg9 = (match invoke_val_c env world noblk9 recv "to_s" Nil false with
+  // (through #message when the class redefined it, as ruby's rb_get_message
+  //  asks it -- a class that overrides #message alone is reported with it)
+  let msg9 = (match invoke_val_c env world noblk9 recv (if has_meth world (exc_cls_of world recv) "message" then "message" else "to_s") Nil false with
               | VStr h9 -> sget h9
               | o9 -> to_s o9) in
   let raw9 = display_cls world (exc_cls_of world recv) in
@@ -46620,6 +46715,25 @@ and load_path_find_conv = fn env -> fn world -> fn (p1: str) ->
 // -- one fact, two representations, and only one of them was reachable from
 // the program. `loaded_files` is kept as bookkeeping (a GC root walk and a
 // diagnostic row read it); it is NOT the answer to this question.
+// a feature asked for again while it is still being loaded: under -w ruby's
+// "loading in progress, circular require considered harmful - <path>", with
+// the requires that led there as `\tfrom` lines, through Warning.warn
+// (test_exception's test_warning_warn_circular_require_backtrace)
+and req_circular_warn = fn world -> fn (full: str) ->
+  if map_len req_loading == 0 || (if verbose_set () && (match map_get globals (gvar_slot "VERBOSE") with VBool true -> true | _ -> false) then false else true) then ()
+  else
+    (let hit = map_new () in
+     let _ = map_iter req_loading (fn (k: str) -> fn (v: str) -> (if str_eq v full then map_set hit "y" 1 else ())) in
+     if map_has hit "y" then
+       (let rec fr = fn (xs: Val list) -> fn (acc: str) ->
+          (match xs with
+           | Nil -> acc
+           | Cons (VStr h, t) -> fr t (acc ++ "\tfrom " ++ sget h ++ "\n")
+           | Cons (_, t) -> fr t acc) in
+        let msg = cur_file () ++ ":" ++ str_of_int (cur_line ()) ++ ": warning: loading in progress, circular require considered harmful - "
+                  ++ full ++ "\n" ++ fr (caller_frames 0) "" in
+        warning_emit world msg VNil)
+     else ())
 and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) ->
   // ruby's BUILT-IN features are loaded before any program runs, so requiring
   // one answers false (with or without its extension): complex, enumerator,
@@ -46715,7 +46829,7 @@ and do_require = fn env -> fn world -> fn blk -> fn (rel: bool) -> fn (p0: str) 
      // $LOADED_FEATURES (bug17885 -- b/b.rb on $: and a/b.rb by
      // require_relative ran one body twice). Asked through the name it was
      // loaded under, so a $LOADED_FEATURES the program rewrote still decides.
-     if feature_loaded full then FNext (VBool false) else
+     if feature_loaded full then (let _ = req_circular_warn world full in FNext (VBool false)) else
      let rpf = (if is_reg_file full then feat_realpath full else full) in
      if map_has feat_rpaths rpf && feature_loaded (map_get feat_rpaths rpf) then FNext (VBool false)
      // rbconfig is a GENERATED pure-Ruby file in CRuby, describing the build.
